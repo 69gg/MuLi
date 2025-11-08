@@ -6,5 +6,17 @@ authors = [
     {name = "Null", email = "pylindex@qq.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = []
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.9.0",
+    "torchvision>=0.24.0",
+    "transformers>=4.57.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch_rocm64" }
+torchvision = { index = "pytorch_rocm64" }
+
+[[tool.uv.index]]
+name = "pytorch_rocm64"
+url = "https://download.pytorch.org/whl/rocm6.4"
