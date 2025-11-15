@@ -5,7 +5,7 @@ from typing import Any
 import os
 
 class ConfigManager:
-    def __init__(self, config_path: str = "config.json5"):
+    def __init__(self, config_path: str = "config.json"):
         self.config_path = config_path
         self.yaml = YAML(typ='rt')
         self.yaml.preserve_quotes = True

@@ -10,4 +10,4 @@ wheels/
 .venv
 
 *.log
-config.json5
+config.json

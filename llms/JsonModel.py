@@ -4,7 +4,7 @@ from config_manage.manager import ConfigManager
 
 class JsonModel:
     def __init__(self):
-        config = ConfigManager("config.json5")
+        config = ConfigManager("config.json")
         self.provider_type = config.get("model_config.json_model.provider_type")
         self.model_name = config.get("model_config.json_model.model_name")
         self.client = openai.OpenAI(api_key=config.get("model_config.json_model.api_key"), base_url=config.get("model_config.json_model.api_base_url"))
