@@ -1,0 +1,8 @@
+{
+    "model_config": {
+        "model_name": "",  // 模型名称
+        "provider_type": "",  // 提供商类型
+        "api_key": "",  // API密钥
+        "api_base_url": "",  // API服务URL
+    }
+}

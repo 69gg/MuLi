@@ -7,3 +7,5 @@ __all__ = [
     "deepseek_get_text_response",
     "deepseek_get_structure_output",
 ]
+
+supported_providers = ["openai", "deepseek"]
