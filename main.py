@@ -1,3 +1,7 @@
 from core.agents.MuLi import MuLi
-main = MuLi()
-print(main.chat("你好，MuLi！帮我查查北京今天天气！"))
+ml = MuLi()
+while True:
+    user_input = input("> ")
+    response = ml.chat(user_input)
+    print(f"{response}")
+    

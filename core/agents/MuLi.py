@@ -22,7 +22,8 @@ class MuLi:
     def chat(self, send: str) -> dict:
         """处理用户消息，支持工具调用"""
         ans = self.ai.chat(send)
-
+        if ans.tool_calls:
+            print(ans.content)
         # 处理工具调用
         while ans.tool_calls:
             for tool_call in ans.tool_calls:
@@ -42,5 +43,5 @@ class MuLi:
 
             # 继续对话，让模型处理工具结果
             ans = self.ai.chat(send=None, after_tool=True)
-
+            
         return ans.content
