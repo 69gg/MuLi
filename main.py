@@ -1,7 +1,10 @@
 from core.agents.MuLi import MuLi
-ml = MuLi()
+from rich.console import Console
+from rich.markdown import Markdown
+console = Console()
+
+ml = MuLi(console=console)
 while True:
     user_input = input("> ")
     response = ml.chat(user_input)
-    print(f"{response}")
-    
+    console.print(Markdown(response))

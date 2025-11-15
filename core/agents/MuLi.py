@@ -3,9 +3,11 @@ from config_manage.manager import ConfigManager
 from charset_normalizer import from_path
 from core.tools import tools
 from core.tools.tool_executor import execute_tool
+from rich.markdown import Markdown
 
 class MuLi:
-    def __init__(self):
+    def __init__(self, console = None):
+        self.console = console
         with open("core/prompts/MuLi.txt", "r", encoding=from_path("core/prompts/MuLi.txt").best().encoding) as f:
             spmp = f.read()
 
@@ -22,8 +24,8 @@ class MuLi:
     def chat(self, send: str) -> dict:
         """处理用户消息，支持工具调用"""
         ans = self.ai.chat(send)
-        if ans.tool_calls:
-            print(ans.content)
+        if ans.tool_calls and self.console:
+            self.console.print(Markdown(ans.content))
         # 处理工具调用
         while ans.tool_calls:
             for tool_call in ans.tool_calls:
@@ -43,5 +45,5 @@ class MuLi:
 
             # 继续对话，让模型处理工具结果
             ans = self.ai.chat(send=None, after_tool=True)
-            
+
         return ans.content
