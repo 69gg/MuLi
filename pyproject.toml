@@ -11,15 +11,4 @@ dependencies = [
     "charset-normalizer>=2.1.1",
     "openai>=2.7.1",
     "ruamel-yaml>=0.18.16",
-    "torch>=2.9.0",
-    "torchvision>=0.24.0",
-    "transformers>=4.57.1",
 ]
-
-[tool.uv.sources]
-torch = { index = "pytorch_rocm64" }
-torchvision = { index = "pytorch_rocm64" }
-
-[[tool.uv.index]]
-name = "pytorch_rocm64"
-url = "https://download.pytorch.org/whl/rocm6.4"
