@@ -22,28 +22,17 @@ class MuLi:
         )
 
     def chat(self, send: str) -> dict:
-        """处理用户消息，支持工具调用"""
         ans = self.ai.chat(send)
         if ans.tool_calls and self.console:
             self.console.print(Markdown(ans.content))
-        # 处理工具调用
         while ans.tool_calls:
             for tool_call in ans.tool_calls:
                 tool_call_id = tool_call.id
                 tool_name = tool_call.function.name
                 arguments = tool_call.function.arguments
-
-                print(f"[工具调用] {tool_name}: {arguments}")
-
-                # 执行工具函数
+                self.console.print(f"[cyan]<工具调用> {tool_name}: {arguments}[/cyan]")
                 result = execute_tool(tool_name, arguments)
-
-                print(f"[工具结果] {result[:200]}{'...' if len(result) > 200 else ''}")
-
-                # 将工具结果添加到对话历史
+                self.console.print(f"[cyan]<工具结果> {result[:100]}{'...' if len(result) > 100 else ''}" + "[/cyan]")
                 self.ai.add_tool_result(tool_call_id, result)
-
-            # 继续对话，让模型处理工具结果
             ans = self.ai.chat(send=None, after_tool=True)
-
         return ans.content

@@ -8,21 +8,14 @@ class AIModel:
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
     def chat(self, send: str | None, after_tool: bool = False) -> dict:
-        if after_tool:
-            if self.provider_type == "openai":
-                ans =  openai_get_text_response(self.messages, self.tools, self.client, self.model_name)
-            elif self.provider_type == "deepseek":
-                ans =  deepseek_get_text_response(self.messages, self.tools, self.client, self.model_name)
-            else:
-                raise NotImplementedError(f"Provider type {self.provider_type} not supported yet. These providers are supported: {supported_providers}")
-        else:
+        if not after_tool:
             self.messages.append({"role": "user", "content": send})
-            if self.provider_type == "openai":
-                ans =  openai_get_text_response(self.messages, self.tools, self.client, self.model_name)
-            elif self.provider_type == "deepseek":
-                ans =  deepseek_get_text_response(self.messages, self.tools, self.client, self.model_name)
-            else:
-                raise NotImplementedError(f"Provider type {self.provider_type} not supported yet. These providers are supported: {supported_providers}")
+        if self.provider_type == "openai":
+            ans =  openai_get_text_response(self.messages, self.tools, self.client, self.model_name)
+        elif self.provider_type == "deepseek":
+            ans =  deepseek_get_text_response(self.messages, self.tools, self.client, self.model_name)
+        else:
+            raise NotImplementedError(f"Provider type {self.provider_type} not supported yet. These providers are supported: {supported_providers}")
         self.messages.append(ans)
         return ans
     
