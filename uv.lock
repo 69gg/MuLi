@@ -184,7 +184,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "charset-normalizer" },
-    { name = "colorama" },
     { name = "openai" },
     { name = "requests" },
     { name = "rich" },
@@ -194,7 +193,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "charset-normalizer", specifier = ">=2.1.1" },
-    { name = "colorama", specifier = ">=0.4.6" },
     { name = "openai", specifier = ">=2.7.1" },
     { name = "requests", specifier = ">=2.28.1" },
     { name = "rich", specifier = ">=14.2.0" },

@@ -6,7 +6,7 @@ from core.tools.tool_executor import execute_tool
 from rich.markdown import Markdown
 
 class MuLi:
-    def __init__(self, console = None):
+    def __init__(self, console):
         self.console = console
         with open("core/prompts/MuLi.txt", "r", encoding=from_path("core/prompts/MuLi.txt").best().encoding) as f:
             spmp = f.read()
@@ -23,8 +23,8 @@ class MuLi:
 
     def chat(self, send: str) -> dict:
         ans = self.ai.chat(send)
-        if ans.tool_calls and self.console:
-            self.console.print(Markdown(ans.content))
+        if ans.tool_calls and self.console and ans.content:
+            self.console.print(Markdown(str(ans.content)))
         while ans.tool_calls:
             for tool_call in ans.tool_calls:
                 tool_call_id = tool_call.id
