@@ -32,7 +32,8 @@ class AIModel:
             ans =  deepseek_get_text_response(self.messages, self.tools, self.client, self.model_name)
         else:
             raise NotImplementedError(f"Provider type {self.provider_type} not supported yet. These providers are supported: {supported_providers}")
-        self.messages.append(ans)
+        
+        self.messages.append(ans.model_dump() if hasattr(ans, "model_dump") else ans)
         return ans
     
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
@@ -61,11 +62,16 @@ class AIModel:
         """
         from rich.markdown import Markdown
         
+        if hasattr(self, 'logger') and self.logger and send:
+            self.logger.log("user", send, "text")
+
         ans = self.chat(send)
         self._print_reasoning(ans, console)
 
         if ans.tool_calls and console and ans.content:
             console.print(Markdown(str(ans.content)))
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.log("assistant", ans.content, "markdown")
 
         tool_color = "cyan dim" if self.model_name == "deepseek-reasoner" else "cyan"
 
@@ -77,6 +83,9 @@ class AIModel:
                 
                 if console:
                     console.print(f"[{tool_color}]<工具调用> {tool_name}: {arguments}[/{tool_color}]")
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log("tool_call", f"{tool_name}: {arguments}", "tool")
+                    
                 with open(os.devnull, 'w') as f:
                     with redirect_stdout(f), redirect_stderr(f):
                         # Check if tool_executor is async
@@ -87,9 +96,17 @@ class AIModel:
                 
                 if console:
                     console.print(f"[{tool_color}]<工具结果> {str(result).replace("\n", "")[:100]}{'...' if len(str(result)) > 100 else ''}[/{tool_color}]")
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.log("tool_result", str(result), "tool")
                 
                 self.add_tool_result(tool_call_id, result)
             ans = self.chat(send=None, after_tool=True)
             self._print_reasoning(ans, console)
+        
+        # Log final assistant response
+        if ans.content: 
+             if hasattr(self, 'logger') and self.logger:
+                self.logger.log("assistant", ans.content, "markdown")
+
         return ans.content
     

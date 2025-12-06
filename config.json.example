@@ -1,6 +1,7 @@
 {
     # 模型配置部分
     "model_config": {
+        "max_context_tokens": 8000, # 最大上下文token数，超过将触发自动压缩
         # 主模型：用于主要的对话、逻辑推理和任务执行
         "main_model": {
             "model_name": "",       # 模型名称

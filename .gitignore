@@ -11,3 +11,4 @@ wheels/
 
 *.log
 config.json
+history/
