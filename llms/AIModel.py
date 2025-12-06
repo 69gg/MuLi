@@ -3,6 +3,11 @@ from typing import Callable
 import asyncio
 from llms.providers import supported_providers, openai_get_text_response, deepseek_get_text_response
 
+import os
+import sys
+from contextlib import redirect_stdout, redirect_stderr
+
+
 class AIModel:
     def __init__(self, api_key: str, base_url: str, model_name: str, provider_type: str, system_prompt: str, tools: None | list[dict] = None):
         self.api_key, self.base_url, self.model_name, self.provider_type, self.system_prompt, self.tools = api_key, base_url, model_name, provider_type, system_prompt, tools
@@ -72,12 +77,13 @@ class AIModel:
                 
                 if console:
                     console.print(f"[{tool_color}]<工具调用> {tool_name}: {arguments}[/{tool_color}]")
-                
-                # Check if tool_executor is async
-                if asyncio.iscoroutinefunction(tool_executor):
-                     result = await tool_executor(tool_name, arguments)
-                else:
-                     result = tool_executor(tool_name, arguments)
+                with open(os.devnull, 'w') as f:
+                    with redirect_stdout(f), redirect_stderr(f):
+                        # Check if tool_executor is async
+                        if asyncio.iscoroutinefunction(tool_executor):
+                             result = await tool_executor(tool_name, arguments)
+                        else:
+                             result = tool_executor(tool_name, arguments)
                 
                 if console:
                     console.print(f"[{tool_color}]<工具结果> {str(result).replace("\n", "")[:100]}{'...' if len(str(result)) > 100 else ''}[/{tool_color}]")

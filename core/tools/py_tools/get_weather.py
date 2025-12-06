@@ -1,4 +1,4 @@
-## -!- START REGINSTER TOOL -!- ##
+## -!- START REGISTER TOOL -!- ##
 ## -!- START TOOL DEFINITION -!- ##
 TOOL_NAME = "get_weather"
 TOOL_DESCRIPTION = "Get the current weather information for a specified location."
@@ -19,4 +19,4 @@ def get_weather_details(city: str) -> str:
     }
     response = requests.request("GET", url, headers = headers, data = payload)
     return response.text
-## -!- END REGINSTER TOOL -!- ##
+## -!- END REGISTER TOOL -!- ##

@@ -4,10 +4,6 @@ import json
 from core.tools import mcp_tool_names, execute_mcp_tools
 import asyncio
 
-def execute_tool(tool_name: str, arguments) -> str:
-    # This function is now a wrapper or needs to be async.
-    # Since the whole stack is moving to async, we make this async.
-    pass
 
 async def execute_tool(tool_name: str, arguments) -> str:
     try:
