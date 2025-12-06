@@ -4,10 +4,15 @@ import textwrap
 
 def get_text_response(messages: list[dict], tools: None | list[dict], client, model_name) -> str:
     if tools:
+        extra_body = {}
+        if model_name == "deepseek-reasoner":
+            extra_body["thinking"] = {"type": "enabled"}
+            
         response = client.chat.completions.create(
             model=model_name,
             messages=messages,
             tools=tools,
+            extra_body=extra_body
         )
         return response.choices[0].message
     else:

@@ -3,7 +3,7 @@ from config_manage.manager import ConfigManager
 from charset_normalizer import from_path
 from core.tools import tools
 from core.tools.tool_executor import execute_tool
-from rich.markdown import Markdown
+
 
 class MuLi:
     def __init__(self, console):
@@ -22,17 +22,9 @@ class MuLi:
         )
 
     def chat(self, send: str) -> dict:
-        ans = self.ai.chat(send)
-        if ans.tool_calls and self.console and ans.content:
-            self.console.print(Markdown(str(ans.content)))
-        while ans.tool_calls:
-            for tool_call in ans.tool_calls:
-                tool_call_id = tool_call.id
-                tool_name = tool_call.function.name
-                arguments = tool_call.function.arguments
-                self.console.print(f"[cyan]<工具调用> {tool_name}: {arguments}[/cyan]")
-                result = execute_tool(tool_name, arguments)
-                self.console.print(f"[cyan]<工具结果> {result[:100]}{'...' if len(result) > 100 else ''}" + "[/cyan]")
-                self.ai.add_tool_result(tool_call_id, result)
-            ans = self.ai.chat(send=None, after_tool=True)
-        return ans.content
+        return self.ai.chat_with_tools(
+            send,
+            tool_executor=execute_tool,
+            console=self.console
+        )
+
