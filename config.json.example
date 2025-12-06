@@ -1,21 +1,30 @@
 {
     "model_config": {
         "main_model": {
-            "model_name": "",  # 模型名称
-            "provider_type": "",  # 提供商类型
-            "api_key": "",  # API密钥
-            "api_base_url": "",  # API服务URL
+            "model_name": "",
+            "provider_type": "",
+            "api_key": "",
+            "api_base_url": ""
         },
         "json_model": {
-            "model_name": "",  # 模型名称
-            "provider_type": "",  # 提供商类型
-            "api_key": "",  # API密钥
-            "api_base_url": "",  # API服务URL
+            "model_name": "",
+            "provider_type": "",
+            "api_key": "",
+            "api_base_url": ""
         }
     },
     "tools_api_config": {
         "get_weather": {
-            "api_key": "",  # 天气工具API密钥
+            "api_key": ""
+        }
+    },
+    "mcp_tools": {
+        "mcpServers": {
+            "tool_name": {
+                "command": "",
+                "args": [
+                ]
+            }
         }
     }
 }
