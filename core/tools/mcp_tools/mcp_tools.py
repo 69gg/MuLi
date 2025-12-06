@@ -4,7 +4,8 @@ import copy
 
 config_f = ConfigManager()
 config = config_f.get("mcp_tools")
-client = Client(config)
+# Global client instance
+mcp_client = Client(config)
 
 def fastmcp_to_openai_tools(fastmcp_tools):
     """
@@ -52,11 +53,12 @@ def fastmcp_to_openai_tools(fastmcp_tools):
 
 
 async def list_tools() -> tuple[list[dict], list[str]]:
-    async with client:
-        fastmcp_tools = await client.list_tools()
+    # Use a temporary client for listing tools at startup.
+    # This prevents the global mcp_client (used in main loop) from being associated with a closed event loop.
+    temp_client = Client(config)
+    async with temp_client:
+        fastmcp_tools = await temp_client.list_tools()
         tools = fastmcp_to_openai_tools(fastmcp_tools)
         tool_names = [tool.name if hasattr(tool, 'name') else tool['name'] for tool in fastmcp_tools]
-        #print(tools)
-        #print(tool_names)
         return (tools, tool_names)
 

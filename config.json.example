@@ -16,20 +16,27 @@
             "api_base_url": ""      # API 基础地址
         }
     },
+    
     # 常规工具 API 配置
     "tools_api_config": {
         "get_weather": {
             "api_key": ""           # 天气查询服务的 API Key，请前往xxapi.cn获取（免费）
         }
     },
+    
     # MCP (Model Context Protocol) 工具配置
     # 用于连接本地或远程的 MCP 服务器，扩展模型能力
     # 可以配置多个 使用官方json格式
-    "mcp_tools": {
+    "mcp_tools": { 
+        # 此处添加了推荐使用的mcp 需要安装npm与uv
         "mcpServers": {
-            "tool_name": {
-                "command": "",
-                "args": []
+            "filesystem": {
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@modelcontextprotocol/server-filesystem",
+                    "/path/to/other/allowed/dir"  # 这里可以填写多个你想让AI访问的路径
+                ]
             }
         }
     }

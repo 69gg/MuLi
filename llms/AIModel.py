@@ -1,5 +1,6 @@
 import openai
 from typing import Callable
+import asyncio
 from llms.providers import supported_providers, openai_get_text_response, deepseek_get_text_response
 
 class AIModel:
@@ -36,7 +37,7 @@ class AIModel:
         if console and hasattr(ans, 'reasoning_content') and ans.reasoning_content:
             console.print(f"[grey50]{ans.reasoning_content}[/grey50]")
 
-    def chat_with_tools(
+    async def chat_with_tools(
         self,
         send: str,
         tool_executor: Callable[[str, str], str],
@@ -72,7 +73,11 @@ class AIModel:
                 if console:
                     console.print(f"[{tool_color}]<工具调用> {tool_name}: {arguments}[/{tool_color}]")
                 
-                result = tool_executor(tool_name, arguments)
+                # Check if tool_executor is async
+                if asyncio.iscoroutinefunction(tool_executor):
+                     result = await tool_executor(tool_name, arguments)
+                else:
+                     result = tool_executor(tool_name, arguments)
                 
                 if console:
                     console.print(f"[{tool_color}]<工具结果> {str(result).replace("\n", "")[:100]}{'...' if len(str(result)) > 100 else ''}[/{tool_color}]")

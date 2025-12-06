@@ -21,8 +21,8 @@ class MuLi:
             tools=tools
         )
 
-    def chat(self, send: str) -> dict:
-        return self.ai.chat_with_tools(
+    async def chat(self, send: str) -> dict:
+        return await self.ai.chat_with_tools(
             send,
             tool_executor=execute_tool,
             console=self.console

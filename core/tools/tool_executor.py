@@ -5,10 +5,15 @@ from core.tools import mcp_tool_names, execute_mcp_tools
 import asyncio
 
 def execute_tool(tool_name: str, arguments) -> str:
+    # This function is now a wrapper or needs to be async.
+    # Since the whole stack is moving to async, we make this async.
+    pass
+
+async def execute_tool(tool_name: str, arguments) -> str:
     try:
         args_dict = json.loads(arguments)
         if tool_name in mcp_tool_names:
-            return asyncio.run(execute_mcp_tools(tool_name, args_dict))
+            return await execute_mcp_tools(tool_name, args_dict)
     except json.JSONDecodeError:
         return f"错误：参数格式不正确"
     except Exception as e:
@@ -29,7 +34,11 @@ def execute_tool(tool_name: str, arguments) -> str:
 
                     if hasattr(module, tool_name):
                         tool_func = getattr(module, tool_name)
-                        result = tool_func(**args_dict)
+                        # Check if tool_func is async
+                        if asyncio.iscoroutinefunction(tool_func):
+                            result = await tool_func(**args_dict)
+                        else:
+                            result = tool_func(**args_dict)
                         return str(result)
                 except Exception:
                     continue
