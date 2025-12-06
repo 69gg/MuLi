@@ -21,6 +21,11 @@
     "tools_api_config": {
         "get_weather": {
             "api_key": ""           # 天气查询服务的 API Key，请前往xxapi.cn获取（免费）
+        },
+        "shell_for_ai": {
+            "enable": false,      # 使用docker给模型提供私有主机，需要安装docker并自己部署容器
+            "container_name": "ai_shell_container", # Docker容器名称
+            "mount_mapping": ""   # 宿主机:容器 映射目录，用于提示AI。例如 "/data/MuLi:/workspace"
         }
     },
     
@@ -36,6 +41,12 @@
                     "-y",
                     "@modelcontextprotocol/server-filesystem",
                     "/path/to/other/allowed/dir"  # 这里可以填写多个你想让AI访问的路径
+                ]
+            },
+            "playwright": {
+                "command": "npx",
+                "args": [
+                    "@playwright/mcp@latest"
                 ]
             }
         }

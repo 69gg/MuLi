@@ -27,8 +27,11 @@ async def execute_tool(tool_name: str, arguments) -> str:
 
                 try:
                     module = importlib.import_module(module_path)
+                except Exception:
+                    continue
 
-                    if hasattr(module, tool_name):
+                if hasattr(module, tool_name):
+                    try:
                         tool_func = getattr(module, tool_name)
                         # Check if tool_func is async
                         if asyncio.iscoroutinefunction(tool_func):
@@ -36,8 +39,8 @@ async def execute_tool(tool_name: str, arguments) -> str:
                         else:
                             result = tool_func(**args_dict)
                         return str(result)
-                except Exception:
-                    continue
+                    except Exception as e:
+                        return f"错误：执行工具 '{tool_name}' 时发生异常: {str(e)}"
 
         return f"错误：未找到工具函数 '{tool_name}'"
     except json.JSONDecodeError:

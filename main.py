@@ -1,13 +1,13 @@
 from rich.console import Console
+console = Console()
+console.print("[green]正在加载工具，请稍候...[/green]")
+
 from rich.markdown import Markdown
 from core.agents.MuLi import MuLi
 from core.tools.mcp_tools.mcp_tools import mcp_client
 import asyncio
 
 async def main():
-    console = Console()
-
-    console.print("[green]正在加载工具，请稍候...[/green]")
     ml = MuLi(console=console)
     console.print("[green]加载完成！[/green]")
 

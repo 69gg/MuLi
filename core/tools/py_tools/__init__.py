@@ -40,6 +40,18 @@ def generate_openai_tools():
                 continue
 
             tool_description = tool_info["TOOL_DESCRIPTION"]
+            
+            # Special handling for shell_for_ai to inject mount_mapping
+            if tool_info.get("TOOL_NAME") == "shell_for_ai":
+                try:
+                    from config_manage.manager import ConfigManager
+                    cfg_mgr = ConfigManager("config.json")
+                    mapping = cfg_mgr.get("tools_api_config.shell_for_ai.mount_mapping")
+                    if mapping:
+                        tool_description += f"\n\nEnvironment Info: Host-Container Mount Mapping: {mapping}"
+                except Exception:
+                    pass
+
             tool_functions = tool_info["TOOL_FUNCTIONS"]
             tool_parameters = tool_info["TOOL_PARAMETERS"]
             
