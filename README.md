@@ -1,11 +1,16 @@
-# MuLi (沐璃) - 一个强大的拟人AI助手
+<img src="./img/standby.png" width = "524" height = "368" alt="MuLi" align=right />
+
+[![Python](https://img.shields.io/badge/Python-3.13+-blue.svg)](https://www.python.org/)
+
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/Python-3.13+-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+# 沐璃
 
-**🤖 一个集成了MCP工具、Docker容器交互和持久化会话的智能AI助手**
+_A high-performance agent framework with high customizability and simplicity._
+
+> 路漫漫其修远兮，吾将上下而求索。
 
 </div>
 
