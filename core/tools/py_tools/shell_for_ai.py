@@ -1,7 +1,7 @@
 ## -!- START REGISTER TOOL -!- ##
 ## -!- START TOOL DEFINITION -!- ##
 TOOL_NAME = "shell_for_ai"
-TOOL_DESCRIPTION = "A tool to interact with a persistent shell session inside a Docker container. Supports sending text input, special keys, and retrieving output. The container is isolated from the host for security. Also supports exposing container ports to the host."
+TOOL_DESCRIPTION = "A tool to interact with a persistent shell session inside a Docker container. Supports sending text input, special keys, and retrieving output. The container is isolated from the host for security. Also supports exposing container ports to the host. You should always do something to know the system's type. You can run package manager like apt, pacman, etc to install some packages."
 TOOL_FUNCTIONS = ["send_shell_input", "get_shell_output", "restart_shell_session", "expose_container_port", "list_exposed_ports", "close_exposed_port"]
 TOOL_PARAMETERS = [
     [

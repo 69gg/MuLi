@@ -9,11 +9,14 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "charset-normalizer>=2.1.1",
+    "docker>=7.1.0",
     "fastmcp>=2.13.1",
     "langchain-community>=0.4.1",
     "openai>=2.7.1",
+    "pytz>=2025.2",
     "requests>=2.28.1",
     "rich>=14.2.0",
     "ruamel-yaml>=0.18.16",
     "tiktoken>=0.12.0",
+    "tqdm>=4.66.5",
 ]
