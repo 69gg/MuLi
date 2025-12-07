@@ -12,7 +12,6 @@ _A high-performance agent framework with high customizability and simplicity._
 
 </div>
 
----
 
 ## 📖 项目简介
 
@@ -23,8 +22,8 @@ MuLi (沐璃) 是一个功能强大的拟人化AI助手，专为需要复杂工�
 - **🧠 智能对话系统**: 支持工具调用、会话历史持久化
 - **🔄 自动上下文管理**: Token超限自动摘要，保持对话连贯性
 - **🛠️ 多工具集成**:
-  - **MCP工具**: context7、filesystem、playwright
-  - **Python工具**: 天气查询、Docker容器shell交互、Web搜索
+  - **MCP工具**: context7、filesystem、playwright...
+  - **Python工具**: 天气查询、Docker容器shell交互、Web搜索...
 - **🐳 Docker容器交互**: 在安全的容器环境中执行命令
 - **🌐 Web搜索**: 集成SearXNG搜索引擎，实时获取网络信息
 - **💾 会话持久化**: 支持历史对话恢复和日志回放
@@ -62,6 +61,12 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.bashrc  # 或 ~/.zshrc
 ```
+
+**也可以pip安装**
+```bash
+pip install uv
+```
+
 
 验证安装：
 ```bash
@@ -156,10 +161,11 @@ uv sync
 3. 进入"API Keys"页面
 4. 点击"创建API密钥"
 5. 复制生成的密钥，填写到 `config.json` 的 `api_key` 字段
+6. 提供商类型填写`deepseek`
 
 > `deepseek-reasoner`模型效果最佳。
 
-> 你也可以使用其他兼容OpenAI的厂商的服务。
+> 你也可以使用其他任何兼容OpenAI的厂商的服务，将提供商类型改为`openai`即可。
 
 ##### 🌤️ 天气API密钥
 
@@ -167,13 +173,13 @@ uv sync
 
 1. 访问 [小小API文档](https://xxapi.cn/)
 2. 天气接口是免费的，密钥仅供认证
-5. 将密钥填入 `config.json` 的 `tools_api_config.get_weather.api_key` 字段
+3. 将密钥填入 `config.json` 的 `tools_api_config.get_weather.api_key` 字段
 
 #### 步骤 4: 部署 SearXNG 搜索引擎（用于web搜索工具）
 
 项目提供了一个web搜索工具，需要部署SearXNG作为搜索引擎后端。
 
-**方式一：使用Docker快速部署（推荐）**
+**使用Docker快速部署**
 
 创建searxng的配置目录：
 ```bash
@@ -207,9 +213,6 @@ notepad searxng-config/settings.yml
 
 在配置文件中添加或修改以下内容：
 ```yaml
-server:
-  secret_key: "your-secret-key-here"  # 必须设置，可以使用openssl rand -hex 16生成
-
 # 启用JSON格式
 formats:
   - html
@@ -221,30 +224,6 @@ formats:
 重启searxng容器使配置生效：
 ```bash
 docker restart searxng
-```
-
-**方式二：使用docker-compose部署**
-
-创建 `docker-compose.yml` 文件：
-```yaml
-version: '3.7'
-
-services:
-  searxng:
-    container_name: searxng
-    image: searxng/searxng:latest
-    ports:
-      - "8888:8080"
-    volumes:
-      - "./searxng-config:/etc/searxng"
-    environment:
-      - SEARXNG_SECRET_KEY=your-secret-key-here  # 必须设置
-    restart: unless-stopped
-```
-
-启动服务：
-```bash
-docker-compose up -d
 ```
 
 验证searxng运行状态：
@@ -278,7 +257,7 @@ curl "http://127.0.0.1:8888/search?q=test&format=json"
 ```bash
 docker run -d --name ai_shell_container \
   ubuntu tail -f /dev/null
-# 或者其他你需要的任何目录映射，记得填入config.json
+# 可以填写你需要的任何目录映射，记得填入config.json让AI知道
 ```
 
 **参数说明：**
@@ -297,12 +276,13 @@ docker ps
 
 运行主程序：
 ```bash
-python main.py
+uv run main.py
 ```
 
 如果一切正常，你会看到：
 ```
 正在加载工具，请稍候...
+（一些log，不用管）
 加载完成！
 >
 ```
@@ -348,59 +328,34 @@ MCP (Model Context Protocol) 工具通过标准化接口为AI提供扩展功能�
 
 #### 步骤 1: 找到MCP工具包
 
-在 [npm官网](https://www.npmjs.com/) 搜索 "mcp" 或 "modelcontextprotocol"，例如：
-- `@modelcontextprotocol/server- Brave`
-- `@modelcontextprotocol/server-postgres`
+在 [mcp.so](https://mcp.so/) 或搜索引擎搜索你想要使用的mcp，获取配置，标准json格式（或者Claude Desktop格式）。
 
 #### 步骤 2: 安装并配置
 
 以添加 Brave 搜索工具为例：
 
-**方式一: 使用 npx 直接运行（推荐）**
-
 修改 `config.json`，在 `mcp_tools.mcpServers` 中添加：
 
 ```json
-{
-  "mcp_tools": {
-    "mcpServers": {
-      "brave-search": {
-        "command": "npx",
-        "args": [
-          "-y",
-          "@modelcontextprotocol/server-brave"
-        ],
-        "env": {
-          "BRAVE_API_KEY": "your-brave-api-key"
-        }
-      }
-    }
+"brave-search": {
+  "command": "npx",
+  "args": [
+    "-y",
+    "@modelcontextprotocol/server-brave"
+  ],
+  "env": {
+    "BRAVE_API_KEY": "your-brave-api-key"
   }
 }
 ```
 
-**方式二: 全局安装后使用**
-
-```bash
-npm install -g @modelcontextprotocol/server-brave
-```
-
-然后在 `config.json` 中配置：
-```json
-{
-  "brave-search": {
-    "command": "mcp-server-brave",
-    "env": {
-      "BRAVE_API_KEY": "your-brave-api-key"
-    }
-  }
-}
-```
+>  这个就是你获取到的json配置。
 
 #### 步骤 3: 重启项目
 
 ```bash
-python main.py
+# 输入/exit退出程序
+uv run main.py # 重启程序
 ```
 
 新的工具会自动加载，你可以在对话中直接使用。
@@ -523,12 +478,14 @@ graph TD
 工具类型:
 1. MCP工具 - 通过FastMCP集成
 如：
-   - context7、filesystem、playwright
+   - context7、filesystem、playwright...
 
 2. Python工具 - 自定义开发
 如：
    - get_weather (天气查询)
    - shell_for_ai (Docker容器交互)
+   - web_search (调用搜索引擎进行搜索)
+   - ...
 ```
 
 ### 🗂️ 核心模块说明
@@ -725,7 +682,7 @@ if current_tokens > max_context_tokens:
 
 如果这个项目对你有帮助，请给我们一个Star！你的支持是我们持续改进的动力！
 
-> **GitHub 仓库**: [MuLi - 拟人AI助手](https://github.com/69更改/MuLi)
+> **GitHub 仓库**: [沐璃 - A high-performance agent framework with high customizability and simplicity.](https://github.com/69gg/MuLi)
 
 ### Star之后还可以：
 
@@ -740,6 +697,6 @@ if current_tokens > max_context_tokens:
 
 **💝 感谢您的关注和支持！**
 
-如有问题，请提交 [Issue](https://github.com/69gg/MuLi/issues) 或联系项目维护者。
+如有问题，请提交 [Issue](https://github.com/69gg/MuLi/issues) 或联系我（QQ: 1708213363）。
 
 </div>
