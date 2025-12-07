@@ -1,24 +1,24 @@
 ## -!- START REGISTER TOOL -!- ##
 ## -!- START TOOL DEFINITION -!- ##
 TOOL_NAME = "shell_for_ai"
-TOOL_DESCRIPTION = "A tool to interact with a persistent shell session inside a Docker container. Supports sending text input, special keys, and retrieving output. The container is isolated from the host for security. Also supports exposing container ports to the host. You should always do something to know the system's type. You can run package manager like apt, pacman, etc to install some packages."
+TOOL_DESCRIPTION = "【操作对象：Docker容器内部，不能操作宿主机】在Docker容器内执行shell命令的工具。此工具的所有操作都严格限制在容器内部，包括：文件系统操作（如ls/cat/mkdir都是查看容器内的文件）、进程管理（ps/kill操作的是容器内的进程）、网络配置、软件安装（apt/pip安装的软件在容器内）等。容器环境与宿主机完全隔离，保证安全性。文件路径如/etc、/home、/tmp都是指容器内部路径，不是宿主机路径。此工具不能访问或操作用户的宿主机文件系统。你可以使用任何命令，就像正常用户，包括包管理器。运行耗时较长的命令时，请设置一个较长的睡眠时间，不要放到后台运行，不要着急，运行结束了再继续。"
 TOOL_FUNCTIONS = ["send_shell_input", "get_shell_output", "restart_shell_session", "expose_container_port", "list_exposed_ports", "close_exposed_port"]
 TOOL_PARAMETERS = [
     [
-        {"input_text": "The text command to type into the shell. Optional if sending a key_combo."},
-        {"key_combo": "Special key combination to send. Supported: 'Enter', 'Ctrl+C', 'Ctrl+Z', 'Ctrl+D', 'Up', 'Down'. Optional."}
+        {"input_text": "【发送到容器内shell】在容器内部执行的文本命令（此命令在容器内运行，不影响宿主机）。例如：'ls -la /etc'查看容器内/etc目录，'ps aux'查看容器内进程。"},
+        {"key_combo": "【容器内shell特殊按键】模拟按键操作。支持: 'Enter'(执行命令), 'Ctrl+C'(中断当前程序), 'Ctrl+Z'(挂起程序), 'Ctrl+D'(EOF/退出), 'Up'(上一条命令), 'Down'(下一条命令)。"}
     ],
     [
-        {"timeout_seconds": "How long to wait for output gathering (not strict sleep, just read window). Default 1."}
-    ],
-    [],
-    [
-        {"container_port": "The port inside the container to expose."},
-        {"host_port": "The port on the host to bind to. If 0 or omitted, a random free port will be selected."}
+        {"timeout_seconds": "【读取容器内输出】等待容器内shell输出内容的超时时间（秒），默认为1秒。不是严格的睡眠，而是持续读取容器内命令的输出。"}
     ],
     [],
     [
-        {"host_port": "The host port to close the forwarding for."}
+        {"container_port": "【容器内→宿主机端口映射】容器内部的要暴露的端口号（这是容器内部程序监听的端口），例如：8080, 3000, 8000。宿主机外部可以通过访问映射的host_port来访问容器内的此端口。"},
+        {"host_port": "【宿主机端口】要绑定到的宿主机端口号。如果为0或省略，则自动选择一个空闲端口。此端口在宿主机上监听，所有发往此端口的流量会自动转发到容器内的container_port端口。例如：设置host_port=9000, container_port=8080，则在宿主机访问localhost:9000会转发到容器内的8080端口。"}
+    ],
+    [],
+    [
+        {"host_port": "【关闭宿主机端口转发】要关闭端口转发的宿主机端口号。关闭后，宿主机将无法再通过此端口访问容器内的服务。"}
     ]
 ]
 ## -!- END TOOL DEFINITION -!- ##
@@ -143,6 +143,9 @@ def send_shell_input(input_text: str = None, key_combo: str = None) -> str:
     Sends text or a key combination to the shell session.
     Example: send_shell_input("python3") then send_shell_input(key_combo="Enter")
     """
+    if input_text is not None and key_combo is None:
+        key_combo = "Enter"  # Default to Enter if only text is provided
+        
     err = _ensure_session()
     if err:
         return err

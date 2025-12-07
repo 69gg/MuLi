@@ -14,10 +14,11 @@ if config.get("tools_api_config.web_search.enable") == True:
     searx_host = config.get("tools_api_config.web_search.base_url")
     s = SearxSearchWrapper(searx_host=searx_host)
 
-s.run("what is a large language model?")
 def web_search(query: str, engine: str = "google", max_length: int = 3000) -> str:
     if config.get("tools_api_config.web_search.enable") == False:
         return "Web search tool is disabled."
-    result = s.run(query=query, engine=engine)
+    result = s.run(query=query, engines=engine)
+    if result == 'No good search result found':
+        result = s.run(query=query, engines=[engine])
     return str(result)[:max_length] if len(str(result)) > max_length else str(result)
 ## -!- END REGISTER TOOL -!- ##

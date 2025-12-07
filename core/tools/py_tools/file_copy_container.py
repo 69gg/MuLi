@@ -1,5 +1,5 @@
 """
-文件复制工具 - 在主机和Docker容器之间双向复制文件
+文件复制工具 - 在主机（宿主机）和Docker容器之间双向复制文件（跨文件系统复制）
 """
 import os
 import tarfile
@@ -9,21 +9,21 @@ from typing import List, Dict, Any
 from tqdm import tqdm
 import docker
 
-## -!- START TOOL DEFINITION -!-
+## -!- START TOOL DEFINITION -!- ##
 TOOL_NAME = "file_copy_container"
-TOOL_DESCRIPTION = "在主机和Docker容器之间双向复制文件的工具。支持批量复制多个文件，每个文件可独立指定目标路径。支持进度条显示和错误处理。"
+TOOL_DESCRIPTION = "【跨文件系统复制：只能在宿主机↔Docker容器之间，绝对不能在宿主机内部或容器内部使用】此工具的唯一用途是在用户的宿主机（用户电脑）和Docker容器之间双向传输文件。它有2个函数：(1) 从宿主机复制文件到容器内，(2) 从容器复制文件到宿主机。不能在宿主机内部复制文件（如从一个目录复制到另一个目录），也不能在容器内部复制文件。工具自动处理两个文件系统之间的差异，支持批量复制，支持进度条显示。"
 TOOL_FUNCTIONS = ["copy_files_from_host_to_container", "copy_files_from_container_to_host"]
 TOOL_PARAMETERS = [
     [
-        {"host_file_paths": "主机源文件路径列表，每个元素为绝对路径字符串"},
-        {"container_dest_paths": "容器内目标路径列表，与host_file_paths一一对应，包含完整路径和文件名"}
+        {"host_file_paths": "【源：用户宿主机】宿主机上的源文件路径列表，必须是用户电脑上的绝对路径，不能是容器内路径。例如：['/tmp/host_file.txt', '/home/user/data.json']"},
+        {"container_dest_paths": "【目标：Docker容器】容器内的目标路径列表，与host_file_paths一一对应，必须是容器内的绝对路径（含文件名）。例如：['/root/container_file.txt', '/app/config/data.json']"}
     ],
     [
-        {"container_file_paths": "容器内源文件路径列表，每个元素为绝对路径字符串"},
-        {"host_dest_paths": "主机目标路径列表，与container_file_paths一一对应，包含完整路径和文件名"}
+        {"container_file_paths": "【源：Docker容器】容器内的源文件路径列表，必须是容器内部的绝对路径。例如：['/etc/container_config.yml', '/var/log/app.log']"},
+        {"host_dest_paths": "【目标：用户宿主机】宿主机上的目标路径列表，与container_file_paths一一对应，必须是用户电脑上的绝对路径（含文件名）。例如：['/tmp/backup/config.yml', '/home/user/logs/app.log']"}
     ]
 ]
-## -!- END TOOL DEFINITION -!-
+## -!- END TOOL DEFINITION -!- ##
 
 
 def _get_container(container_name: str):
