@@ -169,7 +169,7 @@ uv sync
 ```bash
 docker run -d --name ai_shell_container \
   ubuntu tail -f /dev/null
-# 或者其他你需要的任何端口映射，记得填入config.json
+# 或者其他你需要的任何目录映射，记得填入config.json
 ```
 
 **参数说明：**
