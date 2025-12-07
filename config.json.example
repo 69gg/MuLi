@@ -27,7 +27,11 @@
             "enable": false,      # 使用docker给模型提供私有主机，需要安装docker并自己部署容器
             "container_name": "ai_shell_container", # Docker容器名称
             "mount_mapping": ""   # 宿主机:容器 映射目录，用于提示AI。例如 "/data/MuLi:/workspace"
-        }
+        },
+        "web_search": {
+            "enable": false,       # 是否启用网络搜索
+            "base_url": "http://127.0.0.1:8888"  # searxng部署地址
+        },
     },
     
     # MCP (Model Context Protocol) 工具配置

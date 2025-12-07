@@ -21,8 +21,9 @@ MuLi (沐璃) 是一个功能强大的拟人化AI助手，专为需要复杂工�
 - **🔄 自动上下文管理**: Token超限自动摘要，保持对话连贯性
 - **🛠️ 多工具集成**:
   - **MCP工具**: context7、filesystem、playwright
-  - **Python工具**: 天气查询、Docker容器shell交互
+  - **Python工具**: 天气查询、Docker容器shell交互、Web搜索
 - **🐳 Docker容器交互**: 在安全的容器环境中执行命令
+- **🌐 Web搜索**: 集成SearXNG搜索引擎，实时获取网络信息
 - **💾 会话持久化**: 支持历史对话恢复和日志回放
 - **🎯 多LLM支持**: 支持DeepSeek、OpenAI等多种提供商
 - **⚡ 异步架构**: 非阻塞的工具调用和I/O操作
@@ -105,7 +106,7 @@ uv sync
 ```json
 {
   "model_config": {
-    "max_context_tokens": 65536, 
+    "max_context_tokens": 65536,
     "main_model": {                       // 主模型配置
       "model_name": "deepseek-reasoner",
       "provider_type": "deepseek",       // deepseek 或 openai
@@ -127,6 +128,10 @@ uv sync
       "enable": true,
       "container_name": "ai_shell_container", //容器名称
       "mount_mapping": ""
+    },
+    "web_search": {
+      "enable": true,                      // 是否启用web搜索功能
+      "base_url": "http://127.0.0.1:8888"  // searxng搜索引擎地址
     }
   },
   "mcp_tools": {
@@ -161,7 +166,108 @@ uv sync
 2. 天气接口是免费的，密钥仅供认证
 5. 将密钥填入 `config.json` 的 `tools_api_config.get_weather.api_key` 字段
 
-#### 步骤 4: 启动 Docker 容器（用于shell工具）
+#### 步骤 4: 部署 SearXNG 搜索引擎（用于web搜索工具）
+
+项目提供了一个web搜索工具，需要部署SearXNG作为搜索引擎后端。
+
+**方式一：使用Docker快速部署（推荐）**
+
+创建searxng的配置目录：
+```bash
+mkdir -p searxng-config
+```
+
+启动searxng容器：
+```bash
+docker run -d --name searxng \
+  -p 8888:8080 \
+  -v "$(pwd)/searxng-config:/etc/searxng" \
+  searxng/searxng:latest
+```
+
+**参数说明：**
+- `-d`: 后台运行
+- `--name searxng`: 容器名称
+- `-p 8888:8080`: 端口映射（主机端口:容器端口）
+- `-v "$(pwd)/searxng-config:/etc/searxng"`: 配置目录映射
+- `searxng/searxng:latest`: 使用的镜像
+
+**重要配置：**
+为了让web_search工具正常工作，需要启用JSON格式输出。编辑searxng配置文件：
+```bash
+# Linux/macOS
+nano searxng-config/settings.yml
+
+# Windows (PowerShell)
+notepad searxng-config/settings.yml
+```
+
+在配置文件中添加或修改以下内容：
+```yaml
+server:
+  secret_key: "your-secret-key-here"  # 必须设置，可以使用openssl rand -hex 16生成
+
+# 启用JSON格式
+formats:
+  - html
+  - json  # 必须添加这一行
+```
+
+启用JSON格式的详细说明见[searxng文档](https://docs.searxng.org/admin/engines/search-formats.html#json)。
+
+重启searxng容器使配置生效：
+```bash
+docker restart searxng
+```
+
+**方式二：使用docker-compose部署**
+
+创建 `docker-compose.yml` 文件：
+```yaml
+version: '3.7'
+
+services:
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    ports:
+      - "8888:8080"
+    volumes:
+      - "./searxng-config:/etc/searxng"
+    environment:
+      - SEARXNG_SECRET_KEY=your-secret-key-here  # 必须设置
+    restart: unless-stopped
+```
+
+启动服务：
+```bash
+docker-compose up -d
+```
+
+验证searxng运行状态：
+```bash
+# 检查容器状态
+docker ps | grep searxng
+
+# 测试搜索功能（使用JSON格式）
+curl "http://127.0.0.1:8888/search?q=test&format=json"
+```
+
+**更新配置文件**
+
+编辑 `config.json` 文件，启用web搜索工具：
+```json
+{
+  "tools_api_config": {
+    "web_search": {
+      "enable": true,
+      "base_url": "http://127.0.0.1:8888"
+    }
+  }
+}
+```
+
+#### 步骤 5: 启动 Docker 容器（用于shell工具）
 
 项目集成了一个强大的Docker容器shell交互工具，需要先启动一个Docker容器。
 
@@ -184,7 +290,7 @@ docker ps
 # 应该能看到名为 ai_shell_container 的容器在运行
 ```
 
-#### 步骤 5: 启动项目
+#### 步骤 6: 启动项目
 
 运行主程序：
 ```bash
@@ -200,7 +306,32 @@ python main.py
 
 现在你可以开始与MuLi对话了！
 
-### 🔧 MCP工具说明
+### 🔧 内置工具说明
+
+#### Web搜索工具
+
+如果你已经按照步骤4部署了SearXNG并启用了web_search工具，你可以在对话中直接使用网络搜索功能：
+
+**基本用法：**
+```
+> 搜索最新的AI新闻
+> 查找关于量子计算的最新研究
+> 搜索Python 3.13的新特性
+```
+
+**高级用法（指定参数）：**
+```
+> 使用web_search工具搜索，指定最多返回10条结果，使用duckduckgo和wikipedia引擎
+> 搜索关于机器学习的教程，限制返回token数为2000
+```
+
+该工具支持以下参数：
+- `query`: 搜索关键词（必需）
+- `max_results`: 最大返回结果数（默认：5）
+- `engines`: 搜索引擎列表（默认：["google"]）
+- `max_tokens`: 返回结果的最大token数（默认：3000）
+
+#### MCP工具
 
 项目预配置了几个MCP工具，具体配置详见`config.json(.example)`。
 
