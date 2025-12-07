@@ -35,6 +35,20 @@ class AIModel:
         
         self.messages.append(ans.model_dump() if hasattr(ans, "model_dump") else ans)
         return ans
+
+    def generate_response(self, messages: list[dict], tools: list[dict] = None) -> str:
+        """
+        Generates a response for a given list of messages without updating the internal state.
+        This is useful for summarization or other stateless operations.
+        """
+        if self.provider_type == "openai":
+            ans = openai_get_text_response(messages, tools, self.client, self.model_name)
+        elif self.provider_type == "deepseek":
+            ans = deepseek_get_text_response(messages, tools, self.client, self.model_name)
+        else:
+            raise NotImplementedError(f"Provider type {self.provider_type} not supported yet.")
+            
+        return ans.content if hasattr(ans, 'content') else str(ans)
     
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
         self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})

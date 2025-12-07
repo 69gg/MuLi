@@ -29,6 +29,12 @@ class MuLi:
             tools=tools
         )
         self.ai.logger = self.logger # Inject logger into AIModel
+        
+        try:
+            self.encoding = tiktoken.encoding_for_model(self.ai.model_name)
+        except KeyError:
+            self.encoding = tiktoken.get_encoding("cl100k_base")
+
         self.history_dir = "history"
         os.makedirs(self.history_dir, exist_ok=True)
         self.session_file = os.path.join(self.history_dir, "dialog.json")
@@ -85,10 +91,7 @@ class MuLi:
 
     def _count_tokens(self, messages: list[dict]) -> int:
         """计算消息列表的 token 数量"""
-        try:
-            encoding = tiktoken.encoding_for_model(self.ai.model_name)
-        except KeyError:
-            encoding = tiktoken.get_encoding("cl100k_base")
+        encoding = self.encoding
         
         num_tokens = 0
         for message in messages:
@@ -136,22 +139,12 @@ class MuLi:
         summary_messages = [{"role": "system", "content": "You are a helpful assistant."}] + messages_to_summarize + [{"role": "user", "content": summary_prompt}]
         
         try:
-             # Use a simple direct call for summary
-            if self.ai.provider_type == "openai":
-                from llms.providers.openai import get_text_response
-                summary_response = get_text_response(summary_messages, None, self.ai.client, self.ai.model_name)
-            elif self.ai.provider_type == "deepseek":
-                from llms.providers.deepseek import get_text_response
-                summary_response = get_text_response(summary_messages, None, self.ai.client, self.ai.model_name)
-            else:
-                # Fallback for mocking or other providers if added
-                class MockResponse:
-                    content = "Summary not supported for this provider."
-                summary_response = MockResponse()
+             # Use the generic generate_response method
+            summary_text = self.ai.generate_response(summary_messages)
+
+            # summary_text is already a string from generate_response
 
             # Fix: Access content via attribute .content, not dict item ['content']
-            summary_text = summary_response.content if hasattr(summary_response, 'content') else str(summary_response)
-            
             new_system_context = f"{SUMMARY_MARKER} Previous conversation summary: {summary_text}"
             
             # Reconstruct messages: 

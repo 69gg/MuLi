@@ -49,6 +49,10 @@
                 "args": [
                     "@playwright/mcp@latest"
                 ]
+            },
+            "fetch": {
+                "command": "uvx",
+                "args": ["mcp-server-fetch"]
             }
         }
     }

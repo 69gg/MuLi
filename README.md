@@ -157,7 +157,7 @@ uv sync
 
 项目使用 [小小API](https://xxapi.cn/) 的天气服务：
 
-1. 访问 [小小心API文档](https://xxapi.cn/)
+1. 访问 [小小API文档](https://xxapi.cn/)
 2. 天气接口是免费的，密钥仅供认证
 5. 将密钥填入 `config.json` 的 `tools_api_config.get_weather.api_key` 字段
 
@@ -202,7 +202,7 @@ python main.py
 
 ### 🔧 MCP工具说明
 
-项目预配置了三个MCP工具，具体配置详见`config.json(.example)`。
+项目预配置了几个MCP工具，具体配置详见`config.json(.example)`。
 
 ---
 
