@@ -1,796 +1,110 @@
-<img src="./img/standby.png" width = "524" height = "368" alt="MuLi" align=right />
-
-[![Python](https://img.shields.io/badge/Python-3.13+-blue.svg)](https://www.python.org/) [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
 <div align="center">
 
-# 沐璃
+# 沐璃 · MuLi
 
-_A high-performance agent framework with high customizability and simplicity._
+本地数字生命，与你一起把事情做好。
 
-> 路漫漫其修远兮，吾将上下而求索。
+[![CI](https://github.com/69gg/MuLi/actions/workflows/ci.yml/badge.svg)](https://github.com/69gg/MuLi/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 </div>
 
+MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料、记忆偏好、接收任务，以及让多个 agent 分工和复核。主要适配 Arch Linux 和其他 Linux；网页与核心服务支持 macOS / Windows，桌面操作和用户服务的能力按平台显示。
 
-## 📖 项目简介
+角色形象是十八岁的少女，定位为数字生命与本地助手，不设定恋爱关系。青瓷蓝工作台将对话放在中心，执行轨迹、审批和设置按需展开。
 
-沐璃是一个功能强大的拟人化AI助手，专为需要复杂工具调用和会话管理的场景设计。它采用异步架构，支持持久化会话历史、自动上下文压缩，并集成了多种实用工具。
+![青瓷蓝工作台](docs/screenshots/workbench-desktop.jpg)
 
-### ✨ 核心功能
+## 能力
 
-- **🧠 智能对话系统**: 支持工具调用、会话历史持久化
-- **🔄 自动上下文管理**: Token超限自动摘要，保持对话连贯性
-- **🛠️ 多工具集成**:
-  - **MCP工具**: context7、filesystem、playwright...
-  - **Python工具**: 天气查询、Docker容器shell交互、Web搜索、双向文件复制、时间日期处理...
-- **🐳 Docker容器交互**: 在安全的容器环境中执行命令
-- **🔄 双向文件复制**: 在主机和容器之间批量复制文件
-- **⏰ 全面的时间日期工具**: 时区转换、时间计算、计时器、秒表等功能
-- **🌐 Web搜索**: 集成SearXNG搜索引擎，实时获取网络信息
-- **💾 会话持久化**: 支持历史对话恢复和日志回放
-- **🎯 多LLM支持**: 支持DeepSeek、OpenAI等多种提供商
-- **⚡ 异步架构**: 非阻塞的工具调用和I/O操作
+| 领域 | 当前实现 |
+| --- | --- |
+| 模型 | OpenAI Chat Completions、Responses、Anthropic 原生协议；流式/非流式、推理参数、工具回放、重试预算 |
+| 协作 | 有依赖的多 agent 工作流，独立会话、角色模型、并行限制、失败传播、取消和复核模板 |
+| 权限 | ask 每个工具调用询问；auto 独立审查 agent，风险操作交给用户；yolo 自动执行 |
+| 文件 | 目录、读取、写入、精确编辑、搜索、复制、移动、可恢复回收站 |
+| 搜索 | SearXNG / Brave / Tavily 可配服务，有限大小网页读取与来源链接 |
+| 记忆 | 全历史倒排索引、两跳关系检索、来源与置信度、修订历史和级联忘记 |
+| 电脑 | Linux AT-SPI 无障碍树、节点动作与文本编辑；新鲜快照与节点身份校验 |
+| 主动事件 | chiliarch 原生配对与 SSE 任务；持久提醒、可选 Linux 桌面通知，无 AI 轮询 |
+| 扩展 | 可选 MCP stdio / HTTP / SSE 工具，共用权限与输出预算 |
+| 长任务 | 工具结果节选、完整原生协议回放、有限排队；原始会话记录保留 |
+| 管理 | 模型、权限、工具、目录、记忆、工作流、通知、服务状态与日志统一入口 |
 
----
+## 启动
 
-## 🚀 部署教程
-
-本教程适合零基础用户，请按照步骤逐步操作。
-
-### 📋 前置条件
-
-在开始之前，请确保你的系统已安装以下软件：
-
-1. **Python 3.13+**: [下载地址](https://www.python.org/downloads/)
-2. **Node.js 18+**: [下载地址](https://nodejs.org/)
-3. **Docker**: [下载地址](https://www.docker.com/products/docker-desktop/)
-4. **Git**: [下载地址](https://git-scm.com/downloads)
-
-### 🛠️ 环境准备
-
-#### 1. 安装 uv (Python包管理器)
-
-`uv` 是一个快速的Python包管理器，比传统的pip更快。
-
-**Windows (PowerShell):**
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-**macOS/Linux:**
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.bashrc  # 或 ~/.zshrc
-```
-
-**也可以pip安装**
-```bash
-pip install uv
-```
-
-
-验证安装：
-```bash
-uv --version
-```
-
-#### 2. 安装 npm (Node.js包管理器)
-
-npm通常会随Node.js一起安装，验证安装：
-```bash
-npm --version
-```
-
-#### 3. 安装 Docker
-
-按照官方文档安装Docker Desktop，安装完成后启动Docker服务。
-
-验证安装：
-```bash
-docker --version
-docker ps  # 应该能看到运行的容器列表（可能为空）
-```
-
-### 📦 项目部署
-
-#### 步骤 1: 克隆项目
+需要 Python 3.12+ 和 [uv](https://docs.astral.sh/uv/)。前端无需安装 Node 依赖或构建。默认运行不依赖 Docker、向量数据库或本地模型。
 
 ```bash
-git clone https://github.com/69gg/MuLi/
+git clone https://github.com/69gg/MuLi.git
 cd MuLi
+uv sync --locked
+uv run muli init
+uv run muli serve
 ```
 
-#### 步骤 2: 创建虚拟环境并安装依赖
+打开 **http://127.0.0.1:8765**，在设置中填写模型协议、基础地址和模型名称。主模型处理会话，审查模型使用独立的无工具上下文，工作模型未配置时复用主模型。API key 可从环境变量读取。
 
-使用 `uv` 安装项目依赖：
+默认配置为 `$XDG_CONFIG_HOME/muli/config.json`（通常 `~/.config/muli/config.json`），数据为 `~/.local/share/muli/`。`MULI_CONFIG` / `MULI_DATA_DIR` 或 CLI `--config` / `--data-dir` 可覆盖位置。密钥不出现在配置读取 API；配置文件和数据库使用私人文件权限。
 
 ```bash
-uv sync
+uv run muli --config /path/config.json --data-dir /path/data serve --port 8766
+uv run muli doctor
 ```
 
-#### 步骤 3: 配置 API 密钥
+模型连接尚未配置时，界面可用于管理，不会伪装产生模型回答。独立审查未配置或失败时，auto 转为人工审批。
 
-项目配置文件为 `config.json`，需要填写以下API密钥（更多提示详见`config.json.example`注释）：
-
-```json
-{
-  "model_config": {
-    "max_context_tokens": 65536,
-    "main_model": {                       // 主模型配置
-      "model_name": "deepseek-reasoner",
-      "provider_type": "deepseek",       // deepseek 或 openai
-      "api_key": "sk-your-api-key-here", // 你的API密钥
-      "api_base_url": "https://api.deepseek.com"
-    },
-    "json_model": {                       // JSON输出模型配置
-      "model_name": "deepseek-reasoner",
-      "provider_type": "deepseek",
-      "api_key": "sk-your-api-key-here",
-      "api_base_url": "https://api.deepseek.com"
-    }
-  },
-  "tools_api_config": {
-    "get_weather": {
-      "api_key": "your-weather-api-key"   // 天气API密钥，前往xxapi.cn获取
-    },
-    "shell_for_ai": {
-      "enable": true,
-      "container_name": "ai_shell_container", //容器名称
-      "mount_mapping": ""
-    },
-    "web_search": {
-      "enable": true,                      // 是否启用web搜索功能
-      "base_url": "http://127.0.0.1:8888"  // searxng搜索引擎地址
-    }
-  },
-  "mcp_tools": {
-    "mcpServers": {
-      "context7": { ... },
-      "filesystem": { ... },
-      "playwright": { ... }
-    }
-  }
-}
-```
-
-**获取API密钥的详细说明：**
-
-##### 🔑 DeepSeek API 密钥
-
-1. 访问 [DeepSeek开放平台](https://platform.deepseek.com/)
-2. 注册/登录账号
-3. 进入"API Keys"页面
-4. 点击"创建API密钥"
-5. 复制生成的密钥，填写到 `config.json` 的 `api_key` 字段
-6. 提供商类型填写`deepseek`
-
-> `deepseek-reasoner`模型效果最佳。
-
-> 你也可以使用其他任何兼容OpenAI的厂商的服务，将提供商类型改为`openai`即可。
-
-##### 🌤️ 天气API密钥
-
-项目使用 [小小API](https://xxapi.cn/) 的天气服务：
-
-1. 访问 [小小API文档](https://xxapi.cn/)
-2. 天气接口是免费的，密钥仅供认证
-3. 将密钥填入 `config.json` 的 `tools_api_config.get_weather.api_key` 字段
-
-#### 步骤 4: 部署 SearXNG 搜索引擎（用于web搜索工具）
-
-项目提供了一个web搜索工具，需要部署SearXNG作为搜索引擎后端。
-
-**使用Docker快速部署**
-
-创建searxng的配置目录：
-```bash
-mkdir -p searxng-config
-```
-
-启动searxng容器：
-```bash
-docker run -d --name searxng \
-  -p 8888:8080 \
-  -v "$(pwd)/searxng-config:/etc/searxng" \
-  searxng/searxng:latest
-```
-
-**参数说明：**
-- `-d`: 后台运行
-- `--name searxng`: 容器名称
-- `-p 8888:8080`: 端口映射（主机端口:容器端口）
-- `-v "$(pwd)/searxng-config:/etc/searxng"`: 配置目录映射
-- `searxng/searxng:latest`: 使用的镜像
-
-**重要配置：**
-为了让web_search工具正常工作，需要启用JSON格式输出。编辑searxng配置文件：
-```bash
-# Linux/macOS
-nano searxng-config/settings.yml
-
-# Windows (PowerShell)
-notepad searxng-config/settings.yml
-```
-
-在配置文件中添加或修改以下内容：
-```yaml
-# 启用JSON格式
-formats:
-  - html
-  - json  # 必须添加这一行
-```
-
-启用JSON格式的详细说明见[searxng文档](https://docs.searxng.org/admin/engines/search-formats.html#json)。
-
-重启searxng容器使配置生效：
-```bash
-docker restart searxng
-```
-
-验证searxng运行状态：
-```bash
-# 检查容器状态
-docker ps | grep searxng
-
-# 测试搜索功能（使用JSON格式）
-curl "http://127.0.0.1:8888/search?q=test&format=json"
-```
-
-**更新配置文件**
-
-编辑 `config.json` 文件，启用web搜索工具：
-```json
-{
-  "tools_api_config": {
-    "web_search": {
-      "enable": true,
-      "base_url": "http://127.0.0.1:8888"
-    }
-  }
-}
-```
-
-#### 步骤 5: 启动 Docker 容器（用于shell工具）
-
-项目集成了一个强大的Docker容器shell交互工具，需要先启动一个Docker容器。
-
-创建并启动容器：
-```bash
-docker run -d --name ai_shell_container \
-  ubuntu tail -f /dev/null
-# 可以填写你需要的任何目录映射，记得填入config.json让AI知道
-```
-
-**参数说明：**
-- `-d`: 后台运行
-- `--name ai_shell_container`: 容器名称（必须与 `config.json` 中的一致）
-- `ubuntu`: 使用的镜像
-- `tail -f /dev/null`: 保持容器持续运行
-
-验证容器运行状态：
-```bash
-docker ps
-# 应该能看到名为 ai_shell_container 的容器在运行
-```
-
-#### 步骤 6: 启动项目
-
-运行主程序：
-```bash
-uv run main.py
-```
-
-如果一切正常，你会看到：
-```
-正在加载工具，请稍候...
-（一些log，不用管）
-加载完成！
->
-```
-
-现在你可以开始与沐璃对话了！
-
-### 🔧 内置工具说明
-
-#### Web搜索工具
-
-如果你已经按照步骤4部署了SearXNG并启用了web_search工具，你可以在对话中直接使用网络搜索功能：
-
-**基本用法：**
-```
-> 搜索最新的AI新闻
-> 查找关于量子计算的最新研究
-> 搜索Python 3.13的新特性
-```
-
-**高级用法（指定参数）：**
-```
-> 使用web_search工具搜索，指定最多返回10条结果，使用duckduckgo和wikipedia引擎
-> 搜索关于机器学习的教程，限制返回token数为2000
-```
-
-该工具支持以下参数：
-- `query`: 搜索关键词（必需）
-- `max_results`: 最大返回结果数（默认：5）
-- `engines`: 搜索引擎列表（默认：["google"]）
-- `max_tokens`: 返回结果的最大token数（默认：3000）
-
-#### 双向文件复制工具
-
-项目提供了在主机和Docker容器之间双向复制文件的功能，支持批量复制和精确控制每个文件的目标路径。
-
-**从主机复制到容器:**
-```
-> 将主机的 /tmp/test.txt 复制到容器的 /root/test.txt
-> 批量复制多个文件到容器的不同位置
-```
-
-**从容器复制到主机:**
-```
-> 将容器的 /etc/passwd 复制到主机的 /tmp/container_passwd.txt
-> 批量导出容器日志文件到主机
-```
-
-**工具特点:**
-- 支持批量复制多个文件
-- 每个文件独立指定目标路径（支持重命名）
-- 进度条显示复制状态
-- 支持Linux/macOS/Windows跨平台
-- 自动处理目录创建
-- 保持文件权限（如果可能）
-
-**函数说明:**
-- `copy_files_from_host_to_container(host_file_paths, container_dest_paths)`: 主机→容器
-- `copy_files_from_container_to_host(container_file_paths, host_dest_paths)`: 容器→主机
-
-注意：复制前会自动检查目标文件是否存在，如果存在会询问用户是否覆盖。
-
-#### 时间日期工具
-
-项目提供了全面的时间日期处理功能，包括时区转换、时间计算、格式化、计时器等功能。
-
-**基本时间获取:**
-```
-> 获取当前本地时间
-> 获取纽约的当前时间
-> 获取UTC时间
-```
-
-**时间计算:**
-```
-> 计算3天后的日期时间
-> 计算2小时前的时间
-> 计算时间差
-```
-
-**时区转换:**
-```
-> 将北京时间转换为纽约时间
-> 转换日期时间到不同时区
-```
-
-**计时器和秒表:**
-```
-> 启动一个30分钟的计时器
-> 开始秒表计时
-> 停止秒表并显示经过的时间
-```
-
-**时间格式化:**
-```
-> 将时间格式化为中文格式
-> 将时间格式化为12小时制
-> Unix时间戳转换为日期时间
-```
-
-**提供的函数:**
-- `get_current_time()`: 获取当前本地时间
-- `get_time_with_timezone(timezone)`: 获取指定时区的当前时间
-- `convert_timezone(datetime_str, from_tz, to_tz)`: 时区转换
-- `add_time(datetime_str, days, hours, minutes, seconds)`: 时间加减计算
-- `format_datetime(datetime_str, format_str)`: 时间格式化
-- `timestamp_to_datetime(timestamp)`: 时间戳转日期时间
-- `datetime_to_timestamp(datetime_str)`: 日期时间转时间戳
-- `start_timer(seconds, timer_name)`: 启动倒计时计时器
-- `stop_timer(timer_name)`: 停止计时器
-- `start_stopwatch(stopwatch_name)`: 启动秒表
-- `stop_stopwatch(stopwatch_name)`: 停止秒表并显示时间
-- `get_time_difference(start_time, end_time)`: 计算时间差
-
-**工具特点:**
-- 支持全球时区转换（需安装 pytz 库）
-- 支持多种时间计算和格式化
-- 提供计时器和秒表功能
-- 支持Unix时间戳转换
-- 智能处理日期时间边界（如闰年、月份天数）
-
-#### MCP工具
-
-项目预配置了几个MCP工具，具体配置详见`config.json(.example)`。
-
----
-
-## 🔧 高级调优
-
-### 🛠️ 如何添加自定义 MCP 工具
-
-MCP (Model Context Protocol) 工具通过标准化接口为AI提供扩展功能。添加新的MCP工具非常简单：
-
-#### 步骤 1: 找到MCP工具包
-
-在 [mcp.so](https://mcp.so/) 或搜索引擎搜索你想要使用的mcp，获取配置，标准json格式（或者Claude Desktop格式）。
-
-#### 步骤 2: 安装并配置
-
-以添加 Brave 搜索工具为例：
-
-修改 `config.json`，在 `mcp_tools.mcpServers` 中添加：
-
-```json
-"brave-search": {
-  "command": "npx",
-  "args": [
-    "-y",
-    "@modelcontextprotocol/server-brave"
-  ],
-  "env": {
-    "BRAVE_API_KEY": "your-brave-api-key"
-  }
-}
-```
-
->  这个就是你获取到的json配置。
-
-#### 步骤 3: 重启项目
+## Linux 常驻服务
 
 ```bash
-# 输入/exit退出程序
-uv run main.py # 重启程序
+uv run muli service print
+uv run muli service install
+uv run muli service enable
+uv run muli service start
+uv run muli service status
+journalctl --user -u muli.service -f
 ```
 
-新的工具会自动加载，你可以在对话中直接使用。
+也可在工作台的系统设置中安装、启动、停止、重启和启用登录启动。服务属于当前用户，不需要 root；内存、CPU 和进程数有 systemd 上限。配置修改后重启服务才能应用监听端口变化。
 
-### 🐍 如何添加自定义 Python 工具
+用户服务通常随用户会话启动。需要退出登录后仍保持运行时，可自行按系统策略启用 user lingering；MuLi 不更改系统登录策略。macOS / Windows 可直接运行 `muli serve`，不伪装提供 systemd 或 AT-SPI。
 
-项目支持添加自定义Python工具，工具会自动注册和加载。
+## 权限与资源
 
+所有模型发起的工具调用经过同一个权限门，子 agent 继承模式，不得自行提升。工作目录列表是文件工具的访问范围；yolo 也不会取消配置的预算和工具禁用状态。shell 与桌面操作具有当前用户能力，auto 会交给用户确认；路径范围不是操作系统沙箱。
 
-#### 示例: 添加一个计算器工具
+文件操作默认限于用户主目录，可在设置里修改。文件读取/写入、网页下载、命令输出、工作流节点与并行数均有上限。删除使用回收站，跨文件系统回收拒绝隐式复制大目录。重启后未完成任务标为中断，不盲目重复可能已有副作用的操作。
 
-**步骤 1: 创建工具文件**
+## 进一步阅读
 
-在 `/core/tools/py_tools/` 目录下创建新文件 `calculator.py`：
+- [架构与执行边界](docs/architecture.md)
+- [模型协议与参数](docs/providers.md)
+- [多 agent 工作流](docs/workflows.md)
+- [上下文与长任务](docs/context.md)
+- [个人记忆设计](docs/memory.md)
+- [MCP 扩展](docs/mcp.md)
+- [桌面通知](docs/notifications.md)
+- [chiliarch 接入](docs/chiliarch.md)
+- [工作台交互](docs/frontend.md)
+- [配置、迁移与运维](docs/operations.md)
+- [迭代记录](docs/iterations.md)
+- [版本变更](CHANGELOG.md)
 
-```python
-## -!- START REGISTER TOOL -!- ##
-## -!- START TOOL DEFINITION -!- ##
-TOOL_NAME = "calculator"
-TOOL_DESCRIPTION = "A simple calculator tool that can perform basic arithmetic operations."
-TOOL_FUNCTIONS = ["add", "subtract", "multiply", "divide"]
-TOOL_PARAMETERS = [
-    [{"a": "First number", "b": "Second number"}],
-    [{"a": "First number", "b": "Second number"}],
-    [{"a": "First number", "b": "Second number"}],
-    [{"a": "First number", "b": "Second number"}]
-]
-## -!- END TOOL DEFINITION -!- ##
+## 开发与验证
 
-def add(a: float, b: float) -> float:
-    """Add two numbers."""
-    return a + b
-
-def subtract(a: float, b: float) -> float:
-    """Subtract b from a."""
-    return a - b
-
-def multiply(a: float, b: float) -> float:
-    """Multiply two numbers."""
-    return a * b
-
-def divide(a: float, b: float) -> float:
-    """Divide a by b."""
-    if b == 0:
-        return "Error: Division by zero"
-    return a / b
-
-## -!- END REGISTER TOOL -!- ##
+```bash
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+node --test tests/frontend/*.test.mjs
+uv build
+uv run python scripts/check_wheel.py
 ```
 
-**关键说明**：
-- 工具必须在 `## -!- START REGISTER TOOL -!- ##` 和 `## -!- END REGISTER TOOL -!- ##` 之间
-- `TOOL_NAME`: 工具的唯一名称
-- `TOOL_DESCRIPTION`: 工具的描述，帮助AI理解工具用途
-- `TOOL_FUNCTIONS`: 工具提供的函数列表
-- `TOOL_PARAMETERS`: 每个函数的参数列表（列表的列表）
+测试使用临时目录、模拟 HTTP/SSE 与假模型，不使用真实模型额度、不点击真实桌面。CI 在 Linux、macOS、Windows 与 Python 3.12/3.13 上验证核心；操作系统特有测试按能力跳过。
 
-**步骤 2: 无需额外配置**
+协议测试通过不代表特定供应商已联调；AT-SPI 能否读取某个应用取决于桌面会话和应用的无障碍支持。参见各模块文档中的已验证边界。
 
-Python工具会自动扫描并加载，无需修改配置文件。
-
-**步骤 3: 测试工具**
-
-启动项目后，尝试输入：
-```
-> 使用计算器工具计算 123 乘以 456 的结果
-```
-
-
-### ⚙️ 配置文件参数调优
-
-#### 调整上下文限制
-
-在 `config.json` 中：
-
-```json
-{
-  "model_config": {
-    "max_context_tokens": 65536  // 默认值为65536
-  }
-}
-```
-
-这个值控制对话历史的长度，超过后会触发自动摘要。
-
----
-
-## 📚 项目详解
-
-### 🏗️ 架构设计
-
-```mermaid
-graph TD
-    %% 节点定义
-    Main[main.py<br>程序入口点]
-    沐璃[core/agents/MuLi.py<br>核心AI代理 - 会话管理]
-    LLM[llms/AIModel.py<br>LLM抽象层]
-    Config[config_manage/manager.py<br>配置管理]
-
-    %% 工具系统子图
-    subgraph ToolsSystem [core/tools/ 工具系统]
-        direction TB
-        MCP[mcp_tools/]
-        PyTools[py_tools/]
-    end
-
-    %% 连接关系
-    Main --> 沐璃
-    沐璃 --> LLM
-    沐璃 --> Config
-    LLM --> ToolsSystem
-
-    %% 简单的配色 (可选)
-    style Main fill:#e1f5fe,stroke:#01579b
-    style 沐璃 fill:#fff9c4,stroke:#fbc02d
-    style ToolsSystem fill:#f3e5f5,stroke:#7b1fa2,stroke-dasharray: 5 5
-```
-
-支持的LLM提供商: DeepSeek、OpenAI（以及任何兼容厂商）
-
-工具类型:
-1. MCP工具 - 通过FastMCP集成
-如：
-   - context7、filesystem、playwright...
-
-2. Python工具 - 自定义开发
-如：
-   - get_weather (天气查询)
-   - shell_for_ai (Docker容器交互)
-   - web_search (调用搜索引擎进行搜索)
-   - file_copy_container (双向文件复制)
-   - time (时间日期处理：时区转换、计时器、时间计算)
-   - ...
-```
-
-### 🗂️ 核心模块说明
-
-#### 1. main.py - 程序入口
-
-```python
-from rich.console import Console
-console = Console()
-
-async def main():
-    ml = MuLi(console=console)
-
-    async with mcp_client:  # 使用持久的MCP客户端
-        while True:
-            user_input = await asyncio.to_thread(input, "> ")
-            response = await ml.chat(user_input)
-            console.print(Markdown(response))
-```
-
-**关键特性**:
-- 异步主循环，支持后台任务（MCP心跳）
-- Rich终端美化输出
-- Markdown渲染支持
-
-#### 2. core/agents/MuLi.py - 核心AI代理
-
-**主要功能**:
-- 会话历史管理（保存到 `history/dialog.json`）
-- Token计数和上下文压缩
-- 历史记录恢复和回放
-- 工具调用协调
-
-**关键代码**:
-```python
-class MuLi:
-    def __init__(self, console):
-        self.config = ConfigManager("config.json")
-        self.max_context_tokens = self.config.get("model_config.max_context_tokens", 8000)
-        self.ai = AIModel(...)  # 初始化LLM
-        self._restore_session()  # 恢复历史会话
-
-    def _restore_session(self):
-        """从dialog.json恢复会话历史"""
-        session_file = "history/dialog.json"
-        if os.path.exists(session_file):
-            with open(session_file, "r") as f:
-                messages = json.load(f)
-            self.ai.messages = messages
-```
-
-#### 3. core/tools/py_tools/ - Python工具系统
-
-工具自动注册机制：
-```python
-## -!- START REGISTER TOOL -!- ##
-## -!- START TOOL DEFINITION -!- ##
-TOOL_NAME = "tool_name"
-TOOL_DESCRIPTION = "工具描述"
-TOOL_FUNCTIONS = ["func1", "func2"]
-TOOL_PARAMETERS = [[{"param": "description"}]]
-## -!- END TOOL DEFINITION -!- ##
-
-# 工具函数实现
-
-def func1(param: type) -> return_type:
-    """函数说明"""
-    pass
-
-## -!- END REGISTER TOOL -!- ##
-```
-
-工具加载器扫描所有 `.py` 文件，自动提取并注册工具。
-
-#### 4. core/tools/py_tools/shell_for_ai.py - Docker容器交互
-
-这是项目中最复杂的工具，提供了完整的容器交互能力：
-
-**核心功能**:
-- 基于PTY的交互式shell
-- 非阻塞I/O和实时输出
-- 端口转发管理（TCP代理）
-- 特殊按键支持（Ctrl+C、Enter等）
-
-**使用示例**:
-```python
-# 发送命令到容器
-send_shell_input(input_text="python3")
-send_shell_input(key_combo="Enter")
-
-# 获取输出
-output = get_shell_output(timeout_seconds=2)
-
-# 暴露容器端口
-expose_container_port(container_port=8000, host_port=8080)
-
-# 查看已暴露的端口
-list_exposed_ports()
-```
-
-#### 5. core/tools/mcp_tools/ - MCP工具管理
-
-FastMCP客户端封装：
-```python
-class MCPTools:
-    async def __aenter__(self):
-        config = ConfigManager("config.json").get("mcp_tools")
-        self.client = Client(config, timeout=20)
-        await self.client.__aenter__()
-        return self
-```
-
-**特点**:
-- 持久化连接（`async with` 上下文管理）
-- 工具格式转换（FastMCP -> OpenAI格式）
-- 错误处理和重连机制
-
-#### 6. llms/AIModel.py - LLM抽象层
-
-统一的LLM接口设计：
-```python
-class AIModel:
-    def __init__(self, api_key, base_url, model_name,
-                 provider_type, system_prompt, tools=None):
-        self.provider = self._create_provider(
-            provider_type, api_key, base_url, model_name
-        )
-
-    def _create_provider(self, provider_type, ...):
-        if provider_type == "openai":
-            return OpenAIProvider(...)
-        elif provider_type == "deepseek":
-            return DeepSeekProvider(...)
-```
-
-**支持的提供商**:
-- `openai`: OpenAI GPT系列
-- `deepseek`: DeepSeek系列（推荐，价格便宜）
-
-#### 7. config_manage/manager.py - 配置管理
-
-支持点号路径访问配置：
-```python
-config = ConfigManager("config.json")
-api_key = config.get("model_config.main_model.api_key")
-```
-
-自动检测文件编码，支持多种格式（JSON、YAML）。
-
-### 🔍 关键技术细节
-
-#### Token计数与上下文压缩
-
-```python
-import tiktoken
-
-def count_tokens(text: str) -> int:
-    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-    return len(encoding.encode(text))
-```
-
-当token数超过 `max_context_tokens` 时，会触发摘要生成：
-```python
-if current_tokens > max_context_tokens:
-    summary = await self.ai.generate_summary()
-    self.ai.messages = [system_message, summary, recent_messages]
-```
-
-#### 异步设计
-
-- 使用 `asyncio.to_thread()` 将阻塞的 `input()` 移到线程池
-- MCP客户端保持异步心跳
-- 工具调用采用 `async/await` 模式
-
-#### 会话持久化
-
-会话历史保存在 `/history/dialog.json`：
-```json
-[
-  {"role": "user", "content": "你好"},
-  {"role": "assistant", "content": "你好！有什么可以帮助你的吗？"}
-]
-```
-
-日志系统（DisplayLogger）支持多种内容类型：
-- text/markdown
-- text/plain
-- tool_use
-- tool_response
-
----
-
-## ⭐ Star
-
-如果这个项目对你有帮助，请给我们一个Star！你的支持是我们持续改进的动力！
-
-> **GitHub 仓库**: [沐璃 - A high-performance agent framework with high customizability and simplicity.](https://github.com/69gg/MuLi)
-
-### Star之后还可以：
-
-1. **Fork项目**: 创建你自己的分支
-2. **提交Issue**: 报告Bug或提出新功能建议
-3. **提交PR**: 贡献代码，共同改进项目
-4. **分享项目**: 告诉更多人这个有用的工具
-
----
-
-<div align="center">
-
-**💝 感谢您的关注和支持！**
-
-如有问题，请提交 [Issue](https://github.com/69gg/MuLi/issues) 或联系我（QQ: 1708213363）。
-
-</div>
+旧版源代码保存在 Git 历史基线 `6e22bf3`。旧 `config.json`、历史数据及本地环境不会被启动程序自动覆盖。

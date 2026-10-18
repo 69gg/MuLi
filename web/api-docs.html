@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>API 参考 · 沐璃</title>
+  <link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/api-docs.mjs"></script>
+</head>
+<body>
+  <header class="api-header"><a class="api-brand" href="/">沐璃 <span>MuLi</span></a><a class="text-button" href="/">返回工作台</a></header>
+  <main class="api-reference">
+    <div class="api-title"><div><h1>API 参考</h1><p id="api-meta">正在读取接口描述…</p></div><a class="secondary-button export-button" href="/api/openapi.json">OpenAPI JSON</a></div>
+    <label class="api-search field"><span>检索接口</span><input id="api-search" type="search" placeholder="输入方法、路径或关键词" autocomplete="off" disabled></label>
+    <p id="api-feedback" class="settings-role-hint" role="status"></p>
+    <div id="api-error" hidden><p class="form-error" role="alert"></p><button id="api-retry" class="secondary-button" type="button">重试</button></div>
+    <section class="api-endpoints" aria-label="接口列表" id="api-endpoints"></section>
+    <section class="api-schemas" id="api-schemas" aria-labelledby="api-schemas-title" hidden><h2 id="api-schemas-title">数据结构</h2><div id="api-schema-list"></div></section>
+  </main>
+</body>
+</html>

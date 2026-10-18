@@ -1,63 +1,111 @@
 {
-    # 模型配置部分
-    "model_config": {
-        "max_context_tokens": 8000, # 最大上下文token数，超过将触发自动压缩
-        # 主模型：用于主要的对话、逻辑推理和任务执行
-        "main_model": {
-            "model_name": "",       # 模型名称
-            "provider_type": "",    # 提供商类型
-            "api_key": "",          # 对应的 API 密钥
-            "api_base_url": ""      # API 基础地址
-        },
-        # JSON 专用模型：用于需要严格 JSON 格式输出的任务
-        "json_model": {
-            "model_name": "",       # 模型名称
-            "provider_type": "",    # 提供商类型
-            "api_key": "",          # API 密钥
-            "api_base_url": ""      # API 基础地址
-        }
+  "models": {
+    "main": {
+      "protocol": "openai_chat",
+      "model": "",
+      "base_url": "",
+      "api_key": "",
+      "api_key_env": "",
+      "max_output_tokens": 4096,
+      "timeout": 60,
+      "max_retries": 2,
+      "stream": true,
+      "max_response_bytes": 8388608,
+      "retry_backoff": 0.5,
+      "temperature": null,
+      "top_p": null,
+      "reasoning": {},
+      "extra_body": {},
+      "extra_headers": {}
     },
-    
-    # 常规工具 API 配置
-    "tools_api_config": {
-        "get_weather": {
-            "api_key": ""           # 天气查询服务的 API Key，请前往xxapi.cn获取（免费）
-        },
-        "shell_for_ai": {
-            "enable": false,      # 使用docker给模型提供私有主机，需要安装docker并自己部署容器
-            "container_name": "ai_shell_container", # Docker容器名称
-            "mount_mapping": ""   # 宿主机:容器 映射目录，用于提示AI。例如 "/data/MuLi:/workspace"
-        },
-        "web_search": {
-            "enable": false,       # 是否启用网络搜索
-            "base_url": "http://127.0.0.1:8888"  # searxng部署地址
-        },
+    "reviewer": {
+      "protocol": "openai_chat",
+      "model": "",
+      "base_url": "",
+      "api_key": "",
+      "api_key_env": "",
+      "max_output_tokens": 4096,
+      "timeout": 60,
+      "max_retries": 2,
+      "stream": true,
+      "max_response_bytes": 8388608,
+      "retry_backoff": 0.5,
+      "temperature": null,
+      "top_p": null,
+      "reasoning": {},
+      "extra_body": {},
+      "extra_headers": {}
     },
-    
-    # MCP (Model Context Protocol) 工具配置
-    # 用于连接本地或远程的 MCP 服务器，扩展模型能力
-    # 可以配置多个 使用官方json格式
-    "mcp_tools": { 
-        # 此处添加了推荐使用的mcp 需要安装npm与uv
-        "mcpServers": {
-            "filesystem": {
-                "command": "npx",
-                "args": [
-                    "-y",
-                    "@modelcontextprotocol/server-filesystem",
-                    "/path/to/other/allowed/dir"  # 这里可以填写多个你想让AI访问的路径
-                ]
-            },
-            "playwright": {
-                "command": "npx",
-                "args": [
-                    "@playwright/mcp@latest"
-                ]
-            },
-            "fetch": {
-                "command": "uvx",
-                "args": ["mcp-server-fetch"]
-            }
-        }
+    "worker": {
+      "protocol": "openai_chat",
+      "model": "",
+      "base_url": "",
+      "api_key": "",
+      "api_key_env": "",
+      "max_output_tokens": 4096,
+      "timeout": 60,
+      "max_retries": 2,
+      "stream": true,
+      "max_response_bytes": 8388608,
+      "retry_backoff": 0.5,
+      "temperature": null,
+      "top_p": null,
+      "reasoning": {},
+      "extra_body": {},
+      "extra_headers": {}
     }
+  },
+  "default_mode": "auto",
+  "workspace_roots": [
+    "~"
+  ],
+  "search": {
+    "provider": "searxng",
+    "base_url": "",
+    "api_key": "",
+    "api_key_env": "",
+    "max_results": 5
+  },
+  "computer": {
+    "enabled": false,
+    "backend": "atspi",
+    "python_path": "/usr/bin/python3",
+    "max_nodes": 300
+  },
+  "chiliarch": {
+    "enabled": false,
+    "base_url": "",
+    "credential": "",
+    "agent_id": "",
+    "name": "MuLi",
+    "machine": "",
+    "max_queued_tasks": 100
+  },
+  "notifications": {
+    "enabled": false,
+    "timeout": 5,
+    "max_queue": 32,
+    "expire_ms": 8000
+  },
+  "limits": {
+    "max_parallel_agents": 2,
+    "max_pending_runs": 8,
+    "max_tool_steps": 16,
+    "max_run_seconds": 600,
+    "max_file_bytes": 2000000,
+    "max_output_chars": 24000,
+    "max_context_chars": 96000,
+    "max_workflow_steps": 12,
+    "approval_timeout": 600,
+    "max_search_entries": 2000,
+    "max_search_results": 100,
+    "max_search_depth": 16,
+    "max_search_seconds": 10
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "disabled_tools": [],
+  "mcp": {}
 }

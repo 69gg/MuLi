@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#e8f1f4">
+  <meta name="color-scheme" content="light">
+  <title>沐璃 · 工作台</title>
+  <link rel="icon" href="./assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#message-input">跳到输入框</a>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="主导航">
+      <a class="brand" href="./" aria-label="沐璃工作台">
+        <img src="./assets/mark.svg" alt="" width="35" height="35">
+        <span class="brand-name">沐璃<span class="brand-roman">MuLi</span></span>
+      </a>
+      <button class="new-session" type="button" data-action="new-session"><span data-icon="plus"></span>新会话<span class="key-hint">⌘ K</span></button>
+      <nav class="primary-nav" aria-label="工作区">
+        <button class="nav-item active" type="button" data-view="chat"><span data-icon="chat"></span>会话</button>
+        <button class="nav-item" type="button" data-view="workflows"><span data-icon="workflow"></span>工作流</button>
+        <button class="nav-item" type="button" data-view="memories"><span data-icon="memory"></span>记忆</button>
+        <button class="nav-item" type="button" data-view="notifications"><span data-icon="inbox"></span>通知<span id="notification-count" class="nav-count" hidden></span></button>
+      </nav>
+      <div class="session-section">
+        <div class="section-label"><span>最近会话</span><button class="icon-button" type="button" data-action="toggle-session-search" aria-label="搜索会话"><span data-icon="search"></span></button></div>
+        <input id="session-search" class="sidebar-search" type="search" placeholder="搜索会话" aria-label="搜索会话" hidden>
+        <div id="session-list" class="session-list"><p class="sidebar-empty">正在读取会话…</p></div>
+      </div>
+      <div class="sidebar-bottom">
+        <button class="nav-item" type="button" data-view="settings"><span data-icon="settings"></span>设置<span id="settings-attention" class="attention-dot" hidden></span></button>
+        <div class="connection-summary"><span id="connection-dot" class="status-dot"></span><span id="connection-label">连接工作台…</span><button class="icon-button" type="button" data-action="refresh" aria-label="重新连接"><span data-icon="refresh"></span></button></div>
+      </div>
+    </aside>
+    <button id="sidebar-backdrop" class="sidebar-backdrop" type="button" aria-label="关闭导航" hidden></button>
+    <main class="main-workspace" id="main-workspace">
+      <header class="topbar">
+        <div class="breadcrumbs"><button class="icon-button mobile-menu" type="button" data-action="toggle-sidebar" aria-label="打开导航"><span data-icon="menu"></span></button><span class="breadcrumb-root">工作台</span><span class="breadcrumb-divider">/</span><h1 id="page-title">新会话</h1><button id="rename-session" class="icon-button rename-session" type="button" data-action="rename-session" aria-label="重命名会话" hidden><span data-icon="edit"></span></button></div>
+        <div class="topbar-actions"><button class="model-indicator" type="button" data-action="model-settings"><span class="status-dot" id="model-dot"></span><span id="model-label">读取模型…</span><span data-icon="chevron-down"></span></button><span class="toolbar-divider"></span><button id="timeline-toggle" class="icon-button" type="button" data-action="toggle-timeline" aria-label="显示运行轨迹" aria-pressed="false"><span data-icon="panel"></span></button></div>
+      </header>
+      <div id="connection-banner" class="connection-banner" role="status" hidden><span data-icon="info"></span><span id="connection-banner-text"></span><button class="text-button" type="button" data-action="refresh">重试</button></div>
+      <div class="workspace-body">
+        <section class="primary-workspace">
+          <div id="chat-view" class="chat-view">
+            <div id="conversation-scroll" class="conversation-scroll">
+              <div id="welcome" class="welcome">
+                <div class="welcome-copy"><span class="welcome-eyebrow">MuLi · 沐璃</span><h2>有什么需要<br>一起完成？</h2><p>把想法写下来，从这里开始。</p><div class="starter-prompts"><button type="button" data-prompt="先了解当前项目，整理结构与关键模块。"><span data-icon="folder"></span>了解项目</button><button type="button" data-prompt="帮我排查一个问题："><span data-icon="terminal"></span>排查问题</button><button type="button" data-prompt="和我一起制定实施计划："><span data-icon="sparkles"></span>规划任务</button></div></div>
+                <div class="welcome-art" aria-hidden="true"><img src="./assets/standby.webp" alt="" fetchpriority="high"></div>
+              </div>
+              <div id="messages" class="messages" aria-live="off"></div>
+              <div id="reasoning-region" class="reasoning-region" hidden></div>
+              <div id="approval-region" class="approval-region" aria-live="polite"></div>
+              <div id="run-status" class="run-status" role="status" hidden></div>
+            </div>
+            <button id="scroll-bottom" class="scroll-bottom icon-button" type="button" data-action="scroll-bottom" aria-label="回到最新消息" hidden><span data-icon="arrow-down"></span></button>
+            <div class="composer-area">
+              <form id="composer" class="composer">
+                <label class="sr-only" for="message-input">消息</label><textarea id="message-input" name="message" rows="1" placeholder="描述任务，或继续这段对话…" maxlength="64000" autofocus></textarea>
+                <div class="composer-toolbar"><div class="composer-options"><span data-icon="sliders"></span><label class="sr-only" for="mode-select">执行模式</label><select id="mode-select" aria-label="执行模式"><option value="ask">Ask · 逐次审批</option><option value="auto">Auto · 自动判断</option><option value="yolo">Yolo · 直接执行</option></select><span id="composer-context" class="composer-context">新会话</span></div><button id="stop-button" class="send-button stop-button" type="button" data-action="stop" aria-label="停止任务" hidden><span data-icon="stop"></span></button><button id="send-button" class="send-button" type="submit" aria-label="发送消息" disabled><span data-icon="arrow-up"></span></button></div>
+              </form>
+              <div class="composer-footnote"><span id="composer-status">正在连接工作台</span><span class="keyboard-hint">Enter 发送<span>·</span>Shift + Enter 换行</span></div>
+            </div>
+          </div>
+          <div id="other-view" class="other-view" hidden></div>
+        </section>
+        <aside id="timeline" class="timeline-panel" aria-label="运行轨迹" hidden><div class="inspector-heading"><h2>运行轨迹</h2><button class="icon-button" type="button" data-action="toggle-timeline" aria-label="关闭运行轨迹"><span data-icon="close"></span></button></div><div id="timeline-summary" class="timeline-summary"></div><div id="tool-timeline" class="tool-timeline"></div><div id="timeline-footer" class="timeline-footer"></div></aside>
+      </div>
+    </main>
+  </div>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <dialog id="app-dialog" class="app-dialog"><form id="dialog-form"><div class="dialog-heading"><h2 id="dialog-title"></h2><button class="icon-button" type="button" data-action="close-dialog" aria-label="关闭"><span data-icon="close"></span></button></div><div id="dialog-content" class="dialog-content"></div><p id="dialog-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button id="dialog-submit" class="primary-button" type="submit">保存</button></div></form></dialog>
+</body>
+</html>

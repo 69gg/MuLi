@@ -1,0 +1,80 @@
+"""Install the built wheel offline and check it outside the source checkout."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+async def check_installed(target: Path) -> None:
+    import httpx
+
+    import muli
+    from muli.config import ConfigFile
+    from muli.server import create_app
+
+    assert Path(muli.__file__).resolve().is_relative_to(target.resolve()), muli.__file__
+    with tempfile.TemporaryDirectory(prefix="muli-wheel-data-") as directory:
+        root = Path(directory)
+        app = create_app(ConfigFile(root / "config.json"), root / "data")
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app), base_url="http://localhost:8765"
+            ) as client:
+                for path in ("/", "/app.mjs", "/assets/standby.webp", "/api/docs", "/api-docs.mjs"):
+                    assert (await client.get(path)).status_code == 200, path
+                state = (await client.get("/api/status")).json()
+                assert state["version"] == muli.__version__
+                assert state["configured"] is False
+                assert app.state.runtime._history("new")[0].content
+    print("Installed wheel: import, static assets, API docs, prompts and lifespan passed")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--installed", type=Path)
+    args = parser.parse_args()
+    if args.installed:
+        asyncio.run(check_installed(args.installed))
+        return
+    wheels = list(Path("dist").glob("*.whl"))
+    if len(wheels) != 1:
+        parser.error("dist must contain exactly one freshly built wheel")
+    with tempfile.TemporaryDirectory(prefix="muli-wheel-smoke-") as directory:
+        target = Path(directory) / "site"
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--offline",
+                "--no-deps",
+                "--link-mode=copy",
+                "--target",
+                str(target),
+                str(wheels[0].resolve()),
+            ],
+            check=True,
+        )
+        environment = dict(os.environ, PYTHONPATH=str(target))
+        subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--installed", str(target)],
+            cwd=directory,
+            env=environment,
+            check=True,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "muli", "--version"],
+            cwd=directory,
+            env=environment,
+            check=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
