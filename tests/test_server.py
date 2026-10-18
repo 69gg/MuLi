@@ -44,14 +44,15 @@ async def test_secret_roundtrip_is_redacted_and_preserved(client: httpx.AsyncCli
                     "model": "test",
                     "base_url": "https://unused.invalid/v1",
                     "api_key": "not-a-real-key",
-                    "extra_headers": {"X-Secret": "private"},
+                    "extra_headers": {"X-Secret": "sensitive-header-token-fixture"},
                 }
             }
         },
     )
     assert response.status_code == 200
     assert "not-a-real-key" not in response.text
-    assert "private" not in response.text
+    assert "sensitive-header-token-fixture" not in response.text
+    assert response.json()["models"]["main"]["extra_headers"] == {"X-Secret": "••••"}
     assert response.json()["models"]["main"]["api_key_set"] is True
     await client.patch("/api/settings", json={"models": {"main": {"api_key": ""}}})
     assert (await client.get("/api/settings")).json()["models"]["main"]["api_key_set"] is True

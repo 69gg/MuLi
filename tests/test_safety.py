@@ -372,7 +372,7 @@ async def test_process_separate_stderr_preserves_json_and_common_limit() -> None
         limit=100,
     )
     assert json.loads(result["output"]) == {"nodes": []}
-    assert result["stderr"] == "warning\n"
+    assert result["stderr"] == f"warning{os.linesep}"
     with pytest.raises(ValueError, match="输出超过"):
         await run_process(
             [sys.executable, "-c", "import sys; print('o'*60); print('e'*60, file=sys.stderr)"],

@@ -378,10 +378,13 @@ async def test_queue_limit_rejects_before_storing_user_input(tmp_path: Path) -> 
         await runtime.close()
 
 
-async def test_large_tool_result_is_packed_without_changing_the_journal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+async def test_large_tool_result_is_packed_without_changing_the_journal(
+    tmp_path: Path, newline: str
+) -> None:
     path = tmp_path / "long.txt"
-    original = "first-evidence\n" + "中" * 6000 + "\nlast-evidence"
-    path.write_text(original, encoding="utf-8")
+    original = "first-evidence" + newline + "中" * 6000 + newline + "last-evidence"
+    path.write_bytes(original.encode("utf-8"))
     runtime, seen = make_runtime(
         tmp_path,
         [
