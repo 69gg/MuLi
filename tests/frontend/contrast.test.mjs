@@ -19,6 +19,7 @@ test("body, hints, placeholders and button text retain WCAG AA contrast", () => 
   for (const foreground of ["danger", "success"]) assert.ok(contrast(tokens[foreground], tokens.canvas) >= 4.5);
   assert.ok(contrast("#f2f8fa", tokens.accent) >= 4.5);
   assert.ok(contrast(tokens.muted, "#e6f0f4") >= 4.5);
+  assert.ok(contrast(tokens["accent-dark"], "#aac9d5") >= 4.5);
   for (const selector of [".composer textarea::placeholder", ".secondary-button", ".row-content p", ".field small", ".composer-footnote"]) {
     const rule = css.slice(css.indexOf(`${selector} {`)).split("}", 1)[0];
     assert.match(rule, /color:\s*var\(--muted\)/, `${selector} should use the readable text token`);
