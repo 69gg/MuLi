@@ -5,29 +5,86 @@ from pathlib import Path
 
 import pytest
 
+import muli.reminders as reminders
 from muli.events import EventBus
 from muli.reminders import Reminders
 from muli.store import Store, now
 
 
+class ObservedEvent(asyncio.Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: asyncio.Queue[None] = asyncio.Queue()
+
+    async def wait(self) -> bool:
+        self.waits.put_nowait(None)
+        return await super().wait()
+
+
 async def test_reminder_fires_once_and_survives_restart(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.db")
-    engine = Reminders(store, EventBus(store))
+    bus = EventBus(store)
+    engine = Reminders(store, bus)
     item = engine.create("稍后提醒", now() + 0.02)
     await engine.start()
-    for _ in range(50):
-        if store.list("notification"):
-            break
-        await asyncio.sleep(0.005)
-    await engine.close()
+    try:
+        # Short sleeps may wake early on coarse clocks. Wait for the observable result;
+        # the timeout only detects a stalled scheduler, not how many sleeps have elapsed.
+        async with asyncio.timeout(2), bus.changed:
+            await bus.changed.wait_for(lambda: bool(store.list("notification")))
+    finally:
+        await engine.close()
     assert len(store.list("notification")) == 1
+    assert store.list("notification")[0]["created_at"] >= item["due_at"]
     assert not store.get("reminder", item["id"])["enabled"]
-    second = Reminders(store, EventBus(store))
-    await second.start()
-    await asyncio.sleep(0)
-    await second.close()
-    assert len(store.list("notification")) == 1
+    assert store.get("reminder", item["id"])["fired_count"] == 1
     store.close()
+
+    store = Store(tmp_path / "state.db")
+    second = Reminders(store, EventBus(store))
+    idle = ObservedEvent()
+    second.changed = idle
+    await second.start()
+    try:
+        async with asyncio.timeout(2):
+            await idle.waits.get()
+        assert len(store.list("notification")) == 1
+        assert store.get("reminder", item["id"])["fired_count"] == 1
+    finally:
+        await second.close()
+        store.close()
+
+
+async def test_early_wakeups_and_clock_rollback_do_not_fire_before_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamp = now()
+    monkeypatch.setattr(reminders, "now", lambda: timestamp)
+    store = Store(tmp_path / "state.db")
+    bus = EventBus(store)
+    engine = Reminders(store, bus)
+    changed = ObservedEvent()
+    engine.changed = changed
+    item = engine.create("按到期时间提醒", timestamp + 60)
+    await engine.start()
+    try:
+        async with asyncio.timeout(2):
+            await changed.waits.get()
+            for offset in (-30, -90, -1):
+                timestamp = item["due_at"] + offset
+                engine.changed.set()
+                await changed.waits.get()
+                assert not store.list("notification")
+            timestamp = item["due_at"]
+            engine.changed.set()
+            async with bus.changed:
+                await bus.changed.wait_for(lambda: bool(store.list("notification")))
+        notices = store.list("notification")
+        assert len(notices) == 1
+        assert notices[0]["created_at"] == item["due_at"]
+    finally:
+        await engine.close()
+        store.close()
 
 
 async def test_missed_recurrences_coalesce_without_storm(tmp_path: Path) -> None:
