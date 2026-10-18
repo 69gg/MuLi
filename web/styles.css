@@ -59,7 +59,7 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .nav-item:hover { background: #d3e4eb; color: var(--text-strong); }
 .nav-item.active { color: var(--accent-dark); background: var(--selected); font-weight: 550; }
 .nav-item.active svg { color: var(--muted); }
-.nav-count { margin-left: auto; font-size: 10px; min-width: 18px; text-align: center; background: #aac9d5; color: #315a6b; padding: 1px 5px; border-radius: 6px; }
+.nav-count { margin-left: auto; font-size: 10px; min-width: 18px; text-align: center; background: #aac9d5; color: var(--accent-dark); padding: 1px 5px; border-radius: 6px; }
 .session-section { margin-top: 36px; display: flex; flex-direction: column; min-height: 80px; flex: 1; }
 .section-label { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11px; padding-left: 12px; margin-bottom: 6px; }
 .section-label .icon-button { width: 28px; height: 28px; color: var(--muted); }
