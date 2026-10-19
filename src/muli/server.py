@@ -820,6 +820,24 @@ def create_app(
             "runs": runs,
         }
 
+    @app.get("/api/workflow-runs/active")
+    async def active_workflow_runs(
+        after_id: Annotated[str, Query(max_length=200)] = "",
+        limit: Annotated[int, Query(ge=1, le=50)] = 50,
+    ) -> dict[str, Any]:
+        identifiers = runtime.workflows.unfinished_run_ids(after_id=after_id, limit=limit + 1)
+        has_more = len(identifiers) > limit
+        items = [
+            item
+            for identifier in identifiers[:limit]
+            if (item := runtime.store.workflow_run_summary(identifier)) is not None
+        ]
+        return {
+            "items": items,
+            "next_after": identifiers[limit - 1] if has_more else None,
+            "has_more": has_more,
+        }
+
     @app.post("/api/workflows")
     async def create_workflow(body: WorkflowInput) -> dict[str, Any]:
         return runtime.workflows.create(
@@ -838,10 +856,7 @@ def create_app(
 
     @app.delete("/api/workflows/{identifier}")
     async def delete_workflow(identifier: str) -> dict[str, bool]:
-        if any(
-            run.get("workflow_id") == identifier and run.get("status") in {"queued", "running"}
-            for run in runtime.store.list("workflow_run")
-        ):
+        if runtime.workflows.has_unfinished(identifier):
             raise HTTPException(409, "工作流仍在运行")
         return {"deleted": runtime.store.delete("workflow", identifier)}
 

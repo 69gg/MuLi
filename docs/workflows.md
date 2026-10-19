@@ -90,4 +90,18 @@
 
 服务重启时，残留的 queued/running 运行和未完成节点标记 `interrupted`，对应会话回到 idle；已完成输出保留。不会自动重跑工作流，避免重复写文件、执行命令或调用外部工具。
 
+恢复与父运行收尾先按真实状态或精确 `parent_run_id` 筛选，再按稳定 ID 分页，不能把最近历史列表当成活动全集。恢复覆盖 `session/run/approval/workflow_run` 的 `pending/queued/running`，会话回到 idle，其余标记 interrupted；paused 与已终态记录保留。分页不使用会被恢复更新的 updated 或 OFFSET。父完成逐个等待同一次父 run 的全部子工作流并核对结果；停止只取消原父 run 下尚未完成的子工作，不扩大到同一会话后续运行。
+
+内部候选页只从 SQLite 投影 ID，再按需读取单个记录；未完成对象部分索引与父运行索引避免反复解析无关历史。首次创建索引仍需 SQLite 扫描已有对象一次，不隐瞒迁移成本；不会删历史、重新提炼、启动模型或新增后台轮询。
+
+## 活动运行管理
+
+工作流页将全局进行中的执行与最近定义/历史分开。同一定义可以同时运行多次，每个活动行显示独立完整 run ID，并调用现有 `POST /api/workflow-runs/{id}/cancel` 精确取消；历史结果不会遮住另一项仍运行的任务，旧定义不在最近列表中也能从活动入口找到执行。
+
+`GET /api/workflow-runs/active?after_id=&limit=50` 先筛选 `pending/queued/running`，再按 ID 升序分页。`limit` 为 1–50，响应为 `items/next_after/has_more`；每条仅包含 `id/workflow_id/name/status/created_at/updated_at`，不附带节点提示、结果或正文。旧记录缺失时间时返回 null。仍有下一页时 `next_after` 是本页末条的完整 ID，否则为 null；当前 anchor 已结束或删除也可以继续读取。
+
+ID 游标是位置，不是快照、已读回执或活动总数。新运行可能排在旧游标前，显式刷新或收到工作流更新事件后从首页重新核对，不自动连续请求所有页。读取失败明确展示错误，不把失败当作空闲；本地点击取消也不能先于真实返回将运行标记完成。`GET /api/workflows` 保持最近定义和历史的兼容合同，这个旧列表不再作为活动判断依据。
+
+`DELETE /api/workflows/{id}` 直接检查整个定义范围的未完成存在性，有任何 pending/queued/running 都返回 409；停止和删除是不同操作，删除不会暗中停止执行。终态运行历史继续保留。接口复用已有登录、同源防护和不缓存响应，参数错误返回 422。
+
 `tests/test_workflows.py` 使用临时 SQLite 和模拟回调验证 DAG、独立评审、共享并发、未完成运行数量限制与名额释放、失败传播、取消（包括首次调度前取消）、总时限、输出预算及重启恢复，不调用真实模型或外部工具。
