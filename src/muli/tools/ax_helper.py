@@ -493,6 +493,7 @@ class Observation:
     records: list[dict[str, Any]] = field(default_factory=list)
     omissions: dict[str, int | None] = field(default_factory=dict)
     seen: dict[int, list[int]] = field(default_factory=dict)
+    known_protected: set[int] = field(default_factory=set)
 
     def omit(self, reason: str, count: int | None = None) -> None:
         previous = self.omissions.get(reason, 0)
@@ -585,6 +586,10 @@ class Session:
             if isinstance(subrole, str) and subrole and subrole != "AXUnknown"
             else None
         )
+        if observation is not None and protected is True:
+            # Later metadata failures must not discard a proven protection
+            # boundary. Traversal owns these pointers until observation ends.
+            observation.known_protected.add(pointer)
         text = role in TEXT_ROLES
         safe = protected is not True and (role in ACTION_ROLES or (text and protected is False))
         name = (
@@ -724,7 +729,7 @@ class Session:
                         observation.omit(
                             "output_budget" if exc.code == "output_budget" else "provider_error"
                         )
-                    if record and record["protected"] is True:
+                    if pointer in observation.known_protected:
                         observation.omit(
                             "provider_error"
                         )  # Protected descendants are intentionally unread.
