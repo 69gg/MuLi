@@ -313,6 +313,17 @@ class CaptureSettings(Section):
     max_total_bytes: int = Field(default=200 * 1024 * 1024, ge=1024)
 
 
+class WebVoiceSettings(Section):
+    model_config = ConfigDict(strict=True)
+
+    enabled: bool = False
+    max_seconds: int = Field(default=60, ge=1, le=300)
+    max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1024, le=32 * 1024 * 1024)
+    max_concurrent: int = Field(default=1, ge=1, le=4)
+    timeout: float = Field(default=60, gt=0, le=300, allow_inf_nan=False)
+    max_text_chars: int = Field(default=64000, ge=1, le=64000)
+
+
 class VoiceSettings(Section):
     enabled: bool = False
     wake_word: str = "沐璃"
@@ -466,6 +477,7 @@ class Settings(Section):
     search: Search = Field(default_factory=Search)
     computer: Computer = Field(default_factory=Computer)
     voice: VoiceSettings = Field(default_factory=VoiceSettings)
+    web_voice: WebVoiceSettings = Field(default_factory=WebVoiceSettings)
     channels: ChannelSettings = Field(default_factory=ChannelSettings)
     chiliarch: Chiliarch = Field(default_factory=Chiliarch)
     notifications: DesktopNotifications = Field(default_factory=DesktopNotifications)

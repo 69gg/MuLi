@@ -157,6 +157,8 @@ embedding 验证返回条数、索引、有限数值和一致维度，结果按�
 
 ASR 默认请求 JSON，支持 `extra_body.response_format` 选择 `json`、`verbose_json`、`diarized_json`、`text`、`srt`、`vtt`，返回对应文本；其他原生选项可写入 `extra_body`，数组转为 multipart 的 `key[]` 字段，嵌套对象序列化为 JSON。文件名只发送 basename，不发送本地目录。`ServiceConfig.response_format` 专用于 TTS。
 
+可选网页录音复用 `media.asr`，以认证的 `/api/media/transcribe` 接口生成草稿；不调用主模型或自动提交对话。启用、格式探测、取消与资源限制见 [网页点击录音](voice.md#网页点击录音)。
+
 TTS 要求明确配置 `voice` 字符串，保留供应商音色标识，不硬编码可选音色清单。`response_format` 支持 `mp3`（默认）、`opus`、`aac`、`flac`、`wav`、`pcm`；`speed:null` 省略语速，数值范围 0.25–4；`instructions:""` 省略语气指导。附加原生参数走 `extra_body`。返回只包含音频数据和文件类型信息，保存、播放、发送文件由应用负责；PCM 是原始样本数据，服务不自动封装 WAV。JSON/HTML、空音频或与所选格式冲突的响应类型会明确失败。
 
 媒体服务不自动重试，请求和响应分别受字节限制，整个 HTTP 调用（包括缓慢分块响应）受总超时限制；取消向外传播并关闭响应。视觉调用整体同样受所选模型的 `timeout` 限制。HTTP 重定向不跟随，错误仅暴露安全原因和状态码，不回显上游正文。`extra_body` 不能覆盖模型、输入、文件、文档、查询、音色、鉴权等本次操作的核心字段；附加请求头禁止覆盖 Host、Content-Type、Content-Length、Transfer-Encoding，避免破坏 multipart 或请求边界。

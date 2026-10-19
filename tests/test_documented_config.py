@@ -18,21 +18,22 @@ def test_shipped_configuration_example_uses_the_current_application_schema() -> 
     )
     assert not settings.models.main.configured
     assert not settings.computer.enabled and not settings.computer.capture.enabled
-    assert not settings.voice.enabled and not settings.notifications.enabled
+    assert not settings.voice.enabled and not settings.web_voice.enabled
+    assert not settings.notifications.enabled
     assert all(
         not getattr(settings.channels, name).enabled
         for name in ("onebot", "telegram", "qq", "weixin")
     )
 
 
-@pytest.mark.parametrize("name", ["providers", "channels"])
+@pytest.mark.parametrize("name", ["providers", "channels", "voice"])
 def test_documented_model_and_channel_examples_use_application_settings(name: str) -> None:
     document = (ROOT / "docs" / f"{name}.md").read_text(encoding="utf-8")
     examples = [json.loads(block) for block in re.findall(r"```json\n(.*?)\n```", document, re.S)]
     settings_examples = [
         item
         for item in examples
-        if isinstance(item, dict) and {"models", "media", "channels"} & item.keys()
+        if isinstance(item, dict) and {"models", "media", "channels", "web_voice"} & item.keys()
     ]
     assert settings_examples, f"{name} 缺少应用配置示例"
     for example in settings_examples:

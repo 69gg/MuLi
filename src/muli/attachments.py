@@ -25,6 +25,7 @@ SAFE_INLINE = {
     "audio/ogg",
     "audio/flac",
     "audio/mp4",
+    "audio/webm",
     "video/mp4",
     "video/webm",
     "video/ogg",
@@ -44,6 +45,7 @@ async def file_io[T](operation: Callable[[], T]) -> T:
 
 def detected_media(header: bytes, claimed: str) -> str:
     """Only known passive media gets an inline preview; claimed HTML/SVG stays a file."""
+    claimed = claimed.lower().split(";", 1)[0].strip()
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if header.startswith(b"\xff\xd8\xff"):
@@ -65,8 +67,8 @@ def detected_media(header: bytes, claimed: str) -> str:
         return "video/ogg" if claimed == "video/ogg" else "audio/ogg"
     if header[4:8] == b"ftyp":
         return "audio/mp4" if claimed == "audio/mp4" else "video/mp4"
-    if header.startswith(b"\x1a\x45\xdf\xa3") and claimed == "video/webm":
-        return "video/webm"
+    if header.startswith(b"\x1a\x45\xdf\xa3") and claimed in {"audio/webm", "video/webm"}:
+        return claimed
     return "application/octet-stream"
 
 

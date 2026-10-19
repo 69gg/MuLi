@@ -31,9 +31,11 @@ from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
 from muli.plugins import PluginManager
+from muli.providers import ProviderError
 from muli.runtime import Runtime
 from muli.service import UserService
 from muli.store import now
+from muli.web_voice import WebVoiceError, WebVoiceInput
 
 
 class Input(BaseModel):
@@ -49,6 +51,10 @@ class ChatInput(Input):
     content: str = Field(default="", max_length=64000)
     mode: Mode | None = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=32)
+
+
+class TranscriptionInput(Input):
+    attachment_id: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
 class LoginInput(Input):
@@ -115,6 +121,7 @@ def create_app(
     authentication = Authentication(config)
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
     local_services = LocalServices(runtime, attachments)
+    web_voice = WebVoiceInput(local_services)
     memory_application = MemoryApplication(runtime, local_services.media)
     channel_application = ChannelApplication(runtime, attachments)
     personal_io = PersonalIO(runtime, local_services, attachments)
@@ -129,6 +136,7 @@ def create_app(
             )
         previous = config.settings.model_copy(deep=True)
         await attention.close()
+        await web_voice.aclose()
         await integration.close()
         await channel_application.close()
         await personal_io.close()
@@ -141,6 +149,7 @@ def create_app(
             await personal_io.reconfigure()
             await integration.start()
             await attention.reconfigure()
+            await web_voice.reconfigure()
         except Exception:
             config.replace(previous)
             await runtime.reconfigure()
@@ -149,6 +158,7 @@ def create_app(
             await personal_io.reconfigure()
             await integration.start()
             await attention.reconfigure()
+            await web_voice.reconfigure()
             raise
 
     async def onboarding() -> None:
@@ -177,6 +187,7 @@ def create_app(
             yield
         finally:
             await attention.close()
+            await web_voice.aclose()
             await management.close()
             await integration.close()
             await channel_application.close()
@@ -196,6 +207,7 @@ def create_app(
     app.state.runtime, app.state.integration = runtime, integration
     app.state.attachments, app.state.authentication = attachments, authentication
     app.state.local_services = local_services
+    app.state.web_voice = web_voice
     plugins = PluginManager(runtime, app, config.path.resolve().parent / "plugins")
     management = SelfManagement(runtime, plugins, service, apply_configuration)
     app.state.management, app.state.plugins = management, plugins
@@ -338,6 +350,44 @@ def create_app(
         async with local_services.media() as media:
             return media.status()
 
+    @app.post("/api/media/transcribe")
+    async def transcribe_audio(body: TranscriptionInput, request: Request) -> dict[str, Any]:
+        """转写本地音频，只返回待用户编辑与发送的草稿，不提交对话。"""
+
+        async def disconnected() -> None:
+            # FastAPI has already consumed the JSON body. Await the ASGI event;
+            # do not periodically poll or leave a paid request behind an abort.
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        operation = asyncio.create_task(web_voice.transcribe(body.attachment_id))
+        disconnect = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait(
+                (operation, disconnect), return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnect in done:
+                raise HTTPException(499, "转写已取消")
+            return await operation
+        except WebVoiceError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        except ProviderError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(504, "转写达到时间上限") from exc
+        finally:
+            operation.cancel()
+            disconnect.cancel()
+            cleanup = asyncio.gather(operation, disconnect, return_exceptions=True)
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
+
     @app.get("/api/commitments")
     async def commitments(status: str = "active") -> dict[str, Any]:
         return {"items": local_services.commitments.list(status)}
@@ -430,6 +480,7 @@ def create_app(
             "channels": channel_application.manager.status(),
             "capture": personal_io.capture.status(),
             "voice": personal_io.voice.status(),
+            "web_voice": web_voice.status(),
             "attention": attention.status(),
             "limits": settings.limits.model_dump(),
         }

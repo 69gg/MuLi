@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ApiError, createSSEParser, readEvents, request, uploadFile } from "../../web/api.mjs";
+import { ApiError, createSSEParser, readEvents, request, uploadFile, transcribeAttachment } from "../../web/api.mjs";
 
 test("SSE parser survives every possible CRLF split and preserves Unicode", () => {
   const wire = ': heartbeat\r\nid: 8\r\nevent: message.delta\r\ndata: {"content":"沐璃，继续。"}\r\n\r\n';
@@ -79,4 +79,18 @@ test("an unauthorized SSE is exposed before a stream starts", async (context) =>
   let opened = false;
   await assert.rejects(readEvents("/events", { onOpen: () => { opened = true; }, onEvent: () => assert.fail("an unauthorized stream must not deliver events") }), (error) => error.status === 401);
   assert.equal(opened, false);
+});
+
+test("web transcription posts only an attachment ID with cancellable draft semantics", async (context) => {
+  let captured;
+  context.mock.method(globalThis, "fetch", async (url, options) => {
+    captured = { url, options }; return Response.json({ text: "可编辑", draft: true });
+  });
+  const controller = new AbortController();
+  const result = await transcribeAttachment("fixture-id", { signal: controller.signal });
+  assert.equal(captured.url, "/api/media/transcribe");
+  assert.equal(captured.options.method, "POST");
+  assert.deepEqual(JSON.parse(captured.options.body), { attachment_id: "fixture-id" });
+  assert.equal(captured.options.signal, controller.signal);
+  assert.equal(result.draft, true);
 });

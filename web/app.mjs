@@ -1,10 +1,11 @@
-import { request as apiRequest, readEvents, uploadFile } from "./api.mjs";
+import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
+import { VoiceInput, mergeTranscript } from "./voice-input.mjs";
 
 const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -39,6 +40,7 @@ const ICONS = {
   moon: '<path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10Z"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
   attachment: '<path d="m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7L13 2m-7 12 7-7a1.5 1.5 0 0 1 2 2l-7 7"/>',
+  microphone: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3m-4 0h8"/>',
   "arrow-left": '<path d="M20 12H4m7-7-7 7 7 7"/>',
   download: '<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
   team: '<circle cx="9" cy="8" r="3"/><path d="M2 21v-3a7 7 0 0 1 14 0v3M16 5a3 3 0 0 1 0 6m3 4a5 5 0 0 1 3 4v2"/>',
@@ -53,7 +55,7 @@ const state = {
   viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaved: false,
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
-  timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0,
+  timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
   team: { members: [], messages: [] }, recordQuery: "",
   auth: { required: false, authenticated: false },
 };
@@ -65,6 +67,46 @@ let queuedRender = false;
 let messageNodes = new Map();
 let toolNodes = new Map();
 let dialogSubmit = null;
+let draftRevision = 0;
+const voiceInput = new VoiceInput({
+  upload: uploadFile, transcribe: transcribeAttachment,
+  onUploaded: (file) => { state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
+  onChange: () => renderVoiceInput(),
+  onError: (error) => { if (error.status === 401) showLogin(); showError(error); },
+  onDraft: (draft) => {
+    const input = $("#message-input");
+    const merged = mergeTranscript(draft.context, captureDraft(), draft.text);
+    if (merged !== null && merged.length <= (state.status?.web_voice?.max_text_chars ?? 64000)) {
+      input.value = merged; draftRevision += 1; resizeComposer(); input.focus();
+      toast("转写已加入草稿，检查后点击发送。");
+    } else {
+      state.voiceDraft = draft;
+      $("#voice-draft-text").value = draft.text;
+      renderVoiceInput();
+      toast("转写已保留，当前输入内容没有改动。");
+    }
+  },
+});
+
+function captureDraft() {
+  return { session: state.activeSession?.id, revision: draftRevision, text: $("#message-input").value };
+}
+
+function renderVoiceInput() {
+  const recording = voiceInput.status();
+  const policy = state.status?.web_voice;
+  const busyVoice = recording.phase !== "idle";
+  const button = $("#voice-button");
+  const reason = voiceInput.support();
+  button.disabled = !state.connected || !policy?.available || !!reason || busyVoice || recording.pendingPermission || !!state.voiceDraft;
+  button.title = !policy?.enabled ? "在设置中开启网页语音输入" : !policy?.configured ? "请先配置 ASR 模型服务" : reason || (state.voiceDraft ? "请先处理已有转写草稿" : recording.pendingPermission ? "等待浏览器权限提示结束" : "录音并转写为草稿");
+  button.setAttribute("aria-label", button.title);
+  $("#voice-progress").hidden = !busyVoice;
+  const phases = { permission: "等待麦克风权限…", recording: `正在录音，最长 ${policy?.max_seconds ?? ""} 秒`, stopping: "正在结束录音…", uploading: "正在保存录音…", transcribing: "正在转写，不会自动发送…" };
+  $("#voice-status").textContent = phases[recording.phase] ?? "";
+  $("#voice-stop").hidden = recording.phase !== "recording";
+  $("#voice-draft").hidden = !state.voiceDraft;
+}
 
 async function request(path, options) {
   try { return await apiRequest(path, options); }
@@ -72,6 +114,7 @@ async function request(path, options) {
 }
 
 function showLogin() {
+  voiceInput.cancel();
   globalController?.abort(); sessionController?.abort();
   state.connected = false; state.auth.authenticated = false;
   $(".app-shell").inert = true; $("#auth-gate").hidden = false;
@@ -174,6 +217,7 @@ function renderComposer() {
   $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "持续对话";
   $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
   $("#composer-status").textContent = state.uploading ? `正在保存 ${state.uploading} 个附件…` : !state.connected ? state.loading ? "正在连接沐璃" : "等待服务连接" : !state.status?.configured ? "请先配置主模型" : running ? state.session.status === "approval" ? "等待批准 · 可以继续补充" : "正在处理 · 可以继续补充" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
+  renderVoiceInput();
 }
 
 function scrollIsNearBottom() {
@@ -445,7 +489,7 @@ async function sendMessage(event) {
   let targetSession = state.activeSession;
   let pendingId = null;
   const stillCurrent = () => intentVersion === sessionRequestVersion && (!targetSession || state.activeSession?.id === targetSession.id);
-  input.value = ""; state.attachments = []; renderComposerAttachments(); resizeComposer();
+  input.value = ""; draftRevision += 1; state.attachments = []; renderComposerAttachments(); resizeComposer();
   state.sending = true; renderComposer();
   try {
     if (stillCurrent()) {
@@ -545,6 +589,7 @@ function emptyState(iconName, title, description) {
 }
 
 async function switchView(view) {
+  if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
   state.view = view; state.viewError = ""; renderChrome();
@@ -1058,6 +1103,7 @@ function renderInputSettings() {
   const voiceState = voiceStatus && statusList([["状态", capabilityLabel(voiceStatus)], ["录音后端", voiceStatus.recorder?.backend || "未检测到"], ["声学唤醒", voiceStatus.wake?.available ? "已检测" : "未就绪"], ["参考声纹", voiceStatus.speaker?.enrolled ? "已录制" : "未录制"], ["语音识别", voiceStatus.asr ? "已配置" : "未配置"], ["提示播放", voiceStatus.playback?.backend || "未检测到"], ["运行设备", voiceStatus.device?.selected ?? "状态未知"], ["设备运行验证", voiceStatus.device?.runtime_verified ? "已验证" : "尚未验证"]]);
   const captureState = captureStatus && statusList([["状态", capabilityLabel(captureStatus)], ["截图后端", captureStatus.screenshot?.backend || "未检测到"], ["录屏后端", captureStatus.recording?.backend || "未检测到"], ["采集权限", captureStatus.permission_verified ? "已验证" : "尚未验证"]]);
   return element("div", {},
+    settingsSection("网页语音输入", switchField("允许点击录音并生成草稿", "web_voice.enabled", state.settingsDraft.web_voice?.enabled), element("p", { text: "需要配置 ASR。转写只进入可编辑草稿，点击发送后才成为用户消息；与后台唤醒独立。" }), settingsJSON("web_voice", state.settingsDraft.web_voice ?? {}, ["enabled"])),
     settingsSection("语音", settingsResourceError("voice"), voiceState,
       voiceStatus?.last_error && element("p", { class: "form-error", text: voiceStatus.last_error }),
       voiceStatus?.reason && element("p", { class: "settings-role-hint", text: voiceStatus.reason }),
@@ -1303,9 +1349,27 @@ async function refreshService() {
 
 async function handleAction(action, button) {
   if (action === "toggle-theme") { toggleTheme(); renderThemeControl(); }
-  if (action === "logout") { await request("/auth/logout", { method: "POST" }); state.settings = null; state.settingsDraft = null; state.status = null; state.session = createSessionState(); resetMessageNodes(); showLogin(); }
+  if (action === "logout") {
+    voiceInput.cancel(); state.voiceDraft = null; $("#voice-draft-text").value = "";
+    $("#message-input").value = ""; draftRevision += 1; resizeComposer();
+    await request("/auth/logout", { method: "POST" }); state.settings = null; state.settingsDraft = null; state.status = null; state.session = createSessionState(); resetMessageNodes(); showLogin();
+  }
   if (action === "open-settings") { state.settingsTab = "overview"; await switchView("settings"); }
   if (action === "attach-files") $("#file-input").click();
+  if (action === "voice-record") {
+    if (state.voiceDraft) throw new Error("请先处理已有转写草稿。");
+    await voiceInput.start(state.status?.web_voice, captureDraft());
+  }
+  if (action === "voice-stop") await voiceInput.stop();
+  if (action === "voice-cancel") voiceInput.cancel();
+  if (action === "voice-draft-dismiss") { state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); }
+  if (action === "voice-draft-append") {
+    const input = $("#message-input");
+    const text = $("#voice-draft-text").value;
+    const merged = input.value ? `${input.value}\n${text}` : text;
+    if (merged.length > (state.status?.web_voice?.max_text_chars ?? 64000)) throw new Error("合并后的草稿超过上限，请先缩短内容。");
+    input.value = merged; draftRevision += 1; state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); resizeComposer(); input.focus();
+  }
   if (action === "remove-attachment") { state.attachments = state.attachments.filter((file) => file.id !== button.dataset.id); renderComposerAttachments(); }
   if (action === "use-attachment") {
     const file = state.uploads.find((entry) => entry.id === button.dataset.id);
@@ -1412,7 +1476,7 @@ $("#login-form").addEventListener("submit", async (event) => {
   catch (error) { $("#login-error").textContent = error.message; $("#login-error").hidden = false; }
   finally { button.disabled = false; }
 });
-$("#message-input").addEventListener("input", resizeComposer);
+$("#message-input").addEventListener("input", () => { draftRevision += 1; resizeComposer(); });
 $("#message-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
 });
@@ -1442,9 +1506,9 @@ document.addEventListener("keydown", (event) => {
     requestAnimationFrame(() => $('#other-view [role="tab"][aria-selected="true"]')?.focus());
   }
 });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !state.connected) void connect(); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { globalController?.abort(); sessionController?.abort(); });
+window.addEventListener("pagehide", () => { voiceInput.cancel(); globalController?.abort(); sessionController?.abort(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();
