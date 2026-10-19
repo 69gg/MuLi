@@ -73,6 +73,9 @@ let dialogTeamView = null;
 let dialogMemoryReturn = null;
 let taskDialog = null;
 let memoryDialog = null;
+let memoryPath = null;
+let memoryPathSequence = 0;
+let memorySearchController = null;
 const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
@@ -126,6 +129,7 @@ function showLogin() {
   voiceInput.cancel();
   clearTaskControls();
   releaseMemoryDialog();
+  cancelMemorySearch(); releaseMemoryPath();
   dialogTeamView = null; dialogMemoryReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
@@ -457,7 +461,7 @@ function startGlobalEvents() {
     }
     if (event.type.startsWith("team.") && state.view === "team") void refreshTeam();
     if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog();
-    if (["memory.updated", "memory.forgotten"].includes(event.type)) invalidateMemoryEvidence(event);
+    if (["memory.updated", "memory.forgotten"].includes(event.type)) { invalidateMemoryPath(); invalidateMemoryEvidence(event); }
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads();
   } });
 }
@@ -557,10 +561,10 @@ function resizeComposer() {
   const input = $("#message-input"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 220)}px`; renderComposer();
 }
 
-function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, onSubmit }) {
+function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, onSubmit }) {
   releaseTaskDialog();
   releaseMemoryDialog();
-  dialogMemoryReturn = returnMemoryId;
+  dialogMemoryReturn = returnMemoryId ? { id: returnMemoryId, trigger: returnMemoryTrigger, pathButton: returnMemoryTrigger?.dataset.memoryPathRef ? memoryPath?.button : null } : null;
   const teamView = captureTeamView($("#other-view"));
   dialogTeamView = teamView?.inside ? teamView : null;
   $("#dialog-title").textContent = title;
@@ -611,6 +615,7 @@ function emptyState(iconName, title, description) {
 }
 
 async function switchView(view) {
+  cancelMemorySearch(); releaseMemoryPath();
   if (view !== state.view && memoryDialog) { $("#app-dialog").close(); releaseMemoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
@@ -624,7 +629,9 @@ async function switchView(view) {
     if (view === "team") { const page = await teamPager.load(); if (page) state.team = page; }
     if (view === "records") { state.sessions = collection(await request("/sessions")); state.sessionsError = ""; }
     if (view === "memories") {
-      const results = await Promise.allSettled([request(`/memories${state.memoryQuery ? `?query=${encodeURIComponent(state.memoryQuery)}` : ""}`), request("/memories/graph")]);
+      const query = state.memoryQuery;
+      const results = await Promise.allSettled([request(`/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`), request("/memories/graph")]);
+      if (version !== viewRequestVersion || state.view !== "memories" || query !== state.memoryQuery || !state.auth.authenticated) return;
       if (results[0].status === "rejected") throw results[0].reason;
       state.memories = collection(results[0].value);
       state.memoryGraph = results[1].status === "fulfilled" ? results[1].value : { nodes: [], edges: [] };
@@ -949,10 +956,10 @@ function renderRecordList() {
 }
 
 function renderMemories() {
+  releaseMemoryPath();
   const search = element("input", { type: "search", name: "memory-search", id: "memory-search", value: state.memoryQuery, placeholder: "检索内容、实体或偏好", "aria-label": "检索记忆" });
   const form = element("form", { class: "content-toolbar", onSubmit: async (event) => {
-    event.preventDefault(); state.memoryQuery = search.value.trim();
-    try { state.memories = collection(await request(`/memories?query=${encodeURIComponent(state.memoryQuery)}`)); renderOtherView(); $("#memory-search")?.focus(); } catch (error) { showError(error); }
+    event.preventDefault(); await searchMemories(search.value.trim());
   } }, element("div", { class: "search-field" }, icon("search"), search), element("button", { class: "secondary-button", type: "submit", text: "检索" }));
   const tabs = element("div", { class: "role-tabs memory-tabs", role: "tablist", "aria-label": "记忆视图" }, ...[["list", "记忆列表"], ["graph", "关系图"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.memoryTab === key ? "active" : "", text: label, "aria-selected": String(state.memoryTab === key), dataset: { memoryTab: key } })));
   const root = element("div", { class: "view-content" }, viewHeading("记忆", "保留偏好、事实与长期上下文。", actionButton("新增记忆", "new-memory", "primary-button", "plus")), tabs);
@@ -960,9 +967,118 @@ function renderMemories() {
   root.append(form, element("div", { class: "list-caption" }, `${state.memories.length} 条记忆`, state.memoryQuery ? `“${state.memoryQuery}”` : "全部记忆"));
   if (!state.memories.length) root.append(emptyState("memory", state.memoryQuery ? "没有找到相关记忆" : "还没有记忆", state.memoryQuery ? "换个关键词试试。" : "添加希望沐璃记住的内容。"));
   for (const item of state.memories) {
-    root.append(element("article", { class: "memory-row" }, element("div", { class: "row-icon" }, icon("memory")), element("div", { class: "row-content" }, element("p", { text: item.content }), element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryKind(item.kind) }), memoryNeedsReview(item) && element("span", { class: "row-tag", text: "待核对" }), ...(item.entities ?? []).map((entity) => element("span", { text: typeof entity === "string" ? entity : entity.name ?? "" })), element("time", { text: formatTimestamp(item.updated_at ?? item.created_at) }), item.matched_by && element("span", { text: { text: "文本匹配", graph: "关系匹配", "graph+text": "文本与关系匹配" }[item.matched_by] ?? item.matched_by }))), element("div", { class: "row-actions" }, actionButton("核查", "memory-evidence", "text-button", undefined, { id: item.id }), iconButton("更正记忆", "edit-memory", "edit", { id: item.id }), iconButton("删除记忆", "delete-memory", "trash", { id: item.id }))));
+    const meta = element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryKind(item.kind) }), memoryNeedsReview(item) && element("span", { class: "row-tag", text: "待核对" }), ...(item.entities ?? []).map((entity) => element("span", { text: typeof entity === "string" ? entity : entity.name ?? "" })), element("time", { text: formatTimestamp(item.updated_at ?? item.created_at) }), item.matched_by && element("span", { text: { text: "文本匹配", lexical: "文本匹配", graph: "关系匹配", "graph+text": "文本与关系匹配" }[item.matched_by] ?? item.matched_by }));
+    const content = element("div", { class: "row-content" }, element("p", { text: item.content }), meta);
+    if (item.path_omitted === true) meta.append(element("span", { class: "memory-path-note", text: "召回路径因预算省略" }));
+    else if (state.memoryQuery && memoryGraphPath(item)) {
+      const regionId = `memory-path-${++memoryPathSequence}`, query = state.memoryQuery;
+      const region = element("div", { id: regionId, class: "memory-recall-path", role: "region", "aria-label": "本次检索路径", hidden: true });
+      const button = element("button", { type: "button", class: "text-button memory-path-toggle", text: "召回路径", "aria-expanded": "false", "aria-controls": regionId, dataset: { memoryPath: String(item.id) }, onClick: () => void toggleMemoryPath(item.id, button, region, query) });
+      meta.append(button); content.append(region);
+    }
+    root.append(element("article", { class: "memory-row" }, element("div", { class: "row-icon" }, icon("memory")), content, element("div", { class: "row-actions" }, actionButton("核查", "memory-evidence", "text-button", undefined, { id: item.id }), iconButton("更正记忆", "edit-memory", "edit", { id: item.id }), iconButton("删除记忆", "delete-memory", "trash", { id: item.id }))));
   }
   return root;
+}
+
+function cancelMemorySearch() { memorySearchController?.abort(); memorySearchController = null; }
+
+async function searchMemories(query) {
+  cancelMemorySearch(); releaseMemoryPath();
+  const controller = new AbortController(), version = ++viewRequestVersion;
+  memorySearchController = controller; state.memoryQuery = query;
+  const current = () => memorySearchController === controller && version === viewRequestVersion && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
+  try {
+    const payload = await request(`/memories?query=${encodeURIComponent(query)}`, { signal: controller.signal, cache: "no-store" });
+    if (!current()) return;
+    state.memories = collection(payload); renderOtherView(); $("#memory-search")?.focus();
+  } catch (error) { if (current() && !controller.signal.aborted) showError(error); }
+  finally { if (memorySearchController === controller) memorySearchController = null; }
+}
+
+function memoryGraphPath(item) {
+  const via = item?.graph_via, seed = via?.seed;
+  const id = (value) => typeof value === "string" && value.length > 0;
+  const optionalId = (value) => value === null || id(value);
+  if (!via || via.complete !== true || !Number.isSafeInteger(via.revision) || via.revision < 0 || !id(via.seed_id) || !seed || seed.entity_id !== via.seed_id || !id(seed.name) || !id(seed.canonical) || !optionalId(seed.alias) || !optionalId(seed.memory_id) || !optionalId(seed.source_id) || typeof seed.has_more !== "boolean" || !["source", "manual", "direct", "legacy_unknown"].includes(seed.kind) || !Array.isArray(via.steps) || !via.steps.length) return null;
+  let from = via.seed_id;
+  for (const step of via.steps) {
+    if (!step || !id(step.memory_id) || !optionalId(step.source_id) || !id(step.subject_id) || !id(step.object_id) || !id(step.subject) || !id(step.object) || !id(step.predicate) || step.from_id !== from || !["forward", "reverse"].includes(step.direction)) return null;
+    const forward = step.direction === "forward";
+    if (step.from_id !== (forward ? step.subject_id : step.object_id) || step.to_id !== (forward ? step.object_id : step.subject_id)) return null;
+    from = step.to_id;
+  }
+  return via.steps.at(-1).memory_id === String(item.id) ? via : null;
+}
+
+function memoryPathCurrent(slot) {
+  return memoryPath === slot && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && $("#other-view").contains(slot.region) && !slot.region.hidden;
+}
+
+function releaseMemoryPath() {
+  const slot = memoryPath; memoryPath = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null; slot.via = null;
+  slot.region.replaceChildren(); slot.region.hidden = true; slot.button.setAttribute("aria-expanded", "false");
+}
+
+function memoryPathNotice(slot, message) {
+  if (!memoryPathCurrent(slot)) return;
+  const focused = slot.region.contains(document.activeElement);
+  const retry = element("button", { type: "button", class: "text-button", text: "重新检索", onClick: () => void loadMemoryPath(slot) });
+  slot.region.replaceChildren(element("p", { role: "status", text: message }), retry);
+  if (focused && !$("#app-dialog").open) retry.focus({ preventScroll: true });
+}
+
+function invalidateMemoryPath() {
+  const slot = memoryPath;
+  if (!slot) return;
+  if (!memoryPathCurrent(slot)) { releaseMemoryPath(); return; }
+  slot.controller?.abort(); slot.controller = null; slot.via = null;
+  memoryPathNotice(slot, "关系已有变更，请重新检索。");
+}
+
+async function toggleMemoryPath(id, button, region, query) {
+  const root = $("#other-view");
+  if (state.view !== "memories" || state.memoryTab !== "list" || state.memoryQuery !== query || !root.contains(button) || !root.contains(region)) return;
+  if (memoryPath?.button === button) { releaseMemoryPath(); button.focus({ preventScroll: true }); return; }
+  releaseMemoryPath();
+  const slot = { id: String(id), query, button, region, controller: null, via: null };
+  memoryPath = slot; region.hidden = false; button.setAttribute("aria-expanded", "true");
+  await loadMemoryPath(slot);
+}
+
+async function loadMemoryPath(slot) {
+  if (!memoryPathCurrent(slot)) return;
+  slot.controller?.abort(); slot.via = null;
+  const controller = new AbortController(); slot.controller = controller;
+  if (slot.region.contains(document.activeElement)) slot.button.focus({ preventScroll: true });
+  slot.region.replaceChildren(element("p", { role: "status", text: "正在读取路径…" }));
+  try {
+    const payload = await request(`/memories?query=${encodeURIComponent(slot.query)}`, { signal: controller.signal, cache: "no-store" });
+    if (!memoryPathCurrent(slot) || slot.controller !== controller) return;
+    const item = collection(payload).find((item) => String(item.id) === slot.id), via = memoryGraphPath(item);
+    if (item?.path_omitted === true) { memoryPathNotice(slot, "召回路径因预算省略，请重新检索。"); return; }
+    if (!via || (payload.revision !== undefined && payload.revision !== via.revision)) { memoryPathNotice(slot, "当前未返回该路径，请重新检索。"); return; }
+    slot.via = via; renderMemoryPath(slot, payload.truncated === true);
+  } catch (error) {
+    if (memoryPathCurrent(slot) && slot.controller === controller && !controller.signal.aborted) memoryPathNotice(slot, error.status === 404 ? "路径已不可用，请重新检索。" : error.status === 409 ? "关系已有变更，请重新检索。" : error.message);
+  } finally { if (slot.controller === controller) slot.controller = null; }
+}
+
+function renderMemoryPath(slot, truncated) {
+  const via = slot.via, seed = via.seed;
+  const label = { direct: "规范名称", source: "原始登记", manual: "手工登记", legacy_unknown: "旧索引，依据未登记" }[seed.kind];
+  const proofButton = (id, key, text) => actionButton(text, "memory-evidence", "text-button", undefined, { id, memoryPathRef: key });
+  const origin = element("div", { class: "memory-path-origin" }, element("span", { class: "memory-path-triple", text: seed.alias ? `${seed.alias} → ${seed.name}` : seed.name }), element("span", { class: "memory-path-note", text: label }));
+  if (seed.kind !== "direct" && seed.memory_id) origin.append(proofButton(seed.memory_id, "seed", "核查登记"));
+  if (seed.has_more) origin.append(element("span", { class: "memory-path-note", text: "还有登记未展示" }));
+  const steps = element("ol", { class: "memory-path-steps" });
+  for (const [index, step] of via.steps.entries()) {
+    const forward = step.direction === "forward", from = forward ? step.subject : step.object, to = forward ? step.object : step.subject;
+    steps.append(element("li", {}, element("div", { class: "memory-path-step" }, element("span", { class: "memory-path-triple", text: `${from} ${forward ? "—" : "←"}${step.predicate}${forward ? "→" : "—"} ${to}` }), proofButton(step.memory_id, `step-${index}`, "核查"))));
+  }
+  slot.region.replaceChildren(element("p", { class: "memory-path-title", text: "本次检索路径" }), origin, steps, truncated && element("span", { class: "memory-path-note", text: "部分检索结果" }));
 }
 
 const MEMORY_KINDS = { observation: "观察", preference: "偏好", fact: "事实", procedure: "流程", summary: "摘要", identity: "身份", episodic: "情景", semantic: "语义事实", procedural: "流程经验" };
@@ -1031,7 +1147,7 @@ function renderMemoryGraph() {
   }
   svg.append(svgNode("rect", { x: 52, y: centerY - 23, width: 210, height: 46, rx: 10, class: "graph-node graph-node-selected" }));
   svg.append(svgNode("text", { x: 157, y: centerY + 4, "text-anchor": "middle", class: "graph-label graph-label-selected" }, selected.length > 23 ? `${selected.slice(0, 22)}…` : selected));
-  const root = element("div", {}, element("div", { class: "graph-toolbar" }, element("label", {}, "实体", choose), element("span", { text: `${graph.nodes.length} 个实体 · ${graph.edges.length} 条关系` })), element("div", { class: "memory-graph" }, svg), element("div", { class: "list-caption" }, "关系与证据", `${edges.length} 条${edges.length > displayed.length ? ` · 图中显示 ${displayed.length} 条` : ""}`));
+  const root = element("div", {}, element("div", { class: "graph-toolbar" }, element("label", {}, "实体", choose), element("span", { text: `${graph.nodes.length} 个实体 · ${graph.edges.length} 条关系${graph.truncated ? " · 部分关系" : ""}` })), element("div", { class: "memory-graph" }, svg), element("div", { class: "list-caption" }, "关系与证据", `${edges.length} 条${edges.length > displayed.length ? ` · 图中显示 ${displayed.length} 条` : ""}`));
   for (const edge of edges) root.append(element("div", { class: "graph-evidence-row" }, element("span", { class: "graph-evidence-triple" }, element("strong", { text: edge.subject }), element("span", { text: edge.predicate }), element("strong", { text: edge.object })), actionButton("查看来源", "memory-evidence", "text-button", "link", { id: edge.memory_id })));
   return root;
 }
@@ -1074,9 +1190,9 @@ function invalidateMemoryEvidence(event) {
   } else memoryUnavailable(slot, event.type === "memory.forgotten" ? "原文已不可用。" : "记忆已有更新，请重新核查。");
 }
 
-async function showMemoryEvidence(id, { editing = false } = {}) {
+async function showMemoryEvidence(id, { editing = false, trigger = null } = {}) {
   const content = element("div", { class: "memory-verification" });
-  openDialog({ title: editing ? "更正记忆" : "核查记忆", content, readOnly: true, returnMemoryId: String(id) });
+  openDialog({ title: editing ? "更正记忆" : "核查记忆", content, readOnly: true, returnMemoryId: String(id), returnMemoryTrigger: trigger });
   const slot = { id: String(id), content, item: null, sourceId: state.memories.find((item) => String(item.id) === String(id))?.source_id, offsets: [0], pageIndex: 0, page: null, editing: false };
   memoryDialog = slot;
   await refreshMemoryEvidence(slot, editing);
@@ -1782,7 +1898,7 @@ async function handleAction(action, button) {
   if (action === "delete-memory") confirmAction("删除记忆", "这条记忆会被遗忘；如有关联原文，同源记忆也会一并遗忘。", "删除记忆", async () => { await request(`/memories/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("memories"); toast("记忆已删除"); });
   if (action === "add-memory-relation") $("#memory-relations")?.append(relationEditor());
   if (action === "remove-memory-relation") button.closest(".relation-editor")?.remove();
-  if (action === "memory-evidence") await showMemoryEvidence(button.dataset.id);
+  if (action === "memory-evidence") await showMemoryEvidence(button.dataset.id, { trigger: button });
   if (action === "new-workflow") newWorkflow();
   if (action === "workflow-templates") workflowTemplates();
   if (action === "add-workflow-step") addWorkflowStep();
@@ -1832,7 +1948,7 @@ document.addEventListener("click", async (event) => {
     else if (button.dataset.prompt) { if (state.view !== "chat") await switchView("chat"); $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
     else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); $("#other-view").scrollTop = 0; }
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
-    else if (button.dataset.memoryTab) { state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
+    else if (button.dataset.memoryTab) { cancelMemorySearch(); releaseMemoryPath(); state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
   } catch (error) { showError(error); }
 });
@@ -1875,8 +1991,13 @@ $("#app-dialog").addEventListener("close", () => {
   releaseMemoryDialog();
   const saved = dialogTeamView; dialogTeamView = null;
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
-  const memoryId = dialogMemoryReturn; dialogMemoryReturn = null;
-  if (state.auth.authenticated && state.view === "memories" && memoryId) $$("[data-action=memory-evidence]", $("#other-view")).find((button) => button.dataset.id === memoryId)?.focus({ preventScroll: true });
+  const memoryReturn = dialogMemoryReturn; dialogMemoryReturn = null;
+  if (state.auth.authenticated && state.view === "memories" && memoryReturn) {
+    const root = $("#other-view"), fallback = $$("[data-action=memory-evidence]", root).find((button) => button.dataset.id === memoryReturn.id);
+    const target = [memoryReturn.trigger, memoryReturn.pathButton, fallback].find((button) => button && root.contains(button));
+    if (target) target.focus({ preventScroll: true });
+    else { const heading = $(".view-heading h2", root); if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); } }
+  }
 });
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); if (!$("#app-dialog").open) void switchView("chat"); }
@@ -1891,7 +2012,7 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog) $("#app-dialog").close(); releaseMemoryDialog(); globalController?.abort(); sessionController?.abort(); });
+window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog) $("#app-dialog").close(); releaseMemoryDialog(); cancelMemorySearch(); releaseMemoryPath(); globalController?.abort(); sessionController?.abort(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();

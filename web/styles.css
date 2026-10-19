@@ -276,6 +276,17 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .graph-evidence-triple > span::before { content: "→ "; color: var(--muted); }
 .graph-evidence-triple > span::after { content: " →"; color: var(--muted); }
 .graph-evidence-row .text-button { font-size: 10px; flex-shrink: 0; }
+.memory-path-toggle { padding: 2px 0; font-size: 10px; }
+.memory-recall-path { min-width: 0; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line); animation: arrive .18s ease-out; }
+.memory-path-title { color: var(--text) !important; font-size: 11px !important; }
+.memory-path-origin { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px 12px; margin-bottom: 12px; }
+.memory-path-triple { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 11px; line-height: 1.9; color: var(--text); }
+.memory-path-note { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.memory-path-steps { margin: 0; padding-left: 18px; color: var(--muted); font-size: 10px; }
+.memory-path-steps li + li { margin-top: 10px; }
+.memory-path-step { display: flex; align-items: flex-start; gap: 9px; }
+.memory-path-step .memory-path-triple { flex: 1; }
+.memory-recall-path .text-button { flex-shrink: 0; font-size: 10px; padding: 2px 0; }
 .memory-evidence-content { white-space: pre-wrap; color: var(--muted); font-size: 12px; }
 .memory-verification { min-width: 0; overflow-wrap: anywhere; }
 .memory-current-content { color: var(--text); margin: 0 0 20px; }
@@ -587,6 +598,8 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
   .view-heading-actions { flex-wrap: wrap; }
   .row-icon { width: 28px; height: 28px; border-radius: 8px; }
   .memory-row, .workflow-row, .notification-row, .team-row { gap: 11px; padding: 20px 0; }
+  .memory-row:has(.memory-path-toggle[aria-expanded="true"]) { display: grid; grid-template-columns: 28px minmax(0, 1fr); }
+  .memory-row:has(.memory-path-toggle[aria-expanded="true"]) .row-actions { grid-column: 2; }
   .row-actions { gap: 0; }
   .row-actions .icon-button { width: 34px; height: 36px; }
   .workflow-row { flex-wrap: wrap; }
