@@ -16,7 +16,15 @@ from muli.evidence import (
 from muli.store import Store
 
 _UTF8_MAX_BYTES = 4
+_SQLITE_MAX_PARAMETER = (1 << 63) - 1
 _OPTIONAL_METADATA = ("source", "principal")
+
+
+def _archive_sequence(value: int, name: str, *, minimum: int = 0) -> None:
+    # Byte offsets reserve one integer for +1; these sequence predicates do not.
+    if type(value) is int and value == _SQLITE_MAX_PARAMETER:
+        return
+    validate_integer(value, name, minimum=minimum)
 
 
 class HistoryEvidence:
@@ -86,6 +94,51 @@ class HistoryEvidence:
                     return True
         return False
 
+    def _preview(self, row: dict[str, Any], budget: int) -> dict[str, Any]:
+        record = self._metadata(row, budget)
+        if row["content_type"] == "text":
+            record["content"] = decode_utf8(row["content"], allow_incomplete_tail=True)
+            record["content_bytes"] = row["content_bytes"]
+            record["content_truncated"] = (
+                len(record["content"].encode("utf-8")) < row["content_bytes"]
+            )
+        else:
+            record.update(
+                content=None,
+                content_bytes=None,
+                content_truncated=False,
+                content_unavailable=True,
+            )
+        return record
+
+    def _fit_preview(self, result: dict[str, Any], record: dict[str, Any], budget: int) -> bool:
+        """Fit the current record while accounting for the caller's complete envelope."""
+        while json_size(result) > budget and self._omit_optional(record):
+            pass
+        content = record["content"]
+        if json_size(result) > budget and isinstance(content, str):
+            record["content"] = ""
+            record["content_truncated"] = bool(record["content_bytes"])
+        if json_size(result) > budget:
+            return False
+        if isinstance(content, str) and record["content"] != content:
+            low, high = 0, len(content)
+            while low < high:
+                middle = (low + high + 1) // 2
+                record["content"] = content[:middle]
+                record["content_truncated"] = (
+                    len(record["content"].encode("utf-8")) < record["content_bytes"]
+                )
+                if json_size(result) <= budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            record["content"] = content[:low]
+            record["content_truncated"] = (
+                len(record["content"].encode("utf-8")) < record["content_bytes"]
+            )
+        return True
+
     def read(
         self,
         session_id: str,
@@ -120,32 +173,13 @@ class HistoryEvidence:
                 if len(result["records"]) >= limit:
                     result["has_more"] = True
                     break
-                record = self._metadata(row, max_output_chars)
-                if row["content_type"] == "text":
-                    record["content"] = decode_utf8(row["content"], allow_incomplete_tail=True)
-                    record["content_bytes"] = row["content_bytes"]
-                    record["content_truncated"] = (
-                        len(record["content"].encode("utf-8")) < row["content_bytes"]
-                    )
-                else:
-                    record.update(
-                        content=None,
-                        content_bytes=None,
-                        content_truncated=False,
-                        content_unavailable=True,
-                    )
+                record = self._preview(row, max_output_chars)
                 result["records"].append(record)
                 previous = result["next_after"]
                 result["next_after"] = record["seq"]
                 # false is one JSON character longer than true; reserve the EOF form.
                 result["has_more"] = False
-                while json_size(result) > max_output_chars and self._omit_optional(record):
-                    pass
-                content = record["content"]
-                if json_size(result) > max_output_chars and isinstance(content, str):
-                    record["content"] = ""
-                    record["content_truncated"] = bool(row["content_bytes"])
-                if json_size(result) > max_output_chars:
+                if not self._fit_preview(result, record, max_output_chars):
                     result["records"].pop()
                     result["next_after"] = previous
                     result["has_more"] = True
@@ -154,26 +188,73 @@ class HistoryEvidence:
                             "output_budget", "预算不足以返回一条消息的完整定位元数据"
                         )
                     break
-                if isinstance(content, str) and record["content"] != content:
-                    low, high = 0, len(content)
-                    while low < high:
-                        middle = (low + high + 1) // 2
-                        record["content"] = content[:middle]
-                        record["content_truncated"] = (
-                            len(record["content"].encode("utf-8")) < row["content_bytes"]
-                        )
-                        if json_size(result) <= max_output_chars:
-                            low = middle
-                        else:
-                            high = middle - 1
-                    record["content"] = content[:low]
-                    record["content_truncated"] = (
-                        len(record["content"].encode("utf-8")) < row["content_bytes"]
-                    )
             else:
                 result["has_more"] = False
         if json_size(result) > max_output_chars:
             raise EvidenceError("output_budget", "目录页无法在工具输出预算内完整返回")
+        return result
+
+    def archive(
+        self,
+        session_id: str,
+        *,
+        before_seq: int | None = None,
+        through_seq: int | None = None,
+        limit: int = 50,
+        max_output_chars: int,
+    ) -> dict[str, Any]:
+        """Page older persisted content independently from live messages and event replay."""
+        if before_seq is not None:
+            _archive_sequence(before_seq, "before_seq", minimum=1)
+        if through_seq is not None:
+            _archive_sequence(through_seq, "through_seq")
+        validate_integer(limit, "limit", minimum=1)
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
+        self._session(session_id)
+        if through_seq is None:
+            through_seq = self.store.message_evidence_max_seq(session_id)
+        result: dict[str, Any] = {
+            "session_id": session_id,
+            "messages": [],
+            "through_seq": through_seq,
+            "next_before_seq": None,
+            "has_older": False,
+        }
+        if json_size(result) > max_output_chars:
+            raise EvidenceError("output_budget", "归档页元数据超过输出预算")
+        preview_bytes = min(max_output_chars * _UTF8_MAX_BYTES, _SQLITE_MAX_PARAMETER)
+        rows = self.store.message_evidence_archive(
+            session_id,
+            before_seq=before_seq,
+            through_seq=through_seq,
+            limit=min(limit, max_output_chars) + 1,
+            preview_bytes=preview_bytes,
+            metadata_bytes=preview_bytes,
+        )
+        with closing(rows):
+            row = next(rows, None)
+            while row is not None:
+                # A single bounded lookahead determines the actual EOF envelope.
+                following = next(rows, None)
+                record = self._preview(row, max_output_chars)
+                result["messages"].append(record)
+                result["has_older"] = following is not None
+                result["next_before_seq"] = record["seq"] if following is not None else None
+                if not self._fit_preview(result, record, max_output_chars):
+                    result["messages"].pop()
+                    if not result["messages"]:
+                        raise EvidenceError(
+                            "output_budget", "预算不足以返回一条消息的完整定位元数据"
+                        )
+                    result["has_older"] = True
+                    result["next_before_seq"] = result["messages"][-1]["seq"]
+                    break
+                if len(result["messages"]) >= limit:
+                    break
+                row = following
+        result["messages"].reverse()
+        if json_size(result) > max_output_chars:
+            raise EvidenceError("output_budget", "归档页无法在输出预算内完整返回")
         return result
 
     def read_content(

@@ -450,6 +450,50 @@ class Store:
         finally:
             cursor.close()
 
+    def message_evidence_max_seq(self, session_id: str) -> int:
+        """Return the latest valid mapping without materializing message JSON in Python."""
+        row = self.db.execute(
+            "SELECT m.seq" + _EVIDENCE_FROM + "ORDER BY m.seq DESC LIMIT 1", (session_id,)
+        ).fetchone()
+        return int(row["seq"]) if row is not None else 0
+
+    def message_evidence_archive(
+        self,
+        session_id: str,
+        *,
+        before_seq: int | None,
+        through_seq: int,
+        limit: int,
+        preview_bytes: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield a bounded descending window using the existing session/sequence index."""
+        predicate = "AND m.seq<=? "
+        bounds: tuple[int, ...] = (through_seq,)
+        if before_seq is not None:
+            predicate += "AND m.seq<? "
+            bounds += (before_seq,)
+        cursor = self.db.execute(
+            "SELECT "
+            + _EVIDENCE_COLUMNS
+            + _EVIDENCE_FROM
+            + predicate
+            + "ORDER BY m.seq DESC LIMIT ?",
+            (
+                1,
+                preview_bytes,
+                *([metadata_bytes] * len(_EVIDENCE_METADATA)),
+                session_id,
+                *bounds,
+                limit,
+            ),
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
     def message_evidence_slice(
         self,
         session_id: str,
