@@ -380,22 +380,126 @@ def workflow_call() -> ModelTurn:
 
 
 async def test_parent_waits_for_children_without_single_slot_deadlock(tmp_path: Path) -> None:
-    runtime, _ = make_runtime(
-        tmp_path,
-        [workflow_call(), ModelTurn(content="已安排"), ModelTurn(content="真实子任务结果")],
-    )
+    runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update({"limits": {"max_parallel_agents": 1}})
     await runtime.reconfigure()
+    parent_turns = [workflow_call(), ModelTurn(content="已安排")]
+    child_context_ready, parent_waiting, child_streaming = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    allow_child_model, allow_child_result = asyncio.Event(), asyncio.Event()
+    child_ids: list[str] = []
+    real_wait = runtime.workflows.wait
+
+    async def gate_child_context(session_id: str, messages: list[Message]) -> list[Message]:
+        session = runtime.store.get("session", session_id)
+        if session is not None and session.get("workflow_run_id"):
+            child_context_ready.set()
+            await allow_child_model.wait()
+        return messages
+
+    async def observe_child_wait(run_id: str) -> dict[str, Any]:
+        child_ids.append(run_id)
+        parent_waiting.set()
+        return await real_wait(run_id)
+
+    class ChildClient(FakeClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            if any(
+                message.role == "user" and message.content.startswith("工作流：")
+                for message in messages
+            ):
+                assert runtime.capacity.locked()
+                child_streaming.set()
+                await allow_child_result.wait()
+                yield StreamEvent("done", turn=ModelTurn(content="真实子任务结果"))
+            else:
+                async for event in super().stream(messages, tools):
+                    yield event
+
+    def factory(config: ModelConfig) -> ChildClient:
+        return ChildClient(parent_turns, [])
+
+    runtime.client_factory = factory  # type: ignore[assignment]
+    runtime.context_hooks.append(gate_child_context)
+    runtime.workflows.wait = observe_child_wait  # type: ignore[method-assign]
     try:
         session = runtime.new_session(mode="yolo")
         result = await runtime.start(session["id"], "拆分工作")
-        output = await asyncio.wait_for(runtime.tasks[session["id"]], 2)
-        child = runtime.store.list("workflow_run")[0]
+        parent = runtime.tasks[session["id"]]
+
+        async def stage(event: asyncio.Event) -> None:
+            observer = asyncio.create_task(event.wait())
+            try:
+                # Only a deadlock watchdog: progress is proved by the gates,
+                # and its expiry cannot cancel the execution being inspected.
+                await asyncio.wait(
+                    [observer, parent], timeout=2, return_when=asyncio.FIRST_COMPLETED
+                )
+                if parent.done():
+                    parent.result()
+                assert event.is_set() and not parent.done(), {
+                    "parent": runtime.store.get("run", result["run_id"]),
+                    "children": [runtime.store.get("workflow_run", key) for key in child_ids],
+                }
+                if observer.done():
+                    observer.result()
+            finally:
+                if not observer.done():
+                    observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
+
+        await stage(child_context_ready)
+        await stage(parent_waiting)
+        assert len(child_ids) == 1
+        assert not runtime.capacity.locked(), {
+            "parent": runtime.store.get("run", result["run_id"]),
+            "child": runtime.store.get("workflow_run", child_ids[0]),
+        }
+        allow_child_model.set()
+        await stage(child_streaming)
+        done, pending = await asyncio.wait([parent], timeout=0)
+        assert not done and parent in pending and not parent.cancelling()
+        assert runtime.store.get("workflow_run", child_ids[0])["status"] == "running"
+        observing_child = asyncio.Event()
+
+        async def observe_child() -> dict[str, Any]:
+            observing_child.set()
+            return await real_wait(child_ids[0])
+
+        observer = asyncio.create_task(observe_child())
+        try:
+            await stage(observing_child)
+            observer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await observer
+            assert not parent.cancelling()
+            assert not runtime.workflows._tasks[child_ids[0]].cancelling()
+        finally:
+            if not observer.done():
+                observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)
+        allow_child_result.set()
+        await asyncio.wait([parent], timeout=2)
+        assert parent.done(), {
+            "parent": runtime.store.get("run", result["run_id"]),
+            "child": runtime.store.get("workflow_run", child_ids[0]),
+        }
+        output = parent.result()
+        child = runtime.store.get("workflow_run", child_ids[0])
+        assert child is not None
         assert child["parent_run_id"] == result["run_id"]
         assert child["status"] == "completed"
         assert "真实子任务结果" in output
+        assert not parent_turns
         assert runtime.store.get("run", result["run_id"])["status"] == "completed"
     finally:
+        allow_child_model.set()
+        allow_child_result.set()
         await runtime.close()
 
 
