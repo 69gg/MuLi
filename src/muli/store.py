@@ -20,7 +20,7 @@ _UNFINISHED_LIFECYCLE = (
     "kind IN ('session','run','approval','workflow_run') "
     "AND json_extract(data,'$.status') IN ('pending','queued','running') "
 )
-_SQLITE_MAX_INTEGER = (1 << 63) - 1
+SQLITE_MAX_INTEGER = (1 << 63) - 1
 _SESSION_RECORD_LIMIT = 101  # A public page of at most 100 plus one lookahead.
 
 
@@ -249,7 +249,7 @@ class Store:
             raise ValueError("记录目录查询需要 1–101 条的有界窗口")
         if type(metadata_bytes) is not int or metadata_bytes < 1:
             raise ValueError("记录目录元数据字节预算必须是正整数")
-        metadata_bytes = min(metadata_bytes, _SQLITE_MAX_INTEGER)
+        metadata_bytes = min(metadata_bytes, SQLITE_MAX_INTEGER)
         predicate = ""
         bounds: tuple[int | float | str, ...] = ()
         if after is not None:
@@ -397,6 +397,10 @@ class Store:
             "data": data,
             "created_at": created,
         }
+
+    def event_position(self) -> int:
+        """Read the latest durable event ID without loading any event payload."""
+        return int(self.db.execute("SELECT coalesce(max(id),0) FROM events").fetchone()[0])
 
     def events(
         self, after: int = 0, session_id: str | None = None, limit: int = 500
