@@ -26,14 +26,15 @@ def test_shipped_configuration_example_uses_the_current_application_schema() -> 
     )
 
 
-@pytest.mark.parametrize("name", ["providers", "channels", "voice"])
+@pytest.mark.parametrize("name", ["providers", "channels", "voice", "computer"])
 def test_documented_model_and_channel_examples_use_application_settings(name: str) -> None:
     document = (ROOT / "docs" / f"{name}.md").read_text(encoding="utf-8")
     examples = [json.loads(block) for block in re.findall(r"```json\n(.*?)\n```", document, re.S)]
     settings_examples = [
         item
         for item in examples
-        if isinstance(item, dict) and {"models", "media", "channels", "web_voice"} & item.keys()
+        if isinstance(item, dict)
+        and {"models", "media", "channels", "web_voice", "computer"} & item.keys()
     ]
     assert settings_examples, f"{name} 缺少应用配置示例"
     for example in settings_examples:

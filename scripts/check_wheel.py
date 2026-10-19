@@ -17,8 +17,11 @@ async def check_installed(target: Path) -> None:
     import muli
     from muli.config import ConfigFile
     from muli.server import create_app
+    from muli.tools import atspi_helper
+    from muli.tools.computer import ComputerError
 
     assert Path(muli.__file__).resolve().is_relative_to(target.resolve()), muli.__file__
+    assert Path(atspi_helper.__file__).resolve().is_relative_to(target.resolve())
     with tempfile.TemporaryDirectory(prefix="muli-wheel-data-") as directory:
         root = Path(directory)
         config = ConfigFile(root / "config.json")
@@ -42,6 +45,14 @@ async def check_installed(target: Path) -> None:
                 assert state["version"] == muli.__version__
                 assert state["configured"] is False
                 assert app.state.runtime._history("new")[0].content
+                computer = app.state.runtime.computer
+                assert "computer_targets" in app.state.runtime.tools
+                try:
+                    await computer.targets({})
+                except ComputerError as exc:
+                    assert exc.code == "disabled" and exc.outcome == "not_started"
+                else:
+                    raise AssertionError("Disabled desktop discovery must not access a desktop")
                 task = await app.state.local_services.commitments.save(
                     "发行包任务控制检查",
                     brief={"goal": "验证离线管理入口", "constraints": [], "evidence_refs": []},
@@ -53,7 +64,10 @@ async def check_installed(target: Path) -> None:
                 assert response.status_code == 200, response.text
                 assert response.json()["current"]["control"]["paused"] is True
                 assert not app.state.runtime.tasks
-    print("Installed wheel: import, assets, API docs, prompts, task control and lifespan passed")
+    print(
+        "Installed wheel: import, assets, API docs, prompts, desktop defaults, "
+        "task control and lifespan passed"
+    )
 
 
 def main() -> None:

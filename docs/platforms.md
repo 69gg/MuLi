@@ -20,6 +20,8 @@ macOS 与 Windows 使用本地日志包装器，不依赖终端重定向。每�
 
 Linux 节点操作先使用 AT-SPI 获取无障碍树和节点身份。`computer_screenshot` / `computer_record` 是独立的图像采集工具，不要求 AT-SPI 可用，遵循 computer 风险门；采集结果不能提供绕过快照校验的点击坐标。配置 computer.enabled 与 computer.capture.enabled 后才可执行，二者默认关闭。macOS / Windows 的图像采集不代表已实现 AX / UIA 节点操作。
 
+2.4 的 `computer_targets` 先列应用、再按应用列直接窗口；`computer_snapshot` 可指定发现所得目标，零参数保留桌面语义。省略原因和当前引用的有效期单独报告，使用方式与验证边界见[无障碍电脑操作](computer.md)。不完整树不能用来证明目标控件不存在。
+
 | 平台 / 会话 | 截图候选 | 录屏候选 | 额外限制 |
 | --- | --- | --- | --- |
 | Linux Wayland | grim、gnome-screenshot | wf-recorder + timeout | grim / wf-recorder 依赖合成器提供相应协议；GNOME 等环境可能不支持 |
