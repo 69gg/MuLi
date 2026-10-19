@@ -513,7 +513,11 @@ def test_process_timeout_kills_descendant_after_parent_exits(tmp_path: Path) -> 
         identifier = int(pid_file.read_text())
         for _ in range(100):
             status = Path(f"/proc/{identifier}/stat")
-            if not status.exists() or status.read_text().split()[2] == "Z":
+            try:
+                state = status.read_text(encoding="utf-8").split()[2]
+            except FileNotFoundError:
+                return
+            if state == "Z":
                 return
             await asyncio.sleep(0.005)
         pytest.fail("子进程在超时后仍在运行")
