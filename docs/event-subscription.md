@@ -1,0 +1,30 @@
+# 事件订阅与恢复位置
+
+## 服务端位置与 HTTP 游标
+
+认证后的 `GET /api/ui/event-position` 只返回当前资料库的全局事件位置：
+
+```json
+{"after":"9007199254740993"}
+```
+
+`after` 始终是精确十进制字符串，空事件表返回 `"0"`。Store 复用最大事件主键查询，只读取整数位置，不加载事件 JSON，也不创建主会话、提交输入或启动模型。接口沿用管理 API 的认证与同源边界，响应带 `Cache-Control: no-store`。
+
+调用方应先取得位置 P，再读取初始化事实，最后以 `after=P` 订阅全局 `/api/events`。这样 P 之后的持久变化仍可通过后继事件使摘要失效。P 是一次当前位置读取；它没有把多个 HTTP 事实请求变成同一事务快照，也不替代会话 hydrate 自己的恢复位置。
+
+`GET /api/events` 与 `GET /api/sessions/{session_id}/events` 共用 HTTP 游标校验：
+
+| 输入 | 有效范围与行为 | 无效响应 |
+| --- | --- | --- |
+| query `after` | FastAPI 整数参数，默认 0，范围为 0 至 SQLite signed int64 最大值 9223372036854775807 | 格式或范围无效返回 422 |
+| 非空 `Last-Event-ID` | 独立解析整数，范围与 query 相同；空 header 沿用未提供语义 | 返回 400，`detail` 为“事件游标无效” |
+
+两项分别通过校验后才取较大值，不能让一个合法输入掩盖另一个无效输入。负数和超界数不会被夹成合法位置；检查完成后才构造 `StreamingResponse`，无效输入不会进入 `EventBus.stream` 或 `Store.events`。合法位置即使高于当前最大事件 ID，仍保留等待后继事件的既有行为。内部 EventBus 消费者的合同没有变化。
+
+位置字符串与外部 SSE 输入可以完整表达 int64 范围，但旧 conversation/session snapshot 的 JSON 数字事件 ID 在超过 JavaScript 安全整数范围时仍可能失真；本片不更改该格式。数据库替换、恢复后的实例 epoch、未来或过旧位置的显式重同步协议也留待后续。
+
+## 服务端验证边界
+
+`tests/test_event_subscription_api.py` 使用临时 SQLite、真实 ASGI 路由、真实 EventBus 的有限帧读取及有限 SSE 替身，覆盖认证、no-store、空表、超过 JavaScript 安全整数范围及 int64 上界的精确位置、只读与不加载 payload、重开及删除末事件后的当前位置。真实 EventBus 回归验证先读 P、再持久写入事件，后继订阅只返回 P 之后的事件。两个 SSE 入口均覆盖格式、负值、超界、一个输入合法而另一个无效、空 header、默认位置和 query/header 最大值选择；拒绝路径明确断言没有调用流工厂或事件列表查询。
+
+这些回归不连接真实模型、设备或外部服务，也不证明 bootstrap、活动正文、单条 SSE payload、长期浏览器 state/seen/DOM 的总资源有界。

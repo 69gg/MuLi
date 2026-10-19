@@ -39,7 +39,7 @@ from muli.providers import ProviderError
 from muli.runtime import Runtime
 from muli.service import UserService
 from muli.session_records import SessionRecords
-from muli.store import now
+from muli.store import SQLITE_MAX_INTEGER, now
 from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
 
@@ -769,28 +769,39 @@ def create_app(
         await runtime.stop(session_id)
         return {"stopped": True}
 
+    @app.get("/api/ui/event-position")
+    async def event_position() -> dict[str, str]:
+        return {"after": str(runtime.store.event_position())}
+
     def event_stream(
         request: Request, after: int, session_id: str | None = None
     ) -> StreamingResponse:
         cursor = request.headers.get("last-event-id")
         if cursor:
             try:
-                after = max(after, int(cursor))
+                header_after = int(cursor)
+                if not 0 <= header_after <= SQLITE_MAX_INTEGER:
+                    raise ValueError
             except ValueError as exc:
                 raise HTTPException(400, "事件游标无效") from exc
+            after = max(after, header_after)
         return StreamingResponse(
-            runtime.bus.stream(max(0, after), session_id),
+            runtime.bus.stream(after, session_id),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no"},
         )
 
     @app.get("/api/events")
-    async def events(request: Request, after: int = 0) -> StreamingResponse:
+    async def events(
+        request: Request, after: Annotated[int, Query(ge=0, le=SQLITE_MAX_INTEGER)] = 0
+    ) -> StreamingResponse:
         return event_stream(request, after)
 
     @app.get("/api/sessions/{session_id}/events")
     async def session_events(
-        request: Request, session_id: str, after: int = 0
+        request: Request,
+        session_id: str,
+        after: Annotated[int, Query(ge=0, le=SQLITE_MAX_INTEGER)] = 0,
     ) -> StreamingResponse:
         if not runtime.store.get("session", session_id):
             raise KeyError(session_id)
