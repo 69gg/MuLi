@@ -32,6 +32,17 @@ CREATE TABLE IF NOT EXISTS memory_aliases (
  source_id TEXT REFERENCES memory_sources(id) ON DELETE CASCADE,
  memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS memory_aliases_entity ON memory_aliases(entity_id);
+CREATE INDEX IF NOT EXISTS memory_aliases_memory ON memory_aliases(memory_id);
+CREATE INDEX IF NOT EXISTS memory_aliases_source ON memory_aliases(source_id);
+CREATE TABLE IF NOT EXISTS memory_alias_evidence (
+ alias TEXT NOT NULL,
+ entity_id TEXT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+ memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+ source_id TEXT REFERENCES memory_sources(id) ON DELETE CASCADE,
+ PRIMARY KEY(alias,memory_id));
+CREATE INDEX IF NOT EXISTS memory_alias_evidence_entity ON memory_alias_evidence(entity_id);
+CREATE INDEX IF NOT EXISTS memory_alias_evidence_memory ON memory_alias_evidence(memory_id);
+CREATE INDEX IF NOT EXISTS memory_alias_evidence_source ON memory_alias_evidence(source_id);
 CREATE TABLE IF NOT EXISTS memory_mentions (
  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
  entity_id TEXT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
