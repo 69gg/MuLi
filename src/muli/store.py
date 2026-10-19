@@ -6,6 +6,7 @@ import builtins
 import json
 import os
 import sqlite3
+import sys
 import time
 import uuid
 from collections.abc import Callable, Generator
@@ -18,6 +19,25 @@ _LIFECYCLE_PAGE_SIZE = 100
 _UNFINISHED_LIFECYCLE = (
     "kind IN ('session','run','approval','workflow_run') "
     "AND json_extract(data,'$.status') IN ('pending','queued','running') "
+)
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+_SESSION_RECORD_LIMIT = 101  # A public page of at most 100 plus one lookahead.
+
+
+def _session_record_time(field: str) -> str:
+    """Modern session dates are finite positive JSON numbers, never coerced text."""
+    value = f"json_extract(data,'$.{field}')"
+    return (
+        f"CASE WHEN json_type(data,'$.{field}') IN ('integer','real') "
+        f"AND {value}>0 AND {value}<={sys.float_info.max!r} THEN {value} END"
+    )
+
+
+_SESSION_RECORD_CREATED = _session_record_time("created_at")
+_SESSION_RECORD_SORT = f"coalesce(({_SESSION_RECORD_CREATED}),0)"
+_SESSION_RECORD_UPDATED = _session_record_time("updated_at")
+_SESSION_RECORD_TITLE = (
+    "CASE WHEN json_type(data,'$.title')='text' THEN json_extract(data,'$.title') END"
 )
 
 
@@ -132,6 +152,12 @@ class Store:
             CREATE INDEX IF NOT EXISTS relations_subject ON relations(subject);
             CREATE INDEX IF NOT EXISTS relations_object ON relations(object);
         """)
+        # The expression is shared with the page predicate/order. The kind prefix
+        # lets SQLite choose this partial index over the older updated index.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS sessions_created_directory "
+            f"ON objects(kind,({_SESSION_RECORD_SORT}) DESC,id DESC) WHERE kind='session'"
+        )
         # Old archives have no insertion sequence. Preserve their existing order once;
         # all subsequent messages use a database sequence, independent of wall time.
         if (
@@ -209,6 +235,62 @@ class Store:
             (kind, limit),
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def session_record_rows(
+        self,
+        *,
+        query: str,
+        after: tuple[int | float, str] | None,
+        limit: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield creation-ordered metadata without loading whole session JSON in Python."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("记录目录查询需要 1–101 条的有界窗口")
+        if type(metadata_bytes) is not int or metadata_bytes < 1:
+            raise ValueError("记录目录元数据字节预算必须是正整数")
+        metadata_bytes = min(metadata_bytes, _SQLITE_MAX_INTEGER)
+        predicate = ""
+        bounds: tuple[int | float | str, ...] = ()
+        if after is not None:
+            # The scalar bound lets SQLite seek the expression index; the tuple
+            # keeps ties strict without depending on the anchor row still existing.
+            predicate = (
+                f"AND ({_SESSION_RECORD_SORT})<=? AND (({_SESSION_RECORD_SORT}),objects.id)<(?,?) "
+            )
+            bounds = (after[0], *after)
+        columns = [
+            "substr(CAST(id AS BLOB),1,min(?,length(CAST(id AS BLOB)))) AS id",
+            "length(CAST(id AS BLOB)) AS id_bytes",
+            f"({_SESSION_RECORD_CREATED}) AS created_at",
+            f"({_SESSION_RECORD_UPDATED}) AS updated_at",
+            f"({_SESSION_RECORD_SORT}) AS sort_created_at",
+        ]
+        for field in ("title", "status"):
+            value = f"json_extract(data,'$.{field}')"
+            columns.extend(
+                (
+                    f"json_type(data,'$.{field}') AS {field}_type",
+                    f"CASE WHEN json_type(data,'$.{field}')='text' THEN "
+                    f"substr(CAST({value} AS BLOB),1,min(?,length(CAST({value} AS BLOB)))) "
+                    f"END AS {field}",
+                    f"length(CAST({value} AS BLOB)) AS {field}_bytes",
+                )
+            )
+        cursor = self.db.execute(
+            "SELECT "
+            + ",".join(columns)
+            + " FROM objects WHERE kind='session' "
+            + f"AND (?='' OR instr(lower({_SESSION_RECORD_TITLE}),lower(?))>0) "
+            + predicate
+            + f"ORDER BY ({_SESSION_RECORD_SORT}) DESC,objects.id DESC LIMIT ?",
+            (metadata_bytes, metadata_bytes, metadata_bytes, query, query, *bounds, limit),
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
 
     @staticmethod
     def _lifecycle_page(after_id: str, limit: int) -> None:
