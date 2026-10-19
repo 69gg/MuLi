@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -67,7 +67,7 @@ class Runtime:
         self._tool_session: ContextVar[str | None] = ContextVar("muli_tool_session", default=None)
         self._coordinator_tools: set[str] = set()
         self._closing = False
-        self._stopping: set[str] = set()
+        self._stopping: dict[str, int] = {}
         self.tasks: dict[str, asyncio.Task[str]] = {}
         self.run_ids: dict[str, str] = {}
         self.configuration_lock = asyncio.Lock()
@@ -570,13 +570,26 @@ class Runtime:
             raise asyncio.CancelledError
         raise ValueError(str(run.get("error", "运行已中断")))
 
+    @contextlib.contextmanager
+    def _stopping_session(self, session_id: str) -> Iterator[None]:
+        self._stopping[session_id] = self._stopping.get(session_id, 0) + 1
+        try:
+            yield
+        finally:
+            count = self._stopping[session_id] - 1
+            if count:
+                self._stopping[session_id] = count
+            else:
+                del self._stopping[session_id]
+
     async def stop(self, session_id: str, *, cancel_pending: bool = True) -> None:
         pending = self.store.pending_inputs(session_id) if cancel_pending else 0
-        self._stopping.add(session_id)
         try:
-            await self._stop(session_id, cancel_pending=cancel_pending)
+            with self._stopping_session(session_id):
+                async with self.team.stopping_children(session_id):
+                    await self._stop(session_id, cancel_pending=cancel_pending)
         finally:
-            self._stopping.discard(session_id)
+            self._wake_main()
         if pending:
             # An offline queue has no active run to emit run.cancelled. Consumers
             # waiting for ingress capacity still need one deterministic wakeup.
@@ -587,12 +600,14 @@ class Runtime:
             self.store.cancel_inputs(session_id)
         task = self.tasks.get(session_id)
         expected_run = self.run_ids.get(session_id)
+        cancelled = False
         if task and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        await self.team.cancel_children(session_id)
+            if not task.cancelling():
+                task.cancel()
+            cancelled = await self.team._settle([task])
         if self.run_ids.get(session_id) != expected_run:
+            if cancelled:
+                raise asyncio.CancelledError
             return
         run_id = self.run_ids.pop(session_id, None)
         self.tasks.pop(session_id, None)
@@ -608,8 +623,8 @@ class Runtime:
                     # Immediate cancellation can precede the driver's first schedule.
                     self.compaction.adopt(session_id)
                 await self.bus.emit("run.cancelled", {"run_id": run_id}, session_id)
-        if cancel_pending:
-            self.store.cancel_inputs(session_id)
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def run_step(self, session_id: str, prompt: str, role: str, mode: str) -> str:
         self.store.add_message(session_id, "user", prompt)
@@ -680,13 +695,8 @@ class Runtime:
         finally:
             if run["status"] != "completed":
                 self._repair_tail(session_id)
-                already_stopping = session_id in self._stopping
-                self._stopping.add(session_id)
-                try:
+                with self._stopping_session(session_id):
                     await self.team.cancel_children(session_id)
-                finally:
-                    if not already_stopping:
-                        self._stopping.discard(session_id)
                 for child in self.store.list("workflow_run", 10000):
                     if child.get("parent_run_id") == run_id and child["status"] in {
                         "queued",
