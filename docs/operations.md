@@ -29,11 +29,13 @@
 
 Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用系统发行的 python-gobject / at-spi2-core；不需要在 MuLi 虚拟环境编译 GTK。设置 computer.python_path 指向具有 GI 的系统 Python，然后启用电脑工具。先在状态页查看能力。
 
+`computer.operation_timeout_seconds` 控制单次无障碍 helper 的总期限，默认 12 秒，可配置为大于 0、至多 120 秒的有限数值；`computer.snapshot_ttl_seconds` 控制快照及目标发现引用的有效期，默认 60 秒，至多 300 秒。两者不接受布尔值、字符串或无穷大。旧配置无需修改，缺省时沿用原期限；修改配置不会延长已有操作凭据。
+
 操作路径是 snapshot → action/type → 再次 snapshot。快照具有有效期，操作校验进程及 D-Bus 对象身份，成功或失败都消耗快照。界面不支持的动作不会降级成任意坐标点击。无障碍树不可用时可单独请求截图；截图不产生可执行节点身份，不能代替操作前的快照。macOS AX、Windows UIA 与任意坐标操作仍未实现。
 
 桌面图像采集另由 computer.capture.enabled 开启，默认关闭。截图与有界录屏保存在数据目录 captures/，随后可作为本地附件使用；不自动上传、不录制声音。工具沿用 computer 风险及 ask/auto/yolo 权限模式。单文件默认 32 MiB、目录默认 200 MiB，默认录屏上限 30 秒、8 fps；超过配额或取消时终止采集进程并删除未完成文件。后端与授权边界见 [平台能力](platforms.md)。
 
-下一版本候选支持显式 computer.capture.backend=portal 的 Linux 截图，复用 computer.python_path 的系统 Gio，不要求 AT-SPI 可用。保持 auto 选择顺序；Portal 不提供录屏或失败降级。portal_timeout_seconds 单独控制交互等待，默认 60 秒；可在截图高级配置或管理 API 中调整。能力查询不触发截图授权，真正截图仍可能显示系统对话框；当前只完成私有总线模拟验证，未在真实桌面采集。
+2.1 起支持显式 computer.capture.backend=portal 的 Linux 截图，复用 computer.python_path 的系统 Gio，不要求 AT-SPI 可用。保持 auto 选择顺序；Portal 不提供录屏或失败降级。portal_timeout_seconds 单独控制交互等待，默认 60 秒；可在截图高级配置或管理 API 中调整。能力查询不触发截图授权，真正截图仍可能显示系统对话框；当前只完成私有总线模拟验证，未在真实桌面采集。
 
 ## 数据与恢复
 

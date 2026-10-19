@@ -269,6 +269,8 @@
     "backend": "atspi",
     "python_path": "/usr/bin/python3",
     "max_nodes": 300,
+    "operation_timeout_seconds": 12,
+    "snapshot_ttl_seconds": 60,
     "capture": {
       "enabled": false,
       "backend": "auto",

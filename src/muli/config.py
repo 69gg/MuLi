@@ -401,6 +401,10 @@ class Computer(Section):
     backend: Literal["atspi"] = "atspi"
     python_path: str = "/usr/bin/python3"
     max_nodes: int = Field(default=300, ge=10, le=1000)
+    operation_timeout_seconds: float = Field(
+        default=12, gt=0, le=120, strict=True, allow_inf_nan=False
+    )
+    snapshot_ttl_seconds: float = Field(default=60, gt=0, le=300, strict=True, allow_inf_nan=False)
     capture: CaptureSettings = Field(default_factory=CaptureSettings)
 
 
