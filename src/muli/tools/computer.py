@@ -110,7 +110,7 @@ class Computer:
         if not self.config.enabled:
             raise ComputerError("disabled", "电脑操作尚未启用")
         if self.backend != "atspi" or sys.platform != "linux":
-            raise ComputerError("backend_unavailable", "当前版本的无障碍操作后端支持 Linux AT-SPI")
+            raise ComputerError("backend_unavailable", "当前平台无法使用所选无障碍后端")
         action = request.get("operation") in {"action", "type"}
 
         def failure(code: str, message: str) -> ComputerError:

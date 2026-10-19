@@ -17,11 +17,13 @@ async def check_installed(target: Path) -> None:
     import muli
     from muli.config import ConfigFile
     from muli.server import create_app
-    from muli.tools import atspi_helper
+    from muli.tools import atspi_helper, ax_helper, ax_lease
     from muli.tools.computer import ComputerError
 
     assert Path(muli.__file__).resolve().is_relative_to(target.resolve()), muli.__file__
     assert Path(atspi_helper.__file__).resolve().is_relative_to(target.resolve())
+    assert Path(ax_helper.__file__).resolve().is_relative_to(target.resolve())
+    assert Path(ax_lease.__file__).resolve().is_relative_to(target.resolve())
     with tempfile.TemporaryDirectory(prefix="muli-wheel-data-") as directory:
         root = Path(directory)
         config = ConfigFile(root / "config.json")
@@ -47,6 +49,7 @@ async def check_installed(target: Path) -> None:
                 assert app.state.runtime._history("new")[0].content
                 computer = app.state.runtime.computer
                 assert "computer_targets" in app.state.runtime.tools
+                assert "computer_release" in app.state.runtime.tools
                 try:
                     await computer.targets({})
                 except ComputerError as exc:

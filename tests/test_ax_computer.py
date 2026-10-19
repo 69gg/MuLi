@@ -52,6 +52,8 @@ ACCEPTED = {"ok": True, "outcome": "accepted", "effect_verified": False}
 PROBE = {
     "backend": "ax",
     "dependency_available": True,
+    "helper_pid": 42,
+    "executable": "/fake/python",
     "permission": {"trusted": True, "subject": "helper_process", "prompted": False},
     "session_accessible": None,
     "discovery_scope": "foreground_application",
@@ -317,6 +319,11 @@ async def test_cleanup_failure_does_not_overwrite_native_outcome(
     else:
         assert await computer.action(action(snapshot)) == ACCEPTED
     assert computer._ax._cleanup_error is not None and computer._ax._lease is lease
+    computer._ax._probe_result = {"available": True, "state": "ready"}
+    computer._ax._probe_until = asyncio.get_running_loop().time() + 60
+    status = await computer.status()
+    assert status["state"] == "unavailable" and status["available"] is False
+    assert status["busy"] and status["cleanup_error"]
     monkeypatch.setattr(lease, "aclose", original)
     await computer.aclose()
 

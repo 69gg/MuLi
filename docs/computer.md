@@ -1,6 +1,6 @@
 # 无障碍电脑操作
 
-2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 开发中的 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。Windows UIA 节点操作尚未实现；截图、录屏和后台服务的范围见[平台能力](platforms.md)。真实桌面验收与离线测试分开记录。
+2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 的实验性 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。Windows UIA 节点操作尚未实现；截图、录屏和后台服务的范围见[平台能力](platforms.md)。真实桌面验收与离线测试分开记录。
 
 ## 选择读取范围
 
@@ -59,7 +59,7 @@ helper 最长寿命复用 `snapshot_ttl_seconds`，从创建计时，读取和�
 }
 ```
 
-`operation_timeout_seconds` 是一次 helper 的总期限，大于 0、至多 120 秒；`snapshot_ttl_seconds` 同时约束快照与发现引用，大于 0、至多 300 秒。两者必须是有限数值。输出预算仍使用现有 `limits.max_output_chars`，无需再设置另一套预算。旧配置缺少这些字段时使用原来的 12 秒操作期限和 60 秒快照有效期。
+`operation_timeout_seconds` 是一次无障碍操作的期限，大于 0、至多 120 秒；`snapshot_ttl_seconds` 同时约束快照与发现引用，大于 0、至多 300 秒，AX 还用它限制整个原生对象会话的绝对寿命。两者必须是有限数值。输出预算仍使用现有 `limits.max_output_chars`，无需再设置另一套预算。旧配置缺少这些字段时使用原来的 12 秒操作期限和 60 秒快照有效期。
 
 `backend=auto` 在 Linux 选择 AT-SPI、macOS 选择 AX，其他平台明确报告不可用；显式 `atspi` 或 `ax` 不自动降级。旧配置中已有的 `atspi` 保持原值；macOS 用户需明确改为 `auto` 或 `ax`。Python 路径只影响 Linux 的 AT-SPI/Portal。所有平台仍默认 `enabled=false`。
 

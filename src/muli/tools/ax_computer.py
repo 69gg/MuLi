@@ -349,6 +349,10 @@ class AXComputer:
                 or permission.get("prompted") is not False
                 or data.get("session_accessible") is not None
                 or data.get("discovery_scope") != "foreground_application"
+                or type(data.get("helper_pid")) is not int
+                or data["helper_pid"] <= 0
+                or not isinstance(data.get("executable"), str)
+                or not 0 < len(data["executable"]) <= 4096
             ):
                 raise ComputerError("protocol_error", "AX 探测响应格式无效")
             trusted = permission["trusted"]
@@ -360,6 +364,8 @@ class AXComputer:
                 "dependency_available": True,
                 "session_accessible": None,
                 "permission": permission,
+                "helper_pid": data["helper_pid"],
+                "executable": data["executable"],
                 "discovery_scope": "foreground_application",
                 "supported_operations": ["targets", "snapshot", "action", "type"]
                 if trusted
@@ -414,6 +420,10 @@ class AXComputer:
         )
         if self._cleanup_error is not None:
             result["cleanup_error"] = self._cleanup_error
+            if (self._lease is not None and not self._lease.closed) or (
+                self._probe_lease is not None and not self._probe_lease.closed
+            ):
+                result.update(available=False, state="unavailable", reason=self._cleanup_error)
         return result
 
     async def aclose(self) -> None:
