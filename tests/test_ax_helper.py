@@ -619,6 +619,42 @@ def test_secure_text_does_not_read_label_value_children_or_actions() -> None:
 
 
 @pytest.mark.parametrize("role", sorted(helper.TEXT_ROLES))
+def test_secure_subtree_stays_unread_after_pid_metadata_failure(role: str) -> None:
+    descendant = Element(name="SECRET descendant")
+    secure = Element(
+        role,
+        "SECRET label",
+        pid=-1,
+        attrs={"AXSubrole": helper.SECURE_SUBROLE, "AXChildren": [descendant]},
+    )
+    world = World(secure)
+    try:
+        result = world.result("snapshot")
+        assert result["omission_reasons"] == ["provider_error"]
+        assert len(result["nodes"]) == 1 and "SECRET" not in json.dumps(result)
+        assert not {"AXTitle", "AXDescription", "AXValue", "AXChildren", "actions"}.intersection(
+            secure.reads
+        )
+        assert not descendant.reads
+    finally:
+        world.close()
+
+
+def test_nonprotected_subtree_remains_readable_after_pid_metadata_failure() -> None:
+    descendant = Element(name="普通后代")
+    group = Element("AXGroup", pid=-1, attrs={"AXChildren": [descendant]})
+    world = World(group)
+    try:
+        result = world.result("snapshot")
+        record = result["nodes"][1]
+        assert record["name"] == descendant.name and record["depth"] == 2
+        assert record["parent_ref_id"] is None and not record["parent_observed"]
+        assert result["omission_reasons"] == ["provider_error"]
+    finally:
+        world.close()
+
+
+@pytest.mark.parametrize("role", sorted(helper.TEXT_ROLES))
 @pytest.mark.parametrize(
     "subrole", [None, Fault(helper.NO_VALUE), Fault(helper.ATTRIBUTE_UNSUPPORTED), False]
 )
