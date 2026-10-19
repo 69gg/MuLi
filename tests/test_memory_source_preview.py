@@ -112,6 +112,29 @@ def test_arbitrarily_large_positive_integer_keeps_full_preview_behavior(memory: 
     assert memory.source("original", max_chars=1 << 100) == {**original, "truncated": False}
 
 
+@pytest.mark.parametrize("max_chars", [1, 4, 1 << 29, 1 << 62, 1 << 100])
+def test_sql_substr_length_never_exceeds_actual_blob(memory: Memory, max_chars: int) -> None:
+    content = "完整\x00😀原文"
+    original = register(memory, content)
+    lengths: list[int] = []
+
+    def observed_substr(raw: bytes, start: int, length: int) -> bytes:
+        # Observe the argument after SQL evaluation, before an older SQLite
+        # implementation could narrow it to a signed 32-bit integer.
+        lengths.append(length)
+        return raw[start - 1 : start - 1 + length]
+
+    memory.store.db.create_function("substr", 3, observed_substr)
+    preview = memory.source("original", max_chars=max_chars)
+    assert len(lengths) == 1
+    assert 0 <= lengths[0] <= len(content.encode("utf-8"))
+    assert preview == {
+        **original,
+        "content": content[:max_chars],
+        "truncated": len(content) > max_chars,
+    }
+
+
 @pytest.mark.parametrize("limit", [0, -1, True, False, 1.5, "3", [], {}])
 def test_invalid_source_preview_limit_is_rejected(memory: Memory, limit: Any) -> None:
     register(memory, "原文")

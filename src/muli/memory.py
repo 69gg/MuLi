@@ -256,9 +256,12 @@ class Memory:
             # Four bytes cover each requested Unicode code point. Keep SQLite's
             # integer binding bounded even when callers use an arbitrary-size int.
             max_bytes = min(max_chars * 4, sys.maxsize)
+            # Older SQLite narrows substr's length to 32 bits. The actual BLOB
+            # length is always valid, even when the requested prefix is larger.
             row = self.store.db.execute(
                 "SELECT id,source,session_id,role,principal,trusted_owner,digest,created_at,"
-                "substr(CAST(content AS BLOB),1,?) AS content_bytes,"
+                "substr(CAST(content AS BLOB),1,min(?,length(CAST(content AS BLOB)))) "
+                "AS content_bytes,"
                 "length(CAST(content AS BLOB)) AS total_bytes FROM memory_sources WHERE id=?",
                 (max_bytes, identifier),
             ).fetchone()
