@@ -93,6 +93,10 @@ for raw in sys.stdin.buffer:
         }
     elif mode == "bad_receipt":
         response["result"]["effect_verified"] = True
+    elif mode.startswith("error:"):
+        _, code, outcome = mode.split(":", 2)
+        response.pop("result")
+        response["error"] = {"code": code, "message": "有界诊断", "outcome": outcome}
     send(response)
     if mode == "duplicate":
         send(response)
@@ -520,6 +524,8 @@ async def test_protocol_parser_rejects_malformed_typed_fields(
     item._request_id, item._dispatched = "r1", True
     data: dict[str, Any] = {"v": 1, "request_id": "r1", "result": {}}
     corrupt(data)
+    if "error" in data:
+        data.pop("result")
     item._response(json.dumps(data).encode("utf-8"))
     with pytest.raises(AXLeaseError) as caught:
         await item._pending
@@ -697,5 +703,37 @@ async def test_transport_failure_after_write_attempt_is_unknown(
         await item.request("action", {"ref_id": "r1", "action": "AXPress"})
     assert caught.value.outcome == "unknown" and caught.value.code == "action_unknown_outcome"
     assert "sensitive" not in str(caught.value)
+    assert item._count == 1
+    assert_reaped(item)
+
+
+@pytest.mark.parametrize(
+    ("command", "code", "outcome", "expected_code", "expected_outcome"),
+    [
+        ("snapshot", "backend_unavailable", "not_started", "backend_unavailable", "not_started"),
+        ("snapshot", "node_budget", "not_started", "node_budget", "not_started"),
+        ("action", "output_budget", "not_started", "output_budget", "not_started"),
+        ("action", "action_unknown_outcome", "unknown", "action_unknown_outcome", "unknown"),
+        ("snapshot", "action_unknown_outcome", "unknown", "protocol_error", "not_started"),
+        ("snapshot", "action_unknown_outcome", "not_started", "protocol_error", "not_started"),
+        ("action", "action_unknown_outcome", "not_started", "action_unknown_outcome", "unknown"),
+        ("snapshot", "element_disabled", "unknown", "protocol_error", "not_started"),
+        ("action", "element_disabled", "unknown", "action_unknown_outcome", "unknown"),
+        ("snapshot", "future_unknown_code", "not_started", "protocol_error", "not_started"),
+        ("action", "future_unknown_code", "not_started", "action_unknown_outcome", "unknown"),
+    ],
+)
+async def test_native_error_codes_cannot_misrepresent_dispatch_outcome(
+    command: str,
+    code: str,
+    outcome: str,
+    expected_code: str,
+    expected_outcome: str,
+) -> None:
+    item = lease(f"error:{code}:{outcome}")
+    payload = {} if command == "snapshot" else {"ref_id": "r1", "action": "AXPress"}
+    with pytest.raises(AXLeaseError) as caught:
+        await item.request(command, payload)
+    assert caught.value.code == expected_code and caught.value.outcome == expected_outcome
     assert item._count == 1
     assert_reaped(item)

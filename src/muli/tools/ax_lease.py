@@ -21,6 +21,24 @@ MAX_REQUESTS = 16
 MAX_STDERR_BYTES = 2048
 _CLOSE_GRACE = 0.2
 _COMMANDS = frozenset({"probe", "targets", "snapshot", "action", "type", "release"})
+_PRE_DISPATCH_ERRORS = frozenset(
+    {
+        "backend_unavailable",
+        "dependency_missing",
+        "read_timeout",
+        "element_unavailable",
+        "permission_required",
+        "unsupported_operation",
+        "no_session",
+        "node_budget",
+        "protocol_error",
+        "output_budget",
+        "stale_node",
+        "target_changed",
+        "protected_element",
+        "element_disabled",
+    }
+)
 
 
 class AXLeaseError(ValueError):
@@ -289,6 +307,11 @@ class AXHelperLease:
                     or set(error) - {"code", "message", "outcome", "native_code"}
                 ):
                     raise ValueError("error")
+                if error["code"] == "action_unknown_outcome":
+                    if error["outcome"] != "unknown" or not self._mutation:
+                        raise ValueError("error_outcome")
+                elif error["code"] not in _PRE_DISPATCH_ERRORS or error["outcome"] != "not_started":
+                    raise ValueError("error_outcome")
                 self._pending.set_exception(
                     AXLeaseError(
                         error["code"],
