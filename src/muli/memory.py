@@ -9,6 +9,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from muli.memory_schema import SCHEMA
@@ -55,6 +56,14 @@ def _slots(values: Sequence[Any]) -> str:
     return ",".join("?" for _ in values)
 
 
+@dataclass(slots=True)
+class _Walk:
+    nodes: dict[str, int]
+    edges: list[dict[str, Any]]
+    parents: dict[str, dict[str, Any]]
+    truncated: bool
+
+
 class Memory:
     """所有 SQLite 操作在调用事件循环线程同步提交，事务中不等待网络。"""
 
@@ -84,6 +93,7 @@ class Memory:
                 "WHEN 'procedure' THEN 'procedural' WHEN 'observation' THEN 'episodic' "
                 "WHEN 'identity' THEN 'identity' ELSE 'semantic' END,content FROM memories"
             )
+            self._migrate_alias_evidence()
         cursor = self.store.db.execute(
             "SELECT id,content,entities FROM memories WHERE id NOT IN "
             "(SELECT memory_id FROM memory_terms)"
@@ -108,6 +118,26 @@ class Memory:
                             item["source_id"],
                             item["quote"],
                         )
+
+    def _migrate_alias_evidence(self) -> None:
+        """Copy only the one surviving legacy contribution, never infer lost assertions."""
+        if self.store.db.execute(
+            "SELECT 1 FROM memory_state WHERE name='alias_evidence_version'"
+        ).fetchone():
+            return
+        migrated = self.store.db.execute(
+            "INSERT OR IGNORE INTO memory_alias_evidence(alias,entity_id,memory_id,source_id) "
+            "SELECT a.alias,a.entity_id,a.memory_id,a.source_id FROM memory_aliases a "
+            "JOIN memory_entities e ON e.id=a.entity_id "
+            "JOIN memory_meta m ON m.memory_id=a.memory_id "
+            "JOIN memories i ON i.id=a.memory_id "
+            "WHERE a.alias!=e.canonical AND a.source_id IS m.source_id "
+            "AND (a.source_id IS NULL OR EXISTS "
+            "(SELECT 1 FROM memory_sources s WHERE s.id=a.source_id))"
+        )
+        self.store.db.execute("INSERT INTO memory_state VALUES('alias_evidence_version',1)")
+        if migrated.rowcount > 0:
+            self._bump()
 
     def configure(
         self,
@@ -276,9 +306,17 @@ class Memory:
         aliases: Mapping[str, str],
         source_id: str | None,
         memory_id: str | None,
-    ) -> None:
+    ) -> bool:
         if len(aliases) > 30:
             raise ValueError("实体别名数量超限")
+        if not aliases:
+            return False
+        owner = self.store.db.execute(
+            "SELECT source_id FROM memory_meta WHERE memory_id=?", (memory_id,)
+        ).fetchone()
+        if owner is None or owner["source_id"] != source_id:
+            raise ValueError("别名证明的记忆与原始来源不一致")
+        changed_before = self.store.db.total_changes
         for alias, canonical in aliases.items():
             if any(
                 not isinstance(value, str) or not value.strip() or len(value) > 200
@@ -296,6 +334,61 @@ class Memory:
                 "INSERT OR IGNORE INTO memory_aliases VALUES(?,?,?,?)",
                 (folded, identifier, source_id, memory_id),
             )
+            canonical_row = self.store.db.execute(
+                "SELECT canonical FROM memory_entities WHERE id=?", (identifier,)
+            ).fetchone()
+            if folded != canonical_row[0]:
+                self.store.db.execute(
+                    "INSERT OR IGNORE INTO memory_alias_evidence VALUES(?,?,?,?)",
+                    (folded, identifier, memory_id, source_id),
+                )
+                self._repair_aliases([folded])
+        return self.store.db.total_changes != changed_before
+
+    def _alias_keys(self, field: str, identifier: str) -> list[str]:
+        if field not in {"memory_id", "source_id"}:
+            raise ValueError("未知别名证明引用")
+        return [
+            str(row[0])
+            for row in self.store.db.execute(
+                f"SELECT alias FROM memory_alias_evidence WHERE {field}=? "
+                f"UNION SELECT alias FROM memory_aliases WHERE {field}=?",
+                (identifier, identifier),
+            )
+        ]
+
+    def _repair_aliases(self, aliases: Sequence[str]) -> None:
+        """Rebuild affected lookup rows before orphan cleanup, without owning proofs."""
+        for alias in sorted(set(aliases)):
+            row = self.store.db.execute(
+                "SELECT p.entity_id,p.memory_id,p.source_id FROM memory_alias_evidence p "
+                "JOIN memory_meta m ON m.memory_id=p.memory_id "
+                "WHERE p.alias=? AND p.source_id IS m.source_id ORDER BY p.memory_id LIMIT 1",
+                (alias,),
+            ).fetchone()
+            if row is not None:
+                self.store.db.execute(
+                    "INSERT INTO memory_aliases VALUES(?,?,?,?) ON CONFLICT(alias) DO UPDATE SET "
+                    "entity_id=excluded.entity_id,source_id=excluded.source_id,memory_id=excluded.memory_id "
+                    "WHERE memory_aliases.entity_id!=excluded.entity_id "
+                    "OR memory_aliases.source_id IS NOT excluded.source_id "
+                    "OR memory_aliases.memory_id IS NOT excluded.memory_id",
+                    (alias, row["entity_id"], row["source_id"], row["memory_id"]),
+                )
+            else:
+                # Legacy canonical rows may have owned references. Restore direct lookup
+                # after their cascade; the normal orphan purge still removes unused entities.
+                self.store.db.execute(
+                    "INSERT OR IGNORE INTO memory_aliases(alias,entity_id) "
+                    "SELECT canonical,id FROM memory_entities WHERE canonical=?",
+                    (alias,),
+                )
+
+    def _replace_alias_contributions(self, memory_id: str) -> None:
+        affected = self._alias_keys("memory_id", memory_id)
+        self.store.db.execute("DELETE FROM memory_alias_evidence WHERE memory_id=?", (memory_id,))
+        self.store.db.execute("DELETE FROM memory_aliases WHERE memory_id=?", (memory_id,))
+        self._repair_aliases(affected)
 
     def _sync_graph(
         self,
@@ -425,6 +518,8 @@ class Memory:
                 "SELECT memory_id FROM memory_meta WHERE dedup_key=?", (dedup_key,)
             ).fetchone()
             if duplicate is not None and duplicate[0] != identifier:
+                if self._aliases(aliases, source_id, str(duplicate[0])):
+                    self._bump()
                 return str(duplicate[0])
         identifier = identifier or new_id()
         if existing is not None:
@@ -435,7 +530,7 @@ class Memory:
             )
             self.store.db.execute("DELETE FROM memory_vectors WHERE memory_id=?", (identifier,))
             if not preserve_metadata:
-                self.store.db.execute("DELETE FROM memory_aliases WHERE memory_id=?", (identifier,))
+                self._replace_alias_contributions(identifier)
                 self.store.db.execute(
                     "DELETE FROM memory_conflicts WHERE left_id=? OR right_id=?",
                     (identifier, identifier),
@@ -739,8 +834,10 @@ class Memory:
             return self.forget_source(item["source_id"])
         with self.store.db:
             affected = self._memory_entity_ids(identifier)
+            aliases = self._alias_keys("memory_id", identifier)
             self._invalidate_communities([identifier])
             self.store.db.execute("DELETE FROM memories WHERE id=?", (identifier,))
+            self._repair_aliases(aliases)
             self._refresh_conflicts()
             self._rebuild_communities(affected)
             self._purge_orphans()
@@ -760,10 +857,14 @@ class Memory:
             entity for identifier in identifiers for entity in self._memory_entity_ids(identifier)
         }
         with self.store.db:
+            aliases = self._alias_keys("source_id", source_id)
+            for identifier in identifiers:
+                aliases.extend(self._alias_keys("memory_id", identifier))
             self._invalidate_communities(identifiers)
             for identifier in identifiers:
                 self.store.db.execute("DELETE FROM memories WHERE id=?", (identifier,))
             self.store.db.execute("DELETE FROM memory_sources WHERE id=?", (source_id,))
+            self._repair_aliases(aliases)
             self.store.db.execute(
                 "INSERT OR IGNORE INTO memory_forgotten_sources VALUES(?,?)", (source_id, now())
             )
@@ -778,8 +879,10 @@ class Memory:
             "DELETE FROM memory_entities WHERE id NOT IN (SELECT entity_id FROM memory_mentions) "
             "AND id NOT IN (SELECT subject_id FROM memory_edges) "
             "AND id NOT IN (SELECT object_id FROM memory_edges) "
-            "AND id NOT IN (SELECT entity_id FROM memory_aliases "
-            "WHERE source_id IS NOT NULL OR memory_id IS NOT NULL)"
+            "AND id NOT IN (SELECT entity_id FROM memory_alias_evidence) "
+            "AND id NOT IN (SELECT a.entity_id FROM memory_aliases a "
+            "JOIN memory_entities e ON e.id=a.entity_id WHERE a.alias!=e.canonical "
+            "AND (a.source_id IS NOT NULL OR a.memory_id IS NOT NULL))"
         )
 
     def _memory_entity_ids(self, identifier: str | None) -> set[str]:
@@ -797,13 +900,14 @@ class Memory:
 
     def _seeds(self, query: str) -> set[str]:
         folded = normalize_entity(query)
-        candidates = sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:64]
+        candidates = self._seed_terms(query)
         if not candidates:
             return set()
         seeds = {
             row[0]
             for row in self.store.db.execute(
-                f"SELECT entity_id FROM memory_aliases WHERE alias IN ({_slots(candidates)}) LIMIT ?",
+                f"SELECT DISTINCT entity_id FROM memory_aliases WHERE alias IN ({_slots(candidates)}) "
+                "ORDER BY entity_id LIMIT ?",
                 [*candidates, self.max_candidates],
             ).fetchall()
         }
@@ -814,11 +918,67 @@ class Memory:
                 "SELECT DISTINCT e.id,e.canonical FROM memory_entities e "
                 "JOIN memory_mentions mm ON mm.entity_id=e.id "
                 "JOIN memory_terms t ON t.memory_id=mm.memory_id "
-                f"WHERE t.term IN ({_slots(tokens)}) LIMIT ?",
+                f"WHERE t.term IN ({_slots(tokens)}) ORDER BY e.id LIMIT ?",
                 [*tokens, self.max_candidates],
             ).fetchall()
             seeds.update(row["id"] for row in rows if row["canonical"] in folded)
         return seeds
+
+    @staticmethod
+    def _seed_terms(query: str) -> list[str]:
+        folded = normalize_entity(query)
+        return sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:64]
+
+    def _seed_evidence(self, query: str, seeds: Sequence[str]) -> list[dict[str, Any]]:
+        """One bounded supporting contribution per actual seed, with no source body reads."""
+        candidates = self._seed_terms(query)
+        result: list[dict[str, Any]] = []
+        for identifier in seeds:
+            entity = self.store.db.execute(
+                "SELECT canonical,name FROM memory_entities WHERE id=?", (identifier,)
+            ).fetchone()
+            if entity is None:
+                continue
+            row = self.store.db.execute(
+                "SELECT alias,memory_id,source_id FROM memory_aliases "
+                f"WHERE entity_id=? AND alias IN ({_slots(candidates)}) "
+                "ORDER BY alias=? ,alias LIMIT 1",
+                [identifier, *candidates, entity["canonical"]],
+            ).fetchone()
+            alias = str(row["alias"]) if row is not None else None
+            entry: dict[str, Any] = {
+                "entity_id": identifier,
+                "canonical": entity["canonical"],
+                "name": entity["name"],
+                "alias": alias,
+                "kind": "direct",
+                "memory_id": None,
+                "source_id": None,
+                "has_more": False,
+            }
+            if alias is not None and alias != entity["canonical"]:
+                proofs = self.store.db.execute(
+                    "SELECT p.memory_id,p.source_id FROM memory_alias_evidence p "
+                    "JOIN memory_meta m ON m.memory_id=p.memory_id "
+                    "WHERE p.alias=? AND p.entity_id=? AND p.source_id IS m.source_id "
+                    "ORDER BY p.memory_id LIMIT 2",
+                    (alias, identifier),
+                ).fetchall()
+                if proofs:
+                    entry.update(
+                        kind="source" if proofs[0]["source_id"] is not None else "manual",
+                        memory_id=proofs[0]["memory_id"],
+                        source_id=proofs[0]["source_id"],
+                        has_more=len(proofs) > 1,
+                    )
+                else:
+                    entry.update(
+                        kind="legacy_unknown",
+                        memory_id=row["memory_id"],
+                        source_id=row["source_id"],
+                    )
+            result.append(entry)
+        return result
 
     def _walk(
         self,
@@ -826,12 +986,13 @@ class Memory:
         hops: int,
         *,
         node_limit: int | None = None,
-    ) -> tuple[dict[str, int], list[dict[str, Any]], bool]:
+    ) -> _Walk:
         node_limit = node_limit or self.max_candidates
         nodes = {identifier: 0 for identifier in sorted(seeds)[:node_limit]}
         frontier = set(nodes)
         seen_edges: set[tuple[str, str, str, str]] = set()
         edges: list[dict[str, Any]] = []
+        parents: dict[str, dict[str, Any]] = {}
         truncated = len(seeds) > node_limit
         for depth in range(1, hops + 1):
             if not frontier or len(edges) >= self.max_graph_edges:
@@ -861,22 +1022,50 @@ class Memory:
                 if len(nodes) + len(unseen) > node_limit:
                     truncated = True
                     continue
+                if row["subject_id"] in frontier:
+                    origin, destination, direction = row["subject_id"], row["object_id"], "forward"
+                else:
+                    origin, destination, direction = row["object_id"], row["subject_id"], "reverse"
+                step = {
+                    "memory_id": row["memory_id"],
+                    "source_id": row["source_id"],
+                    "subject_id": row["subject_id"],
+                    "subject": row["subject"],
+                    "predicate": row["predicate"],
+                    "object_id": row["object_id"],
+                    "object": row["object"],
+                    "from_id": origin,
+                    "to_id": destination,
+                    "direction": direction,
+                }
                 seen_edges.add(key)
-                edges.append({**dict(row), "depth": depth})
+                edges.append({**dict(row), "depth": depth, "traversal": step})
                 for identifier in unseen:
                     nodes[identifier] = depth
                     next_frontier.add(identifier)
+                    parents[identifier] = step
             frontier = next_frontier
-        return nodes, edges, truncated
+        return _Walk(nodes, edges, parents, truncated)
+
+    @staticmethod
+    def _walk_path(step: dict[str, Any], parents: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
+        steps = [step]
+        seed = str(step["from_id"])
+        while seed in parents:
+            previous = parents[seed]
+            steps.append(previous)
+            seed = str(previous["from_id"])
+        return {"seed_id": seed, "steps": list(reversed(steps)), "complete": True}
 
     def traverse(self, entity: str, *, hops: int | None = None) -> dict[str, Any]:
         self._query(entity)
         chosen_hops = self.graph_hops if hops is None else hops
         if type(chosen_hops) is not int or not 0 <= chosen_hops <= 8:
             raise ValueError("图查询 hops 必须在 0 到 8 之间")
-        nodes, edges, truncated = self._walk(self._seeds(entity), chosen_hops)
+        revision = self.revision
+        walk = self._walk(self._seeds(entity), chosen_hops)
         names = []
-        for identifier, depth in nodes.items():
+        for identifier, depth in walk.nodes.items():
             row = self.store.db.execute(
                 "SELECT name,canonical FROM memory_entities WHERE id=?", (identifier,)
             ).fetchone()
@@ -889,7 +1078,16 @@ class Memory:
                         "depth": depth,
                     }
                 )
-        return {"nodes": names, "edges": edges, "hops": chosen_hops, "truncated": truncated}
+        seeds = [identifier for identifier, depth in walk.nodes.items() if depth == 0]
+        return {
+            "nodes": names,
+            "edges": walk.edges,
+            "hops": chosen_hops,
+            "truncated": walk.truncated,
+            "revision": revision,
+            "alias_evidence": self._seed_evidence(entity, seeds),
+            "paths": [self._walk_path(edge["traversal"], walk.parents) for edge in walk.edges],
+        }
 
     def graph(self) -> dict[str, Any]:
         rows = self.store.db.execute(
@@ -921,6 +1119,7 @@ class Memory:
         limit = max(1, min(limit, self.max_candidates))
         scores: dict[str, float] = {}
         matched: dict[str, str] = {}
+        graph_paths: dict[str, dict[str, Any]] = {}
         tokens = sorted(terms(query))[:64]
         if not query.strip():
             rows = self.store.db.execute(
@@ -943,11 +1142,17 @@ class Memory:
                 matched[row["memory_id"]] = "lexical"
         if query.strip():
             graph = self.traverse(query, hops=hops)
-            for edge in graph["edges"]:
+            seed_evidence = {entry["entity_id"]: entry for entry in graph["alias_evidence"]}
+            for edge, path in zip(graph["edges"], graph["paths"], strict=True):
                 identifier = edge["memory_id"]
                 if identifier not in scores and len(scores) < self.max_candidates:
                     scores[identifier] = 0.5 / edge["depth"]
                     matched[identifier] = "graph"
+                    graph_paths[identifier] = {
+                        **path,
+                        "revision": graph["revision"],
+                        "seed": seed_evidence[path["seed_id"]],
+                    }
         ranked = []
         timestamp = now()
         for identifier, score in scores.items():
@@ -956,7 +1161,10 @@ class Memory:
                 continue
             age_days = max(0.0, timestamp - item["updated_at"]) / 86400
             score += 0.15 * item["confidence"] + 0.05 / (1 + age_days)
-            ranked.append({**item, "score": score, "matched_by": matched[identifier]})
+            entry = {**item, "score": score, "matched_by": matched[identifier]}
+            if identifier in graph_paths:
+                entry["graph_via"] = graph_paths[identifier]
+            ranked.append(entry)
         return sorted(ranked, key=lambda item: (-item["score"], -item["updated_at"], item["id"]))[
             :limit
         ]
@@ -966,13 +1174,14 @@ class Memory:
         for seed in sorted(affected):
             if seed in visited:
                 continue
-            nodes, _, truncated = self._walk(
+            walk = self._walk(
                 {seed},
                 self.max_community_members,
                 node_limit=self.max_community_members,
             )
-            visited.update(nodes)
-            ordered = sorted(nodes)
+            truncated = walk.truncated
+            visited.update(walk.nodes)
+            ordered = sorted(walk.nodes)
             if not ordered:
                 continue
             self.store.db.execute(
