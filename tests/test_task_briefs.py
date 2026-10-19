@@ -49,6 +49,35 @@ def bind(runtime: Runtime, commitment_id: str) -> dict[str, Any]:
     return session
 
 
+@pytest.mark.parametrize("with_services", [False, True])
+async def test_brief_guidance_is_only_given_to_main_with_registered_tools(
+    tmp_path: Path, with_services: bool
+) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    if with_services:
+        attach_services(runtime, tmp_path)
+    try:
+        main = runtime.main_session()
+        prompt = runtime._history(main["id"])[0].content
+        assert ("持续协作的任务说明：" in prompt) is with_services
+        if with_services:
+            for instruction in (
+                "完整目标、逐条限制",
+                "evidence_refs",
+                "commitment_id",
+                "send_input 显式通知",
+                "不增加授权",
+                "不会自动暂停队友或即时撤销工具调用",
+            ):
+                assert instruction in prompt
+        for kind in ("team", "workflow"):
+            session = runtime.new_session()
+            runtime.store.put("session", {**session, "kind": kind, "role": "main"})
+            assert "持续协作的任务说明：" not in runtime._history(session["id"])[0].content
+    finally:
+        await runtime.close()
+
+
 async def test_progress_saves_preserve_full_brief_and_unknown_fields(tmp_path: Path) -> None:
     store = Store(tmp_path / "db")
     ledger = Commitments(store, EventBus(store))
