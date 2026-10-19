@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
@@ -51,6 +50,7 @@ class WorkflowEngine:
         self.timeout, self.max_output_chars = timeout, max_output_chars
         self._capacity = asyncio.Semaphore(max_parallel)
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancellations: dict[str, asyncio.Task[JsonObject]] = {}
         self._closed = False
         self.scope_admission = scope_admission
         self._recover()
@@ -448,20 +448,63 @@ class WorkflowEngine:
         except Exception as exc:
             await self._finish(run, "failed", f"工作流执行失败：{type(exc).__name__}")
 
-    async def cancel(self, run_id: str) -> JsonObject:
+    def _cancellation(self, run_id: str) -> asyncio.Task[JsonObject]:
+        if operation := self._cancellations.get(run_id):
+            return operation
         run = self.store.get("workflow_run", run_id)
         if run is None:
             raise KeyError(run_id)
         task = self._tasks.get(run_id)
-        if task is not None and not task.done():
+        # Select and cancel before the first await/task handoff, so an immediate
+        # stop cannot accidentally let a queued node execute. A terminal commit
+        # may still own a live finalizer, which must only be observed.
+        if (
+            run["status"] in _UNFINISHED
+            and task is not None
+            and not task.done()
+            and not task.cancelling()
+        ):
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        run = self.store.get("workflow_run", run_id) or run
+        operation = asyncio.create_task(
+            self._cancel(run, task), name=f"muli-workflow-cancel-{run_id}"
+        )
+        self._cancellations[run_id] = operation
+        operation.add_done_callback(lambda completed: self._cancel_done(run_id, completed))
+        return operation
+
+    def _cancel_done(self, run_id: str, task: asyncio.Task[JsonObject]) -> None:
+        self._cancellations.pop(run_id, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _cancel(self, run: JsonObject, task: asyncio.Task[None] | None) -> JsonObject:
+        if task is not None:
+            await self._settle([task])
+            if not task.cancelled():
+                task.result()
+        run = self.store.get("workflow_run", run["id"]) or run
         # create_task 在首次调度前被取消时，协程内部的 finally 不会执行。
         if run["status"] in _UNFINISHED:
             await self._finish(run, "cancelled", "工作流已取消")
         return run
+
+    @staticmethod
+    async def _settle(tasks: Sequence[asyncio.Task[Any]]) -> bool:
+        """Adopt cleanup before propagating an observer's cancellation."""
+        settled = asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = False
+        while not settled.done():
+            try:
+                await asyncio.shield(settled)
+            except asyncio.CancelledError:
+                cancelled = True
+        return cancelled
+
+    async def cancel(self, run_id: str) -> JsonObject:
+        operation = self._cancellation(run_id)
+        if await self._settle([operation]):
+            raise asyncio.CancelledError
+        return operation.result()
 
     async def wait(self, run_id: str) -> JsonObject:
         """外部等待者取消只结束等待，子运行的取消须显式调用 cancel。"""
@@ -483,5 +526,11 @@ class WorkflowEngine:
 
     async def close(self) -> None:
         self._closed = True
-        for run_id in list(self._tasks):
-            await self.cancel(run_id)
+        # A pre-schedule cancellation can already have removed its driver while
+        # the shared fallback is still publishing. Close owns both kinds of work.
+        operations = set(self._cancellations.values())
+        operations.update(self._cancellation(run_id) for run_id in self._tasks)
+        if await self._settle(list(operations)):
+            raise asyncio.CancelledError
+        for operation in operations:
+            operation.result()
