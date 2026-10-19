@@ -19,10 +19,16 @@ class DOMElement {
   constructor(tag, document) {
     this.tagName = tag.toUpperCase(); this.document = document; this.childNodes = []; this.parentNode = null;
     this.dataset = {}; this.attributes = {}; this.events = {}; this.className = "";
-    this.value = ""; this.name = ""; this.type = ""; this.hidden = false; this.disabled = false; this.open = false;
+    this._value = ""; this.name = ""; this.type = ""; this.hidden = false; this.disabled = false; this.open = false;
     this.classList = { toggle() {}, add() {}, remove() {} };
   }
   get children() { return this.childNodes.filter((node) => node instanceof DOMElement); }
+  get value() {
+    if (this.tagName !== "SELECT") return this._value;
+    const options = this.children.filter((node) => node.tagName === "OPTION");
+    return this.selectionSet ? options.find((option) => option.value === this._value)?.value ?? "" : options[0]?.value ?? "";
+  }
+  set value(value) { this._value = String(value); this.selectionSet = true; }
   get firstElementChild() { return this.children[0] ?? null; }
   get textContent() { return this.childNodes.map((node) => node.textContent).join(""); }
   set textContent(text) { this.replaceChildren(new TextNode(text)); }
@@ -358,4 +364,25 @@ test("queued toggles from detached old details cannot prefetch after a new check
   await h.button("重新核查").dispatch("click"); await flush();
   for (const detail of oldDetails) { detail.open = true; await detail.dispatch("toggle"); }
   await flush(); assert.equal(h.requests.length, 2); assert.equal(h.ui.slot.page, null);
+});
+
+test("all persisted memory types have a Chinese option and survive the actual correction form submission", async () => {
+  for (const kind of ["identity", "episodic", "semantic", "procedural", "observation", "preference", "fact", "procedure", "summary"]) {
+    const item = fixtureMemory("memory-one", { kind }), h = harness(async () => item);
+    await h.ui.editMemory(item.id);
+    const select = h.dialog.querySelector('[name="kind"]');
+    assert.equal(select.value, kind, `${kind} must not become an empty or fallback selection`);
+    assert.match(select.children.find((option) => option.value === kind).textContent, /[\u4e00-\u9fff]/);
+    await h.form.dispatch("submit");
+    assert.equal(h.requests.find((request) => request.method === "PATCH")?.body.kind, kind);
+  }
+});
+
+test("an unknown persisted type remains a current option and is never silently replaced", async () => {
+  const item = fixtureMemory("memory-one", { kind: "future_kind" }), h = harness(async () => item);
+  await h.ui.editMemory(item.id);
+  const select = h.dialog.querySelector('[name="kind"]');
+  assert.equal(select.value, item.kind); assert.ok(select.children.some((option) => option.value === item.kind && option.textContent.includes("当前类型")));
+  await h.form.dispatch("submit");
+  assert.equal(h.requests.find((request) => request.method === "PATCH")?.body.kind, item.kind);
 });
