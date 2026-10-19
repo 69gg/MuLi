@@ -43,6 +43,13 @@ export function uploadFile(file, { signal } = {}) {
   });
 }
 
+/** Return text for an editable draft; this endpoint never submits chat input. */
+export function transcribeAttachment(attachmentId, { signal } = {}) {
+  return request("/media/transcribe", {
+    method: "POST", body: { attachment_id: attachmentId }, signal,
+  });
+}
+
 /** CR, LF, split CRLF, comments and multiline data are handled incrementally. */
 export function createSSEParser(onEvent) {
   let buffer = "";

@@ -279,6 +279,14 @@
       "max_total_bytes": 209715200
     }
   },
+  "web_voice": {
+    "enabled": false,
+    "max_seconds": 60,
+    "max_file_bytes": 8388608,
+    "max_concurrent": 1,
+    "timeout": 60,
+    "max_text_chars": 64000
+  },
   "voice": {
     "enabled": false,
     "wake_word": "沐璃",

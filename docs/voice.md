@@ -1,4 +1,42 @@
-# 本地唤醒与语音
+# 网页录音草稿与本地语音
+
+## 网页点击录音
+
+`web_voice.enabled` 默认 `false`，与后台 `voice.enabled` 独立。工作台“语音与采集”设置开启后，还需配置 `media.asr` 的模型、基础地址和凭据。网页不需要安装录音库、本地模型或 FFmpeg；音频只发往当前配置的 OpenAI 兼容 ASR 服务。
+
+```json
+{
+  "web_voice": {
+    "enabled": false,
+    "max_seconds": 60,
+    "max_file_bytes": 8388608,
+    "max_concurrent": 1,
+    "timeout": 60,
+    "max_text_chars": 64000
+  },
+  "media": {
+    "asr": {
+      "model": "填写转写模型ID",
+      "base_url": "https://provider.example/v1",
+      "api_key_env": "MULI_ASR_KEY"
+    }
+  }
+}
+```
+
+在对话输入框点击麦克风，再由浏览器申请权限；点击“停止并转写”才上传并转写。转写只返回可编辑草稿，检查后仍需点击发送，才成为当前登录用户的消息。接口不会调用主模型、提交主人输入、触发记忆提炼或登记语音身份。浏览器权限和这段录音都不构成声纹验证，也不会启用后台唤醒。
+
+录音开始时保留输入框和会话快照。期间发生输入、发送或会话切换时，转写保存在独立草稿区，原输入不变；可编辑后选择追加或丢弃。即使文字后来被改回原值，也不会覆盖期间的编辑。取消、切换至其它功能页、页面隐藏或离开页面会停止所有已取得的轨道并中止上传/转写；取消后迟到的结果被丢弃。设备意外结束或权限撤销时丢弃本次未上传录音并提示重试。显式退出登录会取消当前操作并清空内存中的输入和转写草稿，已保存的音频仍在附件库。浏览器的权限请求无法由标准 API 撤回，忽略权限提示时最多保留一个未决请求；若后来批准，已取消录音的轨道会立即关闭。
+
+网页需要 HTTPS 或 localhost 等安全上下文及浏览器的 `getUserMedia` / `MediaRecorder` 支持。远程 HTTP 地址通常不能使用麦克风；通过局域网访问时需提供 HTTPS。格式按浏览器探测选择 WebM/Opus、MP4 或 Ogg/Opus，不要求所有浏览器支持同一种格式。格式不可用或权限拒绝会显示原因，不尝试后台采集。
+
+`max_seconds` 为 1–300 秒，浏览器使用单调时钟到期停止；浏览器暂停或延迟计时器时无法保证精确音频时长，服务端不解码音频验证时长。服务端硬限制为文件字节、总转写时间和并发数：文件上限取本节、`uploads.max_file_bytes`、`media.asr.max_input_bytes` 三者最小值，并受附件总配额约束；本节可设 1 KiB–32 MiB。`max_concurrent` 为 1–4，满额立即返回 429，不建立等待队列。`timeout` 为有限正数，最多 300 秒，限制整个服务端读取与 ASR 请求，也用于网页权限、停止、上传和转写各阶段的等待上限。`max_text_chars` 为 1–64000，超限明确失败，不静默截断。
+
+停止后通过既有 `POST /api/uploads` 保存原音频，再以 `POST /api/media/transcribe`、JSON `{"attachment_id":"附件ID"}` 取得 `{"text":"转写文字","attachment_id":"附件ID","draft":true}`。两个接口沿用登录与同源限制；新接口只接受本地音频附件。请求断开、配置修改及关闭服务会取消正在转写的 HTTP 请求，但取消不能保证已接收音频的上游不计费。音频仍保留在附件目录 `data/attachments/`，转写失败或丢弃文字不会删除音频；可在附件库手动删除。录音不会自动附到聊天消息，只有用户另行选择附件或点击发送文字才进入对话。NDJSON 导出不包含音频文件，备份时应另存附件目录。
+
+网页状态机、ASR 接口和断开处理均以假录音器、假轨道及 HTTP MockTransport 验证；开发验证没有打开实际麦克风或调用付费转写。浏览器行为依据 [getUserMedia](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)、[MediaRecorder.stop](https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/stop)、[MediaStreamTrack.stop](https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack/stop) 官方文档核对。
+
+## 本地后台唤醒
 
 voice.enabled 默认 false。未启用时，start 不创建采集任务，listen_once 和 enroll 拒绝录音。模块导入、状态探测与设置读取都不会打开麦克风、下载模型或加载 GPU 推理框架。本轮使用模拟音频与模拟进程验证，未实际录音或播放开发机音频。
 

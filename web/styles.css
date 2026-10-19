@@ -425,6 +425,12 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .composer-options { gap: 8px; }
 .composer-options select { font-size: 11px; }
 .composer-attachments { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 0 13px; }
+.voice-progress { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-bottom: 12px; font-size: 12px; color: var(--muted); }
+.voice-progress > span { flex: 1; min-width: 150px; }
+.voice-draft { padding-bottom: 12px; }
+.voice-draft > label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+.voice-draft textarea { width: 100%; max-height: 180px; resize: vertical; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--text); font: inherit; }
+.voice-draft > div { display: flex; gap: 12px; margin-top: 6px; }
 .attach-button { margin-left: -4px; }
 .attach-button svg { width: 17px; height: 17px; }
 .send-button { width: 34px; height: 34px; color: var(--on-accent); }
