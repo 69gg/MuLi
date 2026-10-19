@@ -1064,7 +1064,8 @@ function invalidateMemoryEvidence(event) {
   const slot = memoryDialog;
   if (!slot || !memoryDialogCurrent(slot)) return;
   const data = event.data ?? {};
-  if (!(data.memory_ids ?? []).includes(slot.id) && !(data.source_id && data.source_id === slot.sourceId)) return;
+  const sourceUnresolved = slot.sourceId === undefined && !!slot.readController;
+  if (!(data.memory_ids ?? []).includes(slot.id) && !(data.source_id && (data.source_id === slot.sourceId || sourceUnresolved))) return;
   resetMemoryReads(slot);
   if (slot.editing) {
     slot.invalidated = true; $("#dialog-submit").disabled = true;
@@ -1114,7 +1115,12 @@ function renderMemoryCorrection(slot) {
     await saveMemory(item, form);
     if (!memoryDialogCurrent(slot)) return;
     await switchView("memories");
-    if (memoryDialogCurrent(slot)) await refreshMemoryEvidence(slot);
+    if (memoryDialogCurrent(slot)) {
+      await refreshMemoryEvidence(slot);
+      if (memoryDialogCurrent(slot) && slot.item) {
+        const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
+      }
+    }
   };
   $("textarea", slot.content)?.focus({ preventScroll: true });
 }
