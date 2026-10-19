@@ -222,6 +222,7 @@ test("the live task control renderer inserts button nodes in every actionable st
     assert.ok(slot.actions.children.length >= 2);
     assert.ok(slot.actions.children.every((node) => node instanceof DOMButton), "replaceChildren must receive the actual button nodes, not an array coerced to text");
     assert.ok(slot.actions.children.every((node) => node.type === "button"));
+    if (taskControlView(model.state).paused && !model.state.editing) assert.ok(slot.actions.children.some((node) => node.children.includes("补充要求并交沐璃")));
   }
 });
 

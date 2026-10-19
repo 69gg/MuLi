@@ -800,7 +800,7 @@ function renderTaskBriefDialog(slot = taskDialog) {
     actions.push(localButton(data.conflict ? "确认要求并重新规划" : "交沐璃重新规划", "replan", () => void submitTaskControl(slot.model, "request_replan"), { primary: true, disabled: !view.canReplan }));
     actions.push(localButton("取消编辑", "cancel-edit", () => { slot.model.cancelEdit(); renderTaskBriefDialog(slot); }, { disabled: view.busy }));
   } else if (view.paused) {
-    actions.push(localButton("修改要求并交沐璃", "edit", () => { slot.model.edit(); renderTaskBriefDialog(slot); slot.input.focus(); }, { primary: true, disabled: !view.canReplan }));
+    actions.push(localButton("补充要求并交沐璃", "edit", () => { slot.model.edit(); renderTaskBriefDialog(slot); slot.input.focus(); }, { primary: true, disabled: !view.canReplan }));
     if (data.current.control.replan_request_id) actions.push(localButton("重新暂停", "pause", () => void submitTaskControl(slot.model, "pause"), { disabled: !view.canPause }));
     actions.push(localButton("查看主对话", "chat", () => { $("#app-dialog").close(); void switchView("chat"); }));
   } else if (view.capable) actions.push(localButton("暂停任务树", "pause", () => void submitTaskControl(slot.model, "pause"), { primary: true, disabled: !view.canPause }));
