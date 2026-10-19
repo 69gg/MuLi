@@ -70,7 +70,9 @@ let messageNodes = new Map();
 let toolNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
+let dialogMemoryReturn = null;
 let taskDialog = null;
+let memoryDialog = null;
 const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
@@ -123,7 +125,8 @@ async function request(path, options) {
 function showLogin() {
   voiceInput.cancel();
   clearTaskControls();
-  dialogTeamView = null;
+  releaseMemoryDialog();
+  dialogTeamView = null; dialogMemoryReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
   state.connected = false; state.auth.authenticated = false;
@@ -454,6 +457,7 @@ function startGlobalEvents() {
     }
     if (event.type.startsWith("team.") && state.view === "team") void refreshTeam();
     if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog();
+    if (["memory.updated", "memory.forgotten"].includes(event.type)) invalidateMemoryEvidence(event);
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads();
   } });
 }
@@ -553,8 +557,10 @@ function resizeComposer() {
   const input = $("#message-input"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 220)}px`; renderComposer();
 }
 
-function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, onSubmit }) {
+function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, onSubmit }) {
   releaseTaskDialog();
+  releaseMemoryDialog();
+  dialogMemoryReturn = returnMemoryId;
   const teamView = captureTeamView($("#other-view"));
   dialogTeamView = teamView?.inside ? teamView : null;
   $("#dialog-title").textContent = title;
@@ -605,6 +611,7 @@ function emptyState(iconName, title, description) {
 }
 
 async function switchView(view) {
+  if (view !== state.view && memoryDialog) { $("#app-dialog").close(); releaseMemoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
@@ -953,27 +960,33 @@ function renderMemories() {
   root.append(form, element("div", { class: "list-caption" }, `${state.memories.length} 条记忆`, state.memoryQuery ? `“${state.memoryQuery}”` : "全部记忆"));
   if (!state.memories.length) root.append(emptyState("memory", state.memoryQuery ? "没有找到相关记忆" : "还没有记忆", state.memoryQuery ? "换个关键词试试。" : "添加希望沐璃记住的内容。"));
   for (const item of state.memories) {
-    root.append(element("article", { class: "memory-row" }, element("div", { class: "row-icon" }, icon("memory")), element("div", { class: "row-content" }, element("p", { text: item.content }), element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryKind(item.kind) }), ...(item.entities ?? []).map((entity) => element("span", { text: typeof entity === "string" ? entity : entity.name ?? "" })), element("time", { text: formatTimestamp(item.updated_at ?? item.created_at) }), item.matched_by && element("span", { text: { text: "文本匹配", graph: "关系匹配", "graph+text": "文本与关系匹配" }[item.matched_by] ?? item.matched_by }), item.relations?.length && actionButton(`${item.relations.length} 条关系`, "memory-evidence", "text-button", undefined, { id: item.id }))), element("div", { class: "row-actions" }, iconButton("编辑记忆", "edit-memory", "edit", { id: item.id }), iconButton("删除记忆", "delete-memory", "trash", { id: item.id }))));
+    root.append(element("article", { class: "memory-row" }, element("div", { class: "row-icon" }, icon("memory")), element("div", { class: "row-content" }, element("p", { text: item.content }), element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryKind(item.kind) }), memoryNeedsReview(item) && element("span", { class: "row-tag", text: "待核对" }), ...(item.entities ?? []).map((entity) => element("span", { text: typeof entity === "string" ? entity : entity.name ?? "" })), element("time", { text: formatTimestamp(item.updated_at ?? item.created_at) }), item.matched_by && element("span", { text: { text: "文本匹配", graph: "关系匹配", "graph+text": "文本与关系匹配" }[item.matched_by] ?? item.matched_by }))), element("div", { class: "row-actions" }, actionButton("核查", "memory-evidence", "text-button", undefined, { id: item.id }), iconButton("更正记忆", "edit-memory", "edit", { id: item.id }), iconButton("删除记忆", "delete-memory", "trash", { id: item.id }))));
   }
   return root;
 }
 
 function memoryKind(kind) { return { preference: "偏好", fact: "事实", observation: "观察", procedure: "流程", summary: "摘要" }[kind] ?? kind ?? "观察"; }
+function memoryNeedsReview(item) { return item.status === "conflict" || !!item.conflicts?.length; }
 
-function editMemory(id) {
-  const item = state.memories.find((entry) => String(entry.id) === String(id));
+function memoryEditor(item) {
   const relations = element("div", { id: "memory-relations", class: "memory-relations-editor" });
   for (const relation of item?.relations ?? []) relations.append(relationEditor(relation));
-  const content = element("div", {}, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 5, required: true }), selectField("类型", "kind", item?.kind ?? "observation", [["observation", "观察"], ["preference", "偏好"], ["fact", "事实"], ["procedure", "流程"], ["summary", "摘要"]]), field("关联实体", "entities", (item?.entities ?? []).join(", "), { placeholder: "用逗号分隔" }), element("details", { class: "advanced-settings", open: !!item?.relations?.length }, element("summary", { text: "关系与来源" }), element("label", { class: "field" }, element("span", { text: "关系" })), relations, actionButton("添加关系", "add-memory-relation", "secondary-button", "plus"), element("div", { class: "field-row field-top-space" }, field("来源", "source", item?.source ?? "user"), field("置信度", "confidence", item?.confidence ?? 1, { type: "number", min: 0, max: 1, step: .05 }))));
-  openDialog({ title: item ? "编辑记忆" : "新增记忆", content, onSubmit: async (form) => {
-    const data = new FormData(form);
-    const edges = $$(".relation-editor", form).map((row) => Object.fromEntries(["subject", "predicate", "object"].map((key) => [key, $(`[name=relation-${key}]`, row).value.trim()])));
-    if (edges.some((edge) => !edge.subject || !edge.predicate || !edge.object)) throw new Error("请填写完整关系，或移除空白关系。");
-    const payload = { content: String(data.get("content")).trim(), kind: data.get("kind"), entities: String(data.get("entities")).split(/[,，]/).map((entry) => entry.trim()).filter(Boolean), relations: edges, source: String(data.get("source")).trim() || "user", confidence: Number(data.get("confidence")) };
-    if (!payload.content) throw new Error("请输入记忆内容。");
-    await request(item ? `/memories/${encodeURIComponent(item.id)}` : "/memories", { method: item ? "PATCH" : "POST", body: payload });
-    toast(item ? "记忆已更新" : "记忆已保存"); await switchView("memories");
-  } });
+  return element("div", {}, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 5, required: true }), selectField("类型", "kind", item?.kind ?? "observation", [["observation", "观察"], ["preference", "偏好"], ["fact", "事实"], ["procedure", "流程"], ["summary", "摘要"]]), field("关联实体", "entities", (item?.entities ?? []).join(", "), { placeholder: "用逗号分隔" }), element("details", { class: "advanced-settings", open: !!item?.relations?.length }, element("summary", { text: "关系与来源标签" }), element("label", { class: "field" }, element("span", { text: "关系" })), relations, actionButton("添加关系", "add-memory-relation", "secondary-button", "plus"), element("div", { class: "field-row field-top-space" }, field("来源标签", "source", item?.source ?? "user"), field("置信度", "confidence", item?.confidence ?? 1, { type: "number", min: 0, max: 1, step: .05 }))));
+}
+
+async function saveMemory(item, form) {
+  const data = new FormData(form);
+  const edges = $$(".relation-editor", form).map((row) => Object.fromEntries(["subject", "predicate", "object"].map((key) => [key, $(`[name=relation-${key}]`, row).value.trim()])));
+  if (edges.some((edge) => !edge.subject || !edge.predicate || !edge.object)) throw new Error("请填写完整关系，或移除空白关系。");
+  const payload = { content: String(data.get("content")).trim(), kind: data.get("kind"), entities: String(data.get("entities")).split(/[,，]/).map((entry) => entry.trim()).filter(Boolean), relations: edges, source: String(data.get("source")).trim() || "user", confidence: Number(data.get("confidence")) };
+  if (!payload.content) throw new Error("请输入记忆内容。");
+  await request(item ? `/memories/${encodeURIComponent(item.id)}` : "/memories", { method: item ? "PATCH" : "POST", body: payload });
+  toast(item ? "记忆已更新" : "记忆已保存");
+}
+
+async function editMemory(id) {
+  if (id) return showMemoryEvidence(id, { editing: true });
+  openDialog({ title: "新增记忆", content: memoryEditor(), onSubmit: async (form) => { await saveMemory(null, form); await switchView("memories"); } });
 }
 
 function relationEditor(relation = {}) {
@@ -1020,35 +1033,178 @@ function renderMemoryGraph() {
   return root;
 }
 
-async function showMemoryEvidence(id) {
-  let item = state.memories.find((memory) => String(memory.id) === String(id));
-  if (!item) item = await request(`/memories/${encodeURIComponent(id)}`);
-  const content = element("div", {}, element("p", { class: "memory-evidence-content", text: item.content }), statusList([["类型", memoryKind(item.kind)], ["来源", item.source], ["更新", formatTimestamp(item.updated_at)], ["置信度", `${Math.round(item.confidence * 100)}%`]]));
-  if (item.relations?.length) {
-    content.append(element("div", { class: "memory-evidence-relations" }, item.relations.map((edge) => element("div", { class: "graph-evidence-triple" }, element("strong", { text: edge.subject }), element("span", { text: edge.predicate }), element("strong", { text: edge.object })))));
-  }
-  const history = element("details", { class: "advanced-settings memory-history" }, element("summary", { text: "修改历史" }));
-  const historyList = element("div", { class: "memory-history-list" });
-  const loadHistory = async () => {
-    if (history.dataset.loading || history.dataset.loaded) return;
-    history.dataset.loading = "true";
-    historyList.replaceChildren(element("p", { class: "settings-role-hint", text: "正在读取…" }));
-    try {
-      const revisions = collection(await request(`/memories/${encodeURIComponent(id)}/revisions`));
-      historyList.replaceChildren();
-      if (!revisions.length) historyList.append(element("p", { class: "settings-role-hint", text: "暂无修改记录。" }));
-      for (const revision of revisions) {
-        const snapshot = revision.snapshot ?? {};
-        historyList.append(element("article", { class: "memory-revision" }, element("time", { text: formatFullDate(revision.changed_at) }), element("p", { class: "memory-evidence-content", text: snapshot.content ?? "" }), element("div", { class: "row-meta" }, memoryKind(snapshot.kind), snapshot.source), (snapshot.relations ?? []).map((edge) => element("div", { class: "graph-evidence-triple" }, element("strong", { text: edge.subject }), element("span", { text: edge.predicate }), element("strong", { text: edge.object })))));
-      }
-      history.dataset.loaded = "true";
-    } catch (error) {
-      historyList.replaceChildren(element("p", { class: "form-error", text: error.message }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadHistory() }));
-    } finally { delete history.dataset.loading; }
+function resetMemoryReads(slot) {
+  for (const key of ["readController", "sourceController", "historyController"]) { slot[key]?.abort(); slot[key] = null; }
+  slot.sourceRegion?.replaceChildren(); slot.historyList?.replaceChildren();
+  slot.page = null; slot.offsets = [0]; slot.pageIndex = 0;
+}
+
+function releaseMemoryDialog() {
+  const slot = memoryDialog;
+  memoryDialog = null;
+  if (slot) { resetMemoryReads(slot); slot.item = null; slot.content.replaceChildren(); dialogSubmit = null; }
+}
+
+function memoryDialogCurrent(slot) {
+  return memoryDialog === slot && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function memoryUnavailable(slot, message) {
+  if (!memoryDialogCurrent(slot)) return;
+  resetMemoryReads(slot); slot.item = null; slot.editing = false;
+  dialogSubmit = null; $("#dialog-submit").hidden = true;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = "关闭";
+  slot.content.replaceChildren(element("p", { role: "status", text: message }), element("button", { type: "button", class: "secondary-button", text: "重新核查", onClick: () => void refreshMemoryEvidence(slot) }));
+}
+
+function invalidateMemoryEvidence(event) {
+  const slot = memoryDialog;
+  if (!slot || !memoryDialogCurrent(slot)) return;
+  const data = event.data ?? {};
+  if (!(data.memory_ids ?? []).includes(slot.id) && !(data.source_id && data.source_id === slot.sourceId)) return;
+  resetMemoryReads(slot);
+  if (slot.editing) {
+    slot.invalidated = true; $("#dialog-submit").disabled = true;
+    slot.editorNotice.replaceChildren(element("span", { text: "记忆已有变更，请重新核查。" }), element("button", { type: "button", class: "text-button", text: "重新核查", onClick: () => void refreshMemoryEvidence(slot) }));
+    slot.editorNotice.hidden = false;
+  } else memoryUnavailable(slot, event.type === "memory.forgotten" ? "原文已不可用。" : "记忆已有更新，请重新核查。");
+}
+
+async function showMemoryEvidence(id, { editing = false } = {}) {
+  const content = element("div", { class: "memory-verification" });
+  openDialog({ title: editing ? "更正记忆" : "核查记忆", content, readOnly: true, returnMemoryId: String(id) });
+  const slot = { id: String(id), content, item: null, sourceId: state.memories.find((item) => String(item.id) === String(id))?.source_id, offsets: [0], pageIndex: 0, page: null, editing: false };
+  memoryDialog = slot;
+  await refreshMemoryEvidence(slot, editing);
+}
+
+async function refreshMemoryEvidence(slot, editing = false) {
+  if (!memoryDialogCurrent(slot)) return;
+  resetMemoryReads(slot); slot.item = null; slot.editing = false; slot.invalidated = false;
+  dialogSubmit = null; $("#dialog-submit").hidden = true; $("#dialog-submit").disabled = false;
+  $("#dialog-error").hidden = true;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = "关闭";
+  slot.content.replaceChildren(element("p", { role: "status", text: "正在核查…" }));
+  const controller = new AbortController(); slot.readController = controller;
+  try {
+    const item = await request(`/memories/${encodeURIComponent(slot.id)}`, { signal: controller.signal, cache: "no-store" });
+    if (!memoryDialogCurrent(slot) || slot.readController !== controller) return;
+    if (String(item?.id) !== slot.id) throw new Error("记忆响应不一致，请重新核查。");
+    slot.item = item; slot.sourceId = item.source_id;
+    if (editing) renderMemoryCorrection(slot);
+    else renderMemoryEvidence(slot);
+  } catch (error) {
+    if (memoryDialogCurrent(slot) && slot.readController === controller) memoryUnavailable(slot, error.status === 404 ? "记忆已不可用。" : error.message);
+  } finally { if (slot.readController === controller) slot.readController = null; }
+}
+
+function renderMemoryCorrection(slot) {
+  const item = slot.item;
+  slot.editing = true;
+  $("#dialog-title").textContent = "更正记忆";
+  slot.editorNotice = element("div", { class: "memory-editor-notice", role: "status", hidden: true });
+  slot.content.replaceChildren(slot.editorNotice, memoryEditor(item));
+  const submit = $("#dialog-submit"); submit.hidden = false; submit.disabled = false; submit.textContent = "保存更正";
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = "取消";
+  dialogSubmit = async (form) => {
+    if (!memoryDialogCurrent(slot) || slot.invalidated) throw new Error("记忆已有变更，请重新核查。");
+    await saveMemory(item, form);
+    if (!memoryDialogCurrent(slot)) return;
+    await switchView("memories");
+    if (memoryDialogCurrent(slot)) await refreshMemoryEvidence(slot);
   };
-  history.addEventListener("toggle", () => { if (history.open) void loadHistory(); });
-  history.append(historyList); content.append(history);
-  openDialog({ title: "记忆来源", content, submitLabel: "完成", onSubmit: async () => {} });
+  $("textarea", slot.content)?.focus({ preventScroll: true });
+}
+
+function renderMemoryEvidence(slot) {
+  const item = slot.item;
+  $("#dialog-title").textContent = "核查记忆";
+  const status = { active: "生效中", conflict: "待核对", superseded: "已替代", forgotten: "已遗忘" }[item.status] ?? item.status ?? "未记录";
+  const trusted = (value) => value === true ? "主人来源" : value === false ? "未标为主人来源" : "未记录";
+  slot.content.replaceChildren(element("p", { class: "memory-evidence-content memory-current-content", text: item.content }), statusList([["层次", { identity: "身份", preference: "偏好", episodic: "经历", semantic: "事实", procedural: "流程" }[item.layer] ?? item.layer ?? "未记录"], ["类型", memoryKind(item.kind)], ["状态", status], ["来源标签", item.source], ["记忆可信标记", trusted(item.trusted_owner)], ["置信度", Number.isFinite(item.confidence) ? `${Math.round(item.confidence * 100)}%` : "未记录"], ["更新", formatTimestamp(item.updated_at)]]));
+  if (item.quote) slot.content.append(element("section", { class: "memory-original-quote" }, element("h3", { text: "原始引文" }), element("blockquote", { text: item.quote })));
+  const origin = item.origin;
+  if (origin) {
+    slot.content.append(element("h3", { class: "memory-section-title", text: "原始来源" }), statusList([["身份", origin.principal ?? "未记录"], ["角色", origin.role ?? "未记录"], ["渠道", origin.source ?? "未记录"], ["来源可信标记", trusted(origin.trusted_owner)], ["时间", formatTimestamp(origin.created_at)]]));
+    slot.sourceRegion = element("div", { class: "memory-source-page", "aria-live": "polite" });
+    const source = element("details", { class: "advanced-settings memory-source" }, element("summary", { text: "查看原文" }), slot.sourceRegion);
+    source.addEventListener("toggle", () => { if (slot.content.contains(source) && source.open && !slot.page && !slot.sourceController) void loadMemorySource(slot, 0, 0); });
+    slot.content.append(source);
+  } else slot.content.append(element("p", { class: "settings-role-hint", text: item.source_id ? "原文已不可用。" : "无关联原文。" }));
+  if (item.conflicts?.length) slot.content.append(element("div", { class: "memory-conflicts" }, element("span", { text: "待核对" }), item.conflicts.map((id) => actionButton("核查另一条", "memory-evidence", "text-button", undefined, { id }))));
+  if (item.relations?.length) slot.content.append(element("details", { class: "advanced-settings" }, element("summary", { text: `${item.relations.length} 条关系` }), element("div", { class: "memory-evidence-relations" }, item.relations.map((edge) => element("div", { class: "graph-evidence-triple" }, element("strong", { text: edge.subject }), element("span", { text: edge.predicate }), element("strong", { text: edge.object }))))));
+  slot.historyList = element("div", { class: "memory-history-list" });
+  const history = element("details", { class: "advanced-settings memory-history" }, element("summary", { text: "修改历史" }), slot.historyList);
+  slot.historyLoaded = false;
+  history.addEventListener("toggle", () => { if (slot.content.contains(history) && history.open && !slot.historyLoaded && !slot.historyController) void loadMemoryHistory(slot); });
+  slot.content.append(history, element("div", { class: "memory-evidence-actions" }, element("button", { type: "button", class: "secondary-button", text: "更正", onClick: () => void refreshMemoryEvidence(slot, true) })));
+}
+
+function validMemorySource(page, slot, offset) {
+  const origin = slot.item.origin;
+  return page?.memory_id === slot.id && page.source_id === slot.item.source_id && page.source_id === origin.id && page.revision === origin.digest && page.field === "content" && typeof page.content === "string"
+    && [page.offset_bytes, page.length_bytes, page.next_offset_bytes, page.total_bytes].every((value) => Number.isSafeInteger(value) && value >= 0)
+    && page.offset_bytes === offset && page.length_bytes === new TextEncoder().encode(page.content).length && page.next_offset_bytes === offset + page.length_bytes
+    && typeof page.has_more === "boolean" && page.has_more === (page.next_offset_bytes < page.total_bytes) && page.next_offset_bytes <= page.total_bytes && (!page.has_more || page.length_bytes > 0);
+}
+
+async function loadMemorySource(slot, offset, index) {
+  if (!memoryDialogCurrent(slot) || slot.editing || slot.sourceController || !slot.item?.origin) return;
+  const origin = slot.item.origin;
+  if (!origin.digest || origin.id !== slot.item.source_id) { memoryUnavailable(slot, "原文关联已变化，请重新核查。"); return; }
+  const controller = new AbortController(); slot.sourceController = controller;
+  slot.sourceError = ""; slot.sourceRetry = { offset, index }; renderMemorySource(slot);
+  try {
+    const query = new URLSearchParams({ offset_bytes: String(offset), revision: origin.digest });
+    const page = await request(`/memories/${encodeURIComponent(slot.id)}/source?${query}`, { signal: controller.signal, cache: "no-store" });
+    if (!memoryDialogCurrent(slot) || slot.sourceController !== controller) return;
+    if (!validMemorySource(page, slot, offset)) { memoryUnavailable(slot, "原文响应不一致，请重新核查。"); return; }
+    slot.page = page; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
+  } catch (error) {
+    if (!memoryDialogCurrent(slot) || slot.sourceController !== controller) return;
+    if ([404, 409].includes(error.status)) { memoryUnavailable(slot, error.status === 404 ? "原文已不可用。" : "原文已更新，请重新核查。"); return; }
+    slot.sourceError = error.message;
+  } finally {
+    if (memoryDialogCurrent(slot) && slot.sourceController === controller) { slot.sourceController = null; renderMemorySource(slot); }
+  }
+}
+
+function renderMemorySource(slot) {
+  const page = slot.page;
+  const focused = slot.sourceRegion.contains(document.activeElement);
+  slot.sourceRegion.setAttribute("aria-busy", String(!!slot.sourceController));
+  slot.sourceRegion.replaceChildren();
+  if (page) {
+    slot.sourceRegion.append(element("p", { class: "memory-source-content", text: page.content }));
+    const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: !!slot.sourceController || slot.pageIndex === 0, onClick: () => void loadMemorySource(slot, slot.offsets[slot.pageIndex - 1], slot.pageIndex - 1) });
+    const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1) });
+    const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
+    slot.sourceRegion.append(element("nav", { class: "memory-source-navigation", "aria-label": "原文分段" }, previous, position, next));
+    if (focused) position.focus({ preventScroll: true });
+  }
+  if (slot.sourceController) slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: "正在读取…" }));
+  if (slot.sourceError) slot.sourceRegion.append(element("p", { class: "form-error", text: slot.sourceError }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemorySource(slot, slot.sourceRetry.offset, slot.sourceRetry.index) }));
+}
+
+async function loadMemoryHistory(slot) {
+  if (!memoryDialogCurrent(slot) || slot.editing || slot.historyController) return;
+  const controller = new AbortController(); slot.historyController = controller;
+  slot.historyList.replaceChildren(element("p", { class: "settings-role-hint", text: "正在读取…" }));
+  try {
+    const revisions = collection(await request(`/memories/${encodeURIComponent(slot.id)}/revisions`, { signal: controller.signal, cache: "no-store" }));
+    if (!memoryDialogCurrent(slot) || slot.historyController !== controller) return;
+    slot.historyList.replaceChildren();
+    if (!revisions.length) slot.historyList.append(element("p", { class: "settings-role-hint", text: "暂无修改记录。" }));
+    for (const revision of revisions) {
+      const snapshot = revision.snapshot ?? {};
+      slot.historyList.append(element("article", { class: "memory-revision" }, element("time", { text: formatFullDate(revision.changed_at) }), element("p", { class: "memory-evidence-content", text: snapshot.content ?? "" }), element("div", { class: "row-meta" }, memoryKind(snapshot.kind), snapshot.source), (snapshot.relations ?? []).map((edge) => element("div", { class: "graph-evidence-triple" }, element("strong", { text: edge.subject }), element("span", { text: edge.predicate }), element("strong", { text: edge.object })))));
+    }
+    slot.historyLoaded = true;
+  } catch (error) {
+    if (!memoryDialogCurrent(slot) || slot.historyController !== controller) return;
+    if ([404, 409].includes(error.status)) { memoryUnavailable(slot, "记忆已变化，请重新核查。"); return; }
+    slot.historyList.replaceChildren(element("p", { class: "form-error", text: error.message }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemoryHistory(slot) }));
+  } finally { if (slot.historyController === controller) slot.historyController = null; }
 }
 
 function renderWorkflows() {
@@ -1612,9 +1768,9 @@ async function handleAction(action, button) {
       await refreshSessions(); toast("记录已删除");
     });
   }
-  if (action === "new-memory") editMemory();
-  if (action === "edit-memory") editMemory(button.dataset.id);
-  if (action === "delete-memory") confirmAction("删除记忆", "删除后，沐璃将不再检索这条记忆。", "删除记忆", async () => { await request(`/memories/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("memories"); toast("记忆已删除"); });
+  if (action === "new-memory") await editMemory();
+  if (action === "edit-memory") await editMemory(button.dataset.id);
+  if (action === "delete-memory") confirmAction("删除记忆", "这条记忆会被遗忘；如有关联原文，同源记忆也会一并遗忘。", "删除记忆", async () => { await request(`/memories/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("memories"); toast("记忆已删除"); });
   if (action === "add-memory-relation") $("#memory-relations")?.append(relationEditor());
   if (action === "remove-memory-relation") button.closest(".relation-editor")?.remove();
   if (action === "memory-evidence") await showMemoryEvidence(button.dataset.id);
@@ -1707,8 +1863,11 @@ $("#dialog-form").addEventListener("submit", async (event) => {
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
   releaseTaskDialog();
+  releaseMemoryDialog();
   const saved = dialogTeamView; dialogTeamView = null;
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
+  const memoryId = dialogMemoryReturn; dialogMemoryReturn = null;
+  if (state.auth.authenticated && state.view === "memories" && memoryId) $$("[data-action=memory-evidence]", $("#other-view")).find((button) => button.dataset.id === memoryId)?.focus({ preventScroll: true });
 });
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); if (!$("#app-dialog").open) void switchView("chat"); }
@@ -1723,7 +1882,7 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { voiceInput.cancel(); globalController?.abort(); sessionController?.abort(); });
+window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog) $("#app-dialog").close(); releaseMemoryDialog(); globalController?.abort(); sessionController?.abort(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();
