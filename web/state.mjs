@@ -12,6 +12,11 @@ export function createSessionState(messages = []) {
   };
 }
 
+export function messagePresentation(message) {
+  if (message.principal === "system:attention") return { kind: "system-context", label: "系统资料" };
+  return message.role === "user" ? { kind: "user", label: "你的消息" } : { kind: "assistant", label: "沐璃的回复" };
+}
+
 function upsert(items, item, key = "id") {
   const index = items.findIndex((entry) => String(entry[key]) === String(item[key]));
   if (index < 0) return [...items, item];
@@ -45,16 +50,17 @@ export function applyEvent(state, event, { history = false } = {}) {
     case "reasoning.delta":
       if (!history) next.reasoning += data.content ?? "";
       break;
+    case "attention.queued":
     case "message.queued":
     case "message.completed": {
       if (history || !data.message) break;
-      const message = data.message;
+      const message = event.type === "attention.queued" ? { ...data.message, role: "user", delivery_status: "pending" } : data.message;
       const queued = message.role === "user" && (message.delivery_status === "pending" || event.type === "message.queued" || data.queued);
       if (queued && next.messages.some((entry) => String(entry.id) === String(message.id) && entry.delivery_status === "delivered")) break;
       let messages = message.role === "assistant" ? next.messages.filter((entry) => !entry.streaming) : next.messages;
       if (message.role === "user") {
         const attachmentIds = message.attachment_ids ?? message.attachments?.map((file) => file.id) ?? [];
-        const pending = messages.findIndex((entry) => entry.pending && (entry.content === message.content || (!entry.content && attachmentIds.length && JSON.stringify(entry.attachment_ids ?? entry.attachments?.map((file) => file.id) ?? []) === JSON.stringify(attachmentIds))));
+        const pending = message.principal === "system:attention" ? -1 : messages.findIndex((entry) => entry.pending && (entry.content === message.content || (!entry.content && attachmentIds.length && JSON.stringify(entry.attachment_ids ?? entry.attachments?.map((file) => file.id) ?? []) === JSON.stringify(attachmentIds))));
         if (pending >= 0) messages = messages.filter((_, index) => index !== pending);
         next.queued = queued ? [...new Set([...next.queued, String(message.id)])] : next.queued.filter((id) => id !== String(message.id));
       }
@@ -68,6 +74,12 @@ export function applyEvent(state, event, { history = false } = {}) {
       const injected = new Set((data.message_ids ?? []).map(String));
       next.queued = next.queued.filter((id) => !injected.has(id));
       next.messages = next.messages.map((message) => injected.has(String(message.id)) ? { ...message, delivery_status: "delivered" } : message);
+      break;
+    }
+    case "ingress.cancelled": {
+      const cancelled = new Set(next.queued);
+      next.queued = [];
+      next.messages = next.messages.filter((message) => message.delivery_status !== "pending" && !cancelled.has(String(message.id)));
       break;
     }
     case "tool.started":

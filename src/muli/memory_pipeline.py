@@ -542,15 +542,29 @@ class MemoryPipeline:
         cached = self._cached(query, limit, chosen_hops) if use_semantic else None
         if cached is not None:
             return cached
+        revision = self.memory.revision
         local = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
-        items, degraded = local, []
+        items = local
+        degraded: list[str] = []
+
+        def refreshed_local() -> dict[str, Any]:
+            # Awaited model/lock work may outlive edits or a source-level forget.
+            # Return a current local projection once; never retry the network or
+            # associate candidates from the old revision with the new cache.
+            current = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
+            return self._result(current[:limit], [*degraded, "memory_changed"])
+
         if use_semantic and query.strip() and self.media is not None:
             try:
                 async with asyncio.timeout(self.config.query_timeout):
                     async with self._media_lock:
+                        if self.memory.revision != revision:
+                            return refreshed_local()
                         semantic: list[dict[str, Any]] = []
                         if self.media.config.embedding is not None:
                             vectors = await self.media.embed([query])
+                            if self.memory.revision != revision:
+                                return refreshed_local()
                             if len(vectors) != 1:
                                 raise ValueError("查询向量数量错误")
                             semantic = self.memory.vector_search(
@@ -578,6 +592,8 @@ class MemoryPipeline:
                             ranked = await self.media.rerank(
                                 query, [item["content"] for item in items], top_n=limit
                             )
+                            if self.memory.revision != revision:
+                                return refreshed_local()
                             items = [
                                 {
                                     **items[result.index],
@@ -589,6 +605,8 @@ class MemoryPipeline:
             except Exception as error:
                 degraded.append("semantic_unavailable:" + type(error).__name__)
                 items = local
+        if self.memory.revision != revision:
+            return refreshed_local()
         result = self._result(items[:limit], degraded)
         if use_semantic:
             self._remember(query, limit, chosen_hops, result)

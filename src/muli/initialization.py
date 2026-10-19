@@ -13,8 +13,24 @@ from pathlib import Path
 from typing import Any
 
 from muli.config import ConfigFile, Settings
+from muli.service import UserService
 
 SOURCE_REPOSITORY = "https://github.com/69gg/MuLi.git"
+
+
+async def start_background(manager: UserService) -> dict[str, Any]:
+    """Install and request login startup; report observed state without claiming readiness."""
+    capability = manager.capability()
+    if not capability["supported"]:
+        return {"accepted": False, **capability, "completed": []}
+    completed: list[str] = []
+    try:
+        for action in ("install", "enable", "start"):
+            await manager.action(action)
+            completed.append(action)
+        return {"accepted": True, "completed": completed, "status": await manager.status()}
+    except (OSError, ValueError, TimeoutError) as exc:
+        return {"accepted": False, "completed": completed, "reason": str(exc)}
 
 
 def prompt_settings(

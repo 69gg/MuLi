@@ -67,6 +67,37 @@ class MockMedia:
         ]
 
 
+class PausedQueryMedia(MockMedia):
+    def __init__(self, stage: str, *, fail: bool = False) -> None:
+        super().__init__(reranker=True)
+        self.stage, self.fail = stage, fail
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+        self.embedding_attempts = self.rerank_attempts = 0
+
+    async def _pause(self, stage: str) -> None:
+        if self.stage == stage:
+            self.entered.set()
+            await self.release.wait()
+            if self.fail:
+                raise RuntimeError("query failed after memory changed")
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.embedding_attempts += 1
+        await self._pause("embedding")
+        return await super().embed(texts)
+
+    async def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_n: int | None = None,
+    ) -> list[RerankResult]:
+        self.rerank_attempts += 1
+        await self._pause("rerank")
+        return await super().rerank(query, documents, top_n=top_n)
+
+
 async def done(pipeline: MemoryPipeline, identifier: str) -> dict[str, Any]:
     async with asyncio.timeout(3):
         job = await pipeline.wait(identifier)
@@ -303,6 +334,100 @@ async def test_hybrid_rerank_cache_and_revision_invalidation(tmp_path: Path) -> 
     assert not pipeline.cached_context("喜欢什么颜色")
     assert not (await pipeline.query("喜欢什么颜色", limit=4))["memories"]
     await pipeline.close()
+    store.close()
+
+
+@pytest.mark.parametrize("stage", ["embedding", "rerank"])
+@pytest.mark.parametrize("fail", [False, True])
+async def test_forgetting_during_semantic_query_never_returns_or_recaches_old_evidence(
+    tmp_path: Path, stage: str, fail: bool
+) -> None:
+    store = Store(tmp_path / "memory.db")
+    memory = Memory(store)
+    media = PausedQueryMedia(stage, fail=fail)
+    pipeline = MemoryPipeline(memory, media=media)
+    item = pipeline.ingest(message("forget-query", "需要忘记的蓝色证据"), trusted_owner=True)
+    memory.store_vector(item["memory_id"], [1.0, 0.0], pipeline._model_key())
+    query = asyncio.create_task(pipeline.query("蓝色", limit=4))
+    try:
+        async with asyncio.timeout(3):
+            await media.entered.wait()
+            assert memory.forget_source("forget-query")
+            media.release.set()
+            result = await query
+        assert result["memories"] == [] and result["sources"] == []
+        assert "memory_changed" in result["degraded"]
+        assert not pipeline.cached_context("蓝色")
+        assert memory.vector_count(pipeline._model_key()) == 0
+        # The stale request must not start a second network pass or seed a cache.
+        assert not pipeline._cache
+        assert media.embedding_attempts == 1
+        assert media.rerank_attempts == int(stage == "rerank")
+        assert not (await pipeline.query("蓝色", limit=4))["memories"]
+        assert not pipeline.cached_context("蓝色")
+    finally:
+        media.release.set()
+        await asyncio.gather(query, return_exceptions=True)
+        store.close()
+
+
+@pytest.mark.parametrize("stage", ["embedding", "rerank"])
+@pytest.mark.parametrize("change", ["edit", "extraction"])
+async def test_inflight_query_uses_current_local_projection_after_any_memory_revision(
+    tmp_path: Path, stage: str, change: str
+) -> None:
+    store = Store(tmp_path / "memory.db")
+    memory = Memory(store)
+    media = PausedQueryMedia(stage)
+    pipeline = MemoryPipeline(memory, media=media)
+    item = pipeline.ingest(message("changing-query", "蓝色原始资料"), trusted_owner=True)
+    query = asyncio.create_task(pipeline.query("蓝色", limit=4))
+    expected = "蓝色更正资料" if change == "edit" else "蓝色合并事实"
+    try:
+        async with asyncio.timeout(3):
+            await media.entered.wait()
+            if change == "edit":
+                memory.save(expected, identifier=item["memory_id"], quote="蓝色原始资料")
+            else:
+                memory.apply_extraction(
+                    "changing-query",
+                    [{"content": expected, "layer": "semantic", "quote": "蓝色原始资料"}],
+                )
+            media.release.set()
+            result = await query
+        assert expected in {entry["content"] for entry in result["memories"]}
+        assert "memory_changed" in result["degraded"]
+        if change == "edit":
+            assert "蓝色原始资料" not in {entry["content"] for entry in result["memories"]}
+        assert not pipeline._cache
+        assert media.embedding_attempts == 1
+        assert media.rerank_attempts == int(stage == "rerank")
+        assert expected in pipeline.cached_context("蓝色")
+    finally:
+        media.release.set()
+        await asyncio.gather(query, return_exceptions=True)
+        store.close()
+
+
+async def test_forgetting_while_waiting_for_media_lock_skips_network_entirely(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "memory.db")
+    memory = Memory(store)
+    media = MockMedia(reranker=True)
+    pipeline = MemoryPipeline(memory, media=media)
+    pipeline.ingest(message("forget-lock", "蓝色锁等待资料"), trusted_owner=True)
+    async with asyncio.timeout(3):
+        async with pipeline._media_lock:
+            query = asyncio.create_task(pipeline.query("蓝色"))
+            await asyncio.sleep(0)  # The query reaches the held lock before forgetting.
+            assert not query.done()
+            assert memory.forget_source("forget-lock")
+        result = await query
+    assert result["memories"] == []
+    assert result["degraded"] == ["memory_changed"]
+    assert not media.embed_calls and not media.rerank_calls
+    assert not pipeline.cached_context("蓝色")
     store.close()
 
 

@@ -12,6 +12,36 @@
 
 ## 配置合同
 
+工作台与 `config.json` 使用应用配置：对话模型位于 `models.main` / `reviewer` / `worker` / `vision` / `compactor` / `memory_extractor`；独立视觉模型使用 `models.vision`，其余 HTTP 服务使用 `media.embedding` / `reranker` / `asr` / `tts`。下文的 `ModelConfig`、`MediaConfig` 是 Python 模块接口，不应直接作为配置文件根字段。
+
+应用配置额外支持 `api_key_env`，在每次创建连接配置时读取指定环境变量。环境变量名已填写但值缺失时不回退到明文 `api_key`；后台服务也必须能读取该变量，终端中临时导出的值不保证会传给 systemd、launchd 或计划任务。`temperature` / `top_p` 可直接写在模型项中，默认 `null` 表示省略；非空时优先于 `extra_body` 中同名值。
+
+例如为不支持看图的主模型配置外挂视觉和 TTS，合并以下片段后替换模型、服务地址和音色，并在服务环境中提供密钥：
+
+```json
+{
+  "models": {
+    "vision": {
+      "protocol": "openai_chat",
+      "model": "填写视觉模型ID",
+      "base_url": "https://provider.example/v1",
+      "api_key_env": "MULI_VISION_API_KEY",
+      "vision": true
+    }
+  },
+  "media": {
+    "tts": {
+      "model": "填写语音模型ID",
+      "base_url": "https://provider.example/v1",
+      "api_key_env": "MULI_TTS_API_KEY",
+      "voice": "填写供应商音色标识"
+    }
+  }
+}
+```
+
+这些 HTTP 能力包含在基础安装中，无需安装名为 vision、voice 或 media 的 extra；本地语音唤醒仍需另外配置声学桥接，见 [语音](voice.md)。
+
 `ModelConfig` 是可由 `dict` 构造的 dataclass。必填字段为 `protocol`、`model`、`base_url`；可选字段如下。
 
 | 字段 | 默认值 | 行为 |

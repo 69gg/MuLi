@@ -23,7 +23,10 @@ def main() -> None:
     initialize = commands.add_parser("init", help="交互设置主模型、称呼与访问方式")
     initialize.add_argument("--defaults", action="store_true", help="不提问，只创建默认配置")
     initialize.add_argument("--no-source", action="store_true", help="暂不下载只读源码参考")
-    service = commands.add_parser("service", help="管理 Linux 用户服务")
+    initialize.add_argument(
+        "--no-service", action="store_true", help="只配置，不安装或启动后台用户服务"
+    )
+    service = commands.add_parser("service", help="管理当前系统的用户后台服务")
     service.add_argument(
         "action",
         choices=["status", "print", "install", "start", "stop", "restart", "enable", "disable"],
@@ -32,7 +35,7 @@ def main() -> None:
     args = parser.parse_args()
     config = ConfigFile(args.config)
     if args.command == "init":
-        from muli.initialization import clone_source
+        from muli.initialization import clone_source, start_background
         from muli.initialization import initialize as initialize_config
 
         try:
@@ -40,12 +43,30 @@ def main() -> None:
         except (ValueError, FileExistsError) as exc:
             parser.error(str(exc))
         print(f"已创建 {args.config}；数据保存在 {args.data_dir}")
-        if not args.no_source:
+        if not args.no_source and not args.defaults:
             result = clone_source(
                 args.config.expanduser().resolve().parent, initial_settings.updates.repository
             )
             print(f"源码参考：{result.get('path', result.get('reason'))}")
-        print("运行 MuLi serve 后打开工作台，沐璃会接着帮你配置记忆、渠道和其它模型。")
+        if not args.defaults and not args.no_service:
+            result = asyncio.run(start_background(UserService(args.config, args.data_dir)))
+            if result["accepted"]:
+                print(
+                    "后台启动请求已提交，并已启用用户登录启动；可用 MuLi service status 查看状态。"
+                )
+            else:
+                print(
+                    f"后台设置未完成：{result.get('reason', '请查看服务状态')}。已完成：{result['completed']}"
+                )
+                print("配置已保留，可运行 MuLi serve，或稍后使用 MuLi service 继续设置。")
+        else:
+            print("运行 MuLi serve 启动工作台。")
+        host = initial_settings.server.host
+        host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
+        address = f"[{host}]" if ":" in host else host
+        print(
+            f"工作台：http://{address}:{initial_settings.server.port}；沐璃会接着帮你配置其它能力。"
+        )
     elif args.command == "service":
         manager = UserService(args.config, args.data_dir)
         if args.action == "print":

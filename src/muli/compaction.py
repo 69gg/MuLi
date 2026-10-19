@@ -123,7 +123,7 @@ class Compactor:
         self.adopt(session_id)
         active = self.store.get("compaction", session_id)
         after = int(active["covered_seq"]) if active else 0
-        records = self.store.messages(session_id, after=after)
+        records = self.store.replay_messages(session_id, after=after)
         earliest = self.store.message_prefix(session_id, after=after, limit=1)
         omitted: list[dict[str, Any]] = []
         if earliest and records and earliest[0]["seq"] != records[0]["seq"]:

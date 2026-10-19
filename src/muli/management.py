@@ -201,6 +201,7 @@ class SelfManagement:
             return {
                 "plans": self.plans(),
                 "plugins": self.plugins.inventory(),
+                "plugins_restart_required": self.plugins.restart_required,
                 "update": runtime.store.get("update", "latest"),
             }
 

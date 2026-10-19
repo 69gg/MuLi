@@ -53,6 +53,11 @@ class IntegrationManager:
 
     def _config(self, name: str | None = None) -> ChiliarchConfig:
         config = self.runtime.config.settings.chiliarch
+        persona = self.runtime.config.settings.persona
+        introduction = persona.introduction.strip() or (
+            f"我是{persona.name}，{persona.user_name}的私人数字助手。"
+            "我负责理解需求、统筹本机团队并回复进展；任务执行遵循本机配置的权限与资源限制。"
+        )
         return ChiliarchConfig(
             base_url=config.base_url,
             credential=config.credential,
@@ -60,6 +65,7 @@ class IntegrationManager:
             name=name or config.name,
             machine=config.machine or socket.gethostname(),
             capabilities=("muli.personal_assistant",),
+            introduction=introduction,
         )
 
     def status(self) -> dict[str, Any]:

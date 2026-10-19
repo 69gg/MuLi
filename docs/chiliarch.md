@@ -2,6 +2,14 @@
 
 MuLi 作为一个配对 agent 主动连接 chiliarch。后台通过 SSE 接收发送给此身份的消息，使用 POST 上报心跳与业务 ACK。网络等待和重连不会调用模型，chiliarch 服务端也无需反向连接 MuLi。
 
+## 连接自我介绍（chiliarch 0.5.0）
+
+每次连接和重连的首个心跳都会发送 `payload.metadata.introduction`，之后随正常心跳更新。介绍优先取 `persona.introduction`，为空时从 `persona.name` 与 `persona.user_name` 构造“我是……，……的私人数字助手”及统筹职责说明；不会额外调用模型。主 MuLi 可通过已有配置管理工具修改 persona.introduction，配置校验和重新连接流程沿用原机制。
+
+介绍为最多 4000 字符的纯文本，不包含配置密钥或会话正文。chiliarch 保存并在 agent 管理界面和总管工具结果中展示，内容属于自行声明的资料，不能授予权限。软件 0.5.0 的协议版本仍为 `1.0`；配对请求格式不变，旧 chiliarch 服务端仍接受已有 metadata 扩展，旧客户端缺失字段仍合法。其他客户端可省略表示保留、传空串或 `null` 表示清除；MuLi 正常运行会持续上报当前人格介绍。
+
+独立桥接器可设置 `ChiliarchConfig(..., introduction="...")`。连接自述、心跳与网络重连均为确定性后台操作，不使用 AI 轮询。
+
 实现位于 `src/muli/integrations/chiliarch.py`，只依赖已有的 HTTPX 和 Python 标准库。HTTPX 的异步流使用 `AsyncClient.stream()` 上下文，退出后关闭响应；外部注入的 HTTPX client 仍由调用方负责关闭。[HTTPX 官方异步文档](https://github.com/encode/httpx/blob/master/docs/async.md)
 
 ## 接口与认证
@@ -158,4 +166,6 @@ MuLi 的 `ask/auto/yolo` 应在本地统一工具入口落实，不能让外部�
 
 `tests/test_chiliarch.py` 使用 HTTPX MockTransport 和临时 SQLite，覆盖配对格式、路径前缀、持久化早于 ACK、重复投递、存储失败后的重投、吊销与永久错误停止、禁止重定向泄露凭据、快速停止、流式帧解析与大小限制。测试不会连接或修改真实 chiliarch，也不会调用模型。
 
-`tests/test_integration_manager.py` 使用假 Runtime 和假桥接器验证 task ID 去重、先取消后分派、重复取消清理、本机权限继承、原信封重发、重启不重做、身份切换隔离、过期/越界目录拒绝，以及通知不擅自唤醒模型。真实服务的配对及网络联调需要用户配置，当前模拟测试不代表已完成真实联调。
+`tests/test_integration_manager.py` 使用假 Runtime 和假桥接器验证 task ID 去重、先取消后分派、重复取消清理、本机权限继承、原信封重发、重启不重做、身份切换隔离、过期/越界目录拒绝，以及通知不擅自唤醒模型。自述回归额外覆盖人格默认值、自定义文本、长度边界与每次重连上报。
+
+0.5.0 联动开发另使用临时配置、临时 SQLite 和本机临时 TCP 服务完成 MuLi `IntegrationManager.pair()` → 真实 chiliarch 配对 → SSE 连接 → 首心跳自述持久化验收，全程禁止模型调用。chiliarch 端另覆盖 WS/SSE/长轮询及重连。用户实际部署的凭据、反向代理和生产任务尚未联调；这些隔离验收不会修改或启停用户服务。

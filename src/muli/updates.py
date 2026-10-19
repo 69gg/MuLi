@@ -109,13 +109,15 @@ class Updates:
                 "当前不是uv tool安装，已拒绝修改开发环境；请用uv tool install muli-agent"
             )
         result = await run_process(
-            [uv, "tool", "install", "--upgrade", "--no-python-downloads", f"muli-agent=={version}"],
+            [uv, "tool", "upgrade", "--no-python-downloads", f"muli-agent=={version}"],
             timeout=120,
             limit=12000,
             env=environment,
         )
         if result["exit_code"]:
-            raise ValueError("uv更新失败，未安排重启，请检查安装环境")
+            raise ValueError(
+                "uv更新失败，未安排重启；请检查安装环境及原有版本约束，未改写工具安装要求"
+            )
         source = self.config.path.resolve().parent / "source"
         source_status = "absent"
         if (source / ".git").exists():

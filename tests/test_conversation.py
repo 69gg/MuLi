@@ -16,6 +16,38 @@ from muli.store import Store
 from muli.tools import Tool, parameters
 
 
+async def test_admission_guard_rechecks_channel_after_configuration_lock(tmp_path: Path) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    entered = asyncio.Event()
+    authorized = True
+    checks: list[bool] = []
+
+    def guard() -> None:
+        checks.append(authorized)
+        if not authorized:
+            raise PermissionError("渠道授权已撤销")
+
+    async def incoming() -> dict[str, Any]:
+        entered.set()
+        return await runtime.submit(
+            "旧渠道请求", source="channel:telegram:bot", admission_guard=guard
+        )
+
+    try:
+        async with runtime.configuration_lock:
+            task = asyncio.create_task(incoming())
+            await entered.wait()
+            assert not task.done() and checks == []
+            authorized = False
+        with pytest.raises(PermissionError, match="已撤销"):
+            await task
+        assert checks == [False]
+        assert runtime.store.db.execute("SELECT count(*) FROM ingress").fetchone()[0] == 0
+        assert not runtime.tasks and seen == []
+    finally:
+        await runtime.close()
+
+
 async def test_single_owner_identity_and_ingress_survive_restart(tmp_path: Path) -> None:
     runtime, _ = make_runtime(tmp_path, [ModelTurn(content="第一次")])
     first = await runtime.submit("网页消息", mode="yolo", source="web")

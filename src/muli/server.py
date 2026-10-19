@@ -19,13 +19,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from muli import __version__
 from muli.attachments import SAFE_INLINE, Attachments
+from muli.attention import AttentionInbox
 from muli.auth import COOKIE_NAME, Authentication
+from muli.channel_application import ChannelApplication
+from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
 from muli.local_services import LocalServices
 from muli.management import SelfManagement
 from muli.memory_application import MemoryApplication
 from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
+from muli.personal_io import PersonalIO
 from muli.plugins import PluginManager
 from muli.runtime import Runtime
 from muli.service import UserService
@@ -84,6 +88,10 @@ class ServiceInput(Input):
     action: Literal["install", "start", "restart", "stop", "enable", "disable"]
 
 
+class DeliveryRetryInput(Input):
+    allow_unknown: bool = False
+
+
 class ReminderInput(Input):
     title: str = Field(min_length=1, max_length=120)
     due_at: float
@@ -102,11 +110,14 @@ def create_app(
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
     runtime = runtime or Runtime(config, data_dir or default_data_dir())
+    attention = AttentionInbox(runtime)
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
     local_services = LocalServices(runtime, attachments)
     memory_application = MemoryApplication(runtime, local_services.media)
+    channel_application = ChannelApplication(runtime, attachments)
+    personal_io = PersonalIO(runtime, local_services, attachments)
     from muli.integrations.manager import IntegrationManager
 
     integration = IntegrationManager(runtime)
@@ -117,18 +128,27 @@ def create_app(
                 "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
             )
         previous = config.settings.model_copy(deep=True)
+        await attention.close()
         await integration.close()
+        await channel_application.close()
+        await personal_io.close()
         await memory_application.close()
         try:
             config.replace(target)
             await runtime.reconfigure()
             await memory_application.reconfigure()
+            await channel_application.reconfigure()
+            await personal_io.reconfigure()
             await integration.start()
+            await attention.reconfigure()
         except Exception:
             config.replace(previous)
             await runtime.reconfigure()
             await memory_application.reconfigure()
+            await channel_application.reconfigure()
+            await personal_io.reconfigure()
             await integration.start()
+            await attention.reconfigure()
             raise
 
     async def onboarding() -> None:
@@ -147,14 +167,20 @@ def create_app(
         try:
             await plugins.load()
             await runtime.startup()
+            await attention.start()
             await memory_application.start()
+            await channel_application.start()
+            await personal_io.start()
             await integration.start()
             await management.start()
             await onboarding()
             yield
         finally:
+            await attention.close()
             await management.close()
             await integration.close()
+            await channel_application.close()
+            await personal_io.close()
             await memory_application.close()
             await plugins.close()
             await runtime.close()
@@ -174,6 +200,8 @@ def create_app(
     management = SelfManagement(runtime, plugins, service, apply_configuration)
     app.state.management, app.state.plugins = management, plugins
     app.state.memory_application = memory_application
+    app.state.attention = attention
+    app.state.channel_application, app.state.personal_io = channel_application, personal_io
     app.add_middleware(BodyLimitMiddleware)
 
     @app.middleware("http")
@@ -211,6 +239,10 @@ def create_app(
         body_limit = config.settings.uploads.max_file_bytes if upload else 1_048_576
         if size < 0 or size > body_limit:
             return JSONResponse({"detail": "请求体超过限制"}, status_code=413)
+        signed_webhook = request.method == "POST" and request.url.path in {
+            "/api/channels/onebot/webhook",
+            "/api/channels/qq/webhook",
+        }
         if (
             request.url.path.startswith("/api/")
             and request.url.path
@@ -218,6 +250,7 @@ def create_app(
                 "/api/auth/status",
                 "/api/auth/login",
             }
+            and not signed_webhook
             and not authentication.authenticated(request.cookies.get(COOKIE_NAME, ""))
         ):
             return JSONResponse({"detail": "需要登录"}, status_code=401)
@@ -394,6 +427,10 @@ def create_app(
             "chiliarch": integration.status(),
             "mcp": runtime.mcp.status(),
             "notifications": runtime.notifications.status(),
+            "channels": channel_application.manager.status(),
+            "capture": personal_io.capture.status(),
+            "voice": personal_io.voice.status(),
+            "attention": attention.status(),
             "limits": settings.limits.model_dump(),
         }
 
@@ -410,6 +447,7 @@ def create_app(
         return {
             "plans": management.plans(),
             "plugins": plugins.inventory(),
+            "plugins_restart_required": plugins.restart_required,
             "update": runtime.store.get("update", "latest"),
         }
 
@@ -420,6 +458,39 @@ def create_app(
     @app.get("/api/memory/status")
     async def memory_status() -> dict[str, Any]:
         return memory_application.pipeline.status()
+
+    @app.get("/api/channels")
+    async def channel_status() -> dict[str, Any]:
+        return {
+            **channel_application.manager.status(),
+            "deliveries": channel_application.manager.deliveries(),
+        }
+
+    @app.post("/api/channels/{name}/webhook")
+    async def channel_webhook(name: str, request: Request) -> dict[str, Any]:
+        if name not in {"onebot", "qq"}:
+            raise HTTPException(404, "该渠道不使用此webhook入口")
+        try:
+            return await channel_application.manager.webhook(
+                name, await request.body(), request.headers
+            )
+        except ChannelError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+
+    @app.post("/api/channels/deliveries/{identifier}/retry")
+    async def retry_delivery(identifier: str, body: DeliveryRetryInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            return await channel_application.manager.retry(
+                identifier, allow_unknown=body.allow_unknown
+            )
+
+    @app.get("/api/capture")
+    async def capture_status() -> dict[str, Any]:
+        return personal_io.capture.status()
+
+    @app.get("/api/voice")
+    async def voice_status() -> dict[str, Any]:
+        return personal_io.voice.status()
 
     @app.get("/api/memory/query")
     async def memory_query(query: str, limit: int = 8) -> dict[str, Any]:
@@ -468,6 +539,9 @@ def create_app(
     async def delete_session(session_id: str) -> dict[str, bool]:
         if session_id == runtime.main_session()["id"]:
             raise HTTPException(409, "主 MuLi 会话是持续身份，不能按普通窗口删除")
+        session = runtime.store.get("session", session_id)
+        if session is not None and session.get("workflow_run_id"):
+            raise HTTPException(409, "该记录属于持久工作流，请使用工作流取消功能，保留运行记录")
         if runtime.store.db.execute(
             "SELECT 1 FROM objects WHERE kind='agent' AND json_extract(data,'$.session_id')=? LIMIT 1",
             (session_id,),
@@ -670,7 +744,28 @@ def create_app(
                 )
                 + "\n"
             )
-            for table in ("objects", "memories", "relations", "memory_revisions"):
+            for table in (
+                "objects",
+                "message_order",
+                "ingress",
+                "memories",
+                "relations",
+                "memory_revisions",
+                "memory_sources",
+                "memory_forgotten_sources",
+                "memory_meta",
+                "memory_entities",
+                "memory_aliases",
+                "memory_mentions",
+                "memory_edges",
+                "memory_vectors",
+                "memory_conflicts",
+                "memory_communities",
+                "memory_community_members",
+                "memory_community_nodes",
+                "channel_inbound",
+                "channel_outbox",
+            ):
                 cursor = runtime.store.db.execute(f"SELECT * FROM {table}")
                 try:
                     while rows := cursor.fetchmany(100):

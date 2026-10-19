@@ -1,7 +1,8 @@
 import { request as apiRequest, readEvents, uploadFile } from "./api.mjs";
-import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate } from "./state.mjs";
+import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
-import { setPath, settingsPatch } from "./settings.mjs";
+import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
+import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 
@@ -51,6 +52,7 @@ const state = {
   timelineOpen: false, sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
   viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaved: false,
+  management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
   timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0,
   team: { members: [], messages: [] }, recordQuery: "",
   auth: { required: false, authenticated: false },
@@ -195,16 +197,21 @@ function renderChat() {
   for (const [id, node] of messageNodes) if (!ids.has(id)) { node.remove(); messageNodes.delete(id); }
   for (const message of visibleMessages) {
     const id = String(message.id);
+    const presentation = messagePresentation(message);
     let node = messageNodes.get(id);
     if (!node) {
-      node = element("article", { class: `message ${message.role}`, dataset: { messageId: id }, "aria-label": message.role === "user" ? "你的消息" : "沐璃的回复" });
-      if (message.role !== "user") {
-        node.append(element("div", { class: "message-heading" }, element("span", { class: "message-avatar" }, element("img", { src: "./assets/muli-avatar.svg", alt: "" })), element("span", { text: "沐璃" }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
+      node = element("article", { class: `message ${presentation.kind}`, dataset: { messageId: id }, "aria-label": presentation.label });
+      let content = node;
+      if (presentation.kind === "system-context") {
+        content = element("details", {}, element("summary", { class: "message-heading" }, icon("info"), element("span", { text: presentation.label }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
+        node.append(content);
+      } else if (message.role !== "user") {
+        content.append(element("div", { class: "message-heading" }, element("span", { class: "message-avatar" }, element("img", { src: "./assets/muli-avatar.svg", alt: "" })), element("span", { text: "沐璃" }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
       }
-      node.append(element("div", { class: "message-body" }));
-      node.append(element("div", { class: "message-attachments" }));
+      content.append(element("div", { class: "message-body" }));
+      content.append(element("div", { class: "message-attachments" }));
       const actions = element("div", { class: "message-actions" }, iconButton("复制消息", "copy-message", "copy", { id }));
-      node.append(actions); messageNodes.set(id, node); container.append(node);
+      content.append(actions); messageNodes.set(id, node); container.append(node);
     }
     if (node.dataset.content !== message.content) {
       const body = $(".message-body", node);
@@ -375,7 +382,7 @@ function startGlobalEvents() {
   globalController?.abort();
   globalController = new AbortController();
   void subscribe("/events", globalController, { reportConnection: true, onEvent: (event) => {
-    if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested"].includes(event.type)) void refreshNotifications();
+    if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested", "attention.queued", "ingress.cancelled"].includes(event.type)) void refreshNotifications();
     if (event.type.startsWith("run.") || event.type.startsWith("session.")) void refreshSessions();
     if (event.type === "workflow.updated") {
       const workflow = state.workflows.find((item) => item.id === event.data?.workflow_id);
@@ -419,7 +426,7 @@ async function loadSession(id) {
   const content = element("div", { class: "session-record" });
   for (const message of detail.messages ?? []) {
     if (!["user", "assistant"].includes(message.role)) continue;
-    content.append(element("article", { class: "record-message" }, element("strong", { text: message.role === "user" ? "任务" : "沐璃" }), element("div", { class: "message-body" }, renderMarkdown(message.content ?? "")), element("div", { class: "message-attachments" }, (message.attachments ?? []).map((file) => renderAttachment(file)))));
+    content.append(element("article", { class: "record-message" }, element("strong", { text: messagePresentation(message).kind === "system-context" ? "系统资料" : message.role === "user" ? "任务" : "沐璃" }), element("div", { class: "message-body" }, renderMarkdown(message.content ?? "")), element("div", { class: "message-attachments" }, (message.attachments ?? []).map((file) => renderAttachment(file)))));
   }
   if (!content.children.length) content.append(emptyState("chat", "还没有消息"));
   openDialog({ title: detail.session?.title || "运行记录", content, submitLabel: "关闭", onSubmit: async () => {} });
@@ -561,11 +568,11 @@ async function switchView(view) {
       state.reminders = results[1].status === "fulfilled" ? collection(results[1].value) : [];
       state.remindersError = results[1].status === "rejected" ? results[1].reason.message : "";
     }
-    if (view === "settings" && !state.settingsDraft) {
-      const results = await Promise.allSettled([request("/settings"), request("/service")]);
+    if (view === "settings") {
+      const dirty = state.settingsDraft && Object.keys(settingsPatch(state.settings, state.settingsDraft)).length;
+      const results = await Promise.allSettled([dirty ? null : request("/settings"), refreshSettingsResources()]);
       if (results[0].status === "rejected") throw results[0].reason;
-      state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); state.settingsSaved = false;
-      state.service = results[1].status === "fulfilled" ? results[1].value : null;
+      if (results[0].value) { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); state.settingsSaved = false; }
     }
   } catch (error) { if (version === viewRequestVersion) state.viewError = error.message; }
   if (version !== viewRequestVersion) return;
@@ -589,6 +596,9 @@ function renderOtherView() {
   if (state.view === "uploads") root.replaceChildren(renderUploads());
   if (state.view === "team") root.replaceChildren(renderTeam());
   if (state.view === "records") root.replaceChildren(renderRecords());
+  const nav = $(".settings-nav", root);
+  const active = $(".settings-nav .active", root);
+  if (nav && active && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, active.offsetLeft - nav.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2);
 }
 
 function renderThemeControl() {
@@ -946,8 +956,9 @@ async function markRead(id) {
 function renderSettings() {
   if (!state.settingsDraft) return element("div", { class: "view-content" }, emptyState("settings", "设置暂不可用"));
   const nav = element("nav", { class: "settings-nav", "aria-label": "设置分组" });
-  for (const [key, label] of [["overview", "概览"], ["models", "模型"], ["persona", "称呼与提示词"], ["tools", "权限与工具"], ["connections", "连接"], ["media", "媒体与检索"], ["system", "系统"]]) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
-  if (state.settingsTab === "overview") return element("div", { class: "view-content" }, viewHeading("设置", "告诉沐璃需要调整什么。"), element("div", { class: "settings-layout" }, nav, renderConfigurationOverview()));
+  for (const [key, label] of SETTINGS_GROUPS) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
+  const refresh = actionButton("刷新状态", "refresh-settings-status", "text-button", "refresh");
+  if (state.settingsTab === "overview") return element("div", { class: "view-content" }, viewHeading("设置", "告诉沐璃需要调整什么。", refresh), element("div", { class: "settings-layout" }, nav, renderConfigurationOverview()));
   const form = element("form", { id: "settings-form", class: "settings-panel", onSubmit: saveSettings });
   if (state.settingsTab === "models") form.append(renderModelSettings());
   if (state.settingsTab === "tools") form.append(renderToolSettings());
@@ -955,8 +966,11 @@ function renderSettings() {
   if (state.settingsTab === "system") form.append(renderSystemSettings());
   if (state.settingsTab === "persona") form.append(renderPersonaSettings());
   if (state.settingsTab === "media") form.append(renderMediaSettings());
+  if (state.settingsTab === "channels") form.append(renderChannelSettings());
+  if (state.settingsTab === "inputs") form.append(renderInputSettings());
+  if (state.settingsTab === "maintenance") form.append(renderMaintenanceSettings());
   form.append(element("p", { class: "form-error", id: "settings-error", hidden: true }), element("div", { class: "settings-footer" }, element("button", { class: "primary-button", type: "submit", text: "保存设置" }), state.settingsSaved && element("span", { class: "settings-save-status", text: "已保存" })));
-  return element("div", { class: "view-content" }, viewHeading("设置", "模型、工具与本地运行配置。"), element("div", { class: "settings-layout" }, nav, form));
+  return element("div", { class: "view-content" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, form));
 }
 
 function renderConfigurationOverview() {
@@ -970,12 +984,115 @@ function renderConfigurationOverview() {
     if (state.status?.configured) $("#composer").requestSubmit();
   } }, element("label", { class: "field" }, element("span", { text: "想调整什么？" }), element("textarea", { rows: 4, placeholder: "例如：每天晚上九点提醒我整理笔记", required: true, "aria-label": "配置要求" })), element("button", { type: "submit", class: "primary-button", text: "交给沐璃" }));
   const examples = element("div", { class: "configuration-examples" });
-  for (const prompt of ["帮我检查当前配置", "帮我安排一组协作任务", "记住我的工作偏好"]) examples.append(actionButton(prompt, "configure-prompt", "text-button", undefined, { prompt }));
-  return element("div", { class: "settings-panel configuration-overview" }, form, examples, !state.status?.configured && element("div", { class: "configuration-bootstrap" }, element("p", { text: "先连接一个主模型，即可通过对话配置。" }), actionButton("连接主模型", "model-settings", "secondary-button", "link")), settingsSection("当前状态", statusList([["主模型", state.status?.model || "未配置"], ["执行模式", MODES[state.mode]?.label ?? state.mode], ["运行任务", String(state.status?.running ?? 0)], ["工作目录", (state.settingsDraft.workspace_roots ?? []).join("、")]])));
+  for (const [label, prompt] of [["检查配置", "请检查当前配置和未就绪的能力。"], ["接入消息渠道", "帮我配置一个消息渠道，先告诉我需要哪些资料。"], ["配置语音", "请检查语音唤醒需要的本地组件，并帮我规划配置。"], ["查看更新", "请查看更新状态和待应用的管理操作。"]]) examples.append(actionButton(label, "configure-prompt", "text-button", undefined, { prompt }));
+  return element("div", { class: "settings-panel configuration-overview" }, form, examples, !state.status?.configured && element("div", { class: "configuration-bootstrap" }, element("p", { text: "先连接一个主模型，即可通过对话配置。" }), actionButton("连接主模型", "model-settings", "secondary-button", "link")), settingsResourceError("status"), settingsSection("当前状态", statusList([["主模型", state.status?.model || "未配置"], ["执行模式", MODES[state.mode]?.label ?? state.mode], ["运行任务", state.status ? String(state.status.running ?? 0) : "状态未知"], ["语音", capabilityLabel(state.voice)], ["桌面采集", capabilityLabel(state.capture)], ["待应用操作", state.management ? String((state.management.plans ?? []).filter((item) => ["pending", "applying"].includes(item.status)).length) : "状态未知"], ["工作目录", (state.settingsDraft.workspace_roots ?? []).join("、")]])));
 }
 
 function settingsSection(title, ...children) {
   return element("section", { class: "settings-section" }, element("h3", { text: title }), children);
+}
+
+async function refreshSettingsResources() {
+  const { values, errors } = await loadSettingsResources(request);
+  for (const [key, value] of Object.entries(values)) state[key] = value;
+  state.settingsStatusErrors = errors;
+}
+
+function settingsResourceError(key) {
+  const error = state.settingsStatusErrors[key];
+  return error && element("p", { class: "form-error", text: `状态暂不可用：${error}` });
+}
+
+function settingsJSON(path, config, excluded = [], rows = 7, title = "更多参数") {
+  return element("details", { class: "advanced-settings" }, element("summary", { text: title }), field("参数 JSON", path, pretty(settingsExtras(config, excluded)), { type: "textarea", rows, json: true, format: "json-merge", hint: "填写要覆盖的字段，其余保留。" }));
+}
+
+function statusDetails(value) {
+  return value && element("details", { class: "advanced-settings" }, element("summary", { text: "完整状态" }), element("pre", { class: "service-log", text: pretty(value) }));
+}
+
+function renderChannelSettings() {
+  const config = state.settingsDraft.channels ?? {};
+  const root = element("div", {}, settingsResourceError("channels"));
+  const channelStatus = state.channels?.channels ?? {};
+  const commonFields = ["enabled", "base_url", "owner_ids", "allowed_groups", "receive_files"];
+  for (const [key, label] of CHANNELS) {
+    const profile = config[key] ?? {}; const path = `channels.${key}`; const status = channelStatus[key];
+    const credentials = element("details", { class: "advanced-settings" }, element("summary", { text: "连接凭据" }));
+    for (const [name, title] of [["token", "令牌"], ["webhook_secret", "Webhook 密钥"], ["client_secret", "客户端密钥"]]) {
+      credentials.append(field(title, `${path}.${name}`, profile[name] ?? "", { type: "password", placeholder: profile[`${name}_set`] ? "已配置，留空保留" : "按渠道需要填写" }));
+      if (profile[`${name}_set`]) credentials.append(switchField(`清除${title}`, `${path}.clear_${name}`, profile[`clear_${name}`]));
+    }
+    root.append(element("details", { class: "media-profile advanced-settings" },
+      element("summary", {}, element("span", { text: label }), element("small", { text: capabilityLabel(status) })),
+      switchField("启用渠道", `${path}.enabled`, profile.enabled),
+      field("服务地址", `${path}.base_url`, profile.base_url ?? "", { type: "url" }),
+      field("你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", hint: "每行一个 ID。" }),
+      field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
+      switchField("接收附件", `${path}.receive_files`, profile.receive_files), credentials,
+      settingsJSON(path, profile, commonFields),
+      status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ["允许的群组", String(status.group_count ?? 0)]]),
+      status?.last_error && element("p", { class: "form-error", text: status.last_error })));
+  }
+  root.append(settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, CHANNELS.map(([key]) => key)), renderDeliveries()));
+  return root;
+}
+
+function deliveryLabel(value) {
+  return ({ pending: "待发送", retry: "待重试", sending: "发送中", sent: "已发送", failed: "发送失败", unknown: "结果未知" })[value] ?? value;
+}
+
+function renderDeliveries() {
+  if (!state.channels) return null;
+  const details = element("details", { class: "advanced-settings" }, element("summary", { text: "最近发送记录" }));
+  const deliveries = state.channels.deliveries ?? [];
+  if (!deliveries.length) details.append(element("p", { class: "settings-role-hint", text: "暂无发送记录。" }));
+  for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
+  return details;
+}
+
+function renderInputSettings() {
+  const voice = state.settingsDraft.voice ?? {};
+  const capture = state.settingsDraft.computer?.capture ?? {};
+  const voiceStatus = state.voice; const captureStatus = state.capture;
+  const voiceState = voiceStatus && statusList([["状态", capabilityLabel(voiceStatus)], ["录音后端", voiceStatus.recorder?.backend || "未检测到"], ["声学唤醒", voiceStatus.wake?.available ? "已检测" : "未就绪"], ["参考声纹", voiceStatus.speaker?.enrolled ? "已录制" : "未录制"], ["语音识别", voiceStatus.asr ? "已配置" : "未配置"], ["提示播放", voiceStatus.playback?.backend || "未检测到"], ["运行设备", voiceStatus.device?.selected ?? "状态未知"], ["设备运行验证", voiceStatus.device?.runtime_verified ? "已验证" : "尚未验证"]]);
+  const captureState = captureStatus && statusList([["状态", capabilityLabel(captureStatus)], ["截图后端", captureStatus.screenshot?.backend || "未检测到"], ["录屏后端", captureStatus.recording?.backend || "未检测到"], ["采集权限", captureStatus.permission_verified ? "已验证" : "尚未验证"]]);
+  return element("div", {},
+    settingsSection("语音", settingsResourceError("voice"), voiceState,
+      voiceStatus?.last_error && element("p", { class: "form-error", text: voiceStatus.last_error }),
+      voiceStatus?.reason && element("p", { class: "settings-role-hint", text: voiceStatus.reason }),
+      switchField("启用语音唤醒", "voice.enabled", voice.enabled),
+      field("唤醒词", "voice.wake_word", voice.wake_word ?? ""),
+      selectField("计算设备", "voice.device", voice.device ?? "auto", [["auto", "自动"], ["cpu", "CPU"], ["rocm", "ROCm"], ["cuda", "CUDA"]]),
+      field("录音设备", "voice.input_device", voice.input_device ?? "", { placeholder: "使用系统默认设备", hint: voiceStatus?.recorder?.reason || undefined }),
+      switchField("合成唤醒提示语", "voice.tts_enabled", voice.tts_enabled),
+      settingsJSON("voice", voice, ["enabled", "wake_word", "device", "input_device", "tts_enabled"], 10),
+      element("button", { type: "button", class: "text-button field-top-space", text: "设置语音识别与合成模型", dataset: { settingsTab: "media" } }), statusDetails(voiceStatus)),
+    settingsSection("截图与录屏", settingsResourceError("capture"), captureState,
+      captureStatus?.reason && element("p", { class: "settings-role-hint", text: captureStatus.reason }),
+      switchField("启用桌面采集", "computer.capture.enabled", capture.enabled),
+      field("采集后端", "computer.capture.backend", capture.backend ?? "auto"),
+      field("采集设备", "computer.capture.device", capture.device ?? "", { placeholder: "使用当前图形会话" }),
+      element("div", { class: "field-row" }, field("最长录屏（秒）", "computer.capture.max_seconds", capture.max_seconds ?? "", { type: "number", min: 1, max: 300 }), field("录屏帧率", "computer.capture.fps", capture.fps ?? "", { type: "number", min: 1, max: 30 })),
+      settingsJSON("computer.capture", capture, ["enabled", "backend", "device", "max_seconds", "fps"]), statusDetails(captureStatus)));
+}
+
+function renderMaintenanceSettings() {
+  const config = state.settingsDraft; const management = state.management;
+  const plugins = config.plugins ?? {}; const updates = config.updates ?? {};
+  const inventory = element("div", { class: "management-list" });
+  if (management && !management.plugins?.length) inventory.append(element("p", { class: "settings-role-hint", text: "暂无本地插件。" }));
+  for (const plugin of management?.plugins ?? []) inventory.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: plugin.name || plugin.id }), element("span", { text: managementLabel(plugin.status) })), element("p", { text: [plugin.id, plugin.version].filter(Boolean).join(" · ") }), plugin.error && element("p", { class: "form-error", text: plugin.error })));
+  const plans = element("div", { class: "management-list" });
+  if (management && !management.plans?.length) plans.append(element("p", { class: "settings-role-hint", text: "暂无管理操作。" }));
+  for (const plan of management?.plans ?? []) plans.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: ({ configure: "配置变更", restart: "重启服务", update: "版本更新" })[plan.action] ?? plan.action }), element("span", { text: managementLabel(plan.status) })), element("p", { text: [plan.created_at && formatFullDate(plan.created_at), plan.version, ...(plan.changed_sections ?? [])].filter(Boolean).join(" · ") }), plan.error && element("p", { class: "form-error", text: plan.error })));
+  const update = management?.update;
+  return element("div", {}, settingsResourceError("management"),
+    settingsSection("本地插件", switchField("启用插件", "plugins.enabled", plugins.enabled), field("禁用的插件 ID", "plugins.disabled", (plugins.disabled ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }), inventory,
+      management?.plugins_restart_required && element("p", { class: "settings-notice", text: "插件配置已保存，重启后生效。" }), settingsJSON("plugins", plugins, ["enabled", "disabled"])),
+    settingsSection("版本更新", statusList([["状态", updateLabel(management)], ["当前版本", update?.current ?? state.status?.version], ["最新版本", update?.latest], ["上次检查", update?.checked_at ? formatFullDate(update.checked_at) : "—"]]), switchField("启动时检查更新", "updates.check_on_start", updates.check_on_start), settingsJSON("updates", updates, ["check_on_start"]), actionButton("交给沐璃检查", "configure-prompt", "text-button", "chat", { prompt: "请检查 MuLi 的更新状态，有更新时先告诉我版本与变更。" })),
+    settingsSection("管理操作", plans),
+    state.status?.server?.restart_required && element("p", { class: "settings-notice", text: "监听配置已保存，重启后生效。" }));
 }
 
 function renderModelSettings() {
@@ -983,7 +1100,7 @@ function renderModelSettings() {
   const model = state.settingsDraft.models?.[role] ?? {};
   const path = `models.${role}`;
   const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "模型角色" });
-  for (const [key, label] of [["main", "主模型"], ["reviewer", "审阅"], ["worker", "执行"], ["vision", "视觉"], ["compactor", "压缩"]]) tabs.append(element("button", { type: "button", role: "tab", class: role === key ? "active" : "", text: label, "aria-selected": String(role === key), dataset: { modelRole: key } }));
+  for (const [key, label] of MODEL_ROLES) tabs.append(element("button", { type: "button", role: "tab", class: role === key ? "active" : "", text: label, "aria-selected": String(role === key), dataset: { modelRole: key } }));
   const protocol = model.protocol ?? "openai_chat";
   const advanced = element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }),
     element("div", { class: "field-row" }, field("Temperature", `${path}.temperature`, model.temperature ?? "", { type: "number", step: .1, min: 0, max: 2, placeholder: "使用模型默认值" }), field("Top P", `${path}.top_p`, model.top_p ?? "", { type: "number", step: .05, min: 0, max: 1, placeholder: "使用模型默认值" })),
@@ -994,9 +1111,10 @@ function renderModelSettings() {
     field("Reasoning effort", `${path}.reasoning_effort`, model.reasoning_effort ?? "", { placeholder: "使用模型默认值", format: "nullable" }),
     field("Extra body", `${path}.extra_body`, pretty(model.extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }),
     field("Extra headers", `${path}.extra_headers`, pretty(model.extra_headers ?? {}), { type: "textarea", rows: 3, json: true, format: "json", hint: "保持 •••• 可保留原值，移除字段即可删除。" }),
+    field("响应大小上限（字节）", `${path}.max_response_bytes`, model.max_response_bytes ?? "", { type: "number", min: 1024 }),
     switchField("流式输出", `${path}.stream`, model.stream !== false),
     model.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false));
-  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", reviewer: "未配置时，工具审查交由你确认。", vision: "主模型不支持图片时，使用此模型识图。" };
+  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未配置时，工具审查交由你确认。", vision: "主模型不支持图片时，使用此模型识图。" };
   return element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
     settingsSection("模型连接", selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]), field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" }), field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" }), field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), switchField("支持图片", `${path}.vision`, model.vision), advanced));
 }
@@ -1017,6 +1135,7 @@ function renderMediaSettings() {
     details.append(element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }), field("API Key 环境变量", `${path}.api_key_env`, config.api_key_env ?? ""), field("超时（秒）", `${path}.timeout`, config.timeout ?? "", { type: "number", min: 1, max: 600 }), field("Extra body", `${path}.extra_body`, pretty(config.extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }), field("Extra headers", `${path}.extra_headers`, pretty(config.extra_headers ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }), config.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false)));
     root.append(details);
   }
+  root.append(settingsSection("记忆与上下文", settingsJSON("memory", state.settingsDraft.memory ?? {}, [], 10, "记忆处理"), settingsJSON("compaction", state.settingsDraft.compaction ?? {}, [], 7, "上下文压缩"), state.settingsDraft.attention && settingsJSON("attention", state.settingsDraft.attention, [], 7, "主动关注")));
   return root;
 }
 
@@ -1068,7 +1187,7 @@ function renderSystemSettings() {
   const config = state.settingsDraft;
   const limits = config.limits ?? {};
   const service = state.service;
-  const serviceSection = settingsSection("用户服务", statusList([["服务", service?.supported === false ? "当前系统不支持" : service?.unit || "读取中"], ["安装", service?.installed ? "已安装" : "未安装"], ["状态", service?.active ? "运行中" : "未运行"], ["登录后启动", service?.enabled ? "已启用" : "未启用"]]));
+  const serviceSection = settingsSection("用户服务", settingsResourceError("service"), statusList([["服务", service?.supported === false ? "当前系统不支持" : service?.unit || "状态未知"], ["安装", !service ? "状态未知" : service.installed ? "已安装" : "未安装"], ["状态", !service ? "状态未知" : service.active ? "运行中" : "未运行"], ["登录后启动", !service ? "状态未知" : service.enabled ? "已启用" : "未启用"]]));
   if (service?.supported) {
     const actions = element("div", { class: "service-actions" });
     if (!service.installed) actions.append(actionButton("安装用户服务", "service", "secondary-button", "server", { command: "install" }));
@@ -1087,7 +1206,8 @@ function renderSystemSettings() {
     settingsSection("通知", switchField("桌面通知", "notifications.enabled", config.notifications?.enabled), state.status?.notifications?.available === false && element("p", { text: "桌面通知暂不可用。" }), state.status?.notifications?.last_error && element("p", { class: "form-error", text: state.status.notifications.last_error })),
     settingsSection("访问", field("访问密码", "server.password", "", { type: "password", placeholder: config.server?.password_set ? "已设置，留空保留" : "尚未设置" }), config.server?.password_set && switchField("清除访问密码", "server.clear_password", false), state.auth.required && actionButton("退出登录", "logout", "secondary-button")),
     serviceSection,
-    settingsSection("运行限制", element("div", { class: "field-row" }, field("并行 Agent 数", "limits.max_parallel_agents", limits.max_parallel_agents ?? "", { type: "number", min: 1, max: 32 }), field("未完成任务上限", "limits.max_pending_runs", limits.max_pending_runs ?? "", { type: "number", min: 1, placeholder: "使用服务默认值" })), element("div", { class: "field-row" }, field("工具步骤上限", "limits.max_tool_steps", limits.max_tool_steps ?? "", { type: "number", min: 1 }), field("任务时限（秒）", "limits.max_run_seconds", limits.max_run_seconds ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("文件大小上限（字节）", "limits.max_file_bytes", limits.max_file_bytes ?? "", { type: "number", min: 1 }), field("工具输出字符上限", "limits.max_output_chars", limits.max_output_chars ?? "", { type: "number", min: 1 }))));
+    settingsSection("运行限制", element("div", { class: "field-row" }, field("并行 Agent 数", "limits.max_parallel_agents", limits.max_parallel_agents ?? "", { type: "number", min: 1 }), field("未完成任务上限", "limits.max_pending_runs", limits.max_pending_runs ?? "", { type: "number", min: 1, placeholder: "使用服务默认值" })), element("div", { class: "field-row" }, field("工具步骤上限", "limits.max_tool_steps", limits.max_tool_steps ?? "", { type: "number", min: 1 }), field("任务时限（秒）", "limits.max_run_seconds", limits.max_run_seconds ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("文件大小上限（字节）", "limits.max_file_bytes", limits.max_file_bytes ?? "", { type: "number", min: 1 }), field("工具输出字符上限", "limits.max_output_chars", limits.max_output_chars ?? "", { type: "number", min: 1 })), settingsJSON("limits", limits, ["max_parallel_agents", "max_pending_runs", "max_tool_steps", "max_run_seconds", "max_file_bytes", "max_output_chars"])),
+    settingsSection("附件库", settingsJSON("uploads", config.uploads ?? {})));
 }
 
 function collectSettingsForm() {
@@ -1108,13 +1228,13 @@ function collectSettingsForm() {
       if (!input.value.trim()) continue;
       value = Number(input.value);
       if (!Number.isFinite(value)) throw new Error("数值格式不正确。");
-    } else if (input.dataset.format === "json") {
+    } else if (["json", "json-merge"].includes(input.dataset.format)) {
       try { value = parseJSONField(input.value); } catch { throw new Error(`${input.closest("label")?.firstElementChild?.textContent ?? "参数"} 需要填写有效 JSON 对象。`); }
     } else if (input.dataset.format === "lines") value = input.value.split("\n").map((line) => line.trim()).filter(Boolean);
     else if (input.dataset.format === "nullable") value = input.value.trim() || null;
     else value = input.type === "password" ? input.value : input.value.trim();
-    if ((input.name.endsWith(".api_key") || input.name === "server.password") && !value) continue;
-    setPath(state.settingsDraft, input.name, value);
+    if (input.dataset.format === "json-merge") mergeSettingsExtras(state.settingsDraft, input.name, value);
+    else setPath(state.settingsDraft, input.name, value);
   }
 }
 
@@ -1132,9 +1252,9 @@ async function saveSettings(event) {
     if (!Object.keys(patch).length) { toast("设置没有变化"); return; }
     submit.disabled = true;
     await request("/settings", { method: "PATCH", body: patch });
-    const results = await Promise.allSettled([request("/settings"), request("/status")]);
+    const results = await Promise.allSettled([request("/settings"), refreshSettingsResources()]);
     if (results[0].status === "fulfilled") { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); }
-    if (results[1].status === "fulfilled") { state.status = results[1].value; if (!state.activeSession) state.mode = state.status.mode || "auto"; }
+    if (results[1].status === "fulfilled" && !state.activeSession) state.mode = state.status?.mode || "auto";
     state.settingsSaved = true; renderOtherView(); renderChrome(); renderComposer(); toast("设置已保存");
   } catch (error) { displaySettingsError(error); submit.disabled = false; }
 }
@@ -1148,6 +1268,7 @@ async function pairChiliarch(button) {
     const patch = settingsPatch(state.settings, state.settingsDraft);
     if (Object.keys(patch).length) await request("/settings", { method: "PATCH", body: patch });
     await request("/integrations/chiliarch/pair", { method: "POST", body: { code, name: "MuLi" } });
+    state.settingsDraft = null;
     toast("配对已完成"); await switchView("settings");
   } catch (error) { displaySettingsError(error); button.disabled = false; }
 }
@@ -1253,6 +1374,18 @@ async function handleAction(action, button) {
   if (action === "pair-chiliarch") await pairChiliarch(button);
   if (action === "service") await serviceAction(button.dataset.command);
   if (action === "refresh-service") await refreshService();
+  if (action === "refresh-settings-status") { collectSettingsForm(); button.disabled = true; try { await refreshSettingsResources(); renderOtherView(); renderChrome(); } finally { button.disabled = false; } }
+  if (action === "retry-delivery") {
+    const delivery = state.channels?.deliveries?.find((item) => item.id === button.dataset.id);
+    if (!delivery) throw new Error("发送记录已变化，请刷新状态。");
+    const perform = async (allowUnknown = false) => {
+      collectSettingsForm(); button.disabled = true;
+      try { await retryChannelDelivery(request, delivery, { allowUnknown }); await refreshSettingsResources(); renderOtherView(); toast("已提交重试"); }
+      finally { button.disabled = false; }
+    };
+    if (delivery.state === "unknown") confirmAction("重试发送", "上次发送结果未知，再次发送可能重复。", "仍然重试", () => perform(true));
+    else await perform();
+  }
 }
 
 document.addEventListener("click", async (event) => {
@@ -1263,7 +1396,7 @@ document.addEventListener("click", async (event) => {
     else if (button.dataset.view) await switchView(button.dataset.view);
     else if (button.dataset.session) await loadSession(button.dataset.session);
     else if (button.dataset.prompt) { if (state.view !== "chat") await switchView("chat"); $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
-    else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); }
+    else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); $("#other-view").scrollTop = 0; }
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) { state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }

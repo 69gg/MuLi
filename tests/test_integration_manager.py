@@ -124,6 +124,23 @@ def dispatch(identifier: str, **payload: Any) -> Envelope:
     )
 
 
+@pytest.mark.parametrize("introduction", ["", "  ", "我是沐璃，负责整理资料。"])
+def test_introduction_uses_persona_without_model_calls(tmp_path: Path, introduction: str) -> None:
+    runtime, manager = setup(tmp_path)
+    try:
+        runtime.config.update(
+            {"persona": {"name": "小璃", "user_name": "小明", "introduction": introduction}}
+        )
+        advertised = manager._config().introduction
+        if introduction.strip():
+            assert advertised == introduction
+        else:
+            assert "小璃" in advertised and "小明的私人数字助手" in advertised
+        assert "secret" not in advertised and runtime.started == []
+    finally:
+        runtime.store.close()
+
+
 def test_dispatch_runs_once_and_reports_ordered_states_with_local_mode(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime, manager = setup(tmp_path)

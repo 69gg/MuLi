@@ -342,8 +342,10 @@ class ChannelProfile(Section):
     allowed_groups: list[str] = Field(default_factory=list)
     receive_files: bool = False
     max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1024)
+    max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
+    max_attachments: int = Field(default=8, ge=1)
     timeout: float = Field(default=45, gt=0, le=180)
-    poll_timeout: float = Field(default=30, gt=0, le=120)
+    poll_timeout: int = Field(default=30, ge=1, le=50)
     max_message_chars: int = Field(default=4000, ge=1, le=64000)
     app_id: str = ""
     client_secret: str = ""
@@ -407,6 +409,25 @@ class DesktopNotifications(Section):
     expire_ms: int = Field(default=8000, ge=1000, le=60000)
 
 
+AttentionEvent = Literal["reminder", "management", "update"]
+ATTENTION_EVENTS: tuple[AttentionEvent, ...] = ("reminder", "management", "update")
+
+
+class AttentionSettings(Section):
+    enabled: bool = Field(default=True, strict=True)
+    events: list[AttentionEvent] = Field(default_factory=lambda: list(ATTENTION_EVENTS))
+    batch_size: int = Field(default=8, ge=1, le=128, strict=True)
+    max_chars: int = Field(default=4000, ge=512, le=32000, strict=True)
+    coalesce_seconds: float = Field(default=0.25, ge=0, le=60, allow_inf_nan=False)
+
+    @field_validator("events")
+    @classmethod
+    def unique_events(cls, value: list[AttentionEvent]) -> list[AttentionEvent]:
+        if len(value) != len(set(value)):
+            raise ValueError("注意事项事件不能重复")
+        return value
+
+
 class Server(Section):
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1024, le=65535)
@@ -448,6 +469,7 @@ class Settings(Section):
     channels: ChannelSettings = Field(default_factory=ChannelSettings)
     chiliarch: Chiliarch = Field(default_factory=Chiliarch)
     notifications: DesktopNotifications = Field(default_factory=DesktopNotifications)
+    attention: AttentionSettings = Field(default_factory=AttentionSettings)
     limits: Limits = Field(default_factory=Limits)
     server: Server = Field(default_factory=Server)
     disabled_tools: list[str] = Field(default_factory=list)

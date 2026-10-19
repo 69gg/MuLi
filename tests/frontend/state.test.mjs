@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyEvent, createSessionState, hydrateSession, safeURL, parseJSONField, formatTimestamp, toDateTimeLocal, fromDateTimeLocal } from "../../web/state.mjs";
+import { applyEvent, createSessionState, hydrateSession, safeURL, parseJSONField, formatTimestamp, toDateTimeLocal, fromDateTimeLocal, messagePresentation } from "../../web/state.mjs";
 
 test("duplicate SSE replay never duplicates streamed tokens or tool calls", () => {
   let state = applyEvent(createSessionState(), { id: 1, type: "run.started", data: { run_id: "r1" } });
@@ -124,6 +124,39 @@ test("durable ingress queued and delivered events update the live count without 
   state = applyEvent(state, { type: "message.queued", data: { message: { ...message, id: "receipt-two" } } });
   state = applyEvent(state, { type: "run.cancelled", data: {} });
   assert.deepEqual(state.queued, []);
+});
+
+test("attention facts retain their system identity and never acknowledge an optimistic owner message", () => {
+  const initial = createSessionState([{ id: "owner-pending", role: "user", content: "检查结果", pending: true }]);
+  let state = applyEvent(initial, { type: "message.delta", data: { content: "正在回复" } });
+  const message = { id: "system-fact", content: "检查结果", principal: "system:attention", source: "system:attention", state: "pending" };
+  state = applyEvent(state, { type: "attention.queued", data: { message } });
+  assert.deepEqual(state.queued, ["system-fact"]);
+  assert.equal(state.messages.length, 3);
+  assert.equal(state.messages.find((entry) => entry.streaming).content, "正在回复");
+  const fact = state.messages.find((entry) => entry.id === "system-fact");
+  assert.deepEqual(messagePresentation(fact), { kind: "system-context", label: "系统资料" });
+  assert.deepEqual(messagePresentation({ role: "user", content: "system:attention", source: "system:attention" }), { kind: "user", label: "你的消息" });
+  state = applyEvent(state, { type: "message.completed", data: { message: { ...fact, delivery_status: "delivered" } } });
+  assert.deepEqual(state.queued, []);
+  state = applyEvent(state, { type: "attention.queued", data: { message } });
+  assert.equal(state.messages.find((entry) => entry.id === "system-fact").delivery_status, "delivered");
+  assert.deepEqual(state.queued, []);
+});
+
+test("cancelled ingress removes pending facts and owner receipts while preserving delivered history and streams", () => {
+  let state = hydrateSession({ messages: [
+    { id: "history", role: "user", content: "已有消息", delivery_status: "delivered" },
+    { id: "owner", role: "user", content: "补充", delivery_status: "pending" },
+    { id: "fact", role: "user", content: "资料", principal: "system:attention", delivery_status: "pending" },
+  ], events: [{ type: "run.started", data: { run_id: "current" } }, { type: "message.delta", data: { content: "正在回复" } }] });
+  state = applyEvent(state, { type: "ingress.cancelled", data: { count: 2 } });
+  assert.deepEqual(state.queued, []);
+  assert.deepEqual(state.messages.map((message) => message.id), ["history", "stream:current"]);
+  assert.equal(state.status, "running");
+  assert.equal(state.messages[1].content, "正在回复");
+  const restored = hydrateSession({ messages: state.messages, events: [{ type: "attention.queued", data: { message: { id: "fact", principal: "system:attention", content: "资料" } } }, { type: "ingress.cancelled", data: { count: 1 } }] });
+  assert.equal(restored.messages.some((message) => message.id === "fact"), false);
 });
 
 test("interrupted generation retains partial output and exposes the real failure", () => {

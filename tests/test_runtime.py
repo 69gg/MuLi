@@ -266,6 +266,94 @@ async def test_latest_turn_cannot_bypass_context_budget(tmp_path: Path) -> None:
         await runtime.close()
 
 
+@pytest.mark.parametrize("batch_size", [17, 1000])
+async def test_oversized_native_tool_batch_fails_before_any_call_or_replay_is_stored(
+    tmp_path: Path, batch_size: int
+) -> None:
+    path = tmp_path / "must-not-be-written.txt"
+    calls = [
+        ToolCall(f"c{index}", "fs_write", json.dumps({"path": str(path), "content": "bad"}))
+        for index in range(batch_size)
+    ]
+    turn = ModelTurn(
+        tool_calls=calls,
+        provider_data={
+            "protocol": "anthropic",
+            "content_blocks": [
+                {"type": "thinking", "thinking": "原生思考", "signature": "signed-original"},
+                *[
+                    {
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": json.loads(call.arguments),
+                    }
+                    for call in calls
+                ],
+            ],
+        },
+    )
+    runtime, seen = make_runtime(tmp_path, [turn])
+    try:
+        session = runtime.new_session(mode="yolo")
+        started = await runtime.start(session["id"], "必须保留的当前任务")
+        with pytest.raises(ValueError, match="批次超过剩余预算.*未执行"):
+            await runtime.wait(started["run_id"])
+        assert not path.exists()
+        assert [item["role"] for item in runtime.store.messages(session["id"])] == ["user"]
+        assert len(seen) == 1 and seen[0][-1].content == "必须保留的当前任务"
+        assert len(turn.tool_calls) == batch_size
+        assert len(turn.provider_data["content_blocks"]) == batch_size + 1
+        assert runtime.store.get("run", started["run_id"])["status"] == "failed"
+        assert not any(event["type"] == "tool.started" for event in runtime.store.events())
+    finally:
+        await runtime.close()
+
+
+async def test_tool_batch_budget_applies_to_remaining_calls_after_prior_effects(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first.txt", tmp_path / "second.txt"
+    runtime, _ = make_runtime(
+        tmp_path,
+        [
+            ModelTurn(
+                tool_calls=[
+                    ToolCall("first", "fs_write", json.dumps({"path": str(first), "content": "ok"}))
+                ]
+            ),
+            ModelTurn(
+                tool_calls=[
+                    ToolCall(
+                        f"extra{index}",
+                        "fs_write",
+                        json.dumps({"path": str(second), "content": "bad"}),
+                    )
+                    for index in range(2)
+                ]
+            ),
+        ],
+    )
+    runtime.config.update({"limits": {"max_tool_steps": 2}})
+    try:
+        session = runtime.new_session(mode="yolo")
+        started = await runtime.start(session["id"], "有界操作")
+        with pytest.raises(ValueError, match="剩余预算（1）"):
+            await runtime.wait(started["run_id"])
+        assert first.read_text() == "ok" and not second.exists()
+        records = runtime.store.messages(session["id"])
+        assert [record["role"] for record in records] == ["user", "assistant", "tool"]
+        assert records[-1]["tool_call_id"] == "first"
+        assert [message.role for message in runtime._history(session["id"])] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+        ]
+    finally:
+        await runtime.close()
+
+
 def workflow_call() -> ModelTurn:
     return ModelTurn(
         tool_calls=[

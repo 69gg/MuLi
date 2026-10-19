@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { settingsPatch, setPath, getPath } from "../../web/settings.mjs";
+import { settingsPatch, setPath, getPath, settingsExtras, mergeSettingsExtras, MODEL_ROLES, SETTINGS_GROUPS } from "../../web/settings.mjs";
 
 test("untouched redacted credentials and empty secret controls never enter PATCH", () => {
   const original = { models: { main: { model: "model-one", api_key_set: true, extra_headers: { Authorization: "***" } } }, chiliarch: { credential_set: true } };
@@ -43,4 +43,48 @@ test("password flags and blank password controls stay private while explicit cha
   assert.deepEqual(settingsPatch(original, { server: { ...original.server, password: "", clear_password: false } }), {});
   assert.deepEqual(settingsPatch(original, { server: { ...original.server, password: "new-value" } }), { server: { password: "new-value" } });
   assert.deepEqual(settingsPatch(original, { server: { ...original.server, clear_password: true } }), { server: { clear_password: true } });
+});
+
+test("channel flags and empty secret fields never enter a configuration patch", () => {
+  const original = { channels: { qq: { enabled: false, token_set: true, webhook_secret_set: true, client_secret_set: true } }, chiliarch: { credential_set: true } };
+  const draft = structuredClone(original);
+  Object.assign(draft.channels.qq, { enabled: true, token: "", webhook_secret: "", client_secret: "", clear_token: false, clear_webhook_secret: false, clear_client_secret: false });
+  draft.chiliarch.credential = "";
+  assert.deepEqual(settingsPatch(original, draft), { channels: { qq: { enabled: true } } });
+  assert.equal(original.channels.qq.enabled, false);
+});
+
+test("new channel credentials and explicit clearing are retained independently", () => {
+  const draft = { channels: { onebot: { token: "new-token", clear_webhook_secret: true }, qq: { client_secret: "new-secret", clear_token: true }, weixin: { clear_client_secret: true } } };
+  assert.deepEqual(settingsPatch({}, draft), draft);
+});
+
+test("advanced field editing keeps primary controls and other settings drafts", () => {
+  const original = { voice: { enabled: false, wake_command: [], chunk_seconds: 2 }, computer: { capture: { enabled: false, max_file_bytes: 1024 } } };
+  const draft = structuredClone(original);
+  setPath(draft, "voice.enabled", true);
+  mergeSettingsExtras(draft, "voice", { wake_command: ["/local/wake", "--json"], chunk_seconds: 1 });
+  mergeSettingsExtras(draft, "computer.capture", { max_file_bytes: 2048 });
+  assert.deepEqual(settingsPatch(original, draft), { voice: { enabled: true, wake_command: ["/local/wake", "--json"], chunk_seconds: 1 }, computer: { capture: { max_file_bytes: 2048 } } });
+  assert.equal(original.voice.enabled, false);
+});
+
+test("advanced channel JSON omits primary fields, secrets and redacted flags", () => {
+  const section = { enabled: false, token: "temporary-draft", token_set: true, webhook_secret_set: true, client_secret_set: true, clear_token: true, clear_webhook_secret: false, owner_ids: ["owner"], token_env: "MY_BOT_TOKEN", poll_timeout: 15, app_id: "app" };
+  assert.deepEqual(settingsExtras(section, ["enabled", "owner_ids"]), { token_env: "MY_BOT_TOKEN", poll_timeout: 15, app_id: "app" });
+});
+
+test("memory extraction has an independent model draft and visible management group", () => {
+  assert.ok(MODEL_ROLES.some(([role]) => role === "memory_extractor"));
+  assert.ok(["channels", "inputs", "maintenance"].every((key) => SETTINGS_GROUPS.some(([group]) => group === key)));
+  const original = { models: { main: { model: "main" }, memory_extractor: { model: "", reasoning: {} } } };
+  const draft = structuredClone(original);
+  setPath(draft, "models.memory_extractor.model", "extractor");
+  setPath(draft, "models.memory_extractor.reasoning", { effort: "high" });
+  assert.deepEqual(settingsPatch(original, draft), { models: { memory_extractor: { model: "extractor", reasoning: { effort: "high" } } } });
+});
+
+test("channel-like names inside atomic MCP environment configuration remain exact", () => {
+  const mcp = { mcpServers: { example: { enabled: false, env: { token_set: "••••", token: "", CLIENT_SECRET: "••••" } } } };
+  assert.deepEqual(settingsPatch({ mcp: {} }, { mcp }), { mcp });
 });

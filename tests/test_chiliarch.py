@@ -67,6 +67,51 @@ async def unused_callback(_: Envelope) -> None:
     raise AssertionError("不应接收到业务消息")
 
 
+async def test_introduction_is_sent_on_each_reconnect_without_changing_pair_protocol() -> None:
+    opened: list[asyncio.Event] = []
+    introductions: list[str] = []
+    bridge: ChiliarchBridge
+
+    class Stream(httpx.AsyncByteStream):
+        def __init__(self, release: asyncio.Event) -> None:
+            self.release = release
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b": connected\n\n"
+            await self.release.wait()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            opened.append(asyncio.Event())
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=Stream(opened[-1])
+            )
+        body = json.loads(request.content)
+        introductions.append(body["payload"]["metadata"]["introduction"])
+        if len(introductions) == 1:
+            opened[0].set()
+        else:
+            bridge.stop()
+        return receipt(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        bridge = ChiliarchBridge(
+            config(introduction="我是沐璃，用户的私人数字助手。", heartbeat_seconds=60),
+            unused_callback,
+            client=client,
+        )
+        await asyncio.wait_for(bridge.run(), 2)
+    assert len(opened) == 2
+    assert introductions == [bridge.config.introduction, bridge.config.introduction]
+
+
+def test_introduction_is_bounded_plain_text() -> None:
+    with pytest.raises(ValueError, match="introduction"):
+        config(introduction="x" * 4001)
+    with pytest.raises(ValueError, match="introduction"):
+        config(introduction={"message": "不是文本"})
+
+
 @pytest.mark.parametrize("pairing", [True, False])
 async def test_control_response_size_is_bounded_and_stream_is_closed(pairing: bool) -> None:
     stream = EventStream([b" " * 1024, b" "], remain_open=False)

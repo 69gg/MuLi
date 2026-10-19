@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from test_runtime import FakeClient, make_runtime
 
 from muli.compaction import Compactor, closed_groups
 from muli.config import CompactionSettings
+from muli.providers import Message, ModelTurn, StreamEvent
 from muli.store import Store
 
 
@@ -266,3 +269,92 @@ async def test_forget_settles_job_before_deleting_all_summary_layers(tmp_path: P
     finally:
         await compactor.close()
         store.close()
+
+
+@pytest.mark.parametrize("foreground", ["main", "team"])
+async def test_background_summary_never_takes_the_only_foreground_slot(
+    tmp_path: Path, foreground: str
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    runtime.config.update({"limits": {"max_parallel_agents": 1, "max_context_chars": 5000}})
+    await runtime.reconfigure()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Client(FakeClient):
+        async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+            entered.set()
+            await release.wait()
+            return ModelTurn(content="历史摘要")
+
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent("done", turn=ModelTurn(content="即时回复"))
+
+    runtime.client_factory = lambda config: Client([], seen)  # type: ignore[assignment,return-value]
+    try:
+        old = runtime.new_session(mode="yolo")
+        history(runtime.store, old["id"])
+        runtime.compaction.observe(old["id"])
+        await asyncio.wait_for(entered.wait(), 2)
+        if foreground == "main":
+            started = await runtime.submit("新的短问题", mode="yolo")
+            assert await asyncio.wait_for(runtime.wait(started["run_id"]), 2) == "即时回复"
+        else:
+            parent = runtime.new_session(mode="yolo")
+            child = await runtime.team.spawn("及时执行", "新的短任务", parent_id=parent["id"])
+            outcome = await asyncio.wait_for(runtime.team.wait([child["id"]], timeout=2), 3)
+            assert outcome["agents"][0]["status"] == "completed"
+        assert not release.is_set()
+        assert runtime.compaction.status(old["id"])["running"]
+    finally:
+        release.set()
+        await runtime.close()
+
+
+async def test_final_stream_idle_boundary_adopts_ready_summary_and_releases_job_budget(
+    tmp_path: Path,
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    runtime.config.update(
+        {"limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000}}
+    )
+    await runtime.reconfigure()
+    prepared, release = asyncio.Event(), asyncio.Event()
+
+    class Client(FakeClient):
+        async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+            prepared.set()
+            return ModelTurn(content="已完成的摘要")
+
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            await release.wait()
+            yield StreamEvent("done", turn=ModelTurn(content="最终答复"))
+
+    runtime.client_factory = lambda config: Client([], seen)  # type: ignore[assignment,return-value]
+    try:
+        session = runtime.new_session(mode="yolo")
+        history(runtime.store, session["id"])
+        started = await runtime.start(session["id"], "继续")
+        await asyncio.wait_for(prepared.wait(), 2)
+        jobs = list(runtime.compaction._tasks.values())
+        await asyncio.gather(*jobs)
+        # Gather's callback order is not the condition under test: explicitly settle
+        # the done callback while the foreground stream remains alive.
+        for job in jobs:
+            runtime.compaction._done(session["id"], job)
+        assert runtime.compaction.status(session["id"])["ready"]
+        assert runtime.store.get("compaction", session["id"]) is None
+        release.set()
+        assert await runtime.wait(started["run_id"]) == "最终答复"
+        assert runtime.store.get("compaction", session["id"]) is not None
+        assert not runtime.compaction.status(session["id"])["ready"]
+        other = runtime.new_session(mode="yolo")
+        history(runtime.store, other["id"])
+        runtime.compaction.observe(other["id"])
+        assert runtime.compaction.status(other["id"])["running"]
+    finally:
+        release.set()
+        await runtime.close()

@@ -43,6 +43,7 @@ class ChiliarchConfig:
     name: str = "MuLi"
     machine: str = ""
     capabilities: tuple[str, ...] = ()
+    introduction: str = ""
     heartbeat_seconds: float = 15.0
     reconnect_initial_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
@@ -83,6 +84,8 @@ class ChiliarchConfig:
             raise ValueError("chiliarch agent 名称必须为 1–256 个字符")
         if len(self.machine) > 256 or len(self.capabilities) > 256:
             raise ValueError("chiliarch machine 或 capabilities 超过协议限制")
+        if not isinstance(self.introduction, str) or len(self.introduction) > 4000:
+            raise ValueError("chiliarch introduction 必须是不超过 4000 字符的文本")
 
 
 def _text(value: object, name: str, maximum: int = 128) -> str:
@@ -358,12 +361,14 @@ class ChiliarchBridge:
 
     async def _heartbeat(self) -> None:
         while not self._stop_event.is_set():
+            metadata = dict(self.heartbeat_metadata() if self.heartbeat_metadata else {})
+            metadata["introduction"] = self.config.introduction
             await self.send(
                 Envelope(
                     type="heartbeat",
                     payload={
                         "status": "ready",
-                        "metadata": self.heartbeat_metadata() if self.heartbeat_metadata else {},
+                        "metadata": metadata,
                     },
                 )
             )

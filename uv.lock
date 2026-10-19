@@ -669,7 +669,7 @@ wheels = [
 
 [[package]]
 name = "muli-agent"
-version = "1.0.0"
+version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -680,6 +680,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+channels = [
+    { name = "cryptography" },
+]
 mcp = [
     { name = "fastmcp" },
 ]
@@ -694,6 +697,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", marker = "extra == 'channels'", specifier = ">=43,<48" },
     { name = "fastapi", specifier = ">=0.119,<1" },
     { name = "fastmcp", marker = "extra == 'mcp'", specifier = ">=2.13,<3" },
     { name = "httpx", specifier = ">=0.28,<1" },
@@ -701,7 +705,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "uvicorn", specifier = ">=0.38,<1" },
 ]
-provides-extras = ["mcp"]
+provides-extras = ["channels", "mcp"]
 
 [package.metadata.requires-dev]
 dev = [

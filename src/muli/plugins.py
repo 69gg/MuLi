@@ -64,6 +64,15 @@ class PluginManager:
         self._tools: dict[str, Tool] = {}
         self._base_factory = runtime.client_factory
         self._started = False
+        self._installed_since_start = False
+        self._loaded_settings = runtime.config.settings.plugins.model_dump()
+
+    @property
+    def restart_required(self) -> bool:
+        return (
+            self._installed_since_start
+            or self.runtime.config.settings.plugins.model_dump() != self._loaded_settings
+        )
 
     def inventory(self) -> list[dict[str, Any]]:
         return list(self.records)
@@ -72,6 +81,8 @@ class PluginManager:
         if self._started:
             return
         self._started = True
+        self._installed_since_start = False
+        self._loaded_settings = self.runtime.config.settings.plugins.model_dump()
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         settings = self.runtime.config.settings.plugins
         if not settings.enabled:
@@ -209,6 +220,17 @@ class PluginManager:
 
             shutil.rmtree(directory)
             raise
+        if self._started:
+            self._installed_since_start = True
+            self.records.append(
+                {
+                    "id": identifier,
+                    "name": str(data.get("name", identifier))[:120],
+                    "version": str(data.get("version", ""))[:80],
+                    "status": "installed",
+                    "restart_required": True,
+                }
+            )
         return {
             "id": identifier,
             "path": str(directory),

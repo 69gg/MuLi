@@ -97,6 +97,11 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .message-body { font-size: 14px; line-height: 1.95; color: var(--text); overflow-wrap: anywhere; }
 .message.user .message-body { background: var(--surface-2); border: 1px solid var(--line); border-radius: 13px 13px 3px 13px; padding: 12px 18px; max-width: 88%; white-space: pre-wrap; font-size: 13px; }
 .message.user .message-heading { display: none; }
+.message.system-context { border-left: 2px solid var(--line); padding-left: 14px; }
+.message.system-context summary { cursor: pointer; margin-bottom: 0; }
+.message.system-context summary svg { width: 14px; height: 14px; }
+.message.system-context details[open] summary { margin-bottom: 12px; }
+.message.system-context .message-body { font-size: 12px; white-space: pre-wrap; }
 .message-body p { margin: 0 0 12px; }
 .message-body p:last-child { margin-bottom: 0; }
 .message-body h2, .message-body h3, .message-body h4, .message-body h5 { font-size: 16px; font-weight: 600; margin: 22px 0 10px; color: var(--text); }
@@ -477,6 +482,12 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .media-profile { border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 22px; }
 .media-profile > summary { padding: 5px 0; font-size: 13px; color: var(--text); }
 .media-profile > summary small { float: right; color: var(--muted); font-size: 11px; font-weight: 400; }
+.management-item { padding: 15px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.management-item:last-child { border-bottom: 0; }
+.management-item-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; color: var(--text); font-size: 12px; }
+.management-item-heading strong { font-weight: 500; overflow-wrap: anywhere; }
+.management-item-heading > span { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
+.management-item p, .settings-notice { margin: 8px 0 0; font-size: 11px; line-height: 1.8; color: var(--muted); overflow-wrap: anywhere; }
 .auth-gate { position: fixed; z-index: 90; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--canvas); padding: 28px; }
 .login-form { width: min(310px, 100%); }
 .login-form > img { display: block; margin: 0 auto 14px; border-radius: 20px; }

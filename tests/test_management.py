@@ -217,3 +217,63 @@ async def test_update_refuses_to_change_development_environment(
         assert calls == [["uv", "tool", "dir"]]
     finally:
         await runtime.close()
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_update_retains_uv_tool_requirements_and_reports_constraint_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    runtime, _ = setup_runtime(tmp_path)
+    root = tmp_path / "tools"
+    calls: list[list[str]] = []
+
+    async def command(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        calls.append(argv)
+        if argv[1:] == ["tool", "dir"]:
+            return {"exit_code": 0, "output": str(root)}
+        return {"exit_code": exit_code, "output": ""}
+
+    monkeypatch.setattr("muli.updates.shutil.which", lambda _: "uv")
+    monkeypatch.setattr("muli.updates.run_process", command)
+    monkeypatch.setattr("muli.updates.sys.prefix", str(root / "muli-agent"))
+    try:
+        updates = Updates(runtime.config, runtime.store, runtime.bus)
+        if exit_code:
+            with pytest.raises(ValueError, match="原有版本约束"):
+                await updates.apply("2.0.0")
+        else:
+            result = await updates.apply("2.0.0")
+            assert result == {"installed": "2.0.0", "source": "absent", "restart_required": True}
+        assert calls == [
+            ["uv", "tool", "dir"],
+            ["uv", "tool", "upgrade", "--no-python-downloads", "muli-agent==2.0.0"],
+        ]
+    finally:
+        await runtime.close()
+
+
+async def test_new_plugin_is_visible_before_restart_without_executing_it(tmp_path: Path) -> None:
+    runtime, plugins = setup_runtime(tmp_path)
+    try:
+        await plugins.load()
+        installed = plugins.install(
+            "pending",
+            {
+                "plugin.json": '{"id":"pending","api_version":1,"entry":"main.py"}',
+                "main.py": 'raise RuntimeError("must not execute during installation")\n',
+            },
+        )
+        assert installed["restart_required"] and plugins.restart_required
+        assert plugins.inventory() == [
+            {
+                "id": "pending",
+                "name": "pending",
+                "version": "",
+                "status": "installed",
+                "restart_required": True,
+            }
+        ]
+        assert not plugins.contexts
+    finally:
+        await plugins.close()
+        await runtime.close()

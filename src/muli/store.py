@@ -241,6 +241,26 @@ class Store:
             result.append(record)
         return result
 
+    def replay_messages(
+        self, session_id: str, *, after: int = 0, limit: int = 1000
+    ) -> builtins.list[dict[str, Any]]:
+        """A bounded tail starting at a full user turn, never an orphan tool result.
+
+        If the current turn alone exceeds the row budget, fail explicitly instead
+        of dropping the user's request and silently replaying an unrelated suffix.
+        The archive and its pagination API retain every original message.
+        """
+        if type(limit) is not int or limit < 1:
+            raise ValueError("回放消息条数预算必须是正整数")
+        records = self.messages(session_id, after=after, limit=limit)
+        earliest = self.message_prefix(session_id, after=after, limit=1)
+        if not records or not earliest or records[0]["seq"] == earliest[0]["seq"]:
+            return records
+        for index, record in enumerate(records):
+            if record["role"] == "user":
+                return records[index:]
+        raise ValueError("当前完整用户轮次超过回放消息条数预算；原始会话仍保留，未发送残缺上下文")
+
     def main_session(self, mode: str = "auto") -> dict[str, Any]:
         """One durable local identity; old conversation sessions remain accessible."""
         with self.db:

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from muli.capture import Capture
 from muli.config import Settings
 from muli.process import run_process
 from muli.store import new_id
@@ -16,8 +17,9 @@ from muli.tools import Tool, parameters, string
 
 
 class Computer:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, capture: Capture | None = None) -> None:
         self.config = settings.computer
+        self.capture = capture
         self.snapshot_id = ""
         self.snapshot_time = 0.0
         self.nodes: dict[str, dict[str, Any]] = {}
@@ -48,9 +50,25 @@ class Computer:
     async def status(self) -> dict[str, Any]:
         try:
             data = await self.call({"operation": "probe"})
-            return {"backend": "atspi", **data, "reason": ""}
+            result = {"backend": "atspi", **data, "reason": ""}
         except (ValueError, OSError, TimeoutError) as exc:
-            return {"available": False, "backend": "atspi", "reason": str(exc)}
+            result = {"available": False, "backend": "atspi", "reason": str(exc)}
+        result["capture"] = (
+            self.capture.status()
+            if self.capture is not None
+            else {"enabled": False, "available": False, "reason": "采集服务未连接"}
+        )
+        return result
+
+    async def screenshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self.config.enabled or self.capture is None:
+            raise ValueError("电脑采集尚未启用")
+        return await self.capture.screenshot()
+
+    async def record(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self.config.enabled or self.capture is None:
+            raise ValueError("电脑采集尚未启用")
+        return await self.capture.record(arguments["seconds"])
 
     async def snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
         async with self._lock:
@@ -93,10 +111,10 @@ class Computer:
 
     def tools(self) -> list[Tool]:
         target = {"snapshot_id": string(), "node_id": string()}
-        return [
+        tools = [
             Tool(
                 "computer_snapshot",
-                "读取 Linux 无障碍树，操作前必须获取新快照",
+                "优先读取 Linux 无障碍树；不可用时可另行请求截图，操作前必须获取新快照",
                 parameters({}),
                 self.snapshot,
             ),
@@ -115,3 +133,32 @@ class Computer:
                 "computer",
             ),
         ]
+        if self.capture is not None:
+            tools.extend(
+                [
+                    Tool(
+                        "computer_screenshot",
+                        "保存当前桌面截图到本地附件；需要采集授权",
+                        parameters({}),
+                        self.screenshot,
+                        "computer",
+                    ),
+                    Tool(
+                        "computer_record",
+                        "保存有界桌面录屏到本地附件；不录制声音",
+                        parameters(
+                            {
+                                "seconds": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": self.capture.config.max_seconds,
+                                }
+                            },
+                            ("seconds",),
+                        ),
+                        self.record,
+                        "computer",
+                    ),
+                ]
+            )
+        return tools

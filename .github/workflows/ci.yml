@@ -13,6 +13,7 @@ concurrency:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -33,6 +34,7 @@ jobs:
           name: python-package
           path: dist/*
   tests:
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -45,13 +47,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
-      - run: uv run pytest -q
+      - run: uv run pytest -q -o faulthandler_timeout=60
   mcp:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.13'
-      - run: uv sync --locked --extra mcp
-      - run: uv run --extra mcp pytest -q tests/test_mcp.py
+      - run: uv sync --locked --extra mcp --extra channels
+      - run: uv run --extra mcp --extra channels pytest -q -o faulthandler_timeout=60 tests/test_mcp.py tests/test_channels.py
