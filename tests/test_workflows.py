@@ -146,11 +146,11 @@ async def test_parallel_start_barrier_survives_same_turn_watchdog(
 ) -> None:
     loop = asyncio.get_running_loop()
     original_time = loop.time
-    tick = original_time()
+    offset = 0.0
     shifted = False
 
     def simulated_time() -> float:
-        return tick
+        return original_time() + offset
 
     def create(callback: RunStep, **options: Any) -> WorkflowEngine:
         engine = factory(callback, **options)
@@ -159,13 +159,13 @@ async def test_parallel_start_barrier_survives_same_turn_watchdog(
         async def delayed_publish(
             event_type: str, data: JsonObject, session_id: str | None = None
         ) -> JsonObject:
-            nonlocal tick, shifted
+            nonlocal offset, shifted
             result = await original_emit(event_type, data, session_id)
             if not shifted and data.get("run", {}).get("status") == "running":
                 # Model slow synchronous persistence without sleeping or blocking.
                 # Both worker tasks run before the ready waiter resumes.
                 shifted = True
-                tick += 2
+                offset += 2
             return result
 
         monkeypatch.setattr(engine.bus, "emit", delayed_publish)
