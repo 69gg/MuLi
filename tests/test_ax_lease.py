@@ -712,7 +712,7 @@ async def test_transport_failure_after_write_attempt_is_unknown(
     [
         ("snapshot", "backend_unavailable", "not_started", "backend_unavailable", "not_started"),
         ("snapshot", "node_budget", "not_started", "node_budget", "not_started"),
-        ("action", "output_budget", "not_started", "output_budget", "not_started"),
+        ("action", "output_budget", "not_started", "action_unknown_outcome", "unknown"),
         ("action", "action_unknown_outcome", "unknown", "action_unknown_outcome", "unknown"),
         ("snapshot", "action_unknown_outcome", "unknown", "protocol_error", "not_started"),
         ("snapshot", "action_unknown_outcome", "not_started", "protocol_error", "not_started"),

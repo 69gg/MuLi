@@ -32,7 +32,6 @@ _PRE_DISPATCH_ERRORS = frozenset(
         "no_session",
         "node_budget",
         "protocol_error",
-        "output_budget",
         "stale_node",
         "target_changed",
         "protected_element",
