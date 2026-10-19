@@ -46,7 +46,7 @@ from muli.task_control import (
 )
 from muli.team import TeamManager
 from muli.tools import Tool, parameters, string
-from muli.tools.computer import Computer
+from muli.tools.computer import Computer, ComputerError
 from muli.tools.files import Files
 from muli.tools.mcp import MCPManager
 from muli.tools.web import Web
@@ -679,6 +679,9 @@ class Runtime:
         self.model_config("main")
         if not content.strip() or len(content) > 64000:
             raise ValueError("消息需为1–64000字符")
+        # Close an interrupted batch before a new user record hides its open tail.
+        # Unknown outcomes are journalled, never retried.
+        self._repair_tail(session_id)
         if mode:
             session["mode"] = mode
         if session["title"] == "新会话":
@@ -801,6 +804,7 @@ class Runtime:
             raise asyncio.CancelledError
 
     async def run_step(self, session_id: str, prompt: str, role: str, mode: str) -> str:
+        self._repair_tail(session_id)
         self.store.add_message(session_id, "user", prompt)
         run_id = new_id()
         task = asyncio.current_task()
@@ -1299,6 +1303,8 @@ class Runtime:
             raise
         except asyncio.CancelledError:
             raise
+        except ComputerError as exc:
+            result = exc.as_result()
         except Exception as exc:
             result = {
                 "error": str(exc)[:1000]
