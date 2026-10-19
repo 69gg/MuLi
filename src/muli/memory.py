@@ -7,11 +7,13 @@ import heapq
 import json
 import math
 import re
+import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from muli.evidence import decode_utf8
 from muli.memory_schema import SCHEMA
 from muli.store import Store, new_id, now
 
@@ -244,18 +246,30 @@ class Memory:
         return self.source(identifier), True
 
     def source(self, identifier: str, *, max_chars: int | None = None) -> dict[str, Any] | None:
-        row = self.store.db.execute(
-            "SELECT * FROM memory_sources WHERE id=?", (identifier,)
-        ).fetchone()
+        if max_chars is None:
+            row = self.store.db.execute(
+                "SELECT * FROM memory_sources WHERE id=?", (identifier,)
+            ).fetchone()
+        else:
+            if type(max_chars) is not int or max_chars <= 0:
+                raise ValueError("来源节选限制必须是正整数")
+            # Four bytes cover each requested Unicode code point. Keep SQLite's
+            # integer binding bounded even when callers use an arbitrary-size int.
+            max_bytes = min(max_chars * 4, sys.maxsize)
+            row = self.store.db.execute(
+                "SELECT id,source,session_id,role,principal,trusted_owner,digest,created_at,"
+                "substr(CAST(content AS BLOB),1,?) AS content_bytes,"
+                "length(CAST(content AS BLOB)) AS total_bytes FROM memory_sources WHERE id=?",
+                (max_bytes, identifier),
+            ).fetchone()
         if row is None:
             return None
         result = dict(row)
         result["trusted_owner"] = bool(result["trusted_owner"])
         if max_chars is not None:
-            if max_chars <= 0:
-                raise ValueError("来源节选限制必须大于零")
-            result["truncated"] = len(result["content"]) > max_chars
-            result["content"] = result["content"][:max_chars]
+            raw, total = result.pop("content_bytes"), result.pop("total_bytes")
+            result["content"] = decode_utf8(raw, allow_incomplete_tail=len(raw) < total)[:max_chars]
+            result["truncated"] = len(result["content"].encode("utf-8")) < total
         return result
 
     def search_sources(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
