@@ -10,7 +10,15 @@ import time
 import uuid
 from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+LifecycleKind = Literal["session", "run", "approval", "workflow_run"]
+_LIFECYCLE_KINDS = ("session", "run", "approval", "workflow_run")
+_LIFECYCLE_PAGE_SIZE = 100
+_UNFINISHED_LIFECYCLE = (
+    "kind IN ('session','run','approval','workflow_run') "
+    "AND json_extract(data,'$.status') IN ('pending','queued','running') "
+)
 
 
 def new_id() -> str:
@@ -76,6 +84,11 @@ class Store:
             CREATE INDEX IF NOT EXISTS agents_status ON objects(json_extract(data,'$.status')) WHERE kind='agent';
             CREATE INDEX IF NOT EXISTS agents_commitment ON objects(json_extract(data,'$.commitment_id')) WHERE kind='agent';
             CREATE INDEX IF NOT EXISTS workflow_runs_status ON objects(json_extract(data,'$.status')) WHERE kind='workflow_run';
+            CREATE INDEX IF NOT EXISTS objects_unfinished_lifecycle ON objects(kind,id)
+                WHERE kind IN ('session','run','approval','workflow_run')
+                AND json_extract(data,'$.status') IN ('pending','queued','running');
+            CREATE INDEX IF NOT EXISTS workflow_runs_by_parent
+                ON objects(json_extract(data,'$.parent_run_id'),id) WHERE kind='workflow_run';
             CREATE INDEX IF NOT EXISTS task_plan_pending ON objects(id) WHERE kind='task_plan_delivery' AND json_extract(data,'$.state')='pending';
             CREATE TABLE IF NOT EXISTS message_order (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE,
@@ -192,6 +205,68 @@ class Store:
             (kind, limit),
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    @staticmethod
+    def _lifecycle_page(after_id: str, limit: int) -> None:
+        if (
+            not isinstance(after_id, str)
+            or type(limit) is not int
+            or not 1 <= limit <= _LIFECYCLE_PAGE_SIZE
+        ):
+            raise ValueError(f"生命周期查询需要字符串游标和 1–{_LIFECYCLE_PAGE_SIZE} 的分页数量")
+
+    def unfinished_object_ids(
+        self,
+        kind: LifecycleKind,
+        *,
+        after_id: str = "",
+        limit: int = _LIFECYCLE_PAGE_SIZE,
+        workflow_id: str | None = None,
+    ) -> builtins.list[str]:
+        """Select the unfinished scope before paging, without materializing its bodies."""
+        self._lifecycle_page(after_id, limit)
+        if kind not in _LIFECYCLE_KINDS or (workflow_id is not None and kind != "workflow_run"):
+            raise ValueError("生命周期类型或工作流筛选无效")
+        scope = "AND json_extract(data,'$.workflow_id')=? " if workflow_id is not None else ""
+        values: tuple[Any, ...] = (kind, after_id)
+        if workflow_id is not None:
+            values += (workflow_id,)
+        rows = self.db.execute(
+            "SELECT id FROM objects WHERE "
+            + _UNFINISHED_LIFECYCLE
+            + "AND kind=? AND id>? "
+            + scope
+            + "ORDER BY id LIMIT ?",
+            (*values, limit),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def workflow_child_ids(
+        self, parent_run_id: str, *, after_id: str = "", limit: int = _LIFECYCLE_PAGE_SIZE
+    ) -> builtins.list[str]:
+        """Page every child of one exact execution, including completed children."""
+        self._lifecycle_page(after_id, limit)
+        rows = self.db.execute(
+            "SELECT id FROM objects WHERE kind='workflow_run' "
+            "AND json_extract(data,'$.parent_run_id')=? AND id>? ORDER BY id LIMIT ?",
+            (parent_run_id, after_id, limit),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def has_unfinished_workflow(self, workflow_id: str) -> bool:
+        return bool(self.unfinished_object_ids("workflow_run", workflow_id=workflow_id, limit=1))
+
+    def workflow_run_summary(self, identifier: str) -> dict[str, Any] | None:
+        """Read management metadata without loading node prompts, results or tool data."""
+        row = self.db.execute(
+            "SELECT id,json_extract(data,'$.workflow_id') AS workflow_id,"
+            "json_extract(data,'$.name') AS name,json_extract(data,'$.status') AS status,"
+            "json_extract(data,'$.created_at') AS created_at,"
+            "json_extract(data,'$.updated_at') AS updated_at "
+            "FROM objects WHERE kind='workflow_run' AND id=?",
+            (identifier,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def delete(self, kind: str, identifier: str) -> bool:
         with self.db:

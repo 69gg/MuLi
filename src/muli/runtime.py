@@ -37,7 +37,7 @@ from muli.providers import (
     ToolCall,
 )
 from muli.reminders import Reminders
-from muli.store import Store, new_id, now
+from muli.store import LifecycleKind, Store, new_id, now
 from muli.task_control import (
     ControlConflict,
     ControlResult,
@@ -549,11 +549,7 @@ class Runtime:
                     "SELECT 1 FROM objects WHERE kind='agent' AND json_extract(data,'$.status') IN ('queued','running') LIMIT 1"
                 ).fetchone()
             )
-            or bool(
-                self.store.db.execute(
-                    "SELECT 1 FROM objects WHERE kind='workflow_run' AND json_extract(data,'$.status') IN ('queued','running') LIMIT 1"
-                ).fetchone()
-            )
+            or bool(self.store.unfinished_object_ids("workflow_run", limit=1))
         )
 
     @property
@@ -605,11 +601,16 @@ class Runtime:
         await self.team.flush_reports()
 
     def _recover(self) -> None:
-        for kind in ("session", "run", "approval"):
-            for item in self.store.list(kind, 10000):
-                if item.get("status") in {"running", "pending", "queued"}:
-                    item["status"] = "interrupted" if kind != "session" else "idle"
-                    self.store.put(kind, item)
+        kinds: tuple[LifecycleKind, ...] = ("session", "run", "approval")
+        for kind in kinds:
+            after_id = ""
+            while identifiers := self.store.unfinished_object_ids(kind, after_id=after_id):
+                after_id = identifiers[-1]
+                for identifier in identifiers:
+                    item = self.store.get(kind, identifier)
+                    if item is not None and item.get("status") in {"running", "pending", "queued"}:
+                        item["status"] = "interrupted" if kind != "session" else "idle"
+                        self.store.put(kind, item)
 
     def configure(self) -> None:
         settings = self.config.settings
@@ -865,23 +866,34 @@ class Runtime:
                 await self.bus.emit("run.started", run, session_id)
                 result = await self._execute(session_id, run_id, role, mode, workflow_step)
                 # Child agents need the same capacity pool. Release the parent's slot first.
-                children = [
-                    child
-                    for child in self.store.list("workflow_run", 10000)
-                    if child.get("parent_run_id") == run_id
-                ]
-                child_results = []
-                for child in children:
-                    finished = await self.workflows.wait(child["id"])
-                    if finished["status"] != "completed":
-                        raise ValueError(
-                            f"子工作流未成功完成：{finished['name']}（{finished['status']}）"
-                        )
-                    child_results.append(f"{finished['name']}\n{finished.get('result', '')}")
-                if child_results:
-                    result = "\n\n".join(child_results)[
-                        : self.config.settings.limits.max_output_chars
-                    ]
+                child_results: list[str] = []
+                has_children = False
+                remaining = self.config.settings.limits.max_output_chars
+                after_id = ""
+                while children := self.workflows.child_run_ids(run_id, after_id=after_id):
+                    after_id = children[-1]
+                    for child_id in children:
+                        finished = await self.workflows.wait(child_id)
+                        if finished["status"] != "completed":
+                            raise ValueError(
+                                f"子工作流未成功完成：{finished['name']}（{finished['status']}）"
+                            )
+                        if remaining:
+                            for part in (
+                                "\n\n" if has_children else "",
+                                finished["name"],
+                                "\n",
+                                finished.get("result", ""),
+                            ):
+                                piece = str(part)[:remaining]
+                                if piece:
+                                    child_results.append(piece)
+                                    remaining -= len(piece)
+                                if not remaining:
+                                    break
+                        has_children = True
+                if has_children:
+                    result = "".join(child_results)
                     message = self.store.add_message(session_id, "assistant", result)
                     await self.bus.emit("message.completed", {"message": message}, session_id)
             run["status"], run["result"] = "completed", result
@@ -926,12 +938,17 @@ class Runtime:
                 self._repair_tail(session_id)
                 with self._stopping_session(session_id):
                     await self.team.cancel_children(session_id)
-                for child in self.store.list("workflow_run", 10000):
-                    if child.get("parent_run_id") == run_id and child["status"] in {
-                        "queued",
-                        "running",
-                    }:
-                        await self.workflows.cancel(child["id"])
+                after_id = ""
+                while children := self.workflows.child_run_ids(run_id, after_id=after_id):
+                    after_id = children[-1]
+                    for child_id in children:
+                        child = self.store.get("workflow_run", child_id)
+                        if child is not None and child.get("status") in {
+                            "pending",
+                            "queued",
+                            "running",
+                        }:
+                            await self.workflows.cancel(child_id)
             run["finished_at"] = now()
             self.store.put("run", run)
             if self.run_ids.get(session_id) == run_id:
