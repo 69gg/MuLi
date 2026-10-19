@@ -2,26 +2,119 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from muli.config import CaptureSettings
+from muli.config import CaptureSettings, Computer
 from muli.platforms.files import LocalFiles, artifact
 from muli.process import run_process
 
 
 class Capture:
     def __init__(
-        self, config: CaptureSettings, data_dir: Path, *, platform: str | None = None
+        self,
+        config: CaptureSettings,
+        data_dir: Path,
+        *,
+        platform: str | None = None,
+        python_path: str | None = None,
     ) -> None:
         self.config = config
         self.platform = platform or sys.platform
+        self.python_path = python_path if python_path is not None else Computer().python_path
+        self._portal: dict[str, Any] = {}
+        self._portal_key: tuple[Any, ...] = ()
+        self._portal_time = 0.0
+        self._probe_task: asyncio.Task[None] | None = None
+        self._closed = False
         self.files = LocalFiles(
             data_dir / "captures", config.max_file_bytes, config.max_total_bytes
         )
+
+    def _portal_state(self) -> dict[str, Any]:
+        key = (
+            self.platform,
+            self.python_path,
+            self.config.enabled,
+            self.config.backend,
+            os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
+        )
+        if key != self._portal_key:
+            self._portal_key, self._portal_time = key, 0.0
+            self._portal = {
+                "state": "unknown",
+                "available": None,
+                "version": None,
+                "available_targets": None,
+                "reason": "Portal 能力尚未确认",
+            }
+        ttl = 60 if self._portal.get("state") == "ready" else 10
+        return {
+            "implemented": True,
+            "detected": self.platform == "linux" and bool(key[-1]),
+            **self._portal,
+            "stale": not self._portal_time or time.monotonic() - self._portal_time >= ttl,
+        }
+
+    async def _portal_call(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+        result = await run_process(
+            [self.python_path, str(Path(__file__).parent / "tools" / "portal_helper.py")],
+            input_text=json.dumps(request),
+            timeout=timeout,
+            limit=24000,
+            merge_stderr=False,
+            terminate_grace=2 if request["operation"] == "screenshot" else 0,
+        )
+        try:
+            data = json.loads(result["output"])
+        except ValueError as exc:
+            raise ValueError("无法读取 Portal 响应；检查系统 Python GI 与会话总线") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Portal 响应格式无效")
+        if result["exit_code"] or "error" in data:
+            raise ValueError(str(data.get("error", "Portal 运行失败")))
+        return data
+
+    async def refresh_portal(self) -> dict[str, Any]:
+        state = self._portal_state()
+        if (
+            self._closed
+            or not self.config.enabled
+            or self.config.backend != "portal"
+            or self.platform != "linux"
+        ):
+            return state
+        if not state["stale"]:
+            return state
+        if self._probe_task is None or self._probe_task.done():
+            key = self._portal_key
+
+            async def probe() -> None:
+                try:
+                    data = await self._portal_call({"operation": "probe", "timeout": 2}, 2)
+                except (ValueError, OSError, TimeoutError) as exc:
+                    data = {"state": "error", "available": False, "reason": str(exc)[:500]}
+                self._portal_state()
+                if key == self._portal_key:
+                    self._portal.update(data)
+                    self._portal_time = time.monotonic()
+
+            self._probe_task = asyncio.create_task(probe())
+        await asyncio.shield(self._probe_task)
+        return self._portal_state()
+
+    async def aclose(self) -> None:
+        self._closed = True
+        if self._probe_task is not None:
+            self._probe_task.cancel()
+            await asyncio.gather(self._probe_task, return_exceptions=True)
+            self._probe_task = None
 
     def _mac_video_device(self) -> str:
         video, separator, audio = self.config.device.partition(":")
@@ -30,6 +123,15 @@ class Capture:
         return video + ":none"
 
     def _backend(self, recording: bool) -> tuple[str, str]:
+        if self.config.backend == "portal":
+            if self.platform != "linux" or recording:
+                return "", "Portal 后端仅支持 Linux 截图"
+            state = self._portal_state()
+            return (
+                ("portal", "")
+                if state["available"] and not state["stale"]
+                else ("", str(state["reason"] or "Portal 能力待刷新"))
+            )
         wayland, display = os.environ.get("WAYLAND_DISPLAY"), os.environ.get("DISPLAY")
         if self.platform == "linux":
             if recording:
@@ -77,11 +179,7 @@ class Capture:
                 "backend": recording,
                 "reason": recording_reason,
             },
-            "portal": {
-                "detected": self.platform == "linux"
-                and bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")),
-                "implemented": False,
-            },
+            "portal": self._portal_state(),
             "permission_verified": False,
             "reason": "" if self.config.enabled else "桌面采集尚未启用",
         }
@@ -170,6 +268,8 @@ class Capture:
     async def _capture(self, seconds: int | None) -> dict[str, Any]:
         if not self.config.enabled:
             raise ValueError("桌面采集尚未启用")
+        if self.config.backend == "portal" and seconds is None and self.platform == "linux":
+            return await self._capture_portal()
         backend, reason = self._backend(seconds is not None)
         if not backend:
             raise ValueError(reason)
@@ -193,5 +293,46 @@ class Capture:
                     path, "image/png" if seconds is None else "video/mp4", backend=backend
                 )
             except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+
+    async def _capture_portal(self) -> dict[str, Any]:
+        async with self.files.lock:
+            budget = min(
+                self.config.max_file_bytes,
+                self.config.max_total_bytes - self.files.used_bytes(),
+            )
+            if budget < 8:
+                raise ValueError("本地采集目录已达到容量限制，请先清理文件")
+            path = self.files.allocate(".png")
+            self._portal_state()
+            key = self._portal_key
+
+            async def run(arguments: list[str], **kwargs: Any) -> dict[str, Any]:
+                data = await self._portal_call(
+                    {
+                        "operation": "screenshot",
+                        "output": str(path.absolute()),
+                        "max_bytes": budget,
+                        "timeout": self.config.portal_timeout_seconds,
+                    },
+                    self.config.portal_timeout_seconds + 1.5,
+                )
+                self._portal_state()
+                if key == self._portal_key:
+                    self._portal.update(data)
+                    self._portal_time = time.monotonic()
+                return {"exit_code": 0}
+
+            try:
+                await self.files.run_output(
+                    run, [], path, timeout=self.config.portal_timeout_seconds + 1.5
+                )
+                with path.open("rb") as source:
+                    if source.read(8) != b"\x89PNG\r\n\x1a\n":
+                        raise ValueError("Portal 结果不是 PNG 文件")
+                return artifact(path, "image/png", backend="portal")
+            except BaseException:
+                self._portal_time = 0.0
                 path.unlink(missing_ok=True)
                 raise

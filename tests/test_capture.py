@@ -122,7 +122,7 @@ async def test_capture_rejects_bad_format_and_total_quota(
         await capture.screenshot()
 
 
-def test_capabilities_do_not_claim_portal_or_permission_verification(
+def test_capabilities_do_not_claim_portal_probe_or_permission_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
@@ -131,7 +131,10 @@ def test_capabilities_do_not_claim_portal_or_permission_verification(
     monkeypatch.setattr(capture_module.shutil, "which", lambda name: "/bin/" + name)
     status = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux").status()
     assert status["available"] is False
-    assert status["portal"] == {"detected": True, "implemented": False}
+    assert status["portal"]["detected"] is True
+    assert status["portal"]["implemented"] is True
+    assert status["portal"]["state"] == "unknown"
+    assert status["portal"]["available"] is None
     assert status["permission_verified"] is False
     mac = Capture(CaptureSettings(enabled=True), tmp_path, platform="darwin").status()
     assert mac["screenshot"]["available"] is True

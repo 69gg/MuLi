@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import signal
 import subprocess
@@ -19,9 +20,12 @@ async def run_process(
     input_text: str | None = None,
     merge_stderr: bool = True,
     env: dict[str, str] | None = None,
+    terminate_grace: float = 0,
 ) -> dict[str, Any]:
     if not argv or any("\x00" in arg for arg in argv):
         raise ValueError("命令参数无效")
+    if not math.isfinite(terminate_grace) or terminate_grace < 0:
+        raise ValueError("进程清理宽限须为有限非负数")
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
@@ -67,19 +71,47 @@ async def run_process(
         completed = True
     finally:
         if not completed:
-            try:
-                if os.name == "posix":
-                    # The parent can exit while descendants still retain its output pipe.
-                    os.killpg(process.pid, signal.SIGKILL)
-                elif process.returncode is None:
-                    process.kill()
-            except ProcessLookupError:
-                pass
-            for reader in readers:
-                reader.cancel()
 
             async def settle() -> None:
+                for reader in readers:
+                    reader.cancel()
                 await asyncio.gather(*readers, return_exceptions=True)
+
+                async def discard(stream: asyncio.StreamReader) -> None:
+                    while await stream.read(4096):
+                        pass
+
+                streams = [stream for stream in (process.stdout, process.stderr) if stream]
+                draining = asyncio.gather(*(discard(stream) for stream in streams))
+                if terminate_grace > 0:
+                    try:
+                        if os.name == "posix":
+                            os.killpg(process.pid, signal.SIGTERM)
+                        elif process.returncode is None:
+                            process.terminate()
+                        await asyncio.wait_for(process.wait(), terminate_grace)
+                    except (ProcessLookupError, TimeoutError):
+                        pass
+                try:
+                    if os.name == "posix":
+                        # A departed parent may leave descendants retaining its output pipe.
+                        os.killpg(process.pid, signal.SIGKILL)
+                    elif process.returncode is None:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+                # A paused StreamReader can prevent Process.wait() even after SIGKILL.
+                # Discard buffered output, then close inherited pipes on a finite deadline.
+                try:
+                    await asyncio.wait_for(draining, 1)
+                except Exception:
+                    pass
+                finally:
+                    for stream in streams:
+                        # StreamReader has no public close; close its pipe transport.
+                        transport = getattr(stream, "_transport", None)
+                        if transport is not None:
+                            transport.close()
                 await process.wait()
 
             cleanup = asyncio.create_task(settle())

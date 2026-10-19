@@ -486,7 +486,7 @@ def create_app(
 
     @app.get("/api/capture")
     async def capture_status() -> dict[str, Any]:
-        return personal_io.capture.status()
+        return await personal_io.capture_status()
 
     @app.get("/api/voice")
     async def voice_status() -> dict[str, Any]:
