@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyEvent, createSessionState, hydrateSession, safeURL, parseJSONField, formatTimestamp, toDateTimeLocal, fromDateTimeLocal, messagePresentation } from "../../web/state.mjs";
+import { applyEvent, createSessionState, hydrateSession, isRunning, toolStatusLabel, safeURL, parseJSONField, formatTimestamp, toDateTimeLocal, fromDateTimeLocal, messagePresentation } from "../../web/state.mjs";
 
 test("duplicate SSE replay never duplicates streamed tokens or tool calls", () => {
   let state = applyEvent(createSessionState(), { id: 1, type: "run.started", data: { run_id: "r1" } });
@@ -194,4 +194,56 @@ test("reminder datetime-local conversion preserves local wall time to the minute
 test("tool failures encoded inside JSON results stay visibly failed", () => {
   const state = applyEvent(createSessionState(), { type: "tool.completed", data: { call_id: "one", name: "shell", result: '{"error":"用户拒绝了工具调用"}' } });
   assert.equal(state.tools[0].status, "failed");
+});
+
+test("a paused run settles streaming and approvals while preserving queued owner input", () => {
+  const pending = { id: "later", role: "user", content: "补充要求", delivery_status: "pending" };
+  let state = createSessionState([pending]);
+  for (const event of [
+    { type: "run.started", data: { run_id: "scope-run" } },
+    { type: "message.delta", data: { content: "已核查第一项" } },
+    { type: "approval.requested", data: { id: "old-approval" } },
+    { id: 4, type: "run.paused", data: { run_id: "scope-run", observed_epoch: 2, reason: "主人暂停了任务" } },
+  ]) state = applyEvent(state, event);
+  assert.equal(state.status, "paused");
+  assert.equal(isRunning(state.status), false);
+  assert.equal(state.approvals.length, 0);
+  assert.deepEqual(state.queued, [pending.id]);
+  assert.equal(state.messages[1].content, "已核查第一项");
+  assert.equal(state.messages[1].streaming, false);
+  assert.equal(state.messages[1].interrupted, true);
+  assert.equal(state.messages[1].paused, true);
+  assert.equal(state.error, "");
+});
+
+test("paused history hydrates without an endless stream or dropping pending input", () => {
+  const state = hydrateSession({
+    messages: [{ id: "later", role: "user", content: "补充要求", delivery_status: "pending" }],
+    events: [
+      { id: 1, type: "run.started", data: { run_id: "scope-run" } },
+      { id: 2, type: "message.delta", data: { content: "保留已生成部分" } },
+      { id: 3, type: "tool.started", data: { call_id: "write-one", name: "fs_write", arguments: { path: "note.txt" } } },
+      { id: 4, type: "tool.completed", data: { call_id: "write-one", name: "fs_write", status: "not_executed", code: "task_paused", result: '{"status":"not_executed"' } },
+      { id: 5, type: "run.paused", data: { run_id: "scope-run", observed_epoch: 2 } },
+    ],
+  });
+  assert.equal(state.status, "paused");
+  assert.equal(state.cursor, "5");
+  assert.deepEqual(state.queued, ["later"]);
+  assert.equal(state.messages[1].content, "保留已生成部分");
+  assert.equal(state.messages[1].streaming, false);
+  assert.equal(state.messages[1].paused, true);
+  assert.equal(state.tools[0].status, "not_executed");
+  assert.equal(toolStatusLabel(state.tools[0]), "未执行 · 已暂停");
+  assert.equal(applyEvent(state, { id: 5, type: "run.paused", data: {} }), state);
+});
+
+test("not-executed results remain distinct from successes and execution failures", () => {
+  for (const [result, expected] of [[{ status: "not_executed", code: "task_paused" }, "未执行 · 已暂停"], [JSON.stringify({ status: "not_executed", reason: "收到新要求" }), "未执行"]]) {
+    const state = applyEvent(createSessionState(), { type: "tool.completed", data: { call_id: "never-entered", result } });
+    assert.equal(state.tools[0].status, "not_executed");
+    assert.equal(toolStatusLabel(state.tools[0]), expected);
+  }
+  assert.equal(toolStatusLabel({ status: "failed" }), "执行失败");
+  assert.equal(toolStatusLabel({ status: "completed" }), "已完成");
 });

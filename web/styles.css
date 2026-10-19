@@ -487,6 +487,7 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .task-brief h3 { color: var(--text); font-size: 13px; font-weight: 500; margin: 20px 0 8px; }
 .task-brief p, .task-brief li { white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-brief ul { padding-left: 20px; }
+.dialog-content:has(> .task-brief) { max-height: min(70svh, 650px); }
 .task-control-panel { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 20px; }
 .task-control-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; }
 .task-control-heading small { color: var(--muted); }
