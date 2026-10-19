@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from muli.permissions import Mode
@@ -21,6 +23,8 @@ class TeamManager:
         self.runtime = runtime
         self._active: dict[str, asyncio.Task[None]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._stopping_tasks: dict[asyncio.Task[Any], int] = {}
+        self._stopping_generations: dict[tuple[str, int], int] = {}
         self._waiting: dict[str, set[str]] = {}
         self._waiter = TeamWait(self)
         self._closed = False
@@ -149,6 +153,8 @@ class TeamManager:
                 return True
             visited.add(current)
             agent = self.runtime.store.get("agent", current)
+            if agent and (current, agent.get("generation", 0)) in self._stopping_generations:
+                return True
             current = agent.get("parent_id") if agent else None
         return False
 
@@ -351,7 +357,11 @@ class TeamManager:
             status = "completed"
         except asyncio.CancelledError:
             status = "interrupted" if self._closed else "cancelled"
-            await self.runtime.stop(agent["session_id"], cancel_pending=not self._closed)
+            await self.runtime.stop(
+                agent["session_id"],
+                cancel_pending=not self._closed
+                and asyncio.current_task() not in self._stopping_tasks,
+            )
             raise
         except Exception as exc:
             result = (
@@ -473,42 +483,118 @@ class TeamManager:
 
     async def stop(self, target: str) -> dict[str, Any]:
         agent = self.get(target)
-        await self.cancel_children(agent["id"])
-        self.runtime.store.cancel_inputs(agent["session_id"])
-        task = self._active.get(agent["id"])
-        cancelled = False
-        if task is not None:
-            if not task.cancelling():
-                task.cancel()
-            cancelled = await self._settle([task])
-            if not task.cancelled():
-                task.result()
-            if self._active.get(agent["id"]) is task:
-                self._active.pop(agent["id"], None)
-            current = self.get(agent["id"])
-            if current["status"] not in TERMINAL:
-                self._finish(current, "cancelled", "", None)
-                await self.runtime.bus.notify()
-        else:
-            if agent["status"] not in TERMINAL:
-                self._finish(agent, "cancelled", "", None)
-                await self.runtime.bus.notify()
-        self.runtime.store.cancel_inputs(agent["session_id"])
-        if cancelled:
-            raise asyncio.CancelledError
+        async with self._stopping([*self._descendants(agent["id"]), agent]):
+            pass
         return self.get(agent["id"])
 
-    async def cancel_children(self, parent_id: str) -> None:
+    def _descendants(self, parent_id: str) -> builtins.list[dict[str, Any]]:
         children = self.runtime.store.db.execute(
             "WITH RECURSIVE descendants(id) AS ("
             "SELECT id FROM objects WHERE kind='agent' AND json_extract(data,'$.parent_id')=? "
             "UNION SELECT o.id FROM objects o JOIN descendants d ON json_extract(o.data,'$.parent_id')=d.id WHERE o.kind='agent') "
-            "SELECT o.id FROM objects o JOIN descendants d ON o.id=d.id WHERE o.kind='agent' "
+            "SELECT o.data FROM objects o JOIN descendants d ON o.id=d.id WHERE o.kind='agent' "
             "AND json_extract(o.data,'$.status') IN ('queued','running')",
             (parent_id,),
         ).fetchall()
-        for child in children:
-            await self.stop(child[0])
+        return [json.loads(child[0]) for child in children]
+
+    async def cancel_children(self, parent_id: str) -> None:
+        if asyncio.current_task() in self._stopping_tasks:
+            # The outer batch already owns this execution's entire subtree.
+            # Runtime finalizers must not discover a later resumed generation.
+            return
+        async with self._stopping(self._descendants(parent_id)):
+            pass
+
+    @asynccontextmanager
+    async def stopping_children(self, parent_id: str) -> AsyncIterator[None]:
+        """Keep Runtime.stop and its driver finalizer on one cancellation batch."""
+        if asyncio.current_task() in self._stopping_tasks:
+            yield
+            return
+        observers = [asyncio.current_task(), self.runtime.tasks.get(parent_id)]
+        async with self._stopping(
+            self._descendants(parent_id),
+            observers=[task for task in observers if task is not None],
+        ):
+            yield
+
+    @asynccontextmanager
+    async def _stopping(
+        self,
+        agents: builtins.list[dict[str, Any]],
+        *,
+        observers: builtins.list[asyncio.Task[Any]] | None = None,
+    ) -> AsyncIterator[None]:
+        # Capture the entire batch before the first await: later resume/send
+        # calls belong to a later intent, even for a sibling not yet settled.
+        snapshots = [(agent, self._active.get(agent["id"])) for agent in agents]
+        tasks = [task for _, task in snapshots if task is not None]
+        executions: set[asyncio.Task[Any]] = {*tasks, *(observers or [])}
+        for agent, _ in snapshots:
+            driver = self.runtime.tasks.get(agent["session_id"])
+            if driver is not None:
+                executions.add(driver)
+        for task in executions:
+            self._stopping_tasks[task] = self._stopping_tasks.get(task, 0) + 1
+        generations = [(agent["id"], agent.get("generation", 0)) for agent, _ in snapshots]
+        for generation in generations:
+            self._stopping_generations[generation] = (
+                self._stopping_generations.get(generation, 0) + 1
+            )
+        try:
+            for agent, _ in snapshots:
+                self.runtime.store.cancel_inputs(agent["session_id"])
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            try:
+                yield
+            finally:
+                cancelled = await self._settle(tasks)
+                failure: BaseException | None = None
+                changed = False
+                for agent, stopped_task in snapshots:
+                    error = (
+                        stopped_task.exception()
+                        if stopped_task is not None and not stopped_task.cancelled()
+                        else None
+                    )
+                    if error is not None:
+                        failure = failure or error
+                    if self._active.get(agent["id"]) is not stopped_task:
+                        continue
+                    if stopped_task is not None:
+                        self._active.pop(agent["id"], None)
+                    current = self.get(agent["id"])
+                    if (
+                        error is None
+                        and current["status"] not in TERMINAL
+                        and current.get("generation", 0) == agent.get("generation", 0)
+                        and current.get("completion_revision", 0)
+                        == agent.get("completion_revision", 0)
+                    ):
+                        self._finish(current, "cancelled", "", None)
+                        changed = True
+                if changed:
+                    await self.runtime.bus.notify()
+                if cancelled:
+                    raise asyncio.CancelledError
+                if failure is not None:
+                    raise failure
+        finally:
+            for generation in generations:
+                count = self._stopping_generations[generation] - 1
+                if count:
+                    self._stopping_generations[generation] = count
+                else:
+                    del self._stopping_generations[generation]
+            for task in executions:
+                count = self._stopping_tasks[task] - 1
+                if count:
+                    self._stopping_tasks[task] = count
+                else:
+                    del self._stopping_tasks[task]
 
     def tools(self, caller: str, mode: Mode) -> builtins.list[Tool]:
         async def spawn(args: dict[str, Any]) -> Any:
@@ -630,7 +716,7 @@ class TeamManager:
         ]
 
     @staticmethod
-    async def _settle(tasks: builtins.list[asyncio.Task[None]]) -> bool:
+    async def _settle(tasks: builtins.list[asyncio.Task[Any]]) -> bool:
         """Finish cleanup without forwarding the observer's cancellation again."""
         settled = asyncio.gather(*tasks, return_exceptions=True)
         cancelled = False
