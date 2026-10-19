@@ -29,7 +29,9 @@ def validate(root: Path, tag: str, dist: Path) -> str:
     if versions != [version]:
         raise ValueError("运行时版本与发行版本不一致")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    match = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
+    match = re.search(
+        rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S
+    )
     if not match or not match.group(1).strip():
         raise ValueError("CHANGELOG 缺少该正式版本的发布说明")
     wheels, sources = list(dist.glob("*.whl")), list(dist.glob("*.tar.gz"))

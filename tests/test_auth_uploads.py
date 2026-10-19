@@ -35,7 +35,7 @@ def test_password_hash_and_new_default_paths(
 async def test_password_change_revokes_sessions_and_rate_limit_is_bounded(tmp_path: Path) -> None:
     config = ConfigFile(tmp_path / "config.json")
     config.update({"server": {"password": "first-password", "host": "0.0.0.0"}})
-    assert "first-password" not in config.path.read_text()
+    assert "first-password" not in config.path.read_text(encoding="utf-8")
     assert config.public()["server"]["password_set"]
     timestamp = 100.0
     auth = Authentication(config, clock=lambda: timestamp)
