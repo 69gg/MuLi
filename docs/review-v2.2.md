@@ -28,4 +28,11 @@ IAB 使用独立临时目录、关闭全部模型与设备，验证详情全文�
 
 ## 发布状态
 
-当前为发布准备。签名标签、完整远端 CI、PyPI 文件与 GitHub Release 都须分别核实后，才记为发布成功。
+已发布。最终签名提交 `568b083535cfd1ba0dc148944d90feb76fe21156` 经 [PR #5](https://github.com/69gg/MuLi/pull/5) 合入 main；[发布前 CI](https://github.com/69gg/MuLi/actions/runs/39300033096) 的八项检查全部成功，包括 Linux、macOS、Windows × Python 3.12/3.13、质量与发行包检查、可选 MCP 检查。签名标签 `v2.2.0` 验签通过，[发布流水线](https://github.com/69gg/MuLi/actions/runs/39300846150) 的十一项作业全部成功。
+
+2026-10-20 02:19（Asia/Shanghai），[PyPI 2.2.0](https://pypi.org/project/muli-agent/2.2.0/) 与 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.2.0) 均提供以下文件；分别读取两站元数据确认大小及 SHA-256 一致，未下载发行包或修改用户安装。
+
+| 文件 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.2.0-py3-none-any.whl` | 403631 | `1785432719dc36b23563bdad79d86f72ebe3f95d39425f9be2730dc746b76b14` |
+| `muli_agent-2.2.0.tar.gz` | 2392408 | `936b5758ba1837f86249829fcfe706cffb86e407c017e88e16d4e5fb57b1dac9` |
