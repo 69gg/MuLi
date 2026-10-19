@@ -625,7 +625,15 @@ def test_notification_requires_actual_protected_provenance(
             key: value for key, value in result.ingress.items() if key not in {"seq", "state"}
         }
     record[field] = {"delivery_id": "other"} if field == "task_control" else "not-trusted"
-    if claimed:
+    if claimed and field == "session_id":
+        # Bypass the host's immutable message ownership check to model a legacy/corrupt archive.
+        with rig.store.db:
+            rig.store.db.execute(
+                "UPDATE objects SET data=json_set(data,'$.session_id',?) "
+                "WHERE kind='message' AND id=?",
+                (record["session_id"], record["id"]),
+            )
+    elif claimed:
         rig.store.put("message", record)
     else:
         with rig.store.db:
