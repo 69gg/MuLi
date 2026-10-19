@@ -965,13 +965,16 @@ function renderMemories() {
   return root;
 }
 
-function memoryKind(kind) { return { preference: "偏好", fact: "事实", observation: "观察", procedure: "流程", summary: "摘要" }[kind] ?? kind ?? "观察"; }
+const MEMORY_KINDS = { observation: "观察", preference: "偏好", fact: "事实", procedure: "流程", summary: "摘要", identity: "身份", episodic: "情景", semantic: "语义事实", procedural: "流程经验" };
+function memoryKind(kind) { return Object.hasOwn(MEMORY_KINDS, kind) ? MEMORY_KINDS[kind] : kind ?? MEMORY_KINDS.observation; }
 function memoryNeedsReview(item) { return item.status === "conflict" || !!item.conflicts?.length; }
 
 function memoryEditor(item) {
   const relations = element("div", { id: "memory-relations", class: "memory-relations-editor" });
   for (const relation of item?.relations ?? []) relations.append(relationEditor(relation));
-  return element("div", {}, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 5, required: true }), selectField("类型", "kind", item?.kind ?? "observation", [["observation", "观察"], ["preference", "偏好"], ["fact", "事实"], ["procedure", "流程"], ["summary", "摘要"]]), field("关联实体", "entities", (item?.entities ?? []).join(", "), { placeholder: "用逗号分隔" }), element("details", { class: "advanced-settings", open: !!item?.relations?.length }, element("summary", { text: "关系与来源标签" }), element("label", { class: "field" }, element("span", { text: "关系" })), relations, actionButton("添加关系", "add-memory-relation", "secondary-button", "plus"), element("div", { class: "field-row field-top-space" }, field("来源标签", "source", item?.source ?? "user"), field("置信度", "confidence", item?.confidence ?? 1, { type: "number", min: 0, max: 1, step: .05 }))));
+  const kind = item?.kind ?? "observation", choices = Object.entries(MEMORY_KINDS);
+  if (!Object.hasOwn(MEMORY_KINDS, kind)) choices.push([kind, `当前类型：${kind}`]);
+  return element("div", {}, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 5, required: true }), selectField("类型", "kind", kind, choices), field("关联实体", "entities", (item?.entities ?? []).join(", "), { placeholder: "用逗号分隔" }), element("details", { class: "advanced-settings", open: !!item?.relations?.length }, element("summary", { text: "关系与来源标签" }), element("label", { class: "field" }, element("span", { text: "关系" })), relations, actionButton("添加关系", "add-memory-relation", "secondary-button", "plus"), element("div", { class: "field-row field-top-space" }, field("来源标签", "source", item?.source ?? "user"), field("置信度", "confidence", item?.confidence ?? 1, { type: "number", min: 0, max: 1, step: .05 }))));
 }
 
 async function saveMemory(item, form) {
