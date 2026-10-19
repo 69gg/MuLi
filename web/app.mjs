@@ -76,6 +76,9 @@ let memoryDialog = null;
 let memoryPath = null;
 let memoryPathSequence = 0;
 let memorySearchController = null;
+let historyDialog = null;
+let dialogHistoryReturn = null;
+const historyPageSize = 50;
 let workflowActivity = null;
 const workflowStopping = new Set();
 const workflowPageSize = 50;
@@ -132,9 +135,10 @@ function showLogin() {
   voiceInput.cancel();
   clearTaskControls();
   releaseMemoryDialog();
+  releaseHistoryDialog();
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
-  dialogTeamView = null; dialogMemoryReturn = null;
+  dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
   state.connected = false; state.auth.authenticated = false;
@@ -220,6 +224,16 @@ function renderChrome() {
   $("#timeline-toggle").hidden = state.view !== "chat";
   $("#timeline").hidden = state.view !== "chat" || !state.timelineOpen;
   $("#timeline-toggle").setAttribute("aria-pressed", String(state.timelineOpen));
+  renderHistoryEntry();
+}
+
+function renderHistoryEntry() {
+  let entry = $("#history-archive-entry");
+  if (!entry) {
+    entry = element("div", { id: "history-archive-entry", class: "history-archive-entry" }, element("button", { id: "history-archive-button", type: "button", class: "text-button", text: "已保存记录", onClick: (event) => void showHistoryArchive(state.mainSessionId, { trigger: event.currentTarget }) }));
+    $("#conversation-scroll").prepend(entry);
+  }
+  entry.hidden = state.view !== "chat" || !state.connected || !state.mainSessionId;
 }
 
 function renderSessions() {
@@ -487,16 +501,210 @@ function startSessionEvents(sessionId) {
 
 function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); $("#tool-timeline").replaceChildren(); toolNodes = new Map(); }
 
-async function loadSession(id) {
+async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
-  const detail = await request(`/sessions/${encodeURIComponent(id)}`);
-  const content = element("div", { class: "session-record" });
-  for (const message of detail.messages ?? []) {
-    if (!["user", "assistant"].includes(message.role)) continue;
-    content.append(element("article", { class: "record-message" }, element("strong", { text: messagePresentation(message).kind === "system-context" ? "系统资料" : message.role === "user" ? "任务" : "沐璃" }), element("div", { class: "message-body" }, renderMarkdown(message.content ?? "")), element("div", { class: "message-attachments" }, (message.attachments ?? []).map((file) => renderAttachment(file)))));
+  const slot = openHistoryDialog(id, "运行记录", trigger, "detail");
+  await loadSessionRecord(slot);
+}
+
+function releaseHistoryDialog() {
+  const slot = historyDialog; historyDialog = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.page = null; slot.bodyPage = null; slot.selected = null;
+  slot.starts = []; slot.offsets = []; slot.content.replaceChildren();
+}
+
+function historyDialogCurrent(slot) {
+  return historyDialog === slot && state.auth.authenticated && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function openHistoryDialog(sessionId, title, trigger, mode) {
+  const content = element("div", { class: "history-archive" });
+  openDialog({ title, content, readOnly: true });
+  const slot = { sessionId: String(sessionId), title, content, trigger, mode, page: null, bodyPage: null, selected: null, controller: null, through: null, before: null, starts: [null], offsets: [0], segment: 0, error: "", retry: null, focusAfterLoad: false, returnMessageId: null };
+  historyDialog = slot;
+  dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view };
+  const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
+  return slot;
+}
+
+async function loadSessionRecord(slot) {
+  if (!historyDialogCurrent(slot)) return;
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  slot.content.replaceChildren(element("p", { role: "status", text: "正在读取记录…" }));
+  try {
+    const detail = await request(`/sessions/${encodeURIComponent(slot.sessionId)}`, { signal: controller.signal, cache: "no-store" });
+    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    if (detail?.session?.id !== slot.sessionId || !Array.isArray(detail.messages)) throw new Error("记录响应不一致，请重新读取。");
+    slot.title = detail.session.title || "运行记录";
+    $("#dialog-title").textContent = slot.title;
+    const content = element("div", { class: "session-record" });
+    content.append(element("div", { class: "history-record-actions" }, element("button", { type: "button", class: "text-button", text: "查看正文归档", onClick: () => void showHistoryArchive(slot.sessionId, { trigger: slot.trigger, title: slot.title, fromRecord: true }) })));
+    for (const message of detail.messages) {
+      if (!["user", "assistant"].includes(message.role)) continue;
+      content.append(element("article", { class: "record-message" }, element("strong", { text: messagePresentation(message).kind === "system-context" ? "系统资料" : message.role === "user" ? "任务" : "沐璃" }), element("div", { class: "message-body" }, renderMarkdown(message.content ?? "")), element("div", { class: "message-attachments" }, (message.attachments ?? []).map((file) => renderAttachment(file)))));
+    }
+    if (content.children.length === 1) content.append(emptyState("chat", "还没有消息"));
+    slot.content.replaceChildren(content);
+  } catch (error) {
+    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    slot.content.replaceChildren(element("p", { class: "form-error", text: error.message }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadSessionRecord(slot) }));
+  } finally { if (slot.controller === controller) slot.controller = null; }
+}
+
+function historyRole(message) {
+  if (message.principal === "system:attention") return "系统资料";
+  const roles = { user: "用户记录", assistant: "助手回复", tool: "工具输出", system: "系统记录", developer: "开发者记录" };
+  return Object.hasOwn(roles, message.role) ? roles[message.role] : "未知角色";
+}
+
+function historyProvenance(message) {
+  return { runtime_excerpt: "保存时已节选", unknown: "完整性未标记" }[message.content_provenance] ?? "";
+}
+
+function historyMetadataValid(message) {
+  return message && Number.isSafeInteger(message.seq) && message.seq > 0 && typeof message.revision === "string" && !!message.revision && typeof message.role === "string"
+    && ["accepted", "runtime_excerpt", "unknown"].includes(message.content_provenance)
+    && ["source", "principal"].every((key) => message[key] === undefined || typeof message[key] === "string")
+    && (message.metadata_omitted === undefined || Array.isArray(message.metadata_omitted) && message.metadata_omitted.every((key) => typeof key === "string"));
+}
+
+function historyDirectory(payload, sessionId, before, through) {
+  const invalid = () => { throw new Error("归档响应不完整或序号超出可用范围，请重新读取。"); };
+  if (!payload || payload.session_id !== sessionId || !Array.isArray(payload.messages) || payload.messages.length > historyPageSize || !Number.isSafeInteger(payload.through_seq) || payload.through_seq < 0 || typeof payload.has_older !== "boolean" || through !== null && payload.through_seq !== through) invalid();
+  const ids = new Set(); let last = 0;
+  for (const message of payload.messages) {
+    if (!historyMetadataValid(message) || typeof message.id !== "string" || !message.id || ids.has(message.id) || message.seq <= last || message.seq > payload.through_seq || before !== null && message.seq >= before || typeof message.content_truncated !== "boolean") invalid();
+    ids.add(message.id); last = message.seq;
+    if (typeof message.content === "string") {
+      const bytes = new TextEncoder().encode(message.content).length;
+      if (!Number.isSafeInteger(message.content_bytes) || message.content_bytes < bytes || message.content_truncated !== (bytes < message.content_bytes)) invalid();
+    } else if (message.content !== null || message.content_bytes !== null || message.content_unavailable !== true || message.content_truncated) invalid();
   }
-  if (!content.children.length) content.append(emptyState("chat", "还没有消息"));
-  openDialog({ title: detail.session?.title || "运行记录", content, submitLabel: "关闭", onSubmit: async () => {} });
+  if (payload.has_older ? !payload.messages.length || !Number.isSafeInteger(payload.next_before_seq) || payload.next_before_seq !== payload.messages[0].seq : payload.next_before_seq !== null) invalid();
+  return payload;
+}
+
+async function showHistoryArchive(sessionId, { trigger = null, title = "已保存记录", fromRecord = false } = {}) {
+  if (!sessionId) return;
+  const slot = openHistoryDialog(sessionId, "正文归档", trigger, "list");
+  slot.recordTitle = title; slot.fromRecord = fromRecord;
+  await loadHistoryPage(slot);
+}
+
+async function loadHistoryPage(slot, before = null, starts = [null], returnMessageId = null) {
+  if (!historyDialogCurrent(slot)) return;
+  slot.focusAfterLoad = slot.content.contains(document.activeElement);
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  slot.mode = "list"; slot.page = null; slot.bodyPage = null; slot.selected = null;
+  slot.error = ""; slot.retry = () => void loadHistoryPage(slot, before, starts, returnMessageId);
+  renderHistoryDialog(slot);
+  try {
+    const query = new URLSearchParams({ limit: String(historyPageSize) });
+    if (before !== null) query.set("before_seq", String(before));
+    if (slot.through !== null) query.set("through_seq", String(slot.through));
+    const payload = await request(`/sessions/${encodeURIComponent(slot.sessionId)}/messages?${query}`, { signal: controller.signal, cache: "no-store" });
+    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    slot.page = historyDirectory(payload, slot.sessionId, before, slot.through);
+    slot.through = payload.through_seq; slot.before = before; slot.starts = starts; slot.returnMessageId = returnMessageId;
+  } catch (error) {
+    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    slot.error = error.status === 404 ? "记录已不可用。" : error.message;
+    if (error.status === 404) slot.retry = null;
+  } finally {
+    if (historyDialogCurrent(slot) && slot.controller === controller) { slot.controller = null; renderHistoryDialog(slot); }
+  }
+}
+
+function historyContentValid(page, slot, offset) {
+  return historyMetadataValid(page) && page.session_id === slot.sessionId && page.message_id === slot.selected.id && page.seq === slot.selected.seq && page.revision === slot.selected.revision && page.field === "content" && typeof page.content === "string"
+    && [page.offset_bytes, page.length_bytes, page.next_offset_bytes, page.total_bytes].every((value) => Number.isSafeInteger(value) && value >= 0)
+    && page.total_bytes === slot.selected.content_bytes && page.offset_bytes === offset && page.length_bytes === new TextEncoder().encode(page.content).length && page.next_offset_bytes === offset + page.length_bytes
+    && typeof page.has_more === "boolean" && page.has_more === (page.next_offset_bytes < page.total_bytes) && page.next_offset_bytes <= page.total_bytes && (!page.has_more || page.length_bytes > 0);
+}
+
+async function selectHistoryMessage(slot, message) {
+  if (!historyDialogCurrent(slot)) return;
+  const { content, ...selected } = message;
+  slot.selected = selected; slot.page = null; slot.offsets = [0]; slot.segment = 0;
+  await loadHistoryContent(slot, 0, 0);
+}
+
+async function loadHistoryContent(slot, offset, segment) {
+  if (!historyDialogCurrent(slot) || !slot.selected) return;
+  slot.focusAfterLoad = slot.content.contains(document.activeElement);
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  slot.mode = "body"; slot.bodyPage = null; slot.error = "";
+  slot.retry = () => void loadHistoryContent(slot, offset, segment);
+  renderHistoryDialog(slot);
+  try {
+    const query = new URLSearchParams({ offset_bytes: String(offset), revision: slot.selected.revision });
+    const page = await request(`/sessions/${encodeURIComponent(slot.sessionId)}/messages/${encodeURIComponent(slot.selected.id)}/content?${query}`, { signal: controller.signal, cache: "no-store" });
+    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    if (!historyContentValid(page, slot, offset)) throw new Error("正文响应不一致，请返回记录重新读取。");
+    slot.bodyPage = page; slot.offsets = [...slot.offsets.slice(0, segment), offset]; slot.segment = segment;
+  } catch (error) {
+    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    slot.error = error.status === 404 ? "正文已不可用，请返回记录。" : error.status === 409 ? "正文已更新，请返回记录重新选择。" : error.message;
+    if ([404, 409].includes(error.status)) { slot.retry = null; slot.offsets = [0]; slot.segment = 0; }
+  } finally {
+    if (historyDialogCurrent(slot) && slot.controller === controller) { slot.controller = null; renderHistoryDialog(slot); }
+  }
+}
+
+function renderHistoryDialog(slot) {
+  if (!historyDialogCurrent(slot)) return;
+  const root = slot.content;
+  const restoreFocus = slot.focusAfterLoad && (root.contains(document.activeElement) || document.activeElement === document.body);
+  root.setAttribute("aria-busy", String(!!slot.controller)); root.replaceChildren();
+  $("#dialog-title").textContent = slot.mode === "body" ? "已保存正文" : "正文归档";
+  if (slot.mode === "body") {
+    const id = slot.selected.id;
+    root.append(element("button", { type: "button", class: "text-button", text: "返回记录", onClick: () => void loadHistoryPage(slot, slot.before, slot.starts, id) }));
+    const page = slot.bodyPage;
+    if (page) {
+      root.append(statusList([["角色", historyRole(page)], ["序号", page.seq], ["身份", page.principal ?? "未记录"], ["来源", page.source ?? "未记录"]]));
+      if (page.metadata_omitted?.length) root.append(element("p", { class: "history-note", text: "部分来源元数据未显示。" }));
+      const provenance = historyProvenance(page);
+      if (provenance) root.append(element("p", { class: "history-note", text: provenance }));
+      root.append(element("pre", { class: "history-content", text: page.content }));
+      const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: slot.segment === 0, onClick: () => void loadHistoryContent(slot, slot.offsets[slot.segment - 1], slot.segment - 1) });
+      const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !page.has_more, onClick: () => void loadHistoryContent(slot, page.next_offset_bytes, slot.segment + 1) });
+      root.append(element("nav", { class: "history-navigation", "aria-label": "正文分段" }, previous, element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.segment + 1} 段 · ${page.has_more ? "尚有后文" : "已到所存正文末尾"}` }), next));
+    }
+  } else {
+    if (slot.fromRecord) root.append(element("button", { type: "button", class: "text-button", text: "返回任务详情", onClick: () => void loadSession(slot.sessionId, slot.trigger) }));
+    root.append(element("p", { class: "history-note", text: slot.fromRecord ? `${slot.recordTitle} · 已保存的消息正文` : "已保存的消息正文" }));
+    if (slot.page) {
+      for (const message of slot.page.messages) {
+        const row = element("article", { class: "history-message" }, element("div", { class: "history-message-heading" }, element("strong", { text: historyRole(message) }), element("span", { text: `#${message.seq}` })));
+        row.append(element("p", { class: "history-preview", text: message.content ?? "此消息无文本正文。" }));
+        row.append(element("p", { class: "history-note", text: `身份：${message.principal ?? "未记录"} · 来源：${message.source ?? "未记录"}` }));
+        const notes = [message.content_truncated ? "正文预览" : "", historyProvenance(message)].filter(Boolean);
+        if (message.metadata_omitted?.length) notes.push("部分来源元数据未显示");
+        if (notes.length) row.append(element("p", { class: "history-note", text: notes.join(" · ") }));
+        if (typeof message.content === "string") row.append(element("button", { type: "button", class: "text-button", text: "查看正文", dataset: { historyMessageId: message.id }, onClick: () => void selectHistoryMessage(slot, message) }));
+        root.append(row);
+      }
+      if (!slot.page.messages.length) root.append(element("p", { role: "status", text: "此页没有已保存记录。" }));
+      const newer = element("button", { type: "button", class: "text-button", text: "较新一页", disabled: slot.starts.length < 2, onClick: () => void loadHistoryPage(slot, slot.starts.at(-2), slot.starts.slice(0, -1)) });
+      const older = element("button", { type: "button", class: "text-button", text: "更早一页", disabled: !slot.page.has_older, onClick: () => void loadHistoryPage(slot, slot.page.next_before_seq, [...slot.starts, slot.page.next_before_seq]) });
+      root.append(element("nav", { class: "history-navigation", "aria-label": "正文归档分页" }, newer, element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.starts.length} 页 · ${slot.page.has_older ? "尚有更早记录" : "已到最早"}` }), older));
+    }
+  }
+  if (slot.controller) root.append(element("p", { role: "status", class: "history-note", text: "正在读取…" }));
+  if (slot.error) {
+    root.append(element("p", { class: "form-error", role: "alert", text: slot.error }));
+    if (slot.retry) root.append(element("button", { type: "button", class: "text-button", text: "重试", onClick: slot.retry }));
+  }
+  if (!slot.controller && slot.focusAfterLoad) {
+    if (restoreFocus) {
+      const target = slot.returnMessageId && $$("[data-history-message-id]", root).find((button) => button.dataset.historyMessageId === slot.returnMessageId) || $(".history-position", root) || $("#dialog-title");
+      target.focus({ preventScroll: true });
+    }
+    slot.focusAfterLoad = false;
+  }
 }
 
 async function sendMessage(event) {
@@ -568,6 +776,7 @@ function resizeComposer() {
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, onSubmit }) {
   releaseTaskDialog();
   releaseMemoryDialog();
+  releaseHistoryDialog(); dialogHistoryReturn = null;
   dialogMemoryReturn = returnMemoryId ? { id: returnMemoryId, trigger: returnMemoryTrigger, pathButton: returnMemoryTrigger?.dataset.memoryPathRef ? memoryPath?.button : null } : null;
   const teamView = captureTeamView($("#other-view"));
   dialogTeamView = teamView?.inside ? teamView : null;
@@ -621,7 +830,7 @@ function emptyState(iconName, title, description) {
 async function switchView(view) {
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
-  if (view !== state.view && memoryDialog) { $("#app-dialog").close(); releaseMemoryDialog(); }
+  if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
@@ -2034,7 +2243,7 @@ async function handleAction(action, button) {
   if (action === "add-workflow-step") addWorkflowStep();
   if (action === "remove-workflow-step") button.closest(".workflow-step-editor")?.remove();
   if (action === "run-workflow") await runWorkflow(button.dataset.id, button);
-  if (action === "workflow-session") await loadSession(button.dataset.session);
+  if (action === "workflow-session") await loadSession(button.dataset.session, button);
   if (["refresh-workflow-runs", "page-workflow-runs"].includes(action)) {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button) || slot.loading) return;
@@ -2086,7 +2295,7 @@ document.addEventListener("click", async (event) => {
   try {
     if (button.dataset.action) await handleAction(button.dataset.action, button);
     else if (button.dataset.view) await switchView(button.dataset.view);
-    else if (button.dataset.session) await loadSession(button.dataset.session);
+    else if (button.dataset.session) await loadSession(button.dataset.session, button);
     else if (button.dataset.prompt) { if (state.view !== "chat") await switchView("chat"); $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
     else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); $("#other-view").scrollTop = 0; }
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
@@ -2131,6 +2340,7 @@ $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
   releaseTaskDialog();
   releaseMemoryDialog();
+  releaseHistoryDialog();
   const saved = dialogTeamView; dialogTeamView = null;
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
   const memoryReturn = dialogMemoryReturn; dialogMemoryReturn = null;
@@ -2139,6 +2349,13 @@ $("#app-dialog").addEventListener("close", () => {
     const target = [memoryReturn.trigger, memoryReturn.pathButton, fallback].find((button) => button && root.contains(button));
     if (target) target.focus({ preventScroll: true });
     else { const heading = $(".view-heading h2", root); if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); } }
+  }
+  const historyReturn = dialogHistoryReturn; dialogHistoryReturn = null;
+  if (state.auth.authenticated && historyReturn?.view === state.view) {
+    const fallback = state.view === "chat" ? $("#history-archive-button") : $$("[data-action=workflow-session]", $("#other-view")).find((button) => button.dataset.session === historyReturn.sessionId);
+    const target = historyReturn.trigger && document.contains(historyReturn.trigger) ? historyReturn.trigger : fallback;
+    if (target) target.focus({ preventScroll: true });
+    else { const heading = $(".view-heading h2", $("#other-view")); if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); } }
   }
 });
 document.addEventListener("keydown", (event) => {
@@ -2154,7 +2371,7 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog) $("#app-dialog").close(); releaseMemoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); globalController?.abort(); sessionController?.abort(); });
+window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); globalController?.abort(); sessionController?.abort(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();
