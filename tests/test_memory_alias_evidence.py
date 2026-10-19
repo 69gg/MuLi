@@ -594,3 +594,59 @@ def test_forgotten_source_cannot_recreate_alias_from_late_extraction(memory: Mem
     )
     assert not proof_rows(memory)
     assert not memory.traverse("Lumi")["nodes"]
+
+
+@pytest.mark.parametrize(
+    ("legacy_kind", "forget_first"),
+    [
+        ("source_only", "fresh"),
+        ("source_only", "legacy"),
+        ("no_references", "fresh"),
+        ("mismatched_source", "fresh"),
+        ("mismatched_source", "legacy"),
+    ],
+)
+def test_new_contribution_does_not_replace_legacy_lookup_lifetime(
+    memory: Memory, legacy_kind: str, forget_first: str
+) -> None:
+    original = sourced(memory, "original")
+    keeper = memory.save("保留规范实体", entities=["MuLi"])
+    memory.register_source({"id": "legacy", "content": "旧的 Lumi 名称资料"})
+    with memory.store.db:
+        memory.store.db.execute(
+            "UPDATE memory_aliases SET source_id=?,memory_id=? WHERE alias='lumi'",
+            (
+                None if legacy_kind == "no_references" else "legacy",
+                original["id"] if legacy_kind == "mismatched_source" else None,
+            ),
+        )
+    migrated = legacy_reopen(memory)
+    before = seed(migrated)
+    assert before["kind"] == "legacy_unknown"
+    fresh = sourced(migrated, "fresh")
+    assert seed(migrated)["memory_id"] == fresh["id"]
+    assert seed(migrated)["kind"] == "source"
+    projection = migrated.store.db.execute(
+        "SELECT memory_id,source_id FROM memory_aliases WHERE alias='lumi'"
+    ).fetchone()
+    assert dict(projection) == {"memory_id": before["memory_id"], "source_id": before["source_id"]}
+    if forget_first == "fresh":
+        migrated.forget_source("fresh")
+        assert seed(migrated) == before
+        if legacy_kind == "mismatched_source":
+            # Either FK owns this one legacy lookup; deleting its memory must
+            # retire it even while its inconsistent legacy source still exists.
+            migrated.forget_source("original")
+            assert migrated.source("legacy") is not None
+        else:
+            migrated.forget_source("legacy")
+        if legacy_kind == "no_references":
+            assert seed(migrated) == before
+            migrated.forget_source("original")
+            migrated.delete(keeper["id"])
+    else:
+        migrated.forget_source("legacy")
+        assert seed(migrated)["memory_id"] == fresh["id"]
+        assert seed(migrated)["source_id"] == "fresh"
+        migrated.forget_source("fresh")
+    assert not migrated.traverse("Lumi", hops=0)["nodes"]
