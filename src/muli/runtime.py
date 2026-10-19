@@ -951,6 +951,7 @@ class Runtime:
                             await self.workflows.cancel(child_id)
             run["finished_at"] = now()
             self.store.put("run", run)
+            session_updated = False
             if self.run_ids.get(session_id) == run_id:
                 session = self.store.get("session", session_id)
                 if session:
@@ -958,7 +959,16 @@ class Runtime:
                         "paused" if run["status"] == "paused" else "idle",
                         now(),
                     )
-                    self.store.put("session", session)
+                    # Terminal events precede asynchronous cleanup. Publish the
+                    # final session fact atomically with its invalidation so a
+                    # subscriber starting during cleanup cannot remain running.
+                    self.store.event(
+                        "session.updated",
+                        {"session_id": session_id, "status": session["status"]},
+                        session_id,
+                        objects=[("session", session)],
+                    )
+                    session_updated = True
                     # A summary can become ready during the final stream. Its done
                     # callback saw a running session, so settle it at this idle boundary.
                     self.compaction.adopt(session_id)
@@ -966,6 +976,16 @@ class Runtime:
                 self.run_ids.pop(session_id, None)
                 if session and session.get("kind") == "main":
                     self._wake_main()
+            if session_updated:
+                # Unregister this driver before the next suspension; a late
+                # cancellation must not strand its handles or erase the event.
+                notification = asyncio.create_task(self.bus.notify())
+                release_cancelled = await self.team._settle([notification]) or release_cancelled
+                if notification.cancelled():
+                    release_cancelled = True
+                elif error := notification.exception():
+                    run["notification_error"] = f"会话更新通知失败：{type(error).__name__}"
+                    self.store.put("run", run)
             if release_cancelled:
                 raise asyncio.CancelledError
 
