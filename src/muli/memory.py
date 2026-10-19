@@ -374,6 +374,17 @@ class Memory:
     def _repair_aliases(self, aliases: Sequence[str]) -> None:
         """Rebuild affected lookup rows before orphan cleanup, without owning proofs."""
         for alias in sorted(set(aliases)):
+            legacy = self.store.db.execute(
+                "SELECT 1 FROM memory_aliases a WHERE a.alias=? AND NOT EXISTS "
+                "(SELECT 1 FROM memory_alias_evidence p JOIN memory_meta m ON m.memory_id=p.memory_id "
+                "WHERE p.alias=a.alias AND p.entity_id=a.entity_id AND p.memory_id=a.memory_id "
+                "AND p.source_id IS a.source_id AND p.source_id IS m.source_id)",
+                (alias,),
+            ).fetchone()
+            if legacy is not None:
+                # A legacy lookup has its own unknown lifetime. A new contribution
+                # must not replace those references and implicitly revoke it later.
+                continue
             row = self.store.db.execute(
                 "SELECT p.entity_id,p.memory_id,p.source_id FROM memory_alias_evidence p "
                 "JOIN memory_meta m ON m.memory_id=p.memory_id "
