@@ -484,6 +484,26 @@ async function clickMemoryButton(h, button) {
   await flush();
 }
 
+test("DOM replacement keeps primitive text values rather than filtering boolean or nullish children", () => {
+  const h = harness(), root = h.document.createElement("div");
+  // Native DOM converts non-Node arguments to text; this substitute must not hide them.
+  root.replaceChildren(false, true, null, undefined, 0, "");
+  assert.deepEqual(root.childNodes.map((node) => node.textContent), ["false", "true", "null", "undefined", "0", ""]);
+  assert.ok(root.childNodes.every((node) => node instanceof TextNode));
+  root.replaceChildren(); assert.equal(root.childNodes.length, 0);
+});
+
+test("graph path renders only nodes for complete results and adds one note for truncated results", async () => {
+  for (const truncated of [false, undefined, null, true]) {
+    const item = graphMemory(), h = harness(async () => ({ items: [item], truncated }));
+    await clickMemoryButton(h, mountGraphResults(h, [item]));
+    const region = h.ui.path.region;
+    assert.ok(region.childNodes.every((node) => node instanceof DOMElement), `unexpected text node with truncated=${truncated}`);
+    assert.equal(region.childNodes.length, truncated === true ? 4 : 3);
+    assert.equal(region.textContent.includes("部分检索结果"), truncated === true);
+  }
+});
+
 test("only complete graph results expose a real disclosure, while whole-path omissions are explicit", () => {
   const valid = graphMemory(), omitted = { ...graphMemory("omitted"), path_omitted: true }, old = fixtureMemory("old", { matched_by: "graph" });
   const invalid = graphMemory("invalid"); invalid.graph_via.complete = false;
