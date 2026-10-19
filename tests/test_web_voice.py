@@ -73,6 +73,22 @@ def mock_media(
     monkeypatch.setattr(local, "media", factory)
 
 
+def defer_transcription_timeout(
+    monkeypatch: pytest.MonkeyPatch, expected_delay: float
+) -> asyncio.Timeout:
+    original_timeout = asyncio.timeout
+    timer = original_timeout(None)
+
+    def capture(delay: float | None) -> asyncio.Timeout:
+        # Defer only the next production timeout; media timeouts stay unchanged.
+        monkeypatch.setattr(asyncio, "timeout", original_timeout)
+        assert delay == expected_delay
+        return timer
+
+    monkeypatch.setattr(asyncio, "timeout", capture)
+    return timer
+
+
 @pytest.mark.parametrize(
     "patch",
     [
@@ -218,9 +234,15 @@ async def test_concurrency_is_immediate_and_cancellation_frees_capacity(
 async def test_timeout_cancels_remote_operation(
     harness: VoiceHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cancelled = asyncio.Event()
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    requests = 0
 
     async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests > 1:
+            return httpx.Response(200, json={"text": "超时后可重新转写"})
+        started.set()
         try:
             await asyncio.Event().wait()
         finally:
@@ -228,12 +250,77 @@ async def test_timeout_cancels_remote_operation(
         raise AssertionError("unreachable")
 
     item = await harness.audio()
-    harness.runtime.config.update({"web_voice": {"timeout": 0.02}})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         mock_media(monkeypatch, harness.local, client)
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(harness.voice.transcribe(item["id"]), 2)
-    assert cancelled.is_set() and harness.voice.status()["active"] == 0
+        timer = defer_transcription_timeout(
+            monkeypatch, harness.runtime.config.settings.web_voice.timeout
+        )
+        task = asyncio.create_task(harness.voice.transcribe(item["id"]))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            assert not task.done() and not timer.expired()
+            timer.reschedule(asyncio.get_running_loop().time())
+            # The watchdog must not supply the TimeoutError asserted below.
+            done, _ = await asyncio.wait({task}, timeout=2)
+            assert task in done, "转写未在超时后结束"
+            with pytest.raises(TimeoutError):
+                task.result()
+            assert timer.expired() and cancelled.is_set() and requests == 1
+            assert harness.voice.status()["active"] == 0
+            result = await asyncio.wait_for(harness.voice.transcribe(item["id"]), 2)
+            assert result["text"] == "超时后可重新转写" and requests == 2
+            assert harness.voice.status()["active"] == 0
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_timeout_during_audio_read_never_dispatches_remote_operation(
+    harness: VoiceHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reading, cancelled = asyncio.Event(), asyncio.Event()
+    requests: list[httpx.Request] = []
+    original_read = harness.local.read_bytes
+
+    async def read(identifier: str, max_bytes: int) -> tuple[dict[str, Any], bytes]:
+        reading.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"text": "读取超时后可重新转写"})
+
+    item = await harness.audio()
+    monkeypatch.setattr(harness.local, "read_bytes", read)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        mock_media(monkeypatch, harness.local, client)
+        timer = defer_transcription_timeout(
+            monkeypatch, harness.runtime.config.settings.web_voice.timeout
+        )
+        task = asyncio.create_task(harness.voice.transcribe(item["id"]))
+        try:
+            await asyncio.wait_for(reading.wait(), 2)
+            assert not task.done() and not timer.expired()
+            timer.reschedule(asyncio.get_running_loop().time())
+            done, _ = await asyncio.wait({task}, timeout=2)
+            assert task in done, "音频读取未在超时后结束"
+            with pytest.raises(TimeoutError):
+                task.result()
+            assert timer.expired() and cancelled.is_set() and not requests
+            assert harness.voice.status()["active"] == 0
+            monkeypatch.setattr(harness.local, "read_bytes", original_read)
+            result = await asyncio.wait_for(harness.voice.transcribe(item["id"]), 2)
+            assert result["text"] == "读取超时后可重新转写" and len(requests) == 1
+            assert harness.voice.status()["active"] == 0
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_reconfigure_cancels_then_allows_new_operation(
