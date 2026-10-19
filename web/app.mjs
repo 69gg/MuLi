@@ -1078,7 +1078,8 @@ function renderMemoryPath(slot, truncated) {
     const forward = step.direction === "forward", from = forward ? step.subject : step.object, to = forward ? step.object : step.subject;
     steps.append(element("li", {}, element("div", { class: "memory-path-step" }, element("span", { class: "memory-path-triple", text: `${from} ${forward ? "—" : "←"}${step.predicate}${forward ? "→" : "—"} ${to}` }), proofButton(step.memory_id, `step-${index}`, "核查"))));
   }
-  slot.region.replaceChildren(element("p", { class: "memory-path-title", text: "本次检索路径" }), origin, steps, truncated && element("span", { class: "memory-path-note", text: "部分检索结果" }));
+  slot.region.replaceChildren(element("p", { class: "memory-path-title", text: "本次检索路径" }), origin, steps);
+  if (truncated) slot.region.append(element("span", { class: "memory-path-note", text: "部分检索结果" }));
 }
 
 const MEMORY_KINDS = { observation: "观察", preference: "偏好", fact: "事实", procedure: "流程", summary: "摘要", identity: "身份", episodic: "情景", semantic: "语义事实", procedural: "流程经验" };
