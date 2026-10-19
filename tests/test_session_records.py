@@ -151,6 +151,28 @@ def test_infinite_json_numbers_and_missing_times_are_unknown(store: Store) -> No
     assert items[-1]["title"] is items[-1]["status"] is None
 
 
+@pytest.mark.parametrize("field", ["title", "status"])
+def test_empty_text_metadata_is_preserved_on_first_and_continuation_pages(
+    store: Store, field: str
+) -> None:
+    save(store, "empty-first", 3, **{field: ""})
+    save(store, "empty-next", 2, **{field: ""})
+    save(store, "nullable", 1, **{field: None})
+    store.put("session", {"id": "missing"})
+
+    items = all_records(SessionRecords(store), limit=1)
+
+    assert [item["id"] for item in items] == [
+        "empty-first",
+        "empty-next",
+        "nullable",
+        "missing",
+    ]
+    assert [item[field] for item in items[:2]] == ["", ""]
+    assert items[2][field] is None
+    assert items[3]["title"] is items[3]["status"] is None
+
+
 def test_integer_keys_keep_precision_and_a_first_page_has_no_artificial_upper_anchor(
     store: Store,
 ) -> None:

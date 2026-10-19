@@ -272,7 +272,8 @@ class Store:
                 (
                     f"json_type(data,'$.{field}') AS {field}_type",
                     f"CASE WHEN json_type(data,'$.{field}')='text' THEN "
-                    f"substr(CAST({value} AS BLOB),1,min(?,length(CAST({value} AS BLOB)))) "
+                    f"coalesce(substr(CAST({value} AS BLOB),1,"
+                    f"min(?,length(CAST({value} AS BLOB)))),x'') "
                     f"END AS {field}",
                     f"length(CAST({value} AS BLOB)) AS {field}_bytes",
                 )
