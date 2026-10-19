@@ -171,7 +171,11 @@ test("directory navigation uses actual returned boundaries, one DOM page and a f
   const h = harness(async (path) => path.includes("before_seq=98") ? directory([message(90)], { through_seq: 100, has_older: true, next_before_seq: 90 }) : directory(first, { has_older: true, next_before_seq: 98 }));
   await h.ui.showHistoryArchive("main");
   assert.equal(h.requests.length, 1); assert.equal(h.button("较新一页").disabled, true);
+  const children = h.ui.slot.content.children;
+  assert.ok(children.indexOf(h.dialog.querySelector("nav")) < children.indexOf(h.dialog.querySelector(".history-message")), "page navigation must precede long record lists");
+  h.document.querySelector("#dialog-content").scrollTop = 6000;
   await h.click(h.button("更早一页"));
+  assert.equal(h.document.querySelector("#dialog-content").scrollTop, 0);
   assert.equal(h.requests[1].path, "/sessions/main/messages?limit=50&before_seq=98&through_seq=100");
   assert.equal(h.dialog.querySelectorAll(".history-message").length, 1);
   assert.equal(h.body().includes("saved-100"), false); assert.equal(h.ui.slot.bodyPage, null);
@@ -209,7 +213,11 @@ test("UTF-8 body pages send revision on first read, keep one segment and reread 
   assert.equal(h.requests[1].path, "/sessions/main/messages/message-9/content?offset_bytes=0&revision=revision-9");
   assert.equal(h.ui.slot.page, null); assert.equal("content" in h.ui.slot.selected, false);
   assert.equal(h.dialog.querySelector("pre").textContent, first); assert.equal(h.button("上一段").disabled, true);
+  const children = h.ui.slot.content.children;
+  assert.ok(children.indexOf(h.dialog.querySelector("nav")) < children.indexOf(h.dialog.querySelector("pre")), "segment navigation must precede long body text");
+  h.document.querySelector("#dialog-content").scrollTop = 6000;
   await h.click(h.button("下一段"));
+  assert.equal(h.document.querySelector("#dialog-content").scrollTop, 0);
   assert.ok(h.requests[2].path.includes(`offset_bytes=${offset}`));
   assert.equal(h.dialog.querySelectorAll("pre").length, 1); assert.equal(h.dialog.querySelector("pre").textContent, second);
   assert.equal(h.dialog.querySelectorAll("img").length, 0); assert.equal(h.body().includes(first), false);
