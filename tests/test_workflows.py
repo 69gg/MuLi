@@ -61,6 +61,25 @@ async def completed(engine: WorkflowEngine, run_id: str) -> JsonObject:
                 )
 
 
+async def started(engine: WorkflowEngine, run_id: str, event: asyncio.Event) -> None:
+    ready = asyncio.create_task(event.wait())
+    finished = asyncio.create_task(engine.wait(run_id))
+    try:
+        # Keep the watchdog, but inspect the real condition after waking. A timer
+        # can run after Event.set() and before its waiter resumes in the same turn.
+        await asyncio.wait({ready, finished}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        run = engine.store.get("workflow_run", run_id)
+        assert run is not None
+        statuses = {identifier: node["status"] for identifier, node in run["nodes"].items()}
+        assert event.is_set(), f"工作流未到达同步点：status={run['status']}, nodes={statuses}"
+    finally:
+        for observer in (ready, finished):
+            if not observer.done():
+                observer.cancel()
+        # WorkflowEngine.wait shields the actual run; only these observers stop.
+        await asyncio.gather(ready, finished, return_exceptions=True)
+
+
 async def noop(session_id: str, prompt: str, role: str, mode: str) -> str:
     return "完成"
 
@@ -94,10 +113,12 @@ async def test_dag_parallel_workers_independent_sessions_and_final_reviewer(
     )
     assert not definition["review_recommended"]
     run = await engine.start(definition["id"])
-    await asyncio.wait_for(both_started.wait(), 1)
-    current = engine.store.get("workflow_run", run["id"])
-    assert current is not None and current["nodes"]["review"]["status"] == "pending"
-    release.set()
+    try:
+        await started(engine, run["id"], both_started)
+        current = engine.store.get("workflow_run", run["id"])
+        assert current is not None and current["nodes"]["review"]["status"] == "pending"
+    finally:
+        release.set()
     result = await completed(engine, run["id"])
     assert result["status"] == "completed" and result["result"] == "独立评审通过"
     assert maximum == 2 and len({call["session_id"] for call in calls}) == 3
@@ -117,6 +138,113 @@ async def test_dag_parallel_workers_independent_sessions_and_final_reviewer(
         for event in events
     )
     assert events[-1]["session_id"] is None and events[-1]["data"]["run"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_parallel_start_barrier_survives_same_turn_watchdog(
+    factory: Callable[..., WorkflowEngine], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = asyncio.get_running_loop()
+    original_time = loop.time
+    tick = original_time()
+    shifted = False
+
+    def simulated_time() -> float:
+        return tick
+
+    def create(callback: RunStep, **options: Any) -> WorkflowEngine:
+        engine = factory(callback, **options)
+        original_emit = engine.bus.emit
+
+        async def delayed_publish(
+            event_type: str, data: JsonObject, session_id: str | None = None
+        ) -> JsonObject:
+            nonlocal tick, shifted
+            result = await original_emit(event_type, data, session_id)
+            if not shifted and data.get("run", {}).get("status") == "running":
+                # Model slow synchronous persistence without sleeping or blocking.
+                # Both worker tasks run before the ready waiter resumes.
+                shifted = True
+                tick += 2
+            return result
+
+        monkeypatch.setattr(engine.bus, "emit", delayed_publish)
+        return engine
+
+    try:
+        monkeypatch.setattr(loop, "time", simulated_time)
+        await test_dag_parallel_workers_independent_sessions_and_final_reviewer(create)
+        assert shifted
+    finally:
+        monkeypatch.setattr(loop, "time", original_time)
+
+
+@pytest.mark.asyncio
+async def test_start_observer_reports_early_terminal_state(
+    factory: Callable[..., WorkflowEngine],
+) -> None:
+    async def fail(session_id: str, prompt: str, role: str, mode: str) -> str:
+        raise ValueError("故意失败")
+
+    engine = factory(fail)
+    run = await engine.start(engine.create("同步点之前失败", [step("a")])["id"])
+    with pytest.raises(AssertionError, match="status=failed"):
+        await started(engine, run["id"], asyncio.Event())
+    assert engine.active_run_ids == ()
+    assert (await engine.wait(run["id"]))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_start_observer_cancellation_settles_observers_and_preserves_run(
+    factory: Callable[..., WorkflowEngine], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    running, release = asyncio.Event(), asyncio.Event()
+    wait_started, wait_settled, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    ready_settled = asyncio.Event()
+
+    class ObservedEvent(asyncio.Event):
+        async def wait(self) -> bool:
+            try:
+                return await super().wait()
+            finally:
+                ready_settled.set()
+
+    async def callback(session_id: str, prompt: str, role: str, mode: str) -> str:
+        running.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "工作仍可完成"
+
+    engine = factory(callback)
+    run = await engine.start(engine.create("只取消观察者", [step("a")])["id"])
+    original_wait = engine.wait
+
+    async def observed_wait(run_id: str) -> JsonObject:
+        wait_started.set()
+        try:
+            return await original_wait(run_id)
+        finally:
+            wait_settled.set()
+
+    monkeypatch.setattr(engine, "wait", observed_wait)
+    observer = asyncio.create_task(started(engine, run["id"], ObservedEvent()))
+    try:
+        await wait_started.wait()
+        await running.wait()
+        observer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await observer
+        assert ready_settled.is_set() and wait_settled.is_set() and not cancelled.is_set()
+        current = engine.store.get("workflow_run", run["id"])
+        assert current is not None and current["status"] == "running"
+    finally:
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)
+        release.set()
+    assert (await engine.wait(run["id"]))["result"] == "工作仍可完成"
 
 
 @pytest.mark.asyncio
