@@ -38,11 +38,12 @@ from muli.plugins import PluginManager
 from muli.providers import ProviderError
 from muli.runtime import Runtime
 from muli.service import UserService
+from muli.session_records import SessionRecords
 from muli.store import now
 from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
 
-_ARCHIVE_OUTPUT_CHARS = 32_000
+_HISTORY_OUTPUT_CHARS = 32_000
 _MAX_WEB_SEQUENCE = (1 << 53) - 1  # JSON numbers must round-trip through browser Number.
 
 
@@ -645,6 +646,19 @@ def create_app(
     async def sessions() -> dict[str, Any]:
         return {"items": runtime.store.list("session")}
 
+    @app.get("/api/session-records")
+    async def session_records(
+        query: Annotated[str, Query(max_length=120)] = "",
+        cursor: Annotated[str | None, Query(min_length=1, max_length=_HISTORY_OUTPUT_CHARS)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ) -> dict[str, Any]:
+        return SessionRecords(runtime.store).read(
+            query=query,
+            cursor=cursor,
+            limit=limit,
+            max_output_chars=min(config.settings.limits.max_output_chars, _HISTORY_OUTPUT_CHARS),
+        )
+
     @app.post("/api/sessions")
     async def new_session(body: SessionInput) -> dict[str, Any]:
         return runtime.new_session(body.title, body.mode)
@@ -674,7 +688,7 @@ def create_app(
                 through_seq=through_seq,
                 limit=limit,
                 max_output_chars=min(
-                    config.settings.limits.max_output_chars, _ARCHIVE_OUTPUT_CHARS
+                    config.settings.limits.max_output_chars, _HISTORY_OUTPUT_CHARS
                 ),
             )
         )
@@ -695,7 +709,7 @@ def create_app(
                 length_bytes=length_bytes,
                 revision=revision,
                 max_output_chars=min(
-                    config.settings.limits.max_output_chars, _ARCHIVE_OUTPUT_CHARS
+                    config.settings.limits.max_output_chars, _HISTORY_OUTPUT_CHARS
                 ),
             )
         )
