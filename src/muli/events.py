@@ -21,10 +21,14 @@ class EventBus:
         self, event_type: str, data: dict[str, Any], session_id: str | None = None
     ) -> dict[str, Any]:
         event = self.store.event(event_type, data, session_id)
+        await self.notify()
+        return event
+
+    async def notify(self) -> None:
+        """Wake observers after an event was committed with its related objects."""
         async with self.changed:
             self.revision += 1
             self.changed.notify_all()
-        return event
 
     async def stream(self, after: int = 0, session_id: str | None = None) -> AsyncIterator[str]:
         while True:

@@ -10,12 +10,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from muli.permissions import Mode
 from muli.store import new_id, now
+from muli.team_wait import TERMINAL, TeamWait
 from muli.tools import Tool, parameters, string
 
 if TYPE_CHECKING:
     from muli.runtime import Runtime
-
-TERMINAL = {"completed", "failed", "cancelled", "interrupted", "idle"}
 
 
 class TeamManager:
@@ -23,6 +22,7 @@ class TeamManager:
         self.runtime = runtime
         self._active: dict[str, asyncio.Task[None]] = {}
         self._waiting: dict[str, set[str]] = {}
+        self._waiter = TeamWait(self)
         self._closed = False
         self._flushing = False
         rows = runtime.store.db.execute(
@@ -30,8 +30,55 @@ class TeamManager:
         ).fetchall()
         for row in rows:
             agent = json.loads(row[0])
-            agent["status"] = "interrupted"
-            runtime.store.put("agent", agent)
+            run = runtime.store.get("run", agent.get("run_id", ""))
+            # Older versions left the previous generation's run_id on a
+            # running identity. Never claim that completed run as crash evidence.
+            run_id = (
+                run["id"]
+                if run
+                and run.get("status") == "interrupted"
+                and run.get("session_id") == agent["session_id"]
+                else None
+            )
+            self._finish(agent, "interrupted", "", run_id)
+
+    def _finish(
+        self,
+        agent: dict[str, Any],
+        status: str,
+        result: str,
+        run_id: str | None,
+        *,
+        objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
+        requeue: bool = False,
+    ) -> None:
+        """Commit the terminal generation even when the identity is already queued again."""
+        current = self.get(agent["id"])
+        budget = self.runtime.config.settings.limits.max_output_chars
+        result_chars = len(result)
+        result = result[:budget]
+        agent.update(
+            status="queued" if requeue else status,
+            result=result,
+            run_id=run_id,
+            updated_at=now(),
+            completion_revision=current.get("completion_revision", 0) + 1,
+        )
+        preview = result[: min(2000, budget)]
+        self.runtime.store.event(
+            "team.finished",
+            {
+                "agent_id": agent["id"],
+                "generation": agent.get("generation", 0),
+                "completion_revision": agent["completion_revision"],
+                "status": status,
+                "run_id": run_id,
+                "result_preview": preview,
+                "truncated": result_chars > len(preview),
+            },
+            agent["session_id"],
+            objects=[("agent", agent), *(objects or [])],
+        )
 
     def list(
         self,
@@ -151,6 +198,7 @@ class TeamManager:
             "created_at": now(),
             "updated_at": now(),
             "generation": 0,
+            "completion_revision": 0,
         }
         text = self._message(parent_id, prompt)
         self.runtime.conversation.enqueue(
@@ -273,12 +321,14 @@ class TeamManager:
         try:
             async with self.runtime.configuration_lock:
                 if self._closed or self.runtime._closing:
+                    status = "interrupted"
                     return
                 session = self.runtime.store.get("session", agent["session_id"])
                 assert session is not None
                 agent.update(status="running", generation=agent["generation"] + 1, updated_at=now())
-                self.runtime.store.put("agent", agent)
                 run_id = self.runtime._launch(session, agent["role"], cast(Mode, agent["mode"]))
+                agent["run_id"] = run_id
+                self.runtime.store.put("agent", agent)
             await self.runtime.bus.emit("team.updated", {"agent": agent})
             result = await self.runtime.wait(run_id)
             status = "completed"
@@ -296,10 +346,9 @@ class TeamManager:
             agent.update(
                 status=status,
                 result=result[: self.runtime.config.settings.limits.max_output_chars],
-                updated_at=now(),
                 run_id=run_id,
             )
-            writes = [("agent", agent)]
+            writes = []
             if run_id:
                 # Result and notification intent commit together. A full parent
                 # mailbox cannot silently lose a completed child's report.
@@ -325,10 +374,17 @@ class TeamManager:
                 ):
                     report["status"] = "suppressed"
                 writes.append(("team_report", report))
-            if status == "completed" and self.runtime.store.pending_inputs(agent["session_id"]):
-                agent["status"] = "queued"
-            self.runtime.store.put_many(writes)
+            self._finish(
+                agent,
+                status,
+                result,
+                run_id,
+                objects=writes,
+                requeue=status == "completed"
+                and bool(self.runtime.store.pending_inputs(agent["session_id"])),
+            )
             self._active.pop(identifier, None)
+            await self.runtime.bus.notify()
             await self.runtime.bus.emit("team.updated", {"agent": agent})
             if not self._closed and not self.runtime._closing:
                 await self.flush_reports()
@@ -394,51 +450,9 @@ class TeamManager:
         *,
         timeout: float = 30,
         caller: str | None = None,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        identifiers = {self.get(target)["id"] for target in targets}
-        if (
-            not identifiers
-            or len(identifiers) > self.runtime.config.settings.limits.max_pending_runs
-        ):
-            raise ValueError("等待目标为空或超过未完成任务预算")
-        if timeout <= 0 or timeout > self.runtime.config.settings.limits.max_run_seconds:
-            raise ValueError("等待时间超出运行预算")
-        if caller:
-
-            def reaches(node: str, visited: set[str]) -> bool:
-                if node == caller:
-                    return True
-                if node in visited:
-                    return False
-                visited.add(node)
-                return any(reaches(child, visited) for child in self._waiting.get(node, set()))
-
-            if any(reaches(target, set()) for target in identifiers):
-                raise ValueError("队友等待形成循环")
-            self._waiting[caller] = identifiers
-        try:
-            async with asyncio.timeout(timeout):
-                while True:
-                    revision = self.runtime.bus.revision
-                    agents = [self.get(identifier) for identifier in sorted(identifiers)]
-                    if any(agent["status"] in TERMINAL for agent in agents):
-                        return {"agents": agents, "timed_out": False}
-                    if caller and self.runtime.store.pending_inputs(caller):
-                        return {"agents": agents, "new_input": True, "timed_out": False}
-
-                    def changed(expected: int = revision) -> bool:
-                        return self.runtime.bus.revision != expected
-
-                    async with self.runtime.bus.changed:
-                        await self.runtime.bus.changed.wait_for(changed)
-        except TimeoutError:
-            return {
-                "agents": [self.get(identifier) for identifier in sorted(identifiers)],
-                "timed_out": True,
-            }
-        finally:
-            if caller:
-                self._waiting.pop(caller, None)
+        return await self._waiter.wait(targets, timeout=timeout, caller=caller, cursor=cursor)
 
     async def stop(self, target: str) -> dict[str, Any]:
         agent = self.get(target)
@@ -453,12 +467,12 @@ class TeamManager:
                 self._active.pop(agent["id"], None)
             current = self.get(agent["id"])
             if current["status"] not in TERMINAL:
-                current["status"] = "cancelled"
-                self.runtime.store.put("agent", current)
+                self._finish(current, "cancelled", "", None)
+                await self.runtime.bus.notify()
         else:
             if agent["status"] not in TERMINAL:
-                agent["status"] = "cancelled"
-                self.runtime.store.put("agent", agent)
+                self._finish(agent, "cancelled", "", None)
+                await self.runtime.bus.notify()
         self.runtime.store.cancel_inputs(agent["session_id"])
         return self.get(agent["id"])
 
@@ -490,7 +504,13 @@ class TeamManager:
             )
 
         async def wait(args: dict[str, Any]) -> Any:
-            return await self.wait(args["targets"], timeout=args.get("timeout", 30), caller=caller)
+            result = await self.wait(
+                args["targets"],
+                timeout=args.get("timeout", 30),
+                caller=caller,
+                cursor=args.get("cursor"),
+            )
+            return self._waiter.tool_snapshot(result) if args.get("cursor") is None else result
 
         async def stop(args: dict[str, Any]) -> Any:
             agent = self.get(args["target"])
@@ -552,11 +572,12 @@ class TeamManager:
             ),
             Tool(
                 "wait_agents",
-                "等待队友状态变化或新用户输入，不占模型执行名额",
+                "等待队友或新输入，不占模型名额；带上次cursor只收新完成，不带返回终态快照",
                 parameters(
                     {
                         "targets": {"type": "array", "items": string(), "minItems": 1},
                         "timeout": {"type": "number", "exclusiveMinimum": 0},
+                        "cursor": {"type": "string", "minLength": 1},
                     },
                     ("targets",),
                 ),

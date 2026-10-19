@@ -70,6 +70,9 @@ class Store:
                 session_id TEXT, data TEXT NOT NULL, created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS events_session ON events(session_id,id);
+            CREATE UNIQUE INDEX IF NOT EXISTS team_completion_revision
+                ON events(session_id,json_extract(data,'$.completion_revision'))
+                WHERE type='team.finished';
             CREATE TABLE IF NOT EXISTS inbox (
                 id TEXT PRIMARY KEY, envelope TEXT NOT NULL, received REAL NOT NULL
             );
@@ -102,7 +105,19 @@ class Store:
             self.db.execute(
                 "INSERT INTO runtime_state(name,value) VALUES('message_sequence_v1','done')"
             )
+        self.db.execute(
+            "INSERT OR IGNORE INTO runtime_state(name,value) VALUES('store_instance_v1',?)",
+            (new_id(),),
+        )
         self.db.commit()
+
+    @property
+    def instance_id(self) -> str:
+        row = self.db.execute(
+            "SELECT value FROM runtime_state WHERE name='store_instance_v1'"
+        ).fetchone()
+        assert row is not None
+        return str(row[0])
 
     def close(self) -> None:
         self.db.close()
@@ -154,10 +169,17 @@ class Store:
             )
 
     def event(
-        self, event_type: str, data: dict[str, Any], session_id: str | None = None
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        session_id: str | None = None,
+        *,
+        objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         created = now()
         with self.db:
+            for kind, item in objects or []:
+                self._put(kind, item)
             cursor = self.db.execute(
                 "INSERT INTO events(type,session_id,data,created_at) VALUES(?,?,?,?)",
                 (event_type, session_id, json.dumps(data, ensure_ascii=False), created),
@@ -182,6 +204,18 @@ class Store:
             rows = self.db.execute(
                 "SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?", (after, limit)
             ).fetchall()
+        return [{**dict(row), "data": json.loads(row["data"])} for row in rows]
+
+    def team_completions(
+        self, session_id: str, after: int, *, limit: int = 1
+    ) -> builtins.list[dict[str, Any]]:
+        """Read a bounded revision prefix using the partial completion index."""
+        rows = self.db.execute(
+            "SELECT * FROM events WHERE type='team.finished' AND session_id=? "
+            "AND json_extract(data,'$.completion_revision')>? "
+            "ORDER BY json_extract(data,'$.completion_revision') LIMIT ?",
+            (session_id, after, max(0, limit)),
+        ).fetchall()
         return [{**dict(row), "data": json.loads(row["data"])} for row in rows]
 
     def recent_events(self, session_id: str, limit: int = 3000) -> builtins.list[dict[str, Any]]:
