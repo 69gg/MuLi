@@ -570,6 +570,7 @@ class MemoryPipeline:
             "communities": self.memory.communities_for([item["id"] for item in items]),
             "sources": sources,
             "degraded": degraded,
+            "revision": self.memory.revision,
         }
 
     async def query(

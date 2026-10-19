@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from muli.media import MediaService
-from muli.memory_evidence import MemoryEvidence
+from muli.memory_evidence import MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
 from muli.providers import Message
 from muli.runtime import Runtime
@@ -113,9 +113,15 @@ class MemoryApplication:
         self.runtime.memory_context_provider = self.pipeline.cached_context
         await self.start()
 
+    async def query(self, query: str, limit: int = 8, *, hops: int | None = None) -> dict[str, Any]:
+        result = await self.pipeline.query(query, limit=limit, hops=hops)
+        return query_result(
+            result, max_output_chars=self.runtime.config.settings.limits.max_output_chars
+        )
+
     def tools(self, runtime: Runtime) -> list[Tool]:
         async def query(args: dict[str, Any]) -> Any:
-            return await self.pipeline.query(
+            return await self.query(
                 str(args["query"]), limit=int(args.get("limit", 8)), hops=args.get("hops")
             )
 
@@ -143,7 +149,8 @@ class MemoryApplication:
         return [
             Tool(
                 "memory_query",
-                "融合关键词、向量、关系和社区检索个人记忆；语义服务失败时降级本地",
+                "融合关键词、向量、关系和社区检索记忆；graph_via 为实际召回路径，"
+                "truncated/omitted 表示预算省略；语义服务失败时降级本地",
                 parameters(
                     {
                         "query": string(),
@@ -153,6 +160,7 @@ class MemoryApplication:
                     ("query",),
                 ),
                 query,
+                preserve_output=True,
             ),
             Tool(
                 "memory_source",

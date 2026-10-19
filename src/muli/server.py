@@ -29,7 +29,7 @@ from muli.evidence import EvidenceError
 from muli.local_services import LocalServices
 from muli.management import SelfManagement
 from muli.memory_application import MemoryApplication
-from muli.memory_evidence import MemoryEvidence
+from muli.memory_evidence import MemoryEvidence, memory_listing
 from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
@@ -618,7 +618,7 @@ def create_app(
 
     @app.get("/api/memory/query")
     async def memory_query(query: str, limit: int = 8) -> dict[str, Any]:
-        return await memory_application.pipeline.query(query, limit=min(max(1, limit), 100))
+        return await memory_application.query(query, limit=min(max(1, limit), 100))
 
     @app.patch("/api/settings")
     async def update_settings(changes: dict[str, Any]) -> dict[str, Any]:
@@ -745,7 +745,11 @@ def create_app(
 
     @app.get("/api/memories")
     async def memories(query: str = "") -> dict[str, Any]:
-        return {"items": runtime.memory.search(query, 100)}
+        return memory_listing(
+            runtime.memory.search(query, 100),
+            revision=runtime.memory.revision,
+            max_path_chars=config.settings.limits.max_output_chars,
+        )
 
     @app.get("/api/memories/graph")
     async def graph() -> dict[str, Any]:

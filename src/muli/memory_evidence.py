@@ -4,12 +4,63 @@ from __future__ import annotations
 
 from typing import Any
 
-from muli.evidence import EvidenceError, content_page, validate_integer
+from muli.evidence import EvidenceError, content_page, json_size, validate_integer
 from muli.memory import Memory
 
 _SOURCE_METADATA = (
     "s.id,s.source,s.session_id,s.role,s.principal,s.trusted_owner,s.digest,s.created_at"
 )
+
+
+def query_result(result: dict[str, Any], *, max_output_chars: int) -> dict[str, Any]:
+    """Project a cached query without slicing its identities or actual graph paths."""
+    validate_integer(max_output_chars, "max_output_chars", minimum=1)
+    sections = ("memories", "sources", "communities")
+    omitted = {section: len(result[section]) for section in sections}
+    page: dict[str, Any] = {
+        "memories": [],
+        "communities": [],
+        "sources": [],
+        "degraded": list(result["degraded"]),
+        "revision": result["revision"],
+        "truncated": False,
+        "omitted": omitted,
+    }
+    if json_size(page) > max_output_chars:
+        raise EvidenceError("output_budget", "记忆查询定位元数据超过输出预算")
+    # Reserve the longer false spelling throughout. Metadata, including counts,
+    # remains complete; a large candidate must not hide smaller later matches.
+    for section in sections:
+        for item in result[section]:
+            page[section].append(item)
+            omitted[section] -= 1
+            if json_size(page) > max_output_chars:
+                page[section].pop()
+                omitted[section] += 1
+    page["truncated"] = any(omitted.values())
+    return page
+
+
+def memory_listing(
+    items: list[dict[str, Any]], *, revision: int, max_path_chars: int
+) -> dict[str, Any]:
+    """Budget only added paths; keep the existing management list's full records."""
+    validate_integer(max_path_chars, "max_path_chars", minimum=1)
+    remaining = max_path_chars
+    records = []
+    omitted = False
+    for item in items:
+        record = dict(item)
+        if "graph_via" in record:
+            size = json_size({"graph_via": record["graph_via"]})
+            if size <= remaining:
+                remaining -= size
+            else:
+                del record["graph_via"]
+                record["path_omitted"] = True
+                omitted = True
+        records.append(record)
+    return {"items": records, "revision": revision, "truncated": omitted}
 
 
 class MemoryEvidence:
