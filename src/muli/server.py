@@ -25,9 +25,11 @@ from muli.channel_application import ChannelApplication
 from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
 from muli.conversation import MAX_EVENT_ID_CHARS
+from muli.evidence import EvidenceError
 from muli.local_services import LocalServices
 from muli.management import SelfManagement
 from muli.memory_application import MemoryApplication
+from muli.memory_evidence import MemoryEvidence
 from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
@@ -291,6 +293,13 @@ def create_app(
     @app.exception_handler(ValueError)
     async def bad_input(request: Request, exc: ValueError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)[:1000]}, status_code=400)
+
+    @app.exception_handler(EvidenceError)
+    async def unavailable_evidence(request: Request, exc: EvidenceError) -> JSONResponse:
+        status = {"evidence_not_found": 404, "evidence_changed": 409}.get(exc.code, 400)
+        return JSONResponse(
+            {"detail": {"code": exc.code, "message": exc.message}}, status_code=status
+        )
 
     @app.exception_handler(KeyError)
     async def missing(request: Request, exc: KeyError) -> JSONResponse:
@@ -744,10 +753,22 @@ def create_app(
 
     @app.get("/api/memories/{identifier}")
     async def memory_detail(identifier: str) -> dict[str, Any]:
-        item = runtime.memory.get(identifier)
-        if item is None:
-            raise KeyError(identifier)
-        return item
+        return MemoryEvidence(runtime.memory).detail(identifier)
+
+    @app.get("/api/memories/{identifier}/source")
+    async def memory_source(
+        identifier: str,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+        revision: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    ) -> dict[str, Any]:
+        return MemoryEvidence(runtime.memory).read(
+            identifier,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
+            revision=revision,
+            max_output_chars=config.settings.limits.max_output_chars,
+        )
 
     @app.get("/api/memories/{identifier}/revisions")
     async def memory_revisions(identifier: str) -> dict[str, Any]:
@@ -757,15 +778,31 @@ def create_app(
 
     @app.post("/api/memories")
     async def remember(body: MemoryInput) -> dict[str, Any]:
-        return runtime.memory.save(**body.model_dump())
+        item = runtime.memory.save(**body.model_dump())
+        await runtime.bus.emit(
+            "memory.updated", {"memory_ids": [item["id"]], "source_id": item["source_id"]}
+        )
+        return item
 
     @app.patch("/api/memories/{identifier}")
     async def edit_memory(identifier: str, body: MemoryInput) -> dict[str, Any]:
-        return runtime.memory.save(identifier=identifier, **body.model_dump())
+        revision = runtime.memory.revision
+        item = runtime.memory.edit(identifier, **body.model_dump(exclude_unset=True))
+        if runtime.memory.revision != revision:
+            await runtime.bus.emit(
+                "memory.updated", {"memory_ids": [identifier], "source_id": item["source_id"]}
+            )
+        return item
 
     @app.delete("/api/memories/{identifier}")
     async def forget(identifier: str) -> dict[str, bool]:
-        return {"deleted": runtime.memory.delete(identifier)}
+        item = runtime.memory.get(identifier)
+        deleted = runtime.memory.delete(identifier)
+        if deleted and item:
+            await runtime.bus.emit(
+                "memory.forgotten", {"memory_ids": [identifier], "source_id": item["source_id"]}
+            )
+        return {"deleted": deleted}
 
     @app.get("/api/workflows")
     async def workflows() -> dict[str, Any]:

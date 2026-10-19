@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from muli.media import MediaService
+from muli.memory_evidence import MemoryEvidence
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
 from muli.providers import Message
 from muli.runtime import Runtime
@@ -119,15 +120,25 @@ class MemoryApplication:
             )
 
         async def source(args: dict[str, Any]) -> Any:
-            return runtime.memory.source(
-                str(args["id"]), max_chars=runtime.config.settings.limits.max_output_chars
+            return MemoryEvidence(runtime.memory).read(
+                args["id"],
+                by_memory=False,
+                offset_bytes=args.get("offset_bytes", 0),
+                length_bytes=args.get("length_bytes"),
+                revision=args.get("revision"),
+                max_output_chars=runtime.config.settings.limits.max_output_chars,
             )
 
         async def conflicts(args: dict[str, Any]) -> Any:
             return [item for item in runtime.memory.conflicts() if item["resolved_at"] is None]
 
         async def resolve(args: dict[str, Any]) -> Any:
-            return runtime.memory.resolve_conflict(str(args["id"]), str(args["chosen_id"]))
+            result = runtime.memory.resolve_conflict(str(args["id"]), str(args["chosen_id"]))
+            await runtime.bus.emit(
+                "memory.updated",
+                {"memory_ids": [result["chosen_id"], result["superseded_id"]], "source_id": None},
+            )
+            return result
 
         return [
             Tool(
@@ -145,9 +156,18 @@ class MemoryApplication:
             ),
             Tool(
                 "memory_source",
-                "按需读取记忆原文及其真实来源",
-                parameters({"id": string()}, ("id",)),
+                "按原始来源 ID 读取原文；长文用 revision 和 next_offset_bytes 继续读取",
+                parameters(
+                    {
+                        "id": string(),
+                        "offset_bytes": {"type": "integer", "minimum": 0},
+                        "length_bytes": {"type": "integer", "minimum": 1},
+                        "revision": string(),
+                    },
+                    ("id",),
+                ),
                 source,
+                preserve_output=True,
             ),
             Tool("memory_conflicts", "查看相互矛盾且尚未处理的记忆证据", parameters({}), conflicts),
             Tool(

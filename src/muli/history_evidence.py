@@ -6,49 +6,17 @@ import json
 from contextlib import closing
 from typing import Any
 
+from muli.evidence import (
+    EvidenceError,
+    content_page,
+    decode_utf8,
+    json_size,
+    validate_integer,
+)
 from muli.store import Store
 
-_SQLITE_MAX_INTEGER = (1 << 63) - 1
 _UTF8_MAX_BYTES = 4
 _OPTIONAL_METADATA = ("source", "principal")
-
-
-class EvidenceError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code, self.message = code, message
-
-
-def _integer(value: int, name: str, *, minimum: int = 0) -> None:
-    if type(value) is not int or not minimum <= value < _SQLITE_MAX_INTEGER:
-        raise EvidenceError(
-            "invalid_arguments",
-            f"{name} 必须是有效的非负整数" if not minimum else f"{name} 必须是有效的正整数",
-        )
-
-
-def _size(value: dict[str, Any]) -> int:
-    return len(json.dumps(value, ensure_ascii=False))
-
-
-def _decode(raw: bytes, *, allow_incomplete_tail: bool) -> str:
-    if raw and 0x80 <= raw[0] <= 0xBF:
-        raise EvidenceError(
-            "invalid_offset", "offset_bytes 位于 UTF-8 字符中间，请使用上一页 next_offset_bytes"
-        )
-    try:
-        return raw.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        if (
-            allow_incomplete_tail
-            and exc.reason == "unexpected end of data"
-            and exc.end == len(raw)
-            and len(raw) - exc.start < _UTF8_MAX_BYTES
-        ):
-            return raw[: exc.start].decode("utf-8", errors="strict")
-        raise EvidenceError(
-            "archive_encoding_error", "持久正文不是有效 UTF-8，未返回替代或丢失字符"
-        ) from exc
 
 
 class HistoryEvidence:
@@ -73,7 +41,7 @@ class HistoryEvidence:
         elif revision_type == "text" and row["evidence_revision_bytes"] == len(
             row["evidence_revision"]
         ):
-            revision = _decode(row["evidence_revision"], allow_incomplete_tail=False)
+            revision = decode_utf8(row["evidence_revision"], allow_incomplete_tail=False)
             if not revision:
                 raise EvidenceError("content_unavailable", "持久消息的版本号无效")
         else:
@@ -92,7 +60,7 @@ class HistoryEvidence:
             if row[field + "_type"] != "text" or row[field + "_bytes"] != len(row[field]):
                 omitted.append(field)
                 continue
-            value = _decode(row[field], allow_incomplete_tail=False)
+            value = decode_utf8(row[field], allow_incomplete_tail=False)
             if len(json.dumps(value, ensure_ascii=False)) > budget:
                 omitted.append(field)
             else:
@@ -112,7 +80,7 @@ class HistoryEvidence:
                     del candidate[field]
                 if field not in candidate["metadata_omitted"]:
                     candidate["metadata_omitted"].append(field)
-                if _size(candidate) < _size(value):
+                if json_size(candidate) < json_size(value):
                     value.clear()
                     value.update(candidate)
                     return True
@@ -126,9 +94,9 @@ class HistoryEvidence:
         limit: int = 20,
         max_output_chars: int,
     ) -> dict[str, Any]:
-        _integer(after, "after")
-        _integer(limit, "limit", minimum=1)
-        _integer(max_output_chars, "max_output_chars", minimum=1)
+        validate_integer(after, "after")
+        validate_integer(limit, "limit", minimum=1)
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
         self._session(session_id)
         result: dict[str, Any] = {
             "session_id": session_id,
@@ -136,7 +104,7 @@ class HistoryEvidence:
             "next_after": after,
             "has_more": False,
         }
-        if _size(result) > max_output_chars:
+        if json_size(result) > max_output_chars:
             raise EvidenceError("output_budget", "目录元数据超过工具输出预算")
         # One bounded row is assembled at a time; SQL does not materialize all previews in Python.
         previews = max_output_chars * _UTF8_MAX_BYTES
@@ -154,7 +122,7 @@ class HistoryEvidence:
                     break
                 record = self._metadata(row, max_output_chars)
                 if row["content_type"] == "text":
-                    record["content"] = _decode(row["content"], allow_incomplete_tail=True)
+                    record["content"] = decode_utf8(row["content"], allow_incomplete_tail=True)
                     record["content_bytes"] = row["content_bytes"]
                     record["content_truncated"] = (
                         len(record["content"].encode("utf-8")) < row["content_bytes"]
@@ -171,13 +139,13 @@ class HistoryEvidence:
                 result["next_after"] = record["seq"]
                 # false is one JSON character longer than true; reserve the EOF form.
                 result["has_more"] = False
-                while _size(result) > max_output_chars and self._omit_optional(record):
+                while json_size(result) > max_output_chars and self._omit_optional(record):
                     pass
                 content = record["content"]
-                if _size(result) > max_output_chars and isinstance(content, str):
+                if json_size(result) > max_output_chars and isinstance(content, str):
                     record["content"] = ""
                     record["content_truncated"] = bool(row["content_bytes"])
-                if _size(result) > max_output_chars:
+                if json_size(result) > max_output_chars:
                     result["records"].pop()
                     result["next_after"] = previous
                     result["has_more"] = True
@@ -194,7 +162,7 @@ class HistoryEvidence:
                         record["content_truncated"] = (
                             len(record["content"].encode("utf-8")) < row["content_bytes"]
                         )
-                        if _size(result) <= max_output_chars:
+                        if json_size(result) <= max_output_chars:
                             low = middle
                         else:
                             high = middle - 1
@@ -204,7 +172,7 @@ class HistoryEvidence:
                     )
             else:
                 result["has_more"] = False
-        if _size(result) > max_output_chars:
+        if json_size(result) > max_output_chars:
             raise EvidenceError("output_budget", "目录页无法在工具输出预算内完整返回")
         return result
 
@@ -219,8 +187,8 @@ class HistoryEvidence:
         revision: str | None = None,
         max_output_chars: int,
     ) -> dict[str, Any]:
-        _integer(offset_bytes, "offset_bytes")
-        _integer(max_output_chars, "max_output_chars", minimum=1)
+        validate_integer(offset_bytes, "offset_bytes")
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
         if (message_id is None) == (seq is None) or (
             message_id is not None and (not isinstance(message_id, str) or not message_id)
         ):
@@ -228,9 +196,9 @@ class HistoryEvidence:
                 "invalid_arguments", "message_id 和 seq 必须且只能提供一个有效定位值"
             )
         if seq is not None:
-            _integer(seq, "seq", minimum=1)
+            validate_integer(seq, "seq", minimum=1)
         if length_bytes is not None:
-            _integer(length_bytes, "length_bytes", minimum=1)
+            validate_integer(length_bytes, "length_bytes", minimum=1)
         if revision is not None and (not isinstance(revision, str) or not revision):
             raise EvidenceError("invalid_arguments", "revision 必须是非空字符串")
         if offset_bytes and revision is None:
@@ -256,47 +224,12 @@ class HistoryEvidence:
             )
         if row["content_type"] != "text":
             raise EvidenceError("content_unavailable", "此消息没有可读取的字符串 content 字段")
-        if offset_bytes > row["content_bytes"]:
-            raise EvidenceError("invalid_offset", "offset_bytes 超过持久正文末尾")
-        text = _decode(row["content"], allow_incomplete_tail=True)
-        result.update(
-            session_id=session_id,
-            message_id=result.pop("id"),
-            field="content",
+        result.update(session_id=session_id, message_id=result.pop("id"))
+        return content_page(
+            result,
+            row["content"],
             offset_bytes=offset_bytes,
-            length_bytes=0,
-            next_offset_bytes=offset_bytes,
             total_bytes=row["content_bytes"],
-            has_more=offset_bytes < row["content_bytes"],
-            content="",
+            max_output_chars=max_output_chars,
+            omit_optional=self._omit_optional,
         )
-
-        def select(count: int) -> None:
-            content = text[:count]
-            size = len(content.encode("utf-8"))
-            result.update(
-                content=content,
-                length_bytes=size,
-                next_offset_bytes=offset_bytes + size,
-                has_more=offset_bytes + size < row["content_bytes"],
-            )
-
-        select(min(1, len(text)))
-        while _size(result) > max_output_chars and self._omit_optional(result):
-            pass
-        if _size(result) > max_output_chars:
-            raise EvidenceError("output_budget", "正文页定位元数据超过工具输出预算")
-        low, high = 0, len(text)
-        while low < high:
-            middle = (low + high + 1) // 2
-            select(middle)
-            if _size(result) <= max_output_chars:
-                low = middle
-            else:
-                high = middle - 1
-        select(low)
-        if not low and result["has_more"]:
-            raise EvidenceError("output_budget", "预算不足以返回一个完整字符和续读元数据")
-        if _size(result) > max_output_chars:
-            raise EvidenceError("output_budget", "正文页无法在工具输出预算内完整返回")
-        return result

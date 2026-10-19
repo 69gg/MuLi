@@ -1,6 +1,6 @@
 # 2.5 原生电脑后端审查
 
-状态：本地集成、离线发行安装与独立复审通过；首轮远端矩阵发现 Windows 测试标识兼容问题，已修复，需重新核验矩阵与实际发布。本页的本地结果不等同于已发布。
+状态：2.5.0 已发布。Windows 测试标识修复后的精确提交 `a5aca76a0c3a8a7273404cae34df5a6e366c42d5` 通过八项跨平台 CI；发布流水线十一项全部成功。真实 macOS 桌面验收仍未完成。
 
 本轮为 macOS AX 增加按需原生 helper，持有真实 AXUIElementRef；Linux 继续单次 AT-SPI，不引入新的第三方依赖。进程协议、CF/AX 原生接口、运行器接线分别实现，再由独立 reviewer 审查资源回收、身份与错误语义。
 
@@ -31,3 +31,14 @@
 两个错误都来自同一超长帧用例的 setup/teardown：pytest 将 65536 个 `x` 加换行的参数自动展开进 node ID，随后写入 `PYTEST_CURRENT_TEST`，超过 Windows 的 32767 字符环境变量上限。日志报 `ValueError: the environment variable is longer than 32767 characters`；该用例尚未进入 helper 断言，不是 AX 调用超时。
 
 修复仅为这个参数设置 `oversized-frame` 显式标识，实际 65537 字节输入和原先协议拒绝断言全部保留。收集级反证在修复前测得最长 `PYTEST_CURRENT_TEST` 为 65636 字符，修复后为 131 字符，仍完整收集全部 11 个输入。正式 native helper、真实协议桥接及假 CF/native 桥接共 90 项通过、1 项既有 macOS 系统 CF 冒烟在 Linux 跳过（0.95 秒）；Ruff、格式与 diff 检查通过。没有增大超时、新增跳过或改变产品代码。Windows 的最终结果仍须以修复提交的新 CI 为准。
+
+## 发行核验
+
+[修复后 CI](https://github.com/69gg/MuLi/actions/runs/39316794183) 为 8/8 成功；[发布流程](https://github.com/69gg/MuLi/actions/runs/39317554749) 为 11/11 成功。签名标签 `v2.5.0` 指向上述精确提交。2026-10-20 核对 [PyPI](https://pypi.org/project/muli-agent/2.5.0/) 与 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.5.0) 的文件名、大小和 SHA-256，全部一致；仅读取元数据，未下载包。
+
+| 文件 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| wheel | 454593 | `28d6eed383afce5f8d1c8dac9360d6c6f4380a70dd06c0428bbc3d9aaa5a07bd` |
+| sdist | 2526009 | `94eae11cf5eddfe5f727dbcf0bda70d04aac8ea3ed597923ae3fe5e0f80a592a` |
+
+macOS CI 的系统 CF/ABI 冒烟通过，不等同于 TCC、窗口和实际动作验收；Windows 测试不再因超长用例标识中断。前文“待验证”记录是当时阶段状态，最终发行结果以本节为准。

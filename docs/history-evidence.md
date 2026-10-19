@@ -50,6 +50,10 @@
 
 复用 `objects` 和 `message_order` 的消息 ID、会话与 seq 索引。SQL 只投影所需小字段及 `content` 的 BLOB 字节窗口，Python 不为这次读取展开整条 `provider_data` 或图片。SQLite 仍需访问并解析原有 JSON 记录；不能据此宣称底层 CPU/I/O 与整行大小无关。没有新增全文索引、后台轮询或大型依赖。
 
+## 记忆来源原文
+
+2.7 的 `memory_source` 复用相同字节窗口、JSON 预算与工具批次保留规则，但读取 `memory_sources` 的独立来源快照，版本为其既有 digest。来源级遗忘后不回退查会话；`id/digest/truncated` 保留兼容，末页也不冒充从头开始的全文。网页核查同样按需读页，详见[记忆核查与更正](memory.md#核查与更正)。
+
 ## Codex 参考
 
 只读核对 `/data1/codex/codex-rs/ext/history-notes/src/tools.rs` 的定位与正文窗口分离，以及 `core/src/tools/context.rs`、`context_manager/history.rs` 的采集上限、模型视图与持久记录分层。MuLi 复用本地 SQLite，不接入 Codex 的专用历史服务、私有端点或 Rust 运行时。`compact_retained_tool_outputs.rs` 的特殊保留条件也没有被当成通用绕过配对的方法。

@@ -392,10 +392,18 @@ class Memory:
         claim_key: str,
         aliases: Mapping[str, str],
         dedup_key: str | None,
+        preserve_metadata: bool = False,
     ) -> str:
         existing = self.get(identifier) if identifier else None
         if identifier and existing is None:
             raise KeyError(identifier)
+        if preserve_metadata and existing is not None:
+            source_id, quote = existing["source_id"], existing["quote"]
+            trusted_owner, claim_key = existing["trusted_owner"], existing["claim_key"]
+            layer = existing["layer"] if kind == existing["kind"] else None
+            dedup_key = self.store.db.execute(
+                "SELECT dedup_key FROM memory_meta WHERE memory_id=?", (identifier,)
+            ).fetchone()[0]
         if existing is not None and existing["source_id"] is not None and source_id is None:
             # Editing a derived fact must not detach it from source-level forgetting.
             source_id, quote = existing["source_id"], quote or existing["quote"]
@@ -416,7 +424,7 @@ class Memory:
             duplicate = self.store.db.execute(
                 "SELECT memory_id FROM memory_meta WHERE dedup_key=?", (dedup_key,)
             ).fetchone()
-            if duplicate is not None:
+            if duplicate is not None and duplicate[0] != identifier:
                 return str(duplicate[0])
         identifier = identifier or new_id()
         if existing is not None:
@@ -426,11 +434,19 @@ class Memory:
                 (identifier, _json(existing), now()),
             )
             self.store.db.execute("DELETE FROM memory_vectors WHERE memory_id=?", (identifier,))
-            self.store.db.execute("DELETE FROM memory_aliases WHERE memory_id=?", (identifier,))
-            self.store.db.execute(
-                "DELETE FROM memory_conflicts WHERE left_id=? OR right_id=?",
-                (identifier, identifier),
-            )
+            if not preserve_metadata:
+                self.store.db.execute("DELETE FROM memory_aliases WHERE memory_id=?", (identifier,))
+                self.store.db.execute(
+                    "DELETE FROM memory_conflicts WHERE left_id=? OR right_id=?",
+                    (identifier, identifier),
+                )
+            elif content != existing["content"] or chosen_layer != existing["layer"]:
+                # A correction recomputes live conflicts without erasing a past choice.
+                self.store.db.execute(
+                    "DELETE FROM memory_conflicts WHERE resolved_at IS NULL "
+                    "AND (left_id=? OR right_id=?)",
+                    (identifier, identifier),
+                )
         timestamp = now()
         self.store.db.execute(
             "INSERT INTO memories VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
@@ -451,7 +467,7 @@ class Memory:
         self.store.db.execute(
             "INSERT INTO memory_meta VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(memory_id) DO UPDATE SET "
             "layer=excluded.layer,source_id=excluded.source_id,trusted_owner=excluded.trusted_owner,"
-            "quote=excluded.quote,claim_key=excluded.claim_key,status='active',"
+            "quote=excluded.quote,claim_key=excluded.claim_key,status=excluded.status,"
             "version=excluded.version,dedup_key=excluded.dedup_key",
             (
                 identifier,
@@ -460,7 +476,7 @@ class Memory:
                 int(trusted),
                 quote or content,
                 scoped_claim,
-                "active",
+                existing["status"] if preserve_metadata and existing else "active",
                 existing["version"] + 1 if existing else 1,
                 dedup_key,
             ),
@@ -468,7 +484,9 @@ class Memory:
         self._aliases(aliases, source_id, identifier)
         self._index(identifier, content, entities)
         self._sync_graph(identifier, entities, relations, source_id, quote or content)
-        if scoped_claim:
+        if scoped_claim and not (
+            preserve_metadata and existing and existing["status"] == "superseded"
+        ):
             for other in self.store.db.execute(
                 "SELECT m.id,m.content FROM memories m JOIN memory_meta x ON x.memory_id=m.id "
                 "WHERE x.claim_key=? AND x.layer=? AND x.trusted_owner=? "
@@ -520,6 +538,37 @@ class Memory:
                 claim_key=claim_key,
                 aliases=aliases or {},
                 dedup_key=dedup_key,
+            )
+            self._rebuild_communities(previous_entities | self._memory_entity_ids(saved))
+            self._purge_orphans()
+        result = self.get(saved)
+        assert result is not None
+        return result
+
+    def edit(self, identifier: str, **changes: Any) -> dict[str, Any]:
+        """Correct visible fields without silently replacing host-owned provenance."""
+        allowed = {"content", "kind", "source", "entities", "relations", "confidence"}
+        if changes.keys() - allowed:
+            raise ValueError("更正仅接受内容、类型、来源标签、实体、关系和置信度")
+        with self.store.db:
+            existing = self.get(identifier)
+            if existing is None:
+                raise KeyError(identifier)
+            values = {key: changes.get(key, existing[key]) for key in allowed}
+            if all(values[key] == existing[key] for key in allowed):
+                return existing
+            previous_entities = self._memory_entity_ids(identifier)
+            saved = self._save(
+                **values,
+                identifier=identifier,
+                layer=None,
+                source_id=None,
+                trusted_owner=False,
+                quote="",
+                claim_key="",
+                aliases={},
+                dedup_key=None,
+                preserve_metadata=True,
             )
             self._rebuild_communities(previous_entities | self._memory_entity_ids(saved))
             self._purge_orphans()
@@ -728,7 +777,9 @@ class Memory:
         self.store.db.execute(
             "DELETE FROM memory_entities WHERE id NOT IN (SELECT entity_id FROM memory_mentions) "
             "AND id NOT IN (SELECT subject_id FROM memory_edges) "
-            "AND id NOT IN (SELECT object_id FROM memory_edges)"
+            "AND id NOT IN (SELECT object_id FROM memory_edges) "
+            "AND id NOT IN (SELECT entity_id FROM memory_aliases "
+            "WHERE source_id IS NOT NULL OR memory_id IS NOT NULL)"
         )
 
     def _memory_entity_ids(self, identifier: str | None) -> set[str]:

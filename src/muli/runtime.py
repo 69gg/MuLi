@@ -21,7 +21,8 @@ from muli.config import ConfigFile, ModelProfile
 from muli.context import ContextLimitError, pack_context
 from muli.conversation import Conversation
 from muli.events import EventBus
-from muli.history_evidence import EvidenceError, HistoryEvidence
+from muli.evidence import EvidenceError
+from muli.history_evidence import HistoryEvidence
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -1501,10 +1502,21 @@ class Runtime:
             )
 
         async def remember(args: dict[str, Any]) -> Any:
-            return self.memory.save(**args)
+            item = self.memory.save(**args)
+            await self.bus.emit(
+                "memory.updated", {"memory_ids": [item["id"]], "source_id": item["source_id"]}
+            )
+            return item
 
         async def forget(args: dict[str, Any]) -> Any:
-            return {"deleted": self.memory.delete(str(args["id"]))}
+            identifier = str(args["id"])
+            item = self.memory.get(identifier)
+            deleted = self.memory.delete(identifier)
+            if deleted and item:
+                await self.bus.emit(
+                    "memory.forgotten", {"memory_ids": [identifier], "source_id": item["source_id"]}
+                )
+            return {"deleted": deleted}
 
         async def shell(args: dict[str, Any]) -> Any:
             cwd = self.files.path(str(args["cwd"]))
