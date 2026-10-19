@@ -6,6 +6,7 @@ import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, upda
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
+import { createTaskControl, taskControlView } from "./task-control.mjs";
 import { VoiceInput, mergeTranscript } from "./voice-input.mjs";
 
 const ICONS = {
@@ -69,6 +70,9 @@ let messageNodes = new Map();
 let toolNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
+let taskDialog = null;
+const taskControlModels = new Map();
+const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
 let draftRevision = 0;
 const voiceInput = new VoiceInput({
@@ -118,6 +122,7 @@ async function request(path, options) {
 
 function showLogin() {
   voiceInput.cancel();
+  clearTaskControls();
   dialogTeamView = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
@@ -448,6 +453,7 @@ function startGlobalEvents() {
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
     if (event.type.startsWith("team.") && state.view === "team") void refreshTeam();
+    if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog();
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads();
   } });
 }
@@ -548,6 +554,7 @@ function resizeComposer() {
 }
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, onSubmit }) {
+  releaseTaskDialog();
   const teamView = captureTeamView($("#other-view"));
   dialogTeamView = teamView?.inside ? teamView : null;
   $("#dialog-title").textContent = title;
@@ -712,27 +719,171 @@ async function refreshTeam(changes = {}) {
   } catch (error) { showError(error); }
 }
 
-async function showTaskBrief(identifier) {
-  const content = element("div", { class: "task-brief" }, element("p", { text: "正在读取…", role: "status" }));
-  openDialog({ title: "任务说明", content, readOnly: true, onSubmit: async () => {} });
-  const current = () => $("#app-dialog").open && $("#dialog-content").firstElementChild === content;
+function readSavedTaskControl(identifier) {
+  try { return JSON.parse(sessionStorage.getItem(taskControlStoragePrefix + identifier)); }
+  catch { return null; }
+}
+
+function saveTaskControl(model) {
   try {
-    const item = await request(`/commitments/${encodeURIComponent(identifier)}`);
-    if (!current()) return;
-    const brief = item.brief;
-    $("#dialog-title").textContent = item.title || "任务说明";
-    content.replaceChildren(element("small", { text: `修订 ${item.revision}` }));
-    if (!brief) { content.append(element("p", { text: "尚未登记任务说明。" })); return; }
-    content.append(element("h3", { text: "目标" }), element("p", { text: brief.goal }));
-    if (brief.constraints?.length) content.append(element("h3", { text: "要求" }), element("ul", {}, brief.constraints.map((text) => element("li", { text }))));
-    if (brief.evidence_refs?.length) {
-      const evidence = element("details", { class: "advanced-settings" }, element("summary", { text: "依据" }));
-      for (const reference of brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
-      content.append(evidence);
-    }
-  } catch (error) {
-    if (current()) content.replaceChildren(element("p", { class: "form-error", role: "alert", text: error.message }));
+    const key = taskControlStoragePrefix + model.state.id;
+    if (model.state.submission) sessionStorage.setItem(key, JSON.stringify(model.state.submission));
+    else sessionStorage.removeItem(key);
+  } catch { /* The in-memory request still keeps its retry ID if storage is unavailable. */ }
+}
+
+function releaseTaskDialog() {
+  if (!taskDialog) return;
+  const { model } = taskDialog;
+  taskDialog.readController?.abort();
+  taskDialog = null;
+  if (!model.state.submission) {
+    taskControlModels.delete(model.state.id);
+    model.clear();
   }
+}
+
+function clearTaskControls() {
+  taskDialog?.readController?.abort();
+  for (const model of taskControlModels.values()) model.clear();
+  taskControlModels.clear(); taskDialog = null;
+  try {
+    for (const key of Object.keys(sessionStorage)) if (key.startsWith(taskControlStoragePrefix)) sessionStorage.removeItem(key);
+  } catch { /* Storage can be blocked by the browser. */ }
+}
+
+function taskDialogCurrent(slot) {
+  return taskDialog === slot && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function renderTaskBriefDialog(slot = taskDialog) {
+  if (!slot || !taskDialogCurrent(slot)) return;
+  const data = slot.model.state;
+  const view = taskControlView(data);
+  const focused = document.activeElement;
+  const focusedAction = slot.content.contains(focused) ? focused.dataset.taskControlAction : null;
+  if (data.detail && slot.renderedDetail !== data.detail) {
+    const item = data.detail;
+    const evidenceOpen = $("details", slot.brief)?.open ?? false;
+    $("#dialog-title").textContent = item.title || "任务说明";
+    slot.brief.replaceChildren(element("small", { text: `任务说明 · 修订 ${item.revision}` }));
+    if (!item.brief) slot.brief.append(element("p", { text: "尚未登记任务说明。" }));
+    else {
+      slot.brief.append(element("h3", { text: "目标" }), element("p", { text: item.brief.goal }));
+      if (item.brief.constraints?.length) slot.brief.append(element("h3", { text: "要求" }), element("ul", {}, item.brief.constraints.map((text) => element("li", { text }))));
+      if (item.brief.evidence_refs?.length) {
+        const evidence = element("details", { class: "advanced-settings", open: evidenceOpen }, element("summary", { text: "依据" }));
+        for (const reference of item.brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
+        slot.brief.append(evidence);
+      }
+    }
+    slot.renderedDetail = item;
+  }
+  slot.readStatus.textContent = slot.readError || (!data.detail ? "正在读取…" : !view.fresh ? slot.loading ? "任务说明有更新，正在读取…" : "任务说明有更新，请刷新。" : "");
+  slot.readStatus.className = slot.readError ? "form-error" : "task-control-note";
+  slot.readStatus.hidden = !slot.readStatus.textContent;
+  slot.panel.hidden = !view.capable && !data.submission;
+  slot.status.textContent = view.busy ? "正在提交…" : view.unknown ? "提交结果待确认" : view.label;
+  slot.status.classList.toggle("paused", view.paused);
+  slot.scope.textContent = view.capable ? `范围：${data.current.scope.member_count} 位队友（含子任务）` : "";
+  slot.note.textContent = view.workflowBlocked ? "此任务含活动工作流，先停止或等待结束。" : view.paused ? "已开始的操作会收尾。关闭页面不会恢复任务。" : "已开始的操作会收尾。";
+  slot.error.textContent = data.error || (data.editing && data.conflict ? "要求已有更新，请核对后再提交。" : "");
+  slot.error.hidden = !slot.error.textContent;
+  slot.editor.hidden = !data.editing;
+  slot.input.disabled = !!data.submission;
+  if (slot.input.value !== data.draft) slot.input.value = data.draft;
+  const localButton = (label, action, callback, { primary = false, disabled = false } = {}) => element("button", { type: "button", class: primary ? "primary-button" : "secondary-button", disabled, dataset: { taskControlAction: action }, onClick: callback }, label);
+  const refresh = () => void refreshTaskBriefDialog(slot);
+  const actions = [];
+  if (view.unknown) actions.push(localButton("重试原操作", "retry", () => void submitTaskControl(slot.model, data.submission.action), { primary: true }));
+  else if (data.editing) {
+    actions.push(localButton(data.conflict ? "确认要求并重新规划" : "交沐璃重新规划", "replan", () => void submitTaskControl(slot.model, "request_replan"), { primary: true, disabled: !view.canReplan }));
+    actions.push(localButton("取消编辑", "cancel-edit", () => { slot.model.cancelEdit(); renderTaskBriefDialog(slot); }, { disabled: view.busy }));
+  } else if (view.paused) {
+    actions.push(localButton("修改要求并交沐璃", "edit", () => { slot.model.edit(); renderTaskBriefDialog(slot); slot.input.focus(); }, { primary: true, disabled: !view.canReplan }));
+    if (data.current.control.replan_request_id) actions.push(localButton("重新暂停", "pause", () => void submitTaskControl(slot.model, "pause"), { disabled: !view.canPause }));
+    actions.push(localButton("查看主对话", "chat", () => { $("#app-dialog").close(); void switchView("chat"); }));
+  } else if (view.capable) actions.push(localButton("暂停任务树", "pause", () => void submitTaskControl(slot.model, "pause"), { primary: true, disabled: !view.canPause }));
+  if (view.workflowBlocked) actions.push(localButton("查看工作流", "workflows", () => { $("#app-dialog").close(); void switchView("workflows"); }));
+  if (view.capable || data.submission || slot.readError) actions.push(localButton("刷新状态", "refresh", refresh, { disabled: slot.loading || view.busy }));
+  slot.actions.replaceChildren(actions);
+  slot.plan.hidden = !view.plan;
+  const planLabel = view.plan?.epoch === data.current?.control?.epoch ? "已确认计划" : "此前计划";
+  if (view.plan && (slot.renderedPlan !== view.plan || slot.planLabel !== planLabel)) {
+    const wasOpen = $("details", slot.plan)?.open ?? false;
+    slot.plan.replaceChildren(element("details", { class: "advanced-settings", open: wasOpen }, element("summary", { text: planLabel }), element("p", { text: view.plan.text })));
+    slot.renderedPlan = view.plan; slot.planLabel = planLabel;
+  }
+  if (focusedAction && !focused.isConnected) {
+    const next = $$('[data-task-control-action]', slot.actions).find((button) => button.dataset.taskControlAction === focusedAction && !button.disabled);
+    if (next) next.focus({ preventScroll: true });
+    else { slot.status.tabIndex = -1; slot.status.focus({ preventScroll: true }); }
+  }
+}
+
+async function refreshTaskBriefDialog(slot = taskDialog) {
+  if (!slot || !taskDialogCurrent(slot)) return;
+  if (slot.loading) { slot.refreshAgain = true; return; }
+  slot.loading = true; slot.readError = ""; slot.readController = new AbortController(); renderTaskBriefDialog(slot);
+  try {
+    const item = await request(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: slot.readController.signal });
+    if (!taskDialogCurrent(slot)) return;
+    if (!slot.model.acceptDetail(item)) slot.readError = "任务说明已有更新，请再次刷新。";
+  } catch (error) {
+    if (taskDialogCurrent(slot)) slot.readError = error.message;
+  } finally {
+    slot.loading = false; renderTaskBriefDialog(slot);
+    if (slot.refreshAgain && taskDialogCurrent(slot)) { slot.refreshAgain = false; void refreshTaskBriefDialog(slot); }
+  }
+}
+
+async function submitTaskControl(model, action) {
+  const current = () => taskControlModels.get(model.state.id) === model;
+  if (!current() || model.state.phase === "submitting") return;
+  try {
+    const body = model.begin(action);
+    saveTaskControl(model);
+    if (taskDialog?.model === model) renderTaskBriefDialog();
+    const result = await request(`/commitments/${encodeURIComponent(model.state.id)}/control`, { method: "POST", body });
+    if (!current()) return;
+    model.complete(result);
+    saveTaskControl(model);
+    if (taskDialog?.model === model) {
+      renderTaskBriefDialog();
+      await refreshTaskBriefDialog();
+    } else taskControlModels.delete(model.state.id);
+  } catch (error) {
+    if (!current()) return;
+    model.fail(error); saveTaskControl(model);
+    if (taskDialog?.model === model) {
+      renderTaskBriefDialog();
+      if (error.status === 409) await refreshTaskBriefDialog();
+    } else if (!model.state.submission) taskControlModels.delete(model.state.id);
+  }
+}
+
+async function showTaskBrief(identifier) {
+  const model = taskControlModels.get(identifier) ?? createTaskControl(identifier, { pending: readSavedTaskControl(identifier) });
+  const content = element("div", { class: "task-brief" });
+  const slot = {
+    model, content, loading: false, refreshAgain: false, readError: "",
+    readStatus: element("p", { role: "status" }), brief: element("div"),
+    panel: element("section", { class: "task-control-panel", "aria-label": "任务控制", hidden: true }),
+    status: element("strong", { class: "task-control-status", "aria-live": "polite" }),
+    scope: element("small"), note: element("p", { class: "task-control-note" }),
+    error: element("p", { class: "form-error", role: "alert", hidden: true }),
+    editor: element("div", { class: "task-control-editor", hidden: true }),
+    input: element("textarea", { name: "additional_requirements", rows: 4, placeholder: "可留空，按当前要求重新规划" }),
+    actions: element("div", { class: "task-control-actions" }), plan: element("div"),
+  };
+  slot.input.addEventListener("input", () => model.setDraft(slot.input.value));
+  slot.editor.append(element("label", { class: "field" }, element("span", { text: "补充要求" }), slot.input));
+  slot.panel.append(element("div", { class: "task-control-heading" }, slot.status, slot.scope), slot.note, slot.plan, slot.editor, slot.error, slot.actions);
+  content.append(slot.brief, slot.readStatus, slot.panel);
+  openDialog({ title: "任务说明", content, readOnly: true, onSubmit: null });
+  taskControlModels.set(identifier, model); taskDialog = slot;
+  renderTaskBriefDialog(slot);
+  await refreshTaskBriefDialog(slot);
 }
 
 function renderTeam() {
@@ -747,13 +898,13 @@ function renderTeam() {
   filter.append(element("small", { text: `${state.team.total ?? 0} 位队友` }));
   root.append(filter);
   const members = state.team.members ?? [];
-  const status = { running: "运行中", queued: "排队中", idle: "空闲", completed: "已完成", failed: "失败", closed: "已关闭", cancelled: "已停止", interrupted: "已中断", approval: "等待审批" };
+  const status = { running: "运行中", queued: "排队中", paused: "已暂停", idle: "空闲", completed: "已完成", failed: "失败", closed: "已关闭", cancelled: "已停止", interrupted: "已中断", approval: "等待审批" };
   const roles = { worker: "执行", reviewer: "复核" };
   if (!members.length) root.append(emptyState("team", state.team.active_only ? "没有进行中的协作" : "当前没有协作任务"));
   for (const member of members) {
     const content = element("div", { class: "row-content" }, element("h3", { text: member.name || member.id }), member.task && element("p", { text: member.task }), element("div", { class: "row-meta", text: [roles[member.role] ?? member.role, status[member.status] ?? member.status].filter(Boolean).join(" · ") }));
     if (member.last_message) content.append(element("p", { class: "team-last-message", text: (typeof member.last_message === "string" ? member.last_message : member.last_message.content ?? "") + (member.last_message_truncated ? "…" : "") }));
-    root.append(element("article", { class: "team-row" }, element("div", { class: "row-icon" }, icon("team")), content, element("div", { class: "row-actions" }, member.commitment_id && iconButton("查看任务说明", "view-task-brief", "info", { id: member.id, commitment: member.commitment_id }), member.status !== "closed" && iconButton("发送消息", "message-team", "chat", { id: member.id }), member.session_id && iconButton("查看记录", "workflow-session", "panel", { session: member.session_id }), ["running", "queued", "approval"].includes(member.status) && iconButton("停止任务", "stop-team", "stop", { id: member.id }))));
+    root.append(element("article", { class: "team-row" }, element("div", { class: "row-icon" }, icon("team")), content, element("div", { class: "row-actions" }, member.commitment_id && iconButton("查看任务说明", "view-task-brief", "info", { id: member.id, commitment: member.commitment_id }), member.status !== "closed" && iconButton("发送消息", "message-team", "chat", { id: member.id }), member.session_id && iconButton("查看记录", "workflow-session", "panel", { session: member.session_id }), ["running", "queued", "approval", "paused"].includes(member.status) && iconButton("停止任务", "stop-team", "stop", { id: member.id }))));
   }
   if ((state.team.total ?? 0) > state.team.limit) {
     const previous = actionButton("上一页", "page-team", "secondary-button", null, { offset: Math.max(0, state.team.offset - state.team.limit), direction: "previous" });
@@ -1544,13 +1695,18 @@ $("#file-input").addEventListener("change", (event) => { void addFiles(event.tar
 $("#conversation-scroll").addEventListener("scroll", () => { $("#scroll-bottom").hidden = scrollIsNearBottom() || !state.session.messages.length; }, { passive: true });
 $("#dialog-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!dialogSubmit) return;
+  const callback = dialogSubmit;
+  const content = $("#dialog-content").firstElementChild;
+  const current = () => dialogSubmit === callback && $("#dialog-content").firstElementChild === content && $("#app-dialog").open;
   const submit = $("#dialog-submit"); submit.disabled = true; $("#dialog-error").hidden = true;
-  try { await dialogSubmit?.(event.target); $("#app-dialog").close(); }
-  catch (error) { $("#dialog-error").textContent = error.message ?? String(error); $("#dialog-error").hidden = false; }
-  finally { submit.disabled = false; }
+  try { await callback(event.target); if (current()) $("#app-dialog").close(); }
+  catch (error) { if (current()) { $("#dialog-error").textContent = error.message ?? String(error); $("#dialog-error").hidden = false; } }
+  finally { if (current()) submit.disabled = false; }
 });
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseTaskDialog();
   const saved = dialogTeamView; dialogTeamView = null;
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
 });
