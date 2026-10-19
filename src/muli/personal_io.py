@@ -17,7 +17,11 @@ class PersonalIO:
     def __init__(self, runtime: Runtime, local: LocalServices, attachments: Attachments) -> None:
         self.runtime, self.local, self.attachments = runtime, local, attachments
         self.media = local.media()
-        self.capture = Capture(runtime.config.settings.computer.capture, runtime.data_dir)
+        self.capture = Capture(
+            runtime.config.settings.computer.capture,
+            runtime.data_dir,
+            python_path=runtime.config.settings.computer.python_path,
+        )
         self.voice = VoiceWorker(
             runtime.config.settings.voice,
             runtime.data_dir,
@@ -43,13 +47,18 @@ class PersonalIO:
         await self.runtime.bus.emit("voice.status", event)
 
     async def close(self) -> None:
+        await self.capture.aclose()
         await self.voice.aclose()
         await self.media.aclose()
 
     async def reconfigure(self) -> None:
         await self.close()
         self.media = self.local.media()
-        self.capture = Capture(self.runtime.config.settings.computer.capture, self.runtime.data_dir)
+        self.capture = Capture(
+            self.runtime.config.settings.computer.capture,
+            self.runtime.data_dir,
+            python_path=self.runtime.config.settings.computer.python_path,
+        )
         self.voice = VoiceWorker(
             self.runtime.config.settings.voice,
             self.runtime.data_dir,
@@ -63,6 +72,11 @@ class PersonalIO:
         attachment = await self.attachments.import_file(Path(item["path"]), source="capture")
         await self.runtime.bus.emit("attachment.published", attachment)
         return {**attachment, "local_path": item["path"], "backend": item.get("backend")}
+
+    async def capture_status(self) -> dict[str, Any]:
+        if self.runtime.config.settings.computer.enabled:
+            await self.capture.refresh_portal()
+        return self.capture.status()
 
     def tools(self, runtime: Runtime) -> list[Tool]:
         def check_capture() -> None:
@@ -78,7 +92,7 @@ class PersonalIO:
             return await self.publish(await self.capture.record(int(args["seconds"])))
 
         async def status(args: dict[str, Any]) -> Any:
-            return {"capture": self.capture.status(), "voice": self.voice.status()}
+            return {"capture": await self.capture_status(), "voice": self.voice.status()}
 
         async def enroll(args: dict[str, Any]) -> Any:
             result = await self.voice.enroll(float(args.get("seconds", 5)))

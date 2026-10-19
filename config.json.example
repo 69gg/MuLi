@@ -274,6 +274,7 @@
       "backend": "auto",
       "device": "",
       "max_seconds": 30,
+      "portal_timeout_seconds": 60,
       "fps": 8,
       "max_file_bytes": 33554432,
       "max_total_bytes": 209715200

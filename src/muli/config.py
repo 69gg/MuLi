@@ -308,6 +308,7 @@ class CaptureSettings(Section):
     backend: str = "auto"
     device: str = ""
     max_seconds: int = Field(default=30, ge=1, le=300)
+    portal_timeout_seconds: int = Field(default=60, ge=1, le=300)
     fps: int = Field(default=8, ge=1, le=30)
     max_file_bytes: int = Field(default=32 * 1024 * 1024, ge=1024)
     max_total_bytes: int = Field(default=200 * 1024 * 1024, ge=1024)

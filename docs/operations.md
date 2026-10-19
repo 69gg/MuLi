@@ -33,6 +33,8 @@ Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用�
 
 桌面图像采集另由 computer.capture.enabled 开启，默认关闭。截图与有界录屏保存在数据目录 captures/，随后可作为本地附件使用；不自动上传、不录制声音。工具沿用 computer 风险及 ask/auto/yolo 权限模式。单文件默认 32 MiB、目录默认 200 MiB，默认录屏上限 30 秒、8 fps；超过配额或取消时终止采集进程并删除未完成文件。后端与授权边界见 [平台能力](platforms.md)。
 
+下一版本候选支持显式 computer.capture.backend=portal 的 Linux 截图，复用 computer.python_path 的系统 Gio，不要求 AT-SPI 可用。保持 auto 选择顺序；Portal 不提供录屏或失败降级。portal_timeout_seconds 单独控制交互等待，默认 60 秒；可在截图高级配置或管理 API 中调整。能力查询不触发截图授权，真正截图仍可能显示系统对话框；当前只完成私有总线模拟验证，未在真实桌面采集。
+
 ## 数据与恢复
 
 数据目录保存 muli.sqlite3（含 WAL）、文件回收站、attachments/ 附件库，以及启用后生成的 captures/ 和 voice/。备份运行中数据库应使用 SQLite backup API 或停服务后完整复制，不能只复制活跃数据库主文件。配置与数据库包含个人资料，勿提交 Git。网页录音、截图、录屏、声纹参考与合成音频需要另行备份；NDJSON 数据导出不包含这些二进制文件。
