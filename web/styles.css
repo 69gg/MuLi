@@ -277,6 +277,16 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .graph-evidence-triple > span::after { content: " →"; color: var(--muted); }
 .graph-evidence-row .text-button { font-size: 10px; flex-shrink: 0; }
 .memory-evidence-content { white-space: pre-wrap; color: var(--muted); font-size: 12px; }
+.memory-verification { min-width: 0; overflow-wrap: anywhere; }
+.memory-current-content { color: var(--text); margin: 0 0 20px; }
+.memory-original-quote { margin: 22px 0; padding-left: 14px; border-left: 2px solid var(--line); }
+.memory-original-quote h3, .memory-section-title { font-size: 11px; font-weight: 500; color: var(--muted); margin: 0 0 9px; }
+.memory-original-quote blockquote { margin: 0; white-space: pre-wrap; color: var(--text); }
+.memory-source, .memory-evidence-actions { margin-top: 20px; }
+.memory-source-content { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); margin: 16px 0; }
+.memory-source-navigation { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--line); padding-top: 8px; }
+.memory-source-position { font-size: 10px; color: var(--muted); }
+.memory-conflicts, .memory-editor-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
 .memory-evidence-relations { display: grid; gap: 12px; border-top: 1px solid var(--line); margin-top: 20px; padding-top: 20px; }
 .memory-history { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 22px; }
 .memory-revision { padding: 15px 0; border-bottom: 1px solid var(--line); }
