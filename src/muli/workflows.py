@@ -60,24 +60,43 @@ class WorkflowEngine:
         """Include finalizers even after their persisted status became terminal."""
         return tuple(identifier for identifier, task in self._tasks.items() if not task.done())
 
+    def unfinished_run_ids(
+        self, *, workflow_id: str | None = None, after_id: str = "", limit: int = 100
+    ) -> list[str]:
+        return self.store.unfinished_object_ids(
+            "workflow_run", workflow_id=workflow_id, after_id=after_id, limit=limit
+        )
+
+    def has_unfinished(self, workflow_id: str) -> bool:
+        return self.store.has_unfinished_workflow(workflow_id)
+
+    def child_run_ids(
+        self, parent_run_id: str, *, after_id: str = "", limit: int = 100
+    ) -> list[str]:
+        return self.store.workflow_child_ids(parent_run_id, after_id=after_id, limit=limit)
+
     def _recover(self) -> None:
         """恢复只校正状态，绝不自动重做可能有副作用的节点。"""
-        for run in self.store.list("workflow_run", 10000):
-            if run.get("status") not in _UNFINISHED:
-                continue
-            run.update(
-                status="interrupted",
-                error="服务重启，工作流已中断",
-                finished_at=now(),
-                updated_at=now(),
-            )
-            for node in run.get("nodes", {}).values():
-                if node.get("status") in _UNFINISHED:
-                    node.update(
-                        status="interrupted", error="服务重启，节点未完成", finished_at=now()
-                    )
-                    self._session_state(node["session_id"], "idle")
-            self.store.put("workflow_run", run)
+        after_id = ""
+        while identifiers := self.unfinished_run_ids(after_id=after_id):
+            after_id = identifiers[-1]
+            for identifier in identifiers:
+                run = self.store.get("workflow_run", identifier)
+                if run is None or run.get("status") not in _UNFINISHED:
+                    continue
+                run.update(
+                    status="interrupted",
+                    error="服务重启，工作流已中断",
+                    finished_at=now(),
+                    updated_at=now(),
+                )
+                for node in run.get("nodes", {}).values():
+                    if node.get("status") in _UNFINISHED:
+                        node.update(
+                            status="interrupted", error="服务重启，节点未完成", finished_at=now()
+                        )
+                        self._session_state(node["session_id"], "idle")
+                self.store.put("workflow_run", run)
 
     def _validate(self, steps: Sequence[JsonObject]) -> list[JsonObject]:
         if (
