@@ -41,17 +41,21 @@ def message_text_size(record: dict[str, Any]) -> int:
 
 
 _EVIDENCE_METADATA = ("role", "source", "principal", "evidence_revision")
+# Older SQLite versions narrow substr lengths to 32 bits. The actual BLOB size
+# is sufficient for any requested window and keeps large valid budgets portable.
 _EVIDENCE_COLUMNS = (
     "o.id,m.seq,json_type(o.data,'$.content') AS content_type,"
     "length(CAST(json_extract(o.data,'$.content') AS BLOB)) AS content_bytes,"
-    "coalesce(substr(CAST(json_extract(o.data,'$.content') AS BLOB),?,?),x'') AS content,"
+    "coalesce(substr(CAST(json_extract(o.data,'$.content') AS BLOB),?,"
+    "min(?,length(CAST(json_extract(o.data,'$.content') AS BLOB)))),x'') AS content,"
     "CASE json_extract(o.data,'$.content_provenance') "
     "WHEN 'accepted' THEN 'accepted' WHEN 'runtime_excerpt' THEN 'runtime_excerpt' "
     "ELSE 'unknown' END AS content_provenance,"
     + ",".join(
         f"json_type(o.data,'$.{field}') AS {field}_type,"
         f"CASE WHEN json_type(o.data,'$.{field}')='text' THEN "
-        f"coalesce(substr(CAST(json_extract(o.data,'$.{field}') AS BLOB),1,?),x'') END AS {field},"
+        f"coalesce(substr(CAST(json_extract(o.data,'$.{field}') AS BLOB),1,"
+        f"min(?,length(CAST(json_extract(o.data,'$.{field}') AS BLOB)))),x'') END AS {field},"
         f"length(CAST(json_extract(o.data,'$.{field}') AS BLOB)) AS {field}_bytes"
         for field in _EVIDENCE_METADATA
     )
