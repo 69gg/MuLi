@@ -26,6 +26,7 @@ from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
 from muli.conversation import MAX_EVENT_ID_CHARS
 from muli.evidence import EvidenceError
+from muli.history_evidence import HistoryEvidence
 from muli.local_services import LocalServices
 from muli.management import SelfManagement
 from muli.memory_application import MemoryApplication
@@ -40,6 +41,17 @@ from muli.service import UserService
 from muli.store import now
 from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
+
+_ARCHIVE_OUTPUT_CHARS = 32_000
+_MAX_WEB_SEQUENCE = (1 << 53) - 1  # JSON numbers must round-trip through browser Number.
+
+
+def _web_archive_result(result: dict[str, Any]) -> dict[str, Any]:
+    sequences = [result.get("seq"), result.get("through_seq"), result.get("next_before_seq")]
+    sequences.extend(item["seq"] for item in result.get("messages", []))
+    if any(sequence is not None and sequence > _MAX_WEB_SEQUENCE for sequence in sequences):
+        raise EvidenceError("archive_sequence_range", "此归档序号超出浏览器精确整数范围")
+    return result
 
 
 class Input(BaseModel):
@@ -647,6 +659,46 @@ def create_app(
             "messages": [decorated_message(item) for item in runtime.store.messages(session_id)],
             "events": runtime.store.recent_events(session_id, 3000),
         }
+
+    @app.get("/api/sessions/{session_id}/messages")
+    async def archived_messages(
+        session_id: str,
+        before_seq: Annotated[int | None, Query(ge=1, le=_MAX_WEB_SEQUENCE)] = None,
+        through_seq: Annotated[int | None, Query(ge=0, le=_MAX_WEB_SEQUENCE)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ) -> dict[str, Any]:
+        return _web_archive_result(
+            HistoryEvidence(runtime.store).archive(
+                session_id,
+                before_seq=before_seq,
+                through_seq=through_seq,
+                limit=limit,
+                max_output_chars=min(
+                    config.settings.limits.max_output_chars, _ARCHIVE_OUTPUT_CHARS
+                ),
+            )
+        )
+
+    @app.get("/api/sessions/{session_id}/messages/{message_id}/content")
+    async def archived_content(
+        session_id: str,
+        message_id: str,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+        revision: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    ) -> dict[str, Any]:
+        return _web_archive_result(
+            HistoryEvidence(runtime.store).read_content(
+                session_id,
+                message_id=message_id,
+                offset_bytes=offset_bytes,
+                length_bytes=length_bytes,
+                revision=revision,
+                max_output_chars=min(
+                    config.settings.limits.max_output_chars, _ARCHIVE_OUTPUT_CHARS
+                ),
+            )
+        )
 
     @app.patch("/api/sessions/{session_id}")
     async def update_session(session_id: str, body: SessionInput) -> dict[str, Any]:

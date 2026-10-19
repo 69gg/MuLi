@@ -31,7 +31,7 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 | 语音 | 独立默认关闭的网页录音转写草稿、本地中文声学唤醒与声纹桥接、录音参考、OpenAI 兼容 ASR/TTS；不附带本地模型 |
 | 主动事件 | chiliarch 原生配对与 SSE 任务；持久提醒、维护结果与新版通知进入主会话，可选 Linux 桌面通知，无 AI 轮询 |
 | 扩展 | 用户目录 Python 插件与可选 MCP；工具、提示词、模型、路由和生命周期可扩展 |
-| 长任务 | 原始归档、后台分层压缩、协议回放、持久收件队列、完整任务说明、明确暂停与补充要求后的重新规划 |
+| 长任务 | 原始归档与已知会话正文分页续读、后台分层压缩、协议回放、持久收件队列、完整任务说明、明确暂停与补充要求后的重新规划 |
 | 管理 | 模型、权限、工具、目录、记忆、工作流、通知、服务状态与日志统一入口；活动工作流独立分页与逐次停止 |
 
 ## 启动
@@ -88,6 +88,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [MCP 扩展](docs/mcp.md)
 - [用户插件与自身管理](docs/self-management.md)
 - [压缩后的证据续读](docs/history-evidence.md)
+- [查看已保存的正文](docs/history-archive.md)
 - [PyPI 与发布流程](docs/publishing.md)
 - [桌面通知](docs/notifications.md)
 - [系统注意事项与主会话唤醒](docs/attention.md)

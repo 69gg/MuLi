@@ -38,7 +38,7 @@ assistant 工具调用批次与其全部结果是不可分割单位，未闭合�
 
 仅修改副本的 `tool.content` 和旧普通 `assistant.content`。系统与 developer 提示、最新用户输入、`reasoning`、`tool_calls` 及其参数、`provider_data` 始终不被截断或改写。带思考签名的 Anthropic blocks、Responses encrypted reasoning、Chat 原始消息等原生回放保持完整。
 
-如果文本摘录仍不足，按最旧顺序整体移出已经结束的用户轮次及其 assistant/tool 消息，保留系统与 developer 消息。最新用户轮次始终保留；轮次中的调用及其结果一起移出，避免形成孤立工具结果。原始历史仍在会话存储中，可供界面查阅。
+如果文本摘录仍不足，按最旧顺序整体移出已经结束的用户轮次及其 assistant/tool 消息，保留系统与 developer 消息。最新用户轮次始终保留；轮次中的调用及其结果一起移出，避免形成孤立工具结果。原始历史仍在会话存储中，可通过[独立正文归档窗口](history-archive.md)向前浏览并按版本续读；这个只读窗口不把旧消息重新加入实时聊天或模型上下文。
 
 最新用户输入、系统提示、当前轮的工具参数或原生数据仍然超限时，抛出 `ContextLimitError`（`ValueError` 的子类），明确提示拆分任务或提高上限；错误不包含消息正文。此时不会发送不完整的原生回放，也不自动执行任何工具。
 
