@@ -21,6 +21,7 @@ class TeamManager:
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
         self._active: dict[str, asyncio.Task[None]] = {}
+        self._tasks: set[asyncio.Task[None]] = set()
         self._waiting: dict[str, set[str]] = {}
         self._waiter = TeamWait(self)
         self._closed = False
@@ -323,9 +324,11 @@ class TeamManager:
                 continue
             task = asyncio.create_task(self._run(agent["id"]), name=f"muli-agent-{agent['id']}")
             self._active[agent["id"]] = task
+            self._tasks.add(task)
             task.add_done_callback(self._done)
 
     def _done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
         if not task.cancelled():
             task.exception()
 
@@ -475,7 +478,8 @@ class TeamManager:
         self.runtime.store.cancel_inputs(agent["session_id"])
         task = self._active.get(agent["id"])
         if task is not None:
-            task.cancel()
+            if not task.cancelling():
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
             if self._active.get(agent["id"]) is task:
@@ -624,8 +628,19 @@ class TeamManager:
 
     async def close(self) -> None:
         self._closed = True
-        tasks = list(self._active.values())
+        # The execution slot is released before report delivery. Keep observing
+        # that finalizer even if the same identity has already started again.
+        tasks = list(self._tasks)
         for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        settled = asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = False
+        while not settled.done():
+            try:
+                await asyncio.shield(settled)
+            except asyncio.CancelledError:
+                cancelled = True
         self._active.clear()
+        if cancelled:
+            raise asyncio.CancelledError
