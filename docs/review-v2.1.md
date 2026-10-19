@@ -22,3 +22,9 @@
 - Portal 测试只连接临时私有 D-Bus 和 fake 服务；网页录音测试只使用假轨道与 MockTransport，没有打开真实麦克风或采集桌面。
 
 真实 GNOME/KDE Portal 授权与 Documents/FUSE 路径、实际浏览器麦克风权限、第三方 ASR 尚未实测。Windows/macOS 的真实设备行为也不以跨平台单元测试代替。远端检查与正式发布以对应提交的流水线结果为准。
+
+## 正式交付
+
+最终候选 `07129a724aa8146271d2af0ef6e79b3d82fc88a0` 再经独立合并复审，87 项相关 Python 与 32 项前端专项通过，没有剩余确定 P1/P2。[PR #4](https://github.com/69gg/MuLi/pull/4) 的 [八项远端检查](https://github.com/69gg/MuLi/actions/runs/39290744417) 全部通过后，签名标签 `v2.1.0` 与 main 一并推送。
+
+2026-10-20（北京时间），[发布流水线](https://github.com/69gg/MuLi/actions/runs/39291584414) 的 11 个作业全部成功；[PyPI 2.1.0](https://pypi.org/project/muli-agent/2.1.0/) 与 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.1.0) 已可见。后续任务说明与增量等待另在 2.2 分支开发，不计入本版能力。

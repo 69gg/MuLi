@@ -9,3 +9,5 @@ PyPI Trusted Publisher 已由维护者登记：项目 `muli-agent`、GitHub owne
 验证以远端工作流结论、PyPI 文件及 GitHub Release 实际状态为准。2.0.0 的 [发布流水线](https://github.com/69gg/MuLi/actions/runs/39288541118) 11 个作业全部通过；PyPI 与 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.0.0) 的 wheel 和源码包 SHA-256 分别一致。签名标签指向 `80a40a91fea6351ddc0a48f657671f27b4857f00`。本地开发也可用 `uv tool install .` 验证安装，不能把本地安装成功当作远端发布成功。
 
 参考：[PyPI Pending Publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)、[Trusted Publishing](https://docs.pypi.org/trusted-publishers/using-a-publisher/)。
+
+后续 [2.1.0](https://pypi.org/project/muli-agent/2.1.0/) 也已由同一 Trusted Publisher 发布；[流水线](https://github.com/69gg/MuLi/actions/runs/39291584414) 11 个作业全部通过，对应签名提交与标签 `07129a7` / `v2.1.0`。发布后的功能开发继续使用独立版本分支。
