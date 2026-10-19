@@ -12,14 +12,16 @@
 | `list(limit=100,offset=0)` / `get(target)` | 按页查看；target 优先用 ID，重名时不得模糊选择 |
 | `await send(target,content,wake=True,sender=None,event_id=None)` | 接受信封，不表示已经处理；运行中在安全边界注入；`wake=False` 只写邮箱，不唤醒结束的队友 |
 | `await resume(target)` | 沿用身份、模式、历史和分层摘要继续；有邮箱先处理邮箱，否则明确要求核查此前未知副作用再继续 |
-| `await wait(targets,timeout=30,caller=None)` | 等待任一目标终态，或调用者收到新输入；事件唤醒、可取消、有超时，不占模型执行槽；检测自等待和等待环 |
+| `await wait(targets,timeout=30,caller=None,cursor=None)` | 不带 cursor 保留终态快照；带上次 cursor 只收新完成，支持多个独立观察者；事件唤醒、不占模型槽、检测等待环 |
 | `await stop(target)` | 取消队友及未完成后代；首次调度前取消也清理登记状态，完成的结果不改成取消 |
 
 模型工具名称为 `spawn_agent`、`send_input`（另保留同义 `send_message`）、`resume_agent`、`wait_agents`、`stop_agent`、`list_agents`。在模型自身工具中禁止停止自己或祖先，避免等待自己的退出造成死锁。停止主会话传播到其未完成后代，停止后不因这些取消结果再次启动主模型。
 
+`wait_agents` 可传上次返回的 cursor，避免“一个早已完成、另一个仍运行”时重复立即返回旧结果。增量结果有合法 JSON 预算、逐代完成引用与明确的新目标基线；owner 输入优先，等待不会消费邮箱。完整合同、重启与过期边界见 [team-wait.md](team-wait.md)。
+
 每次模型请求才持有执行槽；工具处理、人工批准、`wait_agents` 和工作流依赖等待均释放该槽。配置并发为 1 时，主助手可派出队友并等待其完成。每轮总时限仍包含排队/审批/等待，工具与模型轮次数有预算，超额如实停止，不无限递归。
 
-队友结果与 `team_report` 发件意图在同一事务保存。父邮箱满时保留 pending 报告，父输入被消费、队友完成或启动恢复时再投递，同 ID 去重，不使用定时 AI 轮询。主/队友父会话收到结果后可以继续统筹；资料明确标注不是新用户指令或授权。用户显式停止和关机期间的取消汇报标记 suppressed，防止自动唤醒。
+队友结果、`completion_revision`、`team.finished` 完成事件与 `team_report` 发件意图在同一事务保存。父邮箱满时保留 pending 报告，父输入被消费、队友完成或启动恢复时再投递，同 ID 去重，不使用定时 AI 轮询。主/队友父会话收到结果后可以继续统筹；资料明确标注不是新用户指令或授权。用户显式停止和关机期间的取消汇报标记 suppressed，防止自动唤醒。
 
 服务重启把已运行队友标为 interrupted，绝不自动重做副作用；尚未开始的 queued 任务可恢复执行。`send`/`resume` 是继续中断身份的明确入口；未消费邮箱独立保存。主、队友和 DAG 节点统一使用 [context.md](context.md) 中的分层摘要、原始工具配对和前缀验证。
 
