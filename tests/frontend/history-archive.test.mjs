@@ -472,4 +472,3 @@ test("close restores the same record button after a management redraw and body l
   h.other.replaceChildren(otherButton, replacement); h.dialog.close(); await flush();
   assert.equal(h.document.activeElement, replacement);
 });
-
