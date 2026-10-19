@@ -522,6 +522,7 @@ function historyDialogCurrent(slot) {
 function openHistoryDialog(sessionId, title, trigger, mode) {
   const content = element("div", { class: "history-archive" });
   openDialog({ title, content, readOnly: true });
+  $("#dialog-content").scrollTop = 0;
   const slot = { sessionId: String(sessionId), title, content, trigger, mode, page: null, bodyPage: null, selected: null, controller: null, through: null, before: null, starts: [null], offsets: [0], segment: 0, error: "", retry: null, focusAfterLoad: false, returnMessageId: null };
   historyDialog = slot;
   dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view };
@@ -658,25 +659,29 @@ function renderHistoryDialog(slot) {
   const root = slot.content;
   const restoreFocus = slot.focusAfterLoad && (root.contains(document.activeElement) || document.activeElement === document.body);
   root.setAttribute("aria-busy", String(!!slot.controller)); root.replaceChildren();
+  if (slot.controller) $("#dialog-content").scrollTop = 0;
   $("#dialog-title").textContent = slot.mode === "body" ? "已保存正文" : "正文归档";
   if (slot.mode === "body") {
     const id = slot.selected.id;
     root.append(element("button", { type: "button", class: "text-button", text: "返回记录", onClick: () => void loadHistoryPage(slot, slot.before, slot.starts, id) }));
     const page = slot.bodyPage;
     if (page) {
+      const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: slot.segment === 0, onClick: () => void loadHistoryContent(slot, slot.offsets[slot.segment - 1], slot.segment - 1) });
+      const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !page.has_more, onClick: () => void loadHistoryContent(slot, page.next_offset_bytes, slot.segment + 1) });
+      root.append(element("nav", { class: "history-navigation", "aria-label": "正文分段" }, previous, element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.segment + 1} 段 · ${page.has_more ? "尚有后文" : "已到所存正文末尾"}` }), next));
       root.append(statusList([["角色", historyRole(page)], ["序号", page.seq], ["身份", page.principal ?? "未记录"], ["来源", page.source ?? "未记录"]]));
       if (page.metadata_omitted?.length) root.append(element("p", { class: "history-note", text: "部分来源元数据未显示。" }));
       const provenance = historyProvenance(page);
       if (provenance) root.append(element("p", { class: "history-note", text: provenance }));
       root.append(element("pre", { class: "history-content", text: page.content }));
-      const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: slot.segment === 0, onClick: () => void loadHistoryContent(slot, slot.offsets[slot.segment - 1], slot.segment - 1) });
-      const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !page.has_more, onClick: () => void loadHistoryContent(slot, page.next_offset_bytes, slot.segment + 1) });
-      root.append(element("nav", { class: "history-navigation", "aria-label": "正文分段" }, previous, element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.segment + 1} 段 · ${page.has_more ? "尚有后文" : "已到所存正文末尾"}` }), next));
     }
   } else {
     if (slot.fromRecord) root.append(element("button", { type: "button", class: "text-button", text: "返回任务详情", onClick: () => void loadSession(slot.sessionId, slot.trigger) }));
     root.append(element("p", { class: "history-note", text: slot.fromRecord ? `${slot.recordTitle} · 已保存的消息正文` : "已保存的消息正文" }));
     if (slot.page) {
+      const newer = element("button", { type: "button", class: "text-button", text: "较新一页", disabled: slot.starts.length < 2, onClick: () => void loadHistoryPage(slot, slot.starts.at(-2), slot.starts.slice(0, -1)) });
+      const older = element("button", { type: "button", class: "text-button", text: "更早一页", disabled: !slot.page.has_older, onClick: () => void loadHistoryPage(slot, slot.page.next_before_seq, [...slot.starts, slot.page.next_before_seq]) });
+      root.append(element("nav", { class: "history-navigation", "aria-label": "正文归档分页" }, newer, element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.starts.length} 页 · ${slot.page.has_older ? "尚有更早记录" : "已到最早"}` }), older));
       for (const message of slot.page.messages) {
         const row = element("article", { class: "history-message" }, element("div", { class: "history-message-heading" }, element("strong", { text: historyRole(message) }), element("span", { text: `#${message.seq}` })));
         row.append(element("p", { class: "history-preview", text: message.content ?? "此消息无文本正文。" }));
@@ -688,9 +693,6 @@ function renderHistoryDialog(slot) {
         root.append(row);
       }
       if (!slot.page.messages.length) root.append(element("p", { role: "status", text: "此页没有已保存记录。" }));
-      const newer = element("button", { type: "button", class: "text-button", text: "较新一页", disabled: slot.starts.length < 2, onClick: () => void loadHistoryPage(slot, slot.starts.at(-2), slot.starts.slice(0, -1)) });
-      const older = element("button", { type: "button", class: "text-button", text: "更早一页", disabled: !slot.page.has_older, onClick: () => void loadHistoryPage(slot, slot.page.next_before_seq, [...slot.starts, slot.page.next_before_seq]) });
-      root.append(element("nav", { class: "history-navigation", "aria-label": "正文归档分页" }, newer, element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.starts.length} 页 · ${slot.page.has_older ? "尚有更早记录" : "已到最早"}` }), older));
     }
   }
   if (slot.controller) root.append(element("p", { role: "status", class: "history-note", text: "正在读取…" }));
