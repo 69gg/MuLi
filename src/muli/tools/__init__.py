@@ -17,6 +17,7 @@ class Tool:
     handler: Handler
     risk: str = "read"
     requires_approval: bool = False
+    preserve_output: bool = False
 
     def schema(self) -> dict[str, Any]:
         return {

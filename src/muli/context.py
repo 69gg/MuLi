@@ -101,11 +101,28 @@ def _older_turns(messages: Sequence[Message]) -> list[list[Message]]:
     return turns[:-1]
 
 
+def _preserved_results(messages: Sequence[Message]) -> set[int]:
+    """Protect host-marked results only until their immediate next model request."""
+    index = len(messages) - 1
+    # Extension hooks may append fixed context after a completed tool batch.
+    while index >= 0 and messages[index].role in _PINNED_ROLES:
+        index -= 1
+    preserved: set[int] = set()
+    while index >= 0 and messages[index].role == "tool":
+        if messages[index].preserve_content is True:
+            preserved.add(index)
+        index -= 1
+    # Pair validation has already established that this is a complete batch.
+    return preserved
+
+
 def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
     """先节选文本，再整体移出旧轮次；返回独立副本，严格遵守 JSON 字符预算。
 
     不补齐、不执行工具；调用方须先为中断且结果未知的调用补明确的未知结果。
     最新用户输入、系统提示、工具参数、思考和 provider_data 均不截断。
+    最新完整工具批次中的宿主 preserve_content 标记同样保留完整正文；
+    新回答、输入或工具批次后，旧标记不再阻止正常节选。
     """
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError("上下文字符预算必须是正整数")
@@ -115,12 +132,13 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
     if current_size <= max_chars:
         return packed
 
+    preserved = _preserved_results(packed)
     last_user = next(
         (index for index in range(len(packed) - 1, -1, -1) if packed[index].role == "user"),
         -1,
     )
     for index, message in enumerate(packed):
-        if message.role == "tool" or (
+        if (message.role == "tool" and index not in preserved) or (
             index < last_user
             and message.role == "assistant"
             and not message.tool_calls
@@ -143,7 +161,8 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
     _validate_pairs(packed)
     if _size(packed) > max_chars:
         raise ContextLimitError(
-            "最新用户输入、完整任务说明、系统提示或当前轮原生协议数据超过上下文字符预算；"
+            "最新用户输入、完整任务说明、系统提示、当前轮原生协议数据或需完整保留的工具结果"
+            "超过上下文字符预算；"
             "已完成操作仍保留在会话中，请拆分任务或提高上限"
         )
     return packed
