@@ -5,6 +5,7 @@ import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, MODEL_ROLE
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
+import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
 
 const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -65,6 +66,7 @@ let queuedRender = false;
 let messageNodes = new Map();
 let toolNodes = new Map();
 let dialogSubmit = null;
+const teamPager = createTeamPager(request);
 
 async function request(path, options) {
   try { return await apiRequest(path, options); }
@@ -553,7 +555,7 @@ async function switchView(view) {
   try {
     if (view === "workflows") state.workflows = collection(await request("/workflows"));
     if (view === "uploads") state.uploads = collection(await request("/uploads"));
-    if (view === "team") state.team = await request("/team");
+    if (view === "team") { const page = await teamPager.load(); if (page) state.team = page; }
     if (view === "records") { state.sessions = collection(await request("/sessions")); state.sessionsError = ""; }
     if (view === "memories") {
       const results = await Promise.allSettled([request(`/memories${state.memoryQuery ? `?query=${encodeURIComponent(state.memoryQuery)}` : ""}`), request("/memories/graph")]);
@@ -594,7 +596,7 @@ function renderOtherView() {
   if (state.view === "notifications") root.replaceChildren(renderNotifications());
   if (state.view === "settings") root.replaceChildren(renderSettings());
   if (state.view === "uploads") root.replaceChildren(renderUploads());
-  if (state.view === "team") root.replaceChildren(renderTeam());
+  if (state.view === "team") { const saved = captureTeamView(root); root.replaceChildren(renderTeam()); restoreTeamView(root, saved); }
   if (state.view === "records") root.replaceChildren(renderRecords());
   const nav = $(".settings-nav", root);
   const active = $(".settings-nav .active", root);
@@ -651,24 +653,43 @@ function renderUploads() {
   return root;
 }
 
-async function refreshTeam() {
-  try { state.team = await request("/team"); if (state.view === "team") renderOtherView(); } catch (error) { showError(error); }
+async function refreshTeam(changes = {}) {
+  try {
+    const page = await teamPager.load(changes);
+    if (page) { state.team = page; if (state.view === "team") renderOtherView(); }
+  } catch (error) { showError(error); }
 }
 
 function renderTeam() {
   const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")));
   root.append(actionButton("与沐璃安排协作", "configure-prompt", "configuration-link", "chat", { prompt: "请帮我安排一组协作任务：" }));
+  const filter = element("div", { class: "team-filter", role: "group", "aria-label": "团队筛选" });
+  for (const [active, label] of [[false, "全部"], [true, "进行中"]]) {
+    const button = actionButton(label, "filter-team", "text-button", null, { active: String(active) });
+    button.setAttribute("aria-pressed", String(!!state.team.active_only === active));
+    filter.append(button);
+  }
+  filter.append(element("small", { text: `${state.team.total ?? 0} 位队友` }));
+  root.append(filter);
   const members = state.team.members ?? [];
-  const status = { running: "运行中", queued: "排队中", idle: "空闲", completed: "已完成", failed: "失败", closed: "已关闭", cancelled: "已停止", approval: "等待审批" };
-  if (!members.length) root.append(emptyState("team", "当前没有协作任务", "需要时，沐璃会在这里展示团队进展。"));
+  const status = { running: "运行中", queued: "排队中", idle: "空闲", completed: "已完成", failed: "失败", closed: "已关闭", cancelled: "已停止", interrupted: "已中断", approval: "等待审批" };
+  const roles = { worker: "执行", reviewer: "复核" };
+  if (!members.length) root.append(emptyState("team", state.team.active_only ? "没有进行中的协作" : "当前没有协作任务"));
   for (const member of members) {
-    const content = element("div", { class: "row-content" }, element("h3", { text: member.name || member.id }), member.task && element("p", { text: member.task }), element("div", { class: "row-meta" }, member.role ?? "", status[member.status] ?? member.status));
-    if (member.last_message) content.append(element("p", { class: "team-last-message", text: typeof member.last_message === "string" ? member.last_message : member.last_message.content ?? "" }));
+    const content = element("div", { class: "row-content" }, element("h3", { text: member.name || member.id }), member.task && element("p", { text: member.task }), element("div", { class: "row-meta", text: [roles[member.role] ?? member.role, status[member.status] ?? member.status].filter(Boolean).join(" · ") }));
+    if (member.last_message) content.append(element("p", { class: "team-last-message", text: (typeof member.last_message === "string" ? member.last_message : member.last_message.content ?? "") + (member.last_message_truncated ? "…" : "") }));
     root.append(element("article", { class: "team-row" }, element("div", { class: "row-icon" }, icon("team")), content, element("div", { class: "row-actions" }, member.status !== "closed" && iconButton("发送消息", "message-team", "chat", { id: member.id }), member.session_id && iconButton("查看记录", "workflow-session", "panel", { session: member.session_id }), ["running", "queued", "approval"].includes(member.status) && iconButton("停止任务", "stop-team", "stop", { id: member.id }))));
+  }
+  if ((state.team.total ?? 0) > state.team.limit) {
+    const previous = actionButton("上一页", "page-team", "secondary-button", null, { offset: Math.max(0, state.team.offset - state.team.limit), direction: "previous" });
+    previous.disabled = state.team.offset === 0;
+    const next = actionButton("下一页", "page-team", "secondary-button", null, { offset: state.team.offset + state.team.limit, direction: "next" });
+    next.disabled = !state.team.has_more;
+    root.append(element("nav", { class: "team-pagination", "aria-label": "团队分页" }, previous, element("span", { text: `${state.team.offset + 1}–${state.team.offset + members.length} / ${state.team.total}` }), next));
   }
   if (state.team.messages?.length) {
     const details = element("details", { class: "team-messages advanced-settings" }, element("summary", { text: "协作消息" }));
-    for (const message of state.team.messages) details.append(element("div", { class: "team-message" }, element("strong", { text: message.from_name || message.sender || message.from || "成员" }), element("p", { text: message.content ?? "" }), element("time", { text: formatTimestamp(message.created_at) })));
+    for (const message of state.team.messages) details.append(element("div", { class: "team-message" }, element("strong", { text: message.from_name || message.sender || message.from || "成员" }), element("p", { text: (message.content ?? "") + (message.truncated ? "…" : "") }), element("time", { text: formatTimestamp(message.created_at) })));
     root.append(details);
   }
   return root;
@@ -1314,6 +1335,8 @@ async function handleAction(action, button) {
   }
   if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
   if (action === "refresh-team") await refreshTeam();
+  if (action === "filter-team") await refreshTeam({ offset: 0, activeOnly: button.dataset.active === "true" });
+  if (action === "page-team") await refreshTeam({ offset: Number(button.dataset.offset) });
   if (action === "message-team") {
     const id = button.dataset.id;
     openDialog({ title: "发送协作消息", content: field("消息", "content", "", { type: "textarea", required: true }), submitLabel: "发送", onSubmit: async (form) => {

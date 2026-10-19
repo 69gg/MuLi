@@ -469,6 +469,12 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .configuration-link svg { width: 16px; height: 16px; }
 .team-row, .record-row { display: flex; gap: 17px; align-items: flex-start; border-bottom: 1px solid var(--line); padding: 23px 0; }
 .team-row .row-actions { flex-wrap: wrap; }
+.team-filter, .team-pagination { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.team-filter { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.team-filter [aria-pressed="true"] { color: var(--accent); text-decoration: underline; text-underline-offset: 6px; }
+.team-filter small { margin-left: auto; color: var(--muted); }
+.team-pagination { justify-content: center; padding: 24px 0; }
+.team-pagination span { color: var(--muted); font-size: 12px; }
 .team-last-message { border-left: 2px solid var(--line); padding-left: 11px; margin-top: 12px !important; }
 .team-message { font-size: 11px; line-height: 1.8; padding: 15px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
 .team-message p { white-space: pre-wrap; overflow-wrap: anywhere; }

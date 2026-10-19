@@ -33,12 +33,45 @@ class TeamManager:
             agent["status"] = "interrupted"
             runtime.store.put("agent", agent)
 
-    def list(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+    def list(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        *,
+        active_only: bool = False,
+        newest_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        condition = (
+            " AND json_extract(data,'$.status') IN ('queued','running')" if active_only else ""
+        )
+        order = "DESC" if newest_first else "ASC"
         rows = self.runtime.store.db.execute(
-            "SELECT data FROM objects WHERE kind='agent' ORDER BY rowid LIMIT ? OFFSET ?",
+            f"SELECT data FROM objects WHERE kind='agent'{condition} ORDER BY rowid {order} LIMIT ? OFFSET ?",
             (max(1, min(limit, 1000)), max(0, offset)),
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def page(
+        self, *, limit: int = 50, offset: int = 0, active_only: bool = False
+    ) -> dict[str, Any]:
+        """A bounded live management page; model listings keep their original order."""
+        limit = max(1, min(limit, 1000))
+        condition = (
+            " AND json_extract(data,'$.status') IN ('queued','running')" if active_only else ""
+        )
+        total = self.runtime.store.db.execute(
+            f"SELECT count(*) FROM objects WHERE kind='agent'{condition}"
+        ).fetchone()[0]
+        offset = min(max(0, offset), ((total - 1) // limit) * limit) if total else 0
+        members = self.list(limit, offset, active_only=active_only, newest_first=True)
+        return {
+            "members": members,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "active_only": active_only,
+            "has_more": offset + len(members) < total,
+        }
 
     def get(self, target: str) -> dict[str, Any]:
         agent = self.runtime.store.get("agent", target)
