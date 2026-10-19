@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-import contextlib
 import json
 from typing import TYPE_CHECKING, Any, cast
 
@@ -477,11 +476,13 @@ class TeamManager:
         await self.cancel_children(agent["id"])
         self.runtime.store.cancel_inputs(agent["session_id"])
         task = self._active.get(agent["id"])
+        cancelled = False
         if task is not None:
             if not task.cancelling():
                 task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            cancelled = await self._settle([task])
+            if not task.cancelled():
+                task.result()
             if self._active.get(agent["id"]) is task:
                 self._active.pop(agent["id"], None)
             current = self.get(agent["id"])
@@ -493,6 +494,8 @@ class TeamManager:
                 self._finish(agent, "cancelled", "", None)
                 await self.runtime.bus.notify()
         self.runtime.store.cancel_inputs(agent["session_id"])
+        if cancelled:
+            raise asyncio.CancelledError
         return self.get(agent["id"])
 
     async def cancel_children(self, parent_id: str) -> None:
@@ -626,6 +629,18 @@ class TeamManager:
             ),
         ]
 
+    @staticmethod
+    async def _settle(tasks: builtins.list[asyncio.Task[None]]) -> bool:
+        """Finish cleanup without forwarding the observer's cancellation again."""
+        settled = asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = False
+        while not settled.done():
+            try:
+                await asyncio.shield(settled)
+            except asyncio.CancelledError:
+                cancelled = True
+        return cancelled
+
     async def close(self) -> None:
         self._closed = True
         # The execution slot is released before report delivery. Keep observing
@@ -634,13 +649,7 @@ class TeamManager:
         for task in tasks:
             if not task.done() and not task.cancelling():
                 task.cancel()
-        settled = asyncio.gather(*tasks, return_exceptions=True)
-        cancelled = False
-        while not settled.done():
-            try:
-                await asyncio.shield(settled)
-            except asyncio.CancelledError:
-                cancelled = True
+        cancelled = await self._settle(tasks)
         self._active.clear()
         if cancelled:
             raise asyncio.CancelledError

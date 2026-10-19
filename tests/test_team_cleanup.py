@@ -161,6 +161,59 @@ async def test_repeated_stop_does_not_interrupt_inflight_cancellation_cleanup(
         await runtime.close()
 
 
+async def test_cancelling_stopper_twice_settles_child_before_propagating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    started, cancelling, release = (asyncio.Event() for _ in range(3))
+    original_emit = runtime.bus.emit
+
+    class Client(FakeClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            started.set()
+            await asyncio.Event().wait()
+            yield StreamEvent("done", turn=ModelTurn(content="不会到达"))
+
+    async def gated_emit(
+        event_type: str, data: dict[str, Any], session_id: str | None = None
+    ) -> dict[str, Any]:
+        if event_type == "run.cancelled":
+            cancelling.set()
+            await release.wait()
+        return await original_emit(event_type, data, session_id)
+
+    runtime.client_factory = lambda _: Client([], seen)  # type: ignore[assignment,return-value]
+    monkeypatch.setattr(runtime.bus, "emit", gated_emit)
+    parent = runtime.new_session(mode="yolo")
+    child = await runtime.team.spawn("停止入口取消", "工作", parent_id=parent["id"])
+    task = runtime.team._active[child["id"]]
+    stopper: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        stopper = asyncio.create_task(runtime.team.stop(child["id"]))
+        await asyncio.wait_for(cancelling.wait(), 2)
+        assert task.cancelling() == 1
+        stopper.cancel()
+        stopper.cancel()
+        assert task.cancelling() == 1, "调用者取消不能转发到已在清理的子任务"
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stopper, 2)
+        assert task.done() and task.cancelled() and task.cancelling() == 1
+        stored = runtime.team.get(child["id"])
+        assert stored["status"] == "cancelled" and stored["completion_revision"] == 1
+        assert not runtime.tasks and not runtime.team._tasks and not runtime.team._active
+        assert (await runtime.team.stop(child["id"]))["completion_revision"] == 1
+    finally:
+        release.set()
+        if stopper is not None:
+            await asyncio.gather(stopper, return_exceptions=True)
+        await runtime.close()
+
+
 async def test_new_generation_starts_while_previous_finalizer_is_tracked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -245,4 +298,29 @@ async def test_unexpected_task_failure_is_observed_and_removed_from_lifecycle_se
         assert errors == []
     finally:
         loop.set_exception_handler(original_handler)
+        await runtime.close()
+
+
+async def test_stop_keeps_unexpected_child_cleanup_error_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    entered = asyncio.Event()
+
+    async def fail(identifier: str) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise RuntimeError(f"清理失败：{identifier}")
+
+    monkeypatch.setattr(runtime.team, "_run", fail)
+    try:
+        parent = runtime.new_session(mode="yolo")
+        child = await runtime.team.spawn("异常可见", "工作", parent_id=parent["id"])
+        await asyncio.wait_for(entered.wait(), 2)
+        with pytest.raises(RuntimeError, match="清理失败"):
+            await asyncio.wait_for(runtime.team.stop(child["id"]), 2)
+        assert not runtime.team._tasks
+    finally:
         await runtime.close()
