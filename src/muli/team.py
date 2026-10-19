@@ -397,7 +397,10 @@ class TeamManager:
                 if (
                     self._closed
                     or self.runtime._closing
-                    or self._parent_stopping(agent["parent_id"])
+                    or (
+                        self._parent_stopping(agent["parent_id"])
+                        and asyncio.current_task() in self._stopping_tasks
+                    )
                 ):
                     report["status"] = "suppressed"
                 writes.append(("team_report", report))
@@ -430,14 +433,12 @@ class TeamManager:
             for row in rows:
                 report = json.loads(row[0])
                 parent = self.runtime.store.get("session", report["parent_id"])
-                if (
-                    parent is None
-                    or self._parent_stopping(parent["id"])
-                    or parent.get("kind") not in {"main", "team"}
-                ):
+                if parent is None or parent.get("kind") not in {"main", "team"}:
                     report["status"] = "suppressed"
                     self.runtime.store.put("team_report", report)
                     continue
+                if self._parent_stopping(parent["id"]):
+                    continue  # A later execution's result waits for the old stop to exit.
                 writes = [("team_report", {**report, "status": "delivered"})]
                 try:
                     if parent.get("kind") == "team":
@@ -503,7 +504,7 @@ class TeamManager:
             # The outer batch already owns this execution's entire subtree.
             # Runtime finalizers must not discover a later resumed generation.
             return
-        async with self._stopping(self._descendants(parent_id)):
+        async with self._stopping(self._descendants(parent_id), report_parent=parent_id):
             pass
 
     @asynccontextmanager
@@ -516,6 +517,7 @@ class TeamManager:
         async with self._stopping(
             self._descendants(parent_id),
             observers=[task for task in observers if task is not None],
+            report_parent=parent_id,
         ):
             yield
 
@@ -525,6 +527,7 @@ class TeamManager:
         agents: builtins.list[dict[str, Any]],
         *,
         observers: builtins.list[asyncio.Task[Any]] | None = None,
+        report_parent: str | None = None,
     ) -> AsyncIterator[None]:
         # Capture the entire batch before the first await: later resume/send
         # calls belong to a later intent, even for a sibling not yet settled.
@@ -543,6 +546,20 @@ class TeamManager:
                 self._stopping_generations.get(generation, 0) + 1
             )
         try:
+            # Only the report intents already present at this stop boundary
+            # belong to it. Later executions may leave new pending reports.
+            parents = {agent["session_id"] for agent, _ in snapshots}
+            if report_parent is not None:
+                parents.add(report_parent)
+            if parents:
+                placeholders = ",".join("?" for _ in parents)
+                with self.runtime.store.db:
+                    self.runtime.store.db.execute(
+                        "UPDATE objects SET data=json_set(data,'$.status','suppressed'),updated=? "
+                        "WHERE kind='team_report' AND json_extract(data,'$.status')='pending' "
+                        f"AND json_extract(data,'$.parent_id') IN ({placeholders})",
+                        (now(), *parents),
+                    )
             for agent, _ in snapshots:
                 self.runtime.store.cancel_inputs(agent["session_id"])
             for task in tasks:
@@ -595,6 +612,8 @@ class TeamManager:
                     self._stopping_tasks[task] = count
                 else:
                     del self._stopping_tasks[task]
+            if not self._closed and not self.runtime._closing:
+                await self.flush_reports()
 
     def tools(self, caller: str, mode: Mode) -> builtins.list[Tool]:
         async def spawn(args: dict[str, Any]) -> Any:

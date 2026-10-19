@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import pytest
 from test_runtime import FakeClient, make_runtime
 
-from muli.providers import Message, ModelTurn, StreamEvent
+from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.store import Store
 
 
@@ -901,6 +902,198 @@ async def test_main_stop_consumes_late_owner_input_once_after_cleanup(tmp_path: 
             )
             == 1
         )
+        assert not runtime._stopping and not runtime.team._stopping_tasks
+        assert not runtime.team._stopping_generations
+    finally:
+        release.set()
+        if stopper is not None:
+            await asyncio.gather(stopper, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_idle_main_queues_late_owner_until_old_children_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    runtime.config.update(
+        {
+            "models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}},
+            "limits": {"max_parallel_agents": 3},
+        }
+    )
+    await runtime.reconfigure()
+    started, cleaning, release, delivered = (asyncio.Event() for _ in range(4))
+    original_emit = runtime.bus.emit
+    workers = 0
+
+    class OldClient(FakeClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+            yield StreamEvent("done", turn=ModelTurn(content="不会执行"))
+
+    class MainClient(FakeClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            seen.append(list(messages))
+            already_spawned = any(
+                call.name == "spawn_agent" for message in messages for call in message.tool_calls
+            )
+            turn = (
+                ModelTurn(content="已核实新的队友证据")
+                if already_spawned
+                else ModelTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "fresh-spawn",
+                            "spawn_agent",
+                            json.dumps({"task_name": "新任务队友", "prompt": "整理新证据"}),
+                        )
+                    ]
+                )
+            )
+            yield StreamEvent("done", turn=turn)
+
+    def factory(config: ModelConfig) -> FakeClient:
+        nonlocal workers
+        if config.model == "worker":
+            workers += 1
+            if workers == 1:
+                return OldClient([], seen)
+            return FakeClient([ModelTurn(content="新任务证据")], seen)
+        return MainClient([], seen)
+
+    async def observing_emit(
+        event_type: str, data: dict[str, Any], session_id: str | None = None
+    ) -> dict[str, Any]:
+        event = await original_emit(event_type, data, session_id)
+        if event_type == "team.result":
+            delivered.set()
+        return event
+
+    runtime.client_factory = factory  # type: ignore[assignment]
+    monkeypatch.setattr(runtime.bus, "emit", observing_emit)
+    main = runtime.main_session()
+    stopper: asyncio.Task[None] | None = None
+    try:
+        await runtime.team.spawn("旧任务队友", "旧任务", parent_id=main["id"])
+        await asyncio.wait_for(started.wait(), 2)
+        stopper = asyncio.create_task(runtime.stop(main["id"]))
+        await asyncio.wait_for(cleaning.wait(), 2)
+        receipt = await runtime.submit("后来的主人任务", mode="yolo")
+        assert receipt["queued"] and receipt["run_id"] is None
+        assert runtime.store.pending_inputs(main["id"]) == 1
+        assert main["id"] not in runtime.tasks and workers == 1 and not seen
+        release.set()
+        await asyncio.wait_for(stopper, 2)
+        await asyncio.wait_for(delivered.wait(), 2)
+        fresh = runtime.team.get("新任务队友")
+        report = runtime.store.get("team_report", fresh["run_id"])
+        assert workers == 2 and report is not None and report["status"] == "delivered"
+        assert runtime.main_session()["mode"] == "yolo"
+        assert any(message.content == "后来的主人任务" for messages in seen for message in messages)
+        assert not runtime._stopping and not runtime.team._stopping_tasks
+    finally:
+        release.set()
+        if stopper is not None:
+            await asyncio.gather(stopper, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_stop_suppresses_old_reports_but_defers_resumed_generation_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    started, first_finished, release, next_started, delivered, main_finished = (
+        asyncio.Event() for _ in range(6)
+    )
+    original_notify, original_emit = runtime.bus.notify, runtime.bus.emit
+    child_id = ""
+    calls = 0
+
+    class Client(FakeClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await asyncio.Event().wait()
+            else:
+                next_started.set()
+            yield StreamEvent("done", turn=ModelTurn(content="显式恢复后的新代证据"))
+
+    async def gated_notify() -> None:
+        event = runtime.store.events(limit=100)[-1]
+        if (
+            event["type"] == "team.finished"
+            and event["data"]["agent_id"] == child_id
+            and event["data"]["generation"] == 1
+        ):
+            first_finished.set()
+            await release.wait()
+        await original_notify()
+
+    async def observing_emit(
+        event_type: str, data: dict[str, Any], session_id: str | None = None
+    ) -> dict[str, Any]:
+        event = await original_emit(event_type, data, session_id)
+        if event_type == "team.result":
+            delivered.set()
+        if event_type == "run.completed" and session_id == main["id"]:
+            main_finished.set()
+        return event
+
+    runtime.client_factory = lambda _: Client([], seen)  # type: ignore[assignment,return-value]
+    monkeypatch.setattr(runtime.bus, "notify", gated_notify)
+    monkeypatch.setattr(runtime.bus, "emit", observing_emit)
+    main = runtime.main_session()
+    child = await runtime.team.spawn("新旧报告区分", "旧任务", parent_id=main["id"])
+    child_id = child["id"]
+    stopper: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        first_run = runtime.team.get(child_id)["run_id"]
+        runtime.store.put(
+            "team_report",
+            {
+                "id": "preexisting-report",
+                "parent_id": main["id"],
+                "agent_id": child_id,
+                "status": "pending",
+                "content": "停止之前已有的旧报告",
+            },
+        )
+        stopper = asyncio.create_task(runtime.stop(main["id"]))
+        await asyncio.wait_for(first_finished.wait(), 2)
+        preexisting = runtime.store.get("team_report", "preexisting-report")
+        cancelled = runtime.store.get("team_report", first_run)
+        assert preexisting is not None and preexisting["status"] == "suppressed"
+        assert cancelled is not None and cancelled["status"] == "suppressed"
+        await runtime.team.resume(child_id)
+        successor = runtime.team._active[child_id]
+        await asyncio.wait_for(next_started.wait(), 2)
+        await asyncio.wait_for(asyncio.shield(successor), 2)
+        current = runtime.team.get(child_id)
+        assert current["generation"] == 2 and current["status"] == "completed"
+        report = runtime.store.get("team_report", current["run_id"])
+        assert report is not None and report["status"] == "pending"
+        assert main["id"] in runtime._stopping and not delivered.is_set()
+        release.set()
+        await asyncio.wait_for(stopper, 2)
+        await asyncio.wait_for(delivered.wait(), 2)
+        await asyncio.wait_for(main_finished.wait(), 2)
+        report = runtime.store.get("team_report", current["run_id"])
+        assert report is not None and report["status"] == "delivered"
+        assert calls == 3 and runtime.team.get(child_id)["generation"] == 2
         assert not runtime._stopping and not runtime.team._stopping_tasks
         assert not runtime.team._stopping_generations
     finally:
