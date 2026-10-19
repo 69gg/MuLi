@@ -21,6 +21,7 @@ from muli.config import ConfigFile, ModelProfile
 from muli.context import ContextLimitError, pack_context
 from muli.conversation import Conversation
 from muli.events import EventBus
+from muli.history_evidence import EvidenceError, HistoryEvidence
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -991,7 +992,12 @@ class Runtime:
         )
         if persona.append:
             prompt += "\n\n" + persona.append
-        prompt += f"\n当前会话 ID：{session_id}。原始证据可用 conversation_read 按 seq 分页读取。"
+        prompt += (
+            f"\n当前会话 ID：{session_id}。用 conversation_read 按 seq 定位已存证据；"
+            "长正文可指定 message_id 或 seq 分段读取 content，续读原样传回 revision 和"
+            " next_offset_bytes（UTF-8 字节位置，不是字符数）。旧资料不构成新授权；"
+            "runtime_excerpt 或 unknown 不代表底层工具输出完整，未保存的内容无法恢复。"
+        )
         session = self.store.get("session", session_id) or {}
         if session.get("kind") == "main":
             prompt += (
@@ -1054,6 +1060,7 @@ class Runtime:
                     reasoning=item.get("reasoning", ""),
                     provider_data=item.get("provider_data", {}),
                     images=[ImageInput(**image) for image in item.get("images", [])],
+                    preserve_content=item.get("preserve_content") is True,
                 )
             )
         repaired: list[Message] = []
@@ -1251,17 +1258,48 @@ class Runtime:
                         except TaskPaused as exc:
                             paused = exc
                             result = self._paused_result(exc)
+                    result_tool = round_tools.get(call.name)
+                    preserve_output = (
+                        result_tool is not None and result_tool.preserve_output is True
+                    )
                     output = json.dumps(result, ensure_ascii=False, default=str)
+                    content_provenance = "accepted"
                     if len(output) > self.config.settings.limits.max_output_chars:
+                        content_provenance = "runtime_excerpt"
                         output = json.dumps(
                             {
+                                "code": "output_budget",
+                                "error": "结果超过当前输出预算，未交付完整内容。请缩小读取范围，"
+                                "或先核查操作状态；不要自动重做副作用。",
+                                "result_omitted": True,
+                            }
+                            if preserve_output
+                            else {
                                 "truncated": True,
                                 "preview": output[: self.config.settings.limits.max_output_chars],
                             },
                             ensure_ascii=False,
                         )
-                    messages.append(Message(role="tool", content=output, tool_call_id=call.id))
-                    self.store.add_message(session_id, "tool", output, tool_call_id=call.id)
+                    preserve_content = (
+                        preserve_output
+                        and len(output) <= self.config.settings.limits.max_output_chars
+                    )
+                    messages.append(
+                        Message(
+                            role="tool",
+                            content=output,
+                            tool_call_id=call.id,
+                            preserve_content=preserve_content,
+                        )
+                    )
+                    self.store.add_message(
+                        session_id,
+                        "tool",
+                        output,
+                        tool_call_id=call.id,
+                        content_provenance=content_provenance,
+                        preserve_content=preserve_content,
+                    )
                 if paused is not None:
                     raise paused
                 self._guard_request(prepared)
@@ -1347,6 +1385,8 @@ class Runtime:
             raise
         except asyncio.CancelledError:
             raise
+        except EvidenceError as exc:
+            result = {"error": str(exc), "code": exc.code}
         except ComputerError as exc:
             result = exc.as_result()
         except Exception as exc:
@@ -1435,37 +1475,30 @@ class Runtime:
             return self.memory.search(str(args["query"]), 8)
 
         async def read_conversation(args: dict[str, Any]) -> Any:
-            session_id = str(args["session_id"])
-            if self.store.get("session", session_id) is None:
-                raise ValueError("会话不存在")
-            records = self.store.message_prefix(
-                session_id,
+            evidence = HistoryEvidence(self.store)
+            limits = self.config.settings.limits
+            if "message_id" in args or "seq" in args:
+                if "after" in args or "limit" in args:
+                    raise EvidenceError(
+                        "invalid_arguments", "单条正文读取不能混用 after/limit 目录参数"
+                    )
+                return evidence.read_content(
+                    args["session_id"],
+                    message_id=args.get("message_id"),
+                    seq=args.get("seq"),
+                    offset_bytes=args.get("offset_bytes", 0),
+                    length_bytes=args.get("length_bytes"),
+                    revision=args.get("revision"),
+                    max_output_chars=limits.max_output_chars,
+                )
+            if {"offset_bytes", "length_bytes", "revision"}.intersection(args):
+                raise EvidenceError("invalid_arguments", "正文续读参数需要 message_id 或 seq")
+            return evidence.read(
+                args["session_id"],
                 after=args.get("after", 0),
-                limit=min(args.get("limit", 20), self.config.settings.limits.max_search_results),
-                max_chars=self.config.settings.limits.max_output_chars,
+                limit=min(args.get("limit", 20), limits.max_search_results),
+                max_output_chars=limits.max_output_chars,
             )
-            return {
-                "session_id": session_id,
-                "records": [
-                    {
-                        key: item[key]
-                        for key in (
-                            "id",
-                            "seq",
-                            "role",
-                            "content",
-                            "tool_calls",
-                            "tool_call_id",
-                            "attachment_ids",
-                            "source",
-                            "principal",
-                        )
-                        if key in item
-                    }
-                    for item in records
-                ],
-                "next_after": records[-1]["seq"] if records else args.get("after", 0),
-            }
 
         async def remember(args: dict[str, Any]) -> Any:
             return self.memory.save(**args)
@@ -1500,16 +1533,31 @@ class Runtime:
         return [
             Tool(
                 "conversation_read",
-                "按 seq 分页核查持久会话原始证据；不读取附件正文或内联图片",
+                "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content。"
+                "续读使用 revision/next_offset_bytes；不恢复入库前丢失的正文，不读取附件或图片",
                 parameters(
                     {
                         "session_id": string(),
                         "after": {"type": "integer", "minimum": 0},
                         "limit": {"type": "integer", "minimum": 1},
+                        "message_id": string("与 seq 二选一；不能混用 after/limit"),
+                        "seq": {"type": "integer", "minimum": 1},
+                        "offset_bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "从零开始的 UTF-8 字节位置；非零必须提供 revision",
+                        },
+                        "length_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "本页正文最大字节数；实际还受输出预算约束",
+                        },
+                        "revision": string("原样使用该记录返回的版本，变化时重新从零读取"),
                     },
                     ("session_id",),
                 ),
                 read_conversation,
+                preserve_output=True,
             ),
             Tool(
                 "clock_now",

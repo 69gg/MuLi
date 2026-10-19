@@ -87,6 +87,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [个人记忆设计](docs/memory.md)
 - [MCP 扩展](docs/mcp.md)
 - [用户插件与自身管理](docs/self-management.md)
+- [压缩后的证据续读](docs/history-evidence.md)
 - [PyPI 与发布流程](docs/publishing.md)
 - [桌面通知](docs/notifications.md)
 - [系统注意事项与主会话唤醒](docs/attention.md)

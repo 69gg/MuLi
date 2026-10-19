@@ -51,7 +51,9 @@ def closed_groups(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 
 
 def extract(records: list[dict[str, Any]], previous: str, budget: int) -> str:
-    lines = ["可追溯摘录（并非完整语义总结）；完整事实请按 seq 读取原始会话。"]
+    lines = [
+        "可追溯摘录（并非完整语义总结）；已存证据请用 conversation_read 按 seq 定位，长正文按版本和字节游标续读。"
+    ]
     if previous:
         lines.append("前层摘要：" + previous[: max(80, budget // 3)])
     allowance = max(24, (budget - sum(map(len, lines))) // max(1, len(records)))
@@ -133,7 +135,7 @@ class Compactor:
                     "role": "assistant",
                     "compaction_summary": True,
                     "content": f"历史资料提示：seq={earliest[0]['seq']} 至 seq<{records[0]['seq']} 的记录尚未进入摘要或当前回放；"
-                    "不能假定这段历史不存在。需要证据时使用 conversation_read 分页读取。",
+                    "不能假定这段历史不存在。用 conversation_read 按 seq 定位，长正文按返回的版本和字节游标续读。",
                 }
             ]
         if not active:
