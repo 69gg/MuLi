@@ -40,6 +40,7 @@ scope 包含同一 commitment 的所有根队友和后代。`resolve_scope(sessi
 | `approve_plan(snapshot, observed_epoch, plan, targets, *, caller_session_id, max_targets)` | 真实 main、宿主已展示快照、当前 owner 意图及 epoch 校验；确认与目标 outbox 同事务 |
 | `pending_deliveries(limit, *, after_id=None)` | 按稳定 ID 有界分页；消费者可越过暂时满箱的目标，不能总从首项重试造成饥饿 |
 | `deliver(id, *, max_pending)` | 同步检查并投递一条计划通知；返回 DeliveryResult，不自行启动任务 |
+| `resume_notified_target(target_session_id)` | 只读核验同代次当前计划的真实通知；供 Runtime 在已判 paused 的完成边界决定是否立即排入新请求 |
 
 `OwnerControlRequest(action, expected_epoch, request_id, additional_requirements="")` 只支持 pause/request_replan，expected_epoch 不接受 bool。request_id 使用现有入站 ID 长度边界。pause 不能夹带修改要求；request_replan 可追加一条完整非空要求或空文本重新规划。
 
@@ -86,10 +87,14 @@ ControlResult 提供 receipt、current、created 和可选 ingress；`public()` 
 
 DeliveryResult 包含 state、session_id、changed、wake、ingress、message、path。path=archive 时有真实 message 存档；path=ingress 时有实际 ingress。重试已 delivered 的对象不再改 agent。宿主只在方法返回后依据 wake 调度，并区分“owner 请求已接收”“计划已确认”“通知已投递”“队友实际续办”，不能用 delivered 冒充已经执行。
 
+另一个顺序是：目标仍 running/queued 时通知已投递，旧请求随后才被 epoch 门禁判为 paused。outbox 此时已 delivered，不能依赖 pending flusher 再唤醒。`resume_notified_target` 从当前批准事实推导唯一通知 ID，复用相同代次/完成修订校验，并核实 ingress 的真实 source、principal、route=null 与受保护 task_control 引用。若通知已被 claim，还同时检查历史消息与 ingress 的 input_seq、message seq、run_id 关联；普通输入、已取消 ingress、缺失档案或旧 epoch 不能成为续办凭据。查询使用确定 ID，不扫描全部历史。
+
+正常调用位置是 **运行器已决定本代结果为 paused，而数据库 agent 仍为 running/queued、generation=gN、completion_revision=cR 时**。返回 True 后，宿主不得 await，立即复用一次 `_finish(..., requeue=True)`：在同一事务写 `team.finished(status=paused, completion_revision=cR+1)` 和 `agent(status=queued, completion_revision=cR+1)`。完整原生调用配对必须已在此前完成；下一次请求重新构造完整快照。这个 helper 只读，不递增修订、不建消息、不启动任务。它也能核验已持久停靠且唯一下一完成事件证明正确的状态，但正常完成路径不能先 finish 再二次 finish；已经 queued 的 cR+1 不会再次通过旧证明，避免重复续排。
+
 消费者由启动、控制确认、输入空间释放和团队实际状态事件驱动；使用 limit/after_id 有界遍历。无状态变化时等待事件，不轮询模型或持续重试。接线层须拥有关闭/取消消费者的生命周期，不能通过取消消费者传播取消 owner/队友任务。
 
 ## 本层验证与尚待集成
 
-`tests/test_task_control.py` 使用临时 SQLite 和故障注入验证：各写点完整回滚、真实 close/reopen、旧回执 CAS 顺序、控制说明保护、同 snapshot 约束与 epoch、主/子身份区别、活动/旧结构 DAG、满箱停靠、取消后同 generation 新意图拒绝、通知存档和排队的原子性、输出预算热缩与不泄漏正文。
+`tests/test_task_control.py` 使用临时 SQLite 和故障注入验证：各写点完整回滚、真实 close/reopen、旧回执 CAS 顺序、控制说明保护、同 snapshot 约束与 epoch、主/子身份区别、活动/旧结构 DAG、满箱停靠、取消后同 generation 新意图拒绝、通知存档和排队的原子性、claim 前后的唯一续办证明、实际来源/档案关联、外部 scope 与已完成目标拒绝、输出预算热缩与不泄漏正文。
 
 本层测试不调用真实模型或外部账号。模型流期间 pause、最后 await 后工具门禁、调用配对、Team wait/active/代次、DAG admission 竞争、API 认证和浏览器交互仍需 B 与服务端/前端集成验证。

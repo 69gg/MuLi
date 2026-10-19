@@ -645,6 +645,90 @@ class TaskControl:
         ).fetchone()
         return row is not None and row[0] == "paused" and row[1] == delivery["target_generation"]
 
+    def resume_notified_target(self, target_session_id: str) -> bool:
+        """Prove a delivered plan can resume this exact generation, without writing.
+
+        The host normally calls this with a paused outcome while the stored agent
+        is still running/queued, then immediately commits one paused completion
+        event plus a queued agent. No await may separate proof and that write.
+        A proven already-parked target is also readable; this method never adds a
+        completion revision or creates another message.
+        """
+        agent = self.store.get("agent", target_session_id)
+        if agent is None or agent.get("status") not in _DELIVERY_TARGETS:
+            return False
+        try:
+            scope = self.resolve_scope(target_session_id)
+            if scope is None:
+                return False
+            state = self._state(self.commitments.get(scope))
+            if (
+                state["epoch"] != state["approved_epoch"]
+                or not state["replan_request_id"]
+                or state["plan"] is None
+                or state["plan"]["epoch"] != state["epoch"]
+            ):
+                return False
+            receipt_id = self._receipt_id(scope, "main", state["replan_request_id"])
+            receipt = self.store.get("task_control_receipt", receipt_id)
+            delivery_id = _digest([receipt_id, target_session_id])
+            delivery = self.store.get("task_plan_delivery", delivery_id)
+            if (
+                receipt is None
+                or receipt.get("action") != "approve_plan"
+                or receipt.get("actor") != "main"
+                or receipt.get("commitment_id") != scope
+                or receipt.get("epoch") != state["epoch"]
+                or delivery is None
+                or delivery.get("state") != "delivered"
+                or delivery.get("path") != "ingress"
+                or delivery.get("target_session_id") != target_session_id
+                or delivery.get("commitment_id") != scope
+                or delivery.get("epoch") != state["epoch"]
+                or not self._same_delivery_target(delivery, agent)
+            ):
+                return False
+            row = self.store.db.execute(
+                "SELECT * FROM ingress WHERE id=? AND session_id=?",
+                (delivery.get("ingress_id"), target_session_id),
+            ).fetchone()
+            if row is None or row["state"] not in {"pending", "delivered"}:
+                return False
+            reference = {
+                "commitment_id": scope,
+                "epoch": state["epoch"],
+                "delivery_id": delivery_id,
+            }
+
+            def trusted(record: object) -> bool:
+                return (
+                    isinstance(record, dict)
+                    and record.get("id") == row["id"]
+                    and record.get("session_id") == target_session_id
+                    and record.get("source") == "task-control"
+                    and record.get("principal") == "system:task_control"
+                    and record.get("route") is None
+                    and record.get("task_control") == reference
+                )
+
+            if not trusted(json.loads(row["payload"])):
+                return False
+            if row["state"] == "pending":
+                return True
+            message = self.store.get("message", row["id"])
+            return (
+                message is not None
+                and trusted(message)
+                and message.get("role") == "user"
+                and message.get("delivery_status") == "delivered"
+                and message.get("input_seq") == row["seq"]
+                and message.get("seq") == row["delivered_seq"]
+                and message.get("run_id") == row["run_id"]
+            )
+        except (KeyError, ValueError):
+            # Corrupt/missing lineage or proof must never revive a parked agent.
+            return False
+
     def deliver(self, identifier: str, *, max_pending: int) -> DeliveryResult:
         _positive(max_pending, "入站容量")
         with self._transaction():
