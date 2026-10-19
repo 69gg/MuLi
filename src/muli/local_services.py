@@ -17,8 +17,13 @@ from muli.tools import Tool, parameters, string
 class LocalServices:
     def __init__(self, runtime: Runtime, attachments: Attachments) -> None:
         self.runtime, self.attachments = runtime, attachments
-        self.commitments = Commitments(runtime.store, runtime.bus)
-        runtime.add_tool_provider(self.tools)
+        self.commitments = Commitments(
+            runtime.store,
+            runtime.bus,
+            max_context_chars=lambda: runtime.config.settings.limits.max_context_chars,
+            max_output_chars=lambda: runtime.config.settings.limits.max_output_chars,
+        )
+        runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.context_hooks.append(self.context)
 
     def media(self) -> MediaService:
@@ -59,7 +64,13 @@ class LocalServices:
             except KeyError:
                 continue
             files.append({key: item[key] for key in ("id", "name", "mime_type", "size")})
-        additions = self.commitments.context()
+        agent = self.runtime.store.get("agent", session_id) or {}
+        commitment_id = agent.get("commitment_id")
+        additions = (
+            self.commitments.brief_context(commitment_id)
+            if commitment_id
+            else self.commitments.context()
+        )
         if files:
             import json
 
@@ -87,6 +98,22 @@ class LocalServices:
         return item, data
 
     def tools(self, runtime: Runtime) -> list[Tool]:
+        def is_main() -> bool:
+            identifier = runtime.tool_session_id
+            session = runtime.store.get("session", identifier) if identifier else None
+            return bool(
+                session
+                and session.get("kind") == "main"
+                and identifier == runtime.main_session()["id"]
+            )
+
+        def read_scope() -> str | None:
+            if is_main():
+                return None
+            identifier = runtime.tool_session_id
+            agent = runtime.store.get("agent", identifier) if identifier else None
+            return str(agent.get("commitment_id") or "") if agent else ""
+
         async def list_files(args: dict[str, Any]) -> Any:
             return self.attachments.list(limit=int(args.get("limit", 50)))
 
@@ -156,7 +183,9 @@ class LocalServices:
             return item
 
         return [
-            *self.commitments.tools(),
+            *self.commitments.tools(
+                allow_brief_write=is_main(), can_write_brief=is_main, read_scope=read_scope
+            ),
             Tool(
                 "attachment_list",
                 "列出本地附件元数据，不读取正文",

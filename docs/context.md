@@ -48,7 +48,13 @@ assistant 工具调用批次与其全部结果是不可分割单位，未闭合�
 
 `message_hooks` 是同步 `(message, trusted_owner) -> None` 列表，只在 `submit` 新信封持久成功后触发，重投不重复。适合短事务入队；不能在钩子中执行模型或慢操作。信任标记仅来自已认证的 `principal == 'owner'`，队友消息不是新的用户授权。钩子失败产生 `message.hook_failed`，不撤销已接收输入；后台消费者应按输入 ID 去重并用持久 ingress 补偿崩溃窗口。
 
-`add_tool_provider(factory, replace=False, coordinator=True)` 注册本机受信任工具，配置重载保留 factory。默认名称冲突拒绝；`replace=True` 显式覆盖，`coordinator=False` 不把写工具加入主助手可直接操作范围。扩展仍经过统一权限检查；带 `requires_approval=True` 的工具始终走 ask，即使当前为 yolo。用户自己的 Python 插件是 full-trust 本地代码，不是沙箱。
+`add_tool_provider(factory, replace=False, coordinator=True, session_scoped=False)` 注册本机受信任工具，配置重载保留 factory。默认名称冲突拒绝；`replace=True` 显式覆盖，`coordinator=False` 不把写工具加入主助手可直接操作范围。扩展仍经过统一权限检查；带 `requires_approval=True` 的工具始终走 ask，即使当前为 yolo。用户自己的 Python 插件是 full-trust 本地代码，不是沙箱。
+
+## 完整任务说明
+
+绑定队友的 task brief 以独立 system 资料参与最终预算，完整目标、限制和证据引用不经过摘要或头尾摘录；明确标注为协调资料，不能成为新的主人授权。必要说明与最新输入/原生回放放不下时清楚失败。每次上下文构建读取一个当前修订快照，等待模型并发额度期间不自动刷新，也不取消已有工具调用。主会话多任务时只保留账本索引，通过只读分页工具按需取正文，详见 [task-briefs.md](task-briefs.md)。
+
+显式开启 session_scoped 的本地工具 factory 会按实际执行 session 生成独立 schema，不改变共享注册表或覆盖后注册的插件替换。运行时在 handler 调用期间用 ContextVar 记录宿主 caller，并在正常、异常与取消路径恢复；派生任务继承的上下文不能替代其真实 session。正文写权限仍须在 handler 内检查，不能仅依赖 schema 隐藏字段。本机 Python 扩展保持 full-trust，不是沙箱。
 
 ## Codex 参考与差异
 

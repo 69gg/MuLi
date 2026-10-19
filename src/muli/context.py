@@ -143,7 +143,7 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
     _validate_pairs(packed)
     if _size(packed) > max_chars:
         raise ContextLimitError(
-            "最新用户输入、系统提示或当前轮原生协议数据超过上下文字符预算；"
+            "最新用户输入、完整任务说明、系统提示或当前轮原生协议数据超过上下文字符预算；"
             "已完成操作仍保留在会话中，请拆分任务或提高上限"
         )
     return packed

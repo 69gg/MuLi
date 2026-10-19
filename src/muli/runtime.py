@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -61,7 +62,9 @@ class Runtime:
         self.context_hooks: list[ContextHook] = []
         self.message_hooks: list[MessageHook] = []
         self.memory_context_provider: Callable[[str], str] | None = None
-        self._tool_providers: list[tuple[ToolProvider, bool, bool]] = []
+        self._tool_providers: list[tuple[ToolProvider, bool, bool, bool]] = []
+        self._tool_factories: dict[str, ToolProvider] = {}
+        self._tool_session: ContextVar[str | None] = ContextVar("muli_tool_session", default=None)
         self._coordinator_tools: set[str] = set()
         self._closing = False
         self._stopping: set[str] = set()
@@ -94,12 +97,32 @@ class Runtime:
         *,
         replace: bool = False,
         coordinator: bool = True,
+        session_scoped: bool = False,
     ) -> None:
         """Register trusted extensions; their factories survive reconfiguration."""
-        if any(registered is factory for registered, _, _ in self._tool_providers):
+        if any(registered is factory for registered, _, _, _ in self._tool_providers):
             return
         self._apply_tool_provider(factory, replace=replace, coordinator=coordinator)
-        self._tool_providers.append((factory, replace, coordinator))
+        self._tool_providers.append((factory, replace, coordinator, session_scoped))
+
+    @property
+    def tool_session_id(self) -> str | None:
+        """Host caller context; model arguments cannot select this identity."""
+        return self._tool_session.get()
+
+    def session_tools(self, session_id: str) -> dict[str, Tool]:
+        """Build explicitly opted-in schemas without mutating the shared registry."""
+        tools = dict(self.tools)
+        token = self._tool_session.set(session_id)
+        try:
+            for factory, _, _, session_scoped in self._tool_providers:
+                if session_scoped:
+                    for tool in factory(self):
+                        if self._tool_factories.get(tool.name) is factory:
+                            tools[tool.name] = tool
+        finally:
+            self._tool_session.reset(token)
+        return tools
 
     def _apply_tool_provider(
         self, factory: ToolProvider, *, replace: bool, coordinator: bool
@@ -112,6 +135,7 @@ class Runtime:
             raise ValueError("扩展工具名称冲突")
         for tool in additions:
             self.tools[tool.name] = tool
+            self._tool_factories[tool.name] = factory
             if coordinator:
                 self._coordinator_tools.add(tool.name)
             else:
@@ -422,7 +446,8 @@ class Runtime:
             ]
         }
         self._coordinator_tools.clear()
-        for factory, can_replace, coordinator in self._tool_providers:
+        self._tool_factories.clear()
+        for factory, can_replace, coordinator, _ in self._tool_providers:
             self._apply_tool_provider(factory, replace=can_replace, coordinator=coordinator)
 
     def model_config(self, role: str) -> ModelConfig:
@@ -832,7 +857,7 @@ class Runtime:
         self._repair_tail(session_id)
         await self._claim_inputs(session_id, run_id)
         messages = await self._next_context(session_id)
-        tools = dict(self.tools)
+        tools = self.session_tools(session_id)
         session = self.store.get("session", session_id) or {}
         if session.get("kind") == "main":
             tools = {
@@ -980,7 +1005,11 @@ class Runtime:
                 {"call_id": call.id, "name": call.name, "arguments": arguments},
                 session_id,
             )
-            result = await tool.handler(arguments)
+            token = self._tool_session.set(session_id)
+            try:
+                result = await tool.handler(arguments)
+            finally:
+                self._tool_session.reset(token)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
