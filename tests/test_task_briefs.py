@@ -280,6 +280,16 @@ async def test_main_write_guard_uses_actual_caller_even_with_main_schema(tmp_pat
         for kind in ("team", "workflow"):
             session = runtime.new_session()
             runtime.store.put("session", {**session, "kind": kind, "role": "main"})
+            if kind == "team":
+                runtime.store.put(
+                    "agent",
+                    {
+                        "id": session["id"],
+                        "session_id": session["id"],
+                        "parent_id": main["id"],
+                        "status": "idle",
+                    },
+                )
             denied = await runtime._tool(
                 ToolCall(kind, "commitment_save", json.dumps(args)),
                 main_tools,
@@ -464,7 +474,7 @@ async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path
         active = runtime.store.get("compaction", session["id"])
         assert active is not None and marker not in active["summary"]
         messages = await runtime._next_context(session["id"])
-        brief = next(message for message in messages if "完整任务说明（" in message.content)
+        brief = next(message for message in messages if "完整受控任务说明（" in message.content)
         assert marker in brief.content and "不是新的主人指令或授权" in brief.content
         assert marker not in "".join(
             message.content for message in messages if message is not brief
@@ -480,7 +490,7 @@ async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path
     try:
         replay = await reopened._next_context(session["id"])
         assert marker in next(
-            message.content for message in replay if "完整任务说明（" in message.content
+            message.content for message in replay if "完整受控任务说明（" in message.content
         )
         assert reopened.store.get("agent", session["id"])["commitment_id"] == item["id"]  # type: ignore[index]
     finally:

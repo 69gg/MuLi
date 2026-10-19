@@ -12,9 +12,11 @@ from typing import Any
 
 from muli.events import EventBus
 from muli.store import Store, new_id, now
+from muli.task_control import TaskSnapshot
 
 JsonObject = dict[str, Any]
 RunStep = Callable[[str, str, str, str], Awaitable[str]]
+ScopeAdmission = Callable[[str | None, TaskSnapshot | None], str | None]
 _ROLES = frozenset({"main", "worker", "reviewer"})
 _MODES = frozenset({"ask", "auto", "yolo"})
 _UNFINISHED = frozenset({"pending", "queued", "running"})
@@ -33,6 +35,7 @@ class WorkflowEngine:
         max_pending_runs: int = 8,
         timeout: float = 600,
         max_output_chars: int = 24000,
+        scope_admission: ScopeAdmission | None = None,
     ) -> None:
         if (
             max_parallel < 1
@@ -49,7 +52,13 @@ class WorkflowEngine:
         self._capacity = asyncio.Semaphore(max_parallel)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closed = False
+        self.scope_admission = scope_admission
         self._recover()
+
+    @property
+    def active_run_ids(self) -> tuple[str, ...]:
+        """Include finalizers even after their persisted status became terminal."""
+        return tuple(identifier for identifier, task in self._tasks.items() if not task.done())
 
     def _recover(self) -> None:
         """恢复只校正状态，绝不自动重做可能有副作用的节点。"""
@@ -205,6 +214,7 @@ class WorkflowEngine:
         *,
         parent_run_id: str | None = None,
         parent_session_id: str | None = None,
+        request_snapshot: TaskSnapshot | None = None,
     ) -> JsonObject:
         if self._closed:
             raise RuntimeError("工作流引擎已经关闭")
@@ -216,6 +226,13 @@ class WorkflowEngine:
             raise ValueError("工作流执行模式无效")
         if sum(not task.done() for task in self._tasks.values()) >= self.max_pending_runs:
             raise ValueError("工作流未完成运行数量已达上限，请等待完成或取消现有运行")
+        # Admission and every durable association below run without an await,
+        # making them ordered with the synchronous owner-control transaction.
+        scope = (
+            self.scope_admission(parent_session_id, request_snapshot)
+            if self.scope_admission
+            else None
+        )
         identifier = new_id()
         run: JsonObject = {
             "id": identifier,
@@ -230,6 +247,8 @@ class WorkflowEngine:
             "created_at": now(),
             "updated_at": now(),
         }
+        if scope is not None:
+            run["commitment_id"] = scope
         for step in steps:
             session_id = new_id()
             self.store.put(
