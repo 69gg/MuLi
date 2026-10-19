@@ -241,7 +241,8 @@ class Runtime:
             if principal == "owner" and not active and receipt["state"] == "pending":
                 session["mode"] = selected
                 self.store.put("session", session)
-                self._launch(session, "main", cast(Mode, selected))
+                if session["id"] not in self._stopping:
+                    self._launch(session, "main", cast(Mode, selected))
             run_id = receipt.get("run_id")
             if principal == "owner" and receipt["state"] == "pending":
                 run_id = self.run_ids.get(session["id"])
@@ -589,7 +590,10 @@ class Runtime:
                 async with self.team.stopping_children(session_id):
                     await self._stop(session_id, cancel_pending=cancel_pending)
         finally:
-            self._wake_main()
+            try:
+                await self.team.flush_reports()
+            finally:
+                self._wake_main()
         if pending:
             # An offline queue has no active run to emit run.cancelled. Consumers
             # waiting for ingress capacity still need one deterministic wakeup.
