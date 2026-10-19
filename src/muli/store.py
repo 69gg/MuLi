@@ -215,6 +215,35 @@ class Store:
         ).fetchall()
         return [{**json.loads(row["data"]), "seq": row["seq"]} for row in reversed(rows)]
 
+    def message_previews(
+        self, session_id: str, *, limit: int = 5, max_chars: int = 1000
+    ) -> builtins.list[dict[str, Any]]:
+        """Project small display records in SQL, without loading native blocks or images."""
+        max_chars = max(0, max_chars)
+        rows = self.db.execute(
+            "SELECT o.id,m.seq,json_extract(o.data,'$.role') AS role,"
+            "json_extract(o.data,'$.created_at') AS created_at,"
+            "substr(CAST(json_extract(o.data,'$.content') AS BLOB),1,?) AS preview,"
+            "length(CAST(json_extract(o.data,'$.content') AS BLOB)) AS content_bytes "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? ORDER BY m.seq DESC LIMIT ?",
+            (max_chars * 4 + 1, session_id, max(0, limit)),
+        ).fetchall()
+        result: builtins.list[dict[str, Any]] = []
+        for row in reversed(rows):
+            # UTF-8 needs at most four bytes per code point. Ignore only an
+            # incomplete final code point; BLOB slicing also preserves embedded NUL.
+            raw = bytes(row["preview"] or b"")
+            text = raw.decode("utf-8", errors="ignore")
+            result.append(
+                {
+                    **{key: row[key] for key in ("id", "seq", "role", "created_at")},
+                    "content": text[:max_chars],
+                    "truncated": row["content_bytes"] > len(raw) or len(text) > max_chars,
+                }
+            )
+        return result
+
     def message_prefix(
         self,
         session_id: str,

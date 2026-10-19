@@ -9,10 +9,10 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import unquote
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -377,15 +377,28 @@ def create_app(
         }
 
     @app.get("/api/team")
-    async def team() -> dict[str, Any]:
-        members = runtime.team.list()
+    async def team(
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        active_only: bool = False,
+    ) -> dict[str, Any]:
+        page = runtime.team.page(limit=limit, offset=offset, active_only=active_only)
+        members = page["members"]
         messages: list[dict[str, Any]] = []
         for member in members:
-            history = runtime.store.messages(member["session_id"])
+            history = runtime.store.message_previews(member["session_id"])
             if history:
-                member["last_message"] = history[-1]["content"][:1000]
-            messages.extend({**item, "agent_id": member["id"]} for item in history[-5:])
-        return {"members": members, "messages": messages[-100:]}
+                member["last_message"] = history[-1]["content"]
+                member["last_message_truncated"] = history[-1]["truncated"]
+            for item in history:
+                messages.append(
+                    {
+                        **item,
+                        "agent_id": member["id"],
+                        "from_name": member["name"],
+                    }
+                )
+        return {**page, "messages": sorted(messages, key=lambda item: item["seq"])[-100:]}
 
     @app.post("/api/team/{identifier}/messages")
     async def team_message(identifier: str, body: TeamMessageInput) -> dict[str, Any]:
