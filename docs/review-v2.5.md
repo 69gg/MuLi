@@ -1,6 +1,6 @@
 # 2.5 原生电脑后端审查
 
-状态：本地集成、离线发行安装与独立复审通过，等待远端矩阵和实际发布核验。本页的本地结果不等同于已发布。
+状态：本地集成、离线发行安装与独立复审通过；首轮远端矩阵发现 Windows 测试标识兼容问题，已修复，需重新核验矩阵与实际发布。本页的本地结果不等同于已发布。
 
 本轮为 macOS AX 增加按需原生 helper，持有真实 AXUIElementRef；Linux 继续单次 AT-SPI，不引入新的第三方依赖。进程协议、CF/AX 原生接口、运行器接线分别实现，再由独立 reviewer 审查资源回收、身份与错误语义。
 
@@ -23,3 +23,11 @@
 独立复审已放行，没有剩余确定阻塞项。最终 wheel/sdist 在离线模式构建并完成临时安装，验证 CLI 版本、资源、接口文档、提示词、AX 模块、电脑默认配置、任务控制和服务生命周期。待验证：远端跨平台矩阵及 PyPI/GitHub 发行物。取消仍会传递给运行器，未返回工具结果的尾部保守落盘为 unknown；本轮不保证取消期间保存每一份刚收到的原生回执，也不自动重试。
 
 未验证：真实 macOS TCC 的终端/LaunchAgent/解释器归属、真实窗口及原生动作、Intel/Apple Silicon 外部应用对象的行为、任意应用保护声明的可靠性。不会在开发机采集屏幕、点击桌面、安装 SDK 或下载模型来替代受控验收。
+
+## 首轮跨平台 CI 与 Windows 修复
+
+[PR #8 的 CI 39315129745](https://github.com/69gg/MuLi/actions/runs/39315129745) 对应精确提交 `af106d8e26cf2b1adc08252e1f6a080b52f4efe7`。quality、mcp、Ubuntu 3.12/3.13 和 macOS 3.12/3.13 六项成功。Windows 3.12/3.13 都完成但失败；分别为 1189 passed、34 skipped、2 errors，耗时 215.63 秒和 372.82 秒，不能记为八项全绿。
+
+两个错误都来自同一超长帧用例的 setup/teardown：pytest 将 65536 个 `x` 加换行的参数自动展开进 node ID，随后写入 `PYTEST_CURRENT_TEST`，超过 Windows 的 32767 字符环境变量上限。日志报 `ValueError: the environment variable is longer than 32767 characters`；该用例尚未进入 helper 断言，不是 AX 调用超时。
+
+修复仅为这个参数设置 `oversized-frame` 显式标识，实际 65537 字节输入和原先协议拒绝断言全部保留。收集级反证在修复前测得最长 `PYTEST_CURRENT_TEST` 为 65636 字符，修复后为 131 字符，仍完整收集全部 11 个输入。正式 native helper、真实协议桥接及假 CF/native 桥接共 90 项通过、1 项既有 macOS 系统 CF 冒烟在 Linux 跳过（0.95 秒）；Ruff、格式与 diff 检查通过。没有增大超时、新增跳过或改变产品代码。Windows 的最终结果仍须以修复提交的新 CI 为准。
