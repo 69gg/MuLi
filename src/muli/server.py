@@ -392,6 +392,10 @@ def create_app(
     async def commitments(status: str = "active") -> dict[str, Any]:
         return {"items": local_services.commitments.list(status)}
 
+    @app.get("/api/commitments/{identifier}")
+    async def commitment_detail(identifier: str) -> dict[str, Any]:
+        return local_services.commitments.get(identifier)
+
     @app.post("/api/uploads")
     async def upload(request: Request) -> dict[str, Any]:
         filename = unquote(request.headers.get("x-file-name", ""), errors="strict")

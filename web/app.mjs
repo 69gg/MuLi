@@ -68,6 +68,7 @@ let queuedRender = false;
 let messageNodes = new Map();
 let toolNodes = new Map();
 let dialogSubmit = null;
+let dialogTeamView = null;
 const teamPager = createTeamPager(request);
 let draftRevision = 0;
 const voiceInput = new VoiceInput({
@@ -117,6 +118,8 @@ async function request(path, options) {
 
 function showLogin() {
   voiceInput.cancel();
+  dialogTeamView = null;
+  $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
   state.connected = false; state.auth.authenticated = false;
   $(".app-shell").inert = true; $("#auth-gate").hidden = false;
@@ -544,13 +547,17 @@ function resizeComposer() {
   const input = $("#message-input"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 220)}px`; renderComposer();
 }
 
-function openDialog({ title, content, submitLabel = "保存", danger = false, onSubmit }) {
+function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, onSubmit }) {
+  const teamView = captureTeamView($("#other-view"));
+  dialogTeamView = teamView?.inside ? teamView : null;
   $("#dialog-title").textContent = title;
   $("#dialog-content").replaceChildren(content);
   $("#dialog-submit").textContent = submitLabel;
   $("#dialog-submit").className = danger ? "danger-button" : "primary-button";
   $("#dialog-error").hidden = true;
   $("#dialog-submit").disabled = false;
+  $("#dialog-submit").hidden = readOnly;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = readOnly ? "关闭" : "取消";
   dialogSubmit = onSubmit;
   $("#app-dialog").showModal();
   const input = $('input:not([type="checkbox"]), textarea, select', $("#dialog-content"));
@@ -705,6 +712,29 @@ async function refreshTeam(changes = {}) {
   } catch (error) { showError(error); }
 }
 
+async function showTaskBrief(identifier) {
+  const content = element("div", { class: "task-brief" }, element("p", { text: "正在读取…", role: "status" }));
+  openDialog({ title: "任务说明", content, readOnly: true, onSubmit: async () => {} });
+  const current = () => $("#app-dialog").open && $("#dialog-content").firstElementChild === content;
+  try {
+    const item = await request(`/commitments/${encodeURIComponent(identifier)}`);
+    if (!current()) return;
+    const brief = item.brief;
+    $("#dialog-title").textContent = item.title || "任务说明";
+    content.replaceChildren(element("small", { text: `修订 ${item.revision}` }));
+    if (!brief) { content.append(element("p", { text: "尚未登记任务说明。" })); return; }
+    content.append(element("h3", { text: "目标" }), element("p", { text: brief.goal }));
+    if (brief.constraints?.length) content.append(element("h3", { text: "要求" }), element("ul", {}, brief.constraints.map((text) => element("li", { text }))));
+    if (brief.evidence_refs?.length) {
+      const evidence = element("details", { class: "advanced-settings" }, element("summary", { text: "依据" }));
+      for (const reference of brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
+      content.append(evidence);
+    }
+  } catch (error) {
+    if (current()) content.replaceChildren(element("p", { class: "form-error", role: "alert", text: error.message }));
+  }
+}
+
 function renderTeam() {
   const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")));
   root.append(actionButton("与沐璃安排协作", "configure-prompt", "configuration-link", "chat", { prompt: "请帮我安排一组协作任务：" }));
@@ -723,7 +753,7 @@ function renderTeam() {
   for (const member of members) {
     const content = element("div", { class: "row-content" }, element("h3", { text: member.name || member.id }), member.task && element("p", { text: member.task }), element("div", { class: "row-meta", text: [roles[member.role] ?? member.role, status[member.status] ?? member.status].filter(Boolean).join(" · ") }));
     if (member.last_message) content.append(element("p", { class: "team-last-message", text: (typeof member.last_message === "string" ? member.last_message : member.last_message.content ?? "") + (member.last_message_truncated ? "…" : "") }));
-    root.append(element("article", { class: "team-row" }, element("div", { class: "row-icon" }, icon("team")), content, element("div", { class: "row-actions" }, member.status !== "closed" && iconButton("发送消息", "message-team", "chat", { id: member.id }), member.session_id && iconButton("查看记录", "workflow-session", "panel", { session: member.session_id }), ["running", "queued", "approval"].includes(member.status) && iconButton("停止任务", "stop-team", "stop", { id: member.id }))));
+    root.append(element("article", { class: "team-row" }, element("div", { class: "row-icon" }, icon("team")), content, element("div", { class: "row-actions" }, member.commitment_id && iconButton("查看任务说明", "view-task-brief", "info", { id: member.id, commitment: member.commitment_id }), member.status !== "closed" && iconButton("发送消息", "message-team", "chat", { id: member.id }), member.session_id && iconButton("查看记录", "workflow-session", "panel", { session: member.session_id }), ["running", "queued", "approval"].includes(member.status) && iconButton("停止任务", "stop-team", "stop", { id: member.id }))));
   }
   if ((state.team.total ?? 0) > state.team.limit) {
     const previous = actionButton("上一页", "page-team", "secondary-button", null, { offset: Math.max(0, state.team.offset - state.team.limit), direction: "previous" });
@@ -1399,6 +1429,7 @@ async function handleAction(action, button) {
   }
   if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
   if (action === "refresh-team") await refreshTeam();
+  if (action === "view-task-brief") await showTaskBrief(button.dataset.commitment);
   if (action === "filter-team") await refreshTeam({ offset: 0, activeOnly: button.dataset.active === "true" });
   if (action === "page-team") await refreshTeam({ offset: Number(button.dataset.offset) });
   if (action === "message-team") {
@@ -1517,6 +1548,11 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   try { await dialogSubmit?.(event.target); $("#app-dialog").close(); }
   catch (error) { $("#dialog-error").textContent = error.message ?? String(error); $("#dialog-error").hidden = false; }
   finally { submit.disabled = false; }
+});
+$("#app-dialog").addEventListener("close", () => {
+  if ($("#app-dialog").open) return;
+  const saved = dialogTeamView; dialogTeamView = null;
+  if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
 });
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); if (!$("#app-dialog").open) void switchView("chat"); }

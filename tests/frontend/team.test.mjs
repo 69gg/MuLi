@@ -102,3 +102,15 @@ test("record action focus belongs to its session rather than the first teammate"
   assert.equal(first.focused, false);
   assert.equal(second.focused, true);
 });
+
+test("a replaced task brief trigger returns to the same teammate sharing that brief", () => {
+  const saved = captureTeamView(surface(control('view-task-brief', { id: 'second', commitment: 'shared' })));
+  const first = control('view-task-brief', { id: 'first', commitment: 'shared' });
+  const second = control('view-task-brief', { id: 'second', commitment: 'shared' });
+  const root = surface(null, [first, second]);
+  restoreTeamView(root, saved);
+  assert.equal(first.focused, false);
+  assert.equal(second.focused, true);
+  restoreTeamView(surface(null, [first]), saved);
+  assert.equal(first.focused, false);
+});

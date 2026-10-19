@@ -484,6 +484,9 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .team-last-message { border-left: 2px solid var(--line); padding-left: 11px; margin-top: 12px !important; }
 .team-message { font-size: 11px; line-height: 1.8; padding: 15px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
 .team-message p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-brief h3 { color: var(--text); font-size: 13px; font-weight: 500; margin: 20px 0 8px; }
+.task-brief p, .task-brief li { white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-brief ul { padding-left: 20px; }
 .upload-row { padding: 24px 0; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .upload-row > .text-button { flex-shrink: 0; }
 .record-row .row-content h3 { margin-top: 0; }

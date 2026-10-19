@@ -160,6 +160,7 @@ class TeamManager:
         parent_id: str | None = None,
         role: str = "worker",
         mode: Mode | None = None,
+        commitment_id: str | None = None,
     ) -> dict[str, Any]:
         self._admit()
         if not name.strip() or len(name) > 120 or role not in {"worker", "reviewer"}:
@@ -168,6 +169,18 @@ class TeamManager:
         parent = self.runtime.store.get("session", parent_id)
         if parent is None:
             raise ValueError("父会话不存在")
+        parent_agent = self.runtime.store.get("agent", parent_id)
+        inherited = parent_agent.get("commitment_id") if parent_agent else None
+        if parent_agent is not None:
+            if commitment_id is not None and commitment_id != inherited:
+                raise ValueError("子队友必须继承父任务说明，不能换绑")
+            commitment_id = inherited
+        elif commitment_id is not None and parent_id != self.runtime.main_session()["id"]:
+            raise ValueError("只有主会话可为新团队选择任务说明")
+        if commitment_id is not None:
+            commitment = self.runtime.store.get("commitment", commitment_id)
+            if commitment is None or not isinstance(commitment.get("brief"), dict):
+                raise ValueError("任务说明不存在或工作账本尚无完整任务说明")
         selected = cast(Mode, parent["mode"])
         if mode is not None and mode != selected:
             raise ValueError("队友必须继承父会话权限模式")
@@ -200,6 +213,8 @@ class TeamManager:
             "generation": 0,
             "completion_revision": 0,
         }
+        if commitment_id is not None:
+            agent["commitment_id"] = commitment_id
         text = self._message(parent_id, prompt)
         self.runtime.conversation.enqueue(
             session_id,
@@ -496,6 +511,7 @@ class TeamManager:
                 parent_id=caller,
                 role=args.get("role", "worker"),
                 mode=mode,
+                commitment_id=args.get("commitment_id"),
             )
 
         async def send(args: dict[str, Any]) -> Any:
@@ -537,6 +553,9 @@ class TeamManager:
                         "task_name": string(),
                         "prompt": string(),
                         "role": {"type": "string", "enum": ["worker", "reviewer"]},
+                        "commitment_id": string(
+                            "主会话为新树选择有完整任务说明的账本；子孙继承，不能换绑"
+                        ),
                     },
                     ("task_name", "prompt"),
                 ),
