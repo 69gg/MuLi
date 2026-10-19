@@ -136,6 +136,8 @@ class Message:
     reasoning: str = ""
     provider_data: JsonObject = field(default_factory=dict)
     images: list[ImageInput] = field(default_factory=list)
+    # Host metadata only. Provider codecs deliberately serialize explicit fields.
+    preserve_content: bool = False
 
 
 @dataclass(slots=True)
