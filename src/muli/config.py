@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import math
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Section(BaseModel):
@@ -159,6 +160,9 @@ class ModelProfile(Section):
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     reasoning: dict[str, Any] = Field(default_factory=dict)
+    thinking: dict[str, Any] = Field(default_factory=dict)
+    reasoning_effort: str | None = None
+    vision: bool = False
     extra_body: dict[str, Any] = Field(default_factory=dict)
     extra_headers: dict[str, str] = Field(default_factory=dict)
 
@@ -174,17 +178,116 @@ class Models(Section):
     main: ModelProfile = Field(default_factory=ModelProfile)
     reviewer: ModelProfile = Field(default_factory=ModelProfile)
     worker: ModelProfile = Field(default_factory=ModelProfile)
+    vision: ModelProfile = Field(default_factory=ModelProfile)
+    compactor: ModelProfile = Field(default_factory=ModelProfile)
+    memory_extractor: ModelProfile = Field(default_factory=ModelProfile)
+
+
+class HTTPServiceProfile(Section):
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    api_key_env: str = ""
+    timeout: float = Field(default=60, gt=0, le=600)
+    max_input_bytes: int = Field(default=20_000_000, ge=1024)
+    max_response_bytes: int = Field(default=8_388_608, ge=1024)
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    dimensions: int | None = Field(default=None, ge=1)
+    query_instruction: str = ""
+    language: str = ""
+    voice: str = ""
+    response_format: str = "mp3"
+    speed: float | None = Field(default=None, ge=0.25, le=4)
+    instructions: str = ""
+
+    def key(self) -> str:
+        return os.environ.get(self.api_key_env, "") if self.api_key_env else self.api_key
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.model and self.base_url)
+
+
+class MediaSettings(Section):
+    embedding: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
+    reranker: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
+    asr: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
+    tts: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
+
+
+class Persona(Section):
+    user_name: str = Field(default="你", min_length=1, max_length=120)
+    name: str = Field(default="沐璃", min_length=1, max_length=120)
+    introduction: str = Field(default="", max_length=4000)
+    prompt: str = Field(default="", max_length=64000)
+    append: str = Field(default="", max_length=32000)
+
+
+class CompactionSettings(Section):
+    enabled: bool = True
+    mode: Literal["auto", "extractive"] = "auto"
+    trigger_ratio: float = Field(default=0.75, gt=0.2, lt=1)
+    target_ratio: float = Field(default=0.4, gt=0.1, lt=0.8)
+    max_summary_tokens: int = Field(default=1600, ge=128)
+
+    @model_validator(mode="after")
+    def valid_ratios(self) -> CompactionSettings:
+        if self.target_ratio >= self.trigger_ratio:
+            raise ValueError("压缩目标比例必须小于触发比例")
+        return self
+
+
+class UploadSettings(Section):
+    max_file_bytes: int = Field(default=32 * 1024 * 1024, ge=1024)
+    max_total_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+    max_concurrent: int = Field(default=2, ge=1)
+
+
+class MemorySettings(Section):
+    enabled: bool = True
+    auto_extract: bool = True
+    max_pending_jobs: int = Field(default=128, ge=1)
+    max_attempts: int = Field(default=3, ge=1)
+    retry_backoff_seconds: float = Field(default=5, ge=0)
+    job_timeout: float = Field(default=60, gt=0)
+    max_source_chars: int = Field(default=64000, ge=1000)
+    max_facts_per_source: int = Field(default=16, ge=1)
+    graph_hops: int = Field(default=2, ge=0, le=8)
+    max_graph_edges: int = Field(default=256, ge=1)
+    max_candidates: int = Field(default=256, ge=1)
+    max_vector_scan: int = Field(default=512, ge=1)
+    max_community_members: int = Field(default=32, ge=2)
+    context_max_chars: int = Field(default=6000, ge=0)
+    context_limit: int = Field(default=6, ge=1)
+    query_timeout: float = Field(default=5, gt=0)
+    cache_entries: int = Field(default=64, ge=1)
+
+
+class PluginSettings(Section):
+    enabled: bool = True
+    disabled: list[str] = Field(default_factory=list)
+    max_source_bytes: int = Field(default=256 * 1024, ge=1024)
+    hook_timeout: float = Field(default=10, gt=0, le=120)
+
+
+class UpdateSettings(Section):
+    check_on_start: bool = True
+    metadata_url: str = "https://pypi.org/pypi/muli-agent/json"
+    repository: str = "https://github.com/69gg/MuLi.git"
+    timeout: float = Field(default=8, gt=0, le=30)
+    max_metadata_bytes: int = Field(default=256 * 1024, ge=1024)
 
 
 class Limits(Section):
-    max_parallel_agents: int = Field(default=2, ge=1, le=4)
-    max_pending_runs: int = Field(default=8, ge=1, le=128)
+    max_parallel_agents: int = Field(default=2, ge=1)
+    max_pending_runs: int = Field(default=8, ge=1)
     max_tool_steps: int = Field(default=16, ge=1, le=100)
     max_run_seconds: int = Field(default=600, ge=10, le=7200)
     max_file_bytes: int = Field(default=2_000_000, ge=1024, le=20_000_000)
     max_output_chars: int = Field(default=24000, ge=1000, le=100000)
     max_context_chars: int = Field(default=96000, ge=4000, le=1000000)
-    max_workflow_steps: int = Field(default=12, ge=1, le=32)
+    max_workflow_steps: int = Field(default=12, ge=1)
     approval_timeout: int = Field(default=600, ge=10, le=86400)
     max_search_entries: int = Field(default=2000, ge=1, le=20000)
     max_search_results: int = Field(default=100, ge=1, le=1000)
@@ -200,11 +303,91 @@ class Search(Section):
     max_results: int = Field(default=5, ge=1, le=20)
 
 
+class CaptureSettings(Section):
+    enabled: bool = False
+    backend: str = "auto"
+    device: str = ""
+    max_seconds: int = Field(default=30, ge=1, le=300)
+    fps: int = Field(default=8, ge=1, le=30)
+    max_file_bytes: int = Field(default=32 * 1024 * 1024, ge=1024)
+    max_total_bytes: int = Field(default=200 * 1024 * 1024, ge=1024)
+
+
+class VoiceSettings(Section):
+    enabled: bool = False
+    wake_word: str = "沐璃"
+    device: Literal["auto", "cpu", "rocm", "cuda"] = "auto"
+    input_device: str = ""
+    sample_rate: int = Field(default=16000, ge=8000, le=48000)
+    chunk_seconds: float = Field(default=2, gt=0, le=10)
+    max_utterance_seconds: int = Field(default=15, ge=1, le=120)
+    cooldown_seconds: float = Field(default=3, ge=0)
+    max_file_bytes: int = Field(default=2_000_000, ge=1024)
+    max_total_bytes: int = Field(default=20_000_000, ge=1024)
+    wake_command: list[str] = Field(default_factory=list)
+    wake_threshold: float = Field(default=0.6, ge=0, le=1)
+    speaker_command: list[str] = Field(default_factory=list)
+    speaker_threshold: float = Field(default=0.75, ge=0, le=1)
+    tts_enabled: bool = False
+
+
+class ChannelProfile(Section):
+    enabled: bool = False
+    base_url: str = ""
+    token: str = ""
+    token_env: str = ""
+    webhook_secret: str = ""
+    webhook_secret_env: str = ""
+    owner_ids: list[str] = Field(default_factory=list)
+    allowed_groups: list[str] = Field(default_factory=list)
+    receive_files: bool = False
+    max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1024)
+    timeout: float = Field(default=45, gt=0, le=180)
+    poll_timeout: float = Field(default=30, gt=0, le=120)
+    max_message_chars: int = Field(default=4000, ge=1, le=64000)
+    app_id: str = ""
+    client_secret: str = ""
+    client_secret_env: str = ""
+    token_url: str = ""
+    account_id: str = ""
+    user_id: str = ""
+    cdn_base_url: str = ""
+
+    def secret(self, name: str) -> str:
+        if name not in {"token", "webhook_secret", "client_secret"}:
+            raise ValueError("未知渠道密钥字段")
+        env = str(getattr(self, f"{name}_env"))
+        return os.environ.get(env, "") if env else str(getattr(self, name))
+
+
+class ChannelSettings(Section):
+    onebot: ChannelProfile = Field(default_factory=ChannelProfile)
+    telegram: ChannelProfile = Field(
+        default_factory=lambda: ChannelProfile(base_url="https://api.telegram.org")
+    )
+    qq: ChannelProfile = Field(
+        default_factory=lambda: ChannelProfile(
+            base_url="https://api.bot.qq.com",
+            token_url="https://api.bot.qq.com/app/getAppAccessToken",
+        )
+    )
+    weixin: ChannelProfile = Field(
+        default_factory=lambda: ChannelProfile(
+            base_url="https://ilinkai.weixin.qq.com",
+            cdn_base_url="https://novac2c.cdn.weixin.qq.com/c2c",
+        )
+    )
+    max_pending_deliveries: int = Field(default=64, ge=1)
+    max_attempts: int = Field(default=3, ge=1)
+    retry_backoff_seconds: float = Field(default=5, ge=0)
+
+
 class Computer(Section):
     enabled: bool = False
     backend: Literal["atspi"] = "atspi"
     python_path: str = "/usr/bin/python3"
     max_nodes: int = Field(default=300, ge=10, le=1000)
+    capture: CaptureSettings = Field(default_factory=CaptureSettings)
 
 
 class Chiliarch(Section):
@@ -227,21 +410,42 @@ class DesktopNotifications(Section):
 class Server(Section):
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1024, le=65535)
+    password_hash: str = ""
+    allowed_hosts: list[str] = Field(default_factory=list)
+    secure_cookie: bool = False
+    session_ttl_seconds: int = Field(default=86400, ge=60, le=31_536_000)
 
     @field_validator("host")
     @classmethod
-    def local_only(cls, value: str) -> str:
-        if value not in {"127.0.0.1", "::1", "localhost"}:
-            raise ValueError("管理服务仅绑定本机回环地址")
+    def valid_host(cls, value: str) -> str:
+        if value != "localhost":
+            ipaddress.ip_address(value)
         return value
+
+    @model_validator(mode="after")
+    def require_authentication(self) -> Server:
+        if self.host != "localhost" and not ipaddress.ip_address(self.host).is_loopback:
+            if not self.password_hash:
+                raise ValueError("非回环监听地址必须配置访问密码")
+        return self
 
 
 class Settings(Section):
     models: Models = Field(default_factory=Models)
+    media: MediaSettings = Field(default_factory=MediaSettings)
+    persona: Persona = Field(default_factory=Persona)
+    compaction: CompactionSettings = Field(default_factory=CompactionSettings)
+    uploads: UploadSettings = Field(default_factory=UploadSettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
+    plugins: PluginSettings = Field(default_factory=PluginSettings)
+    updates: UpdateSettings = Field(default_factory=UpdateSettings)
+    onboarding_pending: bool = False
     default_mode: Literal["ask", "auto", "yolo"] = "auto"
     workspace_roots: list[str] = Field(default_factory=lambda: [str(Path.home())])
     search: Search = Field(default_factory=Search)
     computer: Computer = Field(default_factory=Computer)
+    voice: VoiceSettings = Field(default_factory=VoiceSettings)
+    channels: ChannelSettings = Field(default_factory=ChannelSettings)
     chiliarch: Chiliarch = Field(default_factory=Chiliarch)
     notifications: DesktopNotifications = Field(default_factory=DesktopNotifications)
     limits: Limits = Field(default_factory=Limits)
@@ -263,12 +467,15 @@ class Settings(Section):
 
 
 def default_data_dir() -> Path:
-    return Path(os.environ.get("MULI_DATA_DIR", Path.home() / ".local/share/muli")).expanduser()
+    return Path(os.environ.get("MULI_DATA_DIR", default_home() / "data")).expanduser()
+
+
+def default_home() -> Path:
+    return Path(os.environ.get("MULI_HOME", Path.home() / "MuLi")).expanduser()
 
 
 def default_config_path() -> Path:
-    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return Path(os.environ.get("MULI_CONFIG", base / "muli/config.json")).expanduser()
+    return Path(os.environ.get("MULI_CONFIG", default_home() / "config.json")).expanduser()
 
 
 class ConfigFile:
@@ -282,20 +489,48 @@ class ConfigFile:
 
     def public(self) -> dict[str, Any]:
         data = self.settings.model_dump()
-        for section in [*data["models"].values(), data["search"]]:
+        for section in [*data["models"].values(), *data["media"].values(), data["search"]]:
             section["api_key_set"] = bool(
                 section.pop("api_key", "") or os.environ.get(section.get("api_key_env", ""), "")
             )
             if "extra_headers" in section:
                 section["extra_headers"] = {key: "••••" for key in section["extra_headers"]}
         data["chiliarch"]["credential_set"] = bool(data["chiliarch"].pop("credential"))
+        data["server"]["password_set"] = bool(data["server"].pop("password_hash"))
         data["mcp"] = _public_mcp(data["mcp"])
+        for name in ("onebot", "telegram", "qq", "weixin"):
+            profile = data["channels"][name]
+            for secret in ("token", "webhook_secret", "client_secret"):
+                profile[f"{secret}_set"] = bool(
+                    profile.pop(secret, "") or os.environ.get(profile.get(f"{secret}_env", ""), "")
+                )
         return data
 
-    def update(self, changes: dict[str, Any]) -> Settings:
+    def validate_changes(self, changes: dict[str, Any]) -> Settings:
+        changes = copy.deepcopy(changes)
+        server = changes.get("server")
+        if isinstance(server, dict):
+            from muli.auth import hash_password
+
+            password = server.pop("password", None)
+            if server.pop("clear_password", False):
+                server["password_hash"] = ""
+            elif password:
+                if not isinstance(password, str):
+                    raise ValueError("密码必须是字符串")
+                server["password_hash"] = hash_password(password)
+            server.pop("password_set", None)
         data = self.settings.model_dump()
-        self._merge(data, copy.deepcopy(changes))
-        settings = Settings.model_validate(data)
+        self._merge(data, changes)
+        return Settings.model_validate(data)
+
+    def update(self, changes: dict[str, Any]) -> Settings:
+        settings = self.validate_changes(changes)
+        return self.replace(settings)
+
+    def replace(self, settings: Settings) -> Settings:
+        """Atomically publish a fully validated snapshot, including intentional empty values."""
+        settings = Settings.model_validate(settings.model_dump())
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=".muli-", dir=self.path.parent)
         try:
@@ -314,10 +549,22 @@ class ConfigFile:
         clear_key = changes.pop("clear_api_key", False)
         if clear_key:
             target["api_key"] = ""
+        for secret in ("token", "webhook_secret", "client_secret"):
+            if changes.pop(f"clear_{secret}", False):
+                target[secret] = ""
         for key, value in changes.items():
-            if key in {"api_key_set", "credential_set"}:
+            if key in {
+                "api_key_set",
+                "credential_set",
+                "token_set",
+                "webhook_secret_set",
+                "client_secret_set",
+            }:
                 continue
-            if key in {"api_key", "credential"} and value == "":
+            if (
+                key in {"api_key", "credential", "token", "webhook_secret", "client_secret"}
+                and value == ""
+            ):
                 continue
             if isinstance(value, dict) and isinstance(target.get(key), dict):
                 if key == "mcp":
@@ -326,7 +573,7 @@ class ConfigFile:
                     target[key] = {
                         k: target[key].get(k, "") if v == "••••" else v for k, v in value.items()
                     }
-                elif key in {"extra_body", "reasoning"}:
+                elif key in {"extra_body", "reasoning", "thinking"}:
                     target[key] = value
                 else:
                     cls._merge(target[key], value)

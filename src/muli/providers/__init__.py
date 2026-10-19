@@ -2,6 +2,7 @@
 
 from .client import ModelClient
 from .types import (
+    ImageInput,
     JsonObject,
     Message,
     ModelConfig,
@@ -14,6 +15,7 @@ from .types import (
 )
 
 __all__ = [
+    "ImageInput",
     "JsonObject",
     "Message",
     "ModelClient",

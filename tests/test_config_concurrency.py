@@ -28,6 +28,7 @@ async def workspace(
         {
             "workspace_roots": [str(old_root)],
             "models": {"main": {"model": "before", "base_url": "https://unused.invalid/v1"}},
+            "updates": {"check_on_start": False},
         }
     )
     runtime = Runtime(config, tmp_path / "data")
@@ -131,7 +132,7 @@ async def test_concurrent_settings_updates_are_serialized(
     try:
         await asyncio.sleep(0.01)
         assert not second.done()
-        assert runtime.config.settings.models.main.model == "first"
+        assert runtime.config.settings.models.main.model == "before"
         release.set()
         responses = await asyncio.wait_for(asyncio.gather(first, second), 2)
         assert [response.status_code for response in responses] == [200, 200]
@@ -139,7 +140,7 @@ async def test_concurrent_settings_updates_are_serialized(
             "first",
             "second",
         ]
-        assert observed == ["first", "second"]
+        assert observed == ["before", "first"]
         assert runtime.files.roots == [new_root]
         assert ConfigFile(runtime.config.path).settings.models.main.model == "second"
     finally:

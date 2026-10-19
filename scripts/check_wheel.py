@@ -21,12 +21,21 @@ async def check_installed(target: Path) -> None:
     assert Path(muli.__file__).resolve().is_relative_to(target.resolve()), muli.__file__
     with tempfile.TemporaryDirectory(prefix="muli-wheel-data-") as directory:
         root = Path(directory)
-        app = create_app(ConfigFile(root / "config.json"), root / "data")
+        config = ConfigFile(root / "config.json")
+        config.update({"updates": {"check_on_start": False}})
+        app = create_app(config, root / "data")
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app), base_url="http://localhost:8765"
             ) as client:
-                for path in ("/", "/app.mjs", "/assets/standby.webp", "/api/docs", "/api-docs.mjs"):
+                for path in (
+                    "/",
+                    "/app.mjs",
+                    "/assets/muli-avatar.svg",
+                    "/assets/muli-empty.svg",
+                    "/api/docs",
+                    "/api-docs.mjs",
+                ):
                     assert (await client.get(path)).status_code == 200, path
                 state = (await client.get("/api/status")).json()
                 assert state["version"] == muli.__version__
@@ -38,11 +47,12 @@ async def check_installed(target: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--installed", type=Path)
+    parser.add_argument("--dist", type=Path, default=Path("dist"))
     args = parser.parse_args()
     if args.installed:
         asyncio.run(check_installed(args.installed))
         return
-    wheels = list(Path("dist").glob("*.whl"))
+    wheels = list(args.dist.glob("*.whl"))
     if len(wheels) != 1:
         parser.error("dist must contain exactly one freshly built wheel")
     with tempfile.TemporaryDirectory(prefix="muli-wheel-smoke-") as directory:

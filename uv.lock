@@ -668,7 +668,7 @@ wheels = [
 ]
 
 [[package]]
-name = "muli"
+name = "muli-agent"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [

@@ -21,15 +21,15 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 | 领域 | 当前实现 |
 | --- | --- |
 | 模型 | OpenAI Chat Completions、Responses、Anthropic 原生协议；流式/非流式、推理参数、工具回放、重试预算 |
-| 协作 | 有依赖的多 agent 工作流，独立会话、角色模型、并行限制、失败传播、取消和复核模板 |
+| 协作 | 持续主身份、动态 spawn/send/wait/resume/stop 团队、依赖工作流；历史成员无固定上限，执行有资源预算 |
 | 权限 | ask 每个工具调用询问；auto 独立审查 agent，风险操作交给用户；yolo 自动执行 |
 | 文件 | 目录、读取、写入、精确编辑、搜索、复制、移动、可恢复回收站 |
 | 搜索 | SearXNG / Brave / Tavily 可配服务，有限大小网页读取与来源链接 |
-| 记忆 | 全历史倒排索引、两跳关系检索、来源与置信度、修订历史和级联忘记 |
+| 记忆 | 分层原文与后台提炼、关键词/embedding/关系图混合检索、reranker、来源证据、冲突修订、来源级忘记 |
 | 电脑 | Linux AT-SPI 无障碍树、节点动作与文本编辑；新鲜快照与节点身份校验 |
 | 主动事件 | chiliarch 原生配对与 SSE 任务；持久提醒、可选 Linux 桌面通知，无 AI 轮询 |
-| 扩展 | 可选 MCP stdio / HTTP / SSE 工具，共用权限与输出预算 |
-| 长任务 | 工具结果节选、完整原生协议回放、有限排队；原始会话记录保留 |
+| 扩展 | 用户目录 Python 插件与可选 MCP；工具、提示词、模型、路由和生命周期可扩展 |
+| 长任务 | 原始归档、后台分层压缩、协议回放、持久收件队列及未完成工作账本 |
 | 管理 | 模型、权限、工具、目录、记忆、工作流、通知、服务状态与日志统一入口 |
 
 ## 启动
@@ -37,20 +37,18 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 需要 Python 3.12+ 和 [uv](https://docs.astral.sh/uv/)。前端无需安装 Node 依赖或构建。默认运行不依赖 Docker、向量数据库或本地模型。
 
 ```bash
-git clone https://github.com/69gg/MuLi.git
-cd MuLi
-uv sync --locked
-uv run muli init
-uv run muli serve
+uv tool install muli-agent
+MuLi init
+MuLi serve
 ```
 
-打开 **http://127.0.0.1:8765**，在设置中填写模型协议、基础地址和模型名称。主模型处理会话，审查模型使用独立的无工具上下文，工作模型未配置时复用主模型。API key 可从环境变量读取。
+发行名称是 `muli-agent`，命令为 `MuLi` 或 `muli`。本分支的首次 PyPI 发布尚待发布工作流完成；发布前可按下方源码开发方式运行。`init` 会询问称呼、主模型完整参数、视觉能力、监听地址和密码。启动后打开 **http://127.0.0.1:8765**，沐璃会逐步协助配置其它能力。独立审查使用无工具上下文；工作、压缩和记忆提炼模型未单独配置时复用主模型。API key 可从环境变量读取。
 
-默认配置为 `$XDG_CONFIG_HOME/muli/config.json`（通常 `~/.config/muli/config.json`），数据为 `~/.local/share/muli/`。`MULI_CONFIG` / `MULI_DATA_DIR` 或 CLI `--config` / `--data-dir` 可覆盖位置。密钥不出现在配置读取 API；配置文件和数据库使用私人文件权限。
+默认所有内容集中在 `~/MuLi`：`config.json`、`data/`、`plugins/`、`prompts/`、`logs/` 和可选只读源码参考 `source/`。`MULI_HOME` 设置根目录，`MULI_CONFIG` / `MULI_DATA_DIR` 或 CLI `--config` / `--data-dir` 可单独覆盖。初始化不覆盖已有配置；旧路径不会被自动搬走。密钥不出现在配置读取 API；配置文件和数据库使用私人文件权限。
 
 ```bash
-uv run muli --config /path/config.json --data-dir /path/data serve --port 8766
-uv run muli doctor
+MuLi --config /path/config.json --data-dir /path/data serve --port 8766
+MuLi doctor
 ```
 
 模型连接尚未配置时，界面可用于管理，不会伪装产生模型回答。独立审查未配置或失败时，auto 转为人工审批。
@@ -58,11 +56,11 @@ uv run muli doctor
 ## Linux 常驻服务
 
 ```bash
-uv run muli service print
-uv run muli service install
-uv run muli service enable
-uv run muli service start
-uv run muli service status
+MuLi service print
+MuLi service install
+MuLi service enable
+MuLi service start
+MuLi service status
 journalctl --user -u muli.service -f
 ```
 
@@ -84,6 +82,8 @@ journalctl --user -u muli.service -f
 - [上下文与长任务](docs/context.md)
 - [个人记忆设计](docs/memory.md)
 - [MCP 扩展](docs/mcp.md)
+- [用户插件与自身管理](docs/self-management.md)
+- [PyPI 与发布流程](docs/publishing.md)
 - [桌面通知](docs/notifications.md)
 - [chiliarch 接入](docs/chiliarch.md)
 - [工作台交互](docs/frontend.md)
@@ -94,6 +94,11 @@ journalctl --user -u muli.service -f
 ## 开发与验证
 
 ```bash
+git clone https://github.com/69gg/MuLi.git
+cd MuLi
+uv sync --locked
+uv run MuLi init --no-source
+uv run MuLi serve
 uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .

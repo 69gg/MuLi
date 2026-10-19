@@ -11,6 +11,11 @@ class BodyLimitMiddleware:
         self.app, self.max_bytes = app, max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # The attachment handler applies its own streaming and total-storage limits.
+        # Buffering uploads here would multiply memory use and cap all files at 1 MiB.
+        if scope.get("path") == "/api/uploads" and scope.get("method") == "POST":
+            await self.app(scope, receive, send)
+            return
         if scope["type"] != "http" or scope.get("method") not in {"POST", "PUT", "PATCH", "DELETE"}:
             await self.app(scope, receive, send)
             return

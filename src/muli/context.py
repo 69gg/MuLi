@@ -18,7 +18,15 @@ class ContextLimitError(ValueError):
 
 
 def _size(messages: Sequence[Message]) -> int:
-    return len(json.dumps([asdict(message) for message in messages], ensure_ascii=False))
+    return len(json.dumps([_text_data(message) for message in messages], ensure_ascii=False))
+
+
+def _text_data(message: Message) -> dict[str, object]:
+    """Inline image bytes have a separate media budget, not a text-token budget."""
+    data = asdict(message)
+    for image in data["images"]:
+        image["data"] = f"[inline image: {len(image['data'])} base64 chars]"
+    return data
 
 
 def _validate_pairs(messages: Sequence[Message]) -> None:
@@ -127,7 +135,7 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
             packed = [message for message in packed if id(message) not in removed]
             # 列表元素之间的默认 JSON 分隔符是两个字符；最后一轮始终保留。
             current_size -= sum(
-                len(json.dumps(asdict(message), ensure_ascii=False)) + 2 for message in turn
+                len(json.dumps(_text_data(message), ensure_ascii=False)) + 2 for message in turn
             )
             if current_size <= max_chars:
                 break

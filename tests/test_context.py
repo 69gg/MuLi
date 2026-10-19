@@ -8,7 +8,7 @@ import pytest
 
 from muli.config import Limits
 from muli.context import EXCERPT_MARKER, ContextLimitError, pack_context
-from muli.providers import Message, ModelConfig, ToolCall
+from muli.providers import ImageInput, Message, ModelConfig, ToolCall
 from muli.providers.codecs import build_request
 from muli.providers.types import MessageRole, ProtocolName
 
@@ -274,10 +274,20 @@ def test_invalid_budget_is_rejected(budget: int) -> None:
 
 def test_pending_run_config_limit_defaults_and_bounds() -> None:
     assert Limits().max_pending_runs == 8
-    assert Limits(max_pending_runs=128).max_pending_runs == 128
-    for value in (0, 129):
+    assert Limits(max_pending_runs=1024).max_pending_runs == 1024
+    assert Limits(max_parallel_agents=129).max_parallel_agents == 129
+    assert Limits(max_workflow_steps=256).max_workflow_steps == 256
+    for value in (0, -1):
         with pytest.raises(ValueError):
             Limits(max_pending_runs=value)
+
+
+def test_image_bytes_use_media_budget_and_native_image_stays_intact() -> None:
+    image = ImageInput.from_bytes(b"x" * 128000, "image/png")
+    message = Message(role="user", content="看图", images=[image])
+    packed = pack_context([message], 1000)
+    assert packed == [message] and packed[0].images == [image]
+    assert size(packed) > 1000
 
 
 @pytest.mark.parametrize("budget", [750, 1200, 2100, 4000])

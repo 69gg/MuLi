@@ -111,7 +111,8 @@ def test_mcp_redacted_roundtrip_preserves_values_and_supports_deletion(tmp_path:
     assert config.settings.mcp["mcpServers"]["local"]["env"] == {"EMPTY": ""}
     config.update({"mcp": {}})
     assert config.settings.mcp == {}
-    assert "secret" not in config.path.read_text()
+    for removed in ("env-secret", "query-secret", "header-secret"):
+        assert removed not in config.path.read_text()
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import math
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
@@ -29,6 +32,9 @@ class ModelConfig:
     reasoning: JsonObject = field(default_factory=dict)
     stream: bool = True
     max_response_bytes: int = 8 * 1024 * 1024
+    thinking: JsonObject = field(default_factory=dict)
+    reasoning_effort: str | None = None
+    vision: bool = False
 
     def __post_init__(self) -> None:
         if self.protocol not in {"openai_chat", "openai_responses", "anthropic"}:
@@ -36,14 +42,36 @@ class ModelConfig:
         if not self.model.strip():
             raise ValueError("model 不能为空")
         parsed = urlsplit(self.base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("base_url 必须是 HTTP(S) 基础地址")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or any(character.isspace() for character in self.base_url)
+        ):
             raise ValueError("base_url 不允许包含账号、查询参数或片段")
+        try:
+            _ = parsed.port
+        except ValueError:
+            raise ValueError("base_url 端口无效") from None
         if self.max_output_tokens <= 0 or self.max_response_bytes <= 0:
             raise ValueError("输出限制必须大于零")
-        if self.timeout <= 0 or self.max_retries < 0 or self.retry_backoff < 0:
+        if (
+            not math.isfinite(self.timeout)
+            or not math.isfinite(self.retry_backoff)
+            or self.timeout <= 0
+            or self.max_retries < 0
+            or self.retry_backoff < 0
+        ):
             raise ValueError("timeout 必须大于零，重试次数和间隔不能为负")
+        if self.reasoning_effort is not None and (
+            not isinstance(self.reasoning_effort, str) or not self.reasoning_effort.strip()
+        ):
+            raise ValueError("reasoning_effort 为空时请使用 null 省略参数")
+        if not isinstance(self.thinking, dict) or not isinstance(self.reasoning, dict):
+            raise ValueError("thinking 和 reasoning 必须是对象")
 
     def to_dict(self, *, include_secrets: bool = False) -> JsonObject:
         """默认可供界面展示；持久化密钥需要显式 include_secrets=True。"""
@@ -61,6 +89,44 @@ class ToolCall:
     arguments: str
 
 
+@dataclass(frozen=True, slots=True)
+class ImageInput:
+    """显式图片输入；仅保存可序列化的内联数据，不下载 URL。"""
+
+    data: str = field(repr=False)
+    mime_type: str
+    detail: Literal["auto", "low", "high", "original"] = "auto"
+
+    def __post_init__(self) -> None:
+        if self.mime_type not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+            raise ValueError("图片仅支持 PNG、JPEG、GIF 或 WebP")
+        if self.detail not in {"auto", "low", "high", "original"}:
+            raise ValueError("图片 detail 无效")
+        try:
+            decoded = base64.b64decode(self.data, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("图片必须是有效的非空 base64 数据") from exc
+        if not decoded:
+            raise ValueError("图片不能为空")
+
+    @classmethod
+    def from_bytes(
+        cls,
+        data: bytes,
+        mime_type: str,
+        *,
+        max_bytes: int = 10_000_000,
+        detail: Literal["auto", "low", "high", "original"] = "auto",
+    ) -> ImageInput:
+        if max_bytes <= 0 or not data or len(data) > max_bytes:
+            raise ValueError("图片为空或超过 max_bytes 限制")
+        return cls(base64.b64encode(data).decode("ascii"), mime_type, detail)
+
+    @property
+    def data_url(self) -> str:
+        return f"data:{self.mime_type};base64,{self.data}"
+
+
 @dataclass(slots=True)
 class Message:
     role: MessageRole
@@ -69,6 +135,7 @@ class Message:
     tool_call_id: str | None = None
     reasoning: str = ""
     provider_data: JsonObject = field(default_factory=dict)
+    images: list[ImageInput] = field(default_factory=list)
 
 
 @dataclass(slots=True)

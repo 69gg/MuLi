@@ -18,10 +18,13 @@ from muli.tools import Tool, parameters, string
 
 
 class Files:
-    def __init__(self, settings: Settings, data_dir: Path) -> None:
+    def __init__(
+        self, settings: Settings, data_dir: Path, *, readonly_roots: list[Path] | None = None
+    ) -> None:
         self.settings = settings
         self.roots = [Path(root).expanduser().resolve() for root in settings.workspace_roots]
         self.trash = data_dir / "trash"
+        self.readonly_roots = [root.resolve() for root in readonly_roots or []]
         self._lock = asyncio.Lock()
 
     def path(self, value: str) -> Path:
@@ -38,6 +41,11 @@ class Files:
         path = self.path(value)
         if path in self.roots or path == Path(path.anchor):
             raise PermissionError("不能修改访问根目录本身")
+        if any(
+            path == root or root in path.parents or path in root.parents
+            for root in self.readonly_roots
+        ):
+            raise PermissionError("源码参考和已安装代码只读；请通过用户目录插件定制")
         return path
 
     def _read(self, path: Path) -> str:
@@ -159,7 +167,7 @@ class Files:
                         except (OSError, UnicodeError, ValueError):
                             continue
             return {"items": results, "truncated": truncated}
-        path = self.editable(str(path))
+        path = self.path(str(path)) if operation == "copy" else self.editable(str(path))
         if operation in {"write", "edit"}:
             if operation == "edit":
                 original = self._read(path)

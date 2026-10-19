@@ -12,6 +12,7 @@ from typing import Any, Self
 import httpx
 
 from .codecs import build_request, parse_turn
+from .http import read_response
 from .streaming import StreamAccumulator, sse_events
 from .types import (
     JsonObject,
@@ -48,11 +49,7 @@ def _retry_after(response: httpx.Response) -> float | None:
 
 
 async def _read_json(response: httpx.Response, limit: int) -> JsonObject:
-    data = bytearray()
-    async for chunk in response.aiter_bytes():
-        if len(data) + len(chunk) > limit:
-            raise ProviderError("模型响应超过 max_response_bytes 限制")
-        data.extend(chunk)
+    data = await read_response(response, limit)
     try:
         payload: Any = json.loads(data)
     except (ValueError, UnicodeError) as exc:
@@ -96,20 +93,23 @@ class ModelClient:
         self._closed = True
 
     def _headers(self) -> httpx.Headers:
-        headers = httpx.Headers(
-            {
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream" if self.config.stream else "application/json",
-            }
-        )
-        if self.config.protocol == "anthropic":
-            headers["anthropic-version"] = "2023-06-01"
-            if self.config.api_key:
-                headers["x-api-key"] = self.config.api_key
-        elif self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
-        headers.update(self.config.extra_headers)
-        return headers
+        try:
+            headers = httpx.Headers(
+                {
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream" if self.config.stream else "application/json",
+                }
+            )
+            if self.config.protocol == "anthropic":
+                headers["anthropic-version"] = "2023-06-01"
+                if self.config.api_key:
+                    headers["x-api-key"] = self.config.api_key
+            elif self.config.api_key:
+                headers["Authorization"] = f"Bearer {self.config.api_key}"
+            headers.update(self.config.extra_headers)
+            return headers
+        except (ValueError, UnicodeError):
+            raise ProviderError("模型请求头配置无效") from None
 
     async def complete(
         self, messages: Sequence[Message], tools: Sequence[JsonObject] = ()

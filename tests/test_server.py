@@ -14,7 +14,7 @@ from muli.server import create_app
 @pytest.fixture
 async def client(tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
     config = ConfigFile(tmp_path / "config.json")
-    config.update({"workspace_roots": [str(tmp_path)]})
+    config.update({"workspace_roots": [str(tmp_path)], "updates": {"check_on_start": False}})
     runtime = Runtime(config, tmp_path / "data")
     app = create_app(config, runtime=runtime)
     async with app.router.lifespan_context(app):

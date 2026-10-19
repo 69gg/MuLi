@@ -55,6 +55,34 @@ test("server acknowledgement replaces optimistic user messages", () => {
   assert.equal(initial.messages[0].pending, true);
 });
 
+test("attachment-only acknowledgement replaces its optimistic message after the server supplies a prompt", () => {
+  const initial = createSessionState([{ id: "pending:attachment", role: "user", content: "", attachments: [{ id: "file-one", name: "file.txt" }], pending: true }]);
+  const state = applyEvent(initial, { type: "message.queued", data: { message: { id: "receipt", role: "user", content: "请查看附件", attachment_ids: ["file-one"], delivery_status: "pending" } } });
+  assert.equal(state.messages.length, 1);
+  assert.equal(state.messages[0].id, "receipt");
+  assert.deepEqual(state.queued, ["receipt"]);
+});
+
+test("queued user messages never erase the running assistant reply and replay keeps pending IDs", () => {
+  const events = [
+    { id: 1, type: "run.started", data: { run_id: "main-run" } },
+    { id: 2, type: "message.delta", data: { content: "正在读取" } },
+    { id: 3, type: "message.completed", data: { message: { id: "supplement", role: "user", content: "也检查测试" }, queued: true } },
+    { id: 4, type: "conversation.queued", data: { message_id: "supplement", run_id: "main-run" } },
+  ];
+  let state = events.reduce((current, event) => applyEvent(current, event), createSessionState());
+  assert.equal(state.messages.find((message) => message.streaming)?.content, "正在读取");
+  assert.equal(state.status, "running");
+  assert.deepEqual(state.queued, ["supplement"]);
+  state = applyEvent(state, { id: 5, type: "message.delta", data: { content: "，已完成。" } });
+  assert.equal(state.messages.find((message) => message.streaming)?.content, "正在读取，已完成。");
+  const restored = hydrateSession({ messages: [{ id: "supplement", role: "user", content: "也检查测试" }], events });
+  assert.deepEqual(restored.queued, ["supplement"]);
+  assert.equal(restored.messages.filter((message) => message.streaming).length, 1);
+  state = applyEvent(state, { id: 6, type: "conversation.injected", data: { message_ids: ["supplement"], run_id: "main-run" } });
+  assert.deepEqual(state.queued, []);
+});
+
 test("approval lifecycle resumes the run and terminal events clear stale approvals", () => {
   let state = applyEvent(createSessionState(), { type: "approval.requested", data: { id: "a1", tool: "shell" } });
   state = applyEvent(state, { type: "approval.resolved", data: { id: "a1", decision: "reject" } });
@@ -62,6 +90,40 @@ test("approval lifecycle resumes the run and terminal events clear stale approva
   state = applyEvent(state, { type: "approval.requested", data: { id: "a2" } });
   state = applyEvent(state, { type: "run.cancelled", data: {} });
   assert.equal(state.approvals.length, 0); assert.equal(state.status, "cancelled");
+});
+
+test("snapshot pending ingress restores the queue and injection keeps its displayed message", () => {
+  let state = hydrateSession({
+    messages: [{ id: "delivered", role: "user", content: "读取文件" }, { id: "inbox-one", role: "user", content: "也检查测试", delivery_status: "pending" }],
+    events: [{ id: 1, type: "run.started", data: { run_id: "r1" } }, { id: 2, type: "approval.requested", data: { id: "approval-one", tool: "fs_read" } }],
+  });
+  assert.deepEqual(state.queued, ["inbox-one"]);
+  assert.equal(state.status, "approval");
+  assert.equal(state.messages.length, 2);
+  state = applyEvent(state, { id: 3, type: "conversation.injected", data: { message_ids: ["inbox-one"], run_id: "r1" } });
+  assert.deepEqual(state.queued, []);
+  assert.equal(state.messages.length, 2);
+  assert.equal(state.messages[1].delivery_status, "delivered");
+  state = applyEvent(state, { id: 4, type: "message.completed", data: { message: { id: "inbox-one", role: "user", content: "也检查测试" } } });
+  assert.equal(state.messages.length, 2);
+});
+
+test("durable ingress queued and delivered events update the live count without breaking streams", () => {
+  let state = applyEvent(createSessionState(), { type: "message.delta", data: { content: "正在处理" } });
+  const message = { id: "receipt-one", role: "user", content: "补充", delivery_status: "pending" };
+  state = applyEvent(state, { type: "message.queued", data: { message } });
+  assert.deepEqual(state.queued, ["receipt-one"]);
+  assert.equal(state.messages[0].content, "正在处理");
+  state = applyEvent(state, { type: "message.completed", data: { message: { ...message, delivery_status: "delivered" } } });
+  assert.deepEqual(state.queued, []);
+  assert.equal(state.messages.length, 2);
+  state = applyEvent(state, { type: "message.queued", data: { message } });
+  state = applyEvent(state, { type: "message.completed", data: { message } });
+  assert.deepEqual(state.queued, []);
+  assert.equal(state.messages.find((entry) => entry.id === message.id).delivery_status, "delivered");
+  state = applyEvent(state, { type: "message.queued", data: { message: { ...message, id: "receipt-two" } } });
+  state = applyEvent(state, { type: "run.cancelled", data: {} });
+  assert.deepEqual(state.queued, []);
 });
 
 test("interrupted generation retains partial output and exposes the real failure", () => {

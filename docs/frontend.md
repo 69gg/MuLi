@@ -1,89 +1,98 @@
-# 沐璃网页工作台
+# 沐璃网页对话
 
-工作台使用原生 HTML、CSS 与 ES modules，无 Node 运行时依赖、构建步骤或 CDN 资源。后端同源提供 `web/` 静态文件与 `/api/` 接口；从服务根路径访问 `index.html`，模块和图片使用相对路径加载。
+界面使用原生 HTML、CSS 和 ES modules，无构建步骤、前端运行时依赖或 CDN。后端同源提供 `web/` 和 `/api/`；访问服务根路径即可使用。
 
-## 界面
+## 界面与交互
 
-- **会话**：持久化会话列表、重命名、删除、流式消息、可折叠思考过程、工具轨迹、审批、停止任务与 Ask / Auto / Yolo 模式。
-- **工作流**：从模板或空白创建多步骤任务，配置模型角色及依赖，查看真实运行节点、关联会话、结果，取消运行或删除定义。
-- **记忆**：检索、新增、编辑、删除，管理实体、关系、来源与置信度；关系图可查看证据，详情可展开修改历史。
-- **通知**：收件箱、未读计数、标为已读、关联会话；提醒支持一次或重复、暂停、启用、改期和删除。
-- **设置**：主模型 / 审阅模型 / 执行模型，三种协议，权限目录、联网搜索、电脑操作、Chiliarch 配对、MCP 配置、运行与队列限制、桌面通知和 Linux 用户服务。
-- **API 参考**：`/api/docs` 使用本地静态文件读取 `/api/openapi.json`，支持接口检索、参数、请求 / 响应结构和本地 `$ref` 跳转，不依赖 CDN。
+默认界面只有一段持续的 MuLi 主对话，打开或刷新时通过 `/api/conversation` 恢复。主页面没有侧栏、新建或删除主会话按钮；左下两个小按钮分别切换深浅主题和进入设置。主题首次跟随系统，用户切换后仅在本机浏览器保存偏好，不保存消息或密钥。
 
-起始页图片由仓库已有的 `img/standby.png` 压缩得到，没有添加宣传文字。配色统一为浅青瓷蓝与深青墨；移动端导航和运行轨迹使用抽屉，支持减少动画的系统偏好。
+设置以自然语言要求为入口，完整管理页面仍可直接使用：
 
-正文、辅助文字、占位提示与可用按钮采用至少 4.5:1 的对比度。文字色 token 有自动测试约束；图标、边框和禁用控件另按用途处理。移动端关闭的导航设为 `inert`，原生对话框保留焦点约束，模型与子视图可用方向键切换。
+- 设置：主、审阅、执行、视觉、压缩模型，协议和原生推理参数，称呼与提示词，权限与工具，Chiliarch / MCP，媒体与检索服务，通知、限制、访问和 Linux 用户服务。
+- 工作流：模板、步骤、模型角色、依赖、真实运行结果和取消。
+- 团队：真实协作成员与任务，发送协作消息、停止任务和查看子任务记录。
+- 记忆：检索、内容与实体关系编辑、关系证据、来源、置信度及修改历史。
+- 通知：收件箱、已读状态，以及一次或重复提醒的创建、改期、暂停和删除。
+- 附件：本地文件库、图片和音视频预览、下载，以及将已有附件带入对话。
+- 运行记录：搜索主对话和子任务记录，子任务只读查看；主对话保持唯一。
+
+头像与空态插画分别为 `muli-avatar.svg` 和 `muli-empty.svg`，是本次原创的青蓝古风 Q 版 SVG；并非生图模型输出。旧宣传图片不再用于新界面。浅色为青瓷蓝，深色为夜青；共享文字、表面与状态色 token，正文和可用按钮在两种主题中均以 4.5:1 为最低对比度。装饰线条和禁用控件另按用途处理。
+
+输入支持中文组合输入，`Enter` 发送、`Shift + Enter` 换行、`Ctrl/⌘ + K` 回到主对话。运行中仍可发送补充消息，停止按钮独立显示；收到的是排队确认时显示实际待处理数量。切换管理页面保留对话、输入草稿和 SSE，刷新页面恢复已持久化的消息、未完成回复、审批和队列；未发送的文字草稿不会跨刷新保存。
+
+## 附件边界
+
+选择文件后先上传原始字节到本地附件库，发送消息只携带 `attachment_ids`。前端不会读取文本全文、将文件转成 Base64 注入模型、自动转录或自动播放媒体。移除输入框内的附件只移除引用，不删除文件。图片是否发送到视觉模型由服务端及模型配置决定。
+
+图片使用安全的栅格 MIME 白名单；音频和视频使用原生 `controls`、`preload="metadata"`，不自动播放。SVG、HTML、PDF 等文档保留下载入口，不作为同源活动文档嵌入。所有内容与下载 URL 都由附件 ID 构造，同接口返回的外部地址不会直接作为预览源。后续录音、语音识别和朗读控件可在真实服务接口齐备后接入。
 
 ## 文件职责
 
 | 文件 | 职责 |
 | --- | --- |
-| `web/index.html` | 页面结构、导航、输入框和可访问性入口 |
-| `web/styles.css` | 视觉系统、响应式布局与克制的过渡动画 |
-| `web/app.mjs` | DOM 交互与接口接线 |
-| `web/api.mjs` | JSON 请求、结构化错误与增量 SSE 解析 |
-| `web/state.mjs` | 会话事件归并、回放去重、模式与显示辅助函数 |
-| `web/settings.mjs` | 设置草稿、按字段更新和密钥保护 |
-| `web/markdown.mjs` | 安全的轻量 Markdown 展示 |
-| `web/api-docs.html`、`web/api-docs.mjs` | 纯本地 API 参考与 OpenAPI 结构展示 |
+| `web/index.html` | 主对话、设置管理导航、附件输入、登录门和原生对话框 |
+| `web/styles.css` | 两种主题、响应式布局、可读文字和减少动画偏好 |
+| `web/app.mjs` | DOM 交互、真实接口接线、主会话恢复与管理页面 |
+| `web/api.mjs` | JSON / 原始文件请求、结构化错误和增量 SSE 解析 |
+| `web/state.mjs` | 消息、队列、工具、审批和运行状态的回放归并 |
+| `web/settings.mjs` | 设置草稿、字段差异、原子对象和凭据保护 |
+| `web/theme.mjs` | 系统主题、本地偏好和主题切换 |
+| `web/attachments.mjs` | 安全媒体分类、同源附件 URL 与容量显示 |
+| `web/markdown.mjs` | 纯 DOM 的轻量 Markdown，原始 HTML 按文本显示 |
+| `web/api-docs.html`、`web/api-docs.mjs` | 本地 OpenAPI 参考、搜索和 schema 引用跳转 |
 
 ## API 合同
 
-所有接口均位于同源 `/api` 下。变更请求声明 `Content-Type: application/json`。网页不存储 API Key，不将密钥写入浏览器持久化存储；已保存的密钥由服务端脱敏返回。
+所有接口同源、位于 `/api`。普通变更请求声明 `Content-Type: application/json`；文件上传使用原始 MIME。网页不持久化访问密码或 API Key。服务端负责 Cookie、同源请求、文件访问、模型权限和工具审批。
 
 | 接口 | 用途 |
 | --- | --- |
-| `GET /status` | 模型、工具、电脑操作、Chiliarch、MCP、通知、版本和运行状态 |
-| `GET/POST /sessions` | 列出 / 创建会话 |
-| `GET/PATCH/DELETE /sessions/:id` | 消息及历史事件、标题 / 模式、删除 |
-| `POST /sessions/:id/messages` | `{content, mode}`，返回 `{run_id, session_id, message}` |
+| `GET /auth/status`、`POST /auth/login`、`POST /auth/logout` | 访问状态，密码登录和退出 |
+| `GET /conversation` | 幂等获取唯一主会话，返回 `{session,messages,events}` |
+| `GET /status` | 模型、工具、集成、通知、版本和真实运行状态 |
+| `GET /sessions`、`GET/PATCH/DELETE /sessions/:id` | 子任务记录、详情和已有会话管理 |
+| `POST /sessions/:id/messages` | `{content,mode,attachment_ids}`，返回 `{run_id,session_id,message,queued?}` |
 | `POST /sessions/:id/stop` | 请求停止当前任务 |
-| `GET /events` | 全局 SSE，更新会话和通知 |
-| `GET /sessions/:id/events?after=cursor` | 会话 SSE，断线后按事件 ID 接续 |
-| `POST /approvals/:id` | `{decision: "approve"\|"reject"}` |
-| `GET/POST /memories`、`GET/PATCH/DELETE /memories/:id` | 记忆检索、详情与管理 |
-| `GET /memories/graph`、`GET /memories/:id/revisions` | 实体关系与历史快照 |
-| `GET/POST /workflows`、`DELETE /workflows/:id` | 工作流列表、创建与删除 |
-| `POST /workflows/:id/run`、`POST /workflow-runs/:id/cancel` | 工作流运行与取消 |
-| `GET /notifications`、`PATCH /notifications/:id` | 通知及 `{read: true}` |
-| `GET/POST /reminders`、`PATCH/DELETE /reminders/:id` | 提醒时间、内容、重复间隔与启用状态 |
-| `GET/PATCH /settings` | 读取脱敏配置、保存已编辑字段 |
-| `POST /integrations/chiliarch/pair` | `{code, name}` 配对 |
-| `GET/POST /service` | 状态、安装、启动、重启、停止、启用 / 关闭自动启动 |
-| `GET /export` | 流式下载完整 NDJSON 数据 |
-| `GET /docs`、`GET /openapi.json` | 本地 API 参考与当前服务接口描述 |
+| `GET /events`、`GET /sessions/:id/events?after=cursor` | 全局 / 主会话 SSE，按最后事件 ID 接续 |
+| `POST /approvals/:id` | `{decision:"approve"|"reject"}` |
+| `POST /uploads` | 原始文件字节；`X-File-Name=encodeURIComponent(name)`，原始 MIME 作为 Content-Type |
+| `GET /uploads` | `{items}`；项目含 `id,name,mime_type,size,url,preview_url,kind` |
+| `GET /uploads/:id/content`、`GET /uploads/:id/download` | 本地内容预览 / 文件下载 |
+| `GET /team` | `{members,messages}`，成员含 ID、名称、角色、状态、任务、父成员和会话 ID |
+| `POST /team/:id/messages`、`POST /team/:id/stop` | `{content}` 协作消息 / 停止成员任务 |
+| `GET/POST /memories`、`GET/PATCH/DELETE /memories/:id` | 记忆内容、关系、来源和置信度 |
+| `GET /memories/graph`、`GET /memories/:id/revisions` | 关系证据与历史快照 |
+| `GET/POST /workflows`、`DELETE /workflows/:id` | 工作流定义 |
+| `POST /workflows/:id/run`、`POST /workflow-runs/:id/cancel` | 工作流运行和取消 |
+| `GET /notifications`、`PATCH /notifications/:id` | 收件箱和 `{read:true}` |
+| `GET/POST /reminders`、`PATCH/DELETE /reminders/:id` | Unix 秒提醒时间、内容、重复间隔和启用状态 |
+| `GET/PATCH /settings` | 脱敏设置、仅保存已编辑字段 |
+| `POST /integrations/chiliarch/pair` | `{code,name}` 配对 |
+| `GET/POST /service` | 用户服务状态与安装、启动、重启、停止、启停自动启动 |
+| `GET /export` | 全量 NDJSON 下载 |
+| `GET /docs`、`GET /openapi.json` | 本地 API 参考与实际接口结构 |
 
-SSE 事件结构为 `{id, type, session_id, data, created_at}`。支持 `run.started`、`message.delta`、`reasoning.delta`、`message.completed`、`tool.started`、`tool.completed`、`approval.requested`、`approval.resolved`、`run.completed`、`run.failed`、`run.cancelled`。全局事件另处理 `workflow.updated`、`notification.created` 和 `reminder.updated`。会话详情中的 `messages` 是已完成消息的权威来源；回放重建工具、审批、运行状态、最新思考内容和尚未完成的回复，不重复已保存的回复。事件 ID 去重避免重连后重复显示 Token。
+密码门通过 HttpOnly / SameSite Cookie 访问服务。任何接口或 SSE 返回 401 时立即中止事件重连，显示密码输入；登录成功后重新恢复主对话。API 参考也仅加载同源文件，不依赖 Swagger CDN。
 
-设置保存时仅发送改动字段。空 API Key 保留已有值，显式 `clear_api_key: true` 才清除。`reasoning`、`extra_body` 与 `extra_headers` 作为完整对象更新，后端应支持清空对象，并保留未被显式修改的脱敏请求头凭据。
+SSE 事件为 `{id,type,session_id,data,created_at}`。支持消息增量、思考、消息完成、工具开始 / 完成、审批请求 / 解决、运行开始 / 完成 / 失败 / 取消。持久收件使用 `message.queued {message}`，用户消息的 `delivery_status` 为 `pending` / `delivered`；快照中的 pending 行恢复待处理数量。前端同时兼容 `conversation.queued {message_id,run_id,source}` 和 `conversation.injected {message_ids,run_id}`。用户消息完成事件不会清除助手正在流出的片段；晚到的 pending 确认也不会把已送入的消息重新排队。全局事件更新通知、提醒、工作流、团队和附件列表。
 
-MCP 通过连接设置的 JSON 编辑器管理标准 `mcpServers` 对象；只提交实际改动后的完整 `mcp`。后端原子替换配置，删除服务器 / 字段和提交 `{}` 均会生效。`env`、`headers` 和 URL 查询参数的 `••••` 由服务端保留旧值；新增字段必须填写实际值。旧服务只返回 `configured` 标记时隐藏编辑器，标记不会回传。仅 `enabled: true` 启用服务器，未启用的配置不会启动进程或发起远程连接。
+会话详情的 `messages` 是已完成消息的权威来源；回放仅重建工具、审批、运行状态、最新思考、未完成回复和待处理队列。事件 ID 去重防止重连重复 Token。消息中的 `attachments` 使用完整元数据；只有 `attachment_ids` 时从本地库缓存查找。
 
-执行模型未配置时复用主模型；工具审阅模型未配置时交由用户批准。用户服务操作收到的是提交确认，界面随后读取实际状态；重启 / 停止使用短确认并处理连接中断。桌面通知默认关闭，是否可用和最近错误来自服务端状态。
+设置仅提交实际改动；空 API Key / 访问密码保留旧值，`clear_api_key:true` / `clear_password:true` 才清除。脱敏标记不会回传；`reasoning`、`thinking`、`extra_body`、`extra_headers` 为完整对象替换，互不生成隐式参数。执行与压缩模型未配置时复用主模型；审阅模型未配置时交由用户批准；主模型不支持图片时可配置独立视觉模型。
 
-提醒使用本地 `datetime-local` 输入，向接口发送 Unix 秒；重复间隔使用秒。到期通知和计数来自后端事件，网页不调用模型轮询时间。
+MCP JSON 仅在实际修改后提交完整 `mcp` 对象。服务端原子替换服务器集合，并保留原位未改的 `••••` 凭据。旧服务只返回 `configured` 标记时隐藏编辑器；标记不回传。用户服务重启 / 停止使用短确认并处理断线，收到提交确认后再读取实际状态。提醒由后端调度，网页不调用模型轮询时间。
 
-## 使用与验证
-
-后端启动后直接访问工作台地址。前端未预置演示会话、工具结果、通知或模型状态；服务断开和模型未配置分别显示真实状态。输入框内的草稿在视图切换和暂时断线时保留，刷新页面不会保存草稿。
-
-快捷键：`Enter` 发送、`Shift + Enter` 换行、`Ctrl/⌘ + K` 新会话。中文输入法组合输入期间按回车不会发送。
-
-从仓库根目录运行无依赖的前端测试：
+## 验证
 
 ```sh
 node --test tests/frontend/*.test.mjs
+node --check web/app.mjs
 ```
 
-测试覆盖 SSE 分片 / Unicode、回放去重、运行中恢复与取消后的部分输出、乐观消息确认、审批与停止状态、错误保留、秒级时间戳、提醒时间转换、链接协议过滤、脱敏设置更新、MCP 原子替换、文字对比度和 OpenAPI 引用 / 参数合并。测试不会调用外部模型。
+当前 33 项无依赖测试覆盖：SSE Unicode 与任意分片、回放去重、运行中恢复、补充消息不截断回复、队列快照与实时注入、晚到确认、仅附件消息确认、审批 / 停止、失败保留、时间转换、链接过滤、原始文件字节上传、安全媒体类型与 URL、脱敏设置、密码更新、MCP 原子替换、双主题文字对比度、主题偏好和本地 OpenAPI 引用。测试不会连接真实模型。
 
-2026-10-18 至 19 日，使用 Codex 内置浏览器连接临时实际服务完成桌面 1280×720、手机 390×844 验收：设置保存、会话改名 / 删除、记忆新增 / 编辑 / 检索 / 关系证据 / 修订 / 删除、模板创建工作流与未配置模型的真实运行错误、提醒创建 / 暂停 / 改期 / 到期通知 / 已读 / 删除、禁用 MCP 配置保存 / 清空和数据导出均已核验。`/api/docs` 的接口检索、参数、请求结构与引用跳转也已在实际路由验收，手机页面无横向溢出。
+本轮通过 IAB 在独立临时数据目录完成 1280 × 720 桌面及 390 × 844 手机验收：浅深主题与刷新保存、设置保存和恢复、管理页面导航、工作流创建与删除、原始文本 / 图片 / WAV / MP4 上传、图片解码和媒体控件、原始内容下载、仅附件消息、错误密码与登录 / 退出恢复。手机主对话和设置没有横向溢出。
 
-另外通过本地协议测试服务完成流式说明 → 文件读取审批 → 批准 / 拒绝 → 最终回复的端到端验收。批准后的工具结果含临时测试文件内容；拒绝后的工具结果仅含拒绝错误，回复不含文件内容。刷新并重新打开待审批会话后，历史文本与审批正确恢复。验收会话已删除，临时模型配置已恢复为空。没有执行用户服务变更、启用 MCP、发送桌面通知或调用外部提供商。
+使用本地协议测试模型验证了流式回复、Ask 批准 / 拒绝、工具结果、审批中补充两条消息、刷新后待处理数量恢复、送入后清零与停止。拒绝结果不含测试文件内容。验收期间修复了 pending 收件展示、事件合同兼容及晚到确认的计数回退问题。测试没有调用外部模型、安装服务或采集真实桌面 / 麦克风。
 
-前端共 23 项自动测试通过；实测首屏、设置、已完成聊天和 API 参考的可读文字样本最低对比度为 4.84:1，控制台未记录警告或错误。
-
-视觉验收截图：[桌面](screenshots/workbench-desktop.jpg)、[手机](screenshots/workbench-mobile.jpg)。两者均展示实际已连接但未配置模型的状态，无预置演示数据。
-
-Markdown 展示支持段落、标题、列表、引用、代码块、行内代码、粗体与 HTTP(S) / 邮件链接。模型返回的 HTML 始终按文本处理；不加载远程图片或执行原始 HTML。
+实际截图：[桌面浅色](screenshots/workbench-desktop.jpg)、[手机深色](screenshots/workbench-mobile.jpg)。截图中的 `local-ui-test` 是验收模型，不代表外部模型、Chiliarch、桌面操作、通知显示或系统服务安装已验收。当前 IAB 文件选择桥接未能触发含中文本地路径的 change 事件；改用 ASCII 测试文件路径后上传成功。中文上传名称另由真实 API 回归验证通过。

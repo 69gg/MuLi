@@ -9,16 +9,17 @@ export class ApiError extends Error {
 }
 
 export async function request(path, options = {}) {
+  const { rawBody = false, ...fetchOptions } = options;
   const headers = { Accept: "application/json", ...options.headers };
-  if (!["GET", "HEAD"].includes((options.method ?? "GET").toUpperCase())) headers["Content-Type"] = "application/json";
+  if (!rawBody && !["GET", "HEAD"].includes((options.method ?? "GET").toUpperCase())) headers["Content-Type"] = "application/json";
   let body = options.body;
-  if (body !== undefined && typeof body !== "string") {
+  if (!rawBody && body !== undefined && typeof body !== "string") {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(body);
   }
   let response;
   try {
-    response = await fetch(`/api${path}`, { ...options, headers, body });
+    response = await fetch(`/api${path}`, { ...fetchOptions, headers, body });
   } catch (error) {
     if (error.name === "AbortError") throw error;
     throw new ApiError("暂时无法连接工作台，请检查服务后重试。");
@@ -32,6 +33,14 @@ export async function request(path, options = {}) {
     throw new ApiError(message || `请求未完成（${response.status}）`, response.status, data);
   }
   return data;
+}
+
+/** Upload the original bytes; only the returned local reference enters chat. */
+export function uploadFile(file, { signal } = {}) {
+  return request("/uploads", {
+    method: "POST", body: file, rawBody: true, signal,
+    headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) },
+  });
 }
 
 /** CR, LF, split CRLF, comments and multiline data are handled incrementally. */

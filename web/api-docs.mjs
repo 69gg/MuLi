@@ -1,4 +1,5 @@
 import { request } from "./api.mjs";
+import { initializeTheme } from "./theme.mjs";
 
 const METHODS = new Set(["get", "put", "post", "delete", "options", "head", "patch", "trace"]);
 const SCHEMA_PREFIX = "#/components/schemas/";
@@ -126,6 +127,7 @@ async function loadReference() {
 }
 
 if (typeof document !== "undefined") {
+  initializeTheme();
   document.querySelector("#api-retry").addEventListener("click", () => void loadReference());
   document.addEventListener("click", (event) => {
     const link = event.target.closest("a[data-schema-link]");

@@ -16,8 +16,8 @@ test("explicit key clearing and changed API keys are preserved", () => {
 });
 
 test("protocol parameter objects replace atomically so removed keys are not retained", () => {
-  const original = { models: { main: { reasoning: { effort: "high" }, extra_body: { old: true } } } };
-  assert.deepEqual(settingsPatch(original, { models: { main: { reasoning: {}, extra_body: {} } } }), { models: { main: { reasoning: {}, extra_body: {} } } });
+  const original = { models: { main: { reasoning: { effort: "high" }, thinking: { type: "enabled", budget_tokens: 2048 }, extra_body: { old: true } } } };
+  assert.deepEqual(settingsPatch(original, { models: { main: { reasoning: {}, thinking: {}, extra_body: {} } } }), { models: { main: { reasoning: {}, thinking: {}, extra_body: {} } } });
 });
 
 test("switching settings groups retains independent role drafts", () => {
@@ -37,4 +37,10 @@ test("MCP is unchanged until edited and server deletion sends the complete repla
   assert.deepEqual(settingsPatch(original, draft), { mcp: { mcpServers: { remote: original.mcp.mcpServers.remote } } });
   assert.deepEqual(settingsPatch(original, { mcp: {} }), { mcp: {} });
   assert.deepEqual(settingsPatch({ mcp: { configured: true } }, { mcp: { configured: false }, default_mode: "ask" }), { default_mode: "ask" });
+});
+test("password flags and blank password controls stay private while explicit changes are kept", () => {
+  const original = { server: { password_set: true, host: "127.0.0.1" } };
+  assert.deepEqual(settingsPatch(original, { server: { ...original.server, password: "", clear_password: false } }), {});
+  assert.deepEqual(settingsPatch(original, { server: { ...original.server, password: "new-value" } }), { server: { password: "new-value" } });
+  assert.deepEqual(settingsPatch(original, { server: { ...original.server, clear_password: true } }), { server: { clear_password: true } });
 });

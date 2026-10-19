@@ -1,14 +1,20 @@
 [project]
-name = "MuLi"
+name = "muli-agent"
 version = "1.0.0"
 description = "沐璃：事件驱动的本地数字生命与私人多 agent 助手"
 authors = [{name = "Null", email = "pylindex@qq.com"}]
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["fastapi>=0.119,<1", "httpx>=0.28,<1", "jsonschema>=4.23,<5", "pydantic>=2.12,<3", "uvicorn>=0.38,<1"]
 
 [project.scripts]
 muli = "muli.__main__:main"
+MuLi = "muli.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/69gg/MuLi"
+Documentation = "https://github.com/69gg/MuLi/blob/main/README.md"
 
 [project.optional-dependencies]
 mcp = ["fastmcp>=2.13,<3"]

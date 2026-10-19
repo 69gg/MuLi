@@ -21,6 +21,17 @@ def now() -> float:
     return time.time()
 
 
+def message_text_size(record: dict[str, Any]) -> int:
+    """Text context accounting excludes inline media, whose bytes have their own limit."""
+    data = dict(record)
+    if data.get("images"):
+        data["images"] = [
+            {**image, "data": f"[inline image: {len(image.get('data', ''))} base64 chars]"}
+            for image in data["images"]
+        ]
+    return len(json.dumps(data, ensure_ascii=False))
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -38,6 +49,22 @@ class Store:
                 updated REAL NOT NULL, PRIMARY KEY(kind,id)
             );
             CREATE INDEX IF NOT EXISTS objects_updated ON objects(kind,updated DESC);
+            CREATE INDEX IF NOT EXISTS agents_parent ON objects(json_extract(data,'$.parent_id')) WHERE kind='agent';
+            CREATE INDEX IF NOT EXISTS agents_status ON objects(json_extract(data,'$.status')) WHERE kind='agent';
+            CREATE TABLE IF NOT EXISTS message_order (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS message_order_session ON message_order(session_id,seq);
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                name TEXT PRIMARY KEY, value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ingress (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL,
+                received REAL NOT NULL, delivered_seq INTEGER, run_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ingress_pending ON ingress(session_id,state,seq);
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
                 session_id TEXT, data TEXT NOT NULL, created_at REAL NOT NULL
@@ -59,6 +86,22 @@ class Store:
             CREATE INDEX IF NOT EXISTS relations_subject ON relations(subject);
             CREATE INDEX IF NOT EXISTS relations_object ON relations(object);
         """)
+        # Old archives have no insertion sequence. Preserve their existing order once;
+        # all subsequent messages use a database sequence, independent of wall time.
+        if (
+            self.db.execute(
+                "SELECT 1 FROM runtime_state WHERE name='message_sequence_v1'"
+            ).fetchone()
+            is None
+        ):
+            self.db.execute(
+                "INSERT OR IGNORE INTO message_order(message_id,session_id) "
+                "SELECT id,json_extract(data,'$.session_id') FROM objects WHERE kind='message' "
+                "ORDER BY updated,rowid"
+            )
+            self.db.execute(
+                "INSERT INTO runtime_state(name,value) VALUES('message_sequence_v1','done')"
+            )
         self.db.commit()
 
     def close(self) -> None:
@@ -66,11 +109,28 @@ class Store:
 
     def put(self, kind: str, item: dict[str, Any]) -> dict[str, Any]:
         with self.db:
-            self.db.execute(
-                "INSERT INTO objects VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated",
-                (kind, item["id"], json.dumps(item, ensure_ascii=False), now()),
-            )
+            self._put(kind, item)
         return item
+
+    def _put(self, kind: str, item: dict[str, Any]) -> None:
+        """Write inside the caller's transaction; never commit a nested transaction."""
+        if kind == "message":
+            self.db.execute(
+                "INSERT OR IGNORE INTO message_order(message_id,session_id) VALUES(?,?)",
+                (item["id"], item["session_id"]),
+            )
+            item["seq"] = self.db.execute(
+                "SELECT seq FROM message_order WHERE message_id=?", (item["id"],)
+            ).fetchone()[0]
+        self.db.execute(
+            "INSERT INTO objects VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated",
+            (kind, item["id"], json.dumps(item, ensure_ascii=False), now()),
+        )
+
+    def put_many(self, items: builtins.list[tuple[str, dict[str, Any]]]) -> None:
+        with self.db:
+            for kind, item in items:
+                self._put(kind, item)
 
     def get(self, kind: str, identifier: str) -> dict[str, Any] | None:
         row = self.db.execute(
@@ -144,12 +204,157 @@ class Store:
         self.put("message", message)
         return message
 
-    def messages(self, session_id: str) -> builtins.list[dict[str, Any]]:
+    def messages(
+        self, session_id: str, *, after: int = 0, limit: int = 1000
+    ) -> builtins.list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT data FROM objects WHERE kind='message' AND json_extract(data,'$.session_id')=? ORDER BY updated DESC LIMIT 1000",
-            (session_id,),
+            "SELECT o.data,m.seq FROM message_order m JOIN objects o "
+            "ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND m.seq>? ORDER BY m.seq DESC LIMIT ?",
+            (session_id, after, max(0, limit)),
         ).fetchall()
-        return [json.loads(row[0]) for row in reversed(rows)]
+        return [{**json.loads(row["data"]), "seq": row["seq"]} for row in reversed(rows)]
+
+    def message_prefix(
+        self,
+        session_id: str,
+        *,
+        after: int = 0,
+        through: int | None = None,
+        limit: int = 1000,
+        max_chars: int | None = None,
+    ) -> builtins.list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT o.data,m.seq FROM message_order m JOIN objects o "
+            "ON o.kind='message' AND o.id=m.message_id WHERE m.session_id=? "
+            "AND m.seq>? AND (? IS NULL OR m.seq<=?) ORDER BY m.seq LIMIT ?",
+            (session_id, after, through, through, limit),
+        )
+        result: builtins.list[dict[str, Any]] = []
+        total = 0
+        for row in rows:
+            record = {**json.loads(row["data"]), "seq": row["seq"]}
+            size = message_text_size(record)
+            if max_chars is not None and result and total + size > max_chars:
+                break
+            total += size
+            result.append(record)
+        return result
+
+    def main_session(self, mode: str = "auto") -> dict[str, Any]:
+        """One durable local identity; old conversation sessions remain accessible."""
+        with self.db:
+            row = self.db.execute(
+                "SELECT value FROM runtime_state WHERE name='main_session'"
+            ).fetchone()
+            if row:
+                session = self.get("session", row[0])
+                if session is None:
+                    raise ValueError("主会话记录缺失；请恢复数据，不会静默创建另一个身份")
+                return session
+            session = {
+                "id": new_id(),
+                "title": "沐璃",
+                "kind": "main",
+                "principal": "owner",
+                "mode": mode,
+                "status": "idle",
+                "created_at": now(),
+                "updated_at": now(),
+            }
+            self._put("session", session)
+            self.db.execute(
+                "INSERT INTO runtime_state(name,value) VALUES('main_session',?)", (session["id"],)
+            )
+        return session
+
+    def enqueue_input(
+        self,
+        payload: dict[str, Any],
+        *,
+        max_pending: int,
+        quarantine: bool = False,
+        objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        with self.db:
+            previous = self.db.execute(
+                "SELECT * FROM ingress WHERE id=?", (payload["id"],)
+            ).fetchone()
+            if previous:
+                if previous["payload"] != serialized:
+                    raise ValueError("相同输入 ID 的内容或来源不一致")
+                for kind, item in objects or []:
+                    self._put(kind, item)
+                return {
+                    **payload,
+                    "state": previous["state"],
+                    "seq": previous["seq"],
+                    "run_id": previous["run_id"],
+                }, False
+            state = "quarantined" if quarantine else "pending"
+            count = self.db.execute(
+                "SELECT count(*) FROM ingress WHERE session_id=? AND state=?",
+                (payload["session_id"], state),
+            ).fetchone()[0]
+            if count >= max_pending:
+                raise ValueError("待处理输入已达到配置上限，请稍后再试")
+            cursor = self.db.execute(
+                "INSERT INTO ingress(id,session_id,state,payload,received) VALUES(?,?,?,?,?)",
+                (payload["id"], payload["session_id"], state, serialized, now()),
+            )
+            sequence = cursor.lastrowid
+            for kind, item in objects or []:
+                self._put(kind, item)
+            return {**payload, "state": state, "seq": sequence}, True
+
+    def pending_inputs(self, session_id: str) -> int:
+        return int(
+            self.db.execute(
+                "SELECT count(*) FROM ingress WHERE session_id=? AND state='pending'", (session_id,)
+            ).fetchone()[0]
+        )
+
+    def claim_inputs(
+        self, session_id: str, run_id: str, *, limit: int
+    ) -> builtins.list[dict[str, Any]]:
+        """At a replay-safe boundary, atomically append inputs and advance delivery state."""
+        result: builtins.list[dict[str, Any]] = []
+        with self.db:
+            rows = self.db.execute(
+                "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                message = {
+                    "id": payload["id"],
+                    "session_id": session_id,
+                    "role": "user",
+                    "content": payload["content"],
+                    "created_at": row["received"],
+                    "source": payload["source"],
+                    "principal": payload["principal"],
+                    "route": payload.get("route"),
+                    "attachment_ids": payload.get("attachment_ids", []),
+                    "input_seq": row["seq"],
+                    "delivery_status": "delivered",
+                    "run_id": run_id,
+                }
+                self._put("message", message)
+                self.db.execute(
+                    "UPDATE ingress SET state='delivered',delivered_seq=?,run_id=? WHERE seq=?",
+                    (message["seq"], run_id, row["seq"]),
+                )
+                result.append(message)
+        return result
+
+    def cancel_inputs(self, session_id: str) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE ingress SET state='cancelled' WHERE session_id=? AND state='pending'",
+                (session_id,),
+            )
 
     def ingest(
         self,

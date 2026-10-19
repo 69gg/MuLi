@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -16,9 +18,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from muli import __version__
-from muli.config import ConfigFile, default_config_path, default_data_dir
+from muli.attachments import SAFE_INLINE, Attachments
+from muli.auth import COOKIE_NAME, Authentication
+from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
+from muli.local_services import LocalServices
+from muli.management import SelfManagement
+from muli.memory_application import MemoryApplication
 from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
+from muli.plugins import PluginManager
 from muli.runtime import Runtime
 from muli.service import UserService
 from muli.store import now
@@ -34,8 +42,17 @@ class SessionInput(Input):
 
 
 class ChatInput(Input):
-    content: str = Field(min_length=1, max_length=64000)
+    content: str = Field(default="", max_length=64000)
     mode: Mode | None = None
+    attachment_ids: list[str] = Field(default_factory=list, max_length=32)
+
+
+class LoginInput(Input):
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class TeamMessageInput(Input):
+    content: str = Field(min_length=1, max_length=64000)
 
 
 class ApprovalInput(Input):
@@ -54,7 +71,7 @@ class MemoryInput(Input):
 class WorkflowInput(Input):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
-    steps: list[dict[str, Any]] = Field(min_length=1, max_length=32)
+    steps: list[dict[str, Any]] = Field(min_length=1)
     mode: Mode | None = None
 
 
@@ -75,23 +92,71 @@ class ReminderInput(Input):
 
 
 def create_app(
-    config: ConfigFile | None = None, data_dir: Path | None = None, runtime: Runtime | None = None
+    config: ConfigFile | None = None,
+    data_dir: Path | None = None,
+    runtime: Runtime | None = None,
+    *,
+    listen_port: int | None = None,
 ) -> FastAPI:
     config = config or ConfigFile(default_config_path())
+    bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
+    bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
     runtime = runtime or Runtime(config, data_dir or default_data_dir())
     service = UserService(config.path, runtime.data_dir)
+    authentication = Authentication(config)
+    attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
+    local_services = LocalServices(runtime, attachments)
+    memory_application = MemoryApplication(runtime, local_services.media)
     from muli.integrations.manager import IntegrationManager
 
     integration = IntegrationManager(runtime)
 
+    async def apply_configuration(target: Settings) -> None:
+        if not bound_loopback and not target.server.password_hash:
+            raise ValueError(
+                "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
+            )
+        previous = config.settings.model_copy(deep=True)
+        await integration.close()
+        await memory_application.close()
+        try:
+            config.replace(target)
+            await runtime.reconfigure()
+            await memory_application.reconfigure()
+            await integration.start()
+        except Exception:
+            config.replace(previous)
+            await runtime.reconfigure()
+            await memory_application.reconfigure()
+            await integration.start()
+            raise
+
+    async def onboarding() -> None:
+        if config.settings.onboarding_pending and config.settings.models.main.configured:
+            await runtime.submit(
+                "请先和我打个招呼，并带我逐步完善配置。先询问我最希望你帮忙的事情，再按实际需要配置"
+                "记忆模型、视觉、搜索、其它 agent、chiliarch 配对、通讯渠道和语音。一次只处理少量问题，"
+                "不要假装尚未配置的连接可用。你可以在征求我的偏好后完善自己的自我介绍。",
+                source="onboarding",
+                event_id="first-setup-v2",
+            )
+            config.update({"onboarding_pending": False})
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await runtime.startup()
-        await integration.start()
         try:
+            await plugins.load()
+            await runtime.startup()
+            await memory_application.start()
+            await integration.start()
+            await management.start()
+            await onboarding()
             yield
         finally:
+            await management.close()
             await integration.close()
+            await memory_application.close()
+            await plugins.close()
             await runtime.close()
 
     app = FastAPI(
@@ -103,12 +168,26 @@ def create_app(
         openapi_url="/api/openapi.json",
     )
     app.state.runtime, app.state.integration = runtime, integration
+    app.state.attachments, app.state.authentication = attachments, authentication
+    app.state.local_services = local_services
+    plugins = PluginManager(runtime, app, config.path.resolve().parent / "plugins")
+    management = SelfManagement(runtime, plugins, service, apply_configuration)
+    app.state.management, app.state.plugins = management, plugins
+    app.state.memory_application = memory_application
     app.add_middleware(BodyLimitMiddleware)
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next: Any) -> Any:
         host = request.url.hostname
-        if host not in {"localhost", "127.0.0.1", "::1"}:
+        allowed_hosts = {"localhost", "127.0.0.1", "::1", *config.settings.server.allowed_hosts}
+        if not bound_loopback:
+            try:
+                if host:
+                    ipaddress.ip_address(host)
+                    allowed_hosts.add(host)
+            except ValueError:
+                pass
+        if host not in allowed_hosts:
             return JSONResponse({"detail": "无效管理地址"}, status_code=403)
         origin = request.headers.get("origin")
         if origin and origin != str(request.base_url).rstrip("/"):
@@ -118,22 +197,37 @@ def create_app(
         if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path.startswith(
             "/api/"
         ):
-            if request.method != "DELETE" and not request.headers.get(
-                "content-type", ""
-            ).startswith("application/json"):
+            if (
+                request.url.path != "/api/uploads"
+                and request.method != "DELETE"
+                and not request.headers.get("content-type", "").startswith("application/json")
+            ):
                 return JSONResponse({"detail": "需要 application/json"}, status_code=415)
         try:
             size = int(request.headers.get("content-length", "0"))
         except ValueError:
             return JSONResponse({"detail": "无效请求长度"}, status_code=400)
-        if size > 1_048_576:
+        upload = request.url.path == "/api/uploads" and request.method == "POST"
+        body_limit = config.settings.uploads.max_file_bytes if upload else 1_048_576
+        if size < 0 or size > body_limit:
             return JSONResponse({"detail": "请求体超过限制"}, status_code=413)
+        if (
+            request.url.path.startswith("/api/")
+            and request.url.path
+            not in {
+                "/api/auth/status",
+                "/api/auth/login",
+            }
+            and not authentication.authenticated(request.cookies.get(COOKIE_NAME, ""))
+        ):
+            return JSONResponse({"detail": "需要登录"}, status_code=401)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
         )
         response.headers["Cache-Control"] = (
             "no-store" if request.url.path.startswith("/api/") else "no-cache"
@@ -148,6 +242,127 @@ def create_app(
     async def missing(request: Request, exc: KeyError) -> JSONResponse:
         return JSONResponse({"detail": "记录不存在"}, status_code=404)
 
+    @app.get("/api/auth/status")
+    async def auth_status(request: Request) -> dict[str, bool]:
+        return {
+            "required": authentication.required,
+            "authenticated": authentication.authenticated(request.cookies.get(COOKIE_NAME, "")),
+        }
+
+    @app.post("/api/auth/login")
+    async def login(request: Request, body: LoginInput) -> JSONResponse:
+        try:
+            token = await authentication.login(body.password)
+        except PermissionError as exc:
+            raise HTTPException(401, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(429, str(exc)) from exc
+        response = JSONResponse({"authenticated": True})
+        response.set_cookie(
+            COOKIE_NAME,
+            token,
+            httponly=True,
+            samesite="strict",
+            secure=config.settings.server.secure_cookie or request.url.scheme == "https",
+            max_age=config.settings.server.session_ttl_seconds,
+        )
+        return response
+
+    @app.post("/api/auth/logout")
+    async def logout(request: Request) -> JSONResponse:
+        authentication.logout(request.cookies.get(COOKIE_NAME, ""))
+        response = JSONResponse({"authenticated": False})
+        response.delete_cookie(COOKIE_NAME)
+        return response
+
+    def decorated_message(message: dict[str, Any]) -> dict[str, Any]:
+        files = []
+        for identifier in message.get("attachment_ids", []):
+            try:
+                files.append(attachments.public(attachments.get(identifier)))
+            except KeyError:
+                continue
+        return {**message, "attachments": files}
+
+    def visible_messages(session_id: str) -> list[dict[str, Any]]:
+        history = runtime.store.messages(session_id)
+        delivered = {item["id"] for item in history}
+        pending = runtime.conversation.pending(session_id)
+        return [
+            decorated_message(item)
+            for item in [
+                *history,
+                *(item for item in pending if item["id"] not in delivered),
+            ]
+        ]
+
+    @app.get("/api/uploads")
+    async def list_uploads() -> dict[str, Any]:
+        return {"items": attachments.list(), "used_bytes": attachments.used_bytes()}
+
+    @app.get("/api/media")
+    async def media_status() -> dict[str, Any]:
+        async with local_services.media() as media:
+            return media.status()
+
+    @app.get("/api/commitments")
+    async def commitments(status: str = "active") -> dict[str, Any]:
+        return {"items": local_services.commitments.list(status)}
+
+    @app.post("/api/uploads")
+    async def upload(request: Request) -> dict[str, Any]:
+        filename = unquote(request.headers.get("x-file-name", ""), errors="strict")
+        try:
+            return await attachments.save(
+                request.stream(), filename, request.headers.get("content-type", "")
+            )
+        except ValueError as exc:
+            if "限制" in str(exc) or "配额" in str(exc):
+                raise HTTPException(413, str(exc)) from exc
+            raise
+
+    @app.get("/api/uploads/{identifier}/download")
+    @app.get("/api/uploads/{identifier}/content")
+    async def attachment_content(identifier: str, request: Request) -> FileResponse:
+        item = attachments.get(identifier)
+        inline = request.url.path.endswith("/content") and item["mime_type"] in SAFE_INLINE
+        return FileResponse(
+            attachments.path(identifier),
+            filename=item["name"],
+            media_type=item["mime_type"] if inline else "application/octet-stream",
+            content_disposition_type="inline" if inline else "attachment",
+            headers={"Content-Security-Policy": "sandbox; default-src 'none'"},
+        )
+
+    @app.get("/api/conversation")
+    async def conversation() -> dict[str, Any]:
+        session = runtime.main_session()
+        return {
+            "session": session,
+            "messages": visible_messages(session["id"]),
+            "events": runtime.store.recent_events(session["id"]),
+        }
+
+    @app.get("/api/team")
+    async def team() -> dict[str, Any]:
+        members = runtime.team.list()
+        messages: list[dict[str, Any]] = []
+        for member in members:
+            history = runtime.store.messages(member["session_id"])
+            if history:
+                member["last_message"] = history[-1]["content"][:1000]
+            messages.extend({**item, "agent_id": member["id"]} for item in history[-5:])
+        return {"members": members, "messages": messages[-100:]}
+
+    @app.post("/api/team/{identifier}/messages")
+    async def team_message(identifier: str, body: TeamMessageInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            return await runtime.team.send(identifier, body.content)
+
+    @app.post("/api/team/{identifier}/stop")
+    async def stop_agent(identifier: str) -> dict[str, Any]:
+        return await runtime.team.stop(identifier)
+
     @app.get("/api/status")
     async def status() -> dict[str, Any]:
         settings = config.settings
@@ -159,11 +374,18 @@ def create_app(
             "mode": settings.default_mode,
             "running": len(runtime.tasks),
             "platform": sys.platform,
+            "listener": {
+                "host": bound_host,
+                "port": bound_port,
+                "restart_required": config.settings.server.host != bound_host
+                or config.settings.server.port != bound_port,
+            },
             "tools": [
                 {
                     "name": tool.name,
                     "description": tool.description,
                     "risk": tool.risk,
+                    "requires_approval": tool.requires_approval,
                     "enabled": tool.name not in settings.disabled_tools,
                 }
                 for tool in runtime.tools.values()
@@ -179,16 +401,38 @@ def create_app(
     async def settings() -> dict[str, Any]:
         return config.public()
 
+    @app.get("/api/settings/schema")
+    async def settings_schema() -> dict[str, Any]:
+        return Settings.model_json_schema()
+
+    @app.get("/api/management")
+    async def management_status() -> dict[str, Any]:
+        return {
+            "plans": management.plans(),
+            "plugins": plugins.inventory(),
+            "update": runtime.store.get("update", "latest"),
+        }
+
+    @app.post("/api/management/{identifier}/cancel")
+    async def cancel_management(identifier: str) -> dict[str, Any]:
+        return await management.cancel(identifier)
+
+    @app.get("/api/memory/status")
+    async def memory_status() -> dict[str, Any]:
+        return memory_application.pipeline.status()
+
+    @app.get("/api/memory/query")
+    async def memory_query(query: str, limit: int = 8) -> dict[str, Any]:
+        return await memory_application.pipeline.query(query, limit=min(max(1, limit), 100))
+
     @app.patch("/api/settings")
     async def update_settings(changes: dict[str, Any]) -> dict[str, Any]:
         async with runtime.configuration_lock:
             if runtime.busy:
                 raise HTTPException(409, "请先停止运行中的任务")
-            config.update(changes)
-            await integration.close()
-            await runtime.reconfigure()
-            await integration.start()
-            return config.public()
+            await apply_configuration(config.validate_changes(changes))
+        await onboarding()
+        return config.public()
 
     @app.get("/api/sessions")
     async def sessions() -> dict[str, Any]:
@@ -205,7 +449,7 @@ def create_app(
             raise KeyError(session_id)
         return {
             "session": session,
-            "messages": runtime.store.messages(session_id),
+            "messages": [decorated_message(item) for item in runtime.store.messages(session_id)],
             "events": runtime.store.recent_events(session_id, 3000),
         }
 
@@ -222,18 +466,39 @@ def create_app(
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:
+        if session_id == runtime.main_session()["id"]:
+            raise HTTPException(409, "主 MuLi 会话是持续身份，不能按普通窗口删除")
+        if runtime.store.db.execute(
+            "SELECT 1 FROM objects WHERE kind='agent' AND json_extract(data,'$.session_id')=? LIMIT 1",
+            (session_id,),
+        ).fetchone():
+            raise HTTPException(409, "该记录属于持久队友，请使用团队停止功能，保留身份与任务记录")
         await runtime.stop(session_id)
+        await runtime.compaction.forget(session_id)
         with runtime.store.db:
             runtime.store.db.execute(
                 "DELETE FROM objects WHERE kind IN ('message','run','approval') AND json_extract(data,'$.session_id')=?",
                 (session_id,),
             )
             runtime.store.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+            runtime.store.db.execute("DELETE FROM ingress WHERE session_id=?", (session_id,))
+            runtime.store.db.execute("DELETE FROM message_order WHERE session_id=?", (session_id,))
         return {"deleted": runtime.store.delete("session", session_id)}
 
     @app.post("/api/sessions/{session_id}/messages")
     async def send_message(session_id: str, body: ChatInput) -> dict[str, Any]:
-        return await runtime.start(session_id, body.content, body.mode)
+        for identifier in body.attachment_ids:
+            attachments.path(identifier)
+        content = body.content or ("请查看附件" if body.attachment_ids else "")
+        if session_id == runtime.main_session()["id"]:
+            result = await runtime.submit(content, body.mode, attachment_ids=body.attachment_ids)
+        elif body.attachment_ids:
+            raise ValueError("请在主 MuLi 对话中发送附件")
+        else:
+            result = await runtime.start(session_id, content, body.mode)
+        if "message" in result:
+            result["message"] = decorated_message(result["message"])
+        return result
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str) -> dict[str, bool]:

@@ -8,6 +8,7 @@ export function createSessionState(messages = []) {
   return {
     messages: [...messages], tools: [], approvals: [], reasoning: "",
     status: "idle", runId: null, cursor: "", seen: new Set(), error: "",
+    queued: [...new Set(messages.filter((message) => message.role === "user" && message.delivery_status === "pending").map((message) => String(message.id)))],
   };
 }
 
@@ -44,15 +45,29 @@ export function applyEvent(state, event, { history = false } = {}) {
     case "reasoning.delta":
       if (!history) next.reasoning += data.content ?? "";
       break;
+    case "message.queued":
     case "message.completed": {
       if (history || !data.message) break;
       const message = data.message;
-      let messages = next.messages.filter((entry) => !entry.streaming);
+      const queued = message.role === "user" && (message.delivery_status === "pending" || event.type === "message.queued" || data.queued);
+      if (queued && next.messages.some((entry) => String(entry.id) === String(message.id) && entry.delivery_status === "delivered")) break;
+      let messages = message.role === "assistant" ? next.messages.filter((entry) => !entry.streaming) : next.messages;
       if (message.role === "user") {
-        const pending = messages.findIndex((entry) => entry.pending && entry.content === message.content);
+        const attachmentIds = message.attachment_ids ?? message.attachments?.map((file) => file.id) ?? [];
+        const pending = messages.findIndex((entry) => entry.pending && (entry.content === message.content || (!entry.content && attachmentIds.length && JSON.stringify(entry.attachment_ids ?? entry.attachments?.map((file) => file.id) ?? []) === JSON.stringify(attachmentIds))));
         if (pending >= 0) messages = messages.filter((_, index) => index !== pending);
+        next.queued = queued ? [...new Set([...next.queued, String(message.id)])] : next.queued.filter((id) => id !== String(message.id));
       }
       next.messages = upsert(messages, message);
+      break;
+    }
+    case "conversation.queued":
+      if (data.message_id) next.queued = [...new Set([...next.queued, String(data.message_id)])];
+      break;
+    case "conversation.injected": {
+      const injected = new Set((data.message_ids ?? []).map(String));
+      next.queued = next.queued.filter((id) => !injected.has(id));
+      next.messages = next.messages.map((message) => injected.has(String(message.id)) ? { ...message, delivery_status: "delivered" } : message);
       break;
     }
     case "tool.started":
@@ -77,6 +92,7 @@ export function applyEvent(state, event, { history = false } = {}) {
     case "run.failed":
       next.status = event.type.slice(4);
       next.approvals = [];
+      if (event.type === "run.cancelled") next.queued = [];
       next.messages = next.messages.map((message) => message.streaming ? { ...message, streaming: false, interrupted: event.type !== "run.completed" } : message);
       next.error = event.type === "run.failed" ? String(data.error ?? data.message ?? "本次任务未完成，请重试。") : "";
       break;

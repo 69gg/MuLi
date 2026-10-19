@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <title>沐璃 · 原创青蓝云髻形象</title>
+  <rect width="120" height="120" rx="36" fill="#d9eaf0"/>
+  <path d="M21 102c1-21 9-32 18-37-8-7-10-23-4-35 5-11 16-17 28-16 19 0 31 13 31 31 0 10-3 17-9 23 10 8 15 18 15 34" fill="#345b70"/>
+  <path d="M28 109c5-19 15-26 32-27 18 0 30 9 34 27" fill="#6d9fb3"/>
+  <path d="m45 84 15 16 15-16-9-8H54l-9 8Z" fill="#f1f7f6"/>
+  <path d="m60 99-9 10h18l-9-10Z" fill="#376579"/>
+  <path d="M34 47c0-18 12-24 26-24 16 0 28 9 28 26v11c0 18-12 28-27 28-16 0-27-11-27-28V47Z" fill="#f4e9da"/>
+  <path d="M31 54c0-25 14-33 29-33 19 0 31 11 31 33-8-1-14-8-18-17-2 9-12 16-24 18l7-13c-5 5-13 11-25 12Z" fill="#345b70"/>
+  <path d="M42 64c3-4 8-4 11 0M69 64c3-4 8-4 11 0" stroke="#31576a" stroke-width="3" stroke-linecap="round"/>
+  <ellipse cx="48" cy="67" rx="3.5" ry="5" fill="#426e80"/><ellipse cx="74" cy="67" rx="3.5" ry="5" fill="#426e80"/>
+  <circle cx="49" cy="65" r="1.2" fill="#fff"/><circle cx="75" cy="65" r="1.2" fill="#fff"/>
+  <path d="M57 78c3 2 5 2 8 0" stroke="#9b7565" stroke-width="2" stroke-linecap="round"/>
+  <path d="M27 38c-8-2-11-8-9-13 2-6 9-8 15-4 0-7 9-11 15-7 6 3 6 10 1 14-6 7-13 11-22 10Z" fill="#b9d6df"/>
+  <path d="M34 32c-7-7-4-13 0-15M34 32l11-11" stroke="#f2faf9" stroke-width="2" stroke-linecap="round"/>
+  <path d="M87 29c8-6 17-2 17 5 0 5-4 8-10 8H82" fill="#a9cbd8"/>
+  <path d="M87 33h10M93 29v10" stroke="#edf7f7" stroke-width="2" stroke-linecap="round"/>
+  <path d="M29 56c-4 15-2 29 4 39M92 53c7 16 7 29 1 43" stroke="#b7d6df" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="31" cy="96" r="4" fill="#c1a56c"/><circle cx="93" cy="96" r="4" fill="#c1a56c"/>
+</svg>

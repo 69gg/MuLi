@@ -1,4 +1,33 @@
-# 有限工作流与独立评审
+# 动态团队、有限工作流与独立评审
+
+持续主沐璃负责统筹、规划、向用户回复和少量读取，实际执行交给动态队友。主会话默认只暴露内置读取工具、团队/工作流调度，以及本机显式注册的协调工具；队友使用独立会话并继承父会话权限，不可通过消息提升到 yolo。reviewer 只有读取工具，不能再创建队友或执行写入。
+
+## 动态团队
+
+`Runtime.team` 的持久身份与正在执行的协程分开。完成的队友只保留 SQLite 身份、历史和状态，不常驻模型连接；可以分页列出和再次唤醒。历史 agent 总数没有固定上限；同时未完成的队友受 `limits.max_pending_runs` 约束，实际模型请求共用 `limits.max_parallel_agents`。这些数值只有正数要求，不设人为硬编码的最大 agent 总数；默认仍为 8 和 2。
+
+| 接口 | 行为 |
+| --- | --- |
+| `await spawn(name,prompt,parent_id=None,role='worker',mode=None)` | 原子保存身份、会话和首条任务，继承父权限；返回 `agent_id` 对应的 `id`/`session_id`。角色为 worker/reviewer |
+| `list(limit=100,offset=0)` / `get(target)` | 按页查看；target 优先用 ID，重名时不得模糊选择 |
+| `await send(target,content,wake=True,sender=None,event_id=None)` | 接受信封，不表示已经处理；运行中在安全边界注入；`wake=False` 只写邮箱，不唤醒结束的队友 |
+| `await resume(target)` | 沿用身份、模式、历史和分层摘要继续；有邮箱先处理邮箱，否则明确要求核查此前未知副作用再继续 |
+| `await wait(targets,timeout=30,caller=None)` | 等待任一目标终态，或调用者收到新输入；事件唤醒、可取消、有超时，不占模型执行槽；检测自等待和等待环 |
+| `await stop(target)` | 取消队友及未完成后代；首次调度前取消也清理登记状态，完成的结果不改成取消 |
+
+模型工具名称为 `spawn_agent`、`send_input`（另保留同义 `send_message`）、`resume_agent`、`wait_agents`、`stop_agent`、`list_agents`。在模型自身工具中禁止停止自己或祖先，避免等待自己的退出造成死锁。停止主会话传播到其未完成后代，停止后不因这些取消结果再次启动主模型。
+
+每次模型请求才持有执行槽；工具处理、人工批准、`wait_agents` 和工作流依赖等待均释放该槽。配置并发为 1 时，主助手可派出队友并等待其完成。每轮总时限仍包含排队/审批/等待，工具与模型轮次数有预算，超额如实停止，不无限递归。
+
+队友结果与 `team_report` 发件意图在同一事务保存。父邮箱满时保留 pending 报告，父输入被消费、队友完成或启动恢复时再投递，同 ID 去重，不使用定时 AI 轮询。主/队友父会话收到结果后可以继续统筹；资料明确标注不是新用户指令或授权。用户显式停止和关机期间的取消汇报标记 suppressed，防止自动唤醒。
+
+服务重启把已运行队友标为 interrupted，绝不自动重做副作用；尚未开始的 queued 任务可恢复执行。`send`/`resume` 是继续中断身份的明确入口；未消费邮箱独立保存。主、队友和 DAG 节点统一使用 [context.md](context.md) 中的分层摘要、原始工具配对和前缀验证。
+
+实际只读参考了 `/data1/codex/codex-rs/core/src/agent/api.rs` 的 input/delivery receipt 区分、`agent/control/mailbox.rs` 的只投递邮箱、`agent/control/residency.rs` 的身份/驻留名额分离，以及 `tools/handlers/multi_agents/{send_input,wait,resume_agent}.rs` 的生命周期。MuLi 用事件驱动协程与 SQLite 替代 Codex 的进程/驻留控制，不照搬跨工作树机制；队友不建立独立 OS 沙箱，仍是本机权限边界下的协作任务。
+
+`tests/test_team.py` 覆盖单并发派生等待、持久身份续办、邮箱只投递、历史数与活动预算分离、父子取消、调度前取消、原子创建、父邮箱满的持久汇报，以及等待环/停止祖先拒绝；全部离线模拟模型。
+
+## 静态 DAG
 
 `WorkflowEngine` 执行用户明确提供的有向无环图。节点使用独立会话和角色模型，通过同一个 `run_step(session_id, prompt, role, mode)` 入口继承权限、工具预算和取消行为；节点不能递归创建工作流。
 
@@ -35,7 +64,7 @@
 
 运行仅在所有节点成功时为 `completed`。成功叶节点输出保存在 `results` 字典，拼接文本保存在 `result`；失败分支不抹除已完成的独立结果。每个节点包含 `session_id`、状态、输出或错误与开始/结束时间。节点 session 上记录 `workflow_id`、`workflow_run_id`、`workflow_node_id` 和角色，供工作台跳转过程。
 
-引擎参数为 `max_parallel=2`、`max_steps=12`、`max_pending_runs=8`、`timeout=600`、`max_output_chars=24000`，由运行时配置传入。`limits.max_pending_runs` 默认 8，允许 1–128；引擎内正在执行和排队的未完成运行合计达到上限时，`start` 在创建任何运行记录或节点会话前报错。完成或取消释放名额，检查和登记之间不等待，避免并发启动突破限制。
+引擎参数为 `max_parallel=2`、`max_steps=12`、`max_pending_runs=8`、`timeout=600`、`max_output_chars=24000`，由运行时配置传入。`limits.max_pending_runs`、`max_parallel_agents` 和 `max_workflow_steps` 可配置为任意正整数；引擎内正在执行和排队的未完成运行合计达到配置上限时，`start` 在创建任何运行记录或节点会话前报错。完成或取消释放名额，检查和登记之间不等待，避免并发启动突破限制。动态团队与 DAG 的待办预算分别核算，实际模型并发在 Runtime 共用同一信号量。
 
 并行限制在同一引擎的所有运行间共享；总时限包括排队时间。输出限制同时约束每节点保存的结果、最终拼接文本和依赖资料的总内容预算；截断通过 `result_truncated` 或资料中的 `truncated` 明示。
 

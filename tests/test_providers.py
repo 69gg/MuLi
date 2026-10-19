@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from muli.providers import Message, ModelClient, ModelConfig, ProviderError, ToolCall
+from muli.providers import ImageInput, Message, ModelClient, ModelConfig, ProviderError, ToolCall
 from muli.providers.codecs import build_request
 from muli.providers.streaming import sse_events
 from muli.providers.types import JsonObject, ProtocolName
@@ -591,9 +591,7 @@ def test_core_fields_cannot_be_overridden(field: str) -> None:
 def test_sampling_tool_choice_reasoning_and_token_limits(
     protocol: ProtocolName,
 ) -> None:
-    reasoning = (
-        {"type": "enabled", "budget_tokens": 128} if protocol == "anthropic" else {"effort": "high"}
-    )
+    reasoning = {"type": "adaptive"} if protocol == "anthropic" else {"effort": "high"}
     extra: JsonObject = {
         "temperature": 0.2,
         "top_p": 0.9,
@@ -695,3 +693,168 @@ async def test_clean_eof_without_completion_is_not_success() -> None:
 def test_invalid_config(options: JsonObject) -> None:
     with pytest.raises(ValueError):
         replace(config(), **options)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+async def test_explicit_image_survives_native_tool_continuation(protocol: ProtocolName) -> None:
+    requests: list[JsonObject] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=payload(protocol))
+
+    image = ImageInput.from_bytes(b"image-bytes", "image/png", detail="high")
+    messages = [Message("user", "读取这张图片", images=[image])]
+    original = deepcopy(messages)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        model = ModelClient(config(protocol, vision=True, stream=False), http)
+        turn = await model.complete(messages, TOOLS)
+        await model.complete(
+            [*messages, turn.to_message(), Message("tool", "已读取", tool_call_id="call_1")],
+            TOOLS,
+        )
+    assert messages == original
+    assert image.data not in repr(image)
+    if protocol == "openai_chat":
+        first = requests[0]["messages"][0]["content"]
+        assert first[1] == {
+            "type": "image_url",
+            "image_url": {"url": image.data_url, "detail": "high"},
+        }
+        assert requests[1]["messages"][0]["content"] == first
+        assert requests[1]["messages"][1] == payload(protocol)["choices"][0]["message"]
+    elif protocol == "openai_responses":
+        first = requests[0]["input"][0]["content"]
+        assert first[1] == {"type": "input_image", "image_url": image.data_url, "detail": "high"}
+        assert requests[1]["input"][0]["content"] == first
+        assert requests[1]["input"][1:4] == payload(protocol)["output"]
+    else:
+        first = requests[0]["messages"][0]["content"]
+        assert first[1] == {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": image.data},
+        }
+        assert requests[1]["messages"][0]["content"] == first
+        assert requests[1]["messages"][1]["content"] == payload(protocol)["content"]
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+def test_images_require_explicit_vision_and_user_role(protocol: ProtocolName) -> None:
+    image = ImageInput.from_bytes(b"image", "image/jpeg")
+    with pytest.raises(ValueError, match="vision"):
+        build_request(config(protocol), [Message("user", images=[image])], [], stream=False)
+    with pytest.raises(ValueError, match="user"):
+        build_request(
+            config(protocol, vision=True), [Message("tool", images=[image])], [], stream=False
+        )
+
+
+def test_image_input_serializable_bounded_and_no_url_fetch() -> None:
+    from dataclasses import asdict
+
+    image = ImageInput.from_bytes(b"image", "image/webp")
+    encoded = json.loads(json.dumps(asdict(Message("user", "看图", images=[image]))))
+    assert encoded["images"][0]["data"] == image.data
+    with pytest.raises(ValueError, match="max_bytes"):
+        ImageInput.from_bytes(b"12345", "image/png", max_bytes=4)
+    with pytest.raises(ValueError):
+        ImageInput.from_bytes(b"", "image/png")
+    with pytest.raises(ValueError):
+        ImageInput.from_bytes(b"svg", "image/svg+xml")
+    with pytest.raises(ValueError, match="base64"):
+        ImageInput("https://example.test/image.png", "image/png")
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+def test_thinking_and_effort_are_optional_independent_fields(protocol: ProtocolName) -> None:
+    plain = build_request(config(protocol), [Message("user", "q")], [], stream=False)
+    assert not {"thinking", "reasoning", "reasoning_effort", "output_config"}.intersection(plain)
+    options = config(protocol, thinking={"type": "adaptive"}, reasoning_effort="custom-effort")
+    original = deepcopy(options)
+    body = build_request(options, [Message("user", "q")], [], stream=False)
+    assert body["thinking"] == {"type": "adaptive"}
+    if protocol == "openai_chat":
+        assert body["reasoning_effort"] == "custom-effort"
+    elif protocol == "openai_responses":
+        assert body["reasoning"] == {"effort": "custom-effort"}
+    else:
+        assert body["output_config"] == {"effort": "custom-effort"}
+    assert options == original
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+def test_thinking_manual_budget_and_explicit_disable(protocol: ProtocolName) -> None:
+    body = build_request(
+        config(protocol, thinking={"type": "enabled", "budget_tokens": 1024}),
+        [Message("user", "q")],
+        [],
+        stream=False,
+    )
+    assert body["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    disabled = build_request(
+        config(protocol, thinking={"type": "disabled"}), [Message("user", "q")], [], stream=False
+    )
+    assert disabled["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    "thinking",
+    [
+        {"type": "enabled"},
+        {"type": "enabled", "budget_tokens": 1023},
+        {"type": "enabled", "budget_tokens": 4096},
+        {"type": "enabled", "budget_tokens": True},
+        {"type": "adaptive", "budget_tokens": 1024},
+        {"type": "disabled", "budget_tokens": 0},
+    ],
+)
+def test_anthropic_rejects_invalid_budget_before_network(thinking: JsonObject) -> None:
+    with pytest.raises(ValueError, match="budget_tokens"):
+        build_request(
+            config("anthropic", thinking=thinking), [Message("user", "q")], [], stream=False
+        )
+
+
+def test_reasoning_parameter_precedence_preserves_explicit_vendor_options() -> None:
+    body = build_request(
+        config(
+            "openai_responses",
+            reasoning={"effort": "low", "summary": "auto"},
+            reasoning_effort="high",
+        ),
+        [Message("user", "q")],
+        [],
+        stream=False,
+    )
+    assert body["reasoning"] == {"effort": "high", "summary": "auto"}
+    override = build_request(
+        config(
+            "anthropic",
+            reasoning={"type": "enabled", "budget_tokens": 2048},
+            thinking={"type": "adaptive"},
+            reasoning_effort="high",
+            extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema"}}},
+        ),
+        [Message("user", "q")],
+        [],
+        stream=False,
+    )
+    assert override["thinking"] == {"type": "adaptive"}
+    assert override["output_config"] == {"effort": "low", "format": {"type": "json_schema"}}
+
+
+@pytest.mark.asyncio
+async def test_invalid_header_encoding_is_safe_and_not_retried() -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json=payload("openai_chat"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(ProviderError, match="请求头配置") as error:
+            await ModelClient(config(extra_headers={"X-Secret": "私密凭据"}), http).complete([])
+    assert not called
+    assert "私密" not in str(error.value) and "secret-key" not in str(error.value)

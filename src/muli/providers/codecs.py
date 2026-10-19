@@ -83,7 +83,17 @@ def _chat_messages(messages: Sequence[Message]) -> list[JsonObject]:
             if isinstance(native, dict):
                 result.append(deepcopy(native))
                 continue
-        item: JsonObject = {"role": message.role, "content": message.content}
+        content: Any = message.content
+        if message.images:
+            content = [{"type": "text", "text": message.content}]
+            content.extend(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image.data_url, "detail": image.detail},
+                }
+                for image in message.images
+            )
+        item: JsonObject = {"role": message.role, "content": content}
         if message.role == "tool":
             item["tool_call_id"] = _tool_id(message)
         if message.tool_calls:
@@ -117,7 +127,18 @@ def _responses_input(messages: Sequence[Message]) -> list[JsonObject]:
                 result.extend(deepcopy(native))
                 continue
         if message.content or message.role != "assistant":
-            result.append({"role": message.role, "content": message.content})
+            content: Any = message.content
+            if message.images:
+                content = [{"type": "input_text", "text": message.content}]
+                content.extend(
+                    {
+                        "type": "input_image",
+                        "image_url": image.data_url,
+                        "detail": image.detail,
+                    }
+                    for image in message.images
+                )
+            result.append({"role": message.role, "content": content})
         result.extend(
             {
                 "type": "function_call",
@@ -154,6 +175,17 @@ def _anthropic_messages(messages: Sequence[Message]) -> tuple[list[JsonObject], 
         if not blocks:
             if message.content:
                 blocks.append({"type": "text", "text": message.content})
+            blocks.extend(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.mime_type,
+                        "data": image.data,
+                    },
+                }
+                for image in message.images
+            )
             for call in message.tool_calls:
                 try:
                     arguments: Any = json.loads(call.arguments)
@@ -223,11 +255,18 @@ def build_request(
     *,
     stream: bool,
 ) -> JsonObject:
+    if any(message.images for message in messages):
+        if not config.vision:
+            raise ValueError("当前模型未声明 vision 能力，请配置视觉模型后显式看图")
+        if any(message.images and message.role != "user" for message in messages):
+            raise ValueError("图片只能作为显式 user 消息发送")
     conflicts = _PROTECTED_FIELDS.intersection(config.extra_body)
     if conflicts:
         raise ValueError("extra_body 不允许覆盖协议核心字段：" + ", ".join(sorted(conflicts)))
     body: JsonObject = deepcopy(config.extra_body)
     body.update(model=config.model, stream=stream)
+    if config.thinking:
+        body.setdefault("thinking", deepcopy(config.thinking))
     if "tool_choice" in body:
         body["tool_choice"] = _tool_choice(body["tool_choice"], config.protocol)
     if config.protocol == "openai_chat":
@@ -244,6 +283,8 @@ def build_request(
             if set(config.reasoning) != {"effort"}:
                 raise ValueError("Chat reasoning 仅接受 effort；厂商参数请放入 extra_body")
             body.setdefault("reasoning_effort", config.reasoning["effort"])
+        if config.reasoning_effort is not None and "reasoning_effort" not in config.extra_body:
+            body["reasoning_effort"] = config.reasoning_effort
         if stream:
             options = object_value(body.get("stream_options"))
             body["stream_options"] = {"include_usage": True, **options}
@@ -253,6 +294,13 @@ def build_request(
         token_field = "max_output_tokens"
         if config.reasoning:
             body.setdefault("reasoning", deepcopy(config.reasoning))
+        if config.reasoning_effort is not None:
+            reasoning = body.setdefault("reasoning", {})
+            if not isinstance(reasoning, dict):
+                raise ValueError("Responses reasoning 必须是对象")
+            explicit = object_value(config.extra_body.get("reasoning"))
+            if "effort" not in explicit:
+                reasoning["effort"] = config.reasoning_effort
         if "include" not in body:
             body["include"] = ["reasoning.encrypted_content"]
     else:
@@ -262,6 +310,11 @@ def build_request(
         token_field = "max_tokens"
         if config.reasoning:
             body.setdefault("thinking", deepcopy(config.reasoning))
+        if config.reasoning_effort is not None:
+            output_config = body.setdefault("output_config", {})
+            if not isinstance(output_config, dict):
+                raise ValueError("Anthropic output_config 必须是对象")
+            output_config.setdefault("effort", config.reasoning_effort)
         if "stop" in body:
             body.setdefault("stop_sequences", body.pop("stop"))
         if "parallel_tool_calls" in body:
@@ -276,6 +329,19 @@ def build_request(
     ):
         raise ValueError("模型输出 token 限制必须是正整数")
     body[token_field] = min(requested_limit, config.max_output_tokens)
+    if config.protocol == "anthropic" and "thinking" in body:
+        thinking = body["thinking"]
+        if not isinstance(thinking, dict):
+            raise ValueError("Anthropic thinking 必须是对象")
+        thinking_type = thinking.get("type")
+        if thinking_type not in {"enabled", "adaptive", "disabled"}:
+            raise ValueError("Anthropic thinking.type 必须是 enabled/adaptive/disabled")
+        if thinking_type == "enabled":
+            budget = thinking.get("budget_tokens")
+            if type(budget) is not int or not 1024 <= budget < body[token_field]:
+                raise ValueError("Anthropic thinking.budget_tokens 必须至少为 1024 且小于输出上限")
+        elif "budget_tokens" in thinking:
+            raise ValueError("Anthropic adaptive/disabled thinking 请省略 budget_tokens")
     if tools:
         body["tools"] = _tools(tools, config.protocol)
     return body

@@ -20,7 +20,9 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command")
     serve = commands.add_parser("serve", help="启动本地管理工作台")
     serve.add_argument("--port", type=int)
-    commands.add_parser("init", help="创建默认配置（不覆盖已有文件）")
+    initialize = commands.add_parser("init", help="交互设置主模型、称呼与访问方式")
+    initialize.add_argument("--defaults", action="store_true", help="不提问，只创建默认配置")
+    initialize.add_argument("--no-source", action="store_true", help="暂不下载只读源码参考")
     service = commands.add_parser("service", help="管理 Linux 用户服务")
     service.add_argument(
         "action",
@@ -30,10 +32,20 @@ def main() -> None:
     args = parser.parse_args()
     config = ConfigFile(args.config)
     if args.command == "init":
-        if args.config.exists():
-            parser.error("配置已存在，未覆盖")
-        config.update({})
-        print(f"已创建 {args.config}")
+        from muli.initialization import clone_source
+        from muli.initialization import initialize as initialize_config
+
+        try:
+            initial_settings = initialize_config(args.config, args.data_dir, defaults=args.defaults)
+        except (ValueError, FileExistsError) as exc:
+            parser.error(str(exc))
+        print(f"已创建 {args.config}；数据保存在 {args.data_dir}")
+        if not args.no_source:
+            result = clone_source(
+                args.config.expanduser().resolve().parent, initial_settings.updates.repository
+            )
+            print(f"源码参考：{result.get('path', result.get('reason'))}")
+        print("运行 MuLi serve 后打开工作台，沐璃会接着帮你配置记忆、渠道和其它模型。")
     elif args.command == "service":
         manager = UserService(args.config, args.data_dir)
         if args.action == "print":
@@ -72,7 +84,7 @@ def main() -> None:
 
         port = getattr(args, "port", None) or config.settings.server.port
         uvicorn.run(
-            create_app(config, args.data_dir),
+            create_app(config, args.data_dir, listen_port=port),
             host=config.settings.server.host,
             port=port,
             log_level="info",

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ApiError, createSSEParser, readEvents, request } from "../../web/api.mjs";
+import { ApiError, createSSEParser, readEvents, request, uploadFile } from "../../web/api.mjs";
 
 test("SSE parser survives every possible CRLF split and preserves Unicode", () => {
   const wire = ': heartbeat\r\nid: 8\r\nevent: message.delta\r\ndata: {"content":"沐璃，继续。"}\r\n\r\n';
@@ -56,4 +56,27 @@ test("all mutations declare JSON, including bodyless DELETE and stop requests", 
 test("API errors retain status without exposing raw HTML responses", async (context) => {
   context.mock.method(globalThis, "fetch", async () => new Response('{"detail":"会话仍在运行"}', { status: 409 }));
   await assert.rejects(request("/sessions/test"), (error) => error instanceof ApiError && error.status === 409 && error.message === "会话仍在运行");
+});
+
+test("file uploads preserve bytes and MIME without JSON serialization", async (context) => {
+  const file = new Blob([new Uint8Array([0, 255, 13, 10, 128])], { type: "application/octet-stream" });
+  Object.defineProperty(file, "name", { value: "沐璃 #1.bin" });
+  let captured;
+  context.mock.method(globalThis, "fetch", async (url, options) => {
+    captured = { url, options }; return Response.json({ id: "local-file" });
+  });
+  const result = await uploadFile(file);
+  assert.equal(captured.url, "/api/uploads");
+  assert.equal(captured.options.body, file);
+  assert.equal(captured.options.headers["Content-Type"], "application/octet-stream");
+  assert.equal(decodeURIComponent(captured.options.headers["X-File-Name"]), file.name);
+  assert.equal("rawBody" in captured.options, false);
+  assert.equal(result.id, "local-file");
+});
+
+test("an unauthorized SSE is exposed before a stream starts", async (context) => {
+  context.mock.method(globalThis, "fetch", async () => new Response(null, { status: 401 }));
+  let opened = false;
+  await assert.rejects(readEvents("/events", { onOpen: () => { opened = true; }, onEvent: () => assert.fail("an unauthorized stream must not deliver events") }), (error) => error.status === 401);
+  assert.equal(opened, false);
 });

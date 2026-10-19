@@ -16,6 +16,7 @@ class Tool:
     parameters: dict[str, Any]
     handler: Handler
     risk: str = "read"
+    requires_approval: bool = False
 
     def schema(self) -> dict[str, Any]:
         return {

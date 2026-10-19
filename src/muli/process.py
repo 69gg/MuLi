@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ async def run_process(
     limit: int = 24000,
     input_text: str | None = None,
     merge_stderr: bool = True,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if not argv or any("\x00" in arg for arg in argv):
         raise ValueError("命令参数无效")
@@ -27,6 +29,8 @@ async def run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE,
         start_new_session=os.name == "posix",
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
+        env=env,
     )
     output = bytearray()
     error = bytearray()

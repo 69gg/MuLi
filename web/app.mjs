@@ -1,7 +1,9 @@
-import { request, readEvents } from "./api.mjs";
+import { request as apiRequest, readEvents, uploadFile } from "./api.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
-import { getPath, setPath, settingsPatch } from "./settings.mjs";
+import { setPath, settingsPatch } from "./settings.mjs";
+import { initializeTheme, toggleTheme } from "./theme.mjs";
+import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 
 const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -33,6 +35,12 @@ const ICONS = {
   bell: '<path d="M18 8a6 6 0 0 0-12 0v7l-3 3h18l-3-3V8ZM9 21h6"/>',
   link: '<path d="m9 15 6-6M7 14l-3 3a3 3 0 0 0 4 4l5-5a3 3 0 0 0 0-4M17 10l3-3a3 3 0 0 0-4-4l-5 5a3 3 0 0 0 0 4"/>',
   server: '<rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M12 6.5h5M12 17.5h5"/>',
+  moon: '<path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10Z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/>',
+  attachment: '<path d="m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7L13 2m-7 12 7-7a1.5 1.5 0 0 1 2 2l-7 7"/>',
+  "arrow-left": '<path d="M20 12H4m7-7-7 7 7 7"/>',
+  download: '<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
+  team: '<circle cx="9" cy="8" r="3"/><path d="M2 21v-3a7 7 0 0 1 14 0v3M16 5a3 3 0 0 1 0 6m3 4a5 5 0 0 1 3 4v2"/>',
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -41,17 +49,32 @@ const state = {
   view: "chat", status: null, connected: false, streamConnected: true, loading: true,
   sessions: [], activeSession: null, session: createSessionState(), mode: "auto", sending: false,
   timelineOpen: false, sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
-  viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "models",
+  viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaved: false,
-  timelineUserChoice: false,
+  timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0,
+  team: { members: [], messages: [] }, recordQuery: "",
+  auth: { required: false, authenticated: false },
 };
 let sessionController = null;
 let globalController = null;
 let sessionRequestVersion = 0;
+let viewRequestVersion = 0;
 let queuedRender = false;
 let messageNodes = new Map();
 let toolNodes = new Map();
 let dialogSubmit = null;
+
+async function request(path, options) {
+  try { return await apiRequest(path, options); }
+  catch (error) { if (error.status === 401 && path !== "/auth/login") showLogin(); throw error; }
+}
+
+function showLogin() {
+  globalController?.abort(); sessionController?.abort();
+  state.connected = false; state.auth.authenticated = false;
+  $(".app-shell").inert = true; $("#auth-gate").hidden = false;
+  $("#login-password").focus();
+}
 
 function element(tag, attributes = {}, ...children) {
   const node = document.createElement(tag);
@@ -101,19 +124,18 @@ function pretty(value) {
   return JSON.stringify(value, null, 2) ?? "";
 }
 function collection(payload) { return Array.isArray(payload) ? payload : payload?.items ?? []; }
-function currentTitle() { return state.activeSession?.title || "新会话"; }
+function currentTitle() { return "沐璃对话"; }
 function busy() { return isRunning(state.session.status) || state.sending; }
 
 function renderChrome() {
-  const titles = { chat: currentTitle(), workflows: "工作流", memories: "记忆", notifications: "通知", settings: "设置" };
+  const titles = { chat: currentTitle(), workflows: "工作流", memories: "记忆", notifications: "通知", settings: "设置", team: "团队", uploads: "附件", records: "运行记录" };
   $("#page-title").textContent = titles[state.view];
   document.title = `${titles[state.view]} · 沐璃`;
-  $$(".nav-item[data-view]").forEach((node) => {
+  $$(".management-nav [data-view]").forEach((node) => {
     const selected = node.dataset.view === state.view;
     node.classList.toggle("active", selected);
     node.setAttribute("aria-current", selected ? "page" : "false");
   });
-  $("#rename-session").hidden = state.view !== "chat" || !state.activeSession;
   $("#model-label").textContent = state.status?.model || (state.loading ? "读取模型…" : state.connected ? "配置模型" : "未连接");
   $("#model-dot").className = `status-dot${state.connected && state.status?.configured ? " online" : state.connected ? " warning" : ""}`;
   $("#settings-attention").hidden = !state.connected || !!state.status?.configured;
@@ -125,28 +147,17 @@ function renderChrome() {
   const unread = state.notifications.filter((item) => !item.read).length;
   $("#notification-count").hidden = !unread;
   $("#notification-count").textContent = String(unread);
+  $("#inbox-attention").hidden = !unread;
   $("#chat-view").hidden = state.view !== "chat";
-  $("#other-view").hidden = state.view === "chat";
+  $("#management-shell").hidden = state.view === "chat";
+  $("#settings-toggle").setAttribute("aria-pressed", String(state.view !== "chat"));
   $("#timeline-toggle").hidden = state.view !== "chat";
   $("#timeline").hidden = state.view !== "chat" || !state.timelineOpen;
   $("#timeline-toggle").setAttribute("aria-pressed", String(state.timelineOpen));
 }
 
 function renderSessions() {
-  const query = $("#session-search").value.trim().toLowerCase();
-  const fragment = document.createDocumentFragment();
-  const sessions = state.sessions.filter((session) => !query || session.title?.toLowerCase().includes(query));
-  if (!sessions.length) {
-    fragment.append(element("p", { class: "sidebar-empty", text: state.loading ? "正在读取会话…" : state.sessionsError ? "会话暂未读取" : query ? "没有找到会话" : "新的对话会保存在这里" }));
-  }
-  for (const session of sessions) {
-    const row = element("div", { class: `session-item${session.id === state.activeSession?.id ? " active" : ""}` });
-    if (session.status === "running" || session.status === "approval") row.append(element("span", { class: "session-running", "aria-label": "运行中" }));
-    row.append(element("button", { type: "button", class: "session-select", text: session.title || "未命名会话", title: session.title, dataset: { session: session.id } }));
-    const remove = iconButton("删除会话", "delete-session", "trash", { id: session.id });
-    remove.classList.add("session-delete"); row.append(remove); fragment.append(row);
-  }
-  $("#session-list").replaceChildren(fragment);
+  if (state.view === "records") renderOtherView();
 }
 
 function renderComposer() {
@@ -154,12 +165,13 @@ function renderComposer() {
   const running = busy();
   $("#mode-select").value = state.mode;
   $("#mode-select").disabled = running;
-  $("#send-button").hidden = running;
-  $("#send-button").disabled = !input.value.trim() || !state.connected;
+  $("#send-button").disabled = (!input.value.trim() && !state.attachments.length) || state.sending || state.uploading > 0 || !state.activeSession || !state.connected;
+  $("#send-button").setAttribute("aria-label", running ? "发送补充消息" : "发送消息");
   $("#stop-button").hidden = !running;
   $("#stop-button").disabled = state.sending || !state.activeSession;
-  $("#composer-context").textContent = state.activeSession ? "当前会话" : "新会话";
-  $("#composer-status").textContent = !state.connected ? state.loading ? "正在连接工作台" : "等待服务连接" : !state.status?.configured ? "请先在设置中配置模型" : running ? state.session.status === "approval" ? "等待你的批准" : "沐璃正在处理任务" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
+  $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "持续对话";
+  $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
+  $("#composer-status").textContent = state.uploading ? `正在保存 ${state.uploading} 个附件…` : !state.connected ? state.loading ? "正在连接沐璃" : "等待服务连接" : !state.status?.configured ? "请先配置主模型" : running ? state.session.status === "approval" ? "等待批准 · 可以继续补充" : "正在处理 · 可以继续补充" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
 }
 
 function scrollIsNearBottom() {
@@ -178,7 +190,7 @@ function renderChat() {
   const nearBottom = scrollIsNearBottom();
   $("#welcome").hidden = !!state.session.messages.length || busy();
   const container = $("#messages");
-  const visibleMessages = state.session.messages.filter((message) => ["user", "assistant"].includes(message.role) && (message.content || message.pending || message.streaming));
+  const visibleMessages = state.session.messages.filter((message) => ["user", "assistant"].includes(message.role) && (message.content || message.attachments?.length || message.attachment_ids?.length || message.pending || message.streaming));
   const ids = new Set(visibleMessages.map((message) => String(message.id)));
   for (const [id, node] of messageNodes) if (!ids.has(id)) { node.remove(); messageNodes.delete(id); }
   for (const message of visibleMessages) {
@@ -187,9 +199,10 @@ function renderChat() {
     if (!node) {
       node = element("article", { class: `message ${message.role}`, dataset: { messageId: id }, "aria-label": message.role === "user" ? "你的消息" : "沐璃的回复" });
       if (message.role !== "user") {
-        node.append(element("div", { class: "message-heading" }, element("span", { class: "message-avatar" }, element("img", { src: "./assets/mark.svg", alt: "" })), element("span", { text: "沐璃" }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
+        node.append(element("div", { class: "message-heading" }, element("span", { class: "message-avatar" }, element("img", { src: "./assets/muli-avatar.svg", alt: "" })), element("span", { text: "沐璃" }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
       }
       node.append(element("div", { class: "message-body" }));
+      node.append(element("div", { class: "message-attachments" }));
       const actions = element("div", { class: "message-actions" }, iconButton("复制消息", "copy-message", "copy", { id }));
       node.append(actions); messageNodes.set(id, node); container.append(node);
     }
@@ -200,6 +213,12 @@ function renderChat() {
       node.dataset.content = message.content ?? "";
     }
     node.classList.toggle("streaming", !!message.streaming);
+    const attachments = message.attachments ?? (message.attachment_ids ?? []).map((attachmentId) => state.uploads.find((file) => file.id === attachmentId) ?? { id: attachmentId, name: "附件" });
+    const attachmentKey = JSON.stringify(attachments);
+    if (node.dataset.attachments !== attachmentKey) {
+      $(".message-attachments", node).replaceChildren(...attachments.map((file) => renderAttachment(file)));
+      node.dataset.attachments = attachmentKey;
+    }
     let interruption = $(".interrupted-label", node);
     if (message.interrupted && !interruption) { interruption = element("div", { class: "interrupted-label", text: "生成已停止" }); node.append(interruption); }
   }
@@ -291,14 +310,32 @@ async function refreshNotifications() {
 
 async function connect() {
   state.loading = true; renderChrome();
-  const results = await Promise.allSettled([request("/status"), request("/sessions"), request("/notifications")]);
+  try {
+    state.auth = await request("/auth/status");
+    if (state.auth.required && !state.auth.authenticated) { state.loading = false; showLogin(); return; }
+    $("#auth-gate").hidden = true; $(".app-shell").inert = false;
+  } catch (error) {
+    state.connected = false; state.loading = false; renderChrome(); renderComposer();
+    if (error.status === 401) showLogin();
+    return;
+  }
+  const results = await Promise.allSettled([request("/status"), request("/conversation"), request("/notifications"), request("/sessions"), request("/uploads")]);
   if (results[0].status === "fulfilled") {
     state.status = results[0].value; state.connected = true;
     if (!state.activeSession) state.mode = state.status.mode || "auto";
   } else { state.connected = false; }
-  if (results[1].status === "fulfilled") { state.sessions = collection(results[1].value); state.sessionsError = ""; }
-  else state.sessionsError = results[1].reason.message;
+  if (results[1].status === "fulfilled") {
+    const detail = results[1].value;
+    state.activeSession = detail.session; state.mainSessionId = detail.session.id;
+    state.session = hydrateSession(detail); state.mode = detail.session.mode || state.mode;
+    if (isRunning(detail.session.status) && !isRunning(state.session.status)) state.session.status = detail.session.status;
+    state.sending = false; resetMessageNodes();
+    startSessionEvents(detail.session.id);
+  } else { state.connected = false; }
   if (results[2].status === "fulfilled") state.notifications = collection(results[2].value);
+  if (results[3].status === "fulfilled") { state.sessions = collection(results[3].value); state.sessionsError = ""; }
+  else state.sessionsError = results[3].reason.message;
+  if (results[4].status === "fulfilled") state.uploads = collection(results[4].value);
   state.loading = false;
   renderChrome(); renderSessions(); renderChat();
   if (state.connected) startGlobalEvents();
@@ -325,6 +362,7 @@ async function subscribe(path, controller, { cursor = "", onEvent, reportConnect
       });
     } catch (error) {
       if (error.name === "AbortError" || controller.signal.aborted) return;
+      if (error.status === 401) { showLogin(); return; }
     }
     if (controller.signal.aborted) return;
     if (reportConnection) { state.streamConnected = false; renderChrome(); }
@@ -353,6 +391,8 @@ function startGlobalEvents() {
       if (item?.id) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id)];
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
+    if (event.type.startsWith("team.") && state.view === "team") void refreshTeam();
+    if (event.type === "upload.created" && state.view === "uploads") void refreshUploads();
   } });
 }
 
@@ -365,7 +405,6 @@ function startSessionEvents(sessionId) {
       if (event.session_id && event.session_id !== state.activeSession?.id) return;
       state.session = applyEvent(state.session, event);
       if ((event.type === "tool.started" || event.type === "approval.requested") && !state.timelineUserChoice) state.timelineOpen = true;
-      if (event.type === "message.completed" && event.data?.message?.role === "user") state.sending = false;
       if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) { state.sending = false; void refreshSessions(); }
       queueRender();
     },
@@ -375,66 +414,47 @@ function startSessionEvents(sessionId) {
 function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); $("#tool-timeline").replaceChildren(); toolNodes = new Map(); }
 
 async function loadSession(id) {
-  const version = ++sessionRequestVersion;
-  closeSidebar();
-  try {
-    const detail = await request(`/sessions/${encodeURIComponent(id)}`);
-    if (version !== sessionRequestVersion) return;
-    sessionController?.abort();
-    state.activeSession = detail.session;
-    state.session = hydrateSession(detail);
-    if (isRunning(detail.session?.status) && !isRunning(state.session.status)) state.session.status = detail.session.status;
-    state.mode = detail.session?.mode || state.mode;
-    state.view = "chat"; state.sending = false; state.timelineUserChoice = false; state.timelineOpen = state.session.tools.some((tool) => tool.status === "running");
-    resetMessageNodes(); renderChrome(); renderSessions(); renderChat();
-    startSessionEvents(id);
-    scrollToBottom(true);
-  } catch (error) { showError(error); }
-}
-
-function newSession() {
-  ++sessionRequestVersion;
-  sessionController?.abort(); sessionController = null;
-  state.activeSession = null; state.session = createSessionState(); state.sending = false; state.view = "chat"; state.timelineOpen = false; state.timelineUserChoice = false; state.mode = state.status?.mode || "auto";
-  resetMessageNodes(); renderChrome(); renderSessions(); renderChat(); closeSidebar(); $("#message-input").focus();
+  if (id === state.mainSessionId) { await switchView("chat"); return; }
+  const detail = await request(`/sessions/${encodeURIComponent(id)}`);
+  const content = element("div", { class: "session-record" });
+  for (const message of detail.messages ?? []) {
+    if (!["user", "assistant"].includes(message.role)) continue;
+    content.append(element("article", { class: "record-message" }, element("strong", { text: message.role === "user" ? "任务" : "沐璃" }), element("div", { class: "message-body" }, renderMarkdown(message.content ?? "")), element("div", { class: "message-attachments" }, (message.attachments ?? []).map((file) => renderAttachment(file)))));
+  }
+  if (!content.children.length) content.append(emptyState("chat", "还没有消息"));
+  openDialog({ title: detail.session?.title || "运行记录", content, submitLabel: "关闭", onSubmit: async () => {} });
 }
 
 async function sendMessage(event) {
   event.preventDefault();
   const input = $("#message-input");
   const content = input.value.trim();
-  if (!content || busy() || !state.connected) return;
-  if (!state.status?.configured) { await switchView("settings"); toast("先配置一个主模型，即可开始对话。"); return; }
+  if ((!content && !state.attachments.length) || state.sending || state.uploading || !state.connected || !state.activeSession) return;
+  if (!state.status?.configured) { state.settingsTab = "models"; await switchView("settings"); toast("先配置一个主模型，即可开始对话。"); return; }
   const intentVersion = sessionRequestVersion;
   const mode = state.mode;
+  const wasRunning = busy();
+  const attachments = [...state.attachments];
   let targetSession = state.activeSession;
   let pendingId = null;
   const stillCurrent = () => intentVersion === sessionRequestVersion && (!targetSession || state.activeSession?.id === targetSession.id);
-  input.value = ""; resizeComposer();
+  input.value = ""; state.attachments = []; renderComposerAttachments(); resizeComposer();
   state.sending = true; renderComposer();
   try {
-    if (!targetSession) {
-      const created = await request("/sessions", { method: "POST", body: { mode } });
-      targetSession = created.session ?? created;
-      state.sessions.unshift(targetSession);
-      if (intentVersion === sessionRequestVersion) {
-        state.activeSession = targetSession;
-        renderChrome(); renderSessions(); startSessionEvents(targetSession.id);
-      }
-    }
     if (stillCurrent()) {
       pendingId = `pending:${crypto.randomUUID()}`;
-      state.session.messages.push({ id: pendingId, role: "user", content, created_at: new Date().toISOString(), pending: true });
+      state.session.messages.push({ id: pendingId, role: "user", content, attachments, created_at: new Date().toISOString(), pending: true });
       renderChat(); scrollToBottom(true);
     }
     try {
-      const result = await request(`/sessions/${encodeURIComponent(targetSession.id)}/messages`, { method: "POST", body: { content, mode } });
+      const result = await request(`/sessions/${encodeURIComponent(targetSession.id)}/messages`, { method: "POST", body: { content, mode, attachment_ids: attachments.map((file) => file.id) } });
       if (stillCurrent()) {
         if (result.message) state.session = applyEvent(state.session, { type: "message.completed", data: { message: result.message } });
         const alreadyFinished = state.session.runId === result.run_id && ["completed", "cancelled", "failed"].includes(state.session.status);
         state.session.runId = result.run_id;
         if (!isRunning(state.session.status) && !alreadyFinished) state.session.status = "running";
         state.sending = false;
+        if (result.queued && wasRunning) toast("补充消息已排队");
       }
       void refreshSessions();
     } catch (error) {
@@ -443,7 +463,7 @@ async function sendMessage(event) {
     }
   } catch (error) {
     showError(error);
-    if (stillCurrent()) { state.sending = false; if (!input.value) input.value = content; resizeComposer(); }
+    if (stillCurrent()) { state.sending = false; if (!input.value) input.value = content; state.attachments = [...attachments, ...state.attachments.filter((file) => !attachments.some((existing) => existing.id === file.id))]; renderComposerAttachments(); resizeComposer(); }
   }
   renderChrome(); renderChat();
 }
@@ -469,21 +489,6 @@ async function stopRun(button) {
 
 function resizeComposer() {
   const input = $("#message-input"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 220)}px`; renderComposer();
-}
-
-function syncSidebarAccessibility() {
-  const mobile = window.matchMedia("(max-width: 760px)").matches;
-  const hidden = mobile && !$("#sidebar").classList.contains("open");
-  $("#sidebar").inert = hidden;
-  $("#sidebar").setAttribute("aria-hidden", String(hidden));
-  if (!mobile) $("#sidebar-backdrop").hidden = true;
-}
-
-function closeSidebar() {
-  const hadFocus = $("#sidebar").contains(document.activeElement);
-  $("#sidebar").classList.remove("open"); $("#sidebar-backdrop").hidden = true;
-  if (hadFocus && window.matchMedia("(max-width: 760px)").matches) $('[data-action="toggle-sidebar"]').focus();
-  syncSidebarAccessibility();
 }
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, onSubmit }) {
@@ -533,11 +538,16 @@ function emptyState(iconName, title, description) {
 }
 
 async function switchView(view) {
-  state.view = view; state.viewError = ""; closeSidebar(); renderChrome();
-  if (view === "chat") { renderChat(); return; }
+  if (state.view === "settings" && view !== "settings") collectSettingsForm();
+  const version = ++viewRequestVersion;
+  state.view = view; state.viewError = ""; renderChrome();
+  if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
   state.viewLoading = true; renderOtherView();
   try {
     if (view === "workflows") state.workflows = collection(await request("/workflows"));
+    if (view === "uploads") state.uploads = collection(await request("/uploads"));
+    if (view === "team") state.team = await request("/team");
+    if (view === "records") { state.sessions = collection(await request("/sessions")); state.sessionsError = ""; }
     if (view === "memories") {
       const results = await Promise.allSettled([request(`/memories${state.memoryQuery ? `?query=${encodeURIComponent(state.memoryQuery)}` : ""}`), request("/memories/graph")]);
       if (results[0].status === "rejected") throw results[0].reason;
@@ -551,14 +561,17 @@ async function switchView(view) {
       state.reminders = results[1].status === "fulfilled" ? collection(results[1].value) : [];
       state.remindersError = results[1].status === "rejected" ? results[1].reason.message : "";
     }
-    if (view === "settings") {
+    if (view === "settings" && !state.settingsDraft) {
       const results = await Promise.allSettled([request("/settings"), request("/service")]);
       if (results[0].status === "rejected") throw results[0].reason;
       state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); state.settingsSaved = false;
       state.service = results[1].status === "fulfilled" ? results[1].value : null;
     }
-  } catch (error) { state.viewError = error.message; }
+  } catch (error) { if (version === viewRequestVersion) state.viewError = error.message; }
+  if (version !== viewRequestVersion) return;
   state.viewLoading = false; renderOtherView(); renderChrome();
+  const heading = $(".view-heading h2", $("#other-view"));
+  if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
 }
 
 function renderOtherView() {
@@ -573,6 +586,102 @@ function renderOtherView() {
   if (state.view === "workflows") root.replaceChildren(renderWorkflows());
   if (state.view === "notifications") root.replaceChildren(renderNotifications());
   if (state.view === "settings") root.replaceChildren(renderSettings());
+  if (state.view === "uploads") root.replaceChildren(renderUploads());
+  if (state.view === "team") root.replaceChildren(renderTeam());
+  if (state.view === "records") root.replaceChildren(renderRecords());
+}
+
+function renderThemeControl() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  const button = $("#theme-toggle");
+  button.replaceChildren(icon(dark ? "sun" : "moon"));
+  button.setAttribute("aria-label", dark ? "切换浅色" : "切换深色");
+  button.title = dark ? "切换浅色" : "切换深色";
+}
+
+function renderAttachment(file, { compact = false, removable = false } = {}) {
+  const kind = attachmentKind(file);
+  const root = element("div", { class: `attachment ${compact ? "compact" : kind}` });
+  if (!compact && kind === "image") root.append(element("a", { href: attachmentURL(file), target: "_blank", rel: "noopener", class: "attachment-preview", "aria-label": `查看 ${file.name}` }, element("img", { src: attachmentURL(file), alt: file.name || "图片附件", loading: "lazy" })));
+  if (!compact && (kind === "audio" || kind === "video")) root.append(element(kind, { src: attachmentURL(file), controls: true, preload: "metadata", "aria-label": file.name || "媒体附件" }));
+  root.append(element("div", { class: "attachment-info" }, icon(kind === "file" ? "attachment" : kind === "image" ? "sparkles" : "play"), element("span", { class: "attachment-name", text: file.name || "附件", title: file.name }), element("small", { text: formatBytes(file.size) }), removable ? iconButton("移除附件引用", "remove-attachment", "close", { id: file.id }) : element("a", { href: attachmentURL(file, true), download: file.name || "", class: "icon-button", "aria-label": `下载 ${file.name || "附件"}`, title: "下载" }, icon("download"))));
+  return root;
+}
+
+function renderComposerAttachments() {
+  const root = $("#composer-attachments");
+  root.hidden = !state.attachments.length;
+  root.replaceChildren(...state.attachments.map((file) => renderAttachment(file, { compact: true, removable: true })));
+  renderComposer();
+}
+
+async function addFiles(files) {
+  const pending = [...files];
+  state.uploading += pending.length; renderComposer();
+  for (const file of pending) {
+    try {
+      const uploaded = await uploadFile(file);
+      state.uploads = [uploaded, ...state.uploads.filter((entry) => entry.id !== uploaded.id)];
+      if (!state.attachments.some((entry) => entry.id === uploaded.id)) state.attachments.push(uploaded);
+      renderComposerAttachments();
+    } catch (error) { if (error.status === 401) showLogin(); toast(`${file.name}：${error.message}`, true); }
+    finally { state.uploading -= 1; renderComposer(); }
+  }
+  if (state.view === "uploads") renderOtherView();
+}
+
+async function refreshUploads() {
+  try { state.uploads = collection(await request("/uploads")); if (state.view === "uploads") renderOtherView(); } catch (error) { showError(error); }
+}
+
+function renderUploads() {
+  const root = element("div", { class: "view-content" }, viewHeading("附件", "文件保存在本地，发送时只引用附件。", actionButton("添加文件", "attach-files", "primary-button", "plus")));
+  if (!state.uploads.length) root.append(emptyState("attachment", "还没有附件", "图片、文档与音视频都可以添加。"));
+  for (const file of state.uploads) root.append(element("article", { class: "upload-row" }, renderAttachment(file), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id })));
+  return root;
+}
+
+async function refreshTeam() {
+  try { state.team = await request("/team"); if (state.view === "team") renderOtherView(); } catch (error) { showError(error); }
+}
+
+function renderTeam() {
+  const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")));
+  root.append(actionButton("与沐璃安排协作", "configure-prompt", "configuration-link", "chat", { prompt: "请帮我安排一组协作任务：" }));
+  const members = state.team.members ?? [];
+  const status = { running: "运行中", queued: "排队中", idle: "空闲", completed: "已完成", failed: "失败", closed: "已关闭", cancelled: "已停止", approval: "等待审批" };
+  if (!members.length) root.append(emptyState("team", "当前没有协作任务", "需要时，沐璃会在这里展示团队进展。"));
+  for (const member of members) {
+    const content = element("div", { class: "row-content" }, element("h3", { text: member.name || member.id }), member.task && element("p", { text: member.task }), element("div", { class: "row-meta" }, member.role ?? "", status[member.status] ?? member.status));
+    if (member.last_message) content.append(element("p", { class: "team-last-message", text: typeof member.last_message === "string" ? member.last_message : member.last_message.content ?? "" }));
+    root.append(element("article", { class: "team-row" }, element("div", { class: "row-icon" }, icon("team")), content, element("div", { class: "row-actions" }, member.status !== "closed" && iconButton("发送消息", "message-team", "chat", { id: member.id }), member.session_id && iconButton("查看记录", "workflow-session", "panel", { session: member.session_id }), ["running", "queued", "approval"].includes(member.status) && iconButton("停止任务", "stop-team", "stop", { id: member.id }))));
+  }
+  if (state.team.messages?.length) {
+    const details = element("details", { class: "team-messages advanced-settings" }, element("summary", { text: "协作消息" }));
+    for (const message of state.team.messages) details.append(element("div", { class: "team-message" }, element("strong", { text: message.from_name || message.sender || message.from || "成员" }), element("p", { text: message.content ?? "" }), element("time", { text: formatTimestamp(message.created_at) })));
+    root.append(details);
+  }
+  return root;
+}
+
+function renderRecords() {
+  const root = element("div", { class: "view-content" }, viewHeading("运行记录", "主对话与各项任务的持久化记录。"));
+  const search = element("input", { type: "search", value: state.recordQuery, placeholder: "搜索记录", "aria-label": "搜索记录", onInput: (event) => { state.recordQuery = event.target.value; renderRecordList(); } });
+  root.append(element("div", { class: "search-field" }, icon("search"), search), element("div", { id: "record-list" }));
+  queueMicrotask(renderRecordList);
+  return root;
+}
+
+function renderRecordList() {
+  const list = $("#record-list");
+  if (!list) return;
+  list.replaceChildren();
+  const query = state.recordQuery.trim().toLowerCase();
+  for (const session of state.sessions.filter((record) => !query || record.title?.toLowerCase().includes(query))) {
+    const main = session.id === state.mainSessionId;
+    list.append(element("article", { class: "record-row" }, element("div", { class: "row-content" }, element("h3", { text: main ? "沐璃主对话" : session.title || "任务记录" }), element("div", { class: "row-meta" }, main ? "持续对话" : "任务", element("time", { text: formatTimestamp(session.updated_at ?? session.created_at) }))), actionButton(main ? "回到对话" : "查看", "workflow-session", "text-button", undefined, { session: session.id }), !main && iconButton("删除记录", "delete-session", "trash", { id: session.id })));
+  }
+  if (!list.children.length) list.append(emptyState("chat", query ? "没有找到记录" : "还没有运行记录"));
 }
 
 function renderMemories() {
@@ -837,14 +946,32 @@ async function markRead(id) {
 function renderSettings() {
   if (!state.settingsDraft) return element("div", { class: "view-content" }, emptyState("settings", "设置暂不可用"));
   const nav = element("nav", { class: "settings-nav", "aria-label": "设置分组" });
-  for (const [key, label] of [["models", "模型"], ["tools", "权限与工具"], ["connections", "连接"], ["system", "系统"]]) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
+  for (const [key, label] of [["overview", "概览"], ["models", "模型"], ["persona", "称呼与提示词"], ["tools", "权限与工具"], ["connections", "连接"], ["media", "媒体与检索"], ["system", "系统"]]) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
+  if (state.settingsTab === "overview") return element("div", { class: "view-content" }, viewHeading("设置", "告诉沐璃需要调整什么。"), element("div", { class: "settings-layout" }, nav, renderConfigurationOverview()));
   const form = element("form", { id: "settings-form", class: "settings-panel", onSubmit: saveSettings });
   if (state.settingsTab === "models") form.append(renderModelSettings());
   if (state.settingsTab === "tools") form.append(renderToolSettings());
   if (state.settingsTab === "connections") form.append(renderConnectionSettings());
   if (state.settingsTab === "system") form.append(renderSystemSettings());
+  if (state.settingsTab === "persona") form.append(renderPersonaSettings());
+  if (state.settingsTab === "media") form.append(renderMediaSettings());
   form.append(element("p", { class: "form-error", id: "settings-error", hidden: true }), element("div", { class: "settings-footer" }, element("button", { class: "primary-button", type: "submit", text: "保存设置" }), state.settingsSaved && element("span", { class: "settings-save-status", text: "已保存" })));
   return element("div", { class: "view-content" }, viewHeading("设置", "模型、工具与本地运行配置。"), element("div", { class: "settings-layout" }, nav, form));
+}
+
+function renderConfigurationOverview() {
+  const form = element("form", { class: "configuration-form", onSubmit: async (event) => {
+    event.preventDefault();
+    const input = $("textarea", form);
+    const content = input.value.trim();
+    if (!content) return;
+    await switchView("chat");
+    $("#message-input").value = `请调整沐璃的配置：\n${content}`; resizeComposer();
+    if (state.status?.configured) $("#composer").requestSubmit();
+  } }, element("label", { class: "field" }, element("span", { text: "想调整什么？" }), element("textarea", { rows: 4, placeholder: "例如：每天晚上九点提醒我整理笔记", required: true, "aria-label": "配置要求" })), element("button", { type: "submit", class: "primary-button", text: "交给沐璃" }));
+  const examples = element("div", { class: "configuration-examples" });
+  for (const prompt of ["帮我检查当前配置", "帮我安排一组协作任务", "记住我的工作偏好"]) examples.append(actionButton(prompt, "configure-prompt", "text-button", undefined, { prompt }));
+  return element("div", { class: "settings-panel configuration-overview" }, form, examples, !state.status?.configured && element("div", { class: "configuration-bootstrap" }, element("p", { text: "先连接一个主模型，即可通过对话配置。" }), actionButton("连接主模型", "model-settings", "secondary-button", "link")), settingsSection("当前状态", statusList([["主模型", state.status?.model || "未配置"], ["执行模式", MODES[state.mode]?.label ?? state.mode], ["运行任务", String(state.status?.running ?? 0)], ["工作目录", (state.settingsDraft.workspace_roots ?? []).join("、")]])));
 }
 
 function settingsSection(title, ...children) {
@@ -856,19 +983,41 @@ function renderModelSettings() {
   const model = state.settingsDraft.models?.[role] ?? {};
   const path = `models.${role}`;
   const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "模型角色" });
-  for (const [key, label] of [["main", "主模型"], ["reviewer", "审阅模型"], ["worker", "执行模型"]]) tabs.append(element("button", { type: "button", role: "tab", class: role === key ? "active" : "", text: label, "aria-selected": String(role === key), dataset: { modelRole: key } }));
+  for (const [key, label] of [["main", "主模型"], ["reviewer", "审阅"], ["worker", "执行"], ["vision", "视觉"], ["compactor", "压缩"]]) tabs.append(element("button", { type: "button", role: "tab", class: role === key ? "active" : "", text: label, "aria-selected": String(role === key), dataset: { modelRole: key } }));
   const protocol = model.protocol ?? "openai_chat";
   const advanced = element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }),
     element("div", { class: "field-row" }, field("Temperature", `${path}.temperature`, model.temperature ?? "", { type: "number", step: .1, min: 0, max: 2, placeholder: "使用模型默认值" }), field("Top P", `${path}.top_p`, model.top_p ?? "", { type: "number", step: .05, min: 0, max: 1, placeholder: "使用模型默认值" })),
     element("div", { class: "field-row" }, field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值" }), field("超时（秒）", `${path}.timeout`, model.timeout ?? "", { type: "number", min: 1, max: 600, placeholder: "使用服务默认值" })),
     element("div", { class: "field-row" }, field("重试次数", `${path}.max_retries`, model.max_retries ?? "", { type: "number", min: 0, max: 5, step: 1 }), field("API Key 环境变量", `${path}.api_key_env`, model.api_key_env ?? "", { placeholder: "可选" })),
-    field(protocol === "anthropic" ? "Thinking" : "Reasoning", `${path}.reasoning`, pretty(model.reasoning ?? {}), { type: "textarea", rows: 2, json: true, format: "json", hint: protocol === "anthropic" ? 'JSON，例如 {"type":"enabled","budget_tokens":1024}' : 'JSON，例如 {"effort":"high"}' }),
+    field("Reasoning", `${path}.reasoning`, pretty(model.reasoning ?? {}), { type: "textarea", rows: 2, json: true, format: "json" }),
+    field("Thinking", `${path}.thinking`, pretty(model.thinking ?? {}), { type: "textarea", rows: 2, json: true, format: "json" }),
+    field("Reasoning effort", `${path}.reasoning_effort`, model.reasoning_effort ?? "", { placeholder: "使用模型默认值", format: "nullable" }),
     field("Extra body", `${path}.extra_body`, pretty(model.extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }),
     field("Extra headers", `${path}.extra_headers`, pretty(model.extra_headers ?? {}), { type: "textarea", rows: 3, json: true, format: "json", hint: "保持 •••• 可保留原值，移除字段即可删除。" }),
     switchField("流式输出", `${path}.stream`, model.stream !== false),
     model.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false));
-  return element("div", {}, tabs, role !== "main" && element("p", { class: "settings-role-hint", text: role === "worker" ? "未单独配置时，复用主模型。" : "未配置时，工具审查交由你确认。" }),
-    settingsSection("模型连接", selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]), field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" }), field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" }), field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), advanced));
+  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", reviewer: "未配置时，工具审查交由你确认。", vision: "主模型不支持图片时，使用此模型识图。" };
+  return element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
+    settingsSection("模型连接", selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]), field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" }), field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" }), field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), switchField("支持图片", `${path}.vision`, model.vision), advanced));
+}
+
+function renderPersonaSettings() {
+  const persona = state.settingsDraft.persona ?? {};
+  return element("div", {}, settingsSection("称呼", field("如何称呼你", "persona.user_name", persona.user_name ?? "你", { required: true }), field("助手名称", "persona.name", persona.name ?? "沐璃", { required: true }), field("简介", "persona.introduction", persona.introduction ?? "", { type: "textarea", rows: 3 })), settingsSection("提示词", field("主提示词", "persona.prompt", persona.prompt ?? "", { type: "textarea", rows: 8, placeholder: "留空使用默认提示词" }), field("补充要求", "persona.append", persona.append ?? "", { type: "textarea", rows: 4 })));
+}
+
+function renderMediaSettings() {
+  const root = element("div");
+  for (const [key, label] of [["embedding", "嵌入"], ["reranker", "重排序"], ["asr", "语音识别"], ["tts", "语音合成"]]) {
+    const path = `media.${key}`; const config = state.settingsDraft.media?.[key] ?? {};
+    const details = element("details", { class: "media-profile advanced-settings" }, element("summary", {}, element("span", { text: label }), element("small", { text: config.model || "未配置" })), field("模型", `${path}.model`, config.model ?? ""), field("服务地址", `${path}.base_url`, config.base_url ?? "", { type: "url" }), field("API Key", `${path}.api_key`, "", { type: "password", placeholder: config.api_key_set ? "已配置，留空保留" : "可选" }));
+    if (key === "embedding") details.append(field("维数", `${path}.dimensions`, config.dimensions ?? "", { type: "number", min: 1 }), field("查询指令", `${path}.query_instruction`, config.query_instruction ?? "", { type: "textarea", rows: 2 }));
+    if (key === "asr") details.append(field("语言", `${path}.language`, config.language ?? "", { placeholder: "自动识别" }));
+    if (key === "tts") details.append(field("声音", `${path}.voice`, config.voice ?? ""), field("音频格式", `${path}.response_format`, config.response_format ?? "mp3"), field("语速", `${path}.speed`, config.speed ?? "", { type: "number", min: .01, max: 4, step: .1 }), field("朗读要求", `${path}.instructions`, config.instructions ?? "", { type: "textarea", rows: 2 }));
+    details.append(element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }), field("API Key 环境变量", `${path}.api_key_env`, config.api_key_env ?? ""), field("超时（秒）", `${path}.timeout`, config.timeout ?? "", { type: "number", min: 1, max: 600 }), field("Extra body", `${path}.extra_body`, pretty(config.extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }), field("Extra headers", `${path}.extra_headers`, pretty(config.extra_headers ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }), config.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false)));
+    root.append(details);
+  }
+  return root;
 }
 
 function renderToolSettings() {
@@ -936,6 +1085,7 @@ function renderSystemSettings() {
   return element("div", {},
     settingsSection("工作台", statusList([["版本", state.status?.version], ["平台", state.status?.platform], ["运行任务", String(state.status?.running ?? 0)]]), element("div", { class: "field-row field-top-space" }, field("监听地址", "server.host", config.server?.host ?? ""), field("端口", "server.port", config.server?.port ?? "", { type: "number", min: 1, max: 65535 })), element("p", { text: "监听配置在下次启动时生效。" }), element("div", { class: "system-links" }, element("a", { href: "/api/export", download: "muli-export.jsonl", class: "secondary-button export-button", text: "导出数据" }), element("a", { href: "/api/docs", target: "_blank", rel: "noopener", class: "secondary-button export-button", text: "API 参考" }))),
     settingsSection("通知", switchField("桌面通知", "notifications.enabled", config.notifications?.enabled), state.status?.notifications?.available === false && element("p", { text: "桌面通知暂不可用。" }), state.status?.notifications?.last_error && element("p", { class: "form-error", text: state.status.notifications.last_error })),
+    settingsSection("访问", field("访问密码", "server.password", "", { type: "password", placeholder: config.server?.password_set ? "已设置，留空保留" : "尚未设置" }), config.server?.password_set && switchField("清除访问密码", "server.clear_password", false), state.auth.required && actionButton("退出登录", "logout", "secondary-button")),
     serviceSection,
     settingsSection("运行限制", element("div", { class: "field-row" }, field("并行 Agent 数", "limits.max_parallel_agents", limits.max_parallel_agents ?? "", { type: "number", min: 1, max: 32 }), field("未完成任务上限", "limits.max_pending_runs", limits.max_pending_runs ?? "", { type: "number", min: 1, placeholder: "使用服务默认值" })), element("div", { class: "field-row" }, field("工具步骤上限", "limits.max_tool_steps", limits.max_tool_steps ?? "", { type: "number", min: 1 }), field("任务时限（秒）", "limits.max_run_seconds", limits.max_run_seconds ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("文件大小上限（字节）", "limits.max_file_bytes", limits.max_file_bytes ?? "", { type: "number", min: 1 }), field("工具输出字符上限", "limits.max_output_chars", limits.max_output_chars ?? "", { type: "number", min: 1 }))));
 }
@@ -961,8 +1111,9 @@ function collectSettingsForm() {
     } else if (input.dataset.format === "json") {
       try { value = parseJSONField(input.value); } catch { throw new Error(`${input.closest("label")?.firstElementChild?.textContent ?? "参数"} 需要填写有效 JSON 对象。`); }
     } else if (input.dataset.format === "lines") value = input.value.split("\n").map((line) => line.trim()).filter(Boolean);
+    else if (input.dataset.format === "nullable") value = input.value.trim() || null;
     else value = input.type === "password" ? input.value : input.value.trim();
-    if (input.name.endsWith(".api_key") && !value) continue;
+    if ((input.name.endsWith(".api_key") || input.name === "server.password") && !value) continue;
     setPath(state.settingsDraft, input.name, value);
   }
 }
@@ -1030,12 +1181,31 @@ async function refreshService() {
 }
 
 async function handleAction(action, button) {
-  if (action === "new-session") newSession();
-  if (action === "toggle-sidebar") { const open = !$("#sidebar").classList.contains("open"); $("#sidebar").classList.toggle("open", open); $("#sidebar-backdrop").hidden = !open; syncSidebarAccessibility(); if (open) $(".new-session").focus(); }
-  if (action === "toggle-session-search") { const input = $("#session-search"); input.hidden = !input.hidden; if (!input.hidden) input.focus(); }
+  if (action === "toggle-theme") { toggleTheme(); renderThemeControl(); }
+  if (action === "logout") { await request("/auth/logout", { method: "POST" }); state.settings = null; state.settingsDraft = null; state.status = null; state.session = createSessionState(); resetMessageNodes(); showLogin(); }
+  if (action === "open-settings") { state.settingsTab = "overview"; await switchView("settings"); }
+  if (action === "attach-files") $("#file-input").click();
+  if (action === "remove-attachment") { state.attachments = state.attachments.filter((file) => file.id !== button.dataset.id); renderComposerAttachments(); }
+  if (action === "use-attachment") {
+    const file = state.uploads.find((entry) => entry.id === button.dataset.id);
+    if (file && !state.attachments.some((entry) => entry.id === file.id)) state.attachments.push(file);
+    renderComposerAttachments(); await switchView("chat");
+  }
+  if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
+  if (action === "refresh-team") await refreshTeam();
+  if (action === "message-team") {
+    const id = button.dataset.id;
+    openDialog({ title: "发送协作消息", content: field("消息", "content", "", { type: "textarea", required: true }), submitLabel: "发送", onSubmit: async (form) => {
+      const content = String(new FormData(form).get("content")).trim();
+      if (!content) throw new Error("请输入消息。");
+      await request(`/team/${encodeURIComponent(id)}/messages`, { method: "POST", body: { content } });
+      await refreshTeam(); toast("协作消息已发送");
+    } });
+  }
+  if (action === "stop-team") { await request(`/team/${encodeURIComponent(button.dataset.id)}/stop`, { method: "POST" }); await refreshTeam(); toast("已发送停止请求"); }
   if (action === "toggle-timeline") { state.timelineOpen = !state.timelineOpen; state.timelineUserChoice = true; renderChrome(); renderTimeline(); }
   if (action === "model-settings") { state.settingsTab = "models"; await switchView("settings"); }
-  if (action === "refresh") { await connect(); if (state.activeSession) await loadSession(state.activeSession.id); if (state.view !== "chat") await switchView(state.view); }
+  if (action === "refresh") { await connect(); if (state.view !== "chat") await switchView(state.view); }
   if (action === "retry-view") await switchView(state.view);
   if (action === "scroll-bottom") scrollToBottom(true, true);
   if (action === "stop") await stopRun(button);
@@ -1045,20 +1215,11 @@ async function handleAction(action, button) {
     const message = state.session.messages.find((item) => String(item.id) === button.dataset.id);
     if (message) { await navigator.clipboard.writeText(message.content); toast("已复制"); }
   }
-  if (action === "rename-session" && state.activeSession) {
-    const id = state.activeSession.id;
-    openDialog({ title: "重命名会话", content: field("名称", "title", currentTitle(), { required: true }), onSubmit: async (form) => {
-      const title = String(new FormData(form).get("title")).trim();
-      if (!title) throw new Error("请输入会话名称。");
-      await request(`/sessions/${encodeURIComponent(id)}`, { method: "PATCH", body: { title } });
-      state.activeSession.title = title; await refreshSessions(); renderChrome();
-    } });
-  }
   if (action === "delete-session") {
     const id = button.dataset.id;
     confirmAction("删除会话", "这段会话及其运行记录会被删除。", "删除会话", async () => {
       await request(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (state.activeSession?.id === id) newSession(); await refreshSessions(); toast("会话已删除");
+      await refreshSessions(); toast("记录已删除");
     });
   }
   if (action === "new-memory") editMemory();
@@ -1101,7 +1262,7 @@ document.addEventListener("click", async (event) => {
     if (button.dataset.action) await handleAction(button.dataset.action, button);
     else if (button.dataset.view) await switchView(button.dataset.view);
     else if (button.dataset.session) await loadSession(button.dataset.session);
-    else if (button.dataset.prompt) { $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
+    else if (button.dataset.prompt) { if (state.view !== "chat") await switchView("chat"); $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
     else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); }
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) { state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
@@ -1110,9 +1271,17 @@ document.addEventListener("click", async (event) => {
 });
 
 $("#composer").addEventListener("submit", sendMessage);
+$("#login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target; const button = $('button[type="submit"]', form); const input = $("#login-password");
+  button.disabled = true; $("#login-error").hidden = true;
+  try { await request("/auth/login", { method: "POST", body: { password: input.value } }); input.value = ""; await connect(); }
+  catch (error) { $("#login-error").textContent = error.message; $("#login-error").hidden = false; }
+  finally { button.disabled = false; }
+});
 $("#message-input").addEventListener("input", resizeComposer);
 $("#message-input").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (!busy()) $("#composer").requestSubmit(); }
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
 });
 $("#mode-select").addEventListener("change", async (event) => {
   const previous = state.mode; state.mode = event.target.value;
@@ -1120,8 +1289,7 @@ $("#mode-select").addEventListener("change", async (event) => {
   catch (error) { state.mode = previous; showError(error); }
   renderComposer(); renderTimeline();
 });
-$("#session-search").addEventListener("input", renderSessions);
-$("#sidebar-backdrop").addEventListener("click", closeSidebar);
+$("#file-input").addEventListener("change", (event) => { void addFiles(event.target.files); event.target.value = ""; });
 $("#conversation-scroll").addEventListener("scroll", () => { $("#scroll-bottom").hidden = scrollIsNearBottom() || !state.session.messages.length; }, { passive: true });
 $("#dialog-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1131,8 +1299,8 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   finally { submit.disabled = false; }
 });
 document.addEventListener("keydown", (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); if (!$("#app-dialog").open) newSession(); }
-  if (event.key === "Escape") closeSidebar();
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); if (!$("#app-dialog").open) void switchView("chat"); }
+  if (event.key === "Escape" && state.view !== "chat" && !$("#app-dialog").open) void switchView("chat");
   if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) && event.target.getAttribute("role") === "tab") {
     const tabs = $$('[role="tab"]', event.target.closest('[role="tablist"]'));
     const index = tabs.indexOf(event.target);
@@ -1144,8 +1312,8 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
 window.addEventListener("pagehide", () => { globalController?.abort(); sessionController?.abort(); });
-window.matchMedia("(max-width: 760px)").addEventListener("change", syncSidebarAccessibility);
 
 fillIcons();
-syncSidebarAccessibility();
+initializeTheme(); renderThemeControl();
+document.addEventListener("muli:themechange", renderThemeControl);
 void connect();
