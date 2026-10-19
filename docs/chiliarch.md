@@ -4,6 +4,8 @@ MuLi 作为一个配对 agent 主动连接 chiliarch。后台通过 SSE 接收�
 
 ## 连接自我介绍（chiliarch 0.5.0）
 
+chiliarch [0.5.0](https://pypi.org/project/chiliarch/0.5.0/) 已于 2026-10-20（北京时间）发布。[发布流水线](https://github.com/69gg/chiliarch/actions/runs/39295005766) 的六项作业通过；对应签名提交 `068a6b6` 与标签 `v0.5.0`。发布前完整 CI 覆盖 Linux/macOS/Windows 与 Python 3.11/3.12/3.13，PyPI 和 [GitHub Release](https://github.com/69gg/chiliarch/releases/tag/v0.5.0) 的两个发行包 SHA-256 一致。这证明发行与测试结果，不代表已替用户安装或完成真实配对。
+
 每次连接和重连的首个心跳都会发送 `payload.metadata.introduction`，之后随正常心跳更新。介绍优先取 `persona.introduction`，为空时从 `persona.name` 与 `persona.user_name` 构造“我是……，……的私人数字助手”及统筹职责说明；不会额外调用模型。主 MuLi 可通过已有配置管理工具修改 persona.introduction，配置校验和重新连接流程沿用原机制。
 
 介绍为最多 4000 字符的纯文本，不包含配置密钥或会话正文。chiliarch 保存并在 agent 管理界面和总管工具结果中展示，内容属于自行声明的资料，不能授予权限。软件 0.5.0 的协议版本仍为 `1.0`；配对请求格式不变，旧 chiliarch 服务端仍接受已有 metadata 扩展，旧客户端缺失字段仍合法。其他客户端可省略表示保留、传空串或 `null` 表示清除；MuLi 正常运行会持续上报当前人格介绍。
