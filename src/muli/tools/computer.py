@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,7 +75,14 @@ _HELPER_ERRORS = frozenset(
 
 
 class Computer:
-    def __init__(self, settings: Settings, *, capture: Capture | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        capture: Capture | None = None,
+        owner: Callable[[], tuple[str, str] | None] | None = None,
+        dispatch_guard: Callable[[], Callable[[], None]] | None = None,
+    ) -> None:
         self.settings = settings
         self.config = settings.computer
         self.capture = capture
@@ -87,11 +95,21 @@ class Computer:
         self._snapshot_generation = 0
         self._discovery_generation = 0
         self._lock = asyncio.Lock()
+        self.backend = (
+            {"linux": "atspi", "darwin": "ax"}.get(sys.platform, "unavailable")
+            if self.config.backend == "auto"
+            else self.config.backend
+        )
+        # AX refs live inside one short-lived native process. Importing its host
+        # adapter never loads macOS libraries or starts that process.
+        from muli.tools.ax_computer import AXComputer
+
+        self._ax = AXComputer(self, owner=owner, dispatch_guard=dispatch_guard)
 
     async def call(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self.config.enabled:
             raise ComputerError("disabled", "电脑操作尚未启用")
-        if sys.platform != "linux":
+        if self.backend != "atspi" or sys.platform != "linux":
             raise ComputerError("backend_unavailable", "当前版本的无障碍操作后端支持 Linux AT-SPI")
         action = request.get("operation") in {"action", "type"}
 
@@ -154,6 +172,8 @@ class Computer:
         return data
 
     async def status(self) -> dict[str, Any]:
+        if self.backend == "ax":
+            return await self._ax.status()
         try:
             data = await self.call({"operation": "probe"})
             if (
@@ -166,7 +186,7 @@ class Computer:
                 raise ComputerError("protocol_error", "AT-SPI 探测响应格式无效")
             result = {
                 "available": True,
-                "backend": "atspi",
+                "backend": self.backend,
                 "state": "ready",
                 "reason": "",
                 "dependency_available": True,
@@ -182,7 +202,7 @@ class Computer:
         except ComputerError as exc:
             result = {
                 "available": False,
-                "backend": "atspi",
+                "backend": self.backend,
                 "reason": exc.message,
                 "state": "disabled" if exc.code == "disabled" else "unavailable",
                 "dependency_available": (
@@ -361,6 +381,8 @@ class Computer:
         return result
 
     async def targets(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.backend == "ax":
+            return await self._ax.targets(arguments)
         selected: _Target | None = None
         selection_error: ComputerError | None = None
         try:
@@ -423,6 +445,8 @@ class Computer:
             return result
 
     async def snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.backend == "ax":
+            return await self._ax.snapshot(arguments)
         generation = self._clear_snapshot()
         selected = self._target(arguments["target_id"]) if "target_id" in arguments else None
         discovery_id = self.discovery_id
@@ -487,6 +511,8 @@ class Computer:
             return result
 
     async def action(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.backend == "ax":
+            return await self._ax.action(arguments)
         async with self._lock:
             if (
                 not self.snapshot_id
@@ -511,20 +537,35 @@ class Computer:
             # A snapshot authorizes one action only, including concurrent callers.
             return await self.call(request)
 
+    async def release(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return await self._ax.release() if self.backend == "ax" else {"released": True}
+
+    async def release_execution(self, session_id: str, run_id: str) -> None:
+        await self._ax.release_execution((session_id, run_id))
+
+    async def aclose(self) -> None:
+        await self._ax.aclose()
+
     def tools(self) -> list[Tool]:
         target = {"snapshot_id": string(), "node_id": string()}
         tools = [
             Tool(
                 "computer_targets",
-                "发现 Linux 无障碍应用；使用当前 application_id 仅发现其直接窗口，旧目标随新发现失效",
+                "发现无障碍应用；macOS 限前台应用。当前 application_id 可发现其窗口",
                 parameters({"application_id": string("当前发现结果中的应用 ID，可选")}),
                 self.targets,
             ),
             Tool(
                 "computer_snapshot",
-                "优先读取 Linux 无障碍树；不可用时可另行请求截图，操作前必须获取新快照",
-                parameters({"target_id": string("当前发现中的应用或窗口 ID；省略则读取桌面")}),
+                "读取无障碍树；Linux 默认桌面，macOS 默认前台应用。操作前须获取新快照",
+                parameters({"target_id": string("当前发现中的应用或窗口 ID，可选")}),
                 self.snapshot,
+            ),
+            Tool(
+                "computer_release",
+                "释放当前执行持有的 macOS 无障碍引用；委派其他 agent 操作前先释放，让它重新观察",
+                parameters({}),
+                self.release,
             ),
             Tool(
                 "computer_action",

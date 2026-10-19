@@ -398,7 +398,7 @@ class ChannelSettings(Section):
 
 class Computer(Section):
     enabled: bool = False
-    backend: Literal["atspi"] = "atspi"
+    backend: Literal["auto", "atspi", "ax"] = "auto"
     python_path: str = "/usr/bin/python3"
     max_nodes: int = Field(default=300, ge=10, le=1000)
     operation_timeout_seconds: float = Field(

@@ -81,6 +81,9 @@ class Runtime:
         self._tool_providers: list[tuple[ToolProvider, bool, bool, bool]] = []
         self._tool_factories: dict[str, ToolProvider] = {}
         self._tool_session: ContextVar[str | None] = ContextVar("muli_tool_session", default=None)
+        self._tool_execution: ContextVar[tuple[str, str] | None] = ContextVar(
+            "muli_tool_execution", default=None
+        )
         self._request_context: ContextVar[PreparedRequest | None] = ContextVar(
             "muli_request", default=None
         )
@@ -136,6 +139,27 @@ class Runtime:
     def request_context(self, session_id: str) -> PreparedRequest | None:
         request = self._request_context.get()
         return request if request is not None and request.session_id == session_id else None
+
+    def _computer_dispatch_guard(self) -> Callable[[], None]:
+        owner = self._tool_execution.get()
+        prepared = self._request_context.get()
+        if owner is None or prepared is None or prepared.session_id != owner[0]:
+            raise ComputerError("caller_unavailable", "电脑操作缺少真实执行上下文")
+
+        def guard() -> None:
+            if self._closing or self.run_ids.get(owner[0]) != owner[1]:
+                raise ComputerError("execution_changed", "执行已结束或被新的执行替换")
+            self._guard_request(prepared, "computer")
+            if self.store.pending_inputs(owner[0]):
+                raise ComputerError("input_pending", "收到新的要求，动作尚未派发，请重新规划")
+
+        return guard
+
+    def _computer_owner(self) -> tuple[str, str] | None:
+        owner = self._tool_execution.get()
+        if owner is None or self._closing or self.run_ids.get(owner[0]) != owner[1]:
+            return None
+        return owner
 
     def select_replan(self, session_id: str, identifier: str) -> None:
         """A successful main read selects a scope for the next request only."""
@@ -552,6 +576,7 @@ class Runtime:
         await self.workflows.close()
         await self.mcp.close()
         await self.notifications.close()
+        await self.computer.aclose()
         self.configure()
         self._configure_workflows()
         self._configure_compaction()
@@ -598,7 +623,9 @@ class Runtime:
                 Path(__file__).resolve().parent,
             ],
         )
-        self.computer = Computer(settings)
+        self.computer = Computer(
+            settings, owner=self._computer_owner, dispatch_guard=self._computer_dispatch_guard
+        )
         self.mcp = MCPManager(settings.mcp, max_output_chars=settings.limits.max_output_chars)
         self.notifications = DesktopNotifier(self.store, self.bus, settings.notifications)
         self.tools = {
@@ -777,11 +804,14 @@ class Runtime:
             self.store.cancel_inputs(session_id)
         task = self.tasks.get(session_id)
         expected_run = self.run_ids.get(session_id)
+        computer = self.computer
         cancelled = False
         if task and not task.done():
             if not task.cancelling():
                 task.cancel()
             cancelled = await self.team._settle([task])
+        if expected_run is not None:
+            await computer.release_execution(session_id, expected_run)
         if self.run_ids.get(session_id) != expected_run:
             if cancelled:
                 raise asyncio.CancelledError
@@ -816,6 +846,7 @@ class Runtime:
     async def _drive(
         self, session_id: str, run_id: str, role: str, mode: Mode, workflow_step: bool = False
     ) -> str:
+        computer = self.computer
         run = {
             "id": run_id,
             "session_id": session_id,
@@ -880,6 +911,15 @@ class Runtime:
             await self.bus.emit("run.failed", {"run_id": run_id, "error": run["error"]}, session_id)
             raise
         finally:
+            release = asyncio.create_task(computer.release_execution(session_id, run_id))
+            release_cancelled = await self.team._settle([release])
+            if release.cancelled():
+                release_cancelled = True
+                run["cleanup_error"] = "电脑引用回收被取消"
+            elif error := release.exception():
+                # Preserve the original result/unknown journal and unregister
+                # the driver even if the native cleanup itself fails.
+                run["cleanup_error"] = f"电脑引用回收失败：{type(error).__name__}"
             if run["status"] not in {"completed", "paused"}:
                 self._repair_tail(session_id)
                 with self._stopping_session(session_id):
@@ -907,6 +947,8 @@ class Runtime:
                 self.run_ids.pop(session_id, None)
                 if session and session.get("kind") == "main":
                     self._wake_main()
+            if release_cancelled:
+                raise asyncio.CancelledError
 
     def _repair_tail(self, session_id: str) -> None:
         """Journal unknown results after interruption, never repeat a side effect."""
@@ -1283,6 +1325,7 @@ class Runtime:
                 session_id,
             )
             token = self._tool_session.set(session_id)
+            execution_token = self._tool_execution.set((session_id, run_id))
             request_token = self._request_context.set(prepared)
             try:
                 # Final synchronous fence after the last await. No await may be
@@ -1297,6 +1340,7 @@ class Runtime:
                     result = await tool.handler(arguments)
             finally:
                 self._request_context.reset(request_token)
+                self._tool_execution.reset(execution_token)
                 self._tool_session.reset(token)
         except TaskPaused as exc:
             await self._tool_completed(call, self._paused_result(exc), session_id)
@@ -1630,4 +1674,7 @@ class Runtime:
         await asyncio.gather(*self.tasks.values(), return_exceptions=True)
         await self.mcp.close()
         await self.notifications.close()
-        self.store.close()
+        try:
+            await self.computer.aclose()
+        finally:
+            self.store.close()

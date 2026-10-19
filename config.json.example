@@ -266,7 +266,7 @@
   },
   "computer": {
     "enabled": false,
-    "backend": "atspi",
+    "backend": "auto",
     "python_path": "/usr/bin/python3",
     "max_nodes": 300,
     "operation_timeout_seconds": 12,

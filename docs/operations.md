@@ -29,6 +29,8 @@
 
 Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用系统发行的 python-gobject / at-spi2-core；不需要在 MuLi 虚拟环境编译 GTK。设置 computer.python_path 指向具有 GI 的系统 Python，然后启用电脑工具。先在状态页查看能力。
 
+`computer.backend=auto` 按平台选择 Linux AT-SPI 或 macOS AX，不在失败后更换后端；旧配置中的显式 `atspi` 不迁移。macOS AX 使用当前 MuLi Python 的系统框架，`python_path` 不影响它。能力查询不会弹出辅助功能授权、扫描桌面或保留节点引用；实际授权归属与第三方应用行为仍需本机受控验收。队友不能借用另一个执行的原生引用：先 `computer_release`，再让接手者重新观察。`desktop_busy` 应交回统筹处理，不用模型循环等待。
+
 `computer.operation_timeout_seconds` 控制单次无障碍 helper 的总期限，默认 12 秒，可配置为大于 0、至多 120 秒的有限数值；`computer.snapshot_ttl_seconds` 控制快照及目标发现引用的有效期，默认 60 秒，至多 300 秒。两者不接受布尔值、字符串或无穷大。旧配置无需修改，缺省时沿用原期限；修改配置不会延长已有操作凭据。
 
 操作路径是 snapshot → action/type → 再次 snapshot。快照具有有效期，操作校验进程及 D-Bus 对象身份，成功或失败都消耗快照。界面不支持的动作不会降级成任意坐标点击。无障碍树不可用时可单独请求截图；截图不产生可执行节点身份，不能代替操作前的快照。macOS AX、Windows UIA 与任意坐标操作仍未实现。

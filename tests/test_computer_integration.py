@@ -17,7 +17,7 @@ def facade(*, output_chars: int = 24000) -> Computer:
     return Computer(
         Settings.model_validate(
             {
-                "computer": {"enabled": True, "max_nodes": 10},
+                "computer": {"enabled": True, "backend": "atspi", "max_nodes": 10},
                 "limits": {"max_output_chars": output_chars},
             }
         )

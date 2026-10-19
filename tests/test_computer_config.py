@@ -40,3 +40,18 @@ def test_old_computer_configuration_loads_and_new_deadlines_roundtrip(tmp_path: 
     assert not restored.settings.computer.enabled
     assert restored.settings.computer.operation_timeout_seconds == 2.5
     assert restored.settings.computer.snapshot_ttl_seconds == 30
+
+
+def test_backend_default_is_platform_selection_and_explicit_old_choice_is_preserved(
+    tmp_path: Path,
+) -> None:
+    assert Settings().computer.backend == "auto"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"computer": {"backend": "atspi"}}), encoding="utf-8")
+    config = ConfigFile(path)
+    config.update({"computer": {"max_nodes": 50}})
+    assert ConfigFile(path).settings.computer.backend == "atspi"
+    config.update({"computer": {"backend": "ax"}})
+    assert ConfigFile(path).settings.computer.backend == "ax"
+    with pytest.raises(ValidationError):
+        config.update({"computer": {"backend": "uia"}})

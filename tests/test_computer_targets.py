@@ -47,7 +47,10 @@ def frame(field: str, records: list[dict[str, Any]], **changes: Any) -> dict[str
 def computer(**sections: Any) -> Computer:
     return Computer(
         Settings.model_validate(
-            {"computer": {"enabled": True, **sections.pop("computer", {})}, **sections}
+            {
+                "computer": {"enabled": True, "backend": "atspi", **sections.pop("computer", {})},
+                **sections,
+            }
         )
     )
 

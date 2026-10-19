@@ -1,8 +1,10 @@
 # 无障碍电脑操作
 
-2.4 完善 Linux AT-SPI 的应用和窗口定位。电脑能力默认关闭，使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK。macOS AX、Windows UIA 的节点操作仍未实现；各平台截图、录屏和后台服务的范围见[平台能力](platforms.md)。本轮测试只使用假无障碍对象与临时进程，不操作开发机桌面。
+2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 开发中的 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。Windows UIA 节点操作尚未实现；截图、录屏和后台服务的范围见[平台能力](platforms.md)。真实桌面验收与离线测试分开记录。
 
 ## 选择读取范围
+
+本节先说明 Linux；macOS 的前台范围与引用寿命见下节。
 
 调用 `computer_targets({})` 获取桌面直接应用。应用条目给出临时 `application_id` 和 `target_id`；传 `application_id` 再调用 `computer_targets`，读取那个应用的直接窗口或容器。发现只访问这一层，不预先扫描每个应用的所有后代。应用本身也能作为目标，兼容没有标准顶层窗口结构的程序。
 
@@ -11,6 +13,20 @@
 快照返回 `snapshot_id` 和节点 `id`。后续 `computer_action` 的动作必须来自该节点公开的 `actions`，`computer_type` 用于设置节点的**完整文本**。原生定位信息留在宿主内，模型只使用临时标识。一次操作消费一次快照；需要下一次操作时重新读取。
 
 节点以 `parent_id` 保留公开的父子关系，`depth` 相对于所选根计数。目标根没有父节点，`parent_observed=true`；祖先未能读取时为 `parent_id=null, parent_observed=false`，不能当成平级根节点。条目按父节点先于子节点排序，预算裁剪后不保留悬空父引用，可区分不同面板中的同名控件。
+
+## macOS 原生引用
+
+AX 的零参数发现和快照限定为当前接收键盘输入的应用，范围明确返回 `foreground_application`；选择当前 `application_id` 可列它的窗口，再用窗口 `target_id` 读取子树。不会枚举所有应用、点击坐标或在失败后切换后端。
+
+原生对象由一个短期 helper 保留，使用当前 MuLi 的 `sys.executable`，不使用 Linux 的 `computer.python_path`。保留对象能避免把同名替代控件当作原目标；应用仍可能让原对象失效，因此派发前重新核对对象、当前状态及实际动作。每个新观察替换所有旧发现和快照引用。一次有效快照的操作尝试后，整组引用和 helper 都被回收；明确拒绝、未知结果与取消也不会复活凭据。
+
+引用归属宿主提供的会话和执行代次，模型无法指定。其他执行立即收到 `desktop_busy`，无需等待有效期。让同一队友完成观察与操作；主沐璃若已观察，应先调用无参 `computer_release`，再由队友重新观察。释放是读取级工具，只结束当前调用者持有的 helper，重复释放没有副作用。结束、暂停、停止、配置重载和关闭也会回收准确的执行代次；旧执行不能关闭新执行的引用。
+
+helper 最长寿命复用 `snapshot_ttl_seconds`，从创建计时，读取和状态查询不续期。每组最多 16 条请求，单请求最多 64 KiB，单响应最多 250000 字节，整个 helper 的 stdout/stderr 累计最多 1000000 字节；停止与回收不等待用户或模型。原生 API 自身可能先分配完整动作数组，不能把宿主预算解释成整个系统的绝对内存上限。
+
+状态查询只在短进程中执行无提示的辅助功能信任检查，结果按成功 60 秒、其他 10 秒缓存，并合并并发查询。它不创建应用引用、不遍历桌面、不弹授权，也不证明所有应用可读；`session_accessible` 仍为未知。需要系统授权时根据本机 macOS 设置为实际运行 MuLi 的环境授权，MuLi 不自行更改 TCC；终端、LaunchAgent 和 Python 更新后的授权归属尚未实测。
+
+首版不读取文本 Value 来拼名称。明确密码控件拒绝修改；文本控件保护语义未知时只读，不能把可选 `Subrole` 缺失理解成非密码。只有明确非保护且原生可写的文本控件才接受完整文本设置；普通按钮不因缺少可选子角色而全部禁用。部分应用的普通文本框可能因此暂不可编辑，这是能力边界，不通过重复尝试绕过。
 
 ## 不完整结果
 
@@ -34,7 +50,7 @@
 {
   "computer": {
     "enabled": false,
-    "backend": "atspi",
+    "backend": "auto",
     "python_path": "/usr/bin/python3",
     "max_nodes": 300,
     "operation_timeout_seconds": 12,
@@ -45,8 +61,10 @@
 
 `operation_timeout_seconds` 是一次 helper 的总期限，大于 0、至多 120 秒；`snapshot_ttl_seconds` 同时约束快照与发现引用，大于 0、至多 300 秒。两者必须是有限数值。输出预算仍使用现有 `limits.max_output_chars`，无需再设置另一套预算。旧配置缺少这些字段时使用原来的 12 秒操作期限和 60 秒快照有效期。
 
+`backend=auto` 在 Linux 选择 AT-SPI、macOS 选择 AX，其他平台明确报告不可用；显式 `atspi` 或 `ax` 不自动降级。旧配置中已有的 `atspi` 保持原值；macOS 用户需明确改为 `auto` 或 `ax`。Python 路径只影响 Linux 的 AT-SPI/Portal。所有平台仍默认 `enabled=false`。
+
 ## 依据与验证边界
 
-实现沿用 [AT-SPI 节点接口](https://docs.gtk.org/atspi2/class.Accessible.html)、[D-Bus 原生身份协议](https://gnome.pages.gitlab.gnome.org/at-spi2-core/devel-docs/doc-org.a11y.atspi.Socket.html)及[节点状态定义](https://docs.gtk.org/atspi2/enum.StateType.html)。本轮不引入常驻桌面观察进程、坐标输入、OCR 或跨平台原生引用服务。
+Linux 实现沿用 [AT-SPI 节点接口](https://docs.gtk.org/atspi2/class.Accessible.html)、[D-Bus 原生身份协议](https://gnome.pages.gitlab.gnome.org/at-spi2-core/devel-docs/doc-org.a11y.atspi.Socket.html)及[节点状态定义](https://docs.gtk.org/atspi2/enum.StateType.html)。macOS 使用 [AXUIElement](https://developer.apple.com/documentation/applicationservices/axuielement_h) 与 [无提示信任检查](https://developer.apple.com/documentation/applicationservices/1459186-axisprocesstrustedwithoptions)。不引入桌面轮询、坐标输入或 OCR。
 
-Fake GI 可验证遍历、身份变化、错误和预算；核心跨平台 CI 可验证宿主协议。它们不能替代真实 Arch 桌面上的 GTK、Qt、Electron 应用验收，也不能证明 macOS 或 Windows 无障碍后端可用。实测状态随[版本审查](review-v2.4.md)更新。
+Fake GI/CF 可验证遍历、身份变化、错误和预算；核心跨平台 CI 可验证宿主协议，macOS 系统库检查只能证明 ABI/符号的相应部分。它们不能替代真实 Arch 桌面的 GTK、Qt、Electron 或 macOS TCC、窗口及动作验收。实测状态分别记录于 [2.4 审查](review-v2.4.md)及 [2.5 审查](review-v2.5.md)。

@@ -400,7 +400,7 @@ async def test_computer_protocol_uses_stdout_without_warning_pollution(
 
     monkeypatch.setattr(computer_module, "run_process", subprocess_with_warning)
     monkeypatch.setattr(computer_module.sys, "platform", "linux")
-    computer = Computer(Settings(computer={"enabled": True}))  # type: ignore[arg-type]
+    computer = Computer(Settings(computer={"enabled": True, "backend": "atspi"}))  # type: ignore[arg-type]
     assert await computer.call({"operation": "snapshot"}) == {"nodes": []}
 
 
@@ -468,7 +468,7 @@ def test_concurrent_computer_actions_cannot_reuse_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        computer = Computer(Settings())
+        computer = Computer(Settings.model_validate({"computer": {"backend": "atspi"}}))
         computer.snapshot_id, computer.snapshot_time = "snapshot", time.monotonic()
         computer.nodes = {
             "n0": {
