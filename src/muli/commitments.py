@@ -56,7 +56,7 @@ class Commitments:
         if status not in {*STATES, "active", "all"}:
             raise ValueError("未知承诺状态")
         # Do not load a complete brief for every item in an index or UI listing.
-        query = "SELECT json_remove(data,'$.brief'),json_type(data,'$.brief') FROM objects WHERE kind='commitment'"
+        query = "SELECT json_remove(data,'$.brief','$.control.plan.text'),json_type(data,'$.brief') FROM objects WHERE kind='commitment'"
         values: list[Any] = []
         if status == "active":
             query += " AND json_extract(data,'$.status') NOT IN ('done','cancelled')"
@@ -78,6 +78,22 @@ class Commitments:
             if key in item
         }
         result["has_brief"] = "brief" in item or bool(item.get("has_brief"))
+        if "control" in item:
+            control = item["control"]
+            if (
+                not isinstance(control, dict)
+                or type(control.get("epoch")) is not int
+                or type(control.get("approved_epoch")) is not int
+                or not 0 <= control["approved_epoch"] <= control["epoch"]
+            ):
+                raise ValueError("持久任务控制字段无效")
+            result["control"] = {
+                "epoch": control["epoch"],
+                "approved_epoch": control["approved_epoch"],
+                "paused": control["epoch"] > control["approved_epoch"],
+                "replan_requested": bool(control.get("replan_request_id")),
+                "has_plan": control.get("plan") is not None,
+            }
         # Reserve the omission marker before adding previews: a later omitted
         # field must not make an otherwise fitting projection exceed its budget.
         result["details_omitted"] = False
@@ -221,6 +237,8 @@ class Commitments:
         if status in {"done", "cancelled"} and not evidence.strip():
             raise ValueError("完成需要验证证据；取消需要说明原因")
         previous = self.get(identifier) if identifier else {}
+        if brief is not None and "control" in previous:
+            raise PermissionError("受控任务说明只能由主人控制入口追加要求，不能整体替换")
         item = {
             **previous,
             "id": identifier or new_id(),

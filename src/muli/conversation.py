@@ -8,6 +8,8 @@ from typing import Any
 
 from muli.store import Store, new_id
 
+MAX_EVENT_ID_CHARS = 512
+
 
 class Conversation:
     def __init__(self, store: Store) -> None:
@@ -48,6 +50,36 @@ class Conversation:
         internal: bool = False,
         objects: list[tuple[str, dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        payload = self.payload(
+            session_id,
+            content,
+            source=source,
+            principal=principal,
+            mode=mode,
+            attachment_ids=attachment_ids,
+            route=route,
+            event_id=event_id,
+        )
+        return self.store.enqueue_input(
+            payload,
+            max_pending=max_pending,
+            quarantine=principal != "owner" and not internal,
+            objects=objects,
+        )
+
+    @staticmethod
+    def payload(
+        session_id: str,
+        content: str,
+        *,
+        source: str,
+        principal: str,
+        mode: str,
+        attachment_ids: list[str] | None = None,
+        route: dict[str, Any] | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > 64000:
             raise ValueError("消息需为1–64000字符")
         if not source or len(source) > 120 or not principal or len(principal) > 256:
@@ -63,14 +95,14 @@ class Conversation:
                 or len(json.dumps(route, ensure_ascii=False, allow_nan=False)) > 4096
             ):
                 raise ValueError("消息路由必须是有限的 JSON 对象")
-        if event_id is not None and (not event_id or len(event_id) > 512):
+        if event_id is not None and (not event_id or len(event_id) > MAX_EVENT_ID_CHARS):
             raise ValueError("来源消息 ID 无效")
         identifier = (
             hashlib.sha256(f"{session_id}\0{source}\0{event_id}".encode()).hexdigest()
             if event_id
             else new_id()
         )
-        payload = {
+        return {
             "id": identifier,
             "session_id": session_id,
             "content": content,
@@ -80,9 +112,3 @@ class Conversation:
             "attachment_ids": attachments,
             "route": route,
         }
-        return self.store.enqueue_input(
-            payload,
-            max_pending=max_pending,
-            quarantine=principal != "owner" and not internal,
-            objects=objects,
-        )

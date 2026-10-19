@@ -51,6 +51,9 @@ class Store:
             CREATE INDEX IF NOT EXISTS objects_updated ON objects(kind,updated DESC);
             CREATE INDEX IF NOT EXISTS agents_parent ON objects(json_extract(data,'$.parent_id')) WHERE kind='agent';
             CREATE INDEX IF NOT EXISTS agents_status ON objects(json_extract(data,'$.status')) WHERE kind='agent';
+            CREATE INDEX IF NOT EXISTS agents_commitment ON objects(json_extract(data,'$.commitment_id')) WHERE kind='agent';
+            CREATE INDEX IF NOT EXISTS workflow_runs_status ON objects(json_extract(data,'$.status')) WHERE kind='workflow_run';
+            CREATE INDEX IF NOT EXISTS task_plan_pending ON objects(id) WHERE kind='task_plan_delivery' AND json_extract(data,'$.state')='pending';
             CREATE TABLE IF NOT EXISTS message_order (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE,
                 session_id TEXT NOT NULL
@@ -176,14 +179,25 @@ class Store:
         *,
         objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
-        created = now()
         with self.db:
-            for kind, item in objects or []:
-                self._put(kind, item)
-            cursor = self.db.execute(
-                "INSERT INTO events(type,session_id,data,created_at) VALUES(?,?,?,?)",
-                (event_type, session_id, json.dumps(data, ensure_ascii=False), created),
-            )
+            return self._event(event_type, data, session_id, objects=objects)
+
+    def _event(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        session_id: str | None = None,
+        *,
+        objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        """Append inside the caller's transaction without an intermediate commit."""
+        created = now()
+        for kind, item in objects or []:
+            self._put(kind, item)
+        cursor = self.db.execute(
+            "INSERT INTO events(type,session_id,data,created_at) VALUES(?,?,?,?)",
+            (event_type, session_id, json.dumps(data, ensure_ascii=False), created),
+        )
         return {
             "id": cursor.lastrowid,
             "type": event_type,
@@ -359,37 +373,50 @@ class Store:
         quarantine: bool = False,
         objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
         with self.db:
-            previous = self.db.execute(
-                "SELECT * FROM ingress WHERE id=?", (payload["id"],)
-            ).fetchone()
-            if previous:
-                if previous["payload"] != serialized:
-                    raise ValueError("相同输入 ID 的内容或来源不一致")
+            return self._enqueue_input(
+                payload, max_pending=max_pending, quarantine=quarantine, objects=objects
+            )
+
+    def _enqueue_input(
+        self,
+        payload: dict[str, Any],
+        *,
+        max_pending: int,
+        quarantine: bool = False,
+        objects: builtins.list[tuple[str, dict[str, Any]]] | None = None,
+        apply_objects_on_duplicate: bool = True,
+    ) -> tuple[dict[str, Any], bool]:
+        """Insert inside a caller-owned transaction; control retries must be read-only."""
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        previous = self.db.execute("SELECT * FROM ingress WHERE id=?", (payload["id"],)).fetchone()
+        if previous:
+            if previous["payload"] != serialized:
+                raise ValueError("相同输入 ID 的内容或来源不一致")
+            if apply_objects_on_duplicate:
                 for kind, item in objects or []:
                     self._put(kind, item)
-                return {
-                    **payload,
-                    "state": previous["state"],
-                    "seq": previous["seq"],
-                    "run_id": previous["run_id"],
-                }, False
-            state = "quarantined" if quarantine else "pending"
-            count = self.db.execute(
-                "SELECT count(*) FROM ingress WHERE session_id=? AND state=?",
-                (payload["session_id"], state),
-            ).fetchone()[0]
-            if count >= max_pending:
-                raise ValueError("待处理输入已达到配置上限，请稍后再试")
-            cursor = self.db.execute(
-                "INSERT INTO ingress(id,session_id,state,payload,received) VALUES(?,?,?,?,?)",
-                (payload["id"], payload["session_id"], state, serialized, now()),
-            )
-            sequence = cursor.lastrowid
-            for kind, item in objects or []:
-                self._put(kind, item)
-            return {**payload, "state": state, "seq": sequence}, True
+            return {
+                **payload,
+                "state": previous["state"],
+                "seq": previous["seq"],
+                "run_id": previous["run_id"],
+            }, False
+        state = "quarantined" if quarantine else "pending"
+        count = self.db.execute(
+            "SELECT count(*) FROM ingress WHERE session_id=? AND state=?",
+            (payload["session_id"], state),
+        ).fetchone()[0]
+        if count >= max_pending:
+            raise ValueError("待处理输入已达到配置上限，请稍后再试")
+        cursor = self.db.execute(
+            "INSERT INTO ingress(id,session_id,state,payload,received) VALUES(?,?,?,?,?)",
+            (payload["id"], payload["session_id"], state, serialized, now()),
+        )
+        sequence = cursor.lastrowid
+        for kind, item in objects or []:
+            self._put(kind, item)
+        return {**payload, "state": state, "seq": sequence}, True
 
     def pending_inputs(self, session_id: str) -> int:
         return int(
@@ -410,27 +437,46 @@ class Store:
             ).fetchall()
             for row in rows:
                 payload = json.loads(row["payload"])
-                message = {
-                    "id": payload["id"],
-                    "session_id": session_id,
-                    "role": "user",
-                    "content": payload["content"],
-                    "created_at": row["received"],
-                    "source": payload["source"],
-                    "principal": payload["principal"],
-                    "route": payload.get("route"),
-                    "attachment_ids": payload.get("attachment_ids", []),
-                    "input_seq": row["seq"],
-                    "delivery_status": "delivered",
-                    "run_id": run_id,
-                }
-                self._put("message", message)
+                message = self._archive_input(
+                    payload, received=row["received"], run_id=run_id, input_seq=row["seq"]
+                )
                 self.db.execute(
                     "UPDATE ingress SET state='delivered',delivered_seq=?,run_id=? WHERE seq=?",
                     (message["seq"], run_id, row["seq"]),
                 )
                 result.append(message)
         return result
+
+    def _archive_input(
+        self,
+        payload: dict[str, Any],
+        *,
+        received: float,
+        run_id: str | None,
+        input_seq: int | None = None,
+    ) -> dict[str, Any]:
+        """Archive an input in the caller's transaction, preserving trusted provenance."""
+        message = {
+            "id": payload["id"],
+            "session_id": payload["session_id"],
+            "role": "user",
+            "content": payload["content"],
+            "created_at": received,
+            "source": payload["source"],
+            "principal": payload["principal"],
+            "route": payload.get("route"),
+            "attachment_ids": payload.get("attachment_ids", []),
+            "delivery_status": "delivered",
+            "run_id": run_id,
+        }
+        if input_seq is not None:
+            message["input_seq"] = input_seq
+        if "task_control" in payload:
+            message["task_control"] = payload["task_control"]
+        if self.get("message", payload["id"]) is not None:
+            raise ValueError("输入消息 ID 已经存档，不能覆盖历史")
+        self._put("message", message)
+        return message
 
     def cancel_inputs(self, session_id: str) -> None:
         with self.db:
