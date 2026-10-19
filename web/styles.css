@@ -487,6 +487,16 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .task-brief h3 { color: var(--text); font-size: 13px; font-weight: 500; margin: 20px 0 8px; }
 .task-brief p, .task-brief li { white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-brief ul { padding-left: 20px; }
+.task-control-panel { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 20px; }
+.task-control-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; }
+.task-control-heading small { color: var(--muted); }
+.task-control-status { color: var(--text); font-weight: 500; }
+.task-control-status.paused { color: var(--accent); }
+.task-control-note { color: var(--muted); font-size: 11px; margin: 8px 0 16px; }
+.task-control-editor { margin-top: 16px; }
+.task-control-editor textarea { min-height: 115px; }
+.task-control-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+.task-control-actions button { white-space: normal; min-height: 36px; }
 .upload-row { padding: 24px 0; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .upload-row > .text-button { flex-shrink: 0; }
 .record-row .row-content h3 { margin-top: 0; }
