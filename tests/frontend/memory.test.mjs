@@ -39,7 +39,11 @@ class DOMElement {
       child.parentNode = this; this.childNodes.push(child);
     }
   }
-  replaceChildren(...children) { for (const child of this.childNodes) child.parentNode = null; this.childNodes = []; this.append(...children); }
+  replaceChildren(...children) {
+    if (this.children.some((child) => child.contains(this.document.activeElement))) this.document.activeElement = this.document.body;
+    for (const child of this.childNodes) child.parentNode = null;
+    this.childNodes = []; this.append(...children);
+  }
   setAttribute(key, value) {
     if (key.startsWith("data-")) this.dataset[key.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = String(value);
     else this.attributes[key] = String(value);
@@ -285,6 +289,41 @@ test("an update during initial loading invalidates the same source and ignores i
   detail.resolve(item); await pending; assert.equal(h.body().includes(item.quote), false); assert.ok(h.button("重新核查"));
 });
 
+for (const type of ["memory.updated", "memory.forgotten"]) {
+  test(`${type} invalidates an unknown source while a graph-only memory detail is pending`, async () => {
+    const detail = deferred(), item = fixtureMemory();
+    const h = harness(async () => detail.promise);
+    assert.equal(h.ui.state.memories.length, 0);
+    const pending = h.ui.showMemoryEvidence(item.id);
+    h.ui.startGlobalEvents();
+    h.emitGlobal({ type, data: { memory_ids: ["another-memory"], source_id: item.source_id } });
+    assert.equal(h.requests[0].signal.aborted, true);
+    assert.ok(h.button("重新核查"));
+    detail.resolve(item); await pending;
+    assert.equal(h.body().includes(item.content), false); assert.equal(h.body().includes(item.quote), false);
+    assert.equal(h.requests.length, 1); h.ui.stopEvents();
+  });
+}
+
+test("a known unrelated or absent source does not invalidate a pending memory detail", async () => {
+  for (const sourceId of ["different-source", null]) {
+    const detail = deferred(), item = fixtureMemory("memory-one", { source_id: sourceId, origin: null });
+    const h = harness(async () => detail.promise); h.ui.state.memories = [item];
+    const pending = h.ui.showMemoryEvidence(item.id);
+    for (const type of ["memory.updated", "memory.forgotten"]) h.ui.invalidateMemoryEvidence({ type, data: { memory_ids: ["another-memory"], source_id: "source-one" } });
+    assert.equal(h.requests[0].signal.aborted, false);
+    detail.resolve(item); await pending; assert.ok(h.body().includes(item.content));
+  }
+});
+
+test("an unrelated id-only update does not invalidate an unresolved source", async () => {
+  const detail = deferred(), item = fixtureMemory(), h = harness(async () => detail.promise);
+  const pending = h.ui.showMemoryEvidence(item.id);
+  h.ui.invalidateMemoryEvidence({ type: "memory.updated", data: { memory_ids: ["another-memory"], source_id: null } });
+  assert.equal(h.requests[0].signal.aborted, false);
+  detail.resolve(item); await pending; assert.ok(h.body().includes(item.content));
+});
+
 test("correction uses a fresh detail, submits only editable fields, then checks the saved memory and history", async () => {
   const item = fixtureMemory(), updated = { ...item, content: "更正后的正文", version: 2 }; let saved = false;
   const h = harness(async (path, options) => {
@@ -303,6 +342,37 @@ test("correction uses a fresh detail, submits only editable fields, then checks 
   assert.ok(h.body().includes(updated.content) && h.body().includes("原始引文") && h.body().includes(item.quote));
   assert.equal(h.requests.filter((entry) => entry.path === "/memories/memory-one" && !entry.method).length, 2);
   await h.expand("修改历史"); assert.ok(h.body().includes(item.content)); assert.ok(h.body().includes(updated.content));
+});
+
+test("an own-save event before the response permits a fresh check and returns focus to its heading", async () => {
+  const item = fixtureMemory(), updated = { ...item, content: "OWN_SAVED", version: 2 }; let saved = false, h;
+  h = harness(async (_path, options) => {
+    if (options.method === "PATCH") {
+      saved = true;
+      h.ui.invalidateMemoryEvidence({ type: "memory.updated", data: { memory_ids: [item.id], source_id: item.source_id } });
+      return updated;
+    }
+    return saved ? updated : item;
+  });
+  await h.ui.editMemory(item.id);
+  const input = h.dialog.querySelector("textarea"); input.value = updated.content;
+  assert.equal(h.document.activeElement, input);
+  await h.form.dispatch("submit");
+  assert.equal(h.dialog.open, true); assert.ok(h.body().includes(updated.content)); assert.equal(h.ui.slot.invalidated, false);
+  assert.equal(h.requests.filter((entry) => entry.method === "PATCH").length, 1);
+  const heading = h.document.querySelector("#dialog-title");
+  assert.equal(h.document.activeElement === heading, true); assert.equal(heading.tabIndex, -1);
+});
+
+test("ordinary asynchronous detail and source reads keep the reader's current focus", async () => {
+  const detail = deferred(), source = deferred(), item = fixtureMemory();
+  const h = harness(async (path) => path.includes("/source?") ? source.promise : detail.promise);
+  const pending = h.ui.showMemoryEvidence(item.id), close = h.document.querySelector("#dialog-close");
+  close.focus(); detail.resolve(item); await pending;
+  assert.equal(h.document.activeElement, close);
+  await h.expand("查看原文"); close.focus();
+  source.resolve(sourcePage(item, "原文")); await flush();
+  assert.equal(h.document.activeElement, close);
 });
 
 test("an external update preserves an open correction draft and requires rechecking before saving", async () => {
