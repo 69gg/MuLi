@@ -8,7 +8,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,29 @@ def message_text_size(record: dict[str, Any]) -> int:
             for image in data["images"]
         ]
     return len(json.dumps(data, ensure_ascii=False))
+
+
+_EVIDENCE_METADATA = ("role", "source", "principal", "evidence_revision")
+_EVIDENCE_COLUMNS = (
+    "o.id,m.seq,json_type(o.data,'$.content') AS content_type,"
+    "length(CAST(json_extract(o.data,'$.content') AS BLOB)) AS content_bytes,"
+    "coalesce(substr(CAST(json_extract(o.data,'$.content') AS BLOB),?,?),x'') AS content,"
+    "CASE json_extract(o.data,'$.content_provenance') "
+    "WHEN 'accepted' THEN 'accepted' WHEN 'runtime_excerpt' THEN 'runtime_excerpt' "
+    "ELSE 'unknown' END AS content_provenance,"
+    + ",".join(
+        f"json_type(o.data,'$.{field}') AS {field}_type,"
+        f"CASE WHEN json_type(o.data,'$.{field}')='text' THEN "
+        f"coalesce(substr(CAST(json_extract(o.data,'$.{field}') AS BLOB),1,?),x'') END AS {field},"
+        f"length(CAST(json_extract(o.data,'$.{field}') AS BLOB)) AS {field}_bytes"
+        for field in _EVIDENCE_METADATA
+    )
+)
+_EVIDENCE_FROM = (
+    " FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+    "WHERE m.session_id=? AND json_type(o.data,'$.session_id')='text' "
+    "AND json_extract(o.data,'$.session_id')=m.session_id "
+)
 
 
 class Store:
@@ -133,6 +156,11 @@ class Store:
     def _put(self, kind: str, item: dict[str, Any]) -> None:
         """Write inside the caller's transaction; never commit a nested transaction."""
         if kind == "message":
+            previous = self.db.execute(
+                "SELECT session_id FROM message_order WHERE message_id=?", (item["id"],)
+            ).fetchone()
+            if previous is not None and previous["session_id"] != item["session_id"]:
+                raise ValueError("同一消息不能迁移到另一个会话")
             self.db.execute(
                 "INSERT OR IGNORE INTO message_order(message_id,session_id) VALUES(?,?)",
                 (item["id"], item["session_id"]),
@@ -140,6 +168,8 @@ class Store:
             item["seq"] = self.db.execute(
                 "SELECT seq FROM message_order WHERE message_id=?", (item["id"],)
             ).fetchone()[0]
+            # A caller cannot preserve a cursor across edits by replaying its old token.
+            item["evidence_revision"] = new_id()
         self.db.execute(
             "INSERT INTO objects VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data,updated=excluded.updated",
             (kind, item["id"], json.dumps(item, ensure_ascii=False), now()),
@@ -317,6 +347,59 @@ class Store:
             total += size
             result.append(record)
         return result
+
+    def message_evidence_directory(
+        self,
+        session_id: str,
+        *,
+        after: int,
+        limit: int,
+        preview_bytes: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield bounded SQL projections, without decoding native blocks or media in Python."""
+        cursor = self.db.execute(
+            "SELECT " + _EVIDENCE_COLUMNS + _EVIDENCE_FROM + "AND m.seq>? ORDER BY m.seq LIMIT ?",
+            (
+                1,
+                preview_bytes,
+                *([metadata_bytes] * len(_EVIDENCE_METADATA)),
+                session_id,
+                after,
+                limit,
+            ),
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
+    def message_evidence_slice(
+        self,
+        session_id: str,
+        *,
+        message_id: str | None,
+        seq: int | None,
+        offset_bytes: int,
+        length_bytes: int,
+        metadata_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Read metadata and one content window from a single current SQLite row."""
+        if (message_id is None) == (seq is None):
+            raise ValueError("message_id 和 seq 必须且只能提供一个")
+        predicate = "AND m.message_id=?" if message_id is not None else "AND m.seq=?"
+        row = self.db.execute(
+            "SELECT " + _EVIDENCE_COLUMNS + _EVIDENCE_FROM + predicate,
+            (
+                offset_bytes + 1,
+                length_bytes,
+                *([metadata_bytes] * len(_EVIDENCE_METADATA)),
+                session_id,
+                message_id if message_id is not None else seq,
+            ),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def replay_messages(
         self, session_id: str, *, after: int = 0, limit: int = 1000
