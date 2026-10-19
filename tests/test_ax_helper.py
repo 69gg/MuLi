@@ -891,7 +891,7 @@ def test_recoverable_frame_error_returns_same_id_then_stops(world: World) -> Non
         b'{"v":true,"request_id":"known"}\n',
         b'{"v":1,"request_id":"bad id"}\n',
         b"{}",
-        b"x" * helper.MAX_REQUEST_BYTES + b"\n",
+        pytest.param(b"x" * helper.MAX_REQUEST_BYTES + b"\n", id="oversized-frame"),
     ],
 )
 def test_unrecoverable_frame_never_invents_an_id_or_echoes_input(line: bytes, world: World) -> None:
