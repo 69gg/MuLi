@@ -24,6 +24,7 @@ from muli.auth import COOKIE_NAME, Authentication
 from muli.channel_application import ChannelApplication
 from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
+from muli.conversation import MAX_EVENT_ID_CHARS
 from muli.local_services import LocalServices
 from muli.management import SelfManagement
 from muli.memory_application import MemoryApplication
@@ -35,6 +36,7 @@ from muli.providers import ProviderError
 from muli.runtime import Runtime
 from muli.service import UserService
 from muli.store import now
+from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
 
 
@@ -63,6 +65,13 @@ class LoginInput(Input):
 
 class TeamMessageInput(Input):
     content: str = Field(min_length=1, max_length=64000)
+
+
+class TaskControlInput(Input):
+    action: Literal["pause", "request_replan"]
+    expected_epoch: int = Field(ge=0, strict=True)
+    request_id: str = Field(min_length=1, max_length=MAX_EVENT_ID_CHARS, strict=True)
+    additional_requirements: str = Field(default="", strict=True)
 
 
 class ApprovalInput(Input):
@@ -392,9 +401,47 @@ def create_app(
     async def commitments(status: str = "active") -> dict[str, Any]:
         return {"items": local_services.commitments.list(status)}
 
+    def task_control_error(
+        identifier: str, exc: ControlConflict | ControlUnavailable
+    ) -> HTTPException:
+        detail: dict[str, Any] = {"code": exc.code, "message": exc.message}
+        try:
+            detail["current"] = runtime.task_control_current(identifier)
+        except (KeyError, ControlUnavailable):
+            pass
+        status = 409 if isinstance(exc, ControlConflict) else 503
+        if exc.code == "queue_full":
+            status = 429
+        return HTTPException(status, detail)
+
     @app.get("/api/commitments/{identifier}")
     async def commitment_detail(identifier: str) -> dict[str, Any]:
-        return local_services.commitments.get(identifier)
+        item = local_services.commitments.get(identifier)
+        try:
+            current = runtime.task_control_current(identifier)
+        except (ControlConflict, ControlUnavailable) as exc:
+            raise task_control_error(identifier, exc) from exc
+        return {
+            **item,
+            "control": {**item.get("control", {}), **current["control"]},
+            "scope": current["scope"],
+        }
+
+    @app.post("/api/commitments/{identifier}/control")
+    async def control_task(identifier: str, body: TaskControlInput) -> dict[str, Any]:
+        try:
+            result = await runtime.submit_task_control(
+                identifier,
+                OwnerControlRequest(
+                    action=body.action,
+                    expected_epoch=body.expected_epoch,
+                    request_id=body.request_id,
+                    additional_requirements=body.additional_requirements,
+                ),
+            )
+        except (ControlConflict, ControlUnavailable) as exc:
+            raise task_control_error(identifier, exc) from exc
+        return result.public()
 
     @app.post("/api/uploads")
     async def upload(request: Request) -> dict[str, Any]:

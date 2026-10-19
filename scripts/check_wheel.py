@@ -31,6 +31,7 @@ async def check_installed(target: Path) -> None:
                 for path in (
                     "/",
                     "/app.mjs",
+                    "/task-control.mjs",
                     "/assets/muli-avatar.svg",
                     "/assets/muli-empty.svg",
                     "/api/docs",
@@ -41,7 +42,18 @@ async def check_installed(target: Path) -> None:
                 assert state["version"] == muli.__version__
                 assert state["configured"] is False
                 assert app.state.runtime._history("new")[0].content
-    print("Installed wheel: import, static assets, API docs, prompts and lifespan passed")
+                task = await app.state.local_services.commitments.save(
+                    "发行包任务控制检查",
+                    brief={"goal": "验证离线管理入口", "constraints": [], "evidence_refs": []},
+                )
+                response = await client.post(
+                    f"/api/commitments/{task['id']}/control",
+                    json={"action": "pause", "expected_epoch": 0, "request_id": "wheel-check"},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["current"]["control"]["paused"] is True
+                assert not app.state.runtime.tasks
+    print("Installed wheel: import, assets, API docs, prompts, task control and lifespan passed")
 
 
 def main() -> None:

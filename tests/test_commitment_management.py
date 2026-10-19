@@ -51,7 +51,11 @@ async def test_task_detail_requires_login_and_returns_complete_saved_revision(
             assert logged_in.status_code == 200
             response = await client.get(path)
             assert response.status_code == 200
-            assert response.json() == item
+            detail = response.json()
+            assert {key: detail[key] for key in item} == item
+            assert detail["control"]["epoch"] == 0
+            assert detail["control"]["paused"] is False
+            assert detail["scope"]["member_count"] == 0
             assert (await client.get("/api/commitments/missing")).status_code == 404
             assert runtime.store.get("commitment", item["id"]) == item
             assert runtime.tasks == {}
