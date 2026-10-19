@@ -544,6 +544,11 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .upload-row { padding: 24px 0; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .upload-row > .text-button { flex-shrink: 0; }
 .record-row .row-content h3 { margin-top: 0; }
+.record-toolbar { flex-wrap: wrap; }
+.record-toolbar .search-field { min-width: min(100%, 180px); }
+.record-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.record-page-position, .record-list-status { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.record-row h3, .record-row .row-meta { overflow-wrap: anywhere; }
 .record-message { padding: 15px 0; border-bottom: 1px solid var(--line); }
 .record-message > strong { display: block; font-size: 11px; color: var(--muted); margin-bottom: 12px; }
 .role-tabs { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; gap: 22px; }

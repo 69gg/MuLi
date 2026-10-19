@@ -82,6 +82,9 @@ const historyPageSize = 50;
 let workflowActivity = null;
 const workflowStopping = new Set();
 const workflowPageSize = 50;
+let recordDirectory = null;
+const recordPageSize = 50;
+const recordQueryLimit = 120;
 const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
@@ -138,6 +141,7 @@ function showLogin() {
   releaseHistoryDialog();
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
+  releaseRecordDirectory(); state.recordQuery = "";
   dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
@@ -237,7 +241,9 @@ function renderHistoryEntry() {
 }
 
 function renderSessions() {
-  if (state.view === "records") renderOtherView();
+  if (state.view !== "records" || !state.auth.authenticated) return;
+  if (!recordDirectory) void switchView("records");
+  else markRecordDirectoryDirty();
 }
 
 function renderComposer() {
@@ -832,12 +838,21 @@ function emptyState(iconName, title, description) {
 async function switchView(view) {
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
+  releaseRecordDirectory();
   if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
   state.view = view; state.viewError = ""; renderChrome();
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
+  if (view === "records") {
+    const slot = recordDirectory = { query: state.recordQuery, cursor: null, starts: [null], page: null, controller: null, error: "", retry: null, dirty: false, root: null };
+    state.viewLoading = false; renderOtherView();
+    const heading = $(".view-heading h2", slot.root);
+    heading.tabIndex = -1; heading.focus({ preventScroll: true });
+    await loadRecordDirectory(slot, { query: state.recordQuery });
+    return;
+  }
   if (view === "workflows") {
     const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "" };
     state.workflows = []; state.viewLoading = false; renderOtherView();
@@ -857,7 +872,6 @@ async function switchView(view) {
   try {
     if (view === "uploads") state.uploads = collection(await request("/uploads"));
     if (view === "team") { const page = await teamPager.load(); if (page) state.team = page; }
-    if (view === "records") { state.sessions = collection(await request("/sessions")); state.sessionsError = ""; }
     if (view === "memories") {
       const query = state.memoryQuery;
       const results = await Promise.allSettled([request(`/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`), request("/memories/graph")]);
@@ -900,7 +914,7 @@ function renderOtherView() {
   if (state.view === "settings") root.replaceChildren(renderSettings());
   if (state.view === "uploads") root.replaceChildren(renderUploads());
   if (state.view === "team") { const saved = captureTeamView(root); root.replaceChildren(renderTeam()); restoreTeamView(root, saved); }
-  if (state.view === "records") root.replaceChildren(renderRecords());
+  if (state.view === "records") { const content = renderRecords(); if (root.firstElementChild !== content) root.replaceChildren(content); }
   const nav = $(".settings-nav", root);
   const active = $(".settings-nav .active", root);
   if (nav && active && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, active.offsetLeft - nav.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2);
@@ -1165,24 +1179,121 @@ function renderTeam() {
   return root;
 }
 
-function renderRecords() {
-  const root = element("div", { class: "view-content" }, viewHeading("运行记录", "主对话与各项任务的持久化记录。"));
-  const search = element("input", { type: "search", value: state.recordQuery, placeholder: "搜索记录", "aria-label": "搜索记录", onInput: (event) => { state.recordQuery = event.target.value; renderRecordList(); } });
-  root.append(element("div", { class: "search-field" }, icon("search"), search), element("div", { id: "record-list" }));
-  queueMicrotask(renderRecordList);
-  return root;
+function recordDirectoryCurrent(slot) {
+  return !!slot && recordDirectory === slot && state.view === "records" && state.auth.authenticated && $("#other-view").firstElementChild === slot.root;
 }
 
-function renderRecordList() {
-  const list = $("#record-list");
-  if (!list) return;
-  list.replaceChildren();
-  const query = state.recordQuery.trim().toLowerCase();
-  for (const session of state.sessions.filter((record) => !query || record.title?.toLowerCase().includes(query))) {
-    const main = session.id === state.mainSessionId;
-    list.append(element("article", { class: "record-row" }, element("div", { class: "row-content" }, element("h3", { text: main ? "沐璃主对话" : session.title || "任务记录" }), element("div", { class: "row-meta" }, main ? "持续对话" : "任务", element("time", { text: formatTimestamp(session.updated_at ?? session.created_at) }))), actionButton(main ? "回到对话" : "查看", "workflow-session", "text-button", undefined, { session: session.id }), !main && iconButton("删除记录", "delete-session", "trash", { id: session.id })));
+function releaseRecordDirectory() {
+  const slot = recordDirectory; recordDirectory = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.page = null; slot.retry = null; slot.starts = [];
+  slot.root?.replaceChildren();
+}
+
+function recordDirectoryPage(payload, cursor, starts) {
+  if (!payload || !Array.isArray(payload.items) || payload.items.length > recordPageSize || typeof payload.has_more !== "boolean") throw new Error("记录目录响应不完整，请重新读取。");
+  const seen = new Set();
+  const date = (value) => typeof value === "number" && value > 0 && Number.isFinite(value) && Number.isFinite(new Date(value * 1000).getTime()) ? value : null;
+  const items = payload.items.map((item) => {
+    if (!item || typeof item.id !== "string" || !item.id || seen.has(item.id) || (item.title != null && typeof item.title !== "string") || (item.status != null && typeof item.status !== "string")) throw new Error("记录目录响应不完整，请重新读取。");
+    seen.add(item.id);
+    return { id: item.id, title: item.title ?? null, status: item.status ?? null, created_at: date(item.created_at), updated_at: date(item.updated_at) };
+  });
+  if (payload.has_more ? !items.length || typeof payload.next_cursor !== "string" || !payload.next_cursor || payload.next_cursor === cursor || starts.includes(payload.next_cursor) : payload.next_cursor !== null) throw new Error("记录目录翻页位置无效，请重新读取。");
+  return { items, has_more: payload.has_more, next_cursor: payload.next_cursor };
+}
+
+function renderRecordNotice(slot) {
+  if (!recordDirectoryCurrent(slot)) return;
+  slot.refresh.disabled = !!slot.controller;
+  slot.notice.textContent = slot.controller ? "正在读取记录…" : slot.dirty ? "记录有更新，可刷新列表。" : "";
+  slot.notice.hidden = !slot.notice.textContent;
+}
+
+function markRecordDirectoryDirty() {
+  const slot = recordDirectory;
+  if (!recordDirectoryCurrent(slot)) return;
+  slot.dirty = true; renderRecordNotice(slot);
+}
+
+async function loadRecordDirectory(slot, { query = slot.query, cursor = null, starts = [null], focus = false, allowFallback = true } = {}) {
+  if (!recordDirectoryCurrent(slot)) return;
+  slot.controller?.abort();
+  const controller = slot.controller = new AbortController();
+  slot.query = query; slot.cursor = cursor; slot.starts = [...starts];
+  slot.page = null; slot.error = ""; slot.retry = null; slot.dirty = false;
+  renderRecordList(slot);
+  if (focus && !$("#app-dialog").open) $("#other-view").scrollTop = 0;
+  const current = () => recordDirectoryCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    if ([...query].length > recordQueryLimit) throw new Error(`标题搜索最多 ${recordQueryLimit} 个字符。`);
+    slot.retry = { query, cursor, starts: [...starts], focus };
+    const params = new URLSearchParams({ query, limit: recordPageSize });
+    if (cursor !== null) params.set("cursor", cursor);
+    const payload = await request(`/session-records?${params}`, { signal: controller.signal, cache: "no-store" });
+    if (!current()) return;
+    const page = recordDirectoryPage(payload, cursor, starts);
+    // Deletion can empty a later page; return one known page, never chase cursors.
+    if (cursor !== null && !page.items.length && allowFallback) {
+      const previous = starts.length > 1 ? starts.slice(0, -1) : [null];
+      await loadRecordDirectory(slot, { query, cursor: previous.at(-1), starts: previous, focus, allowFallback: false });
+      return;
+    }
+    slot.page = page; slot.retry = null;
+  } catch (error) {
+    if (current()) slot.error = error.status === 404 ? "当前服务尚不支持完整记录目录。" : error.message;
+  } finally {
+    if (current()) {
+      slot.controller = null;
+      const active = document.activeElement;
+      const restoreFocus = focus && !$("#app-dialog").open && (slot.navigation.contains(active) || active === document.body);
+      renderRecordList(slot);
+      if (restoreFocus) slot.position.focus({ preventScroll: true });
+    }
   }
-  if (!list.children.length) list.append(emptyState("chat", query ? "没有找到记录" : "还没有运行记录"));
+}
+
+function renderRecords() {
+  const slot = recordDirectory;
+  if (!slot) return element("div", { class: "view-content" });
+  if (slot.root) return slot.root;
+  slot.refresh = element("button", { type: "button", class: "text-button", text: "刷新列表", onClick: () => void loadRecordDirectory(slot, { focus: true }) });
+  slot.input = element("input", { type: "search", value: state.recordQuery, placeholder: "按标题搜索", "aria-label": "按标题搜索", onInput: (event) => { state.recordQuery = event.target.value; } });
+  const form = element("form", { class: "content-toolbar record-toolbar", onSubmit: (event) => { event.preventDefault(); void loadRecordDirectory(slot, { query: slot.input.value, focus: true }); } },
+    element("div", { class: "search-field" }, icon("search"), slot.input), element("button", { type: "submit", class: "secondary-button", text: "搜索" }),
+    element("button", { type: "button", class: "text-button", text: "清空筛选", onClick: () => { slot.input.value = ""; state.recordQuery = ""; void loadRecordDirectory(slot, { query: "", focus: true }); } }));
+  slot.notice = element("p", { class: "record-list-status", role: "status", hidden: true });
+  slot.navigation = element("nav", { class: "record-pagination", "aria-label": "记录目录分页" });
+  slot.result = element("div", { id: "record-directory-result", "aria-busy": "false" });
+  slot.root = element("div", { class: "view-content record-directory" }, viewHeading("运行记录", "主对话与各项任务的持久化记录。", slot.refresh), form, slot.notice, slot.navigation, slot.result);
+  return slot.root;
+}
+
+function renderRecordList(slot = recordDirectory) {
+  if (!recordDirectoryCurrent(slot)) return;
+  renderRecordNotice(slot);
+  const page = slot.page;
+  slot.position = element("span", { class: "record-page-position", tabIndex: -1, text: `第 ${slot.starts.length} 页${slot.query ? ` · “${slot.query}”` : ""}${page ? ` · 本页 ${page.items.length} 条${page.has_more ? " · 尚有更早记录" : " · 已到最早"}` : ""}` });
+  const newer = element("button", { type: "button", class: "text-button", text: "较新一页", disabled: !!slot.controller || slot.starts.length < 2, onClick: () => void loadRecordDirectory(slot, { cursor: slot.starts.at(-2), starts: slot.starts.slice(0, -1), focus: true }) });
+  const older = element("button", { type: "button", class: "text-button", text: "更早一页", disabled: !!slot.controller || !page?.has_more, onClick: () => void loadRecordDirectory(slot, { cursor: page.next_cursor, starts: [...slot.starts, page.next_cursor], focus: true }) });
+  slot.navigation.replaceChildren(newer, slot.position, older);
+  slot.result.setAttribute("aria-busy", String(!!slot.controller)); slot.result.replaceChildren();
+  if (slot.error) {
+    slot.result.append(element("p", { class: "form-error", role: "alert", text: slot.error }));
+    if (slot.retry) slot.result.append(element("button", { type: "button", class: "secondary-button", text: "重试", onClick: () => void loadRecordDirectory(slot, slot.retry) }));
+  }
+  if (!page) return;
+  const statuses = { running: "会话运行中", queued: "会话排队中", paused: "会话已暂停", idle: "无当前执行", approval: "等待审批" };
+  for (const session of page.items) {
+    const main = session.id === state.mainSessionId;
+    const timestamp = session.updated_at ?? session.created_at;
+    const title = session.title === null ? "标题未记录" : session.title || "空标题";
+    const row = element("article", { class: "record-row" }, element("div", { class: "row-content" }, element("h3", { text: title }), element("div", { class: "row-meta" }, main ? "主对话" : "任务", element("span", { text: Object.hasOwn(statuses, session.status) ? statuses[session.status] : session.status ? `状态：${session.status}` : "状态未记录" }), element("time", { text: timestamp === null ? "日期未记录" : formatTimestamp(timestamp) }))), actionButton(main ? "回到对话" : "查看", "workflow-session", "text-button", undefined, { session: session.id }));
+    if (!main) row.append(iconButton("删除记录", "delete-session", "trash", { id: session.id }));
+    slot.result.append(row);
+  }
+  if (!page.items.length) slot.result.append(emptyState("chat", slot.query ? "没有找到记录" : "还没有运行记录"));
 }
 
 function renderMemories() {
@@ -2217,7 +2328,7 @@ async function handleAction(action, button) {
   if (action === "stop-team") { await request(`/team/${encodeURIComponent(button.dataset.id)}/stop`, { method: "POST" }); await refreshTeam(); toast("已发送停止请求"); }
   if (action === "toggle-timeline") { state.timelineOpen = !state.timelineOpen; state.timelineUserChoice = true; renderChrome(); renderTimeline(); }
   if (action === "model-settings") { state.settingsTab = "models"; await switchView("settings"); }
-  if (action === "refresh") { await connect(); if (state.view !== "chat") await switchView(state.view); }
+  if (action === "refresh") { await connect(); if (!["chat", "records"].includes(state.view)) await switchView(state.view); }
   if (action === "retry-view") await switchView(state.view);
   if (action === "scroll-bottom") scrollToBottom(true, true);
   if (action === "stop") await stopRun(button);
@@ -2228,11 +2339,16 @@ async function handleAction(action, button) {
     if (message) { await navigator.clipboard.writeText(message.content); toast("已复制"); }
   }
   if (action === "delete-session") {
+    const slot = recordDirectory;
+    if (state.view === "records" && (!recordDirectoryCurrent(slot) || !slot.root.contains(button))) return;
     const id = button.dataset.id;
     confirmAction("删除会话", "这段会话及其运行记录会被删除。", "删除会话", async () => {
       await request(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
-      await refreshSessions(); toast("记录已删除");
+      await refreshSessions();
+      if (recordDirectoryCurrent(slot)) await loadRecordDirectory(slot, { cursor: slot.cursor, starts: slot.starts });
+      toast("记录已删除");
     });
+    dialogHistoryReturn = { trigger: button, sessionId: id, view: state.view, action: "delete-session" };
   }
   if (action === "new-memory") await editMemory();
   if (action === "edit-memory") await editMemory(button.dataset.id);
@@ -2354,9 +2470,11 @@ $("#app-dialog").addEventListener("close", () => {
   }
   const historyReturn = dialogHistoryReturn; dialogHistoryReturn = null;
   if (state.auth.authenticated && historyReturn?.view === state.view) {
-    const fallback = state.view === "chat" ? $("#history-archive-button") : $$("[data-action=workflow-session]", $("#other-view")).find((button) => button.dataset.session === historyReturn.sessionId);
+    const action = historyReturn.action ?? "workflow-session";
+    const fallback = state.view === "chat" ? $("#history-archive-button") : $$("[data-action]", $("#other-view")).find((button) => button.dataset.action === action && (action === "delete-session" ? button.dataset.id : button.dataset.session) === historyReturn.sessionId);
     const target = historyReturn.trigger && document.contains(historyReturn.trigger) ? historyReturn.trigger : fallback;
     if (target) target.focus({ preventScroll: true });
+    else if (state.view === "records" && recordDirectoryCurrent(recordDirectory)) recordDirectory.position?.focus({ preventScroll: true });
     else { const heading = $(".view-heading h2", $("#other-view")); if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); } }
   }
 });
@@ -2373,7 +2491,7 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); globalController?.abort(); sessionController?.abort(); });
+window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); releaseRecordDirectory(); globalController?.abort(); sessionController?.abort(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();
