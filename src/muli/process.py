@@ -80,6 +80,26 @@ async def run_process(
 
             async def settle() -> None:
                 await asyncio.gather(*readers, return_exceptions=True)
+
+                async def discard(stream: asyncio.StreamReader) -> None:
+                    while await stream.read(4096):
+                        pass
+
+                # A paused StreamReader can prevent Process.wait() even after SIGKILL.
+                # Discard buffered output, then close inherited pipes on a finite deadline.
+                streams = [stream for stream in (process.stdout, process.stderr) if stream]
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*(discard(stream) for stream in streams)), 1
+                    )
+                except Exception:
+                    pass
+                finally:
+                    for stream in streams:
+                        # StreamReader has no public close; close its pipe transport.
+                        transport = getattr(stream, "_transport", None)
+                        if transport is not None:
+                            transport.close()
                 await process.wait()
 
             cleanup = asyncio.create_task(settle())

@@ -59,10 +59,10 @@ def aes_media(data: bytes, key: bytes, *, encrypt: bool) -> bytes:
             padder = padding.PKCS7(128).padder()
             padded = padder.update(data) + padder.finalize()
             operation = cipher.encryptor()
-            return operation.update(padded) + operation.finalize()
+            return bytes(operation.update(padded) + operation.finalize())
         operation = cipher.decryptor()
         padded = operation.update(data) + operation.finalize()
         unpadder = padding.PKCS7(128).unpadder()
-        return unpadder.update(padded) + unpadder.finalize()
+        return bytes(unpadder.update(padded) + unpadder.finalize())
     except ValueError:
         raise ChannelError("iLink 媒体密文或填充无效") from None
