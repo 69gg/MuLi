@@ -11,6 +11,7 @@ from muli.commitments import Commitments
 from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
 from muli.runtime import Runtime
+from muli.task_control import TaskControl
 from muli.tools import Tool, parameters, string
 
 
@@ -23,6 +24,8 @@ class LocalServices:
             max_context_chars=lambda: runtime.config.settings.limits.max_context_chars,
             max_output_chars=lambda: runtime.config.settings.limits.max_output_chars,
         )
+        self.task_control = TaskControl(runtime.store, self.commitments)
+        runtime.task_control = self.task_control
         runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.context_hooks.append(self.context)
 
@@ -64,10 +67,10 @@ class LocalServices:
             except KeyError:
                 continue
             files.append({key: item[key] for key in ("id", "name", "mime_type", "size")})
-        agent = self.runtime.store.get("agent", session_id) or {}
-        commitment_id = agent.get("commitment_id")
+        commitment_id = self.task_control.resolve_scope(session_id)
+        prepared = self.runtime.request_context(session_id)
         additions = (
-            self.commitments.brief_context(commitment_id)
+            ("" if prepared else self.commitments.brief_context(commitment_id))
             if commitment_id
             else self.commitments.context()
         )
@@ -111,8 +114,45 @@ class LocalServices:
             if is_main():
                 return None
             identifier = runtime.tool_session_id
-            agent = runtime.store.get("agent", identifier) if identifier else None
-            return str(agent.get("commitment_id") or "") if agent else ""
+            return self.task_control.resolve_scope(identifier) or "" if identifier else ""
+
+        commitment_tools = self.commitments.tools(
+            allow_brief_write=is_main(), can_write_brief=is_main, read_scope=read_scope
+        )
+        original_read = next(
+            tool.handler for tool in commitment_tools if tool.name == "commitment_read"
+        )
+
+        async def read_commitment(args: dict[str, Any]) -> Any:
+            result = await original_read(args)
+            if is_main():
+                assert runtime.tool_session_id is not None
+                runtime.select_replan(runtime.tool_session_id, str(args["identifier"]))
+            return result
+
+        for tool in commitment_tools:
+            if tool.name == "commitment_read":
+                tool.handler = read_commitment
+
+        async def approve_plan(args: dict[str, Any]) -> Any:
+            if not is_main():
+                raise PermissionError("只有真实主会话可确认任务方案")
+            assert runtime.tool_session_id is not None
+            request = runtime.request_context(runtime.tool_session_id)
+            snapshot = request.selected_replan if request else None
+            if snapshot is None:
+                raise PermissionError("请先读取当前任务说明，再在下一轮完整快照中确认方案")
+            result = self.task_control.approve_plan(
+                snapshot,
+                args["observed_epoch"],
+                args["plan"],
+                args["targets"],
+                caller_session_id=runtime.tool_session_id,
+                max_targets=runtime.config.settings.limits.max_pending_runs,
+            )
+            runtime._selected_replans.pop(runtime.tool_session_id, None)
+            await runtime.task_control_committed(result)
+            return result.public()
 
         async def list_files(args: dict[str, Any]) -> Any:
             return self.attachments.list(limit=int(args.get("limit", 50)))
@@ -183,8 +223,30 @@ class LocalServices:
             return item
 
         return [
-            *self.commitments.tools(
-                allow_brief_write=is_main(), can_write_brief=is_main, read_scope=read_scope
+            *commitment_tools,
+            *(
+                [
+                    Tool(
+                        "task_approve_plan",
+                        "只为主人明确要求重规划的任务确认新方案；先用commitment_read选择，下一轮完整快照才可确认。纯暂停不可自解，方案不改变主人要求或扩大授权",
+                        parameters(
+                            {
+                                "observed_epoch": {"type": "integer", "minimum": 1},
+                                "plan": string("完整执行方案；不能覆盖或删去原要求"),
+                                "targets": {
+                                    "type": "array",
+                                    "items": string(),
+                                    "uniqueItems": True,
+                                },
+                            },
+                            ("observed_epoch", "plan", "targets"),
+                        ),
+                        approve_plan,
+                        "write",
+                    )
+                ]
+                if is_main() or runtime.tool_session_id is None
+                else []
             ),
             Tool(
                 "attachment_list",

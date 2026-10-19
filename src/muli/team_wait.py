@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from muli.team import TeamManager
 
-TERMINAL = {"completed", "failed", "cancelled", "interrupted", "idle"}
+TERMINAL = {"completed", "failed", "cancelled", "interrupted", "idle", "paused"}
 
 
 def _encode(team: TeamManager, caller: str | None, seen: dict[str, int]) -> str:

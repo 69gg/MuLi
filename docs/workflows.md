@@ -11,7 +11,7 @@
 | `await spawn(name,prompt,parent_id=None,role='worker',mode=None)` | 原子保存身份、会话和首条任务，继承父权限；返回 `agent_id` 对应的 `id`/`session_id`。角色为 worker/reviewer |
 | `list(limit=100,offset=0)` / `get(target)` | 按页查看；target 优先用 ID，重名时不得模糊选择 |
 | `await send(target,content,wake=True,sender=None,event_id=None)` | 接受信封，不表示已经处理；运行中在安全边界注入；`wake=False` 只写邮箱，不唤醒结束的队友 |
-| `await resume(target)` | 沿用身份、模式、历史和分层摘要继续；有邮箱先处理邮箱，否则明确要求核查此前未知副作用再继续 |
+| `await resume(target)` | 沿用身份、模式、历史和分层摘要继续；有邮箱先处理邮箱，否则明确要求核查此前未知副作用再继续；不会解除未获当前方案确认的暂停 |
 | `await wait(targets,timeout=30,caller=None,cursor=None)` | 不带 cursor 保留终态快照；带上次 cursor 只收新完成，支持多个独立观察者；事件唤醒、不占模型槽、检测等待环 |
 | `await stop(target)` | 取消队友及未完成后代；首次调度前取消也清理登记状态，完成的结果不改成取消 |
 
@@ -23,13 +23,13 @@
 
 队友结果、`completion_revision`、`team.finished` 完成事件与 `team_report` 发件意图在同一事务保存。父邮箱满时保留 pending 报告，父输入被消费、队友完成或启动恢复时再投递，同 ID 去重，不使用定时 AI 轮询。主/队友父会话收到结果后可以继续统筹；资料明确标注不是新用户指令或授权。用户显式停止和关机期间的取消汇报标记 suppressed，防止自动唤醒。
 
-服务重启把已运行队友标为 interrupted，绝不自动重做副作用；尚未开始的 queued 任务可恢复执行。`send`/`resume` 是继续中断身份的明确入口；未消费邮箱独立保存。主、队友和 DAG 节点统一使用 [context.md](context.md) 中的分层摘要、原始工具配对和前缀验证。
+服务重启把已运行队友标为 interrupted，绝不自动重做副作用；尚未开始的 queued 任务可恢复执行，受控暂停任务保留 paused。`send`/`resume` 是继续中断身份的明确入口，但不能绕过任务控制；未消费邮箱独立保存。暂停身份占未完成预算、不占模型名额或常驻等待协程，其结果不是成功。当前暂停 scope 的报告保留 pending，不自动唤醒主助手；其他任务的报告继续按有界分页投递。主、队友和 DAG 节点统一使用 [context.md](context.md) 中的分层摘要、原始工具配对和前缀验证；控制边界见 [task-control-runtime.md](task-control-runtime.md)。
 
 实际只读参考了 `/data1/codex/codex-rs/core/src/agent/api.rs` 的 input/delivery receipt 区分、`agent/control/mailbox.rs` 的只投递邮箱、`agent/control/residency.rs` 的身份/驻留名额分离，以及 `tools/handlers/multi_agents/{send_input,wait,resume_agent}.rs` 的生命周期。MuLi 用事件驱动协程与 SQLite 替代 Codex 的进程/驻留控制，不照搬跨工作树机制；队友不建立独立 OS 沙箱，仍是本机权限边界下的协作任务。
 
 `tests/test_team.py` 覆盖单并发派生等待、持久身份续办、邮箱只投递、历史数与活动预算分离、父子取消、调度前取消、原子创建、父邮箱满的持久汇报，以及等待环/停止祖先拒绝；全部离线模拟模型。
 
-管理页通过 `GET /api/team?limit=50&offset=0&active_only=false` 分页查看，最新创建的队友在前；`limit` 为 1–100，页大小不是历史 agent 总数上限。响应包含 `members`、`messages`、`offset`、`limit`、`total`、`active_only` 和 `has_more`。“进行中”筛选包含 queued/running，审批和工具等待仍属于运行中。筛选使末页消失时返回最后一个有效页。模型 `list_agents` 保持原来的从旧到新顺序及分页方式。
+管理页通过 `GET /api/team?limit=50&offset=0&active_only=false` 分页查看，最新创建的队友在前；`limit` 为 1–100，页大小不是历史 agent 总数上限。响应包含 `members`、`messages`、`offset`、`limit`、`total`、`active_only` 和 `has_more`。“进行中”筛选包含 queued/running/paused，审批和工具等待仍属于运行中，暂停则等待明确重新规划及当前方案确认。筛选使末页消失时返回最后一个有效页。模型 `list_agents` 保持原来的从旧到新顺序及分页方式。
 
 这是实时列表，队友新建或结束后刷新会反映最新集合，不是固定导出快照。界面同一请求代次覆盖翻页、筛选和事件刷新，迟到响应不会跳回旧页；刷新保留当前控件焦点与协作消息的展开状态，不抢页面其它区域的焦点。每位队友仅读取最近 5 条消息；页面附带最近 100 条、各最多 1000 字的预览，`truncated` 明示节选。SQL 直接投影有界正文，避免在 Python 中加载图片和原生协议块。完整证据仍在成员的运行记录中。
 
@@ -56,6 +56,8 @@
 `await start(workflow_id, parent_run_id=None, parent_session_id=None)` 为全部节点创建独立 session、保存运行快照、启动后台任务，随即返回运行字典。两个可选父标识是仅限关键字参数，保存在运行快照中，供父任务绑定取消和结果收集。可以重复启动同一个定义，各次运行和节点会话互相独立。返回字段含相同值的 `id` / `run_id`，`workflow_id`，`nodes`，状态与时间；`nodes` 是按节点 id 索引的字典。
 
 首次等待前即持久化运行并登记后台任务；启动事件发布期间取消，也会取消并结算已登记的运行，不留下永远 queued 的孤儿记录。`await wait(run_id)` 等待并返回最新持久化终态，使用 shield 隔离等待者与子任务；取消等待者只结束等待，父任务应在自己的取消清理中显式调用 `cancel`。父标识本身不赋予额外权限。
+
+受控父会话启动 DAG 时，宿主在首个 await 前同步核验本轮 scope/epoch，并把真实继承绑定保存到运行；节点不能借角色名称、普通会话入口或缺少 agent 行逃离该范围。首版不支持活动 DAG 中途暂停：仍有执行或收尾 task 时拒绝 pause；DAG 完全结束后才可暂停该任务树。独立 DAG 不受无关任务控制。
 
 `await cancel(run_id)` 取消运行、正在执行和排队的节点，并将未启动的节点标记取消。已完成的运行保持结果，重复取消幂等。`await close()` 取消所有活动工作流并拒绝新启动。
 

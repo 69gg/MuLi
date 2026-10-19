@@ -27,6 +27,8 @@ update = await runtime.team.wait(
 
 每条完成记录的 `coalesced=false,count=1` 表示一次准确的终态提交，不把多代完成合并冒充全量。一次执行结束后，即使该身份已经 queued/running 下一代，仍可读到上一代完成。generation 标识执行开始次数；completion_revision 还包括尚未开始就取消的情况，不能互换。
 
+`paused` 也是该代执行的持久终态，能唤醒已有 wait 并出现在完成日志中，但不表示任务成功或已取消。暂停身份保留在 active 筛选并计入未完成预算，不占模型槽、不挂等待批准的协程；没有当前确认方案，普通 send/resume 不能解除暂停。暂停 scope 的报告暂缓投递主助手，已有观察者仍可读取该代日志。控制与事件恢复合同见 [task-control-runtime.md](task-control-runtime.md)。
+
 result_preview 是节选，不是完整结果。事件最多保留 2000 字预览，响应根据 `limits.max_output_chars` 继续收紧，并明确 truncated；完整会话/运行证据仍在原存档。当前 Web API 可通过已有会话详情/事件查看历史，没有新增 `/api/runs/:id` 路由。新模式先按运行时相同的 JSON 序列化方式计算长度，保留合法对象及完整 token；元数据自身放不下时报 `wait_budget_exceeded`，要求拆分目标，不交给通用工具截断器破坏 token。
 
 ## 观察范围、输入和取消
