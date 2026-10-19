@@ -74,20 +74,38 @@ class Commitments:
         """Bounded public projection; full briefs belong to scoped reads only."""
         result = {
             key: item[key]
-            for key in ("id", "title", "status", "revision", "created_at", "updated_at")
+            for key in ("id", "status", "revision", "created_at", "updated_at")
             if key in item
         }
         result["has_brief"] = "brief" in item or bool(item.get("has_brief"))
+        # Reserve the omission marker before adding previews: a later omitted
+        # field must not make an otherwise fitting projection exceed its budget.
+        result["details_omitted"] = False
         # Optional previews never cause the result to exceed its serialized budget.
-        for key in ("next_step", "assignee", "evidence", "source_id"):
+        for key in ("title", "next_step", "assignee", "evidence", "source_id"):
             if key in item:
                 candidate = {**result, key: item[key]}
                 if len(json.dumps(candidate, ensure_ascii=False)) <= self.max_output_chars():
                     result = candidate
                 else:
                     result["details_omitted"] = True
+                    if key == "title":
+                        low, high = 0, len(item[key])
+                        while low < high:
+                            middle = (low + high + 1) // 2
+                            candidate = {**result, key: item[key][:middle]}
+                            if (
+                                len(json.dumps(candidate, ensure_ascii=False))
+                                <= self.max_output_chars()
+                            ):
+                                low = middle
+                            else:
+                                high = middle - 1
+                        result[key] = item[key][:low]
         if len(json.dumps(result, ensure_ascii=False)) > self.max_output_chars():
             raise ValueError("工作账本元数据超过工具输出预算")
+        if not result["details_omitted"]:
+            del result["details_omitted"]
         return result
 
     def get(self, identifier: str, *, revision: int | None = None) -> dict[str, Any]:

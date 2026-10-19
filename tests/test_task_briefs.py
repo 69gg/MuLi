@@ -197,6 +197,32 @@ async def test_paged_read_keeps_json_budget_and_historical_revision(tmp_path: Pa
         store.close()
 
 
+@pytest.mark.parametrize("escaped_title", [False, True])
+async def test_reduced_output_budget_keeps_old_ledger_readable_without_changing_full_text(
+    tmp_path: Path, escaped_title: bool
+) -> None:
+    runtime, _ = make_runtime(tmp_path, [ModelTurn("继续协助")])
+    services = attach_services(runtime, tmp_path)
+    try:
+        item = await services.commitments.save(
+            "X" + "\x01" * 239 if escaped_title else "普通标题",
+            next_step="x" * 763,
+            evidence="证明文字" * 500,
+            brief={"goal": "完整目标", "constraints": ["保持完整要求"]},
+        )
+        runtime.config.update({"limits": {"max_output_chars": 1000}})
+        metadata = services.commitments.list()[0]
+        assert len(json.dumps(metadata, ensure_ascii=False)) <= 1000
+        assert metadata["details_omitted"] is True
+        assert metadata["id"] == item["id"]
+        assert services.commitments.get(item["id"]) == item
+        receipt = await runtime.submit("请继续协助", mode="yolo")
+        assert await runtime.wait(receipt["run_id"]) == "继续协助"
+        assert services.commitments.get(item["id"]) == item
+    finally:
+        await runtime.close()
+
+
 async def test_metadata_paths_do_not_bypass_scoped_brief_reads(tmp_path: Path) -> None:
     runtime, _ = make_runtime(tmp_path, [])
     services = attach_services(runtime, tmp_path)
