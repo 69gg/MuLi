@@ -230,6 +230,16 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .workflow-step-label { display: inline-flex; align-items: center; font-size: 10px; color: var(--muted); gap: 7px; }
 .workflow-step-label + .workflow-step-label::before { content: "→"; color: var(--muted); margin-right: 2px; }
 .workflow-step-number { font-size: 9px; width: 17px; height: 17px; background: var(--surface-2); color: var(--muted); border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; }
+.workflow-activity { margin-bottom: 36px; }
+.workflow-section-heading, .workflow-pagination { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.workflow-section-heading { border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.workflow-section-heading h3 { margin: 0; font-size: 13px; font-weight: 500; }
+.workflow-active-row { display: flex; align-items: flex-start; gap: 12px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.workflow-active-row h4 { font-size: 12px; font-weight: 500; line-height: 1.7; margin: 0 0 6px; overflow-wrap: anywhere; }
+.workflow-run-id { display: block; color: var(--muted); font-size: 10px; line-height: 1.8; overflow-wrap: anywhere; white-space: pre-wrap; margin-bottom: 6px; }
+.workflow-pagination { padding-top: 12px; flex-wrap: wrap; color: var(--muted); font-size: 10px; }
+.workflow-pagination > div { display: flex; gap: 14px; }
+.workflow-list-status { color: var(--muted); font-size: 11px; line-height: 1.8; margin: 16px 0; }
 .workflow-steps-editor { display: grid; gap: 15px; }
 .view-heading-actions { display: flex; gap: 8px; }
 .workflow-run { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 13px; }

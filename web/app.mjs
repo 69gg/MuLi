@@ -76,6 +76,9 @@ let memoryDialog = null;
 let memoryPath = null;
 let memoryPathSequence = 0;
 let memorySearchController = null;
+let workflowActivity = null;
+const workflowStopping = new Set();
+const workflowPageSize = 50;
 const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
@@ -130,6 +133,7 @@ function showLogin() {
   clearTaskControls();
   releaseMemoryDialog();
   cancelMemorySearch(); releaseMemoryPath();
+  releaseWorkflowActivity();
   dialogTeamView = null; dialogMemoryReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
@@ -450,8 +454,8 @@ function startGlobalEvents() {
       if (workflow && event.data.run) {
         const runs = workflow.runs ?? [];
         workflow.runs = [event.data.run, ...runs.filter((run) => run.id !== event.data.run.id)];
-        if (state.view === "workflows") renderOtherView();
       }
+      refreshWorkflowActivity();
       void refreshSessions();
     }
     if (event.type === "reminder.updated") {
@@ -616,15 +620,30 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view) {
   cancelMemorySearch(); releaseMemoryPath();
+  releaseWorkflowActivity();
   if (view !== state.view && memoryDialog) { $("#app-dialog").close(); releaseMemoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
   state.view = view; state.viewError = ""; renderChrome();
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
+  if (view === "workflows") {
+    const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "" };
+    state.workflows = []; state.viewLoading = false; renderOtherView();
+    const heading = $(".view-heading h2", $("#other-view"));
+    if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
+    const definitions = request("/workflows", { signal: slot.definitionsController.signal, cache: "no-store" }).then((payload) => {
+      if (workflowActivityCurrent(slot)) state.workflows = collection(payload);
+    }).catch((error) => {
+      if (workflowActivityCurrent(slot)) slot.definitionsError = error.message;
+    }).finally(() => {
+      if (workflowActivityCurrent(slot)) { slot.definitionsLoading = false; renderOtherView(); }
+    });
+    await Promise.allSettled([definitions, loadWorkflowActivity(slot)]);
+    return;
+  }
   state.viewLoading = true; renderOtherView();
   try {
-    if (view === "workflows") state.workflows = collection(await request("/workflows"));
     if (view === "uploads") state.uploads = collection(await request("/uploads"));
     if (view === "team") { const page = await teamPager.load(); if (page) state.team = page; }
     if (view === "records") { state.sessions = collection(await request("/sessions")); state.sessionsError = ""; }
@@ -665,7 +684,7 @@ function renderOtherView() {
     root.replaceChildren(element("div", { class: "view-content" }, empty)); return;
   }
   if (state.view === "memories") root.replaceChildren(renderMemories());
-  if (state.view === "workflows") root.replaceChildren(renderWorkflows());
+  if (state.view === "workflows") { const saved = captureWorkflowView(root); root.replaceChildren(renderWorkflows()); restoreWorkflowView(root, saved); }
   if (state.view === "notifications") root.replaceChildren(renderNotifications());
   if (state.view === "settings") root.replaceChildren(renderSettings());
   if (state.view === "uploads") root.replaceChildren(renderUploads());
@@ -1333,23 +1352,133 @@ async function loadMemoryHistory(slot) {
   } finally { if (slot.historyController === controller) slot.historyController = null; }
 }
 
+function workflowActivityCurrent(slot) {
+  return !!slot && workflowActivity === slot && state.view === "workflows" && state.auth.authenticated;
+}
+
+function releaseWorkflowActivity() {
+  const slot = workflowActivity; workflowActivity = null;
+  slot?.controller?.abort(); slot?.definitionsController.abort();
+  if (slot) slot.page = null;
+  $("#workflow-active-runs")?.replaceChildren();
+}
+
+function workflowActivityPage(payload, after) {
+  const statuses = ["pending", "queued", "running"];
+  if (!payload || !Array.isArray(payload.items) || payload.items.length > workflowPageSize || typeof payload.has_more !== "boolean") throw new Error("活动运行响应不完整，请重试。");
+  const seen = new Set();
+  const items = payload.items.map((run) => {
+    if (!run || typeof run.id !== "string" || !run.id || run.id === after || seen.has(run.id) || typeof run.workflow_id !== "string" || !run.workflow_id || typeof run.name !== "string" || !statuses.includes(run.status)) throw new Error("活动运行响应不完整，请重试。");
+    seen.add(run.id);
+    return { id: run.id, workflow_id: run.workflow_id, name: run.name, status: run.status, created_at: run.created_at, updated_at: run.updated_at };
+  });
+  if (payload.has_more ? !items.length || payload.next_after !== items.at(-1).id || payload.next_after === after : payload.next_after !== null) throw new Error("活动运行翻页位置无效，请重新读取。");
+  return { items, has_more: payload.has_more, next_after: payload.next_after };
+}
+
+async function loadWorkflowActivity(slot, after = "", starts = [""]) {
+  if (!workflowActivityCurrent(slot)) return;
+  slot.controller?.abort();
+  const controller = slot.controller = new AbortController();
+  slot.loading = true; slot.error = ""; slot.refreshPending = false;
+  renderOtherView();
+  const current = () => workflowActivityCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const payload = await request(`/workflow-runs/active?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" });
+    if (!current()) return;
+    const page = workflowActivityPage(payload, after);
+    // A moving page may become empty. Return to the head once, without following has_more.
+    if (after && !page.items.length) { await loadWorkflowActivity(slot); return; }
+    slot.page = page; slot.after = after; slot.starts = [...starts];
+  } catch (error) {
+    if (current()) slot.error = error.message;
+  } finally {
+    if (workflowActivityCurrent(slot) && slot.controller === controller) {
+      slot.controller = null; slot.loading = false;
+      if (slot.refreshPending) void loadWorkflowActivity(slot);
+      else renderOtherView();
+    }
+  }
+}
+
+function refreshWorkflowActivity() {
+  const slot = workflowActivity;
+  if (!workflowActivityCurrent(slot)) return;
+  if (slot.controller) { slot.refreshPending = true; slot.controller.abort(); }
+  else void loadWorkflowActivity(slot);
+}
+
+function captureWorkflowView(root) {
+  if (!$("#workflow-active-runs", root)) return null;
+  const focused = document.activeElement;
+  const inside = root.contains(focused);
+  return {
+    inside, action: inside ? focused?.dataset?.action : null,
+    id: focused?.dataset?.id, direction: focused?.dataset?.direction,
+    heading: inside ? focused?.getAttribute("id") : null,
+    summary: inside && focused?.tagName === "SUMMARY" ? focused.closest("[data-workflow-history-run]")?.dataset.workflowHistoryRun : null,
+    open: $$("[data-workflow-history-run]", root).filter((node) => node.open).map((node) => node.dataset.workflowHistoryRun),
+  };
+}
+
+function restoreWorkflowView(root, saved) {
+  if (!saved) return;
+  const histories = $$("[data-workflow-history-run]", root);
+  for (const details of histories) details.open = saved.open.includes(details.dataset.workflowHistoryRun);
+  if (!saved.inside) return;
+  const button = saved.action && $$("[data-action]", root).find((node) => node.dataset.action === saved.action && node.dataset.id === saved.id && node.dataset.direction === saved.direction);
+  const summary = saved.summary && histories.find((node) => node.dataset.workflowHistoryRun === saved.summary)?.querySelector("summary");
+  const heading = saved.heading && $$("[id]", root).find((node) => node.getAttribute("id") === saved.heading);
+  const target = button && !button.disabled ? button : summary || heading || $("#workflow-active-heading", root);
+  target?.focus({ preventScroll: true });
+}
+
+function renderWorkflowActivity() {
+  const slot = workflowActivity;
+  const refresh = actionButton("刷新", "refresh-workflow-runs", "text-button", "refresh");
+  refresh.disabled = !slot || slot.loading;
+  const root = element("section", { id: "workflow-active-runs", class: "workflow-activity", "aria-labelledby": "workflow-active-heading", "aria-busy": String(!!slot?.loading) }, element("div", { class: "workflow-section-heading" }, element("h3", { id: "workflow-active-heading", tabIndex: -1, text: "进行中" }), refresh));
+  if (!slot) return root;
+  if (slot.loading) root.append(element("p", { class: "workflow-list-status", role: "status", text: "正在读取活动运行…" }));
+  if (slot.error) root.append(element("p", { class: "form-error", role: "alert", text: slot.error }));
+  if (slot.page) {
+    for (const run of slot.page.items) {
+      const labels = { pending: "等待中", queued: "排队中", running: "运行中" };
+      const stop = actionButton(workflowStopping.has(run.id) ? "正在提交…" : "停止", "cancel-workflow-run", "secondary-button", "stop", { id: run.id });
+      stop.disabled = workflowStopping.has(run.id);
+      stop.setAttribute("aria-label", `停止 ${run.name}（${run.id}）`);
+      root.append(element("article", { class: "workflow-active-row" }, element("div", { class: "row-content" }, element("h4", { text: run.name }), element("code", { class: "workflow-run-id", text: run.id }), element("div", { class: "row-meta" }, labels[run.status], element("time", { text: formatTimestamp(run.updated_at ?? run.created_at) }))), element("div", { class: "row-actions" }, stop)));
+    }
+    if (!slot.page.items.length && !slot.loading && !slot.error) root.append(element("p", { class: "workflow-list-status", text: "没有进行中的工作流" }));
+    if (slot.page.items.length) {
+      const previous = actionButton("上一页", "page-workflow-runs", "text-button", undefined, { direction: "previous" });
+      const next = actionButton("下一页", "page-workflow-runs", "text-button", undefined, { direction: "next" });
+      previous.disabled = slot.loading || slot.starts.length < 2; next.disabled = slot.loading || !slot.page.has_more;
+      root.append(element("nav", { class: "workflow-pagination", "aria-label": "活动运行分页" }, element("span", { text: `第 ${slot.starts.length} 页 · 本页 ${slot.page.items.length} 项${slot.page.has_more ? " · 有后续" : ""}` }), element("div", {}, previous, next)));
+    }
+  }
+  return root;
+}
+
 function renderWorkflows() {
-  const root = element("div", { class: "view-content" }, viewHeading("工作流", "把重复任务整理成可运行的步骤。", element("div", { class: "view-heading-actions" }, actionButton("从模板开始", "workflow-templates", "secondary-button", "sparkles"), actionButton("新建工作流", "new-workflow", "primary-button", "plus"))), element("div", { class: "list-caption" }, `${state.workflows.length} 个工作流`, "任务编排"));
-  if (!state.workflows.length) root.append(emptyState("workflow", "还没有工作流", "创建一个流程，按步骤协作完成任务。"));
+  const root = element("div", { class: "view-content" }, viewHeading("工作流", "把重复任务整理成可运行的步骤。", element("div", { class: "view-heading-actions" }, actionButton("从模板开始", "workflow-templates", "secondary-button", "sparkles"), actionButton("新建工作流", "new-workflow", "primary-button", "plus"))), renderWorkflowActivity(), element("div", { class: "list-caption" }, "最近定义", `${state.workflows.length} 个工作流`));
+  if (workflowActivity?.definitionsLoading) root.append(element("p", { class: "workflow-list-status", text: "正在读取定义…" }));
+  else if (workflowActivity?.definitionsError) root.append(element("p", { class: "form-error", role: "alert", text: workflowActivity.definitionsError }), actionButton("重试读取定义", "retry-view", "text-button", "refresh"));
+  else if (!state.workflows.length) root.append(emptyState("workflow", "还没有工作流", "创建一个流程，按步骤协作完成任务。"));
   for (const workflow of state.workflows) {
     const steps = element("div", { class: "workflow-steps" });
     for (const [index, step] of (workflow.steps ?? []).entries()) steps.append(element("span", { class: "workflow-step-label" }, element("span", { class: "workflow-step-number", text: index + 1 }), step.title || step.name || step.id));
     const content = element("div", { class: "row-content" }, element("h3", { text: workflow.name }), workflow.description && element("p", { text: workflow.description }), steps, element("div", { class: "row-meta" }, `${workflow.steps?.length ?? 0} 个步骤`, `${MODES[workflow.mode]?.label ?? "Auto"} 模式`, element("time", { text: formatTimestamp(workflow.updated_at ?? workflow.created_at) })));
     const latest = workflow.runs?.[0];
     if (latest) content.append(renderWorkflowRun(latest));
-    root.append(element("article", { class: "workflow-row" }, element("div", { class: "row-icon" }, icon("workflow")), content, element("div", { class: "row-actions" }, latest && ["running", "queued"].includes(latest.status) ? actionButton("停止", "cancel-workflow-run", "secondary-button", "stop", { id: latest.id }) : actionButton("运行", "run-workflow", "secondary-button", "play", { id: workflow.id }), iconButton("删除工作流", "delete-workflow", "trash", { id: workflow.id }))));
+    root.append(element("article", { class: "workflow-row" }, element("div", { class: "row-icon" }, icon("workflow")), content, element("div", { class: "row-actions" }, actionButton("运行", "run-workflow", "secondary-button", "play", { id: workflow.id }), iconButton("删除工作流", "delete-workflow", "trash", { id: workflow.id }))));
   }
   return root;
 }
 
 function renderWorkflowRun(run) {
   const labels = { pending: "等待中", queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", timed_out: "已超时", skipped: "已跳过", interrupted: "已中断" };
-  const details = element("details", { class: `workflow-run ${run.status}` }, element("summary", {}, element("span", { class: "status-dot", "aria-hidden": "true" }), `最近运行 · ${labels[run.status] ?? run.status}`, element("time", { text: formatTimestamp(run.updated_at ?? run.created_at) })));
+  const details = element("details", { class: `workflow-run ${run.status}`, dataset: { workflowHistoryRun: run.id } }, element("summary", {}, element("span", { class: "status-dot", "aria-hidden": "true" }), `最近运行 · ${labels[run.status] ?? run.status}`, element("time", { text: formatTimestamp(run.updated_at ?? run.created_at) })));
   for (const node of Object.values(run.nodes ?? {})) details.append(element("div", { class: "workflow-run-node" }, element("span", { class: "workflow-node-status", text: labels[node.status] ?? node.status }), element("span", { text: node.title ?? node.id }), node.session_id && actionButton("会话", "workflow-session", "text-button", undefined, { session: node.session_id })));
   if (run.result) details.append(element("div", { class: "workflow-run-result" }, renderMarkdown(run.result)));
   if (run.error) details.append(element("p", { class: "form-error", text: run.error }));
@@ -1397,7 +1526,7 @@ async function runWorkflow(id, button) {
   button.disabled = true;
   try {
     const result = await request(`/workflows/${encodeURIComponent(id)}/run`, { method: "POST" });
-    toast("工作流已开始"); await refreshSessions();
+    toast("工作流已开始"); refreshWorkflowActivity(); await refreshSessions();
     if (result.session_id) await loadSession(result.session_id);
   } catch (error) { showError(error); }
   button.disabled = false;
@@ -1906,9 +2035,21 @@ async function handleAction(action, button) {
   if (action === "remove-workflow-step") button.closest(".workflow-step-editor")?.remove();
   if (action === "run-workflow") await runWorkflow(button.dataset.id, button);
   if (action === "workflow-session") await loadSession(button.dataset.session);
+  if (["refresh-workflow-runs", "page-workflow-runs"].includes(action)) {
+    const slot = workflowActivity;
+    if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button) || slot.loading) return;
+    if (action === "refresh-workflow-runs") await loadWorkflowActivity(slot);
+    else if (button.dataset.direction === "next" && slot.page?.has_more) await loadWorkflowActivity(slot, slot.page.next_after, [...slot.starts, slot.page.next_after]);
+    else if (button.dataset.direction === "previous" && slot.starts.length > 1) await loadWorkflowActivity(slot, slot.starts.at(-2), slot.starts.slice(0, -1));
+  }
   if (action === "cancel-workflow-run") {
-    button.disabled = true;
-    try { await request(`/workflow-runs/${encodeURIComponent(button.dataset.id)}/cancel`, { method: "POST" }); toast("工作流已停止"); await switchView("workflows"); } finally { button.disabled = false; }
+    const slot = workflowActivity, id = button.dataset.id;
+    if (!workflowActivityCurrent(slot) || !$("#workflow-active-runs")?.contains(button) || !slot.page?.items.some((run) => run.id === id) || workflowStopping.has(id)) return;
+    workflowStopping.add(id); renderOtherView();
+    try {
+      await request(`/workflow-runs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+      if (workflowActivityCurrent(slot)) { toast("已提交停止请求"); refreshWorkflowActivity(); }
+    } finally { workflowStopping.delete(id); if (workflowActivityCurrent(slot)) renderOtherView(); }
   }
   if (action === "delete-workflow") confirmAction("删除工作流", "此工作流定义会被删除，已有会话保留。", "删除工作流", async () => { await request(`/workflows/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("workflows"); toast("工作流已删除"); });
   if (action === "read-notification") await markRead(button.dataset.id);
@@ -2013,7 +2154,7 @@ document.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
 window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog) $("#app-dialog").close(); releaseMemoryDialog(); cancelMemorySearch(); releaseMemoryPath(); globalController?.abort(); sessionController?.abort(); });
+window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog) $("#app-dialog").close(); releaseMemoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); globalController?.abort(); sessionController?.abort(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();
