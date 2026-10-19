@@ -1,5 +1,5 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
-import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
+import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
@@ -281,7 +281,7 @@ function renderChat() {
       node.dataset.attachments = attachmentKey;
     }
     let interruption = $(".interrupted-label", node);
-    if (message.interrupted && !interruption) { interruption = element("div", { class: "interrupted-label", text: "生成已停止" }); node.append(interruption); }
+    if (message.interrupted && !interruption) { interruption = element("div", { class: "interrupted-label", text: message.paused ? "生成已暂停" : "生成已停止" }); node.append(interruption); }
   }
   const reasoning = $("#reasoning-region");
   reasoning.hidden = !state.session.reasoning;
@@ -343,10 +343,10 @@ function renderTimeline() {
       $(".tool-result", node).textContent = pretty(tool.result ?? tool.error ?? "");
       $(".tool-result", node).hidden = tool.result === undefined && !tool.error;
       $(".tool-result-label", node).hidden = tool.result === undefined && !tool.error;
-      $(".tool-step-status", node).textContent = tool.status === "running" ? "执行中" : tool.status === "failed" ? "执行失败" : "已完成";
+      $(".tool-step-status", node).textContent = toolStatusLabel(tool);
     }
   }
-  $("#timeline-footer").textContent = `${MODES[state.mode]?.label ?? state.mode} 模式${state.session.status === "cancelled" ? " · 任务已停止" : ""}`;
+  $("#timeline-footer").textContent = `${MODES[state.mode]?.label ?? state.mode} 模式${state.session.status === "cancelled" ? " · 任务已停止" : state.session.status === "paused" ? " · 任务已暂停" : ""}`;
 }
 
 function queueRender() {
@@ -467,7 +467,7 @@ function startSessionEvents(sessionId) {
       if (event.session_id && event.session_id !== state.activeSession?.id) return;
       state.session = applyEvent(state.session, event);
       if ((event.type === "tool.started" || event.type === "approval.requested") && !state.timelineUserChoice) state.timelineOpen = true;
-      if (["run.completed", "run.failed", "run.cancelled"].includes(event.type)) { state.sending = false; void refreshSessions(); }
+      if (["run.completed", "run.failed", "run.cancelled", "run.paused"].includes(event.type)) { state.sending = false; void refreshSessions(); }
       queueRender();
     },
   });
@@ -806,7 +806,7 @@ function renderTaskBriefDialog(slot = taskDialog) {
   } else if (view.capable) actions.push(localButton("暂停任务树", "pause", () => void submitTaskControl(slot.model, "pause"), { primary: true, disabled: !view.canPause }));
   if (view.workflowBlocked) actions.push(localButton("查看工作流", "workflows", () => { $("#app-dialog").close(); void switchView("workflows"); }));
   if (view.capable || data.submission || slot.readError) actions.push(localButton("刷新状态", "refresh", refresh, { disabled: slot.loading || view.busy }));
-  slot.actions.replaceChildren(actions);
+  slot.actions.replaceChildren(...actions);
   slot.plan.hidden = !view.plan;
   const planLabel = view.plan?.epoch === data.current?.control?.epoch ? "已确认计划" : "此前计划";
   if (view.plan && (slot.renderedPlan !== view.plan || slot.planLabel !== planLabel)) {

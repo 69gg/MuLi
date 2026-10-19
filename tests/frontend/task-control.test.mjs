@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 import { createTaskControl, restoreTaskControlRequest, taskControlView } from "../../web/task-control.mjs";
 
 function current(revision = 1, control = {}, scope = {}) {
@@ -179,4 +181,60 @@ test("malformed or mismatched receipts remain unknown instead of claiming succes
   assert.equal(taskControlView(model.state).unknown, true);
   assert.equal(taskControlView(model.state).paused, false);
   for (const invalid of [null, {}, { action: "resume", expected_epoch: 0, request_id: "x" }, { action: "pause", expected_epoch: true, request_id: "x" }]) assert.equal(restoreTaskControlRequest(invalid), null);
+});
+
+// Exercise the actual application renderer. The tiny DOM double preserves the
+// browser's variadic replaceChildren behavior: an array is text, not child nodes.
+class DOMElement {
+  constructor(tagName) { this.tagName = tagName.toUpperCase(); this.children = []; this.dataset = {}; this.classList = { toggle() {} }; }
+  append(...children) { this.children.push(...children.map((child) => child instanceof DOMElement ? child : String(child))); }
+  replaceChildren(...children) { this.children = []; this.append(...children); }
+  contains(node) { return this === node || this.children.some((child) => child instanceof DOMElement && child.contains(node)); }
+}
+class DOMButton extends DOMElement {}
+function domElement(tag, attributes = {}, ...children) {
+  const node = tag === "button" ? new DOMButton(tag) : new DOMElement(tag);
+  Object.assign(node, attributes);
+  if (attributes.text !== undefined) node.textContent = attributes.text;
+  node.append(...children.flat(Infinity));
+  return node;
+}
+const app = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
+const rendererStart = app.indexOf("function renderTaskBriefDialog(");
+const rendererEnd = app.indexOf("\nasync function refreshTaskBriefDialog(", rendererStart);
+assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
+const renderDialog = runInNewContext(`(${app.slice(rendererStart, rendererEnd)})`, {
+  taskControlView, taskDialogCurrent: () => true, document: { activeElement: null }, element: domElement,
+  $: () => null, $$: () => [],
+});
+function dialogSlot(model) {
+  const slot = { model, loading: false, readError: "", renderedDetail: model.state.detail };
+  for (const key of ["content", "brief", "readStatus", "panel", "status", "scope", "note", "error", "editor", "input", "actions", "plan"]) slot[key] = domElement("div");
+  return slot;
+}
+
+test("the live task control renderer inserts button nodes in every actionable state", () => {
+  const states = [ready(), ready(detail(2, { epoch: 1 })), ready(detail(2, { epoch: 1 }))];
+  states[2].edit();
+  for (const model of states) {
+    const slot = dialogSlot(model);
+    renderDialog(slot);
+    assert.ok(slot.actions.children.length >= 2);
+    assert.ok(slot.actions.children.every((node) => node instanceof DOMButton), "replaceChildren must receive the actual button nodes, not an array coerced to text");
+    assert.ok(slot.actions.children.every((node) => node.type === "button"));
+  }
+});
+
+test("a newly paused epoch labels the unchanged previous plan as historical", () => {
+  const plan = { epoch: 1, text: "先检查再汇报" };
+  const model = ready(detail(4, { epoch: 1, approved_epoch: 1, plan, plan_epoch: 1 }));
+  const slot = dialogSlot(model);
+  renderDialog(slot);
+  assert.equal(slot.plan.children[0].children[0].textContent, "已确认计划");
+  const body = model.begin("pause");
+  model.complete(result(body, current(5, { epoch: 2, approved_epoch: 1, plan_epoch: 1 })));
+  renderDialog(slot);
+  assert.equal(slot.status.textContent, "已暂停后续操作");
+  assert.equal(slot.plan.children[0].children[0].textContent, "此前计划");
+  assert.equal(slot.plan.children[0].children[1].textContent, plan.text);
 });

@@ -88,7 +88,9 @@ export function applyEvent(state, event, { history = false } = {}) {
     case "tool.completed": {
       let result = data.result;
       if (typeof result === "string") { try { result = JSON.parse(result); } catch { /* Plain-text tool output is valid. */ } }
-      next.tools = upsert(next.tools, { ...data, status: data.error || result?.error ? "failed" : "completed", completed_at: event.created_at }, "call_id");
+      const code = data.code ?? result?.code;
+      const status = data.status === "not_executed" || result?.status === "not_executed" ? "not_executed" : data.error || result?.error ? "failed" : "completed";
+      next.tools = upsert(next.tools, { ...data, ...(code ? { code } : {}), status, completed_at: event.created_at }, "call_id");
       break;
     }
     case "approval.requested":
@@ -102,10 +104,11 @@ export function applyEvent(state, event, { history = false } = {}) {
     case "run.completed":
     case "run.cancelled":
     case "run.failed":
+    case "run.paused":
       next.status = event.type.slice(4);
       next.approvals = [];
       if (event.type === "run.cancelled") next.queued = [];
-      next.messages = next.messages.map((message) => message.streaming ? { ...message, streaming: false, interrupted: event.type !== "run.completed" } : message);
+      next.messages = next.messages.map((message) => message.streaming ? { ...message, streaming: false, interrupted: event.type !== "run.completed", ...(event.type === "run.paused" ? { paused: true } : {}) } : message);
       next.error = event.type === "run.failed" ? String(data.error ?? data.message ?? "本次任务未完成，请重试。") : "";
       break;
     default:
@@ -128,12 +131,16 @@ export function hydrateSession(detail) {
     if (event.type === "message.completed" && event.data?.message?.role === "assistant") pendingText = "";
   }
   state.reasoning = reasoning;
-  if (pendingText) state.messages.push({ id: `stream:${state.runId ?? "current"}`, role: "assistant", content: pendingText, streaming: isRunning(state.status), interrupted: !isRunning(state.status) && state.status !== "completed" });
+  if (pendingText) state.messages.push({ id: `stream:${state.runId ?? "current"}`, role: "assistant", content: pendingText, streaming: isRunning(state.status), interrupted: !isRunning(state.status) && state.status !== "completed", ...(state.status === "paused" ? { paused: true } : {}) });
   return state;
 }
 
 export function isRunning(status) {
   return status === "running" || status === "approval";
+}
+
+export function toolStatusLabel(tool) {
+  return tool.status === "running" ? "执行中" : tool.status === "failed" ? "执行失败" : tool.status === "not_executed" ? tool.code === "task_paused" ? "未执行 · 已暂停" : "未执行" : tool.status === "completed" ? "已完成" : "状态未知";
 }
 
 export function formatTimestamp(value, now = new Date()) {
