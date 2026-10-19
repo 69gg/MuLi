@@ -23,14 +23,14 @@ Linux 节点操作先使用 AT-SPI 获取无障碍树和节点身份。`computer
 | 平台 / 会话 | 截图候选 | 录屏候选 | 额外限制 |
 | --- | --- | --- | --- |
 | Linux Wayland | grim、gnome-screenshot | wf-recorder + timeout | grim / wf-recorder 依赖合成器提供相应协议；GNOME 等环境可能不支持 |
-| Linux Portal（下一版本候选） | 显式 backend=portal | 不支持 | 复用系统 Python Gio；只读能力探测与实际授权分开，不自动降级 |
+| Linux Portal（2.1 新增） | 显式 backend=portal | 不支持 | 复用系统 Python Gio；只读能力探测与实际授权分开，不自动降级 |
 | Linux X11 | gnome-screenshot、scrot、ffmpeg x11grab | ffmpeg x11grab | 需要 DISPLAY；可用 capture.device 指定显示源 |
 | macOS | screencapture | ffmpeg avfoundation | 录屏必须显式指定 capture.device，接受已确认的视频设备索引/名称或其 :none 形式；需要系统屏幕录制授权 |
 | Windows | ffmpeg gdigrab | ffmpeg gdigrab | 默认 desktop；capture.device 可显式指定 gdigrab 输入源 |
 
 capture.backend=auto 保留原有候选顺序，不自动选择 Portal；显式后端只用于它支持的操作，不偷偷降级到另一种采集。同步 status 只检查工具、环境及探测缓存，permission_verified 始终为 false。DBus 地址仅作为 portal 环境线索，不代表服务可用或已授权。
 
-本开发树新增的 Portal 截图属于下一版本候选，尚未发布，也未验证真实桌面授权。启用 computer.enabled、computer.capture.enabled，并显式选择 capture.backend=portal 后，使用 computer.python_path 对应的系统 Python Gio 请求截图；不依赖 AT-SPI 可用，不安装组件。系统缺少 GI 或 Portal 接口时明确失败。Portal 录屏、坐标操作和持久授权未实现。
+2.1 新增显式 Portal 截图，已通过私有 D-Bus 测试，未验证真实桌面授权。启用 computer.enabled、computer.capture.enabled，并显式选择 capture.backend=portal 后，使用 computer.python_path 对应的系统 Python Gio 请求截图；不依赖 AT-SPI 可用，不安装组件。系统缺少 GI 或 Portal 接口时明确失败。Portal 录屏、坐标操作和持久授权未实现。
 
 `GET /api/capture` 与 `media_capabilities` 按需执行约 2 秒上限的异步只读探测，合并并发查询；同步 `Capture.status()` 不启动进程。成功缓存 60 秒、其他结果缓存 10 秒，`portal.state` 区分 unknown / ready / error，`stale` 表示缓存是否过期。未运行的服务保持 unknown，探测不激活服务；只有显式截图才允许正常激活 Portal。关闭或重载配置会取消并回收旧探测。
 
