@@ -1,6 +1,6 @@
 # 2.4 审查与验证
 
-状态：本地集成、独立审查和离线发行包验收通过，等待远端 CI 与发布核验。2.4 聚焦 Linux 的应用/窗口定向读取、准确省略报告、观察刷新与动作凭据的生命周期；不把后续 macOS AX、Windows UIA 研究写成本版能力。
+状态：已签名发布。2.4 聚焦 Linux 的应用/窗口定向读取、准确省略报告、观察刷新与动作凭据的生命周期；不把后续 macOS AX、Windows UIA 研究写成本版能力。
 
 ## 设计依据
 
@@ -24,4 +24,15 @@ helper 候选 `14f149eb`、宿主候选 `3f70e99` 均签名冻结。独立 revie
 
 候选 wheel/sdist 离线构建通过，在临时目录隔离安装后检查 CLI 2.4.0、静态文件、提示词、API 文档、默认关闭的电脑发现、无模型任务控制和应用生命周期；发行名称、版本及 changelog 一致。没有从远端下载发行包或改动用户安装。
 
-未验证：真实桌面点击/文本设置、Arch GTK/Qt/Electron 各应用支持、macOS AX、Windows UIA。未安装系统依赖、启动真实模型、采集屏幕或更改用户服务。发布需完成集成回归、签名提交、远端 CI 及发行物核验后另行记录。
+未验证：真实桌面点击/文本设置、Arch GTK/Qt/Electron 各应用支持、macOS AX、Windows UIA。未安装系统依赖、启动真实模型、采集屏幕或更改用户服务。
+
+## 发行证据
+
+最终签名提交 `f3d3b46e5b1bb603a008ce49ad7ed5901ce6e4ff` 经 [PR #7](https://github.com/69gg/MuLi/pull/7) 合入 main。[八项发布前检查](https://github.com/69gg/MuLi/actions/runs/39309768719) 与 [签名标签 v2.4.0 的十一项发布作业](https://github.com/69gg/MuLi/actions/runs/39310777974) 全部成功。北京时间 2026-10-20 03:31，已核对 [PyPI 2.4.0](https://pypi.org/project/muli-agent/2.4.0/) 与 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.4.0) 的两个文件大小及 SHA-256 一致：
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| muli_agent-2.4.0-py3-none-any.whl | 432700 | `745a7c8f56ff95e91df721220d1c90edcf1776327774f2963f85457990303a49` |
+| muli_agent-2.4.0.tar.gz | 2478523 | `9e3fedb1a708acd1eaafa9ad5e6e57f5114b8c81200f9436c94bbb4495238532` |
+
+核验使用平台元数据，没有重新下载发行包，也没有升级用户安装。
