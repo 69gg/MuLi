@@ -41,8 +41,12 @@ def _digest(value: Any) -> str:
     ).hexdigest()
 
 
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
 def _identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+    return (*_file_identity(value), value.st_ctime_ns)
 
 
 def _unique_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -83,7 +87,7 @@ class MCPDirectory:
                     if not entry.name.endswith(".json"):
                         continue
                     path = root / entry.name
-                    # Windows DirEntry.stat zeroes device/inode; lstat matches fstat's identity.
+                    # Windows DirEntry.stat zeroes device/inode; use uncached path identity.
                     info = path.lstat()
                     if not stat.S_ISREG(info.st_mode):
                         raise ExtensionError("source_not_regular", entry.name)
@@ -118,10 +122,13 @@ class MCPDirectory:
                 )
                 with os.fdopen(descriptor, "rb") as handle:
                     opened = os.fstat(handle.fileno())
-                    if not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(expected):
+                    # Windows path ctime can mean creation time while fstat uses change time.
+                    if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(
+                        expected
+                    ):
                         raise ExtensionError("source_changed", source)
                     payload = handle.read(self.limits.max_mcp_fragment_bytes + 1)
-                    if _identity(os.fstat(handle.fileno())) != _identity(expected):
+                    if _identity(os.fstat(handle.fileno())) != _identity(opened):
                         raise ExtensionError("source_changed", source)
                 if _identity(path.lstat()) != _identity(expected):
                     raise ExtensionError("source_changed", source)
