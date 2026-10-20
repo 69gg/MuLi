@@ -132,21 +132,25 @@ def command_for(mode: str, args: list[str]) -> list[str]:
     return [str(Path(executable).absolute()), *args[1:]]
 
 
-def stop_service(unit: str) -> None:
+def stop_service(unit: str) -> bool:
     try:
         state = manager("show", unit, "--value", "-p", "LoadState").stdout.strip()
         if state == "not-found":
-            return
+            return True
         manager("stop", unit)
+        return True
     except (subprocess.SubprocessError, OSError):
         # A collected unit is already gone; a stuck stop still gets a bounded kill.
         try:
             manager("kill", "--kill-whom=all", "--signal=KILL", unit)
+            manager("stop", unit)
+            return True
         except (subprocess.SubprocessError, OSError):
             print(
                 f"Could not confirm cleanup of {unit}; runtime limit remains active.",
                 file=sys.stderr,
             )
+            return False
 
 
 def run(command: list[str], seconds: int) -> int:
@@ -222,18 +226,21 @@ def run(command: list[str], seconds: int) -> int:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupted)
+    code = 125
+    cleaned = False
     try:
-        return subprocess.run(invocation, timeout=seconds + 20, check=False).returncode
+        code = subprocess.run(invocation, timeout=seconds + 20, check=False).returncode
     except (KeyboardInterrupt, subprocess.TimeoutExpired):
-        return 124
+        code = 124
     finally:
         try:
             for signum in previous:
                 signal.signal(signum, signal.SIG_IGN)
-            stop_service(unit)
+            cleaned = stop_service(unit)
         finally:
             for signum, handler in previous.items():
                 signal.signal(signum, handler)
+    return code if cleaned else 125
 
 
 def main() -> int:

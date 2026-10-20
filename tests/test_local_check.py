@@ -99,8 +99,9 @@ def test_command_failure_is_not_systemd_clean_signal_exit(
     assert checker.run_inside("unit.service", 1, ["target"]) == expected
 
 
+@pytest.mark.parametrize("cleaned", [True, False])
 def test_cancel_cleans_own_service_and_keeps_shared_budget(
-    checker: ModuleType, monkeypatch: Any
+    checker: ModuleType, monkeypatch: Any, cleaned: bool
 ) -> None:
     calls: list[tuple[str, ...]] = []
     stopped: list[str] = []
@@ -115,14 +116,18 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
         assert "--setenv=NODE_OPTIONS=--max-old-space-size=256" in command
         raise KeyboardInterrupt
 
+    def stop(unit: str) -> bool:
+        stopped.append(unit)
+        return cleaned
+
     monkeypatch.setattr(checker.sys, "platform", "linux")
     monkeypatch.setattr(checker.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setattr(checker.Path, "is_file", lambda _: True)
     monkeypatch.setattr(checker, "manager", record)
-    monkeypatch.setattr(checker, "stop_service", stopped.append)
+    monkeypatch.setattr(checker, "stop_service", stop)
     monkeypatch.setattr(checker.signal, "signal", lambda *args: None)
     monkeypatch.setattr(checker.subprocess, "run", cancelled)
-    assert checker.run(["/tools/python", "-V"], 1) == 124
+    assert checker.run(["/tools/python", "-V"], 1) == (124 if cleaned else 125)
     assert len(stopped) == 1 and stopped[0].endswith(".service")
     assert calls[0][2] == checker.SLICE
     assert all("stop" not in call for call in calls)
