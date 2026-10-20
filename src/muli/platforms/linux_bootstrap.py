@@ -158,6 +158,10 @@ async def open_boot_session(
             return await admit_managed_boot(session, service, current, probe=managed_probe)
         if managed_root is not None:
             raise BootstrapError("managed_record_required")
+        if current is None:
+            from muli.platforms.managed_deployment import require_unselected_without_record
+
+            require_unselected_without_record(journal.directory.path)
         published = _manifest(root)
         if published is not None:
             journal.limits = published.journal

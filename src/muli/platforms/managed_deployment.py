@@ -67,6 +67,7 @@ __all__ = [
     "SelectorValue",
     "SlotIdentity",
     "register_local_slot",
+    "require_unselected_without_record",
     "resolve_entry",
     "verify_current_slot",
     "verify_slot_files",
@@ -86,6 +87,18 @@ class ManagedDeploymentError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def require_unselected_without_record(root: Path) -> None:
+    """Missing state cannot turn a selected deployment into an ordinary one."""
+    try:
+        (root / SELECTOR_NAME).lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ManagedDeploymentError("managed_state_unavailable") from None
+    # The entry itself is evidence. Never open a FIFO or follow a dangling link.
+    raise ManagedDeploymentError("managed_state_missing")
 
 
 class _ManagedRecord(StrictRecord):
