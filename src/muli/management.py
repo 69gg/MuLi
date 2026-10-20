@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from muli.config import Settings
+from muli.extensions import ExtensionError
 from muli.plugins import PluginManager
 from muli.providers import Message
 from muli.runtime import Runtime
@@ -176,12 +177,22 @@ class SelfManagement:
                 await self.service.action("restart")
             item["status"] = "completed"
         except Exception as exc:
-            item.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
+            if (
+                item["action"] == "configure"
+                and isinstance(exc, ExtensionError)
+                and exc.code == "runtime_busy"
+            ):
+                item["status"] = "pending"
+                self._wake.set()
+            else:
+                item.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
         finally:
-            if item["status"] != "applying":
+            if item["status"] not in {"pending", "applying"}:
                 path.unlink(missing_ok=True)
             self.runtime.store.put("management", item)
-            await self.runtime.bus.emit("management.completed", item)
+            await self.runtime.bus.emit(
+                "management.queued" if item["status"] == "pending" else "management.completed", item
+            )
 
     async def close(self) -> None:
         tasks = [task for task in (self._worker, self._check) if task is not None]
@@ -203,6 +214,7 @@ class SelfManagement:
                 "plugins": self.plugins.inventory(),
                 "plugins_restart_required": self.plugins.restart_required,
                 "update": runtime.store.get("update", "latest"),
+                "extensions": runtime.extensions.status(),
             }
 
         async def restart(args: dict[str, Any]) -> Any:

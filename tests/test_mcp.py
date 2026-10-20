@@ -7,7 +7,14 @@ from typing import Any, Self, cast
 
 import pytest
 
-from muli.tools.mcp import MCPClient, MCPManager
+from muli.tools.mcp import (
+    MCPClient,
+    MCPLimits,
+    MCPManager,
+    MCPPrepareError,
+    ToolPage,
+    _FastMCPClient,
+)
 
 JsonObject = dict[str, Any]
 
@@ -317,3 +324,261 @@ async def test_real_fastmcp_in_process_client_lifecycle() -> None:
     assert not output["is_error"] and "真实本机协议" in json.dumps(output, ensure_ascii=False)
     await manager.close()
     assert not client.is_connected()
+
+
+class PagedClient(FakeClient):
+    def __init__(self, pages: list[tuple[list[str], str | None]]) -> None:
+        super().__init__()
+        self.pages = pages
+        self.cursors: list[str | None] = []
+
+    async def list_tools_page(self, cursor: str | None) -> ToolPage:
+        index = len(self.cursors)
+        self.cursors.append(cursor)
+        self.names, next_cursor = self.pages[index]
+        return ToolPage(await self.list_tools(), next_cursor)
+
+
+async def test_complete_paginated_catalog_and_zero_tool_server() -> None:
+    client = PagedClient([(["first"], "page-two"), (["last"], None)])
+    manager = MCPManager(settings(), client_factory=lambda server, timeout: client)
+    try:
+        assert len(await manager.start()) == 2
+        assert client.cursors == [None, "page-two"]
+        candidate = await manager.prepare(settings())
+        assert client.cursors == [None, "page-two"]
+        assert len(candidate.tools) == 2
+    finally:
+        await manager.close()
+    empty = MCPManager(settings(), client_factory=lambda server, timeout: FakeClient(names=[]))
+    try:
+        assert await empty.start() == []
+        assert empty.status()[0]["status"] == "connected"
+    finally:
+        await empty.close()
+
+
+@pytest.mark.parametrize(
+    "pages,limits,code",
+    [
+        ([(["one"], "same"), (["two"], "same")], MCPLimits(), "pagination_stalled"),
+        ([(["one"], "two")], MCPLimits(max_pages=1), "page_budget_exceeded"),
+        ([(["one", "two"], None)], MCPLimits(max_tools=1), "catalog_budget_exceeded"),
+        ([(["one"], None)], MCPLimits(max_catalog_bytes=1), "catalog_budget_exceeded"),
+        ([(["one"], "two"), (["one"], None)], MCPLimits(), "catalog_invalid"),
+    ],
+)
+async def test_incomplete_candidate_never_replaces_current_catalog(
+    pages: list[tuple[list[str], str | None]], limits: MCPLimits, code: str
+) -> None:
+    original = FakeClient()
+    replacement = PagedClient(pages)
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, timeout: (
+            original if server["url"].endswith("/mcp") else replacement
+        ),
+    )
+    try:
+        old_tools = await manager.start()
+        with pytest.raises(MCPPrepareError) as failed:
+            await manager.prepare(settings(url="https://example.test/new"), limits=limits)
+        assert failed.value.code == code
+        assert manager.tools == old_tools
+        assert original.closed == 0 and replacement.closed == 1
+        assert not (await old_tools[0].handler({"q": "still available"}))["is_error"]
+    finally:
+        await manager.close()
+
+
+async def test_failed_candidate_closes_only_new_connections_not_reused() -> None:
+    old = FakeClient()
+    new = FakeClient()
+    failed = FakeClient(failure=True)
+    clients = {"old": old, "new": new, "failed": failed}
+    base = {"mcpServers": {"old": {"enabled": True, "url": "https://example.test/old"}}}
+    manager = MCPManager(
+        base, client_factory=lambda server, timeout: clients[server["url"].rsplit("/", 1)[-1]]
+    )
+    try:
+        await manager.start()
+        candidate_config = {
+            "mcpServers": {
+                name: {"enabled": True, "url": f"https://example.test/{name}"} for name in clients
+            }
+        }
+        with pytest.raises(MCPPrepareError):
+            await manager.prepare(candidate_config)
+        assert old.entered == 1 and old.closed == 0
+        assert new.closed == failed.closed == 1
+        assert [item["name"] for item in manager.status()] == ["old"]
+    finally:
+        await manager.close()
+
+
+async def test_changed_stdio_requires_restart_without_closing_active_process() -> None:
+    client = FakeClient()
+    config = settings(command="python", args=["installed.py"])
+    config["mcpServers"]["test"].pop("url")
+    manager = MCPManager(config, client_factory=lambda server, timeout: client)
+    try:
+        await manager.start()
+        target = json.loads(json.dumps(config))
+        target["mcpServers"]["test"]["args"] = ["changed.py"]
+        with pytest.raises(MCPPrepareError, match="restart_required"):
+            await manager.prepare(target)
+        assert client.entered == 1 and client.closed == 0
+        assert not (await manager.tools[0].handler({"q": "old"}))["is_error"]
+    finally:
+        await manager.close()
+
+
+async def test_handlers_bind_the_validated_connection_until_retirement() -> None:
+    old, new = FakeClient(names=["old"]), FakeClient(names=["new"])
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, timeout: old if server["url"].endswith("/mcp") else new,
+    )
+    try:
+        old_tool = (await manager.start())[0]
+        candidate = await manager.prepare(settings(url="https://example.test/new"))
+        retired = manager.publish(candidate)
+        assert not (await old_tool.handler({"q": "old generation"}))["is_error"]
+        assert not (await manager.tools[0].handler({"q": "new generation"}))["is_error"]
+        assert old.calls[0]["name"] == "old" and new.calls[0]["name"] == "new"
+        await manager.retire(retired)
+        assert (await old_tool.handler({"q": "retired"}))["is_error"]
+        assert old.closed == 1 and new.closed == 0
+    finally:
+        await manager.close()
+
+
+async def test_retirement_failure_is_reported_after_new_catalog_is_published() -> None:
+    class FailingClose(FakeClient):
+        async def close(self) -> None:
+            await super().close()
+            raise RuntimeError("private-fixture-value")
+
+    old, new = FailingClose(), FakeClient(names=["new"])
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, timeout: old if server["url"].endswith("/mcp") else new,
+    )
+    try:
+        await manager.start()
+        candidate = await manager.prepare(settings(url="https://example.test/new"))
+        await manager.retire(manager.publish(candidate))
+        assert not (await manager.tools[0].handler({"q": "new"}))["is_error"]
+        assert manager.retirement_errors == [
+            {"name": "test", "error_code": "connection_close_failed", "stage": "retirement"}
+        ]
+        assert "private-fixture-value" not in json.dumps(manager.status())
+    finally:
+        await manager.close()
+
+
+async def test_repeated_caller_cancellation_does_not_cancel_owned_cleanup() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class GatedClose(FakeClient):
+        async def close(self) -> None:
+            entered.set()
+            await release.wait()
+            await super().close()
+
+    old, new = GatedClose(), FakeClient(names=["new"])
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, timeout: old if server["url"].endswith("/mcp") else new,
+    )
+    retiring: asyncio.Task[bool] | None = None
+    try:
+        await manager.start()
+        candidate = await manager.prepare(settings(url="https://example.test/new"))
+        retiring = asyncio.create_task(manager.retire(manager.publish(candidate)))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        retiring.cancel()
+        await asyncio.sleep(0)
+        retiring.cancel()
+        await asyncio.sleep(0)
+        assert not retiring.done() and len(manager._retiring) == 1
+        connection = next(iter(manager._retiring))
+        assert connection.cleanup_task is not None and not connection.cleanup_task.cancelled()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await retiring
+        assert old.closed == old.exited == 1
+        assert not manager._retiring
+        assert not (await manager.tools[0].handler({"q": "new"}))["is_error"]
+    finally:
+        release.set()
+        if retiring is not None:
+            await asyncio.gather(retiring, return_exceptions=True)
+        await manager.close()
+
+
+async def test_failed_retirement_stays_owned_and_shutdown_reclaims_it() -> None:
+    class FailOnce(FakeClient):
+        async def close(self) -> None:
+            await super().close()
+            if self.closed == 1:
+                raise RuntimeError("synthetic close failure")
+
+    old, new = FailOnce(), FakeClient(names=["new"])
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, timeout: old if server["url"].endswith("/mcp") else new,
+    )
+    try:
+        await manager.start()
+        candidate = await manager.prepare(settings(url="https://example.test/new"))
+        assert not await manager.retire(manager.publish(candidate))
+        assert len(manager._retiring) == 1 and old.closed == 1
+        with pytest.raises(MCPPrepareError, match="restart_required"):
+            await manager.prepare(manager.config)
+        assert not (await manager.tools[0].handler({"q": "new"}))["is_error"]
+        await manager.close()
+        assert old.closed == 2 and old.exited == 1 and new.closed == 1
+        assert not manager._retiring
+    finally:
+        await manager.close()
+
+
+async def test_locked_fastmcp_adapter_passes_sdk_cursor_without_single_page_helper() -> None:
+    pytest.importorskip("mcp")
+    params: list[Any] = []
+
+    class Session:
+        async def list_tools(self, **arguments: Any) -> Any:
+            params.append(arguments["params"])
+            return SimpleNamespace(tools=[], nextCursor=None)
+
+    adapter = _FastMCPClient(SimpleNamespace(session=Session()))
+    assert await adapter.list_tools_page("second-page") == ToolPage([])
+    assert params[0].cursor == "second-page"
+
+
+async def test_late_notifications_cannot_resurrect_retired_or_closed_connections() -> None:
+    old, new = FakeClient(), FakeClient()
+    notices: list[str] = []
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, timeout: old if server["url"].endswith("/mcp") else new,
+    )
+    manager.set_changed_callback(notices.append)
+    try:
+        await manager.start()
+        previous = manager._connections["test"]
+        manager._notify(previous)
+        candidate = await manager.prepare(settings(url="https://example.test/new"))
+        retired = manager.publish(candidate)
+        manager._notify(previous)
+        manager._notify(manager._connections["test"])
+        assert notices == ["test", "test"]
+        current = manager._connections["test"]
+        await manager.retire(retired)
+        await manager.close()
+        manager._notify(current)
+        assert notices == ["test", "test"]
+    finally:
+        await manager.close()

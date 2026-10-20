@@ -22,6 +22,7 @@ from muli.context import ContextLimitError, pack_context
 from muli.conversation import Conversation
 from muli.events import EventBus
 from muli.evidence import EvidenceError
+from muli.extensions import Extensions
 from muli.history_evidence import HistoryEvidence
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
@@ -78,6 +79,7 @@ class Runtime:
         self.reminders = Reminders(self.store, self.bus)
         self.conversation = Conversation(self.store)
         self.context_hooks: list[ContextHook] = []
+        self.skills_context: ContextHook | None = None
         self.message_hooks: list[MessageHook] = []
         self.memory_context_provider: Callable[[str], str] | None = None
         self._tool_providers: list[tuple[ToolProvider, bool, bool, bool]] = []
@@ -107,6 +109,7 @@ class Runtime:
         self._configure_workflows()
         self.team = TeamManager(self)
         self._configure_compaction()
+        self.extensions = Extensions(self)
 
     def _configure_compaction(self) -> None:
         self.compaction = Compactor(
@@ -227,6 +230,8 @@ class Runtime:
                 ),
                 *messages[1:],
             ]
+        if self.skills_context is not None:
+            messages = await self.skills_context(session_id, messages)
         return pack_context(messages, self.config.settings.limits.max_context_chars)
 
     async def _next_context(self, session_id: str) -> list[Message]:
@@ -585,10 +590,7 @@ class Runtime:
             await self.notifications.start()
 
     async def _start_mcp(self) -> None:
-        for tool in await self.mcp.start():
-            if tool.name in self.tools:
-                raise ValueError("MCP 工具名称冲突")
-            self.tools[tool.name] = tool
+        await self.extensions.load_initial()
 
     async def startup(self) -> None:
         if self.started:
@@ -599,6 +601,7 @@ class Runtime:
         self.started = True
         self._wake_main()
         self.team.start()
+        self.extensions.start()
         await self.flush_task_plan_deliveries()
         await self.team.flush_reports()
 
@@ -1857,6 +1860,7 @@ class Runtime:
         self._close_task.result()
 
     async def _close_resources(self) -> None:
+        await self.extensions.close()
         await self.compaction.close()
         await self.team.close()
         await self.reminders.close()
