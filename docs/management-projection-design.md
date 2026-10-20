@@ -10,6 +10,15 @@
 
 SQLite 连接必须处于 WAL 和 `synchronous=FULL` 或 `EXTRA`；本模块只查询，不静默改动既有 Store。宿主在任何事务之前明确设置并核验 FULL，所有参与恢复的写入者都必须遵守。已有外层 `db.in_transaction` 明确拒绝；`autocommit=True` 或 `isolation_level=None` 等使现有 `Store.event` 不能合并多次写入的模式也明确 unsupported，不会替调用方提交。`read_projection(store)` 使用相同只读连接与身份检查，不把未提交或缺少持久保证的值当作覆盖旧 journal 的证据。
 
+`read_projection_connection(db)` 复用完全相同的固定对象、有限 JSON 读取和
+Store/main、实际 main 路径及持久策略核验，供启动准入使用其宿主已独占的专用连接。
+它不打开或关闭连接、不创建 Store 或主会话、不提交或回滚调用方事务；存在外层事务
+同样固定拒绝。连接和真实文件/lease 的绑定仍由宿主负责，不能用这个读接口自报权限。
+V2 启动只有在同连接观察到该 resolved 记录的精确回执后，才允许采用事务完成后的
+当前配置；没有放宽未决绑定或 selector/unit/安装/格式合同。
+同连接接口尾片与 boot/运行绑定相关模块 138 项受限回归通过，峰值 121.1 MiB、
+swap 0；其中投影单模块为 42 项。四份 Python Ruff/格式、两处源码严格 mypy 通过。
+
 读取 resolved record 后同步 journal 父目录并重读，只有记录完全相同才开始投影。不能把 rename 后尚未确认落盘的 released 当成已完成；同步失败或 revision 变化不写 DB。committed 且 released／released_degraded 映射 completed；rolled_back 且已放行映射 failed，`result.restored_previous=true` 明确表示已恢复旧配置；aborted／cancelled 映射 cancelled，其他 aborted 映射 failed。blocked、recovery_required 或尚未放行不会发送 completed。
 
 原管理计划在 prepare 时保存 `transaction.generation`。只接受同 request ID、同 action、同 generation 的计划；按主键和 journal 字节预算读取计划，不扫描管理历史。保留计划原有 `routing`，不从当前会话、默认地址或记忆重建来源。原工具消息和 unknown 收据不修改。最终计划保留原 metadata，更新状态、固定结果字段、完成时间和 `transaction` 的公共终态；`management.completed.data` 必须与这个最终计划完全一致，供现有 Attention canonical 逻辑验证。

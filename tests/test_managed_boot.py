@@ -30,6 +30,7 @@ from muli.managed_transaction import (
 from muli.management_transaction import (
     ClockReading,
     Deadline,
+    ProjectionReceipt,
     Role,
     TransactionError,
     TransactionJournal,
@@ -433,6 +434,137 @@ def test_resolved_records_admit_only_the_terminal_role(
     assert permit.role == role and not permit.probation
     with closing(permit.open_store()) as store:
         assert store.db.total_changes == 0
+
+
+def _receipt(host: Host, record: TransactionRecordV2, **changes: object) -> None:
+    value = {
+        "id": "transaction-v1",
+        **ProjectionReceipt(
+            **record.position.model_dump(), store_instance=record.identity.store_instance
+        ).model_dump(),
+        **changes,
+    }
+    host.mutate(
+        "INSERT OR REPLACE INTO objects(kind,id,data,updated) VALUES(?,?,?,?)",
+        ("management_projection", "transaction-v1", json.dumps(value), 1.0),
+    )
+
+
+@pytest.mark.parametrize(
+    "phase,activation,legacy",
+    [
+        ("committed", "released", False),
+        ("rolled_back", "released_degraded", False),
+        ("aborted", "pending", False),
+        ("aborted", "pending", True),
+    ],
+)
+def test_projected_terminal_boot_uses_current_config_without_mutating_history(
+    host: Host, phase: str, activation: str, legacy: bool
+) -> None:
+    record = host.record(phase, "none", activation=activation, legacy=legacy)
+    _receipt(host, record)
+    current = b'{"server":{"port":8767}}'
+    Path(host.anchor.config_path).write_bytes(current)
+    before = _snapshot(host.journal.database)
+    permit = host.acquire(boot=_ORIGIN)
+    assert not permit.probation and permit.config.settings.server.port == 8767
+    with closing(permit.open_store()) as store:
+        assert store.db.total_changes == 0
+        assert permit.config.settings.server.port == 8767
+    assert _snapshot(host.journal.database) == before
+    assert host.journal.read_current() == record
+    assert record.binding(permit.role).configuration == json_snapshot(
+        _CONFIG, host.journal.limits.max_snapshot_bytes
+    )
+
+
+@pytest.mark.parametrize(
+    "change", ["missing", "generation", "revision", "store_instance", "extra", "json", "oversize"]
+)
+def test_config_drift_requires_the_same_connections_exact_terminal_receipt(
+    host: Host, change: str
+) -> None:
+    record = host.record("committed", "none", activation="released")
+    if change != "missing":
+        values: dict[str, object] = {
+            "generation": "b" * 32,
+            "revision": record.revision + 1,
+            "store_instance": "different-instance",
+            "extra": "not part of the receipt",
+        }
+        _receipt(host, record, **({change: values[change]} if change in values else {}))
+        if change in {"json", "oversize"}:
+            host.mutate(
+                "UPDATE objects SET data=? WHERE kind='management_projection' AND id='transaction-v1'",
+                ("not JSON" if change == "json" else " " * 4097,),
+            )
+    Path(host.anchor.config_path).write_bytes(b'{"server":{"port":8767}}')
+    before = _snapshot(host.journal.database)
+    with pytest.raises(ManagedBootError):
+        host.acquire()
+    assert _snapshot(host.journal.database) == before
+    with host.journal.writer_lease():
+        pass
+
+
+@pytest.mark.parametrize("phase", ["verifying", "committed"])
+def test_even_a_matching_receipt_does_not_relax_unresolved_configuration(
+    host: Host, phase: str
+) -> None:
+    record = host.record(phase, "none", activation="pending")
+    _receipt(host, record)
+    Path(host.anchor.config_path).write_bytes(b'{"server":{"port":8767}}')
+    with pytest.raises(ManagedBootError, match="managed_files_changed"):
+        host.acquire()
+
+
+def test_config_must_stay_exact_between_acquire_and_store_handoff(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = host.record("committed", "none", activation="released")
+    _receipt(host, record)
+    first = b'{"server":{"port":8767}}'
+    Path(host.anchor.config_path).write_bytes(first)
+    permit = host.acquire()
+    config = permit.config
+    Path(host.anchor.config_path).write_bytes(b'{"server":{"port":8768}}')
+
+    def forbidden(*args: Any, **kwargs: Any) -> Store:
+        raise AssertionError("changed startup config must fail before opening a business Store")
+
+    monkeypatch.setattr(managed_boot.Store, "open_existing", forbidden)
+    with pytest.raises(ManagedBootError, match="managed_configuration_changed"):
+        permit.open_store()
+    assert permit.config is config and config.settings.server.port == 8767
+
+
+def test_receipt_is_rechecked_on_the_returned_store_connection(host: Host) -> None:
+    record = host.record("committed", "none", activation="released")
+    _receipt(host, record)
+    Path(host.anchor.config_path).write_bytes(b'{"server":{"port":8767}}')
+    permit = host.acquire()
+    host.mutate("DELETE FROM objects WHERE kind='management_projection' AND id='transaction-v1'")
+    with pytest.raises(ManagedBootError, match="managed_configuration_unprojected"):
+        permit.open_store()
+
+
+def test_projected_config_cannot_change_during_the_admission_snapshot(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = host.record("committed", "none", activation="released")
+    _receipt(host, record)
+    Path(host.anchor.config_path).write_bytes(b'{"server":{"port":8767}}')
+    original = managed_boot.read_format_evidence
+
+    def changed(db: sqlite3.Connection) -> managed_boot.FormatEvidence:
+        evidence = original(db)
+        Path(host.anchor.config_path).write_bytes(b'{"server":{"port":8768}}')
+        return evidence
+
+    monkeypatch.setattr(managed_boot, "read_format_evidence", changed)
+    with pytest.raises(ManagedBootError, match="managed_record_changed"):
+        host.acquire()
 
 
 def test_rollback_does_not_require_the_failed_target_package(host: Host) -> None:

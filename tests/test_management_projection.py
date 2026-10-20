@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from muli.maintenance import BootPermit
-from muli.management_projection import ProjectionError, project_final, read_projection
+from muli.management_projection import (
+    ProjectionError,
+    project_final,
+    read_projection,
+    read_projection_connection,
+)
 from muli.management_transaction import (
     ClockReading,
     Deadline,
@@ -364,6 +369,8 @@ def test_outer_transaction_is_neither_committed_nor_rolled_back(host: Host) -> N
         project_final(host.permit, host.store)
     with pytest.raises(ProjectionError, match="projection_outer_transaction"):
         read_projection(host.store)
+    with pytest.raises(ProjectionError, match="projection_outer_transaction"):
+        read_projection_connection(host.store.db)
     assert host.store.db.in_transaction
     assert (
         host.store.db.execute(
@@ -379,6 +386,20 @@ def test_outer_transaction_is_neither_committed_nor_rolled_back(host: Host) -> N
         is None
     )
     assert read_projection(host.store) is None
+
+
+def test_connection_reader_reuses_the_fixed_receipt_without_owning_the_connection(
+    host: Host,
+) -> None:
+    host.resolve("committed")
+    receipt = project_final(host.permit, host.store)
+    assert receipt is not None
+    before = host.store.db.total_changes
+    assert read_projection_connection(host.store.db) == receipt
+    assert host.store.db.total_changes == before
+    assert not host.store.db.in_transaction
+    host.store.put("private_fixture", {"id": "still-open"})
+    assert host.store.get("private_fixture", "still-open") == {"id": "still-open"}
 
 
 @pytest.mark.parametrize("stage", ["receipt", "event", "commit"])
