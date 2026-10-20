@@ -76,6 +76,6 @@ macOS/Windows 的 `muli.platforms.service_runner.BoundedLog` 已接管本服务 
 
 查询接口先用 Context7 核对 Python sqlite3 参数绑定、Row 与 SQLite [CROSS JOIN 顺序](https://www.sqlite.org/optoverview.html#manual_control_of_query_plans_using_cross_join)、[INDEXED BY 合同](https://www.sqlite.org/lang_indexedby.html)。显式索引是开发完成后的计划约束：索引若被移除须报错，不静默扫描全部对象。
 
-原生日志下一片另测长单条、轮转断行、密钥前后变化、实例隔离、写入失败不递归、满队列/停止和迟到写入。真实 systemd/launchd/Task Scheduler 与真实第三方日志是否捕获须另记实测边界。所有本地检查只通过 scripts/check_local.py 串行执行；本稿未运行检查。
+原生日志下一片另测长单条、轮转断行、密钥前后变化、实例隔离、写入失败不递归、满队列/停止和迟到写入。真实 systemd/launchd/Task Scheduler 与真实第三方日志是否捕获须另记实测边界。所有本地检查只通过 scripts/check_local.py 串行执行；原生日志留存增强尚未实现或验收。
 
 接口依据已先用 Context7 核实，再查官方细节：[QueueHandler.prepare](https://docs.python.org/3.13/library/logging.handlers.html#logging.handlers.QueueHandler.prepare) 会在入队前格式化 msg/args/异常，不能直接替换本模块“不格式化任意 LogRecord”的合同；[QueueListener.enqueue_sentinel](https://docs.python.org/3.13/library/logging.handlers.html#logging.handlers.QueueListener.enqueue_sentinel) 默认用 put_nowait，满队列停止须另处理；[标准 logging 的多进程文件边界](https://docs.python.org/3.13/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes) 不能由线程锁代替。接口核实不等于该方案已经实现或验证。
