@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from test_evidence_runtime_review import wire_output
 from test_management import setup_runtime
+from test_runtime import FakeClient
 
 from muli.config import Settings
+from muli.context import EXCERPT_MARKER, ContextLimitError
 from muli.management import SelfManagement
+from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
+from muli.providers.codecs import build_request
+from muli.providers.types import ProtocolName
 from muli.service import UserService
 from muli.store import Store, new_id
 from muli.system_event_query import read_system_events
@@ -268,6 +275,104 @@ async def test_tool_reads_disabled_collector_history_after_reconfigure(tmp_path:
         await runtime.reconfigure()
         assert (await runtime.tools["self_events"].handler({}))["items"][0]["id"] == expected["id"]
         assert runtime.store.list("management") == []
+    finally:
+        await manager.close()
+        await runtime.close()
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+@pytest.mark.parametrize("fits", [True, False], ids=["fits", "too_large"])
+async def test_real_query_page_survives_context_pressure(
+    tmp_path: Path, protocol: ProtocolName, fits: bool
+) -> None:
+    runtime, plugins = setup_runtime(tmp_path)
+    runtime.config.update(
+        {
+            "persona": {"prompt": "test"},
+            "models": {
+                "main": {
+                    "protocol": protocol,
+                    "model": "offline-test",
+                    "base_url": "https://unused.invalid/v1",
+                }
+            },
+            "limits": {"max_context_chars": 4000},
+            "compaction": {"enabled": False},
+        }
+    )
+    await runtime.reconfigure()
+
+    async def no_apply(settings: Settings) -> None:
+        raise AssertionError("query must not apply settings")
+
+    manager = SelfManagement(
+        runtime, plugins, UserService(runtime.config.path, runtime.data_dir), no_apply
+    )
+    seen: list[list[Message]] = []
+    query_args = {"limit": 2 if fits else 20}
+    for _ in range(20):
+        record(runtime.store)
+    expected = query(runtime.store, **query_args)
+    session_id = runtime.new_session(mode="yolo")["id"]
+    # This completed turn is removable; the new tool page must not be excerpted
+    # before the packer drops it from the live request.
+    runtime.store.add_message(session_id, "user", "旧上下文" * 1400)
+    runtime.store.add_message(session_id, "assistant", "旧轮次已经结束")
+
+    class Reader(FakeClient):
+        def __init__(self, config: ModelConfig) -> None:
+            super().__init__([], seen)
+            self.config = config
+
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            seen.append(messages)
+            specification = next(
+                tool for tool in tools if tool["function"]["name"] == "self_events"
+            )
+            assert "preserve_output" not in json.dumps(specification)
+            assert "preserve_content" not in json.dumps(specification)
+            result = next(
+                (message for message in messages if message.tool_call_id == "events"), None
+            )
+            if result is None:
+                yield StreamEvent(
+                    "done",
+                    turn=ModelTurn(
+                        tool_calls=[ToolCall("events", "self_events", json.dumps(query_args))]
+                    ),
+                )
+                return
+            page = json.loads(result.content)
+            assert page == expected and page["has_more"]
+            assert result.preserve_content is True and EXCERPT_MARKER not in result.content
+            body = build_request(self.config, messages, tools, stream=False)
+            assert wire_output(protocol, body, "events") == result.content
+            assert "preserve_output" not in json.dumps(body)
+            assert "preserve_content" not in json.dumps(body)
+            yield StreamEvent("done", turn=ModelTurn(content="已核对完整系统事件页"))
+
+    runtime.client_factory = lambda config: Reader(config)  # type: ignore[assignment,return-value]
+    try:
+        started = await runtime.start(session_id, "回查系统事件", mode="yolo")
+        if fits:
+            assert (
+                await asyncio.wait_for(runtime.wait(started["run_id"]), 5) == "已核对完整系统事件页"
+            )
+            assert len(seen) == 2
+        else:
+            with pytest.raises(ContextLimitError, match="需完整保留的工具结果"):
+                await asyncio.wait_for(runtime.wait(started["run_id"]), 5)
+            assert len(seen) == 1
+        stored = next(
+            item
+            for item in runtime.store.messages(session_id)
+            if item.get("tool_call_id") == "events"
+        )
+        assert json.loads(stored["content"]) == expected
+        assert stored["preserve_content"] is True
+        assert stored["content_provenance"] == "accepted"
     finally:
         await manager.close()
         await runtime.close()

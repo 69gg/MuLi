@@ -267,6 +267,7 @@ class SelfManagement:
                 "分页回查保留的系统错误元数据；空页不代表从未出错，不包含日志正文或新通知授权",
                 parameters(query_parameters()),
                 events,
+                preserve_output=True,
             ),
             Tool(
                 "self_logs",
