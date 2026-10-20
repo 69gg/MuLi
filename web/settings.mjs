@@ -30,21 +30,40 @@ export function setPath(object, path, value) {
 }
 
 /** Only edited fields are PATCHed; redacted flags and empty secrets never leak back. */
-export function settingsPatch(original, draft) {
+export function settingsPatch(original, draft, path = "") {
   const patch = {};
   for (const [key, value] of Object.entries(draft ?? {})) {
     if (REDACTED_FIELDS.has(key)) continue;
     if (key === "mcp" && value && typeof value === "object" && "configured" in value) continue;
     if (SECRET_FIELDS.has(key) && !value) continue;
     if (key.startsWith("clear_") && SECRET_FIELDS.has(key.slice(6)) && !value) continue;
-    if (ATOMIC_OBJECTS.has(key)) {
+    const fieldPath = path ? `${path}.${key}` : key;
+    if (ATOMIC_OBJECTS.has(key) || fieldPath === "channels.proactive.default_destination") {
       if (JSON.stringify(value) !== JSON.stringify(original?.[key] ?? {})) patch[key] = value;
     } else if (value && typeof value === "object" && !Array.isArray(value)) {
-      const nested = settingsPatch(original?.[key] ?? {}, value);
+      const nested = settingsPatch(original?.[key] ?? {}, value, fieldPath);
       if (Object.keys(nested).length) patch[key] = nested;
     } else if (JSON.stringify(value) !== JSON.stringify(original?.[key])) {
       patch[key] = value;
     }
   }
+  if (path === "channels.proactive" && patch.default_destination?.kind === "channel" && draft.external_enabled === false) {
+    // A complete external address enables on the backend unless pause is explicit.
+    patch.external_enabled = false;
+  }
   return patch;
+}
+
+/** Choosing an external default is one action; recipients always remain explicit. */
+export function selectProactiveDestination(draft, name, accountId = "") {
+  const proactive = draft.channels?.proactive ?? { external_enabled: false, default_destination: { kind: "web" } };
+  if (name === "web") proactive.default_destination = { kind: "web" };
+  else {
+    if (!["onebot", "telegram", "qq", "weixin"].includes(name)) throw new Error("未知通知渠道。");
+    if (proactive.default_destination?.kind !== "channel" || proactive.default_destination.route?.name !== name) {
+      proactive.default_destination = { kind: "channel", route: { name, account_id: accountId, kind: "private", target: "", sender_id: "" } };
+    }
+    proactive.external_enabled = true;
+  }
+  setPath(draft, "channels.proactive", proactive);
 }

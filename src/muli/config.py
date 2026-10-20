@@ -9,11 +9,12 @@ import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from muli.reply_origin import authorize_route, channel_account
 from muli.system_events import SystemEventsSettings
 
 
@@ -376,6 +377,40 @@ class ChannelProfile(Section):
         return os.environ.get(env, "") if env else str(getattr(self, name))
 
 
+RouteText = Annotated[str, Field(min_length=1, max_length=200, strict=True)]
+
+
+class ProactiveRoute(Section):
+    name: Literal["onebot", "telegram", "qq", "weixin"]
+    account_id: RouteText
+    kind: Literal["private", "group"]
+    target: RouteText
+    sender_id: RouteText
+
+    @field_validator("account_id", "target", "sender_id")
+    @classmethod
+    def finite_identifier(cls, value: str) -> str:
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("渠道目标不能包含控制字符")
+        return value
+
+
+class WebDestination(Section):
+    kind: Literal["web"] = "web"
+
+
+class ChannelDestination(Section):
+    kind: Literal["channel"]
+    route: ProactiveRoute
+
+
+class ProactiveSettings(Section):
+    external_enabled: bool = Field(default=False, strict=True)
+    default_destination: WebDestination | ChannelDestination = Field(
+        default_factory=WebDestination, discriminator="kind"
+    )
+
+
 class ChannelSettings(Section):
     onebot: ChannelProfile = Field(default_factory=ChannelProfile)
     telegram: ChannelProfile = Field(
@@ -396,6 +431,21 @@ class ChannelSettings(Section):
     max_pending_deliveries: int = Field(default=64, ge=1)
     max_attempts: int = Field(default=3, ge=1)
     retry_backoff_seconds: float = Field(default=5, ge=0)
+    proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
+
+    def validate_proactive_destination(self) -> None:
+        destination = self.proactive.default_destination
+        if isinstance(destination, ChannelDestination):
+            route = destination.route
+            profile: ChannelProfile = getattr(self, route.name)
+            authorize_route(
+                route.name,
+                route.model_dump(),
+                account_id=channel_account(route.name, profile),
+                owner_ids=profile.owner_ids,
+                allowed_groups=profile.allowed_groups,
+                outbound=True,
+            )
 
 
 class Computer(Section):
@@ -582,6 +632,17 @@ class ConfigFile:
 
     def validate_changes(self, changes: dict[str, Any]) -> Settings:
         changes = copy.deepcopy(changes)
+        channels = changes.get("channels")
+        proactive = channels.get("proactive") if isinstance(channels, dict) else None
+        destination = proactive.get("default_destination") if isinstance(proactive, dict) else None
+        if (
+            isinstance(proactive, dict)
+            and isinstance(destination, dict)
+            and destination.get("kind") == "channel"
+        ):
+            # Choosing a complete external destination enables it in one action.
+            # An explicit pause in that same patch remains intentional.
+            proactive.setdefault("external_enabled", True)
         server = changes.get("server")
         if isinstance(server, dict):
             from muli.auth import hash_password
@@ -596,7 +657,20 @@ class ConfigFile:
             server.pop("password_set", None)
         data = self.settings.model_dump()
         self._merge(data, changes)
-        return Settings.model_validate(data)
+        target = Settings.model_validate(data)
+        channel_changes = changes.get("channels")
+        proactive = channel_changes.get("proactive") if isinstance(channel_changes, dict) else None
+        if isinstance(proactive, dict) and (
+            "default_destination" in proactive
+            or (
+                proactive.get("external_enabled") is True
+                and not self.settings.channels.proactive.external_enabled
+            )
+        ):
+            # Revoking a binding must remain possible. Validate a newly chosen
+            # destination, not every saved historical destination on every load.
+            target.channels.validate_proactive_destination()
+        return target
 
     def update(self, changes: dict[str, Any]) -> Settings:
         settings = self.validate_changes(changes)
@@ -619,7 +693,9 @@ class ConfigFile:
         return settings
 
     @classmethod
-    def _merge(cls, target: dict[str, Any], changes: dict[str, Any]) -> None:
+    def _merge(
+        cls, target: dict[str, Any], changes: dict[str, Any], path: tuple[str, ...] = ()
+    ) -> None:
         clear_key = changes.pop("clear_api_key", False)
         if clear_key:
             target["api_key"] = ""
@@ -641,7 +717,9 @@ class ConfigFile:
             ):
                 continue
             if isinstance(value, dict) and isinstance(target.get(key), dict):
-                if key == "mcp":
+                if (*path, key) == ("channels", "proactive", "default_destination"):
+                    target[key] = value
+                elif key == "mcp":
                     target[key] = _replace_mcp(target[key], value)
                 elif key == "extra_headers":
                     target[key] = {
@@ -650,6 +728,6 @@ class ConfigFile:
                 elif key in {"extra_body", "reasoning", "thinking"}:
                     target[key] = value
                 else:
-                    cls._merge(target[key], value)
+                    cls._merge(target[key], value, (*path, key))
             else:
                 target[key] = value

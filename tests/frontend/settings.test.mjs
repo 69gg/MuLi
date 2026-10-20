@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { settingsPatch, setPath, getPath, settingsExtras, mergeSettingsExtras, MODEL_ROLES, SETTINGS_GROUPS } from "../../web/settings.mjs";
+import { settingsPatch, setPath, getPath, settingsExtras, mergeSettingsExtras, selectProactiveDestination, MODEL_ROLES, SETTINGS_GROUPS } from "../../web/settings.mjs";
 
 test("untouched redacted credentials and empty secret controls never enter PATCH", () => {
   const original = { models: { main: { model: "model-one", api_key_set: true, extra_headers: { Authorization: "***" } } }, chiliarch: { credential_set: true } };
@@ -87,4 +87,47 @@ test("memory extraction has an independent model draft and visible management gr
 test("channel-like names inside atomic MCP environment configuration remain exact", () => {
   const mcp = { mcpServers: { example: { enabled: false, env: { token_set: "••••", token: "", CLIENT_SECRET: "••••" } } } };
   assert.deepEqual(settingsPatch({ mcp: {} }, { mcp }), { mcp });
+});
+
+test("external default is a complete destination patch and enables in one selection", () => {
+  const original = { channels: { proactive: { external_enabled: false, default_destination: { kind: "web" } }, onebot: { owner_ids: ["7"] } } };
+  const draft = structuredClone(original);
+  selectProactiveDestination(draft, "onebot", "bot");
+  assert.equal(draft.channels.proactive.external_enabled, true);
+  assert.equal(draft.channels.proactive.default_destination.route.target, "");
+  assert.equal(draft.channels.proactive.default_destination.route.sender_id, "");
+  draft.channels.proactive.default_destination.route.target = "7";
+  draft.channels.proactive.default_destination.route.sender_id = "7";
+  assert.deepEqual(settingsPatch(original, draft), { channels: { proactive: { external_enabled: true, default_destination: { kind: "channel", route: { name: "onebot", account_id: "bot", kind: "private", target: "7", sender_id: "7" } } } } });
+  assert.equal(original.channels.proactive.external_enabled, false);
+});
+
+test("switching default to WebUI preserves earlier-send authority and removes the full route", () => {
+  const original = { channels: { proactive: { external_enabled: true, default_destination: { kind: "channel", route: { name: "onebot", account_id: "bot", kind: "private", target: "7", sender_id: "7" } } } } };
+  const draft = structuredClone(original);
+  selectProactiveDestination(draft, "web");
+  assert.equal(draft.channels.proactive.external_enabled, true);
+  assert.deepEqual(settingsPatch(original, draft), { channels: { proactive: { default_destination: { kind: "web" } } } });
+  const same = structuredClone(original);
+  same.channels.proactive.external_enabled = false;
+  selectProactiveDestination(same, "onebot", "replacement-ignored");
+  assert.equal(same.channels.proactive.external_enabled, true);
+  assert.deepEqual(same.channels.proactive.default_destination, original.channels.proactive.default_destination);
+});
+
+test("changing external default replaces every binding field without guessing recipient", () => {
+  const draft = { channels: { proactive: { external_enabled: false, default_destination: { kind: "channel", route: { name: "onebot", account_id: "old", target: "7", sender_id: "7", kind: "group" } } } } };
+  selectProactiveDestination(draft, "telegram", "123");
+  assert.deepEqual(draft.channels.proactive.default_destination, { kind: "channel", route: { name: "telegram", account_id: "123", kind: "private", target: "", sender_id: "" } });
+  assert.throws(() => selectProactiveDestination(draft, "unknown"), /未知/);
+});
+
+test("editing an external destination while paused sends false even when unchanged", () => {
+  const original = { channels: { proactive: { external_enabled: false, default_destination: { kind: "channel", route: { name: "onebot", account_id: "bot", kind: "private", target: "7", sender_id: "7" } } } } };
+  const draft = structuredClone(original);
+  Object.assign(draft.channels.proactive.default_destination.route, { target: "8", sender_id: "8" });
+  const patch = settingsPatch(original, draft);
+  assert.equal(patch.channels.proactive.external_enabled, false);
+  assert.deepEqual(patch.channels.proactive.default_destination, draft.channels.proactive.default_destination);
+  assert.deepEqual(settingsPatch(original, structuredClone(original)), {});
 });

@@ -15,8 +15,10 @@ import httpx
 from muli import __version__
 from muli.config import ConfigFile
 from muli.events import EventBus
+from muli.proactive import FrozenRouting
 from muli.process import run_process
 from muli.providers.http import read_response
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, now
 
 
@@ -45,7 +47,15 @@ class Updates:
     def __init__(self, config: ConfigFile, store: Store, bus: EventBus) -> None:
         self.config, self.store, self.bus = config, store, bus
 
-    async def check(self, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+    async def check(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        independent: bool = False,
+        reply_origin: ReplyOrigin | None = None,
+    ) -> dict[str, Any]:
+        if independent and reply_origin is not None:
+            raise ValueError("更新检查不能同时绑定请求与独立来源")
         settings = self.config.settings.updates
         owned = client is None
         client = client or httpx.AsyncClient(
@@ -77,7 +87,6 @@ class Updates:
         finally:
             if owned:
                 await client.aclose()
-        self.store.put("update", item)
         if item["available"]:
             identifier = "update-" + item["latest"]
             if self.store.get("notification", identifier) is None:
@@ -88,9 +97,21 @@ class Updates:
                     "source": "update",
                     "read": False,
                     "created_at": now(),
+                    "producer": "startup_update_check" if independent else "update_check",
+                    "routing": (
+                        FrozenRouting.independent(self.config.settings)
+                        if independent
+                        else FrozenRouting.bound(reply_origin or ReplyOrigin())
+                    ).dump(),
                 }
-                self.store.put("notification", notice)
-                await self.bus.emit("notification.created", notice)
+                self.store.event(
+                    "notification.created",
+                    notice,
+                    objects=[("update", item), ("notification", notice)],
+                )
+                await self.bus.notify()
+                return item
+        self.store.put("update", item)
         return item
 
     async def apply(self, version: str) -> dict[str, Any]:

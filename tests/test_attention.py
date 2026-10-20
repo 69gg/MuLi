@@ -12,6 +12,7 @@ from test_runtime import FakeClient, make_runtime
 
 from muli.attention import AttentionInbox
 from muli.config import AttentionSettings, ConfigFile, Settings
+from muli.proactive import FrozenRouting
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.runtime import Runtime
 from muli.store import now
@@ -485,9 +486,12 @@ async def test_owner_admitted_while_attention_waits_for_config_lock_defers_atomi
         *,
         objects: list[tuple[str, dict[str, Any]]],
         admission_guard: Callable[[], None] | None = None,
+        routing: FrozenRouting | None = None,
     ) -> dict[str, Any] | None:
         attention_waiting.set()
-        result = await original(content, event_id, objects=objects, admission_guard=admission_guard)
+        result = await original(
+            content, event_id, objects=objects, admission_guard=admission_guard, routing=routing
+        )
         results.append(result)
         return result
 

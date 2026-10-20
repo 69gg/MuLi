@@ -28,6 +28,7 @@ from muli.history_evidence import HistoryEvidence
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
+from muli.proactive import FrozenRouting
 from muli.process import run_process
 from muli.providers import (
     ImageInput,
@@ -70,6 +71,7 @@ class PreparedRequest:
     execution_scope: TaskSnapshot | None = None
     selected_replan: TaskSnapshot | None = None
     reply_origin: ReplyOrigin = ReplyOrigin()
+    attention_routing: FrozenRouting | None = None
 
 
 class Runtime:
@@ -158,6 +160,11 @@ class Runtime:
     def request_context(self, session_id: str) -> PreparedRequest | None:
         request = self._request_context.get()
         return request if request is not None and request.session_id == session_id else None
+
+    def current_reply_origin(self) -> ReplyOrigin:
+        session_id = self.tool_session_id
+        request = self.request_context(session_id) if session_id is not None else None
+        return request.reply_origin if request is not None else ReplyOrigin()
 
     def _computer_dispatch_guard(self) -> Callable[[], None]:
         owner = self._tool_execution.get()
@@ -261,7 +268,12 @@ class Runtime:
                 except ControlConflict:
                     self._selected_replans.pop(session_id, None)
         prepared = PreparedRequest(
-            session_id, [], execution, selected, self._reply_origin(session_id)
+            session_id,
+            [],
+            execution,
+            selected,
+            self._reply_origin(session_id),
+            self._attention_routing(session_id),
         )
         token = self._request_context.set(prepared)
         try:
@@ -508,6 +520,7 @@ class Runtime:
         *,
         objects: list[tuple[str, dict[str, Any]]],
         admission_guard: Callable[[], None] | None = None,
+        routing: FrozenRouting | None = None,
     ) -> dict[str, Any] | None:
         """Admit idle-only facts atomically; execution and report handoff defer admission."""
         async with self.configuration_lock:
@@ -528,6 +541,7 @@ class Runtime:
                 internal=True,
                 max_pending=self.config.settings.limits.max_pending_runs,
                 objects=objects,
+                attention_routing=routing,
             )
             self._wake_main()
         if inserted:
@@ -1295,6 +1309,17 @@ class Runtime:
         ).fetchone()
         return ReplyOrigin.from_input(json.loads(row[0])) if row is not None else ReplyOrigin()
 
+    def _attention_routing(self, session_id: str) -> FrozenRouting | None:
+        row = self.store.db.execute(
+            "SELECT json_extract(o.data,'$.principal'),json_extract(o.data,'$.attention_routing') "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None or row[0] != "system:attention" or row[1] is None:
+            return None
+        return FrozenRouting.load(json.loads(row[1]))
+
     async def _execute(
         self, session_id: str, run_id: str, role: str, mode: Mode, workflow_step: bool
     ) -> str:
@@ -1362,15 +1387,14 @@ class Runtime:
                                 turn = event.turn
                 except BaseException:
                     if partial:
-                        message = self.store.add_message(
+                        self.store.complete_message(
                             session_id,
-                            "assistant",
                             partial,
                             interrupted=True,
                             delivery_routes=delivery_routes,
                             reply_origin=prepared.reply_origin.dump(),
                         )
-                        await self.bus.emit("message.completed", {"message": message}, session_id)
+                        await self.bus.notify()
                     raise
                 if turn is None:
                     raise ValueError("模型响应未完整结束")
@@ -1385,9 +1409,10 @@ class Runtime:
                     # part of it; truncating native calls would break signed replay.
                     raise ValueError(f"模型工具调用批次超过剩余预算（{remaining}）；该批次未执行")
                 messages.append(turn.to_message())
-                message = self.store.add_message(
+                if prepared.attention_routing is not None and turn.tool_calls:
+                    delivery_routes = []
+                self.store.complete_message(
                     session_id,
-                    "assistant",
                     turn.content,
                     tool_calls=[asdict(call) for call in turn.tool_calls],
                     reasoning=turn.reasoning,
@@ -1395,8 +1420,13 @@ class Runtime:
                     usage=asdict(turn.usage),
                     delivery_routes=delivery_routes,
                     reply_origin=prepared.reply_origin.dump(),
+                    **(
+                        {"attention_routing": prepared.attention_routing.dump()}
+                        if prepared.attention_routing is not None
+                        else {}
+                    ),
                 )
-                await self.bus.emit("message.completed", {"message": message}, session_id)
+                await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
                     claimed = (
@@ -1643,7 +1673,7 @@ class Runtime:
             return {"iso": timestamp.isoformat(), "unix": timestamp.timestamp()}
 
         async def schedule(args: dict[str, Any]) -> Any:
-            item = self.reminders.create(**args)
+            item = self.reminders.create(**args, reply_origin=self.current_reply_origin())
             await self.bus.emit("reminder.updated", item)
             return item
 

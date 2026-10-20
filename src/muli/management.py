@@ -12,6 +12,7 @@ from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
 from muli.extensions import ExtensionError
 from muli.plugins import PluginManager
+from muli.proactive import FrozenRouting
 from muli.providers import Message
 from muli.runtime import Runtime
 from muli.service import UserService
@@ -93,10 +94,15 @@ class SelfManagement:
             "target": fingerprint(target),
             "version": version,
             "changed_sections": sorted(changes or {}),
+            "routing": FrozenRouting.bound(self.runtime.current_reply_origin()).dump(),
         }
-        self.runtime.store.put("management", item)
+        try:
+            self.runtime.store.event("management.queued", item, objects=[("management", item)])
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
         self._wake.set()
-        await self.runtime.bus.emit("management.queued", item)
+        await self.runtime.bus.notify()
         return item
 
     async def cancel(self, identifier: str) -> dict[str, Any]:
@@ -104,9 +110,9 @@ class SelfManagement:
         if item is None or item["status"] != "pending":
             raise ValueError("管理操作不存在或已开始应用")
         item["status"] = "cancelled"
-        self.runtime.store.put("management", item)
+        self.runtime.store.event("management.completed", item, objects=[("management", item)])
         (self.directory / f"{identifier}.json").unlink(missing_ok=True)
-        await self.runtime.bus.emit("management.completed", item)
+        await self.runtime.bus.notify()
         return item
 
     async def start(self) -> None:
@@ -120,11 +126,13 @@ class SelfManagement:
                     if item["action"] == "configure" and current == item["target"]
                     else "interrupted"
                 )
-                self.runtime.store.put("management", item)
+                self.runtime.store.event(
+                    "management.completed", item, objects=[("management", item)]
+                )
         self._worker = asyncio.create_task(self._run())
         self._wake.set()
         if self.runtime.config.settings.updates.check_on_start:
-            self._check = asyncio.create_task(self.updates.check())
+            self._check = asyncio.create_task(self.updates.check(independent=True))
 
     async def _idle(self) -> None:
         while self.runtime.busy:
@@ -191,10 +199,12 @@ class SelfManagement:
         finally:
             if item["status"] not in {"pending", "applying"}:
                 path.unlink(missing_ok=True)
-            self.runtime.store.put("management", item)
-            await self.runtime.bus.emit(
-                "management.queued" if item["status"] == "pending" else "management.completed", item
+            self.runtime.store.event(
+                "management.queued" if item["status"] == "pending" else "management.completed",
+                item,
+                objects=[("management", item)],
             )
+            await self.runtime.bus.notify()
 
     async def close(self) -> None:
         tasks = [task for task in (self._worker, self._check) if task is not None]

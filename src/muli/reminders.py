@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import math
 from typing import Any
 
 from muli.events import EventBus
+from muli.proactive import FrozenRouting
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 
 
@@ -19,7 +20,13 @@ class Reminders:
         self.task: asyncio.Task[None] | None = None
 
     def create(
-        self, title: str, due_at: float, content: str = "", interval_seconds: int | None = None
+        self,
+        title: str,
+        due_at: float,
+        content: str = "",
+        interval_seconds: int | None = None,
+        *,
+        reply_origin: ReplyOrigin | None = None,
     ) -> dict[str, Any]:
         if not title.strip() or len(title) > 120 or len(content) > 4000:
             raise ValueError("提醒标题或内容长度无效")
@@ -37,6 +44,7 @@ class Reminders:
             "created_at": now(),
             "last_fired_at": None,
             "fired_count": 0,
+            "routing": FrozenRouting.bound(reply_origin or ReplyOrigin()).dump(),
         }
         self.store.put("reminder", item)
         self.changed.set()
@@ -99,6 +107,7 @@ class Reminders:
             "read": False,
             "created_at": timestamp,
             "reminder_id": item["id"],
+            "routing": FrozenRouting.load(current.get("routing")).dump(),
         }
         interval = item["interval_seconds"]
         current["last_fired_at"] = timestamp
@@ -110,16 +119,13 @@ class Reminders:
         else:
             current["enabled"] = False
         with self.store.db:
-            self.store.db.execute(
-                "INSERT OR IGNORE INTO objects VALUES(?,?,?,?)",
-                ("notification", notice["id"], json.dumps(notice, ensure_ascii=False), timestamp),
+            self.store._event(
+                "notification.created",
+                notice,
+                objects=[("notification", notice), ("reminder", current)],
             )
-            self.store.db.execute(
-                "UPDATE objects SET data=?,updated=? WHERE kind=? AND id=?",
-                (json.dumps(current, ensure_ascii=False), timestamp, "reminder", item["id"]),
-            )
-        await self.bus.emit("notification.created", notice)
-        await self.bus.emit("reminder.updated", current)
+            self.store._event("reminder.updated", current)
+        await self.bus.notify()
 
     async def _run(self) -> None:
         while True:
