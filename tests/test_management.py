@@ -92,6 +92,34 @@ async def test_self_configuration_waits_for_idle_and_keeps_secrets_private(tmp_p
         await runtime.close()
 
 
+async def test_log_tool_survives_reconfigure_without_changing_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, plugins = setup_runtime(tmp_path)
+    service = UserService(runtime.config.path, runtime.data_dir, platform="darwin")
+    service.log_path.parent.mkdir(parents=True)
+    service.log_path.write_text("initial boundary\nfirst\nsecond\n", encoding="utf-8")
+
+    async def no_apply(settings: Settings) -> None:
+        raise AssertionError("reading logs must not apply configuration")
+
+    async def no_action(action: str) -> None:
+        raise AssertionError("reading logs must not change the service")
+
+    monkeypatch.setattr(service, "action", no_action)
+    manager = SelfManagement(runtime, plugins, service, no_apply)
+    try:
+        tool = runtime.tools["self_logs"]
+        assert tool.risk == "read"
+        assert (await tool.handler({"lines": 1}))["text"] == "second"
+        await runtime.reconfigure()
+        assert (await runtime.tools["self_logs"].handler({}))["text"] == "first\nsecond"
+        assert runtime.store.list("management") == []
+    finally:
+        await manager.close()
+        await runtime.close()
+
+
 async def test_configuration_plan_detects_stale_snapshot_and_invalid_changes(
     tmp_path: Path,
 ) -> None:
