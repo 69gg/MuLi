@@ -1,6 +1,6 @@
 # 可恢复的自身配置、重启与更新
 
-状态：2026-10-21 跨进程恢复整体设计；Linux 同版本切片已实现纯 journal／可注入控制者、维护门、被动 Runtime、固定 nonce 握手与 Linux backend／受限 helper，见[分块实现与证据](restart-transaction-v2.15-design.md)和[helper 接口](linux-controller-helper-design.md)。CLI／管理提交、服务 bootstrap 接线和 A/B 切换仍未交付，也没有实测中断时长或恢复成功率。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
+状态：2026-10-21 跨进程恢复整体设计；Linux 同版本的 journal、维护门、被动 Runtime、nonce 握手、Linux backend／受限 helper 及 CLI／管理提交、bootstrap 和终态投影已接入 2.19 候选，见[恢复入口](linux-recovery-operations.md)和[分块证据](restart-transaction-v2.15-design.md)。跨版本 A/B 切换仍未交付，也没有实测中断时长或恢复成功率。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
 
 ## 交付目标与最小范围
 
@@ -10,7 +10,9 @@
 
 这里的恢复不是外部副作用撤销。已发送但未确认的消息、工具执行到一半、插件产生的外部操作仍可能结果未知；恢复旧程序不能把它们变成未执行，也不能自动重做。审批 future、网络连接与模型生成栈不跨进程复活；尽量缩短中断不等于恰好一次执行。
 
-## 当前实现及其可复用部分
+## 设计起点及可复用部分
+
+下表保留改造前的基线与当时缺口；同版本入口当前进度以[恢复操作](linux-recovery-operations.md)为准。原位更新与跨版本格式证据仍是后续工作。
 
 | 位置 | 已有行为 | 本方案需要补齐 |
 | --- | --- | --- |

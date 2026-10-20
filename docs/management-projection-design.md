@@ -1,6 +1,6 @@
 # 恢复事务的管理结果投影
 
-状态：接线前的小片。`management_projection.py` 实现纯投影函数，尚未接入服务启动、管理状态入口或维护解除回调；不会停止或启动服务。journal 是恢复过程的权威，网页管理对象和通知只作投影。
+状态：纯投影函数已接入开发分支的启动恢复、管理状态与下一次准备入口。投影本身不会停止或启动服务。journal 是恢复过程的权威，网页管理对象和通知只作投影；整体验证范围见[恢复入口](linux-recovery-operations.md)。
 
 `project_final(permit, store)` 只处理最新 resolved 的最终记录，不使用 `permit.record` 的启动缓存。`permit=None` 或尚无最终记录时返回 `None`。先确认真正持有目标 DB 的 writer lease，再以有限 `PRAGMA database_list` 核唯一 main 的实际路径，以 `runtime_state` 两个主键核 Store instance／主会话，并验证对应主会话对象已存在；不会调用可能建立主会话的 `Store.main_session()`。
 
@@ -18,7 +18,7 @@ SQLite 连接必须处于 WAL 和 `synchronous=FULL` 或 `EXTRA`；本模块只�
 
 合法 successor 窗口是新 manifest B 已耐久、下一代 prepared 尚未落盘，journal 仍为已投影的旧 A。此时真正 DB／Store／main 和 stable resolved journal 均匹配，exact receipt 可以只读返回，不要求当前 permit.installation 仍等于旧 A；需要创建新投影时才严格要求 permit installation／service 与 record 相同。下一代 prepare 仅接受从真实 Store 读取的精确 receipt，不信任调用方口头声称“上一代已汇报”。
 
-原配置快照清理放在投影之后的独立幂等步骤，不影响结果正确性。本片仅使用临时 Store／journal 与故障注入；后续由服务启动、管理状态读取和既有维护解除回调触发，不增加永久轮询。helper 不打开业务 Store 或写管理结果。发起工具须先完成持久回执，管理 worker 再 prepare；其实际 owner 清除前不能取得 drained，避免重启丢失自己的工具结果。
+原配置快照清理放在投影之后的独立幂等步骤，不影响结果正确性。本片仅使用临时 Store／journal 与故障注入；当前由启动恢复、管理状态读取、下一次准备及维护解除后唤醒的 worker 触发，不增加永久轮询。helper 不打开业务 Store 或写管理结果。发起工具须先完成持久回执，管理 worker 再 prepare；其实际 owner 清除前不能取得 drained，避免重启丢失自己的工具结果。
 
 通过 Context7 核对 [Python sqlite3 事务接口](https://docs.python.org/3/library/sqlite3.html#how-to-use-the-connection-context-manager) 和 [SQLite synchronous／WAL 持久语义](https://www.sqlite.org/pragma.html#pragma_synchronous)。WAL 下 NORMAL 提交可在断电后回退；FULL 每次事务提交额外同步 WAL。这是依赖本地持久文件系统、合作进程与 SQLite VFS 正确实现 fsync 的保证，不对恶意同 uid 文件替换或不诚实存储设备作额外承诺。
 

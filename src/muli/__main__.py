@@ -5,11 +5,70 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from muli import __version__
 from muli.config import ConfigFile, default_config_path, default_data_dir
 from muli.service import UserService
+
+
+async def _serve(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from muli.server import create_app
+
+    session = None
+    app = None
+    handed_off = False
+    try:
+        if sys.platform == "linux":
+            from muli.platforms.linux_bootstrap import open_boot_session
+
+            session = await open_boot_session(
+                UserService(args.config, args.data_dir), args.data_dir / "muli.sqlite3"
+            )
+        config = ConfigFile(args.config)
+        port = getattr(args, "port", None) or config.settings.server.port
+        if (
+            session is not None
+            and session.permit is not None
+            and port != config.settings.server.port
+        ):
+            raise ValueError("transaction_port_override_unsupported")
+        from muli.platforms.linux_transaction import clock_reading
+
+        handed_off = True
+        app = create_app(
+            config,
+            args.data_dir,
+            listen_port=port,
+            boot_session=session,
+            maintenance_clock=clock_reading if session and session.permit else None,
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host=config.settings.server.host,
+                port=port,
+                log_level="info",
+                access_log=False,
+                timeout_graceful_shutdown=5,
+                workers=1,
+            )
+        )
+        await server.serve()
+        if not server.started:
+            raise RuntimeError("service_startup_failed")
+    finally:
+        if app is not None:
+            # Also covers server/config failures before ASGI lifespan entry.
+            # The same owned task is joined by lifespan and this outer owner.
+            await app.state.close()
+        elif session is not None and not handed_off:
+            # After handoff only the writer owner can certify successful close.
+            # A failed close must retain the lease until process exit.
+            session.close_after_writers()
 
 
 def main() -> None:
@@ -32,8 +91,9 @@ def main() -> None:
         choices=["status", "print", "install", "start", "stop", "restart", "enable", "disable"],
     )
     commands.add_parser("doctor", help="显示配置和本机能力")
+    recovery = commands.add_parser("management", help="查看恢复事务或接续现有控制者")
+    recovery.add_argument("action", choices=["status", "recover"])
     args = parser.parse_args()
-    config = ConfigFile(args.config)
     if args.command == "init":
         from muli.initialization import clone_source, start_background
         from muli.initialization import initialize as initialize_config
@@ -68,18 +128,36 @@ def main() -> None:
             f"工作台：http://{address}:{initial_settings.server.port}；沐璃会接着帮你配置其它能力。"
         )
     elif args.command == "service":
+        from muli.management_cli import guarded_service_action
+
         manager = UserService(args.config, args.data_dir)
         if args.action == "print":
             print(manager.render())
         else:
-            result = asyncio.run(
-                manager.status() if args.action == "status" else manager.action(args.action)
-            )
+            try:
+                result = asyncio.run(
+                    manager.status()
+                    if args.action == "status"
+                    else guarded_service_action(manager, args.action)
+                )
+            except (OSError, ValueError) as exc:
+                parser.error(getattr(exc, "code", "service_action_failed"))
             print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "management":
+        from muli.management_cli import management_action
+
+        try:
+            result = asyncio.run(
+                management_action(UserService(args.config, args.data_dir), args.action)
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(getattr(exc, "code", "management_unavailable"))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "doctor":
         from muli.notifications import notification_capability
         from muli.tools.computer import Computer
 
+        config = ConfigFile(args.config)
         print(
             json.dumps(
                 {
@@ -99,19 +177,7 @@ def main() -> None:
             )
         )
     else:
-        import uvicorn
-
-        from muli.server import create_app
-
-        port = getattr(args, "port", None) or config.settings.server.port
-        uvicorn.run(
-            create_app(config, args.data_dir, listen_port=port),
-            host=config.settings.server.host,
-            port=port,
-            log_level="info",
-            access_log=False,
-            timeout_graceful_shutdown=5,
-        )
+        asyncio.run(_serve(args))
 
 
 if __name__ == "__main__":

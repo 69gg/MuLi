@@ -72,11 +72,15 @@ async def test_shutdown_settles_management_before_final_attention_close(
 class ObservedShutdownLock(asyncio.Lock):
     def __init__(self) -> None:
         super().__init__()
-        self.shutdown: asyncio.Task[Any] | None = None
+        self._armed = False
         self.shutdown_waiting = asyncio.Event()
 
+    def arm(self) -> None:
+        self._armed = True
+
     async def acquire(self) -> bool:
-        if asyncio.current_task() is self.shutdown:
+        if self._armed and self.locked():
+            self._armed = False
             self.shutdown_waiting.set()
         return await super().acquire()
 
@@ -121,8 +125,8 @@ async def test_shutdown_waits_for_existing_api_configuration_before_closing_stor
     probes: list[asyncio.Task[bool]] = []
     try:
         await asyncio.wait_for(entered.wait(), 2)
+        lock.arm()
         shutdown = asyncio.create_task(scope.__aexit__(None, None, None))
-        lock.shutdown = shutdown
         probes = [
             asyncio.create_task(lock.shutdown_waiting.wait()),
             asyncio.create_task(premature_store_close.wait()),

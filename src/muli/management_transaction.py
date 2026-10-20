@@ -460,13 +460,22 @@ _INTENTS = {
 
 
 class TransactionJournal(AbstractContextManager["TransactionJournal"]):
-    def __init__(self, root: Path, database: Path, limits: JournalLimits | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        database: Path,
+        limits: JournalLimits | None = None,
+        *,
+        create: bool = True,
+    ) -> None:
         self.limits = limits or JournalLimits()
-        self.directory = _Directory(root)
+        self.directory = _Directory(root, create=create)
         try:
             # Resolve DB aliases before choosing its independent lease inode.
             path = self.database = database.resolve()
-            self.writer_directory = _Directory(path.parent / ("." + path.name + "-writer"))
+            self.writer_directory = _Directory(
+                path.parent / ("." + path.name + "-writer"), create=create
+            )
         except BaseException:
             self.directory.__exit__()
             raise

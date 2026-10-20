@@ -70,16 +70,14 @@ def install_maintenance_routes(
         return proof.model_dump(mode="json")
 
 
-def passive_request_allowed(method: str, path: str, main_session: str) -> bool:
+def passive_request_allowed(method: str, path: str, main_session: str | None) -> bool:
     """Only audited local reads and durable owner ingress remain in probation."""
     if (method, path) in INTERNAL_METHODS or not path.startswith("/api/"):
         return True
     if method == "POST":
-        return path in {
-            "/api/auth/login",
-            "/api/auth/logout",
-            f"/api/sessions/{main_session}/messages",
-        }
+        return path in {"/api/auth/login", "/api/auth/logout"} or (
+            main_session is not None and path == f"/api/sessions/{main_session}/messages"
+        )
     if method != "GET":
         return False
     if path in {
@@ -93,6 +91,7 @@ def passive_request_allowed(method: str, path: str, main_session: str) -> bool:
         "/api/ui/event-position",
         "/api/team",
         "/api/management",
+        "/api/management/transactions/current",
         "/api/extensions",
         "/api/memory/status",
         "/api/channels",
@@ -123,10 +122,14 @@ def passive_request_allowed(method: str, path: str, main_session: str) -> bool:
     )
 
 
-def request_has_effect(method: str, path: str, main_session: str) -> bool:
+def request_has_effect(method: str, path: str, main_session: str | None) -> bool:
     if not path.startswith("/api/") or (method, path) in INTERNAL_METHODS:
         return False
     # Durable owner ingress is allowed while paused and never launches directly.
-    if method == "POST" and path == f"/api/sessions/{main_session}/messages":
+    if (
+        method == "POST"
+        and main_session is not None
+        and path == f"/api/sessions/{main_session}/messages"
+    ):
         return False
     return not passive_request_allowed(method, path, main_session)

@@ -9,7 +9,7 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -53,6 +53,9 @@ from muli.session_records import SessionRecords
 from muli.store import SQLITE_MAX_INTEGER, now
 from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
+
+if TYPE_CHECKING:
+    from muli.platforms.linux_bootstrap import BootSession
 
 _HISTORY_OUTPUT_CHARS = 32_000
 _MAX_WEB_SEQUENCE = (1 << 53) - 1  # JSON numbers must round-trip through browser Number.
@@ -129,6 +132,11 @@ class ServiceInput(Input):
     action: Literal["install", "start", "restart", "stop", "enable", "disable"]
 
 
+class TransactionRequest(Input):
+    action: Literal["configure", "restart"] = "restart"
+    changes: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeliveryRetryInput(Input):
     allow_unknown: bool = False
 
@@ -147,14 +155,32 @@ def create_app(
     *,
     listen_port: int | None = None,
     boot_permit: BootPermit | None = None,
+    boot_session: BootSession | None = None,
     maintenance_clock: Callable[[], ClockReading] | None = None,
 ) -> FastAPI:
     config = config or ConfigFile(default_config_path())
+    if runtime is not None and (boot_permit is not None or boot_session is not None):
+        raise ValueError("boot_permit 只能由一个运行时持有")
+    owned = runtime is None
+    runtime = runtime or Runtime(
+        config, data_dir or default_data_dir(), boot_permit=boot_permit, boot_session=boot_session
+    )
+    try:
+        return _create_app(config, runtime, listen_port, maintenance_clock)
+    except BaseException:
+        if owned:
+            runtime.discard_unstarted()
+        raise
+
+
+def _create_app(
+    config: ConfigFile,
+    runtime: Runtime,
+    listen_port: int | None,
+    maintenance_clock: Callable[[], ClockReading] | None,
+) -> FastAPI:
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
-    if runtime is not None and boot_permit is not None:
-        raise ValueError("boot_permit 只能由一个运行时持有")
-    runtime = runtime or Runtime(config, data_dir or default_data_dir(), boot_permit=boot_permit)
     attention = AttentionInbox(runtime, lambda: config.settings.system_events)
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
@@ -270,35 +296,47 @@ def create_app(
 
     runtime.maintenance.bind_activation(activate_components)
 
+    close_task: asyncio.Task[None] | None = None
+
+    async def close_resources() -> None:
+        nonlocal configuration_closing
+        configuration_closing = True
+        try:
+            await runtime.maintenance.settle_activation()
+        except Exception:
+            pass  # The failed activation remains blocked; still close its components.
+        if onboarding_task is not None:
+            onboarding_task.cancel()
+            await asyncio.gather(onboarding_task, return_exceptions=True)
+        # Join an owned apply/rollback before stopping its components.
+        await management.close()
+        async with runtime.configuration_lock:
+            pass  # An admitted API transaction must settle before Store closes.
+        await attention.close()
+        await web_voice.aclose()
+        await integration.close()
+        await channel_application.close()
+        await personal_io.close()
+        await memory_application.close()
+        await plugins.close()
+        await runtime.close()
+
+    async def close() -> None:
+        nonlocal close_task
+        if close_task is None:
+            close_task = asyncio.create_task(close_resources(), name="muli-application-close")
+        if await _wait_cleanup(close_task):
+            raise asyncio.CancelledError
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        nonlocal configuration_closing
         try:
+            await management.recovery.recover()
             if not (runtime.maintenance.permit and runtime.maintenance.permit.probation):
                 await activate_components()
             yield
         finally:
-            configuration_closing = True
-            try:
-                await runtime.maintenance.settle_activation()
-            except Exception:
-                pass  # The failed activation remains blocked; still close its components.
-            if onboarding_task is not None:
-                onboarding_task.cancel()
-                await asyncio.gather(onboarding_task, return_exceptions=True)
-            # Let an owned apply/rollback finish before finally stopping its components.
-            # Do not hold the lock while joining a worker that may be waiting for it.
-            await management.close()
-            async with runtime.configuration_lock:
-                pass  # An admitted API transaction must also settle before Store closes.
-            await attention.close()
-            await web_voice.aclose()
-            await integration.close()
-            await channel_application.close()
-            await personal_io.close()
-            await memory_application.close()
-            await plugins.close()
-            await runtime.close()
+            await close()
 
     app = FastAPI(
         title="MuLi",
@@ -309,6 +347,7 @@ def create_app(
         openapi_url="/api/openapi.json",
     )
     app.state.runtime, app.state.integration = runtime, integration
+    app.state.close = close
     app.state.attachments, app.state.authentication = attachments, authentication
     app.state.local_services = local_services
     app.state.web_voice = web_voice
@@ -410,16 +449,21 @@ def create_app(
             and channel_application.manager.receiving
             and runtime.maintenance.accepts_external_input
         )
+        main_session = (
+            runtime.store.existing_main_session_id()
+            if request.method == "POST"
+            and request.url.path.startswith("/api/sessions/")
+            and request.url.path.endswith("/messages")
+            else None
+        )
         if (
             not runtime.maintenance.admission.allowed
             and not durable_webhook
-            and not passive_request_allowed(
-                request.method, request.url.path, runtime.main_session()["id"]
-            )
+            and not passive_request_allowed(request.method, request.url.path, main_session)
         ):
             return JSONResponse({"detail": "execution_paused"}, status_code=409)
         if not durable_webhook and request_has_effect(
-            request.method, request.url.path, runtime.main_session()["id"]
+            request.method, request.url.path, main_session
         ):
             with runtime.maintenance.admission.operation():
                 response = await call_next(request)
@@ -755,14 +799,27 @@ def create_app(
 
     @app.get("/api/management")
     async def management_status() -> dict[str, Any]:
+        await management.recovery.project()
         return {
             "plans": management.plans(),
+            "recovery": management.recovery.current(),
             "plugins": plugins.inventory(),
             "plugins_restart_required": plugins.restart_required,
             "update": runtime.store.get("update", "latest"),
             "extensions": runtime.extensions.status(),
             "system_events": runtime.system_events.status(),
         }
+
+    @app.get("/api/management/transactions/current")
+    async def transaction_status() -> dict[str, Any]:
+        await management.recovery.project()
+        return management.recovery.current()
+
+    @app.post("/api/management/transactions")
+    async def prepare_transaction(body: TransactionRequest) -> dict[str, Any]:
+        if body.action == "restart" and body.changes:
+            raise HTTPException(422, "单纯重启不接受配置变更")
+        return await management.stage(body.action, body.changes, apply_mode="restart_transaction")
 
     @app.get("/api/extensions")
     async def extension_status() -> dict[str, Any]:
@@ -1161,7 +1218,11 @@ def create_app(
 
     @app.post("/api/service")
     async def service_action(body: ServiceInput) -> dict[str, Any]:
-        return await service.action(body.action)
+        async with runtime.configuration_lock:
+            runtime.maintenance.require_configuration()
+            from muli.management_cli import guarded_service_action
+
+            return await guarded_service_action(service, body.action)
 
     @app.get("/api/export")
     async def export() -> StreamingResponse:

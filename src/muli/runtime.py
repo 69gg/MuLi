@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 from jsonschema import Draft202012Validator
@@ -59,6 +59,9 @@ from muli.tools.files import Files
 from muli.tools.mcp import MCPManager
 from muli.tools.web import Web
 
+if TYPE_CHECKING:
+    from muli.platforms.linux_bootstrap import BootSession
+
 ClientFactory = Callable[[ModelConfig], ModelClient]
 ContextHook = Callable[[str, list[Message]], Awaitable[list[Message]]]
 ToolProvider = Callable[["Runtime"], list[Tool]]
@@ -83,12 +86,32 @@ class Runtime:
         client_factory: ClientFactory = ModelClient,
         *,
         boot_permit: BootPermit | None = None,
+        boot_session: BootSession | None = None,
     ) -> None:
         self.config, self.data_dir, self.client_factory = config, data_dir, client_factory
+        if boot_session is not None:
+            if boot_permit is not None:
+                raise ValueError("duplicate_boot_owner")
+            boot_session.check_paths(config.path, data_dir / "muli.sqlite3")
+            boot_permit = boot_session.permit
+        self.boot_session = boot_session
         if boot_permit is not None:
             boot_permit.check_paths(config.path, data_dir / "muli.sqlite3")
         self.maintenance = Maintenance(boot_permit)
-        self.store = Store(data_dir / "muli.sqlite3")
+        self.store = (
+            Store(data_dir / "muli.sqlite3", durable=True)
+            if boot_permit is not None
+            else Store(data_dir / "muli.sqlite3")
+        )
+        try:
+            self._initialize()
+        except BaseException:
+            # Constructors have no async producers yet. Never hand back a boot
+            # lease while a partly constructed SQLite writer remains open.
+            self.discard_unstarted()
+            raise
+
+    def _initialize(self) -> None:
         self.bus = EventBus(self.store)
         self.system_events = SystemEvents(
             self.store,
@@ -143,8 +166,19 @@ class Runtime:
         self.maintenance.on_release(self.team.start)
         self.maintenance.on_release(self.extensions.wake)
         self.maintenance.on_configuration_release(self.extensions.wake)
-        if boot_permit is not None:
+        if self.maintenance.permit is not None:
             self.maintenance.prepared(self.store.instance_id, self.main_session()["id"])
+
+    def discard_unstarted(self) -> None:
+        """Factory failure only, before any application lifespan or producer runs."""
+        self.store.close()
+        self._release_writer()
+
+    def _release_writer(self) -> None:
+        if self.boot_session is not None:
+            self.boot_session.close_after_writers()
+        elif self.maintenance.permit is not None:
+            self.maintenance.permit.close_after_writers()
 
     def maintenance_idle(self) -> bool:
         return (
@@ -2056,7 +2090,6 @@ class Runtime:
                 # Stop the log observer regardless, but never close under live drivers.
                 if drivers_settled:
                     self.store.close()
-                    if self.maintenance.permit is not None:
-                        self.maintenance.permit.close_after_writers()
+                    self._release_writer()
         if cancelled:
             raise asyncio.CancelledError

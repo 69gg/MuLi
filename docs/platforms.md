@@ -4,6 +4,8 @@ MuLi 只探测当前已安装的工具，不安装系统组件、下载模型或
 
 ## 当前用户服务
 
+开发分支的 Linux 同版本恢复已接入 CLI 和管理 API，要求标准 systemd unit、真实进程/cgroup 与本地文件系统证明；普通前台运行和 macOS/Windows 不声称获得同等恢复能力。详见[恢复入口及验证范围](linux-recovery-operations.md)。
+
 | 平台 | 后端 | 安装位置 | 日志 |
 | --- | --- | --- | --- |
 | Linux / Arch | systemd --user | $XDG_CONFIG_HOME/systemd/user/muli.service，默认 ~/.config/systemd/user | journalctl --user -u muli.service |
@@ -16,7 +18,7 @@ Windows 计划任务使用当前 Python 环境的 pythonw.exe，缺失时报告�
 
 macOS 与 Windows 使用本地日志包装器，不依赖终端重定向。每份日志最多 1 MiB，保留一个轮转文件。服务命令不隐式提升权限，系统工具缺失、用户会话不可用和查询超时会通过 status.reason 报告。Linux unit 默认保留 MemoryMax=512M、CPUQuota=50%、TasksMax=64，可用用户 unit override 调整。
 
-Linux 同版本恢复另有独立的[安装 manifest](installation-manifest.md)文件身份模块：保留虚拟环境词法解释器入口，有限核对实际二进制、pyvenv、MuLi 包与标准 unit，不扫描完整依赖环境。它尚未接通服务交接入口，不改变上述服务命令；自定义 unit override 仍可用于现有服务，但不属于首期标准 unit 恢复合同。
+Linux 同版本恢复使用独立的[安装 manifest](installation-manifest.md)：保留虚拟环境词法解释器入口，有限核对实际二进制、pyvenv、MuLi 包与标准 unit，不扫描完整依赖环境。它已接入开发候选的交接入口；原始服务命令仍只报告 accepted，并受未决事务与标准 unit 身份保护。自定义 unit/drop-in 不属于首期恢复合同，身份无法核验时拒绝自动控制。
 
 ## 截图与录屏
 

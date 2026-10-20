@@ -1,6 +1,6 @@
 # Linux 启动前 writer 保护
 
-状态：纯启动保护模块已实现并完成定向验证，尚未接入 `serve`、Runtime 或 lifespan。它不启动 helper，不准备或发布事务，也不表示恢复服务闭环已经交付。
+状态：启动保护模块已接入开发分支的 `serve`、Runtime 和 lifespan，并完成独立入口回归。模块自身不启动 helper、不准备或发布事务；整体整合与真实服务验证边界见[恢复入口](linux-recovery-operations.md)。
 
 `open_boot_session(service, database, *, probe=None)` 在 ConfigFile 和 Store 构造之前运行。宿主从实际 CLI 路径构造 `UserService` 并传入实际数据库路径；模块不读取 Settings 来猜路径。journal 固定为 `service.data_dir / management / transaction-v1`，数据库别名沿用 `TransactionJournal` 的规范化结果，所有 Linux serve 模式使用同一数据库 writer lease。
 

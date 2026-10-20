@@ -6,12 +6,13 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
 from muli.extensions import ExtensionError
 from muli.maintenance import MaintenanceError
+from muli.management_host import RecoveryHost
 from muli.plugins import PluginManager
 from muli.proactive import FrozenRouting
 from muli.providers import Message
@@ -46,6 +47,7 @@ class SelfManagement:
         self.directory = runtime.data_dir / "management"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.updates = Updates(runtime.config, runtime.store, runtime.bus)
+        self.recovery = RecoveryHost(runtime, service)
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._check: asyncio.Task[dict[str, Any]] | None = None
@@ -71,11 +73,25 @@ class SelfManagement:
         return messages
 
     async def stage(
-        self, action: str, changes: dict[str, Any] | None = None, version: str = ""
+        self,
+        action: str,
+        changes: dict[str, Any] | None = None,
+        version: str = "",
+        *,
+        apply_mode: Literal["in_process", "restart_transaction"] = "in_process",
     ) -> dict[str, Any]:
         self.runtime.maintenance.require_configuration()
         if action not in {"configure", "restart", "update"}:
             raise ValueError("未知管理操作")
+        if apply_mode not in {"in_process", "restart_transaction"}:
+            raise ValueError("未知配置应用方式")
+        if action == "restart":
+            apply_mode = "restart_transaction"
+        if apply_mode == "restart_transaction":
+            if action == "update":
+                raise ValueError("跨版本恢复更新尚未支持")
+            await self.recovery.verify()
+            self.runtime.maintenance.require_configuration()
         if any(item["status"] in {"pending", "applying"} for item in self.plans()):
             raise ValueError("已有待应用管理操作，请等待完成或取消后再提交")
         settings = self.runtime.config.settings
@@ -94,6 +110,7 @@ class SelfManagement:
         item = {
             "id": identifier,
             "action": action,
+            "apply_mode": apply_mode,
             "status": "pending",
             "created_at": now(),
             "base": fingerprint(settings),
@@ -124,12 +141,23 @@ class SelfManagement:
     async def start(self) -> None:
         if self._worker is not None:
             return
+        await self.recovery.project()
+        current_transaction = self.recovery.current()["transaction"]
         for item in self.plans():
             if item["status"] == "applying":
+                if (
+                    current_transaction is not None
+                    and current_transaction["request_id"] == item["id"]
+                    and isinstance(item.get("transaction"), dict)
+                    and item["transaction"].get("generation") == current_transaction["generation"]
+                ):
+                    continue
                 current = fingerprint(self.runtime.config.settings)
                 item["status"] = (
                     "completed"
-                    if item["action"] == "configure" and current == item["target"]
+                    if item["action"] == "configure"
+                    and item.get("apply_mode", "in_process") == "in_process"
+                    and current == item["target"]
                     else "interrupted"
                 )
                 self.runtime.store.event(
@@ -162,6 +190,7 @@ class SelfManagement:
             await self._wake.wait()
             self._wake.clear()
             await self.runtime.maintenance.wait_configuration()
+            await self.recovery.project()
             for item in reversed(self.plans()):
                 if item["status"] != "pending":
                     continue
@@ -188,16 +217,24 @@ class SelfManagement:
                 raise ValueError("待应用配置内容已改变")
             item["status"] = "applying"
             self.runtime.store.put("management", item)
+            if item["action"] == "restart" or item.get("apply_mode") == "restart_transaction":
+                item = await self.recovery.prepare(item, target)
+                return
             if item["action"] == "configure":
                 await self.apply_settings(target)
-            elif item["action"] == "restart":
-                await self.service.action("restart")
             else:
                 item["result"] = await self.updates.apply(item["version"])
                 await self.service.action("restart")
             item["status"] = "completed"
         except Exception as exc:
-            if isinstance(exc, MaintenanceError) and exc.code == "transaction_in_progress":
+            transaction = self.recovery.current()["transaction"]
+            if transaction is not None and transaction["request_id"] == item["id"]:
+                # prepared is already durable, even if ensure/HTTP/observer failed.
+                item = self.runtime.store.get("management", item["id"]) or item
+                item.update(status="applying", transaction=transaction)
+                item["recovery_notice"] = "controller_unconfirmed"
+                self.runtime.maintenance.reconcile()
+            elif isinstance(exc, MaintenanceError) and exc.code == "transaction_in_progress":
                 item["status"] = "pending"
                 self._wake.set()
             elif (
@@ -211,13 +248,39 @@ class SelfManagement:
                 item.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
         finally:
             try:
+                # The durable plan may have gained its generation while prepare
+                # was awaiting the helper. Cancellation must not write the stale
+                # pre-prepare object back over that binding.
+                stored = self.runtime.store.get("management", item["id"])
+                transaction = self.recovery.current()["transaction"]
+                if (
+                    stored is not None
+                    and isinstance(stored.get("transaction"), dict)
+                    and transaction is not None
+                    and transaction["request_id"] == item["id"]
+                    and stored["transaction"].get("generation") == transaction["generation"]
+                ):
+                    item = stored
+                    if not transaction["resolved"]:
+                        item.update(status="applying", transaction=transaction)
                 if item["status"] not in {"pending", "applying"}:
                     path.unlink(missing_ok=True)
-                self.runtime.store.event(
-                    "management.queued" if item["status"] == "pending" else "management.completed",
-                    item,
-                    objects=[("management", item)],
-                )
+                if not (
+                    transaction is not None
+                    and transaction["resolved"]
+                    and stored is not None
+                    and item is stored
+                    and item["status"] in {"completed", "cancelled", "failed"}
+                ):
+                    self.runtime.store.event(
+                        "management.queued"
+                        if item["status"] == "pending"
+                        else "management.progress"
+                        if item["status"] == "applying"
+                        else "management.completed",
+                        item,
+                        objects=[("management", item)],
+                    )
                 await self.runtime.bus.notify()
             finally:
                 self._applying = None
@@ -240,11 +303,15 @@ class SelfManagement:
             return runtime.config.public()
 
         async def configure(args: dict[str, Any]) -> Any:
-            return await self.stage("configure", args["changes"])
+            return await self.stage(
+                "configure", args["changes"], apply_mode=args.get("apply_mode", "in_process")
+            )
 
         async def status(args: dict[str, Any]) -> Any:
+            await self.recovery.project()
             return {
                 "plans": self.plans(),
+                "recovery": self.recovery.current(),
                 "plugins": self.plugins.inventory(),
                 "plugins_restart_required": self.plugins.restart_required,
                 "update": runtime.store.get("update", "latest"),
@@ -289,7 +356,16 @@ class SelfManagement:
             Tool(
                 "self_configure",
                 "校验配置补丁并排队，所有当前工作结束后应用；无需结束主身份",
-                parameters({"changes": {"type": "object"}}, ("changes",)),
+                parameters(
+                    {
+                        "changes": {"type": "object"},
+                        "apply_mode": {
+                            "type": "string",
+                            "enum": ["in_process", "restart_transaction"],
+                        },
+                    },
+                    ("changes",),
+                ),
                 configure,
                 "write",
             ),
@@ -309,7 +385,7 @@ class SelfManagement:
             ),
             Tool(
                 "self_restart",
-                "校验现有配置后排队重启已安装的常驻服务",
+                "校验后排队恢复重启；仅支持已验证的 Linux 用户服务，最终结果回原会话",
                 parameters({}),
                 restart,
                 "write",

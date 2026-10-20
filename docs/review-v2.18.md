@@ -18,4 +18,6 @@
 
 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.18.0) 于 2026-10-20 18:27:25 UTC 发布。[PyPI 2.18.0](https://pypi.org/project/muli-agent/2.18.0/) 元数据与 GitHub 发行附件的大小、SHA-256 逐项一致；仅读取小型元数据，未下载发行包：wheel 539,185 字节，`ff6a9df163940d9421afdd9f599c7305adac761b88d09159a5a0a56721524620`；sdist 3,124,462 字节，`b5704c19a6102d4b8790e11de80aa56deb778b49e6f55f2bdd4bb7f4e4a89064`。
 
+[主分支流程 39474129438](https://github.com/69gg/MuLi/actions/runs/39474129438) 最初有一项 macOS Python 3.12 作业在领取 runner 前被取消，平台注释明确为 macOS arm64 托管容量不足，没有运行测试步骤。仅重跑失败作业后，8 项检查全部成功；未修改代码或提高测试超时。
+
 维护门和 Linux 恢复后端继续在独立分支开发，不随本版宣传为已启用能力。未改动用户安装或服务。

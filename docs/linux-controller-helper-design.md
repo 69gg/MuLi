@@ -1,6 +1,6 @@
 # Linux 同版本控制者与 helper 接口稿
 
-状态：2026-10-21，backend、独立 helper 入口和 transient ensure 已实现并通过离线替身回归；管理／CLI 发起与服务 bootstrap 仍待接通。前两块的 journal、控制者状态机、维护门与 nonce 路由已提交，Linux 只读 probe、安装 manifest 与配置 CAS 已复用。本稿不证明真实服务重启、硬退出接管或升级能力。
+状态：2026-10-21，backend、独立 helper 入口和 transient ensure 已实现并通过离线替身回归；管理／CLI 发起与服务 bootstrap 已在开发分支接通。journal、控制者状态机、维护门、nonce 路由、Linux probe、安装 manifest 和配置 CAS 均复用既有合同。本稿不证明真实服务重启、硬退出接管或跨版本升级能力；整体验证见[恢复入口](linux-recovery-operations.md)。
 
 ## 文件归属与依赖
 
@@ -10,7 +10,7 @@
 | 当前切片 | `platforms/linux_controller.py`：实现现有 `ControllerBackend`，复用 probe、配置 CAS 及同步安装核验回调，封装固定 nonce HTTP；不另造状态机 |
 | 当前切片 | `tests/test_linux_controller.py` 与控制者的必要窄回归：进程、HTTP、时钟、cgroup 均为替身；锁与配置文件只落临时目录，不运行真实服务 |
 | 当前 helper 切片 | `management_helper.py` 及其测试：仅接收 journal root 的轻量进程入口，取得同一 flock、验证实际资源、按原 deadline 驱动已有 `TransactionController`；提供 transient ensure |
-| 后续协调接线 | `__main__.py`、`management.py`、`server.py`：在根任务提供 bootstrap 合同后再接，不在本接口稿阶段修改 |
+| 宿主协调接线 | `__main__.py`、`management_host.py`、`management.py`、`server.py`：持有启动 lease、准备事务、关闭写入者与投影终态 |
 
 backend 接收 `UserService`、`TransactionJournal`、持有同一 journal flock 的 `JournalControl` 和 `verify_installation: Callable[[], None]`，可注入 `SystemdProbe`、command runner、HTTP transport 与共享 clock。安装模块就绪后用 manifest 的同步 `verify` 提供该回调。backend 不构造 `ConfigFile`、`Runtime` 或 `Store`。真实能力核验不依赖用户当前网页、模型输出或某个 PID 数字。
 
@@ -68,7 +68,7 @@ runner 顺序为：有界读取 manifest → 重构 journal → 取得固定 flo
 
 即使接管时记录已 resolved，也尝试最后一次同代 readiness GET 作为宿主提示。该请求失败不撤销持久 released、不制造隐式未完成状态；宿主现有配置／唤醒入口仍会按 journal 自修提示。配置、Store 与用户效果均不由 helper 做补偿或投影。blocked／recovery_required 不靠自动循环解除；未提供明确恢复能力时如实返回该状态。
 
-transient 在 user manager／机器整体重启后可能不存在。后续只能由受支持服务的 bootstrap 或显式 recover 再 ensure 同代 helper，不新增常驻轮询守护进程，不启用 linger；这些发起入口尚未接通，未自动启动原服务且无人调用恢复入口时不承诺自动续接。
+transient 在 user manager／机器整体重启后可能不存在。受支持服务的启动恢复或显式 recover 可以再 ensure 同代 helper，不新增常驻轮询守护进程，不启用 linger；未自动启动原服务且无人调用恢复入口时不承诺自动续接。
 
 持久 blocked 仅阻止其 health.boot 对应实例；新实例本地仍暂停，返回同代 paused 证明，控制者先持久重绑为 pending 后才允许 activate。本实例 activation 失败始终 blocked，不因换记录而自行重试。成功 activation 的实际宿主此后可继续可靠接收签名主人输入，即使执行门再次暂停；仍不启动模型／外发，重复 webhook 只持久接受一次。被动初始实例和激活失败实例均不因这个入口而获得权限。
 

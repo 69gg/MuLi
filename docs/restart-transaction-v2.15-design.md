@@ -1,6 +1,6 @@
 # Linux 同版本配置／重启事务：首片接口设计
 
-状态：2026-10-21，整体设计与第一块纯 journal／单步控制者已通过独立复审及 60 项离线回归。第二块已接入真实 Runtime、应用生命周期、维护门和固定 nonce 路由；第三块的 Linux backend、独立 helper／ensure 已有替身回归，详见[Linux 控制者与 helper](linux-controller-helper-design.md)。CLI bootstrap 与管理事务提交／投影仍未接通，因此尚不能通过现有 self_restart 取得可恢复重启，也未实测 systemd、中断或恢复成功率。最初基于 `368efc5` 研究，第二块已合入主动通知 A，保留其来源和投递语义。总目标参见[跨进程恢复总设计](recoverable-management-design.md)。不包含 A/B 安装、uv 下载、程序升级或数据库回滚。
+状态：2026-10-21，第一块纯 journal／控制者、第二块 Runtime／维护门／nonce 路由，以及第三块 Linux backend／独立 helper、CLI bootstrap、管理提交与终态投影均已进入 2.19 候选。本文保留分片合同及各自验收证据，当前入口见[恢复操作](linux-recovery-operations.md)。真实 systemd 交接、中断时长或恢复成功率尚未实测；不包含 A/B 安装、uv 下载、程序升级或数据库回滚。最初基于 `368efc5` 研究，后续保留主动通知的来源及投递语义；总目标见[跨进程恢复设计](recoverable-management-design.md)。
 
 ## 第一块的实际边界
 
@@ -8,7 +8,7 @@
 
 持锁读取在执行任何效果前成功同步 journal 目录，作为接管可见记录的持久化屏障；写入或该屏障失败后，同一控制者拒绝继续。新控制者也必须先成功完成屏障。这个约束专门处理 rename 已可见而目录 fsync 失败的窗口，不会因此自动修复文件或重放效果。普通无锁 `journal.read()` 仅用于观察，不确认持久化。
 
-控制者只提供 `await step()`，由调用方持有 journal 锁并注入时钟和 `ControllerBackend`。第一块仅用内存替身验收；后续 Linux backend 已独立实现 owner、配置 CAS、cgroup 与 lease 复核，helper 复用此状态机而不重建阶段。上述产品模块仍未构成已接通的管理／恢复命令，真实服务交接尚未验证。
+控制者只提供 `await step()`，由调用方持有 journal 锁并注入时钟和 `ControllerBackend`。第一块仅用内存替身验收，当时未包含管理／恢复命令；后续 Linux backend 已实现 owner、配置 CAS、cgroup 与 lease 复核，helper 复用此状态机而不重建阶段。真实服务交接尚未验证。
 
 `phase` 表示持久决定，`intent` 仅区分需要先记录的停服／替换／启动步骤；`activation` 区分决定已落盘与执行门确已放行。`rolled_back` 与 `committed` 都必须另有同代放行证明才是 resolved。原始失败码与当前失败码分开，避免回退自身失败掩盖最初原因。一次回退标记和独立 challenge 限制自动回退次数并隔离目标／原配置的健康证明；未引入升级、组件级子事务或逐组件恢复状态。
 
@@ -28,7 +28,7 @@ Runtime(config, data_dir, *, boot_permit=permit)
 create_app(config, data_dir, *, boot_permit=permit, maintenance_clock=clock)
 ```
 
-这几个签名是替代构造入口：给 create_app 传入现成 Runtime 时，不再重复传 permit。journal 的目录 FD 与 writer lease 保留整个实例寿命；应用实际组件／Store 收尾之后才释放 lease。安装、服务摘要和可信 ClockReading 来自尚待接通的宿主核验，不能由 HTTP 请求自报。
+这几个签名是替代构造入口：给 create_app 传入现成 Runtime 时，不再重复传 permit。journal 的目录 FD 与 writer lease 保留整个实例寿命；应用实际组件／Store 收尾之后才释放 lease。当前 CLI 通过 BootSession 接入；安装、服务摘要和可信 ClockReading 来自实际宿主核验，不能由 HTTP 请求自报。
 
 BootPermit 先取得规范化 DB 路径的固定 writer lease，再读当前 journal。未解决代仅接受明确 start_target／verifying／committed 或 start_base／verify_base／rolled_back 许可，校验安装、服务、精确配置字节摘要和只读 SQLite 的 store_instance/main_session；拒绝复用 origin boot、错误库、错误配置或未发启动意图。Runtime 在 Store 构造前复核路径。被动启动只做本地建模、既有恢复校正和 DB 身份核验；不加载 MCP／插件、不启动通知、提醒、记忆提炼、渠道 poll、语音、chiliarch、版本检查或模型。渠道旧 sending 本地标 unknown；记忆旧 processing 本地回 queued，不自动推断已执行工具、重发消息或回滚 DB。
 
@@ -64,7 +64,7 @@ drained 之后才阻止新模型／工具运行和新发送领取。已进入的
 
 组件在 committed／rolled_back 后启动，放行 receipt 另行持久后才 resolved。onboarding 可能修改配置，其任务延后到 resolved 再执行，避免启动过程中改变目标摘要；它保留既有幂等输入 ID，并纳入后续 drain 的真实 owner。配置与扩展写入从 prepared 到 resolved 都返回 transaction_in_progress；已排队管理计划保留 target，扩展 watcher 保留 dirty。
 
-Maintenance.reconcile 只对齐进程内唤醒提示，配置权威始终是当前 journal。宿主 prepare 后调用一次，正常控制者持久 released／resolved 后再请求一次 readiness 立即通知。若控制者正好在最后 GET 前退出，已有配置准入、主会话唤醒或下次已认证 HTTP 入口会重读 journal、对齐提示并唤醒等待者；不产生另一种持久未完成状态，也没有文件轮询框架。私有握手先验证并形成 proof，再触发 reconcile，避免提示任务先改动配置。普通自配置与旧 self_restart 的用户接口尚未切换到事务入口，这是第三块的接线范围。
+Maintenance.reconcile 只对齐进程内唤醒提示，配置权威始终是当前 journal。宿主 prepare 后调用一次，正常控制者持久 released／resolved 后再请求一次 readiness 立即通知。若控制者正好在最后 GET 前退出，已有配置准入、主会话唤醒或下次已认证 HTTP 入口会重读 journal、对齐提示并唤醒等待者；不产生另一种持久未完成状态，也没有文件轮询框架。私有握手先验证并形成 proof，再触发 reconcile，避免提示任务先改动配置。第三块现已将 self_restart 接入事务；普通自配置默认保留进程内应用，可显式选择 restart_transaction。
 
 第二块新增四个 maintenance 测试文件，49 项离线用例已有 guard 通过证据。临时 Runtime + ASGITransport 覆盖完整 commit→activate→finalize、nonce／原实例重入观察、被动无外部启动、配置门、真实尾任务、取消与队列保留；真实激活回归修复了 private readiness 前提前 reconcile 的调度窗。首次新 HTTP fake 路由误置静态 mount 后已中止该检查并修正 fixture，没有循环重跑。
 
@@ -72,7 +72,7 @@ Maintenance.reconcile 只对齐进程内唤醒提示，配置权威始终是当�
 
 ## 交付范围与入口
 
-三个实现块全部完成后的目标是让一个已识别的 Linux 用户服务，使用**同一个受支持安装、解释器、资料库和服务入口**，把配置变更或单纯重启推进到“目标本地就绪并已放行执行”，失败时恢复本事务保存的原配置并重新证明旧实例就绪。保留最新数据库事实；恢复程序不重做未知工具或发送。以下未特别标为已实现的宿主行为仍是整体设计。
+三个实现块的接线让已识别的 Linux 用户服务使用**同一个受支持安装、解释器、资料库和服务入口**，把配置变更或单纯重启推进到“目标本地就绪并已放行执行”，失败时恢复本事务保存的原配置并重新证明旧实例就绪。保留最新数据库事实，不重做未知工具或发送。以下入口已进入开发候选，离线验收与真实服务验证边界仍分别记录。
 
 根任务已确认增加显式 `restart_transaction` 应用方式：
 

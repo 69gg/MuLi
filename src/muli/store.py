@@ -91,13 +91,26 @@ _EVIDENCE_FROM = (
 
 
 class Store:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, durable: bool = False) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(descriptor)
         path.chmod(0o600)
         self.db = sqlite3.connect(path, check_same_thread=False)
+        try:
+            self._initialize(durable=durable)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _initialize(self, *, durable: bool) -> None:
         self.db.row_factory = sqlite3.Row
+        if durable:
+            # Before schema creation or any business transaction, including on
+            # SQLite builds whose WAL default is NORMAL.
+            self.db.execute("PRAGMA synchronous=FULL")
+            if self.db.execute("PRAGMA synchronous").fetchone()[0] != 2:
+                raise ValueError("store_durability_unsupported")
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
@@ -648,6 +661,15 @@ class Store:
             if record["role"] == "user":
                 return records[index:]
         raise ValueError("当前完整用户轮次超过回放消息条数预算；原始会话仍保留，未发送残缺上下文")
+
+    def existing_main_session_id(self) -> str | None:
+        """Read the identity marker without constructing or loading a session."""
+        row = self.db.execute(
+            "SELECT CASE WHEN typeof(value)='text' "
+            "AND length(CAST(value AS BLOB)) BETWEEN 1 AND 96 THEN value END "
+            "FROM runtime_state WHERE name='main_session'"
+        ).fetchone()
+        return str(row[0]) if row is not None and row[0] is not None else None
 
     def main_session(self, mode: str = "auto") -> dict[str, Any]:
         """One durable local identity; old conversation sessions remain accessible."""

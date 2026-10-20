@@ -290,7 +290,7 @@ async def test_paused_running_channel_accepts_signed_owner_text_without_starting
             assert (await client.post("/api/channels/onebot/webhook", json={})).status_code == 401
 
 
-@pytest.mark.parametrize("action", ["configure", "restart", "update"])
+@pytest.mark.parametrize("action", ["configure", "update"])
 async def test_pending_management_plan_waits_without_losing_target_or_calling_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
