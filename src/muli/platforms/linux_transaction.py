@@ -8,11 +8,14 @@ import math
 import os
 import re
 import stat
+import sys
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from muli.management_transaction import ClockReading, TransactionError
 from muli.process import run_process
 from muli.service import UserService
 
@@ -174,6 +177,21 @@ def _read_regular(path: Path, limit: int, *, directory_fd: int | None = None) ->
     if len(data) > limit or identities[0] != identities[1] or identities[0] != identities[2]:
         raise ObservationError("observation_file_changed")
     return data
+
+
+def clock_reading(boot_id_path: Path = Path("/proc/sys/kernel/random/boot_id")) -> ClockReading:
+    """The persistent deadline uses kernel boot identity, never a unit InvocationID."""
+    if sys.platform != "linux":
+        raise TransactionError("clock_invalid")
+    try:
+        boot_id = _read_regular(boot_id_path, 128).decode("ascii").removesuffix("\n")
+        if not re.fullmatch(
+            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", boot_id
+        ):
+            raise ValueError
+        return ClockReading(boot_id=boot_id, wall=time.time(), monotonic=time.monotonic())
+    except (OSError, ValueError):
+        raise TransactionError("clock_invalid") from None
 
 
 def _start_ticks(value: bytes, pid: int) -> int:
