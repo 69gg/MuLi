@@ -15,9 +15,12 @@ import stat
 import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from muli.managed_transaction import TransactionRecordV2
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$")]
 Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -66,6 +69,9 @@ class TransactionError(ValueError):
 
 class StrictRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
+
+
+RecordT = TypeVar("RecordT", bound=StrictRecord)
 
 
 class JournalLimits(StrictRecord):
@@ -500,6 +506,25 @@ class TransactionJournal(AbstractContextManager["TransactionJournal"]):
         except ValueError:
             raise TransactionError("invalid_record") from None
 
+    def read_current(self) -> TransactionRecord | TransactionRecordV2 | None:
+        """Dispatch the one state file without widening the legacy V1 reader."""
+        from muli.managed_transaction import parse_record_v2
+
+        try:
+            data = self.directory.read("state.json", self.limits.max_record_bytes)
+        except FileNotFoundError:
+            return None
+        try:
+            values = _object(data)
+            protocol = values.get("protocol")
+            if type(protocol) is not int or protocol not in {1, 2}:
+                raise TransactionError("invalid_record")
+            if protocol == 2:
+                return parse_record_v2(data, limits=self.limits)
+            return TransactionRecord.model_validate(values)
+        except (ValueError, RecursionError):
+            raise TransactionError("invalid_record") from None
+
     def snapshot(self, record: TransactionRecord, role: Role) -> bytes:
         reference = record.base if role == "base" else record.target
         data = self.directory.read(
@@ -534,6 +559,16 @@ class JournalControl(FixedLock):
             raise
         return record
 
+    def read_current(self) -> TransactionRecord | TransactionRecordV2 | None:
+        self.check()
+        record = self.journal.read_current()
+        try:
+            os.fsync(self.directory.fd)
+        except BaseException:
+            self._poisoned = True
+            raise
+        return record
+
     def _replace(self, name: str, data: bytes) -> None:
         self.check()
         try:
@@ -542,7 +577,7 @@ class JournalControl(FixedLock):
             self._poisoned = True
             raise
 
-    def _write(self, record: TransactionRecord) -> TransactionRecord:
+    def _write(self, record: RecordT) -> RecordT:
         self.check()
         data = record.model_dump_json().encode()
         if len(data) > self.journal.limits.max_record_bytes:
