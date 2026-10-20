@@ -190,11 +190,14 @@ def run(command: list[str], seconds: int) -> int:
         "PYTHONPATH": str(Path.cwd() / "src"),
         "UV_OFFLINE": "1",
         "UV_NO_SYNC": "1",
+        "UV_PYTHON_DOWNLOADS": "never",
         "NODE_OPTIONS": f"--max-old-space-size={NODE_HEAP_MB}",
         "OMP_NUM_THREADS": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
     }
+    if cache := os.environ.get("UV_CACHE_DIR"):
+        environment["UV_CACHE_DIR"] = cache
     invocation = [
         "systemd-run",
         "--user",

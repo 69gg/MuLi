@@ -114,6 +114,9 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
         assert "--slice=muli-checks.slice" in command
         assert "--setenv=UV_OFFLINE=1" in command
         assert "--setenv=NODE_OPTIONS=--max-old-space-size=256" in command
+        assert "--setenv=UV_CACHE_DIR=/existing-uv-cache" in command
+        assert "--setenv=UV_PYTHON_DOWNLOADS=never" in command
+        assert all("PRIVATE_TEST_TOKEN" not in argument for argument in command)
         raise KeyboardInterrupt
 
     def stop(unit: str) -> bool:
@@ -121,6 +124,8 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
         return cleaned
 
     monkeypatch.setattr(checker.sys, "platform", "linux")
+    monkeypatch.setenv("UV_CACHE_DIR", "/existing-uv-cache")
+    monkeypatch.setenv("PRIVATE_TEST_TOKEN", "synthetic-not-forwarded")
     monkeypatch.setattr(checker.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setattr(checker.Path, "is_file", lambda _: True)
     monkeypatch.setattr(checker, "manager", record)

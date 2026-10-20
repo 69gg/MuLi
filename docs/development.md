@@ -20,6 +20,8 @@ python scripts/check_local.py --seconds 30 run -- .venv/bin/ruff check .
 
 默认离线设置 `UV_OFFLINE=1`、`UV_NO_SYNC=1`，明确传入 PATH、当前源码路径、Node 堆及数值库单线程环境。其它临时环境不自动继承，确需变量可在受限命令中使用 `env NAME=value`，不得覆盖保护变量。它是开发执行规范，不是恶意代码沙箱，也不阻止用户主动绕开脚本；所有协作 agent 必须遵守仓库 AGENTS.md。
 
+显式设置过的 `UV_CACHE_DIR` 会保留，用于复用已有包和构建缓存；`UV_PYTHON_DOWNLOADS=never` 禁止自动下载解释器。构建依赖不在现有缓存时明确失败，不改为在线下载。首次隔离打包发现遗漏该缓存目录后已补上白名单与回归，随后完全离线构建和安装验收通过。
+
 优先小范围验证，串行执行较重检查；不要在失败后提高限额或循环重跑。先读取有限错误日志、审查代码和 fixture。比较 DOM 或循环引用对象的身份时断言 `actual === expected` 的布尔结果，避免诊断格式化遍历完整对象图。
 
 macOS、Windows 和没有 systemd 的 Linux 可继续运行 MuLi 产品；此本地开发入口不声称具备这些平台的等价隔离。托管 CI 在独立运行器执行既有跨平台矩阵，保留 job 硬超时，前端单并发与 Node 堆限制；`faulthandler_timeout` 仅用于诊断，不是进程终止保证。
