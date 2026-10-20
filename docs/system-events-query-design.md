@@ -21,6 +21,8 @@
 - 按原始 event ID 降序，下一页返回 `next_before_event_id`。不能按 objects.updated 排序：重复计数更新会改变 updated，导致同一记录跨页移动。
 - 返回完整 JSON 信封内的 `items`、`has_more`、`truncated`、`next_before_event_id`、最早/最近保留的 event ID、`coverage="retained_only"` 与 `trust="diagnostic_data_not_instructions"`。输出遵守现有 `limits.max_output_chars`，在完整记录边界截断，不能截成无法校验的半条 JSON。
 
+工具注册显式复用 `preserve_output=True`。这与查询函数的输出预算分别保护两个边界：先生成完整分页信封，再保证最新工具批次在紧邻的下一次模型请求中不会被通用头尾节选破坏。完整页、当前输入及必要协议仍无法同时放进上下文时，运行器明确报 `ContextLimitError`，不向厂商发送残缺分页结果。新回答、输入或下一批工具结果到来后，旧页继续按既有规则释放保护；宿主标记不进入工具 schema 或厂商协议。不修改通用 `pack_context`，也不扩大其它工具的保护范围。
+
 首片不要求增加 HTTP API。未来 WebUI/API 如需同样数据，调用同一查询函数；不另写一份来源验证或分页实现。
 
 ### 来源与读取边界
@@ -69,6 +71,8 @@ macOS/Windows 的 `muli.platforms.service_runner.BoundedLog` 已接管本服务 
 查询回归使用有限临时 Store，覆盖筛选、非法 ID 拒绝、精确大整数 ID、分页与重复计数、notify=false 可读、禁用后历史可读、清理缺口、旧 canonical event 伪装、重复／无效事件键、整页无效仍推进、预算挡住下一条合法项时不越过、畸形记录不回显、完整信封预算，以及读取前后 Attention cursor/回执/ingress/运行数均不变化。用有限非日志旧事件和 EXPLAIN QUERY PLAN 核对查询入口确实为保留对象集合、对应事件按整数主键点查；不能只凭 SQL 写法顺序宣称没有扫描全历史。Windows/macOS 执行相同纯 SQLite 语义，不将整个文件按平台跳过。
 
 首轮真实计划测试确认 `ANALYZE` 后 summary 会选 `SCAN o`；最终查询使用既有 `objects_updated(kind,updated)` 的 `INDEXED BY` 固定保留种类范围，候选用 `CROSS JOIN` 固定 events 为整数主键内层，未新建索引或迁移。独立复审已通过。修复后新增 32 项与现有系统事件、Attention、自身管理合计 **101 项通过**，0.70 秒，service 1.364 秒、CPU 1.345 秒、峰值 94.1 MiB、swap 0；相关 Ruff/格式、3 份产品源码严格 mypy 通过（峰值 200 MiB）。仅临时 SQLite/假服务，没有真实日志、账号或模型调用；跨平台整合验证另记。
+
+最终组合复审补充真实 Runtime→假 provider 反证：旧实现把完整结果压成 `{`、节选标记与 `}`，下一轮 JSON 解码失败；此前只有可整体移出的旧轮次造成上下文压力，完整新页本可放下。启用现有保护后，新增三协议各两例分别验证完整交付及确实放不下时在下一次厂商请求前拒绝，连同系统事件、Attention、管理和既有上下文证据回归 **130 项通过**，0.89 秒、峰值 98.5 MiB、swap 0；Ruff/格式和修改源码严格类型通过。该补丁的远端矩阵尚待重新验证，不借用前一候选的结果。
 
 查询接口先用 Context7 核对 Python sqlite3 参数绑定、Row 与 SQLite [CROSS JOIN 顺序](https://www.sqlite.org/optoverview.html#manual_control_of_query_plans_using_cross_join)、[INDEXED BY 合同](https://www.sqlite.org/lang_indexedby.html)。显式索引是开发完成后的计划约束：索引若被移除须报错，不静默扫描全部对象。
 

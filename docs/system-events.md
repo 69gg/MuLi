@@ -1,6 +1,6 @@
 # 有界系统日志事件
 
-状态：2.14 候选，尚未发行。独立模块已接入 Runtime、配置、Attention 与应用状态；整版验证记录见[评审](review-v2.14.md)。当前自动生产边界是主助手、队友和工作流实际 Runtime 执行失败；它不宣称已经收集所有第三方日志或所有组件的被捕获异常。
+状态：2.14 已发布；2.15 的 `self_events` 仍在候选验证中。独立模块已接入 Runtime、配置、Attention 与应用状态；整版验证记录见[评审](review-v2.14.md)。当前自动生产边界是主助手、队友和工作流实际 Runtime 执行失败；它不宣称已经收集所有第三方日志或所有组件的被捕获异常。
 
 配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 只关闭既有 reminder/update/management 三类。
 
@@ -38,6 +38,8 @@ system_events / attention 组件不能再次通知；明确 notify=false 的上�
 `self_events` 为只读工具，查询已保留的固定错误元数据；`self_logs` 继续按需读取服务日志。可按精确 `level`、`component`、`code`、`run_id`、`session_id` 过滤，默认 20 条，最多 100 条。`before_event_id` 使用规范十进制字符串，按创建事件 ID 降序翻页，避免大整数精度丢失。重复计数更新不会改变位置，计数反映本次读取时的值。
 
 结果提供 `items`、`next_before_event_id`、`has_more`、`truncated`、保留 ID 范围及无效/无法关联证据计数，只返回白名单字段。每条必须与 canonical `system.log` 事件一致；无效页仍推进游标，不回显畸形内容。完整 JSON 信封按工具输出预算截断，不跨过放不下的下一条；连首条都放不下时明确报 `output_budget`。
+
+`self_events` 复用宿主 `preserve_output` 合同：最新完整工具批次的分页结果在紧邻的下一次模型请求中保持完整，不会只留下游标与头尾节选。当前上下文确实容纳不下时明确报 `ContextLimitError`，完整已存结果仍可核查；不会发送半条 JSON 或重做查询之外的操作。模型读取后，旧页按既有规则节选或移出，不永久占据上下文；保护标记不进入工具 schema 或厂商请求。
 
 关闭采集或通知不会隐藏已有历史，`notify=false` 也可读取。查询不推进 Attention 游标，不新增通知、回执或运行。`coverage="retained_only"` 表示仅覆盖当前保留集合，缺口不一定是连续前缀，空页不能证明从未发生错误。不会查询全部会话事件，也不会把异常正文当作指令。设计与尚未实施的原生日志留存增强见[查询设计](system-events-query-design.md)。
 
