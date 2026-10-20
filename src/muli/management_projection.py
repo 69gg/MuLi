@@ -10,13 +10,16 @@ import os
 import sqlite3
 import stat
 import sys
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from muli.maintenance import BootPermit
-from muli.management_transaction import ProjectionReceipt, TransactionRecord, _object
+from muli.managed_boot import ManagedBootPermit
+from muli.managed_transaction import TransactionRecordV2
+from muli.management_transaction import ProjectionReceipt, Role, TransactionRecord, _object
 from muli.platforms.transaction_files import _open_directory
 from muli.store import Store, now
 
@@ -127,7 +130,7 @@ def read_projection(store: Store) -> ProjectionReceipt | None:
     return _read_projection(store, _connection_identity(store))
 
 
-def _check_lease(permit: BootPermit) -> None:
+def _check_lease(permit: BootPermit | ManagedBootPermit) -> None:
     lease = permit.lease
     lease.check()
     expected, actual = os.fstat(permit.journal.writer_directory.fd), os.fstat(lease.directory.fd)
@@ -139,7 +142,9 @@ def _check_lease(permit: BootPermit) -> None:
 
 
 def _check_identity(
-    permit: BootPermit, identity: _StoreIdentity, record: TransactionRecord
+    permit: BootPermit | ManagedBootPermit,
+    identity: _StoreIdentity,
+    record: TransactionRecord | TransactionRecordV2,
 ) -> None:
     if identity.path != permit.journal.database or (identity.instance, identity.main) != (
         record.identity.store_instance,
@@ -148,7 +153,12 @@ def _check_identity(
         raise ProjectionError("projection_store_identity_changed")
 
 
-def project_final(permit: BootPermit | None, store: Store) -> ProjectionReceipt | None:
+def project_final(
+    permit: BootPermit | ManagedBootPermit | None,
+    store: Store,
+    *,
+    verify_binding: Callable[[TransactionRecordV2, Role | None], None] | None = None,
+) -> ProjectionReceipt | None:
     """Atomically project one stable resolved record; repeated exact calls are reads."""
     if permit is None:
         return None
@@ -156,7 +166,7 @@ def project_final(permit: BootPermit | None, store: Store) -> ProjectionReceipt 
     identity = _connection_identity(store)
     if identity.path != permit.journal.database:
         raise ProjectionError("projection_store_identity_changed")
-    record = permit.journal.read()
+    record = permit.journal.read_current()
     if record is None:
         return None
     _check_identity(permit, identity, record)
@@ -165,7 +175,7 @@ def project_final(permit: BootPermit | None, store: Store) -> ProjectionReceipt 
     # A lock-free read of a visible rename is not its durability receipt. The
     # resolved record must remain exact across the directory sync barrier.
     os.fsync(permit.journal.directory.fd)
-    if permit.journal.read() != record:
+    if permit.journal.read_current() != record:
         raise ProjectionError("projection_journal_changed")
     _check_lease(permit)
     receipt = ProjectionReceipt(**record.position.model_dump(), store_instance=identity.instance)
@@ -174,7 +184,16 @@ def project_final(permit: BootPermit | None, store: Store) -> ProjectionReceipt 
         return receipt
     if previous is not None and previous.generation == receipt.generation:
         raise ProjectionError("projection_revision_conflict")
-    if (permit.installation, permit.service) != (
+    if isinstance(record, TransactionRecordV2):
+        if verify_binding is None:
+            raise ProjectionError("projection_binding_required")
+        role: Role | None = (
+            None
+            if permit.boot == record.identity.origin_boot
+            else ("target" if record.phase == "committed" else "base")
+        )
+        verify_binding(record, role)
+    elif not isinstance(permit, BootPermit) or (permit.installation, permit.service) != (
         record.identity.installation,
         record.identity.service,
     ):
@@ -212,6 +231,9 @@ def project_final(permit: BootPermit | None, store: Store) -> ProjectionReceipt 
     final.pop("error", None)
     if status == "failed":
         final["error"] = record.failure_code or record.code or "transaction_failed"
+    _check_lease(permit)
+    if permit.journal.read_current() != record:
+        raise ProjectionError("projection_journal_changed")
     store.event(
         "management.completed",
         final,
