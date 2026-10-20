@@ -27,12 +27,15 @@ def mount(
     path: Path,
     filesystem: bytes = b"ext4",
     *,
+    root: bytes = b"/",
     options: bytes = b"rw,relatime",
     super_options: bytes = b"rw",
 ) -> bytes:
     return (
         str(identifier).encode()
-        + b" 1 0:999 / "
+        + b" 1 0:999 "
+        + root
+        + b" "
         + escaped(path)
         + b" "
         + options
@@ -113,6 +116,61 @@ def test_unknown_or_volatile_filesystems_fail_closed(host: Host, filesystem: byt
     host.write(mount(10, host.root, filesystem))
     with pytest.raises(fs.FilesystemError, match="^filesystem_unsupported$"):
         host.verify()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_opaque_unrelated_mount_root_does_not_reject_local_directories(
+    host: Host, reverse: bool
+) -> None:
+    rows = (
+        mount(10, host.root, b"btrfs"),
+        mount(20, Path("/run/netns/fixture"), b"nsfs", root=b"net:[4026532671]"),
+    )
+    host.write(*(reversed(rows) if reverse else rows))
+    host.verify()
+    assert len(host.opened) == 2 * len(host.directories)
+
+
+def test_opaque_root_does_not_grant_filesystem_support(host: Host) -> None:
+    host.write(mount(10, host.root, b"nsfs", root=b"net:[4026532671]"))
+    with pytest.raises(fs.FilesystemError, match="^filesystem_unsupported$"):
+        host.verify()
+
+
+@pytest.mark.parametrize(
+    ("root", "code"),
+    [
+        (b"net:[1]\\041", "filesystem_invalid_observation"),
+        (b"net:[1]\\", "filesystem_invalid_observation"),
+        (b"net:[1]\x00", "filesystem_invalid_observation"),
+        (b"net:[1] extra", "filesystem_invalid_path"),
+    ],
+)
+def test_unrelated_opaque_roots_still_reject_malformed_fields(
+    host: Host, root: bytes, code: str
+) -> None:
+    host.write(mount(10, host.root), mount(20, Path("/run/netns/fixture"), b"nsfs", root=root))
+    with pytest.raises(fs.FilesystemError, match=f"^{code}$"):
+        host.verify()
+    assert not host.opened
+
+
+def test_opaque_mount_root_remains_bounded(host: Host) -> None:
+    host.write(
+        mount(10, host.root),
+        mount(20, Path("/run/netns/fixture"), b"nsfs", root=b"n" * 129),
+    )
+    with pytest.raises(fs.FilesystemError, match="^filesystem_invalid_path$"):
+        host.verify(fs.FilesystemLimits(path_bytes=128))
+    assert not host.opened
+
+
+@pytest.mark.parametrize("path", [Path("net:[1]"), Path("/bad/../directory"), Path("//bad")])
+def test_mountpoints_still_require_absolute_paths_without_traversal(host: Host, path: Path) -> None:
+    host.write(mount(10, path, root=b"net:[4026532671]"))
+    with pytest.raises(fs.FilesystemError, match="^filesystem_invalid_path$"):
+        host.verify()
+    assert not host.opened
 
 
 @pytest.mark.parametrize("reverse", [False, True])

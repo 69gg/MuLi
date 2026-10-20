@@ -101,7 +101,7 @@ def _path(path: Path, limit: int) -> Path:
     return path
 
 
-def _unescape(value: bytes, limit: int) -> Path:
+def _unescape(value: bytes, limit: int) -> bytes:
     parts = value.split(b"\\")
     decoded = bytearray(parts[0])
     for part in parts[1:]:
@@ -109,7 +109,9 @@ def _unescape(value: bytes, limit: int) -> Path:
             raise FilesystemError("filesystem_invalid_observation")
         decoded.extend(_ESCAPES[part[:3]])
         decoded.extend(part[3:])
-    return _path(Path(os.fsdecode(bytes(decoded))), limit)
+    if len(decoded) > limit:
+        raise FilesystemError("filesystem_invalid_path")
+    return bytes(decoded)
 
 
 def _options(value: bytes) -> frozenset[bytes]:
@@ -140,10 +142,12 @@ def _mounts(data: bytes, limits: FilesystemLimits) -> dict[int, _Mount]:
             raise FilesystemError("filesystem_invalid_observation")
         for component in device:
             _number(component)
+        # The unused filesystem root may be opaque, e.g. nsfs net:[inode].
         _unescape(head[3], limits.path_bytes)
-        result[identifier] = _Mount(
-            _unescape(head[4], limits.path_bytes), tail[0], _options(head[5]), _options(tail[2])
+        mountpoint = _path(
+            Path(os.fsdecode(_unescape(head[4], limits.path_bytes))), limits.path_bytes
         )
+        result[identifier] = _Mount(mountpoint, tail[0], _options(head[5]), _options(tail[2]))
         # Unknown optional tags are intentionally ignored, as the kernel specifies.
     return result
 
