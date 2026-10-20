@@ -22,6 +22,8 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 接口依据通过 Context7 核对 [systemd journalctl](https://github.com/systemd/systemd/blob/main/src/journal/journalctl.c)。使用原生 journal 优先级过滤并不等同识别 Python 文本中的 `ERROR`；本工具保留最近日志，不伪称已实现跨平台级别告警。
 
+`self_events({"limit":20,"level":"error"})` 可分页回查保留的系统事件元数据，支持组件、错误代码和运行/会话 ID 精确过滤；继续翻页使用返回的 `next_before_event_id` 字符串。它与 `self_logs` 一样是只读诊断，不触发通知；关闭采集后仍可读已有记录，结果仅代表当前保留集合。完整合同见[系统事件](system-events.md)。
+
 ## 插件目录
 
 默认在 `~/MuLi/plugins/<id>/`（自定义配置位置时位于配置旁）。插件是用户信任的 Python 代码，可使用与进程相同的权限，不是隔离沙箱。内置文件工具保护源码参考与已安装模块；shell 和插件仍有用户权限，不能把路径规则当操作系统沙箱。

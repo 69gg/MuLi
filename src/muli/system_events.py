@@ -499,23 +499,29 @@ def _management_source(
     )
 
 
-def _log_source(
-    store: Store,
+def validated_log_record(
+    record: dict[str, Any] | None,
     event: dict[str, Any],
-    enabled: Collection[str],
-    policy: SystemEventsSettings | None,
-) -> AttentionSource | None:
-    if policy is None or not policy.enabled or not policy.notify_enabled:
-        return None
-    data, identifier = event["data"], event["data"]["id"]
-    record = store.get("system_log", identifier)
+) -> dict[str, Any] | None:
+    """Validate retained evidence independently of whether it should notify."""
+    data = event.get("data")
     if (
         record is None
-        or record.get("event_id") != event["id"]
+        or type(data) is not dict
+        or any(
+            key not in record for key in (*_SOURCE_FIELDS, "last_at", "count", "source", "event_id")
+        )
+        or any(key not in data for key in _SOURCE_FIELDS)
+        or event.get("type") != "system.log"
+        or event.get("session_id") is not None
+        or type(record.get("id")) is not str
+        or re.fullmatch(r"[A-Za-z0-9:._+\-]{1,160}", record["id"]) is None
+        or record.get("event_id") != event.get("id")
         or record.get("source") != "python_logging"
         or type(event.get("id")) is not int
+        or event["id"] <= 0
         or type(record.get("event_id")) is not int
-        or record.get("notify") is not True
+        or type(record.get("notify")) is not bool
         or any(data.get(field) != record.get(field) for field in _SOURCE_FIELDS)
     ):
         return None
@@ -523,10 +529,8 @@ def _log_source(
     if (
         type(level) is not str
         or level not in _LEVELS
-        or _LEVELS[level] < _LEVELS[policy.notify_level]
         or type(component) is not str
         or component not in _COMPONENTS
-        or component in {"attention", "system_events"}
         or type(code) is not str
         or code not in _CODES
         or type(record.get("count")) is not int
@@ -540,6 +544,26 @@ def _log_source(
         value = record.get(field)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value < 1e12:
             return None
+    return {key: record[key] for key in (*_SOURCE_FIELDS, "last_at", "count", "source", "event_id")}
+
+
+def _log_source(
+    store: Store,
+    event: dict[str, Any],
+    enabled: Collection[str],
+    policy: SystemEventsSettings | None,
+) -> AttentionSource | None:
+    if policy is None or not policy.enabled or not policy.notify_enabled:
+        return None
+    identifier = event["data"]["id"]
+    record = validated_log_record(store.get("system_log", identifier), event)
+    if (
+        record is None
+        or record["notify"] is not True
+        or _LEVELS[record["level"]] < _LEVELS[policy.notify_level]
+        or record["component"] in {"attention", "system_events"}
+    ):
+        return None
     detail = json.dumps(
         {key: record[key] for key in (*_SOURCE_FIELDS[1:], "last_at", "count")}, ensure_ascii=False
     )
