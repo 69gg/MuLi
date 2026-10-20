@@ -14,12 +14,13 @@ import pytest
 from test_mcp import FakeClient
 from test_runtime import FakeClient as ModelClient
 
-from muli.config import ConfigFile, Settings, default_home
+from muli.config import ConfigFile, Settings, SkillsSettings, default_home
 from muli.extensions import ExtensionError, MCPDirectory
 from muli.management import SelfManagement
 from muli.providers import Message, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.server import create_app
+from muli.skills import SkillLoadError, SkillSnapshot, _secure_read_supported
 from muli.tools.mcp import MCPClient, MCPManager, MCPPrepareError
 
 
@@ -51,6 +52,222 @@ def fragment(tmp_path: Path, name: str, value: dict[str, Any]) -> Path:
     path = root / name
     path.write_text(json.dumps(value), encoding="utf-8")
     return path
+
+
+async def watch_until_reloaded(runtime: Runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+    published = asyncio.Event()
+    original = runtime.extensions.apply_locked
+
+    async def observe(target: Settings, *, persist: bool) -> None:
+        await original(target, persist=persist)
+        published.set()
+
+    monkeypatch.setattr(runtime.extensions, "apply_locked", observe)
+    runtime.extensions.start()
+    async with asyncio.timeout(2):
+        await published.wait()
+
+
+@pytest.mark.parametrize("valid_initial_source", [True, False])
+async def test_initial_mcp_source_change_is_not_acknowledged_as_the_prepared_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_initial_source: bool
+) -> None:
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    class GatedList(FakeClient):
+        async def list_tools(self) -> list[Any]:
+            ready.set()
+            await release.wait()
+            return await super().list_tools()
+
+    runtime = setup_runtime(tmp_path)
+    runtime.config.settings.extensions.watch_enabled = True
+    path = fragment(tmp_path, "changing.json", {"mcpServers": {"before": server("before")}})
+    if not valid_initial_source:
+        path.write_text('{"mcpServers": {}, "mcpServers": {}}', encoding="utf-8")
+    clients: list[FakeClient] = []
+
+    def factory(config: dict[str, Any], timeout: float) -> MCPClient:
+        client = GatedList() if not clients else FakeClient()
+        clients.append(client)
+        return client
+
+    runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=factory)
+    operation: asyncio.Task[None] | None = None
+    try:
+        operation = asyncio.create_task(runtime.extensions.load_initial())
+        async with asyncio.timeout(2):
+            await ready.wait()
+        fragment(tmp_path, "changing.json", {"mcpServers": {"after": server("after")}})
+        release.set()
+        async with asyncio.timeout(2):
+            await operation
+        await watch_until_reloaded(runtime, monkeypatch)
+        assert {item["name"] for item in runtime.mcp.status()} == {"old", "after"}
+        assert runtime.extensions.phase == "loaded"
+        assert runtime.extensions.status()["error"] is None
+    finally:
+        release.set()
+        if operation is not None:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.skipif(not _secure_read_supported(), reason="Skills 安全读取需 dir_fd/O_NOFOLLOW")
+async def test_initial_skill_source_change_is_not_acknowledged_as_the_prepared_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = setup_runtime(tmp_path)
+    runtime.config.settings.extensions.watch_enabled = True
+    runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: FakeClient())
+    path = tmp_path / "skills" / "example" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    header = "---\nname: example\ndescription: 门控技能\n---\n"
+    path.write_text(header + "旧指导", encoding="utf-8")
+    original = runtime.extensions.skills.prepare
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def paused_prepare(settings: SkillsSettings) -> SkillSnapshot:
+        snapshot = await original(settings)
+        if not ready.is_set():
+            ready.set()
+            await release.wait()
+        return snapshot
+
+    monkeypatch.setattr(runtime.extensions.skills, "prepare", paused_prepare)
+    operation: asyncio.Task[None] | None = None
+    try:
+        operation = asyncio.create_task(runtime.extensions.load_initial())
+        async with asyncio.timeout(2):
+            await ready.wait()
+        path.write_text(header + "新指导", encoding="utf-8")
+        release.set()
+        async with asyncio.timeout(2):
+            await operation
+        await watch_until_reloaded(runtime, monkeypatch)
+        assert runtime.extensions.skills._snapshot.entries[0].body == "新指导"
+        assert runtime.extensions.phase == "loaded"
+    finally:
+        release.set()
+        if operation is not None:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_unscannable_initial_directory_keeps_inline_tools_available(tmp_path: Path) -> None:
+    runtime = setup_runtime(tmp_path)
+    (tmp_path / "mcp.d").write_text("不是目录", encoding="utf-8")
+    client = FakeClient()
+    runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: client)
+    try:
+        await runtime.extensions.load_initial()
+        assert client.entered == 1 and len(runtime.mcp.tools) == 1
+        assert runtime.extensions.status()["error"]["code"] == "source_not_directory"
+        assert runtime.extensions.phase == "failed"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("fingerprint_failure", ["none", "skill", "os"])
+async def test_bad_initial_skills_source_does_not_block_inline_or_core_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fingerprint_failure: str
+) -> None:
+    runtime = setup_runtime(tmp_path)
+    (tmp_path / "skills").write_text("不是技能目录", encoding="utf-8")
+    client = FakeClient()
+    runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: client)
+
+    async def unavailable_fingerprint(settings: SkillsSettings) -> str:
+        if fingerprint_failure == "skill":
+            raise SkillLoadError("source_unavailable")
+        raise OSError("temporary fingerprint failure")
+
+    if fingerprint_failure != "none":
+        monkeypatch.setattr(runtime.extensions.skills, "fingerprint", unavailable_fingerprint)
+    try:
+        await runtime.extensions.load_initial()
+        assert client.entered == 1 and len(runtime.mcp.tools) == 1
+        assert "skill_read" in runtime.tools
+        assert runtime.extensions.status()["error"]["code"] == "directory_not_regular"
+        assert runtime.extensions.phase == "failed"
+    finally:
+        await runtime.close()
+
+
+async def test_unpublished_reconfiguration_reobserves_same_source_after_fingerprint_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = setup_runtime(tmp_path)
+    runtime.config.settings.extensions.watch_enabled = True
+    runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: FakeClient())
+    try:
+        await runtime.extensions.load_initial()
+        await runtime.reconfigure()
+        runtime.mcp = MCPManager(
+            runtime.config.settings.mcp, client_factory=lambda *_: FakeClient()
+        )
+        original = runtime.extensions.fingerprint
+        scans = 0
+
+        async def interrupted_fingerprint(settings: Settings) -> str:
+            nonlocal scans
+            scans += 1
+            if scans == 2:
+                raise SkillLoadError("source_unavailable")
+            return await original(settings)
+
+        monkeypatch.setattr(runtime.extensions, "fingerprint", interrupted_fingerprint)
+        await runtime.extensions.load_initial()
+        assert runtime.extensions.phase == "failed"
+        assert runtime.mcp.tools == []
+        await watch_until_reloaded(runtime, monkeypatch)
+        assert runtime.extensions.phase == "loaded"
+        assert {item["name"] for item in runtime.mcp.status()} == {"old"}
+    finally:
+        await runtime.close()
+
+
+async def test_initial_source_recheck_cannot_publish_after_extensions_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = setup_runtime(tmp_path)
+    client = FakeClient()
+    runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: client)
+    original = runtime.extensions.fingerprint
+    ready, release = asyncio.Event(), asyncio.Event()
+    scans = 0
+
+    async def paused_fingerprint(settings: Settings) -> str:
+        nonlocal scans
+        value = await original(settings)
+        scans += 1
+        if scans == 2:
+            ready.set()
+            await release.wait()
+        return value
+
+    monkeypatch.setattr(runtime.extensions, "fingerprint", paused_fingerprint)
+    operation: asyncio.Task[None] | None = None
+    try:
+        operation = asyncio.create_task(runtime.extensions.load_initial())
+        async with asyncio.timeout(2):
+            await ready.wait()
+        await runtime.extensions.close()
+        release.set()
+        async with asyncio.timeout(2):
+            await operation
+        assert runtime.extensions.generation == 0
+        assert runtime.mcp.tools == []
+        assert client.closed == 1
+        assert runtime.extensions.status()["error"]["code"] == "runtime_closed"
+    finally:
+        release.set()
+        if operation is not None:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        await runtime.close()
 
 
 async def test_full_configuration_cannot_discard_an_unclosed_mcp_generation(

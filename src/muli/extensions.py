@@ -269,10 +269,16 @@ class Extensions:
             raise ExtensionError("runtime_closed")
         settings = self.runtime.config.settings
         self._closed = False
+        self._observed = ""
         self.phase, self._error = "preparing", None
         requested = self._requested
         error: ExtensionError | None = None
+        fingerprint: str | None = None
         sources: tuple[str, ...] = ()
+        try:
+            fingerprint = await self.fingerprint(settings)
+        except Exception as exc:
+            error = self._failure(exc)
         try:
             source = await file_io(MCPDirectory(settings).prepare)
             config, sources = source.config, source.sources
@@ -292,6 +298,9 @@ class Extensions:
                     snapshot = await self.skills.prepare(settings.skills)
                 except Exception as exc:
                     error = self._failure(exc)
+                if fingerprint is not None and await self.fingerprint(settings) != fingerprint:
+                    # Do not acknowledge a source that this candidate did not read.
+                    raise ExtensionError("source_changed")
                 if self._closed or self.runtime._closing:
                     raise ExtensionError("runtime_closed")
                 self.runtime.mcp.publish(candidate)
@@ -306,8 +315,9 @@ class Extensions:
                 }
                 self.generation += 1
                 self._sources = sources
-                self._observed = await self.fingerprint(settings)
-                self._fingerprint = self._observed
+                # An unavailable scan can still serve inline/core tools, but has
+                # no accepted directory identity; recovery must trigger a reload.
+                self._observed = self._fingerprint = fingerprint or ""
                 if self._requested == requested:
                     self._dirty = False
                     self._refresh.clear()
@@ -321,12 +331,17 @@ class Extensions:
                 else:
                     self.phase, self._error = "loaded", None
         except asyncio.CancelledError:
-            if candidate is not None and not published:
-                await self.runtime.mcp.discard(candidate)
+            if not published:
+                self._observed = ""
+                if candidate is not None:
+                    await self.runtime.mcp.discard(candidate)
             raise
         except Exception as exc:
-            if candidate is not None and not published:
-                await self.runtime.mcp.discard(candidate)
+            if not published:
+                # Re-observe even unchanged sources after a failed full rebuild.
+                self._observed = ""
+                if candidate is not None:
+                    await self.runtime.mcp.discard(candidate)
             self._failure(exc)
 
     def start(self) -> None:
