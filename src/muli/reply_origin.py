@@ -3,13 +3,86 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 MAX_ROUTE_CHARS = 4096
 MAX_ORIGIN_ID_CHARS = 512
 _ROUTE_FIELDS = ("name", "account_id", "target", "sender_id", "kind", "reply_to")
 _ROUTE_FIELD_CHARS = 200
+
+
+class ChannelBinding(Protocol):
+    @property
+    def account_id(self) -> str: ...
+
+    @property
+    def app_id(self) -> str: ...
+
+    @property
+    def user_id(self) -> str: ...
+
+    def secret(self, name: str) -> str: ...
+
+
+class RouteError(ValueError):
+    def __init__(self, message: str, *, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def channel_account(name: str, profile: ChannelBinding) -> str:
+    if profile.account_id or profile.app_id or profile.user_id:
+        return profile.account_id or profile.app_id or profile.user_id
+    if name == "telegram":
+        prefix = profile.secret("token").partition(":")[0]
+        if prefix.isdigit():
+            return prefix
+    return "bot"
+
+
+def authorize_route(
+    name: str,
+    route: Mapping[str, Any],
+    *,
+    account_id: str,
+    owner_ids: Collection[str],
+    allowed_groups: Collection[str],
+    outbound: bool,
+) -> dict[str, Any]:
+    """Shared binding checks for a complete candidate config and the live transport."""
+    sender, target, kind = route.get("sender_id"), route.get("target"), route.get("kind", "private")
+    if (
+        any(
+            not isinstance(value, str) or not value or len(value) > _ROUTE_FIELD_CHARS
+            for value in (sender, target)
+        )
+        or not isinstance(kind, str)
+        or kind not in {"private", "group"}
+    ):
+        raise RouteError("渠道路由需要真实 sender_id/target/kind")
+    if route.get("name", name) != name or route.get("account_id", account_id) != account_id:
+        raise RouteError("渠道路由账号不匹配")
+    if kind == "group" and target not in allowed_groups:
+        raise RouteError("此群未在 allowed_groups 中绑定", status_code=403)
+    if kind == "private" and target != sender:
+        raise RouteError("私聊目标与真实 sender_id 不一致", status_code=403)
+    if outbound and sender not in owner_ids:
+        raise RouteError("渠道收件人未绑定 owner_ids", status_code=403)
+    result = {
+        "name": name,
+        "account_id": account_id,
+        "target": target,
+        "sender_id": sender,
+        "kind": kind,
+    }
+    reply = route.get("reply_to")
+    if reply:
+        if not isinstance(reply, str) or len(reply) > _ROUTE_FIELD_CHARS:
+            raise RouteError("渠道 reply_to 无效")
+        result["reply_to"] = reply
+    return result
 
 
 def _route_json(value: object) -> str:

@@ -406,7 +406,11 @@
     },
     "max_pending_deliveries": 64,
     "max_attempts": 3,
-    "retry_backoff_seconds": 5.0
+    "retry_backoff_seconds": 5.0,
+    "proactive": {
+      "external_enabled": false,
+      "default_destination": { "kind": "web" }
+    }
   },
   "chiliarch": {
     "enabled": false,

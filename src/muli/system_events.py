@@ -19,6 +19,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from muli.events import EventBus
+from muli.proactive import FrozenRouting
 from muli.store import Store, new_id
 
 LogLevel = Literal["warning", "error", "critical"]
@@ -431,6 +432,7 @@ class AttentionSource:
     record_id: str
     detail: str
     logical_key: str
+    routing: FrozenRouting = FrozenRouting()
 
 
 def _notification_source(
@@ -443,7 +445,16 @@ def _notification_source(
     notice = store.get("notification", identifier)
     if notice is None or any(
         data.get(field) != notice.get(field)
-        for field in ("id", "title", "content", "source", "reminder_id", "created_at")
+        for field in (
+            "id",
+            "title",
+            "content",
+            "source",
+            "reminder_id",
+            "created_at",
+            "routing",
+            "producer",
+        )
     ):
         return None
     kind = notice.get("source")
@@ -451,6 +462,7 @@ def _notification_source(
         return None
     if not isinstance(notice.get("title"), str) or not isinstance(notice.get("content"), str):
         return None
+    routing = FrozenRouting.load(notice.get("routing"))
     if kind == "reminder":
         reminder_id = notice.get("reminder_id")
         if not isinstance(reminder_id, str):
@@ -460,6 +472,8 @@ def _notification_source(
             reminder is None
             or not reminder.get("fired_count")
             or not identifier.startswith(f"reminder:{reminder_id}:")
+            or routing != FrozenRouting.load(reminder.get("routing"))
+            or routing.classification == "independent"
         ):
             return None
     else:
@@ -469,10 +483,18 @@ def _notification_source(
             or update.get("available") is not True
             or update.get("status") != "checked"
             or identifier != "update-" + str(update.get("latest", ""))
+            or (
+                routing.classification == "independent"
+                and notice.get("producer") != "startup_update_check"
+            )
         ):
             return None
     return AttentionSource(
-        kind, identifier, notice["title"] + "\n" + notice["content"], "notification:" + identifier
+        kind,
+        identifier,
+        notice["title"] + "\n" + notice["content"],
+        "notification:" + identifier,
+        routing,
     )
 
 
@@ -490,12 +512,17 @@ def _management_source(
         plan is None
         or plan.get("status") not in {"completed", "failed"}
         or plan.get("action") not in {"configure", "restart", "update"}
-        or any(data.get(field) != plan.get(field) for field in ("status", "action"))
+        or any(data.get(field) != plan.get(field) for field in ("status", "action", "routing"))
+        or FrozenRouting.load(plan.get("routing")).classification == "independent"
     ):
         return None
     detail = json.dumps({"action": plan["action"], "status": plan["status"]}, ensure_ascii=False)
     return AttentionSource(
-        "management", identifier, detail, f"management:{identifier}:{plan['status']}"
+        "management",
+        identifier,
+        detail,
+        f"management:{identifier}:{plan['status']}",
+        FrozenRouting.load(plan.get("routing")),
     )
 
 

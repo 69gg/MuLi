@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from muli.attachments import Attachments
 from muli.channels import ChannelManager, ChannelProfile, ChannelsConfig
+from muli.proactive import FrozenRouting, guard_delivery
 from muli.runtime import Runtime
 from muli.tools import Tool, parameters, string
 
@@ -19,6 +21,7 @@ class ChannelApplication:
 
     def _manager(self) -> ChannelManager:
         data = self.runtime.config.settings.channels.model_dump()
+        data.pop("proactive")
         expected = self.runtime.config.settings.channels.model_dump()
         generation = self._generation
 
@@ -32,6 +35,9 @@ class ChannelApplication:
 
             return await self.runtime.submit(**kwargs, admission_guard=guard)
 
+        def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:
+            guard_delivery(self.runtime.config.settings, route, metadata)
+
         for name in ("onebot", "telegram", "qq", "weixin"):
             data[name] = ChannelProfile(**data[name])
         return ChannelManager(
@@ -40,7 +46,22 @@ class ChannelApplication:
             ChannelsConfig(**data),
             submit,
             self.attachments,
+            delivery_guard=delivery_guard,
         )
+
+    def status(self) -> dict[str, Any]:
+        settings = self.runtime.config.settings
+        selected = FrozenRouting.independent(settings)
+        return {
+            **self.manager.status(),
+            "proactive": {
+                **settings.channels.proactive.model_dump(),
+                "next_destination": selected.dump()["destination"],
+                "attention_enabled": settings.attention.enabled,
+                "model_configured": settings.models.main.configured,
+                "independent_sources": ["startup_update_check"],
+            },
+        }
 
     async def start(self) -> None:
         await self.manager.start()
@@ -56,7 +77,7 @@ class ChannelApplication:
 
     def tools(self, runtime: Runtime) -> list[Tool]:
         async def status(args: dict[str, Any]) -> Any:
-            return {**self.manager.status(), "deliveries": self.manager.deliveries()}
+            return {**self.status(), "deliveries": self.manager.deliveries()}
 
         async def send(args: dict[str, Any]) -> Any:
             key = args.get("idempotency_key")

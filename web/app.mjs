@@ -1,7 +1,7 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
-import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
+import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, selectProactiveDestination, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
@@ -2162,8 +2162,35 @@ function renderChannelSettings() {
       status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ["允许的群组", String(status.group_count ?? 0)]]),
       status?.last_error && element("p", { class: "form-error", text: status.last_error })));
   }
-  root.append(settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, CHANNELS.map(([key]) => key)), renderDeliveries()));
+  root.append(renderProactiveSettings(config), settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, [...CHANNELS.map(([key]) => key), "proactive"]), renderDeliveries()));
   return root;
+}
+
+function renderProactiveSettings(config) {
+  const policy = config.proactive ?? { external_enabled: false, default_destination: { kind: "web" } };
+  const destination = policy.default_destination;
+  const selected = destination.kind === "channel" ? destination.route.name : "web";
+  const control = selectField("无发令会话时通知到", "proactive-destination", selected, [["web", "WebUI"], ...CHANNELS], "选择外部渠道会同时启用独立事项外发；绑定到任务的回复继续走原渠道。");
+  $("select", control).addEventListener("change", (event) => {
+    try {
+      collectSettingsForm();
+      const name = event.target.value;
+      const profile = state.settingsDraft.channels?.[name] ?? {};
+      const account = profile.account_id || profile.app_id || profile.user_id || state.channels?.channels?.[name]?.account_id || "";
+      selectProactiveDestination(state.settingsDraft, name, account);
+      renderOtherView();
+    } catch (error) { displaySettingsError(error); }
+  });
+  const section = settingsSection("主动通知", control, element("p", { text: "当前仅自主启动更新检查可使用默认目的地；旧提醒和系统日志留在 WebUI。需开启主动关注并配置主模型，排队不代表送达。" }));
+  if (destination.kind === "channel") {
+    const path = "channels.proactive.default_destination.route";
+    const route = destination.route;
+    section.append(field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, [["private", "私聊"], ["group", "已允许的群组"]]), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" }));
+  }
+  section.append(switchField("暂停独立事项外发", "proactive-pause", !policy.external_enabled), element("p", { class: "settings-role-hint", text: "更改默认只影响新独立事项。暂停会阻塞尚未发送的独立通知；恢复后需明确重试，结果未知不会自动补发。" }));
+  const status = state.channels?.proactive;
+  if (status) section.append(statusList([["主动关注", status.attention_enabled ? "已开启" : "已关闭"], ["主模型", status.model_configured ? "已配置" : "未配置"], ["当前独立来源", "启动时自主更新检查"]]));
+  return section;
 }
 
 function deliveryLabel(value) {
@@ -2343,7 +2370,7 @@ function collectSettingsForm() {
   const form = $("#settings-form");
   if (!form || !state.settingsDraft) return;
   for (const input of $$('[name]', form)) {
-    if (!input.name || input.name === "pairing-code") continue;
+    if (!input.name || ["pairing-code", "proactive-destination", "proactive-pause"].includes(input.name)) continue;
     if (input.name.startsWith("tool-enabled:")) {
       const name = input.name.slice("tool-enabled:".length);
       const disabled = new Set(state.settingsDraft.disabled_tools ?? []);
@@ -2365,6 +2392,8 @@ function collectSettingsForm() {
     if (input.dataset.format === "json-merge") mergeSettingsExtras(state.settingsDraft, input.name, value);
     else setPath(state.settingsDraft, input.name, value);
   }
+  const pause = $('[name="proactive-pause"]', form);
+  if (pause) setPath(state.settingsDraft, "channels.proactive.external_enabled", !pause.checked);
 }
 
 function displaySettingsError(error) {
