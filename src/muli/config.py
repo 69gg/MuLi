@@ -625,6 +625,14 @@ class ConfigFile:
             else Settings()
         )
 
+    @classmethod
+    def from_bytes(cls, path: Path, data: bytes) -> ConfigFile:
+        """Use host-verified bytes without rereading a path or defaulting a missing file."""
+        result = cls.__new__(cls)
+        result.path = path
+        result.settings = Settings.model_validate_json(data)
+        return result
+
     def public(self) -> dict[str, Any]:
         data = self.settings.model_dump()
         for section in [*data["models"].values(), *data["media"].values(), data["search"]]:
