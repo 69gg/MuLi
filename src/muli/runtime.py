@@ -39,6 +39,7 @@ from muli.providers import (
     ToolCall,
 )
 from muli.reminders import Reminders
+from muli.reply_origin import ReplyOrigin
 from muli.store import LifecycleKind, Store, new_id, now
 from muli.system_events import SystemEvents, SystemLogger
 from muli.task_control import (
@@ -68,6 +69,7 @@ class PreparedRequest:
     messages: list[Message]
     execution_scope: TaskSnapshot | None = None
     selected_replan: TaskSnapshot | None = None
+    reply_origin: ReplyOrigin = ReplyOrigin()
 
 
 class Runtime:
@@ -258,7 +260,9 @@ class Runtime:
                     selected = self.task_control.replan_snapshot(session_id, identifier)
                 except ControlConflict:
                     self._selected_replans.pop(session_id, None)
-        prepared = PreparedRequest(session_id, [], execution, selected)
+        prepared = PreparedRequest(
+            session_id, [], execution, selected, self._reply_origin(session_id)
+        )
         token = self._request_context.set(prepared)
         try:
             try:
@@ -1271,14 +1275,25 @@ class Runtime:
         return cast(dict[str, Any], json.loads(row[0])) if row is not None else None
 
     def _delivery_routes(self, session_id: str) -> list[dict[str, Any]]:
-        """Snapshot the latest trigger; a system notice never reuses an owner's channel."""
-        message = self._latest_main_trigger(session_id)
-        if message is None or message.get("principal") != "owner":
+        session = self.store.get("session", session_id) or {}
+        if session.get("kind") != "main":
             return []
-        route = message.get("route")
-        if not str(message.get("source", "")).startswith("channel:") or not isinstance(route, dict):
-            return []
-        return [route]
+        return self._reply_origin(session_id).delivery_routes()
+
+    def _reply_origin(self, session_id: str) -> ReplyOrigin:
+        agent = self.store.get("agent", session_id)
+        if agent is not None:
+            return ReplyOrigin.load(agent.get("reply_origin"))
+        # Read only provenance, never a potentially large historical message body.
+        row = self.store.db.execute(
+            "SELECT json_object('id',o.id,'source',json_extract(o.data,'$.source'),"
+            "'principal',json_extract(o.data,'$.principal'),'route',json_extract(o.data,'$.route'),"
+            "'reply_origin',json_extract(o.data,'$.reply_origin')) "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return ReplyOrigin.from_input(json.loads(row[0])) if row is not None else ReplyOrigin()
 
     async def _execute(
         self, session_id: str, run_id: str, role: str, mode: Mode, workflow_step: bool
@@ -1315,7 +1330,9 @@ class Runtime:
                 )
                 turn: ModelTurn | None = None
                 partial = ""
-                delivery_routes = self._delivery_routes(session_id)
+                delivery_routes = (
+                    prepared.reply_origin.delivery_routes() if session.get("kind") == "main" else []
+                )
                 trigger = self._latest_main_trigger(session_id)
                 round_tools = (
                     {name: tool for name, tool in tools.items() if tool.risk == "read"}
@@ -1351,6 +1368,7 @@ class Runtime:
                             partial,
                             interrupted=True,
                             delivery_routes=delivery_routes,
+                            reply_origin=prepared.reply_origin.dump(),
                         )
                         await self.bus.emit("message.completed", {"message": message}, session_id)
                     raise
@@ -1376,6 +1394,7 @@ class Runtime:
                     provider_data=turn.provider_data,
                     usage=asdict(turn.usage),
                     delivery_routes=delivery_routes,
+                    reply_origin=prepared.reply_origin.dump(),
                 )
                 await self.bus.emit("message.completed", {"message": message}, session_id)
                 if not turn.tool_calls:

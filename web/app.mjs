@@ -2167,7 +2167,7 @@ function renderChannelSettings() {
 }
 
 function deliveryLabel(value) {
-  return ({ pending: "待发送", retry: "待重试", sending: "发送中", sent: "已发送", failed: "发送失败", unknown: "结果未知" })[value] ?? value;
+  return ({ pending: "待发送", retry: "待重试", sending: "发送中", sent: "已发送", failed: "发送失败", blocked: "原路投递受阻", unknown: "结果未知" })[value] ?? value;
 }
 
 function renderDeliveries() {
@@ -2175,7 +2175,7 @@ function renderDeliveries() {
   const details = element("details", { class: "advanced-settings" }, element("summary", { text: "最近发送记录" }));
   const deliveries = state.channels.deliveries ?? [];
   if (!deliveries.length) details.append(element("p", { class: "settings-role-hint", text: "暂无发送记录。" }));
-  for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
+  for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown", "blocked"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
   return details;
 }
 

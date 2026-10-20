@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from muli.permissions import Mode
+from muli.reply_origin import ReplyOrigin
 from muli.store import new_id, now
 from muli.task_control import ControlConflict, TaskPaused
 from muli.team_wait import TERMINAL, TeamWait
@@ -182,6 +183,14 @@ class TeamManager:
         if parent is None:
             raise ValueError("父会话不存在")
         parent_agent = self.runtime.store.get("agent", parent_id)
+        request = self.runtime.request_context(parent_id)
+        reply_origin = (
+            ReplyOrigin.load(parent_agent.get("reply_origin"))
+            if parent_agent is not None
+            else request.reply_origin
+            if request is not None
+            else ReplyOrigin()
+        )
         inherited = (
             self.runtime.task_control.resolve_scope(parent_id)
             if self.runtime.task_control
@@ -233,6 +242,7 @@ class TeamManager:
             "updated_at": now(),
             "generation": 0,
             "completion_revision": 0,
+            "reply_origin": reply_origin.dump(),
         }
         if commitment_id is not None:
             agent["commitment_id"] = commitment_id
@@ -246,6 +256,7 @@ class TeamManager:
             max_pending=self.runtime.config.settings.limits.max_pending_runs,
             internal=True,
             objects=[("session", session), ("agent", agent)],
+            reply_origin=reply_origin,
         )
         self.start()
         await self.runtime.bus.emit("team.created", {"agent": agent})
@@ -395,6 +406,7 @@ class TeamManager:
             "execution_status": "paused",
             "commitment_id": identifier,
             "content": f"队友 {agent['id']} 已暂停：{reason}；这不是成功结果或新授权。",
+            "reply_origin": ReplyOrigin.load(agent.get("reply_origin")).dump(),
         }
         session = self.runtime.store.get("session", agent["session_id"])
         writes: builtins.list[tuple[str, dict[str, Any]]] = [("team_report", report)]
@@ -479,6 +491,7 @@ class TeamManager:
                         },
                         ensure_ascii=False,
                     )[:30000],
+                    "reply_origin": ReplyOrigin.load(agent.get("reply_origin")).dump(),
                 }
                 if (
                     self._closed
@@ -574,6 +587,9 @@ class TeamManager:
                 event_id=f"result:{report['id']}",
                 objects=writes,
                 max_pending=self.runtime.config.settings.limits.max_pending_runs,
+                reply_origin=(
+                    ReplyOrigin.load(report["reply_origin"]) if "reply_origin" in report else None
+                ),
             )
         except ValueError:
             return  # Capacity is retried on actual delivery/completion, never a timer.

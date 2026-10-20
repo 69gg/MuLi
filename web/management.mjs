@@ -37,7 +37,7 @@ export function updateLabel(management) {
 }
 
 export async function retryChannelDelivery(request, delivery, { allowUnknown = false } = {}) {
-  if (!["failed", "unknown"].includes(delivery?.state)) throw new Error("这条发送记录当前不能重试。");
+  if (!["failed", "unknown", "blocked"].includes(delivery?.state)) throw new Error("这条发送记录当前不能重试。");
   if (delivery.state === "unknown" && !allowUnknown) throw new Error("请先确认可能重复的发送。");
   return request(`/channels/deliveries/${encodeURIComponent(delivery.id)}/retry`, { method: "POST", body: { allow_unknown: delivery.state === "unknown" && allowUnknown } });
 }

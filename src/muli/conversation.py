@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any
 
+from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
 
 MAX_EVENT_ID_CHARS = 512
@@ -49,6 +50,7 @@ class Conversation:
         event_id: str | None = None,
         internal: bool = False,
         objects: list[tuple[str, dict[str, Any]]] | None = None,
+        reply_origin: ReplyOrigin | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload = self.payload(
             session_id,
@@ -59,6 +61,7 @@ class Conversation:
             attachment_ids=attachment_ids,
             route=route,
             event_id=event_id,
+            reply_origin=reply_origin,
         )
         return self.store.enqueue_input(
             payload,
@@ -78,6 +81,7 @@ class Conversation:
         attachment_ids: list[str] | None = None,
         route: dict[str, Any] | None = None,
         event_id: str | None = None,
+        reply_origin: ReplyOrigin | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > 64000:
@@ -92,7 +96,7 @@ class Conversation:
         if route is not None:
             if (
                 not isinstance(route, dict)
-                or len(json.dumps(route, ensure_ascii=False, allow_nan=False)) > 4096
+                or len(json.dumps(route, ensure_ascii=False, allow_nan=False)) > MAX_ROUTE_CHARS
             ):
                 raise ValueError("消息路由必须是有限的 JSON 对象")
         if event_id is not None and (not event_id or len(event_id) > MAX_EVENT_ID_CHARS):
@@ -102,7 +106,7 @@ class Conversation:
             if event_id
             else new_id()
         )
-        return {
+        payload = {
             "id": identifier,
             "session_id": session_id,
             "content": content,
@@ -112,3 +116,6 @@ class Conversation:
             "attachment_ids": attachments,
             "route": route,
         }
+        if reply_origin is not None:
+            payload["reply_origin"] = reply_origin.dump()
+        return payload

@@ -13,6 +13,7 @@ import httpx
 
 from muli.attachments import Attachments, file_io
 from muli.events import EventBus
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
@@ -428,13 +429,41 @@ class ChannelManager:
         event_id: str | None = None,
         route: Mapping[str, Any] | None = None,
         media_mode: str = "file",
+        automatic: bool = False,
     ) -> dict[str, Any]:
         profile = self.config.profile(name)
-        if not profile.enabled:
-            raise ChannelError("渠道未启用", status_code=404)
-        selected = self._route(
-            name, route or {"target": target, "sender_id": target, "kind": "private"}, outbound=True
-        )
+        blocked = ""
+        if automatic:
+            # Preserve the original account and recipient even when today's
+            # binding no longer authorizes sending. Only finite host metadata
+            # enters the ledger; no arbitrary event dictionary is persisted.
+            candidate = {
+                "name": name,
+                "account_id": self._account(name),
+                "kind": "private",
+                **dict(route or {}),
+            }
+            origin = ReplyOrigin.load({"kind": "channel", "input_id": event_id, "route": candidate})
+            routes = origin.delivery_routes()
+            if not routes:
+                raise ChannelError("自动回复来源无效，已保留在本地")
+            selected = routes[0]
+            try:
+                if not profile.enabled:
+                    raise ChannelError("原回复渠道未启用", status_code=404)
+                selected = self._route(name, selected, outbound=True)
+                if name not in self._active:
+                    raise ChannelError("原回复渠道尚未就绪")
+            except ChannelError as error:
+                blocked = str(error)
+        else:
+            if not profile.enabled:
+                raise ChannelError("渠道未启用", status_code=404)
+            selected = self._route(
+                name,
+                route or {"target": target, "sender_id": target, "kind": "private"},
+                outbound=True,
+            )
         if selected["target"] != target:
             raise ChannelError("渠道目标与路由不一致")
         if media_mode not in {"file", "voice"}:
@@ -467,6 +496,15 @@ class ChannelManager:
             for offset in range(0, len(text), chunk_size)
         )
         for attachment_id in attachment_ids:
+            if blocked:
+                if (
+                    not isinstance(attachment_id, str)
+                    or not attachment_id
+                    or len(attachment_id) > 256
+                ):
+                    raise ChannelError("渠道附件引用无效")
+                parts.append({"attachment_id": attachment_id})
+                continue
             if self.attachments is None:
                 raise ChannelError("附件服务未启用")
             try:
@@ -504,30 +542,26 @@ class ChannelManager:
         count = self.store.db.execute(
             "SELECT count(*) FROM channel_outbox WHERE state IN ('pending','retry','sending')"
         ).fetchone()[0]
-        if count >= self.config.max_pending_deliveries:
+        if not blocked and count >= self.config.max_pending_deliveries:
             raise ChannelError("渠道投递队列已满", retryable=True, status_code=429)
         timestamp = now()
         with self.store.db:
-            if name == "qq" and selected.get("reply_to"):
-                state_key = "qq_sequence:" + encoded(
-                    [self._account(name), target, selected["reply_to"]]
-                )
-                used = int(self._state(state_key, "0"))
-                if used + len(parts) > 5:
-                    raise ChannelError("QQ 同一被动消息的五次回复预算不足")
-                for index, part in enumerate(parts):
-                    part["sequence"] = used + index
-                self.store.db.execute(
-                    "INSERT INTO channel_state VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
-                    (state_key, str(used + len(parts))),
-                )
+            if not blocked:
+                try:
+                    self._reserve_reply_parts(name, selected, parts)
+                except ChannelError as error:
+                    if not automatic:
+                        raise
+                    blocked = str(error)
             self.store.db.execute(
-                "INSERT INTO channel_outbox(id,name,route,payload,state,next_attempt,created_at,updated_at) VALUES(?,?,?,?,'pending',?,?,?)",
+                "INSERT INTO channel_outbox(id,name,route,payload,state,last_error,next_attempt,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     identifier,
                     name,
                     encoded(selected),
                     encoded(payload),
+                    "blocked" if blocked else "pending",
+                    blocked,
                     timestamp,
                     timestamp,
                     timestamp,
@@ -538,6 +572,25 @@ class ChannelManager:
         result = self.delivery(identifier)
         assert result is not None
         return result
+
+    def _reserve_reply_parts(
+        self, name: str, route: Mapping[str, Any], parts: list[dict[str, Any]]
+    ) -> None:
+        """Reserve QQ's passive reply slots inside the caller's existing transaction."""
+        if name != "qq" or not route.get("reply_to"):
+            return
+        state_key = "qq_sequence:" + encoded(
+            [route["account_id"], route["target"], route["reply_to"]]
+        )
+        used = int(self._state(state_key, "0"))
+        if used + len(parts) > 5:
+            raise ChannelError("QQ 同一被动消息的五次回复预算不足")
+        for index, part in enumerate(parts):
+            part["sequence"] = used + index
+        self.store.db.execute(
+            "INSERT INTO channel_state VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            (state_key, str(used + len(parts))),
+        )
 
     def delivery(self, identifier: str) -> dict[str, Any] | None:
         row = self.store.db.execute(
@@ -563,9 +616,13 @@ class ChannelManager:
             raise KeyError(identifier)
         if item["state"] == "unknown" and not allow_unknown:
             raise ChannelError("发送结果未知；必须明确允许可能重复的人工重试")
-        if item["state"] not in {"failed", "unknown"}:
+        if item["state"] not in {"failed", "unknown", "blocked"}:
             return item
+        if not self.config.profile(item["name"]).enabled:
+            raise ChannelError("原回复渠道未启用", status_code=404)
         self._route(item["name"], item["route"], outbound=True)
+        if item["state"] == "blocked" and item["name"] not in self._active:
+            raise ChannelError("原回复渠道尚未就绪")
         if (
             self.store.db.execute(
                 "SELECT count(*) FROM channel_outbox WHERE state IN ('pending','retry','sending')"
@@ -574,9 +631,11 @@ class ChannelManager:
         ):
             raise ChannelError("渠道投递队列已满", status_code=429)
         with self.store.db:
+            if item["state"] == "blocked":
+                self._reserve_reply_parts(item["name"], item["route"], item["payload"]["parts"])
             self.store.db.execute(
-                "UPDATE channel_outbox SET state='pending',attempts=0,next_attempt=?,last_error='',updated_at=? WHERE id=?",
-                (now(), now(), identifier),
+                "UPDATE channel_outbox SET state='pending',payload=?,attempts=0,next_attempt=?,last_error='',updated_at=? WHERE id=?",
+                (encoded(item["payload"]), now(), now(), identifier),
             )
         self._wake.set()
         await self._publish()
@@ -587,7 +646,11 @@ class ChannelManager:
     async def wait(self, identifier: str) -> dict[str, Any] | None:
         def terminal() -> bool:
             item = self.delivery(identifier)
-            return self._stopped or item is None or item["state"] in {"sent", "failed", "unknown"}
+            return (
+                self._stopped
+                or item is None
+                or item["state"] in {"sent", "failed", "unknown", "blocked"}
+            )
 
         async with self.changed:
             await self.changed.wait_for(terminal)
@@ -749,7 +812,7 @@ class ChannelManager:
                         routes = message.get("delivery_routes", [])
                         if isinstance(routes, list):
                             for route in routes[:1]:
-                                if isinstance(route, dict) and route.get("name") in self._active:
+                                if isinstance(route, dict) and route.get("name") in NAMES:
                                     try:
                                         await self.enqueue(
                                             route["name"],
@@ -758,6 +821,7 @@ class ChannelManager:
                                             message.get("attachment_ids", []),
                                             event_id=str(message.get("id") or event["id"]),
                                             route=route,
+                                            automatic=True,
                                         )
                                     except ChannelError as error:
                                         if error.retryable:
