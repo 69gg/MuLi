@@ -13,9 +13,10 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from muli.maintenance import BootPermit, MaintenanceError
+from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import FixedLock, TransactionJournal, TransactionRecord
 from muli.platforms.filesystem_identity import FilesystemError, verify_local_filesystems
 from muli.platforms.installation import HelperLimits, InstallationManifest, _read_file
@@ -26,6 +27,10 @@ from muli.platforms.linux_transaction import (
     SystemdProbe,
 )
 from muli.service import UserService
+
+if TYPE_CHECKING:
+    from muli.managed_boot import ManagedBootPermit
+    from muli.platforms.managed_bootstrap import ManagedServiceProbe
 
 
 class BootstrapError(ValueError):
@@ -45,7 +50,7 @@ class BootSession:
     journal: TransactionJournal
     lease: FixedLock
     config_path: Path
-    permit: BootPermit | None = None
+    permit: BootPermit | ManagedBootPermit | None = None
     manifest: InstallationManifest | None = None
     unsupported_reason: str | None = None
     _closed: bool = False
@@ -63,11 +68,14 @@ class BootSession:
     def close_after_writers(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        try:
+        if self.permit is not None:
+            # A managed permit may still own an unclosed SQLite connection.
+            # Its refusal must retain both lease and journal descriptors.
+            self.permit.close_after_writers()
+        else:
             self.lease.__exit__()
-        finally:
-            self.journal.__exit__()
+        self.journal.__exit__()
+        self._closed = True
 
 
 def _manifest(root: Path) -> InstallationManifest | None:
@@ -117,12 +125,22 @@ async def open_boot_session(
     database: Path,
     *,
     probe: ServiceProbe | None = None,
+    managed_root: Path | None = None,
+    managed_probe: ManagedServiceProbe | None = None,
 ) -> BootSession:
     if sys.platform != "linux":
         raise BootstrapError("platform_unsupported")
-    root = service.data_dir.absolute() / "management" / "transaction-v1"
-    published = _manifest(root)
-    journal = TransactionJournal(root, database, published.journal if published else None)
+    root = (
+        managed_root.absolute()
+        if managed_root is not None
+        else service.data_dir.absolute() / "management" / "transaction-v1"
+    )
+    try:
+        journal = TransactionJournal(root, database, create=managed_root is None)
+    except (OSError, ValueError):
+        if managed_root is not None:
+            raise BootstrapError("managed_journal_unavailable") from None
+        raise
     try:
         lease = journal.writer_lease().__enter__()
     except BaseException:
@@ -131,6 +149,18 @@ async def open_boot_session(
     session = BootSession(journal, lease, service.config_path.absolute())
     paths = (service.config_path, service.data_dir, service.path, service.executable)
     try:
+        # The one journal selects the protocol before any legacy manifest read.
+        # A rollback launched by the raw V1 unit has no --managed-root flag.
+        current = journal.read_current()
+        if isinstance(current, TransactionRecordV2):
+            from muli.platforms.managed_bootstrap import admit_managed_boot
+
+            return await admit_managed_boot(session, service, current, probe=managed_probe)
+        if managed_root is not None:
+            raise BootstrapError("managed_record_required")
+        published = _manifest(root)
+        if published is not None:
+            journal.limits = published.journal
         record = journal.read()
         _database(journal, record)
         if record is not None and not record.resolved and published is None:

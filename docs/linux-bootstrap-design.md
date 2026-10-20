@@ -2,9 +2,9 @@
 
 状态：启动保护模块已随 2.19.0 接入 `serve`、Runtime 和 lifespan，并完成独立入口回归。模块自身不启动 helper、不准备或发布事务；整体整合与真实服务验证边界见[恢复入口](linux-recovery-operations.md)。
 
-`open_boot_session(service, database, *, probe=None)` 在 ConfigFile 和 Store 构造之前运行。宿主从实际 CLI 路径构造 `UserService` 并传入实际数据库路径；模块不读取 Settings 来猜路径。journal 固定为 `service.data_dir / management / transaction-v1`，数据库别名沿用 `TransactionJournal` 的规范化结果，所有 Linux serve 模式使用同一数据库 writer lease。
+`open_boot_session(service, database, *, probe=None, managed_root=None, managed_probe=None)` 在 ConfigFile 和 Store 构造之前运行。宿主从实际 CLI 路径构造 `UserService` 并传入实际数据库路径；模块不读取 Settings 来猜路径。journal 默认是 `service.data_dir / management / transaction-v1`，数据库别名沿用 `TransactionJournal` 的规范化结果，所有 Linux serve 模式使用同一数据库 writer lease。V2 在读取旧 manifest 前严格分派到[managed bootstrap](managed-bootstrap.md)；显式 managed root 不允许降级，legacy raw unit 未带该参数也按同账本分派。以下原 manifest/foreground 规则仅描述 V1。
 
-返回的 `BootSession` 拥有 journal 目录描述符、真实 writer lease、启动时的 config 词法绝对路径，以及可选的 `permit`、`manifest`、固定 `unsupported_reason`。`check_paths(config_path, database)` 在 Runtime 构造前复核租约仍被持有、config 词法路径相同及实际数据库路径相同，不创建 Store。probe 等待期间传入 service 的路径或解释器发生变化会拒绝。宿主必须在全部数据库写入者结束后显式调用幂等 `close_after_writers()`；本模块不提供容易提前释放租约的上下文管理入口。启动失败或外部取消会清理本次取得的描述符和租约。`BootPermit.acquire(..., lease=...)` 接管已经获取的真实租约，核对固定 `lease` 名称、writer 目录身份与实际锁 inode，沿用原有 phase、配置摘要与 Store/main 身份检查，失败也释放所接管租约；不会释放后重取或复制一套 phase 判断。
+返回的 `BootSession` 拥有 journal 目录描述符、真实 writer lease、启动时的 config 词法绝对路径，以及可选的 `permit`、`manifest`、固定 `unsupported_reason`。`check_paths(config_path, database)` 在 Runtime 构造前复核租约仍被持有、config 词法路径相同及实际数据库路径相同，不创建 Store。probe 等待期间传入 service 的路径或解释器发生变化会拒绝。宿主必须在全部数据库写入者结束后显式调用幂等 `close_after_writers()`；本模块不提供容易提前释放租约的上下文管理入口。关闭先委托 permit，成功后才关闭 journal 并标记 session 已关闭；V2 的未知连接关闭失败会保留 owner、lease 与 journal 至进程退出。普通失败或外部取消只清理可确认已移交结束的所有权。`BootPermit.acquire(..., lease=...)` 接管已经获取的真实租约，核对固定 `lease` 名称、writer 目录身份与实际锁 inode，沿用原有 phase、配置摘要与 Store/main 身份检查，失败也释放所接管租约；不会释放后重取或复制一套 phase 判断。
 
 ## 获得事务能力的条件
 
@@ -12,7 +12,7 @@
 
 随后只对 config parent、数据库 parent、journal 目录、writer 目录调用既有 `verify_local_filesystems`。它不扫描包或数据库，不为普通 foreground 运行附加本地持久文件系统要求。通过后才捕获或验证实际当前解释器词法入口、真实可执行文件、pyvenv、当前导入的 MuLi 包及标准 unit；不接受 manifest 任意指定的包目录，也不把整个依赖环境宣称为已验证。
 
-现存 `installation.json` 在构造 journal 前严格加载，以其已发布的 `JournalLimits` 读取 record，并沿用该代 helper/package 预算。损坏或不可读的现存清单是明确启动错误，不按清单不存在处理。bootstrap 没有预算修改入口；新的预算由后续 prepare 在锁内捕获、耐久发布，再更新当前 permit。
+持 writer lease 后先严格识别协议；V1 才加载现存 `installation.json`，按其已发布 `JournalLimits` 重新读取 record，并沿用该代 helper/package 预算。损坏或不可读的现存 V1 清单是明确启动错误，不按清单不存在处理，也不改变 V2 的分派。bootstrap 没有预算修改入口；新的预算由后续 prepare 在锁内捕获、耐久发布，再更新当前 permit。
 
 ## record 分支
 
