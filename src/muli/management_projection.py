@@ -14,14 +14,16 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from muli.maintenance import BootPermit
-from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import ProjectionReceipt, Role, TransactionRecord, _object
 from muli.platforms.transaction_files import _open_directory
 from muli.store import Store, now
+
+if TYPE_CHECKING:
+    from muli.managed_boot import ManagedBootPermit
 
 _RECEIPT_KIND = "management_projection"
 _RECEIPT_ID = "transaction-v1"
@@ -42,10 +44,9 @@ class _StoreIdentity:
     main: str
 
 
-def _connection_identity(store: Store) -> _StoreIdentity:
+def _database_identity(db: sqlite3.Connection) -> _StoreIdentity:
     if sys.platform != "linux":
         raise ProjectionError("projection_platform_unsupported")
-    db = store.db
     if db.in_transaction:
         raise ProjectionError("projection_outer_transaction")
     if db.autocommit != sqlite3.LEGACY_TRANSACTION_CONTROL or db.isolation_level is None:
@@ -92,8 +93,14 @@ def _connection_identity(store: Store) -> _StoreIdentity:
     return _StoreIdentity(path, instance, main)
 
 
-def _read_object(store: Store, kind: str, identifier: str, limit: int) -> dict[str, Any] | None:
-    row = store.db.execute(
+def _connection_identity(store: Store) -> _StoreIdentity:
+    return _database_identity(store.db)
+
+
+def _read_object(
+    db: sqlite3.Connection, kind: str, identifier: str, limit: int
+) -> dict[str, Any] | None:
+    row = db.execute(
         "SELECT length(CAST(data AS BLOB)),substr(CAST(data AS BLOB),1,?) "
         "FROM objects WHERE kind=? AND id=?",
         (limit + 1, kind, identifier),
@@ -108,8 +115,8 @@ def _read_object(store: Store, kind: str, identifier: str, limit: int) -> dict[s
         raise ProjectionError("projection_object_invalid") from None
 
 
-def _read_projection(store: Store, identity: _StoreIdentity) -> ProjectionReceipt | None:
-    value = _read_object(store, _RECEIPT_KIND, _RECEIPT_ID, _RECEIPT_BYTES)
+def _read_projection(db: sqlite3.Connection, identity: _StoreIdentity) -> ProjectionReceipt | None:
+    value = _read_object(db, _RECEIPT_KIND, _RECEIPT_ID, _RECEIPT_BYTES)
     if value is None:
         return None
     if set(value) != _RECEIPT_FIELDS or value["id"] != _RECEIPT_ID:
@@ -127,7 +134,17 @@ def _read_projection(store: Store, identity: _StoreIdentity) -> ProjectionReceip
 
 def read_projection(store: Store) -> ProjectionReceipt | None:
     """Read the fixed durable receipt without creating or committing any state."""
-    return _read_projection(store, _connection_identity(store))
+    return read_projection_connection(store.db)
+
+
+def read_projection_connection(db: sqlite3.Connection) -> ProjectionReceipt | None:
+    """Read the same fixed receipt from a host-owned existing connection.
+
+    The caller owns the connection and authenticates its file/lease binding.
+    This checks the existing identity/durability contract without constructing
+    a Store, creating a main session, or opening or closing a connection.
+    """
+    return _read_projection(db, _database_identity(db))
 
 
 def _check_lease(permit: BootPermit | ManagedBootPermit) -> None:
@@ -179,7 +196,7 @@ def project_final(
         raise ProjectionError("projection_journal_changed")
     _check_lease(permit)
     receipt = ProjectionReceipt(**record.position.model_dump(), store_instance=identity.instance)
-    previous = _read_projection(store, identity)
+    previous = _read_projection(store.db, identity)
     if previous == receipt:
         return receipt
     if previous is not None and previous.generation == receipt.generation:
@@ -199,7 +216,7 @@ def project_final(
     ):
         raise ProjectionError("projection_installation_changed")
     plan = _read_object(
-        store, "management", record.request_id, permit.journal.limits.max_record_bytes
+        store.db, "management", record.request_id, permit.journal.limits.max_record_bytes
     )
     if (
         plan is None
