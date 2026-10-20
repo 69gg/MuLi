@@ -525,3 +525,92 @@ async def test_cached_proof_without_running_owner_never_commits(
 
     monkeypatch.setattr(service, "observe", stale)
     assert (await driver.step()).phase == "rolling_back"
+
+
+@pytest.mark.parametrize("phase", ["committed", "rolled_back"])
+async def test_decision_missing_proof_waits_then_releases_without_extending_deadline(
+    setup: tuple[TransactionJournal, JournalControl, FakeClock, FakeService],
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    _, control, clock, service = setup
+    service.healthy_target = phase != "rolled_back"
+    driver = TransactionController(control, service, clock)
+    record = await reach(driver, phase)
+    original, calls = service.observe, list(service.calls)
+
+    async def unavailable(record: TransactionRecord) -> ServiceObservation:
+        return replace(await original(record), health=None)
+
+    monkeypatch.setattr(service, "observe", unavailable)
+    assert await driver.step() == record and service.calls == calls
+    monkeypatch.setattr(service, "observe", original)
+    result = await finish(driver)
+    assert result.resolved and result.phase == phase and result.deadline == record.deadline
+
+
+@pytest.mark.parametrize("phase", ["committed", "rolled_back"])
+@pytest.mark.parametrize("action", ["observe", "activate"])
+async def test_short_decision_timeout_waits_but_total_deadline_still_blocks(
+    setup: tuple[TransactionJournal, JournalControl, FakeClock, FakeService],
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    action: str,
+) -> None:
+    _, control, clock, service = setup
+    service.healthy_target = phase != "rolled_back"
+    driver = TransactionController(control, service, clock, operation_timeout=0.01)
+    record = await reach(driver, phase)
+
+    async def timed_out(*args: object) -> ServiceObservation:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, action, timed_out)
+    assert await driver.step() == record
+    clock.elapsed = 61.0
+    final = await driver.step()
+    assert final.phase == phase and final.activation == "blocked" and not final.resolved
+    assert final.code == "deadline_exceeded" and final.deadline == record.deadline
+
+
+@pytest.mark.parametrize("phase", ["committed", "rolled_back"])
+async def test_wrong_decision_proof_is_not_treated_as_temporarily_missing(
+    setup: tuple[TransactionJournal, JournalControl, FakeClock, FakeService],
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    _, control, clock, service = setup
+    service.healthy_target = phase != "rolled_back"
+    driver = TransactionController(control, service, clock)
+    await reach(driver, phase)
+    original = service.observe
+
+    async def wrong(record: TransactionRecord) -> ServiceObservation:
+        observed = await original(record)
+        assert observed.health is not None
+        return replace(
+            observed, health=observed.health.model_copy(update={"configuration": "f" * 64})
+        )
+
+    monkeypatch.setattr(service, "observe", wrong)
+    result = await driver.step()
+    assert result.activation == "blocked" and result.code == "health_failed"
+
+
+async def test_clock_invalid_after_decision_timeout_is_persisted(
+    setup: tuple[TransactionJournal, JournalControl, FakeClock, FakeService],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, control, clock, service = setup
+    driver = TransactionController(control, service, clock, operation_timeout=0.01)
+    await reach(driver, "committed")
+
+    async def timed_out(record: TransactionRecord) -> ServiceObservation:
+        clock.elapsed = -1.0
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, "observe", timed_out)
+    final = await driver.step()
+    assert final.activation == "blocked" and final.code == "clock_invalid"
