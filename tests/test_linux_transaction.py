@@ -10,10 +10,47 @@ from typing import Any
 
 import pytest
 
-from muli.platforms.linux_transaction import ObservationError, ProbeLimits, SystemdProbe
+from muli.management_transaction import TransactionError
+from muli.platforms.linux_transaction import (
+    ObservationError,
+    ProbeLimits,
+    SystemdProbe,
+    clock_reading,
+)
 from muli.service import UserService
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux proc and unit identity")
+
+
+def test_clock_uses_kernel_boot_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "boot_id"
+    identifier = "12345678-1234-5678-90ab-1234567890ab"
+    path.write_text(identifier + "\n")
+    monkeypatch.setattr("muli.platforms.linux_transaction.time.time", lambda: 100.0)
+    monkeypatch.setattr("muli.platforms.linux_transaction.time.monotonic", lambda: 10.0)
+    reading = clock_reading(path)
+    assert (reading.boot_id, reading.wall, reading.monotonic) == (identifier, 100.0, 10.0)
+
+
+@pytest.mark.parametrize("content", [b"", b"unit-invocation", b"x" * 129, b"\xff", b"{}\n"])
+def test_clock_rejects_invalid_identity(tmp_path: Path, content: bytes) -> None:
+    path = tmp_path / "boot_id"
+    path.write_bytes(content)
+    with pytest.raises(TransactionError, match="clock_invalid"):
+        clock_reading(path)
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "fifo"])
+def test_clock_does_not_follow_replacement(tmp_path: Path, kind: str) -> None:
+    path = tmp_path / "boot_id"
+    if kind == "symlink":
+        original = tmp_path / "original"
+        original.write_text("12345678-1234-5678-90ab-1234567890ab\n")
+        path.symlink_to(original)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    with pytest.raises(TransactionError, match="clock_invalid"):
+        clock_reading(path)
 
 
 class FakeBus:
