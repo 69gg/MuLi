@@ -26,6 +26,7 @@ from muli.media import SpeechResult
 from muli.providers import ModelTurn
 from muli.runtime import Runtime
 from muli.server import create_app
+from muli.store import Store
 from muli.voice import VoiceWorker
 
 
@@ -298,11 +299,16 @@ async def test_pending_management_plan_waits_without_losing_target_or_calling_se
         pytest.skip("Linux transaction bootstrap")
     config = configured(tmp_path)
     data = tmp_path / "data"
+    if action == "update":
+        # This case exercises the legacy in-place update queue, not marked upgrades.
+        Store(data / "muli.sqlite3").close()
     with TransactionJournal(tmp_path / "transactions", data / "muli.sqlite3") as journal:
         permit = BootPermit.acquire(
             journal, config.path, boot="origin", installation="a" * 64, service="b" * 64
         )
         runtime = Runtime(config, data, boot_permit=permit)
+        if action == "update":
+            assert runtime.store.format_state is None
         app = create_app(config, data, runtime)
         calls: list[str] = []
         applied = asyncio.Event()

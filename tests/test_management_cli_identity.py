@@ -188,6 +188,8 @@ async def test_management_diagnostics_do_not_construct_config_or_store(
 
     monkeypatch.setattr("muli.config.ConfigFile.__init__", unexpected)
     monkeypatch.setattr("muli.store.Store.__init__", unexpected)
+    monkeypatch.setattr("muli.store.Store.open_runtime", unexpected)
+    monkeypatch.setattr("muli.store.Store.open_existing", unexpected)
     assert await management_action(installed.service, action) == {"transaction": None}
 
 

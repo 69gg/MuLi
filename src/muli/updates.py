@@ -6,9 +6,10 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import httpx
 
@@ -43,9 +44,39 @@ def release_version(value: str) -> tuple[int, int, int]:
     return int(major), int(minor), int(patch)
 
 
+class UpdateCapability(TypedDict):
+    mode: Literal["in_place"]
+    format_eligible: bool
+    code: Literal[
+        "installation_check_required", "verified_candidate_required", "format_verification_failed"
+    ]
+
+
 class Updates:
     def __init__(self, config: ConfigFile, store: Store, bus: EventBus) -> None:
         self.config, self.store, self.bus = config, store, bus
+
+    def capability(self) -> UpdateCapability:
+        """Format eligibility only; this neither inspects uv nor authorizes effects."""
+        try:
+            self.store.revalidate_format()
+        except (ValueError, sqlite3.Error):
+            return {
+                "mode": "in_place",
+                "format_eligible": False,
+                "code": "format_verification_failed",
+            }
+        marked = self.store.format_state is not None
+        return {
+            "mode": "in_place",
+            "format_eligible": not marked,
+            "code": "verified_candidate_required" if marked else "installation_check_required",
+        }
+
+    def require_in_place_update(self) -> None:
+        capability = self.capability()
+        if not capability["format_eligible"]:
+            raise ValueError(capability["code"])
 
     async def check(
         self,
@@ -90,10 +121,16 @@ class Updates:
         if item["available"]:
             identifier = "update-" + item["latest"]
             if self.store.get("notification", identifier) is None:
+                eligible = self.capability()["format_eligible"]
                 notice = {
                     "id": identifier,
                     "title": "沐璃有新版本",
-                    "content": f"{item['latest']} 已发布，可以让沐璃帮你更新。更新会先征得你的同意。",
+                    "content": f"{item['latest']} 已发布。"
+                    + (
+                        "可以让沐璃检查安装条件并在你同意后更新。"
+                        if eligible
+                        else "当前资料库需要先核验候选格式，尚不支持自动安装此版本。"
+                    ),
                     "source": "update",
                     "read": False,
                     "created_at": now(),
@@ -116,6 +153,9 @@ class Updates:
 
     async def apply(self, version: str) -> dict[str, Any]:
         release_version(version)
+        # Approval is not evidence that the target preserves the admitted format.
+        # Recheck here as well as at planning, before discovering or invoking uv.
+        self.require_in_place_update()
         uv = shutil.which("uv")
         if uv is None:
             raise ValueError("自动更新需要uv tool安装；当前未找到uv")
@@ -129,6 +169,7 @@ class Updates:
             raise ValueError(
                 "当前不是uv tool安装，已拒绝修改开发环境；请用uv tool install muli-agent"
             )
+        self.require_in_place_update()
         result = await run_process(
             [uv, "tool", "upgrade", "--no-python-downloads", f"muli-agent=={version}"],
             timeout=120,

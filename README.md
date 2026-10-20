@@ -91,6 +91,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [Agent Skills](docs/skills.md)
 - [用户插件与自身管理](docs/self-management.md)
 - [Linux 同版本恢复入口](docs/linux-recovery-operations.md)
+- [新资料库格式准入](docs/fresh-format-admission.md)
 - [压缩后的证据续读](docs/history-evidence.md)
 - [查找全部运行记录](docs/session-records.md)
 - [查看已保存的正文](docs/history-archive.md)

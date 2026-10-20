@@ -63,11 +63,19 @@ class SelfManagement:
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         update = self.runtime.store.get("update", "latest")
         if update and update.get("available"):
+            instruction = (
+                "self_update仍须检查实际安装条件并经真实用户批准。"
+                if self.updates.capability()["format_eligible"]
+                else "当前自动安装不支持此资料库；不能把用户批准当作候选格式兼容证明。"
+            )
             messages.insert(
                 1,
                 Message(
                     role="system",
-                    content=f"版本检查资料：当前{update['current']}，可更新到{update['latest']}。在自然时机提醒用户；self_update始终需要真实用户批准。",
+                    content=(
+                        f"版本检查资料：当前{update['current']}，发现新版{update['latest']}。"
+                        "在自然时机提醒用户；" + instruction
+                    ),
                 ),
             )
         return messages
@@ -83,6 +91,8 @@ class SelfManagement:
         self.runtime.maintenance.require_configuration()
         if action not in {"configure", "restart", "update"}:
             raise ValueError("未知管理操作")
+        if action == "update":
+            self.updates.require_in_place_update()
         if apply_mode not in {"in_process", "restart_transaction"}:
             raise ValueError("未知配置应用方式")
         if action == "restart":
@@ -315,6 +325,7 @@ class SelfManagement:
                 "plugins": self.plugins.inventory(),
                 "plugins_restart_required": self.plugins.restart_required,
                 "update": runtime.store.get("update", "latest"),
+                "update_capability": self.updates.capability(),
                 "extensions": runtime.extensions.status(),
                 "system_events": runtime.system_events.status(),
             }
@@ -392,7 +403,7 @@ class SelfManagement:
             ),
             Tool(
                 "self_update",
-                "更新到指定正式版本并重启；无论当前模式都需真实用户批准",
+                "核验安装条件后更新并重启；已认证格式的资料库暂不支持，始终需要真实用户批准",
                 parameters({"version": string()}, ("version",)),
                 update,
                 "external",

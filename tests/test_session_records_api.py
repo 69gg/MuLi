@@ -13,6 +13,7 @@ from muli.config import ConfigFile
 from muli.providers import ModelConfig
 from muli.runtime import Runtime
 from muli.server import create_app
+from muli.store import Store
 
 
 def no_model(config: ModelConfig) -> NoReturn:
@@ -20,9 +21,13 @@ def no_model(config: ModelConfig) -> NoReturn:
 
 
 @pytest.fixture
-async def records_case(tmp_path: Path) -> AsyncIterator[tuple[Runtime, httpx.AsyncClient]]:
+async def records_case(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> AsyncIterator[tuple[Runtime, httpx.AsyncClient]]:
     config = ConfigFile(tmp_path / "config.json")
     config.update({"workspace_roots": [str(tmp_path)], "updates": {"check_on_start": False}})
+    if getattr(request, "param", False):
+        Store(tmp_path / "data" / "muli.sqlite3").close()
     runtime = Runtime(config, tmp_path / "data", client_factory=no_model)
     app = create_app(config, runtime=runtime)
     try:
@@ -150,12 +155,13 @@ async def test_directory_cursor_query_binding_and_empty_results_are_distinct(
     assert empty.json() == {"items": [], "next_cursor": None, "has_more": False}
 
 
+@pytest.mark.parametrize("records_case", [False, True], indirect=True, ids=["fresh", "legacy"])
 async def test_directory_preserves_empty_text_and_null_metadata_across_http_pages(
     records_case: tuple[Runtime, httpx.AsyncClient],
 ) -> None:
     runtime, client = records_case
     values: list[tuple[str | None, str | None]] = [(None, None), ("", ""), ("正常标题", "idle")]
-    expected: list[dict[str, Any]] = []
+    expected = runtime.store.list("session")
     for index, (title, status) in enumerate(values):
         session = runtime.new_session("旧档案")
         expected.append(
@@ -163,6 +169,7 @@ async def test_directory_preserves_empty_text_and_null_metadata_across_http_page
                 "session", {**session, "title": title, "status": status, "created_at": index + 1}
             )
         )
+    expected.sort(key=lambda item: (item["created_at"], item["id"]))
     changes = runtime.store.db.total_changes
     params: dict[str, Any] = {"limit": 1}
     for index, record in enumerate(reversed(expected)):
@@ -211,7 +218,10 @@ async def test_invalid_directory_queries_are_rejected_before_reading(
     assert runtime.store.db.total_changes == changes and not runtime.tasks
 
 
-async def test_directory_requires_login_and_accepts_unicode_length_boundary(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True], ids=["fresh", "legacy"])
+async def test_directory_requires_login_and_accepts_unicode_length_boundary(
+    tmp_path: Path, legacy: bool
+) -> None:
     config = ConfigFile(tmp_path / "config.json")
     config.update(
         {
@@ -219,9 +229,17 @@ async def test_directory_requires_login_and_accepts_unicode_length_boundary(tmp_
             "server": {"password_hash": hash_password("record-test-password")},
         }
     )
+    if legacy:
+        Store(tmp_path / "data" / "muli.sqlite3").close()
     runtime = Runtime(config, tmp_path / "data", client_factory=no_model)
     try:
+        sessions = runtime.store.list("session")
+        if legacy:
+            assert sessions == []
+        else:
+            assert len(sessions) == 1 and sessions[0]["kind"] == "main"
         app = create_app(config, runtime=runtime)
+        changes = runtime.store.db.total_changes
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://localhost:8765"
         ) as client:
@@ -231,6 +249,7 @@ async def test_directory_requires_login_and_accepts_unicode_length_boundary(tmp_
             response = await client.get("/api/session-records", params={"query": "🙂" * 120})
             assert response.status_code == 200 and response.json()["items"] == []
             assert response.headers["cache-control"] == "no-store"
-            assert not runtime.tasks and runtime.store.list("session") == []
+            assert not runtime.tasks and runtime.store.list("session") == sessions
+            assert runtime.store.db.total_changes == changes
     finally:
         await runtime.close()

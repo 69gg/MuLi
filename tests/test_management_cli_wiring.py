@@ -225,7 +225,7 @@ def serving(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> Iter
         ).model_dump_json()
     )
     state = Serving(installation)
-    original_init, original_close = Store.__init__, Store.close
+    original_open, original_close = Store.open_runtime, Store.close
     original_session_close = BootSession.close_after_writers
 
     async def bootstrap(service: UserService, database: Path) -> BootSession:
@@ -242,11 +242,15 @@ def serving(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> Iter
         state.loops.append(asyncio.get_running_loop())
         return ConfigFile(path)
 
-    def store_init(self: Store, *args: Any, **kwargs: Any) -> None:
+    def store_open_runtime(
+        cls: type[Store], path: Path, *, default_mode: str, durable: bool = False
+    ) -> Store:
+        assert cls is Store
         assert state.sessions
         state.sessions[-1].lease.check()
-        original_init(self, *args, **kwargs)
-        state.stores.append(self)
+        store = original_open(path, default_mode=default_mode, durable=durable)
+        state.stores.append(store)
+        return store
 
     def store_close(self: Store) -> None:
         state.sessions[-1].lease.check()
@@ -264,7 +268,7 @@ def serving(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setattr(linux_bootstrap, "open_boot_session", bootstrap)
     monkeypatch.setattr(linux_bootstrap, "verify_local_filesystems", lambda paths: None)
     monkeypatch.setattr(cli, "ConfigFile", config)
-    monkeypatch.setattr(Store, "__init__", store_init)
+    monkeypatch.setattr(Store, "open_runtime", classmethod(store_open_runtime))
     monkeypatch.setattr(Store, "close", store_close)
     monkeypatch.setattr(BootSession, "close_after_writers", session_close)
     arguments(monkeypatch, installation, "serve")

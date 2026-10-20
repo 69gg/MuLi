@@ -15,12 +15,15 @@ from muli.management import SelfManagement
 from muli.plugins import PluginManager
 from muli.runtime import Runtime
 from muli.service import UserService
+from muli.store import Store
 from muli.updates import Updates
 
 
-def setup_runtime(tmp_path: Path) -> tuple[Runtime, PluginManager]:
+def setup_runtime(tmp_path: Path, *, legacy: bool = False) -> tuple[Runtime, PluginManager]:
     config = ConfigFile(tmp_path / "config.json")
     config.update({"updates": {"check_on_start": False}})
+    if legacy:
+        Store(tmp_path / "data" / "muli.sqlite3").close()
     runtime = Runtime(config, tmp_path / "data")
     return runtime, PluginManager(runtime, FastAPI(), tmp_path / "plugins")
 
@@ -227,7 +230,7 @@ async def test_version_check_is_bounded_and_notifies_once(tmp_path: Path) -> Non
 async def test_update_refuses_to_change_development_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime, _ = setup_runtime(tmp_path)
+    runtime, _ = setup_runtime(tmp_path, legacy=True)
     calls: list[list[str]] = []
 
     async def command(argv: list[str], **kwargs: Any) -> dict[str, Any]:
@@ -251,7 +254,7 @@ async def test_update_refuses_to_change_development_environment(
 async def test_update_retains_uv_tool_requirements_and_reports_constraint_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
 ) -> None:
-    runtime, _ = setup_runtime(tmp_path)
+    runtime, _ = setup_runtime(tmp_path, legacy=True)
     root = tmp_path / "tools"
     calls: list[list[str]] = []
 
