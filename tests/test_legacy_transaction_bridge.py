@@ -4,6 +4,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from test_managed_launcher import _slot
@@ -61,7 +62,18 @@ class Recovered:
             objects=[("management_projection", {"id": "transaction-v1", **receipt.model_dump()})],
         )
 
-    def prepare(self) -> TransactionRecord:
+    def prepare(
+        self,
+        *,
+        action: Literal["configure", "restart"] = "configure",
+        target: bytes | None = None,
+    ) -> TransactionRecord:
+        if target is None:
+            target = (
+                self.target
+                if action == "configure"
+                else Path(self.manifest.config_path).read_bytes()
+            )
         with self.journal.locked() as control:
             return prepare_legacy_after_managed(
                 control,
@@ -69,9 +81,9 @@ class Recovered:
                 writer=self.writer,
                 manifest=self.manifest,
                 origin_boot=self.previous.health.boot if self.previous.health else "running-legacy",
-                request_id="next-configure",
-                action="configure",
-                target=self.target,
+                request_id="next-" + action,
+                action=action,
+                target=target,
                 deadline=deadline(),
             )
 
@@ -229,6 +241,68 @@ def test_failed_adoption_can_prepare_a_fresh_legacy_generation(recovered: Recove
     assert InstallationManifest.load(recovered.journal.directory.path) == recovered.manifest
 
 
+@pytest.mark.parametrize("recovered", ["aborted", "rolled_back"], indirect=True)
+@pytest.mark.parametrize("action", ["configure", "restart"])
+def test_projected_hot_configuration_becomes_the_next_legacy_base(
+    recovered: Recovered, action: Literal["configure", "restart"]
+) -> None:
+    historical = read_snapshots(recovered.journal, recovered.previous, "base").configuration
+    current = Settings(default_mode="yolo").model_dump_json(indent=2).encode()
+    Path(recovered.manifest.config_path).write_bytes(current)
+    record = recovered.prepare(action=action)
+    assert record.base == _snapshot(current, recovered.journal.limits.max_snapshot_bytes)
+    assert recovered.journal.snapshot(record, "base") == current
+    assert recovered.journal.snapshot(record, "target") == (
+        recovered.target if action == "configure" else current
+    )
+    assert read_snapshots(recovered.journal, recovered.previous, "base").configuration == historical
+    assert record.base != recovered.previous.base.configuration
+
+
+@pytest.mark.parametrize("recovered", ["aborted", "rolled_back"], indirect=True)
+def test_hot_configuration_does_not_bypass_exact_projection(recovered: Recovered) -> None:
+    Path(recovered.manifest.config_path).write_bytes(
+        Settings(default_mode="yolo").model_dump_json().encode()
+    )
+    recovered.store.db.execute("DELETE FROM objects WHERE kind='management_projection'")
+    recovered.store.db.commit()
+    with pytest.raises(TransactionError, match="projection_required"):
+        recovered.prepare(action="restart")
+    assert recovered.journal.read_current() == recovered.previous
+
+
+def test_restart_cannot_replace_hot_configuration_with_the_historical_base(
+    recovered: Recovered,
+) -> None:
+    historical = read_snapshots(recovered.journal, recovered.previous, "base").configuration
+    current = Settings(default_mode="yolo").model_dump_json().encode()
+    Path(recovered.manifest.config_path).write_bytes(current)
+    with pytest.raises(TransactionError, match="restart_changes_configuration"):
+        recovered.prepare(action="restart", target=historical)
+    assert recovered.journal.read_current() == recovered.previous
+    assert Path(recovered.manifest.config_path).read_bytes() == current
+
+
+def test_configuration_change_during_preparation_preserves_the_previous_generation(
+    recovered: Recovered, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = Settings(default_mode="yolo").model_dump_json().encode()
+    config_path = Path(recovered.manifest.config_path)
+    config_path.write_bytes(current)
+    replace = recovered.journal.directory.replace
+
+    def changed(name: str, data: bytes) -> None:
+        replace(name, data)
+        if name.endswith("-target.json"):
+            config_path.write_bytes(recovered.target)
+
+    monkeypatch.setattr(recovered.journal.directory, "replace", changed)
+    with pytest.raises(ValueError, match="configuration_changed"):
+        recovered.prepare()
+    assert recovered.journal.read_current() == recovered.previous
+    assert config_path.read_bytes() == recovered.target
+
+
 def test_target_budget_precedes_settings_parsing(
     recovered: Recovered,
     monkeypatch: pytest.MonkeyPatch,
@@ -256,7 +330,7 @@ def test_bridge_refuses_changed_evidence_without_replacing_state(
         recovered.store.db.execute("DELETE FROM objects WHERE kind='management_projection'")
         recovered.store.db.commit()
     elif mutation == "config":
-        Path(recovered.manifest.config_path).write_bytes(recovered.target)
+        Path(recovered.manifest.config_path).write_bytes(b"invalid configuration")
     elif mutation == "unit":
         Path(recovered.manifest.unit_path).write_bytes(b"[Service]\nExecStart=/foreign\n")
     elif mutation == "selector":
