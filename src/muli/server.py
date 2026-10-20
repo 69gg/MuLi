@@ -38,6 +38,7 @@ from muli.personal_io import PersonalIO
 from muli.plugins import PluginManager
 from muli.process import _wait_cleanup
 from muli.providers import ProviderError
+from muli.reply_origin import ReplyOrigin
 from muli.runtime import Runtime
 from muli.service import UserService
 from muli.session_records import SessionRecords
@@ -603,7 +604,7 @@ def create_app(
             "mcp": runtime.mcp.status(),
             "extensions": runtime.extensions.status(),
             "notifications": runtime.notifications.status(),
-            "channels": channel_application.manager.status(),
+            "channels": channel_application.status(),
             "capture": personal_io.capture.status(),
             "voice": personal_io.voice.status(),
             "web_voice": web_voice.status(),
@@ -650,7 +651,7 @@ def create_app(
     @app.get("/api/channels")
     async def channel_status() -> dict[str, Any]:
         return {
-            **channel_application.manager.status(),
+            **channel_application.status(),
             "deliveries": channel_application.manager.deliveries(),
         }
 
@@ -994,7 +995,7 @@ def create_app(
 
     @app.post("/api/reminders")
     async def create_reminder(body: ReminderInput) -> dict[str, Any]:
-        item = runtime.reminders.create(**body.model_dump())
+        item = runtime.reminders.create(**body.model_dump(), reply_origin=ReplyOrigin("web"))
         await runtime.bus.emit("reminder.updated", item)
         return item
 

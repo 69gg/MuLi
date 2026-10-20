@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any
 
@@ -13,7 +13,8 @@ import httpx
 
 from muli.attachments import Attachments, file_io
 from muli.events import EventBus
-from muli.reply_origin import ReplyOrigin
+from muli.proactive import FrozenRouting
+from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_account
 from muli.store import Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
@@ -38,6 +39,10 @@ def encoded(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
+class _BlockedDelivery(ChannelError):
+    pass
+
+
 class ChannelManager:
     def __init__(
         self,
@@ -48,9 +53,11 @@ class ChannelManager:
         attachments: Attachments | None = None,
         *,
         client: httpx.AsyncClient | None = None,
+        delivery_guard: Callable[[Mapping[str, Any], object], None] | None = None,
     ) -> None:
         self.store, self.bus, self.config, self.submit = store, bus, config, submit
         self.attachments = attachments
+        self.delivery_guard = delivery_guard
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.adapters: dict[str, Adapter] = {
@@ -67,6 +74,7 @@ class ChannelManager:
         self._active: set[str] = set()
         self._closed = False
         self._stopped = False
+        self._revocation_after = ""
         self.store.db.executescript(_SCHEMA)
         columns = {row[1] for row in self.store.db.execute("PRAGMA table_info(channel_inbound)")}
         if "fingerprint" not in columns:
@@ -74,14 +82,7 @@ class ChannelManager:
                 self.store.db.execute("ALTER TABLE channel_inbound ADD COLUMN fingerprint TEXT")
 
     def _account(self, name: str) -> str:
-        profile = self.config.profile(name)
-        if profile.account_id or profile.app_id or profile.user_id:
-            return profile.account_id or profile.app_id or profile.user_id
-        if name == "telegram":
-            prefix = profile.secret("token").partition(":")[0]
-            if prefix.isdigit():
-                return prefix
-        return "bot"
+        return channel_account(name, self.config.profile(name))
 
     def _state(self, key: str, default: str = "") -> str:
         row = self.store.db.execute(
@@ -162,6 +163,7 @@ class ChannelManager:
         for name in NAMES:
             profile = self.config.profile(name)
             channels[name] = {
+                "account_id": self._account(name),
                 "enabled": profile.enabled,
                 "active": name in self._active,
                 "owner_count": len(profile.owner_ids),
@@ -181,39 +183,57 @@ class ChannelManager:
 
     def _route(self, name: str, route: Mapping[str, Any], *, outbound: bool) -> dict[str, Any]:
         profile = self.config.profile(name)
-        sender, target, kind = (
-            route.get("sender_id"),
-            route.get("target"),
-            route.get("kind", "private"),
-        )
-        if any(
-            not isinstance(value, str) or not value or len(value) > 200
-            for value in (sender, target)
-        ) or kind not in {"private", "group"}:
-            raise ChannelError("渠道路由需要真实 sender_id/target/kind")
-        if route.get("name", name) != name or route.get(
-            "account_id", self._account(name)
-        ) != self._account(name):
-            raise ChannelError("渠道路由账号不匹配")
-        if kind == "group" and target not in profile.allowed_groups:
-            raise ChannelError("此群未在 allowed_groups 中绑定", status_code=403)
-        if kind == "private" and target != sender:
-            raise ChannelError("私聊目标与真实 sender_id 不一致", status_code=403)
-        if outbound and sender not in profile.owner_ids:
-            raise ChannelError("渠道收件人未绑定 owner_ids", status_code=403)
-        result = {
-            "name": name,
-            "account_id": self._account(name),
-            "target": target,
-            "sender_id": sender,
-            "kind": kind,
-        }
-        reply = route.get("reply_to")
-        if reply:
-            if not isinstance(reply, str) or len(reply) > 200:
-                raise ChannelError("渠道 reply_to 无效")
-            result["reply_to"] = reply
-        return result
+        try:
+            return authorize_route(
+                name,
+                route,
+                account_id=self._account(name),
+                owner_ids=profile.owner_ids,
+                allowed_groups=profile.allowed_groups,
+                outbound=outbound,
+            )
+        except RouteError as error:
+            raise ChannelError(str(error), status_code=error.status_code) from None
+
+    def _automatic_guard(self, name: str, route: Mapping[str, Any], metadata: object) -> None:
+        try:
+            if not self.config.profile(name).enabled:
+                raise ChannelError("原回复渠道未启用", status_code=404)
+            self._route(name, route, outbound=True)
+            if name not in self._active:
+                raise ChannelError("原回复渠道尚未就绪")
+            if self.delivery_guard is not None:
+                self.delivery_guard(route, metadata)
+        except ValueError as error:
+            raise _BlockedDelivery(str(error), status_code=403) from None
+
+    def _block_revoked(self) -> tuple[bool, bool]:
+        # Page through pending work, including queues left above a reduced limit.
+        # Sent/unknown rows are never reconsidered; each turn parses at most 100.
+        rows = self.store.db.execute(
+            "SELECT id,name,route,payload FROM channel_outbox WHERE state IN ('pending','retry') "
+            "AND json_extract(payload,'$.automatic')=1 AND id>? ORDER BY id LIMIT 101",
+            (self._revocation_after,),
+        ).fetchall()
+        more = len(rows) > 100
+        rows = rows[:100]
+        self._revocation_after = rows[-1]["id"] if more else ""
+        changed = False
+        with self.store.db:
+            for row in rows:
+                try:
+                    self._automatic_guard(
+                        row["name"],
+                        json.loads(row["route"]),
+                        json.loads(row["payload"]).get("attention_routing"),
+                    )
+                except _BlockedDelivery as error:
+                    self.store.db.execute(
+                        "UPDATE channel_outbox SET state='blocked',last_error=?,updated_at=? WHERE id=?",
+                        (str(error), now(), row["id"]),
+                    )
+                    changed = True
+        return changed, more
 
     async def webhook(self, name: str, raw: bytes, headers: Mapping[str, str]) -> dict[str, Any]:
         profile = self.config.profile(name)
@@ -430,8 +450,14 @@ class ChannelManager:
         route: Mapping[str, Any] | None = None,
         media_mode: str = "file",
         automatic: bool = False,
+        attention_routing: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         profile = self.config.profile(name)
+        metadata = (
+            FrozenRouting.load(attention_routing).dump() if attention_routing is not None else None
+        )
+        if metadata is not None and not automatic:
+            raise ChannelError("主动投递证据只能来自宿主自动回复")
         blocked = ""
         if automatic:
             # Preserve the original account and recipient even when today's
@@ -449,11 +475,7 @@ class ChannelManager:
                 raise ChannelError("自动回复来源无效，已保留在本地")
             selected = routes[0]
             try:
-                if not profile.enabled:
-                    raise ChannelError("原回复渠道未启用", status_code=404)
-                selected = self._route(name, selected, outbound=True)
-                if name not in self._active:
-                    raise ChannelError("原回复渠道尚未就绪")
+                self._automatic_guard(name, selected, metadata)
             except ChannelError as error:
                 blocked = str(error)
         else:
@@ -522,7 +544,11 @@ class ChannelManager:
             parts.append(part)
         if self._closed:
             raise ChannelError("渠道管理器已关闭，请使用当前配置重新发送")
-        payload = {"parts": parts}
+        payload: dict[str, Any] = {"parts": parts}
+        if automatic:
+            payload["automatic"] = True
+        if metadata is not None:
+            payload["attention_routing"] = metadata
         identifier = (
             hashlib.sha256(encoded([event_id, name, selected]).encode("utf-8")).hexdigest()
             if event_id
@@ -536,16 +562,30 @@ class ChannelManager:
                     for part in existing["payload"]["parts"]
                 ]
             }
-            if plain != payload or existing["route"] != selected:
+            if (
+                plain["parts"] != parts
+                or existing["route"] != selected
+                or existing["payload"].get("attention_routing") != metadata
+            ):
                 raise ChannelError("相同投递 ID 的内容或发送模式不一致", status_code=409)
             return existing
         count = self.store.db.execute(
             "SELECT count(*) FROM channel_outbox WHERE state IN ('pending','retry','sending')"
         ).fetchone()[0]
+        if automatic and not blocked:
+            try:
+                self._automatic_guard(name, selected, metadata)
+            except _BlockedDelivery as error:
+                blocked = str(error)
         if not blocked and count >= self.config.max_pending_deliveries:
             raise ChannelError("渠道投递队列已满", retryable=True, status_code=429)
         timestamp = now()
         with self.store.db:
+            if automatic and not blocked:
+                try:
+                    self._automatic_guard(name, selected, metadata)
+                except _BlockedDelivery as error:
+                    blocked = str(error)
             if not blocked:
                 try:
                     self._reserve_reply_parts(name, selected, parts)
@@ -579,6 +619,8 @@ class ChannelManager:
         """Reserve QQ's passive reply slots inside the caller's existing transaction."""
         if name != "qq" or not route.get("reply_to"):
             return
+        if parts and all("sequence" in part for part in parts):
+            return  # A blocked later segment keeps the original reservation.
         state_key = "qq_sequence:" + encoded(
             [route["account_id"], route["target"], route["reply_to"]]
         )
@@ -621,6 +663,10 @@ class ChannelManager:
         if not self.config.profile(item["name"]).enabled:
             raise ChannelError("原回复渠道未启用", status_code=404)
         self._route(item["name"], item["route"], outbound=True)
+        if item["payload"].get("automatic"):
+            self._automatic_guard(
+                item["name"], item["route"], item["payload"].get("attention_routing")
+            )
         if item["state"] == "blocked" and item["name"] not in self._active:
             raise ChannelError("原回复渠道尚未就绪")
         if (
@@ -684,6 +730,12 @@ class ChannelManager:
     async def _outbox(self) -> None:
         while True:
             self._wake.clear()
+            changed, more = self._block_revoked()
+            if changed or more:
+                if changed:
+                    await self._publish()
+                await asyncio.sleep(0)
+                continue
             names = sorted(self._active)
             if not names:
                 await self._wake.wait()
@@ -717,6 +769,10 @@ class ChannelManager:
                     (now(), item["id"]),
                 )
             try:
+                if item["payload"].get("automatic"):
+                    self._automatic_guard(
+                        item["name"], item["route"], item["payload"].get("attention_routing")
+                    )
                 route = self._route(item["name"], item["route"], outbound=True)
                 if item["name"] == "weixin":
                     route["context_token"] = self._state(
@@ -733,6 +789,10 @@ class ChannelManager:
                         if "attachment_id" in part
                         else None
                     )
+                    if item["payload"].get("automatic"):
+                        self._automatic_guard(
+                            item["name"], item["route"], item["payload"].get("attention_routing")
+                        )
                     receipt = await adapter.send(
                         route,
                         part.get("text", ""),
@@ -776,6 +836,8 @@ class ChannelManager:
                 state = (
                     "unknown"
                     if uncertain
+                    else "blocked"
+                    if isinstance(error, _BlockedDelivery)
                     else "retry"
                     if retryable and attempts < self.config.max_attempts
                     else "failed"
@@ -822,6 +884,7 @@ class ChannelManager:
                                             event_id=str(message.get("id") or event["id"]),
                                             route=route,
                                             automatic=True,
+                                            attention_routing=message.get("attention_routing"),
                                         )
                                     except ChannelError as error:
                                         if error.retryable:
