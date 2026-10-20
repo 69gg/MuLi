@@ -1,6 +1,6 @@
 # 2.19 Linux 同版本恢复入口
 
-状态：本地与最终候选八项 CI 通过，签名标签已推送，等待发行流水线和构件核验。本版连接此前分别审查的恢复组件，包含实际 CLI/API 接线；跨版本 A/B 更新仍为后续切片。
+状态：已发布。本地、最终候选八项 CI、main 八项 CI 与十一项发行作业通过，PyPI/GitHub 构件元数据逐项一致。本版连接此前分别审查的恢复组件，包含实际 CLI/API 接线；跨版本 A/B 更新仍为后续切片。
 
 Linux serve 在配置和业务数据库之前取得 writer lease，并核验实际 systemd 启动身份。宿主持久保存管理计划代次，再发布 manifest、journal 和候选配置；独立受限 helper 执行排空、停止、CAS、被动启动、健康确认及放行。业务库 WAL/FULL 与终态原子投影保留最新收件、原汇报来源和未知效果，不能通过换数据目录绕过同一个 unit 的未决事务。
 
@@ -16,6 +16,13 @@ CLI/HTTP 独立入口 31 项与身份/初始化 34 项回归分别通过。整�
 
 首轮远端矩阵 `39482512155` 的质量、MCP、Linux 与 macOS 全过，Windows 两项均只失败在新增 HTTP 测试默认以 cp1252 读取 UTF-8 中文候选配置。生产写入已显式 UTF-8；仅将测试读取指定相同编码，受限 11 项及 Ruff/格式通过，峰值 124.8 MiB、swap 0。签名提交 `c662d0eec49198f3790c2f0a33c506f9693bac8f` 的[最终八项 CI](https://github.com/69gg/MuLi/actions/runs/39483905264)全部成功，覆盖 Linux/macOS/Windows 的 Python 3.12/3.13；未盲重试旧候选或降低断言。
 
-同一精确提交已创建 GPG 签名标签 `v2.19.0`，并与 main 原子推送；[main CI](https://github.com/69gg/MuLi/actions/runs/39484677611)及[发行流水线](https://github.com/69gg/MuLi/actions/runs/39484678672)仍待最终核验。后续兼容模块与进程故障回归在下一分支，未混入本标签。
+同一精确提交已创建 GPG 签名标签 `v2.19.0`，并与 main 原子推送；[main CI](https://github.com/69gg/MuLi/actions/runs/39484677611)八项与[发行流水线](https://github.com/69gg/MuLi/actions/runs/39484678672)十一项均在第一次运行成功。macOS 发布作业排队期间继续下一分支工作，没有盲重试或改写标签。后续兼容模块与进程故障回归在下一分支，未混入本标签。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.19.0) 于 2026-10-20 19:47:51 UTC 发布；[PyPI 2.19.0](https://pypi.org/project/muli-agent/2.19.0/) 未被撤回。仅读取小型 API 元数据，两端文件名、大小和 SHA-256 全部一致，没有下载发行包：
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.19.0-py3-none-any.whl` | 595,332 | `9da75042991ae6b6d447375b374b071fafabdfb835d825bbf60b1282846c95a2` |
+| `muli_agent-2.19.0.tar.gz` | 3,280,035 | `49d8980902bfe67b68255b025da58550fc8a7a8d821bb37b04d8e06a81e7be25` |
 
 未操作用户真实 systemd 服务，未验证真实停机时长、断电或外部渠道故障；所有副作用使用临时文件、SQLite、fake runner/probe/transport。远端平台测试不等于真实 macOS/Windows 服务恢复验收。第一期只支持标准同用户 systemd unit、实际 cgroup v2 及本地持久文件系统；能力不足明确拒绝，不自动直接重启。原位 self_update 不获得跨版本回退能力。

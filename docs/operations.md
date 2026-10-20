@@ -66,7 +66,7 @@ Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用�
 
 服务管理按当前系统选择 systemd 用户服务、macOS LaunchAgent 或 Windows 当前用户计划任务。install 只安装，enable 只管理登录自动启动；start、stop、restart 分开执行。不会使用管理员权限或创建系统级服务。Windows 必须有当前 Python 环境对应的 pythonw.exe，避免弹出控制台；服务内重启由独立的一次性计划任务执行，避免结束发起者后无法再启动。macOS / Windows 日志保存至 logs/service.log，单份最多 1 MiB 并保留一个轮转文件。实际平台验证范围见 [平台能力](platforms.md)。
 
-Linux 同版本恢复已在开发分支接入独立控制者、serve bootstrap 和管理事务入口。提交或 helper accepted 只表示请求已保存/提交，最终结果须以 journal 终态及业务投影为准。waiting 等待完整自然空闲，只有 drained 后才暂停新执行；现有 owner 不收尾时有限超时保留原服务。未决代次阻止原始服务控制旁路；安装 unit 与调用者的配置、数据、解释器不符时拒绝操作。验证范围、恢复命令与限制见[同版本恢复入口](linux-recovery-operations.md)，不把离线通过当成真实机器故障注入通过。
+Linux 同版本恢复自 2.19.0 起已接入独立控制者、serve bootstrap 和管理事务入口。提交或 helper accepted 只表示请求已保存/提交，最终结果须以 journal 终态及业务投影为准。waiting 等待完整自然空闲，只有 drained 后才暂停新执行；现有 owner 不收尾时有限超时保留原服务。未决代次阻止原始服务控制旁路；安装 unit 与调用者的配置、数据、解释器不符时拒绝操作。验证范围、恢复命令与限制见[同版本恢复入口](linux-recovery-operations.md)，不把离线通过当成真实机器故障注入通过。
 
 交互 `MuLi init` 在配置成功后依次请求 install、enable、start，报告已完成步骤；启动请求被接受不等于服务已健康。`--no-service` 或 `--defaults` 跳过这一步，开发环境建议使用 `MuLi init --no-source --no-service`。启动失败时配置仍保留，可查看 `MuLi service status` 或使用 `MuLi serve` 诊断。
 

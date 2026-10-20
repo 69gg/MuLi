@@ -4,7 +4,7 @@ MuLi 只探测当前已安装的工具，不安装系统组件、下载模型或
 
 ## 当前用户服务
 
-开发分支的 Linux 同版本恢复已接入 CLI 和管理 API，要求标准 systemd unit、真实进程/cgroup 与本地文件系统证明；普通前台运行和 macOS/Windows 不声称获得同等恢复能力。详见[恢复入口及验证范围](linux-recovery-operations.md)。
+Linux 同版本恢复自 2.19.0 起已接入 CLI 和管理 API，要求标准 systemd unit、真实进程/cgroup 与本地文件系统证明；普通前台运行和 macOS/Windows 不声称获得同等恢复能力。详见[恢复入口及验证范围](linux-recovery-operations.md)。
 
 | 平台 | 后端 | 安装位置 | 日志 |
 | --- | --- | --- | --- |

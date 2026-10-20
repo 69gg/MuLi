@@ -1,6 +1,6 @@
 # Linux 同版本控制者与 helper 接口稿
 
-状态：2026-10-21，backend、独立 helper 入口和 transient ensure 已实现并通过离线替身回归；管理／CLI 发起与服务 bootstrap 已在开发分支接通。journal、控制者状态机、维护门、nonce 路由、Linux probe、安装 manifest 和配置 CAS 均复用既有合同。本稿不证明真实服务重启、硬退出接管或跨版本升级能力；整体验证见[恢复入口](linux-recovery-operations.md)。
+状态：2026-10-21，backend、独立 helper 入口和 transient ensure 已实现并通过离线替身回归；管理／CLI 发起与服务 bootstrap 已随 2.19.0 接通并发布。journal、控制者状态机、维护门、nonce 路由、Linux probe、安装 manifest 和配置 CAS 均复用既有合同。本稿不证明真实服务重启、硬退出接管或跨版本升级能力；整体验证见[恢复入口](linux-recovery-operations.md)。
 
 ## 文件归属与依赖
 

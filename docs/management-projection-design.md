@@ -1,6 +1,6 @@
 # 恢复事务的管理结果投影
 
-状态：纯投影函数已接入开发分支的启动恢复、管理状态与下一次准备入口。投影本身不会停止或启动服务。journal 是恢复过程的权威，网页管理对象和通知只作投影；整体验证范围见[恢复入口](linux-recovery-operations.md)。
+状态：纯投影函数已随 2.19.0 接入启动恢复、管理状态与下一次准备入口。投影本身不会停止或启动服务。journal 是恢复过程的权威，网页管理对象和通知只作投影；整体验证范围见[恢复入口](linux-recovery-operations.md)。
 
 `project_final(permit, store)` 只处理最新 resolved 的最终记录，不使用 `permit.record` 的启动缓存。`permit=None` 或尚无最终记录时返回 `None`。先确认真正持有目标 DB 的 writer lease，再以有限 `PRAGMA database_list` 核唯一 main 的实际路径，以 `runtime_state` 两个主键核 Store instance／主会话，并验证对应主会话对象已存在；不会调用可能建立主会话的 `Store.main_session()`。
 
