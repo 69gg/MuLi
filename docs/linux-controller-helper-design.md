@@ -1,6 +1,6 @@
 # Linux 同版本控制者与 helper 接口稿
 
-状态：2026-10-21，当前切片实现 backend 并通过离线替身回归；helper 与管理／CLI 发起接线仍是下述设计。前两块的 journal、控制者状态机、维护门与 nonce 路由已提交，Linux 只读 probe 与配置 CAS 已复用。本稿不证明真实服务重启、硬退出接管或升级能力。
+状态：2026-10-21，backend、独立 helper 入口和 transient ensure 已实现并通过离线替身回归；管理／CLI 发起与服务 bootstrap 仍待接通。前两块的 journal、控制者状态机、维护门与 nonce 路由已提交，Linux 只读 probe、安装 manifest 与配置 CAS 已复用。本稿不证明真实服务重启、硬退出接管或升级能力。
 
 ## 文件归属与依赖
 
@@ -9,7 +9,7 @@
 | 根任务 | `platforms/linux_transaction.py`：结构化 systemd/proc 观察；安装 manifest、原配置字节 CAS、bootstrap 身份模块及测试。保持其实际摘要、文件耐久性与服务入口核验的权威 |
 | 当前切片 | `platforms/linux_controller.py`：实现现有 `ControllerBackend`，复用 probe、配置 CAS 及同步安装核验回调，封装固定 nonce HTTP；不另造状态机 |
 | 当前切片 | `tests/test_linux_controller.py` 与控制者的必要窄回归：进程、HTTP、时钟、cgroup 均为替身；锁与配置文件只落临时目录，不运行真实服务 |
-| 后续 helper 切片 | `management_helper.py` 及其测试：仅接收 journal root 的轻量进程入口，取得同一 flock、验证实际资源、按原 deadline 驱动已有 `TransactionController`；transient ensure 也留在该片 |
+| 当前 helper 切片 | `management_helper.py` 及其测试：仅接收 journal root 的轻量进程入口，取得同一 flock、验证实际资源、按原 deadline 驱动已有 `TransactionController`；提供 transient ensure |
 | 后续协调接线 | `__main__.py`、`management.py`、`server.py`：在根任务提供 bootstrap 合同后再接，不在本接口稿阶段修改 |
 
 backend 接收 `UserService`、`TransactionJournal`、持有同一 journal flock 的 `JournalControl` 和 `verify_installation: Callable[[], None]`，可注入 `SystemdProbe`、command runner、HTTP transport 与共享 clock。安装模块就绪后用 manifest 的同步 `verify` 提供该回调。backend 不构造 `ConfigFile`、`Runtime` 或 `Store`。真实能力核验不依赖用户当前网页、模型输出或某个 PID 数字。
@@ -52,20 +52,32 @@ POST activate 可能已被宿主强拥有任务接受而响应超时。backend �
 
 ## 独立 helper 寿命
 
-固定绝对解释器以隔离模式执行 `-m muli.management_helper`，业务参数仅 journal root；建议 `WorkingDirectory=/`，不依赖调用者 cwd／PYTHONPATH。helper 名绑定完整安装摘要和 generation。ensure 先读取现有同名 unit 并核验 argv、身份与限制，不能以另起名字绕过已存在控制者或重启限制。
+公开接线为 `helper_unit_name(record)`、`helper_arguments(manifest, root)`、`await ensure_helper(control, manifest, *, probe=None, runner=run_process)` 与 `await run_helper(root, *, probe=None, runner=run_process, clock=clock_reading)`。ensure 的调用方已经持有同一 JournalControl；函数不会再争抢自己的 flock。root 必须是已有的规范绝对目录，不能借相对路径、父段或目录链接选择另一套 journal。
 
-transient 使用 service、Type=exec、KillMode=control-group、明确 UMask、MemoryMax、MemorySwapMax、CPUQuota、TasksMax、RuntimeMaxSec／TimeoutStopSec，并有有限 Restart/StartLimit；不使用 scope、后台 shell、PartOf 或 BindsTo 原应用的关系。不要求安装新 slice。manager 接受／exec 成功不是事务完成；helper 驱动任何效果前必须核验实际 cgroup 硬限。缺少能力明确 unsupported，保留原服务，不退回无保护进程。
+固定词法解释器以 `-I -m muli.management_helper <root>` 执行，保留虚拟环境入口，业务参数仅 journal root；`WorkingDirectory=/`，不依赖调用者 cwd／PYTHONPATH。unit 名为 `muli-transaction-` 加 canonical JSON `[installation_digest, generation]` 的完整 SHA-256，再加 `.service`。生成实际 argv 用 `--expand-environment=no`，不把 `$` 交给环境替换，也不经 shell。
 
-runner 顺序为：有界读取 manifest → 重构 journal → 取得固定 flock 并 adoption barrier → 核验自身 unit/资源与安装 → 在原持久 deadline 内逐步调用既有状态机。只在没有进展时做有限等待，等待预算来自 manifest；不创建第二套阶段或额外成功状态。普通控制者取消保留最后持久 intent，收尾 HTTP／进程句柄后退出；异常重入仍先观察实际状态，不能重新给满额 deadline。
+ensure 先用成功的精确 `ListUnitsByPatterns` 结果判断 manager 是否已加载同名 unit；存在时必须完整 `read_helper`，返回 running。未加载仅允许一次同名 transient 创建，返回 accepted；它不证明磁盘上无同名 unit，创建冲突／查询失败原样停止为固定失败，不 reset-failed、不 start 已退出同名 unit、不换名字。正在启动但尚不能通过严格 running 核验的同名 helper 也不能另起一个。固定错误不包含原始命令输出、配置、环境或 nonce。
+
+transient 使用 service、Type=exec、KillMode=control-group、SendSIGKILL、UMask=0077、MemoryMax、MemorySwapMax=0、CPUQuota、TasksMax、LimitCORE=0、NoNewPrivileges、OOMPolicy=kill、RuntimeMaxSec／TimeoutStopSec，并有有限 Restart=on-failure／StartLimit。`CollectMode=inactive` 且不使用 `--collect`，保留 failed unit 及本代重启限制，不通过 GC 重建重置失败预算。不使用 scope、后台 shell、PartOf 或 BindsTo 原应用的关系；Requires／Requisite／Conflicts 也不能指向原应用。不要求安装新 slice。
+
+manager 接受／exec 成功不是事务完成；helper 每步驱动前复用 `read_helper` 的实际 proc、argv、独立 unit 与内核 cgroup 硬限核验，并要求 MainPID 是当前 helper 的实际 PID。`OOMPolicy=kill` 之外必须读到 `memory.oom.group=1`；不存在可用的 MemoryOOMGroup D-Bus 属性。缺少能力明确失败，保留原服务，不退回无保护进程。这些是 helper 的独立预算，不宣称整套产品的 aggregate 硬限。
+
+runner 顺序为：有界读取 manifest → 重构 journal → 取得固定 flock → 共用 verifier 核本地文件系统与安装 → adoption barrier → 核验自身 unit/资源 → 在原持久 deadline 内逐步调用既有状态机。持久 record 的安装／服务／DB／journal 预算、总期限和回退预留必须与 manifest 一致。共用 verifier 复用 `verify_local_filesystems`，核 journal root、配置父目录、数据库父目录、真实 writer lease 目录，并在检查前后复核两个固定目录 anchor；不把通常重复的 data_dir 当作第四个独立挂载证明。ensure 创建前和 backend 每次效果前均调用同一 verifier，不另复制文件系统解析器。构造 journal 可建立协议私有目录，但此前后不构造 Store 或打开业务 writer。仅在记录没有推进时做有限等待，不创建第二套阶段或额外成功状态。普通控制者取消保留最后持久 intent，收尾 HTTP／进程句柄后退出；异常重入仍先观察实际状态，不能重新给满额 deadline。
+
+过期或时钟失效的未决记录仍可 ensure 一个受限 helper，仅让已有 driver 将它明确收敛为 recovery_required／blocked；不会延长原 deadline，也不会执行应用 stop、配置替换或 start。已经 resolved／recovery_required 不再创建 helper。driver 返回 recovery_required／blocked 后 helper 正常退出，不自发反复重启；真正启动／身份／资源故障以非零退出交给本代有限 Restart 预算。
 
 即使接管时记录已 resolved，也尝试最后一次同代 readiness GET 作为宿主提示。该请求失败不撤销持久 released、不制造隐式未完成状态；宿主现有配置／唤醒入口仍会按 journal 自修提示。配置、Store 与用户效果均不由 helper 做补偿或投影。blocked／recovery_required 不靠自动循环解除；未提供明确恢复能力时如实返回该状态。
 
-transient 在 user manager／机器整体重启后可能不存在。只由受支持服务的 bootstrap 或显式 recover 再 ensure 同代 helper，不新增常驻轮询守护进程，不启用 linger；未自动启动原服务且无人调用恢复入口时不承诺自动续接。
+transient 在 user manager／机器整体重启后可能不存在。后续只能由受支持服务的 bootstrap 或显式 recover 再 ensure 同代 helper，不新增常驻轮询守护进程，不启用 linger；这些发起入口尚未接通，未自动启动原服务且无人调用恢复入口时不承诺自动续接。
+
+持久 blocked 仅阻止其 health.boot 对应实例；新实例本地仍暂停，返回同代 paused 证明，控制者先持久重绑为 pending 后才允许 activate。本实例 activation 失败始终 blocked，不因换记录而自行重试。成功 activation 的实际宿主此后可继续可靠接收签名主人输入，即使执行门再次暂停；仍不启动模型／外发，重复 webhook 只持久接受一次。被动初始实例和激活失败实例均不因这个入口而获得权限。
 
 ## 离线验收与来源
 
-本 backend 的最小反证包含：启动窗口未持 lease 不过早 verifying、HTTP 前后 InvocationID 变化、原 boot 被拒作新健康、超限／重定向／压缩响应、已有 stop job、MainPID=0 但 cgroup 非空、lease 被占、CAS 冲突／desired 可见但 fsync 持续失败不得 start、同步确认后期限耗尽、激活响应丢失／取消后不重复 POST、真实控制者配合假服务完成 commit 及单次 rollback。helper 同名异 argv／资源不足、重复 ensure 与 resolved 接管后的最后提示仍待后续 helper 切片，当前未验收。测试仅替身，全部 guard 串行。
+本 backend 的最小反证包含：启动窗口未持 lease 不过早 verifying、HTTP 前后 InvocationID 变化、原 boot 被拒作新健康、超限／重定向／压缩响应、已有 stop job、MainPID=0 但 cgroup 非空、lease 被占、CAS 冲突／desired 可见但 fsync 持续失败不得 start、同步确认后期限耗尽、激活响应丢失／取消后不重复 POST、真实控制者配合假服务完成 commit 及单次 rollback。测试仅替身，全部 guard 串行。
 
 本片共 83 项定向用例有通过证据（45 个 backend 与 38 个控制者）。首组 82 项 0.56 秒、峰值 66.1 MiB；新增 backend 效果前时钟失效单例另验 0.09 秒，确认持久 recovery_required 且不替换配置。四文件 Ruff／格式、两源码严格 mypy 通过，静态检查峰值 123.7 MiB，swap 0。首轮 mypy 的两个局部 Optional 句柄提示改为区分可取得句柄与跨观察持有的 lease 后消除，相关 44 个 backend 也复验通过；没有放宽类型或资源限制。
+
+helper／维护门首组 56 项定向通过，3.03 秒、峰值 119.6 MiB；接入文件系统复核后最终 58 项通过，3.05 秒、峰值 119.5 MiB。五个 Python 文件 Ruff／格式、两个源码 mypy 通过，静态最高峰值 126 MiB，swap 0。覆盖同名现存／不明／错误资源拒绝、只创建一次与冲突、取消、实际 PID 不符零效果、原期限收敛、完整假 commit／单次 rollback、resolved 接管最后提示丢失、文件系统不支持时零创建／零业务效果和效果前挂载变更拒绝，以及两角色真实临时库 Maintenance→Controller 新 boot 重绑和真实 Runtime→HTTP 签名入站持久去重。首轮七项失败来自新测试对旧 FakeService 原 boot 常量及 dataclass DTO 的错误假设，修正夹具后通过，没有放宽产品门。尚未实测 transient 服务创建、原服务停止／启动、硬退出续接或发行安装闭环。
 
 已通过 Context7 查验 [systemd transient 可用属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[D-Bus 接口](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html)、[systemd-run 行为](https://github.com/systemd/systemd/blob/main/src/run/run.c) 和 [HTTPX 流式响应及客户端选项](https://github.com/encode/httpx/blob/0.28.1/httpx/_client.py)。这些上游资料不能代替已安装版本的 capability 核验；本稿未运行命令探测或真实产品服务。

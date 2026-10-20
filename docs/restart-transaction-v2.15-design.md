@@ -1,6 +1,6 @@
 # Linux 同版本配置／重启事务：首片接口设计
 
-状态：2026-10-21，整体设计与第一块纯 journal／单步控制者已通过独立复审及 60 项离线回归。第二块已接入真实 Runtime、应用生命周期、维护门和固定 nonce 路由，并通过临时库与假组件回归；第三块的真实 Linux 服务控制者、CLI bootstrap 与管理事务提交／投影仍未接通。因此尚不能通过现有 self_restart 取得可恢复重启，也未实测 systemd、中断或恢复成功率。最初基于 `368efc5` 研究，第二块已合入主动通知 A，保留其来源和投递语义。总目标参见[跨进程恢复总设计](recoverable-management-design.md)。不包含 A/B 安装、uv 下载、程序升级或数据库回滚。
+状态：2026-10-21，整体设计与第一块纯 journal／单步控制者已通过独立复审及 60 项离线回归。第二块已接入真实 Runtime、应用生命周期、维护门和固定 nonce 路由；第三块的 Linux backend、独立 helper／ensure 已有替身回归，详见[Linux 控制者与 helper](linux-controller-helper-design.md)。CLI bootstrap 与管理事务提交／投影仍未接通，因此尚不能通过现有 self_restart 取得可恢复重启，也未实测 systemd、中断或恢复成功率。最初基于 `368efc5` 研究，第二块已合入主动通知 A，保留其来源和投递语义。总目标参见[跨进程恢复总设计](recoverable-management-design.md)。不包含 A/B 安装、uv 下载、程序升级或数据库回滚。
 
 ## 第一块的实际边界
 
@@ -8,7 +8,7 @@
 
 持锁读取在执行任何效果前成功同步 journal 目录，作为接管可见记录的持久化屏障；写入或该屏障失败后，同一控制者拒绝继续。新控制者也必须先成功完成屏障。这个约束专门处理 rename 已可见而目录 fsync 失败的窗口，不会因此自动修复文件或重放效果。普通无锁 `journal.read()` 仅用于观察，不确认持久化。
 
-控制者只提供 `await step()`，由调用方持有 journal 锁并注入时钟和 `ControllerBackend`。当前唯一 backend 是测试中的内存替身。每个真实 backend 方法将来必须独立复核 owner、配置 CAS、cgroup 与 lease；这些是尚未验证的实现义务，不是本片已提供的保证。未提供轮询任务、子进程、真实服务适配器或可调用的恢复命令。
+控制者只提供 `await step()`，由调用方持有 journal 锁并注入时钟和 `ControllerBackend`。第一块仅用内存替身验收；后续 Linux backend 已独立实现 owner、配置 CAS、cgroup 与 lease 复核，helper 复用此状态机而不重建阶段。上述产品模块仍未构成已接通的管理／恢复命令，真实服务交接尚未验证。
 
 `phase` 表示持久决定，`intent` 仅区分需要先记录的停服／替换／启动步骤；`activation` 区分决定已落盘与执行门确已放行。`rolled_back` 与 `committed` 都必须另有同代放行证明才是 resolved。原始失败码与当前失败码分开，避免回退自身失败掩盖最初原因。一次回退标记和独立 challenge 限制自动回退次数并隔离目标／原配置的健康证明；未引入升级、组件级子事务或逐组件恢复状态。
 
@@ -43,7 +43,7 @@ drained 之后才阻止新模型／工具运行和新发送领取。已进入的
 | PersonalIO | shield 的 Portal probe 由 capture 持有，观察者取消不丢失句柄；关闭等待实际回收 |
 | 应用本地任务 | 记忆回填、管理应用与启动版本检查、延后的 onboarding 采用真实 Task，而非常驻 worker 的存活计数 |
 
-主人文字和审计过的本地查询继续可用：输入持久排队而不启动模型。正常旧实例允许签名渠道文字入站，渠道附件下载等待门；等待不消耗下载 attempt。只读长轮询等待及 chiliarch ACK／heartbeat 属于协议控制流，不被宣称为业务执行已清零；drained 不代表 HTTP 连接或控制帧为零。它们仍由原组件 close 强拥有收尾。probation 不启动这些外部接收器，也不接受渠道 webhook。外发 pending／retry、内存通知与管理候选保留；门释放后由事件一次唤醒，Attention 不依赖新 bus 事件才能处理暂停期间的事实。
+主人文字和审计过的本地查询继续可用：输入持久排队而不启动模型。正常旧实例允许签名渠道文字入站，渠道附件下载等待门；等待不消耗下载 attempt。只读长轮询等待及 chiliarch ACK／heartbeat 属于协议控制流，不被宣称为业务执行已清零；drained 不代表 HTTP 连接或控制帧为零。它们仍由原组件 close 强拥有收尾。被动实例在本代实际 activation 成功前不启动这些外部接收器，也不接受渠道 webhook；成功后保留可靠入站许可，随后暂停执行仍可持久接收主人文字，不启动模型。外发 pending／retry、内存通知与管理候选保留；门释放后由事件一次唤醒，Attention 不依赖新 bus 事件才能处理暂停期间的事实。
 
 无可核验生命周期／idle 合同的 Python legacy 插件不参与事务：检测到已加载／失败插件，或启用插件功能且发现未在 settings.plugins.disabled 中排除的带 plugin.json 包候选，返回 maintenance_unsupported/legacy_plugins。即使 manifest 内 enabled=false，也保守拒绝这类未显式 disabled 的候选；不导入来探测、不卸载原插件，旧服务保持运行。这不是插件后台任务的通用生命周期引擎。
 
@@ -60,7 +60,7 @@ drained 之后才阻止新模型／工具运行和新发送领取。已进入的
 
 原实例的 readiness 只接受 prepared／draining／aborted、activating+stop_base 或 rolling_back+stop_target，使用原 challenge、base 摘要和 origin boot；返回 paused 前同步复核全部 owner 与 effects 确实空闲。控制者仅在 prepared／draining 把原实例证明解释为 resumed／drained，其余停止窗口只用于重新核对原实例身份，不缓存先前 POST 响应。原 boot 始终不能通过 TransactionRecord.accepts 成为目标／回退新实例的健康证明；drain／resume 动作的阶段限制不变。
 
-激活前先成功 fsync journal 目录并重读同一记录；强拥有 activation Task 在首次外部 await 之前、组件启动之后和放行前再次校验阶段、当前 boot、配置、blocked 与原 deadline。观察者取消不终止它；同 boot 失败不会重复执行启动。release 回调失败同样使本地证明 blocked 并重新关门；已发生的外部效果不能撤销，不能据此承诺回滚。新 boot 续接必须先由控制者按第一块合同持久重绑 pending，不接受宿主自解 blocked。
+激活前先成功 fsync journal 目录并重读同一记录；强拥有 activation Task 在首次外部 await 之前、组件启动之后和放行前再次校验阶段、当前 boot、配置、blocked 与原 deadline。观察者取消不终止它；同 boot 失败不会重复执行启动。release 回调失败同样使本地证明 blocked 并重新关门；已发生的外部效果不能撤销，不能据此承诺回滚。持久 blocked 只限制其 health.boot，本实例 activation 失败始终 blocked；新 boot 本地仍暂停，必须先由控制者按第一块合同持久重绑 pending，重绑前 activate 拒绝，不接受宿主自解 blocked。target／base 两角色均有真实 Maintenance→Controller 的重绑与一次放行回归。
 
 组件在 committed／rolled_back 后启动，放行 receipt 另行持久后才 resolved。onboarding 可能修改配置，其任务延后到 resolved 再执行，避免启动过程中改变目标摘要；它保留既有幂等输入 ID，并纳入后续 drain 的真实 owner。配置与扩展写入从 prepared 到 resolved 都返回 transaction_in_progress；已排队管理计划保留 target，扩展 watcher 保留 dirty。
 

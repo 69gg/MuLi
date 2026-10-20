@@ -1,6 +1,6 @@
 # 可恢复的自身配置、重启与更新
 
-状态：2026-10-21 跨进程恢复整体设计；Linux 同版本切片已实现纯 journal／可注入控制者、维护门、被动 Runtime 与固定 nonce 握手，见[分块实现与证据](restart-transaction-v2.15-design.md)。真实 Linux 服务控制者、CLI／管理提交接线和 A/B 切换仍未交付，也没有实测中断时长或恢复成功率。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
+状态：2026-10-21 跨进程恢复整体设计；Linux 同版本切片已实现纯 journal／可注入控制者、维护门、被动 Runtime、固定 nonce 握手与 Linux backend／受限 helper，见[分块实现与证据](restart-transaction-v2.15-design.md)和[helper 接口](linux-controller-helper-design.md)。CLI／管理提交、服务 bootstrap 接线和 A/B 切换仍未交付，也没有实测中断时长或恢复成功率。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
 
 ## 交付目标与最小范围
 

@@ -6,10 +6,12 @@ import os
 import sqlite3
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
+from test_management_controller import FakeService
 
 from muli.maintenance import (
     Admission,
@@ -18,9 +20,12 @@ from muli.maintenance import (
     MaintenanceError,
     configuration_digest,
 )
+from muli.management_controller import ServiceObservation, TransactionController
 from muli.management_transaction import (
     ClockReading,
     Deadline,
+    Phase,
+    Role,
     ServiceIdentity,
     TransactionError,
     TransactionJournal,
@@ -137,6 +142,96 @@ async def test_admission_retains_real_owner_until_finally_and_release_wakes_once
     assert not admission.release()
     await waiting
     assert woke.is_set()
+
+
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_fresh_host_rebinds_blocked_decision_before_owned_activation(
+    host: tuple[TransactionJournal, Path, BootPermit, Maintenance], role: Role
+) -> None:
+    journal, path, _, _ = host
+    previous = target(host)
+    if role == "base":
+        assert previous.permit is not None
+        previous.permit.close_after_writers()
+        move(
+            journal,
+            Transition(phase="rolling_back", intent="stop_target", code="health_failed"),
+            Transition(phase="rolling_back", intent="restore_base"),
+            Transition(phase="rolling_back", intent="start_base"),
+            Transition(phase="rolling_back", intent="verify_base"),
+        )
+        path.write_bytes(BASE)
+        old = BootPermit.acquire(
+            journal, path, boot="base-old", installation="a" * 64, service="b" * 64
+        )
+        previous = Maintenance(old)
+        record = journal.read()
+        assert record is not None
+        previous.prepared(record.identity.store_instance, record.identity.main_session)
+        previous.owner("fake", lambda: True)
+        previous.seal({"fake"})
+    old_permit = previous.permit
+    assert old_permit is not None
+    record = journal.read()
+    assert record is not None
+    nonce = record.challenge if role == "target" else record.rollback_challenge
+    assert nonce is not None
+    phase: Phase = "committed" if role == "target" else "rolled_back"
+    proof = previous.readiness(record.generation, old_permit.boot, nonce)
+    blocked = move(
+        journal,
+        Transition(phase=phase, proof=proof),
+        Transition(phase=phase, activation="blocked", code="activation_failed"),
+    )
+    assert previous.readiness(record.generation, old_permit.boot, nonce).admission == "blocked"
+    old_permit.close_after_writers()
+    permit = BootPermit.acquire(
+        journal, path, boot=role + "-fresh", installation="a" * 64, service="b" * 64
+    )
+    try:
+        maintenance = Maintenance(permit)
+        maintenance.prepared(record.identity.store_instance, record.identity.main_session)
+        maintenance.owner("fake", lambda: True)
+        maintenance.seal({"fake"})
+        activated: list[str] = []
+
+        async def components() -> None:
+            activated.append(permit.boot)
+
+        maintenance.bind_activation(components)
+        with pytest.raises(MaintenanceError, match="activation_not_permitted"):
+            await maintenance.activate(record.generation, permit.boot, nonce, lambda: NOW)
+        assert not activated and not maintenance.admission.allowed
+        paused = maintenance.readiness(record.generation, permit.boot, nonce)
+        assert paused.admission == "paused"
+        assert journal.read() == blocked
+
+        class HostService(FakeService):
+            async def observe(self, current: TransactionRecord) -> ServiceObservation:
+                observed = await super().observe(current)
+                actual = maintenance.readiness(current.generation, permit.boot, nonce)
+                return replace(
+                    observed, health=actual, activation_failed=actual.admission == "blocked"
+                )
+
+            async def activate(self, current: TransactionRecord, role: Role) -> None:
+                self.calls.append("activate:" + role)
+                await maintenance.activate(current.generation, permit.boot, nonce, lambda: NOW)
+
+        service = HostService()
+        service.boot, service.role, service.configuration = permit.boot, role, path.read_bytes()
+        with journal.locked() as control:
+            driver = TransactionController(control, service, lambda: NOW)
+            rebound = await driver.step()
+            assert rebound.activation == "pending" and rebound.health == paused
+            assert not activated and not maintenance.admission.allowed
+            await driver.step()
+            assert activated == [permit.boot] and maintenance.admission.allowed
+            final = await driver.step()
+            assert final.phase == phase and final.resolved
+            assert service.calls == ["activate:" + role]
+    finally:
+        permit.close_after_writers()
 
 
 def test_drain_is_unavailable_until_all_owners_are_bound_and_idle(
