@@ -8,14 +8,16 @@ import math
 from typing import Any
 
 from muli.events import EventBus
+from muli.maintenance import Admission
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 
 
 class Reminders:
-    def __init__(self, store: Store, bus: EventBus) -> None:
+    def __init__(self, store: Store, bus: EventBus, *, admission: Admission | None = None) -> None:
         self.store, self.bus = store, bus
+        self.admission = admission or Admission()
         self.changed = asyncio.Event()
         self.task: asyncio.Task[None] | None = None
 
@@ -96,6 +98,11 @@ class Reminders:
             self.task = None
 
     async def _fire(self, item: dict[str, Any], timestamp: float) -> None:
+        await self.admission.wait()
+        with self.admission.operation():
+            await self._fire_admitted(item, timestamp)
+
+    async def _fire_admitted(self, item: dict[str, Any], timestamp: float) -> None:
         current = self.store.get("reminder", item["id"])
         if not current or not current["enabled"] or current["due_at"] != item["due_at"]:
             return
@@ -129,6 +136,7 @@ class Reminders:
 
     async def _run(self) -> None:
         while True:
+            await self.admission.wait()
             self.changed.clear()
             active = [item for item in self.store.list("reminder", 10000) if item["enabled"]]
             timestamp = now()

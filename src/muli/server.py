@@ -6,7 +6,7 @@ import asyncio
 import ipaddress
 import json
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -29,7 +29,15 @@ from muli.evidence import EvidenceError
 from muli.extensions import ExtensionError
 from muli.history_evidence import HistoryEvidence
 from muli.local_services import LocalServices
+from muli.maintenance import BootPermit, MaintenanceError
+from muli.maintenance_api import (
+    INTERNAL_METHODS,
+    install_maintenance_routes,
+    passive_request_allowed,
+    request_has_effect,
+)
 from muli.management import SelfManagement
+from muli.management_transaction import ClockReading
 from muli.memory_application import MemoryApplication
 from muli.memory_evidence import MemoryEvidence, memory_listing
 from muli.middleware import BodyLimitMiddleware
@@ -138,11 +146,15 @@ def create_app(
     runtime: Runtime | None = None,
     *,
     listen_port: int | None = None,
+    boot_permit: BootPermit | None = None,
+    maintenance_clock: Callable[[], ClockReading] | None = None,
 ) -> FastAPI:
     config = config or ConfigFile(default_config_path())
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
-    runtime = runtime or Runtime(config, data_dir or default_data_dir())
+    if runtime is not None and boot_permit is not None:
+        raise ValueError("boot_permit 只能由一个运行时持有")
+    runtime = runtime or Runtime(config, data_dir or default_data_dir(), boot_permit=boot_permit)
     attention = AttentionInbox(runtime, lambda: config.settings.system_events)
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
@@ -155,9 +167,17 @@ def create_app(
     from muli.integrations.manager import IntegrationManager
 
     integration = IntegrationManager(runtime)
+    runtime.maintenance.owner("integration", lambda: integration.idle)
+    runtime.maintenance.owner("memory_recovery", lambda: memory_application.idle)
+    runtime.maintenance.owner("personal_io", lambda: personal_io.idle)
     configuration_closing = False
+    onboarding_task: asyncio.Task[None] | None = None
+    runtime.maintenance.owner(
+        "onboarding", lambda: onboarding_task is None or onboarding_task.done()
+    )
 
     async def apply_configuration(target: Settings) -> None:
+        runtime.maintenance.require_configuration()
         if configuration_closing:
             raise ValueError("服务正在关闭，不能应用新配置")
         if not bound_loopback and not target.server.password_hash:
@@ -187,6 +207,7 @@ def create_app(
                 await channel_application.close()
                 await personal_io.close()
                 await memory_application.close()
+                runtime.maintenance.require_configuration()
                 runtime.validate_proactive_settings(target)
                 config.replace(target)
                 await rebuild()
@@ -202,6 +223,8 @@ def create_app(
             raise asyncio.CancelledError
 
     async def onboarding() -> None:
+        if runtime.maintenance.configuration_blocked:
+            return
         if config.settings.onboarding_pending and config.settings.models.main.configured:
             await runtime.submit(
                 "请先和我打个招呼，并带我逐步完善配置。先询问我最希望你帮忙的事情，再按实际需要配置"
@@ -210,24 +233,59 @@ def create_app(
                 source="onboarding",
                 event_id="first-setup-v2",
             )
-            config.update({"onboarding_pending": False})
+            async with runtime.configuration_lock:
+                if not runtime.maintenance.configuration_blocked:
+                    config.update({"onboarding_pending": False})
+
+    def wake_onboarding() -> None:
+        nonlocal onboarding_task
+        if (
+            not configuration_closing
+            and runtime.started
+            and config.settings.onboarding_pending
+            and (onboarding_task is None or onboarding_task.done())
+        ):
+
+            async def admitted_onboarding() -> None:
+                with runtime.maintenance.admission.operation():
+                    await onboarding()
+
+            onboarding_task = asyncio.create_task(admitted_onboarding(), name="muli-onboarding")
+
+    runtime.maintenance.on_configuration_release(wake_onboarding)
+
+    async def activate_components() -> None:
+        await plugins.load()
+        if runtime.maintenance.permit and runtime.maintenance.permit.probation:
+            await runtime.activate_components()
+        else:
+            await runtime.startup()
+        await attention.start()
+        await memory_application.start()
+        await channel_application.start()
+        await personal_io.start()
+        await integration.start()
+        await management.start()
+        await onboarding()
+
+    runtime.maintenance.bind_activation(activate_components)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         nonlocal configuration_closing
         try:
-            await plugins.load()
-            await runtime.startup()
-            await attention.start()
-            await memory_application.start()
-            await channel_application.start()
-            await personal_io.start()
-            await integration.start()
-            await management.start()
-            await onboarding()
+            if not (runtime.maintenance.permit and runtime.maintenance.permit.probation):
+                await activate_components()
             yield
         finally:
             configuration_closing = True
+            try:
+                await runtime.maintenance.settle_activation()
+            except Exception:
+                pass  # The failed activation remains blocked; still close its components.
+            if onboarding_task is not None:
+                onboarding_task.cancel()
+                await asyncio.gather(onboarding_task, return_exceptions=True)
             # Let an owned apply/rollback finish before finally stopping its components.
             # Do not hold the lock while joining a worker that may be waiting for it.
             await management.close()
@@ -255,12 +313,42 @@ def create_app(
     app.state.local_services = local_services
     app.state.web_voice = web_voice
     plugins = PluginManager(runtime, app, config.path.resolve().parent / "plugins")
+
+    def legacy_plugins_present() -> bool:
+        if plugins.contexts or any(item["status"] == "failed" for item in plugins.inventory()):
+            return True
+        if not config.settings.plugins.enabled or not plugins.directory.exists():
+            return False
+        # Candidate boots must reject before importing unknown startup hooks.
+        try:
+            return any(
+                entry.is_dir()
+                and not entry.is_symlink()
+                and entry.name not in config.settings.plugins.disabled
+                and (entry / "plugin.json").exists()
+                for entry in plugins.directory.iterdir()
+            )
+        except OSError:
+            return True
+
+    runtime.maintenance.unsupported("legacy_plugins", legacy_plugins_present)
     management = SelfManagement(runtime, plugins, service, apply_configuration)
+    runtime.maintenance.seal(
+        {
+            "runtime",
+            "integration",
+            "memory_recovery",
+            "personal_io",
+            "management",
+            "onboarding",
+        }
+    )
     app.state.management, app.state.plugins = management, plugins
     app.state.memory_application = memory_application
     app.state.attention = attention
     app.state.channel_application, app.state.personal_io = channel_application, personal_io
     app.add_middleware(BodyLimitMiddleware)
+    install_maintenance_routes(app, runtime, maintenance_clock)
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next: Any) -> Any:
@@ -301,6 +389,7 @@ def create_app(
             "/api/channels/onebot/webhook",
             "/api/channels/qq/webhook",
         }
+        internal_handshake = (request.method, request.url.path) in INTERNAL_METHODS
         if (
             request.url.path.startswith("/api/")
             and request.url.path
@@ -309,10 +398,33 @@ def create_app(
                 "/api/auth/login",
             }
             and not signed_webhook
+            and not internal_handshake
             and not authentication.authenticated(request.cookies.get(COOKIE_NAME, ""))
         ):
             return JSONResponse({"detail": "需要登录"}, status_code=401)
-        response = await call_next(request)
+        if not internal_handshake:
+            runtime.maintenance.reconcile()
+        durable_webhook = (
+            signed_webhook
+            and runtime.started
+            and channel_application.manager.receiving
+            and runtime.maintenance.accepts_external_input
+        )
+        if (
+            not runtime.maintenance.admission.allowed
+            and not durable_webhook
+            and not passive_request_allowed(
+                request.method, request.url.path, runtime.main_session()["id"]
+            )
+        ):
+            return JSONResponse({"detail": "execution_paused"}, status_code=409)
+        if not durable_webhook and request_has_effect(
+            request.method, request.url.path, runtime.main_session()["id"]
+        ):
+            with runtime.maintenance.admission.operation():
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
@@ -329,6 +441,24 @@ def create_app(
     async def bad_input(request: Request, exc: ValueError) -> JSONResponse:
         status = 409 if isinstance(exc, ExtensionError) and exc.code == "runtime_busy" else 400
         return JSONResponse({"detail": str(exc)[:1000]}, status_code=status)
+
+    @app.exception_handler(MaintenanceError)
+    async def maintenance_error(request: Request, exc: MaintenanceError) -> JSONResponse:
+        status = (
+            401
+            if exc.code == "transaction_unauthorized"
+            else 503
+            if exc.code
+            in {
+                "transaction_unavailable",
+                "maintenance_incomplete",
+            }
+            else 409
+        )
+        return JSONResponse(
+            {"detail": exc.code, **({"reason": exc.reason} if exc.reason else {})},
+            status_code=status,
+        )
 
     @app.exception_handler(EvidenceError)
     async def unavailable_evidence(request: Request, exc: EvidenceError) -> JSONResponse:
@@ -640,6 +770,7 @@ def create_app(
 
     @app.post("/api/extensions/reload")
     async def reload_extensions() -> dict[str, Any]:
+        runtime.maintenance.require_configuration()
         return runtime.extensions.request_reload()
 
     @app.post("/api/management/{identifier}/cancel")

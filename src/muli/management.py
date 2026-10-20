@@ -11,6 +11,7 @@ from typing import Any
 from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
 from muli.extensions import ExtensionError
+from muli.maintenance import MaintenanceError
 from muli.plugins import PluginManager
 from muli.proactive import FrozenRouting
 from muli.providers import Message
@@ -48,6 +49,9 @@ class SelfManagement:
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._check: asyncio.Task[dict[str, Any]] | None = None
+        self._applying: asyncio.Task[Any] | None = None
+        runtime.maintenance.owner("management", lambda: self.idle)
+        runtime.maintenance.on_configuration_release(self._wake.set)
         runtime.add_tool_provider(self.tools)
         runtime.context_hooks.append(self.context)
 
@@ -69,6 +73,7 @@ class SelfManagement:
     async def stage(
         self, action: str, changes: dict[str, Any] | None = None, version: str = ""
     ) -> dict[str, Any]:
+        self.runtime.maintenance.require_configuration()
         if action not in {"configure", "restart", "update"}:
             raise ValueError("未知管理操作")
         if any(item["status"] in {"pending", "applying"} for item in self.plans()):
@@ -156,12 +161,14 @@ class SelfManagement:
         while True:
             await self._wake.wait()
             self._wake.clear()
+            await self.runtime.maintenance.wait_configuration()
             for item in reversed(self.plans()):
                 if item["status"] != "pending":
                     continue
                 await self._idle()
+                await self.runtime.maintenance.wait_configuration()
                 async with self.runtime.configuration_lock:
-                    if self.runtime.busy:
+                    if self.runtime.busy or self.runtime.maintenance.configuration_blocked:
                         self._wake.set()
                         continue
                     current = self.runtime.store.get("management", item["id"])
@@ -170,6 +177,8 @@ class SelfManagement:
                     await self._apply(current)
 
     async def _apply(self, item: dict[str, Any]) -> None:
+        self.runtime.maintenance.require_configuration()
+        self._applying = asyncio.current_task()
         path = self.directory / f"{item['id']}.json"
         try:
             if fingerprint(self.runtime.config.settings) != item["base"]:
@@ -188,7 +197,10 @@ class SelfManagement:
                 await self.service.action("restart")
             item["status"] = "completed"
         except Exception as exc:
-            if (
+            if isinstance(exc, MaintenanceError) and exc.code == "transaction_in_progress":
+                item["status"] = "pending"
+                self._wake.set()
+            elif (
                 item["action"] == "configure"
                 and isinstance(exc, ExtensionError)
                 and exc.code == "runtime_busy"
@@ -198,14 +210,23 @@ class SelfManagement:
             else:
                 item.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
         finally:
-            if item["status"] not in {"pending", "applying"}:
-                path.unlink(missing_ok=True)
-            self.runtime.store.event(
-                "management.queued" if item["status"] == "pending" else "management.completed",
-                item,
-                objects=[("management", item)],
-            )
-            await self.runtime.bus.notify()
+            try:
+                if item["status"] not in {"pending", "applying"}:
+                    path.unlink(missing_ok=True)
+                self.runtime.store.event(
+                    "management.queued" if item["status"] == "pending" else "management.completed",
+                    item,
+                    objects=[("management", item)],
+                )
+                await self.runtime.bus.notify()
+            finally:
+                self._applying = None
+
+    @property
+    def idle(self) -> bool:
+        return (self._applying is None or self._applying.done()) and (
+            self._check is None or self._check.done()
+        )
 
     async def close(self) -> None:
         tasks = [task for task in (self._worker, self._check) if task is not None]

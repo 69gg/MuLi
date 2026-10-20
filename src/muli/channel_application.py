@@ -41,14 +41,17 @@ class ChannelApplication:
 
         for name in ("onebot", "telegram", "qq", "weixin"):
             data[name] = ChannelProfile(**data[name])
-        return ChannelManager(
+        manager = ChannelManager(
             self.runtime.store,
             self.runtime.bus,
             ChannelsConfig(**data),
             submit,
             self.attachments,
             delivery_guard=delivery_guard,
+            admission=self.runtime.maintenance.admission,
         )
+        manager.recover()
+        return manager
 
     def status(self) -> dict[str, Any]:
         settings = self.runtime.config.settings

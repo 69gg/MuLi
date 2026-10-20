@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from muli.events import EventBus
+from muli.maintenance import Admission
 from muli.media import MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
 from muli.store import now
@@ -137,9 +138,11 @@ class MemoryPipeline:
         extractor: Extractor | None = None,
         media: MemoryMedia | None = None,
         config: MemoryPipelineConfig | None = None,
+        admission: Admission | None = None,
     ) -> None:
         self.memory, self.bus = memory, bus
         self.config = config or MemoryPipelineConfig()
+        self.admission = admission or Admission()
         self.extractor, self.media = extractor, media
         self.memory.configure(
             graph_hops=self.config.graph_hops,
@@ -224,13 +227,17 @@ class MemoryPipeline:
     async def start(self) -> None:
         if not self.config.enabled or (self._worker is not None and not self._worker.done()):
             return
+        self.recover()
+        self._worker = asyncio.create_task(self._run(), name="muli-memory")
+        self._wake.set()
+
+    def recover(self) -> None:
+        """Requeue local interrupted work without starting model/media calls."""
         with self.memory.store.db:
             self.memory.store.db.execute(
                 "UPDATE memory_jobs SET state='queued',updated_at=? WHERE state='processing'",
                 (now(),),
             )
-        self._worker = asyncio.create_task(self._run(), name="muli-memory")
-        self._wake.set()
 
     async def close(self) -> None:
         worker, self._worker = self._worker, None
@@ -331,6 +338,7 @@ class MemoryPipeline:
 
     async def _run(self) -> None:
         while True:
+            await self.admission.wait()
             self._wake.clear()
             self._admit_deferred()
             row = self.memory.store.db.execute(
@@ -351,35 +359,39 @@ class MemoryPipeline:
                     pass
                 continue
             source_id = str(row[0])
+            with self.admission.operation():
+                await self._run_job(source_id)
+            await asyncio.sleep(0)
+
+    async def _run_job(self, source_id: str) -> None:
+        with self.memory.store.db:
+            self.memory.store.db.execute(
+                "UPDATE memory_jobs SET state='processing',attempts=attempts+1,updated_at=? WHERE source_id=?",
+                (now(), source_id),
+            )
+        try:
+            async with asyncio.timeout(self.config.job_timeout):
+                await self._process(source_id)
+        except asyncio.CancelledError:
             with self.memory.store.db:
                 self.memory.store.db.execute(
-                    "UPDATE memory_jobs SET state='processing',attempts=attempts+1,updated_at=? WHERE source_id=?",
+                    "UPDATE memory_jobs SET state='queued',updated_at=? WHERE source_id=? AND state='processing'",
                     (now(), source_id),
                 )
-            try:
-                async with asyncio.timeout(self.config.job_timeout):
-                    await self._process(source_id)
-            except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # Upstream bodies may contain credentials: only persist the exception class.
+            self._last_error = type(error).__name__
+            job = self.job(source_id)
+            if job is not None:
+                state = "failed" if job["attempts"] >= self.config.max_attempts else "retry"
+                delay = self.config.retry_backoff_seconds * job["attempts"]
                 with self.memory.store.db:
                     self.memory.store.db.execute(
-                        "UPDATE memory_jobs SET state='queued',updated_at=? WHERE source_id=? AND state='processing'",
-                        (now(), source_id),
+                        "UPDATE memory_jobs SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE source_id=?",
+                        (state, now() + delay, self._last_error, now(), source_id),
                     )
-                raise
-            except Exception as error:
-                # Upstream bodies may contain credentials: only persist the exception class.
-                self._last_error = type(error).__name__
-                job = self.job(source_id)
-                if job is not None:
-                    state = "failed" if job["attempts"] >= self.config.max_attempts else "retry"
-                    delay = self.config.retry_backoff_seconds * job["attempts"]
-                    with self.memory.store.db:
-                        self.memory.store.db.execute(
-                            "UPDATE memory_jobs SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE source_id=?",
-                            (state, now() + delay, self._last_error, now(), source_id),
-                        )
-            await self._publish(source_id)
-            await asyncio.sleep(0)
+        await self._publish(source_id)
 
     def _validated(self, payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):

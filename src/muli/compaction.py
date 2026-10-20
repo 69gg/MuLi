@@ -113,6 +113,10 @@ class Compactor:
             "generation": active.get("generation", 0),
         }
 
+    @property
+    def idle(self) -> bool:
+        return not self._tasks
+
     async def finish(self, session_id: str) -> bool:
         """One foreground-pressure fallback; ordinary turns never await summaries."""
         task = self._tasks.get(session_id)

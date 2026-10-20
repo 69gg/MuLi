@@ -20,6 +20,7 @@ from muli.integrations.chiliarch import (
     PairingResult,
 )
 from muli.integrations.manager import IntegrationManager
+from muli.maintenance import Maintenance
 from muli.permissions import Mode
 from muli.store import Store, new_id
 from muli.tools.files import Files
@@ -46,6 +47,7 @@ class FakeRuntime:
         self.store = Store(directory / "state.db")
         self.bus = EventBus(self.store)
         self.files = Files(self.config.settings, directory / "data")
+        self.maintenance = Maintenance()
         self.tasks: dict[str, asyncio.Task[str]] = {}
         self.runs: dict[str, asyncio.Task[str]] = {}
         self.started: list[tuple[str, str, Mode | None]] = []

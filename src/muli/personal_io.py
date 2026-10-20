@@ -28,6 +28,7 @@ class PersonalIO:
             self.media,
             self.on_voice,
             on_status=self.on_voice_status,
+            admission=runtime.maintenance.admission,
         )
         runtime.add_tool_provider(self.tools, coordinator=False)
 
@@ -42,6 +43,11 @@ class PersonalIO:
 
     async def start(self) -> None:
         await self.voice.start()
+
+    @property
+    def idle(self) -> bool:
+        # refresh_portal owns a shielded child even if its HTTP observer is gone.
+        return self.capture.idle
 
     async def on_voice_status(self, event: dict[str, Any]) -> None:
         await self.runtime.bus.emit("voice.status", event)
@@ -65,6 +71,7 @@ class PersonalIO:
             self.media,
             self.on_voice,
             on_status=self.on_voice_status,
+            admission=self.runtime.maintenance.admission,
         )
         await self.start()
 

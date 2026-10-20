@@ -60,6 +60,12 @@ class WorkflowEngine:
         """Include finalizers even after their persisted status became terminal."""
         return tuple(identifier for identifier, task in self._tasks.items() if not task.done())
 
+    @property
+    def idle(self) -> bool:
+        return all(task.done() for task in self._tasks.values()) and all(
+            task.done() for task in self._cancellations.values()
+        )
+
     def unfinished_run_ids(
         self, *, workflow_id: str | None = None, after_id: str = "", limit: int = 100
     ) -> list[str]:

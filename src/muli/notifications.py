@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape
 
 from muli.config import DesktopNotifications
 from muli.events import EventBus
+from muli.maintenance import Admission
 from muli.process import run_process
 from muli.store import Store
 
@@ -72,6 +73,7 @@ class DesktopNotifier:
         max_body_chars: int = 2000,
         process_output_bytes: int = 4096,
         runner: ProcessRunner | None = None,
+        admission: Admission | None = None,
     ) -> None:
         if min(max_title_chars, max_body_chars, process_output_bytes) < 1:
             raise ValueError("桌面通知标题、正文和进程输出限制必须大于零")
@@ -80,7 +82,9 @@ class DesktopNotifier:
         self.max_title_chars, self.max_body_chars = max_title_chars, max_body_chars
         self.process_output_bytes = process_output_bytes
         self.runner = runner or run_process
+        self.admission = admission or Admission()
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(self.config.max_queue)
+        self._queued = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._capability = notification_capability()
         self._started = False
@@ -155,6 +159,7 @@ class DesktopNotifier:
         item = (safe_title, _literal_text(body, self.max_body_chars, body=True))
         try:
             self._queue.put_nowait(item)
+            self._queued.set()
         except asyncio.QueueFull:
             self._dropped += 1
 
@@ -178,38 +183,48 @@ class DesktopNotifier:
 
     async def _send(self) -> None:
         while True:
-            title, body = await self._queue.get()
-            self._sending = True
+            await self.admission.wait()
             try:
-                async with asyncio.timeout(self.config.timeout):
-                    result = await self.runner(
-                        [
-                            self._capability["command"],
-                            "--app-name=MuLi",
-                            "--urgency=normal",
-                            f"--expire-time={self.config.expire_ms}",
-                            "--hint=boolean:suppress-sound:true",
-                            "--",
-                            title,
-                            body,
-                        ],
-                        timeout=self.config.timeout,
-                        limit=self.process_output_bytes,
-                    )
-                if result["exit_code"] != 0:
-                    raise OSError("notify-send 未确认成功")
-                self._sent += 1
-                self._state, self._last_error = "ready", None
-            except asyncio.CancelledError:
-                self._dropped += 1
-                raise
-            except Exception:
-                self._failed += 1
-                self._state = "error"
-                self._last_error = "桌面通知发送失败；请检查通知服务和当前用户桌面会话"
-            finally:
-                self._sending = False
-                self._queue.task_done()
+                title, body = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                self._queued.clear()
+                await self._queued.wait()
+                continue
+            with self.admission.operation():
+                await self._deliver(title, body)
+
+    async def _deliver(self, title: str, body: str) -> None:
+        self._sending = True
+        try:
+            async with asyncio.timeout(self.config.timeout):
+                result = await self.runner(
+                    [
+                        self._capability["command"],
+                        "--app-name=MuLi",
+                        "--urgency=normal",
+                        f"--expire-time={self.config.expire_ms}",
+                        "--hint=boolean:suppress-sound:true",
+                        "--",
+                        title,
+                        body,
+                    ],
+                    timeout=self.config.timeout,
+                    limit=self.process_output_bytes,
+                )
+            if result["exit_code"] != 0:
+                raise OSError("notify-send 未确认成功")
+            self._sent += 1
+            self._state, self._last_error = "ready", None
+        except asyncio.CancelledError:
+            self._dropped += 1
+            raise
+        except Exception:
+            self._failed += 1
+            self._state = "error"
+            self._last_error = "桌面通知发送失败；请检查通知服务和当前用户桌面会话"
+        finally:
+            self._sending = False
+            self._queue.task_done()
 
     async def close(self) -> None:
         self._started = False

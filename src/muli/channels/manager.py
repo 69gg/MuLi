@@ -13,6 +13,7 @@ import httpx
 
 from muli.attachments import Attachments, file_io
 from muli.events import EventBus
+from muli.maintenance import Admission
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_account
 from muli.store import Store, new_id, now
@@ -54,10 +55,12 @@ class ChannelManager:
         *,
         client: httpx.AsyncClient | None = None,
         delivery_guard: Callable[[Mapping[str, Any], object], None] | None = None,
+        admission: Admission | None = None,
     ) -> None:
         self.store, self.bus, self.config, self.submit = store, bus, config, submit
         self.attachments = attachments
         self.delivery_guard = delivery_guard
+        self.admission = admission or Admission()
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.adapters: dict[str, Adapter] = {
@@ -67,6 +70,8 @@ class ChannelManager:
             "weixin": Weixin(config.weixin, self.client),
         }
         self._tasks: list[asyncio.Task[None]] = []
+        self._incoming: set[asyncio.Task[Any]] = set()
+        self._recovered = False
         self._wake = asyncio.Event()
         self.changed = asyncio.Condition()
         self._inbound_lock = asyncio.Lock()
@@ -108,6 +113,22 @@ class ChannelManager:
                     self._errors[name] = str(error)
                 else:
                     self._active.add(name)
+        self.recover()
+        self._tasks = [
+            asyncio.create_task(self._outbox(), name="muli-channel-outbox"),
+            asyncio.create_task(self._events(), name="muli-channel-events"),
+        ]
+        for name in ("telegram", "weixin"):
+            if name in self._active:
+                self._tasks.append(
+                    asyncio.create_task(self._poll(name), name="muli-channel-" + name)
+                )
+        self._wake.set()
+
+    def recover(self) -> None:
+        """Pure local crash recovery; probation never needs to start adapters."""
+        if self._recovered:
+            return
         with self.store.db:
             # A process may have died after remote acceptance but before local commit.
             self.store.db.execute(
@@ -124,20 +145,12 @@ class ChannelManager:
                 self.store.db.execute(
                     "INSERT INTO channel_state VALUES('events',?)", (str(latest),)
                 )
-        self._tasks = [
-            asyncio.create_task(self._outbox(), name="muli-channel-outbox"),
-            asyncio.create_task(self._events(), name="muli-channel-events"),
-        ]
-        for name in ("telegram", "weixin"):
-            if name in self._active:
-                self._tasks.append(
-                    asyncio.create_task(self._poll(name), name="muli-channel-" + name)
-                )
-        self._wake.set()
+        self._recovered = True
 
     async def close(self) -> None:
         self._closed = True
         tasks, self._tasks = self._tasks, []
+        tasks = list(set(tasks).union(self._incoming) - {asyncio.current_task()})
         for task in tasks:
             task.cancel()
         if tasks:
@@ -148,6 +161,10 @@ class ChannelManager:
         self._stopped = True
         async with self.changed:
             self.changed.notify_all()
+
+    @property
+    def receiving(self) -> bool:
+        return bool(self._tasks) and not self._closed
 
     def status(self) -> dict[str, Any]:
         counts = {
@@ -266,6 +283,17 @@ class ChannelManager:
         return {"op": 12} if name == "qq" else {"ok": True}
 
     async def receive(self, name: str, message: IncomingMessage) -> dict[str, Any]:
+        if self._closed:
+            raise ChannelError("渠道正在关闭", status_code=503)
+        task = asyncio.current_task()
+        assert task is not None
+        self._incoming.add(task)
+        try:
+            return await self._receive(name, message)
+        finally:
+            self._incoming.discard(task)
+
+    async def _receive(self, name: str, message: IncomingMessage) -> dict[str, Any]:
         profile = self.config.profile(name)
         if not profile.enabled:
             raise ChannelError("渠道未启用", status_code=404)
@@ -328,8 +356,9 @@ class ChannelManager:
                 if trusted and profile.receive_files and self.attachments is not None
                 else ()
             )
-            async with asyncio.timeout(profile.timeout):
-                for index, remote in enumerate(wanted[staged["processed"] :], staged["processed"]):
+            for index, remote in enumerate(wanted[staged["processed"] :], staged["processed"]):
+                await self.admission.wait()
+                with self.admission.operation():
                     if staged["attempts"] >= self.config.max_attempts:
                         staged["warnings"].append("附件多次接收超时，未自动继续下载")
                         staged["processed"], staged["attempts"] = index + 1, 0
@@ -338,8 +367,9 @@ class ChannelManager:
                     staged["attempts"] += 1
                     checkpoint()
                     try:
-                        content = await self.adapters[name].download(remote, route)
-                        attachment = await self._save_file(content, name)
+                        async with asyncio.timeout(profile.timeout):
+                            content = await self.adapters[name].download(remote, route)
+                            attachment = await self._save_file(content, name)
                     except ChannelError as error:
                         if error.retryable and staged["attempts"] < self.config.max_attempts:
                             raise
@@ -729,6 +759,7 @@ class ChannelManager:
 
     async def _outbox(self) -> None:
         while True:
+            await self.admission.wait()
             self._wake.clear()
             changed, more = self._block_revoked()
             if changed or more:
@@ -761,98 +792,102 @@ class ChannelManager:
                 continue
             item = self.delivery(row[0])
             assert item is not None
-            adapter = self.adapters[item["name"]]
-            adapter.delivery_started = False
-            with self.store.db:
-                self.store.db.execute(
-                    "UPDATE channel_outbox SET state='sending',attempts=attempts+1,updated_at=? WHERE id=?",
-                    (now(), item["id"]),
+            with self.admission.operation():
+                await self._send_item(item)
+            await asyncio.sleep(0)
+
+    async def _send_item(self, item: dict[str, Any]) -> None:
+        adapter = self.adapters[item["name"]]
+        adapter.delivery_started = False
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE channel_outbox SET state='sending',attempts=attempts+1,updated_at=? WHERE id=?",
+                (now(), item["id"]),
+            )
+        try:
+            if item["payload"].get("automatic"):
+                self._automatic_guard(
+                    item["name"], item["route"], item["payload"].get("attention_routing")
                 )
-            try:
+            route = self._route(item["name"], item["route"], outbound=True)
+            if item["name"] == "weixin":
+                route["context_token"] = self._state(
+                    "context:weixin:" + self._account("weixin") + ":" + route["target"]
+                )
+            part = item["payload"]["parts"][item["next_part"]]
+            async with asyncio.timeout(self.config.profile(item["name"]).timeout):
+                file = (
+                    await self._file(
+                        part["attachment_id"],
+                        item["name"],
+                        media_mode=part.get("media_mode", "file"),
+                    )
+                    if "attachment_id" in part
+                    else None
+                )
                 if item["payload"].get("automatic"):
                     self._automatic_guard(
                         item["name"], item["route"], item["payload"].get("attention_routing")
                     )
-                route = self._route(item["name"], item["route"], outbound=True)
-                if item["name"] == "weixin":
-                    route["context_token"] = self._state(
-                        "context:weixin:" + self._account("weixin") + ":" + route["target"]
-                    )
-                part = item["payload"]["parts"][item["next_part"]]
-                async with asyncio.timeout(self.config.profile(item["name"]).timeout):
-                    file = (
-                        await self._file(
-                            part["attachment_id"],
-                            item["name"],
-                            media_mode=part.get("media_mode", "file"),
-                        )
-                        if "attachment_id" in part
-                        else None
-                    )
-                    if item["payload"].get("automatic"):
-                        self._automatic_guard(
-                            item["name"], item["route"], item["payload"].get("attention_routing")
-                        )
-                    receipt = await adapter.send(
-                        route,
-                        part.get("text", ""),
-                        file,
-                        key=item["id"],
-                        sequence=part.get("sequence", item["next_part"]),
-                    )
-                receipts = [*item["receipts"], receipt]
-                next_part = item["next_part"] + 1
-                with self.store.db:
-                    self.store.db.execute(
-                        "UPDATE channel_outbox SET state=?,next_part=?,attempts=0,next_attempt=?,last_error='',receipts=?,updated_at=? WHERE id=?",
-                        (
-                            "sent" if next_part == len(item["payload"]["parts"]) else "pending",
-                            next_part,
-                            now(),
-                            encoded(receipts),
-                            now(),
-                            item["id"],
-                        ),
-                    )
-            except asyncio.CancelledError:
-                with self.store.db:
-                    self.store.db.execute(
-                        "UPDATE channel_outbox SET state=?,last_error=?,updated_at=? WHERE id=?",
-                        (
-                            "unknown" if adapter.delivery_started else "pending",
-                            "关闭时发送结果未确认" if adapter.delivery_started else "",
-                            now(),
-                            item["id"],
-                        ),
-                    )
-                raise
-            except Exception as error:
-                safe = str(error) if isinstance(error, ChannelError) else type(error).__name__
-                uncertain = (
-                    error.uncertain if isinstance(error, ChannelError) else adapter.delivery_started
+                receipt = await adapter.send(
+                    route,
+                    part.get("text", ""),
+                    file,
+                    key=item["id"],
+                    sequence=part.get("sequence", item["next_part"]),
                 )
-                retryable = isinstance(error, ChannelError) and error.retryable
-                attempts = item["attempts"] + 1
-                state = (
-                    "unknown"
-                    if uncertain
-                    else "blocked"
-                    if isinstance(error, _BlockedDelivery)
-                    else "retry"
-                    if retryable and attempts < self.config.max_attempts
-                    else "failed"
+            receipts = [*item["receipts"], receipt]
+            next_part = item["next_part"] + 1
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE channel_outbox SET state=?,next_part=?,attempts=0,next_attempt=?,last_error='',receipts=?,updated_at=? WHERE id=?",
+                    (
+                        "sent" if next_part == len(item["payload"]["parts"]) else "pending",
+                        next_part,
+                        now(),
+                        encoded(receipts),
+                        now(),
+                        item["id"],
+                    ),
                 )
-                delay = max(
-                    self.config.retry_backoff_seconds * attempts,
-                    error.retry_after if isinstance(error, ChannelError) else 0,
+        except asyncio.CancelledError:
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE channel_outbox SET state=?,last_error=?,updated_at=? WHERE id=?",
+                    (
+                        "unknown" if adapter.delivery_started else "pending",
+                        "关闭时发送结果未确认" if adapter.delivery_started else "",
+                        now(),
+                        item["id"],
+                    ),
                 )
-                with self.store.db:
-                    self.store.db.execute(
-                        "UPDATE channel_outbox SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE id=?",
-                        (state, now() + delay, safe, now(), item["id"]),
-                    )
-            await self._publish()
-            await asyncio.sleep(0)
+            raise
+        except Exception as error:
+            safe = str(error) if isinstance(error, ChannelError) else type(error).__name__
+            uncertain = (
+                error.uncertain if isinstance(error, ChannelError) else adapter.delivery_started
+            )
+            retryable = isinstance(error, ChannelError) and error.retryable
+            attempts = item["attempts"] + 1
+            state = (
+                "unknown"
+                if uncertain
+                else "blocked"
+                if isinstance(error, _BlockedDelivery)
+                else "retry"
+                if retryable and attempts < self.config.max_attempts
+                else "failed"
+            )
+            delay = max(
+                self.config.retry_backoff_seconds * attempts,
+                error.retry_after if isinstance(error, ChannelError) else 0,
+            )
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE channel_outbox SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE id=?",
+                    (state, now() + delay, safe, now(), item["id"]),
+                )
+        await self._publish()
 
     async def _events(self) -> None:
         after = int(self._state("events", "0"))
