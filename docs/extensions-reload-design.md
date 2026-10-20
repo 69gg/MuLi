@@ -1,0 +1,102 @@
+# MCP 与 Agent Skills 发现及热重载
+
+状态：设计与首片实现合同，尚未整体发布验收。Skills 模块已完成离线候选回归，MCP 目录与运行时接线由独立切片交付；整体状态以整合验证为准。用户已授权自动配置与后续实施，本文不增加许可门。第一期复用现有空闲任务边界：文件变化可以在运行期间发现，但必须等当前主任务、团队与工作流空闲后才切换。`queued` 不代表已加载，更不承诺执行中的调用已经使用新配置。
+
+## 最小交付行为
+
+用户将标准 Skill 放进 MuLi 的 `skills` 目录，或将 MCP 配置放进 `mcp.d` 后，MuLi 自动发现、验证并报告加载状态。模型通过有界目录知道可用 Skills，按需读取正文与资源；不会因扫描目录而运行脚本。MuLi 可通过现有自身管理工具配置这些能力，无需另建配置账本或重启整个服务。
+
+发现、准备和发布是不同步骤。非法或半写文件、连接失败、重名或超预算不能拆掉当前仍可用的工具与 Skill 正文。第一期只在空闲时发布，复用现有 `configuration_lock` 和自身管理等待机制；不先重构所有模型轮次为多代连接租约。运行中无等待切换、任意 Python 插件卸载与服务 A/B 更新分别留在后续切片。
+
+## 当前实现与复用位置
+
+| 现有位置 | 已有能力 | 本次需要补齐 |
+| --- | --- | --- |
+| `config.default_home` | `MULI_HOME`，默认 `Path.home() / "MuLi"` | 派生扩展目录及有类型的预算配置，不写死用户名 |
+| `config._validate_mcp/_public_mcp` | `mcpServers` 格式校验、至多 32 个 server、密钥隐藏 | 目录分片合并与来源诊断；保留旧配置语义 |
+| `tools/mcp.MCPManager` | stdio/HTTP/SSE、工具命名、统一权限、调用超时与结果脱敏 | 完整候选判定、分页、总目录预算、变更通知 |
+| `runtime.reconfigure/_start_mcp` | 工具提供者重注册 | 当前先关闭旧 MCP 再连接新 MCP，不可直接用作失败保旧代的热切换 |
+| `LocalServices` | session 工具提供者、上下文钩子 | Skill 元数据目录、正文与资源读取、有限活跃状态 |
+| `SelfManagement` | 校验、私有配置快照、空闲排队、配置锁 | 扩展专用窄应用；不能为 MCP-only 变化拆掉全部运行时 |
+| `PluginManager` | 受信任本地 Python 插件与重启加载 | 保持原行为，不能把 Markdown Skills 等同可热卸载 Python 代码 |
+
+`MCPManager.start()` 当前按 server 捕获连接或导入异常并写入 `status` 后继续；因此“调用没有抛异常”不代表候选成功。它还先获取工具列表再按 `max_tools` 截取，这既不是完整目录的证明，也不是接收阶段的内存上限。
+
+## 目录与兼容合同
+
+默认目录由 `default_home()` 推导为 `skills/<name>/SKILL.md` 和 `mcp.d/*.json`。允许在配置中显式替换这两个根，空值使用默认；既有 `MULI_CONFIG`、内联 `mcp` 与配置旁的 `plugins` 路径不改变。不自动扫描整个 HOME、`.claude`、`.agents` 或任意项目，也不因安装 Skill 扫描其全部资源树。MCP 协议不规定本地配置目录，`mcp.d` 是 MuLi 的产品约定。
+
+每个 MCP 分片仍使用已有 `{"mcpServers": {...}}` 格式，复用校验与脱敏。**新目录文件代表明确安装的配置来源，其中省略 `enabled` 时默认启用；显式 `enabled:false` 或 `disabled:true` 停用。旧内联配置省略 `enabled` 时仍停用。** 新约定只在目录归一化时补默认值，不改全局校验器的旧语义。跨分片或内联出现同名 server 时拒绝候选，报告两个来源，不采用隐式覆盖；分片内重复 JSON 键也拒绝。
+
+保留现有禁止隐式下载的规则：`npx` 必须离线或 `--no-install`，`uvx` 必须离线；不为缺失命令、库或服务器自动安装依赖。`self_configure` 继续承担权限与配置校验；扩展目录内的 agent 写入仍经过已有文件/写入权限，扩展内容不能批准自身安装或外部操作。
+
+首期目录扫描只列举 Skills 的一级包目录和 MCP 的一级 JSON 文件。根目录先确定规范路径，包入口及资源必须为允许根内的普通文件，拒绝符号链接逃逸；不把单次 `resolve()` 当成竞争写入期间的保证。Skills 源与资源在支持的平台从绝对路径根逐段以 `dir_fd + O_DIRECTORY | O_NOFOLLOW` 打开，绑定已接受的包目录身份，最终文件只相对已绑定父目录读取并前后复核；祖先目录换成符号链接不能改变实际读取目标。首片拒绝在缺少这些能力的平台读取已安装 Skill，状态明确 `secure_file_reads:false`；空目录、关闭 Skills 和核心聊天仍正常，不宣称已适配 Windows 安全句柄。用户应使用原子替换发布文件；同一普通文件被对抗性改写且伪造元数据、挂载替换等不在可信扩展目录的防护承诺内。MCP 分片读取的对应边界由其实现独立验证。
+
+## Skills：元数据、正文和资源分开
+
+兼容 [Agent Skills 规范](https://agentskills.io/specification) 的目录与 YAML frontmatter：`name`、`description` 必须为字符串，接受 `license`、`compatibility`、字符串映射 `metadata` 与实验性 `allowed-tools`。校验名称长度/字符/目录一致性、说明长度，未知宿主专用字段给出诊断；不宣称实现 Claude Code hooks、subagent 或工具权限语义。`allowed-tools` 是兼容提示，不能扩大 MuLi 的可执行工具集。包内 `scripts`、`references`、`assets` 可存在，扫描时不读取或执行。
+
+使用 PyYAML `SafeLoader`，不手写 YAML 解析器，也不使用默认不安全 Loader。安全构造器本身不是资源配额：在有限 frontmatter 的事件/节点检查中拒绝别名、过深结构、多文档和重复键，再验证浅层标量/字符串映射。源字节、解析深度与节点数分别设界限，错误使用固定诊断码，不回显源正文。Context7 已核对 [PyYAML API](https://github.com/yaml/pyyaml/blob/main/lib/yaml/__init__.py) 与 [alias 的节点复用行为](https://github.com/yaml/pyyaml/blob/main/lib/yaml/composer.py)，不能把 `safe_load` 宣传成防止所有循环结构或资源放大的机制。
+
+依赖核查：本地安装元数据与 `uv.lock` 都已有 PyYAML 6.0.3，但 `pyproject.toml` 未声明核心依赖，当前通过 MCP 的间接依赖得到。缓存目录中找到 6.0.3 的索引记录不等于已证明所有目标平台均有可用离线 wheel。Skills 实施时声明小型直接依赖，并先离线核对锁与当前平台缓存；本次没有执行 `uv sync`、升级或下载。仅安装核心包也必须能用 Skills，不能隐式要求安装 MCP extra。
+
+目录钩子只把 `{name, description, location, revision}` 放进模型上下文，不把所有正文加入提示词。候选在总源字节预算内读取、解析并保存不可变的元数据与完整正文，正文按需交付；这点有意区别于只存路径的目录，否则文件替换失败后无法保留旧正文。哈希覆盖已接受源字节，元数据与正文来自同一快照，不额外常驻一份原始字节。最多保存当前代和一个候选，发布后释放旧目录快照，不无限保留历史代。
+
+提供 session 作用域的 `skill_read(name, revision)`。名称来自当前目录，修订不符明确返回 `skill_changed`；完整正文须服从沿用的单次交付预算和活跃集合预算。工具只返回 `activated`、正文 hash 和 `delivery:next_model_context` 回执，完整正文由下一次上下文钩子注入一次，不再同时传进工具结果。激活前用真实已准备请求加合法小型调用/回执批次预检，预算不足明确不激活；实际下一请求仍检查其它调用与固定上下文。正文可建议模型继续读取包内相对资源，读取工具复用路径校验、普通文件检查与现有输出预算；资源过大时明确返回节选范围/续读位置。资源首期按读取时版本返回自己的内容哈希，await 后重新检查接受代，不把已退役代的资源交付为当前指导；不承诺整个资源包已做不可变快照。
+
+活跃 Skill 不能只依赖最近一次 tool 结果的 `preserve_content`：现有 `context.pack_context` 只保护最新完整工具批次，较旧结果仍会被节选或压缩。首期在现有 Store 对象机制中保存每 session 一个有上限的活跃集合，内容为 `{name, revision, body_hash, body}`，正文复用已接受快照且总量有限；上下文钩子重注该集合，主会话重开与压缩后都能继续使用。同名重复激活不叠加；达到名额或 Skills 注入预算时明确拒绝，不静默挤掉仍被使用的指令。完整请求仍由现有上下文打包器核验总预算；后续配置缩小或其它固定资料挤占导致放不下时，完整持久正文保留，但本轮显式 `guidance_status:suspended`、不注入任何半份指导，模型可调用 `skill_forget` 清除或修正预算。必要时目录也明确暂停，仅发有限恢复提示，不能因本功能锁死清除入口；不承诺任意超大新用户输入都能容纳。首期没有接入 worker 结束即回收钩子，只在该会话下次上下文准备时按当前目录失效或显式清除，不宣称跨会话状态总数已有全局上限；宿主预留 `release_session` 供后续会话删除流程复用。发布新目录时，变更/删除项的旧激活失效并提示重新读取，未变更项保留；不在任务进行中偷偷替换正文。
+
+Skills 的窄 `runtime.skills_context` 回调在全部普通 `context_hooks` 和不可变 task snapshot 注入后执行，随后 Runtime 仍做最终打包。它不是排在普通 hooks 第一位的扩展，否则后置插件资料和任务证据可绕过暂停判断。只调用一次 Skills 回调，不重复执行普通插件 hooks，也不能为保留指导裁剪权威任务正文。
+
+这遵循官方的[渐进加载集成建议](https://agentskills.io/client-implementation/adding-skills-support)：宿主提供目录与读取能力，由模型决定何时激活，不另加关键词路由或模型轮询器。Skill 内容可指导工作，但不能变成用户授权或绕过执行门。
+
+## MCP：候选连接与空闲发布
+
+首次启动沿用当前 best-effort 服务可用性：无可用扩展时核心助手仍工作，逐来源报告失败，不能伪称所有配置已加载。运行期间，一旦有当前代，新的扩展重载必须完整验证后才替换；一个目标 enabled server 失败不发布部分目录，也不删除旧工具。目录不存在是合法空来源；用户明确删除文件或停用 server 是有意移除，成功发布后才生效。
+
+加载器维护 `active_generation`、一个候选与一个合并后的 dirty 标记。阶段固定为 `discovered → queued → preparing → loaded`，失败为 `failed` 或 `restart_required`。发现新文件只更新待处理指纹；busy 时保持 `queued`。空闲后取得 `configuration_lock` 并重新检查 `runtime.busy`；该属性已经包含主任务、queued/running agent 与未完 workflow。候选准备和发布在受总时限约束的锁内进行，新运行入口在现有锁后排队，管理读取继续可用。
+
+候选复用已验证且未变化的 server 连接，只为新增/变化的 server 建立新连接；可由小型 server 连接包装持有一个所有者，切换时转移所有权，失败只关闭本候选新建连接。不能将旧 client 的清理栈一并关闭。候选工具闭包必须绑定它验证过的 client/server，不能用全局 server 名临时查到别代连接。
+
+准备依次完成配置校验、客户端初始化、完整工具目录读取、名称冲突/schema/预算检查。每个目标启用 server 均须有明确 `loaded` 状态；合法零工具 server 也可成功。候选全部通过后，在无 await 的发布步骤里替换 MCP 工具子集与当前配置指纹，保留内置和第三方 provider 工具。第一期发布时已无执行中的主/worker/workflow 调用，随后才退休删除或变化的旧连接；关闭故障记为退役错误，不把已发布的新目录撤回成未知状态。
+
+候选连接准备失败、取消或总期限到达时，必须关闭新客户端、进程及清理栈，旧代不受影响。独占端口、文件锁等 stdio server 不能旧新并存时返回 `restart_required`，不为验证候选先杀掉旧服务。未知外部副作用不因重载或清理自动重试。
+
+`self_configure` 的 MCP-only 补丁与目录发现必须经过同一个扩展应用器；不能一条路径先关旧代，另一条路径保留旧代。混合修改模型、渠道等配置仍走原有整体配置路径，第一期不宣称它也获得了全部失败保旧能力。配置持久化必须与内存发布绑定成一次管理操作：先准备候选，再保存已校验配置，保存失败不发布；只有保存与发布均成功才记 `loaded`。目录来源本身不会被偷偷改写进 `config.json`，状态中保留来源指纹。
+
+## FastMCP 2.13.1 的真实接口边界
+
+本设计以锁定的 FastMCP **2.13.1** 和 MCP SDK **1.21.0** 为基线，不升级到 3.x。Context7 当前主线文档会描述自动分页，但本地安装源码中 `Client.list_tools_mcp()` 直接调用 `session.list_tools()` 一次，`list_tools()` 只取其 `tools`，不会自动取 `nextCursor`。实现须使用该 SDK 的 `session.list_tools(params=PaginatedRequestParams(cursor=...))`，循环中检查 `nextCursor` 推进并设置页数、总工具数、schema/描述总字节与整个候选的总期限。超限应拒绝候选，不能截成一个看似完整的新目录。
+
+该版 `Client` 已接受 `message_handler`，`MessageHandler.on_tool_list_changed` 已存在；MuLi 当前没有接入。按 [FastMCP 通知接口](https://gofastmcp.com/clients/notifications) 将通知合并到同一候选刷新器，旧目录继续服务，server 关闭后不得由迟到通知复活。分页与 `notifications/tools/list_changed` 依据 [MCP 2025-06-18 tools 协议](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)；不把更新版协议的其他通知/订阅接口推断为 2.13.1 已支持。
+
+工具目录限制在 SDK 返回单页之后才能检查，尚不是传输层单帧字节上限。首期不宣称可抵御不可信服务器在一个 JSON 响应内发送任意大载荷；对此需要另行核实传输层预解码预算，不能用分页数或 schema 长度检查替代。既有结果脱敏、工具风险与统一权限继续适用，server 提供的 annotations 也不授予权限。
+
+## 预算与变更检测
+
+下列数值为首期可配置默认值，按有类型配置集中校验，UI 不必暴露全部内部参数。文件、目录、解析、上下文与连接分别计量；任何一项超限都是明确失败，不自动加预算重试。
+
+| 对象 | 默认预算与处理 |
+| --- | --- |
+| 扫描 | 每次最多 256 个一级目录/文件入口，最多 64 个 Skill；不递归枚举资源树 |
+| Skill 源 | 单个 `SKILL.md` 256 KiB，frontmatter 16 KiB；所有已接受源合计 2 MiB；YAML 深度 8、节点数 256 |
+| Skill 目录上下文 | 完整 JSON 字符最多 12,000；超限拒绝候选，不悄悄隐藏尾部 Skills |
+| 活跃正文 | 每 session 最多 4 项、完整 JSON 合计至多 24,000 字符，并服从当前 `max_context_chars`；单次完整交付还服从 `max_output_chars`，正文只注入一次 |
+| MCP 配置 | 至多 32 个分片，单片 64 KiB、总共 256 KiB；最终 server 数沿用既有上限 32 |
+| MCP 工具目录 | 至多 8 页、100 个工具、schema/名称/描述合计 256 KiB；超限拒绝候选，不当作成功截断 |
+| 连接准备 | 整个候选最多 30 秒，单 server 仍受已有 timeout；至多一个候选，失败立即清理 |
+| 检测 | 每 2 秒一次轻量有限扫描，500 毫秒去抖；无变化不重连，不启动模型；相同失败指纹不循环重试 |
+
+工具变更通知和文件变化共用 singleflight：准备时再有变化只设 dirty，完成后重新读取稳定来源；不得逐通知积累任务。失败指纹只有在源变化、server 发出新的目录通知或用户显式重试时再准备。快照身份与 hash 用于防止普通并发修改和重复工作，不是本地恶意代码沙箱。
+
+状态至少给出 `active_generation`、阶段、来源、指纹、排队原因、各 server/skill 结果与固定失败码；敏感值仍交给既有脱敏，不能把 env、headers、连接异常原文或 Skill 正文塞进全局状态事件。自动发现只在新代接受后报告加载成功；`failed` 时同时指出哪一代仍在服务。进程重启后首次发现失败仍允许核心助手工作；首期的保旧代承诺限定在同一运行进程的热重载，不宣称已有持久 last-known-good 扩展环境恢复。
+
+## 交付与验证边界
+
+先独立交付 Skills：配置与预算、直接 YAML 依赖、受限目录、元数据钩子、正文/资源读取、有限活跃状态和文件变更排队。它不依赖 MCP extra，也不执行包内脚本。第二片再补 MCP 分片、候选连接、分页与目录变更通知，最后将自身配置的扩展专用窄应用接到同一发布器。每片同步用户文档、配置 schema 与回归，不以设计稿替代实现证据。
+
+离线 fake client 与临时目录验证包括：核心包无 MCP extra 仍能用 Skills；多行 YAML、非法类型/别名/重复键/超深与预算；半写和原子替换；同名来源、路径逃逸与非普通文件；元数据/正文同代、资源变化有明确结果；压缩/重开后有限活跃正文可恢复；busy 排队期间仍用旧目录；新连接失败或取消保留旧代；同指纹不重连；分页游标重复和总限；合法零工具 server；通知风暴只保留一个候选；改变配置保存失败不发布；关闭候选不误关复用连接。
+
+所有本地执行仍必须通过 `scripts/check_local.py`，测试串行、无真实账号/设备、无下载或服务器安装。Skills 首片在 MCP 接线候选树只读绑定后，47 项回归通过，峰值 72.7 MiB、swap 0，Ruff 与模块 mypy 通过；包括源/资源父目录置换门控、资源读取后换代、真实 Runtime 单次正文交付、后置普通 hook 与权威 task snapshot 的预算顺序，以及预算缩小后通过工具清除恢复。所有 Runtime 用例隔离 `MULI_HOME`、使用离线模型，不读取用户扩展目录。PyYAML 缺少类型 stub，仅对三处外部导入局部标注 `import-untyped`，节点值仍做类型验证；没有为检查下载类型包。
+
+本次没有加载真实第三方 Skill、连接用户 MCP server 或改变运行配置；本机受限回归不等于验证所有外部 server 或三平台文件监听语义。目录句柄选择依据 Context7 核对的 [Python `dir_fd` 平台合同](https://docs.python.org/3.13/library/os.html#os.supports_dir_fd)，Windows 读取能力明确未交付。运行中即时换代、多进程协同监听、Python 插件热卸载、包级不可变资源快照与持久 last-known-good 环境恢复均未在第一期交付范围内。

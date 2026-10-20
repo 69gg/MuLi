@@ -48,6 +48,8 @@ assistant 工具调用批次与其全部结果是不可分割单位，未闭合�
 
 `context_hooks` 接收异步 `(session_id, messages) -> messages`，每个安全边界使用新历史投影调用，之后再统一检查预算和工具配对。`memory_context_provider(query) -> str` 是可选同步缓存入口，替代默认本地检索，调用方不应在这里联网；运行时统一标注资料性质并限制长度。
 
+宿主专用 `skills_context` 在全部普通 hooks 和不可变任务快照加入后、最终打包前执行一次。它为已激活 Skill 注入完整正文；预算不足时保留持久指导但明确暂停，留下可调用的清除路径，不裁剪权威任务资料，也不重复运行插件 hooks。`skill_read` 仅返回激活回执，正文不会再复制到同批工具结果；压缩后由有限会话状态恢复，详见 [Agent Skills](skills.md)。
+
 `message_hooks` 是同步 `(message, trusted_owner) -> None` 列表，只在 `submit` 新信封持久成功后触发，重投不重复。适合短事务入队；不能在钩子中执行模型或慢操作。信任标记仅来自已认证的 `principal == 'owner'`，队友消息不是新的用户授权。钩子失败产生 `message.hook_failed`，不撤销已接收输入；后台消费者应按输入 ID 去重并用持久 ingress 补偿崩溃窗口。
 
 `add_tool_provider(factory, replace=False, coordinator=True, session_scoped=False)` 注册本机受信任工具，配置重载保留 factory。默认名称冲突拒绝；`replace=True` 显式覆盖，`coordinator=False` 不把写工具加入主助手可直接操作范围。扩展仍经过统一权限检查；带 `requires_approval=True` 的工具始终走 ask，即使当前为 yolo。用户自己的 Python 插件是 full-trust 本地代码，不是沙箱。
