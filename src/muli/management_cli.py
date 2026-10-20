@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from muli.management_transaction import TransactionError, TransactionJournal
+from muli.managed_cli import check_cli_paths, managed_record
+from muli.management_transaction import Role, TransactionError, TransactionJournal
 from muli.platforms.installation import InstallationManifest
 from muli.platforms.transaction_files import ConfigurationFile
 from muli.service import UserService
@@ -48,11 +49,25 @@ def _check_unit(service: UserService, *, installing: bool) -> None:
 
 
 async def management_action(
-    service: UserService, action: Literal["status", "recover"]
+    service: UserService,
+    action: Literal["status", "recover"],
+    *,
+    managed_root: Path | None = None,
 ) -> dict[str, Any]:
     if service.platform != "linux":
         return {"supported": False, "reason": "platform_unsupported", "transaction": None}
-    root = service.data_dir.absolute() / "management" / "transaction-v1"
+    root = managed_root or service.data_dir.absolute() / "management" / "transaction-v1"
+    managed = managed_record(root, required=managed_root is not None)
+    if managed is not None:
+        check_cli_paths(root, managed, service.config_path, service.data_dir)
+        result: dict[str, Any] = {"transaction": managed.public()}
+        if action == "status" or managed.resolved or managed.phase == "recovery_required":
+            return result
+        # Importable selected code only routes recovery; the retained controller
+        # verifies its own process and starts the separately bounded helper.
+        from muli.platforms.managed_launcher import execute, resolve_entry
+
+        execute(resolve_entry(root.absolute(), purpose="recover"))
     try:
         root.lstat()
     except FileNotFoundError:
@@ -67,7 +82,7 @@ async def management_action(
         if manifest is not None:
             _check_paths(service, journal, manifest)
         record = journal.read()
-        result: dict[str, Any] = {"transaction": record.public() if record is not None else None}
+        result = {"transaction": record.public() if record is not None else None}
         if (
             action == "status"
             or record is None
@@ -89,11 +104,35 @@ async def management_action(
         return result
 
 
-async def guarded_service_action(service: UserService, action: str) -> dict[str, Any]:
+async def guarded_service_action(
+    service: UserService, action: str, *, managed_root: Path | None = None
+) -> dict[str, Any]:
     if service.platform != "linux":
         return await service.action(action)
+    root = managed_root or service.data_dir.absolute() / "management" / "transaction-v1"
+    managed = managed_record(root, required=managed_root is not None)
+    if managed is not None:
+        anchor = check_cli_paths(root, managed, service.config_path, service.data_dir)
+        if not managed.resolved:
+            raise TransactionError("transaction_in_progress")
+        if action == "install":
+            raise TransactionError("managed_unit_replacement_forbidden")
+        with (
+            TransactionJournal(
+                root, Path(anchor.database_path), anchor.journal, create=False
+            ) as journal,
+            journal.locked() as control,
+        ):
+            if control.read_current() != managed:
+                raise TransactionError("stale_revision")
+            role: Role = "target" if managed.phase == "committed" else "base"
+            binding = managed.binding(role)
+            if str(service.path.absolute()) != anchor.unit_path:
+                raise TransactionError("service_identity_changed")
+            with ConfigurationFile(service.path, anchor.journal.max_snapshot_bytes) as unit:
+                unit.confirm(binding.unit.digest, guard=control.check)
+            return await service.action(action)
     _check_unit(service, installing=action == "install")
-    root = service.data_dir.absolute() / "management" / "transaction-v1"
     manifest = _published(root)
     with (
         TransactionJournal(

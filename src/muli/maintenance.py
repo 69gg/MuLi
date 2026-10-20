@@ -13,8 +13,9 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
+from muli.managed_transaction import HealthProofV2, TransactionRecordV2, format_digest
 from muli.management_transaction import (
     ClockReading,
     FixedLock,
@@ -24,6 +25,12 @@ from muli.management_transaction import (
     TransactionRecord,
 )
 from muli.platforms.transaction_files import ConfigurationError, ConfigurationFile
+
+if TYPE_CHECKING:
+    from muli.managed_boot import ManagedBootPermit
+
+CurrentRecord = TransactionRecord | TransactionRecordV2
+ManagedVerifier = Callable[[TransactionRecordV2, Role | None], None]
 
 
 class MaintenanceError(ValueError):
@@ -207,7 +214,7 @@ class BootPermit:
 class Maintenance:
     """A host binds local owners and activation; unsealed coverage cannot prove drain."""
 
-    def __init__(self, permit: BootPermit | None = None) -> None:
+    def __init__(self, permit: BootPermit | ManagedBootPermit | None = None) -> None:
         self.permit = permit
         self.admission = Admission(allowed=not (permit and permit.probation))
         self._owners: dict[str, Callable[[], bool]] = {}
@@ -220,7 +227,25 @@ class Maintenance:
         self._unsupported: dict[str, Callable[[], bool]] = {}
         self._configuration_free = asyncio.Event()
         self._configuration_wake: list[Callable[[], None]] = []
+        self._managed_verifier: ManagedVerifier | None = None
+        self._projected: Callable[[TransactionRecordV2], bool] | None = None
         self.reconcile()
+
+    def bind_managed_verifier(self, verify: ManagedVerifier) -> None:
+        """Bind actual Store/installation evidence, shared by both protocol origins."""
+        if self._managed_verifier is not None:
+            raise RuntimeError("managed_verifier_already_bound")
+        self._managed_verifier = verify
+
+    def verify_managed(self, record: TransactionRecordV2, role: Role | None) -> None:
+        if self._managed_verifier is None:
+            raise MaintenanceError("managed_evidence_unavailable")
+        self._managed_verifier(record, role)
+
+    def bind_projection_checker(self, check: Callable[[TransactionRecordV2], bool]) -> None:
+        if self._projected is not None:
+            raise RuntimeError("projection_checker_already_bound")
+        self._projected = check
 
     def unsupported(self, reason: str, present: Callable[[], bool]) -> None:
         self._unsupported[reason] = present
@@ -280,8 +305,8 @@ class Maintenance:
                 raise MaintenanceError("store_identity_changed")
         self._core = store_instance, main_session
 
-    def current(self) -> TransactionRecord | None:
-        return self.permit.journal.read() if self.permit else None
+    def current(self) -> CurrentRecord | None:
+        return self.permit.journal.read_current() if self.permit else None
 
     @property
     def pending(self) -> bool:
@@ -296,7 +321,16 @@ class Maintenance:
 
     @property
     def configuration_blocked(self) -> bool:
-        return not self.admission.allowed or self.pending
+        if not self.admission.allowed:
+            return True
+        record = self.current()
+        if record is not None and not record.resolved:
+            return True
+        # Configuration may change after an exact final result reached the real
+        # Store. It cannot erase frozen evidence before that result is projected.
+        return isinstance(record, TransactionRecordV2) and (
+            self._projected is None or not self._projected(record)
+        )
 
     @property
     def accepts_external_input(self) -> bool:
@@ -322,7 +356,7 @@ class Maintenance:
             )
         )
 
-    def _record(self, generation: str, boot: str, nonce: str) -> TransactionRecord:
+    def _record(self, generation: str, boot: str, nonce: str) -> CurrentRecord:
         permit = self.permit
         record = self.current()
         if permit is None or record is None:
@@ -337,10 +371,15 @@ class Maintenance:
         ):
             raise MaintenanceError("transaction_unauthorized")
         permit.lease.check()
-        if (permit.installation, permit.service) != (
+        if self._core != (record.identity.store_instance, record.identity.main_session):
+            raise MaintenanceError("foreign_state")
+        if isinstance(record, TransactionRecordV2):
+            self.verify_managed(record, role)
+            return record
+        if not isinstance(permit, BootPermit) or (permit.installation, permit.service) != (
             record.identity.installation,
             record.identity.service,
-        ) or self._core != (record.identity.store_instance, record.identity.main_session):
+        ):
             raise MaintenanceError("foreign_state")
         reference = record.target if role == "target" else record.base
         if (
@@ -350,7 +389,7 @@ class Maintenance:
             raise MaintenanceError("configuration_changed")
         return record
 
-    def _role(self, record: TransactionRecord) -> Role | None:
+    def _role(self, record: CurrentRecord) -> Role | None:
         permit = self.permit
         assert permit is not None
         if record.identity.origin_boot == permit.boot:
@@ -398,7 +437,7 @@ class Maintenance:
         self._release()
         self.reconcile()
 
-    def readiness(self, generation: str, boot: str, nonce: str) -> HealthProof:
+    def readiness(self, generation: str, boot: str, nonce: str) -> HealthProof | HealthProofV2:
         record = self._record(generation, boot, nonce)
         self.require_support()
         permit = self.permit
@@ -427,6 +466,29 @@ class Maintenance:
             self.reconcile()
         challenge = record.rollback_challenge if role == "base" else record.challenge
         assert challenge is not None
+        if isinstance(record, TransactionRecordV2):
+            binding = record.binding(role or "base")
+            return HealthProofV2(
+                generation=generation,
+                challenge=challenge,
+                boot=boot,
+                role=role or "origin",
+                deployment=record.identity.deployment,
+                installation=binding.installation,
+                compatibility=binding.compatibility,
+                configuration=binding.configuration.digest,
+                selector=binding.selector.digest if binding.selector is not None else None,
+                unit=binding.unit.digest,
+                store_instance=self._core[0],
+                main_session=self._core[1],
+                format_digest=format_digest(record.observed_format),
+                core_ready=True,
+                admission="blocked"
+                if blocked
+                else ("released" if self.admission.allowed else "paused"),
+            )
+        if not isinstance(permit, BootPermit):
+            raise MaintenanceError("foreign_state")
         return HealthProof(
             generation=generation,
             challenge=challenge,
@@ -444,7 +506,7 @@ class Maintenance:
 
     async def activate(
         self, generation: str, boot: str, nonce: str, clock: Callable[[], ClockReading]
-    ) -> HealthProof:
+    ) -> HealthProof | HealthProofV2:
         record = self._record(generation, boot, nonce)
         permit = self.permit
         assert permit is not None
@@ -455,7 +517,7 @@ class Maintenance:
         # A lock-free host never contends with the controller's flock. Confirm
         # the durable decision before any external activation, then re-read CAS.
         os.fsync(permit.journal.directory.fd)
-        if permit.journal.read() != record:
+        if self.current() != record:
             raise MaintenanceError("transaction_changed")
         if self._activation is None:
             self._activation = asyncio.create_task(
@@ -465,7 +527,7 @@ class Maintenance:
         await asyncio.shield(self._activation)
         return self.readiness(generation, boot, nonce)
 
-    def _decision(self, record: TransactionRecord, boot: str) -> None:
+    def _decision(self, record: CurrentRecord, boot: str) -> None:
         permit = self.permit
         assert permit is not None
         role = self._role(record)

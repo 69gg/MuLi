@@ -26,6 +26,7 @@ from muli.evidence import EvidenceError
 from muli.extensions import Extensions
 from muli.history_evidence import HistoryEvidence
 from muli.maintenance import BootPermit, Maintenance
+from muli.managed_boot import ManagedBootPermit
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -85,7 +86,7 @@ class Runtime:
         data_dir: Path,
         client_factory: ClientFactory = ModelClient,
         *,
-        boot_permit: BootPermit | None = None,
+        boot_permit: BootPermit | ManagedBootPermit | None = None,
         boot_session: BootSession | None = None,
     ) -> None:
         self.config, self.data_dir, self.client_factory = config, data_dir, client_factory
@@ -97,24 +98,49 @@ class Runtime:
         self.boot_session = boot_session
         if boot_permit is not None:
             boot_permit.check_paths(config.path, data_dir / "muli.sqlite3")
-        self.maintenance = Maintenance(boot_permit)
-        self.store = (
-            Store.open_runtime(
+        if isinstance(boot_permit, ManagedBootPermit):
+            if config is not boot_permit.config:
+                raise ValueError("managed_configuration_owner_required")
+            self.store = boot_permit.open_store()
+            # The Store admission revalidates the current record and refreshes
+            # the exact frozen ConfigFile before any recovery component exists.
+            self.config = boot_permit.config
+        else:
+            self.store = Store.open_runtime(
                 data_dir / "muli.sqlite3",
                 default_mode=config.settings.default_mode,
-                durable=True,
+                durable=boot_permit is not None,
             )
-            if boot_permit is not None
-            else Store.open_runtime(
-                data_dir / "muli.sqlite3", default_mode=config.settings.default_mode
-            )
-        )
         try:
+            self.maintenance = Maintenance(boot_permit)
+            if boot_permit is not None:
+                from muli.managed_runtime_binding import verify_running_binding
+                from muli.management_projection import read_projection
+                from muli.management_transaction import ProjectionReceipt
+
+                self.maintenance.bind_managed_verifier(
+                    lambda record, role: verify_running_binding(
+                        boot_permit, self.store, record, role
+                    )
+                )
+                self.maintenance.bind_projection_checker(
+                    lambda record: (
+                        read_projection(self.store)
+                        == ProjectionReceipt(
+                            **record.position.model_dump(),
+                            store_instance=record.identity.store_instance,
+                        )
+                    )
+                )
             self._initialize()
         except BaseException:
             # Constructors have no async producers yet. Never hand back a boot
             # lease while a partly constructed SQLite writer remains open.
-            self.discard_unstarted()
+            self.store.close()
+            if boot_session is not None:
+                boot_session.close_after_writers()
+            elif boot_permit is not None:
+                boot_permit.close_after_writers()
             raise
 
     def _initialize(self) -> None:
