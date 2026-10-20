@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -141,6 +142,7 @@ def prepare_managed(
     writer: FixedLock,
     projected: ProjectionReceipt | None = None,
     generation: str | None = None,
+    guard: Callable[[], None] | None = None,
 ) -> TransactionRecordV2:
     control.check()
     writer.check()
@@ -173,14 +175,20 @@ def prepare_managed(
         # A retry must not silently repair changed durable evidence.
         read_snapshots(control.journal, record, "base")
         read_snapshots(control.journal, record, "target")
+        if guard is not None:
+            guard()
         return record
     incoming = {
         **base_data.entries(record.generation, "base"),
         **target_data.entries(record.generation, "target"),
     }
+    if guard is not None:
+        guard()
     _collect(control, previous, incoming)
     for name, data in incoming.items():
         control._replace(name, data)
+    if guard is not None:
+        guard()
     return control._write(record)
 
 
