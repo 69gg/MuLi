@@ -34,4 +34,6 @@
 
 PR #17 首轮 CI `39452082640` 的核心 quality 环境未安装可选 FastMCP，严格类型检查拒绝从不可用依赖的 Any 类型继承 MessageHandler。本地按导入不可用的类型语义复现，改用锁定版本原生支持的异步 message_handler 回调，并只接受 SDK ServerNotification 中的 ToolListChangedNotification；不为核心安装增加 MCP 依赖，也不关闭严格检查。55 项 MCP/扩展回归通过，峰值 123 MiB；无增量的 76 源码严格检查通过，峰值 376.3 MiB。其它真实平台结果及最后修订另记。
 
+同轮 Windows 3.13 job `118729246085` 的 9 项扩展测试失败，首个根因为 `DirEntry.stat()` 的设备号/inode 为零，与 `fstat()` 比较后误报 `source_changed`。改用路径 `lstat()` 获取完整身份，保留普通文件、符号链接、非阻塞打开、读取前后及指纹验证。模拟 Windows 零字段的跨平台回归在旧实现稳定失败；修复后完整扩展文件 26 项通过，1.56 秒，峰值 96.4 MiB、swap 0，相关 Ruff、格式及严格类型通过。没有提高超时或新增跳过；真实 Windows 结果由后续精确提交的 CI 确认。
+
 Skills 的 YAML 元数据复用环境和锁文件中已有的 PyYAML 6.0.3，提升为声明的直接依赖。首次离线整体解析因其它平台的现有 Pydantic 元数据不在本机缓存而拒绝；没有联网下载或改变 Python 支持范围。随后仅提升既有 PyYAML 条目的根依赖及 requires-dist，所有已锁版本/产物保持原样，`uv lock --check --offline` 确认 83 包一致；最终还需远端锁定安装与打包验证。所有本地验证使用既有 cgroup 守卫。

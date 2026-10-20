@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -92,6 +94,39 @@ def directory_settings(tmp_path: Path, **limits: Any) -> Settings:
     return Settings.model_validate(
         {"extensions": {"mcp_directory": str(tmp_path / "mcp.d"), **limits}}
     )
+
+
+def test_directory_uses_full_path_identity_when_direntry_has_windows_zero_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fragment(tmp_path, "windows.json", {"mcpServers": {"native": server()}})
+    original_scandir = os.scandir
+
+    class WindowsDirEntry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self.entry, self.name = entry, entry.name
+
+        def stat(self, *, follow_symlinks: bool = True) -> SimpleNamespace:
+            info = self.entry.stat(follow_symlinks=follow_symlinks)
+            return SimpleNamespace(
+                st_dev=0,
+                st_ino=0,
+                st_nlink=0,
+                st_mode=info.st_mode,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns,
+                st_ctime_ns=info.st_ctime_ns,
+            )
+
+    @contextmanager
+    def windows_scandir(path: str | os.PathLike[str]) -> Iterator[Iterator[WindowsDirEntry]]:
+        with original_scandir(path) as entries:
+            yield (WindowsDirEntry(entry) for entry in entries)
+
+    monkeypatch.setattr(os, "scandir", windows_scandir)
+    snapshot = MCPDirectory(directory_settings(tmp_path)).prepare()
+    assert snapshot.sources == ("windows.json",)
+    assert snapshot.config["mcpServers"]["native"]["enabled"] is True
 
 
 async def test_unconfigured_directories_respect_muli_home_and_ignore_physical_home(

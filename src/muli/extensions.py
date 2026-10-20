@@ -82,10 +82,12 @@ class MCPDirectory:
                         raise ExtensionError("directory_budget_exceeded", "mcp.d")
                     if not entry.name.endswith(".json"):
                         continue
-                    info = entry.stat(follow_symlinks=False)
+                    path = root / entry.name
+                    # Windows DirEntry.stat zeroes device/inode; lstat matches fstat's identity.
+                    info = path.lstat()
                     if not stat.S_ISREG(info.st_mode):
                         raise ExtensionError("source_not_regular", entry.name)
-                    files.append((root / entry.name, info))
+                    files.append((path, info))
                     if len(files) > self.limits.max_mcp_fragments:
                         raise ExtensionError("fragment_budget_exceeded", "mcp.d")
         except OSError as exc:
