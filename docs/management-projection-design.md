@@ -2,6 +2,10 @@
 
 状态：纯投影函数已随 2.19.0 接入启动恢复、管理状态与下一次准备入口。投影本身不会停止或启动服务。journal 是恢复过程的权威，网页管理对象和通知只作投影；整体验证范围见[恢复入口](linux-recovery-operations.md)。
 
+后续 V2 切片继续复用同一 journal 和固定 receipt，以 `verify_binding` 宿主回调重核
+当前实际角色后再写新投影；V1 既有调用保持兼容，不把 slot 摘要当作 V1 service。
+具体接口与本轮独立验证边界见[运行期绑定](managed-runtime-binding.md)。
+
 `project_final(permit, store)` 只处理最新 resolved 的最终记录，不使用 `permit.record` 的启动缓存。`permit=None` 或尚无最终记录时返回 `None`。先确认真正持有目标 DB 的 writer lease，再以有限 `PRAGMA database_list` 核唯一 main 的实际路径，以 `runtime_state` 两个主键核 Store instance／主会话，并验证对应主会话对象已存在；不会调用可能建立主会话的 `Store.main_session()`。
 
 SQLite 连接必须处于 WAL 和 `synchronous=FULL` 或 `EXTRA`；本模块只查询，不静默改动既有 Store。宿主在任何事务之前明确设置并核验 FULL，所有参与恢复的写入者都必须遵守。已有外层 `db.in_transaction` 明确拒绝；`autocommit=True` 或 `isolation_level=None` 等使现有 `Store.event` 不能合并多次写入的模式也明确 unsupported，不会替调用方提交。`read_projection(store)` 使用相同只读连接与身份检查，不把未提交或缺少持久保证的值当作覆盖旧 journal 的证据。
