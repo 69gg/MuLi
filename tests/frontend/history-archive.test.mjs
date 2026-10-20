@@ -8,6 +8,7 @@ import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachment
 
 // Exercise actual app functions, dialog/SSE handlers and native text conversion.
 // No browser dependency, service, model, account or real database is involved.
+// Compare DOM/slot identity through booleans: failed object diffs traverse the cyclic mock graph.
 const app = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
 const application = app.slice(app.indexOf("const ICONS ="), app.indexOf("\nfillIcons();"));
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -128,6 +129,8 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   runInNewContext(application + `
     renderChrome = () => {}; renderChat = () => {}; renderOtherView = () => {}; toast = () => {}; resizeComposer = () => {};
     refreshSessions = async () => {}; refreshNotifications = async () => {}; queueRender = () => {};
+    const owner = beginConnection(); owner.ready = true;
+    owner.sessions.start(); owner.notifications.start();
     globalThis.ui = { state, renderHistoryEntry, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
       get slot() { return historyDialog; }, get draftRevision() { return draftRevision; },
       stopEvents() { globalController?.abort(); sessionController?.abort(); } };
@@ -163,7 +166,7 @@ test("the main entry is a real button, starts at latest saved records and does n
   assert.equal(h.requests[0].cache, "no-store");
   assert.ok(h.requests[0].signal instanceof AbortSignal);
   assert.equal(h.ui.slot.through, 1); assert.equal(h.body().includes("pending"), false);
-  assert.equal(h.document.activeElement, h.document.querySelector("#dialog-title"));
+  assert.equal(h.document.activeElement === h.document.querySelector("#dialog-title"), true);
 });
 
 test("directory navigation uses actual returned boundaries, one DOM page and a fixed append ceiling", async () => {
@@ -178,7 +181,7 @@ test("directory navigation uses actual returned boundaries, one DOM page and a f
   assert.equal(h.document.querySelector("#dialog-content").scrollTop, 0);
   assert.equal(h.requests[1].path, "/sessions/main/messages?limit=50&before_seq=98&through_seq=100");
   assert.equal(h.dialog.querySelectorAll(".history-message").length, 1);
-  assert.equal(h.body().includes("saved-100"), false); assert.equal(h.ui.slot.bodyPage, null);
+  assert.equal(h.body().includes("saved-100"), false); assert.equal(h.ui.slot.bodyPage === null, true);
   assert.equal(h.document.activeElement.className, "history-position");
   await h.click(h.button("较新一页"));
   assert.equal(h.requests[2].path, "/sessions/main/messages?limit=50&through_seq=100");
@@ -211,7 +214,7 @@ test("UTF-8 body pages send revision on first read, keep one segment and reread 
   const h = harness(async (path) => path.includes("/content?") ? contentPage(item, path.includes(`offset_bytes=${offset}`) ? second : first, path.includes(`offset_bytes=${offset}`) ? offset : 0, total, { principal: item.principal, source: item.source }) : directory([item]));
   await h.ui.showHistoryArchive("main"); await h.click(h.button("查看正文"));
   assert.equal(h.requests[1].path, "/sessions/main/messages/message-9/content?offset_bytes=0&revision=revision-9");
-  assert.equal(h.ui.slot.page, null); assert.equal("content" in h.ui.slot.selected, false);
+  assert.equal(h.ui.slot.page === null, true); assert.equal("content" in h.ui.slot.selected, false);
   assert.equal(h.dialog.querySelector("pre").textContent, first); assert.equal(h.button("上一段").disabled, true);
   const children = h.ui.slot.content.children;
   assert.ok(children.indexOf(h.dialog.querySelector("nav")) < children.indexOf(h.dialog.querySelector("pre")), "segment navigation must precede long body text");
@@ -225,7 +228,7 @@ test("UTF-8 body pages send revision on first read, keep one segment and reread 
   await h.click(h.button("上一段"));
   assert.equal(h.requests[3].path, h.requests[1].path); assert.equal(h.ui.slot.offsets.length, 1);
   await h.click(h.button("返回记录"));
-  assert.equal(h.ui.slot.bodyPage, null); assert.equal(h.ui.slot.selected, null);
+  assert.equal(h.ui.slot.bodyPage === null, true); assert.equal(h.ui.slot.selected === null, true);
   assert.equal(h.document.activeElement.dataset.historyMessageId, item.id);
 });
 
@@ -255,8 +258,8 @@ test("unsafe integers and malformed directory pages produce an error without sen
   ];
   for (const response of invalid) {
     const h = harness(async () => response); await h.ui.showHistoryArchive("main");
-    assert.equal(h.ui.slot.page, null); assert.ok(h.dialog.querySelector('[role="alert"]'));
-    assert.equal(h.button("更早一页"), undefined); assert.equal(h.requests.length, 1);
+    assert.equal(h.ui.slot.page === null, true); assert.ok(h.dialog.querySelector('[role="alert"]'));
+    assert.equal(h.button("更早一页") === undefined, true); assert.equal(h.requests.length, 1);
   }
 });
 
@@ -264,7 +267,7 @@ test("an older page cannot change the ceiling, cross its exclusive boundary or l
   for (const invalid of [directory([message(3)], { through_seq: 8 }), directory([message(5)], { through_seq: 9 })]) {
     const h = harness(async (path) => path.includes("before_seq") ? invalid : directory([message(5)], { through_seq: 9, has_older: true, next_before_seq: 5 }));
     await h.ui.showHistoryArchive("main"); await h.click(h.button("更早一页"));
-    assert.equal(h.ui.slot.page, null); assert.equal(h.body().includes("saved-5"), false);
+    assert.equal(h.ui.slot.page === null, true); assert.equal(h.body().includes("saved-5"), false);
     assert.ok(h.dialog.querySelector('[role="alert"]')); assert.equal(h.requests.length, 2);
   }
 });
@@ -294,7 +297,7 @@ test("body responses reject wrong identity, revision, byte spans and non-advanci
   for (const fields of mutations) {
     const h = harness(async (path) => path.includes("/content?") ? contentPage(item, item.content, 0, item.content_bytes, fields) : directory([item]));
     await h.ui.showHistoryArchive("main"); await h.click(h.button("查看正文"));
-    assert.equal(h.ui.slot.bodyPage, null); assert.equal(h.dialog.querySelector("pre"), null);
+    assert.equal(h.ui.slot.bodyPage === null, true); assert.equal(h.dialog.querySelector("pre") === null, true);
     assert.ok(h.body().includes("正文响应不一致")); assert.equal(h.requests.length, 2);
   }
 });
@@ -311,8 +314,8 @@ test("deleted or revised body pages clear previous text and require returning to
     });
     await h.ui.showHistoryArchive("main"); await h.click(h.button("查看正文"));
     await h.click(h.button("下一段"));
-    assert.equal(h.dialog.querySelector("pre"), null); assert.equal(h.body().includes("first"), false);
-    assert.equal(h.button("重试"), undefined); assert.equal(h.ui.slot.offsets.length, 1);
+    assert.equal(h.dialog.querySelector("pre") === null, true); assert.equal(h.body().includes("first"), false);
+    assert.equal(h.button("重试") === undefined, true); assert.equal(h.ui.slot.offsets.length, 1);
     await h.click(h.button("返回记录"));
     assert.equal(h.ui.slot.page.messages[0].revision, revision);
     assert.equal(h.document.activeElement.dataset.historyMessageId, item.id);
@@ -327,7 +330,7 @@ test("body read failures retry the same byte offset and revision without replayi
     return contentPage(item);
   });
   await h.ui.showHistoryArchive("main"); await h.click(h.button("查看正文"));
-  assert.ok(h.body().includes("暂时离线")); assert.equal(h.ui.slot.bodyPage, null);
+  assert.ok(h.body().includes("暂时离线")); assert.equal(h.ui.slot.bodyPage === null, true);
   await h.click(h.button("重试"));
   assert.equal(h.requests[2].path, h.requests[1].path);
   assert.ok(h.requests.every((entry) => entry.method === undefined));
@@ -339,10 +342,10 @@ test("returning to records during a body read invalidates its response within th
   const h = harness(async (path) => path.includes("/content?") ? gate.promise : directory([item]));
   await h.ui.showHistoryArchive("main"); await h.click(h.button("查看正文"));
   const slot = h.ui.slot; await h.click(h.button("返回记录"));
-  assert.equal(h.ui.slot, slot); assert.equal(h.requests[1].signal.aborted, true);
+  assert.equal(h.ui.slot === slot, true); assert.equal(h.requests[1].signal.aborted, true);
   gate.resolve(contentPage(item)); await flush();
-  assert.equal(slot.mode, "list"); assert.equal(slot.bodyPage, null);
-  assert.equal(h.dialog.querySelector("pre"), null); assert.ok(h.button("查看正文"));
+  assert.equal(slot.mode, "list"); assert.equal(slot.bodyPage === null, true);
+  assert.equal(h.dialog.querySelector("pre") === null, true); assert.ok(h.button("查看正文"));
 });
 
 test("native replaceChildren converts false and null to text but archive conditional rows never pass such values", async () => {
@@ -360,9 +363,9 @@ test("closing an in-flight archive aborts it, clears retained pages and ignores 
   h.ui.renderHistoryEntry(); const trigger = h.button("已保存记录", h.document.body);
   const reading = h.ui.showHistoryArchive("main", { trigger }); const slot = h.ui.slot;
   h.dialog.close(); await flush();
-  assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.slot, null);
-  assert.equal(slot.page, null); assert.equal(slot.bodyPage, null); assert.equal(slot.starts.length, 0);
-  assert.equal(h.document.activeElement, trigger);
+  assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.slot === null, true);
+  assert.equal(slot.page === null, true); assert.equal(slot.bodyPage === null, true); assert.equal(slot.starts.length, 0);
+  assert.equal(h.document.activeElement === trigger, true);
   gate.resolve(directory([message(1, { content: "LATE_SECRET", content_bytes: 11 })])); await reading;
   assert.equal(h.body().includes("LATE_SECRET"), false); assert.equal(h.dialog.open, false);
 });
@@ -388,7 +391,7 @@ test("leaving the view or page aborts reading and late bodies cannot refill the 
     const reading = h.ui.showHistoryArchive("main");
     if (leave === "view") await h.ui.switchView("uploads");
     else h.windowEvents.pagehide();
-    await flush(); assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.slot, null);
+    await flush(); assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.slot === null, true);
     gate.resolve(directory()); await reading;
     assert.equal(h.dialog.open, false); assert.equal(h.body().includes("saved-1"), false);
   }
@@ -398,11 +401,11 @@ test("401 closes the archive and clears data before an older request can arrive"
   const gate = deferred();
   const h = harness(async (path) => { if (path.startsWith("/sessions/old/")) return gate.promise; throw new ApiError("请重新登录", 401); });
   const first = h.ui.showHistoryArchive("old"); await h.ui.showHistoryArchive("main");
-  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.slot, null);
+  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.slot === null, true);
   assert.equal(h.dialog.open, false); assert.equal(h.body(), "");
-  assert.equal(h.document.activeElement, h.document.querySelector("#login-password"));
+  assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
   gate.resolve(directory([message(1)], { session_id: "old" })); await first;
-  assert.equal(h.body(), ""); assert.equal(h.ui.slot, null);
+  assert.equal(h.body(), ""); assert.equal(h.ui.slot === null, true);
 });
 
 test("401 while continuing a body clears the retained text and selected identity", async () => {
@@ -415,8 +418,8 @@ test("401 while continuing a body clears the retained text and selected identity
   await h.ui.showHistoryArchive("main"); await h.click(h.button("查看正文"));
   const slot = h.ui.slot; assert.equal(slot.bodyPage.content, "private");
   await h.click(h.button("下一段"));
-  assert.equal(h.body(), ""); assert.equal(h.ui.slot, null);
-  assert.equal(slot.bodyPage, null); assert.equal(slot.selected, null);
+  assert.equal(h.body(), ""); assert.equal(h.ui.slot === null, true);
+  assert.equal(slot.bodyPage === null, true); assert.equal(slot.selected === null, true);
   assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
 });
 
@@ -458,10 +461,10 @@ test("new SSE changes the live state without reloading the archive, altering dra
   h.emit("/events", { id: "done-event", type: "run.completed", data: {} });
   await flush();
   assert.ok(h.ui.state.session.messages.some((item) => item.content === "LIVE_ONLY"));
-  assert.equal(h.body(), before); assert.equal(h.ui.slot, slot); assert.equal(slot.through, 8);
+  assert.equal(h.body(), before); assert.equal(h.ui.slot === slot, true); assert.equal(slot.through, 8);
   assert.equal(h.requests.length, 1); assert.equal(input.value, "UNSENT_DRAFT");
   assert.equal(h.ui.state.attachments[0].id, "draft-attachment"); assert.equal(h.ui.draftRevision, revision);
-  assert.equal(h.document.activeElement, focused); h.ui.stopEvents();
+  assert.equal(h.document.activeElement === focused, true); h.ui.stopEvents();
 });
 
 test("close restores the same record button after a management redraw and body loading does not steal unrelated focus", async () => {
@@ -478,5 +481,5 @@ test("close restores the same record button after a management redraw and body l
   const otherButton = h.document.createElement("button"); otherButton.dataset.action = "workflow-session"; otherButton.dataset.session = "other";
   const replacement = h.document.createElement("button"); replacement.dataset.action = "workflow-session"; replacement.dataset.session = "main";
   h.other.replaceChildren(otherButton, replacement); h.dialog.close(); await flush();
-  assert.equal(h.document.activeElement, replacement);
+  assert.equal(h.document.activeElement === replacement, true);
 });

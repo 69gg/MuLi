@@ -44,6 +44,20 @@ test("current page errors remain visible instead of fabricating an empty page", 
   await assert.rejects(pager.load(), /offline/);
 });
 
+test("connection invalidation discards a late page and its server-clamped query", async () => {
+  const old = deferred();
+  const pager = createTeamPager(async () => old.promise);
+  const loading = pager.load({ offset: 50, activeOnly: true }); pager.invalidate();
+  old.resolve({ members: [{ id: "stale" }], limit: 50, offset: 0, active_only: false });
+  assert.equal(await loading === null, true);
+  assert.deepEqual(pager.query, { limit: 50, offset: 50, activeOnly: true });
+  const page = await pager.load({}, async (path) => {
+    assert.equal(path, "/team?limit=50&offset=50&active_only=true");
+    return { members: [{ id: "fresh" }], limit: 50, offset: 50, active_only: true };
+  });
+  assert.equal(page.members[0].id, "fresh");
+});
+
 function control(action, data = {}, extra = {}) {
   return { dataset: { action, ...data }, tagName: 'BUTTON', disabled: false, focused: false,
     focus() { this.focused = true; }, ...extra };

@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
+
+// Compare DOM/slot identity through booleans: failed object diffs traverse the cyclic mock graph.
 import { MODES } from "../../web/state.mjs";
 import { ApiError } from "../../web/api.mjs";
 
@@ -120,6 +122,8 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   };
   runInNewContext(application + `
     renderChrome = () => {}; renderChat = () => {}; toast = (text) => toasts.push(text); showError = (error) => errors.push(error.message);
+    const owner = beginConnection(); owner.ready = true;
+    owner.sessions.start(); owner.notifications.start();
     globalThis.ui = { state, renderWorkflows, switchView, handleAction, startGlobalEvents, showLogin,
       stopEvents() { globalController?.abort(); },
       get activity() { return typeof workflowActivity === "undefined" ? null : workflowActivity; } };
@@ -275,9 +279,9 @@ test("a late 401 clears the active page and prevents pending responses from rest
   const h = harness(async (path) => path === "/workflows" ? definitions() : active.promise);
   const opening = h.ui.switchView("workflows"); await flush();
   active.reject(new ApiError("请重新登录", 401)); await opening;
-  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.activity, null);
+  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.activity === null, true);
   assert.equal(h.other.querySelector("#workflow-active-runs").textContent, "");
-  assert.equal(h.document.activeElement, h.document.querySelector("#login-password"));
+  assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
 });
 
 test("pagehide discards the current page and ignores an active refresh that finishes later", async () => {
@@ -286,7 +290,7 @@ test("pagehide discards the current page and ignores an active refresh that fini
   await h.ui.switchView("workflows");
   const refreshing = click(h, h.button("refresh-workflow-runs")); await flush();
   h.windowEvents.pagehide();
-  assert.equal(h.ui.activity, null); assert.equal(h.other.querySelector("#workflow-active-runs").textContent, "");
+  assert.equal(h.ui.activity === null, true); assert.equal(h.other.querySelector("#workflow-active-runs").textContent, "");
   later.resolve(page([run("late-private-run")])); await refreshing;
   assert.equal(h.other.textContent.includes("late-private-run"), false);
 });
@@ -309,7 +313,7 @@ test("stopping one concurrent run uses its full ID once and keeps the other acti
   await h.ui.handleAction("cancel-workflow-run", button);
   assert.equal(h.requests.filter((request) => request.method === "POST").length, 1);
   stop.resolve(); await stopping; await flush();
-  assert.equal(h.button("cancel-workflow-run", fullID), undefined);
+  assert.equal(h.button("cancel-workflow-run", fullID) === undefined, true);
   assert.ok(h.button("cancel-workflow-run", "second-running"));
   assert.ok(h.toasts.includes("已提交停止请求"));
 });
@@ -357,7 +361,7 @@ test("native DOM keeps names and IDs as text with no conditional false/null chil
   await h.ui.switchView("workflows");
   const region = h.other.querySelector("#workflow-active-runs");
   assert.ok(region.textContent.includes(name)); assert.ok(region.textContent.includes("完整-运行-ID"));
-  assert.equal(region.querySelector("img"), null);
+  assert.equal(region.querySelector("img") === null, true);
   assert.equal(region.childNodes.some((node) => node instanceof TextNode && ["false", "null", "undefined"].includes(node.textContent)), false);
   const native = h.document.createElement("div"); native.replaceChildren(false, null, undefined);
   assert.equal(native.textContent, "falsenullundefined");
@@ -370,12 +374,12 @@ test("refresh preserves open history and same-run focus, falling back when that 
   h.other.querySelector(".workflow-run").open = true;
   h.button("cancel-workflow-run", "focused-run").focus();
   h.emitGlobal({ type: "workflow.updated", data: { workflow_id: "unlisted" } }); await flush();
-  assert.equal(h.document.activeElement, h.button("cancel-workflow-run", "focused-run"));
+  assert.equal(h.document.activeElement === h.button("cancel-workflow-run", "focused-run"), true);
   assert.equal(h.other.querySelector(".workflow-run").open, true);
   items = [run("other-run")];
   h.emitGlobal({ type: "workflow.updated", data: { workflow_id: "unlisted" } }); await flush();
   assert.equal(h.document.activeElement.getAttribute("id"), "workflow-active-heading");
   const outside = h.document.querySelector("#message-input"); outside.focus();
   h.emitGlobal({ type: "workflow.updated", data: { workflow_id: "unlisted" } }); await flush();
-  assert.equal(h.document.activeElement, outside); h.ui.stopEvents();
+  assert.equal(h.document.activeElement === outside, true); h.ui.stopEvents();
 });

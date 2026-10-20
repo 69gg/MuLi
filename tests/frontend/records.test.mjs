@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
-import { createSessionState, applyEvent, messagePresentation, isRunning } from "../../web/state.mjs";
+import { createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning } from "../../web/state.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachments.mjs";
 
 // Exercise the actual records page, global SSE and dialog handlers with native DOM text semantics.
 // No browser dependency, service, model, account or real database is involved.
+// Compare DOM/slot identity through booleans: failed object diffs traverse the cyclic mock graph.
 const app = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
 const application = app.slice(app.indexOf("const ICONS ="), app.indexOf("\nfillIcons();"));
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -117,7 +118,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     window: { addEventListener: (name, callback) => { windowEvents[name] = callback; } },
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,
     setTimeout: () => 0, clearTimeout() {},
-    createSessionState, applyEvent, messagePresentation, isRunning, attachmentKind, attachmentURL, formatBytes,
+    createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning, attachmentKind, attachmentURL, formatBytes,
     createTeamPager: () => ({}), captureTeamView: () => null, restoreTeamView() {},
     renderMarkdown: (text) => { const node = document.createElement("p"); node.textContent = text; return node; },
     uploadFile() {}, transcribeAttachment() {}, VoiceInput: class { cancel() {} }, sessionStorage: {},
@@ -126,9 +127,15 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     readEvents: async (path, options) => { streams.set(path, options.onEvent); await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
   };
   runInNewContext(application + `
-    renderChrome = () => {}; renderChat = () => {}; toast = () => {}; resizeComposer = () => {};
+    renderChrome = () => {}; renderChat = () => {}; toast = () => {}; resizeComposer = () => {}; resetMessageNodes = () => {};
     refreshNotifications = async () => {}; queueRender = () => {};
+    const activateConnection = () => {
+      const owner = beginConnection(); owner.ready = true;
+      owner.sessions.start(); owner.notifications.start(); return owner;
+    };
+    activateConnection();
     globalThis.ui = { state, renderOtherView, renderSessions, refreshSessions, loadRecordDirectory, releaseRecordDirectory, recordDirectoryPage, renderHistoryEntry, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
+      activateConnection, connect,
       get slot() { return recordDirectory; }, get historySlot() { return historyDialog; }, get draftRevision() { return draftRevision; },
       stopEvents() { globalController?.abort(); sessionController?.abort(); } };
   `, context);
@@ -177,7 +184,7 @@ test("search submits exact literal Unicode, whitespace, NUL and percent values; 
   assert.equal(h.requests.length, 1);
   await original.parentNode.parentNode.dispatch("submit"); await flush();
   assert.equal(params(h.requests[1].path).get("query"), query);
-  assert.equal(input(h), original); assert.equal(input(h).value, query);
+  assert.equal(input(h) === original, true); assert.equal(input(h).value, query);
   await h.click(h.button("清空筛选"));
   assert.equal(params(h.requests[2].path).get("query"), ""); assert.equal(input(h).value, "");
 });
@@ -188,7 +195,7 @@ test("the query limit counts Unicode characters, accepts 120 astral emoji and re
   assert.equal(params(h.requests.at(-1).path).get("query"), "🙂".repeat(120));
   const before = h.requests.length; await search(h, "🙂".repeat(121));
   assert.equal(h.requests.length, before); assert.ok(h.other.textContent.includes("最多 120 个字符"));
-  assert.equal(h.button("重试"), undefined);
+  assert.equal(h.button("重试") === undefined, true);
   await search(h, "继续"); assert.equal(params(h.requests.at(-1).path).get("query"), "继续");
 });
 
@@ -239,13 +246,13 @@ test("malformed pages and cyclic continuation are errors, never fabricated EOF o
   ];
   for (const response of invalid) {
     const h = harness(async () => response); await h.ui.switchView("records");
-    assert.equal(h.ui.slot.page, null); assert.equal(rows(h).length, 0);
+    assert.equal(h.ui.slot.page === null, true); assert.equal(rows(h).length, 0);
     assert.ok(h.other.querySelector('[role="alert"]')); assert.equal(h.requests.length, 1);
     assert.equal(h.other.textContent.includes("已到最早"), false);
   }
   const h = harness(async (path) => page([record(params(path).get("cursor") || "first")], { has_more: true, next_cursor: "same" }));
   await h.ui.switchView("records"); await h.click(h.button("更早一页"));
-  assert.ok(h.other.textContent.includes("翻页位置无效")); assert.equal(h.ui.slot.page, null);
+  assert.ok(h.other.textContent.includes("翻页位置无效")); assert.equal(h.ui.slot.page === null, true);
 });
 
 test("failed page reads clear old rows, retain a visible error and retry the same exact query and cursor", async () => {
@@ -289,10 +296,10 @@ test("leaving and reopening invalidates an old directory even if its request ign
   const h = harness(async () => ++reads === 1 ? pending.promise : page([record("reopened")]));
   const first = h.ui.switchView("records"); await flush(); const oldSlot = h.ui.slot;
   await h.ui.switchView("chat");
-  assert.equal(oldSlot.page, null); assert.equal(oldSlot.controller, null); assert.equal(oldSlot.root.textContent, "");
+  assert.equal(oldSlot.page === null, true); assert.equal(oldSlot.controller === null, true); assert.equal(oldSlot.root.textContent, "");
   await h.ui.switchView("records"); pending.resolve(page([record("late-old")])); await first;
   assert.ok(h.other.textContent.includes("reopened")); assert.equal(h.other.textContent.includes("late-old"), false);
-  assert.notEqual(h.ui.slot, oldSlot);
+  assert.equal(h.ui.slot !== oldSlot, true);
 });
 
 test("401 clears the retained directory and late successful reads cannot refill the password gate", async () => {
@@ -305,7 +312,7 @@ test("401 clears the retained directory and late successful reads cannot refill 
   });
   await h.ui.switchView("records"); const oldSlot = h.ui.slot;
   await search(h, "pending"); await search(h, "unauthorized");
-  assert.equal(h.ui.slot, null); assert.equal(oldSlot.page, null); assert.equal(oldSlot.root.textContent, "");
+  assert.equal(h.ui.slot === null, true); assert.equal(oldSlot.page === null, true); assert.equal(oldSlot.root.textContent, "");
   assert.equal(h.ui.state.recordQuery, ""); assert.equal(h.ui.state.auth.authenticated, false);
   pending.resolve(page([record("late-private")])); await flush();
   assert.equal(oldSlot.root.textContent, ""); assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
@@ -316,7 +323,7 @@ test("pagehide releases summaries and controllers and forbids late refill", asyn
   const h = harness(async () => ++reads === 1 ? page([record()], { has_more: true, next_cursor: "later" }) : pending.promise);
   await h.ui.switchView("records"); await h.click(h.button("更早一页")); const oldSlot = h.ui.slot;
   h.windowEvents.pagehide(); pending.resolve(page([record("late")])); await flush();
-  assert.equal(h.ui.slot, null); assert.equal(oldSlot.page, null); assert.equal(oldSlot.root.textContent, "");
+  assert.equal(h.ui.slot === null, true); assert.equal(oldSlot.page === null, true); assert.equal(oldSlot.root.textContent, "");
   assert.equal(h.requests.at(-1).signal.aborted, true);
 });
 
@@ -329,9 +336,9 @@ test("real global session/workflow/run events only mark the directory dirty and 
   try {
     for (const type of ["run.completed", "session.updated", "workflow.updated"]) h.emit("/events", { id: type, type, data: {} });
     await flush(); await flush(); h.ui.renderOtherView();
-    assert.equal(input(h), original); assert.equal(h.document.activeElement === original, true);
+    assert.equal(input(h) === original, true); assert.equal(h.document.activeElement === original, true);
     assert.equal(original.value, "未提交"); assert.equal(original.selectionStart, 1); assert.equal(original.selectionEnd, 2);
-    assert.equal(slot.page, savedPage); assert.equal(slot.dirty, true);
+    assert.equal(slot.page === savedPage, true); assert.equal(slot.dirty, true);
     assert.equal(h.requests.filter((request) => request.path.startsWith("/session-records")).length, 1);
     assert.ok(h.other.textContent.includes("记录有更新"));
     assert.equal(h.document.querySelector("#message-input").value, "主草稿"); assert.equal(h.ui.state.attachments[0].id, "draft-file");
@@ -352,9 +359,52 @@ test("restored authentication reopens an independent directory rather than leavi
   let reads = 0;
   const h = harness(async () => page([record(`authenticated-${++reads}`)]));
   await h.ui.switchView("records"); const old = h.ui.slot; h.ui.showLogin();
-  h.ui.state.auth.authenticated = true; h.ui.renderSessions(); await flush();
-  assert.notEqual(h.ui.slot, old); assert.equal(h.ui.slot.page.items[0].id, "authenticated-2");
+  h.ui.state.auth.authenticated = true; h.ui.activateConnection(); h.ui.renderSessions(); await flush();
+  assert.equal(h.ui.slot !== old, true); assert.equal(h.ui.slot.page.items[0].id, "authenticated-2");
   assert.equal(rows(h).length, 1); assert.equal(h.requests.length, 2); assert.equal(old.root.textContent, "");
+});
+
+test("BFCache return restores the released records directory and committed query without changing chat drafts", async () => {
+  let reads = 0, positions = 0;
+  const h = harness(async (path) => {
+    if (path.startsWith("/session-records?")) return page([record(`directory-${++reads}`)]);
+    if (path === "/auth/status") return { required: false, authenticated: true };
+    if (path === "/ui/event-position") return { after: String(++positions * 20) };
+    if (path === "/status") return { mode: "auto" };
+    if (path === "/conversation") return { session: { id: "main", status: "idle" }, messages: [], events: [] };
+    return { items: [] };
+  });
+  await h.ui.switchView("records"); await search(h, "保留筛选");
+  const old = h.ui.slot; const draft = h.document.querySelector("#message-input");
+  draft.value = "尚未发送的主草稿"; h.ui.state.attachments = [{ id: "draft-file" }];
+  h.document.visibilityState = "visible"; h.document.querySelector("#auth-gate").hidden = true;
+  h.windowEvents.pagehide(); await flush();
+  assert.equal(h.ui.slot === null, true); assert.equal(old.root.textContent, "");
+  h.windowEvents.pageshow({ persisted: true }); await flush(); await flush();
+  assert.equal(h.ui.state.view, "records"); assert.equal(h.ui.slot === null, false);
+  assert.equal(h.ui.state.recordQuery, "保留筛选"); assert.equal(input(h).value, "保留筛选");
+  assert.equal(rows(h).length, 1); assert.equal(h.ui.slot.page.items[0].id, "directory-3");
+  assert.equal(reads, 3); assert.equal(positions, 1); assert.equal(h.ui.state.connected, true);
+  assert.equal(draft.value, "尚未发送的主草稿"); assert.equal(h.ui.state.attachments[0].id, "draft-file");
+  await search(h, "返回后可操作"); assert.equal(reads, 4);
+  h.ui.stopEvents();
+});
+
+test("reconnecting with a retained directory only marks its current page dirty", async () => {
+  let reads = 0;
+  const h = harness(async (path) => {
+    if (path.startsWith("/session-records?")) { reads += 1; return page([record("retained")]); }
+    if (path === "/auth/status") return { required: false, authenticated: true };
+    if (path === "/ui/event-position") return { after: "20" };
+    if (path === "/status") return { mode: "auto" };
+    if (path === "/conversation") return { session: { id: "main", status: "idle" }, messages: [], events: [] };
+    return { items: [] };
+  });
+  await h.ui.switchView("records"); const slot = h.ui.slot, field = input(h);
+  field.value = "未提交的目录输入"; field.focus(); await h.ui.connect();
+  assert.equal(h.ui.slot === slot, true); assert.equal(slot.dirty, true); assert.equal(reads, 1);
+  assert.equal(input(h) === field, true); assert.equal(field.value, "未提交的目录输入");
+  assert.equal(h.document.activeElement === field, true); h.ui.stopEvents();
 });
 
 test("nullable metadata, unknown status and invalid dates remain neutral; titles are pure text with no false/null children", async () => {
@@ -381,9 +431,9 @@ test("nullable metadata, unknown status and invalid dates remain neutral; titles
 test("the main record returns to the only live conversation without opening or creating another session", async () => {
   const h = harness(async () => page([record("main", { title: "主会话真实标题" })]));
   await h.ui.switchView("records"); assert.ok(h.other.textContent.includes("主会话真实标题"));
-  assert.equal(h.other.querySelector('[data-action="delete-session"]'), null);
+  assert.equal(h.other.querySelector('[data-action="delete-session"]') === null, true);
   await h.click(h.button("回到对话"));
-  assert.equal(h.ui.state.view, "chat"); assert.equal(h.ui.state.activeSession.id, "main"); assert.equal(h.ui.slot, null);
+  assert.equal(h.ui.state.view, "chat"); assert.equal(h.ui.state.activeSession.id, "main"); assert.equal(h.ui.slot === null, true);
   assert.equal(h.requests.length, 1);
 });
 

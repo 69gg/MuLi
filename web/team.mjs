@@ -4,12 +4,13 @@ export function createTeamPager(request, { limit = 50 } = {}) {
   let generation = 0;
   return {
     get query() { return { ...query }; },
-    async load(changes = {}) {
+    invalidate() { generation += 1; },
+    async load(changes = {}, read = request) {
       query = { ...query, ...changes };
       const current = ++generation;
       const params = new URLSearchParams({ limit: query.limit, offset: query.offset, active_only: query.activeOnly });
       try {
-        const page = await request(`/team?${params}`);
+        const page = await read(`/team?${params}`);
         if (current !== generation) return null;
         query = { limit: page.limit, offset: page.offset, activeOnly: page.active_only };
         return page;
