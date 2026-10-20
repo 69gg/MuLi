@@ -4,6 +4,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from test_attention import eventually
+from test_channels import onebot_body, onebot_event, profile
 from test_maintenance import NOW, move
 from test_maintenance_runtime import FakeClient, configured
 
@@ -56,6 +58,7 @@ async def host_app(
     passive: bool = False,
     password: bool = False,
     onboarding: bool = False,
+    onebot: bool = False,
 ) -> AsyncIterator[tuple[FastAPI, TransactionJournal, TransactionRecord]]:
     if sys.platform != "linux":
         pytest.skip("Linux transaction bootstrap")
@@ -67,6 +70,8 @@ async def host_app(
             "onboarding_pending": onboarding,
         }
     )
+    if onebot:
+        config.update({"channels": {"onebot": asdict(profile())}})
     data = tmp_path / "data"
     with TransactionJournal(tmp_path / "transactions", data / "muli.sqlite3") as journal:
         permit = BootPermit.acquire(
@@ -352,6 +357,46 @@ async def test_real_passive_host_activates_after_commit_and_defers_configuration
                 assert not calls
             runtime.maintenance.require_configuration()
             assert not runtime.maintenance.configuration_blocked
+
+
+async def test_activated_passive_host_keeps_signed_owner_webhook_durable_when_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with host_app(tmp_path, passive=True, onebot=True) as (app, journal, record):
+        runtime: Runtime = app.state.runtime
+        calls: list[str] = []
+
+        def forbidden_model(config: Any) -> Any:
+            calls.append("model")
+            raise AssertionError("paused input must not execute")
+
+        monkeypatch.setattr(runtime, "client_factory", forbidden_model)
+        raw, signed = onebot_body(onebot_event())
+        signed["Content-Type"] = "application/json"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            url = "/api/channels/onebot/webhook"
+            assert not runtime.maintenance.accepts_external_input
+            assert (await client.post(url, content=raw, headers=signed)).status_code == 409
+            assert not runtime.store.pending_inputs(runtime.main_session()["id"])
+            proof = runtime.maintenance.readiness(record.generation, "target", record.challenge)
+            move(journal, Transition(phase="committed", proof=proof))
+            response = await client.post(
+                "/api/internal/management/activate",
+                json={"generation": record.generation, "boot": "target"},
+                headers={"X-MuLi-Nonce": record.challenge},
+            )
+            assert response.status_code == 200 and response.json()["admission"] == "released"
+            assert runtime.maintenance.accepts_external_input
+            released = runtime.maintenance.readiness(record.generation, "target", record.challenge)
+            move(journal, Transition(phase="committed", activation="released", proof=released))
+            runtime.maintenance.admission.pause()
+            response = await client.post(url, content=raw, headers=signed)
+            assert response.status_code == 200 and response.json() == {"ok": True}
+            assert (await client.post(url, content=raw, headers=signed)).status_code == 200
+            assert runtime.store.pending_inputs(runtime.main_session()["id"]) == 1
+            assert not runtime.tasks and not calls
 
 
 async def test_passive_legacy_plugin_is_rejected_before_import_or_health_proof(

@@ -1,6 +1,6 @@
 # Linux 安装 manifest
 
-状态：同版本恢复的独立文件身份模块；尚未接通 CLI／管理提交、bootstrap、真实控制者与独立 helper。模块和回归不等于已交付可恢复服务，也不改变现有 `self_restart` 行为。
+状态：同版本恢复的独立文件身份模块；Linux backend 与独立 helper 已复用本合同，见[helper 接口](linux-controller-helper-design.md)，CLI／管理提交和服务 bootstrap 尚未接通。模块和回归不等于已交付可恢复服务，也不改变现有 `self_restart` 行为。
 
 `muli.platforms.installation.InstallationManifest` 复用现有 `UserService`、journal 私有目录、严格 JSON 解析和耐久写入。manifest 不含配置正文、数据库正文、环境变量、口令或 nonce；它只能供受信任的宿主内部构造，不能由模型工具参数选择包目录或解释器。
 

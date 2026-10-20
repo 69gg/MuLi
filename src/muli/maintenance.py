@@ -290,11 +290,26 @@ class Maintenance:
     @property
     def accepts_external_input(self) -> bool:
         # Existing instances may keep receiving durable owner input while paused.
-        # A passive replacement cannot start external polling or accept webhooks.
+        # A replacement first needs its own successful, strongly owned activation.
         if not self.permit or not self.permit.probation:
             return True
         record = self.current()
-        return bool(record and record.identity.origin_boot == self.permit.boot)
+        return bool(
+            record
+            and (
+                record.identity.origin_boot == self.permit.boot
+                or (
+                    self.permit.record
+                    and record.generation == self.permit.record.generation
+                    and record.phase in {"committed", "rolled_back"}
+                    and record.health is not None
+                    and record.health.boot == self.permit.boot
+                    and self._activation is not None
+                    and self._activation.done()
+                    and not self._activation_failed
+                )
+            )
+        )
 
     def _record(self, generation: str, boot: str, nonce: str) -> TransactionRecord:
         permit = self.permit
@@ -390,7 +405,12 @@ class Maintenance:
                 not self.admission.idle or not all(idle() for idle in self._owners.values())
             ):
                 raise MaintenanceError("maintenance_incomplete")
-        if record.activation == "blocked":
+        blocked = self._activation_failed or (
+            record.activation == "blocked"
+            and record.health is not None
+            and record.health.boot == permit.boot
+        )
+        if blocked:
             self.admission.pause()
         if record.resolved:
             self.reconcile()
@@ -407,7 +427,7 @@ class Maintenance:
             configuration=(record.target if role == "target" else record.base).digest,
             core_ready=True,
             admission="blocked"
-            if self._activation_failed or record.activation == "blocked"
+            if blocked
             else ("released" if self.admission.allowed else "paused"),
         )
 
