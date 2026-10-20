@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -81,7 +82,9 @@ def install_child(
 async def test_real_transport_preserves_app_window_snapshot_and_single_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ax_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ax_module, "sys", SimpleNamespace(platform="darwin", executable=sys.executable)
+    )
     computer = Computer(
         Settings.model_validate({"computer": {"enabled": True, "backend": "ax"}}),
         owner=lambda: ("owner", "run"),
@@ -109,7 +112,9 @@ async def test_real_transport_preserves_app_window_snapshot_and_single_action(
 async def test_real_transport_lost_action_receipt_is_unknown_and_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ax_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ax_module, "sys", SimpleNamespace(platform="darwin", executable=sys.executable)
+    )
     computer = Computer(
         Settings.model_validate({"computer": {"enabled": True, "backend": "ax"}}),
         owner=lambda: ("owner", "run"),
@@ -129,7 +134,9 @@ async def test_real_transport_lost_action_receipt_is_unknown_and_not_retried(
 async def test_runtime_final_guard_after_real_lease_start_writes_no_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ax_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ax_module, "sys", SimpleNamespace(platform="darwin", executable=sys.executable)
+    )
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update({"computer": {"backend": "ax", "enabled": True}})
     await runtime.reconfigure()
