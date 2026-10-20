@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+from test_legacy_transaction_bridge import Recovered
+from test_legacy_transaction_bridge import recovered as recovered
+from test_managed_transaction import deadline
+
+from muli import legacy_boot_adapter, managed_boot
+from muli.config import Settings
+from muli.legacy_boot_adapter import LegacyBootPermit, prepare_legacy_permit
+from muli.maintenance import BootPermit, Maintenance
+from muli.managed_boot import ManagedBootError, ManagedBootPermit
+from muli.management_projection import project_final
+from muli.management_transaction import TransactionError, TransactionRecord, Transition
+from muli.platforms.managed_deployment import resolve_entry
+from muli.proactive import FrozenRouting
+from muli.reply_origin import ReplyOrigin
+from muli.store import Store
+
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux legacy writer ownership")
+
+
+@dataclass
+class Host:
+    recovered: Recovered
+    owner: ManagedBootPermit
+    store: Store
+
+    def prepare(self, *, action: str = "configure") -> LegacyBootPermit:
+        assert action in {"configure", "restart"}
+        with self.recovered.journal.locked() as control:
+            return prepare_legacy_permit(
+                control,
+                owner=self.owner,
+                store=self.store,
+                manifest=self.recovered.manifest,
+                request_id="next-legacy-" + action,
+                action="configure" if action == "configure" else "restart",
+                target=self.recovered.target
+                if action == "configure"
+                else Path(self.recovered.manifest.config_path).read_bytes(),
+                deadline=deadline(),
+            )
+
+    def assert_owned(self) -> None:
+        self.owner.check_paths(
+            Path(self.recovered.manifest.config_path), self.recovered.journal.database
+        )
+        assert self.owner._database is not None and self.owner._database.fd is not None
+        os.fstat(self.owner._database.fd)
+        with pytest.raises(TransactionError, match="lock_busy"):
+            self.recovered.journal.writer_lease().__enter__()
+
+
+@pytest.fixture
+def host(recovered: Recovered, monkeypatch: pytest.MonkeyPatch) -> Iterator[Host]:
+    recovered.store.close()
+    monkeypatch.setattr(managed_boot, "verify_local_filesystems", lambda paths: None)
+    owner = ManagedBootPermit.acquire(
+        recovered.journal,
+        boot=recovered.previous.health.boot if recovered.previous.health else "running-legacy",
+        plan=resolve_entry(recovered.journal.directory.path, purpose="service"),
+        lease=recovered.writer,
+    )
+    store = owner.open_store()
+    recovered.store = store
+    try:
+        yield Host(recovered, owner, store)
+    finally:
+        store.close()
+        if owner._cleanup_failed:
+            # Synthetic failure teardown only: the test already proved sticky
+            # production close refuses. The real temporary Store is now closed.
+            assert owner._database is not None
+            owner._database.close()
+        else:
+            owner.close_after_writers()
+
+
+@pytest.mark.parametrize("recovered", ["aborted", "rolled_back"], indirect=True)
+@pytest.mark.parametrize("action", ["configure", "restart"])
+async def test_returned_v1_view_proves_origin_without_losing_managed_database_anchor(
+    host: Host, action: str
+) -> None:
+    owner = host.owner
+    original_record, original_installation = owner.record, owner.installation
+    anchor = owner._database
+    assert anchor is not None
+    current = Settings(default_mode="yolo").model_dump_json().encode()
+    Path(host.recovered.manifest.config_path).write_bytes(current)
+    view = host.prepare(action=action)
+    assert isinstance(view, BootPermit)
+    assert view.writer_owner is owner and view.lease is owner.lease
+    assert view.boot == owner.boot and view.journal is owner.journal
+    assert view.installation == host.recovered.manifest.digest
+    assert view.service == host.recovered.manifest.service_digest
+    assert view.installation != owner.installation
+    assert view.record is not None and view.record.identity.origin_boot == owner.boot
+    assert view.record.base != host.recovered.previous.base.configuration
+    assert view.journal.snapshot(view.record, "base") == current
+    assert not view.probation and view.role is None
+    assert owner.record == original_record and owner.installation == original_installation
+    assert not hasattr(owner, "service") and owner._database is anchor
+    host.assert_owned()
+
+    maintenance = Maintenance(view)
+    maintenance.prepared(host.store.instance_id, host.store.main_session()["id"])
+    maintenance.owner("runtime", lambda: True)
+    maintenance.seal({"runtime"})
+    with view.journal.locked() as control:
+        record = control.advance(view.record.position, Transition(phase="draining"))
+    assert maintenance.drain(record.generation, owner.boot, record.challenge)["state"] == "drained"
+    proof = maintenance.readiness(record.generation, owner.boot, record.challenge)
+    assert proof.installation == view.installation and proof.admission == "paused"
+    host.assert_owned()
+    host.store.close()
+    # Closing a business writer alone never releases the managed inode/lease.
+    host.assert_owned()
+    view.close_after_writers()
+    assert anchor.fd is None and owner._closed
+    with view.journal.writer_lease():
+        pass
+
+
+def test_failed_bridge_leaves_original_owner_and_store_live(host: Host) -> None:
+    original_record = host.owner.record
+    host.store.db.execute("DELETE FROM objects WHERE kind='management_projection'")
+    host.store.db.commit()
+    with pytest.raises(TransactionError, match="projection_required"):
+        host.prepare()
+    assert host.recovered.journal.read_current() == original_record
+    assert host.owner.record == original_record and not hasattr(host.owner, "service")
+    assert host.store.db.execute("SELECT 1").fetchone()[0] == 1
+    host.assert_owned()
+
+
+def test_bridge_cancellation_does_not_release_original_owner(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    def interrupted(*args: object, **kwargs: object) -> TransactionRecord:
+        raise Cancelled
+
+    monkeypatch.setattr(legacy_boot_adapter, "prepare_legacy_after_managed", interrupted)
+    with pytest.raises(Cancelled):
+        host.prepare()
+    assert host.recovered.journal.read_current() == host.recovered.previous
+    host.assert_owned()
+
+
+def test_v1_projection_uses_manifest_identity_while_original_owner_remains_retained(
+    host: Host,
+) -> None:
+    view = host.prepare()
+    assert view.record is not None
+    routing = FrozenRouting.bound(ReplyOrigin("web", "legacy-owner-input")).dump()
+    host.store.put(
+        "management",
+        {
+            "id": view.record.request_id,
+            "action": view.record.action,
+            "status": "applying",
+            "transaction": {"generation": view.record.generation},
+            "routing": routing,
+        },
+    )
+    with view.journal.locked() as control:
+        current = control.advance(
+            view.record.position, Transition(phase="aborted", code="cancelled")
+        )
+    receipt = project_final(view, host.store)
+    assert receipt is not None and receipt.generation == current.generation
+    plan = host.store.get("management", current.request_id)
+    assert plan is not None and plan["status"] == "cancelled"
+    assert plan["routing"] == routing
+    host.assert_owned()
+
+
+def test_sticky_managed_close_failure_cannot_be_bypassed_by_the_v1_view(host: Host) -> None:
+    view = host.prepare()
+    host.owner._retain(host.store)
+    with pytest.raises(ManagedBootError, match="managed_boot_cleanup_failed") as failure:
+        view.close_after_writers()
+    assert failure.value._owner is host.owner
+    host.assert_owned()
+    assert host.store.db.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_path_checks_keep_the_original_database_inode_guard(host: Host) -> None:
+    view = host.prepare()
+    database = view.journal.database
+    displaced = database.with_suffix(".displaced")
+    database.rename(displaced)
+    database.write_bytes(b"foreign database, never opened")
+    try:
+        with pytest.raises(ManagedBootError, match="managed_database_changed"):
+            view.check_paths(Path(host.recovered.manifest.config_path), database)
+        with pytest.raises(TransactionError, match="lock_busy"):
+            view.journal.writer_lease().__enter__()
+    finally:
+        database.unlink()
+        displaced.rename(database)

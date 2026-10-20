@@ -87,7 +87,7 @@ def prepare_legacy_after_managed(
         raise TransactionError("format_changed")
     # A failed adoption must still have its frozen evidence; this is not an
     # escape hatch for a corrupt managed record or a broken deployment anchor.
-    old = read_snapshots(journal, previous, "base")
+    read_snapshots(journal, previous, "base")
     read_snapshots(journal, previous, "target")
     with DeploymentStore(journal.directory.path, journal.limits) as deployments:
         anchor = deployments.read_anchor(previous.identity.deployment)
@@ -110,8 +110,6 @@ def prepare_legacy_after_managed(
     limit = journal.limits.max_snapshot_bytes
     target_ref = _snapshot(target, limit)
     Settings.model_validate_json(target)
-    if action == "restart" and target_ref != previous.base.configuration:
-        raise TransactionError("restart_changes_configuration")
 
     def guard() -> None:
         control.check()
@@ -122,11 +120,18 @@ def prepare_legacy_after_managed(
         ConfigurationFile(Path(anchor.unit_path), limit) as unit,
         SelectorStore(journal.directory.path) as selector,
     ):
-        configuration = config.confirm(previous.base.configuration.digest, guard=guard)
+        # Exact projection has already released this generation's configuration
+        # gate. Freeze the current validated bytes for the new V1 generation;
+        # the historical V2 snapshots remain evidence, not the new base.
+        configuration = config.read()
+        base_ref = _snapshot(configuration.data, limit)
+        Settings.model_validate_json(configuration.data)
+        if action == "restart" and target_ref != base_ref:
+            raise TransactionError("restart_changes_configuration")
+        config.confirm(base_ref.digest, guard=guard)
         restored_unit = unit.confirm(previous.base.unit.digest, guard=guard)
         if (
-            configuration.data != old.configuration
-            or raw_snapshot(restored_unit.data, limit) != previous.base.unit
+            raw_snapshot(restored_unit.data, limit) != previous.base.unit
             or selector.read() is not None
         ):
             raise TransactionError("legacy_entry_changed")
@@ -143,7 +148,7 @@ def prepare_legacy_after_managed(
                 main_session=actual_store.main,
                 origin_boot=origin_boot,
             ),
-            base=previous.base.configuration,
+            base=base_ref,
             target=target_ref,
             deadline=deadline,
             challenge=secrets.token_hex(32),
@@ -155,7 +160,7 @@ def prepare_legacy_after_managed(
         ):
             raise TransactionError("record_budget")
         incoming = {
-            f"{generation}-base.json": old.configuration,
+            f"{generation}-base.json": configuration.data,
             f"{generation}-target.json": target,
             "installation.json": installation,
         }
@@ -164,7 +169,7 @@ def prepare_legacy_after_managed(
             control._replace(name, data)
         # Confirm again after preparation writes; no await or new authorization
         # can turn a manual file edit into permission to overwrite state.
-        config.confirm(previous.base.configuration.digest, guard=guard)
+        config.confirm(base_ref.digest, guard=guard)
         unit.confirm(previous.base.unit.digest, guard=guard)
         selector.confirm(None, guard=guard)
         manifest.verify()
