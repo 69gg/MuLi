@@ -32,4 +32,6 @@
 
 最终独立静态复审无剩余阻断。MCP 修复后相关 80 项通过，随后整版 **1,880 通过、1 项平台跳过**，36.03 秒，service 38.140 秒、CPU 30.089 秒、峰值 839.1 MiB、swap 0。该轮没有真实账号、模型、桌面、服务安装或重启。远端矩阵与发行仍待完成，不以本地通过冒充跨平台或已发布。
 
+PR #17 首轮 CI `39452082640` 的核心 quality 环境未安装可选 FastMCP，严格类型检查拒绝从不可用依赖的 Any 类型继承 MessageHandler。本地按导入不可用的类型语义复现，改用锁定版本原生支持的异步 message_handler 回调，并只接受 SDK ServerNotification 中的 ToolListChangedNotification；不为核心安装增加 MCP 依赖，也不关闭严格检查。55 项 MCP/扩展回归通过，峰值 123 MiB；无增量的 76 源码严格检查通过，峰值 376.3 MiB。其它真实平台结果及最后修订另记。
+
 Skills 的 YAML 元数据复用环境和锁文件中已有的 PyYAML 6.0.3，提升为声明的直接依赖。首次离线整体解析因其它平台的现有 Pydantic 元数据不在本机缓存而拒绝；没有联网下载或改变 Python 支持范围。随后仅提升既有 PyYAML 条目的根依赖及 requires-dist，所有已锁版本/产物保持原样，`uv lock --check --offline` 确认 83 包一致；最终还需远端锁定安装与打包验证。所有本地验证使用既有 cgroup 守卫。

@@ -13,10 +13,37 @@ from muli.tools.mcp import (
     MCPManager,
     MCPPrepareError,
     ToolPage,
+    _default_factory,
     _FastMCPClient,
 )
 
 JsonObject = dict[str, Any]
+
+
+async def test_optional_client_callback_only_accepts_tool_catalog_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fastmcp = pytest.importorskip("fastmcp")
+    types = pytest.importorskip("mcp.types")
+    options: dict[str, Any] = {}
+    changed: list[bool] = []
+
+    def client(transport: Any, **kwargs: Any) -> Any:
+        options.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(fastmcp, "Client", client)
+    _default_factory(
+        {"transport": "http", "url": "https://unused.invalid/mcp"},
+        1,
+        lambda: changed.append(True),
+    )
+    callback = options["message_handler"]
+    await callback(types.ServerNotification(root=types.ToolListChangedNotification()))
+    await callback(types.ServerNotification(root=types.ResourceListChangedNotification()))
+    await callback({"method": "notifications/tools/list_changed"})
+    await callback(RuntimeError("notification failure"))
+    assert changed == [True]
 
 
 class FakeClient:
