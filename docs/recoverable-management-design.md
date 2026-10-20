@@ -135,13 +135,15 @@ uv 没有这里所需的通用安装目录硬配额开关。磁盘预留、有�
 
 现有 controller 在配置摘要已经等于 target/base 时会跳过 install/restore；这适用于同版本配置事务，但 A/B 通常配置完全相同，照搬会跳过程序切换。V2 需要同时确认配置、selector 和实际运行安装，两个文件分别 CAS、耐久确认并可重观察。probation 选择不等于已确认的 CLI 活动版本；稳定入口、服务 probe 的真实解释器核验及 CLI 委托必须一起交付，避免网页已切换而命令仍落旧环境。
 
+不能先在现有 `init/service install` 自动种下强制 selector：当前 `self_update` 仍合法执行原位 `uv tool upgrade`，随后重启；包或 pyvenv 指纹变化会使预解析校验拒绝全部 CLI，连修复入口也不可达。因此，托管模式需显式迁入，并与独立、版本化的修复入口同片交付。旧模式沿原路径；托管模式不得再执行原位升级或让普通 service install 覆盖稳定 unit。迁入/迁出都需核对旧事务的精确终态投影、停止后的空 cgroup、writer lease 与控制锁；未决事务只能接续原控制者，不能重签变化后的安装来消除故障。托管后端未完成时只能提供预检，不写入模式或 selector。这里记录的是审查后的设计约束，尚无迁入命令。
+
 prepare 时的兼容判定只负责早拒。每次候选或回退 boot 都须在真实 writer lease 下、ConfigFile/Store 之前重新读取格式证据，绑定 generation、实际 boot、role、安装/声明、DB/config 与 Store/main；再通过无迁移连接复核后进入本地恢复。健康证明须包含本次准入身份，不能跨 boot 复用旧证据。以上是后续接线约束，目前没有 V2 生产入口或 selector。
 
 首期自动更新要求旧/新程序对**同一持久格式**兼容：不仅 SQLite 表结构，还包含 objects/ingress/outbox 的 JSON 语义、配置 schema、receipt/profile 语义与管理交接协议。候选发行包须提供无需启动应用即可读取的兼容 manifest：协议版本、可读/可写持久格式、配置格式、是否需要迁移；版本号大小不能替代该证据。
 
 下一开发片已实现[兼容元数据纯判定](upgrade-compatibility.md)，独立区分 database、objects、configuration、ingress、outbox、memory、install_profile 七个完整语义领域。它只比较经调用者提供的声明，不读取真实库、不发当前版本格式标记，也不授权切换。缺少来源证明、原版本 manifest 或真实格式证据时仍拒绝；现有 protocol 1 的单安装身份不因声明中的协议数字相同而变成 A/B 协议。
 
-[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；uv 身份、完整解析上下文与候选安装仍未实现。[无迁移启动方案](no-migration-startup-design.md)已列出 Store、Memory 与 ChannelManager 的实际隐式写入路径，需全部纳入候选准入，不能只禁止其中一个构造器。
+[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；uv 身份、完整解析上下文与候选安装仍未实现。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；正式启动仍需按[无迁移启动方案](no-migration-startup-design.md)接入完整候选准入。
 
 [格式证据读取器](format-evidence.md)已独立实现：宿主提供专用连接，读取器在单一快照中核对完整格式标记、资料库及主人主会话身份，读取预算有限且不补数据。它不认证连接路径、发行来源或格式语义，也未接启动；缺少完整标记的历史库仍拒绝，不能自动补出兼容证明。
 

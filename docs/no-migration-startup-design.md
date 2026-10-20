@@ -1,6 +1,6 @@
 # A/B 候选的无迁移启动边界
 
-状态：启动策略仍为设计；[连接内格式证据读取器](format-evidence.md)已独立实现，尚未接入实际启动。本文补充[可恢复管理](recoverable-management-design.md)与[兼容声明](upgrade-compatibility.md)，不改变 2.19 的同版本恢复入口，也不为已有数据库补发格式证明。
+状态：[连接内格式证据读取器](format-evidence.md)与覆盖三个构造器的[禁止迁移入口](store-existing.md)已独立实现，完整准入与实际启动接线仍为设计。本文补充[可恢复管理](recoverable-management-design.md)与[兼容声明](upgrade-compatibility.md)，不改变 2.19 的同版本恢复入口，也不为已有数据库补发格式证明。
 
 ## 为什么现有 probation 还不够
 
@@ -57,4 +57,6 @@ SQLite 的只读连接不等于文件系统完全零变动：WAL 模式可能涉
 
 合成临时 SQLite 测试至少覆盖：缺库/缺 marker 不创建；未知/重复/类型错误/超大标记固定拒绝；schema 变化与身份变化；真实 WAL 中最新已提交事实；锁竞争和查询预算；禁止入口缺表/缺索引/缺实例 ID 不修补；Memory 不迁移别名或回填索引；禁用渠道的构造与重新配置也不补 fingerprint；格式准入失败前后业务事实相同；两个已认证同格式实现对 ingress/outbox/unknown、审批与路由 proof 的读取一致。
 
-读取器已在宿主提供的合成连接上通过单快照、WAL、身份/标记、锁竞争、读取预算与清理测试，并拒绝非零 `read_uncommitted`，避免共享缓存连接读取未提交事实。连接内新回归与纯判定共 200 项通过，详情见[验证记录](format-evidence.md#验证边界)。实际路径打开、三个禁止迁移构造器和跨版本语义验收仍未实现；没有访问用户真实数据库。
+读取器已在宿主提供的合成连接上通过单快照、WAL、身份/标记、锁竞争、读取预算与清理测试，并拒绝非零 `read_uncommitted`，避免共享缓存连接读取未提交事实。连接内新回归与纯判定共 200 项通过，详情见[验证记录](format-evidence.md#验证边界)。
+
+`Store.open_existing` 已实现已有文件的禁止创建打开和三组结构、局部身份的有界核验，Memory 与 ChannelManager 继承同一策略；普通初始化不变。独立测试覆盖零迁移、失败不修复、成功后的业务写入与 Runtime/渠道重新配置，详情见[构造验证](store-existing.md#验证边界)。宿主路径认证、完整七领域准入、实际 bootstrap 接线和跨版本语义验收仍未完成；没有访问用户真实数据库。
