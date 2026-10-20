@@ -1,6 +1,6 @@
 # 2.19 Linux 同版本恢复入口
 
-状态：本地验证通过，等待候选 CI 与发布核验。本版连接此前分别审查的恢复组件，包含实际 CLI/API 接线；跨版本 A/B 更新仍为后续切片。
+状态：本地与最终候选八项 CI 通过，签名标签已推送，等待发行流水线和构件核验。本版连接此前分别审查的恢复组件，包含实际 CLI/API 接线；跨版本 A/B 更新仍为后续切片。
 
 Linux serve 在配置和业务数据库之前取得 writer lease，并核验实际 systemd 启动身份。宿主持久保存管理计划代次，再发布 manifest、journal 和候选配置；独立受限 helper 执行排空、停止、CAS、被动启动、健康确认及放行。业务库 WAL/FULL 与终态原子投影保留最新收件、原汇报来源和未知效果，不能通过换数据目录绕过同一个 unit 的未决事务。
 
@@ -14,4 +14,8 @@ CLI/HTTP 独立入口 31 项与身份/初始化 34 项回归分别通过。整�
 
 离线构建 wheel/sdist，并在源码树外临时安装验证导入、网页资产、API 文档、提示词、默认关闭的桌面功能、任务控制和 lifespan，安装输出版本 2.19.0。构建峰值 91 MiB，安装验证 88.8 MiB，swap 0。无网络依赖安装或模型下载。
 
-未操作用户真实 systemd 服务，未验证真实停机时长、断电或外部渠道故障；所有副作用使用临时文件、SQLite、fake runner/probe/transport。macOS/Windows 已静态核对导入门，实际远端矩阵结论待 CI。第一期只支持标准同用户 systemd unit、实际 cgroup v2 及本地持久文件系统；能力不足明确拒绝，不自动直接重启。原位 self_update 不获得跨版本回退能力。
+首轮远端矩阵 `39482512155` 的质量、MCP、Linux 与 macOS 全过，Windows 两项均只失败在新增 HTTP 测试默认以 cp1252 读取 UTF-8 中文候选配置。生产写入已显式 UTF-8；仅将测试读取指定相同编码，受限 11 项及 Ruff/格式通过，峰值 124.8 MiB、swap 0。签名提交 `c662d0eec49198f3790c2f0a33c506f9693bac8f` 的[最终八项 CI](https://github.com/69gg/MuLi/actions/runs/39483905264)全部成功，覆盖 Linux/macOS/Windows 的 Python 3.12/3.13；未盲重试旧候选或降低断言。
+
+同一精确提交已创建 GPG 签名标签 `v2.19.0`，并与 main 原子推送；[main CI](https://github.com/69gg/MuLi/actions/runs/39484677611)及[发行流水线](https://github.com/69gg/MuLi/actions/runs/39484678672)仍待最终核验。后续兼容模块与进程故障回归在下一分支，未混入本标签。
+
+未操作用户真实 systemd 服务，未验证真实停机时长、断电或外部渠道故障；所有副作用使用临时文件、SQLite、fake runner/probe/transport。远端平台测试不等于真实 macOS/Windows 服务恢复验收。第一期只支持标准同用户 systemd unit、实际 cgroup v2 及本地持久文件系统；能力不足明确拒绝，不自动直接重启。原位 self_update 不获得跨版本回退能力。
