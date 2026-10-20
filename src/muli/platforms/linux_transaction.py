@@ -45,6 +45,7 @@ _SERVICE_FIELDS = (
 )
 _HELPER_UNIT_FIELDS = (
     ("Transient", "b"),
+    ("CollectMode", "s"),
     ("PartOf", "as"),
     ("BindsTo", "as"),
     ("StopPropagatedFrom", "as"),
@@ -341,6 +342,7 @@ class SystemdProbe:
     async def _helper_limits(self, path: str, limits: HelperLimits) -> None:
         expected: dict[str, object] = {
             "Transient": True,
+            "CollectMode": "inactive",
             "PartOf": (),
             "BindsTo": (),
             "StopPropagatedFrom": (),

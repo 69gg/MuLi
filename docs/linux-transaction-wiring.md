@@ -34,6 +34,8 @@ manifest 在 journal 锁内发布；旧代未解决或终态未投影时不得�
 
 控制者不能位于主服务 cgroup 下，也不能通过 PartOf、BindsTo、StopPropagatedFrom 绑定其它 unit；Requires、Requisite、Conflicts 中不能包含主服务。正常的 slice 和 shutdown 依赖不受此限制。此检查不承诺阻止管理员在观察结束后更改 manager 状态。
 
+控制者必须使用 `CollectMode=inactive`，保留失败的同名单元；不能使用 `--collect` 自动回收 failed 单元后重新创建，以绕过既有 StartLimit。该属性同时通过实际 D-Bus 观察核验，新增反例已通过。
+
 `helper_exists` 使用固定 `ListUnitsByPatterns([], [精确名称])`，仅成功的结构化空列表表示 manager 当前没有加载该名。它不证明磁盘上没有同名单元；后续 transient 创建若冲突必须失败，不能 reset、换名或把 manager 读取失败解释为不存在。
 
 本片 54 项新增及 48 项既有探测回归通过，0.27 秒、峰值 61.9 MiB、swap 0；Ruff/格式与单源码 mypy 通过，后者峰值 121 MiB。独立审查补充了 Requires 停止传播和 TimeoutError 继承 OSError 的边界。另仅对一个不存在的精确 helper 名运行了受 guard 保护的只读 D-Bus 查询，核实 `data:[[]]` 格式（59 毫秒、10.3 MiB），未启动或停止真实服务。接口类型同时对照本机安装的 `/usr/share/dbus-1/interfaces/org.freedesktop.systemd1.{Unit,Service,Manager}.xml` 和 [systemd 官方资料](https://github.com/systemd/systemd/blob/main/man/org.freedesktop.systemd1.xml)。
