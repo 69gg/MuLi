@@ -129,6 +129,64 @@ def test_directory_uses_full_path_identity_when_direntry_has_windows_zero_fields
     assert snapshot.config["mcpServers"]["native"]["enabled"] is True
 
 
+def _with_ctime(info: os.stat_result, nanoseconds: int) -> os.stat_result:
+    return os.stat_result(
+        info,
+        {"st_mtime_ns": info.st_mtime_ns, "st_ctime_ns": nanoseconds},
+    )
+
+
+def test_directory_accepts_distinct_stable_path_and_handle_ctimes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = fragment(tmp_path, "windows.json", {"mcpServers": {"native": server()}})
+    handle_ctime = path.lstat().st_ctime_ns + 1
+    original_fstat = os.fstat
+    calls = 0
+
+    def fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        return _with_ctime(original_fstat(descriptor), handle_ctime)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    snapshot = MCPDirectory(directory_settings(tmp_path)).prepare()
+    assert snapshot.sources == ("windows.json",)
+    assert snapshot.config["mcpServers"]["native"]["enabled"] is True
+    assert calls == 2
+
+
+@pytest.mark.parametrize("api", ["fstat", "lstat"])
+def test_directory_still_rejects_ctime_changes_within_each_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api: str
+) -> None:
+    path = fragment(tmp_path, "changing.json", {"mcpServers": {"native": server()}})
+    initial_ctime = path.lstat().st_ctime_ns
+    calls = 0
+    original_fstat, original_lstat = os.fstat, Path.lstat
+
+    def fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        return _with_ctime(original_fstat(descriptor), initial_ctime + (calls > 1))
+
+    def lstat(source: Path) -> os.stat_result:
+        nonlocal calls
+        info = original_lstat(source)
+        if source == path:
+            calls += 1
+            return _with_ctime(info, initial_ctime + (calls > 1))
+        return info
+
+    if api == "fstat":
+        monkeypatch.setattr(os, "fstat", fstat)
+    else:
+        monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(ExtensionError, match="source_changed"):
+        MCPDirectory(directory_settings(tmp_path)).prepare()
+    assert calls == 2
+
+
 async def test_unconfigured_directories_respect_muli_home_and_ignore_physical_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -543,6 +601,20 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
     runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=factory)
     app = create_app(runtime.config, runtime=runtime)
     manager: SelfManagement = app.state.management
+    busy_returned, release_management = asyncio.Event(), asyncio.Event()
+    apply_settings = manager.apply_settings
+
+    async def gated_management_apply(settings: Settings) -> None:
+        try:
+            await apply_settings(settings)
+        except ExtensionError as exc:
+            if exc.code == "runtime_busy":
+                busy_returned.set()
+                await release_management.wait()
+            raise
+
+    if mode == "management":
+        monkeypatch.setattr(manager, "apply_settings", gated_management_apply)
     operation: asyncio.Task[httpx.Response] | None = None
     try:
         await runtime.extensions.load_initial()
@@ -603,6 +675,19 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
                     ):
                         await asyncio.sleep(0.01)
                 if plan is not None:
+                    # Closing a candidate does not finish the caller's requeue.
+                    await asyncio.wait_for(busy_returned.wait(), timeout=2)
+                    current = runtime.store.get("management", plan["id"])
+                    assert current is not None and current["status"] == "applying"
+                    release_management.set()
+
+                    def requeued() -> bool:
+                        assert plan is not None
+                        saved = runtime.store.get("management", plan["id"])
+                        return saved is not None and saved["status"] == "pending"
+
+                    async with asyncio.timeout(2), runtime.bus.changed:
+                        await runtime.bus.changed.wait_for(requeued)
                     current = runtime.store.get("management", plan["id"])
                     assert current is not None and current["status"] == "pending"
                     assert (manager.directory / f"{plan['id']}.json").is_file()
@@ -628,6 +713,7 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
     finally:
         finish_prepare.set()
         finish_model.set()
+        release_management.set()
         if operation is not None:
             await asyncio.gather(operation, return_exceptions=True)
         await manager.close()
