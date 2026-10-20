@@ -295,7 +295,7 @@ def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
 class _Directory(AbstractContextManager["_Directory"]):
     """Anchor private files to an fd; never open a FIFO or follow a final link."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, create: bool = True) -> None:
         if sys.platform != "linux":
             raise TransactionError("platform_unsupported")
         self.path = path.absolute()
@@ -309,6 +309,8 @@ class _Directory(AbstractContextManager["_Directory"]):
                         dir_fd=descriptor,
                     )
                 except FileNotFoundError:
+                    if not create:
+                        raise
                     os.mkdir(part, 0o700, dir_fd=descriptor)
                     os.fsync(descriptor)
                     next_fd = os.open(

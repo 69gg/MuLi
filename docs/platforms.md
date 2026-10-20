@@ -16,6 +16,8 @@ Windows 计划任务使用当前 Python 环境的 pythonw.exe，缺失时报告�
 
 macOS 与 Windows 使用本地日志包装器，不依赖终端重定向。每份日志最多 1 MiB，保留一个轮转文件。服务命令不隐式提升权限，系统工具缺失、用户会话不可用和查询超时会通过 status.reason 报告。Linux unit 默认保留 MemoryMax=512M、CPUQuota=50%、TasksMax=64，可用用户 unit override 调整。
 
+Linux 同版本恢复另有独立的[安装 manifest](installation-manifest.md)文件身份模块：保留虚拟环境词法解释器入口，有限核对实际二进制、pyvenv、MuLi 包与标准 unit，不扫描完整依赖环境。它尚未接通服务交接入口，不改变上述服务命令；自定义 unit override 仍可用于现有服务，但不属于首期标准 unit 恢复合同。
+
 ## 截图与录屏
 
 Linux 节点操作先使用 AT-SPI 获取无障碍树和节点身份；2.5 的实验性 macOS AX 使用单独的短期原生对象会话，Windows UIA 尚未实现。`computer_screenshot` / `computer_record` 是独立的图像采集工具，不要求节点后端可用，遵循 computer 风险门；采集结果不能提供绕过快照校验的点击坐标。配置 computer.enabled 与 computer.capture.enabled 后才可执行，二者默认关闭。图像采集能力与节点后端分别报告。

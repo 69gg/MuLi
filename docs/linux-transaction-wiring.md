@@ -22,7 +22,7 @@ manifest 在 journal 锁内发布；旧代未解决或终态未投影时不得�
 
 ## 任务分工与验证
 
-根任务负责私有 manifest、配置文件入口、bootstrap/管理投影接线；服务作者负责 `ControllerBackend`、nonce HTTP、独立 helper 与有界 manager 操作；独立审查者审合同、失败窗口与最终差异。所有新路径先使用注入 runner/HTTP transport、临时目录和假 cgroup；不启动用户真实服务。
+安装身份作者负责独立 [manifest 模块](installation-manifest.md)及其回归；根任务负责配置文件入口、bootstrap/管理投影接线；服务作者负责 `ControllerBackend`、nonce HTTP、独立 helper 与有界 manager 操作；独立审查者审合同、失败窗口与最终差异。所有新路径先使用注入 runner/HTTP transport、临时目录和假 cgroup；不启动用户真实服务。
 
 初始支持面限标准同用户 systemd unit、可核验 cgroup v2 与本地持久文件系统。unsupported 保留原服务。机器重启后恢复依赖已启用的服务或显式恢复入口；不会自动启用 linger。最终只有包含 bootstrap、管理入口、独立 helper、真实 writer lease 和终态投影的闭环全部通过，才宣传同版本可恢复重启。
 
