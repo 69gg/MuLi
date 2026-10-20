@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_ax_computer import ACCEPTED, FakeLease, action, frame
@@ -14,7 +16,9 @@ from muli.runtime import Runtime
 
 
 async def configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Runtime:
-    monkeypatch.setattr(ax_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ax_module, "sys", SimpleNamespace(platform="darwin", executable=sys.executable)
+    )
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update({"computer": {"enabled": True, "backend": "ax"}})
     await runtime.reconfigure()
