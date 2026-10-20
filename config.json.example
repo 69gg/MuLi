@@ -409,7 +409,8 @@
     "retry_backoff_seconds": 5.0,
     "proactive": {
       "external_enabled": false,
-      "default_destination": { "kind": "web" }
+      "default_destination": { "kind": "web" },
+      "memory_preference": null
     }
   },
   "chiliarch": {

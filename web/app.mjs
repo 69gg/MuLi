@@ -1,7 +1,7 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
-import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, selectProactiveDestination, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
+import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
@@ -1735,7 +1735,7 @@ function renderMemoryEvidence(slot) {
   $("#dialog-title").textContent = "核查记忆";
   const status = { active: "生效中", conflict: "待核对", superseded: "已替代", forgotten: "已遗忘" }[item.status] ?? item.status ?? "未记录";
   const trusted = (value) => value === true ? "主人来源" : value === false ? "未标为主人来源" : "未记录";
-  slot.content.replaceChildren(element("p", { class: "memory-evidence-content memory-current-content", text: item.content }), statusList([["层次", { identity: "身份", preference: "偏好", episodic: "经历", semantic: "事实", procedural: "流程" }[item.layer] ?? item.layer ?? "未记录"], ["类型", memoryKind(item.kind)], ["状态", status], ["来源标签", item.source], ["记忆可信标记", trusted(item.trusted_owner)], ["置信度", Number.isFinite(item.confidence) ? `${Math.round(item.confidence * 100)}%` : "未记录"], ["更新", formatTimestamp(item.updated_at)]]));
+  slot.content.replaceChildren(element("p", { class: "memory-evidence-content memory-current-content", text: item.content }), statusList([["记忆 ID", item.id], ["记忆版本", Number.isSafeInteger(item.version) ? String(item.version) : "未记录"], ["层次", { identity: "身份", preference: "偏好", episodic: "经历", semantic: "事实", procedural: "流程" }[item.layer] ?? item.layer ?? "未记录"], ["类型", memoryKind(item.kind)], ["状态", status], ["来源标签", item.source], ["记忆可信标记", trusted(item.trusted_owner)], ["置信度", Number.isFinite(item.confidence) ? `${Math.round(item.confidence * 100)}%` : "未记录"], ["更新", formatTimestamp(item.updated_at)]]));
   if (item.quote) slot.content.append(element("section", { class: "memory-original-quote" }, element("h3", { text: "原始引文" }), element("blockquote", { text: item.quote })));
   const origin = item.origin;
   if (origin) {
@@ -2182,15 +2182,43 @@ function renderProactiveSettings(config) {
     } catch (error) { displaySettingsError(error); }
   });
   const section = settingsSection("主动通知", control, element("p", { text: "当前仅自主启动更新检查可使用默认目的地；旧提醒和系统日志留在 WebUI。需开启主动关注并配置主模型，排队不代表送达。" }));
-  if (destination.kind === "channel") {
-    const path = "channels.proactive.default_destination.route";
-    const route = destination.route;
-    section.append(field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, [["private", "私聊"], ["group", "已允许的群组"]]), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" }));
+  section.append(...proactiveRouteFields(destination, "channels.proactive.default_destination.route"));
+  const preference = policy.memory_preference;
+  const toggle = switchField("使用明确的记忆偏好", "proactive-memory-enabled", Boolean(preference));
+  $("input", toggle).addEventListener("change", (event) => {
+    try {
+      collectSettingsForm();
+      selectNotificationPreference(state.settingsDraft, event.target.checked);
+      renderOtherView();
+    } catch (error) { displaySettingsError(error); }
+  });
+  section.append(toggle);
+  if (preference) {
+    const path = "channels.proactive.memory_preference";
+    const name = preference.destination.kind === "channel" ? preference.destination.route.name : "web";
+    const preferred = selectField("该偏好用于通知到", "proactive-memory-destination", name, [["web", "WebUI"], ...CHANNELS]);
+    $("select", preferred).addEventListener("change", (event) => {
+      try {
+        collectSettingsForm();
+        const chosen = event.target.value;
+        const profile = state.settingsDraft.channels?.[chosen] ?? {};
+        const account = profile.account_id || profile.app_id || profile.user_id || state.channels?.channels?.[chosen]?.account_id || "";
+        selectPreferenceDestination(state.settingsDraft, chosen, account);
+        renderOtherView();
+      } catch (error) { displaySettingsError(error); }
+    });
+    section.append(field("偏好记忆 ID", `${path}.memory_id`, preference.memory_id, { required: true, maxLength: 200 }), field("记忆版本", `${path}.version`, preference.version, { type: "number", min: 1, required: true }), preferred, ...proactiveRouteFields(preference.destination, `${path}.destination.route`), element("p", { class: "settings-role-hint", text: "从记忆页核对偏好及原始证据，填写确切 ID 和版本。地址由本次设置明确选择；后台提炼不会改动通知设置。偏好失效后，新事项用普通默认，旧依赖项会受阻且不会改投。" }));
   }
   section.append(switchField("暂停独立事项外发", "proactive-pause", !policy.external_enabled), element("p", { class: "settings-role-hint", text: "更改默认只影响新独立事项。暂停会阻塞尚未发送的独立通知；恢复后需明确重试，结果未知不会自动补发。" }));
   const status = state.channels?.proactive;
-  if (status) section.append(statusList([["主动关注", status.attention_enabled ? "已开启" : "已关闭"], ["主模型", status.model_configured ? "已配置" : "未配置"], ["当前独立来源", "启动时自主更新检查"]]));
+  if (status) section.append(statusList([["主动关注", status.attention_enabled ? "已开启" : "已关闭"], ["主模型", status.model_configured ? "已配置" : "未配置"], ["记忆依据（已保存配置）", preferenceStatusLabel(status.memory_status?.reason ?? "not_configured")], ["当前独立来源", "启动时自主更新检查"]]));
   return section;
+}
+
+function proactiveRouteFields(destination, path) {
+  if (destination.kind !== "channel") return [];
+  const route = destination.route;
+  return [field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, [["private", "私聊"], ["group", "已允许的群组"]]), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" })];
 }
 
 function deliveryLabel(value) {
@@ -2370,7 +2398,7 @@ function collectSettingsForm() {
   const form = $("#settings-form");
   if (!form || !state.settingsDraft) return;
   for (const input of $$('[name]', form)) {
-    if (!input.name || ["pairing-code", "proactive-destination", "proactive-pause"].includes(input.name)) continue;
+    if (!input.name || ["pairing-code", "proactive-destination", "proactive-pause", "proactive-memory-enabled", "proactive-memory-destination"].includes(input.name)) continue;
     if (input.name.startsWith("tool-enabled:")) {
       const name = input.name.slice("tool-enabled:".length);
       const disabled = new Set(state.settingsDraft.disabled_tools ?? []);

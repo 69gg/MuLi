@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from jsonschema import Draft202012Validator
 
 from muli.compaction import Compactor
-from muli.config import ConfigFile, ModelProfile
+from muli.config import ConfigFile, ModelProfile, Settings
 from muli.context import ContextLimitError, pack_context
 from muli.conversation import Conversation
 from muli.events import EventBus
@@ -165,6 +165,24 @@ class Runtime:
         session_id = self.tool_session_id
         request = self.request_context(session_id) if session_id is not None else None
         return request.reply_origin if request is not None else ReplyOrigin()
+
+    def validate_proactive_settings(self, target: Settings) -> None:
+        """Validate newly selected evidence again when a queued config is applied."""
+        from muli.proactive_memory import check_preference
+
+        previous = self.config.settings
+        before, after = previous.channels.proactive, target.channels.proactive
+        selecting = after.memory_preference is not None and (
+            after.memory_preference != before.memory_preference
+            or (target.memory.enabled and not previous.memory.enabled)
+            or (after.external_enabled and not before.external_enabled)
+        )
+        if selecting:
+            evidence, reason = check_preference(target, self.store.db)
+            if evidence is None:
+                raise ValueError("主动通知记忆绑定不可用：" + reason)
+            assert after.memory_preference is not None
+            target.channels.validate_proactive_destination(after.memory_preference.destination)
 
     def _computer_dispatch_guard(self) -> Callable[[], None]:
         owner = self._tool_execution.get()

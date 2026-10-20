@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
-import { selectProactiveDestination, setPath, mergeSettingsExtras, settingsPatch } from "../../web/settings.mjs";
+import { selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, setPath, mergeSettingsExtras, settingsPatch } from "../../web/settings.mjs";
 
 const source = readFileSync(new URL("../../web/app.mjs", import.meta.url), "utf8");
 const render = source.slice(source.indexOf("function renderProactiveSettings("), source.indexOf("\nfunction deliveryLabel("));
@@ -23,9 +23,9 @@ function harness(config) {
     selectField: makeControl, field: makeControl,
     switchField: (label, name, checked) => makeControl(label, name, checked, { type: "checkbox" }),
     statusList: (rows) => element("status", { rows }),
-    $: (selector, parent) => selector === "#settings-form" ? form : selector === "select" ? parent.input : form.controls.find((input) => input.name === "proactive-pause"),
+    $: (selector, parent) => selector === "#settings-form" ? form : ["select", "input"].includes(selector) ? parent.input : form.controls.find((input) => input.name === selector.match(/^\[name="([^"]+)"\]$/)?.[1]),
     $$: () => form.controls,
-    setPath, mergeSettingsExtras, selectProactiveDestination,
+    setPath, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel,
     renderOtherView() {},
     displaySettingsError(error) { throw error; },
   };
@@ -81,4 +81,48 @@ test("selecting external then pausing before first save sends an explicit pause"
   const patch = settingsPatch({ channels: original }, second.context.state.settingsDraft);
   assert.equal(patch.channels.proactive.external_enabled, false);
   assert.equal(patch.channels.proactive.default_destination.route.target, "7");
+});
+
+test("explicit memory binding uses complete identity and destination without inferring an owner", () => {
+  const original = { proactive: { external_enabled: false, default_destination: { kind: "web" }, memory_preference: null } };
+  const first = harness(original);
+  first.context.renderProactiveSettings(first.context.state.settingsDraft.channels);
+  first.form.controls.find((input) => input.name === "proactive-memory-enabled").events.change({ target: { checked: true } });
+  const second = harness(first.context.state.settingsDraft.channels);
+  second.context.renderProactiveSettings(second.context.state.settingsDraft.channels);
+  second.form.controls.find((input) => input.name === "channels.proactive.memory_preference.memory_id").value = "fact";
+  second.form.controls.find((input) => input.name === "channels.proactive.memory_preference.version").value = "3";
+  second.form.controls.find((input) => input.name === "proactive-memory-destination").events.change({ target: { value: "onebot" } });
+  const selected = second.context.state.settingsDraft.channels.proactive.memory_preference;
+  assert.equal(selected.destination.route.target, "");
+  assert.equal(selected.destination.route.sender_id, "");
+  const third = harness(second.context.state.settingsDraft.channels);
+  third.context.renderProactiveSettings(third.context.state.settingsDraft.channels);
+  third.form.controls.find((input) => input.name === "channels.proactive.memory_preference.destination.route.target").value = "8";
+  third.form.controls.find((input) => input.name === "channels.proactive.memory_preference.destination.route.sender_id").value = "8";
+  third.form.controls.find((input) => input.name === "proactive-pause").checked = true;
+  third.context.collectSettingsForm();
+  const patch = settingsPatch({ channels: original }, third.context.state.settingsDraft);
+  assert.equal(patch.channels.proactive.external_enabled, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(patch.channels.proactive.memory_preference)), { memory_id: "fact", version: 3, destination: { kind: "channel", route: { name: "onebot", account_id: "bot", kind: "private", target: "8", sender_id: "8" } } });
+  assert.equal("proactive-memory-enabled" in third.context.state.settingsDraft, false);
+  assert.equal("proactive-memory-destination" in third.context.state.settingsDraft, false);
+});
+
+test("unchanged paused binding stays paused in a complete replacement and can be removed", () => {
+  const original = { proactive: { external_enabled: false, default_destination: { kind: "web" }, memory_preference: { memory_id: "old", version: 1, destination: { kind: "channel", route: { name: "onebot", account_id: "bot", kind: "private", target: "7", sender_id: "7" } } } } };
+  const { context, form } = harness(original);
+  context.state.channels.proactive.memory_status = { valid: false, reason: "version_changed" };
+  const rendered = context.renderProactiveSettings(context.state.settingsDraft.channels);
+  assert.deepEqual(settingsPatch({ channels: original }, context.state.settingsDraft), {});
+  assert.ok(rendered.children.some((node) => node.props?.rows?.some((row) => row[1] === "偏好版本已更正，使用普通默认")));
+  form.controls.find((input) => input.name === "channels.proactive.memory_preference.version").value = "2";
+  context.collectSettingsForm();
+  const patch = settingsPatch({ channels: original }, context.state.settingsDraft);
+  assert.equal(patch.channels.proactive.external_enabled, false);
+  assert.equal(patch.channels.proactive.memory_preference.memory_id, "old");
+  assert.equal(patch.channels.proactive.memory_preference.version, 2);
+  form.controls.find((input) => input.name === "proactive-memory-enabled").events.change({ target: { checked: false } });
+  assert.equal(settingsPatch({ channels: original }, context.state.settingsDraft).channels.proactive.memory_preference, null);
+  assert.deepEqual(settingsPatch({ channels: { proactive: { memory_preference: null } } }, { channels: { proactive: { memory_preference: null } } }), {});
 });
