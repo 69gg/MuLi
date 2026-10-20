@@ -9,6 +9,7 @@
 - 使用 `busctl --user --json=short --auto-start=no --allow-interactive-authorization=no`，限定固定的只读 `GetUnit` 和属性名单。`GetUnit` 的 data 是单参数数组；`get-property` 按请求顺序逐行返回有类型的 JSON。严格校验类型、数量、长度，不读取服务 Environment 或原始异常文本。
 - `ControlGroup` 来自 `org.freedesktop.systemd1.Service`；`InvocationID`、`FragmentPath`、`DropInPaths` 与 `NeedDaemonReload` 来自 Unit。通过服务返回的路径定位 cgroup，不从 unit 名猜测 cgroup 层级。
 - 只接受 `UserService.render()` 的当前标准 unit、相同的实际 ExecStart 参数、无 drop-in、无待重新加载配置；其它布局返回固定的 unsupported 原因，保留原服务。
+- 另从实际 Service 属性核验 `KillMode=control-group` 与 `SendSIGKILL=true`，不依赖生成文本中省略配置时的默认值。停止观察仍须另查 cgroup 和 writer lease，不能因退出策略匹配就声称旧 writer 已消失。
 - 连续两次结构化快照之间读取受限 `/proc/<MainPID>` 身份与已生成 unit 文件；确认 PID 的启动时间、实际 executable、argv、uid 和 cgroup 相符，前后快照必须一致。停止或切换中的 unit 返回可观察的状态，不将单次 MainPID=0 当作所有 writer 已退出。
 - 同一探测有总期限、每条命令输出上限与本地文件读取上限。发生版本不支持、格式变化、取消、路径替换或进程消失时明确失败，不执行修复、重载或重启。
 
@@ -21,3 +22,5 @@
 测试使用注入进程结果、临时 proc/cgroup 文件和受控异步窗口，覆盖类型混淆、输出预算、同 PID 不同启动时间、相同内容 unit 换 inode、配置/命令/入口变化、FIFO/符号链接拒绝、取消与状态切换。首轮 34 项通过、一项指出 `TimeoutError` 被共同 `OSError` 分支归类；修复为保留总期限错误，并在同步文件观察后再次核验截止期限。最终 35 项通过，0.09 秒；两文件 Ruff/格式、单产品源码严格 mypy 通过，service 728ms、峰值 67.6 MiB、swap 0。独立只读复审无阻断，没有执行真实服务控制。
 
 文件字节预算与返回前期限核验不等于能中断任意阻塞文件系统调用；正式控制者还须核验受支持的本地文件系统并有独立进程硬期限。真实 systemd 停服、启动和崩溃接管尚未验收。
+
+接线前另补实际退出策略属性的反证，39 项通过（在原 35 项上增加 4 项），0.10 秒、峰值 56.3 MiB、swap 0；两文件 Ruff 与产品源码 mypy 通过。仅假 bus 数据验证，未增加真实服务操作。
