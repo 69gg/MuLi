@@ -38,6 +38,8 @@ class FakeBus:
             "Type": ("s", "simple"),
             "MainPID": ("u", 123),
             "ControlGroup": ("s", "/user.slice/example.service"),
+            "KillMode": ("s", "control-group"),
+            "SendSIGKILL": ("b", True),
             "ExecStart": (
                 "a(sasbttttuii)",
                 [[service.executable, service._arguments(), False, 0, 0, 0, 0, 123, 0, 0]],
@@ -136,6 +138,8 @@ async def test_stopped_snapshot_does_not_claim_writer_or_cgroup_is_empty(tmp_pat
         ("SourcePath", "/generator/input"),
         ("DropInPaths", ["/override.conf"]),
         ("NeedDaemonReload", True),
+        ("KillMode", "process"),
+        ("SendSIGKILL", False),
     ],
 )
 async def test_nonstandard_layout_is_rejected(tmp_path: Path, field: str, value: Any) -> None:
@@ -151,6 +155,8 @@ async def test_nonstandard_layout_is_rejected(tmp_path: Path, field: str, value:
         ("MainPID", True),
         ("MainPID", -1),
         ("NeedDaemonReload", 0),
+        ("KillMode", False),
+        ("SendSIGKILL", 1),
         ("InvocationID", [False] * 16),
         ("InvocationID", [256] * 16),
         ("InvocationID", []),

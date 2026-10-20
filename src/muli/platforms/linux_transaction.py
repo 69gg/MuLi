@@ -35,6 +35,8 @@ _SERVICE_FIELDS = (
     ("MainPID", "u"),
     ("ControlGroup", "s"),
     ("ExecStart", "a(sasbttttuii)"),
+    ("KillMode", "s"),
+    ("SendSIGKILL", "b"),
 )
 
 
@@ -79,6 +81,8 @@ class UnitSnapshot:
     executable: str
     argv: tuple[str, ...]
     ignore_failure: bool
+    kill_mode: str
+    send_sigkill: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +268,8 @@ class SystemdProbe:
             _string(entry[0]),
             _strings(entry[1]),
             _boolean(entry[2]),
+            _string(service["KillMode"]),
+            _boolean(service["SendSIGKILL"]),
         )
 
     def _process(self, pid: int) -> ProcessIdentity:
@@ -327,6 +333,8 @@ class SystemdProbe:
                     or before.argv != expected
                     or before.executable != expected[0]
                     or before.ignore_failure
+                    or before.kill_mode != "control-group"
+                    or not before.send_sigkill
                 ):
                     raise ObservationError("unsupported_service_layout")
                 unit_identity = _file_identity(service.path.stat(follow_symlinks=False))
