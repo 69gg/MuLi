@@ -64,7 +64,7 @@ class ChannelApplication:
                 "next_destination": selected.dump()["destination"],
                 "attention_enabled": settings.attention.enabled,
                 "model_configured": settings.models.main.configured,
-                "independent_sources": ["startup_update_check"],
+                "independent_sources": ["startup_update_check", "extensions_watch"],
                 "memory_status": {"valid": reason == "valid", "reason": reason},
             },
         }

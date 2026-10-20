@@ -15,6 +15,8 @@ from test_report_origin import origin, route, wait_for_reply
 from test_runtime import FakeClient, make_runtime
 from test_system_events_runtime import fail_streams, inbox_for
 
+from muli.attachments import Attachments
+from muli.channel_application import ChannelApplication
 from muli.extensions import ExtensionError
 from muli.proactive import FrozenRouting, guard_delivery
 from muli.proactive_memory import PreferenceEvidence
@@ -45,6 +47,26 @@ def source_for(runtime: Runtime, record: dict[str, Any]) -> FrozenRouting:
     detail = json.loads(source.detail)
     assert not {"routing", "producer", "occurrence_id", "memory_evidence"}.intersection(detail)
     return source.routing
+
+
+async def test_channel_status_includes_the_actual_autonomous_error_producer(tmp_path: Path) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    application = ChannelApplication(
+        runtime, Attachments(runtime.store, tmp_path / "uploads", runtime.config)
+    )
+    try:
+        await start_capture(runtime)
+        runtime.system_events.extension_watch_failed()
+        await eventually(lambda: runtime.system_events.status()["persisted"] == 1)
+        record = runtime.store.list("system_log")[0]
+        assert source_for(runtime, record).classification == "independent"
+        sources = application.status()["proactive"]["independent_sources"]
+        assert record["producer"] in sources
+        assert "startup_update_check" in sources and "runtime_request" not in sources
+        assert seen == []
+    finally:
+        await application.close()
+        await runtime.close()
 
 
 async def test_request_failure_keeps_A_while_B_queues_and_attention_final_routes_once(
@@ -108,11 +130,14 @@ async def test_new_claim_and_preparation_cannot_reuse_previous_request_source(
     )
     runtime, seen = make_runtime(tmp_path, [])
     entered, release = asyncio.Event(), asyncio.Event()
+    probe_calls = 0
 
-    async def probe() -> dict[str, bool]:
+    async def probe(args: dict[str, Any]) -> dict[str, bool]:
+        nonlocal probe_calls
+        probe_calls += 1
         return {"ok": True}
 
-    runtime.tools["probe"] = Tool("probe", "只读探针", "read", parameters({}), probe)
+    runtime.tools["probe"] = Tool("probe", "只读探针", parameters({}), probe)
 
     class Client(FakeClient):
         async def stream(
@@ -164,6 +189,19 @@ async def test_new_claim_and_preparation_cannot_reuse_previous_request_source(
         else:
             assert selected.classification == record["producer"] == "legacy_local"
         assert runtime.store.pending_inputs(first["session_id"]) == 0
+        # B arrived before A's tool batch: the actual boundary must preserve
+        # not_executed, rather than accidentally exercise an invalid handler.
+        assert probe_calls == 0
+        results = [
+            message
+            for message in runtime.store.messages(first["session_id"])
+            if message.get("tool_call_id") == "probe-1"
+        ]
+        if first_turn == "tool":
+            assert len(results) == 1
+            assert json.loads(results[0]["content"])["status"] == "not_executed"
+        else:
+            assert results == []
     finally:
         release.set()
         await runtime.close()

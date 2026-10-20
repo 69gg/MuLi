@@ -28,6 +28,12 @@ TOML 解析段也将 CPython 整数字符串转换限制产生的裸 `ValueError
 
 ## 后续完整 Profile 接口与结论
 
+首个实际宿主切片将限定为可证明的匿名 PyPI 上下文，不再新增仅凭调用者自报 `adoption/source_ref` 就能成功的纯模型。须先核当前有效来源、uv/Python、receipt 与执行隔离资源；自定义索引、认证、TLS/代理策略或来源缺口不能通过清除设置后回退 PyPI 来“修复”。`--no-config` 只禁止配置发现，不能替代这些证据。
+
+已核 pinned uv 的[NETRC 选择](https://github.com/astral-sh/uv/blob/4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17/crates/uv-netrc/src/lib.rs)和[凭据目录覆盖](https://github.com/astral-sh/uv/blob/4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17/crates/uv-auth/src/store.rs)：未来执行器可使用宿主核验、持续存在的空 `NETRC` 文件与私有空 `UV_CREDENTIALS_DIR`，并从空子进程环境构造有限键，禁用 keyring/preview；不修改或注入 HOME/CODEX_HOME。不存在的 NETRC 路径仍会回退，不能当作禁用。该隔离策略只是后续执行设计，不证明当前安装本来允许匿名，也没有实际建立目录或运行安装。
+
+不解析 `--show-settings` 充当认证过的有效配置导出：该入口是隐藏的 Debug 文本输出，且位于缓存构造之后，并非稳定 JSON 或纯观察协议。完整上下文仍需由宿主按受支持来源逐项采集，效果前重验安装/receipt；研究没有读取真实环境或凭据。
+
 本节及以下完整 Profile 合同属于后续设计，不是当前纯解析器已交付的能力。后续归一化输入还需已核验 uv/安装身份、显式提供的非秘密解析上下文和凭据来源引用。它仍不自行发现配置、读取环境变量、打开文件、调用 uv、构造 Store 或访问网络。文件与环境采集、候选命令生成分别留给后续受限适配器；不在本片实现另一套安装器。
 
 建议输入由 `ReceiptInput`、`ResolverContext`、`PythonBinding` 和 `CredentialReference` 四部分组成；输出不可变 `InstallProfile` 或固定拒绝代码。字段具体命名在实现前定稿，本稿 JSON 是 fixture 合同示意，不是已上线 API。

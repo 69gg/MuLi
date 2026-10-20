@@ -12,6 +12,8 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 启动自主更新检查可使用默认渠道，默认 WebUI；通知首次保存时冻结目的地，通知、版本记录和事件原子提交。同一版本的已有通知不改绑、不因再次检查重发。自主扩展目录监听的新失败转移也可使用独立默认，手动重载和普通日志不自动取得该来源。`self_configure` 可在一个 changes 补丁中设置完整 `channels.proactive.default_destination`，或以 `memory_preference={memory_id,version,destination}` 选择已核对的主人偏好。外部目的地省略 `external_enabled` 同次启用，明确 false 则保持暂停。新绑定在生成计划、空闲应用及组件停止等待后复核有限来源证据；失效则计划失败并保留原配置，不能用模型传入的 source_id/digest/trusted_owner 代替验证。复用既有权限与配置事务，不增加第二次许可门；详见[主动通知](channels.md#无发令会话时的默认通知)及[错误来源](system-events.md#失败来源与投递)。
 
+渠道状态的 `proactive.independent_sources` 列出自主更新检查与自主扩展监听错误，描述支持的独立来源；不表示当前渠道已启用或消息已投递。主请求错误有实际请求归属，因此不列为独立来源。
+
 管理计划从有效模型请求保存原始来源，终态继承该来源；无请求上下文的宿主调用及旧计划留本地，不因完成时无人发令就套默认。私人候选文件不进入事件，未能提交计划时删除该候选；计划与 queued/completed 事件在各自原事务提交。设置尚在排队、Attention accepted、模型终答已存与渠道 sent 分别显示，不把前一阶段当作已送达。现有 WebUI 没有新增管理提交或手动更新检查入口。
 
 更新使用 `uv tool upgrade muli-agent==版本`，保留安装时的 extras、额外依赖和索引设置。若用户原先固定了互不兼容的版本约束，更新失败并保留安装要求，不通过重新安装悄悄移除 MCP 或渠道扩展；需要先显式调整该安装约束。CLI 需支持 `uv tool upgrade` 的版本参数。
