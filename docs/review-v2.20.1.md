@@ -14,7 +14,7 @@
 
 整合后的全仓 Ruff、232 文件格式与 99 个源码文件严格 mypy 通过，类型检查峰值 187.3 MiB。83 包离线锁一致性、2.20.1 wheel/sdist 离线构建、源码树外的临时 wheel 安装 smoke 及发行元数据校验通过；CLI 输出 2.20.1。构建峰值 91.8 MiB，安装 smoke 峰值 88.8 MiB，均为 swap 0，没有下载依赖。临时安装核验导入、网页资产、API 文档、提示词、默认关闭的桌面功能、任务控制及 lifespan；本地产物不上传，正式发行使用远端检查后的构件。
 
-精确签名提交 `ca028d30fb488fd783cb970eda10f358e18a4dda` 的[八项候选 CI](https://github.com/69gg/MuLi/actions/runs/39497144168)全部通过，覆盖 Linux/macOS/Windows 的 Python 3.12/3.13、质量与 MCP。签名标签 `v2.20.1` 已验证并与同一提交到 main 的更新原子推送，标签对象为 `0cacea60fb4131a9953e77d8d37362048da4ecac`；发行结果在完成后追加。2.20 的发行证据仍以[对应记录](review-v2.20.md)为准，不沿用其它 head 的 CI 状态。
+精确签名提交 `ca028d30fb488fd783cb970eda10f358e18a4dda` 的[八项候选 CI](https://github.com/69gg/MuLi/actions/runs/39497144168)全部通过，覆盖 Linux/macOS/Windows 的 Python 3.12/3.13、质量与 MCP。签名标签 `v2.20.1` 已验证并与同一提交到 main 的更新原子推送，标签对象为 `0cacea60fb4131a9953e77d8d37362048da4ecac`；发行结果见下文。2.20 的发行证据仍以[对应记录](review-v2.20.md)为准，不沿用其它 head 的 CI 状态。
 
 该 head 的 [main 八项 CI](https://github.com/69gg/MuLi/actions/runs/39499273145)与[发行十一项作业](https://github.com/69gg/MuLi/actions/runs/39499273710)全部通过。[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.20.1)于北京时间 2026-10-21 05:23:49 发布，与 [PyPI 2.20.1](https://pypi.org/project/muli-agent/2.20.1/) 的以下小型元数据一致；未下载发行包，没有将真实模型/账号或用户服务操作计入本轮验证。
 
