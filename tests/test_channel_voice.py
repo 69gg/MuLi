@@ -15,6 +15,7 @@ from test_runtime import make_runtime
 from muli.attachments import Attachments
 from muli.channel_application import ChannelApplication
 from muli.channels import ChannelError, ChannelsConfig
+from muli.channels import manager as channel_manager
 from muli.channels.adapters import QQ
 from muli.channels.types import FileContent
 
@@ -31,8 +32,9 @@ async def audio(
     return str((await attachments.save(chunks(), name, mime, source="tts"))["id"])
 
 
+@pytest.mark.parametrize("voice_first", [True, False])
 async def test_telegram_voice_is_explicit_and_default_audio_remains_document(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, voice_first: bool
 ) -> None:
     sends: list[httpx.Request] = []
 
@@ -45,23 +47,40 @@ async def test_telegram_voice_is_explicit_and_default_audio_remains_document(
     harness = Harness(tmp_path, ChannelsConfig(telegram=profile()), handler)
     try:
         attachment_id = await audio(harness.attachments)
-        voice = await harness.manager.enqueue(
-            "telegram", "7", "说明", [attachment_id], media_mode="voice"
-        )
-        file = await harness.manager.enqueue("telegram", "7", attachment_ids=[attachment_id])
+        timestamp = channel_manager.now()
+        identifiers = iter(("a" * 32, "b" * 32) if voice_first else ("b" * 32, "a" * 32))
+
+        def fixed_time() -> float:
+            return timestamp
+
+        def next_identifier() -> str:
+            return next(identifiers)
+
+        # Coarse clocks can tie; the outbox breaks ties by ID, not enqueue order.
+        with monkeypatch.context() as patch:
+            patch.setattr(channel_manager, "now", fixed_time)
+            patch.setattr(channel_manager, "new_id", next_identifier)
+            voice = await harness.manager.enqueue(
+                "telegram", "7", "说明", [attachment_id], media_mode="voice"
+            )
+            file = await harness.manager.enqueue("telegram", "7", attachment_ids=[attachment_id])
         assert voice["payload"]["parts"][-1]["media_mode"] == "voice"
         assert "media_mode" not in file["payload"]["parts"][0]
         await harness.manager.start()
         assert (await terminal(harness.manager, file["id"]))["state"] == "sent"
         assert (await terminal(harness.manager, voice["id"]))["state"] == "sent"
-        assert [request.url.path.rsplit("/", 1)[-1] for request in sends] == [
+        methods = [request.url.path.rsplit("/", 1)[-1] for request in sends]
+        assert sorted(methods) == [
+            "sendDocument",
             "sendMessage",
             "sendVoice",
-            "sendDocument",
         ]
-        assert b'name="voice"' in sends[1].content and MP3 in sends[1].content
-        assert b'name="document"' in sends[2].content
-        assert b"parse_mode" not in sends[1].content
+        assert methods.index("sendMessage") < methods.index("sendVoice")
+        voice_request = sends[methods.index("sendVoice")]
+        document_request = sends[methods.index("sendDocument")]
+        assert b'name="voice"' in voice_request.content and MP3 in voice_request.content
+        assert b'name="document"' in document_request.content
+        assert b"parse_mode" not in voice_request.content
         capabilities = harness.manager.status()["channels"]
         assert capabilities["telegram"]["voice_supported"] is True
         assert capabilities["qq"]["voice_supported"] is False
