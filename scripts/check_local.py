@@ -20,6 +20,7 @@ MAX_SECONDS = 180
 NODE_HEAP_MB = 256
 NODE_TEST_TIMEOUT_MS = 15000
 MANAGER_TIMEOUT = 10
+BACKEND_BATCH_FILES = 32
 
 
 def manager(*args: str) -> subprocess.CompletedProcess[str]:
@@ -94,7 +95,38 @@ def verify_inside(unit: str, seconds: int) -> None:
         raise RuntimeError(f"Service lifetime limits not enforced: {properties}")
 
 
-def run_inside(unit: str, seconds: int, command: list[str]) -> int:
+def backend_paths(paths: list[str]) -> list[str]:
+    """Discover and validate tests only after entering the resource guard."""
+    paths = paths or [
+        str(path)
+        for path in sorted(
+            set(Path("tests").rglob("test_*.py")) | set(Path("tests").rglob("*_test.py"))
+        )
+    ]
+    if not paths:
+        raise ValueError("No backend tests found")
+    if any(path.startswith("-") or not Path(path).is_file() for path in paths):
+        raise ValueError("backend accepts test file paths only")
+    return list(dict.fromkeys(paths))
+
+
+def run_backend(command: list[str]) -> int:
+    """Run fresh pytest processes serially within the already verified service."""
+    executable, *requested = command
+    paths = backend_paths(requested)
+    batches = (len(paths) + BACKEND_BATCH_FILES - 1) // BACKEND_BATCH_FILES
+    for number, start in enumerate(range(0, len(paths), BACKEND_BATCH_FILES), 1):
+        batch = paths[start : start + BACKEND_BATCH_FILES]
+        print(f"Backend batch {number}/{batches}: {len(batch)} files", flush=True)
+        code = subprocess.run(
+            [executable, "-m", "pytest", "-q", "--", *batch], check=False
+        ).returncode
+        if code:
+            return code
+    return 0
+
+
+def run_inside(unit: str, seconds: int, command: list[str], *, backend: bool = False) -> int:
     def interrupted(signum: int, frame: object) -> None:
         raise SystemExit(128 + signum)
 
@@ -104,7 +136,7 @@ def run_inside(unit: str, seconds: int, command: list[str]) -> int:
         signal.signal(signum, interrupted)
     verify_inside(unit, seconds)
     print("Kernel resource limits verified; starting check.", flush=True)
-    code = subprocess.run(command, check=False).returncode
+    code = run_backend(command) if backend else subprocess.run(command, check=False).returncode
     return code if code >= 0 else 128 - code
 
 
@@ -124,6 +156,9 @@ def command_for(mode: str, args: list[str]) -> list[str]:
             f"--test-timeout={NODE_TEST_TIMEOUT_MS}",
             *paths,
         ]
+    elif mode == "backend":
+        if not args:
+            raise ValueError("backend requires an existing Python executable")
     if not args:
         raise ValueError("A command is required")
     executable = shutil.which(args[0])
@@ -153,7 +188,7 @@ def stop_service(unit: str) -> bool:
             return False
 
 
-def run(command: list[str], seconds: int) -> int:
+def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
     if sys.platform != "linux" or not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
         raise RuntimeError("Local checks require Linux cgroup v2; no unbounded fallback")
     if not 1 <= seconds <= MAX_SECONDS:
@@ -218,7 +253,7 @@ def run(command: list[str], seconds: int) -> int:
         unit,
         "--seconds",
         str(seconds),
-        "run",
+        "backend" if backend else "run",
         "--",
         *command,
     ]
@@ -250,16 +285,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=MAX_SECONDS)
     parser.add_argument("--inside", help=argparse.SUPPRESS)
-    parser.add_argument("mode", choices=("frontend", "run"))
+    parser.add_argument("mode", choices=("frontend", "backend", "run"))
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
-        command = command_for(args.mode, args.command)
+        # The outer invocation resolves the executable, never a test-directory
+        # scan. The guarded backend freezes the discovered list before batching.
+        command = command_for("run" if args.inside else args.mode, args.command)
         if not 1 <= args.seconds <= MAX_SECONDS:
             raise ValueError(f"seconds must be between 1 and {MAX_SECONDS}")
         if args.inside:
-            return run_inside(args.inside, args.seconds, command)
-        return run(command, args.seconds)
+            return run_inside(args.inside, args.seconds, command, backend=args.mode == "backend")
+        return run(command, args.seconds, backend=args.mode == "backend")
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"Local check refused: {exc}", file=sys.stderr)
         return 125

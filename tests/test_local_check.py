@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -69,7 +71,10 @@ def test_frontend_uses_serial_finite_tests(checker: ModuleType, monkeypatch: Any
         checker.command_for("frontend", ["--test-concurrency=20"])
 
 
-def test_failed_guard_never_launches_command(checker: ModuleType, monkeypatch: Any) -> None:
+@pytest.mark.parametrize("backend", [False, True])
+def test_failed_guard_never_launches_command(
+    checker: ModuleType, monkeypatch: Any, backend: bool
+) -> None:
     def refuse(*args: Any) -> None:
         raise RuntimeError("no limits")
 
@@ -77,12 +82,13 @@ def test_failed_guard_never_launches_command(checker: ModuleType, monkeypatch: A
         pytest.fail("unguarded command was launched")
 
     monkeypatch.setattr(checker, "verify_inside", refuse)
+    monkeypatch.setattr(checker, "backend_paths", unexpected)
     monkeypatch.setattr(checker.subprocess, "run", unexpected)
     for name in ("SIGHUP", "SIGINT", "SIGTERM", "SIGPIPE"):
         monkeypatch.setattr(checker.signal, name, 1, raising=False)
     monkeypatch.setattr(checker.signal, "signal", lambda *args: None)
     with pytest.raises(RuntimeError, match="no limits"):
-        checker.run_inside("unit.service", 1, ["target"])
+        checker.run_inside("unit.service", 1, ["target", "test_one.py"], backend=backend)
 
 
 @pytest.mark.parametrize(("code", "expected"), [(0, 0), (7, 7), (-15, 143), (-9, 137)])
@@ -142,3 +148,97 @@ def test_no_unbounded_fallback(checker: ModuleType, monkeypatch: Any) -> None:
     monkeypatch.setattr(checker.sys, "platform", "win32")
     with pytest.raises(RuntimeError, match="no unbounded fallback"):
         checker.run(["target"], 1)
+
+
+def test_backend_discovers_each_test_file_and_requires_existing_python(
+    checker: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "tests/nested").mkdir(parents=True)
+    for name in ("test_one.py", "nested/test_two.py", "nested/three_test.py", "helper.py"):
+        (tmp_path / "tests" / name).write_text("", encoding="utf-8")
+    expected = ["tests/nested/test_two.py", "tests/nested/three_test.py", "tests/test_one.py"]
+    command = checker.command_for("backend", [sys.executable])
+    assert command[0] == str(Path(sys.executable).absolute())
+    assert command[1:] == []
+    assert [Path(path).as_posix() for path in checker.backend_paths([])] == expected
+    assert checker.backend_paths([expected[2], expected[2]]) == [expected[2]]
+    for args in ([], [str(tmp_path / "missing-python")]):
+        with pytest.raises(ValueError):
+            checker.command_for("backend", args)
+    for paths in (["--maxfail=1"], ["tests"], ["missing.py"]):
+        with pytest.raises(ValueError):
+            checker.backend_paths(paths)
+
+
+def test_backend_empty_discovery_refuses_execution(
+    checker: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="No backend tests"):
+        checker.backend_paths([])
+
+
+def test_backend_command_preparation_does_not_scan_tests(
+    checker: ModuleType, monkeypatch: Any
+) -> None:
+    def unexpected(*args: Any) -> None:
+        pytest.fail("backend discovered tests before entering the guard")
+
+    monkeypatch.setattr(checker.Path, "rglob", unexpected)
+    monkeypatch.setattr(checker, "backend_paths", unexpected)
+    assert checker.command_for("backend", [sys.executable]) == [
+        str(Path(sys.executable).absolute())
+    ]
+
+
+@pytest.mark.parametrize("fail_at", [None, 2])
+def test_backend_uses_fresh_serial_processes_and_stops_after_failure(
+    checker: ModuleType, monkeypatch: Any, tmp_path: Path, fail_at: int | None
+) -> None:
+    # A tiny local pytest stand-in records the actual process boundary; it does
+    # not invoke pytest recursively or start services, models or other tools.
+    package = tmp_path / "pytest"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "path: Path = Path('runs.jsonl')\n"
+        "number: int = len(path.read_text(encoding='utf-8').splitlines()) + 1 "
+        "if path.exists() else 1\n"
+        "with path.open('a', encoding='utf-8') as output:\n"
+        "    output.write(json.dumps({'pid': os.getpid(), 'args': sys.argv[1:]}) + '\\n')\n"
+        f"raise SystemExit(7 if number == {fail_at!r} else 0)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    paths = [f"test_{index}.py" for index in range(checker.BACKEND_BATCH_FILES * 2 + 1)]
+    for path in paths:
+        Path(path).write_text("", encoding="utf-8")
+    assert checker.run_backend([sys.executable, *paths]) == (7 if fail_at else 0)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "runs.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == (fail_at or 3)
+    assert len({row["pid"] for row in rows}) == len(rows)
+    assert all(row["args"][:2] == ["-q", "--"] for row in rows)
+    assert all(1 <= len(row["args"][2:]) <= checker.BACKEND_BATCH_FILES for row in rows)
+    assert [path for row in rows for path in row["args"][2:]] == paths[
+        : checker.BACKEND_BATCH_FILES * (fail_at or 3)
+    ]
+
+
+@pytest.mark.parametrize(("code", "expected"), [(-9, 137), (-15, 143), (7, 7)])
+def test_backend_signal_failure_keeps_nonzero_status(
+    checker: ModuleType, monkeypatch: Any, code: int, expected: int
+) -> None:
+    monkeypatch.setattr(checker, "verify_inside", lambda *args: None)
+    for name in ("SIGHUP", "SIGINT", "SIGTERM", "SIGPIPE"):
+        monkeypatch.setattr(checker.signal, name, 1, raising=False)
+    monkeypatch.setattr(checker.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(checker, "run_backend", lambda command: code)
+    assert (
+        checker.run_inside("unit.service", 1, ["python", "test_one.py"], backend=True) == expected
+    )

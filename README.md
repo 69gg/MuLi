@@ -120,7 +120,7 @@ uv sync --locked
 uv run MuLi init --no-source --no-service
 uv run MuLi serve
 # Linux 本地验证：先核验 cgroup 限制，再执行；复用已安装依赖，默认离线
-python scripts/check_local.py run -- .venv/bin/python -m pytest -q
+python scripts/check_local.py backend .venv/bin/python
 python scripts/check_local.py run -- .venv/bin/ruff check .
 python scripts/check_local.py run -- .venv/bin/ruff format --check .
 python scripts/check_local.py run -- .venv/bin/mypy

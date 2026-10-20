@@ -11,12 +11,19 @@ Node 额外限制 V8 堆为 256 MiB。前端预设按文件单并发，测试超
 
 ```sh
 # 复用已经安装的依赖，不自动同步或下载
+python scripts/check_local.py backend .venv/bin/python
 python scripts/check_local.py frontend tests/frontend/api.test.mjs
 python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_local_check.py
 python scripts/check_local.py --seconds 30 run -- .venv/bin/ruff check .
 ```
 
 其它 worktree 在其自身目录调用主仓库脚本的绝对路径；共享名称固定为 `muli-checks.slice`，每次 service 使用不同名称。脚本输出 service 名称、退出结果、运行时间、内存峰值与 swap 使用，测试失败不会变成成功。只有全部启动前检查通过后才会出现 `Kernel resource limits verified`。
+
+`backend` 必须显式指定已有 Python 解释器，不能自动下载或创建环境。核验资源限制后，按当前仓库约定递归发现 `tests/` 下的 `test_*.py` 与 `*_test.py`，固定文件清单；每批最多 32 个文件，使用新 pytest 进程串行运行，避免一个 Python 进程长期保留全套测试对象。也可在解释器后指定测试文件；目录、pytest 选项和不存在的路径拒绝，不悄悄改跑全量。需要 `-k` 等筛选时仍使用 `run -- 解释器 -m pytest ...`。
+
+所有批次在**同一个** service/cgroup 与总运行期限内，后续批次不重置 180 秒预算，不提高内存或 CPU 限额。第一批失败、进程被信号终止或资源守卫拒绝后停止，不重试或继续其它批；取消仍回收整个 service。新进程释放自身堆，并不承诺所有文件缓存立即归零或任意规模测试一定能在预算内通过。前端和远端 CI 保留原验证方式。
+
+此入口以当时全部 125 个后端文件实际运行四批，3,034 项通过、1 项平台跳过，整个 service 55.278 秒、峰值 846.8 MiB、swap 0；这是单个 cgroup 的整组峰值，不与四个独立 service 的分批峰值混称。随后将目录发现移入资源核验之后，26 项守卫检查与 48 项已有库检查经真实 backend 入口同组通过（峰值 86.7 MiB），Ruff/格式及脚本严格 mypy 通过。小型临时 pytest 替身还验证了真实新 PID、参数顺序和第二批失败后不启动第三批；无需递归运行真实 pytest 或创建额外服务。
 
 默认离线设置 `UV_OFFLINE=1`、`UV_NO_SYNC=1`，明确传入 PATH、当前源码路径、Node 堆及数值库单线程环境。其它临时环境不自动继承，确需变量可在受限命令中使用 `env NAME=value`，不得覆盖保护变量。它是开发执行规范，不是恶意代码沙箱，也不阻止用户主动绕开脚本；所有协作 agent 必须遵守仓库 AGENTS.md。
 

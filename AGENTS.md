@@ -2,7 +2,7 @@
 
 - 使用简体中文；Python 必须有类型注释。改动前先读现有代码，复用已有实现，同步文档与必要回归。
 - 本机测试、检查、打包及实验一律经过 `python scripts/check_local.py`。其他 worktree 可使用本仓库该脚本的绝对路径，工作目录保持目标 worktree。
-- 前端使用 `python scripts/check_local.py frontend [测试文件…]`；其他命令使用 `python scripts/check_local.py run -- 命令 参数…`。不得裸跑全量测试、绕过限制、为通过测试提高上限或用工具等待时间冒充硬超时。
+- 全量后端使用 `python scripts/check_local.py backend .venv/bin/python [测试文件…]`，在同一守卫内按至多 32 个文件串行分批；其它 worktree 指定主仓库已有解释器。前端使用 `python scripts/check_local.py frontend [测试文件…]`；定向 pytest 和其他命令使用 `python scripts/check_local.py run -- 命令 参数…`。不得裸跑全量测试、绕过限制、为通过测试提高上限或用工具等待时间冒充硬超时。
 - 所有 agent/worktree 共用 `muli-checks.slice`：合计 2 GiB、swap 0、一个逻辑 CPU 的等效时间预算、128 个任务；单次 1 GiB、最长 180 秒。Node 堆 256 MiB，前端文件单并发。限制无法核验时停止该检查，不退回无保护运行。
 - 并行调研、实现和审查；测试尽量串行，先跑相关小范围，再做整合验证。失败时先看有限日志和代码，不重复触发同一失控用例。比较 DOM/带循环引用对象的身份时断言布尔结果，避免失败报告递归展开对象图。
 - 不下载大库/模型、不进行训练或压测、不动真实用户数据或真实桌面。开发验证默认离线；外部集成未实测须如实说明。
