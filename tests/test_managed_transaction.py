@@ -83,7 +83,12 @@ def binding(slot: str, *, legacy: bool = False, configuration: bytes = CONFIG) -
         selector=None
         if legacy
         else _snapshot(
-            json.dumps({"deployment": "d" * 64, "installation": slot * 64}).encode(), 4096
+            json.dumps(
+                {"deployment": "d" * 64, "installation": slot * 64},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            4096,
         ),
         unit=raw_snapshot(
             b"[Service]\nExecStart=/original/python -m muli\n" if legacy else UNIT, 4096
