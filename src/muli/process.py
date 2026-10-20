@@ -63,6 +63,7 @@ async def _settle_process(
             await asyncio.wait_for(process.wait(), eof_grace)
         except TimeoutError:
             pass
+    group_error: PermissionError | None = None
     if terminate_grace > 0:
         try:
             if os.name == "posix":
@@ -72,6 +73,9 @@ async def _settle_process(
             await asyncio.wait_for(process.wait(), terminate_grace)
         except (ProcessLookupError, TimeoutError):
             pass
+        except PermissionError:
+            # Still attempt hard cleanup and settle pipes before reporting failure.
+            pass
     try:
         if os.name == "posix":
             # A departed parent may leave descendants retaining its output pipe.
@@ -80,6 +84,13 @@ async def _settle_process(
             process.kill()
     except ProcessLookupError:
         pass
+    except PermissionError as error:
+        group_error = error
+        if process.returncode is None:
+            try:
+                process.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
     # A paused StreamReader can prevent Process.wait() even after SIGKILL.
     # Drain buffers, then close inherited pipes on a finite deadline.
     try:
@@ -97,7 +108,23 @@ async def _settle_process(
             await asyncio.wait_for(process.stdin.wait_closed(), 1)
         except (ConnectionError, TimeoutError):
             pass
-    await process.wait()
+    if group_error is None:
+        await process.wait()
+        return
+    try:
+        await asyncio.wait_for(process.wait(), 1)
+    except TimeoutError as error:
+        raise group_error from error
+    if os.name == "posix":
+        try:
+            # Darwin can return EPERM for a group containing only zombies.
+            # Reaping the child is not proof that all descendants are gone.
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    raise group_error
 
 
 async def run_process(
