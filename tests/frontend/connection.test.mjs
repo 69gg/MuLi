@@ -140,6 +140,30 @@ test("an old bootstrap cannot hydrate or start streams after a new connection fi
   assert.deepEqual(h.streams.map((stream) => stream.path), ["/sessions/main-2/events", "/events"]);
 });
 
+test("session bootstrap resumes its exact snapshot position and a live page settles after server recovery", async (t) => {
+  const after = "9007199254740993";
+  const h = harness(t, async (path) => path !== "/conversation" ? payload(path) : {
+    session: { id: "main", status: "running" }, messages: [], after,
+    events: [{ id: "1", type: "run.started", data: { id: "run" } }],
+    live: { session_id: "main", run_id: "run", status: "approval", run: { id: "run", status: "running" },
+      pending_approvals: [{ id: "pending", session_id: "main", run_id: "run", status: "pending" }] },
+  });
+  await h.ui.connect();
+  const stream = h.latestStream("/sessions/main/events");
+  assert.equal(stream.after, after); assert.equal(h.ui.state.session.status, "approval");
+  stream.onEvent({ id: "9007199254740994", type: "session.recovered", session_id: "main", data: { kind: "run", run_id: "run", session_status: "idle" } });
+  assert.equal(h.ui.state.session.status, "interrupted"); assert.equal(h.ui.state.session.approvals.length, 0);
+  stream.onEvent({ id: "9007199254740992", type: "approval.requested", data: { id: "old" } });
+  assert.equal(h.ui.state.session.approvals.length, 0);
+});
+
+test("invalid conversation continuation positions never start either stream", async (t) => {
+  const h = harness(t, async (path) => path === "/conversation" ? { ...payload(path), after: "01" } : payload(path));
+  await h.ui.connect();
+  assert.equal(h.ui.owner === null, true); assert.equal(h.ui.state.connected, false);
+  assert.equal(h.streams.length, 0);
+});
+
 test("late stream callbacks and 401 from a replaced owner cannot refresh or show login", async (t) => {
   const h = harness(t); await h.ui.connect(); const stale = h.latestStream();
   const owner = h.ui.activate(); const count = h.requests.length;

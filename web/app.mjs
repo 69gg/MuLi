@@ -535,11 +535,13 @@ async function connect() {
   } else { state.connected = false; }
   if (results[1].status === "fulfilled") {
     const detail = results[1].value;
-    state.activeSession = detail.session; state.mainSessionId = detail.session.id;
-    state.session = hydrateSession(detail); state.mode = detail.session.mode || state.mode;
-    if (isRunning(detail.session.status) && !isRunning(state.session.status)) state.session.status = detail.session.status;
-    state.sending = false; resetMessageNodes();
-    startSessionEvents(detail.session.id, owner);
+    try {
+      const session = hydrateSession(detail);
+      state.activeSession = detail.session; state.mainSessionId = detail.session.id;
+      state.session = session; state.mode = detail.session.mode || state.mode;
+      state.sending = false; resetMessageNodes();
+      startSessionEvents(detail.session.id, owner);
+    } catch { state.connected = false; }
   } else { state.connected = false; }
   if (results[4].status === "fulfilled") state.uploads = collection(results[4].value);
   state.loading = false;
@@ -626,9 +628,11 @@ function startSessionEvents(sessionId, owner = connection) {
     cursor: state.session.cursor, owner,
     onEvent: (event) => {
       if (event.session_id && event.session_id !== state.activeSession?.id) return;
-      state.session = applyEvent(state.session, event);
+      const next = applyEvent(state.session, event);
+      if (next === state.session) return;
+      state.session = next;
       if ((event.type === "tool.started" || event.type === "approval.requested") && !state.timelineUserChoice) state.timelineOpen = true;
-      if (["run.completed", "run.failed", "run.cancelled", "run.paused"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
+      if (["run.completed", "run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
   });

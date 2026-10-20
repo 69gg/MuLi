@@ -493,10 +493,29 @@ def create_app(
     @app.get("/api/conversation")
     async def conversation() -> dict[str, Any]:
         session = runtime.main_session()
+        # Keep these reads synchronous: facts and the global continuation position
+        # belong to one event-loop turn, without a snapshot/SSE subscription gap.
+        messages = visible_messages(session["id"])
+        events = runtime.store.recent_events(session["id"])
+        candidate_run_id = next(
+            (
+                identifier
+                for event in reversed(events)
+                if event["type"].startswith("run.")
+                and isinstance(
+                    identifier := event["data"].get("run_id") or event["data"].get("id"), str
+                )
+            ),
+            None,
+        )
+        live = runtime.session_live(session, candidate_run_id=candidate_run_id)
+        after = str(runtime.store.event_position())
         return {
             "session": session,
-            "messages": visible_messages(session["id"]),
-            "events": runtime.store.recent_events(session["id"]),
+            "messages": messages,
+            "events": [{**event, "id": str(event["id"])} for event in events],
+            "live": live,
+            "after": after,
         }
 
     @app.get("/api/team")
@@ -809,11 +828,7 @@ def create_app(
 
     @app.get("/api/approvals")
     async def approvals() -> dict[str, Any]:
-        return {
-            "items": [
-                item for item in runtime.store.list("approval") if item["status"] == "pending"
-            ]
-        }
+        return {"items": runtime.live_approvals()}
 
     @app.post("/api/approvals/{identifier}")
     async def approve(identifier: str, body: ApprovalInput) -> dict[str, bool]:
