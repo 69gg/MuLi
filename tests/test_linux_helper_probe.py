@@ -46,6 +46,7 @@ def setup(tmp_path: Path) -> tuple[SystemdProbe, HelperBus, tuple[str, ...], Pat
         FragmentPath=("s", "/run/user/1000/systemd/transient/" + NAME),
         ExecStart=("a(sasbttttuii)", [[argv[0], list(argv), False, 0, 0, 0, 0, 123, 0, 0]]),
         Transient=("b", True),
+        CollectMode=("s", "inactive"),
         PartOf=("as", []),
         BindsTo=("as", []),
         StopPropagatedFrom=("as", []),
@@ -99,6 +100,7 @@ async def test_helper_requires_actual_process_and_enforced_kernel_limits(tmp_pat
     ("name", "value"),
     [
         ("Transient", False),
+        ("CollectMode", "inactive-or-failed"),
         ("PartOf", ["muli.service"]),
         ("BindsTo", ["other.service"]),
         ("StopPropagatedFrom", ["muli.service"]),
