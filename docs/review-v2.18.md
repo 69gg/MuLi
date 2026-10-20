@@ -1,6 +1,6 @@
 # 2.18 系统错误的真实请求来源
 
-状态：候选整合中。本版接入统一系统事件的两种明确来源，不包含跨进程恢复或 A/B 安装。
+状态：已发布。本版接入统一系统事件的两种明确来源，不包含跨进程恢复或 A/B 安装。
 
 主会话错误以当前任务和已构造的 PreparedRequest 为依据。请求构造、认领、工具批次与驱动收尾各边界清理作用域，子任务不能继承父来源；显式 notify=false 和注意事项自身失败的抑制保留。只有自主目录 watcher 的明确生产者可按默认渠道或记忆偏好创建独立通知，手动重载即使也经过 watcher，仍由请求代号区分。
 
@@ -12,6 +12,10 @@
 
 与 2.17 的本地缓存现象一致，首次增量 mypy 在未修改的 YAML 导入处报三项 unused-ignore；不更改源码或规则，以 --no-incremental 完整检查通过（峰值 378.1 MiB），随后常规增量检查也通过。尚不将缓存内部原因归为业务代码缺陷；远端干净环境继续复验。
 
-离线构建 wheel/sdist，源码目录外临时安装验证导入、网页资产、API 文档、提示词、默认关闭的桌面功能、任务控制及 lifespan；版本、标签、changelog 和两种包元数据一致。构建峰值 90.2 MiB，安装检查峰值 85.9 MiB，swap 0。正式远端矩阵与发行证据待补。
+离线构建 wheel/sdist，源码目录外临时安装验证导入、网页资产、API 文档、提示词、默认关闭的桌面功能、任务控制及 lifespan；版本、标签、changelog 和两种包元数据一致。构建峰值 90.2 MiB，安装检查峰值 85.9 MiB，swap 0。
+
+签名提交 `9b858f2dd888e3294fd13527dd6eb81c3838d16f` 与签名标签 `v2.18.0` 通过同一次 SSH 443 atomic push 发布，未修改 Git 远端或全局配置。[PR #21](https://github.com/69gg/MuLi/pull/21) 的 8 项检查全部成功；[发布流程 39474129446](https://github.com/69gg/MuLi/actions/runs/39474129446) 的 11 项检查全部成功，覆盖三平台 Python 3.12/3.13、MCP、质量、构建验证和 Trusted Publishing。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.18.0) 于 2026-10-20 18:27:25 UTC 发布。[PyPI 2.18.0](https://pypi.org/project/muli-agent/2.18.0/) 元数据与 GitHub 发行附件的大小、SHA-256 逐项一致；仅读取小型元数据，未下载发行包：wheel 539,185 字节，`ff6a9df163940d9421afdd9f599c7305adac761b88d09159a5a0a56721524620`；sdist 3,124,462 字节，`b5704c19a6102d4b8790e11de80aa56deb778b49e6f55f2bdd4bb7f4e4a89064`。
 
 维护门和 Linux 恢复后端继续在独立分支开发，不随本版宣传为已启用能力。未改动用户安装或服务。
