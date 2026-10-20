@@ -47,7 +47,21 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
-      - run: uv run pytest -q -o faulthandler_timeout=60
+      - name: Report SQLite runtime
+        run: uv run python -c "import sqlite3, sys; print(sys.version); print('SQLite', sqlite3.sqlite_version)"
+      - run: uv run pytest -q -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
+      - name: Preserve synthetic channel recovery evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: channel-recovery-${{ matrix.os }}-${{ matrix.python }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/muli-pytest/channel-recovery*/channels.db
+            ${{ runner.temp }}/muli-pytest/channel-recovery*/channels.db-wal
+            ${{ runner.temp }}/muli-pytest/channel-recovery*/channels.db-shm
+            ${{ runner.temp }}/muli-pytest/channel-recovery*/sqlite-diagnostics.json
   mcp:
     runs-on: ubuntu-latest
     timeout-minutes: 10

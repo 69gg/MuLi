@@ -5,6 +5,8 @@ import base64
 import hashlib
 import hmac
 import json
+import sqlite3
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -231,18 +233,103 @@ async def test_outbox_safe_connect_retry_but_read_timeout_is_unknown(tmp_path: P
     await harness.close()
 
 
-async def test_crash_recovery_never_blindly_retries_sending(tmp_path: Path) -> None:
-    harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
-    item = await harness.manager.enqueue("onebot", "7", "possible accepted")
-    with harness.store.db:
-        harness.store.db.execute(
-            "UPDATE channel_outbox SET state='sending' WHERE id=?", (item["id"],)
+async def test_crash_recovery_never_blindly_retries_sending(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    directory = tmp_path_factory.mktemp("channel-recovery")
+    checks: dict[str, list[str]] = {}
+    diagnostics: dict[str, Any] = {
+        "python_version": sys.version,
+        "sqlite_version": sqlite3.sqlite_version,
+        "integrity_checks": checks,
+        "stage": "open",
+        "connections_closed": False,
+    }
+    harness: Harness | None = None
+    primary_error: BaseException | None = None
+
+    def check_integrity(stage: str) -> None:
+        assert harness is not None
+        diagnostics["stage"] = stage
+        checks[stage] = [
+            str(row[0]) for row in harness.store.db.execute("PRAGMA integrity_check(10)")
+        ]
+        assert checks[stage] == ["ok"]
+
+    async def close_current() -> None:
+        nonlocal harness
+        current, harness = harness, None
+        if current is None:
+            return
+        try:
+            await current.close()
+        except BaseException as error:
+            diagnostics["close_error"] = f"{type(error).__name__}: {error}"
+            diagnostics["connections_closed"] = False
+            raise
+        diagnostics["connections_closed"] = True
+
+    try:
+        harness = Harness(directory, ChannelsConfig(onebot=profile()), unused)
+        diagnostics["sqlite_source_id"] = harness.store.db.execute(
+            "SELECT sqlite_source_id()"
+        ).fetchone()[0]
+        item = await harness.manager.enqueue("onebot", "7", "possible accepted")
+        with harness.store.db:
+            harness.store.db.execute(
+                "UPDATE channel_outbox SET state='sending' WHERE id=?", (item["id"],)
+            )
+        check_integrity("before_close")
+        diagnostics["stage"] = "close"
+        await close_current()
+        diagnostics["stage"] = "reopen"
+        # A constructor may open SQLite before failing to return its Harness.
+        diagnostics["connections_closed"] = False
+        harness = Harness(directory, ChannelsConfig(onebot=profile()), unused)
+        check_integrity("after_reopen")
+        diagnostics["stage"] = "recover_sending"
+        await harness.manager.start()
+        assert harness.manager.delivery(item["id"])["state"] == "unknown"
+        diagnostics["stage"] = "complete"
+    except BaseException as error:
+        primary_error = error
+        if isinstance(error, sqlite3.Error):
+            diagnostics["sqlite_errorcode"] = getattr(error, "sqlite_errorcode", None)
+            diagnostics["sqlite_errorname"] = getattr(error, "sqlite_errorname", None)
+        error.add_note(json.dumps(diagnostics, ensure_ascii=False, sort_keys=True))
+        raise
+    finally:
+        close_error: BaseException | None = None
+        try:
+            await close_current()
+        except BaseException as error:
+            close_error = error
+            if primary_error is not None:
+                primary_error.add_note("Synthetic database close failed: " + str(error))
+        diagnostics["file_evidence_consistency"] = (
+            "closed_test_connections" if diagnostics["connections_closed"] else "unconfirmed"
         )
-    await harness.close()
-    harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
-    await harness.manager.start()
-    assert harness.manager.delivery(item["id"])["state"] == "unknown"
-    await harness.close()
+        # Hash only after every test connection was confirmed closed. On close
+        # or constructor failure, retained CI files are unconfirmed evidence.
+        diagnostics["files"] = (
+            {
+                name: {
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                for name in ("channels.db", "channels.db-wal", "channels.db-shm")
+                if (path := directory / name).is_file()
+            }
+            if diagnostics["connections_closed"]
+            else {}
+        )
+        (directory / "sqlite-diagnostics.json").write_text(
+            json.dumps(diagnostics, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if close_error is not None and primary_error is None:
+            close_error.add_note(json.dumps(diagnostics, ensure_ascii=False, sort_keys=True))
+            raise close_error
 
 
 async def test_partial_checkpoint_preserves_successful_parts_on_retry(tmp_path: Path) -> None:
