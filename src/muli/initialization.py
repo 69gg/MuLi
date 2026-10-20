@@ -20,13 +20,15 @@ SOURCE_REPOSITORY = "https://github.com/69gg/MuLi.git"
 
 async def start_background(manager: UserService) -> dict[str, Any]:
     """Install and request login startup; report observed state without claiming readiness."""
+    from muli.management_cli import guarded_service_action
+
     capability = manager.capability()
     if not capability["supported"]:
         return {"accepted": False, **capability, "completed": []}
     completed: list[str] = []
     try:
         for action in ("install", "enable", "start"):
-            await manager.action(action)
+            await guarded_service_action(manager, action)
             completed.append(action)
         return {"accepted": True, "completed": completed, "status": await manager.status()}
     except (OSError, ValueError, TimeoutError) as exc:

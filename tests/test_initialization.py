@@ -92,13 +92,16 @@ def test_invalid_parameters_create_no_partial_configuration(tmp_path: Path) -> N
 async def test_background_setup_reports_partial_failure_without_losing_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
-    manager = UserService(tmp_path / "config.json", tmp_path / "data")
+    manager = UserService(tmp_path / "config.json", tmp_path / "data", tmp_path / "units")
     calls: list[str] = []
 
     async def action(name: str) -> dict[str, Any]:
         calls.append(name)
         if name == failure:
             raise ValueError("模拟平台拒绝")
+        if name == "install":
+            manager.path.parent.mkdir(parents=True, exist_ok=True)
+            manager.path.write_text(manager.render())
         return {"accepted": True}
 
     async def status() -> dict[str, Any]:
