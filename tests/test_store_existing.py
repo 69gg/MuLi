@@ -423,7 +423,6 @@ async def test_main_marker_removed_after_open_is_never_recreated(database: Path)
         ExistingStoreLimits(sql_bytes=1),
         ExistingStoreLimits(main_object_bytes=1),
         ExistingStoreLimits(vm_steps=1),
-        ExistingStoreLimits(seconds=1e-9),
     ],
 )
 async def test_read_budgets_reject_without_partial_migration(
@@ -433,6 +432,26 @@ async def test_read_budgets_reject_without_partial_migration(
     connections, mutations = prohibit_writes(monkeypatch)
     with pytest.raises(ExistingStoreError):
         Store.open_existing(database, limits=limits)
+    assert mutations == [] and snapshot(database) == before
+    assert_closed(connections)
+
+
+async def test_elapsed_read_budget_rejects_without_partial_migration(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = snapshot(database)
+    connections, mutations = prohibit_writes(monkeypatch)
+    readings = 0
+
+    def clock() -> float:
+        nonlocal readings
+        readings += 1
+        return 0.0 if readings == 1 else 1.0
+
+    monkeypatch.setattr("muli.store_schema.monotonic", clock)
+    with pytest.raises(ExistingStoreError, match="existing_store_read_budget"):
+        Store.open_existing(database, limits=ExistingStoreLimits(seconds=0.5))
+    assert readings >= 2
     assert mutations == [] and snapshot(database) == before
     assert_closed(connections)
 
