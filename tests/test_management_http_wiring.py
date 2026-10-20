@@ -127,7 +127,7 @@ async def test_configure_endpoint_stages_restart_candidate_without_applying_or_r
     assert host.runtime.config.path.read_bytes() == before
     assert host.runtime.store.get("management", item["id"]) == item
     path = host.app.state.management.directory / f"{item['id']}.json"
-    assert json.loads(path.read_text())["persona"]["name"] == "下一代"
+    assert json.loads(path.read_text(encoding="utf-8"))["persona"]["name"] == "下一代"
 
 
 class ObservedLock:
