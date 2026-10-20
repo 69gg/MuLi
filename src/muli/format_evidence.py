@@ -213,6 +213,39 @@ class _Reader:
         self.check()
         return FormatEvidence(state, instance, main, schema)
 
+    def read_optional(self) -> FormatEvidence | None:
+        tables = self.rows(
+            "SELECT name,type FROM main.sqlite_schema "
+            "WHERE name='runtime_state' COLLATE NOCASE LIMIT 2",
+            overflow="format_schema_unsupported",
+        )
+        if not tables:
+            return None
+        if tables != [("runtime_state", "table")]:
+            raise FormatEvidenceError("format_schema_unsupported")
+        # SQLite's non-STRICT TEXT affinity still permits BLOB primary keys.
+        # Their separate PK range must not masquerade as absent metadata.
+        if self.rows(
+            "SELECT 1 FROM main.runtime_state WHERE name>=? AND name<? LIMIT 2",
+            (b"format_state_", b"format_state`"),
+            overflow="format_marker_unknown",
+        ):
+            raise FormatEvidenceError("format_marker_unknown")
+        # A PK range, not a scan of all state values or JSON text. This prefix is
+        # reserved: future names and partial/multiple markers must fail closed.
+        markers = self.rows(
+            "SELECT CASE WHEN typeof(name)='text' "
+            "AND length(CAST(name AS BLOB))<=? THEN CAST(name AS BLOB) END "
+            "FROM main.runtime_state WHERE name>=? AND name<? ORDER BY name LIMIT 2",
+            (_IDENTITY_BYTES, "format_state_", "format_state`"),
+            overflow="format_marker_unknown",
+        )
+        if not markers:
+            return None
+        if markers != [(FORMAT_STATE_KEY.encode("utf-8"),)]:
+            raise FormatEvidenceError("format_marker_unknown")
+        return self.read()
+
 
 def read_format_evidence(
     db: sqlite3.Connection, *, limits: FormatReadLimits | None = None
@@ -225,6 +258,25 @@ def read_format_evidence(
     limits/PRAGMAs. It cannot detect unknown old callbacks. It never closes db.
     The caller authenticates the source; query_only does not prove path identity.
     """
+    result = _read_evidence(db, limits=limits, optional=False)
+    assert result is not None
+    return result
+
+
+def read_optional_format_evidence(
+    db: sqlite3.Connection, *, limits: FormatReadLimits | None = None
+) -> FormatEvidence | None:
+    """The same bounded snapshot, returning None only for absent format metadata.
+
+    A missing runtime_state table is legacy. An unreadable table, unknown marker
+    name, or malformed marker is an error, never a reason to initialize it.
+    """
+    return _read_evidence(db, limits=limits, optional=True)
+
+
+def _read_evidence(
+    db: sqlite3.Connection, *, limits: FormatReadLimits | None, optional: bool
+) -> FormatEvidence | None:
     limits = limits or FormatReadLimits()
     reader = _Reader(db, limits)
     saved_limits: dict[int, int] = {}
@@ -257,7 +309,7 @@ def read_format_evidence(
         reader.check()
         begin_attempted = True
         _rows(db, "BEGIN")
-        result = reader.read()
+        result = reader.read_optional() if optional else reader.read()
     except sqlite3.Error as error:
         code = reader.interrupted or (
             "format_read_timeout"

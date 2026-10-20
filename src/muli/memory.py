@@ -88,6 +88,7 @@ class Memory:
             max_vector_scan=max_vector_scan,
             max_community_members=max_community_members,
         )
+        self.store.revalidate_format()
         if not self.store.migration_allowed:
             validate_existing_schema(self.store.db, "memory")
             return

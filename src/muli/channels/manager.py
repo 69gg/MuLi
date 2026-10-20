@@ -17,8 +17,6 @@ from muli.maintenance import Admission
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_account
 from muli.store import Store, new_id, now
-from muli.store_schema import CHANNEL_SCHEMA as _SCHEMA
-from muli.store_schema import validate_existing_schema
 
 from .adapters import QQ, Adapter, OneBot, Telegram
 from .types import NAMES, ChannelError, ChannelsConfig, FileContent, IncomingMessage, Submit
@@ -51,16 +49,7 @@ class ChannelManager:
         self.delivery_guard = delivery_guard
         self.admission = admission or Admission()
         # Validate before constructing an owned client, including on reconfigure.
-        if not self.store.migration_allowed:
-            validate_existing_schema(self.store.db, "channel")
-        else:
-            self.store.db.executescript(_SCHEMA)
-            columns = {
-                row[1] for row in self.store.db.execute("PRAGMA table_info(channel_inbound)")
-            }
-            if "fingerprint" not in columns:
-                with self.store.db:
-                    self.store.db.execute("ALTER TABLE channel_inbound ADD COLUMN fingerprint TEXT")
+        self.store.prepare_channels()
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.adapters: dict[str, Adapter] = {

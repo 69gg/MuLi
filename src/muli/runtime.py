@@ -99,9 +99,15 @@ class Runtime:
             boot_permit.check_paths(config.path, data_dir / "muli.sqlite3")
         self.maintenance = Maintenance(boot_permit)
         self.store = (
-            Store(data_dir / "muli.sqlite3", durable=True)
+            Store.open_runtime(
+                data_dir / "muli.sqlite3",
+                default_mode=config.settings.default_mode,
+                durable=True,
+            )
             if boot_permit is not None
-            else Store(data_dir / "muli.sqlite3")
+            else Store.open_runtime(
+                data_dir / "muli.sqlite3", default_mode=config.settings.default_mode
+            )
         )
         try:
             self._initialize()
@@ -700,6 +706,7 @@ class Runtime:
 
     async def reconfigure(self) -> None:
         self.maintenance.require_configuration()
+        self.store.revalidate_format()
         if self.busy:
             raise ValueError("请先停止运行中的任务")
         await self.compaction.close()

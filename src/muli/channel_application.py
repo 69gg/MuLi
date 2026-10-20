@@ -77,6 +77,7 @@ class ChannelApplication:
         await self.manager.close()
 
     async def reconfigure(self) -> None:
+        self.runtime.store.revalidate_format()
         await self.close()
         self.manager = self._manager()
         await self.start()
