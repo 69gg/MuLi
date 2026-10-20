@@ -166,6 +166,8 @@ class ChannelManager:
                 "owner_count": len(profile.owner_ids),
                 "group_count": len(profile.allowed_groups),
                 "receive_files": profile.receive_files,
+                "voice_supported": bool(self.adapters[name].voice_mime_types),
+                "voice_mime_types": sorted(self.adapters[name].voice_mime_types),
                 "last_error": self._errors.get(name, ""),
             }
         return {
@@ -425,6 +427,7 @@ class ChannelManager:
         *,
         event_id: str | None = None,
         route: Mapping[str, Any] | None = None,
+        media_mode: str = "file",
     ) -> dict[str, Any]:
         profile = self.config.profile(name)
         if not profile.enabled:
@@ -434,6 +437,19 @@ class ChannelManager:
         )
         if selected["target"] != target:
             raise ChannelError("渠道目标与路由不一致")
+        if media_mode not in {"file", "voice"}:
+            raise ChannelError("渠道 media_mode 仅支持 file 或 voice")
+        if event_id is not None and (
+            not isinstance(event_id, str)
+            or not 1 <= len(event_id) <= 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in event_id)
+        ):
+            raise ChannelError("渠道幂等键需要 1–256 字符的非控制字符串")
+        if media_mode == "voice":
+            if len(attachment_ids) != 1:
+                raise ChannelError("原生语音需要恰好一个本地音频附件")
+            if not self.adapters[name].voice_mime_types:
+                raise ChannelError("当前渠道适配器不支持原生语音发送")
         if (
             not isinstance(text, str)
             or len(text) > 100000
@@ -459,7 +475,15 @@ class ChannelManager:
                 raise ChannelError("渠道附件不存在或已删除") from None
             if item["size"] > profile.max_file_bytes:
                 raise ChannelError("渠道附件超过 max_file_bytes")
-            parts.append({"attachment_id": attachment_id})
+            part: dict[str, Any] = {"attachment_id": attachment_id}
+            if media_mode == "voice":
+                # Validate before committing any text or media part. Dispatch
+                # validates the bytes again, including the stored digest.
+                await self._file(attachment_id, name, media_mode=media_mode)
+                part["media_mode"] = media_mode
+            parts.append(part)
+        if self._closed:
+            raise ChannelError("渠道管理器已关闭，请使用当前配置重新发送")
         payload = {"parts": parts}
         identifier = (
             hashlib.sha256(encoded([event_id, name, selected]).encode("utf-8")).hexdigest()
@@ -475,7 +499,7 @@ class ChannelManager:
                 ]
             }
             if plain != payload or existing["route"] != selected:
-                raise ChannelError("相同投递 ID 的内容不一致")
+                raise ChannelError("相同投递 ID 的内容或发送模式不一致", status_code=409)
             return existing
         count = self.store.db.execute(
             "SELECT count(*) FROM channel_outbox WHERE state IN ('pending','retry','sending')"
@@ -574,7 +598,7 @@ class ChannelManager:
             self.changed.notify_all()
         await self.bus.emit("channel.updated", self.status())
 
-    async def _file(self, identifier: str, name: str) -> FileContent:
+    async def _file(self, identifier: str, name: str, *, media_mode: str = "file") -> FileContent:
         if self.attachments is None:
             raise ChannelError("附件服务未启用")
         item = self.attachments.get(identifier)
@@ -590,7 +614,9 @@ class ChannelManager:
         data = await file_io(read)
         if len(data) > maximum or hashlib.sha256(data).hexdigest() != item["sha256"]:
             raise ChannelError("附件内容已变化或超过上限")
-        return FileContent(item["name"], item["mime_type"], data)
+        file = FileContent(item["name"], item["mime_type"], data, media_mode=media_mode)
+        self.adapters[name].validate_media(file)
+        return file
 
     async def _outbox(self) -> None:
         while True:
@@ -636,7 +662,11 @@ class ChannelManager:
                 part = item["payload"]["parts"][item["next_part"]]
                 async with asyncio.timeout(self.config.profile(item["name"]).timeout):
                     file = (
-                        await self._file(part["attachment_id"], item["name"])
+                        await self._file(
+                            part["attachment_id"],
+                            item["name"],
+                            media_mode=part.get("media_mode", "file"),
+                        )
                         if "attachment_id" in part
                         else None
                     )
