@@ -712,6 +712,10 @@ class MCPManager:
             self._status[name]["status"] = "close_failed" if connection.close_failed else "closed"
         self._connections.clear()
         self.tools.clear()
+        if self._retiring:
+            # A whole Runtime reconfiguration must retain this owner until every
+            # connection is reclaimed, just as candidate publication already does.
+            raise MCPPrepareError("connection_cleanup_pending")
 
     async def close(self) -> None:
         async with self._lock:

@@ -216,11 +216,15 @@ class SelfManagement:
                 "plugins_restart_required": self.plugins.restart_required,
                 "update": runtime.store.get("update", "latest"),
                 "extensions": runtime.extensions.status(),
+                "system_events": runtime.system_events.status(),
             }
 
         async def logs(args: dict[str, Any]) -> Any:
             return await read_service_logs(
-                self.service, runtime.config, lines=args.get("lines", DEFAULT_LOG_LINES)
+                self.service,
+                runtime.config,
+                lines=args.get("lines", DEFAULT_LOG_LINES),
+                mcp_config=lambda: runtime.mcp.config,
             )
 
         async def restart(args: dict[str, Any]) -> Any:

@@ -14,6 +14,7 @@ from test_runtime import FakeClient, make_runtime
 from muli.attention import AttentionInbox
 from muli.providers import Message, ModelTurn, StreamEvent
 from muli.runtime import Runtime
+from muli.store import new_id
 
 
 def inbox_for(runtime: Runtime) -> AttentionInbox:
@@ -249,3 +250,72 @@ async def test_collector_starts_before_components_and_stops_before_store(
     finally:
         await runtime.close()
     assert checked == ["start", "close"]
+
+
+async def test_old_attention_run_remains_suppressed_after_over_one_hundred_new_inputs(
+    tmp_path: Path,
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    inbox_for(runtime)
+    session = runtime.main_session()
+    run_id = new_id()
+    runtime.store.put("run", {"id": run_id, "session_id": session["id"], "status": "failed"})
+    runtime.conversation.enqueue(
+        session["id"],
+        "历史注意事项",
+        source="system:attention",
+        principal="system:attention",
+        mode="ask",
+        max_pending=1,
+        internal=True,
+    )
+    runtime.store.claim_inputs(session["id"], run_id, limit=1)
+    previous = runtime.store.db.execute("SELECT max(seq) FROM ingress").fetchone()[0]
+    for index in range(101):
+        runtime.conversation.enqueue(
+            session["id"],
+            "后续主人输入",
+            source="web",
+            principal="owner",
+            mode="ask",
+            max_pending=1,
+            event_id=f"later-owner-{index}",
+        )
+        runtime.store.cancel_inputs(session["id"])
+    newer_count = runtime.store.db.execute(
+        "SELECT count(*) FROM ingress WHERE seq>?", (previous,)
+    ).fetchone()[0]
+    assert newer_count == 101
+    try:
+        await runtime.startup()
+        assert runtime.system_logger is not None
+        runtime.system_logger.error(
+            "历史运行晚到的错误",
+            extra={
+                "muli_component": "runtime",
+                "muli_code": "runtime_failed",
+                "muli_run_id": run_id,
+                "muli_session_id": session["id"],
+            },
+        )
+        await eventually(lambda: runtime.system_events.status()["persisted"] == 1)
+        record = runtime.store.list("system_log")[0]
+        assert record["run_id"] == run_id and record["notify"] is False
+        assert not seen and not runtime.tasks
+    finally:
+        await runtime.close()
+
+
+async def test_exact_run_attribution_query_uses_its_partial_index(tmp_path: Path) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    try:
+        rows = runtime.store.db.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM ingress WHERE run_id=? "
+            "AND json_extract(payload,'$.principal')='system:attention' LIMIT 1",
+            (new_id(),),
+        ).fetchall()
+        detail = "\n".join(row["detail"] for row in rows)
+        assert "USING INDEX ingress_system_log_run" in detail
+        assert "SCAN ingress" not in detail
+    finally:
+        await runtime.close()

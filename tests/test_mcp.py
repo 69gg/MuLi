@@ -474,7 +474,9 @@ async def test_retirement_failure_is_reported_after_new_catalog_is_published() -
         ]
         assert "private-fixture-value" not in json.dumps(manager.status())
     finally:
-        await manager.close()
+        with pytest.raises(MCPPrepareError, match="connection_cleanup_pending"):
+            await manager.close()
+        assert manager.pending_cleanup == 1
 
 
 async def test_repeated_caller_cancellation_does_not_cancel_owned_cleanup() -> None:

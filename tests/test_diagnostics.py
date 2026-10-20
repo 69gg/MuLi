@@ -248,6 +248,36 @@ async def test_effective_directory_mcp_secrets_are_hidden_across_reload(
     assert config.settings.mcp == {}
 
 
+async def test_self_logs_uses_the_published_mcp_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from muli.server import create_app
+    from muli.tools.mcp import MCPManager
+
+    config, _ = configured(tmp_path)
+    app = create_app(config, tmp_path / "data")
+    runtime = app.state.runtime
+    app.state.management.service.platform = "linux"
+    monkeypatch.setattr("muli.diagnostics.shutil.which", lambda name: name)
+    runtime.mcp.config = {
+        "mcpServers": {"directory": {"headers": {"X-Private": "published-before"}}}
+    }
+
+    async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        runtime.mcp = MCPManager(
+            {"mcpServers": {"directory": {"env": {"PRIVATE": "published-after"}}}}
+        )
+        return {"exit_code": 0, "output": "published-before published-after"}
+
+    monkeypatch.setattr("muli.diagnostics.run_process", run)
+    try:
+        result = await runtime.tools["self_logs"].handler({})
+        assert result["text"] == "[hidden] [hidden]"
+        assert config.settings.mcp == {}
+    finally:
+        await runtime.close()
+
+
 async def test_cancel_remains_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config, service = configured(tmp_path)
     monkeypatch.setattr("muli.diagnostics.shutil.which", lambda name: name)

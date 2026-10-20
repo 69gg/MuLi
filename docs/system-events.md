@@ -35,6 +35,6 @@ system_events / attention 组件不能再次通知；明确 notify=false 的上�
 
 只使用临时数据库、独立 logger、假模型与有限线程验证：阈值、突发/队列满、单唤醒、重复计数、保留/旧事件、停止/配置更新、实例隔离、持久化失败无递归、通知失败抑制、旧来源等价，以及主/团队工作结束后的原有 Attention 等待合同。所有检查经根目录 scripts/check_local.py 串行进行，不访问真实服务或模型。
 
-`tests/test_system_events.py` 与原 `tests/test_attention.py` 合计 59 项通过，峰值 73.9 MiB、swap 0；两份产品源码严格 mypy 及相关 Ruff/format 通过。`tests/test_system_events_runtime.py` 的七项宿主接线回归已另行准备并通过静态检查，尚未执行；模块回归通过不等于 Runtime/server 接线已完成验证。
+`tests/test_system_events.py` 与原 `tests/test_attention.py` 合计 59 项通过，峰值 73.9 MiB、swap 0；两份产品源码严格 mypy 及相关 Ruff/format 通过。宿主接线另覆盖真实执行失败、注意事项自身失败不再唤醒、claim 前失败、跨运行归属、热改策略、启动/关闭顺序、旧运行被较新历史遮挡及精确查询索引。已纳入整版 1,879 项通过、1 项平台跳过的 Linux 检查；后续最终候选及跨平台结果见[评审记录](review-v2.14.md)。
 
 依据：[logging.Handler.emit](https://docs.python.org/3.13/library/logging.html#logging.Handler.emit)、[call_soon_threadsafe](https://docs.python.org/3.13/library/asyncio-eventloop.html#asyncio.loop.call_soon_threadsafe)、[contextvars](https://docs.python.org/3.13/library/contextvars.html)。已用 Context7 核对 Handler 锁顺序与跨线程调度；接口核对不等于功能验证。

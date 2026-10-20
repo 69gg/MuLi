@@ -628,6 +628,7 @@ def create_app(
             "plugins_restart_required": plugins.restart_required,
             "update": runtime.store.get("update", "latest"),
             "extensions": runtime.extensions.status(),
+            "system_events": runtime.system_events.status(),
         }
 
     @app.get("/api/extensions")

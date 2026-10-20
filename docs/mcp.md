@@ -67,6 +67,8 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 ## 配置编辑与密钥
 
+整体重新配置也不能丢弃未确认关闭的 MCP 管理器。关闭后仍有待回收连接时抛固定 `connection_cleanup_pending`，保留清理引用；恢复原配置时若仍不能回收则继续明确失败，不创建新管理器或伪称全部组件已恢复。程序最终关闭也报告此状态；它不表示操作系统连接必然仍存活，只表示客户端未确认回收。
+
 配置管理仅接受根 `mcpServers`，最多 32 个服务器；单服务器只接受上述字段与 enabled/disabled/transport/timeout。timeout 为一天以内的有限正数，管理器进一步用全局时限收紧。URL 必须是 HTTP(S)，不允许内嵌账号、片段或空白。
 
 `GET /api/settings` 保留 MCP 配置结构，将 env 和 headers 的全部值显示为 `••••`，URL 查询参数整体显示为 `?••••`。密钥建议放在 env 或 headers，避免放入可展示的 command、args、cwd 或服务器名称。

@@ -18,7 +18,7 @@ from muli.management import SelfManagement
 from muli.providers import Message, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.server import create_app
-from muli.tools.mcp import MCPClient, MCPManager
+from muli.tools.mcp import MCPClient, MCPManager, MCPPrepareError
 
 
 def server(url: str = "old", *, enabled: bool = True) -> dict[str, Any]:
@@ -49,6 +49,43 @@ def fragment(tmp_path: Path, name: str, value: dict[str, Any]) -> Path:
     path = root / name
     path.write_text(json.dumps(value), encoding="utf-8")
     return path
+
+
+async def test_full_configuration_cannot_discard_an_unclosed_mcp_generation(
+    tmp_path: Path,
+) -> None:
+    class Unclosed(FakeClient):
+        allow_close = False
+
+        async def close(self) -> None:
+            await super().close()
+            if not self.allow_close:
+                raise RuntimeError("private transport cleanup detail")
+
+    runtime = setup_runtime(tmp_path)
+    client = Unclosed()
+    previous = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: client)
+    runtime.mcp = previous
+    app = create_app(runtime.config, runtime=runtime)
+    original = runtime.config.settings.model_dump()
+    try:
+        await runtime.extensions.load_initial()
+        target = runtime.config.validate_changes({"persona": {"append": "requires full rebuild"}})
+        async with runtime.configuration_lock:
+            with pytest.raises(MCPPrepareError, match="connection_cleanup_pending"):
+                await app.state.management.apply_settings(target)
+        assert runtime.mcp is previous
+        assert runtime.config.settings.model_dump() == original
+        assert ConfigFile(runtime.config.path).settings.model_dump() == original
+        assert previous.pending_cleanup == 1
+        assert previous.status()[0]["status"] == "close_failed"
+        assert runtime.extensions.status()["cleanup_pending"] == 1
+        assert "private transport" not in json.dumps(runtime.extensions.status())
+        assert client.entered == 1
+    finally:
+        client.allow_close = True
+        await previous.close()
+        await runtime.close()
 
 
 def directory_settings(tmp_path: Path, **limits: Any) -> Settings:
