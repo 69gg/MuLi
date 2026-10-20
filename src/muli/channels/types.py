@@ -178,3 +178,4 @@ class FileContent:
     name: str
     mime_type: str
     data: bytes = field(repr=False)
+    media_mode: str = "file"

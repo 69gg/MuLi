@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "../../web/management.mjs";
 
 test("management status loading only reads existing APIs and preserves their payloads", async () => {
@@ -58,6 +60,39 @@ test("failed deliveries retry without approving unknown results", async () => {
   let captured;
   await retryChannelDelivery(async (path, options) => { captured = { path, options }; }, { id: "record/one", state: "failed" }, { allowUnknown: true });
   assert.deepEqual(captured, { path: "/channels/deliveries/record%2Fone/retry", options: { method: "POST", body: { allow_unknown: false } } });
+});
+
+test("blocked deliveries expose their reason and the existing explicit retry action", () => {
+  const source = readFileSync(new URL("../../web/app.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("function deliveryLabel(value)");
+  const end = source.indexOf("function renderInputSettings()", start);
+  assert.ok(start >= 0 && end > start);
+  const element = (tag, props, ...children) => ({ tag, props, children: children.filter(Boolean), append(...items) { this.children.push(...items.filter(Boolean)); } });
+  const context = {
+    state: { channels: { deliveries: [{ id: "blocked-origin", name: "onebot", state: "blocked", route: { target: "original-owner" }, last_error: "原回复渠道未启用" }, { id: "already-sent", name: "onebot", state: "sent" }] } },
+    CHANNELS: [["onebot", "OneBot"]], element, formatFullDate: String,
+    actionButton: (label, action, _style, _icon, data) => element("button", { text: label, action, ...data }),
+  };
+  runInNewContext(source.slice(start, end), context, { timeout: 1000 });
+  const rendered = context.renderDeliveries();
+  const nodes = [];
+  const visit = (node) => { nodes.push(node); for (const child of node.children) visit(child); };
+  visit(rendered);
+  assert.ok(nodes.some((node) => node.props.text === "原路投递受阻"));
+  assert.ok(nodes.some((node) => node.props.text === "原回复渠道未启用"));
+  assert.ok(nodes.some((node) => node.props.text === "original-owner"));
+  assert.ok(nodes.some((node) => node.tag === "button" && node.props.action === "retry-delivery" && node.props.id === "blocked-origin"));
+  assert.ok(!nodes.some((node) => node.tag === "button" && node.props.id === "already-sent"));
+});
+
+test("blocked deliveries retry the same record without approving unknown results", async () => {
+  const calls = [];
+  const delivery = { id: "blocked/origin", state: "blocked" };
+  const request = async (...args) => { calls.push(args); return { id: delivery.id, state: "pending" }; };
+  assert.equal(calls.length, 0);
+  const result = await retryChannelDelivery(request, delivery, { allowUnknown: true });
+  assert.deepEqual(calls, [["/channels/deliveries/blocked%2Forigin/retry", { method: "POST", body: { allow_unknown: false } }]]);
+  assert.equal(result.id, delivery.id);
 });
 
 test("unknown deliveries cannot retry until explicitly confirmed", async () => {

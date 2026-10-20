@@ -36,6 +36,14 @@
 
 网页状态机、ASR 接口和断开处理均以假录音器、假轨道及 HTTP MockTransport 验证；开发验证没有打开实际麦克风或调用付费转写。浏览器行为依据 [getUserMedia](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)、[MediaRecorder.stop](https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/stop)、[MediaStreamTrack.stop](https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack/stop) 官方文档核对。
 
+## AI 转录、合成与渠道语音
+
+AI 已有 `audio_transcribe(id)` 按需转录音频附件，以及 `speech_synthesize(text, voice?)` 调用当前配置的 TTS、保存合成音频并返回本地附件 ID。合成不会自动播放或发出；无需为发送功能打开后台麦克风或唤醒。
+
+需要发送原生语音时，再显式调用 `channel_send`，传 `attachment_ids=[合成返回的ID]`、`media_mode="voice"` 和从可信入站取得的已绑定目标/群路由。同一逻辑发送可带稳定 `idempotency_key`；返回排队 ID 后以 `channel_status` 检查状态，不把入队说成已送达。结果 unknown 不自动重发，不能通过改键绕过重复风险。
+
+当前显式 voice 支持 Telegram 的 MP3、M4A、Ogg/Opus，以及远端确认 `can_send_record` 的 OneBot；QQ 与微信的这一显式模式尚未支持，会明确拒绝。默认 file 保持各平台原有附件行为。TTS 默认 MP3 可直接走 Telegram 语音；若服务配置生成 WAV、FLAC、PCM 等 Telegram 不支持的格式，需显式选择兼容的 TTS 输出或文件发送，不会自动安装转码器或降级。详见[渠道语音合同](channels.md#显式发送语音)。没有真实平台收发或付费 TTS 验收记录。
+
 ## 本地后台唤醒
 
 voice.enabled 默认 false。未启用时，start 不创建采集任务，listen_once 和 enroll 拒绝录音。模块导入、状态探测与设置读取都不会打开麦克风、下载模型或加载 GPU 推理框架。本轮使用模拟音频与模拟进程验证，未实际录音或播放开发机音频。

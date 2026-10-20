@@ -21,7 +21,11 @@ MuLi 可把 Telegram、OneBot/NapCat、QQ 官方机器人及微信 iLink 的消�
 
 `name` 为 `onebot`、`telegram`、`qq` 或 `weixin`；群聊的 `kind` 为 `group`。私聊的 `target` 必须与 `sender_id` 相同。账号优先取 `account_id`、`app_id`、`user_id`；Telegram 还可取 token 中公开的机器人数字 ID；其他情况为逻辑账号 `bot`。OneBot 配置多个实例或切换账号时应明确设置稳定的 `account_id`。
 
-每次主模型请求开始时，Runtime 从最新已接收的机主输入复制一个路由快照。只有主会话的最终 assistant 消息携带 `delivery_routes` 时才自动出站；网页输入会清空渠道路由，工作流与子代理消息不会自动外发，取消后的不完整回复也跳过。模型流式生成期间新到的渠道输入只影响下一次请求。发送前再次检查当前机主、群和账号绑定；撤销绑定后旧的排队消息不能继续发给该对象。
+每次模型请求在进入上下文钩子前冻结宿主来源；主会话完整 assistant 消息携带一个 `delivery_routes` 时才自动出站，取消后的不完整回复跳过。网页输入对应本地回复；模型流式生成期间新到的渠道输入只影响下一次请求。发送前再次检查当前机主、群和账号绑定；撤销绑定后旧的排队消息不能继续发给该对象。来源记录缺少账号时，从原输入的 `source` 取得账号，不套用后来配置的新账号。
+
+Team 队友保存派工时的来源，并由子队友、恢复、普通补充消息和结果报告继承。从 A 渠道派工后切到 B 或 WebUI，主助手整理该任务后台报告时仍投回 A。输入队列只在既有工具回放安全边界领取连续同目的地的一段；完整 route（含账号及 `reply_to`）不同的输入不混成一段外发回复。普通 `send_message` 和 `resume` 不改绑；本片没有改绑工具，新任务需要新建队友。报告仍是资料，不取得主人身份或新的执行授权。
+
+旧队友或旧报告没有原始来源证据时，回复留在 WebUI。队友自身消息不直接自动外发；Workflow 自动汇报、默认主动渠道及记忆偏好选路尚未接入本合同。已有 A 目的地不可用时不会换发到 B、最近渠道或默认渠道；设计与边界见 [Team 原路汇报](report-origin-v2.15-design.md)。
 
 路由、投递记录和状态接口不含 token、client secret 或微信 `context_token`。iLink 的 `context_token` 只单独保存在本地渠道状态中，发送时按当前账号与目标查找。它需要本地数据目录的同等保护。
 
@@ -82,8 +86,8 @@ Telegram 的 `getUpdates` 与远端 webhook 互斥。本实现使用长轮询，
 
 接收的文件先进入现有附件仓库。图片、音频和视频只保存为附件，随后由显式看图、转录等工具按需读取；不会把图片盲目注入主提示词。非机主、未绑定群或关闭 `receive_files` 时不下载。附件超限、格式不允许或多次下载失败会在入站文本中标明，仍提交原文字。已落盘的附件有独立进度记录；提交消息失败后重放不会重复导入它们。
 
-- Telegram 使用 `sendMessage` 与 multipart `sendDocument`，不启用 HTML/Markdown 解析。接收先 `getFile`，再从该机器人配置的文件端点获取内容；接收上限同时受官方 20 MiB 和本地配置限制。
-- OneBot 发送数组形式的 text segment，不把文字解释为 CQ code。文件使用 NapCat 的 `upload_private_file` / `upload_group_file`，通过 `base64://` 提交，无需共享本机文件路径。接收使用 `get_image`、`get_record`、`get_private_file_url` 或 `get_group_file_url` 获取 URL；不读取 NapCat 返回的本地路径。通用 OneBot 服务若没有 NapCat 文件扩展，文本仍可用，文件操作明确失败。
+- Telegram 使用 `sendMessage` 与 multipart `sendDocument`；显式语音使用 multipart `sendVoice`，不启用 HTML/Markdown 解析。接收先 `getFile`，再从该机器人配置的文件端点获取内容；接收上限同时受官方 20 MiB 和本地配置限制。
+- OneBot 发送数组形式的 text segment，不把文字解释为 CQ code。文件使用 NapCat 的 `upload_private_file` / `upload_group_file`，通过 `base64://` 提交，无需共享本机文件路径。显式语音先查询 `can_send_record`，再发送包含 Base64 的 `record` 数组段。接收使用 `get_image`、`get_record`、`get_private_file_url` 或 `get_group_file_url` 获取 URL；不读取 NapCat 返回的本地路径。通用 OneBot 服务若没有 NapCat 文件扩展，文本仍可用，文件操作明确失败。
 - QQ 支持 `C2C_MESSAGE_CREATE` 与 `GROUP_AT_MESSAGE_CREATE`；校验 `X-Bot-Appid`、时间戳及 Ed25519 原始请求签名，并实现官方 `op=13` 回调验证。access token 有效期必须为有限正数并提前刷新。文件先上传到目标用户或群的 `/files`，然后以 `msg_type=7` 和原样 `file_info` 发送；本轮直接上传限制为 5 MiB，不实现大文件分块。被动回复的 `msg_id/msg_seq` 在 SQLite 中跨投递分配，同一入站消息最多分配 5 次；预算不足会在发送前拒绝。平台的时间窗口、主动消息配额及资质仍由 QQ 决定。
 - iLink 按只读参考项目验证的 2.4.6 协议发送文本、图片、视频和普通文件；媒体使用协议规定的 AES-128-ECB/PKCS#7 与 CDN。音频出站作为文件发送，此版本不提供原生语音消息发送或引用回复。消息使用稳定的 `client_id`；失效 token 的 `-14` 响应暂停重试一小时。没有有效 `context_token` 时明确要求用户先向机器人发消息。
 
@@ -113,13 +117,42 @@ uv tool install "muli-agent[channels]"
 | `sending` | 正在处理当前分段 |
 | `sent` | 所有分段均收到平台 API 成功确认；不代表对方已读 |
 | `failed` | 明确拒绝、文件失效或安全重试达到上限 |
+| `blocked` | 自动回复的原渠道未启用、尚未就绪、绑定失效或被动回复预算不足；已持久记录，尚未发送，不自动重试 |
 | `unknown` | 请求可能已被平台接受，无法确认；不自动重发 |
 
 每段成功后立即持久记录下一段位置。后续分段失败再重试时，不重发前面已确认的部分。连接尚未建立或明确限流可有限重试；读取/写入超时、发送后无效确认、服务器错误以及发送途中退出会保守标记 `unknown`。进程重启看到遗留 `sending` 也转为 `unknown`。
 
 `retry(id, allow_unknown=True)` 才能人工重试未知结果，调用方须明确接受可能重复。HTTP 成功后、本地落盘前进程崩溃仍可能留下歧义，系统不承诺跨平台 exactly-once。QQ 的消息序号和 iLink 的稳定 `client_id` 会尽量复用平台去重能力；不把它等同于已验证的绝对不重复。
 
+`blocked` 也使用同一个 outbox 和稳定去重 ID；重新启用渠道、重启或重复消费该 assistant 事件不会把它改回 pending。工作台将其显示为“原路投递受阻”，附原因和既有“重试发送”按钮。显式 `retry(id)` 只有在原账号/owner/group 重新通过验证、渠道已就绪后才继续；QQ 在此时才为尚未发送的 blocked 项预留被动回复序号。阻塞项的附件在真正发送时仍核验存在、大小及内容摘要，记录阻塞不等于附件当前可用。`team_report.delivered` 只证明父会话收件成功，实际外部送达状态以这里的 outbox 为准。
+
 工作台 `/api/channels` 与 `channel_status` 可查看状态和投递记录。`channel_send` 通过统一 `external` 权限门显式发送本地附件或文字，目标仍须符合绑定。工具返回排队 ID 后应检查投递状态，不能把入队说成已送达。
+
+## 显式发送语音
+
+`channel_send` 新增可选 `media_mode="file"|"voice"`，默认 file 保持已有附件发送行为，不按扩展名把所有音频自动切到新语音路径。file 的含义是原有传输路径，不承诺每个平台都显示文档：QQ 原有音频附件仍沿用平台富媒体 `file_type=3`，本片不改变它。
+
+voice 只接受一个本地音频附件 ID，可附文字；文字仍作为先行独立分段，不作为音频 caption。所有本地格式与大小校验在整条投递入队前完成，发送时再次核验文件摘要；若后续远端拒绝或附件失效，已确认的文字分段不会撤回或重发。
+
+| 渠道 | 当前显式 voice 能力 |
+| --- | --- |
+| Telegram | MP3、M4A、Ogg/Opus；普通 Vorbis Ogg、WAV、WebM 等会明确拒绝。上传名按 MIME 使用 `.mp3` / `.m4a` / `.ogg`，已保存附件的文件名和字节不变。Opus 只核对有限文件头中的标记，不做完整解码验证；平台仍可能拒绝无效音频。受本地 `max_file_bytes`、附件库配额和 Telegram 50 MiB 上限约束。 |
+| OneBot | 当前适配器接收附件库识别的 MP3、WAV、Ogg、FLAC、MP4 音频与 WebM 音频。实际发送前须由远端 `can_send_record` 返回 `yes=true`；不保证每个实现都支持所有编码，远端拒绝会明确失败，不在 MuLi 内转码。 |
+| QQ 官方、微信 iLink | 本片尚未提供显式 voice，直接拒绝；默认附件发送继续可用。这里说明的是当前 MuLi 适配器能力，不是对上游协议未来能力的限制。 |
+
+先用现有 `speech_synthesize` 获得保存的语音附件 ID，再显式发送；也可用 `file_publish` 将已有文件导入附件库：
+
+```json
+{
+  "channel": "telegram",
+  "target": "从可信路由取得的已绑定目标",
+  "attachment_ids": ["speech_synthesize返回的附件ID"],
+  "media_mode": "voice",
+  "idempotency_key": "同一逻辑发送保持稳定的键"
+}
+```
+
+`idempotency_key` 可选，限制为 1–200 字符、不能包含控制字符。它复用持久出站去重：同一键、渠道及可信路由返回原投递；正文、附件或模式改变会报冲突。同键重试仍会先做附件预检，附件必须存在且可核验；删除附件后应从 `channel_status` 的持久记录查原投递，不能靠重新调用发送获取收据。省略键表示新的发送，不能用换键将 unknown 伪装成安全重试。mode 保存在附件分段中，重启不丢；旧分段无该字段时继续原 file 语义。OneBot 能力查询未发送消息，查询取消保持 pending；实际发送后的无效回执、超时、取消及重启遗留 sending 保持 unknown，不自动重试。`channel_status` 的 `voice_supported` / `voice_mime_types` 只描述本适配器的协议路径，不是对真实账号或设备的验收。
 
 ## 模块接口与测试
 
@@ -134,11 +167,12 @@ await manager.close()
 
 `submit` 为异步回调，接收 `content/source/principal/route/event_id/attachment_ids`。关闭时取消长轮询、事件消费者与出站工作器，完成正在发送任务的状态收口后唤醒等待者；若管理器关闭，`wait` 返回当时的持久状态，尚未发送的项目仍可能是 `pending`。
 
-离线验证命令：`python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_channels.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
+离线验证命令：`python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_channels.py tests/test_channel_voice.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。语音回归覆盖 Telegram multipart、OneBot 私聊/群 record 与能力拒绝、格式/数量预检、默认文件与 QQ 音频兼容、同键模式冲突、持久重开及 unknown 不重发。相关渠道/应用集成/附件服务共 61 项受限测试通过，源码检查记录见[语音设计](channel-voice-design.md#验证)。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
 
 ## 协议依据
 
-- [Telegram Bot API](https://core.telegram.org/bots/api)：`getUpdates`、`sendMessage`、`sendDocument`、`getFile`。
+- [Telegram Bot API](https://core.telegram.org/bots/api)：`getUpdates`、`sendMessage`、`sendDocument`、`sendVoice`、`getFile`。
+- [OneBot 11 语音消息段](https://github.com/botuniverse/onebot-11/blob/master/message/segment.md#语音)、[公开 API](https://github.com/botuniverse/onebot-11/blob/master/api/public.md)：`record` 与 `can_send_record`。
 - [OneBot 11 反向 HTTP 通信](https://github.com/botuniverse/onebot-11/blob/master/_autodocs/api-reference/communication-http-post.md)：原始请求体 HMAC-SHA1 签名。
 - [NapCat 私聊文件上传](https://napcat.apifox.cn/226658883e0)、[群文件上传](https://napcat.apifox.cn/226658753e0)；[官方 URI 解析源码](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-common/src/file.ts)确认 `base64://` 支持。
 - [QQ 调用基础与 access token](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/api-use.html)、[事件回调](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html)、[签名校验](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/sign.html)。

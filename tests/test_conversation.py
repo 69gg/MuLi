@@ -400,8 +400,10 @@ async def test_channel_route_is_snapshot_per_model_request(
             for message in runtime.store.messages(first["session_id"])
             if message["role"] == "assistant"
         ]
-        assert replies[0]["delivery_routes"] == [original_route]
-        assert replies[1]["delivery_routes"] == ([next_route] if next_route else [])
+        assert replies[0]["delivery_routes"] == [{**original_route, "account_id": "bot"}]
+        assert replies[1]["delivery_routes"] == (
+            [{**next_route, "account_id": "owner"}] if next_route else []
+        )
         events = [
             event["data"]["message"]
             for event in runtime.store.events(session_id=first["session_id"])

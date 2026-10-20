@@ -14,7 +14,7 @@
 }
 ```
 
-`events` 只能选择上述三类，不能填任意总线事件名；空列表停止接收新事件，已经接受的待处理批次仍会继续处理。要同时取消这些旧批次，使用 `enabled=false`。`batch_size` 限制每次读取的事件条数，`max_chars` 限制一条系统输入的正文，实际正文还按当前上下文预算收紧。`coalesce_seconds` 只在发现合格事件后短暂等待合并突发事件，空闲没有计时轮询。主队列沿用 `limits.max_pending_runs`，其中最多保留一批尚未消费的注意事项，避免后台资料淹没前台输入。单个记录太长时保留事件 ID 和原记录 ID，并明确标注资料节选。
+`events` 只能选择上述三类，不能填任意总线事件名。日志由独立的 `system_events.notify_enabled` 与级别策略控制，见[系统日志事件](system-events.md)；`events=[]` 只停止上述三类新事项。要关闭全部注意事项并取消旧的待处理批次，使用 `attention.enabled=false`。`batch_size` 限制每次读取的事件条数，`max_chars` 限制一条系统输入的正文，实际正文还按当前上下文预算收紧。`coalesce_seconds` 只在发现合格事件后短暂等待合并突发事件，空闲没有计时轮询。主队列沿用 `limits.max_pending_runs`，其中最多保留一批尚未消费的注意事项，避免后台资料淹没前台输入。单个记录太长时保留事件 ID 和原记录 ID，并明确标注资料节选。
 
 允许的来源与证据：
 
@@ -23,6 +23,7 @@
 | `reminder` | `notification.created`，`source=reminder` | 相同通知正文及来源、已触发的 reminder、对应通知 ID |
 | `update` | `notification.created`，`source=update` | 相同通知正文及来源、当前已检查且确有新版的 update 记录、对应版本通知 ID |
 | `management` | `management.completed` | 相同管理计划 ID、action 与终态；只接受 configure/restart/update 的 completed/failed |
+| 独立日志策略 | `system.log` | 当前 `system_log` 原记录、精确事件 ID、固定字段一致，且来源允许通知、级别符合策略 |
 
 仅伪造一个同名事件不够。消费器回查 SQLite 的通知、提醒、版本和管理记录；管理计划的原始错误、配置快照、结果对象不进入模型，避免诊断中的凭据外泄。本地 Python 插件仍是用户信任的代码，能修改数据库与事件总线；这里不是针对恶意插件的操作系统沙箱。
 

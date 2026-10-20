@@ -13,6 +13,8 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any, Literal
 
+from muli.reply_origin import ReplyOrigin
+
 LifecycleKind = Literal["session", "run", "approval", "workflow_run"]
 _LIFECYCLE_KINDS = ("session", "run", "approval", "workflow_run")
 _LIFECYCLE_PAGE_SIZE = 100
@@ -128,6 +130,8 @@ class Store:
                 received REAL NOT NULL, delivered_seq INTEGER, run_id TEXT
             );
             CREATE INDEX IF NOT EXISTS ingress_pending ON ingress(session_id,state,seq);
+            CREATE INDEX IF NOT EXISTS ingress_system_log_run
+                ON ingress(run_id) WHERE run_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
                 session_id TEXT, data TEXT NOT NULL, created_at REAL NOT NULL
@@ -723,6 +727,7 @@ class Store:
     ) -> builtins.list[dict[str, Any]]:
         """At a replay-safe boundary, atomically append inputs and advance delivery state."""
         result: builtins.list[dict[str, Any]] = []
+        destination: tuple[str, str] | None = None
         with self.db:
             rows = self.db.execute(
                 "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
@@ -730,6 +735,10 @@ class Store:
             ).fetchall()
             for row in rows:
                 payload = json.loads(row["payload"])
+                origin = ReplyOrigin.from_input(payload)
+                if destination is not None and origin.destination_key != destination:
+                    break  # Another recipient waits for the next replay-safe boundary.
+                destination = origin.destination_key
                 message = self._archive_input(
                     payload, received=row["received"], run_id=run_id, input_seq=row["seq"]
                 )
@@ -761,6 +770,7 @@ class Store:
             "attachment_ids": payload.get("attachment_ids", []),
             "delivery_status": "delivered",
             "run_id": run_id,
+            "reply_origin": ReplyOrigin.from_input(payload).dump(),
         }
         if input_seq is not None:
             message["input_seq"] = input_seq

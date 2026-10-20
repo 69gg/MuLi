@@ -36,6 +36,7 @@ from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
 from muli.plugins import PluginManager
+from muli.process import _wait_cleanup
 from muli.providers import ProviderError
 from muli.runtime import Runtime
 from muli.service import UserService
@@ -141,7 +142,7 @@ def create_app(
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
     runtime = runtime or Runtime(config, data_dir or default_data_dir())
-    attention = AttentionInbox(runtime)
+    attention = AttentionInbox(runtime, lambda: config.settings.system_events)
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
@@ -153,8 +154,11 @@ def create_app(
     from muli.integrations.manager import IntegrationManager
 
     integration = IntegrationManager(runtime)
+    configuration_closing = False
 
     async def apply_configuration(target: Settings) -> None:
+        if configuration_closing:
+            raise ValueError("服务正在关闭，不能应用新配置")
         if not bound_loopback and not target.server.password_hash:
             raise ValueError(
                 "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
@@ -163,14 +167,8 @@ def create_app(
             await runtime.extensions.apply_locked(target, persist=True)
             return
         previous = config.settings.model_copy(deep=True)
-        await attention.close()
-        await web_voice.aclose()
-        await integration.close()
-        await channel_application.close()
-        await personal_io.close()
-        await memory_application.close()
-        try:
-            config.replace(target)
+
+        async def rebuild() -> None:
             await runtime.reconfigure()
             await memory_application.reconfigure()
             await channel_application.reconfigure()
@@ -178,16 +176,27 @@ def create_app(
             await integration.start()
             await attention.reconfigure()
             await web_voice.reconfigure()
-        except Exception:
-            config.replace(previous)
-            await runtime.reconfigure()
-            await memory_application.reconfigure()
-            await channel_application.reconfigure()
-            await personal_io.reconfigure()
-            await integration.start()
-            await attention.reconfigure()
-            await web_voice.reconfigure()
-            raise
+
+        async def apply() -> None:
+            try:
+                await attention.close()
+                await web_voice.aclose()
+                await integration.close()
+                await channel_application.close()
+                await personal_io.close()
+                await memory_application.close()
+                config.replace(target)
+                await rebuild()
+            except (Exception, asyncio.CancelledError):
+                config.replace(previous)
+                await rebuild()
+                raise
+
+        # The caller keeps configuration_lock until commit or recovery settles.
+        # Disconnecting an observer must not strand half of the application stopped.
+        applying = asyncio.create_task(apply(), name="muli-configuration")
+        if await _wait_cleanup(applying):
+            raise asyncio.CancelledError
 
     async def onboarding() -> None:
         if config.settings.onboarding_pending and config.settings.models.main.configured:
@@ -202,6 +211,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal configuration_closing
         try:
             await plugins.load()
             await runtime.startup()
@@ -214,9 +224,14 @@ def create_app(
             await onboarding()
             yield
         finally:
+            configuration_closing = True
+            # Let an owned apply/rollback finish before finally stopping its components.
+            # Do not hold the lock while joining a worker that may be waiting for it.
+            await management.close()
+            async with runtime.configuration_lock:
+                pass  # An admitted API transaction must also settle before Store closes.
             await attention.close()
             await web_voice.aclose()
-            await management.close()
             await integration.close()
             await channel_application.close()
             await personal_io.close()
@@ -593,6 +608,7 @@ def create_app(
             "voice": personal_io.voice.status(),
             "web_voice": web_voice.status(),
             "attention": attention.status(),
+            "system_events": runtime.system_events.status(),
             "limits": settings.limits.model_dump(),
         }
 
@@ -612,6 +628,7 @@ def create_app(
             "plugins_restart_required": plugins.restart_required,
             "update": runtime.store.get("update", "latest"),
             "extensions": runtime.extensions.status(),
+            "system_events": runtime.system_events.status(),
         }
 
     @app.get("/api/extensions")

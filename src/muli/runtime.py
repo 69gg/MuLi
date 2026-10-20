@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -38,7 +39,9 @@ from muli.providers import (
     ToolCall,
 )
 from muli.reminders import Reminders
+from muli.reply_origin import ReplyOrigin
 from muli.store import LifecycleKind, Store, new_id, now
+from muli.system_events import SystemEvents, SystemLogger
 from muli.task_control import (
     ControlConflict,
     ControlResult,
@@ -66,6 +69,7 @@ class PreparedRequest:
     messages: list[Message]
     execution_scope: TaskSnapshot | None = None
     selected_replan: TaskSnapshot | None = None
+    reply_origin: ReplyOrigin = ReplyOrigin()
 
 
 class Runtime:
@@ -75,6 +79,14 @@ class Runtime:
         self.config, self.data_dir, self.client_factory = config, data_dir, client_factory
         self.store = Store(data_dir / "muli.sqlite3")
         self.bus = EventBus(self.store)
+        self.system_events = SystemEvents(
+            self.store, self.bus, lambda: self.config.settings.system_events
+        )
+        # A private logger cannot capture another Runtime's data or alter global logging.
+        self._system_logger = logging.Logger("muli.runtime", logging.WARNING)
+        self._system_logger.propagate = False
+        self._system_logger.addHandler(logging.NullHandler())
+        self.system_logger: SystemLogger | None = None
         self.memory = Memory(self.store)
         self.reminders = Reminders(self.store, self.bus)
         self.conversation = Conversation(self.store)
@@ -248,7 +260,9 @@ class Runtime:
                     selected = self.task_control.replan_snapshot(session_id, identifier)
                 except ControlConflict:
                     self._selected_replans.pop(session_id, None)
-        prepared = PreparedRequest(session_id, [], execution, selected)
+        prepared = PreparedRequest(
+            session_id, [], execution, selected, self._reply_origin(session_id)
+        )
         token = self._request_context.set(prepared)
         try:
             try:
@@ -586,6 +600,7 @@ class Runtime:
         self._configure_workflows()
         self._configure_compaction()
         if self.started:
+            self.system_logger = await self.system_events.reconfigure()
             await self._start_mcp()
             await self.notifications.start()
 
@@ -595,6 +610,7 @@ class Runtime:
     async def startup(self) -> None:
         if self.started:
             return
+        self.system_logger = await self.system_events.start(self._system_logger)
         await self._start_mcp()
         await self.notifications.start()
         await self.reminders.start()
@@ -940,6 +956,16 @@ class Runtime:
             "mode": mode,
         }
         self.store.put("run", run)
+        # Bind suppression before the first await: input claiming itself can fail,
+        # before ingress receives this run_id. Such failures must not wake us again.
+        attention_origin = (
+            self.store.db.execute(
+                "SELECT 1 FROM ingress WHERE session_id=? AND state='pending' "
+                "AND json_extract(payload,'$.principal')='system:attention' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        )
         try:
             async with asyncio.timeout(self.config.settings.limits.max_run_seconds):
                 run["status"] = "running"
@@ -995,6 +1021,17 @@ class Runtime:
             raise
         except Exception as exc:
             run["status"] = "failed"
+            if self.system_logger is not None:
+                self.system_logger.error(
+                    "runtime_failed",
+                    extra={
+                        "muli_component": "runtime",
+                        "muli_code": "runtime_failed",
+                        "muli_run_id": run_id,
+                        "muli_session_id": session_id,
+                        "muli_notify": not attention_origin,
+                    },
+                )
             reason = (
                 str(exc)
                 if isinstance(exc, (ValueError, PermissionDenied, ProviderError))
@@ -1238,14 +1275,25 @@ class Runtime:
         return cast(dict[str, Any], json.loads(row[0])) if row is not None else None
 
     def _delivery_routes(self, session_id: str) -> list[dict[str, Any]]:
-        """Snapshot the latest trigger; a system notice never reuses an owner's channel."""
-        message = self._latest_main_trigger(session_id)
-        if message is None or message.get("principal") != "owner":
+        session = self.store.get("session", session_id) or {}
+        if session.get("kind") != "main":
             return []
-        route = message.get("route")
-        if not str(message.get("source", "")).startswith("channel:") or not isinstance(route, dict):
-            return []
-        return [route]
+        return self._reply_origin(session_id).delivery_routes()
+
+    def _reply_origin(self, session_id: str) -> ReplyOrigin:
+        agent = self.store.get("agent", session_id)
+        if agent is not None:
+            return ReplyOrigin.load(agent.get("reply_origin"))
+        # Read only provenance, never a potentially large historical message body.
+        row = self.store.db.execute(
+            "SELECT json_object('id',o.id,'source',json_extract(o.data,'$.source'),"
+            "'principal',json_extract(o.data,'$.principal'),'route',json_extract(o.data,'$.route'),"
+            "'reply_origin',json_extract(o.data,'$.reply_origin')) "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return ReplyOrigin.from_input(json.loads(row[0])) if row is not None else ReplyOrigin()
 
     async def _execute(
         self, session_id: str, run_id: str, role: str, mode: Mode, workflow_step: bool
@@ -1282,7 +1330,9 @@ class Runtime:
                 )
                 turn: ModelTurn | None = None
                 partial = ""
-                delivery_routes = self._delivery_routes(session_id)
+                delivery_routes = (
+                    prepared.reply_origin.delivery_routes() if session.get("kind") == "main" else []
+                )
                 trigger = self._latest_main_trigger(session_id)
                 round_tools = (
                     {name: tool for name, tool in tools.items() if tool.risk == "read"}
@@ -1318,6 +1368,7 @@ class Runtime:
                             partial,
                             interrupted=True,
                             delivery_routes=delivery_routes,
+                            reply_origin=prepared.reply_origin.dump(),
                         )
                         await self.bus.emit("message.completed", {"message": message}, session_id)
                     raise
@@ -1343,6 +1394,7 @@ class Runtime:
                     provider_data=turn.provider_data,
                     usage=asdict(turn.usage),
                     delivery_routes=delivery_routes,
+                    reply_origin=prepared.reply_origin.dump(),
                 )
                 await self.bus.emit("message.completed", {"message": message}, session_id)
                 if not turn.tool_calls:
@@ -1860,20 +1912,28 @@ class Runtime:
         self._close_task.result()
 
     async def _close_resources(self) -> None:
-        await self.extensions.close()
-        await self.compaction.close()
-        await self.team.close()
-        await self.reminders.close()
-        await self.workflows.close()
-        for task in list(self.tasks.values()):
-            task.cancel()
-        await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-        cancelled = await self.team._settle(list(self._session_finalizers))
-        await self.mcp.close()
-        await self.notifications.close()
+        drivers_settled = False
         try:
+            await self.extensions.close()
+            await self.compaction.close()
+            await self.team.close()
+            await self.reminders.close()
+            await self.workflows.close()
+            for task in list(self.tasks.values()):
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            cancelled = await self.team._settle(list(self._session_finalizers))
+            drivers_settled = True
+            await self.mcp.close()
+            await self.notifications.close()
             await self.computer.aclose()
         finally:
-            self.store.close()
+            try:
+                await self.system_events.close()
+            finally:
+                # Earlier failure can leave a producer with ownership of this DB.
+                # Stop the log observer regardless, but never close under live drivers.
+                if drivers_settled:
+                    self.store.close()
         if cancelled:
             raise asyncio.CancelledError

@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
+from collections.abc import Callable
 from typing import Any
 
 from muli.config import AttentionSettings
 from muli.runtime import Runtime
 from muli.store import now
+from muli.system_events import SystemEventsSettings, attention_source
 
 _HEADER = (
     "【系统注意事项｜本机可信事件，非用户消息或新授权】\n"
@@ -20,8 +21,13 @@ _HEADER = (
 
 
 class AttentionInbox:
-    def __init__(self, runtime: Runtime) -> None:
+    def __init__(
+        self,
+        runtime: Runtime,
+        system_settings: Callable[[], SystemEventsSettings] | None = None,
+    ) -> None:
         self.runtime, self.store, self.bus = runtime, runtime.store, runtime.bus
+        self._system_settings = system_settings
         self._task: asyncio.Task[None] | None = None
         self._closing = True
         self._generation = 0
@@ -97,81 +103,24 @@ class AttentionInbox:
         await self.close()
         await self.start()
 
-    def _record(self, event: dict[str, Any], policy: AttentionSettings) -> dict[str, Any] | None:
-        if event["session_id"] is not None:
+    def _record(
+        self,
+        event: dict[str, Any],
+        policy: AttentionSettings,
+        system_policy: SystemEventsSettings | None = None,
+    ) -> dict[str, Any] | None:
+        source = attention_source(self.store, event, policy.events, system_policy)
+        if source is None:
             return None
-        data = event["data"]
-        if not isinstance(data, dict):
-            return None
-        identifier = data.get("id")
-        if (
-            not isinstance(identifier, str)
-            or re.fullmatch(r"[A-Za-z0-9:._+\-]{1,160}", identifier) is None
-        ):
-            return None
-        if event["type"] == "notification.created":
-            notice = self.store.get("notification", identifier)
-            if notice is None or any(
-                data.get(field) != notice.get(field)
-                for field in ("id", "title", "content", "source", "reminder_id", "created_at")
-            ):
-                return None
-            kind = notice.get("source")
-            if kind not in {"reminder", "update"} or kind not in policy.events:
-                return None
-            if not isinstance(notice.get("title"), str) or not isinstance(
-                notice.get("content"), str
-            ):
-                return None
-            if kind == "reminder":
-                reminder_id = notice.get("reminder_id")
-                if not isinstance(reminder_id, str):
-                    return None
-                reminder = self.store.get("reminder", reminder_id)
-                if (
-                    reminder is None
-                    or not reminder.get("fired_count")
-                    or not identifier.startswith(f"reminder:{reminder_id}:")
-                ):
-                    return None
-            else:
-                update = self.store.get("update", "latest")
-                if (
-                    update is None
-                    or update.get("available") is not True
-                    or update.get("status") != "checked"
-                    or identifier != "update-" + str(update.get("latest", ""))
-                ):
-                    return None
-            detail = notice["title"] + "\n" + notice["content"]
-            logical_key = "notification:" + identifier
-        elif event["type"] == "management.completed" and "management" in policy.events:
-            plan = self.store.get("management", identifier)
-            if (
-                plan is None
-                or plan.get("status") not in {"completed", "failed"}
-                or plan.get("action") not in {"configure", "restart", "update"}
-                or any(data.get(field) != plan.get(field) for field in ("status", "action"))
-            ):
-                return None
-            kind = "management"
-            # Validation errors and snapshots can contain credentials. Only fixed status
-            # fields enter the model; the authenticated management UI retains diagnostics.
-            detail = json.dumps(
-                {"action": plan["action"], "status": plan["status"]}, ensure_ascii=False
-            )
-            logical_key = f"management:{identifier}:{plan['status']}"
-        else:
-            return None
-        receipt_id = hashlib.sha256(logical_key.encode("utf-8")).hexdigest()
+        receipt_id = hashlib.sha256(source.logical_key.encode("utf-8")).hexdigest()
         if self.store.get("attention_receipt", receipt_id) is not None:
             return None
         return {
             "receipt_id": receipt_id,
             "event_id": event["id"],
-            "kind": kind,
-            "record_id": identifier,
-            "detail": detail,
+            "kind": source.kind,
+            "record_id": source.record_id,
+            "detail": source.detail,
         }
 
     @staticmethod
@@ -212,6 +161,7 @@ class AttentionInbox:
 
     async def _consume(self) -> bool:
         policy = self.runtime.config.settings.attention.model_copy(deep=True)
+        system_policy = self._system_settings() if self._system_settings is not None else None
         if not policy.enabled:
             self._waiting = "disabled"
             return False
@@ -223,7 +173,9 @@ class AttentionInbox:
                 else "events"
             )
             return False
-        if policy.coalesce_seconds and any(self._record(event, policy) for event in events):
+        if policy.coalesce_seconds and any(
+            self._record(event, policy, system_policy) for event in events
+        ):
             self._waiting = "coalescing"
             await asyncio.sleep(policy.coalesce_seconds)
             events = self.store.events(self.cursor, limit=policy.batch_size)
@@ -234,7 +186,7 @@ class AttentionInbox:
             policy.max_chars, max(512, self.runtime.config.settings.limits.max_context_chars // 4)
         )
         for event in events:
-            record = self._record(event, policy)
+            record = self._record(event, policy, system_policy)
             if record is not None and record["receipt_id"] not in seen:
                 if len(self._content([*records, record])) > budget:
                     if records:
@@ -267,6 +219,7 @@ class AttentionInbox:
                 self._closing
                 or generation != self._generation
                 or policy != self.runtime.config.settings.attention
+                or (self._system_settings is not None and system_policy != self._system_settings())
             ):
                 raise ValueError("注意事项策略已改变")
 

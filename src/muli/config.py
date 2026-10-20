@@ -14,6 +14,8 @@ from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from muli.system_events import SystemEventsSettings
+
 
 class Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -519,6 +521,7 @@ class Settings(Section):
     chiliarch: Chiliarch = Field(default_factory=Chiliarch)
     notifications: DesktopNotifications = Field(default_factory=DesktopNotifications)
     attention: AttentionSettings = Field(default_factory=AttentionSettings)
+    system_events: SystemEventsSettings = Field(default_factory=SystemEventsSettings)
     limits: Limits = Field(default_factory=Limits)
     server: Server = Field(default_factory=Server)
     disabled_tools: list[str] = Field(default_factory=list)

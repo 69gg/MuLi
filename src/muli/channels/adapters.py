@@ -9,6 +9,7 @@ import math
 import re
 import time
 from collections.abc import Mapping
+from pathlib import PurePath
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -31,6 +32,8 @@ def identifier(value: Any) -> str:
 
 
 class Adapter:
+    voice_mime_types: frozenset[str] = frozenset()
+
     def __init__(self, profile: ChannelProfile, client: httpx.AsyncClient) -> None:
         self.profile, self.http = profile, ChannelHTTP(client, profile)
         self.delivery_started = False
@@ -41,6 +44,15 @@ class Adapter:
 
     def endpoint(self, path: str) -> str:
         return self.profile.base_url.rstrip("/") + "/" + path.lstrip("/")
+
+    def validate_media(self, file: FileContent) -> None:
+        if file.media_mode not in {"file", "voice"}:
+            raise ChannelError("渠道 media_mode 仅支持 file 或 voice")
+        if file.media_mode == "voice":
+            if not self.voice_mime_types:
+                raise ChannelError("当前渠道适配器不支持原生语音发送")
+            if file.mime_type not in self.voice_mime_types:
+                raise ChannelError("当前渠道不支持此语音格式；请显式使用文件模式或兼容音频")
 
     async def poll(self, cursor: str) -> PollBatch:
         raise ChannelError("此渠道使用签名 webhook 接收")
@@ -77,6 +89,19 @@ class Adapter:
 
 
 class Telegram(Adapter):
+    voice_mime_types = frozenset({"audio/mpeg", "audio/mp4", "audio/ogg"})
+
+    def validate_media(self, file: FileContent) -> None:
+        super().validate_media(file)
+        if file.media_mode != "voice":
+            return
+        if len(file.data) > 50 * 1024 * 1024:
+            raise ChannelError("Telegram 原生语音超过 50 MiB")
+        if file.mime_type == "audio/ogg" and not (
+            file.data.startswith(b"OggS") and b"OpusHead" in file.data[:512]
+        ):
+            raise ChannelError("Telegram 原生 Ogg 语音需要 Opus 编码；不会自动转码")
+
     def ready(self) -> None:
         super().ready()
         if not self.profile.secret("token"):
@@ -173,17 +198,32 @@ class Telegram(Adapter):
         key: str,
         sequence: int,
     ) -> str:
+        if file is not None:
+            self.validate_media(file)
         self.delivery_started = True
         if file is None:
             result = await self.call(
                 "sendMessage", delivery=True, json={"chat_id": route["target"], "text": text}
             )
         else:
+            voice = file.media_mode == "voice"
+            field_name = "voice" if voice else "document"
+            filename = (
+                str(
+                    PurePath(file.name).with_suffix(
+                        {"audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/mpeg": ".mp3"}[
+                            file.mime_type
+                        ]
+                    )
+                )
+                if voice
+                else file.name
+            )
             result = await self.call(
-                "sendDocument",
+                "sendVoice" if voice else "sendDocument",
                 delivery=True,
                 data={"chat_id": route["target"]},
-                files={"document": (file.name, file.data, file.mime_type)},
+                files={field_name: (filename, file.data, file.mime_type)},
             )
         message_id = identifier(object_value(result).get("message_id"))
         if not message_id:
@@ -210,6 +250,10 @@ class Telegram(Adapter):
 
 
 class OneBot(Adapter):
+    voice_mime_types = frozenset(
+        {"audio/mpeg", "audio/wav", "audio/ogg", "audio/flac", "audio/mp4", "audio/webm"}
+    )
+
     def authenticate(self, raw: bytes, headers: Mapping[str, str]) -> None:
         secret = self.profile.secret("webhook_secret")
         expected = "sha1=" + hmac.new(secret.encode("utf-8"), raw, hashlib.sha1).hexdigest()
@@ -291,8 +335,23 @@ class OneBot(Adapter):
     ) -> str:
         group = route["kind"] == "group"
         parameters: dict[str, Any] = {"group_id" if group else "user_id": route["target"]}
+        voice = file is not None and file.media_mode == "voice"
+        if file is not None:
+            self.validate_media(file)
         if file is None:
             parameters["message"] = [{"type": "text", "data": {"text": text}}]
+            action = "send_group_msg" if group else "send_private_msg"
+        elif voice:
+            capability = object_value(await self.call("can_send_record", {}))
+            if capability.get("yes") is not True:
+                raise ChannelError("OneBot 实现未确认可发送语音；不会自动改成文件")
+            assert file is not None
+            parameters["message"] = [
+                {
+                    "type": "record",
+                    "data": {"file": "base64://" + base64.b64encode(file.data).decode("ascii")},
+                }
+            ]
             action = "send_group_msg" if group else "send_private_msg"
         else:
             # NapCat's file upload action accepts base64://, without a shared host path.
@@ -302,7 +361,10 @@ class OneBot(Adapter):
             action = "upload_group_file" if group else "upload_private_file"
         self.delivery_started = True
         result = await self.call(action, parameters, delivery=True)
-        return identifier(object_value(result).get("message_id")) or key
+        message_id = identifier(object_value(result).get("message_id"))
+        if voice and not message_id:
+            raise ChannelError("OneBot 语音发送确认缺少消息 ID", uncertain=True)
+        return message_id or key
 
     async def download(self, file: RemoteFile, route: dict[str, Any]) -> FileContent:
         url = file.url
@@ -456,6 +518,8 @@ class QQ(Adapter):
         key: str,
         sequence: int,
     ) -> str:
+        if file is not None:
+            self.validate_media(file)
         if route.get("reply_to") and sequence >= 5:
             raise ChannelError("QQ 同一被动消息的五次回复预算已用完")
         prefix = (

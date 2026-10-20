@@ -8,7 +8,23 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
+
+
+@contextmanager
+def isolated_home() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="muli-wheel-data-") as directory:
+        root = Path(directory)
+        with patch.dict(
+            os.environ,
+            MULI_HOME=str(root),
+            MULI_CONFIG=str(root / "config.json"),
+            MULI_DATA_DIR=str(root / "data"),
+        ):
+            yield root
 
 
 async def check_installed(target: Path) -> None:
@@ -24,8 +40,7 @@ async def check_installed(target: Path) -> None:
     assert Path(atspi_helper.__file__).resolve().is_relative_to(target.resolve())
     assert Path(ax_helper.__file__).resolve().is_relative_to(target.resolve())
     assert Path(ax_lease.__file__).resolve().is_relative_to(target.resolve())
-    with tempfile.TemporaryDirectory(prefix="muli-wheel-data-") as directory:
-        root = Path(directory)
+    with isolated_home() as root:
         config = ConfigFile(root / "config.json")
         config.update({"updates": {"check_on_start": False}})
         app = create_app(config, root / "data")
@@ -100,7 +115,11 @@ def main() -> None:
             ],
             check=True,
         )
-        environment = dict(os.environ, PYTHONPATH=str(target))
+        # Automatic extension discovery must never inspect the user's real home
+        # during a package smoke test, including when it contains enabled MCP.
+        environment = dict(
+            os.environ, PYTHONPATH=str(target), MULI_HOME=str(Path(directory) / "home")
+        )
         subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--installed", str(target)],
             cwd=directory,
