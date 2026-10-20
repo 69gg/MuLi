@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from muli.config import VoiceSettings
+from muli.maintenance import Admission
 from muli.media import MediaService
 from muli.platforms.files import LocalFiles, artifact
 from muli.process import run_process
@@ -269,8 +270,10 @@ class VoiceWorker:
         speaker: AcousticDetector | None = None,
         player: Player | None = None,
         on_status: VoiceCallback | None = None,
+        admission: Admission | None = None,
     ) -> None:
         self.config, self.media, self.on_text = config, media, on_text
+        self.admission = admission or Admission()
         self.files = LocalFiles(data_dir / "voice", config.max_file_bytes, config.max_total_bytes)
         self.recorder = recorder or SystemRecorder(config, self.files)
         self.wake = wake or CommandDetector(config, "wake")
@@ -360,7 +363,11 @@ class VoiceWorker:
         nested = task in self._operations
         self._operations.add(task)
         try:
-            yield
+            await self.admission.wait()
+            if self._closed or self._stopping:
+                raise ValueError("语音服务已关闭" if self._closed else "语音服务正在停止")
+            with self.admission.operation():
+                yield
         finally:
             if not nested:
                 self._operations.discard(task)
@@ -602,6 +609,7 @@ class VoiceWorker:
         while self.config.enabled and self._task is asyncio.current_task():
             try:
                 await self.listen_once()
+                await asyncio.sleep(0)  # Let a maintenance request claim the safe cycle boundary.
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

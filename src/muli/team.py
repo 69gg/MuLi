@@ -144,6 +144,7 @@ class TeamManager:
         return agent
 
     def _admit(self) -> None:
+        self.runtime.maintenance.admission.require()
         if self._closed:
             raise ValueError("团队正在关闭")
         count = self.runtime.store.db.execute(
@@ -352,7 +353,7 @@ class TeamManager:
         return self.get(agent["id"])
 
     def start(self) -> None:
-        if self._closed or self.runtime._closing:
+        if self._closed or self.runtime._closing or not self.runtime.maintenance.admission.allowed:
             return
         after = 0
         limit = self.runtime.config.settings.limits.max_pending_runs
@@ -375,6 +376,10 @@ class TeamManager:
                 self._active[agent["id"]] = task
                 self._tasks.add(task)
                 task.add_done_callback(self._done)
+
+    @property
+    def idle(self) -> bool:
+        return not self._tasks and not self._stopping_tasks
 
     def _paused_scope(self, session_id: str) -> tuple[str, int] | None:
         control = self.runtime.task_control

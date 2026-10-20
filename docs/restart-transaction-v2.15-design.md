@@ -1,6 +1,6 @@
 # Linux 同版本配置／重启事务：首片接口设计
 
-状态：2026-10-21 整体设计已通过根任务和独立静态复审；第一块纯 journal／可注入 backend 的单步控制者已完成 60 项离线回归（31 journal、29 controller，分两轮定向验证），并通过独立代码复审。尚无真实 Linux backend、CLI、准入门或产品接线，未连接 systemd、未运行服务或模型。基于 `368efc5` 阅读当前实现，并核对根任务工作区的[跨进程恢复总设计](/data0/MuLi/docs/recoverable-management-design.md)与其 2.14 配置关闭屏障修复。本片不包含 A/B 安装、uv 下载、程序更新或数据库回滚。
+状态：2026-10-21，整体设计与第一块纯 journal／单步控制者已通过独立复审及 60 项离线回归。第二块已接入真实 Runtime、应用生命周期、维护门和固定 nonce 路由，并通过临时库与假组件回归；第三块的真实 Linux 服务控制者、CLI bootstrap 与管理事务提交／投影仍未接通。因此尚不能通过现有 self_restart 取得可恢复重启，也未实测 systemd、中断或恢复成功率。最初基于 `368efc5` 研究，第二块已合入主动通知 A，保留其来源和投递语义。总目标参见[跨进程恢复总设计](recoverable-management-design.md)。不包含 A/B 安装、uv 下载、程序升级或数据库回滚。
 
 ## 第一块的实际边界
 
@@ -14,9 +14,61 @@
 
 单步推进在观察前后使用同一 deadline 检查，总期限耗尽不得补写成功。时钟倒拨无法确认预算时，提交前进入 recovery_required，决定已持久时标 blocked，不自动回退。准备／排空只针对仍使用 base、running 且 boot 为 origin 的原实例；其它观察进入 recovery_required，不向它发 resume。提交或回退决定后若实例更换，可在原 deadline 内用同代 nonce 的新 boot 证明重新绑定并确认放行，不重置预算、不重复启动、不撤销提交。显式当前实例失败优先于同次观察中矛盾的 released proof，不能据此解决事务。主动取消驱动只留下已持久 intent，后继先观察；启动命令是否执行不明确时不盲目重发。
 
-本片验证使用临时目录、注入时钟、内存服务和文件错误，不证明掉电后的文件系统行为、真实进程被杀后的接管、systemd 生命周期、监听入口 nonce 或运行中执行门。第二块／第三块尚未开始，不能将本片标作“已实现可恢复重启”。
+第一块验证使用临时目录、注入时钟、内存服务和文件错误，不证明掉电后的文件系统行为、真实进程被杀后的接管或 systemd 生命周期。第二块新增的本地握手与执行门证据见下，仍不能将两块标作“已实现可恢复重启”。
 
-已通过根 check_local 串行执行四个新 Python 文件的 Ruff format/check、两个新源码的严格 mypy（follow-imports=silent），以及 `tests/test_management_transaction.py tests/test_management_controller.py` 首轮 56 项回归。独立复审补充失败优先级四项后，只复验变更的 controller 文件，最终 29 项通过；未变化的 journal 首轮 31 项结果继续有效，共 60 项。pytest 峰 60.6 MiB，mypy 峰 193.5 MiB，swap 均为 0；单次 1 GiB／共享 2 GiB／单 CPU／180 秒保护已由内核核验。没有运行整库或真实 Runtime／服务验收。
+已通过根 check_local 串行执行四个新 Python 文件的 Ruff format/check、两个新源码的严格 mypy（follow-imports=silent），以及 `tests/test_management_transaction.py tests/test_management_controller.py` 首轮 56 项回归。独立复审补充失败优先级四项后，只复验变更的 controller 文件，最终 29 项通过；未变化的 journal 首轮 31 项结果继续有效，共 60 项。pytest 峰 60.6 MiB，mypy 峰 193.5 MiB，swap 均为 0；单次 1 GiB／共享 2 GiB／单 CPU／180 秒保护已由内核核验。第一块没有运行整库或真实 Runtime／服务验收。
+
+## 第二块：已实现的维护门与被动启动
+
+`maintenance.py` 提供 `BootPermit`、`Maintenance` 和单事件循环的 `Admission`；`maintenance_api.py` 只安装四个固定握手路由。未带 permit 的既有服务保持原启动行为，私有事务接口返回 transaction_unavailable。第三块必须在读取 ConfigFile、构造 Store 之前取得 permit，不能给已经打开真实库的进程补发一份许可：
+
+```python
+BootPermit.acquire(journal, config_path, *, boot, installation, service)
+Runtime(config, data_dir, *, boot_permit=permit)
+create_app(config, data_dir, *, boot_permit=permit, maintenance_clock=clock)
+```
+
+这几个签名是替代构造入口：给 create_app 传入现成 Runtime 时，不再重复传 permit。journal 的目录 FD 与 writer lease 保留整个实例寿命；应用实际组件／Store 收尾之后才释放 lease。安装、服务摘要和可信 ClockReading 来自尚待接通的宿主核验，不能由 HTTP 请求自报。
+
+BootPermit 先取得规范化 DB 路径的固定 writer lease，再读当前 journal。未解决代仅接受明确 start_target／verifying／committed 或 start_base／verify_base／rolled_back 许可，校验安装、服务、精确配置字节摘要和只读 SQLite 的 store_instance/main_session；拒绝复用 origin boot、错误库、错误配置或未发启动意图。Runtime 在 Store 构造前复核路径。被动启动只做本地建模、既有恢复校正和 DB 身份核验；不加载 MCP／插件、不启动通知、提醒、记忆提炼、渠道 poll、语音、chiliarch、版本检查或模型。渠道旧 sending 本地标 unknown；记忆旧 processing 本地回 queued，不自动推断已执行工具、重发消息或回滚 DB。
+
+执行准入采用自然空闲边界。prepared／waiting 阶段只冻结普通配置写入，现有服务仍可开始正常工作，**waiting 不表示已暂停新 claim**。drain 在既有 configuration_lock 内同步检查全部实际 owner；只有前台、团队、工作流与 finalizer、compaction、管理应用／版本检查、记忆回填、onboarding、Portal probe 和已领取外部效果都空闲，才在无 await 的同一步关闭门并返回 drained。持续输入／语音等流量可能始终无法自然空闲；控制者必须遵循原 deadline，超时保留原服务，不强杀工作或伪称排空。没有在持配置锁期间等待工作，也没有增加 parent→child 准入继承机制。
+
+drained 之后才阻止新模型／工具运行和新发送领取。已进入的实际 Task 以 finally 收尾，不把计数写零代替排空证据：
+
+| 拥有者 | 实际边界 |
+| --- | --- |
+| Runtime／team／workflow／compaction | 运行 Task、会话 finalizer、团队 stop task、工作流 driver 与取消 fallback；终态已存但通知未完成仍不空闲 |
+| Admission effects | HTTP 效果 handler、summary、记忆提炼 job、通知发送、提醒交付、chiliarch 业务 sender、渠道文件下载／一段发送、一次语音采集至 ASR／提示／回调 TTS |
+| PersonalIO | shield 的 Portal probe 由 capture 持有，观察者取消不丢失句柄；关闭等待实际回收 |
+| 应用本地任务 | 记忆回填、管理应用与启动版本检查、延后的 onboarding 采用真实 Task，而非常驻 worker 的存活计数 |
+
+主人文字和审计过的本地查询继续可用：输入持久排队而不启动模型。正常旧实例允许签名渠道文字入站，渠道附件下载等待门；等待不消耗下载 attempt。只读长轮询等待及 chiliarch ACK／heartbeat 属于协议控制流，不被宣称为业务执行已清零；drained 不代表 HTTP 连接或控制帧为零。它们仍由原组件 close 强拥有收尾。probation 不启动这些外部接收器，也不接受渠道 webhook。外发 pending／retry、内存通知与管理候选保留；门释放后由事件一次唤醒，Attention 不依赖新 bus 事件才能处理暂停期间的事实。
+
+无可核验生命周期／idle 合同的 Python legacy 插件不参与事务：检测到已加载／失败插件，或启用插件功能且发现未在 settings.plugins.disabled 中排除的带 plugin.json 包候选，返回 maintenance_unsupported/legacy_plugins。即使 manifest 内 enabled=false，也保守拒绝这类未显式 disabled 的候选；不导入来探测、不卸载原插件，旧服务保持运行。这不是插件后台任务的通用生命周期引擎。
+
+### 固定内部握手与放行
+
+| 方法／路径 | 请求与限制 |
+| --- | --- |
+| POST /api/internal/management/drain | JSON generation、boot；仅本代 origin + draining；返回 waiting 或带真实 owner receipt 的 drained |
+| POST /api/internal/management/resume | 同样两个字段；仅 origin + prepared／aborted 且 base 配置未切换；释放一次 |
+| GET /api/internal/management/readiness | query generation、boot；已 seal 的被动 target／base 返回 core_ready 与 paused／blocked／released 证明；原 boot 也可在准备／排空／停止原实例的精确窗口只读观察实际门状态 |
+| POST /api/internal/management/activate | JSON generation、boot；target 必须 committed，base 必须 rolled_back，health 绑定当前 boot，blocked 不自动重试 |
+
+四条精确 method/path 用 X-MuLi-Nonce 代替 Cookie；其他 API 不豁免。保留 Host、同源、JSON 类型、请求体上限，schema 拒绝 path、command、配置正文等额外字段。nonce 与 proof 只在私有握手中传输，不进入公开管理对象、日志或 SSE。
+
+原实例的 readiness 只接受 prepared／draining／aborted、activating+stop_base 或 rolling_back+stop_target，使用原 challenge、base 摘要和 origin boot；返回 paused 前同步复核全部 owner 与 effects 确实空闲。控制者仅在 prepared／draining 把原实例证明解释为 resumed／drained，其余停止窗口只用于重新核对原实例身份，不缓存先前 POST 响应。原 boot 始终不能通过 TransactionRecord.accepts 成为目标／回退新实例的健康证明；drain／resume 动作的阶段限制不变。
+
+激活前先成功 fsync journal 目录并重读同一记录；强拥有 activation Task 在首次外部 await 之前、组件启动之后和放行前再次校验阶段、当前 boot、配置、blocked 与原 deadline。观察者取消不终止它；同 boot 失败不会重复执行启动。release 回调失败同样使本地证明 blocked 并重新关门；已发生的外部效果不能撤销，不能据此承诺回滚。新 boot 续接必须先由控制者按第一块合同持久重绑 pending，不接受宿主自解 blocked。
+
+组件在 committed／rolled_back 后启动，放行 receipt 另行持久后才 resolved。onboarding 可能修改配置，其任务延后到 resolved 再执行，避免启动过程中改变目标摘要；它保留既有幂等输入 ID，并纳入后续 drain 的真实 owner。配置与扩展写入从 prepared 到 resolved 都返回 transaction_in_progress；已排队管理计划保留 target，扩展 watcher 保留 dirty。
+
+Maintenance.reconcile 只对齐进程内唤醒提示，配置权威始终是当前 journal。宿主 prepare 后调用一次，正常控制者持久 released／resolved 后再请求一次 readiness 立即通知。若控制者正好在最后 GET 前退出，已有配置准入、主会话唤醒或下次已认证 HTTP 入口会重读 journal、对齐提示并唤醒等待者；不产生另一种持久未完成状态，也没有文件轮询框架。私有握手先验证并形成 proof，再触发 reconcile，避免提示任务先改动配置。普通自配置与旧 self_restart 的用户接口尚未切换到事务入口，这是第三块的接线范围。
+
+第二块新增四个 maintenance 测试文件，49 项离线用例已有 guard 通过证据。临时 Runtime + ASGITransport 覆盖完整 commit→activate→finalize、nonce／原实例重入观察、被动无外部启动、配置门、真实尾任务、取消与队列保留；真实激活回归修复了 private readiness 前提前 reconcile 的调度窗。首次新 HTTP fake 路由误置静态 mount 后已中止该检查并修正 fixture，没有循环重跑。
+
+本轮按相关文件串行验证，49 项新增及 524 项既有用例均取得通过证据，共 573 个唯一用例：第一组 359 项全过，第二组 204 项通过；集成替身补齐新增 Maintenance 合同后，该文件 13 项复验全过；原实例观察新增两项及受影响 API 合计 31 项另组全过。26 个 Python 文件 Ruff format/check、21 个受影响源码严格 mypy 与 diff 检查通过，pytest 峰 419 MiB、mypy 峰 150 MiB，swap 0，未提高 guard 限制。本片未跑整库，未启动 systemd、设备、外部模型或真实集成，未取得真实可恢复重启证据。
 
 ## 交付范围与入口
 
@@ -43,8 +95,8 @@
 | `runtime.py:startup` 与 `server.py:lifespan` | 会立即读扩展、启动通知／提醒、唤醒 pending、加载插件并启动各集成；必须拆出被动准备与提交后的激活 |
 | `runtime.py:_wake_main`、`team.py:_deliver_report` | 内部唤醒不都受 configuration_lock 约束，必须检查明确的维护准入状态；不能把锁是否 locked 当作禁止执行标记 |
 | `runtime.py:busy`、`_session_finalizers` | busy 之外还有 driver 最后通知和报告交接；首片复用真实拥有者，不用 session.status 或最近事件猜空闲 |
-| `channels/manager.py:_outbox/start` | 发送前有独立 sending claim；启动将旧 sending 标 unknown。需暂停新 claim、等待已 claim 的发送收尾，再交接，不能关闭后盲重发 |
-| `notifications.py:_send` 与 `reminders.py:_fire` | 新通知、提醒会产生外部效果或新的宿主事件，probation 不启动，draining 停止领取新的发送 |
+| `channels/manager.py:_outbox/start` | 发送前有独立 sending claim；启动将旧 sending 标 unknown。等待全部 owner 自然空闲后原子关门并确认 drained，随后停止新 claim；不能关闭后盲重发 |
+| `notifications.py:_send` 与 `reminders.py:_fire` | 新通知、提醒会产生外部效果或新的宿主事件，probation 不启动，drained 后停止领取新的发送；waiting 仍可正常领取 |
 | `store.py:Store.__init__/instance_id` | 构造会建表、索引与迁移；已有 store_instance_v1 可作资料库身份，不能把构造当无副作用预检 |
 
 根任务已修复 2.14 的进程内 apply/rollback 强拥有与 lifespan 关闭屏障；首片保留这些路径，不重新实现一遍。
@@ -134,7 +186,7 @@ class MaintenanceAdmission:
 ## 一次事务的握手
 
 1. 应用校验候选并采集 unit、实际绑定地址、安装、config/data/Store/main 身份；在配置锁内复核 base 与当前设置一致，短暂取得 journal 锁落 prepared。返回同一事务的 accepted 摘要；重复请求以 plan/request ID 幂等，不创建第二个并行事务。控制者接管后才成为阶段唯一写者，主进程只投影和处理受限命令。
-2. 控制者确认自身硬限、持锁身份和剩余总时限，先落 draining intent，再用私有 nonce 请求旧实例排空。请求快速返回 waiting/draining/drained；有界观察接口供控制者确认，不用一条长 HTTP 请求拥有整个排空操作。旧实例强拥有一个同代 drain task，重复请求只读该任务状态。
+2. 控制者确认自身硬限、持锁身份和剩余总时限，先落 draining intent，再用私有 nonce 请求旧实例检查自然空闲。请求快速返回 waiting/drained；waiting 时原服务继续执行，不承诺最终能自然空闲。每次请求只同步核对实际 owner，不用一条长 HTTP 请求拥有整个等待，也不另造 drain task。
 3. 排空到达安全边界后，旧实例确认配置／启动身份仍匹配并关闭准入，给出带本次 boot 身份的 receipt。只有当前运行族群、finalizer、handoff 与已领取发送均收尾，receipt 才是 drained。正常路径须确认发起管理工具的结果已经持久化；若先前进程已硬退出，只能保留其 unknown 历史，不凭事务结果伪造原工具回执。
 4. 控制者落 stop intent，停止旧 unit，观察 job、InvocationID、cgroup 与 writer lease；确认旧 writer 已退出后，持久目标配置与对应 boot permit，再启动同一 unit。stop/start 的 accepted 与实际退出／就绪分开记录。旧进程自然崩溃、目标自动重启或 controller 重入都先观察事实再决定下一步。
 5. 新实例启动前的 guard 验证本代许可，进入 probation。正确 nonce 的 HTTP 本地健康证明通过后，控制者持久 committed，再发幂等 activate 提示或让 probation 的有界观察任务读取到提交；实际放行另有 receipt。

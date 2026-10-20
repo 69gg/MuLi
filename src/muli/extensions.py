@@ -356,6 +356,7 @@ class Extensions:
 
     async def apply_locked(self, target: Settings, *, persist: bool) -> None:
         """The owner holds configuration_lock; recheck internal wakeups before publishing."""
+        self.runtime.maintenance.require_configuration()
         if self._closed or self.runtime._closing:
             raise ExtensionError("runtime_closed")
         if self.runtime.busy:
@@ -385,6 +386,7 @@ class Extensions:
                     raise ExtensionError("runtime_closed")
                 if self.runtime.busy:
                     raise ExtensionError("runtime_busy")
+                self.runtime.maintenance.require_configuration()
                 # No await between persistence and publication. Everything below is prevalidated.
                 if persist:
                     try:
@@ -416,7 +418,7 @@ class Extensions:
         except Exception as exc:
             if candidate is not None and not published:
                 await self.runtime.mcp.discard(candidate)
-            if isinstance(exc, ExtensionError) and exc.code == "runtime_busy":
+            if getattr(exc, "code", None) in {"runtime_busy", "transaction_in_progress"}:
                 self._refresh.update(refresh)
             raise self._failure(exc) from exc
 
@@ -432,21 +434,29 @@ class Extensions:
                 except Exception as exc:
                     self._failure(exc)
             if self._dirty and asyncio.get_running_loop().time() >= self._ready_at:
-                if self.runtime.busy:
+                if self.runtime.busy or self.runtime.maintenance.configuration_blocked:
                     self.phase = "queued"
                 else:
                     async with self.runtime.configuration_lock:
-                        if not self.runtime.busy and not self._closed:
+                        if (
+                            not self.runtime.busy
+                            and not self._closed
+                            and not self.runtime.maintenance.configuration_blocked
+                        ):
                             self._dirty = False
                             try:
                                 await self.apply_locked(self.runtime.config.settings, persist=False)
                             except ExtensionError as exc:
-                                if exc.code == "runtime_busy":
+                                if exc.code in {"runtime_busy", "transaction_in_progress"}:
                                     self._dirty = True
                                     self.phase, self._error = "queued", None
             self._wake.clear()
             interval = settings.extensions.scan_interval_seconds
-            if self._dirty and not self.runtime.busy:
+            if (
+                self._dirty
+                and not self.runtime.busy
+                and not self.runtime.maintenance.configuration_blocked
+            ):
                 interval = min(
                     interval,
                     max(0.01, self._ready_at - asyncio.get_running_loop().time()),
@@ -455,6 +465,9 @@ class Extensions:
                 await asyncio.wait_for(self._wake.wait(), timeout=interval)
             except TimeoutError:
                 pass
+
+    def wake(self) -> None:
+        self._wake.set()
 
     async def close(self) -> None:
         self._closed = True

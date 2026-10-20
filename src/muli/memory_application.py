@@ -29,13 +29,16 @@ class MemoryApplication:
     def _pipeline(self) -> MemoryPipeline:
         settings = self.runtime.config.settings
         configured = settings.models.main.configured or settings.models.memory_extractor.configured
-        return MemoryPipeline(
+        pipeline = MemoryPipeline(
             self.runtime.memory,
             self.runtime.bus,
             extractor=self.extract if configured else None,
             media=self.media,
             config=MemoryPipelineConfig(**settings.memory.model_dump()),
+            admission=self.runtime.maintenance.admission,
         )
+        pipeline.recover()
+        return pipeline
 
     def ingest(self, message: dict[str, Any], trusted_owner: bool) -> None:
         # Quarantined strangers cannot trigger background inference or alter owner memory.
@@ -43,6 +46,11 @@ class MemoryApplication:
             self.pipeline.ingest(message, trusted_owner=True)
 
     async def extract(self, source: dict[str, Any]) -> dict[str, Any]:
+        await self.runtime.maintenance.admission.wait()
+        with self.runtime.maintenance.admission.operation():
+            return await self._extract_admitted(source)
+
+    async def _extract_admitted(self, source: dict[str, Any]) -> dict[str, Any]:
         profile = self.runtime.model_config("memory_extractor")
         profile = replace(profile, max_output_tokens=min(profile.max_output_tokens, 4096))
         instructions = (
@@ -75,6 +83,10 @@ class MemoryApplication:
     async def start(self) -> None:
         await self.pipeline.start()
         self._recovery = asyncio.create_task(self._recover())
+
+    @property
+    def idle(self) -> bool:
+        return self._recovery is None or self._recovery.done()
 
     async def _recover(self) -> None:
         if not self.runtime.config.settings.memory.enabled:

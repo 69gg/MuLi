@@ -116,6 +116,10 @@ class Capture:
             await asyncio.gather(self._probe_task, return_exceptions=True)
             self._probe_task = None
 
+    @property
+    def idle(self) -> bool:
+        return self._probe_task is None or self._probe_task.done()
+
     def _mac_video_device(self) -> str:
         video, separator, audio = self.config.device.partition(":")
         if not video or (separator and audio != "none"):

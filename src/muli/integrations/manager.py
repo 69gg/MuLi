@@ -138,6 +138,7 @@ class IntegrationManager:
         self.bridge = None
 
     async def pair(self, code: str, name: str | None = None) -> dict[str, Any]:
+        self.runtime.maintenance.require_configuration()
         if self._active:
             raise ValueError("请先停止 chiliarch 任务再更换身份")
         await self.close()
@@ -359,6 +360,7 @@ class IntegrationManager:
     async def _worker(self) -> None:
         while not self._closing:
             await self._work.wait()
+            await self.runtime.maintenance.admission.wait()
             self._work.clear()
             if self._closing:
                 break
@@ -384,6 +386,10 @@ class IntegrationManager:
         if not task.cancelled() and task.exception() is not None:
             self.last_error = "chiliarch 任务记录失败，重启后需核查状态"
         self._work.set()
+
+    @property
+    def idle(self) -> bool:
+        return not self._active
 
     async def _settle_cancelled(self, record: dict[str, Any], session_id: str | None) -> None:
         if session_id is not None:
@@ -463,12 +469,16 @@ class IntegrationManager:
         delay = self.bridge.config.reconnect_initial_seconds
         while not self._closing:
             await self._outgoing.wait()
+            await self.runtime.maintenance.admission.wait()
             self._outgoing.clear()
             for record in self._records("chiliarch_outbox"):
                 if self._closing:
                     return
+                await self.runtime.maintenance.admission.wait()
                 try:
-                    await self.bridge.send(Envelope.from_dict(record["envelope"]))
+                    with self.runtime.maintenance.admission.operation():
+                        await self.bridge.send(Envelope.from_dict(record["envelope"]))
+                        self.store.delete("chiliarch_outbox", record["id"])
                 except (httpx.TransportError, ChiliarchConnectionError):
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, self.bridge.config.reconnect_max_seconds)
@@ -479,7 +489,6 @@ class IntegrationManager:
                     self.bridge.stop()
                     return
                 else:
-                    self.store.delete("chiliarch_outbox", record["id"])
                     delay = self.bridge.config.reconnect_initial_seconds
             if self._records("chiliarch_outbox"):
                 self._outgoing.set()

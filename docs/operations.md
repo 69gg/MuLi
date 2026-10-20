@@ -64,6 +64,8 @@ Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用�
 
 服务管理按当前系统选择 systemd 用户服务、macOS LaunchAgent 或 Windows 当前用户计划任务。install 只安装，enable 只管理登录自动启动；start、stop、restart 分开执行。不会使用管理员权限或创建系统级服务。Windows 必须有当前 Python 环境对应的 pythonw.exe，避免弹出控制台；服务内重启由独立的一次性计划任务执行，避免结束发起者后无法再启动。macOS / Windows 日志保存至 logs/service.log，单份最多 1 MiB 并保留一个轮转文件。实际平台验证范围见 [平台能力](platforms.md)。
 
+Linux 同版本恢复切片已接入内部维护门、被动启动和 nonce 健康证明，但服务控制者、serve bootstrap 与管理事务入口尚未接通。当前 service/self_restart 返回值仍不能证明跨进程恢复成功，未修改既有 unit 或安装路径。维护 waiting 的定义是等待完整自然空闲，只有 drained 后才暂停新执行；现有 owner 不收尾时有限超时保留原服务。实现与离线验证边界见[恢复切片](restart-transaction-v2.15-design.md#第二块已实现的维护门与被动启动)。
+
 交互 `MuLi init` 在配置成功后依次请求 install、enable、start，报告已完成步骤；启动请求被接受不等于服务已健康。`--no-service` 或 `--defaults` 跳过这一步，开发环境建议使用 `MuLi init --no-source --no-service`。启动失败时配置仍保留，可查看 `MuLi service status` 或使用 `MuLi serve` 诊断。
 
 管理服务默认监听回环地址。绑定非回环地址必须配置访问密码；登录使用 HttpOnly、SameSite=Strict cookie，API 拒绝跨源变更与不合法 Host。密码和监听地址可在初始化或设置中配置；外部访问仍需自行提供合适的 HTTPS 入口。

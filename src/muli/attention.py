@@ -259,6 +259,10 @@ class AttentionInbox:
             routing=routing,
         )
         if receipt is None:
+            if not self.runtime.maintenance.admission.allowed:
+                self._waiting = "maintenance"
+                await self.runtime.maintenance.admission.wait()
+                return True
             # Work can start while admission waits for the config lock. Nothing
             # was committed; wait for a real execution task or the report/event bus.
             return await self._wait_for_work()

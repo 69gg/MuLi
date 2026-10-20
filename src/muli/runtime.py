@@ -25,6 +25,7 @@ from muli.events import EventBus
 from muli.evidence import EvidenceError
 from muli.extensions import Extensions
 from muli.history_evidence import HistoryEvidence
+from muli.maintenance import BootPermit, Maintenance
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -76,9 +77,17 @@ class PreparedRequest:
 
 class Runtime:
     def __init__(
-        self, config: ConfigFile, data_dir: Path, client_factory: ClientFactory = ModelClient
+        self,
+        config: ConfigFile,
+        data_dir: Path,
+        client_factory: ClientFactory = ModelClient,
+        *,
+        boot_permit: BootPermit | None = None,
     ) -> None:
         self.config, self.data_dir, self.client_factory = config, data_dir, client_factory
+        if boot_permit is not None:
+            boot_permit.check_paths(config.path, data_dir / "muli.sqlite3")
+        self.maintenance = Maintenance(boot_permit)
         self.store = Store(data_dir / "muli.sqlite3")
         self.bus = EventBus(self.store)
         self.system_events = SystemEvents(
@@ -90,7 +99,7 @@ class Runtime:
         self._system_logger.addHandler(logging.NullHandler())
         self.system_logger: SystemLogger | None = None
         self.memory = Memory(self.store)
-        self.reminders = Reminders(self.store, self.bus)
+        self.reminders = Reminders(self.store, self.bus, admission=self.maintenance.admission)
         self.conversation = Conversation(self.store)
         self.context_hooks: list[ContextHook] = []
         self.skills_context: ContextHook | None = None
@@ -124,6 +133,23 @@ class Runtime:
         self.team = TeamManager(self)
         self._configure_compaction()
         self.extensions = Extensions(self)
+        self.maintenance.owner("runtime", self.maintenance_idle)
+        self.maintenance.on_release(self._wake_main)
+        self.maintenance.on_release(self.team.start)
+        self.maintenance.on_release(self.extensions.wake)
+        self.maintenance.on_configuration_release(self.extensions.wake)
+        if boot_permit is not None:
+            self.maintenance.prepared(self.store.instance_id, self.main_session()["id"])
+
+    def maintenance_idle(self) -> bool:
+        return (
+            not self._closing
+            and not self.busy
+            and not self._session_finalizers
+            and self.team.idle
+            and self.compaction.idle
+            and self.workflows.idle
+        )
 
     def _configure_compaction(self) -> None:
         self.compaction = Compactor(
@@ -391,6 +417,11 @@ class Runtime:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     async def _summarize(self, source: str, max_tokens: int) -> str:
+        await self.maintenance.admission.wait()
+        with self.maintenance.admission.operation():
+            return await self._summarize_admitted(source, max_tokens)
+
+    async def _summarize_admitted(self, source: str, max_tokens: int) -> str:
         config = self.model_config("compactor")
         config = replace(config, max_output_tokens=min(max_tokens, config.max_output_tokens))
         prompt = (
@@ -462,7 +493,12 @@ class Runtime:
                         hook(dict(receipt), principal == "owner")
                     except Exception as exc:
                         hook_errors.append(type(exc).__name__)
-            if principal == "owner" and not active and receipt["state"] == "pending":
+            if (
+                principal == "owner"
+                and not active
+                and receipt["state"] == "pending"
+                and self.maintenance.admission.allowed
+            ):
                 session["mode"] = selected
                 self.store.put("session", session)
                 if session["id"] not in self._stopping:
@@ -497,7 +533,8 @@ class Runtime:
         }
 
     def _wake_main(self) -> None:
-        if self._closing:
+        self.maintenance.reconcile()
+        if self._closing or not self.maintenance.admission.allowed:
             return
         session = self.main_session()
         if (
@@ -529,7 +566,7 @@ class Runtime:
             if admission_guard is not None:
                 admission_guard()
             session = self.main_session()
-            if self.attention_busy:
+            if self.attention_busy or not self.maintenance.admission.allowed:
                 return None
             receipt, inserted = self.conversation.enqueue(
                 session["id"],
@@ -603,6 +640,7 @@ class Runtime:
         )
 
     async def reconfigure(self) -> None:
+        self.maintenance.require_configuration()
         if self.busy:
             raise ValueError("请先停止运行中的任务")
         await self.compaction.close()
@@ -622,6 +660,12 @@ class Runtime:
         await self.extensions.load_initial()
 
     async def startup(self) -> None:
+        if self.maintenance.permit and self.maintenance.permit.probation:
+            return
+        await self.activate_components()
+
+    async def activate_components(self) -> None:
+        """Start external components only after normal boot or durable activation."""
         if self.started:
             return
         self.system_logger = await self.system_events.start(self._system_logger)
@@ -741,7 +785,9 @@ class Runtime:
             settings, owner=self._computer_owner, dispatch_guard=self._computer_dispatch_guard
         )
         self.mcp = MCPManager(settings.mcp, max_output_chars=settings.limits.max_output_chars)
-        self.notifications = DesktopNotifier(self.store, self.bus, settings.notifications)
+        self.notifications = DesktopNotifier(
+            self.store, self.bus, settings.notifications, admission=self.maintenance.admission
+        )
         self.tools = {
             tool.name: tool
             for tool in [
@@ -810,6 +856,7 @@ class Runtime:
         return result
 
     def _start(self, session_id: str, content: str, mode: Mode | None) -> dict[str, Any]:
+        self.maintenance.admission.require()
         session = self.store.get("session", session_id)
         if not session:
             raise KeyError(session_id)
@@ -834,6 +881,7 @@ class Runtime:
         return {"run_id": run_id, "session_id": session_id, "message": message}
 
     def _launch(self, session: dict[str, Any], role: str, mode: Mode) -> str:
+        self.maintenance.admission.require()
         session_id = session["id"]
         if session_id in self.tasks:
             raise ValueError("会话仍在运行")
@@ -948,6 +996,7 @@ class Runtime:
             raise asyncio.CancelledError
 
     async def run_step(self, session_id: str, prompt: str, role: str, mode: str) -> str:
+        self.maintenance.admission.require()
         self._repair_tail(session_id)
         self.store.add_message(session_id, "user", prompt)
         run_id = new_id()
@@ -1925,6 +1974,7 @@ class Runtime:
     def _workflow_admission(
         self, parent_session_id: str | None, snapshot: TaskSnapshot | None
     ) -> str | None:
+        self.maintenance.admission.require()
         if self.task_control is None or parent_session_id is None:
             return None
         if snapshot is None:
@@ -1944,6 +1994,10 @@ class Runtime:
     async def _close_resources(self) -> None:
         drivers_settled = False
         try:
+            try:
+                await self.maintenance.settle_activation()
+            except (Exception, asyncio.CancelledError):
+                pass  # A blocked activation still owns components that need closing.
             await self.extensions.close()
             await self.compaction.close()
             await self.team.close()
@@ -1965,5 +2019,7 @@ class Runtime:
                 # Stop the log observer regardless, but never close under live drivers.
                 if drivers_settled:
                     self.store.close()
+                    if self.maintenance.permit is not None:
+                        self.maintenance.permit.close_after_writers()
         if cancelled:
             raise asyncio.CancelledError

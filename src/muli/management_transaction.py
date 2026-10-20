@@ -463,7 +463,7 @@ class TransactionJournal(AbstractContextManager["TransactionJournal"]):
         self.directory = _Directory(root)
         try:
             # Resolve DB aliases before choosing its independent lease inode.
-            path = database.resolve()
+            path = self.database = database.resolve()
             self.writer_directory = _Directory(path.parent / ("." + path.name + "-writer"))
         except BaseException:
             self.directory.__exit__()
