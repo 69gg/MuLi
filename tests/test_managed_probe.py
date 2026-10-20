@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import Iterator
@@ -14,7 +15,7 @@ from test_managed_launcher import deployment as deployment
 from muli.managed_journal import RoleSnapshots
 from muli.managed_transaction import TransactionRecordV2, raw_snapshot
 from muli.management_transaction import TransactionJournal
-from muli.platforms.linux_transaction import ObservationError
+from muli.platforms.linux_transaction import ObservationError, ProbeLimits
 from muli.platforms.managed_deployment import DeploymentAnchor, SelectorValue
 from muli.platforms.managed_probe import (
     ManagedProbeResult,
@@ -204,3 +205,21 @@ async def test_changed_second_observation_is_rejected(host: ProbeHost, change: s
     host.bus.before_second = modify
     with pytest.raises(ObservationError, match="(?:service_observation|process_identity)_changed"):
         await observe(host)
+
+
+async def test_timeout_and_cancellation_settle_bus_without_reclassifying(host: ProbeHost) -> None:
+    host.bus.block = True
+    host.probe = ManagedSystemdProbe(
+        runner=host.bus, proc_root=host.proc, limits=ProbeLimits(seconds=0.05)
+    )
+    with pytest.raises(TimeoutError):
+        await observe(host)
+    assert host.bus.cancelled
+    host.bus.cancelled = False
+    host.bus.started.clear()
+    task = asyncio.create_task(observe(host))
+    await host.bus.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert host.bus.cancelled
