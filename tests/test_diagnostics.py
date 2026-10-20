@@ -221,6 +221,33 @@ async def test_inline_and_environment_secrets_are_both_hidden(
     assert (await read_service_logs(service, config))["text"] == " ".join(["[hidden]"] * 6)
 
 
+async def test_effective_directory_mcp_secrets_are_hidden_across_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, service = configured(tmp_path)
+    effective: dict[str, Any] = {
+        "mcpServers": {"directory": {"headers": {"X-Private": "accepted-secret"}}}
+    }
+    monkeypatch.setattr("muli.diagnostics.shutil.which", lambda name: name)
+
+    async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        effective["mcpServers"] = {
+            "directory": {
+                "headers": {"X-Private": "reloaded-secret"},
+                "env": {"PRIVATE": "directory-environment"},
+            }
+        }
+        return {
+            "exit_code": 0,
+            "output": "accepted-secret reloaded-secret directory-environment",
+        }
+
+    monkeypatch.setattr("muli.diagnostics.run_process", run)
+    result = await read_service_logs(service, config, mcp_config=lambda: effective)
+    assert result["text"] == "[hidden] [hidden] [hidden]"
+    assert config.settings.mcp == {}
+
+
 async def test_cancel_remains_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config, service = configured(tmp_path)
     monkeypatch.setattr("muli.diagnostics.shutil.which", lambda name: name)

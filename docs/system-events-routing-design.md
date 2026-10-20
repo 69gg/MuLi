@@ -1,6 +1,6 @@
 # 系统事件、日志与汇报路由
 
-2026-10-20 设计草案，尚未实现统一告警或主动默认路由。当前已有 AttentionInbox、持久输入/出站账本、服务日志及 ASR/TTS 工具；新增 `self_logs` 是独立的按需读取切片，不能代替本稿的事件触发设施。
+2026-10-20 设计与分片进度。2.14 候选已实现[结构化系统日志与统一来源](system-events.md)，以及 [Telegram/OneBot 显式语音发送](channel-voice-design.md)；整合验证见[评审记录](review-v2.14.md)。任务来源绑定、主动默认路由及记忆偏好选路仍是后续设计，不计为当前能力。`self_logs` 是独立的按需服务日志读取，不扫描日志来驱动模型。
 
 ## 现有接口与缺口
 
@@ -35,9 +35,9 @@ systemd 的 stdout/stderr 原生 priority 不一定对应 Python 文本中的 ER
 
 ## 语音复用
 
-现有 `audio_transcribe` 已按附件 ID 调用 ASR；`speech_synthesize` 已生成音频附件并保存。`file_publish` 和 `channel_send` 复用附件登记及持久出站队列。下一片应增加明确的发送表现形式（文件/语音），而非仅凭 audio MIME 就宣称所有渠道都产生语音气泡。
+现有 `audio_transcribe` 已按附件 ID 调用 ASR；`speech_synthesize` 已生成音频附件并保存。`file_publish` 和 `channel_send` 复用附件登记及持久出站队列。2.14 的 `media_mode=file|voice` 已明确区分发送表现形式，不能仅凭 audio MIME 宣称所有渠道都产生语音气泡。
 
-目前 Telegram 使用 sendDocument，QQ 会按 audio MIME 上传为音频类型；仍需逐渠道核实支持的格式、大小、时长与回执。不为适配格式自动安装大库或模型。必要转换使用已安装组件和有限子进程；不支持时明确返回能力缺口，不把静默降级文件发送当成原生语音成功。
+默认文件模式保留 Telegram sendDocument 和 QQ 按 audio MIME 上传的行为；显式语音支持 Telegram sendVoice 与 OneBot record，不支持的渠道或格式明确拒绝，不自动转码、安装大库或降级。协议替身验收与真实账号收发分别记录。
 
 ## 验收顺序
 

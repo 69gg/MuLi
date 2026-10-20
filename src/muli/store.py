@@ -128,6 +128,8 @@ class Store:
                 received REAL NOT NULL, delivered_seq INTEGER, run_id TEXT
             );
             CREATE INDEX IF NOT EXISTS ingress_pending ON ingress(session_id,state,seq);
+            CREATE INDEX IF NOT EXISTS ingress_system_log_run
+                ON ingress(run_id) WHERE run_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
                 session_id TEXT, data TEXT NOT NULL, created_at REAL NOT NULL

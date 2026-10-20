@@ -141,7 +141,7 @@ def create_app(
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
     runtime = runtime or Runtime(config, data_dir or default_data_dir())
-    attention = AttentionInbox(runtime)
+    attention = AttentionInbox(runtime, lambda: config.settings.system_events)
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
@@ -153,8 +153,11 @@ def create_app(
     from muli.integrations.manager import IntegrationManager
 
     integration = IntegrationManager(runtime)
+    configuration_closing = False
 
     async def apply_configuration(target: Settings) -> None:
+        if configuration_closing:
+            raise ValueError("服务正在关闭，不能应用新配置")
         if not bound_loopback and not target.server.password_hash:
             raise ValueError(
                 "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
@@ -204,6 +207,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal configuration_closing
         try:
             await plugins.load()
             await runtime.startup()
@@ -216,9 +220,14 @@ def create_app(
             await onboarding()
             yield
         finally:
+            configuration_closing = True
+            # Let an owned apply/rollback finish before finally stopping its components.
+            # Do not hold the lock while joining a worker that may be waiting for it.
+            await management.close()
+            async with runtime.configuration_lock:
+                pass  # An admitted API transaction must also settle before Store closes.
             await attention.close()
             await web_voice.aclose()
-            await management.close()
             await integration.close()
             await channel_application.close()
             await personal_io.close()
@@ -593,6 +602,7 @@ def create_app(
             "voice": personal_io.voice.status(),
             "web_voice": web_voice.status(),
             "attention": attention.status(),
+            "system_events": runtime.system_events.status(),
             "limits": settings.limits.model_dump(),
         }
 

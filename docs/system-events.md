@@ -1,6 +1,10 @@
 # 有界系统日志事件
 
-状态：独立模块与 Attention 来源验证已实现，尚未发行。配置字段、应用生命周期与真实业务失败边界由宿主另行接线，未接线不能声称日志告警已启用。
+状态：2.14 候选，尚未发行。独立模块已接入 Runtime、配置、Attention 与应用状态；整版验证记录见[评审](review-v2.14.md)。当前自动生产边界是主助手、队友和工作流实际 Runtime 执行失败；它不宣称已经收集所有第三方日志或所有组件的被捕获异常。
+
+配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 只关闭既有 reminder/update/management 三类。
+
+Runtime 在其它组件启动前建立私有 logger，在关闭 Store 前移除采集器，不修改全局 logging 配置。生产失败记录只携带固定 runtime/runtime_failed 与真实 run/session 引用。首次 await 前已识别的系统输入禁止再次通知，覆盖 ingress 尚未关联 run_id 时的启动失败；消费后的归属仍由精确 run_id 查询验证。配置恢复同时恢复采集策略。API 状态中的 `system_events` 返回运行、队列、丢弃、去重和持久化计数。
 
 ## 宿主接口
 

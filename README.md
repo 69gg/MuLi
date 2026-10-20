@@ -94,6 +94,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [PyPI 与发布流程](docs/publishing.md)
 - [桌面通知](docs/notifications.md)
 - [系统注意事项与主会话唤醒](docs/attention.md)
+- [系统日志事件与通知级别](docs/system-events.md)
 - [chiliarch 接入](docs/chiliarch.md)
 - [可选通讯渠道与本地文件收发](docs/channels.md)
 - [跨平台服务、截图和录屏](docs/platforms.md)

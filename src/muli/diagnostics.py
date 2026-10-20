@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, quote_plus, urlsplit
@@ -22,7 +23,7 @@ LOG_TIMEOUT = 5
 _MASK = "[hidden]"
 
 
-def _secrets(config: ConfigFile) -> set[str]:
+def _secrets(config: ConfigFile, mcp: dict[str, Any] | None = None) -> set[str]:
     settings = config.settings
     values: set[str] = {settings.chiliarch.credential, settings.server.password_hash}
     profiles = [
@@ -32,6 +33,7 @@ def _secrets(config: ConfigFile) -> set[str]:
         *settings.channels.model_dump().values(),
     ]
     profiles.extend(settings.mcp.get("mcpServers", {}).values())
+    profiles.extend((mcp or {}).get("mcpServers", {}).values())
     for profile in profiles:
         if not isinstance(profile, dict):
             continue
@@ -115,12 +117,16 @@ def _file_tail(path: Path, budget: int, lines: int) -> tuple[str, bool]:
 
 
 async def read_service_logs(
-    service: UserService, config: ConfigFile, *, lines: int = DEFAULT_LOG_LINES
+    service: UserService,
+    config: ConfigFile,
+    *,
+    lines: int = DEFAULT_LOG_LINES,
+    mcp_config: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if type(lines) is not int or not 1 <= lines <= MAX_LOG_LINES:
         raise ValueError(f"lines 必须为 1 至 {MAX_LOG_LINES} 的整数")
     budget = config.settings.limits.max_output_chars
-    secrets = _secrets(config)
+    secrets = _secrets(config, mcp_config() if mcp_config is not None else None)
     result: dict[str, Any] = {
         "source": "journal" if service.platform == "linux" else "service_file",
         "status": "unavailable",
@@ -165,7 +171,10 @@ async def read_service_logs(
         # Neither stderr nor exception strings are a safe diagnostic response.
         result["reason"] = "log_read_unavailable_or_over_budget"
         return result
-    text = _redact(text, secrets | _secrets(config))
+    text = _redact(
+        text,
+        secrets | _secrets(config, mcp_config() if mcp_config is not None else None),
+    )
     result.update(status="available" if text else "empty", text=text)
     # Keep the complete tool envelope within the existing output-character budget.
     low, high = 0, len(text)

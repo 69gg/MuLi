@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -38,6 +39,7 @@ from muli.providers import (
 )
 from muli.reminders import Reminders
 from muli.store import LifecycleKind, Store, new_id, now
+from muli.system_events import SystemEvents, SystemLogger
 from muli.task_control import (
     ControlConflict,
     ControlResult,
@@ -74,6 +76,14 @@ class Runtime:
         self.config, self.data_dir, self.client_factory = config, data_dir, client_factory
         self.store = Store(data_dir / "muli.sqlite3")
         self.bus = EventBus(self.store)
+        self.system_events = SystemEvents(
+            self.store, self.bus, lambda: self.config.settings.system_events
+        )
+        # A private logger cannot capture another Runtime's data or alter global logging.
+        self._system_logger = logging.Logger("muli.runtime", logging.WARNING)
+        self._system_logger.propagate = False
+        self._system_logger.addHandler(logging.NullHandler())
+        self.system_logger: SystemLogger | None = None
         self.memory = Memory(self.store)
         self.reminders = Reminders(self.store, self.bus)
         self.conversation = Conversation(self.store)
@@ -581,6 +591,7 @@ class Runtime:
         self._configure_workflows()
         self._configure_compaction()
         if self.started:
+            self.system_logger = await self.system_events.reconfigure()
             await self._start_mcp()
             await self.notifications.start()
 
@@ -593,6 +604,7 @@ class Runtime:
     async def startup(self) -> None:
         if self.started:
             return
+        self.system_logger = await self.system_events.start(self._system_logger)
         await self._start_mcp()
         await self.notifications.start()
         await self.reminders.start()
@@ -937,6 +949,16 @@ class Runtime:
             "mode": mode,
         }
         self.store.put("run", run)
+        # Bind suppression before the first await: input claiming itself can fail,
+        # before ingress receives this run_id. Such failures must not wake us again.
+        attention_origin = (
+            self.store.db.execute(
+                "SELECT 1 FROM ingress WHERE session_id=? AND state='pending' "
+                "AND json_extract(payload,'$.principal')='system:attention' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        )
         try:
             async with asyncio.timeout(self.config.settings.limits.max_run_seconds):
                 run["status"] = "running"
@@ -992,6 +1014,17 @@ class Runtime:
             raise
         except Exception as exc:
             run["status"] = "failed"
+            if self.system_logger is not None:
+                self.system_logger.error(
+                    "runtime_failed",
+                    extra={
+                        "muli_component": "runtime",
+                        "muli_code": "runtime_failed",
+                        "muli_run_id": run_id,
+                        "muli_session_id": session_id,
+                        "muli_notify": not attention_origin,
+                    },
+                )
             reason = (
                 str(exc)
                 if isinstance(exc, (ValueError, PermissionDenied, ProviderError))
@@ -1857,19 +1890,27 @@ class Runtime:
         self._close_task.result()
 
     async def _close_resources(self) -> None:
-        await self.compaction.close()
-        await self.team.close()
-        await self.reminders.close()
-        await self.workflows.close()
-        for task in list(self.tasks.values()):
-            task.cancel()
-        await asyncio.gather(*self.tasks.values(), return_exceptions=True)
-        cancelled = await self.team._settle(list(self._session_finalizers))
-        await self.mcp.close()
-        await self.notifications.close()
+        drivers_settled = False
         try:
+            await self.compaction.close()
+            await self.team.close()
+            await self.reminders.close()
+            await self.workflows.close()
+            for task in list(self.tasks.values()):
+                task.cancel()
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            cancelled = await self.team._settle(list(self._session_finalizers))
+            drivers_settled = True
+            await self.mcp.close()
+            await self.notifications.close()
             await self.computer.aclose()
         finally:
-            self.store.close()
+            try:
+                await self.system_events.close()
+            finally:
+                # Earlier failure can leave a producer with ownership of this DB.
+                # Stop the log observer regardless, but never close under live drivers.
+                if drivers_settled:
+                    self.store.close()
         if cancelled:
             raise asyncio.CancelledError
