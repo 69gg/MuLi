@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any
 
+from muli.proactive import FrozenRouting
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
 
@@ -51,6 +52,7 @@ class Conversation:
         internal: bool = False,
         objects: list[tuple[str, dict[str, Any]]] | None = None,
         reply_origin: ReplyOrigin | None = None,
+        attention_routing: FrozenRouting | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload = self.payload(
             session_id,
@@ -62,6 +64,7 @@ class Conversation:
             route=route,
             event_id=event_id,
             reply_origin=reply_origin,
+            attention_routing=attention_routing,
         )
         return self.store.enqueue_input(
             payload,
@@ -82,6 +85,7 @@ class Conversation:
         route: dict[str, Any] | None = None,
         event_id: str | None = None,
         reply_origin: ReplyOrigin | None = None,
+        attention_routing: FrozenRouting | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > 64000:
@@ -118,4 +122,9 @@ class Conversation:
         }
         if reply_origin is not None:
             payload["reply_origin"] = reply_origin.dump()
+        if attention_routing is not None:
+            if principal != "system:attention" or source != "system:attention":
+                raise ValueError("主动通知选路仅允许系统注意事项入口")
+            payload["attention_routing"] = attention_routing.dump()
+            payload["reply_origin"] = attention_routing.reply_origin(identifier).dump()
         return payload

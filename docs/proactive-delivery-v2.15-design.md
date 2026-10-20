@@ -1,6 +1,6 @@
 # 主动通知的默认目的地与明确记忆偏好
 
-状态：只读设计，尚未实现。基于 `9bf9dab` 的 Team `reply_origin` 合同；本稿不代表真实渠道收发已经验证，不修改现有产品配置或版本。第一期 A 先交付默认配置与来源保存，B 再增加显式记忆引用，两片可独立验证。
+状态：A 已实现并完成定向离线验证，B 显式记忆引用仍为未实现设计。基于 `9bf9dab` 的 Team `reply_origin` 合同，操作说明见[渠道文档](channels.md#无发令会话时的默认通知)；本稿不代表真实平台收发已验证。两片可独立验证，A 不等待 B。
 
 目标是一个持续主身份在没有发令会话时仍能按用户设置通知。已经知道任务来自 A，就继续回 A；明确来自 WebUI，就继续留在 WebUI。只有宿主能证明是独立产生的事项，才选择默认目的地。默认仍为 WebUI。模型整理内容，不选择地址、不解释投递偏好、不获取新的发送工具权限。
 
@@ -71,8 +71,8 @@ WebUI/channel 用 `kind` 判别联合，复用 `Section(extra="forbid")`、有�
 具体入口必须写清，不能只检查字段不存在：
 
 - `reminder_schedule` 在有效 PreparedRequest 中从宿主捕获来源；authenticated WebUI 创建提醒固定为 web。提醒修改、重复触发与恢复保留初始绑定，正文和模型参数不能改绑。直接 Python 调用没有请求上下文时默认 `legacy_local`。原提醒没有 origin 的升级记录也留本地；第一期不凭“定时触发时没人说话”将其改为独立。
-- `SelfManagement.stage` 保存有效请求的来源；WebUI 管理操作明确为 web。后续 configure/restart/update 结果继承该计划，不能因为执行时主模型空闲就改走全局默认。旧计划和没有已登记独立入口的直接宿主调用留本地。
-- 更新检查由启动时的自主检查入口明确标记 independent；WebUI 主动点击检查则标记 web。adapter 继续核验当前 checked/available 的版本记录和对应通知；只伪造一个 `notification.created` 不够。以后的自主检查若增加其它调用点，须逐个登记，不由 `Updates.check` 缺少参数反推。
+- `SelfManagement.stage` 保存有效请求的来源。后续 configure/restart/update 结果继承该计划，不能因为执行时主模型空闲就改走全局默认。旧计划和没有已登记独立入口的直接宿主调用留本地。当前 WebUI 只有读取/取消管理计划，没有新增创建入口；以后若新增，须明确绑定 web。
+- 更新检查由启动时的自主检查入口明确标记 independent。adapter 继续核验当前 checked/available 的版本记录和对应通知；只伪造一个 `notification.created` 不够。以后的自主检查若增加其它调用点，须逐个登记，不由 `Updates.check` 缺少参数反推。当前没有新增 WebUI 手动检查入口；以后若新增，须明确绑定 web。
 - 系统日志继续核验 canonical `system_log` 与精确 event ID。当前仅有 run/session 引用或仅仅缺少引用，都不足以证明 independent。第一期现有日志默认本地；以后仅对明确的服务维护调用点增加独立标记，或在任务执行入口保存其冻结来源。`unknown` component/code、普通 logging 调用和带 run 但无法关联原来源的记录不能选默认渠道。handler 线程不读记忆、不查 SQLite、不决定路由。
 - `source=assistant` 的 `notify`、外部/chiliarch 通知和一般 EventBus 文本保持原合同，不自动提升成合格来源。这样也不会把模型自己的通知再次交回 Attention，形成外发循环。
 
@@ -132,10 +132,14 @@ HTTP 已开始之后的安全撤销不能声称撤回已送达内容。已有成
 
 设置/状态至少显示：当前默认、记忆绑定是否有效及原因、Attention/模型条件、下一条新独立事项将如何处理。每条 outbox 继续显示原对象、选路依据、阻塞/未知原因与原有重试入口。`attention_receipt=accepted`、assistant 已生成、outbox pending、平台 API 确认 sent 和用户已读分别陈述；不把排队或本地已读当作送达。
 
-A 的交付范围为配置/共享路由校验、已登记生产入口的来源与原子事件、Attention 分组及主动终答/outbox 证据、现有设置与状态展示。第一期唯一启用 independent 的入口是启动时自主更新检查；用户发起的新提醒/管理操作保存来源，现有日志全部留本地。不同时实现 Workflow 自动汇报、所有日志调用点的来源追溯、另一个原文通知消费者或新主动收件人发现。B 只增加一个显式记忆绑定和点查校验。实施前按此范围再定 owned 文件；本稿没有产品改动。
+A 的交付范围为配置/共享路由校验、已登记生产入口的来源与原子事件、Attention 分组及主动终答/outbox 证据、现有设置与状态展示。第一期唯一启用 independent 的入口是启动时自主更新检查；用户发起的新提醒/管理操作保存来源，现有日志全部留本地。不同时实现 Workflow 自动汇报、所有日志调用点的来源追溯、另一个原文通知消费者或新主动收件人发现。B 只增加一个显式记忆绑定和点查校验，尚未实现；A 验证见下文。
 
 验证必须使用真实 Store 与离线门控：默认 WebUI 零外发；A 任务与明确 WebUI 压过全局 B；旧无 origin 记录仍本地；只有登记的独立入口可选 default；默认改变不重定向旧项；不同目的地不合批；记录/事件、ingress/receipt/cursor 在注入失败时一起回滚；重开重复事件不复位 blocked/unknown/sent；安全撤销发生在等待、入队和分段发送前；模型未配置/失败时保持未完成与可查记录。配置另测一次保存启用、channel→web 无残留、外部 A→B 完整替换、仅暂停保留地址、同次账号/授权变更按候选校验、manager 能构造并按原生命周期重建、schema/公开配置一致且不出现凭据。B 另测伪 trusted 事件、自由文本/引用、冲突/版本/忘记/关闭、手工 memory_remember、配置排队后证据变化，以及没有召回/外部模型调用。
 
 所有未来运行继续通过统一 `scripts/check_local.py`，与其它片串行。真实账号主动权限、QQ 平台时限、微信上下文寿命与跨真实进程发送后崩溃只能在单独授权的集成实验中验证，本稿不作通过声明。
 
 配置方法已通过 Context7 核实：[Pydantic 判别联合](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions)、[extra=forbid](https://docs.pydantic.dev/latest/api/config/#pydantic.config.ConfigDict.extra)。事务沿用既有 `Store._event`/`EventBus.notify`；[sqlite3 Connection context manager](https://docs.python.org/3.13/library/sqlite3.html#how-to-use-the-connection-context-manager) 不提供嵌套事务。这些来源说明方法，不是本稿已实现或通过测试的证据。
+
+### A 的离线验证
+
+经统一资源 guard 串行通过 218 项定向 Python 回归（包含 30 项新增）、19 项前端回归，峰值 160.4 MiB、swap 0。覆盖实际 Runtime/Store 的终答与事件同事务、通知/管理注入失败回滚、冻结来源与默认变更、连续目的地分组、工具中间轮不外发且保留 token 流、原路撤销 blocked、未知结果不复位、QQ 分段回执与预算保留、附件读取 await 期间撤销，以及真实设置表单→PATCH 的暂停语义。14 份源码 mypy 与 16 份源码/测试 Ruff 通过，`git diff --check` 通过。独立只读复审已收敛，未运行完整仓库测试、真实账号或平台集成；这些定向证据不代替后续整合验证。

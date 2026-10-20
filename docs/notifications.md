@@ -2,6 +2,8 @@
 
 工作台的通知记录可以同时显示为 Linux 桌面通知。此功能默认关闭，只复用系统已安装的 `notify-send`，不安装 Python 包或系统组件。macOS、Windows 显示 `unsupported`，没有跨平台替代实现。
 
+这里的桌面弹窗与[Attention 主会话说明](attention.md)、[无发令会话时默认渠道](channels.md#无发令会话时的默认通知)分别配置。默认渠道仍 WebUI，第一期只允许启动自主更新检查选默认；原任务提醒继承请求来源，旧通知保持本地。桌面 enabled/失败/已读不会更改渠道目的地、复位 blocked/unknown 或产生一次新的 fallback 发送。通知已保存与模型已整理、渠道 sent 是不同阶段。
+
 在配置中启用：
 
 ```json

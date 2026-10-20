@@ -1,6 +1,8 @@
 # 2.15 原渠道汇报与系统事件查询
 
-状态：候选整合中。独立切片已经实现、测试和复审；整版与远端验证分别记录，不操作用户服务、真实账号或模型。
+状态：签名候选的发布复验失败，未上传 PyPI；原标签保留，修复与功能由 2.16 继承。独立切片、整版与远端验证分别记录，不操作用户服务、真实账号或模型。
+
+最终签名提交 `2966cfe18da30f5ea934076aeafbdcd83bc15a03` 的 [PR CI 39461442182](https://github.com/69gg/MuLi/actions/runs/39461442182) 八项通过，但 [Release 39462552531](https://github.com/69gg/MuLi/actions/runs/39462552531) 在 Ubuntu / Python 3.12 的进程消失读取竞争及 Windows / Python 3.12 的同时间戳出站顺序假设失败；prepare、publish、github-release 均未执行。原提交和 `v2.15.0` 标签保持不变，反证及修复见 [2.16 审查](review-v2.16.md)。
 
 ## 原渠道回复
 

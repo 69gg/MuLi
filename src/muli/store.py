@@ -13,6 +13,7 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any, Literal
 
+from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
 
 LifecycleKind = Literal["session", "run", "approval", "workflow_run"]
@@ -441,6 +442,20 @@ class Store:
         return [{**dict(row), "data": json.loads(row["data"])} for row in reversed(rows)]
 
     def add_message(self, session_id: str, role: str, content: str, **extra: Any) -> dict[str, Any]:
+        message = self._message(session_id, role, content, **extra)
+        self.put("message", message)
+        return message
+
+    def complete_message(self, session_id: str, content: str, **extra: Any) -> dict[str, Any]:
+        """Commit a model response and the consumer wakeup evidence as one fact."""
+        message = self._message(session_id, "assistant", content, **extra)
+        self.event(
+            "message.completed", {"message": message}, session_id, objects=[("message", message)]
+        )
+        return message
+
+    @staticmethod
+    def _message(session_id: str, role: str, content: str, **extra: Any) -> dict[str, Any]:
         message = {
             "id": new_id(),
             "session_id": session_id,
@@ -449,7 +464,6 @@ class Store:
             "created_at": now(),
             **extra,
         }
-        self.put("message", message)
         return message
 
     def messages(
@@ -727,7 +741,7 @@ class Store:
     ) -> builtins.list[dict[str, Any]]:
         """At a replay-safe boundary, atomically append inputs and advance delivery state."""
         result: builtins.list[dict[str, Any]] = []
-        destination: tuple[str, str] | None = None
+        destination: tuple[str, str, str] | None = None
         with self.db:
             rows = self.db.execute(
                 "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
@@ -736,9 +750,14 @@ class Store:
             for row in rows:
                 payload = json.loads(row["payload"])
                 origin = ReplyOrigin.from_input(payload)
-                if destination is not None and origin.destination_key != destination:
+                routing = FrozenRouting.load(payload.get("attention_routing"))
+                key = (
+                    *origin.destination_key,
+                    routing.batch_key if "attention_routing" in payload else "",
+                )
+                if destination is not None and key != destination:
                     break  # Another recipient waits for the next replay-safe boundary.
-                destination = origin.destination_key
+                destination = key
                 message = self._archive_input(
                     payload, received=row["received"], run_id=run_id, input_seq=row["seq"]
                 )
@@ -776,6 +795,8 @@ class Store:
             message["input_seq"] = input_seq
         if "task_control" in payload:
             message["task_control"] = payload["task_control"]
+        if "attention_routing" in payload:
+            message["attention_routing"] = FrozenRouting.load(payload["attention_routing"]).dump()
         if self.get("message", payload["id"]) is not None:
             raise ValueError("输入消息 ID 已经存档，不能覆盖历史")
         self._put("message", message)

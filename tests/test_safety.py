@@ -515,7 +515,8 @@ def test_process_timeout_kills_descendant_after_parent_exits(tmp_path: Path) -> 
             status = Path(f"/proc/{identifier}/stat")
             try:
                 state = status.read_text(encoding="utf-8").split()[2]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
+                # Linux can return ESRCH if the process exits after opening stat.
                 return
             if state == "Z":
                 return
