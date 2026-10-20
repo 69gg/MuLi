@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 import json
-import os
 import sqlite3
 import time
 import uuid
@@ -12,9 +11,23 @@ from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any, Literal
 
+from muli.compatibility import FormatState
+from muli.format_admission import (
+    FormatAdmissionError,
+    publish_created_format,
+    require_current_format,
+)
+from muli.format_evidence import (
+    FormatEvidence,
+    FormatEvidenceError,
+    FormatReadLimits,
+    read_optional_format_evidence,
+)
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
+from muli.store_initialization import CreatedDatabase, StoreConstructionLock
 from muli.store_schema import (
+    CHANNEL_SCHEMA,
     CORE_SCHEMA,
     SESSION_DIRECTORY_SCHEMA,
     ExistingStoreError,
@@ -97,17 +110,121 @@ _EVIDENCE_FROM = (
 
 class Store:
     def __init__(self, path: Path, *, durable: bool = False) -> None:
-        self._migration_allowed = True
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        os.close(descriptor)
-        path.chmod(0o600)
-        self.db = sqlite3.connect(path, check_same_thread=False)
         try:
-            self._initialize(durable=durable)
+            with StoreConstructionLock(path) as lock:
+                self._open_locked(lock, durable=durable)
         except BaseException:
-            self.db.close()
+            if hasattr(self, "db"):
+                self.db.close()
             raise
+
+    @classmethod
+    def open_runtime(cls, path: Path, *, default_mode: str, durable: bool = False) -> Store:
+        """Initialize/certify only a database exclusively created by this call.
+
+        Existing unmarked data keeps legacy behavior. No empty-file or schema
+        heuristic can turn it into a newly created, format-certified database.
+        """
+        store = cls.__new__(cls)
+        try:
+            with StoreConstructionLock(path) as lock:
+                store._open_locked(lock, durable=durable, runtime_mode=default_mode)
+        except BaseException:
+            if hasattr(store, "db"):
+                store.db.close()
+            raise
+        return store
+
+    def _open_locked(
+        self, lock: StoreConstructionLock, *, durable: bool, runtime_mode: str | None = None
+    ) -> None:
+        self._migration_allowed = True
+        self._format_state: FormatState | None = None
+        self._format_identity: tuple[str, str] | None = None
+        lock.check()
+        creation = CreatedDatabase.claim(lock.database)
+        try:
+            self.db = sqlite3.connect(
+                lock.database.as_uri() + "?mode=rw&cache=private",
+                uri=True,
+                check_same_thread=False,
+                timeout=0,
+                isolation_level="DEFERRED",
+            )
+            if creation is not None:
+                creation.check()
+            # Classification occurs under the constructor lock and before
+            # any ordinary DDL, backfill, chmod or new identity.
+            evidence = read_optional_format_evidence(self.db)
+            if evidence is not None:
+                self._admit_format(evidence)
+                self._configure_existing(durable=durable)
+            else:
+                if creation is not None:
+                    creation.check()
+                lock.database.chmod(0o600)
+                self._initialize(durable=durable)
+                if creation is not None and runtime_mode is not None:
+                    self._finish_runtime_creation(creation, lock, runtime_mode)
+            lock.check()
+        finally:
+            if creation is not None:
+                creation.__exit__()
+
+    def _finish_runtime_creation(
+        self, creation: CreatedDatabase, lock: StoreConstructionLock, default_mode: str
+    ) -> None:
+        # Memory is synchronous and owns no external resources. Reuse its actual
+        # initializer on this proven-new database, not a second schema mirror.
+        from muli.memory import Memory
+
+        creation.check()
+        Memory(self)
+        creation.check()
+        self.prepare_channels()
+        self.main_session(default_mode)
+        validate_existing_schema(self.db)
+        lock.check()
+        creation.check()
+        publish_created_format(self.db, creation)
+        evidence = read_optional_format_evidence(self.db)
+        if evidence is None:
+            raise FormatAdmissionError("store_format_marker_missing")
+        self._admit_format(evidence)
+
+    def _admit_format(self, evidence: FormatEvidence) -> None:
+        require_current_format(evidence)
+        validate_existing_schema(self.db)
+        identity = evidence.store_instance, evidence.main_session
+        if self._format_identity is not None and identity != self._format_identity:
+            raise FormatAdmissionError("store_format_identity_changed")
+        self._format_state, self._format_identity = evidence.state, identity
+        self._migration_allowed = False
+
+    def revalidate_format(self) -> None:
+        """Admitted data never falls back to legacy if its marker is removed."""
+        if self._format_state is not None:
+            evidence = read_optional_format_evidence(self.db)
+            if evidence is None:
+                raise FormatAdmissionError("store_format_marker_missing")
+            self._admit_format(evidence)
+
+    @property
+    def format_state(self) -> FormatState | None:
+        """Last admitted contract; callers revalidate before protected effects."""
+        return self._format_state
+
+    def prepare_channels(self) -> None:
+        """Shared local schema preparation; never create a transport or recover."""
+        self.revalidate_format()
+        if not self.migration_allowed:
+            validate_existing_schema(self.db, "channel")
+            return
+        self.db.executescript(CHANNEL_SCHEMA)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(channel_inbound)")}
+        if "fingerprint" not in columns:
+            with self.db:
+                self.db.execute("ALTER TABLE channel_inbound ADD COLUMN fingerprint TEXT")
 
     @classmethod
     def open_existing(
@@ -124,6 +241,8 @@ class Store:
         """
         store = cls.__new__(cls)
         store._migration_allowed = False
+        store._format_state = None
+        store._format_identity = None
         try:
             store.db = sqlite3.connect(
                 path.absolute().as_uri() + "?mode=rw&cache=private",
@@ -135,12 +254,31 @@ class Store:
         except sqlite3.Error:
             raise ExistingStoreError("existing_store_unavailable") from None
         try:
+            format_limits = (
+                FormatReadLimits(seconds=limits.seconds, vm_steps=limits.vm_steps)
+                if limits is not None
+                else None
+            )
+            evidence = read_optional_format_evidence(store.db, limits=format_limits)
+            if evidence is not None:
+                store._admit_format(evidence)
             # No SQL, even a connection PRAGMA, precedes bounded validation.
             validate_existing_schema(store.db, limits=limits)
-            store._configure_connection(durable=durable)
-            store.db.execute("PRAGMA foreign_keys=ON")
-            store.db.execute("PRAGMA busy_timeout=3000")
+            store._configure_existing(durable=durable)
             return store
+        except (FormatEvidenceError, FormatAdmissionError) as error:
+            store.db.close()
+            codes = {
+                "format_read_timeout": "existing_store_read_budget",
+                "format_query_budget": "existing_store_read_budget",
+                "format_cleanup_failed": "existing_store_cleanup_failed",
+                "format_read_failed": "existing_store_unavailable",
+                "format_isolation_unsupported": "existing_store_isolation_unsupported",
+                "format_connection_unsupported": "existing_store_connection_unsupported",
+                "format_transaction_active": "existing_store_outer_transaction",
+            }
+            code = codes.get(error.code, error.code)
+            raise ExistingStoreError(code) from None
         except sqlite3.Error:
             store.db.close()
             raise ExistingStoreError("existing_store_unavailable") from None
@@ -151,6 +289,11 @@ class Store:
     @property
     def migration_allowed(self) -> bool:
         return self._migration_allowed
+
+    def _configure_existing(self, *, durable: bool) -> None:
+        self._configure_connection(durable=durable)
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.execute("PRAGMA busy_timeout=3000")
 
     def _configure_connection(self, *, durable: bool) -> None:
         self.db.row_factory = sqlite3.Row

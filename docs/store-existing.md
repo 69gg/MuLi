@@ -1,6 +1,6 @@
 # 已有数据库的禁止迁移构造
 
-状态：独立内部构造切片；尚未接入 Runtime 正式启动、公开配置或 protocol 2。它不建立完整格式标记，也不认证任何发布版本或历史数据库的兼容性。正常 `Store(path)`、`Memory(store)` 与渠道首次初始化仍保留原有建表和历史迁移流程。
+状态：内部禁止迁移入口已实现，并由[新建库准入](fresh-format-admission.md)复用于已标记库的真实 Runtime 启动与重配置；未暴露公开配置开关，也未接 protocol 2。`open_existing` 本身不建立完整格式标记、不认证历史库。无标记 legacy 仍使用原有建表/迁移流程；已有有效完整标记的库从所有 Store 入口进入禁止迁移模式。
 
 ## 入口与策略
 
@@ -10,7 +10,7 @@
 
 Store 在返回之前一次性核齐 core、memory、channel 三组，避免 Runtime 在 Memory 后执行恢复写入，直到渠道构造才发现缺表或 fingerprint。后续 Memory/ChannelManager 构造再复核自身部分；它们失败不修复数据。禁止迁移路径的 `main_session()` 只读已有 marker 和有界 owner 主对象，缺失或归属错误不会新建身份。后续显式业务仍可生成新记录 ID、写记忆、恢复 ingress/outbox 或入队；禁止迁移不是永久 query-only。
 
-本入口由可信宿主使用。宿主仍须独占 writer lease、核配置/路径/连接身份，并先完成双方安装与七领域格式准入；一个内部方法或可读的布尔属性不是跨版本许可。本片不改变 Runtime 默认打开方式，不把局部 marker 转成 `format_state_v1`，也不替旧库补发认证。
+本入口由可信宿主使用。跨版本宿主仍须独占 writer lease、核配置/路径/连接身份，并先完成双方安装与七领域格式准入；一个内部方法或可读的布尔属性不是跨版本许可。本入口不把局部 marker 转成 `format_state_v1`，也不替旧库补发认证。后续 Runtime 工厂只有本次独占新建证明才能发布完整声明，具体构造顺序与持续约束见[新建库准入](fresh-format-admission.md)。
 
 ## 保守结构合同
 
@@ -18,7 +18,7 @@ Store 与渠道的原始 DDL 提取为共享常量，普通初始化和核验使
 
 `sqlite3.complete_statement` 只为仓库内有界声明判断语句边界；它不是语法验证器。读取器仅识别受控 CREATE TABLE/INDEX/UNIQUE INDEX 前缀、去掉 IF NOT EXISTS 和末尾分号，其余正文逐字节与 `main.sqlite_schema.sql` 比较。数据库提供的 SQL 从不执行，表达式、partial 条件、默认值、主键、唯一性和外键不能只靠同名对象蒙混通过。[Python sqlite3](https://docs.python.org/3/library/sqlite3.html#sqlite3.complete_statement)、[SQLite schema 文本存储规则](https://sqlite.org/schematab.html)
 
-这是刻意严格的当前构造前提：不同空白、等价写法或历史 ALTER 留下的不同 SQL 文本也拒绝。例如旧 `channel_inbound` 经 `ALTER TABLE ... ADD COLUMN fingerprint` 后，其存储文本可能不同于当前完整声明；不会为了接受它静默重建。普通历史初始化仍可照原流程使用。额外 schema 不等于已获认证，读取器不证明所有触发器、扩展、JSON/ingress/outbox 语义或数据行完整一致；未来协议仍需完整格式审查。
+这是刻意严格的当前构造前提：不同空白、等价写法或历史 ALTER 留下的不同 SQL 文本也拒绝。例如旧 `channel_inbound` 经 `ALTER TABLE ... ADD COLUMN fingerprint` 后，其存储文本可能不同于当前完整声明；不会为了接受它静默重建。无标记历史库的普通初始化仍可照原流程使用。额外 schema 不等于已获认证，读取器不证明所有触发器、扩展、JSON/ingress/outbox 语义或数据行完整一致；未来协议仍需完整格式审查。
 
 必须已存在 `message_sequence_v1='done'`、1–96 UTF-8 bytes 的 TEXT `store_instance_v1`/`main_session`，以及对应 JSON `id` 一致、`kind='main'`、`principal='owner'` 的主对象。记忆必须有非负 INTEGER revision 和 INTEGER `alias_evidence_version=1`。缺少派生行不触发回填，也不据此保证检索完整；本片不扫描所有消息、记忆或关系。
 
@@ -38,4 +38,4 @@ VM 步数按至多 100 条指令回调累计，每条语句末尾还有小于该
 
 已通过统一资源 guard 的 30 秒受限检查：新增 48 项全部通过（0.45 秒、峰值 82.3 MiB、swap 0）；其中先完成的 45 项与既有 Store/Memory/渠道/会话及格式证据 254 项同轮共 299 项通过（2.12 秒、峰值 199.1 MiB）。测试连接显式关闭及三个连接模式尾例补齐后，仅重验新增文件。四个源码严格 mypy（峰值 121.6 MiB）与五个 Python 文件 Ruff/format 均通过。
 
-所有 fixture 都是临时合成数据库；未读取真实用户库、安装候选、迁移或运行真实服务。通过上述构造回归不代表跨版本 handoff 已实现或历史库已获语义认证。
+所有 fixture 都是临时合成数据库；未读取真实用户库、安装候选、迁移或运行真实服务。后续 Runtime 工厂测试使用本次独占创建的新临时库，完整数据见[新片验证](fresh-format-admission.md#验证记录)。通过上述构造回归不代表跨版本 handoff 已实现或历史库已获语义认证。

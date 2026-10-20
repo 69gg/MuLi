@@ -404,6 +404,7 @@ class Extensions:
                 if self.runtime.busy:
                     raise ExtensionError("runtime_busy")
                 self.runtime.maintenance.require_configuration()
+                self.runtime.store.revalidate_format()
                 # No await between persistence and publication. Everything below is prevalidated.
                 if persist:
                     try:

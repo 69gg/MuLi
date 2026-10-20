@@ -204,6 +204,7 @@ def _create_app(
 
     async def apply_configuration(target: Settings) -> None:
         runtime.maintenance.require_configuration()
+        runtime.store.revalidate_format()
         if configuration_closing:
             raise ValueError("服务正在关闭，不能应用新配置")
         if not bound_loopback and not target.server.password_hash:
@@ -235,6 +236,7 @@ def _create_app(
                 await memory_application.close()
                 runtime.maintenance.require_configuration()
                 runtime.validate_proactive_settings(target)
+                runtime.store.revalidate_format()
                 config.replace(target)
                 await rebuild()
             except (Exception, asyncio.CancelledError):
@@ -806,6 +808,7 @@ def _create_app(
             "plugins": plugins.inventory(),
             "plugins_restart_required": plugins.restart_required,
             "update": runtime.store.get("update", "latest"),
+            "update_capability": management.updates.capability(),
             "extensions": runtime.extensions.status(),
             "system_events": runtime.system_events.status(),
         }

@@ -1,6 +1,6 @@
 # A/B 候选的无迁移启动边界
 
-状态：[连接内格式证据读取器](format-evidence.md)与覆盖三个构造器的[禁止迁移入口](store-existing.md)已独立实现，完整准入与实际启动接线仍为设计。本文补充[可恢复管理](recoverable-management-design.md)与[兼容声明](upgrade-compatibility.md)，不改变 2.19 的同版本恢复入口，也不为已有数据库补发格式证明。
+状态：[连接内格式证据读取器](format-evidence.md)与覆盖三个构造器的[禁止迁移入口](store-existing.md)已实现；[独占新建库的完整格式声明](fresh-format-admission.md)已接入真实 Runtime，并让已标记库后续构造/重配置禁止迁移。跨版本双方安装准入、静态 manifest、protocol 2 与 selector 仍为设计。本文补充[可恢复管理](recoverable-management-design.md)与[兼容声明](upgrade-compatibility.md)，不为历史已有数据库补发格式证明。
 
 ## 为什么现有 probation 还不够
 
@@ -20,7 +20,7 @@
 
 ## 选择与不采用的捷径
 
-采用显式的“打开已有数据且禁止迁移”启动策略，覆盖 Store、Memory 与 ChannelManager；普通首次初始化仍保留现有流程。只增加一个 Store 布尔开关、让其它构造器继续回填是不完整的。实际接口应随准入证据一起评审，不能暴露一个由模型自报 `compatible=true` 的绕过参数。
+采用显式的“打开已有数据且禁止迁移”启动策略，覆盖 Store、Memory 与 ChannelManager；历史无标记库保留原流程，本版本独占创建并完成全部准备的新 Runtime 库才发布完整声明。所有 Store 入口识别已有标记，不能只在 Runtime 工厂封口。只增加一个 Store 布尔开关、让其它构造器继续回填是不完整的，不能暴露一个由模型自报 `compatible=true` 的绕过参数。
 
 不通过 SQL authorizer 阻止少数 ALTER 语句来定义兼容：INSERT 回填同样会改变事实，objects/ingress/outbox 的 JSON 解释也可能改变而 SQL 完全相同。authorizer 可作为测试断言或附加约束，不能替代七领域格式合同。
 
@@ -49,14 +49,14 @@ SQLite 的只读连接不等于文件系统完全零变动：WAL 模式可能涉
 
 不能给仍会变化的业务库设置 `immutable=1` 来规避锁或辅助文件；该参数会关闭部分锁与变更检测，必须以真正不变为前提。[SQLite URI 参数](https://sqlite.org/uri.html#uriimmutable)
 
-完整格式标记的首次建立是另一项交付：需要明确各领域合同、旧数据适配范围和跨版本 fixture，不能因为两项局部迁移 marker 存在就自动生成。读取器首期对没有完整标记的历史库保持不支持；普通启动的历史兼容能力不受其替代。
+完整格式标记现在只由本版本独占创建证明的新 Runtime 库建立，七领域合同与崩溃/重开边界见[新建库准入](fresh-format-admission.md)。不能因为两项局部迁移 marker 存在就自动生成。没有完整标记的历史库仍不能获得跨版本支持；普通启动的历史兼容能力不受其替代。
 
 ## 最小实现与验收顺序
 
-先独立实现有界只读格式证据读取与拒绝分支，再实现覆盖 Store/Memory/ChannelManager 的禁止迁移入口，最后接 protocol 2。先不改普通启动默认行为，也不新增跨平台服务控制器或数据库降级工具。
+实现顺序为有界只读格式证据、三组禁止迁移入口、新建库声明与已标记库的真实启动约束，最后才接 protocol 2。前三项已实现；不新增跨平台服务控制器或数据库降级工具，不把本版本普通启动等同于 A/B 准入。
 
 合成临时 SQLite 测试至少覆盖：缺库/缺 marker 不创建；未知/重复/类型错误/超大标记固定拒绝；schema 变化与身份变化；真实 WAL 中最新已提交事实；锁竞争和查询预算；禁止入口缺表/缺索引/缺实例 ID 不修补；Memory 不迁移别名或回填索引；禁用渠道的构造与重新配置也不补 fingerprint；格式准入失败前后业务事实相同；两个已认证同格式实现对 ingress/outbox/unknown、审批与路由 proof 的读取一致。
 
 读取器已在宿主提供的合成连接上通过单快照、WAL、身份/标记、锁竞争、读取预算与清理测试，并拒绝非零 `read_uncommitted`，避免共享缓存连接读取未提交事实。连接内新回归与纯判定共 200 项通过，详情见[验证记录](format-evidence.md#验证边界)。
 
-`Store.open_existing` 已实现已有文件的禁止创建打开和三组结构、局部身份的有界核验，Memory 与 ChannelManager 继承同一策略；普通初始化不变。独立测试覆盖零迁移、失败不修复、成功后的业务写入与 Runtime/渠道重新配置，详情见[构造验证](store-existing.md#验证边界)。宿主路径认证、完整七领域准入、实际 bootstrap 接线和跨版本语义验收仍未完成；没有访问用户真实数据库。
+`Store.open_existing` 已实现已有文件的禁止创建打开和三组结构、局部身份的有界核验，Memory 与 ChannelManager 继承同一策略。独立测试覆盖零迁移、失败不修复、成功后的业务写入与 Runtime/渠道重新配置，详情见[构造验证](store-existing.md#验证边界)。新建库声明与后续当前版本准入见[新片验证](fresh-format-admission.md#验证记录)。跨版本双方构件认证、protocol 2 bootstrap 接线和跨版本语义验收仍未完成；没有访问用户真实数据库。

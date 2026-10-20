@@ -1,0 +1,68 @@
+# 新建数据库的完整格式声明与启动准入
+
+本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
+
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。历史无标记库继续使用原有初始化与迁移流程；其中的局部迁移标记不能替代完整声明。
+
+## 真实构造顺序
+
+`Runtime.__init__` 将 `ConfigFile.settings.default_mode` 交给内部 `Store.open_runtime` 工厂。三种默认模式 `ask/auto/yolo` 沿用配置验证结果，创建对应的 owner 主会话；重开时不因默认模式变化而替换既有主身份或模式。
+
+1. 普通 `Store(path)` 与工厂先取得相同规范数据库路径的短构造锁，然后重新读取当前标记分类。不存在“锁外判定 legacy，等待后照旧迁移”的分支。
+2. 工厂保留独占创建的文件描述符。连接建立后、分类后进入初始化前、各准备阶段及最终发布前，均复核创建句柄与当前路径的 `dev/ino`、普通文件和单链接身份。不从 SQLite 空文件或 schema 猜测创建资格。
+3. 无标记新库复用实际 Store 初始化、`Memory.__init__`、`Store.prepare_channels` 和 `main_session(default_mode)`。渠道只准备共享 DDL，不创建 HTTP client，不运行渠道恢复。随后只读核齐 core、memory、channel 三组与 Store/main 身份。
+4. 再次确认路径、构造锁和无完整标记，设置并核验 `synchronous=FULL`，在显式 `BEGIN IMMEDIATE` / `COMMIT` 中插入完整七领域声明。此前准备允许分多个事务提交；不把 `with db` 或 `executescript` 当作整个初始化的原子事务。
+5. 发布后重读格式和身份，通过后返回 `migration_allowed=False` 的 Store。此时才进入 Runtime 的 Memory 构造、`Runtime._recover`，以及之后的 `ChannelApplication._manager` / `ChannelManager.recover`。后两者可执行正常恢复业务写入，不能先迁移再宣称准入。
+
+普通 `Store(path)` 仍可创建仅 core 的未标记库，避免轻量内部用途被强制变成完整 Runtime。但它打开已经标记的库时，与工厂一样先准入并禁止迁移。`Store.open_existing` 仍只打开已有文件，不新建构造锁、不 mkdir/chmod；它不迁移，并要求可信宿主持有路径及 writer 所有权。
+
+### 短锁与失败边界
+
+锁使用数据库规范路径同目录下的固定 `.<数据库名>-initialization.lock`，POSIX 使用 `flock(LOCK_EX|LOCK_NB)`，Windows 使用 `msvcrt.locking(LK_NBLCK, 1)`。Windows 加解锁前均 seek 到 byte 0，锁区允许位于 EOF 后，无需写入占位字节。竞争立即以固定 `store_initialization_busy` 失败，不轮询，不退回无保护初始化；释放只关闭/解锁，不删除固定 inode。POSIX 还核验锁文件归属及私有权限，不 chmod 已有锁。[Python fcntl](https://docs.python.org/3/library/fcntl.html#fcntl.flock)、[Python msvcrt](https://docs.python.org/3/library/msvcrt.html#msvcrt.locking)
+
+文件描述符不可被 exec/subprocess 继承；这不等于对纯 fork 隔离描述符。构造链不使用 fork。该锁只串行合作构造器的分类与准备，不是运行期 writer lease，也不阻止已运行实例或任意同权限外部程序改库、换路径或改安装环境。规范路径可归并普通路径别名，不提供任意硬链接发现或恶意 ABA 防护。
+
+准备、核验或 marker 提交之前失败，连接和创建句柄关闭，文件不删除，已提交的准备事实可以保留为无标记 legacy。下一次打开已有文件没有独占创建资格，不自动补证。若 COMMIT 或其后核验报错，调用者得不到可用 Store；不宣称能撤销可能已经提交的 marker。重开按实际持久事实重新分类：有效标记走禁止迁移，确实无标记才走 legacy，坏标记直接拒绝。
+
+SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝前无业务写入”不等于目录完全没有变化；不复制运行中的单个 DB 文件、不忽略 WAL，也不使用 `immutable=1`。
+
+## 七领域合同 1
+
+完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，下列七个不透明合同 ID 均为 `1`。ID 不是大小可比较的 schema 版本；下一版修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
+
+| 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
+| --- | --- | --- |
+| `database` | 共享 core、memory、channel DDL 与索引；WAL；消息插入序号；`message_sequence_v1='done'`；1–96 UTF-8 bytes 的 Store/main 身份；主对象 `id` 对应、`kind='main'`、`principal='owner'`。不扫描所有业务行或替缺失派生行回填。 | `Store._initialize/_put/main_session`、`validate_existing_schema`、`read_format_evidence`；共享声明见 `store_schema` 与 `memory_schema`。 |
+| `objects` | `(kind,id)` 主键下的 JSON 对象、事件与消息顺序；run/session/approval/任务快照的原有状态语义；持久 approval 不等于当前活跃 future。执行身份、权限快照与 ReplyOrigin 分离；unknown 外部效果不能被重启或合成错误收据伪装成安全重试。压缩保留原始证据与来源边界。 | `Store._put/event/messages`、`Runtime._recover/_execute`、Permissions、TeamManager、WorkflowEngine、Compactor 与 Conversation。 |
+| `configuration` | 缺文件采用 `Settings` 默认；Pydantic 沿用现有类型转换，未知字段拒绝，并非 `strict=True` JSON 合同。`validate_changes` 递归合并，渠道 destination/memory preference 等既有整体替换规则继续；候选配置仍需原有来源、授权及生命周期核验。外部 JSON 配置的原始 bytes/路径真实性不由数据库 marker 证明。 | `ConfigFile.__init__/validate_changes/_merge/replace`、Settings、server 的 `apply_configuration` 与 `Extensions.apply_locked`。 |
+| `ingress` | 持久输入 ID、原 payload 比较、有限队列及 pending/delivered/cancelled/quarantined 状态；完整 route/proof 与 principal 独立冻结；同来源前缀合批而不混入另一来源，领取与恢复维持已有原子性。来源文本与模型输出不能自行提升权限或猜收件人。 | `Store._enqueue_input/claim_inputs`、`Runtime.submit/_claim_inputs/_recover`、Conversation、AttentionInbox、渠道入站。 |
+| `outbox` | `channel_outbox` 的原 payload、media mode、route、proactive/proof、分片游标及收据；相同幂等键不同 payload 拒绝。`sending` 恢复为 unknown，unknown 不自动重发，blocked 需显式现有重试/重验。默认附件行为保留，voice 仅显式选择；发送时继续核当前授权与冻结来源。 | `ChannelManager.enqueue/recover`、发送循环及重试、`ChannelApplication`、`FrozenRouting/guard_delivery`、原平台 adapter。 |
+| `memory` | 原始 source/revision、记忆事实及版本、别名证据、关系与派生检索结构；`revision` 为非负 INTEGER，`alias_evidence_version=1`。记忆绑定以 ID/version/source 元数据证明核验，不能由记忆正文自动授予渠道地址权限。禁止迁移重开不重建 meta、别名、词索引或关系。 | `Memory.__init__/_migrate_alias_evidence/register_source/save/edit/resolve_conflict`、MemoryPipeline、`proactive_memory.check_preference`。 |
+| `install_profile` | 接受尚未准备任何实例 profile/receipt 的缺省状态；本片不制造持久实例 profile。已有安装意图仅按 pinned uv adapter 有界解析，保留主 requirement/extras/with/constraints/overrides/python/entrypoint 与已支持 options；结果仍是 `intent_parsed/context_required`。索引/约束/凭据来源及 ResolverContext 未核齐时不能变成可安装证明。 | `parse_install_intent`、`InstallationReceipt/read_install_receipt`，以及现有安装 manifest 的独立核验；这些证据不由七 ID 自动生成。 |
+
+以上声明绑定当前可信应用代码的解释合同，不声称审计数据库内所有额外 SQL、插件或历史手工写入。额外插件私有表/其私有索引可保留；这不是插件完整性或任意触发器认证。正常配置和安装真实性仍由各自宿主核验负责。
+
+## 已标记库的持续约束
+
+`read_optional_format_evidence` 在有界快照中区分真正缺失、有效完整标记与错误。缺少 `runtime_state` 表可视为 legacy；目录按 SQLite 的 NOCASE 名称规则定位，再拒绝非 canonical 名称，避免 `RUNTIME_STATE` 被误当缺表。不可读/错误类型的表、未知命名族、坏 JSON、部分领域、未知 metadata 或当前不支持的合同 ID 都拒绝。`runtime_state.name` 非 STRICT TEXT 仍可存 BLOB，所以 TEXT 与 BLOB 的 `format_state_` 前缀分别用主键范围查询；BLOB-only 和合法 TEXT 与 BLOB 冲突均不能降为 legacy。最多三次分类查询加五次完整证据查询，沿用默认八次查询预算。
+
+有效标记必须匹配当前七 ID，并再次核齐三组受控结构、局部 marker 和 owner 主身份，才返回 Store。Memory 不运行迁移分支；ChannelManager 在创建自有 HTTP client 前调用共享准备入口并只读复核，重新配置继续继承。结构相同不能生成格式 ID，具名 partial/表达式索引仍按已有保守声明核验，不仅比较名称。
+
+`Store.format_state` 是最后已 admitted 的不可变合同观察值。效果前调用 `revalidate_format()`；一旦本 Store 已 admitted，marker 后来删除、损坏、换合同或 Store/main 身份改变均失败，状态不清空、不变成 `migration_allowed=True`。该方法不会把原先无标记 legacy 自动升级为 marked。
+
+Runtime 与 ChannelApplication 重配置入口先核；server 在关闭可用组件之前核一次，在全部 close awaits 后、保存候选配置之前再核；Extensions 在最后一次异步 fingerprint 后、无 await 的 persist/publish 前核，失败丢弃未发布候选连接。预先坏状态不会先关闭组件；关闭途中发生变化时不保存 target，仍传播失败并沿用原有恢复策略，不承诺所有组件一定可恢复。
+
+与本片配套的更新能力检查会重核 admitted 状态，已标记库暂拒 Runtime 内原位自动升级，直到完整候选切换接通；legacy 沿用原安装检查。版本查询与通知仍可用，不许诺批准即可安装。`format_state` 不等于 `migration_allowed`：已有禁止迁移入口也可打开无标记 legacy。跨 data-dir 共享同一 uv 环境、手工外部升级或直接运行不识别 marker 的旧程序，不在当前 Runtime 封口的全局控制范围内。
+
+## 验证记录
+
+全部本地执行经过 `/data0/MuLi/scripts/check_local.py`，每次 1 GiB、共享 2 GiB、swap 0、共享一个 CPU、最长 180 秒。使用小型临时数据库和 fake 组件，没有读取用户库、调用模型、下载、安装或重启服务。
+
+- fresh + 既有禁止迁移 + 格式读取器：先有 144 项通过，1.21 秒，峰值 114.2 MiB。首轮发现旧入口 cleanup 错误码遗漏，修复映回 `existing_store_cleanup_failed` 后通过，未放宽预算。补完最后三例后，同三组最终 147 项通过，1.27 秒，峰值 120.6 MiB；这次使用 30 秒硬限，其中新增文件共 44 项。
+- 实际 Runtime、渠道、配置恢复、Extensions 与 cleanup 回归：92 项通过，2.49 秒，峰值 137 MiB。与上一组有一项 cleanup 重叠，不把两组相加声称唯一 case 数。
+- server close-await 与权限断言尾差曾仅重验新增文件：42 项通过，0.85 秒，峰值 99.7 MiB。随后增加 NOCASE 分类的 marked/legacy 两例，在上述最终 147 项中验收；没有将不同轮次计数混成更多唯一 case。
+- 九个已改源码严格 mypy 通过；十二个 Python 文件 Ruff/format 通过，最终测试尾差也单独通过。server 新增管理能力字段依赖另一片 Updates 实现，管理 API 能力回归与完整整合由主树执行。
+
+真实子进程回归在父工厂持锁、core 已提交但 full marker 尚未发布时，分别调用普通 Store 和 Runtime 工厂；两者均固定 busy、父库事实不变，之后父可完成发布并以 marked/禁止迁移重开。三个重开入口也保留额外插件私有表、索引和一行资料。准备/COMMIT 拒绝后的重开不补证；标记损坏、结构/局部身份缺失与 BLOB 命名族均无迁移写入。
+
+POSIX 真实路径替换反例证明连接到旧库时在 chmod/core DDL 前拒绝；Windows 禁止替换持有中的创建句柄，此例明确跳过，其余创建检查、锁和子进程回归仍运行。Windows/macOS 的静态官方 API 审查已完成，远端实际执行仍待整合 CI；本机结果不替代跨平台证据。没有验收真实 A/B 切换、历史库补证、任意插件认证或实际安装 profile 重建。

@@ -1,10 +1,12 @@
 # 连接内的只读格式证据
 
-状态：独立读取切片；尚未接入启动、维护事务或跨版本 handoff。所有测试格式声明均为合成 fixture，不代表任何已发布版本或历史数据库已经兼容。本文不新增迁移或为旧库补发格式标记。
+状态：连接读取器已用于[本版本新建库声明与已标记库启动准入](fresh-format-admission.md)，尚未接入跨版本 handoff。本文原始读取器测试的格式声明仍是合成 fixture，不代表历史数据库或双方发布版本已经兼容；不为旧库补发格式标记。
 
 ## 调用与所有权
 
 `read_format_evidence(db, *, limits=FormatReadLimits())` 只接收宿主提供的 `sqlite3.Connection`，返回不可变 `FormatEvidence`。读取器不发现路径、不开文件、不创建数据库，不构造 Store、Memory 或 Runtime，也不关闭调用者的连接。
+
+`read_optional_format_evidence` 复用相同快照/预算；仅在 `runtime_state` 表或保留格式命名族真正缺失时返回 `None`。目录按 SQLite 的 NOCASE 名称规则定位，非 canonical 大小写也固定拒绝；缺表与不可读/错误类型的对象明确区分。TEXT/BLOB 的 `format_state_` 前缀各用一个有界主键范围查询；未知 TEXT 名、BLOB-only、TEXT 与 BLOB 冲突都固定拒绝。最多三次分类查询加五次完整读取，仍在默认八次查询内；没有全库文本扫描或根据旧局部 marker 猜测版本。
 
 宿主必须交付专用、独占、没有活跃事务的连接，负责真实只读打开、路径/数据库/lease 身份和连接生命周期。连接使用默认 `str` 文本解码。游标独立使用普通 tuple 行，不改变连接的 row factory。宿主明确转交本次读取的 progress callback 与连接限制设置权；此专用连接此前不能装有其它 progress handler 或 authorizer，也不能与其它线程/任务同时使用。Python 没有读取旧 progress callback 的接口，代码无法自动检测或恢复未知回调，不能将任意共享连接传进来。
 
@@ -37,4 +39,4 @@ VM progress 按至多 100 条指令回调，`vm_steps` 限定累计回调覆盖�
 
 回归只使用小型临时 SQLite 数据库，覆盖真实 WAL 最新提交、读取期间另一 writer 提交仍不拼接快照、缺/坏/超大/重复标记、旧 marker 不替代、身份与主对象、schema 观察、锁竞争、预算中止、事务/回调/限制清理及无业务写入。共享缓存反证仅通过两个临时 URI 的 `cache=shared` 启用，旧实现确实返回另一连接未提交的格式/实例，修复后拒绝且保留调用者 read-uncommitted 设置；未修改全局 SQLite 选项。
 
-已通过统一 `scripts/check_local.py` 的 30 秒受限检查：新回归与既有 compatibility 合计 200 项通过（0.22 秒、峰值 58.7 MiB、swap 0），两文件 Ruff/format 与单源码严格 mypy 通过；静态检查最高峰值 194.3 MiB。未读取用户数据库，未接启动或验证真实 A/B 更新，也未声称格式标记的发布认证已完成。
+已通过统一 `scripts/check_local.py` 的 30 秒受限检查：原始新回归与既有 compatibility 合计 200 项通过（0.22 秒、峰值 58.7 MiB、swap 0），两文件 Ruff/format 与单源码严格 mypy 通过；静态检查最高峰值 194.3 MiB。后续 optional 分类与真实启动的定向数据见[新片验证](fresh-format-admission.md#验证记录)。未读取用户数据库，未验证真实 A/B 更新，读取器本身仍不认证格式来源。

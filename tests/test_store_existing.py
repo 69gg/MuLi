@@ -374,7 +374,9 @@ async def test_real_channel_application_reconfigure_inherits_store_policy(
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    def existing(path: Path, *, durable: bool = False) -> Store:
+    def existing(
+        cls: type[Store], path: Path, *, default_mode: str, durable: bool = False
+    ) -> Store:
         assert path == database
         store = Store.open_existing(path, durable=durable)
         store.db.set_authorizer(authorizer)
@@ -384,7 +386,7 @@ async def test_real_channel_application_reconfigure_inherits_store_policy(
         raise AssertionError("No model may be constructed")
 
     # Test-only injection: this slice does not expose a Runtime setting or mode.
-    monkeypatch.setattr("muli.runtime.Store", existing)
+    monkeypatch.setattr(Store, "open_runtime", classmethod(existing))
     config = ConfigFile(tmp_path / "config.json")
     runtime = Runtime(config, database.parent, no_model)
     app: ChannelApplication | None = None
