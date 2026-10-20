@@ -8,6 +8,7 @@ from typing import Any
 from muli.attachments import Attachments
 from muli.channels import ChannelManager, ChannelProfile, ChannelsConfig
 from muli.proactive import FrozenRouting, guard_delivery
+from muli.proactive_memory import check_preference
 from muli.runtime import Runtime
 from muli.tools import Tool, parameters, string
 
@@ -36,7 +37,7 @@ class ChannelApplication:
             return await self.runtime.submit(**kwargs, admission_guard=guard)
 
         def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:
-            guard_delivery(self.runtime.config.settings, route, metadata)
+            guard_delivery(self.runtime.config.settings, route, metadata, db=self.runtime.store.db)
 
         for name in ("onebot", "telegram", "qq", "weixin"):
             data[name] = ChannelProfile(**data[name])
@@ -51,7 +52,8 @@ class ChannelApplication:
 
     def status(self) -> dict[str, Any]:
         settings = self.runtime.config.settings
-        selected = FrozenRouting.independent(settings)
+        selected = FrozenRouting.independent(settings, self.runtime.store.db)
+        _, reason = check_preference(settings, self.runtime.store.db)
         return {
             **self.manager.status(),
             "proactive": {
@@ -60,6 +62,7 @@ class ChannelApplication:
                 "attention_enabled": settings.attention.enabled,
                 "model_configured": settings.models.main.configured,
                 "independent_sources": ["startup_update_check"],
+                "memory_status": {"valid": reason == "valid", "reason": reason},
             },
         }
 

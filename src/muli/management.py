@@ -79,6 +79,7 @@ class SelfManagement:
             if action == "configure"
             else Settings.model_validate(settings.model_dump())
         )
+        self.runtime.validate_proactive_settings(target)
         identifier = new_id()
         # Secrets remain in a private configuration snapshot, never in the public journal.
         path = self.directory / f"{identifier}.json"

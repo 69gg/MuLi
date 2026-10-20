@@ -165,7 +165,7 @@ test("checking always reads fresh detail, separates original quote and true iden
   await h.ui.showMemoryEvidence(item.id);
   assert.deepEqual(h.requests.map((entry) => entry.path), ["/memories/memory-one"]);
   assert.equal(h.requests[0].cache, "no-store");
-  for (const text of [item.content, "原始引文", item.quote, "来源标签", "原始来源", "system:attention", "未标为主人来源", "已替代", "修改历史"]) assert.ok(h.body().includes(text), text);
+  for (const text of [item.content, "记忆 ID", item.id, "记忆版本", "原始引文", item.quote, "来源标签", "原始来源", "system:attention", "未标为主人来源", "已替代", "修改历史"]) assert.ok(h.body().includes(text), text);
   assert.equal(h.body().includes("STALE_CACHE"), false);
   assert.equal(h.dialog.querySelectorAll("img").length, 0);
   assert.ok(h.button("更正") instanceof DOMButton);

@@ -404,11 +404,23 @@ class ChannelDestination(Section):
     route: ProactiveRoute
 
 
+class NotificationPreference(Section):
+    memory_id: RouteText
+    version: int = Field(ge=1, strict=True)
+    destination: WebDestination | ChannelDestination = Field(discriminator="kind")
+
+    @field_validator("memory_id")
+    @classmethod
+    def finite_identifier(cls, value: str) -> str:
+        return ProactiveRoute.finite_identifier(value)
+
+
 class ProactiveSettings(Section):
     external_enabled: bool = Field(default=False, strict=True)
     default_destination: WebDestination | ChannelDestination = Field(
         default_factory=WebDestination, discriminator="kind"
     )
+    memory_preference: NotificationPreference | None = None
 
 
 class ChannelSettings(Section):
@@ -433,8 +445,10 @@ class ChannelSettings(Section):
     retry_backoff_seconds: float = Field(default=5, ge=0)
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
 
-    def validate_proactive_destination(self) -> None:
-        destination = self.proactive.default_destination
+    def validate_proactive_destination(
+        self, destination: WebDestination | ChannelDestination | None = None
+    ) -> None:
+        destination = destination or self.proactive.default_destination
         if isinstance(destination, ChannelDestination):
             route = destination.route
             profile: ChannelProfile = getattr(self, route.name)
@@ -643,6 +657,14 @@ class ConfigFile:
             # Choosing a complete external destination enables it in one action.
             # An explicit pause in that same patch remains intentional.
             proactive.setdefault("external_enabled", True)
+        preference = proactive.get("memory_preference") if isinstance(proactive, dict) else None
+        if (
+            isinstance(proactive, dict)
+            and isinstance(preference, dict)
+            and isinstance(preference.get("destination"), dict)
+            and preference["destination"].get("kind") == "channel"
+        ):
+            proactive.setdefault("external_enabled", True)
         server = changes.get("server")
         if isinstance(server, dict):
             from muli.auth import hash_password
@@ -660,16 +682,20 @@ class ConfigFile:
         target = Settings.model_validate(data)
         channel_changes = changes.get("channels")
         proactive = channel_changes.get("proactive") if isinstance(channel_changes, dict) else None
-        if isinstance(proactive, dict) and (
-            "default_destination" in proactive
-            or (
+        if isinstance(proactive, dict):
+            # Revoking a binding must remain possible. Validate a newly chosen
+            # destination, not every saved historical destination on every load.
+            enabling = (
                 proactive.get("external_enabled") is True
                 and not self.settings.channels.proactive.external_enabled
             )
-        ):
-            # Revoking a binding must remain possible. Validate a newly chosen
-            # destination, not every saved historical destination on every load.
-            target.channels.validate_proactive_destination()
+            if "default_destination" in proactive or (
+                enabling and target.channels.proactive.memory_preference is None
+            ):
+                target.channels.validate_proactive_destination()
+            preference = target.channels.proactive.memory_preference
+            if preference is not None and ("memory_preference" in proactive or enabling):
+                target.channels.validate_proactive_destination(preference.destination)
         return target
 
     def update(self, changes: dict[str, Any]) -> Settings:
@@ -717,7 +743,10 @@ class ConfigFile:
             ):
                 continue
             if isinstance(value, dict) and isinstance(target.get(key), dict):
-                if (*path, key) == ("channels", "proactive", "default_destination"):
+                if (*path, key) in {
+                    ("channels", "proactive", "default_destination"),
+                    ("channels", "proactive", "memory_preference"),
+                }:
                     target[key] = value
                 elif key == "mcp":
                     target[key] = _replace_mcp(target[key], value)

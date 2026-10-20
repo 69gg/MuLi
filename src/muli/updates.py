@@ -99,7 +99,7 @@ class Updates:
                     "created_at": now(),
                     "producer": "startup_update_check" if independent else "update_check",
                     "routing": (
-                        FrozenRouting.independent(self.config.settings)
+                        FrozenRouting.independent(self.config.settings, self.store.db)
                         if independent
                         else FrozenRouting.bound(reply_origin or ReplyOrigin())
                     ).dump(),
