@@ -647,7 +647,7 @@ def _management_source(
     if (
         plan is None
         or plan.get("status") not in {"completed", "failed"}
-        or plan.get("action") not in {"configure", "restart", "update"}
+        or plan.get("action") not in {"configure", "restart", "update", "adopt", "switch"}
         or any(data.get(field) != plan.get(field) for field in ("status", "action", "routing"))
         or FrozenRouting.load(plan.get("routing")).classification == "independent"
     ):
