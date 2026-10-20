@@ -43,8 +43,9 @@ class ManagedProcessIdentity:
 class BindingConfirmation:
     """Fresh backend attestation, never a durable authorization token.
 
-    The backend confirms configuration, selector (including proven absence)
-    and unit in that order under the actual writer lease and empty cgroup. It
+    Under the actual writer lease and empty cgroup, target installation confirms
+    configuration, selector (including proven absence), then unit. Base restore
+    changes and confirms those files in reverse order. It
     reloads when needed and compares fresh loaded unit properties to the unit
     referenced by ``loaded_unit``. That field is the attested raw unit digest,
     not a claim that systemd exposes the original file bytes. start() must

@@ -53,6 +53,66 @@ def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def transaction_url(configuration: bytes, action: str) -> str:
+    """Use the frozen configuration and the existing loopback-only endpoint."""
+    settings = Settings.model_validate_json(configuration)
+    host = settings.server.host
+    host = "127.0.0.1" if host in {"localhost", "0.0.0.0"} else "::1" if host == "::" else host
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise ObservationError("transaction_http_not_loopback") from None
+    if not address.is_loopback:
+        raise ObservationError("transaction_http_not_loopback")
+    host = f"[{host}]" if address.version == 6 else host
+    return f"http://{host}:{settings.server.port}/api/internal/management/{action}"
+
+
+async def transaction_request(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    generation: str,
+    boot: str,
+    challenge: str,
+    action: str,
+    seconds: float,
+    max_bytes: int,
+) -> dict[str, Any] | None:
+    """Share only the bounded nonce transport; callers validate their own proof."""
+    values = {"generation": generation, "boot": boot}
+    try:
+        async with asyncio.timeout(seconds):
+            async with client.stream(
+                "GET" if action == "readiness" else "POST",
+                url,
+                params=values if action == "readiness" else None,
+                json=None if action == "readiness" else values,
+                headers={"X-MuLi-Nonce": challenge, "Host": "localhost"},
+            ) as response:
+                if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                    raise ObservationError("transaction_http_encoding")
+                data = bytearray()
+                async for part in response.aiter_raw():
+                    if len(data) + len(part) > max_bytes:
+                        raise ObservationError("transaction_http_budget")
+                    data.extend(part)
+                if response.status_code == 503 and action == "readiness":
+                    return None
+                if response.status_code != 200:
+                    raise ObservationError("transaction_http_rejected")
+                value = json.loads(data, object_pairs_hook=_unique)
+                if not isinstance(value, dict):
+                    raise ObservationError("invalid_transaction_reply")
+                return value
+    except (httpx.TransportError, TimeoutError):
+        return None
+    except (ValueError, RecursionError) as exc:
+        if isinstance(exc, ObservationError):
+            raise
+        raise ObservationError("invalid_transaction_reply") from None
+
+
 class CgroupObservation:
     """Read a manager-provided relative cgroup path without following links."""
 
@@ -199,19 +259,9 @@ class LinuxControllerBackend(AbstractAsyncContextManager["LinuxControllerBackend
         return "base" if record.phase in {"rolling_back", "rolled_back"} else "target"
 
     def _url(self, record: TransactionRecord, role: Role | None, action: str) -> str:
-        settings = Settings.model_validate_json(
-            self.journal.snapshot(record, "target" if role == "target" else "base")
+        return transaction_url(
+            self.journal.snapshot(record, "target" if role == "target" else "base"), action
         )
-        host = settings.server.host
-        host = "127.0.0.1" if host in {"localhost", "0.0.0.0"} else "::1" if host == "::" else host
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            raise ObservationError("transaction_http_not_loopback") from None
-        if not address.is_loopback:
-            raise ObservationError("transaction_http_not_loopback")
-        host = f"[{host}]" if address.version == 6 else host
-        return f"http://{host}:{settings.server.port}/api/internal/management/{action}"
 
     async def _request(
         self, record: TransactionRecord, boot: str, action: str
@@ -220,38 +270,17 @@ class LinuxControllerBackend(AbstractAsyncContextManager["LinuxControllerBackend
         challenge = record.rollback_challenge if role == "base" else record.challenge
         if challenge is None:
             raise ObservationError("transaction_challenge_missing")
-        values = {"generation": record.generation, "boot": boot}
         url = self._url(record, role, action)
-        try:
-            async with asyncio.timeout(self.probe.limits.seconds):
-                async with self.client.stream(
-                    "GET" if action == "readiness" else "POST",
-                    url,
-                    params=values if action == "readiness" else None,
-                    json=None if action == "readiness" else values,
-                    headers={"X-MuLi-Nonce": challenge, "Host": "localhost"},
-                ) as response:
-                    if response.headers.get("Content-Encoding", "identity").lower() != "identity":
-                        raise ObservationError("transaction_http_encoding")
-                    data = bytearray()
-                    async for part in response.aiter_raw():
-                        if len(data) + len(part) > self.journal.limits.max_record_bytes:
-                            raise ObservationError("transaction_http_budget")
-                        data.extend(part)
-                    if response.status_code == 503 and action == "readiness":
-                        return None
-                    if response.status_code != 200:
-                        raise ObservationError("transaction_http_rejected")
-                    value = json.loads(data, object_pairs_hook=_unique)
-                    if not isinstance(value, dict):
-                        raise ObservationError("invalid_transaction_reply")
-                    return value
-        except (httpx.TransportError, TimeoutError):
-            return None
-        except (ValueError, RecursionError) as exc:
-            if isinstance(exc, ObservationError):
-                raise
-            raise ObservationError("invalid_transaction_reply") from None
+        return await transaction_request(
+            self.client,
+            url=url,
+            generation=record.generation,
+            boot=boot,
+            challenge=challenge,
+            action=action,
+            seconds=self.probe.limits.seconds,
+            max_bytes=self.journal.limits.max_record_bytes,
+        )
 
     def _proof(self, record: TransactionRecord, boot: str, value: dict[str, Any]) -> HealthProof:
         try:
