@@ -35,6 +35,7 @@ from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
 from muli.plugins import PluginManager
+from muli.process import _wait_cleanup
 from muli.providers import ProviderError
 from muli.runtime import Runtime
 from muli.service import UserService
@@ -159,14 +160,8 @@ def create_app(
                 "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
             )
         previous = config.settings.model_copy(deep=True)
-        await attention.close()
-        await web_voice.aclose()
-        await integration.close()
-        await channel_application.close()
-        await personal_io.close()
-        await memory_application.close()
-        try:
-            config.replace(target)
+
+        async def rebuild() -> None:
             await runtime.reconfigure()
             await memory_application.reconfigure()
             await channel_application.reconfigure()
@@ -174,16 +169,27 @@ def create_app(
             await integration.start()
             await attention.reconfigure()
             await web_voice.reconfigure()
-        except Exception:
-            config.replace(previous)
-            await runtime.reconfigure()
-            await memory_application.reconfigure()
-            await channel_application.reconfigure()
-            await personal_io.reconfigure()
-            await integration.start()
-            await attention.reconfigure()
-            await web_voice.reconfigure()
-            raise
+
+        async def apply() -> None:
+            try:
+                await attention.close()
+                await web_voice.aclose()
+                await integration.close()
+                await channel_application.close()
+                await personal_io.close()
+                await memory_application.close()
+                config.replace(target)
+                await rebuild()
+            except (Exception, asyncio.CancelledError):
+                config.replace(previous)
+                await rebuild()
+                raise
+
+        # The caller keeps configuration_lock until commit or recovery settles.
+        # Disconnecting an observer must not strand half of the application stopped.
+        applying = asyncio.create_task(apply(), name="muli-configuration")
+        if await _wait_cleanup(applying):
+            raise asyncio.CancelledError
 
     async def onboarding() -> None:
         if config.settings.onboarding_pending and config.settings.models.main.configured:
