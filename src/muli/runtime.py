@@ -612,7 +612,83 @@ class Runtime:
                     item = self.store.get(kind, identifier)
                     if item is not None and item.get("status") in {"running", "pending", "queued"}:
                         item["status"] = "interrupted" if kind != "session" else "idle"
-                        self.store.put(kind, item)
+                        session_id = item["id"] if kind == "session" else item.get("session_id")
+                        if not isinstance(session_id, str) or not session_id:
+                            self.store.put(kind, item)
+                            continue
+                        session = (
+                            item if kind == "session" else self.store.get("session", session_id)
+                        )
+                        self.store.event(
+                            "session.recovered",
+                            {
+                                "kind": kind,
+                                "object_id": identifier,
+                                "run_id": identifier if kind == "run" else item.get("run_id"),
+                                "session_status": (session or {}).get("status", "idle"),
+                            },
+                            session_id,
+                            objects=[(kind, item)],
+                        )
+
+    def live_approvals(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        """The same live waiter and durable state required by Permissions.resolve."""
+        approvals: list[dict[str, Any]] = []
+        for identifier, future in self.permissions.pending.items():
+            if future.done():
+                continue
+            item = self.store.get("approval", identifier)
+            if item is not None and item.get("status") == "pending":
+                if session_id is None or item.get("session_id") == session_id:
+                    approvals.append(item)
+        return approvals
+
+    def session_live(
+        self, session: dict[str, Any], *, candidate_run_id: str | None = None
+    ) -> dict[str, Any]:
+        """Read current execution ownership synchronously, never revive a stored task."""
+        session_id = str(session["id"])
+        run_id = self.run_ids.get(session_id)
+        run = self.store.get("run", run_id) if run_id else None
+        if run is None and candidate_run_id:
+            run = self.store.get("run", candidate_run_id)
+        if run is not None and run.get("session_id") != session_id:
+            run = None
+        task = self.tasks.get(session_id)
+        active_run_id = (
+            run_id
+            if task is not None
+            and not task.done()
+            and run is not None
+            and run.get("id") == run_id
+            and run.get("status") in {"queued", "running"}
+            else None
+        )
+        approvals = [
+            item
+            for item in self.live_approvals(session_id)
+            if active_run_id is not None and item.get("run_id") == active_run_id
+        ]
+        status = "paused" if session.get("status") == "paused" else "idle"
+        if active_run_id is not None:
+            status = "approval" if approvals else "running"
+        elif run is not None and run.get("status") in {
+            "completed",
+            "failed",
+            "cancelled",
+            "paused",
+            "interrupted",
+        }:
+            status = str(run["status"])
+        return {
+            "session_id": session_id,
+            "run_id": active_run_id,
+            "status": status,
+            "run": {key: run[key] for key in ("id", "status", "error") if key in run}
+            if run is not None
+            else None,
+            "pending_approvals": approvals,
+        }
 
     def configure(self) -> None:
         settings = self.config.settings
@@ -1455,11 +1531,16 @@ class Runtime:
 
     async def _tool_completed(self, call: ToolCall, result: Any, session_id: str) -> None:
         rendered = json.dumps(result, ensure_ascii=False, default=str)
-        state: dict[str, str] = {}
-        if isinstance(result, dict) and result.get("status") == "not_executed":
-            state["status"] = "not_executed"
-            if result.get("code") == "task_paused":
-                state["code"] = "task_paused"
+        state: dict[str, str] = {"status": "completed"}
+        if isinstance(result, dict):
+            if result.get("status") == "unknown" or result.get("outcome") == "unknown":
+                state["status"] = "unknown"
+            elif result.get("status") == "not_executed":
+                state["status"] = "not_executed"
+                if result.get("code") == "task_paused":
+                    state["code"] = "task_paused"
+            elif result.get("status") == "failed" or result.get("error"):
+                state["status"] = "failed"
         await self.bus.emit(
             "tool.completed",
             {

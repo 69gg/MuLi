@@ -100,6 +100,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [中文唤醒与声纹桥接](docs/voice.md)
 - [工作台交互](docs/frontend.md)
 - [事件订阅与恢复位置](docs/event-subscription.md)
+- [会话恢复与当前执行](docs/session-recovery.md)
 - [开发验证与资源保护](docs/development.md)
 - [配置、迁移与运维](docs/operations.md)
 - [迭代记录](docs/iterations.md)
