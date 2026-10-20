@@ -16,6 +16,7 @@ from typing import Any
 from muli.evidence import decode_utf8
 from muli.memory_schema import SCHEMA
 from muli.store import Store, new_id, now
+from muli.store_schema import validate_existing_schema
 
 LAYERS = frozenset({"identity", "preference", "episodic", "semantic", "procedural"})
 _KIND_LAYER = {
@@ -87,6 +88,9 @@ class Memory:
             max_vector_scan=max_vector_scan,
             max_community_members=max_community_members,
         )
+        if not self.store.migration_allowed:
+            validate_existing_schema(self.store.db, "memory")
+            return
         self.store.db.executescript(SCHEMA)
         with self.store.db:
             self.store.db.execute(

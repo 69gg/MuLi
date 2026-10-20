@@ -17,23 +17,12 @@ from muli.maintenance import Admission
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_account
 from muli.store import Store, new_id, now
+from muli.store_schema import CHANNEL_SCHEMA as _SCHEMA
+from muli.store_schema import validate_existing_schema
 
 from .adapters import QQ, Adapter, OneBot, Telegram
 from .types import NAMES, ChannelError, ChannelsConfig, FileContent, IncomingMessage, Submit
 from .weixin import Weixin
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS channel_state (name TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS channel_inbound (
- id TEXT PRIMARY KEY,name TEXT NOT NULL,attachment_ids TEXT NOT NULL DEFAULT '[]',
- receipt TEXT,created_at REAL NOT NULL,fingerprint TEXT);
-CREATE TABLE IF NOT EXISTS channel_outbox (
- id TEXT PRIMARY KEY,name TEXT NOT NULL,route TEXT NOT NULL,payload TEXT NOT NULL,
- state TEXT NOT NULL,next_part INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,
- next_attempt REAL NOT NULL,last_error TEXT NOT NULL DEFAULT '',receipts TEXT NOT NULL DEFAULT '[]',
- created_at REAL NOT NULL,updated_at REAL NOT NULL);
-CREATE INDEX IF NOT EXISTS channel_outbox_ready ON channel_outbox(state,next_attempt,created_at);
-"""
 
 
 def encoded(value: Any) -> str:
@@ -61,6 +50,17 @@ class ChannelManager:
         self.attachments = attachments
         self.delivery_guard = delivery_guard
         self.admission = admission or Admission()
+        # Validate before constructing an owned client, including on reconfigure.
+        if not self.store.migration_allowed:
+            validate_existing_schema(self.store.db, "channel")
+        else:
+            self.store.db.executescript(_SCHEMA)
+            columns = {
+                row[1] for row in self.store.db.execute("PRAGMA table_info(channel_inbound)")
+            }
+            if "fingerprint" not in columns:
+                with self.store.db:
+                    self.store.db.execute("ALTER TABLE channel_inbound ADD COLUMN fingerprint TEXT")
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.adapters: dict[str, Adapter] = {
@@ -80,11 +80,6 @@ class ChannelManager:
         self._closed = False
         self._stopped = False
         self._revocation_after = ""
-        self.store.db.executescript(_SCHEMA)
-        columns = {row[1] for row in self.store.db.execute("PRAGMA table_info(channel_inbound)")}
-        if "fingerprint" not in columns:
-            with self.store.db:
-                self.store.db.execute("ALTER TABLE channel_inbound ADD COLUMN fingerprint TEXT")
 
     def _account(self, name: str) -> str:
         return channel_account(name, self.config.profile(name))
