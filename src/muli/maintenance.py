@@ -124,9 +124,20 @@ class BootPermit:
         boot: str,
         installation: str,
         service: str,
+        lease: FixedLock | None = None,
     ) -> Self:
-        lease = journal.writer_lease().__enter__()
+        # An adopted lease transfers ownership, including cleanup on failure.
+        lease = lease if lease is not None else journal.writer_lease().__enter__()
         try:
+            lease.check()
+            journal.writer_directory.check()
+            actual = os.fstat(lease.directory.fd)
+            expected = os.fstat(journal.writer_directory.fd)
+            if lease.name != "lease" or (actual.st_dev, actual.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                raise MaintenanceError("foreign_writer_lease")
             record = journal.read()
             role: Role | None = None
             if record is not None and not record.resolved:
