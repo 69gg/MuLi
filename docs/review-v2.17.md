@@ -1,6 +1,6 @@
 # 2.17 明确记忆偏好与主动通知
 
-状态：候选整合中。基于 2.16 的默认目的地增加可撤销的记忆绑定；本版没有跨进程恢复或程序 A/B 更新。
+状态：已发布。基于 2.16 的默认目的地增加可撤销的记忆绑定；本版没有跨进程恢复或程序 A/B 更新。
 
 ## 实现与独立审查
 
@@ -22,6 +22,19 @@
 
 首次增量 mypy 在未更改的 YAML 导入处报三项 unused-ignore；保持源码和检查规则不变，以 `--no-incremental` 重建缓存后通过（峰值 378.3 MiB），随后常规增量检查也通过。此结果只确认新旧缓存行为差异，不将未重现的内部原因归为业务代码缺陷或放宽类型规则。
 
-离线构建 wheel/sdist，并在源码目录外临时安装验证导入、网页资产、API 文档、提示词、默认关闭桌面能力、任务控制和 lifespan；发行标签、版本、changelog 与两种包元数据一致。检查 service 2.008 秒、峰值 90.6 MiB、swap 0。精确签名提交的远端矩阵和正式发行尚待验证。
+离线构建 wheel/sdist，并在源码目录外临时安装验证导入、网页资产、API 文档、提示词、默认关闭桌面能力、任务控制和 lifespan；发行标签、版本、changelog 与两种包元数据一致。检查 service 2.008 秒、峰值 90.6 MiB、swap 0。精确签名提交的远端矩阵和正式发行证据列于下文。
 
 本地保持单次 1 GiB、共享 2 GiB、swap 0、一个逻辑 CPU 等效预算及有限期限，验证协调串行；未更改用户安装或服务。
+
+## 正式发布证据
+
+签名提交 `2c04365cc0cd1fbff0fe26392bec2e732b08eb7f` 对应 [PR #20](https://github.com/69gg/MuLi/pull/20)，精确提交的 [PR 矩阵](https://github.com/69gg/MuLi/actions/runs/39468563521) 和 [main 矩阵](https://github.com/69gg/MuLi/actions/runs/39470669224) 均通过；[发布流水线](https://github.com/69gg/MuLi/actions/runs/39470703915) 11 项全部通过。
+
+Git 入口超时期间，使用 GitHub Git Data API 写入原始签名标签对象，远端摘要 `7a1d5a2b0733315fdd464c308d6b64af937aa617` 与本地一致，GitHub verification 为 valid。先以 `force=false` 快进 main，确认成功后创建该标签引用；没有修改全局网络配置或绕过签名，两个引用的 API 写入不是一次原子 Git push。
+
+[GitHub 2.17.0](https://github.com/69gg/MuLi/releases/tag/v2.17.0) 于 2026-10-20 18:05:54 UTC 发布；[PyPI 2.17.0](https://pypi.org/project/muli-agent/2.17.0/) 两项文件与 GitHub 大小和 SHA-256 一致。只查询元数据，未下载或安装远端包。
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| wheel | 537416 | `34f6ef184e803144f9b8be10ab55ead56aa3ef2e2f0c789c49520e272245aae0` |
+| sdist | 3112592 | `75e04dc2f322d7fe05953b4aae839b3586f5c336eff7403c751fa7259aba5a7d` |
