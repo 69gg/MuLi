@@ -26,6 +26,7 @@ from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
 from muli.conversation import MAX_EVENT_ID_CHARS
 from muli.evidence import EvidenceError
+from muli.extensions import ExtensionError
 from muli.history_evidence import HistoryEvidence
 from muli.local_services import LocalServices
 from muli.management import SelfManagement
@@ -162,6 +163,9 @@ def create_app(
             raise ValueError(
                 "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
             )
+        if runtime.extensions.configuration_only(config.settings, target):
+            await runtime.extensions.apply_locked(target, persist=True)
+            return
         previous = config.settings.model_copy(deep=True)
 
         async def rebuild() -> None:
@@ -320,7 +324,8 @@ def create_app(
 
     @app.exception_handler(ValueError)
     async def bad_input(request: Request, exc: ValueError) -> JSONResponse:
-        return JSONResponse({"detail": str(exc)[:1000]}, status_code=400)
+        status = 409 if isinstance(exc, ExtensionError) and exc.code == "runtime_busy" else 400
+        return JSONResponse({"detail": str(exc)[:1000]}, status_code=status)
 
     @app.exception_handler(EvidenceError)
     async def unavailable_evidence(request: Request, exc: EvidenceError) -> JSONResponse:
@@ -596,6 +601,7 @@ def create_app(
             "computer": await runtime.computer.status(),
             "chiliarch": integration.status(),
             "mcp": runtime.mcp.status(),
+            "extensions": runtime.extensions.status(),
             "notifications": runtime.notifications.status(),
             "channels": channel_application.manager.status(),
             "capture": personal_io.capture.status(),
@@ -621,7 +627,16 @@ def create_app(
             "plugins": plugins.inventory(),
             "plugins_restart_required": plugins.restart_required,
             "update": runtime.store.get("update", "latest"),
+            "extensions": runtime.extensions.status(),
         }
+
+    @app.get("/api/extensions")
+    async def extension_status() -> dict[str, Any]:
+        return runtime.extensions.status()
+
+    @app.post("/api/extensions/reload")
+    async def reload_extensions() -> dict[str, Any]:
+        return runtime.extensions.request_reload()
 
     @app.post("/api/management/{identifier}/cancel")
     async def cancel_management(identifier: str) -> dict[str, Any]:

@@ -469,6 +469,36 @@ class Server(Section):
         return self
 
 
+class SkillsSettings(Section):
+    enabled: bool = Field(default=True, strict=True)
+    directory: str = ""
+    max_entries: int = Field(default=256, ge=1, le=4096, strict=True)
+    max_skills: int = Field(default=64, ge=1, le=1024, strict=True)
+    max_source_bytes: int = Field(default=262144, ge=1, le=2_097_152, strict=True)
+    max_total_source_bytes: int = Field(default=2_097_152, ge=1, le=8_388_608, strict=True)
+    max_frontmatter_bytes: int = Field(default=16384, ge=1, le=262144, strict=True)
+    max_catalog_chars: int = Field(default=12000, ge=1, le=64000, strict=True)
+    max_active_skills: int = Field(default=4, ge=1, le=32, strict=True)
+    max_active_chars: int = Field(default=24000, ge=1, le=256000, strict=True)
+    max_yaml_depth: int = Field(default=8, ge=1, le=32, strict=True)
+    max_yaml_nodes: int = Field(default=256, ge=1, le=4096, strict=True)
+
+
+class ExtensionSettings(Section):
+    mcp_directory: str = ""
+    watch_enabled: bool = Field(default=True, strict=True)
+    scan_interval_seconds: float = Field(default=2, ge=0.25, le=300, allow_inf_nan=False)
+    debounce_seconds: float = Field(default=0.5, ge=0, le=60, allow_inf_nan=False)
+    max_entries: int = Field(default=256, ge=1, le=4096, strict=True)
+    max_mcp_fragments: int = Field(default=32, ge=1, le=256, strict=True)
+    max_mcp_fragment_bytes: int = Field(default=65536, ge=1, le=1_048_576, strict=True)
+    max_mcp_source_bytes: int = Field(default=262144, ge=1, le=4_194_304, strict=True)
+    max_mcp_pages: int = Field(default=8, ge=1, le=64, strict=True)
+    max_mcp_tools: int = Field(default=100, ge=1, le=1000, strict=True)
+    max_mcp_catalog_bytes: int = Field(default=262144, ge=1, le=4_194_304, strict=True)
+    candidate_timeout_seconds: float = Field(default=30, gt=0, le=180, allow_inf_nan=False)
+
+
 class Settings(Section):
     models: Models = Field(default_factory=Models)
     media: MediaSettings = Field(default_factory=MediaSettings)
@@ -478,6 +508,8 @@ class Settings(Section):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     plugins: PluginSettings = Field(default_factory=PluginSettings)
     updates: UpdateSettings = Field(default_factory=UpdateSettings)
+    skills: SkillsSettings = Field(default_factory=SkillsSettings)
+    extensions: ExtensionSettings = Field(default_factory=ExtensionSettings)
     onboarding_pending: bool = False
     default_mode: Literal["ask", "auto", "yolo"] = "auto"
     workspace_roots: list[str] = Field(default_factory=lambda: [str(Path.home())])
