@@ -51,21 +51,24 @@ export function transcribeAttachment(attachmentId, { signal } = {}) {
 }
 
 /** CR, LF, split CRLF, comments and multiline data are handled incrementally. */
-export function createSSEParser(onEvent) {
+export function createSSEParser(onEvent, { onId } = {}) {
   let buffer = "";
   let lastId = "";
-  let frame = { data: [], type: "message", id: "" };
+  let frame = { data: [], type: "message", id: undefined };
   const consumeLine = (line) => {
     if (!line) {
       if (frame.data.length) {
         const raw = frame.data.join("\n");
         let payload;
         try { payload = JSON.parse(raw); } catch { payload = raw; }
+        const id = frame.id ?? (payload && typeof payload === "object" ? payload.id : undefined) ?? lastId;
         onEvent(payload && typeof payload === "object" && payload.type
-          ? { ...payload, id: payload.id ?? (frame.id || lastId) }
-          : { id: frame.id || lastId, type: frame.type, data: payload });
+          ? { ...payload, id }
+          : { id, type: frame.type, data: payload });
       }
-      frame = { data: [], type: "message", id: "" };
+      // An empty id is an explicit reset, including a completed id-only frame.
+      if (frame.id !== undefined) onId?.(frame.id);
+      frame = { data: [], type: "message", id: undefined };
       return;
     }
     if (line.startsWith(":")) return;
@@ -94,7 +97,7 @@ export function createSSEParser(onEvent) {
   };
 }
 
-export async function readEvents(path, { signal, after = "", onEvent, onOpen }) {
+export async function readEvents(path, { signal, after = "", onEvent, onOpen, onId }) {
   const separator = path.includes("?") ? "&" : "?";
   const suffix = after ? `${separator}after=${encodeURIComponent(after)}` : "";
   const response = await fetch(`/api${path}${suffix}`, {
@@ -105,7 +108,7 @@ export async function readEvents(path, { signal, after = "", onEvent, onOpen }) 
     throw new ApiError(`实时连接暂不可用（${response.status}）`, response.status);
   }
   onOpen?.();
-  const parser = createSSEParser(onEvent);
+  const parser = createSSEParser(onEvent, { onId });
   const decoder = new TextDecoder();
   const reader = response.body.getReader();
   try {

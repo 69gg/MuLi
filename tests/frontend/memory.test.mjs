@@ -6,6 +6,7 @@ import { ApiError } from "../../web/api.mjs";
 
 // Run the actual application functions and registered dialog close handler.
 // No browser library, server, model, account or real database is involved.
+// Compare DOM/slot identity through booleans: failed object diffs traverse the cyclic mock graph.
 const app = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
 const application = app.slice(app.indexOf("const ICONS ="), app.indexOf("\nfillIcons();"));
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -129,7 +130,13 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   runInNewContext(application + `
     const realOtherView = renderOtherView;
     renderChrome = () => {}; renderOtherView = () => {}; renderChat = () => {}; toast = () => {};
+    const activateConnection = () => {
+      const owner = beginConnection(); owner.ready = true;
+      owner.sessions.start(); owner.notifications.start(); return owner;
+    };
+    activateConnection();
     globalThis.ui = { state, renderMemories, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories,
+      activateConnection,
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       stopEvents() { globalController?.abort(); },
       get slot() { return memoryDialog; }, get path() { return memoryPath; }, get submit() { return dialogSubmit; } };
@@ -214,7 +221,7 @@ for (const [name, override] of [["memory identity", { memory_id: "other" }], ["s
     const item = fixtureMemory();
     const h = harness(async (path) => path.includes("/source?") ? sourcePage(item, "PRIVATE", 0, 7, override) : item);
     await h.ui.showMemoryEvidence(item.id); await h.expand("查看原文");
-    assert.equal(h.ui.slot.page, null); assert.equal(h.body().includes("PRIVATE"), false);
+    assert.equal(h.ui.slot.page === null, true); assert.equal(h.body().includes("PRIVATE"), false);
     assert.equal(h.body().includes(item.quote), false); assert.ok(h.button("重新核查"));
   });
 }
@@ -228,7 +235,7 @@ for (const status of [404, 409]) test(`source ${status} clears existing evidence
   });
   await h.ui.showMemoryEvidence(item.id); await h.expand("查看原文"); unavailable = true;
   await h.button("下一段").dispatch("click"); await flush();
-  assert.equal(h.ui.slot.page, null); assert.equal(h.body().includes("PRIVATE"), false); assert.equal(h.body().includes(item.quote), false);
+  assert.equal(h.ui.slot.page === null, true); assert.equal(h.body().includes("PRIVATE"), false); assert.equal(h.body().includes(item.quote), false);
   assert.ok(h.button("重新核查")); assert.equal(h.requests.some((entry) => entry.path.includes("/sessions/")), false);
 });
 
@@ -246,7 +253,7 @@ test("closing aborts and clears source/history, and both late responses remain i
   const h = harness(async (path) => path.includes("/source?") ? source.promise : path.endsWith("/revisions") ? history.promise : item);
   await h.ui.showMemoryEvidence(item.id); await h.expand("查看原文"); await h.expand("修改历史");
   const slot = h.ui.slot, signals = h.requests.slice(1).map((entry) => entry.signal);
-  h.dialog.close(); await flush(); assert.equal(h.ui.slot, null);
+  h.dialog.close(); await flush(); assert.equal(h.ui.slot === null, true);
   assert.ok(signals.every((signal) => signal.aborted)); assert.equal(slot.content.textContent, ""); assert.equal(slot.item, null);
   source.resolve(sourcePage(item, "LATE_PRIVATE")); history.resolve({ items: [{ snapshot: { content: "LATE_HISTORY" } }] }); await flush();
   assert.equal(h.body(), ""); assert.equal(slot.sourceRegion.textContent, ""); assert.equal(slot.historyList.textContent, "");
@@ -257,7 +264,7 @@ test("changing management view or pagehide releases private evidence and pending
     const source = deferred(), item = fixtureMemory();
     const h = harness(async (path) => path.includes("/source?") ? source.promise : item);
     await h.ui.showMemoryEvidence(item.id); await h.expand("查看原文"); const signal = h.requests.at(-1).signal;
-    await leave(h); assert.equal(h.ui.slot, null); assert.equal(signal.aborted, true); assert.equal(h.body(), "");
+    await leave(h); assert.equal(h.ui.slot === null, true); assert.equal(signal.aborted, true); assert.equal(h.body(), "");
     source.resolve(sourcePage(item, "LATE_PRIVATE")); await flush(); assert.equal(h.body(), "");
   }
 });
@@ -267,8 +274,8 @@ test("401 clears the modal immediately and late source data cannot reopen it", a
   const h = harness(async (path) => path.includes("/source?") ? source.promise : path.endsWith("/revisions") ? history.promise : item);
   await h.ui.showMemoryEvidence(item.id); await h.expand("查看原文"); await h.expand("修改历史");
   history.reject(new ApiError("请登录", 401)); await flush();
-  assert.equal(h.ui.slot, null); assert.equal(h.dialog.open, false); assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.body(), "");
-  assert.equal(h.document.activeElement, h.document.querySelector("#login-password"));
+  assert.equal(h.ui.slot === null, true); assert.equal(h.dialog.open, false); assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.body(), "");
+  assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
   source.resolve(sourcePage(item, "LATE_PRIVATE")); await flush(); assert.equal(h.body(), "");
 });
 
@@ -279,7 +286,7 @@ test("source-level forgetting clears all currently displayed evidence and aborts
   const signal = h.requests.at(-1).signal;
   h.ui.startGlobalEvents();
   h.emitGlobal({ type: "memory.forgotten", data: { memory_ids: ["another-memory"], source_id: item.source_id } });
-  assert.equal(signal.aborted, true); assert.equal(h.ui.slot.page, null); assert.equal(h.body().includes("PRIVATE"), false); assert.equal(h.body().includes(item.quote), false);
+  assert.equal(signal.aborted, true); assert.equal(h.ui.slot.page === null, true); assert.equal(h.body().includes("PRIVATE"), false); assert.equal(h.body().includes(item.quote), false);
   next.resolve(sourcePage(item, "OLD", 7, 10)); await flush(); assert.equal(h.body().includes("OLD"), false); h.ui.stopEvents();
 });
 
@@ -359,7 +366,7 @@ test("an own-save event before the response permits a fresh check and returns fo
   });
   await h.ui.editMemory(item.id);
   const input = h.dialog.querySelector("textarea"); input.value = updated.content;
-  assert.equal(h.document.activeElement, input);
+  assert.equal(h.document.activeElement === input, true);
   await h.form.dispatch("submit");
   assert.equal(h.dialog.open, true); assert.ok(h.body().includes(updated.content)); assert.equal(h.ui.slot.invalidated, false);
   assert.equal(h.requests.filter((entry) => entry.method === "PATCH").length, 1);
@@ -372,10 +379,10 @@ test("ordinary asynchronous detail and source reads keep the reader's current fo
   const h = harness(async (path) => path.includes("/source?") ? source.promise : detail.promise);
   const pending = h.ui.showMemoryEvidence(item.id), close = h.document.querySelector("#dialog-close");
   close.focus(); detail.resolve(item); await pending;
-  assert.equal(h.document.activeElement, close);
+  assert.equal(h.document.activeElement === close, true);
   await h.expand("查看原文"); close.focus();
   source.resolve(sourcePage(item, "原文")); await flush();
-  assert.equal(h.document.activeElement, close);
+  assert.equal(h.document.activeElement === close, true);
 });
 
 test("an external update preserves an open correction draft and requires rechecking before saving", async () => {
@@ -394,7 +401,7 @@ test("a save completing after close cannot reopen private detail", async () => {
   const h = harness(async (_path, options) => options.method === "PATCH" ? save.promise : item);
   await h.ui.editMemory(item.id); const submission = h.ui.submit(h.form); h.dialog.close(); await flush();
   save.resolve(item); await submission;
-  assert.equal(h.body(), ""); assert.equal(h.ui.slot, null); assert.equal(h.requests.length, 2);
+  assert.equal(h.body(), ""); assert.equal(h.ui.slot === null, true); assert.equal(h.requests.length, 2);
 });
 
 test("closing after the underlying list rerenders restores the same memory check button", async () => {
@@ -402,7 +409,7 @@ test("closing after the underlying list rerenders restores the same memory check
   h.other.replaceChildren(h.ui.renderMemories()); h.other.querySelector("[data-action=memory-evidence]").focus();
   await h.ui.showMemoryEvidence(item.id); h.other.replaceChildren(h.ui.renderMemories());
   const currentButton = h.other.querySelector("[data-action=memory-evidence]");
-  h.dialog.close(); await flush(); assert.equal(h.document.activeElement, currentButton);
+  h.dialog.close(); await flush(); assert.equal(h.document.activeElement === currentButton, true);
 });
 
 test("a late source cannot overwrite another modal, including its heading and actions", async () => {
@@ -412,7 +419,7 @@ test("a late source cannot overwrite another modal, including its heading and ac
   const content = h.document.createElement("p"); content.textContent = "其他内容";
   h.ui.openDialog({ title: "其他设置", content, readOnly: true });
   source.resolve(sourcePage(item, "LATE_PRIVATE")); await flush();
-  assert.equal(signal.aborted, true); assert.equal(h.ui.slot, null); assert.equal(h.body(), "其他内容");
+  assert.equal(signal.aborted, true); assert.equal(h.ui.slot === null, true); assert.equal(h.body(), "其他内容");
   assert.equal(h.document.querySelector("#dialog-title").textContent, "其他设置");
 });
 
@@ -436,7 +443,7 @@ test("queued toggles from detached old details cannot prefetch after a new check
   h.ui.invalidateMemoryEvidence({ type: "memory.updated", data: { memory_ids: [item.id] } });
   await h.button("重新核查").dispatch("click"); await flush();
   for (const detail of oldDetails) { detail.open = true; await detail.dispatch("toggle"); }
-  await flush(); assert.equal(h.requests.length, 2); assert.equal(h.ui.slot.page, null);
+  await flush(); assert.equal(h.requests.length, 2); assert.equal(h.ui.slot.page === null, true);
 });
 
 test("all persisted memory types have a Chinese option and survive the actual correction form submission", async () => {
@@ -561,7 +568,7 @@ for (const [label, mutate] of badPaths) {
   test(`a fresh ${label} path is rejected without displaying a fabricated chain`, async () => {
     const item = graphMemory(), invalid = graphMemory(); mutate(invalid);
     const h = harness(async () => ({ items: [invalid] })); await clickMemoryButton(h, mountGraphResults(h, [item]));
-    assert.equal(h.ui.path.via, null); assert.equal(h.ui.path.region.querySelectorAll("[data-memory-path-ref]").length, 0);
+    assert.equal(h.ui.path.via === null, true); assert.equal(h.ui.path.region.querySelectorAll("[data-memory-path-ref]").length, 0);
     assert.ok(h.ui.path.region.textContent.includes("当前未返回该路径")); assert.equal(h.requests.length, 1);
   });
 }
@@ -570,7 +577,7 @@ test("fresh omitted, missing, lexical-only and mismatched-revision results never
   const item = graphMemory();
   for (const payload of [{ items: [{ ...item, path_omitted: true }] }, { items: [] }, { items: [fixtureMemory(item.id, { matched_by: "lexical" })] }, { items: [item], revision: 8 }]) {
     const h = harness(async () => payload); await clickMemoryButton(h, mountGraphResults(h, [item]));
-    assert.equal(h.ui.path.via, null); assert.equal(h.ui.path.region.querySelectorAll("[data-memory-path-ref]").length, 0);
+    assert.equal(h.ui.path.via === null, true); assert.equal(h.ui.path.region.querySelectorAll("[data-memory-path-ref]").length, 0);
     assert.ok(h.ui.path.region.textContent.includes(payload.items[0]?.path_omitted ? "因预算省略" : "当前未返回该路径")); assert.equal(h.requests.length, 1);
   }
 });
@@ -580,7 +587,7 @@ test("collapsing a pending path aborts its read and a late response cannot reope
   const toggle = mountGraphResults(h, [item]); await clickMemoryButton(h, toggle);
   const region = h.ui.path.region, signal = h.requests[0].signal;
   await clickMemoryButton(h, toggle);
-  assert.equal(h.ui.path, null); assert.equal(signal.aborted, true); assert.equal(region.hidden, true); assert.equal(region.textContent, "");
+  assert.equal(h.ui.path === null, true); assert.equal(signal.aborted, true); assert.equal(region.hidden, true); assert.equal(region.textContent, "");
   page.resolve({ items: [item] }); await flush();
   assert.equal(region.textContent, ""); assert.equal(toggle.getAttribute("aria-expanded"), "false"); assert.equal(h.document.activeElement === toggle, true);
 });
@@ -601,7 +608,7 @@ for (const type of ["memory.updated", "memory.forgotten"]) {
     const page = deferred(), item = graphMemory(), h = harness(async () => page.promise);
     await clickMemoryButton(h, mountGraphResults(h, [item])); const region = h.ui.path.region;
     h.ui.startGlobalEvents(); h.emitGlobal({ type, data: { memory_ids: ["not-the-final-memory"], source_id: "any-source" } });
-    assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.path.via, null); assert.ok(region.textContent.includes("关系已有变更"));
+    assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.path.via === null, true); assert.ok(region.textContent.includes("关系已有变更"));
     page.resolve({ items: [item] }); await flush(); assert.equal(region.querySelectorAll("[data-memory-path-ref]").length, 0); assert.equal(h.requests.length, 1); h.ui.stopEvents();
   });
 }
@@ -623,7 +630,7 @@ test("a graph change clears its path without interrupting an unrelated original 
   await clickMemoryButton(h, h.other.querySelector('[data-memory-path-ref="seed"]'));
   assert.ok(h.body().includes(proof.content)); h.ui.startGlobalEvents();
   h.emitGlobal({ type: "memory.updated", data: { memory_ids: ["different-memory"], source_id: "different-source" } });
-  assert.equal(h.ui.path.via, null); assert.ok(h.body().includes(proof.content));
+  assert.equal(h.ui.path.via === null, true); assert.ok(h.body().includes(proof.content));
   h.dialog.close(); await flush(); assert.equal(h.document.activeElement === h.ui.path.button, true);
   await h.ui.editMemory(proof.id); h.dialog.querySelector("textarea").value = "未保存的要求";
   h.emitGlobal({ type: "memory.forgotten", data: { memory_ids: ["another-memory"], source_id: "another-source" } });
@@ -644,7 +651,7 @@ test("a changed query cancels its path and old search responses cannot replace t
   const h = harness(async (url) => url.endsWith("Lumi") ? path.promise : url.endsWith("old") ? old.promise : { items: [latest] });
   await clickMemoryButton(h, mountGraphResults(h, [item])); const region = h.ui.path.region;
   const input = h.other.querySelector("#memory-search"), form = h.other.querySelector("form"); input.value = "old";
-  const older = form.dispatch("submit"); assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.path, null);
+  const older = form.dispatch("submit"); assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.path === null, true);
   await h.ui.searchMemories("new"); assert.equal(h.requests[1].signal.aborted, true);
   path.resolve({ items: [item] }); old.resolve({ items: [item] }); await older; await flush();
   assert.equal(h.ui.state.memoryQuery, "new"); assert.equal(h.ui.state.memories[0].id, latest.id); assert.ok(h.other.textContent.includes(latest.content)); assert.equal(region.textContent, "");
@@ -659,7 +666,7 @@ test("view/tab changes, rerenders and pagehide clear pending path data without a
   ]) {
     const page = deferred(), item = graphMemory(), h = harness(async () => page.promise);
     await clickMemoryButton(h, mountGraphResults(h, [item])); const region = h.ui.path.region;
-    await leave(h); assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.path, null); assert.equal(region.textContent, "");
+    await leave(h); assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.path === null, true); assert.equal(region.textContent, "");
     page.resolve({ items: [item] }); await flush(); assert.equal(region.textContent, "");
   }
 });
@@ -668,7 +675,7 @@ test("a path 401 clears private references and returns to the password gate with
   const page = deferred(), item = graphMemory(), h = harness(async () => page.promise);
   await clickMemoryButton(h, mountGraphResults(h, [item])); const region = h.ui.path.region;
   page.reject(new ApiError("请登录", 401)); await flush();
-  assert.equal(h.ui.path, null); assert.equal(region.textContent, ""); assert.equal(h.ui.state.auth.authenticated, false);
+  assert.equal(h.ui.path === null, true); assert.equal(region.textContent, ""); assert.equal(h.ui.state.auth.authenticated, false);
   assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true); assert.equal(h.requests.length, 1);
 });
 
@@ -709,7 +716,7 @@ test("a disclosure rendered for the previous query cannot read against a newer p
   const page = deferred(), item = graphMemory(), h = harness(async () => page.promise);
   const oldToggle = mountGraphResults(h, [item]);
   const pending = h.ui.searchMemories("changed-query"); await clickMemoryButton(h, oldToggle);
-  assert.equal(h.requests.length, 1); assert.equal(h.ui.path, null);
+  assert.equal(h.requests.length, 1); assert.equal(h.ui.path === null, true);
   page.resolve({ items: [] }); await pending;
 });
 

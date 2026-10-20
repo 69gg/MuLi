@@ -63,6 +63,7 @@ const state = {
 };
 let sessionController = null;
 let globalController = null;
+let connection = null;
 let sessionRequestVersion = 0;
 let viewRequestVersion = 0;
 let queuedRender = false;
@@ -134,7 +135,118 @@ async function request(path, options) {
   catch (error) { if (error.status === 401 && path !== "/auth/login") showLogin(); throw error; }
 }
 
+/** One active read and one shared next-read promise; events never add waiters. */
+function createSummaryLane({ read, publish, failed = () => {}, current = () => true }) {
+  let active = null, queued = null, dirty = false, enabled = false, disposed = false, error = null;
+  const pending = () => {
+    let resolve;
+    const promise = new Promise((finish) => { resolve = finish; });
+    return { promise, resolve };
+  };
+  const pump = () => {
+    if (disposed || !enabled || active || !dirty || !current()) return;
+    dirty = false;
+    const pass = active = queued ?? pending(); queued = null;
+    void (async () => {
+      let fresh = false;
+      try {
+        const value = await read();
+        if (disposed || !current()) return;
+        publish(value); error = null; fresh = true;
+      } catch (reason) {
+        if (!disposed && current()) { error = reason; failed(reason); }
+      } finally {
+        pass.resolve(fresh);
+        if (active !== pass) return;
+        active = null;
+        if (!fresh) {
+          queued?.resolve(false); queued = null;
+          // A failed read stops this attempt. A later real trigger may retry.
+          return;
+        }
+        pump();
+      }
+    })();
+  };
+  return {
+    get error() { return error; },
+    request() {
+      if (disposed || !current()) return Promise.resolve(false);
+      dirty = true;
+      const pass = queued ??= pending();
+      pump();
+      return pass.promise;
+    },
+    start() { enabled = true; pump(); },
+    invalidate() {
+      disposed = true; dirty = false;
+      active?.resolve(false); queued?.resolve(false); active = null; queued = null;
+    },
+  };
+}
+
+function connectionCurrent(owner) {
+  return !!owner && connection === owner && !owner.controller.signal.aborted;
+}
+
+function invalidateConnection() {
+  const owner = connection; connection = null;
+  owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.controller.abort();
+  globalController?.abort(); sessionController?.abort();
+  teamPager.invalidate?.();
+  state.connected = false; state.streamConnected = false;
+}
+
+function beginConnection() {
+  invalidateConnection();
+  const owner = { controller: new AbortController(), ready: false, position: "0" };
+  connection = owner;
+  owner.sessions = createSummaryLane({
+    current: () => connectionCurrent(owner), read: () => ownedRequest("/sessions", {}, owner),
+    publish: (payload) => {
+      state.sessions = collection(payload); state.sessionsError = "";
+      const active = state.sessions.find((session) => session.id === state.activeSession?.id);
+      if (active) state.activeSession = active;
+      renderSessions(); renderChrome();
+    },
+    failed: (error) => { state.sessionsError = error.message; renderSessions(); renderChrome(); },
+  });
+  owner.notifications = createSummaryLane({
+    current: () => connectionCurrent(owner), read: () => ownedRequest("/notifications", {}, owner),
+    publish: (payload) => {
+      state.notifications = collection(payload); renderChrome();
+      if (state.view === "notifications") renderOtherView();
+    },
+  });
+  return owner;
+}
+
+/** Raw API calls keep a previous connection's 401 out of the login handler. */
+async function ownedRequest(path, options = {}, owner = connection) {
+  const cancelled = () => Object.assign(new Error("读取已失效"), { name: "AbortError" });
+  if (!connectionCurrent(owner)) throw cancelled();
+  const controller = new AbortController();
+  const signals = [owner.controller.signal, options.signal].filter(Boolean);
+  const abort = () => controller.abort();
+  for (const signal of signals) {
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  try {
+    const result = await apiRequest(path, { ...options, signal: controller.signal });
+    if (!connectionCurrent(owner) || controller.signal.aborted) throw cancelled();
+    return result;
+  } catch (error) {
+    if (!connectionCurrent(owner) || controller.signal.aborted) throw cancelled();
+    if (error.status === 401) showLogin();
+    throw error;
+  } finally {
+    for (const signal of signals) signal.removeEventListener("abort", abort);
+  }
+}
+
 function showLogin() {
+  invalidateConnection();
   voiceInput.cancel();
   clearTaskControls();
   releaseMemoryDialog();
@@ -145,7 +257,7 @@ function showLogin() {
   dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
-  state.connected = false; state.auth.authenticated = false;
+  state.connected = false; state.loading = false; state.auth.authenticated = false;
   $(".app-shell").inert = true; $("#auth-gate").hidden = false;
   $("#login-password").focus();
 }
@@ -386,32 +498,37 @@ function queueRender() {
   requestAnimationFrame(() => { queuedRender = false; renderChrome(); if (state.view === "chat") renderChat(); });
 }
 
-async function refreshSessions() {
-  try {
-    state.sessions = collection(await request("/sessions")); state.sessionsError = "";
-    const active = state.sessions.find((session) => session.id === state.activeSession?.id);
-    if (active) state.activeSession = active;
-  }
-  catch (error) { state.sessionsError = error.message; }
-  renderSessions(); renderChrome();
+function refreshSessions(owner = connection) {
+  return owner?.sessions.request() ?? Promise.resolve(false);
 }
 
-async function refreshNotifications() {
-  try { state.notifications = collection(await request("/notifications")); renderChrome(); if (state.view === "notifications") renderOtherView(); } catch { /* Status is reported by the main connection indicator. */ }
+function refreshNotifications(owner = connection) {
+  return owner?.notifications.request() ?? Promise.resolve(false);
 }
 
 async function connect() {
-  state.loading = true; renderChrome();
+  const owner = beginConnection();
+  state.loading = true; $(".app-shell").inert = true; renderChrome();
   try {
-    state.auth = await request("/auth/status");
+    const auth = await ownedRequest("/auth/status", {}, owner);
+    if (!connectionCurrent(owner)) return;
+    state.auth = auth;
     if (state.auth.required && !state.auth.authenticated) { state.loading = false; showLogin(); return; }
+    const position = await ownedRequest("/ui/event-position", { cache: "no-store" }, owner);
+    if (!connectionCurrent(owner)) return;
+    if (typeof position?.after !== "string" || !/^(0|[1-9][0-9]*)$/.test(position.after) || BigInt(position.after) > 9223372036854775807n) throw new Error("事件位置无效，请重新连接。");
+    owner.position = position.after; owner.ready = true;
     $("#auth-gate").hidden = true; $(".app-shell").inert = false;
   } catch (error) {
+    if (!connectionCurrent(owner)) return;
+    invalidateConnection();
     state.connected = false; state.loading = false; renderChrome(); renderComposer();
-    if (error.status === 401) showLogin();
     return;
   }
-  const results = await Promise.allSettled([request("/status"), request("/conversation"), request("/notifications"), request("/sessions"), request("/uploads")]);
+  const notifications = refreshNotifications(owner), sessions = refreshSessions(owner);
+  owner.notifications.start(); owner.sessions.start();
+  const results = await Promise.allSettled([ownedRequest("/status", {}, owner), ownedRequest("/conversation", {}, owner), notifications, sessions, ownedRequest("/uploads", {}, owner)]);
+  if (!connectionCurrent(owner)) return;
   if (results[0].status === "fulfilled") {
     state.status = results[0].value; state.connected = true;
     if (!state.activeSession) state.mode = state.status.mode || "auto";
@@ -422,15 +539,23 @@ async function connect() {
     state.session = hydrateSession(detail); state.mode = detail.session.mode || state.mode;
     if (isRunning(detail.session.status) && !isRunning(state.session.status)) state.session.status = detail.session.status;
     state.sending = false; resetMessageNodes();
-    startSessionEvents(detail.session.id);
+    startSessionEvents(detail.session.id, owner);
   } else { state.connected = false; }
-  if (results[2].status === "fulfilled") state.notifications = collection(results[2].value);
-  if (results[3].status === "fulfilled") { state.sessions = collection(results[3].value); state.sessionsError = ""; }
-  else state.sessionsError = results[3].reason.message;
   if (results[4].status === "fulfilled") state.uploads = collection(results[4].value);
   state.loading = false;
   renderChrome(); renderSessions(); renderChat();
-  if (state.connected) startGlobalEvents();
+  if (state.connected) { startGlobalEvents(owner); revalidateVisibleState(owner); }
+  else invalidateConnection();
+}
+
+function revalidateVisibleState(owner) {
+  if (!connectionCurrent(owner)) return;
+  // These projections used to receive missed changes from the global replay.
+  if (["workflows", "notifications", "team", "memories", "uploads"].includes(state.view)) void switchView(state.view, owner);
+  if (state.view === "records") renderSessions();
+  if (taskDialog) void refreshTaskBriefDialog(taskDialog, owner);
+  invalidateMemoryPath();
+  if (memoryDialog) invalidateMemoryEvidence({ type: "memory.updated", data: { memory_ids: [memoryDialog.id] } });
 }
 
 function waitToReconnect(milliseconds, signal) {
@@ -442,64 +567,68 @@ function waitToReconnect(milliseconds, signal) {
   });
 }
 
-async function subscribe(path, controller, { cursor = "", onEvent, reportConnection = false } = {}) {
+async function subscribe(path, controller, { cursor = "", onEvent, reportConnection = false, owner = connection } = {}) {
   let delay = 1000;
   let after = cursor;
-  while (!controller.signal.aborted) {
+  const current = () => connectionCurrent(owner) && !controller.signal.aborted;
+  while (current()) {
     try {
       await readEvents(path, {
         signal: controller.signal, after,
-        onOpen: () => { delay = 1000; if (reportConnection) { state.streamConnected = true; renderChrome(); } },
-        onEvent: (event) => { if (event.id) after = String(event.id); onEvent(event); },
+        onOpen: () => { if (!current()) return; delay = 1000; if (reportConnection) { state.streamConnected = true; renderChrome(); } },
+        onEvent: (event) => { if (!current()) return; onEvent(event); if (event.id !== undefined && event.id !== null) after = String(event.id); },
+        onId: (id) => { if (current()) after = id; },
       });
     } catch (error) {
-      if (error.name === "AbortError" || controller.signal.aborted) return;
+      if (error.name === "AbortError" || !current()) return;
       if (error.status === 401) { showLogin(); return; }
     }
-    if (controller.signal.aborted) return;
+    if (!current()) return;
     if (reportConnection) { state.streamConnected = false; renderChrome(); }
     await waitToReconnect(delay, controller.signal);
     delay = Math.min(delay * 2, 12000);
   }
 }
 
-function startGlobalEvents() {
+function startGlobalEvents(owner = connection) {
+  if (!connectionCurrent(owner) || !owner.ready) return;
   globalController?.abort();
   globalController = new AbortController();
-  void subscribe("/events", globalController, { reportConnection: true, onEvent: (event) => {
-    if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested", "attention.queued", "ingress.cancelled"].includes(event.type)) void refreshNotifications();
-    if (event.type.startsWith("run.") || event.type.startsWith("session.")) void refreshSessions();
+  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onEvent: (event) => {
+    if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested", "attention.queued", "ingress.cancelled"].includes(event.type)) void refreshNotifications(owner);
+    if (event.type.startsWith("run.") || event.type.startsWith("session.")) void refreshSessions(owner);
     if (event.type === "workflow.updated") {
       const workflow = state.workflows.find((item) => item.id === event.data?.workflow_id);
       if (workflow && event.data.run) {
         const runs = workflow.runs ?? [];
         workflow.runs = [event.data.run, ...runs.filter((run) => run.id !== event.data.run.id)];
       }
-      refreshWorkflowActivity();
-      void refreshSessions();
+      refreshWorkflowActivity(owner);
+      void refreshSessions(owner);
     }
     if (event.type === "reminder.updated") {
       const item = event.data;
       if (item?.id) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id)];
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
-    if (event.type.startsWith("team.") && state.view === "team") void refreshTeam();
-    if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog();
+    if (event.type.startsWith("team.") && state.view === "team") void refreshTeam({}, owner);
+    if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog(taskDialog, owner);
     if (["memory.updated", "memory.forgotten"].includes(event.type)) { invalidateMemoryPath(); invalidateMemoryEvidence(event); }
-    if (event.type === "upload.created" && state.view === "uploads") void refreshUploads();
+    if (event.type === "upload.created" && state.view === "uploads") void refreshUploads(owner);
   } });
 }
 
-function startSessionEvents(sessionId) {
+function startSessionEvents(sessionId, owner = connection) {
+  if (!connectionCurrent(owner)) return;
   sessionController?.abort();
   sessionController = new AbortController();
   void subscribe(`/sessions/${encodeURIComponent(sessionId)}/events`, sessionController, {
-    cursor: state.session.cursor,
+    cursor: state.session.cursor, owner,
     onEvent: (event) => {
       if (event.session_id && event.session_id !== state.activeSession?.id) return;
       state.session = applyEvent(state.session, event);
       if ((event.type === "tool.started" || event.type === "approval.requested") && !state.timelineUserChoice) state.timelineOpen = true;
-      if (["run.completed", "run.failed", "run.cancelled", "run.paused"].includes(event.type)) { state.sending = false; void refreshSessions(); }
+      if (["run.completed", "run.failed", "run.cancelled", "run.paused"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
   });
@@ -835,7 +964,8 @@ function emptyState(iconName, title, description) {
   return element("div", { class: "empty-state" }, icon(iconName), element("h3", { text: title }), description && element("p", { text: description }));
 }
 
-async function switchView(view) {
+async function switchView(view, owner = connection) {
+  if (!connectionCurrent(owner) || !owner.ready) return;
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
   releaseRecordDirectory();
@@ -843,6 +973,7 @@ async function switchView(view) {
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
+  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === view;
   state.view = view; state.viewError = ""; renderChrome();
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
   if (view === "records") {
@@ -858,43 +989,45 @@ async function switchView(view) {
     state.workflows = []; state.viewLoading = false; renderOtherView();
     const heading = $(".view-heading h2", $("#other-view"));
     if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
-    const definitions = request("/workflows", { signal: slot.definitionsController.signal, cache: "no-store" }).then((payload) => {
-      if (workflowActivityCurrent(slot)) state.workflows = collection(payload);
+    const definitions = ownedRequest("/workflows", { signal: slot.definitionsController.signal, cache: "no-store" }, owner).then((payload) => {
+      if (current() && workflowActivityCurrent(slot)) state.workflows = collection(payload);
     }).catch((error) => {
-      if (workflowActivityCurrent(slot)) slot.definitionsError = error.message;
+      if (current() && workflowActivityCurrent(slot)) slot.definitionsError = error.message;
     }).finally(() => {
-      if (workflowActivityCurrent(slot)) { slot.definitionsLoading = false; renderOtherView(); }
+      if (current() && workflowActivityCurrent(slot)) { slot.definitionsLoading = false; renderOtherView(); }
     });
-    await Promise.allSettled([definitions, loadWorkflowActivity(slot)]);
+    await Promise.allSettled([definitions, loadWorkflowActivity(slot, "", [""], owner)]);
     return;
   }
   state.viewLoading = true; renderOtherView();
   try {
-    if (view === "uploads") state.uploads = collection(await request("/uploads"));
-    if (view === "team") { const page = await teamPager.load(); if (page) state.team = page; }
+    if (view === "uploads") { const payload = await ownedRequest("/uploads", {}, owner); if (current()) state.uploads = collection(payload); }
+    if (view === "team") { const page = await teamPager.load({}, (path) => ownedRequest(path, {}, owner)); if (current() && page) state.team = page; }
     if (view === "memories") {
       const query = state.memoryQuery;
-      const results = await Promise.allSettled([request(`/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`), request("/memories/graph")]);
-      if (version !== viewRequestVersion || state.view !== "memories" || query !== state.memoryQuery || !state.auth.authenticated) return;
+      const results = await Promise.allSettled([ownedRequest(`/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`, {}, owner), ownedRequest("/memories/graph", {}, owner)]);
+      if (!current() || query !== state.memoryQuery || !state.auth.authenticated) return;
       if (results[0].status === "rejected") throw results[0].reason;
       state.memories = collection(results[0].value);
       state.memoryGraph = results[1].status === "fulfilled" ? results[1].value : { nodes: [], edges: [] };
     }
     if (view === "notifications") {
-      const results = await Promise.allSettled([request("/notifications"), request("/reminders")]);
+      const results = await Promise.allSettled([refreshNotifications(owner), ownedRequest("/reminders", {}, owner)]);
+      if (!current()) return;
       if (results[0].status === "rejected") throw results[0].reason;
-      state.notifications = collection(results[0].value);
+      if (!results[0].value) throw owner.notifications.error ?? new Error("通知暂时无法读取，请重试。");
       state.reminders = results[1].status === "fulfilled" ? collection(results[1].value) : [];
       state.remindersError = results[1].status === "rejected" ? results[1].reason.message : "";
     }
     if (view === "settings") {
       const dirty = state.settingsDraft && Object.keys(settingsPatch(state.settings, state.settingsDraft)).length;
       const results = await Promise.allSettled([dirty ? null : request("/settings"), refreshSettingsResources()]);
+      if (!current()) return;
       if (results[0].status === "rejected") throw results[0].reason;
       if (results[0].value) { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); state.settingsSaved = false; }
     }
-  } catch (error) { if (version === viewRequestVersion) state.viewError = error.message; }
-  if (version !== viewRequestVersion) return;
+  } catch (error) { if (current()) state.viewError = error.message; }
+  if (!current()) return;
   state.viewLoading = false; renderOtherView(); renderChrome();
   const heading = $(".view-heading h2", $("#other-view"));
   if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
@@ -959,8 +1092,11 @@ async function addFiles(files) {
   if (state.view === "uploads") renderOtherView();
 }
 
-async function refreshUploads() {
-  try { state.uploads = collection(await request("/uploads")); if (state.view === "uploads") renderOtherView(); } catch (error) { showError(error); }
+async function refreshUploads(owner = connection) {
+  const version = viewRequestVersion;
+  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "uploads";
+  try { const payload = await ownedRequest("/uploads", {}, owner); if (current()) { state.uploads = collection(payload); renderOtherView(); } }
+  catch (error) { if (current()) showError(error); }
 }
 
 function renderUploads() {
@@ -970,11 +1106,13 @@ function renderUploads() {
   return root;
 }
 
-async function refreshTeam(changes = {}) {
+async function refreshTeam(changes = {}, owner = connection) {
+  const version = viewRequestVersion;
+  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "team";
   try {
-    const page = await teamPager.load(changes);
-    if (page) { state.team = page; if (state.view === "team") renderOtherView(); }
-  } catch (error) { showError(error); }
+    const page = await teamPager.load(changes, (path) => ownedRequest(path, {}, owner));
+    if (current() && page) { state.team = page; renderOtherView(); }
+  } catch (error) { if (current()) showError(error); }
 }
 
 function readSavedTaskControl(identifier) {
@@ -1079,19 +1217,24 @@ function renderTaskBriefDialog(slot = taskDialog) {
   }
 }
 
-async function refreshTaskBriefDialog(slot = taskDialog) {
-  if (!slot || !taskDialogCurrent(slot)) return;
-  if (slot.loading) { slot.refreshAgain = true; return; }
-  slot.loading = true; slot.readError = ""; slot.readController = new AbortController(); renderTaskBriefDialog(slot);
+async function refreshTaskBriefDialog(slot = taskDialog, owner = connection) {
+  if (!slot || !taskDialogCurrent(slot) || !connectionCurrent(owner)) return;
+  if (slot.loading && slot.readOwner === owner) { slot.refreshAgain = true; return; }
+  slot.readController?.abort();
+  const controller = slot.readController = new AbortController(); slot.readOwner = owner;
+  const current = () => connectionCurrent(owner) && taskDialogCurrent(slot) && slot.readController === controller;
+  slot.loading = true; slot.readError = ""; slot.refreshAgain = false; renderTaskBriefDialog(slot);
   try {
-    const item = await request(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: slot.readController.signal });
-    if (!taskDialogCurrent(slot)) return;
+    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: controller.signal }, owner);
+    if (!current()) return;
     if (!slot.model.acceptDetail(item)) slot.readError = "任务说明已有更新，请再次刷新。";
   } catch (error) {
-    if (taskDialogCurrent(slot)) slot.readError = error.message;
+    if (current()) slot.readError = error.message;
   } finally {
-    slot.loading = false; renderTaskBriefDialog(slot);
-    if (slot.refreshAgain && taskDialogCurrent(slot)) { slot.refreshAgain = false; void refreshTaskBriefDialog(slot); }
+    if (current()) {
+      slot.loading = false; renderTaskBriefDialog(slot);
+      if (slot.refreshAgain) { slot.refreshAgain = false; void refreshTaskBriefDialog(slot, owner); }
+    }
   }
 }
 
@@ -1698,36 +1841,37 @@ function workflowActivityPage(payload, after) {
   return { items, has_more: payload.has_more, next_after: payload.next_after };
 }
 
-async function loadWorkflowActivity(slot, after = "", starts = [""]) {
-  if (!workflowActivityCurrent(slot)) return;
+async function loadWorkflowActivity(slot, after = "", starts = [""], owner = connection) {
+  if (!workflowActivityCurrent(slot) || !connectionCurrent(owner)) return;
   slot.controller?.abort();
   const controller = slot.controller = new AbortController();
+  slot.readOwner = owner;
   slot.loading = true; slot.error = ""; slot.refreshPending = false;
   renderOtherView();
-  const current = () => workflowActivityCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  const current = () => connectionCurrent(owner) && workflowActivityCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
   try {
-    const payload = await request(`/workflow-runs/active?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(`/workflow-runs/active?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     const page = workflowActivityPage(payload, after);
     // A moving page may become empty. Return to the head once, without following has_more.
-    if (after && !page.items.length) { await loadWorkflowActivity(slot); return; }
+    if (after && !page.items.length) { await loadWorkflowActivity(slot, "", [""], owner); return; }
     slot.page = page; slot.after = after; slot.starts = [...starts];
   } catch (error) {
     if (current()) slot.error = error.message;
   } finally {
-    if (workflowActivityCurrent(slot) && slot.controller === controller) {
+    if (connectionCurrent(owner) && workflowActivityCurrent(slot) && slot.controller === controller) {
       slot.controller = null; slot.loading = false;
-      if (slot.refreshPending) void loadWorkflowActivity(slot);
+      if (slot.refreshPending) void loadWorkflowActivity(slot, "", [""], owner);
       else renderOtherView();
     }
   }
 }
 
-function refreshWorkflowActivity() {
+function refreshWorkflowActivity(owner = connection) {
   const slot = workflowActivity;
-  if (!workflowActivityCurrent(slot)) return;
-  if (slot.controller) { slot.refreshPending = true; slot.controller.abort(); }
-  else void loadWorkflowActivity(slot);
+  if (!workflowActivityCurrent(slot) || !connectionCurrent(owner)) return;
+  if (slot.controller && slot.readOwner === owner) { slot.refreshPending = true; slot.controller.abort(); }
+  else void loadWorkflowActivity(slot, "", [""], owner);
 }
 
 function captureWorkflowView(root) {
@@ -1928,9 +2072,9 @@ async function toggleReminder(id, button) {
 }
 
 async function markRead(id) {
-  await request(`/notifications/${encodeURIComponent(id)}`, { method: "PATCH", body: { read: true } });
-  const item = state.notifications.find((entry) => String(entry.id) === String(id)); if (item) item.read = true;
-  renderChrome(); if (state.view === "notifications") renderOtherView();
+  const owner = connection;
+  await ownedRequest(`/notifications/${encodeURIComponent(id)}`, { method: "PATCH", body: { read: true } }, owner);
+  await refreshNotifications(owner);
 }
 
 function renderSettings() {
@@ -2489,9 +2633,14 @@ document.addEventListener("keydown", (event) => {
     requestAnimationFrame(() => $('#other-view [role="tab"][aria-selected="true"]')?.focus());
   }
 });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); if (document.visibilityState === "visible" && !state.connected) void connect(); });
-window.addEventListener("online", () => void connect());
-window.addEventListener("pagehide", () => { voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); releaseRecordDirectory(); globalController?.abort(); sessionController?.abort(); });
+function recoverConnection() {
+  if (document.visibilityState === "visible" && !connectionCurrent(connection) && $("#auth-gate").hidden) void connect();
+}
+
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); recoverConnection(); });
+window.addEventListener("online", recoverConnection);
+window.addEventListener("pageshow", (event) => { if (event.persisted) recoverConnection(); });
+window.addEventListener("pagehide", () => { invalidateConnection(); voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); releaseRecordDirectory(); });
 
 fillIcons();
 initializeTheme(); renderThemeControl();
