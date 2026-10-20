@@ -1,0 +1,637 @@
+"""Linux protocol 2 effects over the existing leases and frozen role prefixes.
+
+The systemd probe authenticates the stable unit and the exec-replaced process
+separately. This backend additionally verifies current slot files, exact disk
+bytes and durability before effects; command acceptance is never readiness.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Self
+
+import httpx
+
+from muli.managed_controller import (
+    BindingConfirmation,
+    ManagedProcessIdentity,
+    ManagedServiceObservation,
+    _files,
+    _prefixes,
+)
+from muli.managed_journal import Component, RoleSnapshots, read_snapshots
+from muli.managed_transaction import HealthProofV2, TransactionRecordV2, format_digest
+from muli.management_transaction import (
+    ClockReading,
+    FixedLock,
+    JournalControl,
+    Role,
+    TransactionError,
+    TransactionJournal,
+)
+from muli.platforms.linux_controller import (
+    CgroupObservation,
+    transaction_request,
+    transaction_url,
+)
+from muli.platforms.linux_transaction import (
+    CommandRunner,
+    ObservationError,
+    ProbeLimits,
+    ServiceSnapshot,
+    clock_reading,
+)
+from muli.platforms.managed_deployment import (
+    DeploymentAnchor,
+    DeploymentStore,
+    SelectorSnapshot,
+    SelectorStore,
+    SelectorValue,
+    SlotIdentity,
+    verify_slot_files,
+)
+from muli.platforms.managed_probe import (
+    ManagedProbeResult,
+    ManagedSystemdProbe,
+    ManagedUserService,
+)
+from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSnapshot
+from muli.process import run_process
+
+_ROLES: tuple[Role, ...] = ("base", "target")
+
+
+@dataclass(frozen=True, slots=True)
+class _DiskBinding:
+    configuration: ConfigurationSnapshot
+    selector: SelectorSnapshot | None
+    unit: ConfigurationSnapshot
+
+    @property
+    def digests(self) -> tuple[str, str | None, str]:
+        return (
+            self.configuration.digest,
+            None if self.selector is None else self.selector.digest,
+            self.unit.digest,
+        )
+
+
+class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
+    def __init__(
+        self,
+        anchor: DeploymentAnchor,
+        controller_slot: SlotIdentity,
+        slots: dict[Role, SlotIdentity],
+        journal: TransactionJournal,
+        *,
+        control: JournalControl,
+        clock: Callable[[], ClockReading] = clock_reading,
+        probe: ManagedSystemdProbe | None = None,
+        runner: CommandRunner = run_process,
+        transport: httpx.AsyncBaseTransport | None = None,
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
+        operation_timeout: float = 20.0,
+    ) -> None:
+        if (
+            control.journal is not journal
+            or set(slots) != {"base", "target"}
+            or anchor.controller_slot != controller_slot.digest
+            or str(journal.directory.path) != anchor.journal_root
+            or str(journal.database) != anchor.database_path
+            or journal.limits != anchor.journal
+        ):
+            raise ObservationError("transaction_backend_unsupported")
+        if not math.isfinite(operation_timeout) or not 0 < operation_timeout <= 30:
+            raise ObservationError("invalid_operation_timeout")
+        self.anchor, self.controller_slot, self.slots = anchor, controller_slot, dict(slots)
+        self.journal, self.control, self.clock = journal, control, clock
+        self.operation_timeout, self.runner = operation_timeout, runner
+        self.probe = probe or ManagedSystemdProbe(
+            runner=runner, limits=ProbeLimits(seconds=operation_timeout / 4)
+        )
+        if self.probe.limits.seconds > operation_timeout / 4:
+            raise ObservationError("invalid_probe_timeout")
+        self.service = ManagedUserService(
+            Path(anchor.config_path),
+            Path(anchor.data_dir),
+            Path(anchor.unit_path).parent,
+            controller=controller_slot,
+            launcher=Path(anchor.launcher.path),
+            journal_root=Path(anchor.journal_root),
+        )
+        self.cgroups = CgroupObservation(cgroup_root, self.probe.limits.file_bytes)
+        self._activation_attempt: tuple[str, str, Role | None] | None = None
+        self.client = httpx.AsyncClient(
+            transport=transport,
+            trust_env=False,
+            follow_redirects=False,
+            timeout=self.probe.limits.seconds,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            headers={"Accept-Encoding": "identity"},
+        )
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.client.aclose()
+
+    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+        self.control.check()
+        if self.control.read_current() != record:
+            raise TransactionError("stale_revision")
+        if record.identity.deployment != self.anchor.digest:
+            raise ObservationError("managed_deployment_changed")
+        with DeploymentStore(Path(self.anchor.journal_root), self.journal.limits) as store:
+            if (
+                store.read_anchor(self.anchor.digest) != self.anchor
+                or store.read_slot(self.anchor.controller_slot) != self.controller_slot
+            ):
+                raise ObservationError("managed_deployment_changed")
+            store.verify_anchor(self.anchor)
+            # The opposite role is frozen metadata, not a requirement that its
+            # damaged package remain executable in order to restore the base.
+            for selected in _ROLES:
+                binding, slot = record.binding(selected), self.slots[selected]
+                if (
+                    binding.installation != slot.digest
+                    or binding.compatibility != slot.compatibility_digest
+                    or store.read_slot(binding.installation) != slot
+                ):
+                    raise ObservationError("managed_slot_changed")
+        if role is not None:
+            verify_slot_files(self.slots[role])
+
+    def _effect_guard(self, record: TransactionRecordV2, role: Role | None) -> None:
+        self._check(record, role)
+        remaining = record.deadline.remaining(self.clock())
+        if record.phase in {"activating", "verifying"}:
+            remaining -= record.deadline.rollback_reserve
+        if remaining <= 0:
+            raise TimeoutError
+
+    def _guard(
+        self, record: TransactionRecordV2, role: Role, lease: FixedLock, cgroup: str
+    ) -> None:
+        self._effect_guard(record, role)
+        lease.check()
+        if not self.cgroups.empty(cgroup):
+            raise ObservationError("cgroup_not_empty")
+
+    @staticmethod
+    def _stopped(snapshot: ServiceSnapshot) -> bool:
+        return (
+            snapshot.unit.active_state in {"inactive", "failed"}
+            and snapshot.unit.pid == 0
+            and snapshot.process is None
+            and snapshot.unit.job == (0, "/")
+        )
+
+    @staticmethod
+    def _role(record: TransactionRecordV2, boot: str) -> Role | None:
+        if boot == record.identity.origin_boot:
+            return None
+        if (record.phase, record.intent) == ("rolling_back", "stop_target"):
+            return "target"
+        return "base" if record.phase in {"rolling_back", "rolled_back"} else "target"
+
+    @staticmethod
+    def _stop_only(record: TransactionRecordV2) -> bool:
+        return (record.phase, record.intent) in {
+            ("activating", "stop_base"),
+            ("rolling_back", "stop_target"),
+        }
+
+    def _desired(self, record: TransactionRecordV2, role: Role) -> RoleSnapshots:
+        data = read_snapshots(self.journal, record, role)
+        if data.selector is not None:
+            value = SelectorValue.model_validate_json(data.selector)
+            if (
+                value.canonical() != data.selector
+                or value.deployment != record.identity.deployment
+                or value.installation != record.binding(role).installation
+            ):
+                raise ObservationError("unsupported_managed_selector")
+        return data
+
+    async def _probe(self, record: TransactionRecordV2) -> ManagedProbeResult:
+        self._check(record)
+        result = await self.probe.read_managed(
+            self.journal, record, self.anchor, self.controller_slot, self.slots
+        )
+        self._check(record)
+        return result
+
+    def _disk(self) -> _DiskBinding:
+        with (
+            ConfigurationFile(
+                Path(self.anchor.config_path), self.journal.limits.max_snapshot_bytes
+            ) as configuration,
+            SelectorStore(Path(self.anchor.journal_root)) as selector,
+            ConfigurationFile(
+                Path(self.anchor.unit_path), self.journal.limits.max_snapshot_bytes
+            ) as unit,
+        ):
+            return _DiskBinding(configuration.read(), selector.read(), unit.read())
+
+    def _owned(
+        self, record: TransactionRecordV2, result: ManagedProbeResult, disk: _DiskBinding
+    ) -> Role | None:
+        snapshot = result.service
+        role = self._role(record, snapshot.unit.invocation)
+        selected: Role = "base" if role is None else role
+        if (
+            snapshot.process is None
+            or selected not in result.process_roles
+            or disk.digests != _files(record.binding(selected))
+            or not result.unit_confirmed
+        ):
+            raise ObservationError("foreign_transaction_process")
+        return role
+
+    async def _request(
+        self, record: TransactionRecordV2, boot: str, action: str
+    ) -> dict[str, Any] | None:
+        role = self._role(record, boot)
+        challenge = record.rollback_challenge if role == "base" else record.challenge
+        if challenge is None:
+            raise ObservationError("transaction_challenge_missing")
+        data = self._desired(record, "target" if role == "target" else "base")
+        return await transaction_request(
+            self.client,
+            url=transaction_url(data.configuration, action),
+            generation=record.generation,
+            boot=boot,
+            challenge=challenge,
+            action=action,
+            seconds=self.probe.limits.seconds,
+            max_bytes=self.journal.limits.max_record_bytes,
+        )
+
+    def _proof(
+        self, record: TransactionRecordV2, boot: str, value: dict[str, Any]
+    ) -> HealthProofV2:
+        try:
+            proof = HealthProofV2.model_validate(value)
+        except ValueError:
+            raise ObservationError("invalid_transaction_proof") from None
+        role = self._role(record, boot)
+        binding = record.binding("base" if role is None else role)
+        challenge = record.rollback_challenge if role == "base" else record.challenge
+        if (
+            proof.generation != record.generation
+            or proof.boot != boot
+            or proof.role != ("origin" if role is None else role)
+            or proof.challenge != challenge
+            or proof.deployment != record.identity.deployment
+            or proof.installation != binding.installation
+            or proof.compatibility != binding.compatibility
+            or (proof.configuration, proof.selector, proof.unit) != _files(binding)
+            or proof.store_instance != record.identity.store_instance
+            or proof.main_session != record.identity.main_session
+            or proof.format_digest != format_digest(record.observed_format)
+            or not proof.core_ready
+        ):
+            raise ObservationError("foreign_transaction_proof")
+        return proof
+
+    def _confirm(
+        self,
+        record: TransactionRecordV2,
+        role: Role,
+        lease: FixedLock,
+        cgroup: str,
+    ) -> _DiskBinding:
+        expected = _files(record.binding(role))
+
+        def guard() -> None:
+            self._guard(record, role, lease, cgroup)
+            if self._disk().digests != expected:
+                raise ObservationError("foreign_managed_binding")
+
+        order: tuple[Component, ...] = (
+            ("configuration", "selector", "unit")
+            if role == "target"
+            else ("unit", "selector", "configuration")
+        )
+        for component in order:
+            guard()
+            if component == "selector":
+                with SelectorStore(Path(self.anchor.journal_root)) as selector:
+                    selector.confirm(selector.read(), guard=guard)
+            else:
+                path = (
+                    self.anchor.config_path
+                    if component == "configuration"
+                    else self.anchor.unit_path
+                )
+                digest = expected[0] if component == "configuration" else expected[2]
+                with ConfigurationFile(Path(path), self.journal.limits.max_snapshot_bytes) as file:
+                    file.confirm(digest, guard=guard)
+        guard()
+        return self._disk()
+
+    async def observe(self, record: TransactionRecordV2) -> ManagedServiceObservation:
+        before, disk = await self._probe(record), self._disk()
+        boot = before.service.unit.invocation if before.service.process is not None else None
+        process: ManagedProcessIdentity | None = None
+        proof: HealthProofV2 | None = None
+        if boot is not None:
+            role = self._owned(record, before, disk)
+            selected: Role = "base" if role is None else role
+            process = ManagedProcessIdentity(
+                record.binding(selected).entry,
+                record.binding(selected).installation,
+                record.binding(selected).compatibility,
+            )
+            if not self._stop_only(record):
+                self._check(record, selected)
+                value = await self._request(record, boot, "readiness")
+                if value is not None:
+                    proof = self._proof(record, boot, value)
+        writer_free, empty = False, False
+        available = self.journal.writer_lease()
+        lease: FixedLock | None = None
+        try:
+            available.__enter__()
+        except TransactionError as exc:
+            if exc.code != "lock_busy":
+                raise
+        else:
+            writer_free = True
+            if self._stopped(before.service):
+                lease = available
+            else:
+                available.__exit__()
+        confirmation: BindingConfirmation | None = None
+        try:
+            after = await self._probe(record)
+            if before != after or disk != self._disk():
+                raise ObservationError("transaction_observation_changed")
+            if boot is not None and not self._stop_only(record):
+                current_role = self._role(record, boot)
+                self._check(record, "base" if current_role is None else current_role)
+            if self._stopped(after.service) and lease is not None:
+                lease.check()
+                empty = self.cgroups.empty(after.service.unit.cgroup)
+                desired: Role = (
+                    "base" if record.phase in {"rolling_back", "rolled_back"} else "target"
+                )
+                if empty and disk.digests == _files(record.binding(desired)):
+                    self._desired(record, desired)
+                    disk = self._confirm(record, desired, lease, after.service.unit.cgroup)
+                    confirmed = await self._probe(record)
+                    if confirmed != after or disk != self._disk():
+                        raise ObservationError("transaction_observation_changed")
+                    if confirmed.unit_confirmed:
+                        confirmation = BindingConfirmation(
+                            record.position, desired, *disk.digests, loaded_unit=disk.unit.digest
+                        )
+        finally:
+            if lease is not None:
+                lease.__exit__()
+        state: Literal["running", "stopped", "starting", "stopping", "foreign"]
+        if self._stopped(after.service):
+            state = "stopped" if empty else "stopping"
+        elif after.service.unit.active_state == "activating":
+            state = "starting"
+        elif after.service.unit.active_state == "deactivating":
+            state = "stopping"
+        elif after.service.unit.active_state == "active" and after.service.process is not None:
+            early = (record.phase, record.intent) in {
+                ("activating", "start_target"),
+                ("rolling_back", "start_base"),
+            } and (proof is None or (writer_free and proof.admission != "blocked"))
+            state = "starting" if early else "running"
+        else:
+            state = "foreign"
+        origin = boot == record.identity.origin_boot
+        return ManagedServiceObservation(
+            identity_matches=True,
+            configuration=disk.configuration.digest,
+            selector=None if disk.selector is None else disk.selector.digest,
+            unit=disk.unit.digest,
+            service=state,
+            boot=boot,
+            writer_free=writer_free,
+            process=process,
+            confirmation=confirmation,
+            drained=origin
+            and record.phase == "draining"
+            and bool(proof and proof.admission == "paused"),
+            resumed=origin
+            and record.phase in {"prepared", "aborted"}
+            and bool(proof and proof.admission in {"released", "released_degraded"}),
+            health=proof,
+            health_failed=bool(proof and proof.admission == "blocked"),
+            activation_failed=bool(
+                proof
+                and proof.admission == "blocked"
+                and record.phase in {"committed", "rolled_back"}
+            ),
+        )
+
+    async def _command(self, action: Literal["start", "stop", "daemon-reload"]) -> None:
+        argv = ["systemctl", "--user"]
+        argv += (
+            [action]
+            if action == "daemon-reload"
+            else ["--no-block", "--job-mode=fail", action, self.service.unit]
+        )
+        async with asyncio.timeout(self.probe.limits.seconds):
+            result = await self.runner(
+                argv,
+                timeout=self.probe.limits.seconds,
+                limit=self.probe.limits.command_bytes,
+                merge_stderr=False,
+            )
+        if result.get("exit_code") != 0:
+            raise ObservationError("transaction_unit_command_failed")
+
+    async def _host_command(
+        self, record: TransactionRecordV2, action: str, role: Role | None
+    ) -> None:
+        if (
+            action == "drain"
+            and (record.phase != "draining" or role is not None)
+            or action == "resume"
+            and (record.phase not in {"prepared", "aborted"} or role is not None)
+            or action == "activate"
+            and (
+                (record.phase, role) not in {("committed", "target"), ("rolled_back", "base")}
+                or record.activation == "blocked"
+            )
+        ):
+            raise ObservationError("transaction_effect_not_permitted")
+        before, disk = await self._probe(record), self._disk()
+        boot = before.service.unit.invocation
+        if (
+            before.service.unit.active_state != "active"
+            or self._owned(record, before, disk) != role
+            or action == "activate"
+            and (record.health is None or record.health.boot != boot)
+        ):
+            raise ObservationError("foreign_transaction_process")
+        self._effect_guard(record, "base" if role is None else role)
+        if action == "activate":
+            attempt = record.generation, boot, role
+            if self._activation_attempt == attempt:
+                return
+            self._activation_attempt = attempt
+        value = await self._request(record, boot, action)
+        after = await self._probe(record)
+        self._check(record, "base" if role is None else role)
+        if before != after or disk != self._disk():
+            raise ObservationError("transaction_observation_changed")
+        if value is None:
+            return
+        if action == "activate":
+            if self._proof(record, boot, value).admission == "blocked":
+                raise ObservationError("transaction_activation_failed")
+        elif (
+            action == "drain"
+            and value.get("state") not in {"waiting", "drained"}
+            or action == "resume"
+            and value.get("released") is not True
+            or action == "drain"
+            and value.get("boot") != boot
+        ):
+            raise ObservationError("invalid_transaction_reply")
+
+    async def drain(self, record: TransactionRecordV2) -> None:
+        await self._host_command(record, "drain", None)
+
+    async def resume(self, record: TransactionRecordV2) -> None:
+        await self._host_command(record, "resume", None)
+
+    async def activate(self, record: TransactionRecordV2, role: Role) -> None:
+        await self._host_command(record, "activate", role)
+
+    async def stop(self, record: TransactionRecordV2, role: Role) -> None:
+        if (record.phase, record.intent, role) not in {
+            ("activating", "stop_base", "base"),
+            ("rolling_back", "stop_target", "base"),
+            ("rolling_back", "stop_target", "target"),
+        }:
+            raise ObservationError("transaction_effect_not_permitted")
+        before, disk = await self._probe(record), self._disk()
+        if self._stopped(before.service):
+            return
+        expected = (
+            None
+            if before.service.unit.invocation == record.identity.origin_boot and role == "base"
+            else role
+        )
+        if self._owned(record, before, disk) != expected:
+            raise ObservationError("foreign_transaction_process")
+        if (
+            before.service.unit.job != (0, "/")
+            or before.service.unit.active_state == "deactivating"
+        ):
+            return
+        # Stop-only may terminate a precisely observed broken slot. It neither
+        # grants health nor requires that slot's damaged package to run again.
+        self._effect_guard(record, None)
+        if before != await self._probe(record) or disk != self._disk():
+            raise ObservationError("transaction_observation_changed")
+        self._effect_guard(record, None)
+        await self._command("stop")
+
+    async def install(self, record: TransactionRecordV2, role: Role, data: RoleSnapshots) -> None:
+        if (record.phase, record.intent, role) not in {
+            ("activating", "install_target", "target"),
+            ("rolling_back", "restore_base", "base"),
+        }:
+            raise ObservationError("transaction_effect_not_permitted")
+        if data != self._desired(record, role):
+            raise ObservationError("transaction_snapshot_changed")
+        self._check(record, role)
+        before = await self._probe(record)
+        if not self._stopped(before.service):
+            raise ObservationError("transaction_service_not_stopped")
+        with self.journal.writer_lease() as lease:
+            cgroup = before.service.unit.cgroup
+
+            def guard() -> None:
+                self._guard(record, role, lease, cgroup)
+                if self._disk().digests not in _prefixes(record):
+                    raise ObservationError("foreign_managed_binding")
+
+            guard()
+            if before != await self._probe(record):
+                raise ObservationError("transaction_observation_changed")
+            order: tuple[Component, ...] = (
+                ("configuration", "selector", "unit")
+                if role == "target"
+                else ("unit", "selector", "configuration")
+            )
+            for component in order:
+                guard()
+                current = self._disk()
+                if component == "selector":
+                    value = (
+                        None
+                        if data.selector is None
+                        else SelectorValue.model_validate_json(data.selector)
+                    )
+                    with SelectorStore(Path(self.anchor.journal_root)) as selector:
+                        selector.replace(current.selector, value, guard=guard)
+                else:
+                    path = (
+                        self.anchor.config_path
+                        if component == "configuration"
+                        else self.anchor.unit_path
+                    )
+                    desired = data.configuration if component == "configuration" else data.unit
+                    snapshot = (
+                        current.configuration if component == "configuration" else current.unit
+                    )
+                    with ConfigurationFile(
+                        Path(path), self.journal.limits.max_snapshot_bytes
+                    ) as file:
+                        if snapshot.data == desired:
+                            file.confirm(snapshot.digest, guard=guard)
+                        else:
+                            file.replace(snapshot.digest, desired, guard=guard)
+            self._confirm(record, role, lease, cgroup)
+            fresh = await self._probe(record)
+            if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
+                raise ObservationError("transaction_observation_changed")
+            if not fresh.unit_confirmed:
+                guard()
+                await self._command("daemon-reload")
+                guard()
+                fresh = await self._probe(record)
+            if (
+                not self._stopped(fresh.service)
+                or not fresh.unit_confirmed
+                or fresh.disk_unit != record.binding(role).unit.digest
+            ):
+                raise ObservationError("managed_unit_not_loaded")
+            self._confirm(record, role, lease, cgroup)
+
+    async def start(self, record: TransactionRecordV2, role: Role) -> None:
+        if (record.phase, record.intent, role) not in {
+            ("activating", "start_target", "target"),
+            ("rolling_back", "start_base", "base"),
+        }:
+            raise ObservationError("transaction_effect_not_permitted")
+        self._desired(record, role)
+        before = await self._probe(record)
+        if not self._stopped(before.service):
+            raise ObservationError("transaction_service_not_stopped")
+        with self.journal.writer_lease() as lease:
+            cgroup = before.service.unit.cgroup
+            self._guard(record, role, lease, cgroup)
+            disk = self._confirm(record, role, lease, cgroup)
+            fresh = await self._probe(record)
+            if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
+                raise ObservationError("transaction_observation_changed")
+            self._guard(record, role, lease, cgroup)
+        self._effect_guard(record, role)
+        await self._command("start")
