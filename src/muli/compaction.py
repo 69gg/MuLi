@@ -214,10 +214,10 @@ class Compactor:
             task.exception()
         if session_id not in self._ready:
             self._attempted.pop(session_id, None)
-        # A completed foreground run has no live replay to invalidate. Adoption
-        # still checks the immutable prefix and lets historical actors unload.
+        # Idle and paused sessions have no live replay to invalidate. Adoption
+        # still checks the immutable prefix and releases their pending-job budget.
         session = self.store.get("session", session_id)
-        if session and session.get("status") == "idle":
+        if session and session.get("status") in {"idle", "paused"}:
             self.adopt(session_id)
 
     async def _prepare(

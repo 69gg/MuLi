@@ -12,6 +12,7 @@ from muli.compaction import Compactor, closed_groups
 from muli.config import CompactionSettings
 from muli.providers import Message, ModelTurn, StreamEvent
 from muli.store import Store
+from muli.task_control import TaskPaused
 
 
 def history(store: Store, session: str = "session") -> list[dict[str, Any]]:
@@ -357,4 +358,99 @@ async def test_final_stream_idle_boundary_adopts_ready_summary_and_releases_job_
         assert runtime.compaction.status(other["id"])["running"]
     finally:
         release.set()
+        await runtime.close()
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled", "paused"])
+@pytest.mark.parametrize("summary_first", [False, True], ids=["late", "early"])
+async def test_terminal_run_releases_summary_budget_for_another_session(
+    tmp_path: Path, outcome: str, summary_first: bool
+) -> None:
+    runtime, _ = make_runtime(tmp_path, [ModelTurn(content="本轮完成")])
+    runtime.config.update(
+        {"limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000}}
+    )
+    await runtime.reconfigure()
+    foreground_entered, foreground_release = asyncio.Event(), asyncio.Event()
+    first_entered, first_release, first_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    other_entered, other_release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def summarize(source: str, max_tokens: int) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            await first_release.wait()
+        else:
+            other_entered.set()
+            await other_release.wait()
+        return "保留原始证据位置的摘要"
+
+    async def gate_foreground(session_id: str, messages: list[Message]) -> list[Message]:
+        foreground_entered.set()
+        await foreground_release.wait()
+        if outcome == "paused":
+            raise TaskPaused("task_paused", "门控暂停", observed_epoch=0)
+        if outcome == "failed":
+            raise ValueError("门控失败")
+        return messages
+
+    runtime.compaction.summarize = summarize
+    runtime.context_hooks.append(gate_foreground)
+    try:
+        session = runtime.main_session()
+        session_id = session["id"]
+        original = history(runtime.store, session_id)
+        started = await runtime.submit("继续", mode="yolo")
+        await asyncio.wait_for(foreground_entered.wait(), 2)
+        await asyncio.wait_for(first_entered.wait(), 2)
+        job = runtime.compaction._tasks[session_id]
+        # Register after Compactor's callback, so this event observes its real cleanup.
+        job.add_done_callback(lambda completed: first_done.set())
+        if summary_first:
+            first_release.set()
+            await asyncio.wait_for(first_done.wait(), 2)
+            assert runtime.store.get("run", started["run_id"])["status"] == "running"
+            assert session_id in runtime.tasks
+            assert runtime.compaction.status(session_id)["ready"]
+            assert runtime.store.get("compaction", session_id) is None
+
+        if outcome == "cancelled":
+            await asyncio.wait_for(runtime.stop(session_id), 2)
+            with pytest.raises(asyncio.CancelledError):
+                await runtime.wait(started["run_id"])
+        else:
+            foreground_release.set()
+            if outcome == "paused":
+                with pytest.raises(TaskPaused, match="门控暂停"):
+                    await asyncio.wait_for(runtime.wait(started["run_id"]), 2)
+            elif outcome == "failed":
+                with pytest.raises(ValueError, match="门控失败"):
+                    await asyncio.wait_for(runtime.wait(started["run_id"]), 2)
+            else:
+                assert await asyncio.wait_for(runtime.wait(started["run_id"]), 2) == "本轮完成"
+        assert runtime.store.get("run", started["run_id"])["status"] == outcome
+        assert runtime.store.get("session", session_id)["status"] == (
+            "paused" if outcome == "paused" else "idle"
+        )
+        assert session_id not in runtime.tasks
+        if not summary_first:
+            first_release.set()
+            await asyncio.wait_for(first_done.wait(), 2)
+
+        other = runtime.new_session(mode="yolo")
+        history(runtime.store, other["id"])
+        runtime.compaction.observe(other["id"])
+        # The second callback must actually start under the one-job limit.
+        await asyncio.wait_for(other_entered.wait(), 2)
+        assert calls == 2
+        assert runtime.compaction.status(other["id"])["running"]
+        assert runtime.store.get("compaction", session_id) is not None
+        assert not runtime.compaction.status(session_id)["ready"]
+        assert runtime.store.messages(session_id)[: len(original)] == original
+    finally:
+        foreground_release.set()
+        first_release.set()
+        other_release.set()
         await runtime.close()
