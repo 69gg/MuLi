@@ -52,4 +52,14 @@ Python 文件 Ruff 通过，静态最高峰值 124.8 MiB、swap 0；均使用同
 随后冻结本次 base 的尾差单独复验 adapter 29 项通过（10.40 秒、峰值 82.2 MiB），
 再补准备授权后配置变化的 1 项通过（0.45 秒、峰值 63.8 MiB）；两份源码 mypy
 和相关 Ruff 通过，峰值 124.6 MiB、swap 0。这两轮没有重复统计为一次完整组合。
-完整 RecoveryHost 集成测试由宿主整合片另行验证，本片数字不包含它们。
+上述数字不包含完整 RecoveryHost 集成测试。
+
+宿主整合另以根工作树源码执行 5 项回归，通过显式 pytest 配置、rootdir 与源码路径
+断言确认实际测试目标。实际 `ManagedBootPermit` 回退到 legacy 后构造完整 Runtime，
+经公开 stage、真实 manifest/bridge/Store 与 fake helper 覆盖 configure/restart、
+helper 观察失败/取消，以及真实 state 写入成功后丢失返回的同进程确认；保留同代
+applying、原 routing 和原 writer owner，Store 关闭前不会释放 DB fd 或 lease。
+临时目录的文件系统拓扑观察及服务进程观察由替身提供，文件身份、快照、准入、
+排他锁与清理仍使用真实实现；没有真实 systemd 操作。
+这 5 项为 2.10 秒、峰值 79.2 MiB、swap 0，单文件 Ruff/格式检查通过，均经资源
+守卫串行运行，未与前述独立回归轮次合计为一次整合测试。
