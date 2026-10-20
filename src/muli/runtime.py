@@ -82,7 +82,12 @@ class Runtime:
         self.store = Store(data_dir / "muli.sqlite3")
         self.bus = EventBus(self.store)
         self.system_events = SystemEvents(
-            self.store, self.bus, lambda: self.config.settings.system_events
+            self.store,
+            self.bus,
+            lambda: self.config.settings.system_events,
+            independent_routing=lambda: FrozenRouting.independent(
+                self.config.settings, self.store.db
+            ),
         )
         # A private logger cannot capture another Runtime's data or alter global logging.
         self._system_logger = logging.Logger("muli.runtime", logging.WARNING)
@@ -275,6 +280,7 @@ class Runtime:
         return (await self._prepare_request(session_id)).messages
 
     async def _prepare_request(self, session_id: str) -> PreparedRequest:
+        self.system_events.clear_request(session_id)
         execution: TaskSnapshot | None = None
         selected: TaskSnapshot | None = None
         if self.task_control is not None:
@@ -293,6 +299,7 @@ class Runtime:
             self._reply_origin(session_id),
             self._attention_routing(session_id),
         )
+        self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
         try:
             try:
@@ -998,12 +1005,22 @@ class Runtime:
             ).fetchone()
             is not None
         )
+        log_session = self.store.get("session", session_id) or {}
+        log_scope = self.system_events.begin_run(
+            run_id,
+            session_id,
+            main=log_session.get("kind") == "main"
+            and not workflow_step
+            and not log_session.get("workflow_run_id"),
+            notify=not attention_origin,
+        )
         try:
             async with asyncio.timeout(self.config.settings.limits.max_run_seconds):
                 run["status"] = "running"
                 self.store.put("run", run)
                 await self.bus.emit("run.started", run, session_id)
                 result = await self._execute(session_id, run_id, role, mode, workflow_step)
+                self.system_events.clear_request(session_id)
                 # Child agents need the same capacity pool. Release the parent's slot first.
                 child_results: list[str] = []
                 has_children = False
@@ -1075,6 +1092,7 @@ class Runtime:
             await self.bus.emit("run.failed", {"run_id": run_id, "error": run["error"]}, session_id)
             raise
         finally:
+            self.system_events.end_run(log_scope)
             release = asyncio.create_task(computer.release_execution(session_id, run_id))
             release_cancelled = await self.team._settle([release])
             if release.cancelled():
@@ -1447,10 +1465,10 @@ class Runtime:
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
-                    claimed = (
-                        round_index < self.config.settings.limits.max_tool_steps
-                        and await self._claim_inputs(session_id, run_id)
-                    )
+                    claimed = False
+                    if round_index < self.config.settings.limits.max_tool_steps:
+                        self.system_events.clear_request(session_id)
+                        claimed = await self._claim_inputs(session_id, run_id)
                     self._guard_request(prepared)
                     if claimed:
                         prepared = await self._prepare_request(session_id)
@@ -1529,6 +1547,7 @@ class Runtime:
                     raise paused
                 self._guard_request(prepared)
                 if round_index < self.config.settings.limits.max_tool_steps:
+                    self.system_events.clear_request(session_id)
                     await self._claim_inputs(session_id, run_id)
                 prepared = await self._prepare_request(session_id)
                 if spent >= self.config.settings.limits.max_tool_steps:

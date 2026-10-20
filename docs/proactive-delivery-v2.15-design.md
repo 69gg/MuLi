@@ -73,7 +73,7 @@ WebUI/channel 用 `kind` 判别联合，复用 `Section(extra="forbid")`、有�
 - `reminder_schedule` 在有效 PreparedRequest 中从宿主捕获来源；authenticated WebUI 创建提醒固定为 web。提醒修改、重复触发与恢复保留初始绑定，正文和模型参数不能改绑。直接 Python 调用没有请求上下文时默认 `legacy_local`。原提醒没有 origin 的升级记录也留本地；第一期不凭“定时触发时没人说话”将其改为独立。
 - `SelfManagement.stage` 保存有效请求的来源。后续 configure/restart/update 结果继承该计划，不能因为执行时主模型空闲就改走全局默认。旧计划和没有已登记独立入口的直接宿主调用留本地。当前 WebUI 只有读取/取消管理计划，没有新增创建入口；以后若新增，须明确绑定 web。
 - 更新检查由启动时的自主检查入口明确标记 independent。adapter 继续核验当前 checked/available 的版本记录和对应通知；只伪造一个 `notification.created` 不够。以后的自主检查若增加其它调用点，须逐个登记，不由 `Updates.check` 缺少参数反推。当前没有新增 WebUI 手动检查入口；以后若新增，须明确绑定 web。
-- 系统日志继续核验 canonical `system_log` 与精确 event ID。当前仅有 run/session 引用或仅仅缺少引用，都不足以证明 independent。第一期现有日志默认本地；以后仅对明确的服务维护调用点增加独立标记，或在任务执行入口保存其冻结来源。`unknown` component/code、普通 logging 调用和带 run 但无法关联原来源的记录不能选默认渠道。handler 线程不读记忆、不查 SQLite、不决定路由。
+- 系统日志继续核验 canonical `system_log` 与精确 event ID。仅有 run/session 引用或仅仅缺少引用，都不足以证明 independent。A 第一片日志默认本地；后续 [C 来源切片](system-error-origin-design.md)只增加主会话当前 PreparedRequest 的 bound 来源与扩展目录自主 watch 的固定独立标记。`unknown` component/code、普通 logging 调用和带 run 但无法关联原来源的记录不能选默认渠道。handler 线程不读记忆、不查 SQLite、不决定路由。
 - `source=assistant` 的 `notify`、外部/chiliarch 通知和一般 EventBus 文本保持原合同，不自动提升成合格来源。这样也不会把模型自己的通知再次交回 Attention，形成外发循环。
 
 新入口的原始来源、独立标记和选路结果进入 adapter 的 canonical 一致性核验。不能只验证通知正文却允许事件中的路由覆盖原记录。这里沿用本地可信 Python 插件的信任边界，不宣称抵御可直接改库的恶意本机代码。
@@ -132,7 +132,7 @@ HTTP 已开始之后的安全撤销不能声称撤回已送达内容。已有成
 
 设置/状态至少显示：当前默认、记忆绑定是否有效及原因、Attention/模型条件、下一条新独立事项将如何处理。每条 outbox 继续显示原对象、选路依据、阻塞/未知原因与原有重试入口。`attention_receipt=accepted`、assistant 已生成、outbox pending、平台 API 确认 sent 和用户已读分别陈述；不把排队或本地已读当作送达。
 
-A 的交付范围为配置/共享路由校验、已登记生产入口的来源与原子事件、Attention 分组及主动终答/outbox 证据、现有设置与状态展示。第一期唯一启用 independent 的入口是启动时自主更新检查；用户发起的新提醒/管理操作保存来源，现有日志全部留本地。不同时实现 Workflow 自动汇报、所有日志调用点的来源追溯、另一个原文通知消费者或新主动收件人发现。B 只增加一个显式记忆绑定和点查校验；A 验证见下文，B 的操作合同见渠道与记忆文档。
+A 的交付范围为配置/共享路由校验、已登记生产入口的来源与原子事件、Attention 分组及主动终答/outbox 证据、现有设置与状态展示。A 第一片唯一启用 independent 的入口是启动时自主更新检查；用户发起的新提醒/管理操作保存来源，当时日志全部留本地，后续日志窄扩展见 C 设计。不同时实现 Workflow 自动汇报、所有日志调用点的来源追溯、另一个原文通知消费者或新主动收件人发现。B 只增加一个显式记忆绑定和点查校验；A 验证见下文，B 的操作合同见渠道与记忆文档。
 
 验证必须使用真实 Store 与离线门控：默认 WebUI 零外发；A 任务与明确 WebUI 压过全局 B；旧无 origin 记录仍本地；只有登记的独立入口可选 default；默认改变不重定向旧项；不同目的地不合批；记录/事件、ingress/receipt/cursor 在注入失败时一起回滚；重开重复事件不复位 blocked/unknown/sent；安全撤销发生在等待、入队和分段发送前；模型未配置/失败时保持未完成与可查记录。配置另测一次保存启用、channel→web 无残留、外部 A→B 完整替换、仅暂停保留地址、同次账号/授权变更按候选校验、manager 能构造并按原生命周期重建、schema/公开配置一致且不出现凭据。B 另测伪 trusted 事件、自由文本/引用、冲突/版本/忘记/关闭、手工 memory_remember、配置排队后证据变化，以及没有召回/外部模型调用。
 

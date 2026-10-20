@@ -56,7 +56,7 @@ MuLi doctor
 
 QQ 官方机器人和微信 iLink 使用可选加密依赖：`uv tool install 'muli-agent[channels]'`；同时需要 MCP 时使用 `uv tool install 'muli-agent[mcp,channels]'`。默认安装不包含本地语音或 GPU 模型；平台接入方式见[渠道说明](docs/channels.md)。
 
-没有发令会话的主动通知默认留 WebUI，可在“消息渠道 → 主动通知”一次设置外部默认。第一期仅启动自主更新检查使用该默认；新任务提醒保存原请求来源，旧记录与日志留本地。默认更改只影响新事项，撤销后的待发项 blocked，unknown 不自动重试；见[默认通知的配置与边界](docs/channels.md#无发令会话时的默认通知)。
+没有发令会话的主动通知默认留 WebUI，可在“消息渠道 → 主动通知”一次设置外部默认。启动自主更新检查、扩展目录自主 watch 的新失败状态可使用该默认；主会话当前请求失败和新任务提醒保存原请求来源，旧记录及其它日志留本地。默认更改只影响新事项，撤销后的待发项 blocked，unknown 不自动重试；见[默认通知的配置与边界](docs/channels.md#无发令会话时的默认通知)。
 
 ## 后台服务
 

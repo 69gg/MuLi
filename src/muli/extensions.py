@@ -181,6 +181,8 @@ class Extensions:
         self._sources: tuple[str, ...] = ()
         self._dirty = False
         self._requested = 0
+        self._directory_request: int | None = None
+        self._watch_failure: tuple[int, str, str, str] | None = None
         self._refresh: set[str] = set()
         self._ready_at = 0.0
         self._wake = asyncio.Event()
@@ -421,16 +423,31 @@ class Extensions:
             raise self._failure(exc) from exc
 
     async def _watch(self) -> None:
+        def notify_failure(previous: tuple[str, dict[str, str] | None]) -> None:
+            if self.phase not in {"failed", "restart_required"} or self._error is None:
+                return
+            signature = self.generation, self.phase, self._error["code"], self._error["source"]
+            if signature == self._watch_failure:
+                return
+            self._watch_failure = signature
+            if previous != (self.phase, self._error):
+                self.runtime.system_events.extension_watch_failed()
+
         while not self._closed:
+            if self.phase == "loaded":
+                self._watch_failure = None
             settings = self.runtime.config.settings
             if settings.extensions.watch_enabled:
+                previous = self.phase, self._error
                 try:
                     observed = await self.fingerprint(settings)
                     if observed != self._observed:
                         self._observed = observed
                         self.request_reload(refresh_catalogs=False)
+                        self._directory_request = self._requested
                 except Exception as exc:
                     self._failure(exc)
+                    notify_failure(previous)
             if self._dirty and asyncio.get_running_loop().time() >= self._ready_at:
                 if self.runtime.busy:
                     self.phase = "queued"
@@ -438,12 +455,16 @@ class Extensions:
                     async with self.runtime.configuration_lock:
                         if not self.runtime.busy and not self._closed:
                             self._dirty = False
+                            previous = self.phase, self._error
+                            autonomous = self._directory_request == self._requested
                             try:
                                 await self.apply_locked(self.runtime.config.settings, persist=False)
                             except ExtensionError as exc:
                                 if exc.code == "runtime_busy":
                                     self._dirty = True
                                     self.phase, self._error = "queued", None
+                                elif autonomous:
+                                    notify_failure(previous)
             self._wake.clear()
             interval = settings.extensions.scan_interval_seconds
             if self._dirty and not self.runtime.busy:

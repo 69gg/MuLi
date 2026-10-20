@@ -12,14 +12,15 @@ import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterator, MutableMapping
 from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from muli.events import EventBus
 from muli.proactive import FrozenRouting
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id
 
 LogLevel = Literal["warning", "error", "critical"]
@@ -54,6 +55,8 @@ _EXTRA_FIELDS = ("muli_component", "muli_code", "muli_run_id", "muli_session_id"
 _BATCH_SIZE = 32
 _MAX_COUNT = (1 << 63) - 1
 _SOURCE_FIELDS = ("id", "level", "component", "code", "run_id", "session_id", "first_at", "notify")
+_ROUTING_FIELDS = ("producer", "occurrence_id", "routing")
+LogProducer = Literal["legacy_local", "runtime_request", "extensions_watch"]
 
 
 class SystemEventsSettings(BaseModel):
@@ -81,10 +84,23 @@ class _Context:
     run_id: str | None = None
     session_id: str | None = None
     notify: bool = True
+    instance_id: str | None = None
+    owner: asyncio.Task[Any] | None = None
+    request_enabled: bool = False
+    routing: FrozenRouting = FrozenRouting()
+    producer: LogProducer = "legacy_local"
+    occurrence_id: str | None = None
 
 
 _EMPTY_CONTEXT = _Context()
 _CONTEXT: ContextVar[_Context] = ContextVar("muli_system_log", default=_EMPTY_CONTEXT)
+
+
+def _current_task() -> asyncio.Task[Any] | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None  # A plain logging thread owns no Runtime request.
 
 
 @contextmanager
@@ -100,8 +116,16 @@ def system_log_context(
         raise ValueError("日志运行引用或通知标记无效")
     previous = _CONTEXT.get()
     token = _CONTEXT.set(
-        _Context(
-            run_id or previous.run_id, session_id or previous.session_id, notify and previous.notify
+        replace(
+            previous,
+            run_id=run_id or previous.run_id,
+            session_id=session_id or previous.session_id,
+            notify=notify and previous.notify,
+            routing=(
+                previous.routing
+                if run_id in {None, previous.run_id} and session_id in {None, previous.session_id}
+                else FrozenRouting()
+            ),
         )
     )
     try:
@@ -119,6 +143,9 @@ class _Metadata:
     run_id: str | None
     session_id: str | None
     notify: bool
+    producer: LogProducer = "legacy_local"
+    occurrence_id: str | None = None
+    routing: FrozenRouting = FrozenRouting()
 
 
 class SystemLogger(logging.LoggerAdapter[logging.Logger]):
@@ -149,9 +176,15 @@ class _Handler(logging.Handler):
 
 class SystemEvents:
     def __init__(
-        self, store: Store, bus: EventBus, settings: Callable[[], SystemEventsSettings]
+        self,
+        store: Store,
+        bus: EventBus,
+        settings: Callable[[], SystemEventsSettings],
+        *,
+        independent_routing: Callable[[], FrozenRouting] | None = None,
     ) -> None:
         self.store, self.bus, self.settings = store, bus, settings
+        self._independent_routing = independent_routing
         # A live owner token also isolates two observers of the same database.
         self._instance_id = new_id()
         self._lock = threading.Lock()
@@ -180,6 +213,66 @@ class SystemEvents:
             0,
         )
         self.last_error: str | None = None
+
+    def begin_run(
+        self, run_id: str, session_id: str, *, main: bool, notify: bool
+    ) -> Token[_Context]:
+        # A new driver must not inherit another Task's principal/source/suppression.
+        return _CONTEXT.set(
+            _Context(
+                run_id,
+                session_id,
+                notify,
+                self._instance_id,
+                _current_task(),
+                request_enabled=main,
+            )
+        )
+
+    @staticmethod
+    def end_run(token: Token[_Context]) -> None:
+        _CONTEXT.reset(token)
+
+    def clear_request(self, session_id: str) -> None:
+        context = _CONTEXT.get()
+        if (
+            context.instance_id == self._instance_id
+            and context.owner is _current_task()
+            and context.owner is not None
+        ):
+            if context.session_id == session_id:
+                _CONTEXT.set(replace(context, routing=FrozenRouting()))
+
+    def bind_request(self, session_id: str, origin: ReplyOrigin) -> None:
+        context = _CONTEXT.get()
+        if (
+            context.instance_id == self._instance_id
+            and context.owner is _current_task()
+            and context.owner is not None
+            and context.session_id == session_id
+            and context.request_enabled
+        ):
+            _CONTEXT.set(replace(context, routing=FrozenRouting.bound(origin)))
+
+    def extension_watch_failed(self) -> None:
+        """Only the autonomous watch transition may claim this fixed producer."""
+        if self._adapter is None:
+            return
+        token = _CONTEXT.set(
+            _Context(
+                instance_id=self._instance_id,
+                owner=_current_task(),
+                producer="extensions_watch",
+                occurrence_id=new_id(),
+            )
+        )
+        try:
+            self._adapter.error(
+                "extension_reload_failed",
+                extra={"muli_component": "extensions", "muli_code": "extension_reload_failed"},
+            )
+        finally:
+            _CONTEXT.reset(token)
 
     def _count(self, name: str, amount: int = 1) -> None:
         self._counts[name] = min(_MAX_COUNT, self._counts[name] + amount)
@@ -263,6 +356,10 @@ class SystemEvents:
         )
         code = code if type(code) is str and len(code) <= 32 and code in _CODES else "unknown"
         context = _CONTEXT.get()
+        if context.owner is not None and (
+            context.owner is not _current_task() or context.instance_id != self._instance_id
+        ):
+            context = _Context(notify=context.notify)
         run_id = fields.get("muli_run_id", context.run_id)
         session_id = fields.get("muli_session_id", context.session_id)
         notify = context.notify and fields.get("muli_notify", True) is True
@@ -270,14 +367,42 @@ class SystemEvents:
             session_id is not None and _reference(session_id) is None
         ):
             notify = False
+        run_id, session_id = _reference(run_id), _reference(session_id)
+        producer: LogProducer = "legacy_local"
+        routing, occurrence = FrozenRouting(), None
+        if (
+            context.instance_id == self._instance_id
+            and context.owner is not None
+            and context.owner is _current_task()
+        ):
+            if (
+                component == "runtime"
+                and code == "runtime_failed"
+                and run_id == context.run_id
+                and session_id == context.session_id
+                and context.request_enabled
+                and context.routing.classification == "bound"
+            ):
+                producer, routing = "runtime_request", context.routing
+            elif (
+                component == "extensions"
+                and code == "extension_reload_failed"
+                and context.producer == "extensions_watch"
+                and run_id is None
+                and session_id is None
+            ):
+                producer, occurrence = "extensions_watch", context.occurrence_id
         metadata = _Metadata(
             severity,
             component,
             code,
             time.time(),
-            _reference(run_id),
-            _reference(session_id),
+            run_id,
+            session_id,
             notify and component not in {"attention", "system_events"},
+            producer,
+            occurrence,
+            routing,
         )
         with self._lock:
             if not self._accepting or self._handler is not handler:
@@ -329,7 +454,10 @@ class SystemEvents:
             item.run_id,
             item.session_id,
             allowed,
-            bucket,
+            item.producer,
+            item.occurrence_id,
+            item.routing.dump(),
+            None if item.producer == "extensions_watch" else bucket,
         )
         identifier = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         with self.store.db:
@@ -339,6 +467,11 @@ class SystemEvents:
                 record["count"] = min(_MAX_COUNT, int(record["count"]) + 1)
                 record["last_at"] = item.captured_at
             else:
+                routing = (
+                    self._independent_routing()
+                    if item.producer == "extensions_watch" and self._independent_routing is not None
+                    else item.routing
+                )
                 record = {
                     "id": identifier,
                     "level": item.level,
@@ -351,9 +484,12 @@ class SystemEvents:
                     "count": 1,
                     "notify": allowed,
                     "source": "python_logging",
+                    "producer": item.producer,
+                    "occurrence_id": item.occurrence_id,
+                    "routing": routing.dump(),
                 }
                 event = self.store._event(
-                    "system.log", {key: record[key] for key in _SOURCE_FIELDS}
+                    "system.log", {key: record[key] for key in (*_SOURCE_FIELDS, *_ROUTING_FIELDS)}
                 )
                 record["event_id"] = event["id"]
             self.store._put("system_log", record)
@@ -526,6 +662,39 @@ def _management_source(
     )
 
 
+def _valid_log_routing(record: dict[str, Any], data: dict[str, Any]) -> bool:
+    if not any(key in value for value in (record, data) for key in _ROUTING_FIELDS):
+        return True  # Records created before source routing stay local.
+    if any(key not in value for value in (record, data) for key in _ROUTING_FIELDS) or any(
+        record[key] != data[key] for key in _ROUTING_FIELDS
+    ):
+        return False
+    routing = FrozenRouting.load(record["routing"])
+    if record["routing"] != routing.dump():
+        return False
+    producer, occurrence = record["producer"], record["occurrence_id"]
+    if producer == "legacy_local":
+        return occurrence is None and routing.classification == "legacy_local"
+    if producer == "runtime_request":
+        return (
+            record["component"] == "runtime"
+            and record["code"] == "runtime_failed"
+            and record["run_id"] is not None
+            and record["session_id"] is not None
+            and occurrence is None
+            and routing.classification == "bound"
+        )
+    return (
+        producer == "extensions_watch"
+        and record["component"] == "extensions"
+        and record["code"] == "extension_reload_failed"
+        and record["run_id"] is None
+        and record["session_id"] is None
+        and _reference(occurrence) is not None
+        and routing.classification in {"independent", "legacy_local"}
+    )
+
+
 def validated_log_record(
     record: dict[str, Any] | None,
     event: dict[str, Any],
@@ -550,6 +719,7 @@ def validated_log_record(
         or type(record.get("event_id")) is not int
         or type(record.get("notify")) is not bool
         or any(data.get(field) != record.get(field) for field in _SOURCE_FIELDS)
+        or not _valid_log_routing(record, data)
     ):
         return None
     level, component, code = record.get("level"), record.get("component"), record.get("code")
@@ -583,7 +753,8 @@ def _log_source(
     if policy is None or not policy.enabled or not policy.notify_enabled:
         return None
     identifier = event["data"]["id"]
-    record = validated_log_record(store.get("system_log", identifier), event)
+    canonical = store.get("system_log", identifier)
+    record = validated_log_record(canonical, event)
     if (
         record is None
         or record["notify"] is not True
@@ -595,7 +766,11 @@ def _log_source(
         {key: record[key] for key in (*_SOURCE_FIELDS[1:], "last_at", "count")}, ensure_ascii=False
     )
     return AttentionSource(
-        "system_log", identifier, detail, f"system.log:{event['id']}:{identifier}"
+        "system_log",
+        identifier,
+        detail,
+        f"system.log:{event['id']}:{identifier}",
+        FrozenRouting.load(canonical.get("routing")) if canonical is not None else FrozenRouting(),
     )
 
 
