@@ -77,6 +77,7 @@ def test_default_is_local_and_destination_replacement_is_atomic(tmp_path: Path) 
     assert config.settings.channels.proactive.model_dump() == {
         "external_enabled": False,
         "default_destination": {"kind": "web"},
+        "memory_preference": None,
     }
     assert not FrozenRouting.independent(config.settings).origin.delivery_routes()
     configure(config)

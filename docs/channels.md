@@ -25,7 +25,7 @@ MuLi 可把 Telegram、OneBot/NapCat、QQ 官方机器人及微信 iLink 的消�
 
 Team 队友保存派工时的来源，并由子队友、恢复、普通补充消息和结果报告继承。从 A 渠道派工后切到 B 或 WebUI，主助手整理该任务后台报告时仍投回 A。输入队列只在既有工具回放安全边界领取连续同目的地的一段；完整 route（含账号及 `reply_to`）不同的输入不混成一段外发回复。普通 `send_message` 和 `resume` 不改绑；本片没有改绑工具，新任务需要新建队友。报告仍是资料，不取得主人身份或新的执行授权。
 
-旧队友或旧报告没有原始来源证据时，回复留在 WebUI。队友自身消息不直接自动外发；Workflow 自动汇报及记忆偏好选路尚未接入本合同。已有 A 目的地不可用时不会换发到 B、最近渠道或默认渠道；设计与边界见 [Team 原路汇报](report-origin-v2.15-design.md)。
+旧队友或旧报告没有原始来源证据时，回复留在 WebUI。队友自身消息不直接自动外发；Workflow 自动汇报尚未接入本合同。记忆偏好仅用于下节的独立事项，不改变 Team 已固定的来源。已有 A 目的地不可用时不会换发到 B、最近渠道或默认渠道；设计与边界见 [Team 原路汇报](report-origin-v2.15-design.md)。
 
 路由、投递记录和状态接口不含 token、client secret 或微信 `context_token`。iLink 的 `context_token` 只单独保存在本地渠道状态中，发送时按当前账号与目标查找。它需要本地数据目录的同等保护。
 
@@ -61,7 +61,13 @@ Team 队友保存派工时的来源，并由子队友、恢复、普通补充消
 }
 ```
 
-完整的外部 `default_destination` 补丁省略 `external_enabled` 时也同次启用；若要更改地址并继续暂停，必须同时明确给 `external_enabled=false`。单独启用渠道 transport 不会开启主动外发。暂停只需该 false，原地址仍保留。默认值为 `{"external_enabled":false,"default_destination":{"kind":"web"}}`；`default_destination` 是完整替换值，切回 `{"kind":"web"}` 不残留 route，也不会隐式暂停已冻结的外部项。
+完整的外部 `default_destination` 或 `memory_preference.destination` 补丁省略 `external_enabled` 时也同次启用；若要更改地址并继续暂停，必须同时明确给 `external_enabled=false`。单独启用渠道 transport 不会开启主动外发。暂停只需该 false，原地址仍保留。默认值为 `{"external_enabled":false,"default_destination":{"kind":"web"},"memory_preference":null}`；两个目的地配置均按完整对象替换，切回 `{"kind":"web"}` 不残留 route，也不会隐式暂停已冻结的外部项。
+
+可选 `channels.proactive.memory_preference` 明确引用一条主人的已保存偏好：`{"memory_id":"事实ID","version":1,"destination":{"kind":"web"}}`；外部 `destination` 使用上例相同结构。在设置页填写确切 ID、版本及地址，或让 `self_configure` 一次提交完整对象；设为 `null` 取消。记忆页提供详情和按需原始证据核查。设置输入不能提供 `trusted_owner/source_id/digest` 代替来源校验，也不会根据记忆正文猜出账号、群组或收件人。
+
+新建、更换或重新启用绑定时，宿主只按主键读取当前事实与来源的有限元数据：记忆已开启、active 的 preference、版本一致、事实及来源受主人信任、来源确为 user/owner，且具有有效摘要。排队应用和关闭组件的等待结束后再次核对，证据变化则保留原配置。后台记忆提炼不改此设置；尚未提炼出合格事实时可先使用普通默认。未变更的旧绑定失效不阻止无关设置、关闭记忆、撤销渠道权限、暂停外发或显式解绑。
+
+产生新的独立事项时，有效绑定优先于普通默认；否则使用普通默认并在渠道状态显示原因。绑定所用事实版本、来源 ID 和摘要随目的地一同冻结，不读取全文或运行搜索/模型。取消绑定、记忆关闭、事实更正/冲突/遗忘、来源变化或更换该绑定地址后，旧的依赖项受阻，不能自动改投普通默认；冲突解决后的新版本也需重新明确绑定。恢复相同依据不会自动重发 blocked，unknown 同样保留原规则。
 
 外部地址需要明确四种渠道之一、稳定账号、私聊或已允许群组、目标及已绑定主人。私聊目标与主人 ID 必须相同；群聊还要在 `allowed_groups`。不自动挑第一个主人或群，不允许 URL、token、`context_token` 或固定 `reply_to`。QQ/iLink 等平台仍有自己的主动发送权限、窗口与会话凭据限制；配置通过不等于平台已经允许或送达。
 
@@ -69,7 +75,7 @@ Team 队友保存派工时的来源，并由子队友、恢复、普通补充消
 
 独立外发暂停或 Attention 关闭时，尚未发送的 independent 外发持久变为 `blocked`，不影响 bound/Team 的原路回复。账号/主人/群绑定撤销、渠道停用或未就绪则阻塞所有自动回复，保留原目的地与已成功分段。恢复设置不会自动重发 blocked；需使用既有“重试”入口，复核通过后从未完成部分继续。`unknown` 永不自动重试，仍需明确确认可能重复。改默认、重复事件和通知已读都不会复位 sent/blocked/unknown。HTTP 已开始的发送不能承诺撤回。
 
-需要开启 Attention、订阅 update 并配置主模型才会整理自主更新通知；模型未配置可保留一批待处理输入，失败则保留运行失败，不自动再生成。`/api/channels` 与 `channel_status` 返回当前默认、Attention/模型条件及投递状态；accepted、排队、已生成回复和 sent 各有不同含义。WebUI 始终保留通知与回复；失败后不会再创建第二条所谓 fallback 发送。尚未连接真实账号验证本片；明确记忆偏好选路与其它独立来源留到后续切片。
+需要开启 Attention、订阅 update 并配置主模型才会整理自主更新通知；模型未配置可保留一批待处理输入，失败则保留运行失败，不自动再生成。`/api/channels` 与 `channel_status` 返回当前策略、记忆依据短状态、下一事项目的地及 Attention/模型条件；accepted、排队、已生成回复和 sent 各有不同含义。WebUI 始终保留通知与回复；失败后不会再创建第二条所谓 fallback 发送。记忆失效的 fallback 只适用于新事项。尚未连接真实账号验证本片，其它独立来源仍未加入。
 
 ## 配置
 

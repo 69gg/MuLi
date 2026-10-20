@@ -164,6 +164,7 @@ def create_app(
             raise ValueError(
                 "当前进程仍监听非回环地址。请先保留密码、改为回环监听并重启，然后再清除密码"
             )
+        runtime.validate_proactive_settings(target)
         if runtime.extensions.configuration_only(config.settings, target):
             await runtime.extensions.apply_locked(target, persist=True)
             return
@@ -186,6 +187,7 @@ def create_app(
                 await channel_application.close()
                 await personal_io.close()
                 await memory_application.close()
+                runtime.validate_proactive_settings(target)
                 config.replace(target)
                 await rebuild()
             except (Exception, asyncio.CancelledError):
