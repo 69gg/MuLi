@@ -19,7 +19,7 @@ from test_linux_bootstrap import FakeProbe
 import muli.__main__ as cli
 import muli.server as server
 from muli.config import ConfigFile, Settings
-from muli.management_transaction import JournalControl, TransactionJournal
+from muli.management_transaction import JournalControl, TransactionError, TransactionJournal
 from muli.platforms import linux_bootstrap
 from muli.platforms.installation import InstallationManifest
 from muli.platforms.linux_bootstrap import BootSession, open_boot_session
@@ -341,3 +341,35 @@ def test_serve_runtime_constructor_failure_closes_writer_before_lease(
         cli.main()
     serving.assert_closed()
     assert serving.events[-2:] == ["store-close", "lease-close"]
+
+
+@pytest.mark.parametrize("failure", ["runtime", "application"])
+def test_serve_constructor_cleanup_failure_keeps_open_writer_lease(
+    serving: Serving, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    def initialize(self: server.Runtime) -> NoReturn:
+        raise RuntimeError("runtime-construction")
+
+    def attachments(*args: Any, **kwargs: Any) -> NoReturn:
+        raise RuntimeError("application-construction")
+
+    def fail_close(self: Store) -> NoReturn:
+        serving.sessions[-1].lease.check()
+        raise OSError("store-close-failed")
+
+    if failure == "runtime":
+        monkeypatch.setattr(server.Runtime, "_initialize", initialize)
+    else:
+        monkeypatch.setattr(server, "Attachments", attachments)
+    monkeypatch.setattr(Store, "close", fail_close)
+    with pytest.raises(OSError, match="store-close-failed"):
+        cli.main()
+    assert serving.stores and serving.sessions
+    for store in serving.stores:
+        assert store.db.execute("SELECT 1").fetchone()[0] == 1
+    session = serving.sessions[-1]
+    assert not session._closed
+    session.lease.check()
+    with TransactionJournal(session.journal.directory.path, session.journal.database) as contender:
+        with pytest.raises(TransactionError, match="lock_busy"):
+            contender.writer_lease().__enter__()
