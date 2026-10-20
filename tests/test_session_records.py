@@ -60,10 +60,32 @@ def all_records(
 
 def test_directory_finds_old_titles_before_pagination_and_keeps_the_legacy_list(
     store: Store,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    save(store, "old-record", 1, title="唯一的旧任务")
+    timestamp = 1.0
+
+    def clock() -> float:
+        return timestamp
+
+    # The legacy list orders by objects.updated, independent of JSON dates.
+    monkeypatch.setattr("muli.store.now", clock)
+    save(store, "old-record", timestamp, title="唯一的旧任务")
+    expected_times = {"old-record": timestamp}
     for index in range(201):
-        save(store, f"new-{index:03d}", index + 2)
+        timestamp = float(index + 2)
+        identifier = f"new-{index:03d}"
+        save(store, identifier, timestamp)
+        expected_times[identifier] = timestamp
+    saved_times = {
+        row["id"]: (row["created_at"], row["updated_at"], row["updated"])
+        for row in store.db.execute(
+            "SELECT id,updated,json_extract(data,'$.created_at') AS created_at,"
+            "json_extract(data,'$.updated_at') AS updated_at FROM objects WHERE kind='session'"
+        )
+    }
+    assert saved_times == {
+        identifier: (value, value, value) for identifier, value in expected_times.items()
+    }
     assert "old-record" not in {item["id"] for item in store.list("session")}
     changes = store.db.total_changes
     reader = SessionRecords(store)

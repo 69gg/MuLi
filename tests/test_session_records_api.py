@@ -36,13 +36,38 @@ async def records_case(tmp_path: Path) -> AsyncIterator[tuple[Runtime, httpx.Asy
 
 async def test_title_directory_finds_old_record_and_keeps_live_contract_and_identity(
     records_case: tuple[Runtime, httpx.AsyncClient],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, client = records_case
     main = runtime.main_session()
+    timestamp = 1.0
+
+    def clock() -> float:
+        return timestamp
+
+    # Keep runtime JSON dates and the legacy storage order explicit even when
+    # the host wall clock gives every quick write the same timestamp.
+    monkeypatch.setattr("muli.runtime.now", clock)
+    monkeypatch.setattr("muli.store.now", clock)
     old = runtime.new_session("旧的中文 %_ Archive")
     message = runtime.store.add_message(old["id"], "user", "旧资料不是新主人输入")
+    expected_times = {old["id"]: timestamp}
     for index in range(201):
-        runtime.new_session(f"较新资料 {index}")
+        timestamp = float(index + 2)
+        session = runtime.new_session(f"较新资料 {index}")
+        expected_times[session["id"]] = timestamp
+    saved_times = {
+        row["id"]: (row["created_at"], row["updated_at"], row["updated"])
+        for row in runtime.store.db.execute(
+            "SELECT id,updated,json_extract(data,'$.created_at') AS created_at,"
+            "json_extract(data,'$.updated_at') AS updated_at FROM objects "
+            "WHERE kind='session' AND id<>?",
+            (main["id"],),
+        )
+    }
+    assert saved_times == {
+        identifier: (value, value, value) for identifier, value in expected_times.items()
+    }
     old_list = (await client.get("/api/sessions")).json()
     assert len(old_list["items"]) == 200
     assert old["id"] not in {item["id"] for item in old_list["items"]}
