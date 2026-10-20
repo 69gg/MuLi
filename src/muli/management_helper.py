@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal
 
+from muli.managed_transaction import TransactionRecordV2
 from muli.management_controller import ControllerBackend, TransactionController
 from muli.management_transaction import (
     ClockReading,
@@ -107,7 +108,13 @@ def _seconds(value: float) -> str:
 def _launch_arguments(
     manifest: InstallationManifest, record: TransactionRecord, root: Path
 ) -> list[str]:
-    limits = manifest.helper
+    return helper_launch_arguments(
+        helper_unit_name(record), helper_arguments(manifest, root), manifest.helper
+    )
+
+
+def helper_launch_arguments(name: str, argv: tuple[str, ...], limits: HelperLimits) -> list[str]:
+    """Share the exact existing resource envelope, without selecting an identity."""
     properties: dict[str, str | int] = {
         "WorkingDirectory": "/",
         "CollectMode": "inactive",
@@ -134,10 +141,10 @@ def _launch_arguments(
         "--no-block",
         "--service-type=exec",
         "--expand-environment=no",
-        "--unit=" + helper_unit_name(record),
+        "--unit=" + name,
         *(f"--property={name}={value}" for name, value in properties.items()),
         "--",
-        *helper_arguments(manifest, root),
+        *argv,
     ]
 
 
@@ -196,15 +203,31 @@ async def _drive(
     driver = TransactionController(
         control, backend, clock, operation_timeout=limits.operation_timeout
     )
+    return await drive_loop(
+        driver.step, control.read, backend.observe, limits, clock, verify_helper, wait=wait
+    )
+
+
+async def drive_loop[RecordT: TransactionRecord | TransactionRecordV2](
+    step: Callable[[], Awaitable[RecordT]],
+    read: Callable[[], RecordT | None],
+    observe_final: Callable[[RecordT], Awaitable[object]],
+    limits: HelperLimits,
+    clock: Callable[[], ClockReading],
+    verify_helper: Callable[[], Awaitable[None]],
+    *,
+    wait: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> RecordT:
+    """Drive either typed controller without changing its proof/effect policy."""
     while True:
         await verify_helper()
-        before = control.read()
-        record = await driver.step()
+        before = read()
+        record = await step()
         if record.resolved:
             # A lost final hint cannot undo released or leave an implicit phase.
             try:
                 async with asyncio.timeout(limits.operation_timeout):
-                    await backend.observe(record)
+                    await observe_final(record)
             except Exception:
                 pass
             return record
