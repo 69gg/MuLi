@@ -7,11 +7,9 @@ by the host; a real Linux capability verifier remains a separate responsibility.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import hmac
 import os
 import sqlite3
-import stat
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -25,6 +23,7 @@ from muli.management_transaction import (
     TransactionJournal,
     TransactionRecord,
 )
+from muli.platforms.transaction_files import ConfigurationError, ConfigurationFile
 
 
 class MaintenanceError(ValueError):
@@ -86,40 +85,11 @@ class Admission:
 
 def configuration_digest(path: Path, limit: int) -> str:
     """Read exact bounded bytes without blocking on a replaced FIFO or link."""
-    path = path.absolute()
-    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        for part in path.parts[1:-1]:
-            child = os.open(
-                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
-            )
-            os.close(parent)
-            parent = child
-        descriptor = os.open(
-            path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
-        )
-        with os.fdopen(descriptor, "rb") as handle:
-            before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
-                raise MaintenanceError("configuration_not_regular")
-            if before.st_size > limit:
-                raise MaintenanceError("configuration_budget")
-            data = handle.read(limit + 1)
-            after = os.fstat(handle.fileno())
-        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-
-        def identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
-            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
-
-        if (
-            len(data) > limit
-            or identity(before) != identity(after)
-            or identity(before) != identity(current)
-        ):
-            raise MaintenanceError("configuration_changed")
-        return hashlib.sha256(data).hexdigest()
-    finally:
-        os.close(parent)
+        with ConfigurationFile(path, limit) as source:
+            return source.read().digest
+    except ConfigurationError as exc:
+        raise MaintenanceError(str(exc)) from None
 
 
 class BootPermit:
