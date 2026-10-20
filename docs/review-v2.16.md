@@ -1,6 +1,6 @@
 # 2.16 主动通知与发布复验修复
 
-状态：候选整合中。继承未成功发布的 2.15，新增明确的默认通知目的地；记忆偏好绑定与跨进程可恢复重启仍独立开发，不计入本版。
+状态：2.16 已完成独立发布复验并发布 GitHub / PyPI。继承未成功发布的 2.15，新增明确的默认通知目的地；记忆偏好绑定与跨进程可恢复重启不计入本版。
 
 ## 主动通知
 
@@ -25,3 +25,12 @@ Linux 子进程已消失时，打开 `/proc/<pid>/stat` 与读取之间可能抛
 离线构建 wheel/sdist，在源码目录外临时安装验证导入、网页资源、API 文档、提示词、桌面默认关闭、任务控制与完整 lifespan，并验证版本、标签、changelog 和两种包元数据一致。通过，service 1.802 秒、峰值 90.3 MiB、swap 0；未修改用户安装。精确签名提交的远端矩阵与正式发行尚待验证，不能用本地通过代替发布成功。
 
 所有本地验证均使用共享资源守卫，保持单次 1 GiB、总计 2 GiB、swap 0、一个逻辑 CPU 的等效预算及有限执行期限。
+
+## 正式发布证据
+
+精确 GPG 签名提交 `0a6f9e185a0cfbfb45f967e2a38c25e8007bf999` 的 [PR CI 39465536522](https://github.com/69gg/MuLi/actions/runs/39465536522) 八项全部成功，随后签名标签 `v2.16.0` 的 [Release 39466820221](https://github.com/69gg/MuLi/actions/runs/39466820221) 十一项全部成功，包括原失败组合及 PyPI 短期 OIDC 发布。[PR #19](https://github.com/69gg/MuLi/pull/19) 已合入同一提交，没有移动 2.15 标签。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.16.0) 于 2026-10-20 17:39:33 UTC 发布；[PyPI 2.16.0](https://pypi.org/project/muli-agent/2.16.0/) 返回同版本的两个文件。仅读取小型元数据，逐一核对 GitHub 与 PyPI 的大小和 SHA-256，无下载或安装发布包：
+
+- wheel：533,772 字节，`78620e8df35991033defcc15e81b39e708e720bd1dc56bbae0c83a7d4d42778e`。
+- sdist：3,099,450 字节，`06b5cb0b6f1786888106f854d6596ff978b169afe65fd81e60f54208f9111877`。
