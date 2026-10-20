@@ -27,3 +27,13 @@ manifest 在 journal 锁内发布；旧代未解决或终态未投影时不得�
 初始支持面限标准同用户 systemd unit、可核验 cgroup v2 与本地持久文件系统。unsupported 保留原服务。机器重启后恢复依赖已启用的服务或显式恢复入口；不会自动启用 linger。最终只有包含 bootstrap、管理入口、独立 helper、真实 writer lease 和终态投影的闭环全部通过，才宣传同版本可恢复重启。
 
 配置文件入口已实现，50 项定向用例通过（其中 19 项新增），0.94 秒、峰值 112 MiB、swap 0；三个文件 Ruff/格式、两份源码 mypy 通过。首次测试的 11 个失败全部来自测试将全局 fixture 预建的 `muli-home` 误判为残留；测试改用专有目录后通过，未放宽产品检查。独立复审指出重开 handle 不能继承内存中的未确认状态，随后增加明确 confirm 屏障及持续目录同步失败的反证。真实 backend 必须调用此入口，单模块通过仍不表示服务恢复闭环已交付。
+
+## 独立控制者的实际资源证明
+
+`SystemdProbe.read_helper(name, argv, limits)` 只观察已运行的控制者。它核对同名 transient `Type=exec`、实际 argv/解释器/uid/InvocationID、当前进程的 cgroup，以及内存、swap、CPU、任务数、整组 OOM、停止和有限重启预算。内核 `memory.max`、`memory.swap.max`、`cpu.max`、`pids.max`、`memory.oom.group` 必须实际生效；D-Bus 配置值不能代替内核证据。前后两次 unit、进程与内核观察变化均拒绝，路径逐段不跟随链接、单文件读取有界，整个观察保留总超时与外部取消。
+
+控制者不能位于主服务 cgroup 下，也不能通过 PartOf、BindsTo、StopPropagatedFrom 绑定其它 unit；Requires、Requisite、Conflicts 中不能包含主服务。正常的 slice 和 shutdown 依赖不受此限制。此检查不承诺阻止管理员在观察结束后更改 manager 状态。
+
+`helper_exists` 使用固定 `ListUnitsByPatterns([], [精确名称])`，仅成功的结构化空列表表示 manager 当前没有加载该名。它不证明磁盘上没有同名单元；后续 transient 创建若冲突必须失败，不能 reset、换名或把 manager 读取失败解释为不存在。
+
+本片 54 项新增及 48 项既有探测回归通过，0.27 秒、峰值 61.9 MiB、swap 0；Ruff/格式与单源码 mypy 通过，后者峰值 121 MiB。独立审查补充了 Requires 停止传播和 TimeoutError 继承 OSError 的边界。另仅对一个不存在的精确 helper 名运行了受 guard 保护的只读 D-Bus 查询，核实 `data:[[]]` 格式（59 毫秒、10.3 MiB），未启动或停止真实服务。接口类型同时对照本机安装的 `/usr/share/dbus-1/interfaces/org.freedesktop.systemd1.{Unit,Service,Manager}.xml` 和 [systemd 官方资料](https://github.com/systemd/systemd/blob/main/man/org.freedesktop.systemd1.xml)。
