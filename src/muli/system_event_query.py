@@ -11,8 +11,10 @@ from muli.system_events import _CODES, _COMPONENTS, _LEVELS, _reference, validat
 
 DEFAULT_EVENT_LIMIT = 20
 MAX_EVENT_LIMIT = 100
-# Fixed metadata only; never deserialize arbitrary exception bodies from storage.
-_RECORD_BYTES = 4096
+# Includes the canonical route/proof, not log text. The 4096-character route,
+# 512-character input ID and finite proof fit even with UTF-8/JSON escaping.
+# The returned metadata and its independent output budget remain unchanged.
+_RECORD_BYTES = 32 * 1024
 _FILTERS = ("level", "component", "code", "run_id", "session_id")
 _LINK = (
     "e.id=CASE WHEN json_valid(o.data) "

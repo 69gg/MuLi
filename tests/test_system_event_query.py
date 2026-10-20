@@ -19,7 +19,7 @@ from muli.providers.codecs import build_request
 from muli.providers.types import ProtocolName
 from muli.service import UserService
 from muli.store import Store, new_id
-from muli.system_event_query import read_system_events
+from muli.system_event_query import _RECORD_BYTES, read_system_events
 from muli.system_events import SystemEventsSettings, attention_source
 
 
@@ -173,7 +173,7 @@ def test_unverified_metadata_is_not_echoed(store: Store, mutation: str) -> None:
     elif mutation == "missing":
         del item["run_id"]
     elif mutation == "oversized":
-        item["private"] = "SECRET" * 1000
+        item["private"] = "SECRET" * (_RECORD_BYTES // 6 + 1)
     elif mutation == "count_bool":
         item["count"] = True
     elif mutation == "old_event":
