@@ -6,7 +6,6 @@ import builtins
 import json
 import os
 import sqlite3
-import sys
 import time
 import uuid
 from collections.abc import Callable, Generator
@@ -15,6 +14,23 @@ from typing import Any, Literal
 
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
+from muli.store_schema import (
+    CORE_SCHEMA,
+    SESSION_DIRECTORY_SCHEMA,
+    ExistingStoreError,
+    ExistingStoreLimits,
+    read_existing_main,
+    validate_existing_schema,
+)
+from muli.store_schema import (
+    SESSION_RECORD_CREATED as _SESSION_RECORD_CREATED,
+)
+from muli.store_schema import (
+    SESSION_RECORD_SORT as _SESSION_RECORD_SORT,
+)
+from muli.store_schema import (
+    session_record_time as _session_record_time,
+)
 
 LifecycleKind = Literal["session", "run", "approval", "workflow_run"]
 _LIFECYCLE_KINDS = ("session", "run", "approval", "workflow_run")
@@ -27,17 +43,6 @@ SQLITE_MAX_INTEGER = (1 << 63) - 1
 _SESSION_RECORD_LIMIT = 101  # A public page of at most 100 plus one lookahead.
 
 
-def _session_record_time(field: str) -> str:
-    """Modern session dates are finite positive JSON numbers, never coerced text."""
-    value = f"json_extract(data,'$.{field}')"
-    return (
-        f"CASE WHEN json_type(data,'$.{field}') IN ('integer','real') "
-        f"AND {value}>0 AND {value}<={sys.float_info.max!r} THEN {value} END"
-    )
-
-
-_SESSION_RECORD_CREATED = _session_record_time("created_at")
-_SESSION_RECORD_SORT = f"coalesce(({_SESSION_RECORD_CREATED}),0)"
 _SESSION_RECORD_UPDATED = _session_record_time("updated_at")
 _SESSION_RECORD_TITLE = (
     "CASE WHEN json_type(data,'$.title')='text' THEN json_extract(data,'$.title') END"
@@ -92,6 +97,7 @@ _EVIDENCE_FROM = (
 
 class Store:
     def __init__(self, path: Path, *, durable: bool = False) -> None:
+        self._migration_allowed = True
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(descriptor)
@@ -103,79 +109,70 @@ class Store:
             self.db.close()
             raise
 
-    def _initialize(self, *, durable: bool) -> None:
+    @classmethod
+    def open_existing(
+        cls,
+        path: Path,
+        *,
+        durable: bool = False,
+        limits: ExistingStoreLimits | None = None,
+    ) -> Store:
+        """Internal no-migration construction; not compatibility authorization.
+
+        The host authenticates paths and exclusively owns the writer lease. This
+        method neither creates a missing database nor changes its journal mode.
+        """
+        store = cls.__new__(cls)
+        store._migration_allowed = False
+        try:
+            store.db = sqlite3.connect(
+                path.absolute().as_uri() + "?mode=rw&cache=private",
+                uri=True,
+                check_same_thread=False,
+                timeout=0,
+                isolation_level="DEFERRED",
+            )
+        except sqlite3.Error:
+            raise ExistingStoreError("existing_store_unavailable") from None
+        try:
+            # No SQL, even a connection PRAGMA, precedes bounded validation.
+            validate_existing_schema(store.db, limits=limits)
+            store._configure_connection(durable=durable)
+            store.db.execute("PRAGMA foreign_keys=ON")
+            store.db.execute("PRAGMA busy_timeout=3000")
+            return store
+        except sqlite3.Error:
+            store.db.close()
+            raise ExistingStoreError("existing_store_unavailable") from None
+        except BaseException:
+            store.db.close()
+            raise
+
+    @property
+    def migration_allowed(self) -> bool:
+        return self._migration_allowed
+
+    def _configure_connection(self, *, durable: bool) -> None:
         self.db.row_factory = sqlite3.Row
         if durable:
-            # Before schema creation or any business transaction, including on
-            # SQLite builds whose WAL default is NORMAL.
+            # This is a connection policy, not a persistent journal-mode change.
             self.db.execute("PRAGMA synchronous=FULL")
             if self.db.execute("PRAGMA synchronous").fetchone()[0] != 2:
                 raise ValueError("store_durability_unsupported")
-        self.db.executescript("""
+
+    def _initialize(self, *, durable: bool) -> None:
+        self._configure_connection(durable=durable)
+        self.db.executescript(
+            """
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
             PRAGMA busy_timeout=3000;
-            CREATE TABLE IF NOT EXISTS objects (
-                kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
-                updated REAL NOT NULL, PRIMARY KEY(kind,id)
-            );
-            CREATE INDEX IF NOT EXISTS objects_updated ON objects(kind,updated DESC);
-            CREATE INDEX IF NOT EXISTS agents_parent ON objects(json_extract(data,'$.parent_id')) WHERE kind='agent';
-            CREATE INDEX IF NOT EXISTS agents_status ON objects(json_extract(data,'$.status')) WHERE kind='agent';
-            CREATE INDEX IF NOT EXISTS agents_commitment ON objects(json_extract(data,'$.commitment_id')) WHERE kind='agent';
-            CREATE INDEX IF NOT EXISTS workflow_runs_status ON objects(json_extract(data,'$.status')) WHERE kind='workflow_run';
-            CREATE INDEX IF NOT EXISTS objects_unfinished_lifecycle ON objects(kind,id)
-                WHERE kind IN ('session','run','approval','workflow_run')
-                AND json_extract(data,'$.status') IN ('pending','queued','running');
-            CREATE INDEX IF NOT EXISTS workflow_runs_by_parent
-                ON objects(json_extract(data,'$.parent_run_id'),id) WHERE kind='workflow_run';
-            CREATE INDEX IF NOT EXISTS task_plan_pending ON objects(id) WHERE kind='task_plan_delivery' AND json_extract(data,'$.state')='pending';
-            CREATE TABLE IF NOT EXISTS message_order (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL UNIQUE,
-                session_id TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS message_order_session ON message_order(session_id,seq);
-            CREATE TABLE IF NOT EXISTS runtime_state (
-                name TEXT PRIMARY KEY, value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS ingress (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-                session_id TEXT NOT NULL, state TEXT NOT NULL, payload TEXT NOT NULL,
-                received REAL NOT NULL, delivered_seq INTEGER, run_id TEXT
-            );
-            CREATE INDEX IF NOT EXISTS ingress_pending ON ingress(session_id,state,seq);
-            CREATE INDEX IF NOT EXISTS ingress_system_log_run
-                ON ingress(run_id) WHERE run_id IS NOT NULL;
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
-                session_id TEXT, data TEXT NOT NULL, created_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS events_session ON events(session_id,id);
-            CREATE UNIQUE INDEX IF NOT EXISTS team_completion_revision
-                ON events(session_id,json_extract(data,'$.completion_revision'))
-                WHERE type='team.finished';
-            CREATE TABLE IF NOT EXISTS inbox (
-                id TEXT PRIMARY KEY, envelope TEXT NOT NULL, received REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY, content TEXT NOT NULL, kind TEXT NOT NULL,
-                source TEXT NOT NULL, entities TEXT NOT NULL, created_at REAL NOT NULL,
-                updated_at REAL NOT NULL, confidence REAL NOT NULL DEFAULT 1.0
-            );
-            CREATE TABLE IF NOT EXISTS relations (
-                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-                subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL,
-                PRIMARY KEY(memory_id,subject,predicate,object)
-            );
-            CREATE INDEX IF NOT EXISTS relations_subject ON relations(subject);
-            CREATE INDEX IF NOT EXISTS relations_object ON relations(object);
-        """)
+        """
+            + CORE_SCHEMA
+        )
         # The expression is shared with the page predicate/order. The kind prefix
         # lets SQLite choose this partial index over the older updated index.
-        self.db.execute(
-            "CREATE INDEX IF NOT EXISTS sessions_created_directory "
-            f"ON objects(kind,({_SESSION_RECORD_SORT}) DESC,id DESC) WHERE kind='session'"
-        )
+        self.db.execute(SESSION_DIRECTORY_SCHEMA)
         # Old archives have no insertion sequence. Preserve their existing order once;
         # all subsequent messages use a database sequence, independent of wall time.
         if (
@@ -673,6 +670,8 @@ class Store:
 
     def main_session(self, mode: str = "auto") -> dict[str, Any]:
         """One durable local identity; old conversation sessions remain accessible."""
+        if not self.migration_allowed:
+            return read_existing_main(self.db, self.existing_main_session_id())
         with self.db:
             row = self.db.execute(
                 "SELECT value FROM runtime_state WHERE name='main_session'"
