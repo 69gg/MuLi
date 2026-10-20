@@ -11,7 +11,7 @@ from test_managed_transaction import CONFIG, UNIT, binding, deadline, identity, 
 
 from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.managed_journal import RoleSnapshots, advance_managed, prepare_managed, read_snapshots
-from muli.managed_transaction import TransactionRecordV2, TransitionV2
+from muli.managed_transaction import RoleBinding, TransactionRecordV2, TransitionV2
 from muli.management_transaction import (
     JournalLimits,
     ProjectionReceipt,
@@ -19,6 +19,7 @@ from muli.management_transaction import (
     TransactionError,
     TransactionJournal,
     Transition,
+    _snapshot,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux flock/fsync primitive")
@@ -33,7 +34,11 @@ def journal(tmp_path: Path) -> Iterator[TransactionJournal]:
 def snapshots(slot: str) -> RoleSnapshots:
     return RoleSnapshots(
         configuration=CONFIG,
-        selector=json.dumps({"deployment": "d" * 64, "installation": slot * 64}).encode(),
+        selector=json.dumps(
+            {"deployment": "d" * 64, "installation": slot * 64},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
         unit=UNIT,
     )
 
@@ -130,6 +135,37 @@ def test_same_request_reuses_identity_without_repairing_corrupted_snapshot(
         prepare(journal)
     assert path.read_bytes() == UNIT + b"# changed\n"
     assert journal.read_current() == record
+
+
+def test_noncanonical_selector_is_rejected_before_any_snapshot_is_written(
+    journal: TransactionJournal,
+) -> None:
+    selector = json.dumps({"deployment": "d" * 64, "installation": "a" * 64}, indent=2).encode()
+    base = RoleBinding.model_validate(
+        {
+            **binding("a").model_dump(),
+            "selector": _snapshot(selector, 4096).model_dump(),
+        }
+    )
+    with journal.writer_lease() as writer, journal.locked() as control:
+        with pytest.raises(TransactionError, match="selector_not_canonical"):
+            prepare_managed(
+                control,
+                request_id="request",
+                action="switch",
+                identity=identity(),
+                base=base,
+                target=binding("b"),
+                base_data=RoleSnapshots(CONFIG, selector, UNIT),
+                target_data=snapshots("b"),
+                observed_format=CURRENT_FORMAT_STATE,
+                base_manifest=manifest(),
+                target_manifest=manifest(),
+                deadline=deadline(),
+                writer=writer,
+            )
+    assert journal.read_current() is None
+    assert {path.name for path in journal.directory.path.iterdir()} == {"lock"}
 
 
 def test_v2_advance_compares_generation_revision_on_the_same_file(

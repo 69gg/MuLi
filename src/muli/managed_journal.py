@@ -59,6 +59,8 @@ class RoleSnapshots:
         selector = None if self.selector is None else _snapshot(self.selector, limit)
         if selector != binding.selector or raw_snapshot(self.unit, limit) != binding.unit:
             raise TransactionError("snapshot_invalid")
+        if selector is not None and selector.digest != selector.semantic_digest:
+            raise TransactionError("selector_not_canonical")
 
     def entries(self, generation: str, role: Role) -> dict[str, bytes]:
         values: dict[Component, bytes | None] = {
