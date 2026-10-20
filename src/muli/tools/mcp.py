@@ -153,8 +153,8 @@ def _default_factory(
 ) -> MCPClient:
     # MCP 是可选依赖；未配置或未启用服务器时不加载。
     from fastmcp import Client
-    from fastmcp.client.messages import MessageHandler
     from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
+    from mcp.types import ServerNotification, ToolListChangedNotification
 
     transport: Any
     if server["transport"] == "stdio":
@@ -170,10 +170,13 @@ def _default_factory(
         transport_type = SSETransport if server["transport"] == "sse" else StreamableHttpTransport
         transport = transport_type(url=server["url"], headers=server.get("headers"))
 
-    class CatalogNotifications(MessageHandler):
-        async def on_tool_list_changed(self, message: Any) -> None:
-            if changed is not None:
-                changed()
+    async def catalog_notifications(message: Any) -> None:
+        if (
+            changed is not None
+            and isinstance(message, ServerNotification)
+            and isinstance(message.root, ToolListChangedNotification)
+        ):
+            changed()
 
     return _FastMCPClient(
         Client(
@@ -181,7 +184,7 @@ def _default_factory(
             timeout=timeout,
             init_timeout=timeout,
             log_handler=_ignore_server_log,
-            message_handler=CatalogNotifications(),
+            message_handler=catalog_notifications,
         )
     )
 
@@ -712,6 +715,10 @@ class MCPManager:
             self._status[name]["status"] = "close_failed" if connection.close_failed else "closed"
         self._connections.clear()
         self.tools.clear()
+        if self._retiring:
+            # A whole Runtime reconfiguration must retain this owner until every
+            # connection is reclaimed, just as candidate publication already does.
+            raise MCPPrepareError("connection_cleanup_pending")
 
     async def close(self) -> None:
         async with self._lock:

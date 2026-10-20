@@ -13,10 +13,37 @@ from muli.tools.mcp import (
     MCPManager,
     MCPPrepareError,
     ToolPage,
+    _default_factory,
     _FastMCPClient,
 )
 
 JsonObject = dict[str, Any]
+
+
+async def test_optional_client_callback_only_accepts_tool_catalog_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fastmcp = pytest.importorskip("fastmcp")
+    types = pytest.importorskip("mcp.types")
+    options: dict[str, Any] = {}
+    changed: list[bool] = []
+
+    def client(transport: Any, **kwargs: Any) -> Any:
+        options.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(fastmcp, "Client", client)
+    _default_factory(
+        {"transport": "http", "url": "https://unused.invalid/mcp"},
+        1,
+        lambda: changed.append(True),
+    )
+    callback = options["message_handler"]
+    await callback(types.ServerNotification(root=types.ToolListChangedNotification()))
+    await callback(types.ServerNotification(root=types.ResourceListChangedNotification()))
+    await callback({"method": "notifications/tools/list_changed"})
+    await callback(RuntimeError("notification failure"))
+    assert changed == [True]
 
 
 class FakeClient:
@@ -474,7 +501,9 @@ async def test_retirement_failure_is_reported_after_new_catalog_is_published() -
         ]
         assert "private-fixture-value" not in json.dumps(manager.status())
     finally:
-        await manager.close()
+        with pytest.raises(MCPPrepareError, match="connection_cleanup_pending"):
+            await manager.close()
+        assert manager.pending_cleanup == 1
 
 
 async def test_repeated_caller_cancellation_does_not_cancel_owned_cleanup() -> None:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -18,7 +20,7 @@ from muli.management import SelfManagement
 from muli.providers import Message, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.server import create_app
-from muli.tools.mcp import MCPClient, MCPManager
+from muli.tools.mcp import MCPClient, MCPManager, MCPPrepareError
 
 
 def server(url: str = "old", *, enabled: bool = True) -> dict[str, Any]:
@@ -51,10 +53,138 @@ def fragment(tmp_path: Path, name: str, value: dict[str, Any]) -> Path:
     return path
 
 
+async def test_full_configuration_cannot_discard_an_unclosed_mcp_generation(
+    tmp_path: Path,
+) -> None:
+    class Unclosed(FakeClient):
+        allow_close = False
+
+        async def close(self) -> None:
+            await super().close()
+            if not self.allow_close:
+                raise RuntimeError("private transport cleanup detail")
+
+    runtime = setup_runtime(tmp_path)
+    client = Unclosed()
+    previous = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: client)
+    runtime.mcp = previous
+    app = create_app(runtime.config, runtime=runtime)
+    original = runtime.config.settings.model_dump()
+    try:
+        await runtime.extensions.load_initial()
+        target = runtime.config.validate_changes({"persona": {"append": "requires full rebuild"}})
+        async with runtime.configuration_lock:
+            with pytest.raises(MCPPrepareError, match="connection_cleanup_pending"):
+                await app.state.management.apply_settings(target)
+        assert runtime.mcp is previous
+        assert runtime.config.settings.model_dump() == original
+        assert ConfigFile(runtime.config.path).settings.model_dump() == original
+        assert previous.pending_cleanup == 1
+        assert previous.status()[0]["status"] == "close_failed"
+        assert runtime.extensions.status()["cleanup_pending"] == 1
+        assert "private transport" not in json.dumps(runtime.extensions.status())
+        assert client.entered == 1
+    finally:
+        client.allow_close = True
+        await previous.close()
+        await runtime.close()
+
+
 def directory_settings(tmp_path: Path, **limits: Any) -> Settings:
     return Settings.model_validate(
         {"extensions": {"mcp_directory": str(tmp_path / "mcp.d"), **limits}}
     )
+
+
+def test_directory_uses_full_path_identity_when_direntry_has_windows_zero_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fragment(tmp_path, "windows.json", {"mcpServers": {"native": server()}})
+    original_scandir = os.scandir
+
+    class WindowsDirEntry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self.entry, self.name = entry, entry.name
+
+        def stat(self, *, follow_symlinks: bool = True) -> SimpleNamespace:
+            info = self.entry.stat(follow_symlinks=follow_symlinks)
+            return SimpleNamespace(
+                st_dev=0,
+                st_ino=0,
+                st_nlink=0,
+                st_mode=info.st_mode,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns,
+                st_ctime_ns=info.st_ctime_ns,
+            )
+
+    @contextmanager
+    def windows_scandir(path: str | os.PathLike[str]) -> Iterator[Iterator[WindowsDirEntry]]:
+        with original_scandir(path) as entries:
+            yield (WindowsDirEntry(entry) for entry in entries)
+
+    monkeypatch.setattr(os, "scandir", windows_scandir)
+    snapshot = MCPDirectory(directory_settings(tmp_path)).prepare()
+    assert snapshot.sources == ("windows.json",)
+    assert snapshot.config["mcpServers"]["native"]["enabled"] is True
+
+
+def _with_ctime(info: os.stat_result, nanoseconds: int) -> os.stat_result:
+    return os.stat_result(
+        info,
+        {"st_mtime_ns": info.st_mtime_ns, "st_ctime_ns": nanoseconds},
+    )
+
+
+def test_directory_accepts_distinct_stable_path_and_handle_ctimes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = fragment(tmp_path, "windows.json", {"mcpServers": {"native": server()}})
+    handle_ctime = path.lstat().st_ctime_ns + 1
+    original_fstat = os.fstat
+    calls = 0
+
+    def fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        return _with_ctime(original_fstat(descriptor), handle_ctime)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    snapshot = MCPDirectory(directory_settings(tmp_path)).prepare()
+    assert snapshot.sources == ("windows.json",)
+    assert snapshot.config["mcpServers"]["native"]["enabled"] is True
+    assert calls == 2
+
+
+@pytest.mark.parametrize("api", ["fstat", "lstat"])
+def test_directory_still_rejects_ctime_changes_within_each_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api: str
+) -> None:
+    path = fragment(tmp_path, "changing.json", {"mcpServers": {"native": server()}})
+    initial_ctime = path.lstat().st_ctime_ns
+    calls = 0
+    original_fstat, original_lstat = os.fstat, Path.lstat
+
+    def fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        return _with_ctime(original_fstat(descriptor), initial_ctime + (calls > 1))
+
+    def lstat(source: Path) -> os.stat_result:
+        nonlocal calls
+        info = original_lstat(source)
+        if source == path:
+            calls += 1
+            return _with_ctime(info, initial_ctime + (calls > 1))
+        return info
+
+    if api == "fstat":
+        monkeypatch.setattr(os, "fstat", fstat)
+    else:
+        monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(ExtensionError, match="source_changed"):
+        MCPDirectory(directory_settings(tmp_path)).prepare()
+    assert calls == 2
 
 
 async def test_unconfigured_directories_respect_muli_home_and_ignore_physical_home(
@@ -471,6 +601,20 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
     runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=factory)
     app = create_app(runtime.config, runtime=runtime)
     manager: SelfManagement = app.state.management
+    busy_returned, release_management = asyncio.Event(), asyncio.Event()
+    apply_settings = manager.apply_settings
+
+    async def gated_management_apply(settings: Settings) -> None:
+        try:
+            await apply_settings(settings)
+        except ExtensionError as exc:
+            if exc.code == "runtime_busy":
+                busy_returned.set()
+                await release_management.wait()
+            raise
+
+    if mode == "management":
+        monkeypatch.setattr(manager, "apply_settings", gated_management_apply)
     operation: asyncio.Task[httpx.Response] | None = None
     try:
         await runtime.extensions.load_initial()
@@ -531,6 +675,19 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
                     ):
                         await asyncio.sleep(0.01)
                 if plan is not None:
+                    # Closing a candidate does not finish the caller's requeue.
+                    await asyncio.wait_for(busy_returned.wait(), timeout=2)
+                    current = runtime.store.get("management", plan["id"])
+                    assert current is not None and current["status"] == "applying"
+                    release_management.set()
+
+                    def requeued() -> bool:
+                        assert plan is not None
+                        saved = runtime.store.get("management", plan["id"])
+                        return saved is not None and saved["status"] == "pending"
+
+                    async with asyncio.timeout(2), runtime.bus.changed:
+                        await runtime.bus.changed.wait_for(requeued)
                     current = runtime.store.get("management", plan["id"])
                     assert current is not None and current["status"] == "pending"
                     assert (manager.directory / f"{plan['id']}.json").is_file()
@@ -556,6 +713,7 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
     finally:
         finish_prepare.set()
         finish_model.set()
+        release_management.set()
         if operation is not None:
             await asyncio.gather(operation, return_exceptions=True)
         await manager.close()

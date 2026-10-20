@@ -33,8 +33,16 @@ system_events / attention 组件不能再次通知；明确 notify=false 的上�
 
 ## 验证
 
+### 按需回查（2.15 开发中）
+
+`self_events` 为只读工具，查询已保留的固定错误元数据；`self_logs` 继续按需读取服务日志。可按精确 `level`、`component`、`code`、`run_id`、`session_id` 过滤，默认 20 条，最多 100 条。`before_event_id` 使用规范十进制字符串，按创建事件 ID 降序翻页，避免大整数精度丢失。重复计数更新不会改变位置，计数反映本次读取时的值。
+
+结果提供 `items`、`next_before_event_id`、`has_more`、`truncated`、保留 ID 范围及无效/无法关联证据计数，只返回白名单字段。每条必须与 canonical `system.log` 事件一致；无效页仍推进游标，不回显畸形内容。完整 JSON 信封按工具输出预算截断，不跨过放不下的下一条；连首条都放不下时明确报 `output_budget`。
+
+关闭采集或通知不会隐藏已有历史，`notify=false` 也可读取。查询不推进 Attention 游标，不新增通知、回执或运行。`coverage="retained_only"` 表示仅覆盖当前保留集合，缺口不一定是连续前缀，空页不能证明从未发生错误。不会查询全部会话事件，也不会把异常正文当作指令。设计与尚未实施的原生日志留存增强见[查询设计](system-events-query-design.md)。
+
 只使用临时数据库、独立 logger、假模型与有限线程验证：阈值、突发/队列满、单唤醒、重复计数、保留/旧事件、停止/配置更新、实例隔离、持久化失败无递归、通知失败抑制、旧来源等价，以及主/团队工作结束后的原有 Attention 等待合同。所有检查经根目录 scripts/check_local.py 串行进行，不访问真实服务或模型。
 
-`tests/test_system_events.py` 与原 `tests/test_attention.py` 合计 59 项通过，峰值 73.9 MiB、swap 0；两份产品源码严格 mypy 及相关 Ruff/format 通过。`tests/test_system_events_runtime.py` 的七项宿主接线回归已另行准备并通过静态检查，尚未执行；模块回归通过不等于 Runtime/server 接线已完成验证。
+`tests/test_system_events.py` 与原 `tests/test_attention.py` 合计 59 项通过，峰值 73.9 MiB、swap 0；两份产品源码严格 mypy 及相关 Ruff/format 通过。宿主接线另覆盖真实执行失败、注意事项自身失败不再唤醒、claim 前失败、跨运行归属、热改策略、启动/关闭顺序、旧运行被较新历史遮挡及精确查询索引。已纳入整版 1,879 项通过、1 项平台跳过的 Linux 检查；后续最终候选及跨平台结果见[评审记录](review-v2.14.md)。
 
 依据：[logging.Handler.emit](https://docs.python.org/3.13/library/logging.html#logging.Handler.emit)、[call_soon_threadsafe](https://docs.python.org/3.13/library/asyncio-eventloop.html#asyncio.loop.call_soon_threadsafe)、[contextvars](https://docs.python.org/3.13/library/contextvars.html)。已用 Context7 核对 Handler 锁顺序与跨线程调度；接口核对不等于功能验证。
