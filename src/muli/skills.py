@@ -530,6 +530,10 @@ class Skills:
         # Host-owned marker makes repeated preparation idempotent without touching history.
         current = self._replace_context(messages, None)
         active, invalidated = self._active(session_id)
+        if invalidated:
+            # Once this session observes invalidation, restoring identical old
+            # bytes must not reactivate it. Valid suspended guidance is retained.
+            self._save_active(session_id, active)
         if not self._snapshot.settings.enabled or not self._snapshot.entries:
             self.release_session(session_id)
             if not invalidated:

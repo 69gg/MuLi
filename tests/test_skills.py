@@ -395,6 +395,82 @@ async def test_removed_skill_notice_and_explicit_forget_do_not_keep_old_guidance
     assert await host.skills.context("main", []) == []
 
 
+@pytest.mark.parametrize("session_id", ["main", "worker"])
+@pytest.mark.parametrize("change", ["removed", "changed"])
+async def test_observed_invalidation_does_not_reactivate_restored_old_skill(
+    host: Host, session_id: str, change: str
+) -> None:
+    host.store.put("session", {"id": session_id})
+    host.tool_session_id = session_id
+    path = host.source(body="原始指导")
+    host.source("retained", body="继续有效的指导")
+    original, retained = await host.load()
+    assert (await host.activate(original))["status"] == "activated"
+    assert (await host.activate(retained))["status"] == "activated"
+    if change == "removed":
+        path.unlink()
+    else:
+        host.source(body="新修订指导")
+    await host.load()
+    changed = payload(await host.skills.context(session_id, []))
+    assert changed["changed_requires_reread_or_forget"] == ["example"]
+    assert [item["name"] for item in changed["active"]] == ["retained"]
+    host.source(body="原始指导")
+    restored, _ = await host.load()
+    current = payload(await host.skills.context(session_id, []))
+    assert [item["name"] for item in current["active"]] == ["retained"]
+    assert (await host.activate(restored))["status"] == "activated"
+    assert {
+        item["name"] for item in payload(await host.skills.context(session_id, []))["active"]
+    } == {
+        "example",
+        "retained",
+    }
+
+
+@pytest.mark.parametrize("change", ["removed", "changed"])
+async def test_unobserved_intermediate_skill_change_keeps_identical_activation(
+    host: Host, change: str
+) -> None:
+    path = host.source(body="原始指导")
+    host.source("retained")
+    original, _ = await host.load()
+    assert (await host.activate(original))["status"] == "activated"
+    if change == "removed":
+        path.unlink()
+    else:
+        host.source(body="中间修订")
+    await host.load()
+    # This session did not prepare context while the activation was invalid.
+    host.source(body="原始指导")
+    await host.load()
+    current = payload(await host.skills.context("main", []))
+    assert current["changed_requires_reread_or_forget"] == []
+    assert current["active"][0]["revision"] == original.revision
+    assert current["active"][0]["body"] == original.body
+
+
+async def test_invalidated_skill_pruning_keeps_valid_suspended_guidance(host: Host) -> None:
+    host.source(body="旧指导")
+    host.source("retained", body="有效但暂停的完整指导")
+    original, retained = await host.load()
+    assert (await host.activate(original))["status"] == "activated"
+    assert (await host.activate(retained))["status"] == "activated"
+    host.source(body="新指导")
+    reduced = host.config.settings.skills.model_copy(update={"max_active_chars": 1})
+    host.skills.publish(await host.skills.prepare(reduced))
+    suspended = payload(await host.skills.context("main", []))
+    assert suspended["guidance_status"] == "suspended" and suspended["active"] == []
+    state = host.store.get("skill_state", "main")
+    assert state is not None
+    assert [item["name"] for item in state["skills"]] == ["retained"]
+    assert state["skills"][0]["body"] == retained.body
+    await host.load()
+    resumed = payload(await host.skills.context("main", []))
+    assert resumed["guidance_status"] == "available"
+    assert [item["name"] for item in resumed["active"]] == ["retained"]
+
+
 async def test_fingerprint_tracks_accepted_sources_not_recursive_resources(host: Host) -> None:
     path = host.source()
     fingerprint = await host.skills.fingerprint(host.config.settings.skills)
