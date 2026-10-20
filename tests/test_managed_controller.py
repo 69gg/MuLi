@@ -192,13 +192,19 @@ def scenario(
         CONFIG,
         None
         if first.selector is None
-        else json.dumps({"deployment": "d" * 64, "installation": "a" * 64}).encode(),
+        else json.dumps(
+            {"deployment": "d" * 64, "installation": "a" * 64},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
         b"[Service]\nExecStart=/original/python -m muli\n" if action == "adopt" else UNIT,
     )
     target_data = RoleSnapshots(
         b'{"credential":"other-fixture","port":8765}' if changed_config else CONFIG,
         json.dumps(
-            {"deployment": "d" * 64, "installation": ("b" if action == "switch" else "a") * 64}
+            {"deployment": "d" * 64, "installation": ("b" if action == "switch" else "a") * 64},
+            sort_keys=True,
+            separators=(",", ":"),
         ).encode(),
         UNIT,
     )
