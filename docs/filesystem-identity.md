@@ -18,6 +18,9 @@ mountinfo 的设备号字段仍严格解析，但不与 `fstat.st_dev` 强行相
 
 默认最多 8 个目录，mountinfo 最多 512 KiB／4096 条挂载，单份 fdinfo 最多 4 KiB，路径最多 4096 字节；`FilesystemLimits` 只允许有限的小范围调整。
 按内核格式识别 ` - ` 分隔符及四种路径八进制转义，忽略不认识的 optional tags；重复 mount ID、缺失或重复 `mnt_id`、不完整记录均拒绝。
+`root` 字段是文件系统内部名称，可以是 nsfs 的 `net:[inode]`，不一定为绝对路径；它只接受有界、合法的字段解码，不参与目录选择。
+用于目录包含关系的 `mountpoint` 仍必须是没有 `..` 的绝对路径，并按实际 fd 的 `mnt_id` 选择；无关 nsfs 挂载不会阻断本地目录，但实际目录若属于 nsfs 仍明确拒绝。
+两字段的未知／残缺转义、NUL、字段注入及超出路径字节预算仍会失败。
 所有 fd 在成功和失败时关闭，普通文件来源使用 `O_NONBLOCK|O_NOFOLLOW` 并在读取前核验类型及上限，不会阻塞读取 FIFO。
 
 prepare、标准服务 bootstrap 和 helper 的安装核验应重新调用此入口；本片只提供函数及离线回归，不修改这些既有调用点。
@@ -27,9 +30,11 @@ prepare、标准服务 bootstrap 和 helper 的安装核验应重新调用此入
 依据经 Context7 核对的 [Linux proc 格式](https://github.com/torvalds/linux/blob/master/Documentation/filesystems/proc.rst)、
 [fdinfo 的 mount ID](https://man7.org/linux/man-pages/man5/proc_pid_fdinfo.5.html)、
 [内核 mountinfo 输出与转义](https://github.com/torvalds/linux/blob/master/fs/proc_namespace.c)、
+[nsfs 动态内部名称](https://github.com/torvalds/linux/blob/master/fs/nsfs.c)、
 [Btrfs getattr 的设备号](https://github.com/torvalds/linux/blob/master/fs/btrfs/inode.c)、
 [ext4 写屏障](https://docs.kernel.org/admin-guide/ext4.html)和
 [F2FS fsync／checkpoint 选项](https://docs.kernel.org/filesystems/f2fs.html)。
-定向验证经 `scripts/check_local.py` 保护入口完成：75 项回归通过（0.09 秒，峰值 53.1 MiB、swap 0），覆盖重叠挂载、四种路径转义、目录与 mount ID 变化、有限读取、错误选项、异常关闭 fd 和不支持平台。
+定向验证经 `scripts/check_local.py` 保护入口完成：86 项回归通过（0.11 秒，峰值 54.3 MiB、swap 0），覆盖重叠挂载、四种路径转义、目录与 mount ID 变化、有限读取、错误选项、异常关闭 fd 和不支持平台。
+其中无关 nsfs 与 Btrfs 目录的两种 mountinfo 行序在旧实现均稳定报 `filesystem_invalid_path`；修复后通过，并保留实际选中 nsfs 拒绝、root 坏转义／字段注入／超预算拒绝、mountpoint 非绝对路径／路径穿越拒绝的回归。
 两份 Python 文件的 Ruff 格式／检查及单源码严格 mypy 通过。
 测试只使用临时目录和假 proc 内容，不创建真实挂载、不操作用户服务；本片不声明真实 ext4、Btrfs、XFS、F2FS 故障恢复验证。
