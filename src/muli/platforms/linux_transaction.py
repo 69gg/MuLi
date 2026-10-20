@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from muli.management_transaction import ClockReading, TransactionError
+from muli.platforms.installation import HelperLimits
+from muli.platforms.transaction_files import _open_directory
 from muli.process import run_process
-from muli.service import UserService
+from muli.service import UNIT, UserService
 
 _BUS = "org.freedesktop.systemd1"
 _MANAGER = "/org/freedesktop/systemd1"
@@ -40,6 +42,31 @@ _SERVICE_FIELDS = (
     ("ExecStart", "a(sasbttttuii)"),
     ("KillMode", "s"),
     ("SendSIGKILL", "b"),
+)
+_HELPER_UNIT_FIELDS = (
+    ("Transient", "b"),
+    ("PartOf", "as"),
+    ("BindsTo", "as"),
+    ("StopPropagatedFrom", "as"),
+    ("Requires", "as"),
+    ("Requisite", "as"),
+    ("Conflicts", "as"),
+    ("StartLimitIntervalUSec", "t"),
+    ("StartLimitBurst", "u"),
+)
+_HELPER_SERVICE_FIELDS = (
+    ("Restart", "s"),
+    ("RestartUSec", "t"),
+    ("RuntimeMaxUSec", "t"),
+    ("TimeoutStopUSec", "t"),
+    ("MemoryMax", "t"),
+    ("MemorySwapMax", "t"),
+    ("CPUQuotaPerSecUSec", "t"),
+    ("TasksMax", "t"),
+    ("LimitCORE", "t"),
+    ("UMask", "u"),
+    ("NoNewPrivileges", "b"),
+    ("OOMPolicy", "s"),
 )
 
 
@@ -104,6 +131,13 @@ class ServiceSnapshot:
     process: ProcessIdentity | None
 
 
+@dataclass(frozen=True, slots=True)
+class HelperSnapshot:
+    unit: UnitSnapshot
+    process: ProcessIdentity
+    limits: HelperLimits
+
+
 def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for name, value in pairs:
@@ -131,8 +165,8 @@ def _string(value: object) -> str:
     return value
 
 
-def _number(value: object) -> int:
-    if type(value) is not int or not 0 <= value < 2**32:
+def _number(value: object, bits: int = 32) -> int:
+    if type(value) is not int or not 0 <= value < 2**bits:
         raise ObservationError("invalid_bus_integer")
     return value
 
@@ -215,8 +249,10 @@ class SystemdProbe:
         runner: CommandRunner = run_process,
         limits: ProbeLimits | None = None,
         proc_root: Path = Path("/proc"),
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
     ) -> None:
         self.runner, self.limits, self.proc_root = runner, limits or ProbeLimits(), proc_root
+        self.cgroup_root = cgroup_root
 
     async def _command(self, *arguments: str) -> str:
         result = await self.runner(
@@ -290,6 +326,202 @@ class SystemdProbe:
             _boolean(service["SendSIGKILL"]),
         )
 
+    async def _unit_path(self, name: str) -> str:
+        reply = _typed(
+            await self._command("call", _BUS, _MANAGER, _BUS + ".Manager", "GetUnit", "s", name),
+            "o",
+        )
+        if not isinstance(reply, list) or len(reply) != 1 or not isinstance(reply[0], str):
+            raise ObservationError("invalid_unit_path")
+        path = reply[0]
+        if not re.fullmatch(r"/org/freedesktop/systemd1/unit/[a-zA-Z0-9_]+", path):
+            raise ObservationError("invalid_unit_path")
+        return path
+
+    async def _helper_limits(self, path: str, limits: HelperLimits) -> None:
+        expected: dict[str, object] = {
+            "Transient": True,
+            "PartOf": (),
+            "BindsTo": (),
+            "StopPropagatedFrom": (),
+            "StartLimitIntervalUSec": round(limits.seconds * 1_000_000),
+            "StartLimitBurst": limits.restart_burst,
+            "Restart": "on-failure",
+            "RestartUSec": round(limits.restart_delay * 1_000_000),
+            "RuntimeMaxUSec": round(limits.seconds * 1_000_000),
+            "TimeoutStopUSec": round(limits.stop_seconds * 1_000_000),
+            "MemoryMax": limits.memory_bytes,
+            "MemorySwapMax": 0,
+            "CPUQuotaPerSecUSec": limits.cpu_percent * 10_000,
+            "TasksMax": limits.tasks,
+            "LimitCORE": 0,
+            "UMask": 0o077,
+            "NoNewPrivileges": True,
+            "OOMPolicy": "kill",
+        }
+        for interface, fields in (
+            ("Unit", _HELPER_UNIT_FIELDS),
+            ("Service", _HELPER_SERVICE_FIELDS),
+        ):
+            values = await self._properties(path, interface, fields)
+            for name, signature in fields:
+                raw = values[name]
+                value = (
+                    _boolean(raw)
+                    if signature == "b"
+                    else _strings(raw)
+                    if signature == "as"
+                    else _string(raw)
+                    if signature == "s"
+                    else _number(raw, 64 if signature == "t" else 32)
+                )
+                if name in {"Requires", "Requisite", "Conflicts"}:
+                    if UNIT in _strings(raw):
+                        raise ObservationError("helper_lifetime_dependency")
+                elif value != expected[name]:
+                    raise ObservationError("helper_limits_mismatch")
+
+    async def helper_exists(self, name: str) -> bool:
+        """Only a successful exact-name empty list proves absence."""
+        if sys.platform != "linux":
+            raise ObservationError("platform_unsupported")
+        if not re.fullmatch(r"muli-transaction-[a-f0-9]{64}\.service", name):
+            raise ObservationError("invalid_helper_identity")
+        async with asyncio.timeout(self.limits.seconds):
+            reply = _typed(
+                await self._command(
+                    "call",
+                    _BUS,
+                    _MANAGER,
+                    _BUS + ".Manager",
+                    "ListUnitsByPatterns",
+                    "asas",
+                    "0",
+                    "1",
+                    name,
+                ),
+                "a(ssssssouso)",
+            )
+            if (
+                not isinstance(reply, list)
+                or len(reply) != 1
+                or not isinstance(reply[0], list)
+                or len(reply[0]) > 1
+            ):
+                raise ObservationError("invalid_helper_listing")
+            if not reply[0]:
+                return False
+            entry = reply[0][0]
+            if not isinstance(entry, list) or len(entry) != 10 or entry[0] != name:
+                raise ObservationError("invalid_helper_listing")
+            for index in (0, 1, 2, 3, 4, 5, 6, 8, 9):
+                _string(entry[index])
+            _number(entry[7])
+            if not re.fullmatch(r"/org/freedesktop/systemd1/unit/[a-zA-Z0-9_]+", entry[6]):
+                raise ObservationError("invalid_unit_path")
+            return True
+
+    def _kernel_limits(self, cgroup: str, limits: HelperLimits) -> tuple[object, ...]:
+        path = self.cgroup_root / cgroup.removeprefix("/")
+        descriptor = _open_directory(path)
+        try:
+            identity = os.fstat(descriptor)
+            values: list[int] = []
+            for name, maximum in (
+                ("memory.max", limits.memory_bytes),
+                ("memory.swap.max", 0),
+                ("pids.max", limits.tasks),
+            ):
+                raw = _read_regular(Path(name), 128, directory_fd=descriptor).strip()
+                if not re.fullmatch(rb"[0-9]{1,20}", raw):
+                    raise ObservationError("helper_kernel_limits")
+                value = int(raw)
+                if value > maximum or (name != "memory.swap.max" and value == 0):
+                    raise ObservationError("helper_kernel_limits")
+                values.append(value)
+            cpu = _read_regular(Path("cpu.max"), 128, directory_fd=descriptor).strip()
+            if not re.fullmatch(rb"[0-9]{1,20} [0-9]{1,20}", cpu):
+                raise ObservationError("helper_kernel_limits")
+            quota, period = map(int, cpu.split())
+            if min(quota, period) <= 0 or quota * 100 > period * limits.cpu_percent:
+                raise ObservationError("helper_kernel_limits")
+            if (
+                _read_regular(Path("memory.oom.group"), 128, directory_fd=descriptor).strip()
+                != b"1"
+            ):
+                raise ObservationError("helper_kernel_limits")
+            current = _open_directory(path)
+            try:
+                actual = os.fstat(current)
+                if (actual.st_dev, actual.st_ino) != (identity.st_dev, identity.st_ino):
+                    raise ObservationError("helper_cgroup_changed")
+            finally:
+                os.close(current)
+            return (identity.st_dev, identity.st_ino, *values, quota, period)
+        finally:
+            os.close(descriptor)
+
+    async def read_helper(
+        self, name: str, argv: tuple[str, ...], limits: HelperLimits
+    ) -> HelperSnapshot:
+        """Observe an already running helper; never create units or relax limits."""
+        if sys.platform != "linux":
+            raise ObservationError("platform_unsupported")
+        if not re.fullmatch(r"muli-transaction-[a-f0-9]{64}\.service", name) or not argv:
+            raise ObservationError("invalid_helper_identity")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.limits.seconds
+        try:
+            async with asyncio.timeout(self.limits.seconds):
+                path = await self._unit_path(name)
+                before = await self._snapshot(path)
+                if (
+                    before.name != name
+                    or before.load_state != "loaded"
+                    or before.active_state != "active"
+                    or before.sub_state != "running"
+                    or before.service_type != "exec"
+                    or before.source
+                    or before.drop_ins
+                    or before.needs_reload
+                    or before.argv != argv
+                    or before.executable != argv[0]
+                    or before.ignore_failure
+                    or before.kill_mode != "control-group"
+                    or not before.send_sigkill
+                    or before.pid == 0
+                    or before.job != (0, "/")
+                    or before.invocation == "0" * 32
+                    or Path(before.cgroup).name != name
+                    or UNIT in Path(before.cgroup).parts
+                ):
+                    raise ObservationError("unsupported_helper_layout")
+                await self._helper_limits(path, limits)
+                process = self._process(before.pid)
+                if (
+                    process.uid != os.geteuid()
+                    or process.argv != argv
+                    or process.executable != str(Path(argv[0]).resolve(strict=True))
+                    or process.cgroup != before.cgroup
+                ):
+                    raise ObservationError("foreign_helper_process")
+                kernel = self._kernel_limits(before.cgroup, limits)
+                after = await self._snapshot(path)
+                await self._helper_limits(path, limits)
+                if (
+                    before != after
+                    or process != self._process(process.pid)
+                    or kernel != self._kernel_limits(before.cgroup, limits)
+                ):
+                    raise ObservationError("helper_observation_changed")
+                if loop.time() >= deadline:
+                    raise TimeoutError
+                return HelperSnapshot(after, process, limits)
+        except TimeoutError:
+            raise
+        except (OSError, UnicodeError):
+            raise ObservationError("helper_observation_unavailable") from None
+
     def _process(self, pid: int) -> ProcessIdentity:
         descriptor = os.open(
             self.proc_root / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -327,17 +559,7 @@ class SystemdProbe:
         deadline = loop.time() + self.limits.seconds
         try:
             async with asyncio.timeout(self.limits.seconds):
-                reply = _typed(
-                    await self._command(
-                        "call", _BUS, _MANAGER, _BUS + ".Manager", "GetUnit", "s", service.unit
-                    ),
-                    "o",
-                )
-                if not isinstance(reply, list) or len(reply) != 1 or not isinstance(reply[0], str):
-                    raise ObservationError("invalid_unit_path")
-                path = reply[0]
-                if not re.fullmatch(r"/org/freedesktop/systemd1/unit/[a-zA-Z0-9_]+", path):
-                    raise ObservationError("invalid_unit_path")
+                path = await self._unit_path(service.unit)
                 before = await self._snapshot(path)
                 expected = tuple(service._arguments())
                 if (
