@@ -176,6 +176,8 @@ async def read_service_logs(
         secrets | _secrets(config, mcp_config() if mcp_config is not None else None),
     )
     result.update(status="available" if text else "empty", text=text)
+    if not text and result["truncated"]:
+        result["reason"] = "no_complete_lines"
     # Keep the complete tool envelope within the existing output-character budget.
     low, high = 0, len(text)
     if len(json.dumps(result, ensure_ascii=False)) > budget:

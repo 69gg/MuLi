@@ -20,7 +20,7 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 `self_logs({"lines":40})` 读取自身服务最近日志，`lines` 可选，范围 1–200，沿用 ask/auto/yolo 工具权限。Linux 只查询当前用户的 `muli.service` journal；macOS / Windows 只读取服务启动器管理的 `data/logs/service.log` 尾部。数据根来自现有配置，不接受任意文件路径、unit 或 shell 命令。开发模式未安装服务时可能没有对应日志。
 
-返回 `source/status/text/truncated`，其中 `available` 表示读到了资料，`empty` 表示本次没有日志；缺少后端、文件缺失、权限失败或超出读取预算返回 `unavailable` 及固定原因。空日志不证明服务健康，也不证明没有历史错误。macOS / Windows 只读取当前文件，轮转旧文件不在本次结果内。
+返回 `source/status/text/truncated`，其中 `available` 表示读到了资料，`empty` 表示本次没有可返回的日志文本。文件有源内容、但保守省略行边界后为空时，同时返回 `truncated=true` 和固定 `reason=no_complete_lines`，意为“没有可安全返回的完整行”，不表示原文件没有完整行或错误；真正空文件不带该原因。缺少后端、文件缺失、权限失败或超出读取预算返回 `unavailable` 及固定原因。空日志不证明服务健康，也不证明没有历史错误。macOS / Windows 只读取当前文件，轮转旧文件不在本次结果内。
 
 读取复用有限子进程与文件 I/O，Linux 命令最多 5 秒；输入字节与最终完整 JSON 字符分别受现有 `limits.max_output_chars` 限制。文件模式始终省略无法证明完整的首行（即使从偏移零开始，也可能续接轮转前的半行）和尚未写完的尾行，并标记 `truncated`；非普通文件拒绝读取，支持 `O_NOFOLLOW` 的系统也拒绝符号链接。输出过长同样标记截断，不会通过增加读取预算或重试循环补齐。
 

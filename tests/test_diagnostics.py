@@ -109,8 +109,36 @@ async def test_file_tail_keeps_complete_recent_lines_and_does_not_write(
     original = b"old\nfirst\nsecond\nunfinished-credential"
     service.log_path.write_bytes(original)
     result = await read_service_logs(service, config, lines=2)
+    assert result["status"] == "available"
     assert result["text"] == "first\nsecond"
     assert result["truncated"] is True
+    assert "reason" not in result
+    assert service.log_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+@pytest.mark.parametrize(
+    "original",
+    [
+        pytest.param(b"single complete error\n", id="complete-single-line"),
+        pytest.param(b"unfinished-credential", id="partial-line"),
+        pytest.param(b"", id="empty-file"),
+    ],
+)
+async def test_empty_file_tail_distinguishes_omitted_content_from_empty_source(
+    tmp_path: Path, platform: str, original: bytes
+) -> None:
+    config, service = configured(tmp_path, platform)
+    service.log_path.parent.mkdir(parents=True)
+    service.log_path.write_bytes(original)
+    result = await read_service_logs(service, config)
+    assert result["status"] == "empty"
+    assert result["text"] == ""
+    assert result["truncated"] is bool(original)
+    if original:
+        assert result["reason"] == "no_complete_lines"
+    else:
+        assert "reason" not in result
     assert service.log_path.read_bytes() == original
 
 
