@@ -109,6 +109,70 @@ def test_private_roundtrip_preserves_exact_bytes_and_public_view(
         record.phase = "committed"  # type: ignore[misc]
 
 
+def test_preallocated_generation_binds_durable_management_plan(journal: TransactionJournal) -> None:
+    generation = "1" * 32
+    with journal.writer_lease() as writer, journal.locked() as control:
+        values = {
+            "request_id": "preallocated",
+            "action": "configure",
+            "identity": identity(),
+            "base": BASE,
+            "target": TARGET,
+            "deadline": deadline(),
+            "writer": writer,
+        }
+        record = control.prepare(**values, generation=generation)  # type: ignore[arg-type]
+        assert record.generation == generation
+        assert journal.snapshot(record, "base") == BASE
+        assert control.prepare(**values, generation=generation) == record  # type: ignore[arg-type]
+        assert control.prepare(**values) == record  # type: ignore[arg-type]
+        with pytest.raises(TransactionError, match="request_conflict"):
+            control.prepare(**values, generation="2" * 32)  # type: ignore[arg-type]
+        assert control.read() == record
+
+
+def test_successor_cannot_reuse_predecessor_generation(journal: TransactionJournal) -> None:
+    record = prepare(journal)
+    with journal.writer_lease() as writer, journal.locked() as control:
+        record = control.advance(record.position, Transition(phase="aborted", code="cancelled"))
+        with pytest.raises(TransactionError, match="generation_conflict"):
+            control.prepare(
+                request_id="successor",
+                action="configure",
+                identity=identity(),
+                base=BASE,
+                target=TARGET,
+                deadline=deadline(),
+                writer=writer,
+                generation=record.generation,
+                projected=ProjectionReceipt(
+                    **record.position.model_dump(), store_instance=record.identity.store_instance
+                ),
+            )
+        assert control.read() == record
+        assert journal.snapshot(record, "target") == TARGET
+
+
+@pytest.mark.parametrize("generation", ["", "A" * 32, "a" * 31, "a" * 33, "../" + "a" * 29])
+def test_invalid_preallocated_generation_never_writes_snapshots(
+    journal: TransactionJournal, generation: str
+) -> None:
+    with journal.writer_lease() as writer, journal.locked() as control:
+        with pytest.raises(TransactionError, match="invalid_generation"):
+            control.prepare(
+                request_id="preallocated",
+                action="configure",
+                identity=identity(),
+                base=BASE,
+                target=TARGET,
+                deadline=deadline(),
+                writer=writer,
+                generation=generation,
+            )
+        assert control.read() is None
+        assert set(os.listdir(journal.directory.fd)) == {"lock"}
+
+
 def test_distinct_fixed_locks_and_database_alias_share_lease(
     journal: TransactionJournal,
     tmp_path: Path,

@@ -10,6 +10,10 @@ SQLite 连接必须处于 WAL 和 `synchronous=FULL` 或 `EXTRA`；本模块只�
 
 原管理计划在 prepare 时保存 `transaction.generation`。只接受同 request ID、同 action、同 generation 的计划；按主键和 journal 字节预算读取计划，不扫描管理历史。保留计划原有 `routing`，不从当前会话、默认地址或记忆重建来源。原工具消息和 unknown 收据不修改。最终计划保留原 metadata，更新状态、固定结果字段、完成时间和 `transaction` 的公共终态；`management.completed.data` 必须与这个最终计划完全一致，供现有 Attention canonical 逻辑验证。
 
+为消除 journal prepared 已落盘、数据库计划尚未保存 generation 的崩溃窗口，管理 worker 预先生成 32 位小写十六进制 generation，先持久保存 applying 计划，再发布安装清单并调用 `JournalControl.prepare(generation=...)`。原调用者可以省略此参数，由 journal 继续生成。指定 generation 的同请求重放必须匹配已有值，新请求不能复用上一代；非法值在任何快照写入前拒绝。若进程在计划保存后、prepared 前退出，启动恢复只能标记未执行／中断，不能生成完成事件或伪造恢复记录。
+
+此窄接口新增 7 项回归；与 helper CollectMode 新反例及既有相关测试共 93 项通过，峰值 61.6 MiB、swap 0，四文件 Ruff/格式与两源码 mypy 通过。管理入口接线仍需遵守上述先后顺序。
+
 单个 `Store.event` 事务同时写管理计划、固定对象 `kind=management_projection`／`id=transaction-v1` 的最新 `ProjectionReceipt` 与 `management.completed` 事件。receipt 只含固定 ID、generation／revision／Store instance；重复 exact receipt 直接返回，不增加通知。相同 generation 任意不同 revision 都拒绝，不回退或重发该代终态；只有验证过当前 record／计划的另一 generation 可以替换固定 receipt。提交或任一写入失败时三者一起回滚。
 
 合法 successor 窗口是新 manifest B 已耐久、下一代 prepared 尚未落盘，journal 仍为已投影的旧 A。此时真正 DB／Store／main 和 stable resolved journal 均匹配，exact receipt 可以只读返回，不要求当前 permit.installation 仍等于旧 A；需要创建新投影时才严格要求 permit installation／service 与 record 相同。下一代 prepare 仅接受从真实 Store 读取的精确 receipt，不信任调用方口头声称“上一代已汇报”。

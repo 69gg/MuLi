@@ -552,9 +552,14 @@ class JournalControl(FixedLock):
         deadline: Deadline,
         writer: FixedLock,
         projected: ProjectionReceipt | None = None,
+        generation: str | None = None,
     ) -> TransactionRecord:
         self.check()
         writer.check()
+        if generation is not None and (
+            not isinstance(generation, str) or not re.fullmatch(r"[a-f0-9]{32}", generation)
+        ):
+            raise TransactionError("invalid_generation")
         if writer.name != "lease" or _identity(os.fstat(writer.directory.fd)) != _identity(
             os.fstat(self.journal.writer_directory.fd)
         ):
@@ -571,6 +576,7 @@ class JournalControl(FixedLock):
                     or previous.action != action
                     or previous.base != base_ref
                     or previous.target != target_ref
+                    or (generation is not None and generation != previous.generation)
                 ):
                     raise TransactionError("request_conflict")
                 return previous
@@ -582,10 +588,12 @@ class JournalControl(FixedLock):
                 raise TransactionError("projection_required")
             if previous.identity.store_instance != identity.store_instance:
                 raise TransactionError("store_changed")
+            if generation == previous.generation:
+                raise TransactionError("generation_conflict")
         record = TransactionRecord(
             request_id=request_id,
             action=action,
-            generation=secrets.token_hex(16),
+            generation=generation or secrets.token_hex(16),
             revision=1,
             identity=identity,
             base=base_ref,
