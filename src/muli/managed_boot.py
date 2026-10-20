@@ -22,7 +22,15 @@ from muli.compatibility import assess_compatibility
 from muli.config import ConfigFile
 from muli.format_evidence import FormatEvidence, read_format_evidence
 from muli.managed_transaction import TransactionRecordV2, parse_record_v2, raw_snapshot
-from muli.management_transaction import FixedLock, Identifier, Role, TransactionJournal, _snapshot
+from muli.management_projection import read_projection_connection
+from muli.management_transaction import (
+    FixedLock,
+    Identifier,
+    ProjectionReceipt,
+    Role,
+    TransactionJournal,
+    _snapshot,
+)
 from muli.platforms.filesystem_identity import verify_local_filesystems
 from muli.platforms.managed_deployment import (
     _LAUNCHER_BYTES,
@@ -135,6 +143,7 @@ class ManagedBootPermit:
         self._database: _DatabaseAnchor | None = None
         self._opened = self._closed = self._cleanup_failed = False
         self._unclosed: Store | sqlite3.Connection | None = None
+        self._configuration_bytes: bytes | None = None
         self.record: TransactionRecordV2
         self.anchor: DeploymentAnchor
         self.role: Role
@@ -276,7 +285,7 @@ class ManagedBootPermit:
         with SelectorStore(self.journal.directory.path) as file:
             selector = file.read()
         if (
-            _snapshot(configuration, limit) != binding.configuration
+            (not record.resolved and _snapshot(configuration, limit) != binding.configuration)
             or raw_snapshot(unit, limit) != binding.unit
             or (selector.reference if selector else None) != binding.selector
             or (
@@ -314,18 +323,33 @@ class ManagedBootPermit:
             "PRAGMA main.synchronous"
         ).fetchone()[0] not in {2, 3}:
             raise ManagedBootError("managed_durability_unsupported")
+        self._configuration(db, observation)
         self.check_paths(Path(observation.anchor.config_path), self.journal.database)
         fresh = self._observe()
         if (
             fresh.role != observation.role
+            or fresh.configuration != observation.configuration
             or fresh.record.revision < observation.record.revision
             or fresh.record.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
             != observation.record.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
         ):
             raise ManagedBootError("managed_record_changed")
+        self._configuration(db, fresh)
         self.check_paths(Path(fresh.anchor.config_path), self.journal.database)
         # This synchronous read may observe a legal phase/revision advance.
         self.record = fresh.record
+
+    def _configuration(self, db: sqlite3.Connection, observation: _Observation) -> None:
+        record = observation.record
+        if (
+            _snapshot(observation.configuration, self.journal.limits.max_snapshot_bytes)
+            == record.binding(observation.role).configuration
+        ):
+            return
+        if not record.resolved or read_projection_connection(db) != ProjectionReceipt(
+            **record.position.model_dump(), store_instance=record.identity.store_instance
+        ):
+            raise ManagedBootError("managed_configuration_unprojected")
 
     def _format(self, evidence: FormatEvidence, observation: _Observation) -> None:
         record = observation.record
@@ -346,6 +370,7 @@ class ManagedBootPermit:
         self.anchor, self.role = observation.anchor, observation.role
         self.config_path = Path(self.anchor.config_path)
         self.config = ConfigFile.from_bytes(self.config_path, observation.configuration)
+        self._configuration_bytes = observation.configuration
         self.installation = observation.slot.digest
         self.probation = not self.record.resolved
 
@@ -364,6 +389,8 @@ class ManagedBootPermit:
         self._opened = True
         try:
             observation = self._observe()
+            if observation.configuration != self._configuration_bytes:
+                raise ManagedBootError("managed_configuration_changed")
             self.check_paths(Path(observation.anchor.config_path), self.journal.database)
         except ManagedBootError:
             raise

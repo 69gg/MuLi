@@ -71,6 +71,20 @@ unit 按原始字节而非 JSON 校验；managed role 的 unit 必须对应 anch
 实际配置从已经核过的 bytes 经 `ConfigFile.from_bytes` 解析，使用既有 Settings
 转换和未知字段拒绝规则，不重读路径，也不采用缺文件的默认配置分支。
 
+未决代以及尚未在实际 Store 精确投影的终态仍冻结三份文件。只有记录已 resolved，
+且同一个已核 DB 连接读取到固定 `management_projection/transaction-v1` 对象，其
+generation/revision/store_instance 与该终态精确相符，启动才允许采用与历史快照不同
+的当前配置。复用 `read_projection_connection` 的有界回执解析和真实 Store/main、
+路径、WAL/FULL 合同，不构造临时 Store，也不凭 DTO 或 resolved 字段单独放行。
+这使已完成事务后的普通配置热更能在下次启动保留；旧 journal 和快照不被改写。
+selector、unit、slot、anchor 和完整格式始终保持原合同，未决代不因同形回执放宽。
+
+一次启动中，`acquire` 已核配置 bytes 必须保持到 `open_store`，包括原样字节与解析后
+设置；中途变化在业务 Store 工厂前拒绝，不静默更换调用方已用来确定监听参数的配置。
+初次准入内部前后观察之间也要求相同 bytes；返回 Store 前再次从该实际连接核回执。
+该规则只处理启动准入，不允许旧 nonce 健康证明在配置已变后继续报告历史配置摘要；
+运行期健康与配置门的宿主接线须独立保留严格判定。
+
 DB 的 parent 和普通文件均保留 nofollow 描述符，拒绝缺文件、软链接、非普通文件、
 外来 owner、多硬链接及 inode/path 变化。只比较稳定的文件身份，不用主 DB 文件
 摘要代替 SQLite WAL。初次读取采用专用 `mode=ro&cache=private` 连接，复用
@@ -91,6 +105,13 @@ DDL/backfill/新身份；返回业务 Store 前，在该同一连接上再次读
 通过后正常业务仍可写；这不是只读运行模式。
 
 ## 验证边界
+
+终态已投影后的配置准入尾片新增 16 项参数化回归，同连接回执接口新增 1 项并强化
+外层事务保持断言。当前 boot 63 项、投影 42 项和运行绑定 33 项合计 138 项通过
+（pytest 2.36 秒，service 2.848 秒，峰值 121.1 MiB、swap 0）；四份 Python 文件
+Ruff/格式和两处源码严格 mypy 通过，静态检查最高 122.8 MiB。覆盖四种终态、缺失/
+错误/畸形/超大回执、未决代同形回执不放宽、acquire→open_store 配置变化、准入观察
+中变化、实际返回 Store 连接再次核回执，以及不改写历史或创建额外 Store。
 
 新增单文件 47 项回归通过（pytest 0.94 秒，受限 service 1.436 秒，峰值 85.8 MiB、
 swap 0）；两处源码严格 mypy、三份 Python 文件 Ruff 和格式检查通过，静态检查最高
