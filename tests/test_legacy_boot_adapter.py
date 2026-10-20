@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -13,11 +14,21 @@ from test_managed_transaction import deadline
 
 from muli import legacy_boot_adapter, managed_boot
 from muli.config import Settings
-from muli.legacy_boot_adapter import LegacyBootPermit, prepare_legacy_permit
+from muli.legacy_boot_adapter import (
+    LegacyBootPermit,
+    PendingLegacy,
+    confirm_legacy_permit,
+    prepare_legacy_permit,
+)
 from muli.maintenance import BootPermit, Maintenance
 from muli.managed_boot import ManagedBootError, ManagedBootPermit
 from muli.management_projection import project_final
-from muli.management_transaction import TransactionError, TransactionRecord, Transition
+from muli.management_transaction import (
+    TransactionError,
+    TransactionRecord,
+    Transition,
+    _snapshot,
+)
 from muli.platforms.managed_deployment import resolve_entry
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
@@ -32,20 +43,36 @@ class Host:
     owner: ManagedBootPermit
     store: Store
 
-    def prepare(self, *, action: str = "configure") -> LegacyBootPermit:
+    def pending(self, *, action: str = "configure") -> PendingLegacy:
         assert action in {"configure", "restart"}
+        return PendingLegacy(
+            manifest=self.recovered.manifest,
+            previous=self.recovered.previous,
+            request_id="next-legacy-" + action,
+            action="configure" if action == "configure" else "restart",
+            base=Path(self.recovered.manifest.config_path).read_bytes(),
+            target=self.recovered.target
+            if action == "configure"
+            else Path(self.recovered.manifest.config_path).read_bytes(),
+            deadline=deadline(),
+            generation=secrets.token_hex(16),
+        )
+
+    def prepare(
+        self, *, action: str = "configure", pending: PendingLegacy | None = None
+    ) -> LegacyBootPermit:
         with self.recovered.journal.locked() as control:
             return prepare_legacy_permit(
                 control,
                 owner=self.owner,
                 store=self.store,
-                manifest=self.recovered.manifest,
-                request_id="next-legacy-" + action,
-                action="configure" if action == "configure" else "restart",
-                target=self.recovered.target
-                if action == "configure"
-                else Path(self.recovered.manifest.config_path).read_bytes(),
-                deadline=deadline(),
+                pending=pending or self.pending(action=action),
+            )
+
+    def confirm(self, pending: PendingLegacy) -> LegacyBootPermit:
+        with self.recovered.journal.locked() as control:
+            return confirm_legacy_permit(
+                control, owner=self.owner, store=self.store, pending=pending
             )
 
     def assert_owned(self) -> None:
@@ -208,3 +235,181 @@ def test_path_checks_keep_the_original_database_inode_guard(host: Host) -> None:
     finally:
         database.unlink()
         displaced.rename(database)
+
+
+def test_lost_return_requires_a_fresh_controller_and_retains_the_real_owner(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pending = host.pending()
+    journal = host.owner.journal
+    original = journal.directory.replace
+
+    def lost_return(name: str, data: bytes) -> None:
+        original(name, data)
+        if name == "state.json":
+            raise OSError("synthetic lost return after real durable state replacement")
+
+    monkeypatch.setattr(journal.directory, "replace", lost_return)
+    with journal.locked() as poisoned:
+        with pytest.raises(OSError, match="synthetic lost return"):
+            prepare_legacy_permit(poisoned, owner=host.owner, store=host.store, pending=pending)
+        with pytest.raises(TransactionError, match="journal_unconfirmed"):
+            confirm_legacy_permit(poisoned, owner=host.owner, store=host.store, pending=pending)
+    before = (journal.directory.path / "state.json").read_bytes()
+    view = host.confirm(pending)
+    assert view.record is not None and view.record.generation == pending.generation
+    assert view.writer_owner is host.owner and view.lease is host.owner.lease
+    assert (journal.directory.path / "state.json").read_bytes() == before
+    assert poisoned._poisoned
+    assert host.owner.record == pending.previous and not hasattr(host.owner, "service")
+    host.assert_owned()
+
+
+def test_unconfirmed_state_cannot_be_adopted_until_directory_fsync_succeeds(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pending = host.pending()
+    journal = host.owner.journal
+    original = os.fsync
+    failing = True
+
+    def fsync(descriptor: int) -> None:
+        raw = (journal.directory.path / "state.json").read_bytes()
+        if failing and descriptor == journal.directory.fd and b'"protocol":1' in raw:
+            raise OSError("synthetic persistent directory EIO")
+        original(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError, match="persistent directory EIO"):
+        host.prepare(pending=pending)
+    visible = journal.read_current()
+    assert isinstance(visible, TransactionRecord) and visible.generation == pending.generation
+    with pytest.raises(OSError, match="persistent directory EIO"):
+        host.confirm(pending)
+    host.assert_owned()
+    failing = False
+    assert host.confirm(pending).record == visible
+    host.assert_owned()
+
+
+@pytest.mark.parametrize("phase", ["prepared", "draining", "aborted", "stop_base", "stop_target"])
+def test_same_origin_can_confirm_legitimate_controller_progress(host: Host, phase: str) -> None:
+    pending = host.pending()
+    view = host.prepare(pending=pending)
+    assert view.record is not None
+    record = view.record
+    with view.journal.locked() as control:
+        if phase == "aborted":
+            record = control.advance(record.position, Transition(phase="aborted", code="cancelled"))
+        elif phase != "prepared":
+            record = control.advance(record.position, Transition(phase="draining"))
+            if phase != "draining":
+                record = control.advance(
+                    record.position, Transition(phase="activating", intent="stop_base")
+                )
+            if phase == "stop_target":
+                record = control.advance(
+                    record.position,
+                    Transition(phase="rolling_back", intent="stop_target", code="health_failed"),
+                )
+    assert host.confirm(pending).record == record
+    host.assert_owned()
+
+
+@pytest.mark.parametrize("mutation", ["request", "generation", "action", "target", "deadline"])
+def test_confirm_rejects_a_different_immutable_attempt(host: Host, mutation: str) -> None:
+    pending = host.pending()
+    view = host.prepare(pending=pending)
+    if mutation == "request":
+        other = replace(pending, request_id="another-request")
+    elif mutation == "generation":
+        other = replace(pending, generation=secrets.token_hex(16))
+    elif mutation == "action":
+        other = replace(pending, action="restart")
+    elif mutation == "target":
+        other = replace(pending, target=Settings(default_mode="yolo").model_dump_json().encode())
+    else:
+        other = replace(pending, deadline=pending.deadline.model_copy(update={"seconds": 70.0}))
+    with pytest.raises(TransactionError, match="legacy_attempt_changed"):
+        host.confirm(other)
+    assert host.owner.journal.read_current() == view.record
+    host.assert_owned()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["receipt", "config", "unit", "selector", "snapshot", "manifest"]
+)
+def test_confirm_rechecks_the_actual_store_and_frozen_files(host: Host, mutation: str) -> None:
+    pending = host.pending()
+    view = host.prepare(pending=pending)
+    assert view.record is not None
+    root = host.owner.journal.directory.path
+    if mutation == "receipt":
+        host.store.db.execute("DELETE FROM objects WHERE kind='management_projection'")
+        host.store.db.commit()
+    elif mutation == "config":
+        Path(pending.manifest.config_path).write_bytes(pending.target)
+    elif mutation == "unit":
+        Path(pending.manifest.unit_path).write_bytes(b"[Service]\nExecStart=/foreign\n")
+    elif mutation == "selector":
+        (root / "selector.json").write_bytes(host.recovered.selector.canonical())
+    elif mutation == "snapshot":
+        (root / f"{pending.generation}-target.json").write_bytes(b"{}")
+    else:
+        (root / "installation.json").write_bytes(b"{}")
+    with pytest.raises((OSError, ValueError)):
+        host.confirm(pending)
+    assert host.owner.journal.read_current() == view.record
+    host.assert_owned()
+
+
+def test_confirm_rejects_a_target_decision_even_when_restart_configuration_is_unchanged(
+    host: Host,
+) -> None:
+    from test_management_transaction import proof, verifying
+
+    pending = host.pending(action="restart")
+    view = host.prepare(pending=pending)
+    assert view.record is not None
+    with view.journal.locked() as control:
+        verifying_record = verifying(control, view.record)
+        decided = control.advance(
+            verifying_record.position, Transition(phase="committed", proof=proof(verifying_record))
+        )
+    with pytest.raises(TransactionError, match="legacy_origin_not_permitted"):
+        host.confirm(pending)
+    assert host.owner.journal.read_current() == decided
+    host.assert_owned()
+
+
+def test_confirmation_does_not_authorize_a_consistently_rewritten_base(host: Host) -> None:
+    pending = host.pending()
+    view = host.prepare(pending=pending)
+    assert view.record is not None
+    journal = host.owner.journal
+    foreign = Settings(default_mode="yolo").model_dump_json().encode()
+    changed = view.record.model_copy(
+        update={"base": _snapshot(foreign, journal.limits.max_snapshot_bytes)}
+    )
+    with journal.locked() as control:
+        control._replace(f"{pending.generation}-base.json", foreign)
+        Path(pending.manifest.config_path).write_bytes(foreign)
+        control._write(changed)
+    assert changed.generation == pending.generation and changed.target == view.record.target
+    with pytest.raises(TransactionError, match="legacy_attempt_changed"):
+        host.confirm(pending)
+    assert journal.read_current() == changed
+    assert journal.snapshot(changed, "base") == foreign
+    assert Path(pending.manifest.config_path).read_bytes() == foreign
+    host.assert_owned()
+
+
+def test_prepare_refuses_a_configuration_change_after_authorization(host: Host) -> None:
+    pending = host.pending()
+    foreign = Settings(default_mode="yolo").model_dump_json().encode()
+    Path(pending.manifest.config_path).write_bytes(foreign)
+    with pytest.raises(TransactionError, match="configuration_changed"):
+        host.prepare(pending=pending)
+    assert host.owner.journal.read_current() == pending.previous
+    assert Path(pending.manifest.config_path).read_bytes() == foreign
+    host.assert_owned()
