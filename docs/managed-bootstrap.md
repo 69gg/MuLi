@@ -11,6 +11,12 @@ manifest 不成为 V2 的启动依据，也不阻塞已经选定的 legacy 回�
 `data_dir/management/transaction-v1`，因此恢复后的 legacy raw unit 即便没有
 `--managed-root`，也能从同一账本识别 V2。没有新增 mode 文件、数据库或锁。
 
+默认入口缺失 `state.json` 时，只有 `selector.json` 目录项也不存在才允许普通
+启动。共享 `require_unselected_without_record(root)` 使用 `lstat`，因此坏 JSON、
+dangling symlink、FIFO 或目录均按残留 selector 拒绝；不会打开特殊文件或跟随链接。
+仅预发布 anchor/slot、尚无 selector 的准备崩溃前缀仍可走普通入口。此门不重建
+记录、重签安装或猜测上一代选择；宿主 CLI 的缺记录分支也应调用此检查。
+
 ## 准入顺序
 
 1. 原 bootstrap 持有实际数据库 writer lease，才读取并分派 record。V2 从不可变
@@ -53,6 +59,14 @@ service 2.044 秒，峰值 105.8 MiB）；两源码严格 mypy、三份 Python �
 格式检查通过，静态检查最高 128.8 MiB，swap 0。全部经统一守卫、每次 30 秒硬限。
 首轮 106 过、1 个 fixture 失败：模拟只推进 revision 时误重写了 unit，实际 probe
 正确拒绝身份变化。fixture 改为只在 journal 锁内推进 record 后，同组全部通过。
+
+缺记录尾片另增 7 项，连同 Linux/bootstrap/launcher 相关组共 104 项通过
+（pytest 6.88 秒，service 7.475 秒，峰值 107.5 MiB）；两源码 mypy、三份 Python
+文件 Ruff/格式检查通过，静态检查最高 126.5 MiB，swap 0，每次仍为 30 秒硬限。
+旧入口的单例反证确实越过 bootstrap 到达 `ConfigFile` 构造哨兵；补门后普通
+`serve` 对四种残留 selector 均在配置、Runtime 和 SQLite 入口前拒绝，并释放
+尚未移交的 writer lease。首轮相关组 103 过、1 个既有显式 root 错误码断言失败，
+新门移到显式 root 原拒绝分支之后，保留既有接口后同组全部通过。
 
 回归使用临时 marked 数据库、真实 flock、实际 ManagedSystemdProbe 配合合成
 D-Bus/procfs，以及临时安装声明。覆盖同一账本的
