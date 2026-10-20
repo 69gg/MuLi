@@ -97,6 +97,8 @@ class Runtime:
         self._closing = False
         self._stopping: dict[str, int] = {}
         self.tasks: dict[str, asyncio.Task[str]] = {}
+        self._session_finalizers: set[asyncio.Task[Any]] = set()
+        self._close_task: asyncio.Task[None] | None = None
         self.run_ids: dict[str, str] = {}
         self.configuration_lock = asyncio.Lock()
         self.started = False
@@ -977,15 +979,21 @@ class Runtime:
                 if session and session.get("kind") == "main":
                     self._wake_main()
             if session_updated:
-                # Unregister this driver before the next suspension; a late
-                # cancellation must not strand its handles or erase the event.
-                notification = asyncio.create_task(self.bus.notify())
-                release_cancelled = await self.team._settle([notification]) or release_cancelled
-                if notification.cancelled():
-                    release_cancelled = True
-                elif error := notification.exception():
-                    run["notification_error"] = f"会话更新通知失败：{type(error).__name__}"
-                    self.store.put("run", run)
+                # This driver has released its session slot, but shutdown still
+                # owns its final notification and any diagnostic persistence.
+                finalizer = asyncio.current_task()
+                assert finalizer is not None
+                self._session_finalizers.add(finalizer)
+                try:
+                    notification = asyncio.create_task(self.bus.notify())
+                    release_cancelled = await self.team._settle([notification]) or release_cancelled
+                    if notification.cancelled():
+                        release_cancelled = True
+                    elif error := notification.exception():
+                        run["notification_error"] = f"会话更新通知失败：{type(error).__name__}"
+                        self.store.put("run", run)
+                finally:
+                    self._session_finalizers.discard(finalizer)
             if release_cancelled:
                 raise asyncio.CancelledError
 
@@ -1759,9 +1767,15 @@ class Runtime:
         return snapshot.commitment_id if snapshot else None
 
     async def close(self) -> None:
-        if self._closing:
-            return
-        self._closing = True
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close_resources())
+        cancelled = await self.team._settle([self._close_task])
+        if cancelled:
+            raise asyncio.CancelledError
+        self._close_task.result()
+
+    async def _close_resources(self) -> None:
         await self.compaction.close()
         await self.team.close()
         await self.reminders.close()
@@ -1769,9 +1783,12 @@ class Runtime:
         for task in list(self.tasks.values()):
             task.cancel()
         await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+        cancelled = await self.team._settle(list(self._session_finalizers))
         await self.mcp.close()
         await self.notifications.close()
         try:
             await self.computer.aclose()
         finally:
             self.store.close()
+        if cancelled:
+            raise asyncio.CancelledError
