@@ -1,7 +1,7 @@
 """Single-step transaction driver with injected observations and effects.
 
-There is deliberately no Linux service backend, process launcher, CLI or polling
-loop here yet. Passing its fake-backend tests does not prove a service restart.
+The Linux backend is a separate module. No process launcher, CLI or polling loop
+lives here; passing fake-backend tests does not prove a service restart.
 """
 
 from __future__ import annotations
@@ -94,6 +94,10 @@ class TransactionController:
             raise
         except TimeoutError:
             raise _BackendFailure("deadline_exceeded") from None
+        except TransactionError as exc:
+            if exc.code == "clock_invalid":
+                raise
+            raise _BackendFailure("backend_failed") from None
         except Exception:
             raise _BackendFailure("backend_failed") from None
 
@@ -183,6 +187,22 @@ class TransactionController:
                 current = self.control.read()
                 if current is None:
                     raise TransactionError("transaction_missing") from None
+                if (
+                    exc.code == "deadline_exceeded"
+                    and current.phase in {"committed", "rolled_back"}
+                    and current.generation == record.generation
+                    and not current.resolved
+                ):
+                    try:
+                        remaining = current.deadline.remaining(self.clock())
+                    except TransactionError as clock_error:
+                        if clock_error.code != "clock_invalid":
+                            raise
+                        return self._failure(current, "clock_invalid")
+                    if remaining > 0:
+                        # A short observation/HTTP budget expiring does not
+                        # revoke the durable decision or extend its deadline.
+                        return current
                 return self._failure(current, exc.code)
 
     async def _step(
@@ -344,7 +364,11 @@ class TransactionController:
                         phase=record.phase, activation=activation, proof=proof, code=record.code
                     ),
                 )
-            if proof is None or proof.boot != observation.boot or not record.accepts(proof, role):
+            if proof is None:
+                # A missing HTTP observation is not an explicit host failure.
+                # Keep the original deadline and do not resend activation.
+                return record
+            if proof.boot != observation.boot or not record.accepts(proof, role):
                 return self._failure(record, "health_failed")
             if record.health is not None and proof.boot != record.health.boot:
                 return self._move(
