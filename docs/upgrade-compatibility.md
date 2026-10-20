@@ -6,7 +6,7 @@
 
 `muli.compatibility` 只接收有限元数据，不打开文件或数据库，不构造 `Store`、`Memory`、`ConfigFile` 或 `Runtime`，不安装、迁移、备份、恢复、启动或停止任何组件。没有随本片发出当前版本的兼容 manifest，也没有自动给旧库补格式标签。
 
-这项区分直接对应现有代码：`Store._initialize` 会建表、建索引及补消息序号；`Memory` 会补元数据、别名证据与搜索索引。`message_sequence_v1` 和 `alias_evidence_version` 分别证明局部迁移事实，不能当成整库、配置或外发语义相同的证据。候选真实启动前仍需独立实现只读证据采集和拒绝隐式迁移的启动模式；本片没有提供这些能力。
+这项区分直接对应现有代码：`Store._initialize` 会建表、建索引及补消息序号；`Memory` 会补元数据、别名证据与搜索索引。`message_sequence_v1` 和 `alias_evidence_version` 分别证明局部迁移事实，不能当成整库、配置或外发语义相同的证据。[连接内格式证据读取器](format-evidence.md)已独立实现，但实际路径/来源认证、启动接线和拒绝隐式迁移的启动模式仍待完成；纯判定本身没有这些能力。
 
 ## 格式合同
 
