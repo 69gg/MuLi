@@ -228,10 +228,14 @@ def serving(installation: Installation, monkeypatch: pytest.MonkeyPatch) -> Iter
     original_open, original_close = Store.open_runtime, Store.close
     original_session_close = BootSession.close_after_writers
 
-    async def bootstrap(service: UserService, database: Path) -> BootSession:
+    async def bootstrap(
+        service: UserService, database: Path, *, managed_root: Path | None = None
+    ) -> BootSession:
         state.events.append("bootstrap")
         state.loops.append(asyncio.get_running_loop())
-        session = await open_boot_session(service, database, probe=FakeProbe(service))
+        session = await open_boot_session(
+            service, database, probe=FakeProbe(service), managed_root=managed_root
+        )
         state.sessions.append(session)
         return session
 

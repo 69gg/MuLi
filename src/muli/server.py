@@ -36,6 +36,7 @@ from muli.maintenance_api import (
     passive_request_allowed,
     request_has_effect,
 )
+from muli.managed_boot import ManagedBootPermit
 from muli.management import SelfManagement
 from muli.management_transaction import ClockReading
 from muli.memory_application import MemoryApplication
@@ -154,17 +155,23 @@ def create_app(
     runtime: Runtime | None = None,
     *,
     listen_port: int | None = None,
-    boot_permit: BootPermit | None = None,
+    boot_permit: BootPermit | ManagedBootPermit | None = None,
     boot_session: BootSession | None = None,
     maintenance_clock: Callable[[], ClockReading] | None = None,
 ) -> FastAPI:
-    config = config or ConfigFile(default_config_path())
     if runtime is not None and (boot_permit is not None or boot_session is not None):
         raise ValueError("boot_permit 只能由一个运行时持有")
+    permit = boot_session.permit if boot_session is not None else boot_permit
+    if isinstance(permit, ManagedBootPermit):
+        if config is not None and config is not permit.config:
+            raise ValueError("managed_configuration_owner_required")
+        config = permit.config
+    config = config or ConfigFile(default_config_path())
     owned = runtime is None
     runtime = runtime or Runtime(
         config, data_dir or default_data_dir(), boot_permit=boot_permit, boot_session=boot_session
     )
+    config = runtime.config
     try:
         return _create_app(config, runtime, listen_port, maintenance_clock)
     except BaseException:
@@ -389,7 +396,9 @@ def _create_app(
     app.state.attention = attention
     app.state.channel_application, app.state.personal_io = channel_application, personal_io
     app.add_middleware(BodyLimitMiddleware)
-    install_maintenance_routes(app, runtime, maintenance_clock)
+    install_maintenance_routes(
+        app, runtime, maintenance_clock, on_resolved=management.recovery.project
+    )
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next: Any) -> Any:
@@ -443,7 +452,15 @@ def _create_app(
             and not authentication.authenticated(request.cookies.get(COOKIE_NAME, ""))
         ):
             return JSONResponse({"detail": "需要登录"}, status_code=401)
-        if not internal_handshake:
+        if (
+            not internal_handshake
+            and not signed_webhook
+            and request.url.path.startswith("/api/")
+            and authentication.authenticated(request.cookies.get(COOKIE_NAME, ""))
+        ):
+            # A lost final helper hint must not leave configuration permanently
+            # paused. Projection is idempotent and keeps the original reply route.
+            await management.recovery.project()
             runtime.maintenance.reconcile()
         durable_webhook = (
             signed_webhook

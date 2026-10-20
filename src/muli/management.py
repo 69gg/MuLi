@@ -88,6 +88,7 @@ class SelfManagement:
         *,
         apply_mode: Literal["in_process", "restart_transaction"] = "in_process",
     ) -> dict[str, Any]:
+        await self.recovery.project()
         self.runtime.maintenance.require_configuration()
         if action not in {"configure", "restart", "update"}:
             raise ValueError("未知管理操作")

@@ -26,9 +26,17 @@ async def _serve(args: argparse.Namespace) -> None:
             from muli.platforms.linux_bootstrap import open_boot_session
 
             session = await open_boot_session(
-                UserService(args.config, args.data_dir), args.data_dir / "muli.sqlite3"
+                UserService(args.config, args.data_dir),
+                args.data_dir / "muli.sqlite3",
+                managed_root=getattr(args, "managed_root", None),
             )
-        config = ConfigFile(args.config)
+        from muli.managed_boot import ManagedBootPermit
+
+        config = (
+            session.permit.config
+            if session is not None and isinstance(session.permit, ManagedBootPermit)
+            else ConfigFile(args.config)
+        )
         port = getattr(args, "port", None) or config.settings.server.port
         if (
             session is not None
@@ -72,10 +80,13 @@ async def _serve(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="muli", description="沐璃 · 本地数字生命助手")
+    parser = argparse.ArgumentParser(
+        prog="muli", description="沐璃 · 本地数字生命助手", allow_abbrev=False
+    )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    parser.add_argument("--managed-root", type=Path, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command")
     serve = commands.add_parser("serve", help="启动本地管理工作台")
     serve.add_argument("--port", type=int)
@@ -94,6 +105,26 @@ def main() -> None:
     recovery = commands.add_parser("management", help="查看恢复事务或接续现有控制者")
     recovery.add_argument("action", choices=["status", "recover"])
     args = parser.parse_args()
+    if args.command not in {None, "serve"}:
+        from muli.managed_cli import route_command
+
+        arguments = [args.command]
+        if args.command in {"service", "management"}:
+            arguments.append(args.action)
+        elif args.command == "init":
+            arguments.extend(
+                flag
+                for flag, enabled in (
+                    ("--defaults", args.defaults),
+                    ("--no-source", args.no_source),
+                    ("--no-service", args.no_service),
+                )
+                if enabled
+            )
+        try:
+            route_command(args.config, args.data_dir, arguments, managed_root=args.managed_root)
+        except (OSError, ValueError) as exc:
+            parser.error(getattr(exc, "code", "managed_entry_unavailable"))
     if args.command == "init":
         from muli.initialization import clone_source, start_background
         from muli.initialization import initialize as initialize_config
@@ -138,7 +169,9 @@ def main() -> None:
                 result = asyncio.run(
                     manager.status()
                     if args.action == "status"
-                    else guarded_service_action(manager, args.action)
+                    else guarded_service_action(
+                        manager, args.action, managed_root=args.managed_root
+                    )
                 )
             except (OSError, ValueError) as exc:
                 parser.error(getattr(exc, "code", "service_action_failed"))
@@ -148,7 +181,11 @@ def main() -> None:
 
         try:
             result = asyncio.run(
-                management_action(UserService(args.config, args.data_dir), args.action)
+                management_action(
+                    UserService(args.config, args.data_dir),
+                    args.action,
+                    managed_root=args.managed_root,
+                )
             )
         except (OSError, ValueError) as exc:
             parser.error(getattr(exc, "code", "management_unavailable"))

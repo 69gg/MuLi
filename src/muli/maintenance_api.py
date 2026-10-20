@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Header, Query
@@ -33,6 +33,8 @@ def install_maintenance_routes(
     app: FastAPI,
     runtime: Runtime,
     clock: Callable[[], ClockReading] | None,
+    *,
+    on_resolved: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     @app.post(_PREFIX + "/drain")
     async def drain(
@@ -57,7 +59,12 @@ def install_maintenance_routes(
         boot: str = Query(min_length=1, max_length=96),
         nonce: str = Header(default="", alias="X-MuLi-Nonce", max_length=96),
     ) -> dict[str, Any]:
-        return runtime.maintenance.readiness(generation, boot, nonce).model_dump(mode="json")
+        proof = runtime.maintenance.readiness(generation, boot, nonce)
+        record = runtime.maintenance.current()
+        if record is not None and record.resolved and on_resolved is not None:
+            await on_resolved()
+            runtime.maintenance.reconcile()
+        return proof.model_dump(mode="json")
 
     @app.post(_PREFIX + "/activate")
     async def activate(

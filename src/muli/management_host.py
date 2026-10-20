@@ -8,7 +8,9 @@ import secrets
 from typing import TYPE_CHECKING, Any
 
 from muli.config import Settings
-from muli.maintenance import MaintenanceError
+from muli.maintenance import BootPermit, MaintenanceError
+from muli.managed_boot import ManagedBootPermit
+from muli.managed_transaction import TransactionRecordV2
 from muli.management_projection import project_final, read_projection
 from muli.management_transaction import Deadline, ServiceIdentity, TransactionError
 from muli.platforms.filesystem_identity import verify_local_filesystems
@@ -74,13 +76,13 @@ class RecoveryHost:
     def current(self) -> dict[str, Any]:
         session = self.runtime.boot_session
         permit = self.runtime.maintenance.permit
-        record = session.journal.read() if session is not None else None
+        record = session.journal.read_current() if session is not None else None
         unsupported = self.runtime.maintenance.unsupported_reason
         return {
             "available": bool(
                 session
                 and permit
-                and session.manifest
+                and (session.manifest or isinstance(permit, ManagedBootPermit))
                 and not self.projection_error
                 and not unsupported
             ),
@@ -96,7 +98,9 @@ class RecoveryHost:
             return
         before = self.runtime.store.event_position()
         try:
-            receipt = project_final(permit, self.runtime.store)
+            receipt = project_final(
+                permit, self.runtime.store, verify_binding=self.runtime.maintenance.verify_managed
+            )
         except (OSError, ValueError) as exc:
             self.projection_error = self._reason(exc, "projection_failed")
             if strict:
@@ -106,7 +110,7 @@ class RecoveryHost:
         if self.runtime.store.event_position() != before:
             await self.runtime.bus.notify()
         if receipt is not None:
-            record = permit.journal.read()
+            record = permit.journal.read_current()
             if record is not None and (record.generation, record.revision) == (
                 receipt.generation,
                 receipt.revision,
@@ -118,6 +122,7 @@ class RecoveryHost:
                     )
                 except OSError:
                     pass  # Retain the snapshot and retry cleanup on the next projection read.
+            self.runtime.maintenance.reconcile()
 
     async def prepare(self, item: dict[str, Any], target: Settings) -> dict[str, Any]:
         runtime = self.runtime
@@ -126,7 +131,8 @@ class RecoveryHost:
             raise MaintenanceError("configuration_lock_required")
         manifest = await self.verify()
         permit = runtime.maintenance.permit
-        assert permit is not None
+        if not isinstance(permit, BootPermit):
+            raise MaintenanceError("transaction_unsupported", "managed_preparation_required")
         journal = permit.journal
         await self.project(strict=True)
         # Evidence can be edited while the plan waits or identity probes await.
@@ -191,15 +197,25 @@ class RecoveryHost:
         if session is None or session.permit is None:
             return self.current()
         await self.project()
-        record = session.journal.read()
+        record = session.journal.read_current()
         if record is None or record.resolved or record.phase == "recovery_required":
             return self.current()
         try:
             state: str
             with session.journal.locked() as control:
-                from muli.management_helper import ensure_helper
+                if isinstance(record, TransactionRecordV2):
+                    from muli.managed_host import ensure_managed_helper
+                    from muli.platforms.managed_deployment import DeploymentStore
 
-                state = await ensure_helper(control, self._manifest())
+                    with DeploymentStore(
+                        session.journal.directory.path, session.journal.limits
+                    ) as deployments:
+                        anchor = deployments.read_anchor(record.identity.deployment)
+                    state = await ensure_managed_helper(control, anchor)
+                else:
+                    from muli.management_helper import ensure_helper
+
+                    state = await ensure_helper(control, self._manifest())
         except (OSError, ValueError, TimeoutError) as exc:
             if isinstance(exc, TransactionError) and exc.code == "lock_busy":
                 state = "controller_busy"
