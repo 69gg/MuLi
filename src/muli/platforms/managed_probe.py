@@ -234,5 +234,7 @@ class ManagedSystemdProbe(SystemdProbe):
                 if loop.time() >= deadline:
                     raise TimeoutError
                 return ManagedProbeResult(ServiceSnapshot(after, process), matches, loaded, disk)
+        except TimeoutError:
+            raise
         except (OSError, UnicodeError):
             raise ObservationError("systemd_observation_unavailable") from None
