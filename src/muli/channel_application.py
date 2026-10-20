@@ -59,12 +59,21 @@ class ChannelApplication:
             return {**self.manager.status(), "deliveries": self.manager.deliveries()}
 
         async def send(args: dict[str, Any]) -> Any:
+            key = args.get("idempotency_key")
+            if key is not None and (
+                not isinstance(key, str)
+                or not 1 <= len(key) <= 200
+                or any(ord(character) < 32 or ord(character) == 127 for character in key)
+            ):
+                raise ValueError("idempotency_key 需要 1–200 字符的非控制字符串")
             return await self.manager.enqueue(
                 str(args["channel"]),
                 str(args["target"]),
                 str(args.get("text", "")),
                 args.get("attachment_ids", []),
                 route=args.get("route"),
+                media_mode=args.get("media_mode", "file"),
+                event_id="tool:" + key if key is not None else None,
             )
 
         return [
@@ -76,7 +85,7 @@ class ChannelApplication:
             ),
             Tool(
                 "channel_send",
-                "向已绑定的渠道目标发送文字或本地附件；返回投递ID，未成功前不得声称已送达",
+                "向已绑定渠道发送文字或附件；media_mode=voice显式发送单个语音附件，默认保持文件路径；重试同一逻辑发送保持idempotency_key，结果未知不自动重发，返回排队ID不代表送达",
                 parameters(
                     {
                         "channel": {
@@ -85,6 +94,17 @@ class ChannelApplication:
                         },
                         "target": string(),
                         "text": string(),
+                        "media_mode": {
+                            "type": "string",
+                            "enum": ["file", "voice"],
+                            "description": "默认file保留既有附件行为；voice仅Telegram/OneBot，需一个兼容音频附件，不自动转码或降级",
+                        },
+                        "idempotency_key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200,
+                            "description": "同一逻辑发送保持稳定；同键内容或模式改变会拒绝。省略表示新发送，不能用换键规避未知结果",
+                        },
                         "attachment_ids": {
                             "type": "array",
                             "items": {"type": "string"},
