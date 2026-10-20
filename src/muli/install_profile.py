@@ -242,7 +242,7 @@ def parse_install_intent(
         raise InstallProfileError("receipt_budget")
     try:
         document = tomllib.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except ValueError:
         raise InstallProfileError("invalid_receipt") from None
     except RecursionError:
         raise InstallProfileError("receipt_budget") from None

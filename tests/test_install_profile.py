@@ -6,6 +6,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -305,6 +306,16 @@ def test_missing_malformed_and_duplicate_receipt_inputs_fail_closed(data: bytes)
         parse(data)
     assert error.value.code in {"invalid_receipt", "unsupported_tool"}
     assert "secret" not in str(error.value)
+
+
+def test_oversized_toml_integer_has_fixed_error_without_changing_interpreter_limits() -> None:
+    digits = sys.get_int_max_str_digits()
+    if not 0 < digits <= 8192:
+        pytest.skip("integer conversion limit is disabled or exceeds the bounded fixture")
+    data = b"[tool]\npython = " + b"1" * (digits + 1)
+    with pytest.raises(InstallProfileError, match="^invalid_receipt$") as error:
+        parse(data)
+    assert str(error.value) == error.value.code
 
 
 def test_root_and_entrypoint_unknown_fields_are_rejected() -> None:

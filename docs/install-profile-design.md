@@ -14,6 +14,10 @@
 
 输入使用标准库 [tomllib.loads](https://docs.python.org/3.12/library/tomllib.html)，先限制 bytes，解析后迭代限制节点、深度、字符串和集合；所有失败转换成不含原文的 `InstallProfileError.code`。模型复用 `StrictRecord`，内层集合使用 tuple。`IntentLimits` 集中提供有限上下界。当前没有 ResolverContext、CredentialReference 采集或合并，也没有接运行入口、发行 manifest 或兼容格式声明。
 
+TOML 解析段也将 CPython 整数字符串转换限制产生的裸 `ValueError` 归一为
+`invalid_receipt`；递归超限仍为 `receipt_budget`。回归根据当前解释器限制生成多一位的
+十进制样本，最多 8193 位；限制关闭或超过该固定预算时明确 skip，不修改进程全局限制。
+
 ## 研究依据与版本边界
 
 已用 Context7 核对 uv 工具 receipt、升级和配置语义，并阅读官方源码。研究 adapter 锚定 [uv 0.13.0](https://github.com/astral-sh/uv/releases/tag/0.13.0)，提交 `4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17`；这是上游格式研究基线，不是本机安装证据，也不是所有 uv 0.x 的兼容承诺。未在本仓发现可复用的 uv Rust 源码缓存，不继续扫描用户目录。
@@ -178,6 +182,6 @@ index-strategy = "first-index"
 
 本轮交独立纯 parser、合成回归和本设计；上述涉及来源合并、候选 pin 连续性、凭据和上下文的 fixture 仍是后续验收要求，当前不冒称已经覆盖。之后再分别交付有界只读采集、完整 profile、候选准备和 A/B 交接；每一步沿用现有安装/兼容/资源边界，不为通过意图解析放宽真实数据与外发安全。
 
-2026-10-21，经共享 `scripts/check_local.py` guard 串行验证：新增 114 项合成回归通过，用时 0.14 秒、峰值 56.9 MiB；两文件 Ruff 与格式检查、单源码严格 mypy 通过，静态检查峰值 118.6 MiB，全部 swap 0。测试覆盖字段/顺序保留、缺省与显式空值、固定拒绝、版本/来源/URL、严格类型、输入上界、不可变集合及禁止文件/进程/网络等隐式访问；未实际读取 fixture 路径或凭据。
+2026-10-21，经共享 `scripts/check_local.py` guard 串行验证：115 项合成回归通过，用时 0.12 秒、峰值 54.5 MiB；两文件 Ruff、格式检查与严格 mypy 通过，静态检查峰值 185.3 MiB，全部 swap 0。有限整数反证在修复前实际以裸 `ValueError` 失败：当前上限 4300 位，4301 位样本仍在 receipt bytes 预算内；修复后固定拒绝且不回显原文。测试还覆盖字段/顺序保留、缺省与显式空值、版本/来源/URL、严格类型、输入上界、不可变集合及禁止文件/进程/网络等隐式访问；未实际读取 fixture 路径或凭据。
 
 尚未验证：真实本机 uv 版本与安装来源、真实 receipt 样本、实际索引/认证、完整上下文合并、候选解析与安装、依赖完整性、跨版本启动/切换/回退。纯解析通过不能作为这些能力的验收证据。
