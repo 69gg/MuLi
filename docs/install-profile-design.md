@@ -1,6 +1,6 @@
 # uv 安装意图与 InstallProfile 最小设计
 
-状态：独立纯 receipt 意图解析及定向检查已完成；采集器、完整 InstallProfile 和候选安装仍是后续方案。本片没有读取真实 receipt、用户配置、凭据或数据库，没有运行 uv、安装、下载或服务操作。不把当前本机 uv 版本列为已支持。
+状态：独立纯 receipt 意图解析及定向检查已完成；[已核安装内的固定 receipt 观察](install-receipt.md)也已独立实现，完整来源发现、InstallProfile 和候选安装仍是后续方案。本片没有读取用户真实 receipt、配置、凭据或数据库，没有运行 uv、安装、下载或服务操作。不把当前本机 uv 版本列为已支持。
 
 本片接续[跨版本兼容元数据](upgrade-compatibility.md)，细化[可恢复管理设计的候选准备](recoverable-management-design.md#uv-候选准备继承要求不碰当前环境)。当前只解析已知 receipt 结构并保留安装意图；完整解析上下文仍待补证，不回答目标是否可解、候选是否健康或能否切换。
 

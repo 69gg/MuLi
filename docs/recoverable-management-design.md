@@ -133,7 +133,7 @@ uv 没有这里所需的通用安装目录硬配额开关。磁盘预留、有�
 
 下一开发片已实现[兼容元数据纯判定](upgrade-compatibility.md)，独立区分 database、objects、configuration、ingress、outbox、memory、install_profile 七个完整语义领域。它只比较经调用者提供的声明，不读取真实库、不发当前版本格式标记，也不授权切换。缺少来源证明、原版本 manifest 或真实格式证据时仍拒绝；现有 protocol 1 的单安装身份不因声明中的协议数字相同而变成 A/B 协议。
 
-[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口；完整解析上下文与候选安装仍未实现。[无迁移启动方案](no-migration-startup-design.md)已列出 Store、Memory 与 ChannelManager 的实际隐式写入路径，需全部纳入候选准入，不能只禁止其中一个构造器。
+[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；uv 身份、完整解析上下文与候选安装仍未实现。[无迁移启动方案](no-migration-startup-design.md)已列出 Store、Memory 与 ChannelManager 的实际隐式写入路径，需全部纳入候选准入，不能只禁止其中一个构造器。
 
 [格式证据读取器](format-evidence.md)已独立实现：宿主提供专用连接，读取器在单一快照中核对完整格式标记、资料库及主人主会话身份，读取预算有限且不补数据。它不认证连接路径、发行来源或格式语义，也未接启动；缺少完整标记的历史库仍拒绝，不能自动补出兼容证明。
 
@@ -167,4 +167,4 @@ uv 没有这里所需的通用安装目录硬配额开关。磁盘预留、有�
 
 再以有限假服务子进程证明控制者在主进程退出后仍完成恢复，最后才分平台记录真实服务证据。当前设计阶段不执行安装、下载、重启、真实外部账号或真实模型；未取得对应证据前，不宣称真实跨平台 A/B 更新已实现。
 
-下一开发分支已补[真实进程退出接管回归](management-process-recovery.md)：两个独立解释器、真实 journal/writer 锁与临时 WAL，验证已提交事实保留，以及缺少宿主健康证据时停在 recovery_required。它尚未覆盖真实服务重启或成功激活后的控制者死亡窗口。
+下一开发分支已补[真实进程退出接管回归](management-process-recovery.md)：真实 journal/writer 锁与临时 WAL 验证已提交事实保留，以及缺少宿主健康证据时停在 recovery_required。另一用例通过独立宿主与两个控制者覆盖成功激活后的控制者死亡窗口，真实 nonce HTTP 重观察后只记一次终态；未覆盖真实系统服务或 SQLite 投影提交中途被杀。
