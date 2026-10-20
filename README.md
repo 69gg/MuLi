@@ -111,16 +111,19 @@ cd MuLi
 uv sync --locked
 uv run MuLi init --no-source --no-service
 uv run MuLi serve
-uv run pytest -q
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy
-node --test tests/frontend/*.test.mjs
-uv build
-uv run python scripts/check_wheel.py
+# Linux 本地验证：先核验 cgroup 限制，再执行；复用已安装依赖，默认离线
+python scripts/check_local.py run -- .venv/bin/python -m pytest -q
+python scripts/check_local.py run -- .venv/bin/ruff check .
+python scripts/check_local.py run -- .venv/bin/ruff format --check .
+python scripts/check_local.py run -- .venv/bin/mypy
+python scripts/check_local.py frontend
+python scripts/check_local.py run -- uv build --offline
+python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 ```
 
-测试使用临时目录、模拟 HTTP/SSE 与假模型，不使用真实模型额度、不点击真实桌面。CI 在 Linux、macOS、Windows 与 Python 3.12/3.13 上验证核心；操作系统特有测试按能力跳过。
+本地检查入口覆盖子进程，并在执行前核验内核实际限额：单次 1 GiB、所有 worktree 合计 2 GiB、swap 0、共享一个逻辑 CPU 的等效时间预算、128 个任务、每次最长 180 秒。前端文件单并发，Node 堆另限 256 MiB；超时或局部 OOM 回收整组任务。没有 systemd 用户服务或 cgroup v2 时拒绝执行，不降级为无保护运行。使用方式和边界见[开发验证](docs/development.md)。
+
+测试使用临时目录、模拟 HTTP/SSE 与假模型，不使用真实模型额度、不点击真实桌面。托管 CI 在 Linux、macOS、Windows 与 Python 3.12/3.13 上验证核心；操作系统特有测试按能力跳过。开发入口的 Linux 要求不改变产品的跨平台支持。
 
 协议测试通过不代表特定供应商已联调；AT-SPI 能否读取某个应用取决于桌面会话和应用的无障碍支持。参见各模块文档中的已验证边界。
 

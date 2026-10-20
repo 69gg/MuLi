@@ -1,0 +1,27 @@
+# 开发验证与资源保护
+
+Linux 本地检查统一经过 `scripts/check_local.py`，使用已有 systemd 用户管理器和 cgroup v2，不安装运行库、不修改系统服务、不会配置开机自启。执行前在服务内部读取自身与共享 slice 的内核控制文件，再启动检查；环境不具备控制能力或任一限制缺失时拒绝执行。
+
+| 范围 | 内存 | Swap | CPU | 进程与线程 | 时间 |
+| --- | --- | --- | --- | --- | --- |
+| 全部本地 agent/worktree 的检查合计 | 2 GiB | 0 | 一个逻辑 CPU 的等效时间预算 | 128 | — |
+| 一次检查及其所有子进程 | 1 GiB | 0 | 受上述共享预算约束 | 128 | 运行预算 180 秒，终止宽限 2 秒 |
+
+Node 额外限制 V8 堆为 256 MiB。前端预设按文件单并发，测试超时 15 秒；该超时不能替代进程组期限。禁止 core dump，避免失败生成大文件。普通测试结束、取消、超时和局部 OOM 均由独立 service 回收其子进程，不停止其它检查或 Codex。共享 slice 只有本次登录的运行时配置，不改变 `user.slice` 或其它应用的额度。
+
+```sh
+# 复用已经安装的依赖，不自动同步或下载
+python scripts/check_local.py frontend tests/frontend/api.test.mjs
+python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_local_check.py
+python scripts/check_local.py --seconds 30 run -- .venv/bin/ruff check .
+```
+
+其它 worktree 在其自身目录调用主仓库脚本的绝对路径；共享名称固定为 `muli-checks.slice`，每次 service 使用不同名称。脚本输出 service 名称、退出结果、运行时间、内存峰值与 swap 使用，测试失败不会变成成功。只有全部启动前检查通过后才会出现 `Kernel resource limits verified`。
+
+默认离线设置 `UV_OFFLINE=1`、`UV_NO_SYNC=1`，明确传入 PATH、当前源码路径、Node 堆及数值库单线程环境。其它临时环境不自动继承，确需变量可在受限命令中使用 `env NAME=value`，不得覆盖保护变量。它是开发执行规范，不是恶意代码沙箱，也不阻止用户主动绕开脚本；所有协作 agent 必须遵守仓库 AGENTS.md。
+
+优先小范围验证，串行执行较重检查；不要在失败后提高限额或循环重跑。先读取有限错误日志、审查代码和 fixture。比较 DOM 或循环引用对象的身份时断言 `actual === expected` 的布尔结果，避免诊断格式化遍历完整对象图。
+
+macOS、Windows 和没有 systemd 的 Linux 可继续运行 MuLi 产品；此本地开发入口不声称具备这些平台的等价隔离。托管 CI 在独立运行器执行既有跨平台矩阵，保留 job 硬超时，前端单并发与 Node 堆限制；`faulthandler_timeout` 仅用于诊断，不是进程终止保证。
+
+实现依据：[systemd 资源控制](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)、[临时服务](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)、[服务期限与 OOM 策略](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)、[Node 测试运行器](https://nodejs.org/api/test.html)。

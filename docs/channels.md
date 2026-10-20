@@ -134,7 +134,7 @@ await manager.close()
 
 `submit` 为异步回调，接收 `content/source/principal/route/event_id/attachment_ids`。关闭时取消长轮询、事件消费者与出站工作器，完成正在发送任务的状态收口后唤醒等待者；若管理器关闭，`wait` 返回当时的持久状态，尚未发送的项目仍可能是 `pending`。
 
-离线验证命令：`PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_channels.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
+离线验证命令：`python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_channels.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
 
 ## 协议依据
 

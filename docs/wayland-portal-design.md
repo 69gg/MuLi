@@ -91,6 +91,6 @@ helper 以只读描述符打开源文件，逐层用目录描述符与 `O_NOFOLL
 | 文件接收 | 有效 PNG；Documents 样式路径；远程 URI、链接、FIFO、目录、空文件、坏头、超额和读取期间增长 |
 | 集成收尾 | 配额已满、复制或发布失败；只删除自有未完成文件；无遗留进程和私有总线；权限门与附件行为保持 |
 
-候选实现已通过私有总线测试，复核命令为 `PYTHONPATH=本工作树/src /data0/MuLi/.venv/bin/pytest -q tests/test_portal.py tests/test_capture.py tests/test_process_cleanup.py tests/test_process_grace.py`。测试只启动自有临时总线和 fake 服务，均在 fixture 退出时回收；输出洪流测试有独立进程 watchdog。
+候选实现已通过私有总线测试，复核命令为 `python /data0/MuLi/scripts/check_local.py run -- /data0/MuLi/.venv/bin/pytest -q tests/test_portal.py tests/test_capture.py tests/test_process_cleanup.py tests/test_process_grace.py`。测试只启动自有临时总线和 fake 服务，均在 fixture 退出时回收；输出洪流测试有独立进程 watchdog。
 
 发布前仍应在用户明确授权下对 Arch 的实际 GNOME / KDE Portal 做有限人工验收。在实际桌面验证前，发行说明必须继续区分“实现并通过模拟测试”和“已验证该桌面授权与截图”；本轮未实施真实桌面验收。

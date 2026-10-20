@@ -170,9 +170,11 @@ MCP JSON 仅在实际修改后提交完整 `mcp` 对象。服务端原子替换�
 ## 验证
 
 ```sh
-node --test tests/frontend/*.test.mjs
-node --check web/app.mjs
+python scripts/check_local.py frontend
+python scripts/check_local.py run -- node --check web/app.mjs
 ```
+
+本地检查必须使用[受限入口](development.md)，不直接执行全量 Node 测试；前端文件单并发，V8 堆限制与整个进程组的内存、CPU、时间限制同时生效。循环 DOM 对象的身份比较使用布尔断言，避免失败输出展开完整对象图。
 
 当前 219 项无依赖测试覆盖：SSE Unicode 与任意分片、回放去重、运行中恢复、补充消息不截断回复、队列快照与实时注入、晚到确认、仅附件消息确认、审批 / 停止、失败保留、时间转换、链接过滤、原始文件字节上传、安全媒体类型与 URL、脱敏设置、密码更新、MCP 原子替换、双主题文字对比度、主题偏好和本地 OpenAPI 引用。新管理回归覆盖只读状态请求、单模块及全部失败、更新未知状态、渠道密钥保留 / 清除、伪状态字段过滤、高级参数草稿合并、独立记忆提取角色、重试确认门、系统资料身份和取消收件。测试不会连接真实模型。
 

@@ -26,7 +26,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node --test tests/frontend/*.test.mjs
+      - run: node --test --test-concurrency=1 --test-timeout=15000 tests/frontend/*.test.mjs
+        env:
+          NODE_OPTIONS: --max-old-space-size=256
       - run: uv build
       - run: uv run python scripts/check_wheel.py
       - uses: actions/upload-artifact@v4
