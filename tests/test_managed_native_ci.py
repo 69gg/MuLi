@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import stat
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -189,10 +190,146 @@ class Commands:
 @pytest.fixture
 def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Commands]:
     commands = Commands(tmp_path)
+    temporary = tmp_path / "public-temporary"
+    temporary.mkdir(mode=0o1777)
+    os.chmod(temporary, 0o1777)
+    original_lstat = Path.lstat
+
+    def root_owned_parent(path: Path) -> os.stat_result:
+        info = original_lstat(path)
+        if path == temporary:
+            fields = list(info)
+            fields[4] = 0  # Synthetic /tmp ownership; no host account is changed.
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(ci, "VOLUME_PARENT", temporary)
+    monkeypatch.setattr(Path, "lstat", root_owned_parent)
     monkeypatch.setattr(ci, "account", commands.accounts.get)
     monkeypatch.setattr(ci, "private_group", commands.groups.get)
     monkeypatch.setattr(ci, "CGROUP_ROOT", commands.cgroup_root)
     return ci.NativeCI(tmp_path / ci.ROOT_NAME, run=commands), commands
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "owner", "mode"])
+def test_volume_parent_must_be_the_existing_root_owned_sticky_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    path = tmp_path / "temporary"
+    target = tmp_path / "target"
+    target.mkdir()
+    if kind == "symlink":
+        path.symlink_to(target, target_is_directory=True)
+    elif kind == "file":
+        path.write_bytes(b"not a directory")
+    else:
+        path.mkdir()
+    original = path.lstat()
+    fields = list(original)
+    fields[4] = 1 if kind == "owner" else 0
+    if kind in {"owner", "mode"}:
+        fields[0] = stat.S_IFDIR | (0o777 if kind == "mode" else 0o1777)
+    monkeypatch.setattr(ci, "VOLUME_PARENT", path)
+    monkeypatch.setattr(Path, "lstat", lambda value: os.stat_result(fields))
+    with pytest.raises(ci.FixtureError, match="temporary_parent_invalid"):
+        ci.temporary_identity()
+
+
+def test_private_runner_ancestor_is_not_required_by_either_transient_or_fresh_cleanup(
+    fixture: tuple[Any, Commands],
+    tmp_path: Path,
+) -> None:
+    native, commands = fixture
+    runner = tmp_path / "runner-home"
+    runner.mkdir(mode=0o750)
+    temporary = runner / "_temp"
+    temporary.mkdir()
+    native.root = temporary / ci.ROOT_NAME
+    native.receipt_path = native.root / "receipt.json"
+
+    def no_runner_access(argv: Any, *, seconds: float = 5) -> Any:
+        if "systemd-run" in argv:
+            executable = next(Path(value) for value in argv if value.endswith("/a/bin/python"))
+            if executable.is_relative_to(runner):
+                commands.calls.append(tuple(argv))
+                return ci.Reply(1, b"Failed to find executable: Permission denied")
+        return commands(argv, seconds=seconds)
+
+    native.run = no_runner_access
+    native.execute()
+    assert not native.volume.is_relative_to(runner)
+    assert native.receipt_path.is_relative_to(temporary)
+    assert (native.root / "filesystem.ext4").is_file()
+    directory = native.receipt.volume_directory
+    recovered = ci.NativeCI(native.root, run=no_runner_access)
+    recovered.cleanup()
+    assert recovered.volume == native.volume and recovered.home == native.home
+    assert recovered.receipt.volume_directory == directory
+    assert not commands.mounts and not commands.accounts and not commands.groups
+    assert (
+        ci.fixture_result((native.root / "result.json").read_bytes())["resources"]["cleanup"]
+        == "verified"
+    )
+    assert runner.stat().st_mode & 0o777 == 0o750
+    assert not any("setfacl" in args or str(runner) in args for args in commands.calls)
+
+
+@pytest.mark.parametrize("entry", ["directory", "dangling-symlink"])
+def test_existing_volume_entry_is_not_adopted_or_deleted(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    from types import SimpleNamespace
+
+    native, commands = fixture
+    monkeypatch.setattr(ci.uuid, "uuid4", lambda: SimpleNamespace(hex="a" * 32))
+    volume = ci.VOLUME_PARENT / f"{ci.ROOT_NAME}-muli-ci-{'a' * 12}"
+    if entry == "directory":
+        volume.mkdir(mode=0o700)
+        (volume / "sentinel").write_bytes(b"unowned")
+    else:
+        volume.symlink_to(volume.with_name("missing-target"), target_is_directory=True)
+    with pytest.raises(FileExistsError):
+        native.prepare()
+    assert ci.Receipt.read(native.receipt_path).volume_directory is None
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="volume_creation_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls
+    if entry == "directory":
+        assert (volume / "sentinel").read_bytes() == b"unowned"
+    else:
+        assert volume.is_symlink()
+
+
+def test_changed_temporary_parent_rejects_cleanup_before_any_effect(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    temporary = ci.VOLUME_PARENT
+    temporary.rename(temporary.with_name("original-temporary"))
+    temporary.mkdir(mode=0o1777)
+    os.chmod(temporary, 0o1777)
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="temporary_parent_changed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls and commands.accounts and commands.mounts
+
+
+def test_changed_original_volume_directory_cannot_authorize_account_deletion(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    native.volume.rename(native.volume.with_name("replaced-volume"))
+    native.volume.mkdir(mode=0o700)
+    commands.mounts.clear()  # The recorded mounts have disappeared, not moved here.
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="volume_directory_changed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert commands.accounts and not any("userdel" in args for args in commands.calls)
 
 
 def test_default_runner_cannot_accidentally_run_a_native_effect() -> None:
@@ -296,7 +433,11 @@ def test_mount_observation_does_not_need_runner_access_after_private_handoff(
         return reply
 
     def runner_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if handed_off and path.is_relative_to(native.volume):
+        if (
+            handed_off
+            and path.is_relative_to(native.volume)
+            and (path != native.volume or follow_symlinks)
+        ):
             raise PermissionError("the runner cannot traverse the private 0700 volume")
         return original(path, follow_symlinks=follow_symlinks)
 
@@ -1222,7 +1363,7 @@ def test_diagnostic_ancestor_metadata_is_bounded_path_free_and_not_access_proof(
 ) -> None:
     temporary = tmp_path / "runner-temp"
     temporary.mkdir(mode=0o700)
-    home = temporary / ci.ROOT_NAME / "volume/home"
+    home = temporary / f"{ci.ROOT_NAME}-muli-ci-{'a' * 12}" / "home"
     value = worker.diagnostic_ancestors(home)
     assert 0 < len(value) <= 16 and value[-1]["mode"] & 0o777 == 0o700
     assert value[-1]["uid"] == os.getuid() and value[-1]["gid"] == os.getgid()

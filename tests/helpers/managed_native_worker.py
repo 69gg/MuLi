@@ -237,8 +237,8 @@ def diagnostic_command_code(status: object, stderr: object) -> str:
 
 
 def diagnostic_ancestors(home: Path) -> list[dict[str, int]]:
-    """Observe only the fixed RUNNER_TEMP ancestor chain, never its contents."""
-    temporary = home.parents[2]
+    """Observe only the volume parent's ancestor chain, never its contents."""
+    temporary = home.parents[1]
     paths = tuple(reversed((temporary, *temporary.parents)))
     require(len(paths) <= 16, "native_diagnostic_invalid")
     result: list[dict[str, int]] = []

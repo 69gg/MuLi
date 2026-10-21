@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含启动诊断的 61 项纯 fixture 与限定静态检查已通过；真实托管 runner 首轮在 harness 启动阶段失败，尚未执行三事务。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含私有卷入口修复的 89 项纯 fixture 与限定静态检查已通过；前三轮真实托管 runner 均未观察到 worker 结果，记录为 0 个事务；仅第三轮的精确 typed listing 证实该 harness 单元缺席。第三轮已取得客户端可执行文件查找权限失败与用户总线成功的独立事实，本轮调整私有卷入口，真实启动与三事务待下一精确远端候选验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -12,9 +12,11 @@ A、B 复制同一个当前 MuLi 包，保留原 `compatibility.json`；依赖�
 
 ## 专用 UID 与已有解释器
 
-CI 协调脚本为本次运行创建唯一非 root 用户和组，记录实际 UID/GID、精确 HOME 和私有根。其 HOME、配置、数据、用户 unit、两个 retained prefix、辅助脚本均在 `RUNNER_TEMP` 内独占的 0700 子根。创建冲突直接失败，不复用已有用户；不修改 runner 用户、全局 `user.slice` 或其它 UID 的 manager。
+CI 协调脚本为本次运行创建唯一非 root 用户和组，记录实际 UID/GID、精确 HOME 和私有根。镜像文件、setup receipt 与导出结果仍在 `RUNNER_TEMP` 内由 runner 拥有；唯一 ext4 挂载入口位于现有 `/tmp` 下的本次独占目录。其 HOME、配置、数据、用户 unit、两个 retained prefix、辅助脚本均在这一个 0700 私有卷中。创建冲突直接失败，不复用已有用户；不修改 runner 用户、祖先目录的 mode/ACL/补充组、全局 `user.slice` 或其它 UID 的 manager。
 
 setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，不放在该 UID 的可写卷中。它逐阶段记录本次已确认创建的用户/组、实际 UID/GID/HOME、镜像文件身份和精确 mount 身份；先记准备意图不能冒充已经创建成功。每次 setup 失败和 `always()` 重入清理都重新核 username↔UID/GID/HOME 及挂载身份仍一致，只处理本次已证实创建的资源。旧 UID 已被复用、映射改变或效果不能确认时保留证据并失败，不能依旧 receipt 删除后来账户；首次 setup 未成功创建的资源不归本次清理。若 `useradd` 已产生账户但响应丢失，未确认 receipt 不授权删除；清理发现同名账户或组会明确失败，不能报告已清理。
+
+`/tmp` 必须经 `lstat` 确认为非符号链接、root 拥有的 01777 目录；记录并重核其 dev/inode。卷入口名只由固定前缀和 receipt 中已严格验证的本次用户名派生，不接受命令行另给任意挂载目标。排他 `mkdir` 后，先确认原入口的 dev/inode、runner owner 和 0700 并持久保存，才建立镜像和挂载。跨进程 cleanup 从同一 receipt 重建精确路径，复核 `/tmp` 身份、已有 mount 身份，以及卸载后原入口的 dev/inode/owner/mode；碰撞、未确认创建、目录替换或失证均失败且不删除它。保留卸载后的空私有入口与镜像，不递归删除输出。这样无需穿越权限为 0750 的 runner 祖先，也不引入新的 bind 或放宽私有数据权限。
 
 临时数据使用现有 Linux fixture 相同配方的独立 64 MiB sparse ext4 镜像，挂载选项为 `loop,nodev,nosuid,noatime`。新 job 不与 matrix 的卷共用可写目录。先报告实际挂载、可用字节和 inode，再运行真实 `verify_local_filesystems`；不支持就使该显式 job 失败，不跳过或修改白名单。该卷只承载小型合成事实，不模拟断电耐久性。
 
@@ -83,7 +85,7 @@ setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，
 
 `resources.startup` 分别保留启动客户端与诊断客户端的退出码、固定命令报告分类，以及观察器的 `identity/ancestors/import/manager/listing/get_unit/unit_properties/service_properties` 阶段和最后一条 `busctl` 的退出码/分类。未知退出码保持空值，已尝试但超时不能记为从未启动。分类只对白名单短语作匹配；它是命令所报告的线索，不证明实际根因、权限或进程授权，原 stderr、路径和异常正文均不导出。先成功读取 typed Manager，再对精确 unit 执行 `ListUnitsByPatterns`；只有该 typed 列表成功且为空才能记 `unit_absent`。总线不可达、GetUnit 失败、属性查询失败或坏响应均保留各自阶段，不能归为单元缺席。成功观察才附加 `Id/LoadState/ActiveState/SubState/Result/ExecMainCode/ExecMainStatus/MainPID` 的有限事实。
 
-同一次诊断仅对从 `/` 到本次 `RUNNER_TEMP` 的固定祖先链做至多 16 次 `lstat`，按顺序索引保留 mode（含文件种类）、uid/gid，不扫描目录或导出祖先路径。它们只是 DAC 线索，不检查 ACL、补充组或有效可遍历权限，也不修改任何父目录权限。`user@UID.service` 已启动和聚合 cgroup 已核验都不等于普通用户 D-Bus 已可达；[v255 的 user@ unit](https://github.com/systemd/systemd/blob/v255/units/user%40.service.in) 依赖 runtime-dir，不能据此替代实际总线查询。[v255 的 systemd-run](https://github.com/systemd/systemd/blob/v255/src/run/run.c) 在本例 `--wait --pipe` 下强制使用普通 user bus，且在连接前先查找可执行文件；不带这些选项时可能使用的 `systemd/private` 通路不能混作本例的可达证据。
+同一次诊断仅对从 `/` 到本次私有卷父目录的固定祖先链做至多 16 次 `lstat`，按顺序索引保留 mode（含文件种类）、uid/gid，不扫描目录或导出祖先路径。本轮父目录是 `/tmp`，不再从 HOME 层级推作 `RUNNER_TEMP`。它们只是 DAC 线索，不检查 ACL、补充组或有效可遍历权限，也不修改任何父目录权限。`user@UID.service` 已启动和聚合 cgroup 已核验都不等于普通用户 D-Bus 已可达；[v255 的 user@ unit](https://github.com/systemd/systemd/blob/v255/units/user%40.service.in) 依赖 runtime-dir，不能据此替代实际总线查询。[v255 的 systemd-run](https://github.com/systemd/systemd/blob/v255/src/run/run.c) 在本例 `--wait --pipe` 下强制使用普通 user bus，且在连接前先查找可执行文件；不带这些选项时可能使用的 `systemd/private` 通路不能混作本例的可达证据。
 
 这次诊断至多消耗现有 5 秒命令预算，并且必须落在本次原有 `90+5` 秒启动观察总期限的剩余时间内；启动观察已耗尽就不发诊断命令，不增加功能 60 秒、harness 90 秒或清理 5 秒的上限。Ubuntu 24.04 对应的 [systemd v255 参数实现](https://github.com/systemd/systemd/blob/v255/src/run/run.c)支持当前 `--wait --pipe --service-type=exec --expand-environment=no`；[同版本手册](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)说明关闭环境展开的选项从 v254 起存在。参数支持不等于本次实际 exec 成功；retained `bin/python` 与 `pyvenv.cfg.home` 的源 runtime 相对关系也由纯 fixture 明确核验，实际权限仍由远端运行证明。
 
@@ -112,6 +114,18 @@ PR [#37](https://github.com/69gg/MuLi/pull/37) 的首轮精确候选为签名提
 617 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39564407572/artifacts/12329236961) 中，功能结果依然是 `harness_start/worker_not_observed`、timeline/generations 为空，即 **0 个事务**。本轮已取得实际聚合 kernel 值：memory.max 1073741824、memory.swap.max 0、cpu.max `100000 100000`、pids.max 128；启动客户端退出码为 1，旧观察器只返回 `unavailable`。这仍不足以区分可执行文件查找、导入或用户总线故障。该次 receipt 的专用用户 `muli-ci-0af59a4095a9`、UID 999/GID 987 分别已删除，已记录 mounts 为空；服务正常收尾仍未通过，不能据此称三事务成功。
 
 分阶段诊断补充 19 项纯 fixture，覆盖两个客户端独立失败、未知退出码的超时、产品导入失败、五个 D-Bus 观察阶段、typed 空集与坏列表区别，以及有限祖先元数据不改权限、不泄路径。最终整文件 **80 个唯一 case**（原 61 加新 19）通过，0.44 秒、服务 0.982 秒、峰值 74.5 MiB/swap 0；先运行的 28 项及过渡 79 项均为重叠检查，不重复计数。三份 Python 文件 Ruff/format、两脚本 strict mypy 通过；本轮 mypy 最高 162.5 MiB，最后缓存尾轮 65.7 MiB，swap 0。每条仍通过 root 绝对路径 30 秒守卫串行执行，没有本机真实 harness、用户/挂载/服务操作。这一补片只提高下一精确候选失败时的辨识度，不宣称已修复启动根因或已经完成原生验收。
+
+## 第三轮远端结果与私有卷入口修复
+
+精确签名候选 `02ab6da94fb0c3de8badfdafbb9361177932860d` 的 CI [39569796860](https://github.com/69gg/MuLi/actions/runs/39569796860) 最终八项成功，仅原生 [job 119120822395](https://github.com/69gg/MuLi/actions/runs/39569796860/job/119120822395) 失败。739 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39569796860/artifacts/12331815464)的 zip SHA256 为 `bc8cc9bdaa24612fc91545bab5ebe4f0ba265706b19bfb01c4983e082a3bb8d8`。功能结果仍为 `harness_start/worker_not_observed`，timeline/generations 为空，即 **0 个事务**。
+
+启动客户端退出 1，固定分类为 `executable_permission`；诊断客户端退出 0，typed Manager 与精确 listing 成功，得到 `stage=listing/code=unit_absent/query_status=0`。因此本轮不是用户总线不可达，而是在客户端查找可执行文件时报权限错误，尚未创建该精确 harness。旧入口祖先元数据的索引 2 为 040750、UID/GID 1001，其余为 040755；本次专用 UID 999/GID 987。这些 mode 仍不作为 ACL 或实际有效访问权限证明；路径调整只移开这一必须经过的 runner 私有祖先，不扩大其权限。
+
+同一轮 `native_service_cleanup_failed` 不能解释为合法缺席被误拒：cleanup transient 也使用同一 retained 可执行文件路径，无法启动就保留失败；其后的专用 manager 停止、用户/组删除与已记录挂载回收属于兜底。receipt 中 `user_removed=true/group_removed=true/mounts=[]` 证明这些资源已回收，不能称正常服务收尾。修复不把 `unit_absent` 当清理 worker 成功；标准服务原有 typed 缺席分支保持，仍须真正执行 cleanup worker 并完成其余证明。
+
+本轮新增 9 项纯 fixture，覆盖不可遍历 runner 祖先下的协调者仍可使用独立卷执行 drive 与 fresh-coordinator cleanup、`/tmp` 类型/owner/mode、入口目录/悬空符号链接碰撞、父目录替换和原入口身份替换拒绝。新 9 项通过 0.13 秒、峰值 63.3 MiB；最终整文件 **89 个唯一 case**（原 80 加新 9）通过，0.41 秒、服务 0.973 秒、峰值 74.1 MiB/swap 0。新 9 项和权限 fake 单例均包含在 89 项内，不重复计数。首次整文件运行发现旧权限 fake 在卸载后仍永久禁止原入口本身的 `lstat`；仅允许该入口的 nofollow 元数据读取，私有内容与普通 `stat` 仍拒绝，再通过该单例和完整 89 项。三份 Python 文件 Ruff/format、两脚本 strict mypy 通过，mypy 峰值 157.8 MiB/swap 0，所有检查均由 root 绝对路径守卫逐条 30 秒串行执行。
+
+所有真实 subprocess 继续在该测试模块被硬拒绝；没有本机原生 harness、用户/挂载/服务操作。纯 fixture 不证明真实临时 UID 可执行，实际查找、导入与三事务仍待下一精确远端候选验收。95 秒启动 envelope、60 秒功能期限、5 秒清理效果/证明及已有故障命令 kill/reap 上限均不变。
 
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 

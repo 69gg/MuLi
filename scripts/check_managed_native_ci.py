@@ -29,6 +29,7 @@ HARNESS_SECONDS = 90
 IMAGE_BYTES = 64 * 1024**2
 OUTPUT_BYTES = 32768
 ROOT_NAME = "muli-managed-native-ci"
+VOLUME_PARENT = Path("/tmp")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
@@ -405,6 +406,14 @@ def require_ci(root: Path) -> None:
         raise FixtureError("native_hosted_ci_required")
 
 
+def temporary_identity() -> tuple[int, int]:
+    """Only the existing root-owned sticky directory may host the private volume."""
+    info = VOLUME_PARENT.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o1777:
+        raise FixtureError("native_temporary_parent_invalid")
+    return info.st_dev, info.st_ino
+
+
 def account(name: str) -> tuple[int, int, str] | None:
     import pwd
 
@@ -435,6 +444,8 @@ class Receipt:
     group_removed: bool = False
     manager_group: str = ""
     image: tuple[int, int] | None = None
+    temporary: tuple[int, int] | None = None
+    volume_directory: tuple[int, int] | None = None
     mounts: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -468,14 +479,19 @@ class Receipt:
             )
         ):
             raise FixtureError("native_receipt_invalid")
-        if result.image is not None:
+        for name in ("image", "temporary", "volume_directory"):
+            identity = getattr(result, name)
+            if identity is None:
+                continue
             if (
-                not isinstance(result.image, (list, tuple))
-                or len(result.image) != 2
-                or any(type(item) is not int or item < 0 for item in result.image)
+                not isinstance(identity, (list, tuple))
+                or len(identity) != 2
+                or any(type(item) is not int or item < 0 for item in identity)
             ):
                 raise FixtureError("native_receipt_invalid")
-            result.image = (result.image[0], result.image[1])
+            setattr(result, name, (identity[0], identity[1]))
+        if result.volume_directory is not None and result.temporary is None:
+            raise FixtureError("native_receipt_invalid")
         if (
             not isinstance(result.mounts, list)
             or len(result.mounts) > 3
@@ -497,12 +513,38 @@ class Receipt:
 class NativeCI:
     def __init__(self, root: Path, *, run: Runner = command) -> None:
         self.root, self.run = root, run
-        self.volume = root / "volume"
-        self.home = self.volume / "home"
         self.receipt_path = root / "receipt.json"
         self.receipt: Receipt | None = None
         self.cleanup_deadline: float | None = None
         self.manager_limits: dict[str, str] = {}
+
+    @property
+    def volume(self) -> Path:
+        if self.receipt is None:
+            raise FixtureError("native_receipt_required")
+        return VOLUME_PARENT / f"{ROOT_NAME}-{self.receipt.user}"
+
+    @property
+    def home(self) -> Path:
+        return self.volume / "home"
+
+    def check_temporary(self) -> None:
+        assert self.receipt is not None
+        if self.receipt.temporary != temporary_identity():
+            raise FixtureError("native_temporary_parent_changed")
+
+    def check_volume_directory(self) -> None:
+        """Check the original, unmounted entry, never adopt a name collision."""
+        assert self.receipt is not None
+        self.check_temporary()
+        info = self.volume.lstat()
+        if (
+            self.receipt.volume_directory != (info.st_dev, info.st_ino)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise FixtureError("native_volume_directory_changed")
 
     def call(self, argv: Sequence[str], *, seconds: float = 5) -> Reply:
         if self.cleanup_deadline is not None:
@@ -622,11 +664,20 @@ class NativeCI:
             Path(description[key]).resolve(strict=True) for key in ("runtime", "dependencies")
         )
         for path in (runtime, dependencies):
-            if self.root.is_relative_to(path) or path.is_relative_to(self.root):
+            if any(
+                output.is_relative_to(path) or path.is_relative_to(output)
+                for output in (self.root, self.volume)
+            ):
                 raise FixtureError("native_recursive_input")
         if runtime.is_relative_to(dependencies) or dependencies.is_relative_to(runtime):
             raise FixtureError("native_recursive_input")
+        self.receipt.temporary = temporary_identity()
+        self.save()
         self.volume.mkdir(mode=0o700)
+        info = self.volume.lstat()
+        self.receipt.volume_directory = (info.st_dev, info.st_ino)
+        self.check_volume_directory()
+        self.save()
         image = self.root / "filesystem.ext4"
         with image.open("xb") as output:
             os.chmod(image, 0o600)
@@ -635,6 +686,7 @@ class NativeCI:
         self.receipt.image = (info.st_dev, info.st_ino)
         self.save()
         self.checked(("mkfs.ext4", "-q", "-F", str(image)))
+        self.check_volume_directory()
         self.sudo(
             "mount", "-t", "ext4", "-o", "loop,nodev,nosuid,noatime", str(image), str(self.volume)
         )
@@ -931,6 +983,12 @@ class NativeCI:
             raise FixtureError("native_root_owner")
         self.receipt = Receipt.read(self.receipt_path)
         receipt = self.receipt
+        if receipt.temporary is not None:
+            self.check_temporary()
+            if receipt.volume_directory is None and os.path.lexists(self.volume):
+                raise FixtureError("native_volume_creation_unconfirmed")
+        elif receipt.volume_directory is not None or receipt.mounts:
+            raise FixtureError("native_receipt_invalid")
         if not receipt.user_created and (
             account(receipt.user) is not None or private_group(receipt.user) is not None
         ):
@@ -989,6 +1047,8 @@ class NativeCI:
                 self.sudo("umount", str(target))
                 if self.mount(target) is not None:
                     raise FixtureError("native_mount_not_released")
+            if target == self.volume:
+                self.check_volume_directory()
             receipt.mounts.remove(value)
             self.save()
         if any(
@@ -996,6 +1056,8 @@ class NativeCI:
             for path in (self.volume / "input/deps", self.volume / "input/python", self.volume)
         ):
             raise FixtureError("native_unrecorded_mount")
+        if receipt.volume_directory is not None:
+            self.check_volume_directory()
         if receipt.user_created and not receipt.user_removed:
             self.current_account()
             self.sudo("userdel", receipt.user)
