@@ -115,9 +115,11 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
         assert "private-password-label" not in encoded and "private-password-value" not in encoded
         assert all(item["editable"] is False for item in snapshot["nodes"])
         assert all(item["actions"] == [] and item["read_only"] for item in protected)
-        assert [item["name"] for item in snapshot["nodes"] if item["actions"]] == [
-            uia_native_window.BUTTON_NAME
+        buttons = [
+            item for item in snapshot["nodes"] if item["name"] == uia_native_window.BUTTON_NAME
         ]
+        assert len(buttons) == 1
+        assert buttons[0]["actions"] == ["invoke"] and buttons[0]["read_only"] is False
         assert snapshot["scope"] == "window"
         lease = computer._uia._lease
         assert lease is not None and lease._process is not None
