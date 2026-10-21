@@ -1,0 +1,793 @@
+"""GitHub-only native-systemd fixture; never run this harness on a workstation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
+
+MEMORY = 1024**3
+HARNESS_MEMORY = MEMORY // 4
+TASKS = 128
+HARNESS_TASKS = 32
+CASE_SECONDS = 60
+CLEANUP_SECONDS = 5
+HARNESS_SECONDS = 90
+IMAGE_BYTES = 64 * 1024**2
+OUTPUT_BYTES = 32768
+ROOT_NAME = "muli-managed-native-ci"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+class FixtureError(ValueError):
+    """Only fixed fixture errors are printed by the coordinator."""
+
+
+@dataclass(frozen=True)
+class Reply:
+    code: int
+    output: bytes = b""
+
+
+class Runner(Protocol):
+    def __call__(self, argv: Sequence[str], *, seconds: float = 5) -> Reply: ...
+
+
+def command(argv: Sequence[str], *, seconds: float = 5) -> Reply:
+    """Bound both output and lifetime, and reap the one owned command group."""
+    if not 0 < seconds <= HARNESS_SECONDS + CLEANUP_SECONDS:
+        raise FixtureError("native_command_budget")
+    end = time.monotonic() + seconds
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise FixtureError("native_command_timeout")
+                for key, _ in selector.select(remaining):
+                    data = os.read(key.fd, min(4096, OUTPUT_BYTES + 1 - len(output)))
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    else:
+                        output.extend(data)
+                        if len(output) > OUTPUT_BYTES:
+                            raise FixtureError("native_command_output_budget")
+        return Reply(process.wait(timeout=max(0.001, end - time.monotonic())), bytes(output))
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.stdout.close()
+        process.wait(timeout=CLEANUP_SECONDS)
+
+
+def object_bytes(data: bytes) -> dict[str, Any]:
+    if len(data) > OUTPUT_BYTES:
+        raise FixtureError("native_metadata_budget")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise FixtureError("native_metadata_invalid")
+    return value
+
+
+def fixture_result(data: bytes) -> dict[str, Any]:
+    """Export only finite fixture facts, never arbitrary worker JSON fields."""
+    value = object_bytes(data)
+    if (
+        set(value) != {"completed", "stage", "code", "timeline", "generations", "resources"}
+        or type(value["completed"]) is not bool
+        or not isinstance(value["stage"], str)
+        or re.fullmatch(r"[a-z_]{1,40}", value["stage"]) is None
+        or not isinstance(value["code"], str)
+        or re.fullmatch(r"[A-Za-z_]{0,64}", value["code"]) is None
+    ):
+        raise FixtureError("native_result_invalid")
+    timeline = value["timeline"]
+    integers = {"elapsed_ms", "pid", "exit_status"}
+    strings = {
+        "stage",
+        "phase",
+        "activation",
+        "request_id",
+        "generation",
+        "helper",
+        "state",
+        "boot",
+        "result",
+    }
+    if not isinstance(timeline, list) or len(timeline) > 64:
+        raise FixtureError("native_result_invalid")
+    for row in timeline:
+        if (
+            not isinstance(row, dict)
+            or not {"stage", "elapsed_ms"}.issubset(row)
+            or not set(row).issubset(integers | strings)
+        ):
+            raise FixtureError("native_result_invalid")
+        for name, fact in row.items():
+            if name in integers:
+                valid = type(fact) is int and 0 <= fact <= 2**63 - 1
+            else:
+                valid = (
+                    isinstance(fact, str)
+                    and re.fullmatch(r"[A-Za-z0-9_.-]{0,100}", fact) is not None
+                )
+            if not valid:
+                raise FixtureError("native_result_invalid")
+    history = value["generations"]
+    if not isinstance(history, list) or len(history) > 3:
+        raise FixtureError("native_result_invalid")
+    for row in history:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"deployment", "generation", "helper"}
+            or any(
+                not isinstance(row[name], str) or re.fullmatch(pattern, row[name]) is None
+                for name, pattern in (
+                    ("deployment", r"[a-f0-9]{64}"),
+                    ("generation", r"[a-f0-9]{32}"),
+                    ("helper", r"muli-transaction-[a-f0-9]{64}\.service"),
+                )
+            )
+        ):
+            raise FixtureError("native_result_invalid")
+    resources = value["resources"]
+    if not isinstance(resources, dict) or not set(resources).issubset(
+        {"manager", "harness", "manager_peak", "initial", "cleanup"}
+    ):
+        raise FixtureError("native_result_invalid")
+    for name, facts in resources.items():
+        if name in {"manager", "harness"}:
+            valid = (
+                isinstance(facts, dict)
+                and set(facts) == {"memory.max", "memory.swap.max", "cpu.max", "pids.max"}
+                and all(
+                    isinstance(item, str)
+                    and re.fullmatch(r"[0-9]{1,20}( [0-9]{1,20})?", item) is not None
+                    for item in facts.values()
+                )
+            )
+        elif name == "initial":
+            valid = (
+                isinstance(facts, dict)
+                and set(facts) == {"store", "main", "device", "inode"}
+                and all(
+                    isinstance(facts[key], str)
+                    and re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", facts[key]) is not None
+                    for key in ("store", "main")
+                )
+                and all(type(facts[key]) is int and facts[key] >= 0 for key in ("device", "inode"))
+            )
+        elif name == "manager_peak":
+            valid = isinstance(facts, str) and re.fullmatch(r"[0-9]{1,20}", facts) is not None
+        else:
+            valid = facts in ("verified", "failed")
+        if not valid:
+            raise FixtureError("native_result_invalid")
+    return value
+
+
+def write_json(path: Path, value: object) -> None:
+    data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    if len(data) > OUTPUT_BYTES:
+        raise FixtureError("native_metadata_budget")
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("wb") as output:
+        os.chmod(temporary, 0o600)
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def verify_kernel(path: Path, memory: int, tasks: int) -> None:
+    """The same four kernel limits used by the local resource guard."""
+    for name, maximum in (("memory.max", memory), ("memory.swap.max", 0), ("pids.max", tasks)):
+        value = (path / name).read_text().strip()
+        if not value.isdecimal() or int(value) > maximum or (maximum and int(value) == 0):
+            raise FixtureError("native_kernel_limit")
+    values = (path / "cpu.max").read_text().split()
+    if len(values) != 2 or not all(value.isdecimal() for value in values):
+        raise FixtureError("native_kernel_cpu")
+    quota, period = map(int, values)
+    if not 0 < quota <= period:
+        raise FixtureError("native_kernel_cpu")
+
+
+def require_ci(root: Path) -> None:
+    if (
+        sys.platform != "linux"
+        or os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_OS") != "Linux"
+        or not os.environ.get("RUNNER_TEMP")
+        or root.name != ROOT_NAME
+        or root.parent != Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+        or not root.is_absolute()
+        or any(character in str(root) for character in "\r\n\x00")
+    ):
+        raise FixtureError("native_hosted_ci_required")
+
+
+def account(name: str) -> tuple[int, int, str] | None:
+    import pwd
+
+    try:
+        value = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return value.pw_uid, value.pw_gid, value.pw_dir
+
+
+def private_group(name: str) -> tuple[int, tuple[str, ...]] | None:
+    import grp
+
+    try:
+        value = grp.getgrnam(name)
+    except KeyError:
+        return None
+    return value.gr_gid, tuple(value.gr_mem)
+
+
+@dataclass
+class Receipt:
+    user: str
+    uid: int | None = None
+    gid: int | None = None
+    user_created: bool = False
+    user_removed: bool = False
+    group_removed: bool = False
+    manager_group: str = ""
+    image: tuple[int, int] | None = None
+    mounts: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def read(cls, path: Path) -> Receipt:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise FixtureError("native_receipt_owner")
+        with path.open("rb") as source:
+            value = object_bytes(source.read(OUTPUT_BYTES + 1))
+        if set(value) != set(cls.__dataclass_fields__):
+            raise FixtureError("native_receipt_invalid")
+        result = cls(**value)
+        if not re.fullmatch(r"muli-ci-[a-f0-9]{12}", result.user):
+            raise FixtureError("native_receipt_invalid")
+        if any(
+            type(getattr(result, name)) is not bool
+            for name in ("user_created", "user_removed", "group_removed")
+        ):
+            raise FixtureError("native_receipt_invalid")
+        if any(
+            value is not None and (type(value) is not int or value <= 0)
+            for value in (result.uid, result.gid)
+        ):
+            raise FixtureError("native_receipt_invalid")
+        if not isinstance(result.manager_group, str) or (
+            result.manager_group
+            and (
+                not result.manager_group.startswith("/")
+                or ".." in Path(result.manager_group).parts
+                or Path(result.manager_group).name != f"user@{result.uid}.service"
+            )
+        ):
+            raise FixtureError("native_receipt_invalid")
+        if result.image is not None:
+            if (
+                not isinstance(result.image, (list, tuple))
+                or len(result.image) != 2
+                or any(type(item) is not int or item < 0 for item in result.image)
+            ):
+                raise FixtureError("native_receipt_invalid")
+            result.image = (result.image[0], result.image[1])
+        if (
+            not isinstance(result.mounts, list)
+            or len(result.mounts) > 3
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"target", "source", "fstype", "options", "id", "device", "inode"}
+                or any(
+                    not isinstance(item[key], str)
+                    for key in ("target", "source", "fstype", "options")
+                )
+                or any(type(item[key]) is not int for key in ("id", "device", "inode"))
+                for item in result.mounts
+            )
+        ):
+            raise FixtureError("native_receipt_invalid")
+        return result
+
+
+class NativeCI:
+    def __init__(self, root: Path, *, run: Runner = command) -> None:
+        self.root, self.run = root, run
+        self.volume = root / "volume"
+        self.home = self.volume / "home"
+        self.receipt_path = root / "receipt.json"
+        self.receipt: Receipt | None = None
+        self.cleanup_deadline: float | None = None
+
+    def call(self, argv: Sequence[str], *, seconds: float = 5) -> Reply:
+        if self.cleanup_deadline is not None:
+            seconds = min(seconds, self.cleanup_deadline - time.monotonic())
+            if seconds <= 0:
+                raise FixtureError("native_cleanup_deadline")
+        reply = self.run(argv, seconds=seconds)
+        if self.cleanup_deadline is not None and time.monotonic() >= self.cleanup_deadline:
+            raise FixtureError("native_cleanup_deadline")
+        return reply
+
+    def checked(self, argv: Sequence[str], *, seconds: float = 5) -> bytes:
+        reply = self.call(argv, seconds=seconds)
+        if reply.code:
+            raise FixtureError("native_command_failed")
+        return reply.output
+
+    def sudo(self, *argv: str, seconds: float = 5) -> bytes:
+        return self.checked(("sudo", "--non-interactive", *argv), seconds=seconds)
+
+    def save(self) -> None:
+        assert self.receipt is not None
+        write_json(self.receipt_path, asdict(self.receipt))
+
+    def current_account(self) -> tuple[int, int]:
+        receipt = self.receipt
+        assert receipt is not None
+        actual = account(receipt.user)
+        if (
+            not receipt.user_created
+            or receipt.user_removed
+            or actual != (receipt.uid, receipt.gid, str(self.home))
+            or receipt.uid is None
+            or receipt.gid is None
+        ):
+            raise FixtureError("native_account_changed")
+        return receipt.uid, receipt.gid
+
+    def as_user(self, *argv: str, seconds: float = 5) -> bytes:
+        uid, _ = self.current_account()
+        assert self.receipt is not None
+        return self.sudo(
+            "--user",
+            self.receipt.user,
+            "--",
+            "env",
+            "-i",
+            f"HOME={self.home}",
+            f"USER={self.receipt.user}",
+            f"LOGNAME={self.receipt.user}",
+            "PATH=/usr/bin:/bin",
+            "LANG=C.UTF-8",
+            "LC_ALL=C.UTF-8",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+            *argv,
+            seconds=seconds,
+        )
+
+    def mount(self, path: Path) -> dict[str, Any] | None:
+        result = self.call(
+            (
+                "findmnt",
+                "--json",
+                "--mountpoint",
+                str(path),
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS,ID",
+            )
+        )
+        if result.code == 1:
+            return None
+        if result.code:
+            raise FixtureError("native_mount_observation")
+        rows = object_bytes(result.output).get("filesystems")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise FixtureError("native_mount_observation")
+        value = rows[0]
+        if set(value) != {"target", "source", "fstype", "options", "id"} or value["target"] != str(
+            path
+        ):
+            raise FixtureError("native_mount_observation")
+        # The handed-off 0700 volume is intentionally not traversable by the
+        # runner. Only this fixed target is observed with the bounded root command.
+        identity = self.sudo("stat", "--format=%d:%i:%f", "--", str(path)).decode().strip()
+        if re.fullmatch(r"[0-9]+:[0-9]+:[a-f0-9]+", identity) is None:
+            raise FixtureError("native_mount_observation")
+        device, inode, mode = identity.split(":")
+        if not stat.S_ISDIR(int(mode, 16)):
+            raise FixtureError("native_mount_observation")
+        return {**value, "device": int(device), "inode": int(inode)}
+
+    def record_mount(self, path: Path, *, readonly: bool = False) -> None:
+        assert self.receipt is not None
+        value = self.mount(path)
+        if value is None or (readonly and "ro" not in str(value["options"]).split(",")):
+            raise FixtureError("native_mount_not_ready")
+        self.receipt.mounts.append(value)
+        self.save()
+
+    def prepare(self) -> dict[str, Any]:
+        if self.root.exists():
+            raise FixtureError("native_root_exists")
+        self.root.mkdir(mode=0o711)
+        os.chmod(self.root, 0o711)
+        self.receipt = Receipt("muli-ci-" + uuid.uuid4().hex[:12])
+        self.save()  # Intent alone never authorizes deleting an existing account.
+        if account(self.receipt.user) is not None:
+            raise FixtureError("native_user_exists")
+        worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+        description = object_bytes(self.checked((sys.executable, "-I", str(worker), "describe")))
+        runtime, dependencies = (
+            Path(description[key]).resolve(strict=True) for key in ("runtime", "dependencies")
+        )
+        for path in (runtime, dependencies):
+            if self.root.is_relative_to(path) or path.is_relative_to(self.root):
+                raise FixtureError("native_recursive_input")
+        if runtime.is_relative_to(dependencies) or dependencies.is_relative_to(runtime):
+            raise FixtureError("native_recursive_input")
+        self.volume.mkdir(mode=0o700)
+        image = self.root / "filesystem.ext4"
+        with image.open("xb") as output:
+            os.chmod(image, 0o600)
+            output.truncate(IMAGE_BYTES)
+        info = image.lstat()
+        self.receipt.image = (info.st_dev, info.st_ino)
+        self.save()
+        self.checked(("mkfs.ext4", "-q", "-F", str(image)))
+        self.sudo(
+            "mount", "-t", "ext4", "-o", "loop,nodev,nosuid,noatime", str(image), str(self.volume)
+        )
+        self.record_mount(self.volume)
+        # A freshly mounted ext4 root belongs to root. Only this new volume is
+        # made writable for runner's preparation, before handing it to the UID.
+        self.sudo("chown", f"{os.getuid()}:{os.getgid()}", str(self.volume))
+        self.sudo("chmod", "0700", str(self.volume))
+        for path in (self.home, self.volume / "input/python", self.volume / "input/deps"):
+            path.mkdir(mode=0o700, parents=True)
+        limits = description["limits"]
+        if not isinstance(limits, dict) or type(description.get("size")) is not int:
+            raise FixtureError("native_source_invalid")
+        free = shutil.disk_usage(self.volume).free
+        if free < 2 * description["size"] + 16 * 1024**2:
+            raise FixtureError("native_filesystem_capacity")
+        for name in ("a", "b"):
+            self.copy_slot(name, description)
+        shutil.copyfile(worker, self.volume / "managed_native_worker.py")
+        (self.volume / "_muli_native_ci_hook.py").write_text(
+            "import sys\nif sys.argv[-1:] == ['serve']:\n"
+            "    from managed_native_worker import install_hook\n    install_hook()\n",
+            encoding="utf-8",
+        )
+        self.sudo(
+            "useradd",
+            "--system",
+            "--user-group",
+            "--no-create-home",
+            "--home-dir",
+            str(self.home),
+            "--shell",
+            "/usr/sbin/nologin",
+            self.receipt.user,
+        )
+        actual = account(self.receipt.user)
+        if (
+            actual is None
+            or actual[2] != str(self.home)
+            or actual[0] == 0
+            or private_group(self.receipt.user) != (actual[1], ())
+        ):
+            raise FixtureError("native_account_creation")
+        self.receipt.uid, self.receipt.gid, _ = actual
+        self.receipt.user_created = True
+        self.save()
+        write_json(
+            self.volume / "fixture.json",
+            {
+                "uid": actual[0],
+                "memory": MEMORY,
+                "tasks": TASKS,
+                "harness_memory": HARNESS_MEMORY,
+                "harness_tasks": HARNESS_TASKS,
+                "seconds": CASE_SECONDS,
+                "cleanup_seconds": CLEANUP_SECONDS,
+                "harness_seconds": HARNESS_SECONDS,
+                "http_bytes": description["http_bytes"],
+                "package_digest": description["digest"],
+                "harness_unit": "muli-native-" + uuid.uuid4().hex + ".service",
+            },
+        )
+        # No mounted inputs exist yet: this cannot traverse or chown source trees.
+        self.sudo("chown", "--no-dereference", "-R", f"{actual[0]}:{actual[1]}", str(self.volume))
+        for source, target in (
+            (runtime, self.volume / "input/python"),
+            (dependencies, self.volume / "input/deps"),
+        ):
+            self.sudo("mount", "--bind", str(source), str(target))
+            self.record_mount(target)
+            self.sudo("mount", "-o", "remount,bind,ro,nodev,nosuid", str(target))
+            current = self.mount(target)
+            if (
+                current is None
+                or not self.same_mount(current, self.receipt.mounts[-1])
+                or "ro" not in current["options"].split(",")
+            ):
+                raise FixtureError("native_mount_not_readonly")
+        unit = f"user@{actual[0]}.service"
+        self.sudo(
+            "systemctl",
+            "set-property",
+            "--runtime",
+            unit,
+            f"MemoryMax={MEMORY}",
+            "MemorySwapMax=0",
+            "CPUQuota=100%",
+            f"TasksMax={TASKS}",
+        )
+        self.sudo("systemctl", "start", f"user-runtime-dir@{actual[0]}.service", unit)
+        group = (
+            self.sudo("systemctl", "show", "--value", "-p", "ControlGroup", unit).decode().strip()
+        )
+        if not group.startswith("/") or Path(group).name != unit or ".." in Path(group).parts:
+            raise FixtureError("native_manager_group")
+        self.receipt.manager_group = group
+        self.save()
+        verify_kernel(CGROUP_ROOT / group.lstrip("/"), MEMORY, TASKS)
+        return description
+
+    def copy_slot(self, name: str, description: dict[str, Any]) -> None:
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        prefix = self.volume / name
+        site = prefix / "lib" / version / "site-packages"
+        site.mkdir(parents=True, mode=0o700)
+        (prefix / "bin").mkdir(mode=0o700)
+        base = Path(description["executable"]).relative_to(description["runtime"])
+        (prefix / "bin/python").symlink_to(self.volume / "input/python" / base)
+        (prefix / "pyvenv.cfg").write_text(
+            f"home = {self.volume / 'input/python' / base.parent}\ninclude-system-site-packages = false\n",
+            encoding="utf-8",
+        )
+        shutil.copytree(
+            description["package"],
+            site / "muli",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        (site / "fixture.pth").write_text(
+            "import sys; sys.dont_write_bytecode = True\n"
+            f"{self.volume / 'input/deps'}\n{self.volume}\nimport _muli_native_ci_hook\n",
+            encoding="utf-8",
+        )
+
+    def transient(self, fixture: dict[str, Any], mode: str, seconds: int) -> tuple[str, ...]:
+        unit = fixture["harness_unit"] if mode == "drive" else "muli-native-cleanup.service"
+        cleanup: tuple[str, ...] = ()
+        if mode == "cleanup":
+            if self.cleanup_deadline is None:
+                raise FixtureError("native_cleanup_deadline")
+            cleanup = (f"--setenv=MULI_NATIVE_CLEANUP_DEADLINE={self.cleanup_deadline}",)
+        return (
+            "systemd-run",
+            "--user",
+            "--wait",
+            "--pipe",
+            "--service-type=exec",
+            "--expand-environment=no",
+            f"--unit={unit}",
+            f"--property=MemoryMax={HARNESS_MEMORY}",
+            "--property=MemorySwapMax=0",
+            "--property=CPUQuota=100%",
+            f"--property=TasksMax={HARNESS_TASKS}",
+            f"--property=RuntimeMaxSec={seconds}",
+            "--property=TimeoutStopSec=2",
+            "--property=Restart=no",
+            "--property=KillMode=control-group",
+            "--property=SendSIGKILL=yes",
+            "--property=OOMPolicy=kill",
+            "--property=LimitCORE=0",
+            "--property=UMask=0077",
+            *cleanup,
+            str(self.volume / "a/bin/python"),
+            "-I",
+            str(self.volume / "managed_native_worker.py"),
+            mode,
+            str(self.volume),
+        )
+
+    def collect_result(self) -> dict[str, Any] | None:
+        # Only the fixture's fixed schema is exported. Never include subprocess
+        # logs, configuration, nonce or a complete transaction record.
+        reply = self.call(("sudo", "--non-interactive", "cat", str(self.volume / "result.json")))
+        if reply.code:
+            return None
+        result = fixture_result(reply.output)
+        write_json(self.root / "result.json", result)
+        return result
+
+    def execute(self) -> None:
+        self.prepare()
+        fixture = object_bytes(self.sudo("cat", str(self.volume / "fixture.json")))
+        write_json(
+            self.root / "result.json",
+            {
+                "completed": False,
+                "stage": "harness_start",
+                "code": "worker_not_observed",
+                "timeline": [],
+                "generations": [],
+                "resources": {},
+            },
+        )
+        try:
+            self.as_user(
+                *self.transient(fixture, "drive", HARNESS_SECONDS),
+                seconds=HARNESS_SECONDS + CLEANUP_SECONDS,
+            )
+        finally:
+            result = self.collect_result()
+        if result is None or result.get("completed") is not True:
+            raise FixtureError("native_case_failed")
+
+    @staticmethod
+    def same_mount(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+        # Remounting the same bind read-only may succeed before its response is
+        # observed. Options are not a new mount identity and cannot orphan it.
+        return all(actual[key] == expected[key] for key in expected if key != "options")
+
+    def cleanup(self) -> None:
+        if not self.root.exists():
+            return
+        self.cleanup_deadline = time.monotonic() + CLEANUP_SECONDS
+        root_info = self.root.lstat()
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or root_info.st_mode & 0o022
+        ):
+            raise FixtureError("native_root_owner")
+        self.receipt = Receipt.read(self.receipt_path)
+        receipt = self.receipt
+        if not receipt.user_created and (
+            account(receipt.user) is not None or private_group(receipt.user) is not None
+        ):
+            # A lost useradd response is not proof of ownership. Do not delete
+            # an account merely because its name appeared in our setup intent.
+            raise FixtureError("native_account_creation_unconfirmed")
+        if receipt.image is not None:
+            image = (self.root / "filesystem.ext4").lstat()
+            if (
+                not stat.S_ISREG(image.st_mode)
+                or image.st_uid != os.getuid()
+                or (image.st_dev, image.st_ino) != receipt.image
+                or image.st_size != IMAGE_BYTES
+            ):
+                raise FixtureError("native_image_changed")
+        failure = False
+        result: dict[str, Any] | None = None
+        if receipt.user_created and not receipt.user_removed:
+            uid, _ = self.current_account()  # Recheck mapping before any stop or deletion.
+            try:
+                fixture = object_bytes(self.sudo("cat", str(self.volume / "fixture.json")))
+                self.as_user(
+                    *self.transient(fixture, "cleanup", CLEANUP_SECONDS), seconds=CLEANUP_SECONDS
+                )
+            except (FixtureError, OSError, subprocess.SubprocessError):
+                failure = True
+            result = self.collect_result()
+            # This dedicated UID has no unrelated services; never touch runner's manager.
+            self.sudo(
+                "systemctl",
+                "stop",
+                f"user@{uid}.service",
+                f"user-runtime-dir@{uid}.service",
+                seconds=CLEANUP_SECONDS,
+            )
+            if receipt.manager_group:
+                group = CGROUP_ROOT / receipt.manager_group.lstrip("/")
+                if (
+                    group.exists()
+                    and "populated 0" not in (group / "cgroup.events").read_text().splitlines()
+                ):
+                    raise FixtureError("native_manager_not_empty")
+            self.sudo("systemctl", "revert", f"user@{uid}.service")
+        for value in list(reversed(receipt.mounts)):
+            target = Path(value["target"])
+            if target not in {
+                self.volume,
+                self.volume / "input/python",
+                self.volume / "input/deps",
+            }:
+                raise FixtureError("native_mount_receipt_invalid")
+            actual = self.mount(target)
+            if actual is not None:
+                if not self.same_mount(actual, value):
+                    raise FixtureError("native_mount_changed")
+                self.sudo("umount", str(target))
+                if self.mount(target) is not None:
+                    raise FixtureError("native_mount_not_released")
+            receipt.mounts.remove(value)
+            self.save()
+        if any(
+            self.mount(path) is not None
+            for path in (self.volume / "input/deps", self.volume / "input/python", self.volume)
+        ):
+            raise FixtureError("native_unrecorded_mount")
+        if receipt.user_created and not receipt.user_removed:
+            self.current_account()
+            self.sudo("userdel", receipt.user)
+            if account(receipt.user) is not None:
+                raise FixtureError("native_user_not_removed")
+            receipt.user_removed = True
+            self.save()
+        if receipt.user_created and not receipt.group_removed:
+            if account(receipt.user) is not None:
+                raise FixtureError("native_account_changed")
+            remaining_group = private_group(receipt.user)
+            if remaining_group is not None:
+                if remaining_group != (receipt.gid, ()):
+                    raise FixtureError("native_group_changed")
+                self.sudo("groupdel", receipt.user)
+                if private_group(receipt.user) is not None:
+                    raise FixtureError("native_group_not_removed")
+            receipt.group_removed = True
+            self.save()
+        # Keep bounded owner receipt/result as evidence; never recursively remove a mount tree.
+        if self.cleanup_deadline is None or time.monotonic() >= self.cleanup_deadline:
+            raise FixtureError("native_cleanup_deadline")
+        if result is not None:
+            result["resources"]["cleanup"] = "failed" if failure else "verified"
+            write_json(self.root / "result.json", result)
+        if failure:
+            raise FixtureError("native_service_cleanup_failed")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("run", "cleanup"))
+    parser.add_argument("root", type=Path)
+    args = parser.parse_args()
+    require_ci(args.root)
+    fixture = NativeCI(args.root)
+    try:
+        if args.mode == "cleanup":
+            fixture.cleanup()
+        else:
+            fixture.execute()
+        return 0
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print(
+            str(error) if isinstance(error, FixtureError) else "native_fixture_failed",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
