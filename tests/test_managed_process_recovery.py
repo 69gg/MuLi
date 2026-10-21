@@ -53,6 +53,111 @@ EARLY_SITE_HOOK = (
 )
 
 
+def service_site_hook(root: Path) -> str:
+    # The standalone launcher must not import the slot it is about to authenticate.
+    # It execs this exact CLI, whose separate interpreter initialization installs the hook.
+    expected = [
+        "-I",
+        "-m",
+        "muli",
+        "--config",
+        str(root / "config.json"),
+        "--data-dir",
+        str(root / "data"),
+        "--managed-root",
+        str(root / "journal"),
+        "serve",
+    ]
+    return (
+        "import os, sys\n"
+        "if (\n"
+        "    os.environ.get('MULI_RECOVERY_ROLE') in {'base','target'}\n"
+        f"    and sys.orig_argv[1:] == {expected!r}\n"
+        "):\n"
+        "    from managed_recovery_worker import install_hooks\n"
+        "    install_hooks()\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("invocation", "role", "expected"),
+    [
+        ("launcher", "target", False),
+        ("launcher", "base", False),
+        ("controller", "controller", False),
+        ("cli", "target", True),
+        ("cli", "base", True),
+        ("cli", "unknown", False),
+        ("different-root", "target", False),
+        ("without-isolation", "target", False),
+        ("other-command", "target", False),
+        ("extra-option", "target", False),
+    ],
+)
+def test_service_site_hook_imports_worker_only_for_the_actual_cli(
+    invocation: str, role: str, expected: bool
+) -> None:
+    root = Path("/fixture")
+    argv = [
+        str(root / (role if role in {"base", "target"} else "base") / "bin/python"),
+        "-I",
+        "-m",
+        "muli",
+        "--config",
+        str(root / "config.json"),
+        "--data-dir",
+        str(root / "data"),
+        "--managed-root",
+        str(root / "journal"),
+        "serve",
+    ]
+    if invocation == "launcher":
+        argv = [
+            str(root / "base/bin/python"),
+            "-I",
+            str(root / "journal/launcher.py"),
+            "--root",
+            str(root / "journal"),
+            "service",
+        ]
+    elif invocation == "controller":
+        argv = [argv[0], "-I", "/fixture/managed_recovery_worker.py", "controller", str(root)]
+    elif invocation == "different-root":
+        argv[5] = "/different/config.json"
+    elif invocation == "without-isolation":
+        argv.remove("-I")
+    elif invocation == "other-command":
+        argv[-1] = "doctor"
+    elif invocation == "extra-option":
+        argv.append("--version")
+    imports: list[str] = []
+    calls: list[bool] = []
+
+    def install_hooks() -> None:
+        calls.append(True)
+
+    modules = {
+        "os": SimpleNamespace(environ={"MULI_RECOVERY_ROLE": role}),
+        "sys": SimpleNamespace(orig_argv=argv),
+        "managed_recovery_worker": SimpleNamespace(install_hooks=install_hooks),
+    }
+
+    def imported(
+        name: str,
+        _globals: dict[str, object] | None = None,
+        _locals: dict[str, object] | None = None,
+        _fromlist: tuple[str, ...] = (),
+        _level: int = 0,
+    ) -> object:
+        imports.append(name)
+        return modules[name]
+
+    # Execute only the actual generated hook, with no real module imports or process effects.
+    exec(service_site_hook(root), {"__builtins__": {"__import__": imported}})
+    assert calls == ([True] if expected else [])
+    assert ("managed_recovery_worker" in imports) is expected
+
+
 def finish_service(process: subprocess.Popen[bytes]) -> None:
     # Only after all timed recovery proofs: cleanup has its own existing cap.
     process.terminate()
@@ -450,10 +555,7 @@ def slot(root: Path, name: str, repository: Path) -> SlotIdentity:
         encoding="utf-8",
     )
     (site / "_muli_managed_process_fixture_hook.py").write_text(
-        "import os\n"
-        "if os.environ.get('MULI_RECOVERY_ROLE') in {'base','target'}:\n"
-        "    from managed_recovery_worker import install_hooks\n"
-        "    install_hooks()\n",
+        service_site_hook(root),
         encoding="utf-8",
     )
     return register_local_slot(prefix, python, package)
