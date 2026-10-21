@@ -1,7 +1,7 @@
 # 2.30 Windows Skills 原生文件读取审查
 
-精确修复候选已通过全部八项 CI，并已签名推送 main 与版本标签；发行作业
-和构件核验尚待完成。本机 Linux 的通过结果不替代真实 Windows NTFS 行为。
+已正式发布。精确修复候选与 main 各八项 CI、发行十一项全部成功，签名
+标签和 PyPI/GitHub 构件元数据一致。本机 Linux 的通过结果不替代真实 Windows 行为。
 上一版 2.29 已按原签名提交发布，main 与发行作业全部成功，证据独立记录。
 
 ## 合同与审查
@@ -100,5 +100,20 @@ Windows 3.13 / 3.12 job 分别为 `119057340455` / `119057340588`，
 根审查独立核对精确 head、八项结果和 GPG 签名后，非强制原子推送 main
 及签名标签 `v2.30.0`。PR34 于 `2026-10-21T05:41:26Z` 按原提交合入；
 标签对象为 `40c2165a83fda38e413d8ee5e5fbaccc217b93c2`，指向同一提交。
-main 复验、发行作业和 PyPI/GitHub 构件元数据仍待独立核验，不能据标签
-存在宣称已上传。后续在线候选与 UIA 实现继续在独立分支推进。
+随后同一 head 的 [main CI 39550976316](https://github.com/69gg/MuLi/actions/runs/39550976316)
+attempt 1 八项全部成功，
+[Release 39550976895](https://github.com/69gg/MuLi/actions/runs/39550976895)
+attempt 1 十一项全部成功。根审查独立核对两个运行的 head 与全部结果。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.30.0) ID
+`419201674` 于 `2026-10-21T05:49:01Z` 发布，非 draft / prerelease；
+远端 main、标签目标均为上述提交，commit/tag 签名验证均 valid。
+PyPI 与 GitHub 两构件名称、大小、SHA256 完全一致，PyPI 均未撤回：
+
+| 构件 | 字节 | SHA256 |
+| --- | ---: | --- |
+| `muli_agent-2.30.0-py3-none-any.whl` | 739247 | `53ffb5e18a1bed56d25e4b1a8144bac303e9cfdaebcec194f983d176deb843b0` |
+| `muli_agent-2.30.0.tar.gz` | 3783728 | `379e68bd186c384a343679c8c70f84a63f5b0833ae9102e61de0329bbbbd7163` |
+
+只读取发布元数据，没有下载发行包。前两轮 Windows 失败保留；后续在线
+候选与 UIA 实现继续在独立分支推进，不因发布完成停止迭代。
