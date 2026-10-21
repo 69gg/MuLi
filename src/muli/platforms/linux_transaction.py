@@ -81,6 +81,17 @@ class CommandRunner(Protocol):
     ) -> Awaitable[dict[str, Any]]: ...
 
 
+class _KernelResourceLimits(Protocol):
+    @property
+    def memory_bytes(self) -> int: ...
+
+    @property
+    def cpu_percent(self) -> int: ...
+
+    @property
+    def tasks(self) -> int: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ProbeLimits:
     seconds: float = 5.0
@@ -423,7 +434,7 @@ class SystemdProbe:
                 raise ObservationError("invalid_unit_path")
             return True
 
-    def _kernel_limits(self, cgroup: str, limits: HelperLimits) -> tuple[object, ...]:
+    def _kernel_limits(self, cgroup: str, limits: _KernelResourceLimits) -> tuple[object, ...]:
         path = self.cgroup_root / cgroup.removeprefix("/")
         descriptor = _open_directory(path)
         try:
