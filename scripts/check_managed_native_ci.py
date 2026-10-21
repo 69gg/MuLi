@@ -95,6 +95,38 @@ def object_bytes(data: bytes) -> dict[str, Any]:
     return value
 
 
+def startup_facts(value: object, unit: str) -> bool:
+    """Accept only the exact harness's finite, typed exit observation."""
+    if (
+        not isinstance(value, dict)
+        or value.get("unit") != unit
+        or re.fullmatch(r"muli-native-[a-f0-9]{32}\.service", unit) is None
+        or value.get("code") not in ("observed", "unavailable")
+        or (
+            value.get("client_status") is not None
+            and (
+                type(value["client_status"]) is not int
+                or not -(2**31) <= value["client_status"] < 2**31
+            )
+        )
+    ):
+        return False
+    base = {"unit", "code", "client_status"}
+    if value["code"] == "unavailable":
+        return set(value) == base
+    strings = {"load_state", "active_state", "sub_state", "result"}
+    integers = {"exec_code", "exec_status", "pid"}
+    return (
+        set(value) == base | strings | integers
+        and all(
+            isinstance(value[key], str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", value[key]) is not None
+            for key in strings
+        )
+        and all(type(value[key]) is int and 0 <= value[key] < 2**31 for key in integers)
+    )
+
+
 def fixture_result(data: bytes) -> dict[str, Any]:
     """Export only finite fixture facts, never arbitrary worker JSON fields."""
     value = object_bytes(data)
@@ -158,7 +190,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             raise FixtureError("native_result_invalid")
     resources = value["resources"]
     if not isinstance(resources, dict) or not set(resources).issubset(
-        {"manager", "harness", "manager_peak", "initial", "cleanup"}
+        {"manager", "harness", "manager_peak", "initial", "cleanup", "startup"}
     ):
         raise FixtureError("native_result_invalid")
     for name, facts in resources.items():
@@ -183,6 +215,9 @@ def fixture_result(data: bytes) -> dict[str, Any]:
                 )
                 and all(type(facts[key]) is int and facts[key] >= 0 for key in ("device", "inode"))
             )
+        elif name == "startup":
+            valid = isinstance(facts, dict) and isinstance(facts.get("unit"), str)
+            valid = valid and startup_facts(facts, facts["unit"])
         elif name == "manager_peak":
             valid = isinstance(facts, str) and re.fullmatch(r"[0-9]{1,20}", facts) is not None
         else:
@@ -210,18 +245,22 @@ def write_json(path: Path, value: object) -> None:
         os.close(descriptor)
 
 
-def verify_kernel(path: Path, memory: int, tasks: int) -> None:
+def verify_kernel(path: Path, memory: int, tasks: int) -> dict[str, str]:
     """The same four kernel limits used by the local resource guard."""
+    observed: dict[str, str] = {}
     for name, maximum in (("memory.max", memory), ("memory.swap.max", 0), ("pids.max", tasks)):
         value = (path / name).read_text().strip()
         if not value.isdecimal() or int(value) > maximum or (maximum and int(value) == 0):
             raise FixtureError("native_kernel_limit")
+        observed[name] = value
     values = (path / "cpu.max").read_text().split()
     if len(values) != 2 or not all(value.isdecimal() for value in values):
         raise FixtureError("native_kernel_cpu")
     quota, period = map(int, values)
     if not 0 < quota <= period:
         raise FixtureError("native_kernel_cpu")
+    observed["cpu.max"] = " ".join(values)
+    return observed
 
 
 def require_ci(root: Path) -> None:
@@ -335,6 +374,7 @@ class NativeCI:
         self.receipt_path = root / "receipt.json"
         self.receipt: Receipt | None = None
         self.cleanup_deadline: float | None = None
+        self.manager_limits: dict[str, str] = {}
 
     def call(self, argv: Sequence[str], *, seconds: float = 5) -> Reply:
         if self.cleanup_deadline is not None:
@@ -373,10 +413,12 @@ class NativeCI:
             raise FixtureError("native_account_changed")
         return receipt.uid, receipt.gid
 
-    def as_user(self, *argv: str, seconds: float = 5) -> bytes:
+    def user_arguments(self, *argv: str) -> tuple[str, ...]:
         uid, _ = self.current_account()
         assert self.receipt is not None
-        return self.sudo(
+        return (
+            "sudo",
+            "--non-interactive",
             "--user",
             self.receipt.user,
             "--",
@@ -391,8 +433,10 @@ class NativeCI:
             f"XDG_RUNTIME_DIR=/run/user/{uid}",
             f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
             *argv,
-            seconds=seconds,
         )
+
+    def as_user(self, *argv: str, seconds: float = 5) -> bytes:
+        return self.checked(self.user_arguments(*argv), seconds=seconds)
 
     def mount(self, path: Path) -> dict[str, Any] | None:
         result = self.call(
@@ -560,7 +604,7 @@ class NativeCI:
             raise FixtureError("native_manager_group")
         self.receipt.manager_group = group
         self.save()
-        verify_kernel(CGROUP_ROOT / group.lstrip("/"), MEMORY, TASKS)
+        self.manager_limits = verify_kernel(CGROUP_ROOT / group.lstrip("/"), MEMORY, TASKS)
         return description
 
     def copy_slot(self, name: str, description: dict[str, Any]) -> None:
@@ -631,6 +675,47 @@ class NativeCI:
         write_json(self.root / "result.json", result)
         return result
 
+    def observe_startup(
+        self, fixture: dict[str, Any], *, deadline: float, client_status: int | None
+    ) -> None:
+        """Use runner's working Python, not the failed retained interpreter."""
+        unit = fixture["harness_unit"]
+        facts: dict[str, Any] = {
+            "unit": unit,
+            "client_status": client_status,
+            "code": "unavailable",
+        }
+        try:
+            uid, _ = self.current_account()
+            assert self.receipt is not None
+            end = min(deadline, time.monotonic() + CLEANUP_SECONDS)
+            if end <= time.monotonic():
+                raise FixtureError("native_diagnostic_deadline")
+            worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+            reply = self.call(
+                (
+                    sys.executable,
+                    "-I",
+                    str(worker),
+                    "diagnose",
+                    self.receipt.user,
+                    str(uid),
+                    str(self.home),
+                    unit,
+                    str(end),
+                ),
+                seconds=end - time.monotonic(),
+            )
+            if reply.code == 0:
+                observed = {**object_bytes(reply.output), "client_status": client_status}
+                if startup_facts(observed, unit):
+                    facts = observed
+        except (ValueError, OSError, subprocess.SubprocessError):
+            pass  # Diagnostic failure never authorizes another launch or hides the first error.
+        result = fixture_result((self.root / "result.json").read_bytes())
+        result["resources"]["startup"] = facts
+        write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
+
     def execute(self) -> None:
         self.prepare()
         fixture = object_bytes(self.sudo("cat", str(self.volume / "fixture.json")))
@@ -642,16 +727,23 @@ class NativeCI:
                 "code": "worker_not_observed",
                 "timeline": [],
                 "generations": [],
-                "resources": {},
+                "resources": {"manager": self.manager_limits},
             },
         )
+        deadline = time.monotonic() + HARNESS_SECONDS + CLEANUP_SECONDS
+        client_status: int | None = None
         try:
-            self.as_user(
-                *self.transient(fixture, "drive", HARNESS_SECONDS),
-                seconds=HARNESS_SECONDS + CLEANUP_SECONDS,
+            reply = self.call(
+                self.user_arguments(*self.transient(fixture, "drive", HARNESS_SECONDS)),
+                seconds=deadline - time.monotonic(),
             )
+            client_status = reply.code
+            if client_status:
+                raise FixtureError("native_command_failed")
         finally:
             result = self.collect_result()
+            if result is None:
+                self.observe_startup(fixture, deadline=deadline, client_status=client_status)
         if result is None or result.get("completed") is not True:
             raise FixtureError("native_case_failed")
 

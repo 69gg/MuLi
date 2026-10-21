@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，50 项纯 fixture 与限定静态检查已通过；真实托管 runner 尚未执行。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含启动诊断的 61 项纯 fixture 与限定静态检查已通过；真实托管 runner 首轮在 harness 启动阶段失败，尚未执行三事务。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -79,6 +79,10 @@ setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，
 
 有限证据包括实际资源属性与 kernel 限额、单元状态/InvocationID、固定错误码、各请求的最终状态、receipt 次数及只含合成资料的 DB 断言。协调者只导出严格白名单结构与有限标量；自定义 `NativeError` 仅保存格式受限的 `native_*` 固定码，其他异常只记类型，不输出原异常正文。worker 无法导入时也保留协调者预写的 `harness_start/worker_not_observed` 证据。清理不重写功能 timeline 或清空三代历史；仅全部清理证明完成且仍在期限内才单独标记 `resources.cleanup=verified`。默认不输出配置、nonce、Cookie、密码、完整 journal 或任意业务正文。取消或外层硬杀后走独立 always 清理；VM 最终销毁不是已经成功清理的证据。
 
+若启动客户端返回失败且 worker 尚未产生结果，协调者使用 **runner 自己已有的解释器与源 worker** 做一次只读诊断，不再依赖出错的 retained Python。只有其中的 `busctl` 经 `sudo` 切到本次 receipt 已确认、并重新通过 passwd 核对 UID/HOME 的专用用户；环境明确指定 `/run/user/UID/bus`，不读取 runner 的 user manager。诊断只对本次生成的精确 `muli-native-32hex.service`，复用 `SystemdProbe` 的 typed D-Bus 读取 `Id/LoadState/ActiveState/SubState/Result/ExecMainCode/ExecMainStatus/MainPID`，不依赖启动成功才会存在的完整 process identity。结果经固定字段/类型/长度白名单进入 `resources.startup`，与客户端退出码、准备时已核的聚合 kernel 限额一同保留；查询失败只记 `unavailable`，不据此猜测故障或重新启动服务，也不泛扫 journal 或保存原 stderr。真实 worker 已留下的结果始终优先，不被此诊断替换。
+
+这次诊断至多消耗现有 5 秒命令预算，并且必须落在本次原有 `90+5` 秒启动观察总期限的剩余时间内；启动观察已耗尽就不发诊断命令，不增加功能 60 秒、harness 90 秒或清理 5 秒的上限。Ubuntu 24.04 对应的 [systemd v255 参数实现](https://github.com/systemd/systemd/blob/v255/src/run/run.c)支持当前 `--wait --pipe --service-type=exec --expand-environment=no`；[同版本手册](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)说明关闭环境展开的选项从 v254 起存在。参数支持不等于本次实际 exec 成功；retained `bin/python` 与 `pyvenv.cfg.home` 的源 runtime 相对关系也由纯 fixture 明确核验，实际权限仍由远端运行证明。
+
 ## 实施与验收顺序
 
 设计已由主 agent 与独立 reviewer 复审后实现上述 CI job、两个脚本及纯 fixture 回归。第一轮本机只允许受守卫的纯 fixture 单位测试及静态检查，不运行真实 harness，不创建本机用户、挂载或服务。真实效果只在明确的托管 CI job 内执行，失败读取精确有限日志，不能通过扩大期限、跳过或放宽生产 gate 处理。
@@ -87,7 +91,15 @@ setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，
 
 本机验收：`tests/test_managed_native_ci.py` 共 50 个唯一 case 通过，所有原生 subprocess 入口在该模块由 autouse fixture 硬拒绝。先运行的 44 例为 0.34 秒，再新增末次 receipt 持久化耗尽期限 1 例为 0.06 秒，以及只读 SQLite 锁/固定诊断码 5 例为 0.12 秒；强化已有清理期限例后单跑的 1 例属于前 44 例，不重复计数。测试最高 71.3 MiB、swap 0。三份 Python 文件 Ruff/format 与两脚本 strict mypy 通过；首轮类型检查的局部注解/分支收窄问题已修，类型检查最高 223 MiB，最终尾轮 156.4 MiB，swap 0。每条检查均经 root 的 `check_local.py`、30 秒单次守卫串行执行。
 
-纯 fixture 同时覆盖：handoff 后 runner 不能直接 stat 私有卷、useradd 已创建但响应失败时不越权删除、只读 SQLite 遇真实临时库排他锁零等待失败、固定服务 listing 与严格 helper 名区分、清理最后一步超时不覆盖功能成功证据，以及任意异常正文/非白名单字段不进入导出。静态复审发现并修复的接口、权限与清理缺口没有当成真实托管环境已经运行；实际 runner 的 UID 导入权限、controller 委派、容量、60 秒三事务和实际卸载仍待新增 job 首次验收。
+纯 fixture 同时覆盖：handoff 后 runner 不能直接 stat 私有卷、useradd 已创建但响应失败时不越权删除、只读 SQLite 遇真实临时库排他锁零等待失败、固定服务 listing 与严格 helper 名区分、清理最后一步超时不覆盖功能成功证据，以及任意异常正文/非白名单字段不进入导出。静态复审发现并修复的接口、权限与清理缺口没有当成真实托管环境已经运行；实际 runner 的 UID 导入、60 秒三事务和服务正常收尾仍待验收。首轮实际账户、组与已记录挂载的回收事实见下一段，不能等同于该完整验收。
+
+## 首轮远端结果与诊断补片
+
+PR [#37](https://github.com/69gg/MuLi/pull/37) 的首轮精确候选为签名提交 `54a91d6dec6ce6a348280d3cb159f7a1f5a01865`，CI [39561110110](https://github.com/69gg/MuLi/actions/runs/39561110110) 九项中七项成功、两项失败。macOS 3.13 的独立 AX 期限夹具失败另行处理；原生 [job 119092322076](https://github.com/69gg/MuLi/actions/runs/39561110110/job/119092322076) 在 `07:19:06Z` 报 `native_command_failed`，随后 always 清理仍报 `native_service_cleanup_failed`，没有将任一步记为成功。
+
+该轮 490 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39561110110/artifacts/12326704803)中的 `result.json` 是 `completed=false/stage=harness_start/code=worker_not_observed`，timeline 与 generations 均为空，即 **0 个事务**；没有 retained 导入或业务阶段的成功证据。`receipt.json` 记录该次独有用户 `muli-ci-f9911e829db9`、UID 999/GID 987 已分别 `user_removed=true/group_removed=true`，`mounts=[]`。这证明对应账户、组和已记录挂载已回收，不能把它当作服务正常收尾或三事务已验收。原始失败没有单元退出状态，不能直接归因于 DAC、解释器导入或 systemd 参数；上述只读启动诊断补片用于下一精确候选取得这项缺失事实，不重试旧 head。
+
+诊断补片新增 11 项纯 fixture，覆盖 typed 退出状态、精确 UID/bus、错误 unit/账号/期限前拒绝、原 envelope 不续期、原 stderr 和额外字段不导出、真实 worker 结果优先、CLI 只读分派与 retained 路径/启动参数关系。整文件 61 个唯一 case（原 50 加新 11）通过，0.34 秒、服务 0.879 秒、峰值 72.4 MiB/swap 0。首轮 typed 回归发现 `ProbeLimits` 默认 command 输出上限为 64 KiB，与此 fixture 32 KiB 合同不符，已显式使用原 `MAX_BYTES` 缩回，再通过相关 13 例与完整 61 例；13 例与 61 例重叠不重复计数。三份 Python 文件 Ruff/format 和两脚本 strict mypy 通过，mypy 峰值 157.5 MiB/swap 0。所有命令仍经 root 绝对路径守卫逐条 30 秒串行执行，无本机真实 harness。这是诊断链的纯回归证据，不计为远端启动已经修复。
 
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 

@@ -87,6 +87,29 @@ class Commands:
         self.calls.append(values)
         if values[-1] == "describe":
             return ci.Reply(0, json.dumps(self.description).encode())
+        if len(values) == 9 and values[3] == "diagnose":
+            assert values[:2] == (sys.executable, "-I")
+            assert values[4:7] == (
+                next(iter(self.accounts)),
+                str(self.uid),
+                self.accounts[values[4]][2],
+            )
+            return ci.Reply(
+                0,
+                json.dumps(
+                    {
+                        "unit": values[-2],
+                        "code": "observed",
+                        "load_state": "loaded",
+                        "active_state": "failed",
+                        "sub_state": "failed",
+                        "result": "exit-code",
+                        "exec_code": 1,
+                        "exec_status": 203,
+                        "pid": 0,
+                    }
+                ).encode(),
+            )
         if values[0] == "findmnt":
             row = self.mounts.get(values[values.index("--mountpoint") + 1])
             return (
@@ -389,6 +412,7 @@ def test_failed_case_exports_bounded_phase_evidence_before_cleanup(
     assert result["completed"] is False and result["timeline"][0]["phase"] == "verifying"
     assert len((native.root / "result.json").read_bytes()) <= ci.OUTPUT_BYTES
     assert set(result) == {"completed", "stage", "code", "timeline", "generations", "resources"}
+    assert not any("diagnose" in args for args in commands.calls)
 
 
 @pytest.mark.parametrize(
@@ -763,7 +787,8 @@ def test_worker_import_failure_still_leaves_coordinator_phase_evidence(
 
     def fail(argv: Any, *, seconds: float = 5) -> Any:
         if "systemd-run" in argv and argv[-2] == "drive":
-            return ci.Reply(1)
+            commands.calls.append(tuple(argv))
+            return ci.Reply(1, b"private command stderr must not be exported")
         return commands(argv, seconds=seconds)
 
     native.run = fail
@@ -772,6 +797,194 @@ def test_worker_import_failure_still_leaves_coordinator_phase_evidence(
     saved = ci.fixture_result((native.root / "result.json").read_bytes())
     assert saved["completed"] is False and saved["stage"] == "harness_start"
     assert saved["code"] == "worker_not_observed"
+    facts = saved["resources"]["startup"]
+    assert facts["client_status"] == 1 and facts["exec_status"] == 203
+    assert facts["exec_code"] == 1 and facts["active_state"] == "failed"
+    assert saved["resources"]["manager"]["memory.max"] == str(ci.MEMORY)
+    assert saved["generations"] == []
+    assert b"private" not in (native.root / "result.json").read_bytes()
+    launched = next(args for args in commands.calls if "systemd-run" in args)
+    diagnostic = next(args for args in commands.calls if "diagnose" in args)
+    unit = next(arg.removeprefix("--unit=") for arg in launched if arg.startswith("--unit="))
+    assert facts["unit"] == unit == diagnostic[-2]
+    assert not diagnostic[0].startswith(str(native.volume))  # Runner's trusted interpreter.
+    assert diagnostic[2] == str(SCRIPT.parents[1] / "tests/helpers/managed_native_worker.py")
+    assert len([args for args in commands.calls if "systemd-run" in args]) == 1
+
+
+def test_retained_python_layout_and_systemd_arguments_remain_exact(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    config = worker.read_json(native.volume / "fixture.json")
+    argv = native.transient(config, "drive", ci.HARNESS_SECONDS)
+    assert "--wait" in argv and "--pipe" in argv and "--service-type=exec" in argv
+    assert "--expand-environment=no" in argv and "--property=Restart=no" in argv
+    assert f"--property=MemoryMax={ci.HARNESS_MEMORY}" in argv
+    assert "--property=MemorySwapMax=0" in argv
+    assert f"--property=RuntimeMaxSec={ci.HARNESS_SECONDS}" in argv
+    assert argv[-5:] == (
+        str(native.volume / "a/bin/python"),
+        "-I",
+        str(native.volume / "managed_native_worker.py"),
+        "drive",
+        str(native.volume),
+    )
+    original = Path(commands.description["executable"]).relative_to(commands.description["runtime"])
+    assert (native.volume / "a/bin/python").readlink() == native.volume / "input/python" / original
+    assert (native.volume / "a/pyvenv.cfg").read_text() == (
+        f"home = {native.volume / 'input/python' / original.parent}\n"
+        "include-system-site-packages = false\n"
+    )
+
+
+@pytest.mark.parametrize("change", ["body", "unit", "extra", "type"])
+def test_untrusted_startup_diagnostic_cannot_replace_the_original_failure(
+    fixture: tuple[Any, Commands], change: str
+) -> None:
+    native, commands = fixture
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        if "systemd-run" in argv and argv[-2] == "drive":
+            return ci.Reply(1)
+        reply = commands(argv, seconds=seconds)
+        if "diagnose" not in argv:
+            return reply
+        if change == "body":
+            return ci.Reply(1, b"private diagnostic body")
+        value = json.loads(reply.output)
+        if change == "unit":
+            value["unit"] = "muli-native-" + "f" * 32 + ".service"
+        elif change == "extra":
+            value["stderr"] = "private diagnostic body"
+        else:
+            value["exec_status"] = True
+        return ci.Reply(0, json.dumps(value).encode())
+
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="command_failed"):
+        native.execute()
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert saved["code"] == "worker_not_observed" and saved["generations"] == []
+    assert saved["resources"]["startup"]["code"] == "unavailable"
+    assert b"private" not in (native.root / "result.json").read_bytes()
+
+
+def test_startup_diagnostic_cannot_extend_the_original_harness_deadline(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    clock = 100.0
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal clock
+        if "systemd-run" in argv and argv[-2] == "drive":
+            clock += ci.HARNESS_SECONDS + ci.CLEANUP_SECONDS
+            return ci.Reply(1)
+        return commands(argv, seconds=seconds)
+
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="command_failed"):
+        native.execute()
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert saved["resources"]["startup"]["code"] == "unavailable"
+    assert not any("diagnose" in args for args in commands.calls)
+
+
+async def test_diagnostic_uses_typed_probe_and_only_the_verified_uid_bus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pwd
+    from types import SimpleNamespace
+
+    from muli import process
+
+    user, uid, unit = "muli-ci-" + "a" * 12, 23145, "muli-native-" + "b" * 32 + ".service"
+    home = tmp_path / "volume/home"
+    path = "/org/freedesktop/systemd1/unit/fixture"
+    calls: list[list[str]] = []
+    rows = {
+        "Id": ("s", unit),
+        "LoadState": ("s", "loaded"),
+        "ActiveState": ("s", "failed"),
+        "SubState": ("s", "failed"),
+        "Result": ("s", "exit-code"),
+        "ExecMainCode": ("i", 1),
+        "ExecMainStatus": ("i", 203),
+        "MainPID": ("u", 0),
+    }
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        assert argv[:7] == ["sudo", "--non-interactive", "--user", user, "--", "env", "-i"]
+        assert f"HOME={home}" in argv and f"XDG_RUNTIME_DIR=/run/user/{uid}" in argv
+        assert f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus" in argv
+        assert 0 < timeout <= ci.CLEANUP_SECONDS and limit == ci.OUTPUT_BYTES
+        assert merge_stderr is False and "--auto-start=no" in argv
+        calls.append(argv)
+        if "GetUnit" in argv:
+            assert argv[-1] == unit
+            output = json.dumps({"type": "o", "data": [path]})
+        else:
+            index = argv.index("get-property")
+            assert argv[index + 2] == path
+            output = "\n".join(
+                json.dumps({"type": rows[name][0], "data": rows[name][1]})
+                for name in argv[index + 4 :]
+            )
+        return {"exit_code": 0, "output": output, "stderr": "not exported"}
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+    monkeypatch.setattr(process, "run_process", query)
+    value = await worker.diagnose(user, uid, home, unit, worker.time.monotonic() + 5)
+    assert value["unit"] == unit and value["exec_status"] == 203 and len(calls) == 3
+    assert ci.startup_facts({**value, "client_status": 1}, unit)
+
+
+@pytest.mark.parametrize("change", ["identity", "unit", "deadline"])
+async def test_diagnostic_identity_and_deadline_reject_before_any_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    import pwd
+    from types import SimpleNamespace
+
+    user, uid, unit = "muli-ci-" + "a" * 12, 23145, "muli-native-" + "b" * 32 + ".service"
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=uid + (change == "identity"), pw_dir=str(home)),
+    )
+    if change == "unit":
+        unit = "muli.service"
+    deadline = worker.time.monotonic() + (0 if change == "deadline" else 5)
+    with pytest.raises(worker.NativeError):
+        await worker.diagnose(user, uid, home, unit, deadline)
+
+
+def test_diagnostic_cli_dispatch_is_readonly_and_uses_exact_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed: list[tuple[str, int, Path, str, float]] = []
+    unit = "muli-native-" + "b" * 32 + ".service"
+    user = "muli-ci-" + "a" * 12
+
+    async def diagnose(
+        name: str, uid: int, home: Path, target: str, deadline: float
+    ) -> dict[str, Any]:
+        observed.append((name, uid, home, target, deadline))
+        return {"unit": target, "code": "unavailable"}
+
+    monkeypatch.setattr(worker, "diagnose", diagnose)
+    monkeypatch.setattr(
+        sys, "argv", ["worker", "diagnose", user, "23145", str(tmp_path), unit, "9"]
+    )
+    assert worker.main() == 0
+    assert observed == [(user, 23145, tmp_path, unit, 9)]
+    assert json.loads(capsys.readouterr().out) == {"unit": unit, "code": "unavailable"}
 
 
 @pytest.mark.parametrize(

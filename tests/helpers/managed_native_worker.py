@@ -135,6 +135,101 @@ async def service_exists(probe: SystemdProbe) -> bool:
         return True
 
 
+async def observe_harness(probe: SystemdProbe, unit: str) -> dict[str, Any]:
+    """Read the exact failed harness through the product's typed D-Bus parser."""
+    require(
+        re.fullmatch(r"muli-native-[a-f0-9]{32}\.service", unit) is not None,
+        "native_fixture_unit",
+    )
+    path = await probe._unit_path(unit)
+    state = await probe._properties(
+        path,
+        "Unit",
+        (("Id", "s"), ("LoadState", "s"), ("ActiveState", "s"), ("SubState", "s")),
+    )
+    service = await probe._properties(
+        path,
+        "Service",
+        (("Result", "s"), ("ExecMainCode", "i"), ("ExecMainStatus", "i"), ("MainPID", "u")),
+    )
+    require(state["Id"] == unit, "native_fixture_unit")
+    strings = {
+        "load_state": state["LoadState"],
+        "active_state": state["ActiveState"],
+        "sub_state": state["SubState"],
+        "result": service["Result"],
+    }
+    integers = {
+        "exec_code": service["ExecMainCode"],
+        "exec_status": service["ExecMainStatus"],
+        "pid": service["MainPID"],
+    }
+    require(
+        all(
+            isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", value) is not None
+            for value in strings.values()
+        )
+        and all(type(value) is int and 0 <= value < 2**31 for value in integers.values()),
+        "native_diagnostic_invalid",
+    )
+    return {"unit": unit, "code": "observed", **strings, **integers}
+
+
+async def diagnose(user: str, uid: int, home: Path, unit: str, deadline: float) -> dict[str, Any]:
+    """Runner owns this interpreter; only busctl changes to the verified UID."""
+    import pwd
+
+    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+    from muli.process import run_process
+
+    require(
+        re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None
+        and uid > 0
+        and home.is_absolute()
+        and re.fullmatch(r"muli-native-[a-f0-9]{32}\.service", unit) is not None,
+        "native_diagnostic_identity",
+    )
+    account = pwd.getpwnam(user)
+    require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_diagnostic_identity")
+    require(remaining(deadline) <= CLEANUP_SECONDS, "native_diagnostic_deadline")
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        require(argv[0] == "busctl" and not merge_stderr, "native_diagnostic_command")
+        return await run_process(
+            [
+                "sudo",
+                "--non-interactive",
+                "--user",
+                user,
+                "--",
+                "env",
+                "-i",
+                f"HOME={home}",
+                f"USER={user}",
+                f"LOGNAME={user}",
+                "PATH=/usr/bin:/bin",
+                "LANG=C.UTF-8",
+                "LC_ALL=C.UTF-8",
+                f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                *argv,
+            ],
+            timeout=min(timeout, remaining(deadline)),
+            limit=limit,
+            merge_stderr=False,
+        )
+
+    async with asyncio.timeout(remaining(deadline)):
+        return await observe_harness(
+            SystemdProbe(
+                runner=query, limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES)
+            ),
+            unit,
+        )
+
+
 def fixture(root: Path) -> dict[str, Any]:
     require(root.is_absolute() and root.resolve(strict=True) == root, "native_root_invalid")
     value = read_json(root / "fixture.json")
@@ -871,6 +966,14 @@ async def run(mode: str, root: Path) -> int:
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "describe":
         print(json.dumps(describe(), sort_keys=True, separators=(",", ":")))
+        return 0
+    if len(sys.argv) == 7 and sys.argv[1] == "diagnose":
+        value = asyncio.run(
+            diagnose(
+                sys.argv[2], int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5], float(sys.argv[6])
+            )
+        )
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0
     require(len(sys.argv) == 3 and sys.argv[1] in {"drive", "cleanup"}, "native_arguments")
     return asyncio.run(run(sys.argv[1], Path(sys.argv[2])))
