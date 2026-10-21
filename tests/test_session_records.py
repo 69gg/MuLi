@@ -7,7 +7,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -280,6 +280,34 @@ def test_invalid_cursor_encoding_is_a_domain_error(store: Store, cursor: Any) ->
     with pytest.raises(EvidenceError) as caught:
         SessionRecords(store).read(cursor=cursor, max_output_chars=1000)
     assert caught.value.code == "record_cursor_invalid"
+
+
+def test_oversized_cursor_is_rejected_before_decoding_or_querying(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> NoReturn:
+        raise AssertionError("oversized cursor must not reach decoder or record query")
+
+    monkeypatch.setattr(base64, "b64decode", forbidden)
+    monkeypatch.setattr(store, "session_record_rows", forbidden)
+    with pytest.raises(EvidenceError) as caught:
+        SessionRecords(store).read(cursor="A" * 1001, max_output_chars=1000)
+    assert caught.value.code == "output_budget"
+
+
+def test_emitted_cursor_survives_original_budget_after_temporary_shrink(store: Store) -> None:
+    save(store, "界" * 320, 2)
+    save(store, "older", 1)
+    reader = SessionRecords(store)
+    page = reader.read(limit=1, max_output_chars=4000)
+    cursor = page["next_cursor"]
+    assert isinstance(cursor, str) and len(cursor) > 1000
+    with pytest.raises(EvidenceError) as caught:
+        reader.read(cursor=cursor, max_output_chars=1000)
+    assert caught.value.code == "output_budget"
+    following = reader.read(cursor=cursor, max_output_chars=4000)
+    assert [item["id"] for item in following["items"]] == ["older"]
+    assert following["has_more"] is False
 
 
 @pytest.mark.parametrize(

@@ -23,11 +23,15 @@ class SessionRecords:
     def __init__(self, store: Store) -> None:
         self.store = store
 
-    def _cursor(self, token: str | None, query: str) -> tuple[int | float, str] | None:
+    def _cursor(
+        self, token: str | None, query: str, max_output_chars: int
+    ) -> tuple[int | float, str] | None:
         if token is None:
             return None
         if not isinstance(token, str) or not token:
             raise EvidenceError("record_cursor_invalid", "记录目录游标无效；请从首页重新读取")
+        if len(token) > max_output_chars:
+            raise EvidenceError("output_budget", "记录目录游标超过当前预算；请提高预算或从首页重读")
         try:
             payload = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
             if not isinstance(payload, list) or len(payload) != 5:
@@ -117,7 +121,7 @@ class SessionRecords:
         if type(limit) is not int or not 1 <= limit <= _MAX_PAGE_ITEMS:
             raise EvidenceError("record_limit_invalid", "记录目录每页数量必须是 1–100 的整数")
         validate_integer(max_output_chars, "max_output_chars", minimum=1)
-        after = self._cursor(cursor, query)
+        after = self._cursor(cursor, query, max_output_chars)
         result: dict[str, Any] = {"items": [], "next_cursor": None, "has_more": False}
         if json_size(result) > max_output_chars:
             raise EvidenceError("output_budget", "记录目录页元数据超过输出预算")
