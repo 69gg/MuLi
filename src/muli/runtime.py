@@ -30,6 +30,7 @@ from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role
+from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -864,6 +865,10 @@ class Runtime:
             "pending_approvals": approvals,
         }
 
+    def _mcp_receive_failed(self, code: str, occurrence_id: str) -> None:
+        if not self._closing:
+            self.system_events.mcp_receive_failed(code, occurrence_id)
+
     def configure(self) -> None:
         settings = self.config.settings
         self.capacity = asyncio.Semaphore(settings.limits.max_parallel_agents)
@@ -881,7 +886,9 @@ class Runtime:
         self.computer = Computer(
             settings, owner=self._computer_owner, dispatch_guard=self._computer_dispatch_guard
         )
+        self.mcp_policy = ReceivePolicyStore(self.store)
         self.mcp = MCPManager(settings.mcp, max_output_chars=settings.limits.max_output_chars)
+        self.mcp.set_receive_failed_callback(self._mcp_receive_failed)
         self.notifications = DesktopNotifier(
             self.store, self.bus, settings.notifications, admission=self.maintenance.admission
         )

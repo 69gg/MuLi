@@ -120,6 +120,18 @@ host，合计 **52 passed、3 原 native Linux skipped**，0.22 秒、峰值 58.
 目标 PID、provider 和密码 Name 关联仍须由后续精确 Windows CI 证明。
 失败旧 run 已闭合，不盲重跑。
 
+## 最终 Windows 验收
+
+精确签名 `1cf078dbd31c4f71054328de9cf02a46f2805d8f` 的候选
+`39576755760`、main `39578053330` 和发行 `39578052294` 均为 attempt 1，
+各自 Windows 3.12/3.13 作业全部成功，原三个 native 用例、严格 PID/标题、
+12 秒、4 KiB 和直接子进程清理没有放宽。候选共 8/8、main 8/8、发行 11/11，
+完整发行及两包元数据见[2.33 审查](review-v2.33.md#精确发行验收)。
+
+这证明本片在这些 GitHub-hosted Windows 环境中的实际目标窗口、provider 与密码
+Name 关联通过，不推断任意机器的启动上界，也不反向认定旧 PowerShell 冷启动的
+内部原因。本机仍未创建桌面窗口；首个失败矩阵保持原记录。
+
 ## 接口依据
 
 先经 Context7 查询 Win32 API，再对照微软逐项原文补足结构与返回值：

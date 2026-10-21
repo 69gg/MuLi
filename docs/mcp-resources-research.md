@@ -1,7 +1,8 @@
 # MCP 资源能力的后续调研
 
-状态：研究，未实现，也未连接外部服务器、安装依赖或下载资源。
-现有产品只接入 MCP 工具；活跃任务换代在独立实现中验收。本文件不扩大那一片的范围。
+状态：资源能力仍未实现，也未连接外部服务器、安装依赖或下载资源。本文件保留初次调研时的源码与边界；活跃任务换代已完成，HTTP/SSE 接收保护已在独立切片提交，实际发行证据仍归各片记录。
+
+已形成[普通资源按需列表/读取设计](mcp-resources-design.md)：首片拟限已启用且有接收 guard 的 HTTP/SSE，完整有界目录加有限内存分页，只读取已发现引用的完整短文本。设计方向经根静态评审认可；先等待统一通知片整合，再从其基线实施，不将本研究或设计当成功能交付。
 
 ## 已核实的差异
 
@@ -44,6 +45,10 @@ Context7 当前检索返回了 SDK v2/main 文档，不能据此给此安装声�
   的 `list_resources` 与 `list_resource_templates` 支持
   `params=PaginatedRequestParams(cursor=...)`；旧 cursor 位置参数已标记弃用。
   可复用 MuLi 工具目录适配器的分页形态，而不是依赖 FastMCP 高层自动取完目录。
+  固定版本 `types.py` 的 `Cursor=str`、`nextCursor: Cursor | None` 没有非空约束；
+  [分页协议](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination)
+  要求游标不透明、原样回传。空字符串不能当作结束或坏格式，缺失/None 才结束，
+  重复空串仍须受停滞与原页数预算保护。工具目录的独立窄修与验证见[设计附记](mcp-resources-design.md#工具目录空游标的独立兼容修复)，不表示资源能力已经交付。
 - [Streamable HTTP](https://github.com/modelcontextprotocol/python-sdk/blob/v1.21.0/src/mcp/client/streamable_http.py)
   的 JSON 路径先 `response.aread()` 再交给 Pydantic，SSE 路径先取得完整事件数据再解析。
   此版本暴露 `httpx_client_factory`，但该入口本身不是字节限制；对 POST、后台 GET 和
@@ -64,4 +69,4 @@ Context7 当前检索返回了 SDK v2/main 文档，不能据此给此安装声�
 - 假 session 和已有可选依赖的进程内协议测试先证明分页停滞、重复 URI、超预算、换代、
   取消、文本/blob 区分与外部权限；任何真实协议验证均不访问用户服务器或自动下载内容。
 
-这是待选方案与验证门槛，不是后续发行承诺；优先完成当前热重载和 Linux 原生恢复验收。
+以上是初次调研提出的门槛，不是后续发行承诺。HTTP/SSE 接收接缝的后续实现与独立验证见[接收预算设计](mcp-wire-budget-design.md)，stdio 的未终止行边界仍未闭合；资源功能的实际实施/验收按新设计单独进行。Linux 原生恢复验收保持独立。

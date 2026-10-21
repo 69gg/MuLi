@@ -1,9 +1,9 @@
 # 2.33 MCP 活跃换代审查
 
-状态：MCP 实现、Windows 测试目标调整与版本整合离线检查通过；首次精确候选 CI
-六项成功、两项 Windows 因新夹具的启动器 PID 不一致失败，修复与再次验收中，未发行。
-Windows 真 provider 与 Linux 托管服务原生验收分别独立推进；它们尚未完成的
-结果不能由此处的离线检查代替。2.32.1 已发布标签保持不变。
+状态：已正式发布。首次候选的两项 Windows 失败修复后，最终精确候选/main 各八项
+及发行十一项全部成功，包含真实 Windows provider 验收；签名与包元数据见末节。
+Linux 托管服务原生整链仍在独立 PR37，不能由这里的成功结果代替。
+2.32.1 已发布标签保持不变。
 
 ## 用户结果与实现
 
@@ -99,4 +99,36 @@ Ruff/格式与严格类型通过（类型峰值 272.9 MiB），两位 reviewer �
 
 上述三片合入后，全仓 Ruff 与 330 文件格式检查再次通过（22 MiB、swap 0）。
 不重复作者已通过的纯测试；数据库生产源码已在其变更后单独完成严格类型检查。
-下一精确候选继续运行全部八个原 CI 作业，尚未据本地结果创建发行标签。
+以下最终候选继续运行全部八个原 CI 作业，没有以本地结果代替跨平台验收。
+
+## 精确发行验收
+
+最终签名提交 `1cf078dbd31c4f71054328de9cf02a46f2805d8f` 的
+[候选 CI](https://github.com/69gg/MuLi/actions/runs/39576755760) attempt 1
+八项全部成功。根独立核对全部 job 与 SHA 后，非强制原子推送 main 与签名标签
+`v2.33.0`；[PR39](https://github.com/69gg/MuLi/pull/39) 于
+2026-10-21 09:34:45 UTC 合入相同提交。标签对象
+`79d5649382920deb2bcb04a6cd0f16cef37c437f` 指向该精确提交，提交与标签的
+GPG 签名均通过核验。
+
+相同 SHA 的 [main CI](https://github.com/69gg/MuLi/actions/runs/39578053330)
+attempt 1 八项成功；[发行流水线](https://github.com/69gg/MuLi/actions/runs/39578052294)
+attempt 1 十一项成功。三轮均包含 Ubuntu、macOS、Windows 的 Python 3.12/3.13
+矩阵、质量与可选 MCP 作业，发行另含 prepare、publish、github-release。
+这次真实 Windows CI 验证了保留原期限与断言的 Win32 目标/provider 用例；
+Ubuntu CI 同时保留合成托管进程恢复测试。Linux 原生 systemd 整链仍在独立
+PR37，不包含于这些成功作业。
+
+[GitHub v2.33.0](https://github.com/69gg/MuLi/releases/tag/v2.33.0)（release
+`419383359`）于 2026-10-21 09:41:29 UTC 发布，非草稿、非预发布。
+根与独立 reviewer 只读取小型元数据，确认与
+[PyPI 2.33.0](https://pypi.org/project/muli-agent/2.33.0/) 的两个包名称、大小及
+SHA256 一致，PyPI 均未撤回；没有下载发行包。
+
+| 文件 | 字节 | SHA256 |
+| --- | ---: | --- |
+| `muli_agent-2.33.0-py3-none-any.whl` | 759925 | `11882151d8f5e06d3e00a720c2e1359d1c49c980b2f3b4768b89a6d5d503ce59` |
+| `muli_agent-2.33.0.tar.gz` | 3884302 | `bec340c1b8fa84442689b649686dcd6c6d9fe0221457729f71848160b4966388` |
+
+首次候选的两项 Windows 失败继续保留，不以重跑或改标签覆盖。发行作为检查点，
+后续接收限额与独立原生服务验收继续推进。

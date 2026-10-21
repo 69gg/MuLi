@@ -4,6 +4,8 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 自主目录发现的纯 Skills 文档变化可独立热发布，当前请求保留已物化正文，下一请求按修订核验；不替换 MCP 连接或撤销其 handler。其它纯扩展变化和手动完整重载也可在任务期间通过完整候选发布，已有手动请求不会被随后目录变化降级。MCP 新代撤销尚未派发的旧调用，已接纳调用保留旧连接完成；回收期间计划排队，不创建第三套连接。`self_status` 的扩展 `last_apply` 区分 Skills-only 范围、实际发布及旧连接回收状态；未解决恢复事务仍阻止换代，模型/渠道混合配置仍等空闲。详见[Skills 活跃发布](skills-live-design.md)与[MCP 活跃换代](mcp-live-generation-design.md)。
 
+`self_mcp_receive_configure` 或已认证的 `GET/PUT /api/management/mcp-receive-policy` 管理独立的 HTTP/SSE 接收策略，唯一字段 `max_message_bytes` 默认 1 MiB、范围 64 KiB–4 MiB。完整替换只保存并请求扩展重载，不改主配置、不新建管理计划；`self_config.mcp_receive_policy` 显示 desired/effective/pending/error。限额变化需新连接发布，失败保留旧有效值，旧在途调用不被热改限额。坏策略明确失败，不默认放宽；通知丢返回不回写旧策略。后台接收失效可在 `self_status.extensions.mcp` 查固定原因；当前连接首次失效另走统一系统事项，不自动重连。通知沿用原阈值与独立路由规则，见[MCP 接收策略](mcp.md#httpsse-接收策略)。
+
 候选更新策略使用独立的 `self_update_configure` 工具，或已认证的 `GET /api/management/update-policy`、`PUT /api/management/update-policy`。`self_config` 的 `candidate_update_policy` 返回完整策略；它不属于 `/api/settings` 的主配置，不能交给 `self_configure`。保存采用完整替换，先读取现值再修改，省略字段恢复默认；只保存策略，不创建目录、执行 uv、下载或切换安装。默认关闭，启用时需指定本地 wheelhouse、保留目录和 uv 绝对路径，以及资源预算。路径由主人或其授权的 agent 配置，保存成功不表示实际环境已经通过核验。
 
 策略复用现有 Store 中一个有界对象，保存与摘要事件原子提交；不向主配置添加字段，以保留旧恢复控制器的严格解析兼容性。未知版本、损坏或超出预算的既有策略不能被静默覆盖；服务关闭或恢复事务阻止配置时同样拒绝写入。保存后仍须 `self_update_preview` 核定实际来源，将其 `expected_policy` 原样用于 `self_update` 并经真实用户批准。准备在后台执行，结果沿原会话汇报；保存、预览或批准均不代表安装或服务健康已经验证。
@@ -28,7 +30,7 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 启动自主更新检查可使用默认渠道，默认 WebUI；通知首次保存时冻结目的地，通知、版本记录和事件原子提交。同一版本的已有通知不改绑、不因再次检查重发。自主扩展目录监听的新失败转移也可使用独立默认，手动重载和普通日志不自动取得该来源。`self_configure` 可在一个 changes 补丁中设置完整 `channels.proactive.default_destination`，或以 `memory_preference={memory_id,version,destination}` 选择已核对的主人偏好。外部目的地省略 `external_enabled` 同次启用，明确 false 则保持暂停。新绑定在生成计划、空闲应用及组件停止等待后复核有限来源证据；失效则计划失败并保留原配置，不能用模型传入的 source_id/digest/trusted_owner 代替验证。复用既有权限与配置事务，不增加第二次许可门；详见[主动通知](channels.md#无发令会话时的默认通知)及[错误来源](system-events.md#失败来源与投递)。
 
-渠道状态的 `proactive.independent_sources` 列出自主更新检查与自主扩展监听错误，描述支持的独立来源；不表示当前渠道已启用或消息已投递。主请求错误有实际请求归属，因此不列为独立来源。
+渠道状态的 `proactive.independent_sources` 列出自主更新检查、自主扩展监听错误、MCP 当前连接首次接收失败及另行开启的 chiliarch 普通消息提醒，描述支持的独立来源；不表示当前渠道已启用或消息已投递。主请求错误有实际请求归属，因此不列为独立来源。
 
 管理计划从有效模型请求保存原始来源，终态继承该来源；无请求上下文的宿主调用及旧计划留本地，不因完成时无人发令就套默认。私人候选文件不进入事件，未能提交计划时删除该候选；计划与 queued/completed 事件在各自原事务提交。设置尚在排队、Attention accepted、模型终答已存与渠道 sent 分别显示，不把前一阶段当作已送达。现有 WebUI 没有新增管理提交或手动更新检查入口。
 

@@ -39,6 +39,8 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 初次启动保留 best-effort：失败来源或服务器记入状态，核心助手仍可启动，合法零工具服务器属于成功。后续变更必须通过全部启用服务器的连接、完整分页、名称、参数 schema 和总预算验证，才会发布整代；任一失败都保留当前工具、连接和 Skills 代。不会把前几页或前 100 个工具截断后当作完整目录成功。
 
+分页游标按[协议](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination)视为不透明字符串，包含合法空串，原样交给下一页；只有缺失或 `None` 结束。重复游标（含重复空串）仍明确停滞，页数及目录预算不变。
+
 首次准备也核对读取前和发布前的同一来源指纹；等待 MCP 或 Skills 时发生编辑，会丢弃旧候选并让监听器重新准备，不能把新文件指纹记到旧工具代上。未发布的失败或取消清除观察状态，完整配置重建后的临时扫描错误恢复为原指纹时也能重试。坏 Skills 来源不会阻止仍可用的 MCP 配置与核心助手启动；失败状态不冒充目录已成功加载。详见[生命周期回归](extension-lifecycle-review.md)。
 
 发现变化或收到 `notifications/tools/list_changed` 后先合并为一个候选请求。纯扩展候选可以在主会话、队友和工作流运行期间准备并发布；配置锁仍串行化准备、来源复核、保存和发布，最后复核到整组发布之间没有 await。未变服务器复用原连接；只为新增或改变的 HTTP/SSE 服务器建立候选连接。工具处理函数始终绑定它验证过的连接，发布时只替换 MCP 工具子集，不替换内置工具或其它 provider。
@@ -59,7 +61,7 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 默认每 2 秒轻扫描、500 毫秒合并变更，最多一个准备任务与一个 dirty 标记；相同失败指纹不会定时重连，只有源变化、新通知或显式 reload 才重试发现。工具执行本身仍不自动重试。关闭 watcher 后的迟到服务器通知不会恢复已删除连接。
 
-预算集中在 `Settings.extensions`，均有类型和上下限校验：
+目录与候选预算集中在 `Settings.extensions`，均有类型和上下限校验：
 
 | 字段 | 默认值 | 含义 |
 | --- | ---: | --- |
@@ -75,7 +77,21 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 | debounce_seconds | 0.5 | 变更合并窗口 |
 | watch_enabled | true | 自动目录扫描；显式 reload 仍可用 |
 
-服务器合计仍最多 32 个。Skills 的读取、目录和活跃正文预算独立放在 `Settings.skills`。目录预算是在 MCP SDK 解码单页后核对，不保证传输层巨型单帧的预解码内存上限；没有跨进程持久化上一可用工具代，不替换已接纳调用的实际连接，也不支持任意 Python 插件热卸载。
+服务器合计仍最多 32 个。Skills 的读取、目录和活跃正文预算独立放在 `Settings.skills`。目录预算是在 MCP SDK 解码单页后核对；下述 HTTP/SSE 接收策略在解码前独立检查 body/event，两者不能互相替代。没有跨进程持久化上一可用工具代，不替换已接纳调用的实际连接，也不支持任意 Python 插件热卸载。
+
+## HTTP/SSE 接收策略
+
+`self_mcp_receive_configure({"max_message_bytes":1048576})` 完整替换 HTTP/SSE 单条接收上限，沿用工具写权限；也可使用已认证的 `GET/PUT /api/management/mcp-receive-policy`。默认 1 MiB，允许 64 KiB–4 MiB 的整数，省略字段恢复默认。这是现有 Store 内的独立小策略，不属于主 Settings 或 `self_configure` 的补丁，不改变旧控制器读取的配置 JSON。损坏、未知版本或超预算的现存策略明确失败，不能静默覆盖为默认值。
+
+保存只请求原扩展重载，不表示已生效。`self_config.mcp_receive_policy`、该 GET API 及扩展状态的 `receive_policy` 返回 `desired/effective/pending/error`；`effective=null` 表示尚无已发布的 MCP 代，而不是无限额。限额绑定到具体 HTTP/SSE 连接，即使服务器配置未变，修改限额也需准备新连接并发布代次；旧在途调用保留旧限额到完成，退休结束前不建第三套。候选失败保留旧连接和旧有效值，Skills-only 路径不能把策略请求当作已经完成。stdio 不因这项预算而重启，也不获得本片的字节防护。
+
+普通 JSON、错误响应、重定向和其它非流式 body 按完整原字节计费。成功 SSE 长连接按事件计费，包含注释、未知字段和分隔空行；CR、LF、CRLF 与跨块边界保持同一协议含义，未终止长行也不能无限积累。长期 GET 的累计 body 不受单事件大小限制。锁定 SDK 的旧 SSE transport 使用普通 POST 接收响应，因此该 POST 即使声明 SSE 也必须服从总 body 上限；streamable HTTP 的流式 POST 才能按事件重置。SSE 仅接纳 UTF-8。请求使用 `Accept-Encoding: identity`，非 identity 压缩响应在 HTTPX 解压前拒绝；不通过解压后截断掩盖膨胀。
+
+首次接收失败同步锁存固定原因，连接立即禁止新调用。后台 GET 的 SDK 异常可能被吞掉，固定原因仍可从 `self_status.extensions.mcp`、`/api/extensions` 的 `mcp` 或 `/api/status.mcp` 查询；外层 `phase=loaded` 只表示曾发布成功，不保证每条连接仍可用。尚未进入 handler 的调用返回 `not_executed` 和固定失败码；已经进入 SDK 的调用保持失败/未知语义，不重发。
+
+当前已发布 HTTP/SSE 连接的首次接收失败另以 `mcp_connection` 进入[统一系统事项](mcp-receive-notification-design.md)，受现有采集/通知级别、Attention 总开关与有界队列控制。它是独立连接故障，首次持久化时冻结默认或有效显式记忆路由，不冒用当前请求来源或 `extensions_watch`。前台工具回执可能同时可见，不表示远端执行两次。候选、退休连接、stdio、取消及 Runtime 关闭期间不新增该通知；不自动重连、重放或授予 MCP 操作权限。队满、写失败和关机可能丢通知，固定 latch/status 仍可按需查。旧 slot 不具有这项新来源，回退期间不承诺补发。
+
+预算约束的是交给 HTTPX/SDK 解码器的 body，不保证底层 transport 已分配的单个 chunk、全部连接合计 RSS 或无限小事件的速率。旧 slot 会保留但不执行这份私有策略，回退后不能声称仍受此防护。实现、锁定依赖与验证见[接收预算设计](mcp-wire-budget-design.md)。
 
 ## 配置编辑与密钥
 
@@ -108,5 +124,7 @@ PATCH 中的 mcp 原子替换整个服务器配置；省略的服务器或密钥
 `tests/test_mcp.py` 验证默认禁用、不自动下载、持久连接、命名隔离、统一外部风险、配置传递、错误遮盖、调用时限、取消和结果限制，以及完整分页、停滞游标、候选预算、失败保旧、复用连接归属、stdio 需重启、旧 handler 撤销和退休关闭失败。可选依赖存在时，原有进程内 FastMCP 用例验证完整协议与关闭生命周期。`tests/test_extensions.py` 覆盖目录规则、分片预算、源变化、配置锁、保存失败、准备期限、相同失败不循环重连和窄管理接线；真实队友报告在候选准备中唤醒离线主模型，也不阻止纯扩展发布。专用代次回归使用真实 Runtime/Team 与假 provider/client，覆盖旧批配对、审批撤销、下一轮 schema、在途回收、旧秘密及候选取消；准确结果与旧实现反例见[代次发布记录](mcp-live-generation-design.md)。没有连接用户的实际外部服务器，也没有下载服务器包。
 
 `tests/conftest.py` 为每个测试隔离临时 `MULI_HOME`，并移除宿主的配置/数据目录环境覆盖；测试可自行覆盖这些变量来验证默认路径。没有显式配置目录的 Runtime 测试也不会扫描真实 `~/MuLi` 的扩展分片。
+
+接收片新增三文件 68 项回归：真实 HTTPX 流式 MockTransport 验证解码前预算，锁定 SDK/FastMCP 验证后台 GET 吞异常后仍封锁派发与 streamable POST 事件计费；临时 Store/Runtime 验证完整替换、事务、代次与管理入口。含既有关联组共 15 文件 330 项唯一用例通过，准确分组与资源结果见[接收验证记录](mcp-wire-budget-design.md#本片验证)。可选依赖缺失时仅实际 SSE decoder/SDK 用例按需跳过，JSON/Store/Runtime 替身用例仍可收集；原 MCP extras CI 明确运行三份新文件。未连接实际外部 MCP 或运行 MCP stdio 程序。
 
 接口依据：[FastMCP 客户端](https://gofastmcp.com/clients/client)、[FastMCP transport](https://gofastmcp.com/clients/transports)、[MCP 工具目录协议](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)。本地锁定 FastMCP 2.13.1 的 `list_tools()` 和 `list_tools_mcp()` 均只读取一页；实现按 MCP SDK 1.21.0 的 `session.list_tools(params=PaginatedRequestParams(cursor=...))` 完整跟随 nextCursor，没有套用当前主分支的自动分页语义。
