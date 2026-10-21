@@ -2,32 +2,28 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pydantic import AnyUrl
+
+from muli.tools.mcp_catalog import MAX_CATALOG_ITEMS, Catalog
+from muli.tools.mcp_catalog import ContentError as ResourceError
 
 JsonObject = dict[str, Any]
 
 # Host protocol limits; the configured page, catalog, wire and output budgets
 # can reject an operation earlier. These do not add a second settings policy.
-MAX_RESOURCE_ITEMS = 256
+MAX_RESOURCE_ITEMS = MAX_CATALOG_ITEMS
 MAX_RESOURCE_URI_BYTES = 4096
 MAX_RESOURCE_CONTENT_BLOCKS = 16
-
-
-class ResourceError(ValueError):
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
 
 
 @dataclass(frozen=True, slots=True)
 class Capabilities:
     tools: bool
     resources: bool
+    prompts: bool = False
 
 
 class ResourceClient(Protocol):
@@ -44,39 +40,7 @@ class ResourceItem:
     metadata: JsonObject
 
 
-@dataclass(slots=True)
-class ResourceCatalog:
-    identifier: str
-    items: tuple[ResourceItem, ...]
-    references: dict[str, int] = field(default_factory=dict)
-    cursors: dict[str, int] = field(default_factory=dict)
-
-    def token(self, kind: str, position: int) -> str:
-        return hashlib.sha256(f"{kind}:{self.identifier}:{position}".encode()).hexdigest()[:32]
-
-
-def json_size(value: object, maximum: int) -> int:
-    """Charge the whole logical page, including fields that will not be shown."""
-    size = 0
-    try:
-        for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(value):
-            size += len(chunk.encode("utf-8"))
-            if size > maximum:
-                raise ResourceError("resource_catalog_budget_exceeded")
-    except (TypeError, ValueError, RecursionError, UnicodeError) as error:
-        if isinstance(error, ResourceError):
-            raise
-        raise ResourceError("resource_invalid") from None
-    return size
-
-
-def fits_output(value: object, maximum: int) -> bool:
-    size = 0
-    for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(value):
-        size += len(chunk)
-        if size > maximum:
-            return False
-    return True
+ResourceCatalog = Catalog[ResourceItem]
 
 
 def resource_uri(value: object) -> AnyUrl:
@@ -116,18 +80,6 @@ def resource_item(value: object) -> ResourceItem:
             raise ResourceError("resource_invalid")
         metadata["size"] = size
     return ResourceItem(uri, metadata)
-
-
-def resource_page(value: object, remaining: int) -> tuple[list[Any], str | None]:
-    if type(value) is not dict or type(value.get("resources")) is not list:
-        raise ResourceError("resource_invalid")
-    items = value["resources"]
-    if len(items) > remaining:
-        raise ResourceError("resource_catalog_budget_exceeded")
-    cursor = value.get("nextCursor")
-    if cursor is not None and type(cursor) is not str:
-        raise ResourceError("resource_invalid")
-    return items, cursor
 
 
 def resource_content(value: object) -> list[JsonObject]:
