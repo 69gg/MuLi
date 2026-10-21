@@ -1,4 +1,4 @@
-# Fixed, read-only bridge. No source compilation, external commands or UI actions.
+# Fixed MTA bridge. Only captured ordinary Buttons may be invoked, once.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PSModuleAutoLoadingPreference = 'None'
@@ -11,6 +11,7 @@ $writer.NewLine = [string][char]10
 $writer.AutoFlush = $true
 $script:ready = $false
 $script:references = @{}
+$script:selected = $null
 $reasonOrder = @('node_budget', 'depth_limit', 'children_limit', 'provider_error', 'output_budget')
 
 function Stop-Bridge([string]$code) {
@@ -80,7 +81,7 @@ function Read-Node([object]$element, [object]$parent, [int]$depth, [string]$kind
             Add-Omission 'output_budget'
             return $null
         }
-        return [ordered]@{
+        $node = [ordered]@{
             ref_id = [Guid]::NewGuid().ToString('N')
             parent_ref_id = $parent
             depth = $depth
@@ -93,6 +94,23 @@ function Read-Node([object]$element, [object]$parent, [int]$depth, [string]$kind
             protected = $protected
             enabled = [bool]$current.IsEnabled
         }
+        if ($kind -eq 'node' -and -not $protected -and $node.enabled -and
+            $current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
+            $null -ne $script:selected -and
+            $current.ProcessId -eq $script:selected.stamp.process) {
+            $pattern = $null
+            if ($element.TryGetCurrentPattern(
+                    [System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern) -and
+                $pattern -is [System.Windows.Automation.InvokePattern]) {
+                $node.actions = @('invoke')
+                $node.read_only = $false
+                $script:references[$node.ref_id] = @{
+                    kind = 'node'; element = $element; record = $node
+                    window = $script:selected.element; stamp = $script:selected.stamp
+                }
+            }
+        }
+        return $node
     } catch {
         Add-Omission 'provider_error'
         return $null
@@ -182,7 +200,9 @@ function Read-Targets {
             try {
                 $stamp = Window-Stamp $element
                 $script:rows.Add($node)
-                $script:references[$node.ref_id] = @{ element = $element; stamp = $stamp }
+                $script:references[$node.ref_id] = @{
+                    kind = 'target'; element = $element; stamp = $stamp
+                }
             } catch {
                 if ($_.Exception.Data['muli_code'] -eq 'read_timeout') { throw }
                 Add-Omission 'provider_error'
@@ -200,12 +220,58 @@ function Read-Snapshot([string]$reference) {
     }
     $selected = $script:references[$reference]
     $script:references = @{}
+    if ($selected.kind -ne 'target') { Stop-Bridge 'target_changed' }
+    $script:selected = $selected
     Same-Window $selected.element $selected.stamp
     $node = Read-Node $selected.element $null 0 'window'
     if ($null -eq $node) { Stop-Bridge 'element_unavailable' }
     $script:rows.Add($node)
     Read-Children $selected.element $node.ref_id 1
     Same-Window $selected.element $selected.stamp
+}
+
+function Invoke-Node([string]$reference) {
+    # Every attempt consumes the entire private snapshot, even a bad reference.
+    $captured = $script:references
+    $script:references = @{}
+    if (-not $captured.ContainsKey($reference)) { Stop-Bridge 'stale_node' }
+    $selected = $captured[$reference]
+    if ($selected.kind -ne 'node') { Stop-Bridge 'stale_node' }
+    Check-Deadline
+    $current = $selected.element.Current
+    # IsPassword is always the first provider property gate. Never ask for a
+    # protected Name, Value, TextPattern or InvokePattern.
+    if ($current.IsPassword) { Stop-Bridge 'protected_element' }
+    if ($current.ControlType -ne [System.Windows.Automation.ControlType]::Button -or
+        $current.ProcessId -ne $selected.stamp.process -or
+        [string]$current.Name -cne $selected.record.name) {
+        Stop-Bridge 'stale_node'
+    }
+    if (-not $current.IsEnabled) { Stop-Bridge 'element_disabled' }
+    Same-Window $selected.window $selected.stamp
+    $cursor = $selected.element
+    $owned = $false
+    for ($depth = 0; $depth -le 12 -and $null -ne $cursor; $depth++) {
+        Check-Deadline
+        if ([System.Windows.Automation.Automation]::Compare($cursor, $selected.window)) {
+            $owned = $true
+            break
+        }
+        if ($depth -eq 12) { break }
+        $cursor = $script:walker.GetParent($cursor)
+    }
+    if (-not $owned) { Stop-Bridge 'target_changed' }
+    $pattern = $null
+    if (-not $selected.element.TryGetCurrentPattern(
+            [System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern) -or
+        $pattern -isnot [System.Windows.Automation.InvokePattern]) {
+        Stop-Bridge 'unsupported_operation'
+    }
+    Check-Deadline
+    # An exception after entering a provider is not proof of zero effects.
+    $script:nativeEntered = $true
+    $pattern.Invoke()
+    return @{ ok = $true; outcome = 'accepted'; effect_verified = $false }
 }
 
 function Tree-Result([string]$command, [object[]]$rows) {
@@ -245,10 +311,23 @@ function Fits-Frame([string]$text) {
         ($encoding.GetByteCount($text) + 1 -le 250000))
 }
 
+function Keep-References([object[]]$rows) {
+    $kept = @{}
+    foreach ($row in $rows) {
+        if ($script:references.ContainsKey($row.ref_id)) {
+            $kept[$row.ref_id] = $script:references[$row.ref_id]
+        }
+    }
+    $script:references = $kept
+}
+
 function Tree-Frame([string]$requestId, [string]$command) {
     $all = $script:rows.ToArray()
     $json = Encode-Result $requestId (Tree-Result $command $all)
-    if (Fits-Frame $json) { return $json }
+    if (Fits-Frame $json) {
+        Keep-References $all
+        return $json
+    }
     Add-Omission 'output_budget'
     $low = 0
     $high = $all.Length
@@ -264,6 +343,7 @@ function Tree-Frame([string]$requestId, [string]$command) {
     if ($low -gt 0) { $kept = @($all[0..($low - 1)]) }
     $json = Encode-Result $requestId (Tree-Result $command $kept)
     if (-not (Fits-Frame $json)) { Stop-Bridge 'node_budget' }
+    Keep-References $kept
     return $json
 }
 
@@ -281,6 +361,8 @@ try {
             Stop-Bridge 'protocol_error'
         }
         $requestId = [string]$request.request_id
+        $script:nativeEntered = $false
+        $script:selected = $null
         try {
             $script:seconds = [double]$request.limits.timeout_seconds
             $script:maxNodes = [int]$request.limits.max_nodes
@@ -333,19 +415,36 @@ try {
                     Read-Snapshot ([string]$request.payload.target_ref_id)
                     $json = Tree-Frame $requestId 'snapshot'
                 }
+                'action' {
+                    $properties = @($request.payload.PSObject.Properties.Name)
+                    if ($properties.Count -ne 2 -or 'ref_id' -cnotin $properties -or
+                        'action' -cnotin $properties -or
+                        $request.payload.ref_id -cnotmatch '^[a-f0-9]{32}$' -or
+                        $request.payload.action -cne 'invoke') {
+                        $script:references = @{}
+                        Stop-Bridge 'unsupported_operation'
+                    }
+                    $json = Encode-Result $requestId (Invoke-Node ([string]$request.payload.ref_id))
+                }
                 default { Stop-Bridge 'unsupported_operation' }
             }
             Check-Deadline
         } catch {
             $code = $_.Exception.Data['muli_code']
             if ($code -notin @('dependency_missing', 'protocol_error', 'read_timeout',
-                'element_unavailable', 'target_changed', 'node_budget', 'unsupported_operation')) {
+                'element_unavailable', 'target_changed', 'node_budget', 'unsupported_operation',
+                'stale_node', 'protected_element', 'element_disabled')) {
                 $code = 'element_unavailable'
+            }
+            $outcome = 'not_started'
+            if ($script:nativeEntered) {
+                $code = 'action_unknown_outcome'
+                $outcome = 'unknown'
             }
             $json = Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject @{
                 v = 1
                 request_id = $requestId
-                error = @{ code = $code; message = 'UIA read unavailable'; outcome = 'not_started' }
+                error = @{ code = $code; message = 'UIA operation unavailable'; outcome = $outcome }
             } -Depth 4 -Compress
             $script:references = @{}
         }
@@ -356,5 +455,6 @@ try {
     exit 1
 } finally {
     $script:references = @{}
+    $script:selected = $null
     $writer.Dispose()
 }

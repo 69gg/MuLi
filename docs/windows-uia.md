@@ -1,9 +1,13 @@
-# Windows UIA 只读窗口
+# Windows UIA 窗口与按钮
 
 状态：Windows UIA 只读后端已随 2.32.0 发布。最终精确候选和 main 各八项、
 发行十一项检查全部成功，包含 Windows 3.12/3.13 的三个真实原生用例。
 前两轮失败仍保留在[发行审查](review-v2.32.md)，不反推旧夹具超时的唯一原因。
 没有在开发机调用 PowerShell、读取桌面、安装组件或修改执行策略。
+
+当前开发片增加普通按钮的一次 `invoke`，输入继续不可用；受限本地回归与静态检查
+已通过，最终独立实现审查与真实 Windows 动作验收仍待完成。下面明确区分已发布只读首片的历史
+证据和新能力，不能把历史只读矩阵当作按钮动作已经通过。详见[Invoke 设计](windows-uia-actions-design.md)。
 
 2.32.1 后续 main 的 Windows 3.12 在测试目标窗夹具启动时再次超时，发行矩阵仍全部
 通过。本轮仅把被读取的测试目标从额外 PowerShell/WinForms 进程改为 stdlib Win32
@@ -26,13 +30,17 @@
   不传标识、未知或失效标识都拒绝，不回退整个桌面，也不按标题寻找替代窗口。
 - `computer_release({})` 释放当前执行的引用。外部原生引用、PID、窗口句柄、模块路径
   与 UIA RuntimeId 不提供给模型。另一个执行收到 `desktop_busy`，旧执行不能释放新执行。
-- `computer_action` / `computer_type` 明确 `unsupported_operation`；仍保留原 `computer`
-  风险门。发现、读取与释放沿用读取权限，不新增授权旁路。
+- `computer_action({"snapshot_id":"当前快照","node_id":"按钮节点","action":"invoke"})`
+  只接受该快照实际展示、明确非密码且启用的普通 Button；`computer_type` 继续拒绝。
+  动作保留原 `computer` 风险门，发现、读取与释放沿用读取权限，不新增授权旁路。
 
-每个新观察消费旧发现集合。树只是当时的外部资料，不是原子桌面快照或可执行凭据。
+每个新观察消费旧发现与快照。树只是当时的外部资料，不是原子桌面快照；名称本身
+不能授权操作，只有本次公开快照中的临时标识与明确能力才可用于一次尝试。
 UIA 的 Name 可能包含普通应用文字；首片不读取 ValuePattern / TextPattern。明确密码
 节点先核 `IsPassword`，再决定是否读取 Name；密码节点返回空名称和 `protected=true`。
-所有节点均为 `read_only=true`、`editable=false`、`actions=[]`。
+只有能取得 InvokePattern 的普通非密码、启用 Button 才提供 `actions=["invoke"]`、
+`read_only=false`；其它节点保持 `read_only=true`、`actions=[]`。所有节点的
+`editable=false`，不读 Value/Text，也不使用键盘、焦点、坐标或另一模式兜底。
 
 ## 固定系统桥接
 
@@ -64,6 +72,18 @@ Add-Type 只加载系统 UIAutomationClient / UIAutomationTypes 程序集，并�
 超时、格式错误、执行结束、重载与关闭都回收准确的 helper。回收未确认时保留占用和
 固定错误，不把计数或空引用当成退出证明。
 
+新观察尝试、有效快照的一次操作尝试都在首个 await 前消费旧操作凭据。坏节点、
+不支持操作、取消与失败不会复活旧凭据。宿主只缓存最终 JSON 中实际展示的节点；
+helper 同样只保留已装箱节点的实际对象。最终 write 前复用 Runtime 的同步
+dispatch_guard，重新检查真实执行、新输入、暂停与关闭。Invoke 前向原对象核密码、
+Button 角色、启用、非保护名称、同 PID/窗口 stamp 及最多 12 层原窗口父链；
+不使用 RuntimeId、标题或句柄寻找替代控件。
+
+成功仅表示 `{"ok":true,"outcome":"accepted","effect_verified":false}`。进入原生
+Invoke 后的异常、丢回执或超时均保守为 `action_unknown_outcome/unknown`；调用前拒绝
+保留 `not_started`。取消不撤销已经发生的界面效果，清理失败不将 accepted/unknown
+改成可重试错误。不自动重放，下一步需重新观察。
+
 Windows 的现有进程原语只终止并等待自有的直接 helper。桥接没有显式派生子进程，
 但系统 UIA 可能使用 COM / 跨位数代理；本片不拥有、终止或宣称回收这些系统 broker。
 
@@ -78,7 +98,7 @@ helper 的完整 JSON 信封同时受 60000 字符与 250000 UTF-8 字节上限�
 1000000 字节。不完整结果不能证明某个窗口或控件不存在。外部 provider 可能阻塞或
 内部先分配内存，不能把遍历预算说成系统 COM 内存硬上限。
 
-## 已检查与待验证
+## 已发布只读首片的检查与后续记录
 
 所有本地命令经 `scripts/check_local.py` 串行、每组 30 秒，单次 1 GiB / 共享 2 GiB、
 swap 0 / 一逻辑 CPU 上限不变：
@@ -136,6 +156,29 @@ label/value 不泄露、protected 空 name 和只读断言保留。受控宿主�
 reader 的端到端旧码红、修后绿；16 fixture + 9 startup + 27 host 共 52 项通过、
 3 原 native Linux skip，四份 Python 静态通过，本轮最高 145.2 MiB、swap 0。
 精确候选、job、历史首轮静态与远端待验边界见上述目标夹具记录。
+这里的远端待验是该夹具修正时的状态；随后精确 `1cf078d` 的 2.33.0 候选、main
+及发行矩阵均成功，已提供该只读夹具在双 Windows 矩阵的实际验收，不能用它替代
+本次新增 Invoke 动作的验证。
+
+## 本片 Invoke 验证
+
+修改前两条真实宿主反例已失败，证明旧快照不能提供按钮能力且旧 UIA 错误转换丢失
+unknown outcome；详见[设计中的红例记录](windows-uia-actions-design.md)。本地回归
+仅使用假 lease、真实 Runtime/Store 和纯 Win32 调用替身，明确拒绝真实子进程。
+专用 Invoke 29 项、宿主/启动/窗口夹具 63 项、既有 Computer/AX 纯回归 101 项通过，
+合计 193 个不同用例（40 新增、153 既有）；专用首轮 28 项与后续 29 项重叠，
+不重复累计。4 项 hosted Windows 原生用例在 Linux 按原门控跳过。
+9 份 Python 的 Ruff/格式与两份源码 strict mypy 通过；pytest 峰值 67.2 MiB，
+类型检查峰值 213.4 MiB，swap 0，每条命令仍由原 30 秒守卫串行执行。
+最终实现独审与真实 Windows provider 验收待完成，没有运行开发机 PowerShell 或桌面。
+
+原有三项 hosted Windows 原生用例与 12 秒启动、4 KiB 两管道/诊断预算保留；新用例
+只操作自身临时窗的 BUTTON。标准控件的 `WM_COMMAND/BN_CLICKED` 必须同时匹配
+原父 HWND、控制 ID 与按钮 HWND，才发送一次固定计数。helper 的 accepted 与该
+计数分别断言并共用原操作期限。禁用按钮及密码无 Invoke，旧快照不能再次调用。
+输出 reader 在 readiness 后继续消费同一 stdout，按钮事件仍计入原 4 KiB 总额，
+重复或错误事件使夹具失败并强拥有回收。上述真实 Windows provider、动作和消息
+关联仍待远端矩阵，不以 Linux fake 或只读历史通过替代。
 
 ## 官方依据
 
