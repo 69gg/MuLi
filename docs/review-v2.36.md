@@ -1,6 +1,6 @@
 # 2.36 MCP 普通资源审查
 
-状态：实现、两层审查与根整合检查完成；精确远端验收与发布待完成。
+状态：精确候选十项 CI 全部通过，签名提交与标签已推送；main 和发行流水线待完成。
 
 ## 用户行为
 
@@ -46,6 +46,15 @@ unused-ignore；保持源码和严格规则不变，以 `--no-incremental` 和�
 
 全部本地检查继续使用绝对路径资源守卫并串行执行，单次 1 GiB、共享 2 GiB、
 单 CPU、swap 0，测试不连接实际 MCP、不启动 stdio 服务或安装新依赖。
-精确十项 CI 尚未完成，不能用本地通过代替跨平台、构建和实际无 extras 验收。
+精确候选 `a4938fdbc4b25fca2cab1db49ef1924d8c0ea1f4` 的
+[CI](https://github.com/69gg/MuLi/actions/runs/39595349263) attempt 1 十项全部成功，
+包括普通无 extras 平台矩阵、质量与加入三文件的 MCP extras。根逐项核 SHA、
+终态、签名、远端 main 的 `2286cd6`、快进与标签不存在后非强制原子推送 main
+和 `v2.36.0`；PR42 于 2026-10-21 12:03:20 UTC 按原提交合入。
+标签对象 `392993b88506be18e92558e7325cf647aca14bba` 本地及 GitHub 验签有效。
+
+[main CI](https://github.com/69gg/MuLi/actions/runs/39596574176) 与
+[发行](https://github.com/69gg/MuLi/actions/runs/39596574355) 待完成；
+PyPI 尚未核实，不能把候选通过或标签存在当作包已发布。
 
 设计与边界见[资源设计](mcp-resources-design.md)、[MCP 使用说明](mcp.md)。

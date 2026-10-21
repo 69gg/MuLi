@@ -1,6 +1,6 @@
 # 2.35 MCP 故障通知与分页兼容审查
 
-状态：精确候选十项 CI 全部通过，签名提交与标签已推送；main 和发行流水线待完成。
+状态：正式发布；精确候选/main 各十项与发行十三项全部通过，PyPI/GitHub 构件一致。
 MCP 普通资源工具仍是下一阶段设计，不作为本版本已交付能力。
 
 ## 用户结果与归属
@@ -95,8 +95,19 @@ PR41 于 2026-10-21 11:47:35 UTC 按原提交合入；标签对象为
 Linux 3.12 两片分别 2249/2408 通过、24/5 跳过，选中集合与对方 deselected 数互相
 对应，合计 4657 通过、29 跳过，增加的五项正是分片回归。用时 118.48/132.15 秒，
 两片清理步骤均成功；这只记录本次表现，不据此承诺固定加速比例。
-[main CI](https://github.com/69gg/MuLi/actions/runs/39594587114) 与
-[发行](https://github.com/69gg/MuLi/actions/runs/39594586403) 正在验收，PyPI 尚未核实。
+[main CI](https://github.com/69gg/MuLi/actions/runs/39594587114) 十项与
+[发行](https://github.com/69gg/MuLi/actions/runs/39594586403) 十三项随后全部成功，
+每项 head SHA 均为同一签名提交。GitHub Release `419499851` 于
+2026-10-21 11:54:51 UTC 发布，非 draft、非 prerelease；PyPI 精确 2.35.0 的两包
+均未撤回，文件名、大小和 SHA-256 与 GitHub 相同：
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.35.0-py3-none-any.whl` | 765232 | `287b7df3cd5ed13b983ab0dafdcbfb1baa057ce8acfbc81fc78d213026aa9c9b` |
+| `muli_agent-2.35.0.tar.gz` | 3930834 | `70aa16c3e4bb703e14b5f6124532ed7b2c018400ca9e42946e46d5ebb440c2c2` |
+
+根仅读取有限元数据，没有下载发行包、安装或更新本机 MuLi。此轮发布已闭合，
+后续资源与平台能力继续迭代，不重复轮询已完成工作流。
 
 ## 限制与后续
 
@@ -104,9 +115,9 @@ Linux 3.12 两片分别 2249/2408 通过、24/5 跳过，选中集合与对方 d
 按需查询。旧 slot 不认识新 producer/code 时可能跳过并推进 Attention cursor，
 不保证升级后的历史补发，也不声称旧程序执行新接收保护。
 
-Linux 原生服务整链在独立 draft PR37 验收：第七轮 `7a0ece9` 的
-CI `39585202872` 八项成功、一项 native 失败，仍为零事务、正常清理未获证明。
-有限观察只证明当时专用 UID 的 manager 镜像存在，不证明具体等待根因。
+Linux 原生服务整链在独立 draft PR37 验收：第八轮 `b516cf2` 的
+CI `39590177536` 八项成功、一项 native 失败，仍为零事务、正常清理未获证明。
+有限观察只证明当时专用 UID 的 manager 镜像与 epoll_wait，不证明具体等待根因。
 本机不进行账户、挂载、用户服务或真实升级测试，也不放宽资源和期限。
 
 详细合同见[通知设计](mcp-receive-notification-design.md)、
