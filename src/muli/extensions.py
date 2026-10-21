@@ -207,6 +207,7 @@ class Extensions:
         return {
             "generation": self.generation,
             "phase": self.phase,
+            "running": not self._closed and self._worker is not None and not self._worker.done(),
             "fingerprint": self._fingerprint,
             "sources": list(self._sources),
             "queued_reason": "runtime_busy" if self._dirty and self.runtime.busy else None,
@@ -345,8 +346,14 @@ class Extensions:
             self._failure(exc)
 
     def start(self) -> None:
-        if self._worker is None:
-            self._worker = asyncio.create_task(self._watch(), name="muli-extensions")
+        if self._closed or self.runtime._closing:
+            return
+        if self._worker is not None:
+            if not self._worker.done():
+                return
+            if not self._worker.cancelled():
+                self._worker.exception()
+        self._worker = asyncio.create_task(self._watch(), name="muli-extensions")
 
     def _catalog_changed(self, name: str) -> None:
         if self._closed:
@@ -449,55 +456,74 @@ class Extensions:
                 return
             self._watch_failure = signature
             if previous != (self.phase, self._error):
-                self.runtime.system_events.extension_watch_failed()
+                try:
+                    self.runtime.system_events.extension_watch_failed()
+                except Exception:
+                    # The sink may have accepted the notification before failing.
+                    # Keep its signature; do not recurse or retry unknown delivery.
+                    self._failure(ExtensionError("watcher_failed", "extensions"))
 
         while not self._closed:
-            if self.phase == "loaded":
-                self._watch_failure = None
             settings = self.runtime.config.settings
-            if settings.extensions.watch_enabled:
-                previous = self.phase, self._error
-                try:
-                    observed = await self.fingerprint(settings)
-                    if observed != self._observed:
-                        self._observed = observed
-                        self.request_reload(refresh_catalogs=False)
-                        self._directory_request = self._requested
-                except Exception as exc:
-                    self._failure(exc)
-                    notify_failure(previous)
-            if self._dirty and asyncio.get_running_loop().time() >= self._ready_at:
-                if self.runtime.busy or self.runtime.maintenance.configuration_blocked:
-                    self.phase = "queued"
-                else:
-                    async with self.runtime.configuration_lock:
-                        if (
-                            not self.runtime.busy
-                            and not self._closed
-                            and not self.runtime.maintenance.configuration_blocked
-                        ):
-                            self._dirty = False
-                            previous = self.phase, self._error
-                            autonomous = self._directory_request == self._requested
-                            try:
-                                await self.apply_locked(self.runtime.config.settings, persist=False)
-                            except ExtensionError as exc:
-                                if exc.code in {"runtime_busy", "transaction_in_progress"}:
-                                    self._dirty = True
-                                    self.phase, self._error = "queued", None
-                                elif autonomous:
-                                    notify_failure(previous)
-            self._wake.clear()
             interval = settings.extensions.scan_interval_seconds
-            if (
-                self._dirty
-                and not self.runtime.busy
-                and not self.runtime.maintenance.configuration_blocked
-            ):
-                interval = min(
-                    interval,
-                    max(0.01, self._ready_at - asyncio.get_running_loop().time()),
-                )
+            previous = self.phase, self._error
+            try:
+                if self.phase == "loaded":
+                    self._watch_failure = None
+                if settings.extensions.watch_enabled:
+                    previous = self.phase, self._error
+                    try:
+                        observed = await self.fingerprint(settings)
+                        if observed != self._observed:
+                            self._observed = observed
+                            self.request_reload(refresh_catalogs=False)
+                            self._directory_request = self._requested
+                    except Exception as exc:
+                        self._failure(exc)
+                        notify_failure(previous)
+                if self._dirty and asyncio.get_running_loop().time() >= self._ready_at:
+                    if self.runtime.busy or self.runtime.maintenance.configuration_blocked:
+                        self.phase = "queued"
+                    else:
+                        async with self.runtime.configuration_lock:
+                            if (
+                                not self.runtime.busy
+                                and not self._closed
+                                and not self.runtime.maintenance.configuration_blocked
+                            ):
+                                self._dirty = False
+                                previous = self.phase, self._error
+                                autonomous = self._directory_request == self._requested
+                                try:
+                                    await self.apply_locked(
+                                        self.runtime.config.settings, persist=False
+                                    )
+                                except ExtensionError as exc:
+                                    if exc.code in {"runtime_busy", "transaction_in_progress"}:
+                                        self._dirty = True
+                                        self.phase, self._error = "queued", None
+                                    elif autonomous:
+                                        notify_failure(previous)
+                if (
+                    self._dirty
+                    and not self.runtime.busy
+                    and not self.runtime.maintenance.configuration_blocked
+                ):
+                    interval = min(
+                        interval,
+                        max(0.01, self._ready_at - asyncio.get_running_loop().time()),
+                    )
+            except Exception:  # noqa: BLE001 - observation failure must not lose the watcher owner
+                if self._closed or self.runtime._closing:
+                    return
+                self._failure(ExtensionError("watcher_failed", "extensions"))
+                notify_failure(previous)
+                # Keep the existing dirty state. A consumed candidate request is
+                # not an invitation to retry unknown effects; failed observation
+                # waits the normal interval without reading its failing gate again.
+            if self._closed or self.runtime._closing:
+                return
+            self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=interval)
             except TimeoutError:

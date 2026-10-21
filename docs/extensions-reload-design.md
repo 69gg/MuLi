@@ -66,6 +66,14 @@ Skills 的窄 `runtime.skills_context` 回调在全部普通 `context_hooks` 和
 
 `self_configure` 的 MCP-only 补丁与目录发现必须经过同一个扩展应用器；不能一条路径先关旧代，另一条路径保留旧代。混合修改模型、渠道等配置仍走原有整体配置路径，第一期不宣称它也获得了全部失败保旧能力。配置持久化必须与内存发布绑定成一次管理操作：先准备候选，再保存已校验配置，保存失败不发布；只有保存与发布均成功才记 `loaded`。目录来源本身不会被偷偷改写进 `config.json`，状态中保留来源指纹。
 
+### Watcher 存活与故障恢复
+
+后台轮次在读取维护状态、进入配置锁或计算下一次等待时也可能失败。此类观察异常现在报告固定 `watcher_failed` / `extensions` 状态，不回显路径、凭据或异常正文，保留当前已发布代和已有 dirty 状态，并沿现有扫描间隔等待下一轮或显式唤醒。失败后的等待不再次读取故障属性，也不以 10 毫秒间隔忙重试。候选请求若已经消费，不因轮次兜底而自动重做可能已产生效果的准备；用户仍可显式请求重载。
+
+自主目录失败继续沿既有统一系统事件与 Attention 路径去重，手动重载和 catalog 候选失败不因此自称自主来源。后台观察自身失败可以报告一次固定 watcher 故障；通知函数若抛出异常，watcher 保持存活并暴露固定故障状态，保留已尝试的失败签名，既不递归通知，也不自动重试结果未知的投递。通知无法写入时不承诺 Attention 已收到。真正发布成功后，新一代的后续故障可再次报告。持续忙碌仍可无限延后发布，本片没有强制打断活动任务或改变空闲边界。
+
+状态增加 `running`，只在 watcher 任务存在且尚未结束、扩展尚未关闭时为真。显式 `start()` 会先收集已结束任务的异常，再创建一个新任务；活跃任务不会重复启动。普通 `request_reload()` 和 `wake()` 保持原有事件唤醒语义，不隐式开启生命周期，Runtime 启动仍负责调用 `start()`。本片修复的观察与通知异常不会使任务退出；其它已结束任务的恢复依赖显式 `start()`，不承诺另有自动监督器。取消继续传播，关闭会取消并等待任务，关闭后 `start()`、重载和唤醒均不能复活它。
+
 ## FastMCP 2.13.1 的真实接口边界
 
 本设计以锁定的 FastMCP **2.13.1** 和 MCP SDK **1.21.0** 为基线，不升级到 3.x。Context7 当前主线文档会描述自动分页，但本地安装源码中 `Client.list_tools_mcp()` 直接调用 `session.list_tools()` 一次，`list_tools()` 只取其 `tools`，不会自动取 `nextCursor`。实现须使用该 SDK 的 `session.list_tools(params=PaginatedRequestParams(cursor=...))`，循环中检查 `nextCursor` 推进并设置页数、总工具数、schema/描述总字节与整个候选的总期限。超限应拒绝候选，不能截成一个看似完整的新目录。
@@ -102,3 +110,5 @@ Skills 的窄 `runtime.skills_context` 回调在全部普通 `context_hooks` 和
 所有本地执行仍必须通过 `scripts/check_local.py`，测试串行、无真实账号/设备、无下载或服务器安装。Skills 首片在 MCP 接线候选树只读绑定后，47 项回归通过，峰值 72.7 MiB、swap 0，Ruff 与模块 mypy 通过；包括源/资源父目录置换门控、资源读取后换代、真实 Runtime 单次正文交付、后置普通 hook 与权威 task snapshot 的预算顺序，以及预算缩小后通过工具清除恢复。所有 Runtime 用例隔离 `MULI_HOME`、使用离线模型，不读取用户扩展目录。PyYAML 缺少类型 stub，仅对三处外部导入局部标注 `import-untyped`，节点值仍做类型验证；没有为检查下载类型包。
 
 本次没有加载真实第三方 Skill、连接用户 MCP server 或改变运行配置；本机受限回归不等于验证所有外部 server 或三平台文件监听语义。目录句柄选择依据 Context7 核对的 [Python `dir_fd` 平台合同](https://docs.python.org/3.13/library/os.html#os.supports_dir_fd)，Windows 读取能力明确未交付。运行中即时换代、多进程协同监听、Python 插件热卸载、包级不可变资源快照与持久 last-known-good 环境恢复均未在第一期交付范围内。
+
+Watcher 存活补片先以真实 watcher 任务稳定复现旧行为：维护属性抛出异常后任务结束，再次 `start()` 仍保留同一已结束任务，单例按预期失败。修复后新增 14 项回归通过（0.47 秒，峰值 81.1 MiB）；既有扩展、系统错误来源和 MCP 三文件的 93 项通过（5.58 秒，峰值 143.2 MiB）。两文件 Ruff/格式与扩展源码严格 mypy 通过，所有守卫检查均 swap 0、每次 30 秒上限。新增用例禁止 HTTP 与子进程，使用真实 Runtime、配置锁、watcher 任务及离线 MCP client，覆盖三个观察失败位置、随后真实发布和工具调用、多轮去重、通知自身失败、候选消费后不重试、已结束任务回收、取消与关闭。没有为此运行真实 MCP 服务、模型或第三方安装；跨平台真实执行仍以远端矩阵为准。[Python 的任务异常与取消合同](https://docs.python.org/3.13/library/asyncio-task.html)也要求只读取已结束且未取消任务的异常，并继续传播 `CancelledError`。
