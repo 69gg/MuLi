@@ -17,6 +17,7 @@ import pytest
 import pytest_asyncio
 from helpers import uia_native_window
 from helpers.uia_native_startup import observe_native_form
+from helpers.uia_probe_diagnostics import observe_probe
 
 from muli.config import Settings
 from muli.process import _settle_process
@@ -90,7 +91,7 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     probe = computer._uia._new_lease(once=True)
     try:
-        result = await probe.request("probe", {})
+        result = await observe_probe(probe)
         assert result["apartment"] == "MTA" and result["has_window"] is False
         assert result["no_profile"] is True and result["non_interactive"] is True
         assert result["module_autoloading"] == "None"
@@ -132,7 +133,6 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
             assert kwargs["creationflags"] & int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             assert not any("ExecutionPolicy" in arg or arg == "-Command" for arg in argv)
     finally:
-        await probe.aclose()
         await computer.aclose()
 
 
