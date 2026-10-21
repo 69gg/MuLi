@@ -40,7 +40,7 @@
 
 `audio_transcribe(id, language?)` 按需调用当前 ASR 一次，并把完整 UTF-8 转写留存在私有附件库。返回的 `id` 仍为原音频 ID；短结果 `text` 为全文，长结果为预览，另带 `asr_completed=true`、`transcript_id`、`revision`、下载 `url`、`next_offset_bytes` 和 `has_more`。需要全文时用 `audio_transcript_read(id=transcript_id, revision=revision, offset_bytes=next_offset_bytes)` 逐页读取 `content`；字节偏移只能使用返回的游标，不用字符数推算，也无需再次付费转写。
 
-两种结果都按完整 JSON 信封遵守 `limits.max_output_chars`。全文字节上限取 `media.asr.max_response_bytes` 与 `uploads.max_file_bytes` 的最小值，并受附件总配额限制；保存/预览失败会明确 `asr_completed=true`，不自动重调 ASR。已保存但响应丢失时，可从 `attachment_list` 找到来源 `asr`、文件名 `转写-原音频ID.txt` 的工件。续读核对版本、文件大小与完整 SHA-256，文件变化或预算缩小超限时拒绝，不返回混版内容。
+两种结果都按完整 JSON 信封遵守 `limits.max_output_chars`。全文字节上限取 `media.asr.max_response_bytes` 与 `uploads.max_file_bytes` 的最小值，并受附件总配额限制；保存/预览失败会明确 `asr_completed=true`，不自动重调 ASR。已保存但响应丢失时，用 `attachment_search(source="asr", name_query="原音频ID")` 查找文件名 `转写-原音频ID.txt` 的工件。沿 `next_cursor` 继续直到 `has_more=false`；空 `items` 也可能还有未扫描范围。找到后以目录的 `id`、`sha256` 作为续读的工件 ID、`revision`。旧 `attachment_list` 仍只列最近一批；[附件检索](attachment-search.md)支持有界分页，目录本身不证明文件存在。续读核对版本、文件大小与完整 SHA-256，文件变化或预算缩小超限时拒绝，不返回混版内容。
 
 转写留存只是原 `read` 工具的受控结果归档，不授予任意目录写权限、自动发送权限或主人身份。内容属于资料而非指令；私有附件不以内联 HTML 显示，下载沿用现有认证。文件与元数据需一起备份，消息 NDJSON 不含附件正文。网页录音草稿和后台唤醒不经过此工具，保持原有处理。实现边界与验证记录见[完整转写工件设计](voice-transcripts-design.md)。
 
