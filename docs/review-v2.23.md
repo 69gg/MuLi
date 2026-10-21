@@ -1,7 +1,7 @@
 # 2.23 候选更新审查记录
 
-当前是开发验收记录，尚未发布 2.23.0。已发布版本仍为 2.22.0；此文件不把
-局部测试、预览成功或进程收尾成功称为新版本已经可用。
+2.23.0 已完成精确候选、main 与发行验证，并发布至 PyPI 和 GitHub。
+局部预览、进程收尾及模拟宿主测试仍不等于真实用户服务已安装或恢复成功。
 
 ## 功能范围
 
@@ -62,7 +62,30 @@ quality、MCP、Ubuntu 3.12/3.13、macOS 3.12/3.13 六项成功。Windows 3.12/3
 均为 2682 passed、1364 skipped、4 errors：新预算测试的 32 KiB 参数默认名称
 进入 `PYTEST_CURRENT_TEST`，超过 Windows 32767 字符环境变量上限。
 修复仅为三个原参数指定短 ID，保留全部 ASCII、UTF-8 和 JSON 转义载荷与预算
-断言；三个用例本地通过，峰值 64.3 MiB。修后完整 CI 与发行验收仍待执行。
+断言；三个用例本地通过，峰值 64.3 MiB。修后完整 CI 与发行验收见下。
+
+## 正式发行证据
+
+签名提交 `c77663018c06313dcc262681bf6bf9124ea99c46` 的
+[PR27 候选 CI](https://github.com/69gg/MuLi/actions/runs/39533742583) 八项全部成功。
+[PR27](https://github.com/69gg/MuLi/pull/27) 于 2026-10-21 02:41:28 UTC 合入
+main，精确保持同一提交；[main CI](https://github.com/69gg/MuLi/actions/runs/39534414192)
+八项成功，覆盖 quality、MCP、Ubuntu/macOS/Windows 的 Python 3.12/3.13。
+
+签名标签 `v2.23.0` 的对象为 `8e2b9f5555313c166bec01e4588cc055e6610001`，
+peel 后为上述候选提交；已验证本地 GPG 签名和远端 main/tag 引用。
+[发行流水线](https://github.com/69gg/MuLi/actions/runs/39534414196) 十一项全部成功，
+独立重跑完整验证后发布其生成的同一份构件。
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.23.0)
+于 2026-10-21 02:48:42 UTC 发布；[PyPI 2.23.0](https://pypi.org/project/muli-agent/2.23.0/)
+两个文件均未撤回，元数据与 GitHub 逐项相同：
+
+| 文件 | 大小（字节） | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.23.0-py3-none-any.whl` | 715625 | `d5b1fc3cb59ae3980afea8a572bef5cbf2fee7d2630bf9a9489d4c8f38ad0eb2` |
+| `muli_agent-2.23.0.tar.gz` | 3668585 | `d0fdcf714ca66d6f5dc59b821a0a15519d83d54685e8436a59cffaab3b7fc90a` |
+
+仅查询版本元数据，未下载发行包、升级本机安装或启动真实用户服务。
 
 ## 尚未验证
 
