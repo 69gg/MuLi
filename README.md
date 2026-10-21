@@ -23,12 +23,12 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 | 模型 | OpenAI Chat Completions、Responses、Anthropic 原生协议；流式/非流式、推理参数、工具回放、重试预算 |
 | 协作 | 持续主身份、动态 spawn/send/wait/resume/stop 团队、可跨重启的增量结果游标、依赖工作流；历史成员无固定上限，执行有资源预算 |
 | 权限 | ask 每个工具调用询问；auto 独立审查 agent，风险操作交给用户；yolo 自动执行 |
-| 文件 | 目录、读取、写入、精确编辑、搜索、复制、移动、可恢复回收站 |
+| 文件 | 目录、读取、写入、精确编辑、搜索、复制、移动、可恢复回收站；附件元数据检索与有界分页 |
 | 搜索 | SearXNG / Brave / Tavily 可配服务，有限大小网页读取与来源链接 |
 | 记忆 | 分层原文与后台提炼、关键词/embedding/关系图混合检索、reranker、多来源别名与实际召回路径、相关资料与侧写共同注入、原文分页核查、冲突修订、来源级忘记 |
 | 电脑 | Linux AT-SPI 应用/窗口定位与节点操作；实验性 macOS AX 前台应用及原生引用；可选有界截图、录屏与统一附件引用 |
 | 渠道 | 可选 OneBot/NapCat、Telegram、QQ 官方机器人和微信 iLink；同一主身份、Team 后台报告保留原渠道、失效目的地持久阻塞与本地文件收发 |
-| 语音 | 独立默认关闭的网页录音转写草稿、本地中文声学唤醒与声纹桥接、录音参考、OpenAI 兼容 ASR/TTS；不附带本地模型 |
+| 语音 | 独立默认关闭的网页录音转写草稿、本地中文声学唤醒与声纹桥接、录音参考、OpenAI 兼容 ASR/TTS、完整转写留存与续读；不附带本地模型 |
 | 主动事件 | chiliarch 原生配对与 SSE 任务；持久提醒、维护结果与新版通知进入主会话，独立更新可按默认或显式记忆绑定通知，可选 Linux 桌面通知，无 AI 轮询 |
 | 扩展 | Agent Skills 渐进读取、用户目录 Python 插件与可选 MCP；工具、提示词、模型、路由和生命周期可扩展 |
 | 长任务 | 完整标题目录与已保存正文分页续读、后台分层压缩、协议回放、持久收件队列、完整任务说明、明确暂停与补充要求后的重新规划 |
@@ -111,6 +111,8 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [跨平台服务、截图和录屏](docs/platforms.md)
 - [应用、窗口与无障碍操作](docs/computer.md)
 - [中文唤醒与声纹桥接](docs/voice.md)
+- [完整语音转写与续读](docs/voice-transcripts-design.md)
+- [附件检索与分页](docs/attachment-search.md)
 - [工作台交互](docs/frontend.md)
 - [事件订阅与恢复位置](docs/event-subscription.md)
 - [会话恢复与当前执行](docs/session-recovery.md)

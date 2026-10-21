@@ -10,7 +10,7 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 2.23.0、`metadata_version=1`、交接协议 2、无需迁移，以及七领域各 `reads=[1]`、`writes=1`。这些 ID 对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[七领域合同 1](fresh-format-admission.md#七领域合同-1)；`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 2.24.0、`metadata_version=1`、交接协议 2、无需迁移，以及七领域各 `reads=[1]`、`writes=1`。这些 ID 对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[七领域合同 1](fresh-format-admission.md#七领域合同-1)；`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
 
 现有 Hatch `packages=["src/muli"]` 将包内非 Python 资产一并选入，不需要另造 manifest 生成器或增加强制覆盖规则，见 [Hatch 文件选择](https://hatch.pypa.io/latest/config/build/#file-selection)。构建必须保留源码中的真实文件；进程回归复制整个有界 MuLi 包并沿用它，不再临时写出一份自报声明。
 
