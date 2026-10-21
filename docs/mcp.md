@@ -29,7 +29,7 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 只有 JSON 布尔值 `enabled:true` 才会连接；省略、false 均不启动，`disabled:true` 优先禁用。配置管理接口要求 enabled/disabled 为布尔值，字符串 true 会被拒绝；独立使用管理器时，非布尔 true 也不会触发启动。`stdio` 可省略 transport；URL 默认使用 streamable HTTP，兼容 `http` / `streamable-http`，旧式 SSE 使用 `sse`。HTTP 支持 headers，stdio 支持 command、args、env、cwd，不通过 shell 拼接命令。
 
-## 目录发现与空闲热重载
+## 目录发现与活跃任务热重载
 
 除原有内联 `mcp` 外，运行时读取 `MULI_HOME/mcp.d/*.json`，默认是 `~/MuLi/mcp.d/`。`extensions.mcp_directory` 可替换目录，空字符串使用默认路径。只扫描一级 `.json` 普通文件，不递归、不跟随分片符号链接。每个分片仍使用 `{"mcpServers": {...}}`；**目录分片省略 enabled 时默认启用**，显式 false 或 `disabled:true` 停用。原有内联配置省略 enabled 仍停用。
 
@@ -41,15 +41,21 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 首次准备也核对读取前和发布前的同一来源指纹；等待 MCP 或 Skills 时发生编辑，会丢弃旧候选并让监听器重新准备，不能把新文件指纹记到旧工具代上。未发布的失败或取消清除观察状态，完整配置重建后的临时扫描错误恢复为原指纹时也能重试。坏 Skills 来源不会阻止仍可用的 MCP 配置与核心助手启动；失败状态不冒充目录已成功加载。详见[生命周期回归](extension-lifecycle-review.md)。
 
-发现变化或收到 `notifications/tools/list_changed` 后先合并为一个候选请求。主会话、queued/running agent 或未结束 workflow 忙碌时显示 queued；空闲后获取运行时配置锁，再检查真实活跃状态。队友报告等内部唤醒仍可在候选准备的等待期间启动主会话，因此在最后一次源核对之后、保存和发布之前再次同步检查 busy；发现新运行则丢弃候选，自动 reload 保留请求等待下次空闲。该检查到整组发布之间没有 await。未变服务器复用原连接；只为新增或改变的 HTTP/SSE 服务器建立候选连接。工具处理函数绑定已验证连接，发布时只替换 MCP 工具子集，不替换内置工具或其它 provider。
+发现变化或收到 `notifications/tools/list_changed` 后先合并为一个候选请求。纯扩展候选可以在主会话、队友和工作流运行期间准备并发布；配置锁仍串行化准备、来源复核、保存和发布，最后复核到整组发布之间没有 await。未变服务器复用原连接；只为新增或改变的 HTTP/SSE 服务器建立候选连接。工具处理函数始终绑定它验证过的连接，发布时只替换 MCP 工具子集，不替换内置工具或其它 provider。
 
-仅 Skills 文档的自主目录变化可以沿[独立 Skills 发布路径](skills-live-design.md)在任务活跃时生效；它不准备、重连、发布或退休 MCP。最后完整接受的 MCP 来源/配置/预算必须不变，且不能有未履行的手动重载或 catalog refresh；混合变化继续排队。该次 `last_apply` 明示 `scope:skills`、`mcp:unchanged`，扩展代次推进不代表 MCP 已重新连接。
+每轮实际模型请求开始前取得当前工具表，本轮 schema 与返回调用查同一份表。实际 MCP 发布会撤销旧代尚未进入 handler 的调用，包含仍在模型流、审批等待或同批前序工具等待中的调用；按原调用 ID 返回 `status:not_executed, code:generation_changed`，不会用旧名称投到新端点，也不自动重试。已经进入 handler 并登记为在途的调用保留原连接完成，结果继续使用旧代的密钥脱敏与输出预算；外部超时、取消和未知结果不被改称未执行。下一模型轮才使用新版 schema，主会话、reviewer、系统注意事项、禁用工具及最后无工具回合的限制保持不变。
 
-已有 stdio 服务器的配置变化保守返回 `restart_required`，保持旧进程和旧配置；不会先关闭旧进程来试运行候选。删除服务器仍可在空闲发布后关闭旧连接。要改变这类 stdio 配置，需要在停止或重启进程时应用源配置；窄管理接口不会提前保存无法发布的候选。
+仅 Skills 文档的自主目录变化继续沿[独立 Skills 发布路径](skills-live-design.md)生效；它不准备、重连、发布或退休 MCP，也不撤销已取得的 MCP handler。最后完整接受的 MCP 来源/配置/预算必须不变，且不能有未履行的手动重载或 catalog refresh；其它纯扩展变化走完整候选。该次 `last_apply` 明示 `scope:skills`、`mcp:unchanged`，扩展代次推进不代表 MCP 已重新连接。
 
-`PATCH /api/settings` 和 `self_configure` 的纯 `mcp`、`skills`、`extensions` 修改使用同一窄入口：先准备并验证全部候选，再原子保存配置，随后在没有 await 的步骤发布工具和 Skills 快照。保存失败丢弃候选，保留旧配置和旧能力。候选准备中出现新运行时，PATCH 返回 `409 runtime_busy` 且不保存；self_configure 保留 pending 计划及私有目标，等当前工作结束后重新准备。发布成功后才退休旧连接；旧连接关闭失败单独记为 retirement error，新代仍已生效，不声称回滚成功。退休任务由管理器强持有，调用者的重复取消不会取消正在关闭的连接；关闭失败的连接继续保留，由 shutdown 再尝试强制关闭客户端，不强杀进程、不重试工具执行。仍有未确认清理连接时拒绝新增候选并说明需要重启，避免重复积累连接。混合修改模型、渠道等其它配置仍走原有整体 reconfigure，暂不提供同等的候选保旧承诺。
+已有 stdio 服务器的配置变化保守返回 `restart_required`，保持旧进程和旧配置；不会先关闭旧进程来试运行候选。删除服务器发布后先撤销新调用，已接纳调用结束后才关闭旧连接。要改变这类 stdio 配置，需要在停止或重启进程时应用源配置；窄管理接口不会提前保存无法发布的候选。
 
-`GET /api/extensions`（以及 `/api/status`、`/api/management`、`self_status` 中的 extensions）返回代号、phase、指纹、分片来源、固定错误码、Skills 计数和关闭错误。`last_apply` 分别显示配置 unchanged/saved/save_failed、是否 published、旧连接退休 unneeded/pending/complete/failed；不会回显请求头、环境变量、URL、远端异常正文或 Skill 正文。`POST /api/extensions/reload` 接收 `{}`，返回 queued 状态，要求显式重查当前服务器目录；它不表示已换代。
+`PATCH /api/settings` 和 `self_configure` 的纯 `mcp`、`skills`、`extensions` 修改使用同一窄入口：先准备并验证全部候选，再原子保存配置，随后在没有 await 的步骤发布工具和 Skills 快照。保存失败或候选取消不发布，旧配置和旧 handler 继续可用。轮到的纯扩展计划无需等全局空闲；已有管理计划时仍须先完成或撤销它，纯扩展不越队。混合修改模型、渠道等其它配置仍走原有空闲与整体 reconfigure，暂不提供同等的候选保旧承诺。
+
+发布后旧连接先等待已接纳调用归零，再由管理器强持有的退休任务关闭；发布与配置锁不等待这些调用或关闭完成。至多当前与一个候选或待退休连接集合。仍有待回收连接时，目录请求合并排队，PATCH 返回 `409 generation_draining` 且不保存，管理计划保持 pending；不创建第三套连接。真正关闭失败单独记为 retirement error，新代仍已生效，不声称回滚成功；失败引用继续保留，后续准备说明需要重启，由 shutdown 再尝试强制关闭客户端，不强杀进程、不重试工具执行。调用者的重复取消不会取消已拥有的清理任务。在途调用已有执行期限，归零后的关闭沿原 timeout；不承诺任意 SDK 都可在固定总时长内回收。
+
+`GET /api/extensions`（以及 `/api/status`、`/api/management`、`self_status` 中的 extensions）返回代号、phase、指纹、分片来源、固定错误码、Skills 计数和关闭错误。`last_apply` 分别显示配置 unchanged/saved/save_failed、是否 published、旧连接退休 unneeded/draining/pending/complete/failed；`draining` 是仍有已接纳调用的旧连接数，`cleanup_pending` 包含待关闭和关闭失败，排队原因会区分回收等待与维护门。不会回显请求头、环境变量、URL、远端异常正文或 Skill 正文。`POST /api/extensions/reload` 接收 `{}`，返回 queued 状态，要求显式重查当前服务器目录；它不表示已换代。
+
+排队原因取 watcher 已观察到的状态，查询本身不重新读取维护门。局部 Skills 候选失效或准入暂阻时，尚未消费的请求和来源保留到正常下一观察轮；新请求或显式唤醒仍可提前触发。目录观察失败时也不在同一轮再次准备候选。
 
 默认每 2 秒轻扫描、500 毫秒合并变更，最多一个准备任务与一个 dirty 标记；相同失败指纹不会定时重连，只有源变化、新通知或显式 reload 才重试发现。工具执行本身仍不自动重试。关闭 watcher 后的迟到服务器通知不会恢复已删除连接。
 
@@ -69,7 +75,7 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 | debounce_seconds | 0.5 | 变更合并窗口 |
 | watch_enabled | true | 自动目录扫描；显式 reload 仍可用 |
 
-服务器合计仍最多 32 个。Skills 的读取、目录和活跃正文预算独立放在 `Settings.skills`。目录预算是在 MCP SDK 解码单页后核对，不保证传输层巨型单帧的预解码内存上限；没有跨进程持久化上一可用工具代，也不支持执行中换代或任意 Python 插件热卸载。
+服务器合计仍最多 32 个。Skills 的读取、目录和活跃正文预算独立放在 `Settings.skills`。目录预算是在 MCP SDK 解码单页后核对，不保证传输层巨型单帧的预解码内存上限；没有跨进程持久化上一可用工具代，不替换已接纳调用的实际连接，也不支持任意 Python 插件热卸载。
 
 ## 配置编辑与密钥
 
@@ -99,7 +105,7 @@ PATCH 中的 mcp 原子替换整个服务器配置；省略的服务器或密钥
 
 ## 验证边界
 
-`tests/test_mcp.py` 验证默认禁用、不自动下载、持久连接、命名隔离、统一外部风险、配置传递、错误遮盖、调用时限、取消和结果限制，以及完整分页、停滞游标、候选预算、失败保旧、复用连接归属、stdio 需重启、处理函数连接绑定和退休关闭失败。可选依赖存在时，还使用真实 FastMCP 客户端连接进程内测试服务器验证完整协议与关闭生命周期。`tests/test_extensions.py` 覆盖目录规则、分片预算、源变化、忙时排队、配置保存失败、准备期限、相同失败不循环重连和窄管理接线；门控真实队友报告在候选准备中唤醒离线主模型，核对 API 冲突、自动请求与管理计划重排，以及旧配置、工具与 Skills 代保留。没有连接用户的实际外部服务器，也没有下载服务器包。
+`tests/test_mcp.py` 验证默认禁用、不自动下载、持久连接、命名隔离、统一外部风险、配置传递、错误遮盖、调用时限、取消和结果限制，以及完整分页、停滞游标、候选预算、失败保旧、复用连接归属、stdio 需重启、旧 handler 撤销和退休关闭失败。可选依赖存在时，原有进程内 FastMCP 用例验证完整协议与关闭生命周期。`tests/test_extensions.py` 覆盖目录规则、分片预算、源变化、配置锁、保存失败、准备期限、相同失败不循环重连和窄管理接线；真实队友报告在候选准备中唤醒离线主模型，也不阻止纯扩展发布。专用代次回归使用真实 Runtime/Team 与假 provider/client，覆盖旧批配对、审批撤销、下一轮 schema、在途回收、旧秘密及候选取消；准确结果与旧实现反例见[代次发布记录](mcp-live-generation-design.md)。没有连接用户的实际外部服务器，也没有下载服务器包。
 
 `tests/conftest.py` 为每个测试隔离临时 `MULI_HOME`，并移除宿主的配置/数据目录环境覆盖；测试可自行覆盖这些变量来验证默认路径。没有显式配置目录的 Runtime 测试也不会扫描真实 `~/MuLi` 的扩展分片。
 
