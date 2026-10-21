@@ -24,6 +24,7 @@ from muli.conversation import Conversation
 from muli.events import EventBus
 from muli.evidence import EvidenceError
 from muli.extensions import Extensions
+from muli.failure_diagnostics import capture_failure
 from muli.history_evidence import HistoryEvidence
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
@@ -1190,6 +1191,12 @@ class Runtime:
             raise
         except Exception as exc:
             run["status"] = "failed"
+            if self.config.settings.system_events.enabled:
+                try:
+                    run["failure_diagnostic"] = capture_failure(exc)
+                except Exception:
+                    # Optional evidence must never replace the original failure.
+                    pass
             if self.system_logger is not None:
                 self.system_logger.error(
                     "runtime_failed",
