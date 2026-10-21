@@ -6,8 +6,14 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, Literal
 
+from muli.candidate_lineage import check_plan_budget
+from muli.candidate_policy import CandidateError, CandidateSettings, ExpectedPolicy
+from muli.candidate_policy_store import CandidatePolicyStore
+from muli.candidate_preparation import create_attempt
+from muli.candidate_update import CandidateUpdates, CapturedCandidate, UpdateRequest
 from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
 from muli.extensions import ExtensionError
@@ -51,7 +57,12 @@ class SelfManagement:
         self.directory = runtime.data_dir / "management"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.updates = Updates(runtime.config, runtime.store, runtime.bus)
+        self.update_policy = CandidatePolicyStore(runtime.store)
         self.recovery = RecoveryHost(runtime, service, bound_address=bound_address)
+        self._closing = False
+        self.candidates = CandidateUpdates(
+            runtime, service, self.update_policy, closing=lambda: self._closing
+        )
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._check: asyncio.Task[dict[str, Any]] | None = None
@@ -64,14 +75,30 @@ class SelfManagement:
     def plans(self) -> list[dict[str, Any]]:
         return self.runtime.store.list("management", 100)
 
+    def replace_update_policy(self, policy: CandidateSettings) -> CandidateSettings:
+        """The caller holds configuration_lock; saving does not start an update."""
+        if self._closing:
+            raise MaintenanceError("transaction_unavailable", "service_closing")
+        if not self.runtime.configuration_lock.locked():
+            raise MaintenanceError("configuration_lock_required")
+        self.runtime.maintenance.require_configuration()
+        return self.update_policy.replace(policy)
+
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         update = self.runtime.store.get("update", "latest")
         if update and update.get("available"):
-            instruction = (
-                "self_update仍须检查实际安装条件并经真实用户批准。"
-                if self.updates.capability()["format_eligible"]
-                else "当前自动安装不支持此资料库；不能把用户批准当作候选格式兼容证明。"
-            )
+            if self.updates.candidate_configured():
+                instruction = (
+                    "已配置本地候选来源；先用self_update_preview核验，再将返回的"
+                    "expected_policy原样用于self_update，经真实用户批准后准备和切换。"
+                    "预览或批准均不代表候选已经安装或通过服务健康检查。"
+                )
+            else:
+                instruction = (
+                    "self_update仍须检查实际安装条件并经真实用户批准。"
+                    if self.updates.capability()["format_eligible"]
+                    else "此资料库需要托管候选更新；先配置来源并核验，不能用批准代替格式证据。"
+                )
             messages.insert(
                 1,
                 Message(
@@ -92,12 +119,18 @@ class SelfManagement:
         *,
         apply_mode: Literal["in_process", "restart_transaction"] = "in_process",
         candidate: LocalCandidate | None = None,
+        candidate_update: CapturedCandidate | None = None,
     ) -> dict[str, Any]:
         await self.recovery.project()
         self.runtime.maintenance.require_configuration()
         if action not in {"configure", "restart", "update", "adopt", "switch"}:
             raise ValueError("未知管理操作")
-        validate_candidate(action, candidate)
+        if candidate_update is not None:
+            if action != "switch" or candidate is not None:
+                raise CandidateError("candidate_plan_invalid")
+            candidate_update.policy.verify(candidate_update.policy.expected)
+        else:
+            validate_candidate(action, candidate)
         if action != "configure" and changes:
             raise ValueError("只有配置操作接受配置变更")
         if action == "update":
@@ -165,6 +198,17 @@ class SelfManagement:
         if candidate is not None:
             item["candidate"] = candidate.model_dump()
         try:
+            if candidate_update is not None:
+                item.update(
+                    operation="update",
+                    expected_policy=candidate_update.policy.expected.model_dump(mode="json"),
+                    phase="candidate_queued",
+                )
+                if candidate_update.lineage is not None:
+                    item["source_candidate_evidence"] = (
+                        candidate_update.lineage.reference.model_dump(mode="json")
+                    )
+                self._check_candidate_plan(item)
             self.runtime.store.event("management.queued", item, objects=[("management", item)])
         except BaseException:
             path.unlink(missing_ok=True)
@@ -172,6 +216,32 @@ class SelfManagement:
         self._wake.set()
         await self.runtime.bus.notify()
         return item
+
+    def _check_candidate_plan(self, item: dict[str, Any]) -> None:
+        permit = self.runtime.maintenance.permit
+        if not isinstance(permit, ManagedBootPermit):
+            raise CandidateError("candidate_managed_boot_required")
+        check_plan_budget(item, permit.journal.limits.max_record_bytes)
+
+    async def stage_update(self, version: str, expected: ExpectedPolicy) -> dict[str, Any]:
+        from muli.updates import release_version
+
+        release_version(version)
+        async with self.runtime.configuration_lock:
+            captured = await self.candidates.capture()
+            if captured.policy.expected != expected:
+                raise CandidateError("candidate_policy_changed")
+            return await self.stage("switch", version=version, candidate_update=captured)
+
+    async def preview_update(self) -> dict[str, Any]:
+        async with self.runtime.configuration_lock:
+            captured = await self.candidates.capture()
+            return {
+                "mode": "retained_candidate",
+                "expected_policy": captured.policy.expected.model_dump(mode="json"),
+                "offline": True,
+                "requires_approval": True,
+            }
 
     async def cancel(self, identifier: str) -> dict[str, Any]:
         item = self.runtime.store.get("management", identifier)
@@ -186,6 +256,7 @@ class SelfManagement:
     async def start(self) -> None:
         if self._worker is not None:
             return
+        self._closing = False
         await self.recovery.project()
         current_transaction = self.recovery.current()["transaction"]
         for item in self.plans():
@@ -196,6 +267,20 @@ class SelfManagement:
                     and isinstance(item.get("transaction"), dict)
                     and item["transaction"].get("generation") == current_transaction["generation"]
                 ):
+                    continue
+                if item.get("operation") == "update" and item.get("phase") in {
+                    "candidate_preparing",
+                    "candidate_cleanup_required",
+                }:
+                    # The independent candidate unit may survive the host. A
+                    # lost task is not proof its process tree is empty.
+                    item.update(
+                        phase="candidate_cleanup_required",
+                        recovery_notice="candidate_cleanup_unconfirmed",
+                    )
+                    self.runtime.store.event(
+                        "management.progress", item, objects=[("management", item)]
+                    )
                     continue
                 current = fingerprint(self.runtime.config.settings)
                 item["status"] = (
@@ -248,7 +333,118 @@ class SelfManagement:
                     current = self.runtime.store.get("management", item["id"])
                     if current is None or current["status"] != "pending":
                         continue
-                    await self._apply(current)
+                    if current.get("operation") != "update":
+                        await self._apply(current)
+                        continue
+                # Candidate preparation owns its child processes but must leave
+                # ordinary configuration reads/changes and foreground work live.
+                await self._apply_candidate(current)
+
+    async def _apply_candidate(self, item: dict[str, Any]) -> None:
+        from muli.platforms.candidate_process import CandidateProcessError, run_candidate_process
+        from muli.platforms.managed_launcher import read_file
+
+        runtime = self.runtime
+        self._applying = asyncio.current_task()
+        path = self.directory / f"{item['id']}.json"
+        try:
+            async with runtime.configuration_lock:
+                runtime.maintenance.require_configuration()
+                if runtime.store.get("management", item["id"]) != item:
+                    raise CandidateError("candidate_plan_changed")
+                if item.get("action") != "switch" or item.get("status") != "pending":
+                    raise CandidateError("candidate_plan_invalid")
+                if fingerprint(runtime.config.settings) != item["base"]:
+                    raise CandidateError("candidate_configuration_changed")
+                data, _ = read_file(
+                    path, self.update_policy.read().limits.metadata_bytes, private=True
+                )
+                target = Settings.model_validate_json(data)
+                if fingerprint(target) != item["target"]:
+                    raise CandidateError("candidate_configuration_changed")
+                expected = ExpectedPolicy.model_validate(item["expected_policy"])
+                captured = await self.candidates.capture()
+                if runtime.store.get("management", item["id"]) != item:
+                    raise CandidateError("candidate_plan_changed")
+                if captured.policy.expected != expected:
+                    raise CandidateError("candidate_policy_changed")
+                source_reference = (
+                    captured.lineage.reference.model_dump(mode="json")
+                    if captured.lineage is not None
+                    else None
+                )
+                if item.get("source_candidate_evidence") != source_reference:
+                    raise CandidateError("candidate_source_evidence_changed")
+                item = {
+                    **item,
+                    "status": "applying",
+                    "phase": "candidate_preparing",
+                    "candidate_attempt": str(
+                        Path(captured.policy.settings.retained_root) / f"candidate-{item['id']}"
+                    ),
+                }
+                self._check_candidate_plan(item)
+                runtime.store.event("management.progress", item, objects=[("management", item)])
+            await runtime.bus.notify()
+            attempt = create_attempt(
+                captured.policy,
+                expected=expected,
+                request_id=item["id"],
+                version=item["version"],
+                configuration=data,
+            )
+            attempt.accept_uv_version(await run_candidate_process(attempt.uv_version_spec()))
+            attempt.accept_install(await run_candidate_process(attempt.install_spec()))
+            attempt.accept_dependencies(await run_candidate_process(attempt.dependency_spec()))
+            ready = attempt.finish(await run_candidate_process(attempt.probe_spec()))
+            async with runtime.configuration_lock:
+                if runtime.store.get("management", item["id"]) != item:
+                    raise CandidateError("candidate_plan_changed")
+                attempt.verify_ready(ready)
+                item = {
+                    **item,
+                    "phase": "candidate_ready",
+                    "candidate": {
+                        "prefix": str(ready.paths.prefix),
+                        "python": str(ready.paths.python),
+                        "package_root": str(ready.paths.package_root),
+                    },
+                    "candidate_evidence": ready.evidence_file.model_dump(mode="json"),
+                }
+                self._check_candidate_plan(item)
+                runtime.store.event("management.progress", item, objects=[("management", item)])
+                item = await self.recovery.prepare(
+                    item, target, candidate_guard=lambda: attempt.verify_ready(ready)
+                )
+        except asyncio.CancelledError:
+            # A preparation is single-use. The process backend settles its owned
+            # subtree first; a future boot records interruption, never reinstalls.
+            item.update(status="interrupted", error="candidate_preparation_interrupted")
+            raise
+        except Exception as exc:
+            transaction = self.recovery.current()["transaction"]
+            if transaction is not None and transaction["request_id"] == item["id"]:
+                item = runtime.store.get("management", item["id"]) or item
+                item.update(status="applying", transaction=transaction)
+                item["recovery_notice"] = "controller_unconfirmed"
+                runtime.maintenance.reconcile()
+            elif isinstance(exc, CandidateProcessError) and not exc.cleanup_confirmed:
+                item.update(
+                    status="applying",
+                    phase="candidate_cleanup_required",
+                    recovery_notice="candidate_cleanup_unconfirmed",
+                    candidate_unit=exc.unit_name,
+                )
+            else:
+                item.update(
+                    status="failed",
+                    error=self.recovery._reason(exc, "candidate_preparation_failed"),
+                )
+        finally:
+            try:
+                await self._finish_plan(item, path)
+            finally:
+                self._applying = None
 
     async def _apply(self, item: dict[str, Any]) -> None:
         self.runtime.maintenance.require_configuration()
@@ -293,42 +489,54 @@ class SelfManagement:
                 item.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
         finally:
             try:
-                # The durable plan may have gained its generation while prepare
-                # was awaiting the helper. Cancellation must not write the stale
-                # pre-prepare object back over that binding.
-                stored = self.runtime.store.get("management", item["id"])
-                transaction = self.recovery.current()["transaction"]
-                if (
-                    stored is not None
-                    and isinstance(stored.get("transaction"), dict)
-                    and transaction is not None
-                    and transaction["request_id"] == item["id"]
-                    and stored["transaction"].get("generation") == transaction["generation"]
-                ):
-                    item = stored
-                    if not transaction["resolved"]:
-                        item.update(status="applying", transaction=transaction)
-                if item["status"] not in {"pending", "applying"}:
-                    path.unlink(missing_ok=True)
-                if not (
-                    transaction is not None
-                    and transaction["resolved"]
-                    and stored is not None
-                    and item is stored
-                    and item["status"] in {"completed", "cancelled", "failed"}
-                ):
-                    self.runtime.store.event(
-                        "management.queued"
-                        if item["status"] == "pending"
-                        else "management.progress"
-                        if item["status"] == "applying"
-                        else "management.completed",
-                        item,
-                        objects=[("management", item)],
-                    )
-                await self.runtime.bus.notify()
+                await self._finish_plan(item, path)
             finally:
                 self._applying = None
+
+    async def _finish_plan(self, item: dict[str, Any], path: Path) -> None:
+        # Preparation may have durably published its generation while awaiting
+        # the helper. Never replace that binding with an older local plan copy.
+        stored = self.runtime.store.get("management", item["id"])
+        transaction = self.recovery.current()["transaction"]
+        if (
+            item.get("operation") == "update"
+            and stored is not None
+            and stored.get("status") == "cancelled"
+            and (transaction is None or transaction["request_id"] != item["id"])
+        ):
+            # The owner may cancel while a read-only source probe is awaiting
+            # systemd. Do not overwrite that terminal result with probe failure.
+            path.unlink(missing_ok=True)
+            return
+        if (
+            stored is not None
+            and isinstance(stored.get("transaction"), dict)
+            and transaction is not None
+            and transaction["request_id"] == item["id"]
+            and stored["transaction"].get("generation") == transaction["generation"]
+        ):
+            item = stored
+            if not transaction["resolved"]:
+                item.update(status="applying", transaction=transaction)
+        if item["status"] not in {"pending", "applying"}:
+            path.unlink(missing_ok=True)
+        if not (
+            transaction is not None
+            and transaction["resolved"]
+            and stored is not None
+            and item is stored
+            and item["status"] in {"completed", "cancelled", "failed"}
+        ):
+            self.runtime.store.event(
+                "management.queued"
+                if item["status"] == "pending"
+                else "management.progress"
+                if item["status"] == "applying"
+                else "management.completed",
+                item,
+                objects=[("management", item)],
+            )
+        await self.runtime.bus.notify()
 
     @property
     def idle(self) -> bool:
@@ -337,6 +545,7 @@ class SelfManagement:
         )
 
     async def close(self) -> None:
+        self._closing = True
         tasks = [task for task in (self._worker, self._check) if task is not None]
         for task in tasks:
             task.cancel()
@@ -345,7 +554,17 @@ class SelfManagement:
 
     def tools(self, runtime: Runtime) -> list[Tool]:
         async def configuration(args: dict[str, Any]) -> Any:
-            return runtime.config.public()
+            return {
+                **runtime.config.public(),
+                "candidate_update_policy": self.update_policy.read().model_dump(mode="json"),
+            }
+
+        async def configure_update(args: dict[str, Any]) -> Any:
+            policy = CandidateSettings.model_validate(args)
+            async with runtime.configuration_lock:
+                result = self.replace_update_policy(policy)
+            await runtime.bus.notify()
+            return result.model_dump(mode="json")
 
         async def configure(args: dict[str, Any]) -> Any:
             return await self.stage(
@@ -395,8 +614,14 @@ class SelfManagement:
         async def update(args: dict[str, Any]) -> Any:
             from muli.updates import release_version
 
-            release_version(str(args["version"]))
-            return await self.stage("update", version=str(args["version"]))
+            request = UpdateRequest.model_validate(args)
+            release_version(request.version)
+            if request.expected_policy is not None:
+                return await self.stage_update(request.version, request.expected_policy)
+            return await self.stage("update", version=request.version)
+
+        async def preview_update(args: dict[str, Any]) -> Any:
+            return await self.preview_update()
 
         async def install(args: dict[str, Any]) -> Any:
             return self.plugins.install(str(args["id"]), args["files"])
@@ -404,9 +629,16 @@ class SelfManagement:
         return [
             Tool(
                 "self_config",
-                "查看自身全部配置（密钥隐藏）；配置字段可通过管理API schema查看",
+                "查看自身全部配置（密钥隐藏）；candidate_update_policy单独通过self_update_configure保存",
                 parameters({}),
                 configuration,
+            ),
+            Tool(
+                "self_update_configure",
+                "完整替换候选更新策略；先读取现值，省略项恢复默认。只保存策略，不安装或切换",
+                CandidateSettings.model_json_schema(),
+                configure_update,
+                "write",
             ),
             Tool(
                 "self_configure",
@@ -468,9 +700,15 @@ class SelfManagement:
                 requires_approval=True,
             ),
             Tool(
+                "self_update_preview",
+                "只读核验当前托管安装与本地候选策略，返回供self_update批准使用的expected_policy",
+                parameters({}),
+                preview_update,
+            ),
+            Tool(
                 "self_update",
-                "核验安装条件后更新并重启；已认证格式的资料库暂不支持，始终需要真实用户批准",
-                parameters({"version": string()}, ("version",)),
+                "更新并重启；托管安装须先preview并原样带上expected_policy，始终需要真实用户批准",
+                UpdateRequest.model_json_schema(),
                 update,
                 "external",
                 requires_approval=True,

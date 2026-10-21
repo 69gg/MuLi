@@ -21,6 +21,7 @@ from muli import __version__
 from muli.attachments import SAFE_INLINE, Attachments
 from muli.attention import AttentionInbox
 from muli.auth import COOKIE_NAME, Authentication
+from muli.candidate_policy import CandidateSettings
 from muli.channel_application import ChannelApplication
 from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
@@ -843,6 +844,23 @@ def _create_app(
     async def transaction_status() -> dict[str, Any]:
         await management.recovery.project()
         return management.recovery.current()
+
+    @app.get("/api/management/update-policy")
+    async def update_policy() -> dict[str, Any]:
+        return management.update_policy.read().model_dump(mode="json")
+
+    @app.get("/api/management/update-preview")
+    async def update_preview() -> dict[str, Any]:
+        return await management.preview_update()
+
+    @app.put("/api/management/update-policy")
+    async def replace_update_policy(body: CandidateSettings) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = management.replace_update_policy(body)
+        await runtime.bus.notify()
+        return result.model_dump(mode="json")
 
     @app.post("/api/management/transactions")
     async def prepare_transaction(body: TransactionRequest) -> dict[str, Any]:

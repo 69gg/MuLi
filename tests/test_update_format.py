@@ -8,6 +8,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from muli.candidate_policy import CandidateSettings
+from muli.candidate_policy_store import CandidatePolicyStore
 from muli.config import ConfigFile, Settings
 from muli.events import EventBus
 from muli.format_evidence import FORMAT_STATE_KEY
@@ -143,9 +145,54 @@ async def test_version_notice_and_context_preserve_actual_installation_capabilit
             assert "检查安装条件" in notices[0]["content"]
             assert "真实用户批准" in context[0].content
         else:
-            assert "尚不支持自动安装" in notices[0]["content"]
-            assert "当前自动安装不支持" in context[0].content
+            assert "先配置来源并核验候选格式" in notices[0]["content"]
+            assert "先配置来源并核验" in context[0].content
             assert "可更新到" not in context[0].content
+    finally:
+        await manager.close()
+        await runtime.close()
+
+
+@pytest.mark.parametrize("damaged", [False, True])
+async def test_candidate_notice_is_only_a_configured_hint_not_installation_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damaged: bool
+) -> None:
+    runtime = runtime_at(tmp_path)
+    manager = manager_for(runtime)
+    forbid_installation(monkeypatch)
+    CandidatePolicyStore(runtime.store).replace(
+        CandidateSettings(
+            enabled=True,
+            wheelhouse=str(tmp_path / "absent-materials"),
+            retained_root=str(tmp_path / "absent-retained"),
+            uv_executable=str(tmp_path / "absent-uv"),
+        )
+    )
+    if damaged:
+        runtime.store.put("update_policy", {"id": "candidate-v1", "schema_version": 999})
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200, json={"info": {"name": "muli-agent", "version": "99.0.0"}}
+                )
+            )
+        ) as client:
+            result = await manager.updates.check(client, independent=True)
+        assert result["available"] and result["status"] == "checked"
+        context = await manager.context(runtime.main_session()["id"], [])
+        notice = runtime.store.list("notification")[0]["content"]
+        if damaged:
+            assert "先配置来源" in notice
+            assert "已配置本地候选来源" not in context[0].content
+        else:
+            assert "先预检" in notice
+            assert "self_update_preview" in context[0].content
+            assert "expected_policy" in context[0].content
+            assert "不代表候选已经安装" in context[0].content
+        assert not manager.plans()
+        assert not (tmp_path / "absent-retained").exists()
+        assert not manager.updates.capability()["format_eligible"]
     finally:
         await manager.close()
         await runtime.close()

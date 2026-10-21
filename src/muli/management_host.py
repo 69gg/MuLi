@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -216,10 +217,16 @@ class RecoveryHost:
                     pass  # Retain the snapshot and retry cleanup on the next projection read.
             self.runtime.maintenance.reconcile()
 
-    async def prepare(self, item: dict[str, Any], target: Settings) -> dict[str, Any]:
+    async def prepare(
+        self,
+        item: dict[str, Any],
+        target: Settings,
+        *,
+        candidate_guard: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         try:
             self.require_listener(target)
-            return await self._prepare(item, target)
+            return await self._prepare(item, target, candidate_guard=candidate_guard)
         except BaseException:
             # The previous with-block has released its possibly poisoned lock.
             # Keep the original error, but recover the logical view if a fresh
@@ -230,7 +237,13 @@ class RecoveryHost:
                 pass  # Retain the one attempt for the next explicit recovery.
             raise
 
-    async def _prepare(self, item: dict[str, Any], target: Settings) -> dict[str, Any]:
+    async def _prepare(
+        self,
+        item: dict[str, Any],
+        target: Settings,
+        *,
+        candidate_guard: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         runtime = self.runtime
         runtime.maintenance.require_configuration()
         if not runtime.configuration_lock.locked():
@@ -241,7 +254,9 @@ class RecoveryHost:
             and current.binding("target" if current.phase == "committed" else "base").entry
             == "managed"
         ):
-            return await self._prepare_managed(item, target)
+            return await self._prepare_managed(item, target, candidate_guard=candidate_guard)
+        if candidate_guard is not None:
+            raise MaintenanceError("managed_boot_required")
         manifest = await self.verify()
         permit = runtime.maintenance.permit
         assert permit is not None
@@ -348,7 +363,14 @@ class RecoveryHost:
         await runtime.bus.notify()
         return queued
 
-    async def _prepare_managed(self, item: dict[str, Any], target: Settings) -> dict[str, Any]:
+    async def _prepare_managed(
+        self,
+        item: dict[str, Any],
+        target: Settings,
+        *,
+        candidate_guard: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        from muli.candidate_lineage import check_plan_budget, read_lineage
         from muli.managed_host import ensure_managed_helper
         from muli.managed_preparation import LocalSlotPaths, ManagedPreparation
         from muli.managed_requests import LocalCandidate, validate_candidate
@@ -367,8 +389,39 @@ class RecoveryHost:
             else None
         )
         await self.project(strict=True)
+        source_guard = candidate_guard
+        permit = self.runtime.maintenance.permit
+        if isinstance(permit, ManagedBootPermit):
+            plan_limit = permit.journal.limits.max_record_bytes
+            current = await ManagedPreparation(self.runtime, self.service).observe_current()
+            lineage = read_lineage(self.runtime.store, current, plan_limit=plan_limit)
+            reference = lineage.reference.model_dump(mode="json") if lineage else None
+            if (
+                "source_candidate_evidence" in item
+                and item["source_candidate_evidence"] != reference
+            ):
+                raise MaintenanceError("candidate_source_evidence_changed")
+            if reference is not None and "source_candidate_evidence" not in item:
+                item = {**item, "source_candidate_evidence": reference}
+                check_plan_budget(item, plan_limit)
+                self.runtime.store.event(
+                    "management.progress", item, objects=[("management", item)]
+                )
+
+            def verify_source() -> None:
+                current.verify()
+                if read_lineage(self.runtime.store, current, plan_limit=plan_limit) != lineage:
+                    raise MaintenanceError("candidate_source_evidence_changed")
+                if candidate_guard is not None:
+                    candidate_guard()
+
+            source_guard = verify_source
         prepared = await ManagedPreparation(self.runtime, self.service).prepare(
-            item, target, candidate=candidate, listener_guard=self.require_listener
+            item,
+            target,
+            candidate=candidate,
+            listener_guard=self.require_listener,
+            source_guard=source_guard,
         )
         permit = self.runtime.maintenance.permit
         assert permit is not None
@@ -379,6 +432,7 @@ class RecoveryHost:
         ):
             raise MaintenanceError("managed_preparation_plan_changed")
         queued["transaction"] = prepared.record.public()
+        check_plan_budget(queued, permit.journal.limits.max_record_bytes)
         self.runtime.store.event("management.prepared", queued, objects=[("management", queued)])
         self.runtime.maintenance.reconcile()
         with permit.journal.locked() as control:

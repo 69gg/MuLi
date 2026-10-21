@@ -78,6 +78,16 @@ class Updates:
         if not capability["format_eligible"]:
             raise ValueError(capability["code"])
 
+    def candidate_configured(self) -> bool:
+        """A notice hint only; actual boot, materials and policy need preview."""
+        from muli.candidate_policy import CandidateError
+        from muli.candidate_policy_store import CandidatePolicyStore
+
+        try:
+            return CandidatePolicyStore(self.store).read().enabled
+        except CandidateError:
+            return False
+
     async def check(
         self,
         client: httpx.AsyncClient | None = None,
@@ -129,7 +139,9 @@ class Updates:
                     + (
                         "可以让沐璃检查安装条件并在你同意后更新。"
                         if eligible
-                        else "当前资料库需要先核验候选格式，尚不支持自动安装此版本。"
+                        else "已配置本地候选来源，可以让沐璃先预检，再经你同意后准备和切换。"
+                        if self.candidate_configured()
+                        else "当前资料库需要托管候选更新，先配置来源并核验候选格式。"
                     ),
                     "source": "update",
                     "read": False,

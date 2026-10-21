@@ -406,6 +406,7 @@ class ManagedPreparation:
         *,
         candidate: LocalSlotPaths | None = None,
         listener_guard: Callable[[Settings], None] | None = None,
+        source_guard: Callable[[], None] | None = None,
     ) -> PreparedManaged:
         runtime = self.runtime
         runtime.maintenance.require_configuration()
@@ -477,6 +478,9 @@ class ManagedPreparation:
         assert source.plan is not None
         queued = {**source.plan, "status": "applying", "transaction": {"generation": generation}}
         journal = permit.journal
+        from muli.candidate_lineage import check_plan_budget
+
+        check_plan_budget(queued, journal.limits.max_record_bytes)
         expected = source.previous
         expected_plan = source.plan
         with journal.locked() as control:
@@ -491,6 +495,11 @@ class ManagedPreparation:
 
             def validate() -> None:
                 gate()
+                # Once prepared has been published, the live-source observer
+                # correctly rejects the previous resolved record. The journal,
+                # selected files and existing validate() now own that handoff.
+                if expected == source.previous and source_guard is not None:
+                    source_guard()
                 if listener_guard is not None:
                     listener_guard(target)
                 self._paths(permit)
