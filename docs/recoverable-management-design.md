@@ -1,6 +1,6 @@
 # 可恢复的自身配置、重启与更新
 
-状态：本文保留跨进程恢复的整体设计与历史分片基线。Linux 同版本恢复已随 2.19 接入；本地保留安装的 protocol 2、稳定入口、公开迁入/切换、启动准入和终态投影已接入 2.22 开发分支，当前范围见[本地托管切换](managed-operations.md)。2.22 尚未发布，也未在用户真实 systemd 服务上执行，没有实测中断时长或恢复成功率；临时进程与 fake manager 的验证不能替代该证据。同版本入口与原分块证据见[恢复入口](linux-recovery-operations.md)和[分块证据](restart-transaction-v2.15-design.md)。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
+状态：本文保留跨进程恢复的整体设计与历史分片基线。Linux 同版本恢复已随 2.19 发布；本地保留安装的 protocol 2、稳定入口、公开迁入/切换、启动准入和终态投影已随 2.22 发布，2.23 增加离线候选准备及中断清理。当前范围见[本地托管切换](managed-operations.md)和[候选管理接入](candidate-host-design.md)，下文分片基线不覆盖这些后续接线。尚未在用户真实 systemd 服务上执行，没有实测中断时长或恢复成功率；临时进程与 fake manager 的验证不能替代该证据。同版本入口与原分块证据见[恢复入口](linux-recovery-operations.md)和[分块证据](restart-transaction-v2.15-design.md)。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
 
 ## 交付目标与最小范围
 
@@ -12,7 +12,7 @@
 
 ## 设计起点及可复用部分
 
-下表保留改造前的基线与当时缺口；同版本入口以[恢复操作](linux-recovery-operations.md)为准，本地保留安装与真实格式准入的当前接线见[本地托管切换](managed-operations.md)。下文的 uv 自动候选准备仍是设计，不属于当前本地候选切换入口。
+下表保留改造前的基线与当时缺口；同版本入口以[恢复操作](linux-recovery-operations.md)为准，本地保留安装与真实格式准入的当前接线见[本地托管切换](managed-operations.md)。2.23 已实现有限离线 wheelhouse 候选准备；下文的在线来源与完整历史解析上下文仍是设计，不属于当前入口。
 
 | 位置 | 已有行为 | 本方案需要补齐 |
 | --- | --- | --- |
@@ -123,13 +123,13 @@ uv 没有这里所需的通用安装目录硬配额开关。磁盘预留、有�
 
 候选以 probation 启动：可完成本地配置/数据库兼容检查和恢复，但在 committed 前不得自动唤醒 pending、发送渠道消息、运行模型、启动外部 MCP/插件副作用或触发 onboarding。同版本入口已将这些动作分成被动准备与提交后激活；跨版本候选还须在 Store 构造前证明持久格式兼容，不能只复用一个 HTTP 检查。健康证明只承诺已验证的本地核心能力；外部服务和任意插件真实工作能力另列未验证，不以模型请求作为更新探针。
 
-确认后先持久 committed，再解除准入门；候选若在这两步之间死亡，下次启动继续同一个已提交代并重新确认本地就绪，不能误当未提交而还原数据库。提交后组件激活失败记录 degraded/activation_failed，允许程序回退但不承诺撤销已经发生的外部动作。成功报告回到原发起会话，同一 transaction 只交付一次意图，发送确认未知仍沿用既有 outbox 语义。
+确认后先持久 committed，再解除准入门；候选若在这两步之间死亡，下次启动继续同一个已提交代并重新确认本地就绪，不能误当未提交而还原数据库。当前实现对提交后组件激活失败保留终态并标记 activation=blocked，须接续核验，不自动改成提交前的回退；也不承诺撤销已经发生的外部动作。成功报告回到原发起会话，同一 transaction 只交付一次意图，发送确认未知仍沿用既有 outbox 语义。
 
 恢复配置必须比较当前文件与本事务 target 指纹：只有仍是本事务所写目标时才能恢复旧快照；用户期间手工修改、路径被替换或内容损坏则 recovery_required，不覆盖新设置。恢复旧文件成功仍需旧运行时/服务健康；不能仅凭文件指纹相同就把管理操作记 completed。
 
 ## 数据兼容与回退边界
 
-本节保留 protocol 2 接线前发现的单安装约束及其解决条件。下列启动、角色准入与本地候选切换现已接线；自动下载/准备候选和迁出托管仍不属于当前范围，见[本地托管切换](managed-operations.md)。
+本节保留 protocol 2 接线前发现的单安装约束及其解决条件。下列启动、角色准入与本地候选切换现已接线，2.23 已加入有限离线准备；在线下载候选和迁出托管仍不属于当前范围，见[本地托管切换](managed-operations.md)及[候选管理接入](candidate-host-design.md)。
 
 跨版本接线必须显式引入 protocol 2，保留 protocol 1 的 DTO 与单安装比较。代码审查已确认，单安装约束分布在 `TransactionRecord.accepts`、BootPermit、Linux bootstrap、安装 manifest 与终态投影中；不能把任一处改成“两个安装之一即可”便当作角色准入。V2 每个阶段须唯一选择 base 或 target，并记录双方安装/兼容声明摘要与共同 Store/main 身份。
 
@@ -145,7 +145,7 @@ prepare 时的兼容判定只负责早拒。每次候选或回退 boot 都须在
 
 [兼容元数据纯判定](upgrade-compatibility.md)独立区分 database、objects、configuration、ingress、outbox、memory、install_profile 七个完整语义领域。判定器自身只比较经调用者提供的声明，不读取真实库、不发当前版本格式标记，也不授权切换；当前宿主另外核实际发行声明与真实格式证据。缺少来源证明、原版本 manifest 或真实格式证据时仍拒绝；protocol 1 的单安装身份不因声明中的协议数字相同而变成 A/B 协议。
 
-[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；uv 身份、完整解析上下文与自动候选安装仍未实现。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；完整候选准入已按[无迁移启动方案](no-migration-startup-design.md)接入 V2 启动链。
+[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；2.23 候选入口另核验 uv 和离线安装条件，不恢复未知的完整历史解析上下文，也不支持在线下载候选。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；完整候选准入已按[无迁移启动方案](no-migration-startup-design.md)接入 V2 启动链。
 
 [格式证据读取器](format-evidence.md)由宿主提供专用连接，在单一快照中核对完整格式标记、资料库及主人主会话身份，读取预算有限且不补数据。读取器已用于 V2 prepare 和 boot；它自身不认证连接路径、发行来源或格式语义，这些证据由调用链分别核验。缺少完整标记的历史库仍拒绝，不能自动补出兼容证明。
 

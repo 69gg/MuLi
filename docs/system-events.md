@@ -45,6 +45,8 @@ system_events / attention 组件不能再次通知；明确 notify=false 的上�
 
 `self_events` 为只读工具，查询已保留的固定错误元数据；`self_logs` 继续按需读取服务日志。可按精确 `level`、`component`、`code`、`run_id`、`session_id` 过滤，默认 20 条，最多 100 条。`before_event_id` 使用规范十进制字符串，按创建事件 ID 降序翻页，避免大整数精度丢失。重复计数更新不会改变位置，计数反映本次读取时的值。
 
+取得运行 ID 后，可用 [`self_failure`](failure-diagnostics.md) 查询随失败终态保存的有限包内位置。它不读取异常正文、不自动进入通知，也不覆盖所有进程崩溃；旧运行、采集关闭、尚未保存和读取超限会明确返回缺失原因。系统事件级别仍按原规则控制采集和通知。
+
 结果提供 `items`、`next_before_event_id`、`has_more`、`truncated`、保留 ID 范围及无效/无法关联证据计数，只返回白名单字段。每条必须与 canonical `system.log` 事件一致；无效页仍推进游标，不回显畸形内容。完整 JSON 信封按工具输出预算截断，不跨过放不下的下一条；连首条都放不下时明确报 `output_budget`。
 
 每条原记录及 canonical 事件的读取上限为 32 KiB，容纳合法的完整 route、来源 input ID 和记忆证据的多字节/JSON 转义形式；该内部证据上限不扩大返回字段或工具输出预算，路由和记忆证据不会出现在查询响应中。
