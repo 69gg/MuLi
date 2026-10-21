@@ -114,6 +114,7 @@ class Commands:
                         "query_code": "ok",
                         "failure": "none",
                         "unit": f"user@{self.uid}.service",
+                        "process": worker.process_unavailable(),
                         "units": [
                             {"unit": name, "code": "unit_absent"}
                             for name in (
@@ -1848,7 +1849,34 @@ def test_setup_receipt_phase_is_a_strict_fixed_enum(
 
 
 @pytest.mark.parametrize(
-    "case", ["present", "absent", "bad-list", "get-unit", "property", "bus", "budget", "deadline"]
+    "case",
+    [
+        "present",
+        "absent",
+        "bad-list",
+        "get-unit",
+        "property",
+        "bus",
+        "budget",
+        "deadline",
+        "executor",
+        "other-image",
+        "exe-permission",
+        "uid-mismatch",
+        "typed-pid-change",
+        "typed-group-change",
+        "ticks-change",
+        "proc-group-change",
+        "exe-change",
+        "uid-change",
+        "state-change",
+        "proc-budget",
+        "proc-deadline",
+        "no-pid",
+        "proc-missing",
+        "bad-stat",
+        "bad-uid",
+    ],
 )
 async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
@@ -1857,6 +1885,7 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
     from types import SimpleNamespace
 
     from muli import process
+    from muli.platforms import linux_transaction
 
     user, uid, home = "muli-ci-" + "a" * 12, 23145, tmp_path / "private-home"
     names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
@@ -1865,19 +1894,73 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
     }
     calls: list[list[str]] = []
     clock = 100.0
+    proc_calls: list[str] = []
+    proc_limits: list[int] = []
+    image_calls = 0
+    binding_calls = 0
+    group = f"/user.slice/{names[-1]}"
+    images = {
+        "manager": "/usr/lib/systemd/systemd",
+        "executor": "/usr/lib/systemd/systemd-executor",
+    }
     monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(worker, "system_executables", lambda: images)
+
+    def read_proc(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        nonlocal clock
+        assert directory_fd is None and path.parent == Path("/proc/42")
+        assert path.name in {"stat", "status", "cgroup"} and 0 < limit < ci.OUTPUT_BYTES
+        if proc_limits:
+            assert limit < proc_limits[-1]
+        proc_limits.append(limit)
+        proc_calls.append(path.name)
+        if case == "proc-missing":
+            raise PermissionError("secret proc body")
+        if case == "proc-budget":
+            return b"x" * (limit + 1)
+        if case == "proc-deadline":
+            clock = 105.0
+        count = proc_calls.count(path.name)
+        if path.name == "stat":
+            if case == "bad-stat":
+                return b"secret malformed stat"
+            state = "R" if case == "state-change" and count == 1 else "S"
+            ticks = 101 if case == "ticks-change" and count > 1 else 100
+            return f"42 (secret ) (name) {state} {'0 ' * 18}{ticks}\n".encode()
+        if path.name == "status":
+            if case == "bad-uid":
+                return b"Uid:\ttrue 1 1 1\n"
+            value = 0 if case == "uid-mismatch" or (case == "uid-change" and count > 1) else uid
+            return f"Name:\tsecret\nUid:\t{value}\t{value}\t{value}\t{value}\n".encode()
+        current = "/foreign" if case == "proc-group-change" and count > 1 else group + "/init.scope"
+        return f"0::{current}\n".encode()
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", read_proc)
 
     async def query(
         argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
     ) -> dict[str, Any]:
-        nonlocal clock
-        assert argv[:2] == ["busctl", "--system"] and "--user" not in argv
-        assert "--auto-start=no" in argv and not merge_stderr
+        nonlocal clock, image_calls, binding_calls
+        assert not merge_stderr
         assert 0 < timeout <= 5 and 0 < limit <= ci.OUTPUT_BYTES
+        calls.append(argv)
+        if argv[:4] == ["sudo", "--non-interactive", "--", "readlink"]:
+            assert argv == ["sudo", "--non-interactive", "--", "readlink", "--", "/proc/42/exe"]
+            image_calls += 1
+            if case == "exe-permission":
+                return {"exit_code": 1, "output": "", "stderr": "secret permission body"}
+            kind = (
+                "executor"
+                if case == "executor" or (case == "exe-change" and image_calls > 1)
+                else "manager"
+            )
+            image = "/private/secret/systemd" if case == "other-image" else images[kind]
+            return {"exit_code": 0, "output": image + "\n", "stderr": ""}
+        assert argv[:2] == ["busctl", "--system"] and "--user" not in argv
+        assert "--auto-start=no" in argv
         assert all(
             command not in argv for command in ("start", "stop", "set-property", "journalctl")
         )
-        calls.append(argv)
         if case == "bus":
             return {"exit_code": 7, "output": "", "stderr": "Failed to connect to bus secret"}
         if "ListUnitsByPatterns" in argv:
@@ -1922,11 +2005,18 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
                     "Result": ("s", "success"),
                     "ExecMainCode": ("i", 0),
                     "ExecMainStatus": ("i", 0),
-                    "MainPID": ("u", 42),
+                    "MainPID": ("u", 0 if case == "no-pid" else 42),
                     "ControlGroup": ("s", f"/user.slice/{name}"),
                 }
                 if case == "property":
                     rows["MainPID"] = ("u", True)
+                if name == names[-1] and fields == ["MainPID", "ControlGroup"]:
+                    binding_calls += 1
+                    if binding_calls > 1:
+                        if case == "typed-pid-change":
+                            rows["MainPID"] = ("u", 43)
+                        if case == "typed-group-change":
+                            rows["ControlGroup"] = ("s", "/foreign")
                 output = "\n".join(
                     json.dumps({"type": rows[field][0], "data": rows[field][1]}) for field in fields
                 )
@@ -1936,14 +2026,67 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
     monkeypatch.setattr(process, "run_process", query)
     value = await worker.diagnose_setup(user, uid, home, 105.0)
     assert "secret" not in json.dumps(value) and len(value["units"]) <= 2
-    if case in {"present", "absent"}:
+    proc_cases = {
+        "present",
+        "executor",
+        "other-image",
+        "exe-permission",
+        "uid-mismatch",
+        "typed-pid-change",
+        "typed-group-change",
+        "ticks-change",
+        "proc-group-change",
+        "exe-change",
+        "uid-change",
+        "state-change",
+        "proc-budget",
+        "proc-deadline",
+        "no-pid",
+        "proc-missing",
+        "bad-stat",
+        "bad-uid",
+    }
+    if case in proc_cases | {"absent"}:
         assert value["failure"] == "none" and len(value["units"]) == 2
         assert [item["unit"] for item in value["units"]] == list(names)
-        if case == "present":
+        if case in proc_cases:
             assert all(
-                item["pid"] == 42 and item["job"] == 11 and item["cgroup_present"]
+                item["pid"] == (0 if case == "no-pid" else 42)
+                and item["job"] == 11
+                and item["cgroup_present"]
                 for item in value["units"]
             )
+            observed = value["process"]
+            if case in {"present", "executor", "other-image", "uid-mismatch", "state-change"}:
+                assert observed == {
+                    "code": "observed",
+                    "exe": {"executor": "executor", "other-image": "other"}.get(case, "manager"),
+                    "uid_matches": case != "uid-mismatch",
+                    "state": "S",
+                }
+                assert (
+                    image_calls == 2
+                    and proc_calls.count("stat") == 2
+                    and proc_calls.count("status") == 2
+                )
+            else:
+                code = {
+                    "exe-permission": "unavailable",
+                    "proc-missing": "unavailable",
+                    "no-pid": "pid_absent",
+                    "proc-budget": "output_budget",
+                    "proc-deadline": "timeout",
+                    "bad-stat": "invalid_reply",
+                    "bad-uid": "invalid_reply",
+                }.get(case, "identity_changed")
+                assert observed == {
+                    "code": code,
+                    "exe": "unavailable",
+                    "uid_matches": None,
+                    "state": "",
+                }
+                if case == "no-pid":
+                    assert proc_calls == [] and image_calls == 0
         else:
             assert all(item["code"] == "unit_absent" for item in value["units"]) and len(calls) == 2
     elif case == "get-unit":
@@ -2011,3 +2154,69 @@ def test_setup_diagnostic_cli_keeps_separate_readonly_mode(
     assert worker.main() == 0
     assert called == [("muli-ci-" + "a" * 12, 23145, tmp_path, 105.0)]
     assert json.loads(capsys.readouterr().out) == {"stage": "manager"}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "extra",
+        "exe-path",
+        "unknown-code",
+        "uid-type",
+        "state-text",
+        "unavailable-detail",
+        "observed-unavailable",
+    ],
+)
+def test_process_diagnostic_export_rejects_noncanonical_or_private_fields(change: str) -> None:
+    value: dict[str, Any] = {
+        "code": "observed",
+        "exe": "manager",
+        "uid_matches": True,
+        "state": "S",
+    }
+    assert ci.process_facts(value)
+    if change == "extra":
+        value["path"] = "/private/secret"
+    elif change == "exe-path":
+        value["exe"] = "/private/secret/systemd"
+    elif change == "unknown-code":
+        value["code"] = "private-error-body"
+    elif change == "uid-type":
+        value["uid_matches"] = 1
+    elif change == "state-text":
+        value["state"] = "private-state"
+    elif change == "unavailable-detail":
+        value["code"] = "unavailable"
+    else:
+        value["exe"] = "unavailable"
+    assert not ci.process_facts(value)
+
+
+@pytest.mark.parametrize("change", ["owned", "uid", "group-write", "world-write", "not-regular"])
+def test_system_image_classification_requires_actual_fixed_root_owned_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    from types import SimpleNamespace
+
+    directory = tmp_path / "systemd"
+    directory.mkdir()
+    paths = {"manager": directory / "systemd", "executor": directory / "systemd-executor"}
+    for path in paths.values():
+        path.write_bytes(b"not an executable fixture")
+    alias = tmp_path / "alias"
+    alias.symlink_to(directory, target_is_directory=True)
+    monkeypatch.setattr(worker, "SYSTEM_EXECUTABLE_ROOTS", (alias, tmp_path / "absent"))
+    original = Path.stat
+
+    def info(path: Path, *, follow_symlinks: bool = True) -> Any:
+        if path in paths.values():
+            mode = stat.S_IFDIR | 0o755 if change == "not-regular" else stat.S_IFREG | 0o755
+            mode |= {"group-write": 0o020, "world-write": 0o002}.get(change, 0)
+            return SimpleNamespace(st_mode=mode, st_uid=1000 if change == "uid" else 0)
+        return original(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", info)
+    assert worker.system_executables() == (
+        {kind: str(path) for kind, path in paths.items()} if change == "owned" else {}
+    )

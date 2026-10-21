@@ -9,9 +9,11 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import sys
 import sysconfig
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -32,6 +34,8 @@ HARNESS_MEMORY = MEMORY // 4
 HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
+PROCESS_STATES = frozenset("RSDZTtXxKWPI")
+SYSTEM_EXECUTABLE_ROOTS = (Path("/usr/lib/systemd"), Path("/lib/systemd"))
 
 
 class NativeError(ValueError):
@@ -367,8 +371,131 @@ async def diagnose(user: str, uid: int, home: Path, unit: str, deadline: float) 
     return facts
 
 
+def system_executables() -> dict[str, str]:
+    """Classify only existing, root-owned system images at the fixed system paths."""
+    result: dict[str, str] = {}
+    for kind, name in (("manager", "systemd"), ("executor", "systemd-executor")):
+        for parent in SYSTEM_EXECUTABLE_ROOTS:
+            try:
+                path = (parent / name).resolve(strict=True)
+                info = path.stat()
+                if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022:
+                    result[kind] = str(path)
+                    break
+            except OSError:
+                continue
+    return result
+
+
+def process_unavailable(code: str = "not_started") -> dict[str, Any]:
+    return {"code": code, "exe": "unavailable", "uid_matches": None, "state": ""}
+
+
+async def observe_setup_process(
+    probe: SystemdProbe,
+    path: str,
+    uid: int,
+    pid: int,
+    group: str,
+    read: Callable[[int, str], Awaitable[bytes | None]],
+    deadline: float,
+) -> dict[str, Any]:
+    """A bounded observation window, not an atomic snapshot or process authority."""
+    from muli.platforms.linux_transaction import _cgroup, _start_ticks
+
+    if pid == 0:
+        return process_unavailable("pid_absent")
+    try:
+        require(0 < pid < 2**31 and bool(_cgroup(group)), "native_diagnostic_invalid")
+        binding = {"MainPID": pid, "ControlGroup": group}
+        fields = (("MainPID", "u"), ("ControlGroup", "s"))
+        before = await probe._properties(path, "Service", fields)
+        require(before == binding, "native_process_changed")
+
+        async def required(name: str) -> bytes:
+            value = await read(pid, name)
+            if value is None:
+                raise OSError
+            return value
+
+        async def cgroup() -> str:
+            value = (await required("cgroup")).decode("ascii")
+            lines = value.splitlines()
+            require(len(lines) == 1 and lines[0].startswith("0::"), "native_diagnostic_invalid")
+            current = _cgroup(lines[0][3:])
+            require(current == group or current.startswith(group + "/"), "native_process_changed")
+            return current
+
+        async def uids() -> tuple[int, ...]:
+            rows = [
+                row[4:].split()
+                for row in (await required("status")).splitlines()
+                if row.startswith(b"Uid:")
+            ]
+            require(
+                len(rows) == 1 and len(rows[0]) == 4 and all(item.isdigit() for item in rows[0]),
+                "native_diagnostic_invalid",
+            )
+            values = tuple(int(item) for item in rows[0])
+            require(all(0 <= item < 2**32 for item in values), "native_diagnostic_invalid")
+            return values
+
+        async def image() -> str:
+            value = (await required("exe")).decode("utf-8").removesuffix("\n")
+            require(
+                value.startswith("/") and not any(item in value for item in ("\n", "\r", "\0")),
+                "native_diagnostic_invalid",
+            )
+            return value
+
+        first = await required("stat")
+        ticks = _start_ticks(first, pid)
+        first_group = await cgroup()
+        first_image = await image()
+        first_uids = await uids()
+        last_uids = await uids()
+        last_image = await image()
+        last_group = await cgroup()
+        last = await required("stat")
+        last_ticks = _start_ticks(last, pid)
+        after = await probe._properties(path, "Service", fields)
+        require(
+            ticks == last_ticks
+            and before == after
+            and first_group == last_group
+            and first_image == last_image
+            and first_uids == last_uids,
+            "native_process_changed",
+        )
+        state = last.rsplit(b")", 1)[1].split()[0].decode("ascii")
+        require(state in PROCESS_STATES, "native_diagnostic_invalid")
+        known = system_executables()
+        remaining(deadline)
+        return {
+            "code": "observed",
+            "exe": next((kind for kind, value in known.items() if value == last_image), "other"),
+            "uid_matches": all(value == uid for value in last_uids),
+            "state": state,
+        }
+    except TimeoutError:
+        return process_unavailable("timeout")
+    except OSError:
+        return process_unavailable("unavailable")
+    except ValueError as error:
+        code = {
+            "native_deadline_exceeded": "timeout",
+            "native_diagnostic_output_budget": "output_budget",
+            "native_process_changed": "identity_changed",
+        }.get(str(error), "invalid_reply")
+        return process_unavailable(code)
+
+
 async def observe_setup_units(
-    probe: SystemdProbe, uid: int, facts: dict[str, Any]
+    probe: SystemdProbe,
+    uid: int,
+    facts: dict[str, Any],
+    read: Callable[[int, str], Awaitable[bytes | None]],
+    deadline: float,
 ) -> dict[str, Any]:
     """Read the two dedicated system units without depending on their user bus."""
     from muli.platforms.linux_transaction import _typed
@@ -484,6 +611,10 @@ async def observe_setup_units(
                 "cgroup_present": bool(group),
             }
         )
+        if name == names[-1]:
+            facts["process"] = await observe_setup_process(
+                probe, path, uid, service["MainPID"], group, read, deadline
+            )
     facts["failure"] = "none"
     return facts
 
@@ -507,6 +638,7 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
         "failure": "not_started",
         "unit": "",
         "units": [],
+        "process": process_unavailable(),
     }
     try:
         account = pwd.getpwnam(user)
@@ -517,36 +649,69 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
 
         used = 0
 
-        async def query(
-            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
-        ) -> dict[str, Any]:
+        def charge(data: bytes) -> None:
             nonlocal used
-            require(
-                argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command"
-            )
-            facts["query_status"], facts["query_code"] = None, "not_started"
-            if used >= MAX_BYTES:
-                facts["query_code"] = "output_budget"
-                raise NativeError("native_diagnostic_invalid")
+            used += len(data)
+            require(used <= MAX_BYTES, "native_diagnostic_output_budget")
+
+        async def command(argv: list[str], *, timeout: float, limit: int) -> dict[str, Any]:
+            require(used < MAX_BYTES, "native_diagnostic_output_budget")
             result = await run_process(
-                [argv[0], "--system", *argv[2:]],
+                argv,
                 timeout=min(timeout, remaining(deadline)),
                 limit=min(limit, MAX_BYTES - used),
                 merge_stderr=False,
             )
+            output, stderr = result.get("output"), result.get("stderr")
+            if not isinstance(output, str) or not isinstance(stderr, str):
+                raise NativeError("native_diagnostic_invalid")
+            charge(output.encode())
+            charge(stderr.encode())
+            remaining(deadline)
+            return result
+
+        async def query(
+            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+        ) -> dict[str, Any]:
+            require(
+                argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command"
+            )
+            facts["query_status"], facts["query_code"] = None, "not_started"
+            try:
+                result = await command(
+                    [argv[0], "--system", *argv[2:]], timeout=timeout, limit=limit
+                )
+            except NativeError as error:
+                if str(error) == "native_diagnostic_output_budget":
+                    facts["query_code"] = "output_budget"
+                raise
             status = result.get("exit_code")
             facts["query_status"] = (
                 status if type(status) is int and -(2**31) <= status < 2**31 else None
             )
             facts["query_code"] = diagnostic_command_code(status, result.get("stderr"))
-            output, stderr = result.get("output"), result.get("stderr")
-            if not isinstance(output, str) or not isinstance(stderr, str):
-                raise NativeError("native_diagnostic_invalid")
-            used += len(output.encode()) + len(stderr.encode())
-            if used > MAX_BYTES:
-                facts["query_code"] = "output_budget"
-                raise NativeError("native_diagnostic_invalid")
             return result
+
+        async def read(pid: int, name: str) -> bytes | None:
+            from muli.platforms.linux_transaction import _read_regular
+
+            require(
+                0 < pid < 2**31 and name in {"stat", "status", "cgroup", "exe"},
+                "native_diagnostic_command",
+            )
+            remaining(deadline)
+            if name == "exe":
+                result = await command(
+                    ["sudo", "--non-interactive", "--", "readlink", "--", f"/proc/{pid}/exe"],
+                    timeout=CLEANUP_SECONDS,
+                    limit=MAX_BYTES,
+                )
+                return result["output"].encode() if result.get("exit_code") == 0 else None
+            require(used < MAX_BYTES, "native_diagnostic_output_budget")
+            data = _read_regular(Path("/proc") / str(pid) / name, MAX_BYTES - used)
+            charge(data)
+            remaining(deadline)
+            return data
 
         async with asyncio.timeout(remaining(deadline)):
             return await observe_setup_units(
@@ -556,6 +721,8 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
                 ),
                 uid,
                 facts,
+                read,
+                deadline,
             )
     except TimeoutError:
         facts["failure"], facts["query_code"] = "deadline", "timeout"

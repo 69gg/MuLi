@@ -155,6 +155,19 @@ SETUP_COMMANDS = frozenset({"daemon_reload", "manager_start", "manager_show"})
 SETUP_PHASES = frozenset(
     {"initial"} | {f"{name}_{edge}" for name in SETUP_COMMANDS for edge in ("before", "after")}
 )
+PROCESS_CODES = frozenset(
+    {
+        "not_started",
+        "observed",
+        "pid_absent",
+        "unavailable",
+        "identity_changed",
+        "output_budget",
+        "timeout",
+        "invalid_reply",
+    }
+)
+PROCESS_STATES = frozenset("RSDZTtXxKWPI")
 
 
 def command_code(status: int | None, output: bytes) -> str:
@@ -270,6 +283,27 @@ def startup_facts(value: object, unit: str) -> bool:
     )
 
 
+def process_facts(value: object) -> bool:
+    """Export a finite observation window, never raw proc fields or paths."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"code", "exe", "uid_matches", "state"}
+        or not isinstance(value["code"], str)
+        or value["code"] not in PROCESS_CODES
+        or not isinstance(value["exe"], str)
+        or value["exe"] not in {"manager", "executor", "other", "unavailable"}
+        or not isinstance(value["state"], str)
+    ):
+        return False
+    if value["code"] == "observed":
+        return (
+            value["exe"] != "unavailable"
+            and type(value["uid_matches"]) is bool
+            and value["state"] in PROCESS_STATES
+        )
+    return value["exe"] == "unavailable" and value["uid_matches"] is None and value["state"] == ""
+
+
 def setup_facts(value: object) -> bool:
     """Only the confirmed UID's two system units may enter setup evidence."""
     fields = {
@@ -284,6 +318,7 @@ def setup_facts(value: object) -> bool:
         "failure",
         "unit",
         "units",
+        "process",
     }
     if (
         not isinstance(value, dict)
@@ -302,6 +337,7 @@ def setup_facts(value: object) -> bool:
         or value["stage"] not in DIAGNOSTIC_STAGES
         or not isinstance(value["failure"], str)
         or value["failure"] not in DIAGNOSTIC_FAILURES
+        or not process_facts(value["process"])
     ):
         return False
     uid = value["uid"]
@@ -1226,6 +1262,12 @@ class NativeCI:
             "failure": "not_started",
             "unit": "",
             "units": [],
+            "process": {
+                "code": "not_started",
+                "exe": "unavailable",
+                "uid_matches": None,
+                "state": "",
+            },
         }
         end = time.monotonic() + CLEANUP_SECONDS
         try:
