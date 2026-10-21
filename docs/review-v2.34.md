@@ -1,7 +1,7 @@
 # 2.34 MCP 接收保护审查
 
-状态：最终精确候选八项 CI 全部成功，原提交已合入 main 并推送签名标签；
-main 与发行流水线验收进行中，尚未确认 PyPI/GitHub 包发布。
+状态：已正式发布。最终精确候选/main 各八项与发行十一项全部成功，PR40 原提交
+合入，签名标签及 PyPI/GitHub 两构件元数据一致；精确证据见末节。
 真实外部 MCP、stdio 帧保护及 Linux 原生 systemd 整链不属于这里的成功证据。
 
 ## 用户结果与实现
@@ -82,6 +82,20 @@ CI `39583336308` attempt 1 最终七项成功、quality 一项失败；六平台
 提交。签名标签 `v2.34.0` 对象 `9d4271955896cadefaead22d31185706e5bd009b`
 指向该提交，本地与 GitHub 均确认 GPG 有效。首次七项成功、一项失败的记录保留。
 
-同一 SHA 的 [main CI](https://github.com/69gg/MuLi/actions/runs/39585414183) 和
-[发行流水线](https://github.com/69gg/MuLi/actions/runs/39585416301) 尚在运行；
-不会将标签已推送等同于包已发布或所有发行作业成功。
+同一 SHA 的 [main CI](https://github.com/69gg/MuLi/actions/runs/39585414183)
+attempt 1 八项成功；[发行流水线](https://github.com/69gg/MuLi/actions/runs/39585416301)
+attempt 1 十一项成功，包括重复完整矩阵、质量、MCP 和 prepare/publish/github-release。
+根逐个核对全部作业的精确 SHA 与终态，不以候选检查替代发行验收。
+
+[GitHub v2.34.0](https://github.com/69gg/MuLi/releases/tag/v2.34.0)（release `419435201`）
+于 2026-10-21 10:41:11 UTC 发布，非草稿、非预发布。根读取小型元数据确认与
+[PyPI 2.34.0](https://pypi.org/project/muli-agent/2.34.0/) 两包的名称、大小和 SHA256
+一致，PyPI 均未撤回；没有下载或安装发行包。
+
+| 文件 | 字节 | SHA256 |
+| --- | ---: | --- |
+| `muli_agent-2.34.0-py3-none-any.whl` | 764254 | `de9bf54533da4234e455d6081f00cb4dca957057a087661e0ee989872e79d7b4` |
+| `muli_agent-2.34.0.tar.gz` | 3905102 | `5790e8c7cf66bf3cdf4e21247bd0557a2a4cb19ad8c1109a23c66b3a500b42bd` |
+
+首次候选的类型检查失败保留，不移动或重写已发布标签。发布后继续统一通知、
+资源能力设计及独立 Linux 原生验收，未将这些后续工作记作本版本已交付。
