@@ -24,7 +24,7 @@
 | `src/muli/tools/mcp.py:819–857、669–689` | 最后同步 generation/连接/latch 门、在途登记、期限和退休已有实现；资源操作沿同一所有者，不建第二套连接。 |
 | `src/muli/runtime.py:1631–1667、1750–1785`、`src/muli/permissions.py:25–67` | 工具统一经过审批与最后请求门；`preserve_output` 让完整结果进入上下文，放不下时明确失败。不能仅在资源 handler 内核输出预算。 |
 
-协议依据：[2025-06-18 resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources)、[pagination](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination)。资源能力以 `resources is not None` 判断，`resources={}` 合法，subscribe/listChanged 都不是必需条件。SDK 游标只作为原样不透明值回传，不能解析、修改或跨 session 持久化。
+协议依据：[2025-06-18 resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources)、[pagination](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination)。资源能力以 `resources is not None` 判断，`resources={}` 合法，subscribe/listChanged 都不是必需条件。SDK 1.21 的 `Cursor=str`、`nextCursor: Cursor | None` 没有非空约束；缺失或 `None` 才终止，空字符串必须原样发给下一页。游标不能解析、修改或跨 session 持久化。
 
 ## 能力、工具与兼容
 
@@ -43,7 +43,7 @@
 - 沿用当前有效 `MCPLimits.max_pages`（默认 8）作为本次资源目录页数上限、`max_catalog_bytes`（默认 256 KiB）作为本次全部目录页逻辑 JSON 总字节上限；分别计费，不冒充 wire 上限或原工具目录合计。新增说明这两个既有上限也限制显式资源目录操作，不添加 Settings 字段或新策略对象。
 - 使用命名协议常量 `MAX_RESOURCE_ITEMS=256`、`MAX_RESOURCE_URI_BYTES=4096` 和 `MAX_RESOURCE_CONTENT_BLOCKS=16`，分别限制目录实际条目遍历、URI 和读取块数。这是首片协议边界，不接受环境变量扩大，不建立另一套配置平台；更小的既有目录/输出/接收预算先到即止。
 - 在逐项处理前核实际列表长度；所有条目与页均计数，包括空页、重复 URI、未知字段和随后不展示的元数据。每页整个 SDK 结果（包含 extra/_meta）参与总逻辑 JSON 字节计费，之后仅保留允许字段；序列化失败归一固定码。该计费发生在 SDK 解码后，不能取代接收 guard。
-- 重复 URI、空或重复 nextCursor、缺字段、类型错误、超页/条目/总字节预算均整体失败。达到上限但仍有 nextCursor，不能把前缀标成完整。空目录只有在实际资源列表为空且没有 nextCursor 时才完整成功。
+- 重复 URI、重复 nextCursor、缺字段、类型错误、超页/条目/总字节预算均整体失败。空字符串是合法游标，第二次出现同一空字符串仍算分页停滞。达到上限但 `nextCursor is not None`，不能把前缀标成完整；空目录只有在实际资源列表为空且 `nextCursor is None` 时才完整成功。
 - 名称、title、description、mimeType、size 仅作为有界服务端元数据。未知字段不传播或求值，不据此执行、抓取、生成工具或扩大权限；已被 SDK 接受的额外元数据不因名称新颖而单独拒绝。size 是估计，不是内容已读或安全证明。
 
 一次失败、取消或超限不发布部分目录，也不冒用旧目录作为这次成功结果；旧完整目录可保留其原身份。接收 latch 已失败时旧目录同样不能再授权 RPC。
@@ -85,7 +85,7 @@ read 只接受当前目录实际已展示项的 ref，并核 server、generation
 专用新测试先用旧实现证明“没有按需资源入口/资源专用服务器错误请求 tools/list”，再验证：
 
 1. resources 缺失与 `{}`、tools-only 旧 fake、资源专用服务器、真正空目录；严格 extra 投影及未知元数据计费。
-2. SDK 原 cursor 原样传递、多页终结、重复 URI/游标、空页带 cursor、最后一页刚好/超预算；失败或取消不发布前缀，不因多页续期。
+2. SDK 原 cursor（含空字符串）原样传递、仅 None 终结、重复 URI/游标（含重复空串）、空页带 cursor、最后一页刚好/超预算；失败或取消不发布前缀，不因多页续期。
 3. 超过单模型页但未超总目录预算的列表，以宿主 cursor 完整拼回；每个 ID/URI 不变、不跳项。引用数有界，重复翻页不增长；刷新/换代/关闭使旧 ref 失效，Skills-only 不误撤销。
 4. 真 Runtime/假 provider 的完整页与多块文本，经实际请求装配和三种 codec 保持 full；超批次预算明确失败且不发下一请求，宿主标记不进入 wire schema。
 5. URI 只能来自已展示引用；file/custom scheme 不产生本机读或另一次 HTTP，正文指令不改变权限；blob/混合/未知形状明确拒绝，错误不返回假空文本。
@@ -93,3 +93,9 @@ read 只接受当前目录实际已展示项的 ref，并核 server、generation
 7. 可选 MCP extras job 用锁定 SDK/FastMCP 与流式 MockTransport 验证实际 resources/list/read；普通无 extras 矩阵仍收集纯值、租约与 Runtime 测试。外部网络、真实 stdio 和下载均硬阻断。
 
 首片不承诺服务端跨页或正文快照、任意恶意 transport 的整体 RSS、进程重启后旧引用恢复、模板/二进制兼容、旧 slot 执行资源防护或实际外部服务器验收。现有[研究](mcp-resources-research.md)保留其当时证据；[接收预算](mcp-wire-budget-design.md)是前置边界，不是资源功能已经完成的证明。
+
+## 工具目录空游标的独立兼容修复
+
+现有工具目录曾以 `not next_cursor` 拒绝合法空串。假客户端返回两页、首个游标为空时，旧实现稳定返回零工具；仅移除非空判断后完整发现两项。新增四个唯一 case，连同原分页/适配器回归共 **11 项唯一测试**通过（先跑的 5 项已包含其中）：空串原样交下一页及锁定 SDK 参数，重复空串仍停滞，页数、目录预算、失败保旧及候选关闭不变。
+
+两份 Python 的 Ruff/format 与单源码 mypy 通过；pytest 峰 66.6 MiB、mypy 峰 177.8 MiB，swap 0。全部经根守卫、每条 30 秒串行执行，未运行真实 in-process MCP、stdio、网络或服务。这只验收工具目录的游标谓词，不代表本资源设计已经实现。

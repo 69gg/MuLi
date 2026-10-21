@@ -45,6 +45,10 @@ Context7 当前检索返回了 SDK v2/main 文档，不能据此给此安装声�
   的 `list_resources` 与 `list_resource_templates` 支持
   `params=PaginatedRequestParams(cursor=...)`；旧 cursor 位置参数已标记弃用。
   可复用 MuLi 工具目录适配器的分页形态，而不是依赖 FastMCP 高层自动取完目录。
+  固定版本 `types.py` 的 `Cursor=str`、`nextCursor: Cursor | None` 没有非空约束；
+  [分页协议](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination)
+  要求游标不透明、原样回传。空字符串不能当作结束或坏格式，缺失/None 才结束，
+  重复空串仍须受停滞与原页数预算保护。工具目录的独立窄修与验证见[设计附记](mcp-resources-design.md#工具目录空游标的独立兼容修复)，不表示资源能力已经交付。
 - [Streamable HTTP](https://github.com/modelcontextprotocol/python-sdk/blob/v1.21.0/src/mcp/client/streamable_http.py)
   的 JSON 路径先 `response.aread()` 再交给 Pydantic，SSE 路径先取得完整事件数据再解析。
   此版本暴露 `httpx_client_factory`，但该入口本身不是字节限制；对 POST、后台 GET 和

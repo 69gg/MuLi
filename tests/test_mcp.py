@@ -385,6 +385,64 @@ async def test_complete_paginated_catalog_and_zero_tool_server() -> None:
         await empty.close()
 
 
+async def test_empty_opaque_cursor_reaches_the_next_catalog_page() -> None:
+    client = PagedClient([(["first"], ""), (["last"], None)])
+    manager = MCPManager(settings(), client_factory=lambda *_: client)
+    try:
+        tools = await manager.start()
+        assert len(tools) == 2
+        assert client.cursors == [None, ""]
+        assert [tool.name for tool in manager._connections["test"].catalog] == ["first", "last"]
+    finally:
+        await manager.close()
+    assert client.closed == 1
+
+
+@pytest.mark.parametrize(
+    "pages,limits,code,cursors",
+    [
+        pytest.param(
+            [(["one"], ""), (["two"], "")],
+            MCPLimits(),
+            "pagination_stalled",
+            [None, ""],
+            id="repeated-empty",
+        ),
+        pytest.param(
+            [(["one"], "")],
+            MCPLimits(max_pages=1),
+            "page_budget_exceeded",
+            [None],
+            id="page-limit",
+        ),
+    ],
+)
+async def test_empty_opaque_cursor_keeps_existing_page_guards(
+    pages: list[tuple[list[str], str | None]],
+    limits: MCPLimits,
+    code: str,
+    cursors: list[str | None],
+) -> None:
+    original, replacement = FakeClient(), PagedClient(pages)
+    manager = MCPManager(
+        settings(),
+        client_factory=lambda server, _: (
+            original if server["url"].endswith("/mcp") else replacement
+        ),
+    )
+    try:
+        old_tools = await manager.start()
+        with pytest.raises(MCPPrepareError) as failed:
+            await manager.prepare(settings(url="https://example.test/new"), limits=limits)
+        assert failed.value.code == code
+        assert replacement.cursors == cursors
+        assert manager.tools == old_tools
+        assert original.closed == 0 and replacement.closed == 1
+        assert not (await old_tools[0].handler({"q": "still available"}))["is_error"]
+    finally:
+        await manager.close()
+
+
 @pytest.mark.parametrize(
     "pages,limits,code",
     [
@@ -575,7 +633,10 @@ async def test_failed_retirement_stays_owned_and_shutdown_reclaims_it() -> None:
         await manager.close()
 
 
-async def test_locked_fastmcp_adapter_passes_sdk_cursor_without_single_page_helper() -> None:
+@pytest.mark.parametrize("cursor", ["second-page", ""], ids=["nonempty", "empty"])
+async def test_locked_fastmcp_adapter_passes_sdk_cursor_without_single_page_helper(
+    cursor: str,
+) -> None:
     pytest.importorskip("mcp")
     params: list[Any] = []
 
@@ -585,8 +646,8 @@ async def test_locked_fastmcp_adapter_passes_sdk_cursor_without_single_page_help
             return SimpleNamespace(tools=[], nextCursor=None)
 
     adapter = _FastMCPClient(SimpleNamespace(session=Session()))
-    assert await adapter.list_tools_page("second-page") == ToolPage([])
-    assert params[0].cursor == "second-page"
+    assert await adapter.list_tools_page(cursor) == ToolPage([])
+    assert params[0].cursor == cursor
 
 
 async def test_late_notifications_cannot_resurrect_retired_or_closed_connections() -> None:

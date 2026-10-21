@@ -478,7 +478,7 @@ class MCPManager:
             next_cursor = page.next_cursor
             if next_cursor is None:
                 return tuple(catalog)
-            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in cursors:
+            if not isinstance(next_cursor, str) or next_cursor in cursors:
                 raise MCPPrepareError("pagination_stalled")
             cursors.add(next_cursor)
             cursor = next_cursor
