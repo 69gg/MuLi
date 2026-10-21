@@ -39,9 +39,23 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
         python: ['3.12', '3.13']
+        include:
+          - os: ubuntu-latest
+            python: '3.12'
+            shard: 1
+          - os: ubuntu-latest
+            python: '3.12'
+            shard: 2
+          - os: ubuntu-latest
+            python: '3.13'
+            shard: 1
+          - os: ubuntu-latest
+            python: '3.13'
+            shard: 2
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +84,12 @@ jobs:
           export MULI_MANAGED_TEST_ROOT="$directory"
           uv run python -c "import os; from pathlib import Path; from muli.platforms.filesystem_identity import verify_local_filesystems; verify_local_filesystems((Path(os.environ['MULI_MANAGED_TEST_ROOT']),))"
           printf 'MULI_MANAGED_TEST_ROOT=%s\n' "$directory" >> "$GITHUB_ENV"
-      - run: uv run pytest -q -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
+      - name: Run complete suite on macOS and Windows
+        if: runner.os != 'Linux'
+        run: uv run pytest -q --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
+      - name: Run disjoint Linux suite partition
+        if: runner.os == 'Linux'
+        run: uv run pytest -q --muli-ci-shard=${{ matrix.shard }} --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
       - name: Release Linux recovery filesystem fixture
         if: always() && runner.os == 'Linux'
         shell: bash
@@ -84,7 +103,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: channel-recovery-${{ matrix.os }}-${{ matrix.python }}
+          name: channel-recovery-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.shard || 'all' }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
