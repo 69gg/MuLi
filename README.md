@@ -109,6 +109,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [按运行查询故障位置](docs/failure-diagnostics.md)
 - [chiliarch 接入](docs/chiliarch.md)
 - [可选通讯渠道与本地文件收发](docs/channels.md)
+- [微信语音文字与原始录音](docs/weixin-voice-ingress.md)
 - [跨平台服务、截图和录屏](docs/platforms.md)
 - [应用、窗口与无障碍操作](docs/computer.md)
 - [中文唤醒与声纹桥接](docs/voice.md)
