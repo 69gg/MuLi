@@ -417,7 +417,7 @@ async def test_status_probe_shared_cached_and_cancelled_observer_does_not_cancel
     [
         ("linux", "auto", "atspi"),
         ("darwin", "auto", "ax"),
-        ("win32", "auto", "unavailable"),
+        ("win32", "auto", "uia"),
         ("darwin", "atspi", "atspi"),
         ("linux", "ax", "ax"),
     ],

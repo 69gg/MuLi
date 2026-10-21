@@ -35,7 +35,7 @@ async def check_installed(target: Path) -> None:
     from muli.config import ConfigFile
     from muli.format_admission import CURRENT_FORMAT_STATE
     from muli.server import create_app
-    from muli.tools import atspi_helper, ax_helper, ax_lease
+    from muli.tools import atspi_helper, ax_helper, ax_lease, uia_computer
     from muli.tools.computer import ComputerError
 
     assert muli.__file__ is not None
@@ -43,6 +43,12 @@ async def check_installed(target: Path) -> None:
     assert Path(atspi_helper.__file__).resolve().is_relative_to(target.resolve())
     assert Path(ax_helper.__file__).resolve().is_relative_to(target.resolve())
     assert Path(ax_lease.__file__).resolve().is_relative_to(target.resolve())
+    uia_script = Path(uia_computer.__file__).with_name("uia_helper.ps1")
+    assert uia_script.resolve().is_relative_to(target.resolve())
+    uia_source = uia_script.read_bytes().decode("utf-8", errors="strict")
+    assert "function Initialize-Uia" in uia_source
+    assert "function Read-Snapshot" in uia_source
+    assert "$PSModuleAutoLoadingPreference = 'None'" in uia_source
     with (Path(muli.__file__).parent / "compatibility.json").open("rb") as stream:
         declaration = CompatibilityManifest.from_json(stream.read(16_384 + 1))
     assert declaration.release == muli.__version__
