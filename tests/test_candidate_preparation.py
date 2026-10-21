@@ -120,7 +120,7 @@ def install_fixture(value: CandidateAttempt) -> ReadyCandidate:
     value.install_spec()
     slot = _slot(value.root / "tools", "muli-agent")
     declaration = Path(slot.declaration.path)
-    declaration.write_bytes(declaration.read_bytes().replace(b"2.22.0", b"2.23.0"))
+    declaration.write_bytes(declaration.read_bytes().replace(b"2.22.0", value.version.encode()))
     intent = value.policy.original_intent
     tool = {
         "requirements": [
@@ -131,7 +131,7 @@ def install_fixture(value: CandidateAttempt) -> ReadyCandidate:
             item.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
             for item in intent.constraints
         ]
-        + [{"name": "muli-agent", "specifier": "==2.23.0"}],
+        + [{"name": "muli-agent", "specifier": f"=={value.version}"}],
         "overrides": [
             item.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
             for item in intent.overrides

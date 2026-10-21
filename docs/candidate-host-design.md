@@ -20,6 +20,13 @@
 批准门，不因会话处于 yolo 自动放行；宿主从真实策略重新获取路径和预算，不采用
 工具参数决定安装路径。原位旧资料库路径仍独立受原有安装/格式门约束。
 
+可选在线路径另使用 `self_update_online_configure` / `GET/PUT /api/management/update-online-policy`，
+默认关闭且不扩主配置。启用后预览必须提供精确 `version`；只读取有限元数据，返回
+`expected_artifact` 与 `expected_policy`，二者必须作为同一次 `self_update` 真实批准的
+参数。宿主在排队前重取元数据并核实际策略/来源；worker 仅消费同计划冻结事实，
+把一枚已核 MuLi universal wheel 加入本次私有材料，然后沿原四步离线准备。
+不会网络补齐依赖、借全局缓存或在恢复时重新安装；详见[在线材料合同](bounded-online-candidate-design.md)。
+
 ## 一份计划和一份事务
 
 候选更新计划第一次保存即为 `action=switch, operation=update`，携带目标版本、

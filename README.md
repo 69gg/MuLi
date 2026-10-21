@@ -75,7 +75,9 @@ Linux 本地候选托管切换提供 `self_adopt`、`self_switch` 和 `self_reco
 
 已托管的 Linux 安装可配置本地 wheelhouse，通过 `self_update_preview` 核验候选
 来源，再经真实用户批准执行 `self_update`。准备进程有资源预算与持久恢复记录，
-中断后由 `self_recover` 收尾；策略默认关闭，不自动下载依赖。配置、使用顺序及
+中断后由 `self_recover` 收尾；策略默认关闭，不自动下载依赖。另可启用独立在线策略，
+预览精确版本并批准完整构件事实后，在预算内获取一枚 MuLi wheel，再走同一离线准备；
+依赖仍需本地 wheelhouse，缺失时保留旧安装。配置、使用顺序及
 尚未实测的真实系统恢复边界见[候选更新说明](docs/candidate-host-design.md)。
 
 Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当前用户计划任务及 `pythonw.exe`，不弹出命令窗口。它们通常随用户登录启动。Linux 退出登录后仍需运行时，可按系统策略启用 user lingering；MuLi 不更改系统登录策略。桌面权限与实际平台验证范围见[平台能力](docs/platforms.md)。

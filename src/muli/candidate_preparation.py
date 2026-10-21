@@ -8,6 +8,7 @@ existing verified current-source observation and owns the execution backend.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import stat
@@ -123,6 +124,7 @@ class CandidateSource:
     verify: Callable[[], None] = field(repr=False, compare=False)
     previous: CandidateEvidence | None = field(default=None, repr=False)
     protected_roots: tuple[Path, ...] = field(default=(), repr=False)
+    observed_format: FormatState | None = field(default=None, repr=False)
 
     def original_intent(self) -> InstallIntent:
         self.verify()
@@ -233,9 +235,15 @@ def _archive(
 
 
 def _wheel(
-    root: Path, descriptor: int, name: str, limits: CandidateLimits, deadline: float
+    root: Path,
+    descriptor: int,
+    name: str,
+    limits: CandidateLimits,
+    deadline: float,
+    *,
+    filename: str | None = None,
 ) -> WheelEvidence:
-    parse_wheel_filename(name)
+    parse_wheel_filename(filename or name)
     handle = os.open(
         name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
     )
@@ -260,7 +268,7 @@ def _wheel(
         ):
             raise CandidateError("candidate_material_changed")
     return WheelEvidence(
-        name=name,
+        name=filename or name,
         fingerprint=FileFingerprint(
             path=str(root / name), identity=identity, digest=digest.hexdigest()
         ),
@@ -542,6 +550,48 @@ class CandidateAttempt:
     metadata: tuple[FileFingerprint, ...]
     _stage: str = "new"
     _uv_version: str | None = None
+    _download_size: int = 0
+    _downloaded: WheelEvidence | None = None
+
+    @property
+    def material_digest(self) -> str:
+        if self._downloaded is None:
+            return self.policy.materials.digest
+        return hashlib.sha256(
+            _canonical(
+                {
+                    "local": self.policy.materials.digest,
+                    "online": self._downloaded.model_dump(mode="json"),
+                }
+            )
+        ).hexdigest()
+
+    def accept_download(self, expected: WheelEvidence, approval: bytes) -> None:
+        """Admit one already verified wheel before any process specification.
+
+        Reuse the ordinary whole-wheelhouse budgets and compare every original
+        copied wheel. Adding a file cannot authorize replacement of a dependency.
+        """
+        if self._stage != "download_pending":
+            raise CandidateError("candidate_stage_invalid")
+        self.observe()
+        current = inspect_wheelhouse(
+            self.root / "wheelhouse", self.policy.settings.limits, deadline=self.deadline
+        )
+        previous = {wheel.name: wheel for wheel in self.copied.wheels}
+        added = tuple(wheel for wheel in current.wheels if wheel.name not in previous)
+        if (
+            len(current.wheels) != len(previous) + 1
+            or added != (expected,)
+            or expected.fingerprint.identity.size != self._download_size
+            or any(previous.get(wheel.name, wheel) != wheel for wheel in current.wheels)
+            or len(approval) > self.policy.settings.limits.metadata_bytes
+        ):
+            raise CandidateError("candidate_material_changed")
+        receipt = _write(self.root / "online-artifact.json", approval)
+        self.copied, self._downloaded = current, expected
+        self.metadata = (*self.metadata, receipt)
+        self._stage = "new"
 
     @property
     def prefix(self) -> Path:
@@ -863,7 +913,7 @@ class CandidateAttempt:
                 version=self.version,
                 uv_version=self._uv_version,
                 policy=self.policy.expected,
-                materials=self.policy.materials.digest,
+                materials=self.material_digest,
             )
             fingerprint = _write(
                 self.root / "evidence.json",
@@ -883,6 +933,7 @@ class CandidateAttempt:
             or ready.slot.prefix != str(self.prefix)
             or ready.slot.lexical_python != str(self.python)
             or ready.evidence_file.path != str(self.root / "evidence.json")
+            or ready.evidence.materials != self.material_digest
         ):
             raise CandidateError("candidate_stage_invalid")
         self.observe()
@@ -956,6 +1007,8 @@ def create_attempt(
     request_id: str,
     version: str,
     configuration: bytes,
+    deadline: float | None = None,
+    additional_material_bytes: int = 0,
 ) -> CandidateAttempt:
     """Allocate once at the final path; errors leave owned material for the host.
 
@@ -973,7 +1026,17 @@ def create_attempt(
             or len(configuration) > policy.settings.limits.metadata_bytes
         ):
             raise CandidateError("candidate_configuration_budget")
-        deadline = time.monotonic() + policy.settings.limits.seconds
+        now = time.monotonic()
+        if (deadline is not None and (not math.isfinite(deadline) or deadline <= now)) or (
+            type(additional_material_bytes) is not int
+            or not 0 <= additional_material_bytes <= policy.settings.limits.wheel_bytes
+        ):
+            raise CandidateError("candidate_deadline_exceeded")
+        deadline = (
+            min(deadline, now + policy.settings.limits.seconds)
+            if deadline
+            else (now + policy.settings.limits.seconds)
+        )
         policy.verify(expected, deadline=deadline)
         root = Path(policy.settings.retained_root)
         path = root / f"candidate-{request_id}"
@@ -994,6 +1057,7 @@ def create_attempt(
                 + limits.cache_bytes
                 + limits.spare_bytes
                 + sum(w.fingerprint.identity.size for w in policy.materials.wheels)
+                + additional_material_bytes
             )
             if free.f_bavail * free.f_frsize < required:
                 raise CandidateError("candidate_space_unavailable")
@@ -1028,7 +1092,16 @@ def create_attempt(
         )
         copied = _copy_materials(policy, path / "wheelhouse", deadline)
         result = CandidateAttempt(
-            policy, request_id, version, path, identity, deadline, copied, metadata
+            policy,
+            request_id,
+            version,
+            path,
+            identity,
+            deadline,
+            copied,
+            metadata,
+            _stage="download_pending" if additional_material_bytes else "new",
+            _download_size=additional_material_bytes,
         )
         result.observe()
         policy.verify(expected, deadline=deadline)

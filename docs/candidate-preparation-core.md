@@ -36,6 +36,13 @@
 6. 回配置锁后调用`attempt.verify_ready(ready)`，随后原计划仍以canonical switch
    交`RecoveryHost.prepare(candidate=ready.paths)`。只原V2 resolved+精确Store投影才终态。
 
+有界在线材料接入时，宿主先把批准的单 wheel 事实持久化；`create_attempt` 可接收
+同一总截止与待下载大小，先处于 `download_pending`，不允许生成任何进程 spec。
+下载模块核验实际 hash、METADATA 和包内兼容声明后，调用 `accept_download` 按原
+整份材料预算接纳，原复制材料不得替换；新的 wheel 指纹进入最终材料摘要和
+各步骤前后检查。随后 uv 仍使用 `--offline --no-index` 与同一私有缓存。
+此路径不调用网络 resolver，细节见[有界在线材料](bounded-online-candidate-design.md)。
+
 所有操作共用一个绝对单调截止，默认180秒；版本/依赖/schema预检另受30秒子上限，
 不会延长总期限。host须强拥有实际准备Task及backend的清理，不能把stage字符串当排空证据。
 

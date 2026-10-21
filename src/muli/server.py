@@ -21,6 +21,7 @@ from muli import __version__
 from muli.attachments import SAFE_INLINE, Attachments
 from muli.attention import AttentionInbox
 from muli.auth import COOKIE_NAME, Authentication
+from muli.candidate_online import OnlineSettings
 from muli.candidate_policy import CandidateSettings
 from muli.channel_application import ChannelApplication
 from muli.channels import ChannelError
@@ -856,8 +857,23 @@ def _create_app(
         return management.update_policy.read().model_dump(mode="json")
 
     @app.get("/api/management/update-preview")
-    async def update_preview() -> dict[str, Any]:
-        return await management.preview_update()
+    async def update_preview(
+        version: Annotated[str | None, Query(max_length=40, pattern=r"^\d+\.\d+\.\d+$")] = None,
+    ) -> dict[str, Any]:
+        return await management.preview_update(version)
+
+    @app.get("/api/management/update-online-policy")
+    async def online_update_policy() -> dict[str, Any]:
+        return management.online_policy.read().model_dump(mode="json")
+
+    @app.put("/api/management/update-online-policy")
+    async def replace_online_update_policy(body: OnlineSettings) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = management.replace_online_policy(body)
+        await runtime.bus.notify()
+        return result.model_dump(mode="json")
 
     @app.put("/api/management/update-policy")
     async def replace_update_policy(body: CandidateSettings) -> dict[str, Any]:
