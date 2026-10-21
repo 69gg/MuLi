@@ -1,8 +1,9 @@
 # UIA 测试目标的独立 Win32 夹具
 
-状态：从精确 `1cf156b7b498c394b4aa719e3c3391ddafaba003` 隔离实施，本地受限
-纯 fixture/host 回归及静态已通过，新的 Windows 矩阵待验。仅测试代码与文档，
-不改产品后端或已发布标签。
+状态：从精确 `1cf156b7b498c394b4aa719e3c3391ddafaba003` 隔离实施。初次整合
+`753e0e5` 的 CI 为六项成功、两项 Windows 失败，定位到虚拟环境启动器与实际目标的
+PID 不同。直接基础解释器修正后的本地 52 项及静态已通过，新的 Windows 矩阵待验。
+仅测试代码与文档，不改产品后端或已发布标签。
 
 ## 精确失败与可证实边界
 
@@ -60,7 +61,7 @@ PowerShell MTA helper 读取它。本片只去除测试目标的额外 PS/.NET/W
 
 ## 验证安排与限制
 
-根明确交接共享 guard 后，经绝对路径 `check_local.py --seconds 30 run` 串行完成：
+初版在根明确交接共享 guard 后，经绝对路径 `check_local.py --seconds 30 run` 串行完成：
 
 - 新 `test_uia_native_window.py` 的 11 项、既有启动/清理 9 项与 UIA host 27 项，
   合计 **47 passed、3 native Windows skipped**；0.22 秒、服务 0.731 秒、峰值
@@ -79,6 +80,45 @@ PowerShell MTA helper 读取它。本片只去除测试目标的额外 PS/.NET/W
 本轮未在开发机运行 PowerShell、创建桌面窗口或安装组件。新的真实 Windows 矩阵仍
 待执行；去除测试目标的额外初始化依赖不等于确认或修复系统 PowerShell 冷启动根因，
 也不保证任意机器的 Python/PowerShell 都能在 12 秒内准备好。
+
+## 首个整合矩阵与 PID 修正
+
+精确候选 `753e0e50528091c55566c306f4aedac502387cbd`、CI `39573510582` attempt 1
+完整终态为 **6/8 成功**。质量、MCP、Ubuntu 3.12/3.13 与 macOS 3.12/3.13 成功；
+Windows 3.13 作业 `119133264765` 和 Windows 3.12 作业 `119133264818` 均为
+`3200 passed, 1361 skipped, 2 errors`，错误仅在前两项 native 的目标窗 setup。
+
+这次固定诊断已依次到达 Python、class、window、controls、show 和实际
+`message_loop_ready`；首例分别仅 95 ms 和 79 ms，第二例为 73 ms 和 62 ms。
+错误来自原 `_read_ready` 的 `{pid: process.pid, title}` 严格比较，不是 12 秒超时、
+输出超预算或未读 stderr。原强拥有清理均已 reap，第三项产品 helper 取消用例通过。
+
+先经 Context7，再核固定 CPython v3.13.9 的
+[venvlauncher.c](https://github.com/python/cpython/blob/v3.13.9/PC/venvlauncher.c)：
+Windows venv 的 `python.exe` 用 CreateProcessW 启动真正解释器并等待其退出。
+[getpath.py](https://github.com/python/cpython/blob/v3.13.9/Modules/getpath.py)
+把真实基础入口和 venv 启动入口分开。因此 asyncio 持有的直接 launcher PID 与
+目标回执中的 `os.getpid()` 不同，原夹具把两者当成同一进程的假设不成立。
+
+本次仅让 **stdlib-only 测试目标** 在 Windows 直接使用当前 CPython 的
+`sys._base_executable`，保留 `-I -B`；缺失或非绝对路径明确拒绝，不回退启动器。
+这是当前 CPython 实现提供的内部信息，不声称为通用 Python 解释器的公共 API。
+其它平台的 argv 保持原 `sys.executable`。严格 PID/标题回执、原三项 native 正文、
+12 秒、4 KiB 及直接进程清理全部不变，也没有接受任意子 PID 或改动产品 PowerShell。
+
+修正的纯端到端反例把标准 Win32 API double 实际消息派发产生的 `_ready` UTF-8
+字节送入原 `observe_native_form`，只在 fake 启动边界区分 launcher 与 base PID。
+旧码稳定在同一 `readiness did not match` 处失败（0.06 秒、54.2 MiB）；修后通过，
+证明 producer/reader 的衔接，不冒称已在 Linux 执行 Windows redirector。
+
+本轮再次按根独占 guard 串行受限检查：16 项目标 fixture、9 项 startup 和 27 项
+host，合计 **52 passed、3 原 native Linux skipped**，0.22 秒、峰值 58.4 MiB；
+四份测试 Python 的 Ruff/格式和限定 strict mypy 通过，整轮峰值 145.2 MiB、swap 0。
+首轮静态仅发现 import 顺序和 fake Process 的显式 cast 边界，修后无产品语义变化；
+端到端单例在该类型收尾后再通过 0.04 秒，已包含于上述 52 项，不重复累计。
+测试替身没有启动目标子进程、加载 Windows DLL、运行 PowerShell 或创建窗口；真实
+目标 PID、provider 和密码 Name 关联仍须由后续精确 Windows CI 证明。
+失败旧 run 已闭合，不盲重跑。
 
 ## 接口依据
 

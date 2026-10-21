@@ -8,7 +8,10 @@
 2.32.1 后续 main 的 Windows 3.12 在测试目标窗夹具启动时再次超时，发行矩阵仍全部
 通过。本轮仅把被读取的测试目标从额外 PowerShell/WinForms 进程改为 stdlib Win32
 临时窗口；产品 PowerShell/MTA 桥接、12 秒期限和三项原生断言不变，尚待新矩阵验证。
-零阶段事实与覆盖边界见[目标窗夹具记录](uia-native-win32-fixture-review.md)。
+首个整合 `753e0e5` 矩阵为 6/8：两项 Windows 在目标已就绪后的严格 PID 比较失败，
+已定位 Windows venv 启动器与实际 Python 为不同进程。测试目标现直接使用 CPython
+基础解释器，保持同 PID 校验；修后远端待验。
+零阶段事实、这次不同的失败与覆盖边界见[目标窗夹具记录](uia-native-win32-fixture-review.md)。
 
 ## 使用范围
 
@@ -126,9 +129,13 @@ label/value 不泄露、protected 空 name 和只读断言保留。受控宿主�
 非空 name 回执；它不等于动态证明 PowerShell Name getter 从未调用。
 新目标的真实 UIA 可枚举性、密码 Name 关联与无窗口启动仍须由 Windows CI 证明；
 不能用 Linux fake API 结果替代，也不把去除额外依赖说成查明旧 PS 启动根因。
-新纯 fixture 11 项、既有 startup 9 项及 host 27 项合计 47 项通过，原 native 3 项
-在 Linux 跳过；四份修改测试 Python 的 Ruff/格式与 strict mypy 通过，整轮最高
-244.4 MiB、swap 0。准确首轮静态修正和分组见上述目标夹具记录。
+初版新纯 fixture 11 项、既有 startup 9 项及 host 27 项合计 47 项通过，原 native
+3 项在 Linux 跳过，静态通过；随后首个整合矩阵的两个 Windows 作业在严格 PID 比较
+失败。修正仅把 stdlib-only 目标入口改为 Windows CPython 的 `sys._base_executable`，
+不接受子 PID；缺失/非绝对入口拒绝，产品 PS/MTA 与预算未改。纯消息派发→原就绪
+reader 的端到端旧码红、修后绿；16 fixture + 9 startup + 27 host 共 52 项通过、
+3 原 native Linux skip，四份 Python 静态通过，本轮最高 145.2 MiB、swap 0。
+精确候选、job、历史首轮静态与远端待验边界见上述目标夹具记录。
 
 ## 官方依据
 
