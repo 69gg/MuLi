@@ -10,6 +10,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from muli.events import EventBus
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 from muli.task_control import TaskSnapshot
 
@@ -240,6 +241,7 @@ class WorkflowEngine:
         parent_run_id: str | None = None,
         parent_session_id: str | None = None,
         request_snapshot: TaskSnapshot | None = None,
+        reply_origin: ReplyOrigin | None = None,
     ) -> JsonObject:
         if self._closed:
             raise RuntimeError("工作流引擎已经关闭")
@@ -265,6 +267,7 @@ class WorkflowEngine:
             "workflow_id": workflow_id,
             "parent_run_id": parent_run_id,
             "parent_session_id": parent_session_id,
+            "reply_origin": (reply_origin or ReplyOrigin()).dump(),
             "name": workflow["name"],
             "mode": workflow["mode"],
             "status": "queued",
@@ -307,6 +310,46 @@ class WorkflowEngine:
             await self.cancel(identifier)
             raise
         return deepcopy(run)
+
+    def publish_results(
+        self, parent_run_id: str, parent_session_id: str, results: Sequence[tuple[str, str]]
+    ) -> None:
+        """Commit bounded fragments only after the parent's replay-safe all-success gate."""
+        parent = self.store.get("session", parent_session_id)
+        if parent is None or parent.get("kind") != "main":
+            raise ValueError("只有主会话可直接发布工作流结果，队友须使用父报告链")
+        with self.store.db:
+            for identifier, content in results:
+                run = self.store.get("workflow_run", identifier)
+                if (
+                    run is None
+                    or run.get("parent_run_id") != parent_run_id
+                    or run.get("parent_session_id") != parent_session_id
+                    or run.get("status") != "completed"
+                ):
+                    raise ValueError("工作流结果与已完成的父运行不匹配")
+                if "result_message_id" in run or not content.strip():
+                    continue
+                origin = ReplyOrigin.load(run.get("reply_origin"))
+                message = self.store._message(
+                    parent_session_id,
+                    "assistant",
+                    content,
+                    workflow_run_id=identifier,
+                    reply_origin=origin.dump(),
+                    delivery_routes=origin.delivery_routes(),
+                )
+                # Use the existing transaction-owned primitive: event()/put()
+                # here would commit an incomplete batch through nested contexts.
+                self.store._event(
+                    "message.completed",
+                    {"message": message},
+                    parent_session_id,
+                    objects=[
+                        ("message", message),
+                        ("workflow_run", {**run, "result_message_id": message["id"]}),
+                    ],
+                )
 
     def _done(self, identifier: str, task: asyncio.Task[None]) -> None:
         self._tasks.pop(identifier, None)

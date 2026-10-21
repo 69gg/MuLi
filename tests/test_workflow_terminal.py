@@ -96,7 +96,22 @@ async def test_late_cancel_api_preserves_successful_child_and_real_parent(
                 assert response.status_code == 200
                 assert response.json()["status"] == "completed"
             assert "child evidence" in await asyncio.wait_for(scenario.parent_task, 2)
-            assert runtime.store.get("workflow_run", scenario.child_id) == committed
+            published = runtime.store.get("workflow_run", scenario.child_id)
+            assert published is not None
+            message_id = published.pop("result_message_id")
+            # Reporting adds only its atomic marker; late cancellation must
+            # preserve every pre-existing terminal field, including timestamps.
+            assert published == committed
+            message = runtime.store.get("message", message_id)
+            assert message is not None and message["role"] == "assistant"
+            assert message["session_id"] == scenario.parent_id
+            assert message["workflow_run_id"] == scenario.child_id
+            assert message["content"] == committed["name"] + "\n" + committed["result"]
+            assert any(
+                event["type"] == "message.completed"
+                and event["data"]["message"]["id"] == message_id
+                for event in runtime.store.events(session_id=scenario.parent_id)
+            )
             parent = runtime.store.get("run", scenario.parent_run_id)
             assert parent is not None and parent["status"] == "completed"
             assert scenario.child_id not in runtime.workflows.active_run_ids
