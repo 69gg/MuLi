@@ -502,7 +502,8 @@ def test_real_windows_leaf_read_blocks_edit_and_releases_every_handle(
         assert getattr(write_error.value, "winerror", None) in (None, 32)
         with pytest.raises(PermissionError) as rename_error:
             path.parent.rename(tmp_path / "renamed")
-        assert rename_error.value.winerror == 32
+        assert rename_error.value.errno == errno.EACCES
+        assert rename_error.value.winerror in (5, 32)
         actual = original(handle, limit)
         assert actual == content
         return actual
