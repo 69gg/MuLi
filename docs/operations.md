@@ -29,11 +29,11 @@
 
 Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用系统发行的 python-gobject / at-spi2-core；不需要在 MuLi 虚拟环境编译 GTK。设置 computer.python_path 指向具有 GI 的系统 Python，然后启用电脑工具。先在状态页查看能力。
 
-`computer.backend=auto` 按平台选择 Linux AT-SPI 或 macOS AX，不在失败后更换后端；旧配置中的显式 `atspi` 不迁移。macOS AX 使用当前 MuLi Python 的系统框架，`python_path` 不影响它。能力查询不会弹出辅助功能授权、扫描桌面或保留节点引用；实际授权归属与第三方应用行为仍需本机受控验收。队友不能借用另一个执行的原生引用：先 `computer_release`，再让接手者重新观察。`desktop_busy` 应交回统筹处理，不用模型循环等待。
+`computer.backend=auto` 按平台选择 Linux AT-SPI、macOS AX 或 Windows 只读 UIA，不在失败后更换后端；旧配置中的显式 `atspi` 不迁移。macOS AX 使用当前 MuLi Python 的系统框架，`python_path` 不影响它。Windows 使用系统 PowerShell/.NET，保持原执行策略，受限环境可能不可用。AX/UIA 能力查询不会弹出辅助功能授权、扫描桌面或保留节点引用；实际授权归属与第三方应用行为仍需本机受控验收。队友不能借用另一个执行的原生引用：先 `computer_release`，再让接手者重新观察。`desktop_busy` 应交回统筹处理，不用模型循环等待。
 
 `computer.operation_timeout_seconds` 控制单次无障碍 helper 的总期限，默认 12 秒，可配置为大于 0、至多 120 秒的有限数值；`computer.snapshot_ttl_seconds` 控制快照及目标发现引用的有效期，默认 60 秒，至多 300 秒。两者不接受布尔值、字符串或无穷大。旧配置无需修改，缺省时沿用原期限；修改配置不会延长已有操作凭据。
 
-操作路径是 snapshot → action/type → 再次 snapshot。快照具有有效期，Linux 操作校验进程及 D-Bus 对象身份，成功或失败都消耗快照。界面不支持的动作不会降级成任意坐标点击。无障碍树不可用时可单独请求截图；截图不产生可执行节点身份，不能代替操作前的快照。实验性 macOS AX 使用归属于当前会话/执行代次的短期 helper 保留原生引用，动作或释放后须重新观察；已完成离线原生接口测试，但真实 TCC 授权和桌面动作尚未实测。Windows UIA 与任意坐标操作仍未实现，见[电脑操作合同](computer.md)。
+Linux/macOS 的操作路径是 snapshot → action/type → 再次 snapshot。快照具有有效期，Linux 操作校验进程及 D-Bus 对象身份，成功或失败都消耗快照。界面不支持的动作不会降级成任意坐标点击。无障碍树不可用时可单独请求截图；截图不产生可执行节点身份，不能代替操作前的快照。实验性 macOS AX 使用归属于当前会话/执行代次的短期 helper 保留原生引用，动作或释放后须重新观察；已完成离线原生接口测试，但真实 TCC 授权和桌面动作尚未实测。开发中的 Windows UIA 仅走 targets → 选定窗口 snapshot → release，动作、输入与任意坐标操作不可用；真实 Windows CI 待验证，见[电脑操作合同](computer.md)。
 
 桌面图像采集另由 computer.capture.enabled 开启，默认关闭。截图与有界录屏保存在数据目录 captures/，随后可作为本地附件使用；不自动上传、不录制声音。工具沿用 computer 风险及 ask/auto/yolo 权限模式。单文件默认 32 MiB、目录默认 200 MiB，默认录屏上限 30 秒、8 fps；超过配额或取消时终止采集进程并删除未完成文件。后端与授权边界见 [平台能力](platforms.md)。
 
