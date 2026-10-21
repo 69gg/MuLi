@@ -13,11 +13,13 @@ import stat
 import struct
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from muli.candidate_policy import CandidateError, CandidateLimits, ProcessOutput, ProcessSpec
+from muli.platforms.candidate_process_state import AcceptedUnit, PersistProcess, ProcessPersistence
 from muli.platforms.linux_controller import CgroupObservation
 from muli.platforms.linux_transaction import (
     _BUS,
@@ -220,6 +222,16 @@ class CandidateProbe(SystemdProbe):
             raise ObservationError("candidate_observation_changed")
         return CandidateObservation(unit, process)
 
+    async def recoverable(
+        self, name: str, argv: tuple[str, ...], limits: CandidateLimits, runtime_us: int
+    ) -> CandidateObservation | None:
+        before = await self.owned(name, argv)
+        if before is not None:
+            await self._resources(await self._unit_path(name), limits, runtime_us)
+            if before != await self.owned(name, argv):
+                raise ObservationError("candidate_observation_changed")
+        return before
+
     async def stop(self, name: str) -> None:
         _name(name)
         _typed(
@@ -369,27 +381,43 @@ async def _permit(
     raise CandidateProcessError("candidate_gate_attempts")
 
 
-async def _cleanup(
+async def _settle_subtree(
     probe: CandidateProbe,
     name: str,
     worker: tuple[str, ...],
-    spec: ProcessSpec,
-    proof: CandidateObservation | None,
-    launch: asyncio.Task[dict[str, Any]],
+    limits: CandidateLimits,
+    accepted: AcceptedUnit | None,
+    on_accepted: Callable[[AcceptedUnit], None] | None = None,
 ) -> bool:
-    """Own both manager subtree and CLI; cancellation of the observer cannot abandon either."""
+    """Shared bounded stop/empty proof; a missing unobserved start is ambiguous."""
     confirmed = False
     try:
-        async with asyncio.timeout(2 * spec.limits.stop_seconds):
+        async with asyncio.timeout(2 * limits.stop_seconds):
             current = await probe.owned(name, worker)
             if current is None:
                 # Without a previously observed unit, an in-flight StartTransientUnit
                 # may still succeed after this absence observation. Never claim empty.
-                confirmed = proof is not None and probe.empty(proof.unit.cgroup)
+                confirmed = accepted is not None and (
+                    probe.empty(accepted.cgroup) if accepted.cgroup else accepted.pid == 0
+                )
             else:
-                if proof is not None and current.unit.invocation != proof.unit.invocation:
-                    raise ObservationError("candidate_invocation_changed")
-                cgroup = current.unit.cgroup or (proof.unit.cgroup if proof else "")
+                if accepted is not None:
+                    if current.unit.invocation != accepted.invocation or (
+                        current.unit.cgroup
+                        and accepted.cgroup
+                        and current.unit.cgroup != accepted.cgroup
+                    ):
+                        raise ObservationError("candidate_invocation_changed")
+                else:
+                    accepted = AcceptedUnit.capture(current.unit, current.process)
+                    if on_accepted is not None:
+                        try:
+                            on_accepted(accepted)
+                        except Exception:
+                            # Continue owning/stopping the tree after a lost DB return.
+                            # A final settled receipt must still persist before recovery returns.
+                            pass
+                cgroup = current.unit.cgroup or accepted.cgroup
                 if (
                     current.unit.active_state in {"inactive", "failed"}
                     and current.unit.pid == 0
@@ -400,7 +428,7 @@ async def _cleanup(
                 else:
                     # The static worker ExecStart still identifies this unit after execve.
                     await probe.stop(name)
-                    kill_at = time.monotonic() + spec.limits.stop_seconds / 2
+                    kill_at = time.monotonic() + limits.stop_seconds / 2
                     killed = False
                     while True:
                         if cgroup and probe.empty(cgroup):
@@ -422,10 +450,36 @@ async def _cleanup(
                                 raise ObservationError("candidate_invocation_changed")
                             await probe.kill(name)
                             killed = True
-                        await asyncio.sleep(min(spec.limits.poll_interval, 0.05))
+                        await asyncio.sleep(min(limits.poll_interval, 0.05))
     except Exception:
         # Reporting unconfirmed is intentional; never turn failure to observe into empty.
         confirmed = False
+    return confirmed
+
+
+async def _cleanup(
+    probe: CandidateProbe,
+    name: str,
+    worker: tuple[str, ...],
+    spec: ProcessSpec,
+    proof: CandidateObservation | None,
+    launch: asyncio.Task[dict[str, Any]],
+    persistence: ProcessPersistence | None = None,
+) -> bool:
+    """Own both manager subtree and CLI; cancellation cannot abandon either."""
+    confirmed = False
+    try:
+        accepted = persistence.value.accepted if persistence is not None else None
+        if accepted is None and proof is not None:
+            accepted = AcceptedUnit.capture(proof.unit, proof.process)
+        confirmed = await _settle_subtree(
+            probe,
+            name,
+            worker,
+            spec.limits,
+            accepted,
+            persistence.accept if persistence is not None else None,
+        )
     finally:
         if not launch.done():
             launch.cancel()
@@ -439,7 +493,11 @@ async def _cleanup(
 
 
 async def _run_candidate_process(
-    spec: ProcessSpec, *, probe: CandidateProbe | None = None, runner: CommandRunner = run_process
+    spec: ProcessSpec,
+    *,
+    probe: CandidateProbe | None = None,
+    runner: CommandRunner = run_process,
+    persist: PersistProcess | None = None,
 ) -> ProcessOutput:
     """Return only with a reaped CLI and confirmed-empty owned service subtree.
 
@@ -463,6 +521,7 @@ async def _run_candidate_process(
     confirmed = True
     result: dict[str, Any] | None = None
     original: BaseException | None = None
+    persistence: ProcessPersistence | None = None
     try:
         _directory_check(spec.private_root, directory)
         payload = json.dumps(
@@ -489,6 +548,11 @@ async def _run_candidate_process(
         )
         with os.fdopen(fd, "wb") as target:
             target.write(payload)
+            if persist is not None:
+                target.flush()
+                os.fsync(target.fileno())
+        if persist is not None:
+            os.fsync(directory)
         listener.bind("\x00" + gate)
         listener.listen(8)
         listener.setblocking(False)
@@ -508,6 +572,9 @@ async def _run_candidate_process(
         )
         _directory_check(spec.private_root, directory)
         arguments = _arguments(name, worker, spec, runtime_us)
+        if persist is not None:
+            persistence = ProcessPersistence.create(spec, name, worker, runtime_us, persist)
+            persistence.value.check_files()
         timeout = _remaining(spec.deadline)
 
         async def run_client() -> dict[str, Any]:
@@ -536,6 +603,9 @@ async def _run_candidate_process(
                         if str(error) != "candidate_not_waiting":
                             raise
                         await asyncio.sleep(spec.limits.poll_interval)
+                if persistence is not None:
+                    persistence.accept(AcceptedUnit.capture(proof.unit, proof.process))
+                    persistence.value.check_files()
                 await _permit(
                     listener,
                     proof,
@@ -562,7 +632,9 @@ async def _run_candidate_process(
             original = error
         finally:
             listener.close()  # EOF can only refuse permission, never grant it.
-            cleanup = asyncio.create_task(_cleanup(observer, name, worker, spec, proof, launch))
+            cleanup = asyncio.create_task(
+                _cleanup(observer, name, worker, spec, proof, launch, persistence)
+            )
 
             async def settle() -> None:
                 nonlocal confirmed
@@ -574,6 +646,9 @@ async def _run_candidate_process(
             raise CandidateProcessError(
                 "candidate_cleanup_unconfirmed", unit_name=name, cleanup_confirmed=False
             ) from None
+        if persistence is not None:
+            persistence.value.check_files()
+            persistence.settle()
         if original is not None:
             if isinstance(original, asyncio.CancelledError):
                 raise original
@@ -599,7 +674,10 @@ async def _run_candidate_process(
         listener.close()
         # Keep metadata with the attempt when ownership could not be settled.
         try:
-            if confirmed:
+            if confirmed and (
+                persistence is None
+                or (persistence.value.phase == "settled" and persistence.acknowledged)
+            ):
                 try:
                     os.unlink(control, dir_fd=directory)
                 except FileNotFoundError:
@@ -609,11 +687,15 @@ async def _run_candidate_process(
 
 
 async def run_candidate_process(
-    spec: ProcessSpec, *, probe: CandidateProbe | None = None, runner: CommandRunner = run_process
+    spec: ProcessSpec,
+    *,
+    probe: CandidateProbe | None = None,
+    runner: CommandRunner = run_process,
+    persist: PersistProcess | None = None,
 ) -> ProcessOutput:
     """Expose fixed errors without environment, arguments or filesystem diagnostics."""
     try:
-        return await _run_candidate_process(spec, probe=probe, runner=runner)
+        return await _run_candidate_process(spec, probe=probe, runner=runner, persist=persist)
     except (CandidateProcessError, asyncio.CancelledError):
         raise
     except Exception:
