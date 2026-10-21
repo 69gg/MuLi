@@ -1,6 +1,6 @@
 # 无障碍电脑操作
 
-2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 的实验性 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。开发中的 Windows UIA 首片沿用工具提供顶层窗口与选定窗口只读树，动作和输入明确不可用；真实 Windows 验证边界见 [UIA 实现记录](windows-uia.md)。截图、录屏和后台服务的范围见[平台能力](platforms.md)。
+2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 的实验性 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。Windows UIA 沿用工具提供顶层窗口与选定窗口只读树，动作和输入明确不可用；真实 Windows 验证边界见 [UIA 实现记录](windows-uia.md)。截图、录屏和后台服务的范围见[平台能力](platforms.md)。
 
 ## 选择读取范围
 
