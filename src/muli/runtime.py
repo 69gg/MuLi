@@ -865,6 +865,10 @@ class Runtime:
             "pending_approvals": approvals,
         }
 
+    def _mcp_receive_failed(self, code: str, occurrence_id: str) -> None:
+        if not self._closing:
+            self.system_events.mcp_receive_failed(code, occurrence_id)
+
     def configure(self) -> None:
         settings = self.config.settings
         self.capacity = asyncio.Semaphore(settings.limits.max_parallel_agents)
@@ -884,6 +888,7 @@ class Runtime:
         )
         self.mcp_policy = ReceivePolicyStore(self.store)
         self.mcp = MCPManager(settings.mcp, max_output_chars=settings.limits.max_output_chars)
+        self.mcp.set_receive_failed_callback(self._mcp_receive_failed)
         self.notifications = DesktopNotifier(
             self.store, self.bus, settings.notifications, admission=self.maintenance.admission
         )

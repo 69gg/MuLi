@@ -4,6 +4,8 @@
 
 本片只增加两个可证明的来源。主会话当前请求执行失败，使用该次 `PreparedRequest.reply_origin`；扩展目录自主 watch 从非同一失败状态进入失败，作为固定 `extensions_watch` 独立生产者。Team、工作流、用户发起的配置/加载操作及其它日志仍保持原有本地行为；已有终态报告不再广播。
 
+后续 [MCP 接收故障通知](mcp-receive-notification-design.md)增加独立 `mcp_connection` 来源，复用这里的原子证据、首次选路与撤销守卫；本文保留原 C 切片范围及验证数字，不代表后续来源仍未接入。
+
 ## 主会话错误的来源生命周期
 
 `SystemEvents` 在现有有限日志上下文中保存不可变的运行引用、请求来源和拥有它的 asyncio Task。`_drive` 首次 await 前建立全新上下文，不继承父任务的运行、来源或 principal；finally 在清理/唤醒后续任务前还原。仅真实 main 且非 workflow 的驱动允许绑定请求。上下文不是授权：TaskSnapshot、principal、工具风险与 route validator 保持各自边界。

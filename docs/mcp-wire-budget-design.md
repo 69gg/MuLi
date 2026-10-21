@@ -30,6 +30,8 @@ JSON、错误/重定向/其它普通 body 按总原字节计费。只有成功�
 
 固定失败原因沿 `MCPManager.status` 进入 `self_status.extensions.mcp` 与已有 API，不把外层 `loaded` 当作逐连接健康。SDK 的 debug 日志并未可靠承接统一错误通知；本片不调用 catalog-changed 来重连，不冒用 `extensions_watch` producer，不新增默认渠道通知。统一通知仍是独立后续范围。
 
+后续[MCP 接收故障通知](mcp-receive-notification-design.md)已单独接入当前连接首次失败的 `mcp_connection` 来源；本段保留 wire 原切片的交付边界和验证归属，不表示当前版本仍只有按需状态。
+
 ## 验证计划与独立自审
 
 仅流式 MockTransport、小型临时 Store 和真实 Runtime/假 provider；阻断真实网络和子进程。验证普通 body 精确边界、SSE 所有换行拆块/长行/长期流、压缩预拒与非流式 SSE body；后台 latch 后未派发拒绝、在途失败无重试、坏连接不复用/发布；同配置改限额新连接与旧调用 drain、两套上限、Skills-only 请求、策略漂移和保存失败保旧；工具/API认证、原配置字节不变、坏/过大对象与事务回滚。

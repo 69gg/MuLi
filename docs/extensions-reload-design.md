@@ -6,6 +6,8 @@ MCP 代次片新增 21 项真实 Runtime/假客户端回归；含关联组共 16
 
 后续[HTTP/SSE 接收预算](mcp-wire-budget-design.md)复用同一候选/退休生命周期，策略保存在原 Store 私有对象而非主 Settings。准备前和最后无 await 发布段重读策略；Skills-only 也必须确认策略未变。修改限额会创建新 HTTP/SSE 连接，旧调用保留旧限额；坏连接的同步 latch 同时阻止复用、发布和新派发。接收失败的固定原因进入扩展状态的 `mcp` 列表，但不据此自动请求重连或自称自主 watch 通知来源。本片新增 68 项，含关联组共 330 项唯一回归，不能与上述历史数字相加。
 
+另行实现的[MCP 接收故障通知](mcp-receive-notification-design.md)复用这个 first-latch 与退休所有权，仅把当前已发布 HTTP/SSE 连接的首次失败作为独立 `mcp_connection` 系统事项，不生成 catalog reload 或目录请求；原候选发布代次不受通知成败影响。
+
 ## 最小交付行为
 
 用户将标准 Skill 放进 MuLi 的 `skills` 目录，或将 MCP 配置放进 `mcp.d` 后，MuLi 自动发现、验证并报告加载状态。模型通过有界目录知道可用 Skills，按需读取正文与资源；不会因扫描目录而运行脚本。MuLi 可通过现有自身管理工具配置这些能力，无需另建配置账本或重启整个服务。
