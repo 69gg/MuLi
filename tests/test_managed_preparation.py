@@ -318,6 +318,71 @@ async def test_adopt_persists_plan_first_and_freezes_exact_original_files(
     assert not [e for e in host.runtime.store.events() if e["type"] == "management.completed"]
 
 
+async def test_current_installation_observation_does_not_create_plan_or_generation(
+    host: Host,
+) -> None:
+    adopted = host.complete(await host.run(host.plan("adopt"), candidate=host.slot))
+    plans = host.runtime.store.list("management", 100)
+    position = host.runtime.store.event_position()
+    async with host.runtime.configuration_lock:
+        observed = await host.prepare.observe_current()
+        repeated = await host.prepare.observe_current()
+    assert observed.record == adopted
+    assert observed.slot == host.slot
+    assert observed.binding_revision == repeated.binding_revision
+    assert len(observed.binding_revision) == 64
+    observed.verify()
+    host.runtime.store.put("notes", {"id": "concurrent", "text": "new user information"})
+    observed.verify()
+    assert host.journal.read_current() == adopted
+    assert host.runtime.store.list("management", 100) == plans
+    assert host.runtime.store.event_position() == position
+
+
+async def test_current_installation_observation_rejects_legacy_without_adopting(
+    host: Host,
+) -> None:
+    async with host.runtime.configuration_lock:
+        with pytest.raises(ValueError, match="managed_boot_required"):
+            await host.prepare.observe_current()
+    assert host.journal.read_current() is None
+    assert not host.runtime.store.list("management", 100)
+
+
+async def test_current_installation_observation_requires_exact_projection(host: Host) -> None:
+    host.complete(await host.run(host.plan("adopt"), candidate=host.slot), project=False)
+    async with host.runtime.configuration_lock:
+        # Maintenance already blocks configuration until this exact final is projected.
+        with pytest.raises(ValueError, match="transaction_in_progress"):
+            await host.prepare.observe_current()
+
+
+async def test_current_installation_observation_rechecks_after_process_await(host: Host) -> None:
+    host.complete(await host.run(host.plan("adopt"), candidate=host.slot))
+    original = host.service.path.read_bytes()
+
+    def drift() -> None:
+        host.service.path.write_bytes(original + b"\n")
+
+    host.probe.during = drift
+    async with host.runtime.configuration_lock:
+        with pytest.raises(ValueError, match="managed_preparation_files_changed"):
+            await host.prepare.observe_current()
+
+
+async def test_current_installation_observation_tracks_hot_configuration(host: Host) -> None:
+    host.complete(await host.run(host.plan("adopt"), candidate=host.slot))
+    async with host.runtime.configuration_lock:
+        original = await host.prepare.observe_current()
+        host.runtime.config.update({"updates": {"check_on_start": True}})
+        with pytest.raises(ValueError, match="managed_source_changed"):
+            original.verify()
+        changed = await host.prepare.observe_current()
+    assert original.binding_revision != changed.binding_revision
+    assert original.slot == changed.slot
+    changed.verify()
+
+
 @pytest.mark.parametrize("action", ["restart", "configure", "switch"])
 async def test_managed_actions_capture_actual_base_after_exact_projection(
     host: Host, action: ManagedAction

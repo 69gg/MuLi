@@ -7,10 +7,12 @@ running host. A helper may consume the returned generation after this method.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -87,6 +89,17 @@ class PreparedManaged:
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentManagedInstallation:
+    """Observed running source, with no queued plan or authority to install."""
+
+    record: TransactionRecordV2 = field(repr=False)
+    anchor: DeploymentAnchor = field(repr=False)
+    slot: SlotIdentity = field(repr=False)
+    binding_revision: str
+    verify: Callable[[], None] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _Source:
     previous: CurrentRecord | None
     projected: ProjectionReceipt | None
@@ -95,7 +108,7 @@ class _Source:
     controller: SlotIdentity
     data: RoleSnapshots
     selector: SelectorSnapshot | None
-    plan: dict[str, Any]
+    plan: dict[str, Any] | None
     anchor: DeploymentAnchor | None = None
     manifest: InstallationManifest | None = None
     role: Role | None = None
@@ -142,7 +155,7 @@ class ManagedPreparation:
     def _source(
         self,
         permit: Permit,
-        item: dict[str, Any],
+        item: dict[str, Any] | None,
         action: ManagedAction,
         candidate: LocalSlotPaths | None,
     ) -> _Source:
@@ -152,7 +165,7 @@ class ManagedPreparation:
         if previous is not None:
             if not previous.resolved:
                 raise TransactionError("transaction_in_progress")
-            if previous.request_id == item["id"]:
+            if item is not None and previous.request_id == item["id"]:
                 raise MaintenanceError("managed_preparation_recovery_required")
             if receipt != ProjectionReceipt(
                 **previous.position.model_dump(),
@@ -161,15 +174,24 @@ class ManagedPreparation:
                 raise TransactionError("projection_required")
         elif receipt is not None:
             raise MaintenanceError("managed_preparation_state_missing")
-        plan = _read_object(store.db, "management", item["id"], journal.limits.max_record_bytes)
-        if (
-            plan is None
-            or plan.get("id") != item["id"]
-            or plan.get("action") != action
-            or plan.get("status") not in ("pending", "applying")
-            or plan.get("routing") != item.get("routing")
+        plan = None
+        if item is not None:
+            plan = _read_object(store.db, "management", item["id"], journal.limits.max_record_bytes)
+            if (
+                plan is None
+                or plan.get("id") != item["id"]
+                or plan.get("action") != action
+                or plan.get("status") not in ("pending", "applying")
+                or plan.get("routing") != item.get("routing")
+            ):
+                raise MaintenanceError("managed_preparation_plan_changed")
+        elif (
+            not isinstance(permit, ManagedBootPermit)
+            or not isinstance(previous, TransactionRecordV2)
+            or action != "switch"
+            or candidate is not None
         ):
-            raise MaintenanceError("managed_preparation_plan_changed")
+            raise MaintenanceError("managed_boot_required")
         evidence = read_format_evidence(store.db)
         identity = _connection_identity(store)
         if (
@@ -292,6 +314,52 @@ class ManagedPreparation:
             raise MaintenanceError("managed_preparation_unit_changed")
         return source
 
+    async def observe_current(self) -> CurrentManagedInstallation:
+        """Read the resolved managed source before an update has been approved.
+
+        Reuse preparation's source checks, without fabricating or persisting a
+        plan. A later install and switch must still perform their own admission.
+        """
+        runtime = self.runtime
+        runtime.maintenance.require_configuration()
+        if not runtime.configuration_lock.locked():
+            raise MaintenanceError("configuration_lock_required")
+        permit = self._permit()
+        self._paths(permit)
+        source = self._source(permit, None, "switch", None)
+        assert isinstance(source.previous, TransactionRecordV2)
+        assert source.anchor is not None
+        await self._observe_process(permit, source)
+
+        def verify() -> None:
+            runtime.maintenance.require_configuration()
+            if self._permit() is not permit:
+                raise MaintenanceError("managed_source_changed")
+            self._paths(permit)
+            if self._source(permit, None, "switch", None) != source:
+                raise MaintenanceError("managed_source_changed")
+
+        verify()
+        revision = hashlib.sha256(
+            json.dumps(
+                {
+                    "record": source.previous.model_dump(mode="json"),
+                    "slot": source.slot.digest,
+                    "controller": source.controller.digest,
+                    "anchor": source.anchor.digest,
+                    "configuration": hashlib.sha256(source.data.configuration).hexdigest(),
+                    "unit": hashlib.sha256(source.data.unit).hexdigest(),
+                    "selector": hashlib.sha256(source.data.selector or b"").hexdigest(),
+                    "schema": [asdict(fact) for fact in source.evidence.schema],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        return CurrentManagedInstallation(
+            source.previous, source.anchor, source.slot, revision, verify
+        )
+
     def _legacy_service(self, permit: Permit, source: _Source) -> UserService:
         unit_path = (
             source.anchor.unit_path
@@ -406,6 +474,7 @@ class ManagedPreparation:
             created=self.clock(), seconds=helper.seconds, rollback_reserve=helper.rollback_reserve
         )
         generation = secrets.token_hex(16)
+        assert source.plan is not None
         queued = {**source.plan, "status": "applying", "transaction": {"generation": generation}}
         journal = permit.journal
         expected = source.previous
