@@ -63,6 +63,10 @@ def _directory_identity(info: os.stat_result) -> tuple[int, ...]:
 
 
 def _secure_read_supported() -> bool:
+    if os.name == "nt":
+        from muli.platforms.windows_skill_files import available
+
+        return available()
     return (
         os.open in os.supports_dir_fd
         and os.stat in os.supports_dir_fd
@@ -120,6 +124,13 @@ def _directory(settings: SkillsSettings) -> Path:
     path = (
         Path(settings.directory).expanduser() if settings.directory else default_home() / "skills"
     )
+    if os.name == "nt":
+        from muli.platforms.windows_skill_files import WindowsSkillError, normalize_root
+
+        try:
+            return normalize_root(path)
+        except WindowsSkillError as exc:
+            raise SkillLoadError(exc.code) from None
     return path.resolve()
 
 
@@ -129,6 +140,32 @@ def _scan(settings: SkillsSettings) -> tuple[str, tuple[_Source, ...]]:
         return _digest(signature), ()
     root = _directory(settings)
     signature.append(str(root))
+    if os.name == "nt":
+        from muli.platforms.windows_skill_files import WindowsSkillError, scan
+
+        try:
+            root_identity, entries = scan(root, settings.max_entries, settings.max_skills)
+        except WindowsSkillError as exc:
+            raise SkillLoadError(exc.code) from None
+        if root_identity is None:
+            return _digest([*signature, "missing"]), ()
+        sources: list[_Source] = []
+        for native_source in entries:
+            source = f"{native_source.name}/SKILL.md"
+            if not _NAME.fullmatch(native_source.name) or len(native_source.name) > 64:
+                raise SkillLoadError("invalid_name", source)
+            sources.append(
+                _Source(
+                    native_source.name,
+                    root / native_source.name / "SKILL.md",
+                    native_source.identity,
+                    native_source.directory_identity,
+                )
+            )
+        sources.sort(key=lambda item: item.name)
+        signature.append(root_identity)
+        signature.extend((item.name, item.identity, item.directory_identity) for item in sources)
+        return _digest(signature), tuple(sources)
     try:
         root_info = root.stat()
     except FileNotFoundError:
@@ -136,7 +173,7 @@ def _scan(settings: SkillsSettings) -> tuple[str, tuple[_Source, ...]]:
     if not stat.S_ISDIR(root_info.st_mode):
         raise SkillLoadError("directory_not_regular")
     signature.append(_identity(root_info))
-    sources: list[_Source] = []
+    sources = []
     with os.scandir(root) as iterator:
         for count, entry in enumerate(iterator, 1):
             if count > settings.max_entries:
@@ -177,6 +214,13 @@ def _read_regular(
 ) -> bytes:
     if not _secure_read_supported():
         raise SkillLoadError("secure_read_unavailable")
+    if os.name == "nt":
+        from muli.platforms.windows_skill_files import WindowsSkillError, read_regular
+
+        try:
+            return read_regular(path, limit, root, root_identity, expected)
+        except WindowsSkillError as exc:
+            raise SkillLoadError(exc.code) from None
     if not path.is_absolute() or not path.is_relative_to(root):
         raise SkillLoadError("resource_path_invalid")
     # Open every directory without following links, then use only the bound
@@ -363,6 +407,17 @@ def _resource_path(skill: Skill, relative: str) -> Path:
     ):
         raise SkillLoadError("resource_path_invalid")
     root = skill.location.parent
+    if os.name == "nt":
+        from muli.platforms.windows_skill_files import WindowsSkillError, validate_component
+
+        try:
+            for component in relative.split("/"):
+                validate_component(component)
+        except WindowsSkillError as exc:
+            raise SkillLoadError(exc.code) from None
+        # The reader acquires and verifies this directory by native handle.
+        # Resolving it here would follow a junction before that traversal.
+        return root.joinpath(*value.parts)
     if root.is_symlink() or root.resolve() != root:
         raise SkillLoadError("symlink_forbidden")
     path = root
@@ -389,7 +444,9 @@ class Skills:
                 return _scan(settings)[0]
             except (OSError, ValueError, RuntimeError) as exc:
                 try:
-                    identity: Any = _identity(_directory(settings).stat())
+                    identity: Any = (
+                        "unavailable" if os.name == "nt" else _identity(_directory(settings).stat())
+                    )
                 except (OSError, ValueError, RuntimeError):
                     identity = "unavailable"
                 return _digest(
