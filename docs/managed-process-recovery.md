@@ -37,3 +37,42 @@ Ubuntu CI 暴露了两层不同原因。3.12 的公共 `sitecustomize` 名称碰
 2.26 首次候选 CI 的两个 Windows 作业暴露参数装饰器提前访问 `signal.SIGKILL` 的收集错误；模块执行期 skip 不能阻止该访问。参数改为退出类别，Linux 信号延后到测试函数体，仍核非零退出与被杀两种失败。受限子进程删除该常量后导入旧代码稳定失败、修后通过；四项 Linux 确定性回归通过（0.17 秒、63.1 MiB、swap 0），静态与独审通过。这不是 Windows 本地验收，远端完整矩阵须在新提交重新验证。
 
 实现前核对了 [Python Popen 的 pipesize/pass_fds 与超时清理合同](https://docs.python.org/3/library/subprocess.html#subprocess.Popen)、[Python isolated mode](https://docs.python.org/3/using/cmdline.html#cmdoption-I)、[Python site 的 .pth 与 sitecustomize 顺序](https://docs.python.org/3/library/site.html)、[Uvicorn programmatic server](https://www.uvicorn.org/#running-programmatically) 和 [HTTPX 异步 streaming](https://www.python-httpx.org/async/#streaming-responses)。[HTTPX read timeout 按数据块计算](https://www.python-httpx.org/advanced/timeouts/)，所以这里另加整段总期限。`-I` 会忽略 `PYTHON*` 环境，但不禁用 `site`；fixture 因此依靠临时 prefix 自己的 `.pth` 显式导入，不依赖 `PYTHONPATH` 或公共 `sitecustomize` 名称。CI 的独立卷使用 [GitHub 托管 Linux VM 的 sudo](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges) 和 [util-linux 的 loop 文件挂载及自动分离](https://github.com/util-linux/util-linux/blob/master/sys-utils/mount.8.adoc#loop-device-support)，不改宿主现有挂载。
+
+2.32 首次候选 `6a8ad38e7899b70cb34ac91f0b9a6570bcf1faa9` 的
+[CI 39554055600](https://github.com/69gg/MuLi/actions/runs/39554055600) 为七项通过、一项失败；
+唯一失败是 Ubuntu 3.13 的真实回退参数。target 已拒绝、退出，base 已启动并返回 paused，
+但父进程在原 20 秒期限内未等到 `controller-resolved`。它没有走到最终服务收尾；
+不能将此失败与前述 32 毫秒 cleanup 问题混同。日志中的 driver `-9` 是 finally 收取后的
+进程状态，也不足以证明 driver 自行遭遇 SIGKILL。两个 Windows job 全部通过，包含三个
+在 Windows Actions 启用的 UIA 原生用例；该失败未发生于 UIA 原生用例。
+
+一次带临时阶段观测的本地原始回退例通过（13.65 秒，service 14.171 秒，CPU 13.113 秒，
+峰值 179.7 MiB、swap 0），base ready 在约 11.55 秒，resolved 在约 13.06 秒。
+两个临时 MuLi 包各生成了 119 个 `.pyc`：`-I` 同时隐含 `-E`，所以环境中的
+`PYTHONDONTWRITEBYTECODE` 没有效果。这是已证实的测试额外写入；上述单次成功和远端
+原有有限日志尚不能将其认定为远端超时的唯一根因，也不能证明控制器固定停在某一 phase。
+
+当前仅把 `sys.dont_write_bytecode = True` 加入原本排序最早的测试专用 `.pth`，
+在后续 fixture 模块及 MuLi 导入前关闭 bytecode 写入。真实两例都核验各自专用 MuLi 包
+与专用 fixture 模块未生成 `.pyc`，不承诺 `.pth` 执行前的系统模块也无写入。两个微型
+真实 `-I` 子进程作确定性对照：仅设环境变量仍产生缓存，采用该早期 hook 后不产生缓存；
+旧 hook 的新断言先稳定失败（0.20 秒、64.6 MiB、swap 0）。不修改产品 fingerprint、
+启动准入、原 20 秒期限、各阶段等待和最终业务断言。
+
+失败时原异常附一条完整 JSON 的 `managed_recovery_diagnostic` note，总 UTF-8 不超过
+既有 4 KiB 预算。它保留最多 16 个固定阶段名和毫秒时刻、当前剩余期限、journal 的
+revision/phase/intent/activation/code，以及 base/target 的 HTTP posts/started/allowed
+固定标量。SQLite 按两个固定主键读取至多 4097 字节哨兵，不加载整库或输出正文；
+只读连接的 busy timeout 为零，锁冲突记为 unavailable，不等待业务 writer。
+坏记录、缺失证据和超预算同样使用固定状态；不输出私有路径、完整 journal/数据库或异常
+正文，不改变原异常及 finally 的 owned 子进程回收，也不新增持久诊断文件或扫描框架。
+
+该窄修的 20 项单位回归通过（含 5 项新增，0.19 秒、峰值 63.7 MiB），涵盖真实
+`-I` 对照、固定标量白名单、超预算完整 JSON 和真实 SQLite exclusive lock 下的
+nonblocking 读取。两个原真实参数分开经 30 秒守卫：成功切换 `1 passed in 8.31s`，
+service 8.798 秒、CPU 8.369 秒、峰值 178.4 MiB；目标拒绝后回退
+`1 passed in 13.78s`，service 14.273 秒、CPU 13.574 秒、峰值 171.7 MiB。
+两例新增的专用包/fixture 模块无缓存断言均通过；全部 swap 0，未运行真实服务管理命令。
+本轮数字不构成相同 runner 的性能对照，不声称该修复已解决远端唯一根因。
+单文件 Ruff、格式检查和 strict mypy 均通过；mypy 使用 `MYPYPATH=src:tests`，
+service 2.030 秒、峰值 254.6 MiB，swap 0。独立静态审查无阻断；远端新候选仍须重新验收。
