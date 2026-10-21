@@ -14,6 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from muli.integrations.attention import (
+    MESSAGE_TYPES,
+    ChiliarchAttentionError,
+    ChiliarchAttentionInput,
+    ChiliarchAttentionPolicyStore,
+    ChiliarchAttentionState,
+    message_notification,
+)
 from muli.integrations.chiliarch import (
     ChiliarchBridge,
     ChiliarchConfig,
@@ -21,7 +29,10 @@ from muli.integrations.chiliarch import (
     ChiliarchProtocolError,
     Envelope,
 )
+from muli.maintenance import MaintenanceError
+from muli.proactive import FrozenRouting
 from muli.store import now
+from muli.tools import Tool, parameters
 
 if TYPE_CHECKING:
     from muli.runtime import Runtime
@@ -32,7 +43,11 @@ _TERMINAL = frozenset({"completed", "failed", "cancelled", "interrupted"})
 
 class IntegrationManager:
     def __init__(
-        self, runtime: Runtime, *, bridge_factory: BridgeFactory = ChiliarchBridge
+        self,
+        runtime: Runtime,
+        *,
+        bridge_factory: BridgeFactory = ChiliarchBridge,
+        closing: Callable[[], bool] | None = None,
     ) -> None:
         self.runtime = runtime
         self.store = runtime.store
@@ -45,6 +60,8 @@ class IntegrationManager:
         self._closing = True
         self.last_error: str | None = None
         self._scope = self._identity_scope()
+        self.attention_policy = ChiliarchAttentionPolicyStore(self.store)
+        self._host_closing = closing
 
     def _identity_scope(self) -> str:
         config = self.runtime.config.settings.chiliarch
@@ -83,6 +100,7 @@ class IntegrationManager:
             "base_url": config.base_url,
             "name": config.name,
             "last_error": self.last_error or (self.bridge.last_error if self.bridge else None),
+            "attention": self.attention_settings().public(),
             "running": len(self._active),
             "queued": len(self._records("chiliarch_task", state="queued")),
             "outbox": self.store.db.execute(
@@ -90,6 +108,65 @@ class IntegrationManager:
                 (self._scope,),
             ).fetchone()[0],
         }
+
+    def attention_settings(self) -> ChiliarchAttentionState:
+        config = self.runtime.config.settings.chiliarch
+        # Recompute from current Settings, not only this instance's old scope.
+        scope = self._identity_scope()
+        return self.attention_policy.observe(
+            scope,
+            available=bool(
+                not self._closing
+                and config.enabled
+                and config.base_url
+                and config.credential
+                and scope == self._scope
+            ),
+        )
+
+    def replace_attention(self, enabled: bool) -> dict[str, Any]:
+        """The authenticated host caller holds configuration_lock."""
+        if self.runtime._closing or (self._host_closing is not None and self._host_closing()):
+            raise MaintenanceError("transaction_unavailable", "service_closing")
+        if not self.runtime.configuration_lock.locked():
+            raise MaintenanceError("configuration_lock_required")
+        self.runtime.maintenance.require_configuration()
+        self.store.revalidate_format()
+        config = self.runtime.config.settings.chiliarch
+        if enabled and not (config.enabled and config.base_url and config.credential):
+            raise ChiliarchAttentionError("chiliarch_attention_pairing_required")
+        self.attention_policy.replace(self._identity_scope(), enabled)
+        return self.attention_settings().public()
+
+    def tools(self, runtime: Runtime) -> list[Tool]:
+        async def status(args: dict[str, Any]) -> dict[str, Any]:
+            return self.attention_settings().public()
+
+        async def configure(args: dict[str, Any]) -> dict[str, Any]:
+            request = ChiliarchAttentionInput.model_validate(args)
+            caller = runtime.tool_session_id
+            if caller is not None and caller != self.store.existing_main_session_id():
+                raise PermissionError("只有主人主会话可以修改 chiliarch 消息提醒策略")
+            async with runtime.configuration_lock:
+                result = self.replace_attention(request.enabled)
+            await runtime.bus.notify()
+            return result
+
+        return [
+            Tool(
+                "chiliarch_attention_status",
+                "查看当前配对身份的 chiliarch 普通消息提醒策略；不连接远端",
+                parameters({}),
+                status,
+            ),
+            Tool(
+                "chiliarch_attention_configure",
+                "开启或关闭当前配对身份以后新消息的提醒；不补历史，不运行任务或自动回信",
+                ChiliarchAttentionInput.model_json_schema(),
+                configure,
+                "write",
+            ),
+        ]
 
     async def start(self) -> None:
         if not self._closing:
@@ -266,7 +343,27 @@ class IntegrationManager:
                     ),
                 )
 
-        inserted = self.store.ingest(envelope.to_dict(), apply=apply, namespace=self._scope)
+        state = self.attention_settings()
+        routing: FrozenRouting | None = None
+        if (
+            envelope.type in MESSAGE_TYPES
+            and state.enabled
+            and self.runtime.config.settings.attention.enabled
+        ):
+            try:
+                routing = FrozenRouting.independent(self.runtime.config.settings, self.store.db)
+            except (ValueError, sqlite3.Error):
+                pass  # A notice route failure cannot reject the original inbox/ACK.
+        notice = message_notification(
+            envelope,
+            state,
+            receive_scope=self._scope,
+            max_chars=self.runtime.config.settings.attention.max_chars,
+            routing=routing,
+        )
+        self.store.ingest(
+            envelope.to_dict(), apply=apply, namespace=self._scope, notification=notice
+        )
         self._work.set()
         self._outgoing.set()
         if envelope.type == "task.cancel":
@@ -274,15 +371,9 @@ class IntegrationManager:
             active = self._active.get(identifier)
             if active is not None:
                 active.cancel()
-        if inserted:
-            await self.runtime.bus.emit(
-                "notification.created",
-                {
-                    "id": f"{self._scope}:{envelope.id}",
-                    "source": "chiliarch",
-                    "type": envelope.type,
-                },
-            )
+        # A previous delivery may have committed then lost the wakeup/ACK.
+        # Re-waking duplicates is safe; Store.ingest never appends their event.
+        await self.runtime.bus.notify()
 
     def _dispatch(self, db: sqlite3.Connection, envelope: Envelope) -> None:
         payload = envelope.payload

@@ -29,6 +29,7 @@ from muli.conversation import MAX_EVENT_ID_CHARS
 from muli.evidence import EvidenceError
 from muli.extensions import ExtensionError
 from muli.history_evidence import HistoryEvidence
+from muli.integrations.attention import ChiliarchAttentionInput
 from muli.local_services import LocalServices
 from muli.maintenance import BootPermit, MaintenanceError
 from muli.maintenance_api import (
@@ -191,7 +192,11 @@ def _create_app(
 ) -> FastAPI:
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
-    attention = AttentionInbox(runtime, lambda: config.settings.system_events)
+    attention = AttentionInbox(
+        runtime,
+        lambda: config.settings.system_events,
+        chiliarch_settings=lambda: integration.attention_settings(),
+    )
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
@@ -202,7 +207,8 @@ def _create_app(
     personal_io = PersonalIO(runtime, local_services, attachments)
     from muli.integrations.manager import IntegrationManager
 
-    integration = IntegrationManager(runtime)
+    integration = IntegrationManager(runtime, closing=lambda: configuration_closing)
+    runtime.add_tool_provider(integration.tools)
     runtime.maintenance.owner("integration", lambda: integration.idle)
     runtime.maintenance.owner("memory_recovery", lambda: memory_application.idle)
     runtime.maintenance.owner("personal_io", lambda: personal_io.idle)
@@ -1276,6 +1282,19 @@ def _create_app(
     async def pair(body: PairInput) -> dict[str, Any]:
         async with runtime.configuration_lock:
             return await integration.pair(body.code, body.name)
+
+    @app.get("/api/integrations/chiliarch/attention")
+    async def chiliarch_attention() -> dict[str, Any]:
+        return integration.attention_settings().public()
+
+    @app.put("/api/integrations/chiliarch/attention")
+    async def configure_chiliarch_attention(body: ChiliarchAttentionInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = integration.replace_attention(body.enabled)
+        await runtime.bus.notify()
+        return result
 
     @app.get("/api/service")
     async def service_status() -> dict[str, Any]:

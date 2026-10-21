@@ -135,7 +135,19 @@ def make_bridge(
 
 身份范围由服务地址和 agent ID 共同决定。换服务或重新配对为另一身份后，不执行旧身份的排队任务，也不把旧回执发送给新身份。重启时 `running/cancelling` 标为 `interrupted` 并上报，不重复可能已产生的副作用；尚未开始的 `queued` 任务可以继续。
 
-外部任务使用本机 `default_mode`。远端 `parameters.mode` 仅为不可信资料，不能升级为 `yolo`。`workdir` 必须是本机允许目录中的现有绝对目录，仅作为任务资料传给模型，不修改进程 cwd，也不声称提供仓库沙箱。未派任务的 `agent.message/collaboration.message` 进入收件箱，`wake=true` 不会自动触发模型。未实现的 `repository.command` 明确返回失败，不声明仓库命令能力。
+外部任务使用本机 `default_mode`。远端 `parameters.mode` 仅为不可信资料，不能升级为 `yolo`。`workdir` 必须是本机允许目录中的现有绝对目录，仅作为任务资料传给模型，不修改进程 cwd，也不声称提供仓库沙箱。未派任务的 `agent.message/collaboration.message` 默认只进入收件箱，远端 `wake=true` 本身不授予提醒或模型权限。未实现的 `repository.command` 明确返回失败，不声明仓库命令能力。
+
+## 普通消息提醒（默认关闭）
+
+主人可用 `chiliarch_attention_status` 读取状态，以 `chiliarch_attention_configure({"enabled":true})` 开启当前配对身份以后新消息的提醒；关闭传 `false`。配置工具为 write 风险，只允许主人主会话调用，沿用正常审批。等价管理 API 为 `GET/PUT /api/integrations/chiliarch/attention`，PUT 的完整 JSON 仅为 `{"enabled":true}` 或 `{"enabled":false}`；沿用管理页登录、同源、JSON、配置锁及维护门。此操作只保存本地策略，不配对或连接服务；需要已经保存有效接入配置。
+
+策略保存为独立 SQLite 对象，主 `Settings` 和 `attention.events` 三项不变。状态返回当前 scope、revision、实际开关和固定原因；身份变化后旧策略不自动应用于新身份，坏值或未知版本不会自动重置。旧版读取主配置仍兼容，但不会执行这项新提醒功能。
+
+开启后，仅首次持久接收、正文为非空白字符串的两类普通消息可成为注意事项。inbox、通知和事件在同一事务中提交后才 ACK；重复只唤醒已有事件，不重建通知或重新授权。通知稳定 ID 绑定接收连接的真实 scope，同 ID 换身份也不会覆盖或冲突。开启不会补授权旧消息，远端 `wake/metadata` 不能改变策略或来源。
+
+提醒复用 [Attention](attention.md) 的自然空闲等待、游标和去重凭据：外部正文明确标为资料，每条最多 4000 字符且服从当前正文预算，仅开放读取工具，不运行任务、不改配置、不自动回信 chiliarch。需要总 `attention.enabled` 开启；主模型未配置时仍可保留一批已接纳资料。首次接收时按 `channels.proactive` 冻结默认或显式记忆绑定的目的地，默认 WebUI；后续不从消息猜地址，也不会改发给新默认。已接纳资料保持原历史身份，不撤销所有既有 ingress/outbox。
+
+来源核验使用固定主键与 SQL 字节上限，不先加载完整 payload 再截取。坏策略或过大证明只使本 producer 无法自动提醒，原入站 ACK 和其他提醒不受影响。实现、预算及本地验证边界见 [chiliarch 提醒设计](chiliarch-attention-design.md)。
 
 ## 持久化与安全重放
 

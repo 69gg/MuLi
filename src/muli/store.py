@@ -1006,8 +1006,14 @@ class Store:
         *,
         apply: Callable[[sqlite3.Connection], None] | None = None,
         namespace: str = "",
+        notification: dict[str, Any] | None = None,
     ) -> bool:
-        """Persist envelope and its notification in one transaction before upstream ACK."""
+        """Persist envelope, notice and its event atomically before upstream ACK.
+
+        ``notification`` is host-produced metadata, never a remote envelope field.
+        The caller only wakes the bus after this transaction; duplicates do not
+        append another event.
+        """
         serialized = json.dumps(
             envelope,
             ensure_ascii=False,
@@ -1030,16 +1036,33 @@ class Store:
                 return False
             if apply is not None:
                 apply(self.db)
-            notice = {
-                "id": identifier,
-                "title": str(envelope.get("type", "chiliarch")),
-                "content": json.dumps(envelope.get("payload", {}), ensure_ascii=False),
-                "source": "chiliarch",
-                "read": False,
-                "created_at": now(),
-            }
+            notice = (
+                notification
+                if notification is not None
+                else {
+                    "id": identifier,
+                    "title": str(envelope.get("type", "chiliarch")),
+                    "content": json.dumps(envelope.get("payload", {}), ensure_ascii=False),
+                    "source": "chiliarch",
+                    "read": False,
+                    "created_at": now(),
+                }
+            )
             self.db.execute(
                 "INSERT INTO objects VALUES('notification',?,?,?)",
                 (notice["id"], json.dumps(notice, ensure_ascii=False), now()),
+            )
+            self._event(
+                "notification.created",
+                {
+                    "id": notice["id"],
+                    "source": notice["source"],
+                    "type": envelope["type"],
+                    **{
+                        field: notice[field]
+                        for field in ("created_at", "producer", "attention")
+                        if field in notice
+                    },
+                },
             )
         return True
