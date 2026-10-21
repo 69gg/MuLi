@@ -1,6 +1,6 @@
 # 2.36 MCP 普通资源审查
 
-状态：精确候选十项 CI 全部通过，签名提交与标签已推送；main 和发行流水线待完成。
+状态：精确候选与 main 各十项 CI 全部通过，签名提交与标签已推送；发行因 Windows 3.12 原生探测超时受阻，尚未发布包。
 
 ## 用户行为
 
@@ -53,8 +53,16 @@ unused-ignore；保持源码和严格规则不变，以 `--no-incremental` 和�
 和 `v2.36.0`；PR42 于 2026-10-21 12:03:20 UTC 按原提交合入。
 标签对象 `392993b88506be18e92558e7325cf647aca14bba` 本地及 GitHub 验签有效。
 
-[main CI](https://github.com/69gg/MuLi/actions/runs/39596574176) 与
-[发行](https://github.com/69gg/MuLi/actions/runs/39596574355) 待完成；
-PyPI 尚未核实，不能把候选通过或标签存在当作包已发布。
+[main CI](https://github.com/69gg/MuLi/actions/runs/39596574176) 十项全部成功。
+[发行](https://github.com/69gg/MuLi/actions/runs/39596574355) attempt 1 的九项验证成功，
+Windows 3.12 作业 `119210252707` 失败，prepare/publish/github-release 三项跳过。
+失败项是既有 `test_real_windows_system_module_probe_mta_and_owned_unicode_tree`：
+自建目标窗口已启动，另一个 PowerShell helper 的 `probe` 在等待响应时耗尽原
+12 秒预算（调用 12.44 秒，包括收尾）；该组为 3350 通过、1388 跳过、1 失败。
+不是测试摘要成功后作业被取消，也不是 MCP 资源测试失败。
+
+同一提交的候选与 main 上该平台均通过，这只能说明本次没有稳定复现，不能
+证明超时根因或已修复。保留日志和原标签，继续检查启动/响应链路，不增加期限
+或屏蔽原生检查。GitHub release 查询为 404；不能把标签存在当作包已发布。
 
 设计与边界见[资源设计](mcp-resources-design.md)、[MCP 使用说明](mcp.md)。
