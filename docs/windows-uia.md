@@ -180,6 +180,18 @@ unknown outcome；详见[设计中的红例记录](windows-uia-actions-design.md
 重复或错误事件使夹具失败并强拥有回收。上述真实 Windows provider、动作和消息
 关联仍待远端矩阵，不以 Linux fake 或只读历史通过替代。
 
+## 后续 probe 阶段证据
+
+2.36 发行的 Windows 3.12 job `119210252707` 曾在目标窗已经就绪后，独立 PS
+probe 等待回执超时；现有日志不足以区分启动、模块导入、UIA 初始化与写回阶段。
+本开发片仅给精确包内脚本增加每 helper 最多八行固定 stderr 标记，仍计入原会话
+预算；CI 在自有 helper 收尾后，只附固定阶段和回收标量。没有扩大 12 秒、修改
+MTA/执行策略、预热或自动重试，生产 API 不返回原始 stderr。缺少标记不等于确定
+停滞原因，WriteLine 返回也不等于宿主已经收到。实现与真实 Windows 验证状态见
+[阶段证据设计](windows-uia-probe-diagnostics-design.md)；不把观测片描述成根因修复。
+本地仅运行 13 新增与 42 既有纯用例，三份 Python 静态及新 helper 类型检查通过，
+峰值 67.9 MiB、swap 0；独立静态后审未发现确定 P1/P2，真实脚本阶段输出仍待验。
+
 ## 官方依据
 
 Context7 先查 PowerShell / .NET 接口；模块自动加载问题无匹配时再核微软原文：
