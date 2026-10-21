@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import tomllib
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import Field
 
@@ -18,6 +18,8 @@ from muli.management_transaction import StrictRecord
 UV_RECEIPT_VERSION = "0.13.0"
 UV_RECEIPT_COMMIT = "4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17"
 _NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*", re.ASCII)
+_INVALID_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})", re.ASCII)
+ReceiptAdapter = Literal["uv-tool-0.13.0", "uv-tool-0.13.1"]
 IndexStrategy = Literal["first-index", "unsafe-first-match", "unsafe-best-match"]
 _STRATEGIES: tuple[IndexStrategy, ...] = (
     "first-index",
@@ -65,6 +67,8 @@ class ReceiptOptions(StrictRecord):
     extra_index_urls: tuple[str, ...] | None = Field(default=None, repr=False)
     no_index: bool | None = None
     index_strategy: IndexStrategy | None = None
+    find_links: tuple[str, ...] | None = Field(default=None, repr=False)
+    no_build: bool | None = None
 
 
 class InstallIntent(StrictRecord):
@@ -80,8 +84,18 @@ class InstallIntent(StrictRecord):
 class ParsedInstallIntent(StrictRecord):
     status: Literal["intent_parsed"] = "intent_parsed"
     context_status: Literal["context_required"] = "context_required"
-    adapter: Literal["uv-tool-0.13.0"] = "uv-tool-0.13.0"
+    adapter: ReceiptAdapter = "uv-tool-0.13.0"
     intent: InstallIntent
+
+
+def receipt_adapter(uv_version: str) -> ReceiptAdapter:
+    """Select only explicitly reviewed formats, without observing a uv binary."""
+    if type(uv_version) is str:
+        if uv_version == "0.13.0":
+            return "uv-tool-0.13.0"
+        if uv_version == "0.13.1":
+            return "uv-tool-0.13.1"
+    raise InstallProfileError("unsupported_uv_version")
 
 
 def _table(value: object, allowed: set[str], code: str) -> dict[str, object]:
@@ -137,6 +151,31 @@ def _https(value: object) -> str:
     return url
 
 
+def _local_links(value: object) -> str:
+    """Keep a local URI as evidence; never discover or authorize its contents."""
+    url = _text(value)
+    try:
+        parts = urlsplit(url)
+        path = unquote(parts.path, encoding="utf-8", errors="strict")
+        if (
+            not url.startswith("file:///")
+            or parts.netloc
+            or "?" in url
+            or "#" in url
+            or _INVALID_ESCAPE.search(url)
+            or any(character.isspace() for character in url)
+            or not path.startswith("/")
+            or path.startswith("//")
+            or "\\" in path
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
+            or any(part in {".", ".."} for part in path.split("/"))
+        ):
+            raise ValueError
+    except ValueError:
+        raise InstallProfileError("unsupported_find_links") from None
+    return url
+
+
 def _bounded_tree(value: object, limits: IntentLimits) -> None:
     pending: list[tuple[object, int]] = [(value, 0)]
     nodes = 0
@@ -188,17 +227,23 @@ def _requirement(value: object, limits: IntentLimits) -> RegistryRequirement:
 
 def _options(value: object, limits: IntentLimits) -> ReceiptOptions:
     table = _table(
-        value, {"index-url", "extra-index-url", "no-index", "index-strategy"}, "unsupported_option"
+        value,
+        {"index-url", "extra-index-url", "no-index", "index-strategy", "find-links", "no-build"},
+        "unsupported_option",
     )
     extra = _array(table["extra-index-url"]) if "extra-index-url" in table else None
-    if (len(extra) if extra is not None else 0) + int("index-url" in table) > limits.max_indexes:
+    links = _array(table["find-links"]) if "find-links" in table else None
+    if (len(extra) if extra is not None else 0) + (len(links) if links is not None else 0) + int(
+        "index-url" in table
+    ) > limits.max_indexes:
         raise InstallProfileError("receipt_budget")
-    no_index: bool | None = None
-    if "no-index" in table:
-        value = table["no-index"]
-        if type(value) is not bool:
-            raise InstallProfileError("invalid_receipt")
-        no_index = value
+    booleans: dict[str, bool | None] = {"no-index": None, "no-build": None}
+    for name in booleans:
+        if name in table:
+            value = table[name]
+            if type(value) is not bool:
+                raise InstallProfileError("invalid_receipt")
+            booleans[name] = value
     strategy: IndexStrategy | None = None
     if "index-strategy" in table:
         value = table["index-strategy"]
@@ -211,8 +256,10 @@ def _options(value: object, limits: IntentLimits) -> ReceiptOptions:
     return ReceiptOptions(
         index_url=_https(table["index-url"]) if "index-url" in table else None,
         extra_index_urls=tuple(_https(item) for item in extra) if extra is not None else None,
-        no_index=no_index,
+        no_index=booleans["no-index"],
         index_strategy=strategy,
+        find_links=tuple(_local_links(item) for item in links) if links is not None else None,
+        no_build=booleans["no-build"],
     )
 
 
@@ -233,8 +280,7 @@ def parse_install_intent(
     This format adapter never resolves PEP specifiers/markers, applies defaults
     from outside the receipt, discovers credentials or selects a target release.
     """
-    if type(uv_version) is not str or uv_version != UV_RECEIPT_VERSION:
-        raise InstallProfileError("unsupported_uv_version")
+    adapter = receipt_adapter(uv_version)
     if type(data) is not bytes:
         raise InstallProfileError("invalid_receipt")
     budget = limits if limits is not None else IntentLimits()
@@ -267,6 +313,7 @@ def parse_install_intent(
     if len(entrypoints) > budget.max_entrypoints:
         raise InstallProfileError("receipt_budget")
     return ParsedInstallIntent(
+        adapter=adapter,
         intent=InstallIntent(
             main=parsed[0],
             with_requirements=parsed[1:],
@@ -275,5 +322,5 @@ def parse_install_intent(
             python=_text(tool["python"]) if "python" in tool else None,
             entrypoints=tuple(_entrypoint(item) for item in entrypoints),
             options=_options(tool["options"], budget) if "options" in tool else None,
-        )
+        ),
     )
