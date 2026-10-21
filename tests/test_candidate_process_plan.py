@@ -378,7 +378,11 @@ def test_bad_attachment_is_not_treated_as_absent(plan: dict[str, Any], attachmen
         read_process({**plan, "candidate_process": attachment}, LIMIT)
 
 
-@pytest.mark.parametrize("tail", ["x" * LIMIT, "中" * (LIMIT // 3), '"' * (LIMIT // 2)])
+@pytest.mark.parametrize(
+    "tail",
+    ["x" * LIMIT, "中" * (LIMIT // 3), '"' * (LIMIT // 2)],
+    ids=["ascii", "utf8", "json-escaped"],
+)
 def test_plan_budget_counts_utf8_escaping_and_final_headroom(
     store: Store, plan: dict[str, Any], tail: str
 ) -> None:

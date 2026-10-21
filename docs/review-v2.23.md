@@ -48,7 +48,14 @@ not-found 不足以解锁。详情见[管理接入](candidate-host-design.md)。
 - 宿主修改后的管理相关 31 项及既有恢复入口/HTTP/托管管理/宿主 51 项通过；
   这两个组与上面的新测试有重叠，不能直接相加宣称唯一测试总数。
 - 全仓 Ruff、格式检查及 128 个源码文件的 mypy 通过，静态检查峰值
-  288.5 MiB、swap 0。完整测试集、候选 CI 与发行验收仍待执行。
+  288.5 MiB、swap 0。
+
+首轮完整候选 CI `39531729631` 对应 `880600ce9b6bb1620e8ea6caed5dd74361a23fb3`：
+quality、MCP、Ubuntu 3.12/3.13、macOS 3.12/3.13 六项成功。Windows 3.12/3.13
+均为 2682 passed、1364 skipped、4 errors：新预算测试的 32 KiB 参数默认名称
+进入 `PYTEST_CURRENT_TEST`，超过 Windows 32767 字符环境变量上限。
+修复仅为三个原参数指定短 ID，保留全部 ASCII、UTF-8 和 JSON 转义载荷与预算
+断言；三个用例本地通过，峰值 64.3 MiB。修后完整 CI 与发行验收仍待执行。
 
 ## 尚未验证
 
