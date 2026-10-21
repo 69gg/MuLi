@@ -1,16 +1,18 @@
 # uv 安装意图与 InstallProfile 最小设计
 
-状态：独立纯 receipt 意图解析及定向检查已完成；[已核安装内的固定 receipt 观察](install-receipt.md)也已独立实现，完整来源发现、InstallProfile 和候选安装仍是后续方案。本片没有读取用户真实 receipt、配置、凭据或数据库，没有运行 uv、安装、下载或服务操作。不把当前本机 uv 版本列为已支持。
+状态：独立纯 receipt 意图解析及[固定 receipt 观察](install-receipt.md)已实现；2.23 开发片补充明确的 uv 0.13.1 adapter、有限本地 wheelhouse 选项和当前 managed slot 观察。完整来源发现、InstallProfile 和候选安装尚未由本片交付，不单独发版。本片没有读取用户真实 receipt、配置、凭据或数据库，也没有运行 uv、安装、下载或服务操作；下述已完成的独立微型实验仅提供格式依据。
 
 本片接续[跨版本兼容元数据](upgrade-compatibility.md)，细化[可恢复管理设计的候选准备](recoverable-management-design.md#uv-候选准备继承要求不碰当前环境)。当前只解析已知 receipt 结构并保留安装意图；完整解析上下文仍待补证，不回答目标是否可解、候选是否健康或能否切换。
 
 ## 当前已实现的窄入口
 
-`muli.install_profile.parse_install_intent(raw, uv_version="0.13.0", limits=...)` 只接收 bytes 和调用者声明的版本，返回冻结的 `ParsedInstallIntent`。成功状态固定为 `intent_parsed`，`context_status` 固定为 `context_required`，不输出 `profile_complete`、候选版本或可安装结论。传入版本不是二进制认证，也不能证明 receipt 的历史 producer。
+`muli.install_profile.parse_install_intent(raw, uv_version="0.13.0" | "0.13.1", limits=...)` 只接收 bytes 和调用者声明的版本，返回冻结的 `ParsedInstallIntent`，adapter 分别为 `uv-tool-0.13.0` / `uv-tool-0.13.1`。原 `UV_RECEIPT_VERSION` / `UV_RECEIPT_COMMIT` 保留 0.13.0 研究基线，不将新版本隐式设为默认。成功状态固定为 `intent_parsed`，`context_status` 固定为 `context_required`，不输出 `profile_complete`、候选版本或可安装结论。传入版本不是二进制认证，也不能证明 receipt 的历史 producer。
 
 当前保留主 requirement、extras、with、constraints、overrides 的原顺序及原 specifier/marker，保留显式 Python 请求和 entrypoint 证据。省略的 specifier/marker/options 与显式空值区分；不求值 marker、不解析 PEP 版本、不排序或去重。使用上游规范名称格式，只接受主工具 `muli-agent`；with 再声明主工具时拒绝歧义。入口路径与 Python 请求只是文本证据，不会被打开或执行。
 
-已支持 options **仅** `index-url`、`extra-index-url`、`no-index`、`index-strategy`，后者保留三个已核枚举，不擅改原策略。索引 URL 与 requirement 的 registry index 只接受无 userinfo/query/fragment 的 HTTPS；不验证真实连通性、认证或信任。named index、find-links、构建选项以及 tool 的 excludes/build constraints 即使显式为空也暂不支持；任何其它根/tool/requirement/entrypoint/option 字段都固定拒绝，不丢字段后成功。旧字符串 requirement、非 registry 来源、groups/conflict 和未知枚举同样拒绝。
+原四个 options 字段 `index-url`、`extra-index-url`、`no-index`、`index-strategy` 保持原 API；后者保留三个已核枚举，不擅改原策略。2.23 新增 `find_links: tuple[str, ...] | None`（对应 `find-links`）及 `no_build: bool | None`（对应 `no-build`），保留顺序、重复项及省略/显式空列表/False 的差别。索引 URL 与 requirement 的 registry index 只接受无 userinfo/query/fragment 的 HTTPS；`find-links` 仅接受无 authority/query/fragment、控制字符或含糊路径段的 `file:///` 绝对本地 URI，原 URI 不重写。普通路径、远端 URL、主机名/UNC、坏百分号编码等均拒绝。这里只验证有限语法，不打开目录、不核所有权、内容或来源信任；候选宿主仍须单独核实本地来源及其效果。
+
+`no-build` 只保留严格布尔值，不在 parser 中把 False 偷改为 True；执行策略必须另行拒绝与宿主禁止构建策略相冲突的意图。索引及 find-links 合计受 `max_indexes` 限制，所有字符串、集合和总输入预算继续生效。named index、其它构建选项以及 tool 的 excludes/build constraints 即使显式为空也暂不支持；任何其它根/tool/requirement/entrypoint/option 字段都固定拒绝，不丢字段后成功。旧字符串 requirement、非 registry requirement 来源、groups/conflict 和未知枚举同样拒绝。
 
 输入使用标准库 [tomllib.loads](https://docs.python.org/3.12/library/tomllib.html)，先限制 bytes，解析后迭代限制节点、深度、字符串和集合；所有失败转换成不含原文的 `InstallProfileError.code`。模型复用 `StrictRecord`，内层集合使用 tuple。`IntentLimits` 集中提供有限上下界。当前没有 ResolverContext、CredentialReference 采集或合并，也没有接运行入口、发行 manifest 或兼容格式声明。
 
@@ -20,11 +22,13 @@ TOML 解析段也将 CPython 整数字符串转换限制产生的裸 `ValueError
 
 ## 研究依据与版本边界
 
-已用 Context7 核对 uv 工具 receipt、升级和配置语义，并阅读官方源码。研究 adapter 锚定 [uv 0.13.0](https://github.com/astral-sh/uv/releases/tag/0.13.0)，提交 `4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17`；这是上游格式研究基线，不是本机安装证据，也不是所有 uv 0.x 的兼容承诺。未在本仓发现可复用的 uv Rust 源码缓存，不继续扫描用户目录。
+已用 Context7 核对 uv 工具 receipt、升级和配置语义，并阅读官方源码。原 adapter 锚定 [uv 0.13.0](https://github.com/astral-sh/uv/releases/tag/0.13.0)，提交 `4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17`。本次另核 [0.13.1 的 Tool/entrypoint](https://github.com/astral-sh/uv/blob/0.13.1/crates/uv-tool/src/tool.rs) 与 [ToolOptionsWire](https://github.com/astral-sh/uv/blob/0.13.1/crates/uv-settings/src/settings.rs)：本片接受的六个 options 在两个版本中类型一致，`no-index` / `no-build` 为可省略布尔值，`find-links` 为可省略列表；其余字段继续拒绝。这是明确版本的有限适配，不是所有 uv 0.x 的兼容承诺，也不认证当前 uv 二进制。
+
+此前获准的单次隔离实验使用 `uv 0.13.1 (62faed335)`：标准库构造无依赖、无构建脚本的 1450 bytes 微型 wheel，以离线/no-index/本地 find-links/no-build/no-python-downloads/no-config 参数安装到私有 `UV_TOOL_DIR`，独立 bin/cache/temp，材料随后清理。467 bytes receipt 实际保存 `no-index = true`、`find-links = ["file:///…/wheelhouse"]`、`no-build = true`；不保存 offline/no-config/no-python-downloads，宿主每次执行仍须明确施加这些限制。新增样本据该真实结构转写，替换工具名/入口名和私有路径，不称原始 receipt bytes，也不称已实际安装 MuLi、验证 extras/with/constraints 或连续两轮部署。该实验用现有解释器，无依赖或 Python 下载；执行 0.14 秒、峰值 40.7 MiB、swap 0。本次开发不重复安装实验。
 
 [receipt 根结构](https://github.com/astral-sh/uv/blob/4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17/crates/uv-tool/src/receipt.rs)没有独立的 producer 版本或 schema 版本。未来调用者必须提供受核验的 uv 二进制身份、版本和明确 adapter ID；不能靠文件名或 TOML 能解析就认定兼容。当前 uv 版本也不能证明这个 receipt 最初由该版本产生：只有完整匹配已审格式的输入才可归一化，旧字符串格式等分支必须单列支持或拒绝。
 
-本地 `updates.py` 仍通过原位 `uv tool upgrade --no-python-downloads muli-agent==目标` 更新。官方 [upgrade 实现](https://github.com/astral-sh/uv/blob/4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17/crates/uv-tool-commands/src/upgrade.rs)会复用 receipt 要求与选项；新的候选安装不能假定自动继承另一个环境的这些内容。本片不改原位更新行为，也不调用它来试探格式。
+未标记 legacy 库的原位更新仍使用 `uv tool upgrade --no-python-downloads muli-agent==目标`；已标记库沿既有能力门拒绝原位自动更新。官方 [upgrade 实现](https://github.com/astral-sh/uv/blob/4ecd0eff2a81e3ffdcd7cfee10d08936e4747c17/crates/uv-tool-commands/src/upgrade.rs)会复用 receipt 要求与选项；新的候选安装不能假定自动继承另一个环境的这些内容。本片不改上述能力门，也不调用原位更新来试探格式。
 
 ## 后续完整 Profile 接口与结论
 
@@ -94,7 +98,7 @@ Receipt 保存的是部分解析结果，不是原安装命令、完整配置来
 | build constraints、excludes、dependency-metadata、config-settings、build-isolation、额外构建依赖/变量、torch-backend 等 | 都是已知影响行为的输入；首片未实现语义的非默认值返回 `unsupported_option`，不透传任意键值或默默删除 |
 | 未知根键、未知 tool/requirement/options/index 内层键或新枚举值 | 一律拒绝，即使上游某层容忍未知字段也不放行 |
 
-后续支持矩阵须与该 adapter 的源字段逐项对齐；当前只有前述四个 options 与有限要求字段实现了纯保留，其它选项明确拒绝。不能把此表的后续保留要求当成已实现转换，不扩成 uv 全配置解释器。
+后续支持矩阵须与该 adapter 的源字段逐项对齐；当前只有前述六个 options 与有限要求字段实现了纯保留，其它选项明确拒绝。不能把此表的后续保留要求当成已实现转换，不扩成 uv 全配置解释器。
 
 ## 索引与凭据来源
 
@@ -190,4 +194,6 @@ index-strategy = "first-index"
 
 2026-10-21，经共享 `scripts/check_local.py` guard 串行验证：115 项合成回归通过，用时 0.12 秒、峰值 54.5 MiB；两文件 Ruff、格式检查与严格 mypy 通过，静态检查峰值 185.3 MiB，全部 swap 0。有限整数反证在修复前实际以裸 `ValueError` 失败：当前上限 4300 位，4301 位样本仍在 receipt bytes 预算内；修复后固定拒绝且不回显原文。测试还覆盖字段/顺序保留、缺省与显式空值、版本/来源/URL、严格类型、输入上界、不可变集合及禁止文件/进程/网络等隐式访问；未实际读取 fixture 路径或凭据。
 
-尚未验证：真实本机 uv 版本与安装来源、真实 receipt 样本、实际索引/认证、完整上下文合并、候选解析与安装、依赖完整性、跨版本启动/切换/回退。纯解析通过不能作为这些能力的验收证据。
+以上 115 项为原 0.13.0 解析片的历史验证。2.23 增量经同一 guard 串行执行 `test_install_profile.py`、`test_install_receipt.py`、`test_installation.py`，合计 224 项通过（0.54 秒，service 1.016 秒、峰值 62.4 MiB、swap 0）；4 个 Python 文件的 Ruff / 格式及两源码严格 mypy 通过（后者 3.069 秒、峰值 194.2 MiB、swap 0）。新增选项也在禁止文件/环境/进程/网络 I/O 的测试替身下解析成功。没有运行安装实验或用户环境发现。
+
+微型实验已核其 uv 版本和 receipt 形状；真实用户安装来源、实际索引/认证、完整上下文合并、MuLi 候选解析与安装、依赖完整性及候选准备到 A/B 交接的纵向链仍未由本片验证。纯解析通过不能作为这些能力的验收证据。
