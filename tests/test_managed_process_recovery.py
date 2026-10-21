@@ -14,12 +14,13 @@ import time
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
 from helpers.managed_recovery_worker import BOOT, PREFIX, deployment, prepare, read_record
-from test_management_process_recovery import checkpoint, cleanup, remaining
+from test_management_process_recovery import CLEANUP_SECONDS, checkpoint, cleanup, remaining
 
 import muli
 from muli.managed_transaction import HealthProofV2, format_digest
@@ -37,6 +38,65 @@ pytestmark = pytest.mark.skipif(
 )
 CASE_SECONDS = 20.0
 HTTP_BYTES = 4096
+
+
+def finish_service(process: subprocess.Popen[bytes]) -> None:
+    # Only after all timed recovery proofs: cleanup has its own existing cap.
+    process.terminate()
+    assert process.wait(timeout=CLEANUP_SECONDS) in {0, -signal.SIGTERM}
+
+
+class _ExitProcess:
+    def __init__(self, *, exit_code: int = 0, exit_seconds: float = 0.1) -> None:
+        self.exit_code = exit_code
+        self.exit_seconds = exit_seconds
+        self.terminated = 0
+        self.waits: list[float] = []
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        assert self.terminated and timeout is not None, "exit wait must be signalled and bounded"
+        self.waits.append(timeout)
+        if timeout < self.exit_seconds:
+            raise subprocess.TimeoutExpired("fixture-service", timeout)
+        return self.exit_code
+
+
+def test_final_service_exit_has_cleanup_budget_when_operation_time_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline = CASE_SECONDS
+    clock = deadline - 0.032199681
+    monkeypatch.setattr(
+        "test_management_process_recovery.time", SimpleNamespace(monotonic=lambda: clock)
+    )
+    process = _ExitProcess()
+    process.terminate()
+    # Reproduce the CI boundary deterministically without sleeping or spawning.
+    with pytest.raises(subprocess.TimeoutExpired):
+        process.wait(timeout=min(CLEANUP_SECONDS, remaining(deadline)))
+    assert 0 < process.waits[0] < process.exit_seconds
+    clock = deadline + 1
+    process.waits.clear()
+    finish_service(cast(subprocess.Popen[bytes], process))
+    assert process.waits == [CLEANUP_SECONDS] and process.terminated == 2
+
+
+@pytest.mark.parametrize("exit_code", [1, -signal.SIGKILL])
+def test_final_service_exit_still_rejects_unexpected_status(exit_code: int) -> None:
+    process = _ExitProcess(exit_code=exit_code)
+    with pytest.raises(AssertionError):
+        finish_service(cast(subprocess.Popen[bytes], process))
+    assert process.waits == [CLEANUP_SECONDS] and process.terminated == 1
+
+
+def test_final_service_exit_does_not_extend_cleanup_or_retry_a_timeout() -> None:
+    process = _ExitProcess(exit_seconds=CLEANUP_SECONDS + 1)
+    with pytest.raises(subprocess.TimeoutExpired):
+        finish_service(cast(subprocess.Popen[bytes], process))
+    assert process.waits == [CLEANUP_SECONDS] and process.terminated == 1
 
 
 def fixture_parent(repository: Path) -> Path:
@@ -408,8 +468,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         assert proof.role == selected and proof.boot == BOOT[selected]
                         assert proof.installation == (base.digest if failure else target.digest)
                         assert proof.format_digest == format_digest(before.observed_format)
-                live.terminate()
-                assert live.wait(timeout=min(2.0, remaining(deadline))) in {0, -signal.SIGTERM}
+                finish_service(live)
                 with (
                     TransactionJournal(root / "journal", database, create=False) as journal,
                     journal.writer_lease(),
