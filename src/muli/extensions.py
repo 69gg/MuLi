@@ -1,4 +1,4 @@
-"""Bounded directory discovery and idle publication of MCP/Skills generations."""
+"""Bounded extension discovery, idle MCP and request-boundary Skills publication."""
 
 from __future__ import annotations
 
@@ -179,7 +179,9 @@ class Extensions:
         self._fingerprint = ""
         self._observed = ""
         self._sources: tuple[str, ...] = ()
+        self._skills_base: tuple[str, str] | None = None
         self._dirty = False
+        self._full_reload = False
         self._requested = 0
         self._directory_request: int | None = None
         self._watch_failure: tuple[int, str, str, str] | None = None
@@ -243,14 +245,45 @@ class Extensions:
         )
 
     async def fingerprint(self, settings: Settings) -> str:
+        return self._source_fingerprint(
+            settings,
+            await file_io(MCPDirectory(settings).fingerprint),
+            await self.skills.fingerprint(settings.skills),
+        )
+
+    @staticmethod
+    def _source_fingerprint(settings: Settings, mcp: str, skills: str) -> str:
         return _digest(
             [
                 settings.mcp,
                 settings.extensions.model_dump(),
                 settings.skills.model_dump(),
-                await file_io(MCPDirectory(settings).fingerprint),
-                await self.skills.fingerprint(settings.skills),
+                mcp,
+                skills,
             ]
+        )
+
+    @staticmethod
+    def _skills_configuration(settings: Settings) -> str:
+        return _digest(
+            [
+                settings.mcp,
+                settings.extensions.model_dump(),
+                settings.skills.model_dump(),
+                settings.limits.max_output_chars,
+            ]
+        )
+
+    def _skills_request(self, settings: Settings, requested: int) -> bool:
+        return (
+            self._skills_base is not None
+            and self._skills_base[0] == self._skills_configuration(settings)
+            and self._directory_request == self._requested == requested
+            and not self._full_reload
+            and not self._refresh
+            and not self.runtime.mcp.pending_cleanup
+            and not self._closed
+            and not self.runtime._closing
         )
 
     def _registry(self, candidate: MCPCandidate) -> dict[str, Tool]:
@@ -271,11 +304,14 @@ class Extensions:
         settings = self.runtime.config.settings
         self._closed = False
         self._observed = ""
+        self._skills_base = None
+        configuration = self._skills_configuration(settings)
         self.phase, self._error = "preparing", None
         requested = self._requested
         error: ExtensionError | None = None
         fingerprint: str | None = None
         sources: tuple[str, ...] = ()
+        source: MCPSourceSnapshot | None = None
         try:
             fingerprint = await self.fingerprint(settings)
         except Exception as exc:
@@ -321,6 +357,7 @@ class Extensions:
                 self._observed = self._fingerprint = fingerprint or ""
                 if self._requested == requested:
                     self._dirty = False
+                    self._full_reload = False
                     self._refresh.clear()
                 failed = next(
                     (item for item in candidate.statuses if item["status"] == "error"), None
@@ -331,6 +368,8 @@ class Extensions:
                     self._failure(error)
                 else:
                     self.phase, self._error = "loaded", None
+                    if source is not None:
+                        self._skills_base = configuration, source.fingerprint
         except asyncio.CancelledError:
             if not published:
                 self._observed = ""
@@ -363,14 +402,21 @@ class Extensions:
 
     def request_reload(self, *, refresh_catalogs: bool = True) -> dict[str, Any]:
         if not self._closed:
+            self._full_reload = True
             if refresh_catalogs:
                 self._refresh.update(
                     item["name"]
                     for item in self.runtime.mcp.status()
                     if item["status"] == "connected"
                 )
+        return self._queue_reload()
+
+    def _queue_reload(self, *, directory: bool = False) -> dict[str, Any]:
+        if not self._closed:
             self._dirty = True
             self._requested += 1
+            if directory:
+                self._directory_request = self._requested
             self.phase = "queued"
             self._ready_at = asyncio.get_running_loop().time() + (
                 self.runtime.config.settings.extensions.debounce_seconds
@@ -388,6 +434,8 @@ class Extensions:
         candidate: MCPCandidate | None = None
         published = False
         self.phase, self._error = "preparing", None
+        self._skills_base = None
+        configuration = self._skills_configuration(target)
         self._last_apply = {
             "configuration": "unchanged",
             "published": False,
@@ -427,8 +475,10 @@ class Extensions:
                 self._sources = sources.sources
                 self._observed = self._fingerprint = before
                 self.phase, self._error = "loaded", None
+                self._skills_base = configuration, sources.fingerprint
                 if self._requested == requested:
                     self._dirty = False
+                    self._full_reload = False
                 published = True
                 self._last_apply.update(
                     published=True, retirement="pending" if retired else "unneeded"
@@ -445,6 +495,58 @@ class Extensions:
                 await self.runtime.mcp.discard(candidate)
             if getattr(exc, "code", None) in {"runtime_busy", "transaction_in_progress"}:
                 self._refresh.update(refresh)
+            raise self._failure(exc) from exc
+
+    async def _apply_skills_locked(self, settings: Settings) -> bool:
+        """Publish only an autonomous Skills change; the owner holds configuration_lock."""
+        requested, generation, baseline = self._requested, self.generation, self._skills_base
+        if not self._skills_request(settings, requested):
+            return False
+        target = settings.model_copy(deep=True)
+        try:
+            self.runtime.maintenance.require_configuration()
+            self.runtime.store.revalidate_format()
+            async with asyncio.timeout(target.extensions.candidate_timeout_seconds):
+                mcp = await file_io(MCPDirectory(target).fingerprint)
+                if baseline is None or mcp != baseline[1]:
+                    return False
+                self.phase, self._error = "preparing", None
+                self._last_apply = {
+                    "scope": "skills",
+                    "mcp": "unchanged",
+                    "configuration": "unchanged",
+                    "published": False,
+                    "retirement": "unneeded",
+                }
+                snapshot = await self.skills.prepare(target.skills)
+                final_mcp = await file_io(MCPDirectory(target).fingerprint)
+                final_skills = await self.skills.fingerprint(target.skills)
+                if (
+                    not self._skills_request(self.runtime.config.settings, requested)
+                    or self._skills_base != baseline
+                    or self.generation != generation
+                    or final_mcp != mcp
+                ):
+                    return False
+                if snapshot.source_fingerprint != final_skills:
+                    raise ExtensionError("source_changed", "skills")
+                self.runtime.maintenance.require_configuration()
+                self.runtime.store.revalidate_format()
+                # Only an immutable Skills pointer changes; existing requests and MCP stay owned.
+                self.skills.publish(snapshot)
+                self.generation += 1
+                self._observed = self._fingerprint = self._source_fingerprint(
+                    target, final_mcp, final_skills
+                )
+                self._dirty = False
+                self.phase, self._error = "loaded", None
+                self._last_apply["published"] = True
+                return True
+        except Exception as exc:
+            if self._requested != requested:
+                return False
+            if getattr(exc, "code", None) not in {"runtime_busy", "transaction_in_progress"}:
+                self._dirty = False
             raise self._failure(exc) from exc
 
     async def _watch(self) -> None:
@@ -476,28 +578,35 @@ class Extensions:
                         observed = await self.fingerprint(settings)
                         if observed != self._observed:
                             self._observed = observed
-                            self.request_reload(refresh_catalogs=False)
-                            self._directory_request = self._requested
+                            self._queue_reload(directory=True)
                     except Exception as exc:
                         self._failure(exc)
                         notify_failure(previous)
                 if self._dirty and asyncio.get_running_loop().time() >= self._ready_at:
-                    if self.runtime.busy or self.runtime.maintenance.configuration_blocked:
+                    if (
+                        self.runtime.busy
+                        and not self._skills_request(self.runtime.config.settings, self._requested)
+                    ) or self.runtime.maintenance.configuration_blocked:
                         self.phase = "queued"
                     else:
                         async with self.runtime.configuration_lock:
                             if (
-                                not self.runtime.busy
-                                and not self._closed
+                                not self._closed
                                 and not self.runtime.maintenance.configuration_blocked
                             ):
-                                self._dirty = False
                                 previous = self.phase, self._error
                                 autonomous = self._directory_request == self._requested
                                 try:
-                                    await self.apply_locked(
-                                        self.runtime.config.settings, persist=False
-                                    )
+                                    if self.runtime.busy:
+                                        if not await self._apply_skills_locked(
+                                            self.runtime.config.settings
+                                        ):
+                                            self.phase = "queued"
+                                    else:
+                                        self._dirty = False
+                                        await self.apply_locked(
+                                            self.runtime.config.settings, persist=False
+                                        )
                                 except ExtensionError as exc:
                                     if exc.code in {"runtime_busy", "transaction_in_progress"}:
                                         self._dirty = True

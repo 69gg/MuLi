@@ -15,7 +15,7 @@ description: 检查用户提供的学习笔记是否遗漏论据、前提和来�
 
 名称须与目录相同，长度 1–64，只用小写字母、数字和单连字符，首尾不能是连字符。`description` 为非空字符串，最多 1,024 字符。支持标准 YAML 多行字符串；frontmatter 须以顶格 `---` 开始和结束。建议使用临时文件后原子替换，避免编辑过程中发布半份指导。
 
-文件安装后由扩展运行时自动发现。运行中先排队，当前主任务、团队和工作流空闲后才准备并发布新目录；`queued` 表示尚未加载。非法 YAML、入口过多、预算超限或半写会拒绝候选，已经接受的目录和完整正文继续服务。首次启动失败时没有持久旧代可恢复，核心助手仍可使用；状态会报告未加载。重载机制和 MCP 的共同边界见 [扩展热重载设计](extensions-reload-design.md)。
+文件安装后由扩展运行时自动发现。仅 Skills 文件变化、已接受 MCP 来源和扩展预算不变且没有完整重载请求时，可以在任务活跃期间准备并发布 Skills；已物化的当前请求保持原正文，后续请求使用新目录并核验活跃修订。MCP 或混合变化、设置变更、手动重载和 catalog refresh 继续等待主任务、团队与工作流空闲；`queued` 表示尚未加载。非法 YAML、入口过多、预算超限或半写会拒绝候选，已经接受的目录和完整正文继续服务。首次扩展加载失败时没有可用 Skills-only 基线，核心助手仍可使用，重载保持原空闲合同。发布范围和验证边界见 [Skills 活跃发布](skills-live-design.md)及[扩展热重载设计](extensions-reload-design.md)。
 
 主会话或队友准备上下文时，发现已激活项被删除或修订变化，会持久清除该项并给出重新读取提示。之后恢复完全相同的旧文件也须重新调用 `skill_read`，其它有效指导仍保留；预算不足导致的暂停不会清除合法正文。未曾准备上下文的会话不会被全库扫描撤销，因此没有被该会话观察到的中间删除/恢复不改变其同修订激活。具体回归见[生命周期修复](extension-lifecycle-review.md)。
 
@@ -23,7 +23,7 @@ description: 检查用户提供的学习笔记是否遗漏论据、前提和来�
 
 已激活指导按会话保存，在上下文压缩或进程重新启动后可再次注入。重复读取同一 Skill 不叠加，也不会为新 Skill 静默挤掉旧指导。`skill_forget(name)` 清除指定项，不传名称则全部清除。若后续预算缩小或固定资料挤占空间，完整持久正文保留，但本轮明确 `guidance_status:suspended`，不会注入部分指导或声称已经应用；模型可继续调用清除工具，或修正预算再读。目录本身放不下时也明确暂停并留下有限恢复提示。首期 worker 结束不会立即删除其活跃记录，后续读取时才检查修订、失效或清除；这是每会话有限状态，不是全库会话数量上限。任意超大新输入等其它既有必要消息仍可能超过总预算，这不等同于 Skills 能保证所有请求可发送。
 
-`skill_resource(name, revision, path)` 按需读取包内 UTF-8 文本，`offset` 是字符位置。返回 `revision`、`next_offset` 和 `truncated`；续读必须携带该资源的 `resource_revision`，文件改变后返回 `resource_changed`，避免把不同版本拼在一起。正文快照固定的是 `SKILL.md`，资源在读取时另取版本，并非整个资源包的永久快照。资源须为包内普通文件，拒绝绝对路径、父目录跳转、符号链接和非普通文件；异步读取后若接受代变化也拒绝旧结果。首期不自动执行 `scripts`，也不扫描整个资源树。读取仍受现有 `limits.max_file_bytes` 和包含完整 JSON 信封的 `limits.max_output_chars` 限制。
+`skill_resource(name, revision, path)` 按需读取包内 UTF-8 文本，`offset` 是字符位置。返回 `revision`、`next_offset` 和 `truncated`；续读必须携带该资源的 `resource_revision`，文件改变后返回 `resource_changed`，避免把不同版本拼在一起。正文快照固定的是 `SKILL.md`，资源在读取时另取版本，并非整个资源包的永久快照。资源须为包内普通文件，拒绝绝对路径、父目录跳转、符号链接和非普通文件；异步读取后若该 Skill 已更换也拒绝旧结果。发布时完整相等的 Skill 复用原对象，无关 Skill 更新不使其误报换代；包目录身份变化即使正文 hash 相同也不复用。首期不自动执行 `scripts`，也不扫描整个资源树。读取仍受现有 `limits.max_file_bytes` 和包含完整 JSON 信封的 `limits.max_output_chars` 限制。
 
 源和资源通过绑定目录句柄逐段读取，祖先目录被替换为符号链接不能转向包外文件。首片要求 POSIX `dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW` 能力；缺少能力时状态为 `secure_file_reads:false`，已安装 Skill 拒绝加载并报告 `secure_read_unavailable`。空目录或关闭 Skills 仍正常，核心聊天不依赖这些平台能力。Windows 安全句柄读取尚未实现，不能把本机 Linux 回归称为全平台 Skills 验收。
 
