@@ -30,3 +30,11 @@ Windows reviewer 已核对卷根形状和相对打开方案无设计阻断，要
 现有 POSIX 父目录替换门控保持；两个依赖 POSIX `dir_fd` / symlink 特权的测试仅在 Windows 交由新增真实 junction 门控覆盖。Windows 正常 Skills 宿主用例会随原生 API 可用实际运行，不把它们继续全部跳过。上述 Linux 结果不证明 Win32 ABI、NTFS 行为或 Windows 3.12/3.13 已通过；新增 Windows 专属 fixture 在该平台要求原生 API 和 junction 构造真实成功，不以缺能力为由 skip。首轮远端 CI 若失败，须按精确日志修复后再记录平台结论。
 
 Windows reviewer 和整合方均已只读审查原生读取链与真实门控用例，未发现剩余 P1/P2；没有将静态结论替代 Windows 运行结果。
+
+## 首轮 Windows CI 夹具修正
+
+PR34 精确候选 `646f4279b3c4216be2cadf9dab81478066bc5dd6` 的 CI `39548142576`，Windows 3.12 / 3.13 作业 `119050904114` / `119050904224` 均为两项失败、同一长参数的 setup/teardown 两项错误。资源分页样本原用默认 `write_text`，Windows 将 LF 写成 CRLF，实际读取保留了原字节；修正后显式写入 UTF-8 bytes，并分别覆盖 LF 和 CRLF，仍要求各页完整拼回原文本。叶文件拒写实际已抛 `PermissionError(errno=EACCES)`，但 CRT 未附 `winerror`；夹具只接受该拒绝及空值或共享冲突 32，目录重命名仍要求原生错误 32，且原句柄读取完整旧内容、关闭后修改和重命名成功的证据保留。16382 个 emoji 的路径边界输入保持不变，仅给 pytest 参数设置固定短 ID，避免 `PYTEST_CURRENT_TEST` 本身超过 Windows 环境变量限制。
+
+本轮只修正测试夹具，不改路径准入、读取字节、句柄共享或产品错误处理。真实 Windows 原生链须由修正后的远端 CI 重新验收，不能以 Linux 上的纯解析通过替代。
+
+修正后两份相关测试在 Linux 经同一资源守卫通过 **89 项、跳过 6 项 Windows 原生用例**（0.57 秒，服务 1.094 秒，峰 79.1 MiB、swap 0）；包含 LF/CRLF 两个参数和保留的超长路径输入，不与上轮 88 项重复累计。两份测试 Ruff 与格式检查通过，峰 18.8 MiB；未因仅夹具变化重复运行产品源码 mypy。上述 Windows 两作业失败事实保留，新候选远端结果仍待验证。

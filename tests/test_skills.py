@@ -343,13 +343,15 @@ async def test_nonregular_resource_is_rejected_without_opening_pipe(host: Host) 
     assert result == {"status": "unavailable", "code": "source_not_regular"}
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 async def test_resource_pages_budget_complete_json_and_detect_between_page_edits(
     host: Host,
+    newline: str,
 ) -> None:
     path = host.source()
     (entry,) = await host.load()
-    text = '多字节🙂"\\\n' * 160
-    (path.parent / "reference.txt").write_text(text, encoding="utf-8")
+    text = ('多字节🙂"\\' + newline) * 160
+    (path.parent / "reference.txt").write_bytes(text.encode("utf-8"))
     host.config.settings.limits.max_output_chars = 1000
     arguments: dict[str, Any] = {
         "name": entry.name,
