@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from muli.process import run_process
+from muli.process import _settle_process, run_process
 from muli.tools import ax_lease as module
 from muli.tools.ax_lease import AXHelperLease, AXLeaseError
 
@@ -357,15 +357,86 @@ async def test_busy_observer_cannot_cancel_another_inflight_request() -> None:
     assert_reaped(item)
 
 
-async def test_request_timeout_includes_response_and_reaps_process() -> None:
+async def test_request_timeout_includes_response_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     item = lease("hang")
-    with pytest.raises(AXLeaseError) as caught:
-        await item.request(
+    try:
+        # This case starts at the response phase. Cold startup has its own
+        # unchanged 150ms deadline below; it must not decide this phase's result.
+        async with asyncio.timeout(item._timeout):
+            await item._start()
+        process = item._process
+        assert process is not None and process.stdin is not None
+        drained = asyncio.Event()
+        original_drain = process.stdin.drain
+
+        async def drain() -> None:
+            await original_drain()
+            drained.set()
+
+        monkeypatch.setattr(process.stdin, "drain", drain)
+        current = asyncio.get_running_loop().time()
+        loop = Mock(spec=asyncio.AbstractEventLoop, wraps=asyncio.get_running_loop())
+        # No await separates the completed startup from dispatch. Keep only
+        # this lease's synchronous checks stable; the real timeout still runs.
+        loop.time.return_value = current
+        monkeypatch.setattr(item, "_loop", loop)
+        with pytest.raises(AXLeaseError) as caught:
+            await item.request(
+                "action",
+                {"ref_id": "r1", "action": "AXPress"},
+                deadline=current + 0.15,
+            )
+        assert drained.is_set() and item._count == 1 and item._dispatched
+        assert caught.value.code == "action_unknown_outcome" and caught.value.outcome == "unknown"
+        assert isinstance(caught.value.__cause__, TimeoutError)
+    finally:
+        await item.aclose()
+    assert_reaped(item)
+
+
+async def test_request_timeout_includes_cold_startup_before_dispatch_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = LaunchGate(monkeypatch)
+    item = lease("hang")
+    original_finish = item._finish
+    cleaning = asyncio.Event()
+
+    async def finish() -> None:
+        cleaning.set()
+        await original_finish()
+
+    def forbidden_send() -> None:
+        pytest.fail("Startup timeout must not reach the dispatch fence")
+
+    monkeypatch.setattr(item, "_finish", finish)
+    request = asyncio.create_task(
+        item.request(
             "action",
             {"ref_id": "r1", "action": "AXPress"},
             deadline=asyncio.get_running_loop().time() + 0.15,
+            before_send=forbidden_send,
         )
-    assert caught.value.code == "action_unknown_outcome" and caught.value.outcome == "unknown"
+    )
+    try:
+        # The same deadline must retire even before a process handle returns.
+        await asyncio.wait_for(cleaning.wait(), item._timeout)
+        assert item.state == "closing" and not request.done()
+        assert item._starting is not None and not item._starting.done()
+        gate.release.set()
+        with pytest.raises(AXLeaseError) as caught:
+            await request
+        assert caught.value.code == "read_timeout" and caught.value.outcome == "not_started"
+        assert item._count == 0 and not item._dispatched
+        assert item._starting.done() and item._process is gate.process
+        assert gate.process is not None and gate.process.returncode is not None
+        assert isinstance(caught.value.__cause__, TimeoutError)
+    finally:
+        gate.release.set()
+        await item.aclose()
+        await asyncio.gather(request, return_exceptions=True)
     assert_reaped(item)
 
 
@@ -468,6 +539,7 @@ async def test_launch_handle_is_adopted_after_repeated_cancellation(
     item = lease()
     request = asyncio.create_task(item.request("snapshot", {}))
     await asyncio.wait_for(gate.ready.wait(), 2)
+    closer: asyncio.Task[Any]
     if operation == "request_cancel":
         request.cancel()
         closer = request
@@ -542,7 +614,7 @@ async def test_cancel_during_success_cleanup_still_clears_request_ownership(
 ) -> None:
     item = lease()
     entered, release = asyncio.Event(), asyncio.Event()
-    original = module._settle_process
+    original = _settle_process
 
     async def settle(*args: Any, **kwargs: Any) -> None:
         entered.set()
@@ -650,7 +722,7 @@ async def test_concurrent_close_observers_share_cleanup_even_when_cancelled(
     item = lease()
     await item.request("snapshot", {})
     entered, release = asyncio.Event(), asyncio.Event()
-    original = module._settle_process
+    original = _settle_process
     calls = 0
 
     async def settle(*args: Any, **kwargs: Any) -> None:
@@ -689,7 +761,7 @@ async def test_cleanup_failure_does_not_override_known_receipt_or_host_fence(
 
     item = lease()
     expected = HostPaused("current task paused")
-    original = module._settle_process
+    original = _settle_process
 
     async def settle(*args: Any, **kwargs: Any) -> None:
         await original(*args, **kwargs)
