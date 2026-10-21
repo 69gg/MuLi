@@ -646,18 +646,40 @@ def _management_source(
     plan = store.get("management", identifier)
     if (
         plan is None
-        or plan.get("status") not in {"completed", "failed"}
         or plan.get("action") not in {"configure", "restart", "update", "adopt", "switch"}
         or any(data.get(field) != plan.get(field) for field in ("status", "action", "routing"))
         or FrozenRouting.load(plan.get("routing")).classification == "independent"
     ):
         return None
-    detail = json.dumps({"action": plan["action"], "status": plan["status"]}, ensure_ascii=False)
+    if event["type"] == "management.progress" or plan.get("status") == "interrupted":
+        expected = {
+            "action": "switch",
+            "operation": "update",
+            "status": "applying" if event["type"] == "management.progress" else "interrupted",
+            "phase": (
+                "candidate_cleanup_required"
+                if event["type"] == "management.progress"
+                else "candidate_cleaned"
+            ),
+        }
+        if any(plan.get(field) != value for field, value in expected.items()) or any(
+            field not in data or field not in plan or data[field] != plan[field]
+            for field in (*expected, "routing")
+        ):
+            return None
+        detail_fields = expected
+        logical_key = f"management:{identifier}:{plan['phase']}"
+    else:
+        if plan.get("status") not in {"completed", "failed"}:
+            return None
+        detail_fields = {"action": plan["action"], "status": plan["status"]}
+        logical_key = f"management:{identifier}:{plan['status']}"
+    detail = json.dumps(detail_fields, ensure_ascii=False)
     return AttentionSource(
         "management",
         identifier,
         detail,
-        f"management:{identifier}:{plan['status']}",
+        logical_key,
         FrozenRouting.load(plan.get("routing")),
     )
 
@@ -783,6 +805,7 @@ _ADAPTERS: dict[
 ] = {
     "notification.created": _notification_source,
     "management.completed": _management_source,
+    "management.progress": _management_source,
     "system.log": _log_source,
 }
 
