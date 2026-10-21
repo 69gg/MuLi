@@ -1,6 +1,6 @@
 # MCP 普通资源的按需列表与读取
 
-状态：仅设计与锁定源码核查，未实现、未运行测试、未连接实际 MCP。基线是已提交的 HTTP/SSE 接收预算片 `ca439096b66293448f5afd7a7b37f39079558770`；接收片的根整合与远端结果由其发行记录单独说明。本设计不扩展统一错误通知。
+状态：实现、本地回归、独立后审与根整合已完成，精确远端 CI 待验，未连接外部 MCP 服务器。实现基线为签名 `423596819405cae37311b278cfc30c46454f811b`，已包含接收预算、故障通知与空游标兼容修复；根整合和发行结果见[2.36 审查](review-v2.36.md)。本片不扩展统一错误通知。
 
 ## 首片选择
 
@@ -10,9 +10,9 @@
 
 两种较小替代没有选：直接返回一页 SDK 结果会把跨调用累计预算与不透明游标状态交给调用者；反复 `resources/read` 后切片则没有服务端 offset/修订合同，不能声称读到了同一份正文。选择一次完整有界目录观察加本地元数据分页，正文一次完整交付或明确失败，不新增正文缓存。
 
-## 已核实接口与当前接缝
+## 已核实接口与实施前接缝
 
-先用 Context7 查公开接口，再读根已有环境中的 FastMCP **2.13.1**、MCP **1.21.0** 源码。Context7 返回的 main/v2 自动分页、任务和新订阅接口不适用于这些锁定版本。
+先用 Context7 查公开接口，再读根已有环境中的 FastMCP **2.13.1**、MCP **1.21.0** 源码。Context7 返回的 main/v2 自动分页、任务和新订阅接口不适用于这些锁定版本。下表 MuLi 行号与无条件工具发现描述属于实施前 `4235968` 基线；本片的实际接线和验证另列于末节。
 
 | 证据 | 实际行为与接线要求 |
 | --- | --- |
@@ -66,7 +66,7 @@ read 只接受当前目录实际已展示项的 ref，并核 server、generation
 
 读取仅一次请求，同一连接 timeout、不自动重试。先核 `contents` 长度，再逐项投影 text；允许标准的一次多文本/子资源响应，但其中的 URI 仍是数据，不签发新的可读引用。发现 blob、text/blob 混合形状或无法证明的内容类型，整个读取明确 unsupported/invalid，不返回伪装完整的文本子集，不解 base64。合法空文本与失败明确区分。
 
-允许字段与文本按旧 generation 进行已知密钥脱敏，URI 的显示值与实际内部引用分开；不对 URI 用省略号截断后再请求。结果包含 `untrusted=true`，服务器 description/text/_meta/annotations 不成为系统指令、Skill、工具定义或权限。服务器自身能否真正只读、资源 ACL 是否正确仍属于配置服务器的信任边界，宿主 external 审批不能证明它。
+允许字段的字符串值与文本按旧 generation 进行已知密钥脱敏，宿主白名单字段名保持不变，即使密钥恰好为 `text`、`name` 或 `uri`。URI 的显示值与实际内部引用分开；不对 URI 用省略号截断后再请求。结果包含 `untrusted=true`，服务器 description/text/_meta/annotations 不成为系统指令、Skill、工具定义或权限。服务器自身能否真正只读、资源 ACL 是否正确仍属于配置服务器的信任边界，宿主 external 审批不能证明它。
 
 完整读取结果必须同时满足当前接收预算、块数、输出字符预算与 Runtime 完整工具批次预算。文本超大时返回固定 output_budget；不制作任意正文 preview、自动读取其它资源或重复 read 做分页。`preserve_output` 经过实际 Runtime 打包后必须仍为 accepted/full；若完整批次无法进入下一模型请求，应明确停止，而不是只保护 handler 返回值。旧页后续可能沿既有上下文淘汰规则节选，不承诺永远保留全文。
 
@@ -78,9 +78,9 @@ read 只接受当前目录实际已展示项的 ref，并核 server、generation
 
 目录协议/内容错误只使本次资源操作失败，不把 tools 能力或已发布工具假称坏；接收 guard 的连接级失败仍沿原 latch 同时关闭工具与资源的新派发。公开状态只含支持情况与固定原因，不回显原 cursor、URI、正文、头或远端异常。统一错误通知由独立片负责，此处不触发 catalog-changed 重连。
 
-## 可实施范围与门控
+## 实现范围与门控
 
-预期生产改动集中 `tools/mcp.py` 的真实适配器、资源状态/两个宿主工具、共用调用租约与发布失效；若拆小 helper，只容纳有界投影/分页值，不建 transport 或新生命周期。Runtime 复用已有 `preserve_output`，只有真实回归证明缺口时才窄改。不改 Settings、DDL、policy 对象、管理 plan、模型 codec 或通知来源。
+生产改动集中 `tools/mcp.py` 的真实适配器、资源状态/两个宿主工具、共用调用租约与发布失效；小 helper `tools/mcp_resources.py` 只容纳有界投影/分页值，不建 transport 或新生命周期。Runtime 复用已有 `preserve_output`，无需改动其实现。不改 Settings、DDL、policy 对象、管理 plan、模型 codec 或通知来源。
 
 专用新测试先用旧实现证明“没有按需资源入口/资源专用服务器错误请求 tools/list”，再验证：
 
@@ -98,4 +98,16 @@ read 只接受当前目录实际已展示项的 ref，并核 server、generation
 
 现有工具目录曾以 `not next_cursor` 拒绝合法空串。假客户端返回两页、首个游标为空时，旧实现稳定返回零工具；仅移除非空判断后完整发现两项。新增四个唯一 case，连同原分页/适配器回归共 **11 项唯一测试**通过（先跑的 5 项已包含其中）：空串原样交下一页及锁定 SDK 参数，重复空串仍停滞，页数、目录预算、失败保旧及候选关闭不变。
 
-两份 Python 的 Ruff/format 与单源码 mypy 通过；pytest 峰 66.6 MiB、mypy 峰 177.8 MiB，swap 0。全部经根守卫、每条 30 秒串行执行，未运行真实 in-process MCP、stdio、网络或服务。这只验收工具目录的游标谓词，不代表本资源设计已经实现。
+两份 Python 的 Ruff/format 与单源码 mypy 通过；pytest 峰 66.6 MiB、mypy 峰 177.8 MiB，swap 0。全部经根守卫、每条 30 秒串行执行，未运行真实 in-process MCP、stdio、网络或服务。这次历史验证只验收工具目录的游标谓词；资源首片的独立结果如下。
+
+## 资源首片本地验证
+
+资源专用假服务器的旧实现反例稳定失败：启动仍请求不支持的 `tools/list`，最终没有资源入口（1 failed，0.14 秒，峰 59.7 MiB）。最小接线后，三份新增测试共 **53 项**通过（1.99 秒，峰 110.9 MiB），没有 skip。它们包括锁定 FastMCP/SDK 的实际 HTTP、SSE 会话和流式 HTTPX MockTransport、真实 Runtime/假 provider 的三种 codec、完整页与读取、超上下文停止、外部审批、过滤、代次和旧连接所有权。未连接 socket 或实际 MCP 服务器。
+
+独立审查提出短密钥与固定字段同名的反例：旧投影将 `text` 键一起脱敏，1 failed（0.15 秒，峰 61.2 MiB）。新增三参数回归将 `text/name/uri` 的宿主键、原始 URI 请求和正文值脱敏同时锁定；修复仅限新资源白名单投影，原通用工具结果脱敏不变。这三项已包含在上述 53 项中，首轮 50 项不重复计数。
+
+既有回归分成三组：工具目录、代次、接收和策略 **93 项**（0.81 秒）；活跃换代、接收集成/通知、Extensions、Skills 活跃发布/完整资源页与 watcher **143 项**（3.61 秒）；Runtime、系统错误来源和管理 **55 项**（3.85 秒）。三组互不重叠，合计 **291 项**；加新增共 **344 项唯一测试、17 个测试文件**。既有真实 in-process MCP 用例显式 deselect 一项，不计通过数；所有执行均为 fake 或流式 MockTransport，无真实 stdio、外部网络、服务或原生操作。策略损坏样本触发的一个 Pydantic 序列化警告属于既有回归，不影响断言。
+
+五份修改/新增 Python 的 Ruff 与格式检查、两份生产源码的严格 mypy 均通过。整轮 pytest 峰 **242.4 MiB**，mypy 峰 **173.7 MiB**，swap 0；每条检查经根 `check_local.py --seconds 30` 串行执行，沿用 1 GiB 单次、2 GiB 聚合和单 CPU 上限。未安装依赖。可选 SDK 用例需要已有 extras；普通无 extras 环境仍可收集纯假客户端与 Runtime 测试，远端选择由根整合 CI。
+
+另一个纯探针核实了非法 Unicode 假设：锁定 SDK 的真实 `JSONRPCMessage.model_validate_json` 在接收入口即以 `json_invalid` 拒绝 lone surrogate，因此未据该假设改动产品或通用 codec。此探针不计入 344 项回归。当前结果不代替根整合、无 extras 类型检查、跨平台 CI 或用户服务器验收。
