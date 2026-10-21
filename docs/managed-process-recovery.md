@@ -4,7 +4,7 @@
 
 两例都从旧实例已经停止、同一个 protocol 2 journal 已持久到 `activating/install_target` 开始。fixture 使用真实 `prepare_managed` 和合法持久状态推进，但不声称覆盖公开 prepare、原进程的 drain 或从旧安装迁入。base/target 的配置 bytes 相同，安装 prefix 和包身份不同；目标切换必须实际进入 target 解释器，不能只比较配置摘要。
 
-测试父进程复制有界的当前 MuLi 包到两个临时保留 prefix，以当前已安装的依赖目录供其运行，不安装依赖、不扫描整个 venv、不下载候选。各 prefix 的 `compatibility.json` 直接来自当前包的真实静态资产，测试不生成或改写它；发行包是否确实包含相同资产由 [wheel smoke 与发布检查](upgrade-compatibility.md#随包声明与发行检查)另行验证，这个进程测试不代替已发布构件验证。父进程先绑定一个临时 loopback socket；稳定 launcher 用真实 argv 做同 PID exec，进入实际 `-I -m muli` CLI、`open_boot_session`、`ManagedBootPermit` 和完整 `create_app`。安装、词法解释器、实际 prefix、当前包、文件系统、七领域格式、真实 SQLite WAL/FULL 和 writer lease 都使用产品校验。临时 prefix 的 `fixture.pth` 在依赖与 helper 路径行之后，显式导入唯一命名的 test-only `_muli_managed_process_fixture_hook`；该模块仍只为 base/target 角色注入 manager/probe 观察及已绑定 socket，不替代 permit、健康 proof、nonce 路由或 activation/projection 实现。
+测试父进程复制有界的当前 MuLi 包到两个临时保留 prefix，以当前已安装的依赖目录供其运行，不安装依赖、不扫描整个 venv、不下载候选。各 prefix 的 `compatibility.json` 直接来自当前包的真实静态资产，测试不生成或改写它；发行包是否确实包含相同资产由 [wheel smoke 与发布检查](upgrade-compatibility.md#随包声明与发行检查)另行验证，这个进程测试不代替已发布构件验证。父进程先绑定一个临时 loopback socket；稳定 launcher 用真实 argv 做同 PID exec，进入实际 `-I -m muli` CLI、`open_boot_session`、`ManagedBootPermit` 和完整 `create_app`。安装、词法解释器、实际 prefix、当前包、文件系统、七领域格式、真实 SQLite WAL/FULL 和 writer lease 都使用产品校验。临时 prefix 的 `fixture.pth` 在依赖与 helper 路径行之后，显式导入唯一命名的 test-only `_muli_managed_process_fixture_hook`；只有 base/target 角色且原始解释器参数精确为本 fixture 的 `-I -m muli … serve` 时，该模块才导入 worker 并注入 manager/probe 观察及已绑定 socket。稳定 launcher 阶段不提前导入 worker 或完整服务模块，早期禁 bytecode 和无操作公共 hook 仍保留；该钩子不替代 permit、健康 proof、nonce 路由或 activation/projection 实现。
 
 独立 controller 子进程持同一 journal 的真实 controller lock，调用实际 `ManagedTransactionController` 和 `ManagedLinuxBackend`。只有 systemd 命令接受、loaded unit/proc 归属和 cgroup 是受限假实现；probe 的 live PID、`/proc` argv、实际 executable 和 start ticks 仍取自真实子进程。配置、selector、unit 的正序安装/逆序还原、逐项耐久确认和 writer 锁检查均不另写测试算法。controller 通过固定的 start/stop checkpoint 交给 pytest 父进程创建或收取服务进程，不派生自己的子孙进程。
 
@@ -76,3 +76,25 @@ service 8.798 秒、CPU 8.369 秒、峰值 178.4 MiB；目标拒绝后回退
 本轮数字不构成相同 runner 的性能对照，不声称该修复已解决远端唯一根因。
 单文件 Ruff、格式检查和 strict mypy 均通过；mypy 使用 `MYPYPATH=src:tests`，
 service 2.030 秒、峰值 254.6 MiB，swap 0。独立静态审查无阻断；远端新候选仍须重新验收。
+
+PR37 第四轮精确候选 `e1bb47b` 的
+[Ubuntu 3.13 作业 119129953012](https://github.com/69gg/MuLi/actions/runs/39572518905/job/119129953012)
+再次在原 20 秒功能期限内未等到回退 resolved：target 启动请求在 6.504 秒、ready 在
+8.929 秒，base 启动请求在 16.599 秒、ready 在 18.982 秒、paused 在 19.090 秒；
+最终 journal 为 `rolling_back/verify_base`、activation pending、两个角色均未 POST activate。
+它没有进入最终服务收尾。源码另证实一个夹具额外导入：原钩子仅检查 base/target 角色，
+所以固定 controller Python 执行 standalone launcher 时已经导入完整 worker/server，
+同 PID exec 真正 slot CLI 后又导入一遍；第一遍导入随后被 exec 丢弃。
+当前只将钩子收紧为 [`sys.orig_argv`](https://docs.python.org/3/library/sys.html#sys.orig_argv)
+的精确 CLI 参数后缀，不改产品 launcher、backend、包指纹校验、期限或任何恢复断言。
+两段服务启动等待也包含真实 boot 工作，启动请求前还有实际 install/confirm；
+现有日志不能分解这些成本，更不能将两次约 6.5 秒等待全部归因于重复导入。
+
+直接执行同一生成钩子的纯 argv 反例在旧实现稳定失败：launcher 仍调用一次
+`install_hooks`（0.19 秒、62.1 MiB）。修后 10 项通过（0.16 秒、61.3 MiB），
+既断言 launcher/controller 不导入 worker，也覆盖 base/target 真 CLI、未知角色、错误配置
+路径、缺少隔离参数、其它命令和额外参数；模块导入与安装函数均为受控纯替身，不启动子进程。
+单文件 Ruff、格式和 strict mypy 通过，mypy 使用 `MYPYPATH=src:tests`，service 1.900 秒、
+峰值 272.9 MiB，全部 swap 0。每项检查仍在原 30 秒资源守卫内完成。
+本轮没有运行真实成功/回退参数；冷启动减幅与完整真实链须由新精确 CI 在原 20 秒内验收，
+不以纯 argv 回归代替真实 CLI、nonce、DB 或进程收取证据。
