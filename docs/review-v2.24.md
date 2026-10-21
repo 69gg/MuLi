@@ -1,7 +1,7 @@
 # 2.24 语音资料与后台连续性审查
 
-这是开发验收记录，尚未发布 2.24.0。已发布版本为 2.23.0，不能用其 CI
-或标签证明本分支通过。
+2.24.0 已完成精确候选、main 与发行验证，并发布至 PyPI 和 GitHub。
+下文保留各阶段局部证据；没有用 2.23 的检查或标签替代本版验证。
 
 ## 完整语音转写
 
@@ -67,4 +67,31 @@ ASR；测试只调用一次 MockTransport。已整合为 `d8ff3ec`。
 Skills 中三处既有 `import-untyped` 注释报为 unused；全新检查通过，未删掉
 注释、安装类型包或放宽检查规则。
 随后普通增量检查也通过，峰值 51.6 MiB；未沿用首次失败结果作为通过证据。
-没有前端产品改动；完整跨平台 CI 与发行验收仍待执行。
+没有前端产品改动；完整跨平台 CI 与发行验收结果见下。
+
+## 正式发行证据
+
+签名提交 `b0e3f8b2843b2333f82efe56b52ab883ed0444d6` 的
+[PR28 候选 CI](https://github.com/69gg/MuLi/actions/runs/39536157055) 八项全部成功。
+[PR28](https://github.com/69gg/MuLi/pull/28) 于 2026-10-21 03:10:09 UTC 合入
+main，合入提交仍为同一签名候选；
+[main CI](https://github.com/69gg/MuLi/actions/runs/39537076324) 八项成功，覆盖
+quality、MCP 与 Ubuntu/macOS/Windows 的 Python 3.12/3.13。
+
+签名标签 `v2.24.0` 的对象为 `8c2ca14cac84916881c0ccfbf2c48146ef0fedbd`，
+peel 后为上述提交；已核对本地 GPG 签名与远端 main/tag 引用。
+[发行流水线](https://github.com/69gg/MuLi/actions/runs/39537076390) 十一项全部成功，
+独立完成完整验证后发布同一份构件。
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.24.0)
+于 2026-10-21 03:16:59 UTC 发布；
+[PyPI 2.24.0](https://pypi.org/project/muli-agent/2.24.0/) 两个文件均未撤回，
+与 GitHub 的文件名、大小和完整摘要一致：
+
+| 文件 | 大小（字节） | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.24.0-py3-none-any.whl` | 722236 | `2b1d32240ff8b29b79a20917d10d2470632b518bca4e9c37619ede1c5ba9c86f` |
+| `muli_agent-2.24.0.tar.gz` | 3691703 | `c17f4e08aef4a3c1225847dd294552440ae39dee56c423336a60653bf5cec0bd` |
+
+发行对照仅直连读取平台 JSON 元数据，没有下载构件或安装用户服务。
+跨平台 CI 不代替真实 ASR、实际 MCP 服务器或桌面设备验收。下一轮继续
+研究忙碌任务中的 Skills 发布及按运行查询故障位置，未将其算入本版交付。
