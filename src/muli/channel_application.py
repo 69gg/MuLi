@@ -67,6 +67,7 @@ class ChannelApplication:
                 "independent_sources": [
                     "startup_update_check",
                     "extensions_watch",
+                    "mcp_connection",
                     "chiliarch_message",
                 ],
                 "memory_status": {"valid": reason == "valid", "reason": reason},

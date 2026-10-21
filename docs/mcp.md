@@ -85,7 +85,9 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 普通 JSON、错误响应、重定向和其它非流式 body 按完整原字节计费。成功 SSE 长连接按事件计费，包含注释、未知字段和分隔空行；CR、LF、CRLF 与跨块边界保持同一协议含义，未终止长行也不能无限积累。长期 GET 的累计 body 不受单事件大小限制。锁定 SDK 的旧 SSE transport 使用普通 POST 接收响应，因此该 POST 即使声明 SSE 也必须服从总 body 上限；streamable HTTP 的流式 POST 才能按事件重置。SSE 仅接纳 UTF-8。请求使用 `Accept-Encoding: identity`，非 identity 压缩响应在 HTTPX 解压前拒绝；不通过解压后截断掩盖膨胀。
 
-首次接收失败同步锁存固定原因，连接立即禁止新调用。后台 GET 的 SDK 异常可能被吞掉，固定原因仍可从 `self_status.extensions.mcp`、`/api/extensions` 的 `mcp` 或 `/api/status.mcp` 查询；外层 `phase=loaded` 只表示曾发布成功，不保证每条连接仍可用。尚未进入 handler 的调用返回 `not_executed` 和固定失败码；已经进入 SDK 的调用保持失败/未知语义，不重发。该失败不自动重新连接，也不冒用自主目录监听来源生成默认渠道通知；本片没有新增统一错误通知来源。
+首次接收失败同步锁存固定原因，连接立即禁止新调用。后台 GET 的 SDK 异常可能被吞掉，固定原因仍可从 `self_status.extensions.mcp`、`/api/extensions` 的 `mcp` 或 `/api/status.mcp` 查询；外层 `phase=loaded` 只表示曾发布成功，不保证每条连接仍可用。尚未进入 handler 的调用返回 `not_executed` 和固定失败码；已经进入 SDK 的调用保持失败/未知语义，不重发。
+
+当前已发布 HTTP/SSE 连接的首次接收失败另以 `mcp_connection` 进入[统一系统事项](mcp-receive-notification-design.md)，受现有采集/通知级别、Attention 总开关与有界队列控制。它是独立连接故障，首次持久化时冻结默认或有效显式记忆路由，不冒用当前请求来源或 `extensions_watch`。前台工具回执可能同时可见，不表示远端执行两次。候选、退休连接、stdio、取消及 Runtime 关闭期间不新增该通知；不自动重连、重放或授予 MCP 操作权限。队满、写失败和关机可能丢通知，固定 latch/status 仍可按需查。旧 slot 不具有这项新来源，回退期间不承诺补发。
 
 预算约束的是交给 HTTPX/SDK 解码器的 body，不保证底层 transport 已分配的单个 chunk、全部连接合计 RSS 或无限小事件的速率。旧 slot 会保留但不执行这份私有策略，回退后不能声称仍受此防护。实现、锁定依赖与验证见[接收预算设计](mcp-wire-budget-design.md)。
 

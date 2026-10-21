@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator
 
 from muli.mcp_policy import ReceivePolicy, checked_policy
+from muli.store import new_id
 from muli.tools import Tool
 from muli.tools.mcp_receive import ReceiveState, install_receive_guard
 
@@ -95,6 +96,7 @@ class _Connection:
     client: MCPClient
     stack: AsyncExitStack
     receive: ReceiveState
+    receive_occurrence_id: str = field(default_factory=new_id, repr=False)
     catalog: tuple[_RemoteTool, ...] = ()
     usable: bool = True
     close_failed: bool = False
@@ -264,6 +266,7 @@ class MCPManager:
         self._generation: _Generation | None = None
         self._candidate: _Generation | None = None
         self._changed: Callable[[str], None] | None = None
+        self._receive_failed_callback: Callable[[str, str], None] | None = None
         self.retirement_errors: list[JsonObject] = []
         self.tools: list[Tool] = []
 
@@ -295,6 +298,9 @@ class MCPManager:
     def set_changed_callback(self, callback: Callable[[str], None] | None) -> None:
         self._changed = callback
 
+    def set_receive_failed_callback(self, callback: Callable[[str, str], None] | None) -> None:
+        self._receive_failed_callback = callback
+
     def _notify(self, connection: _Connection) -> None:
         if (
             not self._closed
@@ -311,6 +317,19 @@ class MCPManager:
                 status="error", error_code=connection.receive.code, error=connection.receive.code
             )
             self._schedule_retirement([connection], stage="receive_failure")
+            if (
+                not self._closed
+                and connection.server["transport"] in {"http", "sse"}
+                and connection.receive.code is not None
+                and self._receive_failed_callback is not None
+            ):
+                try:
+                    self._receive_failed_callback(
+                        connection.receive.code, connection.receive_occurrence_id
+                    )
+                except Exception:
+                    # Evidence failure must never undo the latch or lose its cleanup owner.
+                    pass
 
     def status(self) -> list[JsonObject]:
         return deepcopy(list(self._status.values()))

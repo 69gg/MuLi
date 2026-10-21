@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from muli.mcp_policy import ReceivePolicy
+from muli.mcp_receive_errors import ReceiveFailureCode
 
 
 class ReceiveError(ValueError):
@@ -19,10 +20,10 @@ class ReceiveError(ValueError):
 @dataclass(slots=True)
 class ReceiveState:
     policy: ReceivePolicy
-    code: str | None = None
+    code: ReceiveFailureCode | None = None
     failed: Callable[[], None] | None = field(default=None, repr=False)
 
-    def fail(self, code: str) -> ReceiveError:
+    def fail(self, code: ReceiveFailureCode) -> ReceiveError:
         if self.code is None:
             self.code = code
             if self.failed is not None:
