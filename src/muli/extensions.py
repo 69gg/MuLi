@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from muli.attachments import file_io
 from muli.config import Settings, default_home
+from muli.mcp_policy import ReceivePolicy, ReceivePolicyError
 from muli.tools import Tool
 from muli.tools.mcp import MCPCandidate, MCPLimits
 
@@ -232,12 +233,36 @@ class Extensions:
                 else None
             ),
             "error": self._error,
+            "mcp": self.runtime.mcp.status(),
             "retirement_errors": list(self.runtime.mcp.retirement_errors),
             "cleanup_pending": self.runtime.mcp.pending_cleanup,
             "draining": self.runtime.mcp.draining,
             "skills": self.skills.status(),
+            "receive_policy": self.receive_policy_status(),
             "last_apply": last_apply,
         }
+
+    def receive_policy_status(self) -> dict[str, Any]:
+        effective = self.runtime.mcp.effective_receive_policy
+        try:
+            desired = self.runtime.mcp_policy.read()
+        except ReceivePolicyError as exc:
+            return {
+                "desired": None,
+                "effective": effective.model_dump(mode="json") if effective is not None else None,
+                "pending": True,
+                "error": exc.code,
+            }
+        return {
+            "desired": desired.model_dump(mode="json"),
+            "effective": effective.model_dump(mode="json") if effective is not None else None,
+            "pending": desired != effective,
+            "error": None,
+        }
+
+    def _check_policy(self, expected: ReceivePolicy) -> None:
+        if self.runtime.mcp_policy.read() != expected:
+            raise ExtensionError("mcp_policy_changed", "mcp_policy")
 
     def _failure(self, exc: Exception) -> ExtensionError:
         code = getattr(exc, "code", None)
@@ -294,12 +319,17 @@ class Extensions:
         )
 
     def _skills_request(self, settings: Settings, requested: int) -> bool:
+        try:
+            policy_current = self.runtime.mcp_policy.read() == self.runtime.mcp.receive_policy
+        except ReceivePolicyError:
+            policy_current = False
         return (
             self._skills_base is not None
             and self._skills_base[0] == self._skills_configuration(settings)
             and self._directory_request == self._requested == requested
             and not self._full_reload
             and not self._refresh
+            and policy_current
             and not self.runtime.mcp.pending_cleanup
             and not self._closed
             and not self.runtime._closing
@@ -346,8 +376,9 @@ class Extensions:
         self.runtime.mcp.set_changed_callback(self._catalog_changed)
         try:
             async with asyncio.timeout(settings.extensions.candidate_timeout_seconds):
+                policy = self.runtime.mcp_policy.read()
                 candidate = await self.runtime.mcp.prepare(
-                    config, strict=False, limits=self._limits(settings)
+                    config, strict=False, limits=self._limits(settings), receive_policy=policy
                 )
                 registry = self._registry(candidate)
                 try:
@@ -359,6 +390,7 @@ class Extensions:
                     raise ExtensionError("source_changed")
                 if self._closed or self.runtime._closing:
                     raise ExtensionError("runtime_closed")
+                self._check_policy(policy)
                 self.runtime.mcp.publish(candidate)
                 self.runtime.tools = registry
                 if snapshot is not None:
@@ -467,11 +499,15 @@ class Extensions:
         requested = self._requested
         try:
             async with asyncio.timeout(target.extensions.candidate_timeout_seconds):
+                policy = self.runtime.mcp_policy.read()
                 before = await self.fingerprint(target)
                 sources = await file_io(MCPDirectory(target).prepare)
                 snapshot = await self.skills.prepare(target.skills)
                 candidate = await self.runtime.mcp.prepare(
-                    sources.config, refresh=refresh, limits=self._limits(target)
+                    sources.config,
+                    refresh=refresh,
+                    limits=self._limits(target),
+                    receive_policy=policy,
                 )
                 registry = self._registry(candidate)
                 if await self.fingerprint(target) != before:
@@ -484,6 +520,8 @@ class Extensions:
                     raise ExtensionError("runtime_busy")
                 self.runtime.maintenance.require_configuration()
                 self.runtime.store.revalidate_format()
+                self._check_policy(policy)
+                self.runtime.mcp.validate_candidate(candidate)
                 # No await between persistence and publication. Everything below is prevalidated.
                 if persist:
                     try:

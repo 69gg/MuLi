@@ -35,6 +35,7 @@ from muli.managed_boot import ManagedBootPermit
 from muli.managed_requests import LocalCandidate, validate_candidate
 from muli.management_host import RecoveryHost
 from muli.management_projection import _read_object
+from muli.mcp_policy import ReceivePolicy
 from muli.platforms.candidate_process_state import PendingProcess
 from muli.plugins import PluginManager
 from muli.proactive import FrozenRouting
@@ -109,6 +110,19 @@ class SelfManagement:
             raise MaintenanceError("configuration_lock_required")
         self.runtime.maintenance.require_configuration()
         return self.online_policy.replace(policy)
+
+    def replace_mcp_policy(self, policy: ReceivePolicy) -> dict[str, Any]:
+        """Save desired policy, then request the existing extension generation path."""
+        if self._closing:
+            raise MaintenanceError("transaction_unavailable", "service_closing")
+        if not self.runtime.configuration_lock.locked():
+            raise MaintenanceError("configuration_lock_required")
+        self.runtime.maintenance.require_configuration()
+        self.runtime.store.revalidate_format()
+        self.runtime.mcp_policy.replace(policy)
+        # A failed wake/status notification cannot undo this durable replacement.
+        self.runtime.extensions.request_reload(refresh_catalogs=False)
+        return self.runtime.extensions.receive_policy_status()
 
     def _bind_online_policy(
         self, captured: CapturedCandidate, settings: OnlineSettings
@@ -916,6 +930,7 @@ class SelfManagement:
                 **runtime.config.public(),
                 "candidate_update_policy": self.update_policy.read().model_dump(mode="json"),
                 "candidate_online_policy": self.online_policy.read().model_dump(mode="json"),
+                "mcp_receive_policy": runtime.extensions.receive_policy_status(),
             }
 
         async def configure_update(args: dict[str, Any]) -> Any:
@@ -931,6 +946,13 @@ class SelfManagement:
                 result = self.replace_online_policy(policy)
             await runtime.bus.notify()
             return result.model_dump(mode="json")
+
+        async def configure_mcp(args: dict[str, Any]) -> Any:
+            policy = ReceivePolicy.model_validate(args)
+            async with runtime.configuration_lock:
+                result = self.replace_mcp_policy(policy)
+            await runtime.bus.notify()
+            return result
 
         async def configure(args: dict[str, Any]) -> Any:
             return await self.stage(
@@ -1006,7 +1028,7 @@ class SelfManagement:
         return [
             Tool(
                 "self_config",
-                "查看自身配置（密钥隐藏）；候选和在线策略分别由self_update_configure与self_update_online_configure保存",
+                "查看自身配置（密钥隐藏）及独立策略；MCP接收策略显示期望值与实际代次值",
                 parameters({}),
                 configuration,
             ),
@@ -1022,6 +1044,13 @@ class SelfManagement:
                 "完整替换匿名在线候选策略；默认关闭。只保存策略，不下载；依赖仍需本地wheelhouse",
                 OnlineSettings.model_json_schema(),
                 configure_online,
+                "write",
+            ),
+            Tool(
+                "self_mcp_receive_configure",
+                "完整替换MCP HTTP/SSE单条接收预算并请求热重载；保存不等于新代已生效",
+                ReceivePolicy.model_json_schema(),
+                configure_mcp,
                 "write",
             ),
             Tool(
