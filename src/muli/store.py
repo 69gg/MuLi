@@ -54,6 +54,7 @@ _UNFINISHED_LIFECYCLE = (
 )
 SQLITE_MAX_INTEGER = (1 << 63) - 1
 _SESSION_RECORD_LIMIT = 101  # A public page of at most 100 plus one lookahead.
+_ATTACHMENT_RECORD_LIMIT = 201  # At most 200 scanned rows plus one lookahead.
 
 
 _SESSION_RECORD_UPDATED = _session_record_time("updated_at")
@@ -444,6 +445,32 @@ class Store:
             + predicate
             + f"ORDER BY ({_SESSION_RECORD_SORT}) DESC,objects.id DESC LIMIT ?",
             (metadata_bytes, metadata_bytes, metadata_bytes, query, query, *bounds, limit),
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
+    def attachment_record_rows(
+        self, *, before_id: str | None, limit: int, metadata_bytes: int
+    ) -> Generator[dict[str, Any], None, None]:
+        """Seek the attachment primary key before reading a bounded metadata window."""
+        if type(limit) is not int or not 1 <= limit <= _ATTACHMENT_RECORD_LIMIT:
+            raise ValueError("附件目录查询需要 1–201 条的有界窗口")
+        if type(metadata_bytes) is not int or metadata_bytes < 1:
+            raise ValueError("附件目录元数据字节预算必须是正整数")
+        predicate = "AND id<? " if before_id is not None else ""
+        bounds = (before_id,) if before_id is not None else ()
+        # Do not filter JSON before LIMIT: a rare match would scan the whole
+        # directory. Nor parse unbounded JSON inside SQLite to project fields.
+        cursor = self.db.execute(
+            "SELECT substr(CAST(id AS BLOB),1,33) AS id,"
+            "length(CAST(id AS BLOB)) AS id_bytes,"
+            "substr(CAST(data AS BLOB),1,min(?,length(CAST(data AS BLOB)))) AS metadata,"
+            "length(CAST(data AS BLOB)) AS metadata_bytes "
+            "FROM objects WHERE kind='attachment' " + predicate + "ORDER BY id DESC LIMIT ?",
+            (min(metadata_bytes, SQLITE_MAX_INTEGER), *bounds, limit),
         )
         try:
             for row in cursor:
