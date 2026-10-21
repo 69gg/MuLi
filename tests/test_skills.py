@@ -66,7 +66,7 @@ class Host:
 @pytest.fixture
 def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Host]:
     if not module._secure_read_supported():
-        pytest.skip("Skills 安全文件读取需 dir_fd/O_NOFOLLOW")
+        pytest.skip("This platform lacks the required secure Skills file API")
     monkeypatch.setenv("MULI_HOME", str(tmp_path))
     runtime = Host(tmp_path)
     try:
@@ -316,6 +316,7 @@ async def test_resource_paths_cannot_escape_package(host: Host, relative: str) -
     }
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 用真实 junction 门控覆盖，不要求 symlink 特权")
 async def test_resource_symlinks_and_package_replacement_are_rejected(host: Host) -> None:
     path = host.source()
     (entry,) = await host.load()
@@ -522,6 +523,7 @@ async def test_unsupported_safe_read_does_not_disable_empty_or_disabled_core(
 
 
 @pytest.mark.parametrize("source_read", [False, True])
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd 门控；Windows 有独立原生句柄竞争回归")
 async def test_parent_swap_gate_never_opens_external_file(
     host: Host, monkeypatch: pytest.MonkeyPatch, source_read: bool
 ) -> None:
