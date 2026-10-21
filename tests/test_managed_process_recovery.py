@@ -84,8 +84,10 @@ def test_final_service_exit_has_cleanup_budget_when_operation_time_is_spent(
     assert process.waits == [CLEANUP_SECONDS] and process.terminated == 2
 
 
-@pytest.mark.parametrize("exit_code", [1, -signal.SIGKILL])
-def test_final_service_exit_still_rejects_unexpected_status(exit_code: int) -> None:
+@pytest.mark.parametrize("exit_kind", ["error", "killed"])
+def test_final_service_exit_still_rejects_unexpected_status(exit_kind: str) -> None:
+    # Resolve Linux-only signals after pytest has applied the module skip.
+    exit_code = 1 if exit_kind == "error" else -signal.SIGKILL
     process = _ExitProcess(exit_code=exit_code)
     with pytest.raises(AssertionError):
         finish_service(cast(subprocess.Popen[bytes], process))
