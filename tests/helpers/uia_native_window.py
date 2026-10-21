@@ -107,7 +107,15 @@ def _configure(user: Any, kernel: Any) -> None:
 def window_arguments(title: str) -> tuple[str, ...]:
     if not _TITLE.fullmatch(title):
         raise ValueError("Invalid owned UIA window title")
-    return (sys.executable, "-I", "-B", str(Path(__file__).absolute()), title)
+    executable = sys.executable
+    if sys.platform == "win32":
+        # Windows venv python.exe redirects through another process. This
+        # stdlib-only target must itself be the strictly owned/verified PID.
+        base_executable: object = getattr(sys, "_base_executable", None)
+        if not isinstance(base_executable, str) or not Path(base_executable).is_absolute():
+            raise ValueError("Owned UIA base interpreter unavailable")
+        executable = base_executable
+    return (executable, "-I", "-B", str(Path(__file__).absolute()), title)
 
 
 def _run_window(

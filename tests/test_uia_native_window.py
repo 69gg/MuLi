@@ -5,14 +5,15 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import os
-import sys
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from helpers import uia_native_startup
 from helpers import uia_native_window as module
 
 
@@ -235,12 +236,92 @@ def test_callback_exception_becomes_fixed_failure_and_still_closes_owned_window(
     assert "quit:1" in api.events and api.events[-1] == "unregister"
 
 
-def test_target_arguments_use_the_current_isolated_python_and_fixed_helper() -> None:
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_target_arguments_use_the_isolated_interpreter_and_fixed_helper(
+    platform: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     title = "muli-uia-" + "a" * 32
+    executable = str(tmp_path / "venv-python.exe")
+    base_executable = str(tmp_path / "base-python.exe")
+    monkeypatch.setattr(
+        module,
+        "sys",
+        SimpleNamespace(platform=platform, executable=executable, _base_executable=base_executable),
+    )
     arguments = module.window_arguments(title)
-    assert arguments == (sys.executable, "-I", "-B", str(Path(module.__file__).absolute()), title)
+    expected = base_executable if platform == "win32" else executable
+    assert arguments == (expected, "-I", "-B", str(Path(module.__file__).absolute()), title)
     with pytest.raises(ValueError, match="Invalid owned"):
         module.window_arguments("another user's window")
+
+
+@pytest.mark.parametrize("base_executable", [None, "", "relative-python.exe"])
+def test_windows_target_requires_an_absolute_base_interpreter_without_launcher_fallback(
+    base_executable: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "sys",
+        SimpleNamespace(
+            platform="win32",
+            executable=str(tmp_path / "venv-python.exe"),
+            _base_executable=base_executable,
+        ),
+    )
+    with pytest.raises(ValueError, match="base interpreter unavailable"):
+        module.window_arguments("muli-uia-" + "a" * 32)
+
+
+async def test_dispatched_target_receipt_matches_the_owned_process_without_a_venv_redirector(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    title = "muli-uia-" + "a" * 32
+    executable, base_executable = str(tmp_path / "venv-python.exe"), str(tmp_path / "python.exe")
+    output = BytesIO()
+    monkeypatch.setattr(
+        module,
+        "sys",
+        SimpleNamespace(
+            platform="win32",
+            executable=executable,
+            _base_executable=base_executable,
+            stdout=SimpleNamespace(buffer=output),
+        ),
+    )
+    arguments = module.window_arguments(title)
+    # CPython's Windows venv redirector and the actual interpreter have distinct
+    # PIDs. Model that launch boundary, then exercise the real producer + reader.
+    target_pid = os.getpid()
+    process = SimpleNamespace(
+        pid=target_pid if arguments[0] == base_executable else target_pid + 1,
+        stdout=asyncio.StreamReader(limit=uia_native_startup.OUTPUT_BYTES),
+        stderr=asyncio.StreamReader(limit=uia_native_startup.OUTPUT_BYTES),
+        returncode=None,
+    )
+    api = WindowAPI()
+    run(api, ready=module._ready)
+    process.stdout.feed_data(output.getvalue())
+    owned_process = cast(asyncio.subprocess.Process, process)
+
+    async def create() -> asyncio.subprocess.Process:
+        return owned_process
+
+    async def settle(
+        owned: asyncio.subprocess.Process, tasks: Sequence[asyncio.Task[None]]
+    ) -> None:
+        assert owned is owned_process
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        process.returncode = -1
+
+    monkeypatch.setattr(uia_native_startup, "_settle_process", settle)
+    async with uia_native_startup.observe_native_form(
+        asyncio.create_task(create()), title, 12
+    ) as owned:
+        assert owned is owned_process and owned.pid == target_pid
+        assert process.returncode is None and api.events[-1] == "unregister"
+    assert process.returncode == -1
 
 
 @pytest.mark.parametrize(
