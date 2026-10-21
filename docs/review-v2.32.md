@@ -1,0 +1,45 @@
+# 2.32 Windows UIA 只读后端审查
+
+状态：本地整合验证通过，真实 Windows 矩阵与发行尚待完成。这里只提供
+顶层窗口发现、选定窗口树和释放引用，动作及输入明确不可用。
+
+## 范围与审查
+
+签名实现 `ec054b7fe41f255a0229a844275ead2d6e527624` 整合为 `39c9ad0`。
+Windows 的既有 `auto` 后端选择 UIA，主 Settings 格式、资源限制和
+AXHelperLease 协议保持；Linux AT-SPI 与 macOS AX 继续使用原路径。
+
+固定系统 PowerShell 5.1 以 NoProfile / NonInteractive / MTA 和无控制台
+启动，只按 `$PSHOME` 的系统路径加载 Utility 与已有 UIA 程序集，不源码
+编译、安装依赖或修改执行策略。受限系统可能无法运行此桥，返回不可用；
+模块探测成功不等于已经取得桌面访问能力。
+
+helper 只保留同一进程中的短期原生窗口对象，核对 PID、启动时间和句柄；
+宿主绑定调用者与代次，沿原绝对 TTL、输出预算和取消回收机制工作。
+旧引用不按 RuntimeId、标题或 PID 重新搜索。密码节点不读 Name、Value
+或 Text；逐项遍历，限制节点、深度、子项和完整 JSON。仅确认直接 owned
+helper 已退出，不宣称系统 COM broker 或任意 provider 子树都已回收。
+
+作者、独立 reviewer 和根审查已读产品、协议及原生测试，无剩余确定
+P1/P2。原生 fixture 只在 Windows CI 创建自己的临时 WinForms 窗口，验证
+系统模块路径、UTF-8/MTA、密码隐藏、旧引用拒绝和直接 helper 取消；桌面
+不可用时要求失败，不静默跳过或改用 mock。Linux 的三个 skip 明确不是
+这些行为的验收，原生阻塞 provider 和实际用户桌面仍不在本片证明范围。
+
+## 本地验证
+
+作者 186 项通过、3 项 Windows 用例在 Linux 跳过；六份 Python Ruff/格式、
+两份源码严格 mypy 通过，最高 128.7 MiB。首轮 ctypes stub 类型问题修复
+后重核通过；原 auto 后端测试仅同步 Windows 期望，禁用时不启动保持。
+
+根分支同步版本、锁和兼容声明为 2.32.0：八文件 204 项通过、3 项平台
+跳过（3.55 秒、77 MiB）；Runtime、扩展、兼容和发行四个不同文件另
+224 项通过（3.11 秒、132.7 MiB），共十二文件 428 项，不与作者重复累计。
+全仓 Ruff、323 文件格式、136 源码完整 mypy 与 83 包离线锁通过；最高
+398.7 MiB，swap 0。
+
+完整离线构建（92.9 MiB）及临时目录内、无依赖安装的发行包 smoke
+（96.5 MiB）通过：安装后的 `uia_helper.ps1` 存在、位于安装目标内、UTF-8
+可读，既有 API/资源/禁用桌面及生命周期验证通过。没有下载依赖或启动
+PowerShell、真实桌面、真实用户服务。全部检查串行受单次 1 GiB、共享
+2 GiB、单 CPU、swap 0 和 30 秒守卫约束；远端需验证精确候选的完整矩阵。
