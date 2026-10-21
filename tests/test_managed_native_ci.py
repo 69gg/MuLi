@@ -115,6 +115,7 @@ class Commands:
                         "failure": "none",
                         "unit": f"user@{self.uid}.service",
                         "process": worker.process_unavailable(),
+                        "journal": worker.journal_unavailable(),
                         "units": [
                             {"unit": name, "code": "unit_absent"}
                             for name in (
@@ -2081,6 +2082,9 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
                 name = next(name for name, path in paths.items() if path == argv[index + 2])
                 rows = {
                     "Id": ("s", name),
+                    # These earlier proc-only cases deliberately provide no
+                    # usable invocation; journal cases below exercise that gate.
+                    "InvocationID": ("ay", []),
                     "LoadState": ("s", "loaded"),
                     "ActiveState": ("s", "activating"),
                     "SubState": ("s", "start"),
@@ -2350,3 +2354,444 @@ def test_system_image_classification_requires_actual_fixed_root_owned_file(
     assert worker.system_executables() == (
         {kind: str(path) for kind, path in paths.items()} if change == "owned" else {}
     )
+
+
+def journal_row(*, source: str = "user", event: str = "finished") -> dict[str, str]:
+    """A tiny v255 record, including JSON's four mandatory metadata fields."""
+    value = {
+        "__CURSOR": "s=private_cursor",
+        "__REALTIME_TIMESTAMP": "123456789",
+        "__MONOTONIC_TIMESTAMP": "1000000",
+        "_BOOT_ID": "b" * 32,
+        "MESSAGE_ID": {
+            "finished": "eed00a68ffd84e31882105fd973abdd1",
+            "starting": "7d4958e842da4a758f6c1cdc7b36dcc5",
+            "started": "39f53479d3a045ac8e11786248231fbf",
+            "failed": "be02cf6855d2428ba40df7e9d022f03d",
+        }[event],
+    }
+    if source == "system":
+        value.update(_PID="1", _UID="0", UNIT="user@23145.service", INVOCATION_ID="01" * 16)
+    else:
+        value.update(
+            _PID="42",
+            _UID="23145",
+            _SYSTEMD_UNIT="user@23145.service",
+            _SYSTEMD_INVOCATION_ID="01" * 16,
+        )
+        if event != "finished":
+            value["USER_UNIT"] = "basic.target"
+    if event != "finished":
+        value["JOB_TYPE"] = "start"
+        if event != "starting":
+            value["JOB_RESULT"] = "done" if event == "started" else "dependency"
+    return value
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "finished",
+        "basic-job",
+        "system-starting",
+        "system-started",
+        "system-failed",
+        "user-failed",
+        "other-unit",
+        "empty",
+        "wrong-pid",
+        "wrong-uid",
+        "wrong-unit",
+        "wrong-invocation",
+        "system-wrong-uid",
+        "system-wrong-invocation",
+        "system-finished",
+        "duplicate",
+        "array",
+        "extra-message",
+        "missing-metadata",
+        "invalid-metadata",
+        "malformed",
+        "missing-job",
+        "contradictory-job",
+        "bad-then-good",
+        "sentinel",
+        "sentinel-positive",
+        "too-many",
+        "bad-invocation",
+        "boolean-invocation",
+        "changed-invocation",
+        "changed-pid",
+        "changed-group",
+        "changed-ticks",
+        "changed-proc-group",
+        "permission",
+        "oserror",
+        "timeout",
+        "output-budget",
+        "stderr-budget",
+        "response-deadline",
+        "tail-deadline",
+        "cancel",
+    ],
+)
+async def test_setup_journal_uses_one_finite_identity_bound_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    import pwd
+    from types import SimpleNamespace
+
+    from muli import process
+    from muli.platforms import linux_transaction
+
+    user, uid, home = "muli-ci-" + "a" * 12, 23145, tmp_path / "home"
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    paths = {
+        name: f"/org/freedesktop/systemd1/unit/journal{index}" for index, name in enumerate(names)
+    }
+    group = f"/user.slice/{names[-1]}"
+    clock = 100.0
+    calls: list[list[str]] = []
+    limits: list[int] = []
+    invocations = 0
+    journal_calls = 0
+    journal_limit = 0
+    journal_bytes = 0
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(
+        worker, "system_executables", lambda: {"manager": "/usr/lib/systemd/systemd"}
+    )
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+
+    def read_proc(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        assert directory_fd is None and path.parent == Path("/proc/42")
+        assert 0 < limit < ci.OUTPUT_BYTES
+        if limits:
+            assert limit < limits[-1]
+        limits.append(limit)
+        if path.name == "stat":
+            ticks = 101 if journal_calls and case == "changed-ticks" else 100
+            return f"42 (private ) name) S {'0 ' * 18}{ticks}\n".encode()
+        if path.name == "status":
+            return f"Name:\tprivate\nUid:\t{uid} {uid} {uid} {uid}\n".encode()
+        assert path.name == "cgroup"
+        current = (
+            "/foreign" if journal_calls and case == "changed-proc-group" else group + "/init.scope"
+        )
+        return f"0::{current}\n".encode()
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", read_proc)
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal clock, invocations, journal_calls, journal_limit, journal_bytes
+        assert not merge_stderr and 0 < timeout <= 5 and 0 < limit <= ci.OUTPUT_BYTES
+        calls.append(argv)
+        if argv[:4] == ["sudo", "--non-interactive", "--", "readlink"]:
+            assert argv[-2:] == ["--", "/proc/42/exe"]
+            return {"exit_code": 0, "output": "/usr/lib/systemd/systemd\n", "stderr": ""}
+        if argv[:4] == ["sudo", "--non-interactive", "--", "cat"]:
+            assert argv[-2:] == ["--", "/proc/42/wchan"]
+            return {"exit_code": 0, "output": "ep_poll\n", "stderr": ""}
+        if argv[:4] == ["sudo", "--non-interactive", "--", "journalctl"]:
+            journal_calls += 1
+            journal_limit = limit
+            assert journal_calls == 1 and invocations == 1
+            identifiers = [
+                "MESSAGE_ID=7d4958e842da4a758f6c1cdc7b36dcc5",
+                "MESSAGE_ID=39f53479d3a045ac8e11786248231fbf",
+                "MESSAGE_ID=be02cf6855d2428ba40df7e9d022f03d",
+                "MESSAGE_ID=eed00a68ffd84e31882105fd973abdd1",
+            ]
+            assert argv == [
+                "sudo",
+                "--non-interactive",
+                "--",
+                "journalctl",
+                "--boot=0",
+                "--no-pager",
+                "--quiet",
+                "--output=json",
+                "--lines=33",
+                "--output-fields=_PID,_UID,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID,UNIT,INVOCATION_ID,USER_UNIT,MESSAGE_ID,JOB_TYPE,JOB_RESULT",
+                "_PID=1",
+                "_UID=0",
+                f"UNIT={names[-1]}",
+                "INVOCATION_ID=" + "01" * 16,
+                *identifiers,
+                "+",
+                "_PID=42",
+                f"_UID={uid}",
+                f"_SYSTEMD_UNIT={names[-1]}",
+                "_SYSTEMD_INVOCATION_ID=" + "01" * 16,
+                *identifiers,
+            ]
+            if case == "cancel":
+                raise asyncio.CancelledError
+            if case == "oserror":
+                raise OSError("private journal error")
+            if case == "timeout":
+                raise TimeoutError("private deadline error")
+            if case == "permission":
+                return {"exit_code": 1, "output": "", "stderr": "private access error"}
+            source = "system" if case.startswith("system-") else "user"
+            event = {
+                "basic-job": "started",
+                "other-unit": "started",
+                "missing-job": "started",
+                "contradictory-job": "started",
+                "user-failed": "failed",
+                "system-starting": "starting",
+                "system-started": "started",
+                "system-failed": "failed",
+            }.get(case, "finished")
+            row: dict[str, Any] = journal_row(source=source, event=event)
+            change = {
+                "wrong-pid": ("_PID", "43"),
+                "wrong-uid": ("_UID", "0"),
+                "wrong-unit": ("_SYSTEMD_UNIT", "user@999.service"),
+                "wrong-invocation": ("_SYSTEMD_INVOCATION_ID", "02" * 16),
+                "system-wrong-uid": ("_UID", "1"),
+                "system-wrong-invocation": ("INVOCATION_ID", "02" * 16),
+                "other-unit": ("USER_UNIT", "private-unlisted.service"),
+                "array": ("_PID", ["42"]),
+                "extra-message": ("MESSAGE", "private body"),
+                "invalid-metadata": ("_BOOT_ID", []),
+                "contradictory-job": ("JOB_RESULT", "failed"),
+            }.get(case)
+            if change is not None:
+                row[change[0]] = change[1]
+            if case in {"missing-metadata", "missing-job"}:
+                del row["__CURSOR" if case == "missing-metadata" else "JOB_TYPE"]
+            output = json.dumps(row)
+            if case == "duplicate":
+                output = output.replace('"MESSAGE_ID":', '"MESSAGE_ID":"private","MESSAGE_ID":', 1)
+            elif case == "malformed":
+                output = "private malformed json"
+            elif case == "empty":
+                output = ""
+            elif case == "bad-then-good":
+                output = json.dumps({**row, "_UID": "0"}) + "\n" + output
+            elif case in {"sentinel", "sentinel-positive", "too-many"}:
+                count = 34 if case == "too-many" else 33
+                later = {**row, "_UID": "0"} if case == "sentinel" else row
+                output = "\n".join([output] + [json.dumps(later)] * (count - 1))
+            elif case == "output-budget":
+                output = "x" * (limit + 1)
+            stderr = "x" * (limit + 1) if case == "stderr-budget" else ""
+            journal_bytes = len(output.encode()) + len(stderr.encode())
+            if case == "response-deadline":
+                clock = 105.0
+            return {"exit_code": 0, "output": output, "stderr": stderr}
+        assert argv[:2] == ["busctl", "--system"] and "--auto-start=no" in argv
+        if journal_calls and invocations > 0 and case not in {"output-budget", "stderr-budget"}:
+            assert limit <= journal_limit - journal_bytes
+        if "ListUnitsByPatterns" in argv:
+            rows = [
+                [name, "", "loaded", "activating", "start", "", paths[name], 1, "start", "/job/1"]
+                for name in names
+            ]
+            output = json.dumps({"type": "a(ssssssouso)", "data": [rows]})
+        elif "GetUnit" in argv:
+            output = json.dumps({"type": "o", "data": [paths[argv[-1]]]})
+        else:
+            index = argv.index("get-property")
+            fields = argv[index + 4 :]
+            if fields == ["Version"]:
+                output = json.dumps({"type": "s", "data": "255"})
+            else:
+                name = next(name for name, path in paths.items() if path == argv[index + 2])
+                if "InvocationID" in fields:
+                    invocations += 1
+                invocation: list[Any] = [
+                    2 if invocations > 1 and case == "changed-invocation" else 1
+                ] * 16
+                if case == "bad-invocation":
+                    invocation = []
+                elif case == "boolean-invocation":
+                    invocation[0] = True
+                rows = {
+                    "Id": ("s", name),
+                    "InvocationID": ("ay", invocation),
+                    "LoadState": ("s", "loaded"),
+                    "ActiveState": ("s", "activating"),
+                    "SubState": ("s", "start"),
+                    "Job": ("(uo)", [11, "/org/freedesktop/systemd1/job/11"]),
+                    "Result": ("s", "success"),
+                    "ExecMainCode": ("i", 0),
+                    "ExecMainStatus": ("i", 0),
+                    "MainPID": ("u", 43 if invocations > 1 and case == "changed-pid" else 42),
+                    "ControlGroup": (
+                        "s",
+                        "/foreign" if invocations > 1 and case == "changed-group" else group,
+                    ),
+                }
+                if invocations > 1 and case == "tail-deadline":
+                    clock = 105.0
+                output = "\n".join(
+                    json.dumps({"type": rows[field][0], "data": rows[field][1]}) for field in fields
+                )
+        return {"exit_code": 0, "output": output, "stderr": ""}
+
+    monkeypatch.setattr(process, "run_process", query)
+    if case == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await worker.diagnose_setup(user, uid, home, 105.0)
+        assert journal_calls == 1
+        return
+    value = await worker.diagnose_setup(user, uid, home, 105.0)
+    assert len(value["units"]) == 2 and value["failure"] == "none"
+    assert value["process"] == {
+        "code": "observed",
+        "exe": "manager",
+        "uid_matches": True,
+        "state": "S",
+        "wait": "epoll_wait",
+    }
+    observed = value["journal"]
+    invalid = {
+        "wrong-pid",
+        "wrong-uid",
+        "wrong-unit",
+        "wrong-invocation",
+        "system-wrong-uid",
+        "system-wrong-invocation",
+        "system-finished",
+        "duplicate",
+        "array",
+        "extra-message",
+        "missing-metadata",
+        "invalid-metadata",
+        "malformed",
+        "missing-job",
+        "contradictory-job",
+        "empty",
+        "sentinel",
+    }
+    if case in invalid:
+        assert observed["code"] == "no_known_event" and observed["events"] == []
+        assert observed["incomplete"] is (case == "sentinel")
+    elif case in {"bad-invocation", "boolean-invocation", "too-many"}:
+        assert observed == worker.journal_unavailable("invalid_reply")
+    elif case.startswith("changed-"):
+        assert observed == worker.journal_unavailable("identity_changed")
+    elif case in {
+        "permission",
+        "oserror",
+        "timeout",
+        "output-budget",
+        "stderr-budget",
+        "response-deadline",
+        "tail-deadline",
+    }:
+        code = {
+            "permission": "command_failed",
+            "oserror": "unavailable",
+            "timeout": "timeout",
+            "output-budget": "output_budget",
+            "stderr-budget": "output_budget",
+            "response-deadline": "timeout",
+            "tail-deadline": "timeout",
+        }[case]
+        assert observed == worker.journal_unavailable(code)
+    else:
+        assert observed["code"] == "observed"
+        assert observed["incomplete"] is (case == "sentinel-positive")
+        assert len(observed["events"]) == (32 if case == "sentinel-positive" else 1)
+        event = observed["events"][-1]
+        assert event == {
+            "source": "system_manager" if case.startswith("system-") else "user_manager",
+            "event": {
+                "basic-job": "started",
+                "other-unit": "started",
+                "system-starting": "starting",
+                "system-started": "started",
+                "system-failed": "failed",
+                "user-failed": "failed",
+            }.get(case, "user_startup_finished"),
+            "unit": "other"
+            if case == "other-unit"
+            else "basic"
+            if case in {"basic-job", "user-failed"}
+            else "manager",
+            "job_result": "done"
+            if case in {"basic-job", "other-unit", "system-started"}
+            else "dependency"
+            if case in {"system-failed", "user-failed"}
+            else "unknown",
+        }
+    assert journal_calls == (0 if case in {"bad-invocation", "boolean-invocation"} else 1)
+    assert all(
+        not any(word in argv for word in ("start", "stop", "set-property")) for argv in calls
+    )
+    assert not any(
+        word in json.dumps(observed) for word in ("private", "INVOCATION", "_PID", "__CURSOR")
+    )
+    assert ci.setup_facts(
+        {
+            **value,
+            "uid": uid,
+            "phase": "manager_start_before",
+            "client_code": "timeout",
+            "diagnostic_status": 0,
+            "diagnostic_code": "ok",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "raw",
+        "unknown-code",
+        "incomplete-type",
+        "too-many",
+        "unknown-source",
+        "raw-unit",
+        "raw-event",
+        "raw-result",
+        "false-finished",
+        "false-state",
+        "failed-done",
+        "unavailable-detail",
+    ],
+)
+def test_journal_export_rejects_raw_or_unsupported_claims(change: str) -> None:
+    value: dict[str, Any] = {
+        "code": "observed",
+        "incomplete": False,
+        "events": [
+            {
+                "source": "user_manager",
+                "event": "user_startup_finished",
+                "unit": "manager",
+                "job_result": "unknown",
+            }
+        ],
+    }
+    assert ci.journal_facts(value)
+    event = value["events"][0]
+    if change == "raw":
+        value["MESSAGE"] = "private body"
+    elif change == "unknown-code":
+        value["code"] = "private code"
+    elif change == "incomplete-type":
+        value["incomplete"] = 1
+    elif change == "too-many":
+        value["events"] *= 33
+    elif change == "unavailable-detail":
+        value["code"] = "unavailable"
+    elif change == "failed-done":
+        event.update(event="failed", unit="basic", job_result="done")
+    else:
+        key, new = {
+            "unknown-source": ("source", "private source"),
+            "raw-unit": ("unit", "private.service"),
+            "raw-event": ("event", "private event"),
+            "raw-result": ("job_result", "private result"),
+            "false-finished": ("source", "system_manager"),
+            "false-state": ("event", "active"),
+        }[change]
+        event[key] = new
+    assert not ci.journal_facts(value)

@@ -213,6 +213,27 @@ receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 
 
 三份 Python 文件 Ruff/format 与两脚本 strict mypy 均通过；格式检查发现的两处排版已修正。本轮最高峰值为类型检查的 **159.1 MiB/swap 0**。所有命令逐条经 root 绝对路径守卫、每条 30 秒串行，没有本机原生 harness、CLI、manager、账户或挂载效果。根与独立审查均未发现确定 P1/P2；本片只增加诊断，所有真实 MainPID、wchan 与 manager 等待阶段仍只能由下一精确托管候选验收，三个真实事务与正常清理尚未通过。
 
+## 第八轮结果与下一观察边界
+
+合并根冻结基线后的精确签名 `b516cf230be027cc87fcf1f132e928bd27026d67`，其 [CI 39590177536](https://github.com/69gg/MuLi/actions/runs/39590177536) attempt 1 已九项终态：八项成功，仅 [native 119188882495](https://github.com/69gg/MuLi/actions/runs/39590177536/job/119188882495) 失败。1114 字节 [evidence](https://github.com/69gg/MuLi/actions/runs/39590177536/artifacts/12342530101) 只有 receipt 1139 字节与 result 866 字节，zip SHA256 为 `c470f81c6580194feed7f958d99352b6a573c72e0622960a644d379ed705c6b7`。固定失败仍为 `native_command_timeout`，随后为 `native_cleanup_deadline`。
+
+阶段仍是 `manager_start_before`。`user-runtime-dir@999.service` 为 active/exited、Result=success、Job=0；`user@999.service` 为 activating/start、Result=success、PID=2504、Job=1448，cgroup 存在。已绑定进程窗口给出 `observed/manager/uid_matches=true/state=S/wait=epoll_wait`。新增等待类别仅证明该有限窗口命中已核 epoll 内核等待符号，不能推出已经进入 `manager_loop`、basic.target 已活跃、READY 已发送或被 PID1 接收，也不能据此确定启动阻塞原因。
+
+仍为 **0 个事务**，没有 harness 结果；receipt 的账户和组删除标记均未成立，仍记录三个挂载，因此没有账户、组或挂载回收成功证明。下一步仅反查 fixture 的启动假设并独审定向 journald 正向证据提案：在原 5 秒/32 KiB 内按精确 unit、当前 InvocationID 与消息来源取有限结构化字段，用已知启动完成或 job 结果证伪明确假设。该提案尚未实现；空结果、缺字段或查询失败不作为阶段缺席证明，不采集原始 MESSAGE，不改变环境、Type、阻塞启动语义或任何期限。未来 CI 分片调整不倒改本轮九项及此前各轮的历史计数。
+
+## 定向 journald 诊断（纯验完成，远端待验）
+
+根与独立审查通过后，本片仅接入上述只读观察，不改变失败的 setup 或 cleanup 效果。明确待证伪假设为“本次 manager 始终没有离开主循环前的同步启动阶段”：只有可信来源绑定到同一专用 manager PID、unit 与当前 InvocationID 的 `USER_STARTUP_FINISHED` 是强正向反证。`UNIT_STARTING`、`UNIT_STARTED`、`UNIT_FAILED` 只说明该 manager 处理过相应 start job；包括条件未满足而跳过的 job 也可能得到 done，不能据此声称 basic.target 当前 active 或 PID1 已接收 READY。无已知事件只是 unknown，不等于上述假设成立。[v255 完成事件与主循环门](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L3361-L3524)、[job 事件与条件跳过](https://github.com/systemd/systemd/blob/v255/src/core/job.c#L658-L750)、[固定消息 ID 及 job 语义注释](https://github.com/systemd/systemd/blob/v255/src/systemd/sd-messages.h#L61-L141)。
+
+- 仅在此前进程观察已确认 manager 镜像及专用 UID 后追加查询；两侧复核 typed Id/InvocationID/MainPID/ControlGroup、proc startticks 与 cgroup，变化则不发布新事件。它仍是有限身份窗口，不是原子快照；此前已完成的 unit/proc 事实继续保留。
+- 一次固定 `sudo --non-interactive -- journalctl --boot=0 --no-pager --quiet --output=json --lines=33 --output-fields=...`，以 `+` 合并两个 AND 分支：PID1 的 `_PID=1/_UID=0/UNIT=精确user@/INVOCATION_ID=本次ID`，以及 manager 的 `_PID=精确MainPID/_UID=专用UID/_SYSTEMD_UNIT=精确user@/_SYSTEMD_INVOCATION_ID=本次ID`。各分支只匹配四个固定 MESSAGE_ID。系统 manager 的 UNIT/INVOCATION_ID 与用户 manager 的 USER_UNIT/USER_INVOCATION_ID 不混用；不连接用户 bus，不用宽泛 `-u`、grep、follow 或 catalog。[v255 字段选择](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L832-L844)、[日志字段来源](https://github.com/systemd/systemd/blob/v255/man/systemd.journal-fields.xml)。
+- 请求字段只有上述来源/归属字段及 USER_UNIT、MESSAGE_ID、JOB_TYPE、JOB_RESULT。JSON 自动附带的四项元数据允许并核定类型后丢弃；重复键、数组、缺字段、坏类型或额外字段的记录不作为正向证据。原始 MESSAGE、argv、env、exe、nonce、配置、私有路径、cursor 与时间戳均不导出。只导固定 source/event/unit/job_result 类别；内部 unit 仅 basic/default/dbus/other。USER_INVOCATION_ID 属于被谈论的内部 unit，本片不查询它，也不把它当外层 ID。[v255 JSON 字段与条数合同](https://github.com/systemd/systemd/blob/v255/man/journalctl.xml#L547-L566)。
+- 最多处理最近 32 条；有第 33 条时只将最旧一条作为 incomplete 哨兵，不推断更早记录。查询 stdout/stderr、所有自动元数据、前后 typed 与 proc 核验共用原 **5 秒绝对期限及 32 KiB 累计上限**，没有独立时间窗或第二次查询。权限、格式、身份、期限或字节错误仅使新增 journal 观察不可用，取消继续传播；外层结束 worker 或拒收迟到整包时仍不承诺回传部分事实。
+
+本片新增 **54 个唯一纯 case**：42 项经完整 `diagnose_setup` 的来源、事件、身份、重复键/数组/额外元数据、33 条哨兵、字节/期限与取消反例，以及 12 项 coordinator 输出白名单拒绝例。54 项定向通过 0.28 秒、峰值 74.2 MiB/swap 0；完整 **245 个唯一 case**（原 191 加新 54）通过 0.70 秒、服务 1.256 秒、峰值 82.4 MiB/swap 0，定向重叠不另计。所有真实 subprocess 入口仍由模块 fixture 硬拒绝。
+
+三份 Python 文件 Ruff/format 与两脚本 strict mypy 最终均通过。首轮 strict mypy 发现两处 `Any | None` 未收窄：可缺省的 USER_UNIT 改为等价空串默认，输出文本改为显式 `isinstance` 拒绝，不改变固定错误或事件判断；受影响 54 项随后再次通过 0.15 秒、峰值 57.6 MiB/swap 0，不另计唯一数。类型首轮峰值 **164.5 MiB**，修后 **159.2 MiB**，swap 均为 0。全部命令逐条经 root 绝对路径守卫、每条 30 秒串行，没有本机原生 harness、CLI、manager、账户或挂载效果。下一精确远端候选之前，不声称已观察到真实 journald 事件、找到启动根因、完成三个事务或证明正常清理。
+
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。

@@ -311,6 +311,65 @@ def process_facts(value: object) -> bool:
     )
 
 
+def journal_facts(value: object) -> bool:
+    """A start-job fact is not a unit-state or READY acknowledgement."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"code", "incomplete", "events"}
+        or not isinstance(value["code"], str)
+        or value["code"] not in PROCESS_CODES | {"no_known_event", "command_failed"}
+        or type(value["incomplete"]) is not bool
+        or not isinstance(value["events"], list)
+        or len(value["events"]) > 32
+    ):
+        return False
+    if value["code"] not in {"observed", "no_known_event"}:
+        return not value["incomplete"] and value["events"] == []
+    if bool(value["events"]) != (value["code"] == "observed"):
+        return False
+    results = {
+        "unknown",
+        "done",
+        "canceled",
+        "timeout",
+        "failed",
+        "dependency",
+        "skipped",
+        "invalid",
+        "assert",
+        "unsupported",
+        "collected",
+        "once",
+    }
+    for event in value["events"]:
+        if (
+            not isinstance(event, dict)
+            or set(event) != {"source", "event", "unit", "job_result"}
+            or any(not isinstance(item, str) for item in event.values())
+            or event["source"] not in {"system_manager", "user_manager"}
+            or event["event"] not in {"starting", "started", "failed", "user_startup_finished"}
+            or event["unit"] not in {"manager", "basic", "default", "dbus", "other"}
+            or event["job_result"] not in results
+            or (event["source"] == "system_manager" and event["unit"] != "manager")
+        ):
+            return False
+        if event["event"] == "user_startup_finished":
+            if (
+                event["source"] != "user_manager"
+                or event["unit"] != "manager"
+                or event["job_result"] != "unknown"
+            ):
+                return False
+        elif (
+            (event["source"] == "user_manager" and event["unit"] == "manager")
+            or (event["event"] == "starting" and event["job_result"] != "unknown")
+            or (event["event"] == "started" and event["job_result"] != "done")
+            or (event["event"] == "failed" and event["job_result"] in {"unknown", "done"})
+        ):
+            return False
+    return True
+
+
 def setup_facts(value: object) -> bool:
     """Only the confirmed UID's two system units may enter setup evidence."""
     fields = {
@@ -326,6 +385,7 @@ def setup_facts(value: object) -> bool:
         "unit",
         "units",
         "process",
+        "journal",
     }
     if (
         not isinstance(value, dict)
@@ -345,6 +405,7 @@ def setup_facts(value: object) -> bool:
         or not isinstance(value["failure"], str)
         or value["failure"] not in DIAGNOSTIC_FAILURES
         or not process_facts(value["process"])
+        or not journal_facts(value["journal"])
     ):
         return False
     uid = value["uid"]
@@ -1276,6 +1337,7 @@ class NativeCI:
                 "state": "",
                 "wait": "unavailable",
             },
+            "journal": {"code": "not_started", "incomplete": False, "events": []},
         }
         end = time.monotonic() + CLEANUP_SECONDS
         try:

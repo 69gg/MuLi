@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 if TYPE_CHECKING:
     from muli.managed_transaction import TransactionRecordV2
     from muli.management_transaction import Role, TransactionJournal
-    from muli.platforms.linux_transaction import SystemdProbe
+    from muli.platforms.linux_transaction import CommandRunner, SystemdProbe
     from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
     from muli.store import Store
 
@@ -36,6 +36,44 @@ HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 PROCESS_STATES = frozenset("RSDZTtXxKWPI")
 SYSTEM_EXECUTABLE_ROOTS = (Path("/usr/lib/systemd"), Path("/lib/systemd"))
+JOURNAL_EVENTS = 32
+# Fixed v255 sd-messages.h IDs describe jobs, except USER_STARTUP_FINISHED.
+JOURNAL_MESSAGES = {
+    "7d4958e842da4a758f6c1cdc7b36dcc5": "starting",
+    "39f53479d3a045ac8e11786248231fbf": "started",
+    "be02cf6855d2428ba40df7e9d022f03d": "failed",
+    "eed00a68ffd84e31882105fd973abdd1": "user_startup_finished",
+}
+JOURNAL_FIELDS = (
+    "_PID",
+    "_UID",
+    "_SYSTEMD_UNIT",
+    "_SYSTEMD_INVOCATION_ID",
+    "UNIT",
+    "INVOCATION_ID",
+    "USER_UNIT",
+    "MESSAGE_ID",
+    "JOB_TYPE",
+    "JOB_RESULT",
+)
+JOURNAL_METADATA = frozenset(
+    {"__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP", "_BOOT_ID"}
+)
+JOURNAL_JOB_RESULTS = frozenset(
+    {
+        "done",
+        "canceled",
+        "timeout",
+        "failed",
+        "dependency",
+        "skipped",
+        "invalid",
+        "assert",
+        "unsupported",
+        "collected",
+        "once",
+    }
+)
 
 
 class NativeError(ValueError):
@@ -535,12 +573,202 @@ async def observe_setup_process(
         return process_unavailable(code)
 
 
+def journal_unavailable(code: str = "not_started") -> dict[str, Any]:
+    return {"code": code, "incomplete": False, "events": []}
+
+
+def journal_events(output: str, uid: int, pid: int, invocation: str) -> dict[str, Any]:
+    """Keep only fixed positive facts; absent or rejected rows prove no absence."""
+    lines = output.splitlines()
+    require(len(lines) <= JOURNAL_EVENTS + 1, "native_diagnostic_invalid")
+    allowed = set(JOURNAL_FIELDS) | JOURNAL_METADATA
+    events: list[dict[str, str]] = []
+    unit = f"user@{uid}.service"
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            require(key not in value, "native_diagnostic_invalid")
+            value[key] = item
+        return value
+
+    # journalctl emits the most recent records in chronological order. If there
+    # are 33, the oldest is only a sentinel; no claim covers earlier records.
+    for line in lines[-JOURNAL_EVENTS:]:
+        try:
+            row = json.loads(line, object_pairs_hook=unique)
+        except (ValueError, RecursionError):
+            continue
+        if (
+            not isinstance(row, dict)
+            or not set(row) <= allowed
+            or not JOURNAL_METADATA <= set(row)
+            or any(not isinstance(value, str) for value in row.values())
+            or not row["__CURSOR"]
+            or not all(
+                re.fullmatch(r"[0-9]{1,20}", row[key])
+                for key in ("__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP")
+            )
+            or re.fullmatch(r"[a-f0-9]{32}", row["_BOOT_ID"]) is None
+        ):
+            continue
+        inner = row.get("USER_UNIT", "")
+        if (
+            row.get("_PID") == "1"
+            and row.get("_UID") == "0"
+            and row.get("UNIT") == unit
+            and row.get("INVOCATION_ID") == invocation
+        ):
+            source, name = "system_manager", "manager"
+        elif (
+            row.get("_PID") == str(pid)
+            and row.get("_UID") == str(uid)
+            and row.get("_SYSTEMD_UNIT") == unit
+            and row.get("_SYSTEMD_INVOCATION_ID") == invocation
+        ):
+            source = "user_manager"
+            name = {
+                "basic.target": "basic",
+                "default.target": "default",
+                "dbus.service": "dbus",
+                "dbus.socket": "dbus",
+            }.get(inner, "other")
+        else:
+            continue
+        event = JOURNAL_MESSAGES.get(row.get("MESSAGE_ID", ""), "")
+        result = row.get("JOB_RESULT", "unknown")
+        if event == "user_startup_finished":
+            if source != "user_manager" or any(
+                key in row for key in ("USER_UNIT", "JOB_TYPE", "JOB_RESULT")
+            ):
+                continue
+            name = "manager"
+        elif event in {"starting", "started", "failed"}:
+            if row.get("JOB_TYPE") != "start" or (
+                source == "user_manager" and (not inner or len(inner) > 256)
+            ):
+                continue
+            if event == "starting":
+                if "JOB_RESULT" in row:
+                    continue
+            elif result not in JOURNAL_JOB_RESULTS or (event == "started") != (result == "done"):
+                continue
+        else:
+            continue
+        events.append({"source": source, "event": event, "unit": name, "job_result": result})
+    return {
+        "code": "observed" if events else "no_known_event",
+        "incomplete": len(lines) > JOURNAL_EVENTS,
+        "events": events,
+    }
+
+
+async def observe_setup_journal(
+    probe: SystemdProbe,
+    path: str,
+    uid: int,
+    pid: int,
+    group: str,
+    read: Callable[[int, str], Awaitable[bytes | None]],
+    runner: CommandRunner,
+    deadline: float,
+) -> dict[str, Any]:
+    """Read one exact invocation, without connecting to or activating its user bus."""
+    from muli.platforms.linux_transaction import _cgroup, _start_ticks
+
+    if pid == 0:
+        return journal_unavailable("pid_absent")
+    try:
+        require(0 < pid < 2**31 and bool(_cgroup(group)), "native_diagnostic_invalid")
+        unit = f"user@{uid}.service"
+
+        async def binding() -> tuple[str, int, str]:
+            state = await probe._properties(path, "Unit", (("Id", "s"), ("InvocationID", "ay")))
+            invocation = state["InvocationID"]
+            require(
+                state["Id"] == unit
+                and isinstance(invocation, list)
+                and len(invocation) == 16
+                and all(type(value) is int and 0 <= value <= 255 for value in invocation)
+                and any(invocation),
+                "native_diagnostic_invalid",
+            )
+            service = await probe._properties(
+                path, "Service", (("MainPID", "u"), ("ControlGroup", "s"))
+            )
+            require(service == {"MainPID": pid, "ControlGroup": group}, "native_process_changed")
+            raw_stat, raw_group = await read(pid, "stat"), await read(pid, "cgroup")
+            if raw_stat is None or raw_group is None:
+                raise OSError
+            lines = raw_group.decode("ascii").splitlines()
+            require(len(lines) == 1 and lines[0].startswith("0::"), "native_diagnostic_invalid")
+            current_group = _cgroup(lines[0][3:])
+            require(
+                current_group == group or current_group.startswith(group + "/"),
+                "native_process_changed",
+            )
+            remaining(deadline)
+            return bytes(invocation).hex(), _start_ticks(raw_stat, pid), current_group
+
+        before = await binding()
+        identifiers = [f"MESSAGE_ID={value}" for value in JOURNAL_MESSAGES]
+        result = await runner(
+            [
+                "sudo",
+                "--non-interactive",
+                "--",
+                "journalctl",
+                "--boot=0",
+                "--no-pager",
+                "--quiet",
+                "--output=json",
+                f"--lines={JOURNAL_EVENTS + 1}",
+                "--output-fields=" + ",".join(JOURNAL_FIELDS),
+                "_PID=1",
+                "_UID=0",
+                f"UNIT={unit}",
+                f"INVOCATION_ID={before[0]}",
+                *identifiers,
+                "+",
+                f"_PID={pid}",
+                f"_UID={uid}",
+                f"_SYSTEMD_UNIT={unit}",
+                f"_SYSTEMD_INVOCATION_ID={before[0]}",
+                *identifiers,
+            ],
+            timeout=remaining(deadline),
+            limit=MAX_BYTES,
+            merge_stderr=False,
+        )
+        if result.get("exit_code") != 0:
+            return journal_unavailable("command_failed")
+        output = result.get("output")
+        if not isinstance(output, str):
+            raise NativeError("native_diagnostic_invalid")
+        observed = journal_events(output, uid, pid, before[0])
+        require(before == await binding(), "native_process_changed")
+        remaining(deadline)
+        return observed
+    except TimeoutError:
+        return journal_unavailable("timeout")
+    except OSError:
+        return journal_unavailable("unavailable")
+    except ValueError as error:
+        code = {
+            "native_deadline_exceeded": "timeout",
+            "native_diagnostic_output_budget": "output_budget",
+            "native_process_changed": "identity_changed",
+        }.get(str(error), "invalid_reply")
+        return journal_unavailable(code)
+
+
 async def observe_setup_units(
     probe: SystemdProbe,
     uid: int,
     facts: dict[str, Any],
     read: Callable[[int, str], Awaitable[bytes | None]],
     deadline: float,
+    runner: CommandRunner,
 ) -> dict[str, Any]:
     """Read the two dedicated system units without depending on their user bus."""
     from muli.platforms.linux_transaction import _typed
@@ -660,6 +888,14 @@ async def observe_setup_units(
             facts["process"] = await observe_setup_process(
                 probe, path, uid, service["MainPID"], group, read, deadline
             )
+            if (
+                facts["process"]["code"] == "observed"
+                and facts["process"]["exe"] == "manager"
+                and facts["process"]["uid_matches"] is True
+            ):
+                facts["journal"] = await observe_setup_journal(
+                    probe, path, uid, service["MainPID"], group, read, runner, deadline
+                )
     facts["failure"] = "none"
     return facts
 
@@ -684,6 +920,7 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
         "unit": "",
         "units": [],
         "process": process_unavailable(),
+        "journal": journal_unavailable(),
     }
     try:
         account = pwd.getpwnam(user)
@@ -699,7 +936,10 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
             used += len(data)
             require(used <= MAX_BYTES, "native_diagnostic_output_budget")
 
-        async def command(argv: list[str], *, timeout: float, limit: int) -> dict[str, Any]:
+        async def command(
+            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool = False
+        ) -> dict[str, Any]:
+            require(not merge_stderr, "native_diagnostic_command")
             require(used < MAX_BYTES, "native_diagnostic_output_budget")
             result = await run_process(
                 argv,
@@ -775,6 +1015,7 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
                 facts,
                 read,
                 deadline,
+                command,
             )
     except TimeoutError:
         facts["failure"], facts["query_code"] = "deadline", "timeout"
