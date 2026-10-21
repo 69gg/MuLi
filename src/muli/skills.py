@@ -814,6 +814,7 @@ class Skills:
                     ("name", "revision", "path"),
                 ),
                 resource,
+                preserve_output=True,
             ),
             Tool(
                 "skill_forget",

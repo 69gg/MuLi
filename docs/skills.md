@@ -25,6 +25,8 @@ description: 检查用户提供的学习笔记是否遗漏论据、前提和来�
 
 `skill_resource(name, revision, path)` 按需读取包内 UTF-8 文本，`offset` 是字符位置。返回 `revision`、`next_offset` 和 `truncated`；续读必须携带该资源的 `resource_revision`，文件改变后返回 `resource_changed`，避免把不同版本拼在一起。正文快照固定的是 `SKILL.md`，资源在读取时另取版本，并非整个资源包的永久快照。资源须为包内普通文件，拒绝绝对路径、父目录跳转、符号链接和非普通文件；异步读取后若该 Skill 已更换也拒绝旧结果。发布时完整相等的 Skill 复用原对象，无关 Skill 更新不使其误报换代；包目录身份变化即使正文 hash 相同也不复用。首期不自动执行 `scripts`，也不扫描整个资源树。读取仍受现有 `limits.max_file_bytes` 和包含完整 JSON 信封的 `limits.max_output_chars` 限制。
 
+最新工具批次中的资源页在紧接的模型请求里保持完整，避免上下文压缩把正文节选后仍让模型沿原游标续读。必要上下文确实无法容纳整页时，明确报上下文预算错误，不发送半页；已完成读取的完整结果仍保存在会话中。后续回答、输入或工具批次后，旧页可正常节选，不会永久占用上下文。验证范围见[资源页交付审查](skill-resource-pages-review.md)。
+
 源和资源通过绑定目录句柄逐段读取，祖先目录被替换为符号链接不能转向包外文件。POSIX 路径要求 `dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW`。2.30 已发布的 Windows 适配仅支持普通绝对盘符路径上的本地 NTFS：从原生句柄核对精确 GUID 卷根，后续扫描、打开和复核均相对已持有的目录句柄，不跟随 junction 或其它重解析点；UNC、设备路径、ADS、SUBST 子目录及其它文件系统明确不可用。缺少必需 API 时状态为 `secure_file_reads:false`；路径或文件系统不支持时拒绝该来源并报告 `secure_read_unavailable`，不回退到普通全路径读取。空目录或关闭 Skills 仍正常，核心聊天不依赖这些平台能力。Windows 3.12/3.13 托管 CI 已通过真实临时 NTFS 竞争用例，前两次夹具失败及最终发行证据保留在 [2.30 审查](review-v2.30.md)；具体合同与边界见 [Windows Skills 句柄读取](windows-skills-design.md)。
 
 MuLi 接受并验证 `license`、`compatibility`、字符串映射 `metadata` 与实验性字符串 `allowed-tools`，首期不把这些可选字段作为模型目录的一部分，也不实现 Claude Code hooks、subagent 或脚本自动执行。未知宿主字段只报告固定警告码。`allowed-tools` 不授予权限；Skill 是工作指导，不能替代主人指令或工具批准。所有读取工具沿用 MuLi 的统一权限门。目录来自用户受信任的本地文件，不是执行恶意本地代码的沙箱。
