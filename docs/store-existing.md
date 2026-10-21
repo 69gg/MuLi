@@ -28,7 +28,9 @@ Store 拥有新建连接。首条 SQLite 语句之前就设置 SQL/单值长度�
 
 Memory/ChannelManager 的内部复核要求该 Store 连接没有活跃事务、使用默认 str 解码、传统事务控制和非 None isolation_level，且 `read_uncommitted=0`；业务写入继续依赖 Store 原有事务语义，不接受用户改成自动逐条提交的连接。读取器不修改这些设置，不回滚调用前的事务。Store 独占自己的 progress callback；Python 无法获取和恢复未知旧 callback，因此宿主不能在此连接自行安装并期待保留 progress handler。读取器不替换 authorizer。
 
-默认限额为仓库声明总计 32 KiB、96 个必需对象、每条 schema SQL 4 KiB、主对象 16 KiB、累计 20 万 VM 指令与 1 秒期限；SQLite SQL 长度另限 4 KiB，单值长度为最大对象/schema 预算加小量行开销。schema 返回值先在 SQL 内核长再取有限 bytes，非法记忆 marker 不返回其 TEXT/BLOB 正文。每个目录查询只取至多两行，不复制整库。
+默认限额为仓库声明总计 32 KiB、96 个必需对象、每条 schema SQL 4 KiB、主对象 16 KiB、累计 20 万 VM 指令与 1 秒期限；SQLite SQL 长度另限 4 KiB，单值长度为最大对象/schema 预算加小量行开销。schema 返回值先在 SQL 内核长再取有限 bytes，非法记忆 marker 不返回其 TEXT/BLOB 正文。
+
+结构核验将仓库声明中的名称作为参数放入一次 `IN` 查询，最多返回必需对象数加一行，逐行比较类型和 SQL；缺名或重复仍拒绝，不再为每个必需对象重复扫描 `sqlite_schema`。不返回无关对象的 SQL，也不把整个目录装入内存。身份/marker 查询仍至多两行，快照和所有默认预算保持原值。该优化减少扫描开销，不保证繁忙宿主不会耗尽期限。
 
 VM 步数按至多 100 条指令回调累计，每条语句末尾还有小于该间隔的余量；快语句可不触发回调，语句数量和源码大小仍有限，最后再次核期限。底层阻塞 I/O 不受 Python callback 的硬期限保证，执行宿主仍需进程级资源和期限保护。WAL/SHM 辅助文件可能被 SQLite 访问或创建，因此“零迁移/业务写入”不等于“目录完全零变化”；不使用 immutable 忽略实时 WAL。错误使用固定 `ExistingStoreError.code`，不回显数据库正文。
 

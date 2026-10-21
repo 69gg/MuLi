@@ -1,4 +1,4 @@
-"""Only hosted Windows CI creates and reads its own disposable WinForms window."""
+"""Only hosted Windows CI creates and reads its own disposable Win32 window."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from helpers import uia_native_window
 from helpers.uia_native_startup import observe_native_form
 
 from muli.config import Settings
@@ -28,77 +29,6 @@ pytestmark = pytest.mark.skipif(
     reason="Native UIA validation is restricted to a hosted Windows CI temporary window",
 )
 
-_FORM = r"""
-[Console]::Error.WriteLine('muli-native-stage=script_entered')
-[Console]::Error.Flush()
-$ErrorActionPreference = 'Stop'
-$PSModuleAutoLoadingPreference = 'None'
-Set-StrictMode -Version Latest
-$utility = [IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
-Microsoft.PowerShell.Core\Import-Module $utility -Cmdlet Add-Type, ConvertTo-Json
-[Console]::Error.WriteLine('muli-native-stage=system_module_loaded')
-[Console]::Error.Flush()
-Microsoft.PowerShell.Utility\Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-[Console]::Error.WriteLine('muli-native-stage=assemblies_loaded')
-[Console]::Error.Flush()
-$writer = [IO.StreamWriter]::new([Console]::OpenStandardOutput(), [Text.UTF8Encoding]::new($false))
-$writer.AutoFlush = $true
-$form = [Windows.Forms.Form]::new()
-[Console]::Error.WriteLine('muli-native-stage=form_constructed')
-[Console]::Error.Flush()
-$form.Text = $args[0]
-$form.ShowInTaskbar = $false
-$form.StartPosition = [Windows.Forms.FormStartPosition]::Manual
-$form.Location = [Drawing.Point]::new(-20000, -20000)
-$form.Size = [Drawing.Size]::new(320, 220)
-$label = [Windows.Forms.Label]::new()
-$label.Text = '中文🌊 "quote" \ slash'
-$label.AccessibleName = $label.Text
-$label.TabIndex = 0
-$label.AutoSize = $true
-$label.Location = [Drawing.Point]::new(5, 5)
-$password = [Windows.Forms.TextBox]::new()
-$password.AccessibleName = 'private-password-label'
-$password.Text = 'private-password-value'
-$password.UseSystemPasswordChar = $true
-$password.TabIndex = 1
-$password.Location = [Drawing.Point]::new(5, 40)
-$button = [Windows.Forms.Button]::new()
-$button.Text = 'Never invoke this button'
-$button.TabIndex = 2
-$button.Location = [Drawing.Point]::new(5, 80)
-[void]$form.Controls.Add($label)
-[void]$form.Controls.Add($password)
-[void]$form.Controls.Add($button)
-[Console]::Error.WriteLine('muli-native-stage=controls_ready')
-[Console]::Error.Flush()
-$form.Add_HandleCreated({
-    [Console]::Error.WriteLine('muli-native-stage=handle_created')
-    [Console]::Error.Flush()
-})
-$form.Add_Load({
-    [Console]::Error.WriteLine('muli-native-stage=loaded')
-    [Console]::Error.Flush()
-})
-$form.Add_Activated({
-    [Console]::Error.WriteLine('muli-native-stage=activated')
-    [Console]::Error.Flush()
-})
-$form.Add_Shown({
-    [Console]::Error.WriteLine('muli-native-stage=shown')
-    [Console]::Error.Flush()
-    $writer.WriteLine((Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject @{
-        pid = $PID; title = $form.Text
-    } -Compress))
-})
-try {
-    [Console]::Error.WriteLine('muli-native-stage=before_message_loop')
-    [Console]::Error.Flush()
-    [Windows.Forms.Application]::Run($form)
-}
-finally { $form.Dispose(); $writer.Dispose() }
-"""
-
 
 @dataclass(frozen=True)
 class NativeForm:
@@ -111,21 +41,11 @@ def settings() -> Settings:
 
 
 @pytest_asyncio.fixture
-async def native_form(tmp_path: Path) -> AsyncIterator[NativeForm]:
-    # Windows PowerShell 5.1 requires a BOM for non-ASCII source with -File.
-    script = tmp_path / "owned-form.ps1"
-    script.write_text(_FORM, encoding="utf-8-sig")
+async def native_form() -> AsyncIterator[NativeForm]:
     title = "muli-uia-" + uuid4().hex
     starting = asyncio.create_task(
         asyncio.create_subprocess_exec(
-            str(module._powershell()),
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Sta",
-            "-File",
-            str(script),
-            title,
+            *uia_native_window.window_arguments(title),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -138,6 +58,7 @@ async def native_form(tmp_path: Path) -> AsyncIterator[NativeForm]:
         starting, title, settings().computer.operation_timeout_seconds
     ) as process:
         yield NativeForm(process, title)
+    assert process.returncode is not None, "The owned native target must be reaped"
 
 
 async def discover(computer: Computer, form: NativeForm) -> str:

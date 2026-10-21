@@ -1507,26 +1507,8 @@ class Runtime:
         self._repair_tail(session_id)
         await self._claim_inputs(session_id, run_id)
         prepared = await self._prepare_request(session_id)
-        tools = self.session_tools(session_id)
         session = self.store.get("session", session_id) or {}
         workflow_step = workflow_step or bool(session.get("workflow_run_id"))
-        if session.get("kind") == "main":
-            tools = {
-                name: tool
-                for name, tool in tools.items()
-                if tool.risk == "read" or name in self._coordinator_tools
-            }
-        if not workflow_step and role != "reviewer":
-            tools["workflow_create"] = self._workflow_tool(mode, session_id, run_id)
-        if role == "reviewer":
-            tools = {name: tool for name, tool in tools.items() if tool.risk == "read"}
-        elif not workflow_step:
-            tools.update({tool.name: tool for tool in self.team.tools(session_id, mode)})
-        tools = {
-            name: tool
-            for name, tool in tools.items()
-            if name not in self.config.settings.disabled_tools
-        }
         spent = 0
         async with self.client_factory(self.model_config(role)) as client:
             for round_index in range(self.config.settings.limits.max_tool_steps + 1):
@@ -1539,18 +1521,15 @@ class Runtime:
                 delivery_routes = (
                     prepared.reply_origin.delivery_routes() if session.get("kind") == "main" else []
                 )
-                trigger = self._latest_main_trigger(session_id)
-                round_tools = (
-                    {name: tool for name, tool in tools.items() if tool.risk == "read"}
-                    if trigger and trigger.get("principal") == "system:attention"
-                    else tools
-                )
                 try:
                     async with self.capacity:
                         # Capacity and extension hooks may have suspended this
                         # request. Its original brief/epoch must still authorize
                         # entry before any network/model operation begins.
                         self._guard_request(prepared)
+                        round_tools = self._round_tools(
+                            session_id, run_id, role, mode, workflow_step, session, spent
+                        )
                         async for event in client.stream(
                             messages, [tool.schema() for tool in round_tools.values()]
                         ):
@@ -1695,10 +1674,43 @@ class Runtime:
                     self.system_events.clear_request(session_id)
                     await self._claim_inputs(session_id, run_id)
                 prepared = await self._prepare_request(session_id)
-                if spent >= self.config.settings.limits.max_tool_steps:
-                    # A final no-tool turn can explain the partial result without more effects.
-                    tools = {}
             raise ValueError("模型调用达到步骤上限")
+
+    def _round_tools(
+        self,
+        session_id: str,
+        run_id: str,
+        role: str,
+        mode: Mode,
+        workflow_step: bool,
+        session: dict[str, Any],
+        spent: int,
+    ) -> dict[str, Tool]:
+        # Materialize after capacity admission. One dict binds the schemas and
+        # handlers for this whole response, including approval waits and pairing.
+        if spent >= self.config.settings.limits.max_tool_steps:
+            return {}
+        tools = self.session_tools(session_id)
+        if session.get("kind") == "main":
+            tools = {
+                name: tool
+                for name, tool in tools.items()
+                if tool.risk == "read" or name in self._coordinator_tools
+            }
+        if not workflow_step and role != "reviewer":
+            tools["workflow_create"] = self._workflow_tool(mode, session_id, run_id)
+        if role == "reviewer":
+            tools = {name: tool for name, tool in tools.items() if tool.risk == "read"}
+        elif not workflow_step:
+            tools.update({tool.name: tool for tool in self.team.tools(session_id, mode)})
+        disabled = self.config.settings.disabled_tools
+        trigger = self._latest_main_trigger(session_id)
+        attention = bool(trigger and trigger.get("principal") == "system:attention")
+        return {
+            name: tool
+            for name, tool in tools.items()
+            if name not in disabled and (not attention or tool.risk == "read")
+        }
 
     @staticmethod
     def _paused_result(exc: TaskPaused) -> dict[str, Any]:

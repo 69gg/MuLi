@@ -460,7 +460,7 @@ async def test_changed_stdio_requires_restart_without_closing_active_process() -
         await manager.close()
 
 
-async def test_handlers_bind_the_validated_connection_until_retirement() -> None:
+async def test_publishing_revokes_unstarted_handlers_without_rebinding_the_endpoint() -> None:
     old, new = FakeClient(names=["old"]), FakeClient(names=["new"])
     manager = MCPManager(
         settings(),
@@ -470,11 +470,13 @@ async def test_handlers_bind_the_validated_connection_until_retirement() -> None
         old_tool = (await manager.start())[0]
         candidate = await manager.prepare(settings(url="https://example.test/new"))
         retired = manager.publish(candidate)
-        assert not (await old_tool.handler({"q": "old generation"}))["is_error"]
+        denied = await old_tool.handler({"q": "old generation"})
+        assert denied["status"] == "not_executed" and denied["code"] == "generation_changed"
         assert not (await manager.tools[0].handler({"q": "new generation"}))["is_error"]
-        assert old.calls[0]["name"] == "old" and new.calls[0]["name"] == "new"
+        assert old.calls == [] and new.calls[0]["name"] == "new"
         await manager.retire(retired)
-        assert (await old_tool.handler({"q": "retired"}))["is_error"]
+        assert (await old_tool.handler({"q": "retired"}))["code"] == "generation_changed"
+        assert old.calls == [] and len(new.calls) == 1
         assert old.closed == 1 and new.closed == 0
     finally:
         await manager.close()

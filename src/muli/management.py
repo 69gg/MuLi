@@ -1,4 +1,4 @@
-"""Validated self-management plans, applied only after foreground work is idle."""
+"""Validated plans; pure extension changes may publish while foreground work runs."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from muli.candidate_process_plan import CANDIDATE_PROCESS_PROTOCOL, persist_proc
 from muli.candidate_update import CandidateUpdates, CapturedCandidate, PreviewRequest, UpdateRequest
 from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
-from muli.extensions import ExtensionError
+from muli.extensions import ExtensionError, Extensions
 from muli.failure_diagnostics import read_failure
 from muli.maintenance import MaintenanceError
 from muli.managed_boot import ManagedBootPermit
@@ -469,6 +469,27 @@ class SelfManagement:
                 async with self.runtime.bus.changed:
                     await self.runtime.bus.changed.wait_for(changed)
 
+    def _extension_plan(self, item: dict[str, Any]) -> bool:
+        if (
+            item.get("action") != "configure"
+            or item.get("operation") == "update"
+            or item.get("apply_mode", "in_process") != "in_process"
+            or fingerprint(self.runtime.config.settings) != item.get("base")
+        ):
+            return False
+        try:
+            target = self._target_settings(item)
+        except (OSError, ValueError):
+            return False
+        return Extensions.configuration_only(self.runtime.config.settings, target)
+
+    def _target_settings(self, item: dict[str, Any]) -> Settings:
+        path = self.directory / f"{item['id']}.json"
+        target = Settings.model_validate_json(path.read_text(encoding="utf-8"))
+        if fingerprint(target) != item["target"]:
+            raise ValueError("待应用配置内容已改变")
+        return target
+
     async def _run(self) -> None:
         while True:
             await self._wake.wait()
@@ -478,14 +499,25 @@ class SelfManagement:
             for item in reversed(self.plans()):
                 if item["status"] != "pending":
                     continue
-                await self._idle()
+                if self._extension_plan(item):
+                    # Keep the existing worker/order and normal scan cadence;
+                    # a draining generation cannot authorize a third client set.
+                    while self.runtime.mcp.pending_cleanup and not self.runtime.mcp.cleanup_failed:
+                        await asyncio.sleep(
+                            self.runtime.config.settings.extensions.scan_interval_seconds
+                        )
+                else:
+                    await self._idle()
                 await self.runtime.maintenance.wait_configuration()
                 async with self.runtime.configuration_lock:
-                    if self.runtime.busy or self.runtime.maintenance.configuration_blocked:
+                    if self.runtime.maintenance.configuration_blocked:
                         self._wake.set()
                         continue
                     current = self.runtime.store.get("management", item["id"])
                     if current is None or current["status"] != "pending":
+                        continue
+                    if self.runtime.busy and not self._extension_plan(current):
+                        self._wake.set()
                         continue
                     if current.get("operation") != "update":
                         await self._apply(current)
@@ -655,9 +687,7 @@ class SelfManagement:
         try:
             if fingerprint(self.runtime.config.settings) != item["base"]:
                 raise ValueError("配置已经被其它入口修改，请重新生成计划")
-            target = Settings.model_validate_json(path.read_text(encoding="utf-8"))
-            if fingerprint(target) != item["target"]:
-                raise ValueError("待应用配置内容已改变")
+            target = self._target_settings(item)
             item["status"] = "applying"
             self.runtime.store.put("management", item)
             if item["action"] == "restart" or item.get("apply_mode") == "restart_transaction":
@@ -683,7 +713,7 @@ class SelfManagement:
             elif (
                 item["action"] == "configure"
                 and isinstance(exc, ExtensionError)
-                and exc.code == "runtime_busy"
+                and exc.code in {"runtime_busy", "generation_draining", "candidate_pending"}
             ):
                 item["status"] = "pending"
                 self._wake.set()
@@ -996,7 +1026,7 @@ class SelfManagement:
             ),
             Tool(
                 "self_configure",
-                "校验配置补丁并排队，空闲后应用；监听 host/port 变更须通过受支持的恢复重启事务",
+                "校验配置补丁并排队；轮到的纯扩展可运行中应用，其它变更等空闲；监听变更须恢复重启事务",
                 parameters(
                     {
                         "changes": {"type": "object"},

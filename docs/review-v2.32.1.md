@@ -1,6 +1,7 @@
 # 2.32.1 Skills 资源页审查
 
-状态：独立实现、两次静态审查及根分支版本整合检查通过，远端候选与发行待验。
+状态：2.32.1 已发布；精确候选八项与发行十一项成功，main 七项成功、
+Windows 3.12 一项夹具启动失败，保留失败并继续独立调查。
 这项补丁基于已发布的 2.32.0，不改变其发行提交或标签。
 
 `skill_resource` 原来返回完整 JSON，但上下文打包可能先节选这份工具结果，
@@ -39,3 +40,32 @@
 与前述八文件 311 项不重叠。另窄修四处原测试类型边界，基线同错已核实，
 最终单文件 Ruff、格式及严格 mypy 通过，整片最高 186.8 MiB、swap 0。
 根分支不重复运行同样的 77 项；合入后的完整跨平台验收交由新精确候选 CI。
+
+## 发行与后续失败
+
+最终签名提交 `1cf156b7b498c394b4aa719e3c3391ddafaba003` 的
+[候选 CI](https://github.com/69gg/MuLi/actions/runs/39564375926)八项成功，
+PR38 于 2026-10-21 07:57:23 UTC 原提交合入 main。
+签名标签对象 `800e459b04eaba67204cbfc38d742ae8fe2f82df` 指向同一提交；
+本地与 GitHub 签名验证有效。
+[发行检查](https://github.com/69gg/MuLi/actions/runs/39565663502)十一项成功，
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.32.1)
+于 08:05:42 UTC 发布，非草稿、非预发行。PyPI 两包均未撤回，与 GitHub
+构件名称、大小及 SHA256 相同；只读取有限元数据，没有下载构件。
+
+| 构件 | 字节数 | SHA256 |
+| --- | ---: | --- |
+| `muli_agent-2.32.1-py3-none-any.whl` | 758335 | `7ab98888cf856be28eddd1473f85dd121d8f215ba9fe4fa1f766b813edec022f` |
+| `muli_agent-2.32.1.tar.gz` | 3849785 | `7282c772f36cd3ae480cbb2e3560f9788dcb15feaed2ec971aa7f8560a5f844d` |
+
+同一提交的 [main CI](https://github.com/69gg/MuLi/actions/runs/39565663386)
+为七项成功、一项失败。Windows 3.12 作业 `119107199623` 有 3169 项通过、
+1361 项跳过、一个 setup error；失败发生在自建 Windows 窗口夹具的原 12 秒
+启动期限。新增阶段诊断仅观察到 `spawn_returned@0ms`，stdout/stderr 均为
+零字节、尚未 EOF，未观察到首个 `script_entered` 标记。进程清理后已回收、
+读取任务已 settle，没有输出预算超限或读取错误。
+
+这些事实只把问题缩小到“创建进程返回后、首个可见脚本标记前”，不能证明
+UIA、Form Shown、消息循环或管道背压是原因。该 main 失败不会被发行成功
+覆盖；不重跑抹除原结果，不更改已发提交和标签，修复继续在后续分支验证。
+Linux 真实用户服务整链仍由独立临时 runner 候选验收，不能由本次发行代替。

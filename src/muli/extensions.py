@@ -1,4 +1,4 @@
-"""Bounded extension discovery, idle MCP and request-boundary Skills publication."""
+"""Bounded extension discovery and generation publication at request boundaries."""
 
 from __future__ import annotations
 
@@ -181,6 +181,7 @@ class Extensions:
         self._sources: tuple[str, ...] = ()
         self._skills_base: tuple[str, str] | None = None
         self._dirty = False
+        self._queued_reason: str | None = None
         self._full_reload = False
         self._requested = 0
         self._directory_request: int | None = None
@@ -206,18 +207,36 @@ class Extensions:
         )
 
     def status(self) -> dict[str, Any]:
+        last_apply = dict(self._last_apply)
+        if last_apply.get("retirement") in {"pending", "draining"}:
+            last_apply["retirement"] = (
+                "failed"
+                if self.runtime.mcp.cleanup_failed
+                else "draining"
+                if self.runtime.mcp.draining
+                else "pending"
+                if self.runtime.mcp.pending_cleanup
+                else "complete"
+            )
         return {
             "generation": self.generation,
             "phase": self.phase,
             "running": not self._closed and self._worker is not None and not self._worker.done(),
             "fingerprint": self._fingerprint,
             "sources": list(self._sources),
-            "queued_reason": "runtime_busy" if self._dirty and self.runtime.busy else None,
+            "queued_reason": (
+                "generation_draining"
+                if self._dirty and self.runtime.mcp.pending_cleanup
+                else self._queued_reason
+                if self._dirty
+                else None
+            ),
             "error": self._error,
             "retirement_errors": list(self.runtime.mcp.retirement_errors),
             "cleanup_pending": self.runtime.mcp.pending_cleanup,
+            "draining": self.runtime.mcp.draining,
             "skills": self.skills.status(),
-            "last_apply": dict(self._last_apply),
+            "last_apply": last_apply,
         }
 
     def _failure(self, exc: Exception) -> ExtensionError:
@@ -414,6 +433,7 @@ class Extensions:
     def _queue_reload(self, *, directory: bool = False) -> dict[str, Any]:
         if not self._closed:
             self._dirty = True
+            self._queued_reason = None
             self._requested += 1
             if directory:
                 self._directory_request = self._requested
@@ -429,8 +449,10 @@ class Extensions:
         self.runtime.maintenance.require_configuration()
         if self._closed or self.runtime._closing:
             raise ExtensionError("runtime_closed")
-        if self.runtime.busy:
+        if self.runtime.busy and not self.configuration_only(self.runtime.config.settings, target):
             raise ExtensionError("runtime_busy")
+        if self.runtime.mcp.pending_cleanup and not self.runtime.mcp.cleanup_failed:
+            raise ExtensionError("generation_draining")
         candidate: MCPCandidate | None = None
         published = False
         self.phase, self._error = "preparing", None
@@ -456,7 +478,9 @@ class Extensions:
                     raise ExtensionError("source_changed")
                 if self._closed or self.runtime._closing:
                     raise ExtensionError("runtime_closed")
-                if self.runtime.busy:
+                if self.runtime.busy and not self.configuration_only(
+                    self.runtime.config.settings, target
+                ):
                     raise ExtensionError("runtime_busy")
                 self.runtime.maintenance.require_configuration()
                 self.runtime.store.revalidate_format()
@@ -481,11 +505,15 @@ class Extensions:
                     self._full_reload = False
                 published = True
                 self._last_apply.update(
-                    published=True, retirement="pending" if retired else "unneeded"
+                    published=True,
+                    retirement=(
+                        "draining"
+                        if self.runtime.mcp.draining
+                        else "pending"
+                        if retired
+                        else "unneeded"
+                    ),
                 )
-            retirement_complete = await self.runtime.mcp.retire(retired)
-            if retired:
-                self._last_apply["retirement"] = "complete" if retirement_complete else "failed"
         except asyncio.CancelledError:
             if candidate is not None and not published:
                 await self.runtime.mcp.discard(candidate)
@@ -493,15 +521,20 @@ class Extensions:
         except Exception as exc:
             if candidate is not None and not published:
                 await self.runtime.mcp.discard(candidate)
-            if getattr(exc, "code", None) in {"runtime_busy", "transaction_in_progress"}:
+            if getattr(exc, "code", None) in {
+                "runtime_busy",
+                "transaction_in_progress",
+                "generation_draining",
+                "candidate_pending",
+            }:
                 self._refresh.update(refresh)
             raise self._failure(exc) from exc
 
-    async def _apply_skills_locked(self, settings: Settings) -> bool:
-        """Publish only an autonomous Skills change; the owner holds configuration_lock."""
+    async def _apply_skills_locked(self, settings: Settings) -> bool | None:
+        """None selects full reload; False keeps an invalidated Skills attempt queued."""
         requested, generation, baseline = self._requested, self.generation, self._skills_base
         if not self._skills_request(settings, requested):
-            return False
+            return None
         target = settings.model_copy(deep=True)
         try:
             self.runtime.maintenance.require_configuration()
@@ -509,7 +542,7 @@ class Extensions:
             async with asyncio.timeout(target.extensions.candidate_timeout_seconds):
                 mcp = await file_io(MCPDirectory(target).fingerprint)
                 if baseline is None or mcp != baseline[1]:
-                    return False
+                    return None
                 self.phase, self._error = "preparing", None
                 self._last_apply = {
                     "scope": "skills",
@@ -569,6 +602,8 @@ class Extensions:
             settings = self.runtime.config.settings
             interval = settings.extensions.scan_interval_seconds
             previous = self.phase, self._error
+            deferred = False
+            self._queued_reason = None
             try:
                 if self.phase == "loaded":
                     self._watch_failure = None
@@ -582,12 +617,24 @@ class Extensions:
                     except Exception as exc:
                         self._failure(exc)
                         notify_failure(previous)
-                if self._dirty and asyncio.get_running_loop().time() >= self._ready_at:
-                    if (
-                        self.runtime.busy
-                        and not self._skills_request(self.runtime.config.settings, self._requested)
-                    ) or self.runtime.maintenance.configuration_blocked:
+                        # A failed observation cannot authorize preparation in
+                        # the same turn. Keep the request/origin for a fresh scan.
+                        if self._dirty:
+                            self.phase = "queued"
+                            deferred = True
+                if (
+                    self._dirty
+                    and not deferred
+                    and asyncio.get_running_loop().time() >= self._ready_at
+                ):
+                    blocked = self.runtime.maintenance.configuration_blocked
+                    if blocked or (
+                        self.runtime.mcp.pending_cleanup and not self.runtime.mcp.cleanup_failed
+                    ):
                         self.phase = "queued"
+                        self._queued_reason = (
+                            "transaction_in_progress" if blocked else "generation_draining"
+                        )
                     else:
                         async with self.runtime.configuration_lock:
                             if (
@@ -597,25 +644,41 @@ class Extensions:
                                 previous = self.phase, self._error
                                 autonomous = self._directory_request == self._requested
                                 try:
-                                    if self.runtime.busy:
-                                        if not await self._apply_skills_locked(
+                                    skills = (
+                                        await self._apply_skills_locked(
                                             self.runtime.config.settings
-                                        ):
-                                            self.phase = "queued"
-                                    else:
+                                        )
+                                        if self.runtime.busy
+                                        else None
+                                    )
+                                    if skills is None:
                                         self._dirty = False
                                         await self.apply_locked(
                                             self.runtime.config.settings, persist=False
                                         )
+                                    elif not skills:
+                                        # A newer request/source invalidated this attempt.
+                                        # Observe it in a fresh turn, preserving its origin.
+                                        self._dirty = True
+                                        self.phase = "queued"
+                                        deferred = True
                                 except ExtensionError as exc:
-                                    if exc.code in {"runtime_busy", "transaction_in_progress"}:
+                                    if exc.code in {
+                                        "runtime_busy",
+                                        "transaction_in_progress",
+                                        "generation_draining",
+                                        "candidate_pending",
+                                    }:
                                         self._dirty = True
                                         self.phase, self._error = "queued", None
+                                        self._queued_reason = exc.code
+                                        deferred = True
                                     elif autonomous:
                                         notify_failure(previous)
                 if (
                     self._dirty
-                    and not self.runtime.busy
+                    and not deferred
+                    and not self.runtime.mcp.pending_cleanup
                     and not self.runtime.maintenance.configuration_blocked
                 ):
                     interval = min(

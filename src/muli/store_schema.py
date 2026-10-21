@@ -195,6 +195,30 @@ def _row(db: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) 
     return tuple(rows[0])
 
 
+def _validate_definitions(
+    db: sqlite3.Connection, definitions: tuple[_Definition, ...], limits: ExistingStoreLimits
+) -> None:
+    """Check required names in one bounded scan, streaming one SQL value at a time."""
+    remaining = {definition.name: definition for definition in definitions}
+    placeholders = ",".join("?" for _ in remaining)
+    with closing(db.cursor()) as cursor:
+        cursor.row_factory = None
+        cursor.execute(
+            "SELECT name,type,CASE WHEN length(CAST(sql AS BLOB))<=? "
+            "THEN CAST(sql AS BLOB) END FROM main.sqlite_schema "
+            f"WHERE name IN ({placeholders}) LIMIT ?",
+            (limits.sql_bytes, *remaining, len(remaining) + 1),
+        )
+        for name, kind, raw in cursor:
+            definition = remaining.pop(name, None)
+            if definition is None:
+                raise ExistingStoreError("existing_store_evidence_missing")
+            if kind != definition.kind or raw != definition.sql:
+                raise ExistingStoreError("existing_store_schema_unsupported")
+    if remaining:
+        raise ExistingStoreError("existing_store_evidence_missing")
+
+
 def _text(db: sqlite3.Connection, name: str, maximum: int = _IDENTITY_BYTES) -> str:
     kind, size, raw = _row(
         db,
@@ -304,15 +328,7 @@ def validate_existing_schema(
                 raise ExistingStoreError("existing_store_journal_unsupported")
             db.execute("BEGIN")
             begun = True
-            for definition in definitions:
-                kind, raw = _row(
-                    db,
-                    "SELECT type,CASE WHEN length(CAST(sql AS BLOB))<=? "
-                    "THEN CAST(sql AS BLOB) END FROM main.sqlite_schema WHERE name=? LIMIT 2",
-                    (limits.sql_bytes, definition.name),
-                )
-                if kind != definition.kind or raw != definition.sql:
-                    raise ExistingStoreError("existing_store_schema_unsupported")
+            _validate_definitions(db, definitions, limits)
             if group in {"all", "core"}:
                 if _text(db, "message_sequence_v1") != "done":
                     raise ExistingStoreError("existing_store_marker_invalid")

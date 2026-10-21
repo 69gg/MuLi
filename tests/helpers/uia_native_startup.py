@@ -1,4 +1,4 @@
-"""Bounded startup observations for the hosted CI's own WinForms fixture."""
+"""Bounded startup observations for the hosted CI's own native-window fixture."""
 
 from __future__ import annotations
 
@@ -24,6 +24,11 @@ SCRIPT_STAGES = (
     "loaded",
     "activated",
     "shown",
+    "python_entered",
+    "class_registered",
+    "window_created",
+    "window_shown",
+    "message_loop_ready",
 )
 
 
@@ -63,7 +68,7 @@ class _Trace:
             self.budget.charge(data)
         except ValueError:
             self.output_budget = True
-            raise AssertionError("Owned WinForms output budget exceeded") from None
+            raise AssertionError("Owned native-window output budget exceeded") from None
 
     def note(self) -> str:
         result = {
@@ -110,15 +115,19 @@ async def _read_ready(process: asyncio.subprocess.Process, title: str, trace: _T
         line = await process.stdout.readline()
     except ValueError:
         trace.output_budget = True
-        raise AssertionError("Owned WinForms readiness exceeded its output budget") from None
+        raise AssertionError("Owned native-window readiness exceeded its output budget") from None
     trace.charge(line, stderr=False)
     trace.stdout_eof = not line
-    assert line and len(line) <= OUTPUT_BYTES, "Owned WinForms fixture did not publish readiness"
+    assert line and len(line) <= OUTPUT_BYTES, (
+        "Owned native-window fixture did not publish readiness"
+    )
     try:
         ready = json.loads(line.decode("utf-8", errors="strict"))
     except (ValueError, UnicodeError):
-        raise AssertionError("Owned WinForms readiness was invalid") from None
-    assert ready == {"pid": process.pid, "title": title}, "Owned WinForms readiness did not match"
+        raise AssertionError("Owned native-window readiness was invalid") from None
+    assert ready == {"pid": process.pid, "title": title}, (
+        "Owned native-window readiness did not match"
+    )
     trace.mark("readiness_received")
 
 
@@ -181,13 +190,15 @@ async def observe_native_form(
             if trace.cleanup == "pending":
                 trace.cleanup = "failed"
             if failure is None:
-                failure = AssertionError("Owned WinForms fixture cleanup failed")
+                failure = AssertionError("Owned native-window fixture cleanup failed")
                 raise failure from None
         finally:
             if failure is not None:
                 failure.add_note(trace.note())
         if failure is None and (trace.reader_failed or trace.cleanup == "incomplete"):
-            settlement_error = AssertionError("Owned WinForms fixture did not settle successfully")
+            settlement_error = AssertionError(
+                "Owned native-window fixture did not settle successfully"
+            )
             settlement_error.add_note(trace.note())
             raise settlement_error
         if cancelled and failure is None:

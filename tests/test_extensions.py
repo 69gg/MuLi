@@ -599,7 +599,7 @@ async def test_invalid_initial_fragment_keeps_inline_tools_and_reports_failure(
 
 
 @pytest.mark.parametrize("kind,status", [("agent", "queued"), ("workflow_run", "running")])
-async def test_durable_busy_owners_prevent_candidate_preparation(
+async def test_durable_busy_owners_allow_pure_extension_publication(
     tmp_path: Path, kind: str, status: str
 ) -> None:
     runtime = setup_runtime(tmp_path)
@@ -607,10 +607,17 @@ async def test_durable_busy_owners_prevent_candidate_preparation(
     runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=lambda *_: client)
     try:
         await runtime.extensions.load_initial()
-        runtime.store.put(kind, {"id": "fixture-owner", "status": status})
+        owner = {"id": "fixture-owner", "status": status}
+        runtime.store.put(kind, owner)
+        generation, tool = runtime.extensions.generation, runtime.mcp.tools[0]
         async with runtime.configuration_lock:
-            with pytest.raises(ExtensionError, match="runtime_busy"):
-                await runtime.extensions.apply_locked(runtime.config.settings, persist=False)
+            await runtime.extensions.apply_locked(runtime.config.settings, persist=False)
+        assert runtime.extensions.generation == generation + 1 and runtime.busy
+        assert runtime.store.get(kind, owner["id"]) == owner
+        denied = await tool.handler({"q": "旧代"})
+        assert denied["status"] == "not_executed" and denied["code"] == "generation_changed"
+        assert client.calls == []
+        assert not (await runtime.mcp.tools[0].handler({"q": "新代"}))["is_error"]
         assert client.entered == 1 and client.closed == 0
     finally:
         await runtime.close()
@@ -732,7 +739,9 @@ async def test_candidate_total_deadline_does_not_retry_or_close_old_connection(
         await runtime.close()
 
 
-async def test_reload_waits_for_actual_runtime_idle_and_rechecks_under_lock(tmp_path: Path) -> None:
+async def test_reload_publishes_while_busy_but_waits_for_the_configuration_lock(
+    tmp_path: Path,
+) -> None:
     runtime = setup_runtime(tmp_path)
     clients: list[FakeClient] = []
 
@@ -755,20 +764,18 @@ async def test_reload_waits_for_actual_runtime_idle_and_rechecks_under_lock(tmp_
         await runtime.extensions.load_initial()
         generation = runtime.extensions.generation
         fragment(tmp_path, "new.json", {"mcpServers": {"new": server("new")}})
-        runtime.extensions.start()
-        runtime.extensions.request_reload()
-        await asyncio.sleep(0)
-        assert runtime.extensions.phase == "queued" and len(clients) == 1
         async with runtime.configuration_lock:
-            release.set()
-            await work
+            runtime.extensions.start()
+            runtime.extensions.request_reload()
             await asyncio.sleep(0)
-            assert runtime.extensions.generation == generation
+            assert runtime.extensions.phase == "queued" and len(clients) == 1
+            assert runtime.extensions.generation == generation and not work.done()
         async with asyncio.timeout(2):
             while runtime.extensions.generation == generation:
                 await asyncio.sleep(0.01)
         assert len(clients) == 2
         assert clients[0].closed == 0
+        assert not work.done() and runtime.busy
         assert {item["name"] for item in runtime.mcp.status()} == {"old", "new"}
     finally:
         release.set()
@@ -778,7 +785,7 @@ async def test_reload_waits_for_actual_runtime_idle_and_rechecks_under_lock(tmp_
 
 
 @pytest.mark.parametrize("mode", ["api", "automatic", "management"])
-async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeues(
+async def test_report_waking_main_during_prepare_does_not_block_pure_extension_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     ready, finish_prepare = asyncio.Event(), asyncio.Event()
@@ -818,24 +825,19 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
     runtime.mcp = MCPManager(runtime.config.settings.mcp, client_factory=factory)
     app = create_app(runtime.config, runtime=runtime)
     manager: SelfManagement = app.state.management
-    busy_returned, release_management = asyncio.Event(), asyncio.Event()
-    apply_settings = manager.apply_settings
+    published = asyncio.Event()
+    apply_locked = runtime.extensions.apply_locked
 
-    async def gated_management_apply(settings: Settings) -> None:
-        try:
-            await apply_settings(settings)
-        except ExtensionError as exc:
-            if exc.code == "runtime_busy":
-                busy_returned.set()
-                await release_management.wait()
-            raise
+    async def observe_publication(settings: Settings, *, persist: bool) -> None:
+        await apply_locked(settings, persist=persist)
+        published.set()
 
-    if mode == "management":
-        monkeypatch.setattr(manager, "apply_settings", gated_management_apply)
+    monkeypatch.setattr(runtime.extensions, "apply_locked", observe_publication)
     operation: asyncio.Task[httpx.Response] | None = None
     try:
         await runtime.extensions.load_initial()
         generation, registry = runtime.extensions.generation, runtime.tools
+        original_tool = runtime.mcp.tools[0]
         skills = runtime.extensions.skills.status()
         original_config = runtime.config.path.read_bytes()
         fragment(tmp_path, "new.json", {"mcpServers": {"new": server("new")}})
@@ -884,53 +886,36 @@ async def test_report_waking_main_during_prepare_keeps_old_generation_and_requeu
             finish_prepare.set()
             if operation is not None:
                 response = await operation
-                assert response.status_code == 409 and response.json()["detail"] == "runtime_busy"
+                assert response.status_code == 200
+            await asyncio.wait_for(published.wait(), timeout=2)
+            assert runtime.busy and not runtime.tasks[session["id"]].done()
+            assert len(candidates) == 1 and candidates[0].closed == 0 and old.closed == 0
+            assert runtime.extensions.generation == generation + 1 and runtime.tools is not registry
+            assert {item["name"] for item in runtime.mcp.status()} == {"old", "new"}
+            denied = await original_tool.handler({"q": "旧报告轮次的工具"})
+            assert denied["status"] == "not_executed" and denied["code"] == "generation_changed"
+            assert old.calls == candidates[0].calls == []
+            if mode == "automatic":
+                assert runtime.config.path.read_bytes() == original_config
+                assert runtime.extensions.skills.status() == skills
             else:
-                async with asyncio.timeout(2):
-                    while not candidates[0].closed or (
-                        mode == "automatic" and runtime.extensions.phase != "queued"
-                    ):
-                        await asyncio.sleep(0.01)
-                if plan is not None:
-                    # Closing a candidate does not finish the caller's requeue.
-                    await asyncio.wait_for(busy_returned.wait(), timeout=2)
-                    current = runtime.store.get("management", plan["id"])
-                    assert current is not None and current["status"] == "applying"
-                    release_management.set()
+                assert runtime.config.path.read_bytes() != original_config
+                assert runtime.config.settings.skills.enabled is False
+            if plan is not None:
 
-                    def requeued() -> bool:
-                        assert plan is not None
-                        saved = runtime.store.get("management", plan["id"])
-                        return saved is not None and saved["status"] == "pending"
+                def completed() -> bool:
+                    assert plan is not None
+                    saved = runtime.store.get("management", plan["id"])
+                    return saved is not None and saved["status"] == "completed"
 
-                    async with asyncio.timeout(2), runtime.bus.changed:
-                        await runtime.bus.changed.wait_for(requeued)
-                    current = runtime.store.get("management", plan["id"])
-                    assert current is not None and current["status"] == "pending"
-                    assert (manager.directory / f"{plan['id']}.json").is_file()
-            assert candidates[0].closed == 1 and old.closed == 0
-            assert runtime.extensions.generation == generation and runtime.tools is registry
-            assert runtime.config.path.read_bytes() == original_config
-            assert runtime.extensions.skills.status() == skills
-            assert {item["name"] for item in runtime.mcp.status()} == {"old"}
-
+                async with asyncio.timeout(2), runtime.bus.changed:
+                    await runtime.bus.changed.wait_for(completed)
+                assert not (manager.directory / f"{plan['id']}.json").exists()
             finish_model.set()
             assert await runtime.wait(run_id) == "offline report received"
-            if mode != "api":
-                async with asyncio.timeout(2):
-                    while runtime.extensions.generation == generation:
-                        await asyncio.sleep(0.01)
-                assert len(candidates) == 2 and candidates[1].closed == 0
-                assert {item["name"] for item in runtime.mcp.status()} == {"old", "new"}
-                if plan is not None:
-                    current = runtime.store.get("management", plan["id"])
-                    assert current is not None and current["status"] == "completed"
-                    assert not (manager.directory / f"{plan['id']}.json").exists()
-                    assert runtime.config.settings.skills.enabled is False
     finally:
         finish_prepare.set()
         finish_model.set()
-        release_management.set()
         if operation is not None:
             await asyncio.gather(operation, return_exceptions=True)
         await manager.close()
