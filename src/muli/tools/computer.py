@@ -106,7 +106,7 @@ class Computer:
         from muli.tools.uia_computer import UIAComputer
 
         self._ax = AXComputer(self, owner=owner, dispatch_guard=dispatch_guard)
-        self._uia = UIAComputer(self, owner=owner)
+        self._uia = UIAComputer(self, owner=owner, dispatch_guard=dispatch_guard)
 
     async def call(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self.config.enabled:

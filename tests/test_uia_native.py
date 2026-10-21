@@ -34,6 +34,7 @@ pytestmark = pytest.mark.skipif(
 class NativeForm:
     process: asyncio.subprocess.Process
     title: str
+    button_events: asyncio.Queue[int]
 
 
 def settings() -> Settings:
@@ -43,6 +44,7 @@ def settings() -> Settings:
 @pytest_asyncio.fixture
 async def native_form() -> AsyncIterator[NativeForm]:
     title = "muli-uia-" + uuid4().hex
+    button_events: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
     starting = asyncio.create_task(
         asyncio.create_subprocess_exec(
             *uia_native_window.window_arguments(title),
@@ -55,9 +57,9 @@ async def native_form() -> AsyncIterator[NativeForm]:
     )
 
     async with observe_native_form(
-        starting, title, settings().computer.operation_timeout_seconds
+        starting, title, settings().computer.operation_timeout_seconds, button_events=button_events
     ) as process:
-        yield NativeForm(process, title)
+        yield NativeForm(process, title, button_events)
     assert process.returncode is not None, "The owned native target must be reaped"
 
 
@@ -110,7 +112,11 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
         protected = [item for item in snapshot["nodes"] if item["protected"]]
         assert protected and all(item["name"] == "" for item in protected)
         assert "private-password-label" not in encoded and "private-password-value" not in encoded
-        assert all(item["read_only"] and item["actions"] == [] for item in snapshot["nodes"])
+        assert all(item["editable"] is False for item in snapshot["nodes"])
+        assert all(item["actions"] == [] and item["read_only"] for item in protected)
+        assert [item["name"] for item in snapshot["nodes"] if item["actions"]] == [
+            uia_native_window.BUTTON_NAME
+        ]
         assert snapshot["scope"] == "window"
         lease = computer._uia._lease
         assert lease is not None and lease._process is not None
@@ -142,6 +148,69 @@ async def test_real_windows_closed_owned_window_cannot_be_researched_by_old_refe
         assert missing.value.code in {"element_unavailable", "target_changed"}
         assert missing.value.outcome == "not_started" and not computer._uia._targets
         assert computer._uia._lease is None or computer._uia._lease.closed
+    finally:
+        await computer.aclose()
+
+
+async def test_real_windows_invoke_receipt_and_exact_owned_button_click_are_separate(
+    native_form: NativeForm,
+) -> None:
+    computer = Computer(settings(), owner=lambda: ("native-ci", "invoke"))
+    try:
+        identifier = await discover(computer, native_form)
+        snapshot = await computer.snapshot({"target_id": identifier})
+        buttons = [
+            item for item in snapshot["nodes"] if item["name"] == uia_native_window.BUTTON_NAME
+        ]
+        disabled = [
+            item
+            for item in snapshot["nodes"]
+            if item["name"] == uia_native_window.DISABLED_BUTTON_NAME
+        ]
+        assert len(buttons) == len(disabled) == 1
+        assert buttons[0]["actions"] == ["invoke"] and buttons[0]["read_only"] is False
+        assert disabled[0]["enabled"] is False and disabled[0]["actions"] == []
+        assert all(item["actions"] == [] for item in snapshot["nodes"] if item["protected"])
+        with pytest.raises(ComputerError) as unavailable:
+            await computer.action(
+                {
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "node_id": disabled[0]["id"],
+                    "action": "invoke",
+                }
+            )
+        assert unavailable.value.code == "unsupported_operation"
+        assert unavailable.value.outcome == "not_started" and native_form.button_events.empty()
+        # A rejected attempt consumed the whole snapshot. The positive action
+        # needs a new explicit observation, never an implicit replay/fallback.
+        identifier = await discover(computer, native_form)
+        snapshot = await computer.snapshot({"target_id": identifier})
+        buttons = [
+            item for item in snapshot["nodes"] if item["name"] == uia_native_window.BUTTON_NAME
+        ]
+        assert len(buttons) == 1
+        arguments = {
+            "snapshot_id": snapshot["snapshot_id"],
+            "node_id": buttons[0]["id"],
+            "action": "invoke",
+        }
+        lease = computer._uia._lease
+        assert lease is not None and lease._process is not None
+        deadline = asyncio.get_running_loop().time() + computer.config.operation_timeout_seconds
+        async with asyncio.timeout_at(deadline):
+            assert await computer.action(arguments) == {
+                "ok": True,
+                "outcome": "accepted",
+                "effect_verified": False,
+            }
+            # WM_COMMAND carries this owned HWND/control ID; readiness is not
+            # evidence that Invoke actually reached the button.
+            assert await native_form.button_events.get() == 1
+        with pytest.raises(ComputerError) as old:
+            await computer.action(arguments)
+        assert old.value.code == "stale_snapshot" and native_form.button_events.empty()
+        assert lease.closed and lease._process.returncode is not None
+        assert native_form.process.returncode is None
     finally:
         await computer.aclose()
 

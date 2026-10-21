@@ -303,3 +303,71 @@ async def test_cleanup_failure_does_not_replace_the_original_exception(
             raise original
     assert caught.value is original
     assert diagnostic(caught.value)["cleanup"] == "failed"
+
+
+async def test_readiness_is_not_a_button_event_and_the_original_reader_continues(
+    reaped: list[FakeProcess],
+) -> None:
+    process = FakeProcess()
+    process.ready()
+    events: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+    async with module.observe_native_form(start(process), "owned", 12, button_events=events):
+        assert events.empty() and process.returncode is None
+        process.stdout.feed_data(b'{"button_invoked":1}\n')
+        assert await events.get() == 1
+    assert reaped == [process]
+
+
+@pytest.mark.parametrize(
+    "row", [b'{"button_invoked":true}', b'{"button_invoked":2}', b'{"other":1}']
+)
+async def test_button_event_rejects_unproved_counts_and_unrelated_fields(row: bytes) -> None:
+    process = FakeProcess()
+    process.stdout.feed_data(row + b"\n")
+    trace = module._Trace(lambda: 0.0, 0.0)
+    with pytest.raises(AssertionError, match="exactly one click"):
+        await module._read_buttons(
+            cast(asyncio.subprocess.Process, process), trace, asyncio.Queue(maxsize=1)
+        )
+
+
+async def test_duplicate_click_after_body_readiness_fails_and_reaps(
+    monkeypatch: pytest.MonkeyPatch, reaped: list[FakeProcess]
+) -> None:
+    process = FakeProcess()
+    process.ready()
+    events: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+    failed = asyncio.Event()
+    original = module._read_buttons
+
+    async def read_buttons(
+        child: asyncio.subprocess.Process, trace: module._Trace, queue: asyncio.Queue[int]
+    ) -> None:
+        try:
+            await original(child, trace, queue)
+        except AssertionError:
+            failed.set()
+            raise
+
+    monkeypatch.setattr(module, "_read_buttons", read_buttons)
+    with pytest.raises(AssertionError, match="did not settle successfully") as caught:
+        async with module.observe_native_form(start(process), "owned", 12, button_events=events):
+            process.stdout.feed_data(b'{"button_invoked":1}\n')
+            assert await events.get() == 1
+            process.stdout.feed_data(b'{"button_invoked":1}\n')
+            await failed.wait()
+    assert diagnostic(caught.value)["reader_failed"] and reaped == [process]
+
+
+async def test_button_events_share_the_ready_and_stderr_byte_budget() -> None:
+    process = FakeProcess()
+    process.ready()
+    trace = module._Trace(lambda: 0.0, 0.0)
+    await module._read_ready(cast(asyncio.subprocess.Process, process), "owned", trace)
+    trace.charge(b"x" * (module.OUTPUT_BYTES - trace.stdout_bytes - 1), stderr=True)
+    process.stdout.feed_data(b'{"button_invoked":1}\n')
+    with pytest.raises(AssertionError, match="output budget"):
+        await module._read_buttons(
+            cast(asyncio.subprocess.Process, process), trace, asyncio.Queue(maxsize=1)
+        )
+    assert trace.output_budget and trace.stdout_bytes + trace.stderr_bytes > module.OUTPUT_BYTES

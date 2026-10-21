@@ -20,6 +20,7 @@ _LRESULT = ctypes.c_ssize_t
 
 WS_CHILD = 0x40000000
 WS_VISIBLE = 0x10000000
+WS_DISABLED = 0x08000000
 WS_TABSTOP = 0x00010000
 WS_OVERLAPPEDWINDOW = 0x00CF0000
 WS_EX_TOOLWINDOW = 0x00000080
@@ -28,6 +29,11 @@ ES_PASSWORD = 0x0020
 ES_AUTOHSCROLL = 0x0080
 SW_SHOWNOACTIVATE = 4
 WM_DESTROY = 0x0002
+WM_COMMAND = 0x0111
+BN_CLICKED = 0
+BUTTON_ID = 4
+BUTTON_NAME = "Owned Invoke button"
+DISABLED_BUTTON_NAME = "Owned disabled button"
 WM_READY = 0x8001  # WM_APP + 1, private to this owned window.
 UNICODE_TEXT = '中文🌊 "quote" \\ slash'
 PASSWORD_LABEL = "private-password-label"
@@ -126,21 +132,36 @@ def _run_window(
     *,
     mark: Callable[[str], None],
     ready: Callable[[dict[str, str | int]], None],
+    invoked: Callable[[int], None] | None = None,
 ) -> None:
     instance = kernel.GetModuleHandleW(None)
     if not instance:
         raise AssertionError("Owned Win32 module handle unavailable")
     callback_failed = False
     published = False
+    button_handle = 0
+    clicks = 0
 
     def dispatch(hwnd: int, message: int, wparam: int, lparam: int) -> int:
-        nonlocal published, callback_failed
+        nonlocal published, callback_failed, clicks
         try:
             if message == WM_READY:
                 if not published:
                     mark("message_loop_ready")
                     ready({"pid": os.getpid(), "title": title})
                     published = True
+                return 0
+            if (
+                message == WM_COMMAND
+                and hwnd == window
+                and wparam & 0xFFFF == BUTTON_ID
+                and (wparam >> 16) & 0xFFFF == BN_CLICKED
+                and button_handle != 0
+                and lparam == button_handle
+            ):
+                clicks += 1
+                if invoked is not None:
+                    invoked(clicks)
                 return 0
             if message == WM_DESTROY:
                 user.PostQuitMessage(0)
@@ -196,10 +217,19 @@ def _run_window(
                 250,
                 25,
             ),
-            ("BUTTON", "Never invoke this button", WS_VISIBLE | WS_TABSTOP, 5, 80, 250, 30),
+            ("BUTTON", BUTTON_NAME, WS_VISIBLE | WS_TABSTOP, 5, 80, 250, 30),
+            (
+                "BUTTON",
+                DISABLED_BUTTON_NAME,
+                WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
+                5,
+                120,
+                250,
+                30,
+            ),
         )
         for identifier, (kind, text, style, x, y, width, height) in enumerate(controls, 1):
-            if not user.CreateWindowExW(
+            handle = user.CreateWindowExW(
                 0,
                 kind,
                 text,
@@ -212,8 +242,11 @@ def _run_window(
                 identifier,
                 instance,
                 None,
-            ):
+            )
+            if not handle:
                 raise AssertionError("Owned Win32 control creation failed")
+            if identifier == BUTTON_ID:
+                button_handle = handle
         mark("controls_ready")
         # ShowWindow returns the previous visibility, not an error status.
         user.ShowWindow(window, SW_SHOWNOACTIVATE)
@@ -248,6 +281,10 @@ def _ready(value: dict[str, str | int]) -> None:
     sys.stdout.buffer.flush()
 
 
+def _invoked(count: int) -> None:
+    _ready({"button_invoked": count})
+
+
 def main() -> None:
     if sys.platform != "win32" or os.environ.get("GITHUB_ACTIONS") != "true":
         raise SystemExit("Owned UIA window is restricted to hosted Windows CI")
@@ -260,7 +297,9 @@ def main() -> None:
         raise SystemExit("Owned Win32 APIs unavailable")
     user, kernel = loader("user32", use_last_error=True), loader("kernel32", use_last_error=True)
     _configure(user, kernel)
-    _run_window(user, kernel, callback_factory, sys.argv[1], mark=_mark, ready=_ready)
+    _run_window(
+        user, kernel, callback_factory, sys.argv[1], mark=_mark, ready=_ready, invoked=_invoked
+    )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 # Windows UIA Invoke 首片设计
 
-状态：方案已完成根与独立静态审查，未实现动作、未运行任何检查或 Windows 效果。基于签名
-`423596819405cae37311b278cfc30c46454f811b` 的已发布只读后端；现行能力仍以
-[UIA 记录](windows-uia.md)与[电脑工具](computer.md)为准。本片不改版本或 CI。
+状态：根已批准按本设计实施，宿主、固定桥接与自有按钮验收已编写，受限本地
+回归和静态检查通过；最终实现独审与真实 Windows CI 尚待完成。基于签名 `423596819405cae37311b278cfc30c46454f811b`
+的已发布只读后端；能力与验证边界见[UIA 记录](windows-uia.md)和[电脑工具](computer.md)。
+本片不改版本或 CI，没有在开发机运行 PowerShell 或桌面效果。
 
 ## 选择与实际接缝
 
@@ -10,7 +11,7 @@
 工具与 `computer` 风险门。`computer_type` 继续明确拒绝，不加入 Value、Toggle、
 Selection、焦点、坐标、键盘模拟或失败后寻找替代控件。
 
-| 现有代码 | 可复用与必须补齐之处 |
+| 设计时的只读代码 | 可复用与本片补齐之处 |
 | --- | --- |
 | `tools/uia_helper.ps1` 的 `Read-Snapshot`、`Read-Node`、`Window-Stamp` | 现在只保存发现窗口；快照清掉引用后未保存子节点。须保存本次实际子节点对象和所选窗口绑定，不能仅给节点填 actions。 |
 | `tools/uia_computer.py` 的 `_observe`、`_records`、`action` | 现在只缓存 target_id，且强制全部只读；须保存输出预算内的节点映射与 snapshot_id，接入单次消费和串行操作。 |
@@ -108,8 +109,10 @@ fixture 的有界按钮证据及用户文档；不改 Runtime 权限、AX/AT-SPI
   均拒绝，错误引用不触发搜索。新观察失败不能恢复旧快照。
 - 等锁、准备或审批后到最终 write 之前注入新输入/暂停/关闭，实际 write 为零；
   正常调用只发一次，保持 computer 风险与最后请求门。
-- 能力消失、禁用、密码翻转、名称/角色/PID/窗口/父链变化均零 Invoke；密码 Name
-  getter 和 Value/Text getter 的受控 spy 不得访问，错误无 provider 原文。
+- 能力消失、禁用、密码翻转、名称/角色/PID/窗口/父链变化均在 Invoke 前拒绝。
+  宿主回归验证固定 not_started/unknown 回执及 protected 能力拒绝，不冒称动态执行了
+  PowerShell getter spy；桥接的 protected-first 顺序由源码审查核对，真实 provider
+  由 Windows CI 的自有控件验证。Value/Text getter 不属于本片代码路径。
 - 在 stdin write 前失败为 not_started；write 后断流/期限/坏回执为 unknown，
   helper 方法进入后异常同样 unknown；取消/reap、迟到进程与清理失败保占用不重放。
 - accepted 不做业务断言，适配器 outcome 原样传递；最终 JSON 和现有字符/字节/
@@ -144,6 +147,17 @@ fixture 的有界按钮证据及用户文档；不改 Runtime 权限、AX/AT-SPI
 和[Edit 限制](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/ui-automation-support-for-the-edit-control-type)
 支持将 Value/受保护文本单独处理；不把文档示例的键盘 fallback 纳入本产品。
 
-本轮仅查代码、官方文档并形成方案，没有实现动作、运行 Python/PowerShell、操作
-本机桌面、安装或下载组件。根与独立审查未发现确定合同遗漏；本次只冻结设计，
-后续实现与真实 Windows CI 验收须另行授权，不据此宣称 Invoke 已可用。
+设计已签名为 `0273e89de60667dd6f7c629495fc7636afc285b0`，根与独立审查未发现
+确定合同遗漏后另行批准实施。修改生产前的两条旧码反例均真实失败：实际
+Computer.targets→snapshot 的普通按钮能力在旧 `_records` 被当作协议错误；
+`AXLeaseError(outcome='unknown')` 经旧 UIA 转换后实际变成 `not_started`。两条均经
+30 秒守卫，分别 0.13 秒/60.4 MiB 与 0.11 秒/57.1 MiB，swap 0，无真实 subprocess。
+修后专用 Invoke 29 项、宿主/启动/窗口夹具 63 项、既有 Computer/AX 纯回归 101 项
+通过，合计 193 个不同用例；其中 40 项新增（29 项 Invoke 与 11 项按钮夹具），
+153 项既有回归。原生文件在 Linux 按已有 hosted Windows 门跳过 4 项，包含新增
+的真实按钮用例；这些 skip 不是 Windows 验收。先前专用 28 项为新增取消用例前的
+重叠小组，不重复累计。pytest 峰值 67.2 MiB；9 份 Python 的 Ruff/格式检查与两份
+源码 strict mypy 通过，类型检查峰值 213.4 MiB，整轮 swap 0。首轮 Ruff 仅发现
+新测试导入顺序，按建议整理后通过。所有命令串行经过原 30 秒检查守卫，未提高上限。
+没有运行 PowerShell、操作开发机桌面、安装或下载组件；固定脚本语法、标准 provider
+动作与实际 BN_CLICKED 的关联仍待真实 Windows CI，不能从本地受控组反推已通过。

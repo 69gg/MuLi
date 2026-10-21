@@ -1,4 +1,4 @@
-"""Read-only Windows UIA references held by one caller-owned MTA helper."""
+"""Windows UIA observations and one-shot Invoke in a caller-owned MTA helper."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 Owner = tuple[str, str]
 _ERRORS = {
     "dependency_missing": "系统 Windows PowerShell 5.1 或 UI Automation 程序集不可用",
-    "backend_unavailable": "无法运行 Windows UI Automation 只读后端",
+    "backend_unavailable": "无法运行 Windows UI Automation 后端",
     "permission_required": "当前系统策略不允许使用 UI Automation",
     "element_unavailable": "所选窗口已不可读取，请重新发现窗口",
     "target_changed": "所选窗口已变化，请重新发现窗口",
@@ -29,6 +29,11 @@ _ERRORS = {
     "limit_exceeded": "UI Automation 响应超过预算",
     "lease_expired": "窗口引用已过期，请重新发现窗口",
     "protocol_error": "UI Automation helper 响应格式无效",
+    "stale_node": "节点已变化，请重新观察",
+    "protected_element": "受保护节点不允许操作",
+    "element_disabled": "节点当前未启用",
+    "unsupported_operation": "当前节点不支持该操作",
+    "action_unknown_outcome": "原生动作结果不确定，请重新观察，勿直接重试",
 }
 
 
@@ -57,12 +62,21 @@ def _powershell() -> Path:
 
 
 class UIAComputer:
-    def __init__(self, host: Computer, *, owner: Callable[[], Owner | None] | None) -> None:
+    def __init__(
+        self,
+        host: Computer,
+        *,
+        owner: Callable[[], Owner | None] | None,
+        dispatch_guard: Callable[[], Callable[[], None]] | None = None,
+    ) -> None:
         self.host = host
         self._owner = owner or (lambda: None)
+        self._guard = dispatch_guard
         self._lease: AXHelperLease | None = None
         self._lease_owner: Owner | None = None
         self._targets: dict[str, str] = {}
+        self._nodes: dict[str, dict[str, Any]] = {}
+        self._snapshot_id: str | None = None
         self._generation = 0
         self._lock = asyncio.Lock()
         self._closed = False
@@ -99,9 +113,12 @@ class UIAComputer:
         if sys.platform != "win32":
             raise ComputerError("backend_unavailable", "UI Automation 后端仅支持 Windows")
 
-    def _retire(self) -> None:
+    def _retire(self) -> int:
         self._generation += 1
         self._targets = {}
+        self._nodes = {}
+        self._snapshot_id = None
+        return self._generation
 
     def _caller(self) -> Owner:
         self._available()
@@ -129,7 +146,9 @@ class UIAComputer:
 
     @staticmethod
     def _error(exc: AXLeaseError) -> ComputerError:
-        return ComputerError(exc.code, _ERRORS.get(exc.code, _ERRORS["backend_unavailable"]))
+        return ComputerError(
+            exc.code, _ERRORS.get(exc.code, _ERRORS["backend_unavailable"]), exc.outcome
+        )
 
     async def _release_lease(self, lease: AXHelperLease) -> None:
         if self._lease is lease:
@@ -152,6 +171,7 @@ class UIAComputer:
             if not isinstance(node, dict):
                 raise ComputerError("protocol_error", _ERRORS["protocol_error"])
             ref, parent, depth = node.get("ref_id"), node.get("parent_ref_id"), node.get("depth")
+            invoke = node.get("actions") == ["invoke"]
             if (
                 not isinstance(ref, str)
                 or not 1 <= len(ref) <= 128
@@ -165,11 +185,21 @@ class UIAComputer:
                 or not isinstance(node.get("kind"), str)
                 or node["kind"] not in {"window", "node"}
                 or any(not isinstance(node.get(key), str) for key in ("name", "role"))
-                or node.get("actions") != []
+                or node.get("actions") not in ([], ["invoke"])
                 or node.get("editable") is not False
-                or node.get("read_only") is not True
+                or node.get("read_only") is not (not invoke)
                 or any(type(node.get(key)) is not bool for key in ("protected", "enabled"))
                 or (node["protected"] and node["name"] != "")
+                or (
+                    invoke
+                    and (
+                        field != "nodes"
+                        or node["kind"] != "node"
+                        or node["role"] != "ControlType.Button"
+                        or node["protected"]
+                        or not node["enabled"]
+                    )
+                )
                 or (field == "targets" and (depth != 0 or node["kind"] != "window"))
                 or (
                     field == "nodes"
@@ -186,33 +216,30 @@ class UIAComputer:
     async def _observe(self, command: str, arguments: dict[str, Any]) -> dict[str, Any]:
         owner = self._caller()
         deadline = asyncio.get_running_loop().time() + self.host.config.operation_timeout_seconds
+        identifier = arguments.get("target_id")
+        selected = self._targets.get(identifier) if isinstance(identifier, str) else None
+        # Capture the target first, then revoke every old public credential
+        # before waiting for another operation or validating this attempt.
+        generation = self._retire()
+        if command == "targets":
+            if arguments:
+                raise ComputerError(
+                    "unsupported_operation", "Windows 直接发现顶层窗口，不按应用展开"
+                )
+            payload: dict[str, str] = {}
+        else:
+            if set(arguments) != {"target_id"} or selected is None:
+                raise ComputerError(
+                    "target_invalid", "请先发现窗口，再使用当前 target_id 读取该窗口"
+                )
+            payload = {"target_ref_id": selected}
         lease: AXHelperLease | None = None
         complete = False
         try:
             async with asyncio.timeout_at(deadline):
                 async with self._lock:
-                    if self._caller() != owner:
+                    if generation != self._generation or self._caller() != owner:
                         raise ComputerError("target_changed", "观察所属执行已变化")
-                    if command == "targets":
-                        if arguments:
-                            raise ComputerError(
-                                "unsupported_operation",
-                                "Windows 首片直接发现顶层窗口，不按应用展开",
-                            )
-                        payload: dict[str, str] = {}
-                    else:
-                        identifier = arguments.get("target_id")
-                        if (
-                            set(arguments) != {"target_id"}
-                            or not isinstance(identifier, str)
-                            or identifier not in self._targets
-                        ):
-                            raise ComputerError(
-                                "target_invalid", "请先发现窗口，再使用当前 target_id 读取该窗口"
-                            )
-                        payload = {"target_ref_id": self._targets[identifier]}
-                    self._retire()
-                    generation = self._generation
                     if self._lease is None:
                         self._lease, self._lease_owner = self._new_lease(), owner
                     lease = self._lease
@@ -237,18 +264,23 @@ class UIAComputer:
                                 depth=node["depth"],
                             )
                         rows.append(row)
+                    public_id = new_id()
                     result = self.host._bounded(
                         data,
                         rows,
                         field,
                         scope=scope,
-                        **{"discovery_id" if command == "targets" else "snapshot_id": new_id()},
+                        **{"discovery_id" if command == "targets" else "snapshot_id": public_id},
                     )
                     if command == "targets":
                         by_id = {ids[node["ref_id"]]: node["ref_id"] for node in records}
                         self._targets = {
                             row["target_id"]: by_id[row["target_id"]] for row in result[field]
                         }
+                    else:
+                        cached = {ids[node["ref_id"]]: node for node in records}
+                        self._snapshot_id = public_id
+                        self._nodes = {row["id"]: cached[row["id"]] for row in result[field]}
                     complete = True
                     return result
         except AXLeaseError as exc:
@@ -256,8 +288,11 @@ class UIAComputer:
         except TimeoutError as exc:
             raise ComputerError("read_timeout", _ERRORS["read_timeout"]) from exc
         finally:
-            if not complete and lease is not None:
-                await self._release_lease(lease)
+            if not complete and lease is not None and generation == self._generation:
+                try:
+                    await self._release_lease(lease)
+                except Exception:
+                    self._cleanup_error = "UI Automation helper 尚未确认退出"
 
     async def targets(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return await self._observe("targets", arguments)
@@ -266,8 +301,67 @@ class UIAComputer:
         return await self._observe("snapshot", arguments)
 
     async def action(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        self._available()
-        raise ComputerError("unsupported_operation", "Windows UI Automation 首片仅支持读取")
+        owner = self._caller()
+        lease = self._lease
+        if (
+            lease is None
+            or self._snapshot_id is None
+            or arguments.get("snapshot_id") != self._snapshot_id
+        ):
+            raise ComputerError("stale_snapshot", "快照不属于本次执行或已失效")
+        identifier = arguments.get("node_id")
+        node = self._nodes.get(identifier) if isinstance(identifier, str) else None
+        generation = self._retire()
+        deadline = asyncio.get_running_loop().time() + self.host.config.operation_timeout_seconds
+        try:
+            guard = self._guard() if self._guard else None
+            if node is None:
+                raise ComputerError("stale_node", _ERRORS["stale_node"])
+            if (
+                set(arguments) != {"snapshot_id", "node_id", "action"}
+                or arguments["action"] != "invoke"
+                or node["actions"] != ["invoke"]
+            ):
+                raise ComputerError("unsupported_operation", "Windows 仅支持普通按钮的 invoke")
+
+            def before_send() -> None:
+                self._current(lease, owner, generation)
+                if guard is not None:
+                    guard()
+
+            async with asyncio.timeout_at(deadline):
+                await self._lock.acquire()
+            try:
+                before_send()
+                result = await lease.request(
+                    "action",
+                    {"ref_id": node["ref_id"], "action": "invoke"},
+                    deadline=deadline,
+                    before_send=before_send,
+                )
+                if (
+                    result.get("ok") is not True
+                    or result.get("outcome") != "accepted"
+                    or result.get("effect_verified") is not False
+                ):
+                    raise ComputerError(
+                        "action_unknown_outcome", _ERRORS["action_unknown_outcome"], "unknown"
+                    )
+                return {"ok": True, "outcome": "accepted", "effect_verified": False}
+            finally:
+                self._lock.release()
+        except AXLeaseError as exc:
+            raise self._error(exc) from exc
+        except TimeoutError as exc:
+            # The lease itself classifies any timeout after stdin.write.
+            raise ComputerError("read_timeout", "动作尚未派发便超时") from exc
+        finally:
+            try:
+                await self._release_lease(lease)
+            except Exception:
+                # Reaping uncertainty must not overwrite accepted/unknown or
+                # release the occupied helper for another caller.
+                self._cleanup_error = "UI Automation helper 尚未确认退出"
 
     async def release(self) -> dict[str, Any]:
         owner = self._owner()
@@ -322,7 +416,7 @@ class UIAComputer:
                 "available": True,
                 "state": "ready",
                 "reason": "",
-                "supported_operations": ["targets", "snapshot"],
+                "supported_operations": ["targets", "snapshot", "action"],
             }
         except (AXLeaseError, ComputerError) as exc:
             result = self._status_error(self._error(exc) if isinstance(exc, AXLeaseError) else exc)

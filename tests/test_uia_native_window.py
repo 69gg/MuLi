@@ -137,6 +137,7 @@ def run(
     api: WindowAPI,
     *,
     ready: Callable[[dict[str, str | int]], None] | None = None,
+    invoked: Callable[[int], None] | None = None,
 ) -> tuple[list[str], list[dict[str, str | int]]]:
     stages: list[str] = []
     receipts: list[dict[str, str | int]] = []
@@ -152,6 +153,7 @@ def run(
         "muli-uia-" + "a" * 32,
         mark=stages.append,
         ready=publish if ready is None else ready,
+        invoked=invoked,
     )
     return stages, receipts
 
@@ -167,7 +169,7 @@ def test_real_message_dispatch_precedes_ready_and_only_owned_controls_are_create
         "window_shown",
         "message_loop_ready",
     ]
-    top, label, password_label, password, button = api.created
+    top, label, password_label, password, button, disabled = api.created
     assert top[0] == module.WS_EX_TOOLWINDOW | module.WS_EX_NOACTIVATE
     assert top[4:6] == (-20000, -20000) and top[8] is None
     assert label[1:3] == ("STATIC", '中文🌊 "quote" \\ slash')
@@ -175,9 +177,32 @@ def test_real_message_dispatch_precedes_ready_and_only_owned_controls_are_create
     assert not password_label[3] & module.WS_VISIBLE
     assert password[1:3] == ("EDIT", "private-password-value")
     assert password[3] & module.ES_PASSWORD and not password[3] & 0x0004  # No ES_MULTILINE.
-    assert button[1:3] == ("BUTTON", "Never invoke this button")
-    assert all(child[8] == api.window for child in (label, password_label, password, button))
+    assert button[1:3] == ("BUTTON", module.BUTTON_NAME)
+    assert button[9] == module.BUTTON_ID and disabled[3] & module.WS_DISABLED
+    assert disabled[1:3] == ("BUTTON", module.DISABLED_BUTTON_NAME)
+    assert all(
+        child[8] == api.window for child in (label, password_label, password, button, disabled)
+    )
     assert api.events[-3:] == ["destroy", "quit:0", "unregister"]
+
+
+@pytest.mark.parametrize("change", ["none", "parent", "identifier", "notification", "handle"])
+def test_button_counter_requires_the_exact_owned_command_notification(change: str) -> None:
+    api = WindowAPI()
+    clicks: list[int] = []
+
+    def ready(value: dict[str, str | int]) -> None:
+        hwnd = api.window + (1 if change == "parent" else 0)
+        identifier = module.BUTTON_ID + (1 if change == "identifier" else 0)
+        notification = 1 if change == "notification" else module.BN_CLICKED
+        handle = api.window + 5 + (1 if change == "handle" else 0)
+        assert api.callback(hwnd, module.WM_COMMAND, identifier | notification << 16, handle) == (
+            0 if change == "none" else api.default_result
+        )
+
+    run(api, ready=ready, invoked=clicks.append)
+    assert clicks == ([1] if change == "none" else [])
+    assert api.events[-1] == "unregister"
 
 
 def test_message_callback_preserves_pointer_sized_handles_arguments_and_result() -> None:

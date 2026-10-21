@@ -131,6 +131,38 @@ async def _read_ready(process: asyncio.subprocess.Process, title: str, trace: _T
     trace.mark("readiness_received")
 
 
+async def _read_buttons(
+    process: asyncio.subprocess.Process, trace: _Trace, events: asyncio.Queue[int]
+) -> None:
+    """Continue the same owned stdout after readiness, under its original budget."""
+    assert process.stdout is not None
+    received = False
+    while True:
+        try:
+            line = await process.stdout.readline()
+        except ValueError:
+            trace.output_budget = True
+            raise AssertionError("Owned button event exceeded its output budget") from None
+        trace.charge(line, stderr=False)
+        if not line:
+            trace.stdout_eof = True
+            return
+        try:
+            event = json.loads(line.decode("utf-8", errors="strict"))
+        except (ValueError, UnicodeError):
+            raise AssertionError("Owned button event was invalid") from None
+        assert (
+            not received
+            and isinstance(event, dict)
+            and set(event) == {"button_invoked"}
+            and type(event["button_invoked"]) is int
+            and event["button_invoked"] == 1
+        ), "Owned button event did not prove exactly one click"
+        assert events.maxsize == 1 and events.empty(), "Owned button event queue was invalid"
+        events.put_nowait(event["button_invoked"])
+        received = True
+
+
 @asynccontextmanager
 async def observe_native_form(
     starting: asyncio.Task[asyncio.subprocess.Process],
@@ -138,6 +170,7 @@ async def observe_native_form(
     timeout: float,
     *,
     clock: Callable[[], float] | None = None,
+    button_events: asyncio.Queue[int] | None = None,
 ) -> AsyncIterator[asyncio.subprocess.Process]:
     loop = asyncio.get_running_loop()
     clock = loop.time if clock is None else clock
@@ -160,6 +193,8 @@ async def observe_native_form(
             if readers[1].done():
                 readers[1].result()
             await readers[0]
+            if button_events is not None:
+                readers.append(asyncio.create_task(_read_buttons(process, trace, button_events)))
         yield process
     except BaseException as error:
         failure = error
