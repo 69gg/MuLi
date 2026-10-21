@@ -884,7 +884,7 @@ def _create_app(
         async with runtime.configuration_lock:
             if configuration_closing:
                 raise MaintenanceError("transaction_unavailable", "service_closing")
-            return await management.recovery.recover()
+        return await management.recover()
 
     @app.get("/api/extensions")
     async def extension_status() -> dict[str, Any]:

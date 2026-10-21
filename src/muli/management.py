@@ -13,6 +13,7 @@ from muli.candidate_lineage import check_plan_budget
 from muli.candidate_policy import CandidateError, CandidateSettings, ExpectedPolicy
 from muli.candidate_policy_store import CandidatePolicyStore
 from muli.candidate_preparation import create_attempt
+from muli.candidate_process_plan import CANDIDATE_PROCESS_PROTOCOL, persist_process, read_process
 from muli.candidate_update import CandidateUpdates, CapturedCandidate, UpdateRequest
 from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
@@ -21,6 +22,8 @@ from muli.maintenance import MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_requests import LocalCandidate, validate_candidate
 from muli.management_host import RecoveryHost
+from muli.management_projection import _read_object
+from muli.platforms.candidate_process_state import PendingProcess
 from muli.plugins import PluginManager
 from muli.proactive import FrozenRouting
 from muli.providers import Message
@@ -67,6 +70,7 @@ class SelfManagement:
         self._worker: asyncio.Task[None] | None = None
         self._check: asyncio.Task[dict[str, Any]] | None = None
         self._applying: asyncio.Task[Any] | None = None
+        self._candidate_cleanup: asyncio.Task[None] | None = None
         runtime.maintenance.owner("management", lambda: self.idle)
         runtime.maintenance.on_configuration_release(self._wake.set)
         runtime.add_tool_provider(self.tools)
@@ -217,11 +221,41 @@ class SelfManagement:
         await self.runtime.bus.notify()
         return item
 
-    def _check_candidate_plan(self, item: dict[str, Any]) -> None:
+    def _candidate_plan_limit(self) -> int:
         permit = self.runtime.maintenance.permit
         if not isinstance(permit, ManagedBootPermit):
             raise CandidateError("candidate_managed_boot_required")
-        check_plan_budget(item, permit.journal.limits.max_record_bytes)
+        return permit.journal.limits.max_record_bytes
+
+    def _check_candidate_plan(self, item: dict[str, Any]) -> None:
+        check_plan_budget(item, self._candidate_plan_limit())
+
+    def _candidate_cleanup_confirmed(self, item: dict[str, Any]) -> bool:
+        try:
+            process = read_process(item, self._candidate_plan_limit())
+            return (process is None and item.get("phase") == "candidate_preparing") or (
+                process is not None and process.phase == "settled"
+            )
+        except (ValueError, TypeError, KeyError):
+            return False
+
+    def _persist_candidate_process(self, item: dict[str, Any], value: PendingProcess) -> None:
+        limit = self._candidate_plan_limit()
+        try:
+            updated = persist_process(self.runtime.store, item, value, limit=limit)
+        except BaseException:
+            # A commit can succeed before its return is lost. Keep that exact
+            # receipt for cleanup without treating the failed call as permission.
+            latest = _read_object(self.runtime.store.db, "management", item["id"], limit)
+            if latest is not None and latest == {
+                **item,
+                "candidate_process": value.model_dump(mode="json"),
+            }:
+                item.clear()
+                item.update(latest)
+            raise
+        item.clear()
+        item.update(updated)
 
     async def stage_update(self, version: str, expected: ExpectedPolicy) -> dict[str, Any]:
         from muli.updates import release_version
@@ -274,12 +308,25 @@ class SelfManagement:
                 }:
                     # The independent candidate unit may survive the host. A
                     # lost task is not proof its process tree is empty.
-                    item.update(
-                        phase="candidate_cleanup_required",
-                        recovery_notice="candidate_cleanup_unconfirmed",
-                    )
+                    if self._candidate_cleanup_confirmed(item):
+                        item.update(
+                            status="interrupted",
+                            phase="candidate_cleaned",
+                            error="candidate_preparation_interrupted",
+                        )
+                        item.pop("recovery_notice", None)
+                        (self.directory / f"{item['id']}.json").unlink(missing_ok=True)
+                    else:
+                        item.update(
+                            phase="candidate_cleanup_required",
+                            recovery_notice="candidate_cleanup_unconfirmed",
+                        )
                     self.runtime.store.event(
-                        "management.progress", item, objects=[("management", item)]
+                        "management.progress"
+                        if item["status"] == "applying"
+                        else "management.completed",
+                        item,
+                        objects=[("management", item)],
                     )
                     continue
                 current = fingerprint(self.runtime.config.settings)
@@ -379,6 +426,7 @@ class SelfManagement:
                     **item,
                     "status": "applying",
                     "phase": "candidate_preparing",
+                    "candidate_protocol": CANDIDATE_PROCESS_PROTOCOL,
                     "candidate_attempt": str(
                         Path(captured.policy.settings.retained_root) / f"candidate-{item['id']}"
                     ),
@@ -393,10 +441,22 @@ class SelfManagement:
                 version=item["version"],
                 configuration=data,
             )
-            attempt.accept_uv_version(await run_candidate_process(attempt.uv_version_spec()))
-            attempt.accept_install(await run_candidate_process(attempt.install_spec()))
-            attempt.accept_dependencies(await run_candidate_process(attempt.dependency_spec()))
-            ready = attempt.finish(await run_candidate_process(attempt.probe_spec()))
+
+            def persist(value: PendingProcess) -> None:
+                self._persist_candidate_process(item, value)
+
+            attempt.accept_uv_version(
+                await run_candidate_process(attempt.uv_version_spec(), persist=persist)
+            )
+            attempt.accept_install(
+                await run_candidate_process(attempt.install_spec(), persist=persist)
+            )
+            attempt.accept_dependencies(
+                await run_candidate_process(attempt.dependency_spec(), persist=persist)
+            )
+            ready = attempt.finish(
+                await run_candidate_process(attempt.probe_spec(), persist=persist)
+            )
             async with runtime.configuration_lock:
                 if runtime.store.get("management", item["id"]) != item:
                     raise CandidateError("candidate_plan_changed")
@@ -442,6 +502,14 @@ class SelfManagement:
                 )
         finally:
             try:
+                if item.get(
+                    "phase"
+                ) == "candidate_preparing" and not self._candidate_cleanup_confirmed(item):
+                    item.update(
+                        status="applying",
+                        phase="candidate_cleanup_required",
+                        recovery_notice="candidate_cleanup_unconfirmed",
+                    )
                 await self._finish_plan(item, path)
             finally:
                 self._applying = None
@@ -501,6 +569,20 @@ class SelfManagement:
         if (
             item.get("operation") == "update"
             and stored is not None
+            and stored.get("candidate_protocol") == CANDIDATE_PROCESS_PROTOCOL
+            and stored.get("candidate_process") != item.get("candidate_process")
+        ):
+            # Never erase a newer durable process receipt using an older local
+            # copy, including when the first read after a lost commit failed.
+            item = {
+                **stored,
+                "status": "applying",
+                "phase": "candidate_cleanup_required",
+                "recovery_notice": "candidate_cleanup_unconfirmed",
+            }
+        if (
+            item.get("operation") == "update"
+            and stored is not None
             and stored.get("status") == "cancelled"
             and (transaction is None or transaction["request_id"] != item["id"])
         ):
@@ -540,17 +622,113 @@ class SelfManagement:
 
     @property
     def idle(self) -> bool:
-        return (self._applying is None or self._applying.done()) and (
-            self._check is None or self._check.done()
+        return all(
+            task is None or task.done()
+            for task in (self._applying, self._check, self._candidate_cleanup)
         )
 
     async def close(self) -> None:
         self._closing = True
-        tasks = [task for task in (self._worker, self._check) if task is not None]
+        tasks = [
+            task
+            for task in (self._worker, self._check, self._candidate_cleanup)
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._worker = self._check = None
+        self._candidate_cleanup = None
+
+    async def recover(self) -> dict[str, Any]:
+        """Recover the existing candidate cleanup or the published transaction."""
+        from muli.managed_preparation import ManagedPreparation
+        from muli.process import _wait_cleanup
+
+        runtime = self.runtime
+        result: dict[str, Any] = {}
+        async with runtime.configuration_lock:
+            if self._closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            await self.recovery.project(strict=True)
+            transaction = self.recovery.current()["transaction"]
+            if transaction is not None and not transaction["resolved"]:
+                return await self.recovery.recover()
+            pending = [
+                item
+                for item in self.plans()
+                if item.get("operation") == "update"
+                and item.get("status") == "applying"
+                and item.get("phase") in {"candidate_preparing", "candidate_cleanup_required"}
+            ]
+            if not pending:
+                return await self.recovery.recover()
+            if len(pending) != 1:
+                raise CandidateError("candidate_process_plan_invalid")
+            if any(
+                task is not None and not task.done()
+                for task in (self._applying, self._candidate_cleanup)
+            ):
+                return {**self.recovery.current(), "helper": "candidate_cleanup_busy"}
+            runtime.maintenance.require_configuration()
+            self.recovery.require_managed_request("switch")
+            current = await ManagedPreparation(runtime, self.service).observe_current()
+            current.verify()
+            if self._closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            item = pending[0]
+            if runtime.store.get("management", item["id"]) != item:
+                raise CandidateError("candidate_plan_changed")
+
+            async def settle() -> None:
+                await self._recover_candidate(item)
+                # Capture the response while this task still owns Store's
+                # lifetime. A cancelled HTTP observer may resume after close.
+                result.update(
+                    self.recovery.current(),
+                    candidate_cleanup=runtime.store.get("management", item["id"]),
+                )
+
+            self._candidate_cleanup = task = asyncio.create_task(settle())
+        if await _wait_cleanup(task):
+            raise asyncio.CancelledError
+        return result
+
+    async def _recover_candidate(self, item: dict[str, Any]) -> None:
+        from muli.platforms.candidate_recovery import recover_candidate_process
+
+        runtime = self.runtime
+        limit = self._candidate_plan_limit()
+        notice: str | None = None
+
+        def persist(value: PendingProcess) -> None:
+            self._persist_candidate_process(item, value)
+
+        try:
+            pending = read_process(item, limit)
+            if pending is not None and pending.phase != "settled":
+                await recover_candidate_process(pending, persist=persist)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            notice = self.recovery._reason(exc, "candidate_cleanup_unconfirmed")
+        finally:
+            async with runtime.configuration_lock:
+                stored = runtime.store.get("management", item["id"])
+                if stored != item:
+                    raise CandidateError("candidate_plan_changed")
+                if self._candidate_cleanup_confirmed(item):
+                    item.update(
+                        status="interrupted",
+                        phase="candidate_cleaned",
+                        error="candidate_preparation_interrupted",
+                    )
+                    item.pop("recovery_notice", None)
+                else:
+                    item.update(status="applying", phase="candidate_cleanup_required")
+                    if notice is not None:
+                        item["recovery_notice"] = notice
+                await self._finish_plan(item, self.directory / f"{item['id']}.json")
 
     def tools(self, runtime: Runtime) -> list[Tool]:
         async def configuration(args: dict[str, Any]) -> Any:
@@ -603,7 +781,7 @@ class SelfManagement:
             return await self.stage("restart")
 
         async def recover(args: dict[str, Any]) -> Any:
-            return await self.recovery.recover()
+            return await self.recover()
 
         async def adopt(args: dict[str, Any]) -> Any:
             return await self.stage("adopt", candidate=LocalCandidate.model_validate(args))
@@ -679,7 +857,7 @@ class SelfManagement:
             ),
             Tool(
                 "self_recover",
-                "确认宿主绑定并恢复当前管理事务代；不新建事务、不续期、不重试结果未知的业务效果",
+                "收尾已有候选进程或恢复当前管理事务代；不新建、不续期、不重新安装",
                 parameters({}),
                 recover,
                 "write",

@@ -16,7 +16,6 @@ from test_managed_preparation import Host as ManagedHost
 from test_managed_preparation import host as host
 
 import muli.management as management
-from muli.candidate_lineage import check_plan_budget
 from muli.candidate_policy import (
     CandidateError,
     CandidateSettings,
@@ -31,6 +30,7 @@ from muli.managed_preparation import LocalSlotPaths
 from muli.management import SelfManagement
 from muli.management_transaction import JournalControl
 from muli.platforms import candidate_process
+from muli.platforms.candidate_process_state import PersistProcess
 from muli.platforms.installation import FileFingerprint
 from muli.platforms.managed_deployment import DeploymentAnchor
 from muli.platforms.managed_launcher import fingerprint as file_fingerprint
@@ -166,7 +166,9 @@ class CandidateHost:
         self.attempts.append(attempt)
         return cast(CandidateAttempt, attempt)
 
-    async def run(self, spec: ProcessSpec) -> ProcessOutput:
+    async def run(
+        self, spec: ProcessSpec, *, persist: PersistProcess | None = None
+    ) -> ProcessOutput:
         assert not self.runtime.configuration_lock.locked()
         self.steps.append(spec.argv[-1])
         spec.observe()
@@ -234,9 +236,7 @@ def configure_host(
         monkeypatch.setattr(manager.recovery, "project", project)
         monkeypatch.setattr(manager.recovery, "require_managed_request", lambda action: None)
         monkeypatch.setattr(manager.recovery, "prepare", host.prepare)
-        monkeypatch.setattr(
-            manager, "_check_candidate_plan", lambda item: check_plan_budget(item, 32768)
-        )
+        monkeypatch.setattr(manager, "_candidate_plan_limit", lambda: 32768)
     return host
 
 
@@ -349,7 +349,7 @@ async def test_uv_wait_releases_configuration_lock_and_policy_drift_stops_next_e
     item = await host.manager.stage_update("2.23.0", host.policy.expected)
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def blocked(spec: ProcessSpec) -> ProcessOutput:
+    async def blocked(spec: ProcessSpec, *, persist: PersistProcess | None = None) -> ProcessOutput:
         assert not host.runtime.configuration_lock.locked()
         host.steps.append(spec.argv[-1])
         entered.set()
@@ -416,7 +416,7 @@ async def test_close_waits_for_fake_process_cleanup_then_never_retries(
     item = await host.manager.stage_update("2.23.0", host.policy.expected)
     entered, cancelling, release, cleaned = (asyncio.Event() for _ in range(4))
 
-    async def blocked(spec: ProcessSpec) -> ProcessOutput:
+    async def blocked(spec: ProcessSpec, *, persist: PersistProcess | None = None) -> ProcessOutput:
         host.steps.append(spec.argv[-1])
         entered.set()
         try:
@@ -460,7 +460,7 @@ async def test_unconfirmed_cleanup_blocks_new_plans_instead_of_claiming_failure(
     item = await host.manager.stage_update("2.23.0", host.policy.expected)
     unit = "muli-candidate-" + "a" * 32 + ".service"
 
-    async def cleanup_failure(spec: ProcessSpec) -> Never:
+    async def cleanup_failure(spec: ProcessSpec, *, persist: PersistProcess | None = None) -> Never:
         host.steps.append(spec.argv[-1])
         raise candidate_process.CandidateProcessError(
             "candidate_cleanup_unconfirmed", unit_name=unit, cleanup_confirmed=confirmed
@@ -513,7 +513,9 @@ async def test_ready_does_not_prepare_a_different_persisted_plan(
     host = candidate_host
     item = await host.manager.stage_update("2.23.0", host.policy.expected)
 
-    async def change_plan(spec: ProcessSpec) -> ProcessOutput:
+    async def change_plan(
+        spec: ProcessSpec, *, persist: PersistProcess | None = None
+    ) -> ProcessOutput:
         output = await host.run(spec)
         if spec.argv[-1] == "probe":
             saved = host.runtime.store.get("management", item["id"])

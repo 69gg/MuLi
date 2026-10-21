@@ -12,7 +12,7 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 完整热重配置的关闭阶段也参与恢复：某个组件停止失败时，尝试重新建立上一配置及组件。观察者取消或断开不会中断正在进行的切换；同一配置锁保持到应用或恢复结束，再传播取消。如果恢复自身也失败，操作仍为失败，不能把配置文件已恢复当成所有组件健康。默认 `self_configure` 的 `apply_mode=in_process` 仍只保护存活的进程；显式或由监听变更选择的 `restart_transaction` 将配置作为私人候选交给独立 Linux 控制者。安装身份、被动启动、写锁、健康握手和终态投影已随 2.19.0 接通，验证边界和操作方法见[同版本恢复入口](linux-recovery-operations.md)。托管安装的候选切换沿用同一账本。
 
-`self_recover` 与 `POST /api/management/transactions/recover` 接续当前事务，先确认运行宿主可能丢失返回的绑定，再请求独立 helper；不创建新代次或自动重试结果未知的业务效果。已登录用户在维护暂停期间也能使用该 HTTP 入口。详见[恢复操作](managed-operations.md)。
+`self_recover` 与 `POST /api/management/transactions/recover` 接续当前事务，先确认运行宿主可能丢失返回的绑定，再请求独立 helper；不创建新代次或自动重试结果未知的业务效果。候选准备中断且尚未发布事务时，同一入口只收尾已持久保存的进程身份，确认退出后结束中断计划，不能自动重新安装。未观察到的同 boot 启动、证据缺失或无法核空仍保留阻断。恢复与关闭等待同一任务完成；详见[候选管理接入](candidate-host-design.md)和[恢复操作](managed-operations.md)。已登录用户在维护暂停期间也能使用该 HTTP 入口。
 
 受支持宿主创建未解决事务后，普通设置、自配置计划和扩展换代统一返回 transaction_in_progress；既有排队计划保留私人候选，解除后唤醒。维护等待采用自然空闲边界，waiting 期间原服务仍可开始正常工作；只有真实 owner 全部收尾才关闭准入并给 drained，繁忙流量下可超时保留原服务。关门后主人文字继续持久排队，外发与模型等待放行；legacy 插件候选缺少可核验 idle 合同时明确 unsupported，不卸载插件。普通前台 serve 可持写锁正常工作，但不冒充受支持的 systemd 恢复宿主。
 

@@ -42,7 +42,7 @@
 
 宿主可直接消费可信 Store 中的 `settled`；恢复 API 对此也只读返回原证据，不再要求已删除的控制文件或重做服务操作。`pending`/`observed` 则必须保留可核的私有文件；损坏或丢失这些文件时宁可继续阻塞，也不猜测进程已退出。若提交回调失败而当前调用已经核空，异常可报告 `cleanup_confirmed=True`，但它不代表 `settled` 已耐久保存：宿主还须检查本 plan 的持久阶段，未确认时继续阻塞。
 
-本 seam 尚未接入公开恢复工具/HTTP 或宿主管理计划；只提供可复用执行边界。进程被强杀后，原 Python 客户端不再提供 reaping 收据，恢复以 manager 已受理的唯一 invocation、无待执行 job 和内核树空共同证明该启动请求已结束；不以客户端 PID 不存在代替这一证明。同 boot 的未观察缺席分支特意不作该推断。
+宿主已接入同一管理计划和既有 `self_recover` / 恢复 HTTP 入口，宿主整合验收见[管理接入](candidate-host-design.md)。进程被强杀后，原 Python 客户端不再提供 reaping 收据，恢复以 manager 已受理的唯一 invocation、无待执行 job 和内核树空共同证明该启动请求已结束；不以客户端 PID 不存在代替这一证明。同 boot 的未观察缺席分支特意不作该推断。
 
 恢复片串行守卫验收：新增独立 fake 文件 29 项通过（0.68 秒、58.4 MiB），旧 fake 后端 48 项通过（1.35 秒、58.6 MiB），普通 stdlib worker 7 项与既有 helper/probe 103 项合 110 项通过（0.49 秒、62.8 MiB），本轮共 187 项。三个源码严格 mypy、四个 Python 文件 Ruff/格式通过，峰值 123.6 MiB，全部 swap 0。首轮停在复用 helper 夹具只接受 transaction 单元名的列表断言；新用例改用明确的 candidate existence fake，资源验证仍运行原 typed parser，未放宽产品检查。新文件模块级硬拦 subprocess，未创建真实 transient 单元、运行 uv、安装或下载。29 项覆盖真实 backend 的持久化顺序/丢返回、附件限额、已 settled 重放、真实私有文件身份变动、同/跨 boot 缺席与冲突、重复取消及资源验证；真实 manager 的崩溃恢复仍未验收。这里的 187 项包含下文既有回归，不能与原 158 项相加计为互不重叠的测试。
 
