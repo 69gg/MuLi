@@ -170,15 +170,34 @@ unknown outcome；详见[设计中的红例记录](windows-uia-actions-design.md
 不重复累计。4 项 hosted Windows 原生用例在 Linux 按原门控跳过。
 9 份 Python 的 Ruff/格式与两份源码 strict mypy 通过；pytest 峰值 67.2 MiB，
 类型检查峰值 213.4 MiB，swap 0，每条命令仍由原 30 秒守卫串行执行。
-最终实现独审与真实 Windows provider 验收待完成，没有运行开发机 PowerShell 或桌面。
+最终独立静态实现后审未发现确定 P1/P2，没有运行开发机 PowerShell 或桌面。
 
 原有三项 hosted Windows 原生用例与 12 秒启动、4 KiB 两管道/诊断预算保留；新用例
 只操作自身临时窗的 BUTTON。标准控件的 `WM_COMMAND/BN_CLICKED` 必须同时匹配
 原父 HWND、控制 ID 与按钮 HWND，才发送一次固定计数。helper 的 accepted 与该
 计数分别断言并共用原操作期限。禁用按钮及密码无 Invoke，旧快照不能再次调用。
 输出 reader 在 readiness 后继续消费同一 stdout，按钮事件仍计入原 4 KiB 总额，
-重复或错误事件使夹具失败并强拥有回收。上述真实 Windows provider、动作和消息
-关联仍待远端矩阵，不以 Linux fake 或只读历史通过替代。
+重复或错误事件使夹具失败并强拥有回收。首轮 Windows 验收事实与剩余修复见下一节，
+不以 Linux fake 或只读历史通过替代实际 provider 证据。
+
+## 首轮 Windows 验收与按钮范围断言
+
+精确 `415187c66d33837ff5a4765b9c0ee9ec384d1642` 的 CI `39602031782` 为 7 成功、
+3 失败。Windows 3.12 job `119228670548` 和 3.13 job `119228670422` 都在首个
+原生用例的按钮全集断言失败：同一自有窗口还包含普通标题栏按钮，原测试错误地要求
+所有具有 Invoke 能力的节点只能是专属按钮。两组都已通过 probe 的前置断言，并在
+独立 Invoke 用例分别实际收到 `BN_CLICKED`；这些成功不等于整个矩阵已通过。
+
+窄修只按专属 `BUTTON_NAME` 精确定位唯一节点，仍要求 `actions=["invoke"]` 且
+非只读；其他合法按钮可以存在，不用系统按钮的英文名称作白名单。密码保护、禁用
+按钮拒绝、单次快照、实际点击计数及原 12 秒期限均保持。
+
+纯回归直接调用原 native 测试函数，只替换 Computer/lease/进程边界；额外 Unicode
+按钮在旧断言下稳定失败（0.12 秒、57.3 MiB）。修后 5 项通过（0.11 秒、56.7 MiB），
+含额外按钮成功及专属按钮缺失、重复、无 Invoke、只读四项拒绝。两份 Python 的
+Ruff/format-check 和 strict mypy 通过；首轮 mypy 仅报测试引用未显式导出的
+`native.subprocess`，改为直接导入同一标准库模块后通过。整轮峰 195.3 MiB、swap 0；
+没有运行本机 PS、子进程或桌面，修后的真实 Windows 矩阵仍待验。
 
 ## 后续 probe 阶段证据
 
