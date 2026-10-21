@@ -178,6 +178,8 @@ uv tool install "muli-agent[channels]"
 
 工作台 `/api/channels` 与 `channel_status` 可查看状态和投递记录。`channel_send` 通过统一 `external` 权限门显式发送本地附件或文字，目标仍须符合绑定。工具返回排队 ID 后应检查投递状态，不能把入队说成已送达。
 
+微信 `sendmessage` 的成功只表示 API 接受，不证明已阅读或播放。官方允许成功响应省略 `ret`，该兼容性保持；已存在的 `ret` / `errcode` 若是布尔、null、字符串、容器或非有限数值，则保存 `unknown`，不猜测成功或自动重发。稳定 `client_id` 是本地发送身份，不是独立的远端送达回执。详细协议和验证见[微信发送回执](weixin-receipts.md)。
+
 ## 显式发送语音
 
 `channel_send` 新增可选 `media_mode="file"|"voice"`，默认 file 保持已有附件发送行为，不按扩展名把所有音频自动切到新语音路径。file 的含义是原有传输路径，不承诺每个平台都显示文档：QQ 原有音频附件仍沿用平台富媒体 `file_type=3`，本片不改变它。
