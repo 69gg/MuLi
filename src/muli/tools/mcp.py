@@ -78,6 +78,12 @@ class _RemoteTool:
     size: int
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class _Generation:
+    secrets: frozenset[str] = field(repr=False)
+    max_output_chars: int
+
+
 @dataclass(eq=False, slots=True)
 class _Connection:
     name: str
@@ -92,6 +98,11 @@ class _Connection:
     closed: bool = False
     close_attempted: bool = False
     cleanup_task: asyncio.Task[bool] | None = None
+    active_calls: int = 0
+    idle: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    def __post_init__(self) -> None:
+        self.idle.set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +114,7 @@ class MCPCandidate:
     statuses: tuple[JsonObject, ...]
     created: tuple[_Connection, ...]
     limits: MCPLimits
-    secrets: frozenset[str] = field(repr=False)
+    generation: _Generation = field(repr=False)
 
 
 class _FastMCPClient:
@@ -224,10 +235,11 @@ class MCPManager:
         self._lock = asyncio.Lock()
         self._started = False
         self._closed = False
+        self._generation: _Generation | None = None
+        self._candidate: _Generation | None = None
         self._changed: Callable[[str], None] | None = None
         self.retirement_errors: list[JsonObject] = []
         self.tools: list[Tool] = []
-        self._secrets = self._config_secrets(config)
 
     @staticmethod
     def _config_secrets(config: JsonObject) -> set[str]:
@@ -273,21 +285,38 @@ class MCPManager:
     def pending_cleanup(self) -> int:
         return len(self._retiring)
 
-    def _redact(self, value: str) -> str:
-        for secret in sorted(self._secrets, key=len, reverse=True):
+    @property
+    def draining(self) -> int:
+        return sum(connection.active_calls > 0 for connection in self._retiring)
+
+    @property
+    def cleanup_failed(self) -> bool:
+        return any(
+            connection.close_failed
+            and connection.cleanup_task is not None
+            and connection.cleanup_task.done()
+            for connection in self._retiring
+        )
+
+    @staticmethod
+    def _redact(value: str, generation: _Generation) -> str:
+        for secret in sorted(generation.secrets, key=len, reverse=True):
             value = value.replace(secret, "••••")
         return value
 
-    def _sanitize(self, value: Any) -> Any:
+    def _sanitize(self, value: Any, generation: _Generation) -> Any:
         if isinstance(value, str):
-            return self._redact(value)
+            return self._redact(value, generation)
         if isinstance(value, dict):
-            return {str(key): self._sanitize(item) for key, item in value.items()}
+            return {
+                self._redact(str(key), generation): self._sanitize(item, generation)
+                for key, item in value.items()
+            }
         if isinstance(value, (list, tuple)):
-            return [self._sanitize(item) for item in value]
+            return [self._sanitize(item, generation) for item in value]
         if value is None or isinstance(value, (bool, int, float)):
             return value
-        return self._redact(str(value))
+        return self._redact(str(value), generation)
 
     def _server(self, raw: JsonObject) -> tuple[JsonObject, float]:
         server = {
@@ -418,7 +447,7 @@ class MCPManager:
         raise MCPPrepareError("page_budget_exceeded")
 
     def _tools_for(
-        self, connection: _Connection, catalog: tuple[_RemoteTool, ...], secrets: set[str]
+        self, connection: _Connection, catalog: tuple[_RemoteTool, ...], generation: _Generation
     ) -> list[Tool]:
         tools: list[Tool] = []
         for remote in catalog:
@@ -429,11 +458,9 @@ class MCPManager:
                 _connection: _Connection = connection,
                 _remote: str = remote.name,
             ) -> Any:
-                return await self._call(_connection, _remote, arguments)
+                return await self._call(_connection, _remote, arguments, generation)
 
-            description = remote.description
-            for secret in sorted(secrets, key=len, reverse=True):
-                description = description.replace(secret, "••••")
+            description = self._redact(remote.description, generation)
             tools.append(
                 Tool(
                     _name(connection.name, remote.name),
@@ -457,10 +484,16 @@ class MCPManager:
         if self._closed:
             raise MCPPrepareError("manager_closed")
         if self._retiring:
-            raise MCPPrepareError("restart_required", "connection_cleanup_pending")
+            if self.cleanup_failed:
+                raise MCPPrepareError("restart_required", "connection_cleanup_pending")
+            raise MCPPrepareError("generation_draining")
+        if self._candidate is not None:
+            raise MCPPrepareError("candidate_pending")
         limits = limits or self._limits
         config = deepcopy(config)
         secrets = self._config_secrets(config)
+        generation = _Generation(frozenset(secrets), limits.max_output_chars)
+        self._candidate = generation
         connections: dict[str, _Connection] = {}
         catalogs: dict[str, tuple[_RemoteTool, ...]] = {}
         created: list[_Connection] = []
@@ -521,7 +554,7 @@ class MCPManager:
                     total_bytes += size
                     connections[name] = connection
                     catalogs[name] = catalog
-                    tools.extend(self._tools_for(connection, catalog, secrets))
+                    tools.extend(self._tools_for(connection, catalog, generation))
                     status.update(status="connected", tool_count=len(catalog))
                 except asyncio.CancelledError:
                     raise
@@ -545,6 +578,8 @@ class MCPManager:
                         raise MCPPrepareError(code, name) from exc
                     if new and connection is not None:
                         await self._retire([connection], stage="candidate_cleanup")
+            if self._closed:
+                raise MCPPrepareError("manager_closed")
             return MCPCandidate(
                 config,
                 connections,
@@ -553,14 +588,22 @@ class MCPManager:
                 tuple(statuses),
                 tuple(created),
                 limits,
-                frozenset(secrets),
+                generation,
             )
         except BaseException:
-            await self._retire(created, stage="candidate_cleanup")
+            try:
+                await self._retire(created, stage="candidate_cleanup")
+            finally:
+                if self._candidate is generation:
+                    self._candidate = None
             raise
 
     def publish(self, candidate: MCPCandidate) -> tuple[_Connection, ...]:
         """Only reference swaps; the caller validates registry conflicts before persisting config."""
+        if self._closed:
+            raise MCPPrepareError("manager_closed")
+        if self._candidate is not candidate.generation:
+            raise MCPPrepareError("candidate_changed")
         retired = tuple(
             connection
             for name, connection in self._connections.items()
@@ -574,14 +617,25 @@ class MCPManager:
         self._limits = candidate.limits
         self.max_tools = candidate.limits.max_tools
         self.max_output_chars = candidate.limits.max_output_chars
-        self._secrets = set(candidate.secrets)
+        self._generation = candidate.generation
+        self._candidate = None
         self._started = True
+        self._schedule_retirement(retired)
         return retired
 
     async def discard(self, candidate: MCPCandidate) -> None:
-        await self._retire(candidate.created, stage="candidate_cleanup")
+        if candidate.generation is self._generation:
+            raise MCPPrepareError("candidate_already_published")
+        try:
+            await self._retire(candidate.created, stage="candidate_cleanup")
+        finally:
+            if self._candidate is candidate.generation:
+                self._candidate = None
 
     async def _cleanup(self, connection: _Connection, stage: str) -> bool:
+        # A published token has already revoked new admissions. Existing calls
+        # retain their exact connection until the SDK stack has actually settled.
+        await connection.idle.wait()
         connection.close_failed = True
         try:
             async with asyncio.timeout(self.timeout):
@@ -603,15 +657,13 @@ class MCPManager:
         self._retiring.discard(connection)
         return True
 
-    async def _retire(
+    def _schedule_retirement(
         self,
         connections: Iterable[_Connection],
         *,
         stage: str = "retirement",
         retry_failed: bool = False,
-    ) -> bool:
-        complete = True
-        cancelled = False
+    ) -> list[asyncio.Task[bool]]:
         pending: list[asyncio.Task[bool]] = []
         for connection in reversed(list(connections)):
             if connection.closed:
@@ -623,6 +675,18 @@ class MCPManager:
                 task = asyncio.create_task(self._cleanup(connection, stage), name="muli-mcp-close")
                 connection.cleanup_task = task
             pending.append(task)
+        return pending
+
+    async def _retire(
+        self,
+        connections: Iterable[_Connection],
+        *,
+        stage: str = "retirement",
+        retry_failed: bool = False,
+    ) -> bool:
+        complete = True
+        cancelled = False
+        pending = self._schedule_retirement(connections, stage=stage, retry_failed=retry_failed)
         for task in pending:
             while not task.done():
                 try:
@@ -638,7 +702,8 @@ class MCPManager:
     async def retire(self, connections: tuple[_Connection, ...]) -> bool:
         return await self._retire(connections)
 
-    def _result(self, result: Any) -> JsonObject:
+    def _result(self, result: Any, generation: _Generation) -> JsonObject:
+        maximum = generation.max_output_chars
         if getattr(result, "is_error", False) or getattr(result, "isError", False):
             return {"is_error": True, "error": "MCP 服务器报告工具执行失败"}
         content: list[JsonObject] = []
@@ -648,16 +713,14 @@ class MCPManager:
                 content.append(
                     {
                         "type": "text",
-                        "text": self._redact(str(getattr(block, "text", "")))[
-                            : self.max_output_chars
-                        ],
+                        "text": self._redact(str(getattr(block, "text", "")), generation)[:maximum],
                     }
                 )
             elif kind == "resource" and hasattr(getattr(block, "resource", None), "text"):
                 content.append(
                     {
                         "type": "text",
-                        "text": self._redact(str(block.resource.text))[: self.max_output_chars],
+                        "text": self._redact(str(block.resource.text), generation)[:maximum],
                     }
                 )
             else:
@@ -672,15 +735,15 @@ class MCPManager:
         structured = getattr(result, "structured_content", None)
         if structured is not None:
             payload["structured_content"] = structured
-        encoded = json.dumps(self._sanitize(payload), ensure_ascii=False)
-        if len(encoded) <= self.max_output_chars:
+        encoded = json.dumps(self._sanitize(payload, generation), ensure_ascii=False)
+        if len(encoded) <= maximum:
             return cast(JsonObject, json.loads(encoded))
         wrapper: JsonObject = {"is_error": False, "truncated": True, "preview": ""}
-        lower, upper = 0, min(len(encoded), self.max_output_chars)
+        lower, upper = 0, min(len(encoded), maximum)
         while lower < upper:
             middle = (lower + upper + 1) // 2
             wrapper["preview"] = encoded[:middle]
-            if len(json.dumps(wrapper, ensure_ascii=False)) <= self.max_output_chars:
+            if len(json.dumps(wrapper, ensure_ascii=False)) <= maximum:
                 lower = middle
             else:
                 upper = middle - 1
@@ -688,22 +751,39 @@ class MCPManager:
         return wrapper
 
     async def _call(
-        self, connection: _Connection, remote: str, arguments: JsonObject
+        self, connection: _Connection, remote: str, arguments: JsonObject, generation: _Generation
     ) -> JsonObject:
-        if self._closed or not connection.usable:
-            return {"is_error": True, "error": "MCP 服务器未连接"}
+        # This synchronous gate follows Runtime approval/task guards. A schema
+        # snapshot alone never authorizes entry to a revoked endpoint.
+        if (
+            self._closed
+            or generation is not self._generation
+            or not connection.usable
+            or self._connections.get(connection.name) is not connection
+        ):
+            return {
+                "is_error": True,
+                "status": "not_executed",
+                "code": "manager_closed" if self._closed else "generation_changed",
+            }
+        connection.active_calls += 1
+        connection.idle.clear()
         try:
             async with asyncio.timeout(connection.timeout):
                 result = await connection.client.call_tool(
                     remote, arguments, timeout=connection.timeout, raise_on_error=False
                 )
-                return self._result(result)
+                return self._result(result, generation)
         except TimeoutError:
             return {"is_error": True, "error": "MCP 工具调用达到时间上限"}
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             return {"is_error": True, "error": f"MCP 工具调用失败：{type(exc).__name__}"}
+        finally:
+            connection.active_calls -= 1
+            if not connection.active_calls:
+                connection.idle.set()
 
     async def _close_connections(self) -> None:
         await self._retire(

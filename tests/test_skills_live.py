@@ -155,6 +155,8 @@ async def test_busy_request_keeps_materialized_guidance_and_next_request_observe
                 "retirement": "unneeded",
             }
             assert runtime.tools is registry and runtime.mcp.tools is mcp_tools and not mcp_calls
+            # Skills publication does not revoke a previously materialized MCP handler.
+            assert not (await mcp_tools[0].handler({"q": "仍在同一 MCP 代"}))["is_error"]
             assert payload(seen[0])["active"][0]["body"] == old.body
             assert "新版完整指导" not in json.dumps(payload(seen[0]), ensure_ascii=False)
             release.set()
@@ -252,7 +254,7 @@ async def test_resource_read_rejects_changed_skill_or_replaced_package(
 
 
 @pytest.mark.parametrize("change", ["manual", "catalog", "mcp", "inline", "skills", "budget"])
-async def test_mixed_or_explicit_changes_wait_for_idle_then_publish_full_generation(
+async def test_extension_or_explicit_changes_publish_full_generation_while_busy(
     runtime: Runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
     ext = runtime.extensions
@@ -285,18 +287,14 @@ async def test_mixed_or_explicit_changes_wait_for_idle_then_publish_full_generat
             ext._catalog_changed("old")
         ext.start()
         assert await asyncio.wait_for(waits.get(), 2) == 300
-        assert ext.phase == "queued" and ext._dirty and ext.generation == generation
-        assert ext.skills._snapshot is old_snapshot
-        assert runtime.tools is registry and runtime.mcp.tools is mcp_tools
-        assert full_calls == []
-        if change == "catalog":
-            assert ext._refresh == {"old"}
-    ext.wake()
-    assert await asyncio.wait_for(waits.get(), 2) == 300
-    assert ext.phase == "loaded" and not ext._dirty and ext.generation == generation + 1
-    assert ext.skills._snapshot.entries[0].body == "待完整发布"
-    assert full_calls == [None] and runtime.tools is not registry
-    assert "scope" not in ext.status()["last_apply"]
+        assert runtime.busy and ext.phase == "loaded" and not ext._dirty
+        assert ext.generation == generation + 1 and ext.skills._snapshot is not old_snapshot
+        assert ext.skills._snapshot.entries[0].body == "待完整发布"
+        assert full_calls == [None] and runtime.tools is not registry
+        assert runtime.mcp.tools is not mcp_tools
+        assert "scope" not in ext.status()["last_apply"] and not ext._refresh
+        denied = await mcp_tools[0].handler({"q": "未派发旧代"})
+        assert denied["status"] == "not_executed" and denied["code"] == "generation_changed"
 
 
 @pytest.mark.parametrize("with_mcp", [True, False], ids=["connected", "no-connections"])
@@ -309,6 +307,7 @@ async def test_directory_discovery_cannot_downgrade_an_unfulfilled_manual_reload
         async with runtime.configuration_lock:
             await ext.apply_locked(target, persist=True)
         assert runtime.mcp.status() == []
+        assert await runtime.mcp.retire(tuple(runtime.mcp._retiring))
     snapshot, generation = ext.skills._snapshot, ext.generation
     waits = observe_waits(monkeypatch)
     async with busy(runtime):
@@ -318,13 +317,10 @@ async def test_directory_discovery_cannot_downgrade_an_unfulfilled_manual_reload
         source(tmp_path, body="手动完整重载仍未履行")
         ext.start()
         assert await asyncio.wait_for(waits.get(), 2) == 300
-        assert ext.skills._snapshot is snapshot and ext.generation == generation
-        assert ext.phase == "queued" and ext._dirty
-    ext.wake()
-    assert await asyncio.wait_for(waits.get(), 2) == 300
-    assert ext.skills._snapshot.entries[0].body == "手动完整重载仍未履行"
-    assert ext.generation == generation + 1 and not ext._dirty
-    assert "scope" not in ext.status()["last_apply"]
+        assert runtime.busy and ext.skills._snapshot is not snapshot
+        assert ext.skills._snapshot.entries[0].body == "手动完整重载仍未履行"
+        assert ext.phase == "loaded" and ext.generation == generation + 1 and not ext._dirty
+        assert "scope" not in ext.status()["last_apply"]
 
 
 @pytest.mark.parametrize("point", ["prepare", "final-scan"])
@@ -517,7 +513,7 @@ async def test_failed_full_mcp_candidate_does_not_gain_loaded_status_from_skills
         ext.start()
         assert await asyncio.wait_for(waits.get(), 2) == 300
         assert ext.skills._snapshot is snapshot and ext.generation == generation
-        assert ext._dirty and ext.phase == "queued"
+        assert not ext._dirty and ext.phase == "failed"
         assert ext.status()["error"] is not None
 
 

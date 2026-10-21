@@ -519,7 +519,12 @@ def _create_app(
 
     @app.exception_handler(ValueError)
     async def bad_input(request: Request, exc: ValueError) -> JSONResponse:
-        status = 409 if isinstance(exc, ExtensionError) and exc.code == "runtime_busy" else 400
+        status = (
+            409
+            if isinstance(exc, ExtensionError)
+            and exc.code in {"runtime_busy", "generation_draining", "candidate_pending"}
+            else 400
+        )
         return JSONResponse({"detail": str(exc)[:1000]}, status_code=status)
 
     @app.exception_handler(MaintenanceError)
@@ -965,9 +970,10 @@ def _create_app(
     @app.patch("/api/settings")
     async def update_settings(changes: dict[str, Any]) -> dict[str, Any]:
         async with runtime.configuration_lock:
-            if runtime.busy:
+            target = config.validate_changes(changes)
+            if runtime.busy and not runtime.extensions.configuration_only(config.settings, target):
                 raise HTTPException(409, "请先停止运行中的任务")
-            await apply_configuration(config.validate_changes(changes))
+            await apply_configuration(target)
         await onboarding()
         return config.public()
 
