@@ -137,7 +137,7 @@ Telegram 的 `getUpdates` 与远端 webhook 互斥。本实现使用长轮询，
 - Telegram 使用 `sendMessage` 与 multipart `sendDocument`；显式语音使用 multipart `sendVoice`，不启用 HTML/Markdown 解析。接收先 `getFile`，再从该机器人配置的文件端点获取内容；接收上限同时受官方 20 MiB 和本地配置限制。
 - OneBot 发送数组形式的 text segment，不把文字解释为 CQ code。文件使用 NapCat 的 `upload_private_file` / `upload_group_file`，通过 `base64://` 提交，无需共享本机文件路径。显式语音先查询 `can_send_record`，再发送包含 Base64 的 `record` 数组段。接收使用 `get_image`、`get_record`、`get_private_file_url` 或 `get_group_file_url` 获取 URL；不读取 NapCat 返回的本地路径。通用 OneBot 服务若没有 NapCat 文件扩展，文本仍可用，文件操作明确失败。
 - QQ 支持 `C2C_MESSAGE_CREATE` 与 `GROUP_AT_MESSAGE_CREATE`；校验 `X-Bot-Appid`、时间戳及 Ed25519 原始请求签名，并实现官方 `op=13` 回调验证。access token 有效期必须为有限正数并提前刷新。文件先上传到目标用户或群的 `/files`，然后以 `msg_type=7` 和原样 `file_info` 发送；本轮直接上传限制为 5 MiB，不实现大文件分块。被动回复的 `msg_id/msg_seq` 在 SQLite 中跨投递分配，同一入站消息最多分配 5 次；预算不足会在发送前拒绝。平台的时间窗口、主动消息配额及资质仍由 QQ 决定。
-- iLink 按只读参考项目验证的 2.4.6 协议发送文本、图片、视频和普通文件；媒体使用协议规定的 AES-128-ECB/PKCS#7 与 CDN。音频出站作为文件发送，此版本不提供原生语音消息发送或引用回复。消息使用稳定的 `client_id`；失效 token 的 `-14` 响应暂停重试一小时。没有有效 `context_token` 时明确要求用户先向机器人发消息。
+- iLink 按只读参考项目验证的 2.4.6 协议发送文本、图片、视频和普通文件；媒体使用协议规定的 AES-128-ECB/PKCS#7 与 CDN。入站接收平台已有的 `voice_item.text`，按原内容项顺序保留，语音文字边界加换行，不因内容相同丢弃重复项；它属于原渠道文字，不调用 ASR。转写不受附件下载开关影响，原始录音仍只有主人且开启 `receive_files` 时才下载。Tencent SILK 标识可登记为 `audio/silk`，保持文件下载展示，不提供浏览器内联播放或解码保证。音频出站仍作为文件发送，此版本不提供原生语音消息发送或引用回复。消息使用稳定的 `client_id`；失效 token 的 `-14` 响应暂停重试一小时。没有有效 `context_token` 时明确要求用户先向机器人发消息。输入预算、空值与验证边界见[微信入站语音说明](weixin-voice-ingress.md)。
 
 QQ 签名与 iLink 媒体加密按需使用可选 `channels` 依赖中的 `cryptography`；本模块不自动安装依赖。缺少时相关能力明确报告不可用，Telegram 和 OneBot 文本不依赖它。
 
@@ -156,6 +156,8 @@ uv tool install "muli-agent[channels]"
 `ChannelManager` 使用同一个本地 SQLite 的独立渠道表，保存入站去重、平台游标、出站分段进度及安全错误。长轮询和消息事件触发处理；空响应或错误有退避，不调用 AI 定时轮询。首次启动把 assistant 事件游标定位到当前末尾，不补发启用前的历史回复；以后重启恢复持久游标。每个已处理入站事件和每条明确 `event_id` 的出站投递都有稳定去重 ID。
 
 入站还对规范化后的完整消息信封保存 SHA-256 指纹，覆盖正文、真实发送者/目标、附件描述与协议上下文；只保存摘要，不把 CDN URL 或上下文密钥明文写进指纹列。同一渠道、账号、事件 ID 重投时，先核对指纹再返回原接收结果或复用附件进度；正文、发送者或附件改变会报 409，不能把新正文错配给旧附件。旧版数据库自动增加指纹列，但不凭重投内容猜测历史原文：旧已完成项仅返回原 receipt 并明确 `fingerprint_verified=false`，旧未完成 checkpoint 需人工核对并恢复，自动接续会报 409。状态中的 `inbound.legacy_unverified/legacy_incomplete` 公开这些历史数量。
+
+微信新增平台转写后也沿用这条规则；升级后同一历史消息 ID 若解析出的正文与已存信封不同，继续报冲突，不自动重新提交历史语音。
 
 出站状态如下：
 
@@ -217,6 +219,8 @@ await manager.close()
 
 离线验证命令：`python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_channels.py tests/test_channel_voice.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。语音回归覆盖 Telegram multipart、OneBot 私聊/群 record 与能力拒绝、格式/数量预检、默认文件与 QQ 音频兼容、同键模式冲突、持久重开及 unknown 不重发。相关渠道/应用集成/附件服务共 61 项受限测试通过，源码检查记录见[语音设计](channel-voice-design.md#验证)。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
 
+微信入站平台转写与 SILK 文件识别另有新增 32 项，以及既有渠道/语音/附件/上传 96 项定向回归通过；两组独立执行且不含真实平台或 ASR 验收，资源与边界见[微信入站验证记录](weixin-voice-ingress.md#固定来源与验证)。
+
 ## 协议依据
 
 - [Telegram Bot API](https://core.telegram.org/bots/api)：`getUpdates`、`sendMessage`、`sendDocument`、`sendVoice`、`getFile`。
@@ -225,4 +229,4 @@ await manager.close()
 - [NapCat 私聊文件上传](https://napcat.apifox.cn/226658883e0)、[群文件上传](https://napcat.apifox.cn/226658753e0)；[官方 URI 解析源码](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-common/src/file.ts)确认 `base64://` 支持。
 - [QQ 调用基础与 access token](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/api-use.html)、[事件回调](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html)、[签名校验](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/sign.html)。
 - [QQ 富媒体协议](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/rich-media.html)、[群消息接口与被动回复限制](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)。
-- [weixin-ilink-client](https://github.com/69gg/weixin-ilink-client)：本机参考仓库只读核实的 iLink 2.4.6 协议、媒体与状态码，不依赖或自动安装该客户端。
+- [腾讯 iLink v2.4.6 消息类型](https://github.com/Tencent/openclaw-weixin/blob/v2.4.6/src/api/types.ts)与独立客户端 [weixin-ilink-client v0.1.3](https://github.com/69gg/weixin-ilink-client/tree/v0.1.3)：核实 iLink 消息、平台语音转写与 Tencent SILK 标识；不依赖或自动安装该客户端。

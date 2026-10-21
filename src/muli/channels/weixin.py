@@ -75,16 +75,28 @@ class Weixin(Adapter):
             event_id = "seq:" + str(value["seq"]) + ":" + sender
         if value.get("message_type") != 1 or not sender or not event_id:
             return None
-        texts, files = [], []
+        texts: list[str] = []
+        files: list[RemoteFile] = []
+        previous_voice = False
         items = value.get("item_list", [])
         if not isinstance(items, list):
             raise ChannelError("iLink 消息 item_list 格式错误")
         for item in items[:64]:
             item = object_value(item)
             kind = item.get("type")
+            text = ""
             if kind == 1:
-                texts.append(str(object_value(item.get("text_item")).get("text") or ""))
-            elif kind in {2, 3, 4, 5}:
+                text = str(object_value(item.get("text_item")).get("text") or "")
+            elif kind == 3:
+                transcript = object_value(item.get("voice_item")).get("text")
+                if isinstance(transcript, str) and transcript.strip():
+                    text = transcript
+            if text:
+                if texts and (previous_voice or kind == 3):
+                    texts.append("\n")
+                texts.append(text)
+                previous_voice = kind == 3
+            if kind in {2, 3, 4, 5}:
                 key = {2: "image_item", 3: "voice_item", 4: "file_item", 5: "video_item"}[kind]
                 detail = object_value(item.get(key))
                 media = object_value(detail.get("media"))

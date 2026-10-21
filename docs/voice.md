@@ -50,6 +50,8 @@
 
 当前显式 voice 支持 Telegram 的 MP3、M4A、Ogg/Opus，以及远端确认 `can_send_record` 的 OneBot；QQ 与微信的这一显式模式尚未支持，会明确拒绝。默认 file 保持各平台原有附件行为。TTS 默认 MP3 可直接走 Telegram 语音；若服务配置生成 WAV、FLAC、PCM 等 Telegram 不支持的格式，需显式选择兼容的 TTS 输出或文件发送，不会自动安装转码器或降级。详见[渠道语音合同](channels.md#显式发送语音)。没有真实平台收发或付费 TTS 验收记录。
 
+微信 iLink 入站可接收平台已经提供的 `voice_item.text`，不为此调用或外传音频到 ASR；文字仍按原渠道主人身份与隔离规则处理。只有主人且开启 `receive_files` 时才下载原始录音。附件库可识别 Tencent SILK 标识并保存为 `audio/silk`，仍以文件展示；显式调用 `audio_transcribe` 时，配置的 ASR 是否支持 SILK 由服务决定，不提供自动转码或识别保证。顺序、重复内容与大小限制见[微信入站语音说明](weixin-voice-ingress.md)。
+
 ## 本地后台唤醒
 
 voice.enabled 默认 false。未启用时，start 不创建采集任务，listen_once 和 enroll 拒绝录音。模块导入、状态探测与设置读取都不会打开麦克风、下载模型或加载 GPU 推理框架。本轮使用模拟音频与模拟进程验证，未实际录音或播放开发机音频。
