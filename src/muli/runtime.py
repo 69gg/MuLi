@@ -1144,6 +1144,7 @@ class Runtime:
                 self.system_events.clear_request(session_id)
                 # Child agents need the same capacity pool. Release the parent's slot first.
                 child_results: list[str] = []
+                reports: list[tuple[str, str]] = []
                 has_children = False
                 remaining = self.config.settings.limits.max_output_chars
                 after_id = ""
@@ -1156,23 +1157,40 @@ class Runtime:
                                 f"子工作流未成功完成：{finished['name']}（{finished['status']}）"
                             )
                         if remaining:
+                            separator = "\n\n" if has_children else ""
+                            pieces: list[str] = []
                             for part in (
-                                "\n\n" if has_children else "",
+                                separator,
                                 finished["name"],
                                 "\n",
                                 finished.get("result", ""),
                             ):
                                 piece = str(part)[:remaining]
                                 if piece:
-                                    child_results.append(piece)
+                                    pieces.append(piece)
                                     remaining -= len(piece)
                                 if not remaining:
                                     break
+                            fragment = "".join(pieces)
+                            child_results.append(fragment)
+                            # Charge separators to the one parent budget, but
+                            # never send a separator-only fragment to another origin.
+                            content = fragment[len(separator) :]
+                            if content.strip():
+                                reports.append((child_id, content))
                         has_children = True
                 if has_children:
                     result = "".join(child_results)
-                    message = self.store.add_message(session_id, "assistant", result)
-                    await self.bus.emit("message.completed", {"message": message}, session_id)
+                    if log_session.get("kind") == "main":
+                        # No report is committed until every child succeeded.
+                        # The synchronous batch cannot be split by cancellation.
+                        self.workflows.publish_results(run_id, session_id, reports)
+                        await self.bus.notify()
+                    else:
+                        # Team owns its existing parent-report route; its child
+                        # workflows must not bypass it with direct channel output.
+                        message = self.store.add_message(session_id, "assistant", result)
+                        await self.bus.emit("message.completed", {"message": message}, session_id)
             run["status"], run["result"] = "completed", result
             await self.bus.emit("run.completed", {"run_id": run_id}, session_id)
             return result
@@ -2042,18 +2060,20 @@ class Runtime:
 
     def _workflow_tool(self, mode: Mode, session_id: str, run_id: str) -> Tool:
         async def create(args: dict[str, Any]) -> Any:
+            request = self.request_context(session_id)
+            reply_origin = request.reply_origin if request is not None else ReplyOrigin()
             workflow = self.workflows.create(
                 name=args["name"],
                 steps=args["steps"],
                 description=args.get("description", ""),
                 mode=mode,
             )
-            request = self.request_context(session_id)
             return await self.workflows.start(
                 workflow["id"],
                 parent_run_id=run_id,
                 parent_session_id=session_id,
                 request_snapshot=request.execution_scope if request else None,
+                reply_origin=reply_origin,
             )
 
         step = parameters(
