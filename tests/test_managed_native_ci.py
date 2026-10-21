@@ -1876,6 +1876,28 @@ def test_setup_receipt_phase_is_a_strict_fixed_enum(
         "proc-missing",
         "bad-stat",
         "bad-uid",
+        "wait-child",
+        "wait-ep-poll",
+        "wait-epoll",
+        "wait-other",
+        "wait-suffix",
+        "wait-zero",
+        "wait-empty",
+        "wait-whitespace",
+        "wait-nonascii",
+        "wait-change",
+        "wait-permission",
+        "wait-oserror",
+        "wait-budget",
+        "wait-stderr-budget",
+        "wait-deadline",
+        "wait-cancel",
+        "wait-pid-change",
+        "wait-group-change",
+        "wait-ticks-change",
+        "wait-proc-group-change",
+        "wait-exe-change",
+        "wait-uid-change",
     ],
 )
 async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
@@ -1898,6 +1920,8 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
     proc_limits: list[int] = []
     image_calls = 0
     binding_calls = 0
+    wait_calls = 0
+    wait_limits: list[int] = []
     group = f"/user.slice/{names[-1]}"
     images = {
         "manager": "/usr/lib/systemd/systemd",
@@ -1925,14 +1949,28 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
             if case == "bad-stat":
                 return b"secret malformed stat"
             state = "R" if case == "state-change" and count == 1 else "S"
-            ticks = 101 if case == "ticks-change" and count > 1 else 100
+            ticks = (
+                101
+                if (case == "ticks-change" and count > 1)
+                or (case == "wait-ticks-change" and count > 2)
+                else 100
+            )
             return f"42 (secret ) (name) {state} {'0 ' * 18}{ticks}\n".encode()
         if path.name == "status":
             if case == "bad-uid":
                 return b"Uid:\ttrue 1 1 1\n"
-            value = 0 if case == "uid-mismatch" or (case == "uid-change" and count > 1) else uid
+            value = (
+                0
+                if case == "uid-mismatch"
+                or (case == "uid-change" and count > 1)
+                or (case == "wait-uid-change" and count > 2)
+                else uid
+            )
             return f"Name:\tsecret\nUid:\t{value}\t{value}\t{value}\t{value}\n".encode()
-        current = "/foreign" if case == "proc-group-change" and count > 1 else group + "/init.scope"
+        changed = (case == "proc-group-change" and count > 1) or (
+            case == "wait-proc-group-change" and count > 2
+        )
+        current = "/foreign" if changed else group + "/init.scope"
         return f"0::{current}\n".encode()
 
     monkeypatch.setattr(linux_transaction, "_read_regular", read_proc)
@@ -1940,7 +1978,7 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
     async def query(
         argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
     ) -> dict[str, Any]:
-        nonlocal clock, image_calls, binding_calls
+        nonlocal clock, image_calls, binding_calls, wait_calls
         assert not merge_stderr
         assert 0 < timeout <= 5 and 0 < limit <= ci.OUTPUT_BYTES
         calls.append(argv)
@@ -1951,11 +1989,56 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
                 return {"exit_code": 1, "output": "", "stderr": "secret permission body"}
             kind = (
                 "executor"
-                if case == "executor" or (case == "exe-change" and image_calls > 1)
+                if case == "executor"
+                or (case == "exe-change" and image_calls > 1)
+                or (case == "wait-exe-change" and image_calls > 2)
                 else "manager"
             )
             image = "/private/secret/systemd" if case == "other-image" else images[kind]
             return {"exit_code": 0, "output": image + "\n", "stderr": ""}
+        if argv[:4] == ["sudo", "--non-interactive", "--", "cat"]:
+            assert argv == ["sudo", "--non-interactive", "--", "cat", "--", "/proc/42/wchan"]
+            assert binding_calls == 2 and proc_calls.count("stat") == 2
+            if wait_limits:
+                assert limit < wait_limits[-1] or (
+                    case == "wait-empty" and limit == wait_limits[-1]
+                )
+            wait_limits.append(limit)
+            wait_calls += 1
+            if case == "wait-permission":
+                return {"exit_code": 1, "output": "", "stderr": "secret permission body"}
+            if case == "wait-oserror":
+                raise OSError("secret read failure")
+            if case == "wait-cancel":
+                raise asyncio.CancelledError
+            if case == "wait-deadline":
+                clock = 105.0
+            token = {
+                "wait-child": "do_wait\n",
+                "wait-ep-poll": "ep_poll",
+                "wait-epoll": "do_epoll_wait\n",
+                "wait-other": "unknown_private_symbol\n",
+                "wait-suffix": "do_wait.isra.0\n",
+                "wait-empty": "",
+                "wait-whitespace": "do_wait secret\n",
+                "wait-nonascii": "\u79d8\u5bc6\n",
+            }.get(case, "0\n")
+            if case == "wait-change":
+                token = "do_wait\n" if wait_calls == 1 else "ep_poll\n"
+            if case in {
+                "wait-pid-change",
+                "wait-group-change",
+                "wait-ticks-change",
+                "wait-proc-group-change",
+                "wait-exe-change",
+                "wait-uid-change",
+            }:
+                token = "do_wait\n"
+            return {
+                "exit_code": 0,
+                "output": "x" * (limit + 1) if case == "wait-budget" else token,
+                "stderr": "x" * (limit + 1) if case == "wait-stderr-budget" else "",
+            }
         assert argv[:2] == ["busctl", "--system"] and "--user" not in argv
         assert "--auto-start=no" in argv
         assert all(
@@ -2017,6 +2100,11 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
                             rows["MainPID"] = ("u", 43)
                         if case == "typed-group-change":
                             rows["ControlGroup"] = ("s", "/foreign")
+                    if binding_calls > 2:
+                        if case == "wait-pid-change":
+                            rows["MainPID"] = ("u", 43)
+                        if case == "wait-group-change":
+                            rows["ControlGroup"] = ("s", "/foreign")
                 output = "\n".join(
                     json.dumps({"type": rows[field][0], "data": rows[field][1]}) for field in fields
                 )
@@ -2024,6 +2112,11 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
 
     monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
     monkeypatch.setattr(process, "run_process", query)
+    if case == "wait-cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await worker.diagnose_setup(user, uid, home, 105.0)
+        assert wait_calls == 1 and calls[-1][-1] == "/proc/42/wchan"
+        return
     value = await worker.diagnose_setup(user, uid, home, 105.0)
     assert "secret" not in json.dumps(value) and len(value["units"]) <= 2
     proc_cases = {
@@ -2046,6 +2139,9 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
         "bad-stat",
         "bad-uid",
     }
+    wait_case = case.startswith("wait-")
+    if wait_case:
+        proc_cases.add(case)
     if case in proc_cases | {"absent"}:
         assert value["failure"] == "none" and len(value["units"]) == 2
         assert [item["unit"] for item in value["units"]] == list(names)
@@ -2057,18 +2153,36 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
                 for item in value["units"]
             )
             observed = value["process"]
-            if case in {"present", "executor", "other-image", "uid-mismatch", "state-change"}:
+            if wait_case or case in {
+                "present",
+                "executor",
+                "other-image",
+                "uid-mismatch",
+                "state-change",
+            }:
                 assert observed == {
                     "code": "observed",
                     "exe": {"executor": "executor", "other-image": "other"}.get(case, "manager"),
                     "uid_matches": case != "uid-mismatch",
                     "state": "S",
+                    "wait": {
+                        "wait-child": "child_wait",
+                        "wait-ep-poll": "epoll_wait",
+                        "wait-epoll": "epoll_wait",
+                        "wait-other": "other",
+                        "wait-suffix": "other",
+                    }.get(case, "unavailable"),
                 }
-                assert (
-                    image_calls == 2
-                    and proc_calls.count("stat") == 2
-                    and proc_calls.count("status") == 2
-                )
+                assert image_calls >= 2 and proc_calls.count("stat") >= 2
+                assert proc_calls.count("status") >= 2
+                assert 1 <= wait_calls <= 2
+                if not wait_case:
+                    assert image_calls == 2 and proc_calls.count("stat") == 2
+                    assert proc_calls.count("status") == 2
+                if observed["wait"] != "unavailable":
+                    assert wait_calls == 2 and binding_calls == 3
+                    assert image_calls == 3 and proc_calls.count("stat") == 3
+                    assert proc_calls.count("status") == 3
             else:
                 code = {
                     "exe-permission": "unavailable",
@@ -2084,7 +2198,9 @@ async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
                     "exe": "unavailable",
                     "uid_matches": None,
                     "state": "",
+                    "wait": "unavailable",
                 }
+                assert wait_calls == 0
                 if case == "no-pid":
                     assert proc_calls == [] and image_calls == 0
         else:
@@ -2166,6 +2282,10 @@ def test_setup_diagnostic_cli_keeps_separate_readonly_mode(
         "state-text",
         "unavailable-detail",
         "observed-unavailable",
+        "wait-symbol",
+        "wait-type",
+        "missing-wait",
+        "unavailable-wait",
     ],
 )
 def test_process_diagnostic_export_rejects_noncanonical_or_private_fields(change: str) -> None:
@@ -2174,6 +2294,7 @@ def test_process_diagnostic_export_rejects_noncanonical_or_private_fields(change
         "exe": "manager",
         "uid_matches": True,
         "state": "S",
+        "wait": "child_wait",
     }
     assert ci.process_facts(value)
     if change == "extra":
@@ -2188,8 +2309,17 @@ def test_process_diagnostic_export_rejects_noncanonical_or_private_fields(change
         value["state"] = "private-state"
     elif change == "unavailable-detail":
         value["code"] = "unavailable"
-    else:
+    elif change == "observed-unavailable":
         value["exe"] = "unavailable"
+    elif change == "wait-symbol":
+        value["wait"] = "do_wait"
+    elif change == "wait-type":
+        value["wait"] = []
+    elif change == "missing-wait":
+        del value["wait"]
+    else:
+        value.update(worker.process_unavailable())
+        value["wait"] = "child_wait"
     assert not ci.process_facts(value)
 
 

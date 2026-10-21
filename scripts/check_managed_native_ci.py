@@ -287,12 +287,14 @@ def process_facts(value: object) -> bool:
     """Export a finite observation window, never raw proc fields or paths."""
     if (
         not isinstance(value, dict)
-        or set(value) != {"code", "exe", "uid_matches", "state"}
+        or set(value) != {"code", "exe", "uid_matches", "state", "wait"}
         or not isinstance(value["code"], str)
         or value["code"] not in PROCESS_CODES
         or not isinstance(value["exe"], str)
         or value["exe"] not in {"manager", "executor", "other", "unavailable"}
         or not isinstance(value["state"], str)
+        or not isinstance(value["wait"], str)
+        or value["wait"] not in {"child_wait", "epoll_wait", "other", "unavailable"}
     ):
         return False
     if value["code"] == "observed":
@@ -301,7 +303,12 @@ def process_facts(value: object) -> bool:
             and type(value["uid_matches"]) is bool
             and value["state"] in PROCESS_STATES
         )
-    return value["exe"] == "unavailable" and value["uid_matches"] is None and value["state"] == ""
+    return (
+        value["exe"] == "unavailable"
+        and value["uid_matches"] is None
+        and value["state"] == ""
+        and value["wait"] == "unavailable"
+    )
 
 
 def setup_facts(value: object) -> bool:
@@ -1267,6 +1274,7 @@ class NativeCI:
                 "exe": "unavailable",
                 "uid_matches": None,
                 "state": "",
+                "wait": "unavailable",
             },
         }
         end = time.monotonic() + CLEANUP_SECONDS

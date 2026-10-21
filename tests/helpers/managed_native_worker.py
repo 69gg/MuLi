@@ -388,7 +388,25 @@ def system_executables() -> dict[str, str]:
 
 
 def process_unavailable(code: str = "not_started") -> dict[str, Any]:
-    return {"code": code, "exe": "unavailable", "uid_matches": None, "state": ""}
+    return {
+        "code": code,
+        "exe": "unavailable",
+        "uid_matches": None,
+        "state": "",
+        "wait": "unavailable",
+    }
+
+
+def process_wait(first: bytes, last: bytes) -> str:
+    """Classify exact known kernel symbols without exporting their raw text."""
+    first, last = first.removesuffix(b"\n"), last.removesuffix(b"\n")
+    if first != last or re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_.]*", first) is None:
+        return "unavailable"
+    return {
+        b"do_wait": "child_wait",
+        b"ep_poll": "epoll_wait",
+        b"do_epoll_wait": "epoll_wait",
+    }.get(first, "other")
 
 
 async def observe_setup_process(
@@ -471,12 +489,39 @@ async def observe_setup_process(
         require(state in PROCESS_STATES, "native_diagnostic_invalid")
         known = system_executables()
         remaining(deadline)
-        return {
+        result = {
             "code": "observed",
             "exe": next((kind for kind, value in known.items() if value == last_image), "other"),
             "uid_matches": all(value == uid for value in last_uids),
             "state": state,
+            "wait": "unavailable",
         }
+        # Preserve the completed identity observation if this optional read fails.
+        # Its final gate extends the same window and uses the same absolute deadline.
+        try:
+            first_wait = await required("wchan")
+            last_wait = await required("wchan")
+            wait = process_wait(first_wait, last_wait)
+            if wait == "unavailable":
+                return result
+            wait_uids = await uids()
+            wait_image = await image()
+            wait_group = await cgroup()
+            wait_ticks = _start_ticks(await required("stat"), pid)
+            wait_binding = await probe._properties(path, "Service", fields)
+            require(
+                last_uids == wait_uids
+                and last_image == wait_image
+                and last_group == wait_group
+                and last_ticks == wait_ticks
+                and after == wait_binding,
+                "native_process_changed",
+            )
+            remaining(deadline)
+            result["wait"] = wait
+        except (OSError, ValueError):
+            pass
+        return result
     except TimeoutError:
         return process_unavailable("timeout")
     except OSError:
@@ -696,13 +741,20 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
             from muli.platforms.linux_transaction import _read_regular
 
             require(
-                0 < pid < 2**31 and name in {"stat", "status", "cgroup", "exe"},
+                0 < pid < 2**31 and name in {"stat", "status", "cgroup", "exe", "wchan"},
                 "native_diagnostic_command",
             )
             remaining(deadline)
-            if name == "exe":
+            if name in {"exe", "wchan"}:
                 result = await command(
-                    ["sudo", "--non-interactive", "--", "readlink", "--", f"/proc/{pid}/exe"],
+                    [
+                        "sudo",
+                        "--non-interactive",
+                        "--",
+                        "readlink" if name == "exe" else "cat",
+                        "--",
+                        f"/proc/{pid}/{name}",
+                    ],
                     timeout=CLEANUP_SECONDS,
                     limit=MAX_BYTES,
                 )

@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境修补的 112 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮在更早的 manager 准备阶段超时，仍未执行事务，新增分阶段诊断正按以下有限合同实现。环境修补、三事务和正常服务收尾未验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、分阶段进程观察与等待分类的 191 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五至七轮仍未执行事务；第七轮已观察到 manager 镜像，但未确定其等待原因，新增等待分类尚待远端。环境修补、三事务和正常服务收尾未验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -169,7 +169,7 @@ PR [#37](https://github.com/69gg/MuLi/pull/37) 的首轮精确候选为签名提
 
 receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 manager 观察成功：`user-runtime-dir@999.service` 为 loaded/active/exited、退出成功、PID/job 均为 0；`user@999.service` 为 loaded/activating/start，MainPID 2342、job 1891、cgroup 存在。后者的 Result 字段为 success 不代表启动完成；本轮仍在 manager 准备阶段、没有 harness 结果或事务。清理报 `native_cleanup_deadline`，账户/组未标记删除、三个挂载仍在 receipt，不宣称资源回收成功。
 
-固定 v255 源码不支持将该结果直接归为设置自身 D-Bus 地址后同步等待自己：`manager_dbus_is_running` 先检查 dbus.socket 与 dbus.service，核心 API bus 初始化被其门控；用户地址的默认值原本就是 `unix:path=$XDG_RUNTIME_DIR/bus`，Hello 和名称申请为异步。用户 manager 到达 basic.target 才发送 READY。另一方面，notify service 在 PAM 和最终 exec 前便登记初始 MainPID，故目前也不能从 PID 推断已在运行 manager。以上只排除一个直接等待机制，不排除外部 PAM/generator 或其它准备步骤，不能作为移除环境、改 no-block 或提高期限的依据。
+固定 v255 源码不支持将该结果直接归为设置自身 D-Bus 地址后同步等待自己：`manager_dbus_is_running` 先检查 dbus.socket 与 dbus.service，核心 API bus 初始化被其门控；用户地址的默认值原本就是 `unix:path=$XDG_RUNTIME_DIR/bus`，Hello 和名称申请为异步。用户 manager 在 basic.target 活跃时发送 READY；进入主循环后，启动 jobs 全部结束也会走 READY 路径。另一方面，notify service 在 PAM 和最终 exec 前便登记初始 MainPID，故目前也不能从 PID 推断已在运行 manager。以上只排除一个直接等待机制，不排除外部 PAM/generator 或其它准备步骤，不能作为移除环境、改 no-block 或提高期限的依据。
 
 对应固定源码：[API bus 门控](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L1814)、[用户地址选择](https://github.com/systemd/systemd/blob/v255/src/libsystemd/sd-bus/sd-bus.c#L1336)、[异步 Hello](https://github.com/systemd/systemd/blob/v255/src/libsystemd/sd-bus/sd-bus.c#L585)、[basic.target 就绪通知](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L3743)、[notify 主 PID 登记](https://github.com/systemd/systemd/blob/v255/src/core/service.c#L2198)、[PAM 先于最终 exec](https://github.com/systemd/systemd/blob/v255/src/core/exec-invoke.c#L4173)。
 
@@ -184,6 +184,34 @@ receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 
 本片新增 **29 个唯一纯 case**：原 8 项系统查询例扩展 17 项进程窗口反例，另有 7 项输出白名单和 5 项实际固定路径/文件归属分类例。定向 37 项（含原 8 项）通过 0.23 秒；完整 **165 个唯一 case**（原 136 加新 29）通过 0.58 秒、服务 1.128 秒、峰值 80.9 MiB/swap 0。补强有限 proc 读取参数必须使用剩余预算、且逐次严格递减的断言后，受影响 25 项再次通过 0.22 秒，不另计唯一数。权限拒绝、读失败、超预算和内部捕获的期限错误均验证原两个 unit 事实仍保留；整包晚到的既有拒收门保持，未模拟真实 PAM 或 manager 启动。
 
 三份 Python 文件 Ruff/format 及两脚本 strict mypy 通过。首次类型命令未指定 worktree 源路径，使依赖被当作无类型安装包，报 6 处 `no-any-return`（含既有位置），峰值 224.2 MiB；显式 `MYPYPATH=src` 后通过，峰值 189.3 MiB，没有改类型规则或既有业务逻辑。所有命令逐条经 root 绝对路径守卫、每条 30 秒串行，swap 均为 0，没有本机原生 harness、CLI、manager、账户或挂载效果。第六轮根因仍未证明，三个真实事务及正常清理继续待后续精确远端候选验收。
+
+## 第七轮结果与等待观察（纯验完成，远端待验）
+
+精确签名 `7a0ece9b3274c229a687c0514478b9dea55e379f` 的 [CI 39585202872](https://github.com/69gg/MuLi/actions/runs/39585202872) 已九项终态：八项成功，仅 [native 119172272430](https://github.com/69gg/MuLi/actions/runs/39585202872/job/119172272430) 失败。1103 字节 [evidence](https://github.com/69gg/MuLi/actions/runs/39585202872/artifacts/12338678601) 含 receipt 1140 字节及 result 846 字节，zip SHA256 为 `df2994ec8d7fa800f764b7fced52e2ef96c18e069c0a490b31edca33c34ebb13`。阶段仍为 `manager_start_before`，user@ 为 activating/start、PID 2527/job 1824，cgroup 存在。进程窗口为 `observed/manager/uid_matches=true/state=S`，证明观察时已经是专用 UID 的 manager 镜像；它不再是当时仍在 executor/PAM 最终 exec 前的窗口，但 S 不能说明具体等待原因。仍为 **0 个事务**，没有 harness 结果；清理期限失败，账户/组及三个挂载没有回收成功证明。
+
+固定 v255 的实际边界是：`manager_startup` 先同步运行 environment generators 和 generators，再枚举、加载及准备 manager 的 sockets；之后 `main` 才排入默认 target job 并进入 `manager_loop`。generator 的 `execute_directories → execute_strv` 会 fork 中间进程并等待它退出，因此 manager 镜像已经运行时，仍可能在主循环前同步等待孩子。进入循环后，`manager_check_finished` 在 basic.target 活跃或启动 jobs 清空时发送 READY。以上列出可发生的阶段，不证明本次停在 generator 或某个具体 job。[固定启动顺序与 READY](https://github.com/systemd/systemd/blob/v255/src/core/manager.c)、[默认 target 到主循环](https://github.com/systemd/systemd/blob/v255/src/core/main.c)、[同步 generator 执行与等待](https://github.com/systemd/systemd/blob/v255/src/shared/exec-util.c)。
+
+候选观察的取舍如下；首片选择第一项，不增加第二套查询或进程树框架：
+
+| 候选 | 能取得的最小收益 | 本轮取舍 |
+| --- | --- | --- |
+| 在原 MainPID 身份窗口内读有限 `wchan` | 区分命中已核内核符号的 child wait、epoll wait 与未知等待 | 首选；沿现有 derived proc 路径与剩余预算，新增一个固定类别 |
+| 用户 manager 的 typed Manager/Jobs | 成功时可直接看到 manager/job 状态 | 暂不选；`busctl --address` 仍设 bus-client，不能据此当 peer；`--auto-start=no` 只约束消息，不能证明连接用户 bus 不触发 socket activation；现有 systemctl 用户连接又有 fallback，不能把失败当 manager 未进入主循环的证明 |
+| 有限 direct children | 仅能提供某个已绑定直接孩子当时存在的正向事实 | 暂不选；不冻结孩子时 children 列表可能遗漏，空列表不能证明无孩子；中间 generator wrapper 本身也可能仍是 systemd 镜像，额外身份读取不能直接确定具体 generator |
+
+用户 bus 的取舍依据为固定 v255 [busctl acquire_bus](https://github.com/systemd/systemd/blob/v255/src/busctl/busctl.c)、[用户 manager 连接及 fallback](https://github.com/systemd/systemd/blob/v255/src/shared/bus-util.c) 与 [private listener](https://github.com/systemd/systemd/blob/v255/src/core/dbus.c)；本方案不另写 D-Bus/ctypes 客户端。
+
+本片实现沿用已批准的最小 proc 合同：
+
+- 原两个 typed unit 与现有 PID/startticks、typed MainPID/ControlGroup、proc cgroup、exe/UID 前后门保持。先完成并保存原进程观察，再对这次已绑定 PID 在同一绝对期限内读两次 `wchan`；只有两次 token 相同且尾部 UID/exe/cgroup/startticks/typed 绑定仍与原观察一致才发布类别。原窗口本身变化仍拒绝原进程事实，附加尾门变化仅拒绝新增类别；此前已经验证的有限窗口不被回溯当作原子快照。不轮询、不 sleep、不暂停进程。跨 UID 必要时仅沿既有有限 sudo 命令读取精确 `/proc/<typed PID>/wchan`，不提升整个 worker。
+- 只导出 `child_wait`、`epoll_wait`、`other` 或 `unavailable`。固定已核符号 `do_wait` 归为前者，`ep_poll`/`do_epoll_wait` 归为后者；不做子串或函数名模糊匹配。`0`、空值、权限拒绝、格式坏、两次值变化或绑定变化不能声称没有等待。未知内核符号归 other，不新增符号搜集/内核版本下载。原始符号、stack、argv、env、comm 与私有路径不导出。
+- `wchan` 是内核睡眠位置而不是用户态调用栈。`child_wait` 只支持观察时在对应 child-wait 内核路径，不能指定哪个孩子、generator、PAM 或等待多久；`epoll_wait` 只支持当时的内核 epoll 等候，不能证明已进入 `manager_loop`、basic.target 已活跃或 READY 已被接收。两次读取及身份门仍不构成全字段原子快照。[proc wchan 合同](https://man7.org/linux/man-pages/man5/proc_pid_wchan.5.html)、[固定 Linux v6.8 child wait](https://github.com/torvalds/linux/blob/v6.8/kernel/exit.c)、[固定 Linux v6.8 epoll wait](https://github.com/torvalds/linux/blob/v6.8/fs/eventpoll.c)。这些内核源码仅用于已知符号的语义，不声称已经核定 runner 的精确内核版本或保证符号稳定。
+- 新字节、命令 stdout/stderr 与原观察共用已有 **5 秒绝对期限、32 KiB 累计上限**，没有独立额度。wchan 自身读取失败只让新增类别 unavailable，不抹掉已经验证的 unit/进程事实；身份改变不能发布等待类别。内部可捕获错误与外层杀掉 worker/迟到整包拒收的区别继续保持。功能、清理、环境、Type、start 阻塞语义与资源上限均不变。
+- 未来若上述结果仍不足，再单独审最多 4 个 direct child 的正向观察：只读该主线程的 children 候选，不扫 `/proc` 或递归；每个孩子须前后 PPid 等于原父 PID、子 PID/startticks 稳定、同专用 cgroup，并且父身份门仍成立。无论空集、退出、遗漏或超限都不能推出无子进程或授予 stop/kill 权限。本轮不实现该分支。[children 非冻结读取限制](https://man7.org/linux/man-pages/man5/proc_tid_children.5.html)。
+
+本片新增 **26 个唯一纯 case**：22 项等待分类/读取/尾部门控与 4 项新增字段导出拒绝，覆盖固定类别、未知/零值/畸形 token、两次变化、身份/权限/剩余字节/原 deadline，以及内部失败仍保留旧事实；取消继续传播。它们通过原 `diagnose_setup` 和注入的命令读取，所有真实 subprocess 入口仍由模块 fixture 硬拒绝。22 项定向组通过 0.20 秒、峰值 71 MiB/swap 0；完整 **191 个唯一 case**（原 165 加新 26）通过 0.60 秒、服务 1.135 秒、峰值 81.6 MiB/swap 0，定向重叠不另计。首次定向组的空响应例失败于夹具要求：两次响应均为零字节时，剩余字节预算可以相同；仅为该例放宽为允许相等后通过，非空响应仍要求递减，没有修改产品预算。
+
+三份 Python 文件 Ruff/format 与两脚本 strict mypy 均通过；格式检查发现的两处排版已修正。本轮最高峰值为类型检查的 **159.1 MiB/swap 0**。所有命令逐条经 root 绝对路径守卫、每条 30 秒串行，没有本机原生 harness、CLI、manager、账户或挂载效果。根与独立审查均未发现确定 P1/P2；本片只增加诊断，所有真实 MainPID、wchan 与 manager 等待阶段仍只能由下一精确托管候选验收，三个真实事务与正常清理尚未通过。
 
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 
