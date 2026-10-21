@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import secrets
 from typing import Any
 from urllib.parse import quote
@@ -59,6 +60,13 @@ class Weixin(Adapter):
             delivery=delivery,
             timeout=timeout,
         )
+        if method == "sendmessage":
+            for field in ("ret", "errcode"):
+                if field not in result:
+                    continue
+                value = result[field]
+                if type(value) is not int and not (type(value) is float and math.isfinite(value)):
+                    raise ChannelError("iLink 发送回执格式错误", uncertain=True)
         code = result.get("ret", 0) or result.get("errcode", 0)
         if code:
             raise ChannelError(
