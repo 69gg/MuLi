@@ -15,6 +15,8 @@ from typing import Any
 from muli.config import ConfigFile
 from muli.store import Store, new_id, now
 
+_TENCENT_SILK_HEADER = b"\x02#!SILK_V3"
+
 SAFE_INLINE = {
     "image/png",
     "image/jpeg",
@@ -44,7 +46,7 @@ async def file_io[T](operation: Callable[[], T]) -> T:
 
 
 def detected_media(header: bytes, claimed: str) -> str:
-    """Only known passive media gets an inline preview; claimed HTML/SVG stays a file."""
+    """Recognize media signatures; MIME detection does not grant inline preview."""
     claimed = claimed.lower().split(";", 1)[0].strip()
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -59,6 +61,8 @@ def detected_media(header: bytes, claimed: str) -> str:
             return "audio/wav"
     if header.startswith(b"fLaC"):
         return "audio/flac"
+    if len(header) > len(_TENCENT_SILK_HEADER) and header.startswith(_TENCENT_SILK_HEADER):
+        return "audio/silk"
     if header.startswith(b"ID3") or (
         len(header) > 1 and header[0] == 255 and header[1] & 224 == 224
     ):
