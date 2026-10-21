@@ -1,6 +1,6 @@
 # 固定 controller 的 V2 helper 入口
 
-状态：实现并通过离线替身回归，根任务独立源码审查通过。本片提供固定 controller 入口及受限 helper 驱动，尚未把公开迁入命令、管理宿主或服务启动链全部接通；不表示 A/B 升级已可发布。
+固定 controller 入口及受限 helper 驱动已实现，通过下述离线回归及独立源码审查。公开迁入、管理宿主和服务启动链已接线；完整验收状态见[本地托管切换](managed-operations.md)。
 
 稳定 launcher 的恢复命令为固定 controller 的词法 Python 入口：
 
@@ -10,7 +10,7 @@ controller-python -I -m muli.managed_host --root ROOT recover
 
 `recover` 使用现有 launcher 的只读恢复路由核验 root、V2 record、固定 anchor 和 controller，再在原 journal 锁下调用 `ensure_managed_helper`。它不读取当前 selector、不导入 selected target，不构造 Runtime、Store 或 effects backend，也不直接 stop、install、start 或 activate。root 使用 anchor 冻结的路径；数据库须为 Runtime 既有的 `data_dir/muli.sqlite3`。配置/数据库只核无链接路径链及普通所有者文件，不读取 SQLite 内容。
 
-`ensure_managed_helper(control, anchor)` 供后续管理宿主复用，调用者已持有同 journal 锁。调用进程可为当前 base/target；新 helper 的 executable 始终来自固定 controller。unit 名由 protocol 2、deployment digest 与完整 generation 共同摘要得到。同一代只使用该名称；已存在时必须通过现有 `SystemdProbe.read_helper` 核验 argv、PID、cgroup、资源属性及内核限制，不能 reset、改名或另起 helper。只有明确不存在时才调用一次 `systemd-run`，成功仅返回 `accepted`，不声称运行或恢复成功。
+`ensure_managed_helper(control, anchor)` 已由管理宿主复用，调用者已持有同 journal 锁。调用进程可为当前 base/target；新 helper 的 executable 始终来自固定 controller。unit 名由 protocol 2、deployment digest 与完整 generation 共同摘要得到。同一代只使用该名称；已存在时必须通过现有 `SystemdProbe.read_helper` 核验 argv、PID、cgroup、资源属性及内核限制，不能 reset、改名或另起 helper。只有明确不存在时才调用一次 `systemd-run`，成功仅返回 `accepted`，不声称运行或恢复成功。
 
 实际 transient helper 命令为：
 
@@ -34,4 +34,4 @@ CLI 只接受精确的 `--root ROOT recover|run` 三参数，不接受缩写、�
 
 全部检查串行经过统一 guard，每次 30 秒、1 GiB、共享 2 GiB/1 CPU、swap 0。新增 30 项按不重叠三批 7/16/7 全部通过，分别为 1.63/2.22/10.87 秒；原 V1 helper 完整 24 项通过，2.12 秒。两个源码严格 mypy、三个 Python 文件 Ruff/格式及 diff 检查通过。测试最高峰 65.5 MiB，整轮最高峰 123.3 MiB 来自 mypy；没有提高资源上限或运行真实 systemd/service。
 
-本片不启动真实服务，不安装或下载候选，不开用户数据库，也不认证完整 Python 依赖环境。公开 CLI/服务/管理事务的完整闭环仍由后续接线及临时进程验收证明；本片 fake 服务结果不能代替该证明。
+本模块测试不启动真实服务，不安装或下载候选，不开用户数据库，也不认证完整 Python 依赖环境。公开 CLI/服务/管理事务已接线，其[临时进程验收](managed-process-recovery.md)单独记录；本片 fake 服务结果不能代替该证明。

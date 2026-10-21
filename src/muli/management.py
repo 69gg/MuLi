@@ -12,6 +12,8 @@ from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
 from muli.extensions import ExtensionError
 from muli.maintenance import MaintenanceError
+from muli.managed_boot import ManagedBootPermit
+from muli.managed_requests import LocalCandidate, validate_candidate
 from muli.management_host import RecoveryHost
 from muli.plugins import PluginManager
 from muli.proactive import FrozenRouting
@@ -37,6 +39,8 @@ class SelfManagement:
         plugins: PluginManager,
         service: UserService,
         apply_settings: ApplySettings,
+        *,
+        bound_address: tuple[str, int] | None = None,
     ) -> None:
         self.runtime, self.plugins, self.service, self.apply_settings = (
             runtime,
@@ -47,7 +51,7 @@ class SelfManagement:
         self.directory = runtime.data_dir / "management"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.updates = Updates(runtime.config, runtime.store, runtime.bus)
-        self.recovery = RecoveryHost(runtime, service)
+        self.recovery = RecoveryHost(runtime, service, bound_address=bound_address)
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._check: asyncio.Task[dict[str, Any]] | None = None
@@ -87,21 +91,42 @@ class SelfManagement:
         version: str = "",
         *,
         apply_mode: Literal["in_process", "restart_transaction"] = "in_process",
+        candidate: LocalCandidate | None = None,
     ) -> dict[str, Any]:
         await self.recovery.project()
         self.runtime.maintenance.require_configuration()
-        if action not in {"configure", "restart", "update"}:
+        if action not in {"configure", "restart", "update", "adopt", "switch"}:
             raise ValueError("未知管理操作")
+        validate_candidate(action, candidate)
+        if action != "configure" and changes:
+            raise ValueError("只有配置操作接受配置变更")
         if action == "update":
             self.updates.require_in_place_update()
         if apply_mode not in {"in_process", "restart_transaction"}:
             raise ValueError("未知配置应用方式")
-        if action == "restart":
+        if action in {"restart", "adopt", "switch"}:
+            apply_mode = "restart_transaction"
+        current = self.runtime.config.settings
+        candidate_settings = (
+            self.runtime.config.validate_changes(changes or {})
+            if action == "configure"
+            else current
+        )
+        if (current.server.host, current.server.port) != (
+            candidate_settings.server.host,
+            candidate_settings.server.port,
+        ):
             apply_mode = "restart_transaction"
         if apply_mode == "restart_transaction":
             if action == "update":
                 raise ValueError("跨版本恢复更新尚未支持")
-            await self.recovery.verify()
+            self.recovery.require_listener(candidate_settings)
+            if action in {"adopt", "switch"} or isinstance(
+                self.runtime.maintenance.permit, ManagedBootPermit
+            ):
+                self.recovery.require_managed_request(action)
+            else:
+                await self.recovery.verify()
             self.runtime.maintenance.require_configuration()
         if any(item["status"] in {"pending", "applying"} for item in self.plans()):
             raise ValueError("已有待应用管理操作，请等待完成或取消后再提交")
@@ -112,6 +137,13 @@ class SelfManagement:
             else Settings.model_validate(settings.model_dump())
         )
         self.runtime.validate_proactive_settings(target)
+        if apply_mode == "restart_transaction":
+            self.recovery.require_listener(target)
+        elif (settings.server.host, settings.server.port) != (
+            target.server.host,
+            target.server.port,
+        ):
+            raise MaintenanceError("configuration_changed")
         identifier = new_id()
         # Secrets remain in a private configuration snapshot, never in the public journal.
         path = self.directory / f"{identifier}.json"
@@ -130,6 +162,8 @@ class SelfManagement:
             "changed_sections": sorted(changes or {}),
             "routing": FrozenRouting.bound(self.runtime.current_reply_origin()).dump(),
         }
+        if candidate is not None:
+            item["candidate"] = candidate.model_dump()
         try:
             self.runtime.store.event("management.queued", item, objects=[("management", item)])
         except BaseException:
@@ -349,6 +383,15 @@ class SelfManagement:
         async def restart(args: dict[str, Any]) -> Any:
             return await self.stage("restart")
 
+        async def recover(args: dict[str, Any]) -> Any:
+            return await self.recovery.recover()
+
+        async def adopt(args: dict[str, Any]) -> Any:
+            return await self.stage("adopt", candidate=LocalCandidate.model_validate(args))
+
+        async def switch(args: dict[str, Any]) -> Any:
+            return await self.stage("switch", candidate=LocalCandidate.model_validate(args))
+
         async def update(args: dict[str, Any]) -> Any:
             from muli.updates import release_version
 
@@ -367,7 +410,7 @@ class SelfManagement:
             ),
             Tool(
                 "self_configure",
-                "校验配置补丁并排队，所有当前工作结束后应用；无需结束主身份",
+                "校验配置补丁并排队，空闲后应用；监听 host/port 变更须通过受支持的恢复重启事务",
                 parameters(
                     {
                         "changes": {"type": "object"},
@@ -401,6 +444,28 @@ class SelfManagement:
                 parameters({}),
                 restart,
                 "write",
+            ),
+            Tool(
+                "self_recover",
+                "确认宿主绑定并恢复当前管理事务代；不新建事务、不续期、不重试结果未知的业务效果",
+                parameters({}),
+                recover,
+                "write",
+            ),
+            Tool(
+                "self_adopt",
+                "将当前 Linux 用户服务迁入可恢复托管；提供当前保留安装的三个绝对路径，排队后验证",
+                LocalCandidate.model_json_schema(),
+                adopt,
+                "write",
+            ),
+            Tool(
+                "self_switch",
+                "校验并切换到已在本地保留的兼容安装；不下载，失败可回退，须真实用户批准",
+                LocalCandidate.model_json_schema(),
+                switch,
+                "external",
+                requires_approval=True,
             ),
             Tool(
                 "self_update",

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { settingsPatch, setPath, getPath, settingsExtras, mergeSettingsExtras, selectProactiveDestination, MODEL_ROLES, SETTINGS_GROUPS } from "../../web/settings.mjs";
+import { settingsPatch, changesListener, setPath, getPath, settingsExtras, mergeSettingsExtras, selectProactiveDestination, MODEL_ROLES, SETTINGS_GROUPS } from "../../web/settings.mjs";
 
 test("untouched redacted credentials and empty secret controls never enter PATCH", () => {
   const original = { models: { main: { model: "model-one", api_key_set: true, extra_headers: { Authorization: "***" } } }, chiliarch: { credential_set: true } };
@@ -43,6 +43,24 @@ test("password flags and blank password controls stay private while explicit cha
   assert.deepEqual(settingsPatch(original, { server: { ...original.server, password: "", clear_password: false } }), {});
   assert.deepEqual(settingsPatch(original, { server: { ...original.server, password: "new-value" } }), { server: { password: "new-value" } });
   assert.deepEqual(settingsPatch(original, { server: { ...original.server, clear_password: true } }), { server: { clear_password: true } });
+});
+
+test("only actual host or port edits require a listener transaction and retain the full patch", () => {
+  const original = { server: { host: "127.0.0.1", port: 8765, password_set: true }, persona: { name: "沐璃" } };
+  const draft = structuredClone(original);
+  draft.server.password = "";
+  draft.persona.name = "新称呼";
+  assert.equal(changesListener(settingsPatch(original, draft)), false);
+  for (const [key, value] of [["host", "localhost"], ["port", 8766]]) {
+    const changed = structuredClone(draft);
+    changed.server[key] = value;
+    const patch = settingsPatch(original, changed);
+    assert.equal(changesListener(patch), true);
+    assert.deepEqual(patch, { server: { [key]: value }, persona: { name: "新称呼" } });
+    changed.server[key] = original.server[key];
+    assert.equal(changesListener(settingsPatch(original, changed)), false);
+  }
+  assert.equal(changesListener({ server: { password: "new-value", clear_password: true } }), false);
 });
 
 test("channel flags and empty secret fields never enter a configuration patch", () => {

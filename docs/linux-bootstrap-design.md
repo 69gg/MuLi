@@ -1,6 +1,6 @@
 # Linux 启动前 writer 保护
 
-状态：启动保护模块已随 2.19.0 接入 `serve`、Runtime 和 lifespan，并完成独立入口回归。模块自身不启动 helper、不准备或发布事务；整体整合与真实服务验证边界见[恢复入口](linux-recovery-operations.md)。
+状态：启动保护模块已随 2.19.0 接入 `serve`、Runtime 和 lifespan，并完成独立入口回归。模块自身不启动 helper、不准备或发布事务；同版本整合见[恢复入口](linux-recovery-operations.md)，2.22 开发分支的 V2 分派与未验证边界见[本地托管切换](managed-operations.md)。
 
 `open_boot_session(service, database, *, probe=None, managed_root=None, managed_probe=None)` 在 ConfigFile 和 Store 构造之前运行。宿主从实际 CLI 路径构造 `UserService` 并传入实际数据库路径；模块不读取 Settings 来猜路径。journal 默认是 `service.data_dir / management / transaction-v1`，数据库别名沿用 `TransactionJournal` 的规范化结果，所有 Linux serve 模式使用同一数据库 writer lease。V2 在读取旧 manifest 前严格分派到[managed bootstrap](managed-bootstrap.md)；显式 managed root 不允许降级，legacy raw unit 未带该参数也按同账本分派。以下原 manifest/foreground 规则仅描述 V1。
 
@@ -26,10 +26,10 @@
 
 resolved 的旧安装与当前安装不同可以正常 serve，但后续终态投影仍须执行自己的身份与 exact receipt 校验。没有旧代 exact receipt 时不得覆盖旧 journal/manifest 或 prepare 新代；已有 exact receipt 时允许“新 manifest 已耐久、prepared 尚未写”的合法重入。bootstrap 不打开 Store 来判断投影状态，也不抹掉或补造管理收据。
 
-## 宿主后续接线
+## 宿主接线与原模块验证
 
-宿主在所有 `serve` 路径最先取得 session，再读取配置、打开数据库；非 Linux 平台保留既有入口，不调用本模块。Store 连接的 WAL/FULL 耐久策略、工具回执与 plan generation 持久化、`project_final`、bus 通知、helper 创建与恢复 readiness 都属于后续接线。宿主不能因为没有 permit 就跳过 session 的租约持有与最终关闭，也不能在写入者尚存时借调用 `permit.close_after_writers()` 提前解锁。
+宿主在所有 `serve` 路径最先取得 session，再读取配置、打开数据库；非 Linux 平台保留既有入口，不调用本模块。Store 连接的 WAL/FULL 耐久策略、工具回执与 plan generation 持久化、`project_final`、bus 通知、helper 创建与恢复 readiness 已由相应宿主模块接线，不由本模块实现。宿主不能因为没有 permit 就跳过 session 的租约持有与最终关闭，也不能在写入者尚存时借调用 `permit.close_after_writers()` 提前解锁。
 
 验证只使用临时目录、真实文件租约、注入 probe 和文件系统 verifier，不调用真实账号、服务控制或用户数据库。新增回归覆盖无配置读取的持锁顺序、不同 root/数据库别名仍共享同库租约、不同库可独立运行、取消和失败清理、foreground 与 unsupported 的未决拒绝、初次数据库缺失、已发布预算与路径约束、target/base phase 复用、probe 等待期间的输入或 record 变化，以及 resolved 旧证据保留。伪造已发布预算无法替换 record 绑定的安装摘要，未持有、错误名称或其它数据库的租约也不能被 BootPermit 接管。
 
-受统一 `check_local.py` 保护，bootstrap、既有 maintenance 与 management projection 三组共 106 项通过（0.55 秒，service 1.029 秒、峰值 75 MiB）；三份 Python 文件 Ruff/格式通过，两份源码 mypy 通过（峰值 118.7 MiB），swap 0。独立只读主链审查无阻断。未运行真实 systemd 服务或恢复接管，不用这些离线结果替代宿主接线与后续整合验证。
+受统一 `check_local.py` 保护，bootstrap、既有 maintenance 与 management projection 三组共 106 项通过（0.55 秒，service 1.029 秒、峰值 75 MiB）；三份 Python 文件 Ruff/格式通过，两份源码 mypy 通过（峰值 118.7 MiB），swap 0。独立只读主链审查无阻断。这是原模块验证记录，未运行真实 systemd 服务或恢复接管，不能替代宿主整合与真实服务验证。

@@ -25,8 +25,10 @@ from muli.events import EventBus
 from muli.evidence import EvidenceError
 from muli.extensions import Extensions
 from muli.history_evidence import HistoryEvidence
-from muli.maintenance import BootPermit, Maintenance
+from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
+from muli.managed_transaction import TransactionRecordV2
+from muli.management_transaction import Role
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -118,11 +120,13 @@ class Runtime:
                 from muli.management_projection import read_projection
                 from muli.management_transaction import ProjectionReceipt
 
-                self.maintenance.bind_managed_verifier(
-                    lambda record, role: verify_running_binding(
-                        boot_permit, self.store, record, role
-                    )
-                )
+                def verify(record: TransactionRecordV2, role: Role | None) -> None:
+                    current = self.maintenance.permit
+                    if current is None:
+                        raise MaintenanceError("managed_evidence_unavailable")
+                    verify_running_binding(current, self.store, record, role)
+
+                self.maintenance.bind_managed_verifier(verify)
                 self.maintenance.bind_projection_checker(
                     lambda record: (
                         read_projection(self.store)

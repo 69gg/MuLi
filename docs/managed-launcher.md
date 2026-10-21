@@ -1,9 +1,9 @@
 # Linux 本地候选的稳定入口与选择器
 
-本片提供已安装目录的身份、私有选择器、真实 `exec` 入口和只读修复诊断。
-它尚未开放 `adopt` 或 `switch` 产品命令，也没有改变现有 unit、V1 安装清单、
-V1 健康证明或 V1 启动核验。完整切换还依赖同一账本上的 V2 控制者、被动启动、
-格式准入、健康证明、激活和最终投影接线，不能把本片通过视作实际服务升级成功。
+本模块提供已安装目录的身份、私有选择器、真实 `exec` 入口和只读修复诊断。
+管理宿主已连接同一账本上的 V2 控制者、被动启动、格式准入、健康证明、激活和
+最终投影；公开 `self_adopt` / `self_switch` 的整合状态见[本地托管切换](managed-operations.md)。
+下文保留本模块的验证记录，单项通过不能代替完整服务切换证据。
 
 首片只接受显式指定、最终保留的 Linux venv。没有 uv 下载、目录复制安装、
 环境变量/凭据发现或依赖解析；普通安装器仍不因此获得修改 marked 库的许可。
@@ -84,9 +84,9 @@ rename 或 unlink 已可见而父目录 fsync 失败时，当前 handle 被标�
 `confirm(expected, guard=...)`，包括明确缺席时对父目录的确认；持续 I/O 错误不能启动服务。
 静态 `read()` 始终只是观察，不是耐久收据。
 
-完整控制者应按冻结的精确快照执行 config → selector → unit，unit 改变后
+现有控制者按冻结的精确快照执行 config → selector → unit，unit 改变后
 daemon-reload 并重新核 loaded 属性，全部 confirm 后才能 start；回退按反序。
-这些效果属于宿主后续接线，本模块不调用 systemctl。即使 A/B 的配置字节相同，
+这些效果由宿主的 managed backend 执行，本模块不调用 systemctl。即使 A/B 的配置字节相同，
 仍必须核对并确认 selector，不能跳过安装切换。
 
 ## 固定入口与恢复
@@ -104,9 +104,9 @@ launcher 只用标准库，不导入任一 MuLi 安装；它核固定 anchor/con
 <role lexical python> -I -m muli --config <config> --data-dir <data> --managed-root <root> serve
 ```
 
-`exec` 保留 PID。V2 probe 必须分别核 unit 的 launcher argv 与同 MainPID/start_ticks/
+`exec` 保留 PID。V2 probe 分别核 unit 的 launcher argv 与同 MainPID/start_ticks/
 InvocationID/cgroup 下的实际 slot argv；两个 venv 共享 real executable 并不表示同安装。
-不能因此放宽现有 `SystemdProbe.read`。子进程的真实 bootstrap 仍须在 ConfigFile/Store 前
+现有 `SystemdProbe.read` 的 V1 约束保持不变。子进程的 bootstrap 在 ConfigFile/Store 前
 重读当前代、获得 writer lease，并调用当前 slot、格式及角色准入核验。
 
 `cli` 仅在 V2 已 resolved 时按终态 role 委托；任何未解决代均返回
@@ -121,7 +121,7 @@ CLI 参数不能覆盖 anchor 的 config/data/root；保留长选项及其 argpa
 ```
 
 它先核固定 anchor 和保留 controller 的所有静态指纹，再转入宿主控制入口。
-该宿主入口尚属后续集成；同名 helper、预算、持久期限与一次回退规则不由 launcher 重置。
+该宿主入口已接入固定 controller；同名 helper、预算、持久期限与一次回退规则不由 launcher 重置。
 
 `--root <root> repair` 在选定包的核验/导入之前提供有界只读诊断。
 `muli.platforms.managed_repair.inspect_repair` 导出同一观察 API。它不读取配置正文、

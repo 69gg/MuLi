@@ -18,6 +18,7 @@ MuLi 是服务于单个电脑用户的本地数字生命助手。界面保留十
 - `proactive` 区分原请求绑定、宿主证明的独立事项与旧本地来源，在事项持久产生时冻结选路；原记录与事件一起提交，Attention 核查原证据并按完整投递依据分批。`proactive_memory` 只读主键元数据，核验明确绑定的偏好版本和来源，不进行语义选路。只有完整终答进入既有 outbox，每段发送前重新检查授权与原依据。默认目的地不改变旧任务的去向。
 - `personal_io` 组合可选截图、录屏、声学桥接及附件；`management` 在空闲边界应用校验过的自身配置或经批准的更新；`plugins` 从用户目录加载显式信任的扩展。
 - Linux 同版本恢复由 `linux_bootstrap` 在业务库前取得 writer lease，`management_host` 持久准备计划，独立 `management_helper` 驱动已核验的 systemd 后端。新进程先被动验证再放行，`management_projection` 原子写回终态及原请求来源。业务库使用 WAL/FULL，关闭实际写入者后才释放 lease；跨版本安装不复用这套单安装身份协议。
+- Linux 保留安装切换使用独立 protocol 2：`managed_preparation` 核验当前与候选安装，稳定 launcher 选择实际运行环境，固定 controller 复用同一 journal 和共享控制引擎。配置、选择记录、unit 与进程身份分别核验；失败回到旧安装时继续使用原数据库最新数据。管理入口接通 `self_adopt`、`self_switch` 和当前代恢复，监听变更也进入恢复事务；候选环境安装及跨格式迁移尚未提供。合同和验收边界见[本地托管切换](managed-operations.md)。
 - `integrations.chiliarch` 使用真实 agent 配对、SSE、消息与 ACK 协议；收到事件先事务持久化再 ACK。空闲时不调用模型。
 - `reminders` 等待最近到期时间或配置变更事件，通知和下一次触发在同一事务内保存；`tools.mcp` 仅在显式启用后连接扩展。
 - `attention` 只消费有持久证据的提醒、维护终态与新版事件，等待活动主任务结束后把游标、去重凭据和主会话入站原子提交。系统资料使用独立只读回合，不继承 owner 权限或历史渠道；消费者等待事件变化，关闭不会取消正在观察的主任务，并先于 Runtime/Store 退出。

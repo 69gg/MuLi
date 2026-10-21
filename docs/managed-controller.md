@@ -1,6 +1,6 @@
 # 共享控制器与 V2 角色观察
 
-状态：共享引擎与 V1/V2 策略已实现，通过独立只读尾审与下述离线回归。真实 V2 Linux backend、启动准入与 CLI 闭环尚由后续整合完成，本片不宣称 A/B 可用，不连接真实服务。
+共享引擎与 V1/V2 策略已实现，通过独立审查与下述模块回归。V2 Linux backend、启动准入与 CLI 已接线；完整入口和真实进程验收状态见[本地托管切换](managed-operations.md)。本模块回归没有操作用户真实服务。
 
 `management_controller._Controller` 保存单份有界调用、原 deadline、回退 reserve、阶段推进、取消传播和持久 start 意图语义。公开的 `TransactionController`、`ControllerBackend`、`ServiceObservation` 保留原 V1 构造接口，由 V1 policy 执行原配置比较、快照读取与 advance。V1 Linux backend 不修改。
 

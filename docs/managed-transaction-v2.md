@@ -1,12 +1,12 @@
 # 托管切换的 protocol 2 持久合同
 
-状态：V2 类型与纯校验切片已实现，通过独立只读审查与下述受限验证。它尚未接入真实启动、CLI、controller 或文件发布；不是 A/B 功能交付，也不能独自授权任何安装。V1 的 DTO、读取器与单安装健康判定不变。整个本地候选闭环接通并验收前，不宣称托管切换可用。
+V2 类型与纯校验已实现，通过独立审查与下述受限验证，并由启动、CLI、controller 和文件发布复用。类型校验不能独自授权安装；完整入口的整合状态见[本地托管切换](managed-operations.md)。V1 的 DTO、读取器与单安装健康判定不变。
 
 ## 同一个事务权威
 
 `managed_transaction` 只提供 `TransactionRecordV2`、`ServiceIdentityV2`、`RoleBinding`、`HealthProofV2`、`TransitionV2`，以及纯 `parse_record_v2`、`prepare_record_v2`、`advance_record_v2`。没有另一个 journal、锁目录、文件替换器或 DB 连接。
 
-宿主后续在现有 `state.json`、controller lock、writer lease 与私有目录下严格分派整数 protocol 1/2，使用原有文件写入与 fsync/poison 原语。V2 不接受 V1 JSON，V1 类型也不能解释 V2。未知、缺省或非整数 protocol 不得按旧模式尝试。`parse_record_v2` 先核既有 `JournalLimits.max_record_bytes`，再复用重复键和非有限 JSON 拒绝，失败仅返回固定原因。
+宿主在现有 `state.json`、controller lock、writer lease 与私有目录下严格分派整数 protocol 1/2，使用原有文件写入与 fsync/poison 原语。V2 不接受 V1 JSON，V1 类型也不能解释 V2。未知、缺省或非整数 protocol 不得按旧模式尝试。`parse_record_v2` 先核既有 `JournalLimits.max_record_bytes`，再复用重复键和非有限 JSON 拒绝，失败仅返回固定原因。
 
 纯函数收到的安装、声明、格式和投影都由宿主认证。`ProjectionReceipt` 形状相等不是证明；宿主必须在实际 Store 中读到精确终态回执，持有正确锁并核路径/身份后才传入。没有本模块替宿主完成的 lease 或耐久性捷径。
 
@@ -48,10 +48,10 @@
 
 public 视图只给有限状态字段，不给 nonce、健康证明、安装或快照内容。纯函数不恢复配置、改变 selector、启动程序或重发 unknown。
 
-## 后续接线与验证边界
+## 宿主接线与验证边界
 
 controller 必须同时检查配置、selector、unit 与实际安装；相同配置不能跳过程序切换。文件分别 CAS 和 file/parent 耐久确认，部分提交只允许本代冻结前缀；任何 foreign bytes 都拒绝覆盖。启动前还须核 stop、空 cgroup、writer lease，boot 时重新绑定真实安装/格式与 role；prepare 的观察不是永久许可。
 
-稳定入口和 repair 应先锚定 root，V2 未 resolved 时普通 CLI 拒绝，只保留稳定诊断/恢复；坏 selector/anchor 不得回退为未托管或重新 capture 故障安装。最终解释器选择、真实 exec 与 probe、V1/V2 journal 分派和终态投影由后续宿主闭环负责。本模块不下载、不登记候选，也不执行真实服务操作。
+稳定入口和 repair 先锚定 root，V2 未 resolved 时普通 CLI 拒绝，只保留稳定诊断/恢复；坏 selector/anchor 不得回退为未托管或重新 capture 故障安装。最终解释器选择、真实 exec 与 probe、V1/V2 journal 分派和终态投影由已接线的宿主闭环负责，验收状态见[本地托管切换](managed-operations.md)。本模块不下载、不登记候选，也不执行真实服务操作。
 
 本片回归仅构造有限内存对象，覆盖四动作、JSON/原始 unit 引用、严格 protocol、同配置不同安装、完整 role 健康绑定、legacy 回退、激活再观察、精确投影和重试期限。`tests/test_managed_transaction.py` 的 61 项通过（0.14 秒，服务内存峰值 55.7 MiB）；两份 Python 文件 Ruff/格式检查、单源码严格 mypy 均通过，整轮最高内存 116.6 MiB、swap 为零。检查串行经过 `scripts/check_local.py`，每次外层期限 30 秒，单次 1 GiB、共享 2 GiB/单 CPU。真实子进程、系统服务与 A/B 切换证据不属于纯类型测试结果。

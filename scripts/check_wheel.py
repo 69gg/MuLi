@@ -31,15 +31,27 @@ async def check_installed(target: Path) -> None:
     import httpx
 
     import muli
+    from muli.compatibility import CompatibilityManifest, assess_compatibility
     from muli.config import ConfigFile
+    from muli.format_admission import CURRENT_FORMAT_STATE
     from muli.server import create_app
     from muli.tools import atspi_helper, ax_helper, ax_lease
     from muli.tools.computer import ComputerError
 
+    assert muli.__file__ is not None
     assert Path(muli.__file__).resolve().is_relative_to(target.resolve()), muli.__file__
     assert Path(atspi_helper.__file__).resolve().is_relative_to(target.resolve())
     assert Path(ax_helper.__file__).resolve().is_relative_to(target.resolve())
     assert Path(ax_lease.__file__).resolve().is_relative_to(target.resolve())
+    with (Path(muli.__file__).parent / "compatibility.json").open("rb") as stream:
+        declaration = CompatibilityManifest.from_json(stream.read(16_384 + 1))
+    assert declaration.release == muli.__version__
+    assert assess_compatibility(
+        declaration, declaration, CURRENT_FORMAT_STATE, handoff_protocol=2
+    ).format_compatible
+    for domain, version in CURRENT_FORMAT_STATE.formats.model_dump().items():
+        support = getattr(declaration.formats, domain)
+        assert support.reads == (version,) and support.writes == version, domain
     with isolated_home() as root:
         config = ConfigFile(root / "config.json")
         config.update({"updates": {"check_on_start": False}})
@@ -83,8 +95,8 @@ async def check_installed(target: Path) -> None:
                 assert response.json()["current"]["control"]["paused"] is True
                 assert not app.state.runtime.tasks
     print(
-        "Installed wheel: import, assets, API docs, prompts, desktop defaults, "
-        "task control and lifespan passed"
+        "Installed wheel: import, compatibility declaration, assets, API docs, prompts, "
+        "desktop defaults, task control and lifespan passed"
     )
 
 

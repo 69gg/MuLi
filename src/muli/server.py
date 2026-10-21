@@ -37,6 +37,7 @@ from muli.maintenance_api import (
     request_has_effect,
 )
 from muli.managed_boot import ManagedBootPermit
+from muli.managed_requests import LocalCandidate, validate_candidate
 from muli.management import SelfManagement
 from muli.management_transaction import ClockReading
 from muli.memory_application import MemoryApplication
@@ -134,8 +135,9 @@ class ServiceInput(Input):
 
 
 class TransactionRequest(Input):
-    action: Literal["configure", "restart"] = "restart"
+    action: Literal["configure", "restart", "adopt", "switch"] = "restart"
     changes: dict[str, Any] = Field(default_factory=dict)
+    candidate: LocalCandidate | None = None
 
 
 class DeliveryRetryInput(Input):
@@ -211,6 +213,11 @@ def _create_app(
 
     async def apply_configuration(target: Settings) -> None:
         runtime.maintenance.require_configuration()
+        if (target.server.host, target.server.port) != (
+            config.settings.server.host,
+            config.settings.server.port,
+        ):
+            raise MaintenanceError("listener_restart_required")
         runtime.store.revalidate_format()
         if configuration_closing:
             raise ValueError("服务正在关闭，不能应用新配置")
@@ -380,7 +387,9 @@ def _create_app(
             return True
 
     runtime.maintenance.unsupported("legacy_plugins", legacy_plugins_present)
-    management = SelfManagement(runtime, plugins, service, apply_configuration)
+    management = SelfManagement(
+        runtime, plugins, service, apply_configuration, bound_address=(bound_host, bound_port)
+    )
     runtime.maintenance.seal(
         {
             "runtime",
@@ -837,9 +846,27 @@ def _create_app(
 
     @app.post("/api/management/transactions")
     async def prepare_transaction(body: TransactionRequest) -> dict[str, Any]:
-        if body.action == "restart" and body.changes:
-            raise HTTPException(422, "单纯重启不接受配置变更")
-        return await management.stage(body.action, body.changes, apply_mode="restart_transaction")
+        if body.action != "configure" and body.changes:
+            raise HTTPException(422, "只有配置操作接受配置变更")
+        try:
+            validate_candidate(body.action, body.candidate)
+        except ValueError:
+            raise HTTPException(
+                422, "迁入或切换需要完整本地安装路径，其它操作不接受候选路径"
+            ) from None
+        return await management.stage(
+            body.action,
+            body.changes,
+            apply_mode="restart_transaction",
+            candidate=body.candidate,
+        )
+
+    @app.post("/api/management/transactions/recover")
+    async def recover_transaction(body: Input) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            return await management.recovery.recover()
 
     @app.get("/api/extensions")
     async def extension_status() -> dict[str, Any]:

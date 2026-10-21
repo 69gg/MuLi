@@ -1,12 +1,22 @@
 # 跨版本兼容元数据与纯判定
 
-状态：独立实现切片，定向验证通过，尚未接入启动、安装或切换入口。它为后续 A/B 更新提供声明格式和纯判定，不代表当前发行版或任意历史数据库已经获得跨版本兼容认证。总体边界见[可恢复管理设计](recoverable-management-design.md#数据兼容与回退边界)。
+状态：纯判定已供 protocol 2 宿主复用；2.22 新增真实静态声明，源资产、发行校验反证、沿用该资产的两条进程回归，以及实际 wheel/sdist 离线构建和源码目录外安装 smoke 均已通过受限检查，远端发行状态见[2.22 审查](review-v2.22.md)。声明不代表任意历史数据库已经获得跨版本兼容认证，也不证明某个候选环境已经可用。总体边界见[可恢复管理设计](recoverable-management-design.md#数据兼容与回退边界)。
 
 ## 本片的边界
 
-`muli.compatibility` 只接收有限元数据，不打开文件或数据库，不构造 `Store`、`Memory`、`ConfigFile` 或 `Runtime`，不安装、迁移、备份、恢复、启动或停止任何组件。没有随本片发出当前版本的兼容 manifest，也没有自动给旧库补格式标签。
+`muli.compatibility` 只接收有限元数据，不打开文件或数据库，不构造 `Store`、`Memory`、`ConfigFile` 或 `Runtime`，不安装、迁移、备份、恢复、启动或停止任何组件。2.22 的静态声明是包内独立资产，不改变纯模块的职责，也不自动给旧库补格式标签。
 
-这项区分直接对应现有代码：`Store._initialize` 会建表、建索引及补消息序号；`Memory` 会补元数据、别名证据与搜索索引。`message_sequence_v1` 和 `alias_evidence_version` 分别证明局部迁移事实，不能当成整库、配置或外发语义相同的证据。[连接内格式证据读取器](format-evidence.md)及[三个禁止迁移构造器](store-existing.md)已独立实现，但实际路径/来源认证、完整准入和启动接线仍待完成；纯判定本身没有这些能力。
+这项区分直接对应现有代码：legacy 的 `Store._initialize` 会建表、建索引及补消息序号；`Memory` 会补元数据、别名证据与搜索索引。`message_sequence_v1` 和 `alias_evidence_version` 分别证明局部迁移事实，不能当成整库、配置或外发语义相同的证据。完整标记的来源、[连接内格式证据读取器](format-evidence.md)、[禁止迁移构造器](store-existing.md)与[真实构造准入](fresh-format-admission.md)分别承担证据职责；纯判定本身没有这些能力。
+
+## 随包声明与发行检查
+
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 2.22.0、`metadata_version=1`、交接协议 2、无需迁移，以及七领域各 `reads=[1]`、`writes=1`。这些 ID 对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[七领域合同 1](fresh-format-admission.md#七领域合同-1)；`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
+
+现有 Hatch `packages=["src/muli"]` 将包内非 Python 资产一并选入，不需要另造 manifest 生成器或增加强制覆盖规则，见 [Hatch 文件选择](https://hatch.pypa.io/latest/config/build/#file-selection)。构建必须保留源码中的真实文件；进程回归复制整个有界 MuLi 包并沿用它，不再临时写出一份自报声明。
+
+现有 CI 继续构建一次，并将同一 wheel/sdist 交给发布作业。`scripts/check_wheel.py` 在源码目录外安装 wheel 后，先在安装目录有界读取声明，复用 `CompatibilityManifest.from_json` 核严格 16 KiB 合同、正式版本、协议与七领域精确读写 ID，再构造临时应用做原有 smoke。它证明被测安装包携带本版本声明，不认证候选依赖环境、真实服务或历史库。
+
+`scripts/release.py` 保持标准库入口，不导入应用或 Pydantic。它核源码声明的 `release`，并要求 wheel 中的 `muli/compatibility.json` / `muli/__init__.py` 和 sdist 中同一包路径的两文件均唯一、各不超过 16 KiB、原始 bytes 与源码完全一致；sdist 两文件须为普通文件。原有名称、METADATA/PKG-INFO、标签与 CHANGELOG 校验继续保留。声明的完整语义由前序安装包 smoke 负责，此处只补同一受测构件的内容与版本一致性，不扩大成通用压缩包沙箱。
 
 ## 格式合同
 
@@ -43,12 +53,14 @@ result = assess_compatibility(base, candidate, current, handoff_protocol=protoco
 
 调用者必须另行保证声明来自核验过的发行构件、当前格式证据真实且在停写边界重新核验。相同的任意自报 ID 并不能证明对应实现遵守合同。新发行版实际采用某组 ID 前，仍需用跨版本样本核验 ingress/outbox/审批/原路/记忆证明等行为，不能靠给表结构起相同标签完成认证。
 
-现有管理 protocol 1 使用单个安装身份；元数据中交接协议数字相同不改变这个限制。真正 A/B 切换仍需分别核旧/新安装、稳定入口、控制者存活、准入与健康证明。本片没有接任何这些操作，也不放宽现有 protocol 1 的身份比较。
+现有管理 protocol 1 使用单个安装身份；元数据中交接协议数字相同不改变这个限制。protocol 2 的宿主仍须分别核旧/新安装、稳定入口、控制者存活、准入与健康证明。纯判定与静态文件不执行这些操作，也不放宽现有 protocol 1 的身份比较。
 
 回退继续使用包含最新 ingress/outbox/unknown 的当前数据库，只选旧程序及已验证兼容的配置；本片没有把旧数据库备份还原作为兼容分支，也不承诺恢复未保存的 token 或恰好一次外部效果。
 
 ## 验证范围
 
-新回归只使用内存中的测试声明，覆盖七领域、双方读写、未知/缺失/非法版本、迁移和交接协议拒绝、严格有界 JSON、不可变声明以及禁止数据库/文件 I/O。测试里的格式 ID 和 protocol 2 仅为夹具，不是对现有版本的发行声明。
+原始纯判定回归使用内存中的测试声明，覆盖七领域、双方读写、未知/缺失/非法版本、迁移和交接协议拒绝、严格有界 JSON、不可变声明以及禁止数据库/文件 I/O。这里的可变格式 ID 和版本仍为夹具。2.22 另增直接读取真实源资产的版本/七领域一致性回归、wheel/sdist 缺失/重复/超限/内容不符的发布反证，并让真实进程回归直接沿用包内资产。
 
-2026-10-21，经共享 `scripts/check_local.py` guard 串行验证：145 项定向测试通过，用时 0.15 秒、峰值 53.7 MiB；两文件 Ruff 与格式检查、单源码严格 mypy 通过，静态检查最高峰值 199.6 MiB，全部 swap 0。未读取用户数据库、未执行迁移/安装/服务操作，未核验跨版本发行包，也未取得真实 A/B 更新或其它平台的运行证据。
+原始纯判定的 145 项定向测试已于 2026-10-21 通过共享 guard，用时 0.15 秒、峰值 53.7 MiB；当时两文件 Ruff 与格式检查、单源码严格 mypy 通过，全部 swap 0。
+
+本轮同样经 `scripts/check_local.py --seconds 30 run` 串行验证：20 项发布反证与 146 项兼容回归共 166 项通过，用时 0.96 秒、峰值 64.9 MiB。五份 Python 的 Ruff、格式检查及 strict mypy 通过，最终 mypy 峰值 186.9 MiB。沿用真实源资产的成功切换与目标拒绝回退分别通过，详见[真实进程验收](managed-process-recovery.md)。所有检查均 swap 0；发布测试中的压缩包是小型合成夹具，尚不能替代实际 wheel/sdist 的构建、安装及字节一致性验收，也未取得跨版本发行包或其它平台的运行证据。

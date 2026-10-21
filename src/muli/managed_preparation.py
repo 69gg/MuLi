@@ -337,11 +337,14 @@ class ManagedPreparation:
         target: Settings,
         *,
         candidate: LocalSlotPaths | None = None,
+        listener_guard: Callable[[Settings], None] | None = None,
     ) -> PreparedManaged:
         runtime = self.runtime
         runtime.maintenance.require_configuration()
         if not runtime.configuration_lock.locked():
             raise MaintenanceError("configuration_lock_required")
+        if listener_guard is not None:
+            listener_guard(target)
         action = item.get("action")
         if action not in ("adopt", "switch", "configure", "restart"):
             raise MaintenanceError("transaction_action_invalid")
@@ -419,6 +422,8 @@ class ManagedPreparation:
 
             def validate() -> None:
                 gate()
+                if listener_guard is not None:
+                    listener_guard(target)
                 self._paths(permit)
                 verify_current_slot(source.slot)
                 verify_slot_files(selected)

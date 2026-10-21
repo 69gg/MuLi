@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import muli
 from muli.compatibility import (
     CompatibilityError,
     CompatibilityManifest,
@@ -17,6 +18,7 @@ from muli.compatibility import (
     FormatSupport,
     assess_compatibility,
 )
+from muli.format_admission import CURRENT_FORMAT_STATE
 
 DOMAINS: tuple[FormatDomain, ...] = (
     "database",
@@ -55,6 +57,20 @@ def manifest(data: dict[str, Any] | None = None) -> CompatibilityManifest:
 
 def state(data: dict[str, Any] | None = None) -> FormatState:
     return FormatState.from_json(encode(state_data() if data is None else data))
+
+
+def test_shipped_declaration_matches_current_release_and_persisted_contracts() -> None:
+    assert muli.__file__ is not None
+    with (Path(muli.__file__).parent / "compatibility.json").open("rb") as stream:
+        shipped = CompatibilityManifest.from_json(stream.read(16_384 + 1))
+    assert shipped.release == muli.__version__
+    assert assess_compatibility(
+        shipped, shipped, CURRENT_FORMAT_STATE, handoff_protocol=2
+    ).format_compatible
+    for domain in DOMAINS:
+        version = getattr(CURRENT_FORMAT_STATE.formats, domain)
+        support = getattr(shipped.formats, domain)
+        assert support.reads == (version,) and support.writes == version
 
 
 @pytest.mark.parametrize("release", ["2.18.0", "2.19.0", "2.9.0"])
@@ -303,9 +319,9 @@ def test_oversized_input_is_rejected_before_json_parse() -> None:
 def test_declarations_and_nested_read_sets_are_immutable() -> None:
     data = manifest()
     with pytest.raises(ValidationError):
-        data.requires_migration = True  # type: ignore[misc]
+        data.requires_migration = True
     with pytest.raises(ValidationError):
-        data.formats.outbox.writes = 2  # type: ignore[misc]
+        data.formats.outbox.writes = 2
     assert data.formats.outbox.reads == (1,)
     assert FormatSupport(reads=(1,), writes=1) == data.formats.outbox
 

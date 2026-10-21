@@ -1,8 +1,8 @@
 # V2 托管安装的启动准入
 
-本片提供 `muli.managed_boot.ManagedBootPermit` 和 `ConfigFile.from_bytes`。
-它尚未连接 Runtime、Maintenance、CLI、systemd probe 或服务生命周期，不能据此
-宣称 A/B 切换、真实服务回退或第二版健康证明已经可用。它不创建数据库、补格式标记、
+本模块提供 `muli.managed_boot.ManagedBootPermit` 和 `ConfigFile.from_bytes`，已连接
+Runtime、Maintenance、CLI、systemd probe 和服务生命周期。完整入口的整合状态见
+[本地托管切换](managed-operations.md)。准入本身不创建数据库、补格式标记、
 迁移数据、恢复备份、发布 selector 或执行服务操作。
 
 ## 调用与所有权

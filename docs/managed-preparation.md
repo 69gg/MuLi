@@ -91,5 +91,6 @@ systemd/proc 和服务动作边界为 fake。未访问真实用户数据库，�
 拒绝与回滚、快照后/状态后故障保留、取消和相同 prepared request 不续期。独立审查
 补充的两项也已覆盖：实际构造索引在准备前/探针 await 内损坏均拒绝；仅换 slot 的
 switch 保留非规范 JSON 原始配置，并拒绝夹带 Settings 变更。
-V2 完成夹具使用真实 Store/启动准入/投影，服务效果为合成前提；测试树尚未包含根
-Runtime/Maintenance 的 V2 分派，夹具仅将其 current 读取绑定到已有 `read_current`。
+V2 完成夹具使用真实 Store/启动准入/投影，服务效果为合成前提；它显式将 current
+读取绑定到已有 `read_current`。完整 Runtime 与 CLI 的独立进程验收另见
+[真实进程测试](managed-process-recovery.md)，不把合成完成前提计入真实服务证据。

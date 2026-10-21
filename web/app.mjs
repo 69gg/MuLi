@@ -1,7 +1,7 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
-import { setPath, settingsPatch, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
+import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
@@ -55,7 +55,7 @@ const state = {
   sessions: [], activeSession: null, session: createSessionState(), mode: "auto", sending: false,
   timelineOpen: false, sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
   viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
-  modelRole: "main", settingsDraft: null, service: null, settingsSaved: false,
+  modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
   timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
   team: { members: [], messages: [] }, recordQuery: "",
@@ -1028,7 +1028,7 @@ async function switchView(view, owner = connection) {
       const results = await Promise.allSettled([dirty ? null : request("/settings"), refreshSettingsResources()]);
       if (!current()) return;
       if (results[0].status === "rejected") throw results[0].reason;
-      if (results[0].value) { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); state.settingsSaved = false; }
+      if (results[0].value) { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); state.settingsSaveStatus = ""; }
     }
   } catch (error) { if (current()) state.viewError = error.message; }
   if (!current()) return;
@@ -2097,7 +2097,7 @@ function renderSettings() {
   if (state.settingsTab === "channels") form.append(renderChannelSettings());
   if (state.settingsTab === "inputs") form.append(renderInputSettings());
   if (state.settingsTab === "maintenance") form.append(renderMaintenanceSettings());
-  form.append(element("p", { class: "form-error", id: "settings-error", hidden: true }), element("div", { class: "settings-footer" }, element("button", { class: "primary-button", type: "submit", text: "保存设置" }), state.settingsSaved && element("span", { class: "settings-save-status", text: "已保存" })));
+  form.append(element("p", { class: "form-error", id: "settings-error", hidden: true }), element("div", { class: "settings-footer" }, element("button", { class: "primary-button", type: "submit", text: "保存设置" }), element("span", { class: "settings-save-status", id: "settings-save-status", text: state.settingsSaveStatus, hidden: !state.settingsSaveStatus })));
   return element("div", { class: "view-content" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, form));
 }
 
@@ -2386,7 +2386,7 @@ function renderSystemSettings() {
   if (service?.log) serviceSection.append(element("details", { class: "advanced-settings" }, element("summary", { text: "服务日志" }), element("pre", { class: "service-log", text: Array.isArray(service.log) ? service.log.join("\n") : service.log })));
   if (service?.reason) serviceSection.append(element("p", { text: service.reason }));
   return element("div", {},
-    settingsSection("工作台", statusList([["版本", state.status?.version], ["平台", state.status?.platform], ["运行任务", String(state.status?.running ?? 0)]]), element("div", { class: "field-row field-top-space" }, field("监听地址", "server.host", config.server?.host ?? ""), field("端口", "server.port", config.server?.port ?? "", { type: "number", min: 1, max: 65535 })), element("p", { text: "监听配置在下次启动时生效。" }), element("div", { class: "system-links" }, element("a", { href: "/api/export", download: "muli-export.jsonl", class: "secondary-button export-button", text: "导出数据" }), element("a", { href: "/api/docs", target: "_blank", rel: "noopener", class: "secondary-button export-button", text: "API 参考" }))),
+    settingsSection("工作台", statusList([["版本", state.status?.version], ["平台", state.status?.platform], ["运行任务", String(state.status?.running ?? 0)]]), element("div", { class: "field-row field-top-space" }, field("监听地址", "server.host", config.server?.host ?? ""), field("端口", "server.port", config.server?.port ?? "", { type: "number", min: 1, max: 65535 })), element("p", { text: "监听变更将排队执行重启事务。" }), element("div", { class: "system-links" }, element("a", { href: "/api/export", download: "muli-export.jsonl", class: "secondary-button export-button", text: "导出数据" }), element("a", { href: "/api/docs", target: "_blank", rel: "noopener", class: "secondary-button export-button", text: "API 参考" }))),
     settingsSection("通知", switchField("桌面通知", "notifications.enabled", config.notifications?.enabled), state.status?.notifications?.available === false && element("p", { text: "桌面通知暂不可用。" }), state.status?.notifications?.last_error && element("p", { class: "form-error", text: state.status.notifications.last_error })),
     settingsSection("访问", field("访问密码", "server.password", "", { type: "password", placeholder: config.server?.password_set ? "已设置，留空保留" : "尚未设置" }), config.server?.password_set && switchField("清除访问密码", "server.clear_password", false), state.auth.required && actionButton("退出登录", "logout", "secondary-button")),
     serviceSection,
@@ -2429,6 +2429,12 @@ function displaySettingsError(error) {
   if (node) { node.textContent = error.message ?? String(error); node.hidden = false; } else showError(error);
 }
 
+function displaySettingsSaveStatus(value) {
+  state.settingsSaveStatus = value;
+  const node = $("#settings-save-status");
+  if (node) { node.textContent = value; node.hidden = !value; }
+}
+
 async function saveSettings(event) {
   event.preventDefault();
   const submit = $('button[type="submit"]', event.target);
@@ -2437,12 +2443,23 @@ async function saveSettings(event) {
     const patch = settingsPatch(state.settings, state.settingsDraft);
     if (!Object.keys(patch).length) { toast("设置没有变化"); return; }
     submit.disabled = true;
+    displaySettingsSaveStatus("");
+    const errorNode = $("#settings-error");
+    if (errorNode) errorNode.hidden = true;
+    if (changesListener(patch)) {
+      const plan = await request("/management/transactions", { method: "POST", body: { action: "configure", changes: patch } });
+      if (plan?.id) state.management = { ...state.management, plans: [plan, ...(state.management?.plans ?? []).filter((item) => item.id !== plan.id)] };
+      displaySettingsSaveStatus("已排队，空闲后重启");
+      toast(state.settingsSaveStatus);
+      return;
+    }
     await request("/settings", { method: "PATCH", body: patch });
     const results = await Promise.allSettled([request("/settings"), refreshSettingsResources()]);
     if (results[0].status === "fulfilled") { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); }
     if (results[1].status === "fulfilled" && !state.activeSession) state.mode = state.status?.mode || "auto";
-    state.settingsSaved = true; renderOtherView(); renderChrome(); renderComposer(); toast("设置已保存");
-  } catch (error) { displaySettingsError(error); submit.disabled = false; }
+    state.settingsSaveStatus = "已保存"; renderOtherView(); renderChrome(); renderComposer(); toast("设置已保存");
+  } catch (error) { displaySettingsError(error); }
+  finally { submit.disabled = false; }
 }
 
 async function pairChiliarch(button) {
@@ -2452,11 +2469,13 @@ async function pairChiliarch(button) {
   try {
     collectSettingsForm();
     const patch = settingsPatch(state.settings, state.settingsDraft);
+    if (changesListener(patch)) throw new Error("请先保存监听变更，等待重启后再配对。");
     if (Object.keys(patch).length) await request("/settings", { method: "PATCH", body: patch });
     await request("/integrations/chiliarch/pair", { method: "POST", body: { code, name: "MuLi" } });
     state.settingsDraft = null;
     toast("配对已完成"); await switchView("settings");
-  } catch (error) { displaySettingsError(error); button.disabled = false; }
+  } catch (error) { displaySettingsError(error); }
+  finally { button.disabled = false; }
 }
 
 async function serviceAction(action) {

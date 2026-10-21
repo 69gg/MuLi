@@ -2,6 +2,8 @@
 
 状态：已随 2.19.0 发布，完整验证见[发行审查](review-v2.19.md)；没有在用户真实服务上执行重启、停止或故障注入。跨版本 A/B 安装及数据库回滚不在本片范围。
 
+2.22 扩展同一事务 API，增加显式 `adopt/switch` 和三路径 `candidate`，见[本地托管切换](managed-operations.md)。本页保留 V1 操作合同；托管后的重启和配置使用 V2，失败迁入回原入口后可以继续 V1，不增加第二份账本。
+
 ## 可用条件
 
 主进程必须由当前用户的标准 `muli.service` 启动，实际 unit、解释器、包、配置和数据路径均可核验；需要 systemd 用户会话、cgroup v2 与受支持的本地持久文件系统。符号链接、自定义 unit/drop-in、未知文件系统、运行身份不符或缺少可证明空闲合同的 legacy Python 插件会明确报告 unsupported。MCP/Skills 使用已有换代和空闲合同。完整约束见[安装身份](installation-manifest.md)、[文件系统核验](filesystem-identity.md)和[控制者设计](linux-controller-helper-design.md)。
@@ -19,6 +21,7 @@
 | `GET /api/management` | 计划状态及 `recovery` 能力、当前事务 |
 | `GET /api/management/transactions/current` | 被动维护阶段也可读取的有限状态 |
 | `POST /api/management/transactions` | `{"action":"restart"}` 或 `{"action":"configure","changes":{...}}`；未知字段拒绝，restart 不接受 changes |
+| `POST /api/management/transactions/recover` | 2.22 起以 `{}` 确认运行宿主并接续当前代；仍须通过既有用户认证 |
 
 `queued` 表示待应用计划，`applying` 表示正在交接；helper 的 `accepted` 仅表示 systemd 接受创建请求。最终以 resolved journal 和原子业务投影为准，不把进程启动请求当成健康。配置候选、口令和私有 nonce 不出现在公开事务状态中。
 

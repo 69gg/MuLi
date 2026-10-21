@@ -71,6 +71,8 @@ journalctl --user -u muli.service -f
 
 也可在工作台的系统设置中安装、启动、停止、重启和启用登录启动。服务属于当前用户，不需要 root；内存、CPU 和进程数有 systemd 上限。配置修改后重启服务才能应用监听端口变化。
 
+Linux 本地候选托管切换提供 `self_adopt`、`self_switch` 和 `self_recover`，保留最新数据库与原汇报来源；使用条件、验收状态和边界见[托管切换说明](docs/managed-operations.md)。
+
 Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当前用户计划任务及 `pythonw.exe`，不弹出命令窗口。它们通常随用户登录启动。Linux 退出登录后仍需运行时，可按系统策略启用 user lingering；MuLi 不更改系统登录策略。桌面权限与实际平台验证范围见[平台能力](docs/platforms.md)。
 
 ## 权限与资源

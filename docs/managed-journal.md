@@ -1,6 +1,6 @@
 # V2 与原事务账本共用持久化
 
-本文件记录下一开发分支的内部实现；它尚未连接生产启动和服务控制，不代表已经可用的 A/B 更新入口。
+本文件记录 V2 的内部持久化合同与模块验证；启动和服务控制已由宿主接线，完整入口的整合状态见[本地托管切换](managed-operations.md)。
 
 `managed_journal.py` 的函数接收现有 `TransactionJournal` / `JournalControl`。仍然只有原目录里的 `state.json`、固定控制锁和按数据库路径确定的 writer lease，不另设模式账本或第二个“已确认版本”指针。
 

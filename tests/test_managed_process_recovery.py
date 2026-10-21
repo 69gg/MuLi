@@ -73,32 +73,8 @@ def slot(root: Path, name: str, repository: Path) -> SlotIdentity:
         f"home = {base}\ninclude-system-site-packages = false\n", encoding="utf-8"
     )
     package = site / "muli"
+    # Retain the actual package declaration unchanged, rather than inventing fixture evidence.
     shutil.copytree(source, package, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
-    # The declaration is a fixture of this same checkout, not a released-package attestation.
-    (package / "compatibility.json").write_text(
-        json.dumps(
-            {
-                "metadata_version": 1,
-                "distribution": "muli-agent",
-                "release": muli.__version__,
-                "handoff_protocol": 2,
-                "requires_migration": False,
-                "formats": {
-                    domain: {"reads": [1], "writes": 1}
-                    for domain in (
-                        "database",
-                        "objects",
-                        "configuration",
-                        "ingress",
-                        "outbox",
-                        "memory",
-                        "install_profile",
-                    )
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
     dependencies = Path(sys.prefix) / "lib" / version / "site-packages"
     (site / "fixture.pth").write_text(
         f"{dependencies}\n{repository / 'tests/helpers'}\n", encoding="utf-8"

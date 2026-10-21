@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from muli.runtime import Runtime
 
 _PREFIX = "/api/internal/management"
+_RECOVERY_METHOD = ("POST", "/api/management/transactions/recover")
 INTERNAL_METHODS = frozenset(
     {
         ("POST", _PREFIX + "/drain"),
@@ -78,8 +79,12 @@ def install_maintenance_routes(
 
 
 def passive_request_allowed(method: str, path: str, main_session: str | None) -> bool:
-    """Only audited local reads and durable owner ingress remain in probation."""
-    if (method, path) in INTERNAL_METHODS or not path.startswith("/api/"):
+    """Keep audited reads, owner ingress and authenticated management recovery."""
+    if (
+        (method, path) in INTERNAL_METHODS
+        or (method, path) == _RECOVERY_METHOD
+        or not path.startswith("/api/")
+    ):
         return True
     if method == "POST":
         return path in {"/api/auth/login", "/api/auth/logout"} or (
@@ -130,7 +135,13 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
 
 
 def request_has_effect(method: str, path: str, main_session: str | None) -> bool:
-    if not path.startswith("/api/") or (method, path) in INTERNAL_METHODS:
+    # Recovery may confirm an existing host binding and ensure its one helper;
+    # it must stay reachable when ordinary business execution is paused.
+    if (
+        not path.startswith("/api/")
+        or (method, path) in INTERNAL_METHODS
+        or (method, path) == _RECOVERY_METHOD
+    ):
         return False
     # Durable owner ingress is allowed while paused and never launches directly.
     if (

@@ -5,11 +5,41 @@ from __future__ import annotations
 import argparse
 import ast
 import email.parser
+import json
 import re
 import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
+from typing import IO
+
+_METADATA_BYTES = 16_384
+
+
+def read_metadata(stream: IO[bytes]) -> bytes:
+    data = stream.read(_METADATA_BYTES + 1)
+    if len(data) > _METADATA_BYTES:
+        raise ValueError("发行声明或版本文件超过 16 KiB")
+    return data
+
+
+def wheel_file(archive: zipfile.ZipFile, name: str) -> bytes:
+    entries = [item for item in archive.infolist() if item.filename == name]
+    if len(entries) != 1 or entries[0].is_dir():
+        raise ValueError("wheel 声明或版本文件缺失或不唯一")
+    with archive.open(entries[0]) as stream:
+        return read_metadata(stream)
+
+
+def source_file(archive: tarfile.TarFile, name: str) -> bytes:
+    entries = [item for item in archive.getmembers() if item.name == name]
+    if len(entries) != 1 or not entries[0].isfile():
+        raise ValueError("sdist 声明或版本文件缺失或不唯一")
+    stream = archive.extractfile(entries[0])
+    if stream is None:
+        raise ValueError("sdist 声明或版本文件不可读取")
+    with stream:
+        return read_metadata(stream)
 
 
 def validate(root: Path, tag: str, dist: Path) -> str:
@@ -17,7 +47,9 @@ def validate(root: Path, tag: str, dist: Path) -> str:
     version = project["version"]
     if tag != f"v{version}" or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("发布标签必须与正式版本元数据一致")
-    tree = ast.parse((root / "src/muli/__init__.py").read_text(encoding="utf-8"))
+    with (root / "src/muli/__init__.py").open("rb") as stream:
+        runtime_bytes = read_metadata(stream)
+    tree = ast.parse(runtime_bytes.decode("utf-8"))
     versions = [
         ast.literal_eval(node.value)
         for node in tree.body
@@ -28,6 +60,11 @@ def validate(root: Path, tag: str, dist: Path) -> str:
     ]
     if versions != [version]:
         raise ValueError("运行时版本与发行版本不一致")
+    with (root / "src/muli/compatibility.json").open("rb") as stream:
+        declaration = read_metadata(stream)
+    value = json.loads(declaration)
+    if not isinstance(value, dict) or value.get("release") != version:
+        raise ValueError("兼容声明与发行版本不一致")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     match = re.search(
         rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S
@@ -44,6 +81,11 @@ def validate(root: Path, tag: str, dist: Path) -> str:
         if len(metadata_names) != 1:
             raise ValueError("wheel 元数据不唯一")
         metadata = archive.read(metadata_names[0]).decode("utf-8")
+        if (
+            wheel_file(archive, "muli/compatibility.json") != declaration
+            or wheel_file(archive, "muli/__init__.py") != runtime_bytes
+        ):
+            raise ValueError("wheel 声明或版本文件与源码不一致")
     with tarfile.open(sources[0], "r:gz") as archive:
         candidates = [
             member
@@ -52,10 +94,17 @@ def validate(root: Path, tag: str, dist: Path) -> str:
         ]
         if len(candidates) != 1:
             raise ValueError("sdist 元数据不唯一")
-        stream = archive.extractfile(candidates[0])
-        if stream is None:
+        metadata_stream = archive.extractfile(candidates[0])
+        if metadata_stream is None:
             raise ValueError("sdist 元数据不可读取")
-        source_metadata = stream.read().decode("utf-8")
+        with metadata_stream:
+            source_metadata = metadata_stream.read().decode("utf-8")
+        prefix = candidates[0].name.split("/", 1)[0]
+        if (
+            source_file(archive, prefix + "/src/muli/compatibility.json") != declaration
+            or source_file(archive, prefix + "/src/muli/__init__.py") != runtime_bytes
+        ):
+            raise ValueError("sdist 声明或版本文件与源码不一致")
     for content in (metadata, source_metadata):
         parsed = email.parser.Parser().parsestr(content)
         if parsed["Version"] != version or parsed["Name"] != project["name"]:
@@ -70,7 +119,10 @@ def main() -> None:
     args = parser.parse_args()
     notes = validate(Path.cwd(), args.tag, args.dist)
     Path("release-notes.md").write_text(notes, encoding="utf-8")
-    print(f"Validated {args.tag}: source version, changelog, wheel and sdist agree.")
+    print(
+        f"Validated {args.tag}: source version, compatibility declaration, changelog, "
+        "wheel and sdist agree."
+    )
 
 
 if __name__ == "__main__":

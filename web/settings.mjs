@@ -55,6 +55,11 @@ export function settingsPatch(original, draft, path = "") {
   return patch;
 }
 
+/** Only inspect the edited patch; unchanged listener controls need no restart. */
+export function changesListener(patch) {
+  return ["host", "port"].some((key) => Object.hasOwn(patch.server ?? {}, key));
+}
+
 /** Choosing an external default is one action; recipients always remain explicit. */
 export function selectProactiveDestination(draft, name, accountId = "") {
   const proactive = draft.channels?.proactive ?? { external_enabled: false, default_destination: { kind: "web" } };

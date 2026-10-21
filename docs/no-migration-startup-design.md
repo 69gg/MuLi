@@ -1,8 +1,8 @@
 # A/B 候选的无迁移启动边界
 
-状态：[连接内格式证据读取器](format-evidence.md)与覆盖三个构造器的[禁止迁移入口](store-existing.md)已实现；[独占新建库的完整格式声明](fresh-format-admission.md)已接入真实 Runtime，并让已标记库后续构造/重配置禁止迁移。跨版本双方安装准入、静态 manifest、protocol 2 与 selector 仍为设计。本文补充[可恢复管理](recoverable-management-design.md)与[兼容声明](upgrade-compatibility.md)，不为历史已有数据库补发格式证明。
+状态：[连接内格式证据读取器](format-evidence.md)与覆盖三个构造器的[禁止迁移入口](store-existing.md)已实现；[独占新建库的完整格式声明](fresh-format-admission.md)已接入真实 Runtime，并让已标记库后续构造/重配置禁止迁移。双方本地安装准入、实际发行声明、protocol 2 bootstrap 与 selector 已接入 2.22 开发分支，当前范围及未发布、未实测用户真实服务的边界见[本地托管切换](managed-operations.md)。本文保留原实现顺序和验证记录，不为历史已有数据库补发格式证明。
 
-## 为什么现有 probation 还不够
+## 原 protocol 1 probation 的边界
 
 `linux_bootstrap.open_boot_session` 已在 ConfigFile/Store 之前取得 writer lease，并核验 protocol 1 的单安装身份。这个约束使同版本恢复有明确边界，但不允许把另一套候选代码当成同一安装启动。
 
@@ -53,10 +53,10 @@ SQLite 的只读连接不等于文件系统完全零变动：WAL 模式可能涉
 
 ## 最小实现与验收顺序
 
-实现顺序为有界只读格式证据、三组禁止迁移入口、新建库声明与已标记库的真实启动约束，最后才接 protocol 2。前三项已实现；不新增跨平台服务控制器或数据库降级工具，不把本版本普通启动等同于 A/B 准入。
+原实现顺序为有界只读格式证据、三组禁止迁移入口、新建库声明与已标记库的真实启动约束，最后接 protocol 2。这些部分现已接入本地托管切换；本片原始验证记录仍分别列在下文。不新增跨平台服务控制器或数据库降级工具，也不把本版本普通启动等同于 A/B 准入。
 
 合成临时 SQLite 测试至少覆盖：缺库/缺 marker 不创建；未知/重复/类型错误/超大标记固定拒绝；schema 变化与身份变化；真实 WAL 中最新已提交事实；锁竞争和查询预算；禁止入口缺表/缺索引/缺实例 ID 不修补；Memory 不迁移别名或回填索引；禁用渠道的构造与重新配置也不补 fingerprint；格式准入失败前后业务事实相同；两个已认证同格式实现对 ingress/outbox/unknown、审批与路由 proof 的读取一致。
 
 读取器已在宿主提供的合成连接上通过单快照、WAL、身份/标记、锁竞争、读取预算与清理测试，并拒绝非零 `read_uncommitted`，避免共享缓存连接读取未提交事实。连接内新回归与纯判定共 200 项通过，详情见[验证记录](format-evidence.md#验证边界)。
 
-`Store.open_existing` 已实现已有文件的禁止创建打开和三组结构、局部身份的有界核验，Memory 与 ChannelManager 继承同一策略。独立测试覆盖零迁移、失败不修复、成功后的业务写入与 Runtime/渠道重新配置，详情见[构造验证](store-existing.md#验证边界)。新建库声明与后续当前版本准入见[新片验证](fresh-format-admission.md#验证记录)。跨版本双方构件认证、protocol 2 bootstrap 接线和跨版本语义验收仍未完成；没有访问用户真实数据库。
+`Store.open_existing` 已实现已有文件的禁止创建打开和三组结构、局部身份的有界核验，Memory 与 ChannelManager 继承同一策略。独立测试覆盖零迁移、失败不修复、成功后的业务写入与 Runtime/渠道重新配置，详情见[构造验证](store-existing.md#验证边界)。新建库声明与后续当前版本准入见[新片验证](fresh-format-admission.md#验证记录)。双方构件与 protocol 2 bootstrap 已接线，临时进程证据和完整验收边界见[本地托管切换](managed-operations.md)；本文的合成测试不证明任意两个版本的语义兼容或真实 systemd 切换，也没有访问用户真实数据库。

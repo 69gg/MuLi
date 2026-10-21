@@ -2,9 +2,13 @@
 
 MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`self_configure` 校验补丁并写入私人待应用快照，在前台和团队空闲后应用。队列有配置指纹，期间其它入口修改配置会使旧计划失败，避免覆盖新设置。`self_status` 与 `/api/management` 可查看进度，待应用计划可由管理 API 取消。
 
-配置文件原子替换；运行时重新载入失败时恢复原配置。监听 host/port 和插件启用状态需要重启进程，API 不声称已更换监听 socket。非回环进程不能通过“改为回环并清密码”的热修改提前关闭实际仍暴露的认证边界。`self_restart` 使用同版本恢复事务；不满足宿主条件时明确拒绝，不降级成直接重启。
+2.22 增加 `self_adopt` / `self_switch`，连接同一管理队列与受限恢复 helper，处理 Linux 当前安装迁入和已保留的本地候选切换。输入、批准、失败后接续及验收状态见[本地托管切换](managed-operations.md)。这条路径不下载或创建候选环境。
 
-完整热重配置的关闭阶段也参与恢复：某个组件停止失败时，尝试重新建立上一配置及组件。观察者取消或断开不会中断正在进行的切换；同一配置锁保持到应用或恢复结束，再传播取消。如果恢复自身也失败，操作仍为失败，不能把配置文件已恢复当成所有组件健康。默认 `self_configure` 的 `apply_mode=in_process` 仍只保护存活的进程；显式 `restart_transaction` 将配置作为私人候选交给独立 Linux 控制者。安装身份、被动启动、写锁、健康握手和终态投影已随 2.19.0 接通，验证边界和操作方法见[同版本恢复入口](linux-recovery-operations.md)。跨版本 A/B 安装尚未实现。
+配置文件原子替换；运行时重新载入失败时恢复原配置。监听 host/port 变更由 `self_configure` 自动选择配置重启事务，直接热修改返回 `409 listener_restart_required`；工作台保存监听变更也将完整补丁交给该事务入口，只显示排队状态并保留草稿，不把待应用目标当作已保存配置。其它设置仍直接热保存；存在监听草稿时，Chiliarch 配对会提示先完成监听事务。插件启用状态仍需重启进程。非回环进程不能通过“改为回环并清密码”的热修改提前关闭实际仍暴露的认证边界。`self_restart` 使用当前安装的恢复事务；不满足宿主条件时明确拒绝，不降级成直接重启。
+
+完整热重配置的关闭阶段也参与恢复：某个组件停止失败时，尝试重新建立上一配置及组件。观察者取消或断开不会中断正在进行的切换；同一配置锁保持到应用或恢复结束，再传播取消。如果恢复自身也失败，操作仍为失败，不能把配置文件已恢复当成所有组件健康。默认 `self_configure` 的 `apply_mode=in_process` 仍只保护存活的进程；显式或由监听变更选择的 `restart_transaction` 将配置作为私人候选交给独立 Linux 控制者。安装身份、被动启动、写锁、健康握手和终态投影已随 2.19.0 接通，验证边界和操作方法见[同版本恢复入口](linux-recovery-operations.md)。托管安装的候选切换沿用同一账本。
+
+`self_recover` 与 `POST /api/management/transactions/recover` 接续当前事务，先确认运行宿主可能丢失返回的绑定，再请求独立 helper；不创建新代次或自动重试结果未知的业务效果。已登录用户在维护暂停期间也能使用该 HTTP 入口。详见[恢复操作](managed-operations.md)。
 
 受支持宿主创建未解决事务后，普通设置、自配置计划和扩展换代统一返回 transaction_in_progress；既有排队计划保留私人候选，解除后唤醒。维护等待采用自然空闲边界，waiting 期间原服务仍可开始正常工作；只有真实 owner 全部收尾才关闭准入并给 drained，繁忙流量下可超时保留原服务。关门后主人文字继续持久排队，外发与模型等待放行；legacy 插件候选缺少可核验 idle 合同时明确 unsupported，不卸载插件。普通前台 serve 可持写锁正常工作，但不冒充受支持的 systemd 恢复宿主。
 
@@ -12,7 +16,7 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 2.21 起完整格式准入启用后，带认证标记的新资料库暂不接受上述原位自动安装：当前更新器尚不能核验目标版本的完整格式声明，也没有独立候选切换。生成更新计划前和实际安装前都检查，格式拒绝不会创建新计划或执行安装；首次检查在发现 uv 之前，查询工具目录后、安装前也会复核。即使目标版本号更大、用户已批准，也不能替代格式证据。旧的未标记资料库保留原安装检查路径，显式无迁移打开旧库本身不等于它已获格式认证。
 
-`self_status` 与 `/api/management` 的 `update_capability` 说明当前原位路径：`format_eligible=true`、`code=installation_check_required` 仅表示格式门允许继续核验实际安装；`verified_candidate_required` 表示需要已核验的候选更新，`format_verification_failed` 表示既有准入证据已无法通过复核。能力查询不探测 uv、不下载或执行程序。版本检查仍可发现新版，通知和提示资料按当前能力说明，不许诺批准后必能安装。这仅约束本 Runtime 的自更新；其它资料目录共享同一安装或用户手动执行旧版/uv，不由这道格式门控制，完整托管安装仍需后续交付。
+`self_status` 与 `/api/management` 的 `update_capability` 说明当前原位路径：`format_eligible=true`、`code=installation_check_required` 仅表示格式门允许继续核验实际安装；`verified_candidate_required` 表示需要已核验的候选更新，`format_verification_failed` 表示既有准入证据已无法通过复核。能力查询不探测 uv、不下载或执行程序。版本检查仍可发现新版，通知和提示资料按当前能力说明，不许诺批准后必能安装。这仅约束本 Runtime 的自更新；其它资料目录共享同一安装或用户手动执行旧版/uv，不由这道格式门控制。托管切换要求原控制安装和候选安装分别完整保留，不能通过原位覆盖绕过该要求。
 
 启动自主更新检查可使用默认渠道，默认 WebUI；通知首次保存时冻结目的地，通知、版本记录和事件原子提交。同一版本的已有通知不改绑、不因再次检查重发。自主扩展目录监听的新失败转移也可使用独立默认，手动重载和普通日志不自动取得该来源。`self_configure` 可在一个 changes 补丁中设置完整 `channels.proactive.default_destination`，或以 `memory_preference={memory_id,version,destination}` 选择已核对的主人偏好。外部目的地省略 `external_enabled` 同次启用，明确 false 则保持暂停。新绑定在生成计划、空闲应用及组件停止等待后复核有限来源证据；失效则计划失败并保留原配置，不能用模型传入的 source_id/digest/trusted_owner 代替验证。复用既有权限与配置事务，不增加第二次许可门；详见[主动通知](channels.md#无发令会话时的默认通知)及[错误来源](system-events.md#失败来源与投递)。
 

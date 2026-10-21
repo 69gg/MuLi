@@ -1,6 +1,6 @@
 # 可恢复的自身配置、重启与更新
 
-状态：2026-10-21 跨进程恢复整体设计；Linux 同版本的 journal、维护门、被动 Runtime、nonce 握手、Linux backend／受限 helper 及 CLI／管理提交、bootstrap 和终态投影已接入 2.19 候选，见[恢复入口](linux-recovery-operations.md)和[分块证据](restart-transaction-v2.15-design.md)。跨版本 A/B 切换仍未交付，也没有实测中断时长或恢复成功率。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
+状态：本文保留跨进程恢复的整体设计与历史分片基线。Linux 同版本恢复已随 2.19 接入；本地保留安装的 protocol 2、稳定入口、公开迁入/切换、启动准入和终态投影已接入 2.22 开发分支，当前范围见[本地托管切换](managed-operations.md)。2.22 尚未发布，也未在用户真实 systemd 服务上执行，没有实测中断时长或恢复成功率；临时进程与 fake manager 的验证不能替代该证据。同版本入口与原分块证据见[恢复入口](linux-recovery-operations.md)和[分块证据](restart-transaction-v2.15-design.md)。2.13 的恢复事实与 2.14 的进程内配置关闭失败恢复不等同于本稿的跨进程事务。本文落实[持续扩展要求](continuity-extensions-plan.md)。
 
 ## 交付目标与最小范围
 
@@ -12,7 +12,7 @@
 
 ## 设计起点及可复用部分
 
-下表保留改造前的基线与当时缺口；同版本入口当前进度以[恢复操作](linux-recovery-operations.md)为准。原位更新与跨版本格式证据仍是后续工作。
+下表保留改造前的基线与当时缺口；同版本入口以[恢复操作](linux-recovery-operations.md)为准，本地保留安装与真实格式准入的当前接线见[本地托管切换](managed-operations.md)。下文的 uv 自动候选准备仍是设计，不属于当前本地候选切换入口。
 
 | 位置 | 已有行为 | 本方案需要补齐 |
 | --- | --- | --- |
@@ -129,23 +129,25 @@ uv 没有这里所需的通用安装目录硬配额开关。磁盘预留、有�
 
 ## 数据兼容与回退边界
 
+本节保留 protocol 2 接线前发现的单安装约束及其解决条件。下列启动、角色准入与本地候选切换现已接线；自动下载/准备候选和迁出托管仍不属于当前范围，见[本地托管切换](managed-operations.md)。
+
 跨版本接线必须显式引入 protocol 2，保留 protocol 1 的 DTO 与单安装比较。代码审查已确认，单安装约束分布在 `TransactionRecord.accepts`、BootPermit、Linux bootstrap、安装 manifest 与终态投影中；不能把任一处改成“两个安装之一即可”便当作角色准入。V2 每个阶段须唯一选择 base 或 target，并记录双方安装/兼容声明摘要与共同 Store/main 身份。
 
 仍使用同一 journal、controller 锁、writer lease 和代次权威。旧未决记录继续按 v1 恢复；旧终态先精确投影，之后才能创建新的 v2 generation，不改写旧记录、不另开可并行的控制账本。phase/intent 名称、nonce、原期限、单次回退、提交后激活与 unknown 保留可以复用，实际观察与完成条件必须按协议区分。
 
-现有 controller 在配置摘要已经等于 target/base 时会跳过 install/restore；这适用于同版本配置事务，但 A/B 通常配置完全相同，照搬会跳过程序切换。V2 需要同时确认配置、selector 和实际运行安装，两个文件分别 CAS、耐久确认并可重观察。probation 选择不等于已确认的 CLI 活动版本；稳定入口、服务 probe 的真实解释器核验及 CLI 委托必须一起交付，避免网页已切换而命令仍落旧环境。
+原 protocol 1 controller 在配置摘要已经等于 target/base 时会跳过 install/restore；这适用于同版本配置事务，但 A/B 通常配置完全相同，照搬会跳过程序切换。V2 因此同时确认配置、selector、unit 和实际运行安装，三个文件分别 CAS、耐久确认并可重观察。probation 选择不等于已确认的 CLI 活动版本；现有稳定入口、服务 probe 的真实解释器核验及 CLI 委托共同维护这一边界，避免网页已切换而命令仍落旧环境。
 
-不能先在现有 `init/service install` 自动种下强制 selector：当前 `self_update` 仍合法执行原位 `uv tool upgrade`，随后重启；包或 pyvenv 指纹变化会使预解析校验拒绝全部 CLI，连修复入口也不可达。因此，托管模式需显式迁入，并与独立、版本化的修复入口同片交付。旧模式沿原路径；托管模式不得再执行原位升级或让普通 service install 覆盖稳定 unit。迁入/迁出都需核对旧事务的精确终态投影、停止后的空 cgroup、writer lease 与控制锁；未决事务只能接续原控制者，不能重签变化后的安装来消除故障。托管后端未完成时只能提供预检，不写入模式或 selector。这里记录的是审查后的设计约束，尚无迁入命令。
+接线前的审查确认，不能在现有 `init/service install` 自动种下强制 selector：legacy 安装原有的 `self_update` 可执行原位 `uv tool upgrade`，随后重启；包或 pyvenv 指纹变化会使预解析校验拒绝全部 CLI，连修复入口也不可达。因此，2.22 采用显式迁入，并同时提供独立、版本化的修复入口。无标记 legacy 保留原更新路径；已标记库拒绝自动原位更新，托管模式也不允许普通 service install 覆盖稳定 unit。迁入须核对旧事务的精确终态投影、停止后的空 cgroup、writer lease 与控制锁；未决事务只能接续原控制者，不能重签变化后的安装来消除故障。当前已有公开迁入入口，尚不提供迁出命令。
 
-prepare 时的兼容判定只负责早拒。每次候选或回退 boot 都须在真实 writer lease 下、ConfigFile/Store 之前重新读取格式证据，绑定 generation、实际 boot、role、安装/声明、DB/config 与 Store/main；再通过无迁移连接复核后进入本地恢复。健康证明须包含本次准入身份，不能跨 boot 复用旧证据。以上是后续接线约束，目前没有 V2 生产入口或 selector。
+prepare 时的兼容判定只负责早拒。每次候选或回退 boot 都须在真实 writer lease 下、ConfigFile/Store 之前重新读取格式证据，绑定 generation、实际 boot、role、安装/声明、DB/config 与 Store/main；再通过无迁移连接复核后进入本地恢复。健康证明须包含本次准入身份，不能跨 boot 复用旧证据。这些约束现由 V2 prepare、bootstrap、被动 Runtime 和控制者共同执行；入口范围及未验证边界见[本地托管切换](managed-operations.md)。
 
 首期自动更新要求旧/新程序对**同一持久格式**兼容：不仅 SQLite 表结构，还包含 objects/ingress/outbox 的 JSON 语义、配置 schema、receipt/profile 语义与管理交接协议。候选发行包须提供无需启动应用即可读取的兼容 manifest：协议版本、可读/可写持久格式、配置格式、是否需要迁移；版本号大小不能替代该证据。
 
-下一开发片已实现[兼容元数据纯判定](upgrade-compatibility.md)，独立区分 database、objects、configuration、ingress、outbox、memory、install_profile 七个完整语义领域。它只比较经调用者提供的声明，不读取真实库、不发当前版本格式标记，也不授权切换。缺少来源证明、原版本 manifest 或真实格式证据时仍拒绝；现有 protocol 1 的单安装身份不因声明中的协议数字相同而变成 A/B 协议。
+[兼容元数据纯判定](upgrade-compatibility.md)独立区分 database、objects、configuration、ingress、outbox、memory、install_profile 七个完整语义领域。判定器自身只比较经调用者提供的声明，不读取真实库、不发当前版本格式标记，也不授权切换；当前宿主另外核实际发行声明与真实格式证据。缺少来源证明、原版本 manifest 或真实格式证据时仍拒绝；protocol 1 的单安装身份不因声明中的协议数字相同而变成 A/B 协议。
 
-[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；uv 身份、完整解析上下文与候选安装仍未实现。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；正式启动仍需按[无迁移启动方案](no-migration-startup-design.md)接入完整候选准入。
+[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；uv 身份、完整解析上下文与自动候选安装仍未实现。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；完整候选准入已按[无迁移启动方案](no-migration-startup-design.md)接入 V2 启动链。
 
-[格式证据读取器](format-evidence.md)已独立实现：宿主提供专用连接，读取器在单一快照中核对完整格式标记、资料库及主人主会话身份，读取预算有限且不补数据。它不认证连接路径、发行来源或格式语义，也未接启动；缺少完整标记的历史库仍拒绝，不能自动补出兼容证明。
+[格式证据读取器](format-evidence.md)由宿主提供专用连接，在单一快照中核对完整格式标记、资料库及主人主会话身份，读取预算有限且不补数据。读取器已用于 V2 prepare 和 boot；它自身不认证连接路径、发行来源或格式语义，这些证据由调用链分别核验。缺少完整标记的历史库仍拒绝，不能自动补出兼容证明。
 
 在启动候选 Store 之前，旧控制者以只读方式检查当前版本标记与候选 manifest；缺失、未知、需要破坏性迁移或旧程序不能读取候选写入格式时，拒绝自动切换并保留原服务。现有 2.12 没有完整兼容 manifest，因此不能仅凭本文宣称可安全跨任意历史版本自动降级。候选还须有拒绝隐式迁移的启动模式；不能先让 `Store.__init__` 修改真实库，再检查是否兼容。
 
