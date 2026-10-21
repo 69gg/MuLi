@@ -675,8 +675,12 @@ async def _run_candidate_process(
         # Keep metadata with the attempt when ownership could not be settled.
         try:
             if confirmed and (
-                persistence is None
-                or (persistence.value.phase == "settled" and persistence.acknowledged)
+                persist is None
+                or (
+                    persistence is not None
+                    and persistence.value.phase == "settled"
+                    and persistence.acknowledged
+                )
             ):
                 try:
                     os.unlink(control, dir_fd=directory)
