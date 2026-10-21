@@ -164,14 +164,23 @@ async def test_changing_listen_config_cannot_remove_live_remote_authentication(
         ) as client,
     ):
         await client.post("/api/auth/login", json={"password": "remote-password"})
-        response = await client.patch(
-            "/api/settings", json={"server": {"host": "127.0.0.1", "clear_password": True}}
-        )
-        assert response.status_code == 400
-        assert config.settings.server.host == "0.0.0.0"
+        original = config.path.read_bytes()
+        for changes in (
+            {"host": "127.0.0.1", "clear_password": True},
+            {"host": "127.0.0.1"},
+        ):
+            response = await client.patch("/api/settings", json={"server": changes})
+            assert response.status_code == 409
+            assert response.json()["detail"] == "listener_restart_required"
+            assert config.path.read_bytes() == original
+            assert config.settings.server.host == "0.0.0.0"
+            assert config.settings.server.password_hash
+        # Even an out-of-band config edit cannot change the actual bound socket
+        # or remove its authentication through the remaining hot settings path.
+        config.update({"server": {"host": "127.0.0.1"}})
+        changed = await client.patch("/api/settings", json={"server": {"clear_password": True}})
+        assert changed.status_code == 400
         assert config.settings.server.password_hash
-        changed = await client.patch("/api/settings", json={"server": {"host": "127.0.0.1"}})
-        assert changed.status_code == 200
         status = (await client.get("/api/status")).json()
         assert status["listener"]["host"] == "0.0.0.0" and status["listener"]["restart_required"]
         await client.post("/api/auth/logout", json={})

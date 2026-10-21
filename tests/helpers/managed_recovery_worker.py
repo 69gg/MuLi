@@ -375,7 +375,7 @@ def forbidden_model(config: ModelConfig) -> NoReturn:
 
 
 def install_hooks() -> None:
-    """A test-only sitecustomize hook; never installed in a production prefix."""
+    """A test-only explicit .pth hook; never installed in a production prefix."""
     import logging
     from unittest.mock import patch
 
@@ -388,6 +388,8 @@ def install_hooks() -> None:
     from muli.managed_boot import ManagedBootPermit
     from muli.platforms import linux_bootstrap
 
+    common_hook = sys.modules.get("sitecustomize")
+    assert common_hook is not None and vars(common_hook).get("_muli_fixture_noop") is True
     role_value = os.environ["MULI_RECOVERY_ROLE"]
     assert role_value in {"base", "target"}
     role: Role = "base" if role_value == "base" else "target"
@@ -430,6 +432,7 @@ def install_hooks() -> None:
                 "pid": os.getpid(),
                 "prefix": sys.prefix,
                 "python": sys.executable,
+                "sitecustomize_noop": True,
             },
         )
         posts = 0

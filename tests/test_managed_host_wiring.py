@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pytest
@@ -17,6 +18,8 @@ from muli.management import SelfManagement
 from muli.management_transaction import JournalControl
 from muli.platforms.managed_deployment import DeploymentAnchor, DeploymentStore
 from muli.plugins import PluginManager
+
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed host ownership")
 
 
 def manager_for(host: Host, monkeypatch: pytest.MonkeyPatch) -> SelfManagement:

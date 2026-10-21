@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import muli
 from muli.managed_transaction import HealthProofV2, format_digest
 from muli.management_projection import read_projection
 from muli.management_transaction import Role, TransactionJournal
+from muli.platforms.filesystem_identity import FilesystemError, verify_local_filesystems
 from muli.platforms.installation import PackageLimits
 from muli.platforms.managed_deployment import SlotIdentity, register_local_slot
 from muli.platforms.managed_launcher import package_fingerprint
@@ -35,6 +37,90 @@ pytestmark = pytest.mark.skipif(
 )
 CASE_SECONDS = 20.0
 HTTP_BYTES = 4096
+
+
+def fixture_parent(repository: Path) -> Path:
+    unsupported: list[str] = []
+    for parent in (repository, Path(tempfile.gettempdir()).resolve()):
+        try:
+            verify_local_filesystems((parent,))
+        except FilesystemError as error:
+            if error.code not in {"filesystem_unsupported", "filesystem_durability_unsupported"}:
+                raise
+            unsupported.append(error.code)
+        else:
+            return parent
+    raise AssertionError("managed_fixture_no_supported_filesystem:" + ",".join(unsupported))
+
+
+@pytest.mark.parametrize("code", ["filesystem_unsupported", "filesystem_durability_unsupported"])
+def test_fixture_parent_uses_supported_second_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    repository, temporary = tmp_path / "checkout", tmp_path / "temporary"
+    repository.mkdir()
+    temporary.mkdir()
+    observed: list[Path] = []
+
+    def verify(directories: Sequence[Path]) -> None:
+        assert len(directories) == 1
+        observed.append(directories[0])
+        if directories[0] == repository:
+            raise FilesystemError(code)
+        assert directories[0] == temporary
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temporary))
+    monkeypatch.setattr(sys.modules[__name__], "verify_local_filesystems", verify)
+    assert fixture_parent(repository) == temporary
+    assert observed == [repository, temporary]
+
+
+def test_fixture_parent_fails_when_both_candidates_are_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, temporary = tmp_path / "checkout", tmp_path / "temporary"
+    repository.mkdir()
+    temporary.mkdir()
+    observed: list[Path] = []
+
+    def verify(directories: Sequence[Path]) -> None:
+        assert len(directories) == 1
+        observed.append(directories[0])
+        raise FilesystemError(
+            "filesystem_unsupported"
+            if directories[0] == repository
+            else "filesystem_durability_unsupported"
+        )
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temporary))
+    monkeypatch.setattr(sys.modules[__name__], "verify_local_filesystems", verify)
+    with pytest.raises(
+        AssertionError,
+        match="^managed_fixture_no_supported_filesystem:"
+        "filesystem_unsupported,filesystem_durability_unsupported$",
+    ):
+        fixture_parent(repository)
+    assert observed == [repository, temporary]
+
+
+@pytest.mark.parametrize(
+    "error", [FilesystemError("filesystem_observation_unavailable"), OSError("fixture observation")]
+)
+def test_fixture_parent_does_not_hide_observation_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    observed: list[Path] = []
+
+    def verify(directories: Sequence[Path]) -> None:
+        observed.extend(directories)
+        raise error
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "temporary"))
+    monkeypatch.setattr(sys.modules[__name__], "verify_local_filesystems", verify)
+    with pytest.raises(type(error)) as caught:
+        fixture_parent(tmp_path)
+    assert caught.value is error
+    assert observed == [tmp_path]
 
 
 def expect(
@@ -76,10 +162,18 @@ def slot(root: Path, name: str, repository: Path) -> SlotIdentity:
     # Retain the actual package declaration unchanged, rather than inventing fixture evidence.
     shutil.copytree(source, package, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
     dependencies = Path(sys.prefix) / "lib" / version / "site-packages"
-    (site / "fixture.pth").write_text(
-        f"{dependencies}\n{repository / 'tests/helpers'}\n", encoding="utf-8"
+    # Simulate an already imported system hook without changing the host Python.
+    (site / "000_muli_sitecustomize_noop.pth").write_text(
+        "import sys, types; sys.modules['sitecustomize'] = types.ModuleType('sitecustomize'); "
+        "sys.modules['sitecustomize'].__dict__['_muli_fixture_noop'] = True\n",
+        encoding="utf-8",
     )
-    (site / "sitecustomize.py").write_text(
+    (site / "fixture.pth").write_text(
+        f"{dependencies}\n{repository / 'tests/helpers'}\n"
+        "import _muli_managed_process_fixture_hook\n",
+        encoding="utf-8",
+    )
+    (site / "_muli_managed_process_fixture_hook.py").write_text(
         "import os\n"
         "if os.environ.get('MULI_RECOVERY_ROLE') in {'base','target'}:\n"
         "    from managed_recovery_worker import install_hooks\n"
@@ -139,9 +233,11 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
 ) -> None:
     repository = Path(__file__).resolve().parents[1]
     worker = repository / "tests/helpers/managed_recovery_worker.py"
-    # /tmp may be tmpfs. Keep the private, automatically removed fixture on the
-    # checkout's real filesystem so the actual supported-filesystem check runs.
-    with tempfile.TemporaryDirectory(prefix=".managed-process-", dir=repository) as temporary:
+    # Check only these two existing parents. Actual boot rechecks the private
+    # child directories; unsupported storage never becomes a fake observation.
+    with tempfile.TemporaryDirectory(
+        prefix=".managed-process-", dir=fixture_parent(repository)
+    ) as temporary:
         root = Path(temporary)
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -316,6 +412,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                     for role in roles:
                         booted = store.get("fixture", "boot-" + role)
                         assert booted is not None and booted["passive"] is True
+                        assert booted["sitecustomize_noop"] is True
                         chosen = base if role == "base" else target
                         assert (
                             booted["prefix"] == chosen.prefix

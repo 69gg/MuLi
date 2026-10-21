@@ -31,3 +31,11 @@
 实际安装 smoke 验证包内兼容声明、运行版本、七领域格式、网页与 API 文档、提示词、默认关闭的桌面能力、任务控制及 lifespan。发行校验要求源码、wheel、sdist 的声明和版本文件完全一致，沿用 CI 的一次构建产物，不在发布时另造未经检查的包。本地产物只用于验证，正式发布将使用对应远端 CI 构件。
 
 [真实进程验收](managed-process-recovery.md)使用临时保留安装、真实稳定入口同 PID exec、实际 CLI/bootstrap/Runtime、nonce HTTP、SQLite WAL/FULL 与 writer lease；systemd 命令、loaded unit/proc 归属和 cgroup 为合成边界。测试从原服务已停止的持久安装阶段开始，不代表真实用户服务、原实例 drain、完整依赖环境、断电或真实外部渠道已验证。原数据库最新输入、主身份、原 routing 和 unknown 状态均有保留断言。
+
+首个签名候选 `5c6bac495bfd9f05ff2132da1e0c5cddbb96dd2e` 的 [PR #26 CI](https://github.com/69gg/MuLi/actions/runs/39520656142)通过质量与 MCP 检查，完整矩阵暴露测试合同和环境选择遗漏。新宿主测试导入了 Linux 夹具但没有继承其模块标记，非 Linux 平台六项 setup 错误；consumer 模块补同一 Linux 条件，产品支持面不变。认证回归仍期待监听热修改成功，现改为验证两次 `409 listener_restart_required`、配置原始字节不变，并模拟外部配置漂移到回环地址后清密码仍被拒绝，保留实际远程监听的认证保护。
+
+两文件窄修连同监听组共 27 项通过（pytest 2.26 秒、service 3.115 秒、172.1 MiB、swap 0），Ruff 与格式通过。该组单独记录，不将原 1,253 项称为修订后全部重跑；新的远端精确 head 仍须重新完成完整矩阵。
+
+两个 Linux job 另有两例真实进程失败，各为 3 failed、3676 passed、6 skipped。Python 3.12 日志没有测试 boot 包装帧，进入了真实管理探针；Ubuntu 标准库的同名 `sitecustomize.py` 遮蔽了夹具钩子。本地在私有 prefix 预载同名无操作模块，稳定复现同一失败，随后改为 `.pth` 显式加载唯一测试模块。Python 3.13 则已进入钩子，准确原因是 `filesystem_durability_unsupported`；这只证明该路径不符合产品合同，不据此猜测具体挂载选项。夹具改为用真实 verifier 在 checkout 与系统临时目录两个有限父位置中择址，观察错误传播、全不支持仍失败，不改白名单或跳过原进程断言。
+
+最终五项择址单元测试通过（0.13 秒、59.1 MiB），真实成功切换和失败回退分别通过（7.77/13.24 秒，峰值 173.5/172.8 MiB）。两例始终预载无操作的公共 `sitecustomize`，服务和父进程逐角色断言该事实，证明不再依赖通用模块名；测试并未修改系统 Python。两文件 Ruff、格式和逐文件严格 mypy 通过，swap 0；独立尾审无阻断。合并 mypy 一次因辅助模块有两个收集名称报重复，沿用既有逐文件调用后通过，未为此修改源码或放宽类型检查。远端新 head 尚待复验，不能把本地择址通过当作已验证 runner 的临时目录。
