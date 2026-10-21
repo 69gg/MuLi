@@ -7,7 +7,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
@@ -413,7 +413,14 @@ class Skills:
             raise SkillLoadError("source_unavailable") from None
 
     def publish(self, snapshot: SkillSnapshot) -> None:
-        self._snapshot = snapshot
+        previous = {entry.name: entry for entry in self._snapshot.entries}
+        self._snapshot = replace(
+            snapshot,
+            entries=tuple(
+                previous[entry.name] if previous.get(entry.name) == entry else entry
+                for entry in snapshot.entries
+            ),
+        )
 
     def status(self) -> dict[str, Any]:
         snapshot = self._snapshot

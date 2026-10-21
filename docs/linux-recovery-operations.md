@@ -6,7 +6,7 @@
 
 ## 可用条件
 
-主进程必须由当前用户的标准 `muli.service` 启动，实际 unit、解释器、包、配置和数据路径均可核验；需要 systemd 用户会话、cgroup v2 与受支持的本地持久文件系统。符号链接、自定义 unit/drop-in、未知文件系统、运行身份不符或缺少可证明空闲合同的 legacy Python 插件会明确报告 unsupported。MCP/Skills 使用已有换代和空闲合同。完整约束见[安装身份](installation-manifest.md)、[文件系统核验](filesystem-identity.md)和[控制者设计](linux-controller-helper-design.md)。
+主进程必须由当前用户的标准 `muli.service` 启动，实际 unit、解释器、包、配置和数据路径均可核验；需要 systemd 用户会话、cgroup v2 与受支持的本地持久文件系统。符号链接、自定义 unit/drop-in、未知文件系统、运行身份不符或缺少可证明空闲合同的 legacy Python 插件会明确报告 unsupported。MCP 与纯 Skills 文档分别使用各自的[扩展发布合同](skills-live-design.md)，未解决恢复事务均阻止换代。完整约束见[安装身份](installation-manifest.md)、[文件系统核验](filesystem-identity.md)和[控制者设计](linux-controller-helper-design.md)。
 
 普通前台 `MuLi serve` 也取得独占 writer lease，可以正常使用；它不提供 systemd 恢复事务。现有未完成事务缺少正确 manifest、数据库或可支持宿主时，在构造 ConfigFile/Store 之前拒绝启动，不新建空数据库冒充恢复。
 

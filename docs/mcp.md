@@ -43,6 +43,8 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 发现变化或收到 `notifications/tools/list_changed` 后先合并为一个候选请求。主会话、queued/running agent 或未结束 workflow 忙碌时显示 queued；空闲后获取运行时配置锁，再检查真实活跃状态。队友报告等内部唤醒仍可在候选准备的等待期间启动主会话，因此在最后一次源核对之后、保存和发布之前再次同步检查 busy；发现新运行则丢弃候选，自动 reload 保留请求等待下次空闲。该检查到整组发布之间没有 await。未变服务器复用原连接；只为新增或改变的 HTTP/SSE 服务器建立候选连接。工具处理函数绑定已验证连接，发布时只替换 MCP 工具子集，不替换内置工具或其它 provider。
 
+仅 Skills 文档的自主目录变化可以沿[独立 Skills 发布路径](skills-live-design.md)在任务活跃时生效；它不准备、重连、发布或退休 MCP。最后完整接受的 MCP 来源/配置/预算必须不变，且不能有未履行的手动重载或 catalog refresh；混合变化继续排队。该次 `last_apply` 明示 `scope:skills`、`mcp:unchanged`，扩展代次推进不代表 MCP 已重新连接。
+
 已有 stdio 服务器的配置变化保守返回 `restart_required`，保持旧进程和旧配置；不会先关闭旧进程来试运行候选。删除服务器仍可在空闲发布后关闭旧连接。要改变这类 stdio 配置，需要在停止或重启进程时应用源配置；窄管理接口不会提前保存无法发布的候选。
 
 `PATCH /api/settings` 和 `self_configure` 的纯 `mcp`、`skills`、`extensions` 修改使用同一窄入口：先准备并验证全部候选，再原子保存配置，随后在没有 await 的步骤发布工具和 Skills 快照。保存失败丢弃候选，保留旧配置和旧能力。候选准备中出现新运行时，PATCH 返回 `409 runtime_busy` 且不保存；self_configure 保留 pending 计划及私有目标，等当前工作结束后重新准备。发布成功后才退休旧连接；旧连接关闭失败单独记为 retirement error，新代仍已生效，不声称回滚成功。退休任务由管理器强持有，调用者的重复取消不会取消正在关闭的连接；关闭失败的连接继续保留，由 shutdown 再尝试强制关闭客户端，不强杀进程、不重试工具执行。仍有未确认清理连接时拒绝新增候选并说明需要重启，避免重复积累连接。混合修改模型、渠道等其它配置仍走原有整体 reconfigure，暂不提供同等的候选保旧承诺。

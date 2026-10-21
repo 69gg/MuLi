@@ -2,6 +2,8 @@
 
 MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`self_configure` 校验补丁并写入私人待应用快照，在前台和团队空闲后应用。队列有配置指纹，期间其它入口修改配置会使旧计划失败，避免覆盖新设置。`self_status` 与 `/api/management` 可查看进度，待应用计划可由管理 API 取消。
 
+自主目录发现的纯 Skills 文档变化可在任务活跃时发布，当前请求保留已物化正文，下一请求按修订核验；不替换 MCP 连接。MCP、混合变化、设置补丁和手动完整重载仍等待全局空闲，已有手动请求不会被随后目录变化降级。`self_status` 的扩展 `last_apply` 以 `scope:skills` / `mcp:unchanged` 标明此次范围；受支持宿主的未解决恢复事务仍阻止这种发布。详见[Skills 活跃发布](skills-live-design.md)。
+
 候选更新策略使用独立的 `self_update_configure` 工具，或已认证的 `GET /api/management/update-policy`、`PUT /api/management/update-policy`。`self_config` 的 `candidate_update_policy` 返回完整策略；它不属于 `/api/settings` 的主配置，不能交给 `self_configure`。保存采用完整替换，先读取现值再修改，省略字段恢复默认；只保存策略，不创建目录、执行 uv、下载或切换安装。默认关闭，启用时需指定本地 wheelhouse、保留目录和 uv 绝对路径，以及资源预算。路径由主人或其授权的 agent 配置，保存成功不表示实际环境已经通过核验。
 
 策略复用现有 Store 中一个有界对象，保存与摘要事件原子提交；不向主配置添加字段，以保留旧恢复控制器的严格解析兼容性。未知版本、损坏或超出预算的既有策略不能被静默覆盖；服务关闭或恢复事务阻止配置时同样拒绝写入。保存后仍须 `self_update_preview` 核定实际来源，将其 `expected_policy` 原样用于 `self_update` 并经真实用户批准。准备在后台执行，结果沿原会话汇报；保存、预览或批准均不代表安装或服务健康已经验证。
