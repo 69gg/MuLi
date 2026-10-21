@@ -21,7 +21,7 @@ python scripts/check_local.py --seconds 30 run -- .venv/bin/ruff check .
 
 `backend` 必须显式指定已有 Python 解释器，不能自动下载或创建环境。核验资源限制后，按当前仓库约定递归发现 `tests/` 下的 `test_*.py` 与 `*_test.py`，固定文件清单；每批最多 32 个文件，使用新 pytest 进程串行运行，避免一个 Python 进程长期保留全套测试对象。也可在解释器后指定测试文件；目录、pytest 选项和不存在的路径拒绝，不悄悄改跑全量。需要 `-k` 等筛选时仍使用 `run -- 解释器 -m pytest ...`。
 
-所有批次在**同一个** service/cgroup 与总运行期限内，后续批次不重置 180 秒预算，不提高内存或 CPU 限额。第一批失败、进程被信号终止或资源守卫拒绝后停止，不重试或继续其它批；取消仍回收整个 service。新进程释放自身堆，并不承诺所有文件缓存立即归零或任意规模测试一定能在预算内通过。前端和远端 CI 保留原验证方式。
+所有批次在**同一个** service/cgroup 与总运行期限内，后续批次不重置 180 秒预算，不提高内存或 CPU 限额。第一批失败、进程被信号终止或资源守卫拒绝后停止，不重试或继续其它批；取消仍回收整个 service。新进程释放自身堆，并不承诺所有文件缓存立即归零或任意规模测试一定能在预算内通过。前端保留原验证方式，远端 CI 的分片见下文。
 
 此入口以当时全部 125 个后端文件实际运行四批，3,034 项通过、1 项平台跳过，整个 service 55.278 秒、峰值 846.8 MiB、swap 0；这是单个 cgroup 的整组峰值，不与四个独立 service 的分批峰值混称。随后将目录发现移入资源核验之后，26 项守卫检查与 48 项已有库检查经真实 backend 入口同组通过（峰值 86.7 MiB），Ruff/格式及脚本严格 mypy 通过。小型临时 pytest 替身还验证了真实新 PID、参数顺序和第二批失败后不启动第三批；无需递归运行真实 pytest 或创建额外服务。
 
@@ -32,5 +32,19 @@ python scripts/check_local.py --seconds 30 run -- .venv/bin/ruff check .
 优先小范围验证，串行执行较重检查；不要在失败后提高限额或循环重跑。先读取有限错误日志、审查代码和 fixture。比较 DOM 或循环引用对象的身份时断言 `actual === expected` 的布尔结果，避免诊断格式化遍历完整对象图。
 
 macOS、Windows 和没有 systemd 的 Linux 可继续运行 MuLi 产品；此本地开发入口不声称具备这些平台的等价隔离。托管 CI 在独立运行器执行既有跨平台矩阵，保留 job 硬超时，前端单并发与 Node 堆限制；`faulthandler_timeout` 仅用于诊断，不是进程终止保证。
+
+Linux CI 的每种 Python 版本使用两份不重叠的测试集合，macOS/Windows 继续各跑全套。
+显式 `--muli-ci-shard=1` / `2` 只在 pytest 完成正常收集后，按排序后的文件路径
+交错分组；同文件全部参数化用例和 fixture 生命周期保持在同一作业，不另写一套
+文件发现规则。非法参数和空片失败，没有该选项时行为不变。两片合起来覆盖同一
+收集集合，文件均分不保证耗时均分，所有平台输出 `--durations=20` 供后续定位。
+每项仍为十分钟上限，矩阵最多六项并行；恢复证据名称含分片编号，避免覆盖。
+当前 CI 共十项（八个测试作业、质量、MCP），发行复用它后共十三项；本地守卫与
+后端分批入口不改变。微型真实 pytest 回归验证无参数全量、参数化并集/交集、
+同文件归属、非法参数与空片，不运行本地完整测试集。
+
+分片依据为 [pytest collection hook](https://docs.pytest.org/en/stable/reference/reference.html#pytest.hookspec.pytest_collection_modifyitems)
+及 [GitHub matrix](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)；
+接口先经 Context7 检索，再核对已锁定 pytest 8.4.2 源码。
 
 实现依据：[systemd 资源控制](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)、[临时服务](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)、[服务期限与 OOM 策略](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)、[Node 测试运行器](https://nodejs.org/api/test.html)。
