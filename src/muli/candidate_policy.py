@@ -60,9 +60,9 @@ class CandidateLimits(StrictRecord):
 class CandidateSettings(StrictRecord):
     enabled: bool = False
     source: SourceName = "local-wheelhouse"
-    wheelhouse: str = Field(default="", repr=False)
-    retained_root: str = Field(default="", repr=False)
-    uv_executable: str = Field(default="", repr=False)
+    wheelhouse: str = Field(default="", max_length=4096, repr=False)
+    retained_root: str = Field(default="", max_length=4096, repr=False)
+    uv_executable: str = Field(default="", max_length=4096, repr=False)
     disk_mode: DiskMode = "threshold"
     limits: CandidateLimits = Field(default_factory=CandidateLimits)
 
