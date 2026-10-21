@@ -151,6 +151,10 @@ DIAGNOSTIC_FAILURES = frozenset(
         "observer_failed",
     }
 )
+SETUP_COMMANDS = frozenset({"daemon_reload", "manager_start", "manager_show"})
+SETUP_PHASES = frozenset(
+    {"initial"} | {f"{name}_{edge}" for name in SETUP_COMMANDS for edge in ("before", "after")}
+)
 
 
 def command_code(status: int | None, output: bytes) -> str:
@@ -266,6 +270,70 @@ def startup_facts(value: object, unit: str) -> bool:
     )
 
 
+def setup_facts(value: object) -> bool:
+    """Only the confirmed UID's two system units may enter setup evidence."""
+    fields = {
+        "uid",
+        "phase",
+        "client_code",
+        "diagnostic_status",
+        "diagnostic_code",
+        "stage",
+        "query_status",
+        "query_code",
+        "failure",
+        "unit",
+        "units",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or type(value["uid"]) is not int
+        or not 0 < value["uid"] < 2**31
+        or not isinstance(value["phase"], str)
+        or value["phase"] not in SETUP_PHASES
+        or not client_status(value["diagnostic_status"])
+        or not client_status(value["query_status"])
+        or any(
+            not isinstance(value[key], str) or value[key] not in COMMAND_CODES
+            for key in ("client_code", "diagnostic_code", "query_code")
+        )
+        or not isinstance(value["stage"], str)
+        or value["stage"] not in DIAGNOSTIC_STAGES
+        or not isinstance(value["failure"], str)
+        or value["failure"] not in DIAGNOSTIC_FAILURES
+    ):
+        return False
+    uid = value["uid"]
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    if value["unit"] not in ("", *names) or not isinstance(value["units"], list):
+        return False
+    if len(value["units"]) > len(names):
+        return False
+    for name, item in zip(names, value["units"], strict=False):
+        if not isinstance(item, dict) or item.get("unit") != name:
+            return False
+        if item.get("code") == "unit_absent":
+            if set(item) != {"unit", "code"}:
+                return False
+            continue
+        strings = {"load_state", "active_state", "sub_state", "result"}
+        integers = {"exec_code", "exec_status", "pid", "job"}
+        if (
+            item.get("code") != "observed"
+            or set(item) != {"unit", "code", "cgroup_present"} | strings | integers
+            or type(item["cgroup_present"]) is not bool
+            or any(
+                not isinstance(item[key], str)
+                or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", item[key]) is None
+                for key in strings
+            )
+            or any(type(item[key]) is not int or not 0 <= item[key] < 2**31 for key in integers)
+        ):
+            return False
+    return True
+
+
 def fixture_result(data: bytes) -> dict[str, Any]:
     """Export only finite fixture facts, never arbitrary worker JSON fields."""
     value = object_bytes(data)
@@ -329,7 +397,16 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             raise FixtureError("native_result_invalid")
     resources = value["resources"]
     if not isinstance(resources, dict) or not set(resources).issubset(
-        {"manager", "harness", "manager_peak", "initial", "cleanup", "startup", "environment"}
+        {
+            "manager",
+            "harness",
+            "manager_peak",
+            "initial",
+            "cleanup",
+            "startup",
+            "environment",
+            "setup",
+        }
     ):
         raise FixtureError("native_result_invalid")
     for name, facts in resources.items():
@@ -357,6 +434,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
         elif name == "startup":
             valid = isinstance(facts, dict) and isinstance(facts.get("unit"), str)
             valid = valid and startup_facts(facts, facts["unit"])
+        elif name == "setup":
+            valid = setup_facts(facts)
         elif name == "environment":
             names = {
                 "uid_matches",
@@ -467,6 +546,7 @@ class Receipt:
     user_created: bool = False
     user_removed: bool = False
     group_removed: bool = False
+    setup_phase: str = "initial"
     manager_group: str = ""
     image: tuple[int, int] | None = None
     temporary: tuple[int, int] | None = None
@@ -491,6 +571,8 @@ class Receipt:
             type(getattr(result, name)) is not bool
             for name in ("user_created", "user_removed", "group_removed")
         ):
+            raise FixtureError("native_receipt_invalid")
+        if not isinstance(result.setup_phase, str) or result.setup_phase not in SETUP_PHASES:
             raise FixtureError("native_receipt_invalid")
         if any(
             value is not None and (type(value) is not int or value <= 0)
@@ -605,6 +687,18 @@ class NativeCI:
     def save(self) -> None:
         assert self.receipt is not None
         write_json(self.receipt_path, asdict(self.receipt))
+
+    def setup_command(self, phase: str, *argv: str) -> bytes:
+        """Persist the exact original command's boundary without changing its budget."""
+        assert self.receipt is not None
+        if phase not in SETUP_COMMANDS:
+            raise FixtureError("native_setup_phase")
+        self.receipt.setup_phase = f"{phase}_before"
+        self.save()
+        output = self.sudo(*argv)
+        self.receipt.setup_phase = f"{phase}_after"
+        self.save()
+        return output
 
     def current_account(self) -> tuple[int, int]:
         receipt = self.receipt
@@ -726,7 +820,7 @@ class NativeCI:
         self.receipt.environment_file = (info.st_dev, info.st_ino)
         self.check_manager_environment()
         self.save()
-        self.sudo("systemctl", "daemon-reload")
+        self.setup_command("daemon_reload", "systemctl", "daemon-reload")
 
     def user_arguments(self, *argv: str) -> tuple[str, ...]:
         uid, _ = self.current_account()
@@ -913,9 +1007,15 @@ class NativeCI:
                 raise FixtureError("native_mount_not_readonly")
         self.prepare_manager_environment()
         unit = f"user@{actual[0]}.service"
-        self.sudo("systemctl", "start", f"user-runtime-dir@{actual[0]}.service", unit)
+        self.setup_command(
+            "manager_start", "systemctl", "start", f"user-runtime-dir@{actual[0]}.service", unit
+        )
         group = (
-            self.sudo("systemctl", "show", "--value", "-p", "ControlGroup", unit).decode().strip()
+            self.setup_command(
+                "manager_show", "systemctl", "show", "--value", "-p", "ControlGroup", unit
+            )
+            .decode()
+            .strip()
         )
         if not group.startswith("/") or Path(group).name != unit or ".." in Path(group).parts:
             raise FixtureError("native_manager_group")
@@ -1060,7 +1160,14 @@ class NativeCI:
         write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
 
     def execute(self) -> None:
-        self.prepare()
+        try:
+            self.prepare()
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            try:
+                self.observe_setup(error)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                pass  # An evidence failure must preserve the original preparation failure.
+            raise
         fixture = object_bytes(self.sudo("cat", str(self.volume / "fixture.json")))
         write_json(
             self.root / "result.json",
@@ -1100,6 +1207,75 @@ class NativeCI:
                 )
         if result is None or result.get("completed") is not True:
             raise FixtureError("native_case_failed")
+
+    def observe_setup(self, error: Exception) -> None:
+        """Observe two exact system units; never launch a private user-bus client."""
+        receipt = self.receipt
+        if receipt is None or receipt.setup_phase == "initial":
+            return
+        uid, _ = self.current_account()
+        facts: dict[str, Any] = {
+            "uid": uid,
+            "phase": receipt.setup_phase,
+            "client_code": command_error_code(error),
+            "diagnostic_status": None,
+            "diagnostic_code": "not_started",
+            "stage": "not_started",
+            "query_status": None,
+            "query_code": "not_started",
+            "failure": "not_started",
+            "unit": "",
+            "units": [],
+        }
+        end = time.monotonic() + CLEANUP_SECONDS
+        try:
+            worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+            reply = self.call(
+                (
+                    sys.executable,
+                    "-I",
+                    str(worker),
+                    "diagnose-setup",
+                    receipt.user,
+                    str(uid),
+                    str(self.home),
+                    str(end),
+                ),
+                seconds=end - time.monotonic(),
+            )
+            facts["diagnostic_status"] = reply.code
+            if time.monotonic() >= end:
+                raise FixtureError("native_diagnostic_deadline")
+            facts["diagnostic_code"] = command_code(reply.code, reply.output)
+            if reply.code == 0:
+                observed = {
+                    **object_bytes(reply.output),
+                    **{
+                        key: facts[key]
+                        for key in (
+                            "uid",
+                            "phase",
+                            "client_code",
+                            "diagnostic_status",
+                            "diagnostic_code",
+                        )
+                    },
+                }
+                if setup_facts(observed):
+                    facts = observed
+                else:
+                    facts["diagnostic_code"] = "invalid_reply"
+        except (ValueError, OSError, subprocess.SubprocessError) as failure:
+            facts["diagnostic_code"] = command_error_code(failure)
+        result = {
+            "completed": False,
+            "stage": "manager_setup",
+            "code": "setup_failed",
+            "timeline": [],
+            "generations": [],
+            "resources": {"setup": facts},
+        }
+        write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
 
     @staticmethod
     def same_mount(actual: dict[str, Any], expected: dict[str, Any]) -> bool:

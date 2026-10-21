@@ -367,6 +367,210 @@ async def diagnose(user: str, uid: int, home: Path, unit: str, deadline: float) 
     return facts
 
 
+async def observe_setup_units(
+    probe: SystemdProbe, uid: int, facts: dict[str, Any]
+) -> dict[str, Any]:
+    """Read the two dedicated system units without depending on their user bus."""
+    from muli.platforms.linux_transaction import _typed
+
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    facts["stage"] = "manager"
+    manager = await probe._properties("/org/freedesktop/systemd1", "Manager", (("Version", "s"),))
+    require(
+        isinstance(manager["Version"], str) and 0 < len(manager["Version"]) <= 256,
+        "native_diagnostic_invalid",
+    )
+    facts["stage"] = "listing"
+    listed = _typed(
+        await probe._command(
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "ListUnitsByPatterns",
+            "asas",
+            "0",
+            "2",
+            *names,
+        ),
+        "a(ssssssouso)",
+    )
+    require(
+        isinstance(listed, list)
+        and len(listed) == 1
+        and isinstance(listed[0], list)
+        and len(listed[0]) <= len(names)
+        and all(isinstance(row, list) and len(row) == 10 and row[0] in names for row in listed[0]),
+        "native_diagnostic_invalid",
+    )
+    present = {row[0] for row in listed[0]}
+    require(len(present) == len(listed[0]), "native_diagnostic_invalid")
+    for name in names:
+        facts["unit"] = name
+        if name not in present:
+            facts["units"].append({"unit": name, "code": "unit_absent"})
+            continue
+        facts["stage"] = "get_unit"
+        path = await probe._unit_path(name)
+        facts["stage"] = "unit_properties"
+        state = await probe._properties(
+            path,
+            "Unit",
+            (
+                ("Id", "s"),
+                ("LoadState", "s"),
+                ("ActiveState", "s"),
+                ("SubState", "s"),
+                ("Job", "(uo)"),
+            ),
+        )
+        facts["stage"] = "service_properties"
+        service = await probe._properties(
+            path,
+            "Service",
+            (
+                ("Result", "s"),
+                ("ExecMainCode", "i"),
+                ("ExecMainStatus", "i"),
+                ("MainPID", "u"),
+                ("ControlGroup", "s"),
+            ),
+        )
+        job, group = state["Job"], service["ControlGroup"]
+        require(
+            state["Id"] == name
+            and isinstance(job, list)
+            and len(job) == 2
+            and type(job[0]) is int
+            and 0 <= job[0] < 2**31
+            and job[1] == (f"/org/freedesktop/systemd1/job/{job[0]}" if job[0] else "/")
+            and isinstance(group, str)
+            and len(group) <= 1024
+            and (not group or (group.startswith("/") and ".." not in Path(group).parts)),
+            "native_diagnostic_invalid",
+        )
+        require(
+            all(
+                isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", value) is not None
+                for value in (
+                    state["LoadState"],
+                    state["ActiveState"],
+                    state["SubState"],
+                    service["Result"],
+                )
+            )
+            and all(
+                type(value) is int and 0 <= value < 2**31
+                for value in (
+                    service["ExecMainCode"],
+                    service["ExecMainStatus"],
+                    service["MainPID"],
+                )
+            ),
+            "native_diagnostic_invalid",
+        )
+        facts["units"].append(
+            {
+                "unit": name,
+                "code": "observed",
+                "load_state": state["LoadState"],
+                "active_state": state["ActiveState"],
+                "sub_state": state["SubState"],
+                "result": service["Result"],
+                "exec_code": service["ExecMainCode"],
+                "exec_status": service["ExecMainStatus"],
+                "pid": service["MainPID"],
+                "job": job[0],
+                "cgroup_present": bool(group),
+            }
+        )
+    facts["failure"] = "none"
+    return facts
+
+
+async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> dict[str, Any]:
+    """The working runner interpreter observes only its exact new UID's manager."""
+    import pwd
+
+    require(
+        re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None
+        and type(uid) is int
+        and 0 < uid < 2**31
+        and home.is_absolute(),
+        "native_diagnostic_identity",
+    )
+    require(remaining(deadline) <= CLEANUP_SECONDS, "native_diagnostic_deadline")
+    facts: dict[str, Any] = {
+        "stage": "identity",
+        "query_status": None,
+        "query_code": "not_started",
+        "failure": "not_started",
+        "unit": "",
+        "units": [],
+    }
+    try:
+        account = pwd.getpwnam(user)
+        require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_diagnostic_identity")
+        facts["stage"] = "import"
+        from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+        from muli.process import run_process
+
+        used = 0
+
+        async def query(
+            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+        ) -> dict[str, Any]:
+            nonlocal used
+            require(
+                argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command"
+            )
+            facts["query_status"], facts["query_code"] = None, "not_started"
+            if used >= MAX_BYTES:
+                facts["query_code"] = "output_budget"
+                raise NativeError("native_diagnostic_invalid")
+            result = await run_process(
+                [argv[0], "--system", *argv[2:]],
+                timeout=min(timeout, remaining(deadline)),
+                limit=min(limit, MAX_BYTES - used),
+                merge_stderr=False,
+            )
+            status = result.get("exit_code")
+            facts["query_status"] = (
+                status if type(status) is int and -(2**31) <= status < 2**31 else None
+            )
+            facts["query_code"] = diagnostic_command_code(status, result.get("stderr"))
+            output, stderr = result.get("output"), result.get("stderr")
+            if not isinstance(output, str) or not isinstance(stderr, str):
+                raise NativeError("native_diagnostic_invalid")
+            used += len(output.encode()) + len(stderr.encode())
+            if used > MAX_BYTES:
+                facts["query_code"] = "output_budget"
+                raise NativeError("native_diagnostic_invalid")
+            return result
+
+        async with asyncio.timeout(remaining(deadline)):
+            return await observe_setup_units(
+                SystemdProbe(
+                    runner=query,
+                    limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+                ),
+                uid,
+                facts,
+            )
+    except TimeoutError:
+        facts["failure"], facts["query_code"] = "deadline", "timeout"
+    except Exception as error:
+        if isinstance(error, NativeError) and str(error) == "native_deadline_exceeded":
+            facts["failure"], facts["query_code"] = "deadline", "timeout"
+        elif facts["stage"] in {"identity", "import"}:
+            facts["failure"] = (
+                "identity_failed" if facts["stage"] == "identity" else "import_failed"
+            )
+        else:
+            facts["failure"] = "query_failed" if facts["query_code"] != "ok" else "invalid_reply"
+    return facts
+
+
 def fixture(root: Path) -> dict[str, Any]:
     require(root.is_absolute() and root.resolve(strict=True) == root, "native_root_invalid")
     value = read_json(root / "fixture.json")
@@ -1113,6 +1317,12 @@ def main() -> int:
             diagnose(
                 sys.argv[2], int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5], float(sys.argv[6])
             )
+        )
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
+    if len(sys.argv) == 6 and sys.argv[1] == "diagnose-setup":
+        value = asyncio.run(
+            diagnose_setup(sys.argv[2], int(sys.argv[3]), Path(sys.argv[4]), float(sys.argv[5]))
         )
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0

@@ -98,6 +98,32 @@ class Commands:
         self.calls.append(values)
         if values[-1] == "describe":
             return ci.Reply(0, json.dumps(self.description).encode())
+        if len(values) == 8 and values[3] == "diagnose-setup":
+            assert values[:2] == (sys.executable, "-I")
+            assert values[4:7] == (
+                next(iter(self.accounts)),
+                str(self.uid),
+                self.accounts[values[4]][2],
+            )
+            return ci.Reply(
+                0,
+                json.dumps(
+                    {
+                        "stage": "listing",
+                        "query_status": 0,
+                        "query_code": "ok",
+                        "failure": "none",
+                        "unit": f"user@{self.uid}.service",
+                        "units": [
+                            {"unit": name, "code": "unit_absent"}
+                            for name in (
+                                f"user-runtime-dir@{self.uid}.service",
+                                f"user@{self.uid}.service",
+                            )
+                        ],
+                    }
+                ).encode(),
+            )
         if len(values) == 9 and values[3] == "diagnose":
             assert values[:2] == (sys.executable, "-I")
             assert values[4:7] == (
@@ -1653,3 +1679,335 @@ async def test_worker_exports_fixed_failure_code_without_arbitrary_exception_bod
     assert result["code"] == expected and result["completed"] is False
     assert "secret-password-body" not in (tmp_path / "result.json").read_text()
     assert "secret-password-body" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("phase", ["daemon_reload", "manager_start", "manager_show"])
+def test_setup_timeout_keeps_exact_before_phase_and_original_failure(
+    fixture: tuple[Any, Commands], phase: str
+) -> None:
+    native, commands = fixture
+    suffixes = {
+        "daemon_reload": ("systemctl", "daemon-reload"),
+        "manager_start": (
+            "systemctl",
+            "start",
+            f"user-runtime-dir@{commands.uid}.service",
+            f"user@{commands.uid}.service",
+        ),
+        "manager_show": (
+            "systemctl",
+            "show",
+            "--value",
+            "-p",
+            "ControlGroup",
+            f"user@{commands.uid}.service",
+        ),
+    }
+    attempted = 0
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal attempted
+        if tuple(argv[2:]) == suffixes[phase]:
+            attempted += 1
+            assert ci.Receipt.read(native.receipt_path).setup_phase == f"{phase}_before"
+            raise ci.FixtureError("native_command_timeout")
+        return commands(argv, seconds=seconds)
+
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.execute()
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert receipt.setup_phase == f"{phase}_before" and receipt.environment_file is not None
+    assert len(receipt.mounts) == 3 and commands.accounts and not receipt.user_removed
+    result = ci.fixture_result((native.root / "result.json").read_bytes())
+    facts = result["resources"]["setup"]
+    assert result["stage"] == "manager_setup" and result["generations"] == []
+    assert facts["phase"] == f"{phase}_before" and facts["client_code"] == "timeout"
+    assert facts["diagnostic_status"] == 0 and facts["failure"] == "none"
+    assert attempted == 1 and not any("systemd-run" in args for args in commands.calls)
+    diagnostic = next(args for args in commands.calls if "diagnose-setup" in args)
+    assert diagnostic[0] == sys.executable and not diagnostic[0].startswith(str(native.volume))
+
+
+def test_setup_success_persists_each_exact_command_boundary(fixture: tuple[Any, Commands]) -> None:
+    native, commands = fixture
+    seen: list[str] = []
+
+    def observe(argv: Any, *, seconds: float = 5) -> Any:
+        if argv[2:4] in (
+            ("systemctl", "daemon-reload"),
+            ("systemctl", "start"),
+            ("systemctl", "show"),
+        ):
+            seen.append(ci.Receipt.read(native.receipt_path).setup_phase)
+        return commands(argv, seconds=seconds)
+
+    native.run = observe
+    native.prepare()
+    assert seen == [
+        f"{phase}_before" for phase in ("daemon_reload", "manager_start", "manager_show")
+    ]
+    assert ci.Receipt.read(native.receipt_path).setup_phase == "manager_show_after"
+
+
+@pytest.mark.parametrize("change", ["body", "extra", "unit", "type"])
+def test_setup_diagnostic_rejects_untrusted_reply_without_hiding_timeout(
+    fixture: tuple[Any, Commands], change: str
+) -> None:
+    native, commands = fixture
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        if argv[2:4] == ("systemctl", "daemon-reload"):
+            raise ci.FixtureError("native_command_timeout")
+        reply = commands(argv, seconds=seconds)
+        if "diagnose-setup" not in argv:
+            return reply
+        if change == "body":
+            return ci.Reply(2, b"secret error body")
+        value = json.loads(reply.output)
+        if change == "extra":
+            value["stderr"] = "secret error body"
+        elif change == "unit":
+            value["units"][0]["unit"] = "user@1.service"
+        else:
+            value["query_status"] = True
+        return ci.Reply(0, json.dumps(value).encode())
+
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.execute()
+    raw = (native.root / "result.json").read_bytes()
+    facts = ci.fixture_result(raw)["resources"]["setup"]
+    assert facts["units"] == [] and facts["diagnostic_code"] != "ok"
+    assert b"secret" not in raw and ci.Receipt.read(native.receipt_path).mounts
+
+
+def test_late_setup_observation_cannot_restart_its_five_second_window(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    clock = 100.0
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal clock
+        if argv[2:4] == ("systemctl", "daemon-reload"):
+            raise ci.FixtureError("native_command_timeout")
+        reply = commands(argv, seconds=seconds)
+        if "diagnose-setup" in argv:
+            assert float(argv[-1]) == 105.0 and seconds == 5.0
+            clock = 105.0
+        return reply
+
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.execute()
+    facts = ci.fixture_result((native.root / "result.json").read_bytes())["resources"]["setup"]
+    assert facts["diagnostic_status"] == 0 and facts["diagnostic_code"] == "timeout"
+    assert (
+        facts["units"] == []
+        and len([args for args in commands.calls if "diagnose-setup" in args]) == 1
+    )
+
+
+def test_setup_evidence_write_failure_does_not_replace_original_timeout(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    original = ci.write_json
+
+    def write(path: Path, value: object) -> None:
+        if path == native.root / "result.json":
+            raise OSError("secret evidence failure")
+        original(path, value)
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        if argv[2:4] == ("systemctl", "daemon-reload"):
+            raise ci.FixtureError("native_command_timeout")
+        return commands(argv, seconds=seconds)
+
+    monkeypatch.setattr(ci, "write_json", write)
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.execute()
+    assert ci.Receipt.read(native.receipt_path).setup_phase == "daemon_reload_before"
+    assert commands.accounts and not (native.root / "result.json").exists()
+
+
+@pytest.mark.parametrize("phase", ["secret", []], ids=["unknown", "wrong-type"])
+def test_setup_receipt_phase_is_a_strict_fixed_enum(
+    fixture: tuple[Any, Commands], phase: object
+) -> None:
+    native, _ = fixture
+    native.prepare()
+    data = json.loads(native.receipt_path.read_bytes())
+    data["setup_phase"] = phase
+    ci.write_json(native.receipt_path, data)
+    with pytest.raises(ci.FixtureError, match="^native_receipt_invalid$"):
+        ci.Receipt.read(native.receipt_path)
+
+
+@pytest.mark.parametrize(
+    "case", ["present", "absent", "bad-list", "get-unit", "property", "bus", "budget", "deadline"]
+)
+async def test_setup_system_manager_observation_is_typed_bounded_and_readonly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    import pwd
+    from types import SimpleNamespace
+
+    from muli import process
+
+    user, uid, home = "muli-ci-" + "a" * 12, 23145, tmp_path / "private-home"
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    paths = {
+        name: f"/org/freedesktop/systemd1/unit/fixture{index}" for index, name in enumerate(names)
+    }
+    calls: list[list[str]] = []
+    clock = 100.0
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal clock
+        assert argv[:2] == ["busctl", "--system"] and "--user" not in argv
+        assert "--auto-start=no" in argv and not merge_stderr
+        assert 0 < timeout <= 5 and 0 < limit <= ci.OUTPUT_BYTES
+        assert all(
+            command not in argv for command in ("start", "stop", "set-property", "journalctl")
+        )
+        calls.append(argv)
+        if case == "bus":
+            return {"exit_code": 7, "output": "", "stderr": "Failed to connect to bus secret"}
+        if "ListUnitsByPatterns" in argv:
+            assert argv[-2:] == list(names)
+            rows = (
+                []
+                if case == "absent"
+                else [
+                    [name, "", "loaded", "activating", "start", "", path, 1, "start", "/job/1"]
+                    for name, path in paths.items()
+                ]
+            )
+            output = (
+                json.dumps({"type": "s", "data": "secret"})
+                if case == "bad-list"
+                else json.dumps(
+                    {
+                        "type": "a(ssssssouso)",
+                        "data": [rows],
+                    }
+                )
+            )
+        elif "GetUnit" in argv:
+            if case == "get-unit" and argv[-1] == names[-1]:
+                return {"exit_code": 6, "output": "", "stderr": "Unit secret not loaded"}
+            output = json.dumps({"type": "o", "data": [paths[argv[-1]]]})
+        else:
+            index = argv.index("get-property")
+            fields = argv[index + 4 :]
+            if fields == ["Version"]:
+                output = json.dumps({"type": "s", "data": "255"})
+                if case == "deadline":
+                    clock = 105.0
+            else:
+                name = next(name for name, path in paths.items() if path == argv[index + 2])
+                rows = {
+                    "Id": ("s", name),
+                    "LoadState": ("s", "loaded"),
+                    "ActiveState": ("s", "activating"),
+                    "SubState": ("s", "start"),
+                    "Job": ("(uo)", [11, "/org/freedesktop/systemd1/job/11"]),
+                    "Result": ("s", "success"),
+                    "ExecMainCode": ("i", 0),
+                    "ExecMainStatus": ("i", 0),
+                    "MainPID": ("u", 42),
+                    "ControlGroup": ("s", f"/user.slice/{name}"),
+                }
+                if case == "property":
+                    rows["MainPID"] = ("u", True)
+                output = "\n".join(
+                    json.dumps({"type": rows[field][0], "data": rows[field][1]}) for field in fields
+                )
+        return {"exit_code": 0, "output": output, "stderr": "x" * 12000 if case == "budget" else ""}
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+    monkeypatch.setattr(process, "run_process", query)
+    value = await worker.diagnose_setup(user, uid, home, 105.0)
+    assert "secret" not in json.dumps(value) and len(value["units"]) <= 2
+    if case in {"present", "absent"}:
+        assert value["failure"] == "none" and len(value["units"]) == 2
+        assert [item["unit"] for item in value["units"]] == list(names)
+        if case == "present":
+            assert all(
+                item["pid"] == 42 and item["job"] == 11 and item["cgroup_present"]
+                for item in value["units"]
+            )
+        else:
+            assert all(item["code"] == "unit_absent" for item in value["units"]) and len(calls) == 2
+    elif case == "get-unit":
+        assert value["stage"] == "get_unit" and value["query_code"] == "unit_unavailable"
+        assert len(value["units"]) == 1 and value["units"][0]["code"] == "observed"
+    elif case == "deadline":
+        assert value["failure"] == "deadline" and len(calls) == 1
+    else:
+        assert value["failure"] in {"invalid_reply", "query_failed"}
+        assert value["query_code"] == {"bus": "bus_unavailable", "budget": "output_budget"}.get(
+            case, "ok"
+        )
+    assert ci.setup_facts(
+        {
+            **value,
+            "uid": uid,
+            "phase": "manager_start_before",
+            "client_code": "timeout",
+            "diagnostic_status": 0,
+            "diagnostic_code": "ok",
+        }
+    )
+
+
+@pytest.mark.parametrize("change", ["user", "account", "deadline"])
+async def test_setup_observer_identity_and_deadline_refuse_before_system_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    import pwd
+    from types import SimpleNamespace
+
+    user, uid, home = "muli-ci-" + "a" * 12, 23145, tmp_path / "home"
+    monkeypatch.setattr(
+        pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid + 1, pw_dir=str(home))
+    )
+    deadline = worker.time.monotonic() + 5
+    if change == "account":
+        value = await worker.diagnose_setup(user, uid, home, deadline)
+        assert value["failure"] == "identity_failed" and value["units"] == []
+    else:
+        with pytest.raises(worker.NativeError):
+            await worker.diagnose_setup(
+                "root" if change == "user" else user,
+                uid,
+                home,
+                deadline - 6 if change == "deadline" else deadline,
+            )
+
+
+def test_setup_diagnostic_cli_keeps_separate_readonly_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    called: list[tuple[str, int, Path, float]] = []
+
+    async def observe(user: str, uid: int, home: Path, deadline: float) -> dict[str, Any]:
+        called.append((user, uid, home, deadline))
+        return {"stage": "manager"}
+
+    monkeypatch.setattr(worker, "diagnose_setup", observe)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["worker", "diagnose-setup", "muli-ci-" + "a" * 12, "23145", str(tmp_path), "105"],
+    )
+    assert worker.main() == 0
+    assert called == [("muli-ci-" + "a" * 12, 23145, tmp_path, 105.0)]
+    assert json.loads(capsys.readouterr().out) == {"stage": "manager"}

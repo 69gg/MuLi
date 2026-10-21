@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境修补的 112 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败，仍为 0 个事务。环境修补、三事务和正常服务收尾待下一精确远端候选验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境修补的 112 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮在更早的 manager 准备阶段超时，仍未执行事务，新增分阶段诊断正按以下有限合同实现。环境修补、三事务和正常服务收尾未验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -148,6 +148,20 @@ PR [#37](https://github.com/69gg/MuLi/pull/37) 的首轮精确候选为签名提
 独立审查在初轮 22 项新增例、完整 111 项通过后，发现 `set-property` 生成的 `system.control` 目录被整体接受，会使 `revert` 删除后来新增的外来文件。将 fake revert 改为忠实删除四个 unit 根的 instance 配置后，新反例在旧实现中稳定失败；修复改为同一自有文件承载资源与环境，删除 `set-property`，其它 instance 配置一律在首个 stop/revert 前拒绝。该反例证明 foreign 文件保留且没有清理效果，不是本机真实服务实验。
 
 最终完整 **112 个唯一 case**（原 89 加新 23）通过 0.49 秒、服务 1.016 秒、峰值 77.4 MiB/swap 0；先前 111 项、新组与两项关键尾例均包含在最终总数内，不重复计数。三份 Python 文件 Ruff/format 和两脚本 strict mypy 通过；本片 mypy 最高 158 MiB，最终尾轮 68 MiB，swap 0。没有提高任何期限或资源预算；所有命令仍经 root 绝对路径守卫、逐条 30 秒串行执行。没有本机原生 harness、账户/挂载/服务效果或构件下载；专用环境、三事务和正常服务收尾仍待下一精确远端候选验收。
+
+## 第五轮远端结果与 manager 准备诊断
+
+签名环境修复 `70425ce78a6a203d35f83160a4d7083d32e7ab95` 无冲突合入精确 2.33 候选 `1cf078dbd31c4f71054328de9cf02a46f2805d8f`，形成签名候选 `92c2b7360801af8d8726a21f71f055378deec5ce`。CI [39577510437](https://github.com/69gg/MuLi/actions/runs/39577510437) 最终八项成功，仅原生 [job 119146605869](https://github.com/69gg/MuLi/actions/runs/39577510437/job/119146605869) 失败，在 `09:30:52Z` 报 `native_command_timeout`，随后清理报 `native_cleanup_deadline`。620 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39577510437/artifacts/12335500167) 的 zip SHA256 为 `6ddfefb5ec00851df26cef81c0920e46b66832bf06a8283f54e9a9c60519f1d4`。
+
+本轮只有 receipt，没有 worker result：专用环境目录及文件已经确认，但 `manager_group` 仍为空；本次 UID/GID 999/987 的账户/组未标记删除，三个挂载仍记录在 receipt。它不能证明已启动 harness，更不能证明三事务或正常清理。环境文件的持久化早于 `daemon-reload`，manager cgroup 赋值晚于 `start` 和 `show`；现有证据只能界定这三条命令之一未完成，不能据此猜测 HOME、PAM、总线或冷启动耗时。
+
+下一诊断只增加以下事实，不改变准备与清理效果：
+
+- receipt 保存严格固定的 `setup_phase`：初始值，以及 `daemon_reload`、`manager_start`、`manager_show` 各自的 `before`/`after`。`manager_start` 仍是一条命令启动原来的 runtime-dir 与 manager 两个 unit，不拆命令增加等待额度。阶段写入先于命令，只有命令成功并返回才写 `after`。
+- 准备失败后，runner 自己已有的解释器仅用系统 manager 的显式 `--system` 通路，复用 typed D-Bus 解析读取本次已核 UID 的两个精确 unit；不依赖 retained Python 或用户 bus。只保留有限 load/active/sub/result、PID、退出码、job ID 和 cgroup 是否存在，不读 journal、环境或原始 stderr。精确 typed 列表空集才是缺席，GetUnit/属性错误仍保留观察阶段。
+- 整次观察仍共享既有 5 秒绝对诊断期限与 32 KiB 字节上限，不重试启动、不续功能期限，也不借诊断推进 cleanup。观察失败不能覆盖原准备超时；清理没有实际完成时保留原 receipt 和失败事实。真实阶段原因仍待下一精确远端候选。
+
+新增 **24 项纯 fixture** 通过 0.24 秒；完整 **136 个唯一 case**（原 112 加新 24）通过 0.55 秒、服务 1.090 秒、峰值 80.6 MiB/swap 0。它们覆盖三条原命令前后阶段、原异常优先、诊断导出失败/超时、严格系统 manager 查询、缺席与 GetUnit 错误区分、部分观察和累计字节预算。首轮 Ruff 指出 `zip` 需显式声明允许部分观察结果，strict mypy 指出自定义校验函数不能完成可选文本的类型窄化；两处均按原合同窄修，受影响的 8 项查询例再次通过且不另计唯一数。三份 Python 文件 Ruff/format 与两脚本 strict mypy 最终通过；本片最高 163.5 MiB 出现在首轮 mypy，修后 mypy 峰值 157.5 MiB，swap 均为 0。所有检查逐条经 root 绝对路径守卫、每条 30 秒串行执行，没有本机原生 harness、CLI、账户/挂载或真实 manager 效果；诊断片不构成第五轮根因修复或三事务/正常清理通过的证明。
 
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 
