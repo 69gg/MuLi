@@ -34,6 +34,28 @@
 传输预算问题，再选一项真正可验证的能力，比把这些接口全部开放后只裁剪模型输出更稳妥。
 不为研究修改全局安装、升级可选 SDK 或增加本地依赖。
 
+## 锁定 SDK 的进一步核对
+
+`uv.lock` 实际锁定 MCP SDK **1.21.0**、HTTPX **0.28.1** 和 httpx-sse **0.4.3**。
+Context7 当前检索返回了 SDK v2/main 文档，不能据此给此安装声明新的默认帧上限。
+逐项对照精确 1.21.0 tag 后确认：
+
+- [ClientSession](https://github.com/modelcontextprotocol/python-sdk/blob/v1.21.0/src/mcp/client/session.py)
+  的 `list_resources` 与 `list_resource_templates` 支持
+  `params=PaginatedRequestParams(cursor=...)`；旧 cursor 位置参数已标记弃用。
+  可复用 MuLi 工具目录适配器的分页形态，而不是依赖 FastMCP 高层自动取完目录。
+- [Streamable HTTP](https://github.com/modelcontextprotocol/python-sdk/blob/v1.21.0/src/mcp/client/streamable_http.py)
+  的 JSON 路径先 `response.aread()` 再交给 Pydantic，SSE 路径先取得完整事件数据再解析。
+  此版本暴露 `httpx_client_factory`，但该入口本身不是字节限制；对 POST、后台 GET 和
+  恢复流以及压缩响应分别证明预算前，不能声称一个输出截断器保护了接收内存。
+- [stdio](https://github.com/modelcontextprotocol/python-sdk/blob/v1.21.0/src/mcp/client/stdio/__init__.py)
+  将文本块累积到换行后才解析 JSON；零容量对象流约束已解析消息交接，不限制前面的
+  行缓冲。只在 session 返回后检查结果大小无法改变这个接收边界。
+
+因此后续需要独立选择并验证传输接缝或 SDK 兼容升级，不能为资源接口悄悄替换 transport、
+复制整套协议栈或把当前工具信任边界扩大为任意资源下载。以上仅为精确源码核对，没有
+本地安装、运行 SDK、连接服务或变更本轮 2.33 的热重载实现。
+
 ## 实施前需要闭合
 
 - 对锁定 MCP SDK 逐项核实 HTTP/SSE/stdio 的消息解码接缝，区分可强制的字节上限和
