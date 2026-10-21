@@ -12,6 +12,7 @@ import os
 import select
 import socket
 import sys
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any, NoReturn
@@ -299,6 +300,48 @@ class Probe(ManagedSystemdProbe):
         )
 
 
+class ObservedBackend(ManagedLinuxBackend):
+    """Measure the unchanged synchronous guard, without caching its evidence."""
+
+    check_calls: int = 0
+    check_seconds: float = 0.0
+
+    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+        started = time.monotonic()
+        self.check_calls += 1
+        try:
+            super()._check(record, role)
+        finally:
+            self.check_seconds += time.monotonic() - started
+
+
+async def observed_step(
+    driver: ManagedTransactionController,
+    backend: ObservedBackend,
+    index: int,
+    previous: TransactionRecordV2,
+) -> TransactionRecordV2:
+    """At most 32 small fixed records share the original 4 KiB stdout budget."""
+    started = time.monotonic()
+    calls, seconds = backend.check_calls, backend.check_seconds
+    try:
+        return await driver.step()
+    finally:
+        try:
+            # Fixed enums and capped scalars only; never serialize record contents.
+            values = [
+                index,
+                min(1_000_000, max(0, round((time.monotonic() - started) * 1000))),
+                min(1_000_000, max(0, backend.check_calls - calls)),
+                min(1_000_000, max(0, round((backend.check_seconds - seconds) * 1000))),
+                previous.phase,
+                previous.intent,
+            ]
+            checkpoint("controller-step=" + json.dumps(values, separators=(",", ":")))
+        except Exception:
+            pass  # Observation must not replace the step's result or exception.
+
+
 async def controller(root: Path) -> None:
     with TransactionJournal(root / "journal", root / "data/muli.sqlite3", create=False) as journal:
         anchor, slots = deployment(journal)
@@ -319,7 +362,7 @@ async def controller(root: Path) -> None:
                     assert argv == ["systemctl", "--user", "daemon-reload"]
                 return {"exit_code": 0, "stdout": "", "stderr": ""}
 
-            async with ManagedLinuxBackend(
+            async with ObservedBackend(
                 anchor,
                 slots["base"],
                 slots,
@@ -332,9 +375,9 @@ async def controller(root: Path) -> None:
                 driver = ManagedTransactionController(
                     control, backend, clock_reading, operation_timeout=20.0
                 )
-                for _ in range(32):
+                for index in range(32):
                     previous = read_record(journal)
-                    record = await driver.step()
+                    record = await observed_step(driver, backend, index, previous)
                     assert record.phase != "recovery_required", record.public()
                     assert record.activation != "blocked", record.public()
                     if record.resolved:
