@@ -15,9 +15,10 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from helpers.uia_native_startup import observe_native_form
 
 from muli.config import Settings
-from muli.process import _settle_process, _wait_cleanup
+from muli.process import _settle_process
 from muli.tools import uia_computer as module
 from muli.tools.ax_lease import AXHelperLease
 from muli.tools.computer import Computer, ComputerError
@@ -28,15 +29,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 _FORM = r"""
+[Console]::Error.WriteLine('muli-native-stage=script_entered')
+[Console]::Error.Flush()
 $ErrorActionPreference = 'Stop'
 $PSModuleAutoLoadingPreference = 'None'
 Set-StrictMode -Version Latest
 $utility = [IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
 Microsoft.PowerShell.Core\Import-Module $utility -Cmdlet Add-Type, ConvertTo-Json
+[Console]::Error.WriteLine('muli-native-stage=system_module_loaded')
+[Console]::Error.Flush()
 Microsoft.PowerShell.Utility\Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+[Console]::Error.WriteLine('muli-native-stage=assemblies_loaded')
+[Console]::Error.Flush()
 $writer = [IO.StreamWriter]::new([Console]::OpenStandardOutput(), [Text.UTF8Encoding]::new($false))
 $writer.AutoFlush = $true
 $form = [Windows.Forms.Form]::new()
+[Console]::Error.WriteLine('muli-native-stage=form_constructed')
+[Console]::Error.Flush()
 $form.Text = $args[0]
 $form.ShowInTaskbar = $false
 $form.StartPosition = [Windows.Forms.FormStartPosition]::Manual
@@ -61,12 +70,32 @@ $button.Location = [Drawing.Point]::new(5, 80)
 [void]$form.Controls.Add($label)
 [void]$form.Controls.Add($password)
 [void]$form.Controls.Add($button)
+[Console]::Error.WriteLine('muli-native-stage=controls_ready')
+[Console]::Error.Flush()
+$form.Add_HandleCreated({
+    [Console]::Error.WriteLine('muli-native-stage=handle_created')
+    [Console]::Error.Flush()
+})
+$form.Add_Load({
+    [Console]::Error.WriteLine('muli-native-stage=loaded')
+    [Console]::Error.Flush()
+})
+$form.Add_Activated({
+    [Console]::Error.WriteLine('muli-native-stage=activated')
+    [Console]::Error.Flush()
+})
 $form.Add_Shown({
+    [Console]::Error.WriteLine('muli-native-stage=shown')
+    [Console]::Error.Flush()
     $writer.WriteLine((Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject @{
         pid = $PID; title = $form.Text
     } -Compress))
 })
-try { [Windows.Forms.Application]::Run($form) }
+try {
+    [Console]::Error.WriteLine('muli-native-stage=before_message_loop')
+    [Console]::Error.Flush()
+    [Windows.Forms.Application]::Run($form)
+}
 finally { $form.Dispose(); $writer.Dispose() }
 """
 
@@ -105,21 +134,10 @@ async def native_form(tmp_path: Path) -> AsyncIterator[NativeForm]:
         )
     )
 
-    async def settle() -> None:
-        process = await asyncio.shield(starting)
-        await _settle_process(process, [])
-
-    try:
-        async with asyncio.timeout(settings().computer.operation_timeout_seconds):
-            process = await asyncio.shield(starting)
-            assert process.stdout is not None
-            line = await process.stdout.readline()
-            assert 0 < len(line) <= 4096, "Owned WinForms fixture did not publish bounded readiness"
-            ready = json.loads(line.decode("utf-8", errors="strict"))
-            assert ready == {"pid": process.pid, "title": title}
+    async with observe_native_form(
+        starting, title, settings().computer.operation_timeout_seconds
+    ) as process:
         yield NativeForm(process, title)
-    finally:
-        await _wait_cleanup(asyncio.create_task(settle()))
 
 
 async def discover(computer: Computer, form: NativeForm) -> str:
