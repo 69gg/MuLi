@@ -39,3 +39,7 @@
 两个 Linux job 另有两例真实进程失败，各为 3 failed、3676 passed、6 skipped。Python 3.12 日志没有测试 boot 包装帧，进入了真实管理探针；Ubuntu 标准库的同名 `sitecustomize.py` 遮蔽了夹具钩子。本地在私有 prefix 预载同名无操作模块，稳定复现同一失败，随后改为 `.pth` 显式加载唯一测试模块。Python 3.13 则已进入钩子，准确原因是 `filesystem_durability_unsupported`；这只证明该路径不符合产品合同，不据此猜测具体挂载选项。夹具改为用真实 verifier 在 checkout 与系统临时目录两个有限父位置中择址，观察错误传播、全不支持仍失败，不改白名单或跳过原进程断言。
 
 最终五项择址单元测试通过（0.13 秒、59.1 MiB），真实成功切换和失败回退分别通过（7.77/13.24 秒，峰值 173.5/172.8 MiB）。两例始终预载无操作的公共 `sitecustomize`，服务和父进程逐角色断言该事实，证明不再依赖通用模块名；测试并未修改系统 Python。两文件 Ruff、格式和逐文件严格 mypy 通过，swap 0；独立尾审无阻断。合并 mypy 一次因辅助模块有两个收集名称报重复，沿用既有逐文件调用后通过，未为此修改源码或放宽类型检查。远端新 head 尚待复验，不能把本地择址通过当作已验证 runner 的临时目录。
+
+第二轮精确提交 `9c7c383c22a6801ba9ca718a3c05f00c49401cb5` 的 [CI](https://github.com/69gg/MuLi/actions/runs/39522411961)中，质量、MCP、macOS/Windows 四组均通过；Ubuntu 两组各为 3682 passed、6 skipped、2 failed。剩余失败均为 `managed_fixture_no_supported_filesystem:filesystem_durability_unsupported,filesystem_durability_unsupported`，发生在子进程创建之前，证明两个候选父目录均不支持，而非名称钩子或时限问题。此时不再猜其它普通路径；改由托管 CI 供应一个独立 64 MiB 临时 ext4 loop 卷，真实核验并输出挂载与空间信息。显式测试根错误不回退，失败路径也按固定目录正常卸载；不改产品文件系统门，不跳过进程测试。
+
+修订后的 11 项择址回归通过（0.24 秒、61.8 MiB）；显式指定本机原有受支持目录，真实成功切换和回退分别通过（7.74/13.37 秒、176.1/179.9 MiB），没有本机挂载或下载。Ruff、格式、逐文件 strict mypy 通过（mypy 350.2 MiB）；workflow YAML 解析与两个脚本的 `bash -n` 通过，仅检查语法、不执行挂载。上述检查仍为串行 30 秒守卫、swap 0。独立审查确认容量与清理路径，远端专用卷及全矩阵仍待新 head 结果；loop 卷本身不构成断电耐久性证明。

@@ -51,7 +51,35 @@ jobs:
       - run: uv sync --locked
       - name: Report SQLite runtime
         run: uv run python -c "import sqlite3, sys; print(sys.version); print('SQLite', sqlite3.sqlite_version)"
+      - name: Prepare Linux recovery filesystem fixture
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/muli-managed-recovery.ext4"
+          directory="$RUNNER_TEMP/muli-managed-recovery"
+          truncate -s 64M "$image"
+          mkfs.ext4 -q -F "$image"
+          mkdir "$directory"
+          sudo mount -t ext4 -o loop,nodev,nosuid,noatime "$image" "$directory"
+          sudo chown "$(id -u):$(id -g)" "$directory"
+          chmod 700 "$directory"
+          findmnt --mountpoint "$directory" --output TARGET,FSTYPE,OPTIONS
+          df -B1 "$directory"
+          df -i "$directory"
+          export MULI_MANAGED_TEST_ROOT="$directory"
+          uv run python -c "import os; from pathlib import Path; from muli.platforms.filesystem_identity import verify_local_filesystems; verify_local_filesystems((Path(os.environ['MULI_MANAGED_TEST_ROOT']),))"
+          printf 'MULI_MANAGED_TEST_ROOT=%s\n' "$directory" >> "$GITHUB_ENV"
       - run: uv run pytest -q -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
+      - name: Release Linux recovery filesystem fixture
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/muli-managed-recovery"
+          if mountpoint -q "$directory"; then
+            sudo umount "$directory"
+          fi
       - name: Preserve synthetic channel recovery evidence
         if: failure()
         uses: actions/upload-artifact@v4

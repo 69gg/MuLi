@@ -40,6 +40,11 @@ HTTP_BYTES = 4096
 
 
 def fixture_parent(repository: Path) -> Path:
+    configured = os.environ.get("MULI_MANAGED_TEST_ROOT")
+    if configured is not None:
+        parent = Path(configured)
+        verify_local_filesystems((parent,))
+        return parent
     unsupported: list[str] = []
     for parent in (repository, Path(tempfile.gettempdir()).resolve()):
         try:
@@ -57,6 +62,7 @@ def fixture_parent(repository: Path) -> Path:
 def test_fixture_parent_uses_supported_second_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
 ) -> None:
+    monkeypatch.delenv("MULI_MANAGED_TEST_ROOT", raising=False)
     repository, temporary = tmp_path / "checkout", tmp_path / "temporary"
     repository.mkdir()
     temporary.mkdir()
@@ -78,6 +84,7 @@ def test_fixture_parent_uses_supported_second_candidate(
 def test_fixture_parent_fails_when_both_candidates_are_unsupported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("MULI_MANAGED_TEST_ROOT", raising=False)
     repository, temporary = tmp_path / "checkout", tmp_path / "temporary"
     repository.mkdir()
     temporary.mkdir()
@@ -109,6 +116,7 @@ def test_fixture_parent_fails_when_both_candidates_are_unsupported(
 def test_fixture_parent_does_not_hide_observation_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
+    monkeypatch.delenv("MULI_MANAGED_TEST_ROOT", raising=False)
     observed: list[Path] = []
 
     def verify(directories: Sequence[Path]) -> None:
@@ -121,6 +129,51 @@ def test_fixture_parent_does_not_hide_observation_errors(
         fixture_parent(tmp_path)
     assert caught.value is error
     assert observed == [tmp_path]
+
+
+def test_fixture_parent_verifies_explicit_root_without_implicit_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = tmp_path / "explicit"
+    selected.mkdir()
+    observed: list[Path] = []
+
+    def verify(directories: Sequence[Path]) -> None:
+        observed.extend(directories)
+
+    monkeypatch.setenv("MULI_MANAGED_TEST_ROOT", str(selected))
+    monkeypatch.setattr(sys.modules[__name__], "verify_local_filesystems", verify)
+    assert fixture_parent(tmp_path / "unused") == selected
+    assert observed == [selected]
+
+
+@pytest.mark.parametrize(
+    "code", ["filesystem_durability_unsupported", "filesystem_observation_unavailable"]
+)
+def test_fixture_parent_explicit_root_errors_never_fall_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    selected = tmp_path / "explicit"
+    observed: list[Path] = []
+
+    def verify(directories: Sequence[Path]) -> None:
+        observed.extend(directories)
+        raise FilesystemError(code)
+
+    monkeypatch.setenv("MULI_MANAGED_TEST_ROOT", str(selected))
+    monkeypatch.setattr(sys.modules[__name__], "verify_local_filesystems", verify)
+    with pytest.raises(FilesystemError, match=f"^{code}$"):
+        fixture_parent(tmp_path)
+    assert observed == [selected]
+
+
+@pytest.mark.parametrize("value", ["", "relative", "/tmp/../tmp"])
+def test_fixture_parent_explicit_root_rejects_invalid_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("MULI_MANAGED_TEST_ROOT", value)
+    with pytest.raises(FilesystemError, match="^filesystem_invalid_path$"):
+        fixture_parent(tmp_path)
 
 
 def expect(
@@ -233,7 +286,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
 ) -> None:
     repository = Path(__file__).resolve().parents[1]
     worker = repository / "tests/helpers/managed_recovery_worker.py"
-    # Check only these two existing parents. Actual boot rechecks the private
+    # Admit the explicit CI volume or the two local parents. Boot rechecks the private
     # child directories; unsupported storage never becomes a fake observation.
     with tempfile.TemporaryDirectory(
         prefix=".managed-process-", dir=fixture_parent(repository)
