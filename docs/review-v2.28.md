@@ -1,6 +1,6 @@
 # 2.28 工作流原路汇报与测试稳定性审查
 
-这是候选整合记录，尚未发布；2.27 的已固定签名提交已完成独立发行验证。
+2.28.0 已正式发布，精确候选、main 各八项和发行十一项全部成功。
 
 ## 工作流原路汇报
 
@@ -51,4 +51,27 @@
 [PR32](https://github.com/69gg/MuLi/pull/32) 接受自己的
 [CI 39544909670](https://github.com/69gg/MuLi/actions/runs/39544909670)。本地签名
 有效、工作树干净后推送；后续开发与发行事实记录进入独立分支，不修改
-此固定候选。完整矩阵尚未终结。
+此固定候选。该候选矩阵 attempt 1 八项全部成功，包含 macOS 的两个
+Python 版本，AX 确定性修复已获得本候选的平台验证。
+
+## 正式发行
+
+[PR32](https://github.com/69gg/MuLi/pull/32) 于 2026-10-21 04:44:11 UTC 合入
+main，保留精确签名 `2cfdeb230d6ec2e1a24f0516158c9fa9ca7391f5`。
+签名标签 `v2.28.0` 对象为 `2def6682b7ca2e2c7fc552585b02971389bccfd6`，
+本地 GPG 与远端签名、指向均已核对。
+[main CI](https://github.com/69gg/MuLi/actions/runs/39545666522) attempt 1 八项
+成功；同一提交的[发行流水线](https://github.com/69gg/MuLi/actions/runs/39545666431)
+attempt 1 八项独立验证及 prepare/publish/github-release 共十一项成功。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.28.0) 于
+2026-10-21 04:50:46 UTC 发布；[PyPI 2.28.0](https://pypi.org/project/muli-agent/2.28.0/)
+未撤回，两平台的文件名、字节数及 SHA-256 逐项相同：
+
+| 文件 | 大小（字节） | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.28.0-py3-none-any.whl` | 727747 | `c5d4961c343c9cb732b8d837276d05e005a0249d4f109bc7a132c1ab5cdf41d7` |
+| `muli_agent-2.28.0.tar.gz` | 3745370 | `c6d7c5632c8fa6a94c2675ede33750fb23446bb289f4028e59d5b07901f0ef7b` |
+
+仅读取小型 JSON 核验，没有下载发行包。没有以新版本通过改写 2.26 的
+历史 main 失败，也没有把临时 helper 验证称为真实 macOS 桌面操作验收。
