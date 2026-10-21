@@ -10,8 +10,8 @@
 [CI 39561110110 的 macOS 3.13 作业 119092321951](https://github.com/69gg/MuLi/actions/runs/39561110110/job/119092321951)
 为 `1 failed, 3131 passed, 1395 skipped`，129.39 秒。唯一失败是
 `test_request_timeout_includes_response_and_reaps_process`：预期
-`action_unknown_outcome/unknown`，实际为 `read_timeout`。其余七项作业通过，
-失败不来自该 PR 的原生恢复改动。
+`action_unknown_outcome/unknown`，实际为 `read_timeout`。同轮七项作业成功，
+原生恢复 job 另有启动失败；本节 AX 失败与它分开记录。
 
 旧测试从 cold spawn 之前就固定 150ms 请求 deadline，却无条件断言动作已经发送。
 真实产品在启动前确定 `min(timeout, lease expiry, caller deadline)`，直到最终
