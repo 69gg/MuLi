@@ -1,8 +1,9 @@
 # Windows UI Automation 后续切片调研
 
-状态：调研，未实现、未执行桌面或 Windows API。Windows Skills 的 NTFS 适配
-不等于 Windows 电脑操作；现有产品仍只提供 Linux AT-SPI、实验性 macOS AX
-以及独立截图/录屏。优先完成在线候选和当前平台回归，再决定此片实现。
+状态：本文保留实现前的调研依据。后续隔离首片选择系统 Windows PowerShell/.NET
+薄桥，只实现顶层窗口与选定窗口只读树，未开放动作和输入；本地只验证宿主
+协议，Windows 托管 CI 已通过三个真实原生用例并随 2.32.0 发布，未操作开发机桌面。实现与验证范围移至
+[Windows UIA 记录](windows-uia.md)。Windows Skills 的 NTFS 适配不等于电脑操作。
 
 ## 已有接缝
 
@@ -44,5 +45,6 @@ macOS 的具体 helper 或 POSIX 进程假设原样复制。主配置格式 1 �
 隔离桌面、权限不足或依赖缺失要给固定不可用原因；不把 mock 通过或
 headless runner 的 skip 写成用户桌面验收。
 
-本轮 Context7 先检索了 Win32 API 资料，再核对微软原始页面；尚未决定桥接
-实现，不声称系统 PowerShell、原生 COM 或跨位数提供者已经测试成功。
+调研时先用 Context7 检索 Win32 API，再核对微软原始页面；这份调研本身不证明
+系统 PowerShell、原生 COM 或跨位数提供者测试成功。后续实现不修改系统执行策略，
+不编译 Add-Type 源码，不宣称自有 helper 退出等于系统 COM broker 已回收。

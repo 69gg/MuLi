@@ -96,15 +96,17 @@ class Computer:
         self._discovery_generation = 0
         self._lock = asyncio.Lock()
         self.backend = (
-            {"linux": "atspi", "darwin": "ax"}.get(sys.platform, "unavailable")
+            {"linux": "atspi", "darwin": "ax", "win32": "uia"}.get(sys.platform, "unavailable")
             if self.config.backend == "auto"
             else self.config.backend
         )
         # AX refs live inside one short-lived native process. Importing its host
         # adapter never loads macOS libraries or starts that process.
         from muli.tools.ax_computer import AXComputer
+        from muli.tools.uia_computer import UIAComputer
 
         self._ax = AXComputer(self, owner=owner, dispatch_guard=dispatch_guard)
+        self._uia = UIAComputer(self, owner=owner)
 
     async def call(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self.config.enabled:
@@ -174,6 +176,8 @@ class Computer:
     async def status(self) -> dict[str, Any]:
         if self.backend == "ax":
             return await self._ax.status()
+        if self.backend == "uia":
+            return await self._uia.status()
         try:
             data = await self.call({"operation": "probe"})
             if (
@@ -383,6 +387,8 @@ class Computer:
     async def targets(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.backend == "ax":
             return await self._ax.targets(arguments)
+        if self.backend == "uia":
+            return await self._uia.targets(arguments)
         selected: _Target | None = None
         selection_error: ComputerError | None = None
         try:
@@ -447,6 +453,8 @@ class Computer:
     async def snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.backend == "ax":
             return await self._ax.snapshot(arguments)
+        if self.backend == "uia":
+            return await self._uia.snapshot(arguments)
         generation = self._clear_snapshot()
         selected = self._target(arguments["target_id"]) if "target_id" in arguments else None
         discovery_id = self.discovery_id
@@ -513,6 +521,8 @@ class Computer:
     async def action(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.backend == "ax":
             return await self._ax.action(arguments)
+        if self.backend == "uia":
+            return await self._uia.action(arguments)
         async with self._lock:
             if (
                 not self.snapshot_id
@@ -538,32 +548,42 @@ class Computer:
             return await self.call(request)
 
     async def release(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return await self._ax.release() if self.backend == "ax" else {"released": True}
+        if self.backend == "ax":
+            return await self._ax.release()
+        if self.backend == "uia":
+            return await self._uia.release()
+        return {"released": True}
 
     async def release_execution(self, session_id: str, run_id: str) -> None:
-        await self._ax.release_execution((session_id, run_id))
+        try:
+            await self._ax.release_execution((session_id, run_id))
+        finally:
+            await self._uia.release_execution((session_id, run_id))
 
     async def aclose(self) -> None:
-        await self._ax.aclose()
+        try:
+            await self._ax.aclose()
+        finally:
+            await self._uia.aclose()
 
     def tools(self) -> list[Tool]:
         target = {"snapshot_id": string(), "node_id": string()}
         tools = [
             Tool(
                 "computer_targets",
-                "发现无障碍应用；macOS 限前台应用。当前 application_id 可发现其窗口",
+                "发现无障碍应用或 Windows 顶层窗口；macOS 限前台应用。应用可按 application_id 展开",
                 parameters({"application_id": string("当前发现结果中的应用 ID，可选")}),
                 self.targets,
             ),
             Tool(
                 "computer_snapshot",
-                "读取无障碍树；Linux 默认桌面，macOS 默认前台应用。操作前须获取新快照",
+                "读取无障碍树；Linux 默认桌面，macOS 默认前台应用，Windows 须选当前窗口 target_id",
                 parameters({"target_id": string("当前发现中的应用或窗口 ID，可选")}),
                 self.snapshot,
             ),
             Tool(
                 "computer_release",
-                "释放当前执行持有的 macOS 无障碍引用；委派其他 agent 操作前先释放，让它重新观察",
+                "释放当前执行持有的 macOS/Windows 无障碍引用；委派其他 agent 前先释放，让它重新观察",
                 parameters({}),
                 self.release,
             ),
