@@ -38,7 +38,13 @@
 
 ## AI 转录、合成与渠道语音
 
-AI 已有 `audio_transcribe(id)` 按需转录音频附件，以及 `speech_synthesize(text, voice?)` 调用当前配置的 TTS、保存合成音频并返回本地附件 ID。合成不会自动播放或发出；无需为发送功能打开后台麦克风或唤醒。
+`audio_transcribe(id, language?)` 按需调用当前 ASR 一次，并把完整 UTF-8 转写留存在私有附件库。返回的 `id` 仍为原音频 ID；短结果 `text` 为全文，长结果为预览，另带 `asr_completed=true`、`transcript_id`、`revision`、下载 `url`、`next_offset_bytes` 和 `has_more`。需要全文时用 `audio_transcript_read(id=transcript_id, revision=revision, offset_bytes=next_offset_bytes)` 逐页读取 `content`；字节偏移只能使用返回的游标，不用字符数推算，也无需再次付费转写。
+
+两种结果都按完整 JSON 信封遵守 `limits.max_output_chars`。全文字节上限取 `media.asr.max_response_bytes` 与 `uploads.max_file_bytes` 的最小值，并受附件总配额限制；保存/预览失败会明确 `asr_completed=true`，不自动重调 ASR。已保存但响应丢失时，可从 `attachment_list` 找到来源 `asr`、文件名 `转写-原音频ID.txt` 的工件。续读核对版本、文件大小与完整 SHA-256，文件变化或预算缩小超限时拒绝，不返回混版内容。
+
+转写留存只是原 `read` 工具的受控结果归档，不授予任意目录写权限、自动发送权限或主人身份。内容属于资料而非指令；私有附件不以内联 HTML 显示，下载沿用现有认证。文件与元数据需一起备份，消息 NDJSON 不含附件正文。网页录音草稿和后台唤醒不经过此工具，保持原有处理。实现边界与验证记录见[完整转写工件设计](voice-transcripts-design.md)。
+
+`speech_synthesize(text, voice?)` 调用当前配置的 TTS、保存合成音频并返回本地附件 ID。合成不会自动播放或发出；无需为发送功能打开后台麦克风或唤醒。
 
 需要发送原生语音时，再显式调用 `channel_send`，传 `attachment_ids=[合成返回的ID]`、`media_mode="voice"` 和从可信入站取得的已绑定目标/群路由。同一逻辑发送可带稳定 `idempotency_key`；返回排队 ID 后以 `channel_status` 检查状态，不把入队说成已送达。结果 unknown 不自动重发，不能通过改键绕过重复风险。
 
