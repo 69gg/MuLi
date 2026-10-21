@@ -27,6 +27,22 @@ export function managementLabel(value) {
   return ({ pending: "待应用", applying: "正在应用", completed: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", sent: "已发送", sending: "发送中", unknown: "结果未知", loaded: "已加载", disabled: "未启用", error: "加载失败" })[value] ?? value ?? "状态未知";
 }
 
+export function managementActionLabel(plan) {
+  if (plan?.action === "switch" && plan.operation === "update") return "版本更新";
+  return ({ configure: "配置变更", restart: "重启服务", update: "版本更新", switch: "切换版本", adopt: "托管服务" })[plan?.action] ?? plan?.action ?? "管理操作";
+}
+
+export function managementPlanLabel(plan) {
+  if (plan?.action === "switch" && plan.operation === "update") {
+    if (plan.status === "applying") {
+      const label = ({ candidate_cleanup_required: "等待恢复", candidate_preparing: "准备更新", candidate_ready: "等待切换" })[plan.phase];
+      if (label) return label;
+    }
+    if (plan.status === "interrupted" && plan.phase === "candidate_cleaned") return "更新中断";
+  }
+  return managementLabel(plan?.status);
+}
+
 export function updateLabel(management) {
   if (!management) return "状态未知";
   const update = management.update;

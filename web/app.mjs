@@ -2,7 +2,7 @@ import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } f
 import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
-import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
+import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
@@ -2269,7 +2269,7 @@ function renderMaintenanceSettings() {
   for (const plugin of management?.plugins ?? []) inventory.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: plugin.name || plugin.id }), element("span", { text: managementLabel(plugin.status) })), element("p", { text: [plugin.id, plugin.version].filter(Boolean).join(" · ") }), plugin.error && element("p", { class: "form-error", text: plugin.error })));
   const plans = element("div", { class: "management-list" });
   if (management && !management.plans?.length) plans.append(element("p", { class: "settings-role-hint", text: "暂无管理操作。" }));
-  for (const plan of management?.plans ?? []) plans.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: ({ configure: "配置变更", restart: "重启服务", update: "版本更新" })[plan.action] ?? plan.action }), element("span", { text: managementLabel(plan.status) })), element("p", { text: [plan.created_at && formatFullDate(plan.created_at), plan.version, ...(plan.changed_sections ?? [])].filter(Boolean).join(" · ") }), plan.error && element("p", { class: "form-error", text: plan.error })));
+  for (const plan of management?.plans ?? []) plans.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: managementActionLabel(plan) }), element("span", { text: managementPlanLabel(plan) })), element("p", { text: [plan.created_at && formatFullDate(plan.created_at), plan.version, ...(plan.changed_sections ?? [])].filter(Boolean).join(" · ") }), plan.error && element("p", { class: "form-error", text: plan.error })));
   const update = management?.update;
   return element("div", {}, settingsResourceError("management"),
     settingsSection("本地插件", switchField("启用插件", "plugins.enabled", plugins.enabled), field("禁用的插件 ID", "plugins.disabled", (plugins.disabled ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }), inventory,

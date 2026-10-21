@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
-import { loadSettingsResources, capabilityLabel, managementLabel, updateLabel, retryChannelDelivery } from "../../web/management.mjs";
+import { loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, retryChannelDelivery } from "../../web/management.mjs";
 
 test("management status loading only reads existing APIs and preserves their payloads", async () => {
   const calls = [];
@@ -45,6 +45,70 @@ test("capability labels distinguish disabled, detected, running and unknown modu
   assert.equal(capabilityLabel({}), "状态未知");
   assert.equal(managementLabel("unknown"), "结果未知");
   assert.equal(managementLabel("pending"), "待应用");
+});
+
+test("management action labels distinguish candidate updates, version switches and adoption", () => {
+  assert.equal(managementActionLabel({ action: "switch", operation: "update" }), "版本更新");
+  assert.equal(managementActionLabel({ action: "switch" }), "切换版本");
+  assert.equal(managementActionLabel({ action: "adopt" }), "托管服务");
+  assert.equal(managementActionLabel({ action: "configure" }), "配置变更");
+  assert.equal(managementActionLabel({ action: "restart" }), "重启服务");
+  assert.equal(managementActionLabel({ action: "update" }), "版本更新");
+  assert.equal(managementActionLabel({ action: "future" }), "future");
+});
+
+test("candidate update plan labels follow both durable status and preparation phase", () => {
+  const plan = { action: "switch", operation: "update" };
+  for (const [status, phase, label] of [
+    ["applying", "candidate_cleanup_required", "等待恢复"],
+    ["applying", "candidate_preparing", "准备更新"],
+    ["applying", "candidate_ready", "等待切换"],
+    ["interrupted", "candidate_cleaned", "更新中断"],
+    ["pending", "candidate_preparing", "待应用"],
+    ["completed", "candidate_ready", "已完成"],
+    ["failed", "candidate_cleanup_required", "失败"],
+    ["interrupted", "candidate_preparing", "已中断"],
+    ["applying", "prepared", "正在应用"],
+  ]) assert.equal(managementPlanLabel({ ...plan, status, phase }), label);
+});
+
+test("noncandidate plans cannot borrow candidate preparation labels", () => {
+  for (const action of ["switch", "configure", "restart", "update", "adopt"]) {
+    for (const operation of [undefined, "switch", "update"]) {
+      if (action === "switch" && operation === "update") continue;
+      for (const phase of ["candidate_cleanup_required", "candidate_preparing", "candidate_ready", "candidate_cleaned"]) {
+        assert.equal(managementPlanLabel({ action, operation, status: "applying", phase }), "正在应用");
+        assert.equal(managementPlanLabel({ action, operation, status: "interrupted", phase }), "已中断");
+      }
+    }
+  }
+});
+
+test("management plan list renders update recovery labels without changing its layout", () => {
+  const source = readFileSync(new URL("../../web/app.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("function renderMaintenanceSettings()");
+  const end = source.indexOf("function renderModelSettings()", start);
+  assert.ok(start >= 0 && end > start);
+  const element = (tag, props, ...children) => ({ tag, props, children: children.filter(Boolean), append(...items) { this.children.push(...items.filter(Boolean)); } });
+  const context = {
+    state: { settingsDraft: {}, status: {}, management: { plans: [
+      { action: "switch", operation: "update", status: "applying", phase: "candidate_cleanup_required" },
+      { action: "switch", status: "applying", phase: "candidate_cleanup_required" },
+      { action: "adopt", status: "pending" },
+    ] } },
+    element, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, formatFullDate: String,
+    settingsSection: (title, ...children) => element("section", { title }, ...children),
+    settingsResourceError: () => null, settingsJSON: () => null, statusList: () => null,
+    switchField: () => null, field: () => null, actionButton: () => null,
+  };
+  runInNewContext(source.slice(start, end), context, { timeout: 1000 });
+  const pending = [context.renderMaintenanceSettings()]; const headings = [];
+  while (pending.length) {
+    const node = pending.shift();
+    if (node.props.class === "management-item-heading") headings.push(node.children.map((child) => child.props.text));
+    pending.push(...node.children);
+  }
+  assert.deepEqual(headings, [["版本更新", "等待恢复"], ["切换版本", "正在应用"], ["托管服务", "待应用"]]);
 });
 
 test("a failed or missing update check never becomes an up-to-date claim", () => {
