@@ -24,6 +24,26 @@
 
 开始请求丢返回且从未观察到 unit 时，一次列表不存在也不能排除迟到的 StartTransientUnit；此时保守报告未确认。gate 已关闭，迟到 worker 不会获准执行，有限 RuntimeMaxSec 仍生效。没有凭一次 not-found 结果伪造可删除证明。后端不新增持久执行账本、不承诺外部效果恰好一次。
 
+## 现有计划内的清理恢复
+
+`run_candidate_process(..., persist=...)` 可由宿主接入同一管理 plan 的单个私有字段；回调必须同步完成该字段的持久提交。`candidate_process_state.PendingProcess` 不是工具参数或杀进程授权，恢复入口只能接收宿主从已认证 plan 读取的附件。解析和发布均限 32 KiB，保存固定 unit、真实内核 boot、原绝对 deadline、RuntimeMax、原预算、私有目录身份，以及固定可信 worker/控制文件的身份和摘要；不会保存候选业务 argv、环境、gate 名称或 nonce。宿主还必须约束整个 plan 的大小，不能因为附件通过校验就绕过 plan 预算。
+
+控制文件和父目录先完成同步，随后依次提交三个阶段：
+
+1. `pending` 必须在 `systemd-run` 启动之前提交成功。失败或返回 coroutine 都不会启动请求。
+2. 核到同一 worker/proc/内核实限后，`observed` 必须在发送许可前提交成功，保存已受理的 invocation/cgroup/PID/start ticks。提交丢返回也不能发许可；后端仍强持观察到的身份并收尾。
+3. 只有同一 invocation 子树已核空、`systemd-run` 客户端已经收取，才提交 `settled`。提交成功后才能删除控制文件。收尾或提交未知时保留附件与 attempt，由宿主阻止下一候选并明确显示需要清理恢复；不能仅将计划改为 failed 后释放 singleflight。
+
+`platforms.candidate_recovery.recover_candidate_process(pending, persist=...)` 复用原 typed manager/resource 与 stop/empty 验证，不创建新 unit、不发 gate 许可、不执行或重装候选。它不延长原执行期限；只允许原有有限停止宽限。观察者重复取消仍等待同一次清理和最终持久提交，完成后才传播取消。恢复接口不删除 attempt，也不负责自动 GC。
+
+同一内核 boot 中，从未观察到的 `pending` 加一次 unit 不存在仍固定返回 `candidate_start_unconfirmed`，即使原 deadline 已过也不解锁；该保守边界需保留证据并由后续人工处理。已观察到的同 invocation 可停止并核空；若 unit 已不存在，仍要核原 cgroup 空。资源、文件身份、invocation、manager 或 cgroup 观察失败都不是空树证明。只有真实 kernel boot 已更换、两次结构化查询没有同名冲突、私有证据仍可核验时，旧启动请求才可确认已不再存活。当前同名冲突绝不成为跨 boot 的 kill 目标。
+
+宿主可直接消费可信 Store 中的 `settled`；恢复 API 对此也只读返回原证据，不再要求已删除的控制文件或重做服务操作。`pending`/`observed` 则必须保留可核的私有文件；损坏或丢失这些文件时宁可继续阻塞，也不猜测进程已退出。若提交回调失败而当前调用已经核空，异常可报告 `cleanup_confirmed=True`，但它不代表 `settled` 已耐久保存：宿主还须检查本 plan 的持久阶段，未确认时继续阻塞。
+
+本 seam 尚未接入公开恢复工具/HTTP 或宿主管理计划；只提供可复用执行边界。进程被强杀后，原 Python 客户端不再提供 reaping 收据，恢复以 manager 已受理的唯一 invocation、无待执行 job 和内核树空共同证明该启动请求已结束；不以客户端 PID 不存在代替这一证明。同 boot 的未观察缺席分支特意不作该推断。
+
+恢复片串行守卫验收：新增独立 fake 文件 29 项通过（0.68 秒、58.4 MiB），旧 fake 后端 48 项通过（1.35 秒、58.6 MiB），普通 stdlib worker 7 项与既有 helper/probe 103 项合 110 项通过（0.49 秒、62.8 MiB），本轮共 187 项。三个源码严格 mypy、四个 Python 文件 Ruff/格式通过，峰值 123.6 MiB，全部 swap 0。首轮停在复用 helper 夹具只接受 transaction 单元名的列表断言；新用例改用明确的 candidate existence fake，资源验证仍运行原 typed parser，未放宽产品检查。新文件模块级硬拦 subprocess，未创建真实 transient 单元、运行 uv、安装或下载。29 项覆盖真实 backend 的持久化顺序/丢返回、附件限额、已 settled 重放、真实私有文件身份变动、同/跨 boot 缺席与冲突、重复取消及资源验证；真实 manager 的崩溃恢复仍未验收。这里的 187 项包含下文既有回归，不能与原 158 项相加计为互不重叠的测试。
+
 ## 验证边界
 
 修正后的回归只操作小型临时目录、fake manager/proc/cgroup 和已知 stdlib worker。重点验证真实 gate 放行前零执行、断连/错误父身份/期限失败、内核与声明独立校验、观察变化拒绝、客户端已退出但 cgroup 仍活跃、强制 kill、重复取消与未知清理保留。本轮修正后检查没有创建真实 transient 服务、运行 uv、下载、安装候选或访问用户目录；真实 manager 与候选准备整链仍待后续单独验收。
