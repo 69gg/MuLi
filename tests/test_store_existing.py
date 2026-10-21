@@ -18,7 +18,12 @@ from muli.events import EventBus
 from muli.memory import Memory
 from muli.runtime import Runtime
 from muli.store import Store
-from muli.store_schema import ExistingStoreError, ExistingStoreLimits, validate_existing_schema
+from muli.store_schema import (
+    ExistingStoreError,
+    ExistingStoreLimits,
+    SchemaGroup,
+    validate_existing_schema,
+)
 
 _MUTATIONS = {
     sqlite3.SQLITE_CREATE_INDEX,
@@ -456,6 +461,22 @@ async def test_elapsed_read_budget_rejects_without_partial_migration(
     assert readings >= 2
     assert mutations == [] and snapshot(database) == before
     assert_closed(connections)
+
+
+@pytest.mark.parametrize("group", ["all", "core", "memory", "channel"])
+async def test_schema_validation_avoids_rescanning_unrelated_objects(
+    database: Path, group: SchemaGroup
+) -> None:
+    """A small valid store with extra schema fits a bounded instruction budget."""
+    with closing(sqlite3.connect(database)) as db:
+        for index in range(100):
+            db.execute(f"CREATE TABLE extra_fixture_{index} (value TEXT)")
+        db.execute("CREATE VIEW extra_large_view AS SELECT '" + "x" * 20_000 + "' AS value")
+        before = db.total_changes
+        validate_existing_schema(db, group, limits=ExistingStoreLimits(vm_steps=10_000))
+        assert db.total_changes == before
+        assert not db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 0
 
 
 async def test_validation_restores_limits_and_leaves_caller_transaction_untouched(
