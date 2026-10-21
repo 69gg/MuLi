@@ -1,5 +1,7 @@
 # 用户插件与自身管理
 
+已声明普通资源能力的 HTTP/SSE MCP 可由具备外部工具权限的会话或队友按需调用 `mcp_resources_list`、`mcp_resource_read`。两工具复用原审批和代次门，仅读取已展示引用的完整短文本；不增加主 Settings 字段或管理 API，也不自动预取。主协调/reviewer/Attention 的过滤保持，完整结果不能进入下一模型请求时明确停止。详见[MCP 普通资源](mcp.md#按需普通资源)。
+
 MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`self_configure` 校验补丁并写入私人待应用快照；轮到的纯 `mcp/skills/extensions` 计划可在任务运行时应用，其它修改等待前台和团队空闲。已有 pending/applying 计划时拒绝新计划，纯扩展也不越队。队列有配置指纹，期间其它入口修改配置会使旧计划失败，避免覆盖新设置。`self_status` 与 `/api/management` 可查看进度，待应用计划可由管理 API 取消。
 
 自主目录发现的纯 Skills 文档变化可独立热发布，当前请求保留已物化正文，下一请求按修订核验；不替换 MCP 连接或撤销其 handler。其它纯扩展变化和手动完整重载也可在任务期间通过完整候选发布，已有手动请求不会被随后目录变化降级。MCP 新代撤销尚未派发的旧调用，已接纳调用保留旧连接完成；回收期间计划排队，不创建第三套连接。`self_status` 的扩展 `last_apply` 区分 Skills-only 范围、实际发布及旧连接回收状态；未解决恢复事务仍阻止换代，模型/渠道混合配置仍等空闲。详见[Skills 活跃发布](skills-live-design.md)与[MCP 活跃换代](mcp-live-generation-design.md)。
