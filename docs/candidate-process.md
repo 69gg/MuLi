@@ -34,6 +34,8 @@
 2. 核到同一 worker/proc/内核实限后，`observed` 必须在发送许可前提交成功，保存已受理的 invocation/cgroup/PID/start ticks。提交丢返回也不能发许可；后端仍强持观察到的身份并收尾。
 3. 只有同一 invocation 子树已核空、`systemd-run` 客户端已经收取，才提交 `settled`。提交成功后才能删除控制文件。收尾或提交未知时保留附件与 attempt，由宿主阻止下一候选并明确显示需要清理恢复；不能仅将计划改为 failed 后释放 singleflight。
 
+尤其是首次 `pending` 提交已完成但回调丢返回时，构造函数可能还没将状态对象交回外层。删除条件以“是否配置了持久回调、是否已确认 settled”为准，不能把外层尚无状态对象当作未使用持久证据；该分支虽尚未启动进程，也保留控制文件，供真实新 boot 在无冲突时核验恢复。
+
 `platforms.candidate_recovery.recover_candidate_process(pending, persist=...)` 复用原 typed manager/resource 与 stop/empty 验证，不创建新 unit、不发 gate 许可、不执行或重装候选。它不延长原执行期限；只允许原有有限停止宽限。观察者重复取消仍等待同一次清理和最终持久提交，完成后才传播取消。恢复接口不删除 attempt，也不负责自动 GC。
 
 同一内核 boot 中，从未观察到的 `pending` 加一次 unit 不存在仍固定返回 `candidate_start_unconfirmed`，即使原 deadline 已过也不解锁；该保守边界需保留证据并由后续人工处理。已观察到的同 invocation 可停止并核空；若 unit 已不存在，仍要核原 cgroup 空。资源、文件身份、invocation、manager 或 cgroup 观察失败都不是空树证明。只有真实 kernel boot 已更换、两次结构化查询没有同名冲突、私有证据仍可核验时，旧启动请求才可确认已不再存活。当前同名冲突绝不成为跨 boot 的 kill 目标。
@@ -43,6 +45,8 @@
 本 seam 尚未接入公开恢复工具/HTTP 或宿主管理计划；只提供可复用执行边界。进程被强杀后，原 Python 客户端不再提供 reaping 收据，恢复以 manager 已受理的唯一 invocation、无待执行 job 和内核树空共同证明该启动请求已结束；不以客户端 PID 不存在代替这一证明。同 boot 的未观察缺席分支特意不作该推断。
 
 恢复片串行守卫验收：新增独立 fake 文件 29 项通过（0.68 秒、58.4 MiB），旧 fake 后端 48 项通过（1.35 秒、58.6 MiB），普通 stdlib worker 7 项与既有 helper/probe 103 项合 110 项通过（0.49 秒、62.8 MiB），本轮共 187 项。三个源码严格 mypy、四个 Python 文件 Ruff/格式通过，峰值 123.6 MiB，全部 swap 0。首轮停在复用 helper 夹具只接受 transaction 单元名的列表断言；新用例改用明确的 candidate existence fake，资源验证仍运行原 typed parser，未放宽产品检查。新文件模块级硬拦 subprocess，未创建真实 transient 单元、运行 uv、安装或下载。29 项覆盖真实 backend 的持久化顺序/丢返回、附件限额、已 settled 重放、真实私有文件身份变动、同/跨 boot 缺席与冲突、重复取消及资源验证；真实 manager 的崩溃恢复仍未验收。这里的 187 项包含下文既有回归，不能与原 158 项相加计为互不重叠的测试。
+
+独审追加首次 pending 提交丢返回反例：旧链单例 0.16 秒确定失败于控制文件已被删除；新条件下，原回调先保存 pending 再抛错，零 launch 且文件/身份保留，随后模拟真实新 boot 读数并核同名无冲突，可通过原恢复函数提交 settled。恢复文件现 30 项与旧后端 48 项合 78 项通过（1.92 秒、60.2 MiB），两 Python 文件 Ruff/格式和三个源码严格 mypy 通过，峰值 123.3 MiB、swap 0；与前述 187 项有重叠。没有通过删除证据、跳过文件校验或启动真实服务使反例通过。
 
 ## 验证边界
 

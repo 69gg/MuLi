@@ -145,6 +145,35 @@ async def test_pending_commit_failure_or_async_callback_cannot_launch(
     assert not probe.started.is_set() and not probe.permitted.is_set()
 
 
+async def test_lost_pending_commit_return_retains_cross_boot_recovery_evidence(
+    tmp_path: Path, fake_gate: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = FakeProbe()
+    saved: list[PendingProcess] = []
+
+    def persist(value: PendingProcess) -> None:
+        saved.append(value)  # The durable plan already contains this pending identity.
+        raise RuntimeError("pending committed but return lost")
+
+    with pytest.raises(CandidateProcessError, match="candidate_process_unavailable"):
+        await run_candidate_process(
+            spec_for(tmp_path), probe=probe, runner=checked_client(probe), persist=persist
+        )
+    assert [value.phase for value in saved] == ["pending"]
+    assert not probe.started.is_set() and not probe.permitted.is_set()
+    pending = saved[0]
+    assert Path(pending.control_file.path).exists()
+    pending.check_files()
+    monkeypatch.setattr(recovery, "current_boot", lambda: "d" * 32)
+    observer = RecoveryProbe()
+    observer.present = observer.live = False
+    settled = await recovery.recover_candidate_process(
+        pending, persist=saved.append, probe=observer
+    )
+    assert settled.phase == "settled" and saved[-1] == settled
+    assert "stop" not in observer.calls and "kill" not in observer.calls
+
+
 async def test_settled_replay_does_not_need_removed_control_or_manager(tmp_path: Path) -> None:
     value = pending_for(tmp_path, "observed").model_copy(update={"phase": "settled"})
     Path(value.control_file.path).unlink()
