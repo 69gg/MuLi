@@ -1,8 +1,8 @@
 # Windows UI Automation 后续切片调研
 
 状态：本文保留实现前的调研依据。后续隔离首片选择系统 Windows PowerShell/.NET
-薄桥，只实现顶层窗口与选定窗口只读树，未开放动作和输入；当前本地只验证宿主
-协议，未执行真实 Windows API 或开发机桌面。实现与 Windows CI 待验范围移至
+薄桥，只实现顶层窗口与选定窗口只读树，未开放动作和输入；本地只验证宿主
+协议，Windows 托管 CI 已通过三个真实原生用例，未操作开发机桌面。实现与验证范围移至
 [Windows UIA 记录](windows-uia.md)。Windows Skills 的 NTFS 适配不等于电脑操作。
 
 ## 已有接缝

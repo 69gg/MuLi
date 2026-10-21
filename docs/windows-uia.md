@@ -1,7 +1,7 @@
 # Windows UIA 只读窗口
 
-状态：隔离实现已通过下述 Linux 宿主与协议检查，尚未整合发布；三个真实 Windows
-用例等待远端 CI。没有在开发机调用 PowerShell、读取桌面、安装组件或修改执行策略。
+状态：本地整合及 Windows 3.12/3.13 的三个真实原生用例已通过；完整候选矩阵尚待
+收口，未发布。没有在开发机调用 PowerShell、读取桌面、安装组件或修改执行策略。
 
 ## 使用范围
 
@@ -80,7 +80,7 @@ swap 0 / 一逻辑 CPU 上限不变：
   首轮 Linux ctypes stub 缺 WinDLL 类型，改为现有 Windows 适配器相同的按需 loader
   后通过；旧 auto Windows unavailable 预期只改为 uia，禁用不启动断言保留。
 
-这不证明 PowerShell 脚本语法、系统模块实际布局、Windows provider 或 UIA 已工作。
+上述本地结果本身不证明 PowerShell 脚本语法、系统模块实际布局或 UIA 已工作。
 `test_uia_native.py` 只在 hosted Windows CI 创建自己的临时 WinForms 窗口；若未在
 Windows CI 执行，不能把 skip 当作验收。用例要求：
 
@@ -92,8 +92,9 @@ Windows CI 执行，不能把 skip 当作验收。用例要求：
    该项是进程/协议收尾验证，不冒称实际阻塞 provider 已测试。
 
 根分支另完成 428 项整合回归、全仓静态及完整离线构建/安装 smoke，安装后脚本资源
-完整性已验证，详细计数和资源证据见[2.32 审查](review-v2.32.md)。真实 Windows
-3.12/3.13 与上述临时窗口行为仍待精确候选 CI。
+完整性已验证。精确候选 `6a8ad38` 的 CI `39554055600` 在 Windows 3.12/3.13
+实际通过上述三个用例；同一轮 Ubuntu 3.13 的旧回滚用例失败，尚不能发布。
+完整计数、失败定位和后续结果见[2.32 审查](review-v2.32.md)。
 没有执行用户桌面动作、截图、输入、授权修改或系统 broker 清理。
 
 ## 官方依据
