@@ -1,4 +1,4 @@
-# 可选 MCP 工具
+# 可选 MCP 工具与资源
 
 MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要 MCP 库；只有显式启用服务器时才导入可选依赖。连接或列举工具失败只记入状态，不阻止本地助手启动。
 
@@ -69,9 +69,9 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 | max_mcp_fragments | 32 | JSON 分片数 |
 | max_mcp_fragment_bytes | 65536 | 单分片源字节 |
 | max_mcp_source_bytes | 262144 | 分片源总字节 |
-| max_mcp_pages | 8 | 每服务器完整目录页数 |
+| max_mcp_pages | 8 | 每服务器完整工具目录、每次显式资源目录各自的页数 |
 | max_mcp_tools | 100 | 所有启用服务器的工具总数 |
-| max_mcp_catalog_bytes | 262144 | 工具名、描述和参数 schema 的 JSON 总字节 |
+| max_mcp_catalog_bytes | 262144 | 工具名、描述和参数 schema 总 JSON 字节；每次资源目录另按完整页 JSON 合计计费 |
 | candidate_timeout_seconds | 30 | 整个候选准备时限；失败后独立清理另受连接时限约束 |
 | scan_interval_seconds | 2 | 轻扫描间隔 |
 | debounce_seconds | 0.5 | 变更合并窗口 |
@@ -92,6 +92,22 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 当前已发布 HTTP/SSE 连接的首次接收失败另以 `mcp_connection` 进入[统一系统事项](mcp-receive-notification-design.md)，受现有采集/通知级别、Attention 总开关与有界队列控制。它是独立连接故障，首次持久化时冻结默认或有效显式记忆路由，不冒用当前请求来源或 `extensions_watch`。前台工具回执可能同时可见，不表示远端执行两次。候选、退休连接、stdio、取消及 Runtime 关闭期间不新增该通知；不自动重连、重放或授予 MCP 操作权限。队满、写失败和关机可能丢通知，固定 latch/status 仍可按需查。旧 slot 不具有这项新来源，回退期间不承诺补发。
 
 预算约束的是交给 HTTPX/SDK 解码器的 body，不保证底层 transport 已分配的单个 chunk、全部连接合计 RSS 或无限小事件的速率。旧 slot 会保留但不执行这份私有策略，回退后不能声称仍受此防护。实现、锁定依赖与验证见[接收预算设计](mcp-wire-budget-design.md)。
+
+## 按需普通资源
+
+已启用的 HTTP/SSE 服务器在初始化中声明 `resources`（空对象 `{}` 也有效）后，提供两个固定宿主工具。`mcp_resources_list({"server":"remote_tools"})` 返回完整观察过的目录中的一页元数据、该页每项的 `ref` 和可选 `next_cursor`。将 `next_cursor` 原样作为 `cursor` 续页；续页只访问当前内存目录，不再向服务器请求。无 cursor 的调用表示重新完整观察目录。`mcp_resource_read({"server":"remote_tools","ref":"已展示引用"})` 只读取已展示项的完整短文本；不能直接提交 URI 或本机路径。
+
+连接准备、提示词和后台不预抓资源目录或正文。仅声明资源的服务器不请求 `tools/list`；原 tools-only 客户端保持原行为。两个宿主工具都为 `risk=external`，主协调会话、reviewer、Attention 和禁用工具过滤保持，不能借服务器“只读”声明绕过审批。它们不占远端 `max_mcp_tools` 条目，仍受实际模型上下文预算限制。
+
+一次目录观察在原连接 timeout 的同一绝对期限内完成全部服务器页。页数和完整页 JSON 总字节分别沿用上表预算，未知字段也计费；另限 256 项、URI 的 UTF-8 长度 4096 字节。空服务器游标合法，只有缺失或 `None` 结束；重复游标或 URI、超限、不完整均明确失败，不发布目录前缀。`catalog_complete=true` 表示服务器目录已完整观察，不表示这一宿主页展示了全部条目。只投影 name/URI/title/description/mimeType/size，未知扩展字段不传给模型。
+
+每连接仅一份完成目录和一个在途刷新，第二个刷新返回 `resource_catalog_busy`。只有实际展示项的 ref 可读；重复本地翻页不无限增长引用表。成功刷新、MCP 换代（含连接复用）、删除/关闭和重启会使旧 ref/cursor 失效。Skills-only 独立发布不改变 MCP token，不额外撤销资源引用。目录不是服务器原子快照，也不证明正文有同一修订。
+
+read 一次读取至多 16 个完整文本块。file/https/自定义 URI 只回传给原 MCP session，不在本机解释、打开、解析路径或额外 HTTP 抓取。blob、混合 text/blob 和无法证明的内容形状整体拒绝，不解码二进制、不返回文本子集。结果带 `untrusted=true`，元数据和正文都不能作为指令、Skill 或权限。URI 的显示值可脱敏，内部请求仍使用原 SDK URI，不请求被截短或脱敏后的地址。
+
+元数据和文本的字符串值按旧代密钥脱敏，固定字段名和宿主引用保持；随后核完整 JSON 字符预算，不能容纳时明确 `resource_output_budget_exceeded`，不制作正文 preview。最新工具批次经 Runtime 保持完整；完整批次放不进下一请求时停止运行，不继续请求模型。较早批次仍遵循原上下文淘汰规则。取消、超时和已进入 SDK 的未知结果不自动重放；换代前已接纳的 read 可在旧连接完成，迟到目录不签发新代可用引用。接收 latch 同时封锁工具与资源。
+
+本片不接 stdio 资源、模板、订阅或后台抓取，不新增配置/API/通知源。状态中 `resources_supported` 和固定 `resource_error_code` 不回显 URI、原服务器游标、正文或异常。实现与验收边界见[资源设计](mcp-resources-design.md)。
 
 ## 配置编辑与密钥
 
@@ -117,7 +133,7 @@ PATCH 中的 mcp 原子替换整个服务器配置；省略的服务器或密钥
 
 全局 timeout 同时限制连接、工具列举和每次调用；单服务器 timeout 只能收紧它，运行时另限制整个候选准备的总期限。调用不自动重试，以免外部操作重复。取消会传播到客户端；超时或异常只返回固定安全原因，不回显服务器异常正文。
 
-文本与结构化结果遵守 `max_output_chars`，超限返回 `truncated:true` 和受限 preview。图片、音频、二进制资源只保留类型元数据，不把 base64 数据塞入模型上下文或自动下载媒体。服务器错误结果正文不回显；已配置 env/header 值以及 Bearer token 在正常文本中也会遮盖。服务器日志和 stdio stderr 不转发给模型或应用日志。
+远端工具的文本与结构化结果遵守 `max_output_chars`，超限返回 `truncated:true` 和受限 preview。图片、音频、二进制资源只保留类型元数据，不把 base64 数据塞入模型上下文或自动下载媒体。服务器错误结果正文不回显；已配置 env/header 值以及 Bearer token 在正常文本中也会遮盖。服务器日志和 stdio stderr 不转发给模型或应用日志。上述工具结果的 preview 不适用于完整资源读取。
 
 ## 验证边界
 
