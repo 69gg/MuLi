@@ -1,6 +1,8 @@
 # 2.22 Linux 本地保留安装切换
 
-状态：候选已完成下述本地验证，尚未发布；远端精确提交、CI 与发行证据待实际完成后补充。
+状态：2.22.0 已于 2026-10-21 正式发布。签名提交 `cb294d3faefcb33007f7b3dd79885df87163b922` 的 [PR #26](https://github.com/69gg/MuLi/pull/26) 已合并；[候选八项 CI](https://github.com/69gg/MuLi/actions/runs/39523629425)、[main 八项 CI](https://github.com/69gg/MuLi/actions/runs/39524363655) 和 [Release 十一项作业](https://github.com/69gg/MuLi/actions/runs/39524418196) 全部成功。下文保留各次失败、修复和验证边界。
+
+签名标签 `v2.22.0` 对象为 `dde63d75ac09167c7870de95506330ec338cdc0f`，指向上述精确提交，GPG 签名有效。[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.22.0) 与 [PyPI 2.22.0](https://pypi.org/project/muli-agent/2.22.0/) 两份构件元数据一致：wheel 为 678,239 字节、SHA256 `df391f761ca3f5584e1a468e13c04971111cfafa59502725e46533d3d2be9a48`；sdist 为 3,564,340 字节、SHA256 `b6c8a64c4520fd9a33cbee7cd035190487eadad625fa69fb29d60173d53ae597`。核对仅直连读取有限元数据，没有下载发行包或安装用户环境。
 
 本版把 protocol 2 类型、同一 journal 的严格分派、共享控制引擎、稳定 launcher、真实启动准入和 Linux 后端接到公开管理入口。`self_adopt` 迁入当前完整保留安装，`self_switch` 经真实用户批准后切换到另一个已存在的兼容安装。配置与重启沿用同一恢复机制，`self_recover` 和已认证 API 可接续当前代。候选下载、环境创建、跨格式迁移与 macOS/Windows 同等切换不属于本次交付；详细输入与边界见[操作合同](managed-operations.md)。
 
