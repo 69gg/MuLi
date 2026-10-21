@@ -43,6 +43,7 @@ from muli.managed_boot import ManagedBootPermit
 from muli.managed_requests import LocalCandidate, validate_candidate
 from muli.management import SelfManagement
 from muli.management_transaction import ClockReading
+from muli.mcp_policy import ReceivePolicy
 from muli.memory_application import MemoryApplication
 from muli.memory_evidence import MemoryEvidence, memory_listing
 from muli.middleware import BodyLimitMiddleware
@@ -860,6 +861,19 @@ def _create_app(
     @app.get("/api/management/update-policy")
     async def update_policy() -> dict[str, Any]:
         return management.update_policy.read().model_dump(mode="json")
+
+    @app.get("/api/management/mcp-receive-policy")
+    async def mcp_receive_policy() -> dict[str, Any]:
+        return runtime.extensions.receive_policy_status()
+
+    @app.put("/api/management/mcp-receive-policy")
+    async def replace_mcp_receive_policy(body: ReceivePolicy) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = management.replace_mcp_policy(body)
+        await runtime.bus.notify()
+        return result
 
     @app.get("/api/management/update-preview")
     async def update_preview(

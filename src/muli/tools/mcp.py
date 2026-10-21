@@ -18,7 +18,9 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 
+from muli.mcp_policy import ReceivePolicy, checked_policy
 from muli.tools import Tool
+from muli.tools.mcp_receive import ReceiveState, install_receive_guard
 
 JsonObject = dict[str, Any]
 
@@ -92,6 +94,7 @@ class _Connection:
     timeout: float
     client: MCPClient
     stack: AsyncExitStack
+    receive: ReceiveState
     catalog: tuple[_RemoteTool, ...] = ()
     usable: bool = True
     close_failed: bool = False
@@ -115,6 +118,7 @@ class MCPCandidate:
     created: tuple[_Connection, ...]
     limits: MCPLimits
     generation: _Generation = field(repr=False)
+    receive_policy: ReceivePolicy
 
 
 class _FastMCPClient:
@@ -160,12 +164,28 @@ async def _ignore_server_log(message: Any) -> None:
 
 
 def _default_factory(
-    server: JsonObject, timeout: float, changed: Callable[[], None] | None = None
+    server: JsonObject,
+    timeout: float,
+    changed: Callable[[], None] | None = None,
+    receive: ReceiveState | None = None,
 ) -> MCPClient:
     # MCP 是可选依赖；未配置或未启用服务器时不加载。
+    import httpx
     from fastmcp import Client
     from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
+    from mcp.shared._httpx_utils import create_mcp_http_client
     from mcp.types import ServerNotification, ToolListChangedNotification
+
+    receive = receive or ReceiveState(ReceivePolicy())
+
+    def http_client_factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+        install_receive_guard(client, receive, streamable=server["transport"] == "http")
+        return client
 
     transport: Any
     if server["transport"] == "stdio":
@@ -179,7 +199,11 @@ def _default_factory(
         )
     else:
         transport_type = SSETransport if server["transport"] == "sse" else StreamableHttpTransport
-        transport = transport_type(url=server["url"], headers=server.get("headers"))
+        transport = transport_type(
+            url=server["url"],
+            headers=server.get("headers"),
+            httpx_client_factory=http_client_factory,
+        )
 
     async def catalog_notifications(message: Any) -> None:
         if (
@@ -217,6 +241,7 @@ class MCPManager:
         max_tools: int = 100,
         max_pages: int = 8,
         max_catalog_bytes: int = 262144,
+        receive_policy: ReceivePolicy | None = None,
         client_factory: ClientFactory | None = None,
     ) -> None:
         if (
@@ -229,6 +254,7 @@ class MCPManager:
         self.timeout, self.max_output_chars, self.max_tools = timeout, max_output_chars, max_tools
         self._limits = MCPLimits(max_tools, max_pages, max_catalog_bytes, max_output_chars)
         self._factory = client_factory
+        self.receive_policy = checked_policy(receive_policy or ReceivePolicy())
         self._connections: dict[str, _Connection] = {}
         self._retiring: set[_Connection] = set()
         self._status: dict[str, JsonObject] = {}
@@ -278,8 +304,20 @@ class MCPManager:
         ):
             self._changed(connection.name)
 
+    def _receive_failed(self, connection: _Connection) -> None:
+        connection.usable = False
+        if self._connections.get(connection.name) is connection:
+            self._status[connection.name].update(
+                status="error", error_code=connection.receive.code, error=connection.receive.code
+            )
+            self._schedule_retirement([connection], stage="receive_failure")
+
     def status(self) -> list[JsonObject]:
         return deepcopy(list(self._status.values()))
+
+    @property
+    def effective_receive_policy(self) -> ReceivePolicy | None:
+        return self.receive_policy if self._started else None
 
     @property
     def pending_cleanup(self) -> int:
@@ -479,6 +517,7 @@ class MCPManager:
         strict: bool = True,
         refresh: set[str] | None = None,
         limits: MCPLimits | None = None,
+        receive_policy: ReceivePolicy | None = None,
     ) -> MCPCandidate:
         """Prepare a complete catalog; reused connections remain owned by the active generation."""
         if self._closed:
@@ -490,6 +529,7 @@ class MCPManager:
         if self._candidate is not None:
             raise MCPPrepareError("candidate_pending")
         limits = limits or self._limits
+        receive_policy = checked_policy(receive_policy or self.receive_policy)
         config = deepcopy(config)
         secrets = self._config_secrets(config)
         generation = _Generation(frozenset(secrets), limits.max_output_chars)
@@ -516,7 +556,16 @@ class MCPManager:
                     server, timeout = self._server(raw)
                     status["transport"] = server["transport"]
                     previous = self._connections.get(name)
-                    if previous is not None and previous.raw == raw and previous.usable:
+                    if (
+                        previous is not None
+                        and previous.raw == raw
+                        and previous.usable
+                        and previous.receive.code is None
+                        and (
+                            server["transport"] == "stdio"
+                            or previous.receive.policy == receive_policy
+                        )
+                    ):
                         connection = previous
                         catalog = previous.catalog
                         if refresh and name in refresh:
@@ -527,6 +576,7 @@ class MCPManager:
                             raise MCPPrepareError("restart_required", name)
                         stack = AsyncExitStack()
                         holder: list[_Connection] = []
+                        receive = ReceiveState(receive_policy)
 
                         def changed(_holder: list[_Connection] = holder) -> None:
                             if _holder:
@@ -535,16 +585,19 @@ class MCPManager:
                         client = (
                             self._factory(server, timeout)
                             if self._factory is not None
-                            else _default_factory(server, timeout, changed)
+                            else _default_factory(server, timeout, changed, receive)
                         )
                         stack.push_async_callback(client.close)
-                        connection = _Connection(name, raw, server, timeout, client, stack)
+                        connection = _Connection(name, raw, server, timeout, client, stack, receive)
+                        receive.failed = lambda item=connection: self._receive_failed(item)
                         holder.append(connection)
                         created.append(connection)
                         new = True
                         async with asyncio.timeout(timeout):
                             await stack.enter_async_context(client)
                             catalog = await self._catalog(client, limits)
+                    if connection.receive.code is not None:
+                        raise MCPPrepareError(connection.receive.code, name)
                     size = sum(item.size for item in catalog)
                     if (
                         len(tools) + len(catalog) > limits.max_tools
@@ -560,7 +613,9 @@ class MCPManager:
                     raise
                 except Exception as exc:
                     code = (
-                        exc.code
+                        connection.receive.code
+                        if connection is not None and connection.receive.code is not None
+                        else exc.code
                         if isinstance(exc, MCPPrepareError)
                         else "dependency_missing"
                         if isinstance(exc, ImportError)
@@ -589,6 +644,7 @@ class MCPManager:
                 tuple(created),
                 limits,
                 generation,
+                receive_policy,
             )
         except BaseException:
             try:
@@ -598,12 +654,21 @@ class MCPManager:
                     self._candidate = None
             raise
 
-    def publish(self, candidate: MCPCandidate) -> tuple[_Connection, ...]:
-        """Only reference swaps; the caller validates registry conflicts before persisting config."""
+    def validate_candidate(self, candidate: MCPCandidate) -> None:
+        """Synchronous final fence, also usable before a caller persists configuration."""
         if self._closed:
             raise MCPPrepareError("manager_closed")
         if self._candidate is not candidate.generation:
             raise MCPPrepareError("candidate_changed")
+        for connection in candidate.connections.values():
+            if connection.receive.code is not None or not connection.usable:
+                raise MCPPrepareError(
+                    connection.receive.code or "connection_changed", connection.name
+                )
+
+    def publish(self, candidate: MCPCandidate) -> tuple[_Connection, ...]:
+        """Only reference swaps; the caller validates registry conflicts before persisting config."""
+        self.validate_candidate(candidate)
         retired = tuple(
             connection
             for name, connection in self._connections.items()
@@ -615,6 +680,7 @@ class MCPManager:
         self._status = {item["name"]: item for item in candidate.statuses}
         self.tools = list(candidate.tools)
         self._limits = candidate.limits
+        self.receive_policy = candidate.receive_policy
         self.max_tools = candidate.limits.max_tools
         self.max_output_chars = candidate.limits.max_output_chars
         self._generation = candidate.generation
@@ -759,12 +825,17 @@ class MCPManager:
             self._closed
             or generation is not self._generation
             or not connection.usable
+            or connection.receive.code is not None
             or self._connections.get(connection.name) is not connection
         ):
             return {
                 "is_error": True,
                 "status": "not_executed",
-                "code": "manager_closed" if self._closed else "generation_changed",
+                "code": (
+                    "manager_closed"
+                    if self._closed
+                    else connection.receive.code or "generation_changed"
+                ),
             }
         connection.active_calls += 1
         connection.idle.clear()

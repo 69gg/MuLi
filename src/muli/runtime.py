@@ -30,6 +30,7 @@ from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role
+from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -881,6 +882,7 @@ class Runtime:
         self.computer = Computer(
             settings, owner=self._computer_owner, dispatch_guard=self._computer_dispatch_guard
         )
+        self.mcp_policy = ReceivePolicyStore(self.store)
         self.mcp = MCPManager(settings.mcp, max_output_chars=settings.limits.max_output_chars)
         self.notifications = DesktopNotifier(
             self.store, self.bus, settings.notifications, admission=self.maintenance.admission
