@@ -27,7 +27,7 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 | 搜索 | SearXNG / Brave / Tavily 可配服务，有限大小网页读取与来源链接 |
 | 记忆 | 分层原文与后台提炼、关键词/embedding/关系图混合检索、reranker、多来源别名与实际召回路径、相关资料与侧写共同注入、原文分页核查、冲突修订、来源级忘记 |
 | 电脑 | Linux AT-SPI 应用/窗口定位与节点操作；实验性 macOS AX 前台应用及原生引用；可选有界截图、录屏与统一附件引用 |
-| 渠道 | 可选 OneBot/NapCat、Telegram、QQ 官方机器人和微信 iLink；同一主身份、Team 后台报告保留原渠道、失效目的地持久阻塞与本地文件收发 |
+| 渠道 | 可选 OneBot/NapCat、Telegram、QQ 官方机器人和微信 iLink；同一主身份、Team / Workflow 后台报告保留原渠道、失效目的地持久阻塞与本地文件收发 |
 | 语音 | 独立默认关闭的网页录音转写草稿、本地中文声学唤醒与声纹桥接、录音参考、OpenAI 兼容 ASR/TTS、完整转写留存与续读；不附带本地模型 |
 | 主动事件 | chiliarch 原生配对与 SSE 任务；持久提醒、维护结果与新版通知进入主会话，独立更新可按默认或显式记忆绑定通知，可选 Linux 桌面通知，无 AI 轮询 |
 | 扩展 | Agent Skills 渐进读取与文档热发布、用户目录 Python 插件与空闲换代的可选 MCP；工具、提示词、模型、路由和生命周期可扩展 |
@@ -91,6 +91,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [架构与执行边界](docs/architecture.md)
 - [模型协议与参数](docs/providers.md)
 - [多 agent 工作流](docs/workflows.md)
+- [工作流结果回原渠道](docs/workflow-origin-design.md)
 - [任务暂停、补充要求与重新规划](docs/task-control.md)
 - [上下文与长任务](docs/context.md)
 - [个人记忆设计](docs/memory.md)

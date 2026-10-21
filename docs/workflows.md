@@ -53,7 +53,9 @@
 
 `create(name, steps, description='', mode='auto')` 同步验证并保存定义，返回包含 `id` 的字典。节点 id 必须唯一且非空；prompt 非空；角色只能是 `main`、`worker`、`reviewer`。依赖必须存在、不可重复、不能构成环或自身依赖。节点不能添加单独的权限模式，所有节点继承工作流的 `ask`、`auto` 或 `yolo`。
 
-`await start(workflow_id, parent_run_id=None, parent_session_id=None)` 为全部节点创建独立 session、保存运行快照、启动后台任务，随即返回运行字典。两个可选父标识是仅限关键字参数，保存在运行快照中，供父任务绑定取消和结果收集。可以重复启动同一个定义，各次运行和节点会话互相独立。返回字段含相同值的 `id` / `run_id`，`workflow_id`，`nodes`，状态与时间；`nodes` 是按节点 id 索引的字典。
+`await start(workflow_id, parent_run_id=None, parent_session_id=None, request_snapshot=None, reply_origin=None)` 为全部节点创建独立 session、保存运行快照、启动后台任务，随即返回运行字典。可选父标识、任务范围及回复来源是仅限关键字的宿主参数，模型工具不能填写收件人或借来源提升权限。可以重复启动同一个定义，各次运行和节点会话互相独立。返回字段含相同值的 `id` / `run_id`，`workflow_id`，`nodes`，状态与时间；`nodes` 是按节点 id 索引的字典。
+
+主会话的 `workflow_create` 在创建时冻结当前指令来源。父运行先结束完整工具批次，再等其所有子工作流成功，按同一个总输出预算分别回原渠道；任一子项失败或父等待被取消时，不发布部分成功报告。Team 子工作流继续沿父报告链汇报。消息、完成事件与 `result_message_id` 同事务保存；该标记仅证明本地发布，不证明平台送达。历史或独立 API 运行不猜测默认渠道，父在发布意图提交前崩溃也不自动补发，已有结果可在详情查看。见[来源与恢复边界](workflow-origin-design.md)。
 
 首次等待前即持久化运行并登记后台任务；启动事件发布期间取消，也会取消并结算已登记的运行，不留下永远 queued 的孤儿记录。`await wait(run_id)` 等待并返回最新持久化终态，使用 shield 隔离等待者与子任务；取消等待者只结束等待，父任务应在自己的取消清理中显式调用 `cancel`。父标识本身不赋予额外权限。
 

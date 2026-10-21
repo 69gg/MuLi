@@ -1,7 +1,8 @@
 # 2.26 故障诊断与输入预算审查
 
-这是下一轮开发记录，尚未发布 2.26.0。2.25 已正式发布；其 main CI 的
-最终进程收尾失败如实保留，修复进入本轮，不改写已发布提交或标签。
+2.26.0 已正式发布。下文保留开发与修复过程，最后记录精确发行证据；
+候选与发行流水线通过，main 的 macOS 3.13 另有一项测试夹具失败，不能称为
+全部检查通过。2.25 的进程收尾问题已修复，不改写已发布提交或标签。
 
 ## 会话目录游标预算
 
@@ -75,3 +76,33 @@ Windows 作业失败；已确认 2.25 的 Ubuntu 3.13 最终收尾问题在本�
 失败（49.5 MiB），修后通过（49.1 MiB）；这只模拟缺属性边界，不声称运行了
 Windows。四项 Linux 确定性回归通过（0.17 秒、63.1 MiB、swap 0），单文件
 Ruff/格式及严格类型通过，独立只读复审通过。新签名提交将重新接受完整矩阵。
+
+## 正式发行与 main 检查差异
+
+最终签名提交 `f10f7d5a1199f2fe9ee9eb8952f4a021cff7ab9c` 的
+[PR30 候选 CI](https://github.com/69gg/MuLi/actions/runs/39542489741) attempt 1
+八项全部成功；[PR30](https://github.com/69gg/MuLi/pull/30) 于
+2026-10-21 04:17:41 UTC 合入 main，精确保留同一提交。签名标签 `v2.26.0`
+对象为 `d424724882d6b3070baee5ead1737f10b9f8cc98`，本地 GPG 与远端签名、
+指向均已核对。
+
+[main CI](https://github.com/69gg/MuLi/actions/runs/39543241444) attempt 1
+七项成功，macOS 3.13 作业 `119035539442` 的唯一失败是
+`test_absolute_ttl_early_callback_rechecks_and_does_not_renew`，汇总
+1 failed、2924 passed、1302 skipped。用例在 200ms 绝对期限内启动 Python
+helper 并等待真实 IPC，操作正确按绝对期限结束为 `read_timeout`；不能从
+这份日志再细分启动与 IPC 各自耗时。早到 timer 的逻辑验证不应依赖这项
+短墙钟预算，确定性夹具修复在下一分支进行，不放宽生产期限、不重跑掩盖。
+
+相同提交的[发行流水线](https://github.com/69gg/MuLi/actions/runs/39543241848)
+attempt 1 八项独立验证及 prepare/publish/github-release 共十一项成功。
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.26.0) 于
+2026-10-21 04:24:05 UTC 发布；[PyPI 2.26.0](https://pypi.org/project/muli-agent/2.26.0/)
+两种构件均未撤回，两个平台的文件名、字节数与 SHA-256 一致：
+
+| 文件 | 大小（字节） | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.26.0-py3-none-any.whl` | 726538 | `cc74fcff54130dfb0ad59b4203c24f6cba7301805dfb70df60a31f51132eda87` |
+| `muli_agent-2.26.0.tar.gz` | 3720217 | `cd0dc57171c64827457654c3dce9c9cdb3476be25f7c21879ae42635a57aaf90` |
+
+发行对照只读取小型 JSON 元数据，没有下载构件或安装用户服务。
