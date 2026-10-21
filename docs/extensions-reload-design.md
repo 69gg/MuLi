@@ -34,6 +34,8 @@
 
 首期目录扫描只列举 Skills 的一级包目录和 MCP 的一级 JSON 文件。根目录先确定规范路径，包入口及资源必须为允许根内的普通文件，拒绝符号链接逃逸；不把单次 `resolve()` 当成竞争写入期间的保证。Skills 源与资源在支持的平台从绝对路径根逐段以 `dir_fd + O_DIRECTORY | O_NOFOLLOW` 打开，绑定已接受的包目录身份，最终文件只相对已绑定父目录读取并前后复核；祖先目录换成符号链接不能改变实际读取目标。首片拒绝在缺少这些能力的平台读取已安装 Skill，状态明确 `secure_file_reads:false`；空目录、关闭 Skills 和核心聊天仍正常，不宣称已适配 Windows 安全句柄。用户应使用原子替换发布文件；同一普通文件被对抗性改写且伪造元数据、挂载替换等不在可信扩展目录的防护承诺内。MCP 分片读取的对应边界由其实现独立验证。
 
+以上是首期 POSIX 读取合同。2.30 候选在不改变该读取链的前提下增加 Windows 本地 NTFS 句柄适配；Windows 路径不先 `resolve()`，从已验证卷根逐组件相对打开，枚举和末次核对也绑定句柄。当前平台验收状态及不支持的路径见 [Windows Skills](windows-skills-design.md)，不沿用首期跳过结论代表新实现已验证。
+
 ## Skills：元数据、正文和资源分开
 
 兼容 [Agent Skills 规范](https://agentskills.io/specification) 的目录与 YAML frontmatter：`name`、`description` 必须为字符串，接受 `license`、`compatibility`、字符串映射 `metadata` 与实验性 `allowed-tools`。校验名称长度/字符/目录一致性、说明长度，未知宿主专用字段给出诊断；不宣称实现 Claude Code hooks、subagent 或工具权限语义。`allowed-tools` 是兼容提示，不能扩大 MuLi 的可执行工具集。包内 `scripts`、`references`、`assets` 可存在，扫描时不读取或执行。

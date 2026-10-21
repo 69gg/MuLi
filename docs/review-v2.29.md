@@ -1,7 +1,7 @@
 # 2.29 chiliarch 普通消息主动资料审查
 
-这是独立候选记录，尚未发行。2.28 的固定签名提交已完成独立 main 与发行
-验证，本轮不向其追加改动或借用其 CI 结果。
+精确候选已通过八项 CI，并以原签名提交合入 main、推送发行标签；独立 main
+和发行作业仍在执行。2.28 的验证单独保留，不借用其结果。
 
 ## 合同与独立审查
 
@@ -50,3 +50,17 @@ server、maintenance API、系统事件 Runtime、主动记忆及兼容/发行�
 `mypy --no-incremental` 与 83 包离线锁核验通过，类型检查峰值 397.1 MiB；
 全部 swap 0、原守卫串行执行，没有安装依赖。本版不改前端产品，完整网页、
 打包及跨平台矩阵等待新候选 CI。
+
+## 精确候选与发行启动
+
+GPG 签名候选 `796bf311e4e183f50ab856a8586db1bab3c48a0e` 的
+[CI 39546796431](https://github.com/69gg/MuLi/actions/runs/39546796431)
+attempt 1 八项成功：quality、MCP 和 Linux/macOS/Windows × Python 3.12/3.13。
+父审查与独立观察者分别核对精确 SHA 和完整八项结果，没有重跑掩盖失败。
+
+[PR33](https://github.com/69gg/MuLi/pull/33) 于 2026-10-21T05:05:14Z 原提交
+合入 main。签名标签 `v2.29.0` 与 main 一次非强制原子推送；本地标签验证为
+有效 GPG 签名。独立 [main CI 39547575601](https://github.com/69gg/MuLi/actions/runs/39547575601)
+与 [Release 39547575662](https://github.com/69gg/MuLi/actions/runs/39547575662)
+尚待完成，现阶段不把标签存在视为 PyPI 已发布，也不把本版矩阵当作下一版
+Windows Skills 原生句柄实现的验收。
