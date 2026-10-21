@@ -7,6 +7,7 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,14 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from helpers.managed_recovery_worker import BOOT, PREFIX, deployment, prepare, read_record
+from helpers.managed_recovery_worker import (
+    BOOT,
+    IO_SECONDS,
+    PREFIX,
+    deployment,
+    prepare,
+    read_record,
+)
 from test_management_process_recovery import CLEANUP_SECONDS, checkpoint, cleanup, remaining
 
 import muli
@@ -38,6 +46,11 @@ pytestmark = pytest.mark.skipif(
 )
 CASE_SECONDS = 20.0
 HTTP_BYTES = 4096
+EARLY_SITE_HOOK = (
+    "import sys, types; sys.dont_write_bytecode = True; "
+    "sys.modules['sitecustomize'] = types.ModuleType('sitecustomize'); "
+    "sys.modules['sitecustomize'].__dict__['_muli_fixture_noop'] = True\n"
+)
 
 
 def finish_service(process: subprocess.Popen[bytes]) -> None:
@@ -99,6 +112,158 @@ def test_final_service_exit_does_not_extend_cleanup_or_retry_a_timeout() -> None
     with pytest.raises(subprocess.TimeoutExpired):
         finish_service(cast(subprocess.Popen[bytes], process))
     assert process.waits == [CLEANUP_SECONDS] and process.terminated == 1
+
+
+@pytest.mark.parametrize("early_hook", [False, True], ids=["environment-only", "early-hook"])
+def test_isolated_fixture_hook_controls_owned_bytecode(tmp_path: Path, early_hook: bool) -> None:
+    prefix = tmp_path / "retained"
+    python = prefix / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(Path(sys.executable).resolve())
+    base = Path(getattr(sys, "_base_executable", sys.executable)).resolve().parent
+    (prefix / "pyvenv.cfg").write_text(
+        f"home = {base}\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+    site = (
+        prefix
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    site.mkdir(parents=True)
+    if early_hook:
+        (site / "000_muli_sitecustomize_noop.pth").write_text(EARLY_SITE_HOOK, encoding="utf-8")
+    package = site / "muli_bytecode_probe"
+    package.mkdir()
+    (package / "__init__.py").write_text("VALUE = True\n", encoding="utf-8")
+    (site / "fixture_bytecode_probe.py").write_text("VALUE = True\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import sys, json, muli_bytecode_probe, fixture_bytecode_probe; "
+            "print(json.dumps([sys.flags.isolated, sys.dont_write_bytecode, "
+            "muli_bytecode_probe.VALUE, fixture_bytecode_probe.VALUE]))",
+        ],
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        timeout=IO_SECONDS,
+        check=True,
+    )
+    assert len(result.stdout) <= HTTP_BYTES and len(result.stderr) <= HTTP_BYTES
+    assert json.loads(result.stdout) == [1, early_hook, True, True]
+    package_cache = list((package / "__pycache__").glob("*.pyc"))
+    fixture_cache = list((site / "__pycache__").glob("fixture_bytecode_probe*.pyc"))
+    assert bool(package_cache) is (not early_hook)
+    assert bool(fixture_cache) is (not early_hook)
+
+
+def failure_diagnostic(root: Path, timeline: list[dict[str, str | int]], deadline: float) -> str:
+    details: dict[str, Any] = {
+        "timeline": timeline,
+        "remaining_ms": round((deadline - time.monotonic()) * 1000),
+    }
+    try:
+        with TransactionJournal(
+            root / "journal", root / "data/muli.sqlite3", create=False
+        ) as journal:
+            record = read_record(journal)
+            details["state"] = {
+                "revision": record.revision,
+                "phase": record.phase,
+                "intent": record.intent,
+                "activation": record.activation,
+                "code": record.code,
+            }
+    except Exception:
+        details["state"] = "unavailable"
+    try:
+        with closing(
+            sqlite3.connect(
+                (root / "data/muli.sqlite3").as_uri() + "?mode=ro",
+                uri=True,
+                timeout=0,
+            )
+        ) as database:
+            http: dict[str, Any] = {}
+            for role in ("base", "target"):
+                row = database.execute(
+                    "SELECT substr(CAST(data AS BLOB),1,?) FROM objects WHERE kind=? AND id=?",
+                    (HTTP_BYTES + 1, "fixture", "http-" + role),
+                ).fetchone()
+                if row is None:
+                    http[role] = "missing"
+                elif len(row[0]) > HTTP_BYTES:
+                    http[role] = "oversized"
+                else:
+                    value = json.loads(row[0])
+                    if not isinstance(value, dict):
+                        http[role] = "invalid"
+                        continue
+                    posts = value.get("posts")
+                    http[role] = {
+                        "posts": posts if type(posts) is int and 0 <= posts <= HTTP_BYTES else None,
+                        **{
+                            key: value.get(key) if type(value.get(key)) is bool else None
+                            for key in ("started", "allowed")
+                        },
+                    }
+            details["http"] = http
+    except Exception:
+        details["http"] = "unavailable"
+    prefix = "managed_recovery_diagnostic="
+    note = prefix + json.dumps(details, ensure_ascii=True, separators=(",", ":"))
+    if len(note.encode("utf-8")) > HTTP_BYTES:
+        return prefix + '{"status":"output_budget"}'
+    return note
+
+
+def test_failure_diagnostic_exposes_only_bounded_fixed_scalars(tmp_path: Path) -> None:
+    database = tmp_path / "data/muli.sqlite3"
+    database.parent.mkdir()
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("CREATE TABLE objects(kind TEXT,id TEXT,data TEXT,PRIMARY KEY(kind,id))")
+        for role, extra in (("base", "private-body"), ("target", "private-body" * HTTP_BYTES)):
+            connection.execute(
+                "INSERT INTO objects VALUES(?,?,?)",
+                (
+                    "fixture",
+                    "http-" + role,
+                    json.dumps({"posts": 1, "started": True, "allowed": False, "private": extra}),
+                ),
+            )
+    timeline: list[dict[str, str | int]] = [{"stage": "wait:controller-resolved", "elapsed_ms": 5}]
+    note = failure_diagnostic(tmp_path, timeline, time.monotonic() + CASE_SECONDS)
+    assert len(note.encode("utf-8")) <= HTTP_BYTES and "private-body" not in note
+    details = json.loads(note.split("=", 1)[1])
+    assert details["state"] == "unavailable" and not (tmp_path / "journal").exists()
+    assert details["timeline"] == timeline
+    assert details["http"] == {
+        "base": {"posts": 1, "started": True, "allowed": False},
+        "target": "oversized",
+    }
+
+
+def test_failure_diagnostic_keeps_complete_json_within_its_note_budget(tmp_path: Path) -> None:
+    note = failure_diagnostic(tmp_path, [{"stage": "🌊" * HTTP_BYTES}], time.monotonic())
+    assert len(note.encode("utf-8")) <= HTTP_BYTES
+    assert json.loads(note.split("=", 1)[1]) == {"status": "output_budget"}
+    assert not (tmp_path / "data").exists()
+
+
+def test_failure_diagnostic_does_not_wait_for_a_metadata_lock(tmp_path: Path) -> None:
+    database = tmp_path / "data/muli.sqlite3"
+    database.parent.mkdir()
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("CREATE TABLE objects(kind TEXT,id TEXT,data TEXT)")
+        connection.commit()
+        connection.execute("BEGIN EXCLUSIVE")
+        try:
+            note = failure_diagnostic(tmp_path, [], time.monotonic())
+        finally:
+            connection.rollback()
+    assert json.loads(note.split("=", 1)[1])["http"] == "unavailable"
 
 
 def fixture_parent(repository: Path) -> Path:
@@ -278,11 +443,7 @@ def slot(root: Path, name: str, repository: Path) -> SlotIdentity:
     shutil.copytree(source, package, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
     dependencies = Path(sys.prefix) / "lib" / version / "site-packages"
     # Simulate an already imported system hook without changing the host Python.
-    (site / "000_muli_sitecustomize_noop.pth").write_text(
-        "import sys, types; sys.modules['sitecustomize'] = types.ModuleType('sitecustomize'); "
-        "sys.modules['sitecustomize'].__dict__['_muli_fixture_noop'] = True\n",
-        encoding="utf-8",
-    )
+    (site / "000_muli_sitecustomize_noop.pth").write_text(EARLY_SITE_HOOK, encoding="utf-8")
     (site / "fixture.pth").write_text(
         f"{dependencies}\n{repository / 'tests/helpers'}\n"
         "import _muli_managed_process_fixture_hook\n",
@@ -368,8 +529,24 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
             assert plan is not None and unknown is not None
             values = environment(root, failure=failure)
             processes: list[subprocess.Popen[bytes]] = []
-            deadline = time.monotonic() + CASE_SECONDS
+            started = time.monotonic()
+            deadline = started + CASE_SECONDS
+            timeline: list[dict[str, str | int]] = []
             live: subprocess.Popen[bytes] | None = None
+
+            def mark(stage: str) -> None:
+                if len(timeline) < 16:
+                    timeline.append(
+                        {"stage": stage, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                    )
+
+            def observe(
+                process: subprocess.Popen[bytes], expected: bytes, output: bytearray
+            ) -> None:
+                label = expected.decode("ascii")
+                mark("wait:" + label)
+                expect(process, expected, output, deadline)
+                mark("got:" + label)
 
             def spawn(
                 argv: list[str], role: str, *, service: bool = False
@@ -409,7 +586,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                     assert current.intent == ("start_target" if role == "target" else "start_base")
                     anchor, _ = deployment(journal)
                 service = spawn(list(managed_unit_arguments(anchor, base)), role, service=True)
-                expect(service, b"service-ready", bytearray(), deadline)
+                observe(service, b"service-ready", bytearray())
                 publish(service.pid, role)
                 return service
 
@@ -423,7 +600,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                     [base.lexical_python, "-I", str(worker), "controller", str(root)], "controller"
                 )
                 output = bytearray()
-                expect(driver, b"start-target", output, deadline)
+                observe(driver, b"start-target", output)
                 live = start("target")
                 async with httpx.AsyncClient(
                     base_url=f"http://127.0.0.1:{port}",
@@ -436,6 +613,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         client, root, "target", deadline, wrong_nonce=True
                     )
                     assert status == 401 and error["detail"] == "transaction_unauthorized"
+                    mark("target:unauthorized")
                     status, value = await request(client, root, "target", deadline)
                     if failure:
                         assert status == 409 and value["detail"] == "maintenance_unsupported"
@@ -443,10 +621,11 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         proof = HealthProofV2.model_validate(value)
                         assert status == 200 and proof.admission == "paused"
                         assert proof.installation == target.digest and proof.boot == BOOT["target"]
+                    mark("target:observed")
                     continue_controller()
                     selected: Role = "target"
                     if failure:
-                        expect(driver, b"stop-target", output, deadline)
+                        observe(driver, b"stop-target", output)
                         live.terminate()
                         assert live.wait(timeout=min(2.0, remaining(deadline))) in {
                             0,
@@ -454,13 +633,14 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         }
                         publish(0, "target")
                         continue_controller()
-                        expect(driver, b"start-base", output, deadline)
+                        observe(driver, b"start-base", output)
                         live = start("base")
                         selected = "base"
                         status, value = await request(client, root, selected, deadline)
                         assert status == 200 and value["admission"] == "paused"
+                        mark("base:paused")
                         continue_controller()
-                    expect(driver, b"controller-resolved", output, deadline)
+                    observe(driver, b"controller-resolved", output)
                     assert driver.wait(timeout=remaining(deadline)) == 0, bytes(output)
                     # These are real nonce routes and the real host's projection callback.
                     for _ in range(2):
@@ -470,6 +650,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         assert proof.role == selected and proof.boot == BOOT[selected]
                         assert proof.installation == (base.digest if failure else target.digest)
                         assert proof.format_digest == format_digest(before.observed_format)
+                    mark("proofs:released")
                 finish_service(live)
                 with (
                     TransactionJournal(root / "journal", database, create=False) as journal,
@@ -538,5 +719,13 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         )
                         assert observed["allowed"] is (not failure or role == "base")
                         assert observed["started"] is (not failure or role == "base")
+                        site = next((root / role / "lib").glob("python*/site-packages"))
+                        assert not any((site / "muli").rglob("*.pyc"))
+                        assert not any(
+                            (site / "__pycache__").glob("_muli_managed_process_fixture_hook*.pyc")
+                        )
+            except BaseException as error:
+                error.add_note(failure_diagnostic(root, timeline, deadline))
+                raise
             finally:
                 cleanup(processes)
