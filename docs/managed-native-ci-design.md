@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含私有卷入口修复的 89 项纯 fixture 与限定静态检查已通过；前三轮真实托管 runner 均未观察到 worker 结果，记录为 0 个事务；仅第三轮的精确 typed listing 证实该 harness 单元缺席。第三轮已取得客户端可执行文件查找权限失败与用户总线成功的独立事实，本轮调整私有卷入口，真实启动与三事务待下一精确远端候选验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境修补的 112 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败，仍为 0 个事务。环境修补、三事务和正常服务收尾待下一精确远端候选验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -15,6 +15,10 @@ A、B 复制同一个当前 MuLi 包，保留原 `compatibility.json`；依赖�
 CI 协调脚本为本次运行创建唯一非 root 用户和组，记录实际 UID/GID、精确 HOME 和私有根。镜像文件、setup receipt 与导出结果仍在 `RUNNER_TEMP` 内由 runner 拥有；唯一 ext4 挂载入口位于现有 `/tmp` 下的本次独占目录。其 HOME、配置、数据、用户 unit、两个 retained prefix、辅助脚本均在这一个 0700 私有卷中。创建冲突直接失败，不复用已有用户；不修改 runner 用户、祖先目录的 mode/ACL/补充组、全局 `user.slice` 或其它 UID 的 manager。
 
 setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，不放在该 UID 的可写卷中。它逐阶段记录本次已确认创建的用户/组、实际 UID/GID/HOME、镜像文件身份和精确 mount 身份；先记准备意图不能冒充已经创建成功。每次 setup 失败和 `always()` 重入清理都重新核 username↔UID/GID/HOME 及挂载身份仍一致，只处理本次已证实创建的资源。旧 UID 已被复用、映射改变或效果不能确认时保留证据并失败，不能依旧 receipt 删除后来账户；首次 setup 未成功创建的资源不归本次清理。若 `useradd` 已产生账户但响应丢失，未确认 receipt 不授权删除；清理发现同名账户或组会明确失败，不能报告已清理。
+
+客户端的 `env -i` 不会自动成为 `systemd-run` service 模式中服务的环境。专用 `user@UID.service` 启动前，协调者只为本次已确认的新 UID 排他创建一个 runtime instance drop-in，在同一文件写入原四项资源限制，并固定其 `HOME`、`XDG_CONFIG_HOME`、`XDG_RUNTIME_DIR` 与用户 bus 地址，随后 daemon-reload，再启动该 manager。不调用 `set-property`，也不创建或领养 `system.control` 配置。标准 `muli.service` 与恢复 helper 从这一 manager 继承环境；不覆盖产品 `unit_dir`、`ExecStart` 或服务模板。四个固定系统 unit 根下若已有该 UID 的 instance drop-in 或主 unit override，直接拒绝，不领养、覆盖或通过 revert 删除。它不修改 runner 或系统全局环境，也不是对同权限 root 的沙箱。
+
+receipt 分别确认这个 root 拥有的 0755 目录与 0644 文件的 dev/inode；文件仅含原四项资源限制与上述四个无凭据的派生环境赋值。启动前及 cleanup 的首个 stop/revert 前，复核原目录、owner/mode、精确文件及内容，最多观察两个目录项，额外项直接拒绝；其它三个系统 unit 根若出现本 instance 配置，也一律拒绝，不能把已确认的文件扩展为整个 `system.control` 目录的删除权限。创建已生效但返回丢失时保留未确认配置并失败，不凭文件名删除；已确认且仍为空的部分创建目录可精确回收。正常停止专用 manager 后复用既有 instance revert 生命周期，确认该目录消失再清掉相应 receipt 身份。所有临时账户、卷和未知效果的失败语义保持。
 
 `/tmp` 必须经 `lstat` 确认为非符号链接、root 拥有的 01777 目录；记录并重核其 dev/inode。卷入口名只由固定前缀和 receipt 中已严格验证的本次用户名派生，不接受命令行另给任意挂载目标。排他 `mkdir` 后，先确认原入口的 dev/inode、runner owner 和 0700 并持久保存，才建立镜像和挂载。跨进程 cleanup 从同一 receipt 重建精确路径，复核 `/tmp` 身份、已有 mount 身份，以及卸载后原入口的 dev/inode/owner/mode；碰撞、未确认创建、目录替换或失证均失败且不删除它。保留卸载后的空私有入口与镜像，不递归删除输出。这样无需穿越权限为 0750 的 runner 祖先，也不引入新的 bind 或放宽私有数据权限。
 
@@ -81,6 +85,8 @@ setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，
 
 有限证据包括实际资源属性与 kernel 限额、单元状态/InvocationID、固定错误码、各请求的最终状态、receipt 次数及只含合成资料的 DB 断言。协调者只导出严格白名单结构与有限标量；自定义 `NativeError` 仅保存格式受限的 `native_*` 固定码，其他异常只记类型，不输出原异常正文。worker 无法导入时也保留协调者预写的 `harness_start/worker_not_observed` 证据。清理不重写功能 timeline 或清空三代历史；仅全部清理证明完成且仍在期限内才单独标记 `resources.cleanup=verified`。默认不输出配置、nonce、Cookie、密码、完整 journal 或任意业务正文。取消或外层硬杀后走独立 always 清理；VM 最终销毁不是已经成功清理的证据。
 
+环境诊断只导出实际 UID、HOME、配置目录、runtime 目录与 bus 是否匹配本次私有上下文的布尔值，以及配置目录来源为 `explicit` 或 `default`；不导出环境值或完整环境。drive 在启动标准服务前核验，现有测试 hook 在真实 app 构造后核验服务进程，cleanup worker 也核验。配置目录仍由实际 `UserService` 默认规则计算，不能靠传入 `unit_dir` 绕过。环境不匹配固定失败；这些比较不是 ACL、任意外部环境或跨用户可达性的证明。
+
 若启动客户端返回失败且 worker 尚未产生结果，协调者使用 **runner 自己已有的解释器与源 worker** 做一次只读诊断，不再依赖出错的 retained Python。只有其中的 `busctl` 经 `sudo` 切到本次 receipt 已确认、并重新通过 passwd 核对 UID/HOME 的专用用户；环境明确指定 `/run/user/UID/bus`，不读取 runner 的 user manager。诊断只对本次生成的精确 `muli-native-32hex.service`，复用 `SystemdProbe` 的 typed D-Bus 读取，不依赖启动成功才会存在的完整 process identity。真实 worker 已留下的结果始终优先，不被此诊断替换。
 
 `resources.startup` 分别保留启动客户端与诊断客户端的退出码、固定命令报告分类，以及观察器的 `identity/ancestors/import/manager/listing/get_unit/unit_properties/service_properties` 阶段和最后一条 `busctl` 的退出码/分类。未知退出码保持空值，已尝试但超时不能记为从未启动。分类只对白名单短语作匹配；它是命令所报告的线索，不证明实际根因、权限或进程授权，原 stderr、路径和异常正文均不导出。先成功读取 typed Manager，再对精确 unit 执行 `ListUnitsByPatterns`；只有该 typed 列表成功且为空才能记 `unit_absent`。总线不可达、GetUnit 失败、属性查询失败或坏响应均保留各自阶段，不能归为单元缺席。成功观察才附加 `Id/LoadState/ActiveState/SubState/Result/ExecMainCode/ExecMainStatus/MainPID` 的有限事实。
@@ -127,6 +133,22 @@ PR [#37](https://github.com/69gg/MuLi/pull/37) 的首轮精确候选为签名提
 
 所有真实 subprocess 继续在该测试模块被硬拒绝；没有本机原生 harness、用户/挂载/服务操作。纯 fixture 不证明真实临时 UID 可执行，实际查找、导入与三事务仍待下一精确远端候选验收。95 秒启动 envelope、60 秒功能期限、5 秒清理效果/证明及已有故障命令 kill/reap 上限均不变。
 
+## 第四轮远端结果与专用 manager 环境
+
+路径修复的精确签名候选 `e1bb47b19a01671b70e457cedfa119f3566ad6d5`，CI [39572518905](https://github.com/69gg/MuLi/actions/runs/39572518905) 最终六项成功、三项失败；另两个失败是 Ubuntu 3.13 的既有合成 rollback 20 秒总期限例与 macOS 3.12 的既有数据库结构读取预算，分别交由原路径审查，没有提高预算或混入本环境片。
+
+原生 [job 119129953174](https://github.com/69gg/MuLi/actions/runs/39572518905/job/119129953174) 的 654 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39572518905/artifacts/12332114203)，zip SHA256 为 `d0d92f1d333665d02aab3f3ac3edabd678915376c5fd0969eb2a5b2504a3eec2`。真实 harness 已进入 drive：`imports_verified=496ms`、`slots_verified=774ms`。实际 harness kernel 限额为 256 MiB、swap 0、单 CPU、32 tasks；其专用 manager 为 1 GiB、swap 0、单 CPU、128 tasks，均核验通过。这证明前一轮执行路径修复已让实际临时 UID 完成导入、真实文件系统与两 slot 核验。
+
+结果为 `completed=false/stage=slots_verified/code=native_unit_path`，尚未到 `manager_start`，即没有启动本次标准 MuLi 服务、仍为 **0 个事务**。这个固定失败只证明默认 `UserService.path` 不等于私有 HOME 下的标准 unit 路径；本轮尚无实际 HOME/XDG 布尔诊断，不能断言究竟哪个变量漂移。`systemd-run` service 不继承客户端全部环境，因而客户端 `env -i` 本身不足以约束该默认路径；本片按上述专用 manager Environment drop-in 闭合这个接缝，真实结果仍待远端。
+
+本轮 cleanup 仍为失败，不能用上一轮的可执行文件查找错误解释，也不把功能启动进展当成正常收尾通过。receipt 记录该次专用账户 `muli-ci-5ab591afe1a7`、UID 999/GID 987 已删除、已记录 mounts 为空；仍只证明这些资源回收。
+
+本次新增 23 项纯 fixture，覆盖专用环境在 manager 启动前准备、fresh coordinator 精确回收、四类根路径既有 instance 配置/主 unit override 冲突、mkdir/install 已生效但丢返回、已确认空目录的部分失败，以及环境被替换/改写/加项时拒绝清理。worker 的 explicit/default 配置来源通过真实 `UserService` 默认路径验证；字段类型或额外环境值不能混入导出。
+
+独立审查在初轮 22 项新增例、完整 111 项通过后，发现 `set-property` 生成的 `system.control` 目录被整体接受，会使 `revert` 删除后来新增的外来文件。将 fake revert 改为忠实删除四个 unit 根的 instance 配置后，新反例在旧实现中稳定失败；修复改为同一自有文件承载资源与环境，删除 `set-property`，其它 instance 配置一律在首个 stop/revert 前拒绝。该反例证明 foreign 文件保留且没有清理效果，不是本机真实服务实验。
+
+最终完整 **112 个唯一 case**（原 89 加新 23）通过 0.49 秒、服务 1.016 秒、峰值 77.4 MiB/swap 0；先前 111 项、新组与两项关键尾例均包含在最终总数内，不重复计数。三份 Python 文件 Ruff/format 和两脚本 strict mypy 通过；本片 mypy 最高 158 MiB，最终尾轮 68 MiB，swap 0。没有提高任何期限或资源预算；所有命令仍经 root 绝对路径守卫、逐条 30 秒串行执行。没有本机原生 harness、账户/挂载/服务效果或构件下载；专用环境、三事务和正常服务收尾仍待下一精确远端候选验收。
+
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 
-依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
+依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。

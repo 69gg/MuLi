@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -31,6 +32,15 @@ OUTPUT_BYTES = 32768
 ROOT_NAME = "muli-managed-native-ci"
 VOLUME_PARENT = Path("/tmp")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+MANAGER_RUNTIME = Path("/run/systemd/system")
+MANAGER_CONTROL_RUNTIME = Path("/run/systemd/system.control")
+MANAGER_UNIT_ROOTS = (
+    Path("/etc/systemd/system"),
+    MANAGER_RUNTIME,
+    Path("/etc/systemd/system.control"),
+    MANAGER_CONTROL_RUNTIME,
+)
+ENVIRONMENT_NAME = "99-muli-native-environment.conf"
 
 
 class FixtureError(ValueError):
@@ -319,7 +329,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             raise FixtureError("native_result_invalid")
     resources = value["resources"]
     if not isinstance(resources, dict) or not set(resources).issubset(
-        {"manager", "harness", "manager_peak", "initial", "cleanup", "startup"}
+        {"manager", "harness", "manager_peak", "initial", "cleanup", "startup", "environment"}
     ):
         raise FixtureError("native_result_invalid")
     for name, facts in resources.items():
@@ -347,6 +357,21 @@ def fixture_result(data: bytes) -> dict[str, Any]:
         elif name == "startup":
             valid = isinstance(facts, dict) and isinstance(facts.get("unit"), str)
             valid = valid and startup_facts(facts, facts["unit"])
+        elif name == "environment":
+            names = {
+                "uid_matches",
+                "home_matches",
+                "config_matches",
+                "runtime_matches",
+                "bus_matches",
+            }
+            valid = (
+                isinstance(facts, dict)
+                and set(facts) == names | {"config_source"}
+                and isinstance(facts["config_source"], str)
+                and facts["config_source"] in {"explicit", "default"}
+                and all(type(facts[key]) is bool for key in names)
+            )
         elif name == "manager_peak":
             valid = isinstance(facts, str) and re.fullmatch(r"[0-9]{1,20}", facts) is not None
         else:
@@ -446,6 +471,8 @@ class Receipt:
     image: tuple[int, int] | None = None
     temporary: tuple[int, int] | None = None
     volume_directory: tuple[int, int] | None = None
+    environment_directory: tuple[int, int] | None = None
+    environment_file: tuple[int, int] | None = None
     mounts: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -479,7 +506,13 @@ class Receipt:
             )
         ):
             raise FixtureError("native_receipt_invalid")
-        for name in ("image", "temporary", "volume_directory"):
+        for name in (
+            "image",
+            "temporary",
+            "volume_directory",
+            "environment_directory",
+            "environment_file",
+        ):
             identity = getattr(result, name)
             if identity is None:
                 continue
@@ -491,6 +524,10 @@ class Receipt:
                 raise FixtureError("native_receipt_invalid")
             setattr(result, name, (identity[0], identity[1]))
         if result.volume_directory is not None and result.temporary is None:
+            raise FixtureError("native_receipt_invalid")
+        if result.environment_file is not None and result.environment_directory is None:
+            raise FixtureError("native_receipt_invalid")
+        if result.environment_directory is not None and not result.user_created:
             raise FixtureError("native_receipt_invalid")
         if (
             not isinstance(result.mounts, list)
@@ -583,6 +620,114 @@ class NativeCI:
             raise FixtureError("native_account_changed")
         return receipt.uid, receipt.gid
 
+    def environment_directory(self) -> Path:
+        assert self.receipt is not None and self.receipt.uid is not None
+        return MANAGER_RUNTIME / f"user@{self.receipt.uid}.service.d"
+
+    def environment_data(self) -> bytes:
+        assert self.receipt is not None and self.receipt.uid is not None
+        uid = self.receipt.uid
+        values = (
+            f"HOME={self.home}",
+            f"XDG_CONFIG_HOME={self.home / '.config'}",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+        )
+        resources = (
+            f"MemoryMax={MEMORY}",
+            "MemorySwapMax=0",
+            "CPUQuota=100%",
+            f"TasksMax={TASKS}",
+        )
+        return (
+            "[Service]\n"
+            + "\n".join((*resources, *(f'Environment="{value}"' for value in values)))
+            + "\n"
+        ).encode()
+
+    def check_manager_environment(self) -> bool:
+        """Only the receipt's exclusive root-owned instance drop-in is ours."""
+        assert self.receipt is not None
+        receipt = self.receipt
+        directory = self.environment_directory()
+        if any(
+            os.path.lexists(root / directory.name.removesuffix(".d"))
+            or (root != MANAGER_RUNTIME and os.path.lexists(root / directory.name))
+            for root in MANAGER_UNIT_ROOTS
+        ):
+            raise FixtureError("native_manager_environment_changed")
+        if receipt.environment_directory is None:
+            if os.path.lexists(directory):
+                raise FixtureError("native_manager_environment_unconfirmed")
+            return False
+        try:
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o755
+                or receipt.environment_directory != (info.st_dev, info.st_ino)
+                or any(entry.name != ENVIRONMENT_NAME for entry in islice(directory.iterdir(), 2))
+            ):
+                raise FixtureError("native_manager_environment_changed")
+            path = directory / ENVIRONMENT_NAME
+            if receipt.environment_file is None:
+                if os.path.lexists(path):
+                    raise FixtureError("native_manager_environment_unconfirmed")
+                return False
+            info = path.lstat()
+            expected = self.environment_data()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o644
+                or receipt.environment_file != (info.st_dev, info.st_ino)
+                or info.st_size != len(expected)
+            ):
+                raise FixtureError("native_manager_environment_changed")
+            with path.open("rb") as source:
+                if source.read(len(expected) + 1) != expected:
+                    raise FixtureError("native_manager_environment_changed")
+        except FileNotFoundError:
+            raise FixtureError("native_manager_environment_changed") from None
+        return True
+
+    def prepare_manager_environment(self) -> None:
+        """Configure only this new UID before its manager builds user unit paths."""
+        uid, _ = self.current_account()
+        assert self.receipt is not None
+        directory = self.environment_directory()
+        parent = MANAGER_RUNTIME.lstat()
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
+            raise FixtureError("native_manager_environment_parent")
+        if any(
+            os.path.lexists(root / f"user@{uid}.service{suffix}")
+            for root in MANAGER_UNIT_ROOTS
+            for suffix in ("", ".d")
+        ):
+            raise FixtureError("native_manager_environment_exists")
+        self.sudo("mkdir", "--mode=0755", "--", str(directory))
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o755
+        ):
+            raise FixtureError("native_manager_environment_changed")
+        self.receipt.environment_directory = (info.st_dev, info.st_ino)
+        self.save()
+        source = self.root / "manager-environment.conf"
+        with source.open("xb") as output:
+            os.chmod(source, 0o600)
+            output.write(self.environment_data())
+        path = directory / ENVIRONMENT_NAME
+        self.sudo("install", "--mode=0644", "--", str(source), str(path))
+        info = path.lstat()
+        self.receipt.environment_file = (info.st_dev, info.st_ino)
+        self.check_manager_environment()
+        self.save()
+        self.sudo("systemctl", "daemon-reload")
+
     def user_arguments(self, *argv: str) -> tuple[str, ...]:
         uid, _ = self.current_account()
         assert self.receipt is not None
@@ -595,6 +740,7 @@ class NativeCI:
             "env",
             "-i",
             f"HOME={self.home}",
+            f"XDG_CONFIG_HOME={self.home / '.config'}",
             f"USER={self.receipt.user}",
             f"LOGNAME={self.receipt.user}",
             "PATH=/usr/bin:/bin",
@@ -765,17 +911,8 @@ class NativeCI:
                 or "ro" not in current["options"].split(",")
             ):
                 raise FixtureError("native_mount_not_readonly")
+        self.prepare_manager_environment()
         unit = f"user@{actual[0]}.service"
-        self.sudo(
-            "systemctl",
-            "set-property",
-            "--runtime",
-            unit,
-            f"MemoryMax={MEMORY}",
-            "MemorySwapMax=0",
-            "CPUQuota=100%",
-            f"TasksMax={TASKS}",
-        )
         self.sudo("systemctl", "start", f"user-runtime-dir@{actual[0]}.service", unit)
         group = (
             self.sudo("systemctl", "show", "--value", "-p", "ControlGroup", unit).decode().strip()
@@ -1008,6 +1145,11 @@ class NativeCI:
         result: dict[str, Any] | None = None
         if receipt.user_created and not receipt.user_removed:
             uid, _ = self.current_account()  # Recheck mapping before any stop or deletion.
+            environment_ready = self.check_manager_environment()
+            if not environment_ready and receipt.environment_directory is not None:
+                self.sudo("rmdir", "--", str(self.environment_directory()))
+                receipt.environment_directory = None
+                self.save()
             try:
                 fixture = object_bytes(self.sudo("cat", str(self.volume / "fixture.json")))
                 self.as_user(
@@ -1031,7 +1173,13 @@ class NativeCI:
                     and "populated 0" not in (group / "cgroup.events").read_text().splitlines()
                 ):
                     raise FixtureError("native_manager_not_empty")
+            self.check_manager_environment()
             self.sudo("systemctl", "revert", f"user@{uid}.service")
+            if os.path.lexists(self.environment_directory()):
+                raise FixtureError("native_manager_environment_not_removed")
+            receipt.environment_file = None
+            receipt.environment_directory = None
+            self.save()
         for value in list(reversed(receipt.mounts)):
             target = Path(value["target"])
             if target not in {

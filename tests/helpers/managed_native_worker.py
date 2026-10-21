@@ -101,6 +101,31 @@ def membership(unit: str, uid: int) -> Path:
     return Path("/sys/fs/cgroup") / str(group).lstrip("/")
 
 
+def environment_facts(root: Path, uid: int) -> dict[str, bool | str]:
+    """Export only comparisons, never values from the manager's environment."""
+    home = root / "home"
+    explicit = "XDG_CONFIG_HOME" in os.environ
+    config = Path(os.environ["XDG_CONFIG_HOME"]) if explicit else Path.home() / ".config"
+    return {
+        "uid_matches": os.getuid() == uid and os.geteuid() == uid,
+        "home_matches": os.environ.get("HOME") == str(home) and Path.home() == home,
+        "config_source": "explicit" if explicit else "default",
+        "config_matches": config == home / ".config",
+        "runtime_matches": os.environ.get("XDG_RUNTIME_DIR") == f"/run/user/{uid}",
+        "bus_matches": os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        == f"unix:path=/run/user/{uid}/bus",
+    }
+
+
+def require_environment(root: Path, uid: int) -> dict[str, bool | str]:
+    facts = environment_facts(root, uid)
+    require(
+        all(value is True for key, value in facts.items() if key != "config_source"),
+        "native_environment_mismatch",
+    )
+    return facts
+
+
 async def service_exists(probe: SystemdProbe) -> bool:
     """Exact standard-unit listing; helper_exists deliberately rejects this name."""
     from muli.platforms.linux_transaction import _typed
@@ -434,6 +459,7 @@ def install_hook() -> None:
     def application(*args: Any, **kwargs: Any) -> FastAPI:
         app: FastAPI = original(*args, **kwargs)
         runtime = app.state.runtime
+        require_environment(runtime.config.path.parent, os.geteuid())
         runtime.client_factory = forbidden_model
         permit = runtime.maintenance.permit
         if (
@@ -888,6 +914,8 @@ class Case:
             parent for parent in group.parents if parent.name == f"user@{os.geteuid()}.service"
         )
         self.result["resources"]["manager"] = kernel_limits(manager, memory=MEMORY, tasks=TASKS)
+        self.result["resources"]["environment"] = environment_facts(self.root, settings["uid"])
+        require_environment(self.root, settings["uid"])
         self.note("imports_verified")
         verify_local_filesystems([self.root])
         slots = {}
@@ -980,6 +1008,7 @@ class Case:
         from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
 
         settings = fixture(self.root)
+        require_environment(self.root, settings["uid"])
         membership("muli-native-cleanup.service", settings["uid"])
         saved = (
             read_json(self.root / "result.json")

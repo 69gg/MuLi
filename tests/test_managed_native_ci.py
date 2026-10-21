@@ -63,6 +63,16 @@ class Commands:
         self.auto_group = False
         self.uid = 23145
         self.group = f"/user.slice/user-{self.uid}.slice/user@{self.uid}.service"
+        self.manager_runtime = parent / "systemd-run/system"
+        self.manager_control_runtime = parent / "systemd-run/system.control"
+        self.manager_unit_roots = (
+            parent / "systemd-etc/system",
+            self.manager_runtime,
+            parent / "systemd-etc/system.control",
+            self.manager_control_runtime,
+        )
+        for path in self.manager_unit_roots:
+            path.mkdir(parents=True)
         self.cgroup_root = parent / "cgroup"
         kernel(self.cgroup_root / self.group.lstrip("/"), ci.MEMORY, ci.TASKS)
         runtime, dependencies, package = (parent / name for name in ("python", "deps", "package"))
@@ -134,6 +144,20 @@ class Commands:
             assert args[1:3] == ("--format=%d:%i:%f", "--")
             info = os.stat(args[3])  # Emulates root, not runner's Path.stat permission.
             return ci.Reply(0, f"{info.st_dev}:{info.st_ino}:{info.st_mode:x}\n".encode())
+        if args[0] == "mkdir":
+            assert args[1:3] == ("--mode=0755", "--")
+            Path(args[3]).mkdir(mode=0o755)
+            return ci.Reply(0)
+        if args[0] == "install":
+            assert args[1:3] == ("--mode=0644", "--")
+            target = Path(args[-1])
+            target.write_bytes(Path(args[-2]).read_bytes())
+            target.chmod(0o644)
+            return ci.Reply(0)
+        if args[0] == "rmdir":
+            assert args[1] == "--"
+            Path(args[2]).rmdir()
+            return ci.Reply(0)
         if args[0] == "mount":
             target = args[-1]
             if "remount,bind,ro,nodev,nosuid" in args:
@@ -169,6 +193,15 @@ class Commands:
             return ci.Reply(0)
         if args[:2] == ("systemctl", "show"):
             return ci.Reply(0, self.group.encode())
+        if args[:2] == ("systemctl", "revert"):
+            assert args[2] == f"user@{self.uid}.service"
+            for root in self.manager_unit_roots:
+                directory = root / f"{args[2]}.d"
+                if directory.exists():
+                    for path in directory.iterdir():
+                        path.unlink()
+                    directory.rmdir()
+            return ci.Reply(0)
         if args[0] in {"systemctl", "chown", "chmod"}:
             return ci.Reply(0)
         assert args[:1] == ("--user",) and "systemd-run" in args
@@ -197,7 +230,9 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Comma
 
     def root_owned_parent(path: Path) -> os.stat_result:
         info = original_lstat(path)
-        if path == temporary:
+        if path == temporary or any(
+            path.is_relative_to(root) for root in commands.manager_unit_roots
+        ):
             fields = list(info)
             fields[4] = 0  # Synthetic /tmp ownership; no host account is changed.
             return os.stat_result(fields)
@@ -208,7 +243,228 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Comma
     monkeypatch.setattr(ci, "account", commands.accounts.get)
     monkeypatch.setattr(ci, "private_group", commands.groups.get)
     monkeypatch.setattr(ci, "CGROUP_ROOT", commands.cgroup_root)
+    monkeypatch.setattr(ci, "MANAGER_RUNTIME", commands.manager_runtime)
+    monkeypatch.setattr(ci, "MANAGER_CONTROL_RUNTIME", commands.manager_control_runtime)
+    monkeypatch.setattr(ci, "MANAGER_UNIT_ROOTS", commands.manager_unit_roots)
     return ci.NativeCI(tmp_path / ci.ROOT_NAME, run=commands), commands
+
+
+def private_environment(monkeypatch: pytest.MonkeyPatch, root: Path, uid: int) -> None:
+    for key, value in {
+        "HOME": str(root / "home"),
+        "XDG_CONFIG_HOME": str(root / "home/.config"),
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_private_manager_environment_is_confirmed_before_start_and_reclaimed_by_fresh_owner(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert receipt.environment_directory is not None and receipt.environment_file is not None
+    path = native.environment_directory() / ci.ENVIRONMENT_NAME
+    assert path.read_bytes() == native.environment_data()
+    assert path.read_text().splitlines() == [
+        "[Service]",
+        f"MemoryMax={ci.MEMORY}",
+        "MemorySwapMax=0",
+        "CPUQuota=100%",
+        f"TasksMax={ci.TASKS}",
+        f'Environment="HOME={native.home}"',
+        f'Environment="XDG_CONFIG_HOME={native.home / ".config"}"',
+        f'Environment="XDG_RUNTIME_DIR=/run/user/{commands.uid}"',
+        f'Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{commands.uid}/bus"',
+    ]
+    installed = next(index for index, values in enumerate(commands.calls) if "install" in values)
+    reloaded = next(
+        index for index, values in enumerate(commands.calls) if "daemon-reload" in values
+    )
+    started = next(index for index, values in enumerate(commands.calls) if "start" in values)
+    assert installed < reloaded < started
+    assert not any("set-property" in values for values in commands.calls)
+    assert not (commands.manager_control_runtime / path.parent.name).exists()
+    assert native.check_manager_environment()
+    ci.NativeCI(native.root, run=commands).cleanup()
+    assert not path.exists() and not path.parent.exists()
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert receipt.environment_directory is None and receipt.environment_file is None
+
+
+@pytest.mark.parametrize("root_index", range(4))
+def test_existing_instance_dropin_is_not_overwritten_or_reverted(
+    fixture: tuple[Any, Commands], root_index: int
+) -> None:
+    native, commands = fixture
+    directory = commands.manager_unit_roots[root_index] / f"user@{commands.uid}.service.d"
+    directory.mkdir()
+    sentinel = directory / "existing.conf"
+    sentinel.write_bytes(b"unrelated existing configuration")
+    with pytest.raises(ci.FixtureError, match="manager_environment_exists"):
+        native.prepare()
+    assert native.receipt.environment_directory is None
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="manager_environment_(changed|unconfirmed)"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls and sentinel.read_bytes() == b"unrelated existing configuration"
+
+
+def test_existing_instance_unit_override_does_not_grant_revert_authority(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    override = commands.manager_unit_roots[0] / f"user@{commands.uid}.service"
+    override.write_bytes(b"unrelated service override")
+    with pytest.raises(ci.FixtureError, match="manager_environment_exists"):
+        native.prepare()
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="manager_environment_changed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls and override.read_bytes() == b"unrelated service override"
+
+
+def test_extra_instance_control_dropin_never_grants_revert_authority(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    directory = commands.manager_control_runtime / f"user@{commands.uid}.service.d"
+    directory.mkdir()
+    foreign = directory / "foreign.conf"
+    foreign.write_bytes(b"unrelated resource control")
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="manager_environment_changed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls
+    assert foreign.read_bytes() == b"unrelated resource control"
+    assert commands.accounts and commands.mounts
+
+
+@pytest.mark.parametrize("effect", ["mkdir", "install"])
+def test_manager_environment_lost_return_preserves_unconfirmed_evidence(
+    fixture: tuple[Any, Commands], effect: str
+) -> None:
+    native, commands = fixture
+
+    def lost(argv: Any, *, seconds: float = 5) -> Any:
+        reply = commands(argv, seconds=seconds)
+        return ci.Reply(1) if effect in argv else reply
+
+    native.run = lost
+    with pytest.raises(ci.FixtureError, match="command_failed"):
+        native.prepare()
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert (receipt.environment_directory is None) == (effect == "mkdir")
+    assert receipt.environment_file is None
+    directory = native.environment_directory()
+    assert directory.is_dir()
+    if effect == "install":
+        assert (directory / ci.ENVIRONMENT_NAME).read_bytes() == native.environment_data()
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="manager_environment_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls and directory.is_dir()
+
+
+def test_confirmed_empty_environment_directory_can_be_reclaimed_after_install_never_started(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        if "install" in argv:
+            commands.calls.append(tuple(argv))
+            return ci.Reply(1)
+        return commands(argv, seconds=seconds)
+
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="command_failed"):
+        native.prepare()
+    assert ci.Receipt.read(native.receipt_path).environment_directory is not None
+    directory = native.environment_directory()
+    assert not tuple(directory.iterdir())
+    ci.NativeCI(native.root, run=commands).cleanup()
+    assert not directory.exists() and not commands.accounts and not commands.mounts
+
+
+@pytest.mark.parametrize("change", ["directory", "content", "extra"])
+def test_changed_manager_environment_is_never_reverted_or_used_by_cleanup(
+    fixture: tuple[Any, Commands], change: str
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    directory = native.environment_directory()
+    if change == "directory":
+        directory.rename(directory.with_suffix(".old"))
+        directory.mkdir(mode=0o755)
+        (directory / ci.ENVIRONMENT_NAME).write_bytes(native.environment_data())
+    elif change == "content":
+        (directory / ci.ENVIRONMENT_NAME).write_bytes(b"[Service]\nEnvironment=HOME=/different\n")
+    else:
+        (directory / "foreign.conf").write_bytes(b"unrelated")
+    commands.calls.clear()
+    with pytest.raises(ci.FixtureError, match="manager_environment_changed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.calls and commands.accounts and directory.is_dir()
+
+
+@pytest.mark.parametrize("source", ["explicit", "default"])
+def test_worker_environment_facts_use_the_real_default_service_path_without_exporting_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    from muli.service import UserService
+
+    private_environment(monkeypatch, tmp_path, os.geteuid())
+    if source == "default":
+        monkeypatch.delenv("XDG_CONFIG_HOME")
+    facts = worker.require_environment(tmp_path, os.geteuid())
+    assert facts["config_source"] == source
+    assert all(value is True for key, value in facts.items() if key != "config_source")
+    service = UserService(
+        tmp_path / "config.json", tmp_path / "data", executable=tmp_path / "a/bin/python"
+    )
+    assert service.path == tmp_path / "home/.config/systemd/user/muli.service"
+    value = worker.Case(tmp_path).result
+    value["resources"]["environment"] = facts
+    assert ci.fixture_result(json.dumps(value).encode()) == value
+    assert str(tmp_path) not in json.dumps(facts)
+
+
+@pytest.mark.parametrize(
+    "key", ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "uid"]
+)
+def test_worker_environment_mismatch_is_fixed_and_does_not_export_the_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    uid = os.geteuid()
+    private_environment(monkeypatch, tmp_path, uid)
+    if key != "uid":
+        monkeypatch.setenv(key, "/private-upstream-value")
+    facts = worker.environment_facts(tmp_path, uid + 1 if key == "uid" else uid)
+    assert False in facts.values() and "/private-upstream-value" not in json.dumps(facts)
+    with pytest.raises(worker.NativeError, match="^native_environment_mismatch$"):
+        worker.require_environment(tmp_path, uid + 1 if key == "uid" else uid)
+
+
+@pytest.mark.parametrize("change", ["extra", "text", "source"])
+def test_environment_export_rejects_values_instead_of_comparison_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    private_environment(monkeypatch, tmp_path, os.geteuid())
+    facts: dict[str, Any] = worker.environment_facts(tmp_path, os.geteuid())
+    if change == "extra":
+        facts["HOME"] = "private-path"
+    elif change == "text":
+        facts["home_matches"] = "private-path"
+    else:
+        facts["config_source"] = {"private": "path"}
+    value = worker.Case(tmp_path).result
+    value["resources"]["environment"] = facts
+    with pytest.raises(ci.FixtureError, match="result_invalid"):
+        ci.fixture_result(json.dumps(value).encode())
 
 
 @pytest.mark.parametrize("kind", ["symlink", "file", "owner", "mode"])
@@ -846,6 +1102,7 @@ async def test_cleanup_preserves_functional_timeline_and_generations(
     from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
     from muli.platforms import linux_transaction
 
+    private_environment(monkeypatch, tmp_path, os.geteuid())
     case = worker.Case(tmp_path, seconds=worker.CLEANUP_SECONDS)
     record = SimpleNamespace(identity=SimpleNamespace(deployment="a" * 64), generation="b" * 32)
     name = managed_helper_unit_name(record)
