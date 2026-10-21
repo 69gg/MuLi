@@ -22,10 +22,11 @@
 | --- | --- | --- |
 | `reminder` | `notification.created`，`source=reminder` | 相同通知正文及来源、已触发的 reminder、对应通知 ID |
 | `update` | `notification.created`，`source=update` | 相同通知正文及来源、当前已检查且确有新版的 update 记录、对应版本通知 ID |
-| `management` | `management.completed` | 相同管理计划 ID、action 与终态；只接受 configure/restart/update 的 completed/failed |
+| `management` | `management.completed` | 相同管理计划 ID、action、路由与终态；接受 configure/restart/update/adopt/switch 的 completed/failed；候选更新另接受精确 interrupted/candidate_cleaned |
+| `management` | `management.progress` | 当前计划与事件均为 switch/update、applying/candidate_cleanup_required，且原路由一致；同一计划同一阶段去重 |
 | 独立日志策略 | `system.log` | 当前 `system_log` 原记录、精确事件 ID、固定字段一致，且来源允许通知、级别符合策略 |
 
-仅伪造一个同名事件不够。消费器回查 SQLite 的通知、提醒、版本和管理记录；管理计划的原始错误、配置快照、结果对象不进入模型，避免诊断中的凭据外泄。本地 Python 插件仍是用户信任的代码，能修改数据库与事件总线；这里不是针对恶意插件的操作系统沙箱。
+仅伪造一个同名事件不够。消费器回查 SQLite 的通知、提醒、版本和管理记录；管理计划的原始错误、配置快照、结果对象不进入模型，避免诊断中的凭据外泄。候选清理结束表示更新已中断，不表示安装或切换成功；其他 progress 与历史 interrupted 忽略，详情见[候选更新](candidate-host-design.md)。本地 Python 插件仍是用户信任的代码，能修改数据库与事件总线；这里不是针对恶意插件的操作系统沙箱。
 
 系统资料不代表用户授权。每批输入固定使用 `source=principal=system:attention`、`route=null`，不执行 owner 消息 hooks，也不会自动提炼成用户身份记忆。为复用现有工具配对与多协议回放，历史使用 `user` 消息容器，但正文明确以“系统注意事项／非用户消息或新授权”开头；界面应根据 `principal` 标记为系统资料，不能显示成用户主动发言。内部 `Runtime.submit_attention()` 没有对应的公共 HTTP 入站入口；它在配置锁内再次检查执行任务、团队/工作流状态、待投递团队报告与主队列中的非注意事项输入。尚有这些工作时返回 `None` 表示延后，不写入 ingress、游标或去重凭据。
 
