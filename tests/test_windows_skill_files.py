@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import struct
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -79,7 +80,7 @@ def test_components_reject_aliases_devices_ads_and_invalid_utf16(name: str) -> N
         "C:\\a\\..\\b",
         "C:\\a\\",
         "C:\\a:stream",
-        "C:\\" + "🙂" * 16382,
+        pytest.param("C:\\" + "🙂" * 16382, id="utf16-path-over-limit"),
     ],
 )
 def test_root_requires_unambiguous_absolute_disk_components(path: str) -> None:
@@ -494,14 +495,17 @@ def test_real_windows_leaf_read_blocks_edit_and_releases_every_handle(
     def read(handle: int, limit: int) -> bytes:
         nonlocal attempted
         attempted = True
-        for effect in (
-            cast(Callable[[], object], lambda: path.write_bytes(b"external update")),
-            lambda: path.parent.rename(tmp_path / "renamed"),
-        ):
-            with pytest.raises(OSError) as error:
-                effect()
-            assert error.value.winerror == 32
-        return original(handle, limit)
+        with pytest.raises(PermissionError) as write_error:
+            path.write_bytes(b"external update")
+        assert write_error.value.errno == errno.EACCES
+        # CRT file opening can report EACCES without a native winerror.
+        assert getattr(write_error.value, "winerror", None) in (None, 32)
+        with pytest.raises(PermissionError) as rename_error:
+            path.parent.rename(tmp_path / "renamed")
+        assert rename_error.value.winerror == 32
+        actual = original(handle, limit)
+        assert actual == content
+        return actual
 
     monkeypatch.setattr(native, "bytes", read)
     assert _read(path, source, expected=True) == content and attempted
