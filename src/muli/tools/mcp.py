@@ -183,7 +183,9 @@ def _default_factory(
         timeout: httpx.Timeout | None = None,
         auth: httpx.Auth | None = None,
     ) -> httpx.AsyncClient:
-        client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+        client: httpx.AsyncClient = create_mcp_http_client(
+            headers=headers, timeout=timeout, auth=auth
+        )
         install_receive_guard(client, receive, streamable=server["transport"] == "http")
         return client
 
