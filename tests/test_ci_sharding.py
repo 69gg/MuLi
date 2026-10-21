@@ -17,7 +17,7 @@ def sample_suite(tmp_path: Path) -> Path:
     source = (
         "import pytest\n"
         "@pytest.mark.parametrize('value', [1, 2, 3])\n"
-        "def test_value(value):\n"
+        "def test_value(value: int) -> None:\n"
         "    assert value > 0\n"
     )
     for name in ("alpha", "middle", "zeta"):
