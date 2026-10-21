@@ -1,7 +1,7 @@
 # 2.29 chiliarch 普通消息主动资料审查
 
-精确候选已通过八项 CI，并以原签名提交合入 main、推送发行标签；独立 main
-和发行作业仍在执行。2.28 的验证单独保留，不借用其结果。
+已正式发布至 PyPI/GitHub：精确候选和 main 各八项、发行十一项全部通过，
+原签名提交与两种构件元数据均已核实。2.28 的验证单独保留，不借用其结果。
 
 ## 合同与独立审查
 
@@ -64,3 +64,24 @@ attempt 1 八项成功：quality、MCP 和 Linux/macOS/Windows × Python 3.12/3.
 与 [Release 39547575662](https://github.com/69gg/MuLi/actions/runs/39547575662)
 尚待完成，现阶段不把标签存在视为 PyPI 已发布，也不把本版矩阵当作下一版
 Windows Skills 原生句柄实现的验收。
+
+## 发行后核验
+
+上述 main 与 Release 均在 attempt 1 完成：main 八项、Release 的八项 verify
+以及 prepare、publish、github-release 共十一项全部 success，精确 SHA 均为
+`796bf311e4e183f50ab856a8586db1bab3c48a0e`。父审查另行核对两组完整作业。
+远端 main 与标签解引用指向同一提交；标签对象
+`1671e20df558518d3cb457a9cfa6fa503023b0c8` 及提交签名均 verified/valid。
+
+[GitHub 发行](https://github.com/69gg/MuLi/releases/tag/v2.29.0) 于
+2026-10-21T05:11:10Z（北京时间 13:11:10）发布，非草稿、非预发行。
+独立观察者只读取 GitHub/PyPI 小型元数据，两个文件均未撤回，文件名、大小
+及 SHA256 完全一致，没有下载构件：
+
+| 文件 | 字节数 | SHA256 |
+| --- | ---: | --- |
+| `muli_agent-2.29.0-py3-none-any.whl` | 733393 | `da9a2b50aec6ffebb2cf24fa24c1bb9bc175b32fd177a10ab44ca93187bdef50` |
+| `muli_agent-2.29.0.tar.gz` | 3762730 | `337c1a195b0e691b1a540e01f4bd63c8b055de182e1419cb9f40bf9cf25456f6` |
+
+本版验证至此收口，不重复轮询或重跑；下一版 Windows Skills 和在线候选
+获取分别使用自己的提交、审查及验收记录。
