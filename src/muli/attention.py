@@ -9,6 +9,7 @@ from collections.abc import Callable
 from typing import Any
 
 from muli.config import AttentionSettings
+from muli.integrations.attention import ChiliarchAttentionState
 from muli.proactive import FrozenRouting
 from muli.runtime import Runtime
 from muli.store import now
@@ -21,14 +22,21 @@ _HEADER = (
 )
 
 
+class _ChiliarchPolicyChanged(ValueError):
+    """Reconsume immediately so an invalidated source cannot block reminders."""
+
+
 class AttentionInbox:
     def __init__(
         self,
         runtime: Runtime,
         system_settings: Callable[[], SystemEventsSettings] | None = None,
+        *,
+        chiliarch_settings: Callable[[], ChiliarchAttentionState] | None = None,
     ) -> None:
         self.runtime, self.store, self.bus = runtime, runtime.store, runtime.bus
         self._system_settings = system_settings
+        self._chiliarch_settings = chiliarch_settings
         self._task: asyncio.Task[None] | None = None
         self._closing = True
         self._generation = 0
@@ -109,8 +117,11 @@ class AttentionInbox:
         event: dict[str, Any],
         policy: AttentionSettings,
         system_policy: SystemEventsSettings | None = None,
+        chiliarch_policy: ChiliarchAttentionState | None = None,
     ) -> dict[str, Any] | None:
-        source = attention_source(self.store, event, policy.events, system_policy)
+        source = attention_source(
+            self.store, event, policy.events, system_policy, chiliarch_policy=chiliarch_policy
+        )
         if source is None:
             return None
         receipt_id = hashlib.sha256(source.logical_key.encode("utf-8")).hexdigest()
@@ -123,6 +134,7 @@ class AttentionInbox:
             "record_id": source.record_id,
             "detail": source.detail,
             "routing": source.routing.dump(),
+            "producer_proof": source.producer_proof,
         }
 
     @staticmethod
@@ -132,7 +144,7 @@ class AttentionInbox:
                 {
                     key: value
                     for key, value in record.items()
-                    if key not in {"receipt_id", "routing"}
+                    if key not in {"receipt_id", "routing", "producer_proof"}
                 }
                 for record in records
             ],
@@ -168,6 +180,9 @@ class AttentionInbox:
     async def _consume(self) -> bool:
         policy = self.runtime.config.settings.attention.model_copy(deep=True)
         system_policy = self._system_settings() if self._system_settings is not None else None
+        chiliarch_policy = (
+            self._chiliarch_settings() if self._chiliarch_settings is not None else None
+        )
         if not policy.enabled:
             self._waiting = "disabled"
             return False
@@ -180,7 +195,7 @@ class AttentionInbox:
             )
             return False
         if policy.coalesce_seconds and any(
-            self._record(event, policy, system_policy) for event in events
+            self._record(event, policy, system_policy, chiliarch_policy) for event in events
         ):
             self._waiting = "coalescing"
             await asyncio.sleep(policy.coalesce_seconds)
@@ -193,7 +208,7 @@ class AttentionInbox:
             policy.max_chars, max(512, self.runtime.config.settings.limits.max_context_chars // 4)
         )
         for event in events:
-            record = self._record(event, policy, system_policy)
+            record = self._record(event, policy, system_policy, chiliarch_policy)
             if record is not None and record["receipt_id"] not in seen:
                 selected = FrozenRouting.load(record["routing"])
                 if routing is not None and routing.batch_key != selected.batch_key:
@@ -233,6 +248,18 @@ class AttentionInbox:
                 or (self._system_settings is not None and system_policy != self._system_settings())
             ):
                 raise ValueError("注意事项策略已改变")
+            for record in records:
+                proof = record["producer_proof"]
+                if proof is not None:
+                    current = (
+                        self._chiliarch_settings() if self._chiliarch_settings is not None else None
+                    )
+                    if (
+                        current is None
+                        or not current.enabled
+                        or proof != (current.scope, current.revision)
+                    ):
+                        raise _ChiliarchPolicyChanged("chiliarch 消息提醒策略已改变")
 
         batch_id = f"events:{records[0]['event_id']}:{after}"
         objects = [("attention_state", self._state(after, True))]
@@ -247,17 +274,27 @@ class AttentionInbox:
                     "batch_id": batch_id,
                     "routing": record["routing"],
                     "status": "accepted",
+                    **(
+                        {"producer_proof": record["producer_proof"]}
+                        if record["producer_proof"] is not None
+                        else {}
+                    ),
                 },
             )
             for record in records
         )
-        receipt = await self.runtime.submit_attention(
-            self._content(records),
-            batch_id,
-            objects=objects,
-            admission_guard=guard,
-            routing=routing,
-        )
+        try:
+            receipt = await self.runtime.submit_attention(
+                self._content(records),
+                batch_id,
+                objects=objects,
+                admission_guard=guard,
+                routing=routing,
+            )
+        except _ChiliarchPolicyChanged:
+            # The next bounded pass excludes stale Chiliarch records and still
+            # admits valid reminders from this batch, without needing a new event.
+            return True
         if receipt is None:
             if not self.runtime.maintenance.admission.allowed:
                 self._waiting = "maintenance"

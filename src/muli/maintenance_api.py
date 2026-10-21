@@ -105,6 +105,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/management",
         "/api/management/transactions/current",
         "/api/management/update-policy",
+        "/api/integrations/chiliarch/attention",
         "/api/extensions",
         "/api/memory/status",
         "/api/channels",

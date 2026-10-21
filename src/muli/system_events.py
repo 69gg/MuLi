@@ -19,6 +19,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from muli.events import EventBus
+from muli.integrations.attention import ChiliarchAttentionState, read_message
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id
@@ -569,6 +570,7 @@ class AttentionSource:
     detail: str
     logical_key: str
     routing: FrozenRouting = FrozenRouting()
+    producer_proof: tuple[str, str] | None = None
 
 
 def _notification_source(
@@ -815,6 +817,8 @@ def attention_source(
     event: dict[str, Any],
     enabled: Collection[str],
     system_policy: SystemEventsSettings | None = None,
+    *,
+    chiliarch_policy: ChiliarchAttentionState | None = None,
 ) -> AttentionSource | None:
     if event.get("session_id") is not None or not isinstance(event.get("data"), dict):
         return None
@@ -824,5 +828,24 @@ def attention_source(
         or re.fullmatch(r"[A-Za-z0-9:._+\-]{1,160}", identifier) is None
     ):
         return None
+    if event.get("type") == "notification.created" and (
+        event["data"].get("source") == "chiliarch"
+        or event["data"].get("producer") == "chiliarch_message"
+    ):
+        if chiliarch_policy is None:
+            return None
+        message = read_message(store, event["data"], chiliarch_policy)
+        return (
+            AttentionSource(
+                "chiliarch",
+                message.identifier,
+                message.detail,
+                message.identifier,
+                message.routing,
+                (message.scope, message.revision),
+            )
+            if message is not None
+            else None
+        )
     adapter = _ADAPTERS.get(event.get("type", ""))
     return adapter(store, event, enabled, system_policy) if adapter else None
