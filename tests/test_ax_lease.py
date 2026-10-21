@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -368,21 +369,78 @@ async def test_request_timeout_includes_response_and_reaps_process() -> None:
     assert_reaped(item)
 
 
-async def test_absolute_ttl_early_callback_rechecks_and_does_not_renew() -> None:
-    item = lease(ttl=0.2)
-    expiry = item.expires_at
+async def test_absolute_ttl_early_callback_rechecks_and_does_not_renew(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ttl = 0.2
+    item = lease(ttl=ttl)
+    expiry: float = item.expires_at
     item._timer.cancel()
-    item._expire()  # Simulate call_at running early: it must not expire the lease.
-    assert item.state == "new" and item.expires_at == expiry
-    await item.request("snapshot", {})
-    assert item.expires_at == expiry
-    assert item._cleanup is None
-    item.expires_at = asyncio.get_running_loop().time()
-    item._expire()
-    assert item.state == "closing" and not item.closed
-    with pytest.raises(AXLeaseError) as caught:
-        await item.request("snapshot", {})
-    assert caught.value.code == "lease_expired"
+    current: float = expiry - ttl
+    scheduled: list[tuple[float, Callable[[], None], Mock]] = []
+    budgets: list[float] = []
+
+    def clock() -> float:
+        return current
+
+    def call_at(when: float, callback: Callable[[], None]) -> asyncio.TimerHandle:
+        handle = Mock(spec=asyncio.TimerHandle)
+        scheduled.append((when, callback, handle))
+        return handle
+
+    # Only this lease sees virtual time/timers. Futures and cleanup tasks still
+    # belong to the real loop; unrelated test/transport deadlines stay real.
+    loop = Mock(spec=asyncio.AbstractEventLoop, wraps=asyncio.get_running_loop())
+    loop.time.side_effect = clock
+    loop.call_at.side_effect = call_at
+    monkeypatch.setattr(item, "_loop", loop)
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.returncode = 0
+    process.stdin = Mock(spec=asyncio.StreamWriter)
+    process.stdin.drain = AsyncMock(return_value=None)
+
+    def respond(raw: bytes) -> None:
+        request = json.loads(raw)
+        budgets.append(request["limits"]["timeout_seconds"])
+        item._response(
+            json.dumps(
+                {"v": 1, "request_id": request["request_id"], "result": {"command": "snapshot"}}
+            ).encode("utf-8")
+        )
+
+    async def start() -> None:
+        nonlocal current
+        item._check_alive()
+        current += ttl / 4
+        item._process, item._state = process, "in_flight"
+
+    # This request seam cannot suspend: readiness and the matching protocol
+    # frame are controlled here, not by whether an OS spawn fits inside 200ms.
+    process.stdin.write.side_effect = respond
+    monkeypatch.setattr(item, "_start", start)
+    try:
+        item._expire()
+        assert item.state == "new" and item.expires_at == expiry
+        assert len(scheduled) == 1 and scheduled[-1][0] == expiry
+        current += ttl / 4
+        scheduled[-1][1]()  # A second early callback must recheck/rearm too.
+        assert item.state == "new" and item.expires_at == expiry
+        assert len(scheduled) == 2 and scheduled[-1][0] == expiry
+        for _ in range(2):
+            assert (await item.request("snapshot", {}))["command"] == "snapshot"
+            assert item.state == "ready" and item.expires_at == expiry
+            assert item._cleanup is None and len(scheduled) == 2
+        assert budgets == pytest.approx([ttl / 2, ttl / 4])
+        assert item._count == 2 and item._starting is None
+        current = expiry
+        scheduled[-1][1]()  # Reach the original deadline without rewriting it.
+        assert item.state == "closing" and not item.closed
+        scheduled[-1][2].cancel.assert_called_once()
+        with pytest.raises(AXLeaseError) as caught:
+            await item.request("snapshot", {})
+        assert caught.value.code == "lease_expired" and item._count == 2
+    finally:
+        await item.aclose()
     assert_reaped(item)
 
 
