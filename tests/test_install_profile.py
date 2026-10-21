@@ -46,6 +46,20 @@ no-index = false
 index-strategy = "first-index"
 """
 
+# Transcribed from the isolated uv 0.13.1 tiny-wheel experiment. Tool/entrypoint
+# names and private paths are substituted; these are not original receipt bytes
+# or evidence that a MuLi installation was performed.
+OBSERVED_UV_0131_RECEIPT = b"""[tool]
+requirements = [{name = "muli-agent", specifier = "==0.0.1"}]
+python = "/fixture/source/bin/python"
+entrypoints = [{name = "muli", install-path = "/fixture/private-bin/muli", from = "muli-agent"}]
+
+[tool.options]
+no-index = true
+find-links = ["file:///fixture/wheelhouse"]
+no-build = true
+"""
+
 
 def tool_data() -> dict[str, Any]:
     return {
@@ -108,6 +122,36 @@ def test_pinned_wire_preserves_requirements_options_and_entrypoint_evidence() ->
     )
     assert intent.options.no_index is False
     assert intent.options.index_strategy == "first-index"
+
+
+@pytest.mark.parametrize("version", ["0.13.0", "0.13.1"])
+def test_observed_0131_offline_wire_has_only_parsed_intent(version: str) -> None:
+    result = parse_install_intent(OBSERVED_UV_0131_RECEIPT, uv_version=version)
+    assert result.adapter == f"uv-tool-{version}"
+    assert result.context_status == "context_required"
+    assert result.intent.main.specifier == "==0.0.1"
+    assert result.intent.python == "/fixture/source/bin/python"
+    options = result.intent.options
+    assert options is not None
+    assert options.no_index is True and options.no_build is True
+    assert options.find_links == ("file:///fixture/wheelhouse",)
+    assert options.index_url is options.extra_index_urls is options.index_strategy is None
+    assert "offline" not in options.model_dump() and "profile_complete" not in repr(result)
+
+
+def test_local_links_preserve_order_and_explicit_empty_or_false() -> None:
+    data = tool_data()
+    data["options"] = {"find-links": [], "no-build": False}
+    options = parse(receipt(data)).intent.options
+    assert options is not None
+    assert options.find_links == () and options.no_build is False
+    data["options"] = {}
+    options = parse(receipt(data)).intent.options
+    assert options is not None and options.find_links is None and options.no_build is None
+    links = ["file:///fixture/z", "file:///fixture/a%20b", "file:///fixture/z"]
+    data["options"] = {"find-links": links}
+    options = parse(receipt(data)).intent.options
+    assert options is not None and options.find_links == tuple(links)
 
 
 def test_constraints_overrides_and_extras_are_never_sorted_or_deduplicated() -> None:
@@ -178,7 +222,7 @@ def test_no_pep_evaluation_or_candidate_pin_is_invented() -> None:
     assert "target" not in parsed.model_dump() and "profile_complete" not in repr(parsed)
 
 
-@pytest.mark.parametrize("version", ["", "0.12.22", "0.13.1", "main", "uv 0.13.0", True, 13])
+@pytest.mark.parametrize("version", ["", "0.12.22", "0.13.2", "main", "uv 0.13.0", True, 13])
 def test_other_versions_are_not_inferred_from_receipt_shape(version: Any) -> None:
     with pytest.raises(InstallProfileError, match="^unsupported_uv_version$"):
         parse_install_intent(PINNED_RECEIPT, uv_version=version)
@@ -191,10 +235,9 @@ def test_other_versions_are_not_inferred_from_receipt_shape(version: Any) -> Non
         ("build-constraint-dependencies", [], "unsupported_tool_field"),
         ("future-option", 1, "unsupported_tool_field"),
         ("options", {"index": []}, "unsupported_option"),
-        ("options", {"find-links": []}, "unsupported_option"),
         ("options", {"keyring-provider": "subprocess"}, "unsupported_option"),
         ("options", {"config-settings": {"secret-key": "synthetic-secret"}}, "unsupported_option"),
-        ("options", {"no-build": False}, "unsupported_option"),
+        ("options", {"no-binary": False}, "unsupported_option"),
         ("options", {"future-setting": {"version": 2}}, "unsupported_option"),
         ("options", {"index-strategy": "new-strategy"}, "unsupported_index_strategy"),
     ],
@@ -287,6 +330,39 @@ def test_url_policy_also_covers_bound_requirement_and_extra_index(location: str)
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        "/fixture/wheelhouse",
+        "file:relative",
+        "file:/fixture/wheelhouse",
+        "file://localhost/fixture/wheelhouse",
+        "file://remote/fixture/wheelhouse",
+        "file:////remote/wheelhouse",
+        "https://example.invalid/wheelhouse",
+        "file:///fixture/wheelhouse?token=synthetic-secret",
+        "file:///fixture/wheelhouse#synthetic-secret",
+        "file:///fixture/wheelhouse?",
+        "file:///fixture/wheelhouse#",
+        "file:///fixture/white space",
+        "file:///fixture/%00",
+        "file:///fixture/%0a",
+        "file:///fixture/%5cother",
+        "file:///fixture/%2e%2e/wheelhouse",
+        "file:///fixture/../wheelhouse",
+        "file:///fixture/%ff",
+        "file:///fixture/%",
+        "file:///fixture/%zz",
+    ],
+)
+def test_nonlocal_or_ambiguous_find_links_are_not_authorized(url: str) -> None:
+    data = tool_data()
+    data["options"] = {"find-links": [url]}
+    with pytest.raises(InstallProfileError, match="^unsupported_find_links$") as error:
+        parse(receipt(data))
+    assert "synthetic-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize(
     "data",
     [
         b"",
@@ -344,6 +420,10 @@ def test_multiple_primary_requirements_cannot_ambiguously_replace_installation_i
         ("entrypoints", False),
         ("options", {"no-index": 0}),
         ("options", {"no-index": "false"}),
+        ("options", {"no-build": 0}),
+        ("options", {"no-build": "false"}),
+        ("options", {"find-links": "file:///fixture/wheelhouse"}),
+        ("options", {"find-links": [True]}),
         ("options", {"extra-index-url": "https://example.invalid/simple"}),
     ],
 )
@@ -423,6 +503,18 @@ def test_index_entrypoint_and_utf8_string_budgets() -> None:
         parse(receipt(data), IntentLimits(max_string_bytes=32))
 
 
+def test_find_links_share_the_finite_source_budget() -> None:
+    data = tool_data()
+    data["options"] = {
+        "index-url": "https://a.example.invalid/simple",
+        "extra-index-url": ["https://b.example.invalid/simple"],
+        "find-links": ["file:///fixture/wheelhouse"],
+    }
+    assert parse(receipt(data), IntentLimits(max_indexes=3)).intent.options is not None
+    with pytest.raises(InstallProfileError, match="^receipt_budget$"):
+        parse(receipt(data), IntentLimits(max_indexes=2))
+
+
 def test_output_and_nested_collection_values_are_immutable() -> None:
     parsed = parse(PINNED_RECEIPT)
     with pytest.raises(ValidationError):
@@ -456,4 +548,7 @@ def test_pure_entrypoint_does_not_discover_files_environment_credentials_or_proc
         ):
             blocked.setattr(target, name, forbidden)
         result = parse(PINNED_RECEIPT)
+        local = parse_install_intent(OBSERVED_UV_0131_RECEIPT, uv_version="0.13.1")
     assert result.status == "intent_parsed" and result.context_status == "context_required"
+    assert local.intent.options is not None
+    assert local.intent.options.find_links == ("file:///fixture/wheelhouse",)
