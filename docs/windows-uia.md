@@ -5,6 +5,11 @@
 前两轮失败仍保留在[发行审查](review-v2.32.md)，不反推旧夹具超时的唯一原因。
 没有在开发机调用 PowerShell、读取桌面、安装组件或修改执行策略。
 
+2.32.1 后续 main 的 Windows 3.12 在测试目标窗夹具启动时再次超时，发行矩阵仍全部
+通过。本轮仅把被读取的测试目标从额外 PowerShell/WinForms 进程改为 stdlib Win32
+临时窗口；产品 PowerShell/MTA 桥接、12 秒期限和三项原生断言不变，尚待新矩阵验证。
+零阶段事实与覆盖边界见[目标窗夹具记录](uia-native-win32-fixture-review.md)。
+
 ## 使用范围
 
 保留主配置格式和 `computer.backend` 的现有取值。电脑能力仍默认关闭；启用后，
@@ -83,7 +88,7 @@ swap 0 / 一逻辑 CPU 上限不变：
   后通过；旧 auto Windows unavailable 预期只改为 uia，禁用不启动断言保留。
 
 上述本地结果本身不证明 PowerShell 脚本语法、系统模块实际布局或 UIA 已工作。
-`test_uia_native.py` 只在 hosted Windows CI 创建自己的临时 WinForms 窗口；若未在
+`test_uia_native.py` 只在 hosted Windows CI 创建自己的临时标准 Win32 窗口；若未在
 Windows CI 执行，不能把 skip 当作验收。用例要求：
 
 1. 系统 Utility 的实际路径、自动加载关闭、真实 NoProfile / NonInteractive / MTA、
@@ -112,6 +117,18 @@ Shown 回执时触及原 12 秒期限。其测试正文尚未执行；现有日�
 [启动诊断记录](uia-native-startup-review.md)。
 完整计数、失败定位和后续结果见[2.32 审查](review-v2.32.md)。
 没有执行用户桌面动作、截图、输入、授权修改或系统 broker 清理。
+
+当前目标夹具不再需要独立 PowerShell/.NET/WinForms 启动。固定 Python `-I -B` 子进程
+只创建自有窗口及 STATIC、密码 EDIT、BUTTON；消息循环实际处理自有就绪消息后才返回
+原 PID/标题回执，继续服从原 12 秒启动总期限与合计 4 KiB 管道/诊断预算。隐藏的前置
+STATIC 依微软标准控件合同提供密码 EDIT 的 Name，本身不作为 UIA 节点暴露；原私有
+label/value 不泄露、protected 空 name 和只读断言保留。受控宿主测试另拒绝 protected
+非空 name 回执；它不等于动态证明 PowerShell Name getter 从未调用。
+新目标的真实 UIA 可枚举性、密码 Name 关联与无窗口启动仍须由 Windows CI 证明；
+不能用 Linux fake API 结果替代，也不把去除额外依赖说成查明旧 PS 启动根因。
+新纯 fixture 11 项、既有 startup 9 项及 host 27 项合计 47 项通过，原 native 3 项
+在 Linux 跳过；四份修改测试 Python 的 Ruff/格式与 strict mypy 通过，整轮最高
+244.4 MiB、swap 0。准确首轮静态修正和分组见上述目标夹具记录。
 
 ## 官方依据
 
