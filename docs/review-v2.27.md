@@ -1,6 +1,6 @@
 # 2.27 微信语音入站与渠道确认审查
 
-这是独立开发分支的整合记录，候选八项 CI 已通过，main 与发行尚在验证。
+2.27.0 已正式发布，精确候选、main 各八项及发行十一项全部通过。
 基线为 2.26 的签名 `f10f7d5`，保留其 Windows 收集修复；
 已发布版本与 main 的 AX 夹具失败分别记录在[2.26 审查](review-v2.26.md)，
 本片不改写该标签或把后续修复追加到本版固定提交。
@@ -44,13 +44,26 @@ root 独立静态复审没有剩余 P1/P2。
 `mypy --no-incremental` 与 83 包离线锁核验通过；类型检查峰值 396 MiB、
 swap 0。这些是本地结果，尚不能代替完整候选矩阵、构件检查或真实平台验收。
 
-## 固定候选与发行进行中
+## 固定候选与正式发行
 
 最终签名提交 `4b744061c41ebad764ecd2eb22983c2f6a59cb8b` 的
 [候选 CI](https://github.com/69gg/MuLi/actions/runs/39543257833) attempt 1
 八项全部成功。[PR31](https://github.com/69gg/MuLi/pull/31) 于
 2026-10-21 04:28:12 UTC 合入 main，精确保留该提交。签名标签 `v2.27.0`
 对象 `28800cb34e0614ae69305e4b697a9746610a4d90` 的本地与远端签名、指向
-已核实。[main CI](https://github.com/69gg/MuLi/actions/runs/39544203150) 与
-[发行流水线](https://github.com/69gg/MuLi/actions/runs/39544203194) 当前仍在
-执行，尚未将标签推送等同正式发布。
+已核实。[main CI](https://github.com/69gg/MuLi/actions/runs/39544203150)
+attempt 1 八项成功；相同提交的
+[发行流水线](https://github.com/69gg/MuLi/actions/runs/39544203194) attempt 1
+八项独立验证及 prepare/publish/github-release 共十一项成功。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.27.0) 于
+2026-10-21 04:35:32 UTC 发布；[PyPI 2.27.0](https://pypi.org/project/muli-agent/2.27.0/)
+未撤回，两个平台的文件名、大小及 SHA-256 逐项相同：
+
+| 文件 | 大小（字节） | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.27.0-py3-none-any.whl` | 726851 | `e371244ed27f920a0bc9500b1fc4eb42ce2be2e77f515f96016c16ffecd7c656` |
+| `muli_agent-2.27.0.tar.gz` | 3731631 | `90d8ed61f7d8cc692fff767c4899e2e29f25025922c8609ee08c7026792cee47` |
+
+核验仅读取小型 JSON 元数据，没有下载或安装构件。版本发布不代替真实
+微信账号的入站录音与外发平台验收；原 AX 夹具修复在下一版本独立验证。
