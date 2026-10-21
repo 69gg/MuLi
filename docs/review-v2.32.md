@@ -1,6 +1,7 @@
 # 2.32 Windows UIA 只读后端审查
 
-状态：本地整合验证通过，真实 Windows 矩阵与发行尚待完成。这里只提供
+状态：本地整合与两组真实 Windows CI 已通过；首轮完整矩阵有一组 Linux
+旧回滚用例失败，正在修复，尚未发布。这里只提供
 顶层窗口发现、选定窗口树和释放引用，动作及输入明确不可用。
 
 ## 范围与审查
@@ -43,3 +44,26 @@ P1/P2。原生 fixture 只在 Windows CI 创建自己的临时 WinForms 窗口�
 可读，既有 API/资源/禁用桌面及生命周期验证通过。没有下载依赖或启动
 PowerShell、真实桌面、真实用户服务。全部检查串行受单次 1 GiB、共享
 2 GiB、单 CPU、swap 0 和 30 秒守卫约束；远端需验证精确候选的完整矩阵。
+
+## 首轮完整矩阵
+
+精确签名候选 `6a8ad38e7899b70cb34ac91f0b9a6570bcf1faa9` 的
+[PR36](https://github.com/69gg/MuLi/pull/36) 对应
+[CI 39554055600](https://github.com/69gg/MuLi/actions/runs/39554055600)，
+七项成功、一项失败。Windows 3.12 / 3.13 作业 `119069563767` /
+`119069563721` 均为 3151 项通过、1356 项跳过；三个 UIA 原生用例的
+`win32 + GITHUB_ACTIONS` 门在这两组实际启用，没有缺桌面能力的动态跳过。
+
+Ubuntu 3.13 作业 `119069563832` 为 4490 项通过、16 项跳过、一项失败：
+`test_actual_cli_boot_activation_and_projection_preserve_latest_database`
+的 `target-rejected-rollback` 已经过 start-target、stop-target、start-base，
+基础服务 ready 和 paused 健康断言也已通过，但原 20 秒总期限内未收到
+`controller-resolved`。此处尚未进入独立最终退出收尾；trace 中的 -9 来自
+finally 清理，不能当成后台进程自行被杀的证据。
+
+不修改产品或期限的单次受限诊断为 1 项通过、13.65 秒，服务 14.171 秒、
+峰值 179.7 MiB、swap 0。base ready 为诊断起点后 11.552 秒，resolved 为
+13.058 秒；两个临时 slot 各生成 119 个 pyc，确认 `-I` 忽略
+`PYTHONDONTWRITEBYTECODE`。该次成功不能还原远端未保留的失败阶段，
+也不能把额外字节码写入定为超时唯一根因。下一修订修正此已确认的夹具
+副作用，并补有界阶段证据；保持产品、20 秒总期限和完整回滚证明。
