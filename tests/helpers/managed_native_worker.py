@@ -135,18 +135,56 @@ async def service_exists(probe: SystemdProbe) -> bool:
         return True
 
 
-async def observe_harness(probe: SystemdProbe, unit: str) -> dict[str, Any]:
+async def observe_harness(probe: SystemdProbe, unit: str, facts: dict[str, Any]) -> dict[str, Any]:
     """Read the exact failed harness through the product's typed D-Bus parser."""
     require(
         re.fullmatch(r"muli-native-[a-f0-9]{32}\.service", unit) is not None,
         "native_fixture_unit",
     )
+    from muli.platforms.linux_transaction import _typed
+
+    facts["stage"] = "manager"
+    manager = await probe._properties("/org/freedesktop/systemd1", "Manager", (("Version", "s"),))
+    require(
+        isinstance(manager["Version"], str) and 0 < len(manager["Version"]) <= 256,
+        "native_diagnostic_invalid",
+    )
+    facts["stage"] = "listing"
+    listed = _typed(
+        await probe._command(
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "ListUnitsByPatterns",
+            "asas",
+            "0",
+            "1",
+            unit,
+        ),
+        "a(ssssssouso)",
+    )
+    if listed == [[]]:
+        return {**facts, "code": "unit_absent", "failure": "none"}
+    require(
+        isinstance(listed, list)
+        and len(listed) == 1
+        and isinstance(listed[0], list)
+        and len(listed[0]) == 1
+        and isinstance(listed[0][0], list)
+        and len(listed[0][0]) == 10
+        and listed[0][0][0] == unit,
+        "native_diagnostic_invalid",
+    )
+    facts["stage"] = "get_unit"
     path = await probe._unit_path(unit)
+    facts["stage"] = "unit_properties"
     state = await probe._properties(
         path,
         "Unit",
         (("Id", "s"), ("LoadState", "s"), ("ActiveState", "s"), ("SubState", "s")),
     )
+    facts["stage"] = "service_properties"
     service = await probe._properties(
         path,
         "Service",
@@ -172,62 +210,136 @@ async def observe_harness(probe: SystemdProbe, unit: str) -> dict[str, Any]:
         and all(type(value) is int and 0 <= value < 2**31 for value in integers.values()),
         "native_diagnostic_invalid",
     )
-    return {"unit": unit, "code": "observed", **strings, **integers}
+    return {**facts, "code": "observed", "failure": "none", **strings, **integers}
+
+
+def diagnostic_command_code(status: object, stderr: object) -> str:
+    """Only fixed diagnostic labels leave this bounded client wrapper."""
+    if type(status) is not int:
+        return "invalid_reply"
+    if status == 0:
+        return "ok"
+    body = stderr.lower() if isinstance(stderr, str) else ""
+    if "failed to connect to bus" in body or "failed to connect to user" in body:
+        return "bus_permission" if "permission denied" in body else "bus_unavailable"
+    if any(item in body for item in ("unrecognized option", "unknown option", "invalid option")):
+        return "unsupported_argument"
+    if any(item in body for item in ("unknown property", "unknown assignment")):
+        return "property_rejected"
+    if any(
+        item in body
+        for item in ("permission denied", "access denied", "interactive authentication required")
+    ):
+        return "permission_denied"
+    if "unit" in body and ("not loaded" in body or "not found" in body):
+        return "unit_unavailable"
+    return "command_failed"
+
+
+def diagnostic_ancestors(home: Path) -> list[dict[str, int]]:
+    """Observe only the fixed RUNNER_TEMP ancestor chain, never its contents."""
+    temporary = home.parents[2]
+    paths = tuple(reversed((temporary, *temporary.parents)))
+    require(len(paths) <= 16, "native_diagnostic_invalid")
+    result: list[dict[str, int]] = []
+    for index, path in enumerate(paths):
+        info = path.lstat()
+        result.append(
+            {"index": index, "mode": info.st_mode, "uid": info.st_uid, "gid": info.st_gid}
+        )
+    return result
 
 
 async def diagnose(user: str, uid: int, home: Path, unit: str, deadline: float) -> dict[str, Any]:
     """Runner owns this interpreter; only busctl changes to the verified UID."""
     import pwd
 
-    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
-    from muli.process import run_process
-
     require(
         re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None
         and uid > 0
         and home.is_absolute()
+        and len(home.parents) >= 3
         and re.fullmatch(r"muli-native-[a-f0-9]{32}\.service", unit) is not None,
         "native_diagnostic_identity",
     )
-    account = pwd.getpwnam(user)
-    require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_diagnostic_identity")
     require(remaining(deadline) <= CLEANUP_SECONDS, "native_diagnostic_deadline")
+    facts: dict[str, Any] = {
+        "unit": unit,
+        "code": "unavailable",
+        "stage": "identity",
+        "failure": "not_started",
+        "query_status": None,
+        "query_code": "not_started",
+        "ancestors": [],
+    }
+    try:
+        account = pwd.getpwnam(user)
+        require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_diagnostic_identity")
+        facts["stage"] = "ancestors"
+        facts["ancestors"] = diagnostic_ancestors(home)
+        facts["stage"] = "import"
+        from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+        from muli.process import run_process
 
-    async def query(
-        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
-    ) -> dict[str, Any]:
-        require(argv[0] == "busctl" and not merge_stderr, "native_diagnostic_command")
-        return await run_process(
-            [
-                "sudo",
-                "--non-interactive",
-                "--user",
-                user,
-                "--",
-                "env",
-                "-i",
-                f"HOME={home}",
-                f"USER={user}",
-                f"LOGNAME={user}",
-                "PATH=/usr/bin:/bin",
-                "LANG=C.UTF-8",
-                "LC_ALL=C.UTF-8",
-                f"XDG_RUNTIME_DIR=/run/user/{uid}",
-                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
-                *argv,
-            ],
-            timeout=min(timeout, remaining(deadline)),
-            limit=limit,
-            merge_stderr=False,
-        )
+        async def query(
+            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+        ) -> dict[str, Any]:
+            require(argv[0] == "busctl" and not merge_stderr, "native_diagnostic_command")
+            facts["query_status"], facts["query_code"] = None, "not_started"
+            result = await run_process(
+                [
+                    "sudo",
+                    "--non-interactive",
+                    "--user",
+                    user,
+                    "--",
+                    "env",
+                    "-i",
+                    f"HOME={home}",
+                    f"USER={user}",
+                    f"LOGNAME={user}",
+                    "PATH=/usr/bin:/bin",
+                    "LANG=C.UTF-8",
+                    "LC_ALL=C.UTF-8",
+                    f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                    f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                    *argv,
+                ],
+                timeout=min(timeout, remaining(deadline)),
+                limit=limit,
+                merge_stderr=False,
+            )
+            status = result.get("exit_code")
+            facts["query_status"] = (
+                status if type(status) is int and -(2**31) <= status < 2**31 else None
+            )
+            facts["query_code"] = diagnostic_command_code(status, result.get("stderr"))
+            return result
 
-    async with asyncio.timeout(remaining(deadline)):
-        return await observe_harness(
-            SystemdProbe(
-                runner=query, limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES)
-            ),
-            unit,
-        )
+        async with asyncio.timeout(remaining(deadline)):
+            return await observe_harness(
+                SystemdProbe(
+                    runner=query,
+                    limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+                ),
+                unit,
+                facts,
+            )
+    except TimeoutError:
+        facts["failure"] = "deadline"
+        facts["query_code"] = "timeout"
+    except Exception as error:
+        if isinstance(error, NativeError) and str(error) == "native_deadline_exceeded":
+            facts["failure"], facts["query_code"] = "deadline", "timeout"
+        elif facts["stage"] in {"identity", "ancestors", "import"}:
+            facts["failure"] = {
+                "identity": "identity_failed",
+                "ancestors": "metadata_failed",
+                "import": "import_failed",
+            }[facts["stage"]]
+        else:
+            facts["failure"] = "query_failed" if facts["query_code"] != "ok" else "invalid_reply"
+    return facts
 
 
 def fixture(root: Path) -> dict[str, Any]:

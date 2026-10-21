@@ -79,7 +79,11 @@ setup receipt 单独放在 root/runner 拥有、临时 UID 不可写的位置，
 
 有限证据包括实际资源属性与 kernel 限额、单元状态/InvocationID、固定错误码、各请求的最终状态、receipt 次数及只含合成资料的 DB 断言。协调者只导出严格白名单结构与有限标量；自定义 `NativeError` 仅保存格式受限的 `native_*` 固定码，其他异常只记类型，不输出原异常正文。worker 无法导入时也保留协调者预写的 `harness_start/worker_not_observed` 证据。清理不重写功能 timeline 或清空三代历史；仅全部清理证明完成且仍在期限内才单独标记 `resources.cleanup=verified`。默认不输出配置、nonce、Cookie、密码、完整 journal 或任意业务正文。取消或外层硬杀后走独立 always 清理；VM 最终销毁不是已经成功清理的证据。
 
-若启动客户端返回失败且 worker 尚未产生结果，协调者使用 **runner 自己已有的解释器与源 worker** 做一次只读诊断，不再依赖出错的 retained Python。只有其中的 `busctl` 经 `sudo` 切到本次 receipt 已确认、并重新通过 passwd 核对 UID/HOME 的专用用户；环境明确指定 `/run/user/UID/bus`，不读取 runner 的 user manager。诊断只对本次生成的精确 `muli-native-32hex.service`，复用 `SystemdProbe` 的 typed D-Bus 读取 `Id/LoadState/ActiveState/SubState/Result/ExecMainCode/ExecMainStatus/MainPID`，不依赖启动成功才会存在的完整 process identity。结果经固定字段/类型/长度白名单进入 `resources.startup`，与客户端退出码、准备时已核的聚合 kernel 限额一同保留；查询失败只记 `unavailable`，不据此猜测故障或重新启动服务，也不泛扫 journal 或保存原 stderr。真实 worker 已留下的结果始终优先，不被此诊断替换。
+若启动客户端返回失败且 worker 尚未产生结果，协调者使用 **runner 自己已有的解释器与源 worker** 做一次只读诊断，不再依赖出错的 retained Python。只有其中的 `busctl` 经 `sudo` 切到本次 receipt 已确认、并重新通过 passwd 核对 UID/HOME 的专用用户；环境明确指定 `/run/user/UID/bus`，不读取 runner 的 user manager。诊断只对本次生成的精确 `muli-native-32hex.service`，复用 `SystemdProbe` 的 typed D-Bus 读取，不依赖启动成功才会存在的完整 process identity。真实 worker 已留下的结果始终优先，不被此诊断替换。
+
+`resources.startup` 分别保留启动客户端与诊断客户端的退出码、固定命令报告分类，以及观察器的 `identity/ancestors/import/manager/listing/get_unit/unit_properties/service_properties` 阶段和最后一条 `busctl` 的退出码/分类。未知退出码保持空值，已尝试但超时不能记为从未启动。分类只对白名单短语作匹配；它是命令所报告的线索，不证明实际根因、权限或进程授权，原 stderr、路径和异常正文均不导出。先成功读取 typed Manager，再对精确 unit 执行 `ListUnitsByPatterns`；只有该 typed 列表成功且为空才能记 `unit_absent`。总线不可达、GetUnit 失败、属性查询失败或坏响应均保留各自阶段，不能归为单元缺席。成功观察才附加 `Id/LoadState/ActiveState/SubState/Result/ExecMainCode/ExecMainStatus/MainPID` 的有限事实。
+
+同一次诊断仅对从 `/` 到本次 `RUNNER_TEMP` 的固定祖先链做至多 16 次 `lstat`，按顺序索引保留 mode（含文件种类）、uid/gid，不扫描目录或导出祖先路径。它们只是 DAC 线索，不检查 ACL、补充组或有效可遍历权限，也不修改任何父目录权限。`user@UID.service` 已启动和聚合 cgroup 已核验都不等于普通用户 D-Bus 已可达；[v255 的 user@ unit](https://github.com/systemd/systemd/blob/v255/units/user%40.service.in) 依赖 runtime-dir，不能据此替代实际总线查询。[v255 的 systemd-run](https://github.com/systemd/systemd/blob/v255/src/run/run.c) 在本例 `--wait --pipe` 下强制使用普通 user bus，且在连接前先查找可执行文件；不带这些选项时可能使用的 `systemd/private` 通路不能混作本例的可达证据。
 
 这次诊断至多消耗现有 5 秒命令预算，并且必须落在本次原有 `90+5` 秒启动观察总期限的剩余时间内；启动观察已耗尽就不发诊断命令，不增加功能 60 秒、harness 90 秒或清理 5 秒的上限。Ubuntu 24.04 对应的 [systemd v255 参数实现](https://github.com/systemd/systemd/blob/v255/src/run/run.c)支持当前 `--wait --pipe --service-type=exec --expand-environment=no`；[同版本手册](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)说明关闭环境展开的选项从 v254 起存在。参数支持不等于本次实际 exec 成功；retained `bin/python` 与 `pyvenv.cfg.home` 的源 runtime 相对关系也由纯 fixture 明确核验，实际权限仍由远端运行证明。
 
@@ -100,6 +104,14 @@ PR [#37](https://github.com/69gg/MuLi/pull/37) 的首轮精确候选为签名提
 该轮 490 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39561110110/artifacts/12326704803)中的 `result.json` 是 `completed=false/stage=harness_start/code=worker_not_observed`，timeline 与 generations 均为空，即 **0 个事务**；没有 retained 导入或业务阶段的成功证据。`receipt.json` 记录该次独有用户 `muli-ci-f9911e829db9`、UID 999/GID 987 已分别 `user_removed=true/group_removed=true`，`mounts=[]`。这证明对应账户、组和已记录挂载已回收，不能把它当作服务正常收尾或三事务已验收。原始失败没有单元退出状态，不能直接归因于 DAC、解释器导入或 systemd 参数；上述只读启动诊断补片用于下一精确候选取得这项缺失事实，不重试旧 head。
 
 诊断补片新增 11 项纯 fixture，覆盖 typed 退出状态、精确 UID/bus、错误 unit/账号/期限前拒绝、原 envelope 不续期、原 stderr 和额外字段不导出、真实 worker 结果优先、CLI 只读分派与 retained 路径/启动参数关系。整文件 61 个唯一 case（原 50 加新 11）通过，0.34 秒、服务 0.879 秒、峰值 72.4 MiB/swap 0。首轮 typed 回归发现 `ProbeLimits` 默认 command 输出上限为 64 KiB，与此 fixture 32 KiB 合同不符，已显式使用原 `MAX_BYTES` 缩回，再通过相关 13 例与完整 61 例；13 例与 61 例重叠不重复计数。三份 Python 文件 Ruff/format 和两脚本 strict mypy 通过，mypy 峰值 157.5 MiB/swap 0。所有命令仍经 root 绝对路径守卫逐条 30 秒串行执行，无本机真实 harness。这是诊断链的纯回归证据，不计为远端启动已经修复。
+
+## 第二轮远端结果与分阶段诊断
+
+第二轮精确签名候选 `f9a1ca920d462830f630e650985f1a28bfcc0131` 已包含 2.32.1 候选 `1cf156b7b498c394b4aa719e3c3391ddafaba003`。CI [39564407572](https://github.com/69gg/MuLi/actions/runs/39564407572) 最终八项成功，仅原生 [job 119103115810](https://github.com/69gg/MuLi/actions/runs/39564407572/job/119103115810) 失败；不重试该旧 head。`07:47:07Z` 仍为 `native_command_failed`，always 清理仍为 `native_service_cleanup_failed`。
+
+617 字节[有限 evidence](https://github.com/69gg/MuLi/actions/runs/39564407572/artifacts/12329236961) 中，功能结果依然是 `harness_start/worker_not_observed`、timeline/generations 为空，即 **0 个事务**。本轮已取得实际聚合 kernel 值：memory.max 1073741824、memory.swap.max 0、cpu.max `100000 100000`、pids.max 128；启动客户端退出码为 1，旧观察器只返回 `unavailable`。这仍不足以区分可执行文件查找、导入或用户总线故障。该次 receipt 的专用用户 `muli-ci-0af59a4095a9`、UID 999/GID 987 分别已删除，已记录 mounts 为空；服务正常收尾仍未通过，不能据此称三事务成功。
+
+分阶段诊断补充 19 项纯 fixture，覆盖两个客户端独立失败、未知退出码的超时、产品导入失败、五个 D-Bus 观察阶段、typed 空集与坏列表区别，以及有限祖先元数据不改权限、不泄路径。最终整文件 **80 个唯一 case**（原 61 加新 19）通过，0.44 秒、服务 0.982 秒、峰值 74.5 MiB/swap 0；先运行的 28 项及过渡 79 项均为重叠检查，不重复计数。三份 Python 文件 Ruff/format、两脚本 strict mypy 通过；本轮 mypy 最高 162.5 MiB，最后缓存尾轮 65.7 MiB，swap 0。每条仍通过 root 绝对路径 30 秒守卫串行执行，没有本机真实 harness、用户/挂载/服务操作。这一补片只提高下一精确候选失败时的辨识度，不宣称已修复启动根因或已经完成原生验收。
 
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
 

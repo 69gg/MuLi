@@ -100,6 +100,11 @@ class Commands:
                     {
                         "unit": values[-2],
                         "code": "observed",
+                        "stage": "service_properties",
+                        "failure": "none",
+                        "query_status": 0,
+                        "query_code": "ok",
+                        "ancestors": [],
                         "load_state": "loaded",
                         "active_state": "failed",
                         "sub_state": "failed",
@@ -799,6 +804,8 @@ def test_worker_import_failure_still_leaves_coordinator_phase_evidence(
     assert saved["code"] == "worker_not_observed"
     facts = saved["resources"]["startup"]
     assert facts["client_status"] == 1 and facts["exec_status"] == 203
+    assert facts["client_code"] == "command_failed"
+    assert facts["diagnostic_status"] == 0 and facts["diagnostic_code"] == "ok"
     assert facts["exec_code"] == 1 and facts["active_state"] == "failed"
     assert saved["resources"]["manager"]["memory.max"] == str(ci.MEMORY)
     assert saved["generations"] == []
@@ -925,11 +932,26 @@ async def test_diagnostic_uses_typed_probe_and_only_the_verified_uid_bus(
         assert 0 < timeout <= ci.CLEANUP_SECONDS and limit == ci.OUTPUT_BYTES
         assert merge_stderr is False and "--auto-start=no" in argv
         calls.append(argv)
-        if "GetUnit" in argv:
+        if "ListUnitsByPatterns" in argv:
+            assert argv[-1] == unit
+            output = json.dumps(
+                {
+                    "type": "a(ssssssouso)",
+                    "data": [[[unit, "", "loaded", "failed", "failed", "", path, 0, "", "/"]]],
+                }
+            )
+        elif "GetUnit" in argv:
             assert argv[-1] == unit
             output = json.dumps({"type": "o", "data": [path]})
         else:
             index = argv.index("get-property")
+            if argv[index + 2] == "/org/freedesktop/systemd1":
+                assert argv[index + 4 :] == ["Version"]
+                return {
+                    "exit_code": 0,
+                    "output": json.dumps({"type": "s", "data": "255"}),
+                    "stderr": "",
+                }
             assert argv[index + 2] == path
             output = "\n".join(
                 json.dumps({"type": rows[name][0], "data": rows[name][1]})
@@ -940,8 +962,17 @@ async def test_diagnostic_uses_typed_probe_and_only_the_verified_uid_bus(
     monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
     monkeypatch.setattr(process, "run_process", query)
     value = await worker.diagnose(user, uid, home, unit, worker.time.monotonic() + 5)
-    assert value["unit"] == unit and value["exec_status"] == 203 and len(calls) == 3
-    assert ci.startup_facts({**value, "client_status": 1}, unit)
+    assert value["unit"] == unit and value["exec_status"] == 203 and len(calls) == 5
+    assert ci.startup_facts(
+        {
+            **value,
+            "client_status": 1,
+            "client_code": "command_failed",
+            "diagnostic_status": 0,
+            "diagnostic_code": "ok",
+        },
+        unit,
+    )
 
 
 @pytest.mark.parametrize("change", ["identity", "unit", "deadline"])
@@ -961,8 +992,12 @@ async def test_diagnostic_identity_and_deadline_reject_before_any_command(
     if change == "unit":
         unit = "muli.service"
     deadline = worker.time.monotonic() + (0 if change == "deadline" else 5)
-    with pytest.raises(worker.NativeError):
-        await worker.diagnose(user, uid, home, unit, deadline)
+    if change == "identity":
+        value = await worker.diagnose(user, uid, home, unit, deadline)
+        assert value["stage"] == "identity" and value["failure"] == "identity_failed"
+    else:
+        with pytest.raises(worker.NativeError):
+            await worker.diagnose(user, uid, home, unit, deadline)
 
 
 def test_diagnostic_cli_dispatch_is_readonly_and_uses_exact_arguments(
@@ -985,6 +1020,214 @@ def test_diagnostic_cli_dispatch_is_readonly_and_uses_exact_arguments(
     assert worker.main() == 0
     assert observed == [(user, 23145, tmp_path, unit, 9)]
     assert json.loads(capsys.readouterr().out) == {"unit": unit, "code": "unavailable"}
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        (b"Failed to find executable /private/python: Permission denied", "executable_permission"),
+        (
+            b"Failed to find executable /private/python: No such file or directory",
+            "executable_missing",
+        ),
+        (b"Failed to connect to bus: No medium found", "bus_unavailable"),
+        (b"Failed to connect to bus: Permission denied", "bus_permission"),
+        (b"unrecognized option '--private'", "unsupported_argument"),
+        (b"Failed to set unit properties: Unknown assignment private", "property_rejected"),
+        (b"Access denied to private unit", "permission_denied"),
+        (b"Unit private.service not loaded", "unit_unavailable"),
+        (b"private arbitrary secret", "command_failed"),
+    ],
+    ids=[
+        "exec-denied",
+        "exec-missing",
+        "bus-missing",
+        "bus-denied",
+        "option",
+        "property",
+        "denied",
+        "unit",
+        "unknown",
+    ],
+)
+def test_start_client_classification_exports_only_fixed_labels(body: bytes, expected: str) -> None:
+    assert ci.command_code(1, body) == expected
+    assert ci.command_code(0, body) == "ok"
+    assert ci.command_code(None, body) == "not_started"
+
+
+def test_both_client_failures_are_preserved_without_raw_output(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+
+    def fail(argv: Any, *, seconds: float = 5) -> Any:
+        if "systemd-run" in argv and argv[-2] == "drive":
+            return ci.Reply(1, b"Failed to find executable /private/python: Permission denied")
+        if "diagnose" in argv:
+            return ci.Reply(7, b"Failed to connect to bus: No medium found; private secret")
+        return commands(argv, seconds=seconds)
+
+    native.run = fail
+    with pytest.raises(ci.FixtureError, match="command_failed"):
+        native.execute()
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    facts = saved["resources"]["startup"]
+    assert (facts["client_status"], facts["client_code"]) == (1, "executable_permission")
+    assert (facts["diagnostic_status"], facts["diagnostic_code"]) == (7, "bus_unavailable")
+    assert facts["code"] == "unavailable" and facts["stage"] == "not_started"
+    assert "private" not in json.dumps(saved)
+
+
+def test_start_client_timeout_is_not_reported_as_never_started(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+
+    def timeout(argv: Any, *, seconds: float = 5) -> Any:
+        if "systemd-run" in argv and argv[-2] == "drive":
+            raise ci.FixtureError("native_command_timeout")
+        return commands(argv, seconds=seconds)
+
+    native.run = timeout
+    with pytest.raises(ci.FixtureError, match="command_timeout"):
+        native.execute()
+    facts = ci.fixture_result((native.root / "result.json").read_bytes())["resources"]["startup"]
+    assert facts["client_status"] is None and facts["client_code"] == "timeout"
+    assert facts["diagnostic_status"] == 0 and facts["code"] == "observed"
+
+
+@pytest.mark.parametrize(
+    "failed_stage,kind,expected_code,expected_failure",
+    [
+        ("manager", "bus", "unavailable", "query_failed"),
+        ("listing", "absent", "unit_absent", "none"),
+        ("listing", "invalid", "unavailable", "invalid_reply"),
+        ("get_unit", "unit", "unavailable", "query_failed"),
+        ("unit_properties", "permission", "unavailable", "query_failed"),
+        ("service_properties", "property", "unavailable", "query_failed"),
+    ],
+    ids=["bus", "absent", "bad-list", "get-unit", "unit-properties", "service-properties"],
+)
+async def test_diagnostic_keeps_the_exact_failed_stage_and_only_typed_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_stage: str,
+    kind: str,
+    expected_code: str,
+    expected_failure: str,
+) -> None:
+    import pwd
+    from types import SimpleNamespace
+
+    from muli import process
+
+    user, uid, unit = "muli-ci-" + "a" * 12, 23145, "muli-native-" + "b" * 32 + ".service"
+    home, path = tmp_path / "volume/home", "/org/freedesktop/systemd1/unit/fixture"
+    calls: list[str] = []
+    rows = {
+        "Id": ("s", unit),
+        "LoadState": ("s", "loaded"),
+        "ActiveState": ("s", "failed"),
+        "SubState": ("s", "failed"),
+        "Result": ("s", "exit-code"),
+        "ExecMainCode": ("i", 1),
+        "ExecMainStatus": ("i", 203),
+        "MainPID": ("u", 0),
+    }
+    errors = {
+        "bus": ("Failed to connect to bus: No medium found", "bus_unavailable"),
+        "unit": ("Unit private.service not loaded", "unit_unavailable"),
+        "permission": ("Access denied private", "permission_denied"),
+        "property": ("Unknown property private", "property_rejected"),
+    }
+
+    async def query(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        if "ListUnitsByPatterns" in argv:
+            stage = "listing"
+            output = json.dumps(
+                {
+                    "type": "a(ssssssouso)",
+                    "data": [[[unit, "", "loaded", "failed", "failed", "", path, 0, "", "/"]]],
+                }
+            )
+        elif "GetUnit" in argv:
+            stage, output = "get_unit", json.dumps({"type": "o", "data": [path]})
+        else:
+            fields = argv[argv.index("get-property") + 4 :]
+            if fields == ["Version"]:
+                stage, output = "manager", json.dumps({"type": "s", "data": "255"})
+            else:
+                stage = "unit_properties" if fields[0] == "Id" else "service_properties"
+                output = "\n".join(
+                    json.dumps({"type": rows[name][0], "data": rows[name][1]}) for name in fields
+                )
+        calls.append(stage)
+        if stage == failed_stage:
+            if kind == "absent":
+                output = json.dumps({"type": "a(ssssssouso)", "data": [[]]})
+            elif kind == "invalid":
+                output = json.dumps({"type": "s", "data": "private"})
+            else:
+                return {"exit_code": 9, "output": "", "stderr": errors[kind][0] + " secret"}
+        return {"exit_code": 0, "output": output, "stderr": ""}
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+    monkeypatch.setattr(process, "run_process", query)
+    value = await worker.diagnose(user, uid, home, unit, worker.time.monotonic() + 5)
+    assert value["stage"] == calls[-1] == failed_stage
+    assert value["code"] == expected_code and value["failure"] == expected_failure
+    assert value["query_status"] == (0 if kind in {"absent", "invalid"} else 9)
+    assert value["query_code"] == ("ok" if kind in {"absent", "invalid"} else errors[kind][1])
+    assert "private" not in json.dumps(value) and "secret" not in json.dumps(value)
+    assert ci.startup_facts(
+        {
+            **value,
+            "client_status": 1,
+            "client_code": "command_failed",
+            "diagnostic_status": 0,
+            "diagnostic_code": "ok",
+        },
+        unit,
+    )
+
+
+async def test_diagnostic_import_failure_remains_distinct_and_does_not_run_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+    import pwd
+    from types import SimpleNamespace
+
+    original = builtins.__import__
+    user, uid, unit = "muli-ci-" + "a" * 12, 23145, "muli-native-" + "b" * 32 + ".service"
+    home = tmp_path / "volume/home"
+
+    def deny(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "muli.platforms.linux_transaction":
+            raise ImportError("private credential and path")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+    monkeypatch.setattr(builtins, "__import__", deny)
+    value = await worker.diagnose(user, uid, home, unit, worker.time.monotonic() + 5)
+    assert value["stage"] == "import" and value["failure"] == "import_failed"
+    assert value["query_status"] is None and value["query_code"] == "not_started"
+    assert "private" not in json.dumps(value)
+
+
+def test_diagnostic_ancestor_metadata_is_bounded_path_free_and_not_access_proof(
+    tmp_path: Path,
+) -> None:
+    temporary = tmp_path / "runner-temp"
+    temporary.mkdir(mode=0o700)
+    home = temporary / ci.ROOT_NAME / "volume/home"
+    value = worker.diagnostic_ancestors(home)
+    assert 0 < len(value) <= 16 and value[-1]["mode"] & 0o777 == 0o700
+    assert value[-1]["uid"] == os.getuid() and value[-1]["gid"] == os.getgid()
+    assert [row["index"] for row in value] == list(range(len(value)))
+    assert str(tmp_path) not in json.dumps(value) and temporary.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.parametrize(

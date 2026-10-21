@@ -95,24 +95,152 @@ def object_bytes(data: bytes) -> dict[str, Any]:
     return value
 
 
+COMMAND_CODES = frozenset(
+    {
+        "not_started",
+        "ok",
+        "command_failed",
+        "timeout",
+        "output_budget",
+        "invalid_reply",
+        "executable_permission",
+        "executable_missing",
+        "executable_lookup_failed",
+        "bus_unavailable",
+        "bus_permission",
+        "permission_denied",
+        "unsupported_argument",
+        "property_rejected",
+        "unit_unavailable",
+    }
+)
+DIAGNOSTIC_STAGES = frozenset(
+    {
+        "not_started",
+        "identity",
+        "ancestors",
+        "import",
+        "manager",
+        "listing",
+        "get_unit",
+        "unit_properties",
+        "service_properties",
+    }
+)
+DIAGNOSTIC_FAILURES = frozenset(
+    {
+        "not_started",
+        "none",
+        "identity_failed",
+        "metadata_failed",
+        "import_failed",
+        "query_failed",
+        "invalid_reply",
+        "deadline",
+        "observer_failed",
+    }
+)
+
+
+def command_code(status: int | None, output: bytes) -> str:
+    """Classify bounded client output without exporting any part of its text."""
+    if status is None:
+        return "not_started"
+    if status == 0:
+        return "ok"
+    body = output.lower()
+    if b"failed to find executable" in body:
+        if b"permission denied" in body:
+            return "executable_permission"
+        return "executable_missing" if b"no such file" in body else "executable_lookup_failed"
+    if b"failed to connect to bus" in body or b"failed to connect to user" in body:
+        return "bus_permission" if b"permission denied" in body else "bus_unavailable"
+    if any(item in body for item in (b"unrecognized option", b"unknown option", b"invalid option")):
+        return "unsupported_argument"
+    if any(
+        item in body
+        for item in (b"unknown property", b"unknown assignment", b"failed to set unit properties")
+    ):
+        return "property_rejected"
+    if any(
+        item in body
+        for item in (b"permission denied", b"access denied", b"interactive authentication required")
+    ):
+        return "permission_denied"
+    if b"unit" in body and (b"not loaded" in body or b"not found" in body):
+        return "unit_unavailable"
+    return "command_failed"
+
+
+def client_status(value: object) -> bool:
+    return value is None or (type(value) is int and -(2**31) <= value < 2**31)
+
+
+def command_error_code(error: Exception) -> str:
+    """An unavailable exit status is not evidence that a command never ran."""
+    if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) or (
+        isinstance(error, FixtureError)
+        and str(error) in {"native_diagnostic_deadline", "native_command_timeout"}
+    ):
+        return "timeout"
+    if isinstance(error, FixtureError) and str(error) == "native_command_output_budget":
+        return "output_budget"
+    return "command_failed"
+
+
 def startup_facts(value: object, unit: str) -> bool:
     """Accept only the exact harness's finite, typed exit observation."""
     if (
         not isinstance(value, dict)
         or value.get("unit") != unit
         or re.fullmatch(r"muli-native-[a-f0-9]{32}\.service", unit) is None
-        or value.get("code") not in ("observed", "unavailable")
-        or (
-            value.get("client_status") is not None
-            and (
-                type(value["client_status"]) is not int
-                or not -(2**31) <= value["client_status"] < 2**31
-            )
+        or value.get("code") not in ("observed", "unavailable", "unit_absent")
+        or not client_status(value.get("client_status"))
+        or not client_status(value.get("diagnostic_status"))
+        or not client_status(value.get("query_status"))
+        or any(
+            not isinstance(value.get(key), str) or value[key] not in COMMAND_CODES
+            for key in ("client_code", "diagnostic_code", "query_code")
         )
+        or not isinstance(value.get("stage"), str)
+        or value["stage"] not in DIAGNOSTIC_STAGES
+        or not isinstance(value.get("failure"), str)
+        or value["failure"] not in DIAGNOSTIC_FAILURES
     ):
         return False
-    base = {"unit", "code", "client_status"}
-    if value["code"] == "unavailable":
+    ancestors = value.get("ancestors")
+    if not isinstance(ancestors, list) or len(ancestors) > 16:
+        return False
+    for index, item in enumerate(ancestors):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"index", "mode", "uid", "gid"}
+            or item["index"] != index
+            or any(type(item[key]) is not int or not 0 <= item[key] < 2**32 for key in item)
+            or item["mode"] > 0o177777
+        ):
+            return False
+    base = {
+        "unit",
+        "code",
+        "client_status",
+        "client_code",
+        "diagnostic_status",
+        "diagnostic_code",
+        "stage",
+        "query_status",
+        "query_code",
+        "failure",
+        "ancestors",
+    }
+    if value["code"] in {"unit_absent", "observed"} and (
+        value["stage"] != ("listing" if value["code"] == "unit_absent" else "service_properties")
+        or value["failure"] != "none"
+        or value["query_status"] != 0
+        or value["query_code"] != "ok"
+    ):
+        return False
+    if value["code"] != "observed":
         return set(value) == base
     strings = {"load_state", "active_state", "sub_state", "result"}
     integers = {"exec_code", "exec_status", "pid"}
@@ -676,14 +804,27 @@ class NativeCI:
         return result
 
     def observe_startup(
-        self, fixture: dict[str, Any], *, deadline: float, client_status: int | None
+        self,
+        fixture: dict[str, Any],
+        *,
+        deadline: float,
+        client_status: int | None,
+        client_code: str = "not_started",
     ) -> None:
         """Use runner's working Python, not the failed retained interpreter."""
         unit = fixture["harness_unit"]
         facts: dict[str, Any] = {
             "unit": unit,
             "client_status": client_status,
+            "client_code": client_code,
+            "diagnostic_status": None,
+            "diagnostic_code": "not_started",
             "code": "unavailable",
+            "stage": "not_started",
+            "query_status": None,
+            "query_code": "not_started",
+            "failure": "not_started",
+            "ancestors": [],
         }
         try:
             uid, _ = self.current_account()
@@ -706,12 +847,25 @@ class NativeCI:
                 ),
                 seconds=end - time.monotonic(),
             )
+            facts["diagnostic_status"] = reply.code
+            facts["diagnostic_code"] = command_code(reply.code, reply.output)
             if reply.code == 0:
-                observed = {**object_bytes(reply.output), "client_status": client_status}
+                observed = {
+                    **object_bytes(reply.output),
+                    "client_status": client_status,
+                    "client_code": client_code,
+                    "diagnostic_status": reply.code,
+                    "diagnostic_code": "ok",
+                }
                 if startup_facts(observed, unit):
                     facts = observed
-        except (ValueError, OSError, subprocess.SubprocessError):
-            pass  # Diagnostic failure never authorizes another launch or hides the first error.
+                else:
+                    facts["diagnostic_code"] = "invalid_reply"
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            # Diagnostic failure never authorizes another launch or hides the first error.
+            facts["diagnostic_code"] = (
+                "invalid_reply" if facts["diagnostic_status"] == 0 else command_error_code(error)
+            )
         result = fixture_result((self.root / "result.json").read_bytes())
         result["resources"]["startup"] = facts
         write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
@@ -732,18 +886,29 @@ class NativeCI:
         )
         deadline = time.monotonic() + HARNESS_SECONDS + CLEANUP_SECONDS
         client_status: int | None = None
+        client_failure = "not_started"
         try:
             reply = self.call(
                 self.user_arguments(*self.transient(fixture, "drive", HARNESS_SECONDS)),
                 seconds=deadline - time.monotonic(),
             )
             client_status = reply.code
+            client_failure = command_code(reply.code, reply.output)
             if client_status:
                 raise FixtureError("native_command_failed")
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            if client_status is None:
+                client_failure = command_error_code(error)
+            raise
         finally:
             result = self.collect_result()
             if result is None:
-                self.observe_startup(fixture, deadline=deadline, client_status=client_status)
+                self.observe_startup(
+                    fixture,
+                    deadline=deadline,
+                    client_status=client_status,
+                    client_code=client_failure,
+                )
         if result is None or result.get("completed") is not True:
             raise FixtureError("native_case_failed")
 
