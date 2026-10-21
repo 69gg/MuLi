@@ -5,16 +5,27 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
+import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
+from muli.candidate_download import DownloadState, check_local_materials, download_artifact
 from muli.candidate_lineage import check_plan_budget
+from muli.candidate_online import (
+    ArtifactApproval,
+    OnlinePolicyStore,
+    OnlineSettings,
+    check_approval,
+    preview_artifact,
+)
 from muli.candidate_policy import CandidateError, CandidateSettings, ExpectedPolicy
 from muli.candidate_policy_store import CandidatePolicyStore
 from muli.candidate_preparation import create_attempt
 from muli.candidate_process_plan import CANDIDATE_PROCESS_PROTOCOL, persist_process, read_process
-from muli.candidate_update import CandidateUpdates, CapturedCandidate, UpdateRequest
+from muli.candidate_update import CandidateUpdates, CapturedCandidate, PreviewRequest, UpdateRequest
 from muli.config import Settings
 from muli.diagnostics import DEFAULT_LOG_LINES, MAX_LOG_LINES, read_service_logs
 from muli.extensions import ExtensionError
@@ -62,6 +73,7 @@ class SelfManagement:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.updates = Updates(runtime.config, runtime.store, runtime.bus)
         self.update_policy = CandidatePolicyStore(runtime.store)
+        self.online_policy = OnlinePolicyStore(runtime.store)
         self.recovery = RecoveryHost(runtime, service, bound_address=bound_address)
         self._closing = False
         self.candidates = CandidateUpdates(
@@ -89,13 +101,38 @@ class SelfManagement:
         self.runtime.maintenance.require_configuration()
         return self.update_policy.replace(policy)
 
+    def replace_online_policy(self, policy: OnlineSettings) -> OnlineSettings:
+        """Same authenticated host/lock contract as the offline policy."""
+        if self._closing:
+            raise MaintenanceError("transaction_unavailable", "service_closing")
+        if not self.runtime.configuration_lock.locked():
+            raise MaintenanceError("configuration_lock_required")
+        self.runtime.maintenance.require_configuration()
+        return self.online_policy.replace(policy)
+
+    def _bind_online_policy(
+        self, captured: CapturedCandidate, settings: OnlineSettings
+    ) -> CapturedCandidate:
+        original = captured.policy.source
+
+        def verify() -> None:
+            original.verify()
+            if self.online_policy.read() != settings:
+                raise CandidateError("candidate_online_changed")
+
+        return replace(
+            captured,
+            policy=replace(captured.policy, source=replace(original, verify=verify)),
+        )
+
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         update = self.runtime.store.get("update", "latest")
         if update and update.get("available"):
             if self.updates.candidate_configured():
                 instruction = (
-                    "已配置本地候选来源；先用self_update_preview核验，再将返回的"
-                    "expected_policy原样用于self_update，经真实用户批准后准备和切换。"
+                    "已配置候选来源；先用self_update_preview核验；在线模式需提供目标version，"
+                    "将返回的expected_policy和expected_artifact原样用于self_update，"
+                    "经真实用户批准后准备和切换。依赖仍需本地材料。"
                     "预览或批准均不代表候选已经安装或通过服务健康检查。"
                 )
             else:
@@ -209,6 +246,8 @@ class SelfManagement:
                     expected_policy=candidate_update.policy.expected.model_dump(mode="json"),
                     phase="candidate_queued",
                 )
+                if candidate_update.artifact is not None:
+                    item["online_artifact"] = candidate_update.artifact.model_dump(mode="json")
                 if candidate_update.lineage is not None:
                     item["source_candidate_evidence"] = (
                         candidate_update.lineage.reference.model_dump(mode="json")
@@ -258,7 +297,36 @@ class SelfManagement:
         item.clear()
         item.update(updated)
 
-    async def stage_update(self, version: str, expected: ExpectedPolicy) -> dict[str, Any]:
+    def _persist_candidate_download(self, item: dict[str, Any], value: DownloadState) -> None:
+        """Keep a committed attachment even if Store.event loses its return."""
+        db = self.runtime.store.db
+        if db.in_transaction:
+            raise CandidateError("candidate_download_outer_transaction")
+        if db.autocommit != sqlite3.LEGACY_TRANSACTION_CONTROL or db.isolation_level is None:
+            raise CandidateError("candidate_download_transaction_mode_unsupported")
+        limit = self._candidate_plan_limit()
+        if _read_object(self.runtime.store.db, "management", item["id"], limit) != item:
+            raise CandidateError("candidate_plan_changed")
+        updated = {**item, "candidate_download": value.model_dump(mode="json")}
+        self._check_candidate_plan(updated)
+        try:
+            self.runtime.store.event(
+                "management.progress", updated, objects=[("management", updated)]
+            )
+        except BaseException:
+            if _read_object(self.runtime.store.db, "management", item["id"], limit) == updated:
+                item.clear()
+                item.update(updated)
+            raise
+        item.clear()
+        item.update(updated)
+
+    async def stage_update(
+        self,
+        version: str,
+        expected: ExpectedPolicy,
+        artifact: ArtifactApproval | None = None,
+    ) -> dict[str, Any]:
         from muli.updates import release_version
 
         release_version(version)
@@ -266,17 +334,55 @@ class SelfManagement:
             captured = await self.candidates.capture()
             if captured.policy.expected != expected:
                 raise CandidateError("candidate_policy_changed")
+            online = self.online_policy.read()
+            if online.enabled:
+                if artifact is None:
+                    raise CandidateError("candidate_online_preview_required")
+                captured = self._bind_online_policy(captured, online)
+                check_approval(online, artifact, captured.policy, version)
+                actual = await preview_artifact(
+                    online,
+                    captured.policy,
+                    version,
+                    verify=lambda: captured.policy.verify(expected),
+                )
+                if actual != artifact:
+                    raise CandidateError("candidate_online_changed")
+                check_local_materials(captured.policy, artifact)
+                captured = replace(captured, artifact=artifact)
+            elif artifact is not None:
+                raise CandidateError("candidate_online_disabled")
             return await self.stage("switch", version=version, candidate_update=captured)
 
-    async def preview_update(self) -> dict[str, Any]:
+    async def preview_update(self, version: str | None = None) -> dict[str, Any]:
         async with self.runtime.configuration_lock:
             captured = await self.candidates.capture()
-            return {
+            online = self.online_policy.read()
+            result: dict[str, Any] = {
                 "mode": "retained_candidate",
                 "expected_policy": captured.policy.expected.model_dump(mode="json"),
                 "offline": True,
                 "requires_approval": True,
             }
+            if online.enabled:
+                if version is None:
+                    raise CandidateError("candidate_online_version_required")
+                captured = self._bind_online_policy(captured, online)
+                artifact = await preview_artifact(
+                    online,
+                    captured.policy,
+                    version,
+                    verify=lambda: captured.policy.verify(captured.policy.expected),
+                )
+                check_local_materials(captured.policy, artifact)
+                result.update(
+                    offline=False,
+                    expected_artifact=artifact.model_dump(mode="json"),
+                    compatibility="pending_artifact_validation",
+                    dependencies="local_wheelhouse_required",
+                    online_policy=online.model_dump(mode="json"),
+                )
+            return result
 
     async def cancel(self, identifier: str) -> dict[str, Any]:
         item = self.runtime.store.get("management", identifier)
@@ -393,6 +499,7 @@ class SelfManagement:
         from muli.platforms.managed_launcher import read_file
 
         runtime = self.runtime
+        started = time.monotonic()
         self._applying = asyncio.current_task()
         path = self.directory / f"{item['id']}.json"
         try:
@@ -416,6 +523,15 @@ class SelfManagement:
                     raise CandidateError("candidate_plan_changed")
                 if captured.policy.expected != expected:
                     raise CandidateError("candidate_policy_changed")
+                artifact: ArtifactApproval | None = None
+                online = self.online_policy.read()
+                if "online_artifact" in item:
+                    artifact = ArtifactApproval.model_validate(item["online_artifact"])
+                    captured = self._bind_online_policy(captured, online)
+                    check_approval(online, artifact, captured.policy, item["version"])
+                    check_local_materials(captured.policy, artifact)
+                elif online.enabled:
+                    raise CandidateError("candidate_online_changed")
                 source_reference = (
                     captured.lineage.reference.model_dump(mode="json")
                     if captured.lineage is not None
@@ -435,13 +551,30 @@ class SelfManagement:
                 self._check_candidate_plan(item)
                 runtime.store.event("management.progress", item, objects=[("management", item)])
             await runtime.bus.notify()
-            attempt = create_attempt(
-                captured.policy,
-                expected=expected,
-                request_id=item["id"],
-                version=item["version"],
-                configuration=data,
-            )
+            if artifact is not None:
+                attempt = create_attempt(
+                    captured.policy,
+                    expected=expected,
+                    request_id=item["id"],
+                    version=item["version"],
+                    configuration=data,
+                    deadline=started + captured.policy.settings.limits.seconds,
+                    additional_material_bytes=artifact.size,
+                )
+                await download_artifact(
+                    attempt,
+                    online,
+                    artifact,
+                    persist=lambda value: self._persist_candidate_download(item, value),
+                )
+            else:
+                attempt = create_attempt(
+                    captured.policy,
+                    expected=expected,
+                    request_id=item["id"],
+                    version=item["version"],
+                    configuration=data,
+                )
 
             def persist(value: PendingProcess) -> None:
                 self._persist_candidate_process(item, value)
@@ -563,10 +696,26 @@ class SelfManagement:
                 self._applying = None
 
     async def _finish_plan(self, item: dict[str, Any], path: Path) -> None:
+        if item.get("operation") == "update":
+            db = self.runtime.store.db
+            if db.in_transaction:
+                raise CandidateError("candidate_finish_outer_transaction")
+            if db.autocommit != sqlite3.LEGACY_TRANSACTION_CONTROL or db.isolation_level is None:
+                raise CandidateError("candidate_finish_transaction_mode_unsupported")
         # Preparation may have durably published its generation while awaiting
         # the helper. Never replace that binding with an older local plan copy.
         stored = self.runtime.store.get("management", item["id"])
         transaction = self.recovery.current()["transaction"]
+        if (
+            item.get("operation") == "update"
+            and stored is not None
+            and stored.get("online_artifact") == item.get("online_artifact")
+            and "candidate_download" in stored
+            and stored["candidate_download"] != item.get("candidate_download")
+        ):
+            # File acceptance cannot grant retry authority, but a committed
+            # attachment must survive an observer's lost return/older local copy.
+            item = {**item, "candidate_download": stored["candidate_download"]}
         if (
             item.get("operation") == "update"
             and stored is not None
@@ -736,12 +885,20 @@ class SelfManagement:
             return {
                 **runtime.config.public(),
                 "candidate_update_policy": self.update_policy.read().model_dump(mode="json"),
+                "candidate_online_policy": self.online_policy.read().model_dump(mode="json"),
             }
 
         async def configure_update(args: dict[str, Any]) -> Any:
             policy = CandidateSettings.model_validate(args)
             async with runtime.configuration_lock:
                 result = self.replace_update_policy(policy)
+            await runtime.bus.notify()
+            return result.model_dump(mode="json")
+
+        async def configure_online(args: dict[str, Any]) -> Any:
+            policy = OnlineSettings.model_validate(args)
+            async with runtime.configuration_lock:
+                result = self.replace_online_policy(policy)
             await runtime.bus.notify()
             return result.model_dump(mode="json")
 
@@ -805,11 +962,13 @@ class SelfManagement:
             request = UpdateRequest.model_validate(args)
             release_version(request.version)
             if request.expected_policy is not None:
-                return await self.stage_update(request.version, request.expected_policy)
+                return await self.stage_update(
+                    request.version, request.expected_policy, request.expected_artifact
+                )
             return await self.stage("update", version=request.version)
 
         async def preview_update(args: dict[str, Any]) -> Any:
-            return await self.preview_update()
+            return await self.preview_update(PreviewRequest.model_validate(args).version)
 
         async def install(args: dict[str, Any]) -> Any:
             return self.plugins.install(str(args["id"]), args["files"])
@@ -817,7 +976,7 @@ class SelfManagement:
         return [
             Tool(
                 "self_config",
-                "查看自身全部配置（密钥隐藏）；candidate_update_policy单独通过self_update_configure保存",
+                "查看自身配置（密钥隐藏）；候选和在线策略分别由self_update_configure与self_update_online_configure保存",
                 parameters({}),
                 configuration,
             ),
@@ -826,6 +985,13 @@ class SelfManagement:
                 "完整替换候选更新策略；先读取现值，省略项恢复默认。只保存策略，不安装或切换",
                 CandidateSettings.model_json_schema(),
                 configure_update,
+                "write",
+            ),
+            Tool(
+                "self_update_online_configure",
+                "完整替换匿名在线候选策略；默认关闭。只保存策略，不下载；依赖仍需本地wheelhouse",
+                OnlineSettings.model_json_schema(),
+                configure_online,
                 "write",
             ),
             Tool(
@@ -898,13 +1064,14 @@ class SelfManagement:
             ),
             Tool(
                 "self_update_preview",
-                "只读核验当前托管安装与本地候选策略，返回供self_update批准使用的expected_policy",
-                parameters({}),
+                "核验候选策略；在线模式须给精确version，仅取小元数据，返回同次审批需完整带回的expected_policy/expected_artifact",
+                PreviewRequest.model_json_schema(),
                 preview_update,
+                preserve_output=True,
             ),
             Tool(
                 "self_update",
-                "更新并重启；托管安装须先preview并原样带上expected_policy，始终需要真实用户批准",
+                "更新并重启；托管安装须先preview，完整带回expected_policy及在线expected_artifact，依赖仍需本地材料；始终需真实用户批准",
                 UpdateRequest.model_json_schema(),
                 update,
                 "external",

@@ -7,12 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from muli.candidate_lineage import CandidateLineage, read_lineage
+from muli.candidate_online import ArtifactApproval
 from muli.candidate_policy import CandidateError, ExpectedPolicy
 from muli.candidate_policy_store import CandidatePolicyStore
 from muli.candidate_preparation import CandidateSource, FrozenPolicy, inspect_policy
+from muli.compatibility import ReleaseVersion
 from muli.managed_preparation import ManagedPreparation
 from muli.management_transaction import StrictRecord
 from muli.platforms.install_receipt import read_managed_install_receipt
@@ -31,12 +33,26 @@ _SOURCE_RECEIPT_ADAPTER = "0.13.1"
 class UpdateRequest(StrictRecord):
     version: str = Field(pattern=r"^\d+\.\d+\.\d+$", max_length=40)
     expected_policy: ExpectedPolicy | None = None
+    expected_artifact: ArtifactApproval | None = None
+
+    @model_validator(mode="after")
+    def same_approval(self) -> UpdateRequest:
+        if self.expected_artifact is not None and (
+            self.expected_policy is None or self.expected_artifact.version != self.version
+        ):
+            raise ValueError("candidate_online_approval_required")
+        return self
+
+
+class PreviewRequest(StrictRecord):
+    version: ReleaseVersion | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CapturedCandidate:
     policy: FrozenPolicy = field(repr=False)
     lineage: CandidateLineage | None = field(repr=False)
+    artifact: ArtifactApproval | None = None
 
 
 class CandidateUpdates:
@@ -99,5 +115,6 @@ class CandidateUpdates:
             verify=verify,
             previous=lineage.evidence if lineage else None,
             protected_roots=protected,
+            observed_format=current.record.observed_format,
         )
         return CapturedCandidate(inspect_policy(settings, source), lineage)

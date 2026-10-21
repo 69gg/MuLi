@@ -145,7 +145,7 @@ prepare 时的兼容判定只负责早拒。每次候选或回退 boot 都须在
 
 [兼容元数据纯判定](upgrade-compatibility.md)独立区分 database、objects、configuration、ingress、outbox、memory、install_profile 七个完整语义领域。判定器自身只比较经调用者提供的声明，不读取真实库、不发当前版本格式标记，也不授权切换；当前宿主另外核实际发行声明与真实格式证据。缺少来源证明、原版本 manifest 或真实格式证据时仍拒绝；protocol 1 的单安装身份不因声明中的协议数字相同而变成 A/B 协议。
 
-[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；2.23 候选入口另核验 uv 和离线安装条件，不恢复未知的完整历史解析上下文，也不支持在线下载候选。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；完整候选准入已按[无迁移启动方案](no-migration-startup-design.md)接入 V2 启动链。
+[安装意图解析](install-profile-design.md)已实现固定 receipt 格式的纯入口，[安装内 receipt 观察](install-receipt.md)将它接到已核 manifest 的固定 prefix 来源并支持变动重验；2.23 候选入口另核验 uv 和离线安装条件，不恢复未知的完整历史解析上下文。当前另接[有界在线材料](bounded-online-candidate-design.md)，只在同一次真实批准后获取精确 MuLi wheel，依赖仍使用明确本地材料，不进行完整在线求解。[禁止迁移构造](store-existing.md)已覆盖 Store、Memory 与 ChannelManager，打开已有文件并核齐必要结构和身份，失败不补数据；完整候选准入已按[无迁移启动方案](no-migration-startup-design.md)接入 V2 启动链。
 
 [格式证据读取器](format-evidence.md)由宿主提供专用连接，在单一快照中核对完整格式标记、资料库及主人主会话身份，读取预算有限且不补数据。读取器已用于 V2 prepare 和 boot；它自身不认证连接路径、发行来源或格式语义，这些证据由调用链分别核验。缺少完整标记的历史库仍拒绝，不能自动补出兼容证明。
 

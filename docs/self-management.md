@@ -8,6 +8,8 @@ MuLi 可以通过工具管理自己。`self_config` 返回脱敏完整配置，`
 
 策略复用现有 Store 中一个有界对象，保存与摘要事件原子提交；不向主配置添加字段，以保留旧恢复控制器的严格解析兼容性。未知版本、损坏或超出预算的既有策略不能被静默覆盖；服务关闭或恢复事务阻止配置时同样拒绝写入。保存后仍须 `self_update_preview` 核定实际来源，将其 `expected_policy` 原样用于 `self_update` 并经真实用户批准。准备在后台执行，结果沿原会话汇报；保存、预览或批准均不代表安装或服务健康已经验证。
 
+另有默认关闭的匿名在线策略：`self_config.candidate_online_policy`、`self_update_online_configure`，或已认证的 `GET/PUT /api/management/update-online-policy`。同样完整替换，不属于主 Settings。启用后，`self_update_preview({"version":"精确版本"})`（HTTP 用 `?version=`）只读取有限元数据；将返回的 `expected_policy` 与 `expected_artifact` 一起原样交给 `self_update`，经真实用户批准后才下载一枚 MuLi universal wheel。handler 会重取并比较事实，worker 不另选文件。默认下载上限 8 MiB、可配置最大 32 MiB，不自动获取依赖；本地材料不足时原离线准备失败并保留旧安装。完整资源、来源、失败及验收边界见[有界在线候选材料](bounded-online-candidate-design.md)。
+
 2.22 增加 `self_adopt` / `self_switch`，连接同一管理队列与受限恢复 helper，处理 Linux 当前安装迁入和已保留的本地候选切换。输入、批准、失败后接续及验收状态见[本地托管切换](managed-operations.md)。这条路径不下载或创建候选环境。
 
 配置文件原子替换；运行时重新载入失败时恢复原配置。监听 host/port 变更由 `self_configure` 自动选择配置重启事务，直接热修改返回 `409 listener_restart_required`；工作台保存监听变更也将完整补丁交给该事务入口，只显示排队状态并保留草稿，不把待应用目标当作已保存配置。其它设置仍直接热保存；存在监听草稿时，Chiliarch 配对会提示先完成监听事务。插件启用状态仍需重启进程。非回环进程不能通过“改为回环并清密码”的热修改提前关闭实际仍暴露的认证边界。`self_restart` 使用当前安装的恢复事务；不满足宿主条件时明确拒绝，不降级成直接重启。
