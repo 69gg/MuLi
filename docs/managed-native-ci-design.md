@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald。现已记录第十四轮 native 失败：2.5秒回执窗口确实保住同次到期摘要，后备正向观察到 runtime-dir 已完成、user manager 仍 activating/start；仍为0个真实事务，没有 readiness 或正常清理证明。最近整合纯验证为391项通过，详见下文；它不代替原生验收。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮起的 manager 启动原因仍未确定。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald。现已记录第十四轮 native 失败：2.5秒回执窗口确实保住同次到期摘要，后备正向观察到 runtime-dir 已完成、user manager 仍 activating/start；仍为0个真实事务，没有 readiness 或正常清理证明。最近合并后整合纯验证为430项通过，新增失败后环境/socket 投影已实现并完成独立复审，详见下文；它不代替原生验收。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮起的 manager 启动原因仍未确定。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -409,6 +409,10 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 继续使用原约88秒观察截止、2.5秒失败回执、5秒 cleanup 与32 KiB累计余额、1024字节外层回复预留及原资源限制。投影的512字节内部 wire 上限从现有余额内扣除；原始 proc 读取字节、内部 stdout/stderr、最终外层 JSON 都计费。失败或未知字节读取保守占用额度，不重新分配时间或额度；没有可用余额/期限就不启动。context 失败不覆盖 manager_failure，也不授权进入 harness 或清理资源。
 
 纯 fixture 已覆盖父/用户 notify 区分、缺失/异常/重复/截断环境、内外层身份漂移、socket 非法类型/owner/父目录 symlink、秘密值与异常不外泄，以及取消/不足余额/到期拒绝观察或不复用额度。取得共享槽后，全部逐条经主仓绝对路径30秒 guard 串行并收真实终态：native 文件 **426项通过**（pytest1.39秒、服务1.987秒、峰值115.5 MiB）；最终 Ruff77毫秒/24.4 MiB、format-check83毫秒/29.9 MiB、两脚本 strict mypy652毫秒/164.6 MiB均exit0，swap均0，完成即归还槽。首次 Ruff 找到新 fixture 的 zip 未显式 strict 参数，已补 strict=False；首次 mypy 未设置 worktree 源路径，将依赖视为无类型安装包并报8处 no-any-return（含既有位置），在 guard 内设置 `MYPYPATH=src:tests` 并使用 `--explicit-package-bases` 后通过，没有放宽类型规则。未运行本机服务、账户、挂载或远端 CI；第十四轮0事务、未就绪与 cleanup 超时边界不变。
+
+根与 C 对这四个改动文件分别完成只读独立复审，未发现必须修复的 P1/P2；复核范围包括秘密不透传、父/用户 NOTIFY 方向、内外身份绑定、原截止和累计字节。随后四文件以有效 GPG 签名提交 `4b34f9f00178ab0d7f6a36e05af785b6e6d745b5`，再通过有效签名 merge `39b8df56ff83d34d77d36457cd73d5af9a708259` 无冲突合入已发布 main `ca5615213cdcc9cea99239d26835c5864fb56bed`（v2.40）；两者均为 merge 的祖先，四个 native 文件在合并中无变化。相对 main 的候选仍包含原 native 分支历史；本次投影提交没有修改 workflow。
+
+在 merge `39b8df5` 上重新取得独占槽，逐条经主仓绝对路径30秒 guard 完成最小整合验证并实收exit0：native426项加两个直接 OutputBudget 节点4项，共 **430项通过**（pytest1.37秒、服务1.970秒、峰值117 MiB）；三Python文件 Ruff66毫秒/21.6 MiB、format-check71毫秒/21.4 MiB，两脚本 strict mypy1.085秒/171.7 MiB均通过。mypy 在 guard 内显式使用 `MYPYPATH=src:tests`、`--explicit-package-bases`，没有降级规则；全部swap0，完成即归还槽。本轮没有失败重试、本机真实账户/服务/挂载效果或远端 CI。该合并候选提供新的有限观察假说，不表示 manager 根因已确认、0事务边界已解除或正常 cleanup 已验收。
 
 ## 第十四轮 native 有限失败取证与下一验证门
 
