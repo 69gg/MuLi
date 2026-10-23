@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from muli.store import Store
 
 MAX_BYTES = 32768
+CONTEXT_REPLY_BYTES = 512
 CASE_SECONDS = 60
 CLEANUP_SECONDS = 5
 HARNESS_SECONDS = 90
@@ -590,6 +591,256 @@ def journal_unavailable(code: str = "not_started") -> dict[str, Any]:
     return {"code": code, "incomplete": False, "events": []}
 
 
+def context_unavailable(code: str = "not_started") -> dict[str, str]:
+    return dict.fromkeys(
+        (
+            "notify_env",
+            "runtime_env",
+            "bus_env",
+            "listen_env",
+            "parent_notify",
+            "user_notify",
+            "private_socket",
+        ),
+        "unavailable",
+    ) | {"code": code}
+
+
+def context_projection(value: object) -> dict[str, str]:
+    allowed = {
+        "code": {
+            "observed",
+            "not_started",
+            "unavailable",
+            "identity_changed",
+            "invalid_reply",
+            "timeout",
+            "output_budget",
+        },
+        "notify_env": {"parent", "user", "missing", "other", "unavailable"},
+        "runtime_env": {"expected", "missing", "other", "unavailable"},
+        "bus_env": {"expected", "missing", "other", "unavailable"},
+        "listen_env": {"present", "absent", "unavailable"},
+        "parent_notify": {"socket_owner_matches", "absent", "unexpected", "unavailable"},
+        "user_notify": {"socket_owner_matches", "absent", "unexpected", "unavailable"},
+        "private_socket": {"socket_owner_matches", "absent", "unexpected", "unavailable"},
+    }
+    if not isinstance(value, dict):
+        raise NativeError("native_diagnostic_invalid")
+    require(set(value) == set(allowed), "native_diagnostic_invalid")
+    require(
+        all(
+            isinstance(value[key], str) and value[key] in choices
+            for key, choices in allowed.items()
+        ),
+        "native_diagnostic_invalid",
+    )
+    require(
+        value["code"] == "observed" or value == context_unavailable(value["code"]),
+        "native_diagnostic_invalid",
+    )
+    return {key: value[key] for key in allowed}
+
+
+def context_environment(data: bytes, uid: int) -> dict[str, str]:
+    """Classify only initial exec environment; no arbitrary value can escape."""
+    require(not data or data.endswith(b"\0"), "native_diagnostic_invalid")
+    selected = {
+        b"NOTIFY_SOCKET",
+        b"XDG_RUNTIME_DIR",
+        b"DBUS_SESSION_BUS_ADDRESS",
+        b"LISTEN_PID",
+        b"LISTEN_FDS",
+        b"LISTEN_FDNAMES",
+    }
+    values: dict[bytes, bytes] = {}
+    for row in data.split(b"\0")[:-1]:
+        key, separator, value = row.partition(b"=")
+        require(bool(key) and bool(separator), "native_diagnostic_invalid")
+        if key in selected:
+            require(key not in values, "native_diagnostic_invalid")
+            values[key] = value
+    runtime = f"/run/user/{uid}".encode("ascii")
+
+    def match(key: bytes, expected: bytes) -> str:
+        return (
+            "missing" if key not in values else "expected" if values[key] == expected else "other"
+        )
+
+    notify = values.get(b"NOTIFY_SOCKET")
+    return {
+        "notify_env": "missing"
+        if notify is None
+        else (
+            "parent"
+            if notify == b"/run/systemd/notify"
+            else "user"
+            if notify == runtime + b"/systemd/notify"
+            else "other"
+        ),
+        "runtime_env": match(b"XDG_RUNTIME_DIR", runtime),
+        "bus_env": match(b"DBUS_SESSION_BUS_ADDRESS", b"unix:path=" + runtime + b"/bus"),
+        "listen_env": "present" if any(key.startswith(b"LISTEN_") for key in values) else "absent",
+    }
+
+
+def context_socket(path: Path, owner: int) -> str:
+    """Inspect metadata only, rejecting symlinks in every directory component."""
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        info = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+        return (
+            "socket_owner_matches"
+            if stat.S_ISSOCK(info.st_mode) and info.st_uid == owner
+            else "unexpected"
+        )
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unavailable"
+    finally:
+        os.close(descriptor)
+
+
+def read_setup_context(
+    pid: int,
+    uid: int,
+    ticks: int,
+    group: str,
+    deadline: float,
+    limit: int,
+) -> dict[str, Any]:
+    """One privileged projection. Raw proc bytes never leave this process."""
+    from muli.platforms.linux_transaction import _cgroup, _read_regular, _start_ticks
+
+    used = 0
+    try:
+        require(
+            os.geteuid() == 0
+            and 0 < pid < 2**31
+            and 0 < uid < 2**31
+            and ticks > 0
+            and bool(_cgroup(group))
+            and 0 < limit <= MAX_BYTES,
+            "native_diagnostic_invalid",
+        )
+        require(
+            math.isfinite(deadline) and remaining(deadline) <= CLEANUP_SECONDS,
+            "native_diagnostic_invalid",
+        )
+        root = Path("/proc") / str(pid)
+
+        def read(name: str) -> bytes:
+            nonlocal used
+            remaining(deadline)
+            require(used < limit, "native_diagnostic_output_budget")
+            data = _read_regular(root / name, limit - used)
+            used += len(data)
+            require(used <= limit, "native_diagnostic_output_budget")
+            return data
+
+        def binding() -> tuple[int, bytes, bytes, str]:
+            nonlocal used
+            start = _start_ticks(read("stat"), pid)
+            status = [row for row in read("status").splitlines() if row.startswith(b"Uid:")]
+            require(len(status) == 1, "native_diagnostic_invalid")
+            require(status[0].split()[1:] == [str(uid).encode()] * 4, "native_process_changed")
+            raw_group = read("cgroup")
+            rows = raw_group.decode("ascii").splitlines()
+            require(len(rows) == 1 and rows[0].startswith("0::"), "native_diagnostic_invalid")
+            current = _cgroup(rows[0][3:])
+            require(current == group or current.startswith(group + "/"), "native_process_changed")
+            image = os.readlink(root / "exe")
+            used += len(os.fsencode(image))
+            require(used <= limit, "native_diagnostic_output_budget")
+            require(
+                start == ticks and image == system_executables().get("manager"),
+                "native_process_changed",
+            )
+            return start, status[0], raw_group, image
+
+        before = binding()
+        facts = context_environment(read("environ"), uid)
+        runtime = Path("/run/user") / str(uid) / "systemd"
+        facts.update(
+            parent_notify=context_socket(Path("/run/systemd/notify"), 0),
+            user_notify=context_socket(runtime / "notify", uid),
+            private_socket=context_socket(runtime / "private", uid),
+        )
+        require(before == binding(), "native_process_changed")
+        remaining(deadline)
+        return {"facts": {"code": "observed", **facts}, "used": used}
+    except Exception as error:
+        code = {
+            "native_process_changed": "identity_changed",
+            "native_deadline_exceeded": "timeout",
+            "native_diagnostic_output_budget": "output_budget",
+        }.get(str(error), "unavailable" if isinstance(error, OSError) else "invalid_reply")
+        # Failed reads have no trustworthy byte count; never recycle their allowance.
+        return {"facts": context_unavailable(code), "used": limit}
+
+
+async def observe_setup_context(
+    probe: SystemdProbe,
+    path: str,
+    uid: int,
+    pid: int,
+    group: str,
+    read: Callable[[int, str], Awaitable[bytes | None]],
+    io: _SetupIO,
+    deadline: float,
+) -> dict[str, str]:
+    from muli.platforms.linux_transaction import _start_ticks
+
+    try:
+
+        async def binding() -> tuple[dict[str, Any], dict[str, Any], int]:
+            state = await probe._properties(path, "Unit", (("Id", "s"), ("InvocationID", "ay")))
+            invocation = state["InvocationID"]
+            require(
+                state["Id"] == f"user@{uid}.service"
+                and isinstance(invocation, list)
+                and len(invocation) == 16
+                and any(invocation)
+                and all(type(item) is int and 0 <= item <= 255 for item in invocation),
+                "native_diagnostic_invalid",
+            )
+            service = await probe._properties(
+                path, "Service", (("MainPID", "u"), ("ControlGroup", "s"))
+            )
+            require(service == {"MainPID": pid, "ControlGroup": group}, "native_process_changed")
+            raw = await read(pid, "stat")
+            if raw is None:
+                raise OSError
+            return state, service, _start_ticks(raw, pid)
+
+        before = await binding()
+        result = await io.context(pid, uid, before[2], group)
+        require(before == await binding(), "native_process_changed")
+        remaining(deadline)
+        return result
+    except TimeoutError:
+        return context_unavailable("timeout")
+    except OSError:
+        return context_unavailable("unavailable")
+    except ValueError as error:
+        return context_unavailable(
+            {
+                "native_process_changed": "identity_changed",
+                "native_deadline_exceeded": "timeout",
+                "native_diagnostic_output_budget": "output_budget",
+            }.get(str(error), "invalid_reply")
+        )
+
+
 def journal_events(output: str, uid: int, pid: int, invocation: str) -> dict[str, Any]:
     """Keep only fixed positive facts; absent or rejected rows prove no absence."""
     lines = output.splitlines()
@@ -782,6 +1033,8 @@ async def observe_setup_units(
     read: Callable[[int, str], Awaitable[bytes | None]],
     deadline: float,
     runner: CommandRunner,
+    *,
+    context_io: _SetupIO | None = None,
 ) -> dict[str, Any]:
     """Read the two dedicated system units without depending on their user bus."""
     from muli.platforms.linux_transaction import _typed
@@ -906,6 +1159,10 @@ async def observe_setup_units(
                 and facts["process"]["exe"] == "manager"
                 and facts["process"]["uid_matches"] is True
             ):
+                if context_io is not None:
+                    facts["context"] = await observe_setup_context(
+                        probe, path, uid, service["MainPID"], group, read, context_io, deadline
+                    )
                 facts["journal"] = await observe_setup_journal(
                     probe, path, uid, service["MainPID"], group, read, runner, deadline
                 )
@@ -1031,6 +1288,50 @@ class _SetupIO:
         data = _read_regular(Path("/proc") / str(pid) / name, self.limit - self.used)
         self.charge(data)
         return data
+
+    async def context(self, pid: int, uid: int, ticks: int, group: str) -> dict[str, str]:
+        # This inner wire reserve comes from the existing allowance, not in addition to it.
+        wire_limit = CONTEXT_REPLY_BYTES
+        allowance = self.limit - self.used - wire_limit
+        require(allowance > 0, "native_diagnostic_output_budget")
+        self.used += allowance
+        result = await self.command(
+            [
+                "sudo",
+                "--non-interactive",
+                "--",
+                sys.executable,
+                "-I",
+                str(Path(__file__).resolve()),
+                "project-setup-context",
+                str(pid),
+                str(uid),
+                str(ticks),
+                group,
+                str(self.deadline),
+                str(allowance),
+            ],
+            timeout=remaining(self.deadline),
+            limit=wire_limit,
+        )
+        require(result.get("exit_code") == 0, "native_diagnostic_invalid")
+
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
+            for key, item in pairs:
+                require(key not in value, "native_diagnostic_invalid")
+                value[key] = item
+            return value
+
+        value = json.loads(result["output"], object_pairs_hook=unique)
+        require(
+            isinstance(value, dict) and set(value) == {"facts", "used"}, "native_diagnostic_invalid"
+        )
+        facts = context_projection(value["facts"])
+        used = value["used"]
+        require(type(used) is int and 0 <= used <= allowance, "native_diagnostic_invalid")
+        self.used -= allowance - used
+        return facts
 
 
 async def _manager_list(
@@ -1424,6 +1725,7 @@ async def diagnose_setup(
         "units": [],
         "process": process_unavailable(),
         "journal": journal_unavailable(),
+        "context": context_unavailable(),
     }
     io = _SetupIO(deadline, byte_limit, facts)
     try:
@@ -1443,6 +1745,7 @@ async def diagnose_setup(
                 io.read,
                 deadline,
                 io.command,
+                context_io=io,
             )
     except TimeoutError:
         facts["failure"], facts["query_code"] = "deadline", "timeout"
@@ -2220,6 +2523,21 @@ async def run(mode: str, root: Path) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 8 and sys.argv[1] == "project-setup-context":
+        # Never print exception text (which might contain untrusted environment data).
+        try:
+            value = read_setup_context(
+                int(sys.argv[2]),
+                int(sys.argv[3]),
+                int(sys.argv[4]),
+                sys.argv[5],
+                float(sys.argv[6]),
+                int(sys.argv[7]),
+            )
+        except Exception:
+            value = {"facts": context_unavailable("invalid_reply"), "used": MAX_BYTES}
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
     if len(sys.argv) == 2 and sys.argv[1] == "describe":
         print(json.dumps(describe(), sort_keys=True, separators=(",", ":")))
         return 0

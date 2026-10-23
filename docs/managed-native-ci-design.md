@@ -396,6 +396,20 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 
 新基线只做一次相关整合纯验证：完整native387项与两个直接_OutputBudget节点的4项，共 **391项通过**（pytest1.06秒、guard1.629秒、峰值100.6 MiB/swap 0），没有选择process测试文件内真实Popen用例。受影响两Python文件Ruff69毫秒/21.5 MiB、format-check75毫秒/21.7 MiB；协调器与worker strict mypy551毫秒/157.1 MiB，全部exit0/swap 0。均经同一绝对路径30秒guard串行，pytest session收实exit0后才下一项，完成即归还共享槽。之后仅补签名文档记录，不push、触发第十四轮或提高任何预算；第十三轮失败及真实事务/清理未验边界不变。
 
+## 失败后 setup 环境与 socket 投影候选
+
+在第十四轮事实与 `75bc95a` 的 private-bus 否决之后，本候选只为 setup 失败后的已有后备观察增加一次 `context`；不加入 ready 轮询，不改变启动命令、workflow、严格 ready 门或真实验收条件。实现与纯 fixture 已通过下述本地检查，没有新的 CI、真实服务或事务结果。
+
+只有已观察到专用 UID 的 manager 镜像才尝试投影。外层在前后检查同一 system unit 的 Id/InvocationID、MainPID/ControlGroup 与 proc startticks；既有 worker 的窄提权子模式在自己的观察窗口内再检查 startticks、四个 UID、manager exe 和 cgroup。任一漂移使整包 context 失效；这仍是有限窗口，不是原子快照。原始 environ 只留在投影子进程内，不通过 stdout、stderr、异常正文或 artifact 输出。
+
+固定字段为 `code`、`notify_env`、`runtime_env`、`bus_env`、`listen_env`、`parent_notify`、`user_notify`、`private_socket`。仅解析 NOTIFY_SOCKET、XDG_RUNTIME_DIR、DBUS_SESSION_BUS_ADDRESS、LISTEN_PID/FDS/FDNAMES；其它值丢弃。notify 只输出 parent/user/missing/other，runtime/bus 只输出 expected/missing/other，LISTEN 仅 present/absent，socket 仅 socket_owner_matches/absent/unexpected/unavailable；失败字段统一 unavailable。重复目标键、截断、非法格式、未知输出键不能作为有效观察。
+
+`NOTIFY_SOCKET=/run/systemd/notify` 是父 PID 1 的上行入口；`/run/user/UID/systemd/notify` 是 user manager 接收子服务通知的入口。前者缺失或指向后者，会将下一步收窄到 exec 初始环境来源；仍不能独立确认历史超时根因。初始值正确且父 socket 类型/owner 匹配，只排除这两项简单错误，不证明 READY 曾发送或被接受。用户 notify/private socket 只做不跟随符号链接的路径元数据观察；存在不证明创建者、监听状态、已完成初始化或已进入主循环；缺失/不可读也不证明对应阶段未执行。没有 socket connect、bus fallback、activation、通知发送或新协议 wrapper。[v255 notify 入口](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L970)、[v255 private 入口](https://github.com/systemd/systemd/blob/v255/src/core/dbus.c#L850)。Context7 已核对固定 v255，具体入口以这两处官方代码为准。
+
+继续使用原约88秒观察截止、2.5秒失败回执、5秒 cleanup 与32 KiB累计余额、1024字节外层回复预留及原资源限制。投影的512字节内部 wire 上限从现有余额内扣除；原始 proc 读取字节、内部 stdout/stderr、最终外层 JSON 都计费。失败或未知字节读取保守占用额度，不重新分配时间或额度；没有可用余额/期限就不启动。context 失败不覆盖 manager_failure，也不授权进入 harness 或清理资源。
+
+纯 fixture 已覆盖父/用户 notify 区分、缺失/异常/重复/截断环境、内外层身份漂移、socket 非法类型/owner/父目录 symlink、秘密值与异常不外泄，以及取消/不足余额/到期拒绝观察或不复用额度。取得共享槽后，全部逐条经主仓绝对路径30秒 guard 串行并收真实终态：native 文件 **426项通过**（pytest1.39秒、服务1.987秒、峰值115.5 MiB）；最终 Ruff77毫秒/24.4 MiB、format-check83毫秒/29.9 MiB、两脚本 strict mypy652毫秒/164.6 MiB均exit0，swap均0，完成即归还槽。首次 Ruff 找到新 fixture 的 zip 未显式 strict 参数，已补 strict=False；首次 mypy 未设置 worktree 源路径，将依赖视为无类型安装包并报8处 no-any-return（含既有位置），在 guard 内设置 `MYPYPATH=src:tests` 并使用 `--explicit-package-bases` 后通过，没有放宽类型规则。未运行本机服务、账户、挂载或远端 CI；第十四轮0事务、未就绪与 cleanup 超时边界不变。
+
 ## 第十四轮 native 有限失败取证与下一验证门
 
 精确候选 `362330cd3a89001e70ce25e5843ec5e99686a7fc` 的 [CI 39987046967](https://github.com/69gg/MuLi/actions/runs/39987046967) 已全终态，**9项成功、2项失败**（native 与 Windows）；[native job 120528818889](https://github.com/69gg/MuLi/actions/runs/39987046967/job/120528818889) 的有限日志在 `2026-10-23T16:30:00Z` 报 `native_deadline_exceeded`。本次已下载的 evidence 为 **1182 字节**，zip SHA256 `5b676f2b4272f8c576cbd5b60d1fa3cc343ab3aa6cd22dc4fd2ca81a650da7c8`。严格确认只有 `receipt.json`（1139 字节）与 `result.json`（1070 字节）两个普通、非加密有界 entry 后，只读取白名单标量；没有再次下载。结果投影没有导出原始路径、命令、环境、stderr。

@@ -135,6 +135,7 @@ class Commands:
                         "unit": f"user@{self.uid}.service",
                         "process": worker.process_unavailable(),
                         "journal": worker.journal_unavailable(),
+                        "context": worker.context_unavailable(),
                         "units": [
                             {"unit": name, "code": "unit_absent"}
                             for name in (
@@ -2481,6 +2482,11 @@ async def test_setup_journal_uses_one_finite_identity_bound_read(
     from muli import process
     from muli.platforms import linux_transaction
 
+    async def context(*args: Any, **kwargs: Any) -> dict[str, str]:
+        return worker.context_unavailable()
+
+    monkeypatch.setattr(worker, "observe_setup_context", context)
+
     user, uid, home = "muli-ci-" + "a" * 12, 23145, tmp_path / "home"
     names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
     paths = {
@@ -4303,3 +4309,362 @@ def test_fresh_cleanup_preserves_only_valid_owned_finite_readiness(
     assert (result["resources"].get("manager_readiness") == readiness) is (change == "valid")
     assert (result["resources"].get("manager_failure") == failure) is (change == "valid")
     assert commands.accounts == {} and commands.mounts == {}
+
+
+@pytest.fixture
+def context_reader(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    from muli.platforms import linux_transaction
+
+    control: dict[str, Any] = {
+        "clock": 100.0,
+        "reads": [],
+        "round": 0,
+        "change": "none",
+        "environment": b"SECRET=never-export-me\xff\0NOTIFY_SOCKET=/run/systemd/notify\0"
+        b"XDG_RUNTIME_DIR=/run/user/23145\0"
+        b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus\0",
+    }
+    monkeypatch.setattr(worker.time, "monotonic", lambda: control["clock"])
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        worker, "system_executables", lambda: {"manager": "/usr/lib/systemd/systemd"}
+    )
+
+    def read(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        assert path.parent == Path("/proc/42") and directory_fd is None and limit > 0
+        control["reads"].append((path.name, limit))
+        change = control["change"]
+        if path.name == "environ":
+            if change == "permission":
+                raise PermissionError("never-export-me")
+            if change == "deadline":
+                control["clock"] = 105.0
+            data = control["environment"]
+        elif path.name == "stat":
+            control["round"] += 1
+            ticks = 101 if change == "ticks" and control["round"] > 1 else 100
+            data = f"42 (secret) S {'0 ' * 18}{ticks}\n".encode()
+        elif path.name == "status":
+            uid = 1 if change == "uid" and control["round"] > 1 else 23145
+            data = f"Uid:\t{uid} {uid} {uid} {uid}\n".encode()
+        else:
+            assert path.name == "cgroup"
+            group = (
+                "/other"
+                if change == "group" and control["round"] > 1
+                else "/user.slice/user@23145.service/init.scope"
+            )
+            data = f"0::{group}\n".encode()
+        if len(data) > limit:
+            raise ValueError("invalid_observation_file")
+        return data
+
+    def image(path: Path) -> str:
+        assert path == Path("/proc/42/exe")
+        return (
+            "/secret/image"
+            if control["change"] == "image" and control["round"] > 1
+            else "/usr/lib/systemd/systemd"
+        )
+
+    def metadata(path: Path, owner: int) -> str:
+        assert (path, owner) in {
+            (Path("/run/systemd/notify"), 0),
+            (Path("/run/user/23145/systemd/notify"), 23145),
+            (Path("/run/user/23145/systemd/private"), 23145),
+        }
+        return "socket_owner_matches"
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", read)
+    monkeypatch.setattr(os, "readlink", image)
+    monkeypatch.setattr(worker, "context_socket", metadata)
+    return control
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "ticks",
+        "uid",
+        "group",
+        "image",
+        "permission",
+        "deadline",
+        "duplicate",
+        "truncated",
+        "budget",
+    ],
+)
+def test_context_reader_is_bounded_identity_bound_and_never_exports_raw_environment(
+    context_reader: dict[str, Any],
+    change: str,
+) -> None:
+    control = context_reader
+    control["change"] = change
+    if change == "duplicate":
+        control["environment"] += b"NOTIFY_SOCKET=never-export-me\0"
+    if change == "truncated":
+        control["environment"] = b"SECRET=never-export-me"
+    limit = 32 if change == "budget" else 4096
+    value = worker.read_setup_context(
+        42, 23145, 100, "/user.slice/user@23145.service", 105.0, limit
+    )
+    facts = value["facts"]
+    assert ci.context_facts(facts) and "never-export-me" not in json.dumps(value)
+    if change == "none":
+        assert facts == {
+            "code": "observed",
+            "notify_env": "parent",
+            "runtime_env": "expected",
+            "bus_env": "expected",
+            "listen_env": "absent",
+            "parent_notify": "socket_owner_matches",
+            "user_notify": "socket_owner_matches",
+            "private_socket": "socket_owner_matches",
+        }
+        assert 0 < value["used"] < limit
+        limits = [item[1] for item in control["reads"]]
+        assert all(first > second for first, second in zip(limits, limits[1:], strict=False))
+        assert len(json.dumps(value, separators=(",", ":")).encode()) <= 512
+    else:
+        assert facts["code"] != "observed" and value["used"] == limit
+
+
+@pytest.mark.parametrize(
+    ("data", "notify", "runtime", "bus", "listen"),
+    [
+        (b"", "missing", "missing", "missing", "absent"),
+        (
+            b"NOTIFY_SOCKET=/run/user/42/systemd/notify\0LISTEN_PID=secret\0",
+            "user",
+            "missing",
+            "missing",
+            "present",
+        ),
+        (
+            b"NOTIFY_SOCKET=@secret\0XDG_RUNTIME_DIR=secret\0DBUS_SESSION_BUS_ADDRESS=secret\0",
+            "other",
+            "other",
+            "other",
+            "absent",
+        ),
+    ],
+)
+def test_context_environment_distinguishes_parent_and_user_notify(
+    data: bytes,
+    notify: str,
+    runtime: str,
+    bus: str,
+    listen: str,
+) -> None:
+    assert worker.context_environment(data, 42) == {
+        "notify_env": notify,
+        "runtime_env": runtime,
+        "bus_env": bus,
+        "listen_env": listen,
+    }
+
+
+@pytest.mark.parametrize(
+    "case", ["socket", "owner", "regular", "symlink", "missing", "parent-symlink"]
+)
+def test_context_socket_only_inspects_fixed_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    from types import SimpleNamespace
+
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def open_directory(path: Any, flags: int, *, dir_fd: int | None = None) -> int:
+        assert flags & os.O_DIRECTORY and flags & os.O_CLOEXEC
+        if dir_fd is not None:
+            assert flags & os.O_NOFOLLOW and str(path) in {"run", "systemd"}
+        if case == "parent-symlink" and path == "systemd":
+            raise OSError("secret")
+        descriptor = 100 + len(opened)
+        opened.append(descriptor)
+        return descriptor
+
+    def metadata(path: str, *, dir_fd: int, follow_symlinks: bool) -> Any:
+        assert path == "notify" and dir_fd == opened[-1] and not follow_symlinks
+        if case == "missing":
+            raise FileNotFoundError("secret")
+        return SimpleNamespace(
+            st_uid=1 if case == "owner" else 0,
+            st_mode={"regular": stat.S_IFREG, "symlink": stat.S_IFLNK}.get(case, stat.S_IFSOCK),
+        )
+
+    monkeypatch.setattr(os, "open", open_directory)
+    monkeypatch.setattr(os, "close", closed.append)
+    monkeypatch.setattr(os, "stat", metadata)
+    value = worker.context_socket(Path("/run/systemd/notify"), 0)
+    assert value == {
+        "socket": "socket_owner_matches",
+        "missing": "absent",
+        "parent-symlink": "unavailable",
+    }.get(case, "unexpected")
+    assert closed == opened
+
+
+@pytest.mark.parametrize("change", ["extra", "raw", "unknown", "partial"])
+def test_context_exports_reject_unknown_or_private_fields(change: str) -> None:
+    value = worker.context_unavailable()
+    if change == "extra":
+        value["environment"] = "secret"
+    elif change == "raw":
+        value["notify_env"] = "/secret/notify"
+    elif change == "unknown":
+        value["code"] = "ready"
+    else:
+        value["notify_env"] = "parent"
+    assert not ci.context_facts(value)
+    with pytest.raises(worker.NativeError):
+        worker.context_projection(value)
+
+
+def test_context_cli_never_prints_raw_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*args: Any) -> NoReturn:
+        raise ValueError("SECRET=never-export-me")
+
+    monkeypatch.setattr(worker, "read_setup_context", fail)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["worker", "project-setup-context", "42", "23145", "100", "/owned", "105", "1024"],
+    )
+    assert worker.main() == 0
+    output = capsys.readouterr()
+    assert output.err == "" and "never-export-me" not in output.out
+    value = json.loads(output.out)
+    assert ci.context_facts(value["facts"]) and value["facts"]["code"] == "invalid_reply"
+    assert len(output.out.encode()) <= worker.CONTEXT_REPLY_BYTES
+
+
+@pytest.mark.parametrize("change", ["uid", "privilege", "expired", "extended"])
+def test_context_reader_refuses_invalid_identity_or_time_before_proc_reads(
+    context_reader: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    if change == "privilege":
+        monkeypatch.setattr(os, "geteuid", lambda: 23145)
+    value = worker.read_setup_context(
+        42,
+        0 if change == "uid" else 23145,
+        100,
+        "/owned",
+        {"expired": 100.0, "extended": 106.0}.get(change, 105.0),
+        1024,
+    )
+    assert value["facts"]["code"] != "observed" and value["used"] == 1024
+    assert context_reader["reads"] == []
+
+
+@pytest.mark.parametrize("failure", ["balance", "cancel", "exception", "stderr", "late"])
+async def test_context_io_cannot_reuse_failed_allowance_or_extend_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from muli import process
+
+    clock = 100.0
+    calls = 0
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+
+    async def command(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        nonlocal calls, clock
+        calls += 1
+        assert kwargs["timeout"] <= 5 and kwargs["limit"] == worker.CONTEXT_REPLY_BYTES
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        if failure == "exception":
+            raise OSError("SECRET=never-export-me")
+        if failure == "late":
+            clock = 105.0
+        return {"exit_code": 0, "output": "", "stderr": "x" * (worker.CONTEXT_REPLY_BYTES + 1)}
+
+    monkeypatch.setattr(process, "run_process", command)
+    limit = worker.CONTEXT_REPLY_BYTES if failure == "balance" else 4096
+    io = worker._SetupIO(105.0, limit, {})
+    with pytest.raises((ValueError, OSError, asyncio.CancelledError)):
+        await io.context(42, 23145, 100, "/owned")
+    assert calls == (0 if failure == "balance" else 1)
+    if calls:
+        assert io.used >= io.limit
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "invocation", "pid", "ticks", "deadline", "invalid-reply"]
+)
+async def test_context_outer_window_binds_invocation_pid_and_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    from types import SimpleNamespace
+
+    clock = 100.0
+    rounds = 0
+    commands: list[list[str]] = []
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+
+    async def properties(path: str, interface: str, fields: Any) -> dict[str, Any]:
+        nonlocal rounds
+        assert path == "/fixed/unit"
+        if interface == "Unit":
+            rounds += 1
+            return {
+                "Id": "user@23145.service",
+                "InvocationID": [2 if change == "invocation" and rounds > 1 else 1] * 16,
+            }
+        return {
+            "MainPID": 43 if change == "pid" and rounds > 1 else 42,
+            "ControlGroup": "/user.slice/user@23145.service",
+        }
+
+    async def read(pid: int, name: str) -> bytes:
+        assert pid == 42 and name == "stat"
+        ticks = 101 if change == "ticks" and rounds > 1 else 100
+        return f"42 (private) S {'0 ' * 18}{ticks}\n".encode()
+
+    async def command(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        nonlocal clock
+        commands.append(argv)
+        assert argv[:3] == ["sudo", "--non-interactive", "--"]
+        assert argv[6] == "project-setup-context" and argv[7:10] == ["42", "23145", "100"]
+        assert float(argv[-2]) == 105.0 and 0 < int(argv[-1]) < 4096
+        assert 0 < kwargs["timeout"] <= 5 and kwargs["limit"] <= 512
+        if change == "deadline":
+            clock = 105.0
+        facts = worker.context_unavailable("unavailable")
+        if change == "invalid-reply":
+            facts["secret"] = "never-export-me"
+        return {"exit_code": 0, "output": json.dumps({"facts": facts, "used": 20}), "stderr": ""}
+
+    from muli import process
+
+    monkeypatch.setattr(process, "run_process", command)
+    io = worker._SetupIO(105.0, 4096, {})
+    facts = await worker.observe_setup_context(
+        SimpleNamespace(_properties=properties),
+        "/fixed/unit",
+        23145,
+        42,
+        "/user.slice/user@23145.service",
+        read,
+        io,
+        105.0,
+    )
+    assert ci.context_facts(facts) and len(commands) == 1
+    assert facts["code"] == {
+        "none": "unavailable",
+        "deadline": "timeout",
+        "invalid-reply": "invalid_reply",
+    }.get(change, "identity_changed")
+    assert "never-export-me" not in json.dumps(facts)
+    assert 0 < io.used <= 4096

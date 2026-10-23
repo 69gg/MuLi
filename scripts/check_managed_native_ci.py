@@ -421,6 +421,40 @@ def journal_facts(value: object) -> bool:
     return True
 
 
+def context_facts(value: object) -> bool:
+    """Accept finite initial-environment/socket labels, never their source values."""
+    allowed = {
+        "code": {
+            "observed",
+            "not_started",
+            "unavailable",
+            "identity_changed",
+            "invalid_reply",
+            "timeout",
+            "output_budget",
+        },
+        "notify_env": {"parent", "user", "missing", "other", "unavailable"},
+        "runtime_env": {"expected", "missing", "other", "unavailable"},
+        "bus_env": {"expected", "missing", "other", "unavailable"},
+        "listen_env": {"present", "absent", "unavailable"},
+        "parent_notify": {"socket_owner_matches", "absent", "unexpected", "unavailable"},
+        "user_notify": {"socket_owner_matches", "absent", "unexpected", "unavailable"},
+        "private_socket": {"socket_owner_matches", "absent", "unexpected", "unavailable"},
+    }
+    return (
+        isinstance(value, dict)
+        and set(value) == set(allowed)
+        and all(
+            isinstance(value[key], str) and value[key] in choices
+            for key, choices in allowed.items()
+        )
+        and (
+            value["code"] == "observed"
+            or all(value[key] == "unavailable" for key in allowed if key != "code")
+        )
+    )
+
+
 def setup_facts(value: object) -> bool:
     """Only the confirmed UID's two system units may enter setup evidence."""
     fields = {
@@ -437,6 +471,7 @@ def setup_facts(value: object) -> bool:
         "units",
         "process",
         "journal",
+        "context",
     }
     if (
         not isinstance(value, dict)
@@ -457,6 +492,7 @@ def setup_facts(value: object) -> bool:
         or value["failure"] not in DIAGNOSTIC_FAILURES
         or not process_facts(value["process"])
         or not journal_facts(value["journal"])
+        or not context_facts(value["context"])
     ):
         return False
     uid = value["uid"]
@@ -1577,6 +1613,16 @@ class NativeCI:
                 "wait": "unavailable",
             },
             "journal": {"code": "not_started", "incomplete": False, "events": []},
+            "context": {
+                "code": "not_started",
+                "notify_env": "unavailable",
+                "runtime_env": "unavailable",
+                "bus_env": "unavailable",
+                "listen_env": "unavailable",
+                "parent_notify": "unavailable",
+                "user_notify": "unavailable",
+                "private_socket": "unavailable",
+            },
         }
         end = time.monotonic() + CLEANUP_SECONDS
         if self.execute_deadline is not None:
