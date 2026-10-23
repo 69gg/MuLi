@@ -509,6 +509,20 @@ result仍 `completed=false/stage=manager_setup/code=setup_failed`、timeline0/ge
 
 根统一格式化后，完整native **506项通过**（pytest1.87秒、守卫2.461秒、131 MiB）；直接OutputBudget四项通过（0.03秒、守卫510毫秒、53.6 MiB）。三文件Ruff、format-check和明确`MYPYPATH=src:tests`的两脚本strict mypy全部exit0，类型检查694毫秒、166.8 MiB；各步30秒守卫实收终态、swap均0，单次完成后才运行下一项。独立最终后审未发现剩余P1/P2，完整shape/身份/丢回包与清理门、最终实际JSON总量门均保留。本地检查不创建真实服务、账户或挂载，子agent没有独立运行检查；提交与下一精确远端对照仍由根处理，不重复native17或称真实READY已修复。
 
+### 第十八轮：去重未保住后备整包，真实事务仍为零
+
+完整506项native、4项OutputBudget及静态和独立后审通过后，根签名提交`c0394b099305d6b6fe3bb1d0c102d82307fb016a`并推送原PR37分支，仅产生一个新[CI 40022475250](https://github.com/69gg/MuLi/actions/runs/40022475250)。最终completed/failure，**十项成功、仅managed-native失败**；[job120650223635](https://github.com/69gg/MuLi/actions/runs/40022475250/job/120650223635)的事务和清理两步均失败，不能用其它矩阵成功抵消或沿用17轮字段。
+
+job原始日志的首次有界API请求失败，没有取得数据或扩大读取。先只取精确run的`managed-native-evidence`，artifact12531416330，实际**897字节**，SHA256`f80270b66ede2164eeda9b9d4e3af161414b113e8bef52e61c8ae205ff412a2f`；约5.08MB的python-package没有下载。读取最多898字节核对实际长度与digest，ZIP严格只有两个非加密普通白名单entry，receipt410字节、result1103字节，每项有界；复用当前签名协调器完整`fixture_result`校验再输出不超过4KiB摘要。实际30秒守卫exit0、1.854秒、45.7MiB/swap0。整轮终态后改由同一精确job的CLI失败步骤入口取得**2418字节**日志，仍沿原32768字节读取上限；守卫exit0、7.154秒、42.8MiB/swap0。本机没有创建服务、账户或挂载。
+
+- `completed=false/stage=manager_setup/code=setup_failed`，timeline0、generations0，仍为**0个真实事务**。`manager_failure`为`native_deadline_exceeded/manager_validation/query_status=0/query_code=ok/used=17512`；没有readiness记录。
+- 后备`diagnostic_status=0/diagnostic_code=output_budget`，`units=[]`，其余stage/process/context/notification/journal仍为拒绝整包后的默认`not_started`。这是worker返回后外层`used+实际JSON`门拒绝，不能说worker没有观察，也不能把16轮正向状态借作18轮事实。固定fixture的去重节省没有保住本次完整诊断，`saturates-grant`反例所指出的限制真实存在；没有改变原预算或默认结果冒充成功。
+- 清理后的receipt为UID/GID999/987、user_removed=true、group_removed=true、mount_count0、environment_file不在、bootstrap目录0/file不在、manager_program仍有记录；不能从已清空账本推断prepare从未创建。`resources.cleanup`缺失。后取得日志为`20:53:26Z native_deadline_exceeded`、`20:53:29Z native_service_cleanup_failed`，后者是泛化服务收尾失败、不是17轮的`native_command_timeout`；没有具体失败命令，**不称正常cleanup已验收**。
+
+下一步先只读审查worker与外层完整回包的字节责任，设计能在同一固定总量内原子保留有限有用事实的最小合同；没有仅凭本轮失败重开19轮、增加启动变量、扩大期限/输出或执行本机实验。去重是已验证的纯fixture改进，不是已证实的READY根因修复。
+
+只读下一方案建议复用manager-ready原有至多1024字节失败回执：在原观察轮所有身份/结构门完整通过后，保存最后完整轮的固定白名单checkpoint，随`manager_failure`先校验落盘，不新增查询。有限状态、job、PID/startticks/invocation及相对时间必须以最大合法编码证明仍容纳；不携路径、环境或日志。后备大包再失败不能抹掉已核事实；`not_observed`明确无完整轮，不以默认值伪造状态。这只是待审合同：须先用完整轮后到期、下轮无回包占满、后备超额、首轮失败、身份漂移和最大/非法字段反例证伪，并验证调用数、首因及原预算不变。它不提供到期时原子系统状态，不证明READY条件或根因；尚未实现或运行，也不据此直接开启19轮。
+
 ## 第十五轮：新增投影返回有效事实，manager 仍未就绪
 
 精确签名候选 `7c19c754aba5dd297499bb2337d22ac9cb9f26b2` 的唯一 [CI 40002429374](https://github.com/69gg/MuLi/actions/runs/40002429374) 已在 `2026-10-23T18:27:28Z` 更新为 completed/failure，**10项成功、1项失败**，仅 [managed-native job 120581693658](https://github.com/69gg/MuLi/actions/runs/40002429374/job/120581693658) 失败；Windows及其余跨平台任务均成功。本轮不与第十四轮的Windows失败混因。事务步骤 `18:20:14→18:21:42Z` 报 `native_deadline_exceeded`；cleanup `18:21:42→18:21:46Z` 报 `native_service_cleanup_failed`，不是第十四轮的 timeout 标签。之后 evidence 上传成功。
