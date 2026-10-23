@@ -432,6 +432,8 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 
 根及独立集成 agent 对本片四文件实现后审未发现可验证 P1/P2：固定字段不泄漏 StatusText，身份变化同时拒绝两包，getter 与最终回复沿原预算计费，manager_failure 首因和真实业务门保持。该静态结论不代替尚待进行的真实原生验收。
 
+签名实现 `fe2d84f` 经签名 merge `890aedd` 合入当前已发布基线之后的 main `b89a3dc`（2.41 标签尚未发行），无冲突。合并后根另用30秒守卫重验 native454与原 OutputBudget4，共458 passed，pytest1.17秒、守卫1.792秒、峰104.3 MiB；两脚本 strict mypy1.121秒、174.7 MiB。两者实际退出0、swap0；实现及 merge GPG签名均为有效。没有将首次检查当成合并后证据，下一次远端观察仍须单独取得实际结果。
+
 ## 第十五轮：新增投影返回有效事实，manager 仍未就绪
 
 精确签名候选 `7c19c754aba5dd297499bb2337d22ac9cb9f26b2` 的唯一 [CI 40002429374](https://github.com/69gg/MuLi/actions/runs/40002429374) 已在 `2026-10-23T18:27:28Z` 更新为 completed/failure，**10项成功、1项失败**，仅 [managed-native job 120581693658](https://github.com/69gg/MuLi/actions/runs/40002429374/job/120581693658) 失败；Windows及其余跨平台任务均成功。本轮不与第十四轮的Windows失败混因。事务步骤 `18:20:14→18:21:42Z` 报 `native_deadline_exceeded`；cleanup `18:21:42→18:21:46Z` 报 `native_service_cleanup_failed`，不是第十四轮的 timeout 标签。之后 evidence 上传成功。
