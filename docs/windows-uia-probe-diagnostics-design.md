@@ -118,3 +118,8 @@ CRLF/半行、未知/重复/乱序输入、2048 字节截断、完整 JSON note 
 是标准 stderr 的 TextWriter；[StreamWriter.AutoFlush](https://learn.microsoft.com/en-us/dotnet/api/system.io.streamwriter.autoflush?view=netframework-4.8.1)
 不等于刷新 encoder 或接收方确认。固定 ASCII 标记显式 Flush，仅作为已达代码位置的
 有限观察，不是 Windows 启动阶段有时限保证的官方承诺。
+
+后续旧候选 `691ea5c` 的 `39979235619` Windows 3.13 四项 native 失败，包括最小
+owned-pending 脚本未见读后标记。新增独立的
+[同进程判别合同](windows-uia-pending-observation-design.md)，只观察第四例原进程的
+宿主输入与清理边界，不改变本节八阶段协议、产品桥接或原有事实记录。
