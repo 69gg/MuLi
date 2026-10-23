@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald。现已记录第十四轮 native 失败：2.5秒回执窗口确实保住同次到期摘要，后备正向观察到 runtime-dir 已完成、user manager 仍 activating/start；仍为0个真实事务，没有 readiness 或正常清理证明。最近合并后整合纯验证为430项通过，新增失败后环境/socket 投影已实现并完成独立复审，详见下文；它不代替原生验收。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮起的 manager 启动原因仍未确定。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察、定向 journald 与失败后环境/socket 投影。第十五轮全终态10成功1失败，仅native失败；新投影已正向排除 exec 初始 notify 方向、runtime/bus 值及入口类型/owner 的简单错误，manager 仍 activating/start，仍为0个真实事务。账户/组/挂载账本已清除，但服务收尾仍失败，没有正常 cleanup 验收证明。最近合并后整合纯验证为430项通过，详见下文；它不代替原生验收。第十四轮2.5秒失败摘要保留及未就绪事实保留，不用第十五轮覆盖。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮起的 manager 启动原因仍未确定。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -413,6 +413,19 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 根与 C 对这四个改动文件分别完成只读独立复审，未发现必须修复的 P1/P2；复核范围包括秘密不透传、父/用户 NOTIFY 方向、内外身份绑定、原截止和累计字节。随后四文件以有效 GPG 签名提交 `4b34f9f00178ab0d7f6a36e05af785b6e6d745b5`，再通过有效签名 merge `39b8df56ff83d34d77d36457cd73d5af9a708259` 无冲突合入已发布 main `ca5615213cdcc9cea99239d26835c5864fb56bed`（v2.40）；两者均为 merge 的祖先，四个 native 文件在合并中无变化。相对 main 的候选仍包含原 native 分支历史；本次投影提交没有修改 workflow。
 
 在 merge `39b8df5` 上重新取得独占槽，逐条经主仓绝对路径30秒 guard 完成最小整合验证并实收exit0：native426项加两个直接 OutputBudget 节点4项，共 **430项通过**（pytest1.37秒、服务1.970秒、峰值117 MiB）；三Python文件 Ruff66毫秒/21.6 MiB、format-check71毫秒/21.4 MiB，两脚本 strict mypy1.085秒/171.7 MiB均通过。mypy 在 guard 内显式使用 `MYPYPATH=src:tests`、`--explicit-package-bases`，没有降级规则；全部swap0，完成即归还槽。本轮没有失败重试、本机真实账户/服务/挂载效果或远端 CI。该合并候选提供新的有限观察假说，不表示 manager 根因已确认、0事务边界已解除或正常 cleanup 已验收。
+
+## 第十五轮：新增投影返回有效事实，manager 仍未就绪
+
+精确签名候选 `7c19c754aba5dd297499bb2337d22ac9cb9f26b2` 的唯一 [CI 40002429374](https://github.com/69gg/MuLi/actions/runs/40002429374) 已在 `2026-10-23T18:27:28Z` 更新为 completed/failure，**10项成功、1项失败**，仅 [managed-native job 120581693658](https://github.com/69gg/MuLi/actions/runs/40002429374/job/120581693658) 失败；Windows及其余跨平台任务均成功。本轮不与第十四轮的Windows失败混因。事务步骤 `18:20:14→18:21:42Z` 报 `native_deadline_exceeded`；cleanup `18:21:42→18:21:46Z` 报 `native_service_cleanup_failed`，不是第十四轮的 timeout 标签。之后 evidence 上传成功。
+
+只取该 job 至多32769字节日志和精确 run/head 的 `managed-native-evidence` artifact `12522462672`；没有取约4.9MB的 package。ZIP实际 **961字节**，SHA256 `78f96ebae2de426a0df87ef0a953bd3f7bdcf400523c0906a27d14557b91595a`。获独占槽后经绝对路径30秒 guard 验证恰有两个非加密普通白名单 entry：receipt.json316字节、result.json1306字节，逐项大小/类型有界，并复用当前协调器完整结果校验再输出不超过4 KiB的白名单投影。实收exit0/guard success，服务95毫秒、峰值22.1 MiB/swap0，立即归还槽；无原env、任意stderr或原始路径输出。
+
+- `completed=false/stage=manager_setup/code=setup_failed`，timeline0、generations0，仍 **0个真实事务**。`manager_failure` 为 `native_deadline_exceeded/manager_validation/query_status=0/query_code=ok/used=17402`；2.5秒失败回执继续有效，不能误作 ready 成功。
+- 后备 `phase=manager_show_before/client_code=command_failed/diagnostic_status=0/diagnostic_code=ok/failure=none`；runtime-dir仍loaded/active/exited、success、exec1/0、PID0/job0；user@999仍loaded/activating/start、success、exec0/0、PID2284/job1467、cgroup存在。process仍为manager、UID匹配、S/epoll_wait；journal仍no_known_event、incomplete=false、events空，不能推导没有日志或未执行 basic/default。
+- 新的真实正向结果为 `context=observed`：notify_env=parent，runtime_env/bus_env=expected，listen_env=absent，parent_notify/user_notify/private_socket均socket_owner_matches。固定内外前后身份门已接受同一窗口；这排除了 exec 初始通知地址指向用户入口/缺失、这两项runtime/bus值偏离预期、入口类型/owner不符等简单解释。它不证明当前getenv值、socket监听者/创建者、已经进入主循环、达到READY触发条件或通知已经交付/接受。重复同一环境观察不会增加相同假说的鉴别力。
+- receipt为UID/GID999/987，user_created=true、user_removed=true、group_removed=true、mount_count0、environment_file不在、manager_group未赋值；resources.cleanup未记录。本轮明确比第十四轮走到了这些账本资源清除，但 **服务收尾仍失败**，不能写成正常cleanup已验收。源码中 cleanup 在尝试专用用户cleanup transient等操作失败后设置failure，随后继续stop/revert、卸载、删除账户组，最后才抛native_service_cleanup_failed；该泛化标签没有暴露捕获块内具体失败命令，不据此猜根因。
+
+本轮新增事实来自实际托管runner的投影，不是430项fixture的替代描述；同样不构成三事务、readiness或正常服务收尾验收。第十四轮独立失败事实保持不变。后续只读研究可评估新的basic/default/jobs观察入口，须先核对官方API、身份、无fallback/无激活及原期限/字节边界；本记录没有触发第十六轮、加预算、实现新适配或操作本机真实服务。
 
 ## 第十四轮 native 有限失败取证与下一验证门
 
