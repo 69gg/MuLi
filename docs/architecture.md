@@ -22,7 +22,7 @@ MuLi 是服务于单个电脑用户的本地数字生命助手。界面保留十
 - `integrations.chiliarch` 使用真实 agent 配对、SSE、消息与 ACK 协议；收到事件先将 inbox、通知与事件事务持久化再 ACK。`integrations.attention` 使用默认关闭的独立对象策略，把当前配对身份的新普通消息作为外部资料交给 Attention，受锁复核 scope/revision；不自动回信，不改变主配置格式。空闲时不调用模型。
 - `reminders` 等待最近到期时间或配置变更事件，通知和下一次触发在同一事务内保存；`tools.mcp` 仅在显式启用后连接扩展。
 - `attention` 只消费有持久证据且策略允许的提醒、维护、新版、日志及可选 chiliarch 消息，等待活动工作结束后把游标、去重凭据和主会话入站原子提交。系统资料使用独立只读回合，不继承 owner 权限或历史渠道；外部消息正文另标为不可信资料。消费者等待事件变化，关闭不会取消正在观察的主任务，并先于 Runtime/Store 退出。
-- 后台服务分别使用 systemd 用户服务、macOS LaunchAgent 或 Windows 无窗口计划任务。AT-SPI 通过 Linux 系统 Python 的 GI/Atspi 调用，避免在虚拟环境编译 GTK；实验性 macOS AX 使用系统原生框架与短期引用。Windows UIA MTA helper 已发布顶层窗口与选定树只读能力，本片增加实际对象的一次普通 Button Invoke，输入仍拒绝、新动作真实 Windows CI 待验；各平台分别报告能力。
+- 后台服务分别使用 systemd 用户服务、macOS LaunchAgent 或 Windows 无窗口计划任务。AT-SPI 通过 Linux 系统 Python 的 GI/Atspi 调用，避免在虚拟环境编译 GTK；实验性 macOS AX 使用系统原生框架与短期引用。Windows UIA MTA helper 已发布顶层窗口与选定树只读能力，以及实际对象的一次普通 Button Invoke；输入仍拒绝，Windows CI 自有按钮验收已通过，真实用户桌面未验，各平台分别报告能力。
 
 无障碍读取分为有界应用/窗口发现与定向快照。宿主持有带有效期的原生定位信息，仅向模型返回当前临时标识；helper 在每次读取或动作前复核身份。工作量、省略原因与最终 JSON 大小分别核算，新快照失败也不会复活旧操作凭据。Linux 保持单次 helper；macOS AX 需要保留原生对象，因此使用仅归属于一个 session/run 的短期 helper。一次动作、到期或准确执行的终态回收全部引用，配置重载先完成旧对象关闭。协议只允许一个在途命令，发送动作帧前重验捕获的任务控制与新输入；不创建桌面轮询服务。见[电脑操作合同](computer.md)。
 
