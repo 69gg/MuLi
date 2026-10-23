@@ -11,7 +11,7 @@ from typing import Any, cast
 import pytest
 from helpers import uia_probe_diagnostics as diagnostic
 
-from muli.tools import ax_lease
+from muli.tools import ax_lease, uia_computer
 from muli.tools.ax_lease import MAX_STDERR_BYTES, AXLeaseError
 
 PREFIX = b"muli-uia-pending=1:"
@@ -103,7 +103,7 @@ class _Harness:
         await self.cleanup_release.wait()
         if self.cleanup_failure is not None:
             raise self.cleanup_failure
-        assert process is self.process
+        assert process is cast(object, self.process)
         assert process.stdin is not None
         process.stdin.close()
         await process.stdin.wait_closed()
@@ -345,7 +345,7 @@ async def test_native_fourth_case_uses_one_observed_lease_and_keeps_original_can
 ) -> None:
     import test_uia_native as native
 
-    monkeypatch.setattr(native.module, "_powershell", lambda: tmp_path / "owned-host.exe")
+    monkeypatch.setattr(uia_computer, "_powershell", lambda: tmp_path / "owned-host.exe")
     harness.process.stderr.feed_data(markers("input_received"))
     async with asyncio.timeout(2):
         await native.test_real_windows_pending_powershell_cancellation_reaps_only_owned_helper(
