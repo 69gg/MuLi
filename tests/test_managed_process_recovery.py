@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast, get_args
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -24,6 +24,8 @@ from helpers.managed_recovery_worker import (
     BOOT,
     IO_SECONDS,
     PREFIX,
+    STEP_INTENTS,
+    STEP_PHASES,
     deployment,
     prepare,
     read_record,
@@ -33,7 +35,7 @@ from test_management_process_recovery import CLEANUP_SECONDS, cleanup, remaining
 import muli
 from muli.managed_transaction import HealthProofV2, format_digest
 from muli.management_projection import read_projection
-from muli.management_transaction import Intent, Phase, Role, TransactionJournal
+from muli.management_transaction import Role, TransactionJournal
 from muli.platforms.filesystem_identity import FilesystemError, verify_local_filesystems
 from muli.platforms.installation import PackageLimits
 from muli.platforms.managed_deployment import SlotIdentity, register_local_slot
@@ -264,10 +266,16 @@ def test_isolated_fixture_hook_controls_owned_bytecode(tmp_path: Path, early_hoo
     assert bool(fixture_cache) is (not early_hook)
 
 
-def failure_diagnostic(root: Path, timeline: list[dict[str, str | int]], deadline: float) -> str:
+def failure_diagnostic(
+    root: Path,
+    timeline: list[dict[str, str | int]],
+    deadline: float,
+    steps: list[list[int]] | None = None,
+) -> str:
     details: dict[str, Any] = {
         "timeline": timeline,
         "remaining_ms": round((deadline - time.monotonic()) * 1000),
+        "steps": steps if steps is not None else [],
     }
     try:
         with TransactionJournal(
@@ -509,7 +517,11 @@ def test_fixture_parent_explicit_root_rejects_invalid_path(
 
 
 def diagnostic_checkpoint(
-    process: subprocess.Popen[bytes], expected: bytes, output: bytearray, deadline: float
+    process: subprocess.Popen[bytes],
+    expected: bytes,
+    output: bytearray,
+    deadline: float,
+    steps: list[list[int]] | None = None,
 ) -> None:
     """Read fixed controller diagnostics and one actual owned handshake."""
     assert process.stdout is not None
@@ -534,10 +546,13 @@ def diagnostic_checkpoint(
                 values = json.loads(line.removeprefix(b"controller-step="))
             except ValueError:
                 raise AssertionError("invalid step diagnostic") from None
-            assert isinstance(values, list) and len(values) == 6
-            assert all(type(value) is int and 0 <= value <= 1_000_000 for value in values[:4])
+            assert isinstance(values, list) and len(values) == 10
+            assert all(type(value) is int and 0 <= value <= 1_000_000 for value in values)
             assert values[0] == step and step < 32
-            assert values[4] in get_args(Phase) and values[5] in get_args(Intent)
+            assert values[8] < len(STEP_PHASES) and values[9] < len(STEP_INTENTS)
+            if steps is not None:
+                assert len(steps) == step
+                steps.append(values)
             step += 1
         ready, _, _ = select.select([process.stdout], [], [], remaining(deadline))
         assert ready, "worker checkpoint timed out"
@@ -548,10 +563,14 @@ def diagnostic_checkpoint(
 
 
 def expect(
-    process: subprocess.Popen[bytes], expected: bytes, output: bytearray, deadline: float
+    process: subprocess.Popen[bytes],
+    expected: bytes,
+    output: bytearray,
+    deadline: float,
+    steps: list[list[int]] | None = None,
 ) -> None:
     try:
-        diagnostic_checkpoint(process, expected, output, deadline)
+        diagnostic_checkpoint(process, expected, output, deadline, steps)
     except AssertionError:
         # Keep the useful tail of an early exception, within the same byte cap.
         assert process.stdout is not None
@@ -563,7 +582,7 @@ def expect(
             if not data:
                 break
             output.extend(data)
-        raise AssertionError(output.decode("utf-8", errors="replace")) from None
+        raise AssertionError("managed recovery checkpoint failed") from None
 
 
 def slot(root: Path, name: str, repository: Path) -> SlotIdentity:
@@ -673,6 +692,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
             started = time.monotonic()
             deadline = started + CASE_SECONDS
             timeline: list[dict[str, str | int]] = []
+            steps: list[list[int]] = []
             live: subprocess.Popen[bytes] | None = None
 
             def mark(stage: str) -> None:
@@ -686,7 +706,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
             ) -> None:
                 label = expected.decode("ascii")
                 mark("wait:" + label)
-                expect(process, expected, output, deadline)
+                expect(process, expected, output, deadline, steps if process is driver else None)
                 mark("got:" + label)
 
             def spawn(
@@ -782,7 +802,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                         mark("base:paused")
                         continue_controller()
                     observe(driver, b"controller-resolved", output)
-                    assert driver.wait(timeout=remaining(deadline)) == 0, bytes(output)
+                    assert driver.wait(timeout=remaining(deadline)) == 0, "controller failed"
                     # These are real nonce routes and the real host's projection callback.
                     for _ in range(2):
                         status, value = await request(client, root, selected, deadline)
@@ -866,7 +886,7 @@ async def test_actual_cli_boot_activation_and_projection_preserve_latest_databas
                             (site / "__pycache__").glob("_muli_managed_process_fixture_hook*.pyc")
                         )
             except BaseException as error:
-                error.add_note(failure_diagnostic(root, timeline, deadline))
+                error.add_note(failure_diagnostic(root, timeline, deadline, steps))
                 raise
             finally:
                 cleanup(processes)

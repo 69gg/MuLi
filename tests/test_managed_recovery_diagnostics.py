@@ -9,17 +9,19 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import cast, get_args
 
 import pytest
 from helpers import managed_recovery_worker as worker
 
 from muli.managed_controller import ManagedTransactionController
 from muli.managed_transaction import TransactionRecordV2
-from muli.management_transaction import Role
+from muli.management_transaction import Activation, Code, Role
 from muli.platforms.managed_backend import ManagedLinuxBackend
+from muli.platforms.managed_deployment import SlotIdentity
 
 linux_pipe = pytest.mark.skipif(sys.platform != "linux", reason="Linux owned pipe/select fixture")
 
@@ -52,6 +54,82 @@ def test_observed_guard_calls_original_once_and_keeps_its_failure(
     assert untouched.check_calls == 0 and untouched.check_seconds == 0
 
 
+@pytest.mark.parametrize("stage", ["none", "before", "controller", "selected"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_file_observation_preserves_original_calls_failures_and_lookup_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    cancel: bool,
+) -> None:
+    from muli.platforms import managed_backend, managed_deployment
+
+    clock = 10.0
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: clock))
+    record = cast(TransactionRecordV2, object())
+    slot = cast(SlotIdentity, object())
+    failure = asyncio.CancelledError("private") if cancel else ValueError("private")
+    calls: list[str] = []
+
+    def controller(value: SlotIdentity) -> None:
+        nonlocal clock
+        assert value is slot
+        calls.append("controller")
+        clock += 0.25
+        if stage == "controller":
+            raise failure
+
+    def selected(value: SlotIdentity) -> None:
+        nonlocal clock
+        assert value is slot
+        calls.append("selected")
+        clock += 0.5
+        if stage == "selected":
+            raise failure
+
+    def check(self: object, value: TransactionRecordV2, role: Role | None = None) -> None:
+        nonlocal clock
+        assert value is record and role == "target"
+        calls.append("check")
+        clock += 0.125
+        if stage == "before":
+            raise failure
+        managed_deployment.verify_slot_files(slot)
+        vars(managed_backend)["verify_slot_files"](slot)
+        clock += 0.125
+
+    monkeypatch.setattr(managed_deployment, "verify_slot_files", controller)
+    monkeypatch.setattr(managed_backend, "verify_slot_files", selected)
+    monkeypatch.setattr(ManagedLinuxBackend, "_check", check)
+    backend = object.__new__(worker.ObservedBackend)
+    if stage == "none":
+        backend._check(record, "target")
+    else:
+        with pytest.raises(type(failure)) as caught:
+            backend._check(record, "target")
+        assert caught.value is failure
+    expected = {
+        "none": ["check", "controller", "selected"],
+        "before": ["check"],
+        "controller": ["check", "controller"],
+        "selected": ["check", "controller", "selected"],
+    }[stage]
+    assert calls == expected
+    assert managed_deployment.verify_slot_files is controller
+    assert vars(managed_backend)["verify_slot_files"] is selected
+    assert backend.check_calls == 1
+    assert backend.controller_calls == ("controller" in calls)
+    assert backend.selected_calls == ("selected" in calls)
+    assert backend.controller_seconds == (0.25 if "controller" in calls else 0)
+    assert backend.selected_seconds == (0.5 if "selected" in calls else 0)
+    assert backend.check_seconds == clock - 10.0
+    untouched = object.__new__(worker.ObservedBackend)
+    assert untouched.controller_calls == untouched.selected_calls == 0
+    if stage == "none":
+        backend._check(record, "target")
+        assert calls == expected * 2
+        assert backend.check_calls == backend.controller_calls == backend.selected_calls == 2
+
+
 @pytest.mark.parametrize("failure", [None, ValueError("private body"), asyncio.CancelledError()])
 async def test_step_observation_preserves_result_exception_and_single_execution(
     monkeypatch: pytest.MonkeyPatch, failure: BaseException | None
@@ -69,6 +147,8 @@ async def test_step_observation_preserves_result_exception_and_single_execution(
         nonlocal calls
         calls += 1
         backend.check_calls, backend.check_seconds = 3, 0.25
+        backend.controller_calls, backend.controller_seconds = 3, 0.125
+        backend.selected_calls, backend.selected_seconds = 2, 0.0625
         if failure is not None:
             raise failure
         return record
@@ -81,7 +161,7 @@ async def test_step_observation_preserves_result_exception_and_single_execution(
             await worker.observed_step(driver, backend, 4, record)
         assert caught.value is failure
     assert calls == 1
-    assert lines == ['controller-step=[4,500,3,250,"rolling_back","restore_base"]']
+    assert lines == ["controller-step=[4,500,3,250,3,125,2,62,4,5]"]
 
 
 async def test_step_evidence_failure_cannot_mask_original_result(
@@ -110,7 +190,7 @@ async def test_all_step_records_fit_original_pipe_budget(monkeypatch: pytest.Mon
 
     record = cast(
         TransactionRecordV2,
-        SimpleNamespace(phase=max(get_args(Phase), key=len), intent=max(get_args(Intent), key=len)),
+        SimpleNamespace(phase=get_args(Phase)[-1], intent=get_args(Intent)[-1]),
     )
     lines: list[str] = []
     monkeypatch.setattr(worker, "checkpoint", lines.append)
@@ -121,6 +201,10 @@ async def test_all_step_records_fit_original_pipe_budget(monkeypatch: pytest.Mon
     async def step() -> TransactionRecordV2:
         backend.check_calls += 10_000_000
         backend.check_seconds += 10_000_000
+        backend.controller_calls += 10_000_000
+        backend.controller_seconds += 10_000_000
+        backend.selected_calls += 10_000_000
+        backend.selected_seconds += 10_000_000
         return record
 
     driver = cast(ManagedTransactionController, SimpleNamespace(step=step))
@@ -129,7 +213,7 @@ async def test_all_step_records_fit_original_pipe_budget(monkeypatch: pytest.Mon
     assert len(lines) == 32
     output = "\n".join(lines) + "\nstart-target\nstop-target\nstart-base\ncontroller-resolved\n"
     assert len(output.encode()) < 4096
-    assert all(json.loads(line.split("=", 1)[1])[1:4] == [1_000_000] * 3 for line in lines)
+    assert all(json.loads(line.split("=", 1)[1])[1:8] == [1_000_000] * 7 for line in lines)
 
 
 @contextmanager
@@ -151,7 +235,7 @@ def test_diagnostic_lines_do_not_replace_controller_checkpoint(
 ) -> None:
     import test_managed_process_recovery as recovery
 
-    frame = b'controller-step=[0,1985,47,1932,"activating","install_target"]\n'
+    frame = b"controller-step=[0,1985,47,1932,47,1500,20,400,2,2]\n"
     data = frame + b"start-target\n"
     monkeypatch.setattr(
         recovery, "os", SimpleNamespace(read=lambda fd, size: os.read(fd, min(size, chunk_bytes)))
@@ -168,15 +252,15 @@ def test_diagnostic_lines_do_not_replace_controller_checkpoint(
     [
         b"unexpected diagnostic\n",
         b"controller-step=broken\n",
-        b'controller-step=[true,1,1,1,"activating","install_target"]\n',
-        b'controller-step=[0,1,1,1,"private","install_target"]\n',
-        b'controller-step=[1,1,1,1,"activating","install_target"]\n',
-        b'controller-step=[0,-1,1,1,"activating","install_target"]\n',
-        b'controller-step=[0,1,1,1,"activating","install_target"]\n' * 2,
-        b'controller-step=[0,1,1,1,"activating","unknown"]\n',
-        b'controller-step=[0,1,1,1,"activating","install_target",0]\n',
-        b'controller-step=[0,1,true,1,"activating","install_target"]\n',
-        b'controller-step=[0,1,1,1000001,"activating","install_target"]\n',
+        b"controller-step=[true,1,1,1,0,0,0,0,2,2]\n",
+        b"controller-step=[0,1,1,1,0,0,0,0,999,2]\n",
+        b"controller-step=[1,1,1,1,0,0,0,0,2,2]\n",
+        b"controller-step=[0,-1,1,1,0,0,0,0,2,2]\n",
+        b"controller-step=[0,1,1,1,0,0,0,0,2,2]\n" * 2,
+        b"controller-step=[0,1,1,1,0,0,0,0,2,999]\n",
+        b"controller-step=[0,1,1,1,0,0,0,0,2,2,0]\n",
+        b"controller-step=[0,1,true,1,0,0,0,0,2,2]\n",
+        b"controller-step=[0,1,1,1000001,0,0,0,0,2,2]\n",
     ],
     ids=[
         "unknown",
@@ -204,7 +288,7 @@ def test_checkpoint_rejects_unknown_or_invalid_frames(prefix: bytes) -> None:
 def test_diagnostic_without_actual_checkpoint_is_not_success() -> None:
     import test_managed_process_recovery as recovery
 
-    with checkpoint_pipe(b'controller-step=[0,1,1,1,"activating","install_target"]\n') as process:
+    with checkpoint_pipe(b"controller-step=[0,1,1,1,0,0,0,0,2,2]\n") as process:
         with pytest.raises(AssertionError):
             recovery.expect(process, b"start-target", bytearray(), time.monotonic() + 1)
 
@@ -213,7 +297,7 @@ def test_diagnostic_without_actual_checkpoint_is_not_success() -> None:
 def test_other_recovery_reader_stays_strict() -> None:
     from test_management_process_recovery import checkpoint
 
-    data = b'controller-step=[0,1,1,1,"activating","install_target"]\nstart-target\n'
+    data = b"controller-step=[0,1,1,1,0,0,0,0,2,2]\nstart-target\n"
     with checkpoint_pipe(data) as process:
         with pytest.raises(AssertionError):
             checkpoint(process, b"start-target", bytearray(), time.monotonic() + 1)
@@ -251,7 +335,7 @@ def test_step_sequence_survives_multiple_parent_handshakes() -> None:
         process = cast(subprocess.Popen[bytes], SimpleNamespace(stdout=stream))
         output = bytearray()
         for index, expected in enumerate((b"start-target", b"stop-target")):
-            frame = f'controller-step=[{index},1,1,1,"rolling_back","stop_target"]\n'.encode()
+            frame = f"controller-step=[{index},1,1,1,0,0,0,0,4,4]\n".encode()
             sender.write(frame + expected + b"\n")
             recovery.expect(process, expected, output, time.monotonic() + 1)
         assert output.count(b"controller-step=") == 2
@@ -262,14 +346,99 @@ def test_all_32_diagnostics_are_admitted_but_a_33rd_is_rejected() -> None:
     import test_managed_process_recovery as recovery
 
     frames = b"".join(
-        f'controller-step=[{index},1,1,1,"activating","install_target"]\n'.encode()
-        for index in range(32)
+        f"controller-step=[{index},1,1,1,0,0,0,0,2,2]\n".encode() for index in range(32)
     )
     with checkpoint_pipe(frames + b"start-target\n") as process:
         output = bytearray()
         recovery.expect(process, b"start-target", output, time.monotonic() + 1)
-    with checkpoint_pipe(
-        b'controller-step=[32,1,1,1,"activating","start_target"]\nstop-target\n'
-    ) as process:
+    with checkpoint_pipe(b"controller-step=[32,1,1,1,0,0,0,0,2,3]\nstop-target\n") as process:
         with pytest.raises(AssertionError):
             recovery.expect(process, b"stop-target", output, time.monotonic() + 1)
+
+
+@linux_pipe
+@pytest.mark.parametrize("field", [4, 5, 6, 7])
+@pytest.mark.parametrize("invalid", [True, -1, 1_000_001])
+def test_new_timing_fields_reject_noncanonical_scalars(field: int, invalid: int) -> None:
+    import test_managed_process_recovery as recovery
+
+    values = [0, 10, 2, 8, 2, 5, 1, 2, 2, 2]
+    values[field] = invalid
+    frame = b"controller-step=" + json.dumps(values).encode() + b"\nstart-target\n"
+    steps: list[list[int]] = []
+    with checkpoint_pipe(frame) as process:
+        with pytest.raises(AssertionError):
+            recovery.expect(process, b"start-target", bytearray(), time.monotonic() + 1, steps)
+    assert steps == []
+
+
+@linux_pipe
+def test_failure_note_contains_only_consumed_validated_steps(
+    tmp_path: Path,
+) -> None:
+    import test_managed_process_recovery as recovery
+
+    values = [0, 10, 2, 8, 2, 5, 1, 2, 2, 2]
+    frame = b"controller-step=" + json.dumps(values).encode() + b"\nprivate raw output\n"
+    steps: list[list[int]] = []
+    with checkpoint_pipe(frame) as process:
+        with pytest.raises(AssertionError) as caught:
+            recovery.expect(process, b"start-target", bytearray(), time.monotonic() + 1, steps)
+    note = recovery.failure_diagnostic(tmp_path, [], time.monotonic(), steps)
+    caught.value.add_note(note)
+    details = json.loads(note.split("=", 1)[1])
+    assert details["steps"] == [values]
+    assert "private" not in str(caught.value) and "private" not in note
+    assert details["steps"][0][3] - details["steps"][0][5] - details["steps"][0][7] == 1
+
+
+@linux_pipe
+def test_maximum_valid_summary_survives_all_handshakes_and_failure_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import test_managed_process_recovery as recovery
+
+    values = [
+        [index, *([1_000_000] * 7), len(worker.STEP_PHASES) - 1, len(worker.STEP_INTENTS) - 1]
+        for index in range(32)
+    ]
+    frames = b"".join(
+        b"controller-step=" + json.dumps(row, separators=(",", ":")).encode() + b"\n"
+        for row in values
+    )
+    handshakes = b"start-target\nstop-target\nstart-base\ncontroller-resolved\n"
+    assert len(frames + handshakes) <= recovery.HTTP_BYTES
+    steps: list[list[int]] = []
+    with checkpoint_pipe(frames + b"controller-resolved\n") as process:
+        recovery.expect(process, b"controller-resolved", bytearray(), time.monotonic() + 1, steps)
+    assert steps == values
+    record = SimpleNamespace(
+        revision=1_000_000,
+        phase="recovery_required",
+        intent="install_target",
+        activation=max(get_args(Activation), key=len),
+        code=max(get_args(Code), key=len),
+    )
+    monkeypatch.setattr(
+        recovery, "TransactionJournal", lambda *args, **kwargs: nullcontext(object())
+    )
+    monkeypatch.setattr(recovery, "read_record", lambda journal: record)
+    database = SimpleNamespace(
+        close=lambda: None,
+        execute=lambda *args: SimpleNamespace(
+            fetchone=lambda: (b'{"posts":4096,"started":true,"allowed":true}',)
+        ),
+    )
+    monkeypatch.setattr(
+        recovery, "sqlite3", SimpleNamespace(connect=lambda *args, **kwargs: database)
+    )
+    timeline: list[dict[str, str | int]] = [
+        {"stage": "wait:controller-resolved", "elapsed_ms": 1_000_000}
+    ] * 16
+    note = recovery.failure_diagnostic(tmp_path, timeline, time.monotonic(), steps)
+    assert len(note.encode()) <= recovery.HTTP_BYTES
+    details = json.loads(note.split("=", 1)[1])
+    assert details["steps"] == values and details["timeline"] == timeline
+    assert details["state"]["phase"] == record.phase
+    assert details["http"]["base"]["posts"] == recovery.HTTP_BYTES
