@@ -147,9 +147,12 @@ def test_checkpoint_reply_fits_original_reserve_and_survives_exhausted_fallback(
         native.execute()
     saved = ci.fixture_result((native.root / "result.json").read_bytes())
     assert saved["resources"]["manager_failure"] == summary
-    assert saved["resources"]["setup"]["diagnostic_code"] == "output_budget"
+    assert saved["resources"]["setup"]["code"] == "not_observed"
+    assert saved["resources"]["setup"]["reason"] == "output_budget"
     assert saved["timeline"] == [] and saved["generations"] == []
-    assert not any("diagnose-setup" in argv for argv in commands.calls)
+    assert not any(
+        "diagnose-setup" in argv or "diagnose-manager-instance" in argv for argv in commands.calls
+    )
     assert native.setup_bytes == before + summary["used"] + returned <= ci.OUTPUT_BYTES
     assert ci.manager_failure_facts(largest)
     assert not ci.manager_failure_facts(summary | {"private": "must not escape"})
@@ -497,7 +500,7 @@ def test_checkpoint_transport_preserves_original_packet_and_parent_deadline_gate
         assert not native.manager_failure and native.setup_bytes == ci.OUTPUT_BYTES
 
 
-def test_actual_oversized_fallback_json_does_not_replace_saved_checkpoint(
+def test_actual_oversized_legacy_fallback_json_does_not_replace_saved_checkpoint(
     fixture: tuple[Any, Commands],
 ) -> None:
     native, commands = fixture
@@ -509,7 +512,7 @@ def test_actual_oversized_fallback_json_does_not_replace_saved_checkpoint(
         "query_status": 0,
         "query_code": "ok",
         "used": 1,
-        "last_completed_round": observed_round(),
+        "last_completed_round": {"version": 1, "code": "not_observed"},
     }
     native.manager_failure = summary
     native.save_setup_result({})

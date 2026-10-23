@@ -563,8 +563,62 @@ def notification_facts(value: object) -> bool:
     )
 
 
+def manager_instance_facts(value: object) -> bool:
+    """A later same-instance projection, never an internal manager/READY claim."""
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "code",
+        "reason",
+        "uid",
+        "pid",
+        "start_ticks",
+        "invocation",
+        "exe",
+        "uids",
+        "internal",
+        "used",
+    }:
+        return False
+    return (
+        type(value["version"]) is int
+        and value["version"] == 1
+        and all(type(value[key]) is int and 0 < value[key] < 2**31 for key in ("uid", "pid"))
+        and type(value["start_ticks"]) is int
+        and 0 <= value["start_ticks"] < 2**64
+        and isinstance(value["invocation"], str)
+        and re.fullmatch(r"[a-f0-9]{32}", value["invocation"]) is not None
+        and value["invocation"] != "0" * 32
+        and value["internal"] == "not_observed"
+        and type(value["used"]) is int
+        and 0 <= value["used"] <= OUTPUT_BYTES - 1024
+        and (
+            (
+                value["code"] == "observed"
+                and value["reason"] == "none"
+                and value["exe"] in ("manager", "executor", "other")
+                and value["uids"] in ("all_expected", "mismatch")
+            )
+            or (
+                value["code"] == "not_observed"
+                and value["reason"]
+                in ("timeout", "output_budget", "identity_changed", "invalid_reply", "unavailable")
+                and value["exe"] == "unavailable"
+                and value["uids"] == "unavailable"
+            )
+        )
+    )
+
+
+def manager_instance_matches(value: dict[str, Any], checkpoint: dict[str, Any]) -> bool:
+    return all(
+        value[key] == checkpoint["manager"][key] for key in ("pid", "start_ticks", "invocation")
+    )
+
+
 def setup_facts(value: object) -> bool:
     """Only the confirmed UID's two system units may enter setup evidence."""
+    if manager_instance_facts(value):
+        return True
     fields = {
         "uid",
         "phase",
@@ -770,6 +824,17 @@ def fixture_result(data: bytes) -> dict[str, Any]:
         else:
             valid = facts in ("verified", "failed")
         if not valid:
+            raise FixtureError("native_result_invalid")
+    setup = resources.get("setup")
+    if isinstance(setup, dict) and manager_instance_facts(setup):
+        failure = resources.get("manager_failure")
+        checkpoint = failure.get("last_completed_round") if isinstance(failure, dict) else None
+        if (
+            not isinstance(checkpoint, dict)
+            or not manager_checkpoint_facts(checkpoint)
+            or checkpoint["code"] != "observed"
+            or not manager_instance_matches(setup, checkpoint)
+        ):
             raise FixtureError("native_result_invalid")
     return value
 
@@ -1887,12 +1952,120 @@ class NativeCI:
         if result is None or result.get("completed") is not True:
             raise FixtureError("native_case_failed")
 
+    def observe_manager_instance(self, uid: int, checkpoint: dict[str, Any]) -> None:
+        """Replace the large fallback, retaining the already saved first failure."""
+        receipt = self.receipt
+        if receipt is None:
+            return
+        anchor = checkpoint["manager"]
+        facts: dict[str, Any] = {
+            "version": 1,
+            "code": "not_observed",
+            "reason": "output_budget",
+            "uid": uid,
+            **{key: anchor[key] for key in ("pid", "start_ticks", "invocation")},
+            "exe": "unavailable",
+            "uids": "unavailable",
+            "internal": "not_observed",
+            "used": 0,
+        }
+        allowance = OUTPUT_BYTES - self.setup_bytes - 1024
+        end = time.monotonic() + CLEANUP_SECONDS
+        if self.execute_deadline is not None:
+            end = min(end, self.execute_deadline)
+        if allowance <= 0:
+            self.save_setup_result({"setup": facts})
+            return
+        if time.monotonic() >= end:
+            facts["reason"] = "timeout"
+            self.save_setup_result({"setup": facts})
+            return
+        before = self.setup_bytes
+        # No returned, validated usage means no refund of the child's allowance.
+        self.setup_bytes += allowance
+        facts["used"] = allowance
+        returned = False
+        try:
+            worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+            reply = self.call(
+                (
+                    sys.executable,
+                    "-I",
+                    str(worker),
+                    "diagnose-manager-instance",
+                    receipt.user,
+                    str(uid),
+                    str(self.home),
+                    str(end),
+                    str(allowance),
+                    json.dumps(checkpoint, sort_keys=True, separators=(",", ":")),
+                ),
+                seconds=end - time.monotonic(),
+            )
+            returned = True
+            # The wire is charged before parsing/deadline validation; invalid/lost
+            # replies cannot recycle the raw grant or the outer reply reserve.
+            self.setup_bytes += len(reply.output)
+            if len(reply.output) > 1024 or self.setup_bytes > OUTPUT_BYTES:
+                self.setup_bytes = OUTPUT_BYTES
+                raise FixtureError("native_diagnostic_output_budget")
+            if time.monotonic() >= end:
+                raise FixtureError("native_deadline_exceeded")
+
+            def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                value: dict[str, Any] = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise FixtureError("native_diagnostic_invalid")
+                    value[key] = item
+                return value
+
+            data = json.loads(reply.output, object_pairs_hook=unique)
+            if (
+                reply.code != 0
+                or not manager_instance_facts(data)
+                or data["uid"] != uid
+                or not manager_instance_matches(data, checkpoint)
+                or data["used"] > allowance
+            ):
+                raise FixtureError("native_diagnostic_invalid")
+            self.setup_bytes = before + data["used"] + len(reply.output)
+            facts = data
+        except (ValueError, OSError, subprocess.SubprocessError) as failure:
+            if not returned:
+                self.setup_bytes = OUTPUT_BYTES
+            facts["reason"] = {
+                "native_deadline_exceeded": "timeout",
+                "native_execute_deadline": "timeout",
+                "native_cleanup_deadline": "timeout",
+                "native_command_timeout": "timeout",
+                "native_diagnostic_output_budget": "output_budget",
+            }.get(
+                str(failure),
+                "timeout"
+                if isinstance(failure, TimeoutError)
+                else "unavailable"
+                if isinstance(failure, OSError)
+                else "invalid_reply",
+            )
+        self.save_setup_result({"setup": facts})
+
     def observe_setup(self, error: Exception) -> None:
         """Observe two exact system units; never launch a private user-bus client."""
         receipt = self.receipt
         if receipt is None or receipt.setup_phase == "initial":
             return
         uid, _ = self.current_account()
+        checkpoint = (
+            self.manager_failure.get("last_completed_round") if self.manager_failure else None
+        )
+        if (
+            isinstance(checkpoint, dict)
+            and manager_checkpoint_facts(checkpoint)
+            and checkpoint["code"] == "observed"
+        ):
+            self.observe_manager_instance(uid, checkpoint)
+            return
         facts: dict[str, Any] = {
             "uid": uid,
             "phase": receipt.setup_phase,

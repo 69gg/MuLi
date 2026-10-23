@@ -80,3 +80,52 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 源码复核及唯一待审因果分叉见[设计记录第十九轮](managed-native-ci-design.md#第十九轮历史pending轮已保住ready仍未通过)：当前仍无法区分最终exec前、内部basic/job未完成、或READY发送/接收路径。下一步只考虑在原失败观察总量内替换重复负担，先同代确认实际exec层，再区分basic/内部job；可靠无激活读取通道及真实整包上限尚待核清。此记录不增加字段、轮询、启动变量、期限或预算，不实施该方案、不授权盲开第二十轮。
 
 另一失败是Windows3.13原生UIA首probe的12秒超时：1 failed/3692 passed/2017 skipped，阶段到`uia_ready`、sent1、后cleanup confirmed。它不证明完整response已写出或被Python收到；旧后清理投影不能反推清理前进程/reader状态。该native分支尚无`41af626`同进程前后诊断，不借v2.43另一候选的CI或诊断改进宣称本轮Windows根因已修复。
+
+## 第十九轮之后的最小观察合同（已授权实施，待根验证）
+
+本次只读核对根已保存的 native19 result 和有限 setup 日志：仍为上述9绿2红、零事务；历史 pending 轮已保存，后备整包被拒。没有执行检查、系统命令实验或新CI。下面只建议先审定一个小型 **实际映像/凭据观察**；尚没有能满足原边界的内部 basic/pending-jobs 读取通道，不把整条 READY 链写成已可实施。
+
+**先纠正通道归属。** 当前 `_SetupIO.query` 将 `SystemdProbe` 的 `busctl --user` 显式替换为 `--system`。直接用它查 `basic.target` 或 `ListJobs` 得到的是PID1的状态，不能归入该专用UID。现有代码没有 libsystemd/ctypes peer wrapper；既有 busctl 私有握手及 systemctl 用户连接回退的否决仍成立。缓存上游v255的 `manager_check_finished` 先要求 manager running，继而检查 basic active/reloading；jobs非空会返回，jobs空则进入 `manager_send_ready`。因此实际exe=manager本身仍不能证明进入这一检查、basic完成、队列为空或READY已发送/接收。镜像清单、socket存在、epoll_wait及缺少日志均不能补这些事实。内部层本片固定 `not_observed`；没有已审定的无激活连接、peer身份及接收/分配上限，就不发真实新轮。
+
+**建议替换落点。** 仅在 manager-ready 已保存合法 `last_completed_round=observed` 后，`NativeCI.observe_setup` 将此次旧大包 `diagnose-setup` 替换为一次小型实例观察；无checkpoint或非此失败阶段保留旧分支，不从receipt的manager_program造锚点。小观察复用 `SystemdProbe._unit_path/_properties`、现有proc身份解析、`system_executables` 与窄root worker模式，删除这一分支的版本查询、runtime-dir重复快照、wait/environ/socket/notification/journal读取。不是在旧大包后再追加一次诊断。原manager-ready轮询、成功完整门、sleep、失败首因及先保存checkpoint的顺序不变。
+
+窗口内先 `GetUnit(user@UID.service)`，再读 Unit(Id,InvocationID) 和 Service(MainPID,ControlGroup)，必须匹配历史锚点；调用一次固定root helper读 `/proc/PID` 的 stat/status/cgroup/exe 各两遍，最后再读上述Unit/Service两组属性。共至多6条内部命令（5条系统属性命令、1条root helper），不用用户bus，也不发start/reload/新账户操作。helper只接受既有类型的PID/UID/ticks/cgroup和deadline/allowance，不接受任意路径；复用受信脚本与既有系统映像发现，不硬编码runner映像路径。两侧PID/startticks/invocation、cgroup、实际exe和四个UID须稳定；UID只投影 `all_expected/mismatch`，exe只投影 `manager/executor/other`，不导出实际路径或四个数值。exe=executor仅说明窗口内尚是executor映像；other/mismatch不猜PAM或哪一步失败。完整窗口后才发布observed；单位或proc身份漂移、截断、未知格式只发布not_observed，不能用“前半段相同”通过。此窗口发生在历史轮之后，不能把两者称同一时刻或到期原子快照。
+
+**固定小回包与计费。** 独立有限variant由 `setup_facts` 接纳，旧完整setup仍可读；`fixture_result` 对其与manager_failure锚点做交叉核验，`save_setup_result` 保留原首因与历史轮。小回包键固定为 `version/code/reason/uid/pid/start_ticks/invocation/exe/uids/internal/used`：version是严格int 1；code为observed/not_observed；observed仅reason=none、exe=manager/executor/other、uids=all_expected/mismatch；not_observed仅reason=timeout/output_budget/identity_changed/invalid_reply/unavailable且exe/uids均为unavailable。uid/pid是严格int且0<值<2³¹，ticks是严格uint64，invocation始终为非零32位小写hex；两种code均保留已接受的历史锚点，不合成空PID或空invocation。used为严格int且0≤值≤32768−1024；internal固定not_observed。没有合法checkpoint时走原分支，所以此variant不设no_checkpoint。全部为ASCII白名单，最大值按紧凑JSON及newline保守界小于300字节，fixture同时实际序列化证实；整个外层诊断CLI回包上限仍1024，不能只算新增字段，也不把磁盘上含首因的完整result另限为1024。root helper固定仅 `code/reason/exe/uids/used` 五键，同一code/reason/标签枚举，used限于其原始读取授权，不输出异常正文，继续使用原512字节内层wire门。
+
+设入诊断前已计费B、原总量T=32768，则A=T−B、内层读取授权L=A−1024；A≤1024就不启动后备。所有命令两管道、proc实际读取和root helper wire仍向L累计；root子授权按现有context做法先占用再仅凭严格回包used退差额，丢返回/异常不回收授权。worker顶层即使内层耗尽或末次属性读取失败，也须返回固定小型not_observed，而非整包丢回默认not_started。故 `B + worker_used + len(actual_reply) ≤ B + (A−1024) + 300 ≤ T`；最后仍按实际整包字节与父deadline核验。不得以该公式证明现场一定有足够**采集**余额：两遍status等实际字节可能大于L，此时只能明确output_budget。除非后续能给出剩余采集余额的证据，不为小包通过就盲开下一轮；不挪用2.5秒receipt时间做新观察，不增加原5秒后备/cleanup或约88秒绝对期限，不减少现有ready证明来腾字节。
+
+**仅五组待授权纯反例。** 复用 `tests/test_managed_native_checkpoint.py` 和既有managed-native fake：①同锚点实际manager/四UID匹配，后续原查询耗尽也保留小事实和原首因；②只把实际exe改为executor，或四UID中仅一项不符，必须得到对应有限标签、不能从启动登记判manager/匹配；③只改后侧invocation或startticks，完整窗口必须拒绝且不补读重试；④内层占满原grant及最大合法小包/实际1024与1025字节，前者按used+真实JSON计费，超限/父截止仍拒，旧checkpoint不丢；⑤fake PID1的basic active/jobs空，仍必须internal=not_observed，并断言没有用户连接、没有误用系统查询当用户内部状态。另以同一夹具确认idle/ready成功shape与原命令数不变，不把纯fixture绿写成真实READY修复。
+
+这只让下一证据从“整个后备包被拒”收敛到“同代实际映像/凭据已观察，或明确是哪一个有限门未取得”。若根要求一次取得内部basic及pending jobs，则当前方案**不足以授权该真实试验**：应先独立审定读取通道及硬接收边界，而不是给现有system bus换个查询名、重写D-Bus协议或把无日志当阴性结果。上述合同已获准推进下述纯fixture及实施；它不授权native20。
+
+### exe小片的首轮旧实现red（根已收终态）
+
+根已接受上述最小exe/四UID合同。首轮red冻结点仅新 `tests/test_managed_native_instance.py` 和本文改动，生产未动；根已真实运行收齐5 failed/pytest 0.14秒，守卫635毫秒/66.6 MiB/swap0/exit1，一项仍走diagnose-setup、一项拒新variant、三项缺窄helper。五个节点复用既有Commands/context_reader并禁止真实子进程：
+
+- `test_failed_bound_manager_replaces_large_fallback_and_charges_actual_packet_once`：经真实协调器prepare及observe_setup，旧实现仍调用diagnose-setup，必须red；新合同只调用一次diagnose-manager-instance，并把授权占满的used与实际小包各计一次，保留首因/0事务。
+- `test_compact_setup_requires_exact_same_instance_and_never_invents_internal_state`：完整fixture_result应接受新小variant、拒额外键/类型错/锚点不符/内部伪READY；旧实现严格旧setup拒新包，必须red。最大字段真实JSON同时断言小于300字节。
+- `test_instance_helper_reads_actual_image_and_all_four_uids_without_environment[executor]`、`[one-uid-mismatch]`、`[ticks-drift]`：缺少窄helper为旧红；随后必须实际走已有proc解析的注入缝隙，分别验证executor、仅一个UID不符、后侧ticks漂移拒绝。保留两遍固定读取、实际字节计费、内层≤512及无env/路径泄漏断言，不用一份预设“好结果”代替helper执行。
+
+根取得上述真实旧红后授权生产及其余期限/丢返回/后Unit漂移反例。当前实施范围仍只有两脚本、新独立测试、本文；另经根单独批准，仅将旧checkpoint测试的合法锚点耗尽fallback断言由diagnostic_code迁为code/reason，保留历史checkpoint、首因、0命令及计费原断言。未自行检查、Git、联网或启动任何真实服务；以下是待根实际验证的实施边界。
+
+### exe小片实施冻结与窄验证入口（待根实测）
+
+- `NativeCI.observe_setup` 只对合法observed checkpoint提前分流并return；不再跟一次旧diagnose-setup。`observe_manager_instance` 复用原5秒与execute_deadline的较早者，父余额≤1024或已到期不启动命令，只保存output_budget/timeout小包。原observe_manager先保存首因及checkpoint的路径、manager-idle/ready成功门和无锚点旧诊断不变。
+- worker `diagnose_manager_instance` 最多五条原SystemdProbe系统bus查询加一次窄root子命令。root helper `read_manager_instance` 两遍stat/status/cgroup/exe，复用_start_ticks/_cgroup/_read_regular及受信映像发现；既查全部四UID值也比较两遍值，稳定不符是mismatch，只有中途漂移才是identity_changed。两侧Unit/Service属性、进程startticks/所属cgroup/实际exe/四UID及账户身份均须连续，完整门后才发布observed。内部basic/jobs无观察，固定not_observed。
+- `_SetupIO.instance` 先占原raw grant；两管道内层wire实际计费且≤512，固定五键、去重JSON、严格used与标签验证完成后，仅退raw grant减actual used一次。丢回包/命令异常保守耗满原worker grant；已收到但语义不合法的包不退raw grant，已知wire仍计费。父侧同样先占raw grant，收到合法、同锚点、及时且≤1024整个CLI回复后，才以真实used＋真实wire替代占用；父call丢失返回或在内部拒绝过期回复时，保守占满原32768总量。过期/超限/身份错只保存not_observed，不覆盖首因。
+- 输入/协议违反硬上限时不能发布observed。实际run_process仍硬限内层wire；注入夹具故意返回超额wire会被拒绝并耗满原grant，外层not_observed的used钳到原grant，不能输出更大的数字令小包再次整包拒绝。此失败包不声称额外字节曾在真实硬门内合法接收。
+
+新独立测试的主要节点：`test_compact_parent_accepts_only_bounded_timely_same_instance_reply`（实际1024/1025、父截止、丢回复、坏used、异锚点）；`test_compact_worker_binds_both_bus_sides_without_pid1_internal_inference`（正向窗口、后invocation/PID/cgroup漂移、内层丢返回、真实typed ProcessOutputLimitError分类、PID1伪basic/jobs正向陷阱）；`test_inner_reply_never_refunds_an_unvalidated_raw_grant`（耗满raw grant、513字节内层wire、重复键、未知UID正文）；`test_no_bound_checkpoint_keeps_existing_large_diagnostic_contract`（原五键与not_observed锚点）；root helper另补实际exe和单UID中途漂移，不能从稳定初始值宣称完整窗口。新文件当前26个参数节点；旧成功门继续由原managed-native整组回归验证，本片没有改它们。
+
+根可先通过主仓守卫串行运行新独立文件及 `tests/test_managed_native_checkpoint.py`，再与原native及四项OutputBudget整合；随后两脚本strict mypy、所改Python的Ruff/format。所有命令仍须主仓绝对路径check_local.py、每项≤30秒，只有真实终态才记录通过。纯fixture绿仍不能证明现场余额足以完成两遍status、manager进入内部初始化或真实READY；没有安全的user内部观察通道，本文不授权native20。
+
+### 根验证检查点（2026-10-24）
+
+独立Sol冻结后复审确认无剩余P1/P2。期间发现真实`ProcessOutputLimitError`未按output_budget分类的窄P2，已复用现有异常类型并补真实异常类注入；没有扩大wire或原授权。根首个新instance＋旧checkpoint检查为79 passed/1 failed，唯一失败是旧oversized测试仍用合法observed锚点却要求走diagnose-setup。该分支已被新小包明确替换，不能伪称原实现仍该走旧命令。
+
+根将此旧节点明确命名legacy_fallback、只把其checkpoint改为真实合法not_observed，使它继续验旧大包1025字节、原超额计费、历史/首因保留和零事务。新26参数的合法observed覆盖新小包1024/1025及同样保留边界；另一Sol读回确认两分支没有混淆。修正后两文件80 passed（pytest0.24秒、守卫735毫秒、64MiB/swap0）；三文件完整native整合586 passed（pytest1.65秒、守卫2.250秒、120.8MiB/swap0）；独立OutputBudget四项passed、八项deselected（守卫511毫秒、53.6MiB/swap0），均实际exit0。586包含80，不重复累计。
+
+严格类型初查未指定源码路径，将原导入推为Any并报十项；显式MYPYPATH后仅剩新variant的setup可能为None这一真实收窄缺口。根只在原predicate前增加等价的isinstance(dict)门，未放宽验证，另一Sol读回无P1/P2。最终`MYPYPATH=src:tests`、strict/no-incremental/explicit-package-bases两脚本通过，守卫5.348秒、285.1MiB/swap0；改后完整三文件586项再验通过（pytest1.67秒、守卫2.283秒、120.8MiB/swap0），不与此前结果重复累计。
+
+四份改动Python最终Ruff和格式检查均通过；根统一格式化三份、另一份原样。以上全部在主仓check_local.py原30秒守卫串行运行，实际exit0，未触发原生服务、账户或真实桌面效果，无网络或下载。本片不是READY或cleanup修复，也未启动native20。

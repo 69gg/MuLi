@@ -1087,6 +1087,150 @@ def context_socket(path: Path, owner: int) -> str:
         os.close(descriptor)
 
 
+def instance_projection(value: object) -> dict[str, Any]:
+    require(
+        isinstance(value, dict) and set(value) == {"code", "reason", "exe", "uids", "used"},
+        "native_diagnostic_invalid",
+    )
+    assert isinstance(value, dict)
+    require(
+        type(value["used"]) is int
+        and 0 <= value["used"] <= MAX_BYTES
+        and (
+            (
+                value["code"] == "observed"
+                and value["reason"] == "none"
+                and value["exe"] in ("manager", "executor", "other")
+                and value["uids"] in ("all_expected", "mismatch")
+            )
+            or (
+                value["code"] == "not_observed"
+                and value["reason"]
+                in ("timeout", "output_budget", "identity_changed", "invalid_reply", "unavailable")
+                and value["exe"] == "unavailable"
+                and value["uids"] == "unavailable"
+            )
+        ),
+        "native_diagnostic_invalid",
+    )
+    return dict(value)
+
+
+def instance_unavailable(reason: str, used: int) -> dict[str, Any]:
+    return {
+        "code": "not_observed",
+        "reason": reason,
+        "exe": "unavailable",
+        "uids": "unavailable",
+        "used": used,
+    }
+
+
+def instance_error(error: BaseException) -> str:
+    from muli.process import ProcessOutputLimitError
+
+    if isinstance(error, ProcessOutputLimitError):
+        return "output_budget"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    return {
+        "native_process_changed": "identity_changed",
+        "native_deadline_exceeded": "timeout",
+        "native_diagnostic_output_budget": "output_budget",
+    }.get(str(error), "unavailable" if isinstance(error, OSError) else "invalid_reply")
+
+
+def read_manager_instance(
+    pid: int,
+    uid: int,
+    ticks: int,
+    group: str,
+    deadline: float,
+    limit: int,
+) -> dict[str, Any]:
+    """Two bounded proc bindings; no environment, socket, journal or internal bus."""
+    from muli.platforms.linux_transaction import _cgroup, _read_regular, _start_ticks
+
+    used = 0
+    try:
+        require(
+            os.geteuid() == 0
+            and type(pid) is int
+            and 0 < pid < 2**31
+            and type(uid) is int
+            and 0 < uid < 2**31
+            and type(ticks) is int
+            and 0 <= ticks < 2**64
+            and bool(_cgroup(group))
+            and Path(group).name == f"user@{uid}.service"
+            and type(limit) is int
+            and 0 < limit <= MAX_BYTES,
+            "native_diagnostic_invalid",
+        )
+        require(
+            math.isfinite(deadline) and remaining(deadline) <= CLEANUP_SECONDS,
+            "native_diagnostic_invalid",
+        )
+        root = Path("/proc") / str(pid)
+        known = system_executables()
+
+        def read(name: str) -> bytes:
+            nonlocal used
+            remaining(deadline)
+            require(used < limit, "native_diagnostic_output_budget")
+            data = _read_regular(root / name, limit - used)
+            used += len(data)
+            require(used <= limit, "native_diagnostic_output_budget")
+            remaining(deadline)
+            return data
+
+        def binding() -> tuple[int, tuple[int, ...], str, str]:
+            nonlocal used
+            start = _start_ticks(read("stat"), pid)
+            rows = [
+                row.split()[1:] for row in read("status").splitlines() if row.startswith(b"Uid:")
+            ]
+            require(
+                len(rows) == 1
+                and len(rows[0]) == 4
+                and all(re.fullmatch(rb"[0-9]{1,10}", item) for item in rows[0]),
+                "native_diagnostic_invalid",
+            )
+            identities = tuple(int(item) for item in rows[0])
+            require(all(item < 2**32 for item in identities), "native_diagnostic_invalid")
+            groups = read("cgroup").decode("ascii").splitlines()
+            require(len(groups) == 1 and groups[0].startswith("0::"), "native_diagnostic_invalid")
+            current = _cgroup(groups[0][3:])
+            require(current == group or current.startswith(group + "/"), "native_process_changed")
+            image = os.readlink(root / "exe")
+            used += len(os.fsencode(image))
+            require(used <= limit, "native_diagnostic_output_budget")
+            remaining(deadline)
+            require(start == ticks, "native_process_changed")
+            require(
+                image.startswith("/") and not any(char in image for char in "\x00\r\n"),
+                "native_diagnostic_invalid",
+            )
+            return start, identities, current, image
+
+        before = binding()
+        require(before == binding(), "native_process_changed")
+        remaining(deadline)
+        image = before[3]
+        return {
+            "code": "observed",
+            "reason": "none",
+            "exe": next(
+                (key for key in ("manager", "executor") if known.get(key) == image), "other"
+            ),
+            "uids": "all_expected" if before[1] == (uid,) * 4 else "mismatch",
+            "used": used,
+        }
+    except Exception as error:
+        # A partial/failed read has no reusable allowance; retain no positive tags.
+        return instance_unavailable(instance_error(error), limit)
+
+
 def read_setup_context(
     pid: int,
     uid: int,
@@ -1687,6 +1831,52 @@ class _SetupIO:
         self.charge(data)
         return data
 
+    async def instance(self, pid: int, uid: int, ticks: int, group: str) -> dict[str, Any]:
+        allowance = self.limit - self.used - CONTEXT_REPLY_BYTES
+        require(allowance > 0, "native_diagnostic_output_budget")
+        self.used += allowance
+        try:
+            result = await self.command(
+                [
+                    "sudo",
+                    "--non-interactive",
+                    "--",
+                    sys.executable,
+                    "-I",
+                    str(Path(__file__).resolve()),
+                    "project-manager-instance",
+                    str(pid),
+                    str(uid),
+                    str(ticks),
+                    group,
+                    str(self.deadline),
+                    str(allowance),
+                ],
+                timeout=remaining(self.deadline),
+                limit=CONTEXT_REPLY_BYTES,
+            )
+        except (Exception, asyncio.CancelledError):
+            self.used = self.limit
+            raise
+        require(result.get("exit_code") == 0, "native_diagnostic_invalid")
+        require(
+            len(result["output"].encode()) + len(result["stderr"].encode()) <= CONTEXT_REPLY_BYTES,
+            "native_diagnostic_output_budget",
+        )
+
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
+            for key, item in pairs:
+                require(key not in value, "native_diagnostic_invalid")
+                value[key] = item
+            return value
+
+        value = instance_projection(json.loads(result["output"], object_pairs_hook=unique))
+        require(value["used"] <= allowance, "native_diagnostic_invalid")
+        # command() charged the inner wire; only unused raw proc allowance is refunded.
+        self.used -= allowance - value["used"]
+        return value
+
     async def context(self, pid: int, uid: int, ticks: int, group: str) -> dict[str, str]:
         # This inner wire reserve comes from the existing allowance, not in addition to it.
         wire_limit = CONTEXT_REPLY_BYTES
@@ -2146,6 +2336,138 @@ async def manager_state(
             result["code"] = "native_diagnostic_output_budget"
     result["used"] = io.used
     return result
+
+
+def manager_instance_anchor(checkpoint: object) -> dict[str, Any]:
+    require(isinstance(checkpoint, dict), "native_diagnostic_invalid")
+    assert isinstance(checkpoint, dict)
+    require(
+        set(checkpoint) == {"version", "code", "elapsed_ms", "runtime", "manager"}
+        and type(checkpoint["version"]) is int
+        and checkpoint["version"] == 1
+        and checkpoint["code"] == "observed"
+        and type(checkpoint["elapsed_ms"]) is int
+        and 0 <= checkpoint["elapsed_ms"] <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 1000,
+        "native_diagnostic_invalid",
+    )
+    for name in ("runtime", "manager"):
+        item = checkpoint[name]
+        require(
+            isinstance(item, dict)
+            and set(item)
+            == {"active_state", "sub_state", "job"}
+            | ({"pid", "start_ticks", "invocation"} if name == "manager" else set()),
+            "native_diagnostic_invalid",
+        )
+        require(
+            item["active_state"] in ("active", "activating", "inactive")
+            and isinstance(item["sub_state"], str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", item["sub_state"]) is not None
+            and type(item["job"]) is int
+            and 0 <= item["job"] < 2**31
+            and not (item["active_state"] == "inactive" and item["job"] == 0),
+            "native_diagnostic_invalid",
+        )
+    anchor = checkpoint["manager"]
+    require(
+        type(anchor["pid"]) is int
+        and 0 < anchor["pid"] < 2**31
+        and type(anchor["start_ticks"]) is int
+        and 0 <= anchor["start_ticks"] < 2**64
+        and isinstance(anchor["invocation"], str)
+        and re.fullmatch(r"[a-f0-9]{32}", anchor["invocation"]) is not None
+        and anchor["invocation"] != "0" * 32,
+        "native_diagnostic_invalid",
+    )
+    return {key: anchor[key] for key in ("pid", "start_ticks", "invocation")}
+
+
+async def diagnose_manager_instance(
+    user: str,
+    uid: int,
+    home: Path,
+    deadline: float,
+    byte_limit: int,
+    checkpoint: object,
+) -> dict[str, Any]:
+    """A later system-manager/proc identity window, not a deadline snapshot."""
+    import pwd
+
+    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe, _cgroup
+
+    anchor = manager_instance_anchor(checkpoint)
+    require(type(uid) is int and 0 < uid < 2**31, "native_diagnostic_identity")
+    require(
+        type(byte_limit) is int and 0 < byte_limit <= MAX_BYTES - 1024,
+        "native_diagnostic_output_budget",
+    )
+    facts = {
+        "version": 1,
+        "uid": uid,
+        **anchor,
+        "internal": "not_observed",
+        **instance_unavailable("invalid_reply", 0),
+    }
+    io = _SetupIO(deadline, byte_limit, {})
+    try:
+        require(
+            re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None and home.is_absolute(),
+            "native_diagnostic_identity",
+        )
+        require(
+            math.isfinite(deadline) and remaining(deadline) <= CLEANUP_SECONDS,
+            "native_diagnostic_invalid",
+        )
+        account = pwd.getpwnam(user)
+        require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_diagnostic_identity")
+        async with asyncio.timeout(remaining(deadline)):
+            probe = SystemdProbe(
+                runner=io.query,
+                limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+            )
+            path = await probe._unit_path(f"user@{uid}.service")
+
+            async def binding() -> tuple[dict[str, Any], dict[str, Any]]:
+                unit = await probe._properties(path, "Unit", (("Id", "s"), ("InvocationID", "ay")))
+                service = await probe._properties(
+                    path, "Service", (("MainPID", "u"), ("ControlGroup", "s"))
+                )
+                invocation = unit["InvocationID"]
+                require(
+                    isinstance(invocation, list)
+                    and len(invocation) == 16
+                    and all(type(item) is int and 0 <= item <= 255 for item in invocation),
+                    "native_diagnostic_invalid",
+                )
+                group = _cgroup(service["ControlGroup"])
+                require(
+                    unit["Id"] == f"user@{uid}.service"
+                    and bytes(invocation).hex() == anchor["invocation"]
+                    and type(service["MainPID"]) is int
+                    and service["MainPID"] == anchor["pid"]
+                    and bool(group)
+                    and Path(group).name == f"user@{uid}.service",
+                    "native_process_changed",
+                )
+                return unit, service
+
+            before = await binding()
+            projected = await io.instance(
+                anchor["pid"], uid, anchor["start_ticks"], before[1]["ControlGroup"]
+            )
+            if projected["code"] == "observed":
+                require(before == await binding(), "native_process_changed")
+                account = pwd.getpwnam(user)
+                require(
+                    (account.pw_uid, account.pw_dir) == (uid, str(home)), "native_process_changed"
+                )
+            remaining(deadline)
+            facts.update({key: projected[key] for key in ("code", "reason", "exe", "uids")})
+    except Exception as error:
+        facts.update(instance_unavailable(instance_error(error), 0))
+    facts["used"] = min(io.used, byte_limit)
+    # All strings/integers above are fixed or bounded; the complete CLI JSON is <1024B.
+    return facts
 
 
 async def diagnose_setup(
@@ -2976,6 +3298,37 @@ async def run(mode: str, root: Path) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 8 and sys.argv[1] == "project-manager-instance":
+        try:
+            value = read_manager_instance(
+                int(sys.argv[2]),
+                int(sys.argv[3]),
+                int(sys.argv[4]),
+                sys.argv[5],
+                float(sys.argv[6]),
+                int(sys.argv[7]),
+            )
+        except Exception:
+            value = instance_unavailable("invalid_reply", MAX_BYTES)
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
+    if len(sys.argv) == 8 and sys.argv[1] == "diagnose-manager-instance":
+        try:
+            value = asyncio.run(
+                diagnose_manager_instance(
+                    sys.argv[2],
+                    int(sys.argv[3]),
+                    Path(sys.argv[4]),
+                    float(sys.argv[5]),
+                    int(sys.argv[6]),
+                    json.loads(sys.argv[7]),
+                )
+            )
+        except Exception:
+            # Malformed arguments must never export arbitrary exception text.
+            value = {"code": "native_diagnostic_invalid", "used": MAX_BYTES}
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
     if len(sys.argv) == 9 and sys.argv[1] == "bootstrap-files":
         try:
             value = bootstrap_files(

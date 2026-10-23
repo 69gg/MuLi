@@ -1,0 +1,457 @@
+"""Small native failure receipts; all commands, proc data and accounts are injected."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+import pytest
+from test_managed_native_checkpoint import observed_round
+from test_managed_native_ci import Commands, ci, worker
+from test_managed_native_ci import context_reader as context_reader
+from test_managed_native_ci import fixture as fixture
+from test_managed_native_ci import forbid_real_effects as forbid_real_effects
+from test_managed_native_ci import manager_observation as manager_observation
+
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux-only CI coordinator")
+
+
+def instance_packet(uid: int = 23145) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "code": "observed",
+        "reason": "none",
+        "uid": uid,
+        "pid": 42,
+        "start_ticks": 100,
+        "invocation": "0a" * 16,
+        "exe": "manager",
+        "uids": "all_expected",
+        "internal": "not_observed",
+        "used": 128,
+    }
+
+
+def failed_result(packet: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "completed": False,
+        "stage": "manager_setup",
+        "code": "setup_failed",
+        "timeline": [],
+        "generations": [],
+        "resources": {
+            "setup": packet,
+            "manager_failure": {
+                "code": "native_deadline_exceeded",
+                "stage": "manager_validation",
+                "query_status": 0,
+                "query_code": "ok",
+                "used": 1,
+                "last_completed_round": observed_round(),
+            },
+        },
+    }
+
+
+def test_failed_bound_manager_replaces_large_fallback_and_charges_actual_packet_once(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    native.receipt.setup_phase = "manager_show_before"
+    packet = instance_packet(commands.uid)
+    native.manager_failure = failed_result(packet)["resources"]["manager_failure"]
+    native.save_setup_result({})
+    before = native.setup_bytes
+    calls: list[tuple[str, ...]] = []
+    wire = b""
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal wire
+        values = tuple(argv)
+        calls.append(values)
+        assert values[:4] == (
+            sys.executable,
+            "-I",
+            str(Path(worker.__file__).resolve()),
+            "diagnose-manager-instance",
+        ), "old large fallback must be replaced, not followed by another command"
+        assert len(values) == 10 and 0 < seconds <= ci.CLEANUP_SECONDS
+        assert json.loads(values[9]) == observed_round()
+        packet["used"] = int(values[8])
+        assert packet["used"] == ci.OUTPUT_BYTES - before - 1024
+        wire = (json.dumps(packet, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        assert len(wire) <= 1024
+        return ci.Reply(0, wire)
+
+    native.run = run
+    native.observe_setup(ci.FixtureError("native_deadline_exceeded"))
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert saved["resources"]["setup"] == packet and len(calls) == 1
+    assert saved["resources"]["manager_failure"] == native.manager_failure
+    assert saved["timeline"] == [] and saved["generations"] == []
+    assert native.setup_bytes == before + packet["used"] + len(wire) <= ci.OUTPUT_BYTES
+
+
+def test_compact_setup_requires_exact_same_instance_and_never_invents_internal_state() -> None:
+    packet = instance_packet()
+    value = failed_result(packet)
+    assert ci.fixture_result(json.dumps(value).encode()) == value
+    largest = {
+        **packet,
+        "code": "not_observed",
+        "reason": "identity_changed",
+        "uid": 2**31 - 1,
+        "pid": 2**31 - 1,
+        "start_ticks": 2**64 - 1,
+        "invocation": "f" * 32,
+        "exe": "unavailable",
+        "uids": "unavailable",
+        "used": ci.OUTPUT_BYTES - 1024,
+    }
+    assert len((json.dumps(largest, separators=(",", ":")) + "\n").encode()) <= 300
+    for field, bad in (
+        ("invocation", "ff" * 16),
+        ("pid", 43),
+        ("start_ticks", 101),
+        ("version", True),
+        ("internal", "ready"),
+        ("extra", "must-not-escape"),
+    ):
+        corrupted = deepcopy(value)
+        corrupted["resources"]["setup"][field] = bad
+        with pytest.raises(ci.FixtureError, match="native_result_invalid"):
+            ci.fixture_result(json.dumps(corrupted).encode())
+
+
+@pytest.mark.parametrize(
+    "case", ["executor", "one-uid-mismatch", "ticks-drift", "image-drift", "uid-drift"]
+)
+def test_instance_helper_reads_actual_image_and_all_four_uids_without_environment(
+    context_reader: dict[str, Any], monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from muli.platforms import linux_transaction
+
+    read_instance = getattr(worker, "read_manager_instance", None)
+    assert callable(read_instance), "missing bounded same-instance proc projection"
+    control = context_reader
+    control["change"] = "ticks" if case == "ticks-drift" else "none"
+    original = linux_transaction._read_regular
+    charged: list[int] = []
+    images: list[Path] = []
+    known = {"manager": "/usr/lib/systemd/systemd", "executor": "/usr/lib/systemd/systemd-executor"}
+    monkeypatch.setattr(worker, "system_executables", lambda: known)
+
+    def read(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        assert path.name in {"stat", "status", "cgroup"}, "no environ/wchan or recovery read"
+        data = original(path, limit, directory_fd=directory_fd)
+        if path.name == "status" and (
+            case == "one-uid-mismatch" or case == "uid-drift" and control["round"] > 1
+        ):
+            data = b"Uid:\t23145 23145 23145 0\n"
+        assert len(data) <= limit
+        charged.append(len(data))
+        return data
+
+    def image(path: Path) -> str:
+        assert path == Path("/proc/42/exe")
+        images.append(path)
+        result = known[
+            "executor"
+            if case == "executor" or case == "image-drift" and len(images) > 1
+            else "manager"
+        ]
+        charged.append(len(os.fsencode(result)))
+        return result
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", read)
+    monkeypatch.setattr(os, "readlink", image)
+    limit = 4096
+    result = read_instance(42, 23145, 100, "/user.slice/user@23145.service", 105.0, limit)
+    assert set(result) == {"code", "reason", "exe", "uids", "used"}
+    if case in {"ticks-drift", "image-drift", "uid-drift"}:
+        assert result == {
+            "code": "not_observed",
+            "reason": "identity_changed",
+            "exe": "unavailable",
+            "uids": "unavailable",
+            "used": limit,
+        }
+    else:
+        assert result["code"] == "observed" and result["reason"] == "none"
+        assert result["exe"] == ("executor" if case == "executor" else "manager")
+        assert result["uids"] == ("mismatch" if case == "one-uid-mismatch" else "all_expected")
+        assert result["used"] == sum(charged) and len(images) == 2
+        assert [name for name, _ in control["reads"]] == ["stat", "status", "cgroup"] * 2
+    assert len((json.dumps(result, separators=(",", ":")) + "\n").encode()) <= 512
+    assert not any(
+        value in json.dumps(result) for value in ("never-export-me", "/usr/lib", "/proc")
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["1024", "1025", "parent-timeout", "lost-reply", "bad-used", "wrong-instance"]
+)
+def test_compact_parent_accepts_only_bounded_timely_same_instance_reply(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    native.receipt.setup_phase = "manager_show_before"
+    packet = instance_packet(commands.uid)
+    native.manager_failure = failed_result(packet)["resources"]["manager_failure"]
+    native.save_setup_result({})
+    first = deepcopy(native.manager_failure)
+    clock = [100.0]
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock[0])
+    native.execute_deadline = 105.0
+    before = native.setup_bytes
+    calls: list[tuple[str, ...]] = []
+    wire = b""
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal wire
+        values = tuple(argv)
+        assert values[3] == "diagnose-manager-instance" and seconds <= 5
+        calls.append(values)
+        if case == "lost-reply":
+            raise ci.FixtureError("native_command_timeout")
+        packet["used"] = int(values[8]) + 1 if case == "bad-used" else 1
+        if case == "wrong-instance":
+            packet["invocation"] = "ff" * 16
+        wire = (json.dumps(packet, separators=(",", ":")) + "\n").encode()
+        if case in {"1024", "1025"}:
+            wire = wire.ljust(int(case), b" ")
+        if case == "parent-timeout":
+            clock[0] = 105.0
+        return ci.Reply(0, wire)
+
+    native.run = run
+    native.observe_setup(ci.FixtureError("native_deadline_exceeded"))
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    facts = saved["resources"]["setup"]
+    assert len(calls) == 1 and saved["resources"]["manager_failure"] == first
+    assert saved["timeline"] == [] and saved["generations"] == []
+    if case == "1024":
+        assert facts == packet
+        assert native.setup_bytes == before + 1 + 1024
+    else:
+        assert facts["code"] == "not_observed" and facts["exe"] == facts["uids"] == "unavailable"
+        assert facts["reason"] == (
+            "timeout"
+            if case in {"parent-timeout", "lost-reply"}
+            else "output_budget"
+            if case == "1025"
+            else "invalid_reply"
+        )
+        assert facts["used"] == ci.OUTPUT_BYTES - before - 1024
+        assert native.setup_bytes == (
+            ci.OUTPUT_BYTES
+            if case in {"1025", "parent-timeout", "lost-reply"}
+            else ci.OUTPUT_BYTES - 1024 + len(wire)
+        )
+    assert native.setup_bytes <= ci.OUTPUT_BYTES
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "manager",
+        "after-invocation",
+        "after-pid",
+        "after-group",
+        "lost-inner",
+        "inner-output-budget",
+        "pid1-ready",
+    ],
+)
+async def test_compact_worker_binds_both_bus_sides_without_pid1_internal_inference(
+    manager_observation: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    from muli import process
+
+    control = manager_observation
+    control["states"] = ["activating"]
+    original = process.run_process
+    returned_bytes: list[int] = []
+    raw_grants: list[int] = []
+    inner_used = 128
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        if argv[:3] == ["sudo", "--non-interactive", "--"]:
+            assert argv[6] == "project-manager-instance" and len(argv) == 13
+            assert argv[7:11] == ["42", str(control["uid"]), "100", control["group"]]
+            assert float(argv[11]) == 105.0 and limit == worker.CONTEXT_REPLY_BYTES
+            control["calls"].append(argv)
+            raw_grants.append(int(argv[12]))
+            if case == "lost-inner":
+                raise TimeoutError
+            if case == "inner-output-budget":
+                raise process.ProcessOutputLimitError("private diagnostic text must not escape")
+            data = {
+                "code": "observed",
+                "reason": "none",
+                "exe": "manager",
+                "uids": "all_expected",
+                "used": inner_used,
+            }
+            result = {
+                "exit_code": 0,
+                "output": json.dumps(data, separators=(",", ":")) + "\n",
+                "stderr": "",
+            }
+            if case == "after-invocation":
+                control["overrides"]["InvocationID"] = [11] * 16
+            elif case == "after-pid":
+                control["overrides"]["MainPID"] = 43
+            elif case == "after-group":
+                control["overrides"]["ControlGroup"] = "/other/user@23145.service"
+        else:
+            # PID1 is the only bus peer used by _SetupIO; its internal basic/jobs
+            # look ready in this trap, but cannot become user-manager evidence.
+            if case == "pid1-ready" and ("basic.target" in argv or "ListJobs" in argv):
+                assert argv[:2] == ["busctl", "--system"]
+                control["calls"].append(argv)
+                result = {
+                    "exit_code": 0,
+                    "stderr": "",
+                    "output": json.dumps(
+                        {"type": "a(usssoo)", "data": [[]]}
+                        if "ListJobs" in argv
+                        else {"type": "s", "data": "active"}
+                    ),
+                }
+            else:
+                assert "basic.target" not in argv and "ListJobs" not in argv
+                assert "ListUnitsByPatterns" not in argv and "--user" not in argv
+                result = await original(
+                    argv, timeout=timeout, limit=limit, merge_stderr=merge_stderr
+                )
+        returned_bytes.append(len(result["output"].encode()) + len(result["stderr"].encode()))
+        return result
+
+    monkeypatch.setattr(process, "run_process", query)
+    packet = await worker.diagnose_manager_instance(
+        control["user"],
+        control["uid"],
+        control["home"],
+        105.0,
+        4096,
+        observed_round(),
+    )
+    assert ci.manager_instance_facts(packet) and packet["internal"] == "not_observed"
+    assert ci.manager_instance_matches(packet, observed_round())
+    if case in {"manager", "pid1-ready"}:
+        assert packet["code"] == "observed" and packet["exe"] == "manager"
+        assert packet["used"] == sum(returned_bytes) + inner_used
+        assert len(control["calls"]) == 6
+    else:
+        assert packet["code"] == "not_observed" and packet["exe"] == packet["uids"] == "unavailable"
+        assert packet["reason"] == (
+            "timeout"
+            if case == "lost-inner"
+            else "output_budget"
+            if case == "inner-output-budget"
+            else "identity_changed"
+        )
+        if case in {"lost-inner", "inner-output-budget"}:
+            assert packet["used"] == 4096 and len(control["calls"]) == 4
+        else:
+            assert packet["used"] == sum(returned_bytes) + inner_used
+            assert len(control["calls"]) == 6
+    assert len(raw_grants) == 1 and 0 < raw_grants[0] < 4096
+    assert all("basic.target" not in argv and "ListJobs" not in argv for argv in control["calls"])
+    assert control["files"] == []
+    assert len((json.dumps(packet, separators=(",", ":")) + "\n").encode()) <= 1024
+    assert "private diagnostic text" not in json.dumps(packet)
+
+
+@pytest.mark.parametrize("case", ["inner-budget", "wire-oversize", "duplicate-key", "bad-uid-tag"])
+async def test_inner_reply_never_refunds_an_unvalidated_raw_grant(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    from muli import process
+
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 100.0)
+    io = worker._SetupIO(105.0, 4096, {})
+    raw_grant = 4096 - worker.CONTEXT_REPLY_BYTES
+    wire = ""
+
+    async def run(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal wire
+        assert argv[6] == "project-manager-instance" and int(argv[-1]) == raw_grant
+        assert limit == worker.CONTEXT_REPLY_BYTES and not merge_stderr
+        data = {
+            "code": "not_observed",
+            "reason": "output_budget",
+            "exe": "unavailable",
+            "uids": "unavailable",
+            "used": raw_grant,
+        }
+        if case == "bad-uid-tag":
+            data["uids"] = "23145 23145 23145 0"
+        wire = json.dumps(data, separators=(",", ":")) + "\n"
+        if case == "wire-oversize":
+            wire = wire.ljust(worker.CONTEXT_REPLY_BYTES + 1)
+        elif case == "duplicate-key":
+            wire = wire.replace('"used":', '"used":0,"used":')
+        return {"exit_code": 0, "output": wire, "stderr": ""}
+
+    monkeypatch.setattr(process, "run_process", run)
+    if case == "inner-budget":
+        result = await io.instance(42, 23145, 100, "/user.slice/user@23145.service")
+        assert result["code"] == "not_observed" and result["reason"] == "output_budget"
+    else:
+        with pytest.raises(worker.NativeError):
+            await io.instance(42, 23145, 100, "/user.slice/user@23145.service")
+    if case == "wire-oversize":
+        assert io.used == 4096
+    else:
+        assert io.used == raw_grant + len(wire.encode())
+
+
+@pytest.mark.parametrize("case", ["absent", "not-observed"])
+def test_no_bound_checkpoint_keeps_existing_large_diagnostic_contract(
+    fixture: tuple[Any, Commands],
+    case: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    native.receipt.setup_phase = "manager_show_before"
+    native.manager_failure = failed_result(instance_packet(commands.uid))["resources"][
+        "manager_failure"
+    ]
+    if case == "absent":
+        del native.manager_failure["last_completed_round"]
+    else:
+        native.manager_failure["last_completed_round"] = {"version": 1, "code": "not_observed"}
+    before = native.setup_bytes
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        values = tuple(argv)
+        calls.append(values)
+        assert values[3] == "diagnose-setup" and 0 < seconds <= 5
+        return ci.Reply(1, b"")
+
+    native.run = run
+    native.observe_setup(ci.FixtureError("native_deadline_exceeded"))
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    facts = saved["resources"]["setup"]
+    assert len(calls) == 1 and facts["uid"] == commands.uid
+    assert facts["diagnostic_status"] == 1 and facts["diagnostic_code"] == "command_failed"
+    assert not ci.manager_instance_facts(facts) and native.setup_bytes == before
+    assert saved["resources"]["manager_failure"] == native.manager_failure
