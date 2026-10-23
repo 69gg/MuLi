@@ -104,3 +104,37 @@ PR37 的原生 systemd 服务整链已通过，也不把旧超时全部归因于
 峰值 272.9 MiB，全部 swap 0。每项检查仍在原 30 秒资源守卫内完成。
 本轮没有运行真实成功/回退参数；冷启动减幅与完整真实链须由新精确 CI 在原 20 秒内验收，
 不以纯 argv 回归代替真实 CLI、nonce、DB 或进程收取证据。
+
+## main 39986758440 的回退末步证据
+
+精确候选 `13b64760fd82956e95ae961d8d7052f789657a51` 的
+[main run 39986758440](https://github.com/69gg/MuLi/actions/runs/39986758440)
+最终九项通过、一项失败；失败为
+[Linux 3.13 job 120527818116](https://github.com/69gg/MuLi/actions/runs/39986758440/job/120527818116)
+的 `target-rejected-rollback` 参数（20.43 秒）。父进程在原 20 秒期限内未收到
+`controller-resolved`，不是最终服务退出超时，也不是独立 native manager 启动失败。
+本次取证仅使用该 job 的有限日志与对应调用链，未运行本机 process 测试、服务或重跑 CI。
+
+同次诊断中，base 在 17.414 秒 ready、17.526 秒返回 paused；最终 journal 为
+revision 10、`rolled_back/none`、activation pending、code `backend_failed`。
+base 的激活 POST 为一次，`started=true/allowed=true`；target 为零次且未允许。
+这表明回退和 base 激活已经执行，pending 不能解释为回退没有执行。
+`backend_failed` 在此是事务保留的失败代码，不能单凭它断言末步又出现一次后端错误。
+
+最后完整收到的 `controller-step` 为 index 9，末两枚举值为 `6,0`，对应本步入口的
+`rolled_back/none`。该步耗时 1217 毫秒、12 次 `_check`；与实际调用链中的
+`observe` 加 `activate` 路径一致。控制器在 `activate` 返回后原样返回 pending record，
+须在后续步骤取得新的 released readiness proof、完成身份与文件复核，再持久推进
+activation 为 released，才满足 `resolved`。因此最后未完成的是激活后的新 proof 与
+released 确认；现有证据不能区分后续步骤卡在入口、同步验证、HTTP、proof 校验或持久写入。
+观察记录仅在每步 `finally` 输出，没有 index 10 的完整记录；最终收取后的 driver `-9`
+也不能证明其自然崩溃。
+
+十个已完成步骤累计 19.199 秒，其中 205 次 `_check` 累计 14.599 秒。
+controller 的 `verify_slot_files` 累计 8.486 秒，selected-role 累计 5.364 秒；
+两者是 `_check` 的子项，不能再次加到 `_check` 总量上。该观测覆盖整个文件验证函数，
+不足以将耗时直接归因于哈希，也不能据此删除验证或采用未经验证的缓存。
+本轮只记录独立只读结论与限制，不增加观察工具、不实施性能修复；原 20 秒功能期限、
+4 KiB 管道/诊断边界、最多 32 个 controller step 及所有 proof、身份、文件和业务恢复
+断言保持不变。后续若要修改末步路径，仍须先验证激活不重发、fresh proof 必需与原期限
+不续期的合同；现有证据尚不足以认定安全的生产修复。
