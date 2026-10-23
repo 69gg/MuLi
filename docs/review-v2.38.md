@@ -1,6 +1,7 @@
 # 2.38 MCP 资源附件审查
 
-状态：实现、独立后审与根离线整合验证完成，远端候选尚未运行，未发布。
+状态：实现、独立后审与根离线整合验证完成，精确候选/main 各十项、发行十三项
+全部成功，签名与 PyPI/GitHub 两构件元数据一致，已正式发布。
 
 ## 实际行为
 
@@ -67,3 +68,32 @@ write/fsync 单次取消、metadata 真实提交后丢返回及三 codec 整批�
 
 末次文档与发行入口审查纠正了 README/架构中 Windows 动作仍待验的旧表述：
 2.37 的 CI 自有按钮检查已通过，真实用户桌面仍未验收。
+
+## 精确候选与发行准入
+
+精确签名 `5ad4bd7584c99ccc4574a1968e1afafc3341f2a6` 的候选
+[`39973040645`](https://github.com/69gg/MuLi/actions/runs/39973040645) attempt 1
+十项全部成功：quality、MCP、两种 Python 的 macOS/Windows，以及 Linux 各两片。
+两个 Linux 第二片作业本次通过，不能据此称已证明修复间歇超时。
+
+根确认实际十个 job、精确 SHA、有效 GPG、远端 main 快进关系与远端标签不存在后，
+非强制原子推送 main 与签名 `v2.38.0`。标签对象为
+`290f6dafa73c419fb376f494f4d6c9076a4adc19`，验签通过；
+PR [44](https://github.com/69gg/MuLi/pull/44) 于 2026-10-23T14:59:41Z
+按原提交合入。发行
+[`39974392125`](https://github.com/69gg/MuLi/actions/runs/39974392125)
+attempt 1 十三项全部成功，没有重跑、改签或重写标签。main
+[`39974391964`](https://github.com/69gg/MuLi/actions/runs/39974391964)
+同一精确 SHA 的十项也全部成功；历史 2.37 的回退超时仍保留为未证明修复。
+
+GitHub release [`421983834`](https://github.com/69gg/MuLi/releases/tag/v2.38.0)
+于 2026-10-23T15:07:18Z 发布，资产为：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.38.0-py3-none-any.whl` | 777405 | `186084a863670d61bcd0868c2347d3efc5f2e98e4537aaa03a1d2a8039e508df` |
+| `muli_agent-2.38.0.tar.gz` | 4021288 | `0630e4b973183d596acc49429660e20ffd64bb59ef5e94ad74a9031a1faf1bfb` |
+
+直连限时、限 128 KiB 读取 [PyPI 2.38.0 JSON](https://pypi.org/pypi/muli-agent/2.38.0/json)，
+没有下载 wheel/sdist。守卫内只读核验项目名、版本、唯一两个文件、类型、未 yanked、
+字节数与 SHA-256，全部与 GitHub 元数据一致；75 毫秒、15.4 MiB、swap 0。
