@@ -360,4 +360,18 @@ worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累�
 
 独立Sol只读后审未发现确定P1/P2，已核对pending每轮同轮新读取与binding、candidate完整7命令、proc/kernel/final+stat以及原预算；根也复核核心diff与manager_state。审查没有运行检查，真实三事务未验的边界保持。此后仅按授权签名提交并推送一次精确候选，远端结果单独记录，不把纯例或独审当作实际native验收。
 
+## 第十三轮 native 有限失败取证（仅本job终态）
+
+精确签名候选 `28e0452e75047afa3acff6c2e2b63718900e953a` 的 [run 39982801787](https://github.com/69gg/MuLi/actions/runs/39982801787)、[native job 120514184291](https://github.com/69gg/MuLi/actions/runs/39982801787/job/120514184291) 已失败，job于2026-10-23 23:58:16开始、23:59:59结束（Asia/Shanghai）。本片只查该job及一次artifact列表，不查询、等待或推定其余矩阵终态。
+
+有限日志 `/tmp/muli-native-39982801787-120514184291.log` 显示事务步骤23:58:24进入、23:59:54报 `native_command_timeout`，约90.07秒包括准备和观察，不能等同manager自身等待。always cleanup于23:59:54进入、约1.38秒后报 `native_service_cleanup_failed`；本轮清理错误不是此前的 `native_cleanup_deadline`，两步骤仍均非零。
+
+仅取确认698字节的 [managed-native-evidence 12513768416](https://github.com/69gg/MuLi/actions/runs/39982801787/artifacts/12513768416)，未下载4891370字节package。zip SHA256 `a93fce61b438f997b2ab749ba9e86294633cadeb78c531e98092a1bc4723a57f` 与上传日志一致；一次30秒guard先核两个entry的固定名称、类型、数量、无加密及各不超过32 KiB，再只读receipt316字节/result525字节JSON，无解压写盘或执行。实终态exit0，81毫秒/16.5 MiB/swap 0，完成即归还共享槽，没有运行测试。
+
+- result为completed=false/manager_setup/setup_failed，timeline与generations均空，**0事务**。resources仅有setup，**没有manager_failure或manager_readiness**，所以本轮没有新的worker stage/query_status/query_code/used摘要，不能据缺失摘要判断最后一轮查询或就绪状态。
+- setup为UID999、phase=manager_show_before、client_code=timeout、diagnostic_status=null、diagnostic_code=output_budget；stage/query_code/failure均not_started，query_status=null。后备未开始不能当作本次manager查询已确定触及输出上限；第十二轮的typed预算证据也不能倒推成本轮根因。
+- 收尾后的receipt记录user_created=true、user_removed=true、group_removed=true，UID999/GID987，mounts为空，环境文件与manager_group归属记录为空，setup_phase仍manager_show_before。账户/组移除及挂载记录清空与此前轮次不同，但整体服务清理命令仍失败，**不能称正常清理或全部服务回收证明通过**。
+
+本次仅记录新事实并签名文档，不修改实现、增加预算、自动重跑或推送；不从约90秒耗尽、后备预算不足或摘要缺失倒推服务启动根因。第十三轮原生验收仍未通过，前十二轮历史保持。
+
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
