@@ -25,7 +25,7 @@ from muli.platforms.file_watch import (
 )
 from muli.proactive import FrozenRouting
 from muli.process import _wait_cleanup
-from muli.store import Store, new_id, now
+from muli.store import SQLITE_MAX_INTEGER, Store, new_id, now
 from muli.tools import Tool, parameters, string
 
 if TYPE_CHECKING:
@@ -206,7 +206,7 @@ def _valid_record(record: dict[str, Any]) -> bool:
         return False
     if type(proof["watcher_generation"]) is not int or proof["watcher_generation"] < 1:
         return False
-    if type(record["event_id"]) is not int or record["event_id"] < 1:
+    if type(record["event_id"]) is not int or not 1 <= record["event_id"] <= SQLITE_MAX_INTEGER:
         return False
     observed = record["observed_at"]
     if type(observed) not in {int, float} or not 0 <= observed < 1e12:
@@ -330,15 +330,27 @@ class FileInbox:
             raise ValueError("file_inbox_policy_invalid")
         return item
 
-    def _records(self, limit: int) -> list[dict[str, Any]]:
+    def _record_ids(self, limit: int, offset: int = 0) -> list[str]:
+        # Canonical journal IDs define arrival order, including equal or reversed
+        # wall clocks. Invalid JSON/oversized/non-text records sort last safely.
         rows = self.store.db.execute(
-            "SELECT id FROM objects WHERE kind=? ORDER BY updated DESC LIMIT ?",
-            (RECORD_KIND, limit),
+            "SELECT id FROM objects WHERE kind=? ORDER BY "
+            "CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
+            "THEN CASE WHEN json_valid(data) "
+            "THEN CASE WHEN json_type(data,'$.event_id')='integer' "
+            "THEN CASE WHEN typeof(json_extract(data,'$.event_id'))='integer' "
+            "AND json_extract(data,'$.event_id')>0 "
+            "THEN json_extract(data,'$.event_id') END END END END DESC, id DESC "
+            "LIMIT ? OFFSET ?",
+            (RECORD_KIND, _OBJECT_BYTES, limit, offset),
         ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _records(self, limit: int) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
-        for row in rows:
+        for identifier in self._record_ids(limit):
             try:
-                item = _read_object(self.store.db, RECORD_KIND, row[0], _OBJECT_BYTES)
+                item = _read_object(self.store.db, RECORD_KIND, identifier, _OBJECT_BYTES)
             except (ProjectionError, RecursionError):
                 continue
             if item is not None and _valid_record(item):
@@ -611,23 +623,19 @@ class FileInbox:
 
     def _prune_records(self) -> None:
         # No filesystem scan: retain bounded metadata and canonical producer events.
-        stale = self.store.db.execute(
-            "SELECT id FROM objects WHERE kind=? ORDER BY updated DESC LIMIT -1 OFFSET ?",
-            (RECORD_KIND, self._settings.max_records),
-        ).fetchall()
-        for row in stale:
+        for identifier in self._record_ids(-1, self._settings.max_records):
             try:
-                record = _read_object(self.store.db, RECORD_KIND, row[0], _OBJECT_BYTES)
+                record = _read_object(self.store.db, RECORD_KIND, identifier, _OBJECT_BYTES)
             except (ProjectionError, RecursionError):
                 record = None
             self.store.db.execute(
-                "DELETE FROM objects WHERE kind=? AND id=?", (RECORD_KIND, row[0])
+                "DELETE FROM objects WHERE kind=? AND id=?", (RECORD_KIND, identifier)
             )
-            if record is not None and _valid_record(record) and record["id"] == row[0]:
+            if record is not None and _valid_record(record) and record["id"] == identifier:
                 self.store.db.execute(
                     "DELETE FROM events WHERE id=? AND type=? "
                     "AND CASE WHEN json_valid(data) THEN json_extract(data,'$.id') END=?",
-                    (record["event_id"], EVENT_TYPE, row[0]),
+                    (record["event_id"], EVENT_TYPE, identifier),
                 )
 
     def _pause(self, policy: dict[str, Any], code: str) -> None:

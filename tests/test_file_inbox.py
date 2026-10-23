@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -204,7 +205,11 @@ async def test_canonical_atomic_rollback_forgery_and_stale_callback(tmp_path: Pa
         await runtime.close()
 
 
-async def test_invalid_filename_and_bounded_retention(tmp_path: Path) -> None:
+async def test_invalid_filename_and_bounded_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("muli.store.now", lambda: 1_700_000_000.0)
     runtime, inbox, directory = configured(tmp_path, max_records=1)
     try:
         await inbox.start()
@@ -297,7 +302,11 @@ async def test_corrupt_record_is_excluded_without_exception(tmp_path: Path, valu
         await runtime.close()
 
 
-async def test_retention_uses_exact_event_identity_and_keeps_other_events(tmp_path: Path) -> None:
+async def test_retention_uses_exact_event_identity_and_keeps_other_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("muli.store.now", lambda: 1_700_000_000.0)
     runtime, inbox, directory = configured(tmp_path, max_records=1)
     statements: list[str] = []
     try:
@@ -609,4 +618,99 @@ async def test_cancelled_configuration_settles_source_before_unlock(tmp_path: Pa
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await original_close()
+        await runtime.close()
+
+
+async def test_frozen_clock_lists_and_prunes_by_canonical_arrival_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("muli.store.now", lambda: 1_700_000_000.0)
+    runtime, inbox, directory = configured(tmp_path, max_records=3)
+    arrivals: dict[str, int] = {}
+    try:
+        await inbox.start()
+        for index, name in enumerate(("one", "two", "three", "four"), start=1):
+            (directory / name).write_text(name)
+            await inbox.ingest([FileSignal("moved_to", name)])
+            await eventually(lambda index=index: inbox.status()["window_count"] == index)
+            current = inbox.list_records()
+            arrivals[name] = next(
+                item["event_id"] for item in current if item["metadata"]["name"] == name
+            )
+            expected = list(reversed(("one", "two", "three", "four")[:index]))[:3]
+            assert [item["metadata"]["name"] for item in current] == expected
+            assert [item["metadata"]["name"] for item in inbox.list_records(1)] == expected[:1]
+            assert [item["metadata"]["name"] for item in inbox.list_records(2)] == expected[:2]
+        assert (
+            runtime.store.db.execute(
+                "SELECT id FROM events WHERE id=?", (arrivals["one"],)
+            ).fetchone()
+            is None
+        )
+        assert [item["event_id"] for item in inbox.list_records()] == [
+            arrivals[name] for name in ("four", "three", "two")
+        ]
+        assert (
+            runtime.store.db.execute(
+                "SELECT count(DISTINCT updated) FROM objects WHERE kind=?", (RECORD_KIND,)
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        await inbox.close()
+        await runtime.close()
+
+
+async def test_invalid_sort_keys_cannot_displace_current_canonical_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("muli.store.now", lambda: 1_700_000_000.0)
+    runtime, inbox, directory = configured(tmp_path, max_records=2)
+    try:
+        await inbox.start()
+        (directory / "one").write_text("one")
+        await inbox.ingest([FileSignal("moved_to", "one")])
+        await eventually(lambda: inbox.status()["window_count"] == 1)
+        original = inbox.list_records()[0]
+        canonical = runtime.store.get(RECORD_KIND, original["id"])
+        assert canonical is not None
+        unrelated = runtime.store.event("unrelated.history", {"id": "untouched"})
+        invalid_values: list[str | bytes] = [
+            "not-json",
+            '{"oversized":"' + "x" * 17000 + '"}',
+            b'{"event_id":99}',
+        ]
+        for value in (True, -1, 0, 1.5, "999", 1 << 63):
+            invalid = {**canonical, "event_id": value}
+            invalid_values.append(json.dumps(invalid, ensure_ascii=False))
+        with runtime.store.db:
+            for index, data in enumerate(invalid_values):
+                identifier = f"{index:032x}"
+                if isinstance(data, str) and data.startswith('{"id"'):
+                    invalid = json.loads(data)
+                    invalid["id"] = identifier
+                    invalid["proof"] = {**invalid["proof"], "id": identifier}
+                    data = json.dumps(invalid, ensure_ascii=False)
+                runtime.store.db.execute(
+                    "INSERT INTO objects VALUES(?,?,?,?)",
+                    (RECORD_KIND, identifier, data, 1_700_000_000.0),
+                )
+        # The newest known-good prefix must be reachable without parsing bad sort keys.
+        assert inbox.list_records(1)[0]["id"] == original["id"]
+        (directory / "two").write_text("two")
+        await inbox.ingest([FileSignal("moved_to", "two")])
+        await eventually(lambda: inbox.status()["window_count"] == 2)
+        assert [item["metadata"]["name"] for item in inbox.list_records()] == ["two", "one"]
+        assert inbox.status()["records"] == 2
+        assert (
+            runtime.store.db.execute(
+                "SELECT id FROM events WHERE id=?", (unrelated["id"],)
+            ).fetchone()
+            is not None
+        )
+        assert len([item for item in runtime.store.events() if item["type"] == EVENT_TYPE]) == 2
+    finally:
+        await inbox.close()
         await runtime.close()
