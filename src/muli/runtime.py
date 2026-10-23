@@ -1451,6 +1451,7 @@ class Runtime:
                     self.memory.owner_profile(limit),
                     limit=limit,
                     budget=memory_budget,
+                    memory=self.memory,
                 )
         if len(recalled) > memory_budget:
             recalled = ""

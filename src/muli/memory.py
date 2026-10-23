@@ -7,13 +7,14 @@ import heapq
 import json
 import math
 import re
+import sqlite3
 import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from muli.evidence import decode_utf8
+from muli.evidence import EvidenceError, decode_utf8
 from muli.memory_schema import SCHEMA
 from muli.store import Store, new_id, now
 from muli.store_schema import validate_existing_schema
@@ -789,6 +790,131 @@ class Memory:
             ).fetchall()
         ]
         return result
+
+    def prompt_evidence(
+        self, seed: Mapping[str, Any], *, max_bytes: int
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Recheck one seed and one exact conflict pair without expanding graph or sources."""
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("提示证据字节预算必须是正整数")
+        identifier = seed.get("id")
+        conflicts = seed.get("conflicts")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or not isinstance(conflicts, list)
+            or type(seed.get("version")) is not int
+            or seed["version"] < 1
+        ):
+            return None, None
+        try:
+            if len(identifier.encode("utf-8")) > max_bytes:
+                return None, None
+        except UnicodeError:
+            return None, None
+        remaining = max_bytes
+        for conflict in conflicts:
+            if not isinstance(conflict, str) or not conflict:
+                return None, None
+            try:
+                remaining -= len(conflict.encode("utf-8"))
+            except UnicodeError:
+                return None, None
+            if remaining < 0:
+                return None, None
+        peer_id = conflicts[0] if conflicts else None
+        left, right = sorted((identifier, peer_id)) if peer_id else (identifier, identifier)
+        metadata = (
+            "CASE WHEN typeof(m.id)='text' AND typeof(x.layer)='text' "
+            "AND typeof(m.source)='text' AND typeof(x.status)='text' "
+            "AND typeof(x.claim_key)='text' AND typeof(x.source_id) IN ('null','text') "
+            "AND typeof(x.trusted_owner)='integer' AND typeof(x.version)='integer' "
+            "THEN json_object('id',m.id,'layer',x.layer,'source',m.source,'source_id',x.source_id,"
+            "'trusted_owner',x.trusted_owner,'status',x.status,"
+            "'version',x.version,'claim_key',x.claim_key) END"
+        )
+        try:
+            rows = self.store.db.execute(
+                "WITH requested(slot,id) AS (SELECT 0,? UNION ALL SELECT 1,?) "
+                f"SELECT r.slot,CASE WHEN length(CAST({metadata} AS BLOB))<=? "
+                f"THEN CAST({metadata} AS BLOB) END AS metadata,"
+                "CASE WHEN typeof(m.updated_at) IN ('integer','real') THEN m.updated_at END "
+                "AS updated_at,"
+                "CASE WHEN typeof(m.content)='text' THEN "
+                "substr(CAST(m.content AS BLOB),1,?) END AS content,"
+                "length(CAST(m.content AS BLOB)) AS content_bytes,"
+                "x.source_id IS NULL OR (s.id IS NOT NULL AND "
+                "(x.trusted_owner=0 OR (s.trusted_owner=1 AND s.role='user'))) AS source_valid,"
+                "EXISTS(SELECT 1 FROM memory_conflicts WHERE left_id=? AND right_id=? "
+                "AND resolved_at IS NULL) AS linked "
+                "FROM requested r JOIN memories m ON m.id=r.id "
+                "JOIN memory_meta x ON x.memory_id=m.id "
+                "LEFT JOIN memory_sources s ON s.id=x.source_id",
+                (identifier, peer_id, max_bytes, max_bytes, left, right),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return None, None
+        current: dict[int, dict[str, Any]] = {}
+        linked = False
+        for row in rows:
+            try:
+                item = json.loads(row["metadata"])
+                if isinstance(item, dict):
+                    item["updated_at"] = row["updated_at"]
+                if (
+                    not isinstance(item, dict)
+                    or item.get("id") != (identifier if row["slot"] == 0 else peer_id)
+                    or item.get("layer") not in LAYERS
+                    or item.get("status") not in {"active", "conflict"}
+                    or type(item.get("trusted_owner")) is not int
+                    or item["trusted_owner"] not in (0, 1)
+                    or type(item.get("version")) is not int
+                    or item["version"] < 1
+                    or not isinstance(item.get("source"), str)
+                    or not isinstance(item.get("claim_key"), str)
+                    or not (item.get("source_id") is None or isinstance(item["source_id"], str))
+                    or not isinstance(item.get("updated_at"), (int, float))
+                    or not math.isfinite(item["updated_at"])
+                    or not row["source_valid"]
+                ):
+                    continue
+                _json(item).encode("utf-8")
+                item["trusted_owner"] = bool(item["trusted_owner"])
+                if item["layer"] in {"identity", "preference"} and not item["trusted_owner"]:
+                    continue
+                item["conflicts"] = conflicts if row["slot"] == 0 else [identifier]
+                raw = row["content"]
+                item["content"] = (
+                    decode_utf8(raw, allow_incomplete_tail=len(raw) < row["content_bytes"])
+                    + ("[节选]" if len(raw) < row["content_bytes"] else "")
+                    if isinstance(raw, bytes)
+                    else ""
+                )
+                current[row["slot"]] = item
+                linked = bool(row["linked"])
+            except (ValueError, TypeError, UnicodeError, EvidenceError):
+                continue
+        primary = current.get(0)
+        if primary is None or primary["version"] != seed.get("version"):
+            return None, None
+        if linked and primary["status"] != "conflict":
+            # A current unresolved edge contradicts this row's active status.
+            # Never turn that inconsistent evidence into a normal single-sided fact.
+            return None, None
+        peer = current.get(1)
+        if (
+            primary["status"] != "conflict"
+            or peer is None
+            or not linked
+            or peer["id"] == primary["id"]
+            or peer["status"] != "conflict"
+            or not primary["claim_key"]
+            or any(primary[key] != peer[key] for key in ("claim_key", "layer", "trusted_owner"))
+        ):
+            peer = None
+        elif peer is not None:
+            peer["conflicts_partial"] = True
+        return primary, peer
 
     def revisions(self, identifier: str) -> list[dict[str, Any]]:
         return [

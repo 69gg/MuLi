@@ -665,5 +665,10 @@ class MemoryPipeline:
             hops=self.config.graph_hops,
         )
         return render_context(
-            query, recalled, self.memory.owner_profile(limit), limit=limit, budget=max_chars
+            query,
+            recalled,
+            self.memory.owner_profile(limit),
+            limit=limit,
+            budget=max_chars,
+            memory=self.memory,
         )

@@ -285,8 +285,12 @@ async def test_conflict_resolution_refreshes_both_streams_and_keeps_status(memor
     service = pipeline(memory, limit=2)
     await service.query("COLOR", limit=2)
     before = records(service.cached_context("COLOR"))
-    assert len(before) == 2 and all(item["status"] == "conflict" for item in before)
-    assert all(item["conflicts"] for item in before)
+    assert len(before) == 1 and before[0]["type"] == "conflict"
+    assert before[0]["availability"] == "paired" and before[0]["partial"] is True
+    members = before[0]["memories"]
+    assert len(members) == 2 and all(item["status"] == "conflict" for item in members)
+    assert {item["id"] for item in members} == {first["id"], second["id"]}
+    assert all(item["conflicts"] for item in members)
     conflict = memory.conflicts()[0]
     memory.resolve_conflict(conflict["id"], second["id"])
     after = records(service.cached_context("COLOR"))

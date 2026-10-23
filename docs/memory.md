@@ -84,6 +84,18 @@ Runtime 在召回前分配本轮预算：沿用 `min(12000, limits.max_context_c
 
 普通旧 `memory_context_provider(query) -> str` 同步回调仍只调用一次。返回结果或自定义具名适配器输出超过实际预算时整体省略，不裁剪字符串、不捕获 `TypeError` 重试。需要宿主预算的受信扩展应显式使用 `muli.memory_context.MemoryContextProvider(renderer)`；renderer 接收 `(query, max_chars=None, *, latest_user_id=None)`，适配器本身仍支持旧的一参数调用。这里不新增网络调用或持久格式。
 
+### 自动提示中的冲突组合（开发中）
+
+普通记忆保持原 JSON 行形状。尚未解决的冲突使用 `type="conflict"` 资料行：能完整放下双方定位元数据及可读正文片段时，`availability="paired"`，`memories` 中的双方各占一个既有名额；否则整组变为 `availability="pending"`，占一个名额，`memories=[]`，仅在 `seed` 中保留当前仍有效的记忆定位元数据及外层 `revision`，不交付单侧正文。提示本身也放不下时整体省略，不裁剪 ID 或 JSON。
+
+组合始终标 `status="unresolved"`、`partial=true`：只核验本次呈现的一组，不证明已经列全冲突，即使实际只有两项也不声称完整。seed 保留当前候选的完整冲突 ID；增量读取的对方只携已核对的 seed ID，并标 `conflicts_partial=true`。这避免为凑齐对方全部冲突而调用旧无界展开。三方冲突只解决其中一组后仍可能有未解决关联，不保证只余一条事实。
+
+召回与主人侧写两流各取至多 `L=min(context_limit,max_candidates)` 个 seed，跨流同 ID 只复核一次，新增组合点查总数不超过 `2L`。失败占额度，不因组合缺失补扫更旧资料；每项最多核验第一个登记对方，关系走排序后的 `(left_id,right_id)` 唯一键点查。SQL 先限制元数据及正文 BLOB 窗口，再在 Python 严格解码；不读取 source 全文，不展开对方的全部关系，不调用额外模型。来源关联、分层、信任和版本按当前记录复核；旧缓存中的 seed 已遗忘时不能留下含旧来源的 pending 提示。无来源的旧手工记忆仍按原信任可读，不由组合升级成主人偏好。
+
+完整 pair 是不可拆的选材单元；两流或多组共享成员时，不裁掉其中一方来勉强凑名额。与已选成员相交的后续组整体降为 pending 或省略，同一个 seed 不重复提示。两名额且可行的独立侧写需要留位时，可使用 pending 加侧写；原同 ID 覆盖两流的规则继续保留，不保证再额外留一个无关侧写。所有元数据、通知和双方正文共用现有当轮字符预算；选材不会自动解决冲突、修改事实或增加权限。流水线和没有 MemoryApplication 的 Runtime fallback 共用该路径，显式 `memory_query`、冲突管理及来源读取合同不变。
+
+这是 v2.44 开发行为，尚未完成整合或发行验收。新增点查与最终提示受上述边界约束，既有 `Memory.get` 的完整关系/冲突列表读取和旧检索链的总成本并未因此取得相同证明；模型能看到双方也不代表自然模型一定会正确判断。方案与离线验证状态见[候选及实施记录](memory-quality-next-proposal.md)。
+
 查询在读取候选前保存 revision，并在媒体锁、embedding 和 reranker 返回后重新核对。等待期间发生遗忘、编辑、提炼合并或其他记忆修改时，丢弃旧候选，按当前数据库重新进行一次本地检索，返回 `degraded:["memory_changed"]`；此前已有降级原因会一并保留。此分支不重试网络，也不把旧证据写入新 revision 的缓存。上游失败或超时后的本地降级同样受此检查约束。
 
 ## 核查与更正
