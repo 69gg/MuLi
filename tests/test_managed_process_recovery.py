@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import httpx
 import pytest
@@ -28,12 +28,12 @@ from helpers.managed_recovery_worker import (
     prepare,
     read_record,
 )
-from test_management_process_recovery import CLEANUP_SECONDS, checkpoint, cleanup, remaining
+from test_management_process_recovery import CLEANUP_SECONDS, cleanup, remaining
 
 import muli
 from muli.managed_transaction import HealthProofV2, format_digest
 from muli.management_projection import read_projection
-from muli.management_transaction import Role, TransactionJournal
+from muli.management_transaction import Intent, Phase, Role, TransactionJournal
 from muli.platforms.filesystem_identity import FilesystemError, verify_local_filesystems
 from muli.platforms.installation import PackageLimits
 from muli.platforms.managed_deployment import SlotIdentity, register_local_slot
@@ -508,11 +508,50 @@ def test_fixture_parent_explicit_root_rejects_invalid_path(
         fixture_parent(tmp_path)
 
 
+def diagnostic_checkpoint(
+    process: subprocess.Popen[bytes], expected: bytes, output: bytearray, deadline: float
+) -> None:
+    """Read fixed controller diagnostics and one actual owned handshake."""
+    assert process.stdout is not None
+    cursor = len(output)
+    step = sum(line.startswith(b"controller-step=") for line in output.splitlines())
+    while True:
+        while (end := output.find(b"\n", cursor)) != -1:
+            remaining(deadline)
+            line = bytes(output[cursor:end])
+            cursor = end + 1
+            if line == expected:
+                assert cursor == len(output), "unexpected trailing checkpoint bytes"
+                return
+            assert expected in {
+                b"start-target",
+                b"stop-target",
+                b"start-base",
+                b"controller-resolved",
+            }
+            assert line.startswith(b"controller-step="), "unexpected checkpoint frame"
+            try:
+                values = json.loads(line.removeprefix(b"controller-step="))
+            except ValueError:
+                raise AssertionError("invalid step diagnostic") from None
+            assert isinstance(values, list) and len(values) == 6
+            assert all(type(value) is int and 0 <= value <= 1_000_000 for value in values[:4])
+            assert values[0] == step and step < 32
+            assert values[4] in get_args(Phase) and values[5] in get_args(Intent)
+            step += 1
+        ready, _, _ = select.select([process.stdout], [], [], remaining(deadline))
+        assert ready, "worker checkpoint timed out"
+        data = os.read(process.stdout.fileno(), min(1024, HTTP_BYTES - len(output) + 1))
+        assert data, "worker exited before its checkpoint"
+        output.extend(data)
+        assert len(output) <= HTTP_BYTES, "worker exceeded its bounded output budget"
+
+
 def expect(
     process: subprocess.Popen[bytes], expected: bytes, output: bytearray, deadline: float
 ) -> None:
     try:
-        checkpoint(process, expected, output, deadline)
+        diagnostic_checkpoint(process, expected, output, deadline)
     except AssertionError:
         # Keep the useful tail of an early exception, within the same byte cap.
         assert process.stdout is not None
