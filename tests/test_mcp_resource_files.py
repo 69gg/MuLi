@@ -6,7 +6,8 @@ import asyncio
 import base64
 import hashlib
 import json
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -23,6 +24,7 @@ from test_task_briefs import bind
 
 from muli.attachments import Attachments
 from muli.channels import ChannelError, ChannelManager, ChannelsConfig
+from muli.context import ContextLimitError
 from muli.local_services import LocalServices
 from muli.providers import (
     Message,
@@ -574,4 +576,193 @@ async def test_saved_id_requires_explicit_vision_and_channel_operations(
     finally:
         await channels.close()
         await http.aclose()
+        await runtime.close()
+
+
+@pytest.mark.parametrize("boundary", ["write", "fsync"])
+async def test_cancel_during_real_file_io_keeps_lease_until_thread_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    import muli.attachments as module
+
+    runtime, client, attachments, session_id, ref = await file_runtime(tmp_path)
+    original_file_io = module.file_io
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    calls = 0
+    selected = 1 if boundary == "write" else 2
+
+    async def gated_file_io(operation: Callable[[], Any]) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls != selected:
+            return await original_file_io(operation)
+
+        def thread_operation() -> Any:
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise AssertionError("test must release the real file I/O thread")
+            try:
+                return operation()
+            finally:
+                finished.set()
+
+        # Retain the production shield/to_thread implementation. Only pause its
+        # actual worker operation, before a real write or fsync on the temp file.
+        return await original_file_io(thread_operation)
+
+    monkeypatch.setattr(module, "file_io", gated_file_io)
+    operation = asyncio.create_task(save_call(runtime, session_id, ref))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        connection = runtime.mcp._connections["old"]
+        assert connection.active_calls == 1 and attachments.reserved == 3
+        assert len(list(attachments.directory.iterdir())) == 1
+        assert runtime.store.list("attachment") == []
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert operation.done() is False and finished.is_set() is False
+        candidate = await runtime.mcp.prepare({"mcpServers": {}})
+        runtime.mcp.publish(candidate)
+        assert connection.active_calls == 1 and client.closed == 0
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert finished.is_set() is True and calls == selected
+        assert connection.active_calls == 0 and attachments.reserved == 0
+        assert list(attachments.directory.iterdir()) == []
+        assert runtime.store.list("attachment") == [] and len(client.reads) == 1
+    finally:
+        release.set()
+        if not operation.done():
+            await asyncio.gather(operation, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_cancel_after_real_metadata_commit_preserves_file_and_releases_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, client, attachments, session_id, ref = await file_runtime(tmp_path)
+    original_save = attachments.save
+    entered, release = asyncio.Event(), asyncio.Event()
+    committed: list[dict[str, Any]] = []
+
+    async def gate_receipt(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        item = await original_save(*args, **kwargs)
+        # The original writer has committed metadata and the target file. Pause
+        # before its caller receives that result; do not invent a transaction.
+        committed.append(item)
+        entered.set()
+        await release.wait()
+        return item
+
+    monkeypatch.setattr(attachments, "save", gate_receipt)
+    operation = asyncio.create_task(save_call(runtime, session_id, ref))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        connection = runtime.mcp._connections["old"]
+        assert connection.active_calls == 1 and attachments.reserved == 0
+        assert len(committed) == 1
+        identifier = committed[0]["id"]
+        assert attachments.path(identifier).read_bytes() == b"abc"
+        candidate = await runtime.mcp.prepare({"mcpServers": {}})
+        runtime.mcp.publish(candidate)
+        assert connection.active_calls == 1 and client.closed == 0
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 2)
+        assert connection.active_calls == 0 and attachments.reserved == 0
+        assert len(committed) == len(client.reads) == 1
+        assert attachments.path(identifier).read_bytes() == b"abc"
+        assert attachments.get(identifier)["source"] == "mcp"
+        assert len(runtime.store.list("attachment")) == 1
+        assert [path.name for path in attachments.directory.iterdir()] == [identifier]
+        assert not any(event["type"] == "tool.completed" for event in runtime.store.events())
+    finally:
+        release.set()
+        if not operation.done():
+            await asyncio.gather(operation, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+async def test_saved_receipt_batch_that_cannot_fit_context_stops_without_undoing_files(
+    tmp_path: Path,
+    protocol: ProtocolName,
+) -> None:
+    runtime, client, attachments, session_id, ref = await file_runtime(tmp_path)
+    runtime.run_ids.pop(session_id)
+    runtime.config.update(
+        {
+            "persona": {"prompt": "遵守主人指令"},
+            "models": {
+                "main": {
+                    "protocol": protocol,
+                    "model": "offline",
+                    "base_url": "https://unused.invalid",
+                }
+            },
+            "limits": {"max_output_chars": 1600, "max_context_chars": 4000},
+            "compaction": {"enabled": False},
+        }
+    )
+    requests = 0
+    count = 8
+
+    class Saver(FakeModel):
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[dict[str, Any]],
+        ) -> AsyncIterator[StreamEvent]:
+            nonlocal requests
+            requests += 1
+            assert requests == 1, "the complete saved receipt batch must not be silently excerpted"
+            yield StreamEvent(
+                "done",
+                turn=ModelTurn(
+                    tool_calls=[
+                        ToolCall(
+                            f"save-{index}",
+                            "mcp_resource_save",
+                            json.dumps(
+                                {"server": "old", "ref": ref, "name": f"explicit-{index}.bin"}
+                            ),
+                        )
+                        for index in range(count)
+                    ]
+                ),
+            )
+
+    runtime.client_factory = lambda _: cast(ModelClient, Saver([], []))
+    try:
+        started = await runtime.start(session_id, "明确保存这八个资源副本", mode="yolo")
+        with pytest.raises(ContextLimitError, match="需完整保留的工具结果"):
+            await asyncio.wait_for(runtime.wait(started["run_id"]), 5)
+        assert requests == 1 and len(client.reads) == count
+        stored = [
+            message for message in runtime.store.messages(session_id) if message["role"] == "tool"
+        ]
+        assert len(stored) == count
+        identifiers: set[str] = set()
+        for message in stored:
+            receipt = json.loads(message["content"])
+            assert receipt["saved"] is True and receipt["is_error"] is False
+            assert (
+                message["content_provenance"] == "accepted" and message["preserve_content"] is True
+            )
+            item = receipt["attachment"]
+            identifiers.add(item["id"])
+            assert item["sha256"] == hashlib.sha256(b"abc").hexdigest()
+            assert attachments.path(item["id"]).read_bytes() == b"abc"
+        assert len(identifiers) == len(runtime.store.list("attachment")) == count
+        assert len(list(attachments.directory.iterdir())) == count and attachments.reserved == 0
+        run = runtime.store.get("run", started["run_id"])
+        assert run is not None and run["status"] == "failed"
+    finally:
         await runtime.close()

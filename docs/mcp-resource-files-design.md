@@ -63,6 +63,18 @@ SDK 一旦进入就不能把远端结果不明改称整项 not_executed；GET �
 
 资源相关四文件含新增真实锁定 SDK 流式 HTTPX MockTransport→Runtime→Attachments 用例合计 **96 项通过，2.73 秒，峰值 131.2 MiB**；该集合包含上述首轮 42 项，不与最终 44 项重复累计。真实 SDK 用例验证一次 resources/read、原字节/SHA/MIME 与已关闭响应流，没有 socket 或真实 server。附件记录、LocalServices、媒体、扩展与 prompts 七文件另 **206 项通过，3.48 秒，峰值 156.1 MiB**。五个生产文件严格 mypy 通过（峰值 183.5 MiB）；七个 Python 文件 Ruff/format 通过。
 
-全部执行都经过 `/data0/MuLi/scripts/check_local.py --seconds 30 run -- /data0/MuLi/.venv/bin/python …`，单次 1 GiB、共享 2 GiB、swap 0、CPU 1、tasks 128，输出均确认实终态与 swap 0。未下载、训练、压测、连接真实模型/MCP/渠道、操作本机服务或桌面、push、运行远端 CI 或改版本。这里的 vision 成功路径是有限方法替身，OneBot 是 MockTransport outbox；均不证明真实账号可用。尚未单独新增 file_io/metadata 各取消门、任意重复取消与保存回执后整批上下文不足用例，不将既有机制或其它用例的通过冒称这些场景已逐一验收；后续独审按上述明确边界收口。
+全部执行都经过 `/data0/MuLi/scripts/check_local.py --seconds 30 run -- /data0/MuLi/.venv/bin/python …`，单次 1 GiB、共享 2 GiB、swap 0、CPU 1、tasks 128，输出均确认实终态与 swap 0。未下载、训练、压测、连接真实模型/MCP/渠道、操作本机服务或桌面、push、运行远端 CI 或改版本。这里的 vision 成功路径是有限方法替身，OneBot 是 MockTransport outbox；均不证明真实账号可用。本次实现验证当时尚未单独新增 file_io/metadata 各取消门、任意重复取消与保存回执后整批上下文不足用例；后续有限补片见下文，不将既有机制或其它用例的通过冒称这些场景已逐一验收。
 
-冻结切片经独立 Sol 只读审查，追踪了源码、实际调用接线、测试与上述合同，未发现可证实的 P1/P2。独审没有执行检查，也没有连接真实 MCP，不增加任何运行验收证据。file_io/metadata 逐门取消、任意重复取消与保存回执后整体上下文不足尚未新增用例的边界继续保留；独审结论不将这些场景认定为已验证。
+冻结切片经独立 Sol 只读审查，追踪了源码、实际调用接线、测试与上述合同，未发现可证实的 P1/P2。独审没有执行检查，也没有连接真实 MCP，不增加任何运行验收证据。独审时 file_io/metadata 逐门取消、任意重复取消与保存回执后整体上下文不足尚未新增用例；独审结论不将这些场景认定为已验证。
+
+## 有限测试补片
+
+根只读复核后，仅对既有测试文件追加六项，不改生产。先读 `Attachments.file_io/save` 与 Runtime 的完整资源上下文不足回归，并经 Context7 核对 Python 3.13 的 `asyncio.shield`/线程交接合同；补片复用原真实 Runtime、Store、Attachments 和有限假资源客户端。
+
+- 两项在原 `file_io` 的真实 `to_thread` worker 内，分别暂停实际临时文件 write 与 fsync；单次取消并发布删除连接的新代后，原 lease 和 reservation 仍保留、旧连接尚未关闭。放行 worker 执行真实操作后，调用仍抛 `CancelledError`，lease/reservation 归零、临时文件清除、metadata 未创建，仅一次远端读取。这证明该单次取消门会等待 I/O 收尾，不证明线程可被硬停止。
+- 一项在真实 `Attachments.save` 完成文件和 metadata 提交后，用调用返回门暂停 LocalServices 接收回执；随后换代并单次取消，调用保留取消语义、原 lease 释放，既存文件原字节与 MCP metadata 均保留，没有 `tool.completed` 成功回执，也没有再次读取或保存。这是 writer 返回之后的 async 接缝，不声称可在同步 SQLite 提交指令中间暂停。
+- 三项分别使用 OpenAI Chat、Responses、Anthropic 的真实 Runtime 与假 provider，在单批明确请求中成功保存八个小文件。八份完整回执及协议外壳放不进 4000 字符上下文时抛原 `ContextLimitError`，只发生一次模型请求；八个保存结果仍以 accepted/preserve_content 完整入库，文件、原字节、ID 和 SHA 全部保留，运行明确失败，不把已发生效果改称未执行。
+
+六项定向首轮 **6 passed、44 deselected，0.47 秒，峰值 86 MiB**；格式化后整个文件 **50 passed，1.15 秒，峰值 105.4 MiB**，Ruff 检查通过。所有命令仍经上述 30 秒共享资源守卫串行执行并确认实终态，swap 0；本片只改测试和本设计，不因测试无生产修改而重复源码 mypy。没有 socket、真实 MCP/模型/渠道、CLI 或桌面操作，也没有 push、远端 CI、版本改动或子 agent。
+
+这六项补齐了上述指定取消与整体上下文场景的有限运行证据，不改既有独审发生时的历史范围；任意重复取消仍明确未验。writer 的跨介质非事务边界、真实外部集成、真实 vision/渠道能力与线程硬停止均不获得额外承诺。
