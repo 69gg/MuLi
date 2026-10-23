@@ -84,7 +84,7 @@ Runtime 在召回前分配本轮预算：沿用 `min(12000, limits.max_context_c
 
 普通旧 `memory_context_provider(query) -> str` 同步回调仍只调用一次。返回结果或自定义具名适配器输出超过实际预算时整体省略，不裁剪字符串、不捕获 `TypeError` 重试。需要宿主预算的受信扩展应显式使用 `muli.memory_context.MemoryContextProvider(renderer)`；renderer 接收 `(query, max_chars=None, *, latest_user_id=None)`，适配器本身仍支持旧的一参数调用。这里不新增网络调用或持久格式。
 
-### 自动提示中的冲突组合（开发中）
+### 自动提示中的冲突组合
 
 普通记忆保持原 JSON 行形状。尚未解决的冲突使用 `type="conflict"` 资料行：能完整放下双方定位元数据及可读正文片段时，`availability="paired"`，`memories` 中的双方各占一个既有名额；否则整组变为 `availability="pending"`，占一个名额，`memories=[]`，仅在 `seed` 中保留当前仍有效的记忆定位元数据及外层 `revision`，不交付单侧正文。提示本身也放不下时整体省略，不裁剪 ID 或 JSON。
 
@@ -94,7 +94,7 @@ Runtime 在召回前分配本轮预算：沿用 `min(12000, limits.max_context_c
 
 完整 pair 是不可拆的选材单元；两流或多组共享成员时，不裁掉其中一方来勉强凑名额。与已选成员相交的后续组整体降为 pending 或省略，同一个 seed 不重复提示。两名额且可行的独立侧写需要留位时，可使用 pending 加侧写；原同 ID 覆盖两流的规则继续保留，不保证再额外留一个无关侧写。所有元数据、通知和双方正文共用现有当轮字符预算；选材不会自动解决冲突、修改事实或增加权限。流水线和没有 MemoryApplication 的 Runtime fallback 共用该路径，显式 `memory_query`、冲突管理及来源读取合同不变。
 
-这是 v2.44 开发行为，尚未完成整合或发行验收。新增点查与最终提示受上述边界约束，既有 `Memory.get` 的完整关系/冲突列表读取和旧检索链的总成本并未因此取得相同证明；模型能看到双方也不代表自然模型一定会正确判断。方案与离线验证状态见[候选及实施记录](memory-quality-next-proposal.md)。
+这是v2.44候选行为，生产实现、完整本地整合和固定证据评估已完成，精确远端CI及发行仍待核验。新增点查与最终提示受上述边界约束，既有 `Memory.get` 的完整关系/冲突列表读取和旧检索链的总成本并未因此取得相同证明；模型能看到双方也不代表自然模型一定会正确判断。方案与验证状态见[候选及实施记录](memory-quality-next-proposal.md)和[本版审查](review-v2.44.md)。
 
 查询在读取候选前保存 revision，并在媒体锁、embedding 和 reranker 返回后重新核对。等待期间发生遗忘、编辑、提炼合并或其他记忆修改时，丢弃旧候选，按当前数据库重新进行一次本地检索，返回 `degraded:["memory_changed"]`；此前已有降级原因会一并保留。此分支不重试网络，也不把旧证据写入新 revision 的缓存。上游失败或超时后的本地降级同样受此检查约束。
 
