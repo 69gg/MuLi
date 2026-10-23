@@ -268,7 +268,7 @@ receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 
 
 最终独立只读审查确认：轮前 `observed_since` 已闭合 late-ready 的采样边界问题；独立 cleanup 的旧结果读取只继承通过归属、权限、文件类型、字节上限与白名单验证的 readiness 元数据，不授予 completed 或 cleanup 成功。后续未发现确定 P1/P2。保留原 prepare 的 kernel 二次复核作为既有资源事实，新 readiness 核限读取已计入观察预算。审查未运行检查；301 项之后仅有格式、tuple 类型注解与本段文档变更，未改变行为。
 
-## 第十轮 native 失败取证（流水线取证时未终态）
+## 第十轮 native 失败取证（最终十绿一原生红）
 
 精确签名合并候选 `3f0abb3400860ed3ab560b5c34e315bde40a710f` 的 [run 39968348139](https://github.com/69gg/MuLi/actions/runs/39968348139) attempt 1 中，[native job 120464058434](https://github.com/69gg/MuLi/actions/runs/39968348139/job/120464058434) 已于 2026-10-23 22:18:53（Asia/Shanghai）终态失败。一次取证查询得到 run 仍为 `in_progress/conclusion=null`；其余矩阵尚未终态，不将 native job 的结束写成整轮结束，也没有继续轮询。
 
@@ -280,6 +280,26 @@ receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 
 - result：`completed=false/stage=manager_setup/code=setup_failed`，`timeline=[]/generations=[]`。仅有 setup resource；`client_code=command_failed/diagnostic_code=command_failed/diagnostic_status=null`，观察 stage、failure、query、process 与 journal 均为 `not_started`，unit 为空、units 与 events 为空。
 - **0 个事务**，没有 harness 业务结果，也没有 `manager_readiness`；不能据缺失的观察推出 unit 当前状态、同代 activating 是否跨过 5 秒、用户 bus 可用性或启动根因。cleanup 的实际命令已失败，receipt 没有证明账户、组或三个挂载已回收，正常清理仍未通过。
 
-本次仅记录有限失败证据，不修改实现、不重跑 CI；前九轮历史计数及精确证据保持。此处确认的终态只属于 native job，其余 job 的后续结果不在本次单次取证范围内。
+本次取证当时仅确认 native job 终态；根随后只读查实整轮最终为十项成功、仅原生项失败。前九轮历史计数及精确证据保持，仍为 0 个事务、正常清理未通过，不以本片纯测试改写远端事实。
+
+## 同次 manager 失败摘要（纯验完成，远端待验）
+
+第十轮的 generic 错误不足以确定 bus、typed reply、期限或字节根因。静态核对发现：manager worker 已取得的 query 状态未随失败回包返回；协调器只抛固定 code，没有保存这次观察。无返回时保守耗尽剩余额度，后备 `observe_setup` 又因余额不足跳过，而其已知 `native_diagnostic_output_budget` 被归为 `command_failed`。本片只补这个信息保存接缝，不新增系统查询、启动、重试或 typed 状态快照，不放宽任何 ready、身份、kernel 或 cleanup 条件。
+
+失败回包严格只有 `code/stage/query_status/query_code/used`：失败 code 与 stage 为固定有限枚举，query code 沿已有命令分类；status 仅 null 或有符号 32 位非 bool 整数，used 为非 bool 非负整数。stage 在原查询或本地验证前同步设置；查询异常会清除上一状态并记录固定分类，取消仍传播。`query_status=0/query_code=ok` 只说明命令返回，不能证明 typed 解析或 manager ready。没有返回或未知异常体仍不能还原根因，不导出原始 stderr、异常文本、unit/proc 私有字段或输出正文。
+
+worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累计 32 KiB。协调器额外核 `used <= 本次授予额度`，回包不得超过原 1024 字节预留；全枚举与最大整数序列化纯例证明仍可容纳。worker 超额读取只有在明确 `native_diagnostic_output_budget` 失败下饱和记整个额度，不表示完整核验，也不产生可重用额度。无返回、非法 schema、超额 used 或过大回包仍保守耗尽，不为保存摘要另给额度。
+
+协调器先验证并持久写入独立 `resources.manager_failure`，再抛本次原失败，随后才可尝试既有后备诊断。后备没预算时明确记 `output_budget` 并保留摘要；后备失败或证据写失败不覆盖原错误。独立 cleanup 仅复用既有的归属、私有权限、regular/O_NOFOLLOW、32 KiB 哨兵与完整结果白名单读取，继承这个有限 resource；它不授予 completed、ready 或 cleanup 成功。95 秒总期限、原5秒窗口、1024回包预留与全部成功条件均保持。
+
+先补的纯 fake runner 反例在旧实现稳定失败（`manager_failure` 缺失），再改实现。首个定向组 13 过、2 失败分别是旧预算分类断言及旧失败包形状，按已批准协议更新；新增 query 例的首轮两处预期分类写错，依据已有分类函数修正，没有改生产校验。完整文件随后 **318 项通过**（pytest 1.16秒、guard 1.778秒、峰值104.2 MiB/swap 0）；再增4项非法回包/写失败反例，单独 **4项通过**。扩展既有9项 fresh-cleanup归属/白名单用例后该组再过；重叠不另计数。
+
+静态收尾发现外层 timeout 中断尚未返回的 query 时，必须同时将 query code 记 timeout、used 保守记整个授予额度；独审指出缺少后者会让后备诊断复用未知消耗。已修正，真正外部 CancelledError 仍透传。首个新增例错误地在固定全局 monotonic 的夹具里用真实1毫秒asyncio计时器，计时器无法推进；guard 在 **30.033秒**硬终止，峰值 **81.1 MiB/swap 0**，没有提高期限或重跑同一冻结时基例。该次pytest返回session后误启动Ruff/mypy，存在短时重叠，仍处于共享slice限制内，但不符合串行要求；已明确报告。收齐全部终态后，改用纯fake asynccontext模拟外层取消转TimeoutError，并断言未返回的query占满额度；最后failure/cancel组 **26项通过**（0.33秒、峰值81.6 MiB），共 **323个唯一纯case**。后续检查严格逐项等最终exit_code，三文件Ruff/format、两脚本strict mypy均通过，最终类型峰值162.8 MiB/swap 0，完成即归还guard。
+
+已知原run_process输出预算异常是无结构化类别的普通ValueError；本片不解析其正文、不改生产异常API。该无返回路径保守耗尽额度，但query code仍可能为command_failed，不能把它冒称已确定的预算根因。明确的NativeError/FixtureError输出预算类别会保留output_budget。所有执行均经绝对路径共享guard、每次30秒，真实subprocess入口仍硬拒绝；没有本机native、账户、挂载、CLI、服务或网络效果，也没有远端重跑。
+
+最后统一在实际 `_SetupIO.command` 的未知返回边界捕获 Exception 或 CancelledError，保守用尽额度后原样raise，覆盖query及proc命令；外部取消同对象透传，不转换为普通失败。已返回stdout/stderr先合并计账再检查期限，避免首条charge触期限时漏记另一条已返回pipe。新增2项纯反例验证同对象取消/额度耗尽及双pipe完整计账；最后定向 **28项通过**（0.32秒、峰值81.8 MiB/swap 0），共 **325个唯一纯case**。最后Ruff/format与strict两脚本mypy均通过，类型峰值162.8 MiB/swap 0；逐项实终态后才启动下一项，完成后归还guard。本轮完整文件通过数仍是前述318，后续新增例及受影响组单独通过，不冒称最终325全文件重跑。
+
+独立只读终审复核了pending-query期限、统一query/proc未知返回边界及已返回双pipe计账；此前P2已闭合，最终限定范围内未发现确定P1/P2。取消同对象、耗尽额度和双pipe纯例与合同一致。审查未运行检查或修改文件，完成即停止。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。

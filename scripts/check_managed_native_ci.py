@@ -211,9 +211,60 @@ def command_error_code(error: Exception) -> str:
         and str(error) in {"native_diagnostic_deadline", "native_command_timeout"}
     ):
         return "timeout"
-    if isinstance(error, FixtureError) and str(error) == "native_command_output_budget":
+    if isinstance(error, FixtureError) and str(error) in {
+        "native_command_output_budget",
+        "native_diagnostic_output_budget",
+    }:
         return "output_budget"
     return "command_failed"
+
+
+MANAGER_FAILURE_CODES = frozenset(
+    {
+        "native_manager_observation",
+        "native_manager_reply",
+        "native_manager_conflict",
+        "native_manager_missing",
+        "native_manager_failed",
+        "native_manager_changed",
+        "native_manager_not_ready",
+        "native_manager_process",
+        "native_deadline_exceeded",
+        "native_diagnostic_output_budget",
+        "native_kernel_limit",
+        "native_kernel_cpu",
+        "native_kernel_controllers",
+    }
+)
+MANAGER_STAGES = frozenset(
+    {
+        "list_units",
+        "unit_path",
+        "unit_properties",
+        "service_properties",
+        "unit_validation",
+        "manager_validation",
+        "process",
+        "kernel",
+    }
+)
+
+
+def manager_failure_facts(value: object) -> bool:
+    """A failed observation is finite evidence, never readiness authority."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"code", "stage", "query_status", "query_code", "used"}
+        and isinstance(value["code"], str)
+        and value["code"] in MANAGER_FAILURE_CODES
+        and isinstance(value["stage"], str)
+        and value["stage"] in MANAGER_STAGES
+        and client_status(value["query_status"])
+        and isinstance(value["query_code"], str)
+        and value["query_code"] in COMMAND_CODES
+        and type(value["used"]) is int
+        and 0 <= value["used"] <= OUTPUT_BYTES - 1024
+    )
 
 
 def startup_facts(value: object, unit: str) -> bool:
@@ -511,6 +562,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "environment",
             "setup",
             "manager_readiness",
+            "manager_failure",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -541,6 +593,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             valid = valid and startup_facts(facts, facts["unit"])
         elif name == "setup":
             valid = setup_facts(facts)
+        elif name == "manager_failure":
+            valid = manager_failure_facts(facts)
         elif name == "manager_readiness":
             valid = (
                 isinstance(facts, dict)
@@ -752,6 +806,7 @@ class NativeCI:
         self.manager_limits: dict[str, str] = {}
         self.setup_bytes = 0
         self.manager_readiness: dict[str, int | bool] = {}
+        self.manager_failure: dict[str, Any] = {}
 
     @property
     def volume(self) -> Path:
@@ -870,7 +925,12 @@ class NativeCI:
             reply = self.call(arguments, seconds=end - time.monotonic())
             observed = object_bytes(reply.output)
             used = observed.get("used")
-            if type(used) is not int or not 0 <= used <= allowance or reply.code != 0:
+            if (
+                type(used) is not int
+                or not 0 <= used <= allowance - 1024
+                or len(reply.output) > 1024
+                or reply.code != 0
+            ):
                 raise FixtureError("native_manager_observation")
         except (ValueError, OSError, subprocess.SubprocessError):
             self.setup_bytes = OUTPUT_BYTES  # No return means no reusable unspent allowance.
@@ -879,23 +939,15 @@ class NativeCI:
         if self.setup_bytes > OUTPUT_BYTES:
             raise FixtureError("native_diagnostic_output_budget")
         if observed.get("code") != ("idle" if mode == "manager-idle" else "ready"):
-            if isinstance(observed.get("code"), str) and observed["code"] in {
-                "native_manager_observation",
-                "native_manager_reply",
-                "native_manager_conflict",
-                "native_manager_missing",
-                "native_manager_failed",
-                "native_manager_changed",
-                "native_manager_not_ready",
-                "native_manager_process",
-                "native_deadline_exceeded",
-                "native_diagnostic_output_budget",
-                "native_kernel_limit",
-                "native_kernel_cpu",
-                "native_kernel_controllers",
-            }:
+            if manager_failure_facts(observed):
+                self.manager_failure = observed.copy()
+                try:
+                    self.save_setup_result({})
+                except (ValueError, OSError):
+                    pass  # Preserve the original observation error if evidence cannot be written.
                 raise FixtureError(observed["code"])
-            raise FixtureError("native_manager_not_ready")
+            self.setup_bytes = OUTPUT_BYTES
+            raise FixtureError("native_manager_observation")
         expected = {"code", "used", "invocation"}
         if mode == "manager-ready":
             expected |= {"group", "pid", "elapsed_ms", "late_ready"}
@@ -1330,6 +1382,7 @@ class NativeCI:
             return None
         result = fixture_result(reply.output)
         readiness = self.manager_readiness
+        failure = self.manager_failure
         if not readiness and self.cleanup_deadline is not None:
             try:
                 descriptor = os.open(
@@ -1346,10 +1399,13 @@ class NativeCI:
                         raise FixtureError("native_result_owner")
                     saved = fixture_result(source.read(OUTPUT_BYTES + 1))
                 readiness = saved["resources"].get("manager_readiness", {})
+                failure = saved["resources"].get("manager_failure", {})
             except (OSError, ValueError):
                 pass  # Optional old facts cannot grant cleanup success or hide its failure.
         if readiness:
             result["resources"]["manager_readiness"] = readiness
+        if failure:
+            result["resources"]["manager_failure"] = failure
         write_json(self.root / "result.json", result)
         return result
 
@@ -1569,13 +1625,20 @@ class NativeCI:
                     facts["diagnostic_code"] = "invalid_reply"
         except (ValueError, OSError, subprocess.SubprocessError) as failure:
             facts["diagnostic_code"] = command_error_code(failure)
+        self.save_setup_result({"setup": facts})
+
+    def save_setup_result(self, resources: dict[str, Any]) -> None:
+        """Save the validated same-observation summary before optional diagnostics."""
         result = {
             "completed": False,
             "stage": "manager_setup",
             "code": "setup_failed",
             "timeline": [],
             "generations": [],
-            "resources": {"setup": facts},
+            "resources": {
+                **resources,
+                **({"manager_failure": self.manager_failure} if self.manager_failure else {}),
+            },
         }
         write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
 

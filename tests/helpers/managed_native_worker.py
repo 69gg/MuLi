@@ -928,6 +928,8 @@ class _SetupIO:
     def file(self, path: Path) -> str:
         from muli.platforms.linux_transaction import _read_regular
 
+        if "manager_stage" in self.facts:
+            self.facts["manager_stage"] = "kernel"
         require(self.used < self.limit, "native_diagnostic_output_budget")
         value = _read_regular(path, self.limit - self.used)
         self.charge(value)
@@ -947,7 +949,7 @@ class _SetupIO:
                 limit=min(limit, self.limit - self.used),
                 merge_stderr=False,
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # A failed command returns no byte count; its reserved allowance
             # cannot be spent again by another query or a later diagnostic.
             self.used = self.limit
@@ -955,8 +957,8 @@ class _SetupIO:
         output, stderr = result.get("output"), result.get("stderr")
         if not isinstance(output, str) or not isinstance(stderr, str):
             raise NativeError("native_diagnostic_invalid")
-        self.charge(output.encode())
-        self.charge(stderr.encode())
+        # Account for both returned pipes before the deadline check can raise.
+        self.charge(output.encode() + stderr.encode())
         return result
 
     async def query(
@@ -964,13 +966,31 @@ class _SetupIO:
     ) -> dict[str, Any]:
         require(argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command")
         self.facts["query_status"], self.facts["query_code"] = None, "not_started"
+        if "manager_stage" in self.facts:
+            self.facts["manager_stage"] = (
+                "list_units"
+                if "ListUnitsByPatterns" in argv
+                else "unit_path"
+                if "GetUnit" in argv
+                else "unit_properties"
+                if "org.freedesktop.systemd1.Unit" in argv
+                else "service_properties"
+            )
         try:
             result = await self.command(
                 [argv[0], "--system", *argv[2:]], timeout=timeout, limit=limit
             )
-        except NativeError as error:
-            if str(error) == "native_diagnostic_output_budget":
+        except (OSError, ValueError) as error:
+            if isinstance(error, NativeError) and str(error) == "native_diagnostic_output_budget":
                 self.facts["query_code"] = "output_budget"
+            elif isinstance(error, NativeError) and str(error) == "native_diagnostic_invalid":
+                self.facts["query_code"] = "invalid_reply"
+            elif isinstance(error, NativeError) and str(error) == "native_deadline_exceeded":
+                self.facts["query_code"] = "timeout"
+            elif isinstance(error, TimeoutError):
+                self.facts["query_code"] = "timeout"
+            else:
+                self.facts["query_code"] = "command_failed"
             raise
         status = result.get("exit_code")
         self.facts["query_status"] = (
@@ -982,6 +1002,8 @@ class _SetupIO:
     async def read(self, pid: int, name: str) -> bytes | None:
         from muli.platforms.linux_transaction import _read_regular
 
+        if "manager_stage" in self.facts:
+            self.facts["manager_stage"] = "process"
         require(
             0 < pid < 2**31 and name in {"stat", "status", "cgroup", "exe", "wchan"},
             "native_diagnostic_command",
@@ -1007,7 +1029,9 @@ class _SetupIO:
         return data
 
 
-async def _manager_units(probe: SystemdProbe, uid: int) -> dict[str, dict[str, Any]]:
+async def _manager_units(
+    probe: SystemdProbe, uid: int, facts: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
     """List before GetUnit: observation must not LoadUnit an absent instance."""
     from muli.platforms.linux_transaction import _cgroup, _typed
 
@@ -1065,6 +1089,7 @@ async def _manager_units(probe: SystemdProbe, uid: int) -> dict[str, dict[str, A
                 ("ExecMainStatus", "i"),
             ),
         )
+        facts["manager_stage"] = "unit_validation"
         job, invocation = unit["Job"], unit["InvocationID"]
         require(
             unit["Id"] == name
@@ -1125,7 +1150,11 @@ async def manager_state(
         math.isfinite(deadline) and remaining(deadline) <= HARNESS_SECONDS + CLEANUP_SECONDS,
         "native_manager_deadline",
     )
-    facts: dict[str, Any] = {}
+    facts: dict[str, Any] = {
+        "manager_stage": "list_units",
+        "query_status": None,
+        "query_code": "not_started",
+    }
     io = _SetupIO(deadline, byte_limit, facts)
     result: dict[str, Any] = {"code": "native_manager_observation", "used": 0}
     try:
@@ -1135,7 +1164,8 @@ async def manager_state(
         names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
         async with asyncio.timeout(remaining(deadline)):
             if mode == "manager-idle":
-                units = await _manager_units(probe, uid)
+                units = await _manager_units(probe, uid, facts)
+                facts["manager_stage"] = "manager_validation"
                 require(
                     all(
                         unit["LoadState"] == "loaded"
@@ -1163,7 +1193,8 @@ async def manager_state(
                 invocation, binding, late, delay = "", None, False, POLL_SECONDS
                 while True:
                     observed_since = time.monotonic()
-                    units = await _manager_units(probe, uid)
+                    units = await _manager_units(probe, uid, facts)
+                    facts["manager_stage"] = "manager_validation"
                     require(set(units) == set(names), "native_manager_missing")
                     runtime, manager = (units[name] for name in names)
                     require(
@@ -1178,6 +1209,7 @@ async def manager_state(
                     pid, group = manager["MainPID"], manager["ControlGroup"]
                     if pid:
                         require(bool(group), "native_manager_changed")
+                        facts["manager_stage"] = "process"
                         data = await io.read(pid, "stat")
                         require(data is not None, "native_manager_changed")
                         assert data is not None
@@ -1186,6 +1218,7 @@ async def manager_state(
                         binding = observed
                     elif binding is not None:
                         raise NativeError("native_manager_changed")
+                    facts["manager_stage"] = "manager_validation"
                     require(
                         all(
                             unit["ActiveState"] in {"activating", "active"}
@@ -1219,6 +1252,7 @@ async def manager_state(
                             and runtime["ExecMainStatus"] == 0,
                             "native_manager_not_ready",
                         )
+                        facts["manager_stage"] = "process"
                         process = await observe_setup_process(
                             probe,
                             manager["path"],
@@ -1235,14 +1269,17 @@ async def manager_state(
                             and process["uid_matches"] is True,
                             "native_manager_process",
                         )
+                        facts["manager_stage"] = "kernel"
                         kernel_limits(
                             Path("/sys/fs/cgroup") / group.lstrip("/"),
                             memory=MEMORY,
                             tasks=TASKS,
                             read=io.file,
                         )
-                        final = await _manager_units(probe, uid)
+                        final = await _manager_units(probe, uid, facts)
+                        facts["manager_stage"] = "process"
                         last = await io.read(pid, "stat")
+                        facts["manager_stage"] = "manager_validation"
                         require(
                             final == units
                             and last is not None
@@ -1264,9 +1301,22 @@ async def manager_state(
                     delay = min(CLEANUP_SECONDS, delay * 2)
     except TimeoutError:
         result["code"] = "native_deadline_exceeded"
+        if facts["query_status"] is None and facts["query_code"] == "not_started":
+            facts["query_code"] = "timeout"
+            io.used = io.limit  # The interrupted query never returned its byte count.
     except (OSError, ValueError) as error:
         if isinstance(error, NativeError) and re.fullmatch(r"native_[a-z_]{1,57}", str(error)):
             result["code"] = str(error)
+    if result["code"] not in {"idle", "ready"}:
+        result.update(
+            stage=facts["manager_stage"],
+            query_status=facts["query_status"],
+            query_code=facts["query_code"],
+        )
+        if io.used > byte_limit:
+            # Saturation reserves the whole allowance; this is explicitly a failed read.
+            io.used = byte_limit
+            result["code"] = "native_diagnostic_output_budget"
     result["used"] = io.used
     return result
 

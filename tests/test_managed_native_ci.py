@@ -1746,7 +1746,7 @@ def test_setup_timeout_keeps_exact_before_phase_and_original_failure(
     assert result["stage"] == "manager_setup" and result["generations"] == []
     assert facts["phase"] == f"{phase}_before" and facts["client_code"] == "timeout"
     if phase == "manager_show":
-        assert facts["diagnostic_status"] is None and facts["diagnostic_code"] == "command_failed"
+        assert facts["diagnostic_status"] is None and facts["diagnostic_code"] == "output_budget"
         assert native.setup_bytes == ci.OUTPUT_BYTES
         assert not any("diagnose-setup" in args for args in commands.calls)
     else:
@@ -3254,7 +3254,13 @@ def test_initial_ready_and_diagnostic_share_actual_byte_budget(
         if "manager-ready" in argv:
             allowances.append(int(argv[8]))
             value = json.loads(reply.output)
-            value.update(code="native_manager_failed")
+            value = {
+                "code": "native_manager_failed",
+                "used": value["used"],
+                "stage": "manager_validation",
+                "query_status": 0,
+                "query_code": "ok",
+            }
             return ci.Reply(0, json.dumps(value).encode())
         if "diagnose-setup" in argv:
             allowances.append(int(argv[-1]))
@@ -3284,6 +3290,305 @@ def test_success_exports_only_finite_manager_readiness_metadata(
         )
         == 1
     )
+
+
+def test_manager_failure_summary_survives_exhausted_diagnostic_budget(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    summary: dict[str, Any] = {}
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        if "manager-ready" in argv:
+            summary.update(
+                code="native_manager_observation",
+                stage="service_properties",
+                query_status=1,
+                query_code="bus_permission",
+                used=int(argv[8]),
+            )
+            return ci.Reply(0, json.dumps(summary).encode())
+        return commands(argv, seconds=seconds)
+
+    native.run = run
+    with pytest.raises(ci.FixtureError, match="^native_manager_observation$"):
+        native.execute()
+    value = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert value["resources"]["manager_failure"] == summary
+    assert value["resources"]["setup"]["diagnostic_code"] == "output_budget"
+    assert not any("diagnose-setup" in argv for argv in commands.calls)
+    assert native.setup_bytes <= ci.OUTPUT_BYTES
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"used": True},
+        {"used": -1},
+        {"used": ci.OUTPUT_BYTES - 1023},
+        {"query_status": True},
+        {"query_status": 2**31},
+        {"query_status": -(2**31) - 1},
+        {"query_code": "secret"},
+        {"stage": "secret"},
+        {"code": "ready"},
+        {"private": "secret"},
+    ],
+)
+def test_manager_failure_summary_rejects_untrusted_fields(change: dict[str, Any]) -> None:
+    summary = {
+        "code": "native_manager_observation",
+        "used": 0,
+        "stage": "list_units",
+        "query_status": None,
+        "query_code": "not_started",
+    } | change
+    value = {
+        "completed": False,
+        "stage": "manager_setup",
+        "code": "setup_failed",
+        "timeline": [],
+        "generations": [],
+        "resources": {"manager_failure": summary},
+    }
+    with pytest.raises(ci.FixtureError, match="native_result_invalid"):
+        ci.fixture_result(json.dumps(value).encode())
+
+
+def test_manager_failure_summary_maximum_enums_fit_existing_reply_reserve() -> None:
+    for code in ci.MANAGER_FAILURE_CODES:
+        for stage in ci.MANAGER_STAGES:
+            for query in ci.COMMAND_CODES:
+                summary = {
+                    "code": code,
+                    "stage": stage,
+                    "query_status": -(2**31),
+                    "query_code": query,
+                    "used": ci.OUTPUT_BYTES - 1024,
+                }
+                assert ci.manager_failure_facts(summary)
+                assert len(json.dumps(summary).encode()) + 1 <= 1024
+
+
+@pytest.mark.parametrize("failure", ["status", "typed", "timeout", "budget"])
+async def test_manager_failure_summary_preserves_same_query_without_retry(
+    manager_observation: dict[str, Any], monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from muli import process
+
+    control = manager_observation
+    calls = 0
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if failure == "timeout":
+            raise TimeoutError("private timeout")
+        if failure == "budget":
+            return {"exit_code": 0, "output": "x" * (limit + 1), "stderr": ""}
+        return {
+            "exit_code": 1 if failure == "status" else 0,
+            "output": "private invalid typed reply",
+            "stderr": "Access denied",
+        }
+
+    monkeypatch.setattr(process, "run_process", query)
+    value = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        175.0,
+        worker.MAX_BYTES - 1024,
+        started=99.0,
+    )
+    assert ci.manager_failure_facts(value)
+    assert value["stage"] == "list_units" and calls == 1
+    assert value["query_status"] == (
+        1 if failure == "status" else 0 if failure == "typed" else None
+    )
+    assert value["query_code"] == (
+        "permission_denied"
+        if failure == "status"
+        else "ok"
+        if failure == "typed"
+        else "timeout"
+        if failure == "timeout"
+        else "output_budget"
+    )
+    assert "private" not in json.dumps(value)
+    if failure in {"timeout", "budget"}:
+        assert value["used"] == worker.MAX_BYTES - 1024
+
+
+async def test_manager_failure_outer_timeout_marks_pending_query_without_hiding_cancel(
+    manager_observation: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
+    from muli import process
+
+    control = manager_observation
+
+    @asynccontextmanager
+    async def timeout_context(seconds: float) -> AsyncIterator[None]:
+        try:
+            yield
+        except asyncio.CancelledError:
+            raise TimeoutError from None
+
+    monkeypatch.setattr(worker.asyncio, "timeout", timeout_context)
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(process, "run_process", query)
+    value = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        175.0,
+        worker.MAX_BYTES - 1024,
+        started=99.0,
+    )
+    assert ci.manager_failure_facts(value)
+    assert value["code"] == "native_deadline_exceeded"
+    assert value["query_status"] is None and value["query_code"] == "timeout"
+    assert value["used"] == worker.MAX_BYTES - 1024
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "returned-deadline"])
+async def test_setup_command_accounts_for_unknown_or_both_returned_pipes(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from muli import process
+
+    clock = 100.0
+    cancellation = asyncio.CancelledError()
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal clock
+        if outcome == "cancel":
+            raise cancellation
+        clock = 106.0
+        return {"exit_code": 0, "output": "out", "stderr": "error"}
+
+    monkeypatch.setattr(process, "run_process", query)
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+    facts: dict[str, Any] = {"query_status": 0, "query_code": "ok"}
+    io = worker._SetupIO(105.0, 100, facts)
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await io.command(["fake-proc-query"], timeout=5, limit=100)
+        assert caught.value is cancellation and io.used == io.limit
+    else:
+        with pytest.raises(worker.NativeError, match="native_deadline_exceeded"):
+            await io.command(["fake-proc-query"], timeout=5, limit=100)
+        assert io.used == len(b"outerror")
+
+
+def test_manager_failure_saved_before_optional_diagnostic_or_write_failure(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native, commands = fixture
+    summary = {
+        "code": "native_manager_failed",
+        "used": 0,
+        "stage": "manager_validation",
+        "query_status": 0,
+        "query_code": "ok",
+    }
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        if "manager-ready" in argv:
+            return ci.Reply(0, json.dumps(summary).encode())
+        return commands(argv, seconds=seconds)
+
+    def diagnose(error: Exception) -> None:
+        saved = ci.fixture_result((native.root / "result.json").read_bytes())
+        assert saved["resources"]["manager_failure"] == summary
+        raise OSError("private diagnostic failure")
+
+    native.run = run
+    monkeypatch.setattr(native, "observe_setup", diagnose)
+    with pytest.raises(ci.FixtureError, match="^native_manager_failed$"):
+        native.execute()
+
+
+@pytest.mark.parametrize("corrupt", ["used", "reply", "extra"])
+def test_manager_failure_invalid_wire_summary_cannot_reuse_allowance_or_leak(
+    fixture: tuple[Any, Commands],
+    corrupt: str,
+) -> None:
+    native, commands = fixture
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        if "manager-ready" in argv:
+            summary = {
+                "code": "native_manager_failed",
+                "used": 0,
+                "stage": "manager_validation",
+                "query_status": 0,
+                "query_code": "ok",
+            }
+            if corrupt == "used":
+                summary["used"] = int(argv[8]) + 1
+            else:
+                summary["private"] = "secret" * (300 if corrupt == "reply" else 1)
+            return ci.Reply(0, json.dumps(summary).encode())
+        return commands(argv, seconds=seconds)
+
+    native.run = run
+    with pytest.raises(ci.FixtureError, match="^native_manager_observation$"):
+        native.execute()
+    raw = (native.root / "result.json").read_bytes()
+    assert "manager_failure" not in ci.fixture_result(raw)["resources"]
+    assert b"secret" not in raw
+    assert native.setup_bytes == ci.OUTPUT_BYTES
+    assert not any("diagnose-setup" in argv for argv in commands.calls)
+
+
+def test_manager_failure_evidence_write_error_keeps_original_failure(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native, commands = fixture
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        if "manager-ready" in argv:
+            return ci.Reply(
+                0,
+                json.dumps(
+                    {
+                        "code": "native_manager_failed",
+                        "used": 0,
+                        "stage": "manager_validation",
+                        "query_status": 0,
+                        "query_code": "ok",
+                    }
+                ).encode(),
+            )
+        return commands(argv, seconds=seconds)
+
+    def cannot_save(resources: dict[str, Any]) -> None:
+        raise OSError("private write error")
+
+    native.run = run
+    monkeypatch.setattr(native, "save_setup_result", cannot_save)
+    with pytest.raises(ci.FixtureError, match="^native_manager_failed$"):
+        native.execute()
+    assert native.manager_failure["code"] == "native_manager_failed"
 
 
 @pytest.mark.parametrize("spent", [30.0, 95.0], ids=["case-margin", "execute-deadline"])
@@ -3365,7 +3670,14 @@ def test_fresh_cleanup_preserves_only_valid_owned_finite_readiness(
     value.update(completed=True, stage="complete")
     worker.write_json(native.volume / "result.json", value)
     readiness: dict[str, Any] = {"elapsed_ms": 6001, "late_ready": True}
-    saved = {**value, "resources": {"manager_readiness": readiness}}
+    failure = {
+        "code": "native_manager_observation",
+        "stage": "list_units",
+        "used": ci.OUTPUT_BYTES - 1024,
+        "query_status": None,
+        "query_code": "timeout",
+    }
+    saved = {**value, "resources": {"manager_readiness": readiness, "manager_failure": failure}}
     if change.startswith("elapsed-"):
         readiness["elapsed_ms"] = {
             "elapsed-bool": True,
@@ -3391,4 +3703,5 @@ def test_fresh_cleanup_preserves_only_valid_owned_finite_readiness(
     assert result["completed"] is True and result["resources"]["cleanup"] == "verified"
     assert result["timeline"] == value["timeline"] and result["generations"] == value["generations"]
     assert (result["resources"].get("manager_readiness") == readiness) is (change == "valid")
+    assert (result["resources"].get("manager_failure") == failure) is (change == "valid")
     assert commands.accounts == {} and commands.mounts == {}
