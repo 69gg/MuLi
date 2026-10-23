@@ -326,7 +326,7 @@ worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累�
 
 独立只读后审已核对ValueError继承兼容、原文本、类型分类、取消及未知额度合同和第十一轮证据边界，未发现确定P1/P2。审查没有运行检查或修改文件，完成即停止。
 
-## 第十二轮 native 有限失败取证（其余矩阵快照仍运行）
+## 第十二轮 native 有限失败取证（最终九绿两红）
 
 精确签名候选 `691ea5c2c5a18bf7e0fb2670f538f4ef9eaa7385` 已非强制推送原PR分支，触发 [run 39979235619](https://github.com/69gg/MuLi/actions/runs/39979235619)。一次jobs快照为6项success、[managed-native 120501822975](https://github.com/69gg/MuLi/actions/runs/39979235619/job/120501822975) failure、4项in_progress；本次不等待或轮询其余矩阵，不把该job终态当成整轮终态。native于2026-10-23 23:33:07开始、23:34:35结束（Asia/Shanghai）。
 
@@ -339,5 +339,25 @@ worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累�
 - receipt仍UID999/GID987、user_created=true、manager_show_before、环境文件确认、manager_group为空，三个挂载未消除，user_removed=false/group_removed=false。result为completed=false/manager_setup/setup_failed、timeline/generations为空，**0事务**、无manager_readiness。实际cleanup命令仍超时失败，账户、组、挂载回收及正常清理均未证明。
 
 本次只记录精确失败证据，不修实现、不增加预算、不重跑CI、不推送文档。前十一轮历史保持；后续如研究预算路径，先静态核算现有typed查询的累计字节开销并以纯替身复现，不能据新分类直接放宽限额或宣称服务已修复。
+
+根随后查实该精确run最终九项success、两项failure：native 120501822975与Windows 3.13 120501823249。Windows为四个真实UIA用例timeout，3528 passed/1757 skipped，属于另一条调查，不混入本片native归因。前述六绿一红四运行只保留为取证时快照。
+
+## 同轮 pending 观察拆分合同（实现前批准）
+
+第十二轮已确定Service读取触及当次剩余输出上限；没有各轮实际字节、stdout/stderr分项，不能确定是累计小回复、单条大回复还是stderr，也不承诺manager就绪根因已定。静态因果依据是 `_manager_units` 在每个pending轮执行一次List、两次GetUnit及四次六属性get-property，共7次busctl/27次D-Bus调用；`_SetupIO` 把每条命令已返回的双pipe字节累计到同一32 KiB额度，未返回则保守耗尽，没有重复扣账或remaining错传。v255多PROPERTY是合法逐项Properties.Get，不是GetAll。
+
+仅在native helper和纯替身测试内减少pending重复开销：每轮重新List精确两个unit，严格验证十列typed行的字段、唯一名称、unit path及Job id/path，保留本轮load/active/sub/job状态。列表尚非两unit active/Job0时，只补读manager的Id/InvocationID与MainPID/ControlGroup，共3次busctl/5次D-Bus调用，继续逐轮核对同代InvocationID/PID/startticks/CG。不得跨轮沿用路径、状态或身份；失败/缺失/换代/进程变化仍拒绝。
+
+列表已显示两unit active/Job0时，在同一轮接续原完整两unit GetUnit、Unit六属性、Service六属性；核对path与列表对应，保留原全部typed属性校验、ready断言、进程/UID/可执行文件、原四kernel limits、最终完整两unit重读和前后proc核验。idle始终完整核验。pending记录不能直接作为ready证据，最终完整核验不降为轻量读取，也不缓存跨轮事实。
+
+沿用32 KiB总诊断、1024字节回执预留、单execute 95秒、5秒清理与原业务入场余量；不增加系统查询/服务启动/重试，不改成功schema、失败摘要或清理合同。纯例将验证每个pending轮只读三次且身份重新取得、候选ready仍走原全量前后核验，以及严格列表/身份/最终变化反例。本片只证明重复读取可减少，实际三事务和正常清理仍未验；测试写完冻结再申请共享guard，不运行真实native或服务。
+
+实现沿用上述拆分，完整路径额外拒绝List path与GetUnit不一致，ready候选也核对本轮List状态与完整属性状态。Context7已查询systemd v255；该条检索仅返回状态稳定性说明，因此十列顺序依据[官方v255 D-Bus文档](https://github.com/systemd/systemd/blob/v255/man/org.freedesktop.systemd1.xml#L1273-L1299)，多属性逐项Get依据[官方busctl实现](https://github.com/systemd/systemd/blob/v255/src/busctl/busctl.c#L1983-L2041)，没有下载或运行systemd包。
+
+新增39项纯case，完整native纯文件 **367项通过**（pytest1.23秒、guard1.845秒、峰值107 MiB/swap 0）。其中同轮替身对比完整观察7次命令与pending观察3次，实际已返回字节后者更少；三轮pending后ready仍执行两unit全部原属性、进程与原四kernel限制、最终完整重读，核对了每轮新的Id/InvocationID/MainPID/CG，非法typed行、重复/共享path、GetUnit不一致和最终属性变化均拒绝。未声称这些纯例证明真实runner会ready或三事务已通过。
+
+初次strict mypy有一项新增require表达式可能返回正则匹配对象的类型错误；两处改为显式 `is not None`，接受/拒绝结果不变，没有重复已绿367全量。最终strict worker mypy通过（496毫秒、峰值162.7 MiB/swap 0），两文件Ruff及format-check通过。全部执行经主仓绝对路径guard、每条30秒串行，pytest返回session已先收真实exit0再开始下一项，所有检查实终态后明确归还共享槽；没有真实子进程/native/CLI/账户/挂载/服务、本地网络集成、push或远端重跑。
+
+独立Sol只读后审未发现确定P1/P2，已核对pending每轮同轮新读取与binding、candidate完整7命令、proc/kernel/final+stat以及原预算；根也复核核心diff与manager_state。审查没有运行检查，真实三事务未验的边界保持。此后仅按授权签名提交并推送一次精确候选，远端结果单独记录，不把纯例或独审当作实际native验收。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。

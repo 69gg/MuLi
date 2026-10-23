@@ -1033,11 +1033,11 @@ class _SetupIO:
         return data
 
 
-async def _manager_units(
+async def _manager_list(
     probe: SystemdProbe, uid: int, facts: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
-    """List before GetUnit: observation must not LoadUnit an absent instance."""
-    from muli.platforms.linux_transaction import _cgroup, _typed
+    """Validate the exact loaded units and their state/path in this round."""
+    from muli.platforms.linux_transaction import _typed
 
     names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
     listed = _typed(
@@ -1062,17 +1062,65 @@ async def _manager_units(
         and all(isinstance(row, list) and len(row) == 10 and row[0] in names for row in listed[0]),
         "native_manager_reply",
     )
-    present = [row[0] for row in listed[0]]
-    require(len(set(present)) == len(present), "native_manager_reply")
+    facts["manager_stage"] = "unit_validation"
+    result: dict[str, dict[str, Any]] = {}
+    for row in listed[0]:
+        require(
+            all(isinstance(row[index], str) for index in (*range(7), 8, 9))
+            and all(not any(char in value for char in "\x00\r\n") for value in row[:7])
+            and all(re.fullmatch(r"[a-z][a-z0-9-]{0,63}", row[index]) for index in (2, 3, 4))
+            and re.fullmatch(r"/org/freedesktop/systemd1/unit/[a-zA-Z0-9_]+", row[6]) is not None
+            and type(row[7]) is int
+            and 0 <= row[7] < 2**31
+            and (
+                re.fullmatch(r"[a-z][a-z0-9-]{0,63}", row[8]) is not None
+                if row[7]
+                else row[8] == ""
+            )
+            and row[9] == (f"/org/freedesktop/systemd1/job/{row[7]}" if row[7] else "/")
+            and row[0] not in result,
+            "native_manager_reply",
+        )
+        result[row[0]] = {
+            "LoadState": row[2],
+            "ActiveState": row[3],
+            "SubState": row[4],
+            "Job": [row[7], row[9]],
+            "path": row[6],
+        }
+    require(len({unit["path"] for unit in result.values()}) == len(result), "native_manager_reply")
+    return result
+
+
+async def _manager_units(
+    probe: SystemdProbe, uid: int, facts: dict[str, Any], *, pending: bool = False
+) -> dict[str, dict[str, Any]]:
+    """Pending rounds bind fresh identity; ready/idle retain full observations."""
+    from muli.platforms.linux_transaction import _cgroup
+
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    listed = await _manager_list(probe, uid, facts)
+    lightweight = pending and not (
+        set(listed) == set(names)
+        and all(
+            unit["ActiveState"] == "active" and unit["Job"] == [0, "/"] for unit in listed.values()
+        )
+    )
     result = {}
     for name in names:
-        if name not in present:
+        if name not in listed:
             continue
-        path = await probe._unit_path(name)
+        if lightweight and name == names[0]:
+            result[name] = listed[name]
+            continue
+        path = listed[name]["path"] if lightweight else await probe._unit_path(name)
+        require(path == listed[name]["path"], "native_manager_changed")
         unit = await probe._properties(
             path,
             "Unit",
-            (
+            (("Id", "s"), ("InvocationID", "ay"))
+            if lightweight
+            else (
                 ("Id", "s"),
                 ("LoadState", "s"),
                 ("ActiveState", "s"),
@@ -1084,7 +1132,9 @@ async def _manager_units(
         service = await probe._properties(
             path,
             "Service",
-            (
+            (("MainPID", "u"), ("ControlGroup", "s"))
+            if lightweight
+            else (
                 ("Type", "s"),
                 ("MainPID", "u"),
                 ("ControlGroup", "s"),
@@ -1094,7 +1144,7 @@ async def _manager_units(
             ),
         )
         facts["manager_stage"] = "unit_validation"
-        job, invocation = unit["Job"], unit["InvocationID"]
+        job, invocation = listed[name]["Job"] if lightweight else unit["Job"], unit["InvocationID"]
         require(
             unit["Id"] == name
             and isinstance(job, list)
@@ -1107,7 +1157,9 @@ async def _manager_units(
             and all(type(item) is int and 0 <= item <= 255 for item in invocation)
             and all(
                 type(service[key]) is int and 0 <= service[key] < 2**31
-                for key in ("MainPID", "ExecMainCode", "ExecMainStatus")
+                for key in (
+                    ("MainPID",) if lightweight else ("MainPID", "ExecMainCode", "ExecMainStatus")
+                )
             ),
             "native_manager_reply",
         )
@@ -1116,17 +1168,35 @@ async def _manager_units(
             all(
                 isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", value)
                 for value in (
-                    unit["LoadState"],
-                    unit["ActiveState"],
-                    unit["SubState"],
-                    service["Type"],
-                    service["Result"],
+                    ()
+                    if lightweight
+                    else (
+                        unit["LoadState"],
+                        unit["ActiveState"],
+                        unit["SubState"],
+                        service["Type"],
+                        service["Result"],
+                    )
                 )
             )
             and (not group or Path(group).name == name),
             "native_manager_reply",
         )
-        result[name] = {**unit, **service, "path": path, "invocation": bytes(invocation).hex()}
+        if pending and not lightweight:
+            require(
+                all(
+                    unit[key] == listed[name][key]
+                    for key in ("LoadState", "ActiveState", "SubState", "Job")
+                ),
+                "native_manager_changed",
+            )
+        result[name] = {
+            **(listed[name] if lightweight else {}),
+            **unit,
+            **service,
+            "path": path,
+            "invocation": bytes(invocation).hex(),
+        }
     return result
 
 
@@ -1197,7 +1267,7 @@ async def manager_state(
                 invocation, binding, late, delay = "", None, False, POLL_SECONDS
                 while True:
                     observed_since = time.monotonic()
-                    units = await _manager_units(probe, uid, facts)
+                    units = await _manager_units(probe, uid, facts, pending=True)
                     facts["manager_stage"] = "manager_validation"
                     require(set(units) == set(names), "native_manager_missing")
                     runtime, manager = (units[name] for name in names)

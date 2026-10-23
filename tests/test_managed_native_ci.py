@@ -2996,17 +2996,50 @@ def manager_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict
             if "ListUnitsByPatterns" in argv:
                 assert argv[-2:] == list(names)
                 control["polls"] += 1
+                state = control["states"][min(control["polls"] - 1, len(control["states"]) - 1)]
+                idle, active = state == "inactive", state == "active"
                 values = (
                     []
                     if control["absent"]
                     else [
-                        [name, "", "loaded", "active", "running", "", paths[name], 0, "", "/"]
+                        [
+                            name,
+                            "",
+                            "loaded",
+                            state,
+                            "dead"
+                            if idle
+                            else "running"
+                            if name == names[-1] and active
+                            else "exited"
+                            if active
+                            else "start",
+                            "",
+                            paths[name],
+                            0 if idle or active else 11,
+                            "" if idle or active else "start",
+                            "/" if idle or active else "/org/freedesktop/systemd1/job/11",
+                        ]
                         for name in names
                     ]
                 )
+                if values:
+                    for key, index in {"LoadState": 2, "ActiveState": 3, "SubState": 4}.items():
+                        if key in control["overrides"]:
+                            values[-1][index] = control["overrides"][key]
+                    if "Job" in control["overrides"]:
+                        job = control["overrides"]["Job"]
+                        values[-1][7:] = [job[0], "start" if job[0] else "", job[1]]
+                    for index, value in control.get("list_row_changes", {}).items():
+                        values[-1][index] = value
+                    if control.get("list_duplicate"):
+                        values[0] = values[-1].copy()
+                    if control.get("list_shared_path"):
+                        values[0][6] = values[-1][6]
                 output = json.dumps({"type": "a(ssssssouso)", "data": [values]})
             elif "GetUnit" in argv:
-                output = json.dumps({"type": "o", "data": [paths[argv[-1]]]})
+                path = paths[argv[-1]] + ("_changed" if control.get("changed_path") else "")
+                output = json.dumps({"type": "o", "data": [path]})
             else:
                 index = argv.index("get-property")
                 fields = argv[index + 4 :]
@@ -3046,6 +3079,9 @@ def manager_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict
                         values[key] = (values[key][0], value)
                     if control.get("change_invocation") and control["polls"] > 1:
                         values["InvocationID"] = ("ay", [11] * 16)
+                    if control["polls"] > 1:
+                        for key, value in control.get("final_overrides", {}).items():
+                            values[key] = (values[key][0], value)
                 output = "\n".join(
                     json.dumps({"type": values[field][0], "data": values[field][1]})
                     for field in fields
@@ -3181,6 +3217,260 @@ async def test_manager_ready_cancel_is_not_converted_to_not_ready(
             worker.MAX_BYTES,
             started=100.0,
         )
+
+
+async def test_manager_pending_rounds_refresh_identity_and_keep_full_ready_proof(
+    manager_observation: dict[str, Any],
+) -> None:
+    control = manager_observation
+    control["states"] = ["activating"] * 3 + ["active"]
+    value = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES - 1024,
+        started=100.0,
+    )
+    assert value["code"] == "ready" and value["used"] <= worker.MAX_BYTES - 1024
+    rounds: list[list[list[str]]] = []
+    for call in control["calls"]:
+        if call[0] != "busctl":
+            continue
+        if "ListUnitsByPatterns" in call:
+            rounds.append([])
+        rounds[-1].append(call)
+    assert len(rounds) == 5  # Three pending, one complete candidate, one complete final read.
+    for calls in rounds[:3]:
+        assert len(calls) == 3 and not any("GetUnit" in call for call in calls)
+        assert [call[call.index("get-property") + 4 :] for call in calls[1:]] == [
+            ["Id", "InvocationID"],
+            ["MainPID", "ControlGroup"],
+        ]
+    for calls in rounds[3:]:
+        assert sum("GetUnit" in call for call in calls) == 2
+        fields = [
+            call[call.index("get-property") + 4 :] for call in calls if "get-property" in call
+        ]
+        assert (
+            fields.count(["Id", "LoadState", "ActiveState", "SubState", "Job", "InvocationID"]) == 2
+        )
+        assert (
+            fields.count(
+                ["Type", "MainPID", "ControlGroup", "Result", "ExecMainCode", "ExecMainStatus"]
+            )
+            == 2
+        )
+    assert control["read_count"] == 7
+    assert {path.name for path in control["files"]} >= {
+        "status",
+        "cgroup",
+        "memory.max",
+        "memory.swap.max",
+        "pids.max",
+        "cpu.max",
+    }
+
+
+async def test_manager_pending_same_round_output_is_smaller_than_complete_observation(
+    manager_observation: dict[str, Any],
+) -> None:
+    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+
+    control = manager_observation
+    control["states"] = ["activating"]
+    facts: dict[str, Any] = {}
+    counts: list[tuple[int, int]] = []
+    for pending in (False, True):
+        control["calls"].clear()
+        io = worker._SetupIO(180.0, worker.MAX_BYTES - 1024, facts)
+        probe = SystemdProbe(runner=io.query, limits=ProbeLimits(command_bytes=worker.MAX_BYTES))
+        units = await worker._manager_units(probe, control["uid"], facts, pending=pending)
+        manager = units[f"user@{control['uid']}.service"]
+        assert manager["invocation"] == "0a" * 16 and manager["MainPID"] == 42
+        counts.append((len(control["calls"]), io.used))
+    assert counts[0][0] == 7 and counts[1][0] == 3
+    assert 0 < counts[1][1] < counts[0][1] <= worker.MAX_BYTES - 1024
+
+
+@pytest.mark.parametrize(
+    "index,value",
+    [
+        (0, "other.service"),
+        (1, 0),
+        (1, "private\ntext"),
+        (2, True),
+        (2, "bad state"),
+        (3, "bad state"),
+        (4, "bad state"),
+        (5, None),
+        (6, "/private"),
+        (6, 0),
+        (7, True),
+        (7, -1),
+        (7, 2**31),
+        (8, ""),
+        (8, 0),
+        (9, "/"),
+    ],
+)
+async def test_manager_pending_list_is_strict_before_identity_queries(
+    manager_observation: dict[str, Any],
+    index: int,
+    value: Any,
+) -> None:
+    control = manager_observation
+    control["states"] = ["activating"]
+    control["list_row_changes"] = {index: value}
+    result = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+    )
+    assert result["code"] == "native_manager_reply"
+    assert len(control["calls"]) == 1 and not control["files"]
+
+
+@pytest.mark.parametrize("case", ["duplicate", "shared-path", "changed-path"])
+async def test_manager_list_never_grants_another_unit_path(
+    manager_observation: dict[str, Any],
+    case: str,
+) -> None:
+    control = manager_observation
+    control[
+        {
+            "duplicate": "list_duplicate",
+            "shared-path": "list_shared_path",
+            "changed-path": "changed_path",
+        }[case]
+    ] = True
+    result = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+    )
+    assert result["code"] == (
+        "native_manager_changed" if case == "changed-path" else "native_manager_reply"
+    )
+    assert not control["files"]
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("Id", "other.service"),
+        ("InvocationID", []),
+        ("InvocationID", [True] * 16),
+        ("MainPID", True),
+        ("MainPID", -1),
+        ("ControlGroup", "/other.service"),
+    ],
+)
+async def test_manager_pending_identity_remains_strict(
+    manager_observation: dict[str, Any],
+    key: str,
+    value: Any,
+) -> None:
+    control = manager_observation
+    control["states"] = ["activating"]
+    control["overrides"][key] = value
+    result = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+    )
+    assert result["code"] != "ready" and len(control["calls"]) == 3
+    assert not control["files"]
+
+
+@pytest.mark.parametrize("key", ["Id", "InvocationID", "MainPID", "ControlGroup"])
+async def test_manager_pending_rechecks_identity_on_next_round(
+    manager_observation: dict[str, Any],
+    key: str,
+) -> None:
+    control = manager_observation
+    control["states"] = ["activating"]
+    control["final_overrides"] = {
+        key: {
+            "Id": "other.service",
+            "InvocationID": [11] * 16,
+            "MainPID": 0,
+            "ControlGroup": "/changed" + control["group"],
+        }[key]
+    }
+    result = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+    )
+    assert result["code"] == ("native_manager_reply" if key == "Id" else "native_manager_changed")
+    assert control["polls"] == 2 and len(control["calls"]) == 6
+
+
+@pytest.mark.parametrize("index,value", [(2, "not-found"), (3, "activating"), (4, "exited")])
+async def test_manager_ready_requires_same_round_list_and_complete_property_state(
+    manager_observation: dict[str, Any],
+    index: int,
+    value: str,
+) -> None:
+    control = manager_observation
+    control["list_row_changes"] = {index: value}
+    result = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+    )
+    assert result["code"] != "ready"
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("Type", "simple"),
+        ("Result", "exit-code"),
+        ("ExecMainStatus", 1),
+        ("InvocationID", [11] * 16),
+        ("MainPID", 43),
+    ],
+)
+async def test_manager_final_observation_still_reads_all_original_properties(
+    manager_observation: dict[str, Any],
+    key: str,
+    value: Any,
+) -> None:
+    control = manager_observation
+    control["final_overrides"] = {key: value}
+    result = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+    )
+    assert result["code"] == "native_manager_changed" and control["polls"] == 2
 
 
 def test_no_block_start_is_single_admission_and_lost_ack_cannot_enter_harness(
