@@ -1,6 +1,29 @@
-# 自动提示中的冲突证据组合（2.44候选）
+# 自动提示中的冲突证据组合（2.44.0）
+
+## 发版闭合
+
+2026-10-24，v2.44.0已正式发布。最终签名提交为`77af672c2439dbd80b38ab60872721e465129713`，[PR51](https://github.com/69gg/MuLi/pull/51)原提交合入main；[精确候选CI40037820735](https://github.com/69gg/MuLi/actions/runs/40037820735)与[main CI40038781909](https://github.com/69gg/MuLi/actions/runs/40038781909)各十项全部成功，[发行40038781441](https://github.com/69gg/MuLi/actions/runs/40038781441)十三项全部成功。
+
+main与签名标签已原子推送。注释标签对象`e02b030c0d5be1d1593ca8178640d055011c8bb8`指向上述提交；本地有效GPG验签及GitHub `verification.verified=true/reason=valid`均已核对。仅以小型元数据核对[PyPI 2.44.0](https://pypi.org/project/muli-agent/2.44.0/)和[GitHub release](https://github.com/69gg/MuLi/releases/tag/v2.44.0)，两构件名称、大小和SHA-256一致：
+
+| 构件 | 字节数 | SHA-256 |
+| --- | --- | --- |
+| `muli_agent-2.44.0-py3-none-any.whl` | 806907 | `63a50cfab3ccda69fa39a1e644510e5890998d010fbb87ae3ed10a0bb7aeefbd` |
+| `muli_agent-2.44.0.tar.gz` | 4218513 | `679b78e2dd34c5d046ef45e3d82fc89b594d79a01d16d98cc0a837828f823400` |
+
+没有下载发行包或依赖；本地验证构件不声称与远端sdist字节一致。原Windows夹具失败和修复证据保留在以下开发检查点；真实模型质量、账号送达和Linux原生服务三事务仍不由本版绿色替代。
+
+## 历史开发检查点
 
 2026-10-24。v2.44候选已完成生产实现、完整后端、静态检查、多轮独立后审修复及离线构件验证，元数据已统一为2.44.0；尚未远端CI或发行。不能据版本号认定已发布；先前发行与原生验证也不由本片离线绿色替代。
+
+最新状态：最终准备签名`77eb82c82164a1e53f98df1c0f1712f30bedfe3d`已建立[PR51](https://github.com/69gg/MuLi/pull/51)，精确[CI40036682082](https://github.com/69gg/MuLi/actions/runs/40036682082)最终八项成功、Windows3.12/3.13两项失败，未发行。两平台各6 failed/3,792 passed/1,457 skipped，均止于新增固定记忆评估的B/C背景工具正文逐字断言；本轮不涉及旧UIA或格式读取超时。
+
+根读取两份具体job日志，确认夹具`Path.write_text`按Windows默认将LF转为CRLF，而真实`fs_read`保留文件字节；oracle仍为LF。现只用UTF-8编码后的`write_bytes`创建固定资料，不修改文件工具、模型请求、Compactor或逐字断言。八文件记忆/压缩相关125项重验通过，pytest1.88秒、守卫2.556秒、140.1MiB/swap0、实际exit0；这只证明本机回归，新精确Windows候选仍须CI。原失败流水线保持可见，不以重跑旧提交替代修复。
+
+另一Sol只读独立复核真实`Files._read`的二进制读取与夹具、生命周期上下文，确认只固定输入字节，完整保留逐字、覆盖、prefix_digest、原档及正常重开身份断言，没有剩余P1/P2；审查未执行平台检查，不作为Windows通过证据。
+
+此单行夹具修正后，全仓Ruff及373文件格式检查通过；离线wheel/sdist重建1.316秒、98.2MiB，源码外offline/no-deps安装与完整冒烟1.239秒、99MiB，一致性校验173毫秒、19.8MiB，均原30秒守卫、swap0、实际exit0。没有生产或版本变动，沿用已有146源严格类型与完整后端证据，不重复全量消耗；下一精确候选由远端从签名提交重建。
 
 最新整合基线为2.43最终签名`839999d`，精确候选/main各十项、发行十三项已全部成功，PR50原提交合入，签名与PyPI/GitHub两构件核对一致，见[2.43闭合](review-v2.43.md#发版闭合)。下述九项成功/排队是此前检查点。新增固定记忆评估只改测试与文档，11项及包含它的八文件125项整合均通过，证据见下一节；本片2.44仍待精确远端CI与发行。
 
