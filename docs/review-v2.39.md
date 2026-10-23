@@ -1,6 +1,6 @@
 # 2.39：按需核查长期任务
 
-状态：实现、独立后审、本地整合与离线安装验证完成，待精确候选远端 CI；尚未发布。
+状态：2.39.0 已正式发布。精确候选十项、发行十三项成功；main 九项成功、Windows 3.12 一项失败。签名标签及 PyPI/GitHub 两构件元数据已核对，不能把发行成功等同于 main 全部通过。
 
 ## 交付合同
 
@@ -18,9 +18,26 @@
 
 全仓 Ruff、356 文件格式检查、143 生产文件 strict mypy 通过；mypy 2.982 秒、220.2 MiB。离线锁验证 83 包未增加依赖。wheel/sdist 离线构建 1.374 秒、96.2 MiB；独立临时目录中仅安装本地单 wheel（no-deps/offline），原有导入、兼容声明、静态资源、API、提示词、默认关闭桌面和任务控制/lifespan 冒烟通过，1.493 秒、99.2 MiB。发行校验确认源版本、声明、changelog、wheel、sdist 一致，209 毫秒、19.6 MiB。所有结果均真实退出码 0、swap 0，不接触真实用户数据、设备、渠道或外部模型。
 
+## 远端交付核验（2026-10-24）
+
+交付提交为 `340f882cf2362190289bed088de160e61fd84caa`，提交与注释标签 `v2.39.0` 均通过有效 GPG 校验。标签对象为 `dee201ec11aded426c23716e37ac186832fe73d1`，非强制原子推送 main 和标签；[PR #45](https://github.com/69gg/MuLi/pull/45) 已合入。
+
+- [精确候选 39982235354](https://github.com/69gg/MuLi/actions/runs/39982235354)：十项全部成功。
+- [main 39983363804](https://github.com/69gg/MuLi/actions/runs/39983363804)：九项成功、Windows 3.12 失败。精确 job `120516118243` 为 1 failed / 3563 passed / 1429 skipped；失败发生在 `test_channel_configuration_revocation_rejects_waiting_owner` 的 Runtime 创建期间，格式证据读取在首条 sqlite_schema 查询返回后的期限复核抛出 `format_read_timeout`，尚未进入渠道撤销逻辑。整例 call 为 2.59 秒，不能据此称 SQL 耗时 2.59 秒，也没有足够阶段、调度或 I/O 证据解释根因。原 1 秒读取边界未放宽。
+- [发行 39983363864](https://github.com/69gg/MuLi/actions/runs/39983363864)：十三项全部成功，和上述候选/main 都是同一精确提交。[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.39.0)（ID `422046389`）及 [PyPI 2.39.0](https://pypi.org/project/muli-agent/2.39.0/) 已存在。
+
+只直连获取有限 JSON，没有下载远端 wheel/sdist。PyPI 项目名、版本、两个文件名和类型、未撤回状态，与 GitHub 非草稿正式发行的两个构件数量、大小和 SHA-256 均一致：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.39.0-py3-none-any.whl` | 783044 | `cc105a4787babbec61a01f6279bce1837f4def3a647e4fb9a6e63c9f2dd16a44` |
+| `muli_agent-2.39.0.tar.gz` | 4041504 | `e31d0c0a3ddd4313b5cbd34aecefd4023c678ce353d29dd3240975fa653abcce` |
+
+元数据核验同样经过本地守卫：真实退出码 0、76 毫秒、峰值 15.4 MiB、swap 0。发行中的 Windows 两项成功不证明其它运行里的间歇失败已修复。
+
 ## 保留边界
 
 - 显式正文读取一条已有对象；不宣称对任意巨大对象做存储层流式访问。目录不加载 prompt/result/nodes/content；任务本体及显式本地记忆候选仍由既有实现读取。
 - 目录 consistency=live，不是跨全部对象的强一致历史快照。正文变化拒绝拼旧页；候选仅覆盖既有 max_candidates，是否被采用未知。
 - 已删除依据不从历史摘要恢复；报告正文只能读取已保存内容，入库前丢弃的结果不可恢复。资料始终不是新的权限或主人指令。
-- 真实供应商和用户渠道未实测。Linux 原生服务三事务仍未验收；第十二轮旧分支候选 39979235619（691ea5c）为九绿二红：native 输出预算失败，Windows 3.13 四项真实 UIA 超时。此处不声称新功能修复这些独立问题，也不把将来绿色当作根因已证。
+- 真实供应商和用户渠道未实测。Linux 原生服务三事务仍未验收；第十二轮旧分支候选 39979235619（691ea5c）为九绿二红：native 输出预算失败，Windows 3.13 四项真实 UIA 超时。第十三轮 39982801787（28e0452）的 native 约 90 秒后命令超时，0 事务，无 manager 失败摘要；清理记录显示账户、组及挂载已移除，但整体清理证明仍失败。当前 main 的格式读取失败和旧 UIA 启动失败属于不同观测，不声称本功能修复它们，也不把其它绿色当作根因已证。
