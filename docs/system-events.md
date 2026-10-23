@@ -4,6 +4,8 @@
 
 配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 只关闭既有 reminder/update/management 三类。
 
+Linux [资料收件目录](file-inbox.md)是独立的 `file_inbox.observed` 宿主来源，不伪装成日志，也不受日志严重级别控制。它通过内核事件生成有限元数据与覆盖缺口，默认关闭；沿同一 Attention 只读回合和冻结主动路由处理。目录事件不会触发 owner hooks 或自动取得整理、外发及配置权限。
+
 Runtime 在其它组件启动前建立私有 logger，在关闭 Store 前移除采集器，不修改全局 logging 配置。运行失败记录携带固定 runtime/runtime_failed 与真实 run/session 引用，自主 watch 使用固定 extensions/extension_reload_failed，MCP 接收守卫使用 extensions 与六码之一；不保存异常正文。首次 await 前已识别的系统输入禁止再次通知，覆盖 ingress 尚未关联 run_id 时的启动失败；消费后的归属仍由精确 run_id 查询验证。配置恢复同时恢复采集策略。API 状态中的 `system_events` 返回运行、队列、丢弃、去重和持久化计数。
 
 ## 宿主接口

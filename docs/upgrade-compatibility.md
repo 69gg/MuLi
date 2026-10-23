@@ -10,7 +10,9 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 2.29.0、`metadata_version=1`、交接协议 2、无需迁移，以及七领域各 `reads=[1]`、`writes=1`。这些 ID 对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[七领域合同 1](fresh-format-admission.md#七领域合同-1)；`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的当前正式版本（以 `release` 为准）、`metadata_version=1`、交接协议 2、无需迁移，以及七领域各 `reads=[1]`、`writes=1`。这些 ID 对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[七领域合同 1](fresh-format-admission.md#七领域合同-1)；`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
+
+未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 
 现有 Hatch `packages=["src/muli"]` 将包内非 Python 资产一并选入，不需要另造 manifest 生成器或增加强制覆盖规则，见 [Hatch 文件选择](https://hatch.pypa.io/latest/config/build/#file-selection)。构建必须保留源码中的真实文件；进程回归复制整个有界 MuLi 包并沿用它，不再临时写出一份自报声明。
 

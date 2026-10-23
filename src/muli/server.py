@@ -29,6 +29,7 @@ from muli.config import ConfigFile, Settings, default_config_path, default_data_
 from muli.conversation import MAX_EVENT_ID_CHARS
 from muli.evidence import EvidenceError
 from muli.extensions import ExtensionError
+from muli.file_inbox import FileInbox, FileInboxSettings
 from muli.history_evidence import HistoryEvidence
 from muli.integrations.attention import ChiliarchAttentionInput
 from muli.local_services import LocalServices
@@ -194,10 +195,13 @@ def _create_app(
 ) -> FastAPI:
     bound_host, bound_port = config.settings.server.host, listen_port or config.settings.server.port
     bound_loopback = bound_host == "localhost" or ipaddress.ip_address(bound_host).is_loopback
+    file_inbox = FileInbox(runtime, closing=lambda: configuration_closing)
+    runtime.add_tool_provider(file_inbox.tools)
     attention = AttentionInbox(
         runtime,
         lambda: config.settings.system_events,
         chiliarch_settings=lambda: integration.attention_settings(),
+        file_inbox_settings=file_inbox.settings_state,
     )
     service = UserService(config.path, runtime.data_dir)
     authentication = Authentication(config)
@@ -246,11 +250,13 @@ def _create_app(
             await channel_application.reconfigure()
             await personal_io.reconfigure()
             await integration.start()
+            await file_inbox.reconfigure()
             await attention.reconfigure()
             await web_voice.reconfigure()
 
         async def apply() -> None:
             try:
+                await file_inbox.close()
                 await attention.close()
                 await web_voice.aclose()
                 await integration.close()
@@ -312,6 +318,7 @@ def _create_app(
         else:
             await runtime.startup()
         await attention.start()
+        await file_inbox.start()
         await memory_application.start()
         await channel_application.start()
         await personal_io.start()
@@ -337,6 +344,7 @@ def _create_app(
         await management.close()
         async with runtime.configuration_lock:
             pass  # An admitted API transaction must settle before Store closes.
+        await file_inbox.close()
         await attention.close()
         await web_voice.aclose()
         await integration.close()
@@ -412,6 +420,7 @@ def _create_app(
     app.state.management, app.state.plugins = management, plugins
     app.state.memory_application = memory_application
     app.state.attention = attention
+    app.state.file_inbox = file_inbox
     app.state.channel_application, app.state.personal_io = channel_application, personal_io
     app.add_middleware(BodyLimitMiddleware)
     install_maintenance_routes(
@@ -853,9 +862,30 @@ def _create_app(
             "voice": personal_io.voice.status(),
             "web_voice": web_voice.status(),
             "attention": attention.status(),
+            "file_inbox": file_inbox.status(),
             "system_events": runtime.system_events.status(),
             "limits": settings.limits.model_dump(),
         }
+
+    @app.get("/api/file-inbox")
+    async def file_inbox_records(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+        return {"status": file_inbox.status(), "items": file_inbox.list_records(limit)}
+
+    @app.get("/api/file-inbox/settings")
+    async def file_inbox_settings() -> dict[str, Any]:
+        return file_inbox.status()
+
+    @app.put("/api/file-inbox/settings")
+    async def configure_file_inbox(body: FileInboxSettings) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            return await file_inbox.configure(body)
+
+    @app.get("/api/file-inbox/{identifier}")
+    async def file_inbox_record(identifier: str) -> dict[str, Any]:
+        record = file_inbox.locate(identifier)
+        if record is None:
+            raise HTTPException(status_code=404, detail="资料记录不存在或授权已撤销")
+        return record
 
     @app.get("/api/settings")
     async def settings() -> dict[str, Any]:

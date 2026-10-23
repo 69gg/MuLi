@@ -69,6 +69,7 @@ class ChannelApplication:
                     "extensions_watch",
                     "mcp_connection",
                     "chiliarch_message",
+                    "file_inbox",
                 ],
                 "memory_status": {"valid": reason == "valid", "reason": reason},
             },

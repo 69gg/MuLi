@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 
 from muli.config import AttentionSettings
+from muli.file_inbox import FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState
 from muli.proactive import FrozenRouting
 from muli.runtime import Runtime
@@ -22,7 +24,7 @@ _HEADER = (
 )
 
 
-class _ChiliarchPolicyChanged(ValueError):
+class _ProducerPolicyChanged(ValueError):
     """Reconsume immediately so an invalidated source cannot block reminders."""
 
 
@@ -33,10 +35,12 @@ class AttentionInbox:
         system_settings: Callable[[], SystemEventsSettings] | None = None,
         *,
         chiliarch_settings: Callable[[], ChiliarchAttentionState] | None = None,
+        file_inbox_settings: Callable[[], FileInboxState] | None = None,
     ) -> None:
         self.runtime, self.store, self.bus = runtime, runtime.store, runtime.bus
         self._system_settings = system_settings
         self._chiliarch_settings = chiliarch_settings
+        self._file_inbox_settings = file_inbox_settings
         self._task: asyncio.Task[None] | None = None
         self._closing = True
         self._generation = 0
@@ -120,7 +124,12 @@ class AttentionInbox:
         chiliarch_policy: ChiliarchAttentionState | None = None,
     ) -> dict[str, Any] | None:
         source = attention_source(
-            self.store, event, policy.events, system_policy, chiliarch_policy=chiliarch_policy
+            self.store,
+            event,
+            policy.events,
+            system_policy,
+            chiliarch_policy=chiliarch_policy,
+            file_inbox_policy=self._file_inbox_settings() if self._file_inbox_settings else None,
         )
         if source is None:
             return None
@@ -135,6 +144,9 @@ class AttentionInbox:
             "detail": source.detail,
             "routing": source.routing.dump(),
             "producer_proof": source.producer_proof,
+            "file_inbox_proof": asdict(source.file_inbox_proof)
+            if source.file_inbox_proof
+            else None,
         }
 
     @staticmethod
@@ -144,7 +156,7 @@ class AttentionInbox:
                 {
                     key: value
                     for key, value in record.items()
-                    if key not in {"receipt_id", "routing", "producer_proof"}
+                    if key not in {"receipt_id", "routing", "producer_proof", "file_inbox_proof"}
                 }
                 for record in records
             ],
@@ -210,6 +222,10 @@ class AttentionInbox:
         for event in events:
             record = self._record(event, policy, system_policy, chiliarch_policy)
             if record is not None and record["receipt_id"] not in seen:
+                if records and bool(records[0]["file_inbox_proof"]) != bool(
+                    record["file_inbox_proof"]
+                ):
+                    break
                 selected = FrozenRouting.load(record["routing"])
                 if routing is not None and routing.batch_key != selected.batch_key:
                     break
@@ -249,6 +265,22 @@ class AttentionInbox:
             ):
                 raise ValueError("注意事项策略已改变")
             for record in records:
+                file_proof = record["file_inbox_proof"]
+                if file_proof is not None:
+                    current_file = (
+                        self._file_inbox_settings() if self._file_inbox_settings else None
+                    )
+                    event = {
+                        "id": record["event_id"],
+                        "type": "file_inbox.observed",
+                        "data": {
+                            "id": record["record_id"],
+                            "source": "file_inbox",
+                            **file_proof,
+                        },
+                    }
+                    if current_file is None or read_record(self.store, event, current_file) is None:
+                        raise _ProducerPolicyChanged("资料收件目录授权已改变")
                 proof = record["producer_proof"]
                 if proof is not None:
                     current = (
@@ -259,7 +291,7 @@ class AttentionInbox:
                         or not current.enabled
                         or proof != (current.scope, current.revision)
                     ):
-                        raise _ChiliarchPolicyChanged("chiliarch 消息提醒策略已改变")
+                        raise _ProducerPolicyChanged("chiliarch 消息提醒策略已改变")
 
         batch_id = f"events:{records[0]['event_id']}:{after}"
         objects = [("attention_state", self._state(after, True))]
@@ -275,6 +307,11 @@ class AttentionInbox:
                     "routing": record["routing"],
                     "status": "accepted",
                     **(
+                        {"file_inbox_proof": record["file_inbox_proof"]}
+                        if record["file_inbox_proof"] is not None
+                        else {}
+                    ),
+                    **(
                         {"producer_proof": record["producer_proof"]}
                         if record["producer_proof"] is not None
                         else {}
@@ -283,6 +320,16 @@ class AttentionInbox:
             )
             for record in records
         )
+        if records[0]["file_inbox_proof"] is not None:
+            input_id = hashlib.sha256(
+                f"{session['id']}\0system:attention\0{batch_id}".encode()
+            ).hexdigest()
+            objects.append(
+                (
+                    "file_inbox_admission",
+                    {"id": input_id, "revision": records[0]["file_inbox_proof"]["revision"]},
+                )
+            )
         try:
             receipt = await self.runtime.submit_attention(
                 self._content(records),
@@ -291,9 +338,9 @@ class AttentionInbox:
                 admission_guard=guard,
                 routing=routing,
             )
-        except _ChiliarchPolicyChanged:
-            # The next bounded pass excludes stale Chiliarch records and still
-            # admits valid reminders from this batch, without needing a new event.
+        except _ProducerPolicyChanged:
+            # Reconsume the bounded journal suffix so stale source facts cannot
+            # prevent unrelated reminders from being admitted.
             return True
         if receipt is None:
             if not self.runtime.maintenance.admission.allowed:
