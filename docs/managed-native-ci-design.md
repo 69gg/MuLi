@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald 的既有 245 项纯 fixture；本轮单次 job 准入与统一 95 秒期限已实现并通过独立审查，完整 301 项纯回归与限定静态检查通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五至九轮仍未执行事务；后续已观察到 manager 镜像和 epoll 等待，但未确定启动原因，第九轮没有接受到固定四类 journal 正向事件。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；第九轮精确证据与本轮纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald 的既有 245 项纯 fixture；本轮单次 job 准入与统一 95 秒期限已实现并通过独立审查，完整 301 项纯回归与限定静态检查通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五至九轮仍未执行事务；后续已观察到 manager 镜像和 epoll 等待，但未确定启动原因，第九轮没有接受到固定四类 journal 正向事件。第十轮 native job 已失败，仍为 0 个事务、没有 readiness 或正常清理证明；取证时其余矩阵尚未终态。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与本轮纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -267,5 +267,19 @@ receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 
 三份 Python 文件 Ruff 检查通过，首稿 format 检查仅排版失败后已格式化。两脚本 strict mypy 最终通过；首次发现可扩展命令 tuple 被推断成固定长度，改为显式 `tuple[str, ...]`。guard 不转发外层 `MYPYPATH`，因此在 guard 内为目标 tests/src 设置模块搜索路径，并使用 `--explicit-package-bases`；没有改变项目规则。类型检查峰值 168.2 MiB/swap 0。所有执行均经 root 绝对路径 guard、每条 30 秒串行；全部 subprocess、系统文件、进程和时钟边界由纯 fake 注入，真实效果入口硬拒绝。本片没有本机原生 CLI、systemd、账户、挂载、网络、模型或服务效果，也没有新的远端重跑。九轮仍仅支持前述 **0 个事务、正常清理未通过**的历史结论；不据纯例宣称真实 manager 已 ready、三个事务完成或清理成功。
 
 最终独立只读审查确认：轮前 `observed_since` 已闭合 late-ready 的采样边界问题；独立 cleanup 的旧结果读取只继承通过归属、权限、文件类型、字节上限与白名单验证的 readiness 元数据，不授予 completed 或 cleanup 成功。后续未发现确定 P1/P2。保留原 prepare 的 kernel 二次复核作为既有资源事实，新 readiness 核限读取已计入观察预算。审查未运行检查；301 项之后仅有格式、tuple 类型注解与本段文档变更，未改变行为。
+
+## 第十轮 native 失败取证（流水线取证时未终态）
+
+精确签名合并候选 `3f0abb3400860ed3ab560b5c34e315bde40a710f` 的 [run 39968348139](https://github.com/69gg/MuLi/actions/runs/39968348139) attempt 1 中，[native job 120464058434](https://github.com/69gg/MuLi/actions/runs/39968348139/job/120464058434) 已于 2026-10-23 22:18:53（Asia/Shanghai）终态失败。一次取证查询得到 run 仍为 `in_progress/conclusion=null`；其余矩阵尚未终态，不将 native job 的结束写成整轮结束，也没有继续轮询。
+
+有限 job 日志保存于 `/tmp/muli-native-39968348139-120464058434.log`。事务步骤从 22:17:32 左右进入，22:18:45 输出 `native_manager_observation`；独立 always cleanup 随后执行，并于 22:18:50 输出 `native_cleanup_deadline`，两个步骤均非零退出。前述约 72.9 秒包含准备与观察，不能当作 manager 自身等待时长，更不能声称已耗尽完整 95 秒或触及 systemd startup timeout。
+
+只下载元数据确认大小为 **997 字节**的 [managed-native-evidence 12507977390](https://github.com/69gg/MuLi/actions/runs/39968348139/artifacts/12507977390)，未下载同时列出的其他包。zip SHA256 为 `b0ae8e1f5fd09b59b2616dbfaab6df3d7ae816173ffb6338a14a9c2ece5c22c4`，与上传日志一致。本地一次 guard 只读先核两个 entry 的名字、非目录/非符号链接类型与大小，再读有限 JSON，没有解压写盘或执行内容；只有 `receipt.json` **1154 字节**和 `result.json` **533 字节**。该次 guard 服务 75 毫秒、峰值 15.7 MiB/swap 0，完成即归还；没有运行测试或本机原生 fixture。
+
+- receipt：UID=999、GID=987，`user_created=true`，`setup_phase=manager_show_before`，专用环境文件已确认；`manager_group` 为空，仍记录三个挂载，`user_removed=false/group_removed=false`。
+- result：`completed=false/stage=manager_setup/code=setup_failed`，`timeline=[]/generations=[]`。仅有 setup resource；`client_code=command_failed/diagnostic_code=command_failed/diagnostic_status=null`，观察 stage、failure、query、process 与 journal 均为 `not_started`，unit 为空、units 与 events 为空。
+- **0 个事务**，没有 harness 业务结果，也没有 `manager_readiness`；不能据缺失的观察推出 unit 当前状态、同代 activating 是否跨过 5 秒、用户 bus 可用性或启动根因。cleanup 的实际命令已失败，receipt 没有证明账户、组或三个挂载已回收，正常清理仍未通过。
+
+本次仅记录有限失败证据，不修改实现、不重跑 CI；前九轮历史计数及精确证据保持。此处确认的终态只属于 native job，其余 job 的后续结果不在本次单次取证范围内。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
