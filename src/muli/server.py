@@ -715,6 +715,7 @@ def _create_app(
     async def inspect_task(
         identifier: str,
         section: str = "overview",
+        agent_id: Annotated[str | None, Query(min_length=1)] = None,
         cursor: Annotated[str | None, Query(min_length=1)] = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
         query: str | None = None,
@@ -727,6 +728,7 @@ def _create_app(
         return local_services.task_inspection.read(
             identifier,
             section=section,
+            agent_id=agent_id,
             cursor=cursor,
             limit=limit,
             query=query,

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from muli.compatibility import FormatState
+from muli.evidence import EvidenceError
 from muli.format_admission import (
     FormatAdmissionError,
     publish_created_format,
@@ -391,6 +392,47 @@ class Store:
             "SELECT data FROM objects WHERE kind=? AND id=?", (kind, identifier)
         ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def bounded_object(
+        self, kind: str, identifier: str, *, max_bytes: int
+    ) -> dict[str, Any] | None:
+        """Point-read complete JSON only after SQLite has checked its byte budget."""
+        if type(max_bytes) is not int or not 1 <= max_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("对象字节预算必须是正整数")
+        row = self.db.execute(
+            "SELECT length(CAST(data AS BLOB)) AS size,"
+            "CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
+            "THEN data END AS data FROM objects WHERE kind=? AND id=?",
+            (max_bytes, kind, identifier),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["size"] > max_bytes:
+            raise EvidenceError("output_budget", "完整持久对象超过核查字节预算")
+        try:
+            item = json.loads(row["data"])
+            if not isinstance(item, dict) or item.get("id") != identifier:
+                raise ValueError
+            # Digests and tool output must also be valid UTF-8, including escaped strings.
+            json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, RecursionError, UnicodeError) as exc:
+            raise EvidenceError("content_unavailable", "持久对象无法完整核查") from exc
+        return item
+
+    def message_evidence_window(
+        self, session_id: str, *, limit: int, metadata_bytes: int
+    ) -> builtins.list[dict[str, Any]]:
+        """Take raw indexed mappings first: broken rows consume the finite window."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("消息窗口需要 1–101 条映射")
+        if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("映射字节预算必须是正整数")
+        rows = self.db.execute(
+            "SELECT seq,CASE WHEN length(CAST(message_id AS BLOB))<=? THEN message_id END "
+            "AS message_id FROM message_order WHERE session_id=? ORDER BY seq DESC LIMIT ?",
+            (metadata_bytes, session_id, limit),
+        )
+        return [dict(row) for row in rows]
 
     def list(self, kind: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.db.execute(

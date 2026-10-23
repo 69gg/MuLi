@@ -97,6 +97,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [工作流结果回原渠道](docs/workflow-origin-design.md)
 - [任务暂停、补充要求与重新规划](docs/task-control.md)
 - [核查长期任务、报告与记忆依据](docs/task-inspection.md)
+- [按最新证据接办队友任务（开发中）](docs/task-handoff.md)
 - [上下文与长任务](docs/context.md)
 - [个人记忆设计](docs/memory.md)
 - [MCP 扩展](docs/mcp.md)

@@ -6,17 +6,20 @@ import base64
 import binascii
 import hashlib
 import json
+import sqlite3
 from collections.abc import Callable
 from typing import Any
 
 from muli.commitments import Commitments
 from muli.evidence import EvidenceError, content_page, json_size, validate_integer
+from muli.history_evidence import HistoryEvidence
 from muli.memory import Memory
 from muli.store import new_id
 from muli.task_control import ControlUnavailable, TaskControl
 from muli.tools import Tool, parameters, string
 
-SECTIONS = ("overview", "task", "agents", "reports", "workflows", "evidence", "memories")
+SECTIONS = ("overview", "task", "agents", "reports", "workflows", "evidence", "memories", "handoff")
+_MAX_HANDOFF_RECORDS = 100
 _KINDS = {"agents": "agent", "reports": "team_report", "workflows": "workflow_run"}
 _FIELDS = {
     "agents": ("id", "name", "status", "session_id", "run_id", "completion_revision"),
@@ -44,11 +47,247 @@ def _digest(value: Any) -> str:
 
 
 class TaskInspection:
-    def __init__(self, commitments: Commitments, control: TaskControl, memory: Memory) -> None:
+    def __init__(
+        self,
+        commitments: Commitments,
+        control: TaskControl,
+        memory: Memory,
+        *,
+        max_handoff_records: Callable[[], int] = lambda: _MAX_HANDOFF_RECORDS,
+    ) -> None:
         if commitments.store is not control.store or commitments.store is not memory.store:
             raise ValueError("任务核查必须共用资料库")
         self.commitments, self.control, self.memory = commitments, control, memory
         self.store = commitments.store
+        self.max_handoff_records = max_handoff_records
+
+    def handoff_limits(self) -> tuple[int, int]:
+        maximum = self.max_handoff_records()
+        if type(maximum) is not int or maximum < 1:
+            raise EvidenceError("output_budget", "接办记录与父链预算不足")
+        return min(maximum, _MAX_HANDOFF_RECORDS), self.commitments.max_output_chars() * 4
+
+    def _handoff_execution(
+        self, agent: dict[str, Any], identifier: str, byte_budget: int
+    ) -> tuple[dict[str, Any], list[Any]]:
+        execution: dict[str, Any] = {
+            "availability": "unknown",
+            "side_effect_status": "unknown",
+            "run": None,
+            "report": None,
+        }
+        run_id = agent.get("run_id")
+        if run_id is None:
+            return execution, []
+        if not isinstance(run_id, str) or not run_id:
+            raise EvidenceError("content_unavailable", "队友执行关联无效")
+        # send() queues a new turn before _run() replaces its previous run ID.
+        if agent.get("status") == "queued":
+            execution["availability"] = "historical"
+            return execution, []
+        run = self.store.bounded_object("run", run_id, max_bytes=byte_budget)
+        report = self.store.bounded_object("team_report", run_id, max_bytes=byte_budget)
+        if run is not None and run.get("session_id") != agent["session_id"]:
+            raise EvidenceError("evidence_not_found", "执行不属于指定队友")
+        if report is not None and (
+            report.get("agent_id") != agent["id"]
+            or report.get("parent_id") != agent.get("parent_id")
+            or report.get("commitment_id") not in (None, identifier)
+        ):
+            raise EvidenceError("evidence_not_found", "报告不属于指定队友及任务")
+        execution["availability"] = "available" if run is not None else "missing"
+        if run is not None:
+            execution["run"] = {
+                key: run[key] for key in ("id", "status", "session_id") if key in run
+            }
+        execution["report_availability"] = "available" if report is not None else "missing"
+        if report is not None:
+            execution["report"] = {
+                key: report[key] for key in ("id", "status", "execution_status") if key in report
+            }
+            execution["report_read"] = {
+                "identifier": identifier,
+                "section": "reports",
+                "record_id": run_id,
+                "record_revision": _digest(report),
+            }
+        return execution, [run, report]
+
+    def _handoff_messages(
+        self, session_id: str, maximum: int, byte_budget: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], list[Any]]:
+        mappings = self.store.message_evidence_window(
+            session_id, limit=maximum + 1, metadata_bytes=byte_budget
+        )
+        selected = mappings[:maximum]
+        window = {
+            "limit": maximum,
+            "through_seq": selected[0]["seq"] if selected else 0,
+            "oldest_seq": selected[-1]["seq"] if selected else 0,
+            "has_older": len(mappings) > maximum,
+        }
+        items: list[dict[str, Any]] = []
+        versions: list[Any] = []
+        history = HistoryEvidence(self.store)
+        for mapping in selected:
+            item = {"id": mapping["message_id"], "seq": mapping["seq"], "availability": "missing"}
+            if mapping["message_id"] is None:
+                items.append({**item, "availability": "unavailable"})
+                versions.append(mapping)
+                continue
+            try:
+                row = self.store.message_evidence_slice(
+                    session_id,
+                    message_id=None,
+                    seq=mapping["seq"],
+                    offset_bytes=0,
+                    length_bytes=0,
+                    metadata_bytes=byte_budget,
+                )
+                versions.append(
+                    [
+                        mapping,
+                        {
+                            key: hashlib.sha256(value).hexdigest()
+                            if isinstance(value, bytes)
+                            else value
+                            for key, value in row.items()
+                            if key not in {"content", "content_bytes", "content_type"}
+                        },
+                    ]
+                    if row is not None
+                    else [mapping, None]
+                )
+                if row is not None:
+                    metadata = history._metadata(row, byte_budget // 4)
+                    item = {
+                        **metadata,
+                        "availability": "available",
+                        "read": {
+                            "session_id": session_id,
+                            "seq": row["seq"],
+                            "revision": metadata["revision"],
+                        },
+                    }
+            except (EvidenceError, sqlite3.DatabaseError, UnicodeError) as exc:
+                # Do not backfill from older history when a raw mapping is broken.
+                item = {
+                    **item,
+                    "availability": "unavailable",
+                    "reason": (
+                        exc.code if isinstance(exc, EvidenceError) else "content_unavailable"
+                    ),
+                }
+                if len(versions) < len(items) + 1:
+                    versions.append([mapping, "unavailable"])
+            items.append(item)
+        return items, window, versions
+
+    def _handoff(
+        self,
+        identifier: str,
+        agent_id: str,
+        *,
+        limit: int,
+        cursor: str | None,
+        revision: str | None,
+    ) -> dict[str, Any]:
+        maximum, byte_budget = self.handoff_limits()
+        budget = self.commitments.max_output_chars()
+        task = self.store.bounded_object("commitment", identifier, max_bytes=byte_budget)
+        agent = self.store.bounded_object("agent", agent_id, max_bytes=byte_budget)
+        if task is None or agent is None:
+            raise EvidenceError("evidence_not_found", "任务或指定队友不存在")
+        if type(task.get("revision")) is not int or task["revision"] < 1:
+            raise EvidenceError("content_unavailable", "任务版本无效")
+        if agent.get("session_id") != agent_id:
+            raise EvidenceError("content_unavailable", "队友会话关联无效")
+        binding, lineage = self.control.scope_lineage(
+            agent_id, max_hops=maximum, max_bytes=byte_budget
+        )
+        if binding != identifier:
+            raise EvidenceError("evidence_not_found", "队友不属于指定任务")
+        state = self.control._state(task)
+        execution, execution_records = self._handoff_execution(agent, identifier, byte_budget)
+        items, window, versions = self._handoff_messages(agent_id, min(limit, maximum), byte_budget)
+        memory_revision = self.memory.revision
+        token = _digest(
+            [
+                self.store.instance_id,
+                identifier,
+                agent_id,
+                limit,
+                maximum,
+                byte_budget,
+                task,
+                agent,
+                lineage,
+                execution_records,
+                window,
+                versions,
+                memory_revision,
+            ]
+        )
+        if revision is not None and revision != token:
+            raise EvidenceError("evidence_changed", "接办资料已变化，请重新取得首页")
+        after = self._after(cursor, token, budget)
+        try:
+            start = int(after) if after else 0
+            if after and (str(start) != after or not 0 < start < len(items)):
+                raise ValueError
+        except ValueError as exc:
+            raise EvidenceError("invalid_arguments", "接办游标无效") from exc
+        result: dict[str, Any] = {
+            "id": identifier,
+            "section": "handoff",
+            "revision": token,
+            "task_revision": task["revision"],
+            "epoch": state["epoch"],
+            "approved_epoch": state["approved_epoch"],
+            "memory_revision": memory_revision,
+            "consistency": "live",
+            "source_completeness": "recent_window_only",
+            "authority": "coordination_data",
+            "candidate_usage": "unknown",
+            "task_read": {
+                "identifier": identifier,
+                "section": "task",
+                "record_revision": _digest(task),
+            },
+            "agent": {
+                key: agent[key]
+                for key in (
+                    "id",
+                    "session_id",
+                    "parent_id",
+                    "status",
+                    "generation",
+                    "completion_revision",
+                    "run_id",
+                )
+                if key in agent
+            },
+            "execution": execution,
+            "window": window,
+            "items": [],
+            "has_more": False,
+            "next_cursor": None,
+        }
+        self._fit(result, budget)
+        for index in range(start, len(items)):
+            more = index + 1 < len(items)
+            page = {
+                **result,
+                "items": [*result["items"], items[index]],
+                "has_more": more,
+                "next_cursor": self._cursor(token, str(index + 1)) if more else None,
+            }
+            if json_size(page) > budget:
+                if not result["items"]:
+                    raise EvidenceError("output_budget", "预算不足以返回接办首项及续读位置")
+                break
+            result = page
+        return result
 
     def _scope_check(self, section: str, record: dict[str, Any], identifier: str) -> None:
         if section == "agents":
@@ -136,6 +375,8 @@ class TaskInspection:
         try:
             return self._read(identifier, **args)
         except ControlUnavailable as exc:
+            if exc.code == "scope_budget":
+                raise EvidenceError("output_budget", "接办父链超过配置预算，无法完整核查") from exc
             raise EvidenceError("evidence_changed", "任务关联或控制状态不可用，请重新核查") from exc
         finally:
             self.store.db.execute(f"ROLLBACK TO {savepoint}")
@@ -154,6 +395,7 @@ class TaskInspection:
         record_revision: str | None = None,
         offset_bytes: int = 0,
         length_bytes: int | None = None,
+        agent_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(identifier, str) or not identifier or section not in SECTIONS:
             raise EvidenceError("invalid_arguments", "任务 ID 或核查 section 无效")
@@ -161,6 +403,22 @@ class TaskInspection:
         if limit > 100:
             raise EvidenceError("invalid_arguments", "核查每页最多 100 项")
         validate_integer(offset_bytes, "offset_bytes")
+        if section == "handoff":
+            if (
+                not isinstance(agent_id, str)
+                or not agent_id
+                or query is not None
+                or record_id is not None
+                or record_revision is not None
+                or offset_bytes != 0
+                or length_bytes is not None
+            ):
+                raise EvidenceError("invalid_arguments", "接办需要指定 agent_id，仅接受目录参数")
+            return self._handoff(
+                identifier, agent_id, limit=limit, cursor=cursor, revision=revision
+            )
+        if agent_id is not None:
+            raise EvidenceError("invalid_arguments", "仅 handoff 接受 agent_id")
         if length_bytes is not None:
             validate_integer(length_bytes, "length_bytes", minimum=1)
         if record_id is not None and (not isinstance(record_id, str) or not record_id):
@@ -293,7 +551,12 @@ class TaskInspection:
             raise EvidenceError("output_budget", "核查元数据超过输出预算")
         return result
 
-    def tool(self, read_scope: Callable[[], str | None]) -> Tool:
+    def tool(
+        self,
+        read_scope: Callable[[], str | None],
+        *,
+        handoff_read_scope: Callable[[], str | None] | None = None,
+    ) -> Tool:
         async def inspect(args: dict[str, Any]) -> Any:
             allowed = {
                 "identifier",
@@ -306,10 +569,19 @@ class TaskInspection:
                 "record_revision",
                 "offset_bytes",
                 "length_bytes",
+                "agent_id",
             }
             if args.keys() - allowed:
                 raise EvidenceError("invalid_arguments", "核查参数包含未知字段")
-            scope = read_scope()
+            try:
+                scope = (
+                    handoff_read_scope()
+                    if args.get("section") == "handoff" and handoff_read_scope
+                    else read_scope()
+                )
+            except ControlUnavailable as exc:
+                code = "output_budget" if exc.code == "scope_budget" else "evidence_changed"
+                raise EvidenceError(code, "调用会话父链无法在预算内完整核查") from exc
             identifier = args.get("identifier", scope)
             if scope == "" or (scope is not None and identifier != scope):
                 raise PermissionError("只能核查当前绑定的任务")
@@ -328,6 +600,7 @@ class TaskInspection:
                 {
                     "identifier": string("任务ID；绑定队友可省略"),
                     "section": {"type": "string", "enum": list(SECTIONS)},
+                    "agent_id": string("handoff 必填；只核查一个指定队友的有限近期证据"),
                     "cursor": string(),
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "query": string("仅memories段，必须是显式非空本地查询"),

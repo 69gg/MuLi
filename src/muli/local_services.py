@@ -40,7 +40,12 @@ class LocalServices:
             max_output_chars=lambda: runtime.config.settings.limits.max_output_chars,
         )
         self.task_control = TaskControl(runtime.store, self.commitments)
-        self.task_inspection = TaskInspection(self.commitments, self.task_control, runtime.memory)
+        self.task_inspection = TaskInspection(
+            self.commitments,
+            self.task_control,
+            runtime.memory,
+            max_handoff_records=lambda: runtime.config.settings.limits.max_search_results,
+        )
         runtime.task_control = self.task_control
         runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.context_hooks.append(self.context)
@@ -155,12 +160,13 @@ class LocalServices:
 
         def is_main() -> bool:
             identifier = runtime.tool_session_id
-            session = runtime.store.get("session", identifier) if identifier else None
-            return bool(
-                session
-                and session.get("kind") == "main"
-                and identifier == runtime.main_session()["id"]
-            )
+            if not identifier or identifier != runtime.store.existing_main_session_id():
+                return False
+            row = runtime.store.db.execute(
+                "SELECT json_extract(data,'$.kind') FROM objects WHERE kind='session' AND id=?",
+                (identifier,),
+            ).fetchone()
+            return row is not None and row[0] == "main"
 
         def read_scope() -> str | None:
             if is_main():
@@ -168,10 +174,25 @@ class LocalServices:
             identifier = runtime.tool_session_id
             return self.task_control.resolve_scope(identifier) or "" if identifier else ""
 
+        def handoff_read_scope() -> str | None:
+            identifier = runtime.tool_session_id
+            if not identifier:
+                return ""
+            maximum, byte_budget = self.task_inspection.handoff_limits()
+            if identifier == runtime.store.existing_main_session_id():
+                session = runtime.store.bounded_object("session", identifier, max_bytes=byte_budget)
+                return None if session and session.get("kind") == "main" else ""
+            binding, _ = self.task_control.scope_lineage(
+                identifier, max_hops=maximum, max_bytes=byte_budget
+            )
+            return binding or ""
+
         commitment_tools = self.commitments.tools(
             allow_brief_write=is_main(), can_write_brief=is_main, read_scope=read_scope
         )
-        commitment_tools.append(self.task_inspection.tool(read_scope))
+        commitment_tools.append(
+            self.task_inspection.tool(read_scope, handoff_read_scope=handoff_read_scope)
+        )
         original_read = next(
             tool.handler for tool in commitment_tools if tool.name == "commitment_read"
         )

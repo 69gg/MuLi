@@ -13,6 +13,7 @@
 | `workflows` | 任务工作流运行，包括旧记录沿父链继承的运行 |
 | `evidence` | 原任务说明的消息/附件引用及 `available/missing`，不因原文删除丢掉整个任务 |
 | `memories` | 必须提供非空 `query`；本地关键词/图候选，`candidate_usage="unknown"` |
+| `handoff`（开发中） | 必填 `agent_id`，指定队友的有限近期证据索引；不自动确认计划或接班 |
 
 主助手填写 `identifier`；绑定队友可省略，只能读取当前任务。每次调用都按真实会话重新解析范围，复制主助手的工具 schema 或旧游标不能继承主身份。Web 使用既有管理认证，不接受请求提供的 agent/owner 身份。任务资料、报告、来源和记忆都不授予新权限。
 
@@ -32,4 +33,4 @@ agents/reports/workflows/memories 可用同一 section 和 `record_id` 读取一
 
 纠正沿原入口：更正/遗忘记忆，或由主人暂停任务、追加要求并交沐璃重新规划。核查不触发 `commitment_read` 包装 handler 的重规划选择，更不能借旧页恢复暂停任务。读取使用可嵌套的只读 savepoint，保留调用方已有事务，不增加持久格式、缓存副本或后台轮询。显式读取单条正文仍需读取该持久记录，并不宣称是对任意巨大对象的流式存储接口。
 
-设计见 [方案记录](task-inspection-proposal.md)。真实外部模型和用户渠道的使用效果需另行验收；离线 API、持久记录与工具回归记录在版本审查中。
+新接办段使用独立的有限窗口与版本合同，不改变上述旧目录的 live 语义；详见[按最新证据接办](task-handoff.md)。设计见 [方案记录](task-inspection-proposal.md)。真实外部模型和用户渠道的使用效果需另行验收；离线 API、持久记录与工具回归记录在版本审查中。

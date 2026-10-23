@@ -201,30 +201,57 @@ class TaskControl:
 
     def resolve_scope(self, session_id: str) -> str | None:
         """Follow host lineage, including old workflow runs without an explicit binding."""
+        return self._resolve_scope(session_id)[0]
+
+    def scope_lineage(
+        self, session_id: str, *, max_hops: int, max_bytes: int
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Version only the specified bounded parent chain, without enumerating peers."""
+        if type(max_hops) is not int or max_hops < 1:
+            raise ControlUnavailable("scope_budget", "执行范围父链预算不足")
+        return self._resolve_scope(session_id, max_hops=max_hops, max_bytes=max_bytes)
+
+    def _resolve_scope(
+        self, session_id: str, *, max_hops: int | None = None, max_bytes: int | None = None
+    ) -> tuple[str | None, list[dict[str, Any]]]:
         current: str | None = session_id
         visited: set[str] = set()
         binding: str | None = None
+        frames: list[dict[str, Any]] = []
         while current is not None:
             if current in visited:
                 raise ControlUnavailable("scope_invalid", "执行范围父链包含环")
+            if max_hops is not None and len(visited) >= max_hops:
+                raise ControlUnavailable("scope_budget", "执行范围父链超过核查跳数预算")
             visited.add(current)
-            session_row = self.store.db.execute(
-                "SELECT json_extract(data,'$.kind') AS kind,"
-                "json_extract(data,'$.workflow_id') AS workflow_id,"
-                "json_extract(data,'$.workflow_run_id') AS workflow_run_id "
-                "FROM objects WHERE kind='session' AND id=?",
-                (current,),
-            ).fetchone()
-            if session_row is None:
+            if max_bytes is not None:
+                session = self.store.bounded_object("session", current, max_bytes=max_bytes)
+                agent = self.store.bounded_object("agent", current, max_bytes=max_bytes)
+            else:
+                session_row = self.store.db.execute(
+                    "SELECT json_extract(data,'$.kind') AS kind,"
+                    "json_extract(data,'$.workflow_id') AS workflow_id,"
+                    "json_extract(data,'$.workflow_run_id') AS workflow_run_id "
+                    "FROM objects WHERE kind='session' AND id=?",
+                    (current,),
+                ).fetchone()
+                session = dict(session_row) if session_row is not None else None
+                agent_row = self.store.db.execute(
+                    "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
+                    "json_extract(data,'$.parent_id') AS parent_id "
+                    "FROM objects WHERE kind='agent' AND id=?",
+                    (current,),
+                ).fetchone()
+                agent = dict(agent_row) if agent_row is not None else None
+            if session is None:
                 raise ControlUnavailable("scope_invalid", "执行范围父会话缺失")
-            session = dict(session_row)
-            agent_row = self.store.db.execute(
-                "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
-                "json_extract(data,'$.parent_id') AS parent_id "
-                "FROM objects WHERE kind='agent' AND id=?",
-                (current,),
-            ).fetchone()
-            agent = dict(agent_row) if agent_row is not None else None
+            frame: dict[str, Any] = {}
+            if max_bytes is not None:
+                frame = {
+                    "session_id": current,
+                    "session": _digest(session),
+                    "agent": _digest(agent),
+                }
             if agent is None and session.get("kind") == "team":
                 raise ControlUnavailable("scope_invalid", "团队执行记录缺失")
             if session.get("workflow_id") is not None and not session.get("workflow_run_id"):
@@ -234,15 +261,26 @@ class TaskControl:
             if agent is not None:
                 value, parent = agent.get("commitment_id"), agent.get("parent_id")
             elif session.get("workflow_run_id") is not None:
-                row = self.store.db.execute(
-                    "SELECT json_extract(data,'$.commitment_id'),"
-                    "json_extract(data,'$.parent_session_id') FROM objects "
-                    "WHERE kind='workflow_run' AND id=?",
-                    (session["workflow_run_id"],),
-                ).fetchone()
-                if row is None:
+                workflow_id = session["workflow_run_id"]
+                if not isinstance(workflow_id, str) or not workflow_id:
+                    raise ControlUnavailable("scope_invalid", "执行范围工作流关联无效")
+                if max_bytes is not None:
+                    workflow = self.store.bounded_object(
+                        "workflow_run", workflow_id, max_bytes=max_bytes
+                    )
+                else:
+                    row = self.store.db.execute(
+                        "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
+                        "json_extract(data,'$.parent_session_id') AS parent_session_id "
+                        "FROM objects WHERE kind='workflow_run' AND id=?",
+                        (workflow_id,),
+                    ).fetchone()
+                    workflow = dict(row) if row is not None else None
+                if workflow is None:
                     raise ControlUnavailable("scope_invalid", "执行范围工作流缺失")
-                value, parent = row[0], row[1]
+                value, parent = workflow.get("commitment_id"), workflow.get("parent_session_id")
+                if max_bytes is not None:
+                    frame["workflow"] = _digest(workflow)
             if value is not None:
                 if (
                     not isinstance(value, str)
@@ -253,8 +291,10 @@ class TaskControl:
                 binding = value
             if parent is not None and (not isinstance(parent, str) or not parent):
                 raise ControlUnavailable("scope_invalid", "执行范围父会话无效")
+            if max_bytes is not None:
+                frames.append(frame)
             current = parent
-        return binding
+        return binding, frames
 
     def _workflow_scope(self, identifier: str) -> str | None:
         row = self.store.db.execute(
