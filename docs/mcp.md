@@ -105,6 +105,12 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 
 read 一次读取至多 16 个完整文本块。file/https/自定义 URI 只回传给原 MCP session，不在本机解释、打开、解析路径或额外 HTTP 抓取。blob、混合 text/blob 和无法证明的内容形状整体拒绝，不解码二进制、不返回文本子集。结果带 `untrusted=true`，元数据和正文都不能作为指令、Skill 或权限。URI 的显示值可脱敏，内部请求仍使用原 SDK URI，不请求被截短或脱敏后的地址。
 
+装配现有附件服务时，另提供显式 `mcp_resource_save({"server":"remote_tools","ref":"已展示引用","name":"资源.bin"})`。它属于一次 `risk=external` 操作，进行一次原连接读取并持久保存；无附件装配时不提供工具。只接受恰好一个 blob，拒绝 text、混合、多块、非 ASCII 或非法 base64，并在保存前核实际解码大小。目录 size 只是提示。文件名复用上传校验，实际文件使用宿主随机 ID；MIME 由原附件识别器检查头部，不能靠远端 MIME 获得看图权限。
+
+成功仅返回完整 `attachment:{id,mime_type,size,sha256}` 及 `is_error:false,saved:true,untrusted:true`，不回显 blob、原 URI、名字或路径；回执放不进原代输出预算时尚未调用保存器。保存复用 uploads 单文件、总配额与并发限制；原连接 wire 预算也包含 base64/JSON，不能据附件上限推断远端可传满相同字节数。网络读取、等待容量和保存共用一次绝对期限，旧连接 lease 保留至收尾。入口同步核真实 Runtime owner、维护门、disabled、原请求与暂停 epoch；进入后换代或禁用仍按原代完成，不保证中途撤销阻止写入。
+
+保存不附加会话消息、不自动识别或发送；调用者可另用既有 `image_describe`、`channel_send`。保存器进入后未取得完整回执统一返回 `status:unknown,code:resource_save_unknown`，取消仍保留取消语义，均不自动再次 get/save。文件系统与 SQLite 不是跨介质事务：丢回执或 public 投影失败可能留下文件/元数据不一致。可显式用 `attachment_search(source="mcp",name_query=...)` 查记录并核读文件，名称不唯一、记录存在也不证明文件健康。完整回执之后若下一模型上下文不足，原机制停止下一请求，不能据此认定保存未发生。详见[附件设计](mcp-resource-files-design.md)。
+
 元数据和文本的字符串值按旧代密钥脱敏，固定字段名和宿主引用保持；随后核完整 JSON 字符预算，不能容纳时明确 `resource_output_budget_exceeded`，不制作正文 preview。最新工具批次经 Runtime 保持完整；完整批次放不进下一请求时停止运行，不继续请求模型。较早批次仍遵循原上下文淘汰规则。取消、超时和已进入 SDK 的未知结果不自动重放；换代前已接纳的 read 可在旧连接完成，迟到目录不签发新代可用引用。接收 latch 同时封锁工具与资源。
 
 本片不接 stdio 资源、模板、订阅或后台抓取，不新增配置/API/通知源。状态中 `resources_supported` 和固定 `resource_error_code` 不回显 URI、原服务器游标、正文或异常。实现与验收边界见[资源设计](mcp-resources-design.md)。
@@ -145,7 +151,7 @@ PATCH 中的 mcp 原子替换整个服务器配置；省略的服务器或密钥
 
 全局 timeout 同时限制连接、工具列举和每次调用；单服务器 timeout 只能收紧它，运行时另限制整个候选准备的总期限。调用不自动重试，以免外部操作重复。取消会传播到客户端；超时或异常只返回固定安全原因，不回显服务器异常正文。
 
-远端工具的文本与结构化结果遵守 `max_output_chars`，超限返回 `truncated:true` 和受限 preview。图片、音频、二进制资源只保留类型元数据，不把 base64 数据塞入模型上下文或自动下载媒体。服务器错误结果正文不回显；已配置 env/header 值以及 Bearer token 在正常文本中也会遮盖。服务器日志和 stdio stderr 不转发给模型或应用日志。上述工具结果的 preview 不适用于完整资源读取。
+远端工具的文本与结构化结果遵守 `max_output_chars`，超限返回 `truncated:true` 和受限 preview。远端工具结果中的图片、音频、二进制只保留类型元数据，不把 base64 数据塞入模型上下文或自动下载媒体；显式资源保存另沿上述入口。服务器错误结果正文不回显；已配置 env/header 值以及 Bearer token 在正常文本中也会遮盖。服务器日志和 stdio stderr 不转发给模型或应用日志。上述工具结果的 preview 不适用于完整资源读取或附件回执。
 
 ## 验证边界
 

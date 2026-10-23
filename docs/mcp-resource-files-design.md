@@ -1,6 +1,6 @@
 # MCP 单个二进制资源保存为附件
 
-状态：仅为下一片候选设计，基于已签 prompts 切片 `36b2c8b6f144a34b663972599beb8660b7c6a733`，根已整合为 `69935e4`。未修改生产代码、执行测试或连接实际 MCP；本文不是能力已交付的声明。
+状态：已在开发分支实现最小接缝并完成下述受限离线回归，待独立审查与整合；尚未发布或连接真实 MCP。设计基于已签 prompts 切片 `36b2c8b6f144a34b663972599beb8660b7c6a733`，根已整合为 `69935e4`。本地通过不等于外部集成已验收。
 
 ## 选择与协议依据
 
@@ -55,4 +55,14 @@ SDK 一旦进入就不能把远端结果不明改称整项 not_executed；GET �
 5. 网络、容量、file_io 与 metadata 返回门控分别取消/超时，不自动重试；注入保存已提交后丢返回，固定不确定结果且没有第二次 get/save，不把残存对象当健康成功。重复取消仅按实际能证明的 owner 收尾范围记录。
 6. 通过同一附件 ID 显式调用既有看图与 fake 渠道 outbox；无 vision、摘要改变、渠道不支持/超限均沿原错误，保存不触发自动识别或发送。
 
-当前仅完成源码与官方合同核查；没有任何新增测试执行、真实附件保存、外部服务或发布验收。后续实现与独立复审需另行冻结范围，本设计不混入当前 prompts 交付。
+## 开发实现与受限验证记录
+
+实现集中在 `tools/mcp.py`、`tools/mcp_resources.py`、`LocalServices` 与 Runtime。`ResourceSaveTarget` 仅携带原单文件上限与同步 preflight；preflight 在本地识别 MIME、计算摘要并检查完整回执后返回唯一 async 保存回调。工厂在操作入口预校验共享文件名、真实执行 owner、维护门、disabled 与原 PreparedRequest，随后无 await 进入原代 MCP lease。`attachments.py` 只抽取共用文件名函数，writer、DDL、Settings 和渠道逻辑未改；没有装配保存工厂时仍只有原资源工具。
+
+保留的先红用例通过真实 Runtime 列目录取得 ref 后请求保存，旧实现精确返回“工具未启用”：1 failed、0.38 秒、峰值 79.2 MiB；不是 ImportError。实现后新 `test_mcp_resource_files.py` 首轮 42 项绿，最终补齐真实暂停 scope 与显式看图/假渠道交接后 **44 项通过，1.02 秒，峰值 102.2 MiB**。覆盖三 codec 的普通二进制/PNG/空 blob 完整回执、短秘密不改宿主键或摘要、非法内容/大小/回执恰好及差一字符、真实审批后换代/disabled、owner/维护/关闭/缺上下文、进入后网络或容量等待换代、取消/原绝对期限、保存器失败及 metadata 后 public 投影丢回执的固定 unknown。最后两项测试构造曾分别因缺少任务 brief、向冻结渠道 profile 赋值失败，均只修正夹具；生产代码没有因这些失败改动。
+
+资源相关四文件含新增真实锁定 SDK 流式 HTTPX MockTransport→Runtime→Attachments 用例合计 **96 项通过，2.73 秒，峰值 131.2 MiB**；该集合包含上述首轮 42 项，不与最终 44 项重复累计。真实 SDK 用例验证一次 resources/read、原字节/SHA/MIME 与已关闭响应流，没有 socket 或真实 server。附件记录、LocalServices、媒体、扩展与 prompts 七文件另 **206 项通过，3.48 秒，峰值 156.1 MiB**。五个生产文件严格 mypy 通过（峰值 183.5 MiB）；七个 Python 文件 Ruff/format 通过。
+
+全部执行都经过 `/data0/MuLi/scripts/check_local.py --seconds 30 run -- /data0/MuLi/.venv/bin/python …`，单次 1 GiB、共享 2 GiB、swap 0、CPU 1、tasks 128，输出均确认实终态与 swap 0。未下载、训练、压测、连接真实模型/MCP/渠道、操作本机服务或桌面、push、运行远端 CI 或改版本。这里的 vision 成功路径是有限方法替身，OneBot 是 MockTransport outbox；均不证明真实账号可用。尚未单独新增 file_io/metadata 各取消门、任意重复取消与保存回执后整批上下文不足用例，不将既有机制或其它用例的通过冒称这些场景已逐一验收；后续独审按上述明确边界收口。
+
+冻结切片经独立 Sol 只读审查，追踪了源码、实际调用接线、测试与上述合同，未发现可证实的 P1/P2。独审没有执行检查，也没有连接真实 MCP，不增加任何运行验收证据。file_io/metadata 逐门取消、任意重复取消与保存回执后整体上下文不足尚未新增用例的边界继续保留；独审结论不将这些场景认定为已验证。

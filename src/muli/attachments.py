@@ -76,6 +76,14 @@ def detected_media(header: bytes, claimed: str) -> str:
     return "application/octet-stream"
 
 
+def attachment_name(name: str) -> str:
+    """Share the upload filename rules with callers that preflight external I/O."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not name or len(name.encode("utf-8")) > 240 or any(ord(c) < 32 for c in name):
+        raise ValueError("附件文件名无效")
+    return name
+
+
 class Attachments:
     def __init__(self, store: Store, directory: Path, config: ConfigFile) -> None:
         self.store, self.directory, self.config = store, directory, config
@@ -120,9 +128,7 @@ class Attachments:
     async def save(
         self, chunks: AsyncIterator[bytes], name: str, mime_type: str = "", *, source: str = "web"
     ) -> dict[str, Any]:
-        name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
-        if not name or len(name.encode("utf-8")) > 240 or any(ord(c) < 32 for c in name):
-            raise ValueError("附件文件名无效")
+        name = attachment_name(name)
         async with self.capacity:
             identifier = new_id()
             fd, temporary = tempfile.mkstemp(prefix=".upload-", dir=self.directory)
