@@ -1,7 +1,7 @@
 # Windows UIA probe 的固定阶段证据
 
-状态：设计已获根及独立审查认可，实现的受限本地纯回归与静态检查已通过；
-最终独立静态实现后审未发现确定 P1/P2；真实 Windows 阶段输出仍待验。
+状态：原八阶段实现的受限本地纯回归与独立静态后审已完成；本次经根批准增加
+首请求的三个固定输入阶段，受限纯回归与静态检查已通过，真实 Windows 新阶段待验。
 独立于已冻结的 Invoke 片；
 不改变已发布标签，不把增加诊断写成已查明或修复启动超时。
 
@@ -37,22 +37,27 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 ## 固定阶段与一次性规则
 
 每行只允许 ASCII 协议 `muli-uia-stage=1:<stage>` 加换行，不含时间、ID、参数或正文。
-每个 helper 用固定八位状态保存已尝试阶段，每位先置位再尝试写出；每阶段最多一次，
-整生命周期最多八行、合计不超过 512 字节，不因重复 probe 或其他请求增长。
+每个 helper 用固定十一位状态保存已尝试阶段，每位先置位再尝试写出；每阶段最多一次，
+整生命周期最多十一行，LF 合计 361 字节、CRLF 合计 372 字节，均不超过 512 字节，
+不因重复 probe 或其他请求增长。
 
 | stage | 紧邻的代码位置与能够证明的事实 |
 | --- | --- |
 | `script_entered` | 固定偏好与小标记函数可用后、UTF-8 writer 构造前；已执行到脚本主体 |
 | `utility_importing` | 原固定 `$PSHOME` manifest 导入前 |
 | `utility_ready` | 原导入及实际 module.Path 检查全部通过后 |
+| `input_waiting` | 首个请求进入原 `Read-BoundedLine` 前；不证明其后的读取已完成 |
+| `input_line_received` | 首次有界读取返回非 null 值，即已取得 LF 结束的一整行；不证明 JSON 合法 |
+| `request_decoded` | 首次原 `ConvertFrom-Json` 调用返回后；尚未通过版本、ID 与 limits 校验 |
 | `probe_received` | 首个 probe 的原帧、版本与 limits 校验通过后，初始化前 |
 | `uia_initializing` | 首次 `Initialize-Uia` 的版本/MTA/程序集检查开始前 |
 | `uia_ready` | 原 GAC 检查通过并设置 ready 后 |
 | `probe_encoded` | 首个 probe 的原成功 `Encode-Result` 返回后，原末次 deadline 检查前 |
 | `probe_write_returned` | 该成功 probe 的原 `$writer.WriteLine` 返回后；不是宿主已收到的证明 |
 
+三个 input 阶段仅位于 `requestCount=0` 分支，不能在解码前声称输入就是 probe。
 前三级和 UIA 初始化各只尝试一次；probe 的三级仅跟踪首个合法 probe，失败也不为
-后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求八级全序；
+后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求十一级全序；
 本次 CI 的新建 once probe 才核上述顺序。错误回执不冒充成功 encoded/write 阶段。
 
 标记通过 `[Console]::Error.WriteLine` 与 Flush 写出；仅固定字符串，整个写入置于
@@ -67,9 +72,9 @@ best-effort try/catch，不使用 Write-Error 或异常格式化，不输出 `$E
 note；不得新增等待期限、跳过失败、改变异常 code/outcome 或让诊断/收尾异常覆盖
 原异常。成功路径的清理失败仍是失败；取消仍传播。生产工具/API 不展示 stderr。
 
-投影只读取现有 2048 字节前缀，按完整 LF/CRLF 行精确匹配八个固定标记；未知原文、
+投影只读取现有 2048 字节前缀，按完整 LF/CRLF 行精确匹配十一个固定标记；未知原文、
 不完整行和非 ASCII 内容不导出。重复或乱序标为 `stage_sequence=invalid`，不据此
-推断业务成功。至多八个枚举及固定标量：`stderr_prefix_capped`、发送计数 0/1、
+推断业务成功。至多十一个枚举及固定标量：`stderr_prefix_capped`、发送计数 0/1、
 lease.closed、process 存在、退出类别 running/zero/nonzero/unavailable、readers 是否
 全部终态、cleanup confirmed/unconfirmed。reader 终态不等于已读到 EOF；前缀达到
 上限只表示可能截断，不声称完整诊断。无路径、PID、nonce、环境、provider 名称、
@@ -82,7 +87,7 @@ write_returned 存在而宿主仍无回执可缩小下一轮传输/解码调查�
 
 ## 验收与官方依据
 
-先用纯替身核八行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
+先用纯替身核十一行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
 CRLF/半行、未知/重复/乱序输入、2048 字节截断、完整 JSON note 预算。假 lease
 事件门控证明 note 在自有清理后生成、原异常身份/outcome 和取消保留、清理失败不
 伪称回收；既有 reader 继续证明 stderr 全部计费。禁止在 Linux 启动 PS 或桌面。
@@ -122,4 +127,47 @@ CRLF/半行、未知/重复/乱序输入、2048 字节截断、完整 JSON note 
 后续旧候选 `691ea5c` 的 `39979235619` Windows 3.13 四项 native 失败，包括最小
 owned-pending 脚本未见读后标记。新增独立的
 [同进程判别合同](windows-uia-pending-observation-design.md)，只观察第四例原进程的
-宿主输入与清理边界，不改变本节八阶段协议、产品桥接或原有事实记录。
+宿主输入与清理边界，当时没有改变原八阶段协议、产品桥接或原有事实记录；本次输入
+阶段的扩展单独记录如下，不把旧结果改写成新十一阶段已实测。
+
+## 2.41 首请求输入缺口（新增诊断）
+
+精确 `b89a3dc8838b4e6e9c0cd73cc5bcff6821f87ba1` 的候选 `40003241223` 与
+main `40004424238` 各十项成功；发行 `40004425177` 的 Windows 3.13 job
+`120588588362` 仅该 probe 失败，调用 12.44 秒。发布步骤没有执行。
+原 note 只观察到 `script_entered/utility_importing/utility_ready`，序列有效，
+`sent=1`，并确认 helper/readers 清理完成。清理后 nonzero 不是自然退出原因的证明。
+
+`utility_ready` 之后仍要执行原同步有界输入读取、JSON 解码、版本/ID/limits 校验，
+才会到 `probe_received` 与 `uia_initializing`。现有证据没有显示进入 UIA 初始化，
+不能把失败归因于 COM、程序集加载或 JSON 解码，也没有阶段时间可划分各段耗时。
+[Console.In](https://learn.microsoft.com/en-us/dotnet/api/system.console.in?view=netframework-4.8.1)
+的读取会同步等待操作完成；PowerShell 5.1 的
+[ConvertFrom-Json](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/convertfrom-json?view=powershell-5.1)
+把输入字符串转换为对象，其返回不代表本协议校验通过。这些接口事实不是本次超时的
+因果证明；缺失 best-effort 标记也不能绝对证明代码位置未到达。
+
+本次只在原调用两侧增加表中的三个固定标记，不增读取、重试、宿主计时代理或正文
+输出。原八个调用点不移动；投影按实际首请求顺序识别十一名称，仍可识别旧八阶段
+记录。2048 字节前缀、1 MB 会话总额、4 KiB note 与原 12 秒均不变。最坏情况下
+未知 stderr 可占满前缀，所有新标记均不可见；只匹配前缀内完整行，半行不导出，
+已有阶段缺失不标为乱序，也不因截断推断任何后续阶段。此 CI 全新 helper 的首个
+once probe 按表中顺序尝试标记，其任一完整子序列仍有效；重复或逆序的已知行仍为
+invalid。此判断不推广到先执行其他命令、再发 probe 的一般会话。
+
+本次专用文件 18 项通过（原 13 项与新增 5 项，0.14 秒），新增覆盖原源码中首请求
+读取/解码两侧的调用位置及门控、旧八阶段兼容、输入阶段重复/逆序、每一字节截断。
+CRLF 全序列的 0..372 个前缀逐一验证，并以未知完整行挤占 2048 字节保留量，使
+可见标记分别只剩相同前缀；之后完整但超出前缀的标记不可泄入结果。没有任意 stderr
+时，全十一行可容纳于前缀；未知 stderr 存在时不保证标记全部可见。
+
+既有 `test_uia_pending_observation.py` 19 项与 `test_uia_computer.py` 27 项共
+46 项通过（0.20 秒），本次合计 64 个不同用例，无真实进程、PowerShell 或桌面。
+两份 Python Ruff/format-check 与限定 strict mypy 通过；格式首轮仅一处换行，按规则
+修复。mypy 首轮因测试 helper 的双模块名拒绝检查，在守卫内显式传 `MYPYPATH=src:tests`
+并采用 `--explicit-package-bases` 后两文件通过，没有为类型检查改运行代码。
+pytest 峰 61.8 MiB，整轮峰 314.2 MiB、swap 0，每条均由原 30 秒守卫串行执行。
+实际 11 行及 LF/CRLF 字节长度也经同一守卫按脚本原字符串计算。
+
+以上只证明纯投影/源静态边界；根与独立集成 agent 后审未发现可验证 P1/P2，真实 Windows 新阶段待验。
+没有 PowerShell 语法或实际阶段输出的本地证明，也不把增加三个标记写成已修复超时。

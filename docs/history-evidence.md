@@ -14,6 +14,10 @@
 
 返回 `records`、`next_after` 和 `has_more`。目录记录保留 `id`、`seq`、`role`、`revision`、`content_bytes` 和有界 `content`；`content_truncated` 明确说明正文是否仅为预览。`next_after` 只推进已经返回的记录。目录不展开工具参数、原生协议数据、推理签名、图片或附件字节。
 
+目录、单消息正文页与网页归档都完整返回该消息的 `attachment_ids`，便于压缩后按原序号找回交接资料，再调用既有附件工具读取。旧消息没有该字段时返回 `[]`；旧通用信封中的 opaque ID、大小写及重复顺序保持原样。新的本地 Team 交接入口另有严格 ID 校验，见[队友资料交接](teammate-attachments.md)。历史引用不证明文件当前仍可用，也不授予新权限。
+
+附件引用计入完整 JSON 预算，不能被可选元数据省略规则移除。SQL 字节窗口或最终响应预算不足以容纳完整引用时返回 `output_budget`；显式 null、非数组、超出原信封数量/字符串范围或不能编码为 UTF-8 的损坏引用返回 `content_unavailable`，不将坏引用伪装成空数组或截断成功列表。
+
 取得消息 ID 或已有摘要中的 seq 后，读取正文：
 
 ```json

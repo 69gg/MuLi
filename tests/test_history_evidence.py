@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.history_evidence import EvidenceError, HistoryEvidence
 from muli.store import Store
 
@@ -28,6 +29,117 @@ def assert_code(code: str, action: Callable[[], object]) -> None:
     assert captured.value.code == code
     assert captured.value.message == str(captured.value)
     assert len(str(captured.value)) < 300
+
+
+def test_attachment_references_are_complete_in_directory_archive_and_sequence_read(
+    store: Store,
+) -> None:
+    identifiers = [f"{number:032x}" for number in range(MAX_ATTACHMENT_IDS)]
+    original = store.add_message("session", "user", "资料已交接", attachment_ids=identifiers)
+    evidence = HistoryEvidence(store)
+    for page in (
+        evidence.read("session", max_output_chars=4000)["records"][0],
+        evidence.archive("session", max_output_chars=4000)["messages"][0],
+        evidence.read_content("session", seq=original["seq"], max_output_chars=4000),
+    ):
+        assert page["attachment_ids"] == identifiers
+        assert "metadata_omitted" not in page
+    legacy = store.add_message("session", "assistant", "旧消息没有引用")
+    assert (
+        evidence.read_content("session", seq=legacy["seq"], max_output_chars=1000)["attachment_ids"]
+        == []
+    )
+    for action in (
+        lambda: evidence.read("session", max_output_chars=1000),
+        lambda: evidence.archive("session", before_seq=legacy["seq"], max_output_chars=1000),
+        lambda: evidence.read_content("session", seq=original["seq"], max_output_chars=1000),
+    ):
+        assert_code("output_budget", action)
+
+
+@pytest.mark.parametrize(
+    "references",
+    [None, "a" * 32, [1], [""], ["x" * 257], [f"{n:032x}" for n in range(MAX_ATTACHMENT_IDS + 1)]],
+)
+def test_invalid_attachment_evidence_is_never_an_empty_or_partial_success(
+    store: Store, references: Any
+) -> None:
+    record = store.add_message("session", "user", "原消息", attachment_ids=references)
+    evidence = HistoryEvidence(store)
+    for action in (
+        lambda: evidence.read("session", max_output_chars=4000),
+        lambda: evidence.archive("session", max_output_chars=4000),
+        lambda: evidence.read_content("session", seq=record["seq"], max_output_chars=4000),
+    ):
+        assert_code("content_unavailable", action)
+
+
+def test_legacy_opaque_attachment_references_keep_original_order_and_duplicates(
+    store: Store,
+) -> None:
+    references = ["plugin:document/旧资料", "UPPERCASE", "plugin:document/旧资料"]
+    record = store.add_message("session", "user", "原有插件信封", attachment_ids=references)
+    evidence = HistoryEvidence(store)
+    assert (
+        evidence.read("session", max_output_chars=2000)["records"][0]["attachment_ids"]
+        == references
+    )
+    assert (
+        evidence.read_content("session", seq=record["seq"], max_output_chars=2000)["attachment_ids"]
+        == references
+    )
+
+
+def test_oversized_attachment_json_stays_a_bounded_sql_projection(store: Store) -> None:
+    record = store.add_message("session", "user", "原消息", attachment_ids=["x" * 100_000])
+    row = store.message_evidence_slice(
+        "session",
+        seq=record["seq"],
+        message_id=None,
+        offset_bytes=0,
+        length_bytes=100,
+        metadata_bytes=400,
+    )
+    assert row is not None
+    assert len(row["attachment_ids"]) == 400
+    assert row["attachment_ids_bytes"] > 100_000
+    assert_code(
+        "output_budget",
+        lambda: HistoryEvidence(store).read_content(
+            "session", seq=record["seq"], max_output_chars=1000
+        ),
+    )
+
+
+@pytest.mark.parametrize("raw", ['["\\ud800"]', '["\\udfff"]', "[" * 900 + '"opaque"' + "]" * 900])
+def test_sql_valid_but_unusable_attachment_json_is_a_fixed_error(store: Store, raw: str) -> None:
+    # Raw SQL bypasses Python's serializer: SQLite's valid JSON can still contain
+    # escaped lone surrogates or a nested array outside the envelope's shape.
+    assert store.db.execute("SELECT json_valid(?)", (raw,)).fetchone()[0] == 1
+    record = store.add_message("session", "user", "保留原消息")
+    with store.db:
+        store.db.execute(
+            "UPDATE objects SET data=json_set(data,'$.attachment_ids',json(?)) "
+            "WHERE kind='message' AND id=?",
+            (raw, record["id"]),
+        )
+    row = store.message_evidence_slice(
+        "session",
+        seq=record["seq"],
+        message_id=None,
+        offset_bytes=0,
+        length_bytes=100,
+        metadata_bytes=4000,
+    )
+    assert row is not None and row["attachment_ids_type"] == "array"
+    assert row["attachment_ids_bytes"] == len(row["attachment_ids"])
+    evidence = HistoryEvidence(store)
+    for action in (
+        lambda: evidence.read("session", max_output_chars=4000),
+        lambda: evidence.archive("session", max_output_chars=4000),
+        lambda: evidence.read_content("session", seq=record["seq"], max_output_chars=4000),
+    ):
+        assert_code("content_unavailable", action)
 
 
 def test_directory_keeps_small_content_and_existing_sequence_pagination(store: Store) -> None:

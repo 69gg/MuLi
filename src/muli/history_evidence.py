@@ -6,6 +6,7 @@ import json
 from contextlib import closing
 from typing import Any
 
+from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.evidence import (
     EvidenceError,
     content_page,
@@ -60,6 +61,7 @@ class HistoryEvidence:
             "revision": revision,
             "role": "unknown",
             "content_provenance": row["content_provenance"],
+            "attachment_ids": self._attachment_ids(row),
         }
         omitted: list[str] = []
         for field in ("role", *_OPTIONAL_METADATA):
@@ -76,6 +78,36 @@ class HistoryEvidence:
         if omitted:
             result["metadata_omitted"] = omitted
         return result
+
+    @staticmethod
+    def _attachment_ids(row: dict[str, Any]) -> list[str]:
+        # An absent field predates structured handoff. Malformed present data must
+        # not masquerade as an empty or partially recovered reference list.
+        if row["attachment_ids_type"] is None:
+            return []
+        if row["attachment_ids_type"] != "array":
+            raise EvidenceError("content_unavailable", "持久消息的附件引用格式无效")
+        raw = row["attachment_ids"]
+        if row["attachment_ids_bytes"] != len(raw):
+            raise EvidenceError("output_budget", "附件引用无法在预算内完整返回")
+        try:
+            identifiers = json.loads(decode_utf8(raw, allow_incomplete_tail=False))
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise EvidenceError("content_unavailable", "持久消息的附件引用格式无效") from exc
+        # Preserve the original generic envelope contract, including opaque and
+        # repeated legacy references. Only new local Team handoffs require hex IDs.
+        if (
+            not isinstance(identifiers, list)
+            or len(identifiers) > MAX_ATTACHMENT_IDS
+            or any(not isinstance(item, str) or not item or len(item) > 256 for item in identifiers)
+        ):
+            raise EvidenceError("content_unavailable", "持久消息的附件引用格式无效")
+        try:
+            for identifier in identifiers:
+                identifier.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise EvidenceError("content_unavailable", "持久消息的附件引用格式无效") from exc
+        return identifiers
 
     @staticmethod
     def _omit_optional(value: dict[str, Any]) -> bool:

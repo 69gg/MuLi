@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
+from muli.attachments import attachment_ids_schema, validate_attachment_ids
 from muli.permissions import Mode
 from muli.reply_origin import ReplyOrigin
 from muli.store import new_id, now
@@ -17,12 +18,14 @@ from muli.team_wait import TERMINAL, TeamWait
 from muli.tools import Tool, parameters, string
 
 if TYPE_CHECKING:
+    from muli.attachments import Attachments
     from muli.runtime import Runtime
 
 
 class TeamManager:
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
+        self.attachments: Attachments | None = None
         self._active: dict[str, asyncio.Task[None]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping_tasks: dict[asyncio.Task[Any], int] = {}
@@ -175,6 +178,7 @@ class TeamManager:
         role: str = "worker",
         mode: Mode | None = None,
         commitment_id: str | None = None,
+        attachment_ids: builtins.list[str] | None = None,
     ) -> dict[str, Any]:
         self._admit()
         if not name.strip() or len(name) > 120 or role not in {"worker", "reviewer"}:
@@ -248,6 +252,7 @@ class TeamManager:
         if commitment_id is not None:
             agent["commitment_id"] = commitment_id
         text = self._message(parent_id, prompt)
+        references = self._attachment_references(attachment_ids)
         self.runtime.conversation.enqueue(
             session_id,
             text,
@@ -258,6 +263,7 @@ class TeamManager:
             internal=True,
             objects=[("session", session), ("agent", agent)],
             reply_origin=reply_origin,
+            attachment_ids=references,
         )
         self.start()
         await self.runtime.bus.emit("team.created", {"agent": agent})
@@ -275,6 +281,14 @@ class TeamManager:
             raise ValueError("队内消息及来源元数据超过 64000 字符")
         return text
 
+    def _attachment_references(self, value: object) -> builtins.list[str]:
+        identifiers = validate_attachment_ids(value)
+        if not identifiers:
+            return []
+        if self.attachments is None:
+            raise ValueError("附件能力尚未就绪")
+        return self.attachments.validate_references(identifiers)
+
     async def send(
         self,
         target: str,
@@ -283,6 +297,7 @@ class TeamManager:
         wake: bool = True,
         sender: str | None = None,
         event_id: str | None = None,
+        attachment_ids: builtins.list[str] | None = None,
     ) -> dict[str, Any]:
         agent = self.get(target)
         if self._closed:
@@ -303,6 +318,7 @@ class TeamManager:
             if wake and agent["status"] in TERMINAL - {"paused"}
             else agent
         )
+        references = self._attachment_references(attachment_ids)
         receipt, inserted = self.runtime.conversation.enqueue(
             agent["session_id"],
             text,
@@ -313,6 +329,7 @@ class TeamManager:
             internal=True,
             event_id=event_id,
             objects=[("agent", updated)],
+            attachment_ids=references,
         )
         if receipt["state"] != "pending" and updated is not agent:
             self.runtime.store.put("agent", agent)
@@ -786,11 +803,16 @@ class TeamManager:
                 role=args.get("role", "worker"),
                 mode=mode,
                 commitment_id=args.get("commitment_id"),
+                attachment_ids=args.get("attachment_ids"),
             )
 
         async def send(args: dict[str, Any]) -> Any:
             return await self.send(
-                args["target"], args["message"], sender=caller, wake=args.get("wake", True)
+                args["target"],
+                args["message"],
+                sender=caller,
+                wake=args.get("wake", True),
+                attachment_ids=args.get("attachment_ids"),
             )
 
         async def wait(args: dict[str, Any]) -> Any:
@@ -826,6 +848,7 @@ class TeamManager:
                     {
                         "task_name": string(),
                         "prompt": string(),
+                        "attachment_ids": attachment_ids_schema(),
                         "role": {"type": "string", "enum": ["worker", "reviewer"]},
                         "commitment_id": string(
                             "主会话为新树选择有完整任务说明的账本；子孙继承，不能换绑"
@@ -840,7 +863,12 @@ class TeamManager:
                 "send_message",
                 "给已有队友补充任务或资料；wake=false只投递到邮箱",
                 parameters(
-                    {"target": string(), "message": string(), "wake": {"type": "boolean"}},
+                    {
+                        "target": string(),
+                        "message": string(),
+                        "wake": {"type": "boolean"},
+                        "attachment_ids": attachment_ids_schema(),
+                    },
                     ("target", "message"),
                 ),
                 send,
@@ -850,7 +878,12 @@ class TeamManager:
                 "send_input",
                 "在队友安全边界插入补充任务，不打断当前流式或工具；wake=false只存邮箱",
                 parameters(
-                    {"target": string(), "message": string(), "wake": {"type": "boolean"}},
+                    {
+                        "target": string(),
+                        "message": string(),
+                        "wake": {"type": "boolean"},
+                        "attachment_ids": attachment_ids_schema(),
+                    },
                     ("target", "message"),
                 ),
                 send,

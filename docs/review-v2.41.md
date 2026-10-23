@@ -1,6 +1,6 @@
 # 2.41：Linux 资料收件目录
 
-状态：首轮实现、独立后审、受限完整回归及离线构件检查完成；远端候选九项成功、一项失败，发现记录保留顺序缺陷，修复和重新核验中，尚未发布。本文不以入口存在或定向测试通过代替正式发布。上一版交付见 [2.40 审查](review-v2.40.md)。
+状态：记录保留排序缺陷已修复，最终候选和 main 各十项成功；签名标签已推送，但发行验证的 Windows Python 3.13 UIA 原生探测超时，发布步骤跳过，尚未发布。本文不以入口存在、main 绿色或标签存在代替正式发布。上一版交付见 [2.40 审查](review-v2.40.md)。
 
 ## 用户场景与实现
 
@@ -74,7 +74,11 @@
 
 全部真实退出 0、swap 0；同一条既有畸形 MCP policy warning 未改变。最终全仓 Ruff、366 文件格式和146生产文件 strict mypy通过，类型检查1.758秒、216.4 MiB；差异空白检查也通过。前端文件没有改动，沿用此前281项通过的对应代码证据。修复后的 wheel/sdist 离线构建1.267秒/94.5 MiB，临时目录 offline/no-deps 安装包冒烟1.241秒/98.5 MiB，版本/声明/changelog/两包发行校验163毫秒/19.8 MiB全部退出0；没有下载依赖或发行构件。新远端候选仍需逐项实际完成。
 
-候选 CI、main CI、发行流水线、签名标签及 PyPI/GitHub 构件元数据将在各自实际完成后分别记录，当前不宣称已发布。
+最终已签名提交 `b89a3dc8838b4e6e9c0cd73cc5bcff6821f87ba1` 的[候选 CI 40003241223](https://github.com/69gg/MuLi/actions/runs/40003241223)与[main CI 40004424238](https://github.com/69gg/MuLi/actions/runs/40004424238)各十项实际成功。[PR #48](https://github.com/69gg/MuLi/pull/48)已合并；main 与已核验有效 GPG 签名的 `v2.41.0` 标签原子推送，保留原失败候选记录。
+
+同一提交的[发行 40004425177](https://github.com/69gg/MuLi/actions/runs/40004425177)实际完成为九项成功、一项失败、三项跳过；Windows Python 3.13 的 `test_real_windows_system_module_probe_mta_and_owned_unicode_tree` 在首个 helper probe 超时，3,649 passed / 1,454 skipped / 1 failed。固定诊断只观察到 `script_entered/utility_importing/utility_ready`，前缀未截断；一次请求、租约关闭、reader 结算及清理均确认。它将缺口收窄到 utility 就绪之后，不能据此认定 COM、程序集或 UIA 根因。其它平台和 main 绿色不抵消此失败。
+
+prepare、PyPI publish 与 GitHub release 均跳过，没有据此宣称构件已发布；不覆盖签名标签或盲目重跑原工作流。该 UIA 问题由独立后续调查处理，新的诊断或修复须保持原期限、资源与原生验收，不用增加 timeout 或跳过平台消除红灯。
 
 ## 未验收边界
 

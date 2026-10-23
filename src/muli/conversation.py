@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any
 
+from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.proactive import FrozenRouting
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
@@ -93,7 +94,7 @@ class Conversation:
         if not source or len(source) > 120 or not principal or len(principal) > 256:
             raise ValueError("消息来源或身份无效")
         attachments = list(attachment_ids or [])
-        if len(attachments) > 32 or any(
+        if len(attachments) > MAX_ATTACHMENT_IDS or any(
             not isinstance(item, str) or not item or len(item) > 256 for item in attachments
         ):
             raise ValueError("附件引用无效或数量过多")

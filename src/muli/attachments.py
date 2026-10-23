@@ -16,6 +16,35 @@ from muli.config import ConfigFile
 from muli.store import Store, new_id, now
 
 _TENCENT_SILK_HEADER = b"\x02#!SILK_V3"
+MAX_ATTACHMENT_IDS = 32
+ATTACHMENT_ID_PATTERN = r"^[a-f0-9]{32}$"
+
+
+def validate_attachment_ids(value: object) -> list[str]:
+    """Validate a complete ordered reference list without reading attachment data."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_ATTACHMENT_IDS:
+        raise ValueError("附件引用必须是有界列表")
+    if any(
+        not isinstance(item, str) or re.fullmatch(ATTACHMENT_ID_PATTERN, item) is None
+        for item in value
+    ):
+        raise ValueError("附件引用必须是小写32位十六进制ID")
+    if len(set(value)) != len(value):
+        raise ValueError("附件引用不能重复")
+    return list(value)
+
+
+def attachment_ids_schema() -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {"type": "string", "pattern": ATTACHMENT_ID_PATTERN},
+        "maxItems": MAX_ATTACHMENT_IDS,
+        "uniqueItems": True,
+        "description": "显式交给队友的附件ID；仅传引用，不读取正文或增加授权",
+    }
+
 
 SAFE_INLINE = {
     "image/png",
@@ -98,13 +127,22 @@ class Attachments:
         return item
 
     def path(self, identifier: str) -> Path:
-        if not re.fullmatch(r"[a-f0-9]{32}", identifier):
+        if not re.fullmatch(ATTACHMENT_ID_PATTERN, identifier):
             raise KeyError(identifier)
         self.get(identifier)
         path = self.directory / identifier
         if path.is_symlink() or not path.is_file():
             raise FileNotFoundError("附件文件不存在")
         return path
+
+    def validate_references(self, value: object) -> list[str]:
+        identifiers = validate_attachment_ids(value)
+        for identifier in identifiers:
+            try:
+                self.path(identifier)
+            except (KeyError, OSError) as exc:
+                raise ValueError(f"附件不可用：{identifier}") from exc
+        return identifiers
 
     def public(self, item: dict[str, Any]) -> dict[str, Any]:
         identifier = item["id"]

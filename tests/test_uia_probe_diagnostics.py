@@ -18,6 +18,9 @@ STAGES = (
     "script_entered",
     "utility_importing",
     "utility_ready",
+    "input_waiting",
+    "input_line_received",
+    "request_decoded",
     "probe_received",
     "uia_initializing",
     "uia_ready",
@@ -130,7 +133,7 @@ async def test_native_probe_failure_attaches_fixed_evidence_only_after_owned_cle
         await asyncio.gather(operation, return_exceptions=True)
 
 
-def test_packaged_script_has_eight_once_only_fixed_stage_points() -> None:
+def test_packaged_script_has_eleven_once_only_fixed_stage_points() -> None:
     from muli.tools import uia_computer
 
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
@@ -142,10 +145,60 @@ def test_packaged_script_has_eight_once_only_fixed_stage_points() -> None:
         "[Console]::Error.WriteLine"
     )
     assert "$script:traceMask -band $bit" in function and "catch { }" in function
-    assert source.count("Write-Stage ") == 8  # Eight fixed call sites, no per-request loop output.
+    assert "$index -ge $script:traceStages.Length" in function
+    assert source.count("Write-Stage ") == len(STAGES)
     assert "if (-not $script:traceProbeSeen)" in source
     assert source.index("Write-Stage 6") < source.index("$writer.WriteLine($json)")
     assert source.index("Write-Stage 7") > source.index("$writer.WriteLine($json)")
+
+
+def test_first_input_stages_surround_the_original_read_and_decode_only() -> None:
+    from muli.tools import uia_computer
+
+    source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
+    loop = source.split("for ($requestCount = 0; $requestCount -lt 16; $requestCount++)", 1)[1]
+    points = (
+        "if ($requestCount -eq 0) { Write-Stage 8 }",
+        "$line = Read-BoundedLine",
+        "if ($null -eq $line) { break }",
+        "if ($requestCount -eq 0) { Write-Stage 9 }",
+        "$request = Microsoft.PowerShell.Utility\\ConvertFrom-Json -InputObject $line",
+        "if ($requestCount -eq 0) { Write-Stage 10 }",
+        "if ($request.v -ne 1",
+        "Write-Stage 3",
+    )
+    positions = [loop.index(point) for point in points]
+    assert positions == sorted(positions)
+    assert all(source.count(point) == 1 for point in (points[0], points[3], points[5]))
+    assert source.index("Write-Stage 2") < source.index(points[0])
+
+
+def test_every_bounded_prefix_keeps_only_complete_in_order_input_stage_lines() -> None:
+    from helpers.uia_probe_diagnostics import probe_facts
+
+    frame = stage_bytes(*STAGES)
+    assert len(frame) <= 512 < MAX_STDERR_BYTES
+    boundaries = [len(stage_bytes(*STAGES[:count])) for count in range(1, len(STAGES) + 1)]
+    for end in range(len(frame) + 1):
+        complete = sum(boundary <= end for boundary in boundaries)
+        # Fill the retained prefix with an unknown complete line, leaving only
+        # this many marker bytes; later complete markers must not leak through.
+        capped = b"x" * (MAX_STDERR_BYTES - end - 1) + b"\n" + frame
+        for data in (frame[:end], capped):
+            result = probe_facts(cast(AXHelperLease, _Probe(stderr=data)), cleanup_failed=False)
+            assert result["stages"] == list(STAGES[:complete])
+            assert result["stage_sequence"] == ("valid" if complete else "unobserved")
+
+
+def test_old_eight_stage_prefix_remains_valid_without_new_input_markers() -> None:
+    from helpers.uia_probe_diagnostics import probe_facts
+
+    stages = tuple(stage for stage in STAGES if stage not in STAGES[3:6])
+    result = probe_facts(
+        cast(AXHelperLease, _Probe(stderr=stage_bytes(*stages))), cleanup_failed=False
+    )
+    assert len(stages) == 8
+    assert result["stages"] == list(stages) and result["stage_sequence"] == "valid"
 
 
 def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
@@ -176,8 +229,22 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
         (stage_bytes(STAGES[0], STAGES[0]), [STAGES[0]], "invalid"),
         (stage_bytes(STAGES[2], STAGES[0]), [STAGES[2], STAGES[0]], "invalid"),
         (stage_bytes(STAGES[0], "unrecognized", STAGES[2]), [STAGES[0], STAGES[2]], "valid"),
+        (stage_bytes("input_waiting", "input_waiting"), ["input_waiting"], "invalid"),
+        (
+            stage_bytes("request_decoded", "input_line_received"),
+            ["request_decoded", "input_line_received"],
+            "invalid",
+        ),
     ],
-    ids=["unknown", "partial", "duplicate", "out-of-order", "fixed-only"],
+    ids=[
+        "unknown",
+        "partial",
+        "duplicate",
+        "out-of-order",
+        "fixed-only",
+        "input-duplicate",
+        "input-out-of-order",
+    ],
 )
 def test_only_complete_known_lines_contribute_stage_evidence(
     data: bytes, stages: list[str], sequence: str

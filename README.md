@@ -21,7 +21,7 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 | 领域 | 当前实现 |
 | --- | --- |
 | 模型 | OpenAI Chat Completions、Responses、Anthropic 原生协议；流式/非流式、推理参数、工具回放、重试预算 |
-| 协作 | 持续主身份、动态 spawn/send/wait/resume/stop 团队、可跨重启的增量结果游标、依赖工作流；历史成员无固定上限，执行有资源预算 |
+| 协作 | 持续主身份、动态 spawn/send/wait/resume/stop 团队、显式附件交接与补充、可跨重启的增量结果游标、依赖工作流；历史成员无固定上限，执行有资源预算 |
 | 权限 | ask 每个工具调用询问；auto 独立审查 agent，风险操作交给用户；yolo 自动执行 |
 | 文件 | 目录、读取、写入、精确编辑、搜索、复制、移动、可恢复回收站；附件元数据检索与有界分页 |
 | 搜索 | SearXNG / Brave / Tavily 可配服务，有限大小网页读取与来源链接 |
@@ -93,6 +93,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [架构与执行边界](docs/architecture.md)
 - [模型协议与参数](docs/providers.md)
 - [多 agent 工作流](docs/workflows.md)
+- [把文件、语音和图片交给队友](docs/teammate-attachments.md)
 - [工作流结果回原渠道](docs/workflow-origin-design.md)
 - [任务暂停、补充要求与重新规划](docs/task-control.md)
 - [核查长期任务、报告与记忆依据](docs/task-inspection.md)
