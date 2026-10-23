@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from muli.evidence import EvidenceError
 from muli.maintenance import MaintenanceError
 from muli.management_projection import ProjectionError, _read_object
 from muli.platforms.file_watch import (
@@ -25,6 +26,7 @@ from muli.platforms.file_watch import (
 )
 from muli.proactive import FrozenRouting
 from muli.process import _wait_cleanup
+from muli.reply_origin import ReplyOrigin
 from muli.store import SQLITE_MAX_INTEGER, Store, new_id, now
 from muli.tools import Tool, parameters, string
 
@@ -36,6 +38,7 @@ RECORD_KIND = "file_inbox_record"
 EVENT_TYPE = "file_inbox.observed"
 SETTINGS_KIND = "file_inbox_settings"
 SETTINGS_ID = "current"
+PROJECT_KIND = "file_inbox_project"
 _OBJECT_BYTES = 16_384
 
 
@@ -50,6 +53,7 @@ class FileInboxSettings(BaseModel):
     max_records: int = Field(default=128, ge=1, le=1024, strict=True)
     window_seconds: float = Field(default=3600, ge=1, le=86400, allow_inf_nan=False)
     max_notices_per_window: int = Field(default=8, ge=1, le=32, strict=True)
+    project_id: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class FileInboxError(ValueError):
@@ -58,13 +62,99 @@ class FileInboxError(ValueError):
         super().__init__(code)
 
 
+def _project_binding(store: Store) -> dict[str, Any] | None:
+    try:
+        item = store.bounded_object(PROJECT_KIND, SETTINGS_ID, max_bytes=_OBJECT_BYTES)
+    except EvidenceError:
+        raise FileInboxError("file_inbox_project_invalid") from None
+    if item is not None and (
+        set(item) != {"id", "version", "project_id", "revision"}
+        or type(item["version"]) is not int
+        or item["version"] != 1
+        or not isinstance(item["revision"], str)
+        or len(item["revision"]) != 32
+        or (item["project_id"] is not None and not _project_id(item["project_id"]))
+    ):
+        raise FileInboxError("file_inbox_project_invalid")
+    return item
+
+
+def _project_id(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
+
+
+def project_snapshot(runtime: Runtime, identifier: str) -> dict[str, Any] | None:
+    """Point-read a current task envelope, never resolve or load its evidence refs."""
+    from muli.task_control import TaskControl
+
+    try:
+        item = runtime.store.bounded_object(
+            "commitment", identifier, max_bytes=runtime.config.settings.limits.max_output_chars * 4
+        )
+    except EvidenceError as error:
+        raise FileInboxError("file_inbox_project_" + error.code) from None
+    if item is None:
+        return None
+    if not isinstance(item.get("status"), str):
+        raise FileInboxError("file_inbox_project_invalid")
+    if item["status"] in {"done", "cancelled"}:
+        return None
+    brief = item.get("brief")
+    if (
+        type(item.get("revision")) is not int
+        or item["revision"] < 1
+        or item.get("status") not in {"open", "in_progress", "blocked"}
+        or not isinstance(brief, dict)
+        or set(brief) != {"version", "goal", "constraints", "evidence_refs"}
+        or type(brief.get("version")) is not int
+        or brief["version"] != 1
+        or not isinstance(brief.get("goal"), str)
+        or not brief["goal"].strip()
+        or not isinstance(brief.get("constraints"), list)
+        or any(not isinstance(text, str) or not text.strip() for text in brief["constraints"])
+        or not isinstance(brief.get("evidence_refs"), list)
+    ):
+        raise FileInboxError("file_inbox_project_invalid")
+    # Validate only finite reference shapes. Their bodies/existence belong to the
+    # existing read tools, including unavailable evidence after deletion.
+    for ref in brief["evidence_refs"]:
+        if (
+            not isinstance(ref, dict)
+            or not {"kind", "id"} <= ref.keys()
+            or ref.keys() - {"kind", "id", "session_id", "seq"}
+            or not isinstance(ref.get("kind"), str)
+            or ref["kind"] not in {"message", "attachment"}
+            or not isinstance(ref.get("id"), str)
+            or not ref["id"].strip()
+        ):
+            raise FileInboxError("file_inbox_project_invalid")
+    try:
+        control = TaskControl._state(item)
+    except ValueError:
+        raise FileInboxError("file_inbox_project_invalid") from None
+    return {
+        "revision": item["revision"],
+        "status": item["status"],
+        "epoch": control["epoch"],
+        "approved_epoch": control["approved_epoch"],
+    }
+
+
 def _checked_settings(settings: FileInboxSettings) -> tuple[FileInboxSettings, dict[str, Any]]:
     try:
         checked = FileInboxSettings.model_validate(settings.model_dump(mode="python"))
+        if checked.project_id is not None and not _project_id(checked.project_id):
+            raise ValueError("project_id")
         item: dict[str, Any] = {
             "id": SETTINGS_ID,
             "schema_version": 1,
-            "settings": checked.model_dump(mode="json"),
+            "settings": checked.model_dump(mode="json", exclude_none=True),
         }
         size = len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8"))
     except (ValueError, TypeError, UnicodeError, RecursionError):
@@ -114,11 +204,31 @@ class FileInboxSettingsStore:
             raise FileInboxError("file_inbox_settings_transaction_mode_unsupported")
         self.read()  # Never overwrite malformed data or an unknown future schema.
         checked, item = _checked_settings(settings)
+        if checked.project_id is not None:
+            from muli.project_review import require_project_review_format
+
+            require_project_review_format(self.store)
+        binding = _project_binding(self.store)
+        objects = [(SETTINGS_KIND, item)]
+        if (binding is None and checked.project_id is not None) or (
+            binding is not None and binding["project_id"] != checked.project_id
+        ):
+            objects.append(
+                (
+                    PROJECT_KIND,
+                    {
+                        "id": SETTINGS_ID,
+                        "version": 1,
+                        "project_id": checked.project_id,
+                        "revision": new_id(),
+                    },
+                )
+            )
         try:
             self.store.event(
                 "file_inbox.settings.changed",
                 {"id": SETTINGS_ID, "enabled": checked.enabled},
-                objects=[(SETTINGS_KIND, item)],
+                objects=objects,
             )
         except sqlite3.Error:
             raise FileInboxError("file_inbox_settings_write_failed") from None
@@ -131,6 +241,8 @@ class FileInboxState:
     revision: str = ""
     enabled: bool = False
     code: str = "disabled"
+    project_id: str | None = None
+    binding_revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +250,7 @@ class FileInboxProof:
     scope: str
     revision: str
     watcher_generation: int
+    project: dict[str, str] | None = None
 
 
 class Watch(Protocol):
@@ -152,7 +265,7 @@ WatchFactory = Callable[..., Watch]
 
 def _signature(settings: FileInboxSettings, roots: list[str]) -> str:
     return hashlib.sha256(
-        json.dumps([settings.model_dump(), roots], sort_keys=True).encode()
+        json.dumps([settings.model_dump(exclude_none=True), roots], sort_keys=True).encode()
     ).hexdigest()
 
 
@@ -174,6 +287,16 @@ def _valid_name(name: object) -> bool:
         return False
 
 
+def _valid_project_proof(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"project_id", "binding_revision"}
+        and _project_id(value["project_id"])
+        and isinstance(value["binding_revision"], str)
+        and len(value["binding_revision"]) == 32
+    )
+
+
 def _valid_record(record: dict[str, Any]) -> bool:
     if set(record) != {
         "id",
@@ -189,13 +312,18 @@ def _valid_record(record: dict[str, Any]) -> bool:
     if not isinstance(record["id"], str) or len(record["id"]) != 32:
         return False
     proof = record["proof"]
-    if not isinstance(proof, dict) or set(proof) != {
+    fields = {
         "id",
         "source",
         "scope",
         "revision",
         "watcher_generation",
-    }:
+    }
+    if (
+        not isinstance(proof, dict)
+        or set(proof) not in (fields, fields | {"project"})
+        or ("project" in proof and not _valid_project_proof(proof["project"]))
+    ):
         return False
     if proof["id"] != record["id"] or proof["source"] != "file_inbox":
         return False
@@ -235,7 +363,8 @@ def read_record(
     data = event.get("data")
     if not state.enabled or event.get("type") != EVENT_TYPE or not isinstance(data, dict):
         return None
-    if set(data) != {"id", "source", "scope", "revision", "watcher_generation"}:
+    fields = {"id", "source", "scope", "revision", "watcher_generation"}
+    if set(data) not in (fields, fields | {"project"}):
         return None
     if data.get("source") != "file_inbox" or (data.get("scope"), data.get("revision")) != (
         state.scope,
@@ -256,7 +385,14 @@ def read_record(
     if record["kind"] == "candidate" and state.code not in {"watching", "coverage_incomplete"}:
         return None
     routing = FrozenRouting.load(record["routing"])
-    if routing.classification != "independent" or routing.dump() != record["routing"]:
+    if "project" in data:
+        if (
+            data["project"]
+            != {"project_id": state.project_id, "binding_revision": state.binding_revision}
+            or record["routing"] != FrozenRouting.bound(ReplyOrigin(kind="web")).dump()
+        ):
+            return None
+    elif routing.classification != "independent" or routing.dump() != record["routing"]:
         return None
     return record
 
@@ -372,8 +508,16 @@ class FileInbox:
         self.runtime.maintenance.require_configuration()
         self.store.revalidate_format()
         checked, _ = _checked_settings(settings)
+        if checked.project_id is not None:
+            self.runtime.require_project_review_format()
         if checked.enabled:
             _path(checked.path, self.runtime.config.settings.workspace_roots)
+        if (
+            checked.project_id is not None
+            and (checked.enabled or checked.project_id != self.desired_settings().project_id)
+            and project_snapshot(self.runtime, checked.project_id) is None
+        ):
+            raise FileInboxError("file_inbox_project_unavailable")
         self.settings_store.replace(checked)
 
         # Keep the caller's configuration lock until this owned source rebuild
@@ -390,6 +534,11 @@ class FileInbox:
     def settings_state(self) -> FileInboxState:
         try:
             desired = self.desired_settings()
+            binding = _project_binding(self.store)
+            if desired.project_id is not None and (
+                binding is None or binding["project_id"] != desired.project_id
+            ):
+                raise FileInboxError("file_inbox_project_invalid")
         except FileInboxError as error:
             return FileInboxState(code=error.code)
         try:
@@ -412,7 +561,14 @@ class FileInbox:
                 code = getattr(exc, "code", "watch_unavailable")
                 self._failed(code, self._generation)
         # Runtime generation gates callbacks only; durable policy gates committed facts.
-        return FileInboxState(policy["scope"], policy["revision"], active, code)
+        return FileInboxState(
+            policy["scope"],
+            policy["revision"],
+            active,
+            code,
+            desired.project_id,
+            binding["revision"] if desired.project_id is not None and binding else None,
+        )
 
     def status(self) -> dict[str, Any]:
         state = self.settings_state()
@@ -445,13 +601,22 @@ class FileInbox:
         }
 
     async def start(self) -> None:
+        from muli.format_admission import FormatAdmissionError
+
         if not self._closing:
             return
         self._closing = False
         self._generation += 1
         try:
             self._settings = self.desired_settings()
-        except FileInboxError as error:
+            if self._settings.project_id is not None:
+                self.runtime.require_project_review_format()
+            binding = _project_binding(self.store)
+            if self._settings.project_id is not None and (
+                binding is None or binding["project_id"] != self._settings.project_id
+            ):
+                raise FileInboxError("file_inbox_project_invalid")
+        except (FileInboxError, FormatAdmissionError) as error:
             self._failure = error.code
             return
         settings = self.runtime.config.settings
@@ -593,13 +758,22 @@ class FileInbox:
 
     def _commit(self, policy: dict[str, Any], *, metadata: FileMetadata | None = None) -> None:
         identifier = new_id()
-        proof = {
+        proof: dict[str, Any] = {
             "id": identifier,
             "source": "file_inbox",
             "scope": policy["scope"],
             "revision": policy["revision"],
             "watcher_generation": self._generation,
         }
+        if self._settings.project_id is not None:
+            self.runtime.require_project_review_format()
+            binding = _project_binding(self.store)
+            if binding is None or binding["project_id"] != self._settings.project_id:
+                raise FileInboxError("file_inbox_project_invalid")
+            proof["project"] = {
+                "project_id": binding["project_id"],
+                "binding_revision": binding["revision"],
+            }
         record = {
             "id": identifier,
             "proof": proof,
@@ -607,8 +781,10 @@ class FileInbox:
             "observed_at": now(),
             "metadata": asdict(metadata) if metadata is not None else None,
             "code": None if metadata is not None else policy["code"],
-            "routing": FrozenRouting.independent(
-                self.runtime.config.settings, self.store.db
+            "routing": (
+                FrozenRouting.bound(ReplyOrigin(kind="web"))
+                if self._settings.project_id is not None
+                else FrozenRouting.independent(self.runtime.config.settings, self.store.db)
             ).dump(),
         }
         with self.store.db:
@@ -742,7 +918,10 @@ class FileInbox:
             raise ValueError("file_inbox_limit_invalid")
         state = self.settings_state()
         return [
-            {key: value for key, value in record.items() if key not in {"routing", "proof"}}
+            {
+                **{key: value for key, value in record.items() if key not in {"routing", "proof"}},
+                **({"project": record["proof"]["project"]} if "project" in record["proof"] else {}),
+            }
             for record in self._records(min(limit, self._settings.max_records))
             if state.enabled and record["proof"]["revision"] == state.revision
         ]
@@ -763,6 +942,8 @@ class FileInbox:
         ):
             return None
         result = {key: value for key, value in record.items() if key not in {"routing", "proof"}}
+        if "project" in record["proof"]:
+            result["project"] = record["proof"]["project"]
         metadata = record["metadata"]
         if metadata is not None:
             path = (

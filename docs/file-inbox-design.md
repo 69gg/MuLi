@@ -4,6 +4,10 @@
 
 ## 首片范围与实现选择
 
+后续项目关联候选（WIP）：可空 `project_id` 与独立 `file_inbox_project/current` binding 同 SQLite 事务保存；canonical proof 可带严格的 `{project_id,binding_revision}`，任务 revision/epoch 是消费时另取的有界快照，不进入不可变来源证明。项目批固定标准 Web bound，generic 的签名和字段保持原状。Attention 在最终锁内拒绝任务快照变化，至多立即重建一次，再等真实 bus revision；终止/解绑跳过而不回落 generic。任务引用仅核有限结构，不在宿主加载其正文或逐个解引用。项目 marker 与 prompt 共用原 Attention 字符预算，不能容下单条则保留 cursor 并明确预算失败。
+
+该增量尚不能启用或发行：objects/ingress 新合同的真实格式准入与现有数据安全迁移是前置，不能只给新实例启用或写假格式 2；标准 Web 路由值不足以保证旧 Runtime 忽略项目 marker 后不会混入手机输入。现有收件流程保持格式 1，完整的项目执行段、迁移与回退验收均待统一验证。详见 [项目复核方案](proactive-project-inbox-proposal.md) 与 [使用边界](file-inbox.md)。
+
 本方案由项目作出的选择：先支持 Linux 的一个现存目录，只看直属普通文件，默认关闭，不递归。目录必须在现有 workspace_roots 内；开启不扩大已有文件权限。自然语言修改使用主会话专属的 file_inbox_configure，认证管理入口为 GET/PUT /api/file-inbox/settings；沿现有配置锁、维护准入及生命周期只重配本来源，不增加前端常驻面板。macOS、Windows 明确不可用，待各自事件后端验收。
 
 比较过三个方向：服务内 inotify 复用现有生命周期、事件循环和注意事项，适合首片；systemd.path 会额外增加单元安装、认证入站和重复激活，后续再评估；扩展 watcher 是目录指纹轮询，职责不同，不复用为资料事件后端。实现采用零新增依赖的 stdlib ctypes 适配，临时目录原生回归与整体应用验收分别提供证据，不以原型接口代替验收。

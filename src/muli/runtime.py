@@ -38,6 +38,10 @@ from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
 from muli.process import run_process
+from muli.project_review import (
+    require_project_review_format,
+    validate_project_review,
+)
 from muli.providers import (
     ImageInput,
     Message,
@@ -83,6 +87,7 @@ class PreparedRequest:
     selected_replan: TaskSnapshot | None = None
     reply_origin: ReplyOrigin = ReplyOrigin()
     attention_routing: FrozenRouting | None = None
+    project_review: dict[str, Any] | None = None
 
 
 class Runtime:
@@ -394,7 +399,9 @@ class Runtime:
     async def _next_context(self, session_id: str) -> list[Message]:
         return (await self._prepare_request(session_id)).messages
 
-    async def _prepare_request(self, session_id: str) -> PreparedRequest:
+    async def _prepare_request(
+        self, session_id: str, *, project_review: dict[str, Any] | None = None
+    ) -> PreparedRequest:
         self.system_events.clear_request(session_id)
         execution: TaskSnapshot | None = None
         selected: TaskSnapshot | None = None
@@ -411,8 +418,13 @@ class Runtime:
             [],
             execution,
             selected,
-            self._reply_origin(session_id),
-            self._attention_routing(session_id),
+            ReplyOrigin(kind="web")
+            if project_review is not None
+            else self._reply_origin(session_id),
+            FrozenRouting.bound(ReplyOrigin(kind="web"))
+            if project_review is not None
+            else self._attention_routing(session_id),
+            project_review,
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -707,6 +719,7 @@ class Runtime:
         objects: list[tuple[str, dict[str, Any]]],
         admission_guard: Callable[[], None] | None = None,
         routing: FrozenRouting | None = None,
+        project_review: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Admit idle-only facts atomically; execution and report handoff defer admission."""
         async with self.configuration_lock:
@@ -714,6 +727,23 @@ class Runtime:
                 raise ValueError("运行时正在关闭")
             if admission_guard is not None:
                 admission_guard()
+            if project_review is not None:
+                if (
+                    admission_guard is None
+                    or routing is None
+                    or routing.dump() != FrozenRouting.bound(ReplyOrigin(kind="web")).dump()
+                ):
+                    raise ValueError("项目复核需要宿主准入核验及精确的本地路由")
+                policy = self.config.settings.attention
+                max_chars = min(
+                    policy.max_chars, max(512, self.config.settings.limits.max_context_chars // 4)
+                )
+                project_review = validate_project_review(
+                    project_review,
+                    max_sources=policy.batch_size,
+                    max_chars=max_chars - len(content),
+                )
+                self.require_project_review_format()
             session = self.main_session()
             if self.attention_busy or not self.maintenance.admission.allowed:
                 return None
@@ -728,13 +758,18 @@ class Runtime:
                 max_pending=self.config.settings.limits.max_pending_runs,
                 objects=objects,
                 attention_routing=routing,
+                project_review=project_review,
             )
             self._wake_main()
         if inserted:
             await self.bus.emit("attention.queued", {"message": receipt}, session["id"])
         return receipt
 
-    async def _claim_inputs(self, session_id: str, run_id: str) -> bool:
+    def require_project_review_format(self) -> None:
+        """No project producer or admission may silently write the old contract."""
+        require_project_review_format(self.store)
+
+    async def _claim_inputs(self, session_id: str, run_id: str) -> list[dict[str, Any]]:
         messages = self.store.claim_inputs(
             session_id,
             run_id,
@@ -744,7 +779,7 @@ class Runtime:
             await self.bus.emit("message.completed", {"message": message}, session_id)
         await self.flush_task_plan_deliveries()
         await self.team.flush_reports(session_id)
-        return bool(messages)
+        return messages
 
     def _configure_workflows(self) -> None:
         from muli.workflows import WorkflowEngine
@@ -1588,12 +1623,60 @@ class Runtime:
             return None
         return FrozenRouting.load(json.loads(row[1]))
 
+    def _project_review(
+        self, session_id: str, run_id: str, messages: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Use only this claim's bounded, durably archived messages, never history."""
+        if not any("project_review" in message for message in messages):
+            return None
+        marker: dict[str, Any] | None = None
+        routing = FrozenRouting.bound(ReplyOrigin(kind="web")).dump()
+        for message in messages:
+            if "project_review" not in message:
+                raise ValueError("同一项目复核批不能混合普通输入或不同宿主证明")
+            if (
+                not isinstance(message.get("id"), str)
+                or not message["id"]
+                or message.get("session_id") != session_id
+                or message.get("run_id") != run_id
+                or message.get("role") != "user"
+                or message.get("principal") != "system:attention"
+                or message.get("source") != "system:attention"
+                or message.get("route") is not None
+                or message.get("attachment_ids") != []
+                or message.get("attention_routing") != routing
+                or message.get("reply_origin") != ReplyOrigin(kind="web").dump()
+            ):
+                raise ValueError("项目复核持久宿主证明无效")
+            candidate = validate_project_review(message["project_review"])
+            if marker is not None and candidate != marker:
+                raise ValueError("同一项目复核批不能混合普通输入或不同宿主证明")
+            marker = candidate
+        if marker is not None:
+            self.require_project_review_format()
+        return marker
+
+    async def _interrupt_project_review(self, session_id: str, prepared: PreparedRequest) -> str:
+        content = "项目资料复核被新输入中断，尚未完成；已保存读取结果，未自动执行建议或外发报告。"
+        self.store.complete_message(
+            session_id,
+            content,
+            delivery_routes=[],
+            reply_origin=prepared.reply_origin.dump(),
+            attention_routing=FrozenRouting.bound(ReplyOrigin(kind="web")).dump(),
+        )
+        await self.bus.notify()
+        self.compaction.observe(session_id)
+        return content
+
     async def _execute(
         self, session_id: str, run_id: str, role: str, mode: Mode, workflow_step: bool
     ) -> str:
         self._repair_tail(session_id)
-        await self._claim_inputs(session_id, run_id)
-        prepared = await self._prepare_request(session_id)
+        claimed = await self._claim_inputs(session_id, run_id)
+        prepared = await self._prepare_request(
+            session_id, project_review=self._project_review(session_id, run_id, claimed)
+        )
         session = self.store.get("session", session_id) or {}
         workflow_step = workflow_step or bool(session.get("workflow_run_id"))
         spent = 0
@@ -1615,7 +1698,14 @@ class Runtime:
                         # entry before any network/model operation begins.
                         self._guard_request(prepared)
                         round_tools = self._round_tools(
-                            session_id, run_id, role, mode, workflow_step, session, spent
+                            session_id,
+                            run_id,
+                            role,
+                            mode,
+                            workflow_step,
+                            session,
+                            spent,
+                            project_review=prepared.project_review is not None,
                         )
                         async for event in client.stream(
                             messages, [tool.schema() for tool in round_tools.values()]
@@ -1676,13 +1766,21 @@ class Runtime:
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
-                    claimed = False
+                    if prepared.project_review is not None:
+                        if self.store.pending_inputs(session_id):
+                            return await self._interrupt_project_review(session_id, prepared)
+                        self.compaction.observe(session_id)
+                        return turn.content
+                    claimed = []
                     if round_index < self.config.settings.limits.max_tool_steps:
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
                     self._guard_request(prepared)
                     if claimed:
-                        prepared = await self._prepare_request(session_id)
+                        prepared = await self._prepare_request(
+                            session_id,
+                            project_review=self._project_review(session_id, run_id, claimed),
+                        )
                         continue
                     self.compaction.observe(session_id)
                     return turn.content
@@ -1707,7 +1805,12 @@ class Runtime:
                     else:
                         try:
                             result = await self._tool(
-                                call, round_tools, mode, session_id, run_id, prepared=prepared
+                                call,
+                                round_tools,
+                                "ask" if prepared.project_review is not None else mode,
+                                session_id,
+                                run_id,
+                                prepared=prepared,
                             )
                         except TaskPaused as exc:
                             paused = exc
@@ -1757,10 +1860,15 @@ class Runtime:
                 if paused is not None:
                     raise paused
                 self._guard_request(prepared)
-                if round_index < self.config.settings.limits.max_tool_steps:
+                project_review = prepared.project_review
+                if prepared.project_review is not None:
+                    if self.store.pending_inputs(session_id):
+                        return await self._interrupt_project_review(session_id, prepared)
+                elif round_index < self.config.settings.limits.max_tool_steps:
                     self.system_events.clear_request(session_id)
-                    await self._claim_inputs(session_id, run_id)
-                prepared = await self._prepare_request(session_id)
+                    claimed = await self._claim_inputs(session_id, run_id)
+                    project_review = self._project_review(session_id, run_id, claimed)
+                prepared = await self._prepare_request(session_id, project_review=project_review)
             raise ValueError("模型调用达到步骤上限")
 
     def _round_tools(
@@ -1772,6 +1880,8 @@ class Runtime:
         workflow_step: bool,
         session: dict[str, Any],
         spent: int,
+        *,
+        project_review: bool = False,
     ) -> dict[str, Tool]:
         # Materialize after capacity admission. One dict binds the schemas and
         # handlers for this whole response, including approval waits and pairing.
@@ -1792,7 +1902,9 @@ class Runtime:
             tools.update({tool.name: tool for tool in self.team.tools(session_id, mode)})
         disabled = self.config.settings.disabled_tools
         trigger = self._latest_main_trigger(session_id)
-        attention = bool(trigger and trigger.get("principal") == "system:attention")
+        attention = project_review or bool(
+            trigger and trigger.get("principal") == "system:attention"
+        )
         return {
             name: tool
             for name, tool in tools.items()

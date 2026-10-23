@@ -8,6 +8,7 @@ from typing import Any
 
 from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.proactive import FrozenRouting
+from muli.project_review import require_project_review_format, validate_project_review
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
 
@@ -54,7 +55,10 @@ class Conversation:
         objects: list[tuple[str, dict[str, Any]]] | None = None,
         reply_origin: ReplyOrigin | None = None,
         attention_routing: FrozenRouting | None = None,
+        project_review: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if project_review is not None and not internal:
+            raise ValueError("项目复核证明仅允许宿主注意事项入口")
         payload = self.payload(
             session_id,
             content,
@@ -66,7 +70,10 @@ class Conversation:
             event_id=event_id,
             reply_origin=reply_origin,
             attention_routing=attention_routing,
+            project_review=project_review,
         )
+        if project_review is not None:
+            require_project_review_format(self.store)
         return self.store.enqueue_input(
             payload,
             max_pending=max_pending,
@@ -87,6 +94,7 @@ class Conversation:
         event_id: str | None = None,
         reply_origin: ReplyOrigin | None = None,
         attention_routing: FrozenRouting | None = None,
+        project_review: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > 64000:
@@ -128,4 +136,16 @@ class Conversation:
                 raise ValueError("主动通知选路仅允许系统注意事项入口")
             payload["attention_routing"] = attention_routing.dump()
             payload["reply_origin"] = attention_routing.reply_origin(identifier).dump()
+        if project_review is not None:
+            if (
+                principal != "system:attention"
+                or source != "system:attention"
+                or mode != "ask"
+                or route is not None
+                or attachments
+                or attention_routing is None
+                or attention_routing.dump() != FrozenRouting.bound(ReplyOrigin(kind="web")).dump()
+            ):
+                raise ValueError("项目复核仅允许本地只读宿主注意事项")
+            payload["project_review"] = validate_project_review(project_review)
         return payload

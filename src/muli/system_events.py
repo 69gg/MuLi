@@ -927,6 +927,7 @@ def attention_source(
                 file_inbox_policy.scope,
                 file_inbox_policy.revision,
                 record["proof"]["watcher_generation"],
+                record["proof"].get("project"),
             ),
         )
     adapter = _ADAPTERS.get(event.get("type", ""))

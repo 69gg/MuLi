@@ -993,22 +993,42 @@ class Store:
         """At a replay-safe boundary, atomically append inputs and advance delivery state."""
         result: builtins.list[dict[str, Any]] = []
         destination: tuple[str, str, str] | None = None
+        project_key: str | None = None
+        batch: builtins.list[tuple[sqlite3.Row, dict[str, Any]]] = []
+        rows = self.db.execute(
+            "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload"])
+            origin = ReplyOrigin.from_input(payload)
+            routing = FrozenRouting.load(payload.get("attention_routing"))
+            key = (
+                *origin.destination_key,
+                routing.batch_key if "attention_routing" in payload else "",
+            )
+            if destination is not None and (
+                key != destination or ("project_review" in payload) != (project_key is not None)
+            ):
+                break  # Another recipient or execution segment waits for the next boundary.
+            marker_key: str | None = None
+            if "project_review" in payload:
+                from muli.project_review import project_review_key
+
+                marker_key = project_review_key(payload["project_review"])
+            if destination is not None and marker_key != project_key:
+                break  # Even local projects must retain their complete, distinct host facts.
+            destination = key
+            project_key = marker_key
+            batch.append((row, payload))
+        if any("project_review" in payload for _, payload in batch):
+            from muli.project_review import require_project_review_format
+
+            # The bounded evidence reader owns its read transaction. Check this
+            # exact batch synchronously before any archive or delivery DML.
+            require_project_review_format(self)
         with self.db:
-            rows = self.db.execute(
-                "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
-            for row in rows:
-                payload = json.loads(row["payload"])
-                origin = ReplyOrigin.from_input(payload)
-                routing = FrozenRouting.load(payload.get("attention_routing"))
-                key = (
-                    *origin.destination_key,
-                    routing.batch_key if "attention_routing" in payload else "",
-                )
-                if destination is not None and key != destination:
-                    break  # Another recipient waits for the next replay-safe boundary.
-                destination = key
+            for row, payload in batch:
                 message = self._archive_input(
                     payload, received=row["received"], run_id=run_id, input_seq=row["seq"]
                 )
@@ -1048,6 +1068,10 @@ class Store:
             message["task_control"] = payload["task_control"]
         if "attention_routing" in payload:
             message["attention_routing"] = FrozenRouting.load(payload["attention_routing"]).dump()
+        if "project_review" in payload:
+            from muli.project_review import validate_project_review
+
+            message["project_review"] = validate_project_review(payload["project_review"])
         if self.get("message", payload["id"]) is not None:
             raise ValueError("输入消息 ID 已经存档，不能覆盖历史")
         self._put("message", message)
