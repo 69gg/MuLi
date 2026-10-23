@@ -117,3 +117,7 @@ wake_command / speaker_command 是完整 argv 数组，不是 shell 命令字符
 转写回调在采集与文件锁释放后执行，可以合成回复语音。整个回调仍属于当前可取消操作；回调内的嵌套 TTS 不会让关闭流程遗漏尚未结束的录音任务。
 
 录音和播放参数依据 [FFmpeg Devices](https://ffmpeg.org/ffmpeg-devices.html) 与 [Arch arecord 手册](https://man.archlinux.org/man/aplay.1.en)。ASR/TTS 的 HTTP 接线、接口兼容性与请求预算复用 [媒体服务](providers.md#视觉语音和检索服务)。
+
+## 给队友补充音频资料
+
+主 MuLi 可通过 `spawn_agent` 或 `send_input` 的 `attachment_ids` 显式交付音频引用。队友收到元数据后才按需调用 `audio_transcribe`；交接本身不会启动 ASR。已有转写可传递其工件 ID、revision 与游标，使用 `audio_transcript_read` 续读，避免再次转写。转写仍是资料，不增加主人授权，也不改变原任务汇报目的地。完整调用与校验规则见[资料交接](teammate-attachments.md)。

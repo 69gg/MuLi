@@ -232,3 +232,7 @@ await manager.close()
 - [QQ 调用基础与 access token](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/api-use.html)、[事件回调](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html)、[签名校验](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/sign.html)。
 - [QQ 富媒体协议](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/rich-media.html)、[群消息接口与被动回复限制](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)。
 - [腾讯 iLink v2.4.6 消息类型](https://github.com/Tencent/openclaw-weixin/blob/v2.4.6/src/api/types.ts)与独立客户端 [weixin-ilink-client v0.1.3](https://github.com/69gg/weixin-ilink-client/tree/v0.1.3)：核实 iLink 消息、平台语音转写与 Tencent SILK 标识；不依赖或自动安装该客户端。
+
+## 移动渠道补充队友资料
+
+同一主人从已绑定渠道发送文件或语音后，主 MuLi 可显式以 `send_input(target, message, attachment_ids)` 交给已有队友；队友在既有安全边界接收，`wake=false` 仅保存邮箱。补充不改原任务汇报来源；网页派工的结果仍保留网页目的地，移动输入的即时确认沿该输入原路处理。引用接纳不表示正文已读取或外部消息已送达，详见[资料交接](teammate-attachments.md)。

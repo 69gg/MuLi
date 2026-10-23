@@ -82,7 +82,7 @@ def message_text_size(record: dict[str, Any]) -> int:
     return len(json.dumps(data, ensure_ascii=False))
 
 
-_EVIDENCE_METADATA = ("role", "source", "principal", "evidence_revision")
+_EVIDENCE_METADATA = ("role", "source", "principal", "evidence_revision", "attachment_ids")
 # Older SQLite versions narrow substr lengths to 32 bits. The actual BLOB size
 # is sufficient for any requested window and keeps large valid budgets portable.
 _EVIDENCE_COLUMNS = (
@@ -95,7 +95,8 @@ _EVIDENCE_COLUMNS = (
     "ELSE 'unknown' END AS content_provenance,"
     + ",".join(
         f"json_type(o.data,'$.{field}') AS {field}_type,"
-        f"CASE WHEN json_type(o.data,'$.{field}')='text' THEN "
+        f"CASE WHEN json_type(o.data,'$.{field}')="
+        f"'{('array' if field == 'attachment_ids' else 'text')}' THEN "
         f"coalesce(substr(CAST(json_extract(o.data,'$.{field}') AS BLOB),1,"
         f"min(?,length(CAST(json_extract(o.data,'$.{field}') AS BLOB)))),x'') END AS {field},"
         f"length(CAST(json_extract(o.data,'$.{field}') AS BLOB)) AS {field}_bytes"

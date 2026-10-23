@@ -15,6 +15,8 @@
 
 消息项包含完整 `id/seq/revision/role/content/content_bytes/content_truncated/content_provenance`；source/principal 只在实际保存且预算足够时返回，省略用 `metadata_omitted` 明示。无法读取的正文明确标记，不以空字符串冒充完整内容。主、队友、工作流和独立记录均按真实 session ID 查询，不触发模型、记忆提炼、原工具、主人授权 hook 或渠道发送。
 
+消息页及正文续读同时返回完整 `attachment_ids`，不加载附件正文；旧消息缺字段时为 `[]`，旧 opaque 引用及重复顺序保持不变。引用不作为可选元数据静默省略：字节投影或最终 JSON 预算不足返回 `output_budget`；字段存在但为 null、形状超出原信封范围或含无效 UTF-8 字符时返回 `content_unavailable`。它只是已保存资料的定位，不代表当前文件仍存在或获得新的读取授权，详细合同见[证据续读](history-evidence.md)。
+
 首次读取取得该会话已保存的最高消息 seq，作为 `through_seq`；空会话为 0。续页原样携带该上界和 `next_before_seq`，只取小于 before 的记录。每页按 seq 正序展示；还有更早资料时，next 为实际返回最小 seq，否则为 null。预算不足时只保留候选较新端的连续完整项，不能越过未返回的记录。pending 入站序号与未持久流片段不参与这个游标。
 
 through 仅限制本次遍历纳入的追加消息，不是内容快照：删除的记录不会补回，重写正文会产生新 revision。正文续读必须携带旧页版本，避免混拼；返回 409 `evidence_changed` 后从零读取当前版本，404 `evidence_not_found` 表示删除、不存在或会话不匹配。没有一项完整定位能放下时返回 400 `output_budget`，参数范围错误为 422。网页序号限于 JavaScript 可精确表示的非负整数；归档数据超过该范围返回 400 `archive_sequence_range`，不能用舍入游标跳过记录。

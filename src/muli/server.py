@@ -15,10 +15,16 @@ from urllib.parse import unquote
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from muli import __version__
-from muli.attachments import SAFE_INLINE, Attachments
+from muli.attachments import (
+    MAX_ATTACHMENT_IDS,
+    SAFE_INLINE,
+    Attachments,
+    attachment_ids_schema,
+    validate_attachment_ids,
+)
 from muli.attention import AttentionInbox
 from muli.auth import COOKIE_NAME, Authentication
 from muli.candidate_online import OnlineSettings
@@ -85,10 +91,17 @@ class SessionInput(Input):
     mode: Mode | None = None
 
 
+AttachmentReferences = Annotated[
+    list[str],
+    BeforeValidator(validate_attachment_ids),
+    Field(max_length=MAX_ATTACHMENT_IDS, json_schema_extra=attachment_ids_schema()),
+]
+
+
 class ChatInput(Input):
     content: str = Field(default="", max_length=64000)
     mode: Mode | None = None
-    attachment_ids: list[str] = Field(default_factory=list, max_length=32)
+    attachment_ids: AttachmentReferences = Field(default_factory=list)
 
 
 class TranscriptionInput(Input):
@@ -101,6 +114,7 @@ class LoginInput(Input):
 
 class TeamMessageInput(Input):
     content: str = Field(min_length=1, max_length=64000)
+    attachment_ids: AttachmentReferences = Field(default_factory=list)
 
 
 class TaskControlInput(Input):
@@ -819,7 +833,9 @@ def _create_app(
     @app.post("/api/team/{identifier}/messages")
     async def team_message(identifier: str, body: TeamMessageInput) -> dict[str, Any]:
         async with runtime.configuration_lock:
-            return await runtime.team.send(identifier, body.content)
+            return await runtime.team.send(
+                identifier, body.content, attachment_ids=body.attachment_ids
+            )
 
     @app.post("/api/team/{identifier}/stop")
     async def stop_agent(identifier: str) -> dict[str, Any]:
@@ -1156,8 +1172,7 @@ def _create_app(
 
     @app.post("/api/sessions/{session_id}/messages")
     async def send_message(session_id: str, body: ChatInput) -> dict[str, Any]:
-        for identifier in body.attachment_ids:
-            attachments.path(identifier)
+        attachments.validate_references(body.attachment_ids)
         content = body.content or ("请查看附件" if body.attachment_ids else "")
         if session_id == runtime.main_session()["id"]:
             result = await runtime.submit(content, body.mode, attachment_ids=body.attachment_ids)

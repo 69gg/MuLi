@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from muli.attachment_records import AttachmentRecords
-from muli.attachments import Attachments, attachment_name, detected_media, file_io
+from muli.attachments import (
+    MAX_ATTACHMENT_IDS,
+    Attachments,
+    attachment_name,
+    detected_media,
+    file_io,
+)
 from muli.commitments import Commitments
 from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
@@ -24,6 +30,7 @@ from muli.transcripts import AudioTranscripts
 class LocalServices:
     def __init__(self, runtime: Runtime, attachments: Attachments) -> None:
         self.runtime, self.attachments = runtime, attachments
+        runtime.team.attachments = attachments
         self.attachment_records = AttachmentRecords(runtime.store)
         self.transcripts = AudioTranscripts(attachments)
         self.commitments = Commitments(
@@ -102,7 +109,7 @@ class LocalServices:
                 for message in current
                 for identifier in message.get("attachment_ids", [])
             )
-        )[-32:]
+        )[-MAX_ATTACHMENT_IDS:]
         files: list[dict[str, Any]] = []
         for identifier in identifiers:
             try:

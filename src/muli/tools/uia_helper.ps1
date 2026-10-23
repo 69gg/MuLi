@@ -14,12 +14,15 @@ $script:traceStages = @(
     'muli-uia-stage=1:uia_initializing',
     'muli-uia-stage=1:uia_ready',
     'muli-uia-stage=1:probe_encoded',
-    'muli-uia-stage=1:probe_write_returned'
+    'muli-uia-stage=1:probe_write_returned',
+    'muli-uia-stage=1:input_waiting',
+    'muli-uia-stage=1:input_line_received',
+    'muli-uia-stage=1:request_decoded'
 )
 
 function Write-Stage([int]$index) {
     try {
-        if ($index -lt 0 -or $index -ge 8) { return }
+        if ($index -lt 0 -or $index -ge $script:traceStages.Length) { return }
         $bit = 1 -shl $index
         if (($script:traceMask -band $bit) -ne 0) { return }
         $script:traceMask = $script:traceMask -bor $bit
@@ -383,9 +386,12 @@ try {
     if ($null -eq $utility -or $utility.Path -ne $utilityPath) { exit 1 }
     Write-Stage 2
     for ($requestCount = 0; $requestCount -lt 16; $requestCount++) {
+        if ($requestCount -eq 0) { Write-Stage 8 }
         $line = Read-BoundedLine
         if ($null -eq $line) { break }
+        if ($requestCount -eq 0) { Write-Stage 9 }
         $request = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $line
+        if ($requestCount -eq 0) { Write-Stage 10 }
         if ($request.v -ne 1 -or $request.request_id -cnotmatch '^[a-f0-9]{32}$') {
             Stop-Bridge 'protocol_error'
         }
