@@ -216,6 +216,44 @@ def test_bad_mappings_consume_raw_window_and_never_backfill(
     assert any("message_order_session" in row[3] for row in plan)
 
 
+@pytest.mark.parametrize(
+    "expression,identifier",
+    [
+        pytest.param("?", b"blob-id", id="blob"),
+        pytest.param("?", b"", id="empty-blob"),
+        pytest.param("?", "", id="empty-text"),
+        pytest.param("CAST(? AS TEXT)", b"\x80", id="invalid-utf8-text"),
+    ],
+)
+def test_invalid_mapping_identity_is_unavailable_without_backfill(
+    rig: Rig,
+    inspection: TaskInspection,
+    expression: str,
+    identifier: str | bytes,
+) -> None:
+    rig.agent()
+    message(rig, "older-good")
+    inserted = rig.store.db.execute(
+        f"INSERT INTO message_order(message_id,session_id) VALUES({expression},?)",
+        (identifier, "worker"),
+    )
+    seq = inserted.lastrowid
+    rig.store.db.commit()
+    writes = rig.store.db.total_changes
+
+    package = read(inspection, rig, limit=1)
+
+    assert package["items"] == [{"id": None, "seq": seq, "availability": "unavailable"}]
+    assert package["window"] == {
+        "limit": 1,
+        "through_seq": seq,
+        "oldest_seq": seq,
+        "has_older": True,
+    }
+    assert read(inspection, rig, limit=1, revision=package["revision"]) == package
+    assert rig.store.db.total_changes == writes
+
+
 @pytest.mark.parametrize("corruption", ["json", "attachment", "oversize-attachment"])
 def test_damaged_metadata_is_counted_without_returning_partial_references(
     rig: Rig,
@@ -277,6 +315,59 @@ def test_complete_objects_are_sql_bounded_before_json_decode(
     with pytest.raises(EvidenceError) as error:
         read(inspection, rig)
     assert error.value.code == "output_budget"
+
+
+@pytest.mark.parametrize(
+    "kind,identifier",
+    [
+        ("commitment", None),
+        ("agent", "worker"),
+        ("session", "worker"),
+        ("session", "main"),
+        ("run", "current-run"),
+        ("team_report", "current-run"),
+    ],
+)
+def test_invalid_utf8_complete_object_has_a_fixed_evidence_error(
+    rig: Rig,
+    inspection: TaskInspection,
+    kind: str,
+    identifier: str | None,
+) -> None:
+    execution(rig)
+    identifier = (
+        rig.identifier if identifier is None else rig.main if identifier == "main" else identifier
+    )
+    item = rig.store.get(kind, identifier)
+    assert item is not None
+    raw = json.dumps(item).encode("utf-8")[:-1] + b',"invalid_encoding":"\x80"}'
+    rig.store.db.execute(
+        "UPDATE objects SET data=CAST(? AS TEXT) WHERE kind=? AND id=?",
+        (raw, kind, identifier),
+    )
+    rig.store.db.commit()
+    with pytest.raises(EvidenceError) as error:
+        read(inspection, rig)
+    assert error.value.code == "content_unavailable"
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
+def test_complete_object_does_not_autodetect_alternate_json_encodings(
+    rig: Rig,
+    inspection: TaskInspection,
+    encoding: str,
+) -> None:
+    execution(rig)
+    item = rig.store.get("commitment", rig.identifier)
+    assert item is not None
+    rig.store.db.execute(
+        "UPDATE objects SET data=CAST(? AS TEXT) WHERE kind='commitment' AND id=?",
+        (json.dumps(item).encode(encoding), rig.identifier),
+    )
+    rig.store.db.commit()
+    with pytest.raises(EvidenceError) as error:
+        read(inspection, rig)
+    assert error.value.code == "content_unavailable"
 
 
 @pytest.mark.parametrize("corrupt", ["run-session", "report-agent", "report-parent", "report-task"])

@@ -402,7 +402,7 @@ class Store:
         row = self.db.execute(
             "SELECT length(CAST(data AS BLOB)) AS size,"
             "CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
-            "THEN data END AS data FROM objects WHERE kind=? AND id=?",
+            "THEN CAST(data AS BLOB) END AS data FROM objects WHERE kind=? AND id=?",
             (max_bytes, kind, identifier),
         ).fetchone()
         if row is None:
@@ -410,7 +410,10 @@ class Store:
         if row["size"] > max_bytes:
             raise EvidenceError("output_budget", "完整持久对象超过核查字节预算")
         try:
-            item = json.loads(row["data"])
+            raw = row["data"]
+            if raw is None:
+                raise ValueError
+            item = json.loads(raw.decode("utf-8"))
             if not isinstance(item, dict) or item.get("id") != identifier:
                 raise ValueError
             # Digests and tool output must also be valid UTF-8, including escaped strings.
@@ -428,11 +431,22 @@ class Store:
         if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
             raise ValueError("映射字节预算必须是正整数")
         rows = self.db.execute(
-            "SELECT seq,CASE WHEN length(CAST(message_id AS BLOB))<=? THEN message_id END "
+            "SELECT seq,CASE WHEN typeof(message_id)='text' "
+            "AND length(CAST(message_id AS BLOB)) BETWEEN 1 AND ? "
+            "THEN CAST(message_id AS BLOB) END "
             "AS message_id FROM message_order WHERE session_id=? ORDER BY seq DESC LIMIT ?",
             (metadata_bytes, session_id, limit),
         )
-        return [dict(row) for row in rows]
+        mappings: builtins.list[dict[str, Any]] = []
+        for row in rows:
+            mapping = dict(row)
+            raw = mapping["message_id"]
+            try:
+                mapping["message_id"] = raw.decode("utf-8") if raw is not None else None
+            except UnicodeError:
+                mapping["message_id"] = None
+            mappings.append(mapping)
+        return mappings
 
     def list(self, kind: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.db.execute(
