@@ -1,6 +1,6 @@
 # 2.36 MCP 普通资源审查
 
-状态：实现、两层审查与根整合检查完成；精确远端验收与发布待完成。
+状态：已发布；精确候选与 main 各十项成功，发行第二次十三项全部成功，PyPI/GitHub 两包元数据一致。首次原生探测超时及未确定根因的边界保留。
 
 ## 用户行为
 
@@ -46,6 +46,44 @@ unused-ignore；保持源码和严格规则不变，以 `--no-incremental` 和�
 
 全部本地检查继续使用绝对路径资源守卫并串行执行，单次 1 GiB、共享 2 GiB、
 单 CPU、swap 0，测试不连接实际 MCP、不启动 stdio 服务或安装新依赖。
-精确十项 CI 尚未完成，不能用本地通过代替跨平台、构建和实际无 extras 验收。
+精确候选 `a4938fdbc4b25fca2cab1db49ef1924d8c0ea1f4` 的
+[CI](https://github.com/69gg/MuLi/actions/runs/39595349263) attempt 1 十项全部成功，
+包括普通无 extras 平台矩阵、质量与加入三文件的 MCP extras。根逐项核 SHA、
+终态、签名、远端 main 的 `2286cd6`、快进与标签不存在后非强制原子推送 main
+和 `v2.36.0`；PR42 于 2026-10-21 12:03:20 UTC 按原提交合入。
+标签对象 `392993b88506be18e92558e7325cf647aca14bba` 本地及 GitHub 验签有效。
+
+[main CI](https://github.com/69gg/MuLi/actions/runs/39596574176) 十项全部成功。
+[发行](https://github.com/69gg/MuLi/actions/runs/39596574355) attempt 1 的九项验证成功，
+Windows 3.12 作业 `119210252707` 失败，prepare/publish/github-release 三项跳过。
+失败项是既有 `test_real_windows_system_module_probe_mta_and_owned_unicode_tree`：
+自建目标窗口已启动，另一个 PowerShell helper 的 `probe` 在等待响应时耗尽原
+12 秒预算（调用 12.44 秒，包括收尾）；该组为 3350 通过、1388 跳过、1 失败。
+不是测试摘要成功后作业被取消，也不是 MCP 资源测试失败。
+
+同一提交的候选与 main 上该平台均通过，这只能说明本次没有稳定复现，不能
+证明超时根因或已修复。保留日志和原标签，继续检查启动/响应链路，不增加期限
+或屏蔽原生检查。GitHub release 查询为 404；不能把标签存在当作包已发布。
+
+核对原生请求的启动、读写与一次 deadline 后，只能确认它在写入/排空请求后等待
+响应超时；没有重复扣减 12 秒或漏读 stderr 的证据。随后以原失败 job ID 请求
+一次原提交复验。GitHub 将复用的 verify 工作流重新展开为十项矩阵，进入
+attempt 2；不是只实际执行一个平台作业。原标签和期限保持不变，首次失败保留。
+即使该次成功也只证明本次复验通过，不能称为 PowerShell 启动根因已修复。
+
+attempt 2 随后十三项全部成功，仍为原 `a4938fd`。Windows 3.12 复验作业为
+`119218645738`；prepare/publish/github-release 分别为 `119221515604`、
+`119221609177`、`119221884969`。GitHub Release `419532361` 于
+2026-10-21 12:29:51 UTC 发布，非草稿、非预发行。根只读取小型 PyPI JSON，
+核对两份未撤回构件与 GitHub 的名称、大小和 SHA-256 完全一致，没有下载安装包：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.36.0-py3-none-any.whl` | 769922 | `67a57c75204211cd4316ba8656700024808f99aaa4d5d30981946de51478d6ad` |
+| `muli_agent-2.36.0.tar.gz` | 3957441 | `73b9628b4e68aaa488cd35d083a60f304cf6d65532efaac6d4fbaa49bd1cd0da` |
+
+GitHub asset ID 分别为 `662441835`、`662441839`；PyPI 上传时间分别为
+12:29:34.215979、12:29:35.986064 UTC。原签名标签没有改写，用户安装没有改动。
+下轮另补固定 PowerShell 阶段证据；复验通过不关闭原生启动间歇故障的调查。
 
 设计与边界见[资源设计](mcp-resources-design.md)、[MCP 使用说明](mcp.md)。

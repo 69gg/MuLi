@@ -69,9 +69,9 @@ MCP 连接使用 FastMCP 2.x 的持久化异步客户端。核心安装不需要
 | max_mcp_fragments | 32 | JSON 分片数 |
 | max_mcp_fragment_bytes | 65536 | 单分片源字节 |
 | max_mcp_source_bytes | 262144 | 分片源总字节 |
-| max_mcp_pages | 8 | 每服务器完整工具目录、每次显式资源目录各自的页数 |
+| max_mcp_pages | 8 | 每服务器完整工具目录、每次显式资源或 prompt 目录各自的页数 |
 | max_mcp_tools | 100 | 所有启用服务器的工具总数 |
-| max_mcp_catalog_bytes | 262144 | 工具名、描述和参数 schema 总 JSON 字节；每次资源目录另按完整页 JSON 合计计费 |
+| max_mcp_catalog_bytes | 262144 | 工具名、描述和参数 schema 总 JSON 字节；每次资源或 prompt 目录另按完整页 JSON 合计计费 |
 | candidate_timeout_seconds | 30 | 整个候选准备时限；失败后独立清理另受连接时限约束 |
 | scan_interval_seconds | 2 | 轻扫描间隔 |
 | debounce_seconds | 0.5 | 变更合并窗口 |
@@ -108,6 +108,18 @@ read 一次读取至多 16 个完整文本块。file/https/自定义 URI 只回�
 元数据和文本的字符串值按旧代密钥脱敏，固定字段名和宿主引用保持；随后核完整 JSON 字符预算，不能容纳时明确 `resource_output_budget_exceeded`，不制作正文 preview。最新工具批次经 Runtime 保持完整；完整批次放不进下一请求时停止运行，不继续请求模型。较早批次仍遵循原上下文淘汰规则。取消、超时和已进入 SDK 的未知结果不自动重放；换代前已接纳的 read 可在旧连接完成，迟到目录不签发新代可用引用。接收 latch 同时封锁工具与资源。
 
 本片不接 stdio 资源、模板、订阅或后台抓取，不新增配置/API/通知源。状态中 `resources_supported` 和固定 `resource_error_code` 不回显 URI、原服务器游标、正文或异常。实现与验收边界见[资源设计](mcp-resources-design.md)。
+
+## 显式文本 prompts 草稿
+
+初始化声明 `prompts`（`{}` 合法）的已启用 HTTP/SSE 连接另提供 `mcp_prompts_list({"server":"remote_tools"})` 与 `mcp_prompt_get({"server":"remote_tools","ref":"已展示引用","arguments":{"code":"字符串"}})`。只支持 prompts 的服务器不请求 `tools/list`；连接时不预取 prompt 目录或草稿。两工具同为 `risk=external`，保留上述权限、过滤与调用代次门，不占远端工具条目。
+
+list 在一次原连接绝对期限内完整观察目录，先核全部服务器页再发布，未知字段也按完整 JSON 计费。每次最多 256 个 prompt，每项最多 32 个完整参数定义。`next_cursor` 只续读已完成的内存目录，服务器空游标原样续页、None 才结束；不完整、重复名称/游标或超限明确失败，保留上一份可用目录。每连接至多一份资源目录和一份 prompt 目录，不保留历史或草稿正文；两类 ref/cursor 不能互用，失效规则相同。
+
+只有实际完整展示过参数定义的 ref 才能 get。参数按声明名称精确往返，只接受字符串值，required=True 必须存在；允许空名称和空值，不补默认值、不转换类型，省略 arguments 与显式 `{}` 保持不同。完整参数 JSON 限 16 KiB UTF-8，非法 Unicode 或超限在发送前拒绝。显示名称和描述可脱敏，请求仍使用原 prompt name；若脱敏会改变参数名，则整份目录以 `prompt_parameters_unavailable` 失败，不泄漏该键或返回无法使用的合同。
+
+get 一次返回至多 16 条有序文本资料，形如 `{"untrusted":true,"messages":[{"role":"user","text":"草稿"}]}`。role 只保留协议的 user/assistant 枚举，始终位于工具结果内，不创建对应角色的会话消息，不插入指令、不变成 Skill，也不会自动执行。任何图像、音频、链接、嵌入资源或混合媒体均整体拒绝，不读取其中的 URI 或本机路径，不挑出文本子集冒充全文。
+
+完整文本按旧代脱敏和 `max_output_chars` 核完整 JSON；无法容纳时返回固定错误，Runtime 无法完整带入下一请求时停止，不制作 preview 或重取分页。空消息数组和空文本可以成功，不代表错误或模板已执行。已接纳 get 可在旧连接完成；未派发旧 handler、取消、超时与接收 latch 保留前述语义，不自动重放。状态仅有 `prompts_supported` 和固定 `prompt_error_code`，不回显参数或服务器异常。stdio prompts、补全、订阅与模板版本快照不在本片内；旧 slot 不执行这些新检查。接口与验证边界见[prompts 设计](mcp-prompts-design.md)。
 
 ## 配置编辑与密钥
 

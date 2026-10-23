@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Hashable, Iterable
 from contextlib import AsyncExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -22,19 +22,31 @@ from pydantic import AnyUrl
 from muli.mcp_policy import ReceivePolicy, checked_policy
 from muli.store import new_id
 from muli.tools import Tool, parameters, string
+from muli.tools.mcp_catalog import (
+    MAX_CATALOG_ITEMS,
+    Catalog,
+    CatalogKind,
+    ContentError,
+    catalog_page,
+    fits_output,
+    json_size,
+)
+from muli.tools.mcp_prompts import (
+    PromptCatalog,
+    PromptClient,
+    PromptItem,
+    prompt_arguments,
+    prompt_content,
+    prompt_item,
+)
 from muli.tools.mcp_receive import ReceiveState, install_receive_guard
 from muli.tools.mcp_resources import (
-    MAX_RESOURCE_ITEMS,
     Capabilities,
     ResourceCatalog,
     ResourceClient,
-    ResourceError,
     ResourceItem,
-    fits_output,
-    json_size,
     resource_content,
     resource_item,
-    resource_page,
 )
 
 JsonObject = dict[str, Any]
@@ -115,6 +127,8 @@ class _Connection:
     capabilities: Capabilities = Capabilities(tools=True, resources=False)
     resource_catalog: ResourceCatalog | None = None
     resource_refreshing: bool = False
+    prompt_catalog: PromptCatalog | None = None
+    prompt_refreshing: bool = False
     usable: bool = True
     close_failed: bool = False
     closed: bool = False
@@ -175,7 +189,9 @@ class _FastMCPClient:
         if capabilities is None:
             raise MCPPrepareError("capabilities_unavailable")
         return Capabilities(
-            tools=capabilities.tools is not None, resources=capabilities.resources is not None
+            tools=capabilities.tools is not None,
+            resources=capabilities.resources is not None,
+            prompts=capabilities.prompts is not None,
         )
 
     async def list_resources_page(self, cursor: str | None) -> JsonObject:
@@ -188,6 +204,18 @@ class _FastMCPClient:
 
     async def read_resource(self, uri: AnyUrl) -> JsonObject:
         result = await self.client.session.read_resource(uri)
+        return cast(JsonObject, result.model_dump(mode="json", by_alias=True))
+
+    async def list_prompts_page(self, cursor: str | None) -> JsonObject:
+        from mcp.types import PaginatedRequestParams
+
+        result = await self.client.session.list_prompts(
+            params=PaginatedRequestParams(cursor=cursor)
+        )
+        return cast(JsonObject, result.model_dump(mode="json", by_alias=True))
+
+    async def get_prompt(self, name: str, arguments: dict[str, str] | None) -> JsonObject:
+        result = await self.client.session.get_prompt(name, arguments)
         return cast(JsonObject, result.model_dump(mode="json", by_alias=True))
 
     async def call_tool(
@@ -554,11 +582,19 @@ class MCPManager:
             not isinstance(result, Capabilities)
             or type(result.tools) is not bool
             or type(result.resources) is not bool
+            or type(result.prompts) is not bool
             or (
                 result.resources
                 and not all(
                     callable(getattr(client, name, None))
                     for name in ("list_resources_page", "read_resource")
+                )
+            )
+            or (
+                result.prompts
+                and not all(
+                    callable(getattr(client, name, None))
+                    for name in ("list_prompts_page", "get_prompt")
                 )
             )
         ):
@@ -700,6 +736,9 @@ class MCPManager:
                         resources_supported=(
                             connection.capabilities.resources and server["transport"] != "stdio"
                         ),
+                        prompts_supported=(
+                            connection.capabilities.prompts and server["transport"] != "stdio"
+                        ),
                     )
                 except asyncio.CancelledError:
                     raise
@@ -730,6 +769,7 @@ class MCPManager:
             # These fixed host tools are not remote directory entries and do
             # not consume the configured remote max_tools allowance.
             tools.extend(self._resource_tools(connections, generation, limits))
+            tools.extend(self._prompt_tools(connections, generation, limits))
             return MCPCandidate(
                 config,
                 connections,
@@ -772,6 +812,7 @@ class MCPManager:
         for name, connection in candidate.connections.items():
             connection.catalog = candidate.catalogs[name]
             connection.resource_catalog = None
+            connection.prompt_catalog = None
         self.config, self._connections = candidate.config, candidate.connections
         self._status = {item["name"]: item for item in candidate.statuses}
         self.tools = list(candidate.tools)
@@ -832,6 +873,7 @@ class MCPManager:
                 continue
             connection.usable = False
             connection.resource_catalog = None
+            connection.prompt_catalog = None
             self._retiring.add(connection)
             task = connection.cleanup_task
             if task is None or (task.done() and retry_failed):
@@ -914,7 +956,7 @@ class MCPManager:
         return wrapper
 
     def _admit_call(self, connection: _Connection, generation: _Generation) -> JsonObject | None:
-        # Shared with resource RPCs: no await between revocation check and the
+        # Shared with resource/prompt RPCs: no await between revocation check and the
         # active-call registration. Holding an old schema is not authorization.
         if (
             self._closed
@@ -958,10 +1000,14 @@ class MCPManager:
         server = {"type": "string", "enum": list(supported)}
 
         async def listing(arguments: JsonObject) -> JsonObject:
-            return await self._resource_call(supported, generation, limits, arguments, read=False)
+            return await self._content_call(
+                supported, generation, limits, arguments, kind="resource", read=False
+            )
 
         async def reading(arguments: JsonObject) -> JsonObject:
-            return await self._resource_call(supported, generation, limits, arguments, read=True)
+            return await self._content_call(
+                supported, generation, limits, arguments, kind="resource", read=True
+            )
 
         return [
             Tool(
@@ -984,8 +1030,59 @@ class MCPManager:
             ),
         ]
 
+    def _prompt_tools(
+        self,
+        connections: dict[str, _Connection],
+        generation: _Generation,
+        limits: MCPLimits,
+    ) -> list[Tool]:
+        supported = {
+            name: connection
+            for name, connection in connections.items()
+            if connection.capabilities.prompts and connection.server["transport"] != "stdio"
+        }
+        if not supported:
+            return []
+        server = {"type": "string", "enum": list(supported)}
+
+        async def listing(arguments: JsonObject) -> JsonObject:
+            return await self._content_call(
+                supported, generation, limits, arguments, kind="prompt", read=False
+            )
+
+        async def getting(arguments: JsonObject) -> JsonObject:
+            return await self._content_call(
+                supported, generation, limits, arguments, kind="prompt", read=True
+            )
+
+        return [
+            Tool(
+                "mcp_prompts_list",
+                "显式列出 MCP 文本草稿及完整参数；cursor 只续读已观察目录，不取正文。",
+                parameters({"server": server, "cursor": string("宿主返回的续页游标")}, ("server",)),
+                listing,
+                risk="external",
+                preserve_output=True,
+            ),
+            Tool(
+                "mcp_prompt_get",
+                "按已展示 ref 和字符串参数取完整文本草稿；role 只是资料，不创建会话或授权。",
+                parameters(
+                    {
+                        "server": server,
+                        "ref": string("已展示 prompt 的引用"),
+                        "arguments": {"type": "object", "additionalProperties": {"type": "string"}},
+                    },
+                    ("server", "ref"),
+                ),
+                getting,
+                risk="external",
+                preserve_output=True,
+            ),
+        ]
+
     @staticmethod
-    def _resource_error(code: str, *, not_executed: bool = False) -> JsonObject:
+    def _content_error(code: str, *, not_executed: bool = False) -> JsonObject:
         result: JsonObject = {"is_error": True, "code": code}
         if not_executed:
             result["status"] = "not_executed"
@@ -999,25 +1096,47 @@ class MCPManager:
             for key, value in fields.items()
         }
 
-    async def _resource_call(
+    def _prompt_fields(self, fields: JsonObject, generation: _Generation) -> JsonObject:
+        result = self._resource_fields(
+            {key: value for key, value in fields.items() if key != "arguments"}, generation
+        )
+        result["arguments"] = [
+            self._resource_fields(parameter, generation) for parameter in fields["arguments"]
+        ]
+        return result
+
+    def _prompt_item(self, value: object, generation: _Generation) -> PromptItem:
+        item = prompt_item(value)
+        # Validate every parameter before publishing any prefix of the directory.
+        # A redacted key could not round-trip; no second parameter reference map.
+        if any(
+            self._redact(parameter["name"], generation) != parameter["name"]
+            for parameter in item.metadata["arguments"]
+        ):
+            raise ContentError("prompt_parameters_unavailable")
+        return item
+
+    async def _content_call(
         self,
         connections: dict[str, _Connection],
         generation: _Generation,
         limits: MCPLimits,
         arguments: JsonObject,
         *,
+        kind: CatalogKind,
         read: bool,
     ) -> JsonObject:
         name = arguments.get("server")
         key = "ref" if read else "cursor"
+        allowed = {"server", key} | ({"arguments"} if read and kind == "prompt" else set())
         if (
             type(name) is not str
             or name not in connections
-            or set(arguments) - {"server", key}
+            or set(arguments) - allowed
             or (key in arguments and type(arguments[key]) is not str)
             or (read and key not in arguments)
         ):
-            return self._resource_error("resource_arguments_invalid", not_executed=True)
+            return self._content_error(f"{kind}_arguments_invalid", not_executed=True)
         connection = connections[name]
         rejected = self._admit_call(connection, generation)
         if rejected is not None:
@@ -1026,118 +1145,200 @@ class MCPManager:
             deadline = asyncio.get_running_loop().time() + connection.timeout
             async with asyncio.timeout_at(deadline):
                 if read:
-                    catalog = connection.resource_catalog
+                    catalog = (
+                        connection.resource_catalog
+                        if kind == "resource"
+                        else connection.prompt_catalog
+                    )
                     reference = arguments["ref"]
                     if catalog is None or reference not in catalog.references:
-                        return self._resource_error("resource_reference_invalid", not_executed=True)
-                    uri = catalog.items[catalog.references[reference]].uri
-                    # A call retains only its selected URI, not a historical
+                        return self._content_error(f"{kind}_reference_invalid", not_executed=True)
+                    item = catalog.items[catalog.references[reference]]
+                    # A call retains only its selected item, not a historical
                     # directory after a refresh or generation publication.
                     del catalog
-                    raw = await cast(ResourceClient, connection.client).read_resource(uri)
-                    contents = [
-                        self._resource_fields(block, generation) for block in resource_content(raw)
-                    ]
+                    if kind == "resource":
+                        uri = cast(ResourceItem, item).uri
+                        del item
+                        raw = await cast(ResourceClient, connection.client).read_resource(uri)
+                        body: JsonObject = {
+                            "contents": [
+                                self._resource_fields(block, generation)
+                                for block in resource_content(raw)
+                            ]
+                        }
+                    else:
+                        selected = cast(PromptItem, item)
+                        try:
+                            values = prompt_arguments(selected, arguments)
+                        except ContentError as error:
+                            return self._content_error(error.code, not_executed=True)
+                        remote_name = selected.name
+                        del item, selected
+                        raw = await cast(PromptClient, connection.client).get_prompt(
+                            remote_name, values
+                        )
+                        body = prompt_content(raw)
+                        if "description" in body:
+                            body["description"] = self._redact(body["description"], generation)
+                        # Enum roles and host keys are structural, not untrusted text.
+                        body["messages"] = [
+                            {
+                                "role": message["role"],
+                                "text": self._redact(message["text"], generation),
+                            }
+                            for message in body["messages"]
+                        ]
                     result: JsonObject = {
                         "is_error": False,
                         "server": name,
                         "ref": reference,
                         "untrusted": True,
-                        "contents": contents,
+                        **body,
                     }
                     if not fits_output(result, generation.max_output_chars):
-                        raise ResourceError("resource_output_budget_exceeded")
+                        raise ContentError(f"{kind}_output_budget_exceeded")
                 else:
-                    return await self._resource_list(
-                        connection, generation, limits, arguments.get("cursor"), deadline
+                    return await self._directory_list(
+                        connection, generation, limits, arguments.get("cursor"), deadline, kind
                     )
                 if asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError
                 if self._connections.get(name) is connection and self._generation is generation:
-                    self._status[name].pop("resource_error_code", None)
+                    self._status[name].pop(f"{kind}_error_code", None)
                 return result
-        except ResourceError as error:
+        except ContentError as error:
             if self._connections.get(name) is connection and self._generation is generation:
-                self._status[name]["resource_error_code"] = error.code
-            return self._resource_error(error.code)
+                self._status[name][f"{kind}_error_code"] = error.code
+            return self._content_error(error.code)
         except TimeoutError:
-            return self._resource_error("resource_timeout")
+            return self._content_error(f"{kind}_timeout")
         except asyncio.CancelledError:
             raise
         except Exception:
-            return self._resource_error(connection.receive.code or "resource_unavailable")
+            return self._content_error(connection.receive.code or f"{kind}_unavailable")
         finally:
             self._release_call(connection)
 
-    async def _resource_list(
+    async def _directory_list(
         self,
         connection: _Connection,
         generation: _Generation,
         limits: MCPLimits,
         cursor: str | None,
         deadline: float,
+        kind: CatalogKind,
     ) -> JsonObject:
+        catalog: ResourceCatalog | PromptCatalog | None
         if cursor is not None:
-            catalog = connection.resource_catalog
-            if catalog is None or cursor not in catalog.cursors:
-                return self._resource_error("resource_cursor_invalid", not_executed=True)
-            result = self._resource_slice(
-                connection, catalog, catalog.cursors[cursor], generation, deadline
+            catalog = (
+                connection.resource_catalog if kind == "resource" else connection.prompt_catalog
             )
-            self._status[connection.name].pop("resource_error_code", None)
+            if catalog is None or cursor not in catalog.cursors:
+                return self._content_error(f"{kind}_cursor_invalid", not_executed=True)
+            result = self._directory_slice(
+                connection, catalog, catalog.cursors[cursor], generation, deadline, kind
+            )
+            self._status[connection.name].pop(f"{kind}_error_code", None)
             return result
-        if connection.resource_refreshing:
-            return self._resource_error("resource_catalog_busy", not_executed=True)
-        connection.resource_refreshing = True
+        if connection.resource_refreshing if kind == "resource" else connection.prompt_refreshing:
+            return self._content_error(f"{kind}_catalog_busy", not_executed=True)
+        if kind == "resource":
+            connection.resource_refreshing = True
+        else:
+            connection.prompt_refreshing = True
         try:
-            items: list[ResourceItem] = []
-            uris: set[AnyUrl] = set()
-            cursors: set[str] = set()
-            total_bytes = 0
-            remote_cursor: str | None = None
-            client = cast(ResourceClient, connection.client)
-            for _ in range(limits.max_pages):
-                raw = await client.list_resources_page(remote_cursor)
-                total_bytes += json_size(raw, limits.max_catalog_bytes - total_bytes)
-                page, next_cursor = resource_page(raw, MAX_RESOURCE_ITEMS - len(items))
-                for value in page:
-                    item = resource_item(value)
-                    if item.uri in uris:
-                        raise ResourceError("resource_duplicate_uri")
-                    uris.add(item.uri)
-                    items.append(item)
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError
-                if (
-                    self._closed
-                    or self._generation is not generation
-                    or self._connections.get(connection.name) is not connection
-                    or not connection.usable
-                    or connection.receive.code is not None
-                ):
-                    return self._resource_error(connection.receive.code or "resource_stale")
-                if next_cursor is None:
-                    catalog = ResourceCatalog(new_id(), tuple(items))
-                    result = self._resource_slice(connection, catalog, 0, generation, deadline)
-                    # No await from final current-generation fence to publication.
-                    connection.resource_catalog = catalog
-                    self._status[connection.name].pop("resource_error_code", None)
-                    return result
-                if next_cursor in cursors:
-                    raise ResourceError("resource_pagination_stalled")
-                cursors.add(next_cursor)
-                remote_cursor = next_cursor
-            raise ResourceError("resource_page_budget_exceeded")
+            if kind == "resource":
+                catalog = await self._collect_catalog(
+                    connection,
+                    generation,
+                    limits,
+                    deadline,
+                    kind,
+                    cast(ResourceClient, connection.client).list_resources_page,
+                    resource_item,
+                    lambda item: item.uri,
+                )
+            else:
+                catalog = await self._collect_catalog(
+                    connection,
+                    generation,
+                    limits,
+                    deadline,
+                    kind,
+                    cast(PromptClient, connection.client).list_prompts_page,
+                    lambda value: self._prompt_item(value, generation),
+                    lambda item: item.name,
+                )
+            result = self._directory_slice(connection, catalog, 0, generation, deadline, kind)
+            # No await from final current-generation fence to publication.
+            if kind == "resource":
+                connection.resource_catalog = cast(ResourceCatalog, catalog)
+            else:
+                connection.prompt_catalog = cast(PromptCatalog, catalog)
+            self._status[connection.name].pop(f"{kind}_error_code", None)
+            return result
         finally:
-            connection.resource_refreshing = False
+            if kind == "resource":
+                connection.resource_refreshing = False
+            else:
+                connection.prompt_refreshing = False
 
-    def _resource_slice(
+    async def _collect_catalog[T](
         self,
         connection: _Connection,
-        catalog: ResourceCatalog,
+        generation: _Generation,
+        limits: MCPLimits,
+        deadline: float,
+        kind: CatalogKind,
+        fetch: Callable[[str | None], Awaitable[JsonObject]],
+        project: Callable[[object], T],
+        identity: Callable[[T], Hashable],
+    ) -> Catalog[T]:
+        items: list[T] = []
+        identities: set[Hashable] = set()
+        cursors: set[str] = set()
+        total_bytes = 0
+        remote_cursor: str | None = None
+        for _ in range(limits.max_pages):
+            raw = await fetch(remote_cursor)
+            total_bytes += json_size(raw, limits.max_catalog_bytes - total_bytes, kind=kind)
+            page, next_cursor = catalog_page(raw, MAX_CATALOG_ITEMS - len(items), kind)
+            for value in page:
+                item = project(value)
+                key = identity(item)
+                if key in identities:
+                    raise ContentError(
+                        "resource_duplicate_uri" if kind == "resource" else "prompt_duplicate_name"
+                    )
+                identities.add(key)
+                items.append(item)
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError
+            if (
+                self._closed
+                or self._generation is not generation
+                or self._connections.get(connection.name) is not connection
+                or not connection.usable
+                or connection.receive.code is not None
+            ):
+                raise ContentError(connection.receive.code or f"{kind}_stale")
+            if next_cursor is None:
+                return Catalog(new_id(), tuple(items))
+            if next_cursor in cursors:
+                raise ContentError(f"{kind}_pagination_stalled")
+            cursors.add(next_cursor)
+            remote_cursor = next_cursor
+        raise ContentError(f"{kind}_page_budget_exceeded")
+
+    def _directory_slice(
+        self,
+        connection: _Connection,
+        catalog: ResourceCatalog | PromptCatalog,
         position: int,
         generation: _Generation,
         deadline: float,
+        kind: CatalogKind,
     ) -> JsonObject:
         displayed: list[JsonObject] = []
 
@@ -1147,7 +1348,7 @@ class MCPManager:
                 "server": connection.name,
                 "untrusted": True,
                 "catalog_complete": True,
-                "resources": items,
+                ("resources" if kind == "resource" else "prompts"): items,
                 "next_cursor": catalog.token("cursor", end) if end < len(catalog.items) else None,
             }
 
@@ -1156,8 +1357,13 @@ class MCPManager:
         for index in range(position, len(catalog.items)):
             # Only untrusted metadata is redacted: host refs/cursors must remain
             # exact even when a configured secret happens to be a short string.
+            fields = catalog.items[index].metadata
             item = {
-                **self._resource_fields(catalog.items[index].metadata, generation),
+                **(
+                    self._resource_fields(fields, generation)
+                    if kind == "resource"
+                    else self._prompt_fields(fields, generation)
+                ),
                 "ref": catalog.token("ref", index),
             }
             proposed = payload([*displayed, item], index + 1)
@@ -1168,7 +1374,7 @@ class MCPManager:
         if (not displayed and position < len(catalog.items)) or not fits_output(
             result, generation.max_output_chars
         ):
-            raise ResourceError("resource_output_budget_exceeded")
+            raise ContentError(f"{kind}_output_budget_exceeded")
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError
         for index in range(position, end):

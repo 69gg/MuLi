@@ -1,6 +1,6 @@
 # 无障碍电脑操作
 
-2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 的实验性 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。Windows UIA 沿用工具提供顶层窗口与选定窗口只读树，动作和输入明确不可用；真实 Windows 验证边界见 [UIA 实现记录](windows-uia.md)。截图、录屏和后台服务的范围见[平台能力](platforms.md)。
+2.4 完善 Linux AT-SPI 的应用和窗口定位；2.5 的实验性 macOS AX 后端沿用相同工具名。电脑能力默认关闭。Linux 使用已安装的系统 Python GI，不在 MuLi 环境下载或编译 GTK；macOS 按需使用系统原生框架，无新增 Python 依赖。Windows UIA 提供顶层窗口与选定树，本片增加普通按钮的一次 Invoke，输入仍拒绝；新动作的真实 Windows 验收待验，见 [UIA 记录](windows-uia.md)。截图、录屏和后台服务的范围见[平台能力](platforms.md)。
 
 ## 选择读取范围
 
@@ -28,12 +28,14 @@ helper 最长寿命复用 `snapshot_ttl_seconds`，从创建计时，读取和�
 
 首版不读取文本 Value 来拼名称。明确密码控件拒绝修改；文本控件保护语义未知时只读，不能把可选 `Subrole` 缺失理解成非密码。只有明确非保护且原生可写的文本控件才接受完整文本设置；普通按钮不因缺少可选子角色而全部禁用。部分应用的普通文本框可能因此暂不可编辑，这是能力边界，不通过重复尝试绕过。
 
-## Windows 只读窗口
+## Windows 窗口与普通按钮
 
 Windows UIA 的零参数发现只列直接顶层窗口，返回 `scope=desktop_windows`；快照必须
 显式使用本次窗口 `target_id`，范围为 `window`。每个新观察消费旧发现，不接受自造
-PID、句柄或 RuntimeId，不按标题回搜。密码节点不读 Name / Value，所有节点的动作
-为空，`computer_action` / `computer_type` 明确拒绝。它复用 macOS 的调用者与执行
+PID、句柄或 RuntimeId，不按标题回搜。密码节点不读 Name / Value；只为普通非密码、
+启用且支持 InvokePattern 的 Button 提供 `actions=["invoke"]`。合法快照下的一次
+动作尝试消费全部凭据，失败不自动重发；accepted 只表示接口正常返回，不等于业务
+完成。`computer_type` 继续拒绝。它复用 macOS 的调用者与执行
 代次、绝对 helper TTL、释放和关闭合同，但 Windows 只确认自有直接 helper 退出，
 不宣称清理系统 COM broker。详见 [Windows UIA](windows-uia.md)。
 
@@ -70,7 +72,7 @@ PID、句柄或 RuntimeId，不按标题回搜。密码节点不读 Name / Value
 
 `operation_timeout_seconds` 是一次无障碍操作的期限，大于 0、至多 120 秒；`snapshot_ttl_seconds` 同时约束快照与发现引用，大于 0、至多 300 秒，AX 还用它限制整个原生对象会话的绝对寿命。两者必须是有限数值。输出预算仍使用现有 `limits.max_output_chars`，无需再设置另一套预算。旧配置缺少这些字段时使用原来的 12 秒操作期限和 60 秒快照有效期。
 
-`backend=auto` 在 Linux 选择 AT-SPI、macOS 选择 AX、Windows 选择只读 UIA，其他平台明确报告不可用；显式 `atspi` 或 `ax` 不自动降级。未新增 `uia` 配置枚举，旧配置格式不变。旧配置中已有的 `atspi` 保持原值；macOS 用户需明确改为 `auto` 或 `ax`。Python 路径只影响 Linux 的 AT-SPI/Portal。所有平台仍默认 `enabled=false`。
+`backend=auto` 在 Linux 选择 AT-SPI、macOS 选择 AX、Windows 选择 UIA，其他平台明确报告不可用；显式 `atspi` 或 `ax` 不自动降级。未新增 `uia` 配置枚举，旧配置格式不变。旧配置中已有的 `atspi` 保持原值；macOS 用户需明确改为 `auto` 或 `ax`。Python 路径只影响 Linux 的 AT-SPI/Portal。所有平台仍默认 `enabled=false`。
 
 ## 依据与验证边界
 

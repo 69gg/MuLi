@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -70,7 +71,11 @@ PROBE = {
 
 
 def setup(
-    monkeypatch: pytest.MonkeyPatch, responses: list[Any], *, budget: int = 24000
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[Any],
+    *,
+    budget: int = 24000,
+    dispatch_guard: Callable[[], Callable[[], None]] | None = None,
 ) -> tuple[Computer, FakeLease, list[tuple[str, str] | None]]:
     # Do not mutate the process-global sys.platform, including on real Windows CI.
     monkeypatch.setattr(computer_module, "sys", SimpleNamespace(platform="win32"))
@@ -84,6 +89,7 @@ def setup(
             }
         ),
         owner=lambda: owner[0],
+        dispatch_guard=dispatch_guard,
     )
     lease = FakeLease(responses)
     monkeypatch.setattr(computer._uia, "_new_lease", lambda **kwargs: lease)
@@ -132,7 +138,7 @@ async def test_snapshot_never_falls_back_to_desktop_or_search(
         await computer.aclose()
 
 
-async def test_action_type_and_application_expansion_are_explicitly_unsupported(
+async def test_unsupported_action_type_require_snapshot_and_application_expansion_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     computer, lease, _ = setup(monkeypatch, [])
@@ -140,7 +146,7 @@ async def test_action_type_and_application_expansion_are_explicitly_unsupported(
         for arguments in ({"action": "Invoke"}, {"text": "do not type"}):
             with pytest.raises(ComputerError) as rejected:
                 await computer.action(arguments)
-            assert rejected.value.code == "unsupported_operation"
+            assert rejected.value.code == "stale_snapshot"
             assert rejected.value.outcome == "not_started"
         with pytest.raises(ComputerError) as expanded:
             await computer.targets({"application_id": "invented"})
@@ -311,7 +317,7 @@ async def test_status_coalesces_probe_without_exposing_native_paths_or_claiming_
     try:
         result = await second
         assert result["available"] is True and result["session_accessible"] is None
-        assert result["supported_operations"] == ["targets", "snapshot"]
+        assert result["supported_operations"] == ["targets", "snapshot", "action"]
         assert result["apartment"] == "MTA"
         assert not {"utility_path", "powershell_home", "helper_pid", "unexpected"} & result.keys()
         assert lease.calls == [("probe", {})] and lease.closed

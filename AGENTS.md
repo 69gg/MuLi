@@ -1,6 +1,7 @@
 # 本地协作与验证
 
 - 使用简体中文；Python 必须有类型注释。改动前先读现有代码，复用已有实现，同步文档与必要回归。
+- 本项目开发协作默认使用 `gpt-6.1-sol`；实现、测试、调试和持续审查均由该模型承担。`gpt-6-astra` 同时最多一个，仅在需要时新开短会话做项目建议、轻量方案审视等，完成即停止，不持续运行、不承担长循环。本轮可不启用 Astra；不得恢复旧 Astra 长任务或让子 agent 绕过此约定。
 - 本机测试、检查、打包及实验一律经过 `python scripts/check_local.py`。其他 worktree 可使用本仓库该脚本的绝对路径，工作目录保持目标 worktree。
 - 全量后端使用 `python scripts/check_local.py backend .venv/bin/python [测试文件…]`，在同一守卫内按至多 32 个文件串行分批；其它 worktree 指定主仓库已有解释器。前端使用 `python scripts/check_local.py frontend [测试文件…]`；定向 pytest 和其他命令使用 `python scripts/check_local.py run -- 命令 参数…`。不得裸跑全量测试、绕过限制、为通过测试提高上限或用工具等待时间冒充硬超时。
 - 所有 agent/worktree 共用 `muli-checks.slice`：合计 2 GiB、swap 0、一个逻辑 CPU 的等效时间预算、128 个任务；单次 1 GiB、最长 180 秒。Node 堆 256 MiB，前端文件单并发。限制无法核验时停止该检查，不退回无保护运行。

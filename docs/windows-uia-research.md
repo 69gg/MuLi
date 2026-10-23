@@ -5,6 +5,10 @@
 协议，Windows 托管 CI 已通过三个真实原生用例并随 2.32.0 发布，未操作开发机桌面。实现与验证范围移至
 [Windows UIA 记录](windows-uia.md)。Windows Skills 的 NTFS 适配不等于电脑操作。
 
+后续普通 Button Invoke 的实现范围、单次对象凭据与 unknown 合同另见
+[动作设计](windows-uia-actions-design.md)；它不是本历史只读验收的一部分，新增真实
+按钮效果仍待相应 Windows CI，不加入 Value/文本输入或坐标回退。
+
 ## 已有接缝
 
 `tools/computer.py` 保持统一 status / targets / snapshot / action / type 工具、
