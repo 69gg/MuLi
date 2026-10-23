@@ -12,4 +12,4 @@
 
 此用例没有替换 Runtime.submit、Team.send、任务核查处理器或报告持久化。它覆盖实际宿主接纳与工具选择后的行为；外部平台是否收到超时前的请求仍未知，生产故障恢复和自然模型决策质量不在此离线结果中。
 
-手机分支复用 create_app 创建的当前 Manager 和 adapter，只把平台 HTTP 换为 MockTransport，保留真实最终准入闭包。三条控制确认回手机，原未知外发仍只尝试一次；重规划主输入直接核对 route=null 与原任务控制引用，最后新 Web 明确派工及草稿报告仍回 Web。两条参数化旅程已通过受限检查；手机能力尚未发行，压缩和进程重开组合仍须另验，详见[手机候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)。
+手机分支复用 create_app 创建的当前 Manager 和 adapter，只把平台 HTTP 换为 MockTransport，保留真实最终准入闭包。三条控制确认回手机，原未知外发仍只尝试一次；重规划主输入直接核对 route=null 与原任务控制引用，最后新 Web 明确派工及草稿报告仍回 Web。现三个参数均通过受限检查，新增参数覆盖真实压缩、完整lifespan/SQLite正常关闭、新Runtime重组和手机重投，再由新队友沿实际收到的fresh定位读取原证据。仅删除定位行的负控制必须被拒绝。该重开在同一pytest进程，不等于OS新进程或真实系统服务恢复；手机能力尚未发行，真实模型和平台送达未验，详见[手机候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)及[新组合证据](compaction-reopen-handoff-proposal.md)。

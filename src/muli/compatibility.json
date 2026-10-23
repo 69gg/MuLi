@@ -1,7 +1,7 @@
 {
   "metadata_version": 1,
   "distribution": "muli-agent",
-  "release": "2.44.0",
+  "release": "2.45.0",
   "handoff_protocol": 2,
   "requires_migration": false,
   "formats": {
