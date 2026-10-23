@@ -202,7 +202,7 @@ async def prepare_phase(state: Evaluation, phase: str, covered: list[str]) -> No
     unit = "无关背景：这是一份只读的本地资料。\n"
     background = unit * (threshold // len(unit) + 20)
     source = state.root / "background.txt"
-    source.write_text(background, encoding="utf-8")
+    source.write_bytes(background.encode("utf-8"))
     await run(
         state,
         "只读本地背景资料，不执行其它操作。",
