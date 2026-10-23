@@ -5,7 +5,7 @@ import errno
 import json
 import os
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
@@ -36,6 +36,7 @@ from muli.management_transaction import (
     TransactionJournal,
     _snapshot,
 )
+from muli.platforms import managed_launcher
 from muli.platforms.linux_transaction import (
     ObservationError,
     ProbeLimits,
@@ -428,6 +429,64 @@ async def host(tmp_path: Path, request: pytest.FixtureRequest) -> AsyncIterator[
             finally:
                 value.release_writer()
                 await value.backend.__aexit__()
+
+
+def track_slot_scans(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Observe real package hashing after fixture preparation, without replacing it."""
+    scans: list[Path] = []
+    fingerprint = managed_launcher.package_fingerprint
+
+    def observed(root: Path, limits: Mapping[str, int]) -> dict[str, object]:
+        scans.append(root)
+        return fingerprint(root, limits)
+
+    monkeypatch.setattr(managed_launcher, "package_fingerprint", observed)
+    return scans
+
+
+async def test_one_guard_hashes_equal_controller_and_selected_slot_once(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Equality is the complete frozen installation, not Python object identity.
+    host.backend.slots["base"] = host.slots["base"].model_copy(deep=True)
+    assert host.backend.slots["base"] is not host.backend.controller_slot
+    assert host.backend.slots["base"] == host.backend.controller_slot
+    scans = track_slot_scans(monkeypatch)
+
+    host.backend._check(host.record(), "base")
+
+    assert scans == [Path(host.slots["base"].package.root)]
+    assert host.commands == []
+
+
+async def test_one_guard_hashes_distinct_slots_even_with_shared_python(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, target = host.slots["base"], host.slots["target"]
+    assert base != target and base.resolved_python == target.resolved_python
+    scans = track_slot_scans(monkeypatch)
+    record = host.record()
+
+    host.backend._check(record, "target")
+
+    assert scans == [Path(base.package.root), Path(target.package.root)]
+    # The selected package, not just the common interpreter, was authenticated.
+    (Path(target.package.root) / "__main__.py").write_bytes(b"changed selected package")
+    with pytest.raises(ManagedDeploymentError, match="^managed_slot_changed$"):
+        host.backend._check(record, "target")
+    assert host.commands == []
+
+
+async def test_next_guard_rejects_changed_file_in_shared_controller_slot(host: Host) -> None:
+    record = host.record()
+    host.backend._check(record, "base")
+
+    # No cache may outlive one synchronous guard, even for the same record/role.
+    (Path(host.slots["base"].package.root) / "__main__.py").write_bytes(b"changed between guards")
+
+    with pytest.raises(ManagedDeploymentError, match="^anchor_unavailable$"):
+        host.backend._check(record, "base")
+    assert host.commands == []
 
 
 @pytest.mark.parametrize("host", [("switch", False), ("adopt", False)], indirect=True)

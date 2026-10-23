@@ -21,3 +21,5 @@ unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh mana
 独立只读复审已通过：核对冻结前缀、正逆序、两次进程观察、writer/cgroup 门、损坏 target 的 stop-only 例外，以及 V1 HTTP 提取的原语义。复审未把上述 fake 回归视为真实服务验收。
 
 这些模块证据不能证明真实 systemd 用户 manager 的加载或真实服务 exec/激活成功；共享已安装目录被外部程序修改也不是沙箱隔离。生产调用链已接线，另有[真实进程验收](managed-process-recovery.md)；该验收仍使用合成 manager 边界，不代表操作过用户真实服务。
+
+单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次 `verify_anchor` 已完成的文件核验，不再重复扫描同一安装。不同 slot 即使共享完全相同的解释器仍分别核验；结果不跨 `_check` 保存，下一次 guard 会重新读取和核验文件。所有效果前和 await 后的 guard、文件耐久确认及原期限保持原样。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
