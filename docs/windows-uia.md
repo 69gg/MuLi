@@ -211,6 +211,21 @@ MTA/执行策略、预热或自动重试，生产 API 不返回原始 stderr。�
 本地仅运行 13 新增与 42 既有纯用例，三份 Python 静态及新 helper 类型检查通过，
 峰值 67.9 MiB、swap 0；独立静态后审未发现确定 P1/P2，真实脚本阶段输出仍待验。
 
+## 同进程启动判别（尚未实测）
+
+旧候选 `691ea5c` 的 CI `39979235619`、Windows 3.13 job `120501823249` 四项
+UIA native 用例超时，连不调用 COM 的 owned-pending 脚本也未观察到读后标记。
+首 probe 的 stages 为空，只能说明没有观察到；清理后的非零退出不能证明自然失败。
+
+后续窄观测只在第四例原有进程中增加 ReadLine 前/后的两个固定 stderr 标记，并在
+测试侧记录原 spawn/write/drain 及清理前后状态。没有新增启动、重试、管道、查询或
+产品配置，原 12 秒和强拥有清理保持；异常仅在收尾后附不超过 4 KiB 的固定标量，
+不输出任意 stderr 或环境。实现与待验证边界见
+[同进程观测合同](windows-uia-pending-observation-design.md)。本片新增 19 个纯 fake
+节点，与相关既有回归共 74 项通过；三份 Python Ruff/格式与 helper strict mypy
+通过，整轮峰值 94.6 MiB、swap 0。独立 6.1 sol 静态后审未发现确定 P1/P2 或阻断；
+真实 Windows 仍待验证。诊断不是启动失败的修复，后续候选成功也不倒推旧失败已解决。
+
 ## 官方依据
 
 Context7 先查 PowerShell / .NET 接口；模块自动加载问题无匹配时再核微软原文：

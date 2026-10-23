@@ -17,12 +17,17 @@ import pytest
 import pytest_asyncio
 from helpers import uia_native_window
 from helpers.uia_native_startup import observe_native_form
-from helpers.uia_probe_diagnostics import observe_probe
+from helpers.uia_probe_diagnostics import (
+    PENDING_SCRIPT,
+    PendingHelperLease,
+    observe_pending,
+    observe_probe,
+    pending_received,
+)
 
 from muli.config import Settings
 from muli.process import _settle_process
 from muli.tools import uia_computer as module
-from muli.tools.ax_lease import AXHelperLease
 from muli.tools.computer import Computer, ComputerError
 
 pytestmark = pytest.mark.skipif(
@@ -223,24 +228,17 @@ async def test_real_windows_pending_powershell_cancellation_reaps_only_owned_hel
     # A fixed test-only sleeper stands in for a COM call which does not return.
     # This proves transport/process cancellation, not a real provider's behavior.
     script = tmp_path / "owned-pending.ps1"
-    script.write_text(
-        "$null = [Console]::ReadLine()\n"
-        "[Console]::Error.WriteLine('owned-pending')\n"
-        "[Console]::Error.Flush()\n"
-        "[Threading.Thread]::Sleep(30000)\n",
-        encoding="utf-8",
-    )
+    script.write_text(PENDING_SCRIPT, encoding="utf-8")
     configuration = settings().computer
-    lease = AXHelperLease(
+    lease = PendingHelperLease(
         [str(module._powershell()), "-NoProfile", "-NonInteractive", "-Mta", "-File", str(script)],
         timeout=configuration.operation_timeout_seconds,
         ttl=configuration.snapshot_ttl_seconds,
         max_nodes=configuration.max_nodes,
     )
-    reading = asyncio.create_task(lease.request("probe", {}))
-    try:
+    async with observe_pending(lease) as reading:
         async with asyncio.timeout(configuration.operation_timeout_seconds):
-            while b"owned-pending" not in lease._stderr:
+            while not pending_received(lease):
                 if reading.done():
                     await reading
                     raise AssertionError("Pending helper unexpectedly returned")
@@ -251,7 +249,3 @@ async def test_real_windows_pending_powershell_cancellation_reaps_only_owned_hel
             await reading
         assert lease.closed and lease._process.returncode is not None
         assert not lease._readers or all(task.done() for task in lease._readers)
-    finally:
-        reading.cancel()
-        await asyncio.gather(reading, return_exceptions=True)
-        await lease.aclose()

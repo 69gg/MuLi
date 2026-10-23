@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any, cast
 
-from muli.tools.ax_lease import MAX_STDERR_BYTES, AXHelperLease
+from muli.tools.ax_lease import MAX_STDERR_BYTES, AXHelperLease, AXLeaseError
 
 STAGES = (
     "script_entered",
@@ -21,22 +24,41 @@ _STAGE_LINES = {b"muli-uia-stage=1:" + stage.encode("ascii"): stage for stage in
 _NOTE_PREFIX = "uia_probe_diagnostic="
 _NOTE_BYTES = 4096
 
+PENDING_STAGES = ("script_entered", "input_received")
+_PENDING_LINES = {b"muli-uia-pending=1:" + stage.encode("ascii"): stage for stage in PENDING_STAGES}
+PENDING_SCRIPT = (
+    "try { [Console]::Error.WriteLine('muli-uia-pending=1:script_entered'); "
+    "[Console]::Error.Flush() } catch { }\n"
+    "$null = [Console]::ReadLine()\n"
+    "try { [Console]::Error.WriteLine('muli-uia-pending=1:input_received'); "
+    "[Console]::Error.Flush() } catch { }\n"
+    "[Threading.Thread]::Sleep(30000)\n"
+)
+_PENDING_NOTE_PREFIX = "uia_pending_diagnostic="
 
-def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]:
-    data = bytes(lease._stderr[:MAX_STDERR_BYTES])
+
+def _stage_facts(
+    data: bytes, names: tuple[str, ...], lines: dict[bytes, str]
+) -> tuple[list[str], str]:
     stages: list[str] = []
     invalid = False
     previous = -1
     for line in data.split(b"\n")[:-1]:
-        stage = _STAGE_LINES.get(line.removesuffix(b"\r"))
+        stage = lines.get(line.removesuffix(b"\r"))
         if stage is None:
             continue
-        position = STAGES.index(stage)
+        position = names.index(stage)
         if position <= previous or stage in stages:
             invalid = True
         if stage not in stages:
             stages.append(stage)
         previous = position
+    return stages, "invalid" if invalid else "valid" if stages else "unobserved"
+
+
+def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]:
+    data = bytes(lease._stderr[:MAX_STDERR_BYTES])
+    stages, sequence = _stage_facts(data, STAGES, _STAGE_LINES)
 
     process = lease._process
     exit_code = process.returncode if process is not None else None
@@ -52,7 +74,7 @@ def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]
     )
     return {
         "stages": stages,
-        "stage_sequence": "invalid" if invalid else "valid" if stages else "unobserved",
+        "stage_sequence": sequence,
         "stderr_prefix_capped": len(data) == MAX_STDERR_BYTES,
         "sent": lease._count
         if type(lease._count) is int and lease._count in {0, 1}
@@ -94,3 +116,157 @@ async def observe_probe(lease: AXHelperLease) -> dict[str, Any]:
                     BaseException.add_note(failure, encoded)
             except Exception:
                 pass  # Evidence must never replace the original failure.
+
+
+class _PendingInput:
+    """Observe the existing stdin operations; never add a write, drain or wait."""
+
+    def __init__(self, writer: asyncio.StreamWriter, lease: PendingHelperLease) -> None:
+        self.writer, self.lease = writer, lease
+
+    def write(self, data: bytes) -> None:
+        self.lease.write_started = True
+        self.writer.write(data)
+        self.lease.write_returned = True
+
+    async def drain(self) -> None:
+        self.lease.drain_started = True
+        await self.writer.drain()
+        self.lease.drain_returned = True
+
+    def close(self) -> None:
+        self.writer.close()
+
+    async def wait_closed(self) -> None:
+        await self.writer.wait_closed()
+
+
+class PendingHelperLease(AXHelperLease):
+    """Test-only observation of the fourth native case's single owned helper."""
+
+    def __init__(self, argv: list[str], *, timeout: float, ttl: float, max_nodes: int) -> None:
+        super().__init__(argv, timeout=timeout, ttl=ttl, max_nodes=max_nodes)
+        self.input_observed = False
+        self.write_started = self.write_returned = False
+        self.drain_started = self.drain_returned = False
+        self.before_cleanup: dict[str, Any] | None = None
+
+    async def _start(self) -> None:
+        await super()._start()
+        if (
+            not self.input_observed
+            and self._process is not None
+            and self._process.stdin is not None
+        ):
+            self._process.stdin = cast(
+                asyncio.StreamWriter, _PendingInput(self._process.stdin, self)
+            )
+            self.input_observed = True
+
+    def _retire(self, error: AXLeaseError | None = None) -> None:
+        if self._state not in {"closing", "closed"}:
+            try:
+                self.before_cleanup = pending_snapshot(self)
+            except Exception:
+                pass  # First retirement and original error still belong to the base owner.
+        super()._retire(error)
+
+
+def pending_snapshot(lease: PendingHelperLease) -> dict[str, Any]:
+    data = bytes(lease._stderr[:MAX_STDERR_BYTES])
+    stages, sequence = _stage_facts(data, PENDING_STAGES, _PENDING_LINES)
+    starting = lease._starting
+    spawn = "not_started"
+    if starting is not None:
+        if not starting.done():
+            spawn = "pending"
+        elif starting.cancelled():
+            spawn = "cancelled"
+        else:
+            spawn = "failed" if starting.exception() is not None else "returned"
+    process = lease._process
+    exit_code = process.returncode if process is not None else None
+    exit_class = "unavailable" if process is None else "running"
+    if type(exit_code) is int:
+        exit_class = "zero" if exit_code == 0 else "nonzero"
+    return {
+        "spawn": spawn,
+        "lease_state": lease.state
+        if lease.state in {"new", "starting", "in_flight", "ready", "closing", "closed"}
+        else "unavailable",
+        "process_exists": process is not None,
+        "exit": exit_class,
+        "readers_settled": all(reader.done() for reader in lease._readers),
+        "sent": lease._count
+        if type(lease._count) is int and lease._count in {0, 1}
+        else "unavailable",
+        "input_observed": lease.input_observed,
+        "write_started": lease.write_started,
+        "write_returned": lease.write_returned,
+        "drain_started": lease.drain_started,
+        "drain_returned": lease.drain_returned,
+        "script_stages": stages,
+        "stage_sequence": sequence,
+        "stderr_bytes": len(data),
+        "stderr_prefix_capped": len(data) == MAX_STDERR_BYTES,
+    }
+
+
+def pending_received(lease: PendingHelperLease) -> bool:
+    """The pre-read marker is diagnostic only, not an extra readiness condition."""
+    stages, _ = _stage_facts(
+        bytes(lease._stderr[:MAX_STDERR_BYTES]), PENDING_STAGES, _PENDING_LINES
+    )
+    return "input_received" in stages
+
+
+def pending_facts(lease: PendingHelperLease, *, cleanup_failed: bool) -> dict[str, Any]:
+    after = pending_snapshot(lease)
+    cleanup = (
+        not cleanup_failed
+        and lease.closed
+        and after["process_exists"]
+        and after["exit"] in {"zero", "nonzero"}
+        and after["readers_settled"]
+    )
+    return {
+        "before_cleanup": lease.before_cleanup,
+        "after_cleanup": after,
+        "cleanup": "confirmed" if cleanup else "unconfirmed",
+    }
+
+
+@asynccontextmanager
+async def observe_pending(
+    lease: PendingHelperLease,
+) -> AsyncIterator[asyncio.Task[dict[str, Any]]]:
+    """Keep the original test fault/cancellation while the same lease owns cleanup."""
+    reading = asyncio.create_task(lease.request("probe", {}))
+    failure: BaseException | None = None
+    cleanup_failed = False
+    try:
+        yield reading
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        reading.cancel()
+        try:
+            await asyncio.gather(reading, return_exceptions=True)
+            await lease.aclose()
+        except BaseException:
+            cleanup_failed = True
+            if failure is None:
+                raise
+        if failure is not None:
+            try:
+                encoded = _PENDING_NOTE_PREFIX + json.dumps(
+                    pending_facts(lease, cleanup_failed=cleanup_failed),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                if len(encoded.encode("ascii")) <= _NOTE_BYTES:
+                    BaseException.add_note(failure, encoded)
+            except Exception:
+                pass  # Observation must never replace the original fault or cancellation.
