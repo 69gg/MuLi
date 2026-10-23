@@ -250,11 +250,66 @@ MANAGER_STAGES = frozenset(
 )
 
 
+def manager_checkpoint_facts(value: object) -> bool:
+    """Validate a historical pending round, without granting readiness."""
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value["version"] != 1
+    ):
+        return False
+    if value.get("code") == "not_observed":
+        return set(value) == {"version", "code"}
+    if (
+        value.get("code") != "observed"
+        or set(value) != {"version", "code", "elapsed_ms", "runtime", "manager"}
+        or type(value["elapsed_ms"]) is not int
+        or not 0 <= value["elapsed_ms"] <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 1000
+    ):
+        return False
+    for name in ("runtime", "manager"):
+        unit = value[name]
+        keys = {"active_state", "sub_state", "job"}
+        if name == "manager":
+            keys |= {"pid", "start_ticks", "invocation"}
+        if (
+            not isinstance(unit, dict)
+            or set(unit) != keys
+            or not isinstance(unit["active_state"], str)
+            or unit["active_state"] not in {"active", "activating", "inactive"}
+            or not isinstance(unit["sub_state"], str)
+            or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", unit["sub_state"]) is None
+            or type(unit["job"]) is not int
+            or not 0 <= unit["job"] < 2**31
+            or (unit["active_state"] == "inactive" and unit["job"] == 0)
+        ):
+            return False
+        if name == "manager" and (
+            type(unit["pid"]) is not int
+            or not 0 < unit["pid"] < 2**31
+            or type(unit["start_ticks"]) is not int
+            or not 0 <= unit["start_ticks"] < 2**64
+            or not isinstance(unit["invocation"], str)
+            or re.fullmatch(r"[a-f0-9]{32}", unit["invocation"]) is None
+            or unit["invocation"] == "0" * 32
+        ):
+            return False
+    return True
+
+
 def manager_failure_facts(value: object) -> bool:
     """A failed observation is finite evidence, never readiness authority."""
     return (
         isinstance(value, dict)
-        and set(value) == {"code", "stage", "query_status", "query_code", "used"}
+        and set(value)
+        in (
+            {"code", "stage", "query_status", "query_code", "used"},
+            {"code", "stage", "query_status", "query_code", "used", "last_completed_round"},
+        )
+        and (
+            "last_completed_round" not in value
+            or manager_checkpoint_facts(value["last_completed_round"])
+        )
         and isinstance(value["code"], str)
         and value["code"] in MANAGER_FAILURE_CODES
         and isinstance(value["stage"], str)

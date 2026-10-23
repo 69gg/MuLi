@@ -1899,6 +1899,52 @@ async def _manager_units(
     return result
 
 
+def _manager_checkpoint(
+    runtime: dict[str, Any],
+    manager: dict[str, Any],
+    binding: tuple[int, int, str] | None,
+    invocation: str,
+    elapsed: float,
+) -> dict[str, Any] | None:
+    """Project an already validated pending round; never fail the observation."""
+    if (
+        binding is None
+        or not invocation
+        or invocation == "0" * 32
+        or re.fullmatch(r"[a-f0-9]{32}", invocation) is None
+        or manager["invocation"] != invocation
+        or manager["MainPID"] != binding[0]
+        or manager["ControlGroup"] != binding[2]
+        or type(binding[0]) is not int
+        or not 0 < binding[0] < 2**31
+        or type(binding[1]) is not int
+        or not 0 <= binding[1] < 2**64
+        or not math.isfinite(elapsed)
+        or not 0 <= elapsed * 1000 <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 1000
+    ):
+        return None
+    projected: dict[str, Any] = {
+        "version": 1,
+        "code": "observed",
+        "elapsed_ms": round(elapsed * 1000),
+    }
+    for name, unit in (("runtime", runtime), ("manager", manager)):
+        state, sub, job = unit["ActiveState"], unit["SubState"], unit["Job"][0]
+        if (
+            not isinstance(state, str)
+            or state not in {"active", "activating", "inactive"}
+            or not isinstance(sub, str)
+            or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", sub) is None
+            or type(job) is not int
+            or not 0 <= job < 2**31
+            or (state == "inactive" and job == 0)
+        ):
+            return None
+        projected[name] = {"active_state": state, "sub_state": sub, "job": job}
+    projected["manager"].update(pid=binding[0], start_ticks=binding[1], invocation=invocation)
+    return projected
+
+
 async def manager_state(
     mode: str,
     user: str,
@@ -1930,6 +1976,7 @@ async def manager_state(
     }
     io = _SetupIO(deadline, byte_limit, facts)
     result: dict[str, Any] = {"code": "native_manager_observation", "used": 0}
+    last_completed_round: dict[str, Any] = {"version": 1, "code": "not_observed"}
     try:
         probe = SystemdProbe(
             runner=io.query, limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES)
@@ -2070,7 +2117,13 @@ async def manager_state(
                             "used": 0,
                         }
                         break
-                    await asyncio.sleep(min(delay, remaining(deadline)))
+                    pause = min(delay, remaining(deadline))
+                    checkpoint = _manager_checkpoint(
+                        runtime, manager, binding, invocation, observed_since - started
+                    )
+                    if checkpoint is not None:
+                        last_completed_round = checkpoint
+                    await asyncio.sleep(pause)
                     delay = min(CLEANUP_SECONDS, delay * 2)
     except TimeoutError:
         result["code"] = "native_deadline_exceeded"
@@ -2085,6 +2138,7 @@ async def manager_state(
             stage=facts["manager_stage"],
             query_status=facts["query_status"],
             query_code=facts["query_code"],
+            last_completed_round=last_completed_round,
         )
         if io.used > byte_limit:
             # Saturation reserves the whole allowance; this is explicitly a failed read.
