@@ -439,8 +439,9 @@ def test_active_transaction_is_rejected_without_ending_it(
 ) -> None:
     _, _, reader = database
     reader.execute("BEGIN")
-    with pytest.raises(FormatEvidenceError, match="^format_transaction_active$"):
+    with pytest.raises(FormatEvidenceError) as caught:
         read_format_evidence(reader)
+    assert str(caught.value) == caught.value.code == "format_transaction_active"
     assert reader.in_transaction
     reader.execute("ROLLBACK")
 
@@ -484,8 +485,9 @@ def test_cleanup_failure_is_reported_instead_of_success(
         return original(db, sql, parameters, limit=limit)
 
     monkeypatch.setattr(evidence_module, "_rows", fail_rollback)
-    with pytest.raises(FormatEvidenceError, match="^format_cleanup_failed$"):
+    with pytest.raises(FormatEvidenceError) as caught:
         read_format_evidence(reader)
+    assert str(caught.value) == caught.value.code == "format_cleanup_failed"
     assert reader.in_transaction
     assert reader.execute("PRAGMA query_only").fetchone()[0] == 0
     reader.execute("ROLLBACK")
@@ -498,3 +500,154 @@ def test_cleanup_failure_is_reported_instead_of_success(
 def test_limit_values_are_strict_and_capped(changes: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         FormatReadLimits(**changes)
+
+
+def _observation(error: FormatEvidenceError) -> dict[str, Any]:
+    notes = error.__notes__
+    assert len(notes) == 1
+    assert len(notes[0].encode("utf-8")) <= 1024
+    prefix = "format_read_observation="
+    assert notes[0].startswith(prefix)
+    value: dict[str, Any] = json.loads(notes[0][len(prefix) :])
+    assert set(value) == {"elapsed_ms", "phase_ms", "failure_phase", "queries", "vm_steps"}
+    assert set(value["phase_ms"]) == set(evidence_module._PHASES)
+    assert value["failure_phase"] in evidence_module._PHASES
+    assert all(type(item) is int and 0 <= item <= 2**31 - 1 for item in value["phase_ms"].values())
+    assert sum(value["phase_ms"].values()) <= value["elapsed_ms"]
+    return value
+
+
+@pytest.mark.parametrize("optional", [False, True])
+@pytest.mark.parametrize("phase", ["schema", "marker", "identity", "main_object"])
+def test_failure_observation_uses_original_deadline_and_fixed_phases(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection],
+    monkeypatch: pytest.MonkeyPatch,
+    optional: bool,
+    phase: str,
+) -> None:
+    path, writer, reader = database
+    before = _facts(writer)
+    clock = [100.0]
+    original = evidence_module._rows
+    queries: list[str] = []
+    target = {
+        "schema": "SELECT type,name,tbl_name",
+        "marker": FORMAT_STATE_KEY,
+        "identity": "store_instance_v1",
+        "main_object": "FROM main.objects",
+    }[phase]
+
+    def rows(
+        db: sqlite3.Connection, sql: str, parameters: Any = (), *, limit: int = 1
+    ) -> list[tuple[Any, ...]]:
+        result = original(db, sql, parameters, limit=limit)
+        queries.append(sql)
+        if target in sql or target in parameters:
+            clock[0] += 1.25
+        return result
+
+    monkeypatch.setattr(evidence_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(evidence_module, "_rows", rows)
+    read = evidence_module.read_optional_format_evidence if optional else read_format_evidence
+    with pytest.raises(FormatEvidenceError) as caught:
+        read(reader)
+    error = caught.value
+    assert str(error) == error.code == "format_read_timeout"
+    value = _observation(error)
+    assert value["failure_phase"] == phase
+    assert value["phase_ms"][phase] == value["elapsed_ms"] == 1250
+    assert 1 <= value["queries"] <= 8
+    assert str(path) not in error.__notes__[0]
+    assert "SELECT" not in error.__notes__[0] and "instance" not in error.__notes__[0]
+    assert queries.count("ROLLBACK") == 1 and not reader.in_transaction
+    assert _facts(writer) == before
+
+
+def test_cleanup_failure_observation_preserves_fail_closed_priority(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, writer, reader = database
+    _replace_marker(writer, "private malformed marker")
+    original = evidence_module._rows
+
+    def rows(
+        db: sqlite3.Connection, sql: str, parameters: Any = (), *, limit: int = 1
+    ) -> list[tuple[Any, ...]]:
+        if sql == "ROLLBACK":
+            raise sqlite3.OperationalError("private rollback detail")
+        return original(db, sql, parameters, limit=limit)
+
+    monkeypatch.setattr(evidence_module, "_rows", rows)
+    with pytest.raises(FormatEvidenceError) as caught:
+        read_format_evidence(reader)
+    assert str(caught.value) == "format_cleanup_failed"
+    assert _observation(caught.value)["failure_phase"] == "cleanup"
+    assert "private" not in caught.value.__notes__[0]
+    assert reader.in_transaction
+    reader.execute("ROLLBACK")
+
+
+def test_success_does_not_generate_observation(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, reader = database
+
+    def annotate(self: evidence_module._Reader, error: FormatEvidenceError) -> None:
+        raise AssertionError("success must not generate failure diagnostics")
+
+    monkeypatch.setattr(evidence_module._Reader, "annotate", annotate)
+    assert read_format_evidence(reader).main_session == "main"
+
+
+def test_observation_forwarding_does_not_copy_arbitrary_notes() -> None:
+    source = FormatEvidenceError("format_read_failed")
+    source.add_note("private attacker supplied note")
+    target = ValueError("existing_store_unavailable")
+    source.copy_observation_to(target)
+    assert not hasattr(target, "__notes__")
+
+
+@pytest.mark.parametrize(
+    "phase,target",
+    [
+        ("setup", "PRAGMA read_uncommitted"),
+        ("begin", "BEGIN"),
+        ("optional", "SELECT name,type FROM main.sqlite_schema"),
+    ],
+)
+def test_setup_and_classification_failures_have_bounded_observation(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection],
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    target: str,
+) -> None:
+    _, _, reader = database
+    original = evidence_module._rows
+
+    def rows(
+        db: sqlite3.Connection, sql: str, parameters: Any = (), *, limit: int = 1
+    ) -> list[tuple[Any, ...]]:
+        if sql.startswith(target):
+            raise sqlite3.OperationalError("private database detail")
+        return original(db, sql, parameters, limit=limit)
+
+    monkeypatch.setattr(evidence_module, "_rows", rows)
+    with pytest.raises(FormatEvidenceError) as caught:
+        evidence_module.read_optional_format_evidence(reader)
+    assert caught.value.code == "format_read_failed"
+    value = _observation(caught.value)
+    assert value["failure_phase"] == phase
+    assert "private" not in caught.value.__notes__[0]
+    assert not reader.in_transaction
+
+
+def test_vm_budget_remains_fail_closed_and_observed(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection],
+) -> None:
+    _, _, reader = database
+    with pytest.raises(FormatEvidenceError) as caught:
+        read_format_evidence(reader, limits=FormatReadLimits(vm_steps=1))
+    assert caught.value.code == "format_query_budget"
+    value = _observation(caught.value)
+    assert value["vm_steps"] == 1
+    assert not reader.in_transaction

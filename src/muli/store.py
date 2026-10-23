@@ -279,7 +279,10 @@ class Store:
                 "format_transaction_active": "existing_store_outer_transaction",
             }
             code = codes.get(error.code, error.code)
-            raise ExistingStoreError(code) from None
+            mapped = ExistingStoreError(code)
+            if isinstance(error, FormatEvidenceError):
+                error.copy_observation_to(mapped)
+            raise mapped from None
         except sqlite3.Error:
             store.db.close()
             raise ExistingStoreError("existing_store_unavailable") from None

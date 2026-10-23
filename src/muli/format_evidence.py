@@ -7,6 +7,7 @@ unknown old progress callbacks cannot be inspected or restored by sqlite3.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
@@ -23,6 +24,9 @@ FORMAT_STATE_KEY = "format_state_v1"
 _IDENTITY_BYTES = 96
 _SCHEMA_NAME_BYTES = 256
 _SQL_BYTES = 4096
+_PHASES = ("setup", "begin", "optional", "schema", "marker", "identity", "main_object", "cleanup")
+_OBSERVATION_BYTES = 1024
+_MAX_MILLISECONDS = 2**31 - 1
 
 
 class FormatEvidenceError(ValueError):
@@ -30,7 +34,13 @@ class FormatEvidenceError(ValueError):
 
     def __init__(self, code: str) -> None:
         self.code = code
+        self._observation_note: str | None = None
         super().__init__(code)
+
+    def copy_observation_to(self, error: Exception) -> None:
+        """Forward only this reader's generated observation, never arbitrary notes."""
+        if self._observation_note is not None:
+            error.add_note(self._observation_note)
 
 
 class FormatReadLimits(StrictRecord):
@@ -73,10 +83,40 @@ def _rows(
 class _Reader:
     def __init__(self, db: sqlite3.Connection, limits: FormatReadLimits) -> None:
         self.db, self.limits = db, limits
-        self.deadline = monotonic() + limits.seconds
+        self.started = self.phase_started = monotonic()
+        self.deadline = self.started + limits.seconds
+        self.phase = self.failure_phase = "setup"
+        self.durations = dict.fromkeys(_PHASES, 0.0)
         self.queries = self.steps = 0
         self.interval = min(100, limits.vm_steps)
         self.interrupted: str | None = None
+
+    def move(self, phase: str) -> None:
+        now = monotonic()
+        self.durations[self.phase] += max(0.0, now - self.phase_started)
+        self.phase, self.phase_started = phase, now
+
+    def annotate(self, error: FormatEvidenceError) -> None:
+        now = monotonic()
+        self.durations[self.phase] += max(0.0, now - self.phase_started)
+
+        def milliseconds(seconds: float) -> int:
+            return int(min(_MAX_MILLISECONDS, max(0.0, seconds) * 1000))
+
+        note = "format_read_observation=" + json.dumps(
+            {
+                "elapsed_ms": milliseconds(now - self.started),
+                "phase_ms": {phase: milliseconds(value) for phase, value in self.durations.items()},
+                "failure_phase": self.failure_phase,
+                "queries": self.queries,
+                "vm_steps": self.steps,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(note.encode("utf-8")) <= _OBSERVATION_BYTES:
+            error._observation_note = note
+            error.add_note(note)
 
     def check(self) -> None:
         if monotonic() >= self.deadline:
@@ -171,19 +211,23 @@ class _Reader:
         return tuple(facts)
 
     def read(self) -> FormatEvidence:
+        self.move("schema")
         schema = self.schema()
+        self.move("marker")
         raw = self.text_record(FORMAT_STATE_KEY, self.limits.marker_bytes, code="format_marker")
         try:
             state = FormatState.from_json(raw)
         except CompatibilityError:
             raise FormatEvidenceError("format_marker_invalid") from None
         self.check()
+        self.move("identity")
         instance = self.text_record(
             "store_instance_v1", _IDENTITY_BYTES, code="format_store_identity"
         ).decode("utf-8")
         main = self.text_record(
             "main_session", _IDENTITY_BYTES, code="format_main_identity"
         ).decode("utf-8")
+        self.move("main_object")
         rows = self.rows(
             "SELECT typeof(data),length(CAST(data AS BLOB)),"
             "CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
@@ -214,6 +258,7 @@ class _Reader:
         return FormatEvidence(state, instance, main, schema)
 
     def read_optional(self) -> FormatEvidence | None:
+        self.move("optional")
         tables = self.rows(
             "SELECT name,type FROM main.sqlite_schema "
             "WHERE name='runtime_state' COLLATE NOCASE LIMIT 2",
@@ -279,6 +324,17 @@ def _read_evidence(
 ) -> FormatEvidence | None:
     limits = limits or FormatReadLimits()
     reader = _Reader(db, limits)
+    try:
+        return _read_evidence_inner(db, reader, optional=optional)
+    except FormatEvidenceError as error:
+        reader.annotate(error)
+        raise
+
+
+def _read_evidence_inner(
+    db: sqlite3.Connection, reader: _Reader, *, optional: bool
+) -> FormatEvidence | None:
+    limits = reader.limits
     saved_limits: dict[int, int] = {}
     query_only: int | None = None
     busy_timeout: int | None = None
@@ -307,6 +363,7 @@ def _read_evidence(
         timeout = min(limits.busy_timeout_ms, int(limits.seconds * 1000))
         _rows(db, f"PRAGMA busy_timeout={timeout}")
         reader.check()
+        reader.move("begin")
         begin_attempted = True
         _rows(db, "BEGIN")
         result = reader.read_optional() if optional else reader.read()
@@ -325,6 +382,8 @@ def _read_evidence(
     except UnicodeError:
         raise FormatEvidenceError("format_record_invalid") from None
     finally:
+        reader.failure_phase = reader.phase
+        reader.move("cleanup")
         failed = False
         if installed:
             try:
@@ -349,5 +408,6 @@ def _read_evidence(
                 except sqlite3.Error:
                     failed = True
         if failed:
+            reader.failure_phase = "cleanup"
             raise FormatEvidenceError("format_cleanup_failed") from None
     return result

@@ -15,6 +15,7 @@ from muli.channel_application import ChannelApplication
 from muli.channels import ChannelManager, ChannelProfile, ChannelsConfig
 from muli.config import ConfigFile
 from muli.events import EventBus
+from muli.format_evidence import FormatEvidenceError, read_format_evidence
 from muli.memory import Memory
 from muli.runtime import Runtime
 from muli.store import Store
@@ -24,6 +25,43 @@ from muli.store_schema import (
     SchemaGroup,
     validate_existing_schema,
 )
+
+
+async def test_format_observation_survives_only_its_fixed_error_mapping(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with sqlite3.connect(":memory:") as db:
+        with pytest.raises(FormatEvidenceError) as caught:
+            read_format_evidence(db)
+    source = caught.value
+    original_note = source.__notes__[0]
+    source.add_note("private extra note")
+
+    def fail(db: sqlite3.Connection, **kwargs: Any) -> None:
+        raise source
+
+    monkeypatch.setattr("muli.store.read_optional_format_evidence", fail)
+    with pytest.raises(ExistingStoreError) as mapped:
+        Store.open_existing(database)
+    assert str(mapped.value) == source.code
+    assert mapped.value.__notes__ == [original_note]
+
+
+async def test_arbitrary_format_notes_are_not_forwarded_by_store(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = FormatEvidenceError("format_read_timeout")
+    source.add_note("format_read_observation=private forged note")
+
+    def fail(db: sqlite3.Connection, **kwargs: Any) -> None:
+        raise source
+
+    monkeypatch.setattr("muli.store.read_optional_format_evidence", fail)
+    with pytest.raises(ExistingStoreError) as mapped:
+        Store.open_existing(database)
+    assert str(mapped.value) == "existing_store_read_budget"
+    assert not hasattr(mapped.value, "__notes__")
+
 
 _MUTATIONS = {
     sqlite3.SQLITE_CREATE_INDEX,
