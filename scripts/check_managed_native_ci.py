@@ -903,9 +903,12 @@ class NativeCI:
             if self.execute_deadline is not None
             else time.monotonic() + CLEANUP_SECONDS
         )
+        # Cancel the observer before the unchanged transport deadline. This
+        # fixed share of the existing budget is only for a failure receipt.
+        observation_end = end - CLEANUP_SECONDS / 2
         allowance = OUTPUT_BYTES - self.setup_bytes
         # Reserve the small returned JSON as well as charging all inner stdout/stderr.
-        if allowance <= 1024 or end <= time.monotonic():
+        if allowance <= 1024 or observation_end <= time.monotonic():
             raise FixtureError("native_manager_observation_budget")
         worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
         arguments: tuple[str, ...] = (
@@ -916,13 +919,15 @@ class NativeCI:
             self.receipt.user,
             str(uid),
             str(self.home),
-            str(end),
+            str(observation_end),
             str(allowance - 1024),
         )
         if mode == "manager-ready":
             arguments += (str(started), previous)
         try:
             reply = self.call(arguments, seconds=end - time.monotonic())
+            if time.monotonic() >= end:
+                raise FixtureError("native_command_timeout")
             observed = object_bytes(reply.output)
             used = observed.get("used")
             if (
@@ -940,6 +945,9 @@ class NativeCI:
             raise FixtureError("native_diagnostic_output_budget")
         if observed.get("code") != ("idle" if mode == "manager-idle" else "ready"):
             if manager_failure_facts(observed):
+                if time.monotonic() >= end:
+                    self.setup_bytes = OUTPUT_BYTES
+                    raise FixtureError("native_command_timeout")
                 self.manager_failure = observed.copy()
                 try:
                     self.save_setup_result({})
@@ -975,7 +983,7 @@ class NativeCI:
                 or Path(group).name != f"user@{uid}.service"
             ):
                 raise FixtureError("native_manager_observation")
-        if time.monotonic() >= end:
+        if time.monotonic() >= observation_end:
             raise FixtureError("native_execute_deadline")
         return observed
 

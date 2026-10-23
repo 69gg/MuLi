@@ -360,7 +360,7 @@ worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累�
 
 独立Sol只读后审未发现确定P1/P2，已核对pending每轮同轮新读取与binding、candidate完整7命令、proc/kernel/final+stat以及原预算；根也复核核心diff与manager_state。审查没有运行检查，真实三事务未验的边界保持。此后仅按授权签名提交并推送一次精确候选，远端结果单独记录，不把纯例或独审当作实际native验收。
 
-## 第十三轮 native 有限失败取证（仅本job终态）
+## 第十三轮 native 有限失败取证（最终九绿两红）
 
 精确签名候选 `28e0452e75047afa3acff6c2e2b63718900e953a` 的 [run 39982801787](https://github.com/69gg/MuLi/actions/runs/39982801787)、[native job 120514184291](https://github.com/69gg/MuLi/actions/runs/39982801787/job/120514184291) 已失败，job于2026-10-23 23:58:16开始、23:59:59结束（Asia/Shanghai）。本片只查该job及一次artifact列表，不查询、等待或推定其余矩阵终态。
 
@@ -373,5 +373,23 @@ worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累�
 - 收尾后的receipt记录user_created=true、user_removed=true、group_removed=true，UID999/GID987，mounts为空，环境文件与manager_group归属记录为空，setup_phase仍manager_show_before。账户/组移除及挂载记录清空与此前轮次不同，但整体服务清理命令仍失败，**不能称正常清理或全部服务回收证明通过**。
 
 本次仅记录新事实并签名文档，不修改实现、增加预算、自动重跑或推送；不从约90秒耗尽、后备预算不足或摘要缺失倒推服务启动根因。第十三轮原生验收仍未通过，前十二轮历史保持。
+
+根随后查实该精确run已全终态，九项success，native与Windows 3.12两项failure。Windows有限取证另行负责，本片不推测其原因，也不混入native修复；前述不查询其余矩阵描述保留为本次取证边界。
+
+## 观察到期与失败回执窗口（实现前批准）
+
+只读因果审查确认原协议把同一个绝对E同时传给manager worker和parent命令：execute入口95秒，parent E为其截止减原5秒；worker到E才取消、完成已有进程收尾并构造失败摘要，asyncio.run返回后才打印JSON，而parent到E就可超时并SIGKILL。因此到期失败摘要存在确定的竞争窗口。第十三轮约90秒native_command_timeout与无摘要符合这条路径，但不能证明只有此原因，也不解释manager为何未ready。现有单独worker取消纯例不覆盖parent传输边界。
+
+在原parent E内固定分配回执窗口，长度由现有 `CLEANUP_SECONDS / 2` 推导（2.5秒），不加新宽松上限。worker观察截止为E减该窗口，parent命令硬截止仍E；无execute_deadline的既有单次5秒观察同样在内部拆分，不延长为另一轮预算。若剩余时间已不足窗口，观察直接拒绝，不能重设期限或启动查询。asyncio仍只接相对remaining。
+
+worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后核验与取消路径。parent在较早截止前完成原严格校验才允许idle/ready成功；窗口内即使收到ready，也只能失败，不授予manager_readiness或启动事务。窗口仅允许接收、严格验证并保存同次失败摘要，原错误继续抛出；到parent E或更晚的任何回包拒绝。无返回、不可验证的used/回包大小/状态、无效失败摘要或超限仍按原合同保守耗尽额度，真正外部CancelledError不转换成普通failure。
+
+沿用32 KiB累计输出与1024字节回执预留、execute95秒、独立cleanup5秒、单次manager start及全部ready证明；不增加查询/重试、生产进程API、输出字段或服务操作。有限窗口不承诺任意阻塞收尾必能回包，parent原硬终止仍是兜底。先写fake Popen/selector/host clock反例，模拟worker到期后才发布失败摘要：旧同截止会丢回执，新拆分应在原E前保留严格摘要。补窗口内成功拒绝、E边界、无剩余时间与无返回保守记账纯例，再申请guard验证；不使用冻结全局时基配真实asyncio timer。
+
+实现仅改协调器截止分配及原验证后的时间门；worker/helper与生产process没有变化。先写反例再改实现，获guard后首次执行已包含修复，没有声称实际切回旧源码红跑。新增20个纯case用真实parent command逻辑配fake Popen/pipe/selector/monotonic；同截止对照会在失败摘要发布前硬终止并耗尽未知额度，新分配在同一个原parent E内保存严格摘要。两种模式、两种deadline来源、成功收到或校验跨较早截止、失败校验跨parent E、无观察余量、无效失败schema和到期无返回均覆盖，全部没有真实timer或系统进程。
+
+新回执组 **20项通过**（pytest0.40秒、guard931毫秒、89.4 MiB/swap 0）；随后完整native纯文件 **387项通过**（pytest1.14秒、guard1.789秒、100.2 MiB/swap 0）。Ruff格式化84毫秒/28.1 MiB，Ruff check74毫秒/24.7 MiB，协调器与worker strict mypy347毫秒/71.6 MiB，均exit0、swap 0。每条经绝对主仓check_local与解释器、30秒原守卫串行；完整pytest session先收实exit0才开始下一项，所有终态后归还共享槽。之后仅补本文证据，代码冻结待独立后审；没有真实native/CLI/服务/账户/挂载、额外下载、push或远端重跑。纯例证明到期回执竞争可消除，不证明真实manager已ready或三事务与正常清理通过。
+
+第二位Sol只读独审未发现确定P1/P2或阻断，根也已复核协调器与20项fake反例diff，原时间/输出预算边界保持。审查没有运行检查，之后仅按授权签名提交；真实manager就绪、三事务及正常清理仍未验。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。

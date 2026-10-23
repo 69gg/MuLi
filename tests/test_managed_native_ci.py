@@ -3563,6 +3563,281 @@ def test_initial_ready_and_diagnostic_share_actual_byte_budget(
     assert 0 < native.setup_bytes < ci.OUTPUT_BYTES
 
 
+@pytest.fixture
+def manager_transport(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    """Exercise the real parent transport with fake process/pipe/selector/time only."""
+    native, commands = fixture
+    native.prepare()
+    native.manager_readiness = {}
+    state: dict[str, Any] = {
+        "native": native,
+        "clock": 100.0,
+        "offset": 0.1,
+        "ready": False,
+        "launched": 0,
+        "kills": [],
+        "closed": False,
+    }
+    native.execute_deadline = state["clock"] + ci.HARNESS_SECONDS + ci.CLEANUP_SECONDS
+    monkeypatch.setattr(ci.time, "monotonic", lambda: state["clock"])
+
+    class Pipe:
+        def fileno(self) -> int:
+            return 12345
+
+        def close(self) -> None:
+            state["closed"] = True
+
+    pipe = Pipe()
+
+    class Process:
+        pid = 23456
+        stdout = pipe
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout > 0
+            return 0
+
+    def popen(argv: Any, **kwargs: Any) -> Process:
+        state["launched"] += 1
+        assert argv[3] in {"manager-idle", "manager-ready"} and kwargs["start_new_session"] is True
+        state["worker_deadline"] = float(argv[7])
+        state["publish_at"] = (
+            state["parent_deadline"] if state.get("same_deadline") else state["worker_deadline"]
+        ) + state["offset"]
+        reply = commands(argv)
+        value = (
+            json.loads(reply.output)
+            if state["ready"]
+            else {
+                "code": "native_deadline_exceeded",
+                "stage": "service_properties",
+                "query_status": None,
+                "query_code": "timeout",
+                "used": int(argv[8]),
+            }
+        )
+        value.update(state.get("receipt_change", {}))
+        state["chunks"] = [json.dumps(value).encode(), b""]
+        return Process()
+
+    class Selector:
+        def __init__(self) -> None:
+            self.keys: dict[int, Any] = {}
+
+        def __enter__(self) -> Selector:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def register(self, fileobj: Pipe, events: int) -> Any:
+            assert fileobj is pipe and events == ci.selectors.EVENT_READ
+            key = ci.selectors.SelectorKey(fileobj, fileobj.fileno(), events, None)
+            self.keys[key.fd] = key
+            return key
+
+        def unregister(self, fileobj: Pipe) -> Any:
+            assert fileobj is pipe
+            return self.keys.pop(fileobj.fileno())
+
+        def get_map(self) -> dict[int, Any]:
+            return self.keys
+
+        def select(self, timeout: float) -> list[tuple[Any, int]]:
+            assert timeout > 0
+            end = state["clock"] + timeout
+            if state["publish_at"] > end:
+                state["clock"] = end
+                return []
+            state["clock"] = max(state["clock"], state["publish_at"])
+            return [(self.keys[pipe.fileno()], ci.selectors.EVENT_READ)]
+
+    def read(fd: int, limit: int) -> bytes:
+        assert fd == pipe.fileno()
+        data: bytes = state["chunks"].pop(0)
+        assert len(data) <= limit
+        return data
+
+    def blocking(fd: int, enabled: bool) -> None:
+        assert fd == pipe.fileno() and enabled is False
+
+    def kill(pid: int, sig: int) -> None:
+        assert pid == Process.pid and sig == ci.signal.SIGKILL
+        state["kills"].append(pid)
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        if argv[3:4] in (("manager-ready",), ("manager-idle",)):
+            state["parent_deadline"] = state["clock"] + seconds
+            return ci.command(argv, seconds=seconds)
+        return commands(argv, seconds=seconds)
+
+    monkeypatch.setattr(ci.subprocess, "Popen", popen)
+    monkeypatch.setattr(ci.selectors, "DefaultSelector", Selector)
+    monkeypatch.setattr(ci.os, "read", read)
+    monkeypatch.setattr(ci.os, "set_blocking", blocking)
+    monkeypatch.setattr(ci.os, "killpg", kill)
+    native.run = run
+    return state
+
+
+@pytest.mark.parametrize("execute_bound", [True, False])
+@pytest.mark.parametrize("mode", ["manager-idle", "manager-ready"])
+def test_manager_deadline_failure_can_return_inside_original_parent_budget(
+    manager_transport: dict[str, Any],
+    execute_bound: bool,
+    mode: str,
+) -> None:
+    state = manager_transport
+    native = state["native"]
+    if not execute_bound:
+        native.execute_deadline = None
+    expected_parent = 100.0 + (ci.HARNESS_SECONDS if execute_bound else ci.CLEANUP_SECONDS)
+    with pytest.raises(ci.FixtureError, match="^native_deadline_exceeded$"):
+        native.observe_manager(mode, started=99.0)
+    assert state["parent_deadline"] == expected_parent
+    assert state["worker_deadline"] == expected_parent - ci.CLEANUP_SECONDS / 2
+    assert state["worker_deadline"] < state["clock"] < expected_parent
+    value = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert value["resources"]["manager_failure"] == native.manager_failure
+    assert native.manager_failure["query_code"] == "timeout"
+    assert state["launched"] == 1 and state["closed"] and len(state["kills"]) == 1
+    assert not native.manager_readiness and 0 < native.setup_bytes <= ci.OUTPUT_BYTES
+
+
+def test_manager_same_deadline_control_loses_receipt_and_exhausts_unknown_allowance(
+    manager_transport: dict[str, Any],
+) -> None:
+    state = manager_transport
+    state["same_deadline"] = True  # The old contract cannot publish until parent expiry.
+    native = state["native"]
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.observe_manager("manager-ready", started=99.0)
+    assert native.setup_bytes == ci.OUTPUT_BYTES and not native.manager_failure
+    assert state["publish_at"] > state["parent_deadline"]
+    assert state["closed"] and len(state["kills"]) == 1
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.1])
+@pytest.mark.parametrize("mode", ["manager-idle", "manager-ready"])
+def test_manager_reply_window_never_accepts_a_success_receipt(
+    manager_transport: dict[str, Any],
+    offset: float,
+    mode: str,
+) -> None:
+    state = manager_transport
+    state.update(ready=True, offset=offset)
+    native = state["native"]
+    with pytest.raises(ci.FixtureError, match="^native_execute_deadline$"):
+        native.observe_manager(mode, started=99.0)
+    assert not native.manager_readiness and not native.manager_failure
+    assert state["closed"] and len(state["kills"]) == 1
+
+
+@pytest.mark.parametrize("mode", ["manager-idle", "manager-ready"])
+def test_manager_success_before_observation_deadline_still_requires_original_schema(
+    manager_transport: dict[str, Any],
+    mode: str,
+) -> None:
+    state = manager_transport
+    state.update(ready=True, offset=-0.1)
+    native = state["native"]
+    value = native.observe_manager(mode, started=99.0)
+    assert value["code"] == ("ready" if mode == "manager-ready" else "idle")
+    assert state["clock"] < state["worker_deadline"]
+    assert state["parent_deadline"] - state["worker_deadline"] == ci.CLEANUP_SECONDS / 2
+
+
+@pytest.mark.parametrize("offset", [ci.CLEANUP_SECONDS / 2, ci.CLEANUP_SECONDS])
+def test_manager_receipt_at_or_after_parent_deadline_is_not_reusable(
+    manager_transport: dict[str, Any],
+    offset: float,
+) -> None:
+    state = manager_transport
+    state["offset"] = offset
+    native = state["native"]
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.observe_manager("manager-ready", started=99.0)
+    assert native.setup_bytes == ci.OUTPUT_BYTES and not native.manager_failure
+    assert state["closed"] and len(state["kills"]) == 1
+
+
+def test_manager_observation_cannot_start_inside_reserved_reply_window(
+    manager_transport: dict[str, Any],
+) -> None:
+    state = manager_transport
+    native = state["native"]
+    native.execute_deadline = state["clock"] + ci.CLEANUP_SECONDS * 1.5
+    with pytest.raises(ci.FixtureError, match="^native_manager_observation_budget$"):
+        native.observe_manager("manager-ready", started=99.0)
+    assert state["launched"] == 0 and not native.manager_readiness
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"used": True},
+        {"query_status": True},
+        {"stage": "private"},
+        {"extra": "private"},
+    ],
+)
+def test_manager_failure_reply_window_keeps_original_strict_schema(
+    manager_transport: dict[str, Any],
+    change: dict[str, Any],
+) -> None:
+    state = manager_transport
+    state["receipt_change"] = change
+    native = state["native"]
+    with pytest.raises(ci.FixtureError, match="^native_manager_observation$"):
+        native.observe_manager("manager-ready", started=99.0)
+    assert native.setup_bytes == ci.OUTPUT_BYTES and not native.manager_failure
+    assert not native.manager_readiness
+
+
+def test_manager_failure_validation_cannot_overrun_parent_deadline(
+    manager_transport: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = manager_transport
+    native = state["native"]
+    original = ci.manager_failure_facts
+
+    def validate(value: dict[str, Any]) -> bool:
+        valid: bool = original(value)
+        state["clock"] = state["parent_deadline"]
+        return valid
+
+    monkeypatch.setattr(ci, "manager_failure_facts", validate)
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.observe_manager("manager-ready", started=99.0)
+    assert native.setup_bytes == ci.OUTPUT_BYTES and not native.manager_failure
+
+
+def test_manager_success_validation_must_finish_before_observation_deadline(
+    manager_transport: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = manager_transport
+    state.update(ready=True, offset=-0.1)
+    native = state["native"]
+    original = ci.re.fullmatch
+
+    def match(pattern: str, value: str, *args: Any, **kwargs: Any) -> Any:
+        result = original(pattern, value, *args, **kwargs)
+        if pattern == r"[a-f0-9]{32}":
+            state["clock"] = state["worker_deadline"]
+        return result
+
+    monkeypatch.setattr(ci.re, "fullmatch", match)
+    with pytest.raises(ci.FixtureError, match="^native_execute_deadline$"):
+        native.observe_manager("manager-ready", started=99.0)
+    assert not native.manager_readiness and not native.manager_failure
+
+
 def test_success_exports_only_finite_manager_readiness_metadata(
     fixture: tuple[Any, Commands],
 ) -> None:
