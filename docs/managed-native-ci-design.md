@@ -448,7 +448,7 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 
 本轮没有提高约88秒观察、2.5秒回执、5秒cleanup、32 KiB累计、1024字节最小回复预留或原资源限制。未重跑、改码、提交、推送或触发第十七轮；第十四/十五轮事实保留，458项本地纯fixture不能代替本轮真实失败边界。
 
-### 第十六轮后：专用 bootstrap target 对照（纯验证与独立后审通过，待根整合审查）
+### 第十六轮后：专用 bootstrap target 对照（本地整合通过，真实对照待验）
 
 固定 v255 有两条启动 READY 路径：`manager_check_finished()` 在已进入运行循环、非 reload 时，先检查 basic.target 是否 active/reloading，符合则调用 `user_manager_send_ready()`；即便 basic 不存在，只要 jobs 表为空，也调用 `manager_send_ready()`。初入 manager loop 和 job 完成后都会检查；后者在发送后才设置 FinishTimestamp、发布 startup-finished，不能把 startup-finished 当成另一条独立的前置 READY 条件。reload 结束亦复用这些检查，不是本次新进程的独立初始化成功证据。特别是 basic 路径即便 sd_notify 报错仍置 ready_sent，pending jobs 存在时不会再从该路径重发；随后 job-progress STATUS 可以覆盖文本，jobs 清空路径才有再发机会。这是代码支持的竞争假说，不是已证实本轮发生了发送错误。[v255 READY/finished](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L3426-L3523)、[初入循环](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L2955-L2963)、[job 完成重查](https://github.com/systemd/systemd/blob/v255/src/core/job.c#L947-L1009)。
 
@@ -471,6 +471,8 @@ cleanup 先按现有路径停止专用 manager 并核空组，再仅删除身份
 本片新增27个纯 case，最终 native481项与两个直接 OutputBudget 节点4项共 **485项通过**（pytest1.67秒、守卫2.260秒、峰值128.4 MiB/swap0）。真实受限 helper 在 pytest 临时目录运行，UID/属主/账户和系统命令均注入，无真实账户、服务或挂载。三Python文件 Ruff83毫秒/26.7 MiB、format-check83毫秒/23.6 MiB，两脚本 strict mypy525毫秒/165.5 MiB最终均exit0。首轮482绿3红分别暴露丢返回先解析空JSON而非固定拒绝标签、过量metadata标签断言、旧卷替换断言未涵盖新身份门的提前拒绝；已先检查非零返回再解析，并收窄相应拒绝断言，受影响5例通过后重新完成上述485项。首轮 mypy发现stat_result被赋None，改为显式Optional leaf变量后通过；该首轮峰值166.6 MiB为本片最高，全部swap0。所有检查逐条经主仓绝对路径30秒guard，实收终态才运行下一项，结束即归还共享槽。
 
 独立只读后审曾指出fake卸载后的可读路径不足以证明真实foreign现场保留；随后根批准采用上述非空树失败门，回归确认无revert/umount/账户删除而非假设fake与真实卸载等价。复审确认该门保存receipt后直抛，现有cleanup无finally绕行；路径身份、完整leaf读取、单ExecStart与Ex标志、原期限/字节未见剩余P1/P2。此处只记录静态后审和纯验证，不代替根整合审查或远端真实READY、三事务、正常cleanup验收；当前仍未提交、推送或发起第十七轮。
+
+根已签名保存本片 `2a5afda`，再签名合入2.42精确 `ed2b267`，避免重复已证实的独立回退重复哈希问题。合并后全仓Ruff、371文件format及native481项再次通过，pytest1.40秒、guard2.036秒、112.1MiB、swap0。首个两脚本类型命令遗漏源码搜索根，外部`muli`导入按Any产生八处返回诊断；使用明确`MYPYPATH=src`后strict mypy两文件通过，1.266秒、174.3MiB、swap0，未改源码或规则遮蔽。上述均30秒守卫实际exit0；下一次远端对照只允许该新受控初始target，不提高预算或把READY代替真实bus、三事务与cleanup。
 
 ## 第十五轮：新增投影返回有效事实，manager 仍未就绪
 
