@@ -126,5 +126,6 @@ jobs:
           tests/test_mcp_receive.py tests/test_mcp_receive_integration.py
           tests/test_mcp_receive_notifications.py tests/test_mcp_resources.py
           tests/test_mcp_resources_runtime.py tests/test_mcp_resources_sdk.py
+          tests/test_mcp_resource_files.py
           tests/test_mcp_prompts.py tests/test_mcp_prompts_runtime.py
           tests/test_mcp_prompts_sdk.py
