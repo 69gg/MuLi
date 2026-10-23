@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 
+class ProcessOutputLimitError(ValueError):
+    """The shared subprocess output byte allowance was exceeded."""
+
+
 @dataclass(slots=True)
 class _OutputBudget:
     limit: int
@@ -22,7 +26,7 @@ class _OutputBudget:
         # Both pipes share one counter; charging contains no scheduling point.
         self.used += len(data)
         if self.used > self.limit:
-            raise ValueError("命令输出超过限制，已停止")
+            raise ProcessOutputLimitError("命令输出超过限制，已停止")
 
 
 async def _wait_cleanup(task: asyncio.Task[None]) -> bool:

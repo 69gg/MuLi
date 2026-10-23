@@ -964,6 +964,8 @@ class _SetupIO:
     async def query(
         self, argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
     ) -> dict[str, Any]:
+        from muli.process import ProcessOutputLimitError
+
         require(argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command")
         self.facts["query_status"], self.facts["query_code"] = None, "not_started"
         if "manager_stage" in self.facts:
@@ -981,7 +983,9 @@ class _SetupIO:
                 [argv[0], "--system", *argv[2:]], timeout=timeout, limit=limit
             )
         except (OSError, ValueError) as error:
-            if isinstance(error, NativeError) and str(error) == "native_diagnostic_output_budget":
+            if isinstance(error, ProcessOutputLimitError) or (
+                isinstance(error, NativeError) and str(error) == "native_diagnostic_output_budget"
+            ):
                 self.facts["query_code"] = "output_budget"
             elif isinstance(error, NativeError) and str(error) == "native_diagnostic_invalid":
                 self.facts["query_code"] = "invalid_reply"

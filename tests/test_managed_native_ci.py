@@ -3497,6 +3497,39 @@ async def test_setup_command_accounts_for_unknown_or_both_returned_pipes(
         assert io.used == len(b"outerror")
 
 
+@pytest.mark.parametrize("kind", ["output_limit", "value", "os"])
+async def test_setup_query_classifies_output_limit_by_type_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    from muli import process
+
+    error = {
+        "output_limit": process.ProcessOutputLimitError("private sentinel"),
+        "value": ValueError("命令输出超过限制，已停止"),
+        "os": OSError("命令输出超过限制，已停止"),
+    }[kind]
+    calls = 0
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(process, "run_process", query)
+    facts: dict[str, Any] = {"manager_stage": "list_units"}
+    io = worker._SetupIO(worker.time.monotonic() + worker.CLEANUP_SECONDS, worker.MAX_BYTES, facts)
+    with pytest.raises(type(error)) as caught:
+        await io.query(
+            ["busctl", "--user", "ListUnitsByPatterns"], timeout=5, limit=100, merge_stderr=False
+        )
+    assert caught.value is error and calls == 1
+    assert io.used == io.limit and facts["query_status"] is None
+    assert facts["query_code"] == ("output_budget" if kind == "output_limit" else "command_failed")
+
+
 def test_manager_failure_saved_before_optional_diagnostic_or_write_failure(
     fixture: tuple[Any, Commands],
     monkeypatch: pytest.MonkeyPatch,

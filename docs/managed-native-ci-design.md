@@ -304,4 +304,26 @@ worker 的已消费/保守预留额度 `used` 与回包字节共同计入原累�
 
 根整合作者签名 `fd962c4e0c27648c5a68a95ba3739e4a4f345222` 与已正式发布的 2.38 精确源码及发行证据，签名合并为 `498a5cf`；自动合并保留 MCP 附件 extras 用例和原生 job。根在整合树独立重跑最终完整文件，**325项全部通过**（pytest 0.99秒、guard 1.652秒、峰值94.1 MiB/swap 0），全部为纯替身，没有本机真实native/CLI/服务。这个结果只补齐最终整合文件证据，仍不改写前十轮0事务、正常清理未通过的事实；后续远端候选单独记录。
 
+## 第十一轮 native 有限失败取证（最终十绿一原生红）
+
+精确候选 `be918e519dee9b2fe884629af5ba7cbb7b3c42fb` 的 [run 39976924194](https://github.com/69gg/MuLi/actions/runs/39976924194)、[native job 120493828204](https://github.com/69gg/MuLi/actions/runs/39976924194/job/120493828204) 已失败，job于2026-10-23 23:17:02开始、23:18:30结束（Asia/Shanghai）。本次只查该job及一次artifact列表，不查询或等待其余矩阵终态。有限日志 `/tmp/muli-native-39976924194-120493828204.log` 先于23:18:21报 `native_manager_observation`，always cleanup于23:18:26报 `native_cleanup_deadline`，两步均非零；约73秒仍包括准备与观察，不能当manager自身等待或systemd startup timeout。
+
+仅下载确认1057字节的 [managed-native-evidence 12511048578](https://github.com/69gg/MuLi/actions/runs/39976924194/artifacts/12511048578)，没有下载4885003字节的package。zip SHA256 `2a4197703296e5a97e60054e2bb5f3daf250fac0d86e01b8749a440bd4d2f37a` 与上传日志一致；guard先核两个entry数量、名字、类型及大小后，只读receipt1152字节/result680字节JSON，无解压写盘或执行，88毫秒/15.9 MiB/swap 0，完成归还。
+
+- receipt：UID999/GID987，user_created=true、manager_show_before，环境文件已确认、manager_group为空；三个挂载仍记录，user_removed=false/group_removed=false。
+- 新manager_failure：`code=native_manager_observation/stage=service_properties/query_status=null/query_code=command_failed/used=31665`。它定位到Service属性读取路径，但没有可用退出状态；used含未知返回时保守占满的额度，不证明实际输出31665字节。后备setup为diagnostic_status=null、diagnostic_code=output_budget，其余观察not_started，原失败摘要已保留。
+- result仍completed=false/manager_setup/setup_failed，timeline/generations为空，**0事务**，无manager_readiness；正常清理仍未通过，不能宣称账户、组或挂载已回收。原前十轮历史保持；新摘要改善定位，不足以确定输出上限、其他ValueError或OSError中的具体根因。
+
+根随后一次查实该精确run已全终态，十项success、managed-native为唯一failure。本片不再查询或等待全run，不盲目重跑第十一轮。
+
+## 显式进程输出上限异常（仅失败分类）
+
+沿用 `_OutputBudget.charge` 原有计数、边界与错误消息，仅把输出超过限制时的异常窄化为 `ProcessOutputLimitError(ValueError)`。已有捕获ValueError的调用方保持兼容，run_process的启动、双pipe共享预算、取消、reap与返回字段均不改。native `_SetupIO.query` 只按该类型记录output_budget；同文本的普通ValueError及OSError仍为command_failed，不解析异常正文。未知返回仍耗尽原授予额度并原样raise，不新增查询、配置、字段或预算，不修改95秒/5秒期限及ready/cleanup门。
+
+这只是让未来同路径失败可区分输出上限类别，不能据第十一轮旧generic摘要倒推它已触及输出预算，更不声称修复服务、预算根因或正常清理。
+
+新增7项纯case：直接预算单块/累计超过原边界、精确边界通过、旧消息与ValueError捕获兼容；fake run_process分别抛新类型、同消息普通ValueError及OSError，核原异常同对象传播、单次调用、unknown额度全部耗尽及仅新类型标output_budget。一次完整相关纯组 **332项通过**（完整native文件328项加直接预算4项），pytest1.19秒、guard1.812秒、峰值106.5 MiB/swap 0。process与worker及两测试文件Ruff/format通过，process与worker strict mypy通过、峰值169.8 MiB/swap 0。全部经绝对路径共享guard、每条30秒严格串行至真实exit_code；没有未收session或真实子进程/native/CLI/账户/挂载/服务，未运行process测试文件内既有真实子进程用例。检查完成即归还guard，不再追加实验。
+
+独立只读后审已核对ValueError继承兼容、原文本、类型分类、取消及未知额度合同和第十一轮证据边界，未发现确定P1/P2。审查没有运行检查或修改文件，完成即停止。
+
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
