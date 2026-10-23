@@ -164,7 +164,9 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                     or store.read_slot(binding.installation) != slot
                 ):
                     raise ObservationError("managed_slot_changed")
-        if role is not None:
+        # verify_anchor authenticated the controller in this synchronous check.
+        # Equal frozen installations share that proof only until this call returns.
+        if role is not None and self.slots[role] != self.controller_slot:
             verify_slot_files(self.slots[role])
 
     def _effect_guard(self, record: TransactionRecordV2, role: Role | None) -> None:

@@ -43,6 +43,16 @@
 
 首次误用 `--no-build-isolation`，此 worktree 解释器没有 hatchling，未构建；随后两项依赖构件的检查因目录为空失败，不计为验证通过。改用仓库既有 `uv build --offline` 与缓存的隔离构建环境，wheel/sdist 成功，1.293秒、100.3 MiB；未安装或下载新依赖。随后仅在临时目录 offline/no-deps 安装本地单wheel，源码目录外导入、兼容声明、静态资源/API/提示词/桌面默认关闭及任务控制/lifespan冒烟通过，1.256秒、98.8 MiB；发行版本/声明/changelog/两包一致校验168毫秒、19.6 MiB通过。全部守卫实际退出0、swap0。之后的依赖检查以构建成功为前提逐项进行，不将空构件检查或本地构建当成远端发行完成。
 
+## 首轮候选与回退核验修正
+
+PR49 的精确签名 `c1f8bbec7df001ea84fc6a4e4095bdb9261ab6d6`，候选 run `40009696868` 十项九成功一失败；唯一失败为 Ubuntu Python 3.13 shard 2 `120606586618` 的原 20 秒真实 CLI 回退案例。控制器在19,810毫秒完成 resolved，持久状态 rolled_back/released，最后健康读取超时，不能因状态已落盘而计为验收通过。该轮两个 Windows、macOS、其余 Linux、quality 与 MCP 均成功；失败记录保留，不盲重跑。
+
+旧日志表明 controller/selected 文件核验占 `_check` 累计壁钟约95%；base 与 controller 相同的回退步骤重复核验累计约3.077秒。这是旧分项数据，不是新实现节省时间的实测。最小修正仅在一次同步 `_check`、完整 `SlotIdentity` 相等时复用刚完成的 controller 证明，不跨调用缓存，不按共同解释器合并，不删除效果前/await 后 guard，也不提高任何期限。实现者与另一 Sol 分别复审，未发现 P1/P2，细节及红绿记录见[计时记录](managed-recovery-timing-design.md)。
+
+根随后在原期限内检查完整 `test_managed_backend.py` 与 `test_managed_process_recovery.py`，**66 passed**，pytest59.71秒、guard60.386秒、214.2MiB、swap0、实际exit0。包含真实 CLI 子进程、临时数据库、合成 manager 的切换与 target 拒绝回退，不操作用户真实服务。旧三例1红2绿与修正后14项定向结果不与该集合累加。构件重新构建及下一精确候选仍须完成；本地通过不证明远端性能收益或原生 systemd 三事务成功。
+
+修正生产后重新离线构建 `/tmp/muli-v242-fixed-dist` 的 wheel/sdist，1.297秒、96.2MiB；临时 offline/no-deps 安装及源码外生命周期冒烟1.221秒、98.4MiB；版本/声明/changelog/两包校验175毫秒、19.9MiB。全仓 Ruff、368文件格式、146生产源 strict mypy 再次通过。每条均单独30秒守卫、实际exit0、swap0，不增加依赖或下载；下一精确候选仍未验收。
+
 ## Windows 首请求诊断
 
 独立后续调查确认 2.41 失败只有 utility_ready，下一段先读取 stdin 完整行、解码 JSON 并校验信封，之后才是 probe_received 和 UIA 初始化；没有 COM 或程序集卡住的证据。本片仅补 input_waiting、input_line_received、request_decoded 三个首请求一次性固定点，不加入时间代理、重试、预热、额外 reader 或新的期限。
