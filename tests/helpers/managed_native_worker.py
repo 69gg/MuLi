@@ -39,6 +39,7 @@ HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 PROCESS_STATES = frozenset("RSDZTtXxKWPI")
 SYSTEM_EXECUTABLE_ROOTS = (Path("/usr/lib/systemd"), Path("/lib/systemd"))
+BOOTSTRAP_PARENT = Path("/tmp")
 JOURNAL_EVENTS = 32
 # Fixed v255 sd-messages.h IDs describe jobs, except USER_STARTUP_FINISHED.
 JOURNAL_MESSAGES = {
@@ -433,6 +434,315 @@ def system_executables() -> dict[str, str]:
             except OSError:
                 continue
     return result
+
+
+def bootstrap_data() -> bytes:
+    return (
+        b"[Unit]\nDescription=MuLi native bootstrap\nDefaultDependencies=no\n"
+        b"Requires=basic.target dbus.socket\nAfter=basic.target dbus.socket\n"
+    )
+
+
+def bootstrap_files(
+    mode: str, user: str, uid: int, gid: int, manifest: str, deadline: float, limit: int
+) -> dict[str, Any]:
+    """Operate only on this receipt's fixed tree through pinned directory descriptors."""
+    import pwd
+
+    from muli.platforms.linux_transaction import _read_regular
+
+    used = 0
+    handles: list[int] = []
+    try:
+        require(mode in {"create", "check", "remove"}, "native_bootstrap_arguments")
+        require(
+            os.geteuid() == 0 and 0 < uid < 2**31 and 0 < gid < 2**31, "native_bootstrap_identity"
+        )
+        require(
+            re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None, "native_bootstrap_identity"
+        )
+        account = pwd.getpwnam(user)
+        # The caller cannot supply a path, a unit name or file contents to this root mode.
+        volume = BOOTSTRAP_PARENT / f"muli-managed-native-ci-{user}"
+        require(
+            (account.pw_uid, account.pw_gid, account.pw_dir) == (uid, gid, str(volume / "home")),
+            "native_bootstrap_identity",
+        )
+        require(
+            math.isfinite(deadline) and remaining(deadline) <= HARNESS_SECONDS + CLEANUP_SECONDS,
+            "native_bootstrap_deadline",
+        )
+        require(type(limit) is int and 0 < limit <= MAX_BYTES, "native_diagnostic_output_budget")
+
+        def charge(data: bytes) -> None:
+            nonlocal used
+            used += len(data)
+            require(used <= limit, "native_diagnostic_output_budget")
+            remaining(deadline)
+
+        charge(manifest.encode())
+        value = json.loads(manifest)
+        require(
+            isinstance(value, dict) and set(value) == {"directories", "file"},
+            "native_bootstrap_invalid",
+        )
+        directories, identity = value["directories"], value["file"]
+
+        def pair(item: object) -> bool:
+            return (
+                isinstance(item, list)
+                and len(item) == 2
+                and all(type(part) is int and 0 <= part < 2**64 for part in item)
+            )
+
+        require(
+            isinstance(directories, list)
+            and 2 <= len(directories) <= 5
+            and all(pair(item) for item in directories)
+            and (identity is None or (pair(identity) and len(directories) == 5)),
+            "native_bootstrap_invalid",
+        )
+        require(
+            mode != "create" or (len(directories) == 2 and identity is None),
+            "native_bootstrap_invalid",
+        )
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        handles.append(os.open(volume, flags))
+        names = ("home", ".config", "systemd", "user")
+
+        def check_directory(index: int) -> None:
+            info = os.fstat(handles[index])
+            require(
+                stat.S_ISDIR(info.st_mode)
+                and stat.S_IMODE(info.st_mode) == 0o700
+                and (info.st_uid, info.st_gid) == (uid, gid)
+                and [info.st_dev, info.st_ino] == directories[index],
+                "native_bootstrap_changed",
+            )
+            if index:
+                linked = os.stat(names[index - 1], dir_fd=handles[index - 1], follow_symlinks=False)
+            else:
+                linked = os.stat(volume, follow_symlinks=False)
+            require(
+                (linked.st_dev, linked.st_ino, linked.st_mode, linked.st_uid, linked.st_gid)
+                == (info.st_dev, info.st_ino, info.st_mode, uid, gid),
+                "native_bootstrap_changed",
+            )
+
+        check_directory(0)
+        for index, name in enumerate(names, 1):
+            remaining(deadline)
+            if mode == "create" and index >= 2:
+                os.mkdir(name, mode=0o700, dir_fd=handles[-1])  # No exist_ok/adoption.
+                descriptor = os.open(name, flags, dir_fd=handles[-1])
+                handles.append(descriptor)
+                os.fchmod(descriptor, 0o700)
+                os.fchown(descriptor, uid, gid)
+                info = os.fstat(descriptor)
+                directories.append([info.st_dev, info.st_ino])
+            else:
+                try:
+                    descriptor = os.open(name, flags, dir_fd=handles[-1])
+                except FileNotFoundError:
+                    require(
+                        mode == "remove" and identity is not None and index >= 2,
+                        "native_bootstrap_unconfirmed",
+                    )
+                    directories = directories[:index]
+                    break  # A previous remove may have finished before its reply was lost.
+                handles.append(descriptor)
+                require(index < len(directories), "native_bootstrap_unconfirmed")
+            check_directory(index)
+            if mode != "create" and index + 1 == len(directories) and index < 4:
+                try:
+                    os.stat(names[index], dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    break
+                raise NativeError("native_bootstrap_unconfirmed")
+        name = user + ".target"
+        if len(handles) == 5:
+            if mode == "create":
+                data = bootstrap_data()
+                charge(data)
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o644,
+                    dir_fd=handles[-1],
+                )
+                with os.fdopen(descriptor, "wb") as output:
+                    os.fchmod(output.fileno(), 0o644)
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    info = os.fstat(output.fileno())
+                    identity = [info.st_dev, info.st_ino]
+            leaf: os.stat_result | None
+            try:
+                leaf = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
+            except FileNotFoundError:
+                require(mode == "remove" or identity is None, "native_bootstrap_changed")
+                leaf = None
+            if leaf is not None:
+                require(
+                    identity is not None
+                    and [leaf.st_dev, leaf.st_ino] == identity
+                    and stat.S_ISREG(leaf.st_mode)
+                    and stat.S_IMODE(leaf.st_mode) == 0o644
+                    and (leaf.st_uid, leaf.st_gid) == (0, 0),
+                    "native_bootstrap_changed",
+                )
+                data = _read_regular(Path(name), limit - used, directory_fd=handles[-1])
+                charge(data)
+                require(data == bootstrap_data(), "native_bootstrap_changed")
+                linked = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
+                require(
+                    all(
+                        getattr(linked, key) == getattr(leaf, key)
+                        for key in (
+                            "st_dev",
+                            "st_ino",
+                            "st_mode",
+                            "st_uid",
+                            "st_gid",
+                            "st_size",
+                            "st_mtime_ns",
+                            "st_ctime_ns",
+                        )
+                    ),
+                    "native_bootstrap_changed",
+                )
+            for index in range(len(handles)):
+                check_directory(index)
+            if mode == "remove":
+                if leaf is not None:
+                    remaining(deadline)
+                    os.unlink(name, dir_fd=handles[-1])
+                identity = None
+        if mode == "remove":
+            for index in range(len(handles) - 1, 1, -1):
+                remaining(deadline)
+                check_directory(index)
+                with os.scandir(handles[index]) as entries:
+                    if next(entries, None) is not None:
+                        break  # Retain nonempty directories; never remove other entries.
+                os.rmdir(names[index - 1], dir_fd=handles[index - 1])
+                directories.pop()
+            identity = None
+        for index in range(len(directories)):
+            check_directory(index)
+        account = pwd.getpwnam(user)
+        require(
+            (account.pw_uid, account.pw_gid, account.pw_dir) == (uid, gid, str(volume / "home")),
+            "native_bootstrap_identity",
+        )
+        remaining(deadline)
+        return {"code": "verified", "directories": directories, "file": identity, "used": used}
+    except Exception as error:
+        code = str(error) if isinstance(error, NativeError) else "native_bootstrap_invalid"
+        return {"code": code, "used": limit}
+    finally:
+        for descriptor in reversed(handles):
+            os.close(descriptor)
+
+
+async def manager_template(
+    user: str, uid: int, home: Path, deadline: float, limit: int
+) -> dict[str, Any]:
+    """Check the idle instance's typed command before any instance ExecStart override."""
+    import pwd
+
+    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe, _typed
+
+    require(re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None, "native_manager_identity")
+    account = pwd.getpwnam(user)
+    require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_manager_identity")
+    require(
+        math.isfinite(deadline) and remaining(deadline) <= HARNESS_SECONDS + CLEANUP_SECONDS,
+        "native_manager_deadline",
+    )
+    io = _SetupIO(deadline, limit, {})
+    try:
+        async with asyncio.timeout(remaining(deadline)):
+            probe = SystemdProbe(
+                runner=io.query,
+                limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+            )
+            name = f"user@{uid}.service"
+            # Load only metadata for the already-confirmed idle instance. No StartUnit/activation.
+            loaded = _typed(
+                await probe._command(
+                    "call",
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                    "LoadUnit",
+                    "s",
+                    name,
+                ),
+                "o",
+            )
+            require(
+                isinstance(loaded, list) and len(loaded) == 1 and isinstance(loaded[0], str),
+                "native_manager_template",
+            )
+            path = loaded[0]
+            require(
+                re.fullmatch(r"/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+", path) is not None,
+                "native_manager_template",
+            )
+            before = await probe._properties(
+                path,
+                "Unit",
+                (("Id", "s"), ("ActiveState", "s"), ("SubState", "s"), ("Job", "(uo)")),
+            )
+            fields = (
+                ("MainPID", "u"),
+                ("ExecStart", "a(sasbttttuii)"),
+                ("ExecStartEx", "a(sasasttttuii)"),
+            )
+            service = await probe._properties(path, "Service", fields)
+            entries = service["ExecStart"]
+            program = system_executables().get("manager")
+            if program is None:
+                raise NativeError("native_manager_template")
+            require(
+                isinstance(entries, list)
+                and len(entries) == 1
+                and isinstance(entries[0], list)
+                and len(entries[0]) == 10,
+                "native_manager_template",
+            )
+            entry = entries[0]
+            extended = service["ExecStartEx"]
+            require(
+                isinstance(entry[0], str)
+                and Path(entry[0]).resolve(strict=True) == Path(program)
+                and entry[1] == [entry[0], "--user"]
+                and entry[2] is False
+                and all(type(value) is int and 0 <= value < 2**64 for value in entry[3:7])
+                and type(entry[7]) is int
+                and 0 <= entry[7] < 2**32
+                and all(type(value) is int and -(2**31) <= value < 2**31 for value in entry[8:])
+                and extended == [[entry[0], entry[1], [], *entry[3:]]]
+                and service["MainPID"] == 0
+                and before
+                == {"Id": name, "ActiveState": "inactive", "SubState": "dead", "Job": [0, "/"]}
+                and await probe._properties(
+                    path,
+                    "Unit",
+                    (("Id", "s"), ("ActiveState", "s"), ("SubState", "s"), ("Job", "(uo)")),
+                )
+                == before
+                and await probe._properties(path, "Service", fields) == service,
+                "native_manager_template",
+            )
+            remaining(deadline)
+            account = pwd.getpwnam(user)
+            require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_manager_identity")
+            return {"code": "verified", "manager": program, "used": io.used}
+    except (Exception, asyncio.CancelledError):
+        return {"code": "native_manager_template", "used": io.limit}
 
 
 def process_unavailable(code: str = "not_started") -> dict[str, Any]:
@@ -2599,6 +2909,36 @@ async def run(mode: str, root: Path) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 9 and sys.argv[1] == "bootstrap-files":
+        try:
+            value = bootstrap_files(
+                sys.argv[2],
+                sys.argv[3],
+                int(sys.argv[4]),
+                int(sys.argv[5]),
+                sys.argv[6],
+                float(sys.argv[7]),
+                int(sys.argv[8]),
+            )
+        except Exception:
+            value = {"code": "native_bootstrap_invalid", "used": MAX_BYTES}
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
+    if len(sys.argv) == 7 and sys.argv[1] == "manager-template":
+        try:
+            value = asyncio.run(
+                manager_template(
+                    sys.argv[2],
+                    int(sys.argv[3]),
+                    Path(sys.argv[4]),
+                    float(sys.argv[5]),
+                    int(sys.argv[6]),
+                )
+            )
+        except Exception:
+            value = {"code": "native_manager_template", "used": MAX_BYTES}
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
     if len(sys.argv) == 8 and sys.argv[1] == "project-setup-context":
         # Never print exception text (which might contain untrusted environment data).
         try:

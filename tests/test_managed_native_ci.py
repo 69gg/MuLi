@@ -8,8 +8,10 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, NoReturn
 
 import pytest
@@ -60,6 +62,7 @@ class Commands:
         self.fail_cleanup = False
         self.fail_unmount = False
         self.fail_case = False
+        self.bootstrap: Callable[..., dict[str, Any]]
         self.auto_group = False
         self.uid = 23145
         self.group = f"/user.slice/user-{self.uid}.slice/user@{self.uid}.service"
@@ -98,6 +101,25 @@ class Commands:
         self.calls.append(values)
         if values[-1] == "describe":
             return ci.Reply(0, json.dumps(self.description).encode())
+        if len(values) == 9 and values[3] == "manager-template":
+            return ci.Reply(
+                0,
+                json.dumps(
+                    {"code": "verified", "used": 128, "manager": "/usr/lib/systemd/systemd"}
+                ).encode(),
+            )
+        if len(values) == 14 and values[6] == "bootstrap-files":
+            assert values[:5] == ("sudo", "--non-interactive", "--", sys.executable, "-I")
+            value = self.bootstrap(
+                values[7],
+                values[8],
+                int(values[9]),
+                int(values[10]),
+                values[11],
+                float(values[12]),
+                int(values[13]),
+            )
+            return ci.Reply(0, json.dumps(value).encode())
         if len(values) in {9, 11} and values[3] in {"manager-idle", "manager-ready"}:
             assert values[:2] == (sys.executable, "-I")
             assert values[4:7] == (
@@ -295,6 +317,43 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Comma
     monkeypatch.setattr(ci, "MANAGER_RUNTIME", commands.manager_runtime)
     monkeypatch.setattr(ci, "MANAGER_CONTROL_RUNTIME", commands.manager_control_runtime)
     monkeypatch.setattr(ci, "MANAGER_UNIT_ROOTS", commands.manager_unit_roots)
+
+    def bootstrap(
+        mode: str, user: str, uid: int, gid: int, manifest: str, deadline: float, limit: int
+    ) -> dict[str, Any]:
+        import pwd
+
+        original_stat, original_fstat = os.stat, os.fstat
+
+        def virtual_owner(info: os.stat_result) -> os.stat_result:
+            values = list(info)
+            values[4:6] = [uid, gid] if stat.S_ISDIR(info.st_mode) else [0, 0]
+            return os.stat_result(values)
+
+        def virtual_stat(*args: Any, **kwargs: Any) -> os.stat_result:
+            return virtual_owner(original_stat(*args, **kwargs))
+
+        def virtual_fstat(fd: int) -> os.stat_result:
+            return virtual_owner(original_fstat(fd))
+
+        with monkeypatch.context() as context:
+            context.setattr(worker, "BOOTSTRAP_PARENT", temporary)
+            context.setattr(
+                pwd,
+                "getpwnam",
+                lambda name: SimpleNamespace(
+                    pw_uid=commands.accounts[name][0],
+                    pw_gid=commands.accounts[name][1],
+                    pw_dir=commands.accounts[name][2],
+                ),
+            )
+            context.setattr(os, "geteuid", lambda: 0)
+            context.setattr(os, "fchown", lambda *args: None)
+            context.setattr(os, "stat", virtual_stat)
+            context.setattr(os, "fstat", virtual_fstat)
+            return worker.bootstrap_files(mode, user, uid, gid, manifest, deadline, limit)
+
+    commands.bootstrap = bootstrap
     return ci.NativeCI(tmp_path / ci.ROOT_NAME, run=commands), commands
 
 
@@ -306,6 +365,301 @@ def private_environment(monkeypatch: pytest.MonkeyPatch, root: Path, uid: int) -
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
     }.items():
         monkeypatch.setenv(key, value)
+
+
+def test_bootstrap_target_is_owned_and_verified_before_manager_start(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = ci.Receipt.read(native.receipt_path)
+    target = native.home / ".config/systemd/user" / (receipt.user + ".target")
+    assert target.read_bytes() == worker.bootstrap_data()
+    assert target.read_text().splitlines() == [
+        "[Unit]",
+        "Description=MuLi native bootstrap",
+        "DefaultDependencies=no",
+        "Requires=basic.target dbus.socket",
+        "After=basic.target dbus.socket",
+    ]
+    assert len(receipt.bootstrap_directories) == 5 and receipt.bootstrap_file is not None
+    for path in (target.parent, target.parent.parent, target.parent.parent.parent):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    created = next(i for i, args in enumerate(commands.calls) if "bootstrap-files" in args)
+    template = next(i for i, args in enumerate(commands.calls) if "manager-template" in args)
+    started = next(i for i, args in enumerate(commands.calls) if "start" in args)
+    assert created < template < started
+    assert sum("bootstrap-files" in args and "check" in args for args in commands.calls) == 2
+    ci.NativeCI(native.root, run=commands).cleanup()
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert not target.parent.parent.parent.exists()
+    assert receipt.bootstrap_directories == [] and receipt.bootstrap_file is None
+
+
+@pytest.mark.parametrize("change", ["content", "file", "directory", "symlink"])
+def test_bootstrap_changed_identity_or_content_is_preserved(
+    fixture: tuple[Any, Commands],
+    change: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    target = native.home / ".config/systemd/user" / (native.receipt.user + ".target")
+    if change == "content":
+        target.write_bytes(b"unrelated content")
+    elif change == "file":
+        target.rename(target.with_suffix(".saved"))
+        target.write_bytes(worker.bootstrap_data())
+    else:
+        target.parent.rename(target.parent.with_name("saved"))
+        if change == "symlink":
+            target.parent.symlink_to("saved", target_is_directory=True)
+        else:
+            target.parent.mkdir(mode=0o700)
+            target.write_bytes(worker.bootstrap_data())
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        native.bootstrap_files("check")
+    assert target.exists()
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert target.exists() and commands.accounts and commands.mounts
+    assert not any("revert" in args for args in commands.calls)
+
+
+def test_bootstrap_cleanup_retains_foreign_entries_and_their_directories(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    target = native.home / ".config/systemd/user" / (native.receipt.user + ".target")
+    foreign = target.with_name("foreign.service")
+    foreign.write_bytes(b"unrelated")
+    with pytest.raises(ci.FixtureError, match="bootstrap_not_empty"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert not target.exists() and foreign.read_bytes() == b"unrelated"
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert len(receipt.bootstrap_directories) == 5 and receipt.bootstrap_file is None
+    assert commands.accounts and commands.mounts
+    assert not any("revert" in args or "umount" in args for args in commands.calls)
+
+
+def test_bootstrap_create_lost_reply_never_adopts_or_removes_unconfirmed_tree(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+
+    def lost(argv: Any, *, seconds: float = 5) -> Any:
+        reply = commands(argv, seconds=seconds)
+        return ci.Reply(1) if "bootstrap-files" in argv and "create" in argv else reply
+
+    native.run = lost
+    with pytest.raises(ci.FixtureError, match="bootstrap_invalid"):
+        native.prepare()
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert len(receipt.bootstrap_directories) == 2 and receipt.bootstrap_file is None
+    target = native.home / ".config/systemd/user" / (receipt.user + ".target")
+    assert target.read_bytes() == worker.bootstrap_data()
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert target.exists() and commands.accounts and commands.mounts
+
+
+@pytest.mark.parametrize("failure", ["budget", "deadline", "schema"])
+def test_bootstrap_fixed_helper_rejects_without_deleting(
+    fixture: tuple[Any, Commands],
+    failure: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = native.receipt
+    manifest = json.dumps(
+        {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file}
+    )
+    if failure == "schema":
+        manifest = json.dumps(
+            {
+                "directories": receipt.bootstrap_directories,
+                "file": receipt.bootstrap_file,
+                "path": "/must-not-be-used",
+            }
+        )
+    value = commands.bootstrap(
+        "remove",
+        receipt.user,
+        receipt.uid,
+        receipt.gid,
+        manifest,
+        worker.time.monotonic() + (-1 if failure == "deadline" else 5),
+        1 if failure == "budget" else worker.MAX_BYTES,
+    )
+    assert value["code"] != "verified" and "directories" not in value
+    assert (native.home / ".config/systemd/user" / (receipt.user + ".target")).exists()
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "flags", "argv", "multiple", "active", "drift", "budget", "deadline"]
+)
+async def test_manager_template_is_typed_idle_single_unmodified_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    import pwd
+
+    from muli import process
+
+    user, uid = "muli-ci-" + "a" * 12, 23145
+    home = tmp_path / "home"
+    image = tmp_path / "systemd"
+    image.write_bytes(b"not executable")
+    monkeypatch.setattr(pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+    monkeypatch.setattr(worker, "system_executables", lambda: {"manager": str(image)})
+    entry = [str(image), [str(image), "--user"], False, 1, 2, 3, 4, 5, 0, 0]
+    extended = [entry[0], entry[1], [], *entry[3:]]
+    if change == "flags":
+        extended[2] = ["privileged"]
+    if change == "argv":
+        entry[1] = [str(image), "--user", "--unit=foreign.target"]
+        extended[1] = entry[1]
+    fields: dict[str, tuple[str, Any]] = {
+        "Id": ("s", f"user@{uid}.service"),
+        "ActiveState": ("s", "active" if change == "active" else "inactive"),
+        "SubState": ("s", "dead"),
+        "Job": ("(uo)", [0, "/"]),
+        "MainPID": ("u", 0),
+        "ExecStart": ("a(sasbttttuii)", [entry] * (2 if change == "multiple" else 1)),
+        "ExecStartEx": ("a(sasasttttuii)", [extended]),
+    }
+    seen: list[list[str]] = []
+    charged = 0
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        nonlocal charged
+        seen.append(argv)
+        assert argv[:2] == ["busctl", "--system"] and not merge_stderr
+        assert "--auto-start=no" in argv and 0 < timeout <= 5
+        if change == "budget":
+            return {"exit_code": 0, "output": "x" * (limit + 1), "stderr": ""}
+        if "call" in argv:
+            assert argv[-3:] == ["LoadUnit", "s", f"user@{uid}.service"]
+            data = {"type": "o", "data": ["/org/freedesktop/systemd1/unit/fixture"]}
+            output = json.dumps(data)
+        else:
+            names = argv[argv.index("get-property") + 4 :]
+            if change == "drift" and len(seen) > 3:
+                fields["Job"] = ("(uo)", [1, "/job"])
+            output = "\n".join(
+                json.dumps({"type": fields[name][0], "data": fields[name][1]}) for name in names
+            )
+        charged += len(output.encode()) + len(b"bounded diagnostic")
+        return {"exit_code": 0, "output": output, "stderr": "bounded diagnostic"}
+
+    monkeypatch.setattr(process, "run_process", query)
+    deadline = worker.time.monotonic() + (-1 if change == "deadline" else 5)
+    if change == "deadline":
+        with pytest.raises(worker.NativeError, match="deadline"):
+            await worker.manager_template(user, uid, home, deadline, worker.MAX_BYTES)
+        assert not seen
+    else:
+        value = await worker.manager_template(user, uid, home, deadline, worker.MAX_BYTES)
+        if change == "none":
+            assert value == {"code": "verified", "manager": str(image), "used": charged}
+            assert len(seen) == 5
+        else:
+            assert value == {"code": "native_manager_template", "used": worker.MAX_BYTES}
+        assert not any("StartUnit" in args or "systemctl" in args for args in seen)
+
+
+@pytest.mark.parametrize("change", ["reply", "local-deadline", "outer-budget"])
+def test_bootstrap_coordinator_never_accepts_invalid_or_late_reply(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    old = native.receipt.bootstrap_file
+    clock = worker.time.monotonic()
+
+    def invalid(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal clock
+        reply = commands(argv, seconds=seconds)
+        value = json.loads(reply.output)
+        if change == "reply":
+            value["directories"] = [[True, 1]] * 5
+        elif change == "local-deadline":
+            clock += 5
+        else:
+            value["padding"] = "x" * ci.OUTPUT_BYTES
+        return ci.Reply(0, json.dumps(value).encode())
+
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
+    native.run = invalid
+    with pytest.raises(
+        ci.FixtureError, match="bootstrap_invalid|bootstrap_deadline|metadata_budget|output_budget"
+    ):
+        native.bootstrap_files("check")
+    assert native.receipt.bootstrap_file == old
+    assert (native.home / ".config/systemd/user" / (native.receipt.user + ".target")).exists()
+
+
+def test_bootstrap_low_remaining_allowance_never_calls_helper(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    commands.calls.clear()
+    native.setup_bytes = ci.OUTPUT_BYTES - 1024
+    with pytest.raises(ci.FixtureError, match="output_budget"):
+        native.bootstrap_files("check")
+    assert commands.calls == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("manager_program", "/tmp/../systemd"),
+        ("bootstrap_directories", [[True, 1], [2, 3]]),
+        ("bootstrap_directories", [[1, 2]]),
+        ("bootstrap_file", [True, 1]),
+    ],
+)
+def test_bootstrap_receipt_rejects_unbounded_or_ambiguous_metadata(
+    fixture: tuple[Any, Commands],
+    field: str,
+    value: object,
+) -> None:
+    native, _ = fixture
+    native.prepare()
+    values = asdict(native.receipt)
+    values[field] = value
+    ci.write_json(native.receipt_path, values)
+    with pytest.raises(ci.FixtureError, match="receipt_invalid"):
+        ci.Receipt.read(native.receipt_path)
+
+
+def test_bootstrap_parent_replacement_during_read_is_rejected(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from muli.platforms import linux_transaction
+
+    native, _ = fixture
+    native.prepare()
+    original = linux_transaction._read_regular
+    directory = native.home / ".config/systemd/user"
+
+    def read(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        value = original(path, limit, directory_fd=directory_fd)
+        directory.rename(directory.with_name("saved"))
+        directory.mkdir(mode=0o700)
+        return value
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", read)
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        native.bootstrap_files("check")
+    assert (directory.with_name("saved") / (native.receipt.user + ".target")).exists()
 
 
 def test_private_manager_environment_is_confirmed_before_start_and_reclaimed_by_fresh_owner(
@@ -327,6 +681,8 @@ def test_private_manager_environment_is_confirmed_before_start_and_reclaimed_by_
         f'Environment="XDG_CONFIG_HOME={native.home / ".config"}"',
         f'Environment="XDG_RUNTIME_DIR=/run/user/{commands.uid}"',
         f'Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{commands.uid}/bus"',
+        "ExecStart=",
+        f"ExecStart={receipt.manager_program} --user --unit={receipt.user}.target",
     ]
     installed = next(index for index, values in enumerate(commands.calls) if "install" in values)
     reloaded = next(
@@ -632,7 +988,7 @@ def test_changed_original_volume_directory_cannot_authorize_account_deletion(
     native.volume.mkdir(mode=0o700)
     commands.mounts.clear()  # The recorded mounts have disappeared, not moved here.
     commands.calls.clear()
-    with pytest.raises(ci.FixtureError, match="volume_directory_changed"):
+    with pytest.raises(ci.FixtureError, match="volume_directory_changed|bootstrap_unconfirmed"):
         ci.NativeCI(native.root, run=commands).cleanup()
     assert commands.accounts and not any("userdel" in args for args in commands.calls)
 

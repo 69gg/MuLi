@@ -812,6 +812,9 @@ class Receipt:
     volume_directory: tuple[int, int] | None = None
     environment_directory: tuple[int, int] | None = None
     environment_file: tuple[int, int] | None = None
+    manager_program: str = ""
+    bootstrap_directories: list[list[int]] = field(default_factory=list)
+    bootstrap_file: list[int] | None = None
     mounts: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -869,6 +872,41 @@ class Receipt:
         if result.environment_file is not None and result.environment_directory is None:
             raise FixtureError("native_receipt_invalid")
         if result.environment_directory is not None and not result.user_created:
+            raise FixtureError("native_receipt_invalid")
+        if (
+            not isinstance(result.manager_program, str)
+            or (
+                result.manager_program
+                and (
+                    not Path(result.manager_program).is_absolute()
+                    or re.fullmatch(r"/[A-Za-z0-9_./-]{1,255}", result.manager_program) is None
+                    or ".." in Path(result.manager_program).parts
+                    or Path(result.manager_program).name != "systemd"
+                )
+            )
+            or not isinstance(result.bootstrap_directories, list)
+            or (result.bootstrap_directories and not 2 <= len(result.bootstrap_directories) <= 5)
+            or any(
+                not isinstance(item, list)
+                or len(item) != 2
+                or any(type(part) is not int or not 0 <= part < 2**64 for part in item)
+                for item in result.bootstrap_directories
+            )
+            or (
+                result.bootstrap_file is not None
+                and (
+                    len(result.bootstrap_directories) != 5
+                    or not isinstance(result.bootstrap_file, list)
+                    or len(result.bootstrap_file) != 2
+                    or any(
+                        type(part) is not int or not 0 <= part < 2**64
+                        for part in result.bootstrap_file
+                    )
+                )
+            )
+            or (result.bootstrap_directories and not result.user_created)
+            or (result.environment_file is not None and not result.manager_program)
+        ):
             raise FixtureError("native_receipt_invalid")
         if (
             not isinstance(result.mounts, list)
@@ -1112,11 +1150,145 @@ class NativeCI:
             "CPUQuota=100%",
             f"TasksMax={TASKS}",
         )
-        return (
+        program = self.receipt.manager_program
+        if not program or re.fullmatch(r"/[A-Za-z0-9_./-]{1,255}", program) is None:
+            raise FixtureError("native_manager_template")
+        data = (
             "[Service]\n"
             + "\n".join((*resources, *(f'Environment="{value}"' for value in values)))
-            + "\n"
+            + f"\nExecStart=\nExecStart={program} --user --unit={self.receipt.user}.target\n"
         ).encode()
+        if len(data) > OUTPUT_BYTES:
+            raise FixtureError("native_diagnostic_output_budget")
+        return data
+
+    def bootstrap_reply(self, argv: Sequence[str]) -> dict[str, Any]:
+        """Charge the helper and its reply against the original setup allowance."""
+        allowance = OUTPUT_BYTES - self.setup_bytes
+        if allowance <= 1024:
+            raise FixtureError("native_diagnostic_output_budget")
+        deadline = (
+            self.cleanup_deadline if self.cleanup_deadline is not None else self.execute_deadline
+        )
+        end = min(
+            deadline or (time.monotonic() + CLEANUP_SECONDS), time.monotonic() + CLEANUP_SECONDS
+        )
+        try:
+            reply = self.call(
+                (*argv, str(end), str(allowance - 1024)), seconds=end - time.monotonic()
+            )
+            if time.monotonic() >= end:
+                raise FixtureError("native_bootstrap_deadline")
+            if reply.code:
+                raise FixtureError("native_bootstrap_invalid")
+            observed = object_bytes(reply.output)
+            used = observed.get("used")
+            if type(used) is not int or not 0 <= used <= allowance - 1024:
+                raise FixtureError("native_bootstrap_invalid")
+            self.setup_bytes += used + len(reply.output)
+            if self.setup_bytes > OUTPUT_BYTES:
+                raise FixtureError("native_diagnostic_output_budget")
+            if observed.get("code") != "verified":
+                raise FixtureError("native_bootstrap_unconfirmed")
+            return observed
+        except (ValueError, OSError, subprocess.SubprocessError):
+            self.setup_bytes = OUTPUT_BYTES
+            raise
+
+    def bootstrap_files(self, mode: str) -> None:
+        assert self.receipt is not None
+        receipt = self.receipt
+        uid, gid = self.current_account()
+        if mode not in {"create", "check", "remove"} or not receipt.bootstrap_directories:
+            raise FixtureError("native_bootstrap_invalid")
+        worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+        manifest = json.dumps(
+            {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file},
+            separators=(",", ":"),
+        )
+        observed = self.bootstrap_reply(
+            (
+                "sudo",
+                "--non-interactive",
+                "--",
+                sys.executable,
+                "-I",
+                str(worker),
+                "bootstrap-files",
+                mode,
+                receipt.user,
+                str(uid),
+                str(gid),
+                manifest,
+            )
+        )
+        if set(observed) != {"code", "directories", "file", "used"}:
+            raise FixtureError("native_bootstrap_invalid")
+        directories, identity = observed["directories"], observed["file"]
+
+        def pair(item: object) -> bool:
+            return (
+                isinstance(item, list)
+                and len(item) == 2
+                and all(type(part) is int and 0 <= part < 2**64 for part in item)
+            )
+
+        if (
+            not isinstance(directories, list)
+            or not 2 <= len(directories) <= 5
+            or not all(pair(item) for item in directories)
+            or directories[:2] != receipt.bootstrap_directories[:2]
+            or (identity is not None and (len(directories) != 5 or not pair(identity)))
+        ):
+            raise FixtureError("native_bootstrap_invalid")
+        if mode == "check" and (
+            directories != receipt.bootstrap_directories
+            or identity != receipt.bootstrap_file
+            or identity is None
+        ):
+            raise FixtureError("native_bootstrap_changed")
+        if mode == "create" and (len(directories) != 5 or identity is None):
+            raise FixtureError("native_bootstrap_invalid")
+        if mode == "remove" and (
+            identity is not None or directories != receipt.bootstrap_directories[: len(directories)]
+        ):
+            raise FixtureError("native_bootstrap_invalid")
+        receipt.bootstrap_directories = (
+            [] if mode == "remove" and len(directories) == 2 else directories
+        )
+        receipt.bootstrap_file = identity
+        if self.current_account() != (uid, gid):
+            raise FixtureError("native_bootstrap_identity")
+        self.save()
+        if mode == "remove" and receipt.bootstrap_directories:
+            raise FixtureError("native_bootstrap_not_empty")
+
+    def check_template(self) -> None:
+        uid, _ = self.current_account()
+        assert self.receipt is not None
+        worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+        observed = self.bootstrap_reply(
+            (
+                sys.executable,
+                "-I",
+                str(worker),
+                "manager-template",
+                self.receipt.user,
+                str(uid),
+                str(self.home),
+            )
+        )
+        program = observed.get("manager")
+        if (
+            set(observed) != {"code", "manager", "used"}
+            or not isinstance(program, str)
+            or re.fullmatch(r"/[A-Za-z0-9_./-]{1,255}", program) is None
+            or ".." in Path(program).parts
+            or Path(program).name != "systemd"
+        ):
+            raise FixtureError("native_manager_template")
+        self.receipt.manager_program = program
+        self.save()
 
     def check_manager_environment(self) -> bool:
         """Only the receipt's exclusive root-owned instance drop-in is ours."""
@@ -1159,7 +1331,11 @@ class NativeCI:
             ):
                 raise FixtureError("native_manager_environment_changed")
             with path.open("rb") as source:
-                if source.read(len(expected) + 1) != expected:
+                data = source.read(len(expected) + 1)
+                self.setup_bytes += len(data)
+                if self.setup_bytes + 1024 > OUTPUT_BYTES:
+                    raise FixtureError("native_diagnostic_output_budget")
+                if data != expected:
                     raise FixtureError("native_manager_environment_changed")
         except FileNotFoundError:
             raise FixtureError("native_manager_environment_changed") from None
@@ -1179,6 +1355,7 @@ class NativeCI:
             for suffix in ("", ".d")
         ):
             raise FixtureError("native_manager_environment_exists")
+        self.check_template()
         self.sudo("mkdir", "--mode=0755", "--", str(directory))
         info = directory.lstat()
         if (
@@ -1190,9 +1367,13 @@ class NativeCI:
         self.receipt.environment_directory = (info.st_dev, info.st_ino)
         self.save()
         source = self.root / "manager-environment.conf"
+        data = self.environment_data()
+        self.setup_bytes += len(data)
+        if self.setup_bytes + 1024 > OUTPUT_BYTES:
+            raise FixtureError("native_diagnostic_output_budget")
         with source.open("xb") as output:
             os.chmod(source, 0o600)
-            output.write(self.environment_data())
+            output.write(data)
         path = directory / ENVIRONMENT_NAME
         self.sudo("install", "--mode=0644", "--", str(source), str(path))
         info = path.lstat()
@@ -1369,6 +1550,10 @@ class NativeCI:
             },
         )
         # No mounted inputs exist yet: this cannot traverse or chown source trees.
+        self.receipt.bootstrap_directories = [
+            [info.st_dev, info.st_ino] for info in (self.volume.lstat(), self.home.lstat())
+        ]
+        self.save()
         self.sudo("chown", "--no-dereference", "-R", f"{actual[0]}:{actual[1]}", str(self.volume))
         for source, target in (
             (runtime, self.volume / "input/python"),
@@ -1384,7 +1569,9 @@ class NativeCI:
                 or "ro" not in current["options"].split(",")
             ):
                 raise FixtureError("native_mount_not_readonly")
+        self.bootstrap_files("create")
         self.prepare_manager_environment()
+        self.bootstrap_files("check")
         initial = self.observe_manager("manager-idle")
         started = time.monotonic()
         self.setup_command(
@@ -1407,6 +1594,7 @@ class NativeCI:
         self.receipt.setup_phase = "manager_show_after"
         self.save()
         self.manager_limits = verify_kernel(CGROUP_ROOT / group.lstrip("/"), MEMORY, TASKS)
+        self.bootstrap_files("check")
         if self.execute_deadline is not None:
             self.execute_remaining()
         return description
@@ -1834,6 +2022,8 @@ class NativeCI:
                 ):
                     raise FixtureError("native_manager_not_empty")
             self.check_manager_environment()
+            if receipt.bootstrap_directories:
+                self.bootstrap_files("remove")
             self.sudo("systemctl", "revert", f"user@{uid}.service")
             if os.path.lexists(self.environment_directory()):
                 raise FixtureError("native_manager_environment_not_removed")
