@@ -29,6 +29,27 @@ Team 队友保存派工时的来源，并由子队友、恢复、普通补充消
 
 路由、投递记录和状态接口不含 token、client secret 或微信 `context_token`。iLink 的 `context_token` 只单独保存在本地渠道状态中，发送时按当前账号与目标查找。它需要本地数据目录的同等保护。
 
+## 手机上的显式任务控制
+
+本片实现正在本地验收，尚未验证真实 Telegram/OneBot 账号，也不把离线替身当作平台或自然模型效果证明。普通消息仍进入同一主 MuLi；下面的保留指令由宿主处理，不交给模型猜测任务。
+
+在已绑定主人的私聊中发送 `/任务`，取得有限任务状态及可复制的 `/暂停 短任务码`。短码绑定该条状态回执中的具体任务与控制版本，无需输入技术 epoch，也不按相同标题或最近聊天猜任务。暂停回执提供新的 `/调整 短任务码 追加要求`，例如“只交草稿，不得发布”。调整只针对已暂停任务，交主助手重新规划；仍须既有读取和下一轮批准，不自动恢复、派工或批准旧计划。暂停表示已登记控制，已经进入的操作可能仍在收尾；未知副作用不会自动重发。控制确认回当前手机，原任务报告的 Web/渠道来源保持不变。
+
+只有适配器证明的**原始主人私聊纯文本**才有控制资格：
+
+- Telegram 只接受普通 `message.text`，真实非机器人发送者与私聊目标一致，机器人账号由当前 token 的数字前缀核验；显式配置的账号还须与该 ID 一致。不接 caption、附件、回复/引用、转发、`via_bot`、business 消息或未知内容载荷；不调用 `getMe`。按产品选择排除 `blockquote/expandable_blockquote` 引用实体，以及覆盖命令头的 `code/pre` 展示；追加要求中的普通 URL、加粗和代码仍可用。实体最多核对 128 项，坏形状或范围不作为来源证明，位置按 UTF-16 单位核对，不从归一化后的 caption 或文本推断资格。字段依据见官方 [Message](https://core.telegram.org/bots/api#message) 与 [MessageEntity](https://core.telegram.org/bots/api#messageentity)。
+- OneBot/NapCat 须显式配置 `account_id` 为真实机器人 QQ，与原事件 `self_id` 一致，且是私聊 message；必须配置**数组形式接收消息**，完整有界数组中每段均为原始 `text`、`data.text` 为真实字符串。字符串形式可能混有 CQ 媒体与转义，首片不提供控制资格；普通字符串聊天继续沿原路径，不造 CQ 解析器。拒绝回复、转发、语音等非 text 段、notice、群消息与逻辑 `bot` fallback。依据见 OneBot v11 [消息事件](https://github.com/botuniverse/onebot-11/blob/master/event/message.md)、[数组消息](https://github.com/botuniverse/onebot-11/blob/master/message/array.md)与[字符串消息](https://github.com/botuniverse/onebot-11/blob/master/message/string.md)。
+
+QQ 官方、微信 iLink、ASR、附件内容及模型输出没有此控制入口。`/任务`、`/暂停`、`/调整` 前缀保留：合格原始文本格式错误会得到持久纠正回执；来源证明不足的引用、caption 等请求由宿主拒绝，不下载附件、不交模型，也不承诺所有平台都向手机显示拒绝说明。手动复制并重新发送完整指令属于主人新发的原始文本，不能推断其人脑来源。
+
+接纳时在 Runtime 配置锁内再次核对当前管理器、适配器、账号与 owner 绑定，重投已有控制回执同样复核。短码本身不授予权限，不能跨主人、账号或目的地使用；旧控制版本、缺失/损坏回执或历史非手机控制回执须重新 `/任务`，不会自动换新 epoch 重试。普通消息的新证据字段默认空并保留旧信封指纹；仅控制候选的非空来源证明加入指纹，同事件改信封仍冲突。
+
+Manager 的控制前置查询只返回固定指纹是否匹配及回执是否存在等标量，不读取原始回执或附件 checkpoint；已完成控制重投同样由核心在配置锁内按 SQL 字节门读取回执。精确匹配旧信封指纹且已有回执时仅拒绝并保留原行，不解析、升级或信任旧回执 JSON；坏旧资料也不能成为控制授权。普通聊天的既有读取和恢复行为保持。
+
+核心明确拒绝无法核验的手机来源或当前事件回执时，渠道组合层转换为固定 403；配置锁内发现渠道代次、管理器、适配器或授权变化同样拒绝。轮询可跳过这类拒绝，不因同一损坏控制回执卡住游标。存储、关闭状态及提交后通知等其它异常继续向外抛出，不能伪装成已经处理的拒绝；重投仍由持久回执与原控制请求实现幂等恢复。
+
+控制结果先由核心服务持久化，再以 `mobile-task:<完整入站key>` 幂等加入原 outbox。确认队列满时，同事件重投只补本地入队；已提交控制不会重复追加要求。确认发送 `unknown` 仍不自动重发。正常重开、历史压缩不从摘要猜短码，是否仍有效以持久回执、当前授权及控制版本为准。本片不增加票据表、轮询、预热或额外网络身份查询。
+
 ## 无发令会话时的默认通知
 
 设置页的“消息渠道 → 主动通知”可选择无发令会话时的默认目的地，默认 WebUI。**启动时自主检查发现新版本**、**扩展目录自主 watch 的新失败状态**、**MCP 当前 HTTP/SSE 连接首次接收失败**、**另行开启的 chiliarch 普通消息提醒**及 **Linux 资料收件目录**可以使用默认渠道。MCP 受原系统日志阈值与 Attention 总开关控制，不因此重连或重放调用；chiliarch 开关默认关闭，见[消息提醒策略](chiliarch.md#普通消息提醒默认关闭)，只整理外部资料、不自动回信 chiliarch。收件目录默认关闭，文件事实与路由同事务冻结，候选文件名不是外发或整理指令，见[配置与边界](file-inbox.md)。新建的提醒、自身管理计划及主会话当前请求失败从有效请求保存原始来源：渠道请求仍回原渠道，网页来源留在 WebUI。运行尚未准备请求、Team/工作流原有失败日志、手动扩展重载、旧记录及其它日志保持本地。没有来源字段不等于独立事项，模型也不能从记忆或最近聊天猜收件人；具体失败来源边界见[系统日志事件](system-events.md)。
@@ -217,7 +238,7 @@ result = await manager.wait(delivery["id"])
 await manager.close()
 ```
 
-`submit` 为异步回调，接收 `content/source/principal/route/event_id/attachment_ids`。关闭时取消长轮询、事件消费者与出站工作器，完成正在发送任务的状态收口后唤醒等待者；若管理器关闭，`wait` 返回当时的持久状态，尚未发送的项目仍可能是 `pending`。
+`submit` 为异步回调，接收 `content/source/principal/route/event_id/attachment_ids`。可选 `control_submit` 仅用于宿主手机控制组合，接收 `name/message/route/event_id/receipt`（`receipt` 始终为 `None`，核心自行读取唯一权威回执），返回含 `reply_text` 和版本化 `mobile_task_control` 元数据的持久回执；该回调负责最终授权及保存，Manager 不重复写控制回执。`IncomingMessage.control_text/control_account_id` 默认空，不支持的适配器和普通聊天均保持空；它们只是适配器原始信封证据，不能代替当前 owner 授权。关闭时取消长轮询、事件消费者与出站工作器，完成正在发送任务的状态收口后唤醒等待者；若管理器关闭，`wait` 返回当时的持久状态，尚未发送的项目仍可能是 `pending`。
 
 离线验证命令：`python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_channels.py tests/test_channel_voice.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。语音回归覆盖 Telegram multipart、OneBot 私聊/群 record 与能力拒绝、格式/数量预检、默认文件与 QQ 音频兼容、同键模式冲突、持久重开及 unknown 不重发。相关渠道/应用集成/附件服务共 61 项受限测试通过，源码检查记录见[语音设计](channel-voice-design.md#验证)。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
 

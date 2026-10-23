@@ -19,7 +19,15 @@ from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_
 from muli.store import Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
-from .types import NAMES, ChannelError, ChannelsConfig, FileContent, IncomingMessage, Submit
+from .types import (
+    NAMES,
+    ChannelError,
+    ChannelsConfig,
+    FileContent,
+    IncomingMessage,
+    Submit,
+    is_mobile_control_text,
+)
 from .weixin import Weixin
 
 
@@ -43,11 +51,13 @@ class ChannelManager:
         client: httpx.AsyncClient | None = None,
         delivery_guard: Callable[[Mapping[str, Any], object], None] | None = None,
         admission: Admission | None = None,
+        control_submit: Submit | None = None,
     ) -> None:
         self.store, self.bus, self.config, self.submit = store, bus, config, submit
         self.attachments = attachments
         self.delivery_guard = delivery_guard
         self.admission = admission or Admission()
+        self.control_submit = control_submit
         # Validate before constructing an owned client, including on reconfigure.
         self.store.prepare_channels()
         self._owns_client = client is None
@@ -294,14 +304,70 @@ class ChannelManager:
         if not message.event_id or len(message.event_id) > 512 or len(message.text) > 64000:
             raise ChannelError("渠道消息 ID 或内容长度无效")
         trusted = message.sender_id in profile.owner_ids
+        control = is_mobile_control_text(message.text)
+        if control:
+            self.control_guard(name, message, route)
+            if self.control_submit is None:
+                raise ChannelError("手机任务控制服务未启用", status_code=503)
         key = hashlib.sha256(
             encoded([name, self._account(name), message.event_id]).encode("utf-8")
         ).hexdigest()
         try:
-            fingerprint = hashlib.sha256(encoded(asdict(message)).encode("utf-8")).hexdigest()
+            envelope = asdict(message)
+            # Preserve fingerprints of ordinary messages accepted before control
+            # evidence existed. Nonempty evidence remains part of the envelope.
+            for field in ("control_text", "control_account_id"):
+                if not envelope[field]:
+                    del envelope[field]
+            fingerprint = hashlib.sha256(encoded(envelope).encode("utf-8")).hexdigest()
+            legacy_fingerprint = ""
+            if control:
+                old_envelope = dict(envelope)
+                old_envelope.pop("control_text", None)
+                old_envelope.pop("control_account_id", None)
+                legacy_fingerprint = hashlib.sha256(
+                    encoded(old_envelope).encode("utf-8")
+                ).hexdigest()
         except (TypeError, ValueError):
             raise ChannelError("渠道消息信封无法规范化") from None
         async with self._inbound_lock:
+            if control:
+                row = self.store.db.execute(
+                    "SELECT fingerprint IS NULL AS unverified,"
+                    "CASE WHEN typeof(fingerprint)='text' "
+                    "AND length(CAST(fingerprint AS BLOB))=? "
+                    "THEN fingerprint=? COLLATE BINARY ELSE 0 END AS matched,"
+                    "CASE WHEN typeof(fingerprint)='text' "
+                    "AND length(CAST(fingerprint AS BLOB))=? "
+                    "THEN fingerprint=? COLLATE BINARY ELSE 0 END AS legacy_matched,"
+                    "receipt IS NOT NULL AS has_receipt FROM channel_inbound WHERE id=?",
+                    (
+                        len(fingerprint),
+                        fingerprint,
+                        len(legacy_fingerprint),
+                        legacy_fingerprint,
+                        key,
+                    ),
+                ).fetchone()
+                if row is not None:
+                    if row["unverified"] or (row["legacy_matched"] and row["has_receipt"]):
+                        # Refuse only: neither the old JSON nor any of its fields
+                        # become authority, and immutable history stays untouched.
+                        raise ChannelError(
+                            "旧入站回执不是手机任务票据，请重新发送 /任务", status_code=403
+                        )
+                    if not row["matched"]:
+                        raise ChannelError("同一渠道消息 ID 的信封内容不一致", status_code=409)
+                else:
+                    with self.store.db:
+                        self.store.db.execute(
+                            "INSERT INTO channel_inbound(id,name,created_at,fingerprint) "
+                            "VALUES(?,?,?,?)",
+                            (key, name, now(), fingerprint),
+                        )
+                # Only the core service reads and validates a stored control
+                # receipt, under its SQL byte gates and configuration lock.
+                return await self._receive_control(name, message, route, key, None)
             row = self.store.db.execute(
                 "SELECT * FROM channel_inbound WHERE id=?", (key,)
             ).fetchone()
@@ -411,6 +477,47 @@ class ChannelManager:
                 },
             )
             return receipt
+
+    def control_guard(self, name: str, message: IncomingMessage, route: Mapping[str, Any]) -> None:
+        """Synchronous source checks, repeated by the runtime's final guard."""
+        if (
+            self._closed
+            or name not in {"telegram", "onebot"}
+            or not self.config.profile(name).enabled
+            or message.sender_id not in self.config.profile(name).owner_ids
+            or message.kind != "private"
+            or message.files
+            or message.context_token
+            or not message.control_text
+            or not is_mobile_control_text(message.control_text)
+            or message.control_text != message.text
+            or not message.control_account_id
+            or message.control_account_id != self._account(name)
+        ):
+            raise ChannelError(
+                "任务控制仅接受当前已绑定主人原始私聊纯文本与可核验账号", status_code=403
+            )
+        self._route(name, route, outbound=True)
+
+    async def _receive_control(
+        self,
+        name: str,
+        message: IncomingMessage,
+        route: dict[str, Any],
+        key: str,
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        assert self.control_submit is not None
+        receipt = await self.control_submit(
+            name=name, message=message, route=route, event_id=key, receipt=previous
+        )
+        # The core service already committed this receipt while holding the
+        # configuration lock. Retrying only repairs this local idempotent queue.
+        reply = receipt.get("reply_text")
+        if not isinstance(reply, str) or not reply:
+            raise ChannelError("手机任务控制回执缺少明确回复")
+        await self.enqueue(name, message.target, reply, route=route, event_id="mobile-task:" + key)
+        return receipt
 
     async def _save_file(self, file: FileContent, name: str) -> dict[str, Any]:
         assert self.attachments is not None

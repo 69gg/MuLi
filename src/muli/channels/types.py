@@ -14,6 +14,11 @@ NAMES: tuple[ChannelName, ...] = ("onebot", "telegram", "qq", "weixin")
 Submit = Callable[..., Awaitable[dict[str, Any]]]
 
 
+def is_mobile_control_text(text: str) -> bool:
+    """Reserve malformed commands too; this never parses or authorizes one."""
+    return text.lstrip().startswith(("/任务", "/暂停", "/调整"))
+
+
 class ChannelError(ValueError):
     def __init__(
         self,
@@ -165,6 +170,8 @@ class IncomingMessage:
     reply_to: str = ""
     files: tuple[RemoteFile, ...] = ()
     context_token: str = field(default="", repr=False)
+    control_text: str = ""
+    control_account_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

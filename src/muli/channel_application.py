@@ -6,7 +6,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from muli.attachments import Attachments
-from muli.channels import ChannelManager, ChannelProfile, ChannelsConfig
+from muli.channels import ChannelError, ChannelManager, ChannelProfile, ChannelsConfig
+from muli.channels.types import IncomingMessage
+from muli.mobile_task_control import MobileControlRejected, MobileControlSource
 from muli.proactive import FrozenRouting, guard_delivery
 from muli.proactive_memory import check_preference
 from muli.runtime import Runtime
@@ -36,6 +38,48 @@ class ChannelApplication:
 
             return await self.runtime.submit(**kwargs, admission_guard=guard)
 
+        async def control_submit(
+            *,
+            name: str,
+            message: IncomingMessage,
+            route: dict[str, Any],
+            event_id: str,
+            receipt: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            # Even a completed inbound receipt must pass today's authorization.
+            # Runtime owns locking and durable replay; this layer never holds
+            # configuration_lock while waiting for an inbound lock or shutdown.
+            def guard() -> None:
+                if (
+                    generation != self._generation
+                    or manager is not self.manager
+                    or expected != self.runtime.config.settings.channels.model_dump()
+                    or manager.adapters.get(name) is not adapters.get(name)
+                ):
+                    raise ChannelError(
+                        "渠道配置或授权已改变，请由当前渠道重新提交任务控制", status_code=403
+                    )
+                manager.control_guard(name, message, route)
+
+            try:
+                return await self.runtime.submit_mobile_task_control(
+                    inbound_id=event_id,
+                    source=MobileControlSource(
+                        name=name,
+                        account_id=message.control_account_id,
+                        owner_id=message.sender_id,
+                        target=message.target,
+                    ),
+                    text=message.control_text,
+                    admission_guard=guard,
+                )
+            except MobileControlRejected:
+                # Only an explicit pre-write rejection is terminal to polling.
+                # Storage and post-commit notification failures remain retryable.
+                raise ChannelError(
+                    "手机任务控制无法核验，请重新发送 /任务", status_code=403
+                ) from None
+
         def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:
             guard_delivery(self.runtime.config.settings, route, metadata, db=self.runtime.store.db)
 
@@ -49,7 +93,9 @@ class ChannelApplication:
             self.attachments,
             delivery_guard=delivery_guard,
             admission=self.runtime.maintenance.admission,
+            control_submit=control_submit,
         )
+        adapters = dict(manager.adapters)
         manager.recover()
         return manager
 

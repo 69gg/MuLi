@@ -496,18 +496,31 @@ class TaskControl:
         model_configured: bool,
         max_pending: int,
         active_workflow_ids: Sequence[str] = (),
+        expected_approved_epoch: int | None = None,
     ) -> ControlResult:
         """Only the authenticated owner endpoint may call this method."""
+        if expected_approved_epoch is not None and (
+            type(expected_approved_epoch) is not int
+            or not 0 <= expected_approved_epoch <= request.expected_epoch
+        ):
+            raise ValueError("expected_approved_epoch 必须是有效控制快照")
         self._main(main_session_id)
         key = self._receipt_id(identifier, "owner", request.request_id)
-        fingerprint = _digest({"commitment_id": identifier, **asdict(request)})
+        fields = {"commitment_id": identifier, **asdict(request)}
+        # Keep historical Web fingerprints byte-for-byte unchanged.
+        if expected_approved_epoch is not None:
+            fields["expected_approved_epoch"] = expected_approved_epoch
+        fingerprint = _digest(fields)
         with self._transaction():
             duplicate = self._duplicate(key, fingerprint, active_workflow_ids=active_workflow_ids)
             if duplicate is not None:
                 return duplicate
             item = self.commitments.get(identifier)
             state = self._state(item)
-            if state["epoch"] != request.expected_epoch:
+            if state["epoch"] != request.expected_epoch or (
+                expected_approved_epoch is not None
+                and state["approved_epoch"] != expected_approved_epoch
+            ):
                 raise ControlConflict("epoch_conflict", "任务控制版本已改变，请读取当前状态")
             if (
                 request.action == "pause"

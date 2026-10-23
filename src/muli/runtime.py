@@ -33,6 +33,7 @@ from muli.management_transaction import Role
 from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
 from muli.memory_context import MemoryContextProvider, recalled_for_prompt, render_context
+from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
@@ -449,30 +450,65 @@ class Runtime:
         self, identifier: str, request: OwnerControlRequest
     ) -> ControlResult:
         async with self.configuration_lock:
-            if self._closing or self.task_control is None:
-                raise ValueError("任务控制服务不可用")
-            session = self.main_session()
-            result = self.task_control.owner_control(
-                identifier,
-                request,
-                main_session_id=session["id"],
-                mode=session["mode"],
-                model_configured=self.config.settings.models.main.configured,
-                max_pending=self.config.settings.limits.max_pending_runs,
-                active_workflow_ids=self.workflows.active_run_ids,
-            )
-            if result.created and self._selected_replans.get(session["id"]) == identifier:
-                # A new owner intent invalidates selection before a future
-                # request can validate obsolete evidence or spend its budget.
-                # A duplicate old receipt must not clear a newer selection.
-                self._selected_replans.pop(session["id"], None)
-            # Queued work owns no model slot, but it still needs a durable
-            # paused completion rather than an indefinitely unobservable queue.
-            self.team.start()
+            result = self._submit_task_control_locked(identifier, request)
         await self.task_control_committed(result)
         return result
 
+    def _submit_task_control_locked(
+        self,
+        identifier: str,
+        request: OwnerControlRequest,
+        expected_approved_epoch: int | None = None,
+    ) -> ControlResult:
+        """The caller owns configuration_lock; commit without yielding to close/configuration."""
+        if self._closing or self.task_control is None:
+            raise ValueError("任务控制服务不可用")
+        session = self.main_session()
+        result = self.task_control.owner_control(
+            identifier,
+            request,
+            main_session_id=session["id"],
+            mode=session["mode"],
+            model_configured=self.config.settings.models.main.configured,
+            max_pending=self.config.settings.limits.max_pending_runs,
+            active_workflow_ids=self.workflows.active_run_ids,
+            expected_approved_epoch=expected_approved_epoch,
+        )
+        if result.created and self._selected_replans.get(session["id"]) == identifier:
+            # A duplicate old receipt must not clear a newer selection.
+            self._selected_replans.pop(session["id"], None)
+        # Queued work needs its original durable paused completion.
+        self.team.start()
+        return result
+
+    async def submit_mobile_task_control(
+        self,
+        *,
+        inbound_id: str,
+        source: MobileControlSource,
+        text: str,
+        admission_guard: Callable[[], None],
+    ) -> dict[str, Any]:
+        async with self.configuration_lock:
+            if self._closing or self.task_control is None:
+                raise ValueError("任务控制服务不可用")
+            admission_guard()
+            outcome = MobileTaskControl(self.task_control).handle(
+                inbound_id,
+                source,
+                text,
+                submit_control=self._submit_task_control_locked,
+            )
+        if outcome.control_committed:
+            # A persisted mobile receipt may precede an interrupted notification.
+            # Repeating these existing wakeups does not enqueue another input.
+            await self._notify_task_control()
+        return outcome.receipt
+
     async def task_control_committed(self, result: ControlResult) -> None:
+        await self._notify_task_control()
+
+    async def _notify_task_control(self) -> None:
         await self.bus.notify()
         await self.flush_task_plan_deliveries()
         self.team.start()

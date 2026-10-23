@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NoReturn
 
 import httpx
 import pytest
-from test_channels import terminal
+from test_channels import onebot_body, onebot_event, profile, terminal
 from test_runtime import FakeClient, make_runtime
 from test_task_control_runtime import wait_agent
 from test_teammate_attachment_runtime import completed, eventually, tool_result
 
-from muli.channels import ChannelManager
+from muli.channels.manager import encoded
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.server import create_app
 
@@ -32,8 +35,10 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", reject_network)
 
 
+@pytest.mark.parametrize("control_channel", ["web", "onebot"])
 async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence_to_draft_worker(
     tmp_path: Path,
+    control_channel: str,
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update(
@@ -44,11 +49,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             "compaction": {"enabled": False},
             "models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}},
             "channels": {
-                "onebot": {
-                    "enabled": True,
-                    "base_url": "https://platform.invalid",
-                    "owner_ids": ["7"],
-                }
+                "onebot": asdict(profile(account_id="123" if control_channel == "onebot" else ""))
             },
         }
     )
@@ -66,6 +67,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
     body_marker = "HANDOFF-ORIGINAL-SOURCE-ONLY"
     corrected = "发布限制：现在只交草稿，不得发布"
     requests: list[httpx.Request] = []
+    phone_confirmations: list[str] = []
     worker_requests: list[list[Message]] = []
     replacement_started = asyncio.Event()
     draft_release = asyncio.Event()
@@ -316,26 +318,46 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
 
     async def uncertain_http(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/send_private_msg"
+        body = json.loads(request.content)
+        text = "".join(segment["data"]["text"] for segment in body["message"])
+        if text != "原计划外发内容":
+            assert control_channel == "onebot" and body["user_id"] == "7"
+            phone_confirmations.append(text)
+            return httpx.Response(
+                200, json={"status": "ok", "retcode": 0, "data": {"message_id": "phone-ok"}}
+            )
         requests.append(request)
         raise httpx.ReadTimeout("offline unknown external outcome", request=request)
+
+    async def phone_control(event_id: str, text: str) -> dict[str, Any]:
+        payload = {
+            **onebot_event(),
+            "self_id": 123,
+            "sub_type": "friend",
+            "message_id": event_id,
+            "message": [{"type": "text", "data": {"text": text}}],
+        }
+        raw, headers = onebot_body(payload)
+        assert await manager.webhook("onebot", raw, headers) == {"ok": True}
+        inbound_id = hashlib.sha256(encoded(["onebot", "123", event_id]).encode()).hexdigest()
+        row = runtime.store.db.execute(
+            "SELECT receipt FROM channel_inbound WHERE id=?", (inbound_id,)
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        receipt = json.loads(row[0])
+        assert isinstance(receipt, dict) and isinstance(receipt["reply_text"], str)
+        return receipt
 
     runtime.client_factory = factory  # type: ignore[assignment]
     try:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(uncertain_http)
         ) as channel_client:
-            manager = ChannelManager(
-                runtime.store,
-                runtime.bus,
-                original_manager.config,
-                original_manager.submit,
-                app.state.attachments,
-                client=channel_client,
-                delivery_guard=original_manager.delivery_guard,
-                admission=runtime.maintenance.admission,
-            )
-            await original_manager.close()
-            app.state.channel_application.manager = manager
+            manager = original_manager
+            # Keep the real composition's current manager/adapter identity and
+            # admission closure; only the platform HTTP transport is a substitute.
+            for adapter in manager.adapters.values():
+                adapter.http.client = channel_client
             async with (
                 app.router.lifespan_context(app),
                 httpx.AsyncClient(
@@ -379,26 +401,63 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 assert (
                     changed.status_code == 200 and runtime.memory.revision > before_memory_revision
                 )
-                paused = await web.post(
-                    f"/api/commitments/{task_id}/control",
-                    json={
-                        "action": "pause",
-                        "expected_epoch": 0,
-                        "request_id": "pause-before-draft",
-                    },
-                )
-                assert paused.status_code == 200
+                if control_channel == "web":
+                    paused = await web.post(
+                        f"/api/commitments/{task_id}/control",
+                        json={
+                            "action": "pause",
+                            "expected_epoch": 0,
+                            "request_id": "pause-before-draft",
+                        },
+                    )
+                    assert paused.status_code == 200
+                else:
+                    before_round = main_round
+                    status = await phone_control("phone-status", "/任务")
+                    pause_codes = re.findall(
+                        r"/暂停 ([a-f0-9]{12}-[1-9][0-9]*)", status["reply_text"]
+                    )
+                    assert len(pause_codes) == 1
+                    pause_text = "/暂停 " + pause_codes[0]
+                    paused_phone = await phone_control("phone-pause", pause_text)
+                    assert await phone_control("phone-pause", pause_text) == paused_phone
+                    assert main_round == before_round
+                    assert runtime.task_control is not None
+                    assert runtime.task_control.current(task_id)["control"]["epoch"] == 1
                 phase, main_round = "replan", 0
-                requested = await web.post(
-                    f"/api/commitments/{task_id}/control",
-                    json={
-                        "action": "request_replan",
-                        "expected_epoch": 1,
-                        "request_id": "owner-draft-only",
-                        "additional_requirements": "只交草稿，不得发布",
-                    },
-                )
-                assert requested.status_code == 200
+                if control_channel == "web":
+                    requested = await web.post(
+                        f"/api/commitments/{task_id}/control",
+                        json={
+                            "action": "request_replan",
+                            "expected_epoch": 1,
+                            "request_id": "owner-draft-only",
+                            "additional_requirements": "只交草稿，不得发布",
+                        },
+                    )
+                    assert requested.status_code == 200
+                else:
+                    replan_codes = re.findall(
+                        r"/调整 ([a-f0-9]{12}-[1-9][0-9]*)", paused_phone["reply_text"]
+                    )
+                    assert len(replan_codes) == 1
+                    adjusted_phone = await phone_control(
+                        "phone-draft-only", "/调整 " + replan_codes[0] + " 只交草稿，不得发布"
+                    )
+                    control_receipt_id = adjusted_phone["mobile_task_control"]["control_receipt_id"]
+                    domain_receipt = runtime.store.get("task_control_receipt", control_receipt_id)
+                    assert domain_receipt is not None
+                    control_input = runtime.store.db.execute(
+                        "SELECT payload FROM ingress WHERE id=?", (domain_receipt["ingress_id"],)
+                    ).fetchone()
+                    assert control_input is not None
+                    payload = json.loads(control_input["payload"])
+                    assert payload["route"] is None
+                    assert payload["task_control"] == {
+                        "commitment_id": task_id,
+                        "receipt_id": control_receipt_id,
+                        "epoch": 2,
+                    }
                 await eventually(
                     runtime,
                     lambda: bool(completed(runtime, "草稿方案已确认，旧投递仍未知，等待明确派工")),
@@ -432,6 +491,9 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 )
                 assert len(requests) == 1 and manager.delivery(delivery_id)["attempts"] == 1
                 assert len(worker_requests) == 3
+                if control_channel == "onebot":
+                    await eventually(runtime, lambda: len(phone_confirmations) == 3)
+                    assert len(manager.deliveries()) == 4
                 old_calls = [
                     call
                     for item in runtime.store.messages(old_id)
