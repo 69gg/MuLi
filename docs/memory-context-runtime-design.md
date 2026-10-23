@@ -25,6 +25,12 @@ Runtime 在召回前分配本轮记忆块预算，保留现有整体上限、四
 - 有预算适配器、旧一参数 hook、无 MemoryApplication fallback、记忆关闭、极小预算及超大 legacy 结果均有明确结果。旧 hook 抛出的 TypeError 原样传播，不调用第二次。
 - 本地只用临时 SQLite、FakeClient 和门控，不连接真实模型或渠道；检查继续串行通过共享资源守卫，独立后审与相关回归后才发布。
 
+## 实现落点
+
+共用模块 `memory_context.py` 承担完整 JSON 两流渲染、按真实来源的当次过滤和 `MemoryContextProvider` 具名可调用适配器；`Memory.automatic_episode_id` 只查询主键及身份条件。Runtime 从当前配置计算预算并扣外层资料标题后召回；MemoryApplication 的适配器读取当前开关、字符上限和名额，通过 `context_for_prompt` 复用流水线，不重配置后台 worker，原 `cached_context` 仍保留默认配置上限合同。所有提供器输出均作整体超预算复核，未再切片自动记忆字符串；fallback 保持原最多五个名额并遵守更小的配置。缓存有效召回不足当前 `min(context_limit, max_candidates)` 时仅一次既有上限的本地补位，包含命中旧小名额缓存的情况；合并后的召回也受此上限约束，侧写保持独立双流规则，显式查询与缓存不变。
+
+验收代码分别位于 `tests/test_memory_context_selection.py` 和独立 builder 的 `tests/test_memory_runtime_quality.py`；真实请求均由临时 SQLite 与 FakeClient 捕获。共享资源守卫下定向三个上下文文件 52 项、应用与流水线两个文件 25 项通过；7 文件 Ruff 和格式检查、5 生产文件严格类型检查通过。每条硬超时 30 秒，收到退出码 0 和守卫终态；峰值分别为 95.9 MiB、82.9 MiB 和类型检查 188.8 MiB，swap 0。独立后审及更广整合验收仍以最终记录为准。
+
 ## 保留边界
 
 本片改进资料选材，不证明模型必然使用记忆或回答正确，不提供语义召回质量的全面评分。来源资料、旧偏好和旧任务说明均不是新授权。更正后的完整事实仍可能因既有候选或字符预算落选，不能将没有注入解释为没有保存。真实外部模型与个人渠道效果需另行验收。

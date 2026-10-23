@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from muli.media import MediaService
+from muli.memory_context import MemoryContextProvider
 from muli.memory_evidence import MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
 from muli.providers import Message
@@ -24,7 +25,20 @@ class MemoryApplication:
         self._recovery: asyncio.Task[None] | None = None
         runtime.add_tool_provider(self.tools)
         runtime.message_hooks.append(self.ingest)
-        runtime.memory_context_provider = self.pipeline.cached_context
+        runtime.memory_context_provider = MemoryContextProvider(self._context)
+
+    def _context(
+        self, query: str, max_chars: int | None = None, *, latest_user_id: str | None = None
+    ) -> str:
+        settings = self.runtime.config.settings.memory
+        if not settings.enabled:
+            return ""
+        budget = settings.context_max_chars
+        if max_chars is not None:
+            budget = min(budget, max_chars)
+        return self.pipeline.context_for_prompt(
+            query, budget, latest_user_id=latest_user_id, limit=settings.context_limit
+        )
 
     def _pipeline(self) -> MemoryPipeline:
         settings = self.runtime.config.settings
@@ -122,7 +136,7 @@ class MemoryApplication:
         await self.close()
         self.media = self.media_factory()
         self.pipeline = self._pipeline()
-        self.runtime.memory_context_provider = self.pipeline.cached_context
+        self.runtime.memory_context_provider = MemoryContextProvider(self._context)
         await self.start()
 
     async def query(self, query: str, limit: int = 8, *, hops: int | None = None) -> dict[str, Any]:
