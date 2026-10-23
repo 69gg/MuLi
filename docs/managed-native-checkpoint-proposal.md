@@ -1,6 +1,6 @@
-# readiness 最后完整轮的小型失败回执（本地验证完成）
+# readiness 最后完整轮的小型失败回执（第十九轮已取得历史轮，仍未 READY）
 
-2026-10-24。根已独审方案和原提交/保存顺序，并通过唯一守卫收齐旧实现三项预期red：pytest 3 failed/0.12秒，守卫597毫秒/66.4 MiB/swap0/exit1；两项缺字段、一项严格五键拒绝，与预期一致。随后实现worker、协调器及新回归，已完成根整合与另一Sol独立后审，尚未新的远端原生验收。此前本地文档HEAD为`1304e1b`，真实第十八轮精确候选为`c0394b0`；不把本地实现或纯回归当成远端受测实现。
+2026-10-24。根已独审方案和原提交/保存顺序，并通过唯一守卫收齐旧实现三项预期red：pytest 3 failed/0.12秒，守卫597毫秒/66.4 MiB/swap0/exit1；两项缺字段、一项严格五键拒绝，与预期一致。随后实现worker、协调器及新回归，完成根整合与另一Sol独立后审。第十九轮精确候选`db22a5f`现已受测：小回执保住历史pending轮，manager仍未READY、真实事务仍为零，详见末节。此前本地文档HEAD为`1304e1b`，真实第十八轮精确候选为`c0394b0`；本地实现、纯回归与远端结果分别记录。
 
 ## 新事实与问题边界
 
@@ -57,7 +57,7 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 - `test_actual_oversized_fallback_json_does_not_replace_saved_checkpoint`：后备合法JSON加入尾部空白后实际超过1024，worker用满原grant使累计超32768，仍保存原manager_failure及其checkpoint，setup按原output_budget拒整包，0事务。
 - `test_external_cancellation_still_propagates_without_a_synthetic_receipt`：外部取消仍传播，不能把它伪造为worker成功返回的失败包。只有原函数捕获并实际返回、且外层在原截止内严格接受的包，才保证走既有保存顺序；外部取消、丢包、父截止或写盘错误都不承诺新回执。
 
-根的窄验证入口是 `tests/test_managed_native_checkpoint.py`；随后连同既有 `tests/test_managed_native_ci.py` 复验，再对两脚本及新测试做Ruff/format、两脚本strict mypy。每项通过主仓 `/data0/MuLi/scripts/check_local.py --seconds 30` 串行执行；本子agent不持槽、不启动这些检查。纯fixture仅证明新事实的保存与拒绝边界，不能据此宣称READY修复或自动触发第十九轮。
+根的窄验证入口是 `tests/test_managed_native_checkpoint.py`；随后连同既有 `tests/test_managed_native_ci.py` 复验，再对两脚本及新测试做Ruff/format、两脚本strict mypy。每项通过主仓 `/data0/MuLi/scripts/check_local.py --seconds 30` 串行执行；本子agent不持槽、不启动这些检查。纯fixture仅证明新事实的保存与拒绝边界，不能据此宣称READY修复；随后授权执行的第十九轮另记于末节。
 
 ## 实际根验证与独立后审
 
@@ -65,4 +65,18 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 
 三份Python已格式化且Ruff通过。两脚本strict mypy首次未指定源码路径，在八处旧导入得到Any返回错误；保持源码及规则不变，显式指定本worktree的`MYPYPATH=src:tests`并用非增量检查后通过（5.292秒/284.6 MiB、exit0）。没有通过ignore或安装依赖消除错误。
 
-另一Sol独立只读后审未发现P1/P2：核对真实typed调度和原命令/文件数、严格范围、原尾门、实际1024/1025字节、父截止、后备整包超额和历史保留，确认不是只验证投影函数自身。根也审查了原remaining之后的唯一冻结点及既有协调器先保存失败、后可选诊断顺序。没有本机真实账户、服务、挂载或网络实验；远端仍须取得新精确候选事实，不能据此宣称READY、三事务或正常cleanup已修复。
+另一Sol独立只读后审未发现P1/P2：核对真实typed调度和原命令/文件数、严格范围、原尾门、实际1024/1025字节、父截止、后备整包超额和历史保留，确认不是只验证投影函数自身。根也审查了原remaining之后的唯一冻结点及既有协调器先保存失败、后可选诊断顺序。以上没有本机真实账户、服务或挂载实验；当时尚待远端验收，不能据此宣称READY、三事务或正常cleanup已修复。
+
+## 第十九轮实际结果与剩余缺证
+
+候选`db22a5f`的[CI 40029000745](https://github.com/69gg/MuLi/actions/runs/40029000745)最终9项成功、2项失败；Linux [managed-native job120672256510](https://github.com/69gg/MuLi/actions/runs/40029000745/job/120672256510)仍为`native_deadline_exceeded`，随后`native_service_cleanup_failed`。根有界取得并验证artifact12533174463：ZIP **1027字节**，SHA256 `30e4af16c499f7960a2fb8956fa53b71221a4320ace3a8fdc9872af0422de02a`，严格两成员并通过协调器完整result/receipt校验；守卫exit0、104毫秒/19.6 MiB/swap0。本子agent只读根已验证的小result和有限日志，没有重复下载或运行校验。
+
+- `manager_setup/setup_failed`、timeline0、generations0。`manager_failure=native_deadline_exceeded/manager_validation/query_status=0/query_code=ok/used=17468`；本次不是该查询已报告的输出上限或查询退出错误。最后完整轮为`observed/elapsed_ms=81770`：runtime `active/exited/job0`，manager `activating/start/job1759`，PID2305、start_ticks8630、invocation `f5287b597e4c43b39e8bd9ef9bf0fbad`。这是**历史轮开始时间及该轮已核pending事实**，不是到期快照；原pending睡眠或随后期限门仍可触发最终deadline。
+- 此轮仅绑定user@的MainPID/stat/cgroup/invocation，未完成ready分支exe、四UID及尾门。receipt登记`/usr/lib/systemd/systemd`也不是本轮exe实测，更不是内部basic完成、进入事件循环或READY发送/接收证明。不能借第十六轮的process正向事实补齐本轮。
+- 后备`diagnostic_status=0/diagnostic_code=output_budget`仍是**整个回包因累计字节门被拒绝**；默认`not_started/units=[]`不表示worker未执行。小checkpoint成功保留，不等于后备预算或READY已修复。receipt账户/组已removed、mount0、environment/bootstrap清空，只证明所记账资源走到回收；`resources.cleanup`缺失且服务收尾报错，不能称正常cleanup验收。
+
+同job setup前缀明确为Ubuntu **24.04.5 LTS**、image `ubuntu-24.04/20261012.334.1`。其[精确镜像清单](https://github.com/actions/runner-images/blob/ubuntu24/20261012.334/images/ubuntu/Ubuntu2404-Readme.md)列systemd **255.4-1ubuntu8.17**、dbus **1.14.10-4ubuntu4.1**；这是镜像清单与setup身份对应，**不是该job现场包版本或unit正文实测**。上游v255只能用于有版本边界的源码推导，不能等同Ubuntu补丁后源码或本机Arch安装。
+
+源码复核及唯一待审因果分叉见[设计记录第十九轮](managed-native-ci-design.md#第十九轮历史pending轮已保住ready仍未通过)：当前仍无法区分最终exec前、内部basic/job未完成、或READY发送/接收路径。下一步只考虑在原失败观察总量内替换重复负担，先同代确认实际exec层，再区分basic/内部job；可靠无激活读取通道及真实整包上限尚待核清。此记录不增加字段、轮询、启动变量、期限或预算，不实施该方案、不授权盲开第二十轮。
+
+另一失败是Windows3.13原生UIA首probe的12秒超时：1 failed/3692 passed/2017 skipped，阶段到`uia_ready`、sent1、后cleanup confirmed。它不证明完整response已写出或被Python收到；旧后清理投影不能反推清理前进程/reader状态。该native分支尚无`41af626`同进程前后诊断，不借v2.43另一候选的CI或诊断改进宣称本轮Windows根因已修复。

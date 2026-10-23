@@ -523,7 +523,26 @@ job原始日志的首次有界API请求失败，没有取得数据或扩大读�
 
 下一步先只读审查worker与外层完整回包的字节责任，设计能在同一固定总量内原子保留有限有用事实的最小合同；没有仅凭本轮失败重开19轮、增加启动变量、扩大期限/输出或执行本机实验。去重是已验证的纯fixture改进，不是已证实的READY根因修复。
 
-只读下一方案建议复用manager-ready原有至多1024字节失败回执：在原观察轮所有身份/结构门完整通过后，保存最后完整轮的固定白名单checkpoint，随`manager_failure`先校验落盘，不新增查询。有限状态、job、PID/startticks/invocation及相对时间必须以最大合法编码证明仍容纳；不携路径、环境或日志。后备大包再失败不能抹掉已核事实；`not_observed`明确无完整轮，不以默认值伪造状态。这只是待审合同：须先用完整轮后到期、下轮无回包占满、后备超额、首轮失败、身份漂移和最大/非法字段反例证伪，并验证调用数、首因及原预算不变。它不提供到期时原子系统状态，不证明READY条件或根因；尚未实现或运行，也不据此直接开启19轮。
+当时的只读下一方案建议复用manager-ready原有至多1024字节失败回执：在原观察轮所有身份/结构门完整通过后，保存最后完整轮的固定白名单checkpoint，随`manager_failure`先校验落盘，不新增查询。有限状态、job、PID/startticks/invocation及相对时间必须以最大合法编码证明仍容纳；不携路径、环境或日志。后备大包再失败不能抹掉已核事实；`not_observed`明确无完整轮，不以默认值伪造状态。该建议当时仅为待审合同，须先用完整轮后到期、下轮无回包占满、后备超额、首轮失败、身份漂移和最大/非法字段反例证伪，并验证调用数、首因及原预算不变。后续授权实现与本地560项回归见[checkpoint记录](managed-native-checkpoint-proposal.md)，第十九轮实际结果如下；这些改动不提供到期时原子系统状态，也不证明READY条件或根因。
+
+### 第十九轮：历史pending轮已保住，READY仍未通过
+
+精确候选`db22a5f`的唯一[CI 40029000745](https://github.com/69gg/MuLi/actions/runs/40029000745)已全终态，**9项成功、2项失败**：Linux [managed-native job120672256510](https://github.com/69gg/MuLi/actions/runs/40029000745/job/120672256510)与Windows3.13原生UIA分别失败。Linux有限日志为`2026-10-23T21:46:33Z native_deadline_exceeded`，`21:46:37Z native_service_cleanup_failed`；不混用上一轮时间或Windows首因。
+
+根有界取得artifact12533174463，实际ZIP **1027字节**、SHA256 `30e4af16c499f7960a2fb8956fa53b71221a4320ace3a8fdc9872af0422de02a`；核对两个白名单成员及完整`check_managed_native_ci.fixture_result`/`Receipt.read`合同，实际守卫exit0、104毫秒/19.6 MiB/swap0。独立审查只读取根已验证的小result与有限日志，不重复下载、校验或运行服务。
+
+- `completed=false/stage=manager_setup/code=setup_failed`、timeline0、generations0，仍**0个真实事务**。`manager_failure`为`native_deadline_exceeded/manager_validation/query_status=0/query_code=ok/used=17468`。这不是该查询已报告的输出上限或查询退出错误；不能把最终deadline直接称为busctl查询超时。
+- 新字段首次在真实托管runner保住`last_completed_round`：`observed/elapsed_ms=81770`；runtime `active/exited/job0`，manager `activating/start/job1759`，PID2305、start_ticks8630、invocation `f5287b597e4c43b39e8bd9ef9bf0fbad`。时间来自**该历史轮开始**，不是轮完成时刻、到期状态或实时年龄；原remaining成功后、原sleep前冻结，后续sleep或期限门仍可到期。user@的MainPID/stat/cgroup/invocation连续性不等于本轮exe、四UID、内部basic、事件循环或READY证明，不能借第十六轮事实补齐。
+- 后备`diagnostic_status=0/diagnostic_code=output_budget`、`units=[]`及其余默认`not_started`，仍是worker返回后外层按`used+实际整包字节`拒绝。默认值不是worker未执行证据。此次checkpoint已经保住，但大包仍被拒，不能把checkpoint改进写成READY修复或预算问题已消失。
+- receipt账户/组removed、mount0、environment/bootstrap清空，manager_program仍登记`/usr/lib/systemd/systemd`；后者是启动登记，不是本轮exe实测，前者也不证明prepare未创建。`resources.cleanup`缺失。源码在专用用户cleanup transient等捕获块失败后置旗，仍继续stop、资源检查/回收、revert、umount和账户组删除，最后才抛泛化`native_service_cleanup_failed`；没有该块具体失败命令，**不称正常cleanup通过**。
+
+**镜像与源码依据分层。** 同job setup日志11–20行明确Ubuntu **24.04.5 LTS**、Runner Image `ubuntu-24.04`、Version **20261012.334.1**；workflow本身也固定`ubuntu-24.04`，不是由`ubuntu-latest`猜测。对应[官方精确镜像清单](https://github.com/actions/runner-images/blob/ubuntu24/20261012.334/images/ubuntu/Ubuntu2404-Readme.md)列systemd **255.4-1ubuntu8.17**与dbus **1.14.10-4ubuntu4.1**。这证明镜像清单所列版本，未取得本job现场`systemd --version`、包查询或实际basic/dbus/socket unit正文；Ubuntu补丁包也不等于上游v255逐字节源码，本机Arch单元不作为runner证据。
+
+限定读取的上游[v255 main.c启动target选择](https://github.com/systemd/systemd/blob/v255/src/core/main.c#L2130-L2178)与[manager.c READY路径](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L3426-L3501)只支持以下源码推导：`--unit`选择初始target；user basic到达active/reloading或job队列完成涉及READY触发，但触发、发送与PID1接收是不同事实。本实现自有target仍`Requires/After=basic.target dbus.socket`；`DefaultDependencies=no`仅约束该target，未封闭runner的basic前置依赖、wants或generator闭包。当前没有已证实的直接依赖环，也没有本轮basic/job事实，不能据此认定dbus、PAM、READY丢失或具体unit为根因。上游推导不是本次CI内部执行轨迹。
+
+**唯一待审的下一因果分叉。** 不再重复添加环境/socket/journal摘要，也不增加字段、启动变量、轮询或预算。先评估能否以现有失败观察总量内的等价替换，取得同代实际exec事实，再区分该user manager的basic是否完成及是否仍有内部pending job：尚不能证明exec则该层继续unknown，不断言仍在exec前；basic未完成且有job才转向具体依赖；basic已完成而外层仍activating才转向READY发送/接收路径。可靠的无激活读取通道、前后身份绑定和真实整包最坏编码尚未核清，不能承诺当前已可实施或下一轮必能分因；若无法在原边界内取得，就继续保持unknown。本记录不实施、不放宽任何门，也不授权盲开第二十轮。
+
+**Windows独立边界。** 同run另有1 failed/3692 passed/2017 skipped，唯一`tests/test_uia_native.py::test_real_windows_system_module_probe_mta_and_owned_unicode_tree`首probe在原12秒超时；stage完整到`uia_ready`、sent1，后清理confirmed。它不证明完整响应已写出或Python已接收；后清理的进程退出/reader收敛不能反推清理前状态。这个native旧分支没有`41af626`的同进程before/after诊断，不能借v2.43另一候选CI十绿或新增诊断宣称本轮Windows根因已修复。
 
 ## 第十五轮：新增投影返回有效事实，manager 仍未就绪
 
