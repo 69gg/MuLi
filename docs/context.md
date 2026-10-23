@@ -46,7 +46,7 @@ assistant 工具调用批次与其全部结果是不可分割单位，未闭合�
 
 ## 扩展接口
 
-`context_hooks` 接收异步 `(session_id, messages) -> messages`，每个安全边界使用新历史投影调用，之后再统一检查预算和工具配对。`memory_context_provider(query) -> str` 是可选同步缓存入口，替代默认本地检索，调用方不应在这里联网；运行时统一标注资料性质并限制长度。
+`context_hooks` 接收异步 `(session_id, messages) -> messages`，每个安全边界使用新历史投影调用，之后再统一检查预算和工具配对。`memory_context_provider(query) -> str` 是可选同步缓存入口，替代默认本地检索，调用方不应在这里联网。旧回调只调用一次，超出本轮实际记忆预算时整体省略，不截断字符串、不捕获 `TypeError` 重试。预算感知扩展显式注册 `muli.memory_context.MemoryContextProvider(renderer)`，其 renderer 接收 `(query, max_chars=None, *, latest_user_id=None)`；适配器仍支持一参数调用。Runtime 在召回前分配四分之一且至多 12000 字符的记忆块预算，扣外层提示，再受当前 `memory.context_max_chars` 限制；当前开关与缩小预算在下一次请求生效。内建流水线与无应用 fallback 共用完整 JSON 选材和渲染，详见 [记忆](memory.md)。
 
 宿主专用 `skills_context` 在全部普通 hooks 和不可变任务快照加入后、最终打包前执行一次。它为已激活 Skill 注入完整正文；预算不足时保留持久指导但明确暂停，留下可调用的清除路径，不裁剪权威任务资料，也不重复运行插件 hooks。`skill_read` 仅返回激活回执，正文不会再复制到同批工具结果；压缩后由有限会话状态恢复，详见 [Agent Skills](skills.md)。
 

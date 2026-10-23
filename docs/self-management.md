@@ -81,6 +81,8 @@ def setup(api: PluginContext) -> None:
 
 `setup` 可以同步或异步。`PluginContext` 提供 runtime、app、directory，以及工具、上下文钩子、模型 client factory、启动和关闭钩子。`add_route` 的路由位于 `/api/plugins/<id>/`，通过管理入口认证。工具可以显式覆盖同名内置工具；多个插件争用同名工具会报告冲突。模型请求的插件工具仍走统一权限门。重配置后保留注册；加载失败会撤销已登记路由并执行清理钩子。
 
+通过 `runtime.memory_context_provider` 替换自动记忆提示时，旧一参数同步回调仍仅调用一次，超预算整块省略。需要实际预算及最新 user 来源 ID 时显式注册 `muli.memory_context.MemoryContextProvider(renderer)`；renderer 的签名为 `(query, max_chars=None, *, latest_user_id=None)`，只应使用本地资料并返回完整内容。宿主不会猜测回调签名或在 `TypeError` 后换参数重试，详见 [上下文扩展](context.md)。
+
 `plugin_install` 先验证路径、清单、大小和 Python 语法，再保存源码，重启后才加载。它不在安装时执行插件，不覆盖已有插件目录，不自动安装依赖。现有插件可以通过文件工具编辑，或在 `plugins.disabled` 中列出 ID 后重启停用。`persona.prompt` 替换基础提示词，`persona.append` 追加个性设定，插件的 `append_prompt` 再增加对应内容。
 
 ## 持续工作账本

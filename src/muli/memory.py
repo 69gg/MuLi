@@ -747,6 +747,20 @@ class Memory:
             self._purge_orphans()
         return [item for identifier in identifiers if (item := self.get(identifier)) is not None]
 
+    def automatic_episode_id(self, source_id: str) -> str | None:
+        """只投影仍可证明是指定来源初始自动归档副本的主键。"""
+        row = self.store.db.execute(
+            "SELECT x.memory_id FROM memory_meta x JOIN memories m ON m.id=x.memory_id "
+            "JOIN memory_sources s ON s.id=x.source_id "
+            "WHERE x.source_id=? AND x.dedup_key=? AND m.source=s.source "
+            "AND m.kind='observation' AND x.layer='episodic' AND x.version=1 "
+            "AND x.status='active' AND NOT EXISTS "
+            "(SELECT 1 FROM memory_conflicts c WHERE c.resolved_at IS NULL "
+            "AND (c.left_id=x.memory_id OR c.right_id=x.memory_id))",
+            (source_id, "episodic:" + source_id),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
     def get(self, identifier: str | None) -> dict[str, Any] | None:
         row = self.store.db.execute(
             "SELECT m.*,x.layer,x.source_id,x.trusted_owner,x.quote,x.claim_key,x.status,x.version "
