@@ -1,6 +1,6 @@
 # 指定队友的接办证据（开发中）
 
-2.43候选已实现并完成多轮独立后审、损坏数据红绿修复、完整后端整合及离线构件验证；精确远端候选与发行待完成，尚未发布。2.42已修复独立Linux回退重复核验并正式发行，见[2.42闭合记录](review-v2.42.md#发版闭合)。
+2.43候选已实现并完成多轮独立后审、损坏数据红绿修复、完整后端整合及离线构件验证；签名候选`e664b2e`的远端CI八项成功、Windows两项失败，尚未发布。失败保持可见，未合并或打发行标签。2.42已修复独立Linux回退重复核验并正式发行，见[2.42闭合记录](review-v2.42.md#发版闭合)。
 
 ## 范围与实现
 
@@ -57,3 +57,14 @@
 只保留既有畸形MCP policy夹具的Pydantic序列化warning；平台跳过不算原生实测。全仓Ruff、370文件格式、146生产源完整非增量strict mypy、离线83包锁检查通过。前端未修改，沿用上一相同代码的281项结果；远端quality仍会执行完整前端检查。
 
 最终生产离线构建wheel/sdist成功（guard1.279秒、96.8MiB），只在临时目录offline/no-deps安装本地wheel，源码外资源、API/提示词、默认关闭的桌面及任务控制/lifespan冒烟通过（1.201秒、99.1MiB）。版本/声明/changelog/两包一致校验通过（169毫秒、19.6MiB）；均30秒守卫、实际exit0、swap0，没有下载新依赖。暂不等同远端发行或自然模型接办质量已验收。
+
+## 精确候选远端失败
+
+签名提交`e664b2ed9e5aed7c34a87f637b8b965d6ef2e659`已推送并建立[PR #50](https://github.com/69gg/MuLi/pull/50)。唯一[CI 40019282611](https://github.com/69gg/MuLi/actions/runs/40019282611)已结束，八项成功、两项Windows失败，不以本地完整绿色抵消。
+
+- Windows Python3.12（job120639317991）：三个原生UIA用例失败，3,742 passed、1,457 skipped。首probe在原`AXLease`响应等待处超时；spawn、发送和drain已返回。原诊断在cleanup之后提取，没有收到完整白名单marker，不能从`stage_sequence=unobserved`判断COM、Python版本、JSON或脚本哪一项是根因。cleanup取消reader并清理剩余pipe；之后的nonzero或settled不能反推清理前状态。
+- Windows Python3.13（job120639318011）：`test_channel_configuration_revocation_rejects_waiting_owner`在首个Runtime构造时失败，3,744 passed、1,457 skipped，尚未进入渠道撤销业务。格式分类观察为elapsed2255ms、optional1888ms、setup366ms、queries1、vm_steps0，失败位置在首条可选schema查询返回后的原期限检查。进度回调未触发不代表SQL未执行；保持原默认1秒和失败关闭，不能跳过新库分类、移动期限起点或修改时钟使其通过。
+
+同一次UIA probe的前后清理事实投影已完成，不增加进程、预热、marker、重试或期限，也不输出原stderr、argv、环境或路径。根先运行两项固定夹具反例，旧helper均实际`KeyError: before_cleanup`，pytest0.07秒、守卫590毫秒、峰值60.1MiB/swap0、exit1；它只证明现有诊断缺口，不证明真实超时根因或CI已经修复。
+
+实现复用原PendingHelperLease及原工厂一次构造，观察清理前后同一进程/reader/输入边界，新增有限stderr分类、字节数和相对饱和毫秒，收尾后冻结。根七文件**150 passed**，pytest0.56秒、guard1.160秒、73.3MiB/swap0；strict mypy发现并修正测试侧fake进程身份及隐式模块导出类型表达，没有ignore或生产导出变更，仍保留真实`is`和命名空间绑定恢复。四文件最终strict mypy、Ruff、格式通过，类型检查608毫秒、242.3MiB；最后私有工厂绑定表达单项再验通过，guard728毫秒、65.3MiB。独立最终只读后审无P1/P2。生产`AXLease`、PowerShell与格式分类器未改；新精确远端候选仍待验证，原3.12/3.13失败不声称已修复。

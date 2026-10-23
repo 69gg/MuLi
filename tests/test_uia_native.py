@@ -20,6 +20,7 @@ from helpers.uia_native_startup import observe_native_form
 from helpers.uia_probe_diagnostics import (
     PENDING_SCRIPT,
     PendingHelperLease,
+    ProbeHelperLease,
     observe_pending,
     observe_probe,
     pending_received,
@@ -94,7 +95,10 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
         return await original_spawn(*argv, **kwargs)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    probe = computer._uia._new_lease(once=True)
+    # Observe only this original factory call; later UIA leases stay unchanged.
+    with monkeypatch.context() as construction:
+        construction.setattr(module, "AXHelperLease", ProbeHelperLease)
+        probe = computer._uia._new_lease(once=True)
     try:
         result = await observe_probe(probe)
         assert result["apartment"] == "MTA" and result["has_window"] is False

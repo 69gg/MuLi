@@ -1,7 +1,8 @@
 # Windows UIA probe 的固定阶段证据
 
-状态：原八阶段实现的受限本地纯回归与独立静态后审已完成；本次经根批准增加
-首请求的三个固定输入阶段，受限纯回归与静态检查已通过，真实 Windows 新阶段待验。
+状态：原八阶段及后续三个输入阶段的纯回归与静态检查已完成；2.43 候选的 Windows
+3.12 首 probe 仍超时且没有可见阶段。本文末新增同次首 probe 观察，源码与纯回归已
+编写，等待根统一检查与独立后审；真实 Windows 新观察待验。
 独立于已冻结的 Invoke 片；
 不改变已发布标签，不把增加诊断写成已查明或修复启动超时。
 
@@ -171,3 +172,75 @@ pytest 峰 61.8 MiB，整轮峰 314.2 MiB、swap 0，每条均由原 30 秒守�
 
 以上只证明纯投影/源静态边界；根与独立集成 agent 后审未发现可验证 P1/P2，真实 Windows 新阶段待验。
 没有 PowerShell 语法或实际阶段输出的本地证明，也不把增加三个标记写成已修复超时。
+
+## 2.43 同次首 probe 观察缺口
+
+精确 `e664b2ed9e5aed7c34a87f637b8b965d6ef2e659` 的候选 CI `40019282611`
+最终八项成功、两项 Windows 失败。3.12 job `120639317991` 的三个自有窗口正文
+超时，`3742 passed, 1457 skipped, 3 failed`；首 probe 的完整 traceback 停在原
+`AXHelperLease.request` 等待 `_pending`，证明该次原 spawn、write 和 drain 已返回。
+note 为 `stages=[]/stage_sequence=unobserved`、`sent=1`，仅确认收尾后 lease、
+直接进程和 readers 终态；nonzero 不能反推清理前已经自然退出。
+
+本次与 2.41 的 `utility_ready` 事实不同。最早标记在脚本主体执行后才尝试写出，且为
+best effort；空阶段不能证明脚本未进入，更不能归因 Python 版本、COM、JSON 解码、
+执行策略或调度。旧投影没有 stderr 字节数，零字节、未知短行和半行可给出相同 note。
+原 `_settle_process` 先取消 readers，再丢弃管道余量；清理后前缀不能当作完整 stderr。
+
+### 最小实现与投影
+
+只给测试侧增加 `ProbeHelperLease`，复用 `PendingHelperLease` 已有的原 stdin 包装和
+第一次 `_retire` 前快照。首 native 用例在无 await 的构造范围内临时替换既有 UIA
+工厂的 lease 类，仍由原 `_new_lease(once=True)` 构造完整 argv；随后立即恢复工厂。
+包内 PowerShell 原件、参数、一次 spawn/write/drain、12 秒总期限、TTL、强拥有清理
+与所有原生断言均保留。第四例仍使用原 pending 观察；产品 AXLease 和 PS 源码不改。
+
+原 `uia_probe_diagnostic=` 保留既有字段，增加 `before_cleanup/after_cleanup` 两份
+有限快照。前者在父 `_retire` 改状态和调度原清理任务之前无 await 保存，后者在原
+owner 收尾后读取；投影或时钟失败仍不替换原错误对象、outcome 或取消。原错存在时
+收尾错误不覆盖它；成功路径收尾失败仍传播。每条 note 仍限 4096 ASCII bytes。
+
+两份快照复用固定 spawn/lease/exit 枚举、process 存在、readers 全部终态、0/1 发送
+计数、原输入包装和 write/drain 布尔量。只增加保留前缀的 `stderr_bytes`、原
+`stderr_prefix_capped`、完整白名单 `script_stages/stage_sequence`，以及固定分类：
+`empty` 表示前缀零字节；`known_stage` 表示至少一完整白名单行；`unrecognized`
+涵盖未知内容、非 ASCII 和半行，不输出或进一步识别这些内容。`known_stage` 仍可能
+乱序，由原序列字段表达；capped 只表示可能截断，readers settled 不等于 pipe EOF。
+
+相对耗时仅观察同一 lease 的原边界：`spawn` 从原 `_start` 前至其返回，`send` 从
+该返回至原 drain 返回，`response` 从 drain 返回至第一次退休，`cleanup` 从原退休
+至原 `_finish` 结束。当前 `phase` 另允许 `not_started/settled`；`settled` 只表示
+观察时钟冻结，清理是否成功仍看原 `cleanup` 与进程/readers 状态，不将失败收尾改为
+成功。总 `elapsed_ms` 与四个 `phase_ms` 分别向下取整，负量归零、上限为
+`2**31-1`；阶段分别取整之和可小于总量。没有墙上时间、绝对时间、PID、路径、
+argv、环境、原 stderr、异常或响应正文。所有操作内的采样开销仍计入原期限。
+
+这些量可以区分清理前活着/已退出、零前缀/未知非空前缀，以及原预算主要在哪个宿主
+边界消耗，不能据此区分底层 I/O 与调度或证明任何加载根因。没有额外进程、marker、
+读取协程、预热、重试、策略设置、第二份超时或 CI 调度。
+
+### 纯回归与独立失败边界
+
+根先在原 30 秒统一守卫运行两个反例：清理前仍运行且 stderr 零字节，与清理前已经
+退出且 stderr 含未知短内容。二者先验证原 `AXLeaseError` 身份/outcome、同一 owned
+process、一次发送和一次清理，再要求新前后事实；旧投影均在 `before_cleanup`
+缺失处失败。实际 `2 failed`、pytest 0.07 秒，守卫 590 毫秒、峰值 60.1 MiB、swap 0。
+
+实现后的测试复用原 pending fake harness，另覆盖完整白名单、半行/未知/前缀上限、
+晚 spawn 后准确接管、取消对象、reader 取消而无 EOF、相对毫秒取整/饱和/冻结、
+投影/时钟/收尾故障不覆盖原错，以及首 native 工厂 argv/once 与一次生命周期。
+根先在两个诊断文件完成53项，再整合native fixture/window/buttons/computer/invoke共
+七文件**150 passed**，pytest0.56秒、guard1.160秒、73.3MiB/swap0。限定strict mypy
+指出fake Process身份断言和模块私有绑定的类型表达，保持真实`is`语义修正；四文件
+最终strict mypy、Ruff与格式通过，类型检查608毫秒、242.3MiB。最后工厂命名空间
+表达修正后单项再验1 passed，guard728毫秒、65.3MiB。各步30秒守卫、实际exit0，
+没有在开发机执行真实子进程、PowerShell、COM或桌面。独立最终只读后审确认类型
+表达和工厂恢复断言没有弱化，未发现剩余P1/P2；真实Windows仍待新精确候选验收。
+
+同轮 3.13 job `120639318011` 则为独立的 Runtime 构造失败，UIA 正文通过；
+`test_channel_configuration_revocation_rejects_waiting_owner` 在首行 `make_runtime`
+内的第一次 optional 格式查询返回后触发一秒期限，尚未执行配置撤销主体。
+`format_read_observation` 为 `elapsed_ms=2255`、setup 366 ms、optional 1888 ms、
+queries 1、vm_steps 0；`3744 passed, 1457 skipped, 1 failed`。零 progress 回调不证明
+没有执行 SQLite；该失败仍如实保留。本片不改格式分类或预算，不用假时钟、skip 或
+后续不同候选成功掩盖此真实失败，也不把新增观察称为已修复 3.12 启动超时。
