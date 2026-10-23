@@ -13,9 +13,11 @@ import select
 import socket
 import sys
 import time
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast, get_args
+from unittest.mock import patch
 
 from muli.config import ConfigFile
 from muli.format_evidence import read_format_evidence
@@ -28,7 +30,7 @@ from muli.managed_transaction import (
     TransitionV2,
     raw_snapshot,
 )
-from muli.management_transaction import Deadline, Role, TransactionJournal, _snapshot
+from muli.management_transaction import Deadline, Intent, Phase, Role, TransactionJournal, _snapshot
 from muli.platforms.linux_transaction import (
     ProbeLimits,
     ProcessIdentity,
@@ -61,6 +63,8 @@ ORIGIN = "1" * 32
 IO_SECONDS = 4.0
 PREFIX = "/api/internal/management/"
 ROLES: tuple[Role, ...] = ("base", "target")
+STEP_PHASES: tuple[Phase, ...] = get_args(Phase)
+STEP_INTENTS: tuple[Intent, ...] = get_args(Intent)
 
 
 def read_small(path: Path) -> bytes:
@@ -305,12 +309,46 @@ class ObservedBackend(ManagedLinuxBackend):
 
     check_calls: int = 0
     check_seconds: float = 0.0
+    controller_calls: int = 0
+    controller_seconds: float = 0.0
+    selected_calls: int = 0
+    selected_seconds: float = 0.0
 
     def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+        from muli.platforms import managed_backend, managed_deployment
+
         started = time.monotonic()
         self.check_calls += 1
+        controller_verify = managed_deployment.verify_slot_files
+        # The backend's existing private import is the selected-role lookup seam.
+        selected_verify = cast(
+            Callable[[SlotIdentity], None], vars(managed_backend)["verify_slot_files"]
+        )
+
+        def controller(slot: SlotIdentity) -> None:
+            before = time.monotonic()
+            self.controller_calls += 1
+            try:
+                controller_verify(slot)
+            finally:
+                self.controller_seconds += time.monotonic() - before
+
+        def selected(slot: SlotIdentity) -> None:
+            before = time.monotonic()
+            self.selected_calls += 1
+            try:
+                selected_verify(slot)
+            finally:
+                self.selected_seconds += time.monotonic() - before
+
         try:
-            super()._check(record, role)
+            # _check is synchronous: restore both lookup seams before it returns.
+            # Each wrapper invokes the exact original once, including failures.
+            with (
+                patch.object(managed_deployment, "verify_slot_files", controller),
+                patch.object(managed_backend, "verify_slot_files", selected),
+            ):
+                super()._check(record, role)
         finally:
             self.check_seconds += time.monotonic() - started
 
@@ -324,6 +362,8 @@ async def observed_step(
     """At most 32 small fixed records share the original 4 KiB stdout budget."""
     started = time.monotonic()
     calls, seconds = backend.check_calls, backend.check_seconds
+    controller_calls, controller_seconds = backend.controller_calls, backend.controller_seconds
+    selected_calls, selected_seconds = backend.selected_calls, backend.selected_seconds
     try:
         return await driver.step()
     finally:
@@ -334,8 +374,15 @@ async def observed_step(
                 min(1_000_000, max(0, round((time.monotonic() - started) * 1000))),
                 min(1_000_000, max(0, backend.check_calls - calls)),
                 min(1_000_000, max(0, round((backend.check_seconds - seconds) * 1000))),
-                previous.phase,
-                previous.intent,
+                min(1_000_000, max(0, backend.controller_calls - controller_calls)),
+                min(
+                    1_000_000,
+                    max(0, round((backend.controller_seconds - controller_seconds) * 1000)),
+                ),
+                min(1_000_000, max(0, backend.selected_calls - selected_calls)),
+                min(1_000_000, max(0, round((backend.selected_seconds - selected_seconds) * 1000))),
+                STEP_PHASES.index(previous.phase),
+                STEP_INTENTS.index(previous.intent),
             ]
             checkpoint("controller-step=" + json.dumps(values, separators=(",", ":")))
         except Exception:
