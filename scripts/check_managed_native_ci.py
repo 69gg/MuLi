@@ -1569,9 +1569,10 @@ class NativeCI:
                 or "ro" not in current["options"].split(",")
             ):
                 raise FixtureError("native_mount_not_readonly")
-        self.bootstrap_files("create")
         self.prepare_manager_environment()
-        self.bootstrap_files("check")
+        # create confirms the complete chain and leaf after instance setup,
+        # before the unchanged idle gate and single start.
+        self.bootstrap_files("create")
         initial = self.observe_manager("manager-idle")
         started = time.monotonic()
         self.setup_command(

@@ -698,45 +698,58 @@ async def manager_template(
             )
             fields = (
                 ("MainPID", "u"),
-                ("ExecStart", "a(sasbttttuii)"),
                 ("ExecStartEx", "a(sasasttttuii)"),
             )
             service = await probe._properties(path, "Service", fields)
-            entries = service["ExecStart"]
             program = system_executables().get("manager")
             if program is None:
                 raise NativeError("native_manager_template")
-            require(
-                isinstance(entries, list)
-                and len(entries) == 1
-                and isinstance(entries[0], list)
-                and len(entries[0]) == 10,
-                "native_manager_template",
-            )
-            entry = entries[0]
-            extended = service["ExecStartEx"]
-            require(
-                isinstance(entry[0], str)
-                and Path(entry[0]).resolve(strict=True) == Path(program)
-                and entry[1] == [entry[0], "--user"]
-                and entry[2] is False
-                and all(type(value) is int and 0 <= value < 2**64 for value in entry[3:7])
-                and type(entry[7]) is int
-                and 0 <= entry[7] < 2**32
-                and all(type(value) is int and -(2**31) <= value < 2**31 for value in entry[8:])
-                and extended == [[entry[0], entry[1], [], *entry[3:]]]
-                and service["MainPID"] == 0
-                and before
-                == {"Id": name, "ActiveState": "inactive", "SubState": "dead", "Job": [0, "/"]}
-                and await probe._properties(
-                    path,
-                    "Unit",
-                    (("Id", "s"), ("ActiveState", "s"), ("SubState", "s"), ("Job", "(uo)")),
+            program_path = Path(program)
+
+            def check_idle(value: dict[str, Any]) -> None:
+                require(
+                    value
+                    == {"Id": name, "ActiveState": "inactive", "SubState": "dead", "Job": [0, "/"]}
+                    and isinstance(value["Job"], list)
+                    and type(value["Job"][0]) is int,
+                    "native_manager_template",
                 )
-                == before
-                and await probe._properties(path, "Service", fields) == service,
-                "native_manager_template",
+
+            def check_command(value: dict[str, Any]) -> None:
+                entries = value["ExecStartEx"]
+                require(
+                    isinstance(entries, list)
+                    and len(entries) == 1
+                    and isinstance(entries[0], list)
+                    and len(entries[0]) == 10,
+                    "native_manager_template",
+                )
+                entry = entries[0]
+                require(
+                    isinstance(entry[0], str)
+                    and Path(entry[0]).resolve(strict=True) == program_path
+                    and entry[1] == [entry[0], "--user"]
+                    and entry[2] == []
+                    and all(type(item) is int and 0 <= item < 2**64 for item in entry[3:7])
+                    and type(entry[7]) is int
+                    and 0 <= entry[7] < 2**32
+                    and all(type(item) is int and -(2**31) <= item < 2**31 for item in entry[8:])
+                    and type(value["MainPID"]) is int
+                    and value["MainPID"] == 0,
+                    "native_manager_template",
+                )
+
+            check_idle(before)
+            check_command(service)
+            after = await probe._properties(
+                path,
+                "Unit",
+                (("Id", "s"), ("ActiveState", "s"), ("SubState", "s"), ("Job", "(uo)")),
             )
+            final_service = await probe._properties(path, "Service", fields)
+            check_idle(after)
+            check_command(final_service)
+            require(after == before and final_service == service, "native_manager_template")
             remaining(deadline)
             account = pwd.getpwnam(user)
             require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_manager_identity")

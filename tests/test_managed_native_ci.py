@@ -388,12 +388,87 @@ def test_bootstrap_target_is_owned_and_verified_before_manager_start(
     created = next(i for i, args in enumerate(commands.calls) if "bootstrap-files" in args)
     template = next(i for i, args in enumerate(commands.calls) if "manager-template" in args)
     started = next(i for i, args in enumerate(commands.calls) if "start" in args)
-    assert created < template < started
-    assert sum("bootstrap-files" in args and "check" in args for args in commands.calls) == 2
+    assert template < created < started
+    assert sum("bootstrap-files" in args and "check" in args for args in commands.calls) == 1
     ci.NativeCI(native.root, run=commands).cleanup()
     receipt = ci.Receipt.read(native.receipt_path)
     assert not target.parent.parent.parent.exists()
     assert receipt.bootstrap_directories == [] and receipt.bootstrap_file is None
+
+
+def test_bootstrap_create_is_the_only_complete_prestart_leaf_observation(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    check_environment = native.check_manager_environment
+    rereads: list[tuple[int, int]] = []
+
+    def checked_environment() -> bool:
+        before = native.setup_bytes
+        verified = check_environment()
+        rereads.append((len(commands.calls), native.setup_bytes - before))
+        return bool(verified)
+
+    def recorded(argv: Any, *, seconds: float = 5) -> Any:
+        if "manager-idle" in argv:
+            saved = ci.Receipt.read(native.receipt_path)
+            assert len(saved.bootstrap_directories) == 5 and saved.bootstrap_file is not None
+            assert saved.environment_file is not None
+        return commands(argv, seconds=seconds)
+
+    native.check_manager_environment = checked_environment
+    native.run = recorded
+    native.prepare()
+    stages: list[str] = []
+    for args in commands.calls:
+        if "manager-template" in args:
+            stages.append("template")
+        elif "install" in args:
+            stages.append("install")
+        elif "daemon-reload" in args:
+            stages.append("reload")
+        elif "bootstrap-files" in args:
+            stages.append(args[7])
+        elif "manager-idle" in args:
+            stages.append("idle")
+        elif "start" in args:
+            stages.append("start")
+        elif "manager-ready" in args:
+            stages.append("ready")
+    assert stages == ["template", "install", "reload", "create", "idle", "start", "ready", "check"]
+    install = next(i for i, args in enumerate(commands.calls) if "install" in args)
+    reload = next(i for i, args in enumerate(commands.calls) if "daemon-reload" in args)
+    assert len(rereads) == 1 and install < rereads[0][0] <= reload
+    assert rereads[0][1] == len(native.environment_data())
+    assert native.receipt.bootstrap_file is not None
+
+
+def test_bootstrap_removed_duplicate_check_has_exact_manifest_body_and_reply_cost(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = native.receipt
+    manifest = json.dumps(
+        {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file},
+        separators=(",", ":"),
+    )
+    before = native.setup_bytes
+    output = b""
+
+    def recorded(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal output
+        reply = commands(argv, seconds=seconds)
+        assert "bootstrap-files" in argv and "check" in argv
+        output = reply.output
+        return reply
+
+    native.run = recorded
+    native.bootstrap_files("check")  # Reproduce only the removed check, on the owned fixture tree.
+    inner = len(manifest.encode()) + len(worker.bootstrap_data())
+    assert json.loads(output)["used"] == inner
+    assert native.setup_bytes - before == inner + len(output)
+    assert native.setup_bytes <= ci.OUTPUT_BYTES
 
 
 @pytest.mark.parametrize("change", ["content", "file", "directory", "symlink"])
@@ -456,11 +531,19 @@ def test_bootstrap_create_lost_reply_never_adopts_or_removes_unconfirmed_tree(
         native.prepare()
     receipt = ci.Receipt.read(native.receipt_path)
     assert len(receipt.bootstrap_directories) == 2 and receipt.bootstrap_file is None
+    assert receipt.environment_file is not None
+    assert (
+        native.environment_directory() / ci.ENVIRONMENT_NAME
+    ).read_bytes() == native.environment_data()
     target = native.home / ".config/systemd/user" / (receipt.user + ".target")
     assert target.read_bytes() == worker.bootstrap_data()
     with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
         ci.NativeCI(native.root, run=commands).cleanup()
     assert target.exists() and commands.accounts and commands.mounts
+    assert not any(
+        any(effect in args for effect in ("start", "revert", "umount", "userdel", "groupdel"))
+        for args in commands.calls
+    )
 
 
 @pytest.mark.parametrize("failure", ["budget", "deadline", "schema"])
@@ -496,7 +579,36 @@ def test_bootstrap_fixed_helper_rejects_without_deleting(
 
 
 @pytest.mark.parametrize(
-    "change", ["none", "flags", "argv", "multiple", "active", "drift", "budget", "deadline"]
+    "change",
+    [
+        "none",
+        "ex-only",
+        "flags",
+        "unknown-flags",
+        "ignore-failure",
+        "argv",
+        "multiple",
+        "active",
+        "drift",
+        "budget",
+        "deadline",
+        "empty",
+        "shape",
+        "timestamp-bool",
+        "timestamp-negative",
+        "timestamp-overflow",
+        "exec-pid-bool",
+        "exec-pid-overflow",
+        "exec-code-bool",
+        "exec-code-underflow",
+        "exec-status-overflow",
+        "unit-job-bool",
+        "main-pid-bool",
+        "after-pid-bool",
+        "after-ex-bool",
+        "unit-drift",
+        "pwd-drift",
+    ],
 )
 async def test_manager_template_is_typed_idle_single_unmodified_command(
     tmp_path: Path,
@@ -511,15 +623,43 @@ async def test_manager_template_is_typed_idle_single_unmodified_command(
     home = tmp_path / "home"
     image = tmp_path / "systemd"
     image.write_bytes(b"not executable")
-    monkeypatch.setattr(pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=uid, pw_dir=str(home)))
+    account_reads = 0
+
+    def account(_: str) -> SimpleNamespace:
+        nonlocal account_reads
+        account_reads += 1
+        return SimpleNamespace(
+            pw_uid=uid + (change == "pwd-drift" and account_reads > 1), pw_dir=str(home)
+        )
+
+    monkeypatch.setattr(pwd, "getpwnam", account)
     monkeypatch.setattr(worker, "system_executables", lambda: {"manager": str(image)})
-    entry = [str(image), [str(image), "--user"], False, 1, 2, 3, 4, 5, 0, 0]
-    extended = [entry[0], entry[1], [], *entry[3:]]
+    extended = [str(image), [str(image), "--user"], [], 1, 2, 3, 4, 5, 0, 0]
+    entry = [extended[0], extended[1], False, *extended[3:]]
     if change == "flags":
         extended[2] = ["privileged"]
+    if change == "unknown-flags":
+        extended[2] = ["fixture-unknown-prefix"]
+    if change == "ignore-failure":
+        extended[2] = ["ignore-failure"]
     if change == "argv":
-        entry[1] = [str(image), "--user", "--unit=foreign.target"]
-        extended[1] = entry[1]
+        extended[1] = [str(image), "--user", "--unit=foreign.target"]
+        entry[1] = extended[1]
+    bad_numbers: dict[str, tuple[int, Any]] = {
+        "timestamp-bool": (3, True),
+        "timestamp-negative": (4, -1),
+        "timestamp-overflow": (5, 2**64),
+        "exec-pid-bool": (7, False),
+        "exec-pid-overflow": (7, 2**32),
+        "exec-code-bool": (8, False),
+        "exec-code-underflow": (8, -(2**31) - 1),
+        "exec-status-overflow": (9, 2**31),
+    }
+    if change in bad_numbers:
+        index, invalid = bad_numbers[change]
+        extended[index] = invalid
+    if change == "shape":
+        extended.pop()
     fields: dict[str, tuple[str, Any]] = {
         "Id": ("s", f"user@{uid}.service"),
         "ActiveState": ("s", "active" if change == "active" else "inactive"),
@@ -527,15 +667,24 @@ async def test_manager_template_is_typed_idle_single_unmodified_command(
         "Job": ("(uo)", [0, "/"]),
         "MainPID": ("u", 0),
         "ExecStart": ("a(sasbttttuii)", [entry] * (2 if change == "multiple" else 1)),
-        "ExecStartEx": ("a(sasasttttuii)", [extended]),
+        "ExecStartEx": ("a(sasasttttuii)", [extended] * (2 if change == "multiple" else 1)),
     }
+    if change == "ex-only":
+        fields.pop("ExecStart")
+    if change == "empty":
+        fields["ExecStartEx"] = ("a(sasasttttuii)", [])
+    if change == "unit-job-bool":
+        fields["Job"] = ("(uo)", [False, "/"])
+    if change == "main-pid-bool":
+        fields["MainPID"] = ("u", False)
     seen: list[list[str]] = []
     charged = 0
+    historical_charged = 0
 
     async def query(
         argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
     ) -> dict[str, Any]:
-        nonlocal charged
+        nonlocal charged, historical_charged
         seen.append(argv)
         assert argv[:2] == ["busctl", "--system"] and not merge_stderr
         assert "--auto-start=no" in argv and 0 < timeout <= 5
@@ -545,14 +694,35 @@ async def test_manager_template_is_typed_idle_single_unmodified_command(
             assert argv[-3:] == ["LoadUnit", "s", f"user@{uid}.service"]
             data = {"type": "o", "data": ["/org/freedesktop/systemd1/unit/fixture"]}
             output = json.dumps(data)
+            historical_output = output
         else:
             names = argv[argv.index("get-property") + 4 :]
             if change == "drift" and len(seen) > 3:
+                fields["ExecStartEx"] = ("a(sasasttttuii)", [[*extended[:3], 99, *extended[4:]]])
+            if change == "unit-drift" and len(seen) > 3:
                 fields["Job"] = ("(uo)", [1, "/job"])
+            if change == "after-pid-bool" and len(seen) > 3:
+                fields["MainPID"] = ("u", False)
+            if change == "after-ex-bool" and len(seen) > 3:
+                fields["ExecStartEx"] = ("a(sasasttttuii)", [[*extended[:3], True, *extended[4:]]])
+            if "ExecStartEx" in names:
+                assert names == ["MainPID", "ExecStartEx"]
             output = "\n".join(
                 json.dumps({"type": fields[name][0], "data": fields[name][1]}) for name in names
             )
+            historical_output = output
+            if "ExecStartEx" in names:
+                historical_output = "\n".join(
+                    (
+                        json.dumps({"type": fields["MainPID"][0], "data": fields["MainPID"][1]}),
+                        json.dumps({"type": "a(sasbttttuii)", "data": [entry]}),
+                        json.dumps(
+                            {"type": fields["ExecStartEx"][0], "data": fields["ExecStartEx"][1]}
+                        ),
+                    )
+                )
         charged += len(output.encode()) + len(b"bounded diagnostic")
+        historical_charged += len(historical_output.encode()) + len(b"bounded diagnostic")
         return {"exit_code": 0, "output": output, "stderr": "bounded diagnostic"}
 
     monkeypatch.setattr(process, "run_process", query)
@@ -563,9 +733,14 @@ async def test_manager_template_is_typed_idle_single_unmodified_command(
         assert not seen
     else:
         value = await worker.manager_template(user, uid, home, deadline, worker.MAX_BYTES)
-        if change == "none":
+        if change in {"none", "ex-only"}:
             assert value == {"code": "verified", "manager": str(image), "used": charged}
             assert len(seen) == 5
+            one_legacy_line = (
+                json.dumps({"type": "a(sasbttttuii)", "data": [entry]}) + "\n"
+            ).encode()
+            # The historical five calls differ only by this duplicated line in each Service reply.
+            assert historical_charged - value["used"] == 2 * len(one_legacy_line) > 0
         else:
             assert value == {"code": "native_manager_template", "used": worker.MAX_BYTES}
         assert not any("StartUnit" in args or "systemctl" in args for args in seen)
@@ -5282,3 +5457,124 @@ def test_notification_reply_counts_actual_outer_bytes_without_replacing_manager_
     else:
         assert facts["notification"]["status_text"] == "ready"
     assert native.setup_bytes == before + charged + returned
+
+
+@pytest.mark.parametrize("case", ["exact", "one-over", "removed-check-room", "saturates-grant"])
+def test_complete_setup_reply_obeys_total_bytes_beyond_minimum_reply_reserve(
+    fixture: tuple[Any, Commands],
+    case: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    native.receipt.setup_phase = "manager_show_before"
+    summary = {
+        "code": "native_deadline_exceeded",
+        "stage": "manager_validation",
+        "query_status": 0,
+        "query_code": "ok",
+        "used": 17468,
+    }
+    native.manager_failure = summary
+    names = (f"user-runtime-dir@{commands.uid}.service", f"user@{commands.uid}.service")
+    data: dict[str, Any] = {
+        "stage": "service_properties",
+        "query_status": 0,
+        "query_code": "ok",
+        "failure": "none",
+        "unit": names[1],
+        "units": [
+            {
+                "unit": name,
+                "code": "observed",
+                "load_state": "loaded",
+                "active_state": "active" if index == 0 else "activating",
+                "sub_state": "exited" if index == 0 else "start",
+                "result": "success",
+                "exec_code": 1 if index == 0 else 0,
+                "exec_status": 0,
+                "pid": 0 if index == 0 else 42,
+                "job": 0 if index == 0 else 100,
+                "cgroup_present": True,
+            }
+            for index, name in enumerate(names)
+        ],
+        "process": {
+            "code": "observed",
+            "exe": "manager",
+            "uid_matches": True,
+            "state": "S",
+            "wait": "epoll_wait",
+        },
+        "journal": {"code": "no_known_event", "incomplete": False, "events": []},
+        "context": {
+            "code": "observed",
+            "notify_env": "parent",
+            "runtime_env": "expected",
+            "bus_env": "expected",
+            "listen_env": "absent",
+            "parent_notify": "socket_owner_matches",
+            "user_notify": "socket_owner_matches",
+            "private_socket": "socket_owner_matches",
+        },
+        "notification": worker.notification_projection(
+            {
+                "StatusText": "fixture private text",
+                "NotifyAccess": "main",
+                "Type": "notify-reload",
+                "Result": "success",
+            },
+            {"ActiveState": "activating", "SubState": "start"},
+        ),
+        "used": 1024,
+    }
+
+    def encoded() -> bytes:
+        return (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    output = encoded()
+    assert len(output) > 1024  # Original minimum reserve is not a complete-JSON size cap.
+    before = ci.OUTPUT_BYTES - data["used"] - len(output) + (case == "one-over")
+    saving = 0
+    if case == "removed-check-room":
+        original_used = native.setup_bytes
+        native.bootstrap_files("check")  # Measure the actual removed fixture helper/reply cost.
+        saving = native.setup_bytes - original_used
+        historical_before = ci.OUTPUT_BYTES - data["used"] - len(output) + 1
+        assert historical_before + data["used"] + len(output) == ci.OUTPUT_BYTES + 1
+        before = historical_before - saving
+    if case == "saturates-grant":
+        # A synthetic saving increases the grant, and the worker consumes that increase too.
+        # This deliberately proves deduplication alone does not ensure the outer reply fits.
+        before -= len(worker.bootstrap_data())
+        data["used"] = ci.OUTPUT_BYTES - before - 1024
+        output = encoded()
+    native.setup_bytes = before
+    calls = 0
+
+    def observed(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal calls
+        assert "diagnose-setup" in argv
+        calls += 1
+        assert int(argv[-1]) == ci.OUTPUT_BYTES - before - 1024
+        assert data["used"] <= int(argv[-1])
+        assert 0 < seconds <= ci.CLEANUP_SECONDS
+        return ci.Reply(0, output)
+
+    native.run = observed
+    native.observe_setup(ci.FixtureError("native_deadline_exceeded"))
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert saved["resources"]["manager_failure"] == summary and calls == 1
+    assert saved["timeline"] == [] and saved["generations"] == []
+    assert b"private text" not in (native.root / "result.json").read_bytes()
+    facts = saved["resources"]["setup"]
+    assert facts["diagnostic_status"] == 0
+    assert native.setup_bytes == before + data["used"] + len(output)
+    if case in {"exact", "removed-check-room"}:
+        assert native.setup_bytes == ci.OUTPUT_BYTES + (1 - saving if saving else 0)
+        assert native.setup_bytes <= ci.OUTPUT_BYTES
+        assert facts["diagnostic_code"] == "ok" and len(facts["units"]) == 2
+        assert facts["notification"]["status_text"] == "other"
+    else:
+        assert native.setup_bytes > ci.OUTPUT_BYTES
+        assert facts["diagnostic_code"] == "output_budget" and facts["units"] == []
+        assert facts["context"]["code"] == "not_started"

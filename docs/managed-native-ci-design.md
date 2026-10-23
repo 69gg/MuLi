@@ -456,11 +456,11 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 
 **将对照收窄为明确最小 basic 事务，而非空 target。** 空 target 的唯一 job 完成后理论上能从 jobs-empty 路径发送 READY，但不保证 dbus.socket/user bus 可供现有 worker 使用，不能直接充当原生事务验收。待审内容改为唯一自有 target，设置 `DefaultDependencies=no`，显式 `Requires=basic.target dbus.socket`、`After=basic.target dbus.socket`；其余依赖继续来自 runner 已安装单元。保留标准 basic 的 sockets/timers/paths 链及真实 dbus.socket，只替换默认 default.target 这一初始事务入口；其他已安装依赖仍可能间接拉入 default 或额外 job，不能声称已得到完整隔离闭包。不把“达到 basic”改为“空事务结束”。自有 target 的名字由本轮 receipt 唯一身份派生，不重用系统单元名。[v255 默认 target](https://github.com/systemd/systemd/blob/v255/units/user/default.target)、[basic 依赖](https://github.com/systemd/systemd/blob/v255/units/user/basic.target)、[target 默认依赖规则](https://github.com/systemd/systemd/blob/v255/src/core/target.c#L33-L62)。
 
-候选仅修改 fixture 生命周期：在 `prepare()` 已确认专用账户及私有 volume、尚未启动 user@ 时，创建 `self.home/.config/systemd/user/<receipt.user>.target`。新建目录归专用 UID/GID、0700，target 普通文件归 root、0644；拒绝已存在目录/文件/符号链接，不领养任何条目。receipt 记录 volume、home、三个新目录和文件的 device/inode；长度、owner、权限与预期固定字节由 worker 核验。0700 卷交给专用 UID 后，runner 无权直接遍历，故复用可信 root worker 的 `bootstrap-files` 枚举子命令；它只接受 create/check/remove、账户身份、有限 inode 清单、原截止与余额，不接受任意路径、单元名或正文。路径从已核账户和固定相对组件派生，以 O_NOFOLLOW/dir_fd 打开目录，前后核对链及账户；启动前两次、readiness 后再次核定。文件位于该 UID 可写父目录，root 所有权不代表父目录不可替换，故仍须逐次身份验证。
+候选仅修改 fixture 生命周期：在 `prepare()` 已确认专用账户及私有 volume、尚未启动 user@ 时，创建 `self.home/.config/systemd/user/<receipt.user>.target`。新建目录归专用 UID/GID、0700，target 普通文件归 root、0644；拒绝已存在目录/文件/符号链接，不领养任何条目。receipt 记录 volume、home、三个新目录和文件的 device/inode；长度、owner、权限与预期固定字节由 worker 核验。0700 卷交给专用 UID 后，runner 无权直接遍历，故复用可信 root worker 的 `bootstrap-files` 枚举子命令；它只接受 create/check/remove、账户身份、有限 inode 清单、原截止与余额，不接受任意路径、单元名或正文。路径从已核账户和固定相对组件派生，以 O_NOFOLLOW/dir_fd 打开目录，前后核对链及账户。第十七轮实现启动前 create/check 两次完整核定；下节去重候选改为安装 drop-in 并 reload 后由 create 完整核定一次，readiness 后的 check 保留。文件位于该 UID 可写父目录，root 所有权不代表父目录不可替换，故仍须逐次身份验证。
 
 cleanup 先按现有路径停止专用 manager 并核空组，再仅删除身份与固定内容仍匹配的 target，以及本次确实创建且仍为空的目录；保留非空目录和其他条目。遇到非空剩余目录时保存剩余清单并明确失败，阻止继续 revert、卸载、删除账户，保留可达现场；不能用 fake mount 在卸载后仍可读取来证明真实路径保留。原脚本也不会删除 filesystem.ext4，但本门不依赖以后重新挂载镜像恢复。文件/目录替换或 create 回包丢失时不从路径重新领养，明确失败并保留账户/挂载证据；已经确认的 remove 回包丢失后，仅允许匹配的原目录清单内已不存在的自有子目录。root helper 不递归删除，不清 volume/home，不删除其他 unit。POSIX 路径检查并非对同 UID 并发修改者的原子沙箱；创建发生于 manager 启动前，清理沿用先停专用 manager 的门。
 
-`--unit=<owned-name>` 注入现有 `environment_data()/prepare_manager_environment()` 所管理的**该 UID 专用** user@.service drop-in：新 `manager-template` 模式复用 `_SetupIO` 与现有 typed probe，仅向 PID1 LoadUnit 加载该专用实例的元数据，再前后读取 inactive/dead、无 job/MainPID 的 Unit/Service 属性；不启动它。`ExecStart` 必须恰为一条已安装 root 镜像的 `systemd --user`，并同时读取 `ExecStartEx` 确认无任何执行前缀标志，避免 legacy ignore-failure 布尔掩盖其他前缀。镜像由现有 `system_executables()["manager"]` 发现，不硬编码发行版路径。只有同代前后属性一致才返回镜像，仍是非原子观察；receipt 保存经校验的镜像，专用 drop-in 重置该实例 ExecStart、保留 `--user`、增加 `--unit`。未知参数、标志、多命令或活动模板均拒绝。Type=notify-reload、NotifyAccess、PAM、UID、资源/环境项保持；撤销沿用专用 drop-in receipt 门。依据：[ExecStart/ExecStartEx v255 属性](https://github.com/systemd/systemd/blob/v255/src/core/dbus-service.c#L342-L343)、[typed 签名](https://github.com/systemd/systemd/blob/v255/src/core/dbus-execute.h#L17-L19)、[参数与初始事务](https://github.com/systemd/systemd/blob/v255/src/core/main.c#L811-L816)、[加载与排入 job](https://github.com/systemd/systemd/blob/v255/src/core/main.c#L2130-L2178)。
+`--unit=<owned-name>` 注入现有 `environment_data()/prepare_manager_environment()` 所管理的**该 UID 专用** user@.service drop-in：新 `manager-template` 模式复用 `_SetupIO` 与现有 typed probe，仅向 PID1 LoadUnit 加载该专用实例的元数据，再前后读取 inactive/dead、无 job/MainPID 的 Unit/Service 属性；不启动它。第十七轮同时读取 ExecStart 与 ExecStartEx；下节去重候选只读取完整 `ExecStartEx`，自行严格核验唯一命令、已安装 root 镜像的 `systemd --user`、空 flags 及所有整数范围，不依赖 legacy ignore-failure 布尔。镜像由现有 `system_executables()["manager"]` 发现，不硬编码发行版路径。只有前后 Unit、MainPID、完整 Ex 属性一致且账户复查通过才返回镜像，仍是非原子观察；receipt 保存经校验的镜像，专用 drop-in 重置该实例 ExecStart、保留 `--user`、增加 `--unit`。未知参数、标志、多命令或活动模板均拒绝。Type=notify-reload、NotifyAccess、PAM、UID、资源/环境项保持；撤销沿用专用 drop-in receipt 门。依据：[ExecStart/ExecStartEx v255 属性](https://github.com/systemd/systemd/blob/v255/src/core/dbus-service.c#L342-L343)、[typed 签名](https://github.com/systemd/systemd/blob/v255/src/core/dbus-execute.h#L17-L19)、[参数与初始事务](https://github.com/systemd/systemd/blob/v255/src/core/main.c#L811-L816)、[加载与排入 job](https://github.com/systemd/systemd/blob/v255/src/core/main.c#L2130-L2178)。
 
 只有原 manager readiness 成功，才继续原 user bus、daemon-reload、实际服务与三事务验证：private socket 仍由 manager 自身初始化，dbus.socket 则由上述显式要求提供监听入口，后续真实 client 仍可触发既有 dbus 服务；此方案不把 private direct server 改作 busctl broker，也不另造客户端。若 socket/provider 缺失、启动失败或 user bus 后验失败，就保留相应真实失败，不能以 READY 单独判通过。一次最小 basic 事务成功且实际三事务/cleanup 均通过，只支持“改变默认初始事务后此 fixture 可运行”，不定位哪个默认 job、不证明所有正常用户 default 启动；若仍 activating/start，则该改变未解决问题，不据此认定通知传输坏或再加期限。
 
@@ -473,6 +473,41 @@ cleanup 先按现有路径停止专用 manager 并核空组，再仅删除身份
 独立只读后审曾指出fake卸载后的可读路径不足以证明真实foreign现场保留；随后根批准采用上述非空树失败门，回归确认无revert/umount/账户删除而非假设fake与真实卸载等价。复审确认该门保存receipt后直抛，现有cleanup无finally绕行；路径身份、完整leaf读取、单ExecStart与Ex标志、原期限/字节未见剩余P1/P2。此处只记录静态后审和纯验证，不代替根整合审查或远端真实READY、三事务、正常cleanup验收；当前仍未提交、推送或发起第十七轮。
 
 根已签名保存本片 `2a5afda`，再签名合入2.42精确 `ed2b267`，避免重复已证实的独立回退重复哈希问题。合并后全仓Ruff、371文件format及native481项再次通过，pytest1.40秒、guard2.036秒、112.1MiB、swap0。首个两脚本类型命令遗漏源码搜索根，外部`muli`导入按Any产生八处返回诊断；使用明确`MYPYPATH=src`后strict mypy两文件通过，1.266秒、174.3MiB、swap0，未改源码或规则遮蔽。上述均30秒守卫实际exit0；下一次远端对照只允许该新受控初始target，不提高预算或把READY代替真实bus、三事务与cleanup。
+
+### 第十七轮：受控 bootstrap 配置未使 readiness 通过，后备事实被预算门拒绝
+
+精确候选 `65b131ac936a80eda6238428c4a6014a6aaa3694` 的 [CI 40016794998](https://github.com/69gg/MuLi/actions/runs/40016794998) 已全终态，**10项成功、1项失败**，仅 [native job 120630811773](https://github.com/69gg/MuLi/actions/runs/40016794998/job/120630811773) 失败。有限日志记录 run 从 `2026-10-23T20:07:52.003Z` 到 `20:09:19.996Z` 报 `native_deadline_exceeded`；独立 cleanup 随后约5秒报 `native_command_timeout`，不得改写为正常清理或继承第十六轮的清理结果。
+
+本轮唯一 tiny artifact `/tmp/muli-native17-evidence.zip` 为 **1227字节**，SHA256 `a2c0cf0e395c88c86577058ae932f483f0e41b73caab0e102653a08a54c3c0c0`；根已有限校验仅 receipt1303字节/result1103字节且通过 schema。取证两个守卫实收exit0，分别1.667秒/44.3 MiB、152毫秒/22.6 MiB，swap0；此处复用根的白名单投影，未再次解析或下载ZIP。
+
+receipt 的 bootstrap 五目录及leaf账本存在、manager_program和environment_file存在，setup_phase为 `manager_show_before`。按当前调用顺序，create的完整校验、模板核定、drop-in安装复验、启动前bootstrap check、两系统unit的idle门及单次start准入均已返回；后续 readiness 未通过，所以 readiness后的bootstrap check没有执行。本轮证明该受控启动配置未解决观察到期，不能据此宣称目标已被用户manager加载、basic/dbus job完成、某一READY发送路径发生或通知传输失败。
+
+result仍 `completed=false/stage=manager_setup/code=setup_failed`、timeline0/generations0，即 **0个真实事务**；manager_failure为 `native_deadline_exceeded/manager_validation/query_status=0/query_code=ok/used=17468`。setup中 diagnostic_status=0、diagnostic_code=output_budget，其余units空和stage/process/context/notification/journal的not_started是外层默认包：**status0说明后备worker确已返回，不证明内部没有观察**。`observe_setup()`先计worker used与实际返回JSON，超原总量时不接受整包事实，保存默认包和output_budget。因此没有本轮可接受的runtime-dir状态、manager PID/epoll、通知标签或journal事件；第十六轮的observed值不得当成本轮证据。cleanup absent，user/group未删除、仍有3个挂载和bootstrap账本，只能保留未回收边界。
+
+预算只读定位：新 `bootstrap_reply()` 对create/check的manifest、固定正文及回包计费；`manager_template()`前后两次同时读取ExecStart与ExecStartEx，每份都重复镜像、argv和七个运行状态数值；drop-in source写入和安装后复读也各计一次。它们均消耗原setup_bytes，`observe_manager()`与`observe_setup()`仍依次从同一32768字节减余额，不会为新增验证另开额度。最后diagnose-setup只扣原1024最小回包预留，其完整JSON允许超过1024，若内部接近授予额度则最终总量门仍会正确拒绝。这条预算链有代码证据；artifact未保存各阶段计数和被拒回包，不能声称已精确定位内部耗尽行或仅凭新开销算出本次差额。
+
+最小预算去重候选已获根授权并落盘，尚未完成 green 检查：`manager_template()`保留同一前后Unit/MainPID绑定，仅读取完整ExecStartEx、要求唯一命令和空flags；它已包含legacy ExecStart重复的path/argv/状态，legacy bool只表达ignore-failure，不必双读。固定v255由同一ExecCommand产生两个属性，Ex通过flags-to-strv表达完整标志；不能改为只读legacy而丢失其他前缀。[v255 两类序列化](https://github.com/systemd/systemd/blob/v255/src/core/dbus-execute.c#L1075-L1141)。同时将create移至drop-in已核安装、安装后正文复读和reload均完成之后，复用create自身的最终完整目录/leaf核验与receipt保存作为启动前门，消除紧接的第二次check；保留原idle门、readiness后的check及全部cleanup身份门。没有删除source写入/安装复读计费或增加启动变量。
+
+先用纯red夹具固定同一typed回包、manifest与JSON字节，逐项断言去掉的两行legacy属性及一次重复helper的精确差额；构造原预算刚好不足而去重后足够的后备完整投影，要求最终used+实际JSON仍≤32768、1024原最小预留不变，并保留真正不足时拒绝、未知prefix/模板漂移/目录替换仍拒绝、start次数仍1和首因仍deadline。若这些节省不足以让所需白名单观察在原余额完成，就不声称解决，也不据此启动另一轮CI或添加启动变量。
+
+根与独立只读审查同意去重方案后，先补以下3个旧实现确定不满足的red节点，由根独占守卫实际运行，3项均按预期失败：
+
+- `tests/test_managed_native_ci.py::test_manager_template_is_typed_idle_single_unmodified_command[ex-only]`：只提供完整Ex typed字段，要求成功且used精确计入实际stdout/stderr；旧实现仍请求legacy字段会失败。既有flags、ignore-failure、multiple及前后drift反例均直接修改Ex内容，不借legacy变化代测。
+- `tests/test_managed_native_ci.py::test_bootstrap_create_is_the_only_complete_prestart_leaf_observation`：要求严格template→install→reload→create→idle→单start→ready→check，旧实现create位置和重复check不满足。安装后的固定source复读仍由原environment校验负责，未删除。
+- `tests/test_managed_native_ci.py::test_bootstrap_create_lost_reply_never_adopts_or_removes_unconfirmed_tree`：强化已有节点，要求create丢回包时已安装environment_file、仍为两项初始bootstrap清单、leaf未领养，后续cleanup失败且无start/revert/umount/账户组删除；旧实现的create先于environment安装，会在environment_file断言失败。
+
+上述 red 的 pytest 为0.55秒、守卫1.067秒、峰值98.1 MiB/swap0，真实exit1；分别失败于旧实现仍读legacy、旧create位置及重复check、丢回包时environment_file尚不存在。根收到终态后授权两处生产去重。当前 Ex 自行核验完整shape、四个uint64时间戳、uint32执行PID、两个int32状态值、唯一argv与空flags；前后Unit/MainPID/Ex逐项再验且完全相等，最后复查passwd UID/HOME。布尔不能冒充数字零或一；已补真正改变Ex的未知flags、ignore-failure、多命令和前后漂移，以及账户/Unit/MainPID/整数类型范围、预算和原期限反例。
+
+新增纯预算节点如下，已由根统一运行；固定夹具不代替托管runner实际结果：
+
+- `tests/test_managed_native_ci.py::test_manager_template_is_typed_idle_single_unmodified_command[none]` 与 `[ex-only]`：对同一组typed数据分别记录新回包及重构的历史双读回包。五次调用中只有两次Service回复各少一行legacy，精确差额为 `2 × len(legacy_typed_json_line + newline)`；新used必须等于真实注入stdout/stderr字节。路径由临时目录派生，不报告可移植的固定节省数。
+- `tests/test_managed_native_ci.py::test_bootstrap_removed_duplicate_check_has_exact_manifest_body_and_reply_cost`：在自有临时树上实际调用被删除的check一次，差额必须精确等于compact manifest UTF-8字节、固定正文读取字节与真实helper JSON回包字节之和；create的完整读取、回包和保存仍在。
+- `tests/test_managed_native_ci.py::test_complete_setup_reply_obeys_total_bytes_beyond_minimum_reply_reserve[exact]`、`[one-over]`：完整白名单JSON包含两unit/process/journal/context/notification且超过1024字节。最终 `before + worker_used + len(actual_reply)` 恰为32768才接受，超1字节拒绝整包；保留manager首因、0事务及status0，不把拒绝后的默认not_started说成worker未执行。
+- 同节点 `[removed-check-room]`：复用实际测得的check差额，固定同一worker_used和真实JSON，使历史总量为32769、扣除差额后落入原总量，才能接受。`[saturates-grant]` 则固定一个纯合成节省，让worker继续耗满增加后的 `allowance - 1024` 授额；完整JSON超过1024，最终总量仍超限，必须拒绝。该负例直接限制“去重必然恢复诊断”的推断。
+
+全部期限和计费语义保持：约88秒原观察、2.5秒失败回执、5秒cleanup/单命令、32 KiB累计及原1024字节最小回复预留均未改，1024不是完整JSON的大小上限。以上精确差额仅属于固定纯fixture；native17未保存各阶段原始计数或被拒回复，不能回填为本轮真实差额，也不证明下一次诊断能完成或manager会ready。
+
+根统一格式化后，完整native **506项通过**（pytest1.87秒、守卫2.461秒、131 MiB）；直接OutputBudget四项通过（0.03秒、守卫510毫秒、53.6 MiB）。三文件Ruff、format-check和明确`MYPYPATH=src:tests`的两脚本strict mypy全部exit0，类型检查694毫秒、166.8 MiB；各步30秒守卫实收终态、swap均0，单次完成后才运行下一项。独立最终后审未发现剩余P1/P2，完整shape/身份/丢回包与清理门、最终实际JSON总量门均保留。本地检查不创建真实服务、账户或挂载，子agent没有独立运行检查；提交与下一精确远端对照仍由根处理，不重复native17或称真实READY已修复。
 
 ## 第十五轮：新增投影返回有效事实，manager 仍未就绪
 
