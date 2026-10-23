@@ -98,7 +98,25 @@ class Commands:
         self.calls.append(values)
         if values[-1] == "describe":
             return ci.Reply(0, json.dumps(self.description).encode())
-        if len(values) == 8 and values[3] == "diagnose-setup":
+        if len(values) in {9, 11} and values[3] in {"manager-idle", "manager-ready"}:
+            assert values[:2] == (sys.executable, "-I")
+            assert values[4:7] == (
+                next(iter(self.accounts)),
+                str(self.uid),
+                self.accounts[values[4]][2],
+            )
+            value: dict[str, Any] = {"code": "idle", "invocation": "", "used": 128}
+            if values[3] == "manager-ready":
+                value.update(
+                    code="ready",
+                    group=self.group,
+                    pid=42,
+                    invocation="a" * 32,
+                    elapsed_ms=0,
+                    late_ready=False,
+                )
+            return ci.Reply(0, json.dumps(value).encode())
+        if len(values) == 9 and values[3] == "diagnose-setup":
             assert values[:2] == (sys.executable, "-I")
             assert values[4:7] == (
                 next(iter(self.accounts)),
@@ -109,6 +127,7 @@ class Commands:
                 0,
                 json.dumps(
                     {
+                        "used": 128,
                         "stage": "listing",
                         "query_status": 0,
                         "query_code": "ok",
@@ -1052,6 +1071,7 @@ def test_cleanup_uses_one_absolute_budget_and_keeps_resources_when_it_expires(
     commands.calls.clear()
     saved = worker.Case(native.volume).result
     saved.update(completed=True, stage="complete")
+    saved["resources"]["manager_readiness"] = native.manager_readiness
     worker.write_json(native.volume / "result.json", saved)
     ci.write_json(native.root / "result.json", saved)
     clock = 100.0
@@ -1102,6 +1122,7 @@ def test_last_receipt_save_cannot_publish_cleanup_verified_after_deadline(
     native.prepare()
     saved = worker.Case(native.volume).result
     saved.update(completed=True, stage="complete")
+    saved["resources"]["manager_readiness"] = native.manager_readiness
     worker.write_json(native.volume / "result.json", saved)
     ci.write_json(native.root / "result.json", saved)
     clock = 100.0
@@ -1319,10 +1340,10 @@ def test_startup_diagnostic_cannot_extend_the_original_harness_deadline(
 
     monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
     native.run = fail
-    with pytest.raises(ci.FixtureError, match="command_failed"):
+    with pytest.raises(ci.FixtureError, match="^native_execute_deadline$"):
         native.execute()
     saved = ci.fixture_result((native.root / "result.json").read_bytes())
-    assert saved["resources"]["startup"]["code"] == "unavailable"
+    assert "startup" not in saved["resources"] and saved["code"] == "worker_not_observed"
     assert not any("diagnose" in args for args in commands.calls)
 
 
@@ -1676,6 +1697,9 @@ async def test_worker_exports_fixed_failure_code_without_arbitrary_exception_bod
         raise error
 
     monkeypatch.setattr(worker.Case, "drive", fail)
+    monkeypatch.setenv(
+        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+    )
     assert await worker.run("drive", tmp_path) == 1
     result = ci.fixture_result((tmp_path / "result.json").read_bytes())
     assert result["code"] == expected and result["completed"] is False
@@ -1692,16 +1716,10 @@ def test_setup_timeout_keeps_exact_before_phase_and_original_failure(
         "daemon_reload": ("systemctl", "daemon-reload"),
         "manager_start": (
             "systemctl",
+            "--system",
+            "--no-block",
             "start",
             f"user-runtime-dir@{commands.uid}.service",
-            f"user@{commands.uid}.service",
-        ),
-        "manager_show": (
-            "systemctl",
-            "show",
-            "--value",
-            "-p",
-            "ControlGroup",
             f"user@{commands.uid}.service",
         ),
     }
@@ -1709,7 +1727,9 @@ def test_setup_timeout_keeps_exact_before_phase_and_original_failure(
 
     def fail(argv: Any, *, seconds: float = 5) -> Any:
         nonlocal attempted
-        if tuple(argv[2:]) == suffixes[phase]:
+        if (phase == "manager_show" and argv[3:4] == ("manager-ready",)) or (
+            phase != "manager_show" and tuple(argv[2:]) == suffixes[phase]
+        ):
             attempted += 1
             assert ci.Receipt.read(native.receipt_path).setup_phase == f"{phase}_before"
             raise ci.FixtureError("native_command_timeout")
@@ -1725,10 +1745,16 @@ def test_setup_timeout_keeps_exact_before_phase_and_original_failure(
     facts = result["resources"]["setup"]
     assert result["stage"] == "manager_setup" and result["generations"] == []
     assert facts["phase"] == f"{phase}_before" and facts["client_code"] == "timeout"
-    assert facts["diagnostic_status"] == 0 and facts["failure"] == "none"
+    if phase == "manager_show":
+        assert facts["diagnostic_status"] is None and facts["diagnostic_code"] == "command_failed"
+        assert native.setup_bytes == ci.OUTPUT_BYTES
+        assert not any("diagnose-setup" in args for args in commands.calls)
+    else:
+        assert facts["diagnostic_status"] == 0 and facts["failure"] == "none"
     assert attempted == 1 and not any("systemd-run" in args for args in commands.calls)
-    diagnostic = next(args for args in commands.calls if "diagnose-setup" in args)
-    assert diagnostic[0] == sys.executable and not diagnostic[0].startswith(str(native.volume))
+    if phase != "manager_show":
+        diagnostic = next(args for args in commands.calls if "diagnose-setup" in args)
+        assert diagnostic[0] == sys.executable and not diagnostic[0].startswith(str(native.volume))
 
 
 def test_setup_success_persists_each_exact_command_boundary(fixture: tuple[Any, Commands]) -> None:
@@ -1738,9 +1764,8 @@ def test_setup_success_persists_each_exact_command_boundary(fixture: tuple[Any, 
     def observe(argv: Any, *, seconds: float = 5) -> Any:
         if argv[2:4] in (
             ("systemctl", "daemon-reload"),
-            ("systemctl", "start"),
-            ("systemctl", "show"),
-        ):
+            ("systemctl", "--system"),
+        ) or argv[3:4] == ("manager-ready",):
             seen.append(ci.Receipt.read(native.receipt_path).setup_phase)
         return commands(argv, seconds=seconds)
 
@@ -1797,7 +1822,7 @@ def test_late_setup_observation_cannot_restart_its_five_second_window(
             raise ci.FixtureError("native_command_timeout")
         reply = commands(argv, seconds=seconds)
         if "diagnose-setup" in argv:
-            assert float(argv[-1]) == 105.0 and seconds == 5.0
+            assert float(argv[-2]) == 105.0 and seconds == 5.0
             clock = 105.0
         return reply
 
@@ -2256,23 +2281,35 @@ async def test_setup_observer_identity_and_deadline_refuse_before_system_query(
             )
 
 
+@pytest.mark.parametrize("usage", [False, True])
 def test_setup_diagnostic_cli_keeps_separate_readonly_mode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], usage: bool
 ) -> None:
-    called: list[tuple[str, int, Path, float]] = []
+    called: list[tuple[str, int, Path, float, int, bool]] = []
 
-    async def observe(user: str, uid: int, home: Path, deadline: float) -> dict[str, Any]:
-        called.append((user, uid, home, deadline))
+    async def observe(
+        user: str,
+        uid: int,
+        home: Path,
+        deadline: float,
+        byte_limit: int,
+        *,
+        include_usage: bool,
+    ) -> dict[str, Any]:
+        called.append((user, uid, home, deadline, byte_limit, include_usage))
         return {"stage": "manager"}
 
     monkeypatch.setattr(worker, "diagnose_setup", observe)
     monkeypatch.setattr(
         sys,
         "argv",
-        ["worker", "diagnose-setup", "muli-ci-" + "a" * 12, "23145", str(tmp_path), "105"],
+        ["worker", "diagnose-setup", "muli-ci-" + "a" * 12, "23145", str(tmp_path), "105"]
+        + (["1024"] if usage else []),
     )
     assert worker.main() == 0
-    assert called == [("muli-ci-" + "a" * 12, 23145, tmp_path, 105.0)]
+    assert called == [
+        ("muli-ci-" + "a" * 12, 23145, tmp_path, 105.0, 1024 if usage else worker.MAX_BYTES, usage)
+    ]
     assert json.loads(capsys.readouterr().out) == {"stage": "manager"}
 
 
@@ -2795,3 +2832,563 @@ def test_journal_export_rejects_raw_or_unsupported_claims(change: str) -> None:
         }[change]
         event[key] = new
     assert not ci.journal_facts(value)
+
+
+def test_execute_does_not_restart_its_budget_after_preparation(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    clock = 100.0
+    original_prepare = native.prepare
+
+    def prepare() -> dict[str, Any]:
+        nonlocal clock
+        result: dict[str, Any] = original_prepare()
+        clock += ci.HARNESS_SECONDS + ci.CLEANUP_SECONDS
+        return result
+
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(native, "prepare", prepare)
+    with pytest.raises(ci.FixtureError, match="^native_execute_deadline$"):
+        native.execute()
+    assert not any("systemd-run" in argv for argv in commands.calls)
+
+
+def test_execute_clips_actual_harness_runtime_and_passes_absolute_deadline(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    clock = 100.0
+    original_prepare = native.prepare
+
+    def prepare() -> dict[str, Any]:
+        nonlocal clock
+        result: dict[str, Any] = original_prepare()
+        clock += 10
+        return result
+
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(native, "prepare", prepare)
+    native.execute()
+    launched = next(argv for argv in commands.calls if "systemd-run" in argv)
+    runtime = next(
+        float(value.removeprefix("--property=RuntimeMaxSec="))
+        for value in launched
+        if value.startswith("--property=RuntimeMaxSec=")
+    )
+    assert runtime == ci.HARNESS_SECONDS - 10
+    assert "--setenv=MULI_NATIVE_EXECUTE_DEADLINE=195.0" in launched
+
+
+async def test_drive_without_coordinator_deadline_never_enters_business(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    async def drive(self: Any) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.delenv("MULI_NATIVE_EXECUTE_DEADLINE", raising=False)
+    monkeypatch.setattr(worker.Case, "drive", drive)
+    assert await worker.run("drive", tmp_path) == 1
+    assert not called
+
+
+@pytest.fixture
+def manager_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Real typed probe and proc parsing, with every command/file/clock injected."""
+    import pwd
+    from types import SimpleNamespace
+
+    from muli import process
+    from muli.platforms import linux_transaction
+
+    uid = 23145
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    paths = {
+        name: "/org/freedesktop/systemd1/unit/" + str(index) for index, name in enumerate(names)
+    }
+    group = f"/user.slice/user-{uid}.slice/{names[-1]}"
+    control: dict[str, Any] = {
+        "clock": 100.0,
+        "polls": 0,
+        "calls": [],
+        "files": [],
+        "limits": [],
+        "states": ["active"],
+        "overrides": {},
+        "absent": False,
+        "ticks": 100,
+        "uid": uid,
+        "home": tmp_path,
+        "user": "muli-ci-" + "a" * 12,
+        "group": group,
+        "read_count": 0,
+        "exe": "manager",
+        "cancel": False,
+        "stderr": "",
+    }
+    monkeypatch.setattr(worker.time, "monotonic", lambda: control["clock"])
+    monkeypatch.setattr(
+        pwd, "getpwnam", lambda user: SimpleNamespace(pw_uid=uid, pw_dir=str(tmp_path))
+    )
+    monkeypatch.setattr(
+        worker, "system_executables", lambda: {"manager": "/usr/lib/systemd/systemd"}
+    )
+
+    async def sleep(seconds: float) -> None:
+        assert 0 < seconds <= worker.CLEANUP_SECONDS
+        control["clock"] += seconds
+
+    monkeypatch.setattr(worker.asyncio, "sleep", sleep)
+
+    def read(path: Path, limit: int) -> bytes:
+        control["files"].append(path)
+        assert 0 < limit <= worker.MAX_BYTES
+        if control.get("file_error"):
+            raise PermissionError("private file error")
+        if path.name == "stat":
+            if control.get("cross_boundary") and control["polls"] == 1:
+                control["clock"] = 105.1
+            control["read_count"] += 1
+            ticks = control["ticks"] + (
+                control.get("change_ticks", False) and control["read_count"] > 1
+            )
+            return f"42 (private ) name) S {'0 ' * 18}{ticks}\n".encode()
+        if path.name == "status":
+            value = control.get("process_uid", uid)
+            return f"Name:\tprivate\nUid:\t{value}\t{value}\t{value}\t{value}\n".encode()
+        if path.name == "cgroup":
+            return f"0::{control.get('process_group', group)}/init.scope\n".encode()
+        values = {
+            "memory.max": str(worker.MEMORY),
+            "memory.swap.max": "0",
+            "pids.max": str(worker.TASKS),
+            "cpu.max": "100000 100000",
+            "cgroup.controllers": "cpu memory pids",
+        }
+        if control.get("bad_kernel"):
+            values["memory.max"] = "max"
+        return values[path.name].encode()
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", read)
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        assert not merge_stderr and 0 < timeout <= worker.CLEANUP_SECONDS
+        assert 0 < limit <= worker.MAX_BYTES
+        control["calls"].append(argv)
+        control["limits"].append(limit)
+        if control["cancel"]:
+            raise asyncio.CancelledError
+        if control.get("query_deadline"):
+            control["clock"] = 180.0
+        if argv[:4] == ["sudo", "--non-interactive", "--", "readlink"]:
+            assert argv[-2:] == ["--", "/proc/42/exe"]
+            output = (
+                "/usr/lib/systemd/systemd\n" if control["exe"] == "manager" else "/private/image\n"
+            )
+        else:
+            assert argv[:2] == ["busctl", "--system"] and "--auto-start=no" in argv
+            assert not any(action in argv for action in ("LoadUnit", "start", "stop", "journalctl"))
+            if "ListUnitsByPatterns" in argv:
+                assert argv[-2:] == list(names)
+                control["polls"] += 1
+                values = (
+                    []
+                    if control["absent"]
+                    else [
+                        [name, "", "loaded", "active", "running", "", paths[name], 0, "", "/"]
+                        for name in names
+                    ]
+                )
+                output = json.dumps({"type": "a(ssssssouso)", "data": [values]})
+            elif "GetUnit" in argv:
+                output = json.dumps({"type": "o", "data": [paths[argv[-1]]]})
+            else:
+                index = argv.index("get-property")
+                fields = argv[index + 4 :]
+                name = next(name for name, path in paths.items() if path == argv[index + 2])
+                is_manager = name == names[-1]
+                state = control["states"][min(control["polls"] - 1, len(control["states"]) - 1)]
+                idle, active = state == "inactive", state == "active"
+                values = {
+                    "Id": ("s", name),
+                    "LoadState": ("s", "loaded"),
+                    "ActiveState": ("s", state),
+                    "SubState": (
+                        "s",
+                        "dead"
+                        if idle
+                        else (
+                            "running" if is_manager and active else "exited" if active else "start"
+                        ),
+                    ),
+                    "InvocationID": ("ay", [0 if idle else 10] * 16),
+                    "Job": (
+                        "(uo)",
+                        [0, "/"] if idle or active else [11, "/org/freedesktop/systemd1/job/11"],
+                    ),
+                    "Type": ("s", "notify-reload" if is_manager else "oneshot"),
+                    "MainPID": ("u", 42 if is_manager and not idle else 0),
+                    "ControlGroup": (
+                        "s",
+                        (group if is_manager else "/user.slice/" + name) if not idle else "",
+                    ),
+                    "Result": ("s", "success"),
+                    "ExecMainCode": ("i", 0 if is_manager or idle else 1),
+                    "ExecMainStatus": ("i", 0),
+                }
+                if is_manager:
+                    for key, value in control["overrides"].items():
+                        values[key] = (values[key][0], value)
+                    if control.get("change_invocation") and control["polls"] > 1:
+                        values["InvocationID"] = ("ay", [11] * 16)
+                output = "\n".join(
+                    json.dumps({"type": values[field][0], "data": values[field][1]})
+                    for field in fields
+                )
+        if control.get("budget"):
+            output = "x" * (limit + 1)
+        return {"exit_code": 0, "output": output, "stderr": control["stderr"]}
+
+    monkeypatch.setattr(process, "run_process", query)
+    return control
+
+
+@pytest.mark.parametrize(
+    "case", ["absent", "idle", "active", "job", "pid", "group", "failed", "load"]
+)
+async def test_manager_idle_accepts_only_exact_absence_or_fully_stopped_instance(
+    manager_observation: dict[str, Any], case: str
+) -> None:
+    control = manager_observation
+    control["states"] = ["inactive"]
+    if case == "absent":
+        control["absent"] = True
+    elif case in {"active", "failed"}:
+        control["states"] = [case]
+    elif case in {"job", "pid", "group", "load"}:
+        key, value = {
+            "job": ("Job", [11, "/org/freedesktop/systemd1/job/11"]),
+            "pid": ("MainPID", 42),
+            "group": ("ControlGroup", control["group"]),
+            "load": ("LoadState", "not-found"),
+        }[case]
+        control["overrides"][key] = value
+    value = await worker.manager_state(
+        "manager-idle", control["user"], control["uid"], control["home"], 105.0, worker.MAX_BYTES
+    )
+    assert (value["code"] == "idle") == (case in {"absent", "idle"})
+    assert value["used"] > 0
+    if case == "absent":
+        assert not any("GetUnit" in call for call in control["calls"])
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ready",
+        "late",
+        "sample-late",
+        "cross-boundary",
+        "old",
+        "changed",
+        "ticks",
+        "pid",
+        "group",
+        "type",
+        "uid",
+        "image",
+        "kernel",
+        "query-deadline",
+        "budget",
+        "stderr",
+        "pending",
+    ],
+)
+async def test_manager_ready_requires_same_new_instance_process_kernel_and_shared_budget(
+    manager_observation: dict[str, Any], case: str
+) -> None:
+    control = manager_observation
+    if case in {"late", "changed"}:
+        control["states"] = ["activating"] * 8 + ["active"]
+    if case in {"late", "sample-late"}:
+        control["clock"] = 106.0
+    if case == "cross-boundary":
+        control["clock"] = 104.9
+        control["states"] = ["activating", "active"]
+        control["cross_boundary"] = True
+    if case == "changed":
+        control["change_invocation"] = True
+    if case == "ticks":
+        control["change_ticks"] = True
+    if case in {"pid", "group", "type", "pending"}:
+        key, value = {
+            "pid": ("MainPID", 0),
+            "group": ("ControlGroup", ""),
+            "type": ("Type", "simple"),
+            "pending": ("Job", [11, "/org/freedesktop/systemd1/job/11"]),
+        }[case]
+        control["overrides"][key] = value
+    if case == "uid":
+        control["process_uid"] = 0
+    if case == "image":
+        control["exe"] = "other"
+    if case == "kernel":
+        control["bad_kernel"] = True
+    if case == "query-deadline":
+        control["query_deadline"] = True
+    if case == "budget":
+        control["budget"] = True
+    if case == "stderr":
+        control["stderr"] = "x" * worker.MAX_BYTES
+    value = await worker.manager_state(
+        "manager-ready",
+        control["user"],
+        control["uid"],
+        control["home"],
+        180.0,
+        worker.MAX_BYTES,
+        started=100.0,
+        previous="0a" * 16 if case == "old" else "",
+    )
+    assert (value["code"] == "ready") == (
+        case in {"ready", "late", "sample-late", "cross-boundary"}
+    )
+    if value["code"] == "ready":
+        assert value["late_ready"] is (case == "late")
+        assert value["group"] == control["group"] and value["invocation"] == "0a" * 16
+    assert all("/wchan" not in argument for call in control["calls"] for argument in call)
+    assert all(limit <= worker.MAX_BYTES for limit in control["limits"])
+    assert "private" not in json.dumps(value)
+
+
+async def test_manager_ready_cancel_is_not_converted_to_not_ready(
+    manager_observation: dict[str, Any],
+) -> None:
+    control = manager_observation
+    control["cancel"] = True
+    with pytest.raises(asyncio.CancelledError):
+        await worker.manager_state(
+            "manager-ready",
+            control["user"],
+            control["uid"],
+            control["home"],
+            180.0,
+            worker.MAX_BYTES,
+            started=100.0,
+        )
+
+
+def test_no_block_start_is_single_admission_and_lost_ack_cannot_enter_harness(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    starts = 0
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal starts
+        value = commands(argv, seconds=seconds)
+        if argv[2:6] == ("systemctl", "--system", "--no-block", "start"):
+            starts += 1
+            assert ci.Receipt.read(native.receipt_path).setup_phase == "manager_start_before"
+            raise ci.FixtureError("native_command_timeout")
+        return value
+
+    native.run = run
+    with pytest.raises(ci.FixtureError, match="^native_command_timeout$"):
+        native.execute()
+    assert starts == 1 and not any(
+        "systemd-run" in argv or "manager-ready" in argv for argv in commands.calls
+    )
+    assert ci.Receipt.read(native.receipt_path).setup_phase == "manager_start_before"
+
+
+@pytest.mark.parametrize(
+    "change", ["code", "invocation", "pid", "group", "elapsed", "late", "used", "extra"]
+)
+def test_coordinator_rejects_invalid_ready_receipt_before_harness(
+    fixture: tuple[Any, Commands],
+    change: str,
+) -> None:
+    native, commands = fixture
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        reply = commands(argv, seconds=seconds)
+        if "manager-ready" in argv:
+            value = json.loads(reply.output)
+            key, item = {
+                "code": ("code", []),
+                "invocation": ("invocation", "0" * 32),
+                "pid": ("pid", True),
+                "group": ("group", "/foreign"),
+                "elapsed": ("elapsed_ms", -1),
+                "late": ("late_ready", "yes"),
+                "used": ("used", True),
+                "extra": ("private", "secret"),
+            }[change]
+            value[key] = item
+            return ci.Reply(0, json.dumps(value).encode())
+        return reply
+
+    native.run = run
+    with pytest.raises(ci.FixtureError):
+        native.execute()
+    assert not any("systemd-run" in argv for argv in commands.calls)
+    assert b"secret" not in (native.root / "result.json").read_bytes()
+
+
+def test_initial_ready_and_diagnostic_share_actual_byte_budget(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    allowances: list[int] = []
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        reply = commands(argv, seconds=seconds)
+        if "manager-idle" in argv:
+            allowances.append(int(argv[8]))
+        if "manager-ready" in argv:
+            allowances.append(int(argv[8]))
+            value = json.loads(reply.output)
+            value.update(code="native_manager_failed")
+            return ci.Reply(0, json.dumps(value).encode())
+        if "diagnose-setup" in argv:
+            allowances.append(int(argv[-1]))
+        return reply
+
+    native.run = run
+    with pytest.raises(ci.FixtureError, match="^native_manager_failed$"):
+        native.execute()
+    assert len(allowances) == 3 and allowances[0] > allowances[1] > allowances[2] > 0
+    assert 0 < native.setup_bytes < ci.OUTPUT_BYTES
+
+
+def test_success_exports_only_finite_manager_readiness_metadata(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.execute()
+    value = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert value["resources"]["manager_readiness"] == {"elapsed_ms": 0, "late_ready": False}
+    assert (
+        len(
+            [
+                argv
+                for argv in commands.calls
+                if argv[2:6] == ("systemctl", "--system", "--no-block", "start")
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("spent", [30.0, 95.0], ids=["case-margin", "execute-deadline"])
+def test_preparation_cost_cannot_launch_a_case_with_insufficient_margin(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+    spent: float,
+) -> None:
+    native, commands = fixture
+    clock = 100.0
+    original = native.prepare
+
+    def prepare() -> dict[str, Any]:
+        nonlocal clock
+        value: dict[str, Any] = original()
+        clock += spent
+        return value
+
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(native, "prepare", prepare)
+    with pytest.raises(ci.FixtureError):
+        native.execute()
+    assert not any("systemd-run" in argv for argv in commands.calls)
+
+
+@pytest.mark.parametrize("left", [0.0, 60.0, 60.01])
+def test_worker_rechecks_business_margin_without_resetting_case_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    left: float,
+) -> None:
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 100.0)
+    case = worker.Case(tmp_path, seconds=worker.CASE_SECONDS)
+    case.drive_deadline = 100 + left
+    if left > worker.CASE_SECONDS:
+        case.require_start_time()
+    else:
+        with pytest.raises(worker.NativeError):
+            case.require_start_time()
+    assert case.deadline == 160.0
+
+
+def test_result_collection_failure_preserves_first_client_error(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native, commands = fixture
+    commands.fail_case = True
+
+    def fail() -> None:
+        raise OSError("private collection body")
+
+    monkeypatch.setattr(native, "collect_result", fail)
+    with pytest.raises(ci.FixtureError, match="^native_command_failed$"):
+        native.execute()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "valid",
+        "elapsed-bool",
+        "elapsed-negative",
+        "elapsed-large",
+        "late",
+        "extra",
+        "mode",
+        "symlink",
+        "budget",
+    ],
+)
+def test_fresh_cleanup_preserves_only_valid_owned_finite_readiness(
+    fixture: tuple[Any, Commands],
+    change: str,
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    value = worker.Case(native.volume).result
+    value.update(completed=True, stage="complete")
+    worker.write_json(native.volume / "result.json", value)
+    readiness: dict[str, Any] = {"elapsed_ms": 6001, "late_ready": True}
+    saved = {**value, "resources": {"manager_readiness": readiness}}
+    if change.startswith("elapsed-"):
+        readiness["elapsed_ms"] = {
+            "elapsed-bool": True,
+            "elapsed-negative": -1,
+            "elapsed-large": 95001,
+        }[change]
+    elif change == "late":
+        readiness["late_ready"] = "private"
+    elif change == "extra":
+        readiness["private"] = "secret"
+    path = native.root / "result.json"
+    ci.write_json(path, saved)
+    if change == "mode":
+        path.chmod(0o644)
+    elif change == "symlink":
+        path.rename(native.root / "old-result.json")
+        path.symlink_to(native.root / "old-result.json")
+    elif change == "budget":
+        path.write_bytes(b"x" * (ci.OUTPUT_BYTES + 1))
+    fresh = ci.NativeCI(native.root, run=commands)
+    fresh.cleanup()
+    result = ci.fixture_result(path.read_bytes())
+    assert result["completed"] is True and result["resources"]["cleanup"] == "verified"
+    assert result["timeline"] == value["timeline"] and result["generations"] == value["generations"]
+    assert (result["resources"].get("manager_readiness") == readiness) is (change == "valid")
+    assert commands.accounts == {} and commands.mounts == {}

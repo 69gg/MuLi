@@ -510,6 +510,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "startup",
             "environment",
             "setup",
+            "manager_readiness",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -540,6 +541,14 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             valid = valid and startup_facts(facts, facts["unit"])
         elif name == "setup":
             valid = setup_facts(facts)
+        elif name == "manager_readiness":
+            valid = (
+                isinstance(facts, dict)
+                and set(facts) == {"elapsed_ms", "late_ready"}
+                and type(facts["elapsed_ms"]) is int
+                and 0 <= facts["elapsed_ms"] <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 1000
+                and type(facts["late_ready"]) is bool
+            )
         elif name == "environment":
             names = {
                 "uid_matches",
@@ -739,7 +748,10 @@ class NativeCI:
         self.receipt_path = root / "receipt.json"
         self.receipt: Receipt | None = None
         self.cleanup_deadline: float | None = None
+        self.execute_deadline: float | None = None
         self.manager_limits: dict[str, str] = {}
+        self.setup_bytes = 0
+        self.manager_readiness: dict[str, int | bool] = {}
 
     @property
     def volume(self) -> Path:
@@ -770,14 +782,31 @@ class NativeCI:
             raise FixtureError("native_volume_directory_changed")
 
     def call(self, argv: Sequence[str], *, seconds: float = 5) -> Reply:
-        if self.cleanup_deadline is not None:
-            seconds = min(seconds, self.cleanup_deadline - time.monotonic())
+        deadline = (
+            self.cleanup_deadline if self.cleanup_deadline is not None else self.execute_deadline
+        )
+        code = (
+            "native_cleanup_deadline"
+            if self.cleanup_deadline is not None
+            else "native_execute_deadline"
+        )
+        if deadline is not None:
+            seconds = min(seconds, deadline - time.monotonic())
             if seconds <= 0:
-                raise FixtureError("native_cleanup_deadline")
+                raise FixtureError(code)
         reply = self.run(argv, seconds=seconds)
-        if self.cleanup_deadline is not None and time.monotonic() >= self.cleanup_deadline:
-            raise FixtureError("native_cleanup_deadline")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise FixtureError(code)
         return reply
+
+    def execute_remaining(self) -> float:
+        """Use one same-host monotonic deadline, never a fresh phase allowance."""
+        if self.execute_deadline is None:
+            raise FixtureError("native_execute_deadline")
+        value = self.execute_deadline - time.monotonic()
+        if value <= 0:
+            raise FixtureError("native_execute_deadline")
+        return value
 
     def checked(self, argv: Sequence[str], *, seconds: float = 5) -> bytes:
         reply = self.call(argv, seconds=seconds)
@@ -790,7 +819,11 @@ class NativeCI:
 
     def save(self) -> None:
         assert self.receipt is not None
+        if self.execute_deadline is not None and self.cleanup_deadline is None:
+            self.execute_remaining()
         write_json(self.receipt_path, asdict(self.receipt))
+        if self.execute_deadline is not None and self.cleanup_deadline is None:
+            self.execute_remaining()
 
     def setup_command(self, phase: str, *argv: str) -> bytes:
         """Persist the exact original command's boundary without changing its budget."""
@@ -803,6 +836,96 @@ class NativeCI:
         self.receipt.setup_phase = f"{phase}_after"
         self.save()
         return output
+
+    def observe_manager(
+        self, mode: str, *, started: float = 0.0, previous: str = ""
+    ) -> dict[str, Any]:
+        """Only the coordinator starts units; this existing runner worker is read-only."""
+        assert self.receipt is not None
+        uid, _ = self.current_account()
+        end = (
+            self.execute_deadline - CLEANUP_SECONDS
+            if self.execute_deadline is not None
+            else time.monotonic() + CLEANUP_SECONDS
+        )
+        allowance = OUTPUT_BYTES - self.setup_bytes
+        # Reserve the small returned JSON as well as charging all inner stdout/stderr.
+        if allowance <= 1024 or end <= time.monotonic():
+            raise FixtureError("native_manager_observation_budget")
+        worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+        arguments: tuple[str, ...] = (
+            sys.executable,
+            "-I",
+            str(worker),
+            mode,
+            self.receipt.user,
+            str(uid),
+            str(self.home),
+            str(end),
+            str(allowance - 1024),
+        )
+        if mode == "manager-ready":
+            arguments += (str(started), previous)
+        try:
+            reply = self.call(arguments, seconds=end - time.monotonic())
+            observed = object_bytes(reply.output)
+            used = observed.get("used")
+            if type(used) is not int or not 0 <= used <= allowance or reply.code != 0:
+                raise FixtureError("native_manager_observation")
+        except (ValueError, OSError, subprocess.SubprocessError):
+            self.setup_bytes = OUTPUT_BYTES  # No return means no reusable unspent allowance.
+            raise
+        self.setup_bytes += used + len(reply.output)
+        if self.setup_bytes > OUTPUT_BYTES:
+            raise FixtureError("native_diagnostic_output_budget")
+        if observed.get("code") != ("idle" if mode == "manager-idle" else "ready"):
+            if isinstance(observed.get("code"), str) and observed["code"] in {
+                "native_manager_observation",
+                "native_manager_reply",
+                "native_manager_conflict",
+                "native_manager_missing",
+                "native_manager_failed",
+                "native_manager_changed",
+                "native_manager_not_ready",
+                "native_manager_process",
+                "native_deadline_exceeded",
+                "native_diagnostic_output_budget",
+                "native_kernel_limit",
+                "native_kernel_cpu",
+                "native_kernel_controllers",
+            }:
+                raise FixtureError(observed["code"])
+            raise FixtureError("native_manager_not_ready")
+        expected = {"code", "used", "invocation"}
+        if mode == "manager-ready":
+            expected |= {"group", "pid", "elapsed_ms", "late_ready"}
+        invocation = observed.get("invocation")
+        if (
+            set(observed) != expected
+            or not isinstance(invocation, str)
+            or (invocation and re.fullmatch(r"[a-f0-9]{32}", invocation) is None)
+        ):
+            raise FixtureError("native_manager_observation")
+        if mode == "manager-ready":
+            group = observed["group"]
+            if (
+                not invocation
+                or invocation == "0" * 32
+                or invocation == previous
+                or type(observed["pid"]) is not int
+                or not 0 < observed["pid"] < 2**31
+                or type(observed["elapsed_ms"]) is not int
+                or not 0 <= observed["elapsed_ms"] <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 1000
+                or type(observed["late_ready"]) is not bool
+                or not isinstance(group, str)
+                or not group.startswith("/")
+                or ".." in Path(group).parts
+                or Path(group).name != f"user@{uid}.service"
+            ):
+                raise FixtureError("native_manager_observation")
+        if time.monotonic() >= end:
+            raise FixtureError("native_execute_deadline")
+        return observed
 
     def current_account(self) -> tuple[int, int]:
         receipt = self.receipt
@@ -1110,22 +1233,30 @@ class NativeCI:
             ):
                 raise FixtureError("native_mount_not_readonly")
         self.prepare_manager_environment()
-        unit = f"user@{actual[0]}.service"
+        initial = self.observe_manager("manager-idle")
+        started = time.monotonic()
         self.setup_command(
-            "manager_start", "systemctl", "start", f"user-runtime-dir@{actual[0]}.service", unit
+            "manager_start",
+            "systemctl",
+            "--system",
+            "--no-block",
+            "start",
+            f"user-runtime-dir@{actual[0]}.service",
+            f"user@{actual[0]}.service",
         )
-        group = (
-            self.setup_command(
-                "manager_show", "systemctl", "show", "--value", "-p", "ControlGroup", unit
-            )
-            .decode()
-            .strip()
+        self.receipt.setup_phase = "manager_show_before"
+        self.save()
+        ready = self.observe_manager(
+            "manager-ready", started=started, previous=initial["invocation"]
         )
-        if not group.startswith("/") or Path(group).name != unit or ".." in Path(group).parts:
-            raise FixtureError("native_manager_group")
+        group = ready["group"]
+        self.manager_readiness = {key: ready[key] for key in ("elapsed_ms", "late_ready")}
         self.receipt.manager_group = group
+        self.receipt.setup_phase = "manager_show_after"
         self.save()
         self.manager_limits = verify_kernel(CGROUP_ROOT / group.lstrip("/"), MEMORY, TASKS)
+        if self.execute_deadline is not None:
+            self.execute_remaining()
         return description
 
     def copy_slot(self, name: str, description: dict[str, Any]) -> None:
@@ -1151,13 +1282,18 @@ class NativeCI:
             encoding="utf-8",
         )
 
-    def transient(self, fixture: dict[str, Any], mode: str, seconds: int) -> tuple[str, ...]:
+    def transient(self, fixture: dict[str, Any], mode: str, seconds: float) -> tuple[str, ...]:
         unit = fixture["harness_unit"] if mode == "drive" else "muli-native-cleanup.service"
         cleanup: tuple[str, ...] = ()
         if mode == "cleanup":
             if self.cleanup_deadline is None:
                 raise FixtureError("native_cleanup_deadline")
             cleanup = (f"--setenv=MULI_NATIVE_CLEANUP_DEADLINE={self.cleanup_deadline}",)
+        elif self.execute_deadline is not None:
+            seconds = min(seconds, self.execute_remaining() - CLEANUP_SECONDS)
+            if seconds <= CASE_SECONDS:
+                raise FixtureError("native_case_start_budget")
+            cleanup = (f"--setenv=MULI_NATIVE_EXECUTE_DEADLINE={self.execute_deadline}",)
         return (
             "systemd-run",
             "--user",
@@ -1170,7 +1306,7 @@ class NativeCI:
             "--property=MemorySwapMax=0",
             "--property=CPUQuota=100%",
             f"--property=TasksMax={HARNESS_TASKS}",
-            f"--property=RuntimeMaxSec={seconds}",
+            f"--property=RuntimeMaxSec={seconds:g}",
             "--property=TimeoutStopSec=2",
             "--property=Restart=no",
             "--property=KillMode=control-group",
@@ -1193,6 +1329,27 @@ class NativeCI:
         if reply.code:
             return None
         result = fixture_result(reply.output)
+        readiness = self.manager_readiness
+        if not readiness and self.cleanup_deadline is not None:
+            try:
+                descriptor = os.open(
+                    self.root / "result.json",
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
+                )
+                with os.fdopen(descriptor, "rb") as source:
+                    info = os.fstat(source.fileno())
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077
+                    ):
+                        raise FixtureError("native_result_owner")
+                    saved = fixture_result(source.read(OUTPUT_BYTES + 1))
+                readiness = saved["resources"].get("manager_readiness", {})
+            except (OSError, ValueError):
+                pass  # Optional old facts cannot grant cleanup success or hide its failure.
+        if readiness:
+            result["resources"]["manager_readiness"] = readiness
         write_json(self.root / "result.json", result)
         return result
 
@@ -1264,6 +1421,8 @@ class NativeCI:
         write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
 
     def execute(self) -> None:
+        deadline = time.monotonic() + HARNESS_SECONDS + CLEANUP_SECONDS
+        self.execute_deadline = deadline
         try:
             self.prepare()
         except (ValueError, OSError, subprocess.SubprocessError) as error:
@@ -1272,6 +1431,8 @@ class NativeCI:
             except (ValueError, OSError, subprocess.SubprocessError):
                 pass  # An evidence failure must preserve the original preparation failure.
             raise
+        if self.execute_remaining() <= CASE_SECONDS + CLEANUP_SECONDS:
+            raise FixtureError("native_case_start_budget")
         fixture = object_bytes(self.sudo("cat", str(self.volume / "fixture.json")))
         write_json(
             self.root / "result.json",
@@ -1281,12 +1442,20 @@ class NativeCI:
                 "code": "worker_not_observed",
                 "timeline": [],
                 "generations": [],
-                "resources": {"manager": self.manager_limits},
+                "resources": {
+                    "manager": self.manager_limits,
+                    **(
+                        {"manager_readiness": self.manager_readiness}
+                        if self.manager_readiness
+                        else {}
+                    ),
+                },
             },
         )
-        deadline = time.monotonic() + HARNESS_SECONDS + CLEANUP_SECONDS
         client_status: int | None = None
         client_failure = "not_started"
+        result: dict[str, Any] | None = None
+        failed = False
         try:
             reply = self.call(
                 self.user_arguments(*self.transient(fixture, "drive", HARNESS_SECONDS)),
@@ -1297,18 +1466,24 @@ class NativeCI:
             if client_status:
                 raise FixtureError("native_command_failed")
         except (ValueError, OSError, subprocess.SubprocessError) as error:
+            failed = True
             if client_status is None:
                 client_failure = command_error_code(error)
             raise
         finally:
-            result = self.collect_result()
-            if result is None:
-                self.observe_startup(
-                    fixture,
-                    deadline=deadline,
-                    client_status=client_status,
-                    client_code=client_failure,
-                )
+            if time.monotonic() < deadline:
+                try:
+                    result = self.collect_result()
+                    if result is None:
+                        self.observe_startup(
+                            fixture,
+                            deadline=deadline,
+                            client_status=client_status,
+                            client_code=client_failure,
+                        )
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    if not failed:
+                        raise
         if result is None or result.get("completed") is not True:
             raise FixtureError("native_case_failed")
 
@@ -1340,7 +1515,14 @@ class NativeCI:
             "journal": {"code": "not_started", "incomplete": False, "events": []},
         }
         end = time.monotonic() + CLEANUP_SECONDS
+        if self.execute_deadline is not None:
+            end = min(end, self.execute_deadline)
+        if time.monotonic() >= end:
+            return
         try:
+            allowance = OUTPUT_BYTES - self.setup_bytes
+            if allowance <= 1024:
+                raise FixtureError("native_diagnostic_output_budget")
             worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
             reply = self.call(
                 (
@@ -1352,6 +1534,7 @@ class NativeCI:
                     str(uid),
                     str(self.home),
                     str(end),
+                    str(allowance - 1024),
                 ),
                 seconds=end - time.monotonic(),
             )
@@ -1360,8 +1543,15 @@ class NativeCI:
                 raise FixtureError("native_diagnostic_deadline")
             facts["diagnostic_code"] = command_code(reply.code, reply.output)
             if reply.code == 0:
+                data = object_bytes(reply.output)
+                used = data.pop("used", None)
+                if type(used) is not int or not 0 <= used <= allowance:
+                    raise FixtureError("native_diagnostic_output_budget")
+                self.setup_bytes += used + len(reply.output)
+                if self.setup_bytes > OUTPUT_BYTES:
+                    raise FixtureError("native_diagnostic_output_budget")
                 observed = {
-                    **object_bytes(reply.output),
+                    **data,
                     **{
                         key: facts[key]
                         for key in (

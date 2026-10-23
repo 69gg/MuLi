@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 MAX_BYTES = 32768
 CASE_SECONDS = 60
 CLEANUP_SECONDS = 5
+HARNESS_SECONDS = 90
 MEMORY = 1024**3
 TASKS = 128
 HARNESS_MEMORY = MEMORY // 4
@@ -118,19 +120,26 @@ def remaining(deadline: float) -> float:
     return value
 
 
-def kernel_limits(group: Path, *, memory: int, tasks: int) -> dict[str, str]:
+def kernel_limits(
+    group: Path,
+    *,
+    memory: int,
+    tasks: int,
+    read: Callable[[Path], str] | None = None,
+) -> dict[str, str]:
+    read = read or (lambda path: path.read_text())
     result = {}
     for name, maximum in (("memory.max", memory), ("memory.swap.max", 0), ("pids.max", tasks)):
-        value = (group / name).read_text().strip()
+        value = read(group / name).strip()
         require(value.isdecimal() and int(value) <= maximum, "native_kernel_limit")
         require(not maximum or int(value) > 0, "native_kernel_limit")
         result[name] = value
-    values = (group / "cpu.max").read_text().split()
+    values = read(group / "cpu.max").split()
     require(len(values) == 2 and all(item.isdecimal() for item in values), "native_kernel_cpu")
     quota, period = map(int, values)
     require(0 < quota <= period, "native_kernel_cpu")
     result["cpu.max"] = " ".join(values)
-    controllers = (group / "cgroup.controllers").read_text().split()
+    controllers = read(group / "cgroup.controllers").split()
     require({"cpu", "memory", "pids"}.issubset(controllers), "native_kernel_controllers")
     return result
 
@@ -455,6 +464,8 @@ async def observe_setup_process(
     group: str,
     read: Callable[[int, str], Awaitable[bytes | None]],
     deadline: float,
+    *,
+    observe_wait: bool = True,
 ) -> dict[str, Any]:
     """A bounded observation window, not an atomic snapshot or process authority."""
     from muli.platforms.linux_transaction import _cgroup, _start_ticks
@@ -534,6 +545,8 @@ async def observe_setup_process(
             "state": state,
             "wait": "unavailable",
         }
+        if not observe_wait:
+            return result
         # Preserve the completed identity observation if this optional read fails.
         # Its final gate extends the same window and uses the same absolute deadline.
         try:
@@ -900,7 +913,373 @@ async def observe_setup_units(
     return facts
 
 
-async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> dict[str, Any]:
+class _SetupIO:
+    """Share the existing deadline and actual byte allowance across system observations."""
+
+    def __init__(self, deadline: float, limit: int, facts: dict[str, Any]) -> None:
+        require(type(limit) is int and 0 < limit <= MAX_BYTES, "native_diagnostic_output_budget")
+        self.deadline, self.limit, self.facts, self.used = deadline, limit, facts, 0
+
+    def charge(self, data: bytes) -> None:
+        self.used += len(data)
+        require(self.used <= self.limit, "native_diagnostic_output_budget")
+        remaining(self.deadline)
+
+    def file(self, path: Path) -> str:
+        from muli.platforms.linux_transaction import _read_regular
+
+        require(self.used < self.limit, "native_diagnostic_output_budget")
+        value = _read_regular(path, self.limit - self.used)
+        self.charge(value)
+        return value.decode("ascii")
+
+    async def command(
+        self, argv: list[str], *, timeout: float, limit: int, merge_stderr: bool = False
+    ) -> dict[str, Any]:
+        from muli.process import run_process
+
+        require(not merge_stderr, "native_diagnostic_command")
+        require(self.used < self.limit, "native_diagnostic_output_budget")
+        try:
+            result = await run_process(
+                argv,
+                timeout=min(timeout, CLEANUP_SECONDS, remaining(self.deadline)),
+                limit=min(limit, self.limit - self.used),
+                merge_stderr=False,
+            )
+        except Exception:
+            # A failed command returns no byte count; its reserved allowance
+            # cannot be spent again by another query or a later diagnostic.
+            self.used = self.limit
+            raise
+        output, stderr = result.get("output"), result.get("stderr")
+        if not isinstance(output, str) or not isinstance(stderr, str):
+            raise NativeError("native_diagnostic_invalid")
+        self.charge(output.encode())
+        self.charge(stderr.encode())
+        return result
+
+    async def query(
+        self, argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        require(argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command")
+        self.facts["query_status"], self.facts["query_code"] = None, "not_started"
+        try:
+            result = await self.command(
+                [argv[0], "--system", *argv[2:]], timeout=timeout, limit=limit
+            )
+        except NativeError as error:
+            if str(error) == "native_diagnostic_output_budget":
+                self.facts["query_code"] = "output_budget"
+            raise
+        status = result.get("exit_code")
+        self.facts["query_status"] = (
+            status if type(status) is int and -(2**31) <= status < 2**31 else None
+        )
+        self.facts["query_code"] = diagnostic_command_code(status, result.get("stderr"))
+        return result
+
+    async def read(self, pid: int, name: str) -> bytes | None:
+        from muli.platforms.linux_transaction import _read_regular
+
+        require(
+            0 < pid < 2**31 and name in {"stat", "status", "cgroup", "exe", "wchan"},
+            "native_diagnostic_command",
+        )
+        remaining(self.deadline)
+        if name in {"exe", "wchan"}:
+            result = await self.command(
+                [
+                    "sudo",
+                    "--non-interactive",
+                    "--",
+                    "readlink" if name == "exe" else "cat",
+                    "--",
+                    f"/proc/{pid}/{name}",
+                ],
+                timeout=CLEANUP_SECONDS,
+                limit=self.limit,
+            )
+            return result["output"].encode() if result.get("exit_code") == 0 else None
+        require(self.used < self.limit, "native_diagnostic_output_budget")
+        data = _read_regular(Path("/proc") / str(pid) / name, self.limit - self.used)
+        self.charge(data)
+        return data
+
+
+async def _manager_units(probe: SystemdProbe, uid: int) -> dict[str, dict[str, Any]]:
+    """List before GetUnit: observation must not LoadUnit an absent instance."""
+    from muli.platforms.linux_transaction import _cgroup, _typed
+
+    names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+    listed = _typed(
+        await probe._command(
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "ListUnitsByPatterns",
+            "asas",
+            "0",
+            "2",
+            *names,
+        ),
+        "a(ssssssouso)",
+    )
+    require(
+        isinstance(listed, list)
+        and len(listed) == 1
+        and isinstance(listed[0], list)
+        and len(listed[0]) <= len(names)
+        and all(isinstance(row, list) and len(row) == 10 and row[0] in names for row in listed[0]),
+        "native_manager_reply",
+    )
+    present = [row[0] for row in listed[0]]
+    require(len(set(present)) == len(present), "native_manager_reply")
+    result = {}
+    for name in names:
+        if name not in present:
+            continue
+        path = await probe._unit_path(name)
+        unit = await probe._properties(
+            path,
+            "Unit",
+            (
+                ("Id", "s"),
+                ("LoadState", "s"),
+                ("ActiveState", "s"),
+                ("SubState", "s"),
+                ("Job", "(uo)"),
+                ("InvocationID", "ay"),
+            ),
+        )
+        service = await probe._properties(
+            path,
+            "Service",
+            (
+                ("Type", "s"),
+                ("MainPID", "u"),
+                ("ControlGroup", "s"),
+                ("Result", "s"),
+                ("ExecMainCode", "i"),
+                ("ExecMainStatus", "i"),
+            ),
+        )
+        job, invocation = unit["Job"], unit["InvocationID"]
+        require(
+            unit["Id"] == name
+            and isinstance(job, list)
+            and len(job) == 2
+            and type(job[0]) is int
+            and 0 <= job[0] < 2**31
+            and job[1] == (f"/org/freedesktop/systemd1/job/{job[0]}" if job[0] else "/")
+            and isinstance(invocation, list)
+            and len(invocation) == 16
+            and all(type(item) is int and 0 <= item <= 255 for item in invocation)
+            and all(
+                type(service[key]) is int and 0 <= service[key] < 2**31
+                for key in ("MainPID", "ExecMainCode", "ExecMainStatus")
+            ),
+            "native_manager_reply",
+        )
+        group = _cgroup(service["ControlGroup"])
+        require(
+            all(
+                isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", value)
+                for value in (
+                    unit["LoadState"],
+                    unit["ActiveState"],
+                    unit["SubState"],
+                    service["Type"],
+                    service["Result"],
+                )
+            )
+            and (not group or Path(group).name == name),
+            "native_manager_reply",
+        )
+        result[name] = {**unit, **service, "path": path, "invocation": bytes(invocation).hex()}
+    return result
+
+
+async def manager_state(
+    mode: str,
+    user: str,
+    uid: int,
+    home: Path,
+    deadline: float,
+    byte_limit: int,
+    *,
+    started: float = 0.0,
+    previous: str = "",
+) -> dict[str, Any]:
+    """One bounded read-only system-manager observation, never another start."""
+    import pwd
+
+    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe, _start_ticks
+
+    require(mode in {"manager-idle", "manager-ready"}, "native_manager_arguments")
+    require(re.fullmatch(r"muli-ci-[a-f0-9]{12}", user) is not None, "native_manager_identity")
+    account = pwd.getpwnam(user)
+    require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_manager_identity")
+    require(
+        math.isfinite(deadline) and remaining(deadline) <= HARNESS_SECONDS + CLEANUP_SECONDS,
+        "native_manager_deadline",
+    )
+    facts: dict[str, Any] = {}
+    io = _SetupIO(deadline, byte_limit, facts)
+    result: dict[str, Any] = {"code": "native_manager_observation", "used": 0}
+    try:
+        probe = SystemdProbe(
+            runner=io.query, limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES)
+        )
+        names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
+        async with asyncio.timeout(remaining(deadline)):
+            if mode == "manager-idle":
+                units = await _manager_units(probe, uid)
+                require(
+                    all(
+                        unit["LoadState"] == "loaded"
+                        and unit["ActiveState"] == "inactive"
+                        and unit["SubState"] == "dead"
+                        and unit["Job"] == [0, "/"]
+                        and unit["MainPID"] == 0
+                        and unit["ControlGroup"] == ""
+                        for unit in units.values()
+                    ),
+                    "native_manager_conflict",
+                )
+                result = {
+                    "code": "idle",
+                    "invocation": units.get(names[-1], {}).get("invocation", ""),
+                    "used": 0,
+                }
+            else:
+                require(
+                    math.isfinite(started)
+                    and 0 < started <= time.monotonic()
+                    and (not previous or re.fullmatch(r"[a-f0-9]{32}", previous) is not None),
+                    "native_manager_arguments",
+                )
+                invocation, binding, late, delay = "", None, False, POLL_SECONDS
+                while True:
+                    observed_since = time.monotonic()
+                    units = await _manager_units(probe, uid)
+                    require(set(units) == set(names), "native_manager_missing")
+                    runtime, manager = (units[name] for name in names)
+                    require(
+                        all(unit["LoadState"] == "loaded" for unit in units.values()),
+                        "native_manager_failed",
+                    )
+                    current = manager["invocation"]
+                    require(not invocation or current == invocation, "native_manager_changed")
+                    if current != "0" * 32 and current != previous:
+                        require(not invocation or current == invocation, "native_manager_changed")
+                        invocation = current
+                    pid, group = manager["MainPID"], manager["ControlGroup"]
+                    if pid:
+                        require(bool(group), "native_manager_changed")
+                        data = await io.read(pid, "stat")
+                        require(data is not None, "native_manager_changed")
+                        assert data is not None
+                        observed = (pid, _start_ticks(data, pid), group)
+                        require(binding is None or binding == observed, "native_manager_changed")
+                        binding = observed
+                    elif binding is not None:
+                        raise NativeError("native_manager_changed")
+                    require(
+                        all(
+                            unit["ActiveState"] in {"activating", "active"}
+                            or (unit["ActiveState"] == "inactive" and unit["Job"][0] > 0)
+                            for unit in (runtime, manager)
+                        ),
+                        "native_manager_failed",
+                    )
+                    if manager["ActiveState"] == "activating" and invocation:
+                        late |= observed_since > started + CLEANUP_SECONDS
+                    if (
+                        manager["ActiveState"] == "active"
+                        and manager["Job"] == [0, "/"]
+                        and runtime["ActiveState"] == "active"
+                        and runtime["Job"] == [0, "/"]
+                    ):
+                        if not invocation or binding is None:
+                            raise NativeError("native_manager_not_ready")
+                        require(
+                            manager["SubState"] == "running"
+                            and manager["Type"] == "notify-reload"
+                            and manager["Job"] == [0, "/"]
+                            and manager["Result"] == "success"
+                            and runtime["ActiveState"] == "active"
+                            and runtime["SubState"] == "exited"
+                            and runtime["Type"] == "oneshot"
+                            and runtime["Job"] == [0, "/"]
+                            and runtime["MainPID"] == 0
+                            and runtime["Result"] == "success"
+                            and runtime["ExecMainCode"] == 1
+                            and runtime["ExecMainStatus"] == 0,
+                            "native_manager_not_ready",
+                        )
+                        process = await observe_setup_process(
+                            probe,
+                            manager["path"],
+                            uid,
+                            pid,
+                            group,
+                            io.read,
+                            deadline,
+                            observe_wait=False,
+                        )
+                        require(
+                            process["code"] == "observed"
+                            and process["exe"] == "manager"
+                            and process["uid_matches"] is True,
+                            "native_manager_process",
+                        )
+                        kernel_limits(
+                            Path("/sys/fs/cgroup") / group.lstrip("/"),
+                            memory=MEMORY,
+                            tasks=TASKS,
+                            read=io.file,
+                        )
+                        final = await _manager_units(probe, uid)
+                        last = await io.read(pid, "stat")
+                        require(
+                            final == units
+                            and last is not None
+                            and _start_ticks(last, pid) == binding[1],
+                            "native_manager_changed",
+                        )
+                        remaining(deadline)
+                        result = {
+                            "code": "ready",
+                            "group": group,
+                            "invocation": invocation,
+                            "pid": pid,
+                            "elapsed_ms": round((time.monotonic() - started) * 1000),
+                            "late_ready": late,
+                            "used": 0,
+                        }
+                        break
+                    await asyncio.sleep(min(delay, remaining(deadline)))
+                    delay = min(CLEANUP_SECONDS, delay * 2)
+    except TimeoutError:
+        result["code"] = "native_deadline_exceeded"
+    except (OSError, ValueError) as error:
+        if isinstance(error, NativeError) and re.fullmatch(r"native_[a-z_]{1,57}", str(error)):
+            result["code"] = str(error)
+    result["used"] = io.used
+    return result
+
+
+async def diagnose_setup(
+    user: str,
+    uid: int,
+    home: Path,
+    deadline: float,
+    byte_limit: int = MAX_BYTES,
+    *,
+    include_usage: bool = False,
+) -> dict[str, Any]:
     """The working runner interpreter observes only its exact new UID's manager."""
     import pwd
 
@@ -922,100 +1301,24 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
         "process": process_unavailable(),
         "journal": journal_unavailable(),
     }
+    io = _SetupIO(deadline, byte_limit, facts)
     try:
         account = pwd.getpwnam(user)
         require((account.pw_uid, account.pw_dir) == (uid, str(home)), "native_diagnostic_identity")
         facts["stage"] = "import"
         from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
-        from muli.process import run_process
-
-        used = 0
-
-        def charge(data: bytes) -> None:
-            nonlocal used
-            used += len(data)
-            require(used <= MAX_BYTES, "native_diagnostic_output_budget")
-
-        async def command(
-            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool = False
-        ) -> dict[str, Any]:
-            require(not merge_stderr, "native_diagnostic_command")
-            require(used < MAX_BYTES, "native_diagnostic_output_budget")
-            result = await run_process(
-                argv,
-                timeout=min(timeout, remaining(deadline)),
-                limit=min(limit, MAX_BYTES - used),
-                merge_stderr=False,
-            )
-            output, stderr = result.get("output"), result.get("stderr")
-            if not isinstance(output, str) or not isinstance(stderr, str):
-                raise NativeError("native_diagnostic_invalid")
-            charge(output.encode())
-            charge(stderr.encode())
-            remaining(deadline)
-            return result
-
-        async def query(
-            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
-        ) -> dict[str, Any]:
-            require(
-                argv[:2] == ["busctl", "--user"] and not merge_stderr, "native_diagnostic_command"
-            )
-            facts["query_status"], facts["query_code"] = None, "not_started"
-            try:
-                result = await command(
-                    [argv[0], "--system", *argv[2:]], timeout=timeout, limit=limit
-                )
-            except NativeError as error:
-                if str(error) == "native_diagnostic_output_budget":
-                    facts["query_code"] = "output_budget"
-                raise
-            status = result.get("exit_code")
-            facts["query_status"] = (
-                status if type(status) is int and -(2**31) <= status < 2**31 else None
-            )
-            facts["query_code"] = diagnostic_command_code(status, result.get("stderr"))
-            return result
-
-        async def read(pid: int, name: str) -> bytes | None:
-            from muli.platforms.linux_transaction import _read_regular
-
-            require(
-                0 < pid < 2**31 and name in {"stat", "status", "cgroup", "exe", "wchan"},
-                "native_diagnostic_command",
-            )
-            remaining(deadline)
-            if name in {"exe", "wchan"}:
-                result = await command(
-                    [
-                        "sudo",
-                        "--non-interactive",
-                        "--",
-                        "readlink" if name == "exe" else "cat",
-                        "--",
-                        f"/proc/{pid}/{name}",
-                    ],
-                    timeout=CLEANUP_SECONDS,
-                    limit=MAX_BYTES,
-                )
-                return result["output"].encode() if result.get("exit_code") == 0 else None
-            require(used < MAX_BYTES, "native_diagnostic_output_budget")
-            data = _read_regular(Path("/proc") / str(pid) / name, MAX_BYTES - used)
-            charge(data)
-            remaining(deadline)
-            return data
 
         async with asyncio.timeout(remaining(deadline)):
-            return await observe_setup_units(
+            await observe_setup_units(
                 SystemdProbe(
-                    runner=query,
+                    runner=io.query,
                     limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
                 ),
                 uid,
                 facts,
-                read,
+                io.read,
                 deadline,
-                command,
+                io.command,
             )
     except TimeoutError:
         facts["failure"], facts["query_code"] = "deadline", "timeout"
@@ -1028,6 +1331,8 @@ async def diagnose_setup(user: str, uid: int, home: Path, deadline: float) -> di
             )
         else:
             facts["failure"] = "query_failed" if facts["query_code"] != "ok" else "invalid_reply"
+    if include_usage:
+        facts["used"] = io.used
     return facts
 
 
@@ -1042,7 +1347,7 @@ def fixture(root: Path) -> dict[str, Any]:
         "harness_tasks": HARNESS_TASKS,
         "seconds": CASE_SECONDS,
         "cleanup_seconds": CLEANUP_SECONDS,
-        "harness_seconds": 90,
+        "harness_seconds": HARNESS_SECONDS,
         "http_bytes": MAX_BYTES,
     }
     require(
@@ -1174,6 +1479,7 @@ class Case:
         require(0 < seconds <= CASE_SECONDS, "native_case_budget")
         self.root, self.start = root, time.monotonic()
         self.deadline = self.start + seconds
+        self.drive_deadline: float | None = None
         self.stage = "import"
         self.recording = True
         self._notes: dict[str, dict[str, Any]] = {}
@@ -1212,6 +1518,14 @@ class Case:
             timeline.append(row)
             self._notes[stage] = facts
             write_json(self.root / "result.json", self.result)
+
+    def require_start_time(self) -> None:
+        """Imports or queueing cannot turn a late worker into a fresh 60s case."""
+        require(
+            self.drive_deadline is not None and remaining(self.drive_deadline) > CASE_SECONDS,
+            "native_case_start_budget",
+        )
+        remaining(self.deadline)
 
     async def command(self, *argv: str) -> str:
         from muli.process import run_process
@@ -1599,6 +1913,7 @@ class Case:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
         password = os.urandom(24).hex()
+        self.require_start_time()
         config = ConfigFile(self.root / "config.json")
         config.update(
             {
@@ -1624,8 +1939,11 @@ class Case:
         service.path.parent.mkdir(parents=True, mode=0o700)
         service.path.write_text(service.render(), encoding="utf-8")
         service.path.chmod(0o600)
+        self.require_start_time()
+        remaining(self.deadline)
         self.note("manager_start")
         await self.command("systemctl", "--user", "daemon-reload")
+        self.require_start_time()
         await self.command("systemctl", "--user", "start", service.unit)
         async with httpx.AsyncClient(
             base_url=f"http://127.0.0.1:{port}",
@@ -1750,6 +2068,15 @@ async def run(mode: str, root: Path) -> int:
             async with asyncio.timeout(remaining(case.deadline)):
                 await case.cleanup()
         else:
+            end = float(os.environ.get("MULI_NATIVE_EXECUTE_DEADLINE", "nan"))
+            require(
+                math.isfinite(end)
+                and case.start < end <= case.start + HARNESS_SECONDS + CLEANUP_SECONDS,
+                "native_execute_deadline",
+            )
+            case.drive_deadline = end - CLEANUP_SECONDS
+            require(remaining(case.drive_deadline) > CASE_SECONDS, "native_case_start_budget")
+            case.deadline = min(case.deadline, case.drive_deadline)
             case.note("import")
             # The absolute budget also includes every synchronous import and
             # verification boundary before the first manager effect.
@@ -1780,9 +2107,33 @@ def main() -> int:
         )
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0
-    if len(sys.argv) == 6 and sys.argv[1] == "diagnose-setup":
+    if len(sys.argv) in {6, 7} and sys.argv[1] == "diagnose-setup":
         value = asyncio.run(
-            diagnose_setup(sys.argv[2], int(sys.argv[3]), Path(sys.argv[4]), float(sys.argv[5]))
+            diagnose_setup(
+                sys.argv[2],
+                int(sys.argv[3]),
+                Path(sys.argv[4]),
+                float(sys.argv[5]),
+                int(sys.argv[6]) if len(sys.argv) == 7 else MAX_BYTES,
+                include_usage=len(sys.argv) == 7,
+            )
+        )
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
+    if (len(sys.argv) == 7 and sys.argv[1] == "manager-idle") or (
+        len(sys.argv) == 9 and sys.argv[1] == "manager-ready"
+    ):
+        value = asyncio.run(
+            manager_state(
+                sys.argv[1],
+                sys.argv[2],
+                int(sys.argv[3]),
+                Path(sys.argv[4]),
+                float(sys.argv[5]),
+                int(sys.argv[6]),
+                started=float(sys.argv[7]) if len(sys.argv) == 9 else 0.0,
+                previous=sys.argv[8] if len(sys.argv) == 9 else "",
+            )
         )
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0

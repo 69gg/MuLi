@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、分阶段进程观察与等待分类的 191 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五至七轮仍未执行事务；第七轮已观察到 manager 镜像，但未确定其等待原因，新增等待分类尚待远端。环境修补、三事务和正常服务收尾未验收。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald 的 245 项纯 fixture 与限定静态检查已通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五至九轮仍未执行事务；后续已观察到 manager 镜像和 epoll 等待，但未确定启动原因，第九轮没有接受到固定四类 journal 正向事件。环境修补、三事务和正常服务收尾未验收；下述单次 job 准入与统一期限仍只是待审设计。基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -235,5 +235,37 @@ receipt 现在将原命令超时定位在 `manager_start_before`。独立系统 
 三份 Python 文件 Ruff/format 与两脚本 strict mypy 最终均通过。首轮 strict mypy 发现两处 `Any | None` 未收窄：可缺省的 USER_UNIT 改为等价空串默认，输出文本改为显式 `isinstance` 拒绝，不改变固定错误或事件判断；受影响 54 项随后再次通过 0.15 秒、峰值 57.6 MiB/swap 0，不另计唯一数。类型首轮峰值 **164.5 MiB**，修后 **159.2 MiB**，swap 均为 0。全部命令逐条经 root 绝对路径守卫、每条 30 秒串行，没有本机原生 harness、CLI、manager、账户或挂载效果。下一精确远端候选之前，不声称已观察到真实 journald 事件、找到启动根因、完成三个事务或证明正常清理。
 
 本片不验收跨版本声明、真实 wheel/依赖安装、在线下载、用户已有服务、账号/模型、断电或 macOS/Windows 切换。64 MiB sparse 卷与只读 bind 也不是恶意代码沙箱或宿主总磁盘 quota。
+
+## 第九轮结果
+
+精确签名 `8d5b1814466846dc4376d52caab4b51aa15bed4c` 的 [CI 39597034714](https://github.com/69gg/MuLi/actions/runs/39597034714) attempt 1 已十一项终态：十项成功，仅 [native 119211788494](https://github.com/69gg/MuLi/actions/runs/39597034714/job/119211788494) 失败。1146 字节 [evidence](https://github.com/69gg/MuLi/actions/runs/39597034714/artifacts/12343594805) 只有 receipt 1139 字节与 result 933 字节，zip SHA256 为 `118b753546f4a99d397166e49e2d261c39a64e252b62a92d66d5f1020d2dfd0a`。固定错误依次为 `native_command_timeout` 与 `native_cleanup_deadline`。
+
+阶段仍为 `manager_start_before`：runtime-dir 为 active/exited、Job=0；user@ 为 activating/start、MainPID=2501、Job=1572、cgroup 存在。进程窗口为 `observed/manager/uid_matches=true/state=S/wait=epoll_wait`。新增 journal 查询成功返回，但严格解析后为 `no_known_event/events=[]/incomplete=false`；这不证明原始查询没有记录，也不能证明 manager 始终未进入主循环。仍为 **0 个事务**，没有 harness 结果。receipt 未确认账户或组删除，仍记录三个挂载；正常清理没有通过。后续只研究启动和客户端等待合同，不据这组事实修改 UID、PAM、环境、Type 或 target。
+
+## 单次 job 准入与统一期限（已实现，纯验通过，远端待验）
+
+现有 `NativeCI.call()` 默认给每条命令 5 秒，`prepare()` 没有覆盖整段的绝对期限；`execute()` 在准备完成后才为 drive 客户端设 `now + HARNESS_SECONDS + CLEANUP_SECONDS`，即 95 秒。因此历史失败证明的是这次阻塞 `systemctl start` 客户端越过 5 秒，尚未证明 user@ 已触及 systemd 自身启动超时，更不是已观察了 95 秒 manager 启动。v255 的 `--no-block` 只验证并排入 job，返回成功不能充当就绪；user@ 的 `Type=notify-reload` 仍须由 PID1 接受 READY 才离开 start。[固定客户端语义](https://github.com/systemd/systemd/blob/v255/man/systemctl.xml#L2044-L2051)、[固定 user@ 模板](https://github.com/systemd/systemd/blob/v255/units/user%40.service.in)、[READY 处理](https://github.com/systemd/systemd/blob/v255/src/core/service.c#L4001-L4007)。
+
+本片只调整这个 fixture 的一次准入与观察，不增加第二轮账户或启动效果：
+
+1. **一个 execute 期限。** `execute()` 入口即取 `time.monotonic()`，固定 `end = start + HARNESS_SECONDS + CLEANUP_SECONDS`；prepare、manager readiness、drive 与原启动诊断均消耗这同一 95 秒，准备所用时间必须扣除。协调者和 worker 只在本次同 host、同 kernel boot、同时间命名空间的 `time.monotonic()` 时基中比较该绝对值；继续由 `remaining(end)` 转成 `asyncio.timeout()` 的相对余量，不与 wall clock、journal 时间或未经确认的 `loop.time()` epoch 直接混比。普通命令和每次 typed 查询最多 `min(5 秒, end - now)`，调用前后都复核；同步文件/身份工作也在阶段边界复核。不能在 prepare 后重新计 95 秒，也不能为轮询、迟到结果或诊断续期。该限制是本片新增的总约束，不回写历史轮次。独立 workflow cleanup 仍沿其原 5 秒效果/证明及既有最末命令 reap 合同。
+2. **一次准入。** 在精确新 UID、账户/配置归属与两个 unit 的初始状态核定后，仅执行一次 `systemctl --system --no-block start user-runtime-dir@UID.service user@UID.service`。原两 unit 同属一次命令，既有资源与环境 drop-in 不变。客户端成功只记 admission；失败、超时或丢返回均不重发 start，只能在剩余期限内只读观察并保留不确定状态，不进入 harness。初始已有活动实例、job 或无法排除冲突时也不启动。
+3. **精确 readiness。** 沿已有 runner 解释器和系统 bus 的 `SystemdProbe` typed 解析读取精确两 unit，不连接用户 bus。首次观察到的非零 InvocationID 固定为本次实例；后续不得用新 InvocationID 或重启后的 PID 代替。manager 须 loaded、active/running、原 notify-reload 类型、Job=0、MainPID 非零；runtime-dir 须 loaded、active/exited、退出成功、Job=0。成功前复用原 proc 身份窗口，核稳定 PID/startticks、专用 UID、manager 镜像、typed/proc cgroup 归属及前后同 InvocationID；再核原四项实际 kernel 限额。客户端零退出、Result=success、epoll 或 Job 单独消失均不授予下一阶段。系统 manager 属性只表明 PID1 接受该 unit 的就绪，不额外宣称用户 bus 或 MuLi 服务已可用。
+4. **有界观察。** readiness 使用已有 `POLL_SECONDS` 起步、逐次倍增且封顶于原单命令 5 秒的退避；睡眠也裁到剩余期限。每轮只读上述必要属性，完整 proc/kernel 校验只在拟接受 ready 时进行，不在循环中重复 journal/wchan。查询实际 stdout/stderr、必要 proc 字节和最后一次失败诊断累计不超过原 32 KiB；超限固定失败，不通过每轮重置额度换取无限观察。留出原 5 秒收尾诊断额度，诊断终点最多为 `end`，没有另加的 5 秒；额度不足时保留已确认的有限状态，不宣称完整诊断。
+5. **期限传播到实际子任务。** 启动 drive 至少需要原 `CASE_SECONDS + CLEANUP_SECONDS`，即严格多于 65 秒剩余量；不满足则不启动新 harness 或 MuLi 服务。harness `RuntimeMaxSec` 裁为 `min(HARNESS_SECONDS, remaining - CLEANUP_SECONDS)`，不是只缩外层客户端却仍留下原 90 秒运行额度；同一绝对 `end` 和预留后的 drive 结束时刻传给 worker。worker 入场及启动标准 MuLi 服务前复核余量，`Case.deadline`、HTTP/probe、等待和结果接收均取各自原上限与共享结束时刻的较小值；不能迟到后重新给 60 秒。入场耗时导致不再具备完整 case 余量时拒绝业务启动。`RuntimeMaxSec` 是服务启动后的相对期限，排队迟到的业务不启动保证仍须 worker 的绝对门承担，不能只据该属性声称未发生迟到启动。产品已有事务期限、精确单位归属与独立清理不变；客户端退出不证明已接受的 job 或子树为空，失败仍交原所有权复核及 always cleanup，不能写成已回收。
+
+验收结论分开表达：若**同一 InvocationID 在原请求开始 5 秒之后仍成功观察为 activating，随后在共享期限内通过完整 ready/kernel 门**，才支持“原客户端等待边界过短”；仅首次采到 ready 的时间晚于 5 秒不够，可能只是采样晚。如果最后成功观察仍 activating、整体额度耗尽，仍未解释根因；只有固定属性明确进入 failed/非成功终态才报告该终态，不能将 fixture 期限冒称 systemd 的 startup timeout。身份改变、观察失败、材料/资源不符或余量不足分别失败，不自动恢复或再建账号。
+
+纯例合同覆盖准备耗时计入总限、各调用与睡眠不续期；一次 start 返回零但仍 activating；跨 5 秒的同代 ready 正例；active 但 Job/PID/InvocationID/cgroup/kernel 错误拒绝；start 丢返回不二次效果；95 秒末仍 activating 不运行 harness；65 秒余量门与 worker 迟到不启动业务；实际 RuntimeMaxSec、worker deadline、结果接收和最终诊断均被裁限；独立 cleanup 不改成功证据或功能 timeline。初始观察先用 `ListUnitsByPatterns` 列出两个精确名字，只对已列出的 unit 做 `GetUnit`，不让只读观察加载不存在的 unit；已加载但 inactive/dead、PID=0、Job=0、ControlGroup 为空的旧实例允许作为初态，并冻结其旧 manager InvocationID，ready 必须使用新 ID。
+
+`late_ready` 只在**整轮 typed 观察开始时已超过原 start 请求 5 秒，且该轮仍观察同一新 InvocationID 为 activating**后置真。5 秒前读得 activating、后续 service/proc 查询到 5 秒后才完成，不能构成跨 5 秒的正向证据；独立审查发现并收紧了首稿的这个采样边界，新增跨边界反例。最终 ready 仍须同代 typed/proc/kernel 门全过，这一字段不能证明用户 bus 可用或解释启动根因。
+
+初态、readiness 与最终 setup 诊断共用原 32 KiB 累计预算。命令丢返回时无法获得实际字节数，已授予该 worker 的额度不再重用；不能为了取失败诊断重新给予 32 KiB。独立 cleanup 仅从 runner 自有、权限私有、非符号链接的 regular 旧结果文件，最多读 32 KiB 加一个超限哨兵，并通过完整结果白名单验证后保留固定 `elapsed_ms/late_ready` 字段；无效元数据不授予清理成功，原账户、挂载、cgroup 与末期限证明保持。
+
+本片相对原 245 个纯 case 新增 **56 个唯一 case**。首批 45 项通过；收紧 late-ready 边界后 18 项 manager-ready 组通过。全文件首跑 **4 failed/287 passed**：两项旧 cleanup 手工结果缺少新增有限元数据，一项 manager-ready 丢返回后的旧断言仍要求诊断成功，以及旧 CLI 替身未接受新预算参数。逐项核对原业务证明并同步夹具后，相关 16 项通过；最终完整 **301 项通过**，pytest 0.90 秒、guard 服务 1.468 秒、峰值 92.4 MiB/swap 0。定向组有重叠，不另计唯一数。
+
+三份 Python 文件 Ruff 检查通过，首稿 format 检查仅排版失败后已格式化。两脚本 strict mypy 最终通过；首次发现可扩展命令 tuple 被推断成固定长度，改为显式 `tuple[str, ...]`。guard 不转发外层 `MYPYPATH`，因此在 guard 内为目标 tests/src 设置模块搜索路径，并使用 `--explicit-package-bases`；没有改变项目规则。类型检查峰值 168.2 MiB/swap 0。所有执行均经 root 绝对路径 guard、每条 30 秒串行；全部 subprocess、系统文件、进程和时钟边界由纯 fake 注入，真实效果入口硬拒绝。本片没有本机原生 CLI、systemd、账户、挂载、网络、模型或服务效果，也没有新的远端重跑。九轮仍仅支持前述 **0 个事务、正常清理未通过**的历史结论；不据纯例宣称真实 manager 已 ready、三个事务完成或清理成功。
+
+最终独立只读审查确认：轮前 `observed_since` 已闭合 late-ready 的采样边界问题；独立 cleanup 的旧结果读取只继承通过归属、权限、文件类型、字节上限与白名单验证的 readiness 元数据，不授予 completed 或 cleanup 成功。后续未发现确定 P1/P2。保留原 prepare 的 kernel 二次复核作为既有资源事实，新 readiness 核限读取已计入观察预算。审查未运行检查；301 项之后仅有格式、tuple 类型注解与本段文档变更，未改变行为。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
