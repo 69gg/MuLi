@@ -15,6 +15,7 @@ from typing import Literal
 from muli.compatibility import CompatibilityManifest, FormatState
 from muli.managed_transaction import (
     ManagedAction,
+    ProjectControllerTransferRecord,
     RoleBinding,
     ServiceIdentityV2,
     TransactionRecordV2,
@@ -154,6 +155,8 @@ def prepare_managed(
     base_data.verify(base, limit)
     target_data.verify(target, limit)
     previous = control.read_current()
+    if isinstance(previous, ProjectControllerTransferRecord):
+        raise TransactionError("project_controller_transfer_unsupported")
     record = prepare_record_v2(
         request_id=request_id,
         action=action,

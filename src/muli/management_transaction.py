@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 if TYPE_CHECKING:
-    from muli.managed_transaction import TransactionRecordV2
+    from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$")]
 Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -506,9 +506,11 @@ class TransactionJournal(AbstractContextManager["TransactionJournal"]):
         except ValueError:
             raise TransactionError("invalid_record") from None
 
-    def read_current(self) -> TransactionRecord | TransactionRecordV2 | None:
+    def read_current(
+        self,
+    ) -> TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord | None:
         """Dispatch the one state file without widening the legacy V1 reader."""
-        from muli.managed_transaction import parse_record_v2
+        from muli.managed_transaction import parse_managed_record
 
         try:
             data = self.directory.read("state.json", self.limits.max_record_bytes)
@@ -520,7 +522,7 @@ class TransactionJournal(AbstractContextManager["TransactionJournal"]):
             if type(protocol) is not int or protocol not in {1, 2}:
                 raise TransactionError("invalid_record")
             if protocol == 2:
-                return parse_record_v2(data, limits=self.limits)
+                return parse_managed_record(data, limits=self.limits)
             return TransactionRecord.model_validate(values)
         except (ValueError, RecursionError):
             raise TransactionError("invalid_record") from None
@@ -559,7 +561,9 @@ class JournalControl(FixedLock):
             raise
         return record
 
-    def read_current(self) -> TransactionRecord | TransactionRecordV2 | None:
+    def read_current(
+        self,
+    ) -> TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord | None:
         self.check()
         record = self.journal.read_current()
         try:

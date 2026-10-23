@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from muli.maintenance import BootPermit
-from muli.managed_transaction import TransactionRecordV2
+from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_transaction import ProjectionReceipt, Role, TransactionRecord, _object
 from muli.platforms.transaction_files import _open_directory
 from muli.store import Store, now
@@ -186,6 +186,8 @@ def project_final(
     record = permit.journal.read_current()
     if record is None:
         return None
+    if isinstance(record, ProjectControllerTransferRecord):
+        raise ProjectionError("project_controller_transfer_unsupported")
     _check_identity(permit, identity, record)
     if not record.resolved:
         return None

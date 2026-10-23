@@ -27,6 +27,7 @@ from muli.managed_journal import RoleSnapshots, prepare_managed
 from muli.managed_runtime_binding import _legacy_installation
 from muli.managed_transaction import (
     ManagedAction,
+    ProjectControllerTransferRecord,
     RoleBinding,
     ServiceIdentityV2,
     TransactionRecordV2,
@@ -161,7 +162,10 @@ class ManagedPreparation:
     ) -> _Source:
         journal, store = permit.journal, self.runtime.store
         store.revalidate_format()
-        previous, receipt = journal.read_current(), read_projection(store)
+        previous = journal.read_current()
+        if isinstance(previous, ProjectControllerTransferRecord):
+            raise MaintenanceError("project_controller_transfer_unsupported")
+        receipt = read_projection(store)
         if previous is not None:
             if not previous.resolved:
                 raise TransactionError("transaction_in_progress")

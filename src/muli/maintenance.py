@@ -15,7 +15,12 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from muli.managed_transaction import HealthProofV2, TransactionRecordV2, format_digest
+from muli.managed_transaction import (
+    HealthProofV2,
+    ProjectControllerTransferRecord,
+    TransactionRecordV2,
+    format_digest,
+)
 from muli.management_transaction import (
     ClockReading,
     FixedLock,
@@ -306,7 +311,10 @@ class Maintenance:
         self._core = store_instance, main_session
 
     def current(self) -> CurrentRecord | None:
-        return self.permit.journal.read_current() if self.permit else None
+        record = self.permit.journal.read_current() if self.permit else None
+        if isinstance(record, ProjectControllerTransferRecord):
+            raise MaintenanceError("project_controller_transfer_unsupported")
+        return record
 
     @property
     def pending(self) -> bool:
