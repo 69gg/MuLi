@@ -1,6 +1,6 @@
-# 指定队友的接办证据（开发中）
+# 指定队友的接办证据（2.43）
 
-2.43候选已实现并完成多轮独立后审、损坏数据红绿修复、完整后端整合及离线构件验证；精确远端候选与发行待完成，尚未发布。2.42已修复独立Linux回退重复核验并正式发行，见[2.42闭合记录](review-v2.42.md#发版闭合)。
+2.43已完成多轮独立后审、损坏数据红绿修复、完整后端整合及离线构件验证；签名候选`41af62671566f4d0ad48caf939f5e7d7b203f6bc`的[CI 40024393046](https://github.com/69gg/MuLi/actions/runs/40024393046)十项全部成功。当前只收尾发布文档，最终文档提交仍须取得自己的精确候选CI；main、标签和远端发行尚待推进。首轮`e664b2e`的Windows两项失败保留在下文，不声称诊断改进已修复其根因。2.42已正式发行，见[2.42闭合记录](review-v2.42.md#发版闭合)。
 
 ## 范围与实现
 
@@ -12,7 +12,7 @@
 
 ## 独立审查
 
-实施前发现旧 `_read` 完整任务加载和调用者 scope 解析会先于新段执行，均改为在旧读取前分支；调用者使用独立有限 callback。随后补齐 queued 旧 run 与真实 run/report 作用域验证，以及报告读取位置的完整版本。根复核原始有限映射、只读 savepoint、无 await 间隙、分页/版本和既有权限接线，尚未发现剩余 P1/P2；最终整合后仍须复审。
+实施前发现旧 `_read` 完整任务加载和调用者 scope 解析会先于新段执行，均改为在旧读取前分支；调用者使用独立有限 callback。随后补齐 queued 旧 run 与真实 run/report 作用域验证，以及报告读取位置的完整版本。根复核原始有限映射、只读 savepoint、无 await 间隙、分页/版本和既有权限接线，后续损坏数据修复与最终独立后审见下文，未发现剩余 P1/P2。
 
 曾怀疑共享 `is_main` 调用 `main_session` 会提交外层事务；旧 2.42 的真实 Runtime 临时探针为 before=true、after=true、rollback 后无残留，守卫421毫秒、57.3 MiB、swap0，未复现。已有格式 admission 使该路径只读，因此不将其记作已复现 bug。共享身份谓词改为读取既有 marker 与 SQL kind，作为同义简化和预算收敛；不据此声称修复过真实提交缺陷。
 
@@ -57,3 +57,22 @@
 只保留既有畸形MCP policy夹具的Pydantic序列化warning；平台跳过不算原生实测。全仓Ruff、370文件格式、146生产源完整非增量strict mypy、离线83包锁检查通过。前端未修改，沿用上一相同代码的281项结果；远端quality仍会执行完整前端检查。
 
 最终生产离线构建wheel/sdist成功（guard1.279秒、96.8MiB），只在临时目录offline/no-deps安装本地wheel，源码外资源、API/提示词、默认关闭的桌面及任务控制/lifespan冒烟通过（1.201秒、99.1MiB）。版本/声明/changelog/两包一致校验通过（169毫秒、19.6MiB）；均30秒守卫、实际exit0、swap0，没有下载新依赖。暂不等同远端发行或自然模型接办质量已验收。
+
+## 精确候选远端失败
+
+签名提交`e664b2ed9e5aed7c34a87f637b8b965d6ef2e659`已推送并建立[PR #50](https://github.com/69gg/MuLi/pull/50)。唯一[CI 40019282611](https://github.com/69gg/MuLi/actions/runs/40019282611)已结束，八项成功、两项Windows失败，不以本地完整绿色抵消。
+
+- Windows Python3.12（job120639317991）：三个原生UIA用例失败，3,742 passed、1,457 skipped。首probe在原`AXLease`响应等待处超时；spawn、发送和drain已返回。原诊断在cleanup之后提取，没有收到完整白名单marker，不能从`stage_sequence=unobserved`判断COM、Python版本、JSON或脚本哪一项是根因。cleanup取消reader并清理剩余pipe；之后的nonzero或settled不能反推清理前状态。
+- Windows Python3.13（job120639318011）：`test_channel_configuration_revocation_rejects_waiting_owner`在首个Runtime构造时失败，3,744 passed、1,457 skipped，尚未进入渠道撤销业务。格式分类观察为elapsed2255ms、optional1888ms、setup366ms、queries1、vm_steps0，失败位置在首条可选schema查询返回后的原期限检查。进度回调未触发不代表SQL未执行；保持原默认1秒和失败关闭，不能跳过新库分类、移动期限起点或修改时钟使其通过。
+
+同一次UIA probe的前后清理事实投影已完成，不增加进程、预热、marker、重试或期限，也不输出原stderr、argv、环境或路径。根先运行两项固定夹具反例，旧helper均实际`KeyError: before_cleanup`，pytest0.07秒、守卫590毫秒、峰值60.1MiB/swap0、exit1；它只证明现有诊断缺口，不证明真实超时根因或CI已经修复。
+
+实现复用原PendingHelperLease及原工厂一次构造，观察清理前后同一进程/reader/输入边界，新增有限stderr分类、字节数和相对饱和毫秒，收尾后冻结。根七文件**150 passed**，pytest0.56秒、guard1.160秒、73.3MiB/swap0；strict mypy发现并修正测试侧fake进程身份及隐式模块导出类型表达，没有ignore或生产导出变更，仍保留真实`is`和命名空间绑定恢复。四文件最终strict mypy、Ruff、格式通过，类型检查608毫秒、242.3MiB；最后私有工厂绑定表达单项再验通过，guard728毫秒、65.3MiB。独立最终只读后审无P1/P2。生产`AXLease`、PowerShell与格式分类器未改；新精确远端候选仍待验证，原3.12/3.13失败不声称已修复。
+
+## 最终候选与发布准备
+
+上述诊断改进形成签名提交`41af62671566f4d0ad48caf939f5e7d7b203f6bc`。[CI 40024393046](https://github.com/69gg/MuLi/actions/runs/40024393046)首次九项成功，macOS 3.13在取得runner之前被取消；平台注释为托管runner容量及macOS arm64延迟，未执行测试步骤。根请求按job定向重试，平台最终回执列出十项全部成功；不把请求范围当作实际只执行一个job的证明，也不将这次绿色解释为此前Windows根因已修复。
+
+本次发布准备仅同步CHANGELOG和审查/迭代记录，不修改生产或测试代码。最终提交将重新取得精确候选CI；保留既有5,191项完整后端与离线构件证据，不为纯文档提交重复本机全量。签名提交、main快进、签名标签、十三项发行作业及PyPI/GitHub两构件核对仍是独立门槛，未完成前不记录为已发布。
+
+三文档独立只读复审无阻断P1/P2。根对本次收尾运行发行回归20 passed（pytest0.81秒、guard1.310秒、65.1MiB），重新离线构建两包成功（1.330秒、101.3MiB），版本/声明/CHANGELOG及两包核对成功（178毫秒、18.9MiB）；均30秒守卫、实际exit0、swap0，没有新依赖下载。
