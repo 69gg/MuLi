@@ -37,6 +37,16 @@ VM progress 按至多 100 条指令回调，`vm_steps` 限定累计回调覆盖�
 
 ## 验证边界
 
+### 失败阶段观测合同
+
+读取失败时，仅在最终 `FormatEvidenceError` 上附一条 `format_read_observation=` note；成功不添加观察结果。note 只含固定阶段 `setup/begin/optional/schema/marker/identity/main_object/cleanup` 的累计整数毫秒、总毫秒、失败阶段和本次查询/VM progress 计数，不含 SQL、路径、身份、正文、参数或底层异常。毫秒向下取整并饱和到有符号 32 位非负整数，单条 note 最多 1024 UTF-8 bytes。阶段累计包含清理，分别取整可能使各阶段之和略小于总量；这是同进程墙钟观察，不能据此断言 I/O 或调度根因。
+
+共享原入口单调期限，不续期，不增加查询或重试；默认 1 秒、8 查询及所有 VM/bytes/busy 限制不变。只在固定阶段边界采样，progress callback 不增加采样或格式化。先记录失败阶段再清理；清理失败仍优先返回 `format_cleanup_failed` 并记失败阶段为 cleanup，不能将准入失败改为成功。底层阻塞 I/O 仍不承诺 Python 硬期限。
+
+`Store.open_existing` 的固定错误映射只转发此读取器本次生成的 note，不复制任意 `__notes__`，不改变异常 code/str、公开响应或持久数据。此观测用于下一次失败同次定位，不代表已修复期限失败的根因。真实 Windows 期限边界未验证。
+
+本片经统一守卫每项 30 秒串行验证：`test_format_evidence.py` 与 `test_store_existing.py` 合计 124 项通过（含新增 17 项，0.64 秒；守卫运行 1.189 秒、峰值 95.6 MiB、swap 0）；四 Python 文件 Ruff/format 与两源码严格 mypy 通过，整轮最高峰值 188.3 MiB。首次测试 122 通过、2 失败，原因是 pytest 的 `match` 同时匹配新增 note；改为直接精确断言异常 code/str 后全部通过。首次格式检查发现两处排版，格式化后复核通过；未扩大读取预算，未运行真实服务或访问用户数据。
+
 回归只使用小型临时 SQLite 数据库，覆盖真实 WAL 最新提交、读取期间另一 writer 提交仍不拼接快照、缺/坏/超大/重复标记、旧 marker 不替代、身份与主对象、schema 观察、锁竞争、预算中止、事务/回调/限制清理及无业务写入。共享缓存反证仅通过两个临时 URI 的 `cache=shared` 启用，旧实现确实返回另一连接未提交的格式/实例，修复后拒绝且保留调用者 read-uncommitted 设置；未修改全局 SQLite 选项。
 
 已通过统一 `scripts/check_local.py` 的 30 秒受限检查：原始新回归与既有 compatibility 合计 200 项通过（0.22 秒、峰值 58.7 MiB、swap 0），两文件 Ruff/format 与单源码严格 mypy 通过；静态检查最高峰值 194.3 MiB。后续 optional 分类与真实启动的定向数据见[新片验证](fresh-format-admission.md#验证记录)。未读取用户数据库，未验证真实 A/B 更新，读取器本身仍不认证格式来源。
