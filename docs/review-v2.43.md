@@ -1,6 +1,6 @@
 # 指定队友的接办证据（2.43）
 
-2.43已完成多轮独立后审、损坏数据红绿修复、完整后端整合及离线构件验证；签名候选`41af62671566f4d0ad48caf939f5e7d7b203f6bc`的[CI 40024393046](https://github.com/69gg/MuLi/actions/runs/40024393046)十项全部成功。当前只收尾发布文档，最终文档提交仍须取得自己的精确候选CI；main、标签和远端发行尚待推进。首轮`e664b2e`的Windows两项失败保留在下文，不声称诊断改进已修复其根因。2.42已正式发行，见[2.42闭合记录](review-v2.42.md#发版闭合)。
+2.43已正式发布：最终签名`839999d2a9e0a0b53411dd909a3395282cc17dd6`的候选/main各十项、发行十三项全部成功，PR50原提交合入，签名标签与PyPI/GitHub两构件元数据一致，见[发版闭合](#发版闭合)。首轮`e664b2e`的Windows两项失败保留在下文，不声称诊断改进已修复其根因；此前候选、排队与发布准备按历史检查点保留。2.42见[闭合记录](review-v2.42.md#发版闭合)。
 
 ## 范围与实现
 
@@ -74,5 +74,18 @@
 上述诊断改进形成签名提交`41af62671566f4d0ad48caf939f5e7d7b203f6bc`。[CI 40024393046](https://github.com/69gg/MuLi/actions/runs/40024393046)首次九项成功，macOS 3.13在取得runner之前被取消；平台注释为托管runner容量及macOS arm64延迟，未执行测试步骤。根请求按job定向重试，平台最终回执列出十项全部成功；不把请求范围当作实际只执行一个job的证明，也不将这次绿色解释为此前Windows根因已修复。
 
 本次发布准备仅同步CHANGELOG和审查/迭代记录，不修改生产或测试代码。最终提交将重新取得精确候选CI；保留既有5,191项完整后端与离线构件证据，不为纯文档提交重复本机全量。签名提交、main快进、签名标签、十三项发行作业及PyPI/GitHub两构件核对仍是独立门槛，未完成前不记录为已发布。
+
+## 发版闭合
+
+2026-10-24根实核：最终签名提交`839999d2a9e0a0b53411dd909a3395282cc17dd6`的[候选40031924440](https://github.com/69gg/MuLi/actions/runs/40031924440)、[main40033711371](https://github.com/69gg/MuLi/actions/runs/40033711371)均十项成功；[发行40033711273](https://github.com/69gg/MuLi/actions/runs/40033711273)十三项全部成功，包括prepare、PyPI publish及GitHub release。[PR50](https://github.com/69gg/MuLi/pull/50)已MERGED，mergeCommit与精确head相同。
+
+main与签名标签由同一次原子推送接纳。标签对象`d880e7d513976e11b562cd45e75158c6ed0e166b`指向上述commit，本地`git verify-tag`为有效GPG，GitHub tag verification也为true。发行是正式非draft、非prerelease；只读取小型JSON元数据，没有下载发行包。PyPI与GitHub均恰好两个构件，名称、字节数、SHA-256一致且PyPI未yank：
+
+| 构件 | 字节数 | SHA-256 |
+| --- | --- | --- |
+| `muli_agent-2.43.0-py3-none-any.whl` | 804107 | `4ae52916d56e547c506fcea32d6d6cf431f0ab9e8a3a6863de0b1a45099fb63e` |
+| `muli_agent-2.43.0.tar.gz` | 4176836 | `0cea9c4f3ce8fa5981927542104a26388accc8b59df238e0357742faaee5f4df` |
+
+这是远端实际构件元数据，不用此前本地sdist大小冒充相同字节。三轮CI的绿色不构成Windows间歇UIA或格式读取期限失败已定位修复的证明；Linux原生服务三事务、真实模型质量及真实账号送达仍按各自未验收范围继续推进。
 
 三文档独立只读复审无阻断P1/P2。根对本次收尾运行发行回归20 passed（pytest0.81秒、guard1.310秒、65.1MiB），重新离线构建两包成功（1.330秒、101.3MiB），版本/声明/CHANGELOG及两包核对成功（178毫秒、18.9MiB）；均30秒守卫、实际exit0、swap0，没有新依赖下载。
