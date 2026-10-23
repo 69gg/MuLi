@@ -1,6 +1,6 @@
 # 真实 systemd 托管切换 CI 设计
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald 的既有 245 项纯 fixture；本轮单次 job 准入与统一 95 秒期限已实现并通过独立审查，完整 301 项纯回归与限定静态检查通过。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五至九轮仍未执行事务；后续已观察到 manager 镜像和 epoll 等待，但未确定启动原因，第九轮没有接受到固定四类 journal 正向事件。第十轮 native job 已失败，仍为 0 个事务、没有 readiness 或正常清理证明；取证时其余矩阵尚未终态。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与本轮纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
+状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察与定向 journald。现已记录第十四轮 native 失败：2.5秒回执窗口确实保住同次到期摘要，后备正向观察到 runtime-dir 已完成、user manager 仍 activating/start；仍为0个真实事务，没有 readiness 或正常清理证明。最近整合纯验证为391项通过，详见下文；它不代替原生验收。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮起的 manager 启动原因仍未确定。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -395,5 +395,30 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 回执窗口修复签名为 `fad62fe23c53813aab6da6de80d8c2860a702ee3`，随后按授权以GPG no-ff合并根已发布2.39基线与发行证据 `158ce90e254670854109fbf1b61c92998f177da3`，整合提交 `e398d61781e51ffe6c266d5bc64a980696f3de19`，零冲突；该基线没有修改native/process/workflow，未自动合并独立Windows观测片。
 
 新基线只做一次相关整合纯验证：完整native387项与两个直接_OutputBudget节点的4项，共 **391项通过**（pytest1.06秒、guard1.629秒、峰值100.6 MiB/swap 0），没有选择process测试文件内真实Popen用例。受影响两Python文件Ruff69毫秒/21.5 MiB、format-check75毫秒/21.7 MiB；协调器与worker strict mypy551毫秒/157.1 MiB，全部exit0/swap 0。均经同一绝对路径30秒guard串行，pytest session收实exit0后才下一项，完成即归还共享槽。之后仅补签名文档记录，不push、触发第十四轮或提高任何预算；第十三轮失败及真实事务/清理未验边界不变。
+
+## 第十四轮 native 有限失败取证与下一验证门
+
+精确候选 `362330cd3a89001e70ce25e5843ec5e99686a7fc` 的 [CI 39987046967](https://github.com/69gg/MuLi/actions/runs/39987046967) 已全终态，**9项成功、2项失败**（native 与 Windows）；[native job 120528818889](https://github.com/69gg/MuLi/actions/runs/39987046967/job/120528818889) 的有限日志在 `2026-10-23T16:30:00Z` 报 `native_deadline_exceeded`。本次已下载的 evidence 为 **1182 字节**，zip SHA256 `5b676f2b4272f8c576cbd5b60d1fa3cc343ab3aa6cd22dc4fd2ca81a650da7c8`。严格确认只有 `receipt.json`（1139 字节）与 `result.json`（1070 字节）两个普通、非加密有界 entry 后，只读取白名单标量；没有再次下载。结果投影没有导出原始路径、命令、环境、stderr。
+
+- `completed=false/stage=manager_setup/code=setup_failed`；timeline 与 generations 均为空，仍为 **0 个真实事务**。
+- 本轮首次保留同次 manager 到期摘要：`code=native_deadline_exceeded/stage=manager_validation/query_status=0/query_code=ok/used=17275`。这证明2.5秒失败回执窗口在本次确实保住摘要；不能把传输问题改善写成 manager 就绪问题已修复。本次失败不是该摘要已报告的输出上限或查询退出错误。
+- 后备 setup 为 `phase=manager_show_before/client_code=command_failed/diagnostic_status=0/diagnostic_code=ok/failure=none`，最后字段标签 `stage=service_properties/query_status=0/query_code=ok`。这里 `client_code=command_failed` 是协调器对 `native_deadline_exceeded` 的既有泛化映射，不是第二次系统命令退出失败；成功遍历结束也不会把 `stage` 改成新的完成阶段。
+
+| 固定 system unit | load / active / sub | result / ExecMainCode / ExecMainStatus | MainPID / job | cgroup 存在 |
+| --- | --- | --- | --- | --- |
+| `user-runtime-dir@999.service` | loaded / active / exited | success / 1 / 0 | 0 / 0 | 否 |
+| `user@999.service` | loaded / activating / start | success / 0 / 0 | 2580 / 1573 | 是 |
+
+上述是后备观察窗口的有限正向事实：runtime-dir 已成功完成，而 user manager 当时仍有启动 job、未达到既有严格 ready 条件。`Result=success` 与 `ExecMainStatus=0` 在仍 activating 的服务上不能当作已经完成启动；也不能由 PID 非零直接推断 PAM 已结束或 manager 已进入主循环。manager 摘要的 `manager_validation` 是最后保留的阶段；轮后 sleep 到期同样保留该值，不能据此断言某一条 validation 表达式失败。
+
+对同一 zip 的后续有限投影复用现有 `process_facts` 与 `journal_facts` 校验，确认 `process=observed/exe=manager/uid_matches=true/state=S/wait=epoll_wait`；journal 为 `code=no_known_event/incomplete=false/events=[]`。这证明有限身份窗口内已是专用 UID 的 manager 镜像，不能再把该窗口写成仍在 executor/PAM 最终 exec 之前；epoll 仍不证明已进入 `manager_loop`。journal 没有接受到固定四类正向事件，不能推导没有日志、没有启动 basic/default/dbus 或 READY 发送失败。
+
+receipt 为 UID/GID 999/987、`setup_phase=manager_show_before`；环境文件身份仍已确认，`manager_group` 未赋值，账户/组未标记删除，仍记录3个挂载。随后的 cleanup 在 `2026-10-23T16:30:05Z` 报 `native_command_timeout`、exit1，仍在原5秒边界失败，因此没有 readiness、harness 启动、三事务或正常资源回收证明。本轮不与 Windows 或另一条 main/Python 3.13 rollback 超时混为同一根因。
+
+固定 v255 只读交叉核对重申已有 READY 边界：user manager 在 basic.target 活跃时或 jobs 清空时可发送 READY；这两条路径只支持区分“尚未到触发条件”与“通知未成功交付/接受”等待验假说，本次没有新证据判定其中一项。现有 journal 的四类 MESSAGE_ID 与 start/job_result 约束能对应官方 job 日志，但本次没有确认过滤缺陷；`systemctl --user` 的 v255私有连接失败会回退用户 bus，故不能直接追加该命令并宣称完全没有 socket activation 风险。[v255 READY 触发](https://github.com/systemd/systemd/blob/v255/src/core/manager.c)、[v255 job 结构字段](https://github.com/systemd/systemd/blob/v255/src/core/job.c)、[v255 私有连接及回退](https://github.com/systemd/systemd/blob/v255/src/shared/bus-util.c)。Context7 已查询固定 v255；上述具体判断以官方源码为准。
+
+因此本次先冻结失败事实，不启动第十五轮。下一有效观察需要能在同一身份、原期限和32 KiB预算内区分 READY 触发条件与通知路径，或得到新的已核正向事件；先提出可由纯 fixture 证伪的最小方案，再单独审查。当前证据不支持重复同一 CI、提高期限、修改 Type 或把 direct children 当作 epoll 根因证明。本轮尚未形成新的已证实启动根因或代码修复方案。
+
+两次有限投影均经主仓绝对路径 **30秒 `check_local.py` guard** 并实收 exit0/guard success：首次 unit 投影服务85毫秒、峰值16.6 MiB；随后扩充 process/journal 投影98毫秒、峰值22.1 MiB；swap 均0，每次完成即归还共享检查槽。这里只新增失败事实与下一验证门，没有产品或 CI 代码改动、真实服务操作、新下载或新一轮远端运行。
 
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
