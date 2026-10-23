@@ -10,7 +10,28 @@ from typing import cast
 
 import pytest
 
-from muli.process import _settle_process, run_process
+from muli.process import ProcessOutputLimitError, _OutputBudget, _settle_process, run_process
+
+
+@pytest.mark.parametrize("chunks", [(b"abcd",), (b"abc", b"d"), (b"ab", b"cd")])
+def test_output_budget_has_typed_limit_error_with_value_error_compatibility(
+    chunks: tuple[bytes, ...],
+) -> None:
+    budget = _OutputBudget(limit=3)
+    with pytest.raises(ValueError) as failure:
+        for chunk in chunks:
+            budget.charge(chunk)
+    assert type(failure.value) is ProcessOutputLimitError
+    assert str(failure.value) == "命令输出超过限制，已停止"
+    assert budget.used == sum(map(len, chunks))
+
+
+def test_output_budget_accepts_exact_shared_limit() -> None:
+    budget = _OutputBudget(limit=3)
+    budget.charge(b"a")
+    budget.charge(b"bc")
+    budget.charge(b"")
+    assert budget.used == budget.limit
 
 
 @pytest.mark.parametrize("descriptor", [1, 2])

@@ -129,3 +129,27 @@ jobs:
           tests/test_mcp_resource_files.py
           tests/test_mcp_prompts.py tests/test_mcp_prompts_runtime.py
           tests/test_mcp_prompts_sdk.py
+  managed-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+      - run: uv sync --locked
+      - name: Real user-manager retained-slot transactions
+        run: .venv/bin/python scripts/check_managed_native_ci.py run "$RUNNER_TEMP/muli-managed-native-ci"
+      - name: Release only this fixture's user and mounts
+        if: always()
+        run: .venv/bin/python scripts/check_managed_native_ci.py cleanup "$RUNNER_TEMP/muli-managed-native-ci"
+      - name: Preserve bounded native transaction evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-native-evidence
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/muli-managed-native-ci/receipt.json
+            ${{ runner.temp }}/muli-managed-native-ci/result.json
