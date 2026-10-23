@@ -392,4 +392,8 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 
 第二位Sol只读独审未发现确定P1/P2或阻断，根也已复核协调器与20项fake反例diff，原时间/输出预算边界保持。审查没有运行检查，之后仅按授权签名提交；真实manager就绪、三事务及正常清理仍未验。
 
+回执窗口修复签名为 `fad62fe23c53813aab6da6de80d8c2860a702ee3`，随后按授权以GPG no-ff合并根已发布2.39基线与发行证据 `158ce90e254670854109fbf1b61c92998f177da3`，整合提交 `e398d61781e51ffe6c266d5bc64a980696f3de19`，零冲突；该基线没有修改native/process/workflow，未自动合并独立Windows观测片。
+
+新基线只做一次相关整合纯验证：完整native387项与两个直接_OutputBudget节点的4项，共 **391项通过**（pytest1.06秒、guard1.629秒、峰值100.6 MiB/swap 0），没有选择process测试文件内真实Popen用例。受影响两Python文件Ruff69毫秒/21.5 MiB、format-check75毫秒/21.7 MiB；协调器与worker strict mypy551毫秒/157.1 MiB，全部exit0/swap 0。均经同一绝对路径30秒guard串行，pytest session收实exit0后才下一项，完成即归还共享槽。之后仅补签名文档记录，不push、触发第十四轮或提高任何预算；第十三轮失败及真实事务/清理未验边界不变。
+
 依据：[GitHub 托管 runner 的管理权限](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)、[user@.service 与 runtime-dir](https://github.com/systemd/systemd/blob/main/man/user%40.service.xml)、[资源控制](https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml)、[cgroup 委派](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md)、[transient 属性](https://github.com/systemd/systemd/blob/main/docs/TRANSIENT-SETTINGS.md)、[v255 systemd-run service/scope 环境差别](https://github.com/systemd/systemd/blob/v255/man/systemd-run.xml)、[v255 Environment 与进程环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)、[v255 revert 的 config/control 目录删除范围](https://github.com/systemd/systemd/blob/v255/src/shared/install.c)、[systemctl link/运行时管理](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)、[Python SQLite URI 与锁等待](https://docs.python.org/3.13/library/sqlite3.html#sqlite3.connect)。这些说明支持设计可行性，不代替实际托管 runner 的权限、导入与 kernel 核验。
