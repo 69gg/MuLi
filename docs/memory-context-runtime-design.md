@@ -29,7 +29,7 @@ Runtime 在召回前分配本轮记忆块预算，保留现有整体上限、四
 
 共用模块 `memory_context.py` 承担完整 JSON 两流渲染、按真实来源的当次过滤和 `MemoryContextProvider` 具名可调用适配器；`Memory.automatic_episode_id` 只查询主键及身份条件。Runtime 从当前配置计算预算并扣外层资料标题后召回；MemoryApplication 的适配器读取当前开关、字符上限和名额，通过 `context_for_prompt` 复用流水线，不重配置后台 worker，原 `cached_context` 仍保留默认配置上限合同。所有提供器输出均作整体超预算复核，未再切片自动记忆字符串；fallback 保持原最多五个名额并遵守更小的配置。缓存有效召回不足当前 `min(context_limit, max_candidates)` 时仅一次既有上限的本地补位，包含命中旧小名额缓存的情况；合并后的召回也受此上限约束，侧写保持独立双流规则，显式查询与缓存不变。
 
-验收代码分别位于 `tests/test_memory_context_selection.py` 和独立 builder 的 `tests/test_memory_runtime_quality.py`；真实请求均由临时 SQLite 与 FakeClient 捕获。共享资源守卫下定向三个上下文文件 52 项、应用与流水线两个文件 25 项通过；7 文件 Ruff 和格式检查、5 生产文件严格类型检查通过。每条硬超时 30 秒，收到退出码 0 和守卫终态；峰值分别为 95.9 MiB、82.9 MiB 和类型检查 188.8 MiB，swap 0。独立后审及更广整合验收仍以最终记录为准。
+验收代码分别位于 `tests/test_memory_context_selection.py` 和独立 builder 的 `tests/test_memory_runtime_quality.py`；真实请求均由临时 SQLite 与 FakeClient 捕获。共享资源守卫下定向三个上下文文件 52 项、应用与流水线两个文件 25 项通过；7 文件 Ruff 和格式检查、5 生产文件严格类型检查通过。每条硬超时 30 秒，收到退出码 0 和守卫终态；峰值分别为 95.9 MiB、82.9 MiB 和类型检查 188.8 MiB，swap 0。独立后审提出并修复候选合并上限 P2，复审未发现新 P1/P2；204 文件的整合回归与构建边界见[最终审查](review-v2.40.md)，不以本地结果替代真实渠道或跨平台 CI。
 
 ## 保留边界
 
