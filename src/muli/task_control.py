@@ -208,10 +208,23 @@ class TaskControl:
             if current in visited:
                 raise ControlUnavailable("scope_invalid", "执行范围父链包含环")
             visited.add(current)
-            session = self.store.get("session", current)
-            if session is None:
+            session_row = self.store.db.execute(
+                "SELECT json_extract(data,'$.kind') AS kind,"
+                "json_extract(data,'$.workflow_id') AS workflow_id,"
+                "json_extract(data,'$.workflow_run_id') AS workflow_run_id "
+                "FROM objects WHERE kind='session' AND id=?",
+                (current,),
+            ).fetchone()
+            if session_row is None:
                 raise ControlUnavailable("scope_invalid", "执行范围父会话缺失")
-            agent = self.store.get("agent", current)
+            session = dict(session_row)
+            agent_row = self.store.db.execute(
+                "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
+                "json_extract(data,'$.parent_id') AS parent_id "
+                "FROM objects WHERE kind='agent' AND id=?",
+                (current,),
+            ).fetchone()
+            agent = dict(agent_row) if agent_row is not None else None
             if agent is None and session.get("kind") == "team":
                 raise ControlUnavailable("scope_invalid", "团队执行记录缺失")
             if session.get("workflow_id") is not None and not session.get("workflow_run_id"):

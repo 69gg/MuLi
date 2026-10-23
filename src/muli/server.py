@@ -688,6 +688,32 @@ def _create_app(
             "scope": current["scope"],
         }
 
+    @app.get("/api/commitments/{identifier}/inspection")
+    async def inspect_task(
+        identifier: str,
+        section: str = "overview",
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        query: str | None = None,
+        revision: Annotated[str | None, Query(min_length=1)] = None,
+        record_id: Annotated[str | None, Query(min_length=1)] = None,
+        record_revision: Annotated[str | None, Query(min_length=1)] = None,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+    ) -> dict[str, Any]:
+        return local_services.task_inspection.read(
+            identifier,
+            section=section,
+            cursor=cursor,
+            limit=limit,
+            query=query,
+            revision=revision,
+            record_id=record_id,
+            record_revision=record_revision,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
+        )
+
     @app.post("/api/commitments/{identifier}/control")
     async def control_task(identifier: str, body: TaskControlInput) -> dict[str, Any]:
         try:

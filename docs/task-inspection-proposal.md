@@ -1,6 +1,6 @@
 # 按需核查长期任务（提案，未实现）
 
-2026-10-23 的下一片候选方向。先闭合 Linux 恢复验收，再决定实现顺序；本文件不增加工具、API、持久格式或已交付能力。
+2026-10-23 的下一片方向。方案已完成独立代码审查，正在实现；尚未发布。Linux 恢复验收独立推进，不以此功能替代服务验收。
 
 ## 已有基础
 
@@ -25,3 +25,17 @@
 
 1. 读取期间任务修订、epoch 或记忆变化/遗忘，旧页不冒充当前事实；失效、已删除依据、未完成报告和正文省略分别明确。固定证据与相关候选始终区分。
 2. Web 主人和绑定队友获得一致定位及各自原有权限，查看为零业务写入、零模型调用、零唤醒；纠正后仍经原确认门，不能借读取或旧页恢复副作用。
+
+## 首片实现合同
+
+以下是实现者决定，复用现有 Python/SQLite/FastAPI 和工具注册，不增加依赖、持久格式或前端面板：
+
+- `commitment_inspect` 与 `GET /api/commitments/{id}/inspection` 共用读取服务。`section` 为 `overview/task/agents/reports/workflows/evidence/memories`；默认 overview 给出任务元数据、控制摘要和各段入口。
+- `task` 返回当前完整持久任务 JSON 的 UTF-8 字节页，包含 brief 和 plan；与 `commitment_read` 的历史 brief 页不同。不可调用会选择重规划的包装 handler。
+- agents/reports/workflows 在 SQL 中先限定任务及混合父链，再按 ID keyset 读目录；列表不装载 prompt/result/nodes/content。可用 `record_id` 从同入口读取一条完整持久 JSON 的字节页，包括尚未投递的报告。正文只证明已保存内容，不能恢复报告生成前已丢弃的结果。
+- `revision` 绑定资料库、任务内容、section、query 以及记忆段的 memory revision。目录 cursor 绑定该 revision；正文续读另带 `record_revision`，记录改变即失效。每页重做权限与范围核对。列表是 live 观察，新增/更改可能发生在页间，不能称作完整历史快照。
+- evidence 逐项列出原 brief 的消息/附件定位及 available/missing，不因引用删除而丢失整个任务视图。原文继续走既有来源读取；不恢复已删除内容。
+- memories 必须提供非空 query，只调用现有本地 Memory.search 的有界候选集，按 ID 分页，明确是相关候选、是否曾采用未知。记录正文可按 ID 读取，来源核查继续走现有 memory_source_read；不注入最近记忆或调用 embedding/模型。
+- 所有 JSON 元数据和正文共用现有 max_output_chars。无法完整容纳一项时留给下一页；连首项也放不下就明确失败。正文复用 content_page 的 UTF-8 与必须推进约束。读取在一个可嵌套的只读 savepoint 内完成，不提交外层事务。
+
+首片不新增纠正写入口；主人仍通过现有记忆更正/遗忘、任务暂停/重规划来纠正。独立审查确认没有需主人再决策的阻断，用户既有 YOLO 授权继续有效。

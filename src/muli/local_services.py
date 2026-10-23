@@ -14,6 +14,7 @@ from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
 from muli.runtime import Runtime
 from muli.task_control import TaskControl
+from muli.task_inspection import TaskInspection
 from muli.tools import Tool, parameters, string
 from muli.tools.mcp_catalog import ContentError, fits_output
 from muli.tools.mcp_resources import ResourceSaveTarget
@@ -32,6 +33,7 @@ class LocalServices:
             max_output_chars=lambda: runtime.config.settings.limits.max_output_chars,
         )
         self.task_control = TaskControl(runtime.store, self.commitments)
+        self.task_inspection = TaskInspection(self.commitments, self.task_control, runtime.memory)
         runtime.task_control = self.task_control
         runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.context_hooks.append(self.context)
@@ -162,6 +164,7 @@ class LocalServices:
         commitment_tools = self.commitments.tools(
             allow_brief_write=is_main(), can_write_brief=is_main, read_scope=read_scope
         )
+        commitment_tools.append(self.task_inspection.tool(read_scope))
         original_read = next(
             tool.handler for tool in commitment_tools if tool.name == "commitment_read"
         )

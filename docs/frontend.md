@@ -114,6 +114,7 @@
 | `GET /team?limit=50&offset=0&active_only=false` | `{members,messages,offset,limit,total,active_only,has_more}`；成员含限长消息预览，完整历史通过会话详情读取 |
 | `POST /team/:id/messages`、`POST /team/:id/stop` | `{content}` 协作消息 / 停止成员任务 |
 | `GET /commitments`、`GET /commitments/:id` | 有界工作账本索引 / 已认证的完整任务详情；不存在的 ID 返回 404 |
+| `GET /commitments/:id/inspection` | 只读核查；section、目录 cursor 或 record_id/正文版本及 UTF-8 字节页。见 [task-inspection.md](task-inspection.md) |
 | `POST /commitments/:id/control` | `{action:"pause"\|"request_replan",expected_epoch,request_id,additional_requirements?}`；返回 `{receipt,current}`，409 使用 `detail:{code,message,current?}` |
 | `GET/POST /memories`、`GET/PATCH/DELETE /memories/:id` | 记忆内容、关系、来源标签和置信度；详情含只读 `origin` 摘要，无来源为 null |
 | `GET /memories?query=...` | `{items,revision,truncated}`；实际图命中可带完整 `graph_via`，`path_omitted:true` 表示整条路径因预算省略 |
