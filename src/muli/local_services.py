@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import hashlib
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from muli.attachment_records import AttachmentRecords
-from muli.attachments import Attachments, file_io
+from muli.attachments import Attachments, attachment_name, detected_media, file_io
 from muli.commitments import Commitments
 from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
 from muli.runtime import Runtime
 from muli.task_control import TaskControl
 from muli.tools import Tool, parameters, string
+from muli.tools.mcp_catalog import ContentError, fits_output
+from muli.tools.mcp_resources import ResourceSaveTarget
 from muli.transcripts import AudioTranscripts
 
 
@@ -53,6 +56,40 @@ class LocalServices:
             else None,
             max_image_bytes=settings.uploads.max_file_bytes,
         )
+
+    def mcp_resource_target(self, name: str) -> ResourceSaveTarget:
+        name = attachment_name(name)
+        self.runtime.guard_mcp_resource_save()
+        attachments = self.attachments
+
+        def prepare(
+            data: bytes, mime: str, maximum: int
+        ) -> Callable[[], Awaitable[dict[str, Any]]]:
+            receipt: dict[str, Any] = {
+                "is_error": False,
+                "saved": True,
+                "untrusted": True,
+                "attachment": {
+                    "id": "0" * 32,
+                    "mime_type": detected_media(data[:512], mime),
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                },
+            }
+            if not fits_output(receipt, maximum):
+                raise ContentError("resource_output_budget_exceeded")
+
+            async def save() -> dict[str, Any]:
+                async def chunks() -> AsyncIterator[bytes]:
+                    yield data
+
+                item = await attachments.save(chunks(), name, mime, source="mcp")
+                receipt["attachment"]["id"] = item["id"]
+                return receipt
+
+            return save
+
+        return ResourceSaveTarget(self.runtime.config.settings.uploads.max_file_bytes, prepare)
 
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         # Only metadata is injected. Reading/vision/transcription always requires a tool call.
@@ -105,6 +142,8 @@ class LocalServices:
         return item, data
 
     def tools(self, runtime: Runtime) -> list[Tool]:
+        runtime.mcp.set_resource_save_factory(self.mcp_resource_target)
+
         def is_main() -> bool:
             identifier = runtime.tool_session_id
             session = runtime.store.get("session", identifier) if identifier else None

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -11,6 +14,17 @@ from muli.tools.mcp_catalog import MAX_CATALOG_ITEMS, Catalog
 from muli.tools.mcp_catalog import ContentError as ResourceError
 
 JsonObject = dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSaveTarget:
+    """Host-owned preflight returns the sole save operation, without starting it."""
+
+    max_file_bytes: int
+    prepare: Callable[[bytes, str, int], Callable[[], Awaitable[JsonObject]]]
+
+
+ResourceSaveFactory = Callable[[str], ResourceSaveTarget]
 
 # Host protocol limits; the configured page, catalog, wire and output budgets
 # can reject an operation earlier. These do not add a second settings policy.
@@ -105,3 +119,28 @@ def resource_content(value: object) -> list[JsonObject]:
             item["mime_type"] = mime
         result.append(item)
     return result
+
+
+def resource_blob(value: object, maximum: int) -> tuple[bytes, str]:
+    """Validate one complete blob before allocating any attachment reservation."""
+    if type(value) is not dict or type(value.get("contents")) is not list:
+        raise ResourceError("resource_invalid")
+    blocks = value["contents"]
+    if len(blocks) != 1:
+        raise ResourceError("resource_content_unsupported")
+    block = blocks[0]
+    if type(block) is not dict or "text" in block or "blob" not in block:
+        raise ResourceError("resource_content_unsupported")
+    resource_uri(block.get("uri"))
+    encoded, mime = block["blob"], block.get("mimeType", "")
+    if type(encoded) is not str or type(mime) is not str:
+        raise ResourceError("resource_invalid")
+    if len(encoded) > ((maximum + 2) // 3) * 4:
+        raise ResourceError("resource_file_budget_exceeded")
+    try:
+        data = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeError, binascii.Error, ValueError):
+        raise ResourceError("resource_blob_invalid") from None
+    if len(data) > maximum:
+        raise ResourceError("resource_file_budget_exceeded")
+    return data, mime

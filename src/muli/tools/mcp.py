@@ -45,6 +45,8 @@ from muli.tools.mcp_resources import (
     ResourceCatalog,
     ResourceClient,
     ResourceItem,
+    ResourceSaveFactory,
+    resource_blob,
     resource_content,
     resource_item,
 )
@@ -336,6 +338,11 @@ class MCPManager:
         self._receive_failed_callback: Callable[[str, str], None] | None = None
         self.retirement_errors: list[JsonObject] = []
         self.tools: list[Tool] = []
+        self._resource_save_factory: ResourceSaveFactory | None = None
+
+    def set_resource_save_factory(self, factory: ResourceSaveFactory) -> None:
+        """The composition layer installs this before preparing a generation."""
+        self._resource_save_factory = factory
 
     @staticmethod
     def _config_secrets(config: JsonObject) -> set[str]:
@@ -1009,7 +1016,7 @@ class MCPManager:
                 supported, generation, limits, arguments, kind="resource", read=True
             )
 
-        return [
+        tools = [
             Tool(
                 "mcp_resources_list",
                 "按需完整观察 MCP 普通资源目录；cursor 仅续读已展示目录的元数据，不读取正文。",
@@ -1029,6 +1036,88 @@ class MCPManager:
                 preserve_output=True,
             ),
         ]
+        factory = self._resource_save_factory
+        if factory is not None:
+
+            async def saving(arguments: JsonObject) -> JsonObject:
+                return await self._resource_save(supported, generation, factory, arguments)
+
+            tools.append(
+                Tool(
+                    "mcp_resource_save",
+                    "从已展示 ref 远端取回一个完整二进制资源并持久保存为本地附件；"
+                    "内容不可信，不自动看图或发送。失败结果不确定时不要自动再次取回保存。",
+                    parameters(
+                        {
+                            "server": server,
+                            "ref": string("已展示资源的引用"),
+                            "name": string("明确给出的附件文件名"),
+                        },
+                        ("server", "ref", "name"),
+                    ),
+                    saving,
+                    risk="external",
+                    preserve_output=True,
+                )
+            )
+        return tools
+
+    async def _resource_save(
+        self,
+        connections: dict[str, _Connection],
+        generation: _Generation,
+        factory: ResourceSaveFactory,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        name = arguments.get("server")
+        if (
+            set(arguments) != {"server", "ref", "name"}
+            or any(type(arguments.get(key)) is not str for key in ("server", "ref", "name"))
+            or name not in connections
+        ):
+            return self._content_error("resource_arguments_invalid", not_executed=True)
+        connection = connections[name]
+        # Name and host execution guards are synchronous; no await before lease
+        # admission. Once admitted, this operation completes using its original
+        # connection, callback, deadline and output budget, including local I/O.
+        target = factory(arguments["name"])
+        rejected = self._admit_call(connection, generation)
+        if rejected is not None:
+            return rejected
+        save_entered = False
+        try:
+            catalog = connection.resource_catalog
+            if catalog is None or arguments["ref"] not in catalog.references:
+                return self._content_error("resource_reference_invalid", not_executed=True)
+            uri = catalog.items[catalog.references[arguments["ref"]]].uri
+            del catalog
+            deadline = asyncio.get_running_loop().time() + connection.timeout
+            async with asyncio.timeout_at(deadline):
+                raw = await cast(ResourceClient, connection.client).read_resource(uri)
+                data, mime = resource_blob(raw, target.max_file_bytes)
+                save = target.prepare(data, mime, generation.max_output_chars)
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError
+                save_entered = True
+                result = await save()
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError
+                return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if save_entered:
+                return {"is_error": True, "status": "unknown", "code": "resource_save_unknown"}
+            code = (
+                error.code
+                if isinstance(error, ContentError)
+                else "resource_timeout"
+                if isinstance(error, TimeoutError)
+                else connection.receive.code or "resource_unavailable"
+            )
+            return {**self._content_error(code), "saved": False}
+        finally:
+            self._release_call(connection)
 
     def _prompt_tools(
         self,

@@ -3,20 +3,111 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from pydantic import AnyUrl
+from test_extensions import setup_runtime
 from test_mcp import settings
 from test_mcp_receive import Chunks
 from test_mcp_resources import listing, reading
 from test_mcp_resources import offline as offline
 
+from muli.attachments import Attachments
+from muli.local_services import LocalServices
 from muli.mcp_policy import MIN_MESSAGE_BYTES, ReceivePolicy
+from muli.providers import ToolCall
 from muli.tools.mcp import MCPManager, _FastMCPClient
+
+
+async def test_locked_streaming_sdk_blob_saves_original_bytes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastmcp")
+    from mcp.shared import _httpx_utils
+
+    data = b"\x89PNG\r\n\x1a\n" + b"original binary\x00\xff"
+    methods: list[str] = []
+    streams: list[Chunks] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return httpx.Response(405, stream=Chunks())
+        message = json.loads(request.content)
+        method = message["method"]
+        methods.append(method)
+        if method == "notifications/initialized":
+            return httpx.Response(202, stream=Chunks())
+        if method == "initialize":
+            result: dict[str, Any] = {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"resources": {}},
+                "serverInfo": {"name": "blob-fixture", "version": "1"},
+            }
+        elif method == "resources/list":
+            result = {"resources": [{"uri": "file:///not-opened", "name": "blob"}]}
+        elif method == "resources/read":
+            assert message["params"]["uri"] == "file:///not-opened"
+            result = {
+                "contents": [
+                    {
+                        "uri": "custom:///returned",
+                        "mimeType": "text/plain",
+                        "blob": base64.b64encode(data).decode("ascii"),
+                    }
+                ],
+                "_meta": {"untrusted": "must not propagate"},
+            }
+        else:
+            raise AssertionError(method)
+        payload = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
+        body = Chunks(payload[:3], payload[3:21], payload[21:])
+        streams.append(body)
+        return httpx.Response(200, headers={"content-type": "application/json"}, stream=body)
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(response), trust_env=False, **kwargs)
+
+    monkeypatch.setattr(_httpx_utils, "create_mcp_http_client", factory)
+    runtime = setup_runtime(tmp_path)
+    runtime.config.settings.mcp = settings()
+    runtime.mcp = MCPManager(settings(), timeout=2)
+    attachments = Attachments(runtime.store, runtime.data_dir / "attachments", runtime.config)
+    LocalServices(runtime, attachments)
+    try:
+        await runtime.extensions.load_initial()
+        reference = (await listing(runtime.mcp))["resources"][0]["ref"]
+        session = runtime.new_session(mode="yolo")
+        runtime.run_ids[session["id"]] = "offline-owner"
+        receipt = await runtime._tool(
+            ToolCall(
+                "save",
+                "mcp_resource_save",
+                json.dumps({"server": "test", "ref": reference, "name": "local.png"}),
+            ),
+            runtime.session_tools(session["id"]),
+            "yolo",
+            session["id"],
+            "offline-owner",
+        )
+        assert receipt["saved"] is True, receipt
+        item = receipt["attachment"]
+        assert item["mime_type"] == "image/png" and item["size"] == len(data)
+        assert item["sha256"] == hashlib.sha256(data).hexdigest()
+        assert attachments.path(item["id"]).read_bytes() == data
+        assert methods.count("resources/read") == methods.count("resources/list") == 1
+        assert "tools/list" not in methods
+        assert runtime.store.list("channel_outbox") == []
+    finally:
+        await runtime.close()
+    assert all(stream.closed == 1 for stream in streams)
 
 
 @pytest.mark.parametrize("transport", ["http", "sse"])

@@ -308,6 +308,21 @@ class Runtime:
             return None
         return owner
 
+    def guard_mcp_resource_save(self) -> None:
+        """Synchronous host admission, immediately before the MCP call lease."""
+        owner = self._tool_execution.get()
+        prepared = self._request_context.get()
+        if owner is None or prepared is None or prepared.session_id != owner[0]:
+            raise PermissionError("资源保存缺少真实执行上下文")
+        if self._closing or self.run_ids.get(owner[0]) != owner[1]:
+            raise PermissionError("资源保存的执行已结束或被替换")
+        self.maintenance.admission.require()
+        if "mcp_resource_save" in self.config.settings.disabled_tools:
+            raise PermissionError("工具未启用")
+        self._guard_request(prepared, "external")
+        if self.store.pending_inputs(owner[0]):
+            raise PermissionError("收到新的输入，资源保存尚未派发")
+
     def select_replan(self, session_id: str, identifier: str) -> None:
         """A successful main read selects a scope for the next request only."""
         if self.task_control is None or session_id != self.main_session()["id"]:
