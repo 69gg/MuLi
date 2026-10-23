@@ -606,6 +606,60 @@ def context_unavailable(code: str = "not_started") -> dict[str, str]:
     ) | {"code": code}
 
 
+def notification_unavailable(code: str = "not_started") -> dict[str, str]:
+    return dict.fromkeys(
+        (
+            "status_text",
+            "notify_access",
+            "service_type",
+            "result",
+            "active_state_after",
+            "sub_state_after",
+        ),
+        "unavailable",
+    ) | {"code": code}
+
+
+def notification_projection(service: dict[str, Any], state: dict[str, Any]) -> dict[str, str]:
+    """Keep fixed PID1 labels, never STATUS text or a claim that READY arrived."""
+    require(
+        set(service) == {"StatusText", "NotifyAccess", "Type", "Result"}
+        and set(state) == {"ActiveState", "SubState"}
+        and all(isinstance(value, str) for value in (*service.values(), *state.values())),
+        "native_diagnostic_invalid",
+    )
+
+    def label(value: str, allowed: set[str]) -> str:
+        return value if value in allowed else "other"
+
+    return {
+        "code": "observed",
+        "status_text": {
+            "": "empty",
+            "Reached basic.target.": "reached_basic",
+            "Ready.": "ready",
+        }.get(service["StatusText"], "other"),
+        "notify_access": label(service["NotifyAccess"], {"none", "main", "exec", "all"}),
+        "service_type": label(service["Type"], {"notify", "notify-reload"}),
+        "result": label(service["Result"], {"success"}),
+        "active_state_after": label(
+            state["ActiveState"],
+            {
+                "active",
+                "activating",
+                "deactivating",
+                "inactive",
+                "failed",
+                "reloading",
+                "maintenance",
+            },
+        ),
+        "sub_state_after": label(
+            state["SubState"], {"start", "start-post", "running", "exited", "dead", "failed"}
+        ),
+    }
+
+
 def context_projection(value: object) -> dict[str, str]:
     allowed = {
         "code": {
@@ -797,13 +851,17 @@ async def observe_setup_context(
     read: Callable[[int, str], Awaitable[bytes | None]],
     io: _SetupIO,
     deadline: float,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     from muli.platforms.linux_transaction import _start_ticks
 
     try:
 
-        async def binding() -> tuple[dict[str, Any], dict[str, Any], int]:
-            state = await probe._properties(path, "Unit", (("Id", "s"), ("InvocationID", "ay")))
+        async def binding() -> tuple[dict[str, Any], dict[str, Any], int, dict[str, Any]]:
+            state = await probe._properties(
+                path,
+                "Unit",
+                (("Id", "s"), ("InvocationID", "ay"), ("ActiveState", "s"), ("SubState", "s")),
+            )
             invocation = state["InvocationID"]
             require(
                 state["Id"] == f"user@{uid}.service"
@@ -820,25 +878,42 @@ async def observe_setup_context(
             raw = await read(pid, "stat")
             if raw is None:
                 raise OSError
-            return state, service, _start_ticks(raw, pid)
+            return (
+                {key: state[key] for key in ("Id", "InvocationID")},
+                service,
+                _start_ticks(raw, pid),
+                {key: state[key] for key in ("ActiveState", "SubState")},
+            )
 
         before = await binding()
-        result = await io.context(pid, uid, before[2], group)
-        require(before == await binding(), "native_process_changed")
-        remaining(deadline)
-        return result
-    except TimeoutError:
-        return context_unavailable("timeout")
-    except OSError:
-        return context_unavailable("unavailable")
-    except ValueError as error:
-        return context_unavailable(
-            {
-                "native_process_changed": "identity_changed",
-                "native_deadline_exceeded": "timeout",
-                "native_diagnostic_output_budget": "output_budget",
-            }.get(str(error), "invalid_reply")
+        service = await probe._properties(
+            path,
+            "Service",
+            (("StatusText", "s"), ("NotifyAccess", "s"), ("Type", "s"), ("Result", "s")),
         )
+        notification_projection(service, before[3])
+        result = await io.context(pid, uid, before[2], group)
+        after = await binding()
+        require(before[:3] == after[:3], "native_process_changed")
+        # These state getters follow STATUS, but are separate calls, not an atomic snapshot.
+        notification = notification_projection(service, after[3])
+        remaining(deadline)
+        return result, (
+            notification
+            if result["code"] == "observed"
+            else notification_unavailable(result["code"])
+        )
+    except TimeoutError:
+        code = "timeout"
+    except OSError:
+        code = "unavailable"
+    except ValueError as error:
+        code = {
+            "native_process_changed": "identity_changed",
+            "native_deadline_exceeded": "timeout",
+            "native_diagnostic_output_budget": "output_budget",
+        }.get(str(error), "invalid_reply")
+    return context_unavailable(code), notification_unavailable(code)
 
 
 def journal_events(output: str, uid: int, pid: int, invocation: str) -> dict[str, Any]:
@@ -1160,7 +1235,7 @@ async def observe_setup_units(
                 and facts["process"]["uid_matches"] is True
             ):
                 if context_io is not None:
-                    facts["context"] = await observe_setup_context(
+                    facts["context"], facts["notification"] = await observe_setup_context(
                         probe, path, uid, service["MainPID"], group, read, context_io, deadline
                     )
                 facts["journal"] = await observe_setup_journal(
@@ -1726,6 +1801,7 @@ async def diagnose_setup(
         "process": process_unavailable(),
         "journal": journal_unavailable(),
         "context": context_unavailable(),
+        "notification": notification_unavailable(),
     }
     io = _SetupIO(deadline, byte_limit, facts)
     try:

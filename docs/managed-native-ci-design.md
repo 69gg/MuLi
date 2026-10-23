@@ -414,6 +414,24 @@ worker仍以传入的较早绝对截止约束全部原typed/proc/kernel/前后�
 
 在 merge `39b8df5` 上重新取得独占槽，逐条经主仓绝对路径30秒 guard 完成最小整合验证并实收exit0：native426项加两个直接 OutputBudget 节点4项，共 **430项通过**（pytest1.37秒、服务1.970秒、峰值117 MiB）；三Python文件 Ruff66毫秒/21.6 MiB、format-check71毫秒/21.4 MiB，两脚本 strict mypy1.085秒/171.7 MiB均通过。mypy 在 guard 内显式使用 `MYPYPATH=src:tests`、`--explicit-package-bases`，没有降级规则；全部swap0，完成即归还槽。本轮没有失败重试、本机真实账户/服务/挂载效果或远端 CI。该合并候选提供新的有限观察假说，不表示 manager 根因已确认、0事务边界已解除或正常 cleanup 已验收。
 
+## 第十五轮后候选：PID 1 通知状态的固定投影
+
+本片只在 setup 失败后的既有 context 身份窗口内增加 `setup.notification`，复用当前系统 bus 的 typed `Service` 属性读取，不连接 private/user bus、不引入 ctypes 或依赖，也不增加 ready 轮询。窄提权 proc/socket helper 的输入、输出白名单和512字节回复上限保持不变。以下候选已实现并完成纯 fixture/静态验证，尚未真实 CI 验证，不改写第十五轮或第十四轮失败事实。
+
+外层先确认同一 Id/InvocationID、MainPID/ControlGroup 与 proc startticks，再只读 StatusText、NotifyAccess、Type、Result，执行原内层 UID/exe/cgroup/startticks 双重绑定，最后重读同代身份及 ActiveState/SubState。只有原 context 本身观察成功且外层身份未变，notification 才记 observed；失败只保留固定失败码，字段全部 unavailable。状态变化本身允许保留最终采样标签，身份变化则同时拒绝两包。`active_state_after/sub_state_after` 明确是 STATUS 属性之后独立 getter 的结果，整个窗口仍非原子快照；前一份 units 状态可能不同，不能拼成同时发生的事实。
+
+固定字段为 code、status_text、notify_access、service_type、result、active_state_after、sub_state_after。status_text 仅 empty/reached_basic/ready/other/unavailable，其中两个固定标签要求完整精确匹配 v255 的 `Reached basic.target.` 与 `Ready.`；空白、前后缀、换行和其它正文均 other，原文仅在内部属性回复中解析，不进入最终 JSON、导出 stderr 或异常正文。NotifyAccess 只保留 none/main/exec/all/other，Type 只保留 notify/notify-reload/other，Result 只区分 success/other；最终状态亦只保留固定允许枚举，未知值变 other。协调器拒绝额外字段、原始文本、非法类型和不完整成功包。
+
+此观察用于证伪“同一新实例始终没有授权 STATUS 被 PID 1 留存”：v255 在新 InvocationID 启动时清空 status，通知处理先核 NotifyAccess，后写 StatusText。非空值提供这条接收路径的正向事实；它并非通知发送者历史凭据或 READY 位收据。固定 ready 文本与已知 READY 同包发送路径一致，但不能单凭文本授予 readiness；空值仍 unknown，不能推断 READY 未发送/未收到。NotifyAccess 是当前策略，Result=success 在启动初始已设置，两者单独均不证明就绪。[v255 Service 属性](https://github.com/systemd/systemd/blob/v255/src/core/dbus-service.c#L290-L326)、[状态初始化与通知授权/写入](https://github.com/systemd/systemd/blob/v255/src/core/service.c#L2482-L2495)、[通知处理](https://github.com/systemd/systemd/blob/v255/src/core/service.c#L3935-L4067)、[固定 READY/STATUS 发送](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L3426-L3457)。Context7本轮返回月额度耗尽，具体语义以固定v255官方源码为准。
+
+所有新 getter 继续通过原 `_SetupIO` 计实际 stdout/stderr，并受原绝对期限及剩余字节拒绝；最终 diagnose JSON 的实际字节仍由协调器与 worker used 累计计费。1024字节是既有最小回复预留，不是整个 JSON 的硬长度上限；本片不扩大它。约88秒观察、2.5秒失败回执、5秒 cleanup、32 KiB累计和原资源限制均保持。新增包失败不覆盖原 manager_failure，不改变 startup、真实事务、ready 验收或 cleanup 效果。
+
+新增28个纯 case 覆盖固定文本精确匹配、任意正文与未知属性脱敏、空值不推导 READY、前后同代状态变化、InvocationID/PID/cgroup/startticks 漂移、内层身份不可用、坏类型、余额不足、属性/最终重读到期，以及带新增包的最终 JSON 实际计费和首因保留。获独占槽后，逐项经主仓绝对路径 check_local、30秒守卫串行且实收exit0：三Python文件format90毫秒/30.1 MiB；native454项与两个直接OutputBudget节点4项共 **458项通过**（pytest1.46秒、服务2.051秒、峰值119.3 MiB）；Ruff79毫秒/24.1 MiB、format-check73毫秒/21.6 MiB、两脚本strict mypy690毫秒/165 MiB均通过，全部swap0。mypy在守卫内设置MYPYPATH=src:tests并使用explicit-package-bases，未放宽类型规则。无失败重试，终态收齐立即归还检查槽，随后仅补本文记录；未运行真实服务、账户、挂载，未提交/推送或触发第十六轮。fixture通过不证明真实READY通知已发送/收到、manager已就绪或正常cleanup通过。
+
+若此有限属性观察不足，后续 sd-bus 方案仍有独立缺口：已核对的 v255 公共 API 没有原始 wire 累计硬上限入口，库在交给 Python 投影前接收/分配消息。因此32 KiB采集输出计费不可冒称32 KiB D-Bus wire保证；若必须满足后者，当前小型 ctypes 方案不成立，不扩展为自实现协议、内部 ABI 或新代理。本片未实现该方案。
+
+根及独立集成 agent 对本片四文件实现后审未发现可验证 P1/P2：固定字段不泄漏 StatusText，身份变化同时拒绝两包，getter 与最终回复沿原预算计费，manager_failure 首因和真实业务门保持。该静态结论不代替尚待进行的真实原生验收。
+
 ## 第十五轮：新增投影返回有效事实，manager 仍未就绪
 
 精确签名候选 `7c19c754aba5dd297499bb2337d22ac9cb9f26b2` 的唯一 [CI 40002429374](https://github.com/69gg/MuLi/actions/runs/40002429374) 已在 `2026-10-23T18:27:28Z` 更新为 completed/failure，**10项成功、1项失败**，仅 [managed-native job 120581693658](https://github.com/69gg/MuLi/actions/runs/40002429374/job/120581693658) 失败；Windows及其余跨平台任务均成功。本轮不与第十四轮的Windows失败混因。事务步骤 `18:20:14→18:21:42Z` 报 `native_deadline_exceeded`；cleanup `18:21:42→18:21:46Z` 报 `native_service_cleanup_failed`，不是第十四轮的 timeout 标签。之后 evidence 上传成功。

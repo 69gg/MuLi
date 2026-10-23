@@ -455,6 +455,59 @@ def context_facts(value: object) -> bool:
     )
 
 
+def notification_facts(value: object) -> bool:
+    """Accept fixed PID1 projections, never STATUS text or a READY receipt claim."""
+    allowed = {
+        "code": {
+            "observed",
+            "not_started",
+            "unavailable",
+            "identity_changed",
+            "invalid_reply",
+            "timeout",
+            "output_budget",
+        },
+        "status_text": {"empty", "reached_basic", "ready", "other", "unavailable"},
+        "notify_access": {"none", "main", "exec", "all", "other", "unavailable"},
+        "service_type": {"notify", "notify-reload", "other", "unavailable"},
+        "result": {"success", "other", "unavailable"},
+        "active_state_after": {
+            "active",
+            "activating",
+            "deactivating",
+            "inactive",
+            "failed",
+            "reloading",
+            "maintenance",
+            "other",
+            "unavailable",
+        },
+        "sub_state_after": {
+            "start",
+            "start-post",
+            "running",
+            "exited",
+            "dead",
+            "failed",
+            "other",
+            "unavailable",
+        },
+    }
+    return (
+        isinstance(value, dict)
+        and set(value) == set(allowed)
+        and all(
+            isinstance(value[key], str) and value[key] in choices
+            for key, choices in allowed.items()
+        )
+        and all(
+            (value[key] != "unavailable") == (value["code"] == "observed")
+            for key in allowed
+            if key != "code"
+        )
+    )
+
+
 def setup_facts(value: object) -> bool:
     """Only the confirmed UID's two system units may enter setup evidence."""
     fields = {
@@ -472,6 +525,7 @@ def setup_facts(value: object) -> bool:
         "process",
         "journal",
         "context",
+        "notification",
     }
     if (
         not isinstance(value, dict)
@@ -493,6 +547,8 @@ def setup_facts(value: object) -> bool:
         or not process_facts(value["process"])
         or not journal_facts(value["journal"])
         or not context_facts(value["context"])
+        or not notification_facts(value["notification"])
+        or (value["notification"]["code"] == "observed" and value["context"]["code"] != "observed")
     ):
         return False
     uid = value["uid"]
@@ -1622,6 +1678,15 @@ class NativeCI:
                 "parent_notify": "unavailable",
                 "user_notify": "unavailable",
                 "private_socket": "unavailable",
+            },
+            "notification": {
+                "code": "not_started",
+                "status_text": "unavailable",
+                "notify_access": "unavailable",
+                "service_type": "unavailable",
+                "result": "unavailable",
+                "active_state_after": "unavailable",
+                "sub_state_after": "unavailable",
             },
         }
         end = time.monotonic() + CLEANUP_SECONDS

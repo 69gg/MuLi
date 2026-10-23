@@ -136,6 +136,7 @@ class Commands:
                         "process": worker.process_unavailable(),
                         "journal": worker.journal_unavailable(),
                         "context": worker.context_unavailable(),
+                        "notification": worker.notification_unavailable(),
                         "units": [
                             {"unit": name, "code": "unit_absent"}
                             for name in (
@@ -2482,8 +2483,8 @@ async def test_setup_journal_uses_one_finite_identity_bound_read(
     from muli import process
     from muli.platforms import linux_transaction
 
-    async def context(*args: Any, **kwargs: Any) -> dict[str, str]:
-        return worker.context_unavailable()
+    async def context(*args: Any, **kwargs: Any) -> tuple[dict[str, str], dict[str, str]]:
+        return worker.context_unavailable(), worker.notification_unavailable()
 
     monkeypatch.setattr(worker, "observe_setup_context", context)
 
@@ -4621,6 +4622,15 @@ async def test_context_outer_window_binds_invocation_pid_and_ticks(
             return {
                 "Id": "user@23145.service",
                 "InvocationID": [2 if change == "invocation" and rounds > 1 else 1] * 16,
+                "ActiveState": "activating",
+                "SubState": "start",
+            }
+        if fields[0][0] == "StatusText":
+            return {
+                "StatusText": "",
+                "NotifyAccess": "main",
+                "Type": "notify-reload",
+                "Result": "success",
             }
         return {
             "MainPID": 43 if change == "pid" and rounds > 1 else 42,
@@ -4650,7 +4660,7 @@ async def test_context_outer_window_binds_invocation_pid_and_ticks(
 
     monkeypatch.setattr(process, "run_process", command)
     io = worker._SetupIO(105.0, 4096, {})
-    facts = await worker.observe_setup_context(
+    facts, notification = await worker.observe_setup_context(
         SimpleNamespace(_properties=properties),
         "/fixed/unit",
         23145,
@@ -4661,6 +4671,7 @@ async def test_context_outer_window_binds_invocation_pid_and_ticks(
         105.0,
     )
     assert ci.context_facts(facts) and len(commands) == 1
+    assert ci.notification_facts(notification) and notification["code"] == facts["code"]
     assert facts["code"] == {
         "none": "unavailable",
         "deadline": "timeout",
@@ -4668,3 +4679,250 @@ async def test_context_outer_window_binds_invocation_pid_and_ticks(
     }.get(change, "identity_changed")
     assert "never-export-me" not in json.dumps(facts)
     assert 0 < io.used <= 4096
+
+
+@pytest.mark.parametrize(
+    ("text", "label"),
+    [
+        ("", "empty"),
+        ("Reached basic.target.", "reached_basic"),
+        ("Ready.", "ready"),
+        ("Ready.\nSECRET=never-export-me", "other"),
+        (" Ready.", "other"),
+        ("User job private.service/start running ...", "other"),
+    ],
+)
+def test_notification_projection_keeps_only_exact_fixed_text_labels(text: str, label: str) -> None:
+    value = worker.notification_projection(
+        {"StatusText": text, "NotifyAccess": "main", "Type": "notify-reload", "Result": "success"},
+        {"ActiveState": "activating", "SubState": "start"},
+    )
+    assert ci.notification_facts(value) and value["status_text"] == label
+    assert set(value) == {
+        "code",
+        "status_text",
+        "notify_access",
+        "service_type",
+        "result",
+        "active_state_after",
+        "sub_state_after",
+    }
+    assert "never-export-me" not in json.dumps(value) and "private.service" not in json.dumps(value)
+    # Even READY's fixed STATUS label carries no receipt or readiness decision.
+    assert "ready_received" not in value and "ready_sent" not in value
+
+
+@pytest.mark.parametrize("change", ["extra", "raw", "partial", "missing", "boolean"])
+def test_notification_export_rejects_arbitrary_or_partial_facts(change: str) -> None:
+    value: dict[str, Any] = worker.notification_unavailable()
+    if change == "extra":
+        value["StatusText"] = "never-export-me"
+    elif change == "raw":
+        value["status_text"] = "Ready."
+    elif change == "partial":
+        value["status_text"] = "ready"
+    elif change == "missing":
+        value.pop("notify_access")
+    else:
+        value["result"] = True
+    assert not ci.notification_facts(value)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "observed",
+        "state-change",
+        "other",
+        "empty",
+        "unknown-values",
+        "invocation",
+        "pid",
+        "group",
+        "ticks",
+        "status-budget",
+        "status-late",
+        "tail-late",
+        "inner-unavailable",
+        "invalid-status",
+        "balance",
+    ],
+)
+async def test_notification_window_shares_identity_deadline_and_actual_byte_accounting(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from muli import process
+    from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+
+    clock = 100.0
+    rounds = 0
+    calls: list[tuple[list[str], int, float]] = []
+    wire_bytes = 0
+    helper_calls = 0
+    group = "/user.slice/user@23145.service"
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+
+    async def command(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool = False
+    ) -> dict[str, Any]:
+        nonlocal clock, rounds, wire_bytes, helper_calls
+        assert 0 < timeout <= 5 and not merge_stderr
+        calls.append((argv, limit, timeout))
+        if argv[0] == "sudo":
+            helper_calls += 1
+            assert argv[6] == "project-setup-context" and limit == worker.CONTEXT_REPLY_BYTES
+            context = worker.context_unavailable(
+                "unavailable" if case == "inner-unavailable" else "observed"
+            )
+            output = json.dumps({"facts": context, "used": 20})
+        else:
+            assert argv[:2] == ["busctl", "--system"] and "--auto-start=no" in argv
+            index = argv.index("get-property")
+            assert argv[index + 1 : index + 3] == ["org.freedesktop.systemd1", "/fixed/unit"]
+            fields = argv[index + 4 :]
+            if "Id" in fields:
+                rounds += 1
+            changed = rounds > 1
+            status: Any = {
+                "empty": "",
+                "other": "SECRET=never-export-me",
+                "invalid-status": True,
+            }.get(case, "Ready.")
+            rows: dict[str, tuple[str, Any]] = {
+                "Id": ("s", "user@23145.service"),
+                "InvocationID": ("ay", [2 if changed and case == "invocation" else 1] * 16),
+                "MainPID": ("u", 43 if changed and case == "pid" else 42),
+                "ControlGroup": ("s", "/foreign" if changed and case == "group" else group),
+                "ActiveState": (
+                    "s",
+                    "active" if changed and case == "state-change" else "activating",
+                ),
+                "SubState": ("s", "running" if changed and case == "state-change" else "start"),
+                "StatusText": ("s", status),
+                "NotifyAccess": ("s", "never-export-me" if case == "unknown-values" else "main"),
+                "Type": ("s", "never-export-me" if case == "unknown-values" else "notify-reload"),
+                "Result": ("s", "never-export-me" if case == "unknown-values" else "success"),
+            }
+            output = "\n".join(
+                json.dumps({"type": rows[field][0], "data": rows[field][1]}) for field in fields
+            )
+            if "StatusText" in fields and case == "status-budget":
+                output = "x" * (limit + 1)
+            if ("StatusText" in fields and case == "status-late") or (
+                changed and case == "tail-late"
+            ):
+                clock = 105.0
+        wire_bytes += len(output.encode())
+        return {"exit_code": 0, "output": output, "stderr": ""}
+
+    async def read(pid: int, name: str) -> bytes:
+        assert pid == 42 and name == "stat"
+        ticks = 101 if rounds > 1 and case == "ticks" else 100
+        data = f"42 (private) S {'0 ' * 18}{ticks}\n".encode()
+        io.charge(data)
+        return data
+
+    monkeypatch.setattr(process, "run_process", command)
+    io = worker._SetupIO(105.0, 1 if case == "balance" else 4096, {})
+    context, notification = await worker.observe_setup_context(
+        SystemdProbe(runner=io.query, limits=ProbeLimits(seconds=5, command_bytes=4096)),
+        "/fixed/unit",
+        23145,
+        42,
+        group,
+        read,
+        io,
+        105.0,
+    )
+    assert ci.context_facts(context) and ci.notification_facts(notification)
+    assert "never-export-me" not in json.dumps((context, notification))
+    failure = {
+        "invocation": "identity_changed",
+        "pid": "identity_changed",
+        "group": "identity_changed",
+        "ticks": "identity_changed",
+        "status-budget": "output_budget",
+        "status-late": "timeout",
+        "tail-late": "timeout",
+        "inner-unavailable": "unavailable",
+        "invalid-status": "invalid_reply",
+        "balance": "output_budget",
+    }.get(case)
+    if failure is not None:
+        assert notification == worker.notification_unavailable(failure)
+        assert context["code"] == failure
+    else:
+        assert notification["code"] == context["code"] == "observed"
+        assert notification["status_text"] == {"empty": "empty", "other": "other"}.get(
+            case, "ready"
+        )
+        assert notification["active_state_after"] == (
+            "active" if case == "state-change" else "activating"
+        )
+        assert notification["sub_state_after"] == ("running" if case == "state-change" else "start")
+        assert notification["result"] == ("other" if case == "unknown-values" else "success")
+    assert helper_calls == (
+        0 if case in {"status-budget", "status-late", "invalid-status", "balance"} else 1
+    )
+    assert io.used >= wire_bytes
+    assert all(limit <= 4096 and timeout <= 5 for _, limit, timeout in calls)
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_notification_reply_counts_actual_outer_bytes_without_replacing_manager_failure(
+    fixture: tuple[Any, Commands],
+    exhausted: bool,
+) -> None:
+    native, commands = fixture
+    original = ci.FixtureError("native_manager_starting")
+    summary = {
+        "code": "native_deadline_exceeded",
+        "stage": "manager_validation",
+        "query_status": 0,
+        "query_code": "ok",
+        "used": 1,
+    }
+    native.manager_failure = summary
+    native.prepare()
+    assert native.receipt is not None
+    native.receipt.setup_phase = "manager_show_before"
+    before = native.setup_bytes
+    returned = 0
+    charged = 0
+
+    def run(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal returned, charged
+        if "diagnose-setup" not in argv:
+            return commands(argv, seconds=seconds)
+        assert int(argv[-1]) == ci.OUTPUT_BYTES - before - 1024
+        reply = commands(argv, seconds=seconds)
+        value = json.loads(reply.output)
+        value["context"]["code"] = "observed"
+        value["notification"] = worker.notification_projection(
+            {
+                "StatusText": "Ready.",
+                "NotifyAccess": "main",
+                "Type": "notify-reload",
+                "Result": "success",
+            },
+            {"ActiveState": "activating", "SubState": "start"},
+        )
+        if exhausted:
+            value["used"] = ci.OUTPUT_BYTES - before
+        charged = value["used"]
+        output = json.dumps(value).encode()
+        returned = len(output)
+        return ci.Reply(0, output)
+
+    native.run = run
+    native.observe_setup(original)
+    value = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert value["resources"]["manager_failure"] == summary
+    facts = value["resources"]["setup"]
+    assert facts["client_code"] == "command_failed"
+    if exhausted:
+        assert facts["diagnostic_code"] == "output_budget"
+        assert facts["notification"] == worker.notification_unavailable()
+    else:
+        assert facts["notification"]["status_text"] == "ready"
+    assert native.setup_bytes == before + charged + returned
