@@ -26,10 +26,13 @@
 | `management` | `management.progress` | 当前计划与事件均为 switch/update、applying/candidate_cleanup_required，且原路由一致；同一计划同一阶段去重 |
 | 独立日志策略 | `system.log` | 当前 `system_log` 原记录、精确事件 ID、固定字段一致，且来源允许通知、级别符合策略 |
 | 独立 chiliarch 策略 | `notification.created`，`producer=chiliarch_message` | 当前身份与 revision、原 inbox 正文的有限前缀及长度、canonical 通知的宿主证明与冻结路由均一致；仅两类普通消息 |
+| 独立 file_inbox 策略 | `file_inbox.observed` | 有界元数据、精确 canonical 事件 ID、持久目录身份与策略 revision、首次冻结路由均一致；来源默认关闭、仅 Linux |
 
 仅伪造一个同名事件不够。消费器回查 SQLite 的通知、提醒、版本和管理记录；管理计划的原始错误、配置快照、结果对象不进入模型，避免诊断中的凭据外泄。候选清理结束表示更新已中断，不表示安装或切换成功；其他 progress 与历史 interrupted 忽略，详情见[候选更新](candidate-host-design.md)。本地 Python 插件仍是用户信任的代码，能修改数据库与事件总线；这里不是针对恶意插件的操作系统沙箱。
 
 chiliarch 的本地持久接收事实可信，正文仍是不可信外部资料，来源节选会明确标注。coalesce、等待空闲与等待配置锁之后，在入队事务前按每条来源证明再次核对当前身份和策略 revision；失效资料被下一次有界消费跳过，不使同批有效 reminder 卡住。未接纳旧消息不会因重配或重新启用获得新身份的授权；已接纳事项保留原历史身份，不承诺撤销所有既有批次。
+
+[资料收件目录](file-inbox.md)沿独立持久策略启用，使用 `file_inbox_configure` 或已认证的 `/api/file-inbox/settings`，不写主配置；`attention.events=[]` 不关闭它，全部注意事项仍由 `attention.enabled` 控制。宿主仅提交元数据，文件名不是主人命令，正文不自动注入；只读回合可按现有文件权限按需读取。此来源使用独立证明与批次，不冒用 chiliarch 身份；正常重启不使已提交记录因 watcher 换代失效，明确撤销会取消此来源尚未 claimed 的系统输入。候选、保留、单位时间事实和缺口次数分别有界，不能仅依赖 Attention 批大小限制模型费用。
 
 系统资料不代表用户授权。每批输入固定使用 `source=principal=system:attention`、`route=null`，不执行 owner 消息 hooks，也不会自动提炼成用户身份记忆。为复用现有工具配对与多协议回放，历史使用 `user` 消息容器，但正文明确以“系统注意事项／非用户消息或新授权”开头；界面应根据 `principal` 标记为系统资料，不能显示成用户主动发言。内部 `Runtime.submit_attention()` 没有对应的公共 HTTP 入站入口；它在配置锁内再次检查执行任务、团队/工作流状态、待投递团队报告与主队列中的非注意事项输入。尚有这些工作时返回 `None` 表示延后，不写入 ingress、游标或去重凭据。
 

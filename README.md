@@ -29,7 +29,7 @@ MuLi 是面向个人电脑的常驻助手：聊天、管理文件、搜索资料
 | 电脑 | Linux AT-SPI 应用/窗口定位与节点操作；实验性 macOS AX 前台应用及原生引用；Windows UIA 顶层窗口/选定树、普通按钮一次 Invoke（Windows CI 自有按钮验收已通过，真实用户桌面未验）；可选有界截图、录屏与统一附件引用 |
 | 渠道 | 可选 OneBot/NapCat、Telegram、QQ 官方机器人和微信 iLink；同一主身份、Team / Workflow 后台报告保留原渠道、失效目的地持久阻塞与本地文件收发 |
 | 语音 | 独立默认关闭的网页录音转写草稿、本地中文声学唤醒与声纹桥接、录音参考、OpenAI 兼容 ASR/TTS、完整转写留存与续读；不附带本地模型 |
-| 主动事件 | chiliarch 原生配对与 SSE 任务、默认关闭的普通消息资料提醒；持久提醒、维护结果与新版通知进入主会话，独立事项可按默认或显式记忆绑定通知，可选 Linux 桌面通知，无 AI 轮询 |
+| 主动事件 | chiliarch 原生配对与 SSE 任务、默认关闭的普通消息资料提醒；Linux 指定目录的内核资料到达事件；持久提醒、维护结果与新版通知进入主会话，独立事项可按默认或显式记忆绑定通知，可选 Linux 桌面通知，无 AI 轮询 |
 | 扩展 | Agent Skills 渐进读取与文档热发布、运行期间换代的可选 MCP 工具、按需文本资源与显式单 blob 附件保存、显式文本模板、用户目录 Python 插件；工具、提示词、模型、路由和生命周期可扩展 |
 | 长任务 | 完整标题目录与已保存正文分页续读、后台分层压缩、协议回放、持久收件队列、完整任务说明、明确暂停与补充要求后的重新规划 |
 | 管理 | 模型、权限、工具、目录、记忆、工作流、通知、服务状态与日志统一入口；`self_logs` 读取自身日志，`self_events` 分页回查保留错误，`self_failure` 按运行定位故障；活动工作流独立分页与逐次停止 |
@@ -109,6 +109,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [PyPI 与发布流程](docs/publishing.md)
 - [桌面通知](docs/notifications.md)
 - [系统注意事项与主会话唤醒](docs/attention.md)
+- [Linux 资料收件目录](docs/file-inbox.md)
 - [系统日志事件与通知级别](docs/system-events.md)
 - [按运行查询故障位置](docs/failure-diagnostics.md)
 - [chiliarch 接入](docs/chiliarch.md)
