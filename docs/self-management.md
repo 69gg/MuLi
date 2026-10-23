@@ -1,6 +1,6 @@
 # 用户插件与自身管理
 
-已声明普通资源能力的 HTTP/SSE MCP 可由具备外部工具权限的会话或队友按需调用 `mcp_resources_list`、`mcp_resource_read`。两工具复用原审批和代次门，仅读取已展示引用的完整短文本；不增加主 Settings 字段或管理 API，也不自动预取。主协调/reviewer/Attention 的过滤保持，完整结果不能进入下一模型请求时明确停止。详见[MCP 普通资源](mcp.md#按需普通资源)。
+已声明普通资源能力的 HTTP/SSE MCP 可由具备外部工具权限的会话或队友按需调用 `mcp_resources_list`、`mcp_resource_read`，装配附件服务后可显式 `mcp_resource_save` 保存一个完整 blob。工具复用原审批和代次门，只使用已展示引用；不增加主 Settings 字段或管理 API，也不自动预取。保存与网络读取属于同一次 external 操作，进入后按原代完成；不确定结果不自动重试。主协调/reviewer/Attention 的过滤保持，完整结果不能进入下一模型请求时明确停止。详见[MCP 普通资源](mcp.md#按需普通资源)。
 
 声明 prompts 的 HTTP/SSE 另可显式使用 `mcp_prompts_list`、`mcp_prompt_get`：完整展示参数后，按 ref 与精确字符串参数取回有序文本草稿。返回的 user/assistant 角色始终只是非可信工具资料，不创建会话角色、不自动注入或执行，也不读取 URI。混合媒体整体拒绝，完整结果无法进入下一模型请求时停止；无需新策略或配置。详见[MCP 文本 prompts](mcp.md#显式文本-prompts-草稿)。
 

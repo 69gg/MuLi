@@ -1,8 +1,8 @@
 # 2.37 MCP 文本模板与 Windows 按钮操作审查
 
-状态：两片实现与独立后审完成，第二轮远端八项成功、两项失败，未发布。
-Windows 修正已通过两个 Python 版本。新增计时写入了严格 checkpoint 输出流，
-导致两个 Linux 第二片提前失败；这是诊断引入的夹具回归，原耗时问题仍保留跟踪。
+状态：第三轮精确候选十项与发行十三项全部成功，GitHub/PyPI 两构件元数据一致，
+已正式发布。main 九项成功、Linux 3.13 第二片一项失败；原回退用例完成
+controller-resolved 后的就绪查询耗尽总预算。历史失败保留，不宣称耗时根因已修复。
 
 ## 实际行为
 
@@ -119,5 +119,41 @@ install_target，不能由此证明完整事务耗时或把校验略去。共享
 两处测试文件严格 mypy 通过（306.3 MiB），完整 Ruff 与 352 文件格式检查通过。
 以上均经 30 秒资源守卫，swap 0；独立 Sol 只读后审无确定 P1/P2。
 该修正只闭合诊断夹具回归，不宣称解决首轮原有的 20 秒耗时问题。后续远端结果另记。
+
+## 第三轮候选与发行准入
+
+精确签名 `062302d14502a5035528955e75fb0926ce16bfdc` 的
+[`39967595858`](https://github.com/69gg/MuLi/actions/runs/39967595858) attempt 1
+十项全部成功：quality、MCP、macOS/Windows 各两个 Python 版本，以及 Linux
+每种 Python 的两个分片。两个原回退用例和 Windows 自有按钮原生检查均通过，
+没有提高其期限、跳过或重跑前两轮旧提交。
+
+根核对实际十个 job、精确 SHA、有效 GPG、main 快进关系与远端标签不存在后，
+非强制原子推送 main 和 `v2.37.0`；标签对象
+`fcc76969839b1f88a06ba5ef4e394e1e37173a5d` 验签通过。
+PR [43](https://github.com/69gg/MuLi/pull/43) 于 2026-10-23T14:19:54Z
+以原提交合入。main [`39968705387`](https://github.com/69gg/MuLi/actions/runs/39968705387)
+和发行 [`39968704168`](https://github.com/69gg/MuLi/actions/runs/39968704168)
+已取得下述终态。
+
+发行 attempt 1 十三项全部成功，没有重跑、重签或改写标签。GitHub release
+[`421939791`](https://github.com/69gg/MuLi/releases/tag/v2.37.0) 于
+2026-10-23T14:27:22Z 发布；只读查询资产元数据，没有下载或安装包：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.37.0-py3-none-any.whl` | 775520 | `3e9780f860d5761868820dfcb744673937e22407e3c6bd649bbd630d330fb734` |
+| `muli_agent-2.37.0.tar.gz` | 3996656 | `81d4ffd5e07eb1e92210c841743082c6ada34bd28ef51266d9de37642896d205` |
+
+直连读取受限的 [PyPI 2.37.0 JSON](https://pypi.org/pypi/muli-agent/2.37.0/json)，
+只下载小型元数据，不取 wheel 或 sdist；守卫内按文件名明确断言唯一两个构件、
+项目名/版本、未 yanked、大小与上述 SHA-256 完全一致，检查通过，14.8 MiB、swap 0。
+
+main attempt 1 九绿一红，唯一失败为 job `120465321425`，1 失败、2275 通过、
+18 跳过、2590 未选，209.33 秒。回退在 19.870 秒已读取 controller-resolved，
+journal 为 rolled_back / intent none / activation released，base 的一次 POST 已
+started/allowed；随后真实 readiness GET 在原 20 秒末尾超时。它没有重现第二轮
+诊断帧误读，也不证明最后 HTTP 自身异常。保留最后两次幂等查询与全部验证，
+后续仅先做有界分项归因；候选和发行成功不抹除该 main 失败。
 
 设计与边界见 [MCP 模板](mcp-prompts-design.md)、[Windows 操作](windows-uia-actions-design.md)。
