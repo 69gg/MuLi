@@ -117,13 +117,19 @@ read 一次读取至多 16 个完整文本块。file/https/自定义 URI 只回�
 
 ## 搜索结果资源链接
 
-v2.51 开发候选另支持工具结果中的 typed `resource_link`。一次完整成功的工具回执出现 `resource_links_available:true` 时，可先调用 `mcp_resources_list({"server":"remote_tools","source":"tool_result"})`，再把实际展示的 `ref` 交给原 `mcp_resource_read`。这次 list 只展示同连接最近工具调用留下的链接元数据，不补进普通目录、不发送 `resources/list`，也不抓取正文。省略 `source` 或使用 `source:"catalog"` 保持普通目录行为；两来源的 cursor/ref 不能互用。
+已发行的 v2.51 另支持工具结果中的 typed `resource_link`。一次完整成功的工具回执出现 `resource_links_available:true` 时，可先调用 `mcp_resources_list({"server":"remote_tools","source":"tool_result"})`，再把实际展示的 `ref` 交给原 `mcp_resource_read`。这次 list 只展示同连接最近工具调用留下的链接元数据，不补进普通目录、不发送 `resources/list`，也不抓取正文。省略 `source` 或使用 `source:"catalog"` 保持普通目录行为；两来源的 cursor/ref 不能互用。
 
 仅原协议 typed 内容合格；普通文字 URL、structured 字典、错误结果和截断结果不授予链接。整组链接先按既有条目数、URI、UTF-8 与目录字节预算验证，失败不保留合法前缀。只有完整展示页才发引用，正文沿原一次完整短文本、输出预算、外部审批和 `untrusted:true` 合同。`catalog_complete` 在此仅表示本次结果链接组完整通过校验，不是服务器完整目录。
 
 每连接只保留一份有限结果集合；实际接纳的新工具调用立即撤销它，失败或取消不恢复上一份。换代（含复用连接）、接收故障、退休、关闭或重启撤销引用，较早调用晚返不能覆盖较新调用。宿主 ref/cursor 是不透明值，应原样使用；结果来源引用即使过期，也会在附件 factory、预留及远端 RPC 前被 `mcp_resource_save` 拒绝。这一来源只开放文本 read，不自动保存或发送文件；原普通目录的显式 blob 保存保持。
 
-HTTP/SSE、resources capability、stdio、主协调/reviewer/Attention 与禁用工具的原门不变。此候选的正式旅程、五项有限负控及相关回归共318个不同节点已通过，非作者后审无剩余必须修复P1/P2；离线发布验证、远端CI、发行及真实外部服务联调尚未完成。详见[候选审查](review-v2.51.md)与[先红设计记录](mcp-result-resources-proposal.md)。
+HTTP/SSE、resources capability、stdio、主协调/reviewer/Attention 与禁用工具的原门不变。正式旅程、五项有限负控及相关回归共318个不同节点已通过，非作者后审无剩余必须修复P1/P2；v2.51离线包、正式发行与两包元数据核对已闭合。其旧专用CI显式表漏掉两个新增SDK文件，未倒推远端覆盖；v2.52已改为自动发现并在实际SDK作业验证。真实外部服务未联调，详见[发行审查](review-v2.51.md)、[覆盖补齐](review-v2.52.md#发行闭合)与[先红设计记录](mcp-result-resources-proposal.md)。
+
+## 工具直接返回的图片（v2.55 候选）
+
+HTTP/SSE 工具完整成功返回的 typed `ImageContent` 可在原图片内容块中携带宿主 `ref`、MIME 和解码大小。模型看到的是有限元数据；只有显式调用原 `mcp_resource_save(server,ref,name)` 才保存附件，再用 `image_describe` 读取图像。主模型支持视觉时用主模型，否则沿已配置的外挂视觉模型；仅 tools 能力的 MCP 服务器无需额外声明资源能力或发起资源读取。
+
+复用原 wire、目录字节、输出与附件预算，不新增模型配置、持久格式或自动识图。图片引用只在同连接当前代的最近调用有效，新调用、换代、接收失败和关闭后撤销；旧引用在附件预检前拒绝。普通目录资源及 `tool_result:` 文本链接的原权限保持。两种视觉配置的实际图片字节旅程及独立边界均已本地通过，候选尚未正式发行；自然识图质量和真实桌面未验，详见[内联图片方案](mcp-inline-images-proposal.md)及[审查记录](review-v2.55.md)。
 
 ## 显式文本 prompts 草稿
 
@@ -161,7 +167,7 @@ PATCH 中的 mcp 原子替换整个服务器配置；省略的服务器或密钥
 
 全局 timeout 同时限制连接、工具列举和每次调用；单服务器 timeout 只能收紧它，运行时另限制整个候选准备的总期限。调用不自动重试，以免外部操作重复。取消会传播到客户端；超时或异常只返回固定安全原因，不回显服务器异常正文。
 
-远端工具的文本与结构化结果遵守 `max_output_chars`，超限返回 `truncated:true` 和受限 preview。远端工具结果中的图片、音频、二进制只保留类型元数据，不把 base64 数据塞入模型上下文或自动下载媒体；显式资源保存另沿上述入口。服务器错误结果正文不回显；已配置 env/header 值以及 Bearer token 在正常文本中也会遮盖。服务器日志和 stdio stderr 不转发给模型或应用日志。上述工具结果的 preview 不适用于完整资源读取或附件回执。
+远端工具的文本与结构化结果遵守 `max_output_chars`，超限返回 `truncated:true` 和受限 preview。媒体的 base64 不进入普通模型上下文；v2.55候选仅给合格的HTTP/SSE图片增加上述显式保存引用，其它音频、二进制和不合格图片仍只保留类型元数据，不自动下载或处理。服务器错误结果正文不回显；已配置 env/header 值以及 Bearer token 在正常文本中也会遮盖。服务器日志和 stdio stderr 不转发给模型或应用日志。上述工具结果的 preview 不适用于完整资源读取或附件回执。
 
 ## 验证边界
 

@@ -23,3 +23,26 @@
 Ruff初查只有一个import排序，按原工具整理该处和三个文件纯格式后，全Ruff及399文件格式通过。83包离线锁检查通过，没有下载依赖。离线wheel/sdist构建通过、守卫1.380秒、98.2MiB；版本、兼容声明、changelog及两包一致性通过、守卫185毫秒、19MiB，未覆盖旧release-notes。隔离离线wheel安装及原API/资产/lifespan检查通过、守卫1.438秒、100.2MiB。签名候选及精确远端随后补录，尚不作为正式发行。
 
 测试用临时数据、受控时钟、固定模型和HTTP替身；没有操作真实账号或桌面。受控时钟下的真实scheduler旅程不证明真实墙钟、自然模型或平台联调质量；正常重开不等于进程强杀恢复。
+
+## 签名候选与远端检查
+
+签名候选 `2cc123f974e66bab1d66ffabbbfb5b23b1d7a21e`（Good）的精确候选
+[CI 40075592254](https://github.com/69gg/MuLi/actions/runs/40075592254) 十项全通过。
+PR [62](https://github.com/69gg/MuLi/pull/62) 于 `2026-10-24T07:58:09Z` 合并到同提交。
+GPG 标签 `v2.54.0` 已验签 Good，与 main 原子推送；此前远端 main 准确为已正式
+发行的 `c15dc4301392ff76c84049ea6c9ab7e14f96b401`，没有覆盖其它远端工作。
+
+正式 [Release 40076198383](https://github.com/69gg/MuLi/actions/runs/40076198383) 十三项
+全部通过；重复 main CI `40076198551` 已核最终 cancelled，不计通过。
+
+## 发行闭合
+
+GitHub Release 于 `2026-10-24T08:08:37Z` 发布，非 draft、非 prerelease。根只查询有限
+GitHub/PyPI 元数据，未下载包；版本与两构件未 yanked、字节和 SHA-256 均核对一致：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.54.0-py3-none-any.whl` | 840243 | `ec79a22b937701bfc42a8f508ad381f9d03ffe19b0a9f2339539a869a4258c33` |
+| `muli_agent-2.54.0.tar.gz` | 4461645 | `d36ccf58b1622407aa7d30e55a36ef4bd3a32c92a354051b96f2d17385e28fee` |
+
+核对守卫1.274秒、48.4MiB、swap0。正式发行不改变上述真实账号、自然模型与强杀恢复未验边界。
