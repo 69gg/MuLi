@@ -194,3 +194,31 @@ C 随后独立只读后审指出同代 action 降类型 P2：Runtime 已精确�
 C 与另一位未参与实现的审查 agent 分别只读后审，均确认 action 降类型 P2 在双侧身份门、三处消费者及反例合同中闭合，未见新增 P1/P2。不同 generation ordinary 后继仍走原宿主/格式/角色准入，Transfer RPC 与新动作执行仍拒绝；精确 receipt 的幂等早返不能绕过 Runtime 的身份门。审查本身未运行检查，不将其计作额外测试证据。
 
 受控 probe 复用现有 process/systemd 边界，显式区分 loaded unit 的 launcher argv 与 exec 后 app argv；磁盘文件、模型、SQLite 和持有的 permit/lease 都走真实本地实现。没有启动 Runtime lifespan、模型、服务、解释器或新进程，未扩大宿主能力。这组通过也只能证明 terminal 读链与普通后继准备，真实 controller/helper、retained launcher 正式 exec、未知 start 与真实 systemd 交接仍待后续独立片。
+
+## 10. 纯 Transfer 推进：五红与已验证候选
+
+2B 已由根签名提交 `f3c42d1bb6fada3bde75bd25bbf35b571079ad58`，树清洁后先仅新增 `tests/test_project_controller_transfer_advance.py` 和本节，未先改生产。新文件复用既有 `TransferEvidence`、九份 snapshot entries、proof helper 及真实临时 Journal。以 strict Transfer 模型发布合法夹具材料，随后每一步都调用**已经存在的 `advance_managed`**，不导入尚未实现的新 API、不把被推进记录转换为 ordinary。
+
+根唯一守卫实际收取五节点 **5 failed**，pytest 0.25s、守卫 829ms、峰值 69.9MiB、swap 0、exit 1。全部在合法 prepared Transfer 经正式 `advance_managed` 尝试第一步 draining 时被 `managed_transaction_required` 拒绝；strict reader 与九快照材料此前已有效，不是缺失 API/import 或无效 fixture 的红。以下实现候选依据该真实红获授权，本 agent 未自行运行检查。
+
+固定五节点，不扩矩阵：
+
+1. `test_transfer_journal_advances_complete_forward_path`：prepared→draining→stop_base→install_target→start_target→verifying→committed/paused→released。每步严格 +1 revision、正式 reader 仍返回 Transfer、origin/新 anchor/同一 bridge 安装、主身份/格式/deadline/primary nonce 不漂移；九份原 snapshot bytes 不变。
+2. `test_transfer_journal_stale_revision_cannot_write`：先真正推进一次，再用旧 position 请求下一步，必须精确 `stale_revision`；当前 state 和全部目录 bytes 不变。
+3. `test_transfer_journal_never_aborts_or_returns_to_prepared`：进入 draining 后，aborted 和返回 prepared 都精确拒绝且不写；允许进入 recovery_required，保留 drain_timeout 首因且不产生 boot role。
+4. `test_transfer_journal_one_rollback_keeps_nonce_and_first_failure`：已耐久 start_target 不能原 intent 再推进；ambiguous_start 只进入一次 stop_target，生成与 primary 不同的 rollback nonce。重复 stop_target 拒绝；restore_base→start_base→verify_base→rolled_back/paused→released 保持该 nonce 与最初 failure_code，即使后续 code 不同。此处检查的是状态顺序，没有调用或计数任何 start effect。
+5. `test_transfer_journal_requires_own_role_paused_then_release_proof`：进入 verifying 后，以完整 typed proof 分别变更 origin boot、旧 deployment、role、nonce、格式摘要，必须精确 `invalid_health_proof` 且不写；跳过 paused 决策直接 released 必须 `invalid_activation`。合法 proof 才能进入 pending commit。
+
+这些测试的 helper 对每次合法推进固定比较 protocol/request/generation/action/identity/origin/base/target/observed_format/deadline/challenge，CAS/负控制逐项比较真实目录 bytes；health 从已有完整 proof 夹具生成，只调整 Transfer 的角色及其 nonce，不以旧前代健康或 origin 假冒新角色。这里的 anchor/slot 是纯 typed 材料，不是实际安装认证。
+
+已落盘的生产候选仅改 `managed_transaction.py`、`managed_journal.py`、`managed_controller.py`：独立 `advance_transfer_record` 与原 `advance_record_v2` 复用窄的 typed `_advance_protocol2`，返回原始具体记录类型；旧 ordinary 入口不接 Transfer。`advance_managed` 按正式 reader 的实际类型窄分派，沿原 CAS、首因、一次 rollback nonce、proof 与 `_write` 的预算/耐久替换。Transfer 额外禁止 aborted/draining退回 prepared；不删 origin、不经 ordinary 重建、不以 `Any`/cast 隐藏联合差异。
+
+普通 `_ManagedPolicy.move` 不调用已扩展的联合 writer 后再检查类型：先通过其既有 `read()` 明确拒绝所有 Transfer，再用 typed ordinary `advance_record_v2` 和原 `control._write` 保持同一 CAS/预算/耐久写入。第二节点补同一真实 Journal 中的保护：磁盘仍是 Transfer、传入旧 ordinary caller 材料时，普通 policy 必须在任何写入前拒绝，整个目录 bytes 与 backend 调用数不变；然后才继续原合法 Transfer 推进及 stale CAS 断言。节点总数仍为五。
+
+根实收新五项 **5 passed**（pytest 0.23 秒；守卫 840ms、69.3MiB、swap 0、exit 0）。全 146 生产源 strict/no-incremental 通过（守卫 9.728 秒、415.8MiB、swap 0、exit 0）；移除一个未使用导入、格式化两文件后，本片四个 Python 文件 Ruff 与格式检查均通过。C 独立只读后审未见 P1/P2，确认 ordinary policy 在写入之前拒绝 Transfer；审查未执行测试。
+
+首轮八文件整合在 30 秒硬截止终止（守卫 30.201 秒、96.5MiB、swap 0、exit 143），不能记为通过。有限栈诊断定位到既有后端回归反复核验真实解释器指纹，独立慢节点 `test_broken_target_can_be_stopped_and_base_restored_without_loading_target` **1 passed**（pytest 3.56 秒；守卫 4.129 秒、66.5MiB、swap 0），未修改实现、测试或提高限额。
+
+随后按原 30 秒上限串行分批：前七文件 **298 passed**（pytest 1.86 秒；守卫 2.424 秒、89.1MiB、swap 0）；后端余下 33 节点分为 **6 / 10 / 10 / 7 passed**（守卫分别 11.673 / 10.362 / 11.378 / 5.778 秒，峰值不超过 67.7MiB、swap 0、均 exit 0）。加上独立慢节点，这些互不遗漏的分批覆盖原八文件全部 332 节点；298 已包含本片五项，不重复累计，也不将超时首轮算作完成。
+
+本片只准备纯状态推进，不开放新 prepare/发布入口或 controller/helper。Deadline 仍是原冻结值，纯函数没有实际 clock/probe，不能证明剩余期限、origin 已停、writer 已释放、原前缀可安全改写，亦不能证明未知 start 没有重发。后续仍须按第4节单独实现 origin 匹配/停止及固定前缀，改变共享 driver 的 aborted/resume 分支只能经新的行为授权；不得直接将 Transfer 喂给当前普通 controller。本片不运行服务、进程、账户、挂载或远端 CI。

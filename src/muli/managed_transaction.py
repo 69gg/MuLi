@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from typing import Any, Literal, Self
+from typing import Literal, Self
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -283,7 +283,7 @@ class TransferOrigin(StrictRecord):
 
 
 class ProjectControllerTransferRecord(_Protocol2):
-    """Read-only transfer shape; parsing grants no prepare or effect authority.
+    """Strict transfer shape; parsing grants no prepare or effect authority.
 
     The host must prove this installation is the currently executing bridge,
     bind both immutable anchors and authenticate the live origin separately.
@@ -594,8 +594,30 @@ def advance_record_v2(
     record: TransactionRecordV2, expected: Revision, transition: TransitionV2
 ) -> TransactionRecordV2:
     """Return one validated next revision without observing or performing effects."""
+    if not isinstance(record, TransactionRecordV2):
+        raise TransactionError("managed_transaction_required")
+    return _advance_protocol2(record, expected, transition)
+
+
+def advance_transfer_record(
+    record: ProjectControllerTransferRecord, expected: Revision, transition: TransitionV2
+) -> ProjectControllerTransferRecord:
+    """Advance only frozen transfer state; never authenticate or perform an effect."""
+    if not isinstance(record, ProjectControllerTransferRecord):
+        raise TransactionError("project_controller_transfer_required")
+    return _advance_protocol2(record, expected, transition)
+
+
+def _advance_protocol2[RecordT: (TransactionRecordV2, ProjectControllerTransferRecord)](
+    record: RecordT, expected: Revision, transition: TransitionV2
+) -> RecordT:
     if record.position != expected:
         raise TransactionError("stale_revision")
+    if isinstance(record, ProjectControllerTransferRecord) and (
+        transition.phase == "aborted"
+        or (record.phase == "draining" and transition.phase == "prepared")
+    ):
+        raise TransactionError("invalid_transition")
     if transition.phase not in _EDGES.get(record.phase, set()):
         raise TransactionError("invalid_transition")
     if (
@@ -620,7 +642,7 @@ def advance_record_v2(
         raise TransactionError("invalid_intent_transition")
     if transition.phase not in {"committed", "rolled_back"} and transition.proof is not None:
         raise TransactionError("unexpected_health_proof")
-    updates: dict[str, Any] = transition.model_dump(exclude={"proof"})
+    updates: dict[str, object] = transition.model_dump(exclude={"proof"})
     updates["revision"] = record.revision + 1
     if record.failure_code is None and transition.code is not None:
         updates["failure_code"] = transition.code
@@ -655,6 +677,6 @@ def advance_record_v2(
                 raise TransactionError("invalid_activation")
             updates["health"] = proof.model_dump()
     try:
-        return TransactionRecordV2.model_validate({**record.model_dump(), **updates})
+        return type(record).model_validate({**record.model_dump(), **updates})
     except (ValidationError, ValueError, RecursionError):
         raise TransactionError("invalid_transition") from None
