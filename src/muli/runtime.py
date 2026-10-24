@@ -37,7 +37,7 @@ from muli.memory_context import MemoryContextProvider, PromptComposition, compos
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
-from muli.permissions import ApprovalNotice, Mode, PermissionDenied, Permissions
+from muli.permissions import ApprovalNotice, ApprovalSuperseded, Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
 from muli.process import run_process
 from muli.providers import (
@@ -778,7 +778,7 @@ class Runtime:
                 raise ValueError("请在当前运行结束后切换权限模式")
             if principal == "owner":
                 self.model_config("main")
-            receipt, inserted = self.conversation.enqueue(
+            payload = self.conversation.payload(
                 session["id"],
                 content,
                 source=source,
@@ -787,8 +787,22 @@ class Runtime:
                 attachment_ids=attachment_ids,
                 route=route,
                 event_id=event_id,
-                max_pending=self.config.settings.limits.max_pending_runs,
             )
+            with self.store.db:
+                receipt, inserted = self.store._enqueue_input(
+                    payload,
+                    max_pending=self.config.settings.limits.max_pending_runs,
+                    quarantine=principal != "owner",
+                )
+                superseded = (
+                    self._supersede_main_approvals(session, input_id=receipt["id"])
+                    if inserted and principal == "owner" and receipt["state"] == "pending"
+                    else []
+                )
+            # No await separates committing the new input and cancelled tickets
+            # from waking their original waiter. A rollback never wakes it.
+            for future in superseded:
+                future.set_exception(ApprovalSuperseded())
             if inserted and principal == "owner":
                 self._invalidate_voice_reply()
             voice_reply_epoch = self.voice_reply_epoch
@@ -837,6 +851,43 @@ class Runtime:
             "quarantined": receipt["state"] == "quarantined",
             "voice_reply_epoch": voice_reply_epoch,
         }
+
+    def _supersede_main_approvals(
+        self, session: dict[str, Any], *, input_id: str
+    ) -> list[asyncio.Future[bool]]:
+        """Stage only current-main waiters inside the input admission transaction."""
+        session_id = session["id"]
+        run_id = self.run_ids.get(session_id)
+        task = self.tasks.get(session_id)
+        if (
+            session.get("kind") != "main"
+            or session_id != self.store.existing_main_session_id()
+            or session_id in self._stopping
+            or run_id is None
+            or task is None
+            or task.done()
+            or task.cancelling()
+        ):
+            return []
+        identifiers = self.permissions.pending_for(session_id, run_id)
+        if not identifiers:
+            return []
+        budget = self.config.settings.limits.max_output_chars
+        run = self.store.bounded_object("run", run_id, max_bytes=budget * 4)
+        if run is None or run.get("session_id") != session_id or run.get("status") != "running":
+            return []
+        superseded: list[asyncio.Future[bool]] = []
+        for identifier in identifiers:
+            approval = live_approval(self.permissions, identifier, budget=budget)
+            if (
+                approval is not None
+                and approval["session_id"] == session_id
+                and approval["run_id"] == run_id
+            ):
+                future = self.permissions._supersede_in_transaction(approval, input_id=input_id)
+                if future is not None:
+                    superseded.append(future)
+        return superseded
 
     def _wake_main(self) -> None:
         self.reminders.changed.set()
@@ -2176,6 +2227,11 @@ class Runtime:
         except TaskPaused as exc:
             await self._tool_completed(call, self._paused_result(exc), session_id)
             raise
+        except ApprovalSuperseded:
+            result = {
+                "status": "not_executed",
+                "reason": "收到主人新输入；原审批已取消，该操作尚未开始，留待重新规划",
+            }
         except asyncio.CancelledError:
             raise
         except EvidenceError as exc:

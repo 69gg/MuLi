@@ -333,9 +333,11 @@ async def test_requires_approval_cannot_be_bypassed_by_yolo_and_new_input_defers
             while not runtime.permissions.pending:
                 await asyncio.sleep(0)
         assert not calls
-        await runtime.submit("先别更新")
         approval_id = next(iter(runtime.permissions.pending))
-        await runtime.permissions.resolve(approval_id, "approve")
+        future = runtime.permissions.pending[approval_id]
+        await runtime.submit("先别更新")
+        assert runtime.store.get("approval", approval_id)["status"] == "cancelled"
+        assert future.done() and not future.cancelled()
         await runtime.wait(started["run_id"])
         assert not calls
         results = [

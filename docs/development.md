@@ -59,4 +59,19 @@ v2.51 新资源链接旅程已在本地安装的 SDK 下通过；其发行时远
 及 [GitHub matrix](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)；
 接口先经 Context7 检索，再核对已锁定 pytest 8.4.2 源码。
 
+## 队友进度等待的阶段诊断
+
+v2.62正式候选与Release通过，但同提交额外main CI `40100288273` 的Windows3.12第二片
+在 `test_bad_attachment_and_full_parent_inbox_leave_no_partial_progress` 观察到2秒后仍running。
+原满邮箱与坏附件拒绝同步执行，不等待容量；Team.wait超时只返回快照，不取消worker。
+driver可以先发布run.completed，在资源回收后才持久化run终态，因此原running/最后工具
+快照不足以判断等待阶段，不能据此直接归因平台调度或生产死锁。
+
+`tests/test_team_progress_policy.py` 保留原2秒与全部行为断言；只在失败时输出≤1KiB的
+固定阶段、0/1/2或other模型轮数、白名单超时原因和四类有界事件计数，不读消息正文。
+独立Event屏障校准完整委派真实资源释放后保持finalizer，观察真实run.completed已发布、
+数据库仍running的窗口；finally释放并观察同一真实worker正常完成，不以取消制造收口。
+本地校准与准确旧节点通过，四个完整相关文件60项通过；校准不是原远端失败的根因复现，
+不得放宽期限、跳过测试，或因后继CI通过就将其记为根因已修复。
+
 实现依据：[systemd 资源控制](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)、[临时服务](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)、[服务期限与 OOM 策略](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)、[Node 测试运行器](https://nodejs.org/api/test.html)。

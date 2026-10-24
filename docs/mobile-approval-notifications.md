@@ -51,6 +51,36 @@ Runtime 在进入 Permissions 前显式传入本次 `PreparedRequest.reply_origi
 各轮去重累计792个本地节点有通过记录，不声称是同一次命令或同一head的全量。
 真实平台账号、网络送达、强杀恢复与自然模型质量仍未验。
 
+## 发行闭合
+
+GPG签名提交 `710cb950d60283fe5396ce5bf9ec9f288f2c3fc2` 的
+[候选CI 40099276326](https://github.com/69gg/MuLi/actions/runs/40099276326)
+十二项全部success；签名标签v2.62.0经Good signature核验后，与main原子推送。
+[Release 40100288183](https://github.com/69gg/MuLi/actions/runs/40100288183)
+十五项全部success，GitHub与PyPI于2026-10-24T14:04:36Z完成发布。
+
+仅读取小型元数据核对两个发行文件的名称、大小、SHA-256及PyPI未撤回状态，不下载包：
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| muli_agent-2.62.0-py3-none-any.whl | 868872 | 76ac9cbc95107458f2d2e26b07fd4136b64a7a367f0533a100c7abae9c82f46f |
+| muli_agent-2.62.0.tar.gz | 4614895 | 2856f575566ac8aa1b47d827c7ce55bd0172af4e8ad72f0e38e9f74df584a07a |
+
+核对守卫3.971秒、49.3MiB、swap0、exit0。
+[GitHub发行](https://github.com/69gg/MuLi/releases/tag/v2.62.0)与
+[PyPI版本](https://pypi.org/project/muli-agent/2.62.0/)已存在。
+
+### 同提交额外main CI失败仍保留
+
+[main CI 40100288273](https://github.com/69gg/MuLi/actions/runs/40100288273)
+终态failure，十一项success，唯一Windows3.12第二片作业120890856929失败。
+取消请求到达时该运行已结束，不能记作cancelled。准确日志是旧
+`test_team_progress_policy.py::test_bad_attachment_and_full_parent_inbox_leave_no_partial_progress`：
+`team.wait(timeout=2)`返回后agent/run仍running、pending审批0、最后工具为progress_policy_probe，
+errors为空；该用例call3.30秒，整片2028passed、1failed、685平台skip。
+根已读取准确作业日志；后继63树相同节点本地1passed/0.46秒，守卫1.256秒、88MiB、swap0。
+这不证明远端根因已修，仍继续诊断，不提高期限、跳过用例或用另一轮绿掩盖失败。
+
 153源文件strict/no-incremental且MYPYPATH=src通过（守卫8.078秒、381.7MiB、swap0）。
 Ruff首查为新测试导入顺序，格式首查为四文件排版；只用现有格式器修正后Ruff及418文件
 格式通过。83包离线锁校验通过，没有改变依赖或持久格式版本；离线sdist/wheel构建

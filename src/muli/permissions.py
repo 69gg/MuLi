@@ -19,6 +19,10 @@ class PermissionDenied(Exception):
     pass
 
 
+class ApprovalSuperseded(Exception):
+    """New owner input deferred this unstarted call without cancelling its run."""
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalNotice:
     """Host provenance for one approval; not a durable live permission."""
@@ -74,6 +78,7 @@ class Permissions:
     def __init__(self, store: Store, bus: EventBus, review: Review, timeout: int = 600) -> None:
         self.store, self.bus, self.review, self.timeout = store, bus, review, timeout
         self.pending: dict[str, asyncio.Future[bool]] = {}
+        self._waiting: dict[tuple[str, str], set[str]] = {}
 
     async def check(
         self,
@@ -114,6 +119,8 @@ class Permissions:
         }
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self.pending[approval["id"]] = future
+        owner = (session_id, run_id)
+        self._waiting.setdefault(owner, set()).add(approval["id"])
         try:
             requested = dict(approval)
             if reply_origin is not None:
@@ -144,7 +151,41 @@ class Permissions:
                 )
             raise
         finally:
+            # Cancellation can arrive while the requested-event wakeup is still
+            # suspended, before wait_for has observed a superseding exception.
+            if future.done() and not future.cancelled():
+                future.exception()
             self.pending.pop(approval["id"], None)
+            waiting = self._waiting[owner]
+            waiting.discard(approval["id"])
+            if not waiting:
+                del self._waiting[owner]
+
+    def pending_for(self, session_id: str, run_id: str) -> tuple[str, ...]:
+        """Locate only this live execution's waiters, without reading other approvals."""
+        return tuple(
+            identifier
+            for identifier in self._waiting.get((session_id, run_id), ())
+            if (future := self.pending.get(identifier)) is not None and not future.done()
+        )
+
+    def _supersede_in_transaction(
+        self, approval: dict[str, Any], *, input_id: str
+    ) -> asyncio.Future[bool] | None:
+        """Stage a verified live approval; the caller wakes it only after commit."""
+        if not self.store.db.in_transaction:
+            raise RuntimeError("审批延期必须与新输入在同一事务中提交")
+        identifier = approval["id"]
+        future = self.pending.get(identifier)
+        if future is None or future.done():
+            return None
+        self.store._event(
+            "approval.resolved",
+            {"id": identifier, "decision": "cancelled", "input_id": input_id},
+            approval["session_id"],
+            objects=[("approval", {**approval, "status": "cancelled"})],
+        )
+        return future
 
     def resolve_now(
         self,
