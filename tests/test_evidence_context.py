@@ -154,7 +154,10 @@ def test_host_marker_is_not_serialized_to_provider(protocol: ProtocolName) -> No
     messages = [Message(role="user", content="读取")] + batch(evidence)
     packed = pack_context(messages, 2000)
     config = ModelConfig(
-        protocol=protocol, model="offline-test", base_url="https://example.invalid"
+        protocol=protocol,
+        model="offline-test",
+        base_url="https://example.invalid",
+        max_output_tokens=4096 if protocol == "anthropic" else None,
     )
     body = build_request(config, packed, [], stream=False)
     encoded = json.dumps(body, ensure_ascii=False)

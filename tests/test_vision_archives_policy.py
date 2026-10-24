@@ -251,8 +251,17 @@ async def test_actual_model_selection_is_whitelisted_and_frozen_across_hot_confi
         host.runtime.config.update(
             {
                 "models": {
-                    "main": {"vision": profile == "main", "protocol": protocol, "model": name},
-                    "vision": {"protocol": protocol, "model": name},
+                    "main": {
+                        "vision": profile == "main",
+                        "protocol": protocol,
+                        "model": name,
+                        "max_output_tokens": 4096 if protocol == "anthropic" else None,
+                    },
+                    "vision": {
+                        "protocol": protocol,
+                        "model": name,
+                        "max_output_tokens": 4096 if protocol == "anthropic" else None,
+                    },
                 }
             }
         )

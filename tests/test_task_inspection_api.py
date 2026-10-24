@@ -358,7 +358,12 @@ async def test_inspection_body_survives_real_runtime_and_codec_or_refuses_lossy_
         runtime.config.update(
             {
                 "persona": {"prompt": "离线核查任务，只读资料"},
-                "models": {"main": {"protocol": protocol}},
+                "models": {
+                    "main": {
+                        "protocol": protocol,
+                        **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
+                    }
+                },
                 "limits": {"max_output_chars": 32000, "max_context_chars": 12000},
                 "compaction": {"enabled": False},
             }

@@ -29,6 +29,8 @@ def service_config(**options: Any) -> ServiceConfig:
 
 
 def model_config(protocol: ProtocolName = "openai_chat", **options: Any) -> ModelConfig:
+    if protocol == "anthropic":
+        options.setdefault("max_output_tokens", 4096)
     return ModelConfig(
         protocol=protocol,
         model="vision-model",

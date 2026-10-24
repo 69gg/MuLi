@@ -55,7 +55,12 @@ async def test_real_round_under_pressure_keeps_evidence_through_each_codec(
         runtime.config.update(
             {
                 "persona": {"prompt": "test"},
-                "models": {"main": {"protocol": protocol}},
+                "models": {
+                    "main": {
+                        "protocol": protocol,
+                        **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
+                    }
+                },
                 "limits": {"max_output_chars": 1600, "max_context_chars": 4000},
                 "compaction": {"enabled": False},
             }

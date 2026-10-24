@@ -5,6 +5,7 @@ import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
 import { createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning } from "../../web/state.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachments.mjs";
+import { MODEL_ROLES } from "../../web/settings.mjs";
 
 // Exercise the actual records page, global SSE and dialog handlers with native DOM text semantics.
 // No browser dependency, service, model, account or real database is involved.
@@ -118,7 +119,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     window: { addEventListener: (name, callback) => { windowEvents[name] = callback; } },
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,
     setTimeout: () => 0, clearTimeout() {},
-    createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning, attachmentKind, attachmentURL, formatBytes,
+    createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning, attachmentKind, attachmentURL, formatBytes, MODEL_ROLES,
     createTeamPager: () => ({}), captureTeamView: () => null, restoreTeamView() {},
     renderMarkdown: (text) => { const node = document.createElement("p"); node.textContent = text; return node; },
     uploadFile() {}, transcribeAttachment() {}, VoiceInput: class { cancel() {} }, sessionStorage: {},
@@ -134,7 +135,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
       owner.sessions.start(); owner.notifications.start(); return owner;
     };
     activateConnection();
-    globalThis.ui = { state, renderOtherView, renderSessions, refreshSessions, loadRecordDirectory, releaseRecordDirectory, recordDirectoryPage, renderHistoryEntry, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
+    globalThis.ui = { state, renderOtherView, renderModelSettings, renderSessions, refreshSessions, loadRecordDirectory, releaseRecordDirectory, recordDirectoryPage, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
       activateConnection, connect,
       get slot() { return recordDirectory; }, get historySlot() { return historyDialog; }, get draftRevision() { return draftRevision; },
       stopEvents() { globalController?.abort(); sessionController?.abort(); } };
@@ -428,6 +429,30 @@ test("nullable metadata, unknown status and invalid dates remain neutral; titles
   assert.equal(h.other.textContent.includes("已完成"), false); assert.equal(h.other.textContent.includes("false"), false); assert.equal(h.other.textContent.includes("null"), false);
 });
 
+test("model token requirements follow the selected protocol without losing edits or requiring an empty secondary role", async () => {
+  const h = harness();
+  h.ui.state.settingsDraft = { models: { main: { protocol: "openai_chat" }, worker: { protocol: "anthropic" } } };
+  h.ui.state.modelRole = "main";
+  const main = h.ui.renderModelSettings(); h.other.append(main);
+  const token = main.querySelectorAll("input").find((input) => input.name === "models.main.max_output_tokens");
+  const protocol = main.querySelector("select");
+  assert.equal(token.value, ""); assert.equal(token.required, false);
+  assert.equal(token.closest("details") === null, true);
+  token.value = "2048"; protocol.value = "anthropic"; await protocol.dispatch("change");
+  assert.equal(token.required, true); assert.equal(token.value, "2048");
+  protocol.value = "openai_responses"; await protocol.dispatch("change");
+  assert.equal(token.required, false);
+  h.ui.state.modelRole = "worker";
+  const worker = h.ui.renderModelSettings(); h.other.replaceChildren(worker);
+  const workerToken = worker.querySelectorAll("input").find((input) => input.name === "models.worker.max_output_tokens");
+  const model = worker.querySelectorAll("input").find((input) => input.name === "models.worker.model");
+  assert.equal(workerToken.required, false);
+  model.value = "configured-model"; await model.dispatch("input");
+  assert.equal(workerToken.required, true);
+  model.value = ""; await model.dispatch("input");
+  assert.equal(workerToken.required, false);
+});
+
 test("the main record returns to the only live conversation without opening or creating another session", async () => {
   const h = harness(async () => page([record("main", { title: "主会话真实标题" })]));
   await h.ui.switchView("records"); assert.ok(h.other.textContent.includes("主会话真实标题"));
@@ -435,6 +460,22 @@ test("the main record returns to the only live conversation without opening or c
   await h.click(h.button("回到对话"));
   assert.equal(h.ui.state.view, "chat"); assert.equal(h.ui.state.activeSession.id, "main"); assert.equal(h.ui.slot === null, true);
   assert.equal(h.requests.length, 1);
+});
+
+test("the main record opens its saved archive from settings and returns focus to that entry", async () => {
+  const h = harness(async (path) => {
+    if (path.startsWith("/session-records")) return page([record("main")]);
+    assert.equal(path, "/sessions/main/messages?limit=50");
+    return { session_id: "main", messages: [], through_seq: 0, next_before_seq: null, has_older: false };
+  });
+  await h.ui.switchView("records");
+  const trigger = h.button("查看正文归档"); await h.click(trigger);
+  assert.equal(h.ui.state.view, "records");
+  assert.equal(h.ui.historySlot.sessionId, "main");
+  assert.deepEqual(h.requests.map((entry) => entry.path), ["/session-records?query=&limit=50", "/sessions/main/messages?limit=50"]);
+  assert.equal(h.requests.every((entry) => !entry.method), true);
+  h.dialog.close(); await flush();
+  assert.equal(h.document.activeElement === trigger, true);
 });
 
 test("old detail and its archive reuse the full session ID and close back to the current record button", async () => {

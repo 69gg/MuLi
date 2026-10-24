@@ -16,6 +16,12 @@
 
 应用配置额外支持 `api_key_env`，在每次创建连接配置时读取指定环境变量。环境变量名已填写但值缺失时不回退到明文 `api_key`；后台服务也必须能读取该变量，终端中临时导出的值不保证会传给 systemd、launchd 或计划任务。`temperature` / `top_p` 可直接写在模型项中，默认 `null` 表示省略；非空时优先于 `extra_body` 中同名值。
 
+只配置主模型即可运行：未完整配置的审查、队友、压缩和记忆提炼模型沿用主模型的完整连接配置，包括协议、密钥与可选输出限制；显式完整配置的角色使用自己的设置。`model_config("vision")` 同样可解析主模型，但看图仍要求主模型已声明 `vision=true` 或另配外挂视觉，继承不会自动赋予视觉能力。embedding、reranker、ASR、TTS 是独立 HTTP 服务，不继承主模型。
+
+`max_output_tokens` 默认 `null`：OpenAI Chat/Responses 请求省略对应输出 token 字段，由上游决定；需要自定时填写正整数。Anthropic Messages 的 `max_tokens` 必填，因此使用该协议且已填写模型和地址的配置必须显式填写正整数 `max_output_tokens`；留空并继承主模型的角色无需重复填写。保存已有显式上限时仍保留原值，不会自动清除。响应字节、工具输出与上下文预算继续生效；内部压缩和记忆提炼仍可按各自原有宿主预算限制本次输出，不改变用户默认值。
+
+`MuLi init` 仅在选择 Anthropic 时询问必填输出上限，接受 ASCII 十进制整数，并复用模型配置的范围校验；无效输入不会创建配置。选择 OpenAI Chat/Responses 时不增加此问题，保存为 `null`，仍可稍后在工作台设置。
+
 例如为不支持看图的主模型配置外挂视觉和 TTS，合并以下片段后替换模型、服务地址和音色，并在服务环境中提供密钥：
 
 ```json
@@ -47,7 +53,7 @@
 | 字段 | 默认值 | 行为 |
 | --- | --- | --- |
 | `api_key` | 空字符串 | OpenAI 使用 Bearer；Anthropic 使用 `x-api-key` |
-| `max_output_tokens` | `4096` | 总生成 token 上限，包含厂商计入输出预算的推理 token |
+| `max_output_tokens` | `null` | 可选总生成 token 上限；Anthropic 必须显式填写，包含厂商计入输出预算的推理 token |
 | `timeout` | `60` 秒 | HTTPX 每次网络操作的超时；整轮任务另受运行时预算限制 |
 | `max_retries` | `2` | 首次请求之外的最大重试次数 |
 | `retry_backoff` | `0.5` 秒 | 指数退避初值；有 `Retry-After` 时优先采用，等待不超过 `timeout` |
@@ -78,7 +84,7 @@
 
 `temperature`、`top_p`、`seed`、`stop`、`tool_choice`、`parallel_tool_calls` 等可放入 `extra_body`。参数必须由所选模型和协议实际支持；例如 Responses 没有通用 `stop`、`seed` 参数，适配器不会伪造支持或静默丢弃上游拒绝的字段。
 
-Chat 默认使用 `max_completion_tokens`；要求传统 `max_tokens` 的兼容服务可配置 `extra_body: {"max_tokens":4096}`。两种字段只能选一种。扩展参数的 token 限制可收紧 `max_output_tokens`，不能放大它。
+Chat 设置输出上限时默认使用 `max_completion_tokens`；要求传统 `max_tokens` 的兼容服务可配置 `extra_body: {"max_tokens":4096}`。两种字段只能选一种。未配置上限且没有显式扩展参数时不发送 token 字段；扩展参数显式填写的值仍须为正整数。已配置 `max_output_tokens` 时，扩展参数只能收紧它，不能放大。
 
 工具声明统一使用 Chat function schema。选择具体函数时，`tool_choice` 可以使用 `{"type":"function","function":{"name":"工具名"}}`，适配器转换为 Responses 和 Anthropic 原生格式。Anthropic 将 `required` 转换为 `any`，`stop` 转换为 `stop_sequences`，`parallel_tool_calls` 转换为 `tool_choice.disable_parallel_tool_use`。
 

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from muli.config import ConfigFile, Settings
+from muli.config import ConfigFile, ModelProfile, Settings
 from muli.service import UserService
 
 SOURCE_REPOSITORY = "https://github.com/69gg/MuLi.git"
@@ -55,6 +55,12 @@ def prompt_settings(
     if not model or not base_url:
         raise ValueError("请填写主模型 ID 和 API 基础地址；只建空配置可使用 --defaults")
     api_key = secret("API key（本地保存，留空表示无密钥）：").strip()
+    max_output_tokens: int | None = None
+    if protocol == "anthropic":
+        value = ask("Anthropic max tokens 输出上限（必填正整数）")
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError("Anthropic max_output_tokens 必须填写正整数")
+        max_output_tokens = ModelProfile(max_output_tokens=int(value)).max_output_tokens
     vision = ask("主模型可以读图？y/n", "n").casefold() in {"y", "yes", "是"}
     effort = ask("reasoning effort（留空不发送）") or None
     thinking = object_value("thinking 参数，如 type / budget_tokens")
@@ -73,6 +79,7 @@ def prompt_settings(
                 "model": model,
                 "base_url": base_url,
                 "api_key": api_key,
+                "max_output_tokens": max_output_tokens,
                 "vision": vision,
                 "reasoning_effort": effort,
                 "thinking": thinking,

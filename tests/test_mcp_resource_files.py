@@ -60,6 +60,7 @@ async def test_explicit_resource_save_persists_one_complete_attachment_through_r
                     "model": "offline",
                     "base_url": "https://unused.invalid",
                     "protocol": protocol,
+                    **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
                 }
             },
             "limits": {"max_output_chars": 1600, "max_context_chars": 6000},
@@ -703,6 +704,7 @@ async def test_saved_receipt_batch_that_cannot_fit_context_stops_without_undoing
             "models": {
                 "main": {
                     "protocol": protocol,
+                    **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
                     "model": "offline",
                     "base_url": "https://unused.invalid",
                 }

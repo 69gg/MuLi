@@ -154,7 +154,7 @@ class ModelProfile(Section):
     base_url: str = ""
     api_key: str = ""
     api_key_env: str = ""
-    max_output_tokens: int = Field(default=4096, ge=128, le=131072)
+    max_output_tokens: int | None = Field(default=None, strict=True, ge=128, le=131072)
     timeout: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=2, ge=0, le=5)
     stream: bool = True
@@ -175,6 +175,12 @@ class ModelProfile(Section):
     @property
     def configured(self) -> bool:
         return bool(self.model and self.base_url)
+
+    @model_validator(mode="after")
+    def required_output_limit(self) -> ModelProfile:
+        if self.configured and self.protocol == "anthropic" and self.max_output_tokens is None:
+            raise ValueError("Anthropic Messages 必须填写正整数 max_output_tokens")
+        return self
 
 
 class Models(Section):
