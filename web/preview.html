@@ -6,17 +6,17 @@
   <meta name="theme-color" content="#edf4f6">
   <meta name="color-scheme" content="light dark">
   <title>沐璃 · 交互预览</title>
-  <link rel="icon" href="./assets/muli-avatar.svg" type="image/svg+xml">
+  <link rel="icon" href="./assets/muli-icon.png" type="image/png">
   <link rel="stylesheet" href="./styles.css">
   <script type="module" src="./preview.mjs"></script>
 </head>
 <body>
   <a class="skip-link" href="#message-input">跳到输入框</a>
-  <section id="auth-gate" class="auth-gate" aria-label="登录沐璃" hidden><form id="login-form" class="login-form"><img src="./assets/muli-avatar.svg" alt="" width="64" height="64"><h1>沐璃</h1><label class="field"><span>访问密码</span><input id="login-password" type="password" autocomplete="current-password" required aria-label="访问密码"></label><p id="login-error" class="form-error" role="alert" hidden></p><button class="primary-button" type="submit">进入对话</button></form></section>
+  <section id="auth-gate" class="auth-gate" aria-label="登录沐璃" hidden><form id="login-form" class="login-form"><img src="./assets/muli-avatar.webp" alt="" width="64" height="64"><h1>沐璃</h1><label class="field"><span>访问密码</span><input id="login-password" type="password" autocomplete="current-password" required aria-label="访问密码"></label><p id="login-error" class="form-error" role="alert" hidden></p><button class="primary-button" type="submit">进入对话</button></form></section>
   <div class="app-shell">
     <main class="main-workspace" id="main-workspace">
       <header class="topbar">
-        <button class="workspace-brand" type="button" data-view="chat" aria-label="返回沐璃对话"><img src="./assets/muli-avatar.svg" alt="" width="36" height="36"><span>沐璃<small>交互预览 · 仅本页内存</small></span></button>
+        <button class="workspace-brand" type="button" data-view="chat" aria-label="返回沐璃对话"><img src="./assets/muli-avatar.webp" alt="" width="36" height="36"><span>沐璃<small>交互预览 · 仅本页内存</small></span></button>
         <h1 id="page-title" class="sr-only">沐璃对话</h1>
         <div class="topbar-actions"><button class="model-indicator" type="button" data-action="model-settings"><span class="status-dot" id="model-dot"></span><span id="model-label">读取模型…</span><span data-icon="chevron-down"></span></button></div>
       </header>
@@ -26,7 +26,7 @@
           <div id="chat-view" class="chat-view">
             <div id="conversation-scroll" class="conversation-scroll">
               <div id="welcome" class="welcome">
-                <img class="welcome-illustration" src="./assets/muli-empty.svg" alt="" fetchpriority="high" width="380" height="270">
+                <img class="welcome-illustration" src="./assets/muli-empty.webp" alt="" fetchpriority="high" width="380" height="253">
                 <div class="welcome-copy"><h2>沐璃</h2><p>从一件想做的事开始。</p></div>
               </div>
               <div id="messages" class="messages" aria-live="off"></div>

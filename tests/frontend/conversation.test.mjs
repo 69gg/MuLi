@@ -180,6 +180,7 @@ test("the real chat renderer interleaves owner, reasoning, tool and reply in one
   assert.ok(tool.querySelector(".tool-arguments").textContent.includes("notes.txt"));
   assert.ok(tool.querySelector(".tool-result").textContent.includes("笔记正文"));
   assert.equal(reply.matches("article.message.assistant"), true); assert.equal(reply.querySelector(".message-body").textContent, "已阅读笔记。");
+  assert.equal(reply.querySelector(".message-avatar img").getAttribute("src"), "./assets/muli-avatar.webp");
 });
 
 test("tool completion updates the existing details without resetting expansion or summary focus", () => {
@@ -269,5 +270,9 @@ test("both real HTML entry points omit the removed side timeline and standalone 
     assert.doesNotMatch(html, /\bid=["'](?:timeline(?:-[\w-]+)?|reasoning-region)["']/i, entry);
     assert.doesNotMatch(html, /\bdata-action=["'](?:toggle-timeline|toggle-reasoning)["']/i, entry);
     assert.doesNotMatch(html, /\bdata-prompt\b|\bstarter-prompts\b/i, entry);
+    assert.match(html, /<link\b[^>]*rel="icon"[^>]*href="\.\/assets\/muli-icon\.png"[^>]*type="image\/png"/, entry);
+    assert.match(html, /<img\b[^>]*src="\.\/assets\/muli-avatar\.webp"/, entry);
+    assert.match(html, /<img\b[^>]*class="welcome-illustration"[^>]*src="\.\/assets\/muli-empty\.webp"[^>]*width="380"[^>]*height="253"/, entry);
+    assert.doesNotMatch(html, /muli-(?:avatar|empty)\.svg/, entry);
   }
 });
