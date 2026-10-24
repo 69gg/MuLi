@@ -2421,7 +2421,8 @@ class NativeCI:
         (self.volume / "_muli_native_ci_hook.py").write_text(
             "import sys\nif sys.argv[-1:] == ['serve']:\n"
             "    from managed_native_worker import install_hook\n    install_hook()\n"
-            "elif sys.orig_argv[1:4] == ['-I', '-m', 'muli.management_helper']:\n"
+            "elif sys.orig_argv[1:4] in (['-I', '-m', 'muli.management_helper'],\n"
+            "                               ['-I', '-m', 'muli.managed_host']):\n"
             "    try:\n"
             "        from managed_native_worker import install_helper_cost_hook\n"
             "        install_helper_cost_hook()\n"

@@ -19,7 +19,7 @@ from test_managed_native_ci import ci
 from test_managed_native_ci import fixture as fixture
 from test_managed_native_ci import forbid_real_effects as forbid_real_effects
 
-from muli.managed_host import managed_helper_unit_name
+from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
 from muli.management_transaction import TransactionError, TransactionJournal
 from muli.platforms.linux_transaction import SystemdProbe
 from muli.platforms.managed_backend import ManagedLinuxBackend
@@ -28,7 +28,7 @@ from muli.platforms.managed_deployment import SlotIdentity
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux isolated helper fixture")
 
 
-async def test_generated_helper_hook_measures_real_checks_without_changing_their_result(
+async def test_generated_managed_helper_hook_measures_real_checks_without_changing_their_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: tuple[Any, Any]
 ) -> None:
     native, _ = fixture
@@ -79,15 +79,16 @@ async def test_generated_helper_hook_measures_real_checks_without_changing_their
             host = backend_fixture.Host(root, journal, control, "adopt", change_config=False)
             try:
                 record = host.record()
-                executable = host.slots["base"].lexical_python
+                helper_argv = managed_helper_arguments(host.anchor, host.slots["base"])
+                executable = helper_argv[0]
                 monkeypatch.setattr(sys, "prefix", str(root / "a"))
                 monkeypatch.setattr(sys, "executable", executable)
                 monkeypatch.setattr(
                     sys,
                     "orig_argv",
-                    [executable, "-I", "-m", "muli.management_helper", str(journal_root)],
+                    list(helper_argv),
                 )
-                monkeypatch.setattr(sys, "argv", ["-m", str(journal_root)])
+                monkeypatch.setattr(sys, "argv", list(helper_argv[3:]))
                 monkeypatch.setattr(atexit, "register", register)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
                 assert host.backend._check(record) is None
@@ -264,6 +265,53 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
     )
     worker.install_helper_cost_hook()
     assert callbacks == []
+    assert (
+        ManagedLinuxBackend._check,
+        SystemdProbe._command,
+        ManagedLinuxBackend._request,
+    ) == originals
+
+
+@pytest.mark.parametrize("damage", ["wrong_root", "recover", "missing_run", "extra_argument"])
+def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    prefix = tmp_path / "a"
+    executable = str(prefix / "bin/python")
+    arguments = [
+        executable,
+        "-I",
+        "-m",
+        "muli.managed_host",
+        "--root",
+        str(tmp_path / "data/management/transaction-v1"),
+        "run",
+    ]
+    if damage == "wrong_root":
+        arguments[-2] = str(tmp_path / "foreign")
+    elif damage == "recover":
+        arguments[-1] = "recover"
+    elif damage == "missing_run":
+        arguments.pop()
+    else:
+        arguments.append("unexpected")
+    callbacks: list[object] = []
+    accesses: list[Path] = []
+
+    def fixture_access(root: Path) -> dict[str, Any]:
+        accesses.append(root)
+        return {}
+
+    originals = (ManagedLinuxBackend._check, SystemdProbe._command, ManagedLinuxBackend._request)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setattr(sys, "executable", executable)
+    monkeypatch.setattr(sys, "orig_argv", arguments)
+    monkeypatch.setattr(worker, "fixture", fixture_access)
+    monkeypatch.setattr(atexit, "register", lambda callback: callbacks.append(callback))
+    worker.install_helper_cost_hook()
+    assert accesses == [] and callbacks == []
     assert (
         ManagedLinuxBackend._check,
         SystemdProbe._command,

@@ -3197,17 +3197,23 @@ def install_helper_cost_hook() -> None:
 
         prefix = Path(sys.prefix)
         root = prefix.parent
+        journal_root = root / "data/management/transaction-v1"
         require(prefix.name in {"a", "b"}, "native_profile_role")
         require(
             sys.executable == str(prefix / "bin/python")
             and sys.orig_argv
-            == [
-                sys.executable,
-                "-I",
-                "-m",
-                "muli.management_helper",
-                str(root / "data/management/transaction-v1"),
-            ],
+            in (
+                [sys.executable, "-I", "-m", "muli.management_helper", str(journal_root)],
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "muli.managed_host",
+                    "--root",
+                    str(journal_root),
+                    "run",
+                ],
+            ),
             "native_profile_arguments",
         )
         fixture(root)

@@ -1470,3 +1470,35 @@ native fixture回归合计916个不同节点通过（pytest18.26秒、守卫18.9
 ConfigurationFile.replace的真实返回snapshot，继承初次O_EXCL的当前unit birth；
 confirm不能领养，丢回包或凭据写失败必须保留fail。此可能路径无需改生产源码，
 但其发布/清理负控尚未实施，本片统计不能冒称清理所有权已经解决。
+
+### Native37：纠正成本hook的正式V2启动准入（目标先红）
+
+Native36 `40082042192` 的精确候选 `7a3d5a7`，managed-native job
+`120837419796` 失败；根严格核验artifact `12555253653`（1919字节，SHA-256
+`371b259c9522ab9ee220e839417e05c5b8d8db44c11ce9b7dee85b193a54d636`）。
+helper_costs为not_observed/unavailable，没有成本数据。adopt仍已committed49294毫秒、
+released55330、精确projection56604（PID2779、新boot
+`47da42b121e24941995e38a5664b37f8`），prepare switch56605后于59636毫秒Timeout；
+cleanup仍三mount、用户与组未删除，不称三次事务或清理成功。
+
+源码确定的观测接缝错误：正式V2的 `managed_helper_arguments` 返回
+`-I -m muli.managed_host --root <本journal> run`，而生成hook及其初始化器只接受
+旧V1的 `muli.management_helper`。真实V2不会注册统计回调。旧离线目标手拼同一V1
+argv，未覆盖真正被测入口；已有20项绿不能证明V2统计已可用，也不能据空数据归因主成本。
+
+目标改为消费真实Host的anchor/controller，经正式 `managed_helper_arguments` 生成
+完整orig_argv，进入实际prepare产生的hook文本，再保持原真实_check成功、stale_revision
+拒绝、一次atexit注册/写入及五项身份断言：
+`tests/test_managed_native_helper_costs.py::test_generated_managed_helper_hook_measures_real_checks_without_changing_their_result`。
+根已实收准确目标首红：1 failed（pytest0.31秒、守卫0.856秒、65.8MiB、swap0）；
+正式argv、实际prepare生成hook及两次真实_check前置均通过，唯一失败为callbacks0。
+据此只修改两fixture脚本：生成hook保留原V1/serve分支，另分派V2模块；初始化器仅增
+本私有解释器、固定journal、准确 `--root ... run` 的完整argv形状，后续fixture/root/
+record/五项identity及32KiB门均不变。四项小负控要求错root、recover、缺run及多参数
+在访问fixture前拒绝，不能注册回调或替换原方法。生产包、原期限及资源门不改。
+根随后核Native36为completed/failure，十项通用作业全success，仅managed-native失败；
+保留上述空统计，不把一般CI绿误算作现场成功。37新24项全通过（pytest0.37秒、守卫
+0.932秒、74.5MiB、swap0）；合既有coordinator文件共581个不同节点通过（pytest
+2.29秒、守卫2.950秒、142.1MiB、swap0），不与36的916重复累计。全Ruff、383文件
+格式及非作者后审通过，无剩余P1/P2。仅fixture改动，生产strict沿前片已过结果，未重复。
+37精确签名候选的真实helper统计仍待收取，不预写性能归因或整套事务通过。
