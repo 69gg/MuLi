@@ -1,8 +1,9 @@
 # v2.59 私聊工具审批候选审查
 
 基线为已发行v2.58的签名提交 `6b25ea722aeb48a0641eb0b70cc2f2ef9427140d`，
-其发行证据见[上一版审查](review-v2.58.md#发行闭合)。v2.59.0目前仅为本地候选，
-本地功能、质量及离线包验证已闭合，远端推送、候选CI及正式发行仍待完成。
+其发行证据见[上一版审查](review-v2.58.md#发行闭合)。本地功能、质量及离线包验证已闭合，
+签名候选 `185bfe15966c4bd830f7becf1ae34a46e038dabb` 已推送至
+[PR #67](https://github.com/69gg/MuLi/pull/67)，首轮远端十一绿、一项失败，尚未正式发行。
 
 ## 产品行为与提交边界
 
@@ -73,5 +74,63 @@ Node堆边界不变。五项本地真实pytest分片回归验证完整并集、�
 - 隔离离线wheel安装、导入、版本2.59、兼容声明、资产、API、提示词、桌面默认值、
   任务控制与lifespan烟测通过，守卫1.284秒、100.2MiB。
 
-远端推送、候选CI、签名标签及正式发行仍待完成，不以本地通过替代，另记准确终态。
+签名标签及正式发行仍待完成，不以本地通过替代，另记准确终态。
 功能合同和先红边界见[手机审批方案](mobile-approvals-proposal.md)。
+
+## 首次远端候选
+
+[CI 40088379012](https://github.com/69gg/MuLi/actions/runs/40088379012) 终态failure：
+十二作业中十一项success，唯一macOS 3.12作业 `120855843763` 为4068 passed、
+1461 skipped、1 warning、1 error，pytest203.41秒。Linux双Python双片、Windows双Python
+双片、macOS 3.13、quality与mcp均成功；本版六个新增手机审批节点通过。
+
+旧 `test_session_recovery.py::test_tool_terminal_metadata_survives_result_truncation[result3-failed]`
+在setup的 `create_app → prepare_channels → revalidate_format` 中触发原1秒资料格式
+读取期限。有限观测为elapsed1004ms、begin1004ms、queries0、vm_steps0，随后首个
+optional查询前检查报 `format_read_timeout`；现证据不足以区分BEGIN内部阻塞、系统调度
+或其它原因，不能归因“runner慢”，也不能把它当成手机审批断言失败。
+
+根在Linux沿原守卫精确复验该节点，1 passed、pytest0.45秒，守卫1.178秒、85.3MiB、swap0。
+这没有复现或修复macOS根因。未提高期限、跳过读取或重新运行同一失败CI来替代诊断；
+后续先核查读取链和足够的定位证据，当前保留发行门为未通过。
+
+## 首轮失败后的有界诊断校准
+
+本次仅补充格式读取的失败观测，没有证明或修复上述macOS根因。原`begin`阶段覆盖
+完整`_rows(db, "BEGIN")`及进入下一阶段的间隙，不能把1004毫秒直接解释为SQLite执行
+或锁等待。`failure_phase=optional`、`queries=0`证明BEGIN已正常返回，而首个optional
+资料查询还未发出；`vm_steps=0`表示尚未累计到进度回调的100步间隔，不表示零VM指令。
+
+失败note新增唯一固定对象`begin_call`，字段为`wall_ms`、`thread_cpu_ms`、
+`return_gap_ms`和`returned`。墙钟覆盖原完整调用，包括Python游标创建、执行、取结果与
+关闭；返回间隙记录调用完成到后续阶段切换之间的时间。本线程CPU只作可选诊断，函数
+缺失、OSError或NotImplementedError时为null，不能伪记为有效的0。BEGIN异常仍按原
+异常分类，不能标记returned成功。所有毫秒值非负且有界，整个note仍不超过1024字节，
+不输出SQL、路径、数据库资料、原始异常或私有值。
+
+接线保留原1秒期限、查询与VM预算、SQL和PRAGMA、事务及ROLLBACK清理，不新增查询、
+重试或格式跳过。非作者只读后审未发现剩余P1/P2。诊断首目标已准确先红：真实BEGIN、
+原超时和清理均已走完，在缺少新`begin_call`键处失败，1 failed、pytest0.13秒，
+守卫0.896秒、60.9MiB、swap0；不是BEGIN或cleanup夹具前置失败。
+
+五个新增参数节点只校准观测：两个受控时钟分别在真实BEGIN调用内、以及原调用成功
+返回后推进1.004秒；另三个覆盖线程CPU函数缺失或上述两种不可用异常。校准要求原
+format_read_timeout、queries0、真实BEGIN与ROLLBACK各一次、数据库事实不变，并区分
+调用内墙钟与返回间隙；它们不是macOS故障复现，也不证明低CPU究竟来自阻塞、调度或
+其它原因。原有BEGIN异常测试另核returned为false。诊断后的定向复验已实收：整个
+format_evidence文件75个节点，加上述macOS失败节点在本机Linux的精确复验，共76 passed，
+pytest0.59秒、守卫1.350秒、87.5MiB、swap0、exit0。其中5个为新增校准节点；Linux通过
+不代表macOS根因已消除。
+
+诊断后的相邻五文件再次233 passed（pytest4.16秒、守卫5.496秒、213.2MiB）；
+clean/noincremental strict仍为153源文件通过（守卫8.604秒、378.8MiB）。Ruff通过，格式
+首查仅两处测试排版，修正后412文件通过（66毫秒、23.5MiB）。离线重新构建通过
+（1.564秒、99.5MiB），发行校验通过（190毫秒、19.3MiB），均swap0、exit0；旧notes
+未覆写。原审批实现未改，首轮778节点保留为历史，不将相同节点重复累加为新覆盖。
+隔离wheel离线安装、导入、兼容、资产、API、提示词、默认桌面关闭、任务控制和lifespan
+复验通过（1.420秒、99.7MiB、swap0、exit0），版本2.59。新远端候选终态另行收取；
+原读取期限与发行门保持。
+
+时钟定义参考[Python3.12本线程CPU计时](https://docs.python.org/3.12/library/time.html#time.thread_time)，
+事务语义参考[SQLite DEFERRED事务](https://www.sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions)；
+这些定义不代替本次实际耗时定位，远端发行门仍未放行。
