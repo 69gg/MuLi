@@ -754,9 +754,43 @@ def notification_facts(value: object) -> bool:
     )
 
 
-def manager_instance_facts(value: object) -> bool:
+def pending_job_facts(value: object) -> bool:
+    """Only bounded STATUS identifier hints and job types, never verified unit IDs."""
+    if not isinstance(value, dict) or set(value) != {"code", "identifier", "type"}:
+        return False
+    if value["code"] != "user_job":
+        return (
+            value["code"] in ("empty", "reached_basic", "ready", "other", "unavailable")
+            and value["identifier"] == value["type"] == ""
+        )
+    unit = value["identifier"]
+    return (
+        isinstance(unit, str)
+        and len(unit) <= 128
+        and re.fullmatch(
+            r"(?:[A-Za-z0-9_:@.-]|\\x[0-9a-fA-F]{2})+"
+            r"\.(?:service|socket|target|timer|path|slice|scope|device|mount|automount|swap)",
+            unit,
+        )
+        is not None
+        and value["type"]
+        in (
+            "start",
+            "verify-active",
+            "stop",
+            "reload",
+            "reload-or-start",
+            "restart",
+            "try-restart",
+            "try-reload",
+            "nop",
+        )
+    )
+
+
+def manager_instance_facts(value: object, *, allow_legacy: bool = True) -> bool:
     """A later same-instance projection; internal scalars do not prove READY."""
-    if not isinstance(value, dict) or set(value) != {
+    keys = {
         "version",
         "code",
         "reason",
@@ -768,7 +802,15 @@ def manager_instance_facts(value: object) -> bool:
         "uids",
         "internal",
         "used",
-    }:
+    }
+    if not isinstance(value, dict) or set(value) not in (keys, keys | {"pending_job"}):
+        return False
+    if "pending_job" not in value:
+        if not allow_legacy:
+            return False
+    elif not pending_job_facts(value["pending_job"]) or (
+        value["pending_job"]["code"] == "unavailable"
+    ) != (value["code"] != "observed"):
         return False
     return (
         type(value["version"]) is int
@@ -2259,6 +2301,7 @@ class NativeCI:
             "exe": "unavailable",
             "uids": "unavailable",
             "internal": "not_observed",
+            "pending_job": {"code": "unavailable", "identifier": "", "type": ""},
             "used": 0,
         }
         before = self.setup_bytes
@@ -2282,6 +2325,7 @@ class NativeCI:
                     exe="unavailable",
                     uids="unavailable",
                     internal="not_observed",
+                    pending_job={"code": "unavailable", "identifier": "", "type": ""},
                 )
             # fixture_result also verifies the complete compact projection cap.
             self.save_setup_result(resources)
@@ -2340,7 +2384,7 @@ class NativeCI:
             data = json.loads(reply.output, object_pairs_hook=unique)
             if (
                 reply.code != 0
-                or not manager_instance_facts(data)
+                or not manager_instance_facts(data, allow_legacy=False)
                 or data["uid"] != uid
                 or not manager_instance_matches(data, checkpoint)
                 or data["used"] > allowance

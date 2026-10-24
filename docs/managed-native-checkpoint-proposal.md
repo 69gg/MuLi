@@ -164,6 +164,22 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 
 `read_manager_instance`仅在第一次实际exe为已核manager、四UID全部匹配且proc额度尚余时调用独立helper；返回放在原`internal`位置。随后完整复核第二次proc，再由原`diagnose_manager_instance`复核第二次PID1 Unit/Service、账户及原绝对截止。任一后身份漂移撤销整组，internal恢复not_observed，原始tag/部分内部事实不保留；executor或UID不匹配不打开peer。旧inner五键和outer的`internal="not_observed"`仍兼容。内部仅接受精确四字段、固定状态/有限错误及uint32 NJobs，不把它当READY证据。
 
+### native20 后的有界运行 job 投影（离线检查已完成）
+
+native20 已实际取得同实例用户manager私有peer的 `basic=inactive、NJobs=5`，PID1仍为 `activating/start`，没有进入正式事务；这证明本次固定peer读取成功，不证明READY或完整清理成功。v255在basic已到达或启动jobs清空后发送READY；当前事实更支持启动job未完成，尚未定位具体阻塞单元。自建target虽有`DefaultDependencies=no`，它要求的basic仍拉入sockets/timers/paths，不能称发行版启动图已隔离。本节不改变此前native19、native20原始失败和cleanup失败事实。
+
+复用PID1已有`Service.StatusText`：v255 `manager_print_jobs_in_progress`发送可选`(i of n) `前缀及`User job <ident>/<type> running (<time> / <limit>)...`。只在原小实例的第一次Service属性调用中合并此字段，原五次PID1查询、一次内层命令、身份窗口、5秒绝对截止及32768/512/1024字节门均保持；不追加轮询、ListJobs、通知、预热或重试，旧大包和notification固定标签合同不变。[v255实际formatstring](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L185-L253)、[固定job type表](https://github.com/systemd/systemd/blob/v255/src/core/job.c#L1492-L1503)、[basic依赖](https://github.com/systemd/systemd/blob/v255/units/user/basic.target)。
+
+新版小实例始终携带`pending_job={code,identifier,type}`。仅完整匹配、ASCII且最多512字节的上述格式可产生`code=user_job`；identifier最多128字节，只接安全unit形状字符/十六进制转义及固定后缀，type只接v255固定job枚举。其余为empty/reached_basic/ready/other/unavailable，identifier与type均为空；不保存完整原文、任意描述、耗时或异常正文。identifier只是STATUS中的安全候选提示，可能来自Description，不能作为已验证unit ID。后侧PID1/进程身份漂移、内层失败或截止使整组不可用，不能保留先读到的job。旧无该字段artifact保持可读，当前collector回包必须是新版完整形状；超出原整个保存投影1024字节时继续按原规则失败关闭和保留首因，不扩大预算。
+
+这是有限窗口中一个运行job的状态文本投影，不是完整依赖图、全部job清单、到期快照或已证实根因。v255的`unit_status_string(unit, NULL)`可能返回Description；如果Description恰为`dbus.socket`，它同样会成为identifier候选，不能反推出真实unit ID，后续定位必须另核实际单元身份。不符合安全形状的内容才返回other；不声称所有描述必定other。即使标签为ready也不是READY送达凭证，不改变成功准入。[v255实际ident选择](https://github.com/systemd/systemd/blob/v255/src/core/unit.c#L1299-L1327)。
+
+根先实收现有`diagnose_manager_instance`两条目标红：单job及`(2 of 5)`前缀均在“未查询StatusText”断言失败，2 failed/26 deselected，pytest0.14秒，守卫632毫秒、66.7MiB/swap0、exit1。随后候选实现和负控已落：固定标签、坏格式/控制字符/未知type/超界、旧artifact与当前回包分离、后身份漂移、截止、真实wire计费及最大合法保存投影。作者未自行执行检查或真实服务；修复后检查结果待根记录，不能据纯回归宣称真实READY已修复或授权下一次远端native运行。
+
+根随后实际收取instance+原CI两文件563 passed，pytest2.01秒、守卫2.664秒、139.2MiB/swap0/exit0；旧checkpoint/peer/peerintegration/resource四文件170 passed，pytest0.44秒、守卫990毫秒、73.8MiB/swap0/exit0。首次外部helper strict未带既有MYPYPATH，使旧导入变Any产生9处旧行no-any-return，不能据此改源码忽略。独立后审指出ident可能为Description，随后仅将新字段unit收窄为identifier，并补Description恰为unit形状的纯反例。最终六个native文件共734 passed（pytest2.29秒；守卫2.961秒、135.6MiB/swap0、exit0），包含此前检查，不重复累计；两脚本使用既有tests+src路径及explicit package bases的strict/no-incremental检查通过（守卫5.522秒、289.2MiB/swap0、exit0）。四份改动Python的Ruff通过，根仅统一三份排版。另一位未参与实现的Sol复核收窄后的投影，未见剩余P1/P2。
+
+本片未改变原READY、清理、身份、执行期限或资源限额。native20的零事务、basic inactive/NJobs5及cleanup失败保持未关闭；离线回归不能证明现场READY已修复。下一次受限远端验证只用于取得新的判别信息，执行前仍须固定新签名head；本地不启动真实manager、FFI/socket、服务、账户或挂载。
+
 正式`python -I /abs/managed_native_worker.py`的argv和隔离不改；脚本模式按固定同目录文件用importlib注册/装载peer，复用实际`__main__`中的worker异常与clock helper，不修改sys.path、不加载第二份worker。包模式保持相对导入。新增离线装载用例只执行脚本定义及受控loader，拦截真实peer，不是新进程`-I`或FFI实测。旧proc-only用例明确注入固定not_observed helper，以保留其原proc/漂移计费断言并禁止真实socket。
 
 新增父级结算由真实调用前账本、实际raw grant和返回wire记录；校验grant公式、严格数值类型、三种settlement等式、setup.used一致性及紧凑保存上限。失联reply_bytes=null且总量饱和，超1024回复记录实际字节但不退款，0余额无命令。保留原checkpoint、首因和零事务；未改READY、cleanup或effects门。除原17节点外，补固定脚本装载及损坏结算反例，均仅写入待根执行。未运行检查、Git、网络、真实FFI/socket、服务或CI，不授权native20。

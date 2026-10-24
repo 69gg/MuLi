@@ -1169,6 +1169,68 @@ def context_socket(path: Path, owner: int) -> str:
         os.close(descriptor)
 
 
+def pending_job_unavailable() -> dict[str, str]:
+    return {"code": "unavailable", "identifier": "", "type": ""}
+
+
+def pending_job_projection(value: object) -> dict[str, str]:
+    """Extract a safe STATUS identifier hint, not a verified unit ID or raw text."""
+    other = {"code": "other", "identifier": "", "type": ""}
+    if not isinstance(value, str) or len(value) > 512 or not value.isascii():
+        return other
+    fixed = {"": "empty", "Reached basic.target.": "reached_basic", "Ready.": "ready"}
+    if value in fixed:
+        return {"code": fixed[value], "identifier": "", "type": ""}
+    # v255 manager.c::manager_print_jobs_in_progress, not console status prose.
+    match = re.fullmatch(
+        r"(?:\(([1-9][0-9]{0,9}) of ([1-9][0-9]{0,9})\) )?"
+        r"User job ([A-Za-z0-9_:@.\\-]{1,128})/([a-z-]{1,15}) running "
+        r"\([0-9A-Za-z. ]{1,64} / [0-9A-Za-z. ]{1,64}\)\.\.\.",
+        value,
+    )
+    if match is None:
+        return other
+    index, total, unit, job_type = match.groups()
+    if index is not None and not (1 < int(total) < 2**32 and int(index) <= int(total)):
+        return other
+    if not pending_job_facts({"code": "user_job", "identifier": unit, "type": job_type}):
+        return other
+    return {"code": "user_job", "identifier": unit, "type": job_type}
+
+
+def pending_job_facts(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"code", "identifier", "type"}:
+        return False
+    if value["code"] != "user_job":
+        return (
+            value["code"] in ("empty", "reached_basic", "ready", "other", "unavailable")
+            and value["identifier"] == value["type"] == ""
+        )
+    unit = value["identifier"]
+    return (
+        isinstance(unit, str)
+        and len(unit) <= 128
+        and re.fullmatch(
+            r"(?:[A-Za-z0-9_:@.-]|\\x[0-9a-fA-F]{2})+"
+            r"\.(?:service|socket|target|timer|path|slice|scope|device|mount|automount|swap)",
+            unit,
+        )
+        is not None
+        and value["type"]
+        in (
+            "start",
+            "verify-active",
+            "stop",
+            "reload",
+            "reload-or-start",
+            "restart",
+            "try-restart",
+            "try-reload",
+            "nop",
+        )
+    )
+
+
 def instance_projection(value: object) -> dict[str, Any]:
     require(
         isinstance(value, dict)
@@ -2568,6 +2630,7 @@ async def diagnose_manager_instance(
         "uid": uid,
         **anchor,
         "internal": "not_observed",
+        "pending_job": pending_job_unavailable(),
         **instance_unavailable("invalid_reply", 0),
     }
     io = _SetupIO(deadline, byte_limit, {})
@@ -2589,10 +2652,13 @@ async def diagnose_manager_instance(
             )
             path = await probe._unit_path(f"user@{uid}.service")
 
-            async def binding() -> tuple[dict[str, Any], dict[str, Any]]:
+            async def binding(*, status: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
                 unit = await probe._properties(path, "Unit", (("Id", "s"), ("InvocationID", "ay")))
                 service = await probe._properties(
-                    path, "Service", (("MainPID", "u"), ("ControlGroup", "s"))
+                    path,
+                    "Service",
+                    (("MainPID", "u"), ("ControlGroup", "s"))
+                    + ((("StatusText", "s"),) if status else ()),
                 )
                 invocation = unit["InvocationID"]
                 require(
@@ -2613,7 +2679,8 @@ async def diagnose_manager_instance(
                 )
                 return unit, service
 
-            before = await binding()
+            before = await binding(status=True)
+            pending_job = pending_job_projection(before[1].pop("StatusText"))
             projected = await io.instance(
                 anchor["pid"], uid, anchor["start_ticks"], before[1]["ControlGroup"]
             )
@@ -2626,6 +2693,8 @@ async def diagnose_manager_instance(
             remaining(deadline)
             facts.update({key: projected[key] for key in ("code", "reason", "exe", "uids")})
             facts["internal"] = projected.get("internal", "not_observed")
+            if projected["code"] == "observed":
+                facts["pending_job"] = pending_job
     except Exception as error:
         facts.update(instance_unavailable(instance_error(error), 0))
     facts["used"] = min(io.used, byte_limit)

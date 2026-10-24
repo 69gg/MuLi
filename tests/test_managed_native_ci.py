@@ -3612,6 +3612,7 @@ def manager_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict
                         [0, "/"] if idle or active else [11, "/org/freedesktop/systemd1/job/11"],
                     ),
                     "Type": ("s", "notify-reload" if is_manager else "oneshot"),
+                    "StatusText": ("s", ""),
                     "MainPID": ("u", 42 if is_manager and not idle else 0),
                     "ControlGroup": (
                         "s",
