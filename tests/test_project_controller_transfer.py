@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -44,6 +45,7 @@ from muli.managed_transaction import (
 from muli.management_projection import ProjectionError, project_final, read_projection
 from muli.management_transaction import (
     JournalLimits,
+    ProjectionReceipt,
     Role,
     TransactionError,
     TransactionJournal,
@@ -541,3 +543,400 @@ async def test_ordinary_source_rejects_transfer_before_process_or_new_plan(
         assert host.runtime.store.db.total_changes == before
         assert host.probe.calls == calls
         assert (host.journal.directory.path / "state.json").read_bytes() == transfer.data
+
+
+def _transfer_entries(transfer: TransferEvidence) -> dict[str, bytes]:
+    generation = transfer.ordinary.generation
+    return {
+        **{
+            name.replace("-base-", "-origin-"): data
+            for name, data in transfer.origin.entries(generation, "base").items()
+        },
+        **transfer.selected.entries(generation, "base"),
+        **transfer.selected.entries(generation, "target"),
+    }
+
+
+def _publish_released_transfer(
+    journal: TransactionJournal,
+    transfer: TransferEvidence,
+    phase: Literal["committed", "rolled_back"] = "committed",
+) -> ProjectControllerTransferRecord:
+    data = json.dumps(_terminal_values(transfer, phase, "released")).encode()
+    record = parse_managed_record(data, limits=journal.limits)
+    assert isinstance(record, ProjectControllerTransferRecord)
+    assert record.resolved and record.health is not None
+    entries = _transfer_entries(transfer)
+    assert len(entries) == 9
+    with journal.locked() as control:
+        for name, value in entries.items():
+            control._replace(name, value)
+        control._replace("state.json", data)
+    assert journal.read_current() == record
+    return record
+
+
+def _position_receipt(
+    record: ProjectControllerTransferRecord | TransactionRecordV2,
+) -> ProjectionReceipt:
+    return ProjectionReceipt(
+        **record.position.model_dump(), store_instance=record.identity.store_instance
+    )
+
+
+def _prepare_after_transfer(
+    journal: TransactionJournal,
+    transfer: TransferEvidence,
+    source: ProjectControllerTransferRecord,
+    *,
+    projected: ProjectionReceipt | None,
+    request: str = "ordinary-after-transfer",
+    generation: str = "3" * 32,
+    now: float = 125.0,
+    action: Literal["restart", "configure"] = "restart",
+) -> TransactionRecordV2:
+    # Caller-supplied pure protocol material, not an attested running process.
+    # In particular, do not derive a new boot permit from historical health.
+    principal = ServiceIdentityV2(
+        deployment=source.identity.deployment,
+        store_instance=source.identity.store_instance,
+        main_session=source.identity.main_session,
+        origin_boot="fresh-caller-after-reopen",
+    )
+    assert source.health is not None and principal.origin_boot != source.health.boot
+    selected = source.binding("base" if source.phase == "rolled_back" else "target")
+    with journal.writer_lease() as writer, journal.locked() as control:
+        return prepare_managed(
+            control,
+            request_id=request,
+            action=action,
+            identity=principal,
+            base=selected,
+            target=selected,
+            base_data=transfer.selected,
+            target_data=transfer.selected,
+            observed_format=source.observed_format,
+            base_manifest=manifest(),
+            target_manifest=manifest(),
+            deadline=deadline(now=now),
+            writer=writer,
+            projected=projected,
+            generation=generation,
+        )
+
+
+@pytest.mark.parametrize("phase", ["committed", "rolled_back"])
+def test_released_transfer_is_ordinary_restart_predecessor(
+    journal: TransactionJournal,
+    transfer: TransferEvidence,
+    phase: Literal["committed", "rolled_back"],
+) -> None:
+    source = _publish_released_transfer(journal, transfer, phase)
+    old_entries = _transfer_entries(transfer)
+    record = _prepare_after_transfer(journal, transfer, source, projected=_position_receipt(source))
+    assert type(record) is TransactionRecordV2 and record.action == "restart"
+    assert record.identity.deployment == source.identity.deployment
+    assert source.boot_role is not None
+    assert record.base == record.target == source.binding(source.boot_role)
+    assert record.base.selector != source.origin.binding.selector
+    assert record.base.unit != source.origin.binding.unit
+    assert record.observed_format == source.observed_format
+    assert journal.read_current() == record
+    for name, value in old_entries.items():
+        assert (journal.directory.path / name).read_bytes() == value
+
+    before = (journal.directory.path / "state.json").read_bytes()
+    retried = _prepare_after_transfer(
+        journal, transfer, source, projected=_position_receipt(source), now=150.0
+    )
+    assert retried == record
+    assert retried.deadline == deadline(now=125.0)
+    assert retried.challenge == record.challenge and retried.position == record.position
+    assert (journal.directory.path / "state.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("projection", ["origin", "missing", "wrong-revision"])
+def test_transfer_predecessor_requires_current_projection_without_effects(
+    journal: TransactionJournal,
+    transfer: TransferEvidence,
+    projection: Literal["origin", "missing", "wrong-revision"],
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    stale = "0" * 32 + "-base-unit.bin"
+    with journal.locked() as control:
+        control._replace(stale, b"must-not-gc-on-refusal")
+    current = _position_receipt(source)
+    projected = (
+        source.origin.projected
+        if projection == "origin"
+        else None
+        if projection == "missing"
+        else ProjectionReceipt(**{**current.model_dump(), "revision": current.revision + 1})
+    )
+    assert projected != current
+    before = {path.name: path.read_bytes() for path in journal.directory.path.iterdir()}
+    with pytest.raises(TransactionError, match="^projection_required$"):
+        _prepare_after_transfer(journal, transfer, source, projected=projected)
+    assert {path.name: path.read_bytes() for path in journal.directory.path.iterdir()} == before
+    assert journal.read_current() == source
+
+
+@pytest.mark.parametrize("short_by", [0, 1], ids=["exact", "one-short"])
+def test_transfer_predecessor_nine_snapshots_entry_budget(
+    tmp_path: Path, transfer: TransferEvidence, short_by: int
+) -> None:
+    root, database = tmp_path / "journal", tmp_path / "data" / "muli.db"
+    with TransactionJournal(root, database) as journal:
+        source = _publish_released_transfer(journal, transfer)
+        with journal.locked() as control:
+            control._replace("foreign-material.bin", b"foreign-preserved-and-counted")
+        before = {path.name: path.read_bytes() for path in root.iterdir()}
+        incoming = {
+            **transfer.selected.entries("3" * 32, "base"),
+            **transfer.selected.entries("3" * 32, "target"),
+        }
+        assert len(_transfer_entries(transfer)) == 9 and len(incoming) == 6
+        # Every real entry remains referenced or foreign; include the single
+        # atomic-replace temporary entry without increasing the default cap.
+        required = len(before.keys() | incoming.keys() | {"state.json"}) + 1
+        assert required <= journal.limits.max_entries
+    with TransactionJournal(
+        root, database, JournalLimits(max_entries=required - short_by), create=False
+    ) as journal:
+        if short_by:
+            with pytest.raises(TransactionError, match="^directory_budget$"):
+                _prepare_after_transfer(
+                    journal, transfer, source, projected=_position_receipt(source)
+                )
+            assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+            return
+        record = _prepare_after_transfer(
+            journal, transfer, source, projected=_position_receipt(source)
+        )
+        assert journal.read_current() == record
+        assert {path.name for path in root.iterdir()} == before.keys() | incoming.keys()
+        for name, value in before.items():
+            if name != "state.json":
+                assert (root / name).read_bytes() == value
+
+
+def test_transfer_origin_snapshots_gc_only_after_next_predecessor(
+    journal: TransactionJournal, transfer: TransferEvidence
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    with journal.locked() as control:
+        control._replace("foreign-material.bin", b"do-not-delete")
+        control._replace("0" * 32 + "-origin.json", b"not-a-defined-origin-snapshot")
+    first = _prepare_after_transfer(journal, transfer, source, projected=_position_receipt(source))
+    previous = verifying(first)
+    previous = move(
+        previous,
+        TransitionV2(phase="committed", proof=proof(previous, boot="ordinary-boot")),
+    )
+    previous = move(
+        previous,
+        TransitionV2(
+            phase="committed",
+            activation="released",
+            proof=proof(previous, boot="ordinary-boot", admission="released"),
+        ),
+    )
+    # Pure protocol fixture publication; no controller effects or health probe.
+    with journal.locked() as control:
+        control._write(previous)
+    record = _prepare_after_transfer(
+        journal,
+        transfer,
+        source,
+        projected=_position_receipt(previous),
+        request="ordinary-next-generation",
+        generation="4" * 32,
+        now=150.0,
+    )
+    expected = {
+        "lock",
+        "state.json",
+        "foreign-material.bin",
+        "0" * 32 + "-origin.json",
+        *transfer.selected.entries(previous.generation, "base"),
+        *transfer.selected.entries(previous.generation, "target"),
+        *transfer.selected.entries(record.generation, "base"),
+        *transfer.selected.entries(record.generation, "target"),
+    }
+    assert {path.name for path in journal.directory.path.iterdir()} == expected
+    assert not any((journal.directory.path / name).exists() for name in _transfer_entries(transfer))
+    assert (journal.directory.path / "foreign-material.bin").read_bytes() == b"do-not-delete"
+    assert (journal.directory.path / ("0" * 32 + "-origin.json")).read_bytes() == (
+        b"not-a-defined-origin-snapshot"
+    )
+    assert journal.read_current() == record
+
+
+@pytest.mark.parametrize("role", ["origin", "base", "target"])
+@pytest.mark.parametrize("component", ["configuration.json", "selector.json", "unit.bin"])
+def test_transfer_predecessor_verifies_every_retained_snapshot_before_effects(
+    journal: TransactionJournal,
+    transfer: TransferEvidence,
+    role: Literal["origin", "base", "target"],
+    component: Literal["configuration.json", "selector.json", "unit.bin"],
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    path = journal.directory.path / f"{source.generation}-{role}-{component}"
+    path.write_bytes(b"changed-unit" if component == "unit.bin" else b'{"changed":true}')
+    with journal.locked() as control:
+        control._replace("0" * 32 + "-base-unit.bin", b"must-not-collect")
+    before = {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()}
+    with pytest.raises(TransactionError, match="^snapshot_invalid$"):
+        _prepare_after_transfer(journal, transfer, source, projected=_position_receipt(source))
+    assert {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()} == before
+    assert journal.read_current() == source
+
+
+def test_transfer_predecessor_missing_origin_snapshot_is_not_repaired(
+    journal: TransactionJournal, transfer: TransferEvidence
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    missing = journal.directory.path / f"{source.generation}-origin-selector.json"
+    missing.unlink()
+    before = {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()}
+    with pytest.raises(FileNotFoundError):
+        _prepare_after_transfer(journal, transfer, source, projected=_position_receipt(source))
+    assert {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()} == before
+    assert not missing.exists() and journal.read_current() == source
+
+
+def test_restart_after_transfer_retry_does_not_repair_changed_snapshot(
+    journal: TransactionJournal, transfer: TransferEvidence
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    record = _prepare_after_transfer(journal, transfer, source, projected=_position_receipt(source))
+    changed = journal.directory.path / f"{record.generation}-target-unit.bin"
+    changed.write_bytes(transfer.selected.unit + b"# changed\n")
+    before = {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()}
+    with pytest.raises(TransactionError, match="^snapshot_invalid$"):
+        _prepare_after_transfer(
+            journal, transfer, source, projected=_position_receipt(source), now=150.0
+        )
+    assert {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()} == before
+    assert journal.read_current() == record
+
+
+def test_released_transfer_does_not_open_ordinary_configure(
+    journal: TransactionJournal, transfer: TransferEvidence
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    # An unchanged configure is valid under the existing ordinary shape rules;
+    # rejection here belongs to the explicit Transfer predecessor action gate.
+    assert (
+        prepared(
+            "configure",
+            base=transfer.ordinary.base,
+            target=transfer.ordinary.target,
+            principal=transfer.ordinary.identity,
+        ).action
+        == "configure"
+    )
+    before = {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()}
+    with pytest.raises(TransactionError, match="^project_controller_transfer_unsupported$"):
+        _prepare_after_transfer(
+            journal,
+            transfer,
+            source,
+            projected=_position_receipt(source),
+            action="configure",
+        )
+    assert {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()} == before
+
+
+@pytest.mark.parametrize(
+    "changed,code",
+    [
+        ("deployment", "managed_source_changed"),
+        ("store", "store_changed"),
+        ("main", "store_changed"),
+        ("origin-binding", "managed_source_changed"),
+        ("generation", "generation_conflict"),
+        ("request", "request_conflict"),
+    ],
+)
+def test_transfer_predecessor_rejects_foreign_ordinary_material_without_effects(
+    journal: TransactionJournal,
+    transfer: TransferEvidence,
+    changed: str,
+    code: str,
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    principal = ServiceIdentityV2(
+        deployment="f" * 64 if changed == "deployment" else source.identity.deployment,
+        store_instance="another-store" if changed == "store" else source.identity.store_instance,
+        main_session="another-main" if changed == "main" else source.identity.main_session,
+        origin_boot="fresh-caller-after-reopen",
+    )
+    base = source.origin.binding if changed == "origin-binding" else source.target
+    data = transfer.origin if changed == "origin-binding" else transfer.selected
+    before = {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()}
+    with journal.writer_lease() as writer, journal.locked() as control:
+        with pytest.raises(TransactionError, match=f"^{code}$"):
+            prepare_managed(
+                control,
+                request_id=source.request_id if changed == "request" else "next-ordinary",
+                action="restart",
+                identity=principal,
+                base=base,
+                target=base,
+                base_data=data,
+                target_data=data,
+                observed_format=source.observed_format,
+                base_manifest=manifest(),
+                target_manifest=manifest(),
+                deadline=deadline(now=125.0),
+                writer=writer,
+                projected=_position_receipt(source),
+                generation=source.generation if changed == "generation" else "3" * 32,
+            )
+    assert {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()} == before
+
+
+def test_transfer_predecessor_keeps_host_guard_before_new_material(
+    journal: TransactionJournal, transfer: TransferEvidence
+) -> None:
+    source = _publish_released_transfer(journal, transfer)
+    configuration = b'{"port":8766}'
+    base = RoleBinding.model_validate(
+        {**source.target.model_dump(), "configuration": _snapshot(configuration, 4096)}
+    )
+    data = RoleSnapshots(configuration, transfer.selected.selector, transfer.selected.unit)
+    calls: list[str] = []
+
+    def guard() -> None:
+        calls.append("checked")
+        raise TransactionError("fixture_host_configuration_rejected")
+
+    before = {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()}
+    with journal.writer_lease() as writer, journal.locked() as control:
+        with pytest.raises(TransactionError, match="^fixture_host_configuration_rejected$"):
+            prepare_managed(
+                control,
+                request_id="ordinary-with-live-configuration",
+                action="restart",
+                identity=ServiceIdentityV2(
+                    deployment=source.identity.deployment,
+                    store_instance=source.identity.store_instance,
+                    main_session=source.identity.main_session,
+                    origin_boot="fresh-caller-after-reopen",
+                ),
+                base=base,
+                target=base,
+                base_data=data,
+                target_data=data,
+                observed_format=source.observed_format,
+                base_manifest=manifest(),
+                target_manifest=manifest(),
+                deadline=deadline(now=125.0),
+                writer=writer,
+                projected=_position_receipt(source),
+                generation="3" * 32,
+                guard=guard,
+            )
+    assert calls == ["checked"]
+    assert {entry.name: entry.read_bytes() for entry in journal.directory.path.iterdir()} == before

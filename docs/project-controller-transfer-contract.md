@@ -142,3 +142,23 @@ unit 不能声称不变：`ManagedUserService._arguments` 的 Python 来自 cont
 7. `test_transfer_terminal_projects_and_allows_next_same_format_request`：新角色提交或回退在同一真实 DB 投影，close/reopen 后严格接纳该终态为普通新请求 source，当前 anchor/controller/unit 是新值；Store/main、原消息/已接受 pending 与 unknown receipts 不重建、不丢失或重发。格式 1 不变，普通 1→2 仍被原 assess 拒绝。
 
 前 1–3/5–7 的替身通过只证明纯规则、文件/SQLite/lease 与调用边界；第 4 另外证明精确 retained launcher/正式 host 进程路径。真实 systemd loaded unit、进程/cgroup、关闭 owner 与新 writer 交接还需要单独受控验收，不能用 DTO 或 fake probe 宣称已部署可恢复。该批准也不授权运行原生 CI、新进程或真实服务；根先审合同，再给独立实现树与唯一守卫执行窗口。
+
+## 8. 2A：released Transfer 作为普通前代的首批行为红测
+
+根签名第一片 checkpoint `d4b648c3b09fc18052faaa7596d11e9929e06b85` 后，先仅在 `tests/test_project_controller_transfer.py` 追加以下三组、八节点，未先改生产：
+
+- `test_released_transfer_is_ordinary_restart_predecessor[committed/rolled_back]`：完整合法 released Transfer 经正式 Journal 读取，持原 writer lease 准备普通 restart。角色来自新 anchor 的 base/target，而非 origin；保留本代九快照，随后同 request 重试不改变原 deadline、nonce、revision 或 state bytes。
+- `test_transfer_predecessor_requires_current_projection_without_effects[origin/missing/wrong-revision]`：旧 origin receipt、缺失 receipt、错误本代 revision 均须以 `projection_required` 拒绝，整目录实际 bytes 不变，包含可回收旧快照，不能先 GC/写入再发现投影不符。
+- `test_transfer_predecessor_nine_snapshots_entry_budget[exact/one-short]` 与 `test_transfer_origin_snapshots_gc_only_after_next_predecessor`：实际九份前代文件、六份 incoming、state/lock、未知条目及一个原子替换临时项构成精确额度；只收紧原默认额度，不提高上限。刚接普通后继仍保留九份 Transfer 文件；再下一代仅回收已不再引用的完整九份（含 origin 三份），保留当前普通前代六份及未知条目。
+
+根实际收取这八节点：**8 failed**，pytest 0.34s、守卫 906ms、峰值 71.6MiB、swap 0、actual exit 1；全部停在正式 `prepare_managed` 的显式 `project_controller_transfer_unsupported`，投影反例也先遇到该一刀切门而未到预期投影拒绝。这不是尚未存在函数、导入或坏 fixture 制造的红。
+
+根据此授权并落盘的 2A 候选仅修改 `managed_transaction.py` 与 `managed_journal.py`：`prepare_record_v2` 显式接纳 resolved Transfer 前代且只开普通 restart；精确本代投影、Store/main、新 anchor deployment、选定角色的 entry/installation/compatibility/selector/unit、完整 observed format 和新 generation 均在写入前核验。同 request 仍按原普通记录规则保留原 deadline/nonce/position，Transfer request_id 不可伪装成普通重试。未 released 及其它普通动作仍返回原 unsupported，不放宽旧 V1/V2 模型、parser 或兼容判定。
+
+Journal 在纯门通过后，经同一受限目录读取并验证本代 origin/base/target 三组完整九份文件，之后才进入原 record/目录额度、guard、GC、snapshot 写入和最后 state 发布；缺失或损坏不修复、不靠 incoming 替代旧证据。GC 仅额外识别固定 `origin-configuration.json`、`origin-selector.json`、`origin-unit.bin`，保留当前前代整个 generation；下一代已无引用时才回收三组，`origin.json` 等未定义条目继续保留并计额度。原默认 limits、原临时条目预留和旧普通重试分支均未提升或另造。
+
+同文件另补 `test_transfer_predecessor_verifies_every_retained_snapshot_before_effects`（三组×三组件）、`test_transfer_predecessor_missing_origin_snapshot_is_not_repaired`、`test_restart_after_transfer_retry_does_not_repair_changed_snapshot`、`test_released_transfer_does_not_open_ordinary_configure`、`test_transfer_predecessor_rejects_foreign_ordinary_material_without_effects`（deployment/Store/main/旧 origin binding/重代/重 request 六项）、`test_transfer_predecessor_keeps_host_guard_before_new_material`。拒绝前后逐项比较整个临时目录 bytes；保留旧未 released unsupported oracle。
+
+2A 实现后，根唯一守卫实际收取六文件 **296 passed**，pytest 2.27s、守卫 2.865s、峰值 109.5MiB、swap 0、actual exit 0；其中已包含此前 269 项，不将两轮数字相加。根仅格式化本片三份 Python 文件，三文件 Ruff 通过；全 146 源 strict/no-incremental 实际 **exit 0**，同一守卫包含格式/Ruff，合计 8.317s、峰值 419.8MiB、swap 0。C 对冻结 2A 生产与回归独立只读后审未见剩余 P1/P2，未执行检查。上文八红保留为改动前真实历史；本轮通过的是当前纯规则、临时文件/Journal/lease、快照读验与 GC 接缝，不是实际 Transfer 执行或恢复验收。
+
+首批都走现有正式 prepare/Journal/lock/lease 和临时文件，不新增 Transfer 发布入口或真实宿主效果。新请求 `origin_boot` 为独立的调用方测试材料，显式不同于历史健康证明；不以历史 `health.boot` 合成 fresh permit。GC 后继的终态由现有纯 transition/proof helper 构造，不声称真实 controller 已执行。普通 live configuration 可能通过既有 Settings 路径变化，本片只比较角色的其它不可变材料；调用方仍必须交付与实际新配置匹配的快照并通过原 guard，不强行恢复历史配置。guard 反例只证明原同步回调在新材料写入前仍能拒绝，不证明真实宿主准入；`ManagedPreparation._source`、Maintenance、boot、host、projection 的 Transfer 执行分支仍未开放。2A 不代替后续 2B 的当前安装/实际配置/fresh permit、关闭重开或正式 launcher exec 验收，也不证明真实 transfer 已可发布或恢复。

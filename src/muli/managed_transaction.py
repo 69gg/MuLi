@@ -501,7 +501,10 @@ def prepare_record_v2(
     base_manifest: CompatibilityManifest,
     target_manifest: CompatibilityManifest,
     deadline: Deadline,
-    previous: TransactionRecord | TransactionRecordV2 | None = None,
+    previous: TransactionRecord
+    | TransactionRecordV2
+    | ProjectControllerTransferRecord
+    | None = None,
     projected: ProjectionReceipt | None = None,
     generation: str | None = None,
 ) -> TransactionRecordV2:
@@ -515,6 +518,10 @@ def prepare_record_v2(
         not isinstance(generation, str) or not re.fullmatch(r"[a-f0-9]{32}", generation)
     ):
         raise TransactionError("invalid_generation")
+    if isinstance(previous, ProjectControllerTransferRecord) and (
+        not previous.resolved or action != "restart"
+    ):
+        raise TransactionError("project_controller_transfer_unsupported")
     assessment = assess_compatibility(
         base_manifest, target_manifest, observed_format, handoff_protocol=2
     )
@@ -567,6 +574,17 @@ def prepare_record_v2(
         or previous.identity.main_session != identity.main_session
     ):
         raise TransactionError("store_changed")
+    if isinstance(previous, ProjectControllerTransferRecord):
+        selected = previous.binding("base" if previous.phase == "rolled_back" else "target")
+        if identity.deployment != previous.identity.deployment or base.model_dump(
+            exclude={"configuration"}
+        ) != selected.model_dump(exclude={"configuration"}):
+            raise TransactionError("managed_source_changed")
+        if observed_format != previous.observed_format:
+            raise TransactionError("managed_format_changed")
+        # Configuration may have changed through the ordinary live settings
+        # path. Its actual bytes and fresh process permit remain host checks;
+        # neither the old configuration nor historical health grants admission.
     if record.generation == previous.generation:
         raise TransactionError("generation_conflict")
     return record
