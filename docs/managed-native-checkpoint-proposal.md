@@ -129,3 +129,19 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 严格类型初查未指定源码路径，将原导入推为Any并报十项；显式MYPYPATH后仅剩新variant的setup可能为None这一真实收窄缺口。根只在原predicate前增加等价的isinstance(dict)门，未放宽验证，另一Sol读回无P1/P2。最终`MYPYPATH=src:tests`、strict/no-incremental/explicit-package-bases两脚本通过，守卫5.348秒、285.1MiB/swap0；改后完整三文件586项再验通过（pytest1.67秒、守卫2.283秒、120.8MiB/swap0），不与此前结果重复累计。
 
 四份改动Python最终Ruff和格式检查均通过；根统一格式化三份、另一份原样。以上全部在主仓check_local.py原30秒守卫串行运行，实际exit0，未触发原生服务、账户或真实桌面效果，无网络或下载。本片不是READY或cleanup修复，也未启动native20。
+
+## 待审增量：同一实例窗口内的 direct-peer 标量读取
+
+本节仅为方案，尚未编写或运行实现，也不授权native20。不改上述native19失败证据，不把本地586项或镜像清单当作现场READY证明。目标是在现有小实例观察中取得用户manager内部的两个有限事实，**替换**`internal=not_observed`的空位，不恢复旧大包、不追加第二次诊断。
+
+**固定版本依据。** 根已读取上游[v255 `src/core/dbus.c`](https://github.com/systemd/systemd/blob/v255/src/core/dbus.c)的`bus_on_connection`/`bus_check_peercred`及[v255 `src/shared/bus-util.c`](https://github.com/systemd/systemd/blob/v255/src/shared/bus-util.c)167–185行：实际peer凭据为UID0或server自身有效UID才接纳。因此沿用现有真实root helper，不模拟UID、不设trusted、不修改manager认证。该文件217–249行有用户私有连接的new/address/start路径，但其后备连接不在本方案授权内。[v255 `sd-bus.h`](https://github.com/systemd/systemd/blob/v255/src/systemd/sd-bus.h)提供所需非变参API；以上是固定上游源码依据，不等同Ubuntu补丁版或现场连通实测。[peer模式文档](https://www.freedesktop.org/software/systemd/man/latest/sd_bus_set_bus_client.html)及[systemd1接口文档](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html)只作接口解释，latest页面不能替代v255证据。
+
+**唯一连接与调用。** 在已有root helper两次proc stat/status/cgroup/exe读取之间，使用已安装libsystemd的薄FFI：`sd_bus_new`、固定私有socket地址、`sd_bus_set_bus_client(0)`、`sd_bus_start`。socket只能由已核账户UID派生，不能由调用者提供任意地址；缺库或连接失败明确not_observed。禁止open/default、Hello、订阅、自动fallback、CLI替代、LoadUnit/StartUnit或重试。仅发固定`Manager.GetUnit("basic.target")`，再读返回unit的`ActiveState`与同一manager的`NJobs`；GetUnit只查询已经loaded的unit，失败不加载它。用new_method_call/append_basic/read_basic构建及读取，严格核对返回signature和at_end，NJobs只接受`u`，ActiveState只转成有限枚举；不读取ListJobs、任意属性或错误正文。
+
+**身份窗口。** 保持现有前后PID1 Unit/Service属性核对与两次proc四UID、exe/startticks/cgroup连续性门。只有实际exe为manager且四UID均为目标UID才进入peer读取；固定socket连接前后lstat的类型、owner、device/inode须一致。通过`sd_bus_get_fd`取得实际连接FD，核`SO_PEERCRED`的PID/UID确为已锚定manager PID/目标UID，不能用socket属主代替peer身份。调用后再次核socket及原后侧proc/PID1门，任一漂移整组internal事实作废。只证明该有限窗口，不把历史checkpoint、两个顺序标量或最终deadline称为原子同刻状态；basic active且NJobs0也不证明READY已经发出或被PID1接收。
+
+**期限、分配与释放。** 不另开worker或cgroup；FFI在现有受限root helper内执行。每次`sd_bus_call(timeout_usec)`仅取同一个原绝对deadline的剩余额度，外层进程硬截止继续兜底，不为每次调用重置5秒。原5秒后备、cleanup与执行总期限均不扩容。每个bus/message/error及临时FD在全部失败/取消出口释放；借用的bus FD不能误关，若为取peercred复制FD则单独关闭。固定argtypes/restype，不用变参或将native错误串写入回包。libsystemd内部wire接收与malloc由现有真实cgroup上限约束，**不能宣称原32KiB管道/文件预算同时限制D-Bus库内部接收分配**。
+
+**实际计费回执。** 原32768字节proc＋双pipe累计、512字节内层wire及1024字节整个外层回复继续不变，新增有限标量也须容入原包。入诊断前父已付B必须来自真实`setup_bytes`，raw grant为`32768−B−1024`，不从native19的worker.used17468推算。父在原结果中保存固定小型`accounting`：`parent_before`、`raw_grant`、`child_charged`、`reply_bytes`、`parent_after`和`settlement=validated|unvalidated|not_started`；数字仅取实际账本/实际wire，未知reply_bytes用null，不伪造零。合法同锚点、及时、有界回包才按真实used退差额，结算`parent_after=B+child_charged+reply_bytes`；未经验证不退款，丢回包继续按现有保守规则占满总额。未启动不制造子进程花费。该元数据同样受严格shape和整个1024字节保存投影门约束，不借新字段增加预留；它用于暴露现场是否有足够采集余额，不能保证未来一定取得内部事实。
+
+**首片可证伪边界。** 离线fake缝隙须覆盖真实调用顺序与释放：仅两固定属性、无激活/回退；签名或尾部多值、仅peer PID/UID错、后socket/proc/PID1漂移均拒；剩余deadline耗尽、丢回包不退grant；实际512/513与1024/1025临界及最大accounting投影仍保住原checkpoint/首因。fake只证明协议编排和预算，不能证明FFI ABI、真实EXTERNAL握手或v255认证行为。实现获批并通过离线边界后，另行授权受控临时peer验证这些连接与凭据事实；不接真实用户服务、不扩大预算，也不据此跳过原READY尾门或直接启动native20。
