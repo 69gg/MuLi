@@ -2188,6 +2188,107 @@ async def test_actual_uid_import_layout_failure_precedes_any_manager_effect(
         await worker.Case(tmp_path).drive()
 
 
+async def test_actual_case_reuses_bootstrap_directory_before_first_manager_command(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real bootstrap/slot files and Case.drive; no subprocess, socket or service."""
+    from test_managed_launcher import _slot
+
+    import muli
+    from muli.platforms import filesystem_identity
+    from muli.platforms.managed_deployment import SlotIdentity, register_local_slot
+    from muli.service import UserService
+
+    native, commands = fixture
+    slots: dict[str, SlotIdentity] = {}
+
+    def copy_slot(name: str, description: dict[str, Any]) -> None:
+        assert description == commands.description
+        slots[name] = _slot(native.volume, name)
+
+    monkeypatch.setattr(native, "copy_slot", copy_slot)
+    native.prepare()  # Executes the real bootstrap create/check and receipt path.
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert receipt.bootstrap_file is not None and len(receipt.bootstrap_directories) == 5
+    unit_directory = native.home / ".config/systemd/user"
+    before = unit_directory.stat()
+    assert [before.st_dev, before.st_ino] == receipt.bootstrap_directories[-1]
+    assert stat.S_IMODE(before.st_mode) == 0o700
+
+    # The existing retained-slot helper embeds the slot name in two tiny files.
+    # Match both fixture packages, then use the original registration in drive.
+    for name in ("__main__.py", "managed_host.py"):
+        (Path(slots["b"].package.root) / name).write_bytes(
+            (Path(slots["a"].package.root) / name).read_bytes()
+        )
+    settings = worker.read_json(native.volume / "fixture.json")
+    settings["package_digest"] = register_local_slot(
+        native.volume / "a", native.volume / "a/bin/python", Path(slots["a"].package.root)
+    ).package.digest
+    worker.write_json(native.volume / "fixture.json", settings)
+    harness_group = commands.cgroup_root / commands.group.lstrip("/") / settings["harness_unit"]
+    kernel(harness_group, worker.HARNESS_MEMORY, worker.HARNESS_TASKS)
+
+    class Listener:
+        def __enter__(self) -> Listener:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def bind(self, address: tuple[str, int]) -> None:
+            assert address == ("127.0.0.1", 0)
+
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 18765)
+
+    class ManagerStartReached(Exception):
+        pass
+
+    def membership(unit: str, uid: int) -> Path:
+        assert unit == settings["harness_unit"] and uid == commands.uid
+        return harness_group
+
+    def local_filesystems(paths: list[Path]) -> None:
+        assert paths == [native.volume]
+
+    seen: list[tuple[str, ...]] = []
+    case = worker.Case(native.volume)
+    case.drive_deadline = worker.time.monotonic() + ci.HARNESS_SECONDS
+
+    async def command(*argv: str) -> str:
+        assert argv == ("systemctl", "--user", "daemon-reload")
+        assert case.stage == "manager_start"
+        service = UserService(
+            native.volume / "config.json",
+            native.volume / "data",
+            executable=slots["a"].lexical_python,
+        )
+        assert service.path == unit_directory / "muli.service"
+        assert service.path.read_text(encoding="utf-8") == service.render()
+        assert stat.S_IMODE(service.path.stat().st_mode) == 0o600
+        after = unit_directory.stat()
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        assert (unit_directory / (receipt.user + ".target")).read_bytes() == worker.bootstrap_data()
+        seen.append(argv)
+        raise ManagerStartReached
+
+    private_environment(monkeypatch, native.volume, commands.uid)
+    monkeypatch.setattr(worker.os, "getuid", lambda: commands.uid)
+    monkeypatch.setattr(worker.os, "geteuid", lambda: commands.uid)
+    monkeypatch.setattr(worker.sys, "prefix", str(native.volume / "a"))
+    monkeypatch.setattr(worker.sys, "executable", str(native.volume / "a/bin/python"))
+    monkeypatch.setattr(muli, "__file__", str(Path(slots["a"].package.root) / "__init__.py"))
+    monkeypatch.setattr(worker, "membership", membership)
+    monkeypatch.setattr(filesystem_identity, "verify_local_filesystems", local_filesystems)
+    monkeypatch.setattr(worker.socket, "socket", Listener)
+    monkeypatch.setattr(case, "command", command)
+    case.note("import")
+    with pytest.raises(ManagerStartReached):
+        await case.drive()
+    assert seen == [("systemctl", "--user", "daemon-reload")]
+
+
 def test_initial_db_identity_cannot_move_together_with_the_record(tmp_path: Path) -> None:
     from types import SimpleNamespace
 

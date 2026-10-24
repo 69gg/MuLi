@@ -3673,7 +3673,6 @@ class Case:
         require(
             service.path == self.root / "home/.config/systemd/user/muli.service", "native_unit_path"
         )
-        service.path.parent.mkdir(parents=True, mode=0o700)
         service.path.write_text(service.render(), encoding="utf-8")
         service.path.chmod(0o600)
         self.require_start_time()

@@ -651,3 +651,55 @@ D 非作者正式后审未发现剩余P1/P2：新增写入只在READY后针对�
 环境门。以上均为离线受控验证；真实manager环境继承、正式事务和完整cleanup仍待
 新的精确远端CI，不能由Native25的READY进展或这些离线绿推为已修复。
 作者未执行检查、格式、Git、网络或真实服务；本次仅追加文档，源码与测试保持冻结。
+
+### Native26 精确远端进展与下一失败边界
+
+根对G签候选 `df0982e5a7e5fda398d1b4139859db9dfa733250` 的单次CI
+`40066211245` 收取 managed-native 失败证据；其它job当时仍在运行，
+此处不提前给完整矩阵终态。artifact `12549356834` 为814字节，本地
+`/tmp/muli-native26-evidence.zip`，SHA-256为
+`fdab36dbbee3c6d67a94ea8e7e0b67d43d3e41763bfea03c75296f0dd809f9f0`，
+已由根按原 `fixture_result` 与 `Receipt.read` 严格校验。
+
+本轮真实worker的HOME、UID、bus、config与runtime环境门全部为true，manager
+ready260ms、late=false；harness仍256MiB/CPU1/32tasks/swap0，manager仍
+1GiB/CPU1/128tasks/swap0。cleanup为verified，receipt的user/group均已移除、
+mounts为0。这次环境门与完整cleanup已实际推进，不再沿用Native25的环境拒绝和
+cleanup失败描述，但不据此证明环境偏差的历史来源。
+
+正式事务仍未开始：completed=false、generations为空，code为 `FileExistsError`，
+最后stage为 `slots_verified`；timeline依次为import0、imports_verified753ms、
+slots_verified882ms。下一步只读定位该stage之后的实际创建路径，尚未授权生产修复；
+不增加日志、原始路径输出、期限或额度，也不把本轮环境和cleanup通过写成事务成功。
+
+### Native27：复用已拥有 bootstrap 目录的准确红绿
+
+源码定位到真实 `Case.drive`：标准 `UserService.path` 已要求为私有
+`home/.config/systemd/user/muli.service`，其父目录早已由原bootstrap的
+dirfd/NOFOLLOW/no-adopt创建并记录身份。原drive在写unit前却再次执行无exist_ok的
+mkdir，因此正常抵达此处会对已有目录抛 `FileExistsError`。
+
+新增单项回归复用真实prepare/bootstrap create/check与receipt、已有真实retained-slot
+材料helper及原 `Case.drive` 注册、配置和服务render/write/chmod路径。只替代当前进程
+布局/账户环境、临时cgroup与文件系统认证边界、完全不bind的端口替身和首条外部命令；
+屏障在 `manager_start` 的daemon-reload调用前核准确unit正文、0600权限、原父目录
+inode和bootstrap target未变，然后终止，不执行systemctl、HTTP或正式事务。
+
+根实收该selector准确红：1 failed，pytest1.01秒、守卫1.670秒、115.2MiB，
+实际失败为 `Case.drive:3676` 对同一owned目录抛 `FileExistsError`，不是夹具前置。
+根随后仅删除这一次重复mkdir；同一selector转为1 passed，pytest0.50秒、
+守卫1.106秒、89.5MiB。原bootstrap创建的no-adopt、目录与叶身份门均不变，
+原准确路径require、service render/write/chmod、启动余量检查与首manager命令顺序不变；
+不以exist_ok放宽外来目录接纳，不增诊断、查询、额度或期限。
+
+只读复核该一行窄修及首命令屏障未见剩余具体P1/P2。完整七文件回归仍待根收取，
+本项绿只证明复用已拥有目录能走到首条manager命令之前；Native26真实artifact中的
+环境全true、cleanup verified事实保留，正式事务仍为零，不能写成Native27远端成功。
+作者未自行运行检查、Git、网络或真实服务；本次仅追加文档，生产与测试由根冻结验证。
+
+根随后实际收取完整七文件839 passed：pytest2.64秒、守卫3.271秒、159.2MiB、
+swap0；上述新增单项包含其中，不重复累计。三脚本沿原显式包路径、strict、
+no-incremental及explicit-package-bases通过（守卫5.358秒、290.4MiB）；
+全仓Ruff通过（76毫秒、26MiB），378文件格式检查通过（70毫秒、26.1MiB），
+新增测试格式无需改变。此为Native27离线完整相关回归，未替代下一精确远端运行的
+正式启动、事务和cleanup结果；文档再次冻结，作者未自行执行检查。
