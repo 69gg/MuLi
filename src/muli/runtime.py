@@ -47,6 +47,7 @@ from muli.providers import (
     ProviderError,
     ToolCall,
 )
+from muli.reminder_followup import followup_binding, task_status
 from muli.reminders import Reminders
 from muli.reply_origin import ReplyOrigin
 from muli.store import LifecycleKind, Store, new_id, now
@@ -1015,7 +1016,9 @@ class Runtime:
             ]
         }
         self._coordinator_tools.clear()
-        self._coordinator_tools.update({"reminder_schedule", "reminder_cancel"})
+        self._coordinator_tools.update(
+            {"reminder_schedule", "reminder_cancel", "reminder_reschedule"}
+        )
         self._tool_factories.clear()
         for factory, can_replace, coordinator, _ in self._tool_providers:
             self._apply_tool_provider(factory, replace=can_replace, coordinator=coordinator)
@@ -2057,6 +2060,21 @@ class Runtime:
         async def cancel_reminder(args: dict[str, Any]) -> Any:
             return {"deleted": self.reminders.delete(args["id"])}
 
+        async def reschedule_reminder(args: dict[str, Any]) -> Any:
+            self.maintenance.admission.require()
+            item = self.store.get("reminder", args["id"])
+            if item is None:
+                raise KeyError(args["id"])
+            binding = followup_binding(item)
+            if binding is not None and task_status(
+                self.store, binding["commitment_id"], self.config.settings.limits.max_output_chars
+            ) in {"done", "cancelled"}:
+                raise ValueError("已完成或已取消的目标不能重新约定复盘")
+            # No await between validating the current binding and the original update.
+            updated = self.reminders.update(args["id"], {"due_at": args["due_at"], "enabled": True})
+            await self.bus.emit("reminder.updated", updated)
+            return updated
+
         async def recall(args: dict[str, Any]) -> Any:
             return self.memory.search(str(args["query"]), 8)
 
@@ -2186,6 +2204,14 @@ class Runtime:
                 "删除指定提醒",
                 parameters({"id": string()}, ("id",)),
                 cancel_reminder,
+                "write",
+            ),
+            Tool(
+                "reminder_reschedule",
+                "将已有提醒改到未来 Unix 秒并重新启用；保留原 ID、历史和回复渠道。"
+                "先读取准确提醒 ID；周期提醒只改下一次时间，不撤回已经处理的通知。",
+                parameters({"id": string(), "due_at": {"type": "number"}}, ("id", "due_at")),
+                reschedule_reminder,
                 "write",
             ),
             Tool(

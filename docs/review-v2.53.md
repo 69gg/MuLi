@@ -23,3 +23,24 @@ handler同时核真实主身份、当前Task、工具执行上下文、run和Pre
 150源码strict通过，守卫8.284秒、417.5MiB；Ruff通过。格式检查只发现三个改动文件的纯格式差异，沿原formatter整理后397文件全部通过，没有语义变动或额外重复计数。离线锁检查83包通过，未下载依赖。离线wheel/sdist构建通过，守卫1.382秒、99.2MiB；版本、兼容声明、changelog及两包一致性通过，守卫181毫秒、19.3MiB，未覆盖旧release-notes。隔离离线wheel安装及原API/资产/生命周期检查通过，守卫1.273秒、99.4MiB。精确远端证据随后补录；候选尚未作为正式发行。
 
 测试仅使用临时数据、ASGI、锁定SDK和平台HTTP替身，没有操作真实桌面或账号。正常关闭重开不等于强杀窗口恢复；unknown不能判断平台已经收到还是没收到，不因重开自动猜测或重发。
+
+## 签名候选与远端检查
+
+签名候选 `c15dc4301392ff76c84049ea6c9ab7e14f96b401`（Good）的精确CI为
+[40073495288](https://github.com/69gg/MuLi/actions/runs/40073495288)。首attempt九项通过，
+仅Windows3.12作业 `120811795419` 失败于既有
+`test_channel_configuration_revocation_rejects_waiting_owner` 的make_runtime启动前置，
+尚未进入渠道或配置锁场景：有界格式读取elapsed1032毫秒（setup532、optional500），
+一条查询、零VM回调，触发原1秒保护。没有证据证明SQLite锁或底层调度的具体原因，
+不能称作已修复的生产问题。
+
+根先精确本地复验该用例及现有wall deadline/真实数据库锁拒绝两对照，3 passed、
+pytest0.41秒、守卫1.045秒、83.8MiB、swap0；保留原1秒门，不修改生产、跳过或
+延长期限。随后只请求一次该失败作业的同head复核，最终attempt2的十项全通过；
+首次失败记录保留，不写成首次十项全绿或声称已经解释那次墙钟耗时。
+
+PR [61](https://github.com/69gg/MuLi/pull/61) 于2026-10-24T07:36:05Z合并，
+签名标签 `v2.53.0` 验签Good并与main原子推送到同候选。正式发行流水线
+[40074781440](https://github.com/69gg/MuLi/actions/runs/40074781440) 正在运行，
+重复main CI `40074781266` 已确认最终cancelled，不计通过。正式发行与PyPI构件核对
+尚未收取终态，此时不称已正式发布；后续闭合证据单独补录。
