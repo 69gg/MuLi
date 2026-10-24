@@ -13,6 +13,7 @@ from muli.config import AttentionSettings
 from muli.file_inbox import FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState
 from muli.proactive import FrozenRouting
+from muli.reminder_followup import read_followup_notice
 from muli.runtime import Runtime
 from muli.store import now
 from muli.system_events import SystemEventsSettings, attention_source
@@ -130,6 +131,7 @@ class AttentionInbox:
             system_policy,
             chiliarch_policy=chiliarch_policy,
             file_inbox_policy=self._file_inbox_settings() if self._file_inbox_settings else None,
+            max_output_chars=self.runtime.config.settings.limits.max_output_chars,
         )
         if source is None:
             return None
@@ -147,16 +149,34 @@ class AttentionInbox:
             "file_inbox_proof": asdict(source.file_inbox_proof)
             if source.file_inbox_proof
             else None,
+            "reminder_proof": source.reminder_proof,
+            **({"followup": source.reminder_proof.binding()} if source.reminder_proof else {}),
         }
 
     @staticmethod
     def _content(records: list[dict[str, Any]]) -> str:
-        return _HEADER + json.dumps(
+        header = _HEADER
+        if any("followup" in record for record in records):
+            header += (
+                "其中 followup 是约定复盘的任务定位，不是执行授权。"
+                "先用 commitment_read 读取该任务最新完整要求，再用 commitment_inspect 的 deliveries 段"
+                "读取当前或历史验收目录及需要的准确单；缺资料如实说明。"
+                "区分登记时宿主文件事实、模型判断、未验事项和下一步，"
+                "不恢复、批准、派工、重发或自动发送文件。\n"
+            )
+        return header + json.dumps(
             [
                 {
                     key: value
                     for key, value in record.items()
-                    if key not in {"receipt_id", "routing", "producer_proof", "file_inbox_proof"}
+                    if key
+                    not in {
+                        "receipt_id",
+                        "routing",
+                        "producer_proof",
+                        "file_inbox_proof",
+                        "reminder_proof",
+                    }
                 }
                 for record in records
             ],
@@ -265,6 +285,17 @@ class AttentionInbox:
             ):
                 raise ValueError("注意事项策略已改变")
             for record in records:
+                reminder_proof = record["reminder_proof"]
+                if (
+                    reminder_proof is not None
+                    and read_followup_notice(
+                        self.store,
+                        reminder_proof.notice_id,
+                        self.runtime.config.settings.limits.max_output_chars,
+                    )
+                    != reminder_proof
+                ):
+                    raise _ProducerPolicyChanged("目标复盘约定已改变或任务已结束")
                 file_proof = record["file_inbox_proof"]
                 if file_proof is not None:
                     current_file = (

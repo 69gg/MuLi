@@ -1,6 +1,6 @@
-# 带证据的任务交付记录（2.48 候选审查）
+# 带证据的任务交付记录（2.48 审查与发行）
 
-2026-10-24，本片为未发行的 2.48.0 候选，源码、运行时、兼容声明及锁文件版本已同步。非作者静态审查覆盖 `task_delivery.py`、`local_services.py`、`task_inspection.py`、`task_file_publication.py`，以及 Runtime 保存实际工具结果时的 publication 增量、正式旅程与 reader/limits 回归。当前未发现必须修复的 P1/P2；下述本地整合与构件验证已完成，精确候选 CI 和发行核对仍未完成。实现合同及先红历史见[交付证据方案](task-delivery-evidence-proposal.md)。
+2026-10-24，2.48.0 已完成正式发行核对，精确源码为 `312f4abc1bc2e562829b64eaddece9fef6cb84dc`，结果见末节。非作者静态审查覆盖 `task_delivery.py`、`local_services.py`、`task_inspection.py`、`task_file_publication.py`，以及 Runtime 保存实际工具结果时的 publication 增量、正式旅程与 reader/limits 回归，未发现必须修复的 P1/P2。下述候选阶段本地验证与失败记录保留，发行闭合不替代真实外部账号联调。实现合同及先红历史见[交付证据方案](task-delivery-evidence-proposal.md)。
 
 ## 实际行为与权限边界
 
@@ -33,7 +33,18 @@
 
 前四行互不重叠，共 276 个测试节点；其中首行包含九条正式发布/登记旅程及六项 publication/reader 边界。此前历史小集与这些结果有重叠，不再累计。固定模型策略、临时 SQLite/文件和本地 ASGI 验证的是执行关联、证据保存、准入及读取合同，不是自然模型判断质量或真实平台送达。
 
-两项 `changed_copy/receipt_commit` 已取得上述实际通过终态：前者保持副本大小和持久元数据不变，只改变有效 UTF-8 字节，真实摘要核验拒绝登记；后者在单已写入当前事务后注入 receipt 写入失败，单、去重凭据与事件全部回滚。构建和安装均只使用现有本地运行时与依赖，不下载包或模型；构件位于临时目录，未修改真实用户数据。精确候选 CI、签名交付及最终发行核对另行记录，不据本地通过填写远端成功结论。
+两项 `changed_copy/receipt_commit` 已取得上述实际通过终态：前者保持副本大小和持久元数据不变，只改变有效 UTF-8 字节，真实摘要核验拒绝登记；后者在单已写入当前事务后注入 receipt 写入失败，单、去重凭据与事件全部回滚。构建和安装均只使用现有本地运行时与依赖，不下载包或模型；构件位于临时目录，未修改真实用户数据。候选阶段本地结果不单独构成远端发行成功证明；后续实际发行终态另记如下。
+
+## 正式发行闭合
+
+根已核对精确 `312f4abc1bc2e562829b64eaddece9fef6cb84dc` 的 [Release 40062974570](https://github.com/69gg/MuLi/actions/runs/40062974570) 共 13/13 job success。[GitHub v2.48.0](https://github.com/69gg/MuLi/releases/tag/v2.48.0) 为 `draft=false`、`prerelease=false`，发布时刻 `2026-10-24T04:44:46Z`。PyPI 两个发行文件均未 yanked，逐文件 size 与 SHA-256 同 GitHub 构件完全一致：
+
+| 构件 | 字节数 | SHA-256 |
+| --- | --- | --- |
+| wheel | 829646 | `1e42601b95e43778d2dee00f5fe55a926edc423a3a53186be53092ce288630a9` |
+| sdist | 4351959 | `f73f0f57f4cb752f2feb5d613d4fdcb22c0053e277f38e23439960b125c67d38` |
+
+本节仅在后续工作树记录已经取得的发行实证，没有改写已签名 tag，也没有据此新增真实模型、账号或平台送达的验收声明。
 
 ## 仍有边界
 

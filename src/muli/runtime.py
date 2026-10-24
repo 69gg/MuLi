@@ -168,7 +168,12 @@ class Runtime:
         self._system_logger.addHandler(logging.NullHandler())
         self.system_logger: SystemLogger | None = None
         self.memory = Memory(self.store)
-        self.reminders = Reminders(self.store, self.bus, admission=self.maintenance.admission)
+        self.reminders = Reminders(
+            self.store,
+            self.bus,
+            admission=self.maintenance.admission,
+            max_output_chars=lambda: self.config.settings.limits.max_output_chars,
+        )
         self.conversation = Conversation(self.store)
         self.context_hooks: list[ContextHook] = []
         self.skills_context: ContextHook | None = None
@@ -1010,6 +1015,7 @@ class Runtime:
             ]
         }
         self._coordinator_tools.clear()
+        self._coordinator_tools.update({"reminder_schedule", "reminder_cancel"})
         self._tool_factories.clear()
         for factory, can_replace, coordinator, _ in self._tool_providers:
             self._apply_tool_provider(factory, replace=can_replace, coordinator=coordinator)
@@ -2165,6 +2171,9 @@ class Runtime:
                         "content": string(),
                         "due_at": {"type": "number"},
                         "interval_seconds": {"type": "integer", "minimum": 60},
+                        "commitment_id": string(
+                            "可选：关联已有任务，到期只读最新要求及交付依据，不执行任务"
+                        ),
                     },
                     ("title", "due_at"),
                 ),
