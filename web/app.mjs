@@ -58,7 +58,7 @@ const state = {
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
   timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
-  team: { members: [], messages: [] }, recordQuery: "",
+  team: { members: [], messages: [] }, recordQuery: "", approvals: [], approvalsError: "",
   auth: { required: false, authenticated: false },
 };
 let sessionController = null;
@@ -191,15 +191,18 @@ function connectionCurrent(owner) {
 
 function invalidateConnection() {
   const owner = connection; connection = null;
-  owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.controller.abort();
+  owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
   teamPager.invalidate?.();
   state.connected = false; state.streamConnected = false;
+  state.approvals = []; state.approvalsError = "";
+  $("#approval-region")?.replaceChildren();
+  if (state.view === "notifications" && state.notificationTab === "approvals") $("#other-view")?.replaceChildren();
 }
 
 function beginConnection() {
   invalidateConnection();
-  const owner = { controller: new AbortController(), ready: false, position: "0" };
+  const owner = { controller: new AbortController(), ready: false, position: "0", approvalDecisions: new Set(), approvalEpoch: null };
   connection = owner;
   owner.sessions = createSummaryLane({
     current: () => connectionCurrent(owner), read: () => ownedRequest("/sessions", {}, owner),
@@ -215,8 +218,24 @@ function beginConnection() {
     current: () => connectionCurrent(owner), read: () => ownedRequest("/notifications", {}, owner),
     publish: (payload) => {
       state.notifications = collection(payload); renderChrome();
-      if (state.view === "notifications") renderOtherView();
+      if (state.view === "notifications" && state.notificationTab !== "approvals") renderOtherView();
     },
+  });
+  owner.approvals = createSummaryLane({
+    current: () => connectionCurrent(owner),
+    read: async () => {
+      const epoch = owner.approvalEpoch;
+      try { return { epoch, payload: await ownedRequest("/approvals", { cache: "no-store" }, owner) }; }
+      catch (error) { return { epoch, error }; }
+    },
+    publish: ({ epoch, payload, error }) => {
+      if (epoch !== owner.approvalEpoch) return;
+      if (error) throw error;
+      const items = payload?.items;
+      if (!Array.isArray(items) || items.some((item) => !item || typeof item.id !== "string" || !item.id || typeof item.session_id !== "string" || !item.session_id || typeof item.run_id !== "string" || !item.run_id || typeof item.tool !== "string" || typeof item.reason !== "string" || item.status !== "pending" || !item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) || new Set(items.map((item) => item.id)).size !== items.length) throw new Error("审批目录无效，请刷新。");
+      state.approvals = items; state.approvalsError = ""; renderApprovalViews();
+    },
+    failed: (error) => { state.approvals = []; state.approvalsError = error.message; renderApprovalViews(); },
   });
   return owner;
 }
@@ -331,9 +350,11 @@ function renderChrome() {
   $("#connection-banner").hidden = !warning;
   $("#connection-banner-text").textContent = !state.connected ? "服务暂未连接，输入内容会保留。" : "实时连接中断，正在重新连接。";
   const unread = state.notifications.filter((item) => !item.read).length;
-  $("#notification-count").hidden = !unread;
-  $("#notification-count").textContent = String(unread);
-  $("#inbox-attention").hidden = !unread;
+  const needsAttention = unread + state.approvals.length;
+  $("#notification-count").hidden = !needsAttention;
+  $("#notification-count").textContent = String(needsAttention);
+  $("#notification-count").setAttribute("aria-label", `${unread} 条未读通知，${state.approvals.length} 项待批准`);
+  $("#inbox-attention").hidden = !needsAttention && !state.approvalsError;
   $("#chat-view").hidden = state.view !== "chat";
   $("#management-shell").hidden = state.view === "chat";
   $("#settings-toggle").setAttribute("aria-pressed", String(state.view !== "chat"));
@@ -443,20 +464,43 @@ function renderChat() {
   renderTimeline();
 }
 
+function approvalCard(approval) {
+  const session = state.sessions.find((item) => item.id === approval.session_id);
+  return element("section", { class: "approval-item", dataset: { id: approval.id }, "aria-label": "工具审批" },
+    element("div", { class: "approval-heading" }, icon("shield"), "需要你的批准"),
+    element("h3", { text: approval.tool }),
+    element("div", { class: "row-meta" }, session?.title && element("span", { text: session.title }), element("span", { text: `会话 ${approval.session_id}` }), element("span", { text: `运行 ${approval.run_id}` })),
+    approval.reason && element("p", { text: approval.reason }),
+    element("pre", { text: pretty(approval.arguments) }),
+    element("div", { class: "approval-actions" }, actionButton("拒绝", "approval", "secondary-button", undefined, { id: approval.id, decision: "reject" }), actionButton("批准执行", "approval", "primary-button", "check", { id: approval.id, decision: "approve" })));
+}
+
+function renderApprovalViews() {
+  const focused = document.activeElement?.closest?.(".approval-item");
+  const focus = focused ? { id: focused.dataset.id, decision: document.activeElement.dataset.decision } : null;
+  renderApprovals(); renderChrome();
+  if (state.view === "notifications" && state.notificationTab === "approvals") renderOtherView();
+  if (focus) {
+    const root = state.view === "chat" ? $("#approval-region") : $("#other-view");
+    const buttons = $$('[data-action="approval"]', root).filter((button) => !button.disabled);
+    const target = buttons.find((button) => button.dataset.id === focus.id && button.dataset.decision === focus.decision) ?? buttons[0] ?? (state.view === "chat" ? $("#message-input") : $('[data-notification-tab="approvals"]', root));
+    target?.focus({ preventScroll: true });
+  }
+}
+
 function renderApprovals() {
   const region = $("#approval-region");
+  if (state.approvalsError) {
+    region.replaceChildren(element("div", { class: "approval-error", role: "status" }, element("p", { text: state.approvalsError }), actionButton("刷新待批准", "refresh-approvals", "text-button", "refresh"))); return;
+  }
+  $(".approval-error", region)?.remove();
   const existing = new Map($$(".approval-item", region).map((node) => [node.dataset.id, node]));
-  const ids = new Set(state.session.approvals.map((item) => String(item.id)));
+  const ids = new Set(state.approvals.map((item) => item.id));
   for (const [id, node] of existing) if (!ids.has(id)) node.remove();
-  for (const approval of state.session.approvals) {
-    if (existing.has(String(approval.id))) continue;
-    const node = element("section", { class: "approval-item", dataset: { id: approval.id }, "aria-label": "工具审批" },
-      element("div", { class: "approval-heading" }, icon("shield"), "需要你的批准"),
-      element("h3", { text: typeof approval.tool === "string" ? approval.tool : approval.tool?.name ?? "工具调用" }),
-      approval.reason && element("p", { text: approval.reason }),
-      element("pre", { text: pretty(approval.arguments) }),
-      element("div", { class: "approval-actions" }, actionButton("拒绝", "approval", "secondary-button", undefined, { id: approval.id, decision: "reject" }), actionButton("批准执行", "approval", "primary-button", "check", { id: approval.id, decision: "approve" })));
-    region.append(node);
+  for (const approval of state.approvals) {
+    const node = existing.get(approval.id) ?? approvalCard(approval);
+    if (!existing.has(approval.id)) region.append(node);
+    $$("button", node).forEach((button) => { button.disabled = !!connection?.approvalDecisions.has(approval.id); });
   }
 }
 
@@ -506,6 +550,11 @@ function refreshNotifications(owner = connection) {
   return owner?.notifications.request() ?? Promise.resolve(false);
 }
 
+function refreshApprovals(owner = connection) {
+  if (owner) owner.approvalEpoch = Symbol();
+  return owner?.approvals.request() ?? Promise.resolve(false);
+}
+
 async function connect() {
   const owner = beginConnection();
   state.loading = true; $(".app-shell").inert = true; renderChrome();
@@ -525,9 +574,9 @@ async function connect() {
     state.connected = false; state.loading = false; renderChrome(); renderComposer();
     return;
   }
-  const notifications = refreshNotifications(owner), sessions = refreshSessions(owner);
-  owner.notifications.start(); owner.sessions.start();
-  const results = await Promise.allSettled([ownedRequest("/status", {}, owner), ownedRequest("/conversation", {}, owner), notifications, sessions, ownedRequest("/uploads", {}, owner)]);
+  const notifications = refreshNotifications(owner), sessions = refreshSessions(owner), approvals = refreshApprovals(owner);
+  owner.notifications.start(); owner.sessions.start(); owner.approvals.start();
+  const results = await Promise.allSettled([ownedRequest("/status", {}, owner), ownedRequest("/conversation", {}, owner), notifications, sessions, ownedRequest("/uploads", {}, owner), approvals]);
   if (!connectionCurrent(owner)) return;
   if (results[0].status === "fulfilled") {
     state.status = results[0].value; state.connected = true;
@@ -569,15 +618,16 @@ function waitToReconnect(milliseconds, signal) {
   });
 }
 
-async function subscribe(path, controller, { cursor = "", onEvent, reportConnection = false, owner = connection } = {}) {
+async function subscribe(path, controller, { cursor = "", onEvent, onReconnect = () => {}, reportConnection = false, owner = connection } = {}) {
   let delay = 1000;
   let after = cursor;
+  let opened = false;
   const current = () => connectionCurrent(owner) && !controller.signal.aborted;
   while (current()) {
     try {
       await readEvents(path, {
         signal: controller.signal, after,
-        onOpen: () => { if (!current()) return; delay = 1000; if (reportConnection) { state.streamConnected = true; renderChrome(); } },
+        onOpen: () => { if (!current()) return; delay = 1000; if (opened) onReconnect(); opened = true; if (reportConnection) { state.streamConnected = true; renderChrome(); } },
         onEvent: (event) => { if (!current()) return; onEvent(event); if (event.id !== undefined && event.id !== null) after = String(event.id); },
         onId: (id) => { if (current()) after = id; },
       });
@@ -596,7 +646,11 @@ function startGlobalEvents(owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   globalController?.abort();
   globalController = new AbortController();
-  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onEvent: (event) => {
+  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onReconnect: () => { void refreshApprovals(owner); }, onEvent: (event) => {
+    if (event.type === "approval.resolved" && typeof event.data?.id === "string") {
+      state.approvals = state.approvals.filter((item) => item.id !== event.data.id); renderApprovalViews();
+    }
+    if (event.type.startsWith("approval.") || ["run.completed", "run.failed", "run.cancelled", "session.recovered"].includes(event.type)) void refreshApprovals(owner);
     if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested", "attention.queued", "ingress.cancelled"].includes(event.type)) void refreshNotifications(owner);
     if (event.type.startsWith("run.") || event.type.startsWith("session.")) void refreshSessions(owner);
     if (event.type === "workflow.updated") {
@@ -892,14 +946,24 @@ async function sendMessage(event) {
 }
 
 async function approve(id, decision, button) {
-  const node = button.closest(".approval-item");
-  const sessionId = state.activeSession?.id;
-  $$("button", node).forEach((item) => item.disabled = true);
+  const owner = connection;
+  const approval = state.approvals.find((item) => item.id === id);
+  const region = state.view === "chat" ? $("#approval-region") : state.view === "notifications" && state.notificationTab === "approvals" ? $("#other-view") : null;
+  if (!connectionCurrent(owner) || !approval || !region?.contains(button) || owner.approvalDecisions.has(id) || !["approve", "reject"].includes(decision) || button.closest(".approval-item")?.dataset.id !== id) return;
+  owner.approvalDecisions.add(id); renderApprovalViews();
   try {
-    await request(`/approvals/${encodeURIComponent(id)}`, { method: "POST", body: { decision } });
-    if (state.activeSession?.id === sessionId) state.session = applyEvent(state.session, { type: "approval.resolved", data: { id, decision } });
-    renderChat(); toast(decision === "approve" ? "已批准执行" : "已拒绝本次调用");
-  } catch (error) { showError(error); $$("button", node).forEach((item) => item.disabled = false); }
+    const result = await ownedRequest(`/approvals/${encodeURIComponent(id)}`, { method: "POST", body: { decision } }, owner);
+    if (result?.resolved !== true) throw new Error("审批回执无效，请刷新确认。");
+    state.approvals = state.approvals.filter((item) => item.id !== id);
+    if (state.activeSession?.id === approval.session_id) state.session = applyEvent(state.session, { type: "approval.resolved", data: { id, decision } });
+    renderApprovalViews(); toast(decision === "approve" ? "已批准执行" : "已拒绝本次调用");
+    await refreshApprovals(owner);
+  } catch (error) {
+    if (connectionCurrent(owner)) { showError(error); await refreshApprovals(owner); }
+  } finally {
+    owner.approvalDecisions.delete(id);
+    if (connectionCurrent(owner)) renderApprovalViews();
+  }
 }
 
 async function stopRun(button) {
@@ -1016,10 +1080,12 @@ async function switchView(view, owner = connection) {
       state.memoryGraph = results[1].status === "fulfilled" ? results[1].value : { nodes: [], edges: [] };
     }
     if (view === "notifications") {
-      const results = await Promise.allSettled([refreshNotifications(owner), ownedRequest("/reminders", {}, owner)]);
+      const results = await Promise.allSettled([refreshNotifications(owner), ownedRequest("/reminders", {}, owner), refreshApprovals(owner)]);
       if (!current()) return;
-      if (results[0].status === "rejected") throw results[0].reason;
-      if (!results[0].value) throw owner.notifications.error ?? new Error("通知暂时无法读取，请重试。");
+      if (state.notificationTab !== "approvals") {
+        if (results[0].status === "rejected") throw results[0].reason;
+        if (!results[0].value) throw owner.notifications.error ?? new Error("通知暂时无法读取，请重试。");
+      }
       state.reminders = results[1].status === "fulfilled" ? collection(results[1].value) : [];
       state.remindersError = results[1].status === "rejected" ? results[1].reason.message : "";
     }
@@ -2070,8 +2136,19 @@ async function runWorkflow(id, button) {
 function renderNotifications() {
   const unread = state.notifications.filter((item) => !item.read).length;
   const reminders = state.notificationTab === "reminders";
-  const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "通知视图" }, ...[["inbox", "收件箱"], ["reminders", "提醒"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.notificationTab === key ? "active" : "", text: label, "aria-selected": String(state.notificationTab === key), dataset: { notificationTab: key } })));
-  const root = element("div", { class: "view-content" }, viewHeading("通知", reminders ? "到时间，在这里收到提醒。" : unread ? `${unread} 条未读通知。` : "任务结果与需要处理的消息。", reminders ? actionButton("新建提醒", "new-reminder", "primary-button", "plus") : unread ? actionButton("全部已读", "read-all", "secondary-button", "check") : undefined), tabs);
+  const approvals = state.notificationTab === "approvals";
+  const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "通知视图" }, ...[["inbox", "收件箱"], ["approvals", `待批准${state.approvals.length ? ` ${state.approvals.length}` : ""}`], ["reminders", "提醒"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.notificationTab === key ? "active" : "", text: label, "aria-selected": String(state.notificationTab === key), dataset: { notificationTab: key } })));
+  const root = element("div", { class: "view-content" }, viewHeading("通知", approvals ? "主助手与队友等待你的决定。" : reminders ? "到时间，在这里收到提醒。" : unread ? `${unread} 条未读通知。` : "任务结果与需要处理的消息。", approvals ? actionButton("刷新", "refresh-approvals", "secondary-button", "refresh") : reminders ? actionButton("新建提醒", "new-reminder", "primary-button", "plus") : unread ? actionButton("全部已读", "read-all", "secondary-button", "check") : undefined), tabs);
+  if (approvals) {
+    if (state.approvalsError) root.append(emptyState("info", "暂时无法读取待批准", state.approvalsError));
+    else if (!state.approvals.length) root.append(emptyState("shield", "暂无待批准", "当前没有正在等待的工具调用。"));
+    for (const item of state.approvals) {
+      const node = approvalCard(item);
+      $$("button", node).forEach((button) => { button.disabled = !!connection?.approvalDecisions.has(item.id); });
+      root.append(node);
+    }
+    return root;
+  }
   if (reminders) { root.append(renderReminders()); return root; }
   root.append(element("div", { class: "list-caption" }, `${state.notifications.length} 条通知`, "收件箱"));
   if (!state.notifications.length) root.append(emptyState("inbox", "通知已清空", "任务完成或需要处理时，会显示在这里。"));
@@ -2622,6 +2699,7 @@ async function handleAction(action, button) {
   if (action === "scroll-bottom") scrollToBottom(true, true);
   if (action === "stop") await stopRun(button);
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
+  if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") $("#app-dialog").close();
   if (action === "copy-message") {
     const message = state.session.messages.find((item) => String(item.id) === button.dataset.id);
