@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hashlib
 import json
 import math
@@ -16,6 +17,7 @@ import sysconfig
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import closing
+from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
@@ -3152,6 +3154,255 @@ def write_latest(store: Store, record: TransactionRecordV2) -> None:
         )
 
 
+def helper_costs_facts(value: object, source: object) -> bool:
+    """The optional observer has no authority beyond the existing helper proof."""
+    if not isinstance(value, dict):
+        return False
+    if value.get("code") == "not_observed":
+        return set(value) == {"code", "reason"} and value.get("reason") in (
+            "unavailable",
+            "identity_changed",
+            "output_budget",
+        )
+    identity = {"generation", "helper", "uid", "pid", "invocation"}
+    if (
+        not isinstance(source, dict)
+        or set(source) != identity
+        or set(value) != identity | {"version", "code", "checks", "bus", "http"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["code"] != "observed"
+        or any(
+            type(value[key]) is not type(source[key]) or value[key] != source[key]
+            for key in identity
+        )
+    ):
+        return False
+    return all(
+        isinstance(value[name], dict)
+        and set(value[name]) == {"count", "total_ms"}
+        and all(type(item) is int and 0 <= item <= 2**63 - 1 for item in value[name].values())
+        for name in ("checks", "bus", "http")
+    )
+
+
+def install_helper_cost_hook() -> None:
+    """Observe only the exact isolated helper; never change its control flow."""
+    try:
+        from muli.managed_host import managed_helper_unit_name
+        from muli.managed_transaction import TransactionRecordV2
+        from muli.management_transaction import TransactionJournal
+        from muli.platforms.linux_transaction import SystemdProbe
+        from muli.platforms.managed_backend import ManagedLinuxBackend
+
+        prefix = Path(sys.prefix)
+        root = prefix.parent
+        require(prefix.name in {"a", "b"}, "native_profile_role")
+        require(
+            sys.executable == str(prefix / "bin/python")
+            and sys.orig_argv
+            == [
+                sys.executable,
+                "-I",
+                "-m",
+                "muli.management_helper",
+                str(root / "data/management/transaction-v1"),
+            ],
+            "native_profile_arguments",
+        )
+        fixture(root)
+        info = root.lstat()
+        require(
+            stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+            "native_profile_owner",
+        )
+        invocation = os.environ.get("INVOCATION_ID", "")
+        require(
+            re.fullmatch(r"[a-f0-9]{32}", invocation) is not None and invocation != "0" * 32,
+            "native_profile_invocation",
+        )
+        with TransactionJournal(
+            root / "data/management/transaction-v1", root / "data/muli.sqlite3", create=False
+        ) as journal:
+            record = journal.read_current()
+        require(isinstance(record, TransactionRecordV2), "native_profile_record")
+        assert isinstance(record, TransactionRecordV2)
+        facts: dict[str, Any] = {
+            "version": 1,
+            "code": "observed",
+            "generation": record.generation,
+            "helper": managed_helper_unit_name(record),
+            "uid": os.geteuid(),
+            "pid": os.getpid(),
+            "invocation": invocation,
+        }
+        counts = {name: 0 for name in ("checks", "bus", "http")}
+        totals = {name: 0.0 for name in counts}
+        usable, saved = True, False
+        clock = time.perf_counter
+
+        def begin() -> float | None:
+            nonlocal usable
+            try:
+                started = clock()
+                if not math.isfinite(started):
+                    raise ValueError
+                return started
+            except Exception:
+                usable = False
+                return None
+
+        def finish(name: str, started: float | None) -> None:
+            nonlocal usable
+            try:
+                if started is None:
+                    return
+                elapsed = clock() - started
+                if not math.isfinite(elapsed) or elapsed < 0:
+                    raise ValueError
+                counts[name] += 1
+                totals[name] += elapsed
+            except Exception:
+                usable = False
+
+        original_check = ManagedLinuxBackend._check
+        original_command = SystemdProbe._command
+        original_request = ManagedLinuxBackend._request
+
+        @wraps(original_check)
+        def check(*args: Any, **kwargs: Any) -> None:
+            started = begin()
+            try:
+                return original_check(*args, **kwargs)
+            finally:
+                finish("checks", started)
+
+        @wraps(original_command)
+        async def command(*args: Any, **kwargs: Any) -> str:
+            started = begin()
+            try:
+                return await original_command(*args, **kwargs)
+            finally:
+                finish("bus", started)
+
+        @wraps(original_request)
+        async def request(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+            started = begin()
+            try:
+                return await original_request(*args, **kwargs)
+            finally:
+                finish("http", started)
+
+        def save() -> None:
+            nonlocal saved
+            if saved:
+                return
+            saved = True
+            try:
+                if not usable:
+                    return
+                for name, elapsed in totals.items():
+                    facts[name] = {"count": counts[name], "total_ms": int(elapsed * 1000)}
+                source = {
+                    key: facts[key] for key in ("generation", "helper", "uid", "pid", "invocation")
+                }
+                require(helper_costs_facts(facts, source), "native_profile_invalid")
+                data = json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
+                require(len(data) <= MAX_BYTES, "native_metadata_budget")
+                temporary = root / "helper-costs.tmp"
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                )
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.replace(root / "helper-costs.json")
+                directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except Exception:
+                pass  # Observation never replaces the real helper's outcome.
+
+        atexit.register(save)
+        ManagedLinuxBackend._check = check
+        SystemdProbe._command = command
+        ManagedLinuxBackend._request = request
+    except Exception:
+        return  # A missing observer must not prevent the original helper starting.
+
+
+def collect_helper_costs(
+    root: Path, result: dict[str, Any], *, deadline: float | None = None
+) -> None:
+    """One same-UID local read at case settlement, never a manager query."""
+    facts: dict[str, Any] = {"code": "not_observed", "reason": "unavailable"}
+    try:
+        if deadline is not None:
+            remaining(deadline)
+        source = result["resources"].get("helper_source")
+        descriptor = os.open(
+            root / "helper-costs.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            require(
+                stat.S_ISREG(before.st_mode)
+                and before.st_uid == os.geteuid()
+                and not before.st_mode & 0o077
+                and before.st_nlink == 1
+                and before.st_size <= MAX_BYTES,
+                "native_profile_owner",
+            )
+            data = stream.read(MAX_BYTES + 1)
+            after = os.fstat(stream.fileno())
+            current = (root / "helper-costs.json").lstat()
+            fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            require(
+                len(data) <= MAX_BYTES
+                and all(
+                    getattr(before, field) == getattr(after, field) == getattr(current, field)
+                    for field in fields
+                ),
+                "native_profile_changed",
+            )
+
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
+            for key, item in pairs:
+                require(key not in value, "native_profile_invalid")
+                value[key] = item
+            return value
+
+        value = json.loads(data, object_pairs_hook=unique)
+        if deadline is not None:
+            remaining(deadline)
+        if helper_costs_facts(value, source) and value.get("code") == "observed":
+            facts = value
+        else:
+            facts["reason"] = "identity_changed"
+    except Exception:
+        pass
+    result["resources"]["helper_costs"] = facts
+    if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+        result["resources"]["helper_costs"] = {"code": "not_observed", "reason": "output_budget"}
+        if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+            result["resources"].pop("helper_costs")
+
+
 def install_hook() -> None:
     """Wrap only the app factory; the real bootstrap and health path stay intact."""
     from fastapi import FastAPI
@@ -3893,6 +4144,13 @@ async def run(mode: str, root: Path) -> int:
             write_json(root / "result.json", case.result)
         print("native_" + mode + "_failed:" + case.stage + ":" + code, file=sys.stderr)
         return 1
+    finally:
+        if mode != "cleanup":
+            try:
+                collect_helper_costs(root, case.result, deadline=case.drive_deadline)
+                write_json(root / "result.json", case.result)
+            except Exception:
+                pass  # Optional observation cannot replace the case's first outcome.
 
 
 def main() -> int:

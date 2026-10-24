@@ -1399,6 +1399,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "setup_accounting",
             "helper_source",
             "controller_failure",
+            "helper_costs",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1438,6 +1439,19 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             )
         elif name == "controller_failure":
             valid = controller_failure_facts(facts, value)
+        elif name == "helper_costs":
+            source = resources.get("helper_source")
+            valid = resource_worker().helper_costs_facts(facts, source) is True
+            if isinstance(facts, dict) and facts.get("code") == "observed":
+                valid = (
+                    valid
+                    and helper_source_facts(source)
+                    and any(
+                        row["generation"] == facts["generation"]
+                        and row["helper"] == facts["helper"]
+                        for row in history
+                    )
+                )
         elif name == "manager_failure":
             valid = manager_failure_facts(facts)
         elif name == "manager_readiness":
@@ -2406,7 +2420,13 @@ class NativeCI:
         shutil.copyfile(worker, self.volume / "managed_native_worker.py")
         (self.volume / "_muli_native_ci_hook.py").write_text(
             "import sys\nif sys.argv[-1:] == ['serve']:\n"
-            "    from managed_native_worker import install_hook\n    install_hook()\n",
+            "    from managed_native_worker import install_hook\n    install_hook()\n"
+            "elif sys.orig_argv[1:4] == ['-I', '-m', 'muli.management_helper']:\n"
+            "    try:\n"
+            "        from managed_native_worker import install_helper_cost_hook\n"
+            "        install_helper_cost_hook()\n"
+            "    except Exception:\n"
+            "        pass\n",
             encoding="utf-8",
         )
         self.sudo(
@@ -2604,6 +2624,20 @@ class NativeCI:
             and controller_failure_facts(controller_failure, result)
         ):
             result["resources"]["controller_failure"] = controller_failure
+        if (
+            "helper_costs" in result["resources"]
+            and len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+            > OUTPUT_BYTES
+        ):
+            result["resources"]["helper_costs"] = {
+                "code": "not_observed",
+                "reason": "output_budget",
+            }
+            if (
+                len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+                > OUTPUT_BYTES
+            ):
+                result["resources"].pop("helper_costs")
         write_json(self.root / "result.json", result)
         return result
 

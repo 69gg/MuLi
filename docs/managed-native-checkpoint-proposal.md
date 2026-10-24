@@ -1395,3 +1395,78 @@ bootstrap、managed controller和controller failure diagnostic共214个不同节
 剩余P1/P2；根也完成整合审查。当前仅本地候选闭合，尚未提交或取得Native35远端
 结果，不称正式事务恢复；已知cleanup所有权P2仍未修，Native34现场原始InvocationID
 值仍未导出，官方空数组规则与离线反例不代替该现场原值证据。源码和测试继续冻结。
+
+### Native36：隔离helper只观测成本（先短合同与目标回归）
+
+Native35的CI `40079919254` 最终completed/failure：十个通用作业全success，
+仅managed-native job `120831141125` 失败。根严格校验artifact `12555011711`
+（1903字节，SHA-256 `e6580c4f1fa882abd5ede1e80e70644ac76e17bd4c8f74455460724f19c3ff2e`）。
+本轮已真实通过adopt：origin ready5800毫秒、prepared7446、draining14891、stop_base
+20486、install_target25559、start_target38898、verifying48924、committed51122、
+released57336、新boot精确projection58751，随后prepare switch58752、Case60001
+TimeoutError。真实target PID2853、新boot `d5833f80dbe8439797b40cf4b1df4806`；
+不再是_snapshot失败，但不能把adopt成功称三次事务全部完成。controller failure此时
+not_observed/unavailable，cleanup仍三mount、用户/组未删除，不能称清理成功。
+
+先不凭上述阶段差值归因，也不做碎片微优化。仅沿既有复制runtime的fixture.pth/
+`_muli_native_ci_hook`增加独立helper观测分支，与serve工厂hook分离：严格匹配
+`sys.orig_argv` 的私有a或b解释器、`-I -m muli.management_helper`及固定本root journal；
+复用真实fixture UID/root、journal generation和派生helper名，绑定本进程PID及非零
+INVOCATION_ID。不修改生产包文件、controller决策、任何proof/guard、60秒及原资源门。
+
+只包原 `ManagedLinuxBackend._check`、`SystemdProbe._command`、
+`ManagedLinuxBackend._request` 三个函数，分别计checks/bus/http的count和累计total_ms；
+前者同步核包/anchor，后两者为原async命令及HTTP proof等待。调用原函数并原样返回
+或重新传播原异常，perf_counter仅在finally累加，统计失败不得改变原控制流。三类
+没有互相嵌套调用，不另计整observe，避免把包含成本相加。它们不是整个事务的完整
+耗时分解，也不能从某类等待时间推断外部命令的CPU耗时。
+
+进程内累加，atexit最多一次向本fixture根固定 `helper-costs.json` 原子写入私有有界
+JSON；每次函数调用不写文件。固定exact shape为version1、code=observed、generation、
+helper、uid、pid、invocation，以及checks/bus/http各exact `{count,total_ms}`，数值
+严格非bool非负64位整数，无argv/路径/message/环境/正文。文件写入不计入这三类
+函数耗时，仍消耗原真实整体期限；没有新RPC、模型、poll、重试或额外额度。被杀、
+尚未退出、写入失败或文件/身份无效均无可用数据，不能冒充三项零值。
+
+root原collect接缝只接受严格类型/字节门并与本次独立已核helper_source精确匹配的
+统计（generation/helper/UID/PID/invocation）；旧文件、任意同名JSON不得给出observed。
+加入resources.helper_costs仍须原最终32KiB门；旧结果缺字段仍兼容，不补假零。
+统计不参与任何效果授权。当前先写一个小目标：实际NativeCI.prepare生成的hook在
+受控helper orig_argv下装载，复用真实临时Host/Journal及原backend._check，确认一次
+实际hash成功、一次真实stale_revision拒绝都保持原语义；显式触发截获的atexit回调
+才出现准确计数文件。无未来API/import前置红，不宣称真实-I进程、systemd或现场
+性能已验证。目标为
+`tests/test_managed_native_helper_costs.py::test_generated_helper_hook_measures_real_checks_without_changing_their_result`。
+根已实收该准确目标1 failed（pytest0.38秒、守卫1.033秒、65.4MiB、swap0）：
+实际prepare生成hook、真实_check成功与stale_revision拒绝前置均通过，唯一失败为
+atexit callbacks实际0，缺少观测注册。随后根授权fixture两脚本最小实现，不改生产包。
+
+候选现已接入独立helper分支：初始化全部在局部受控try内，失败不阻止原helper；
+三函数的返回、异常和取消均原样转发，计时自身失败只撤统计，atexit先标已尝试、
+最多一次写入固定私有原子文件。原serve工厂分支保持不变。因为volume已交新UID且
+0700，runner不另起sudo读统计：原同UID worker在drive成功或异常结算时一次读取
+NOFOLLOW普通文件，核owner、mode、nlink、字节及前后文件身份，与原helper_source
+五项逐值匹配，沿原result.json的单次cat导出；仍受原execute绝对截止，不新建期限。
+父fixture_result复用同一严格统计validator并再核helper_source及本轮history。
+不存在、未退出、被强杀、坏JSON/重复键、身份或文件漂移都不能输出假零。
+加入统计若使原最终投影超过32KiB，仅撤统计为固定not_observed/output_budget；
+连该短标记也放不下则省略可选字段，原其它proof完整保留、旧缺字段结果仍可读。
+policy回归另覆盖身份五项不符、布尔/负值/额外字段/超64位/缺项、缺文件/软链/
+公开权限/超额/坏JSON、原32KiB临界不裁proof及初始化拒绝保持原函数。
+
+根串行实收新增20项首组19 passed/1夹具失败：预算夹具的64行固定填充实际仍能容下
+完整统计，没有达到所声称的字节边界。仅将夹具改为在原合法字段/100字符上限内
+填充两列，并先断言实际字节贴近原32768上限；生产预算与裁剪逻辑不改。
+新20项随后全通过（pytest0.33秒、守卫0.884秒、67.5MiB、swap0），与九组既有
+native fixture回归合计916个不同节点通过（pytest18.26秒、守卫18.925秒、
+168.7MiB、swap0）。Ruff发现的常量setattr及fixture导入整理后，新20项再过；
+全Ruff与383文件格式通过。生产包未改，不重复跑上一片已过的146源码strict。
+非作者及根后审未发现剩余P1/P2；没有本机真实systemd、用户或桌面效果。
+精确签名候选的远端native现场及统计仍待收取，不预写性能归因或整套成功。
+修后只静态读回，待根目标转绿、相关整合、strict和非作者审；作者未执行检查、
+格式、Git、网络或真实服务，不预写现场性能结果。
+
+已知cleanup P2另行保留，不在36实施。现有fixture hook也可在未来仅观察
+ConfigurationFile.replace的真实返回snapshot，继承初次O_EXCL的当前unit birth；
+confirm不能领养，丢回包或凭据写失败必须保留fail。此可能路径无需改生产源码，
+但其发布/清理负控尚未实施，本片统计不能冒称清理所有权已经解决。
