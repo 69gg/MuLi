@@ -1,6 +1,8 @@
 # 手机调整后，独立完成回报仍回发令私聊
 
-2026-10-24。基线为 `5a5ae91`。2.47原候选已完成本地实现、十二参数旅程、21个相关文件411项整合及独立后审，类型、格式和离线构件检查通过，见[本地闭合记录](review-v2.47.md#最终候选准备)。精确 PR #55 首轮 CI 的 Windows 3.12/3.13 两个 job 中，十二参数均在真实完成报告门控超时；受控 ASCII 默认编码复现确认是夹具读取 UTF-8 草稿时未指定编码。仅修两处读取，保留3秒期限和有限诊断后，根实收ASCII十二参数及正常环境十九项相关回归通过；新签名候选CI和发行仍待完成，详见[失败记录](review-v2.47.md#已观察的失败)。历史首轮先冻结的 sent、blocked、unknown 三条真实旅程均在最终手机7完成说明 outbox 为0处失败，3 failed in 1.50秒；守卫2.420秒、117.7MiB、swap0、exit1。2.46 已发布当前主运行的重规划说明回手机，其本身的证据不覆盖本片独立完成回报，也不等于真实平台送达。
+2026-10-24。2.47.0 已发行，最终精确签名提交为 `17f50d7d7260e02f90954a5a2a9e2a75d7b97656`；PR #55 已合并，Good G tag `v2.47.0` 指向相同提交，最终候选 CI 十个 job 与独立 Release 十三个 job 全部 success。GitHub Release 已于 `2026-10-24T03:11:11Z` 正式发布，PyPI 两构件均未 yanked，名称/大小/SHA-256 与 GitHub assets 一致，完整身份见[实际发行核对](review-v2.47.md#实际发行核对)。主分支同 head 的重复 CI 已由根主动去重 cancelled，不记为 success 或新的功能失败。
+
+以下保留从基线 `5a5ae91` 开始的实施与受控验收合同。原候选完成十二参数旅程、21个相关文件411项整合与独立后审，类型、格式和离线构件检查通过，见[本地闭合记录](review-v2.47.md#最终候选准备)。PR #55 首轮 CI 的 Windows 3.12/3.13 两个 job 中，十二参数均在真实完成报告门控超时；受控 ASCII 默认编码复现确认是夹具读取 UTF-8 草稿时未指定编码。仅修两处读取，保留3秒期限和有限诊断后，根实收ASCII十二参数及正常环境十九项相关回归通过；首轮失败和后续远端成功分别保留，详见[失败记录](review-v2.47.md#已观察的失败)。历史首轮先冻结的 sent、blocked、unknown 三条真实旅程均在最终手机7完成说明 outbox 为0处失败，3 failed in 1.50秒；守卫2.420秒、117.7MiB、swap0、exit1。2.46 已发布当前主运行的重规划说明回手机，其本身的证据不覆盖本片独立完成回报，也不等于真实平台送达。
 
 ## 用户行为与已有缺口
 
@@ -10,7 +12,7 @@
 
 相关入口：[控制事务与计划交付](../src/muli/task_control.py)、[真实代次启动与报告](../src/muli/team.py)、[主运行准备及启动恢复](../src/muli/runtime.py)、[应用默认工厂与关闭生命周期](../src/muli/server.py)、[发送时当前授权和 unknown](../src/muli/channels/manager.py)。
 
-## 最小持久关联候选（本地已验证）
+## 已发行的最小持久关联
 
 1. `approve_plan` 在原事务内，沿宿主冻结的 `snapshot.replan_request_id → task_control_receipt.ingress_id → 主 ingress` 核对实际控制来源。须匹配当前任务、epoch、owner回执、main会话及受保护 `task_control` 引用，且 ingress 的 `source=task-control`、`principal=owner`、`route=null`。仅从这条实际持久输入的显式 `ReplyOrigin` 冻结原手机来源到既有 `task_plan_delivery`；模型参数、当前 PreparedRequest、最新聊天、摘要均不提供目的地。
 2. 复用现有通知代次与批准凭据的核验。archive 路径须匹配真实 `archive_message_id`、`run_id=None` 的受保护通知和实际下一代承接；ingress 路径须匹配本次真实有限 claim 的通知ID、seq、delivered_seq及run_id。`delivery.state=delivered` 在 ingress 路径只表示已入队，pending、未被本次有限 claim 取到或被其它run取到的通知均不得绑定。不能仅凭最新epoch、新run启动或一个 delivery ID 放宽 CAS。

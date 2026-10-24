@@ -61,3 +61,11 @@ Runtime 保存 `run.status=paused`、`pause_reason`、`observed_epoch`，发布 
 首版不支持活动 DAG 中途暂停。同 scope 存在 queued/running DAG，或状态已结束但实际收尾 task 尚未完成时，pause 返回 `workflow_active`，不改变控制事实。DAG 首次 await 前同步检查 scope 并登记运行、节点继承绑定；旧节点通过普通执行入口启动也不能逃离门禁。已批准范围可启动新 DAG，独立 DAG 不受无关暂停影响。
 
 `tests/test_task_control_runtime.py` 使用临时 SQLite、假模型、真实 Runtime/Team/AttentionInbox 与 Event 门控验证以上边界，包括原生批次、最后 await、快照冻结、继承身份、满箱恢复、先投递后停靠、报告公平交接和真实系统注意事项。没有调用真实模型、网络或设备。
+
+## 显式交付验收候选
+
+主助手可显式调用 `task_delivery_record`，为当前任务版本的一个准确直接队友完成报告和一个本地 UTF-8 附件副本保存验收依据。独立协调 provider 只登记这个 write 工具；队友 schema 不提供它，handler 仍复核真实主会话和运行。原工具 provider、普通 completed、任务状态、方案批准与 owner 权限不变。
+
+宿主从真实 file_publish 的完整 accepted 工具结果、准确调用消息和当前完成事件核关联，再在有限字节窗内读取附件副本。宿主文件事实与逐条模型判断分栏；文件属于本任务、由本代写出及满足要求均不能只凭路径或摘要升级为宿主事实。文件 await 在事务外，末 `BEGIN IMMEDIATE` 中无 await 复核任务 revision/epoch 和完整证据后，将不可变单、同任务去重回执及事件原子保存。owner 在核验期间暂停或追加要求，不能留下成功单。
+
+相同规范参数与去重键只返回原单，内容不同报冲突，不重读文件、不重跑队友；任务要求或执行代次变化后原单保留为历史。读取复用 `commitment_inspect(section=deliveries)` 与原认证 HTTP 入口，不新增前端面板。登记不自动发文件，后续说明沿当前真实来源，显式渠道发送继续沿原授权、撤销和 unknown 回执规则。候选、本地历史红点及待验证范围见[交付验收方案](task-delivery-evidence-proposal.md)，不代表本片已发行。

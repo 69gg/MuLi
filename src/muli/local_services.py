@@ -20,6 +20,8 @@ from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
 from muli.runtime import Runtime
 from muli.task_control import TaskControl
+from muli.task_delivery import TaskDelivery
+from muli.task_file_publication import capture_source, stage_publication
 from muli.task_inspection import TaskInspection
 from muli.tools import Tool, parameters, string
 from muli.tools.mcp_catalog import ContentError, fits_output
@@ -40,6 +42,9 @@ class LocalServices:
             max_output_chars=lambda: runtime.config.settings.limits.max_output_chars,
         )
         self.task_control = TaskControl(runtime.store, self.commitments)
+        self.task_delivery = TaskDelivery(
+            runtime, self.commitments, self.task_control, self.read_bytes
+        )
         self.task_inspection = TaskInspection(
             self.commitments,
             self.task_control,
@@ -48,6 +53,7 @@ class LocalServices:
         )
         runtime.task_control = self.task_control
         runtime.add_tool_provider(self.tools, session_scoped=True)
+        runtime.add_tool_provider(self.delivery_tools, coordinator=True, session_scoped=True)
         runtime.context_hooks.append(self.context)
 
     def media(self) -> MediaService:
@@ -154,6 +160,12 @@ class LocalServices:
         if len(data) > max_bytes:
             raise ValueError("附件超过此能力的读取上限")
         return item, data
+
+    def delivery_tools(self, runtime: Runtime) -> list[Tool]:
+        identifier = runtime.tool_session_id
+        if identifier is not None and identifier != runtime.store.existing_main_session_id():
+            return []
+        return [self.task_delivery.tool()]
 
     def tools(self, runtime: Runtime) -> list[Tool]:
         runtime.mcp.set_resource_save_factory(self.mcp_resource_target)
@@ -306,7 +318,9 @@ class LocalServices:
                 raise ValueError("只能发送普通文件")
             if path.stat().st_size > runtime.config.settings.uploads.max_file_bytes:
                 raise ValueError("文件超过附件上限")
+            source = capture_source(runtime, path)
             item = await self.attachments.import_file(path)
+            stage_publication(runtime, source, item)
             await runtime.bus.emit("attachment.published", item)
             return item
 
@@ -331,7 +345,7 @@ class LocalServices:
                         ),
                         approve_plan,
                         "write",
-                    )
+                    ),
                 ]
                 if is_main() or runtime.tool_session_id is None
                 else []

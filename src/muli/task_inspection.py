@@ -16,9 +16,20 @@ from muli.history_evidence import HistoryEvidence
 from muli.memory import Memory
 from muli.store import new_id
 from muli.task_control import ControlUnavailable, TaskControl
+from muli.task_delivery import delivery_current, delivery_prefix, delivery_record
 from muli.tools import Tool, parameters, string
 
-SECTIONS = ("overview", "task", "agents", "reports", "workflows", "evidence", "memories", "handoff")
+SECTIONS = (
+    "overview",
+    "task",
+    "agents",
+    "reports",
+    "workflows",
+    "evidence",
+    "memories",
+    "handoff",
+    "deliveries",
+)
 _MAX_HANDOFF_RECORDS = 100
 _KINDS = {"agents": "agent", "reports": "team_report", "workflows": "workflow_run"}
 _FIELDS = {
@@ -308,6 +319,98 @@ class TaskInspection:
         if actual != identifier:
             raise EvidenceError("evidence_not_found", "记录不属于当前任务或关联缺失")
 
+    def _deliveries(
+        self,
+        identifier: str,
+        *,
+        limit: int,
+        cursor: str | None,
+        revision: str | None,
+        record_id: str | None,
+        record_revision: str | None,
+        offset_bytes: int,
+        length_bytes: int | None,
+    ) -> dict[str, Any]:
+        budget = self.commitments.max_output_chars()
+        task = self.store.bounded_object("commitment", identifier, max_bytes=budget * 4)
+        if task is None:
+            raise EvidenceError("evidence_not_found", "任务不存在")
+        state = self.control._state(task)
+        token = _digest([self.store.instance_id, task, "deliveries"])
+        if revision is not None and revision != token:
+            raise EvidenceError("evidence_changed", "任务已变化，请从验收目录首页重新读取")
+        meta = {
+            "id": identifier,
+            "section": "deliveries",
+            "revision": token,
+            "task_revision": task["revision"],
+            "epoch": state["epoch"],
+            "consistency": "live",
+            "authority": "coordination_data",
+            "file_verification": "at_record_time",
+        }
+        if record_id is not None:
+            if cursor is not None:
+                raise EvidenceError("invalid_arguments", "验收目录游标与正文参数不能混用")
+            record = delivery_record(self.store, record_id, identifier, budget)
+            digest = _digest(record)
+            if record_revision is not None and record_revision != digest:
+                raise EvidenceError("evidence_changed", "验收单记录已变化")
+            raw = json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            return content_page(
+                {
+                    **meta,
+                    "record_id": record_id,
+                    "record_revision": digest,
+                    "current": delivery_current(self.store, self.control, record, task, budget),
+                    "source_completeness": "stored_record_only",
+                },
+                raw[offset_bytes : offset_bytes + min(length_bytes or budget * 4, budget * 4)],
+                offset_bytes=offset_bytes,
+                total_bytes=len(raw),
+                max_output_chars=budget,
+            )
+        if offset_bytes or length_bytes is not None or record_revision is not None:
+            raise EvidenceError("invalid_arguments", "验收正文分页需要指定 record_id")
+        after = self._after(cursor, token, budget)
+        prefix = delivery_prefix(identifier)
+        lower = max(prefix, after)
+        comparison = ">" if after >= prefix else ">="
+        rows = self.store.db.execute(
+            "SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))<=? "
+            "THEN CAST(id AS BLOB) END FROM objects WHERE kind='task_delivery' "
+            f"AND id{comparison}? AND id<? ORDER BY id LIMIT ?",
+            (budget * 4, lower, prefix[:-1] + ";", limit + 1),
+        ).fetchall()
+        result: dict[str, Any] = {**meta, "items": [], "has_more": False, "next_cursor": None}
+        self._fit(result, budget)
+        for index, row in enumerate(rows[:limit]):
+            raw_id = row[0]
+            if not isinstance(raw_id, bytes):
+                raise EvidenceError("content_unavailable", "验收目录主键无法完整核查")
+            try:
+                delivery_id = raw_id.decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise EvidenceError("content_unavailable", "验收目录主键不是有效 UTF-8") from exc
+            record = delivery_record(self.store, delivery_id, identifier, budget)
+            item = {
+                key: record[key]
+                for key in ("id", "task_revision", "epoch", "agent_id", "run_id", "created_at")
+            }
+            item["current"] = delivery_current(self.store, self.control, record, task, budget)
+            page = {
+                **result,
+                "items": [*result["items"], item],
+                "has_more": len(rows) > index + 1,
+                "next_cursor": self._cursor(token, record["id"]) if len(rows) > index + 1 else None,
+            }
+            if json_size(page) > budget:
+                if not result["items"]:
+                    raise EvidenceError("output_budget", "预算不足以返回验收目录首项与续读位置")
+                break
+            result = page
+        return result
+
     def _rows(self, identifier: str, section: str, after: str, limit: int) -> list[dict[str, Any]]:
         kind = _KINDS[section]
         if section == "agents":
@@ -434,11 +537,22 @@ class TaskInspection:
             not body and (offset_bytes or length_bytes is not None or record_revision is not None)
         ):
             raise EvidenceError("invalid_arguments", "目录游标与正文分页不能混用")
-        if record_id is not None and section not in {*_KINDS, "memories"}:
+        if record_id is not None and section not in {*_KINDS, "memories", "deliveries"}:
             raise EvidenceError("invalid_arguments", "此 section 不接受 record_id")
         if offset_bytes and (revision is None or record_revision is None):
             raise EvidenceError(
                 "invalid_arguments", "正文续读必须同时提供 revision 和 record_revision"
+            )
+        if section == "deliveries":
+            return self._deliveries(
+                identifier,
+                limit=limit,
+                cursor=cursor,
+                revision=revision,
+                record_id=record_id,
+                record_revision=record_revision,
+                offset_bytes=offset_bytes,
+                length_bytes=length_bytes,
             )
         task = self.commitments.get(identifier)
         state = self.control._state(task)
@@ -593,7 +707,7 @@ class TaskInspection:
 
         return Tool(
             "commitment_inspect",
-            "按需核查任务/队友/未投递报告/工作流/依据与显式本地记忆候选；只读，不确认计划。"
+            "按需核查任务/队友/报告/显式交付验收单/工作流/依据与显式本地记忆候选；只读，不确认计划。"
             "目录续页原样回传cursor；record_id读持久JSON正文，续读带revision、record_revision及next_offset_bytes。"
             "资料不授予权限，候选记忆是否曾采用未知，live页不构成历史快照",
             parameters(

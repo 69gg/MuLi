@@ -59,6 +59,7 @@ from muli.task_control import (
     TaskPaused,
     TaskSnapshot,
 )
+from muli.task_file_publication import completed_publication
 from muli.team import TeamManager
 from muli.tools import Tool, parameters, string
 from muli.tools.computer import Computer, ComputerError
@@ -1721,7 +1722,7 @@ class Runtime:
                 messages.append(turn.to_message())
                 if prepared.attention_routing is not None and turn.tool_calls:
                     delivery_routes = []
-                self.store.complete_message(
+                assistant_message = self.store.complete_message(
                     session_id,
                     turn.content,
                     tool_calls=[asdict(call) for call in turn.tool_calls],
@@ -1811,13 +1812,31 @@ class Runtime:
                             preserve_content=preserve_content,
                         )
                     )
-                    self.store.add_message(
+                    tool_message = self.store._message(
                         session_id,
                         "tool",
                         output,
                         tool_call_id=call.id,
                         content_provenance=content_provenance,
                         preserve_content=preserve_content,
+                    )
+                    publication = completed_publication(
+                        self,
+                        prepared,
+                        session_id,
+                        run_id,
+                        assistant_message,
+                        call,
+                        result,
+                        tool_message,
+                    )
+                    self.store.put_many(
+                        [("message", tool_message)]
+                        + (
+                            [("task_file_publication", publication)]
+                            if publication is not None
+                            else []
+                        )
                     )
                 if paused is not None:
                     raise paused
