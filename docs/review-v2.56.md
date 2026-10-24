@@ -1,4 +1,4 @@
-# v2.56 视觉解释存档候选审查
+# v2.56 视觉解释存档发行审查
 
 2026-10-24，基线为已发行2.55的签名提交
 `d1f4590d6f12d595b922b90b26d561191964db1a`。本候选支持显式保存一次视觉解释，
@@ -68,4 +68,23 @@
 这是测试输入的换行错误，不把增加等待或跳过Windows作为修复；单项复验不增加314的不同节点数。
 非作者复核二进制读取、固定字节输入及原严格内容/轮数/预算/等待断言，无P1/P2；定向Ruff和格式通过。
 
-修后精确候选CI与正式发行仍待验，不预写远端通过、标签、GitHub/PyPI构件或外部送达。
+## 发行闭合
+
+修后签名提交 `7beae8e7524c2416344db528dd585e55c29a0fce` 的候选CI
+[`40080446607`](https://github.com/69gg/MuLi/actions/runs/40080446607) 十项全为
+completed/success，包括Linux双Python双分片、macOS/Windows双Python、quality及mcp。
+PR64于2026-10-24T09:17:31Z合入该精确提交；GPG签名标签 `v2.56.0` 与main原子推送。
+重复main CI `40081369564` 最终completed/cancelled，不计为通过。
+
+正式Release [`40081369256`](https://github.com/69gg/MuLi/actions/runs/40081369256)
+十三项全为completed/success。GitHub于2026-10-24T09:25:38Z
+[发布v2.56.0](https://github.com/69gg/MuLi/releases/tag/v2.56.0)。根沿原资源守卫读取
+GitHub/PyPI小型JSON，核标签、两份非yanked构件、文件名、大小及SHA-256一致，未下载包：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| wheel | 844768 | `bb8978a4462fc04b89dfcd3ac3f40f78b9c6432cb89e53937863488a100c6668` |
+| sdist | 4500938 | `a5e72e075a447581198af43230cd5ff24b9597e60124c7656d3b9c94600327b6` |
+
+核对守卫1.354秒、47.7MiB、swap0。这闭合发行与公开构件，未升级或重启本机用户服务，
+也不把离线平台旅程扩大为真实账号/设备联调。本节在下一迭代记录，不改冻结发行标签。

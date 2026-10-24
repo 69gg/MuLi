@@ -989,7 +989,7 @@ async function switchView(view, owner = connection) {
     return;
   }
   if (view === "workflows") {
-    const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "" };
+    const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "", schedulesOpen: false, schedulesPage: null, schedulesAfter: "", schedulesStarts: [""], schedulesController: null, schedulesLoading: false, schedulesError: "", schedulesStopping: new Set() };
     state.workflows = []; state.viewLoading = false; renderOtherView();
     const heading = $(".view-heading h2", $("#other-view"));
     if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
@@ -1827,9 +1827,10 @@ function workflowActivityCurrent(slot) {
 
 function releaseWorkflowActivity() {
   const slot = workflowActivity; workflowActivity = null;
-  slot?.controller?.abort(); slot?.definitionsController.abort();
-  if (slot) slot.page = null;
+  slot?.controller?.abort(); slot?.definitionsController.abort(); slot?.schedulesController?.abort();
+  if (slot) { slot.page = null; slot.schedulesPage = null; slot.schedulesStopping.clear(); }
   $("#workflow-active-runs")?.replaceChildren();
+  $("#workflow-schedules")?.replaceChildren();
 }
 
 function workflowActivityPage(payload, after) {
@@ -1930,8 +1931,72 @@ function renderWorkflowActivity() {
   return root;
 }
 
+async function loadWorkflowSchedules(slot, after = "", starts = [""]) {
+  const owner = connection;
+  if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !connectionCurrent(owner)) return;
+  slot.schedulesController?.abort();
+  const controller = slot.schedulesController = new AbortController();
+  slot.schedulesLoading = true; slot.schedulesError = ""; renderOtherView();
+  const current = () => workflowActivityCurrent(slot) && slot.schedulesOpen && connectionCurrent(owner) && slot.schedulesController === controller && !controller.signal.aborted;
+  try {
+    const payload = await ownedRequest(`/workflow-schedules?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" }, owner);
+    if (!current()) return;
+    if (!payload || !Array.isArray(payload.items) || payload.items.length > workflowPageSize || typeof payload.has_more !== "boolean") throw new Error("定时委托响应不完整，请重试。");
+    const seen = new Set();
+    const items = payload.items.map((item) => {
+      if (!item || typeof item.id !== "string" || !item.id || item.id === after || seen.has(item.id) || typeof item.name !== "string" || typeof item.enabled !== "boolean" || !(item.due_at === null || (Number.isFinite(item.due_at) && item.due_at > 0)) || !(item.last_run_id === null || (typeof item.last_run_id === "string" && item.last_run_id)) || !(item.last_status === null || ["pending", "queued", "running", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(item.last_status))) throw new Error("定时委托响应不完整，请重试。");
+      seen.add(item.id);
+      if (typeof item.blocked !== "boolean") throw new Error("定时委托响应不完整，请重试。");
+      return { id: item.id, name: item.name, enabled: item.enabled, blocked: item.blocked, due_at: item.due_at, interval_seconds: item.interval_seconds, last_run_id: item.last_run_id, last_status: item.last_status };
+    });
+    if (payload.has_more ? !items.length || payload.next_after !== items.at(-1).id : payload.next_after !== null) throw new Error("定时委托翻页位置无效，请重新读取。");
+    slot.schedulesPage = { items, has_more: payload.has_more, next_after: payload.next_after };
+    slot.schedulesAfter = after; slot.schedulesStarts = [...starts];
+  } catch (error) { if (current()) slot.schedulesError = error.message; }
+  finally {
+    if (workflowActivityCurrent(slot) && slot.schedulesController === controller) {
+      slot.schedulesController = null; slot.schedulesLoading = false; renderOtherView();
+    }
+  }
+}
+
+function renderWorkflowSchedules() {
+  const slot = workflowActivity;
+  const root = element("section", { id: "workflow-schedules", hidden: !slot?.schedulesOpen });
+  if (!slot?.schedulesOpen) return root;
+  const refresh = actionButton("刷新", "refresh-workflow-schedules", "text-button", "refresh");
+  refresh.disabled = slot.schedulesLoading;
+  root.append(element("div", { class: "list-caption" }, "定时委托", refresh));
+  if (slot.schedulesLoading) root.append(element("p", { class: "workflow-list-status", role: "status", text: "正在读取…" }));
+  if (slot.schedulesError) root.append(element("p", { class: "form-error", role: "alert", text: slot.schedulesError }));
+  if (!slot.schedulesLoading && !slot.schedulesError && !slot.schedulesPage?.items.length) root.append(element("p", { class: "workflow-list-status", text: "暂无定时委托。可在对话中请沐璃安排。" }));
+  for (const item of slot.schedulesPage?.items ?? []) {
+    const status = !item.enabled ? "已停用" : item.blocked ? "暂缓执行" : item.due_at === null ? "无后续计划" : "等待下次执行";
+    const recent = { pending: "等待中", queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", timed_out: "超时" };
+    const content = element("div", { class: "row-content" }, element("h4", { text: item.name }), element("code", { class: "workflow-run-id", text: item.id }), element("div", { class: "row-meta" }, status, item.due_at !== null && element("time", { text: formatTimestamp(item.due_at) })));
+    if (item.last_run_id) content.append(element("div", { class: "row-meta" }, `最近执行：${recent[item.last_status] ?? "状态未记录"}`, element("code", { text: item.last_run_id })));
+    const actions = element("div", { class: "row-actions" });
+    if (item.enabled) {
+      const cancel = actionButton(slot.schedulesStopping.has(item.id) ? "正在提交…" : "取消委托", "cancel-workflow-schedule", "secondary-button", "stop", { id: item.id });
+      cancel.disabled = slot.schedulesLoading || slot.schedulesStopping.has(item.id); actions.append(cancel);
+    }
+    root.append(element("article", { class: "workflow-active-row" }, content, actions));
+  }
+  if (slot.schedulesStarts.length > 1 || slot.schedulesPage?.has_more) {
+    const previous = actionButton("上一页", "page-workflow-schedules", "text-button", undefined, { direction: "previous" });
+    const next = actionButton("下一页", "page-workflow-schedules", "text-button", undefined, { direction: "next" });
+    previous.disabled = slot.schedulesLoading || slot.schedulesStarts.length <= 1;
+    next.disabled = slot.schedulesLoading || !slot.schedulesPage?.has_more;
+    root.append(element("div", { class: "row-actions" }, previous, next));
+  }
+  return root;
+}
+
 function renderWorkflows() {
-  const root = element("div", { class: "view-content" }, viewHeading("工作流", "把重复任务整理成可运行的步骤。", element("div", { class: "view-heading-actions" }, actionButton("从模板开始", "workflow-templates", "secondary-button", "sparkles"), actionButton("新建工作流", "new-workflow", "primary-button", "plus"))), renderWorkflowActivity(), element("div", { class: "list-caption" }, "最近定义", `${state.workflows.length} 个工作流`));
+  const schedules = actionButton("定时委托", "toggle-workflow-schedules", "secondary-button");
+  schedules.setAttribute("aria-expanded", String(!!workflowActivity?.schedulesOpen));
+  schedules.setAttribute("aria-controls", "workflow-schedules");
+  const root = element("div", { class: "view-content" }, viewHeading("工作流", "把重复任务整理成可运行的步骤。", element("div", { class: "view-heading-actions" }, schedules, actionButton("从模板开始", "workflow-templates", "secondary-button", "sparkles"), actionButton("新建工作流", "new-workflow", "primary-button", "plus"))), renderWorkflowActivity(), renderWorkflowSchedules(), element("div", { class: "list-caption" }, "最近定义", `${state.workflows.length} 个工作流`));
   if (workflowActivity?.definitionsLoading) root.append(element("p", { class: "workflow-list-status", text: "正在读取定义…" }));
   else if (workflowActivity?.definitionsError) root.append(element("p", { class: "form-error", role: "alert", text: workflowActivity.definitionsError }), actionButton("重试读取定义", "retry-view", "text-button", "refresh"));
   else if (!state.workflows.length) root.append(emptyState("workflow", "还没有工作流", "创建一个流程，按步骤协作完成任务。"));
@@ -2586,6 +2651,29 @@ async function handleAction(action, button) {
   if (action === "remove-workflow-step") button.closest(".workflow-step-editor")?.remove();
   if (action === "run-workflow") await runWorkflow(button.dataset.id, button);
   if (action === "workflow-session") await loadSession(button.dataset.session, button);
+  if (action === "toggle-workflow-schedules") {
+    const slot = workflowActivity;
+    if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button)) return;
+    slot.schedulesOpen = !slot.schedulesOpen;
+    if (slot.schedulesOpen) await loadWorkflowSchedules(slot);
+    else { slot.schedulesController?.abort(); slot.schedulesController = null; slot.schedulesLoading = false; slot.schedulesPage = null; renderOtherView(); }
+  }
+  if (["refresh-workflow-schedules", "page-workflow-schedules"].includes(action)) {
+    const slot = workflowActivity;
+    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || slot.schedulesLoading) return;
+    if (action === "refresh-workflow-schedules") await loadWorkflowSchedules(slot);
+    else if (button.dataset.direction === "next" && slot.schedulesPage?.has_more) await loadWorkflowSchedules(slot, slot.schedulesPage.next_after, [...slot.schedulesStarts, slot.schedulesPage.next_after]);
+    else if (button.dataset.direction === "previous" && slot.schedulesStarts.length > 1) await loadWorkflowSchedules(slot, slot.schedulesStarts.at(-2), slot.schedulesStarts.slice(0, -1));
+  }
+  if (action === "cancel-workflow-schedule") {
+    const slot = workflowActivity, id = button.dataset.id, owner = connection;
+    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || !slot.schedulesPage?.items.some((item) => item.id === id && item.enabled) || slot.schedulesStopping.has(id)) return;
+    slot.schedulesStopping.add(id); renderOtherView();
+    try {
+      await ownedRequest(`/workflow-schedules/${encodeURIComponent(id)}/cancel`, { method: "POST" }, owner);
+      if (workflowActivityCurrent(slot) && connectionCurrent(owner)) { toast("已提交取消请求"); await loadWorkflowSchedules(slot, slot.schedulesAfter, slot.schedulesStarts); }
+    } finally { slot.schedulesStopping.delete(id); if (workflowActivityCurrent(slot) && connectionCurrent(owner)) renderOtherView(); }
+  }
   if (["refresh-workflow-runs", "page-workflow-runs"].includes(action)) {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button) || slot.loading) return;

@@ -114,6 +114,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/reminders",
         "/api/workflows",
         "/api/workflow-runs/active",
+        "/api/workflow-schedules",
         "/api/commitments",
         "/api/memories",
         "/api/memories/graph",

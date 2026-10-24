@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
@@ -21,6 +22,15 @@ _ROLES = frozenset({"main", "worker", "reviewer"})
 _MODES = frozenset({"ask", "auto", "yolo"})
 _UNFINISHED = frozenset({"pending", "queued", "running"})
 _FAILED = frozenset({"failed", "skipped", "cancelled", "interrupted"})
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledOccurrence:
+    """Host-owned association committed before a scheduled driver can run."""
+
+    schedule: JsonObject
+    occurrence: JsonObject
+    mode: str
 
 
 class WorkflowEngine:
@@ -54,6 +64,7 @@ class WorkflowEngine:
         self._cancellations: dict[str, asyncio.Task[JsonObject]] = {}
         self._closed = False
         self.scope_admission = scope_admission
+        self.on_idle: Callable[[], None] | None = None
         self._recover()
 
     @property
@@ -66,6 +77,11 @@ class WorkflowEngine:
         return all(task.done() for task in self._tasks.values()) and all(
             task.done() for task in self._cancellations.values()
         )
+
+    @property
+    def accepting_runs(self) -> bool:
+        """Use live drivers, including terminal publication finalizers, for capacity."""
+        return sum(not task.done() for task in self._tasks.values()) < self.max_pending_runs
 
     def unfinished_run_ids(
         self, *, workflow_id: str | None = None, after_id: str = "", limit: int = 100
@@ -211,6 +227,12 @@ class WorkflowEngine:
     def create(
         self, name: str, steps: Sequence[JsonObject], description: str = "", mode: str = "auto"
     ) -> JsonObject:
+        return self.store.put("workflow", self._definition(name, steps, description, mode))
+
+    def _definition(
+        self, name: str, steps: Sequence[JsonObject], description: str = "", mode: str = "auto"
+    ) -> JsonObject:
+        """Construct the existing definition without prematurely committing a schedule."""
         if self._closed:
             raise RuntimeError("工作流引擎已经关闭")
         if not isinstance(name, str) or not name.strip():
@@ -219,20 +241,17 @@ class WorkflowEngine:
             raise ValueError("工作流描述或执行模式无效")
         normalized = self._validate(steps)
         recommended = self._review_recommended(normalized)
-        return self.store.put(
-            "workflow",
-            {
-                "id": new_id(),
-                "name": name.strip(),
-                "description": description,
-                "mode": mode,
-                "steps": normalized,
-                "review_recommended": recommended,
-                "warnings": ["建议增加覆盖全部依赖分支的最终 reviewer 节点"] if recommended else [],
-                "created_at": now(),
-                "updated_at": now(),
-            },
-        )
+        return {
+            "id": new_id(),
+            "name": name.strip(),
+            "description": description,
+            "mode": mode,
+            "steps": normalized,
+            "review_recommended": recommended,
+            "warnings": ["建议增加覆盖全部依赖分支的最终 reviewer 节点"] if recommended else [],
+            "created_at": now(),
+            "updated_at": now(),
+        }
 
     async def start(
         self,
@@ -243,6 +262,31 @@ class WorkflowEngine:
         request_snapshot: TaskSnapshot | None = None,
         reply_origin: ReplyOrigin | None = None,
     ) -> JsonObject:
+        run = self._admit_start(
+            workflow_id,
+            parent_run_id=parent_run_id,
+            parent_session_id=parent_session_id,
+            request_snapshot=request_snapshot,
+            reply_origin=reply_origin,
+        )
+        try:
+            await self._publish(run)
+        except BaseException:
+            await self.cancel(run["id"])
+            raise
+        return deepcopy(run)
+
+    def _admit_start(
+        self,
+        workflow_id: str,
+        *,
+        parent_run_id: str | None = None,
+        parent_session_id: str | None = None,
+        request_snapshot: TaskSnapshot | None = None,
+        reply_origin: ReplyOrigin | None = None,
+        scheduled: ScheduledOccurrence | None = None,
+    ) -> JsonObject:
+        """Synchronous admission; scheduled callers already own the config lock."""
         if self._closed:
             raise RuntimeError("工作流引擎已经关闭")
         workflow = self.store.get("workflow", workflow_id)
@@ -251,7 +295,15 @@ class WorkflowEngine:
         steps = self._validate(workflow["steps"])
         if workflow.get("mode") not in _MODES:
             raise ValueError("工作流执行模式无效")
-        if sum(not task.done() for task in self._tasks.values()) >= self.max_pending_runs:
+        mode = workflow["mode"] if scheduled is None else scheduled.mode
+        if mode not in _MODES:
+            raise ValueError("工作流执行模式无效")
+        if (
+            scheduled is not None
+            and self.store.get("workflow_occurrence", scheduled.occurrence["id"]) is not None
+        ):
+            raise ValueError("该定时轮次已经接纳，不能重新执行")
+        if not self.accepting_runs:
             raise ValueError("工作流未完成运行数量已达上限，请等待完成或取消现有运行")
         # Admission and every durable association below run without an await,
         # making them ordered with the synchronous owner-control transaction.
@@ -269,7 +321,7 @@ class WorkflowEngine:
             "parent_session_id": parent_session_id,
             "reply_origin": (reply_origin or ReplyOrigin()).dump(),
             "name": workflow["name"],
-            "mode": workflow["mode"],
+            "mode": mode,
             "status": "queued",
             "nodes": {},
             "created_at": now(),
@@ -277,39 +329,50 @@ class WorkflowEngine:
         }
         if scope is not None:
             run["commitment_id"] = scope
+        associations: list[tuple[str, JsonObject]] = []
+        if scheduled is not None:
+            run.update(
+                schedule_id=scheduled.schedule["id"],
+                schedule_version=scheduled.schedule["version"],
+                scheduled_occurrence_id=scheduled.occurrence["id"],
+            )
+            occurrence = {**scheduled.occurrence, "run_id": identifier, "mode": mode}
+            associations.extend(
+                [("workflow_schedule", scheduled.schedule), ("workflow_occurrence", occurrence)]
+            )
         for step in steps:
             session_id = new_id()
-            self.store.put(
-                "session",
-                {
-                    "id": session_id,
-                    "title": f"{workflow['name']} · {step['title']}",
-                    "mode": workflow["mode"],
-                    "status": "idle",
-                    "role": step["role"],
-                    "workflow_id": workflow_id,
-                    "workflow_run_id": identifier,
-                    "workflow_node_id": step["id"],
-                    "created_at": now(),
-                    "updated_at": now(),
-                },
-            )
+            session: JsonObject = {
+                "id": session_id,
+                "title": f"{workflow['name']} · {step['title']}",
+                "mode": mode,
+                "status": "idle",
+                "role": step["role"],
+                "workflow_id": workflow_id,
+                "workflow_run_id": identifier,
+                "workflow_node_id": step["id"],
+                "created_at": now(),
+                "updated_at": now(),
+            }
+            if scheduled is not None:
+                session["scheduled_workflow"] = {
+                    "schedule_id": run["schedule_id"],
+                    "version": run["schedule_version"],
+                    "occurrence_id": run["scheduled_occurrence_id"],
+                    "run_id": identifier,
+                }
+            associations.append(("session", session))
             run["nodes"][step["id"]] = {
                 **deepcopy(step),
                 "session_id": session_id,
                 "status": "pending",
             }
         # 从首次 await 起，运行必须已经可由父任务找到并取消。
-        self.store.put("workflow_run", run)
+        self.store.put_many([*associations, ("workflow_run", run)])
         task = asyncio.create_task(self._drive(run), name=f"muli-workflow-{identifier}")
         self._tasks[identifier] = task
         task.add_done_callback(lambda completed: self._done(identifier, completed))
-        try:
-            await self._publish(run)
-        except BaseException:
-            await self.cancel(identifier)
-            raise
-        return deepcopy(run)
+        return run
 
     def publish_results(
         self, parent_run_id: str, parent_session_id: str, results: Sequence[tuple[str, str]]
@@ -330,31 +393,45 @@ class WorkflowEngine:
                     raise ValueError("工作流结果与已完成的父运行不匹配")
                 if "result_message_id" in run or not content.strip():
                     continue
-                origin = ReplyOrigin.load(run.get("reply_origin"))
-                message = self.store._message(
-                    parent_session_id,
-                    "assistant",
-                    content,
-                    workflow_run_id=identifier,
-                    reply_origin=origin.dump(),
-                    delivery_routes=origin.delivery_routes(),
-                )
-                # Use the existing transaction-owned primitive: event()/put()
-                # here would commit an incomplete batch through nested contexts.
-                self.store._event(
-                    "message.completed",
-                    {"message": message},
-                    parent_session_id,
-                    objects=[
-                        ("message", message),
-                        ("workflow_run", {**run, "result_message_id": message["id"]}),
-                    ],
-                )
+                self._publish_result(run, parent_session_id, content)
+
+    def _publish_result(
+        self,
+        run: JsonObject,
+        session_id: str,
+        content: str,
+        *,
+        objects: list[tuple[str, JsonObject]] | None = None,
+        routing: JsonObject | None = None,
+    ) -> None:
+        """Transaction-owned publication after the caller's exact-run authorization."""
+        origin = ReplyOrigin.load(run.get("reply_origin"))
+        message = self.store._message(
+            session_id,
+            "assistant",
+            content,
+            workflow_run_id=run["id"],
+            reply_origin=origin.dump(),
+            delivery_routes=origin.delivery_routes(),
+            **({"attention_routing": routing} if routing is not None else {}),
+        )
+        self.store._event(
+            "message.completed",
+            {"message": message},
+            session_id,
+            objects=[
+                ("message", message),
+                ("workflow_run", {**run, "result_message_id": message["id"]}),
+                *(objects or []),
+            ],
+        )
 
     def _done(self, identifier: str, task: asyncio.Task[None]) -> None:
         self._tasks.pop(identifier, None)
         if not task.cancelled():
             task.exception()
+        if self.on_idle is not None:
+            self.on_idle()
 
     def _session_state(self, session_id: str, status: str) -> None:
         session = self.store.get("session", session_id)

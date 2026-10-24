@@ -411,8 +411,9 @@ class Runtime:
         self.system_events.clear_request(session_id)
         execution: TaskSnapshot | None = None
         selected: TaskSnapshot | None = None
+        scheduled, frozen = self.scheduled_workflows.request_snapshot(session_id)
         if self.task_control is not None:
-            execution = self.task_control.execution_snapshot(session_id)
+            execution = frozen if scheduled else self.task_control.execution_snapshot(session_id)
             identifier = self._selected_replans.get(session_id)
             if identifier is not None:
                 try:
@@ -482,6 +483,7 @@ class Runtime:
             self._request_context.reset(token)
 
     def _guard_request(self, request: PreparedRequest, risk: str = "write") -> None:
+        self.scheduled_workflows.guard_session(request.session_id)
         if self.task_control is not None:
             self.task_control.guard_execution(
                 request.execution_scope, session_id=request.session_id, risk=risk
@@ -744,6 +746,7 @@ class Runtime:
         }
 
     def _wake_main(self) -> None:
+        self.reminders.changed.set()
         self.maintenance.reconcile()
         if self._closing or not self.maintenance.admission.allowed:
             return
@@ -809,6 +812,7 @@ class Runtime:
         return messages
 
     def _configure_workflows(self) -> None:
+        from muli.scheduled_workflows import ScheduledWorkflows
         from muli.workflows import WorkflowEngine
 
         self.workflows = WorkflowEngine(
@@ -822,6 +826,11 @@ class Runtime:
             max_pending_runs=self.config.settings.limits.max_pending_runs,
             scope_admission=self._workflow_admission,
         )
+        self.scheduled_workflows = ScheduledWorkflows(self)
+        self.workflows.on_idle = lambda: self.reminders.changed.set()
+        self.reminders.workflow_tick = self.scheduled_workflows.tick
+        self.reminders.workflow_due = self.scheduled_workflows.next_due
+        self.reminders.changed.set()
 
     @property
     def busy(self) -> bool:
@@ -1017,7 +1026,13 @@ class Runtime:
         }
         self._coordinator_tools.clear()
         self._coordinator_tools.update(
-            {"reminder_schedule", "reminder_cancel", "reminder_reschedule"}
+            {
+                "reminder_schedule",
+                "reminder_cancel",
+                "reminder_reschedule",
+                "workflow_schedule",
+                "workflow_schedule_cancel",
+            }
         )
         self._tool_factories.clear()
         for factory, can_replace, coordinator, _ in self._tool_providers:
@@ -2044,6 +2059,18 @@ class Runtime:
         return result["allow"], result["reason"][:500]
 
     def _personal_tools(self) -> list[Tool]:
+        async def schedule_workflow(args: dict[str, Any]) -> Any:
+            item = self.scheduled_workflows.create(**args)
+            await self.bus.notify()
+            return item
+
+        async def list_scheduled_workflows(args: dict[str, Any]) -> Any:
+            return self.scheduled_workflows.list(**args)
+
+        async def cancel_scheduled_workflow(args: dict[str, Any]) -> Any:
+            self.scheduled_workflows._caller()
+            return await self.scheduled_workflows.cancel(args["id"])
+
         async def current_time(args: dict[str, Any]) -> Any:
             zone = args.get("timezone")
             timestamp = datetime.now(ZoneInfo(zone)) if zone else datetime.now().astimezone()
@@ -2146,6 +2173,38 @@ class Runtime:
             return item
 
         return [
+            Tool(
+                "workflow_schedule",
+                "明确授权未来自动执行固定 worker→reviewer 任务并将文字成果回原私聊/Web。"
+                "先核实当前时间；继承当前权限模式，ask/auto的审批门仍保留；周期错过合并。",
+                parameters(
+                    {
+                        "name": string(),
+                        "prompt": string(),
+                        "due_at": {"type": "number"},
+                        "interval_seconds": {"type": "integer", "minimum": 60},
+                    },
+                    ("name", "prompt", "due_at"),
+                ),
+                schedule_workflow,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
+                "workflow_schedule_list",
+                "分页查看定时委托和最近一次真实运行状态",
+                parameters({"after_id": string(), "limit": {"type": "integer", "minimum": 1}}),
+                list_scheduled_workflows,
+                preserve_output=True,
+            ),
+            Tool(
+                "workflow_schedule_cancel",
+                "撤销定时委托并精确取消其已接纳运行；不追回已派发副作用",
+                parameters({"id": string()}, ("id",)),
+                cancel_scheduled_workflow,
+                "write",
+                preserve_output=True,
+            ),
             Tool(
                 "conversation_read",
                 "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content。"

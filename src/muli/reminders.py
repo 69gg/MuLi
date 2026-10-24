@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from muli.events import EventBus
@@ -34,6 +34,9 @@ class Reminders:
         self.max_output_chars = max_output_chars or (lambda: defaults.max_output_chars)
         self.changed = asyncio.Event()
         self.task: asyncio.Task[None] | None = None
+        # Optional explicit delegations share this clock, not Attention's read-only input.
+        self.workflow_tick: Callable[[float], Awaitable[None]] | None = None
+        self.workflow_due: Callable[[float], float | None] | None = None
 
     def create(
         self,
@@ -197,8 +200,15 @@ class Reminders:
             for item in active:
                 if item["due_at"] <= timestamp:
                     await self._fire(item, timestamp)
+            if self.workflow_tick is not None:
+                await self.workflow_tick(timestamp)
             active = [item for item in self.store.list("reminder", 10000) if item["enabled"]]
-            delay = max(0.01, min(item["due_at"] for item in active) - now()) if active else None
+            deadlines = [float(item["due_at"]) for item in active]
+            if self.workflow_due is not None:
+                due = self.workflow_due(timestamp)
+                if due is not None:
+                    deadlines.append(due)
+            delay = max(0.01, min(deadlines) - now()) if deadlines else None
             try:
                 if delay is None:
                     await self.changed.wait()
