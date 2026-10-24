@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers import managed_native_peer as peer
 from test_managed_native_checkpoint import observed_round
 from test_managed_native_ci import Commands, ci, worker
 from test_managed_native_ci import context_reader as context_reader
@@ -145,6 +146,12 @@ def test_instance_helper_reads_actual_image_and_all_four_uids_without_environmen
     images: list[Path] = []
     known = {"manager": "/usr/lib/systemd/systemd", "executor": "/usr/lib/systemd/systemd-executor"}
     monkeypatch.setattr(worker, "system_executables", lambda: known)
+    # This legacy proc-only contract must not attempt the new native connection.
+    monkeypatch.setattr(
+        peer,
+        "read_manager_peer",
+        lambda pid, uid, deadline: peer.PeerFacts("not_observed", "unavailable"),
+    )
 
     def read(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
         assert path.name in {"stat", "status", "cgroup"}, "no environ/wchan or recovery read"
@@ -172,7 +179,9 @@ def test_instance_helper_reads_actual_image_and_all_four_uids_without_environmen
     monkeypatch.setattr(os, "readlink", image)
     limit = 4096
     result = read_instance(42, 23145, 100, "/user.slice/user@23145.service", 105.0, limit)
-    assert set(result) == {"code", "reason", "exe", "uids", "used"}
+    assert set(result) == {"code", "reason", "exe", "uids", "used"} | (
+        set() if result["code"] == "not_observed" else {"internal"}
+    )
     if case in {"ticks-drift", "image-drift", "uid-drift"}:
         assert result == {
             "code": "not_observed",
@@ -185,6 +194,11 @@ def test_instance_helper_reads_actual_image_and_all_four_uids_without_environmen
         assert result["code"] == "observed" and result["reason"] == "none"
         assert result["exe"] == ("executor" if case == "executor" else "manager")
         assert result["uids"] == ("mismatch" if case == "one-uid-mismatch" else "all_expected")
+        assert result["internal"] == (
+            {"code": "not_observed", "reason": "unavailable", "basic_state": None, "njobs": None}
+            if case not in {"executor", "one-uid-mismatch"}
+            else "not_observed"
+        )
         assert result["used"] == sum(charged) and len(images) == 2
         assert [name for name, _ in control["reads"]] == ["stat", "status", "cgroup"] * 2
     assert len((json.dumps(result, separators=(",", ":")) + "\n").encode()) <= 512

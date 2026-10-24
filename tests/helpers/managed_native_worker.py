@@ -17,7 +17,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import closing
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 if TYPE_CHECKING:
     from muli.managed_transaction import TransactionRecordV2
@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from muli.platforms.linux_transaction import CommandRunner, SystemdProbe
     from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
     from muli.store import Store
+
+    from .managed_native_peer import PeerFacts
 
 MAX_BYTES = 32768
 CONTEXT_REPLY_BYTES = 512
@@ -1089,7 +1091,12 @@ def context_socket(path: Path, owner: int) -> str:
 
 def instance_projection(value: object) -> dict[str, Any]:
     require(
-        isinstance(value, dict) and set(value) == {"code", "reason", "exe", "uids", "used"},
+        isinstance(value, dict)
+        and set(value)
+        in (
+            {"code", "reason", "exe", "uids", "used"},
+            {"code", "reason", "exe", "uids", "used", "internal"},
+        ),
         "native_diagnostic_invalid",
     )
     assert isinstance(value, dict)
@@ -1113,7 +1120,47 @@ def instance_projection(value: object) -> dict[str, Any]:
         ),
         "native_diagnostic_invalid",
     )
+    internal = value.get("internal", "not_observed")
+    require(
+        internal == "not_observed"
+        or (
+            value["code"] == "observed"
+            and value["exe"] == "manager"
+            and value["uids"] == "all_expected"
+            and peer_facts(internal)
+            and isinstance(internal, dict)
+            and internal["reason"] != "identity_changed"
+        ),
+        "native_diagnostic_invalid",
+    )
     return dict(value)
+
+
+def peer_facts(value: object) -> bool:
+    """The complete fixed peer result, never a native error or arbitrary unit."""
+    if not isinstance(value, dict) or set(value) != {"code", "reason", "basic_state", "njobs"}:
+        return False
+    return (
+        value["code"] == "observed"
+        and value["reason"] == "none"
+        and value["basic_state"]
+        in (
+            "active",
+            "reloading",
+            "inactive",
+            "failed",
+            "activating",
+            "deactivating",
+            "maintenance",
+        )
+        and type(value["njobs"]) is int
+        and 0 <= value["njobs"] < 2**32
+    ) or (
+        value["code"] == "not_observed"
+        and value["reason"] in ("timeout", "identity_changed", "invalid_reply", "unavailable")
+        and value["basic_state"] is None
+        and value["njobs"] is None
+    )
 
 
 def instance_unavailable(reason: str, used: int) -> dict[str, Any]:
@@ -1140,6 +1187,31 @@ def instance_error(error: BaseException) -> str:
     }.get(str(error), "unavailable" if isinstance(error, OSError) else "invalid_reply")
 
 
+def manager_peer(pid: int, uid: int, deadline: float) -> PeerFacts:
+    if __package__:
+        from .managed_native_peer import read_manager_peer
+
+        return read_manager_peer(pid, uid, deadline)
+    import importlib.util
+
+    name = "_muli_managed_native_peer"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).resolve().with_name("managed_native_peer.py")
+        )
+        require(spec is not None and spec.loader is not None, "native_diagnostic_invalid")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return cast("PeerFacts", module.read_manager_peer(pid, uid, deadline))
+
+
 def read_manager_instance(
     pid: int,
     uid: int,
@@ -1148,7 +1220,7 @@ def read_manager_instance(
     deadline: float,
     limit: int,
 ) -> dict[str, Any]:
-    """Two bounded proc bindings; no environment, socket, journal or internal bus."""
+    """Bracket the one fixed peer observation with both bounded proc bindings."""
     from muli.platforms.linux_transaction import _cgroup, _read_regular, _start_ticks
 
     used = 0
@@ -1214,6 +1286,15 @@ def read_manager_instance(
             return start, identities, current, image
 
         before = binding()
+        internal: dict[str, Any] | str = "not_observed"
+        if known.get("manager") == before[3] and before[1] == (uid,) * 4:
+            require(used < limit, "native_diagnostic_output_budget")
+            remaining(deadline)
+            from dataclasses import asdict
+
+            internal = asdict(manager_peer(pid, uid, deadline))
+            require(peer_facts(internal), "native_diagnostic_invalid")
+            require(internal["reason"] != "identity_changed", "native_process_changed")
         require(before == binding(), "native_process_changed")
         remaining(deadline)
         image = before[3]
@@ -1225,6 +1306,7 @@ def read_manager_instance(
             ),
             "uids": "all_expected" if before[1] == (uid,) * 4 else "mismatch",
             "used": used,
+            "internal": internal,
         }
     except Exception as error:
         # A partial/failed read has no reusable allowance; retain no positive tags.
@@ -2463,6 +2545,7 @@ async def diagnose_manager_instance(
                 )
             remaining(deadline)
             facts.update({key: projected[key] for key in ("code", "reason", "exe", "uids")})
+            facts["internal"] = projected.get("internal", "not_observed")
     except Exception as error:
         facts.update(instance_unavailable(instance_error(error), 0))
     facts["used"] = min(io.used, byte_limit)

@@ -564,7 +564,7 @@ def notification_facts(value: object) -> bool:
 
 
 def manager_instance_facts(value: object) -> bool:
-    """A later same-instance projection, never an internal manager/READY claim."""
+    """A later same-instance projection; internal scalars do not prove READY."""
     if not isinstance(value, dict) or set(value) != {
         "version",
         "code",
@@ -588,7 +588,16 @@ def manager_instance_facts(value: object) -> bool:
         and isinstance(value["invocation"], str)
         and re.fullmatch(r"[a-f0-9]{32}", value["invocation"]) is not None
         and value["invocation"] != "0" * 32
-        and value["internal"] == "not_observed"
+        and (
+            value["internal"] == "not_observed"
+            or (
+                value["code"] == "observed"
+                and value["exe"] == "manager"
+                and value["uids"] == "all_expected"
+                and peer_facts(value["internal"])
+                and value["internal"]["reason"] != "identity_changed"
+            )
+        )
         and type(value["used"]) is int
         and 0 <= value["used"] <= OUTPUT_BYTES - 1024
         and (
@@ -607,6 +616,80 @@ def manager_instance_facts(value: object) -> bool:
             )
         )
     )
+
+
+def peer_facts(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"code", "reason", "basic_state", "njobs"}:
+        return False
+    return (
+        value["code"] == "observed"
+        and value["reason"] == "none"
+        and value["basic_state"]
+        in (
+            "active",
+            "reloading",
+            "inactive",
+            "failed",
+            "activating",
+            "deactivating",
+            "maintenance",
+        )
+        and type(value["njobs"]) is int
+        and 0 <= value["njobs"] < 2**32
+    ) or (
+        value["code"] == "not_observed"
+        and value["reason"] in ("timeout", "identity_changed", "invalid_reply", "unavailable")
+        and value["basic_state"] is None
+        and value["njobs"] is None
+    )
+
+
+def setup_accounting_facts(value: object) -> bool:
+    """Validate the parent's real ledger, independent of the child's wire."""
+    fields = {
+        "parent_before",
+        "raw_grant",
+        "child_charged",
+        "reply_bytes",
+        "parent_after",
+        "settlement",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        return False
+    if any(
+        type(value[key]) is not int or not 0 <= value[key] <= OUTPUT_BYTES
+        for key in fields - {"reply_bytes", "settlement"}
+    ):
+        return False
+    before, grant, charged, after = (
+        value[key] for key in ("parent_before", "raw_grant", "child_charged", "parent_after")
+    )
+    wire = value["reply_bytes"]
+    if grant != max(0, OUTPUT_BYTES - before - 1024) or not 0 <= charged <= grant:
+        return False
+    if value["settlement"] == "not_started":
+        return charged == 0 and type(wire) is int and wire == 0 and after == before
+    if value["settlement"] == "validated":
+        return (
+            grant > 0
+            and type(wire) is int
+            and 0 < wire <= 1024
+            and after == before + charged + wire
+        )
+    if value["settlement"] == "unvalidated":
+        return (
+            grant > 0
+            and charged == grant
+            and (
+                (wire is None and after == OUTPUT_BYTES)
+                or (
+                    type(wire) is int
+                    and 0 <= wire <= OUTPUT_BYTES + 1
+                    and after == min(OUTPUT_BYTES, before + charged + wire)
+                )
+            )
+        )
+    return False
 
 
 def manager_instance_matches(value: dict[str, Any], checkpoint: dict[str, Any]) -> bool:
@@ -764,6 +847,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "setup",
             "manager_readiness",
             "manager_failure",
+            "setup_accounting",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -794,6 +878,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             valid = valid and startup_facts(facts, facts["unit"])
         elif name == "setup":
             valid = setup_facts(facts)
+        elif name == "setup_accounting":
+            valid = setup_accounting_facts(facts)
         elif name == "manager_failure":
             valid = manager_failure_facts(facts)
         elif name == "manager_readiness":
@@ -826,6 +912,21 @@ def fixture_result(data: bytes) -> dict[str, Any]:
         if not valid:
             raise FixtureError("native_result_invalid")
     setup = resources.get("setup")
+    accounting = resources.get("setup_accounting")
+    if accounting is not None and (
+        not isinstance(setup, dict)
+        or not manager_instance_facts(setup)
+        or setup["used"] != accounting["child_charged"]
+        or len(
+            json.dumps(
+                {"setup": setup, "setup_accounting": accounting},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        > 1024
+    ):
+        raise FixtureError("native_result_invalid")
     if isinstance(setup, dict) and manager_instance_facts(setup):
         failure = resources.get("manager_failure")
         checkpoint = failure.get("last_completed_round") if isinstance(failure, dict) else None
@@ -1969,21 +2070,45 @@ class NativeCI:
             "internal": "not_observed",
             "used": 0,
         }
-        allowance = OUTPUT_BYTES - self.setup_bytes - 1024
+        before = self.setup_bytes
+        allowance = max(0, OUTPUT_BYTES - before - 1024)
+        accounting: dict[str, Any] = {
+            "parent_before": before,
+            "raw_grant": allowance,
+            "child_charged": 0,
+            "reply_bytes": 0,
+            "parent_after": before,
+            "settlement": "not_started",
+        }
+
+        def save() -> None:
+            accounting["parent_after"] = self.setup_bytes
+            resources = {"setup": facts, "setup_accounting": accounting}
+            if len(json.dumps(resources, sort_keys=True, separators=(",", ":")).encode()) > 1024:
+                facts.update(
+                    code="not_observed",
+                    reason="output_budget",
+                    exe="unavailable",
+                    uids="unavailable",
+                    internal="not_observed",
+                )
+            # fixture_result also verifies the complete compact projection cap.
+            self.save_setup_result(resources)
+
         end = time.monotonic() + CLEANUP_SECONDS
         if self.execute_deadline is not None:
             end = min(end, self.execute_deadline)
         if allowance <= 0:
-            self.save_setup_result({"setup": facts})
+            save()
             return
         if time.monotonic() >= end:
             facts["reason"] = "timeout"
-            self.save_setup_result({"setup": facts})
+            save()
             return
-        before = self.setup_bytes
         # No returned, validated usage means no refund of the child's allowance.
         self.setup_bytes += allowance
         facts["used"] = allowance
+        accounting.update(child_charged=allowance, reply_bytes=None, settlement="unvalidated")
         returned = False
         try:
             worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
@@ -2003,6 +2128,7 @@ class NativeCI:
                 seconds=end - time.monotonic(),
             )
             returned = True
+            accounting["reply_bytes"] = len(reply.output)
             # The wire is charged before parsing/deadline validation; invalid/lost
             # replies cannot recycle the raw grant or the outer reply reserve.
             self.setup_bytes += len(reply.output)
@@ -2031,6 +2157,7 @@ class NativeCI:
                 raise FixtureError("native_diagnostic_invalid")
             self.setup_bytes = before + data["used"] + len(reply.output)
             facts = data
+            accounting.update(child_charged=data["used"], settlement="validated")
         except (ValueError, OSError, subprocess.SubprocessError) as failure:
             if not returned:
                 self.setup_bytes = OUTPUT_BYTES
@@ -2048,10 +2175,10 @@ class NativeCI:
                 if isinstance(failure, OSError)
                 else "invalid_reply",
             )
-        self.save_setup_result({"setup": facts})
+        save()
 
     def observe_setup(self, error: Exception) -> None:
-        """Observe two exact system units; never launch a private user-bus client."""
+        """Observe exact system units, or the bound manager's one fixed peer window."""
         receipt = self.receipt
         if receipt is None or receipt.setup_phase == "initial":
             return

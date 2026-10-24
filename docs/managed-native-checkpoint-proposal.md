@@ -132,7 +132,7 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 
 ## 待审增量：同一实例窗口内的 direct-peer 标量读取
 
-本节仅为方案，尚未编写或运行实现，也不授权native20。不改上述native19失败证据，不把本地586项或镜像清单当作现场READY证明。目标是在现有小实例观察中取得用户manager内部的两个有限事实，**替换**`internal=not_observed`的空位，不恢复旧大包、不追加第二次诊断。
+本节的独立helper已完成离线检查点；窗口集成与父级结算候选见末节，尚待根验证，也不授权native20。不改上述native19失败证据，不把本地586项或镜像清单当作现场READY证明。目标是在现有小实例观察中取得用户manager内部的两个有限事实，**替换**`internal=not_observed`的空位，不恢复旧大包、不追加第二次诊断。
 
 **固定版本依据。** 根已读取上游[v255 `src/core/dbus.c`](https://github.com/systemd/systemd/blob/v255/src/core/dbus.c)的`bus_on_connection`/`bus_check_peercred`及[v255 `src/shared/bus-util.c`](https://github.com/systemd/systemd/blob/v255/src/shared/bus-util.c)167–185行：实际peer凭据为UID0或server自身有效UID才接纳。因此沿用现有真实root helper，不模拟UID、不设trusted、不修改manager认证。该文件217–249行有用户私有连接的new/address/start路径，但其后备连接不在本方案授权内。[v255 `sd-bus.h`](https://github.com/systemd/systemd/blob/v255/src/systemd/sd-bus.h)提供所需非变参API；以上是固定上游源码依据，不等同Ubuntu补丁版或现场连通实测。[peer模式文档](https://www.freedesktop.org/software/systemd/man/latest/sd_bus_set_bus_client.html)及[systemd1接口文档](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html)只作接口解释，latest页面不能替代v255证据。
 
@@ -142,7 +142,7 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 
 **期限、分配与释放。** 不另开worker或cgroup；FFI在现有受限root helper内执行。每次`sd_bus_call(timeout_usec)`仅取同一个原绝对deadline的剩余额度，外层进程硬截止继续兜底，不为每次调用重置5秒。原5秒后备、cleanup与执行总期限均不扩容。每个bus/message/error及临时FD在全部失败/取消出口释放；借用的bus FD不能误关，若为取peercred复制FD则单独关闭。固定argtypes/restype，不用变参或将native错误串写入回包。libsystemd内部wire接收与malloc由现有真实cgroup上限约束，**不能宣称原32KiB管道/文件预算同时限制D-Bus库内部接收分配**。
 
-**实际计费回执。** 原32768字节proc＋双pipe累计、512字节内层wire及1024字节整个外层回复继续不变，新增有限标量也须容入原包。入诊断前父已付B必须来自真实`setup_bytes`，raw grant为`32768−B−1024`，不从native19的worker.used17468推算。父在原结果中保存固定小型`accounting`：`parent_before`、`raw_grant`、`child_charged`、`reply_bytes`、`parent_after`和`settlement=validated|unvalidated|not_started`；数字仅取实际账本/实际wire，未知reply_bytes用null，不伪造零。合法同锚点、及时、有界回包才按真实used退差额，结算`parent_after=B+child_charged+reply_bytes`；未经验证不退款，丢回包继续按现有保守规则占满总额。未启动不制造子进程花费。该元数据同样受严格shape和整个1024字节保存投影门约束，不借新字段增加预留；它用于暴露现场是否有足够采集余额，不能保证未来一定取得内部事实。
+**实际计费回执。** 原32768字节proc＋双pipe累计、512字节内层wire及1024字节整个外层回复继续不变，新增有限标量也须容入原包。入诊断前父已付B必须来自真实`setup_bytes`，raw grant为`max(0,32768−B−1024)`，不从native19的worker.used17468推算。父在原结果`resources.setup_accounting`中保存固定小型结算：`parent_before`、`raw_grant`、`child_charged`、`reply_bytes`、`parent_after`和`settlement=validated|unvalidated|not_started`；数字仅取实际账本/实际wire，未知reply_bytes用null，不伪造零。合法同锚点、及时、有界回包才按真实used退差额，结算`parent_after=B+child_charged+reply_bytes`；未经验证不退款，丢回包继续按现有保守规则占满总额。未启动不制造子进程花费。结算不进入worker wire；父对紧凑`{setup,setup_accounting}`实际序列化执行原1024字节保存投影门，最终result仍受原32768字节总门约束。原wire的填充照实计费，保存投影不复制填充。装不下时仅保留固定not_observed和结算/首因，不增加预留；它用于暴露现场是否有足够采集余额，不能保证未来一定取得内部事实。
 
 **首片可证伪边界。** 离线fake缝隙须覆盖真实调用顺序与释放：仅两固定属性、无激活/回退；签名或尾部多值、仅peer PID/UID错、后socket/proc/PID1漂移均拒；剩余deadline耗尽、丢回包不退grant；实际512/513与1024/1025临界及最大accounting投影仍保住原checkpoint/首因。fake只证明协议编排和预算，不能证明FFI ABI、真实EXTERNAL握手或v255认证行为。实现获批并通过离线边界后，另行授权受控临时peer验证这些连接与凭据事实；不接真实用户服务、不扩大预算，也不据此跳过原READY尾门或直接启动native20。
 
@@ -157,3 +157,19 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 根随后实际收齐首轮27 passed：pytest0.06秒、守卫570毫秒、57.2MiB/swap0、exit0。这只验证离线编排；假C符号不执行原生返回ABI。根按固定[v255 `man/sd_bus_error.xml`](https://raw.githubusercontent.com/systemd/systemd/v255/man/sd_bus_error.xml)核出`sd_bus_error_free`返回void，候选却声明为pointer；没有因为返回值被忽略就认为声明正确。新增独立符号声明回归检查全部19项argtypes/restype，保留bus/message unref的pointer返回及close的void返回。根实收该节点1 failed：pytest0.06秒、守卫560毫秒、57.1MiB/swap0、exit1，唯一失败为error_free的pointer不等于None，fixture已完整进入ABI声明断言。
 
 据此授权仅将该绑定restype改为None，未改调用流程、资源释放或错误分类。根修后实收28 passed（pytest0.05秒；守卫530毫秒、54.9MiB/swap0、exit0）。Ruff通过；格式首检两文件exit1，根仅格式化这两文件后Ruff与格式均exit0。`MYPYPATH=src:tests`、strict/no-incremental限定新helper的类型检查通过（守卫715毫秒、71.9MiB/swap0、exit0）。28包含前述27，不重复累计。根独立源码复核与固定v255声明核对未见剩余具体P1/P2；这些证据仍不等于真实FFI、peer认证、集成wire/父层结算或READY实测，未启动native20。
+
+### 窗口集成与父级结算离线检查点
+
+根在签名`0cdb78f`后先实际执行独立17节点：10 failed、7 passed（pytest0.21秒；守卫708毫秒、72.9MiB/swap0、exit1）。四个身份窗口分支未调用peer、最大合法internal被旧shape拒绝、五个父级结算分支缺字段；它们已进入真实reader/parent账本，未因夹具错误提前失败。据此授权集成；本节尚不记修复后通过。
+
+`read_manager_instance`仅在第一次实际exe为已核manager、四UID全部匹配且proc额度尚余时调用独立helper；返回放在原`internal`位置。随后完整复核第二次proc，再由原`diagnose_manager_instance`复核第二次PID1 Unit/Service、账户及原绝对截止。任一后身份漂移撤销整组，internal恢复not_observed，原始tag/部分内部事实不保留；executor或UID不匹配不打开peer。旧inner五键和outer的`internal="not_observed"`仍兼容。内部仅接受精确四字段、固定状态/有限错误及uint32 NJobs，不把它当READY证据。
+
+正式`python -I /abs/managed_native_worker.py`的argv和隔离不改；脚本模式按固定同目录文件用importlib注册/装载peer，复用实际`__main__`中的worker异常与clock helper，不修改sys.path、不加载第二份worker。包模式保持相对导入。新增离线装载用例只执行脚本定义及受控loader，拦截真实peer，不是新进程`-I`或FFI实测。旧proc-only用例明确注入固定not_observed helper，以保留其原proc/漂移计费断言并禁止真实socket。
+
+新增父级结算由真实调用前账本、实际raw grant和返回wire记录；校验grant公式、严格数值类型、三种settlement等式、setup.used一致性及紧凑保存上限。失联reply_bytes=null且总量饱和，超1024回复记录实际字节但不退款，0余额无命令。保留原checkpoint、首因和零事务；未改READY、cleanup或effects门。除原17节点外，补固定脚本装载及损坏结算反例，均仅写入待根执行。未运行检查、Git、网络、真实FFI/socket、服务或CI，不授权native20。
+
+根随后在原30秒守卫中串行实收：新集成、独立peer和原instance三文件 **80 passed**（pytest0.35秒；守卫900毫秒、71.9MiB/swap0、exit0）；全部五个native文件整合 **640 passed**（pytest1.91秒；守卫2.593秒、133MiB/swap0、exit0）。640包含前述80，不重复累计。五文件完整集合为`test_managed_native_ci.py`、`test_managed_native_checkpoint.py`、`test_managed_native_instance.py`、`test_managed_native_peer.py`及`test_managed_native_peer_integration.py`。
+
+首次Ruff指出两处导入排序，format check指出四文件排版；根仅执行对应导入整理及格式化。最终五个Python文件Ruff及format check均exit0；`MYPYPATH=src:tests`下两脚本和peer helper的strict/no-incremental检查exit0（守卫5.391秒、285.5MiB/swap0）。格式化后的640项整合结果即上文最终结果。另一位未参与实现的Sol只读后审loader、双身份窗口、真实计费及原限额，未见新增P1/P2，未将审查计作额外测试。
+
+本检查点只完成离线窗口接线和父级结算；没有加载真实libsystemd、连接私有socket、创建原生服务或启动native20。真实ABI/EXTERNAL认证、现场READY与cleanup仍缺独立证据，native19失败保持未关闭。不得从640项通过推出这些外部行为已修复。

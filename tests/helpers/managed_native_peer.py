@@ -17,15 +17,26 @@ import stat
 import struct
 import sys
 from dataclasses import dataclass
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from .managed_native_worker import (
-    CLEANUP_SECONDS,
-    CONTEXT_REPLY_BYTES,
-    NativeError,
-    remaining,
-    require,
-)
+if TYPE_CHECKING or __package__:
+    from .managed_native_worker import (
+        CLEANUP_SECONDS,
+        CONTEXT_REPLY_BYTES,
+        NativeError,
+        remaining,
+        require,
+    )
+else:
+    # The isolated worker CLI loads this exact sibling without changing sys.path.
+    # Reuse its live error/clock helpers rather than importing a second worker.
+    from __main__ import (
+        CLEANUP_SECONDS,
+        CONTEXT_REPLY_BYTES,
+        NativeError,
+        remaining,
+        require,
+    )
 
 BasicState = Literal[
     "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance"
