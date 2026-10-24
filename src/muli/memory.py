@@ -20,6 +20,7 @@ from muli.store import Store, new_id, now
 from muli.store_schema import validate_existing_schema
 
 LAYERS = frozenset({"identity", "preference", "episodic", "semantic", "procedural"})
+_MAX_QUERY_TERMS = 64
 _KIND_LAYER = {
     "observation": "episodic",
     "fact": "semantic",
@@ -66,6 +67,13 @@ class _Walk:
     edges: list[dict[str, Any]]
     parents: dict[str, dict[str, Any]]
     truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSearch:
+    items: list[dict[str, Any]]
+    candidates_used: int
+    tokens: tuple[str, ...]
 
 
 class Memory:
@@ -285,7 +293,7 @@ class Memory:
         self._query(query)
         limit = max(1, min(limit, 100))
         if query.strip():
-            tokens = sorted(terms(query))[:64]
+            tokens = sorted(terms(query))[:_MAX_QUERY_TERMS]
             if not tokens:
                 return []
             rows = self.store.db.execute(
@@ -1085,7 +1093,7 @@ class Memory:
             ).fetchall()
         }
         # Longer Chinese names may be embedded in a sentence. Inspect only indexed hits.
-        tokens = sorted(terms(query))[:64]
+        tokens = sorted(terms(query))[:_MAX_QUERY_TERMS]
         if tokens:
             rows = self.store.db.execute(
                 "SELECT DISTINCT e.id,e.canonical FROM memory_entities e "
@@ -1100,7 +1108,7 @@ class Memory:
     @staticmethod
     def _seed_terms(query: str) -> list[str]:
         folded = normalize_entity(query)
-        return sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:64]
+        return sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:_MAX_QUERY_TERMS]
 
     def _seed_evidence(self, query: str, seeds: Sequence[str]) -> list[dict[str, Any]]:
         """One bounded supporting contribution per actual seed, with no source body reads."""
@@ -1286,46 +1294,32 @@ class Memory:
         hops: int | None = None,
         layer: str | None = None,
     ) -> list[dict[str, Any]]:
-        self._query(query)
-        if layer is not None and layer not in LAYERS:
-            raise ValueError("未知记忆分层")
-        limit = max(1, min(limit, self.max_candidates))
-        scores: dict[str, float] = {}
-        matched: dict[str, str] = {}
-        graph_paths: dict[str, dict[str, Any]] = {}
-        tokens = sorted(terms(query))[:64]
-        if not query.strip():
-            rows = self.store.db.execute(
-                "SELECT memory_id FROM memory_meta m JOIN memories i ON i.id=m.memory_id "
-                "WHERE m.status!='superseded' ORDER BY i.updated_at DESC LIMIT ?",
-                (self.max_candidates,),
-            ).fetchall()
-            scores = {row[0]: 0.0 for row in rows}
-            matched = dict.fromkeys(scores, "recent")
-        elif tokens:
-            rows = self.store.db.execute(
-                "SELECT t.memory_id,count(*) hits FROM memory_terms t "
-                "JOIN memory_meta m ON m.memory_id=t.memory_id "
-                f"WHERE m.status!='superseded' AND t.term IN ({_slots(tokens)}) "
-                "GROUP BY t.memory_id ORDER BY hits DESC,t.memory_id LIMIT ?",
-                [*tokens, self.max_candidates],
-            ).fetchall()
-            for row in rows:
-                scores[row["memory_id"]] = 2 * row["hits"] / len(tokens)
-                matched[row["memory_id"]] = "lexical"
-        if query.strip():
-            graph = self.traverse(query, hops=hops)
-            seed_evidence = {entry["entity_id"]: entry for entry in graph["alias_evidence"]}
-            for edge, path in zip(graph["edges"], graph["paths"], strict=True):
-                identifier = edge["memory_id"]
-                if identifier not in scores and len(scores) < self.max_candidates:
-                    scores[identifier] = 0.5 / edge["depth"]
-                    matched[identifier] = "graph"
-                    graph_paths[identifier] = {
-                        **path,
-                        "revision": graph["revision"],
-                        "seed": seed_evidence[path["seed_id"]],
-                    }
+        return self._search_result(query, limit, hops=hops, layer=layer).items
+
+    def search_for_prompt(self, query: str, limit: int, *, hops: int | None = None) -> PromptSearch:
+        return self._search_result(query, limit, hops=hops)
+
+    def _lexical_scores(self, tokens: Sequence[str], limit: int) -> dict[str, float]:
+        if not tokens or limit <= 0:
+            return {}
+        rows = self.store.db.execute(
+            "SELECT t.memory_id,count(*) hits FROM memory_terms t "
+            "JOIN memory_meta m ON m.memory_id=t.memory_id "
+            f"WHERE m.status!='superseded' AND t.term IN ({_slots(tokens)}) "
+            "GROUP BY t.memory_id ORDER BY hits DESC,t.memory_id LIMIT ?",
+            [*tokens, limit],
+        ).fetchall()
+        return {row["memory_id"]: 2 * row["hits"] / len(tokens) for row in rows}
+
+    def _rank_search(
+        self,
+        scores: Mapping[str, float],
+        matched: Mapping[str, str],
+        graph_paths: Mapping[str, dict[str, Any]],
+        limit: int,
+        *,
+        layer: str | None = None,
+    ) -> list[dict[str, Any]]:
         ranked = []
         timestamp = now()
         for identifier, score in scores.items():
@@ -1341,6 +1335,73 @@ class Memory:
         return sorted(ranked, key=lambda item: (-item["score"], -item["updated_at"], item["id"]))[
             :limit
         ]
+
+    def task_prompt_candidates(
+        self,
+        query: str,
+        *,
+        candidate_limit: int,
+        excluded_ids: frozenset[str],
+        current_tokens: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        self._query(query)
+        remaining_terms = max(0, _MAX_QUERY_TERMS - len(current_tokens))
+        tokens = sorted(terms(query) - set(current_tokens))[:remaining_terms]
+        limit = max(0, min(candidate_limit, self.max_candidates))
+        # Excluded or invalid rows consume this one SQL slice; never refill it.
+        scores = self._lexical_scores(tokens, limit)
+        eligible = {
+            identifier: score
+            for identifier, score in scores.items()
+            if identifier not in excluded_ids
+        }
+        return self._rank_search(eligible, dict.fromkeys(eligible, "lexical"), {}, limit)
+
+    def _search_result(
+        self,
+        query: str,
+        limit: int,
+        *,
+        hops: int | None = None,
+        layer: str | None = None,
+    ) -> PromptSearch:
+        self._query(query)
+        if layer is not None and layer not in LAYERS:
+            raise ValueError("未知记忆分层")
+        limit = max(1, min(limit, self.max_candidates))
+        scores: dict[str, float] = {}
+        matched: dict[str, str] = {}
+        graph_paths: dict[str, dict[str, Any]] = {}
+        tokens = tuple(sorted(terms(query))[:_MAX_QUERY_TERMS])
+        if not query.strip():
+            rows = self.store.db.execute(
+                "SELECT memory_id FROM memory_meta m JOIN memories i ON i.id=m.memory_id "
+                "WHERE m.status!='superseded' ORDER BY i.updated_at DESC LIMIT ?",
+                (self.max_candidates,),
+            ).fetchall()
+            scores = {row[0]: 0.0 for row in rows}
+            matched = dict.fromkeys(scores, "recent")
+        elif tokens:
+            scores = self._lexical_scores(tokens, self.max_candidates)
+            matched = dict.fromkeys(scores, "lexical")
+        if query.strip():
+            graph = self.traverse(query, hops=hops)
+            seed_evidence = {entry["entity_id"]: entry for entry in graph["alias_evidence"]}
+            for edge, path in zip(graph["edges"], graph["paths"], strict=True):
+                identifier = edge["memory_id"]
+                if identifier not in scores and len(scores) < self.max_candidates:
+                    scores[identifier] = 0.5 / edge["depth"]
+                    matched[identifier] = "graph"
+                    graph_paths[identifier] = {
+                        **path,
+                        "revision": graph["revision"],
+                        "seed": seed_evidence[path["seed_id"]],
+                    }
+        return PromptSearch(
+            self._rank_search(scores, matched, graph_paths, limit, layer=layer),
+            len(scores),
+            tokens,
+        )
 
     def _rebuild_communities(self, affected: set[str]) -> None:
         visited: set[str] = set()

@@ -84,6 +84,17 @@ Runtime 在召回前分配本轮预算：沿用 `min(12000, limits.max_context_c
 
 普通旧 `memory_context_provider(query) -> str` 同步回调仍只调用一次。返回结果或自定义具名适配器输出超过实际预算时整体省略，不裁剪字符串、不捕获 `TypeError` 重试。需要宿主预算的受信扩展应显式使用 `muli.memory_context.MemoryContextProvider(renderer)`；renderer 接收 `(query, max_chars=None, *, latest_user_id=None)`，适配器本身仍支持旧的一参数调用。这里不新增网络调用或持久格式。
 
+### 任务背景补位（v2.61开发候选）
+
+真实任务已绑定的队友可从本次冻结目标补充项目背景；主会话明确选中的重规划快照只作选材。
+当前输入的检索、Graph和侧写先照旧执行，过滤本次初始自动episode后仍有当前召回时不补位。
+原资料块逐字保留，任务背景只用剩余词数、候选、证据、名额及字符作本地词法尾补，不新增
+前台网络或图遍历；缓存无本次消费资料时不争取补位。本次自动episode也不能沿目标回灌。
+没有scope不猜最近任务，资料不改变暂停或授权。旧回调保持，默认与应用适配器共用同一路径。
+正式请求先完成原基线、任务说明、Skills与打包；整请求还有空间且宿主消息未被扩展改写或
+复制时，才整份接纳任务增量。不够则省略，不再节选既有工具结果或重跑hook。
+用法、先红和待验边界见[任务背景随队友继续](task-memory-continuity.md)。
+
 ### 自动提示中的冲突组合
 
 普通记忆保持原 JSON 行形状。尚未解决的冲突使用 `type="conflict"` 资料行：能完整放下双方定位元数据及可读正文片段时，`availability="paired"`，`memories` 中的双方各占一个既有名额；否则整组变为 `availability="pending"`，占一个名额，`memories=[]`，仅在 `seed` 中保留当前仍有效的记忆定位元数据及外层 `revision`，不交付单侧正文。提示本身也放不下时整体省略，不裁剪 ID 或 JSON。

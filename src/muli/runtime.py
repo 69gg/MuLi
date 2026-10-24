@@ -9,6 +9,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,7 @@ from jsonschema import Draft202012Validator
 
 from muli.compaction import Compactor
 from muli.config import ConfigFile, ModelProfile, Settings
-from muli.context import ContextLimitError, pack_context
+from muli.context import ContextLimitError, context_size, pack_context
 from muli.conversation import Conversation
 from muli.events import EventBus
 from muli.evidence import EvidenceError
@@ -32,7 +33,7 @@ from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role
 from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
-from muli.memory_context import MemoryContextProvider, recalled_for_prompt, render_context
+from muli.memory_context import MemoryContextProvider, PromptComposition, compose_context_result
 from muli.mobile_approvals import MobileApprovals
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
@@ -93,6 +94,13 @@ class _ExecutionResult:
     content: str
     message_id: str | None = None
     reply_origin: ReplyOrigin | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoryContext:
+    messages: list[Message]
+    host_message: Message
+    system_with_task: str
 
 
 class Runtime:
@@ -402,9 +410,23 @@ class Runtime:
             else:
                 self._coordinator_tools.discard(tool.name)
 
-    async def prepare_context(self, session_id: str, messages: list[Message]) -> list[Message]:
+    async def prepare_context(
+        self,
+        session_id: str,
+        messages: list[Message],
+        *,
+        history: _HistoryContext | None = None,
+    ) -> list[Message]:
+        host = deepcopy(history.host_message) if history is not None else None
         for hook in self.context_hooks:
             messages = await hook(session_id, messages)
+        retained_host = (
+            history is not None
+            and host is not None
+            and history.host_message == host
+            and sum(message is history.host_message for message in messages) == 1
+            and sum(message == host for message in messages) == 1
+        )
         request = self.request_context(session_id)
         snapshot = (request.execution_scope or request.selected_replan) if request else None
         if snapshot is not None:
@@ -420,7 +442,29 @@ class Runtime:
             ]
         if self.skills_context is not None:
             messages = await self.skills_context(session_id, messages)
-        return pack_context(messages, self.config.settings.limits.max_context_chars)
+        packed = pack_context(messages, self.config.settings.limits.max_context_chars)
+        if retained_host and history is not None and host is not None:
+            return self._append_task_memory(packed, host, history.system_with_task)
+        return packed
+
+    def _append_task_memory(
+        self, messages: list[Message], host: Message, system_with_task: str
+    ) -> list[Message]:
+        if system_with_task == host.content:
+            return messages
+        matches = [index for index, message in enumerate(messages) if message == host]
+        if len(matches) != 1:
+            return messages
+        index = matches[0]
+        candidate = list(messages)
+        candidate[index] = replace(messages[index], content=system_with_task)
+        # Optional task evidence must never force another packing pass or displace
+        # the baseline, frozen scope, skills, native protocol or current tool batch.
+        return (
+            candidate
+            if context_size(candidate) <= self.config.settings.limits.max_context_chars
+            else messages
+        )
 
     async def _next_context(self, session_id: str) -> list[Message]:
         return (await self._prepare_request(session_id)).messages
@@ -486,18 +530,16 @@ class Runtime:
         try:
             try:
                 projected = self.compaction.project(session_id)
-                messages = await self.prepare_context(
-                    session_id, self._history(session_id, pack=False, stored=projected)
-                )
+                history = self._history_context(session_id, stored=projected)
+                messages = await self.prepare_context(session_id, history.messages, history=history)
             except ContextLimitError:
                 # Retrying compaction uses the same frozen scope, never a new
                 # epoch attached to the old request's task brief.
                 if not await self.compaction.finish(session_id):
                     raise
                 projected = self.compaction.project(session_id)
-                messages = await self.prepare_context(
-                    session_id, self._history(session_id, pack=False, stored=projected)
-                )
+                history = self._history_context(session_id, stored=projected)
+                messages = await self.prepare_context(session_id, history.messages, history=history)
             if self.task_control is not None and (run_id := self.run_ids.get(session_id)):
                 self.task_control.bind_report_notice(
                     session_id, run_id, execution, projected, messages
@@ -1549,6 +1591,26 @@ class Runtime:
                 interrupted=True,
             )
 
+    def _memory_task_query(self, session_id: str) -> str | None:
+        request = self.request_context(session_id)
+        if request is None:
+            return None
+        snapshot = request.execution_scope or request.selected_replan
+        if snapshot is None:
+            return None
+        try:
+            brief = json.loads(snapshot.brief_json)
+        except (ValueError, TypeError):
+            return None
+        goal = brief.get("goal") if isinstance(brief, dict) else None
+        if not isinstance(goal, str) or not goal.strip():
+            return None
+        try:
+            self.memory._query(goal)
+        except ValueError:
+            return None
+        return goal
+
     def _history(
         self,
         session_id: str,
@@ -1556,6 +1618,19 @@ class Runtime:
         pack: bool = True,
         stored: list[dict[str, Any]] | None = None,
     ) -> list[Message]:
+        history = self._history_context(session_id, stored=stored)
+        return (
+            pack_context(history.messages, self.config.settings.limits.max_context_chars)
+            if pack
+            else history.messages
+        )
+
+    def _history_context(
+        self,
+        session_id: str,
+        *,
+        stored: list[dict[str, Any]] | None = None,
+    ) -> _HistoryContext:
         if stored is None:
             stored = self.compaction.project(session_id)
         self.compaction.observe(session_id)
@@ -1635,31 +1710,42 @@ class Runtime:
                 min(12000, self.config.settings.limits.max_context_chars // 4) - len(memory_prefix),
             ),
         )
-        recalled: str = ""
+        composition = PromptComposition("", "")
         if memory_settings.enabled and memory_budget > 0:
             provider = self.memory_context_provider
             if isinstance(provider, MemoryContextProvider):
-                recalled = provider.render_for_prompt(last_user, memory_budget, latest_user_id)
+                composition = provider.compose_for_prompt(
+                    last_user,
+                    memory_budget,
+                    latest_user_id,
+                    task_query=self._memory_task_query(session_id),
+                )
             elif provider is not None:
                 recalled = provider(last_user)
+                composition = PromptComposition(recalled, recalled)
             else:
                 limit = min(5, memory_settings.context_limit)
-                matches = recalled_for_prompt(
-                    self.memory, last_user, limit, latest_user_id=latest_user_id
-                )
-                recalled = render_context(
+                composition = compose_context_result(
+                    self.memory,
                     last_user,
-                    matches,
-                    self.memory.owner_profile(limit),
                     limit=limit,
                     budget=memory_budget,
-                    memory=self.memory,
+                    latest_user_id=latest_user_id,
+                    task_query=self._memory_task_query(session_id),
                 )
-        if len(recalled) > memory_budget:
-            recalled = ""
-        if recalled:
-            prompt += memory_prefix + recalled
-        messages = [Message(role="system", content=prompt)]
+        if len(composition.baseline) > memory_budget:
+            composition = PromptComposition("", "")
+        elif len(composition.with_task) > memory_budget or not composition.with_task.startswith(
+            composition.baseline
+        ):
+            composition = PromptComposition(composition.baseline, composition.baseline)
+        system_with_task = (
+            prompt + memory_prefix + composition.with_task if composition.with_task else prompt
+        )
+        if composition.baseline:
+            prompt += memory_prefix + composition.baseline
+        host_message = Message(role="system", content=prompt)
+        messages = [host_message]
         for item in stored:
             messages.append(
                 Message(
@@ -1704,11 +1790,7 @@ class Runtime:
             for call in message.tool_calls:
                 pending[call.id] = call
         close_pending()
-        return (
-            pack_context(repaired, self.config.settings.limits.max_context_chars)
-            if pack
-            else repaired
-        )
+        return _HistoryContext(repaired, host_message, system_with_task)
 
     def _latest_main_trigger(self, session_id: str) -> dict[str, Any] | None:
         session = self.store.get("session", session_id) or {}

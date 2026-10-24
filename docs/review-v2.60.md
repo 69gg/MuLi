@@ -2,7 +2,8 @@
 
 状态：本地功能、相关回归、质量与离线包门已闭合。签名候选
 `b65ddf9fb817d3e77c801836696a4d64d050bff3` 已推送至
-[PR #68](https://github.com/69gg/MuLi/pull/68)，首轮远端十一绿、一项失败，尚未正式发行。
+[PR #68](https://github.com/69gg/MuLi/pull/68)，首轮远端十一绿、一项失败；修后精确候选
+十二项及正式发行十五项全绿，GitHub/PyPI两构件元数据已核对，正式发行见文末。
 功能合同见 [voice-reply-proposal.md](voice-reply-proposal.md)。
 
 ## 已实收证据
@@ -66,3 +67,22 @@ deadline、timeout_at、写前末门及取消/unknown回收保持。整lease文�
 （格式76毫秒、21.8MiB）；83包离线锁70毫秒、29.2MiB。离线重建1.431秒、99.3MiB，
 内容校验174毫秒、19.4MiB，隔离wheel离线安装/导入/兼容/资产/API/提示词/桌面默认值/
 任务控制/lifespan烟测1.242秒、99.9MiB，版本2.60。均exit0、swap0，旧notes未覆写。
+
+## 发行闭合
+
+修后GPG签名提交 `64f9d9d074f5432923806b3b42de390c566ff223` 的
+[候选CI 40093175960](https://github.com/69gg/MuLi/actions/runs/40093175960) 十二项全部success。
+签名标签 `v2.60.0` 已本地verify-tag为Good signature，与main原子推送；
+[正式发行40094164612](https://github.com/69gg/MuLi/actions/runs/40094164612) 十五项全部success。
+main重复CI `40094164561` 已请求取消，不能将取消视为通过。
+
+[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.60.0) 已于
+2026-10-24T12:38:49Z发布。根仅读取GitHub/PyPI有限JSON元数据，没有下载发行包；
+核对两边文件名、大小、SHA-256与PyPI未yanked：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.60.0-py3-none-any.whl` | 863776 | `388d0e8cb444db21b892689ebc094b0f81406a29b9b3b4ff19939d9192d26af9` |
+| `muli_agent-2.60.0.tar.gz` | 4591862 | `f1b3eba11e97aa250854cc6f2a035311193a41baa617826ffe9fa5b9f39ac779` |
+
+发行不代表真实设备、声纹识别率、自然模型或外部账号联调已验收，首次失败记录保留。

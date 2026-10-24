@@ -16,7 +16,7 @@ from muli.events import EventBus
 from muli.maintenance import Admission
 from muli.media import MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
-from muli.memory_context import recalled_for_prompt, render_context
+from muli.memory_context import PromptComposition, compose_context_result
 from muli.store import now
 
 Extractor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -645,10 +645,28 @@ class MemoryPipeline:
         *,
         latest_user_id: str | None = None,
         limit: int | None = None,
+        task_query: str | None = None,
     ) -> str:
+        return self.context_for_prompt_result(
+            query,
+            max_chars,
+            latest_user_id=latest_user_id,
+            limit=limit,
+            task_query=task_query,
+        ).with_task
+
+    def context_for_prompt_result(
+        self,
+        query: str,
+        max_chars: int,
+        *,
+        latest_user_id: str | None = None,
+        limit: int | None = None,
+        task_query: str | None = None,
+    ) -> PromptComposition:
         """宿主已检查当前开关和预算；选材不依赖启动时的旧字符上限。"""
         if max_chars <= 0:
-            return ""
+            return PromptComposition("", "")
         limit = self.config.context_limit if limit is None else limit
         cached = self._cached(query, limit, self.config.graph_hops)
         if cached is None:
@@ -656,19 +674,13 @@ class MemoryPipeline:
                 if key[0] == query and key[2] == self.config.graph_hops:
                     cached = deepcopy(self._cache[key])
                     break
-        recalled = recalled_for_prompt(
+        return compose_context_result(
             self.memory,
             query,
-            limit,
+            limit=limit,
+            budget=max_chars,
             latest_user_id=latest_user_id,
             cached=cached["memories"] if cached is not None else None,
             hops=self.config.graph_hops,
-        )
-        return render_context(
-            query,
-            recalled,
-            self.memory.owner_profile(limit),
-            limit=limit,
-            budget=max_chars,
-            memory=self.memory,
+            task_query=task_query,
         )
