@@ -1117,16 +1117,55 @@ def fixture_result(data: bytes) -> dict[str, Any]:
         "boot",
         "result",
     }
+    revision_fields = {"revision", "intent", "code", "failure_code", "rollback_attempted"}
+    intents = {
+        "none",
+        "stop_base",
+        "install_target",
+        "start_target",
+        "stop_target",
+        "restore_base",
+        "start_base",
+        "verify_base",
+    }
+    codes = {
+        "cancelled",
+        "drain_timeout",
+        "deadline_exceeded",
+        "clock_invalid",
+        "foreign_state",
+        "health_failed",
+        "backend_failed",
+        "ambiguous_start",
+        "activation_failed",
+        "snapshot_invalid",
+    }
     if not isinstance(timeline, list) or len(timeline) > 64:
         raise FixtureError("native_result_invalid")
     for row in timeline:
         if (
             not isinstance(row, dict)
             or not {"stage", "elapsed_ms"}.issubset(row)
-            or not set(row).issubset(integers | strings)
+            or not set(row).issubset(integers | strings | revision_fields)
+        ):
+            raise FixtureError("native_result_invalid")
+        if revision_fields.intersection(row) and (
+            row["stage"] != "transaction"
+            or not revision_fields.issubset(row)
+            or type(row["revision"]) is not int
+            or not 1 <= row["revision"] <= 2**63 - 1
+            or not isinstance(row["intent"], str)
+            or row["intent"] not in intents
+            or any(
+                row[key] is not None and (not isinstance(row[key], str) or row[key] not in codes)
+                for key in ("code", "failure_code")
+            )
+            or type(row["rollback_attempted"]) is not bool
         ):
             raise FixtureError("native_result_invalid")
         for name, fact in row.items():
+            if name in revision_fields:
+                continue
             if name in integers:
                 valid = type(fact) is int and 0 <= fact <= 2**63 - 1
             else:

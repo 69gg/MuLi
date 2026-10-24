@@ -3231,6 +3231,7 @@ class Case:
 
     def note(self, stage: str, **facts: Any) -> None:
         require(re.fullmatch(r"[a-z_]{1,40}", stage) is not None, "native_stage_invalid")
+        revision_fields = {"revision", "intent", "code", "failure_code", "rollback_attempted"}
         allowed = {
             "phase",
             "activation",
@@ -3242,8 +3243,24 @@ class Case:
             "boot",
             "result",
             "exit_status",
-        }
+        } | revision_fields
         require(set(facts).issubset(allowed), "native_fact_invalid")
+        if revision_fields.intersection(facts):
+            from typing import get_args
+
+            from muli.management_transaction import Code, Intent
+
+            require(
+                stage == "transaction"
+                and revision_fields.issubset(facts)
+                and type(facts["revision"]) is int
+                and 1 <= facts["revision"] <= 2**63 - 1
+                and facts["intent"] in get_args(Intent)
+                and facts["code"] in (None, *get_args(Code))
+                and facts["failure_code"] in (None, *get_args(Code))
+                and type(facts["rollback_attempted"]) is bool,
+                "native_fact_invalid",
+            )
         self.stage = stage
         if not self.recording:
             return
@@ -3527,6 +3544,11 @@ class Case:
                                 generation=record.generation,
                                 phase=record.phase,
                                 activation=record.activation,
+                                revision=record.revision,
+                                intent=record.intent,
+                                code=record.code,
+                                failure_code=record.failure_code,
+                                rollback_attempted=record.rollback_attempted,
                             )
                             anchor, controller, _ = self.deployment(journal, record)
                             await self.helper_empty(

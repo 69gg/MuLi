@@ -703,3 +703,72 @@ no-incremental及explicit-package-bases通过（守卫5.358秒、290.4MiB）；
 全仓Ruff通过（76毫秒、26MiB），378文件格式检查通过（70毫秒、26.1MiB），
 新增测试格式无需改变。此为Native27离线完整相关回归，未替代下一精确远端运行的
 正式启动、事务和cleanup结果；文档再次冻结，作者未自行执行检查。
+
+### Native27 真实首代事务失败与 Native28 最小首因证据候选
+
+根对G签 `cb6c7c248434e4aebc2dc5abc2f4712b69753d56` 的单次CI
+`40066956416` 收取 managed-native job `120792123122` 失败证据。
+artifact `12549756223` 为1630字节，SHA-256为
+`686d6c7238888e2117eb043f34804c36052416bb04e2ba1cf062a8193213710f`，
+已由根按原typed parser校验。环境门全true、manager ready266ms；本轮实际到达
+origin_ready5049ms、identity_frozen5054ms和adopt准备5083ms，generation1随后经历
+prepared6463ms、draining13262ms、activating18362ms、rolling_back22183ms及
+recovery_required23222ms。最终code为 `native_transaction_blocked`，completed=false；
+helper_exit23247ms记录helper PID2611、Result=success、exit_status=0。
+驱动正常返回恢复态不等于事务成功；尚无已完成代次，也未进入后续switch B/A验收。
+
+本轮cleanup仍失败，receipt的user_removed/group_removed均false、mounts为3，不能
+沿用Native26的cleanup verified。源码另确认fixture写入的 `muli.service` 没有对应
+精准清理步骤，可能触发原bootstrap非空保守门；这与本轮事务首因独立，尚未由该
+artifact证明它是本轮cleanup唯一首因，本节不修改删除授权。
+
+现有revision观察已真实读取完整typed record，但timeline只保留phase/activation等
+旧白名单：既丢掉首 `failure_code` 与最终 `code`，也可能把同phase不同intent的两个
+revision按相同facts合并。Native28候选仅在这次既有record读取的原transaction行增加
+`revision`、`intent`、`code`、`failure_code`、`rollback_attempted`；直接复用原严格类型
+和有限枚举，不输出health、challenge、原始路径、异常串或完整journal。不增加journal
+读取、查询、采样轮、原时间或字节额度，仍受64行及原32KiB实际序列化门约束。
+`backend_failed`仍是受控归类码，不凭它推断systemctl的具体失败原因。
+
+新单项 `tests/test_managed_native_transaction.py::
+test_actual_transaction_preserves_first_and_final_failure_revisions` 复用真实retained-slot、
+anchor与快照发布夹具、真实TransactionJournal和 `advance_managed`：有限HTTP替身依次
+推进activating/stop_base、activating/install_target、rolling_back/stop_target首因
+deadline_exceeded、recovery_required最终backend_failed。实际 `Case.transaction` 读取
+这些已落盘revision并触发原 `native_transaction_blocked`，然后核原result.json同时保留
+四次revision、intent和两个不同失败码，而非仅检查未来schema字段存在。外部HTTP及
+helper进程观察为离线替身，不执行systemd、进程或真实私有socket，不宣称完整托管旅程。
+作者仅新增此测试与本说明，尚未运行检查、格式、Git或网络；生产未改，等待根收取真实红。
+
+根随后收取上述唯一selector真实红：1 failed，pytest0.34秒、守卫884毫秒、
+64.4MiB、swap0；实际 `Case.transaction` 已读取四个正式revision，但首两次同phase、
+不同intent被旧note去重，落盘少一行，尚未到后续字段断言。此为行为缺口，不是
+missing API、导入或未来schema前置失败。Native27整轮CI现已completed/failure，
+准确头仍为 `cb6c7c248434e4aebc2dc5abc2f4712b69753d56`：其它10个job通过，
+唯一managed-native因正式事务及cleanup失败，不能描述成其它10项也失败。
+
+根授权后的候选实现只在同一原revision note补上上述五字段；worker复用原
+`Code/Intent` Literal约束，coordinator以相同有限枚举校验，revision为正的有界精确int、
+rollback_attempted为精确bool，code/failure_code只接受原Code或null。出现新字段须为
+transaction行的完整五字段组；旧artifact不含该组仍按原形状接纳，不补假值，不从
+字符串推断历史revision。实际同phase不同intent现在因revision字段而保留为不同观察。
+
+真实Journal目标回归追加原 `fixture_result` 收集入口的落盘回读，另补旧时间线形状
+不变、bool冒充int/越界revision、非枚举intent/code、任意失败正文对象、非bool回滚标记、
+部分组及错误stage拒绝的纯边界回归。原64行、32KiB门与期限不变，无新journal读取、
+查询或health。候选尚待根统一定向及相关整合验证；作者未运行检查、Git或网络，
+不据诊断字段实作宣称adopt首因已查明或cleanup已修复。
+
+根随后实际完成Native28离线验证：新增文件10 passed，pytest0.33秒、守卫875毫秒、
+72.1MiB；原七文件839 passed，pytest2.68秒、守卫3.321秒、159.2MiB。两组共849个
+不同节点，不是一次849项全量运行，新增目标selector包含在10项中，不另行累计。
+
+coordinator、worker、peer三脚本strict通过（守卫5.481秒、290.2MiB）；全仓Ruff通过
+（74毫秒、24.3MiB），379文件格式检查通过（62毫秒、21.5MiB）。根仅格式化一个
+文件，无语义改动；并独立逐项核对新白名单与原 `Intent/Code` 枚举完全一致，原deadline、
+读取次数及行数/字节门保持。A随后完成正式非作者只读后审，未发现剩余必须修复的
+P1/P2：确认五字段成组、精确类型及枚举、新旧回执兼容，直接复用原已读record，
+没有新增命令、读取或期限。
+以上离线绿只验证固定首因证据的保留与边界，不证明Native27真实adopt失败根因已解决，
+也不包含cleanup修复或新远端事务验收。本次仅追加文档并冻结，作者未改生产/测试，
+未执行检查、Git或网络。
