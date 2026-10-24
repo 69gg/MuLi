@@ -126,6 +126,10 @@ def socket_proc(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "charged": [],
         "rounds": {42: 0, 73: 0},
         "environment": b"SECRET=never-export-me\xff\0XDG_RUNTIME_DIR=/run/user/23145\0",
+        "cmdline": (
+            b"/usr/bin/systemctl\0--user\0set-environment\0"
+            b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus\0"
+        ),
     }
     group = "/user.slice/user-23145.slice/user@23145.service"
     state["group"] = group
@@ -173,6 +177,12 @@ def socket_proc(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             data = (
                 f"0::{current}/{'init.scope' if pid == 42 else 'app.slice/dbus.socket'}\n".encode()
             )
+        elif path.name == "cmdline":
+            assert pid == 73 and limit <= 512
+            assert state["rounds"][73] == 1
+            data = state["cmdline"]
+            if case == "cmdline-deadline":
+                state["clock"] = 105.0
         else:
             assert path.name == "environ" and pid == 73, "only child two-key environment"
             data = state["environment"]
@@ -189,6 +199,8 @@ def socket_proc(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         assert pid in {42, 73}
         state["images"].append(pid)
         value = "/usr/lib/systemd/systemd" if pid == 42 else "/usr/bin/systemctl"
+        if pid == 73 and state["case"] == "child-other-image":
+            value = "/foreign/never-export-me"
         if pid == 73 and state["case"] == "child-image" and state["rounds"][73] > 1:
             value = "/foreign/never-export-me"
         state["charged"].append(len(os.fsencode(value)))
@@ -216,8 +228,8 @@ def test_no_control_pid_is_only_an_absent_observation_and_never_reads_child_proc
             "start_ticks": None,
             "exe": "unavailable",
             "uids": "unavailable",
-            "runtime_env": "unavailable",
-            "force_bus": "unavailable",
+            "env": "---",
+            "cmd": "unavailable",
         },
     }
     assert socket_proc["rounds"] == {42: 2, 73: 0}
@@ -237,7 +249,7 @@ def test_no_control_pid_is_only_an_absent_observation_and_never_reads_child_proc
         (b"SYSTEMCTL_FORCE_BUS=YeS\0", "missing", "on"),
     ],
 )
-def test_start_post_reads_actual_child_in_both_proc_windows_and_classifies_only_two_keys(
+def test_start_post_reads_actual_child_in_both_proc_windows_and_classifies_original_environment_cases(
     socket_proc: dict[str, Any], environment: bytes, runtime: str, force: str
 ) -> None:
     socket_proc["environment"] = b"SECRET=never-export-me\xff\0" + environment
@@ -250,8 +262,10 @@ def test_start_post_reads_actual_child_in_both_proc_windows_and_classifies_only_
             "start_ticks": 200,
             "exe": "systemctl",
             "uids": "all_expected",
-            "runtime_env": runtime,
-            "force_bus": force,
+            "env": {"matches": "e", "missing": "m", "other": "o", "duplicate": "d"}[runtime]
+            + "m"
+            + {"on": "1", "off": "0", "missing": "m", "other": "o", "duplicate": "d"}[force],
+            "cmd": "set_bus",
         },
     }
     assert socket_proc["rounds"] == {42: 2, 73: 2}
@@ -303,8 +317,8 @@ def test_new_maximum_compact_control_shape_keeps_original_wire_caps_and_legacy_i
         "start_ticks": 2**64 - 1,
         "exe": "systemctl",
         "uids": "all_expected",
-        "runtime_env": "duplicate",
-        "force_bus": "duplicate",
+        "env": "ddd",
+        "cmd": "set_other",
     }
     internal = {
         "code": "observed",
@@ -332,3 +346,318 @@ def test_new_maximum_compact_control_shape_keeps_original_wire_caps_and_legacy_i
     }
     assert ci.manager_instance_facts(legacy)
     assert not ci.manager_instance_facts(legacy, allow_legacy=False)
+
+
+@pytest.mark.parametrize(
+    ("environment", "environment_code"),
+    [
+        (
+            b"XDG_RUNTIME_DIR=/foreign\0DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus\0",
+            "oem",
+        ),
+        (
+            b"XDG_RUNTIME_DIR=/run/user/23145\0"
+            b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus\0"
+            b"SYSTEMCTL_FORCE_BUS=YeS\0",
+            "ee1",
+        ),
+        (b"SYSTEMCTL_FORCE_BUS=0\0", "mm0"),
+        (
+            b"XDG_RUNTIME_DIR=a\0XDG_RUNTIME_DIR=b\0"
+            b"DBUS_SESSION_BUS_ADDRESS=a\0DBUS_SESSION_BUS_ADDRESS=b\0"
+            b"SYSTEMCTL_FORCE_BUS=on\0SYSTEMCTL_FORCE_BUS=off\0",
+            "ddd",
+        ),
+    ],
+)
+def test_control_joint_sample_uses_real_cmdline_and_same_environment_without_raw_values(
+    socket_proc: dict[str, Any],
+    environment: bytes,
+    environment_code: str,
+) -> None:
+    socket_proc["environment"] = b"SECRET=never-export-me\xff\0" + environment
+    result = observe(socket_proc)
+    assert result["code"] == "observed"
+    assert result["internal"]["control"] == {
+        "code": "observed",
+        "start_ticks": 200,
+        "exe": "systemctl",
+        "uids": "all_expected",
+        "env": environment_code,
+        "cmd": "set_bus",
+    }
+    selected = [(pid, name) for pid, name, _ in socket_proc["reads"]]
+    assert selected.count((73, "cmdline")) == selected.count((73, "environ")) == 1
+    assert socket_proc["rounds"] == {42: 2, 73: 2}
+    assert socket_proc["images"] == [42, 73, 73, 42]
+    assert result["used"] == sum(socket_proc["charged"])
+    encoded = (json.dumps(result, separators=(",", ":")) + "\n").encode()
+    assert len(encoded) <= 512
+    assert b"never-export-me" not in encoded and b"/run/user" not in encoded
+
+
+@pytest.mark.parametrize(
+    ("arguments", "command"),
+    [
+        (
+            [
+                b"/bin/systemctl",
+                b"--user",
+                b"set-environment",
+                b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus",
+            ],
+            "set_bus",
+        ),
+        (
+            [
+                b"/usr/bin/systemctl",
+                b"--user",
+                b"set-environment",
+                b"DBUS_SESSION_BUS_ADDRESS=never-export-me",
+            ],
+            "set_other",
+        ),
+        (
+            [
+                b"/usr/bin/systemctl",
+                b"--system",
+                b"set-environment",
+                b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus",
+            ],
+            "other",
+        ),
+        (
+            [
+                b"/usr/bin/systemctl",
+                b"--user",
+                b"set-environment",
+                b"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/23145/bus",
+                b"EXTRA=secret",
+            ],
+            "other",
+        ),
+    ],
+)
+def test_control_command_requires_the_complete_fixed_argument_shape(
+    socket_proc: dict[str, Any],
+    arguments: list[bytes],
+    command: str,
+) -> None:
+    socket_proc["cmdline"] = b"\0".join(arguments) + b"\0"
+    result = observe(socket_proc)
+    assert result["code"] == "observed"
+    child = result["internal"]["control"]
+    assert child == {
+        "code": "observed",
+        "start_ticks": 200,
+        "exe": "systemctl",
+        "uids": "all_expected",
+        "env": "emm",
+        "cmd": command,
+    }
+    assert result["used"] == sum(socket_proc["charged"])
+    assert "never-export-me" not in json.dumps(result) and "EXTRA" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("length", [512, 513])
+def test_control_cmdline_byte_boundary_is_charged_to_the_existing_raw_grant(
+    socket_proc: dict[str, Any],
+    length: int,
+) -> None:
+    prefix = b"/usr/bin/systemctl\0--user\0set-environment\0DBUS_SESSION_BUS_ADDRESS="
+    socket_proc["cmdline"] = prefix + b"x" * (length - len(prefix) - 1) + b"\0"
+    result = observe(socket_proc)
+    if length == 512:
+        assert result["code"] == "observed"
+        assert result["internal"]["control"]["cmd"] == "set_other"
+        assert result["used"] == sum(socket_proc["charged"])
+        assert (73, "cmdline", 512) in socket_proc["reads"]
+    else:
+        assert result["code"] == "not_observed" and result["used"] == 4096
+        assert "internal" not in result
+    assert all(0 < limit <= 4096 for _, _, limit in socket_proc["reads"])
+
+
+@pytest.mark.parametrize("cmdline", [b"", b"systemctl\0--user", b"\0--user\0", b"systemctl\0\0"])
+def test_control_invalid_or_incomplete_nul_cmdline_withdraws_the_whole_sample(
+    socket_proc: dict[str, Any],
+    cmdline: bytes,
+) -> None:
+    socket_proc["cmdline"] = cmdline
+    result = observe(socket_proc)
+    assert result == worker.instance_unavailable("invalid_reply", 4096)
+    assert "internal" not in result
+
+
+def test_compact_joint_control_is_current_only_and_retains_both_artifact_legacy_shapes() -> None:
+    child = {
+        "code": "observed",
+        "start_ticks": 2**64 - 1,
+        "exe": "systemctl",
+        "uids": "all_expected",
+        "env": "ddd",
+        "cmd": "set_other",
+    }
+    internal = {
+        "code": "observed",
+        "reason": "none",
+        "sub_state": "stop-pre-sigterm",
+        "control_pid": 2**31 - 1,
+        "control": child,
+    }
+    inner = {
+        "code": "observed",
+        "reason": "none",
+        "exe": "manager",
+        "uids": "all_expected",
+        "used": worker.MAX_BYTES - 1024,
+        "internal": internal,
+    }
+    assert worker.instance_projection(inner) == inner
+    assert len((json.dumps(inner, separators=(",", ":")) + "\n").encode()) <= 512
+    packet = {**instance_packet(), **inner}
+    assert ci.manager_instance_facts(packet, allow_legacy=False)
+    assert len((json.dumps(packet, separators=(",", ":")) + "\n").encode()) <= 1024
+    socket_legacy = {
+        **packet,
+        "internal": {
+            **internal,
+            "control": {
+                "code": "observed",
+                "start_ticks": 200,
+                "exe": "systemctl",
+                "uids": "all_expected",
+                "runtime_env": "other",
+                "force_bus": "missing",
+            },
+        },
+    }
+    basic_legacy = {
+        **packet,
+        "internal": {
+            "code": "observed",
+            "reason": "none",
+            "basic_state": "inactive",
+            "njobs": 5,
+        },
+    }
+    for legacy in (socket_legacy, basic_legacy):
+        assert ci.manager_instance_facts(legacy)
+        assert not ci.manager_instance_facts(legacy, allow_legacy=False)
+        with pytest.raises(worker.NativeError, match="^native_diagnostic_invalid$"):
+            worker.instance_projection({key: legacy[key] for key in inner})
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("env", "ee"),
+        ("env", "eeee"),
+        ("env", "EE1"),
+        ("env", "ee2"),
+        ("env", "---"),
+        ("env", None),
+        ("env", ["e", "e", "m"]),
+        ("cmd", "set-environment"),
+        ("cmd", "unavailable"),
+        ("cmd", ["set_bus"]),
+        ("start_ticks", True),
+        ("runtime_env", "matches"),
+        ("code", "absent"),
+        ("exe", "other"),
+    ],
+)
+def test_joint_control_rejects_bad_compact_fields_in_both_current_validators(
+    field: str,
+    bad: object,
+) -> None:
+    child = {
+        "code": "observed",
+        "start_ticks": 200,
+        "exe": "systemctl",
+        "uids": "all_expected",
+        "env": "eem",
+        "cmd": "set_bus",
+        field: bad,
+    }
+    internal = {**asdict(SocketFacts()), "control": child}
+    assert not worker.peer_facts(internal, control=True)
+    assert not ci.peer_facts(internal, allow_legacy=False)
+    assert not ci.peer_facts(internal)
+
+
+@pytest.mark.parametrize("short", [False, True], ids=["exact-charge", "missing-final-image-room"])
+def test_joint_sample_tight_raw_grant_never_refunds_or_skips_required_identity_reads(
+    socket_proc: dict[str, Any],
+    short: bool,
+) -> None:
+    first = observe(socket_proc)
+    assert first["code"] == "observed"
+    assert first["internal"]["control"]["cmd"] == "set_bus"
+    required = first["used"]
+    assert type(required) is int and required == sum(socket_proc["charged"])
+    final_image_bytes = socket_proc["charged"][-1]
+    socket_proc.update(reads=[], images=[], charged=[], rounds={42: 0, 73: 0})
+    grant = required - final_image_bytes if short else required
+    result = observe(socket_proc, grant)
+    if short:
+        assert result["code"] == "not_observed" and result["used"] == grant
+        assert "internal" not in result
+    else:
+        assert result["code"] == "observed" and result["used"] == grant
+        assert socket_proc["rounds"] == {42: 2, 73: 2}
+        assert socket_proc["images"] == [42, 73, 73, 42]
+    assert sum(socket_proc["charged"]) <= grant
+
+
+def test_cmdline_overflow_probe_is_reserved_inside_the_original_grant(
+    socket_proc: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from muli.platforms import linux_transaction
+
+    original = linux_transaction._read_regular
+    prefix_bytes: list[int] = []
+
+    def capture(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        if path.name == "cmdline":
+            prefix_bytes.append(sum(socket_proc["charged"]))
+        return original(path, limit, directory_fd=directory_fd)
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", capture)
+    assert observe(socket_proc)["code"] == "observed"
+    assert len(prefix_bytes) == 1
+    grant = prefix_bytes[0] + 512
+    socket_proc.update(reads=[], images=[], charged=[], rounds={42: 0, 73: 0})
+    probe_bytes: list[int] = []
+    socket_proc["cmdline"] = b"x" * 513
+
+    def bounded(path: Path, limit: int, *, directory_fd: int | None = None) -> bytes:
+        if path.name == "cmdline":
+            remaining = grant - sum(socket_proc["charged"])
+            assert 0 < limit <= 512 and limit + 1 <= remaining
+            probe_bytes.append(min(len(socket_proc["cmdline"]), limit + 1))
+        return original(path, limit, directory_fd=directory_fd)
+
+    monkeypatch.setattr(linux_transaction, "_read_regular", bounded)
+    result = observe(socket_proc, grant)
+    assert result["code"] == "not_observed" and result["used"] == grant
+    assert len(probe_bytes) == 1
+    assert sum(socket_proc["charged"]) + probe_bytes[0] <= grant
+    assert "internal" not in result
+
+
+@pytest.mark.parametrize("case", ["cmdline-deadline", "child-other-image"])
+def test_joint_command_does_not_grant_a_hook_on_timeout_or_another_image(
+    socket_proc: dict[str, Any],
+    case: str,
+) -> None:
+    socket_proc["case"] = case
+    result = observe(socket_proc)
+    if case == "cmdline-deadline":
+        assert result == worker.instance_unavailable("timeout", 4096)
+    else:
+        assert result["code"] == "observed"
+        assert result["internal"]["control"]["exe"] == "other"
+        assert result["internal"]["control"]["cmd"] == "other"
+    assert "never-export-me" not in json.dumps(result)

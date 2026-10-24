@@ -43,8 +43,8 @@ def internal_packet(*, maximum: bool = False) -> dict[str, Any]:
             "start_ticks": 2**64 - 1,
             "exe": "systemctl",
             "uids": "all_expected",
-            "runtime_env": "duplicate",
-            "force_bus": "duplicate",
+            "env": "ddd",
+            "cmd": "set_other",
         }
         if maximum
         else worker.control_unavailable("absent"),

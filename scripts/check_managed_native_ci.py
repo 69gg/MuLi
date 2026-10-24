@@ -885,16 +885,41 @@ def peer_facts(value: object, *, allow_legacy: bool = True) -> bool:
             and value["control_pid"] is None
         )
         child = value["control"]
-        if (
-            not (observed or unavailable)
-            or not isinstance(child, dict)
-            or set(child) != {"code", "start_ticks", "exe", "uids", "runtime_env", "force_bus"}
-        ):
+        if not (observed or unavailable) or not isinstance(child, dict) or "code" not in child:
             return False
         expected = (
             "not_observed" if unavailable else "absent" if value["control_pid"] == 0 else "observed"
         )
         if child["code"] != expected:
+            return False
+        if set(child) == {"code", "start_ticks", "exe", "uids", "env", "cmd"}:
+            if expected != "observed":
+                return child == {
+                    "code": expected,
+                    "start_ticks": None,
+                    "exe": "unavailable",
+                    "uids": "unavailable",
+                    "env": "---",
+                    "cmd": "unavailable",
+                }
+            return (
+                type(child["start_ticks"]) is int
+                and 0 <= child["start_ticks"] < 2**64
+                and child["exe"] in ("systemctl", "other")
+                and child["uids"] == "all_expected"
+                and isinstance(child["env"], str)
+                and re.fullmatch(r"[emod]{2}[10mod]", child["env"]) is not None
+                and child["cmd"] in ("set_bus", "set_other", "other")
+                and (child["exe"] == "systemctl" or child["cmd"] == "other")
+            )
+        if not allow_legacy or set(child) != {
+            "code",
+            "start_ticks",
+            "exe",
+            "uids",
+            "runtime_env",
+            "force_bus",
+        }:
             return False
         if expected != "observed":
             return child == {

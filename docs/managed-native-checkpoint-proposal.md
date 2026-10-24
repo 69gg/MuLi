@@ -340,3 +340,109 @@ dbus.socket 必有某条 ExecStartPost，也不继续 mask dbus 或其它 vendor
 禁自动启动/交互授权、manager/子PID窗口、额度撤销和当前/历史schema分界，未见确切P1/P2。
 这些是离线证据，不能代替同UID认证、现场可用余额、READY、正式事务或完整cleanup验收。
 下一次远端只针对新的固定G签名head做一次判别，不重跑已知失败的0971候选。
+
+### native23：固定 socket 控制进程已观察，仍未进入真实事务
+
+根实际核定本轮候选head短标识为`81da`，CI
+[40059336595](https://github.com/69gg/MuLi/actions/runs/40059336595)最终11项为
+**10 success、1 managed-native failure**；native job为`120769236075`。
+macOS/Windows的Python3.12与3.13本轮均成功；native22的Windows超时历史仍保留，
+不能将这次通过写成已经定位或修复原超时。
+
+根唯一守卫已对artifact`12546503280`执行有界读取、typed schema与SHA核验：ZIP
+1345字节，SHA256为`f941c52e3056ee04e3e32b10682022f234b24bf5339408aacb8705752020ec84`，
+本地证据为`/tmp/muli-native23-evidence.zip`。以下是根验证后提供的固定允许投影；
+作者本次未另行解析ZIP、导出原环境或运行本机系统效果。
+
+- manager为UID999、PID2306、startticks3054、invocation
+  `4ec6a1f6feb34dd889cc9a6b974e0204`，PID1状态为activating/start，elapsed81716ms。
+- 固定private peer读取成功：dbus.socket为start-post，ControlPID2319；该控制进程
+  两侧proc身份接受，startticks3062、exe=systemctl、四UID均为expected，
+  runtime_env=other、force_bus=missing，userjob为dbus.socket/start。
+- 父级账本为before19895、after31619、grant11849、child charged11237、reply487；
+  used17402、queryok。这里是实际父级grant/charged/wire账本，不将child原始used
+  或reply重复计费，也不把诊断返回视为manager readiness通过。
+- timeline0、generations0。receipt的setup_phase仍为manager_show_before，
+  user_created=true、user_removed=false、group_removed=false、mounts3。
+  native失败仍为deadline，cleanup为native_command_timeout；不能声称READY、
+  事务、回退或cleanup成功，不能用清理未完成的receipt推断新的业务运行。
+
+`runtime_env=other`的比较对象准确为`/run/user/999`：worker只在控制进程唯一的
+XDG_RUNTIME_DIR不等于该值时输出other，并不与fixture home、卷路径或runner当前
+环境比较；空字符串也归other。manager实例drop-in与harness客户端本来都显式设置
+这个规范runtime目录。本次新事实定位到控制进程初始环境的偏离，不证明其实际argv、
+目标socket、当前getenv值或等待原因；以前轮次manager初始环境正确不能替代本轮采样。
+
+已缓存固定v255官方源码给出的解释边界是：用户manager先复制自身环境，但初始jobs
+前的environment generators可修改其transient_environment，之后还会与client_environment
+合并供子服务使用；manager自己的private监听则根据自身secure_getenv的runtime目录
+建路径。因此private peer可用与控制子进程runtime偏离可以并存，尚不能归因于某个
+generator、客户端或vendor单元配置。
+[用户环境及生成器](https://github.com/systemd/systemd/blob/v255/src/core/manager.c#L651)、
+[private监听](https://github.com/systemd/systemd/blob/v255/src/core/dbus.c#L948)。
+
+下一最小采样仅为方案：复用同一次已计费的完整environ读取，增加固定
+DBUS_SESSION_BUS_ADDRESS的expected/missing/other/duplicate分类，原始值不外传，
+不新增proc文件、peer消息、循环、期限或额度，仍经512/1024及总字节门拒绝超额。
+v255用户bus入口先看该地址、缺失才按XDG_RUNTIME_DIR派生；但当前尚无systemctl
+argv/实际transport证据，不能据此断言它已经选择哪条连接路径。
+[地址选择](https://github.com/systemd/systemd/blob/v255/src/libsystemd/sd-bus/sd-bus.c#L1336)。
+该方案尚未实施或授权远端新轮次；不maskdbus、不覆盖vendor单元、不延长原期限，
+当前诊断正向事实不替代真实服务与完整cleanup验收。
+
+### Native24 合并采样候选：同窗命令与环境（待根复验）
+
+根先在唯一守卫实收新增15个目标节点全部失败：pytest0.30秒、守卫798毫秒、
+峰值76.2MiB、swap0。失败分别位于旧control形状、实际未读取cmdline以及current
+validator不识新形状，未用缺API/import制造红。随后授权本节候选；作者没有运行
+检查、格式化、Git、真实proc/FFI/socket或新CI。
+
+原控制进程environ完整读取复用一次，仅多解释DBUS_SESSION_BUS_ADDRESS；新control
+严格六键为code/start_ticks/exe/uids/env/cmd。env恰好三字符，依次表示runtime目录、
+显式userbus地址和SYSTEMCTL_FORCE_BUS。前两位固定e/m/o/d，即规范预期值、缺失、
+其他值、重复键；第三位为1/0/m/o/d，即v255布尔真/假、缺失、其他值、重复键。
+runtime规范值仍为`/run/user/<UID>`，bus规范值为`unix:path=/run/user/<UID>/bus`。
+absent或not_observed的control只允许env=`---`、cmd=unavailable以及原null/占位字段，
+不能用占位码冒充observed。原值不导出，未知环境项仍丢弃且其字节仍计费。
+
+在原子进程before/after proc绑定之间只增加一次cmdline读取，接受正文最多512字节。
+复用原O_NOFOLLOW普通文件读取器；该读取器可能多取一字节判断超长，因此先从当前
+raw余额保留这一探测字节，再将读取限额裁至min(512,余额−1)。成功按实际返回字节
+计费，读失败、坏格式、期限不足或任一身份后核失败仍保守消耗原grant、不退款，
+不将溢出探测挪到原grant之外，也不在失败后追加第二次读取。
+
+cmdline必须非空、完整NUL结尾且无空argv。仅在实际exe已归为受信systemctl时，
+匹配完整四参数形状：argv0 basename为systemctl，后面精确为`--user`、
+`set-environment`、单个DBUS_SESSION_BUS_ADDRESS赋值；该赋值等于规范bus地址才
+输出set_bus，其他赋值为set_other。其余完整命令为other；other映像即使伪装同样
+argv也只能是other。参数额外、不同选项或其他完整形状不推断‘未执行过hook’；
+截断、空argv或超长使整组not_observed。既不输出原argv/路径/环境，也不根据固定
+命令标签宣称已经连接了哪个socket或解释其阻塞根因。
+
+新六键替换两旧长环境键，不叠加字段。当前worker与外层collector仅接新形状；
+历史basic_state/njobs和native23的runtime_env/force_bus控制形状仅允许artifact回读，
+不能作为本轮collector成功回包。peer代码及其三次只读消息不改；原五次PID1查询、
+一次inner命令、5秒绝对截止、512 inner、1024 outer、32768总额、parent真实
+grant/charged/wire结算、READY和cleanup门均不改。native23的612字节raw余量与
+487字节旧回包只是历史现场，不能保证新现场仍有足够空间；额度不足就保留真实拒绝。
+
+原15项红测保留。候选另补19个参数节点，覆盖坏env/cmd/类型/字段及映像组合、
+完整实际raw收费恰好可容与缺最后映像空间、溢出探测字节在原grant内、cmdline期间
+截止和other映像不误认hook。原current oracle只随已批准形状迁移，两种历史形状的
+回读接受/current拒绝仍分别断言；原子/manager漂移、无ControlPID、超额、父账本
+和512/1024最大数值边界继续保留。候选统一待根实际回归与非作者后审；没有新轮次
+运行结果，不能写成READY、三事务、回退或cleanup已经修复。
+
+### Native24 离线验收
+
+根唯一守卫实际收取socket/control、peer、peer integration及instance四文件166节点
+通过（pytest0.47秒、守卫997毫秒、75.9MiB、swap0）；原CI、checkpoint与资源包络
+三文件638节点通过（pytest1.85秒、守卫2.460秒、135.9MiB）。两组共804个不同节点，
+没有扩大期限或跳过原失败。三脚本严格类型检查明确使用MYPYPATH=src:tests及
+explicit-package-bases，通过于守卫5.401秒、289.6MiB。全仓Ruff通过；格式首验
+三文件不合规，仅格式化这三文件后，全仓Ruff和378文件格式检查通过。
+
+非作者Sol后审未发现具体P1/P2：新增读取和溢出探测仍在原grant内，身份后核失败
+整组撤回，不输出原始命令，current与历史回读严格分离。结果仅为离线受控采样及
+协议/计账回归，尚无Native24真实runner结果，不能替代Native23仍失败的启动与
+cleanup证据，也不证明新增观察一定能解释或修复阻塞。

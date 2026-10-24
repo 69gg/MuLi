@@ -1353,19 +1353,16 @@ def control_unavailable(code: str = "not_observed") -> dict[str, Any]:
         "start_ticks": None,
         "exe": "unavailable",
         "uids": "unavailable",
-        "runtime_env": "unavailable",
-        "force_bus": "unavailable",
+        "env": "---",
+        "cmd": "unavailable",
     }
 
 
 def control_facts(value: object) -> bool:
     if (
         not isinstance(value, dict)
-        or set(value) != {"code", "start_ticks", "exe", "uids", "runtime_env", "force_bus"}
-        or not all(
-            isinstance(value[key], str)
-            for key in ("code", "exe", "uids", "runtime_env", "force_bus")
-        )
+        or set(value) != {"code", "start_ticks", "exe", "uids", "env", "cmd"}
+        or not all(isinstance(value[key], str) for key in ("code", "exe", "uids", "env", "cmd"))
     ):
         return False
     if value["code"] != "observed":
@@ -1377,8 +1374,9 @@ def control_facts(value: object) -> bool:
         and 0 <= value["start_ticks"] < 2**64
         and value["exe"] in {"systemctl", "other"}
         and value["uids"] == "all_expected"
-        and value["runtime_env"] in {"matches", "missing", "other", "duplicate"}
-        and value["force_bus"] in {"on", "off", "missing", "other", "duplicate"}
+        and re.fullmatch(r"[emod]{2}[10mod]", value["env"]) is not None
+        and value["cmd"] in {"set_bus", "set_other", "other"}
+        and (value["exe"] == "systemctl" or value["cmd"] == "other")
     )
 
 
@@ -1493,11 +1491,17 @@ def read_manager_instance(
         )
         known = system_executables()
 
-        def read(root: Path, name: str) -> bytes:
+        def read(root: Path, name: str, *, maximum: int | None = None) -> bytes:
             nonlocal used
             remaining(deadline)
             require(used < limit, "native_diagnostic_output_budget")
-            data = _read_regular(root / name, limit - used)
+            allowance = limit - used
+            if maximum is not None:
+                # The regular-file reader may fetch one extra overflow byte.
+                # Reserve it within this same grant; failure consumes the grant.
+                require(allowance > 1, "native_diagnostic_output_budget")
+                allowance = min(maximum, allowance - 1)
+            data = _read_regular(root / name, allowance)
             used += len(data)
             require(used <= limit, "native_diagnostic_output_budget")
             remaining(deadline)
@@ -1526,6 +1530,7 @@ def read_manager_instance(
             require(len(groups) == 1 and groups[0].startswith("0::"), "native_diagnostic_invalid")
             current = _cgroup(groups[0][3:])
             require(current == group or current.startswith(group + "/"), "native_process_changed")
+            require(used < limit, "native_diagnostic_output_budget")
             image = os.readlink(root / "exe")
             used += len(os.fsencode(image))
             require(used <= limit, "native_diagnostic_output_budget")
@@ -1563,6 +1568,7 @@ def read_manager_instance(
                     )
                     selected: dict[bytes, list[bytes]] = {
                         b"XDG_RUNTIME_DIR": [],
+                        b"DBUS_SESSION_BUS_ADDRESS": [],
                         b"SYSTEMCTL_FORCE_BUS": [],
                     }
                     for row in environment.split(b"\x00"):
@@ -1576,29 +1582,50 @@ def read_manager_instance(
                     def classified(name: bytes) -> str:
                         values = selected[name]
                         if not values:
-                            return "missing"
+                            return "m"
                         if len(values) != 1:
-                            return "duplicate"
+                            return "d"
                         value = values[0]
-                        if name == b"XDG_RUNTIME_DIR":
-                            return "matches" if value == f"/run/user/{uid}".encode() else "other"
+                        runtime = f"/run/user/{uid}".encode("ascii")
+                        if name in {b"XDG_RUNTIME_DIR", b"DBUS_SESSION_BUS_ADDRESS"}:
+                            expected = (
+                                runtime
+                                if name == b"XDG_RUNTIME_DIR"
+                                else b"unix:path=" + runtime + b"/bus"
+                            )
+                            return "e" if value == expected else "o"
                         # v255 parse_boolean accepts these case-insensitive words.
                         if value.lower() in {b"1", b"yes", b"y", b"true", b"t", b"on"}:
-                            return "on"
+                            return "1"
                         if value.lower() in {b"0", b"no", b"n", b"false", b"f", b"off"}:
-                            return "off"
-                        return "other"
+                            return "0"
+                        return "o"
 
+                    command = read(Path("/proc") / str(child_pid), "cmdline", maximum=512)
+                    require(command.endswith(b"\x00"), "native_diagnostic_invalid")
+                    arguments = command[:-1].split(b"\x00")
+                    require(all(arguments), "native_diagnostic_invalid")
+                    image = "systemctl" if systemctl_executable() == child_before[3] else "other"
+                    label = "other"
+                    if (
+                        image == "systemctl"
+                        and len(arguments) == 4
+                        and arguments[0].rsplit(b"/", 1)[-1] == b"systemctl"
+                        and arguments[1:3] == [b"--user", b"set-environment"]
+                        and arguments[3].startswith(b"DBUS_SESSION_BUS_ADDRESS=")
+                    ):
+                        expected = f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus".encode(
+                            "ascii"
+                        )
+                        label = "set_bus" if arguments[3] == expected else "set_other"
                     require(child_before == binding(child_pid), "native_process_changed")
                     child = {
                         "code": "observed",
                         "start_ticks": child_before[0],
-                        "exe": "systemctl"
-                        if systemctl_executable() == child_before[3]
-                        else "other",
+                        "exe": image,
                         "uids": "all_expected",
-                        "runtime_env": classified(b"XDG_RUNTIME_DIR"),
-                        "force_bus": classified(b"SYSTEMCTL_FORCE_BUS"),
+                        "env": "".join(classified(name) for name in selected),
+                        "cmd": label,
                     }
             internal["control"] = child
             require(peer_facts(internal, control=True), "native_diagnostic_invalid")
