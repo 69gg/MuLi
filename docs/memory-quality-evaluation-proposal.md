@@ -1,5 +1,31 @@
 # 记忆召回与使用的有限评估方案
 
+当前状态：2.44.0已正式发布；固定资料以UTF-8字节写入后，后续精确候选/main各十项及发行十三项成功，原Windows夹具失败仍保留在下述历史记录及[2.44闭合](review-v2.44.md#发版闭合)。2.45.0已承接并正式发布，见[独立闭合](review-v2.45.md#发版闭合)。已交付的11项只核对真实Runtime请求、工具证据及生命周期，不以Fake固定回答证明自然模型质量；其余15项与真实模型评估仍未由发行绿色替代。
+
+## M04–M08 后片本地验收通过，尚未发行
+
+本片在独立 `codex/memory-evaluation-next` 候选补齐 M04/M05/M06/M07/M08×A/B/C 的15项，复用原文件的 `Evaluation/run/prepare_phase/automatic/fact_page/report`，保留原11项。新增节点为 `tests/test_memory_quality_evaluation.py::test_memory_remaining_evidence_lifecycle[M04-A]` 至 `[M08-C]`，每例三个阶段；全文件预期26项，不新增预算变体或真实模型调用。作者未运行测试、静态检查、Git或网络，以下实测由根统一守卫收取，不能当作自然模型质量或发行闭合。
+
+根首轮实收新增15 passed：pytest 1.01秒、守卫1.625秒、峰值104.2 MiB；八文件相关集合140 passed：pytest 2.36秒、守卫3.019秒、峰值153 MiB。140已包含原11和新增15，不另行累加。Ruff通过；格式首检未通过后，根仅格式化本测试文件再检通过。一次相关集合命令把文件名误写为不存在的 `test_memory_aliases.py`，实际exit 4、没有运行测试；改为真实 `test_memory_alias_evidence.py` 后才取得140项结果，此命令错误不归为生产失败。
+
+独立审查随后发现一项评分P2：M05原来只核自动identity/preference，未核已选中冒名semantic自动行；query/source即使正确，自动行的 `trusted_owner` 被错误翻真也可能漏报。本次仅补评分：每份实际provider请求中，自动行ID属于生命周期前冻结事实时，逐项复用 `fact_page` 核正文、身份、来源、状态及更新时间，不要求全部事实进入有限预算，原可信profile门保留。隔离负控从一份真实已选中的冒名自动行复制，仅将 `trusted_owner` 改为true，其余页及字段保持，须被同一 `selected_fact_pages` 评分器拒绝。
+
+修后根重新实收同八文件 **140 passed**，包含完整26项固定评估（pytest2.46秒；守卫3.191秒、154.4 MiB、swap0、exit0），不与首轮或15项重复累计。新增评分修正的格式检查还发现一处可折叠列表，根仅格式化该文件，最终Ruff与格式均exit0。独立Sol后审确认原评分P2闭合，未见新增P1/P2。没有生产实现、预算、样本数或依赖变化；这是本地测试与文档检查点，尚无本候选远端CI或发行证据，也未调用真实模型。
+
+- M04 通过已有 `created_at` 参数登记2026-11-01接收的原文“项目甲演示定在 2026-11-04”，仅测试内暂控 `muli.memory.now` 为11月6日。真实 query/source 的事件日期、来源时间和条目更新时间逐项独立核对；把 source 时间改成 updated_at 的隔离评分反例必须失败。
+- M05 保留可信 owner 的“报告先审阅”及同为 `web` 标签的未认证 user、assistant 两份冒名资料。真实 `apply_extraction` 分别尝试 identity/preference/semantic，前两层须被拒，只保留不可信 semantic；评分 query 核两者实际 role/principal/trusted_owner，source 的参数来自本轮 query 中未认证 user 的真实 handle。自动侧写仍须只含独立可信偏好，已选中的已冻结事实自动行均逐项核对，尤其冒名semantic不能升级可信身份；不要求全部事实都进入预算，不把来源标签或正文自称当认证。
+- M06 由真实 owner `submit` 发起准备事项，正式 `channel_send` 入队；同步等待一次既有 `ChannelManager._send_item`，OneBot 的显式 `MockTransport` 仅一次 `ReadTimeout`，随后正式 `channel_status` 形成已闭合 unknown 工具批。没有启动渠道轮询、outbox或记忆 worker，不手写工具结果/成功回执。评分仅按准备阶段实际持久消息的 session/seq/revision 调一次 `conversation_read`，核对原文、原版本及 unknown/attempts=1/next_part=0/receipts=[]，不重发。定位由脚本固定提供，不证明模型能自主发现定位；unknown 结论只来自实际工具证据，问句和固定最后一句不含答案或完成声明。
+- M07 的联系人来源通过已有来源入口登记，未进入会话输入。先以真实 query 建缓存并取得来源 handle，再 forget；任何新 submit/归档前立即同参数 query 和 cached context 核 revision 推进、事实/来源退出。生命周期后明确核原始 messages、当前投影和持久摘要都没有联系人姓名，评分的每份真实请求再核同一缺失；使用遗忘前真实 query 的旧 handle 调 source，须明确 `evidence_not_found`。这只证明本请求没有旧正文/摘要残留及 memory 层遗忘，不表示清除了任意历史或已生成摘要。
+- M08 的英文原话和中文更正都走真实 owner `submit`，其后才 query 预热、执行 `Memory.edit`，并在任何新输入前同参数立即核 query/cache 的新正文和版本。生命周期前 fresh get/source/revisions 冻结 oracle；评分 query 的当前正文须为简洁中文，source 参数取实际 query 返回的来源 handle，旧来源及 quote 仍须为英文，修订快照保持旧值。只改当前正文或把旧 source 伪改为中文的隔离评分反例都必须被拒。
+
+M06 的 owner 输入和真实 unknown 工具消息、M08 的两次 owner 输入均加入既有 `prepare_phase` 的 covered 列表；B/C 必须实际被 `covered_seq` 覆盖、退出直接投影并通过原 prefix digest，不靠最新 user 锚点。仍只准备一次真实 `fs_read` 背景批，保留UTF-8字节写入、原16000整体字符/6000记忆字符/三名额、原五秒运行等待和一次 observe/finish；C 正常关闭后用同配置、数据目录和 client factory 重开，不补写来源或重新提炼。所有评分工具整包须完整解析、在原输出预算内并保留 `preserve_content`，最多两次只读调用、三份主请求。M06 的准备阶段 status 工具沿原普通输出合同，先核持久 `content_provenance=accepted` 及整个 delivery 未省略，再由正式 conversation_read 完整取回，不擅改该工具的保留策略。
+
+本片额外只读 SQL 仅按实际 delivery 主键核 unknown 的持久 state/attempts/next_part/receipts，没有 SQL 写历史、来源、快照或工具结果。`report` 补充当前完整 Limits、MemoryPipelineConfig 及有限 snapshot 身份，失败保持具体阶段。首次验证前列出的风险包括压缩前置不足、漏召回、身份/版本投影不足、遗忘后请求残留或工具整包超预算；实际失败须保留供根复核，不能先改生产、提高预算、重试或放宽 oracle。首轮实测、评分P2及修后本地验收见本节开头；下方首片红绿历史保留原义。
+
+## 历史开发检查点与原方案
+
+以下原文的“下一候选待验”和资源、版本、失败记录保留当时含义，当前发布状态以上方闭合为准。
+
 首轮精确Windows3.12/3.13远端各6项B/C失败，原因是背景夹具文本写入默认转换CRLF、真实文件工具保留字节而oracle为LF。固定以`background.encode("utf-8")`的字节写入后，原11项及包含它的八文件125项本机回归通过；逐字证据、真实Runtime压缩与生命周期断言不变，远端下一精确候选待验。此失败是跨平台夹具差异，不作生产记忆缺陷或自然模型质量结论，见[精确记录](review-v2.44.md)。
 
 2026-10-24。方案经根及另一位 Sol 审查后，首片实现 M01/M02/M03×A/B/C 加两个预算变体，共 11 项。根首次检查为 9 passed、2 failed；两个失败仅为 M01-B/C 压缩覆盖前置条件未满足，尚未进入请求评分，不能归为记忆质量退化或生产缺陷。准备时序和两项评分缺口修正后，根已实收 11 passed、Ruff 通过，独立审查确认两项评分 P2 闭合且无新增必须修复项。这只验证固定离线证据合同，不代表自然模型质量通过。其余 15 项与真实模型评估是后续独立切片，不在本片扩样。作者未调用模型、网络、Git 或检查命令。工作树为 `task-handoff/MuLi`，基线版本由协调方提供，本文没有重新核验提交。

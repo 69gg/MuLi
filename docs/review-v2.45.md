@@ -1,4 +1,21 @@
-# 手机渠道显式任务控制（2.45 候选）
+# 手机渠道显式任务控制（2.45.0）
+
+## 发版闭合
+
+2026-10-24，v2.45.0已正式发布。精确提交为`1c6b4cbb11e09463f8012261b5dc6946bb7a19a7`，[PR52](https://github.com/69gg/MuLi/pull/52)于2026-10-23T23:51:04Z合入，mergeCommit与该head一致；[精确候选CI40040542268](https://github.com/69gg/MuLi/actions/runs/40040542268)与[main CI40041936020](https://github.com/69gg/MuLi/actions/runs/40041936020)各十项全部成功，[发行40041935670](https://github.com/69gg/MuLi/actions/runs/40041935670)十三项全部成功。
+
+签名注释标签`v2.45.0`的对象为`dc11a680e4da1f96b35af9a4c7af8ea11d8e9537`，指向上述精确提交；本地GPG `VALIDSIG`（签名键缩记`23C8…B05B37D4`）及GitHub `verification.verified=true/reason=valid`均已核对。[GitHub正式release](https://github.com/69gg/MuLi/releases/tag/v2.45.0)发表于2026-10-23T23:57:58Z，即北京时间2026-10-24 07:57:58，非draft、非prerelease。仅以小型JSON元数据核对[PyPI 2.45.0](https://pypi.org/project/muli-agent/2.45.0/)与GitHub两资产，名称、大小、SHA-256完全一致，PyPI均`yanked=false`：
+
+| 构件 | 字节数 | SHA-256 |
+| --- | --- | --- |
+| `muli_agent-2.45.0-py3-none-any.whl` | 815933 | `95ed160dad3b77f68605507c70d7a26888f55a78686ccf3f2706cbd9fafb2ace` |
+| `muli_agent-2.45.0.tar.gz` | 4272016 | `271cc251e47d16388b07d309381e95834dc3ad0e26730dafc9ce4beabcd995a5` |
+
+根的PR/标签核对守卫1.485秒、43.3MiB；两处发行元数据核对守卫1.178秒、46.7MiB，均swap0、实际exit0。仅取得JSON，没有下载发行构件或依赖，也不声称本地sdist与远端字节一致。标签保持原对象，后续文档检查点不移动发行标签。手机控制、正常压缩重开、固定模型与HTTP替身的离线证据保留下述范围；真实账号送达、自然模型质量、真实用户桌面和Linux原生服务三事务仍未由本版验收替代。
+
+## 历史开发检查点
+
+以下候选准备、失败和“待验/未发行”均保留各自当时状态；当前发布结论以上方闭合记录为准。
 
 本版让已绑定主人在 Telegram 或 OneBot 私聊中查询、暂停和调整具体任务，仍由同一个持续主助手规划，最终任务报告保留原来源。当前为本地候选，尚未远端 CI、合并、打发行标签或发布；真实账号未实测。
 
