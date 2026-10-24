@@ -180,15 +180,24 @@ def install(root: Path, *, limit: int) -> None:
             return original(file, expected_digest, data, guard=guard)
         previous: ConfigurationSnapshot | None = None
         pending: ConfigurationSnapshot | None = None
-        try:
-            with ConfigurationFile(root / _RECEIPT, limit) as receipt:
-                previous, birth = _read(receipt)
-            _matches(root, file, _snapshot(file), birth)
-            pending = _begin(root, limit)
-        except Exception:
-            previous = None
+        attempted = False
+
+        def observed_guard() -> None:
+            nonlocal previous, pending, attempted
+            guard()
+            if attempted:
+                return
+            attempted = True
+            try:
+                with ConfigurationFile(root / _RECEIPT, limit) as receipt:
+                    previous, birth = _read(receipt)
+                _matches(root, file, _snapshot(file), birth)
+                pending = _begin(root, limit)
+            except Exception:
+                previous = None
+
         # No observer exception can replace the original result or exception.
-        installed = original(file, expected_digest, data, guard=guard)
+        installed = original(file, expected_digest, data, guard=observed_guard)
         if previous is not None and pending is not None:
             try:
                 with ConfigurationFile(root / _RECEIPT, limit) as receipt:

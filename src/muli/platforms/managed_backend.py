@@ -322,7 +322,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             else ("unit", "selector", "configuration")
         )
         for component in order:
-            guard()
+            # Each confirm enters this same guard before its first durable effect.
             if component == "selector":
                 with SelectorStore(Path(self.anchor.journal_root)) as selector:
                     selector.confirm(selector.read(), guard=guard)
@@ -573,7 +573,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 else ("unit", "selector", "configuration")
             )
             for component in order:
-                guard()
+                # The selected replace/confirm guards again before writing or syncing.
                 current = self._disk()
                 if component == "selector":
                     value = (

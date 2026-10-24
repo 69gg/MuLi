@@ -31,7 +31,11 @@ from muli.managed_host import managed_helper_arguments
 from muli.management_transaction import TransactionJournal
 from muli.platforms import linux_controller, linux_transaction
 from muli.platforms.managed_deployment import SlotIdentity
-from muli.platforms.transaction_files import ConfigurationError, ConfigurationFile
+from muli.platforms.transaction_files import (
+    ConfigurationError,
+    ConfigurationFile,
+    ConfigurationSnapshot,
+)
 from muli.service import UserService
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux isolated fixture ownership")
@@ -216,6 +220,67 @@ async def test_generated_helper_tracks_real_cas_then_case_cleanup_unlinks_only_c
     assert not unit_path(root).exists()
 
 
+async def test_failed_original_guard_never_starts_birth_or_file_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: tuple[Any, Any]
+) -> None:
+    root = await observed_root(tmp_path, monkeypatch, fixture)
+    receipt = root / ".muli-native-unit.json"
+    before_receipt = receipt.read_bytes()
+    rejected = ValueError("original guard rejected")
+    guard_calls = 0
+    replacements: list[tuple[object, ...]] = []
+
+    def guard() -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        raise rejected
+
+    def forbidden_replace(*args: Any, **kwargs: Any) -> None:
+        replacements.append(args)
+        raise AssertionError("publication after rejected guard")
+
+    with ConfigurationFile(unit_path(root), worker.MAX_BYTES) as unit:
+        before = unit.read()
+        with monkeypatch.context() as context:
+            context.setattr(os, "replace", forbidden_replace)
+            with pytest.raises(ValueError) as caught:
+                unit.replace(before.digest, before.data + b"\n# rejected\n", guard=guard)
+        assert caught.value is rejected
+        assert unit.read() == before
+    assert guard_calls == 1 and replacements == []
+    assert receipt.read_bytes() == before_receipt
+    assert not os.path.lexists(root / ".muli-native-unit.pending")
+
+
+async def test_real_replace_prepares_birth_once_after_first_successful_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: tuple[Any, Any]
+) -> None:
+    root = await observed_root(tmp_path, monkeypatch, fixture)
+    original_begin = births._begin
+    begins: list[int] = []
+    guard_calls = 0
+
+    def begin(directory: Path, limit: int) -> ConfigurationSnapshot:
+        assert directory == root and limit == worker.MAX_BYTES
+        begins.append(guard_calls)
+        return original_begin(directory, limit)
+
+    def guard() -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        assert os.path.lexists(root / ".muli-native-unit.pending") is (guard_calls > 1)
+
+    monkeypatch.setattr(births, "_begin", begin)
+    with ConfigurationFile(unit_path(root), worker.MAX_BYTES) as unit:
+        before = unit.read()
+        installed = unit.replace(before.digest, before.data + b"\n# observed\n", guard=guard)
+        assert installed == unit.read() and installed.identity != before.identity
+    assert guard_calls == 2 and begins == [1]
+    assert not os.path.lexists(root / ".muli-native-unit.pending")
+    receipt = json.loads((root / ".muli-native-unit.json").read_text(encoding="utf-8"))
+    assert receipt["file"] == list(installed.identity) and receipt["digest"] == installed.digest
+
+
 @pytest.mark.parametrize("replacement", ["same_bytes", "symlink", "parent"])
 async def test_case_cleanup_preserves_external_unit_or_directory_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: tuple[Any, Any], replacement: str
@@ -325,8 +390,14 @@ async def test_uncertain_replace_never_repairs_birth_or_changes_original_result(
                     assert receipt.read_bytes() != before_receipt
     if failure != "receipt":
         assert receipt.read_bytes() == before_receipt
-    assert os.path.lexists(root / ".muli-native-unit.pending") is (failure != "confirm")
+    assert os.path.lexists(root / ".muli-native-unit.pending") is (
+        failure not in {"confirm", "cancelled"}
+    )
     case, _ = cleanup_boundaries(root, monkeypatch)
+    if failure == "cancelled":
+        await case.cleanup()
+        assert not unit_path(root).exists()
+        return
     with pytest.raises((ValueError, OSError)):
         await case.cleanup()
     assert unit_path(root).exists()

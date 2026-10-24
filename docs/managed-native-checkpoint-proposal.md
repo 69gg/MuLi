@@ -1511,7 +1511,7 @@ switch于48468毫秒prepared、54263毫秒draining、58655毫秒stop_base，6000
 `52bb85ef8d16483086cbaa0c44cb0156`。没有可采信的成本指标，不据此归因主成本，
 也不称完整事务、回退或cleanup通过。
 
-### Native38：helper退出后立即保留本代成本（本地通过，远端待验）
+### Native38：helper退出后立即保留本代成本（已取得现场成本，完整验收未通过）
 
 源码显示成本文件仅在helper的atexit回调中替换，而原collector只在整个case最终一次
 读取；第二代开始时当前helper_source已更新，第一代完成时没有采集。这能解释为何
@@ -1539,7 +1539,7 @@ controller_failure及原finally当前采集保持，不为历史成本回绑当�
 临界结果不变；还覆盖已到期不再打开文件、仍可合入此前完成代缓存。建议根运行
 `tests/test_managed_native_helper_costs.py`及既有coordinator组；
 作者未自行运行检查；根已实收成本文件38项通过（pytest0.79秒，守卫1.375秒、111.5MiB、swap0），
-真实helper与远端行为仍待验。
+该本地阶段尚未取得真实helper成本；随后远端现场见下节，不由离线通过推定整套成功。
 
 ### 独立候选：fixture 的 app unit 出生凭据与清理
 
@@ -1579,3 +1579,53 @@ ConfigurationFile均不改；新增固定小文件IO计入原墙钟，不加预�
 的lock/lease与固定删除观察边界，保留原timeline/result断言，真实删除仍由专用回归覆盖。
 三文件最终整合604个不同节点通过（pytest4.10秒，守卫4.761秒、186MiB、swap0）。
 非作者只读后审未见剩余P1/P2；未以这些离线结果替代真实systemd/最终清理验收。
+
+### Native38现场与Native39：仅合并两处同步组件门
+
+根已安全核验精确候选 `c4feac5` 的 dispatch `40084916206`，artifact
+`12556841931`：ZIP 2005字节，SHA-256
+`d99c456c8bad3060923561e0eda490819dae7ad541c54d0a084de48847f4c4ca`。
+adopt代 `d642919f66cb6e949847082207309988` 的历史与当前成本均为observed，准确匹配
+PID2562、UID999、invocation `bc1ff49d60c6402e9039a92c88a0d2e5`：完整_check共168次、
+26579毫秒，bus共286次、4675毫秒，HTTP共12次、1354毫秒。adopt于56002毫秒released、
+57403毫秒完成projection；switch于57404毫秒进入prepare，60002毫秒Timeout，未观察到
+其prepared事务。十项通用CI最终全部通过，仅原生job `120845765680` 失败；其日志首报
+`native_command_failed`，独立cleanup报 `native_bootstrap_not_empty`。cleanup仍有三mount，
+用户/组未移除，不能称完整原生事务或清理通过。
+这些同代指标显示完整_check是已计量类别中的主要成本，不等同于
+全部墙钟归因，也不预言下一候选节省的毫秒数。
+
+Native39仅修改 `ManagedLinuxBackend._confirm` 与 `install` 的组件循环，删除各轮
+外层重复guard。两处到下层首guard之间仍有只读文件IO、解析与目录fd打开，不能称
+“没有IO”；其间没有await，不缓存或跨await复用任何身份、材料或截止证明。
+`ConfigurationFile.confirm/replace` 与 `SelectorStore.confirm/replace` 原首guard、
+写入/同步前与CAS后的原核验均保留，循环后的完整确认、await后probe、最终proof、
+lease、cgroup及原deadline不变。start/stop其它路径不改，不引入skip开关。
+fixture出生观察器的pending建立时点由独立作者另行收紧到被包装原guard首次成功后，
+不以新增完整_check抵消本片去重；该fixture接缝须由其专用回归核验。
+
+根实收准确目标
+`tests/test_managed_backend_guard_budget.py::test_confirm_uses_eight_real_checks_without_duplicate_component_guards`
+首红：1 failed（pytest0.52秒，守卫1.061秒、64MiB、swap0）。真实confirm与磁盘
+前置均通过，实际11次完整_check，预期8次，多出三次。候选随后仅删除上述两处
+循环外guard；install真实计数及在真实组件入口使revision、slot、lease或cgroup失效的
+零效果反例由独立测试作者补齐。原截止与跨await保护沿既有回归核验。
+候选尚待根串行检查；没有新远端执行或性能改善/功能成功声明，
+原输出、资源及所有期限上限均未提高。
+
+根随后收取正式默认switch安装，完整_check准确43→34，包含两次真实确认；与confirm
+11→8、四项组件入口漂移共六节点最终通过（pytest3.04秒，守卫3.581秒、63.6MiB、swap0）。
+首轮计数两项已通过，四负控均拒绝且磁盘不变，但错误地要求任何fsync都为零，因原
+`JournalControl.read_current` 必需的目录durability读屏障而失败（4 failed/2 passed，
+守卫3.706秒、65.8MiB）。只修测试分类：严格允许并要求原控制目录唯一fd/dev/inode
+屏障，任何组件同步或额外同步仍失败，生产读屏障没有删。负控对cgroup失效保留
+此前合法配置前缀，不谎称整个install未写入。
+
+出生hook整组11项通过（pytest1.93秒，守卫2.586秒、88.2MiB），新增两项分别证明首
+guard拒绝零pending/零发布及原异常身份不变、真实CAS多次guard只准备一次birth。
+后端、控制器、host wiring、事务文件、coordinator及成本七文件732项整合通过
+（pytest52.89秒，守卫53.594秒、172.8MiB），共749个不同本地节点，均swap0。
+非作者分别核两loop生产、真实漂移负控及birth钩子，未发现剩余P1/P2。
+Ruff已通过；格式首查只发现新测试一处纯排版，已格式化，最终386文件格式检查通过。
+禁用增量缓存的严格类型检查146源文件通过（守卫7.902秒、372.7MiB、swap0）。
+上述本地证明不代替Native39真实systemd性能、三事务与清理验收。
