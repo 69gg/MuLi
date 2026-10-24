@@ -152,7 +152,9 @@ async def install_via_existing_entry(
         current = advanced
     data = _read_snapshots(subject.host.journal, current.generation, current.candidate, "candidate")
     await backend.install(current, "target", data)
-    return current
+    installed = control.read_current()
+    assert isinstance(installed, ProjectFormatTransitionRecord)
+    return installed
 
 
 def backend_for(
@@ -236,7 +238,8 @@ async def test_fixed_migration_same_inode_receipt_and_observed_one_reentry(
                 with pytest.raises(FormatAdmissionError, match="^store_format_unsupported$"):
                     require_current_format(read_format_evidence(db))
                 assert (
-                    installed.observed_format == CURRENT_FORMAT_STATE
+                    installed.revision == 5
+                    and installed.observed_format == record.target_format
                     and installed.boot_role is None
                 )
                 assert control.read_current() == installed
@@ -320,7 +323,8 @@ async def test_fixed_migration_commit_unknown_resolves_exact_durable_pair_withou
                 else:
                     installed = await install_via_existing_entry(subject, record, control, backend)
                     assert (
-                        installed.observed_format == CURRENT_FORMAT_STATE
+                        installed.revision == 5
+                        and installed.observed_format == record.target_format
                         and installed.boot_role is None
                     )
                     assert read_format_evidence(observer).state == record.target_format

@@ -146,11 +146,13 @@ def migrate_project_format(
     guard: Callable[[], None],
     seconds: float,
     metadata_bytes: int,
+    confirm: Callable[[], None] | None = None,
 ) -> None:
     """Caller retains the controller/writer locks and stopped empty-cgroup guard.
 
-    SQL success does not confirm file installation, advance Journal or admit a
-    new process. Reentry authenticates the same durable marker+receipt pair.
+    The optional confirmation runs only inside the authenticated pair's locks;
+    it does not confirm file installation or admit a process. A missing callback
+    deliberately preserves the SQL2/Journal1 recovery prefix for callers.
     """
     if (
         not math.isfinite(seconds)
@@ -238,10 +240,19 @@ def migrate_project_format(
                 check()
                 return False
 
+            def complete() -> None:
+                check()
+                if confirm is not None:
+                    confirm()
+                check()
+
             commit_unknown = False
             with closing(connect()) as db:
                 if inspect(db):
+                    complete()
                     return
+                if record.revision == 5:
+                    raise ObservationError("transaction_format_source_changed")
                 identity = _database_identity(db)
                 steps = 0
                 vm_steps = FormatReadLimits().vm_steps
@@ -310,11 +321,13 @@ def migrate_project_format(
                 if not commit_unknown:
                     if not inspect(db):
                         raise ObservationError("transaction_format_commit_unknown")
+                    complete()
                     return
             # Only a COMMIT exception reaches this path. The old connection is
             # closed and the same DB inode/locks are checked before opening anew.
             with closing(connect()) as reopened:
                 if not inspect(reopened):
                     raise ObservationError("transaction_format_commit_unknown")
+                complete()
     finally:
         anchor.close()

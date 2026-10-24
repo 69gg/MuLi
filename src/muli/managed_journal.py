@@ -27,6 +27,7 @@ from muli.managed_transaction import (
     advance_record_v2,
     advance_transfer_record,
     compatibility_digest,
+    confirm_project_format_record,
     prepare_record_v2,
     raw_snapshot,
 )
@@ -111,11 +112,14 @@ def read_snapshots(
     role: Role,
 ) -> RoleSnapshots:
     if isinstance(record, ProjectFormatTransitionRecord):
+        selected: _SnapshotRole = (
+            "candidate" if role == "target" else "fallback" if record.revision == 5 else "source"
+        )
         return _read_snapshots(
             journal,
             record.generation,
             record.binding(role),
-            "source" if role == "base" else "candidate",
+            selected,
         )
     return _read_snapshots(journal, record.generation, record.binding(role), role)
 
@@ -446,6 +450,38 @@ def prepare_project_format_managed(
         control._replace(name, data)
     guard()
     return control._write(record)
+
+
+def confirm_project_format_managed(
+    control: JournalControl,
+    record: ProjectFormatTransitionRecord,
+    *,
+    writer: FixedLock,
+    guard: Callable[[], None],
+) -> ProjectFormatTransitionRecord:
+    """Called inside the exact SQL-pair observer while all its locks remain held."""
+    control.check()
+    writer.check()
+    if writer.name != "lease" or _identity(os.fstat(writer.directory.fd)) != _identity(
+        os.fstat(control.journal.writer_directory.fd)
+    ):
+        raise TransactionError("writer_lease_required")
+    if control.read_current() != record:
+        raise TransactionError("stale_revision")
+    confirmed = confirm_project_format_record(record, record.position)
+    bindings: tuple[tuple[Literal["source", "candidate", "fallback"], RoleBinding], ...] = (
+        ("source", record.source.binding),
+        ("candidate", record.candidate),
+        ("fallback", record.fallback),
+    )
+    for name, binding in bindings:
+        _read_snapshots(control.journal, record.generation, binding, name)
+    if len(confirmed.model_dump_json().encode()) > control.journal.limits.max_record_bytes:
+        raise TransactionError("record_budget")
+    guard()
+    if control.read_current() != record:
+        raise TransactionError("stale_revision")
+    return record if confirmed == record else control._write(confirmed)
 
 
 def advance_managed(

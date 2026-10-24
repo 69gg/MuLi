@@ -206,13 +206,23 @@ class ManagedSystemdProbe(SystemdProbe):
             )
             origin_argv = managed_unit_arguments(origin, origin_controller)
         for role in _ROLES:
-            binding, slot = record.binding(role), slots[role]
+            physical_source = isinstance(record, ProjectFormatTransitionRecord) and role == "base"
+            binding = (
+                record.source.binding
+                if isinstance(record, ProjectFormatTransitionRecord) and role == "base"
+                else record.binding(role)
+            )
+            slot = slots[role]
             if (
                 binding.installation != slot.digest
                 or binding.compatibility != slot.compatibility_digest
             ):
                 raise ObservationError("managed_probe_identity_changed")
-            unit_data[role] = read_snapshots(journal, record, role).unit
+            unit_data[role] = (
+                _read_snapshots(journal, record.generation, binding, "source").unit
+                if physical_source
+                else read_snapshots(journal, record, role).unit
+            )
             if binding.entry == "managed":
                 if (
                     binding.unit != anchor.managed_unit

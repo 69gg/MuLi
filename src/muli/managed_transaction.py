@@ -466,11 +466,11 @@ class ProjectFormatMigration(StrictRecord):
 
 
 class ProjectFormatTransitionRecord(_Protocol2):
-    """Frozen materials and the fixed pre-SQL prefix; no driver or boot admission."""
+    """Frozen SQL/confirmation prefix; no driver or boot admission."""
 
     request_id: Identifier
     generation: Identifier
-    revision: int = Field(default=1, ge=1, le=4)
+    revision: int = Field(default=1, ge=1, le=5)
     action: Literal["project_review_1_to_2"]
     identity: ServiceIdentityV2
     source: ProjectFormatSource
@@ -507,12 +507,13 @@ class ProjectFormatTransitionRecord(_Protocol2):
             (2, "draining", "none"),
             (3, "activating", "stop_base"),
             (4, "activating", "install_target"),
+            (5, "activating", "install_target"),
         }:
             raise ValueError("invalid_project_format_prefix")
         source = self.source
         if (
             self.rollback_attempted
-            or self.base != source.binding
+            or self.base != (self.fallback if self.revision == 5 else source.binding)
             or self.target != self.candidate
             or len(
                 {
@@ -536,7 +537,8 @@ class ProjectFormatTransitionRecord(_Protocol2):
             ):
                 raise ValueError("invalid_project_format_binding")
         if (
-            self.observed_format != self.source_format
+            self.observed_format
+            != (self.target_format if self.revision == 5 else self.source_format)
             or self.source_format.metadata_version != 1
             or self.target_format.metadata_version != 1
             or any(version != 1 for version in self.source_format.formats.model_dump().values())
@@ -771,6 +773,38 @@ def advance_project_format_record(
             "revision": record.revision + 1,
             "phase": transition.phase,
             "intent": transition.intent,
+        }
+    )
+
+
+def project_format_identity_matches(
+    previous: ProjectFormatTransitionRecord,
+    current: ProjectFormatTransitionRecord,
+) -> bool:
+    """Only validated, forward state may change the two derived routing fields."""
+    mutable = {"revision", "phase", "intent", "base", "observed_format"}
+    return previous.revision <= current.revision and previous.model_dump(
+        exclude=mutable
+    ) == current.model_dump(exclude=mutable)
+
+
+def confirm_project_format_record(
+    record: ProjectFormatTransitionRecord,
+    expected: Revision,
+) -> ProjectFormatTransitionRecord:
+    """Derive the confirmation shape; the caller must authenticate the SQL pair."""
+    if record.position != expected:
+        raise TransactionError("stale_revision")
+    if record.revision == 5:
+        return record
+    if (record.revision, record.phase, record.intent) != (4, "activating", "install_target"):
+        raise TransactionError("invalid_transition")
+    return ProjectFormatTransitionRecord.model_validate(
+        {
+            **record.model_dump(),
+            "revision": 5,
+            "observed_format": record.target_format,
+            "base": record.fallback,
         }
     )
 

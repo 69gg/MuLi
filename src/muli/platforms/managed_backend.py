@@ -27,7 +27,13 @@ from muli.managed_controller import (
     transfer_identity_matches,
 )
 from muli.managed_format_migration import migrate_project_format
-from muli.managed_journal import Component, RoleSnapshots, _read_snapshots, read_snapshots
+from muli.managed_journal import (
+    Component,
+    RoleSnapshots,
+    _read_snapshots,
+    confirm_project_format_managed,
+    read_snapshots,
+)
 from muli.managed_transaction import (
     HealthProofV2,
     ProjectControllerTransferRecord,
@@ -35,6 +41,7 @@ from muli.managed_transaction import (
     RoleBinding,
     TransactionRecordV2,
     format_digest,
+    project_format_identity_matches,
 )
 from muli.management_transaction import (
     ClockReading,
@@ -163,8 +170,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise TransactionError("stale_revision")
         if self._format_record is not None and (
             not isinstance(record, ProjectFormatTransitionRecord)
-            or self._format_record.model_dump(exclude={"revision", "phase", "intent"})
-            != record.model_dump(exclude={"revision", "phase", "intent"})
+            or not project_format_identity_matches(self._format_record, record)
         ):
             raise ObservationError("transaction_format_identity_changed")
         if self._transfer_record is not None and (
@@ -184,7 +190,14 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             # The opposite role is frozen metadata, not a requirement that its
             # damaged package remain executable in order to restore the base.
             for selected in _ROLES:
-                binding, slot = record.binding(selected), self.slots[selected]
+                # SQL confirmation changes logical base to fallback2; it has
+                # not changed the physical source1 files or controller slot.
+                binding = (
+                    record.source.binding
+                    if isinstance(record, ProjectFormatTransitionRecord) and selected == "base"
+                    else record.binding(selected)
+                )
+                slot = self.slots[selected]
                 if (
                     binding.installation != slot.digest
                     or binding.compatibility != slot.compatibility_digest
@@ -710,11 +723,25 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise ObservationError("transaction_service_not_stopped")
         with self.journal.writer_lease() as lease:
             cgroup = before.service.unit.cgroup
+            current = record
 
             def guard() -> None:
-                self._guard(record, role, lease, cgroup)
-                if self._disk().digests != _files(record.source.binding):
+                self._guard(current, role, lease, cgroup)
+                if self._disk().digests != _files(current.source.binding):
                     raise ObservationError("foreign_managed_binding")
+
+            def confirmed() -> None:
+                nonlocal current
+                guard()
+                current = confirm_project_format_managed(
+                    self.control,
+                    current,
+                    writer=lease,
+                    guard=guard,
+                )
+                # All subsequent guards and probes observe only the confirmed
+                # forward record; the physical source binding stays unchanged.
+                guard()
 
             guard()
             if before != await self._probe(record):
@@ -729,9 +756,10 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                     record.deadline.remaining(self.clock()) - record.deadline.rollback_reserve,
                 ),
                 metadata_bytes=self.journal.limits.max_record_bytes,
+                confirm=confirmed,
             )
             guard()
-            if before != await self._probe(record):
+            if before != await self._probe(current):
                 raise ObservationError("transaction_observation_changed")
             guard()
 

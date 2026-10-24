@@ -306,3 +306,94 @@ Journal确认、格式2 reader恢复、启动激活或Project功能发行证明�
 reader资格、三文件安装、candidate/fallback同库启动与激活仍未实现或验收，不能发行
 为完整托管迁移，也未开放CURRENT2或Projectgate。上文的“待验证”保留首验时序，
 当前局部结果以本段为准。
+
+## SQL→Journal 确认小片（局部候选，验证进行中）
+
+本片接续已提交的固定 SQL 效果，不增加迁移动作或启动资格。根先实收
+`tests/test_project_format_transition_confirm.py` 的三个正式入口目标红：3 failed，
+pytest 1.19 秒，守卫 1.831 秒、82.4 MiB、swap 0、exit 1。正向已完成真实
+`prepare→advance_managed→backend.install` 和固定 SQL 提交，但 Journal 仍为 revision4；
+两个丢回包参数均因尚无 revision5 状态写入而 DID NOT RAISE。没有缺失 API、导入或
+无效材料前置失败。下述为实现合同；本片后续实际验证状态见本节末尾，不声称已发行。
+
+唯一新持久点是 `revision4/activating/install_target` 到
+`revision5/activating/install_target`：完整模型严格派生
+`observed_format=target_format`、`base=fallback`，target 仍为 candidate；原 source、
+candidate、fallback、数据库 inode/marker 引用、原 projection、身份、nonce、期限与
+九份材料不变。`resolved=False`、`boot_role=None`、activation pending、health 为空。
+普通 `advance_managed/TransitionV2` 不能凭参数造出这个确认点，也不能从5进入启动或
+健康阶段。CURRENT 仍为1，普通 V1/V2 与 Transfer 的合同不变。
+
+正式 install 在 SQL helper 的精确 pair 观察成功后使用窄同步回调。回调仍处于原
+controller lock、writer lease、StoreConstructionLock、数据库 fd/inode 锚及原绝对
+期限之内；不把 helper 返回的布尔值当作锁外授权。它重新 CAS 当前完整 record，读验
+本代全部九份快照，按原 record 字节上限写唯一 state.json，不增加快照、GC 或账本。
+本代唯一准确 receipt、规范 marker2、主身份、原配置摘要和原 projection 任一不匹配
+均不确认，不补写 receipt。确认写入成功后，捕获的 guard 只向正式新 current5 前进；
+原后侧 `_probe` 及其前后身份、cgroup、物理文件和剩余期限核验全部保留，不能沿旧4
+假装通过当前 Journal 检查。后核失败不反向恢复 marker 或 Journal。
+
+逻辑 base=fallback2 不是已安装 fallback 的证据。此阶段物理 selector/config/unit、
+controller 和 slots[base] 仍为 source1；Journal 的 base 快照读取才映射到 frozen
+fallback。backend 的固定身份比较只接纳严格模型定义的单向进展，同 position 下的
+source/candidate/fallback/identity 变化仍拒绝。独立方案审查最初列出四处接缝；实现
+读码发现第五处真实 `ManagedSystemdProbe.read_managed` 也逐 role 比较 installation，
+会把 logical fallback 与物理 source 混淆。根批准仅为实际 ProjectFormat 类型将物理
+base 绑定与快照固定为 source，target 仍为 candidate；原 loaded argv/unit、proc UID/
+cgroup、文件双读和期限不放宽。专用无服务回归直接调用真实 read_managed，仅替换
+PID1 两次属性读，避免受控完整 probe 遮住这个接缝；错误的 logical slot 或损坏 source
+快照必须在属性读之前拒绝。这不是 reader2 运行资格或真实 systemd 验收。
+
+SQL helper 的显式 `confirm=None` 模式保留 SQL2/Journal1 前缀；它在同锁、同 inode 下
+准确重读后返回，不再次 BEGIN IMMEDIATE/INSERT/UPDATE/COMMIT。正式安装则必须在
+完整返回前确认5。旧迁移测试 helper 改为读取真实 control 当前值，两个旧“完整 install
+返回仍1”的正向 oracle 按本合同演进到5/2；旧坏凭据、原锁、提交不明与无业务改写
+oracle 不放宽。直接 SQL 模式仍独立覆盖原前缀，不把旧捕获 record 当当前值。
+
+当前新文件共16个候选节点：准确5正向、Journal替换前/后丢回包两参数、五种错误 pair/
+inode、四种同 position 身份变化与原期限耗尽、以及三个真实 read_managed 正/负控制。
+丢回包均丢弃旧 poisoned control 并新建 control/backend；替换前可补唯一实际发布，
+替换后仅重读耐久确认，不第二次写 state、递增修订或重复 SQL。SQL2/Journal1、
+已确认5后的 marker1、缺失/异代/错配置 receipt、换 inode 均有独立拒绝 oracle。
+已有固定 SQL 测试的坏 UTF-8、大小、trigger、COMMIT 前后不明及三角色材料漂移继续
+保留。所有测试只用临时数据、实际文件/flock 和受控 manager 属性，不运行真实服务。
+
+三文件安装、真正 candidate/fallback reader2、同库启动、健康、激活、最终投影与
+Project gate 仍未开放；即使本片后续离线通过，也不能把此 WIP 当成可发行迁移。
+
+### 本片根实收与非作者后审
+
+根首次运行新增16节点，实际15 passed、1 failed：pytest5.21秒，守卫5.806秒、
+95MiB、swap0。唯一失败为同 position candidate 漂移负控只改 candidate、未同步其
+派生 target，正式模型先报 `invalid_project_format_roles`，尚未进入身份拒绝门，
+不能记作生产缺陷或该负控已经通过。现仅将该夹具的 target 同步为变更后的 candidate，
+保留同 position、原拒绝错误码以及无 SQL/文件效果的全部断言。根随后仅复跑修正的
+selector，实际1 passed：pytest0.41秒，守卫1.005秒、76.7MiB。故新增16个不同节点
+均已覆盖通过；没有把前置夹具红算作生产回归，也没有重跑全组制造累计通过数。
+
+旧 `test_project_format_transition_migrate.py` 与
+`test_project_format_transition_prepare.py` 合计50节点通过：pytest10.24秒，
+守卫10.841秒、122.7MiB、swap0。上述数字按实际文件组分别记录，不相加为更大的
+独立覆盖。非作者C对确认回调、严格单向身份、物理 source/逻辑 fallback 分离、
+同 pair 只读重入与保留后侧核验的独立只读后审，未发现剩余具体P1/P2。
+旧 transaction/Journal/probe、完整 Transfer 回归及本片全源 strict、Ruff和格式结果
+在该阶段尚待根收齐；此前 SQL 局部候选的静态绿不冒充本片静态结果。
+
+随后根实收原 transaction/Journal/probe 三文件103节点通过：pytest2.51秒，
+守卫3.052秒、66MiB；完整七个 Transfer 文件161节点通过：pytest5.38秒，
+守卫5.961秒、110.8MiB。结合本片新16节点与旧 migrate/prepare 50节点，
+合计330个不同节点通过，以上守卫均swap0。未把分组重试或历史通过数重复计入。
+
+全源类型首验直接调用共享venv的mypy、未显式设置MYPYPATH或禁用增量缓存时，
+实际149文件出现3处旧 `skills.py` 的 unused-ignore：守卫2.341秒、219.8MiB。
+该文件未因本片修改，也没有删除ignore、关闭警告或改无关生产代码取绿。根使用明确的
+`env MYPYPATH=src python -m mypy --strict --no-incremental src/muli` 复验，
+全149源文件通过：守卫8.415秒、418.9MiB、swap0。这证明该明确调用通过，
+不把尚未单独隔离的搜索路径、解释器和缓存因素写成已确认的唯一原因。
+全仓Ruff检查已通过；格式首验四文件需整理，根仅修改排版、未改语义，随后全仓
+394文件格式检查通过：守卫59毫秒、21.3MiB、swap0。此次局部候选的上述离线检查
+已收齐，不将其扩大为真实服务、reader2资格或完整迁移恢复验收。
+
+本片只确认准确 SQL pair 后的 Journal revision5。即使全部离线回归通过，也不提供
+格式2 reader资格、source1重新准入、live三文件安装或完整启动/恢复能力；CURRENT1、
+boot_role=None、driver拒绝和 Project gate 关闭的边界保持。
