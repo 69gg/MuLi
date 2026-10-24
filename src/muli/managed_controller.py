@@ -11,12 +11,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from muli.managed_journal import RoleSnapshots, advance_managed, read_snapshots
+from muli.managed_journal import RoleSnapshots, read_snapshots
 from muli.managed_transaction import (
     HealthProofV2,
     RoleBinding,
     TransactionRecordV2,
     TransitionV2,
+    advance_record_v2,
 )
 from muli.management_controller import _Controller, _ControllerEffects
 from muli.management_transaction import (
@@ -140,10 +141,19 @@ class _ManagedPolicy:
         code: Code | None,
         proof: HealthProofV2 | None,
     ) -> TransactionRecordV2:
-        return advance_managed(
-            self.control,
-            record.position,
-            TransitionV2(phase=phase, intent=intent, activation=activation, code=code, proof=proof),
+        # The ordinary driver must reject a changed action before any write;
+        # accepting the Journal's new Transfer branch here would grant effects.
+        current = self.read()
+        if current is None:
+            raise TransactionError("managed_transaction_required")
+        return self.control._write(
+            advance_record_v2(
+                current,
+                record.position,
+                TransitionV2(
+                    phase=phase, intent=intent, activation=activation, code=code, proof=proof
+                ),
+            )
         )
 
     def allowed(self, record: TransactionRecordV2, observation: ManagedServiceObservation) -> bool:

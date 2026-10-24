@@ -21,6 +21,7 @@ from muli.managed_transaction import (
     TransactionRecordV2,
     TransitionV2,
     advance_record_v2,
+    advance_transfer_record,
     prepare_record_v2,
     raw_snapshot,
 )
@@ -214,8 +215,10 @@ def prepare_managed(
 
 def advance_managed(
     control: JournalControl, expected: Revision, transition: TransitionV2
-) -> TransactionRecordV2:
+) -> TransactionRecordV2 | ProjectControllerTransferRecord:
     record = control.read_current()
+    if isinstance(record, ProjectControllerTransferRecord):
+        return control._write(advance_transfer_record(record, expected, transition))
     if not isinstance(record, TransactionRecordV2):
         raise TransactionError("managed_transaction_required")
     return control._write(advance_record_v2(record, expected, transition))
