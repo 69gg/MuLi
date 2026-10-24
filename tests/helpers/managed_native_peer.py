@@ -23,6 +23,7 @@ if TYPE_CHECKING or __package__:
     from .managed_native_worker import (
         CLEANUP_SECONDS,
         CONTEXT_REPLY_BYTES,
+        SOCKET_SUB_STATES,
         NativeError,
         remaining,
         require,
@@ -33,21 +34,33 @@ else:
     from __main__ import (
         CLEANUP_SECONDS,
         CONTEXT_REPLY_BYTES,
+        SOCKET_SUB_STATES,
         NativeError,
         remaining,
         require,
     )
 
-BasicState = Literal[
-    "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance"
+SocketState = Literal[
+    "dead",
+    "start-pre",
+    "start-chown",
+    "start-post",
+    "listening",
+    "running",
+    "stop-pre",
+    "stop-pre-sigterm",
+    "stop-pre-sigkill",
+    "stop-post",
+    "final-sigterm",
+    "final-sigkill",
+    "failed",
+    "cleaning",
 ]
 Reason = Literal["none", "timeout", "identity_changed", "invalid_reply", "unavailable"]
-_BASIC_STATES = frozenset(
-    {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance"}
-)
 _MANAGER = b"/org/freedesktop/systemd1"
 _MANAGER_INTERFACE = b"org.freedesktop.systemd1.Manager"
 _UNIT_INTERFACE = b"org.freedesktop.systemd1.Unit"
+_SOCKET_INTERFACE = b"org.freedesktop.systemd1.Socket"
 _PROPERTIES = b"org.freedesktop.DBus.Properties"
 
 
@@ -55,8 +68,8 @@ _PROPERTIES = b"org.freedesktop.DBus.Properties"
 class PeerFacts:
     code: Literal["observed", "not_observed"]
     reason: Reason
-    basic_state: BasicState | None = None
-    njobs: int | None = None
+    sub_state: SocketState | None = None
+    control_pid: int | None = None
 
 
 class _Error(ctypes.Structure):
@@ -256,7 +269,7 @@ def _request(
 
 
 def read_manager_peer(pid: int, uid: int, deadline: float) -> PeerFacts:
-    """Read one already loaded basic unit and NJobs; no activation or retries.
+    """Read one already loaded dbus socket's substate/PID; no activation or retries.
 
     This does not authenticate proc/exe/cgroup or infer READY. The eventual
     caller must supply the outer same-process window and hard process deadline.
@@ -293,7 +306,7 @@ def read_manager_peer(pid: int, uid: int, deadline: float) -> PeerFacts:
             _MANAGER,
             _MANAGER_INTERFACE,
             b"GetUnit",
-            (b"basic.target",),
+            (b"dbus.socket",),
             "o",
         )
         require(
@@ -309,32 +322,32 @@ def read_manager_peer(pid: int, uid: int, deadline: float) -> PeerFacts:
             path,
             _PROPERTIES,
             b"Get",
-            (_UNIT_INTERFACE, b"ActiveState"),
+            (_UNIT_INTERFACE, b"SubState"),
             "s",
         )
         require(
-            isinstance(state, bytes) and state.decode("ascii") in _BASIC_STATES,
+            isinstance(state, bytes) and state.decode("ascii") in SOCKET_SUB_STATES,
             "native_diagnostic_invalid",
         )
         assert isinstance(state, bytes)
-        jobs = _request(
+        control_pid = _request(
             api,
             bus,
             deadline,
-            _MANAGER,
+            path,
             _PROPERTIES,
             b"Get",
-            (_MANAGER_INTERFACE, b"NJobs"),
+            (_SOCKET_INTERFACE, b"ControlPID"),
             "u",
         )
-        require(type(jobs) is int and 0 <= jobs < 2**32, "native_diagnostic_invalid")
-        assert isinstance(jobs, int)
+        require(type(control_pid) is int and 0 <= control_pid < 2**31, "native_diagnostic_invalid")
+        assert isinstance(control_pid, int)
         require(
             _peer_identity(descriptor) == (pid, uid) and _socket_identity(uid) == before,
             "native_process_changed",
         )
         remaining(deadline)
-        return PeerFacts("observed", "none", cast(BasicState, state.decode("ascii")), jobs)
+        return PeerFacts("observed", "none", cast(SocketState, state.decode("ascii")), control_pid)
     except (OSError, ValueError, struct.error, ctypes.ArgumentError) as error:
         reason: Reason = (
             "timeout"

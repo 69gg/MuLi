@@ -233,6 +233,8 @@ def test_pending_job_new_collector_is_strict_but_old_artifacts_remain_readable()
     assert ci.manager_instance_facts(packet, allow_legacy=False)
     assert worker.pending_job_facts(packet["pending_job"])
     assert len(json.dumps(packet, separators=(",", ":")).encode()) < 1024
+    # Exercise the old artifact readback contract, not the current collector.
+    # Current socket-control maxima are covered by socket_control/peer_integration.
     packet.update(
         uid=2**31 - 1,
         pid=2**31 - 1,
@@ -449,7 +451,13 @@ def test_instance_helper_reads_actual_image_and_all_four_uids_without_environmen
         assert result["exe"] == ("executor" if case == "executor" else "manager")
         assert result["uids"] == ("mismatch" if case == "one-uid-mismatch" else "all_expected")
         assert result["internal"] == (
-            {"code": "not_observed", "reason": "unavailable", "basic_state": None, "njobs": None}
+            {
+                "code": "not_observed",
+                "reason": "unavailable",
+                "sub_state": None,
+                "control_pid": None,
+                "control": worker.control_unavailable(),
+            }
             if case not in {"executor", "one-uid-mismatch"}
             else "not_observed"
         )

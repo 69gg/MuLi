@@ -28,6 +28,29 @@ from test_managed_native_instance import failed_result, instance_packet
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux native diagnostics")
 
 
+def internal_packet(*, maximum: bool = False) -> dict[str, Any]:
+    return {
+        **asdict(
+            peer.PeerFacts(
+                "observed",
+                "none",
+                "stop-pre-sigterm" if maximum else "listening",
+                2**31 - 1 if maximum else 0,
+            )
+        ),
+        "control": {
+            "code": "observed",
+            "start_ticks": 2**64 - 1,
+            "exe": "systemctl",
+            "uids": "all_expected",
+            "runtime_env": "duplicate",
+            "force_bus": "duplicate",
+        }
+        if maximum
+        else worker.control_unavailable("absent"),
+    }
+
+
 @pytest.fixture(autouse=True)
 def forbid_peer_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(*args: object, **kwargs: object) -> Any:
@@ -96,7 +119,7 @@ async def test_peer_facts_are_inside_both_real_identity_windows(
             control["overrides"]["InvocationID"] = [11] * 16
         elif case == "expired":
             control["clock"] = deadline
-        return peer.PeerFacts("observed", "none", "active", 7)
+        return peer.PeerFacts("observed", "none", "listening", 0)
 
     async def run(
         argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
@@ -145,7 +168,7 @@ async def test_peer_facts_are_inside_both_real_identity_windows(
         assert peer_calls == [(42, control["uid"], 105.0)]
         if case == "manager":
             assert packet["code"] == "observed"
-            assert packet["internal"] == asdict(peer.PeerFacts("observed", "none", "active", 7))
+            assert packet["internal"] == internal_packet()
             assert len(image_calls) == 2 and control["read_count"] == 2
             assert len(control["calls"]) == 6
             assert packet["used"] == sum(returned_bytes) + sum(proc_bytes)
@@ -154,7 +177,7 @@ async def test_peer_facts_are_inside_both_real_identity_windows(
             assert packet["reason"] == ("timeout" if case == "expired" else "identity_changed")
             assert packet["exe"] == packet["uids"] == "unavailable"
             assert packet["internal"] == "not_observed"
-            assert "basic_state" not in json.dumps(packet)
+            assert "control_pid" not in json.dumps(packet)
     assert "secret" not in json.dumps(packet) and inner_wires
 
 
@@ -220,13 +243,13 @@ def test_maximum_internal_projection_fits_unchanged_inner_reserve() -> None:
         "exe": "manager",
         "uids": "all_expected",
         "used": worker.MAX_BYTES,
-        "internal": asdict(peer.PeerFacts("observed", "none", "deactivating", 2**32 - 1)),
+        "internal": internal_packet(maximum=True),
     }
     assert len((json.dumps(value, separators=(",", ":")) + "\n").encode()) <= 512
     assert worker.instance_projection(value) == value
 
 
-@pytest.mark.parametrize("case", ["bool-jobs", "extra", "executor", "uid-mismatch"])
+@pytest.mark.parametrize("case", ["bool-pid", "extra", "executor", "uid-mismatch"])
 def test_internal_facts_cannot_bypass_exact_shape_or_process_tags(case: str) -> None:
     value = {
         "code": "observed",
@@ -234,12 +257,12 @@ def test_internal_facts_cannot_bypass_exact_shape_or_process_tags(case: str) -> 
         "exe": "manager",
         "uids": "all_expected",
         "used": 128,
-        "internal": asdict(peer.PeerFacts("observed", "none", "active", 7)),
+        "internal": internal_packet(),
     }
     internal = value["internal"]
     assert isinstance(internal, dict)
-    if case == "bool-jobs":
-        internal["njobs"] = True
+    if case == "bool-pid":
+        internal["control_pid"] = True
     elif case == "extra":
         internal["unbounded_native_error"] = "must-not-escape"
     elif case == "executor":
@@ -258,10 +281,10 @@ def test_parent_accounting_uses_real_ledger_and_wire_without_enlarging_packet(
     native.prepare()
     native.receipt.setup_phase = "manager_show_before"
     packet = instance_packet(commands.uid)
-    packet["internal"] = asdict(peer.PeerFacts("observed", "none", "active", 7))
+    packet["internal"] = internal_packet()
     if case in {"1024", "1025"}:
         packet.update(pid=2**31 - 1, start_ticks=2**64 - 1, invocation="f" * 32)
-        packet["internal"] = asdict(peer.PeerFacts("observed", "none", "deactivating", 2**32 - 1))
+        packet["internal"] = internal_packet(maximum=True)
     native.manager_failure = failed_result(packet)["resources"]["manager_failure"]
     native.manager_failure["last_completed_round"]["manager"].update(
         {key: packet[key] for key in ("pid", "start_ticks", "invocation")}

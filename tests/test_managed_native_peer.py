@@ -107,13 +107,13 @@ class Library:
             if self.mode == "null-string" and args[1] != b"u":
                 return 1
             if args[1] == b"u":
-                ctypes.cast(cast(ctypes.c_void_p, args[2]), ctypes.POINTER(ctypes.c_uint32))[0] = 7
+                ctypes.cast(cast(ctypes.c_void_p, args[2]), ctypes.POINTER(ctypes.c_uint32))[0] = 0
             else:
                 assert args[1] in (b"s", b"o")
                 value = (
-                    b"/org/freedesktop/systemd1/unit/basic_2etarget"
+                    b"/org/freedesktop/systemd1/unit/dbus_2esocket"
                     if args[1] == b"o"
-                    else b"active"
+                    else b"listening"
                 )
                 if self.mode == "long-string":
                     value = b"x" * (peer.CONTEXT_REPLY_BYTES + 1)
@@ -218,13 +218,13 @@ def test_fixed_peer_reads_actual_scalars_with_one_deadline_and_releases_all(
     assert asdict(result) == {
         "code": "observed",
         "reason": "none",
-        "basic_state": "active",
-        "njobs": 7,
+        "sub_state": "listening",
+        "control_pid": 0,
     }
     assert list(library.messages.values()) == [
-        (b"GetUnit", [b"basic.target"]),
-        (b"Get", [b"org.freedesktop.systemd1.Unit", b"ActiveState"]),
-        (b"Get", [b"org.freedesktop.systemd1.Manager", b"NJobs"]),
+        (b"GetUnit", [b"dbus.socket"]),
+        (b"Get", [b"org.freedesktop.systemd1.Unit", b"SubState"]),
+        (b"Get", [b"org.freedesktop.systemd1.Socket", b"ControlPID"]),
     ]
     assert library.timeouts == [5_000_000, 4_750_000, 4_500_000]
     assert library.socket_calls == library.peer_calls == 2
@@ -271,8 +271,8 @@ def test_rejects_bad_reply_or_identity_without_partial_facts(
     assert asdict(result) == {
         "code": "not_observed",
         "reason": reason,
-        "basic_state": None,
-        "njobs": None,
+        "sub_state": None,
+        "control_pid": None,
     }
     assert "secret" not in json.dumps(asdict(result))
     assert sorted(library.freed) == sorted(list(library.messages) + list(library.reply_for))
@@ -302,7 +302,7 @@ def test_native_error_is_fixed_and_owned_resources_are_released(
     library.fail = function
     result = peer.read_manager_peer(42, 23145, 105.0)
     assert result.code == "not_observed" and result.reason == "unavailable"
-    assert result.basic_state is None and result.njobs is None
+    assert result.sub_state is None and result.control_pid is None
     names = [name for name, _ in library.calls]
     assert names.count("sd_bus_start") <= 1
     inside_request = function in {
@@ -338,8 +338,8 @@ def test_timeout_or_missing_library_never_falls_back(
     assert asdict(peer.read_manager_peer(42, 23145, 105.0)) == {
         "code": "not_observed",
         "reason": "unavailable",
-        "basic_state": None,
-        "njobs": None,
+        "sub_state": None,
+        "control_pid": None,
     }
 
 

@@ -40,6 +40,24 @@ HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 PROCESS_STATES = frozenset("RSDZTtXxKWPI")
+SOCKET_SUB_STATES = frozenset(
+    {
+        "dead",
+        "start-pre",
+        "start-chown",
+        "start-post",
+        "listening",
+        "running",
+        "stop-pre",
+        "stop-pre-sigterm",
+        "stop-pre-sigkill",
+        "stop-post",
+        "final-sigterm",
+        "final-sigkill",
+        "failed",
+        "cleaning",
+    }
+)
 SYSTEM_EXECUTABLE_ROOTS = (Path("/usr/lib/systemd"), Path("/lib/systemd"))
 BOOTSTRAP_PARENT = Path("/tmp")
 JOURNAL_EVENTS = 32
@@ -502,20 +520,31 @@ async def diagnose(user: str, uid: int, home: Path, unit: str, deadline: float) 
     return facts
 
 
+def _system_executable(name: str, roots: tuple[Path, ...]) -> str | None:
+    for parent in roots:
+        try:
+            path = (parent / name).resolve(strict=True)
+            info = path.stat()
+            if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022:
+                return str(path)
+        except OSError:
+            continue
+    return None
+
+
 def system_executables() -> dict[str, str]:
-    """Classify only existing, root-owned system images at the fixed system paths."""
+    """Preserve the manager/executor classification used by the older diagnostic."""
     result: dict[str, str] = {}
     for kind, name in (("manager", "systemd"), ("executor", "systemd-executor")):
-        for parent in SYSTEM_EXECUTABLE_ROOTS:
-            try:
-                path = (parent / name).resolve(strict=True)
-                info = path.stat()
-                if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022:
-                    result[kind] = str(path)
-                    break
-            except OSError:
-                continue
+        path = _system_executable(name, SYSTEM_EXECUTABLE_ROOTS)
+        if path is not None:
+            result[kind] = path
     return result
+
+
+def systemctl_executable() -> str | None:
+    """Classify the control image without extending the older diagnostic's tags."""
+    return _system_executable("systemctl", (Path("/usr/bin"), Path("/bin")))
 
 
 def bootstrap_data() -> bytes:
@@ -1309,7 +1338,7 @@ def instance_projection(value: object) -> dict[str, Any]:
             value["code"] == "observed"
             and value["exe"] == "manager"
             and value["uids"] == "all_expected"
-            and peer_facts(internal)
+            and peer_facts(internal, control=True)
             and isinstance(internal, dict)
             and internal["reason"] != "identity_changed"
         ),
@@ -1318,30 +1347,67 @@ def instance_projection(value: object) -> dict[str, Any]:
     return dict(value)
 
 
-def peer_facts(value: object) -> bool:
-    """The complete fixed peer result, never a native error or arbitrary unit."""
-    if not isinstance(value, dict) or set(value) != {"code", "reason", "basic_state", "njobs"}:
+def control_unavailable(code: str = "not_observed") -> dict[str, Any]:
+    return {
+        "code": code,
+        "start_ticks": None,
+        "exe": "unavailable",
+        "uids": "unavailable",
+        "runtime_env": "unavailable",
+        "force_bus": "unavailable",
+    }
+
+
+def control_facts(value: object) -> bool:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"code", "start_ticks", "exe", "uids", "runtime_env", "force_bus"}
+        or not all(
+            isinstance(value[key], str)
+            for key in ("code", "exe", "uids", "runtime_env", "force_bus")
+        )
+    ):
         return False
+    if value["code"] != "observed":
+        return value["code"] in {"absent", "not_observed"} and value == control_unavailable(
+            value["code"]
+        )
     return (
+        type(value["start_ticks"]) is int
+        and 0 <= value["start_ticks"] < 2**64
+        and value["exe"] in {"systemctl", "other"}
+        and value["uids"] == "all_expected"
+        and value["runtime_env"] in {"matches", "missing", "other", "duplicate"}
+        and value["force_bus"] in {"on", "off", "missing", "other", "duplicate"}
+    )
+
+
+def peer_facts(value: object, *, control: bool = False) -> bool:
+    """Current fixed result only; old basic/jobs are artifact-readback facts."""
+    keys = {"code", "reason", "sub_state", "control_pid"} | ({"control"} if control else set())
+    if not isinstance(value, dict) or set(value) != keys:
+        return False
+    observed = (
         value["code"] == "observed"
         and value["reason"] == "none"
-        and value["basic_state"]
-        in (
-            "active",
-            "reloading",
-            "inactive",
-            "failed",
-            "activating",
-            "deactivating",
-            "maintenance",
-        )
-        and type(value["njobs"]) is int
-        and 0 <= value["njobs"] < 2**32
-    ) or (
+        and isinstance(value["sub_state"], str)
+        and value["sub_state"] in SOCKET_SUB_STATES
+        and type(value["control_pid"]) is int
+        and 0 <= value["control_pid"] < 2**31
+    )
+    unavailable = (
         value["code"] == "not_observed"
         and value["reason"] in ("timeout", "identity_changed", "invalid_reply", "unavailable")
-        and value["basic_state"] is None
-        and value["njobs"] is None
+        and value["sub_state"] is None
+        and value["control_pid"] is None
+    )
+    if not (observed or unavailable):
+        return False
+    if not control:
+        return True
+    child = value["control"]
+    return control_facts(child) and child["code"] == (
+        "not_observed" if unavailable else "absent" if value["control_pid"] == 0 else "observed"
     )
 
 
@@ -1425,10 +1491,9 @@ def read_manager_instance(
             math.isfinite(deadline) and remaining(deadline) <= CLEANUP_SECONDS,
             "native_diagnostic_invalid",
         )
-        root = Path("/proc") / str(pid)
         known = system_executables()
 
-        def read(name: str) -> bytes:
+        def read(root: Path, name: str) -> bytes:
             nonlocal used
             remaining(deadline)
             require(used < limit, "native_diagnostic_output_budget")
@@ -1438,11 +1503,16 @@ def read_manager_instance(
             remaining(deadline)
             return data
 
-        def binding() -> tuple[int, tuple[int, ...], str, str]:
+        def binding(
+            selected_pid: int, expected_ticks: int | None = None
+        ) -> tuple[int, tuple[int, ...], str, str]:
             nonlocal used
-            start = _start_ticks(read("stat"), pid)
+            root = Path("/proc") / str(selected_pid)
+            start = _start_ticks(read(root, "stat"), selected_pid)
             rows = [
-                row.split()[1:] for row in read("status").splitlines() if row.startswith(b"Uid:")
+                row.split()[1:]
+                for row in read(root, "status").splitlines()
+                if row.startswith(b"Uid:")
             ]
             require(
                 len(rows) == 1
@@ -1452,7 +1522,7 @@ def read_manager_instance(
             )
             identities = tuple(int(item) for item in rows[0])
             require(all(item < 2**32 for item in identities), "native_diagnostic_invalid")
-            groups = read("cgroup").decode("ascii").splitlines()
+            groups = read(root, "cgroup").decode("ascii").splitlines()
             require(len(groups) == 1 and groups[0].startswith("0::"), "native_diagnostic_invalid")
             current = _cgroup(groups[0][3:])
             require(current == group or current.startswith(group + "/"), "native_process_changed")
@@ -1460,14 +1530,14 @@ def read_manager_instance(
             used += len(os.fsencode(image))
             require(used <= limit, "native_diagnostic_output_budget")
             remaining(deadline)
-            require(start == ticks, "native_process_changed")
+            require(expected_ticks is None or start == expected_ticks, "native_process_changed")
             require(
                 image.startswith("/") and not any(char in image for char in "\x00\r\n"),
                 "native_diagnostic_invalid",
             )
             return start, identities, current, image
 
-        before = binding()
+        before = binding(pid, ticks)
         internal: dict[str, Any] | str = "not_observed"
         if known.get("manager") == before[3] and before[1] == (uid,) * 4:
             require(used < limit, "native_diagnostic_output_budget")
@@ -1477,7 +1547,62 @@ def read_manager_instance(
             internal = asdict(manager_peer(pid, uid, deadline))
             require(peer_facts(internal), "native_diagnostic_invalid")
             require(internal["reason"] != "identity_changed", "native_process_changed")
-        require(before == binding(), "native_process_changed")
+            child = control_unavailable()
+            if internal["code"] == "observed":
+                child_pid = internal["control_pid"]
+                if child_pid == 0:
+                    child = control_unavailable("absent")
+                else:
+                    require(child_pid != pid, "native_process_changed")
+                    child_before = binding(child_pid)
+                    require(child_before[1] == (uid,) * 4, "native_process_changed")
+                    environment = read(Path("/proc") / str(child_pid), "environ")
+                    require(
+                        not environment or environment.endswith(b"\x00"),
+                        "native_diagnostic_invalid",
+                    )
+                    selected: dict[bytes, list[bytes]] = {
+                        b"XDG_RUNTIME_DIR": [],
+                        b"SYSTEMCTL_FORCE_BUS": [],
+                    }
+                    for row in environment.split(b"\x00"):
+                        name, separator, value = row.partition(b"=")
+                        if separator and name in selected:
+                            # Keep at most two bounded references; duplicates
+                            # are a fixed classification, not a last-wins value.
+                            if len(selected[name]) < 2:
+                                selected[name].append(value)
+
+                    def classified(name: bytes) -> str:
+                        values = selected[name]
+                        if not values:
+                            return "missing"
+                        if len(values) != 1:
+                            return "duplicate"
+                        value = values[0]
+                        if name == b"XDG_RUNTIME_DIR":
+                            return "matches" if value == f"/run/user/{uid}".encode() else "other"
+                        # v255 parse_boolean accepts these case-insensitive words.
+                        if value.lower() in {b"1", b"yes", b"y", b"true", b"t", b"on"}:
+                            return "on"
+                        if value.lower() in {b"0", b"no", b"n", b"false", b"f", b"off"}:
+                            return "off"
+                        return "other"
+
+                    require(child_before == binding(child_pid), "native_process_changed")
+                    child = {
+                        "code": "observed",
+                        "start_ticks": child_before[0],
+                        "exe": "systemctl"
+                        if systemctl_executable() == child_before[3]
+                        else "other",
+                        "uids": "all_expected",
+                        "runtime_env": classified(b"XDG_RUNTIME_DIR"),
+                        "force_bus": classified(b"SYSTEMCTL_FORCE_BUS"),
+                    }
+            internal["control"] = child
+            require(peer_facts(internal, control=True), "native_diagnostic_invalid")
+        require(before == binding(pid, ticks), "native_process_changed")
         remaining(deadline)
         image = before[3]
         return {

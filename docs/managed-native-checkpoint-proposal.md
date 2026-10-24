@@ -233,3 +233,110 @@ create 成功但回包丢失。根实际收取九项全部失败、506 deselecte
 根统一实收目标选择 **10 passed / 512 deselected**（包含新增旧manifest节点；pytest0.51秒，守卫1.023秒、97.9MiB/swap0、exit0），随后完整六个native文件 **750 passed**（pytest2.11秒，守卫2.738秒、146.4MiB/swap0、exit0）。集合有重叠，不重复累计。首次两脚本strict检查指出删除循环复用已推断非空的leaf变量而接收Optional；根仅更名保存叶子的循环变量，不改行为。修后strict/no-incremental通过（守卫5.682秒、289MiB/swap0、exit0）。Ruff通过；格式首检一份测试排版未统一，根只格式化该文件后，三份改动Python的格式均通过。
 
 另一位未参与本片实现的Sol独立只读后审创建、双叶先验、旧receipt/manifest和丢回包路径，未见确切P1/P2。上述均为离线临时文件和受控账户/命令边界；真实GnuPG单元正文和启动钩子的等待位置仍未取得。下一固定签名head只作一次单变量远端对照，保持原basic/dbus、READY和清理准入，不把mask提示当作已经修复生产根因。
+
+### native22 单变量现场结果（仍未完成启动）
+
+G签名 `0971afe1c29e7f432b8eff83ba9a13dda7d73904` 对应一次
+[CI40056790988](https://github.com/69gg/MuLi/actions/runs/40056790988)。
+原生 job120761422259 在03:07:22Z仍报 `native_deadline_exceeded`，
+03:07:26Z清理仍报 `native_service_cleanup_failed`；零正式事务、零generation。
+其它作业的结果不能替代此失败，也不能据临时账户已删除、mount计数为0宣称完整清理成功。
+
+artifact12545886976为975字节，SHA-256
+`b0b790fa9c75be28f3a2c288c5d9628f6c15fcedf714dd67e78291e14a223613`。
+根以原4096字节ZIP限额、精确两成员、原解压上限和实际 `fixture_result` /
+`Receipt.read` 验证，未在本机启动manager。最后完整轮 `elapsed_ms=81838`，
+manager仍 `activating/start`，PID2484、start_ticks23639、invocation
+`53b50b3d5a8a4a57a72bef50d5db314f`；双侧实际映像、四UID和实例身份一致。
+私有peer读取为 `basic=inactive, NJobs=4`，STATUS候选变为
+`pending_job={code:user_job,identifier:dbus.socket,type:start}`。
+这说明单个GnuPG socket隔离改变了观察结果，尚不能证明剩余阻塞的根因。
+
+原账本仍生效：parent19852→24686，raw grant11892，child used4489，实际reply345，
+回包校验成功；原查询记录used17358、status0/code ok。
+下一步须区分实际unit及控制子进程的环境、私有peer连接与回退，不能继续屏蔽dbus或整张启动图。
+v255的 `bus_connect_user_systemd` 先连接 `XDG_RUNTIME_DIR/systemd/private`，
+连接失败才回退普通user bus；`set-environment` 正常使用 `BUS_MANAGER`。
+因此仅凭设置 `DBUS_SESSION_BUS_ADDRESS` 不能断言形成循环。
+依据为 [v255 bus-util](https://github.com/systemd/systemd/blob/v255/src/shared/bus-util.c)
+及 [v255 set-environment](https://github.com/systemd/systemd/blob/v255/src/systemctl/systemctl-set-environment.c)。
+尚未取得runner实际安装unit正文或控制子进程证据，不增加期限或把STATUS字符串当READY。
+
+该次CI终态为9项success、2项failure。另一失败是独立的Windows3.12
+job120761422295：`test_real_windows_system_module_probe_mta_and_owned_unicode_tree`
+在原12秒probe期限报 `read_timeout`，实收1 failed、3696 passed、2207 skipped（390.47秒）。
+有限诊断为stages空、sequence unobserved、stderr未封顶、sent1；lease已关闭、
+进程nonzero、reader已收尾且cleanup confirmed。没有首个脚本阶段证据，尚不能定位
+PowerShell开始前的等待或归因主机负载；不跳过该项、不提高期限、不将九项成功冒充全绿。
+这一Windows失败与Linux零事务/清理失败分别保留，不声称本次socket隔离已经修复任一方。
+
+### native22 后：固定 dbus.socket 控制子进程判别（离线实现候选，待统一复验）
+
+根先实收既有正式 peer 入口两条目标红：2 failed（pytest 0.41秒，守卫933毫秒，
+98MiB、swap0、exit1）；实际仍查询 basic.target/ActiveState，与所需固定 dbus 三调用
+不同，不是缺 API/import。随后授权本节窄实现；作者未运行检查、真实 FFI/socket 或
+新 CI，当前候选待根统一复验。STATUS 已提示 dbus.socket，
+下一采样固定查询这个已加载单元，不把 STATUS identifier 当作真实 unitID。原
+`read_manager_peer(pid, uid, deadline)` 三次调用 **整体替换**：
+`GetUnit(basic.target) → ActiveState → Manager.NJobs` 改为
+`GetUnit(dbus.socket) → Unit.SubState → Socket.ControlPID`。不调用 LoadUnit、
+ListJobs、订阅或自动激活；三条消息仍 auto_start=0、interactive=0，单个显式
+private 地址、bus_client=0、FD 的真实 SO_PEERCRED 及 socket 前后身份不变。
+依据为 [v255 Socket ControlPID/钩子属性](https://github.com/systemd/systemd/blob/v255/src/core/dbus-socket.c#L99-L115)。
+
+新 peer 四字段为 `code/reason/sub_state/control_pid`，替换旧 basic_state/njobs；
+SubState 只允许固定 socket 枚举：dead、start-pre、start-chown、start-post、listening、
+running、stop-pre、stop-pre-sigterm、stop-pre-sigkill、stop-post、final-sigterm、
+final-sigkill、failed、cleaning。PID 为严格非 bool 整数 `0 <= pid < 2**31`；
+失败时两个值均为 null。旧 basic/jobs 形状仅 artifact readback 可读，当前 collector
+不得将其冒充新版成功结果，也不生成同时携带两套概况的大包。
+
+worker 在原 manager 两次 proc 及前后 PID1 身份窗口内，用真实 ControlPID 读取
+子进程两次 stat/status/cgroup/exe，夹内只读一次 environ；全部读取及映像路径字节
+沿同一原 raw grant 累计，任何单读超额/身份漂移/绝对截止使整组失效、不退 grant。
+子 PID 必须与 manager 不同，四 UID 同目标 UID，cgroup 在该固定 user@ 实例下；
+前后 start_ticks/四 UID/cgroup/exe 必须一致。仅将 exe 归为固定 systemctl/other，
+不导出原始 argv、路径、环境或异常正文。环境只分类 XDG_RUNTIME_DIR 与
+SYSTEMCTL_FORCE_BUS；其余环境字节仍计费但不解释/输出。两键重复均固定 duplicate；
+runtime 为 matches/missing/other，force_bus 按 v255 布尔语义为 on/off/missing/other。
+缺文件/读取失败不冒充 missing；完整环境不能在额度内读取则整组 not_observed。
+
+`internal.control` 固定六字段：code、start_ticks、exe、uids、runtime_env、force_bus；
+观测成功 code=observed，UID 分类为 all_expected；ControlPID=0 时 code=absent，
+其余值 null/unavailable，完全不读子进程。start-pre/post 与非零 PID 只证明采样时
+存在控制子进程；PID0只表示当时未观察到，不能证明从未运行钩子或根因位于 bind。
+ControlPID 为该次 Get 的采样值，不声称此后始终是 manager 当前控制 PID；两次
+proc 只能绑定所读进程本身，不能替代额外的持续父子关系观察。
+root peer 成功不证明子进程的实际同 UID private 认证或 fallback 已成功。
+
+原五次 PID1 查询、一次内层命令、5秒绝对截止、32768总 proc/pipe预算及512 inner /
+1024 outer保存门保持。原 parent before/grant/charged/reply_bytes/after/settlement
+取实际 wire 和账本，丢回复占用原 grant、不退款；新字段替换旧概况而非累加。
+不得以新增诊断重置 deadline、扩大回包或削弱 READY/cleanup 成功门。
+
+新 `test_managed_native_socket_control.py` 仅驱动既有 peer/instance 正式入口：固定三
+调用、PID0反证、start-post 两侧真实 proc 数据、两键分类、子/manager漂移、期限与
+超额撤销及512/1024边界；无未来 API/import 红，不执行真实 FFI/socket/proc。
+补充反例核两个环境键重复、大小写布尔语义与ControlPID等于manager时拒绝；
+原 peer 的完整 signature/variant/尾部、认证/socket漂移、截止及释放断言保留。
+父 validator 仅 readback 接受旧 basic/jobs，当前收集路径必须使用新 exact 形状；
+最大 ControlPID/start_ticks 与固定最长 SubState 仍进入原512内层/1024保存门，
+原实际 wire 长度和 parent账本回归沿新包形状验证，未取消超额门。
+共享旧可执行文件标签仍只有manager/executor；新systemctl分类仅用于本段子进程，
+不扩展旧通用诊断枚举。作者尚未检查，后续还须实收外层 PID1漂移与
+parent真实计费回归；离线通过不等于 READY 或完整清理修复。
+
+runner 实际 unit 正文和 drop-in 的固定白名单读取另列未实施：会增加文件字节与
+身份读取，须先从原预算中明确替换/分配。此片不做该采样、不假定 Ubuntu 当前
+dbus.socket 必有某条 ExecStartPost，也不继续 mask dbus 或其它 vendor 单元。
+
+根实际复验新socket-control/peer/integration/instance四文件 **132 passed**
+（pytest0.81秒，守卫1.734秒、76.7MiB），原CI/checkpoint/resource三文件
+**638 passed**（pytest1.87秒，守卫2.496秒、138.1MiB），互不重叠共770项，均swap0/exit0。
+三脚本strict首检遗漏既有源码搜索路径，产生9处旧导入Any返回诊断；不改源码或规则，
+显式 `MYPYPATH=src:tests --explicit-package-bases` 非增量检查通过
+（守卫5.804秒、290.8MiB、swap0）。Ruff通过；格式首检六文件未统一，根只做排版后
+全仓Ruff及378文件格式检查通过。根作为非作者另读实际三调用、uint32属性、
+禁自动启动/交互授权、manager/子PID窗口、额度撤销和当前/历史schema分界，未见确切P1/P2。
+这些是离线证据，不能代替同UID认证、现场可用余额、READY、正式事务或完整cleanup验收。
+下一次远端只针对新的固定G签名head做一次判别，不重跑已知失败的0971候选。

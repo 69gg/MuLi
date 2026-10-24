@@ -827,7 +827,7 @@ def manager_instance_facts(value: object, *, allow_legacy: bool = True) -> bool:
                 value["code"] == "observed"
                 and value["exe"] == "manager"
                 and value["uids"] == "all_expected"
-                and peer_facts(value["internal"])
+                and peer_facts(value["internal"], allow_legacy=allow_legacy)
                 and value["internal"]["reason"] != "identity_changed"
             )
         )
@@ -851,8 +851,69 @@ def manager_instance_facts(value: object, *, allow_legacy: bool = True) -> bool:
     )
 
 
-def peer_facts(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != {"code", "reason", "basic_state", "njobs"}:
+def peer_facts(value: object, *, allow_legacy: bool = True) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if set(value) == {"code", "reason", "sub_state", "control_pid", "control"}:
+        observed = (
+            value["code"] == "observed"
+            and value["reason"] == "none"
+            and value["sub_state"]
+            in (
+                "dead",
+                "start-pre",
+                "start-chown",
+                "start-post",
+                "listening",
+                "running",
+                "stop-pre",
+                "stop-pre-sigterm",
+                "stop-pre-sigkill",
+                "stop-post",
+                "final-sigterm",
+                "final-sigkill",
+                "failed",
+                "cleaning",
+            )
+            and type(value["control_pid"]) is int
+            and 0 <= value["control_pid"] < 2**31
+        )
+        unavailable = (
+            value["code"] == "not_observed"
+            and value["reason"] in ("timeout", "identity_changed", "invalid_reply", "unavailable")
+            and value["sub_state"] is None
+            and value["control_pid"] is None
+        )
+        child = value["control"]
+        if (
+            not (observed or unavailable)
+            or not isinstance(child, dict)
+            or set(child) != {"code", "start_ticks", "exe", "uids", "runtime_env", "force_bus"}
+        ):
+            return False
+        expected = (
+            "not_observed" if unavailable else "absent" if value["control_pid"] == 0 else "observed"
+        )
+        if child["code"] != expected:
+            return False
+        if expected != "observed":
+            return child == {
+                "code": expected,
+                "start_ticks": None,
+                "exe": "unavailable",
+                "uids": "unavailable",
+                "runtime_env": "unavailable",
+                "force_bus": "unavailable",
+            }
+        return (
+            type(child["start_ticks"]) is int
+            and 0 <= child["start_ticks"] < 2**64
+            and child["exe"] in ("systemctl", "other")
+            and child["uids"] == "all_expected"
+            and child["runtime_env"] in ("matches", "missing", "other", "duplicate")
+            and child["force_bus"] in ("on", "off", "missing", "other", "duplicate")
+        )
+    if not allow_legacy or set(value) != {"code", "reason", "basic_state", "njobs"}:
         return False
     return (
         value["code"] == "observed"
