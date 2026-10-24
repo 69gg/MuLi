@@ -268,5 +268,6 @@ test("both real HTML entry points omit the removed side timeline and standalone 
     assert.doesNotMatch(html, /<aside\b/i, entry);
     assert.doesNotMatch(html, /\bid=["'](?:timeline(?:-[\w-]+)?|reasoning-region)["']/i, entry);
     assert.doesNotMatch(html, /\bdata-action=["'](?:toggle-timeline|toggle-reasoning)["']/i, entry);
+    assert.doesNotMatch(html, /\bdata-prompt\b|\bstarter-prompts\b/i, entry);
   }
 });

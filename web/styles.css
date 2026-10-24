@@ -449,10 +449,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .welcome-copy { text-align: center; }
 .welcome h2 { font: 400 34px/1.6 "Noto Serif CJK SC", "Songti SC", SimSun, serif; color: var(--text-strong); letter-spacing: 7px; margin: 0 0 6px 7px; }
 .welcome-copy > p { color: var(--muted); font-size: 13px; letter-spacing: 1px; margin: 0 0 25px; }
-.starter-prompts { display: flex; justify-content: center; flex-wrap: wrap; align-items: center; gap: 10px; }
-.starter-prompts button { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; min-height: 34px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 11px; background: transparent; transition: transform .18s, background .18s, border-color .18s; }
-.starter-prompts button:hover { transform: translateY(-2px); background: var(--hover); border-color: var(--accent); }
-.starter-prompts svg { width: 13px; height: 13px; }
 .messages { width: 100%; }
 .message-avatar, .message-avatar img { width: 29px; height: 29px; border-radius: 9px; }
 .message-body { color: var(--text); }
@@ -584,9 +580,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
   .welcome-illustration { width: min(310px, 90vw); max-height: 215px; }
   .welcome h2 { font-size: 31px; }
   .welcome-copy > p { font-size: 12px; margin-bottom: 23px; }
-  .starter-prompts { gap: 7px; }
-  .starter-prompts button { min-height: 36px; padding: 7px 9px; font-size: 10px; gap: 6px; }
-  .starter-prompts svg { width: 12px; height: 12px; }
   .composer-area { padding: 8px 15px 66px; }
   .composer { padding: 14px 12px 10px 15px; border-radius: 13px; }
   .composer textarea { font-size: 14px; min-height: 40px; }

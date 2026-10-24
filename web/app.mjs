@@ -2818,7 +2818,6 @@ document.addEventListener("click", async (event) => {
     if (button.dataset.action) await handleAction(button.dataset.action, button);
     else if (button.dataset.view) await switchView(button.dataset.view);
     else if (button.dataset.session) await loadSession(button.dataset.session, button);
-    else if (button.dataset.prompt) { if (state.view !== "chat") await switchView("chat"); $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
     else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); $("#other-view").scrollTop = 0; }
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) { cancelMemorySearch(); releaseMemoryPath(); state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
