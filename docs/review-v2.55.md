@@ -52,4 +52,24 @@ stdio 及 tool_result 文本引用的二进制保存禁令保持。图片 ref �
 
 以上全部 root 串行经原守卫，单次1GiB、共享2GiB、swap0；未放宽限额或下载依赖。
 锁定 SDK 与固定模型/HTTP 替身只证明实际传输和工具链，不代表自然识图质量、真实桌面截图、
-外部服务器或账号联调。精确远端发行证据随后补录，当前未正式发行。
+外部服务器或账号联调。下列远端结果在后续候选中补录，不回改已签名标签。
+
+## 发行闭合
+
+GPG签名提交 `d1f4590d6f12d595b922b90b26d561191964db1a` 的精确候选
+[CI 40077252165](https://github.com/69gg/MuLi/actions/runs/40077252165) 十项全部通过。
+PR [63](https://github.com/69gg/MuLi/pull/63) 于 `2026-10-24T08:23:37Z` 合并到同提交。
+`v2.55.0` 标签验签Good；main与标签原子推送前，远端main准确为已发行2.54的
+`2cc123f974e66bab1d66ffabbbfb5b23b1d7a21e`，新标签不存在，未覆盖其它工作。
+
+正式 [Release 40077858670](https://github.com/69gg/MuLi/actions/runs/40077858670) 十三项
+全部通过；重复main CI `40077858553` 已核最终 `completed/cancelled`，为释放runner去重取消，不计为通过，也不作功能失败诊断。
+GitHub Release 于 `2026-10-24T08:32:57Z` 发布，非draft、非prerelease。根只读有限
+GitHub/PyPI元数据，核版本、两构件未yanked、字节及SHA-256一致，未下载包：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.55.0-py3-none-any.whl` | 841736 | `2c224889ba958b948d1ed9a8b7749d7689f71ae4e3b248b35b8d25bbd9e56873` |
+| `muli_agent-2.55.0.tar.gz` | 4480326 | `674bb7e080a90243dc06965b851dd4be39c069efb2e66f61fb8ce9dc680a0a33` |
+
+核对守卫1.280秒、45.2MiB、swap0。正式发行不改变上述自然识图、真实桌面与账号未验边界。

@@ -45,6 +45,17 @@ _SPEECH_FORMATS = {
 
 
 @dataclass(frozen=True, slots=True)
+class ImageDescription:
+    """Only the selected model's public identity accompanies the completed description."""
+
+    description: str
+    profile: str
+    protocol: str
+    model: str
+    max_response_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class ServiceConfig:
     """OpenAI/Cohere 兼容 HTTP 服务；密钥环境变量由 Settings 解析。"""
 
@@ -324,12 +335,18 @@ class MediaService:
             raise ProviderError("媒体模型连接或传输失败") from None
 
     async def describe_image(self, image: bytes, mime_type: str, prompt: str) -> str:
+        return (await self.describe_image_result(image, mime_type, prompt)).description
+
+    async def describe_image_result(
+        self, image: bytes, mime_type: str, prompt: str
+    ) -> ImageDescription:
         if self._closed:
             raise RuntimeError("媒体服务已经关闭")
         if not prompt.strip():
             raise ProviderError("看图问题不能为空")
         if _image_type(image) != mime_type:
             raise ProviderError("图片格式不支持或与声明的 MIME 类型不匹配")
+        use_main = self.main_model is not None and self.main_model.vision
         model = (
             self.main_model
             if self.main_model is not None and self.main_model.vision
@@ -351,7 +368,13 @@ class MediaService:
             raise ProviderError("视觉模型返回了未声明的工具调用")
         if not turn.content:
             raise ProviderError("视觉模型没有返回可读结果")
-        return turn.content
+        return ImageDescription(
+            turn.content,
+            "main" if use_main else "vision",
+            model.protocol,
+            model.model,
+            model.max_response_bytes,
+        )
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         config = self._service("embedding")

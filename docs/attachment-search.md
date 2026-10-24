@@ -15,6 +15,15 @@ ASR 已保存但回执丢失时，按 `source="asr", name_query="原音频ID"` �
 
 目录项仅返回 `id`、`name`、`source`、`mime_type`、`size`、`sha256`、`created_at` 和既有认证下载 `url`，不返回未知元数据字段或本地路径。目录记录可能对应已丢失或改变的文件；这里不做文件检查，正文读取入口仍须独立验证文件与版本。
 
+v2.56候选增加显式视觉解释工件：`image_describe(..., archive=true)` 成功后保存为
+`source="vision"`、名称含原图ID的私有JSON。回执丢失时只用
+`attachment_search(source="vision", name_query=原图ID)` 找回，不自动重复看图。
+将目录的工件ID及SHA传给 `attachment_read(id=..., revision=..., offset_bytes=0)`，
+再沿返回的 `next_offset_bytes` 和同一revision读取完整提问、模型解释及原图版本。
+只有视觉工件支持此入口的分页参数；普通附件和ASR传入这些参数会拒绝，ASR仍用原
+`audio_transcript_read`。每页复核完整工件摘要、文件身份、元数据和当前大小上限；
+原图已缺失时仍可回查历史解释，不证明当前原图健康，见[存档合同](vision-archive-proposal.md)。
+
 ## 游标和有界行为
 
 使用既有 `(kind,id)` 主键按附件 ID 降序翻页，不依赖更新时间、OFFSET 或裸 rowid，不新增索引、数据库迁移或 Settings。ID 顺序不代表音频或工件的创建时间。SQLite 的[键值续页](https://www.sqlite.org/rowvalue.html)可直接定位后续范围；裸 [rowid](https://www.sqlite.org/rowidtable.html) 则可能在 VACUUM 后变化。

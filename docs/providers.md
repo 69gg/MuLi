@@ -121,6 +121,10 @@ def image_question(data: bytes, question: str) -> Message:
 
 `ImageInput.from_bytes` 检查非空、大小、支持的 MIME 和 base64 格式；`MediaService` 还核对 PNG/JPEG/GIF/WebP 文件头与声明的 MIME。轻量服务不解码、转码或判定动画，具体尺寸与动画支持由上游决定。
 
+v2.56候选可显式调用 `image_describe(id=原图ID, prompt=问题, archive=true)` 保留本次完整解释。存档绑定实际发送的原图字节、提问和本次实际模型的安全快照；随后用 `attachment_search(source="vision", name_query=原图ID)` 找回工件，用 `attachment_read(id=工件ID, revision=工件SHA, offset_bytes=上一页游标)` 续读，无需再次调用视觉。普通看图不自动存档；解释是模型资料，不是主人事实或授权，详见[视觉存档](vision-archive-proposal.md)。
+
+`image_describe` 与 `attachment_read` 的短默认结果保持；长默认结果改为工具内有界的 `description/content` 和 `truncated=true`，不再依赖 Runtime 的通用 `preview` 封套。完整回执和视觉页按最终 JSON 计入输出预算并保留在紧邻的工具续轮；之后仍可能压缩，可重新检索。原 `MediaService.describe_image` 继续返回字符串；内部 `describe_image_result` 另返回同次实际选型的 `ImageDescription`，不携带密钥、请求头或完整配置。
+
 ## 视觉、语音和检索服务
 
 `muli.media` 复用 HTTPX，不依赖 OpenAI SDK、音频处理库、向量数据库或本地模型。`MediaConfig` 包含可选的 `vision`、`embedding`、`reranker`、`asr`、`tts`；没有配置的服务不会发起请求。模型名、地址、密钥和音色均由配置提供，不自动安装或下载模型。
