@@ -134,3 +134,13 @@ clean/noincremental strict仍为153源文件通过（守卫8.604秒、378.8MiB�
 时钟定义参考[Python3.12本线程CPU计时](https://docs.python.org/3.12/library/time.html#time.thread_time)，
 事务语义参考[SQLite DEFERRED事务](https://www.sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions)；
 这些定义不代替本次实际耗时定位，远端发行门仍未放行。
+
+## 诊断候选的远端结果
+
+签名提交 `9bb5c2d4e68174608b5455648bff1a751ab6ff64` 的
+[CI 40090387882](https://github.com/69gg/MuLi/actions/runs/40090387882) 已实收十二作业全部
+success，包含此前失败的macOS3.12和完整其余平台、quality、mcp。此结果只证明该精确
+候选本次检查通过，不倒推首次超时根因已经修复。首轮失败及受控诊断的限定保留。
+
+随后同步当前发布操作文档的十二项/十五项数量，历史十项/十三项发行证据不改。
+最终文档提交的CI与签名标签、正式发行仍待闭合，不以先前候选绿色替代。
