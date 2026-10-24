@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -15,9 +16,11 @@ import sys
 import time
 import uuid
 from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from itertools import islice
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Protocol
 
 MEMORY = 1024**3
@@ -57,13 +60,201 @@ class Runner(Protocol):
     def __call__(self, argv: Sequence[str], *, seconds: float = 5) -> Reply: ...
 
 
+def resource_worker() -> ModuleType:
+    """Reuse only the fixed checkout worker; Python -I needs no search-path change."""
+    path = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
+    name = "_muli_native_resource_worker"
+    for candidate in (name, "helpers.managed_native_worker"):
+        module = sys.modules.get(candidate)
+        if module is not None:
+            filename = module.__dict__.get("__file__")
+            if isinstance(filename, str) and Path(filename).resolve() == path:
+                return module
+            if candidate == name:
+                raise FixtureError("native_resource_envelope")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise FixtureError("native_resource_envelope")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def require_resource_envelope(mode: str) -> None:
+    try:
+        resource_worker().require_resource_envelope(mode)
+    except (OSError, ValueError, ImportError) as error:
+        raise FixtureError("native_resource_envelope") from error
+
+
+class NativeLifecycle(AbstractContextManager["NativeLifecycle"]):
+    """One fixed inode outside the fixture; a closed run can never reopen it."""
+
+    def __init__(self, directory: Path, mode: str, *, deadline: float | None) -> None:
+        unit, _, _ = resource_worker().resource_identity()
+        suffix = unit.removeprefix(f"muli-native-envelope-{mode}-").removesuffix(".service")
+        self.name = f".muli-native-envelope-{suffix}.lock"
+        self.directory, self.mode, self.deadline = directory, mode, deadline
+        self.directory_fd: int | None = None
+        self.fd: int | None = None
+
+    def fail(self) -> FixtureError:
+        return FixtureError(
+            "native_service_cleanup_failed"
+            if self.mode == "cleanup"
+            else "native_resource_lifecycle"
+        )
+
+    def remaining(self) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise FixtureError("native_cleanup_deadline")
+
+    def check_directory(self) -> None:
+        self.remaining()
+        if self.directory_fd is None:
+            raise self.fail()
+        parent = os.fstat(self.directory_fd)
+        path_parent = self.directory.lstat()
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or parent.st_mode & 0o022
+            or (parent.st_dev, parent.st_ino) != (path_parent.st_dev, path_parent.st_ino)
+            or not stat.S_ISDIR(path_parent.st_mode)
+        ):
+            raise self.fail()
+
+    def check(self) -> None:
+        self.check_directory()
+        if self.fd is None or self.directory_fd is None:
+            raise self.fail()
+        file = os.fstat(self.fd)
+        leaf = os.stat(self.name, dir_fd=self.directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(file.st_mode)
+            or file.st_uid != os.getuid()
+            or stat.S_IMODE(file.st_mode) != 0o600
+            or file.st_nlink != 1
+            or not 0 <= file.st_size <= 7
+            or (file.st_dev, file.st_ino) != (leaf.st_dev, leaf.st_ino)
+            or not stat.S_ISREG(leaf.st_mode)
+        ):
+            raise self.fail()
+
+    def read(self) -> bytes:
+        self.check()
+        assert self.fd is not None
+        data = os.pread(self.fd, 7, 0)
+        if data not in (b"", b"closed\n") or len(data) != os.fstat(self.fd).st_size:
+            raise self.fail()
+        self.check()
+        return data
+
+    def __enter__(self) -> NativeLifecycle:
+        import fcntl
+
+        try:
+            self.remaining()
+            self.directory_fd = os.open(
+                self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+            self.check_directory()
+            self.fd = os.open(
+                self.name,
+                os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=self.directory_fd,
+            )
+            self.check()
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            data = self.read()
+            if self.mode == "run" and data == b"closed\n":
+                raise FixtureError("native_resource_closed")
+            os.fsync(self.fd)
+            os.fsync(self.directory_fd)
+            self.remaining()
+            return self
+        except BaseException as error:
+            self.close()
+            if isinstance(error, OSError):
+                raise self.fail() from error
+            raise
+
+    def seal(self) -> None:
+        if self.mode != "cleanup":
+            raise self.fail()
+        data = self.read()
+        assert self.fd is not None and self.directory_fd is not None
+        if data == b"" and os.pwrite(self.fd, b"closed\n", 0) != 7:
+            raise self.fail()
+        os.fsync(self.fd)
+        os.fsync(self.directory_fd)
+        if self.read() != b"closed\n":
+            raise self.fail()
+
+    def require_run_empty(self) -> None:
+        # The durable closed gate forbids any later run from producing effects.
+        if self.mode != "cleanup" or self.read() != b"closed\n":
+            raise self.fail()
+        run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+        group = CGROUP_ROOT / "system.slice" / f"muli-native-envelope-run-{run}-{attempt}.service"
+        try:
+            before = group.lstat()
+        except FileNotFoundError:
+            self.check()
+            return  # Absence is usable only after the stable, irreversible gate.
+        if not stat.S_ISDIR(before.st_mode):
+            raise self.fail()
+        with (group / "cgroup.events").open("rb") as source:
+            data = source.read(513)
+        if len(data) > 512:
+            raise self.fail()
+        lines = data.decode("ascii").splitlines()
+        fields = [line.split() for line in lines]
+        if (
+            not fields
+            or any(len(parts) != 2 or parts[1] not in {"0", "1"} for parts in fields)
+            or len({parts[0] for parts in fields}) != len(fields)
+            or {parts[0]: parts[1] for parts in fields}.get("populated") != "0"
+        ):
+            raise self.fail()
+        after = group.lstat()
+        if not stat.S_ISDIR(after.st_mode) or (before.st_dev, before.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise self.fail()
+        self.check()
+
+    def close(self) -> None:
+        if self.fd is not None:
+            descriptor, self.fd = self.fd, None
+            os.close(descriptor)
+        if self.directory_fd is not None:
+            descriptor, self.directory_fd = self.directory_fd, None
+            os.close(descriptor)
+
+    def __exit__(self, *args: object) -> None:
+        try:
+            if args[0] is None:
+                self.read()
+        finally:
+            self.close()
+
+
 def command(argv: Sequence[str], *, seconds: float = 5) -> Reply:
     """Bound both output and lifetime, and reap the one owned command group."""
     if not 0 < seconds <= HARNESS_SECONDS + CLEANUP_SECONDS:
         raise FixtureError("native_command_budget")
     end = time.monotonic() + seconds
+    actual = resource_worker().resource_sudo_arguments(argv)
     process = subprocess.Popen(
-        argv,
+        actual,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -2311,10 +2502,13 @@ class NativeCI:
         # observed. Options are not a new mount identity and cannot orphan it.
         return all(actual[key] == expected[key] for key in expected if key != "options")
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, deadline: float | None = None) -> None:
+        now = time.monotonic()
+        self.cleanup_deadline = deadline if deadline is not None else now + CLEANUP_SECONDS
+        if not now < self.cleanup_deadline <= now + CLEANUP_SECONDS:
+            raise FixtureError("native_cleanup_deadline")
         if not self.root.exists():
             return
-        self.cleanup_deadline = time.monotonic() + CLEANUP_SECONDS
         root_info = self.root.lstat()
         if (
             not stat.S_ISDIR(root_info.st_mode)
@@ -2446,13 +2640,24 @@ def main() -> int:
     parser.add_argument("mode", choices=("run", "cleanup"))
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
+    deadline = time.monotonic() + CLEANUP_SECONDS if args.mode == "cleanup" else None
     require_ci(args.root)
-    fixture = NativeCI(args.root)
+    require_resource_envelope(args.mode)
     try:
-        if args.mode == "cleanup":
-            fixture.cleanup()
-        else:
-            fixture.execute()
+        with NativeLifecycle(args.root.parent, args.mode, deadline=deadline) as lifecycle:
+            if args.mode == "cleanup":
+                try:
+                    lifecycle.seal()
+                    lifecycle.require_run_empty()
+                except FixtureError:
+                    raise
+                except (OSError, UnicodeError) as error:
+                    raise FixtureError("native_service_cleanup_failed") from error
+            fixture = NativeCI(args.root)
+            if args.mode == "cleanup":
+                fixture.cleanup(deadline=deadline)
+            else:
+                fixture.execute()
         return 0
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(
@@ -2463,4 +2668,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except FixtureError as error:
+        if str(error) != "native_resource_envelope":
+            raise
+        print("native_resource_envelope", file=sys.stderr)
+        raise SystemExit(1) from None

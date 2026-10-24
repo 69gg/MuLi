@@ -14,7 +14,7 @@ import stat
 import sys
 import sysconfig
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -64,6 +64,14 @@ JOURNAL_FIELDS = (
 )
 JOURNAL_METADATA = frozenset(
     {"__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP", "_BOOT_ID"}
+)
+RESOURCE_ENVIRONMENT = (
+    "MULI_NATIVE_ENVELOPE_UNIT",
+    "MULI_NATIVE_ENVELOPE_UID",
+    "MULI_NATIVE_ENVELOPE_GID",
+)
+ROOT_RESOURCE_MODES = frozenset(
+    {"project-manager-instance", "project-setup-context", "bootstrap-files"}
 )
 JOURNAL_JOB_RESULTS = frozenset(
     {
@@ -146,6 +154,78 @@ def kernel_limits(
     controllers = read(group / "cgroup.controllers").split()
     require({"cpu", "memory", "pids"}.issubset(controllers), "native_kernel_controllers")
     return result
+
+
+def resource_identity() -> tuple[str, int, int]:
+    """These labels select a kernel identity; they never prove membership."""
+    unit, uid, gid = (os.environ.get(name, "") for name in RESOURCE_ENVIRONMENT)
+    require(
+        re.fullmatch(
+            r"muli-native-envelope-(run|cleanup)-[1-9][0-9]{0,19}-[1-9][0-9]{0,5}\.service",
+            unit,
+        )
+        is not None
+        and re.fullmatch(r"[1-9][0-9]{0,9}", uid) is not None
+        and re.fullmatch(r"[1-9][0-9]{0,9}", gid) is not None,
+        "native_resource_envelope",
+    )
+    require(int(uid) < 2**31 and int(gid) < 2**31, "native_resource_envelope")
+    return unit, int(uid), int(gid)
+
+
+def require_resource_envelope(mode: str | None = None, *, root: bool = False) -> None:
+    """Check this process, including a sudo child, before any effect or FFI."""
+    try:
+        unit, uid, gid = resource_identity()
+        if mode is not None:
+            require(
+                mode in {"run", "cleanup"}
+                and unit
+                == f"muli-native-envelope-{mode}-{os.environ.get('GITHUB_RUN_ID', '')}"
+                f"-{os.environ.get('GITHUB_RUN_ATTEMPT', '')}.service",
+                "native_resource_envelope",
+            )
+        expected_uid, expected_gid = (0, 0) if root else (uid, gid)
+
+        def read(path: Path) -> str:
+            with path.open("rb") as source:
+                data = source.read(513)
+            require(len(data) <= 512, "native_resource_envelope")
+            return data.decode("ascii")
+
+        def identity() -> None:
+            require(
+                os.getresuid() == (expected_uid,) * 3 and os.getresgid() == (expected_gid,) * 3,
+                "native_resource_envelope",
+            )
+            require(
+                read(Path("/proc/self/cgroup")) == f"0::/system.slice/{unit}\n",
+                "native_resource_envelope",
+            )
+
+        identity()
+        group = Path("/sys/fs/cgroup/system.slice") / unit
+        kernel_limits(group, memory=MEMORY, tasks=TASKS, read=read)
+        require(read(group / "memory.oom.group").strip() == "1", "native_resource_envelope")
+        identity()
+    except (OSError, ValueError) as error:
+        raise NativeError("native_resource_envelope") from error
+
+
+def resource_sudo_arguments(argv: Sequence[str]) -> list[str]:
+    """Pass only the fixed selector labels to our own root-Python entry modes."""
+    values = list(argv)
+    if (
+        len(values) >= 7
+        and values[:3] == ["sudo", "--non-interactive", "--"]
+        and values[3:5] == [sys.executable, "-I"]
+        and Path(values[5]).resolve() == Path(__file__).resolve()
+        and values[6] in ROOT_RESOURCE_MODES
+        and os.environ.get(RESOURCE_ENVIRONMENT[0])
+    ):
+        resource_identity()
+        values.insert(2, "--preserve-env=" + ",".join(RESOURCE_ENVIRONMENT))
+    return values
 
 
 def membership(unit: str, uid: int) -> Path:
@@ -1825,7 +1905,7 @@ class _SetupIO:
         require(self.used < self.limit, "native_diagnostic_output_budget")
         try:
             result = await run_process(
-                argv,
+                resource_sudo_arguments(argv),
                 timeout=min(timeout, CLEANUP_SECONDS, remaining(self.deadline)),
                 limit=min(limit, self.limit - self.used),
                 merge_stderr=False,
@@ -3381,6 +3461,8 @@ async def run(mode: str, root: Path) -> int:
 
 
 def main() -> int:
+    if sys.argv[1:2] not in (["drive"], ["cleanup"]):
+        require_resource_envelope(root=bool(sys.argv[1:2] and sys.argv[1] in ROOT_RESOURCE_MODES))
     if len(sys.argv) == 8 and sys.argv[1] == "project-manager-instance":
         try:
             value = read_manager_instance(
@@ -3503,4 +3585,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except NativeError as error:
+        if str(error) != "native_resource_envelope":
+            raise
+        print("native_resource_envelope", file=sys.stderr)
+        raise SystemExit(1) from None

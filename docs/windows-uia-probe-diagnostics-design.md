@@ -1,7 +1,8 @@
 # Windows UIA probe 的固定阶段证据
 
-状态：原八阶段实现的受限本地纯回归与独立静态后审已完成；本次经根批准增加
-首请求的三个固定输入阶段，受限纯回归与静态检查已通过，真实 Windows 新阶段待验。
+状态：原八阶段及后续三个首请求输入阶段的受限纯回归已有记录；原十一阶段在
+后续真实 Windows 失败中观察至 `uia_ready`，原超时仍未解决。本轮经根批准增加
+三个原调用边界阶段，已落盘但尚未运行纯回归、格式/类型检查或真实 Windows 验证。
 独立于已冻结的 Invoke 片；
 不改变已发布标签，不把增加诊断写成已查明或修复启动超时。
 
@@ -37,8 +38,9 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 ## 固定阶段与一次性规则
 
 每行只允许 ASCII 协议 `muli-uia-stage=1:<stage>` 加换行，不含时间、ID、参数或正文。
-每个 helper 用固定十一位状态保存已尝试阶段，每位先置位再尝试写出；每阶段最多一次，
-整生命周期最多十一行，LF 合计 361 字节、CRLF 合计 372 字节，均不超过 512 字节，
+每个 helper 用固定十四位状态保存已尝试阶段，每位先置位再尝试写出；每阶段最多一次，
+整生命周期最多十四行，固定字符串预计 LF 合计 465 字节、CRLF 合计 479 字节，
+仍须由纯回归核对不超过原 512 字节标记预算，
 不因重复 probe 或其他请求增长。
 
 | stage | 紧邻的代码位置与能够证明的事实 |
@@ -52,12 +54,15 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 | `probe_received` | 首个 probe 的原帧、版本与 limits 校验通过后，初始化前 |
 | `uia_initializing` | 首次 `Initialize-Uia` 的版本/MTA/程序集检查开始前 |
 | `uia_ready` | 原 GAC 检查通过并设置 ready 后 |
+| `walker_initializing` | 首个合法 probe 的原 `ControlViewWalker` 静态 getter 紧前，原 deadline 检查后 |
+| `walker_ready` | 该 getter 返回后；不证明后续 provider 或桌面枚举可用 |
+| `probe_process_ready` | probe 的原 `GetCurrentProcess`、`MainWindowHandle` 读取及 `Dispose` 全部返回后 |
 | `probe_encoded` | 首个 probe 的原成功 `Encode-Result` 返回后，原末次 deadline 检查前 |
 | `probe_write_returned` | 该成功 probe 的原 `$writer.WriteLine` 返回后；不是宿主已收到的证明 |
 
 三个 input 阶段仅位于 `requestCount=0` 分支，不能在解码前声称输入就是 probe。
-前三级和 UIA 初始化各只尝试一次；probe 的三级仅跟踪首个合法 probe，失败也不为
-后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求十一级全序；
+前三级和 UIA 初始化各只尝试一次；probe 的固定阶段仅跟踪首个合法 probe，失败也不为
+后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求十四级全序；
 本次 CI 的新建 once probe 才核上述顺序。错误回执不冒充成功 encoded/write 阶段。
 
 标记通过 `[Console]::Error.WriteLine` 与 Flush 写出；仅固定字符串，整个写入置于
@@ -72,9 +77,9 @@ best-effort try/catch，不使用 Write-Error 或异常格式化，不输出 `$E
 note；不得新增等待期限、跳过失败、改变异常 code/outcome 或让诊断/收尾异常覆盖
 原异常。成功路径的清理失败仍是失败；取消仍传播。生产工具/API 不展示 stderr。
 
-投影只读取现有 2048 字节前缀，按完整 LF/CRLF 行精确匹配十一个固定标记；未知原文、
+投影只读取现有 2048 字节前缀，按完整 LF/CRLF 行精确匹配十四个固定标记；未知原文、
 不完整行和非 ASCII 内容不导出。重复或乱序标为 `stage_sequence=invalid`，不据此
-推断业务成功。至多十一个枚举及固定标量：`stderr_prefix_capped`、发送计数 0/1、
+推断业务成功。至多十四个枚举及固定标量：`stderr_prefix_capped`、发送计数 0/1、
 lease.closed、process 存在、退出类别 running/zero/nonzero/unavailable、readers 是否
 全部终态、cleanup confirmed/unconfirmed。reader 终态不等于已读到 EOF；前缀达到
 上限只表示可能截断，不声称完整诊断。无路径、PID、nonce、环境、provider 名称、
@@ -87,7 +92,7 @@ write_returned 存在而宿主仍无回执可缩小下一轮传输/解码调查�
 
 ## 验收与官方依据
 
-先用纯替身核十一行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
+先用纯替身核十四行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
 CRLF/半行、未知/重复/乱序输入、2048 字节截断、完整 JSON note 预算。假 lease
 事件门控证明 note 在自有清理后生成、原异常身份/outcome 和取消保留、清理失败不
 伪称回收；既有 reader 继续证明 stderr 全部计费。禁止在 Linux 启动 PS 或桌面。
@@ -171,3 +176,41 @@ pytest 峰 61.8 MiB，整轮峰 314.2 MiB、swap 0，每条均由原 30 秒守�
 
 以上只证明纯投影/源静态边界；根与独立集成 agent 后审未发现可验证 P1/P2，真实 Windows 新阶段待验。
 没有 PowerShell 语法或实际阶段输出的本地证明，也不把增加三个标记写成已修复超时。
+
+## native19 Windows 3.13：初始化之后的最小分叉（候选待验）
+
+原 run `40029000745` 的 Windows 3.13 job `120672256773` 唯一失败仍为首个
+`test_real_windows_system_module_probe_mta_and_owned_unicode_tree`：`read_timeout`，
+调用 12.23 秒；全任务为 3692 passed、2017 skipped、1 failed，151.31 秒。
+原 note 的十一阶段协议观察至 `uia_ready`，序列 valid、sent1、前缀未达 cap；
+清理后的 lease closed/process handle exists/exit nonzero/readers settled/cleanup
+confirmed 只证明该拥有生命周期已收口，不证明 helper 在超时前自然异常退出。
+
+`uia_ready` 只在版本/MTA/程序集 GAC 核验返回后设置。此后原成功路径仍依次执行
+deadline 检查、`TreeWalker.ControlViewWalker` 静态 getter、两个有限容器构造、
+当前 Process 的 `MainWindowHandle` 和 `Dispose`、固定事实字段构造、成功 JSON 编码，
+之后才到 `probe_encoded`。这条 probe 没有调用 `Read-Targets`、`RootElement` 或
+读取 owned Unicode 窗口树；不能把窗口 provider 遍历当已证明原因。原阶段没有时间戳，
+12 秒又覆盖 spawn/导入/发送/响应，故不能区分哪一步阻塞或 `uia_ready` 是否在总期限
+将尽时才出现。后续其它候选 Windows 绿不构成本次超时已修复的证据。
+
+本轮仅增加上表三个边界：getter 紧前与返回后、当前进程属性读取及释放返回后；
+原 `probe_encoded` 继续标识 `Encode-Result` 成功返回。原标记编号 0–10 和原调用
+位置保持，新名称只追加为 11–13，由既有先置位、best-effort 固定 stderr writer
+输出；三处只在 `$traceProbe` 内，不跟踪后续 probe 或普通树请求。若 deadline 已
+在 getter 前耗尽，可能只保留 `uia_ready`；若 getter 后缺少后继标记，也仍须考虑
+标记写出/传输失败，不能直接断言该调用永久停滞。事实就绪后至 encoded 之间仍含
+原字段构造和编码，不将缺少 encoded 单独称为 JSON 根因。
+
+不移动或延迟 walker 初始化，不新增或替换属性读取、宿主 observer、进程、argv、
+预热、重试或诊断期限；原 12 秒、2048 字节 stderr 前缀、1 MB 会话累计和 4 KiB
+note 上限均保持。纯回归新增原单次 getter/进程属性调用与阶段相对顺序、旧八与十一
+阶段兼容、新名称重复/逆序；原逐字节/CRLF/前缀截断回归扩展至十四名称。源码静态
+约束不能替代 PowerShell 语法、真实执行、耗时分布或因果证明。
+
+根已在原30秒守卫内串行验收：专用 diagnostics、pending observation 与 computer
+三文件共 **68 passed**，pytest0.34s、守卫889ms、65.6MiB、swap0、exit0。
+相关 Python Ruff 通过，格式检查发现的一处换行已统一格式化；明确
+`MYPYPATH=src:tests` 的 helper 与专用测试 strict、no-incremental mypy通过，
+守卫5.972s、331.6MiB、swap0、exit0。没有运行真实 PowerShell、进程或桌面；
+这些纯回归不改变原 native19 的失败结论，也不证明超时根因已修复。

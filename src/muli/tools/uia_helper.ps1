@@ -17,7 +17,10 @@ $script:traceStages = @(
     'muli-uia-stage=1:probe_write_returned',
     'muli-uia-stage=1:input_waiting',
     'muli-uia-stage=1:input_line_received',
-    'muli-uia-stage=1:request_decoded'
+    'muli-uia-stage=1:request_decoded',
+    'muli-uia-stage=1:walker_initializing',
+    'muli-uia-stage=1:walker_ready',
+    'muli-uia-stage=1:probe_process_ready'
 )
 
 function Write-Stage([int]$index) {
@@ -420,7 +423,9 @@ try {
             $script:watch = [Diagnostics.Stopwatch]::StartNew()
             Initialize-Uia
             Check-Deadline
+            if ($traceProbe) { Write-Stage 11 }
             $script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            if ($traceProbe) { Write-Stage 12 }
             $script:rows = [Collections.Generic.List[object]]::new()
             $script:reasons = [Collections.Generic.HashSet[string]]::new()
             $script:visited = 0
@@ -429,6 +434,7 @@ try {
                     $process = [Diagnostics.Process]::GetCurrentProcess()
                     try { $hasWindow = ($process.MainWindowHandle -ne [IntPtr]::Zero) }
                     finally { $process.Dispose() }
+                    if ($traceProbe) { Write-Stage 13 }
                     $json = Encode-Result $requestId @{
                         backend = 'uia'
                         apartment = 'MTA'

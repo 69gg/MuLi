@@ -47,6 +47,189 @@ receipt 分别确认这个 root 拥有的 0755 目录与 0644 文件的 dev/inod
 
 启动任何 MuLi unit 前读取实际 `ControlGroup`，核 cgroup v2 的 `memory.max`、`memory.swap.max`、`cpu.max`、`pids.max` 和有效 controllers；启动后核 harness、服务和 helper 的真实 membership。上述实际 UID 的解释器导入预检在这个 bounded harness unit 内完成，再启动 MuLi 服务，不在未受限的 sudo 子进程中执行导入。标准服务仍使用 `UserService.render()` 的原资源属性，helper 仍由 `helper_launch_arguments()` 与真实 `read_helper()` 验证。不能添加会被产品 probe 拒绝的 drop-in，也不能用 `systemctl` 返回零或父测试进程的 cgroup 冒充子树保护。缺少 controller、delegate 或权限时该 job 失败，无裸进程 fallback。
 
+### 协调者进程链的独立资源包络：六红已实收，候选待验
+
+本片基线由根确认是签名且清洁的 `3197dc3`。先仅提交给根审查的新测试和本节
+已实收 **6 failed**，pytest **0.06秒**、守卫 **547毫秒/56.1 MiB/swap0/exit1**；
+全部是预期 `DID NOT RAISE`，真实旧 main 已进入各有限替身，不是 fixture、导入或
+参数分派错误。随后根授权本候选实现，目前尚未运行候选检查。它补的是上述专用
+UID 聚合之外的缺口：原 workflow 直接运行 runner 的协调器；
+`command()` 的独立 session、超时、输出门及
+kill/reap 不能约束内存、swap、CPU 或 task 数。`user@UID.service` 启动后的实际
+kernel 核验也不能追溯保护之前的准备过程、普通观察 worker 或 sudo root helper。
+
+批准方案的最小合同及本候选落点如下：
+
+- `run` 和 workflow `always()` 的 `cleanup` 分别由系统级 transient **service**
+  启动原 runner UID/GID 的协调器，使用已有绝对解释器、工作目录与固定必要环境。
+  复用 `systemd-run --service-type=exec --wait --pipe --expand-environment=no`；
+  每次 service 名绑定本次 run/attempt 与模式，不复用其它运行的 unit。仅此进程链
+  使用原 `MEMORY`/`TASKS` 上限、swap 0、CPU 100%，整组终止且不自动重启。
+  workflow 采用固定 `muli-native-envelope-{run|cleanup}-{run_id}-{attempt}.service`；
+  `RuntimeMaxSec` 分别为原 `90+5+5` 和 `5+5`，末项是已有客户端 reap 窗口，
+  不是功能、诊断或 cleanup 的追加时间。原内部期限完全不变；外层保险可能更早
+  截断未收敛进程，不能因它尚有余额继续内部效果。非零经 `exec sudo systemd-run`
+  原样返回，没有 `|| true`。不把 sudo 启动客户端的 cgroup 或命令成功当作实际
+  子进程受限证明。
+- 协调器 `main()` 在 hosted-CI 路径门之后、构造 `NativeCI` 之前，必须核实自身
+  `/proc/self/cgroup`、预期系统 service 的身份/runner UID/GID 与实际生效的 cgroup v2
+  四项限制；普通 worker 在分派 `describe`、manager 观察等命令前复核同一包络。
+  缺失、不匹配、无限额或无法核实一律固定 `native_resource_envelope` 拒绝，不裸跑。
+  单个环境声明、unit 名或 systemd 属性声明均不能代替实际 membership/kernel。
+  实现复用 worker 内的 `require_resource_envelope`：限定实际 group 恰为
+  `/system.slice/{unit}`，读取四项限制及 controllers、`memory.oom.group=1`，
+  每份至多512字节并带第513字节哨兵；前后重新核三元 UID/GID 和 membership。
+  coordinator 另外核 unit 与本次 `GITHUB_RUN_ID/ATTEMPT/mode` 精确对应。
+- sudo root helper 在读取本轮 proc、装载 peer/FFI 或进入 bootstrap 文件操作前重核
+  自己的实际 membership 与同一包络。不能假定 sudo/PAM 必然留在父 cgroup；脱离
+  时固定失败，不能回退到无保护读取。预期 unit 的显式传递只能是窄元数据，不能
+  放开任意 unit/path，也不能导出原环境。资源门位于分支的宽泛诊断异常捕获之前，
+  因而不会被伪装成一次成功诊断或有用实例观察。
+  仅对既有固定解释器、`-I`、本 worker 精确路径和三个固定 root 子模式，在实际
+  sudo 发出前插入 `--preserve-env=`，只保留 `MULI_NATIVE_ENVELOPE_UNIT/UID/GID`
+  三键。标签被清除、PAM 迁到其它 group、真实 root 身份不符或任一限额失效时，
+  root 入口拒绝；没有因为缺 env 而准入的回退。正常工具命令、其它路径/子模式
+  不获得这些键。`__main__` 对资源拒绝仅输出固定码和 exit1，避免 traceback
+  被当成诊断回包。
+- 由 user manager 单独启动的 `drive`/`cleanup` harness 继续使用既有 UID 聚合、
+  256 MiB/32 tasks 子限额和实际 membership 门；它们不要求位于系统协调器 service。
+  PID1 启动的 `user@`/runtime-dir 也不是该 service 子树。本片**不是整项 native job
+  的共同聚合资源上限**，不改专用 user manager 的启动拓扑。
+  本片也不凭 Python helper 的验证结果推断所有外部 sudo 工具的 PAM 行为；这些
+  工具保留原有命令期限、输出和 kill/reap。实际 runner 是否保持这条 Python 链
+  的 membership 仍待正式受限执行观察，不能把纯回归当成该运行证明。
+- 不增加观察、循环、READY 条件、512/1024 字节内外回包、32768 字节累计额度，
+  也不延长内部绝对期限、2.5 秒失败回执和 5 秒 cleanup。外层 `RuntimeMaxSec`
+  只作原执行/既有客户端回收边界的最后保险，不能成为额外功能时间。独立 cleanup
+  仍读原 receipt、遵守归属与失败关闭门；原 READY/cleanup 非零原样失败，上传
+  有界证据不能把它改绿。包络启动或核验失败不允许无保护清理。
+
+首批三个正式入口行为节点各有两个参数，共 **6 项，旧实现已按预期红**：
+
+1. `test_coordinator_rejects_no_envelope_before_native_ci[run|cleanup]`：保留真实
+   argparse、`require_ci` 与 `main`，合法 hosted-CI 路径通过后，应在 `NativeCI`
+   构造/execute/cleanup 之前抛固定拒绝，且不创建根目录。
+2. `test_worker_rejects_no_envelope_before_dispatch[describe|manager-ready]`：真实
+   worker `main` 在调用有限替身前拒绝，不输出看似成功的 JSON。
+3. `test_root_helper_rejects_no_envelope_before_proc_peer_or_files[project-manager-instance|bootstrap-files]`：
+   模拟 euid/uid 0，真实参数分派仍须在实例 proc/peer 链或文件 helper 前拒绝。
+
+测试复用既有协调器模块与全 subprocess 硬禁 fixture，只将 `/proc/self/cgroup`
+替换为普通 `session-9.scope`、cgroup 四项限制替换为 `max`；不借测试进程真实
+cgroup，不导入未来 API，不执行真实 helper、FFI、账户、挂载或服务。回调替身只
+标记越过边界，不提供假的资源核验结果。授权后的同一文件已补合法 run/cleanup
+与原非零保留、四类真实入口角色、env 声明无法替代 kernel、四项限额/缺文件/
+controller/OOM/长度哨兵/身份前后漂移、root 不能冒用 runner 身份、另一模式 unit
+不能重用、user harness 不误套系统组门、实际 sudo 三键窄保留及原 wire 计费不变。
+此外纯定义装载证明复制后的 worker 自带资源门，不依赖新增 sibling 或 sys.path；
+coordinator 固定文件 loader 复用已加载的同文件 worker，拒绝同名 foreign 模块，
+不会为资源核验加载 peer/FFI。旧 native 文件仅三处分派测试注入已核角色门，原
+业务/诊断 oracle 保留；独立 envelope 测试直接走真实新门。workflow 文本回归
+核两条 service 包装与现有 Python 常量一致。本候选已由根实收以下纯回归。实际
+systemd service 身份、sudo/PAM 继承和 OOM/整组终止仍需要独立真实 runner 证据，
+本节不授权 native20。
+
+当前变更限六文件：`.github/workflows/ci.yml`、`scripts/check_managed_native_ci.py`、
+`tests/helpers/managed_native_worker.py`、新 `tests/test_managed_native_resource_envelope.py`、
+旧 `tests/test_managed_native_ci.py` 和本文。coordinator 只用 stdlib 的固定文件
+importlib loader 复用既有 worker，不引入依赖、通用 DBus 框架或任意执行器；普通
+worker 的 `-I` 和复制到私有卷后的已有 hook/drive/cleanup 模式保持。
+
+**资源主体原有取消并发缺口，本候选不得直接投入 native20。** `systemd-run --wait` 客户端
+若被取消，系统 run service 可能仍在运行，或另连接的 `StartTransientUnit` 尚在
+排队；此时 always cleanup 不能与其效果/receipt 写入并发。固定 run cgroup 缺失
+不能证明没有稍后启动，`--collect` 又会使正常完成的 cgroup 缺失。单次 PID1
+属性读取同样不能排除另一连接仍有未落地请求，因此本主体没有添加这种查询，
+也没有将 ENOENT 当作未来不会启动的证明、增加 stop/轮询/等待或新账本。以下
+kernel 互斥与 population 补足已通过根的纯回归和 C 独立只读后审；不能把
+实现或纯回归说成实际 runner 取消后的收尾互斥及完整资源生命周期已验收。
+
+**已批准的最小后续合同与增量实现。** C 与根选定同 run/attempt 的真实
+kernel `flock` 加不可逆 closed 门，不加入 stop、PID1 查询、轮询、等待或新期限。
+先只扩同一测试文件和本节，根实收以下9项目标红后，才授权增量生产实现。
+固定文件为 `RUNNER_TEMP/.muli-native-envelope-{run_id}-{attempt}.lock`，
+在 fixture root 外，不受现有 fixture cleanup 删除/挂载生命周期影响；代码永不
+unlink、rename 替换或重建已知 inode。初始空 bytes 表示尚未封门，唯一封门编码
+为 `closed\n`，未知/部分正文须失败关闭，不能降为空或修成可运行。文件私有
+regular/0600、runner owner、nlink1，沿用现 `management_transaction.FixedLock`
+的 `O_NOFOLLOW|O_CLOEXEC`、非阻塞 flock、fd/叶身份前后核验模式；其业务
+`_Directory` 不直接扩成通用临时目录框架。
+
+- run 先核真实资源包络，然后 `LOCK_EX|LOCK_NB`，核同 inode 未 closed，
+  才能构造 `NativeCI`、产生 fixture 效果或发出诊断子进程。锁覆盖 execute、
+  原异常诊断及拥有客户端的 kill/reap 收口，不能在这些动作前释放。
+- cleanup 的原5秒绝对 deadline 从入口资源/锁核验前就开始。锁忙立即
+  `native_service_cleanup_failed`，零 `NativeCI` 构造/fixture 清理；不等、不停
+  run service。获锁后在原 inode 稳定写入并 fsync closed，再读取由同 run/attempt
+  固定推导的 run unit 的实际 `cgroup.events`。populated1、坏数据/读取或身份
+  不确定均保留 closed 与原 receipt 并失败；只有 populated0 或**closed 稳定后**
+  的固定 cgroup 缺失才能继续原清理，原 deadline 必须传入而不重置。
+- 缺失此时只表示当下没有成员：未来迟到的 StartTransientUnit 即使随后创建
+  cgroup，run 入口仍会读到 closed 而在任何效果前拒绝。相反，父锁释放不证明
+  其子进程已死，解锁后仍 populated 的 run cgroup 必须挡住清理。这两个门缺一
+  不可。root 不存在也必须先封门，以阻止仍未建立 fixture 的迟到 run。
+- 锁覆盖 cleanup 全程；不能因 cleanup 失败清空 closed 或改写首因/证据。
+  专用 user@/harness 继续自己的限额和既有收尾断言，不把此 flock 当其 cgroup
+  为空、真实服务已停止或任意恶意同 UID 代码无法改锁文件的证明。
+
+新增 **5组/9节点，根实收旧资源主体行为红**，全部经现有 `main` 与真实新
+资源门，不导入未来锁 API：
+
+1. `test_busy_lifecycle_entry_never_constructs_fixture[run|cleanup]`：两个实际独立
+   open description 争同一个真实 flock，忙时必须零构造/零清理，cleanup 保留
+   固定原失败标签，文件未被截断。
+2. `test_cleanup_without_fixture_seals_same_inode_and_blocks_late_run`：run 在
+   constructor 前已经持锁；root 始终不存在，cleanup 仍在持锁下稳定封门，
+   inode 不变；随后一次迟到 run 不得再次进入 constructor。
+3. `test_cleanup_seals_before_population_and_keeps_orphan_members_fail_closed[populated|malformed|missing]`：
+   父锁已可取但 run population1 或坏记录仍拒清理；固定 group 缺失仅可在
+   closed 已写后进入 constructor，cleanup 自身继续持真实排他锁。
+4. `test_cleanup_lifecycle_passes_original_deadline_without_reset`：入口时刻100，
+   真资源门返回时刻103，清理仍须继承原105 deadline，不能从103另开5秒。
+5. `test_lifecycle_lock_alias_cannot_authorize_fixture_effects[symlink|hardlink]`：
+   真实 symlink/nlink2 必须在 fixture 构造前拒绝，不覆盖其它正文。
+
+测试只在临时目录产生有限合成文件，实际 inode/mode/link count 与 flock 是内核
+文件行为；owner/UID/GID 和 run cgroup 仍为已有纯 fixture 投影。它不运行服务、
+进程、账户或挂载，也不把合成 population 说成实际 orphan/helper 生命周期已验收。
+根实际收取 **9 failed / 39 deselected**，pytest 0.60s，守卫 1.097s、95.5MiB、
+swap0、exit1：分别为忙锁未拒、未持真实 flock、closed 仍空、未继承105期限及
+软硬链接未拒，非缺 API/收集错误。随后根实收完整资源测试 **62 passed**，
+pytest 0.21s，守卫725ms、67.3MiB、swap0、exit0；原五文件 native 回归
+**640 passed**，pytest 1.80s，守卫2.522s、133.5MiB、swap0、exit0。
+两组分别记录，不相加冒充新覆盖；保留首批6项先红及本批9项先红历史。
+C 对固定 inode、非阻塞锁、closed、实际 population 读取路径、原 deadline 与
+首因保留完成独立只读后审，未发现剩余 P1/P2。根随后统一格式化，相关 Python
+Ruff 检查通过；明确 `MYPYPATH=src:tests` 的两脚本 strict、no-incremental mypy
+通过，守卫5.501s、289.5MiB、swap0、exit0。上述证据仍不覆盖真实 runner 上的取消、迟到启动或 root helper
+实际迁组/残留生命周期，不授权 native20，也不能改写既有 READY/cleanup 失败。
+
+增量生产仅在 coordinator 内加入 `NativeLifecycle` 和 `main`/`NativeCI.cleanup`
+接缝，未新增模块或通用框架。目录先以 fd 核 runner owner/非组他人可写及路径
+身份，再以 dir_fd 打开固定锁；文件 metadata 先限 size≤7，`pread` 至多7字节且
+必须读满已核 size，正文只接纳空/closed。退出正常路径再核 fd/叶身份，异常路径
+保留原首因后关闭 fd，不 unlink。cleanup 显式接收入口绝对 deadline，直接调用
+旧 cleanup 的纯 fixture 仍沿原5秒默认值；入口已耗尽则不封门、不构造 fixture。
+固定 run group 读取至多513字节哨兵、只接纳≤512字节 events，并核目录前后同 inode；目录在而 events
+缺失、重复/坏/非 ASCII/超长字段、group 身份漂移均失败，不作空组。缺失只在
+closed 稳定后读取固定目录，并不证明未来不会启动；未来禁止效果由 closed 保证。
+
+必要补强仍在同测试文件：未知/部分/超长锁正文不修复；populated0 正向、目录在但
+events 缺失、重复/超长/非 ASCII 与 group 漂移反例；入口资源门耗尽原期限不得
+重新开5秒；退出核验拒绝被换叶节点，并证明已有业务首因不被覆盖及旧锁实际释放。
+原资源主体 main 正向测试改用同一真实 lifecycle fixture；旧 worker 三处分派只
+注入已核资源角色，其业务 oracle 保留，未削弱独立真实门反例。
+
+选项依据由根本轮查阅固定 v255 官方手册确认：
+[systemd-run](https://www.freedesktop.org/software/systemd/man/255/systemd-run.html)、
+[resource-control](https://www.freedesktop.org/software/systemd/man/255/systemd.resource-control.html)、
+[service](https://www.freedesktop.org/software/systemd/man/255/systemd.service.html)。
+锁依据由根查阅 Python 3.13 与 Linux 官方资料确认：
+[fcntl](https://docs.python.org/3.13/library/fcntl.html)、
+[flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html)。独立 open description
+的 `LOCK_EX|LOCK_NB` 互斥、最后 fd 关闭释放及 `CLOEXEC` 语义不能替代 population 门。
+这些手册支持设计语义，不证明本候选实际已进入受限 service。
+
 ## 三个真实事务
 
 整个案例只有一条顺序链、同一个数据库和 journal，不并行运行多个服务。配置使用动态预选的 loopback 地址，真实 Uvicorn 绑定；若端口被占用，失败并清理，不重试管理业务。关闭模型、启动更新检查、渠道、MCP、Skills、目录监听、插件、自动记忆、注意队列和通知，不接外部账号。

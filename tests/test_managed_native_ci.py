@@ -1987,6 +1987,9 @@ def test_diagnostic_cli_dispatch_is_readonly_and_uses_exact_arguments(
     unit = "muli-native-" + "b" * 32 + ".service"
     user = "muli-ci-" + "a" * 12
 
+    def admitted(*, root: bool = False) -> None:
+        assert root is False
+
     async def diagnose(
         name: str, uid: int, home: Path, target: str, deadline: float
     ) -> dict[str, Any]:
@@ -1994,6 +1997,8 @@ def test_diagnostic_cli_dispatch_is_readonly_and_uses_exact_arguments(
         return {"unit": target, "code": "unavailable"}
 
     monkeypatch.setattr(worker, "diagnose", diagnose)
+    # Resource verification itself is covered by the dedicated envelope tests.
+    monkeypatch.setattr(worker, "require_resource_envelope", admitted)
     monkeypatch.setattr(
         sys, "argv", ["worker", "diagnose", user, "23145", str(tmp_path), unit, "9"]
     )
@@ -2820,6 +2825,9 @@ def test_setup_diagnostic_cli_keeps_separate_readonly_mode(
 ) -> None:
     called: list[tuple[str, int, Path, float, int, bool]] = []
 
+    def admitted(*, root: bool = False) -> None:
+        assert root is False
+
     async def observe(
         user: str,
         uid: int,
@@ -2833,6 +2841,7 @@ def test_setup_diagnostic_cli_keeps_separate_readonly_mode(
         return {"stage": "manager"}
 
     monkeypatch.setattr(worker, "diagnose_setup", observe)
+    monkeypatch.setattr(worker, "require_resource_envelope", admitted)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -5061,10 +5070,14 @@ def test_context_cli_never_prints_raw_failure(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    def admitted(*, root: bool = False) -> None:
+        assert root is True
+
     def fail(*args: Any) -> NoReturn:
         raise ValueError("SECRET=never-export-me")
 
     monkeypatch.setattr(worker, "read_setup_context", fail)
+    monkeypatch.setattr(worker, "require_resource_envelope", admitted)
     monkeypatch.setattr(
         sys,
         "argv",

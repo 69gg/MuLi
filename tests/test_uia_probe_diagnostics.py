@@ -24,6 +24,9 @@ STAGES = (
     "probe_received",
     "uia_initializing",
     "uia_ready",
+    "walker_initializing",
+    "walker_ready",
+    "probe_process_ready",
     "probe_encoded",
     "probe_write_returned",
 )
@@ -133,7 +136,7 @@ async def test_native_probe_failure_attaches_fixed_evidence_only_after_owned_cle
         await asyncio.gather(operation, return_exceptions=True)
 
 
-def test_packaged_script_has_eleven_once_only_fixed_stage_points() -> None:
+def test_packaged_script_has_fourteen_once_only_fixed_stage_points() -> None:
     from muli.tools import uia_computer
 
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
@@ -173,6 +176,30 @@ def test_first_input_stages_surround_the_original_read_and_decode_only() -> None
     assert source.index("Write-Stage 2") < source.index(points[0])
 
 
+def test_probe_native_getters_keep_their_original_single_calls_between_fixed_stages() -> None:
+    from muli.tools import uia_computer
+
+    assert uia_computer.__file__ is not None
+    source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
+    points = (
+        "Initialize-Uia\n            Check-Deadline",
+        "if ($traceProbe) { Write-Stage 11 }",
+        "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker",
+        "if ($traceProbe) { Write-Stage 12 }",
+        "'probe' {",
+        "$process = [Diagnostics.Process]::GetCurrentProcess()",
+        "try { $hasWindow = ($process.MainWindowHandle -ne [IntPtr]::Zero) }",
+        "finally { $process.Dispose() }",
+        "if ($traceProbe) { Write-Stage 13 }",
+        "$json = Encode-Result $requestId @{",
+        "Write-Stage 6",
+    )
+    positions = [source.index(point) for point in points]
+    assert positions == sorted(positions)
+    assert all(source.count(point) == 1 for point in points[1:10])
+    assert source.index("$traceProbe = $true") < positions[0]
+
+
 def test_every_bounded_prefix_keeps_only_complete_in_order_input_stage_lines() -> None:
     from helpers.uia_probe_diagnostics import probe_facts
 
@@ -193,11 +220,38 @@ def test_every_bounded_prefix_keeps_only_complete_in_order_input_stage_lines() -
 def test_old_eight_stage_prefix_remains_valid_without_new_input_markers() -> None:
     from helpers.uia_probe_diagnostics import probe_facts
 
-    stages = tuple(stage for stage in STAGES if stage not in STAGES[3:6])
+    stages = tuple(
+        stage
+        for stage in STAGES
+        if stage
+        not in {
+            "input_waiting",
+            "input_line_received",
+            "request_decoded",
+            "walker_initializing",
+            "walker_ready",
+            "probe_process_ready",
+        }
+    )
     result = probe_facts(
         cast(AXHelperLease, _Probe(stderr=stage_bytes(*stages))), cleanup_failed=False
     )
     assert len(stages) == 8
+    assert result["stages"] == list(stages) and result["stage_sequence"] == "valid"
+
+
+def test_old_eleven_stage_prefix_remains_valid_without_native_getter_markers() -> None:
+    from helpers.uia_probe_diagnostics import probe_facts
+
+    stages = tuple(
+        stage
+        for stage in STAGES
+        if stage not in {"walker_initializing", "walker_ready", "probe_process_ready"}
+    )
+    result = probe_facts(
+        cast(AXHelperLease, _Probe(stderr=stage_bytes(*stages))), cleanup_failed=False
+    )
+    assert len(stages) == 11
     assert result["stages"] == list(stages) and result["stage_sequence"] == "valid"
 
 
@@ -235,6 +289,12 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
             ["request_decoded", "input_line_received"],
             "invalid",
         ),
+        (stage_bytes("walker_ready", "walker_ready"), ["walker_ready"], "invalid"),
+        (
+            stage_bytes("probe_process_ready", "walker_ready"),
+            ["probe_process_ready", "walker_ready"],
+            "invalid",
+        ),
     ],
     ids=[
         "unknown",
@@ -244,6 +304,8 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
         "fixed-only",
         "input-duplicate",
         "input-out-of-order",
+        "walker-duplicate",
+        "native-getter-out-of-order",
     ],
 )
 def test_only_complete_known_lines_contribute_stage_evidence(

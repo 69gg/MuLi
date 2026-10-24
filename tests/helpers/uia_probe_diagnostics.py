@@ -20,6 +20,9 @@ STAGES = (
     "probe_received",
     "uia_initializing",
     "uia_ready",
+    "walker_initializing",
+    "walker_ready",
+    "probe_process_ready",
     "probe_encoded",
     "probe_write_returned",
 )

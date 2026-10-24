@@ -201,6 +201,14 @@ Ruff/format-check 和 strict mypy 通过；首轮 mypy 仅报测试引用未显�
 
 ## 后续 probe 阶段证据
 
+当前诊断候选又为原 getter 前后及当前进程属性读取返回增加三个固定阶段，共十四个
+名称；只补观测，仍待本轮纯回归和真实 Windows 验证。原 native19 Windows 3.13
+job `120672256773` 只观察到十一阶段协议的 `uia_ready`，没有观察到成功编码，原因
+尚未确定。它未进入窗口树读取；`uia_ready` 也不代表已完成 walker 或进程属性访问。
+原同进程、argv、12 秒和 stderr cap 不变，不预热、重试或跳过 probe；后续候选绿
+不能当作这次失败已修复。下文既有字节数和回归结果为各次已记录的历史片，当前
+十四阶段的边界、兼容和待验状态见[阶段证据设计](windows-uia-probe-diagnostics-design.md#native19-windows-313初始化之后的最小分叉候选待验)。
+
 2.36 发行的 Windows 3.12 job `119210252707` 曾在目标窗已经就绪后，独立 PS
 probe 等待回执超时；现有日志不足以区分启动、模块导入、UIA 初始化与写回阶段。
 初版观测仅给精确包内脚本增加每 helper 最多八行固定 stderr 标记，仍计入原会话
