@@ -135,7 +135,8 @@ async def test_archived_vision_survives_compaction_reopen_and_current_phone_retr
     source_id = ""
     background = tmp_path / "background.txt"
     background_body = "有限背景资料，不增加任何授权。\n" * 260
-    background.write_text(background_body, encoding="utf-8")
+    # fs_read preserves bytes; avoid platform newline translation in this fixture.
+    background.write_bytes(background_body.encode("utf-8"))
 
     class Main(FakeClient):
         async def stream(
