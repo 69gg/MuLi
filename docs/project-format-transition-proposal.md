@@ -162,3 +162,147 @@ state最后发布、执行门拒绝及probation路径，未见确切P1/P2。
 上述仅是临时文件、SQLite及受控进程/systemd边界的离线证据；没有迁移用户数据、
 启动真实服务或证明格式2解释器可运行。真正受lease保护的1→2 SQLite事务、
 COMMIT不明恢复及candidate2/fallback2同库启动仍待独立实现和验收。
+
+## 下一片：停写与锁保护下的固定迁移事务（仅目标红与设计）
+
+准备检查点为根签名 `ba3c8c01521a2a5e8e70fd87d4901f210b475396`。
+本次仅新增 `tests/test_project_format_transition_migrate.py` 并追加本节，没有修改生产。
+当前 prepared/revision1 模型、`advance_managed` 与效果入口仍拒绝新动作；以下目标尚待根
+实际收红，不能提前计为失败、通过或可恢复迁移，更不开放 CURRENT2 或 Project gate。
+
+下一授权片拟复用既有 `TransitionV2` 与 Journal position CAS，仅接
+prepared→draining→activating/stop_base→activating/install_target 的有限前缀，始终
+不给 boot_role。正式 `ManagedLinuxBackend.install` 仅为此实际类型、target 与固定
+install_target 增加窄分派：精确本代材料/原配置→新鲜 stopped、PID0、无进程、无job→
+真实 writer lease→实际 cgroup 空→二次 probe 同值→StoreConstructionLock→原DB父目录和
+device/inode 复核。原 controller lock、deadline、lease 与 guard 全程保持；source 尚活、
+空组不可证、锁忙或配置/marker/inode 漂移均在 SQLite DML 和 live 文件效果之前拒绝。
+此分支仅执行固定 SQL 片，不能落入原三文件安装循环，也不调用新库专属
+`publish_created_format`；`prepared` 本身不授权效果。
+
+无业务组件的专用 mode=rw 连接先完成有界 schema、格式、主身份、原投影核验并退出
+各 reader 的读事务，再设置并读回 synchronous=FULL，执行 BEGIN IMMEDIATE。事务内
+重新精确 CAS 原 marker 字节、store_instance/main、原 source projection，并同步复核
+冻结的配置与本代 guard。只允许完整目标 marker 与一个本代 receipt 同次 COMMIT；
+不得改 ingress/业务对象、覆盖旧 receipt 或补写“看起来成功”的凭据。
+
+本次测试先冻结 receipt 定位 `objects(kind='managed_format_transition',id=generation)`，
+完整 JSON 为 `id/version=1/migration_id='project_review_1_to_2'/generation/database{device,inode}/
+source_format_digest/target_format_digest/store_instance/main_session/source_projection/
+source_configuration_digest`，字段值均来自本代严格 record。实际字节纳入已有元数据/记录
+预算，不能增上限。相同 marker2、准确本代 receipt、同 inode 与原身份才表示 SQL 已提交；
+缺失、错代、正文不符或换 inode 一律拒绝，不盲重做 COMMIT 或降回 source1。
+
+第一 SQL 片可以留下“DB完整2且准确receipt已落盘、Journal仍observed1/install_target”的
+两介质崩溃前缀，但必须由新的 backend 实例在同 inode 重读后无写接续；不能依赖内存标志。
+在后续片真正接通耐久格式确认、base=fallback2 与候选启动前，此WIP不发行；source1原
+格式准入必须拒绝2。COMMIT抛错时仍持原锁/lease/构造锁，在原期限内关闭不确定连接并
+按固定marker+receipt重读分类；是否仍有活动事务决定是否回滚未提交部分，不能据异常文字、
+`in_transaction=False` 或 data_version 宣称已提交。同inode重读证明也不能由计数器替代。
+
+新文件三组均先真实 prepare、正常关闭 Runtime 释放 writer，再建立真实物理前置，最后
+调用现有 `advance_managed → ManagedLinuxBackend.install`，没有未来 API/import、
+unchecked model_copy、伪造 phase 或假 permit：
+
+1. `test_fixed_migration_same_inode_receipt_and_observed_one_reentry`：真实临时 SQLite、
+   文件和 flock，受控 stopped/cgroup0；期望原 inode、准确 receipt+marker2，原投影/配置/
+   live文件/业务行不变，Journal仍observed1且无bootrole；新backend重入不再写库，source1
+   格式准入拒绝2。data_version仅作为同一观察连接上的额外“重入未写”断言，提交证明始终
+   来自准确 marker+receipt；它不证明 inode、事务原子性或来源进程实际已停止。
+2. `test_fixed_migration_rejects_source_not_stopped_before_database_effect[running/populated]`：
+   先实际构建受控运行进程快照或 populated1 文件，并在调用前核对观察与真实 cgroup reader；
+   预期 stopped/cgroup 门明确拒绝，完整数据库逻辑内容与 live 文件不变。
+3. `test_fixed_migration_rejects_busy_real_lock_or_changed_marker[writer/construction/marker]`：
+   独立 fd 实际持 writer 或构造 flock，并先证第二 fd 确实 lock_busy；marker 反例只改变原始
+   JSON 空白，完整语义格式仍1，预期精确字节 CAS 拒绝。各例拒绝前后数据库与 live 文件不变。
+
+目前六节点均应先在正式 advance 分派得到 `managed_transaction_required`，不能将同一首门
+红视作后续 SQL/停写门已验证。生产实现授权后仍须补真实事务 COMMIT前/后丢返回、SQL提交
+后Journal未确认、receipt/主身份/原投影/配置/DB inode漂移以及原deadline/VM步数中断等负控。
+这些临时材料中的 candidate/fallback 解释器仍是不可执行占位文件；本片不停止任何本机真实
+服务、不启动候选、不迁移真实数据，也没有证明两个格式2 reader已能恢复用户库。
+
+实现前文档核对：Context7 `/python/cpython/v3.13.9` 返回月额度耗尽，随后按根批准只读官方
+小页面回退。[SQLite事务文档](https://www.sqlite.org/lang_transaction.html)确认BEGIN IMMEDIATE
+立即尝试写事务，读快照未退出会继续看到旧值，部分COMMIT错误仍保留活动事务；
+[Python3.13 sqlite3文档](https://docs.python.org/3.13/library/sqlite3.html)确认URI mode=rw禁止
+隐式创建新库、连接上下文不负责close，以及progress handler非零返回会中断SQL；
+[SQLite data_version文档](https://www.sqlite.org/pragma.html#pragma_data_version)只允许比较
+同连接前后值，不能作提交凭据。以上为接口事实；固定receipt分类、锁次序与失败关闭规则是
+本项目拟实施合同，并非SQLite替本项目保证。作者未运行测试、格式化、Git或真实系统效果。
+
+### 固定 SQL 与持久前缀候选（首验前历史）
+
+根唯一守卫已实收上述六节点 **6 failed**（pytest1.28秒，守卫1.868秒、86.2MiB、
+swap0），均准确在 `advance_managed` 的 `managed_transaction_required`；writer反例也
+先遇到该门，未能到其预期lock_busy。没有missing import、缺API或无效fixture造成的假红。
+随后根授权本段窄生产候选，并额外批准真实probe仅增加实际类型注解接缝。
+
+当前候选涉及五个生产文件：`managed_transaction.py` 的四个严格revision/阶段组合与有限
+CAS推进；`managed_journal.py` 的实际类型分派及base→source、target→candidate九材料
+读取映射；`platforms/managed_probe.py` 仅import/参数联合，原loadedunit/argv/前后核验
+不放宽；`platforms/managed_backend.py` 的固定SQL分支与其他效果显式拒绝；新增专用
+`managed_format_migration.py`。fallback第三角色也在每次同步guard完整核验实际slot文件、
+兼容声明、配置/selector/unit快照，不能因probe只用两角色而遗漏它。原DB inode锚复用
+`managed_boot._DatabaseAnchor`，构造锁/实际writer lease均不另造。
+
+新动作的revision严格为prepared1、draining2、stop_base3、install_target4；普通driver、
+observe/health、host command、stop/start、helper、boot、Runtime仍拒绝。SQL成功只返回
+这一固定效果完成，不返回三文件安装确认，不改live配置/selector/unit，不推进observed2、
+base=fallback2或候选启动。DB2/准确receipt而Journal仍observed1的重入仅重新读证，不重写；
+source1格式准入继续拒绝2。SQL或后核失败时留存真实已提交前缀，不回滚数据库到格式1。
+
+COMMIT丢返回候选区分：执行前抛SQLite错误，回滚仍活动的未提交事务，再以原锁/同inode
+新连接确认1/无receipt，报固定commit_unknown，不自动重试；执行后丢返回，则原连接关闭
+后重读2/精确receipt确认已提交，不再次DML。事务内progress handler限制原remaining与VM
+步数，cleanup先撤自己的handler再回滚未提交部分，连接全部明确close。receipt完整键集、
+严格整数version、主身份/原投影/配置摘要与原marker CAS不因异常而放宽。
+
+`tests/test_project_format_transition_migrate.py` 当前候选共21节点：原六项；COMMIT前/后
+丢回复两项；receipt缺失、坏JSON、异代、正文错、超字节、bool版本及缺字段七项；
+source/candidate/fallback三份真实快照漂移；SQLite同内容异inode的效果前/COMMIT后两项；
+有限前缀CAS/非法越级与driver、health、boot仍关闭一项。异inode只用临时SQLite备份构造
+故障，生产没有backup/restore路径。原准备测试只将已经允许的draining负控改为
+prepared→verifying精确invalid_transition，保留全部零DB/文件/receipt效果断言及旧权限门。
+
+这些候选尚未由作者运行测试、格式化或静态检查；根和独立Sol后审结果待收取。还需完整
+deadline/VM中断、持锁连接关闭异常与并行外来写入等负控，以及下一片实际Journal格式收敛/
+文件效果/同库candidate2与fallback2启动链验收。现状态仍为不可发行的局部WIP，不能把
+上述静态候选或旧准备绿当成真实托管1→2升级、恢复成功或Projectgate已经开放。
+
+### SQL 候选首验与受写表边界修正
+
+根唯一守卫首验新增迁移文件的原21节点全部通过：pytest5.83秒、守卫6.485秒、
+峰值96MiB、swap0。独立Sol随后发现两项P2：receipt查询虽限制正文，却把原始TEXT
+主键直接带过Python边界；既有schema读取也不拒受写表的扩展trigger，固定两次DML
+可能触发额外业务效果。根实收独审新增四参数节点均真实失败：pytest1.56秒、
+守卫2.136秒、94.9MiB、swap0。超长主键实际跨入1048576字符的Python字符串；坏UTF8
+在fetchall阶段抛OperationalError而非固定invalid；objects插入及runtime_state更新
+触发器两项均未拒绝。原21项通过不能覆盖这些边界。
+
+根授权的修正只改专用`managed_format_migration.py`：receipt主键在SQL内核TEXT类型与
+既有身份字节上限，只返回有限BLOB并严格UTF8解码；仍对固定kind读取LIMIT2，不只查
+期望ID，以保留异代/多项拒绝。首次或重入的有界格式证据必须拒绝objects/runtime_state
+上的trigger；BEGIN IMMEDIATE成功后、任何业务DML之前，再复用既有有界schema scanner
+在同一写事务快照内复核。这一复核沿原schema行数/字节及当前事务progress/deadline门，
+不嵌套事务、不更换callback、不泛禁其他表的扩展，不放宽普通Store格式准入。
+
+独审四项测试保持原样，未修改其红测oracle；修正候选尚待根25节点、相关旧回归、
+全源strict与Ruff实收。作者没有运行检查、格式化或Git，独立后审待收；仍不是完整
+Journal确认、格式2 reader恢复、启动激活或Project功能发行证明。
+
+### SQL 局部验收闭合
+
+根在同一资源守卫内实收修正后的全部25节点通过：pytest6.58秒、守卫7.159秒、
+106.4MiB、swap0；四个独审反例保持原oracle。准备及控制权换代八文件186节点再次通过
+（pytest8.39秒、守卫9.000秒、127.9MiB），原事务、Journal和probe三文件103节点通过
+（pytest2.53秒、守卫3.044秒、65MiB）。以上三组互不重叠，没有提高期限或跳过失败节点。
+修正后全149个源文件strict通过，守卫8.382秒、419.1MiB；Ruff首验五处import排序失败，
+仅整理这些import及七个改动代码/测试文件的格式后，全仓Ruff和393文件格式检查通过。
+
+非作者Sol对两项P2的修正后审未发现剩余具体P1/P2；主键先经SQL字节门、固定kind仍
+检测异代/重复，schema在重入及同一写快照内复核，原progress和期限保持。此结论限于
+临时SQLite、实际文件/flock和受控服务观察的固定SQL效果；Journal确认收敛、真实格式2
+reader资格、三文件安装、candidate/fallback同库启动与激活仍未实现或验收，不能发行
+为完整托管迁移，也未开放CURRENT2或Projectgate。上文的“待验证”保留首验时序，
+当前局部结果以本段为准。

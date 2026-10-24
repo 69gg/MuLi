@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from muli.managed_journal import RoleSnapshots, _read_snapshots, read_snapshots
-from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
+from muli.managed_transaction import (
+    ProjectControllerTransferRecord,
+    ProjectFormatTransitionRecord,
+    TransactionRecordV2,
+)
 from muli.management_transaction import Role, TransactionJournal
 from muli.platforms.linux_transaction import (
     ObservationError,
@@ -166,7 +170,9 @@ class ManagedSystemdProbe(SystemdProbe):
     async def read_managed(
         self,
         journal: TransactionJournal,
-        record: TransactionRecordV2 | ProjectControllerTransferRecord,
+        record: TransactionRecordV2
+        | ProjectControllerTransferRecord
+        | ProjectFormatTransitionRecord,
         anchor: DeploymentAnchor,
         controller: SlotIdentity,
         slots: dict[Role, SlotIdentity],

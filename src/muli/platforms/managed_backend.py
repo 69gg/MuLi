@@ -17,6 +17,7 @@ from typing import Any, Literal, Self
 
 import httpx
 
+from muli.compatibility import FormatState, assess_compatibility
 from muli.managed_controller import (
     BindingConfirmation,
     ManagedProcessIdentity,
@@ -25,10 +26,12 @@ from muli.managed_controller import (
     _prefixes,
     transfer_identity_matches,
 )
-from muli.managed_journal import Component, RoleSnapshots, read_snapshots
+from muli.managed_format_migration import migrate_project_format
+from muli.managed_journal import Component, RoleSnapshots, _read_snapshots, read_snapshots
 from muli.managed_transaction import (
     HealthProofV2,
     ProjectControllerTransferRecord,
+    ProjectFormatTransitionRecord,
     RoleBinding,
     TransactionRecordV2,
     format_digest,
@@ -72,7 +75,9 @@ from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSna
 from muli.process import run_process
 
 _ROLES: tuple[Role, ...] = ("base", "target")
-ManagedRecord = TransactionRecordV2 | ProjectControllerTransferRecord
+ManagedRecord = (
+    TransactionRecordV2 | ProjectControllerTransferRecord | ProjectFormatTransitionRecord
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +141,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self.cgroups = CgroupObservation(cgroup_root, self.probe.limits.file_bytes)
         self._activation_attempt: tuple[str, str, Role | None] | None = None
         self._transfer_record: ProjectControllerTransferRecord | None = None
+        self._format_record: ProjectFormatTransitionRecord | None = None
         self.client = httpx.AsyncClient(
             transport=transport,
             trust_env=False,
@@ -155,6 +161,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self.control.check()
         if self.control.read_current() != record:
             raise TransactionError("stale_revision")
+        if self._format_record is not None and (
+            not isinstance(record, ProjectFormatTransitionRecord)
+            or self._format_record.model_dump(exclude={"revision", "phase", "intent"})
+            != record.model_dump(exclude={"revision", "phase", "intent"})
+        ):
+            raise ObservationError("transaction_format_identity_changed")
         if self._transfer_record is not None and (
             not isinstance(record, ProjectControllerTransferRecord)
             or not transfer_identity_matches(self._transfer_record, record)
@@ -179,6 +191,33 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                     or store.read_slot(binding.installation) != slot
                 ):
                     raise ObservationError("managed_slot_changed")
+            if isinstance(record, ProjectFormatTransitionRecord):
+                format_roles: tuple[
+                    tuple[Literal["source", "candidate", "fallback"], RoleBinding, FormatState], ...
+                ] = (
+                    ("source", record.source.binding, record.source_format),
+                    ("candidate", record.candidate, record.target_format),
+                    ("fallback", record.fallback, record.target_format),
+                )
+                for name, binding, state in format_roles:
+                    slot = store.read_slot(binding.installation)
+                    if slot.compatibility_digest != binding.compatibility:
+                        raise ObservationError("managed_slot_changed")
+                    verify_slot_files(slot)
+                    assessment = assess_compatibility(
+                        slot.compatibility, slot.compatibility, state, handoff_protocol=2
+                    )
+                    if not assessment.format_compatible:
+                        raise ObservationError(assessment.code)
+                    material = _read_snapshots(self.journal, record.generation, binding, name)
+                    if material.selector is None or material.unit != self.service.render().encode():
+                        raise ObservationError("transaction_snapshot_changed")
+                    selector = SelectorValue.model_validate_json(material.selector)
+                    if selector != SelectorValue(
+                        deployment=self.anchor.digest, installation=binding.installation
+                    ):
+                        raise ObservationError("transaction_snapshot_changed")
+                self._format_record = record
         if isinstance(record, ProjectControllerTransferRecord):
             transfer_origin_material(self.journal, record, self.anchor)
             self._transfer_record = record
@@ -370,6 +409,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         return self._disk()
 
     async def observe(self, record: ManagedRecord) -> ManagedServiceObservation:
+        if isinstance(record, ProjectFormatTransitionRecord):
+            raise ObservationError("project_format_transition_unsupported")
         before, disk = await self._probe(record), self._disk()
         boot = before.service.unit.invocation if before.service.process is not None else None
         process: ManagedProcessIdentity | None = None
@@ -488,6 +529,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise ObservationError("transaction_unit_command_failed")
 
     async def _host_command(self, record: ManagedRecord, action: str, role: Role | None) -> None:
+        if isinstance(record, ProjectFormatTransitionRecord):
+            raise ObservationError("project_format_transition_unsupported")
         if (
             action == "drain"
             and (record.phase != "draining" or role is not None)
@@ -547,6 +590,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         await self._host_command(record, "activate", role)
 
     async def stop(self, record: ManagedRecord, role: Role) -> None:
+        if isinstance(record, ProjectFormatTransitionRecord):
+            raise ObservationError("project_format_transition_unsupported")
         if (record.phase, record.intent, role) not in {
             ("activating", "stop_base", "base"),
             ("rolling_back", "stop_target", "base"),
@@ -577,6 +622,9 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         await self._command("stop")
 
     async def install(self, record: ManagedRecord, role: Role, data: RoleSnapshots) -> None:
+        if isinstance(record, ProjectFormatTransitionRecord):
+            await self._install_project_format(record, role, data)
+            return
         if (record.phase, record.intent, role) not in {
             ("activating", "install_target", "target"),
             ("rolling_back", "restore_base", "base"),
@@ -649,7 +697,47 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 raise ObservationError("managed_unit_not_loaded")
             self._confirm(record, role, lease, cgroup)
 
+    async def _install_project_format(
+        self, record: ProjectFormatTransitionRecord, role: Role, data: RoleSnapshots
+    ) -> None:
+        if (record.phase, record.intent, role) != ("activating", "install_target", "target"):
+            raise ObservationError("transaction_effect_not_permitted")
+        if data != self._desired(record, role):
+            raise ObservationError("transaction_snapshot_changed")
+        self._check(record, role)
+        before = await self._probe(record)
+        if not self._stopped(before.service):
+            raise ObservationError("transaction_service_not_stopped")
+        with self.journal.writer_lease() as lease:
+            cgroup = before.service.unit.cgroup
+
+            def guard() -> None:
+                self._guard(record, role, lease, cgroup)
+                if self._disk().digests != _files(record.source.binding):
+                    raise ObservationError("foreign_managed_binding")
+
+            guard()
+            if before != await self._probe(record):
+                raise ObservationError("transaction_observation_changed")
+            guard()
+            migrate_project_format(
+                self.journal.database,
+                record,
+                guard=guard,
+                seconds=min(
+                    self.operation_timeout,
+                    record.deadline.remaining(self.clock()) - record.deadline.rollback_reserve,
+                ),
+                metadata_bytes=self.journal.limits.max_record_bytes,
+            )
+            guard()
+            if before != await self._probe(record):
+                raise ObservationError("transaction_observation_changed")
+            guard()
+
     async def start(self, record: ManagedRecord, role: Role) -> None:
+        if isinstance(record, ProjectFormatTransitionRecord):
+            raise ObservationError("project_format_transition_unsupported")
         if (record.phase, record.intent, role) not in {
             ("activating", "start_target", "target"),
             ("rolling_back", "start_base", "base"),

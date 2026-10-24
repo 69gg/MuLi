@@ -466,11 +466,11 @@ class ProjectFormatMigration(StrictRecord):
 
 
 class ProjectFormatTransitionRecord(_Protocol2):
-    """Prepared materials only; no SQL transition, boot or effect is authorized."""
+    """Frozen materials and the fixed pre-SQL prefix; no driver or boot admission."""
 
     request_id: Identifier
     generation: Identifier
-    revision: int = Field(default=1, ge=1, le=1)
+    revision: int = Field(default=1, ge=1, le=4)
     action: Literal["project_review_1_to_2"]
     identity: ServiceIdentityV2
     source: ProjectFormatSource
@@ -483,8 +483,8 @@ class ProjectFormatTransitionRecord(_Protocol2):
     observed_format: FormatState
     migration: ProjectFormatMigration
     deadline: Deadline
-    phase: Literal["prepared"] = "prepared"
-    intent: Literal["none"] = "none"
+    phase: Literal["prepared", "draining", "activating"] = "prepared"
+    intent: Literal["none", "stop_base", "install_target"] = "none"
     activation: Literal["pending"] = "pending"
     challenge: Identifier = Field(repr=False)
     rollback_challenge: None = None
@@ -502,6 +502,13 @@ class ProjectFormatTransitionRecord(_Protocol2):
 
     @model_validator(mode="after")
     def consistent(self) -> Self:
+        if (self.revision, self.phase, self.intent) not in {
+            (1, "prepared", "none"),
+            (2, "draining", "none"),
+            (3, "activating", "stop_base"),
+            (4, "activating", "install_target"),
+        }:
+            raise ValueError("invalid_project_format_prefix")
         source = self.source
         if (
             self.rollback_attempted
@@ -738,6 +745,34 @@ def advance_transfer_record(
     if not isinstance(record, ProjectControllerTransferRecord):
         raise TransactionError("project_controller_transfer_required")
     return _advance_protocol2(record, expected, transition)
+
+
+def advance_project_format_record(
+    record: ProjectFormatTransitionRecord, expected: Revision, transition: TransitionV2
+) -> ProjectFormatTransitionRecord:
+    """Persist only the fixed pre-SQL intent; no observation is implied."""
+    if record.position != expected:
+        raise TransactionError("stale_revision")
+    following = {
+        ("prepared", "none"): ("draining", "none"),
+        ("draining", "none"): ("activating", "stop_base"),
+        ("activating", "stop_base"): ("activating", "install_target"),
+    }
+    if (
+        following.get((record.phase, record.intent)) != (transition.phase, transition.intent)
+        or transition.activation != "pending"
+        or transition.code is not None
+        or transition.proof is not None
+    ):
+        raise TransactionError("invalid_transition")
+    return ProjectFormatTransitionRecord.model_validate(
+        {
+            **record.model_dump(),
+            "revision": record.revision + 1,
+            "phase": transition.phase,
+            "intent": transition.intent,
+        }
+    )
 
 
 def _advance_protocol2[RecordT: (TransactionRecordV2, ProjectControllerTransferRecord)](

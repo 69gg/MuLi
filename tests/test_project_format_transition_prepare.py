@@ -435,8 +435,8 @@ async def test_project_format_prepared_does_not_widen_ordinary_transfer_or_effec
     with pytest.raises(TransactionError, match="^managed_transaction_required$"):
         read_helper_entry(subject.host.journal.directory.path)
     with subject.host.journal.locked() as control:
-        with pytest.raises(TransactionError, match="^managed_transaction_required$"):
-            advance_managed(control, record.position, TransitionV2(phase="draining"))
+        with pytest.raises(TransactionError, match="^invalid_transition$"):
+            advance_managed(control, record.position, TransitionV2(phase="verifying"))
         with pytest.raises(TransactionError, match="^managed_transaction_required$"):
             read_helper_record(control, subject.source.anchor)
     assert material_bytes(subject) == before

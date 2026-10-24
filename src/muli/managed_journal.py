@@ -23,6 +23,7 @@ from muli.managed_transaction import (
     TransactionRecordV2,
     TransferOrigin,
     TransitionV2,
+    advance_project_format_record,
     advance_record_v2,
     advance_transfer_record,
     compatibility_digest,
@@ -106,9 +107,16 @@ def _read_snapshots(
 
 def read_snapshots(
     journal: TransactionJournal,
-    record: TransactionRecordV2 | ProjectControllerTransferRecord,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord | ProjectFormatTransitionRecord,
     role: Role,
 ) -> RoleSnapshots:
+    if isinstance(record, ProjectFormatTransitionRecord):
+        return _read_snapshots(
+            journal,
+            record.generation,
+            record.binding(role),
+            "source" if role == "base" else "candidate",
+        )
     return _read_snapshots(journal, record.generation, record.binding(role), role)
 
 
@@ -442,8 +450,10 @@ def prepare_project_format_managed(
 
 def advance_managed(
     control: JournalControl, expected: Revision, transition: TransitionV2
-) -> TransactionRecordV2 | ProjectControllerTransferRecord:
+) -> TransactionRecordV2 | ProjectControllerTransferRecord | ProjectFormatTransitionRecord:
     record = control.read_current()
+    if isinstance(record, ProjectFormatTransitionRecord):
+        return control._write(advance_project_format_record(record, expected, transition))
     if isinstance(record, ProjectControllerTransferRecord):
         return control._write(advance_transfer_record(record, expected, transition))
     if not isinstance(record, TransactionRecordV2):
