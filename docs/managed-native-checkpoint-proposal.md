@@ -1796,3 +1796,55 @@ shield保留任务引用，取消和重复取消仍等待真实线程结算、�
 未改生产压制错误，按源码根补 `MYPYPATH=src` 后，146源文件strict/no-incremental通过
 （守卫7.898秒、374MiB、swap0、exit0）。本片未改变依赖或发行版本，新的精确签名
 候选及真实原生CI另行验证；这些本地结果仍不证明原2秒请求或60秒三事务已完成。
+
+### Native42真实结果：已进入第二代，仍在总截止失败
+
+GPG签名提交 `7867dafccd2acea7eb854d690835fd50b2800caf` 的
+[CI 40095097180](https://github.com/69gg/MuLi/actions/runs/40095097180) 中，
+已终态failure，十项通用检查全部success，唯一managed-native作业 `120875563257` 失败。
+根已核artifact `12560184685`：ZIP1893字节，
+SHA-256 `d5d1c78238e8103812a1f8405c40d1770e7ecc5d0cf2d884437f65860d415b5a`，
+精确两成员与原typed receipt/result均有效，不执行归档内容。
+
+本轮cleanup为verified、mounts为空、user_removed与group_removed均true。
+主结果仍TimeoutError/completed=false，但本次stage为helper_exit，总截止60000毫秒，
+不再是前两轮的switch HTTP prepare局部失败：adopt于40284毫秒released、41442毫秒
+projection；switch于41443毫秒prepare，第二代 `4438839d4b7972ebb2b0c29131e87aad`
+于44101毫秒prepared、49896毫秒draining、54391毫秒stop_base、58204毫秒install_target，
+60000毫秒结束。没有完成第二代启动验证或第三事务，不能作为完整原生恢复通过证据。
+
+第一代准确PID2340/UID999/invocation `8f059d535c434848ae79e540d1ddeafc` 的成本为
+checks139次/17351毫秒、bus274次/3526毫秒、HTTP12次/1217毫秒；第二代当前成本为
+identity_changed不可用，不将第一代历史当作第二代成本。线程卸载的离线响应性反例已闭合，
+本轮现场也实际走过原prepare；跨runner墙钟差不能独立归因于该改动或折算加速百分比。
+下一片先只读审查原helper/backend的重复工作，保持完整hash、lease、效果前后门和原期限。
+
+### Native43：合并已有selector确认的同步重复入口校验
+
+根沿真实Host、正式install_target和target确认取得准确首红：原_check逐次完整委派，
+磁盘身份/字节、事务record与零命令前置均成立，只因实际8次而要求7次失败。
+1 failed、pytest1.80秒，守卫2.321秒、63.9MiB、swap0、exit1。
+窄修仅在非空SelectorSnapshot时省去SelectorStore.confirm的外层guard；其前置_expect
+为有界同步只读，没有await或写入，随后ConfigurationFile.confirm仍在任何fsync前执行
+原完整guard。底层第二guard、inode双核、文件与父目录fsync和后读保持，缺叶分支
+仍先原guard再目录耐久确认。真实revision与writer lease inode漂移在固定底层入口注入，
+继续原确认与原guard，只准原journal控制fd的读耐久屏障，组件身份/字节不变、零命令。
+
+完整新文件4 passed（pytest4.45秒，守卫4.966秒、63.3MiB、swap0、exit0）。非生产作者
+对实际一处生产差异与低层调用后审未发现明确P1/P2。这不是原生三事务的60秒验收。
+扩大六文件时60秒守卫终止（60.171秒、75.3MiB、swap0、exit143）；没有pytest总结，
+不将部分progress当作完整通过。旧guard次数测试相应更新为非空selector确认7次、正常
+install31次，其中probe的6次保持、target由28变25；None分支不全局减计数。
+后续按完整文件拆分复验，不提高原守卫或事务期限，不跳过安全负控。
+
+拆分后backend完整文件34 passed（pytest31.45秒，守卫32.081秒、72.6MiB、swap0）；
+旧guard预算与新selector两完整文件10 passed（pytest7.51秒，守卫8.106秒、65.7MiB、swap0）。
+安装确认、事务和底层文件三完整文件首验97 passed、2 failed（pytest31.05秒，
+守卫31.621秒、69.8MiB、swap0）：两项准确失败为start的旧15次计数，实际为14。
+start仍完整委派两probe的4次None检查与10次target门；仅同一selector确认少1次同步重复。
+对应断言仅将15改14、target11改10，保持None4、probe2、认证、命令、record和漂移负控。
+三文件再验99 passed（pytest30.83秒，守卫31.396秒、69.6MiB、swap0、exit0）。
+与上述两组无重叠，共143个不同本地节点通过；不把此前部分progress、首失败或子集再累加。
+Ruff通过；格式首查仅新测试一处排版，修正后390文件格式通过。146源文件strict、
+no-incremental且MYPYPATH=src通过（守卫8.193秒、374MiB、swap0、exit0）。
+本片无依赖、发行版本或持久格式变化；新的精确签名候选与原生CI仍需另外验证。

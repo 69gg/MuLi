@@ -448,7 +448,8 @@ class SelectorStore(AbstractContextManager["SelectorStore"]):
     def confirm(
         self, expected: SelectorSnapshot | None, *, guard: Callable[[], None]
     ) -> SelectorSnapshot | None:
-        guard()
+        if expected is None:
+            guard()
         self._expect(expected)
         if expected is None:
             self._unconfirmed = True

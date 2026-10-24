@@ -64,9 +64,9 @@ async def test_real_install_returns_exact_confirmation_and_original_start_rechec
     probes = host.probe.count
     await host.backend.start(started, "target")
 
-    assert len(checks) == 15
+    assert len(checks) == 14
     assert checks.count((started, None)) == 4
-    assert checks.count((started, "target")) == 11
+    assert checks.count((started, "target")) == 10
     assert host.probe.count - probes == 2
     assert host.commands == ["start"]
     assert host.record() == started
@@ -138,7 +138,7 @@ async def test_real_managed_step_uses_install_confirmation_without_a_second_obse
     assert current.position != record.position
     assert (current.phase, current.intent) == ("activating", "start_target")
     assert observed == [record.position]
-    assert start_checks == [15]
+    assert start_checks == [14]
     assert host.commands == ["start"]
 
 

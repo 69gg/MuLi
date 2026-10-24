@@ -26,7 +26,7 @@ from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSna
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed effects/leases")
 
 
-async def test_confirm_uses_eight_real_checks_without_duplicate_component_guards(
+async def test_confirm_uses_seven_real_checks_for_present_selector(
     host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     record = host.install_intent()
@@ -43,11 +43,13 @@ async def test_confirm_uses_eight_real_checks_without_duplicate_component_guards
         confirmed = host.backend._confirm(record, "base", lease, host.probe.snapshot.unit.cgroup)
 
     assert confirmed == before == host.backend._disk()
-    assert checks == [(record, "base")] * 8
+    # The switch fixture has an existing selector: its low-level file confirm
+    # retains two guards; the removed selector wrapper guard was redundant.
+    assert checks == [(record, "base")] * 7
     assert host.record() == record and host.commands == []
 
 
-async def test_install_uses_thirty_four_real_checks_including_both_confirmations(
+async def test_install_uses_thirty_one_real_checks_including_both_confirmations(
     host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     record = host.install_intent()
@@ -61,9 +63,11 @@ async def test_install_uses_thirty_four_real_checks_including_both_confirmations
     monkeypatch.setattr(host.backend, "_check", counted)
     await host.backend.install(record, "target", host.data["target"])
 
-    assert len(checks) == 34
+    # Two full confirmations and the replaced selector's final confirmation
+    # each lose one duplicate guard. Probe checks and absence guards are unchanged.
+    assert len(checks) == 31
     assert checks.count((record, None)) == 6
-    assert checks.count((record, "target")) == 28
+    assert checks.count((record, "target")) == 25
     assert host.backend._disk().digests == (
         record.target.configuration.digest,
         record.target.selector.digest if record.target.selector else None,
