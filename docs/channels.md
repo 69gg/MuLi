@@ -54,6 +54,26 @@ Manager 的控制前置查询只返回固定指纹是否匹配及回执是否存
 
 核心明确拒绝无法核验的手机来源或当前事件回执时，渠道组合层转换为固定 403；配置锁内发现渠道代次、管理器、适配器或授权变化同样拒绝。轮询可跳过这类拒绝，不因同一损坏控制回执卡住游标。存储、关闭状态及提交后通知等其它异常继续向外抛出，不能伪装成已经处理的拒绝；重投仍由持久回执与原控制请求实现幂等恢复。
 
+## 手机上的工具审批
+
+已绑定的Telegram、OneBot主人可在原始私聊发送 `/审批`，查看主助手与队友当前真正
+等待的工具调用；每项提供完整审批ID、会话/运行归属、工具、风险、说明及参数。
+发送 `/审批 完整ID`查看准确一项，再用 `/批准 完整ID`或 `/拒绝 完整ID`登记决定。
+超出原输出预算会明确提示使用Web核对，不把省略参数冒称完整详情。
+
+这三类前缀也保留格式错误；与任务控制相同，群聊、引用、转发、caption、ASR、模型或
+系统资料没有批准资格。每次接纳和重投均重新检查当前账号及主人授权。命令只进入
+宿主控制路径，不成为普通owner输入，不打断等待中的原运行，也不改原成果的回复来源。
+控制确认回当前私聊，实际任务成果仍回原发令渠道及Web。
+
+Web与手机共用真实future及持久pending双核。审批决定、resolved事件及手机回执同事务
+提交后才唤原等待者；回执写失败整笔回滚。批准已登记不等于操作已经执行或成功，
+原任务版本、取消及工具末门继续生效。重复信封只复用原回执；停止、超时或重开后旧
+许可不再有效，确认出站unknown不自动重发、不因此重做工具。
+
+正式Runtime/Team/OneBot离线旅程及五项故障回归见[方案](mobile-approvals-proposal.md)与
+[候选审查](review-v2.59.md)。真实平台账号、自然模型和网络送达效果仍需单独验收。
+
 控制结果先由核心服务持久化，再以 `mobile-task:<完整入站key>` 幂等加入原 outbox。确认队列满时，同事件重投只补本地入队；已提交控制不会重复追加要求。确认发送 `unknown` 仍不自动重发。正常重开、历史压缩不从摘要猜短码，是否仍有效以持久回执、当前授权及控制版本为准。本片不增加票据表、轮询、预热或额外网络身份查询。
 
 ## 无发令会话时的默认通知
@@ -254,7 +274,7 @@ result = await manager.wait(delivery["id"])
 await manager.close()
 ```
 
-`submit` 为异步回调，接收 `content/source/principal/route/event_id/attachment_ids`。可选 `control_submit` 仅用于宿主手机控制组合，接收 `name/message/route/event_id/receipt`（`receipt` 始终为 `None`，核心自行读取唯一权威回执），返回含 `reply_text` 和版本化 `mobile_task_control` 元数据的持久回执；该回调负责最终授权及保存，Manager 不重复写控制回执。`IncomingMessage.control_text/control_account_id` 默认空，不支持的适配器和普通聊天均保持空；它们只是适配器原始信封证据，不能代替当前 owner 授权。关闭时取消长轮询、事件消费者与出站工作器，完成正在发送任务的状态收口后唤醒等待者；若管理器关闭，`wait` 返回当时的持久状态，尚未发送的项目仍可能是 `pending`。
+`submit` 为异步回调，接收 `content/source/principal/route/event_id/attachment_ids`。可选 `control_submit` 仅用于宿主手机控制组合，接收 `name/message/route/event_id/receipt`（`receipt` 始终为 `None`，核心自行读取唯一权威回执），返回含 `reply_text` 和版本化 `mobile_task_control` 或 `mobile_approval` 元数据的持久回执；该回调负责最终授权及保存，Manager 不重复写控制回执。`IncomingMessage.control_text/control_account_id` 默认空，不支持的适配器和普通聊天均保持空；它们只是适配器原始信封证据，不能代替当前 owner 授权。关闭时取消长轮询、事件消费者与出站工作器，完成正在发送任务的状态收口后唤醒等待者；若管理器关闭，`wait` 返回当时的持久状态，尚未发送的项目仍可能是 `pending`。
 
 离线验证命令：`python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_channels.py tests/test_channel_voice.py`。测试使用 `httpx.MockTransport`，覆盖四个平台的实际请求格式、验签/加密、机主隔离、文件收发及大小限制、内网 URL 阻断、持久游标与去重、分段恢复、取消后未知结果、限流有限重试和 QQ 被动回复预算。语音回归覆盖 Telegram multipart、OneBot 私聊/群 record 与能力拒绝、格式/数量预检、默认文件与 QQ 音频兼容、同键模式冲突、持久重开及 unknown 不重发。相关渠道/应用集成/附件服务共 61 项受限测试通过，源码检查记录见[语音设计](channel-voice-design.md#验证)。没有连接真实账号、真实收发消息或安装机器人程序；生产平台的账号资质、权限和端点可达性尚需使用者配置后实际验证。
 

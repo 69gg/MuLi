@@ -11,6 +11,7 @@ from typing import Any
 from muli.attachments import Attachments, attachment_ids_schema
 from muli.channels import ChannelError, ChannelManager, ChannelProfile, ChannelsConfig
 from muli.channels.types import IncomingMessage
+from muli.mobile_approvals import is_approval_command
 from muli.mobile_task_control import MobileControlRejected, MobileControlSource
 from muli.proactive import FrozenRouting, guard_delivery
 from muli.proactive_memory import check_preference
@@ -66,7 +67,12 @@ class ChannelApplication:
                 manager.control_guard(name, message, route)
 
             try:
-                return await self.runtime.submit_mobile_task_control(
+                submit_control = (
+                    self.runtime.submit_mobile_approval
+                    if is_approval_command(message.control_text)
+                    else self.runtime.submit_mobile_task_control
+                )
+                return await submit_control(
                     inbound_id=event_id,
                     source=MobileControlSource(
                         name=name,
@@ -81,7 +87,7 @@ class ChannelApplication:
                 # Only an explicit pre-write rejection is terminal to polling.
                 # Storage and post-commit notification failures remain retryable.
                 raise ChannelError(
-                    "手机任务控制无法核验，请重新发送 /任务", status_code=403
+                    "手机控制无法核验，请重新发送 /审批 或 /任务", status_code=403
                 ) from None
 
         def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:

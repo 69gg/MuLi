@@ -33,6 +33,7 @@ from muli.management_transaction import Role
 from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
 from muli.memory_context import MemoryContextProvider, recalled_for_prompt, render_context
+from muli.mobile_approvals import MobileApprovals
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
 from muli.permissions import Mode, PermissionDenied, Permissions
@@ -533,6 +534,27 @@ class Runtime:
         # Queued work needs its original durable paused completion.
         self.team.start()
         return result
+
+    async def submit_mobile_approval(
+        self,
+        *,
+        inbound_id: str,
+        source: MobileControlSource,
+        text: str,
+        admission_guard: Callable[[], None],
+    ) -> dict[str, Any]:
+        async with self.configuration_lock:
+            if self._closing:
+                raise ValueError("手机审批服务正在关闭")
+            self.maintenance.require_configuration()
+            admission_guard()
+            receipt = MobileApprovals(
+                self.permissions, budget=self.config.settings.limits.max_output_chars
+            ).handle(inbound_id, source, text)
+        # A committed decision/receipt survives notification failure. Replaying
+        # the inbound command only repairs this wakeup and its original outbox.
+        await self.bus.notify()
+        return receipt
 
     async def submit_mobile_task_control(
         self,

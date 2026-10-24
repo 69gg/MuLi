@@ -16,7 +16,7 @@ Submit = Callable[..., Awaitable[dict[str, Any]]]
 
 def is_mobile_control_text(text: str) -> bool:
     """Reserve malformed commands too; this never parses or authorizes one."""
-    return text.lstrip().startswith(("/任务", "/暂停", "/调整"))
+    return text.lstrip().startswith(("/任务", "/暂停", "/调整", "/审批", "/批准", "/拒绝"))
 
 
 class ChannelError(ValueError):

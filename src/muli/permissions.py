@@ -79,18 +79,39 @@ class Permissions:
         finally:
             self.pending.pop(approval["id"], None)
 
-    async def resolve(self, identifier: str, decision: str) -> None:
+    def resolve_now(
+        self,
+        identifier: str,
+        decision: str,
+        *,
+        persist_receipt: Callable[[], None] | None = None,
+    ) -> None:
+        """Commit one live decision and its optional host receipt before waking it.
+
+        The receipt callback only writes in this transaction; it must neither
+        commit nor yield. A failed receipt leaves the original waiter pending.
+        """
         if decision not in {"approve", "reject"}:
             raise ValueError("decision 必须为 approve 或 reject")
+        if self.store.db.in_transaction:
+            raise RuntimeError("审批决定不能嵌套提交")
         future = self.pending.get(identifier)
         approval = self.store.get("approval", identifier)
         if future is None or future.done() or approval is None or approval["status"] != "pending":
             raise ValueError("审批已结束或运行已中止")
         approval["status"] = "approved" if decision == "approve" else "rejected"
-        self.store.put("approval", approval)
+        with self.store.db:
+            self.store._event(
+                "approval.resolved",
+                {"id": identifier, "decision": decision},
+                approval["session_id"],
+                objects=[("approval", approval)],
+            )
+            if persist_receipt is not None:
+                persist_receipt()
+        # No await separates the durable decision from its original live waiter.
         future.set_result(decision == "approve")
-        await self.bus.emit(
-            "approval.resolved",
-            {"id": identifier, "decision": decision},
-            approval["session_id"],
-        )
+
+    async def resolve(self, identifier: str, decision: str) -> None:
+        self.resolve_now(identifier, decision)
+        await self.bus.notify()
