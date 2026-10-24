@@ -145,3 +145,15 @@ result仍为manager_setup/setup_failed、0事务；manager_failure为deadline/ma
 **实际计费回执。** 原32768字节proc＋双pipe累计、512字节内层wire及1024字节整个外层回复继续不变，新增有限标量也须容入原包。入诊断前父已付B必须来自真实`setup_bytes`，raw grant为`32768−B−1024`，不从native19的worker.used17468推算。父在原结果中保存固定小型`accounting`：`parent_before`、`raw_grant`、`child_charged`、`reply_bytes`、`parent_after`和`settlement=validated|unvalidated|not_started`；数字仅取实际账本/实际wire，未知reply_bytes用null，不伪造零。合法同锚点、及时、有界回包才按真实used退差额，结算`parent_after=B+child_charged+reply_bytes`；未经验证不退款，丢回包继续按现有保守规则占满总额。未启动不制造子进程花费。该元数据同样受严格shape和整个1024字节保存投影门约束，不借新字段增加预留；它用于暴露现场是否有足够采集余额，不能保证未来一定取得内部事实。
 
 **首片可证伪边界。** 离线fake缝隙须覆盖真实调用顺序与释放：仅两固定属性、无激活/回退；签名或尾部多值、仅peer PID/UID错、后socket/proc/PID1漂移均拒；剩余deadline耗尽、丢回包不退grant；实际512/513与1024/1025临界及最大accounting投影仍保住原checkpoint/首因。fake只证明协议编排和预算，不能证明FFI ABI、真实EXTERNAL握手或v255认证行为。实现获批并通过离线边界后，另行授权受控临时peer验证这些连接与凭据事实；不接真实用户服务、不扩大预算，也不据此跳过原READY尾门或直接启动native20。
+
+### direct-peer 首片：独立 helper 的离线检查点
+
+根在签名检查点`47c5233`后授权只写独立`tests/helpers/managed_native_peer.py`及`tests/test_managed_native_peer.py`。测试先于helper写入，首次冻结时未执行，根后续实收记录见本节末。公开入口`read_manager_peer(pid, uid, deadline) -> PeerFacts`只接目标身份和原绝对截止，地址固定从目标UID派生；缺库固定unavailable，未引入依赖安装或CLI后备。返回仅含code/reason/basic_state/njobs，不含原生错误正文、路径或unit列表。
+
+候选仅绑定显式非变参v255 API：固定GetUnit加两次Properties.Get，三条消息均关闭auto-start及interactive authorization；每次call取原deadline剩余值。借用字符串用void指针接收，在message存活期间逐字节限长查NUL后复制；append传char[]地址，read传const char**输出位置，不用c_char_p返回值自动展开，也不盲拷最大长度。所有请求/响应/error及bus均有finally释放，SO_PEERCRED使用fromfd复制的FD，只关闭复制件。socket前后有限身份和真实FD的PID/UID核验已留在入口；未来正式集成仍须置于现有两次proc与前后PID1窗口内，helper本身不能代替这些外层身份门或cgroup/进程硬截止。
+
+离线测试用假C符号回填真实ctypes输出指针，核固定请求实参、实际标量来源、原截止递减、完整signature/variant/at_end、空/超长借用字符串、native错误及部分返回资源释放、socket/peer漂移、缺库和无回退；另核借用FD不被关闭。fixture禁止真实CDLL加载、socket和文件open。候选**未接入**read_manager_instance、内外wire/父accounting结算或READY流程，512/1024/32768集成边界仍是后续工作，不能据独立helper结果冒称已覆盖。此次未执行检查、真实FFI/私有socket、真实服务或新CI，不授权native20；ABI、EXTERNAL认证及真实受控临时peer仍未验。
+
+根随后实际收齐首轮27 passed：pytest0.06秒、守卫570毫秒、57.2MiB/swap0、exit0。这只验证离线编排；假C符号不执行原生返回ABI。根按固定[v255 `man/sd_bus_error.xml`](https://raw.githubusercontent.com/systemd/systemd/v255/man/sd_bus_error.xml)核出`sd_bus_error_free`返回void，候选却声明为pointer；没有因为返回值被忽略就认为声明正确。新增独立符号声明回归检查全部19项argtypes/restype，保留bus/message unref的pointer返回及close的void返回。根实收该节点1 failed：pytest0.06秒、守卫560毫秒、57.1MiB/swap0、exit1，唯一失败为error_free的pointer不等于None，fixture已完整进入ABI声明断言。
+
+据此授权仅将该绑定restype改为None，未改调用流程、资源释放或错误分类。根修后实收28 passed（pytest0.05秒；守卫530毫秒、54.9MiB/swap0、exit0）。Ruff通过；格式首检两文件exit1，根仅格式化这两文件后Ruff与格式均exit0。`MYPYPATH=src:tests`、strict/no-incremental限定新helper的类型检查通过（守卫715毫秒、71.9MiB/swap0、exit0）。28包含前述27，不重复累计。根独立源码复核与固定v255声明核对未见剩余具体P1/P2；这些证据仍不等于真实FFI、peer认证、集成wire/父层结算或READY实测，未启动native20。
