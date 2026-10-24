@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal
 
-from muli.managed_transaction import TransactionRecordV2
+from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_controller import ControllerBackend, TransactionController
 from muli.management_transaction import (
     ClockReading,
@@ -208,7 +208,9 @@ async def _drive(
     )
 
 
-async def drive_loop[RecordT: TransactionRecord | TransactionRecordV2](
+async def drive_loop[
+    RecordT: TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord
+](
     step: Callable[[], Awaitable[RecordT]],
     read: Callable[[], RecordT | None],
     observe_final: Callable[[RecordT], Awaitable[object]],

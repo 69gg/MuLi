@@ -18,9 +18,17 @@ from pathlib import Path
 from typing import Literal
 
 from muli.compatibility import assess_compatibility
-from muli.managed_controller import ManagedTransactionController
+from muli.managed_controller import (
+    ManagedTransactionController,
+    TransferTransactionController,
+    transfer_identity_matches,
+)
 from muli.managed_journal import read_snapshots
-from muli.managed_transaction import TransactionRecordV2, parse_record_v2
+from muli.managed_transaction import (
+    ProjectControllerTransferRecord,
+    TransactionRecordV2,
+    parse_managed_record,
+)
 from muli.management_helper import _root, drive_loop, helper_launch_arguments
 from muli.management_transaction import (
     ClockReading,
@@ -46,7 +54,7 @@ from muli.platforms.managed_deployment import (
     verify_current_slot,
 )
 from muli.platforms.managed_launcher import resolve_entry
-from muli.platforms.managed_probe import ManagedSystemdProbe
+from muli.platforms.managed_probe import ManagedSystemdProbe, transfer_origin_material
 from muli.process import run_process
 
 _ROLES: tuple[Role, ...] = ("base", "target")
@@ -54,12 +62,12 @@ _ROLES: tuple[Role, ...] = ("base", "target")
 
 @dataclass(frozen=True, slots=True)
 class _Entry:
-    record: TransactionRecordV2
+    record: TransactionRecordV2 | ProjectControllerTransferRecord
     anchor: DeploymentAnchor
     controller: SlotIdentity
 
 
-def managed_helper_unit_name(record: TransactionRecordV2) -> str:
+def managed_helper_unit_name(record: TransactionRecordV2 | ProjectControllerTransferRecord) -> str:
     identity = json.dumps(
         [2, record.identity.deployment, record.generation], separators=(",", ":")
     ).encode()
@@ -89,7 +97,7 @@ def _entry(root: Path) -> _Entry:
         anchor = store.read_anchor(plan.deployment)
         controller = store.read_slot(anchor.controller_slot)
         data = store.directory.read("state.json", anchor.journal.max_record_bytes)
-        record = parse_record_v2(data, limits=anchor.journal)
+        record = parse_managed_record(data, limits=anchor.journal)
         if (
             record.identity.deployment != anchor.digest
             or plan.installation != controller.digest
@@ -108,7 +116,9 @@ def _entry(root: Path) -> _Entry:
 
 def _record(
     control: JournalControl, anchor: DeploymentAnchor
-) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+) -> tuple[
+    TransactionRecordV2 | ProjectControllerTransferRecord, SlotIdentity, dict[Role, SlotIdentity]
+]:
     control.check()
     journal = control.journal
     if (
@@ -138,7 +148,7 @@ def _record(
         store.verify_anchor(anchor)
         controller = store.read_slot(anchor.controller_slot)
         record = control.read_current()
-        if not isinstance(record, TransactionRecordV2):
+        if not isinstance(record, (TransactionRecordV2, ProjectControllerTransferRecord)):
             raise TransactionError("managed_transaction_required")
         if (
             record.identity.deployment != anchor.digest
@@ -154,6 +164,8 @@ def _record(
                 raise TransactionError("managed_compatibility_changed")
             read_snapshots(journal, record, role)
             slots[role] = slot
+        if isinstance(record, ProjectControllerTransferRecord):
+            transfer_origin_material(journal, record, anchor)
         if not assess_compatibility(
             slots["base"].compatibility,
             slots["target"].compatibility,
@@ -233,7 +245,7 @@ async def run_managed_helper(
     probe: ManagedSystemdProbe | None = None,
     runner: CommandRunner = run_process,
     clock: Callable[[], ClockReading] = clock_reading,
-) -> TransactionRecordV2:
+) -> TransactionRecordV2 | ProjectControllerTransferRecord:
     entry = _entry(root)
     anchor, limits = entry.anchor, entry.anchor.helper
     observed = probe or ManagedSystemdProbe(
@@ -248,10 +260,17 @@ async def run_managed_helper(
             original, controller, slots = _record(control, anchor)
             if original != entry.record or controller != entry.controller:
                 raise TransactionError("managed_entry_changed")
+            previous = original
 
             async def verify_helper() -> None:
+                nonlocal previous
                 current, current_controller, _ = _record(control, anchor)
                 if current.generation != original.generation or current_controller != controller:
+                    raise TransactionError("transaction_changed")
+                if isinstance(previous, ProjectControllerTransferRecord) and (
+                    not isinstance(current, ProjectControllerTransferRecord)
+                    or not transfer_identity_matches(previous, current)
+                ):
                     raise TransactionError("transaction_changed")
                 verify_current_slot(controller)
                 snapshot = await observed.read_helper(
@@ -264,6 +283,7 @@ async def run_managed_helper(
                 verify_current_slot(controller)
                 if _record(control, anchor)[0] != current:
                     raise TransactionError("transaction_changed")
+                previous = current
 
             # Authenticate the real helper before creating even a backend
             # client; each subsequent drive step repeats this authentication.
@@ -279,15 +299,42 @@ async def run_managed_helper(
                 runner=runner,
                 operation_timeout=limits.operation_timeout,
             ) as backend:
+
+                def read() -> TransactionRecordV2 | ProjectControllerTransferRecord:
+                    return _record(control, anchor)[0]
+
+                if isinstance(original, ProjectControllerTransferRecord):
+                    transfer_driver = TransferTransactionController(
+                        control, backend, clock, operation_timeout=limits.operation_timeout
+                    )
+
+                    def read_transfer() -> ProjectControllerTransferRecord:
+                        record = read()
+                        if not isinstance(record, ProjectControllerTransferRecord):
+                            raise TransactionError("transaction_changed")
+                        return record
+
+                    return await drive_loop(
+                        transfer_driver.step,
+                        read_transfer,
+                        backend.observe,
+                        limits,
+                        clock,
+                        verify_helper,
+                    )
+
                 driver = ManagedTransactionController(
                     control, backend, clock, operation_timeout=limits.operation_timeout
                 )
 
-                def read() -> TransactionRecordV2:
-                    return _record(control, anchor)[0]
+                def read_ordinary() -> TransactionRecordV2:
+                    record = read()
+                    if not isinstance(record, TransactionRecordV2):
+                        raise TransactionError("transaction_changed")
+                    return record
 
                 return await drive_loop(
-                    driver.step, read, backend.observe, limits, clock, verify_helper
+                    driver.step, read_ordinary, backend.observe, limits, clock, verify_helper
                 )
 
 

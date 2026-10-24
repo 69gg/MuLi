@@ -189,14 +189,16 @@ def project_final(
     record = permit.journal.read_current()
     if record is None:
         return None
+    _check_identity(permit, identity, record)
+    # A pending record is an observation, never a final decision or permission.
+    # In particular the new probationary host keeps the old durable receipt.
+    if not record.resolved:
+        return None
     if isinstance(record, ProjectControllerTransferRecord):
-        if not record.resolved or isinstance(permit, BootPermit):
+        if isinstance(permit, BootPermit):
             raise ProjectionError("project_controller_transfer_unsupported")
         if permit.boot == record.identity.origin_boot:
             raise ProjectionError("projection_installation_changed")
-    _check_identity(permit, identity, record)
-    if not record.resolved:
-        return None
     # A lock-free read of a visible rename is not its durability receipt. The
     # resolved record must remain exact across the directory sync barrier.
     os.fsync(permit.journal.directory.fd)

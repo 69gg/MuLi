@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from muli.managed_journal import read_snapshots
+from muli.managed_journal import RoleSnapshots, _read_snapshots, read_snapshots
 from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_transaction import Role, TransactionJournal
 from muli.platforms.linux_transaction import (
@@ -23,7 +23,12 @@ from muli.platforms.linux_transaction import (
     _file_identity,
     _read_regular,
 )
-from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
+from muli.platforms.managed_deployment import (
+    DeploymentAnchor,
+    DeploymentStore,
+    SelectorValue,
+    SlotIdentity,
+)
 from muli.service import UserService
 
 _ROLES: tuple[Role, ...] = ("base", "target")
@@ -35,6 +40,7 @@ class ManagedProbeResult:
     process_roles: tuple[Role, ...]
     loaded_units: frozenset[str]
     disk_unit: str
+    origin_process: bool = False
 
     @property
     def unit_confirmed(self) -> bool:
@@ -97,6 +103,65 @@ def managed_unit_arguments(anchor: DeploymentAnchor, controller: SlotIdentity) -
     )
 
 
+def transfer_origin_material(
+    journal: TransactionJournal,
+    record: ProjectControllerTransferRecord,
+    anchor: DeploymentAnchor,
+) -> tuple[DeploymentAnchor, SlotIdentity, RoleSnapshots]:
+    """Authenticate both frozen authorities; origin is not a replacement role."""
+    with DeploymentStore(journal.directory.path, journal.limits) as store:
+        origin = store.read_anchor(record.origin.deployment)
+        controller = store.read_slot(origin.controller_slot)
+        bridge = store.read_slot(anchor.controller_slot)
+        if store.read_anchor(record.identity.deployment) != anchor:
+            raise ObservationError("managed_probe_identity_changed")
+        store.verify_anchor(anchor)
+        store.verify_anchor(origin)
+    if (
+        anchor.model_dump(exclude={"controller_slot", "managed_unit"})
+        != origin.model_dump(exclude={"controller_slot", "managed_unit"})
+        or anchor.controller_slot != record.base.installation
+        or origin.controller_slot == anchor.controller_slot
+        or record.origin.binding.unit != origin.managed_unit
+        or record.base.unit != anchor.managed_unit
+        or bridge.compatibility_digest != record.base.compatibility
+    ):
+        raise ObservationError("managed_transfer_origin_changed")
+    data = _read_snapshots(journal, record.generation, record.origin.binding, "origin")
+    origin_service = ManagedUserService(
+        Path(origin.config_path),
+        Path(origin.data_dir),
+        Path(origin.unit_path).parent,
+        controller=controller,
+        launcher=Path(origin.launcher.path),
+        journal_root=journal.directory.path,
+    )
+    target_service = ManagedUserService(
+        Path(anchor.config_path),
+        Path(anchor.data_dir),
+        Path(anchor.unit_path).parent,
+        controller=bridge,
+        launcher=Path(anchor.launcher.path),
+        journal_root=journal.directory.path,
+    )
+    if (
+        data.unit != origin_service.render().encode()
+        or data.selector
+        != SelectorValue(deployment=origin.digest, installation=bridge.digest).canonical()
+    ):
+        raise ObservationError("managed_transfer_origin_changed")
+    for role in _ROLES:
+        selected = read_snapshots(journal, record, role)
+        if (
+            selected.configuration != data.configuration
+            or selected.unit != target_service.render().encode()
+            or selected.selector
+            != SelectorValue(deployment=anchor.digest, installation=bridge.digest).canonical()
+        ):
+            raise ObservationError("managed_transfer_origin_changed")
+    return origin, controller, data
+
+
 class ManagedSystemdProbe(SystemdProbe):
     async def read_managed(
         self,
@@ -108,8 +173,6 @@ class ManagedSystemdProbe(SystemdProbe):
     ) -> ManagedProbeResult:
         if sys.platform != "linux":
             raise ObservationError("platform_unsupported")
-        if isinstance(record, ProjectControllerTransferRecord) and not record.resolved:
-            raise ObservationError("project_controller_transfer_unsupported")
         if (
             record.identity.deployment != anchor.digest
             or anchor.controller_slot != controller.digest
@@ -129,6 +192,13 @@ class ManagedSystemdProbe(SystemdProbe):
         unit_argv: dict[Role, tuple[str, ...]] = {}
         process_argv: dict[Role, tuple[str, ...]] = {}
         unit_data: dict[Role, bytes] = {}
+        origin_argv: tuple[str, ...] | None = None
+        origin_data: RoleSnapshots | None = None
+        if isinstance(record, ProjectControllerTransferRecord):
+            origin, origin_controller, origin_data = transfer_origin_material(
+                journal, record, anchor
+            )
+            origin_argv = managed_unit_arguments(origin, origin_controller)
         for role in _ROLES:
             binding, slot = record.binding(role), slots[role]
             if (
@@ -168,6 +238,13 @@ class ManagedSystemdProbe(SystemdProbe):
                     if before.argv == unit_argv[role] and before.executable == unit_argv[role][0]
                 )
                 if (
+                    origin_argv is not None
+                    and before.argv == origin_argv
+                    and before.executable == origin_argv[0]
+                ):
+                    assert isinstance(record, ProjectControllerTransferRecord)
+                    loaded = loaded | {record.origin.binding.unit.digest}
+                if (
                     before.name != service.unit
                     or before.load_state != "loaded"
                     or before.fragment != str(service.path.absolute())
@@ -190,6 +267,9 @@ class ManagedSystemdProbe(SystemdProbe):
                     ),
                     None,
                 )
+                if origin_data is not None and data == origin_data.unit:
+                    assert isinstance(record, ProjectControllerTransferRecord)
+                    disk = record.origin.binding.unit.digest
                 if disk is None:
                     raise ObservationError("unsupported_unit_file")
                 reconciling = (
@@ -207,6 +287,7 @@ class ManagedSystemdProbe(SystemdProbe):
                     raise ObservationError("managed_unit_not_loaded")
                 process = self._process(before.pid) if before.pid else None
                 matches: tuple[Role, ...] = ()
+                origin_process = False
                 if process is not None:
                     matches = tuple(
                         role
@@ -217,8 +298,15 @@ class ManagedSystemdProbe(SystemdProbe):
                             and record.binding(role).unit.digest == disk
                         )
                     )
+                    if isinstance(record, ProjectControllerTransferRecord):
+                        origin_process = (
+                            process.argv == managed_process_arguments(anchor, slots["base"])
+                            and process.executable == slots["base"].resolved_python.path
+                            and record.origin.binding.unit.digest == disk
+                            and before.invocation == record.identity.origin_boot
+                        )
                     if (
-                        not matches
+                        (not matches and not origin_process)
                         or process.uid != os.geteuid()
                         or process.cgroup != before.cgroup
                         or before.invocation == "0" * 32
@@ -235,7 +323,9 @@ class ManagedSystemdProbe(SystemdProbe):
                     raise ObservationError("process_identity_changed")
                 if loop.time() >= deadline:
                     raise TimeoutError
-                return ManagedProbeResult(ServiceSnapshot(after, process), matches, loaded, disk)
+                return ManagedProbeResult(
+                    ServiceSnapshot(after, process), matches, loaded, disk, origin_process
+                )
         except TimeoutError:
             raise
         except (OSError, UnicodeError):

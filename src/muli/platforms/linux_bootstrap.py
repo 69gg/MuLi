@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from muli.maintenance import BootPermit, MaintenanceError
-from muli.managed_transaction import TransactionRecordV2
+from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_transaction import FixedLock, TransactionJournal, TransactionRecord
 from muli.platforms.filesystem_identity import FilesystemError, verify_local_filesystems
 from muli.platforms.installation import HelperLimits, InstallationManifest, _read_file
@@ -152,7 +152,7 @@ async def open_boot_session(
         # The one journal selects the protocol before any legacy manifest read.
         # A rollback launched by the raw V1 unit has no --managed-root flag.
         current = journal.read_current()
-        if isinstance(current, TransactionRecordV2):
+        if isinstance(current, (TransactionRecordV2, ProjectControllerTransferRecord)):
             from muli.platforms.managed_bootstrap import admit_managed_boot
 
             return await admit_managed_boot(session, service, current, probe=managed_probe)

@@ -10,7 +10,7 @@ import asyncio
 from typing import Protocol
 
 from muli.managed_boot import _MUTABLE_RECORD_FIELDS, ManagedBootError, ManagedBootPermit
-from muli.managed_transaction import TransactionRecordV2
+from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_transaction import Role, TransactionJournal
 from muli.platforms.linux_bootstrap import BootSession, BootstrapError, _current_process
 from muli.platforms.linux_transaction import ObservationError, ProbeLimits
@@ -30,7 +30,7 @@ class ManagedServiceProbe(Protocol):
     async def read_managed(
         self,
         journal: TransactionJournal,
-        record: TransactionRecordV2,
+        record: TransactionRecordV2 | ProjectControllerTransferRecord,
         anchor: DeploymentAnchor,
         controller: SlotIdentity,
         slots: dict[Role, SlotIdentity],
@@ -40,7 +40,7 @@ class ManagedServiceProbe(Protocol):
 async def admit_managed_boot(
     session: BootSession,
     service: UserService,
-    record: TransactionRecordV2,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
     *,
     probe: ManagedServiceProbe | None = None,
 ) -> BootSession:
@@ -61,9 +61,21 @@ async def admit_managed_boot(
             journal.limits = anchor.journal
             fresh = journal.read_current()
             if (
-                not isinstance(fresh, TransactionRecordV2)
+                not isinstance(fresh, (TransactionRecordV2, ProjectControllerTransferRecord))
                 or fresh.generation != record.generation
                 or fresh.identity.deployment != anchor.digest
+                or (
+                    isinstance(record, TransactionRecordV2)
+                    and not isinstance(fresh, TransactionRecordV2)
+                )
+                or (
+                    isinstance(record, ProjectControllerTransferRecord)
+                    and (
+                        not isinstance(fresh, ProjectControllerTransferRecord)
+                        or fresh.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
+                        != record.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
+                    )
+                )
             ):
                 raise BootstrapError("managed_boot_record_changed")
             record = fresh

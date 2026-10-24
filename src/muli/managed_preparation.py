@@ -14,7 +14,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import TypeAdapter
 
@@ -23,7 +23,13 @@ from muli.config import Settings
 from muli.format_evidence import FormatEvidence, read_format_evidence
 from muli.maintenance import BootPermit, MaintenanceError
 from muli.managed_boot import ManagedBootPermit, _transfer_identity_matches
-from muli.managed_journal import RoleSnapshots, _read_snapshots, prepare_managed, read_snapshots
+from muli.managed_journal import (
+    RoleSnapshots,
+    _read_snapshots,
+    prepare_managed,
+    prepare_transfer_managed,
+    read_snapshots,
+)
 from muli.managed_runtime_binding import _legacy_installation
 from muli.managed_transaction import (
     ManagedAction,
@@ -31,6 +37,7 @@ from muli.managed_transaction import (
     RoleBinding,
     ServiceIdentityV2,
     TransactionRecordV2,
+    TransferOrigin,
     raw_snapshot,
 )
 from muli.management_projection import (
@@ -53,6 +60,7 @@ from muli.platforms.filesystem_identity import verify_local_filesystems
 from muli.platforms.installation import InstallationManifest
 from muli.platforms.linux_transaction import clock_reading
 from muli.platforms.managed_deployment import (
+    _LAUNCHER_BYTES,
     DeploymentAnchor,
     DeploymentStore,
     SelectorSnapshot,
@@ -74,6 +82,7 @@ _IDENTIFIER = TypeAdapter(Identifier)
 CurrentRecord = TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord
 Permit = BootPermit | ManagedBootPermit
 _ROLES: tuple[Role, ...] = ("base", "target")
+PrepareAction = ManagedAction | Literal["project_controller_transfer"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +94,7 @@ class LocalSlotPaths:
 
 @dataclass(frozen=True, slots=True)
 class PreparedManaged:
-    record: TransactionRecordV2 = field(repr=False)
+    record: TransactionRecordV2 | ProjectControllerTransferRecord = field(repr=False)
     anchor: DeploymentAnchor = field(repr=False)
 
 
@@ -157,7 +166,7 @@ class ManagedPreparation:
         self,
         permit: Permit,
         item: dict[str, Any] | None,
-        action: ManagedAction,
+        action: PrepareAction,
         candidate: LocalSlotPaths | None,
     ) -> _Source:
         journal, store = permit.journal, self.runtime.store
@@ -436,15 +445,27 @@ class ManagedPreparation:
         if listener_guard is not None:
             listener_guard(target)
         action = item.get("action")
-        if action not in ("adopt", "switch", "configure", "restart"):
+        if action not in ("adopt", "switch", "configure", "restart", "project_controller_transfer"):
             raise MaintenanceError("transaction_action_invalid")
-        action = cast(ManagedAction, action)
+        action = cast(PrepareAction, action)
         _IDENTIFIER.validate_python(item.get("id"), strict=True)
         if (candidate is not None) != (action in ("adopt", "switch")):
             raise MaintenanceError("managed_candidate_paths_required")
         permit = self._permit()
         self._paths(permit)
         source = self._source(permit, item, action, candidate)
+        transfer = action == "project_controller_transfer"
+        if transfer:
+            if (
+                not isinstance(permit, ManagedBootPermit)
+                or not isinstance(source.previous, TransactionRecordV2)
+                or source.previous.phase not in {"committed", "rolled_back"}
+                or source.anchor is None
+                or source.anchor.controller_slot == source.slot.digest
+            ):
+                raise MaintenanceError("managed_transfer_source_required")
+            if target != runtime.config.settings:
+                raise MaintenanceError("transfer_changes_configuration")
         if action == "adopt":
             assert candidate is not None
             selected = register_local_slot(
@@ -497,6 +518,17 @@ class ManagedPreparation:
         )
         generation = secrets.token_hex(16)
         assert source.plan is not None
+        if transfer and source.plan["status"] == "applying":
+            transaction = source.plan.get("transaction")
+            if (
+                not isinstance(transaction, dict)
+                or set(transaction) != {"generation"}
+                or not isinstance(transaction.get("generation"), str)
+                or len(transaction["generation"]) != 32
+                or any(value not in "0123456789abcdef" for value in transaction["generation"])
+            ):
+                raise MaintenanceError("managed_preparation_plan_changed")
+            generation = transaction["generation"]
         queued = {**source.plan, "status": "applying", "transaction": {"generation": generation}}
         journal = permit.journal
         from muli.candidate_lineage import check_plan_budget
@@ -504,6 +536,7 @@ class ManagedPreparation:
         check_plan_budget(queued, journal.limits.max_record_bytes)
         expected = source.previous
         expected_plan = source.plan
+        record: TransactionRecordV2 | ProjectControllerTransferRecord
         with journal.locked() as control:
 
             def gate() -> None:
@@ -582,6 +615,117 @@ class ManagedPreparation:
                 gate()
 
             validate()
+            if transfer:
+                assert source.anchor is not None and source.projected is not None
+                # Only the exact standalone launcher shipped with this bridge
+                # is accepted; a protocol declaration does not attest action support.
+                from muli.platforms import managed_launcher
+                from muli.platforms.managed_launcher import read_file
+
+                if managed_launcher.__file__ is None:
+                    raise MaintenanceError("launcher_unavailable")
+                origin_anchor = source.anchor
+                shipped_launcher = Path(managed_launcher.__file__).absolute()
+
+                def launcher_guard() -> None:
+                    retained, _ = read_file(Path(origin_anchor.launcher.path), _LAUNCHER_BYTES)
+                    shipped, _ = read_file(shipped_launcher, _LAUNCHER_BYTES)
+                    if retained != shipped:
+                        raise MaintenanceError("transfer_launcher_unsupported")
+
+                launcher_guard()
+                managed_unit = (
+                    ManagedUserService(
+                        permit.config_path,
+                        runtime.data_dir,
+                        Path(source.anchor.unit_path).parent,
+                        controller=source.slot,
+                        launcher=Path(source.anchor.launcher.path),
+                        journal_root=journal.directory.path,
+                    )
+                    .render()
+                    .encode()
+                )
+                limit = journal.limits.max_snapshot_bytes
+                anchor = DeploymentAnchor.model_validate(
+                    {
+                        **source.anchor.model_dump(),
+                        "controller_slot": source.slot.digest,
+                        "managed_unit": raw_snapshot(managed_unit, limit),
+                    }
+                )
+                target_data = RoleSnapshots(
+                    source.data.configuration,
+                    SelectorValue(
+                        deployment=anchor.digest, installation=source.slot.digest
+                    ).canonical(),
+                    managed_unit,
+                )
+                binding = RoleBinding(
+                    entry="managed",
+                    installation=source.slot.digest,
+                    compatibility=source.slot.compatibility_digest,
+                    configuration=_snapshot(target_data.configuration, limit),
+                    selector=_snapshot(cast(bytes, target_data.selector), limit),
+                    unit=anchor.managed_unit,
+                )
+                origin_binding = RoleBinding(
+                    entry="managed",
+                    installation=source.slot.digest,
+                    compatibility=source.slot.compatibility_digest,
+                    configuration=_snapshot(source.data.configuration, limit),
+                    selector=_snapshot(cast(bytes, source.data.selector), limit),
+                    unit=raw_snapshot(source.data.unit, limit),
+                )
+
+                def transfer_guard() -> None:
+                    validate()
+                    launcher_guard()
+
+                def publish_transfer() -> None:
+                    nonlocal expected_plan
+                    runtime.store.event(
+                        "management.preparing", queued, objects=[("management", queued)]
+                    )
+                    expected_plan = queued
+                    with DeploymentStore(journal.directory.path, journal.limits) as deployments:
+                        deployments.publish_slot(source.slot, guard=gate)
+                        deployments.publish_anchor(anchor, guard=gate)
+
+                record = prepare_transfer_managed(
+                    control,
+                    request_id=item["id"],
+                    identity=ServiceIdentityV2(
+                        deployment=anchor.digest,
+                        store_instance=source.evidence.store_instance,
+                        main_session=source.evidence.main_session,
+                        origin_boot=permit.boot,
+                    ),
+                    origin=TransferOrigin(
+                        deployment=source.anchor.digest,
+                        binding=origin_binding,
+                        projected=source.projected,
+                    ),
+                    base=binding,
+                    target=binding,
+                    origin_data=source.data,
+                    base_data=target_data,
+                    target_data=target_data,
+                    observed_format=source.evidence.state,
+                    manifest=source.slot.compatibility,
+                    deadline=deadline,
+                    writer=permit.lease,
+                    generation=generation,
+                    guard=transfer_guard,
+                    materials={
+                        f"slot-{source.slot.digest}.json": source.slot.canonical(),
+                        f"anchor-{anchor.digest}.json": anchor.canonical(),
+                    },
+                    publish=publish_transfer,
+                )
+                expected = record
+                transfer_guard()
+                return PreparedManaged(record, anchor)
             runtime.store.event("management.preparing", queued, objects=[("management", queued)])
             expected_plan = queued
             with DeploymentStore(journal.directory.path, journal.limits) as deployments:
@@ -661,7 +805,7 @@ class ManagedPreparation:
             record = prepare_managed(
                 control,
                 request_id=item["id"],
-                action=action,
+                action=cast(ManagedAction, action),
                 identity=ServiceIdentityV2(
                     deployment=anchor.digest,
                     store_instance=source.evidence.store_instance,

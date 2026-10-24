@@ -222,3 +222,40 @@ C 与另一位未参与实现的审查 agent 分别只读后审，均确认 acti
 随后按原 30 秒上限串行分批：前七文件 **298 passed**（pytest 1.86 秒；守卫 2.424 秒、89.1MiB、swap 0）；后端余下 33 节点分为 **6 / 10 / 10 / 7 passed**（守卫分别 11.673 / 10.362 / 11.378 / 5.778 秒，峰值不超过 67.7MiB、swap 0、均 exit 0）。加上独立慢节点，这些互不遗漏的分批覆盖原八文件全部 332 节点；298 已包含本片五项，不重复累计，也不将超时首轮算作完成。
 
 本片只准备纯状态推进，不开放新 prepare/发布入口或 controller/helper。Deadline 仍是原冻结值，纯函数没有实际 clock/probe，不能证明剩余期限、origin 已停、writer 已释放、原前缀可安全改写，亦不能证明未知 start 没有重发。后续仍须按第4节单独实现 origin 匹配/停止及固定前缀，改变共享 driver 的 aborted/resume 分支只能经新的行为授权；不得直接将 Transfer 喂给当前普通 controller。本片不运行服务、进程、账户、挂载或远端 CI。
+
+
+## 11. 正式准备与九快照发布候选（待根验证）
+
+2026-10-24。本轮准备侧复用 `ManagedPreparation.prepare` 的现有管理计划入口，仅增加独立 `project_controller_transfer` 分支；普通 `ManagedAction` 四动作和原 `prepare_managed` 不扩大。只接受当前真实 source slot 与旧 controller 不同的 managed bridge，禁止 candidate、配置改变、未 resolved/未精确投影/legacy 前代。旧 anchor/current binding/真实投影冻结为 origin，新 anchor 仅改 controller_slot 与对应的完整 unit render；保留原 launcher，且其实际 bytes 必须等于本次发行的 standalone launcher。
+
+`prepare_transfer_managed` 在原 controller lock 与同一 writer lease 下核实际前代、原六份前代快照、三组输入、完整记录和目录预算（含 slot/anchor、全部九快照及一个原子替换临时项）；预算成功前不 GC、不写新材料。后续发布新 anchor、origin/base/target 九快照，最后发布 state.json，live configuration/selector/unit 均不改。实际 current slot、格式/主身份/投影/计划/原文件及 launcher 在发布链复核，管理事件保留原 plan routing。
+
+根已在旧生产实收 `tests/test_project_controller_transfer_prepare.py` 首两项目标红：两项均进入正式 prepare 后被旧动作门 `transaction_action_invalid` 拒绝，非缺 API/import；pytest .45s，guard 1.025s、77.1MiB、swap 0、exit 1。候选新增目录预算与 candidate/同 controller 负控制及 state-last/hot-config 断言，尚待根统一运行。当前记录只说明准备发布候选，不表示 controller effects、retained launcher 的正式 recover exec、真实 systemd 换代或格式 2 迁移已验收。
+
+准备候选还保留 applying 计划已冻结的 generation；部分 snapshot 发布后丢返回可重试，但既有同代文件必须逐项 exact，不能删除后修复。正常重试不重生成代号；损坏孤立 snapshot 在 GC、事件和写入前拒绝。此边界新增真文件故障注入反例，仍待根运行。
+
+## 12. 执行接线候选与正式入口证据
+
+本轮先新增 `tests/test_project_controller_transfer_host.py` 三个正式入口用例。首轮根实收 3 failed（pytest .45s；守卫 1.113s、75.7MiB、swap 0、exit 1），其中只有 origin Runtime drain 在 `Maintenance.current` 的 unsupported 是目标红；另两项漏用既有临时文件系统可移植 fixture，在真正的旧 origin 投影验证提前失败，不能计作 recover/boot 的目标红。仅补齐同第三项相同的 `_boot_environment`，没有替换 permit、reader 或投影器后，根复验首两项 2 failed（pytest .35s；守卫 943ms、75.5MiB、swap 0、exit 1）：分别正式到达 recover 的旧 ordinary parser `invalid_record` 与 start_target acquire 的 `managed_boot_not_permitted`。
+
+授权执行候选保留 ordinary policy 的明确拒绝门，另设 typed Transfer policy/controller；原共享 driver 只扩类型上界，prepared/draining/stop_base 三阶段使用 origin，禁止 aborted、旧 origin resume 与 draining 退回 prepared。原 CAS、首因、deadline、rollback reserve、耐久 start intent 后只观察及固定一次回退不变。`managed_host` 按严格 reader 实际类型选择 driver，复用原 `drive_loop`，后者仅扩 import/类型上界。
+
+`transfer_origin_material` 共用原有有界文件读取：验证新旧 anchor 仅 controller_slot/managed_unit 不同，同一 bridge、九份 snapshot、canonical selector 与旧新 unit render。真实 origin 维护认证额外核旧 ManagedBootPermit、前代 position 对应的真实 receipt、旧 anchor/slot/unit/selector、实际热配置、主身份/格式、writer lease 与前后原始文件/记录；origin proof 标记 origin 和旧 deployment，不作为新角色健康证明。新角色 boot 只接受原 start_target/start_base/后续合法阶段，新 boot 不能复用 origin boot，旧 EntryPlan 仍只负责路由。origin 不能 activate/resume 或产生新角色许可。
+
+文件效果只在停止、空 cgroup 与原 writer lease 下执行。forward 仅 O→X→T；rollback 允许相应 O/X/T/Y 冻结前缀，逆 unit→selector→configuration 到新 anchor 的 base，不能回旧 controller，也不接受任意字段组合。loaded unit 与真实 exec 后 app argv 分开验证，变更后仍需原 CAS/耐久确认、reload 与 fresh loaded 属性。驱动、helper 与 backend 在同代跨 revision 再验 immutable 材料、已出现的 rollback nonce 与首因。
+
+根首次对上述三个正式入口实收 **3 passed**（pytest .40s；守卫 955ms、74.9MiB、swap 0、exit 0）。随后新三文件与旧 controller/backend 共五文件的尝试在 20 秒硬截止退出 143（CPU 20.029s、95.1MiB、swap 0），不能计通过；有限单跑定位到新 pre-start 负控期待错误层级不准确，实际 retained launcher 早以 `LaunchError(transaction_in_progress)` 拒绝。只修该负控的精确期待，origin_boot 参数仍要求正式 permit 的 `ManagedBootError(managed_boot_not_permitted)`，不绕过早门或改变生产。
+
+新 `test_project_controller_transfer_controller.py` 与 `test_project_controller_transfer_backend.py` 分别覆盖受控效果下正常/一次回退/丢 start、drain reserve、origin/前缀漂移，以及真实 Journal/文件/lease、真实 probe parser 配合 synthetic bus 的 forward/reverse CAS 与 reload。它们和 host 新负控尚待根实际运行；这份候选没有执行真实服务、解释器或 retained launcher 子进程，不将纯 fixture、三入口通过或静态审查宣称为真实 systemd 交接、launcher 离线 exec、格式 2 或 Project 正向验收。
+
+根随后实际收取新三文件 **30 passed**（pytest 3.36s；守卫 3.918s、89MiB、swap 0、exit 0），旧 ordinary controller 独立文件 **48 passed**（pytest .44s；守卫 931ms、60.8MiB、swap 0、exit 0）。旧 backend 整文件即使移除 complete-chain 节点仍在原 20 秒硬截止退出 143（CPU 20.110s、67.2MiB、swap 0，16 节点后终止、没有 assertion failure），不计为全文件通过、不提高期限。执行侧九生产文件及新三测试的导入/格式由根守卫排版并检查通过，后续新增入口仍待重新静态验证。
+
+完整宿主链继续只读发现两处不能由三入口绿替代的接缝，先补正式入口红：`test_transfer_formal_boot_dispatch_preserves_real_probe_and_writer_lease` 经 `open_boot_session` 在旧 ordinary 分派提前 `managed_record_required`；`test_transfer_probationary_runtime_final_projection_is_a_read_only_noop` 经真实新角色 Permit→Runtime→`RecoveryHost.project(strict=True)` 在 pending Transfer 的 unsupported 提前失败。根实收 **2 failed**（pytest .36s；守卫 937ms、76.3MiB、swap 0、exit 1），均为目标红。
+
+据此批准的窄补足仅让 Linux bootstrap 按严格 reader 的实际 Transfer 类型进入原 managed admission，复用实际 PID/unit/process probe、lease、EntryPlan 与正式 Permit；fresh read 不得同代降类型或改 immutable 材料，origin boot 仍由 Permit 拒绝。`project_final` 在原 lease、真实 connection 和 Store/main 身份门之后，对所有 pending 记录同样返回 None，不产生 DML、receipt、final proof 或权限；resolved Transfer 仍拒旧 BootPermit/origin boot，并沿原强 final binding。这两个红修补尚待根复验，不能把尚未运行的候选计绿。
+
+origin RPC 本片复用真实旧 permit、receipt 与前后文件/记录核验，未新增“首次见到 Transfer”的 host 内存账本。独立 primary nonce 在同代多次 RPC 间被外部原地改写的额外历史冻结不是这组测试已证明的能力；helper/driver/backend 的跨 revision 冻结门与正式 Journal 不可变推进仍保留。真实取消晚启动、真实 systemd stop/reload/boot、retained launcher 正式离线 exec 和真实恢复仍需各自验收，格式 2 与 Project gate 均未开放。
+
+根对上述两项正式入口红的修补及整合实际复验：新三文件 **32 passed**（pytest 3.66s；守卫 4.214s、90.3MiB、swap 0、exit 0）；旧 bootstrap/projection 三文件 **102 passed**（pytest .97s；守卫 1.526s、93.5MiB、swap 0、exit 0）。全 148 生产源 strict/no-incremental 通过（守卫 8.789s、417.9MiB、swap 0、exit 0）。旧 backend 仅缩窄运行 hash/foreign-stop/deadline 关键集合，**12 passed / 22 deselected**（pytest 2.62s；守卫 3.139s、66.2MiB、swap 0、exit 0），不将未重跑的重哈希大集合计作完成。32 已包含先前三入口及两项正式入口，不与历史 30 相加；这些均为根执行的离线回归与类型检查，仍不开放格式 2 或 Project 正向 gate，也不替代真实宿主交接验收。
+
+准备侧三文件最终 **68 passed**（pytest 2.24s；守卫 2.795s、96.6MiB、swap 0、exit 0）。全仓Ruff与390份Python格式最终均通过。另一位未参与本片实现的Sol独立只读审查14份生产文件与4份新增测试，未发现确切新P1/P2；确认origin认证、阶段/方向前缀、lease及空cgroup、九快照总预算和state最后发布均有实际接线。审查不计作额外执行验收，本片保留CURRENT=1和实际格式迁移拒绝门，只保存为后续迁移前置检查点。

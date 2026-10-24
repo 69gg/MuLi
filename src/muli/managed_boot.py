@@ -48,6 +48,7 @@ from muli.platforms.managed_deployment import (
     verify_slot_files,
 )
 from muli.platforms.managed_launcher import fingerprint
+from muli.platforms.managed_probe import transfer_origin_material
 from muli.platforms.transaction_files import ConfigurationFile, _open_directory
 from muli.store import Store
 from muli.store_schema import ExistingStoreError
@@ -231,7 +232,7 @@ class ManagedBootPermit:
             raise ManagedBootError("managed_record_changed")
         record = parse_managed_record(raw, limits=self.journal.limits)
         if isinstance(record, ProjectControllerTransferRecord) and (
-            not record.resolved or self.boot == record.identity.origin_boot
+            self.boot == record.identity.origin_boot
         ):
             raise ManagedBootError("managed_boot_not_permitted")
         role: Role | None = (
@@ -278,6 +279,8 @@ class ManagedBootPermit:
             binding.entry == "managed" and binding.unit != anchor.managed_unit
         ):
             raise ManagedBootError("managed_binding_changed")
+        if isinstance(record, ProjectControllerTransferRecord):
+            transfer_origin_material(self.journal, record, anchor)
         verify_current_slot(selected)
         plan = self._plan
         argv = (

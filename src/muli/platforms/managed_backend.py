@@ -23,9 +23,16 @@ from muli.managed_controller import (
     ManagedServiceObservation,
     _files,
     _prefixes,
+    transfer_identity_matches,
 )
 from muli.managed_journal import Component, RoleSnapshots, read_snapshots
-from muli.managed_transaction import HealthProofV2, TransactionRecordV2, format_digest
+from muli.managed_transaction import (
+    HealthProofV2,
+    ProjectControllerTransferRecord,
+    RoleBinding,
+    TransactionRecordV2,
+    format_digest,
+)
 from muli.management_transaction import (
     ClockReading,
     FixedLock,
@@ -59,11 +66,13 @@ from muli.platforms.managed_probe import (
     ManagedProbeResult,
     ManagedSystemdProbe,
     ManagedUserService,
+    transfer_origin_material,
 )
 from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSnapshot
 from muli.process import run_process
 
 _ROLES: tuple[Role, ...] = ("base", "target")
+ManagedRecord = TransactionRecordV2 | ProjectControllerTransferRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +135,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         )
         self.cgroups = CgroupObservation(cgroup_root, self.probe.limits.file_bytes)
         self._activation_attempt: tuple[str, str, Role | None] | None = None
+        self._transfer_record: ProjectControllerTransferRecord | None = None
         self.client = httpx.AsyncClient(
             transport=transport,
             trust_env=False,
@@ -141,10 +151,15 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     async def __aexit__(self, *args: object) -> None:
         await self.client.aclose()
 
-    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+    def _check(self, record: ManagedRecord, role: Role | None = None) -> None:
         self.control.check()
         if self.control.read_current() != record:
             raise TransactionError("stale_revision")
+        if self._transfer_record is not None and (
+            not isinstance(record, ProjectControllerTransferRecord)
+            or not transfer_identity_matches(self._transfer_record, record)
+        ):
+            raise ObservationError("managed_transfer_origin_changed")
         if record.identity.deployment != self.anchor.digest:
             raise ObservationError("managed_deployment_changed")
         with DeploymentStore(Path(self.anchor.journal_root), self.journal.limits) as store:
@@ -164,12 +179,15 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                     or store.read_slot(binding.installation) != slot
                 ):
                     raise ObservationError("managed_slot_changed")
+        if isinstance(record, ProjectControllerTransferRecord):
+            transfer_origin_material(self.journal, record, self.anchor)
+            self._transfer_record = record
         # verify_anchor authenticated the controller in this synchronous check.
         # Equal frozen installations share that proof only until this call returns.
         if role is not None and self.slots[role] != self.controller_slot:
             verify_slot_files(self.slots[role])
 
-    def _effect_guard(self, record: TransactionRecordV2, role: Role | None) -> None:
+    def _effect_guard(self, record: ManagedRecord, role: Role | None) -> None:
         self._check(record, role)
         remaining = record.deadline.remaining(self.clock())
         if record.phase in {"activating", "verifying"}:
@@ -177,9 +195,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         if remaining <= 0:
             raise TimeoutError
 
-    def _guard(
-        self, record: TransactionRecordV2, role: Role, lease: FixedLock, cgroup: str
-    ) -> None:
+    def _guard(self, record: ManagedRecord, role: Role, lease: FixedLock, cgroup: str) -> None:
         self._effect_guard(record, role)
         lease.check()
         if not self.cgroups.empty(cgroup):
@@ -195,7 +211,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         )
 
     @staticmethod
-    def _role(record: TransactionRecordV2, boot: str) -> Role | None:
+    def _role(record: ManagedRecord, boot: str) -> Role | None:
         if boot == record.identity.origin_boot:
             return None
         if (record.phase, record.intent) == ("rolling_back", "stop_target"):
@@ -203,13 +219,13 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         return "base" if record.phase in {"rolling_back", "rolled_back"} else "target"
 
     @staticmethod
-    def _stop_only(record: TransactionRecordV2) -> bool:
+    def _stop_only(record: ManagedRecord) -> bool:
         return (record.phase, record.intent) in {
             ("activating", "stop_base"),
             ("rolling_back", "stop_target"),
         }
 
-    def _desired(self, record: TransactionRecordV2, role: Role) -> RoleSnapshots:
+    def _desired(self, record: ManagedRecord, role: Role) -> RoleSnapshots:
         data = read_snapshots(self.journal, record, role)
         if data.selector is not None:
             value = SelectorValue.model_validate_json(data.selector)
@@ -221,7 +237,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 raise ObservationError("unsupported_managed_selector")
         return data
 
-    async def _probe(self, record: TransactionRecordV2) -> ManagedProbeResult:
+    async def _probe(self, record: ManagedRecord) -> ManagedProbeResult:
         self._check(record)
         result = await self.probe.read_managed(
             self.journal, record, self.anchor, self.controller_slot, self.slots
@@ -242,28 +258,40 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             return _DiskBinding(configuration.read(), selector.read(), unit.read())
 
     def _owned(
-        self, record: TransactionRecordV2, result: ManagedProbeResult, disk: _DiskBinding
+        self, record: ManagedRecord, result: ManagedProbeResult, disk: _DiskBinding
     ) -> Role | None:
         snapshot = result.service
         role = self._role(record, snapshot.unit.invocation)
         selected: Role = "base" if role is None else role
+        binding = self._binding(record, role)
+        process_owned = selected in result.process_roles
+        if isinstance(record, ProjectControllerTransferRecord) and role is None:
+            process_owned = result.origin_process
         if (
             snapshot.process is None
-            or selected not in result.process_roles
-            or disk.digests != _files(record.binding(selected))
+            or not process_owned
+            or disk.digests != _files(binding)
             or not result.unit_confirmed
         ):
             raise ObservationError("foreign_transaction_process")
         return role
 
+    @staticmethod
+    def _binding(record: ManagedRecord, role: Role | None) -> RoleBinding:
+        if isinstance(record, ProjectControllerTransferRecord) and role is None:
+            return record.origin.binding
+        return record.binding("base" if role is None else role)
+
     async def _request(
-        self, record: TransactionRecordV2, boot: str, action: str
+        self, record: ManagedRecord, boot: str, action: str
     ) -> dict[str, Any] | None:
         role = self._role(record, boot)
         challenge = record.rollback_challenge if role == "base" else record.challenge
         if challenge is None:
             raise ObservationError("transaction_challenge_missing")
         data = self._desired(record, "target" if role == "target" else "base")
+        if isinstance(record, ProjectControllerTransferRecord) and role is None:
+            _, _, data = transfer_origin_material(self.journal, record, self.anchor)
         return await transaction_request(
             self.client,
             url=transaction_url(data.configuration, action),
@@ -275,22 +303,25 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             max_bytes=self.journal.limits.max_record_bytes,
         )
 
-    def _proof(
-        self, record: TransactionRecordV2, boot: str, value: dict[str, Any]
-    ) -> HealthProofV2:
+    def _proof(self, record: ManagedRecord, boot: str, value: dict[str, Any]) -> HealthProofV2:
         try:
             proof = HealthProofV2.model_validate(value)
         except ValueError:
             raise ObservationError("invalid_transaction_proof") from None
         role = self._role(record, boot)
-        binding = record.binding("base" if role is None else role)
+        binding = self._binding(record, role)
         challenge = record.rollback_challenge if role == "base" else record.challenge
         if (
             proof.generation != record.generation
             or proof.boot != boot
             or proof.role != ("origin" if role is None else role)
             or proof.challenge != challenge
-            or proof.deployment != record.identity.deployment
+            or proof.deployment
+            != (
+                record.origin.deployment
+                if isinstance(record, ProjectControllerTransferRecord) and role is None
+                else record.identity.deployment
+            )
             or proof.installation != binding.installation
             or proof.compatibility != binding.compatibility
             or (proof.configuration, proof.selector, proof.unit) != _files(binding)
@@ -304,7 +335,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
 
     def _confirm(
         self,
-        record: TransactionRecordV2,
+        record: ManagedRecord,
         role: Role,
         lease: FixedLock,
         cgroup: str,
@@ -338,7 +369,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         guard()
         return self._disk()
 
-    async def observe(self, record: TransactionRecordV2) -> ManagedServiceObservation:
+    async def observe(self, record: ManagedRecord) -> ManagedServiceObservation:
         before, disk = await self._probe(record), self._disk()
         boot = before.service.unit.invocation if before.service.process is not None else None
         process: ManagedProcessIdentity | None = None
@@ -346,10 +377,11 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         if boot is not None:
             role = self._owned(record, before, disk)
             selected: Role = "base" if role is None else role
+            binding = self._binding(record, role)
             process = ManagedProcessIdentity(
-                record.binding(selected).entry,
-                record.binding(selected).installation,
-                record.binding(selected).compatibility,
+                binding.entry,
+                binding.installation,
+                binding.compatibility,
             )
             if not self._stop_only(record):
                 self._check(record, selected)
@@ -455,9 +487,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         if result.get("exit_code") != 0:
             raise ObservationError("transaction_unit_command_failed")
 
-    async def _host_command(
-        self, record: TransactionRecordV2, action: str, role: Role | None
-    ) -> None:
+    async def _host_command(self, record: ManagedRecord, action: str, role: Role | None) -> None:
         if (
             action == "drain"
             and (record.phase != "draining" or role is not None)
@@ -469,6 +499,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 or record.activation == "blocked"
             )
         ):
+            raise ObservationError("transaction_effect_not_permitted")
+        if isinstance(record, ProjectControllerTransferRecord) and action == "resume":
             raise ObservationError("transaction_effect_not_permitted")
         before, disk = await self._probe(record), self._disk()
         boot = before.service.unit.invocation
@@ -505,16 +537,16 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         ):
             raise ObservationError("invalid_transaction_reply")
 
-    async def drain(self, record: TransactionRecordV2) -> None:
+    async def drain(self, record: ManagedRecord) -> None:
         await self._host_command(record, "drain", None)
 
-    async def resume(self, record: TransactionRecordV2) -> None:
+    async def resume(self, record: ManagedRecord) -> None:
         await self._host_command(record, "resume", None)
 
-    async def activate(self, record: TransactionRecordV2, role: Role) -> None:
+    async def activate(self, record: ManagedRecord, role: Role) -> None:
         await self._host_command(record, "activate", role)
 
-    async def stop(self, record: TransactionRecordV2, role: Role) -> None:
+    async def stop(self, record: ManagedRecord, role: Role) -> None:
         if (record.phase, record.intent, role) not in {
             ("activating", "stop_base", "base"),
             ("rolling_back", "stop_target", "base"),
@@ -544,7 +576,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self._effect_guard(record, None)
         await self._command("stop")
 
-    async def install(self, record: TransactionRecordV2, role: Role, data: RoleSnapshots) -> None:
+    async def install(self, record: ManagedRecord, role: Role, data: RoleSnapshots) -> None:
         if (record.phase, record.intent, role) not in {
             ("activating", "install_target", "target"),
             ("rolling_back", "restore_base", "base"),
@@ -617,7 +649,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 raise ObservationError("managed_unit_not_loaded")
             self._confirm(record, role, lease, cgroup)
 
-    async def start(self, record: TransactionRecordV2, role: Role) -> None:
+    async def start(self, record: ManagedRecord, role: Role) -> None:
         if (record.phase, record.intent, role) not in {
             ("activating", "start_target", "target"),
             ("rolling_back", "start_base", "base"),

@@ -11,7 +11,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
 
-from muli.managed_transaction import HealthProofV2, TransactionRecordV2
+from muli.managed_transaction import (
+    HealthProofV2,
+    ProjectControllerTransferRecord,
+    TransactionRecordV2,
+)
 from muli.management_transaction import (
     Activation,
     ClockReading,
@@ -120,7 +124,7 @@ class _ControllerPolicy[RecordT, ObservationT, ProofT](Protocol):
 
 
 class _Controller[
-    RecordT: TransactionRecord | TransactionRecordV2,
+    RecordT: TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord,
     ObservationT: _ServiceState,
     ProofT: HealthProof | HealthProofV2,
 ]:

@@ -14,10 +14,12 @@ from typing import Literal, Protocol
 from muli.managed_journal import RoleSnapshots, read_snapshots
 from muli.managed_transaction import (
     HealthProofV2,
+    ProjectControllerTransferRecord,
     RoleBinding,
     TransactionRecordV2,
     TransitionV2,
     advance_record_v2,
+    advance_transfer_record,
 )
 from muli.management_controller import _Controller, _ControllerEffects
 from muli.management_transaction import (
@@ -107,7 +109,15 @@ def _process(binding: RoleBinding) -> ManagedProcessIdentity:
     return ManagedProcessIdentity(binding.entry, binding.installation, binding.compatibility)
 
 
-def _prefixes(record: TransactionRecordV2) -> set[tuple[str, str | None, str]]:
+def _prefixes(
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
+) -> set[tuple[str, str | None, str]]:
+    if isinstance(record, ProjectControllerTransferRecord):
+        origin, target = _files(record.origin.binding), _files(record.target)
+        forward = {origin, (origin[0], target[1], origin[2]), target}
+        if record.phase == "rolling_back":
+            return forward | {(origin[0], origin[1], target[2])}
+        return forward
     base, target = _files(record.base), _files(record.target)
     return {
         base,
@@ -259,3 +269,235 @@ class ManagedTransactionController(
             _ManagedPolicy(control, backend),
             operation_timeout=operation_timeout,
         )
+
+
+class TransferControllerBackend(
+    _ControllerEffects[ProjectControllerTransferRecord, ManagedServiceObservation], Protocol
+):
+    async def install(
+        self, record: ProjectControllerTransferRecord, role: Role, data: RoleSnapshots
+    ) -> None: ...
+
+
+def transfer_identity_matches(
+    original: ProjectControllerTransferRecord, current: ProjectControllerTransferRecord
+) -> bool:
+    mutable = {
+        "revision",
+        "phase",
+        "intent",
+        "health",
+        "activation",
+        "code",
+        "failure_code",
+        "rollback_challenge",
+        "rollback_attempted",
+    }
+    return (
+        original.model_dump(exclude=mutable) == current.model_dump(exclude=mutable)
+        and current.revision >= original.revision
+        and (not original.rollback_attempted or current.rollback_attempted)
+        and (
+            original.rollback_challenge is None
+            or original.rollback_challenge == current.rollback_challenge
+        )
+        and (original.failure_code is None or original.failure_code == current.failure_code)
+    )
+
+
+class _TransferPolicy:
+    def __init__(self, control: JournalControl, backend: TransferControllerBackend) -> None:
+        self.control, self.backend = control, backend
+        self._previous: ProjectControllerTransferRecord | None = None
+
+    def read(self) -> ProjectControllerTransferRecord | None:
+        record = self.control.read_current()
+        if record is not None and not isinstance(record, ProjectControllerTransferRecord):
+            raise TransactionError("transfer_transaction_required")
+        if record is not None:
+            if self._previous is not None and not transfer_identity_matches(self._previous, record):
+                raise TransactionError("transaction_changed")
+            self._previous = record
+        return record
+
+    def snapshots(self, record: ProjectControllerTransferRecord) -> None:
+        from muli.managed_journal import _read_snapshots
+
+        _read_snapshots(self.control.journal, record.generation, record.origin.binding, "origin")
+        read_snapshots(self.control.journal, record, "base")
+        read_snapshots(self.control.journal, record, "target")
+
+    def move(
+        self,
+        record: ProjectControllerTransferRecord,
+        *,
+        phase: Phase,
+        intent: Intent,
+        activation: Activation,
+        code: Code | None,
+        proof: HealthProofV2 | None,
+    ) -> ProjectControllerTransferRecord:
+        current = self.read()
+        if current is None:
+            raise TransactionError("transfer_transaction_required")
+        return self.control._write(
+            advance_transfer_record(
+                current,
+                record.position,
+                TransitionV2(
+                    phase=phase, intent=intent, activation=activation, code=code, proof=proof
+                ),
+            )
+        )
+
+    def origin_matches(
+        self, record: ProjectControllerTransferRecord, observation: ManagedServiceObservation
+    ) -> bool:
+        return (
+            (observation.configuration, observation.selector, observation.unit)
+            == _files(record.origin.binding)
+            and observation.process == _process(record.origin.binding)
+            and observation.boot == record.identity.origin_boot
+        )
+
+    def allowed(
+        self, record: ProjectControllerTransferRecord, observation: ManagedServiceObservation
+    ) -> bool:
+        actual = observation.configuration, observation.selector, observation.unit
+        if observation.boot == record.identity.origin_boot:
+            return (
+                (
+                    record.phase in {"prepared", "draining"}
+                    or (record.phase, record.intent)
+                    in {("activating", "stop_base"), ("rolling_back", "stop_target")}
+                )
+                and self.origin_matches(record, observation)
+                and observation.service in {"running", "stopping"}
+            )
+        complete = actual == _files(record.base)
+        if observation.service in {"running", "starting", "stopping"}:
+            return complete and (
+                observation.process == _process(record.base)
+                or observation.service != "running"
+                and observation.process is None
+            )
+        if observation.service != "stopped" or observation.process is not None:
+            return False
+        if complete:
+            return True
+        if not observation.writer_free:
+            return False
+        if (record.phase, record.intent) == ("activating", "stop_base"):
+            return actual == _files(record.origin.binding)
+        return (record.phase, record.intent) in {
+            ("activating", "install_target"),
+            ("rolling_back", "restore_base"),
+        } and actual in _prefixes(record)
+
+    def restore_prefix_observed(
+        self, record: ProjectControllerTransferRecord, observation: ManagedServiceObservation
+    ) -> bool:
+        return (
+            (record.phase, record.intent) == ("rolling_back", "stop_target")
+            and observation.service == "stopped"
+            and observation.writer_free
+            and observation.process is None
+            and (observation.configuration, observation.selector, observation.unit)
+            in _prefixes(record)
+        )
+
+    def matches(
+        self,
+        record: ProjectControllerTransferRecord,
+        observation: ManagedServiceObservation,
+        role: Role,
+    ) -> bool:
+        return (observation.configuration, observation.selector, observation.unit) == _files(
+            record.binding(role)
+        ) and (
+            observation.process is None
+            if observation.service == "stopped"
+            else observation.process == _process(record.binding(role))
+        )
+
+    def installed(
+        self,
+        record: ProjectControllerTransferRecord,
+        observation: ManagedServiceObservation,
+        role: Role,
+    ) -> bool:
+        return (
+            observation.service == "stopped"
+            and observation.writer_free
+            and self.matches(record, observation, role)
+            and observation.confirmation
+            == BindingConfirmation(
+                record.position,
+                role,
+                *_files(record.binding(role)),
+                loaded_unit=record.binding(role).unit.digest,
+            )
+        )
+
+    async def install(self, record: ProjectControllerTransferRecord, role: Role) -> None:
+        await self.backend.install(record, role, read_snapshots(self.control.journal, record, role))
+
+    def proof(self, observation: ManagedServiceObservation) -> HealthProofV2 | None:
+        return observation.health
+
+    def accepts(
+        self,
+        record: ProjectControllerTransferRecord,
+        proof: HealthProofV2,
+        role: Role,
+        *,
+        released: bool = False,
+    ) -> bool:
+        return record.accepts(proof, role, released=released)
+
+
+class TransferTransactionController(
+    _Controller[ProjectControllerTransferRecord, ManagedServiceObservation, HealthProofV2]
+):
+    def __init__(
+        self,
+        control: JournalControl,
+        backend: TransferControllerBackend,
+        clock: Callable[[], ClockReading],
+        *,
+        operation_timeout: float = 5.0,
+    ) -> None:
+        self.backend = backend
+        self.transfer_policy = _TransferPolicy(control, backend)
+        super().__init__(
+            control, backend, clock, self.transfer_policy, operation_timeout=operation_timeout
+        )
+
+    async def _step(
+        self,
+        record: ProjectControllerTransferRecord,
+        observation: ManagedServiceObservation,
+        remaining: float,
+    ) -> ProjectControllerTransferRecord:
+        if record.phase in {"prepared", "draining"}:
+            if observation.service != "running" or not self.transfer_policy.origin_matches(
+                record, observation
+            ):
+                return self._failure(record, "foreign_state")
+            if remaining <= record.deadline.rollback_reserve:
+                return self._move(record, phase="recovery_required", code="drain_timeout")
+            if record.phase == "prepared":
+                return self._move(record, phase="draining")
+            if observation.drained:
+                return self._move(record, phase="activating", intent="stop_base")
+            await self._call(record, lambda: self._effects.drain(record))
+            return record
+        if (record.phase, record.intent) == ("activating", "stop_base"):
+            if observation.service == "running":
+                if not self.transfer_policy.origin_matches(record, observation):
+                    return self._failure(record, "foreign_state")
+                await self._call(record, lambda: self._effects.stop(record, "base"))
+            elif observation.service == "stopped" and observation.writer_free:
+                return self._move(record, phase="activating", intent="install_target")
+            return record
+        return await super()._step(record, observation, remaining)

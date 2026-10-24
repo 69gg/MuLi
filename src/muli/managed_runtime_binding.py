@@ -12,11 +12,12 @@ from muli.format_evidence import read_format_evidence
 from muli.managed_boot import ManagedBootPermit, _transfer_identity_matches
 from muli.managed_transaction import (
     ProjectControllerTransferRecord,
+    RoleBinding,
     TransactionRecordV2,
     raw_snapshot,
 )
-from muli.management_projection import _check_lease, _connection_identity
-from muli.management_transaction import Role, _snapshot
+from muli.management_projection import _check_lease, _connection_identity, read_projection
+from muli.management_transaction import ProjectionReceipt, Role, _snapshot
 from muli.platforms.filesystem_identity import verify_local_filesystems
 from muli.platforms.installation import InstallationManifest
 from muli.platforms.managed_deployment import (
@@ -26,6 +27,7 @@ from muli.platforms.managed_deployment import (
     SlotIdentity,
     verify_current_slot,
 )
+from muli.platforms.managed_probe import transfer_origin_material
 from muli.platforms.transaction_files import ConfigurationFile
 from muli.service import UserService
 from muli.store import Store
@@ -63,8 +65,7 @@ def _selected_role(
     role: Role | None,
 ) -> Role:
     if isinstance(record, ProjectControllerTransferRecord) and (
-        not record.resolved
-        or role is None
+        role is None
         or permit.boot == record.identity.origin_boot
         or not isinstance(permit, ManagedBootPermit)
     ):
@@ -89,11 +90,10 @@ def _selected_role(
 
 def _files(
     permit: BootPermit | ManagedBootPermit,
-    record: TransactionRecordV2 | ProjectControllerTransferRecord,
-    role: Role,
+    binding: RoleBinding,
+    deployment: str,
     anchor: DeploymentAnchor,
 ) -> None:
-    binding = record.binding(role)
     limit = permit.journal.limits.max_snapshot_bytes
     with (
         ConfigurationFile(Path(anchor.config_path), limit) as configuration,
@@ -108,12 +108,54 @@ def _files(
             or (
                 actual_selector is not None
                 and (
-                    actual_selector.value.deployment != record.identity.deployment
+                    actual_selector.value.deployment != deployment
                     or actual_selector.value.installation != binding.installation
                 )
             )
         ):
             raise RuntimeBindingError("runtime_binding_files_changed")
+
+
+def _origin_permit(
+    permit: BootPermit | ManagedBootPermit,
+    store: Store,
+    record: ProjectControllerTransferRecord,
+    anchor: DeploymentAnchor,
+) -> DeploymentAnchor:
+    origin, _, _ = transfer_origin_material(permit.journal, record, anchor)
+    if not isinstance(permit, ManagedBootPermit):
+        raise RuntimeBindingError("runtime_binding_role_changed")
+    previous = permit.record
+    if (
+        permit.probation
+        or not previous.resolved
+        or permit.boot != record.identity.origin_boot
+        or permit.anchor != origin
+        or permit.installation != record.origin.binding.installation
+        or previous.identity.deployment != origin.digest
+        or previous.identity.store_instance != record.identity.store_instance
+        or previous.identity.main_session != record.identity.main_session
+        or previous.position.generation == record.generation
+        or record.origin.projected
+        != ProjectionReceipt(
+            **previous.position.model_dump(), store_instance=previous.identity.store_instance
+        )
+        or read_projection(store) != record.origin.projected
+    ):
+        raise RuntimeBindingError("runtime_binding_origin_changed")
+    prior = previous.binding(permit.role)
+    current = record.origin.binding
+    # The source may have an authorized hot configuration. Its actual bytes
+    # are frozen in origin; slot/selector/unit must still be this real permit.
+    if (
+        prior.entry != current.entry
+        or prior.installation != current.installation
+        or prior.compatibility != current.compatibility
+        or prior.selector != current.selector
+        or prior.unit != current.unit
+    ):
+        raise RuntimeBindingError("runtime_binding_origin_changed")
+    return origin
 
 
 def _legacy_installation(
@@ -160,15 +202,35 @@ def verify_running_binding(
     """
     try:
         _current_record(permit, record)
-        selected_role = _selected_role(permit, record, role)
-        binding = record.binding(selected_role)
+        origin = isinstance(record, ProjectControllerTransferRecord) and role is None
+        selected_role = None if origin else _selected_role(permit, record, role)
+        if origin:
+            assert isinstance(record, ProjectControllerTransferRecord)
+            if permit.boot != record.identity.origin_boot or (
+                record.phase not in {"prepared", "draining"}
+                and (record.phase, record.intent)
+                not in {("activating", "stop_base"), ("rolling_back", "stop_target")}
+            ):
+                raise RuntimeBindingError("runtime_binding_role_changed")
+            binding = record.origin.binding
+        else:
+            assert selected_role is not None
+            binding = record.binding(selected_role)
         journal = permit.journal
         with DeploymentStore(journal.directory.path, journal.limits) as deployments:
             anchor = deployments.read_anchor(record.identity.deployment)
+            if origin:
+                assert isinstance(record, ProjectControllerTransferRecord)
+                anchor = _origin_permit(permit, store, record, anchor)
             deployments.verify_anchor(anchor)
             slot = deployments.read_slot(binding.installation)
         if (
-            anchor.digest != record.identity.deployment
+            anchor.digest
+            != (
+                record.origin.deployment
+                if origin and isinstance(record, ProjectControllerTransferRecord)
+                else record.identity.deployment
+            )
             or slot.digest != binding.installation
             or slot.compatibility_digest != binding.compatibility
             or anchor.config_path != str(permit.config_path)
@@ -193,7 +255,7 @@ def verify_running_binding(
                 )
             ):
                 raise RuntimeBindingError("runtime_binding_installation_changed")
-            if not _transfer_identity_matches(permit.record, record):
+            if not origin and not _transfer_identity_matches(permit.record, record):
                 raise RuntimeBindingError("runtime_binding_record_changed")
         else:
             if isinstance(record, ProjectControllerTransferRecord) or binding.entry != "legacy":
@@ -208,7 +270,7 @@ def verify_running_binding(
                 Path(anchor.unit_path).parent,
             )
         )
-        _files(permit, record, selected_role, anchor)
+        _files(permit, binding, anchor.digest, anchor)
         evidence = read_format_evidence(store.db)
         identity = _connection_identity(store)
         if (
@@ -223,7 +285,7 @@ def verify_running_binding(
             ).format_compatible
         ):
             raise RuntimeBindingError("runtime_binding_format_changed")
-        _files(permit, record, selected_role, anchor)
+        _files(permit, binding, anchor.digest, anchor)
         permit.check_paths(Path(anchor.config_path), journal.database)
         _current_record(permit, record)
     except RuntimeBindingError:

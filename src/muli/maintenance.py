@@ -314,10 +314,9 @@ class Maintenance:
     def current(self) -> CurrentRecord | None:
         record = self.permit.journal.read_current() if self.permit else None
         if isinstance(record, ProjectControllerTransferRecord) and (
-            not record.resolved
-            or isinstance(self.permit, BootPermit)
+            isinstance(self.permit, BootPermit)
             or self.permit is None
-            or self.permit.boot == record.identity.origin_boot
+            or (record.resolved and self.permit.boot == record.identity.origin_boot)
         ):
             raise MaintenanceError("project_controller_transfer_unsupported")
         return record
@@ -370,17 +369,11 @@ class Maintenance:
             )
         )
 
-    def _record(
-        self, generation: str, boot: str, nonce: str
-    ) -> TransactionRecord | TransactionRecordV2:
+    def _record(self, generation: str, boot: str, nonce: str) -> CurrentRecord:
         permit = self.permit
         record = self.current()
         if permit is None or record is None:
             raise MaintenanceError("transaction_unavailable")
-        # This slice only opens terminal observation/projection and restart
-        # preparation. Transfer drain/readiness/activation are not implemented.
-        if isinstance(record, ProjectControllerTransferRecord):
-            raise MaintenanceError("project_controller_transfer_unsupported")
         role = self._role(record)
         challenge = record.rollback_challenge if role == "base" else record.challenge
         if (
@@ -393,7 +386,7 @@ class Maintenance:
         permit.lease.check()
         if self._core != (record.identity.store_instance, record.identity.main_session):
             raise MaintenanceError("foreign_state")
-        if isinstance(record, TransactionRecordV2):
+        if isinstance(record, (TransactionRecordV2, ProjectControllerTransferRecord)):
             self.verify_managed(record, role)
             return record
         if not isinstance(permit, BootPermit) or (permit.installation, permit.service) != (
@@ -449,7 +442,8 @@ class Maintenance:
         record = self._record(generation, boot, nonce)
         assert self.permit is not None
         if (
-            self._role(record) is not None
+            isinstance(record, ProjectControllerTransferRecord)
+            or self._role(record) is not None
             or boot != record.identity.origin_boot
             or record.phase not in {"prepared", "aborted"}
         ):
@@ -486,14 +480,21 @@ class Maintenance:
             self.reconcile()
         challenge = record.rollback_challenge if role == "base" else record.challenge
         assert challenge is not None
-        if isinstance(record, TransactionRecordV2):
-            binding = record.binding(role or "base")
+        if isinstance(record, (TransactionRecordV2, ProjectControllerTransferRecord)):
+            origin = isinstance(record, ProjectControllerTransferRecord) and role is None
+            binding = (
+                record.origin.binding
+                if isinstance(record, ProjectControllerTransferRecord) and origin
+                else record.binding(role or "base")
+            )
             return HealthProofV2(
                 generation=generation,
                 challenge=challenge,
                 boot=boot,
                 role=role or "origin",
-                deployment=record.identity.deployment,
+                deployment=record.origin.deployment
+                if isinstance(record, ProjectControllerTransferRecord) and origin
+                else record.identity.deployment,
                 installation=binding.installation,
                 compatibility=binding.compatibility,
                 configuration=binding.configuration.digest,
