@@ -1,5 +1,20 @@
 # 指定目标定时复盘（2.49 候选审查）
 
+## 发行闭合
+
+2026-10-24，v2.49.0已正式发行。根核对精确提交 `dd91909cb95feb0d5975fdb5452e65b74e1f7f51` 的有效G签名；[PR57](https://github.com/69gg/MuLi/pull/57)于 `2026-10-24T05:18:18Z` 合并，main与v2.49签名标签已推送。[精确候选CI40065164186](https://github.com/69gg/MuLi/actions/runs/40065164186)十项全部成功，[Release40065726087](https://github.com/69gg/MuLi/actions/runs/40065726087)精确同头完成，十三项全部成功。
+
+[GitHub v2.49.0](https://github.com/69gg/MuLi/releases/tag/v2.49.0)为非draft、非prerelease，于 `2026-10-24T05:27:15Z` 发布。根仅查询小型元数据，确认[PyPI 2.49.0](https://pypi.org/project/muli-agent/2.49.0/)两文件均未yank，大小及SHA-256与GitHub资产digest完全一致：
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.49.0-py3-none-any.whl` | 833499 | `8ae4579c0a8d81b740c5cb0ea95ec9d47d0f0a32a69545144001608a26b5852e` |
+| `muli_agent-2.49.0.tar.gz` | 4375299 | `8a170af6c605a9586febc9e7b34f453287dd55f78088843ef0707a7812ea5643` |
+
+未下载发行包；不把本地构件与远端sdist宣称为逐字节相同。本次闭合证据随2.50文档提交保留，不改已发行2.49标签；下面保留候选阶段的本地证据与历史失败，不再作为当前发行待办。
+
+## 候选阶段记录
+
 2026-10-24，基线为已发行 v2.48.0 的 `312f4abc1bc2e562829b64eaddece9fef6cb84dc`。本候选允许为已有任务约定复盘时间，到期读取最新要求与交付验收单，沿原来源说明证据、未验事项及下一步。本地功能、静态检查及离线发布验证均已有通过终态，合计 279 个不同测试节点；签名候选、远端 PR/CI 和正式发行尚待完成。使用方法见[Attention](attention.md#约定复盘指定任务)，完整合同及先红过程见[方案](goal-followup-proposal.md)。
 
 ## 实现与权限
@@ -48,6 +63,6 @@
 4. 接纳十项首跑 9 passed、1 failed，pytest 1.26 秒，守卫 2.119 秒、128.4 MiB。缺失任务原 oracle 写 400，真实既有 `evidence_not_found` 映射为 404；只修此状态预期，其它拒绝与无创建断言保留，单 selector 随后通过。
 5. C 独立源读取取得真实 OverflowError 红：1 failed，pytest 0.12 秒，守卫 0.643 秒、59.9 MiB。通知时间为 `10**400` 时 `math.isfinite` 的整数转浮点溢出；仅在该转换处受控返回 False，不设时间上限，不捕获整个存储流程，原独立 oracle 随后通过。
 
-## 仍待完成
+## 外部边界
 
-签名候选、远端 PR/CI 及正式发行尚待完成。固定工具策略和 MockTransport 证明宿主读取、持久化、权限及路由合同；自然模型复盘质量、真实账号与平台送达、本片 unknown 发送故障完整旅程未实测。普通任务状态和现有 unknown 不重发语义保持原合同。
+签名候选、远端PR/CI及正式发行已由上方闭合记录取代原待办。固定工具策略和MockTransport证明宿主读取、持久化、权限及路由合同；自然模型复盘质量、真实账号与平台送达、本片unknown发送故障完整旅程未实测。普通任务状态和现有unknown不重发语义保持原合同。
