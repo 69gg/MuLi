@@ -1211,7 +1211,6 @@ def controller_journal_failure(
     if len(data) > OUTPUT_BYTES or not helper_source_facts(source):
         return {"code": "not_observed", "reason": "invalid_reply"}
     fields = {"_UID", "_PID", "_SYSTEMD_USER_UNIT", "_SYSTEMD_INVOCATION_ID", "MESSAGE"}
-    metadata = {"__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP", "_BOOT_ID"}
     prefix = "muli.controller_failure.v1 "
 
     def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1235,8 +1234,8 @@ def controller_journal_failure(
             row = json.loads(line.decode("utf-8"), object_pairs_hook=unique)
             shape = (
                 isinstance(row, dict)
-                and fields <= set(row) <= fields | metadata
-                and all(isinstance(value, str) for value in row.values())
+                and fields <= set(row)
+                and all(isinstance(row[field], str) for field in fields)
             )
             if (
                 not shape
@@ -2709,6 +2708,7 @@ class NativeCI:
                                     "--no-pager",
                                     "--quiet",
                                     "--output=json",
+                                    "--all",
                                     "--lines=2",
                                     "--output-fields=_UID,_PID,_SYSTEMD_USER_UNIT,_SYSTEMD_INVOCATION_ID,MESSAGE",
                                     "--grep=^muli[.]controller_failure[.]v1 ",

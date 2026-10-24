@@ -1118,3 +1118,53 @@ shape、零/三行、错误reason、行/结果extra拒绝及旧形状兼容，�
 
 本片再次冻结。以上离线结果不改变Native30现场metadata_rejected、原事务与cleanup
 仍失败且首因未得的事实；Native31精确新head尚未签名、尚未运行CI，现场结果待验。
+
+### Native32：五个消费字段与JSON格式化阈值的目标回归
+
+Native31随后在精确head `8f7e8a7` 的CI `40074892152` 终态：十个通用作业全绿，
+两Linux shard的测试driver握手回归已恢复；唯一managed-native作业 `120816031280`
+仍失败。根严格校验artifact `12552404045`，1840字节，SHA256
+`deb78abf5e2166bfade9ae04357eb05557f1f0f6e386ac2066b9a7b439ccc57c`。
+controller_failure仍为not_observed/metadata_rejected，但唯一摘要行四个可信身份
+uid/pid/unit/invocation全部matches，shape=false。当前仍首stop_base失败后进入
+recovery_required，cleanup保留三mount；未取得首异常位置，不能说事务或清理修好。
+
+此结果只把拒绝定位到整行shape，不证明现场是额外metadata、MESSAGE缺失或非字符串。
+当前reader把journalctl整行当作自有exact schema，并要求未消费的附带值也是字符串；
+这超出了真正证据的五个字段。拟仅要求五个消费字段存在且为字符串，保留四可信身份
+逐值相等、MESSAGE固定前缀、安全validator、同代revision/intent及timeline全部原门。
+其它formatter字段不参与授权、不进入artifact；原重复键、两行、raw收费与总预算不变。
+
+根已核官方[journalctl JSON输出说明](https://freedesktop.org/software/systemd/man/devel/journalctl.html)：
+单值超过4096字节时默认可输出null，`--all`保留完整值。项目validator限制diagnostic
+本体不超过4096字节，并未把其外层generation/revision/intent envelope及固定前缀算进
+这一上限，因而合法MESSAGE仍可超过该阈值。拟在原唯一查询加`--all`，不是额外查询
+或额外额度；实际完整JSON仍计原剩余32KiB，原deadline、最多两行和失联不退款保留。
+
+本轮先仅新增原controller_failure文件的两条目标回归：第一沿真实controller/capture
+产生的安全消息，经原parent采集保存入口，附加不消费的JSON metadata，期待同一安全
+诊断且不导出额外值；第二保留原真实代次/timeline，明确构造经原validator认可、本体
+仍在4096内而完整MESSAGE超过4096的有限诊断，查询替身严格模拟默认null及`--all`
+完整回包，核同一次查询、实际wire收费、同deadline和原保存总门。后者是格式化边界
+回归，不声称该合成帧列表是真实现场trace，也不推定Native31现场就发生了截值。
+生产未改，作者未运行检查、格式、Git、网络或真实服务；两条目标待根收取真实红，
+未授权新远端轮次，不预写修复通过。
+
+根随后实收上述两条目标均真实红：pytest0.87秒、守卫1.423秒、69.6MiB、swap0。
+原expected observed、diagnostic本体不超过4096而完整MESSAGE超过4096的前置，以及
+原once与实际wire收费均通过，分别准确落在额外formatter metadata误拒与缺`--all`。
+授权后的唯一生产改动在 `scripts/check_managed_native_ci.py`：shape只核五个消费字段
+存在且为字符串，未消费的formatter键不再参与shape且不导出；原四可信值逐项相等、
+prefix/envelope/安全validator/timeline与重复键门不变。原同一次查询增加`--all`，
+没有新增查询、probe、重试或额度，raw上限与绝对deadline不变。
+
+生产、测试和文档静态读回后冻结；作者未运行检查、格式、Git、网络或真实服务。
+根修后实收原文件47项全部通过，pytest15.50秒、守卫16.045秒、75.6MiB、swap0；
+相关原生七文件839项通过，pytest2.61秒、守卫3.262秒、159.1MiB、swap0。
+本片合886个不同本地节点，未将Native31两条未重跑的真实CLI旅程累计进来。
+三个原生脚本strict通过，守卫5.317秒、288.4MiB；Ruff通过。格式检查仅发现新增
+测试的一个列表推导换行，由根沿原formatter整理，无语义变化。根非作者读回生产差异
+与两条目标测试，原四身份、payload、timeline、重复键、实际raw收费及deadline门保持，
+未发现剩余P1/P2；未重跑全应用源码strict，因为本片无应用源码改动。
+Native31的shape=false现场分叉仍未知，此修复不证明已取得首stop_base异常位置，
+也不改变真实事务与cleanup失败状态；新的精确远端结果另行补录。

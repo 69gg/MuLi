@@ -184,6 +184,84 @@ async def test_root_collects_actual_controller_message_once_and_preserves_first_
     assert len((native.root / "result.json").read_bytes()) <= ci.OUTPUT_BYTES
 
 
+async def test_formatter_metadata_does_not_reject_or_escape_the_safe_message(
+    tmp_path: Path, failure_case: tuple[dict[str, Any], bytes]
+) -> None:
+    result, original = failure_case
+    source = result["resources"]["helper_source"]
+    expected = ci.controller_journal_failure(original, source, result)
+    assert expected["code"] == "observed"
+    row = json.loads(original)
+    # Formatter-owned JSON is not the host's five-field evidence schema.
+    row["__EXTRA_FORMATTER_METADATA"] = {"private": ["PRIVATE_FORMATTER_VALUE", 7]}
+    reply = json.dumps(row).encode() + b"\n"
+    native, calls = observer(tmp_path / "parent", result, reply)
+    native.setup_bytes = 17
+    native.observe_controller_failure(result, deadline=native.execute_deadline)
+    native.observe_controller_failure(result, deadline=native.execute_deadline)
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert len(calls) == 1 and native.setup_bytes == 17 + len(reply)
+    assert saved["resources"]["controller_failure"] == expected
+    assert saved["timeline"] == result["timeline"]
+    assert saved["code"] == "native_transaction_blocked"
+    assert "PRIVATE_FORMATTER" not in json.dumps(saved)
+
+
+async def test_root_requests_all_for_valid_message_larger_than_journal_json_threshold(
+    tmp_path: Path, failure_case: tuple[dict[str, Any], bytes]
+) -> None:
+    result, original = failure_case
+    row = json.loads(original)
+    payload = json.loads(row["MESSAGE"][len(PREFIX) :])
+    diagnostic = payload["diagnostic"]
+    # The diagnostic itself is capped at 4096 bytes, but its valid envelope and
+    # prefix can cross journalctl's separate per-value JSON formatting threshold.
+    for width in range(1, 124):
+        diagnostic["frames"] = [
+            {"module": "muli." + "a" * width, "function": "b" * width, "line": 1} for _ in range(16)
+        ]
+        diagnostic["truncated"] = True
+        message = PREFIX + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        if len(message.encode()) > 4096:
+            break
+    assert len(message.encode()) > 4096
+    assert ci.failure_diagnostic_module().validate_failure_diagnostic(diagnostic) is not None
+    assert len(json.dumps(diagnostic, ensure_ascii=False).encode()) <= 4096
+    row["MESSAGE"] = message
+    full_reply = json.dumps(row).encode() + b"\n"
+    expected = ci.controller_journal_failure(
+        full_reply, result["resources"]["helper_source"], result
+    )
+    assert expected["code"] == "observed"
+    native, calls = observer(tmp_path / "parent", result, full_reply)
+    original_run = native.run
+    wires: list[bytes] = []
+
+    def journal(argv: Sequence[str], *, seconds: float = 5) -> Any:
+        original_run(argv, seconds=seconds)  # Retain all original query/identity assertions.
+        projected = dict(row)
+        if "--all" not in argv:
+            projected["MESSAGE"] = None  # Documented journalctl JSON default above 4096.
+        wire = json.dumps(projected).encode() + b"\n"
+        wires.append(wire)
+        return ci.Reply(0, wire)
+
+    native.run = journal
+    native.setup_bytes = 17
+    deadline = native.execute_deadline
+    native.observe_controller_failure(result, deadline=deadline)
+    native.observe_controller_failure(result, deadline=deadline)
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert len(calls) == len(wires) == 1
+    assert "--all" in calls[0]
+    assert native.setup_bytes == 17 + len(wires[0]) <= ci.OUTPUT_BYTES
+    assert native.execute_deadline == deadline
+    assert saved["resources"]["controller_failure"] == expected
+    assert saved["code"] == "native_transaction_blocked"
+    assert saved["timeline"] == result["timeline"]
+    assert len((native.root / "result.json").read_bytes()) <= ci.OUTPUT_BYTES
+
+
 @pytest.mark.parametrize(
     "changed", ["_UID", "_PID", "_SYSTEMD_USER_UNIT", "_SYSTEMD_INVOCATION_ID"]
 )
