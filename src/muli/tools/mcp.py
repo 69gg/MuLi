@@ -41,14 +41,17 @@ from muli.tools.mcp_prompts import (
 )
 from muli.tools.mcp_receive import ReceiveState, install_receive_guard
 from muli.tools.mcp_resources import (
+    TOOL_RESULT_PREFIX,
     Capabilities,
     ResourceCatalog,
     ResourceClient,
     ResourceItem,
     ResourceSaveFactory,
+    ToolResultCatalog,
     resource_blob,
     resource_content,
     resource_item,
+    tool_result_resources,
 )
 
 JsonObject = dict[str, Any]
@@ -113,6 +116,7 @@ class _RemoteTool:
 class _Generation:
     secrets: frozenset[str] = field(repr=False)
     max_output_chars: int
+    max_catalog_bytes: int
 
 
 @dataclass(eq=False, slots=True)
@@ -129,6 +133,8 @@ class _Connection:
     capabilities: Capabilities = Capabilities(tools=True, resources=False)
     resource_catalog: ResourceCatalog | None = None
     resource_refreshing: bool = False
+    result_catalog: ToolResultCatalog | None = None
+    result_call: object | None = field(default=None, repr=False)
     prompt_catalog: PromptCatalog | None = None
     prompt_refreshing: bool = False
     usable: bool = True
@@ -656,7 +662,9 @@ class MCPManager:
         receive_policy = checked_policy(receive_policy or self.receive_policy)
         config = deepcopy(config)
         secrets = self._config_secrets(config)
-        generation = _Generation(frozenset(secrets), limits.max_output_chars)
+        generation = _Generation(
+            frozenset(secrets), limits.max_output_chars, limits.max_catalog_bytes
+        )
         self._candidate = generation
         connections: dict[str, _Connection] = {}
         catalogs: dict[str, tuple[_RemoteTool, ...]] = {}
@@ -819,6 +827,8 @@ class MCPManager:
         for name, connection in candidate.connections.items():
             connection.catalog = candidate.catalogs[name]
             connection.resource_catalog = None
+            connection.result_catalog = None
+            connection.result_call = None
             connection.prompt_catalog = None
         self.config, self._connections = candidate.config, candidate.connections
         self._status = {item["name"]: item for item in candidate.statuses}
@@ -880,6 +890,8 @@ class MCPManager:
                 continue
             connection.usable = False
             connection.resource_catalog = None
+            connection.result_catalog = None
+            connection.result_call = None
             connection.prompt_catalog = None
             self._retiring.add(connection)
             task = connection.cleanup_task
@@ -1019,8 +1031,16 @@ class MCPManager:
         tools = [
             Tool(
                 "mcp_resources_list",
-                "按需完整观察 MCP 普通资源目录；cursor 仅续读已展示目录的元数据，不读取正文。",
-                parameters({"server": server, "cursor": string("宿主返回的续页游标")}, ("server",)),
+                "按需观察 MCP 普通资源目录，或 source=tool_result 显式展示最近工具结果链接；"
+                "cursor 仅续读同来源元数据，不读取正文。",
+                parameters(
+                    {
+                        "server": server,
+                        "source": {"type": "string", "enum": ["catalog", "tool_result"]},
+                        "cursor": string("宿主返回的同来源续页游标"),
+                    },
+                    ("server",),
+                ),
                 listing,
                 risk="external",
                 preserve_output=True,
@@ -1077,6 +1097,10 @@ class MCPManager:
         ):
             return self._content_error("resource_arguments_invalid", not_executed=True)
         connection = connections[name]
+        if arguments["ref"].startswith(TOOL_RESULT_PREFIX):
+            # This source grants short-text read only, including after expiry.
+            # Reject before host preflight/reservation or any remote request.
+            return self._content_error("resource_reference_invalid", not_executed=True)
         # Name and host execution guards are synchronous; no await before lease
         # admission. Once admitted, this operation completes using its original
         # connection, callback, deadline and output budget, including local I/O.
@@ -1217,13 +1241,18 @@ class MCPManager:
     ) -> JsonObject:
         name = arguments.get("server")
         key = "ref" if read else "cursor"
+        source = arguments.get("source", "catalog")
         allowed = {"server", key} | ({"arguments"} if read and kind == "prompt" else set())
+        if not read and kind == "resource":
+            allowed.add("source")
         if (
             type(name) is not str
             or name not in connections
             or set(arguments) - allowed
             or (key in arguments and type(arguments[key]) is not str)
             or (read and key not in arguments)
+            or type(source) is not str
+            or source not in {"catalog", "tool_result"}
         ):
             return self._content_error(f"{kind}_arguments_invalid", not_executed=True)
         connection = connections[name]
@@ -1234,12 +1263,14 @@ class MCPManager:
             deadline = asyncio.get_running_loop().time() + connection.timeout
             async with asyncio.timeout_at(deadline):
                 if read:
+                    reference = arguments["ref"]
                     catalog = (
-                        connection.resource_catalog
+                        connection.result_catalog
+                        if kind == "resource" and reference.startswith(TOOL_RESULT_PREFIX)
+                        else connection.resource_catalog
                         if kind == "resource"
                         else connection.prompt_catalog
                     )
-                    reference = arguments["ref"]
                     if catalog is None or reference not in catalog.references:
                         return self._content_error(f"{kind}_reference_invalid", not_executed=True)
                     item = catalog.items[catalog.references[reference]]
@@ -1287,6 +1318,17 @@ class MCPManager:
                     }
                     if not fits_output(result, generation.max_output_chars):
                         raise ContentError(f"{kind}_output_budget_exceeded")
+                elif kind == "resource" and source == "tool_result":
+                    catalog = connection.result_catalog
+                    if catalog is None:
+                        return self._content_error("resource_reference_invalid", not_executed=True)
+                    cursor = arguments.get("cursor")
+                    if cursor is not None and cursor not in catalog.cursors:
+                        return self._content_error("resource_cursor_invalid", not_executed=True)
+                    position = catalog.cursors[cursor] if cursor is not None else 0
+                    result = self._directory_slice(
+                        connection, catalog, position, generation, deadline, kind
+                    )
                 else:
                     return await self._directory_list(
                         connection, generation, limits, arguments.get("cursor"), deadline, kind
@@ -1478,12 +1520,45 @@ class MCPManager:
         rejected = self._admit_call(connection, generation)
         if rejected is not None:
             return rejected
+        call = object()
+        connection.result_call = call
+        connection.result_catalog = None
         try:
-            async with asyncio.timeout(connection.timeout):
+            deadline = asyncio.get_running_loop().time() + connection.timeout
+            async with asyncio.timeout_at(deadline):
                 result = await connection.client.call_tool(
                     remote, arguments, timeout=connection.timeout, raise_on_error=False
                 )
-                return self._result(result, generation)
+                payload = self._result(result, generation)
+                if (
+                    payload.get("is_error") is False
+                    and not payload.get("truncated")
+                    and connection.capabilities.resources
+                    and connection.server["transport"] != "stdio"
+                ):
+                    try:
+                        items = tool_result_resources(
+                            getattr(result, "content", None), generation.max_catalog_bytes
+                        )
+                    except ContentError:
+                        items = ()
+                    if items:
+                        proposed = {**payload, "resource_links_available": True}
+                        # Old admitted text may finish, but only the latest current
+                        # call may publish links. No await after this final fence.
+                        if (
+                            fits_output(proposed, generation.max_output_chars)
+                            and not self._closed
+                            and self._generation is generation
+                            and self._connections.get(connection.name) is connection
+                            and connection.usable
+                            and connection.receive.code is None
+                            and connection.result_call is call
+                            and asyncio.get_running_loop().time() < deadline
+                        ):
+                            connection.result_catalog = ToolResultCatalog(new_id(), items)
+                            payload = proposed
+                return payload
         except TimeoutError:
             return {"is_error": True, "error": "MCP 工具调用达到时间上限"}
         except asyncio.CancelledError:

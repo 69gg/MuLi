@@ -60,6 +60,14 @@
 
 目录是在若干响应中观察到的完整有界列表，不是服务端原子快照或正文修订。服务端在分页中变化但没有产生可检出的重复/异常时，宿主无法证明一致性；listChanged 不能提供缺失的 revision。首片不订阅或自动重取，需新目录由下一次明确 list 请求触发。
 
+## 工具结果链接补片
+
+v2.51 候选复用同一 `ResourceItem`、目录分页和文本 read，为原工具成功结果中的 typed `resource_link` 增加显式 `source:"tool_result"`。普通目录仍只有原来一份；另保留一份整组通过既有条目/逻辑字节预算的结果集合和一个最新调用 token，不存正文、历史或数据库。普通文字和 structured 数据不形成资源引用，整组失败不发部分引用。
+
+结果集合无 cursor 的 list 只观察已有集合，不向服务器刷新目录。结果来源使用可辨识的 opaque ref/cursor 前缀，仍须完整展示后才登记可读权；既有普通目录 token 不变。新工具调用只撤销该结果来源，普通目录刷新只替换普通目录；实际 MCP 换代（含连接复用）和关闭等原生命周期同时撤销两者。较新失败或取消之后，旧调用晚到也不能重新发布。
+
+结果引用只供原文本 read；`mcp_resource_save` 在附件 factory、预留及远端请求前拒绝此来源，过期后亦然。resources capability、HTTP/SSE、external 与原 Runtime 过滤保持。准确接口及正式先红见[结果资源设计](mcp-result-resources-proposal.md)，该候选新增六节点、相关回归和独立后审结果单独记于[2.51审查](review-v2.51.md)；本文原普通目录验证记录不作为该补片通过证据。
+
 ## 引用读取与非可信内容
 
 read 只接受当前目录实际已展示项的 ref，并核 server、generation 和连接。SDK 已解析的 URI 由内部引用取出，保持 SDK 的 URI 语义；不能把模型传入路径、URL、旧 session 游标或错误返回里的 URI 升格成可读引用。URI 可用 file/https/自定义 scheme，但只回传给已经批准的原 MCP session；不调用本地 open/resolve、HTTP fetch 或 URI 模板展开。

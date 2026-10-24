@@ -113,7 +113,17 @@ read 一次读取至多 16 个完整文本块。file/https/自定义 URI 只回�
 
 元数据和文本的字符串值按旧代密钥脱敏，固定字段名和宿主引用保持；随后核完整 JSON 字符预算，不能容纳时明确 `resource_output_budget_exceeded`，不制作正文 preview。最新工具批次经 Runtime 保持完整；完整批次放不进下一请求时停止运行，不继续请求模型。较早批次仍遵循原上下文淘汰规则。取消、超时和已进入 SDK 的未知结果不自动重放；换代前已接纳的 read 可在旧连接完成，迟到目录不签发新代可用引用。接收 latch 同时封锁工具与资源。
 
-本片不接 stdio 资源、模板、订阅或后台抓取，不新增配置/API/通知源。状态中 `resources_supported` 和固定 `resource_error_code` 不回显 URI、原服务器游标、正文或异常。实现与验收边界见[资源设计](mcp-resources-design.md)。
+普通资源片不接 stdio 资源、模板、订阅或后台抓取，不新增配置/API/通知源。状态中 `resources_supported` 和固定 `resource_error_code` 不回显 URI、原服务器游标、正文或异常。实现与验收边界见[资源设计](mcp-resources-design.md)。
+
+## 搜索结果资源链接
+
+v2.51 开发候选另支持工具结果中的 typed `resource_link`。一次完整成功的工具回执出现 `resource_links_available:true` 时，可先调用 `mcp_resources_list({"server":"remote_tools","source":"tool_result"})`，再把实际展示的 `ref` 交给原 `mcp_resource_read`。这次 list 只展示同连接最近工具调用留下的链接元数据，不补进普通目录、不发送 `resources/list`，也不抓取正文。省略 `source` 或使用 `source:"catalog"` 保持普通目录行为；两来源的 cursor/ref 不能互用。
+
+仅原协议 typed 内容合格；普通文字 URL、structured 字典、错误结果和截断结果不授予链接。整组链接先按既有条目数、URI、UTF-8 与目录字节预算验证，失败不保留合法前缀。只有完整展示页才发引用，正文沿原一次完整短文本、输出预算、外部审批和 `untrusted:true` 合同。`catalog_complete` 在此仅表示本次结果链接组完整通过校验，不是服务器完整目录。
+
+每连接只保留一份有限结果集合；实际接纳的新工具调用立即撤销它，失败或取消不恢复上一份。换代（含复用连接）、接收故障、退休、关闭或重启撤销引用，较早调用晚返不能覆盖较新调用。宿主 ref/cursor 是不透明值，应原样使用；结果来源引用即使过期，也会在附件 factory、预留及远端 RPC 前被 `mcp_resource_save` 拒绝。这一来源只开放文本 read，不自动保存或发送文件；原普通目录的显式 blob 保存保持。
+
+HTTP/SSE、resources capability、stdio、主协调/reviewer/Attention 与禁用工具的原门不变。此候选的正式旅程、五项有限负控及相关回归共318个不同节点已通过，非作者后审无剩余必须修复P1/P2；离线发布验证、远端CI、发行及真实外部服务联调尚未完成。详见[候选审查](review-v2.51.md)与[先红设计记录](mcp-result-resources-proposal.md)。
 
 ## 显式文本 prompts 草稿
 

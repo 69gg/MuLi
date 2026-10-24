@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from pydantic import AnyUrl
 
-from muli.tools.mcp_catalog import MAX_CATALOG_ITEMS, Catalog
+from muli.tools.mcp_catalog import MAX_CATALOG_ITEMS, Catalog, json_size
 from muli.tools.mcp_catalog import ContentError as ResourceError
 
 JsonObject = dict[str, Any]
@@ -31,6 +31,7 @@ ResourceSaveFactory = Callable[[str], ResourceSaveTarget]
 MAX_RESOURCE_ITEMS = MAX_CATALOG_ITEMS
 MAX_RESOURCE_URI_BYTES = 4096
 MAX_RESOURCE_CONTENT_BLOCKS = 16
+TOOL_RESULT_PREFIX = "tool_result:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,15 @@ class ResourceItem:
 
 
 ResourceCatalog = Catalog[ResourceItem]
+
+
+class ToolResultCatalog(Catalog[ResourceItem]):
+    """Keep result refs distinguishable after their sole catalog has expired."""
+
+    __slots__ = ()
+
+    def token(self, kind: str, position: int) -> str:
+        return TOOL_RESULT_PREFIX + super().token(kind, position)
 
 
 def resource_uri(value: object) -> AnyUrl:
@@ -94,6 +104,39 @@ def resource_item(value: object) -> ResourceItem:
             raise ResourceError("resource_invalid")
         metadata["size"] = size
     return ResourceItem(uri, metadata)
+
+
+def tool_result_resources(content: object, maximum: int) -> tuple[ResourceItem, ...]:
+    """Validate one whole original typed-link group before projecting metadata."""
+    if type(content) is not list:
+        raise ResourceError("resource_invalid")
+    blocks: list[Any] = []
+    for block in content:
+        if getattr(block, "type", None) == "resource_link":
+            if len(blocks) >= MAX_RESOURCE_ITEMS:
+                raise ResourceError("resource_catalog_budget_exceeded")
+            blocks.append(block)
+    values: list[JsonObject] = []
+    try:
+        for block in blocks:
+            dump = getattr(block, "model_dump", None)
+            value = dump(mode="json", by_alias=True) if callable(dump) else vars(block)
+            if type(value) is not dict or value.get("type") != "resource_link":
+                raise ResourceError("resource_invalid")
+            values.append(value)
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        raise ResourceError("resource_invalid") from None
+    # Include annotations, extra fields and all links before any whitelist projection.
+    json_size(values, maximum)
+    items: list[ResourceItem] = []
+    seen: set[AnyUrl] = set()
+    for value in values:
+        item = resource_item(value)
+        if item.uri in seen:
+            raise ResourceError("resource_duplicate_uri")
+        seen.add(item.uri)
+        items.append(item)
+    return tuple(items)
 
 
 def resource_content(value: object) -> list[JsonObject]:

@@ -24,6 +24,8 @@
 
 只向当前已启用、声明 resources 且有接收保护的 HTTP/SSE 原连接请求；stdio 和任意 URI 直读仍不接。ref 必须来自该代实际完整展示的普通资源目录。一次 `resources/read`，不用第二次读取拼接；URI 只是传给原 session 的标识，不据 `file:`/`https:` 等 scheme 打开本机文件或发另一次 HTTP。
 
+v2.51 的[工具结果链接候选](mcp-result-resources-proposal.md)只开放原短文本 read，不扩大本保存合同。该来源 ref 带宿主来源前缀，即使其唯一内存集合已失效，也在附件 factory、reservation 与远端 RPC 前明确拒绝；不能借共用目录值类型自动获得 blob 保存能力。原普通目录 ref、同步宿主门和进入后按原代完成的行为保持；新来源拒绝保存的有限负控及当前候选边界见[2.51审查](review-v2.51.md)。
+
 先核实际 `contents` 长度恰为一，再核单块为合法 blob；有 text、混合、多块、未知形状或类型不符则整体失败。未知字段仍由原接收预算计费，不传播或执行。校验返回 URI 但不签发新引用；不要求服务端返回的子资源 URI 是本机路径。空 blob 沿现附件库可保存空文件的行为处理。
 
 在任何临时文件、配额 reservation 或元数据写入之前，完成有界 ASCII/base64 检查、解码与实际长度检查；根据当前单文件限额先拒绝明显超大的编码输入，再核真实 decoded bytes。目录 size 仅为提示，不能代替实际长度。沿用连接的 `max_message_bytes`、一次绝对 timeout 及 uploads 的单文件/总配额/并发限制，不新增 Settings；base64 和 JSON 外壳也消耗 wire 预算，不能承诺取满默认 32 MiB 附件上限。等待容量和写入不重置原操作期限；附件库在写入时仍按当前配额检查 reservation。
