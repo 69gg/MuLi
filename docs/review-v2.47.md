@@ -14,6 +14,7 @@
 - 首轮实现后，92项中90 passed、2 failed。ingress 夹具在新输入尚 pending 时要求写工具成功，与既有门禁冲突；双私聊负控手算原派工消息ID并漏掉 reply_to。定向复验确认相同失败，按真实无工具边界及实际持久输入修正，未提高期限或预算。
 - 独立审查确认无效新证明不应抹掉原报告来源，候选已收窄为仅有效证明覆盖，并补真实私聊8派工、7调整后坏证明仍回8的负控。另发现仅靠正文相等确认通知保留可能误认不同消息；准确身份反例实收93项中92 passed、唯一该反例失败（pytest3.42秒，守卫4.824秒、206.3MiB、swap0）。获准补宿主消息ID与完整正文配对，ID经过正常pack副本保留且不发给模型。
 - 随后十五文件327项中325 passed、2 failed（pytest8.05秒，守卫10.030秒、366.9MiB、swap0）；十二条完成旅程及三协议ID不外发回归均通过。仅既有runtime预算断言把新增宿主ID也计入asdict文本，出现4198大于4000；实际pack预算未变。现将原context私有计量提升为公共context_size，供两处生产预检与四处预算测试复用；历史内容asdict相等性断言保留，不提高预算，待根复验。
+- 签名候选 `2f9599bc5a8e50f580c828e4860ffe1efd6feead` 的 [PR #55](https://github.com/69gg/MuLi/pull/55) 首轮 [CI 40055051645](https://github.com/69gg/MuLi/actions/runs/40055051645) 中，Windows 3.12/3.13 两个 job 的十二个手机完成旅程参数均在原第675行等待真实完成报告的3秒门控超时，不能算跨平台通过。有限诊断后，根以 `LC_ALL=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 PYTHONIOENCODING=utf-8` 运行原 `sent-archive-None`：**1 failed**，pytest3.69秒，守卫4.431秒、125.8MiB、swap0、exit1。真实 `write-draft` 结果为成功写入57字节，worker run 随后 failed，错误为 ASCII 解码遇到 `0xe9`；这证明夹具用默认编码读取 UTF-8 中文草稿是该超时的原因，没有证据归因于负载。修复仅为两处草稿 `read_text` 显式指定 UTF-8，保留原3秒门控和有限失败诊断，生产、预算及工作流不变；ASCII十二参数、正常十二参数及相关回归待根统一复验。
 
 所有本机检查由根经 `scripts/check_local.py` 串行执行。共享2GiB、单次1GiB、swap0与单CPU等效预算保持；开发仅用临时数据、固定模型策略和HTTP替身。
 
@@ -30,4 +31,4 @@
 
 集合重叠，不累计为新测试总数。最终整合首次误写不存在的 `test_commitments.py`，exit4且未运行测试；通过实际文件列表定位 `test_commitment_management.py` 后才取得411项结果。未重跑本机全后端，完整跨平台矩阵由精确候选CI另验。
 
-独立后审核对原owner来源、准确通知身份、真实执行代次、完成报告与事件同事务、坏证明原来源及重开/unknown路径，未发现剩余P1/P2。真实孙代端到端不在本片承诺内，局部parent拒绝不冒充其测试。2.46发行闭合文档同时带入，未覆盖本片新增合同。当前尚无精确远端候选、合并、签名标签及PyPI/GitHub发行结果，不以本地绿色代表已发布。
+独立后审核对原owner来源、准确通知身份、真实执行代次、完成报告与事件同事务、坏证明原来源及重开/unknown路径，未发现剩余P1/P2。真实孙代端到端不在本片承诺内，局部parent拒绝不冒充其测试。2.46发行闭合文档同时带入，未覆盖本片新增合同。精确候选 PR #55 首轮 CI 的八个非Windows作业通过，Windows失败保留。编码窄修后，根在相同ASCII环境实收十二参数 **12 passed**（pytest3.15秒；守卫4.605秒、194.3MiB/swap0、exit0）；正常环境完成旅程及相关两文件 **19 passed**（pytest4.54秒；守卫6.301秒、256.7MiB/swap0、exit0）。改动测试Ruff与格式均通过，未改生产、预算或workflow。新签名候选远端CI及本版合并、标签和发行仍待完成，不以本地绿色代表Windows实测通过或已发布。

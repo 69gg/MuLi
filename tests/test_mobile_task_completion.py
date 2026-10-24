@@ -301,7 +301,7 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
             else:
                 assert len(worker_seen) == (3 if notice_path == "ingress" else 2)
                 assert tool_result(messages, "write-draft")["path"] == str(draft_path)
-                assert draft_path.read_text() == draft_content
+                assert draft_path.read_text(encoding="utf-8") == draft_content
                 if notice_path == "ingress":
                     binding = active_runtime.team.get(worker_id)["report_binding"]
                     assert binding["run_id"] == active_runtime.run_ids[worker_id]
@@ -672,7 +672,34 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
             with monkeypatch.context() as completion_patch:
                 completion_patch.setattr(runtime.bus, "notify", stop_after_durable_completion)
                 finish_resumed_request.set()
-                await asyncio.wait_for(persisted.wait(), 3)
+                try:
+                    await asyncio.wait_for(persisted.wait(), 3)
+                except TimeoutError:
+                    worker_run = runtime.store.get("run", completed_report_id) or {}
+                    draft_result = next(
+                        (
+                            message["content"]
+                            for message in reversed(runtime.store.messages(worker_id))
+                            if message.get("tool_call_id") == "write-draft"
+                        ),
+                        None,
+                    )
+                    pytest.fail(
+                        "等待真实队友完成报告超时："
+                        + json.dumps(
+                            {
+                                "worker_run": {
+                                    key: worker_run.get(key)
+                                    for key in ("status", "error", "failure_diagnostic")
+                                },
+                                "write_draft_result": draft_result[:1000]
+                                if isinstance(draft_result, str)
+                                else None,
+                            },
+                            ensure_ascii=True,
+                        ),
+                        pytrace=False,
+                    )
                 finished = runtime.team.get(worker_id)
                 assert (
                     finished["status"] == "completed" and finished["run_id"] == completed_report_id
@@ -690,7 +717,8 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
                 assert finished_events[0]["status"] == "completed"
                 assert finished_events[0]["generation"] == generation + 1
                 assert finished_events[0]["completion_revision"] == completion_revision + 1
-                assert draft_path.read_text() == draft_content and not forbidden_path.exists()
+                assert draft_path.read_text(encoding="utf-8") == draft_content
+                assert not forbidden_path.exists()
                 assert len(worker_seen) == (3 if notice_path == "ingress" else 2)
                 assert worker_launches == 2
                 pending_report = runtime.store.get("team_report", completed_report_id)
