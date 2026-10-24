@@ -13,6 +13,7 @@ from muli.channels import ChannelError, ChannelManager, ChannelProfile, Channels
 from muli.channels.types import IncomingMessage
 from muli.mobile_approvals import is_approval_command
 from muli.mobile_task_control import MobileControlRejected, MobileControlSource
+from muli.permissions import ApprovalNotice
 from muli.proactive import FrozenRouting, guard_delivery
 from muli.proactive_memory import check_preference
 from muli.reply_origin import authorize_route, channel_account
@@ -93,6 +94,18 @@ class ChannelApplication:
         def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:
             guard_delivery(self.runtime.config.settings, route, metadata, db=self.runtime.store.db)
 
+        def approval_guard(notice: ApprovalNotice) -> dict[str, Any]:
+            route = notice.reply_origin.delivery_routes()[0]
+            name = route["name"]
+            if (
+                generation != self._generation
+                or manager is not self.manager
+                or expected != self.runtime.config.settings.channels.model_dump()
+                or manager.adapters.get(name) is not adapters.get(name)
+            ):
+                raise ValueError("审批通知的渠道配置或授权已改变")
+            return self.runtime.guard_approval_notice(notice)
+
         for name in ("onebot", "telegram", "qq", "weixin"):
             data[name] = ChannelProfile(**data[name])
         manager = ChannelManager(
@@ -102,6 +115,7 @@ class ChannelApplication:
             submit,
             self.attachments,
             delivery_guard=delivery_guard,
+            approval_guard=approval_guard,
             admission=self.runtime.maintenance.admission,
             control_submit=control_submit,
         )

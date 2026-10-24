@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from muli.events import EventBus
+from muli.reply_origin import MAX_ORIGIN_ID_CHARS, ReplyOrigin
 from muli.store import Store, new_id, now
 
 Mode = Literal["ask", "auto", "yolo"]
@@ -15,6 +17,57 @@ Review = Callable[[str, dict[str, Any], str], Awaitable[tuple[bool, str]]]
 
 class PermissionDenied(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalNotice:
+    """Host provenance for one approval; not a durable live permission."""
+
+    approval_id: str
+    session_id: str
+    run_id: str
+    reply_origin: ReplyOrigin
+
+    def dump(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "approval_id": self.approval_id,
+            "session_id": self.session_id,
+            "run_id": self.run_id,
+            "reply_origin": self.reply_origin.dump(),
+        }
+
+    @classmethod
+    def load(cls, value: object) -> ApprovalNotice:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"version", "approval_id", "session_id", "run_id", "reply_origin"}
+            or type(value["version"]) is not int
+            or value["version"] != 1
+        ):
+            raise ValueError("审批通知来源无法核验")
+        for key in ("approval_id", "session_id", "run_id"):
+            identifier = value[key]
+            if (
+                not isinstance(identifier, str)
+                or not 1 <= len(identifier) <= MAX_ORIGIN_ID_CHARS
+                or any(ord(character) < 32 or ord(character) == 127 for character in identifier)
+            ):
+                raise ValueError("审批通知标识无法核验")
+            identifier.encode("utf-8")
+        origin = ReplyOrigin.load(value["reply_origin"])
+        routes = origin.delivery_routes()
+        if (
+            origin.kind != "channel"
+            or origin.dump() != value["reply_origin"]
+            or len(routes) != 1
+            or routes[0].get("name") not in {"onebot", "telegram"}
+            or routes[0].get("kind") != "private"
+            or routes[0].get("sender_id") != routes[0].get("target")
+        ):
+            raise ValueError("审批通知只接受准确原始私聊来源")
+        origin.route_json.encode("utf-8")
+        return cls(value["approval_id"], value["session_id"], value["run_id"], origin)
 
 
 class Permissions:
@@ -30,6 +83,8 @@ class Permissions:
         risk: str,
         session_id: str,
         run_id: str,
+        *,
+        reply_origin: ReplyOrigin | None = None,
     ) -> None:
         if mode == "yolo":
             return
@@ -60,8 +115,20 @@ class Permissions:
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self.pending[approval["id"]] = future
         try:
-            self.store.put("approval", approval)
-            await self.bus.emit("approval.requested", approval, session_id)
+            requested = dict(approval)
+            if reply_origin is not None:
+                try:
+                    notice = ApprovalNotice.load(
+                        ApprovalNotice(approval["id"], session_id, run_id, reply_origin).dump()
+                    )
+                except ValueError:
+                    pass  # Other origins retain the existing local approval.
+                else:
+                    requested["approval_notice"] = notice.dump()
+            self.store.event(
+                "approval.requested", requested, session_id, objects=[("approval", approval)]
+            )
+            await self.bus.notify()
             allowed = await asyncio.wait_for(future, self.timeout)
             if not allowed:
                 raise PermissionDenied("用户拒绝了工具调用")

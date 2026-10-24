@@ -34,10 +34,10 @@ from muli.management_transaction import Role
 from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
 from muli.memory_context import MemoryContextProvider, PromptComposition, compose_context_result
-from muli.mobile_approvals import MobileApprovals
+from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
-from muli.permissions import Mode, PermissionDenied, Permissions
+from muli.permissions import ApprovalNotice, Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
 from muli.process import run_process
 from muli.providers import (
@@ -1036,6 +1036,30 @@ class Runtime:
                 if session_id is None or item.get("session_id") == session_id:
                     approvals.append(item)
         return approvals
+
+    def guard_approval_notice(self, notice: ApprovalNotice) -> dict[str, Any]:
+        """Recheck the actual waiter and run, without selecting a new origin."""
+        session_id, run_id = notice.session_id, notice.run_id
+        task = self.tasks.get(session_id)
+        if (
+            self._closing
+            or not self.maintenance.admission.allowed
+            or session_id in self._stopping
+            or self.team._parent_stopping(session_id)
+            or self.run_ids.get(session_id) != run_id
+            or task is None
+            or task.done()
+            or task.cancelling()
+        ):
+            raise ValueError("审批所属执行已停止或暂停，通知保留在本地")
+        budget = self.config.settings.limits.max_output_chars
+        approval = live_approval(self.permissions, notice.approval_id, budget=budget)
+        if approval is None or approval["session_id"] != session_id or approval["run_id"] != run_id:
+            raise ValueError("审批已结束或不属于原执行，通知保留在本地")
+        run = self.store.bounded_object("run", run_id, max_bytes=budget * 4)
+        if run is None or run.get("session_id") != session_id or run.get("status") != "running":
+            raise ValueError("审批所属运行无法核验，通知保留在本地")
+        return approval
 
     def session_live(
         self, session: dict[str, Any], *, candidate_run_id: str | None = None
@@ -2119,6 +2143,7 @@ class Runtime:
                 tool.risk,
                 session_id,
                 run_id,
+                reply_origin=prepared.reply_origin,
             )
             if self.store.pending_inputs(session_id):
                 return {

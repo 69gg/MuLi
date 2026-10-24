@@ -90,10 +90,29 @@ async def test_pause_wins_after_last_await_before_handler(
         started = await runtime.start(
             worker["id"], "检查", mode="ask" if gate.startswith("approval") else "yolo"
         )
-        await asyncio.wait_for(entered.wait(), 2)
+        approval_id: str | None = None
+        if gate == "approval.requested":
+
+            def waiting_approvals() -> list[dict[str, Any]]:
+                return [
+                    approval
+                    for approval in runtime.live_approvals(worker["id"])
+                    if approval["run_id"] == started["run_id"] and approval["tool"] == "probe"
+                ]
+
+            # Approval persistence now uses Store.event + notify atomically;
+            # observe the real waiter instead of intercepting bus.emit.
+            async with asyncio.timeout(2), runtime.bus.changed:
+                await runtime.bus.changed.wait_for(lambda: bool(waiting_approvals()))
+            approvals = waiting_approvals()
+            assert len(approvals) == 1
+            approval_id = approvals[0]["id"]
+            assert not runtime.permissions.pending[approval_id].done()
+        else:
+            await asyncio.wait_for(entered.wait(), 2)
         await runtime.submit_task_control(item["id"], OwnerControlRequest("pause", 0, "pause"))
-        if gate.startswith("approval"):
-            await runtime.permissions.resolve(next(iter(runtime.permissions.pending)), "approve")
+        if approval_id is not None:
+            await runtime.permissions.resolve(approval_id, "approve")
         release.set()
         with pytest.raises(TaskPaused):
             await asyncio.wait_for(runtime.wait(started["run_id"]), 2)

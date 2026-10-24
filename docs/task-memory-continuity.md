@@ -88,3 +88,24 @@ Ruff通过；格式首查三处文件排版，根只用格式器修正后全仓4
 任务控制/lifespan及2.61版本烟测同一守卫2.738秒、114.9MiB、swap0、exit0。
 独立发行内容校验186毫秒、19.4MiB、swap0、exit0，四处版本、兼容声明及两构件一致；
 仅读validate结果，没有覆写release-notes。
+
+## 发行闭合
+
+精确GPG签名提交 `c3dab8f57216a1d1d98749f070fceaa2a3e3167c` 的
+[候选CI 40095978784](https://github.com/69gg/MuLi/actions/runs/40095978784) 十二项全部success。
+GPG签名标签v2.61.0验证Good signature后与main原子推送；
+[Release 40096888382](https://github.com/69gg/MuLi/actions/runs/40096888382) 十五项全部success。
+同SHA重复main CI `40096887968` 已终态cancelled，不记为通过。
+
+[GitHub v2.61.0](https://github.com/69gg/MuLi/releases/tag/v2.61.0) 于
+2026-10-24T13:17:29Z发布。根经守卫只读GitHub/PyPI小体积元数据，核对两平台构件
+名称、字节大小及SHA-256一致、PyPI未yank；守卫3.189秒、46MiB、swap0、exit0，
+没有下载发行包。
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| muli_agent-2.61.0-py3-none-any.whl | 866433 | b5910ad27cb4da06ca49c02ac88b99c8740eb879244d78232c65da41f3a04873 |
+| muli_agent-2.61.0.tar.gz | 4604651 | c18b3b530bfab189e864d4766fb3e25fd71b132bb243660c584b851e7114bcad |
+
+发行事实记入后继候选，不修改已经冻结的标签。既有首红、总体预算失败和交集反例保留，
+不以最终通过倒写此前结果；外部账号、真实设备及自然模型质量仍未验。

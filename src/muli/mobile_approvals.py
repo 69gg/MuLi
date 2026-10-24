@@ -57,6 +57,50 @@ def _object(data: bytes) -> dict[str, Any]:
     return value
 
 
+def live_approval(
+    permissions: Permissions, identifier: str, *, budget: int
+) -> dict[str, Any] | None:
+    """Point-read the same bounded, live permission used by mobile decisions."""
+    future = permissions.pending.get(identifier)
+    if future is None or future.done():
+        return None
+    row = permissions.store.db.execute(
+        "SELECT CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
+        "THEN CAST(data AS BLOB) END AS raw FROM objects WHERE kind='approval' AND id=?",
+        (budget * 4, identifier),
+    ).fetchone()
+    if row is None or not isinstance(row["raw"], bytes):
+        raise ValueError("approval_unavailable")
+    item = _object(row["raw"])
+    if (
+        set(item)
+        != {
+            "id",
+            "session_id",
+            "run_id",
+            "tool",
+            "arguments",
+            "reason",
+            "risk",
+            "status",
+            "created_at",
+        }
+        or item["id"] != identifier
+        or not _ID.fullmatch(identifier)
+        or item["status"] != "pending"
+        or not all(
+            isinstance(item[key], str) and item[key]
+            for key in ("session_id", "run_id", "tool", "risk")
+        )
+        or not isinstance(item["reason"], str)
+        or not isinstance(item["arguments"], dict)
+        or type(item["created_at"]) not in {int, float}
+        or not math.isfinite(item["created_at"])
+    ):
+        raise ValueError("approval_unavailable")
+    return item
+
+
 class MobileApprovals:
     def __init__(self, permissions: Permissions, *, budget: int) -> None:
         self.permissions, self.store, self.budget = permissions, permissions.store, budget
@@ -152,49 +196,7 @@ class MobileApprovals:
             raise MobileControlRejected("reference_invalid", "手机审批回执无法核验") from error
 
     def _live(self, identifier: str) -> dict[str, Any] | None:
-        future = self.permissions.pending.get(identifier)
-        if future is None or future.done():
-            return None
-        row = self.store.db.execute(
-            "SELECT CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
-            "THEN CAST(data AS BLOB) END AS raw FROM objects WHERE kind='approval' AND id=?",
-            (self.budget * 4, identifier),
-        ).fetchone()
-        if row is None or not isinstance(row["raw"], bytes):
-            raise ValueError("approval_unavailable")
-        item = _object(row["raw"])
-        if (
-            set(item)
-            != {
-                "id",
-                "session_id",
-                "run_id",
-                "tool",
-                "arguments",
-                "reason",
-                "risk",
-                "status",
-                "created_at",
-            }
-            or item["id"] != identifier
-            or not _ID.fullmatch(identifier)
-            or item["status"] != "pending"
-            or not all(
-                isinstance(item[key], str) and item[key]
-                for key in (
-                    "session_id",
-                    "run_id",
-                    "tool",
-                    "risk",
-                )
-            )
-            or not isinstance(item["reason"], str)
-            or not isinstance(item["arguments"], dict)
-            or type(item["created_at"]) not in {int, float}
-            or not math.isfinite(item["created_at"])
-        ):
-            raise ValueError("approval_unavailable")
-        return item
+        return live_approval(self.permissions, identifier, budget=self.budget)
 
     @staticmethod
     def _render(item: dict[str, Any]) -> str:
