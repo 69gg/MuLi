@@ -247,9 +247,9 @@ class NativeLifecycle(AbstractContextManager["NativeLifecycle"]):
             self.close()
 
 
-def command(argv: Sequence[str], *, seconds: float = 5) -> Reply:
+def command(argv: Sequence[str], *, seconds: float = 5, output_bytes: int = OUTPUT_BYTES) -> Reply:
     """Bound both output and lifetime, and reap the one owned command group."""
-    if not 0 < seconds <= HARNESS_SECONDS + CLEANUP_SECONDS:
+    if not 0 < seconds <= HARNESS_SECONDS + CLEANUP_SECONDS or not 0 < output_bytes <= OUTPUT_BYTES:
         raise FixtureError("native_command_budget")
     end = time.monotonic() + seconds
     actual = resource_worker().resource_sudo_arguments(argv)
@@ -271,12 +271,12 @@ def command(argv: Sequence[str], *, seconds: float = 5) -> Reply:
                 if remaining <= 0:
                     raise FixtureError("native_command_timeout")
                 for key, _ in selector.select(remaining):
-                    data = os.read(key.fd, min(4096, OUTPUT_BYTES + 1 - len(output)))
+                    data = os.read(key.fd, min(4096, output_bytes + 1 - len(output)))
                     if not data:
                         selector.unregister(key.fileobj)
                     else:
                         output.extend(data)
-                        if len(output) > OUTPUT_BYTES:
+                        if len(output) > output_bytes:
                             raise FixtureError("native_command_output_budget")
         return Reply(process.wait(timeout=max(0.001, end - time.monotonic())), bytes(output))
     finally:
@@ -1545,7 +1545,9 @@ class NativeCI:
         ):
             raise FixtureError("native_volume_directory_changed")
 
-    def call(self, argv: Sequence[str], *, seconds: float = 5) -> Reply:
+    def call(
+        self, argv: Sequence[str], *, seconds: float = 5, output_bytes: int | None = None
+    ) -> Reply:
         deadline = (
             self.cleanup_deadline if self.cleanup_deadline is not None else self.execute_deadline
         )
@@ -1558,7 +1560,10 @@ class NativeCI:
             seconds = min(seconds, deadline - time.monotonic())
             if seconds <= 0:
                 raise FixtureError(code)
-        reply = self.run(argv, seconds=seconds)
+        if output_bytes is not None and self.run is command:
+            reply = command(argv, seconds=seconds, output_bytes=output_bytes)
+        else:
+            reply = self.run(argv, seconds=seconds)
         if deadline is not None and time.monotonic() >= deadline:
             raise FixtureError(code)
         return reply
@@ -2029,6 +2034,36 @@ class NativeCI:
     def as_user(self, *argv: str, seconds: float = 5) -> bytes:
         return self.checked(self.user_arguments(*argv), seconds=seconds)
 
+    def normalize_manager_environment(self) -> None:
+        """Fix only the owned manager's two XDG values before starting any child unit."""
+        uid, _ = self.current_account()
+        if not self.check_manager_environment():
+            raise FixtureError("native_manager_environment_unconfirmed")
+        allowance = OUTPUT_BYTES - self.setup_bytes
+        # The real command's overflow probe also belongs to this original allowance.
+        if allowance <= 1:
+            raise FixtureError("native_diagnostic_output_budget")
+        argv = self.user_arguments(
+            "systemctl",
+            "--user",
+            "set-environment",
+            f"XDG_CONFIG_HOME={self.home / '.config'}",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+        )
+        before = self.setup_bytes
+        try:
+            reply = self.call(argv, seconds=CLEANUP_SECONDS, output_bytes=allowance - 1)
+        except Exception:
+            # A missing reply cannot refund output that may already have been read.
+            self.setup_bytes = OUTPUT_BYTES
+            raise
+        if len(reply.output) >= allowance:
+            self.setup_bytes = OUTPUT_BYTES
+            raise FixtureError("native_diagnostic_output_budget")
+        self.setup_bytes = before + len(reply.output)
+        if reply.code:
+            raise FixtureError("native_command_failed")
+
     def mount(self, path: Path) -> dict[str, Any] | None:
         result = self.call(
             (
@@ -2217,6 +2252,7 @@ class NativeCI:
         self.save()
         self.manager_limits = verify_kernel(CGROUP_ROOT / group.lstrip("/"), MEMORY, TASKS)
         self.bootstrap_files("check")
+        self.normalize_manager_environment()
         if self.execute_deadline is not None:
             self.execute_remaining()
         return description

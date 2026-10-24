@@ -275,6 +275,16 @@ class Commands:
             return ci.Reply(0)
         if args[0] in {"systemctl", "chown", "chmod"}:
             return ci.Reply(0)
+        if "systemctl" in args:
+            action = args[args.index("systemctl") :]
+            if action[:3] == ("systemctl", "--user", "set-environment"):
+                assert args[:5] == ("--user", next(iter(self.accounts)), "--", "env", "-i")
+                home = self.accounts[args[1]][2]
+                assert len(action) == 5 and set(action[3:]) == {
+                    f"XDG_CONFIG_HOME={Path(home) / '.config'}",
+                    f"XDG_RUNTIME_DIR=/run/user/{self.uid}",
+                }
+                return ci.Reply(0)
         assert args[:1] == ("--user",) and "systemd-run" in args
         if args[-2] == "drive":
             result = {
@@ -365,6 +375,264 @@ def private_environment(monkeypatch: pytest.MonkeyPatch, root: Path, uid: int) -
         "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
     }.items():
         monkeypatch.setenv(key, value)
+
+
+def test_prepare_normalizes_only_the_new_manager_xdg_after_ready_and_owned_checks(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    order: list[str] = []
+    dispatched: list[tuple[str, ...]] = []
+    original_environment = native.check_manager_environment
+    original_bootstrap = native.bootstrap_files
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/foreign/config")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/foreign/runtime")
+
+    def check_environment() -> bool:
+        result: bool = original_environment()
+        if result:
+            order.append("environment_verified")
+        return result
+
+    def check_bootstrap(mode: str) -> None:
+        original_bootstrap(mode)
+        if mode == "check":
+            order.append("bootstrap_verified")
+
+    def invoke(argv: Any, *, seconds: float = 5) -> Any:
+        values = tuple(argv)
+        if "systemctl" in values:
+            action = values[values.index("systemctl") :]
+            if action[:3] == ("systemctl", "--user", "set-environment"):
+                receipt = native.receipt
+                assert receipt is not None and receipt.uid == commands.uid
+                assert values[:7] == (
+                    "sudo",
+                    "--non-interactive",
+                    "--user",
+                    receipt.user,
+                    "--",
+                    "env",
+                    "-i",
+                )
+                assert len(action) == 5 and set(action[3:]) == {
+                    f"XDG_CONFIG_HOME={native.home / '.config'}",
+                    f"XDG_RUNTIME_DIR=/run/user/{commands.uid}",
+                }
+                assert "ready" in order
+                after_ready = order[order.index("ready") + 1 :]
+                assert "environment_verified" in after_ready
+                assert "bootstrap_verified" in after_ready
+                assert native.manager_limits
+                assert not any("systemd-run" in call for call in commands.calls)
+                assert 0 < seconds <= ci.CLEANUP_SECONDS
+                commands.calls.append(values)
+                dispatched.append(action)
+                order.append("normalized")
+                return ci.Reply(0)
+        reply = commands(values, seconds=seconds)
+        if len(values) == 11 and values[3] == "manager-ready":
+            order.append("ready")
+        return reply
+
+    monkeypatch.setattr(native, "check_manager_environment", check_environment)
+    monkeypatch.setattr(native, "bootstrap_files", check_bootstrap)
+    native.run = invoke
+    native.prepare()
+    assert len(dispatched) == 1, (
+        "READY 后须真实 dispatch 两键 manager normalize，不能只改客户端环境"
+    )
+
+
+def test_execute_inherits_the_dispatched_manager_environment_at_the_original_worker_gate(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    manager_environment: dict[str, str] = {}
+    normalizations: list[tuple[str, ...]] = []
+    admitted: list[str] = []
+    initial_rejections: list[str] = []
+
+    def child_environment() -> dict[str, bool | str]:
+        # Only the command runner's synthetic account/manager is substituted.
+        # The original worker comparison and rejection implementation runs intact.
+        with monkeypatch.context() as context:
+            for key, value in manager_environment.items():
+                context.setenv(key, value)
+            context.setattr(worker.os, "getuid", lambda: commands.uid)
+            context.setattr(worker.os, "geteuid", lambda: commands.uid)
+            return worker.require_environment(native.volume, commands.uid)
+
+    def invoke(argv: Any, *, seconds: float = 5) -> Any:
+        values = tuple(argv)
+        if "systemctl" in values:
+            action = values[values.index("systemctl") :]
+            if action[:3] == ("systemctl", "--user", "set-environment"):
+                assert native.receipt is not None
+                assert values[:5] == (
+                    "sudo",
+                    "--non-interactive",
+                    "--user",
+                    native.receipt.user,
+                    "--",
+                )
+                assert len(action) == 5 and set(action[3:]) == {
+                    f"XDG_CONFIG_HOME={native.home / '.config'}",
+                    f"XDG_RUNTIME_DIR=/run/user/{commands.uid}",
+                }
+                assert initial_rejections == ["native_environment_mismatch"]
+                assert native.execute_deadline is not None
+                assert 0 < seconds <= ci.CLEANUP_SECONDS
+                commands.calls.append(values)
+                normalizations.append(action)
+                # Updating the systemd-run client's env never reaches this branch.
+                manager_environment.update(value.split("=", 1) for value in action[3:])
+                return ci.Reply(0)
+        if "systemd-run" in values:
+            facts = child_environment()
+            assert all(value is True for key, value in facts.items() if key != "config_source")
+            admitted.append(values[-2])
+        reply = commands(values, seconds=seconds)
+        if "useradd" in values:
+            manager_environment.update(
+                HOME=str(native.home),
+                XDG_CONFIG_HOME="/synthetic-manager/config-other",
+                XDG_RUNTIME_DIR="/synthetic-manager/runtime-other",
+                DBUS_SESSION_BUS_ADDRESS=f"unix:path=/run/user/{commands.uid}/bus",
+            )
+            with pytest.raises(
+                worker.NativeError, match="^native_environment_mismatch$"
+            ) as failure:
+                child_environment()
+            initial_rejections.append(str(failure.value))
+        return reply
+
+    native.run = invoke
+    native.execute()
+    ci.NativeCI(native.root, run=invoke).cleanup()
+    assert len(normalizations) == 1
+    assert admitted == ["drive", "cleanup"]
+    assert not commands.accounts and not commands.mounts
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "output", "nonzero_output", "lost"])
+def test_manager_normalization_failure_keeps_original_budget_and_starts_no_transient(
+    fixture: tuple[Any, Commands], failure: str
+) -> None:
+    native, commands = fixture
+    before: list[int] = []
+
+    def invoke(argv: Any, *, seconds: float = 5) -> Any:
+        values = tuple(argv)
+        if "set-environment" in values:
+            before.append(native.setup_bytes)
+            commands.calls.append(values)
+            if failure == "lost":
+                raise ci.FixtureError("native_command_timeout")
+            if failure in {"output", "nonzero_output"}:
+                return ci.Reply(
+                    int(failure == "nonzero_output"),
+                    b"x" * (ci.OUTPUT_BYTES - native.setup_bytes),
+                )
+            return ci.Reply(1, b"fixed failure")
+        return commands(values, seconds=seconds)
+
+    native.run = invoke
+    expected = {
+        "nonzero": "native_command_failed",
+        "output": "native_diagnostic_output_budget",
+        "nonzero_output": "native_diagnostic_output_budget",
+        "lost": "native_command_timeout",
+    }[failure]
+    with pytest.raises(ci.FixtureError, match=f"^{expected}$"):
+        native.prepare()
+    assert len(before) == 1
+    assert native.setup_bytes == (
+        before[0] + len(b"fixed failure") if failure == "nonzero" else ci.OUTPUT_BYTES
+    )
+    assert not any("systemd-run" in call for call in commands.calls)
+
+
+def test_manager_normalization_without_remaining_output_never_dispatches(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    ready = False
+    original_environment = native.check_manager_environment
+
+    def check_environment() -> bool:
+        result: bool = original_environment()
+        if ready:
+            native.setup_bytes = ci.OUTPUT_BYTES
+        return result
+
+    def invoke(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal ready
+        values = tuple(argv)
+        result = commands(values, seconds=seconds)
+        if len(values) == 11 and values[3] == "manager-ready":
+            ready = True
+        return result
+
+    monkeypatch.setattr(native, "check_manager_environment", check_environment)
+    native.run = invoke
+    with pytest.raises(ci.FixtureError, match="^native_diagnostic_output_budget$"):
+        native.prepare()
+    assert not any("set-environment" in call or "systemd-run" in call for call in commands.calls)
+
+
+def test_manager_normalization_rejects_unconfirmed_environment_before_dispatch(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    ready = False
+    original_environment = native.check_manager_environment
+
+    def check_environment() -> bool:
+        return False if ready else bool(original_environment())
+
+    def invoke(argv: Any, *, seconds: float = 5) -> Any:
+        nonlocal ready
+        values = tuple(argv)
+        result = commands(values, seconds=seconds)
+        if len(values) == 11 and values[3] == "manager-ready":
+            ready = True
+        return result
+
+    monkeypatch.setattr(native, "check_manager_environment", check_environment)
+    native.run = invoke
+    with pytest.raises(ci.FixtureError, match="^native_manager_environment_unconfirmed$"):
+        native.prepare()
+    assert not any("set-environment" in call or "systemd-run" in call for call in commands.calls)
+
+
+@pytest.mark.parametrize("material", ["environment", "bootstrap", "limits"])
+def test_manager_normalization_rechecks_owned_material_after_ready(
+    fixture: tuple[Any, Commands], material: str
+) -> None:
+    native, commands = fixture
+
+    def invoke(argv: Any, *, seconds: float = 5) -> Any:
+        values = tuple(argv)
+        result = commands(values, seconds=seconds)
+        if len(values) == 11 and values[3] == "manager-ready":
+            assert native.receipt is not None
+            if material == "environment":
+                path = native.environment_directory() / ci.ENVIRONMENT_NAME
+                data = path.read_bytes()
+                path.write_bytes(b"!" + data[1:])
+            elif material == "bootstrap":
+                path = native.home / ".config/systemd/user" / (native.receipt.user + ".target")
+                path.write_bytes(b"!" + path.read_bytes()[1:])
+            else:
+                path = commands.cgroup_root / commands.group.lstrip("/") / "memory.max"
+                path.write_text("max", encoding="ascii")
+        return result
+
+    native.run = invoke
+    with pytest.raises(ci.FixtureError):
+        native.prepare()
+    assert not any("set-environment" in call or "systemd-run" in call for call in commands.calls)
 
 
 def test_bootstrap_target_is_owned_and_verified_before_manager_start(
@@ -861,11 +1129,34 @@ def test_bootstrap_create_is_the_only_complete_prestart_leaf_observation(
             stages.append("start")
         elif "manager-ready" in args:
             stages.append("ready")
-    assert stages == ["template", "install", "reload", "create", "idle", "start", "ready", "check"]
+        elif "set-environment" in args:
+            stages.append("normalize")
+    assert stages == [
+        "template",
+        "install",
+        "reload",
+        "create",
+        "idle",
+        "start",
+        "ready",
+        "check",
+        "normalize",
+    ]
     install = next(i for i, args in enumerate(commands.calls) if "install" in args)
     reload = next(i for i, args in enumerate(commands.calls) if "daemon-reload" in args)
-    assert len(rereads) == 1 and install < rereads[0][0] <= reload
-    assert rereads[0][1] == len(native.environment_data())
+    ready = next(i for i, args in enumerate(commands.calls) if "manager-ready" in args)
+    normalize = next(i for i, args in enumerate(commands.calls) if "set-environment" in args)
+    prestart_reads = [item for item in rereads if item[0] <= ready]
+    assert len(prestart_reads) == 1 and install < prestart_reads[0][0] <= reload
+    # The new write requires its own post-READY ownership check; it does not
+    # reintroduce the removed duplicate complete bootstrap check before start.
+    normalize_reads = [item for item in rereads if ready < item[0] <= normalize]
+    assert len(normalize_reads) == 1
+    assert rereads == prestart_reads + normalize_reads
+    expected_bytes = len(native.environment_data())
+    assert prestart_reads[0][1] == normalize_reads[0][1] == expected_bytes
+    assert sum(cost for _, cost in rereads) == 2 * expected_bytes
+    assert native.setup_bytes <= ci.OUTPUT_BYTES
     assert native.receipt.bootstrap_file is not None
 
 

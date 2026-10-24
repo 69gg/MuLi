@@ -562,3 +562,92 @@ swap0。该结果只闭合bootstrap raw探测越1字节回归，不代表真实R
 全仓378文件格式检查通过（守卫68毫秒、21.7MiB、swap0）。
 非作者审查除已修raw+1外未见新增阻断问题；
 这组离线结果不替代下一次隔离runner上的真实启动、事务与完整cleanup验收。
+
+### Native25：READY 后的交易进程环境边界（仅目标红，生产未改）
+
+根已验证精确候选 `088c2c7` 的 CI `40064351476`、native job `120784343681`：
+运行在 04:57:18–04:57:21 失败，cleanup 步骤仍失败，不能沿用此前约 82 秒的 deadline
+解释。792 字节证据包 `/tmp/muli-native25-evidence.zip` 的 SHA-256 为
+`325f70acb0d580366f8a5d5c0c1333ad6eaf0631dbdec0cba2d9dc7bf2a01f56`；
+根已通过既有成员、Receipt 和 `fixture_result` 严格校验。
+
+本轮 manager readiness 为 240ms、`late_ready=false`；实际交易 worker 已进入 `import`，
+但固定环境门报告 `native_environment_mismatch`：UID、HOME 和 user-bus 地址匹配，
+`config_source=explicit`，XDG config/runtime 均不匹配。timeline 只有 elapsed 0 的 import，
+generations 为空，正式事务仍为零。原 harness 256MiB/CPU1/32 tasks 与 manager
+1GiB/CPU1/128 tasks 均保持。receipt 最后为 `manager_show_after`，登记 manager 为
+`/usr/lib/systemd/systemd`，user/group removed 为 true、mounts 为 0；这不覆盖
+`resources.cleanup=failed`，不能称完整清理已验收。
+
+源码区分启动客户端和被启动进程：`user_arguments` 的 `env -i` 只规范调用
+`systemd-run` 的客户端；真实 transient unit、后续正式应用和 helper 仍继承 user manager
+的环境。当前事实不证明偏差由某个 generator 引入，也没有导出偏差原值。仅在两个
+transient argv 增加环境不能覆盖后续正式服务，不能视为完整修复。
+
+根批准的下一单变量仅针对这个新 UID 的 fixture manager：READY、原私有材料与身份守卫
+之后，任何 transient/application 启动之前，实际 dispatch 一次固定
+`systemctl --user set-environment XDG_CONFIG_HOME=<owned home/.config> XDG_RUNTIME_DIR=/run/user/<实际UID>`。
+只写这两个既定值，不改 HOME、DBUS、force、vendor unit、控制命令、生成器、READY 或
+worker/app 的环境门。这是新增的一次有界写操作，必须诚实计入原执行绝对 deadline 和
+32768 输出额度；不声称总调用数未增，不增加原时间、内存、任务或输出上限。
+
+先行两个纯回归走真实 `NativeCI.prepare/execute` 与既有 `Commands`：第一要求实际准确
+新 UID dispatch 发生在 READY 和材料复验之后、首 transient 之前；第二让受控 manager 的
+两键最初不符，只由实际收到的固定 `set-environment` 命令改变其状态，再交原
+`worker.require_environment`，要求从拒绝到 drive/cleanup 均可接纳。只改父客户端环境
+不能让该测试通过。账户、manager 和系统命令仍由离线替身承接，未运行真实 systemd、
+FFI、私有 socket 或 generator；不宣称这证明真实继承、正式事务或 cleanup 已修复。
+本轮只有测试和方案已写，作者未执行检查，生产待根实收目标红后另行授权；没有新 CI 授权。
+
+### Native26：固定两键 manager normalize 候选（生产已冻结，待根复验）
+
+Native25 精确 CI `40064351476` 最终为 10 个 job 成功、managed-native 一个失败；
+Windows3.12/3.13 本轮实绿，不覆盖 Native24 两个 Windows 失败的历史。
+根随后实际收取上述两项目标红：2 failed，pytest0.85秒、守卫1.410秒、105.7MiB、
+swap0。一项准确失败于未 dispatch normalize，另一项实际到原 worker 环境门，
+以 `native_environment_mismatch` 拒绝；不是缺 API 或导入失败。
+
+授权后的窄实现仅在原 prepare 的真实 READY、manager kernel limits 和 bootstrap
+复核之后，再复验原 manager 私有 drop-in，并用已核新账户和 owned home 生成两键。
+固定 `systemctl --user set-environment` 实际以该 UID 调用，先于首个 transient；
+不接受父环境或任意键值注入，不触碰 worker、app 或 cleanup 原有环境门。
+这是一次新增命令，沿原 execute 绝对截止裁剪至原5秒命令上限；未增查询或另起期限。
+
+新增命令不用先抛非零状态的 `checked/as_user` 包装：先计原始 stdout/stderr 合并回包，
+再判状态。真实默认 runner 仅此处接收原 setup 余额减1的输出限额，为原余额内的
+溢出探测留位；旧调用的默认32768门不变。成功按实际字节记账，非零也计回包，
+超额或无回包保守耗尽余额、不退款；不足以保留探测时不 dispatch。
+离线注入 runner 只在返回后核额度，不宣称它具备真实进程读取硬门。
+
+必要负控覆盖非零、零/非零超额、丢回包、无余额、未确认 drop-in、READY 后真实
+私有环境/bootstrap/资源材料改变时不 normalize 或启动 transient。原先两个核心
+行为 oracle 保留，其中准确命令断言还在外来父 XDG 环境下运行。
+作者未运行检查、格式、真实服务或新 CI；候选等待根统一离线复验与非作者后审。
+READY240ms 是 Native25 已观察到的进展，正式事务和完整 cleanup 仍未验收，
+本候选不证明环境偏差来源或真实继承已修复。
+
+根首轮实际收取新增11项全部通过（pytest0.52秒、守卫1.065秒、102MiB）；
+完整七文件为837 passed、1 failed（pytest2.48秒、守卫3.146秒、159.1MiB）。
+唯一失败是旧启动前观察 oracle 把全部 manager 私有环境读取都限制为一次；新增
+READY 后、normalize 写入前的所有权复核是本片已授权的新观察，不能删除来迁就旧断言。
+测试现按真实 reload/READY/normalize 命令边界区分：启动前仍恰好一次，位于 install
+之后、reload 之前；READY 之后、normalize 之前另恰好一次，二者各自实际正文长度均计入
+原 setup 字节账本，不能有其它未分类读取，也不放大32768额度。只改测试和本说明，
+生产仍保持冻结；该 oracle 修订待根复验。
+
+### Native26 最终离线验证与独立后审
+
+根对上述唯一修订 oracle 实际复验为1 passed。因此完整七文件首跑的837个通过节点，
+加该唯一失败节点修订后的通过，共覆盖838个不同节点；**不是一次838项全量通过**，
+新增11项是其中子集，不另行累计。生产未为该旧断言删减复核或改变预算。
+
+coordinator、worker、peer 三脚本沿原显式 `MYPYPATH=src:tests`、
+`--strict --no-incremental --explicit-package-bases` 检查通过，守卫5.340秒、
+290.2MiB。根最后仅排版两个文件；随后全仓Ruff通过（83毫秒、25.8MiB），
+378文件格式检查通过（87毫秒、21.9MiB）。
+
+D 非作者正式后审未发现剩余P1/P2：新增写入只在READY后针对该新UID执行一次固定
+两XDG键的 `set-environment`，保留原绝对deadline、原输出记账和worker/app/cleanup
+环境门。以上均为离线受控验证；真实manager环境继承、正式事务和完整cleanup仍待
+新的精确远端CI，不能由Native25的READY进展或这些离线绿推为已修复。
+作者未执行检查、格式、Git、网络或真实服务；本次仅追加文档，源码与测试保持冻结。
