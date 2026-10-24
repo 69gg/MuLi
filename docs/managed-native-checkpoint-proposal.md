@@ -772,3 +772,173 @@ P1/P2：确认五字段成组、精确类型及枚举、新旧回执兼容，直
 以上离线绿只验证固定首因证据的保留与边界，不证明Native27真实adopt失败根因已解决，
 也不包含cleanup修复或新远端事务验收。本次仅追加文档并冻结，作者未改生产/测试，
 未执行检查、Git或网络。
+
+### Native28 现场首因边界与 Native29 最小异常位置提案
+
+根对精确头 `0b2a3dd16e4f2a0af157f2b7a26ea71306765620` 收取并严格校验
+artifact `12549314435`（1730字节，SHA-256
+`b6e95867b963ecec8564a8b419c3326ae90e873d232547bf58de56a4fc44ff09`）。
+环境全true，origin_ready6286ms；rev1 prepared7792ms、rev2 draining14991ms、
+rev3 activating/stop_base20688ms、rev4 rolling_back/stop_target24938ms、
+rev5 recovery_required25983ms。后两次code和failure_code均为backend_failed。
+helper在15019ms为active/exit0；这不是事务成功。cleanup仍失败，receipt三mount及
+账户未移除。准确结论仅是stop_base位置失败、尚未进入install_target：通用controller
+在执行stop之前仍先调用observe，现有证据不能区分二者，更不能证明systemctl stop失败。
+
+最小候选复用 `src/muli/failure_diagnostics.py::capture_failure`，不新造异常原因枚举。
+在 `management_controller._Controller._call` 原异常改写前捕获原exc，以固定前缀输出
+一个有限JSON envelope：version、generation、revision、intent及原五键diagnostic；
+固定MESSAGE前缀为 `muli.controller_failure.v1 `。
+保留原backend_failed/deadline_exceeded、clock_invalid直传和CancelledError语义；
+capture、序列化或日志写入失败均局部隔离，不改变任何事务决策。每个controller实例
+仅首次backend failure尝试一次，先标记已尝试；回滚后错不覆盖、不重试capture。
+不输出str/repr、异常参数、locals、cause/context、路径、nonce或HTTP正文。
+使用标准固定logger，无exc_info/stack_info；独立helper的日志配置须确保该固定消息
+能到原stderr/journal，而不是假定Runtime私有logger可用于helper。
+
+原payload最多16帧/4096字节，仅保package-owned module/function/line；
+ObservationError与TransactionError精确类型不在原表，返回unknown是正常结果。
+这仍可定位受控raise，但16帧按外向内截断、locals/lambda未知帧及下层异常包装意味着
+不保证每次取得最深raise或真实外部命令原因。reader通过现模块新增极小公开validator
+复用原 `_validated`，不从外部直接导入私有函数、不另复制schema；实现前须保留
+isolated脚本的固定模块装载边界，不能为复用而放宽sys.path或制造通用诊断框架。
+
+谁读/何时读：worker只从 `Case.helper_empty` 原已取得且核过name/argv/cgroup的snapshot
+冻结非零PID与invocation，关联当前generation；不增加probe。没有可信快照、早collect或
+同代身份漂移则not_observed，不补查询或按名称捞旧日志。root coordinator在现
+collect_result之后、cleanup停manager之前，最多新增一次有界journal读取；不由隔离UID
+worker读系统journal，不使用 `journalctl --user`。固定查询同时匹配可信 `_UID`、`_PID`、
+`_SYSTEMD_USER_UNIT`、`_SYSTEMD_INVOCATION_ID`，只取所需固定JSON字段；MESSAGE须匹配
+固定前缀、完整envelope、受信代次及其已观察revision/intent和公开validator。
+任意其它消息不导出。只保留该controller实例的首条，不用回滚诊断覆盖它。
+可信字段缺失、超额、超时或坏日志均只使诊断不可用，不改变原code与cleanup结果。
+
+字段与匹配依据是systemd255官方
+[journal-fields](https://www.freedesktop.org/software/systemd/man/255/systemd.journal-fields.html)
+和 [journalctl](https://www.freedesktop.org/software/systemd/man/255/journalctl.html)：
+不同字段AND，可信invocation对应unit运行周期；非下划线用户字段INVOCATION_ID不能替代。
+文档不证明本轮runner必定提供这些字段，真实缺失必须如实not_observed。
+
+这明确新增一次journal读取，不再声称查询数不变；没有新增DBus probe、重试、启动或
+期限。journal实际stdout/stderr、JSON envelope及最终保存投影均计入原剩余字节，
+保原绝对deadline、进程资源、64条timeline、32KiB总门和receipt/result两个artifact成员。
+4096字节是diagnostic上限，不是另发额度；剩余不足必须不读/不接纳，不能取消原失败
+或截坏JSON后强行采信。安全诊断放原result的严格optional resources字段，不加journal
+持久字段或修改Code枚举；旧artifact缺该字段仍兼容，新增绑定材料不算事务授权。
+
+预计生产接缝仅原failure_diagnostics的公开校验、management_controller原catch处、
+worker既有helper快照绑定、coordinator一次rootjournal读取及fixture_result严格投影。
+先红应走真实Journal/ManagedTransactionController.step和真实package内受控raise：
+原backend_failed/回滚决定仍成立，但缺应有的安全诊断；再核observe与stop位置可区别、
+异常正文不泄漏、诊断自身失败不遮原错。journal解析另沿真实有限回包入口做身份/前缀/
+预算负控，不以函数存在或未来schema缺字段作为唯一红。提案首次冻结时仅改文档，
+未运行检查、Git、网络或服务；尚无Native29/真实异常位置验收。
+
+根随后核Native28整轮远端终态：其它10个job成功，唯一managed-native的run与cleanup
+两个step失败；这不改变上述准确事务与清理边界。Native29提案前审后进一步收窄为
+每controller实例最多一条首失败诊断，尚无实现或新远端运行。
+
+随后仅新增 `tests/test_managed_controller_failure_diagnostic.py::
+test_real_stop_failure_keeps_decision_and_safe_original_package_location`：复用真实Host的
+快照/Journal/advance与ManagedLinuxBackend，经真实controller.step和真实包内_command
+抛ObservationError，只有manager证据、HTTP及外部command返回为离线替身。先核准确
+stop argv确已到达、原backend_failed与回滚决定不变，再期待首条安全位置诊断且无命令
+正文泄漏。未替换capture/logger，不导入未来API；作者未运行，生产未动，待根收真实红。
+
+根实收此唯一目标真实红：1 failed，pytest0.49秒、守卫1.054秒、64.6MiB、swap0。
+实际observe通过、准确stop seam到达一次，原rolling_back/stop_target、两backend_failed、
+rollback_attempted及同deadline均已通过；唯一缺口是应有一条诊断实际为零。
+
+授权后的首批核心候选仅修改failure_diagnostics和management_controller：公开校验函数
+委托原_validated，不另造schema；原_call改写前捕获原exc，首attempt标记先于capture，
+固定logger输出安全envelope，取消与clock_invalid不诊断，诊断自身普通异常被局部隔离。
+本批源码静态读回后冻结，原目标测试不改；尚待根实测，不提前写绿。CI收集接缝尚未实现。
+
+根首复验仍为1 failed（pytest0.47秒、守卫1.135秒、63.9MiB）：诊断已出现且controller帧
+可定位，但真实backend两帧为unknown，原目标位置断言未放宽。源码确认其继承标准
+AbstractAsyncContextManager，位置门原只接纳精确type而遗漏标准ABCMeta。候选仅额外
+接纳精确abc.ABCMeta，仍核原module/globals/FunctionType/code身份；未知元类及恶意
+ABCMeta子类继续拒绝并补两负控，另独立断言真实backend确为该标准元类。
+同时将read_failure独用的query依赖移入该函数，Store仅TYPE_CHECKING，使同一原文件
+可由固定-I脚本纯stdlib装载公开validator；不改sys.path或复制schema。再次静态冻结，
+原目标oracle不变，尚待根复验，CI收集仍未落盘。
+
+根随后实收核心及全部旧failure diagnostics共41 passed（pytest0.99秒、守卫1.739秒、
+94.3MiB、swap0），原真实stop位置oracle与精确ABCMeta正控均通过。中间一次为
+2 failed/39 passed（pytest1.01秒、守卫1.660秒、96.6MiB）：仅两恶意元类负控的
+monkeypatch.setattr自身先访问替身__class__，未进入collector；根只改为对原模块
+vars的setitem，不改负控断言或生产。该夹具失败与collector缺口分开记录，不抹历史。
+
+CI收集候选现已落盘并静态读回：worker在原helper_empty快照观察内冻结有限
+helper_source，关联已有generation/helper，正PID与非零invocation、原argv和实际UID
+cgroup成员须通过；同代PID/invocation/argv/cgroup漂移撤销且不重新领养，已collect时
+仅保留此前可信快照。没有新增snapshot/probe。root coordinator仅在原execute finally
+collect_result后尝试一次；无source、UID/代次不符、无余额或截止即不查询。
+固定root journalctl不加--user，四可信字段AND，并固定前缀grep及最多两行哨兵；
+完整MESSAGE仅通过同一公开validator和已观察generation/revision/intent后导出首条。
+stderr/stdout仍走原合并pipe的真实总字节门，读取grant为原剩额减一（给增长探测留位）；
+所有返回状态先收费，丢回包耗尽原grant且不退款。保存仍受原32KiB门；放不下时退为
+有限not_observed，连该摘要也无空间则保留原已存result，不抹首因。
+
+诊断只放原result.resources的两个严格optional字段helper_source/controller_failure，
+旧artifact缺字段照旧接纳，仍是两个artifact成员。cleanup独立coordinator回读原result
+时复核并保留同源首诊断，不重新读journal。固定源文件importlib装载仅复用同一公开
+validator，校验缓存module身份/路径，不改sys.path、无新muli导入依赖或schema复制。
+
+新增离线收集回归沿真实controller原包内raise和真实capture生成MESSAGE；helper快照、
+journal回包与account边界为明确离线替身。覆盖root只读一次及实际raw收费、四trusted
+字段和envelope篡改拒绝、无余额/无绑定/撤销/截止零查询、丢回包/超额/失败不退费、
+cleanup重开保留首条、helper身份漂移与collected边界、固定validator装载；另补core的
+capture/logger失败只尝试一次且不改回滚，以及取消/clock_invalid不诊断。作者未执行
+检查、格式、Git、网络或服务；上述CI接缝和新增负控仍待根统一验证，非真实journal验收。
+
+最终静态读回又将cleanup保留条件收紧为完整helper_source相等；即使generation相同，
+PID/UID/helper/invocation改变也不能把旧首诊断改绑到新来源，补独立重开反例。
+离线parent夹具显式设置临时Receipt供原volume路径计算，不把缺receipt当功能红。
+本批收集接缝与负控现语义冻结，仍未执行作者检查；前述41绿仅核心及旧collector范围，
+不代表新增journal收集测试已通过，也不代表真实runner能提供所需trusted字段。
+
+根随后运行四个原controller/backend文件时，30秒守卫在约99个点后终止，无summary、
+无OOM；其间误启动另一strict守卫短暂争用CPU，不能据此把失败直接归因竞争。
+只读参数展开将第99/100项定位到原config-prefix的错误/取消两参；根单独在15秒守卫下
+实收2 passed（pytest5.29秒、守卫5.885秒、CPU5.848秒、64.6MiB），两call约2.37/2.39秒，
+无异常环路。两项直接调用backend.install，不经过新增controller诊断路径；其原真实
+slot哈希/CAS和文件同步成本保留。后续整合应按原30秒拆互不重叠组，不提高限额；
+这次分组终止仍保留为未完成整组检查，不能当成四文件通过。
+
+根随后按互不重叠组收取全部实际终态：两controller共86 passed（pytest0.66秒、
+守卫1.194秒、61.9MiB）；backend前12 passed（12.96秒、13.487秒、65.9MiB）；
+backend后20 passed（22.88秒、23.428秒、67.7MiB）；linux45 passed（0.32秒、
+0.868秒、63.1MiB）。加已单独验证的config-prefix两参，共165个不同节点全绿，
+未提高原30秒上限，也未重跑整组。真实hash/CAS使这些分组的CPU总计约44秒，
+原整组本身超出30秒；旧并发只会额外增加墙钟，不能称其为唯一原因。上述绿仍不包含
+新journal收集文件与新增core负控，须由根另行按有限小组验证。
+
+根接着实收三个诊断文件共70 passed（pytest10.85秒、守卫11.523秒、100.1MiB、
+swap0）：新journal收集25项、controller诊断6项、原failure diagnostics39项，
+以本次实际collection为准。加上述165个不同旧节点，当前235个不同节点已绿；
+此前41项属于本次70项子集，不另累计。原七个native fixture文件的本次影响回归、
+最终静态检查及非作者后审尚待根收取；生产继续冻结，真实helper journal和Native29
+远端事务首因仍未验，不因离线收集绿而宣称已取得现场异常位置。
+
+根随后实收原七个native文件的本次影响回归：ci/checkpoint/resource三个文件
+673 passed（pytest2.43秒、守卫3.063秒、152.7MiB）；peer/peer-integration/instance/
+socket-control四文件166 passed（pytest0.37秒、守卫0.882秒、75.9MiB）。两组839个
+不同旧节点，加前述235项，当前合计1074个不同节点本地绿，不再累计其子集。
+生产和测试保持冻结，最终静态/格式及非作者审查待根收取，没有重测整组或运行服务。
+
+三脚本类型检查沿既有命令形状，在此worktree为工作目录，经主仓30秒守卫运行：
+`env MYPYPATH=src:tests /data0/MuLi/.venv/bin/python -m mypy --strict --no-incremental --explicit-package-bases scripts/check_managed_native_ci.py tests/helpers/managed_native_worker.py tests/helpers/managed_native_peer.py`。
+显式源码根与package-bases用于保持原真实import类型和避免helper重复模块发现，
+不以修改忽略规则遮盖导入Any；本段仅提供既有检查入口，不提前记本轮类型结果。
+
+根最终实收三脚本严格检查通过（上述MYPYPATH与explicit-package-bases，守卫5.587秒、
+288MiB）；此树全部146份源码strict通过（8.221秒、419.2MiB），未把其它树的源码数
+套用于本树。全仓Ruff通过（68毫秒、24.3MiB）；根仅整理一份测试的import并格式化
+三文件，无语义改变，最终381文件format检查通过（66毫秒、21.3MiB）。
+另一位未参与实现的Sol完成全链只读后审，逐项核对可信字段、原预算、cleanup保留和
+固定loader，未发现剩余P1/P2；该审查不另计测试节点，也不替代真实journal采集。
+
+本地候选现保持冻结，下一步由根签名保存、推送后，仅针对该精确新head启动一次CI。
+尚无Native29远端结果；能否取得真实helper的可信journal字段、安全首异常位置，
+以及正式三事务与完整cleanup是否通过，均须按新CI实际产物确认，不预写成功或根因。

@@ -1092,6 +1092,145 @@ def setup_facts(value: object) -> bool:
     return True
 
 
+def failure_diagnostic_module() -> ModuleType:
+    """Load only the fixed stdlib-only diagnostic validator, including under -I."""
+    path = Path(__file__).resolve().parents[1] / "src/muli/failure_diagnostics.py"
+    name = "_muli_native_failure_diagnostics"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        if type(existing) is not ModuleType:
+            raise FixtureError("native_result_invalid")
+        filename = ModuleType.__getattribute__(existing, "__dict__").get("__file__")
+        if not isinstance(filename, str) or Path(filename).resolve() != path:
+            raise FixtureError("native_result_invalid")
+        return existing
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise FixtureError("native_result_invalid")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def helper_source_facts(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"generation", "helper", "uid", "pid", "invocation"}
+        and all(
+            isinstance(value[key], str) and re.fullmatch(pattern, value[key]) is not None
+            for key, pattern in (
+                ("generation", r"[a-f0-9]{32}"),
+                ("helper", r"muli-transaction-[a-f0-9]{64}\.service"),
+                ("invocation", r"[a-f0-9]{32}"),
+            )
+        )
+        and value["invocation"] != "0" * 32
+        and all(type(value[key]) is int and 0 < value[key] < 2**31 for key in ("uid", "pid"))
+    )
+
+
+def controller_failure_facts(value: object, result: dict[str, Any]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("code") == "not_observed":
+        return (
+            set(value) == {"code", "reason"}
+            and isinstance(value["reason"], str)
+            and value["reason"]
+            in {
+                "missing_binding",
+                "identity_changed",
+                "output_budget",
+                "timeout",
+                "unavailable",
+                "invalid_reply",
+                "no_known_event",
+            }
+        )
+    if set(value) != {"code", "failure"} or value["code"] != "observed":
+        return False
+    failure = value["failure"]
+    if (
+        not isinstance(failure, dict)
+        or set(failure) != {"version", "generation", "revision", "intent", "diagnostic"}
+        or type(failure["version"]) is not int
+        or failure["version"] != 1
+        or type(failure["revision"]) is not int
+        or not 1 <= failure["revision"] <= 2**63 - 1
+    ):
+        return False
+    source = result["resources"].get("helper_source")
+    return (
+        helper_source_facts(source)
+        and bool(result["generations"])
+        and result["generations"][-1]["generation"] == source["generation"]
+        and failure["generation"] == source["generation"]
+        and any(
+            row.get("stage") == "transaction"
+            and row.get("generation") == failure["generation"]
+            and row.get("revision") == failure["revision"]
+            and row.get("intent") == failure["intent"]
+            for row in result["timeline"]
+        )
+        and failure_diagnostic_module().validate_failure_diagnostic(failure["diagnostic"])
+        is not None
+    )
+
+
+def controller_journal_failure(
+    data: bytes, source: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Read only the fixed safe message from the already authenticated helper invocation."""
+    unavailable = {"code": "not_observed", "reason": "no_known_event"}
+    if len(data) > OUTPUT_BYTES or not helper_source_facts(source):
+        return {"code": "not_observed", "reason": "invalid_reply"}
+    fields = {"_UID", "_PID", "_SYSTEMD_USER_UNIT", "_SYSTEMD_INVOCATION_ID", "MESSAGE"}
+    metadata = {"__CURSOR", "__REALTIME_TIMESTAMP", "__MONOTONIC_TIMESTAMP", "_BOOT_ID"}
+    prefix = "muli.controller_failure.v1 "
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise FixtureError("native_result_invalid")
+            value[key] = item
+        return value
+
+    lines = data.splitlines()
+    if len(lines) > 2:
+        return {"code": "not_observed", "reason": "invalid_reply"}
+    observed: dict[str, Any] | None = None
+    for line in lines:
+        try:
+            row = json.loads(line.decode("utf-8"), object_pairs_hook=unique)
+            if (
+                not isinstance(row, dict)
+                or not fields <= set(row) <= fields | metadata
+                or any(not isinstance(value, str) for value in row.values())
+                or row["_UID"] != str(source["uid"])
+                or row["_PID"] != str(source["pid"])
+                or row["_SYSTEMD_USER_UNIT"] != source["helper"]
+                or row["_SYSTEMD_INVOCATION_ID"] != source["invocation"]
+                or not row["MESSAGE"].startswith(prefix)
+            ):
+                continue
+            failure = json.loads(row["MESSAGE"][len(prefix) :], object_pairs_hook=unique)
+            candidate = {"code": "observed", "failure": failure}
+            if not controller_failure_facts(candidate, result):
+                continue
+            if observed is not None and observed != candidate:
+                return {"code": "not_observed", "reason": "invalid_reply"}
+            observed = candidate
+        except (ValueError, RecursionError):
+            continue
+    return observed if observed is not None else unavailable
+
+
 def fixture_result(data: bytes) -> dict[str, Any]:
     """Export only finite fixture facts, never arbitrary worker JSON fields."""
     value = object_bytes(data)
@@ -1206,6 +1345,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "manager_readiness",
             "manager_failure",
             "setup_accounting",
+            "helper_source",
+            "controller_failure",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1238,6 +1379,13 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             valid = setup_facts(facts)
         elif name == "setup_accounting":
             valid = setup_accounting_facts(facts)
+        elif name == "helper_source":
+            valid = helper_source_facts(facts) and any(
+                row["generation"] == facts["generation"] and row["helper"] == facts["helper"]
+                for row in history
+            )
+        elif name == "controller_failure":
+            valid = controller_failure_facts(facts, value)
         elif name == "manager_failure":
             valid = manager_failure_facts(facts)
         elif name == "manager_readiness":
@@ -1555,6 +1703,9 @@ class NativeCI:
         self.setup_bytes = 0
         self.manager_readiness: dict[str, int | bool] = {}
         self.manager_failure: dict[str, Any] = {}
+        self.controller_failure_attempted = False
+        self.controller_failure: dict[str, Any] | None = None
+        self.controller_failure_source: dict[str, Any] | None = None
 
     @property
     def volume(self) -> Path:
@@ -2368,6 +2519,8 @@ class NativeCI:
         result = fixture_result(reply.output)
         readiness = self.manager_readiness
         failure = self.manager_failure
+        controller_failure = self.controller_failure
+        controller_source = self.controller_failure_source
         if not readiness and self.cleanup_deadline is not None:
             try:
                 descriptor = os.open(
@@ -2385,12 +2538,20 @@ class NativeCI:
                     saved = fixture_result(source.read(OUTPUT_BYTES + 1))
                 readiness = saved["resources"].get("manager_readiness", {})
                 failure = saved["resources"].get("manager_failure", {})
+                controller_failure = saved["resources"].get("controller_failure")
+                controller_source = saved["resources"].get("helper_source")
             except (OSError, ValueError):
                 pass  # Optional old facts cannot grant cleanup success or hide its failure.
         if readiness:
             result["resources"]["manager_readiness"] = readiness
         if failure:
             result["resources"]["manager_failure"] = failure
+        if (
+            controller_failure is not None
+            and controller_source == result["resources"].get("helper_source")
+            and controller_failure_facts(controller_failure, result)
+        ):
+            result["resources"]["controller_failure"] = controller_failure
         write_json(self.root / "result.json", result)
         return result
 
@@ -2461,6 +2622,85 @@ class NativeCI:
         result["resources"]["startup"] = facts
         write_json(self.root / "result.json", fixture_result(json.dumps(result).encode()))
 
+    def observe_controller_failure(self, result: dict[str, Any], *, deadline: float) -> None:
+        """One root journal read, before fixture cleanup, sharing the original time/byte grant."""
+        if self.controller_failure_attempted or result["completed"]:
+            return
+        self.controller_failure_attempted = True
+        rows = [row for row in result["timeline"] if row["stage"] == "transaction"]
+        if not rows:
+            return
+        facts: dict[str, Any] = {"code": "not_observed", "reason": "missing_binding"}
+        source = result["resources"].get("helper_source")
+        try:
+            if helper_source_facts(source):
+                uid, _ = self.current_account()
+                if source["uid"] != uid or source["generation"] != rows[-1].get("generation"):
+                    facts["reason"] = "identity_changed"
+                elif deadline <= time.monotonic():
+                    facts["reason"] = "timeout"
+                else:
+                    allowance = OUTPUT_BYTES - self.setup_bytes
+                    if allowance <= 1:
+                        facts["reason"] = "output_budget"
+                    else:
+                        before = self.setup_bytes
+                        try:
+                            reply = self.call(
+                                (
+                                    "sudo",
+                                    "--non-interactive",
+                                    "--",
+                                    "journalctl",
+                                    "--boot=0",
+                                    "--no-pager",
+                                    "--quiet",
+                                    "--output=json",
+                                    "--lines=2",
+                                    "--output-fields=_UID,_PID,_SYSTEMD_USER_UNIT,_SYSTEMD_INVOCATION_ID,MESSAGE",
+                                    "--grep=^muli[.]controller_failure[.]v1 ",
+                                    f"_UID={source['uid']}",
+                                    f"_PID={source['pid']}",
+                                    f"_SYSTEMD_USER_UNIT={source['helper']}",
+                                    f"_SYSTEMD_INVOCATION_ID={source['invocation']}",
+                                ),
+                                seconds=deadline - time.monotonic(),
+                                output_bytes=allowance - 1,
+                            )
+                        except Exception:
+                            # A missing reply cannot refund an unknown amount already read.
+                            self.setup_bytes = OUTPUT_BYTES
+                            facts["reason"] = "unavailable"
+                        else:
+                            self.setup_bytes = min(OUTPUT_BYTES, before + len(reply.output))
+                            if len(reply.output) >= allowance:
+                                facts["reason"] = "output_budget"
+                            elif reply.code:
+                                facts["reason"] = "unavailable"
+                            else:
+                                facts = controller_journal_failure(reply.output, source, result)
+        except Exception:
+            # Optional metadata and classification must not replace the original case failure.
+            facts = {"code": "not_observed", "reason": "unavailable"}
+        candidate = {**result, "resources": {**result["resources"], "controller_failure": facts}}
+        try:
+            if time.monotonic() >= deadline:
+                return
+            data = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
+            if len(data) > OUTPUT_BYTES:
+                candidate["resources"]["controller_failure"] = {
+                    "code": "not_observed",
+                    "reason": "output_budget",
+                }
+                data = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
+            validated = fixture_result(data)
+            write_json(self.root / "result.json", validated)
+        except Exception:
+            return  # Preserve the already saved original result, including its first code.
+        result["resources"] = validated["resources"]
+        self.controller_failure = validated["resources"]["controller_failure"]
+        self.controller_failure_source = validated["resources"].get("helper_source")
+
     def execute(self) -> None:
         deadline = time.monotonic() + HARNESS_SECONDS + CLEANUP_SECONDS
         self.execute_deadline = deadline
@@ -2515,6 +2755,8 @@ class NativeCI:
             if time.monotonic() < deadline:
                 try:
                     result = self.collect_result()
+                    if result is not None:
+                        self.observe_controller_failure(result, deadline=deadline)
                     if result is None:
                         self.observe_startup(
                             fixture,

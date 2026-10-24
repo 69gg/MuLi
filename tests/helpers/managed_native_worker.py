@@ -3220,6 +3220,8 @@ class Case:
         self.stage = "import"
         self.recording = True
         self._notes: dict[str, dict[str, Any]] = {}
+        self._invalid_helper_sources: set[str] = set()
+        self._helper_source_groups: dict[str, str] = {}
         self.result: dict[str, Any] = {
             "completed": False,
             "stage": self.stage,
@@ -3360,11 +3362,51 @@ class Case:
             self.note("helper_exit", helper=name, state="collected")
             return True
         snapshot = await probe._snapshot(await probe._unit_path(name))
-        require(snapshot.name == name and snapshot.argv == argv, "native_helper_identity")
-        require(
-            f"user@{os.geteuid()}.service" in Path(snapshot.cgroup).parts or not snapshot.cgroup,
-            "native_helper_membership",
+        generations = [row for row in self.result["generations"] if row["helper"] == name]
+        generation = generations[0]["generation"] if len(generations) == 1 else None
+        membership = (
+            f"user@{os.geteuid()}.service" in Path(snapshot.cgroup).parts or not snapshot.cgroup
         )
+        if generation is not None and (
+            snapshot.name != name or snapshot.argv != argv or not membership
+        ):
+            self._invalid_helper_sources.add(generation)
+            self.result["resources"].pop("helper_source", None)
+        require(snapshot.name == name and snapshot.argv == argv, "native_helper_identity")
+        require(membership, "native_helper_membership")
+        if generation is not None:
+            previous = self.result["resources"].get("helper_source")
+            invocation = snapshot.invocation
+            if (
+                isinstance(previous, dict)
+                and previous["generation"] == generation
+                and (
+                    previous["invocation"] != invocation
+                    or (snapshot.pid != 0 and previous["pid"] != snapshot.pid)
+                    or (
+                        snapshot.pid != 0
+                        and self._helper_source_groups.get(generation, snapshot.cgroup)
+                        != snapshot.cgroup
+                    )
+                )
+            ):
+                self._invalid_helper_sources.add(generation)
+            if generation in self._invalid_helper_sources:
+                self.result["resources"].pop("helper_source", None)
+            elif (
+                0 < snapshot.pid < 2**31
+                and re.fullmatch(r"[a-f0-9]{32}", invocation) is not None
+                and invocation != "0" * 32
+                and f"user@{os.geteuid()}.service" in Path(snapshot.cgroup).parts
+            ):
+                self.result["resources"]["helper_source"] = {
+                    "generation": generation,
+                    "helper": name,
+                    "uid": os.geteuid(),
+                    "pid": snapshot.pid,
+                    "invocation": invocation,
+                }
+                self._helper_source_groups[generation] = snapshot.cgroup
         details = await probe._properties(
             await probe._unit_path(name), "Service", (("Result", "s"), ("ExecMainStatus", "i"))
         )

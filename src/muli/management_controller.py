@@ -7,6 +7,8 @@ lives here; passing fake-backend tests does not prove a service restart.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
@@ -25,6 +27,9 @@ from muli.management_transaction import (
     TransactionRecord,
     Transition,
 )
+
+_LOGGER = logging.getLogger(__name__)
+_FAILURE_PREFIX = "muli.controller_failure.v1 "
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +144,7 @@ class _Controller[
         self._policy = policy
         self.operation_timeout = operation_timeout
         self._step_lock = asyncio.Lock()
+        self._failure_diagnostic_attempted = False
 
     def _move(
         self,
@@ -154,6 +160,32 @@ class _Controller[
             record, phase=phase, intent=intent, activation=activation, code=code, proof=proof
         )
 
+    def _capture_backend_failure(self, record: RecordT, exc: BaseException) -> None:
+        if self._failure_diagnostic_attempted:
+            return
+        # A failed diagnostic is not retried by a later rollback failure.
+        self._failure_diagnostic_attempted = True
+        try:
+            # The query-facing diagnostics module also imports projection/Store;
+            # keep that dependency out of controller module initialization.
+            from muli.failure_diagnostics import capture_failure
+
+            payload = {
+                "version": 1,
+                "generation": record.generation,
+                "revision": record.revision,
+                "intent": record.intent,
+                "diagnostic": capture_failure(exc),
+            }
+            _LOGGER.warning(
+                "%s%s",
+                _FAILURE_PREFIX,
+                json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+            )
+        except Exception:
+            # Optional evidence cannot replace the original transaction decision.
+            pass
+
     async def _call(self, record: RecordT, action: Callable[[], Awaitable[T]]) -> T:
         remaining = record.deadline.remaining(self.clock())
         if record.phase in {"activating", "verifying"}:
@@ -165,13 +197,16 @@ class _Controller[
                 return await action()
         except asyncio.CancelledError:
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            self._capture_backend_failure(record, exc)
             raise _BackendFailure("deadline_exceeded") from None
         except TransactionError as exc:
             if exc.code == "clock_invalid":
                 raise
+            self._capture_backend_failure(record, exc)
             raise _BackendFailure("backend_failed") from None
-        except Exception:
+        except Exception as exc:
+            self._capture_backend_failure(record, exc)
             raise _BackendFailure("backend_failed") from None
 
     def _failure(self, record: RecordT, code: Code) -> RecordT:

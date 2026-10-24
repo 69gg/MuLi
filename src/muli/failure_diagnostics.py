@@ -7,15 +7,15 @@ import os
 import re
 import sqlite3
 import sys
+from abc import ABCMeta
 from itertools import islice
 from pathlib import Path
 from traceback import walk_tb
 from types import FrameType, FunctionType, ModuleType, TracebackType
-from typing import Any, Final, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
-from muli.evidence import json_size
-from muli.management_projection import ProjectionError, _read_object
-from muli.store import Store
+if TYPE_CHECKING:
+    from muli.store import Store
 
 # Version-one evidence limits, independent of the configurable tool-output cap.
 MAX_FAILURE_FRAMES: Final = 16
@@ -102,7 +102,7 @@ def _location(frame: FrameType, line: int) -> FailureFrame:
         return unknown
     value = namespace.get(names[0])
     for name in names[1:]:
-        if type(value) is not type:
+        if type(value) is not type and type(value) is not ABCMeta:
             return unknown
         value = type.__getattribute__(value, "__dict__").get(name)
     if type(value) is staticmethod or type(value) is classmethod:
@@ -178,8 +178,16 @@ def _validated(value: Any) -> FailureDiagnostic | None:
     return cast(FailureDiagnostic, value)
 
 
+def validate_failure_diagnostic(value: object) -> FailureDiagnostic | None:
+    """Validate an already bounded decoded diagnostic without reading persisted runs."""
+    return _validated(value)
+
+
 def read_failure(store: Store, run_id: str, *, max_output_chars: int) -> dict[str, Any]:
     """Point-read a finite original run before parsing; never return result/error text."""
+    from muli.evidence import json_size
+    from muli.management_projection import ProjectionError, _read_object
+
     if type(run_id) is not str or len(run_id) != 32 or _RUN_ID.fullmatch(run_id) is None:
         raise ValueError("failure_run_id_invalid")
     response: dict[str, Any] = {
