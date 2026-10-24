@@ -7,6 +7,8 @@ export const MODES = Object.freeze({
 export function createSessionState(messages = []) {
   return {
     messages: [...messages], tools: [], approvals: [], reasoning: "",
+    timeline: messages.filter((message) => ["user", "assistant"].includes(message.role)).map((message) => ({ id: `message:${message.id}`, kind: "message", message })),
+    timelineRound: 0, timelineSerial: 0,
     status: "idle", runId: null, cursor: "", seen: new Set(), error: "",
     snapshotAfter: "", terminalRun: null,
     queued: [...new Set(messages.filter((message) => message.role === "user" && message.delivery_status === "pending").map((message) => String(message.id)))],
@@ -46,6 +48,146 @@ function unknownTools(tools, runId = null) {
 function atSnapshotPosition(state, id) {
   return state.snapshotAfter !== "" && id !== undefined && id !== null && /^(0|[1-9][0-9]*)$/.test(String(id))
     && BigInt(id) <= BigInt(state.snapshotAfter);
+}
+
+/** An ordered UI projection; accepted messages and tool receipt rules stay canonical. */
+function projectConversation(previous, next, event, history) {
+  const items = conversationEntries(previous), data = event.data ?? {};
+  const runId = data.run_id ?? event.run_id ?? next.runId ?? "current";
+  let round = previous.timelineRound ?? 0, serial = previous.timelineSerial ?? 0;
+  const key = () => `conversation:${event.id ?? `local-${++serial}`}`;
+  const sameTurn = (item) => item.runId === runId && item.round === round;
+  const appendDelta = (kind, content) => {
+    if (!content) return;
+    const last = items.at(-1);
+    if (last?.kind === kind && sameTurn(last) && (kind !== "message" || last.message.streaming)) {
+      items[items.length - 1] = kind === "message"
+        ? { ...last, message: { ...last.message, content: last.message.content + content } }
+        : { ...last, content: last.content + content };
+    } else {
+      const id = key();
+      items.push(kind === "message"
+        ? { id, kind, runId, round, message: { id: `stream:${id}`, role: "assistant", content, created_at: event.created_at, streaming: true } }
+        : { id, kind, runId, round, content, created_at: event.created_at, streaming: true });
+    }
+  };
+  if (event.type === "run.started") round++;
+  if (event.type === "reasoning.delta") appendDelta("reasoning", data.content ?? "");
+  if (event.type === "message.delta") appendDelta("message", data.content ?? "");
+  if (["message.completed", "message.queued", "attention.queued"].includes(event.type) && data.message) {
+    const raw = event.type === "attention.queued" ? { ...data.message, role: "user", delivery_status: "pending" } : data.message;
+    const message = history ? next.messages.find((item) => item.id === raw.id) ?? raw : raw;
+    const already = items.findIndex((item) => item.kind === "message" && item.message.id === message.id);
+    if (message.role === "assistant") {
+      const open = items.map((item, index) => item.kind === "message" && sameTurn(item) && item.message.streaming ? index : -1).filter((index) => index >= 0);
+      const streamed = open.map((index) => items[index].message.content).join("");
+      if (already >= 0) items[already] = { ...items[already], message };
+      else if (open.length) {
+        // Keep text either side of reasoning/tools in its original slot. The
+        // accepted body is authoritative, and attachments belong on its last part.
+        if ((message.content ?? "").startsWith(streamed)) {
+          let offset = 0;
+          for (const [position, index] of open.entries()) {
+            const last = position === open.length - 1;
+            const end = last ? (message.content ?? "").length : offset + items[index].message.content.length;
+            items[index] = { ...items[index], message: { ...message, content: (message.content ?? "").slice(offset, end), ...(!last ? { attachments: [], attachment_ids: [] } : {}) } };
+            offset = end;
+          }
+        } else {
+          const last = open.at(-1);
+          items[last] = { ...items[last], message };
+          for (const index of open.slice(0, -1).reverse()) items.splice(index, 1);
+        }
+      } else if (message.content || message.attachments?.length || message.attachment_ids?.length) items.push({ id: key(), kind: "message", runId, round, message });
+      for (let index = 0; index < items.length; index++) if (items[index].kind === "reasoning" && sameTurn(items[index])) items[index] = { ...items[index], streaming: false };
+      round++;
+    } else if (message.role === "user") {
+      const queued = event.type !== "message.completed" || message.delivery_status === "pending" || data.queued;
+      if (!(queued && previous.messages.some((item) => item.id === message.id && item.delivery_status === "delivered"))) {
+        const attachmentIds = message.attachment_ids ?? message.attachments?.map((file) => file.id) ?? [];
+        const optimistic = message.principal === "system:attention" ? -1 : items.findIndex((item) => item.kind === "message" && item.message.pending && (item.message.content === message.content || (!item.message.content && attachmentIds.length && JSON.stringify(item.message.attachment_ids ?? item.message.attachments?.map((file) => file.id) ?? []) === JSON.stringify(attachmentIds))));
+        const index = already >= 0 ? already : optimistic;
+        if (index >= 0) items[index] = { ...items[index], message };
+        else items.push({ id: key(), kind: "message", runId, round, message });
+      }
+    }
+  }
+  if (["tool.started", "tool.completed"].includes(event.type)) {
+    const matchesCall = (item) => item.kind === "tool" && item.runId === runId && item.tool.call_id === data.call_id;
+    let index = items.findLastIndex((item) => matchesCall(item) && item.tool.status === "running");
+    if (index < 0 && event.type === "tool.completed") index = items.findLastIndex((item) => matchesCall(item) && sameTurn(item));
+    const old = index >= 0 ? items[index].tool : {};
+    const tool = { ...old, ...data, run_id: runId, ...(event.type === "tool.started" ? { status: "running", created_at: event.created_at } : { ...toolReceipt(data), completed_at: event.created_at }) };
+    if (index >= 0) items[index] = { ...items[index], tool };
+    else items.push({ id: key(), kind: "tool", runId, round, tool });
+  }
+  if (event.type === "conversation.injected") {
+    const ids = new Set((data.message_ids ?? []).map(String));
+    for (let index = 0; index < items.length; index++) if (items[index].kind === "message" && ids.has(String(items[index].message.id))) items[index] = { ...items[index], message: { ...items[index].message, delivery_status: "delivered" } };
+  }
+  if (event.type === "ingress.cancelled") {
+    for (let index = items.length - 1; index >= 0; index--) if (items[index].kind === "message" && (items[index].message.delivery_status === "pending" || previous.queued.includes(String(items[index].message.id)))) items.splice(index, 1);
+  }
+  if (["run.completed", "run.cancelled", "run.failed", "run.paused", "session.recovered"].includes(event.type)) {
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      if (item.runId !== runId) continue;
+      if (item.kind === "reasoning") items[index] = { ...item, streaming: false };
+      if (item.kind === "message" && item.message.streaming) items[index] = { ...item, message: { ...item.message, streaming: false, interrupted: event.type !== "run.completed", ...(event.type === "run.paused" ? { paused: true } : {}) } };
+      if (item.kind === "tool") items[index] = { ...item, tool: unknownTools([item.tool], runId)[0] };
+    }
+  }
+  return { ...next, timeline: items, timelineRound: round, timelineSerial: serial };
+}
+
+function conversationEntries(state) {
+  const pendingIds = new Set(state.messages.filter((message) => message.pending).map((message) => String(message.id)));
+  const items = (state.timeline ?? state.messages.map((message) => ({ id: `message:${message.id}`, kind: "message", message })))
+    .filter((item) => item.kind !== "message" || !item.message.pending || pendingIds.has(String(item.message.id)));
+  const represented = new Set(items.filter((item) => item.kind === "message").map((item) => String(item.message.id)));
+  // Preserve the composer's visible slot before projecting the next SSE event.
+  const pending = state.messages.filter((message) => message.pending && !represented.has(String(message.id)));
+  return [...items, ...pending.map((message) => ({ id: `message:${message.id}`, kind: "message", message }))];
+}
+
+/** Entries are ready to render in order: message, reasoning, or tool. */
+export function conversationItems(state) {
+  return conversationEntries(state)
+    .filter((item) => item.kind !== "message" || ["user", "assistant"].includes(item.message.role) && (item.message.content || item.message.attachments?.length || item.message.attachment_ids?.length || item.message.pending || item.message.streaming));
+}
+
+function restoreConversation(state, detail) {
+  const items = [...state.timeline];
+  const messages = (detail.messages ?? []).filter((message) => ["user", "assistant"].includes(message.role));
+  const covered = new Set(items.filter((item) => item.kind === "message").map((item) => String(item.message.id)));
+  let anchored = false;
+  for (const [position, message] of messages.entries()) {
+    if (covered.has(String(message.id))) { anchored = true; continue; }
+    // The event window is bounded. Restore only the accepted message order;
+    // missing historical thinking/tool interleaving is not reconstructed.
+    const following = messages.slice(position + 1).find((item) => covered.has(String(item.id)));
+    const at = following ? anchored ? items.findIndex((item) => item.kind === "message" && String(item.message.id) === String(following.id)) : items.findIndex((item) => !item.historical) : items.length;
+    items.splice(at < 0 ? items.length : at, 0, { id: `message:${message.id}`, kind: "message", message, historical: true });
+    covered.add(String(message.id));
+  }
+  for (const tool of state.tools) {
+    if (tool.status !== "unknown" || items.some((item) => item.kind === "tool" && item.tool.call_id === tool.call_id && (!tool.run_id || item.runId === tool.run_id))) continue;
+    const archive = (detail.messages ?? []).findIndex((message) => message.role === "tool" && message.tool_call_id === tool.call_id);
+    const following = (detail.messages ?? []).slice(archive + 1).find((message) => covered.has(String(message.id)));
+    const at = following ? items.findIndex((item) => item.kind === "message" && String(item.message.id) === String(following.id)) : items.length;
+    items.splice(at < 0 ? items.length : at, 0, { id: `archive-tool:${tool.call_id}`, kind: "tool", runId: tool.run_id, tool, historical: true });
+  }
+  const liveRun = detail.live?.run_id ?? state.runId;
+  const live = isRunning(state.status);
+  return {
+    ...state,
+    timeline: items.map((item) => {
+      if (item.kind === "tool" && (!live || item.runId !== liveRun)) return { ...item, tool: unknownTools([item.tool])[0] };
+      if (item.kind === "reasoning" && (!live || item.runId !== liveRun)) return { ...item, streaming: false };
+      if (item.kind === "message" && item.message.streaming && (!live || item.runId !== liveRun)) return { ...item, message: { ...item.message, streaming: false, interrupted: state.status !== "completed", ...(state.status === "paused" ? { paused: true } : {}) } };
+      return item;
+    }),
+  };
 }
 
 export function applyEvent(state, event, { history = false } = {}) {
@@ -147,7 +289,7 @@ export function applyEvent(state, event, { history = false } = {}) {
     default:
       break;
   }
-  return next;
+  return projectConversation(state, next, event, history);
 }
 
 function reconcileLive(state, detail) {
@@ -193,6 +335,7 @@ function reconcileLive(state, detail) {
 
 export function hydrateSession(detail) {
   let state = createSessionState(detail.messages ?? []);
+  state.timeline = [];
   let pendingText = "";
   let reasoning = "";
   for (const event of detail.events ?? []) {
@@ -213,7 +356,7 @@ export function hydrateSession(detail) {
     if (typeof detail.after !== "string" || !/^(0|[1-9][0-9]*)$/.test(detail.after) || BigInt(detail.after) > 9223372036854775807n) throw new Error("会话事件位置无效，请重新连接。");
     state.snapshotAfter = detail.after; state.cursor = detail.after;
   }
-  return state;
+  return restoreConversation(state, detail);
 }
 
 export function isRunning(status) {

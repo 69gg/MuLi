@@ -31,6 +31,8 @@ TOOLS: list[JsonObject] = [
 
 
 def config(protocol: ProtocolName = "openai_chat", **options: Any) -> ModelConfig:
+    if protocol == "anthropic":
+        options.setdefault("max_output_tokens", 4096)
     return ModelConfig(
         protocol=protocol,
         model="test-model",
@@ -202,7 +204,7 @@ async def test_native_protocol_tool_roundtrip_and_usage(protocol: ProtocolName) 
         assert requests[0].url.path == "/v1/chat/completions"
         assert requests[0].headers["authorization"] == "Bearer secret-key"
         assert wire["messages"][2] == payload(protocol)["choices"][0]["message"]
-        assert wire["max_completion_tokens"] == 4096
+        assert "max_completion_tokens" not in wire and "max_tokens" not in wire
         assert turn.usage.reasoning_tokens == 2
     elif protocol == "openai_responses":
         assert requests[0].url.path == "/v1/responses"
@@ -214,7 +216,7 @@ async def test_native_protocol_tool_roundtrip_and_usage(protocol: ProtocolName) 
         }
         assert wire["store"] is False
         assert wire["tools"][0]["name"] == "lookup"
-        assert wire["max_output_tokens"] == 4096
+        assert "max_output_tokens" not in wire
     else:
         assert requests[0].url.path == "/v1/messages"
         assert requests[0].headers["x-api-key"] == "secret-key"

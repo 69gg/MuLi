@@ -39,6 +39,7 @@ async def prompt_runtime(
             "models": {
                 "main": {
                     "protocol": protocol,
+                    **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
                     "model": "offline",
                     "base_url": "https://unused.invalid",
                 }

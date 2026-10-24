@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
@@ -36,6 +36,8 @@ class TeamManager:
         self._closed = False
         self._flushing = False
         self._reports_dirty = False
+        self.report_observer: Callable[[str, int], None] | None = None
+        self.report_observer_error = ""
         rows = runtime.store.db.execute(
             "SELECT data FROM objects WHERE kind='agent' AND json_extract(data,'$.status')='running'"
         ).fetchall()
@@ -104,6 +106,14 @@ class TeamManager:
             agent["session_id"],
             objects=[("agent", agent), *(objects or [])],
         )
+        if status == "completed" and self.report_observer is not None:
+            try:
+                self.report_observer(agent["session_id"], agent["completion_revision"])
+                self.report_observer_error = ""
+            except Exception as error:
+                # Optional memory admission must not interrupt report delivery or
+                # the terminal coroutine's cleanup. Durable proof remains replayable.
+                self.report_observer_error = type(error).__name__
 
     def list(
         self,

@@ -45,6 +45,16 @@ function harness(controls, respond) {
   return { context, state, submit, errorNode, statusNode, calls, notices, renders, event };
 }
 
+test("clearing an optional model token limit PATCHes null without clearing other numeric settings", async () => {
+  const applied = { ...structuredClone(original), models: { main: { max_output_tokens: null, timeout: 30 } } };
+  const h = harness([control("models.main.max_output_tokens", "", "number"), control("models.main.timeout", "", "number")], async (_path, options) => options ? {} : applied);
+  h.state.settings.models = { main: { max_output_tokens: 4096, timeout: 30 } };
+  h.state.settingsDraft = structuredClone(h.state.settings);
+  await h.context.saveSettings(h.event);
+  assert.deepEqual(h.calls, [{ path: "/settings", options: { method: "PATCH", body: { models: { main: { max_output_tokens: null } } } } }, { path: "/settings", options: undefined }]);
+  assert.equal(h.state.settingsDraft.models.main.timeout, 30);
+});
+
 test("listener save queues the complete patch without applying the target or redrawing newer input", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });

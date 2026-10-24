@@ -322,13 +322,16 @@ def build_request(
             choice["disable_parallel_tool_use"] = not body.pop("parallel_tool_calls")
             body["tool_choice"] = choice
     requested_limit = body.get(token_field, config.max_output_tokens)
-    if (
-        not isinstance(requested_limit, int)
-        or isinstance(requested_limit, bool)
-        or requested_limit <= 0
-    ):
-        raise ValueError("模型输出 token 限制必须是正整数")
-    body[token_field] = min(requested_limit, config.max_output_tokens)
+    if requested_limit is not None or token_field in body:
+        if type(requested_limit) is not int or requested_limit <= 0:
+            raise ValueError("模型输出 token 限制必须是正整数")
+        body[token_field] = (
+            min(requested_limit, config.max_output_tokens)
+            if config.max_output_tokens is not None
+            else requested_limit
+        )
+    elif config.protocol == "anthropic":
+        raise ValueError("Anthropic Messages 必须填写正整数 max_tokens")
     if config.protocol == "anthropic" and "thinking" in body:
         thinking = body["thinking"]
         if not isinstance(thinking, dict):

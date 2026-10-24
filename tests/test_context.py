@@ -264,7 +264,12 @@ def test_packed_turn_still_encodes_with_native_tool_replay(protocol: ProtocolNam
     ]
     packed = pack_context(messages, 2200)
     assert packed[1].provider_data == native and packed[1].tool_calls == [call]
-    config = ModelConfig(protocol=protocol, model="test", base_url="https://example.invalid/v1")
+    config = ModelConfig(
+        protocol=protocol,
+        model="test",
+        base_url="https://example.invalid/v1",
+        max_output_tokens=4096 if protocol == "anthropic" else None,
+    )
     body = build_request(config, packed, [], stream=False)
     encoded = json.dumps(body, ensure_ascii=False)
     assert call.id in encoded and EXCERPT_MARKER in encoded

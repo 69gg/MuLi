@@ -1,5 +1,5 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
-import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
+import { MODES, createSessionState, applyEvent, hydrateSession, conversationItems, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
@@ -53,11 +53,11 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const state = {
   view: "chat", status: null, connected: false, streamConnected: true, loading: true,
   sessions: [], activeSession: null, session: createSessionState(), mode: "auto", sending: false,
-  timelineOpen: false, sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
+  sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
   viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
-  timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
+  mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
   team: { members: [], messages: [] }, recordQuery: "", approvals: [], approvalsError: "",
   auth: { required: false, authenticated: false },
 };
@@ -68,7 +68,6 @@ let sessionRequestVersion = 0;
 let viewRequestVersion = 0;
 let queuedRender = false;
 let messageNodes = new Map();
-let toolNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
 let dialogMemoryReturn = null;
@@ -358,19 +357,6 @@ function renderChrome() {
   $("#chat-view").hidden = state.view !== "chat";
   $("#management-shell").hidden = state.view === "chat";
   $("#settings-toggle").setAttribute("aria-pressed", String(state.view !== "chat"));
-  $("#timeline-toggle").hidden = state.view !== "chat";
-  $("#timeline").hidden = state.view !== "chat" || !state.timelineOpen;
-  $("#timeline-toggle").setAttribute("aria-pressed", String(state.timelineOpen));
-  renderHistoryEntry();
-}
-
-function renderHistoryEntry() {
-  let entry = $("#history-archive-entry");
-  if (!entry) {
-    entry = element("div", { id: "history-archive-entry", class: "history-archive-entry" }, element("button", { id: "history-archive-button", type: "button", class: "text-button", text: "已保存记录", onClick: (event) => void showHistoryArchive(state.mainSessionId, { trigger: event.currentTarget }) }));
-    $("#conversation-scroll").prepend(entry);
-  }
-  entry.hidden = state.view !== "chat" || !state.connected || !state.mainSessionId;
 }
 
 function renderSessions() {
@@ -388,7 +374,8 @@ function renderComposer() {
   $("#send-button").setAttribute("aria-label", running ? "发送补充消息" : "发送消息");
   $("#stop-button").hidden = !running;
   $("#stop-button").disabled = state.sending || !state.activeSession;
-  $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "持续对话";
+  $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "";
+  $("#composer-context").hidden = !state.session.queued?.length;
   $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
   $("#composer-status").textContent = state.uploading ? `正在保存 ${state.uploading} 个附件…` : !state.connected ? state.loading ? "正在连接沐璃" : "等待服务连接" : !state.status?.configured ? "请先配置主模型" : running ? state.session.status === "approval" ? "等待批准 · 可以继续补充" : "正在处理 · 可以继续补充" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
   renderVoiceInput();
@@ -408,17 +395,31 @@ function scrollToBottom(force = false, smooth = false) {
 
 function renderChat() {
   const nearBottom = scrollIsNearBottom();
-  $("#welcome").hidden = !!state.session.messages.length || busy();
+  const items = conversationItems(state.session).filter((item) => item.kind !== "message" || ["user", "assistant"].includes(item.message.role) && (item.message.content || item.message.attachments?.length || item.message.attachment_ids?.length || item.message.pending || item.message.streaming));
+  $("#welcome").hidden = !!items.length || busy();
   const container = $("#messages");
-  const visibleMessages = state.session.messages.filter((message) => ["user", "assistant"].includes(message.role) && (message.content || message.attachments?.length || message.attachment_ids?.length || message.pending || message.streaming));
-  const ids = new Set(visibleMessages.map((message) => String(message.id)));
+  const ids = new Set(items.map((item) => String(item.id)));
   for (const [id, node] of messageNodes) if (!ids.has(id)) { node.remove(); messageNodes.delete(id); }
-  for (const message of visibleMessages) {
-    const id = String(message.id);
+  for (const [position, item] of items.entries()) {
+    const id = String(item.id);
+    if (item.kind !== "message") {
+      const previous = messageNodes.get(id);
+      const contentChanged = item.kind === "reasoning" && previous?.dataset.content !== item.content;
+      const node = renderProcessItem(item, previous);
+      node.dataset.timelineId = id;
+      messageNodes.set(id, node);
+      if (container.children[position] !== node) container.insertBefore(node, container.children[position] ?? null);
+      if (contentChanged && item.streaming && node.open) {
+        const content = $(".reasoning-content", node);
+        if (content?.dataset.follow !== "false" && content?.clientHeight > 0) content.scrollTop = content.scrollHeight;
+      }
+      continue;
+    }
+    const message = item.message;
     const presentation = messagePresentation(message);
     let node = messageNodes.get(id);
     if (!node) {
-      node = element("article", { class: `message ${presentation.kind}`, dataset: { messageId: id }, "aria-label": presentation.label });
+      node = element("article", { class: `message ${presentation.kind}`, dataset: { timelineId: id }, "aria-label": presentation.label });
       let content = node;
       if (presentation.kind === "system-context") {
         content = element("details", {}, element("summary", { class: "message-heading" }, icon("info"), element("span", { text: presentation.label }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
@@ -429,8 +430,10 @@ function renderChat() {
       content.append(element("div", { class: "message-body" }));
       content.append(element("div", { class: "message-attachments" }));
       const actions = element("div", { class: "message-actions" }, iconButton("复制消息", "copy-message", "copy", { id }));
-      content.append(actions); messageNodes.set(id, node); container.append(node);
+      content.append(actions); messageNodes.set(id, node);
     }
+    node.dataset.messageId = String(message.id);
+    if (container.children[position] !== node) container.insertBefore(node, container.children[position] ?? null);
     if (node.dataset.content !== message.content) {
       const body = $(".message-body", node);
       if (message.role === "user") body.textContent = message.content ?? "";
@@ -447,12 +450,6 @@ function renderChat() {
     let interruption = $(".interrupted-label", node);
     if (message.interrupted && !interruption) { interruption = element("div", { class: "interrupted-label", text: message.paused ? "生成已暂停" : "生成已停止" }); node.append(interruption); }
   }
-  const reasoning = $("#reasoning-region");
-  reasoning.hidden = !state.session.reasoning;
-  if (state.session.reasoning) {
-    if (!$("details", reasoning)) reasoning.replaceChildren(element("details", {}, element("summary", { text: "思考过程" }), element("div", { class: "reasoning-content" })));
-    $(".reasoning-content", reasoning).textContent = state.session.reasoning;
-  }
   renderApprovals();
   const runStatus = $("#run-status");
   runStatus.hidden = !busy() && !state.session.error;
@@ -461,7 +458,40 @@ function renderChat() {
   else if (busy()) runStatus.replaceChildren(element("span", { class: "thinking-dots", "aria-hidden": "true" }, element("i"), element("i"), element("i")), element("span", { text: state.session.status === "approval" ? "等待审批" : state.sending ? "正在发送…" : state.session.tools.some((tool) => tool.status === "running") ? "正在使用工具…" : "正在处理…" }));
   if (nearBottom) scrollToBottom(true);
   renderComposer();
-  renderTimeline();
+}
+
+function renderProcessItem(item, node) {
+  if (item.kind === "reasoning") {
+    if (!node) {
+      const content = element("div", { class: "reasoning-content", role: "region", "aria-label": "思考内容", tabIndex: 0 });
+      content.dataset.follow = "true";
+      content.addEventListener("scroll", () => { content.dataset.follow = String(content.scrollHeight - content.scrollTop - content.clientHeight <= 24); });
+      node = element("details", { class: "reasoning-step", open: true }, element("summary", {}, icon("sparkles"), element("span", { text: "思考过程" })), content);
+    }
+    const content = $(".reasoning-content", node);
+    if (node.dataset.content !== item.content) {
+      content.textContent = item.content;
+      node.dataset.content = item.content;
+    }
+    node.classList.toggle("streaming", !!item.streaming);
+    return node;
+  }
+  const tool = item.tool;
+  if (!node) {
+    node = element("details", { class: "tool-step" },
+      element("summary", {}, icon("terminal"), element("code", { class: "tool-name" }), element("span", { class: "tool-step-status" }), element("time", { class: "tool-time" })),
+      element("div", { class: "tool-section" }, element("div", { class: "tool-step-label", text: "参数" }), element("pre", { class: "tool-arguments" })),
+      element("div", { class: "tool-section tool-result-section" }, element("div", { class: "tool-step-label", text: "结果" }), element("pre", { class: "tool-result" })));
+  }
+  node.className = "tool-step " + tool.status;
+  $(".tool-name", node).textContent = tool.name || "工具调用";
+  $(".tool-step-status", node).textContent = toolStatusLabel(tool);
+  const argumentsText = pretty(tool.arguments ?? "未记录参数"), resultText = pretty(tool.result ?? tool.error ?? "");
+  if (node.dataset.arguments !== argumentsText) { $(".tool-arguments", node).textContent = argumentsText; node.dataset.arguments = argumentsText; }
+  if (node.dataset.result !== resultText) { $(".tool-result", node).textContent = resultText; node.dataset.result = resultText; }
+  $(".tool-result-section", node).hidden = tool.result === undefined && !tool.error;
+  $(".tool-time", node).textContent = formatTimestamp(tool.created_at ?? tool.completed_at);
+  return node;
 }
 
 function approvalCard(approval) {
@@ -502,38 +532,6 @@ function renderApprovals() {
     if (!existing.has(approval.id)) region.append(node);
     $$("button", node).forEach((button) => { button.disabled = !!connection?.approvalDecisions.has(approval.id); });
   }
-}
-
-function renderTimeline() {
-  const tools = state.session.tools;
-  const complete = tools.filter((tool) => tool.status !== "running").length;
-  const failed = tools.filter((tool) => tool.status === "failed").length;
-  $("#timeline-summary").textContent = tools.length ? `${complete} / ${tools.length} 项工具调用结束${failed ? ` · ${failed} 项失败` : ""}` : state.activeSession ? "当前会话" : "开始任务后，在这里查看过程";
-  const container = $("#tool-timeline");
-  if (!tools.length) {
-    container.replaceChildren(element("div", { class: "timeline-empty" }, icon("workflow"), "尚无工具调用"));
-    toolNodes = new Map();
-  } else {
-    if (!toolNodes.size) container.replaceChildren();
-    const ids = new Set(tools.map((tool) => String(tool.call_id)));
-    for (const [id, node] of toolNodes) if (!ids.has(id)) { node.remove(); toolNodes.delete(id); }
-    for (const tool of tools) {
-      const id = String(tool.call_id);
-      let node = toolNodes.get(id);
-      if (!node) {
-        node = element("div", { class: "tool-step" }, element("span", { class: "tool-step-dot" }), element("details", {}, element("summary"), element("div", { class: "tool-step-label", text: "参数" }), element("pre", { class: "tool-arguments" }), element("div", { class: "tool-step-label tool-result-label", text: "结果" }), element("pre", { class: "tool-result" })), element("div", { class: "tool-step-status" }));
-        toolNodes.set(id, node); container.append(node);
-      }
-      node.className = `tool-step ${tool.status}`;
-      $("summary", node).textContent = tool.name || "工具调用";
-      $(".tool-arguments", node).textContent = pretty(tool.arguments ?? "未记录参数");
-      $(".tool-result", node).textContent = pretty(tool.result ?? tool.error ?? "");
-      $(".tool-result", node).hidden = tool.result === undefined && !tool.error;
-      $(".tool-result-label", node).hidden = tool.result === undefined && !tool.error;
-      $(".tool-step-status", node).textContent = toolStatusLabel(tool);
-    }
-  }
-  $("#timeline-footer").textContent = `${MODES[state.mode]?.label ?? state.mode} 模式${state.session.status === "cancelled" ? " · 任务已停止" : state.session.status === "paused" ? " · 任务已暂停" : ""}`;
 }
 
 function queueRender() {
@@ -685,14 +683,13 @@ function startSessionEvents(sessionId, owner = connection) {
       const next = applyEvent(state.session, event);
       if (next === state.session) return;
       state.session = next;
-      if ((event.type === "tool.started" || event.type === "approval.requested") && !state.timelineUserChoice) state.timelineOpen = true;
       if (["run.completed", "run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
   });
 }
 
-function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); $("#tool-timeline").replaceChildren(); toolNodes = new Map(); }
+function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); }
 
 async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
@@ -718,7 +715,7 @@ function openHistoryDialog(sessionId, title, trigger, mode) {
   $("#dialog-content").scrollTop = 0;
   const slot = { sessionId: String(sessionId), title, content, trigger, mode, page: null, bodyPage: null, selected: null, controller: null, through: null, before: null, starts: [null], offsets: [0], segment: 0, error: "", retry: null, focusAfterLoad: false, returnMessageId: null };
   historyDialog = slot;
-  dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view };
+  dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view, action: trigger?.dataset.action };
   const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
   return slot;
 }
@@ -1503,7 +1500,8 @@ function renderRecordList(slot = recordDirectory) {
     const timestamp = session.updated_at ?? session.created_at;
     const title = session.title === null ? "标题未记录" : session.title || "空标题";
     const row = element("article", { class: "record-row" }, element("div", { class: "row-content" }, element("h3", { text: title }), element("div", { class: "row-meta" }, main ? "主对话" : "任务", element("span", { text: Object.hasOwn(statuses, session.status) ? statuses[session.status] : session.status ? `状态：${session.status}` : "状态未记录" }), element("time", { text: timestamp === null ? "日期未记录" : formatTimestamp(timestamp) }))), actionButton(main ? "回到对话" : "查看", "workflow-session", "text-button", undefined, { session: session.id }));
-    if (!main) row.append(iconButton("删除记录", "delete-session", "trash", { id: session.id }));
+    if (main) row.append(element("button", { type: "button", class: "text-button", text: "查看正文归档", dataset: { action: "record-archive", session: session.id }, onClick: (event) => void showHistoryArchive(session.id, { trigger: event.currentTarget, title }) }));
+    else row.append(iconButton("删除记录", "delete-session", "trash", { id: session.id }));
     slot.result.append(row);
   }
   if (!page.items.length) slot.result.append(emptyState("chat", slot.query ? "没有找到记录" : "还没有运行记录"));
@@ -2428,9 +2426,13 @@ function renderModelSettings() {
   const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "模型角色" });
   for (const [key, label] of MODEL_ROLES) tabs.append(element("button", { type: "button", role: "tab", class: role === key ? "active" : "", text: label, "aria-selected": String(role === key), dataset: { modelRole: key } }));
   const protocol = model.protocol ?? "openai_chat";
+  const protocolField = selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]);
+  const modelField = field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" });
+  const baseField = field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" });
+  const token = field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值", hint: "Anthropic 配置需要填写；其它协议可留空。" });
   const advanced = element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }),
     element("div", { class: "field-row" }, field("Temperature", `${path}.temperature`, model.temperature ?? "", { type: "number", step: .1, min: 0, max: 2, placeholder: "使用模型默认值" }), field("Top P", `${path}.top_p`, model.top_p ?? "", { type: "number", step: .05, min: 0, max: 1, placeholder: "使用模型默认值" })),
-    element("div", { class: "field-row" }, field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值" }), field("超时（秒）", `${path}.timeout`, model.timeout ?? "", { type: "number", min: 1, max: 600, placeholder: "使用服务默认值" })),
+    field("超时（秒）", `${path}.timeout`, model.timeout ?? "", { type: "number", min: 1, max: 600, placeholder: "使用服务默认值" }),
     element("div", { class: "field-row" }, field("重试次数", `${path}.max_retries`, model.max_retries ?? "", { type: "number", min: 0, max: 5, step: 1 }), field("API Key 环境变量", `${path}.api_key_env`, model.api_key_env ?? "", { placeholder: "可选" })),
     field("Reasoning", `${path}.reasoning`, pretty(model.reasoning ?? {}), { type: "textarea", rows: 2, json: true, format: "json" }),
     field("Thinking", `${path}.thinking`, pretty(model.thinking ?? {}), { type: "textarea", rows: 2, json: true, format: "json" }),
@@ -2440,9 +2442,18 @@ function renderModelSettings() {
     field("响应大小上限（字节）", `${path}.max_response_bytes`, model.max_response_bytes ?? "", { type: "number", min: 1024 }),
     switchField("流式输出", `${path}.stream`, model.stream !== false),
     model.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false));
-  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未配置时，工具审查交由你确认。", vision: "主模型不支持图片时，使用此模型识图。" };
-  return element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
-    settingsSection("模型连接", selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]), field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" }), field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" }), field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), switchField("支持图片", `${path}.vision`, model.vision), advanced));
+  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未单独配置时，复用主模型。", vision: "主模型支持图片时复用主模型；否则需要单独配置支持图片的视觉模型。" };
+  const content = element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
+    settingsSection("模型连接", protocolField, modelField, baseField, field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), token, switchField("支持图片", `${path}.vision`, model.vision), advanced));
+  const protocolInput = $("select", protocolField);
+  const modelInput = $("input", modelField);
+  const baseInput = $("input", baseField);
+  const updateRequired = () => { $("input", token).required = protocolInput.value === "anthropic" && (role === "main" || !!modelInput.value.trim() || !!baseInput.value.trim()); };
+  protocolInput.addEventListener("change", updateRequired);
+  modelInput.addEventListener("input", updateRequired);
+  baseInput.addEventListener("input", updateRequired);
+  updateRequired();
+  return content;
 }
 
 function renderPersonaSettings() {
@@ -2551,9 +2562,13 @@ function collectSettingsForm() {
     let value;
     if (input.type === "checkbox") value = input.checked;
     else if (input.type === "number") {
-      if (!input.value.trim()) continue;
-      value = Number(input.value);
-      if (!Number.isFinite(value)) throw new Error("数值格式不正确。");
+      if (!input.value.trim()) {
+        if (!/^models\.[^.]+\.max_output_tokens$/.test(input.name)) continue;
+        value = null;
+      } else {
+        value = Number(input.value);
+        if (!Number.isFinite(value)) throw new Error("数值格式不正确。");
+      }
     } else if (["json", "json-merge"].includes(input.dataset.format)) {
       try { value = parseJSONField(input.value); } catch { throw new Error(`${input.closest("label")?.firstElementChild?.textContent ?? "参数"} 需要填写有效 JSON 对象。`); }
     } else if (input.dataset.format === "lines") value = input.value.split("\n").map((line) => line.trim()).filter(Boolean);
@@ -2692,7 +2707,6 @@ async function handleAction(action, button) {
     } });
   }
   if (action === "stop-team") { await request(`/team/${encodeURIComponent(button.dataset.id)}/stop`, { method: "POST" }); await refreshTeam(); toast("已发送停止请求"); }
-  if (action === "toggle-timeline") { state.timelineOpen = !state.timelineOpen; state.timelineUserChoice = true; renderChrome(); renderTimeline(); }
   if (action === "model-settings") { state.settingsTab = "models"; await switchView("settings"); }
   if (action === "refresh") { await connect(); if (!["chat", "records"].includes(state.view)) await switchView(state.view); }
   if (action === "retry-view") await switchView(state.view);
@@ -2702,7 +2716,7 @@ async function handleAction(action, button) {
   if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") $("#app-dialog").close();
   if (action === "copy-message") {
-    const message = state.session.messages.find((item) => String(item.id) === button.dataset.id);
+    const message = conversationItems(state.session).find((item) => item.kind === "message" && String(item.id) === button.dataset.id)?.message ?? state.session.messages.find((item) => String(item.id) === button.dataset.id);
     if (message) { await navigator.clipboard.writeText(message.content); toast("已复制"); }
   }
   if (action === "delete-session") {
@@ -2829,7 +2843,7 @@ $("#mode-select").addEventListener("change", async (event) => {
   const previous = state.mode; state.mode = event.target.value;
   try { if (state.activeSession) { await request(`/sessions/${encodeURIComponent(state.activeSession.id)}`, { method: "PATCH", body: { mode: state.mode } }); state.activeSession.mode = state.mode; } }
   catch (error) { state.mode = previous; showError(error); }
-  renderComposer(); renderTimeline();
+  renderComposer();
 });
 $("#file-input").addEventListener("change", (event) => { void addFiles(event.target.files); event.target.value = ""; });
 $("#conversation-scroll").addEventListener("scroll", () => { $("#scroll-bottom").hidden = scrollIsNearBottom() || !state.session.messages.length; }, { passive: true });
@@ -2861,7 +2875,7 @@ $("#app-dialog").addEventListener("close", () => {
   const historyReturn = dialogHistoryReturn; dialogHistoryReturn = null;
   if (state.auth.authenticated && historyReturn?.view === state.view) {
     const action = historyReturn.action ?? "workflow-session";
-    const fallback = state.view === "chat" ? $("#history-archive-button") : $$("[data-action]", $("#other-view")).find((button) => button.dataset.action === action && (action === "delete-session" ? button.dataset.id : button.dataset.session) === historyReturn.sessionId);
+    const fallback = state.view === "chat" ? $("#message-input") : $$("[data-action]", $("#other-view")).find((button) => button.dataset.action === action && (action === "delete-session" ? button.dataset.id : button.dataset.session) === historyReturn.sessionId);
     const target = historyReturn.trigger && document.contains(historyReturn.trigger) ? historyReturn.trigger : fallback;
     if (target) target.focus({ preventScroll: true });
     else if (state.view === "records" && recordDirectoryCurrent(recordDirectory)) recordDirectory.position?.focus({ preventScroll: true });

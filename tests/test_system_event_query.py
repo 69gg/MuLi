@@ -292,6 +292,7 @@ async def test_real_query_page_survives_context_pressure(
             "models": {
                 "main": {
                     "protocol": protocol,
+                    **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
                     "model": "offline-test",
                     "base_url": "https://unused.invalid/v1",
                 }
