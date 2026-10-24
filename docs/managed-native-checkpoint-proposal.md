@@ -1015,3 +1015,106 @@ Ruff通过。格式检查仅发现测试中两处换行，根按原formatter整�
 本片源码、测试及文档再次冻结；以上离线绿和后审不改变Native29真实失败、未取得
 首异常位置与清理未通过的事实。远端Native30尚未启动，只有根完成剩余验证、签名
 推送后才可针对精确新head单次运行，当前不预写现场分类、根因或事务修复结果。
+
+Native30随后以精确签名head `48d3821692614a504b48bcd6c20b110272aa264a` 在
+run `40073002299` 终态失败：managed-native job `120810303629` 仍失败，另外Linux
+3.12与3.13的shard2均在同一真实进程旅程
+`test_actual_cli_boot_activation_and_projection_preserve_latest_database[target-rejected-rollback]`
+失败。两份固定摘要都处于rev6 rolling_back/stop_target、activation pending、
+backend_failed，分别尚余约16.3与14.2秒，不是20秒整体deadline耗尽。
+
+源码与实际有限output确认该回归的直接原因是夹具协议冲突：此测试将driver的stderr
+合并到stdout，而原diagnostic_checkpoint只允许固定checkpoint和controller-step行；
+Native29新增的安全controller warning进入同一pipe，先于step与stop-target被当作
+unexpected checkpoint frame拒绝。Linux3.12日志尾明确已有真实stop-target；3.13
+日志截断尾已包含安全诊断与step2，不从截断文本额外推定其完整后续输出。这里的
+backend_failed本就是测试预设target拒绝后进入回滚的结果，不能据此改生产停止逻辑。
+
+根用原rollback精确selector本机实收相同真实红：1 failed，pytest6.24秒、守卫6.898秒、
+179.4MiB、swap0，诊断仍为rev6 stop_target/backend_failed且剩余14376毫秒。
+授权的唯一候选代码改动在 `tests/helpers/managed_recovery_worker.py::controller`
+入口，局部为固定muli.management_controller logger添加NullHandler并关闭传播。
+只此独立测试driver的可选日志不再混入握手pipe；真实controller仍执行原capture、
+首attempt与事务决定，不修改生产logger、parser、服务子角色、20秒、4KiB或三进程门。
+原formal验证的是实际launcher/CLI/nonce/Runtime回滚与最新数据保留，安全诊断本身
+仍由原专属controller/capture回归验收，不以此测试隔离替代现场日志采集。
+作者未运行检查、格式、Git、网络或服务，源码静态读回后冻结，success与rollback
+两formal的修后结果待根收取，不预写通过。
+
+本次native artifact则是独立失败：根严格typed校验1813字节、SHA256
+`1c3d9a3e6071d781bc1dd438c6d65c47dfa335e2acb0c02cc4786f2c1ec7d0d6`，
+controller_failure实际为metadata_rejected，原最终四可信门仍保留；现场首stop_base
+仍backend_failed，cleanup仍三mount。该阶段分类不证明具体缺失字段或元数据归属
+原因，测试driver隔离不会修复真实native首因或清理，不据此盲重跑同一CI。
+
+根随后签名提交 `48d3821692614a504b48bcd6c20b110272aa264a`（Good）并推送，
+只运行一次精确CI [40073002299](https://github.com/69gg/MuLi/actions/runs/40073002299)，
+最终failure。原生作业 `120810303629` 的1813字节artifact `12552131810` 已完整经过
+当前typed reader和Receipt校验，SHA256为
+`1c3d9a3e6071d781bc1dd438c6d65c47dfa335e2acb0c02cc4786f2c1ec7d0d6`。
+`controller_failure` 为 `not_observed/metadata_rejected`：成功读取到未满足最终完整
+可信元数据门的候选行，不导出其原字段或MESSAGE，仍不能采信原异常位置或断言
+哪一字段缺失。此次helper代次 `39713028392a34976c604c79a50869ed`，UID999、PID2642、
+invocation `86c5ae9a039a46fdac628783460950e3`；manager ready307毫秒、六环境核对全真。
+首adopt仍依次rev3 activating/stop_base、rev4 rolling_back/stop_target/backend_failed、
+rev5 recovery_required；helper退出不等于事务成功。清理仍三mount且user/group未移除。
+
+同一CI两个Linux shard2也出现必须诊断的回归：Python3.12作业 `120810303557` 和
+3.13作业 `120810303625` 均只有
+`test_actual_cli_boot_activation_and_projection_preserve_latest_database[target-rejected-rollback]`
+失败，各2751 passed、18 skipped、3270 deselected。有限现场摘要在target被拒后
+停于wait:stop-target，rev6 rolling_back/stop_target、backend_failed，尚余16.346及
+14.215秒，不是整体deadline耗尽。不能把两个确定失败称为偶发或以延长期限跳过；
+下一步先定位该旧真实进程用例的具体故障接缝，不对相同head盲重跑或宣称全CI绿。
+
+根随后对上述测试driver的定向logger隔离候选收取原success及rollback两条formal，
+实际2 passed（pytest20.01秒、守卫20.542秒、180.8MiB、swap0）；未改变原生产、
+20秒单case、4KiB及三进程限制。本机此时尚未提交，不能把这两条通过当作真实native
+metadata_rejected或首stop_base故障已修。
+
+### Native31：同一有限回包内的固定元数据状态提案与先红
+
+原Native30只定位到metadata_rejected，尚不知道哪一trusted字段缺失或不等。
+下一片不增加查询、probe、读取行数、deadline或字节额度：只在原两行解析中，
+为最终not_observed/metadata_rejected结果附optional `metadata`，包含1至2条
+按原回包顺序的固定摘要，每条严格为uid、pid、unit、invocation、shape五键。
+四身份状态仅missing/mismatch/matches：原key缺失是missing；存在但类型非字符串
+或不等于原可信source是mismatch；原字符串逐值相等是matches。shape为严格bool，
+仅说明原整行字段集合与全部值类型门是否通过，避免四身份匹配但MESSAGE缺失被
+误解成整行通过。没有任何实际字段值、长度、hash、MESSAGE、路径或异常正文。
+
+摘要只解释拒绝，不参与采信或跨行拼接。最终observed仍要求完整同一行的原四可信
+字段、helper_source、generation/revision/intent、安全payload及原timeline门通过；
+单有效行加坏行仍可observed，两个冲突有效payload仍拒绝。坏UTF8/JSON/重复键
+继续原跳过，不生成摘要，纯坏行仍可no_known_event；只有最终metadata_rejected
+可带该字段，payload_rejected或observed不带。旧两键metadata_rejected继续回读。
+新reader须核exact结果键/1至2条/exact五键/四有限enum/严格bool，摘要放不下仍
+原output_budget或保留原result，不扩大32KiB最终门，也不增加授信材料。
+
+本轮先仅在原controller_failure测试文件增加五个目标节点：真实controller/capture
+MESSAGE经原parent采集保存入口，分别删unit、删invocation、改invocation、删MESSAGE，
+以及两行各自身份不符但可互补的反例。原单次query与实际raw收费、首失败及timeline
+均继续核验，期待只保存固定状态且不晋级observed。生产未改，作者未执行检查、
+格式、Git、网络或服务；这些目标仍待根取得真实红，没有新远端轮次授权或根因结论。
+
+根随后实收这五个目标全部真实红：pytest1.89秒、守卫2.415秒、69.7MiB、swap0；
+原query、raw收费及保存均已通过，准确缺口是原parser只保code/reason而没有metadata。
+授权后的生产仍仅修改 `scripts/check_managed_native_ci.py`，在原两行decode内产生
+固定状态摘要，并在原typed reader核上述exact形状；不增加取数或改变最终采信门。
+仅最终metadata_rejected附摘要，observed或其它reason仍原形状，旧两键拒绝仍读。
+
+原相关断言仅按精确新摘要同步，没有允许任意extra；另补reader的非法enum、非bool
+shape、零/三行、错误reason、行/结果extra拒绝及旧形状兼容，保单有效行加坏JSON的
+两个顺序均可observed、两个不同严格有效diagnostic仍invalid_reply。新增摘要不能
+成为事务授权或说明具体外部错误。作者未执行检查、格式、Git、网络或服务；本轮
+生产、测试及文档静态读回后冻结，修后回归和非作者后审待根收取，不预写现场结果。
+
+根随后实收controller文件45 passed（pytest14.84秒、守卫15.377秒、76MiB、swap0）；
+原七个native文件839 passed（pytest2.59秒、守卫3.233秒、159.1MiB、swap0）。加上
+前述测试driver隔离的两条formal，共886个不同节点本地绿，不重复累计其中五个先红
+目标。三脚本严格类型检查通过，守卫5.332秒、287.4MiB、swap0；变更的三个Python
+文件Ruff通过。根只整理script三处纯格式，再对三个文件复验format通过，没有语义
+改动，也未因此重复累计测试。D完成正式非作者只读后审，未发现剩余P1/P2。
+
+本片再次冻结。以上离线结果不改变Native30现场metadata_rejected、原事务与cleanup
+仍失败且首因未得的事实；Native31精确新head尚未签名、尚未运行CI，现场结果待验。

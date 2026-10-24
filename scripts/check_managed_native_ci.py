@@ -1138,9 +1138,8 @@ def controller_failure_facts(value: object, result: dict[str, Any]) -> bool:
     if not isinstance(value, dict):
         return False
     if value.get("code") == "not_observed":
-        return (
-            set(value) == {"code", "reason"}
-            and isinstance(value["reason"], str)
+        if not (
+            isinstance(value.get("reason"), str)
             and value["reason"]
             in {
                 "missing_binding",
@@ -1154,6 +1153,26 @@ def controller_failure_facts(value: object, result: dict[str, Any]) -> bool:
                 "metadata_rejected",
                 "payload_rejected",
             }
+        ):
+            return False
+        if set(value) == {"code", "reason"}:
+            return True
+        if set(value) != {"code", "reason", "metadata"} or value["reason"] != "metadata_rejected":
+            return False
+        rows = value["metadata"]
+        return (
+            isinstance(rows, list)
+            and 1 <= len(rows) <= 2
+            and all(
+                isinstance(row, dict)
+                and set(row) == {"uid", "pid", "unit", "invocation", "shape"}
+                and type(row["shape"]) is bool
+                and all(
+                    isinstance(row[field], str) and row[field] in {"missing", "mismatch", "matches"}
+                    for field in ("uid", "pid", "unit", "invocation")
+                )
+                for row in rows
+            )
         )
     if set(value) != {"code", "failure"} or value["code"] != "observed":
         return False
@@ -1210,18 +1229,37 @@ def controller_journal_failure(
         return {"code": "not_observed", "reason": "empty_reply"}
     reason = "no_known_event"
     observed: dict[str, Any] | None = None
+    rejected_metadata: list[dict[str, str | bool]] = []
     for line in lines:
         try:
             row = json.loads(line.decode("utf-8"), object_pairs_hook=unique)
+            shape = (
+                isinstance(row, dict)
+                and fields <= set(row) <= fields | metadata
+                and all(isinstance(value, str) for value in row.values())
+            )
             if (
-                not isinstance(row, dict)
-                or not fields <= set(row) <= fields | metadata
-                or any(not isinstance(value, str) for value in row.values())
+                not shape
                 or row["_UID"] != str(source["uid"])
                 or row["_PID"] != str(source["pid"])
                 or row["_SYSTEMD_USER_UNIT"] != source["helper"]
                 or row["_SYSTEMD_INVOCATION_ID"] != source["invocation"]
             ):
+                summary: dict[str, str | bool] = {"shape": shape}
+                for field, key, expected in (
+                    ("uid", "_UID", str(source["uid"])),
+                    ("pid", "_PID", str(source["pid"])),
+                    ("unit", "_SYSTEMD_USER_UNIT", source["helper"]),
+                    ("invocation", "_SYSTEMD_INVOCATION_ID", source["invocation"]),
+                ):
+                    summary[field] = (
+                        "missing"
+                        if not isinstance(row, dict) or key not in row
+                        else "matches"
+                        if isinstance(row[key], str) and row[key] == expected
+                        else "mismatch"
+                    )
+                rejected_metadata.append(summary)
                 if reason != "payload_rejected":
                     reason = "metadata_rejected"
                 continue
@@ -1239,7 +1277,11 @@ def controller_journal_failure(
             observed = candidate
         except (ValueError, RecursionError):
             continue
-    return observed if observed is not None else {"code": "not_observed", "reason": reason}
+    if observed is not None:
+        return observed
+    if reason == "metadata_rejected":
+        return {"code": "not_observed", "reason": reason, "metadata": rejected_metadata}
+    return {"code": "not_observed", "reason": reason}
 
 
 def fixture_result(data: bytes) -> dict[str, Any]:

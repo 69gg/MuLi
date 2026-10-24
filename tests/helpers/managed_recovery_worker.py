@@ -390,6 +390,13 @@ async def observed_step(
 
 
 async def controller(root: Path) -> None:
+    import logging
+
+    # This child's merged output is a fixed handshake protocol, not a log sink.
+    # Keep optional production diagnostics out of this fixture's control pipe.
+    logger = logging.getLogger("muli.management_controller")
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
     with TransactionJournal(root / "journal", root / "data/muli.sqlite3", create=False) as journal:
         anchor, slots = deployment(journal)
         with journal.locked() as control:
