@@ -9,7 +9,7 @@ import pytest
 
 from muli.config import ConfigFile
 from muli.providers import ModelConfig
-from muli.runtime import Runtime
+from muli.runtime import Runtime, _ExecutionResult
 from muli.task_control import TaskPaused
 
 
@@ -40,14 +40,14 @@ async def test_final_session_fact_has_followup_event_after_terminal_cleanup_gap(
 ) -> None:
     entered, finish = asyncio.Event(), asyncio.Event()
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
         if outcome == "failed":
             raise ValueError("controlled failure")
         if outcome == "paused":
             raise TaskPaused("task_paused", "controlled pause", observed_epoch=3)
         if outcome == "cancelled":
             raise asyncio.CancelledError
-        return "controlled result"
+        return _ExecutionResult("controlled result")
 
     async def release(session_id: str, run_id: str) -> None:
         entered.set()
@@ -95,8 +95,8 @@ async def test_old_run_does_not_publish_or_overwrite_replacement_session(
 ) -> None:
     entered, finish = asyncio.Event(), asyncio.Event()
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
-        return "old result"
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
+        return _ExecutionResult("old result")
 
     async def release(session_id: str, run_id: str) -> None:
         entered.set()
@@ -133,8 +133,8 @@ async def test_final_session_notification_preserves_facts_and_settles_after_hand
     entered, finish = asyncio.Event(), asyncio.Event()
     original_notify = runtime.bus.notify
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
-        return "known result"
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
+        return _ExecutionResult("known result")
 
     async def notify() -> None:
         if runtime.store.events()[-1]["type"] == "session.updated":
@@ -190,8 +190,8 @@ async def test_close_waits_for_released_session_finalizer_before_closing_store(
     original_notify = runtime.bus.notify
     original_compaction_close = runtime.compaction.close
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
-        return "known result"
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
+        return _ExecutionResult("known result")
 
     async def notify() -> None:
         if runtime.store.events()[-1]["type"] == "session.updated":
@@ -237,13 +237,13 @@ async def test_old_notification_cannot_modify_a_real_replacement_run(
     original_notify = runtime.bus.notify
     executions = 0
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
         nonlocal executions
         executions += 1
         if executions == 2:
             replacement_entered.set()
             await replacement_finish.wait()
-        return f"result {executions}"
+        return _ExecutionResult(f"result {executions}")
 
     async def notify() -> None:
         if not entered.is_set() and runtime.store.events()[-1]["type"] == "session.updated":
@@ -289,13 +289,13 @@ async def test_cancelled_close_observer_still_settles_old_and_replacement_driver
     original_close = runtime.store.close
     executions, releases, store_closes = 0, 0, 0
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
         nonlocal executions
         executions += 1
         if executions == 2:
             new_waiting.set()
             await asyncio.Future[None]()
-        return "old result"
+        return _ExecutionResult("old result")
 
     async def notify() -> None:
         if not old_waiting.is_set() and runtime.store.events()[-1]["type"] == "session.updated":

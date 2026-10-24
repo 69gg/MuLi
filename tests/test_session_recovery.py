@@ -12,7 +12,7 @@ import pytest
 
 from muli.config import ConfigFile
 from muli.providers import ModelConfig, ToolCall
-from muli.runtime import Runtime
+from muli.runtime import Runtime, _ExecutionResult
 from muli.server import create_app
 from muli.store import Store
 from muli.task_control import TaskPaused
@@ -217,14 +217,14 @@ async def test_snapshot_retains_same_run_terminal_evidence_before_cleanup_finish
     runtime, client = recovery_case
     entered, finish = asyncio.Event(), asyncio.Event()
 
-    async def execute(*args: Any, **kwargs: Any) -> str:
+    async def execute(*args: Any, **kwargs: Any) -> _ExecutionResult:
         if outcome == "failed":
             raise ValueError("controlled failure")
         if outcome == "paused":
             raise TaskPaused("task_paused", "controlled pause", observed_epoch=3)
         if outcome == "cancelled":
             raise asyncio.CancelledError
-        return "controlled result"
+        return _ExecutionResult("controlled result")
 
     async def release(session_id: str, run_id: str) -> None:
         entered.set()

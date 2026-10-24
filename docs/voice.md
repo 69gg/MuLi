@@ -64,7 +64,17 @@ voice.enabled 默认 false。未启用时，start 不创建采集任务，listen
 
 然后补录有界指令音频，保留唤醒片段作为前置音频，避免丢掉“沐璃，……”之后紧接的指令。配置声纹组件时，先核对显式录制的参考音频，未通过不调用 ASR；未配置声纹时，回调仍明确 speaker_verified=false。转写复用已配置的 MediaService OpenAI 兼容 ASR，不发送未唤醒片段或声纹参考录音。业务层必须按该身份字段处理权限，唤醒成功本身不等于可信主人身份。
 
-ASR 后回调 `{text,wake_word,speaker_verified,source:"voice"}`。原始唤醒片段和本次指令音频在成功、失败、拒绝及取消后删除；参考录音与显式合成文件留在数据目录 voice/，需要单独备份或删除。合成文件不自动播放；唤醒提示的短音频播放后删除。
+ASR 后回调 `{text,wake_word,speaker_verified,source:"voice"}`。原始唤醒片段和本次指令音频在成功、失败、拒绝及取消后删除；参考录音与合成文件留在数据目录 voice/，需要单独备份或删除。显式合成仍不自动播放；唤醒提示的短音频播放后删除。
+
+## 本地最终答复自动播放
+
+`voice.reply_enabled` 默认 false。另行开启它以及 `voice.enabled`、`voice.tts_enabled`，配置现有声纹桥接、注册参考录音并配置 ASR/TTS 后，本次声纹验证通过的本地语音可让最终答复自动合成并尝试播放一次。它不内置新声学模型，也不改变权限模式；未验证的声音仍隔离。手机或网页输入、网页录音草稿、模型自行填写的来源都不能取得本地播放资格。手机批准原工具时会继续原声纹会话，不因此把答复来源切换到手机。
+
+播放绑定实际入站 ID、消费它的 run 和最终答复来源；中间工具文字、流式片段、失败/暂停/取消和多来源工作流聚合不自动朗读。等待主运行不占语音 Admission；实际 TTS/播放与本设备录音串行，避免录到自己的答复。新主人输入、主人调整/暂停任务、新主动事项、显式停止、关闭或配置换代会撤销旧票据；旧渠道信封重投、队友资料报告和手机审批不会凭空增加一轮播放。已经开始的播放会取消并结算播放器，但已经发出的声音不能撤回，不保证硬实时静音。
+
+`media_capabilities` 的 `voice.last_reply` 提供本次 input/run/message 定位与 waiting、synthesizing、playing、played、cancelled、failed 或 unknown 状态。played 只表示播放器正常返回，不证明人耳听见；进入播放器后失败或取消记 unknown。成功生成的音频默认留在原 voice 私有目录，`audio` 沿用本地 artifact 元数据，继续受 `max_file_bytes/max_total_bytes` 配额限制；失败通过 `last_error` 和 `voice.status` 可见，不截断答复冒充完整内容，不自动重调 TTS 或重播。关闭/重开只恢复原文本记录，不恢复播放票据。
+
+实现和离线正式旅程的设计边界见[语音回复接线方案](voice-reply-proposal.md)。真实声纹准确率、硬件录放音与外部 TTS 效果仍需另行验收。
 
 ## 配置与设备
 
@@ -81,7 +91,8 @@ ASR 后回调 `{text,wake_word,speaker_verified,source:"voice"}`。原始唤醒�
 | wake_command / speaker_command | [] | 声学唤醒 / 声纹命令 argv |
 | wake_threshold / speaker_threshold | 0.6 / 0.75 | 有限置信度阈值 |
 | max_file_bytes / max_total_bytes | 2000000 / 20000000 | 单文件与目录配额 |
-| tts_enabled | false | 允许调用已配置 TTS；用于“请说”和显式语音合成 |
+| tts_enabled | false | 允许调用已配置 TTS；用于“请说”、显式语音合成及另行开启的自动回复 |
+| reply_enabled | false | 允许本次声纹验证通过的本地会话自动合成、播放最终答复；同时需要 tts_enabled |
 
 auto 只探测主机可见的 /dev/kfd、/dev/dri、NVIDIA 设备或工具，优先传递可见加速设备，否则传 CPU。显式请求的 GPU 不可见时报告 CPU 回退。设备可见不证明推理框架或模型能使用它，status.device.runtime_verified=false；桥接组件必须验证支持并处理自身的 CPU 回退。不会探测时装载大模型或安装 CUDA / ROCm。
 
@@ -110,11 +121,11 @@ wake_command / speaker_command 是完整 argv 数组，不是 shell 命令字符
 
 ## 模块接线
 
-`VoiceWorker(config, data_dir, media, on_text, *, recorder=None, wake=None, speaker=None, player=None, on_status=None)` 支持小型本地组件替换。status 同步读取能力；start / stop / aclose 管理后台任务；listen_once 执行一次有限监听；enroll 录制参考；synthesize 保存合成文件，不播放。on_status 可接 SSE，当前提示事件为 `{type:"voice.prompt",prompt:"请说",played,kind,reason}`，kind 是 speech / tone / status；最近结果也在 status.last_prompt 中。
+`VoiceWorker(config, data_dir, media, on_text, *, recorder=None, wake=None, speaker=None, player=None, on_status=None)` 支持小型本地组件替换。status 同步读取能力；start / stop / aclose 管理后台任务；listen_once 执行一次有限监听；enroll 录制参考；synthesize 保存合成文件，不播放。宿主自动回复使用 `reply(text, admission_guard=...)`，复用原音频操作、采集锁和播放器，调用前与合成后复核票据。on_status 可接 SSE，提示事件为 `{type:"voice.prompt",prompt:"请说",played,kind,reason}`，kind 是 speech / tone / status；最近结果也在 status.last_prompt 中，自动回复另有 voice.reply / last_reply。
 
 录音与声学处理使用同一异步锁，避免后台监听和录制参考争用麦克风。后台监听、手动 listen_once、enroll 及 synthesize 都登记为当前操作；stop 会取消正在执行或排队的操作，等待录音进程退出和临时文件清理后返回，随后允许再次 start。aclose 是最终关闭，会拒绝新的监听、录制、合成或启动，status.closed=true；即使等待关闭的调用方被取消，也先完成已有操作的清理再传播取消。文件与进程都有限额；取消会终止子进程、删除未完成文件。失败后至少等待两秒再重试，能力缺失时 start 不进入轮询。
 
-转写回调在采集与文件锁释放后执行，可以合成回复语音。整个回调仍属于当前可取消操作；回调内的嵌套 TTS 不会让关闭流程遗漏尚未结束的录音任务。
+转写回调在采集与文件锁释放后执行，可以合成回复语音。整个回调仍属于当前可取消操作；回调内的嵌套 TTS 不会让关闭流程遗漏尚未结束的录音任务。PersonalIO 的自动回复只在回调内登记一张易失票据后返回，由单个自有任务等待实际主运行；关闭会先失效并结算它，再关闭录放音和媒体服务，不取消被 shield 的主运行。
 
 录音和播放参数依据 [FFmpeg Devices](https://ffmpeg.org/ffmpeg-devices.html) 与 [Arch arecord 手册](https://man.archlinux.org/man/aplay.1.en)。ASR/TTS 的 HTTP 接线、接口兼容性与请求预算复用 [媒体服务](providers.md#视觉语音和检索服务)。
 

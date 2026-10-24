@@ -344,6 +344,7 @@ class VoiceSettings(Section):
     speaker_command: list[str] = Field(default_factory=list)
     speaker_threshold: float = Field(default=0.75, ge=0, le=1)
     tts_enabled: bool = False
+    reply_enabled: bool = False
 
 
 class ChannelProfile(Section):

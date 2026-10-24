@@ -19,7 +19,7 @@ from test_workflows import step
 from muli.channels import ChannelError, ChannelsConfig
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.reply_origin import ReplyOrigin
-from muli.runtime import PreparedRequest, Runtime
+from muli.runtime import PreparedRequest, Runtime, _ExecutionResult
 from muli.workflows import JsonObject
 
 
@@ -78,9 +78,9 @@ def put_children(
 async def start_stored_children(runtime: Runtime, children: list[JsonObject]) -> JsonObject:
     async def execute(
         session_id: str, run_id: str, role: str, mode: str, workflow_step: bool
-    ) -> str:
+    ) -> _ExecutionResult:
         put_children(runtime, session_id, run_id, children)
-        return "arranged"
+        return _ExecutionResult("arranged")
 
     # The real driver still owns waiting, all-success admission, budget and publication.
     runtime._execute = execute  # type: ignore[method-assign]

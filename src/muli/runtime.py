@@ -88,6 +88,13 @@ class PreparedRequest:
     attention_routing: FrozenRouting | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionResult:
+    content: str
+    message_id: str | None = None
+    reply_origin: ReplyOrigin | None = None
+
+
 class Runtime:
     def __init__(
         self,
@@ -196,6 +203,8 @@ class Runtime:
         self._plans_dirty = False
         self._coordinator_tools: set[str] = set()
         self._closing = False
+        self._voice_reply_epoch = 0
+        self._voice_reply_changed = asyncio.Event()
         self._stopping: dict[str, int] = {}
         self.tasks: dict[str, asyncio.Task[str]] = {}
         self._session_finalizers: set[asyncio.Task[Any]] = set()
@@ -278,6 +287,20 @@ class Runtime:
         session_id = self.tool_session_id
         request = self.request_context(session_id) if session_id is not None else None
         return request.reply_origin if request is not None else ReplyOrigin()
+
+    @property
+    def voice_reply_epoch(self) -> int:
+        """Ephemeral revocation only; neither a durable receipt nor authorization."""
+        return self._voice_reply_epoch
+
+    @property
+    def voice_reply_changed(self) -> asyncio.Event:
+        return self._voice_reply_changed
+
+    def _invalidate_voice_reply(self) -> None:
+        self._voice_reply_epoch += 1
+        self._voice_reply_changed.set()
+        self._voice_reply_changed = asyncio.Event()
 
     def validate_proactive_settings(self, target: Settings) -> None:
         """Validate newly selected evidence again when a queued config is applied."""
@@ -528,6 +551,8 @@ class Runtime:
             expected_approved_epoch=expected_approved_epoch,
             reply_origin=reply_origin,
         )
+        if result.created:
+            self._invalidate_voice_reply()
         if result.created and self._selected_replans.get(session["id"]) == identifier:
             # A duplicate old receipt must not clear a newer selection.
             self._selected_replans.pop(session["id"], None)
@@ -722,6 +747,9 @@ class Runtime:
                 event_id=event_id,
                 max_pending=self.config.settings.limits.max_pending_runs,
             )
+            if inserted and principal == "owner":
+                self._invalidate_voice_reply()
+            voice_reply_epoch = self.voice_reply_epoch
             if inserted:
                 for hook in self.message_hooks:
                     try:
@@ -765,6 +793,7 @@ class Runtime:
             "queued": receipt["state"] == "pending",
             "duplicate": not inserted,
             "quarantined": receipt["state"] == "quarantined",
+            "voice_reply_epoch": voice_reply_epoch,
         }
 
     def _wake_main(self) -> None:
@@ -816,6 +845,8 @@ class Runtime:
                 objects=objects,
                 attention_routing=routing,
             )
+            if inserted:
+                self._invalidate_voice_reply()
             self._wake_main()
         if inserted:
             await self.bus.emit("attention.queued", {"message": receipt}, session["id"])
@@ -886,6 +917,7 @@ class Runtime:
         self.store.revalidate_format()
         if self.busy:
             raise ValueError("请先停止运行中的任务")
+        self._invalidate_voice_reply()
         await self.compaction.close()
         await self.workflows.close()
         await self.mcp.close()
@@ -1135,6 +1167,8 @@ class Runtime:
         session["updated_at"], session["status"] = now(), "running"
         self.store.put("session", session)
         message = self.store.add_message(session_id, "user", content)
+        if session.get("kind") == "main":
+            self._invalidate_voice_reply()
         run_id = self._launch(session, "main", cast(Mode, session["mode"]))
         return {"run_id": run_id, "session_id": session_id, "message": message}
 
@@ -1204,6 +1238,9 @@ class Runtime:
                 del self._stopping[session_id]
 
     async def stop(self, session_id: str, *, cancel_pending: bool = True) -> None:
+        invalidate_reply = session_id == self.store.existing_main_session_id()
+        if invalidate_reply:
+            self._invalidate_voice_reply()
         pending = self.store.pending_inputs(session_id) if cancel_pending else 0
         try:
             with self._stopping_session(session_id):
@@ -1301,7 +1338,10 @@ class Runtime:
                 run["status"] = "running"
                 self.store.put("run", run)
                 await self.bus.emit("run.started", run, session_id)
-                result = await self._execute(session_id, run_id, role, mode, workflow_step)
+                execution_result = await self._execute(
+                    session_id, run_id, role, mode, workflow_step
+                )
+                result = execution_result.content
                 self.system_events.clear_request(session_id)
                 # Child agents need the same capacity pool. Release the parent's slot first.
                 child_results: list[str] = []
@@ -1342,6 +1382,9 @@ class Runtime:
                         has_children = True
                 if has_children:
                     result = "".join(child_results)
+                    # An aggregate can have several frozen destinations. It is
+                    # not the earlier assistant message returned by _execute.
+                    execution_result = _ExecutionResult(result)
                     if log_session.get("kind") == "main":
                         # No report is committed until every child succeeded.
                         # The synchronous batch cannot be split by cancellation.
@@ -1353,7 +1396,21 @@ class Runtime:
                         message = self.store.add_message(session_id, "assistant", result)
                         await self.bus.emit("message.completed", {"message": message}, session_id)
             run["status"], run["result"] = "completed", result
-            await self.bus.emit("run.completed", {"run_id": run_id}, session_id)
+            run["result_message_id"] = execution_result.message_id
+            run["reply_origin"] = (
+                execution_result.reply_origin.dump()
+                if execution_result.reply_origin is not None
+                else None
+            )
+            await self.bus.emit(
+                "run.completed",
+                {
+                    "run_id": run_id,
+                    "result_message_id": run["result_message_id"],
+                    "reply_origin": run["reply_origin"],
+                },
+                session_id,
+            )
             return result
         except asyncio.CancelledError:
             run["status"] = "cancelled"
@@ -1700,7 +1757,7 @@ class Runtime:
 
     async def _execute(
         self, session_id: str, run_id: str, role: str, mode: Mode, workflow_step: bool
-    ) -> str:
+    ) -> _ExecutionResult:
         self._repair_tail(session_id)
         await self._claim_inputs(session_id, run_id)
         prepared = await self._prepare_request(session_id)
@@ -1797,7 +1854,15 @@ class Runtime:
                         )
                         continue
                     self.compaction.observe(session_id)
-                    return turn.content
+                    return _ExecutionResult(
+                        turn.content,
+                        assistant_message["id"]
+                        if session.get("kind") == "main" and not workflow_step
+                        else None,
+                        prepared.reply_origin
+                        if session.get("kind") == "main" and not workflow_step
+                        else None,
+                    )
                 paused: TaskPaused | None = None
                 for call in turn.tool_calls:
                     spent += 1
@@ -2422,6 +2487,7 @@ class Runtime:
     async def close(self) -> None:
         if self._close_task is None:
             self._closing = True
+            self._invalidate_voice_reply()
             self._close_task = asyncio.create_task(self._close_resources())
         cancelled = await self.team._settle([self._close_task])
         if cancelled:

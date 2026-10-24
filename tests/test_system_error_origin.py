@@ -22,7 +22,7 @@ from muli.proactive import FrozenRouting, guard_delivery
 from muli.proactive_memory import PreferenceEvidence
 from muli.providers import Message, ModelTurn, StreamEvent, ToolCall
 from muli.reply_origin import RouteError
-from muli.runtime import Runtime
+from muli.runtime import Runtime, _ExecutionResult
 from muli.store import new_id
 from muli.system_event_query import read_system_events
 from muli.system_events import attention_source, system_log_context, validated_log_record
@@ -426,11 +426,13 @@ async def test_run_without_current_prepared_request_stays_local(
             raise ValueError("before_first_prepared_failed")
         return await original_emit(kind, data, session_id)
 
-    async def execute(session_id: str, run_id: str, role: str, mode: Any, workflow: bool) -> str:
+    async def execute(
+        session_id: str, run_id: str, role: str, mode: Any, workflow: bool
+    ) -> _ExecutionResult:
         await runtime._claim_inputs(session_id, run_id)
         prepared = await runtime._prepare_request(session_id)
         assert prepared.reply_origin.kind == "channel"
-        return "请求已结束"
+        return _ExecutionResult("请求已结束")
 
     first_lookup = True
 
