@@ -942,3 +942,76 @@ socket-control四文件166 passed（pytest0.37秒、守卫0.882秒、75.9MiB）�
 本地候选现保持冻结，下一步由根签名保存、推送后，仅针对该精确新head启动一次CI。
 尚无Native29远端结果；能否取得真实helper的可信journal字段、安全首异常位置，
 以及正式三事务与完整cleanup是否通过，均须按新CI实际产物确认，不预写成功或根因。
+
+### Native29现场与Native30有限拒绝分类候选
+
+根已对精确签名head `3174ae2bbd461ef3eb24d85446f0be87f03e4258` 的
+run `40071674265`、managed-native job `120806256473` 取得并严格校验artifact
+`12551716614`：1812字节，SHA256
+`dc998929db457c291d763893044fd4299f715ae7decdc20fb5411b7d891abd17`。
+本条记录时其它job尚未全部终态，不据此判断整轮其它平台结果。现场仍在首adopt的
+rev3 activating/stop_base之后进入rev4 rolling_back/stop_target，继而rev5
+recovery_required，两次失败均为backend_failed。helper_source已核UID999、PID2831、
+invocation `00dff10ef9254ce9bab79133d7575cda`；但controller_failure实际仅为
+`{code:not_observed,reason:no_known_event}`，没有取得首异常位置，不能判断是否已进入
+systemctl stop。cleanup用户/组未删除、仍有三mount，完整清理仍失败。
+
+静态确认现采集同时在journal查询和最终解析处核四个可信字段；查询先筛掉缺少或
+不匹配unit/invocation的行，而解析又将空回包、元数据拒绝、安全payload及timeline
+匹配失败折叠为同一no_known_event。因此该结果既不证明logger没有运行，也不证明
+真实字段一定归属helper。独立helper的logger未见被Runtime私有logger的NullHandler
+过滤；没有现场证据据此调整日志路由或降低身份门。
+
+Native30首片仅替换同一次journal查询的检索预过滤：保留可信_UID、_PID和固定prefix，
+移除查询参数中的unit/invocation约束；输出仍为原五字段、最多两行。最终observed
+仍逐行要求原四可信字段全部准确、原helper_source、generation/revision/intent和
+同一安全diagnostic validator通过，不能把不同拒绝行的身份拼接，也不能从查询命中
+推断unit归属。单条严格有效行仍可采信，两个不同有效payload仍拒绝。
+
+not_observed只新增三个固定阶段结果：成功零行的empty_reply、无可采信完整身份的
+metadata_rejected、已有完整准确身份但payload/前缀/代次或timeline不符的
+payload_rejected；混合行按最远可信阶段归类，不按最后一行覆盖。旧no_known_event
+保留artifact回读兼容。当前坏JSON/UTF8、重复键的原行为是跳过该行，未必返回
+invalid_reply；本片不借分类改变单有效行加坏行仍可采信的合同，仅坏行时可保留
+no_known_event，不冒称是空回包。整包非法或超两行的原invalid_reply门、非零/丢回复
+的unavailable及超额output_budget门继续适用。所有分类
+仅描述本次有限采集，不能排除PID重用或tail两行挤占，不能宣称已定位日志缺失根因。
+不导出元数据实际值、MESSAGE正文、异常文本或路径，不增加probe、重试、启动或
+读取次数；原绝对deadline、allowance减一探针、返回先计费、失联不退款、cleanup
+同源保留、64行timeline和32KiB总门全部保留。
+
+本次先仅修改原 `tests/test_managed_native_controller_failure.py`：原真实controller
+raise/capture生成的有效MESSAGE正控保留，查询替身精确要求仅移除两个检索条件；
+新增沿原parent实际采集/保存入口的空回包、缺invocation、坏安全payload三参及
+两条拒绝行不得拼接身份的负控，原四身份与五payload篡改断言改为准确拒绝分类。
+没有新增未来API或伪造异常诊断。生产未改，作者未运行检查、格式、Git、网络或服务；
+这些目标仍待根收取真实红，不预写通过或授权下一远端轮次。
+
+根随后实收精确14个目标节点均红、15 deselected：pytest4.89秒、守卫5.462秒、
+70.4MiB、swap0。原九个parser篡改及两行身份拼接负控准确落在no_known_event与
+新拒绝分类差异；四个parent采集节点因旧查询仍带四字段AND，触发新的精确query
+断言，按原失联回包保守记账耗尽32768字节。这是预期的查询接缝红，不是现场实际
+读超额，也不是新增API或导入失败。
+
+授权后的生产窄改仅 `scripts/check_managed_native_ci.py`：原一次query移除unit与
+invocation检索参数，原五输出字段与最终四可信字段逐值门不变；typed reader接纳
+三个固定新reason，旧no_known_event仍读。空行集合为empty_reply；成功JSON行未过
+原完整元数据门为metadata_rejected；通过身份门后前缀、安全payload或既有timeline
+失败为payload_rejected，两行取最远可信阶段。原坏JSON/UTF8或重复键继续跳过，
+不撤销另一个严格有效行；纯坏行仍可no_known_event，两个冲突的有效payload仍
+invalid_reply。没有改变原源码异常、helper绑定、query次数、计费、deadline、
+cleanup或artifact预算。源码静态读回后再次冻结；作者未执行检查、格式、Git、网络
+或服务，新分类及原相关回归待根验证，仍未取得Native29现场首因。
+
+根随后实收本文件全部29 passed（pytest9.55秒、守卫10.086秒、73.8MiB、swap0）；
+原七个native文件839 passed（pytest2.63秒、守卫3.352秒、158.9MiB、swap0），
+共868个不同节点本地绿，不重复累计其中14个目标节点。另一位未参与实现的Sol
+完成正式只读后审，确认四可信字段及source/timeline/安全validator采信门、原收费、
+截止和cleanup未放松，单有效行加坏行、冲突有效行与最远可信阶段语义保持，未发现
+剩余P1/P2。三脚本strict随后通过，守卫5.369秒、288.2MiB；两变更Python文件
+Ruff通过。格式检查仅发现测试中两处换行，根按原formatter整理后两文件复验通过，
+没有语义改动，未因此重复累加测试节点。
+
+本片源码、测试及文档再次冻结；以上离线绿和后审不改变Native29真实失败、未取得
+首异常位置与清理未通过的事实。远端Native30尚未启动，只有根完成剩余验证、签名
+推送后才可针对精确新head单次运行，当前不预写现场分类、根因或事务修复结果。

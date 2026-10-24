@@ -147,10 +147,15 @@ def observer(root: Path, result: dict[str, Any], reply: bytes) -> tuple[Any, lis
         for field, value in (
             ("_UID", source["uid"]),
             ("_PID", source["pid"]),
-            ("_SYSTEMD_USER_UNIT", source["helper"]),
-            ("_SYSTEMD_INVOCATION_ID", source["invocation"]),
         ):
             assert f"{field}={value}" in values
+        assert not any(
+            value.startswith(("_SYSTEMD_USER_UNIT=", "_SYSTEMD_INVOCATION_ID=")) for value in values
+        )
+        assert "--grep=^muli[.]controller_failure[.]v1 " in values
+        assert (
+            "--output-fields=_UID,_PID,_SYSTEMD_USER_UNIT,_SYSTEMD_INVOCATION_ID,MESSAGE" in values
+        )
         assert seconds > 0
         return ci.Reply(0, reply)
 
@@ -191,7 +196,7 @@ async def test_trusted_metadata_mismatch_cannot_claim_the_real_diagnostic(
     facts = ci.controller_journal_failure(
         json.dumps(row).encode(), result["resources"]["helper_source"], result
     )
-    assert facts == {"code": "not_observed", "reason": "no_known_event"}
+    assert facts == {"code": "not_observed", "reason": "metadata_rejected"}
 
 
 @pytest.mark.parametrize("changed", ["generation", "revision", "intent", "diagnostic", "prefix"])
@@ -214,7 +219,61 @@ async def test_message_body_cannot_replace_source_binding_or_safe_schema(
     facts = ci.controller_journal_failure(
         json.dumps(row).encode(), result["resources"]["helper_source"], result
     )
-    assert facts == {"code": "not_observed", "reason": "no_known_event"}
+    assert facts == {"code": "not_observed", "reason": "payload_rejected"}
+
+
+@pytest.mark.parametrize(
+    ("condition", "reason"),
+    [
+        ("empty", "empty_reply"),
+        ("missing_invocation", "metadata_rejected"),
+        ("bad_diagnostic", "payload_rejected"),
+    ],
+)
+async def test_root_classifies_unaccepted_actual_message_without_exporting_it(
+    tmp_path: Path,
+    failure_case: tuple[dict[str, Any], bytes],
+    condition: str,
+    reason: str,
+) -> None:
+    result, original = failure_case
+    row = json.loads(original)
+    if condition == "empty":
+        reply = b""
+    else:
+        if condition == "missing_invocation":
+            row.pop("_SYSTEMD_INVOCATION_ID")
+        else:
+            payload = json.loads(row["MESSAGE"][len(PREFIX) :])
+            payload["diagnostic"] = {"raw": "PRIVATE_REJECTED_DIAGNOSTIC"}
+            row["MESSAGE"] = PREFIX + json.dumps(payload)
+        reply = json.dumps(row).encode() + b"\n"
+    native, calls = observer(tmp_path / "parent", result, reply)
+    native.setup_bytes = 17
+    native.observe_controller_failure(result, deadline=native.execute_deadline)
+    native.observe_controller_failure(result, deadline=native.execute_deadline)
+    assert len(calls) == 1 and native.setup_bytes == 17 + len(reply)
+    saved = ci.fixture_result((native.root / "result.json").read_bytes())
+    assert saved["resources"]["controller_failure"] == {
+        "code": "not_observed",
+        "reason": reason,
+    }
+    assert saved["code"] == "native_transaction_blocked"
+    assert saved["timeline"] == result["timeline"]
+    assert "PRIVATE" not in json.dumps(saved)
+
+
+async def test_two_rejected_rows_cannot_combine_their_trusted_identity(
+    failure_case: tuple[dict[str, Any], bytes],
+) -> None:
+    result, original = failure_case
+    first = json.loads(original)
+    second = json.loads(original)
+    first["_SYSTEMD_INVOCATION_ID"] = "5" * 32
+    second["_UID"] = str(int(second["_UID"]) + 1)
+    reply = b"\n".join(json.dumps(row).encode() for row in (first, second)) + b"\n"
+    facts = ci.controller_journal_failure(reply, result["resources"]["helper_source"], result)
+    assert facts == {"code": "not_observed", "reason": "metadata_rejected"}
 
 
 @pytest.mark.parametrize(

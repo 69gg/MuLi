@@ -1150,6 +1150,9 @@ def controller_failure_facts(value: object, result: dict[str, Any]) -> bool:
                 "unavailable",
                 "invalid_reply",
                 "no_known_event",
+                "empty_reply",
+                "metadata_rejected",
+                "payload_rejected",
             }
         )
     if set(value) != {"code", "failure"} or value["code"] != "observed":
@@ -1186,7 +1189,6 @@ def controller_journal_failure(
     data: bytes, source: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
     """Read only the fixed safe message from the already authenticated helper invocation."""
-    unavailable = {"code": "not_observed", "reason": "no_known_event"}
     if len(data) > OUTPUT_BYTES or not helper_source_facts(source):
         return {"code": "not_observed", "reason": "invalid_reply"}
     fields = {"_UID", "_PID", "_SYSTEMD_USER_UNIT", "_SYSTEMD_INVOCATION_ID", "MESSAGE"}
@@ -1204,6 +1206,9 @@ def controller_journal_failure(
     lines = data.splitlines()
     if len(lines) > 2:
         return {"code": "not_observed", "reason": "invalid_reply"}
+    if not lines:
+        return {"code": "not_observed", "reason": "empty_reply"}
+    reason = "no_known_event"
     observed: dict[str, Any] | None = None
     for line in lines:
         try:
@@ -1216,8 +1221,14 @@ def controller_journal_failure(
                 or row["_PID"] != str(source["pid"])
                 or row["_SYSTEMD_USER_UNIT"] != source["helper"]
                 or row["_SYSTEMD_INVOCATION_ID"] != source["invocation"]
-                or not row["MESSAGE"].startswith(prefix)
             ):
+                if reason != "payload_rejected":
+                    reason = "metadata_rejected"
+                continue
+            # Keep the furthest trusted stage, regardless of row order. This
+            # classifies rejection without accepting incomplete helper identity.
+            reason = "payload_rejected"
+            if not row["MESSAGE"].startswith(prefix):
                 continue
             failure = json.loads(row["MESSAGE"][len(prefix) :], object_pairs_hook=unique)
             candidate = {"code": "observed", "failure": failure}
@@ -1228,7 +1239,7 @@ def controller_journal_failure(
             observed = candidate
         except (ValueError, RecursionError):
             continue
-    return observed if observed is not None else unavailable
+    return observed if observed is not None else {"code": "not_observed", "reason": reason}
 
 
 def fixture_result(data: bytes) -> dict[str, Any]:
@@ -2661,8 +2672,6 @@ class NativeCI:
                                     "--grep=^muli[.]controller_failure[.]v1 ",
                                     f"_UID={source['uid']}",
                                     f"_PID={source['pid']}",
-                                    f"_SYSTEMD_USER_UNIT={source['helper']}",
-                                    f"_SYSTEMD_INVOCATION_ID={source['invocation']}",
                                 ),
                                 seconds=deadline - time.monotonic(),
                                 output_bytes=allowance - 1,
