@@ -1177,7 +1177,8 @@ Native32的精确CI `40076165153` 已取得首异常位置，managed-native作�
 controller_failure为observed，generation `034ee2e861820077ccd665550391c04d`、revision3、
 intent stop_base；安全帧依次定位到 `_Controller._call`、`ManagedLinuxBackend.observe`、
 `_probe`、`ManagedSystemdProbe.read_managed`、`SystemdProbe._unit_path`、`_command`。
-最后一处是busctl GetUnit非零回包的原raise，并未进入systemctl stop调用。环境六项
+最后一处是busctl GetUnit非零回包的原raise，证明失败的那一次step未进入其后面的
+systemctl stop调用；不能证明此前同一revision的step没有成功stop。环境六项
 仍为true；事务后续recovery_required，cleanup仍保留三mount，未完成。此处不预写该CI
 其它作业终态，也不能倒推Native31究竟因哪一种JSON形状被拒。
 
@@ -1233,11 +1234,98 @@ pytest0.60秒、守卫1.134秒、63.6MiB、swap0；三个回包均已走真实co
 异常类型及固定内容仍相同。作者未运行检查、格式、Git、网络或真实服务，生产、
 测试与本节静态读回后冻结，修后结果待根收取；尚无Native33现场结果或根因结论。
 
-根随后串行收取修后结果：完整诊断文件10 passed（pytest2.91秒、守卫3.463秒、
-66.1MiB）；原Linux transaction、managed probe、controller三个文件109 passed
-（pytest2.98秒、守卫3.564秒、67.8MiB）。本片合119个不同节点，不把此前Native32
-已通过但未重跑的886节点算入本片。146个应用源码的strict、no-incremental mypy通过
-（守卫8.466秒、414.2MiB）；两改动Python文件Ruff与格式检查通过，全部swap0。
-非作者独审未发现明确P1/P2，并确认本片只分类受控CLI文案形状，不认证D-Bus错误名。
-准备签名后交给隔离CI取得下一次真实分类；此前native事务与cleanup仍失败，未操作
-本机服务，也不预写新现场结果。
+Native33本地修后完整诊断文件10 passed（pytest2.91秒、守卫3.463秒、66.1MiB）；
+原Linux transaction、managed probe、controller三文件109 passed（pytest2.98秒、
+守卫3.564秒、67.8MiB），合119个不同节点。146个应用源码strict、no-incremental
+mypy通过（8.466秒、414.2MiB）；两改动Python文件Ruff及格式通过，全部swap0。
+非作者独审未发现明确P1/P2。未把Native32未重跑的886节点算入该片，也未操作本机服务。
+
+Native33现场随后在精确head `9bc9e18661f6610798620f3f848027ce69e77b3c` 的CI
+`40077754116` 取得分类，managed-native作业 `120824708334` 仍失败。根严格校验
+artifact `12553278523`，2031字节，SHA256
+`e90eb30a96268aaf22d500351ff354152e2eaf31fa9379ae9aab1a0509cabc0b`。
+controller_failure仍为observed，generation `8fa7d7dc4c24f2f7af2b9e73d5c8c569`、
+revision3、stop_base，精确源码_command第298行：固定GetUnit(muli.service)、正式
+未截断回包的完整NoSuchUnit文案形状，非signal或other。可信helper PID2629、UID999、
+invocation `8dc69120eb8243a9a724f5036c229ddb`，环境六项true、manager ready274ms；
+时间线draining13806ms、stop_base19089ms、rolling_back23032ms、recovery_required24075ms。
+真实事务与cleanup仍失败，未从这个文本形状推导出已认证的D-Bus错误名。
+
+因果纠偏：上述时间线只记录generation/revision位置，不记录每一次step。
+`_Controller._step`在stop命令成功后仍返回原stop_base record，`drive_loop`看到record
+未变才sleep再执行下一step；因此先成功stop、inactive unit被GC、同revision下一次
+GetUnit报未加载，完全符合现有证据。此前“观察先于stop”的结论只能限于失败的那次
+step，不能排除前次同revision的真实停止效果。没有证据应继续修改fixture环境。
+
+### Native34：合法inactive unit的正式观察（先目标回归）
+
+Context7本次resolve已实际返回monthly quota reached，未重复请求。固定v255源码：
+[unit_may_gc](https://github.com/systemd/systemd/blob/v255/src/core/unit.c#L401-L467)
+允许无作业、无bus引用且无活进程的inactive unit被卸载；
+[GetUnit与LoadUnit](https://github.com/systemd/systemd/blob/v255/src/core/dbus-manager.c#L424-L467)
+区分“只找已loaded”与“必要时加载描述”，二者不等于StartUnit。原probe每个RPC均用
+短命busctl进程，单独LoadUnit后再读不能保证对象一直驻留。v255的
+[Unit/Service对象fallback](https://github.com/systemd/systemd/blob/v255/src/core/dbus.c#L253-L315)
+对规范对象路径的每次属性请求调用manager_load_unit_from_dbus_path；描述可在各次
+RPC内重新加载，无须根据NoSuchUnit虚构stopped快照。
+
+根选择更完整且更简单的范围：仅 `ManagedSystemdProbe.read_managed` 对原固定UNIT
+统一按规范对象Properties路径读取，不设phase白名单；通用SystemdProbe.read和helper
+继续原GetUnit。这覆盖stop后的观察以及install后start_target、restore后start_base的
+合法inactive窗口，减少一次RPC而不增加loop。规范路径从原UNIT按官方字节escape规则
+派生，依据固定v255的
+[sd_bus_path_encode规则](https://github.com/systemd/systemd/blob/v255/man/sd_bus_path_encode.xml#L62-L90)
+把非对象标识字节编码为下划线加十六进制，不接受任意单位，不新增注册框架、依赖或
+错误fallback。原Id/LoadState/fragment/
+argv/dropins、磁盘双读、needs_reload和各phase判断、PID/job、writerlease、cgroup空门
+全保留；missing、failed load、外来材料绝不能直接当停止或获得安装权限。
+
+先写一个真实二步目标：真实Host/Journal/controller/backend和正式ManagedSystemdProbe，
+仅外部busctl/systemctl回包与proc文件由临时fixture提供。第一step成功观察running并
+执行一次正式effects.stop，返回同一stop_base revision；替身随后模拟inactive对象GC：
+GetUnit未加载，但规范对象Properties可加载合法磁盘描述并返回inactive/PID0/job0。
+第二step应进入install_target且总共只stop一次；旧实现应准确在第二step GetUnit失败，
+进入rolling_back。不能以未来API/import为红，不能绕真实writerlease或磁盘材料。
+作者未改生产、未执行检查/格式/Git/网络CLI或真实服务；目标待根取得实红后再实施。
+
+准确目标为
+`tests/test_managed_stopped_unit_observation.py::test_successful_stop_then_collected_unit_advances_same_revision`。
+它复用既有Host的真实磁盘快照、flock和writerlease；临时proc取原Host进程身份构造，
+bus替身复用现FakeBus合法属性，而非替换read_managed返回值。第一步正式stop命令
+缝隙调用原Host.command释放实际writerlease后才模拟GC，准确保留同一revision；第二步
+必须通过原snapshot验证并进入install_target，不能只是省略GetUnit而直接制造停止。
+本节点静态读回后冻结，尚未执行；原生产文件未改，修后负控在根收红后继续补。
+
+根随后实收此节点准确真红：1 failed，pytest0.59秒、守卫1.189秒、64.2MiB、swap0。
+第一step的正式controller/effects.stop已成功返回同revision3，实际writerlease释放、
+只stop一次等前置均通过；第二step在GetUnit严格NoSuchUnit原298行失败，转rolling_back
+而未进入install_target。该回归证实本仓合法停止后的观察缺口；并不把fake GC回包称为
+对Native33远端每个隐藏step的直接观测。
+
+授权后的唯一生产修改为 `ManagedSystemdProbe.read_managed` 的路径入口：从原UNIT
+以有限ASCII byte escape得到规范对象路径，直接执行原_snapshot属性查询，保留原
+所有材料、状态和双读判断。通用read、helper、原33非零回包分类均未改；没有添加
+LoadUnit、StartUnit、额外查询、等待或重试，不能把属性可读等同于进程健康。
+新测试同文件补坏loaded ExecStart、实际populated cgroup、实际writerlease busy三条
+负控，必须无安装/启动命令、磁盘unit不变，分别保持拒绝或原停止意图等待。
+
+旧Native33分类测试原先假设managed probe必经GetUnit，该入口已被正当替换，不能
+为它加回生产backdoor。该测试迁到通用SystemdProbe.read的真实GetUnit路径，继续
+严格核三个正式回包、固定argv、原ObservationError与安全帧三位置、不泄stderr。
+它现只证明通用读取的有限分类，不再冒称这三类经managed controller观察；此前
+真实controller/effects.stop诊断原测试完全保留，新二步旅程承担managed生命周期。
+生产、两个测试文件与文档静态读回后冻结；作者未运行检查/格式/Git/网络或真实服务，
+修后回归与非作者后审待根收取，没有Native34远端结果，不预写事务或cleanup恢复。
+
+根随后收取Native33远端终态：十个通用作业全部通过，managed-native仍失败，首异常
+分类成功不代表事务或cleanup成功。此为上一片结果，不计入Native34本地覆盖。
+
+Native34修后两文件共14 passed（pytest3.48秒、守卫4.011秒、68.3MiB），含原二步
+目标和三个安全负控。原Linux transaction、managed probe、controller共109 passed
+（pytest2.81秒、守卫3.366秒、65.9MiB）；另选原backend完整切换、写入前停止与所有权
+门、外来进程和不可重试启动四组13 passed、21 deselected（pytest12.32秒、守卫
+12.965秒、66.9MiB），没有把未选节点称为通过。本片合136个不同节点。
+146源码strict、no-incremental mypy通过（8.396秒、414.3MiB）；改动Python Ruff通过，
+仅一新测试文件纯格式整理。非作者独审未发现剩余P1/P2，确认安全门和原通用GetUnit
+诊断仍有效。全部root串行守卫、swap0，无资源上限修改或真实本机服务操作；下一
+精确隔离CI仍待运行，未预写事务或cleanup已恢复。

@@ -20,7 +20,7 @@ from muli.managed_controller import ManagedTransactionController
 from muli.management_transaction import TransactionError, TransactionJournal
 from muli.platforms.linux_transaction import ObservationError, ProbeLimits, SystemdProbe
 from muli.platforms.managed_backend import ManagedLinuxBackend
-from muli.platforms.managed_probe import ManagedSystemdProbe
+from muli.service import UserService
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux journal/flock fixture")
 
@@ -30,9 +30,9 @@ def test_real_backend_has_exact_standard_abc_metaclass() -> None:
 
 
 async def test_real_get_unit_failures_have_distinct_safe_package_locations(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
 ) -> None:
-    """Real controller/probe path; only the external process reply is substituted."""
+    """The generic read keeps GetUnit; managed reads now support collected units."""
     locations: dict[str, int] = {}
     cases = (
         ("no_such_unit", 1, "Call failed: Unit muli.service not loaded.\n"),
@@ -78,56 +78,24 @@ async def test_real_get_unit_failures_have_distinct_safe_package_locations(
                 "truncated": False,
             }
 
-        with TransactionJournal(root / "journal", root / "data/muli.sqlite3") as journal:
-            with journal.locked() as control:
-                host = Host(root, journal, control, "adopt", change_config=False)
-                try:
-                    host.move("draining")
-                    original = host.move("activating", "stop_base")
-                    host.backend.probe = ManagedSystemdProbe(
-                        runner=failed_get_unit, limits=ProbeLimits(seconds=1.0)
-                    )
-                    driver = ManagedTransactionController(
-                        control, host.backend, host.clock, operation_timeout=10.0
-                    )
-                    first_record = len(caplog.records)
-                    with caplog.at_level(logging.WARNING, logger="muli.management_controller"):
-                        failed = await driver.step()
-
-                    assert len(calls) == 1
-                    assert host.commands == []  # Observe failed before systemctl stop.
-                    assert failed.phase == "rolling_back" and failed.intent == "stop_target"
-                    assert failed.code == failed.failure_code == "backend_failed"
-                    assert failed.rollback_attempted and failed.deadline == original.deadline
-                    assert host.record() == failed
-                    prefix = "muli.controller_failure.v1 "
-                    messages = [entry.getMessage() for entry in caplog.records[first_record:]]
-                    payloads = [
-                        json.loads(message[len(prefix) :])
-                        for message in messages
-                        if message.startswith(prefix)
-                    ]
-                    assert len(payloads) == 1
-                    payload = payloads[0]
-                    assert payload["generation"] == original.generation
-                    assert payload["revision"] == original.revision
-                    assert payload["intent"] == "stop_base"
-                    diagnostic = payload["diagnostic"]
-                    assert diagnostic["exception_type"] == "unknown"
-                    frames = [
-                        frame
-                        for frame in diagnostic["frames"]
-                        if frame["module"] == "muli.platforms.linux_transaction"
-                        and frame["function"] == "SystemdProbe._command"
-                    ]
-                    assert len(frames) == 1 and type(frames[0]["line"]) is int
-                    assert frames[0]["line"] > 0
-                    locations[label] = frames[0]["line"]
-                    assert stderr not in "\n".join(messages)
-                    assert len(json.dumps(diagnostic, ensure_ascii=False).encode("utf-8")) <= 4096
-                finally:
-                    host.release_writer()
-                    await host.backend.__aexit__()
+        service = UserService(root / "config.json", root / "data", root / "units", platform="linux")
+        probe = SystemdProbe(runner=failed_get_unit, limits=ProbeLimits(seconds=1.0))
+        with pytest.raises(ObservationError, match="^systemd_observation_unavailable$") as caught:
+            await probe.read(service)
+        assert len(calls) == 1
+        diagnostic = diagnostics.capture_failure(caught.value)
+        assert diagnostic["exception_type"] == "unknown"
+        frames = [
+            frame
+            for frame in diagnostic["frames"]
+            if frame["module"] == "muli.platforms.linux_transaction"
+            and frame["function"] == "SystemdProbe._command"
+        ]
+        assert len(frames) == 1 and type(frames[0]["line"]) is int
+        assert frames[0]["line"] > 0
+        locations[label] = frames[0]["line"]
+        assert stderr not in json.dumps(diagnostic)
+        assert len(json.dumps(diagnostic, ensure_ascii=False).encode("utf-8")) <= 4096
 
     assert len(set(locations.values())) == 3, (
         "the existing safe frame must distinguish fixed NoSuchUnit, signal, and other failures"
