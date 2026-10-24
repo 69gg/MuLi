@@ -2200,6 +2200,11 @@ async def test_actual_case_reuses_bootstrap_directory_before_first_manager_comma
     from muli.service import UserService
 
     native, commands = fixture
+    # This path now proves real file ownership as well as directory reuse.
+    # Keep the account/manager synthetic, but align its UID with actual temp files.
+    commands.uid = os.geteuid()
+    commands.group = f"/user.slice/user-{commands.uid}.slice/user@{commands.uid}.service"
+    kernel(commands.cgroup_root / commands.group.lstrip("/"), ci.MEMORY, ci.TASKS)
     slots: dict[str, SlotIdentity] = {}
 
     def copy_slot(name: str, description: dict[str, Any]) -> None:
@@ -2565,7 +2570,21 @@ async def test_cleanup_preserves_functional_timeline_and_generations(
         return False
 
     verified: list[bool] = []
-    journal = SimpleNamespace(writer_lease=lambda: nullcontext())
+    checks: list[str] = []
+    control = SimpleNamespace(check=lambda: checks.append("controller"))
+    lease = SimpleNamespace(check=lambda: checks.append("writer"))
+    journal = SimpleNamespace(
+        locked=lambda: nullcontext(control), writer_lease=lambda: nullcontext(lease)
+    )
+    removed: list[Path] = []
+
+    def remove(root: Path, *, limit: int, guard: Callable[[], None]) -> None:
+        # This test owns the unchanged functional projection oracle. Real birth
+        # verification/deletion is covered by test_managed_native_unit_birth.py.
+        assert root == tmp_path and limit == worker.MAX_BYTES
+        guard()
+        removed.append(root)
+
     monkeypatch.setattr(case, "journal", lambda: nullcontext(journal))
     monkeypatch.setattr(case, "record", lambda source: record)
     monkeypatch.setattr(case, "deployment", lambda source, item: (anchor, controller, {}))
@@ -2577,9 +2596,11 @@ async def test_cleanup_preserves_functional_timeline_and_generations(
     monkeypatch.setattr(worker, "fixture", lambda root: {"uid": os.geteuid()})
     monkeypatch.setattr(worker, "membership", lambda unit, uid: tmp_path)
     monkeypatch.setattr(worker, "service_exists", absent)
+    monkeypatch.setattr(worker, "unit_files", lambda: SimpleNamespace(remove=remove))
     monkeypatch.setattr(linux_transaction, "SystemdProbe", lambda **kwargs: Probe())
     await case.cleanup()
     assert verified == [True]
+    assert checks == ["controller", "writer"] and removed == [tmp_path]
     assert case.result == saved
     assert worker.read_json(tmp_path / "result.json") == saved
 

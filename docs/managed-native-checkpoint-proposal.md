@@ -1501,4 +1501,81 @@ record/五项identity及32KiB门均不变。四项小负控要求错root、recov
 0.932秒、74.5MiB、swap0）；合既有coordinator文件共581个不同节点通过（pytest
 2.29秒、守卫2.950秒、142.1MiB、swap0），不与36的916重复累计。全Ruff、383文件
 格式及非作者后审通过，无剩余P1/P2。仅fixture改动，生产strict沿前片已过结果，未重复。
-37精确签名候选的真实helper统计仍待收取，不预写性能归因或整套事务通过。
+37真实候选 `c5b5a5c` 的 CI `40082934586`，managed-native job `120840018838`
+失败。根安全核验artifact `12556325393`：ZIP 2093字节，SHA-256
+`78f93d99d544577fc5659c841a8cb4a26f0a18ea2e5371c2801ff9532114d1a6`。
+adopt于44730毫秒released、45679毫秒helper collected、45697毫秒精确projection；
+switch于48468毫秒prepared、54263毫秒draining、58655毫秒stop_base，60000毫秒Timeout。
+成本回执为not_observed/identity_changed；当前helper_source已是第二代
+`4f5c88d76faff4799d8a6aef1ccec813`、PID2833、UID999、invocation
+`52bb85ef8d16483086cbaa0c44cb0156`。没有可采信的成本指标，不据此归因主成本，
+也不称完整事务、回退或cleanup通过。
+
+### Native38：helper退出后立即保留本代成本（本地通过，远端待验）
+
+源码显示成本文件仅在helper的atexit回调中替换，而原collector只在整个case最终一次
+读取；第二代开始时当前helper_source已更新，第一代完成时没有采集。这能解释为何
+最终可能拿第一代文件与第二代身份比较，但现场只有整体identity_changed，未导出文件
+内的generation，故“确为第一代旧文件”仍是代码推导，不能冒称已观测事实。
+
+本候选只在transaction resolved分支原helper_empty返回True后、下一代prepare前，
+复用当前已核五键source，一次读取固定成本文件，先存入Case私有内存缓存；此时不向主结果
+增加或修改字段，不能抢占后续transaction note空间并改变原首因。只在原finally采集位置，
+将缓存按最终完整JSON的实际余额合入新可选resources.helper_cost_history。
+缓存与最终history均
+至多3项，每项严格为`{source,costs}`：source沿原五键身份校验，generation/helper须命中
+原generations，costs沿原validator并必须observed；generation不可重复。只有本次已核
+completed_generation与source一致才保留，缺源或漂移不从文件反推身份。当前helper_source、
+controller_failure及原finally当前采集保持，不为历史成本回绑当前代。旧artifact无新字段仍
+接受；新history的额外字段、坏类型、重复代次、未观测伪指标或外代均拒绝。
+
+新增本地读取不增加RPC、轮询、等待或截止时间；原每次读取、原32KiB最终JSON及首因
+保持。候选完整JSON（包括当前成本与新增history）先过原上限才保留新项，不够保留原历史，
+仅沿旧output_budget缺证路径，不裁切身份或主结果。没有改生产_check、性能路径、cleanup
+所有权或hook安装；清理独立候选另行审查，不把本片作为恢复成功证据。
+
+独立成本fixture补了第一代完成保留→第二代在途旧文件拒绝但历史不丢→第二代完整退出
+追加、重复采集不覆盖、缺源/错PID/错invocation/错完成代次、严格artifact反例与原32KiB
+临界结果不变；还覆盖已到期不再打开文件、仍可合入此前完成代缓存。建议根运行
+`tests/test_managed_native_helper_costs.py`及既有coordinator组；
+作者未自行运行检查；根已实收成本文件38项通过（pytest0.79秒，守卫1.375秒、111.5MiB、swap0），
+真实helper与远端行为仍待验。
+
+### 独立候选：fixture 的 app unit 出生凭据与清理
+
+已知cleanup缺口独立处理：`Case.drive` 在私有home创建的 `muli.service` 没有出生凭据，
+bootstrap清理不能仅凭文件内容、相同UID或存在而删除；前述远端三mount与用户/组未删除
+仍是未完成清理，不能由成本统计或adopt已release推成成功。
+
+本候选不改生产包。新增固定fixture模块 `tests/helpers/managed_native_unit.py`，由原prepare
+复制进隔离volume；Case初次只用O_EXCL创建固定app叶，持久记录root/父目录与叶的
+设备号、inode、大小、mtime/ctime和摘要。原V2 helper的精确orig_argv及私有fixture核验后，
+生成hook才安装观察器；它仅包该固定路径的真正 `ConfigurationFile.replace`，原参数、guard、
+返回值与异常不变。旧birth精确匹配且原replace成功返回新snapshot，才用原有界CAS继承当前
+身份。confirm、外部换代及失败不能补领养；外来同UID同内容文件也不能重新成为owned。
+
+仅fixture根另有固定O_EXCL pending护栏，先持久建立，再执行出生或被观察的CAS；新birth
+真正持久返回后才清护栏。这覆盖receipt rename后fsync失败仍可见新JSON的窗口：取消、
+强杀或任意未确认写入留下护栏，后续清理拒绝，不能从可见内容猜成功。观察器自身失败
+不替换原unit操作的结果；护栏不在产品schema、原Receipt或artifact内，也不作为授权来源。
+
+分离cleanup进程沿原helper/app stop、PID/job/cgroup门，额外持有真实journal controller锁与
+writer lease，再以固定路径dirfd、NOFOLLOW、父目录及当前birth双核删除唯一app叶并fsync。
+未loaded的unit沿原成功exact列表absence门，不将初始化空串冒称已观察到cgroup为空；不新增RPC。
+任目录/叶/symlink换代、失效凭据、pending或未获真实journal/lease均保留失败；不删除任意
+邻接文件、不递归清目录。成功unlink丢回包可在同一父目录识别已缺失；不重建、不领养。
+没有journal却已留下app叶的早期失败仍保留，候选不承诺该类cleanup一定成功。
+
+专用离线回归 `tests/test_managed_native_unit_birth.py` 的四组入口：真实bootstrap/Case.drive
+到首manager屏障的O_EXCL出生；prepare生成正式V2 hook→真实CAS连续替换→真实Case.cleanup
+与journal/lease删除；同内容新inode、symlink、父目录换代拒删；真正发布/receipt fsync失败、
+取消、confirm不改原结果且不补ownership。系统进程、probe和cgroup仍是显式离线边界替身，
+不称真实systemd清理已验。复用的旧首manager测试只将合成UID与临时文件真实owner对齐，
+保留原路径、render、目录inode和首命令断言。原期限、资源/输出门、控制器决定及生产
+ConfigurationFile均不改；新增固定小文件IO计入原墙钟，不加预算。
+
+根已实收出生/清理专用9项通过（pytest1.74秒，守卫2.349秒、88.5MiB、swap0）。
+既有coordinator首轮在172项通过后，旧timeline专用夹具缺新锁接口而失败；仅完善该夹具
+的lock/lease与固定删除观察边界，保留原timeline/result断言，真实删除仍由专用回归覆盖。
+三文件最终整合604个不同节点通过（pytest4.10秒，守卫4.761秒、186MiB、swap0）。
+非作者只读后审未见剩余P1/P2；未以这些离线结果替代真实systemd/最终清理验收。

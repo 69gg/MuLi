@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import closing
 from functools import wraps
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 if TYPE_CHECKING:
@@ -3186,6 +3187,58 @@ def helper_costs_facts(value: object, source: object) -> bool:
     )
 
 
+def unit_files() -> ModuleType:
+    """Load only the fixture's fixed sibling, without changing import paths."""
+    if __package__:
+        from . import managed_native_unit
+
+        return managed_native_unit
+    import importlib.util
+
+    name = "_muli_managed_native_unit"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).resolve().with_name("managed_native_unit.py")
+        )
+        require(spec is not None and spec.loader is not None, "native_unit_birth_unconfirmed")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module
+
+
+def install_unit_birth_hook() -> None:
+    """The fixture observer never changes the real helper's admission/outcome."""
+    try:
+        prefix = Path(sys.prefix)
+        root = prefix.parent
+        require(
+            prefix.name in {"a", "b"}
+            and sys.executable == str(prefix / "bin/python")
+            and sys.orig_argv
+            == [
+                sys.executable,
+                "-I",
+                "-m",
+                "muli.managed_host",
+                "--root",
+                str(root / "data/management/transaction-v1"),
+                "run",
+            ],
+            "native_unit_birth_unconfirmed",
+        )
+        fixture(root)
+        unit_files().install(root, limit=MAX_BYTES)
+    except Exception:
+        pass
+
+
 def install_helper_cost_hook() -> None:
     """Observe only the exact isolated helper; never change its control flow."""
     try:
@@ -3343,14 +3396,19 @@ def install_helper_cost_hook() -> None:
 
 
 def collect_helper_costs(
-    root: Path, result: dict[str, Any], *, deadline: float | None = None
+    root: Path,
+    result: dict[str, Any],
+    *,
+    deadline: float | None = None,
+    completed_generation: str | None = None,
+    retained: list[dict[str, Any]] | None = None,
 ) -> None:
-    """One same-UID local read at case settlement, never a manager query."""
+    """One local read after a checked helper exit or final case settlement."""
     facts: dict[str, Any] = {"code": "not_observed", "reason": "unavailable"}
+    source = result["resources"].get("helper_source")
     try:
         if deadline is not None:
             remaining(deadline)
-        source = result["resources"].get("helper_source")
         descriptor = os.open(
             root / "helper-costs.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         )
@@ -3402,11 +3460,52 @@ def collect_helper_costs(
             facts["reason"] = "identity_changed"
     except Exception:
         pass
+    if completed_generation is not None:
+        if (
+            retained is not None
+            and len(retained) < 3
+            and facts.get("code") == "observed"
+            and isinstance(source, dict)
+            and source.get("generation") == completed_generation
+            and any(
+                row["generation"] == completed_generation and row["helper"] == source.get("helper")
+                for row in result["generations"]
+            )
+            and not any(row["source"]["generation"] == completed_generation for row in retained)
+        ):
+            retained.append({"source": dict(source), "costs": facts})
+        return  # Optional diagnostics cannot occupy later transaction-note space.
     result["resources"]["helper_costs"] = facts
     if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
         result["resources"]["helper_costs"] = {"code": "not_observed", "reason": "output_budget"}
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
             result["resources"].pop("helper_costs")
+    history = result["resources"].get("helper_cost_history", [])
+    for row in retained or []:
+        if len(history) >= 3:
+            break
+        if any(old["source"]["generation"] == row["source"]["generation"] for old in history):
+            continue
+        candidate = {
+            **result,
+            "resources": {
+                **result["resources"],
+                "helper_cost_history": [*history, row],
+            },
+        }
+        if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+            budget = {
+                **result,
+                "resources": {
+                    **result["resources"],
+                    "helper_costs": {"code": "not_observed", "reason": "output_budget"},
+                },
+            }
+            if len(json.dumps(budget, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
+                result["resources"]["helper_costs"] = budget["resources"]["helper_costs"]
+            break
+        history = candidate["resources"]["helper_cost_history"]
+        result["resources"]["helper_cost_history"] = history
 
 
 def install_hook() -> None:
@@ -3479,6 +3578,7 @@ class Case:
         self._notes: dict[str, dict[str, Any]] = {}
         self._invalid_helper_sources: set[str] = set()
         self._helper_source_groups: dict[str, str] = {}
+        self._helper_cost_history: list[dict[str, Any]] = []
         self.result: dict[str, Any] = {
             "completed": False,
             "stage": self.stage,
@@ -3869,6 +3969,13 @@ class Case:
                             ):
                                 await self.pause()
                                 continue
+                            collect_helper_costs(
+                                self.root,
+                                self.result,
+                                deadline=self.deadline,
+                                completed_generation=record.generation,
+                                retained=self._helper_cost_history,
+                            )
                             # A resolved HTTP response can precede helper lock release.
                             with journal.locked():
                                 require(self.record(journal) == record, "native_generation_changed")
@@ -3994,8 +4101,7 @@ class Case:
         require(
             service.path == self.root / "home/.config/systemd/user/muli.service", "native_unit_path"
         )
-        service.path.write_text(service.render(), encoding="utf-8")
-        service.path.chmod(0o600)
+        unit_files().create(self.root, service.render().encode("utf-8"), limit=MAX_BYTES)
         self.require_start_time()
         remaining(self.deadline)
         self.note("manager_start")
@@ -4093,7 +4199,9 @@ class Case:
                         await self.command("systemctl", "--user", "stop", name)
                         while not await self.helper_empty(probe, name, expected_argv):
                             await self.pause()
-        if await service_exists(probe):
+        service_group = ""
+        service_present = await service_exists(probe)
+        if service_present:
             unit = await probe._snapshot(await probe._unit_path("muli.service"))
             require(
                 Path(unit.fragment) == self.root / "home/.config/systemd/user/muli.service",
@@ -4107,11 +4215,37 @@ class Case:
                 and CgroupObservation(Path("/sys/fs/cgroup"), MAX_BYTES).empty(unit.cgroup),
                 "native_service_not_empty",
             )
+            service_group = unit.cgroup
         if state.exists():
-            with self.journal() as journal, journal.writer_lease():
+            with (
+                self.journal() as journal,
+                journal.locked() as control,
+                journal.writer_lease() as lease,
+            ):
                 record = self.record(journal)
                 if saved.get("completed") is True:
                     self.read_database(record, expect_latest=True)
+
+                def guard_unit() -> None:
+                    remaining(self.deadline)
+                    control.check()
+                    lease.check()
+                    require(
+                        not service_present
+                        or CgroupObservation(Path("/sys/fs/cgroup"), MAX_BYTES).empty(
+                            service_group
+                        ),
+                        "native_service_not_empty",
+                    )
+
+                unit_files().remove(self.root, limit=MAX_BYTES, guard=guard_unit)
+        else:
+            # Without the real journal/lease there is no authority to remove
+            # an existing app leaf, even when a stale receipt claims it.
+            require(
+                not os.path.lexists(self.root / "home/.config/systemd/user/muli.service"),
+                "native_unit_birth_unconfirmed",
+            )
         remaining(self.deadline)
 
 
@@ -4153,7 +4287,12 @@ async def run(mode: str, root: Path) -> int:
     finally:
         if mode != "cleanup":
             try:
-                collect_helper_costs(root, case.result, deadline=case.drive_deadline)
+                collect_helper_costs(
+                    root,
+                    case.result,
+                    deadline=case.drive_deadline,
+                    retained=case._helper_cost_history,
+                )
                 write_json(root / "result.json", case.result)
             except Exception:
                 pass  # Optional observation cannot replace the case's first outcome.

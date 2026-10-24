@@ -317,3 +317,196 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
         SystemdProbe._command,
         ManagedLinuxBackend._request,
     ) == originals
+
+
+def test_completed_helper_costs_survive_the_next_live_helper_and_final_settlement(
+    tmp_path: Path,
+) -> None:
+    result, first = costs_result()
+    first_source = copy.deepcopy(result["resources"]["helper_source"])
+    cache: list[dict[str, Any]] = []
+    original = copy.deepcopy(result)
+    worker.write_json(tmp_path / "helper-costs.json", first)
+    worker.collect_helper_costs(
+        tmp_path, result, completed_generation=first_source["generation"], retained=cache
+    )
+    retained = [{"source": first_source, "costs": first}]
+    assert cache == retained and result == original
+    worker.collect_helper_costs(
+        tmp_path, result, completed_generation=first_source["generation"], retained=cache
+    )
+    assert cache == retained and result == original
+
+    second_source = {
+        **first_source,
+        "generation": "e" * 32,
+        "helper": "muli-transaction-" + "f" * 64 + ".service",
+        "pid": first_source["pid"] + 1,
+        "invocation": "a" * 32,
+    }
+    result["generations"].append(
+        {
+            "deployment": "d" * 64,
+            "generation": second_source["generation"],
+            "helper": second_source["helper"],
+        }
+    )
+    result["resources"]["helper_source"] = second_source
+    # The next helper is still live: its exit receipt has not replaced the file.
+    worker.collect_helper_costs(tmp_path, result, retained=cache)
+    assert result["resources"]["helper_source"] == second_source
+    assert result["resources"]["helper_costs"] == {
+        "code": "not_observed",
+        "reason": "identity_changed",
+    }
+    assert result["resources"]["helper_cost_history"] == retained
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+    second = {**copy.deepcopy(first), **second_source}
+    worker.write_json(tmp_path / "helper-costs.json", second)
+    worker.collect_helper_costs(
+        tmp_path, result, completed_generation=second_source["generation"], retained=cache
+    )
+    assert cache == [*retained, {"source": second_source, "costs": second}]
+    worker.collect_helper_costs(tmp_path, result, retained=cache)
+    assert result["resources"]["helper_cost_history"] == [
+        *retained,
+        {"source": second_source, "costs": second},
+    ]
+    assert result["code"] == "TimeoutError"
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+@pytest.mark.parametrize(
+    "damage", ["pid", "invocation", "missing_source", "wrong_completed_generation"]
+)
+def test_completed_cost_history_never_adopts_a_file_without_the_frozen_source(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    result, facts = costs_result()
+    cache: list[dict[str, Any]] = []
+    generation = facts["generation"]
+    if damage == "pid":
+        facts["pid"] += 1
+    elif damage == "invocation":
+        facts["invocation"] = "f" * 32
+    elif damage == "missing_source":
+        result["resources"].pop("helper_source")
+    else:
+        generation = "e" * 32
+    worker.write_json(tmp_path / "helper-costs.json", facts)
+    original = copy.deepcopy(result)
+    worker.collect_helper_costs(tmp_path, result, completed_generation=generation, retained=cache)
+    assert cache == [] and result == original
+    assert "helper_cost_history" not in result["resources"]
+    assert result["code"] == "TimeoutError"
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+def test_expired_cost_read_preserves_prior_completed_generation_without_new_file_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, facts = costs_result()
+    source = copy.deepcopy(result["resources"]["helper_source"])
+    cache = [{"source": source, "costs": facts}]
+    original = copy.deepcopy(result)
+    opens: list[bool] = []
+
+    def expired(deadline: float) -> float:
+        raise TimeoutError
+
+    def unexpected_open(*args: Any, **kwargs: Any) -> int:
+        opens.append(True)
+        raise AssertionError("expired observation must not open a file")
+
+    monkeypatch.setattr(worker, "remaining", expired)
+    monkeypatch.setattr(worker.os, "open", unexpected_open)
+    worker.collect_helper_costs(
+        tmp_path,
+        result,
+        deadline=1.0,
+        completed_generation=source["generation"],
+        retained=cache,
+    )
+    assert result == original and cache == [{"source": source, "costs": facts}]
+    worker.collect_helper_costs(tmp_path, result, deadline=1.0, retained=cache)
+    assert result["resources"]["helper_cost_history"] == cache
+    assert result["resources"]["helper_costs"] == {"code": "not_observed", "reason": "unavailable"}
+    assert opens == []
+    assert result["code"] == "TimeoutError"
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+@pytest.mark.parametrize(
+    "damage", ["duplicate", "four", "source", "counts", "extra", "foreign_generation", "unobserved"]
+)
+def test_cost_history_artifact_rejects_non_contract_rows(damage: str) -> None:
+    result, facts = costs_result()
+    row = {"source": copy.deepcopy(result["resources"]["helper_source"]), "costs": facts}
+    history = [row]
+    if damage in {"duplicate", "four"}:
+        history *= 2 if damage == "duplicate" else 4
+    elif damage == "source":
+        row["source"]["pid"] = True
+    elif damage == "counts":
+        facts["checks"]["count"] = True
+    elif damage == "extra":
+        row["path"] = "/must-not-export"
+    elif damage == "foreign_generation":
+        row["source"]["generation"] = facts["generation"] = "e" * 32
+    else:
+        row["costs"] = {"code": "not_observed", "reason": "unavailable"}
+    result["resources"]["helper_cost_history"] = history
+    with pytest.raises(ci.FixtureError, match="^native_result_invalid$"):
+        ci.fixture_result(json.dumps(result).encode())
+
+
+def test_cost_history_never_displaces_existing_result_at_the_original_byte_limit(
+    tmp_path: Path,
+) -> None:
+    result, facts = costs_result()
+    cache: list[dict[str, Any]] = []
+    worker.write_json(tmp_path / "helper-costs.json", facts)
+    worker.collect_helper_costs(
+        tmp_path, result, completed_generation=facts["generation"], retained=cache
+    )
+    worker.collect_helper_costs(tmp_path, result, retained=cache)
+    retained = copy.deepcopy(result["resources"]["helper_cost_history"])
+    second_source = {
+        **result["resources"]["helper_source"],
+        "generation": "e" * 32,
+        "helper": "muli-transaction-" + "f" * 64 + ".service",
+    }
+    result["resources"]["helper_source"] = second_source
+    result["resources"].pop("helper_costs")
+    result["generations"].append(
+        {
+            "deployment": "d" * 64,
+            "generation": second_source["generation"],
+            "helper": second_source["helper"],
+        }
+    )
+    second = {**facts, **second_source}
+    worker.write_json(tmp_path / "helper-costs.json", second)
+    worker.collect_helper_costs(
+        tmp_path, result, completed_generation=second_source["generation"], retained=cache
+    )
+    row = {"stage": "transaction", "elapsed_ms": 1}
+    row.update({name: "x" * 100 for name in ("request_id", "boot", "result")})
+    result["timeline"] = [dict(row) for _ in range(64)]
+    for name in ("helper", "state"):
+        for item in result["timeline"]:
+            used = len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+            capacity = worker.MAX_BYTES - 1 - used - len(f',"{name}":""')
+            if capacity >= 0:
+                item[name] = "x" * min(100, capacity)
+    used = len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+    assert worker.MAX_BYTES - 100 < used < worker.MAX_BYTES
+    before = copy.deepcopy(result)
+    worker.collect_helper_costs(tmp_path, result, retained=cache)
+    costs = result["resources"].pop("helper_costs", None)
+    assert costs is None or costs == {"code": "not_observed", "reason": "output_budget"}
+    assert result["resources"]["helper_cost_history"] == retained
+    assert result == before
+    assert ci.fixture_result(json.dumps(result, separators=(",", ":")).encode()) == result

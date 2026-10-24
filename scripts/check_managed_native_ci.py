@@ -1400,6 +1400,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "helper_source",
             "controller_failure",
             "helper_costs",
+            "helper_cost_history",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1439,6 +1440,31 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             )
         elif name == "controller_failure":
             valid = controller_failure_facts(facts, value)
+        elif name == "helper_cost_history":
+            valid = isinstance(facts, list) and 1 <= len(facts) <= 3
+            seen: set[str] = set()
+            if valid:
+                for retained in facts:
+                    if not isinstance(retained, dict) or set(retained) != {"source", "costs"}:
+                        valid = False
+                        break
+                    source = retained["source"]
+                    costs = retained["costs"]
+                    if not (
+                        helper_source_facts(source)
+                        and isinstance(costs, dict)
+                        and costs.get("code") == "observed"
+                        and resource_worker().helper_costs_facts(costs, source) is True
+                        and source["generation"] not in seen
+                        and any(
+                            row["generation"] == source["generation"]
+                            and row["helper"] == source["helper"]
+                            for row in history
+                        )
+                    ):
+                        valid = False
+                        break
+                    seen.add(source["generation"])
         elif name == "helper_costs":
             source = resources.get("helper_source")
             valid = resource_worker().helper_costs_facts(facts, source) is True
@@ -2418,11 +2444,19 @@ class NativeCI:
         for name in ("a", "b"):
             self.copy_slot(name, description)
         shutil.copyfile(worker, self.volume / "managed_native_worker.py")
+        shutil.copyfile(
+            worker.with_name("managed_native_unit.py"), self.volume / "managed_native_unit.py"
+        )
         (self.volume / "_muli_native_ci_hook.py").write_text(
             "import sys\nif sys.argv[-1:] == ['serve']:\n"
             "    from managed_native_worker import install_hook\n    install_hook()\n"
             "elif sys.orig_argv[1:4] in (['-I', '-m', 'muli.management_helper'],\n"
             "                               ['-I', '-m', 'muli.managed_host']):\n"
+            "    try:\n"
+            "        from managed_native_worker import install_unit_birth_hook\n"
+            "        install_unit_birth_hook()\n"
+            "    except Exception:\n"
+            "        pass\n"
             "    try:\n"
             "        from managed_native_worker import install_helper_cost_hook\n"
             "        install_helper_cost_hook()\n"
