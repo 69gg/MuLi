@@ -15,7 +15,12 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from muli.managed_transaction import HealthProofV2, TransactionRecordV2, format_digest
+from muli.managed_transaction import (
+    HealthProofV2,
+    ProjectControllerTransferRecord,
+    TransactionRecordV2,
+    format_digest,
+)
 from muli.management_transaction import (
     ClockReading,
     FixedLock,
@@ -29,8 +34,9 @@ from muli.platforms.transaction_files import ConfigurationError, ConfigurationFi
 if TYPE_CHECKING:
     from muli.managed_boot import ManagedBootPermit
 
-CurrentRecord = TransactionRecord | TransactionRecordV2
-ManagedVerifier = Callable[[TransactionRecordV2, Role | None], None]
+ManagedRecord = TransactionRecordV2 | ProjectControllerTransferRecord
+CurrentRecord = TransactionRecord | ManagedRecord
+ManagedVerifier = Callable[[ManagedRecord, Role | None], None]
 
 
 class MaintenanceError(ValueError):
@@ -228,7 +234,7 @@ class Maintenance:
         self._configuration_free = asyncio.Event()
         self._configuration_wake: list[Callable[[], None]] = []
         self._managed_verifier: ManagedVerifier | None = None
-        self._projected: Callable[[TransactionRecordV2], bool] | None = None
+        self._projected: Callable[[ManagedRecord], bool] | None = None
         self.reconcile()
 
     def bind_managed_verifier(self, verify: ManagedVerifier) -> None:
@@ -237,12 +243,12 @@ class Maintenance:
             raise RuntimeError("managed_verifier_already_bound")
         self._managed_verifier = verify
 
-    def verify_managed(self, record: TransactionRecordV2, role: Role | None) -> None:
+    def verify_managed(self, record: ManagedRecord, role: Role | None) -> None:
         if self._managed_verifier is None:
             raise MaintenanceError("managed_evidence_unavailable")
         self._managed_verifier(record, role)
 
-    def bind_projection_checker(self, check: Callable[[TransactionRecordV2], bool]) -> None:
+    def bind_projection_checker(self, check: Callable[[ManagedRecord], bool]) -> None:
         if self._projected is not None:
             raise RuntimeError("projection_checker_already_bound")
         self._projected = check
@@ -306,7 +312,15 @@ class Maintenance:
         self._core = store_instance, main_session
 
     def current(self) -> CurrentRecord | None:
-        return self.permit.journal.read_current() if self.permit else None
+        record = self.permit.journal.read_current() if self.permit else None
+        if isinstance(record, ProjectControllerTransferRecord) and (
+            not record.resolved
+            or isinstance(self.permit, BootPermit)
+            or self.permit is None
+            or self.permit.boot == record.identity.origin_boot
+        ):
+            raise MaintenanceError("project_controller_transfer_unsupported")
+        return record
 
     @property
     def pending(self) -> bool:
@@ -328,7 +342,7 @@ class Maintenance:
             return True
         # Configuration may change after an exact final result reached the real
         # Store. It cannot erase frozen evidence before that result is projected.
-        return isinstance(record, TransactionRecordV2) and (
+        return isinstance(record, (TransactionRecordV2, ProjectControllerTransferRecord)) and (
             self._projected is None or not self._projected(record)
         )
 
@@ -356,11 +370,17 @@ class Maintenance:
             )
         )
 
-    def _record(self, generation: str, boot: str, nonce: str) -> CurrentRecord:
+    def _record(
+        self, generation: str, boot: str, nonce: str
+    ) -> TransactionRecord | TransactionRecordV2:
         permit = self.permit
         record = self.current()
         if permit is None or record is None:
             raise MaintenanceError("transaction_unavailable")
+        # This slice only opens terminal observation/projection and restart
+        # preparation. Transfer drain/readiness/activation are not implemented.
+        if isinstance(record, ProjectControllerTransferRecord):
+            raise MaintenanceError("project_controller_transfer_unsupported")
         role = self._role(record)
         challenge = record.rollback_challenge if role == "base" else record.challenge
         if (

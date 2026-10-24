@@ -1,4 +1,4 @@
-# 阶段一 bridge：固定 controller 换代的最小合同（待审、未实现）
+# 阶段一 bridge：固定 controller 换代的合同与实施记录（未闭环）
 
 2026-10-24。本文细化 [格式转换方案](project-format-transition-proposal.md) 的阶段一，仅新增严格动作 `project_controller_transfer`。数据库完整格式始终为 1，项目功能保持关闭；不实现 `project_review_1_to_2`、不改数据库 marker，不扩大普通 V1/V2 或 `assess_compatibility` 的接受集合。本文为实现合同与分片验证记录；strict model/action reader 和旧消费者临时拒绝保护已通过下述回归及全源 strict 检查，尚未实现可发布的 transfer 或验证真实 systemd 换代。
 
@@ -142,3 +142,55 @@ unit 不能声称不变：`ManagedUserService._arguments` 的 Python 来自 cont
 7. `test_transfer_terminal_projects_and_allows_next_same_format_request`：新角色提交或回退在同一真实 DB 投影，close/reopen 后严格接纳该终态为普通新请求 source，当前 anchor/controller/unit 是新值；Store/main、原消息/已接受 pending 与 unknown receipts 不重建、不丢失或重发。格式 1 不变，普通 1→2 仍被原 assess 拒绝。
 
 前 1–3/5–7 的替身通过只证明纯规则、文件/SQLite/lease 与调用边界；第 4 另外证明精确 retained launcher/正式 host 进程路径。真实 systemd loaded unit、进程/cgroup、关闭 owner 与新 writer 交接还需要单独受控验收，不能用 DTO 或 fake probe 宣称已部署可恢复。该批准也不授权运行原生 CI、新进程或真实服务；根先审合同，再给独立实现树与唯一守卫执行窗口。
+
+## 8. 2A：released Transfer 作为普通前代的首批行为红测
+
+根签名第一片 checkpoint `d4b648c3b09fc18052faaa7596d11e9929e06b85` 后，先仅在 `tests/test_project_controller_transfer.py` 追加以下三组、八节点，未先改生产：
+
+- `test_released_transfer_is_ordinary_restart_predecessor[committed/rolled_back]`：完整合法 released Transfer 经正式 Journal 读取，持原 writer lease 准备普通 restart。角色来自新 anchor 的 base/target，而非 origin；保留本代九快照，随后同 request 重试不改变原 deadline、nonce、revision 或 state bytes。
+- `test_transfer_predecessor_requires_current_projection_without_effects[origin/missing/wrong-revision]`：旧 origin receipt、缺失 receipt、错误本代 revision 均须以 `projection_required` 拒绝，整目录实际 bytes 不变，包含可回收旧快照，不能先 GC/写入再发现投影不符。
+- `test_transfer_predecessor_nine_snapshots_entry_budget[exact/one-short]` 与 `test_transfer_origin_snapshots_gc_only_after_next_predecessor`：实际九份前代文件、六份 incoming、state/lock、未知条目及一个原子替换临时项构成精确额度；只收紧原默认额度，不提高上限。刚接普通后继仍保留九份 Transfer 文件；再下一代仅回收已不再引用的完整九份（含 origin 三份），保留当前普通前代六份及未知条目。
+
+根实际收取这八节点：**8 failed**，pytest 0.34s、守卫 906ms、峰值 71.6MiB、swap 0、actual exit 1；全部停在正式 `prepare_managed` 的显式 `project_controller_transfer_unsupported`，投影反例也先遇到该一刀切门而未到预期投影拒绝。这不是尚未存在函数、导入或坏 fixture 制造的红。
+
+根据此授权并落盘的 2A 候选仅修改 `managed_transaction.py` 与 `managed_journal.py`：`prepare_record_v2` 显式接纳 resolved Transfer 前代且只开普通 restart；精确本代投影、Store/main、新 anchor deployment、选定角色的 entry/installation/compatibility/selector/unit、完整 observed format 和新 generation 均在写入前核验。同 request 仍按原普通记录规则保留原 deadline/nonce/position，Transfer request_id 不可伪装成普通重试。未 released 及其它普通动作仍返回原 unsupported，不放宽旧 V1/V2 模型、parser 或兼容判定。
+
+Journal 在纯门通过后，经同一受限目录读取并验证本代 origin/base/target 三组完整九份文件，之后才进入原 record/目录额度、guard、GC、snapshot 写入和最后 state 发布；缺失或损坏不修复、不靠 incoming 替代旧证据。GC 仅额外识别固定 `origin-configuration.json`、`origin-selector.json`、`origin-unit.bin`，保留当前前代整个 generation；下一代已无引用时才回收三组，`origin.json` 等未定义条目继续保留并计额度。原默认 limits、原临时条目预留和旧普通重试分支均未提升或另造。
+
+同文件另补 `test_transfer_predecessor_verifies_every_retained_snapshot_before_effects`（三组×三组件）、`test_transfer_predecessor_missing_origin_snapshot_is_not_repaired`、`test_restart_after_transfer_retry_does_not_repair_changed_snapshot`、`test_released_transfer_does_not_open_ordinary_configure`、`test_transfer_predecessor_rejects_foreign_ordinary_material_without_effects`（deployment/Store/main/旧 origin binding/重代/重 request 六项）、`test_transfer_predecessor_keeps_host_guard_before_new_material`。拒绝前后逐项比较整个临时目录 bytes；保留旧未 released unsupported oracle。
+
+2A 实现后，根唯一守卫实际收取六文件 **296 passed**，pytest 2.27s、守卫 2.865s、峰值 109.5MiB、swap 0、actual exit 0；其中已包含此前 269 项，不将两轮数字相加。根仅格式化本片三份 Python 文件，三文件 Ruff 通过；全 146 源 strict/no-incremental 实际 **exit 0**，同一守卫包含格式/Ruff，合计 8.317s、峰值 419.8MiB、swap 0。C 对冻结 2A 生产与回归独立只读后审未见剩余 P1/P2，未执行检查。上文八红保留为改动前真实历史；本轮通过的是当前纯规则、临时文件/Journal/lease、快照读验与 GC 接缝，不是实际 Transfer 执行或恢复验收。
+
+首批都走现有正式 prepare/Journal/lock/lease 和临时文件，不新增 Transfer 发布入口或真实宿主效果。新请求 `origin_boot` 为独立的调用方测试材料，显式不同于历史健康证明；不以历史 `health.boot` 合成 fresh permit。GC 后继的终态由现有纯 transition/proof helper 构造，不声称真实 controller 已执行。普通 live configuration 可能通过既有 Settings 路径变化，本片只比较角色的其它不可变材料；调用方仍必须交付与实际新配置匹配的快照并通过原 guard，不强行恢复历史配置。guard 反例只证明原同步回调在新材料写入前仍能拒绝，不证明真实宿主准入；`ManagedPreparation._source`、Maintenance、boot、host、projection 的 Transfer 执行分支仍未开放。2A 不代替后续 2B 的当前安装/实际配置/fresh permit、关闭重开或正式 launcher exec 验收，也不证明真实 transfer 已可发布或恢复。
+
+## 9. 2B：正式 terminal permit 到普通 restart 的读链红测
+
+2A 已由根签名为 `f248fc1aabdea307a7370c96fa597bafa100a1c2`（本地、未推）。下一片先仅新增 `tests/test_project_controller_transfer_runtime.py` 的五节点。根唯一守卫已实际收取 **5 failed**，pytest 0.42s、守卫 971ms、峰值 74.9MiB、swap 0、actual exit 1；全部停在正式 `ManagedBootPermit.acquire` → `_record` 的 `managed_boot_verification_failed`，两项预期 `managed_boot_not_permitted` 的负控制也先遇同一接缝。这是完整材料通过正式入口后的行为红，不是 fixture/import 错误。
+
+复用现有 `test_managed_boot.Host` 的真实临时 SQLite、私有 journal、两个已登记安装、launcher/anchor 文件与进程属性边界。先从实际 slot、Store/main、渲染 unit 和 canonical selector 生成合法普通旧代，**通过正式 `ManagedBootPermit.acquire/open_store`、`verify_running_binding`、`project_final` 产生 origin 精确投影**，关闭旧 writer 后再冻结本代 Transfer 九快照与终态。当前 state 始终是严格 `ProjectControllerTransferRecord`；不把它转成普通 V2 交给被测读链，不手工实例化 permit、不替换任何 reader、Maintenance.current、verifier 或 projection checker。
+
+旧 anchor.controller_slot 是另一个实际 retained 安装，new anchor.controller_slot 正是当前 bridge 安装；新旧 unit 均由 `platforms/managed_probe.py` 的 `ManagedUserService` 正式渲染且 bytes 不同，launcher 指纹/路径保持。旧普通前代仅用于真实 origin receipt 生成；Transfer 终态由严格模型在夹具中发布，不冒充 controller 已执行。新测试重开的是原 journal/DB/lease 同 inode 的一组真实描述符，由正式 `BootSession`/Runtime 持有和关闭；原 Host 仍拥有其夹具描述符，不另建账本或第二把 writer lease。
+
+- `test_terminal_transfer_real_permit_runtime_observe_and_restart[committed/rolled_back]`：正式 EntryPlan → `ManagedBootPermit.acquire` → 再次 `_record` → Runtime 自有 `open_store`/Maintenance。fresh caller boot 与 Transfer 历史 health.boot、旧 origin boot 三者不同，不能拿历史健康证明当 fresh 许可；Runtime 必须绑定同一真实 permit，选新 anchor 的 base/target。旧 origin receipt 仍使 configuration_blocked 为真；fresh permit 的 `role=None` verifier 请求拒绝且无 DML。只有本代 `project_final` 经 Runtime 真实绑定 verifier 写入精确投影后，才解除配置屏障并走 `observe_current`、真实管理 plan、`prepare(restart)`，新 record 的 origin_boot 必须来自 fresh permit。仅放开 Maintenance.current、不补投影屏障不能让本测试通过。
+- `test_terminal_transfer_invalid_boot_is_rejected_before_dml[origin-boot/unreleased]`：本代旧 origin boot，或未 released 终态下的新 boot，在 acquire 处须以 `managed_boot_not_permitted` 拒绝；既有 DB 逻辑快照与 state bytes 不变。不让本片的 terminal 读链授权任何未 resolved Transfer/helper 执行。
+- `test_terminal_transfer_old_projection_blocks_observe_and_prepare_without_dml`：permit 与 Runtime 正常重开，但仍只有真实旧 origin receipt；observe 和 restart prepare 都须在 probe/新 plan 事件/新 journal generation 前以 `transaction_in_progress` 拒绝，SQLite total_changes、逻辑快照和 state bytes 不变。
+
+改动前首个真实拒绝接缝是 `managed_boot.ManagedBootPermit._record` 调用仅支持普通四动作的 `parse_record_v2`：完整 Transfer 成为 `invalid_record` 并由 acquire 包装为 `managed_boot_verification_failed`，尚未到 Runtime。不能只改首个 parser 或 current() 就称整链完成。实现阶段补足夹具的后续前置：旧真实 writer 在关闭及发布 Transfer state 前保存本代 `management` plan，使新 `project_final` 有实际 action/generation 可核；这不是生产缺陷，也不改变上述首红的 parser 因果。`observe_current` 的内部 `_source(..., action='switch', item=None)` 是只读定位，不等同本片开放 switch 发布；实际新增效果仍只允许 ordinary restart。
+
+根据根授权，当前候选仅接 `committed/rolled_back` 且已 released 的 Transfer：`managed_boot` 使用严格 action 分派并拒绝旧 origin boot，旧 EntryPlan revision 只路由，正式 `_record` 仍重读当前 bytes/同代身份/允许 role；open_store 前及原连接准入前后都核不可变字段（包括 origin/action）。Runtime 的真实 permit/Store 绑定 verifier、Maintenance 的精确 projection checker、`project_final`、`managed_runtime_binding`、`ManagedPreparation._source/observe_current` 及 `platforms/managed_probe` 显式接纳这一终态联合。新角色实际 anchor/slot/config/unit/selector、Store/main、完整格式、lease 和前后记录门保留；source 在任何写入/probe 前还读验九份本代快照。fresh boot 不要求等于历史 health.boot，不从后者制造许可。
+
+Maintenance 只开放终态读取/精确投影屏障；旧 BootPermit、旧 origin、`role=None` 与所有 Transfer drain/readiness/activate/resume RPC 仍拒绝。未 resolved Transfer、新动作 prepare/advance、CLI/bootstrap、controller/helper 和真实宿主效果仍未开放。普通 V1/V2 的 parser、角色与投影接受规则不变，没有新增期限、条目或字节预算。旧 receipt 在观察/准备的 probe、DML 或新 journal 代之前阻断；实际新效果只允许 ordinary restart。
+
+新增候选反例 `test_terminal_transfer_old_entry_plan_is_only_routing[released/now-unreleased]` 核旧 plan 后当前 revision 的真正接纳或拒绝；`test_terminal_transfer_origin_cannot_change_between_acquire_and_open_store` 核 immutable origin 漂移在 Store 打开前拒绝；`test_terminal_transfer_runtime_rejects_changed_frozen_origin_before_probe` 在真实 Runtime 已产生精确本代 receipt 后，仅改同代 origin，核强 verifier/source 仍拒绝且无 DML/probe。后者保留 ID/position/receipt，不能只靠配置投影不匹配得到绿。
+
+根首次执行这九节点实际 **8 passed / 1 failed**，pytest 0.79s、守卫 1.364s、峰值 81.5MiB、swap 0、actual exit 1。唯一失败是 acquire→open_store 漂移用例的错误码断言：同 revision 原始 state bytes 已改变，既有 EntryPlan digest 门更早以 `managed_entry_changed` 拒绝，DB 无写；原预期 `managed_record_changed` 不符。这不是生产未拒绝。本次只将该节点改为精确 `managed_entry_changed` 并注明更早原始 bytes 门，生产保持冻结；修后重验和全源类型检查仍待根收取，不将 8 项通过宣称为整片通过。
+
+C 随后独立只读后审指出同代 action 降类型 P2：Runtime 已精确投影后，仅将 Transfer 去掉 origin、改 action 为 restart，正式 `TransactionRecordV2.model_validate` 仍可接受；position 和 receipt 不变，而原两处 immutable 门只识别 incoming Transfer。根先实收新增参数 `test_terminal_transfer_runtime_rejects_changed_frozen_origin_before_probe[action-to-ordinary]` **1 failed**，pytest 0.28s、守卫 923ms、峰值 72.5MiB、swap 0、actual exit 1，准确失败于真实 `Maintenance.verify_managed` 的 DID NOT RAISE，非坏 fixture 或模型拒绝。
+
+根据该红授权的窄修复用一项纯身份比较：incoming Transfer 或 permit 原记录为同 generation Transfer 时，必须两侧仍为 Transfer 且所有 immutable 字段相等；不同 generation 的普通后继沿原规则，不被此门拦截。强 verifier、preparation source 和 Runtime projection checker 共用这一门；配置屏障即使 receipt position 相等也须闭锁，不增加普通记录文件核验。漂移两参数保留原 receipt，分别断言真实 verifier 拒绝、配置闭锁、直接 `_source` 在 probe/DML 前拒绝，以及 `observe_current` 在配置屏障拒绝。原两项正向仍须真正准备下一 generation ordinary restart，不能以同代不可变性拦掉合法后继。当时尚未重验，以下另记根最终实收结果。
+
+根在窄修后实际收取本片 **10 passed**，pytest 0.83s、守卫 1.412s、峰值 81.2MiB、swap 0、exit 0。随后本片与 transfer/transaction/journal/preparation/boot/runtime-binding/maintenance/projection/probe/management/bootstrap/CLI/host-wiring 共 16 个测试文件串行整合 **481 passed**，pytest 12.10s、守卫 13.045s、峰值 262.8MiB、swap 0、exit 0；该总数包含前述 10 项，不相加。全 146 源 strict/no-incremental 检查 exit 0，守卫 8.104s、峰值 413.9MiB、swap 0。Ruff 导入排序及四文件格式候选修整后，八个 Python 文件 lint 和 format check 均通过；未修改运行语义。
+
+C 与另一位未参与实现的审查 agent 分别只读后审，均确认 action 降类型 P2 在双侧身份门、三处消费者及反例合同中闭合，未见新增 P1/P2。不同 generation ordinary 后继仍走原宿主/格式/角色准入，Transfer RPC 与新动作执行仍拒绝；精确 receipt 的幂等早返不能绕过 Runtime 的身份门。审查本身未运行检查，不将其计作额外测试证据。
+
+受控 probe 复用现有 process/systemd 边界，显式区分 loaded unit 的 launcher argv 与 exec 后 app argv；磁盘文件、模型、SQLite 和持有的 permit/lease 都走真实本地实现。没有启动 Runtime lifespan、模型、服务、解释器或新进程，未扩大宿主能力。这组通过也只能证明 terminal 读链与普通后继准备，真实 controller/helper、retained launcher 正式 exec、未知 start 与真实 systemd 交接仍待后续独立片。

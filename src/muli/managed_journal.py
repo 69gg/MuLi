@@ -15,6 +15,7 @@ from typing import Literal
 from muli.compatibility import CompatibilityManifest, FormatState
 from muli.managed_transaction import (
     ManagedAction,
+    ProjectControllerTransferRecord,
     RoleBinding,
     ServiceIdentityV2,
     TransactionRecordV2,
@@ -38,12 +39,14 @@ from muli.management_transaction import (
 )
 
 Component = Literal["configuration", "selector", "unit"]
+_SnapshotRole = Literal["origin", "base", "target"]
 _SNAPSHOT_NAME = re.compile(
-    r"[a-f0-9]{32}-(?:base|target)(?:\.json|-(?:configuration|selector)\.json|-unit\.bin)"
+    r"[a-f0-9]{32}-(?:(?:base|target)(?:\.json|-(?:configuration|selector)\.json|-unit\.bin)"
+    r"|origin-(?:(?:configuration|selector)\.json|unit\.bin))"
 )
 
 
-def _name(generation: str, role: Role, component: Component) -> str:
+def _name(generation: str, role: _SnapshotRole, component: Component) -> str:
     suffix = "bin" if component == "unit" else "json"
     return f"{generation}-{role}-{component}.{suffix}"
 
@@ -76,14 +79,16 @@ class RoleSnapshots:
         }
 
 
-def read_snapshots(
-    journal: TransactionJournal, record: TransactionRecordV2, role: Role
+def _read_snapshots(
+    journal: TransactionJournal,
+    generation: str,
+    binding: RoleBinding,
+    role: _SnapshotRole,
 ) -> RoleSnapshots:
-    binding = record.binding(role)
     limit = journal.limits.max_snapshot_bytes
 
     def read(component: Component) -> bytes:
-        return journal.directory.read(_name(record.generation, role, component), limit)
+        return journal.directory.read(_name(generation, role, component), limit)
 
     value = RoleSnapshots(
         configuration=read("configuration"),
@@ -94,9 +99,17 @@ def read_snapshots(
     return value
 
 
+def read_snapshots(
+    journal: TransactionJournal,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
+    role: Role,
+) -> RoleSnapshots:
+    return _read_snapshots(journal, record.generation, record.binding(role), role)
+
+
 def _collect(
     control: JournalControl,
-    previous: TransactionRecord | TransactionRecordV2 | None,
+    previous: TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord | None,
     incoming: dict[str, bytes],
 ) -> None:
     """Collect only unreferenced snapshots; preserve the entire current generation."""
@@ -168,6 +181,13 @@ def prepare_managed(
         projected=projected,
         generation=generation,
     )
+    if isinstance(previous, ProjectControllerTransferRecord):
+        # The pure predecessor gate above only opens released -> restart.
+        # Authenticate all nine retained files before any GC or new snapshot,
+        # including origin even though only base/target can supply the source.
+        _read_snapshots(control.journal, previous.generation, previous.origin.binding, "origin")
+        read_snapshots(control.journal, previous, "base")
+        read_snapshots(control.journal, previous, "target")
     # Validate the record budget before writing even unreferenced snapshots.
     if len(record.model_dump_json().encode()) > control.journal.limits.max_record_bytes:
         raise TransactionError("record_budget")

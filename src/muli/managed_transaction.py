@@ -268,6 +268,185 @@ class TransactionRecordV2(_Protocol2):
         )
 
 
+class TransferOrigin(StrictRecord):
+    """Frozen old authority; never a boot role under the replacement anchor."""
+
+    deployment: Digest
+    binding: RoleBinding
+    projected: ProjectionReceipt
+
+    @model_validator(mode="after")
+    def managed_origin(self) -> Self:
+        if self.binding.entry != "managed":
+            raise ValueError("managed_origin_required")
+        return self
+
+
+class ProjectControllerTransferRecord(_Protocol2):
+    """Read-only transfer shape; parsing grants no prepare or effect authority.
+
+    The host must prove this installation is the currently executing bridge,
+    bind both immutable anchors and authenticate the live origin separately.
+    Ordinary protocol-2 actions deliberately retain their original model.
+    """
+
+    request_id: Identifier
+    generation: Identifier
+    revision: int = Field(ge=1)
+    action: Literal["project_controller_transfer"]
+    identity: ServiceIdentityV2
+    origin: TransferOrigin
+    base: RoleBinding
+    target: RoleBinding
+    observed_format: FormatState
+    deadline: Deadline
+    phase: Phase = "prepared"
+    intent: Intent = "none"
+    challenge: Identifier = Field(repr=False)
+    rollback_challenge: Identifier | None = Field(default=None, repr=False)
+    rollback_attempted: bool = False
+    health: HealthProofV2 | None = Field(default=None, repr=False)
+    activation: Activation = "pending"
+    code: Code | None = None
+    failure_code: Code | None = None
+
+    @field_validator("generation")
+    @classmethod
+    def snapshot_generation(cls, value: str) -> str:
+        if re.fullmatch(r"[a-f0-9]{32}", value) is None:
+            raise ValueError("invalid_generation")
+        return value
+
+    @model_validator(mode="after")
+    def consistent(self) -> Self:
+        origin, base = self.origin, self.base
+        if (
+            base.entry != "managed"
+            or base != self.target
+            or base.installation != origin.binding.installation
+            or base.compatibility != origin.binding.compatibility
+            or base.configuration != origin.binding.configuration
+            or base.selector == origin.binding.selector
+        ):
+            raise ValueError("invalid_transfer_binding")
+        if (
+            origin.deployment == self.identity.deployment
+            or origin.projected.generation == self.generation
+            or origin.projected.store_instance != self.identity.store_instance
+        ):
+            raise ValueError("invalid_transfer_origin")
+        for selected in (origin.binding, base):
+            selector = selected.selector
+            if selector is None or selector.digest != selector.semantic_digest:
+                raise ValueError("selector_not_canonical")
+        # This action only transfers control of the complete format-1 bridge.
+        # CURRENT_FORMAT_STATE may change in a later release; it is not the
+        # authority to broaden this specific, retained action's contract.
+        if any(version != 1 for version in self.observed_format.formats.model_dump().values()):
+            raise ValueError("transfer_format_required")
+        intents = {
+            "activating": {"stop_base", "install_target", "start_target"},
+            "rolling_back": {"stop_target", "restore_base", "start_base", "verify_base"},
+        }
+        if self.phase == "aborted" or self.intent not in intents.get(self.phase, {"none"}):
+            raise ValueError("invalid_transfer_phase")
+        if self.rollback_attempted != (self.rollback_challenge is not None):
+            raise ValueError("invalid_rollback")
+        if self.rollback_challenge == self.challenge:
+            raise ValueError("invalid_rollback_challenge")
+        if self.phase in {"rolling_back", "rolled_back"} and not self.rollback_attempted:
+            raise ValueError("missing_rollback")
+        if self.rollback_attempted and self.phase not in {
+            "rolling_back",
+            "rolled_back",
+            "recovery_required",
+        }:
+            raise ValueError("invalid_rollback_phase")
+        if self.phase not in {"committed", "rolled_back"} and self.activation != "pending":
+            raise ValueError("invalid_activation")
+        if self.phase in {"committed", "rolled_back"} and self.health is None:
+            raise ValueError("missing_health")
+        if self.health is not None:
+            role: Role = "base" if self.phase == "rolled_back" else "target"
+            released = self.activation in {"released", "released_degraded"}
+            if self.phase not in {"committed", "rolled_back"} or not self.accepts(
+                self.health, role, released=released
+            ):
+                raise ValueError("invalid_health")
+            if released and self.activation != self.health.admission:
+                raise ValueError("invalid_release")
+        return self
+
+    def binding(self, role: Role) -> RoleBinding:
+        if role not in {"base", "target"}:
+            raise TransactionError("invalid_role")
+        return self.base if role == "base" else self.target
+
+    @property
+    def boot_role(self) -> Role | None:
+        if self.phase in {"verifying", "committed"} or (
+            self.phase == "activating" and self.intent == "start_target"
+        ):
+            return "target"
+        if self.phase == "rolled_back" or (
+            self.phase == "rolling_back" and self.intent in {"start_base", "verify_base"}
+        ):
+            return "base"
+        return None
+
+    @property
+    def position(self) -> Revision:
+        return Revision(generation=self.generation, revision=self.revision)
+
+    @property
+    def resolved(self) -> bool:
+        return self.phase in {"committed", "rolled_back"} and self.activation in {
+            "released",
+            "released_degraded",
+        }
+
+    def public(self) -> dict[str, str | int | bool | None]:
+        return {
+            "protocol": self.protocol,
+            "request_id": self.request_id,
+            "generation": self.generation,
+            "revision": self.revision,
+            "action": self.action,
+            "phase": self.phase,
+            "activation": self.activation,
+            "resolved": self.resolved,
+            "code": self.code,
+            "failure_code": self.failure_code,
+        }
+
+    def accepts(self, proof: HealthProofV2, role: Role, *, released: bool = False) -> bool:
+        if role not in {"base", "target"} or self.boot_role != role:
+            return False
+        binding = self.binding(role)
+        return (
+            proof.protocol == 2
+            and proof.role == role
+            and proof.generation == self.generation
+            and proof.challenge == (self.challenge if role == "target" else self.rollback_challenge)
+            and proof.boot != self.identity.origin_boot
+            and proof.deployment == self.identity.deployment
+            and proof.installation == binding.installation
+            and proof.compatibility == binding.compatibility
+            and proof.configuration == binding.configuration.digest
+            and proof.selector == (binding.selector.digest if binding.selector else None)
+            and proof.unit == binding.unit.digest
+            and proof.store_instance == self.identity.store_instance
+            and proof.main_session == self.identity.main_session
+            and proof.format_digest == format_digest(self.observed_format)
+            and proof.core_ready
+            and (
+                proof.admission in {"released", "released_degraded"}
+                if released
+                else proof.admission == "paused"
+            )
+        )
+
+
 class TransitionV2(StrictRecord):
     phase: Phase
     intent: Intent = "none"
@@ -291,6 +470,26 @@ def parse_record_v2(data: bytes, *, limits: JournalLimits | None = None) -> Tran
         raise TransactionError("invalid_record") from None
 
 
+def parse_managed_record(
+    data: bytes, *, limits: JournalLimits | None = None
+) -> TransactionRecordV2 | ProjectControllerTransferRecord:
+    """Bounded action dispatch; ordinary V2 validation remains unchanged."""
+    limits = limits or JournalLimits()
+    if not isinstance(data, bytes):
+        raise TransactionError("invalid_record")
+    if len(data) > limits.max_record_bytes:
+        raise TransactionError("record_budget")
+    try:
+        values = _object(data)
+        if type(values.get("protocol")) is not int or values["protocol"] != 2:
+            raise TransactionError("invalid_record")
+        if values.get("action") == "project_controller_transfer":
+            return ProjectControllerTransferRecord.model_validate(values)
+    except (ValidationError, ValueError, RecursionError):
+        raise TransactionError("invalid_record") from None
+    return parse_record_v2(data, limits=limits)
+
+
 def prepare_record_v2(
     *,
     request_id: str,
@@ -302,7 +501,10 @@ def prepare_record_v2(
     base_manifest: CompatibilityManifest,
     target_manifest: CompatibilityManifest,
     deadline: Deadline,
-    previous: TransactionRecord | TransactionRecordV2 | None = None,
+    previous: TransactionRecord
+    | TransactionRecordV2
+    | ProjectControllerTransferRecord
+    | None = None,
     projected: ProjectionReceipt | None = None,
     generation: str | None = None,
 ) -> TransactionRecordV2:
@@ -316,6 +518,10 @@ def prepare_record_v2(
         not isinstance(generation, str) or not re.fullmatch(r"[a-f0-9]{32}", generation)
     ):
         raise TransactionError("invalid_generation")
+    if isinstance(previous, ProjectControllerTransferRecord) and (
+        not previous.resolved or action != "restart"
+    ):
+        raise TransactionError("project_controller_transfer_unsupported")
     assessment = assess_compatibility(
         base_manifest, target_manifest, observed_format, handoff_protocol=2
     )
@@ -368,6 +574,17 @@ def prepare_record_v2(
         or previous.identity.main_session != identity.main_session
     ):
         raise TransactionError("store_changed")
+    if isinstance(previous, ProjectControllerTransferRecord):
+        selected = previous.binding("base" if previous.phase == "rolled_back" else "target")
+        if identity.deployment != previous.identity.deployment or base.model_dump(
+            exclude={"configuration"}
+        ) != selected.model_dump(exclude={"configuration"}):
+            raise TransactionError("managed_source_changed")
+        if observed_format != previous.observed_format:
+            raise TransactionError("managed_format_changed")
+        # Configuration may have changed through the ordinary live settings
+        # path. Its actual bytes and fresh process permit remain host checks;
+        # neither the old configuration nor historical health grants admission.
     if record.generation == previous.generation:
         raise TransactionError("generation_conflict")
     return record

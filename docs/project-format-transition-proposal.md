@@ -97,7 +97,9 @@ journal 记录的 receipt 只是定位引用，必须从实际 DB 有界重读�
 
 ## 必要实现与最小验证顺序
 
-目前本树 host/segment 是 WIP，格式门拒 1；本树没有可发布的格式迁移或控制权换代实现，不能标为已发布或已恢复。独立桥接树 d4b648c 的冻结合同与分片证据已同步至 [控制权换代合同](project-controller-transfer-contract.md)，仅复制文档；其 strict reader 与临时拒绝保护不等于本树已有 transfer 能力，也未交付完整换代或格式 2 迁移。
+目前本树 host/segment 是 WIP，格式门拒 1；本树没有可发布的格式迁移或控制权换代实现，不能标为已发布或已恢复。本树已整合独立桥接树 `f3c42d1` 的 strict reader、普通前代九快照接缝及 released terminal 的正式 permit/Runtime/投影到普通 restart 准备链，合同与分片证据见 [控制权换代合同](project-controller-transfer-contract.md)。这次包含实际生产与回归文件，已不只是文档副本；Transfer prepare/advance/controller/helper 效果及真实换代、格式 2 迁移仍未交付。
+
+2026-10-24 本次合并的根实收：18 个相关测试文件 **510 passed**（pytest 13.10 秒；守卫 14.084 秒、291.1 MiB、swap 0、exit 0），包括桥接树原 16 文件以及记忆质量评估、项目格式门；全 148 生产源 strict/no-incremental 通过（守卫 8.220 秒、415.7 MiB、swap 0、exit 0）。生产源及四个目标测试文件 Ruff 与格式检查通过（152 个文件格式不变）。这些检查证明已合并片的回归，未执行受实际格式 1 阻挡的项目正向旅程，不将它们记为通过；独立纯 Transfer 状态推进仍在另一候选树，未借本次合并开放效果入口。
 
 当前首片证据仍限于格式 1 拒写及不需要格式 2 的回归。根先实收 24 passed、6 deselected（pytest 0.53 秒；守卫 1.170 秒、85.6 MiB、swap 0、exit 0），ordinary→project 先独立归档普通事项的原红已转绿，C 独立源码后审未见剩余 P1/P2。Ruff 首检 exit 1 的两处闭包绑定与一处 import 排序修正后，根格式化九个相关文件（八个改变格式、一个保持），Ruff 九文件通过；七测试文件实收 **110 passed、6 deselected**（pytest 1.63 秒；守卫 2.306 秒、127.7 MiB、swap 0、exit 0）。110 已包含上述 24 核心和 86 普通回归，不与 24 重复累计。全 148 生产源 strict/no-incremental 实际 exit 0（守卫 8.365 秒、436.1 MiB、swap 0）。六项项目正向仍实际受格式 1 前置阻断，没有证明以下迁移或手机屏障通过；签名 WIP 检查点不开放格式 2。
 

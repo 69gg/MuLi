@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from muli.managed_journal import read_snapshots
-from muli.managed_transaction import TransactionRecordV2
+from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_transaction import Role, TransactionJournal
 from muli.platforms.linux_transaction import (
     ObservationError,
@@ -101,13 +101,15 @@ class ManagedSystemdProbe(SystemdProbe):
     async def read_managed(
         self,
         journal: TransactionJournal,
-        record: TransactionRecordV2,
+        record: TransactionRecordV2 | ProjectControllerTransferRecord,
         anchor: DeploymentAnchor,
         controller: SlotIdentity,
         slots: dict[Role, SlotIdentity],
     ) -> ManagedProbeResult:
         if sys.platform != "linux":
             raise ObservationError("platform_unsupported")
+        if isinstance(record, ProjectControllerTransferRecord) and not record.resolved:
+            raise ObservationError("project_controller_transfer_unsupported")
         if (
             record.identity.deployment != anchor.digest
             or anchor.controller_slot != controller.digest
