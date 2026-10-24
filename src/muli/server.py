@@ -168,6 +168,7 @@ class ReminderInput(Input):
     due_at: float
     content: str = Field(default="", max_length=4000)
     interval_seconds: int | None = Field(default=None, ge=60, le=31536000)
+    commitment_id: str | None = Field(default=None, min_length=1)
 
 
 def create_app(

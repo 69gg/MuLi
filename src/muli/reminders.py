@@ -5,19 +5,33 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
+from collections.abc import Callable
 from typing import Any
 
 from muli.events import EventBus
+from muli.evidence import validate_integer
 from muli.maintenance import Admission
 from muli.proactive import FrozenRouting
+from muli.reminder_followup import followup_binding, task_status
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 
 
 class Reminders:
-    def __init__(self, store: Store, bus: EventBus, *, admission: Admission | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        bus: EventBus,
+        *,
+        admission: Admission | None = None,
+        max_output_chars: Callable[[], int] | None = None,
+    ) -> None:
+        from muli.config import Limits
+
         self.store, self.bus = store, bus
         self.admission = admission or Admission()
+        defaults = Limits()
+        self.max_output_chars = max_output_chars or (lambda: defaults.max_output_chars)
         self.changed = asyncio.Event()
         self.task: asyncio.Task[None] | None = None
 
@@ -29,6 +43,7 @@ class Reminders:
         interval_seconds: int | None = None,
         *,
         reply_origin: ReplyOrigin | None = None,
+        commitment_id: str | None = None,
     ) -> dict[str, Any]:
         if not title.strip() or len(title) > 120 or len(content) > 4000:
             raise ValueError("提醒标题或内容长度无效")
@@ -48,6 +63,8 @@ class Reminders:
             "fired_count": 0,
             "routing": FrozenRouting.bound(reply_origin or ReplyOrigin()).dump(),
         }
+        if commitment_id is not None:
+            self._bind(item, commitment_id, 1)
         self.store.put("reminder", item)
         self.changed.set()
         return item
@@ -56,9 +73,20 @@ class Reminders:
         item = self.store.get("reminder", identifier)
         if item is None:
             raise KeyError(identifier)
-        if set(changes) - {"title", "content", "due_at", "interval_seconds", "enabled"}:
+        if set(changes) - {
+            "title",
+            "content",
+            "due_at",
+            "interval_seconds",
+            "enabled",
+            "commitment_id",
+        }:
             raise ValueError("未知提醒字段")
-        candidate = {**item, **changes}
+        binding = followup_binding(item)
+        candidate = {
+            **item,
+            **{key: value for key, value in changes.items() if key != "commitment_id"},
+        }
         if not isinstance(candidate["enabled"], bool):
             raise ValueError("enabled 必须是布尔值")
         if (
@@ -77,9 +105,26 @@ class Reminders:
         interval = candidate["interval_seconds"]
         if interval is not None and (type(interval) is not int or not 60 <= interval <= 31_536_000):
             raise ValueError("重复间隔无效")
+        if "followup_revision" in item or changes.get("commitment_id") is not None:
+            revision = item.get("followup_revision", 0) + 1
+            validate_integer(revision, "followup_revision", minimum=1)
+            selected = (
+                changes.get("commitment_id")
+                if "commitment_id" in changes
+                else (binding["commitment_id"] if binding is not None else None)
+            )
+            candidate.pop("followup", None)
+            candidate["followup_revision"] = revision
+            if selected is not None:
+                self._bind(candidate, selected, revision)
         self.store.put("reminder", candidate)
         self.changed.set()
         return candidate
+
+    def _bind(self, item: dict[str, Any], identifier: str, revision: int) -> None:
+        task_status(self.store, identifier, self.max_output_chars())
+        item["followup_revision"] = revision
+        item["followup"] = {"version": 1, "commitment_id": identifier, "revision": revision}
 
     def delete(self, identifier: str) -> bool:
         deleted = self.store.delete("reminder", identifier)
@@ -106,23 +151,32 @@ class Reminders:
         current = self.store.get("reminder", item["id"])
         if not current or not current["enabled"] or current["due_at"] != item["due_at"]:
             return
+        binding = followup_binding(current)
+        # A task-bound reminder uses one current snapshot after the admission await.
+        selected = current if "followup_revision" in current else item
         notice = {
-            "id": f"reminder:{item['id']}:{item['due_at']}",
-            "title": item["title"],
-            "content": item["content"],
+            "id": f"reminder:{selected['id']}:{selected['due_at']}",
+            "title": selected["title"],
+            "content": selected["content"],
             "source": "reminder",
             "read": False,
             "created_at": timestamp,
             "reminder_id": item["id"],
             "routing": FrozenRouting.load(current.get("routing")).dump(),
         }
-        interval = item["interval_seconds"]
+        if binding is not None:
+            notice["followup"] = binding
+            notice["followup_occurrence"] = {
+                "number": current["fired_count"] + 1,
+                "due_at": selected["due_at"],
+            }
+        interval = selected["interval_seconds"]
         current["last_fired_at"] = timestamp
         current["fired_count"] += 1
         if interval:
             # Coalesce missed occurrences after downtime; never emit a catch-up storm.
-            missed = math.floor(max(0, timestamp - item["due_at"]) / interval) + 1
-            current["due_at"] = item["due_at"] + missed * interval
+            missed = math.floor(max(0, timestamp - selected["due_at"]) / interval) + 1
+            current["due_at"] = selected["due_at"] + missed * interval
         else:
             current["enabled"] = False
         with self.store.db:
