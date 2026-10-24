@@ -282,6 +282,20 @@ class SystemdProbe:
             merge_stderr=False,
         )
         if result.get("exit_code") != 0:
+            exit_code = result.get("exit_code")
+            if type(exit_code) is int and exit_code < 0:
+                raise ObservationError("systemd_observation_unavailable")
+            # Distinct owned raise locations retain only these bounded failure
+            # categories in the existing safe traceback, never manager stderr.
+            if (
+                type(exit_code) is int
+                and exit_code > 0
+                and arguments == ("call", _BUS, _MANAGER, _BUS + ".Manager", "GetUnit", "s", UNIT)
+                and result.get("truncated") is False
+                and type(result.get("stderr")) is str
+                and result["stderr"] == f"Call failed: Unit {UNIT} not loaded.\n"
+            ):
+                raise ObservationError("systemd_observation_unavailable")
             raise ObservationError("systemd_observation_unavailable")
         output = result.get("output")
         if not isinstance(output, str) or len(output.encode("utf-8")) > self.limits.command_bytes:

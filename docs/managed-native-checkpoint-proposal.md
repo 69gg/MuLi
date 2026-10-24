@@ -1168,3 +1168,76 @@ prefix/envelope/安全validator/timeline与重复键门不变。原同一次查�
 未发现剩余P1/P2；未重跑全应用源码strict，因为本片无应用源码改动。
 Native31的shape=false现场分叉仍未知，此修复不证明已取得首stop_base异常位置，
 也不改变真实事务与cleanup失败状态；新的精确远端结果另行补录。
+
+### Native33：仅区分已读GetUnit非零回包的受控raise位置
+
+Native32的精确CI `40076165153` 已取得首异常位置，managed-native作业
+`120819856934` 仍失败。根严格校验artifact `12552992110`，2032字节，SHA256
+`5215a0b9daafe8d384ab5b8278587098713aae184c25c75a7dd326ce71409748`。
+controller_failure为observed，generation `034ee2e861820077ccd665550391c04d`、revision3、
+intent stop_base；安全帧依次定位到 `_Controller._call`、`ManagedLinuxBackend.observe`、
+`_probe`、`ManagedSystemdProbe.read_managed`、`SystemdProbe._unit_path`、`_command`。
+最后一处是busctl GetUnit非零回包的原raise，并未进入systemctl stop调用。环境六项
+仍为true；事务后续recovery_required，cleanup仍保留三mount，未完成。此处不预写该CI
+其它作业终态，也不能倒推Native31究竟因哪一种JSON形状被拒。
+
+现 `run_process` 已返回exit_code/output/stderr/truncated；probe使用merge_stderr=False，
+stdout与stderr仍共用原单次OutputBudget，signal由子进程returncode负数表示，无需再读
+日志或增加外部调用。v255官方
+[Manager.GetUnit实现](https://github.com/systemd/systemd/blob/v255/src/core/dbus-manager.c#L449-L451)
+对未找到的名称设置BUS_ERROR_NO_SUCH_UNIT，文案为`Unit %s not loaded.`；
+[busctl call实现](https://github.com/systemd/systemd/blob/v255/src/busctl/busctl.c#L1901-L1903)
+在sd_bus_call失败时添加`Call failed: `。本片拟仅在原消费接缝，把固定GetUnit
+`muli.service`且完整stderr严格等于`Call failed: Unit muli.service not loaded.\n`的
+形状、严格负整数exit_code、其它非零三类放到不同受控raise行，仍抛相同
+ObservationError("systemd_observation_unavailable")。不做strip、子串、语言或ANSI
+猜测；其它目标、前后缀、多行、非字符串等均不能被认作该固定NoSuchUnit形状。
+这是受控CLI文本形状分类，不把stderr升级为认证过的D-Bus错误名。
+
+原安全帧可直接区分这三个源码位置，不新增Code、持久schema、日志字段或raw错误；
+controller仍作相同backend_failed与rollback，首次诊断、四可信身份、timeline、安全
+validator、原deadline、输出额度与原查询数均不变。未完成回包的异常继续原路径，
+不猜测exit_code。没有额外probe、重试或真实服务操作。
+
+现有正控已缩小窗口：同一helper每轮先用同一个observed probe/runner成功核自身
+GetUnit及进程身份；controller在draining轮必须成功read_managed且观察到drained，才
+写下一版activating/stop_base。现场revision3因此证明此前同一服务已被成功观察，
+不能解释为本轮从未加载过服务，或整个helper期间用户bus始终不可用；但仍未证明
+下一轮非零是NoSuchUnit、signal、认证错误或其它，也不证明特定环境变量或unit退出
+是根因。新目标只为下一现场作这一有限分叉，不据此修改环境或停止逻辑。
+
+先仅在 `tests/test_managed_controller_failure_diagnostic.py` 增加一个目标节点，复用
+真实Host/Journal/ManagedTransactionController，并将probe换为正式ManagedSystemdProbe；
+仅其进程runner返回上述三类正式回包，精确核同一个busctl GetUnit参数。每类都应只
+调用一次、未进入systemctl stop、保同一backend_failed/rollback/deadline与原安全
+payload且不导出stderr；最后要求原SystemdProbe._command安全帧有三个不同正行号，
+不硬编码未来源码行。当前三类都落同一raise，预期目标红在此行为缺口，非缺API或
+schema。生产未改；作者未运行检查、格式、Git、网络CLI或真实服务，待根取得实红后
+才实施，不授权新远端轮次。
+
+根补齐Native32终态：十个通用作业全绿，managed-native失败，不能把本片诊断采集
+成功称为正式事务或cleanup已修复。Native33上述目标已实收真实红：1 failed，
+pytest0.60秒、守卫1.134秒、63.6MiB、swap0；三个回包均已走真实controller/probe，
+原决策与trace前置全部通过，末尾三个位置仍同为原285行，准确缺少有限分类。
+
+授权后只改 `src/muli/platforms/linux_transaction.py` 原非零回包消费分支：严格int
+负值先走signal位置；只有严格正int、固定GetUnit参数、truncated严格False、stderr
+严格str且全等官方固定文案才走NoSuchUnit形状位置；其它全部保原位置。三个位置
+均抛同样的ObservationError和同一固定内容，不修改外部命令、环境、回滚或采集协议。
+固定目标使用原UNIT常量，未新增任意可配置unit或通用错误匹配设施。
+
+原目标不变；同一测试文件另补三组有限负控，分别核近似stderr（无换行、空白、ANSI、
+额外行、其它unit）、非固定调用（其它unit、LoadUnit、非call）、不完整/非正式回包
+（截断标记为True/缺失/0、bytes stderr、bool或字符串exit_code）。它们必须落回
+同一个other受控位置，不被晋级；比较安全frame的正行号而不硬编码未来行数，原
+异常类型及固定内容仍相同。作者未运行检查、格式、Git、网络或真实服务，生产、
+测试与本节静态读回后冻结，修后结果待根收取；尚无Native33现场结果或根因结论。
+
+根随后串行收取修后结果：完整诊断文件10 passed（pytest2.91秒、守卫3.463秒、
+66.1MiB）；原Linux transaction、managed probe、controller三个文件109 passed
+（pytest2.98秒、守卫3.564秒、67.8MiB）。本片合119个不同节点，不把此前Native32
+已通过但未重跑的886节点算入本片。146个应用源码的strict、no-incremental mypy通过
+（守卫8.466秒、414.2MiB）；两改动Python文件Ruff与格式检查通过，全部swap0。
+非作者独审未发现明确P1/P2，并确认本片只分类受控CLI文案形状，不认证D-Bus错误名。
+准备签名后交给隔离CI取得下一次真实分类；此前native事务与cleanup仍失败，未操作
+本机服务，也不预写新现场结果。
