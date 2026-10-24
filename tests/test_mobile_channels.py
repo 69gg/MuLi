@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, replace
@@ -25,7 +26,7 @@ from muli.channels.types import is_mobile_control_text
 from muli.local_services import LocalServices
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.runtime import Runtime
-from muli.task_control import ControlConflict
+from muli.task_control import ControlConflict, ControlResult
 
 
 def telegram_payload(text: str = "/任务") -> dict[str, Any]:
@@ -552,6 +553,74 @@ def composed_control_application(
     )
     services = attach_services(runtime, tmp_path)
     return runtime, services, ChannelApplication(runtime, services.attachments)
+
+
+async def test_legacy_control_commit_replay_never_retrofits_its_reply_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, services, application = composed_control_application(tmp_path)
+    item = await services.commitments.save(
+        "旧提交恢复", brief={"goal": "核查项目", "constraints": ["不可部署"]}
+    )
+    manager = application.manager
+
+    def incoming(text: str, identifier: int) -> IncomingMessage:
+        payload = onebot_payload(text)
+        payload["message_id"] = identifier
+        return manager.adapters["onebot"].webhook(payload)[0]
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    original = services.task_control.owner_control
+
+    def legacy_control(*args: Any, **kwargs: Any) -> ControlResult:
+        # Exercise the previous host contract with real domain writes, rather
+        # than constructing a historical receipt or ingress with SQL.
+        kwargs.pop("reply_origin", None)
+        return original(*args, **kwargs)
+
+    def lost_save(self: MobileTaskControl, inbound_id: str, receipt: dict[str, Any]) -> None:
+        captured.append((inbound_id, receipt))
+        raise RuntimeError("control receipt save interrupted")
+
+    try:
+        status = await manager.receive("onebot", incoming("/任务", 101))
+        status_key = next(
+            row["id"] for row in runtime.store.db.execute("SELECT id FROM channel_inbound")
+        )
+        assert status["mobile_task_control"]["tickets"][0]["commitment_id"] == item["id"]
+        pause = await manager.receive("onebot", incoming(f"/暂停 {status_key[:12]}-1", 102))
+        pause_key = next(
+            row["id"]
+            for row in runtime.store.db.execute("SELECT id,receipt FROM channel_inbound")
+            if json.loads(row["receipt"]) == pause
+        )
+        adjustment = incoming(f"/调整 {pause_key[:12]}-1 只交草稿", 103)
+        with monkeypatch.context() as patch:
+            patch.setattr(services.task_control, "owner_control", legacy_control)
+            patch.setattr(MobileTaskControl, "_save", lost_save)
+            with pytest.raises(RuntimeError, match="save interrupted"):
+                await manager.receive("onebot", adjustment)
+        assert len(captured) == 1
+        assert runtime.store.db.execute(
+            "SELECT receipt IS NULL FROM channel_inbound WHERE id=?", (captured[0][0],)
+        ).fetchone()[0]
+        before = runtime.conversation.pending(runtime.main_session()["id"])
+        assert len(before) == 1 and before[0]["route"] is None
+        assert "reply_origin" not in before[0]
+        receipts_before = runtime.store.list("task_control_receipt")
+        task_before = services.commitments.get(item["id"])
+        # Replaying a committed command must also work after the model is
+        # disabled, without launching a fresh request to manufacture evidence.
+        runtime.config.update({"models": {"main": {"model": ""}}})
+        recovered = await manager.receive("onebot", adjustment)
+        assert recovered == captured[0][1]
+        assert runtime.conversation.pending(runtime.main_session()["id"]) == before
+        assert runtime.store.list("task_control_receipt") == receipts_before
+        assert services.commitments.get(item["id"]) == task_before
+        assert not runtime.tasks
+    finally:
+        await application.close()
+        await runtime.close()
 
 
 @pytest.mark.parametrize("case", ["bad-json", "non-object", "oversized", "invalid-utf8"])

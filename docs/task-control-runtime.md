@@ -12,6 +12,10 @@
 
 纯 pause 只登记事实，清除旧重规划意图，不增加 main 输入或自动调用模型；无模型配置也可暂停。`request_replan` 明确登记主人重新规划的意图，允许追加完整要求；原始要求不被计划覆盖。启动、确认、输入容量释放和实际完成事件驱动通知投递，没有定时模型轮询。每页受 `limits.max_pending_runs` 限制，越过满邮箱继续扫描；重入事件会请求后续一轮处理，不丢失唯一容量释放唤醒。
 
+手机重规划后续回复候选在最终准入后的私有提交闭包中，将可信 `MobileControlSource` 转为 `ReplyOrigin`，与 owner 控制事实及 main ingress 同事务保存。公开 `OwnerControlRequest` 和 Web 请求不能指定该来源；既有指纹不变，重复领域回执原样返回，不补改旧 ingress。输入仍为 `source=task-control, principal=owner, route=null`，显式回复来源只用于外发归属，不增加权限。
+
+主会话同一运行的工具批次后和无工具续轮都使用实际 claim 的有限输入列表选择来源。严格匹配 `source=team:<id>, principal=agent:<id>` 的队内报告只补充当前请求证据；若没有其它新输入，沿用前一 `PreparedRequest` 的来源与主动通知选路。新主人输入、提醒等其它真实输入按其持久来源更新。首次准备、新运行及队友自身请求仍沿原规则；报告 metadata 和独立 Attention 路由不变，不查询全历史最近主人，也不保存永久目的地偏好。本片只把重规划说明回本次手机，后续队友完成通知仍需单独的持久关联。十五文件431项相关整合、全147源码类型检查和独立后审已闭合，精确远端与发行待验，见[2.46审查](review-v2.46.md)。
+
 ## 同一请求中的完整快照
 
 `PreparedRequest` 分开保存 `execution_scope` 与 `selected_replan`。执行队友和 workflow 节点从真实持久父链继承 scope；主会话仍可协调不同任务，选择待规划任务不会把它绑定成该任务的 worker。

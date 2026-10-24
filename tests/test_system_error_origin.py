@@ -155,7 +155,7 @@ async def test_new_claim_and_preparation_cannot_reuse_previous_request_source(
     claims, preparations = 0, 0
     original_claim, original_origin = runtime._claim_inputs, runtime._reply_origin
 
-    async def claim(session_id: str, run_id: str) -> bool:
+    async def claim(session_id: str, run_id: str) -> list[dict[str, Any]]:
         nonlocal claims
         claims += 1
         result = await original_claim(session_id, run_id)

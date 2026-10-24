@@ -18,6 +18,7 @@ from muli.commitments import Commitments
 from muli.context import ContextLimitError
 from muli.conversation import MAX_EVENT_ID_CHARS, Conversation
 from muli.providers import Message
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 
 JsonObject = dict[str, Any]
@@ -497,6 +498,7 @@ class TaskControl:
         max_pending: int,
         active_workflow_ids: Sequence[str] = (),
         expected_approved_epoch: int | None = None,
+        reply_origin: ReplyOrigin | None = None,
     ) -> ControlResult:
         """Only the authenticated owner endpoint may call this method."""
         if expected_approved_epoch is not None and (
@@ -507,7 +509,8 @@ class TaskControl:
         self._main(main_session_id)
         key = self._receipt_id(identifier, "owner", request.request_id)
         fields = {"commitment_id": identifier, **asdict(request)}
-        # Keep historical Web fingerprints byte-for-byte unchanged.
+        # Keep historical fingerprints unchanged. The authenticated mobile event
+        # already binds its source; duplicate receipts never retrofit that source.
         if expected_approved_epoch is not None:
             fields["expected_approved_epoch"] = expected_approved_epoch
         fingerprint = _digest(fields)
@@ -573,6 +576,7 @@ class TaskControl:
                     principal="owner",
                     mode=mode,
                     event_id=key,
+                    reply_origin=reply_origin,
                 )
                 payload["task_control"] = {
                     "commitment_id": identifier,

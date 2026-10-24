@@ -14,6 +14,7 @@ from test_runtime import FakeClient, make_runtime
 
 from muli.channels import ChannelError, ChannelsConfig
 from muli.conversation import Conversation
+from muli.proactive import FrozenRouting
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.reply_origin import ReplyOrigin
 from muli.runtime import PreparedRequest, Runtime
@@ -245,6 +246,72 @@ async def test_two_queued_origins_get_separate_streamed_replies(tmp_path: Path) 
         ]
         assert deltas == ["A答复", "B答复"]
     finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("first_turn", ["answer", "tool"])
+async def test_new_owner_replaces_attention_source_at_both_continuation_boundaries(
+    tmp_path: Path, first_turn: str
+) -> None:
+    runtime, seen = make_runtime(tmp_path, [])
+    runtime.config.update(
+        {"limits": {"max_context_chars": 16000, "max_output_chars": 6000, "max_pending_runs": 3}}
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    routing = FrozenRouting.bound(origin("reminder-owner"))
+
+    class Client(FakeClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            self.seen.append(list(messages))
+            if len(self.seen) == 1:
+                entered.set()
+                await release.wait()
+                turn = (
+                    ModelTurn(content="提醒资料已核对")
+                    if first_turn == "answer"
+                    else ModelTurn(tool_calls=[ToolCall("read-fact", "probe", "{}")])
+                )
+            else:
+                assert len(self.seen) == 2 and messages[-1].content == "新的主人要求"
+                turn = ModelTurn(content="按新要求回复")
+            yield StreamEvent("done", turn=turn)
+
+    async def probe(args: dict[str, Any]) -> dict[str, bool]:
+        pytest.fail("New pending owner input must defer the unstarted tool")
+
+    runtime.tools["probe"] = Tool("probe", "核查提醒资料", parameters({}), probe)
+    runtime.client_factory = lambda _: Client([], seen)  # type: ignore[assignment,return-value]
+    try:
+        notice = await runtime.submit_attention(
+            "真实系统提醒", "reminder-trigger", objects=[], routing=routing
+        )
+        assert notice is not None
+        await asyncio.wait_for(entered.wait(), 2)
+        run_id = runtime.run_ids[runtime.main_session()["id"]]
+        owner = await runtime.submit("新的主人要求", source="channel:onebot:bot", route=route("8"))
+        release.set()
+        assert await asyncio.wait_for(runtime.wait(run_id), 3) == "按新要求回复"
+        messages = runtime.store.messages(owner["session_id"])
+        system_input = next(
+            message for message in messages if message.get("principal") == "system:attention"
+        )
+        assert system_input["attention_routing"] == routing.dump()
+        replies = [message for message in messages if message["role"] == "assistant"]
+        assert replies[0]["attention_routing"] == routing.dump()
+        assert replies[0]["delivery_routes"] == ([route()] if first_turn == "answer" else [])
+        assert replies[-1]["reply_origin"]["input_id"] == owner["message"]["id"]
+        assert replies[-1]["delivery_routes"] == [route("8")]
+        assert "attention_routing" not in replies[-1]
+        if first_turn == "tool":
+            result = next(
+                message for message in messages if message.get("tool_call_id") == "read-fact"
+            )
+            assert json.loads(result["content"])["status"] == "not_executed"
+        assert len(seen) == 2 and len(messages) <= 32
+    finally:
+        release.set()
         await runtime.close()
 
 

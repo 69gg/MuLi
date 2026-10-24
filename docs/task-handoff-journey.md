@@ -12,4 +12,8 @@
 
 此用例没有替换 Runtime.submit、Team.send、任务核查处理器或报告持久化。它覆盖实际宿主接纳与工具选择后的行为；外部平台是否收到超时前的请求仍未知，生产故障恢复和自然模型决策质量不在此离线结果中。
 
-手机分支复用 create_app 创建的当前 Manager 和 adapter，只把平台 HTTP 换为 MockTransport，保留真实最终准入闭包。三条控制确认回手机，原未知外发仍只尝试一次；重规划主输入直接核对 route=null 与原任务控制引用，最后新 Web 明确派工及草稿报告仍回 Web。现三个参数均通过受限检查，新增参数覆盖真实压缩、完整lifespan/SQLite正常关闭、新Runtime重组和手机重投，再由新队友沿实际收到的fresh定位读取原证据。仅删除定位行的负控制必须被拒绝。该重开在同一pytest进程，不等于OS新进程或真实系统服务恢复；手机能力尚未发行，真实模型和平台送达未验，详见[手机候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)及[新组合证据](compaction-reopen-handoff-proposal.md)。
+手机分支复用 create_app 创建的当前 Manager 和 adapter，只把平台 HTTP 换为 MockTransport，保留真实最终准入闭包。三条控制确认回手机，原未知外发仍只尝试一次；重规划主输入直接核对 route=null 与原任务控制引用，最后新 Web 明确派工及草稿报告仍回 Web。现三个参数均通过受限检查，新增参数覆盖真实压缩、完整lifespan/SQLite正常关闭、新Runtime重组和手机重投，再由新队友沿实际收到的fresh定位读取原证据。仅删除定位行的负控制必须被拒绝。该重开在同一pytest进程，不等于OS新进程或真实系统服务恢复；显式手机控制已随[2.45发布](review-v2.45.md#发版闭合)，真实模型和平台送达未验，详见[原候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)及[新组合证据](compaction-reopen-handoff-proposal.md)。
+
+上述保留原接办切片的验收范围。新增 `tests/test_mobile_task_control_followup.py` 单独要求主助手对手机 `/调整` 的重规划说明回本次私聊：网页真实登记并派原队友，手机暂停使旧调用停靠，保留旧 Web 来源的真实暂停报告，提交调整后正常关闭并重开原 Store，再经真实 `commitment_read`、下一轮 `task_approve_plan` 和一次原队友计划交付生成说明。四个参数覆盖先前 Web/另一私聊、发送前撤销及一次 unknown 后重开不重发；Web 同时可见。原实现四项均已实际到达最终手机 outbox 缺失断言，修复后四项通过。此处显式回复来源不改变 route=null 的任务控制身份，也不改队友报告原来源；后续队友最终完成通知的持久订阅不属于本片。
+
+后续片首轮四条新旅程及三项兼容/来源回归均已通过。十五文件首轮整合取得 429 passed、2 failed；两项是本页既有 OneBot 夹具把新增自动重规划说明计入控制确认，实际 outbox 已包含原 unknown、三条 sent 控制确认和一条 sent 自动说明。夹具现按真实 outbox 的 `automatic` 标记分类，精确核对三条控制回执及唯一自动说明的目的地、原始手机事件来源 ID、主消息对应的 outbox ID 和一次发送；普通阶段总数为 5，重开后额外旧码拒绝回执使总数为 6。成功后的 attempts 按 Manager 真实合同清零为0，一次发送由 HTTP recorder 证明；此前误预期1的两项夹具失败保留。原最终 Web 明确派工、Web 草稿报告与 unknown 一次且不重放的断言保持。此次只改夹具，三参数最终3 passed，十五文件最终431 passed，没有扩大超时或放宽计数。独立后审无剩余P1/P2，精确远端与发行待验，见[2.46审查](review-v2.46.md)。

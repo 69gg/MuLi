@@ -70,6 +70,27 @@ class MobileControlSource:
     owner_id: str
     target: str
 
+    def reply_origin(self, inbound_id: str) -> ReplyOrigin:
+        """Freeze only the complete private source proved by the host's admission."""
+        if self.name not in _CHANNELS or self.account_id == "bot":
+            raise MobileControlRejected("source_rejected", "手机控制缺少支持的可靠账户身份")
+        origin = ReplyOrigin.load(
+            {
+                "kind": "channel",
+                "input_id": inbound_id,
+                "route": {
+                    "name": self.name,
+                    "account_id": self.account_id,
+                    "sender_id": self.owner_id,
+                    "target": self.target,
+                    "kind": "private",
+                },
+            }
+        )
+        if not origin.delivery_routes() or self.owner_id != self.target:
+            raise MobileControlRejected("source_rejected", "手机控制需要完整的主人私聊来源")
+        return origin
+
 
 @dataclass(frozen=True, slots=True)
 class MobileControlOutcome:
@@ -97,7 +118,7 @@ class MobileTaskControl:
         """Persist a fixed receipt before the Runtime performs its first await."""
         if not _HEX_KEY.fullmatch(inbound_id) or not isinstance(text, str):
             raise ValueError("手机控制入站标识或文本无效")
-        self._validate_source(inbound_id, source)
+        source.reply_origin(inbound_id)
         rows = self._records("channel_inbound.id=?", (inbound_id,))
         if (
             len(rows) != 1
@@ -138,26 +159,6 @@ class MobileTaskControl:
         return MobileControlOutcome(
             receipt, receipt["mobile_task_control"]["control_receipt_id"] is not None
         )
-
-    @staticmethod
-    def _validate_source(inbound_id: str, source: MobileControlSource) -> None:
-        if source.name not in _CHANNELS or source.account_id == "bot":
-            raise MobileControlRejected("source_rejected", "手机控制缺少支持的可靠账户身份")
-        origin = ReplyOrigin.load(
-            {
-                "kind": "channel",
-                "input_id": inbound_id,
-                "route": {
-                    "name": source.name,
-                    "account_id": source.account_id,
-                    "sender_id": source.owner_id,
-                    "target": source.target,
-                    "kind": "private",
-                },
-            }
-        )
-        if not origin.delivery_routes() or source.owner_id != source.target:
-            raise MobileControlRejected("source_rejected", "手机控制需要完整的主人私聊来源")
 
     def _records(self, clause: str, values: tuple[str, ...]) -> list[dict[str, Any]]:
         # Both callers supply fixed SQL and indexed equality/range parameters.

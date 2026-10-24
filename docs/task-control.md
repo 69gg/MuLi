@@ -8,7 +8,9 @@
 
 开发中的手机入口复用同一领域层，使用 `owner_control` 的可选 `expected_approved_epoch` 核对状态回执中的双版本；只有传入该参数时才把它纳入请求指纹。既有控制回执查重先于两项版本比较，重投成功操作不会因当前版本已前进而再变更任务。原 Web 请求和指纹保持原样。
 
-`Runtime.submit_mobile_task_control` 在配置锁内执行必需的同步最终准入，并保存宿主不可变回执；控制确认回手机，调整产生的主输入仍是受保护的 task_control 引用且 route=null。纯暂停不增加新模型输入，已有待办仍沿原唤醒规则运行。主助手随后仍须读取完整要求、下一轮确认计划并显式派工，未知外发不重试。候选已完成本地定向整合与独立后审，尚未发行或验收真实账号；平台条件与使用方式见[渠道](channels.md#手机上的显式任务控制)，完整证据见[候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)。
+`Runtime.submit_mobile_task_control` 在配置锁内执行必需的同步最终准入，并保存宿主不可变回执；控制确认回手机，调整产生的主输入仍是受保护的 task_control 引用且 route=null。纯暂停不增加新模型输入，已有待办仍沿原唤醒规则运行。主助手随后仍须读取完整要求、下一轮确认计划并显式派工，未知外发不重试。原手机控制切片的本地定向整合与独立后审证据见[候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)，发行状态以[2.45闭合](review-v2.45.md#发版闭合)为准；真实账号仍未验收，平台条件见[渠道](channels.md#手机上的显式任务控制)。
+
+手机重规划后续回复候选为宿主 `owner_control` 增加可选 `reply_origin`，只随首次重规划 ingress 在原控制事务中写入；它独立于 route 和权限，不进入公开 `OwnerControlRequest` 或旧请求指纹。重复领域回执在所有写入之前返回，不补写旧的来源或改派历史入站。可信来源只由 Runtime 的手机最终准入闭包提供。十五文件431项相关整合与全147源码类型检查通过，范围仅为主助手重规划说明，精确远端与发行待验，详见[2.46审查](review-v2.46.md)。
 
 ## 持久状态与范围
 
@@ -37,7 +39,7 @@ scope 包含同一 commitment 的所有根队友和后代。`resolve_scope(sessi
 
 | 方法 | 合同 |
 | --- | --- |
-| `owner_control(id, OwnerControlRequest, *, main_session_id, mode, model_configured, max_pending, active_workflow_ids=())` | pause/request_replan 短事务；返回 ControlResult；不通知或调用模型 |
+| `owner_control(id, OwnerControlRequest, *, main_session_id, mode, model_configured, max_pending, active_workflow_ids=(), expected_approved_epoch=None, reply_origin=None)` | pause/request_replan 短事务；可选来源仅供已认证宿主；返回 ControlResult；不通知或调用模型 |
 | `current(id, *, active_workflow_ids=())` | `{id, revision, control, scope}` 紧凑投影；control 不含 plan 正文，正文保存在 canonical commitment |
 | `execution_snapshot(session_id)` | 返回真实执行范围的不可变 TaskSnapshot；无绑定的持续 main 返回 None |
 | `replan_snapshot(main_session_id, id)` | 只为实际持续 main 和有效 owner 重规划意图提供选中快照 |

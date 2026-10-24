@@ -7,7 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -394,7 +394,13 @@ class Runtime:
     async def _next_context(self, session_id: str) -> list[Message]:
         return (await self._prepare_request(session_id)).messages
 
-    async def _prepare_request(self, session_id: str) -> PreparedRequest:
+    async def _prepare_request(
+        self,
+        session_id: str,
+        *,
+        previous: PreparedRequest | None = None,
+        claimed_inputs: Sequence[dict[str, Any]] = (),
+    ) -> PreparedRequest:
         self.system_events.clear_request(session_id)
         execution: TaskSnapshot | None = None
         selected: TaskSnapshot | None = None
@@ -406,13 +412,42 @@ class Runtime:
                     selected = self.task_control.replan_snapshot(session_id, identifier)
                 except ControlConflict:
                     self._selected_replans.pop(session_id, None)
+        reply_origin = self._reply_origin(session_id)
+        attention_routing = self._attention_routing(session_id)
+        if (
+            previous is not None
+            and (self.store.get("session", session_id) or {}).get("kind") == "main"
+        ):
+            trigger: dict[str, Any] | None = None
+            for message in claimed_inputs:
+                source = message.get("source")
+                if (
+                    isinstance(source, str)
+                    and source.startswith("team:")
+                    and source[5:]
+                    and message.get("principal") == "agent:" + source[5:]
+                ):
+                    continue
+                trigger = message
+            if trigger is None:
+                # A report is evidence for this running request, not a new owner
+                # request. A later run triggered by that report keeps its origin.
+                reply_origin, attention_routing = previous.reply_origin, previous.attention_routing
+            else:
+                reply_origin = ReplyOrigin.from_input(trigger)
+                attention_routing = (
+                    FrozenRouting.load(trigger["attention_routing"])
+                    if trigger.get("principal") == "system:attention"
+                    and trigger.get("attention_routing") is not None
+                    else None
+                )
         prepared = PreparedRequest(
             session_id,
             [],
             execution,
             selected,
-            self._reply_origin(session_id),
-            self._attention_routing(session_id),
+            reply_origin,
+            attention_routing,
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -459,6 +494,8 @@ class Runtime:
         identifier: str,
         request: OwnerControlRequest,
         expected_approved_epoch: int | None = None,
+        *,
+        reply_origin: ReplyOrigin | None = None,
     ) -> ControlResult:
         """The caller owns configuration_lock; commit without yielding to close/configuration."""
         if self._closing or self.task_control is None:
@@ -473,6 +510,7 @@ class Runtime:
             max_pending=self.config.settings.limits.max_pending_runs,
             active_workflow_ids=self.workflows.active_run_ids,
             expected_approved_epoch=expected_approved_epoch,
+            reply_origin=reply_origin,
         )
         if result.created and self._selected_replans.get(session["id"]) == identifier:
             # A duplicate old receipt must not clear a newer selection.
@@ -493,11 +531,22 @@ class Runtime:
             if self._closing or self.task_control is None:
                 raise ValueError("任务控制服务不可用")
             admission_guard()
+
+            def submit_control(
+                identifier: str, request: OwnerControlRequest, approved_epoch: int
+            ) -> ControlResult:
+                return self._submit_task_control_locked(
+                    identifier,
+                    request,
+                    approved_epoch,
+                    reply_origin=source.reply_origin(inbound_id),
+                )
+
             outcome = MobileTaskControl(self.task_control).handle(
                 inbound_id,
                 source,
                 text,
-                submit_control=self._submit_task_control_locked,
+                submit_control=submit_control,
             )
         if outcome.control_committed:
             # A persisted mobile receipt may precede an interrupted notification.
@@ -734,7 +783,7 @@ class Runtime:
             await self.bus.emit("attention.queued", {"message": receipt}, session["id"])
         return receipt
 
-    async def _claim_inputs(self, session_id: str, run_id: str) -> bool:
+    async def _claim_inputs(self, session_id: str, run_id: str) -> list[dict[str, Any]]:
         messages = self.store.claim_inputs(
             session_id,
             run_id,
@@ -744,7 +793,7 @@ class Runtime:
             await self.bus.emit("message.completed", {"message": message}, session_id)
         await self.flush_task_plan_deliveries()
         await self.team.flush_reports(session_id)
-        return bool(messages)
+        return messages
 
     def _configure_workflows(self) -> None:
         from muli.workflows import WorkflowEngine
@@ -1676,13 +1725,15 @@ class Runtime:
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
-                    claimed = False
+                    claimed: list[dict[str, Any]] = []
                     if round_index < self.config.settings.limits.max_tool_steps:
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
                     self._guard_request(prepared)
                     if claimed:
-                        prepared = await self._prepare_request(session_id)
+                        prepared = await self._prepare_request(
+                            session_id, previous=prepared, claimed_inputs=claimed
+                        )
                         continue
                     self.compaction.observe(session_id)
                     return turn.content
@@ -1757,10 +1808,13 @@ class Runtime:
                 if paused is not None:
                     raise paused
                 self._guard_request(prepared)
+                claimed = []
                 if round_index < self.config.settings.limits.max_tool_steps:
                     self.system_events.clear_request(session_id)
-                    await self._claim_inputs(session_id, run_id)
-                prepared = await self._prepare_request(session_id)
+                    claimed = await self._claim_inputs(session_id, run_id)
+                prepared = await self._prepare_request(
+                    session_id, previous=prepared, claimed_inputs=claimed
+                )
             raise ValueError("模型调用达到步骤上限")
 
     def _round_tools(
