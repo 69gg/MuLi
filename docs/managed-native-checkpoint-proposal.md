@@ -1915,3 +1915,25 @@ CPU23.343秒、185.8MiB、swap0、exit0），包含上述节点，不再累加�
 最终两脚本及测试的Ruff通过，三个文件格式检查通过；提交和dispatch尚未完成。
 真实第二代partial采样与完整三事务仍待新的精确候选CI验证，
 不将本地绿倒写为现场超时已修复。
+
+### Native44真实结果：第一代partial已取得，第二代尚未安装
+
+准确签名候选 `fdb0b95da2ae2e3501c8ad65e0dc3b43e0062e39` 的
+[CI 40102230148](https://github.com/69gg/MuLi/actions/runs/40102230148) 已终态：
+十个通用作业通过，唯一managed-native作业 `120896568215` 失败。
+根已严格核验artifact `12563236559`：
+ZIP1944字节，SHA-256 `7e87ebf77454740cb555d856327beedf1d60450f5affc77efee96501c3bc1c6e`，
+精确两成员与typed receipt/result有效。本轮cleanup为verified、mounts为空，user_removed
+及group_removed均true；上段候选待验证状态保留为当时记录。
+
+第一代 `18ec5be744937a3c185c11747a9cc7de` 的准确helper为PID3038/UID999/invocation
+`352ec2647ee64cf6acbeedd5cdb43334`，完整成本checks135次/17156毫秒、bus274次/4501毫秒、
+HTTP12次/1400毫秒。实际取得的install_returned partial属于这一第一代，revision4：
+checks73次/9105毫秒、bus139次/2495毫秒、HTTP4次/434毫秒；不称已取得第二代采样。
+第一代于42228毫秒released、43483毫秒projection。
+
+第二代 `cf0176289845078c7d36c63092be063d` 的准确helper为PID3438/invocation
+`4620e84d226945a789570c0719f42d8a`，于46284毫秒prepared、52336毫秒draining、57135毫秒
+stop_base，60001毫秒以TimeoutError/stage=helper_exit结束，尚未到install。因此只有第一代
+partial，第二代当前成本仍identity_changed不可用。完整三事务未通过，不能把第一代
+采样或清理成功当作超时修复，也不按跨runner墙钟差计算优化收益。
