@@ -21,7 +21,12 @@ from pydantic import TypeAdapter
 from muli.compatibility import assess_compatibility
 from muli.config import ConfigFile
 from muli.format_evidence import FormatEvidence, read_format_evidence
-from muli.managed_transaction import TransactionRecordV2, parse_record_v2, raw_snapshot
+from muli.managed_transaction import (
+    ProjectControllerTransferRecord,
+    TransactionRecordV2,
+    parse_managed_record,
+    raw_snapshot,
+)
 from muli.management_projection import read_projection_connection
 from muli.management_transaction import (
     FixedLock,
@@ -57,6 +62,24 @@ _MUTABLE_RECORD_FIELDS = {
     "code",
     "failure_code",
 }
+
+
+def _transfer_identity_matches(
+    original: TransactionRecordV2 | ProjectControllerTransferRecord,
+    current: TransactionRecordV2 | ProjectControllerTransferRecord,
+) -> bool:
+    """Bind the live Transfer, while leaving later ordinary generations alone."""
+    if not isinstance(current, ProjectControllerTransferRecord) and not (
+        isinstance(original, ProjectControllerTransferRecord)
+        and original.generation == current.generation
+    ):
+        return True
+    return (
+        isinstance(original, ProjectControllerTransferRecord)
+        and isinstance(current, ProjectControllerTransferRecord)
+        and original.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
+        == current.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
+    )
 
 
 class ManagedBootError(ValueError):
@@ -122,7 +145,7 @@ class _DatabaseAnchor:
 
 @dataclass(frozen=True, slots=True)
 class _Observation:
-    record: TransactionRecordV2 = field(repr=False)
+    record: TransactionRecordV2 | ProjectControllerTransferRecord = field(repr=False)
     role: Role
     anchor: DeploymentAnchor = field(repr=False)
     slot: SlotIdentity = field(repr=False)
@@ -144,7 +167,7 @@ class ManagedBootPermit:
         self._opened = self._closed = self._cleanup_failed = False
         self._unclosed: Store | sqlite3.Connection | None = None
         self._configuration_bytes: bytes | None = None
-        self.record: TransactionRecordV2
+        self.record: TransactionRecordV2 | ProjectControllerTransferRecord
         self.anchor: DeploymentAnchor
         self.role: Role
         self.config: ConfigFile
@@ -198,7 +221,7 @@ class ManagedBootPermit:
         ):
             raise ManagedBootError("managed_writer_lease_required")
 
-    def _record(self) -> tuple[TransactionRecordV2, Role]:
+    def _record(self) -> tuple[TransactionRecordV2 | ProjectControllerTransferRecord, Role]:
         self._check_lease()
         raw = self.journal.directory.read("state.json", self.journal.limits.max_record_bytes)
         # A preceding controller may have died after rename but before fsync.
@@ -206,7 +229,11 @@ class ManagedBootPermit:
         os.fsync(self.journal.directory.fd)
         if self.journal.directory.read("state.json", self.journal.limits.max_record_bytes) != raw:
             raise ManagedBootError("managed_record_changed")
-        record = parse_record_v2(raw, limits=self.journal.limits)
+        record = parse_managed_record(raw, limits=self.journal.limits)
+        if isinstance(record, ProjectControllerTransferRecord) and (
+            not record.resolved or self.boot == record.identity.origin_boot
+        ):
+            raise ManagedBootError("managed_boot_not_permitted")
         role: Role | None = (
             ("target" if record.phase == "committed" else "base")
             if record.resolved
@@ -389,6 +416,12 @@ class ManagedBootPermit:
         self._opened = True
         try:
             observation = self._observe()
+            if isinstance(self.record, ProjectControllerTransferRecord) and (
+                not isinstance(observation.record, ProjectControllerTransferRecord)
+                or observation.record.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
+                != self.record.model_dump(exclude=_MUTABLE_RECORD_FIELDS)
+            ):
+                raise ManagedBootError("managed_record_changed")
             if observation.configuration != self._configuration_bytes:
                 raise ManagedBootError("managed_configuration_changed")
             self.check_paths(Path(observation.anchor.config_path), self.journal.database)

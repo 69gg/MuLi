@@ -161,7 +161,7 @@ def _check_lease(permit: BootPermit | ManagedBootPermit) -> None:
 def _check_identity(
     permit: BootPermit | ManagedBootPermit,
     identity: _StoreIdentity,
-    record: TransactionRecord | TransactionRecordV2,
+    record: TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord,
 ) -> None:
     if identity.path != permit.journal.database or (identity.instance, identity.main) != (
         record.identity.store_instance,
@@ -174,7 +174,10 @@ def project_final(
     permit: BootPermit | ManagedBootPermit | None,
     store: Store,
     *,
-    verify_binding: Callable[[TransactionRecordV2, Role | None], None] | None = None,
+    verify_binding: Callable[
+        [TransactionRecordV2 | ProjectControllerTransferRecord, Role | None], None
+    ]
+    | None = None,
 ) -> ProjectionReceipt | None:
     """Atomically project one stable resolved record; repeated exact calls are reads."""
     if permit is None:
@@ -187,7 +190,10 @@ def project_final(
     if record is None:
         return None
     if isinstance(record, ProjectControllerTransferRecord):
-        raise ProjectionError("project_controller_transfer_unsupported")
+        if not record.resolved or isinstance(permit, BootPermit):
+            raise ProjectionError("project_controller_transfer_unsupported")
+        if permit.boot == record.identity.origin_boot:
+            raise ProjectionError("projection_installation_changed")
     _check_identity(permit, identity, record)
     if not record.resolved:
         return None
@@ -203,7 +209,7 @@ def project_final(
         return receipt
     if previous is not None and previous.generation == receipt.generation:
         raise ProjectionError("projection_revision_conflict")
-    if isinstance(record, TransactionRecordV2):
+    if isinstance(record, (TransactionRecordV2, ProjectControllerTransferRecord)):
         if verify_binding is None:
             raise ProjectionError("projection_binding_required")
         role: Role | None = (

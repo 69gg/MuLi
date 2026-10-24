@@ -9,8 +9,12 @@ from typing import TYPE_CHECKING
 
 from muli.compatibility import assess_compatibility
 from muli.format_evidence import read_format_evidence
-from muli.managed_boot import ManagedBootPermit
-from muli.managed_transaction import TransactionRecordV2, raw_snapshot
+from muli.managed_boot import ManagedBootPermit, _transfer_identity_matches
+from muli.managed_transaction import (
+    ProjectControllerTransferRecord,
+    TransactionRecordV2,
+    raw_snapshot,
+)
 from muli.management_projection import _check_lease, _connection_identity
 from muli.management_transaction import Role, _snapshot
 from muli.platforms.filesystem_identity import verify_local_filesystems
@@ -38,7 +42,10 @@ class RuntimeBindingError(ValueError):
         super().__init__(code)
 
 
-def _current_record(permit: BootPermit | ManagedBootPermit, record: TransactionRecordV2) -> None:
+def _current_record(
+    permit: BootPermit | ManagedBootPermit,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
+) -> None:
     permit.journal.directory.check()
     _check_lease(permit)
     if permit.journal.read_current() != record:
@@ -51,8 +58,17 @@ def _current_record(permit: BootPermit | ManagedBootPermit, record: TransactionR
 
 
 def _selected_role(
-    permit: BootPermit | ManagedBootPermit, record: TransactionRecordV2, role: Role | None
+    permit: BootPermit | ManagedBootPermit,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
+    role: Role | None,
 ) -> Role:
+    if isinstance(record, ProjectControllerTransferRecord) and (
+        not record.resolved
+        or role is None
+        or permit.boot == record.identity.origin_boot
+        or not isinstance(permit, ManagedBootPermit)
+    ):
+        raise RuntimeBindingError("runtime_binding_role_changed")
     if role is None:
         if permit.boot != record.identity.origin_boot or (
             record.phase not in {"prepared", "draining", "aborted"}
@@ -73,7 +89,7 @@ def _selected_role(
 
 def _files(
     permit: BootPermit | ManagedBootPermit,
-    record: TransactionRecordV2,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
     role: Role,
     anchor: DeploymentAnchor,
 ) -> None:
@@ -133,7 +149,7 @@ def _legacy_installation(
 def verify_running_binding(
     permit: BootPermit | ManagedBootPermit,
     store: Store,
-    record: TransactionRecordV2,
+    record: TransactionRecordV2 | ProjectControllerTransferRecord,
     role: Role | None,
 ) -> None:
     """Recheck a nonce-authenticated host; origin uses the frozen base binding.
@@ -177,8 +193,10 @@ def verify_running_binding(
                 )
             ):
                 raise RuntimeBindingError("runtime_binding_installation_changed")
+            if not _transfer_identity_matches(permit.record, record):
+                raise RuntimeBindingError("runtime_binding_record_changed")
         else:
-            if binding.entry != "legacy":
+            if isinstance(record, ProjectControllerTransferRecord) or binding.entry != "legacy":
                 raise RuntimeBindingError("runtime_binding_legacy_required")
             _legacy_installation(permit, record, anchor, slot)
         verify_local_filesystems(

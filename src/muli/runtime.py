@@ -27,8 +27,8 @@ from muli.extensions import Extensions
 from muli.failure_diagnostics import capture_failure
 from muli.history_evidence import HistoryEvidence
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
-from muli.managed_boot import ManagedBootPermit
-from muli.managed_transaction import TransactionRecordV2
+from muli.managed_boot import ManagedBootPermit, _transfer_identity_matches
+from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
 from muli.management_transaction import Role
 from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
@@ -123,22 +123,29 @@ class Runtime:
                 from muli.management_projection import read_projection
                 from muli.management_transaction import ProjectionReceipt
 
-                def verify(record: TransactionRecordV2, role: Role | None) -> None:
+                def verify(
+                    record: TransactionRecordV2 | ProjectControllerTransferRecord, role: Role | None
+                ) -> None:
                     current = self.maintenance.permit
                     if current is None:
                         raise MaintenanceError("managed_evidence_unavailable")
                     verify_running_binding(current, self.store, record, role)
 
-                self.maintenance.bind_managed_verifier(verify)
-                self.maintenance.bind_projection_checker(
-                    lambda record: (
-                        read_projection(self.store)
-                        == ProjectionReceipt(
-                            **record.position.model_dump(),
-                            store_instance=record.identity.store_instance,
-                        )
+                def projected(
+                    record: TransactionRecordV2 | ProjectControllerTransferRecord,
+                ) -> bool:
+                    current = self.maintenance.permit
+                    if isinstance(current, ManagedBootPermit) and not _transfer_identity_matches(
+                        current.record, record
+                    ):
+                        return False
+                    return read_projection(self.store) == ProjectionReceipt(
+                        **record.position.model_dump(),
+                        store_instance=record.identity.store_instance,
                     )
-                )
+
+                self.maintenance.bind_managed_verifier(verify)
+                self.maintenance.bind_projection_checker(projected)
             self._initialize()
         except BaseException:
             # Constructors have no async producers yet. Never hand back a boot

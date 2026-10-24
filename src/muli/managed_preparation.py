@@ -22,8 +22,8 @@ from muli.compatibility import assess_compatibility
 from muli.config import Settings
 from muli.format_evidence import FormatEvidence, read_format_evidence
 from muli.maintenance import BootPermit, MaintenanceError
-from muli.managed_boot import ManagedBootPermit
-from muli.managed_journal import RoleSnapshots, prepare_managed
+from muli.managed_boot import ManagedBootPermit, _transfer_identity_matches
+from muli.managed_journal import RoleSnapshots, _read_snapshots, prepare_managed, read_snapshots
 from muli.managed_runtime_binding import _legacy_installation
 from muli.managed_transaction import (
     ManagedAction,
@@ -71,7 +71,7 @@ if TYPE_CHECKING:
     from muli.runtime import Runtime
 
 _IDENTIFIER = TypeAdapter(Identifier)
-CurrentRecord = TransactionRecord | TransactionRecordV2
+CurrentRecord = TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord
 Permit = BootPermit | ManagedBootPermit
 _ROLES: tuple[Role, ...] = ("base", "target")
 
@@ -93,7 +93,7 @@ class PreparedManaged:
 class CurrentManagedInstallation:
     """Observed running source, with no queued plan or authority to install."""
 
-    record: TransactionRecordV2 = field(repr=False)
+    record: TransactionRecordV2 | ProjectControllerTransferRecord = field(repr=False)
     anchor: DeploymentAnchor = field(repr=False)
     slot: SlotIdentity = field(repr=False)
     binding_revision: str
@@ -164,7 +164,13 @@ class ManagedPreparation:
         store.revalidate_format()
         previous = journal.read_current()
         if isinstance(previous, ProjectControllerTransferRecord):
-            raise MaintenanceError("project_controller_transfer_unsupported")
+            if (
+                not previous.resolved
+                or not isinstance(permit, ManagedBootPermit)
+                or permit.boot == previous.identity.origin_boot
+                or (item is not None and action != "restart")
+            ):
+                raise MaintenanceError("project_controller_transfer_unsupported")
         receipt = read_projection(store)
         if previous is not None:
             if not previous.resolved:
@@ -178,6 +184,10 @@ class ManagedPreparation:
                 raise TransactionError("projection_required")
         elif receipt is not None:
             raise MaintenanceError("managed_preparation_state_missing")
+        if isinstance(previous, ProjectControllerTransferRecord):
+            _read_snapshots(journal, previous.generation, previous.origin.binding, "origin")
+            read_snapshots(journal, previous, "base")
+            read_snapshots(journal, previous, "target")
         plan = None
         if item is not None:
             plan = _read_object(store.db, "management", item["id"], journal.limits.max_record_bytes)
@@ -191,7 +201,7 @@ class ManagedPreparation:
                 raise MaintenanceError("managed_preparation_plan_changed")
         elif (
             not isinstance(permit, ManagedBootPermit)
-            or not isinstance(previous, TransactionRecordV2)
+            or not isinstance(previous, (TransactionRecordV2, ProjectControllerTransferRecord))
             or action != "switch"
             or candidate is not None
         ):
@@ -208,7 +218,7 @@ class ManagedPreparation:
                 != (previous.identity.store_instance, previous.identity.main_session)
             )
             or (
-                isinstance(previous, TransactionRecordV2)
+                isinstance(previous, (TransactionRecordV2, ProjectControllerTransferRecord))
                 and evidence.state != previous.observed_format
             )
         ):
@@ -216,7 +226,7 @@ class ManagedPreparation:
         anchor: DeploymentAnchor | None = None
         manifest: InstallationManifest | None = None
         role: Role | None = None
-        if isinstance(previous, TransactionRecordV2):
+        if isinstance(previous, (TransactionRecordV2, ProjectControllerTransferRecord)):
             role = "target" if previous.phase == "committed" else "base"
             with DeploymentStore(journal.directory.path, journal.limits) as deployments:
                 anchor = deployments.read_anchor(previous.identity.deployment)
@@ -235,7 +245,14 @@ class ManagedPreparation:
             if isinstance(permit, ManagedBootPermit):
                 if permit.anchor != anchor or permit.installation != slot.digest:
                     raise MaintenanceError("managed_preparation_installation_changed")
-            elif previous.binding(role).entry != "legacy":
+                if not _transfer_identity_matches(permit.record, previous) or (
+                    isinstance(previous, ProjectControllerTransferRecord) and permit.role != role
+                ):
+                    raise MaintenanceError("managed_preparation_installation_changed")
+            elif (
+                isinstance(previous, ProjectControllerTransferRecord)
+                or previous.binding(role).entry != "legacy"
+            ):
                 raise MaintenanceError("managed_boot_required")
             else:
                 _legacy_installation(permit, previous, anchor, slot)
@@ -285,7 +302,7 @@ class ManagedPreparation:
             )
         if Settings.model_validate_json(data.configuration) != self.runtime.config.settings:
             raise MaintenanceError("configuration_changed")
-        if isinstance(previous, TransactionRecordV2):
+        if isinstance(previous, (TransactionRecordV2, ProjectControllerTransferRecord)):
             assert role is not None
             binding = previous.binding(role)
             if (
@@ -331,7 +348,7 @@ class ManagedPreparation:
         permit = self._permit()
         self._paths(permit)
         source = self._source(permit, None, "switch", None)
-        assert isinstance(source.previous, TransactionRecordV2)
+        assert isinstance(source.previous, (TransactionRecordV2, ProjectControllerTransferRecord))
         assert source.anchor is not None
         await self._observe_process(permit, source)
 
@@ -379,7 +396,7 @@ class ManagedPreparation:
         )
 
     async def _observe_process(self, permit: Permit, source: _Source) -> None:
-        if isinstance(source.previous, TransactionRecordV2):
+        if isinstance(source.previous, (TransactionRecordV2, ProjectControllerTransferRecord)):
             assert source.anchor is not None and source.role is not None
             with DeploymentStore(
                 permit.journal.directory.path, permit.journal.limits
