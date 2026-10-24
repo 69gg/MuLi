@@ -396,6 +396,72 @@ def test_bootstrap_target_is_owned_and_verified_before_manager_start(
     assert receipt.bootstrap_directories == [] and receipt.bootstrap_file is None
 
 
+def test_bootstrap_private_dbus_runtime_is_created_checked_and_removed(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = ci.Receipt.read(native.receipt_path)
+    directory = native.home / ".config/systemd/user/dbus.socket.d"
+    leaf = directory / "muli-runtime.conf"
+    # Exercise the existing create path before inspecting any new receipt field.
+    assert leaf.is_file() and not leaf.is_symlink()
+    assert leaf.read_bytes() == (
+        f'[Socket]\nEnvironment="XDG_RUNTIME_DIR=/run/user/{receipt.uid}"\n'.encode("ascii")
+    )
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(leaf.stat().st_mode) == 0o644
+    saved = json.loads(native.receipt_path.read_bytes())
+    assert saved["bootstrap_socket_directory"] == [directory.stat().st_dev, directory.stat().st_ino]
+    assert saved["bootstrap_socket_file"] == [leaf.stat().st_dev, leaf.stat().st_ino]
+    assert sorted(path.name for path in directory.iterdir()) == [leaf.name]
+    native.bootstrap_files("check")
+    assert commands.accounts and commands.mounts
+    ci.NativeCI(native.root, run=commands).cleanup()
+    assert not directory.exists()
+    saved = json.loads(native.receipt_path.read_bytes())
+    assert saved["bootstrap_socket_directory"] is None
+    assert saved["bootstrap_socket_file"] is None
+    assert not commands.accounts and not commands.mounts
+
+
+@pytest.mark.parametrize("mode", ["check", "remove"])
+def test_bootstrap_dbus_runtime_identity_change_preserves_all_owned_leaves(
+    fixture: tuple[Any, Commands], mode: str
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    assert native.receipt is not None
+    user_directory = native.home / ".config/systemd/user"
+    directory = user_directory / "dbus.socket.d"
+    leaf = directory / "muli-runtime.conf"
+    content = f'[Socket]\nEnvironment="XDG_RUNTIME_DIR=/run/user/{native.receipt.uid}"\n'.encode(
+        "ascii"
+    )
+    # The old implementation has no owned drop-in; insert an unconfirmed tree.
+    # The candidate creates it, so retaining the old inode proves actual drift.
+    if not directory.exists():
+        directory.mkdir(mode=0o700)
+        leaf.write_bytes(content)
+    leaf.rename(directory / "saved-runtime")
+    leaf.write_bytes(content)
+    target = user_directory / (native.receipt.user + ".target")
+    mask = user_directory / "gpg-agent-ssh.socket"
+    before = native.receipt_path.read_bytes()
+    rejected: str | None = None
+    try:
+        native.bootstrap_files(mode)
+    except ci.FixtureError as error:
+        rejected = str(error)
+    # A late not-empty error after deleting target/mask is insufficient.
+    assert target.is_file() and target.read_bytes() == worker.bootstrap_data()
+    assert mask.is_file() and mask.read_bytes() == b""
+    assert leaf.read_bytes() == content and (directory / "saved-runtime").is_file()
+    assert native.receipt_path.read_bytes() == before
+    assert commands.accounts and commands.mounts
+    assert rejected == "native_bootstrap_unconfirmed"
+
+
 def test_bootstrap_private_ssh_socket_mask_is_verified_and_removed(
     fixture: tuple[Any, Commands],
 ) -> None:
@@ -408,13 +474,190 @@ def test_bootstrap_private_ssh_socket_mask_is_verified_and_removed(
     saved = json.loads(native.receipt_path.read_bytes())
     assert saved["bootstrap_mask"] == [mask.stat().st_dev, mask.stat().st_ino]
     assert sorted(path.name for path in directory.iterdir()) == sorted(
-        [native.receipt.user + ".target", "gpg-agent-ssh.socket"]
+        [native.receipt.user + ".target", "gpg-agent-ssh.socket", "dbus.socket.d"]
     )
     native.bootstrap_files("check")
     ci.NativeCI(native.root, run=commands).cleanup()
     assert not directory.exists()
     assert json.loads(native.receipt_path.read_bytes())["bootstrap_mask"] is None
     assert not commands.accounts and not commands.mounts
+
+
+@pytest.mark.parametrize("mode", ["check", "remove"])
+@pytest.mark.parametrize(
+    "change", ["identity", "content", "symlink", "directory", "directory-symlink"]
+)
+def test_bootstrap_dbus_runtime_drift_never_deletes_other_owned_leaves(
+    fixture: tuple[Any, Commands], mode: str, change: str
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    assert native.receipt is not None
+    parent = native.home / ".config/systemd/user"
+    directory = parent / "dbus.socket.d"
+    leaf = directory / "muli-runtime.conf"
+    content = leaf.read_bytes()
+    if change == "content":
+        leaf.write_bytes(content + b"# foreign\n")
+    elif change in {"directory", "directory-symlink"}:
+        directory.rename(parent / "saved-dbus-directory")
+        if change == "directory-symlink":
+            directory.symlink_to("saved-dbus-directory", target_is_directory=True)
+        else:
+            directory.mkdir(mode=0o700)
+            leaf.write_bytes(content)
+    else:
+        leaf.rename(parent / "saved-dbus-runtime")
+        if change == "symlink":
+            leaf.symlink_to("../saved-dbus-runtime")
+        else:
+            leaf.write_bytes(content)
+    before = native.receipt_path.read_bytes()
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        native.bootstrap_files(mode)
+    assert (parent / (native.receipt.user + ".target")).read_bytes() == worker.bootstrap_data()
+    assert (parent / "gpg-agent-ssh.socket").read_bytes() == b""
+    assert leaf.is_symlink() if change == "symlink" else leaf.is_file()
+    assert native.receipt_path.read_bytes() == before
+    assert commands.accounts and commands.mounts
+
+
+@pytest.mark.parametrize("foreign_directory", [False, True])
+def test_bootstrap_old_receipt_does_not_own_a_private_dbus_dropin(
+    fixture: tuple[Any, Commands], foreign_directory: bool
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    assert native.receipt is not None
+    parent = native.home / ".config/systemd/user"
+    directory = parent / "dbus.socket.d"
+    leaf = directory / "muli-runtime.conf"
+    content = leaf.read_bytes()
+    if not foreign_directory:
+        leaf.unlink()
+        directory.rmdir()
+    saved = json.loads(native.receipt_path.read_bytes())
+    del saved["bootstrap_socket_directory"]
+    del saved["bootstrap_socket_file"]
+    ci.write_json(native.receipt_path, saved)
+    restored = ci.Receipt.read(native.receipt_path)
+    assert restored.bootstrap_socket_directory is None and restored.bootstrap_socket_file is None
+    if foreign_directory:
+        before = native.receipt_path.read_bytes()
+        with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+            ci.NativeCI(native.root, run=commands).cleanup()
+        assert leaf.read_bytes() == content
+        assert (parent / (restored.user + ".target")).read_bytes() == worker.bootstrap_data()
+        assert native.receipt_path.read_bytes() == before
+        assert commands.accounts and commands.mounts
+    else:
+        ci.NativeCI(native.root, run=commands).cleanup()
+        assert not parent.exists() and not commands.accounts and not commands.mounts
+
+
+@pytest.mark.parametrize("mode", ["check", "remove"])
+def test_bootstrap_legacy_manifest_cannot_adopt_the_private_dbus_tree(
+    fixture: tuple[Any, Commands], mode: str
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = native.receipt
+    manifest = json.dumps(
+        {
+            "directories": receipt.bootstrap_directories,
+            "file": receipt.bootstrap_file,
+            "mask": receipt.bootstrap_mask,
+        }
+    )
+    before = native.receipt_path.read_bytes()
+    value = commands.bootstrap(
+        mode,
+        receipt.user,
+        receipt.uid,
+        receipt.gid,
+        manifest,
+        worker.time.monotonic() + worker.CLEANUP_SECONDS,
+        worker.MAX_BYTES,
+    )
+    assert value["code"] == "native_bootstrap_unconfirmed"
+    parent = native.home / ".config/systemd/user"
+    assert (parent / (receipt.user + ".target")).read_bytes() == worker.bootstrap_data()
+    assert (parent / "gpg-agent-ssh.socket").is_file()
+    assert (parent / "dbus.socket.d/muli-runtime.conf").is_file()
+    assert native.receipt_path.read_bytes() == before
+
+
+def test_bootstrap_private_dbus_body_is_charged_before_accepting_the_complete_reply(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    receipt = native.receipt
+    manifest = json.dumps(
+        {
+            "directories": receipt.bootstrap_directories,
+            "file": receipt.bootstrap_file,
+            "mask": receipt.bootstrap_mask,
+            "socket_directory": receipt.bootstrap_socket_directory,
+            "socket_file": receipt.bootstrap_socket_file,
+        },
+        separators=(",", ":"),
+    )
+    full = commands.bootstrap(
+        "check",
+        receipt.user,
+        receipt.uid,
+        receipt.gid,
+        manifest,
+        worker.time.monotonic() + worker.CLEANUP_SECONDS,
+        worker.MAX_BYTES,
+    )
+    expected = (
+        len(manifest.encode())
+        + len(worker.bootstrap_data())
+        + len(worker.bootstrap_socket_data(receipt.uid))
+    )
+    assert full["code"] == "verified" and full["used"] == expected
+    limited = commands.bootstrap(
+        "check",
+        receipt.user,
+        receipt.uid,
+        receipt.gid,
+        manifest,
+        worker.time.monotonic() + worker.CLEANUP_SECONDS,
+        expected - 1,
+    )
+    assert limited == {"code": "native_diagnostic_output_budget", "used": expected - 1}
+    assert (native.home / ".config/systemd/user/dbus.socket.d/muli-runtime.conf").read_bytes() == (
+        worker.bootstrap_socket_data(receipt.uid)
+    )
+
+
+def test_bootstrap_create_never_adopts_an_existing_dbus_runtime_directory(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    original = worker.bootstrap_data
+
+    def foreign_tree() -> bytes:
+        directory = native.home / ".config/systemd/user/dbus.socket.d"
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+            (directory / "muli-runtime.conf").write_bytes(b"foreign socket environment")
+        return original()
+
+    monkeypatch.setattr(worker, "bootstrap_data", foreign_tree)
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        native.prepare()
+    leaf = native.home / ".config/systemd/user/dbus.socket.d/muli-runtime.conf"
+    assert leaf.read_bytes() == b"foreign socket environment"
+    receipt = ci.Receipt.read(native.receipt_path)
+    assert receipt.bootstrap_socket_directory is None and receipt.bootstrap_socket_file is None
+    assert not any("start" in args for args in commands.calls)
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert leaf.read_bytes() == b"foreign socket environment"
+    assert commands.accounts and commands.mounts
 
 
 @pytest.mark.parametrize("mode", ["check", "remove"])
@@ -506,8 +749,13 @@ def test_bootstrap_legacy_receipt_never_adopts_a_socket_mask(
     native.prepare()
     mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
     mask.unlink()
+    socket_directory = mask.parent / "dbus.socket.d"
+    (socket_directory / "muli-runtime.conf").unlink()
+    socket_directory.rmdir()
     saved = json.loads(native.receipt_path.read_bytes())
     del saved["bootstrap_mask"]
+    del saved["bootstrap_socket_directory"]
+    del saved["bootstrap_socket_file"]
     ci.write_json(native.receipt_path, saved)
     restored = ci.Receipt.read(native.receipt_path)
     assert restored.bootstrap_mask is None
@@ -543,6 +791,7 @@ def test_bootstrap_ssh_mask_lost_remove_reply_rechecks_only_owned_cleanup(
     ci.NativeCI(native.root, run=commands).cleanup()
     assert not commands.accounts and not commands.mounts
     assert ci.Receipt.read(native.receipt_path).bootstrap_mask is None
+    assert ci.Receipt.read(native.receipt_path).bootstrap_socket_file is None
 
 
 def test_bootstrap_worker_legacy_manifest_preserves_original_target_contract(
@@ -552,6 +801,9 @@ def test_bootstrap_worker_legacy_manifest_preserves_original_target_contract(
     native.prepare()
     mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
     mask.unlink()
+    socket_directory = mask.parent / "dbus.socket.d"
+    (socket_directory / "muli-runtime.conf").unlink()
+    socket_directory.rmdir()
     receipt = native.receipt
     manifest = json.dumps(
         {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file}
@@ -628,6 +880,8 @@ def test_bootstrap_removed_duplicate_check_has_exact_manifest_body_and_reply_cos
             "directories": receipt.bootstrap_directories,
             "file": receipt.bootstrap_file,
             "mask": receipt.bootstrap_mask,
+            "socket_directory": receipt.bootstrap_socket_directory,
+            "socket_file": receipt.bootstrap_socket_file,
         },
         separators=(",", ":"),
     )
@@ -643,7 +897,11 @@ def test_bootstrap_removed_duplicate_check_has_exact_manifest_body_and_reply_cos
 
     native.run = recorded
     native.bootstrap_files("check")  # Reproduce only the removed check, on the owned fixture tree.
-    inner = len(manifest.encode()) + len(worker.bootstrap_data())
+    inner = (
+        len(manifest.encode())
+        + len(worker.bootstrap_data())
+        + len(worker.bootstrap_socket_data(receipt.uid))
+    )
     assert json.loads(output)["used"] == inner
     assert native.setup_bytes - before == inner + len(output)
     assert native.setup_bytes <= ci.OUTPUT_BYTES
@@ -709,15 +967,19 @@ def test_bootstrap_create_lost_reply_never_adopts_or_removes_unconfirmed_tree(
         native.prepare()
     receipt = ci.Receipt.read(native.receipt_path)
     assert len(receipt.bootstrap_directories) == 2 and receipt.bootstrap_file is None
+    assert receipt.bootstrap_socket_directory is None and receipt.bootstrap_socket_file is None
     assert receipt.environment_file is not None
     assert (
         native.environment_directory() / ci.ENVIRONMENT_NAME
     ).read_bytes() == native.environment_data()
     target = native.home / ".config/systemd/user" / (receipt.user + ".target")
     assert target.read_bytes() == worker.bootstrap_data()
+    leaf = target.parent / "dbus.socket.d/muli-runtime.conf"
+    assert leaf.read_bytes() == worker.bootstrap_socket_data(receipt.uid)
     with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
         ci.NativeCI(native.root, run=commands).cleanup()
     assert target.exists() and commands.accounts and commands.mounts
+    assert leaf.is_file()
     assert not any(
         any(effect in args for effect in ("start", "revert", "umount", "userdel", "groupdel"))
         for args in commands.calls
@@ -979,6 +1241,9 @@ def test_bootstrap_low_remaining_allowance_never_calls_helper(
         ("bootstrap_mask", [True, 1]),
         ("bootstrap_mask", [1]),
         ("bootstrap_mask", "not-an-inode"),
+        ("bootstrap_socket_directory", [True, 1]),
+        ("bootstrap_socket_file", [1]),
+        ("bootstrap_socket_file", None),
     ],
 )
 def test_bootstrap_receipt_rejects_unbounded_or_ambiguous_metadata(
@@ -5773,3 +6038,76 @@ def test_complete_setup_reply_obeys_total_bytes_beyond_minimum_reply_reserve(
         assert native.setup_bytes > ci.OUTPUT_BYTES
         assert facts["diagnostic_code"] == "output_budget" and facts["units"] == []
         assert facts["context"]["code"] == "not_started"
+
+
+def test_bootstrap_socket_growth_probe_never_reads_past_raw_grant(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the real regular-file reader, including its overflow probe."""
+    native, commands = fixture
+    native.prepare()
+    receipt = native.receipt
+    assert receipt is not None
+    leaf = native.home / ".config/systemd/user/dbus.socket.d/muli-runtime.conf"
+    saved = leaf.stat()
+    manifest = json.dumps(
+        {
+            "directories": receipt.bootstrap_directories,
+            "file": receipt.bootstrap_file,
+            "mask": receipt.bootstrap_mask,
+            "socket_directory": receipt.bootstrap_socket_directory,
+            "socket_file": receipt.bootstrap_socket_file,
+        },
+        separators=(",", ":"),
+    )
+    grant = (
+        len(manifest.encode())
+        + len(worker.bootstrap_data())
+        + len(worker.bootstrap_socket_data(receipt.uid))
+    )
+    actual_read = 0
+    original_fdopen = os.fdopen
+
+    class ReadCounter:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> ReadCounter:
+            return self
+
+        def __exit__(self, *arguments: object) -> None:
+            self.handle.close()
+
+        def fileno(self) -> int:
+            return int(self.handle.fileno())
+
+        def read(self, size: int) -> bytes:
+            nonlocal actual_read
+            current = os.fstat(self.fileno())
+            if (current.st_dev, current.st_ino) == (saved.st_dev, saved.st_ino):
+                # The real reader has already taken its initial fstat. Grow
+                # that same inode just before its real bounded read executes.
+                with leaf.open("ab") as output:
+                    output.write(b"x")
+            data: bytes = self.handle.read(size)
+            actual_read += len(data)
+            return data
+
+    def counted_fdopen(descriptor: int, mode: str, *args: Any, **kwargs: Any) -> Any:
+        handle = original_fdopen(descriptor, mode, *args, **kwargs)
+        return ReadCounter(handle) if mode == "rb" else handle
+
+    monkeypatch.setattr(os, "fdopen", counted_fdopen)
+    observed = commands.bootstrap(
+        "check",
+        receipt.user,
+        receipt.uid,
+        receipt.gid,
+        manifest,
+        worker.time.monotonic() + worker.CLEANUP_SECONDS,
+        grant,
+    )
+    assert observed["code"] != "verified" and observed["used"] == grant
+    assert leaf.exists() and receipt.bootstrap_socket_file == [saved.st_dev, saved.st_ino]
+    actual_raw = len(manifest.encode()) + actual_read
+    assert actual_raw <= grant, f"actual raw bytes {actual_raw} exceed grant {grant}"

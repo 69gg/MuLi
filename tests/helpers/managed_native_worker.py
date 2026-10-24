@@ -554,6 +554,10 @@ def bootstrap_data() -> bytes:
     )
 
 
+def bootstrap_socket_data(uid: int) -> bytes:
+    return f'[Socket]\nEnvironment="XDG_RUNTIME_DIR=/run/user/{uid}"\n'.encode("ascii")
+
+
 def bootstrap_files(
     mode: str, user: str, uid: int, gid: int, manifest: str, deadline: float, limit: int
 ) -> dict[str, Any]:
@@ -564,6 +568,7 @@ def bootstrap_files(
 
     used = 0
     handles: list[int] = []
+    socket_descriptor: int | None = None
     try:
         require(mode in {"create", "check", "remove"}, "native_bootstrap_arguments")
         require(
@@ -595,11 +600,18 @@ def bootstrap_files(
         value = json.loads(manifest)
         require(
             isinstance(value, dict)
-            and set(value) in ({"directories", "file"}, {"directories", "file", "mask"}),
+            and set(value)
+            in (
+                {"directories", "file"},
+                {"directories", "file", "mask"},
+                {"directories", "file", "mask", "socket_directory", "socket_file"},
+            ),
             "native_bootstrap_invalid",
         )
         directories, identity = value["directories"], value["file"]
         mask_identity = value.get("mask")
+        socket_directory = value.get("socket_directory")
+        socket_file = value.get("socket_file")
 
         def pair(item: object) -> bool:
             return (
@@ -616,12 +628,27 @@ def bootstrap_files(
             and (
                 mask_identity is None
                 or (pair(mask_identity) and identity is not None and len(directories) == 5)
+            )
+            and (
+                (socket_directory is None and socket_file is None)
+                or (
+                    pair(socket_directory)
+                    and pair(socket_file)
+                    and identity is not None
+                    and len(directories) == 5
+                )
             ),
             "native_bootstrap_invalid",
         )
         require(
             mode != "create"
-            or (len(directories) == 2 and identity is None and mask_identity is None),
+            or (
+                len(directories) == 2
+                and identity is None
+                and mask_identity is None
+                and socket_directory is None
+                and socket_file is None
+            ),
             "native_bootstrap_invalid",
         )
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -679,6 +706,8 @@ def bootstrap_files(
                 raise NativeError("native_bootstrap_unconfirmed")
         target_name = user + ".target"
         mask_name = "gpg-agent-ssh.socket"
+        socket_name = "dbus.socket.d"
+        socket_leaf = "muli-runtime.conf"
         if len(handles) == 5:
             if mode == "create":
                 for name, data in ((target_name, bootstrap_data()), (mask_name, b"")):
@@ -699,16 +728,84 @@ def bootstrap_files(
                             identity = [info.st_dev, info.st_ino]
                         else:
                             mask_identity = [info.st_dev, info.st_ino]
-            leaves: list[tuple[str, os.stat_result | None]] = []
-            for name, expected, content in (
-                (target_name, identity, bootstrap_data()),
-                (mask_name, mask_identity, b""),
-            ):
+
+            if mode == "create" and "socket_directory" in value:
+                os.mkdir(socket_name, mode=0o700, dir_fd=handles[-1])
+                socket_descriptor = os.open(socket_name, flags, dir_fd=handles[-1])
+                os.fchmod(socket_descriptor, 0o700)
+                os.fchown(socket_descriptor, uid, gid)
+                info = os.fstat(socket_descriptor)
+                socket_directory = [info.st_dev, info.st_ino]
+                data = bootstrap_socket_data(uid)
+                charge(data)
+                descriptor = os.open(
+                    socket_leaf,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o644,
+                    dir_fd=socket_descriptor,
+                )
+                with os.fdopen(descriptor, "wb") as output:
+                    os.fchmod(output.fileno(), 0o644)
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    info = os.fstat(output.fileno())
+                    socket_file = [info.st_dev, info.st_ino]
+            elif socket_directory is not None:
                 try:
-                    leaf = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
+                    socket_descriptor = os.open(socket_name, flags, dir_fd=handles[-1])
+                except FileNotFoundError:
+                    require(mode == "remove", "native_bootstrap_changed")
+                    socket_directory = socket_file = None
+
+            def check_socket_directory() -> None:
+                try:
+                    linked = os.stat(socket_name, dir_fd=handles[-1], follow_symlinks=False)
+                except FileNotFoundError:
+                    require(socket_directory is None, "native_bootstrap_changed")
+                    return
+                require(
+                    socket_directory is not None and socket_descriptor is not None,
+                    "native_bootstrap_unconfirmed",
+                )
+                assert socket_descriptor is not None
+                current = os.fstat(socket_descriptor)
+                require(
+                    stat.S_ISDIR(current.st_mode)
+                    and stat.S_IMODE(current.st_mode) == 0o700
+                    and (current.st_uid, current.st_gid) == (uid, gid)
+                    and [current.st_dev, current.st_ino] == socket_directory
+                    and all(
+                        getattr(linked, key) == getattr(current, key)
+                        for key in ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")
+                    ),
+                    "native_bootstrap_changed",
+                )
+                # An unowned sibling must block all removals, including target/mask.
+                with os.scandir(socket_descriptor) as entries:
+                    first = next(entries, None)
+                    require(
+                        (first is None or first.name == socket_leaf)
+                        and next(entries, None) is None,
+                        "native_bootstrap_unconfirmed",
+                    )
+
+            check_socket_directory()
+            leaves: list[tuple[int, str, os.stat_result | None]] = []
+            materials = [
+                (handles[-1], target_name, identity, bootstrap_data()),
+                (handles[-1], mask_name, mask_identity, b""),
+            ]
+            if socket_descriptor is not None:
+                materials.append(
+                    (socket_descriptor, socket_leaf, socket_file, bootstrap_socket_data(uid))
+                )
+            for directory_fd, name, expected, content in materials:
+                try:
+                    leaf = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
                     require(mode == "remove" or expected is None, "native_bootstrap_changed")
-                    leaves.append((name, None))
+                    leaves.append((directory_fd, name, None))
                     continue
                 require(
                     expected is not None
@@ -718,19 +815,23 @@ def bootstrap_files(
                     and (leaf.st_uid, leaf.st_gid) == (0, 0),
                     "native_bootstrap_changed",
                 )
+                # The shared reader may consume one extra byte after fstat to
+                # detect growth. Keep that probe inside this existing raw grant.
+                require(len(content) < limit - used, "native_diagnostic_output_budget")
                 data = _read_regular(
-                    Path(name), min(limit - used, len(content)), directory_fd=handles[-1]
+                    Path(name), min(limit - used - 1, len(content)), directory_fd=directory_fd
                 )
                 charge(data)
                 require(data == content, "native_bootstrap_changed")
-                leaves.append((name, leaf))
+                leaves.append((directory_fd, name, leaf))
 
-            # Both leaves must be safe before deleting either one. Recheck the
+            # All leaves must be safe before deleting any one. Recheck the
             # complete set after all reads, including identity and content size.
             def check_leaves() -> None:
-                for name, leaf in leaves:
+                check_socket_directory()
+                for directory_fd, name, leaf in leaves:
                     try:
-                        linked = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
+                        linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     except FileNotFoundError:
                         require(leaf is None, "native_bootstrap_changed")
                         continue
@@ -757,10 +858,15 @@ def bootstrap_files(
                 check_directory(index)
             if mode == "remove":
                 check_leaves()
-                for name, saved_leaf in leaves:
+                for directory_fd, name, saved_leaf in leaves:
                     if saved_leaf is not None:
                         remaining(deadline)
-                        os.unlink(name, dir_fd=handles[-1])
+                        os.unlink(name, dir_fd=directory_fd)
+                if socket_descriptor is not None:
+                    check_socket_directory()
+                    remaining(deadline)
+                    os.rmdir(socket_name, dir_fd=handles[-1])
+                socket_directory = socket_file = None
                 identity = None
                 mask_identity = None
         if mode == "remove":
@@ -774,6 +880,7 @@ def bootstrap_files(
                 directories.pop()
             identity = None
             mask_identity = None
+            socket_directory = socket_file = None
         for index in range(len(directories)):
             check_directory(index)
         account = pwd.getpwnam(user)
@@ -787,12 +894,16 @@ def bootstrap_files(
             "directories": directories,
             "file": identity,
             "mask": mask_identity,
+            "socket_directory": socket_directory,
+            "socket_file": socket_file,
             "used": used,
         }
     except Exception as error:
         code = str(error) if isinstance(error, NativeError) else "native_bootstrap_invalid"
         return {"code": code, "used": limit}
     finally:
+        if socket_descriptor is not None:
+            os.close(socket_descriptor)
         for descriptor in reversed(handles):
             os.close(descriptor)
 

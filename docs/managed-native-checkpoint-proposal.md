@@ -446,3 +446,119 @@ explicit-package-bases，通过于守卫5.401秒、289.6MiB。全仓Ruff通过�
 整组撤回，不输出原始命令，current与历史回读严格分离。结果仅为离线受控采样及
 协议/计账回归，尚无Native24真实runner结果，不能替代Native23仍失败的启动与
 cleanup证据，也不证明新增观察一定能解释或修复阻塞。
+
+### Native24 现场事实与单变量 runtime 隔离候选（仅测试及方案）
+
+根实际核定精确head `52079de` 的CI
+[40061782017](https://github.com/69gg/MuLi/actions/runs/40061782017)最终为
+**8 success、3 failure**，失败为Windows3.12、Windows3.13和managed-native，
+不能把其余平台结果写作本轮全绿。Windows3.12精确日志为1 failed、3696 passed、
+2261 skipped；UIA首probe阶段unobserved、cleanupconfirmed，原问题未关闭。
+这里没有推断Windows3.13的具体失败机制，也不将Windows失败归因于Linux隔离配置。
+
+managed-native job `120776658463` 于04:18:03至04:19:31运行，仍为
+`native_deadline_exceeded`，cleanup仍报`native_service_cleanup_failed`。
+根已用原typed parser核验1008字节artifact，本地
+`/tmp/muli-native24-evidence.zip`，SHA256为
+`379da7c55e1d9add258aa8ade0a348d00861d8db6325d2d6916601c0eea2c4d6`。
+receipt的user/group removed均为true、mounts为0；这只证明该精确账本的回收结果，
+不能覆盖cleanup job仍失败的事实。
+
+manager仍为activating/start，PID2293、startticks3029、invocation
+`9b5d9d03f26041c585337f9e06b03adb`，最后完整轮elapsed81704ms。
+固定peer观察到dbus.socket为start-post、ControlPID2305。两侧proc接受的control为
+`exe=systemctl,uids=all_expected,start_ticks=3037,env=oem,cmd=set_bus`：
+完整四参数命令确为`systemctl --user set-environment`加规范userbus地址赋值；
+唯一runtime值不等于`/run/user/999`，显式bus地址符合规范，force键缺失。
+raw11306、grant11893、reply471、parent31628，小于原32768总额；
+timeline和generations均为0。未证明actual transport、runtime的具体原值、
+偏差来源或真实READY；不能仅据other归因environment generator。
+
+下一候选只给该新UID的私有用户配置增加固定
+`dbus.socket.d/muli-runtime.conf`，正文恰为：
+
+```ini
+[Socket]
+Environment="XDG_RUNTIME_DIR=/run/user/<实际UID>"
+```
+
+实际UID从已核账户材料生成，不接收任意unit/path/value参数。仅规范该socket执行钩子
+的runtime环境；不改vendor正文、ExecStartPost、DBUS地址、force、target、其它vendor图，
+不再mask单元，也不禁用全部generator。根已核固定v255
+[socket执行钩子](https://github.com/systemd/systemd/blob/v255/man/systemd.socket.xml)、
+[Socket段执行环境](https://github.com/systemd/systemd/blob/v255/man/systemd.exec.xml)
+和[执行环境合并顺序](https://github.com/systemd/systemd/blob/v255/src/core/exec-invoke.c#L4114-L4119)：
+manager环境在前、unit的Environment在后。这是可证伪的fixture normalize实验，
+不是已确认的生产根因修复。
+
+准备复用真实bootstrap的dirfd/NOFOLLOW/O_EXCL、前后目录及叶身份、root文件所有权和
+原计费。目录身份与文件身份分别持久为`bootstrap_socket_directory`、
+`bootstrap_socket_file`；旧receipt缺字段默认无所有权，旧manifest不授权占有外来树。
+同名外来目录/叶不adopt，create丢回包不追认未知inode。check/remove先验证所有已拥有
+target、mask、drop-in和目录，再允许任何删除；新drop-in目录内异物、已记账材料替换或
+内容改变时保留全部叶及receipt，
+不继续卸载或删除账户。只有精确拥有且为空的新增目录可移除。
+新增manifest、正文、复验及回包字节仍记原32768总额，沿原执行/cleanup绝对期限裁剪，
+不增查询、诊断字段、采样轮次、512/1024门或资源限额。
+
+本轮仅新增真实`NativeCI.prepare/bootstrap_files/check/cleanup`目标回归：创建固定叶及
+持久身份后可check/remove；check和remove遇实际inode替换均在删除任何旧叶前拒绝。
+账户/属主与系统命令仍由既有fixture替身承接，真实临时目录、helper及receipt链不替换；
+旧实现预期在缺少固定叶、忽略未确认树或过早删除target处失败，不以缺API/import制造红。
+作者未运行检查，目标红与生产实现均待根下一步授权和实收。
+
+已有采样足以判别，无需新增日志：规范runtime实际生效后仍同hook阻塞，则该偏差不是
+充分解释；runtime仍other则不能称实验有效。如果正常启动使失败后采样不再执行，
+以真实READY、正式事务、回退及完整cleanup结果判定，不要求强造一条`eem`诊断。
+下一远端轮次只有完整离线验证和非作者后审后才由根决定，当前没有触发新CI。
+
+#### 目标红实收与窄实现候选（待根验证）
+
+根唯一守卫已真实收取上述3节点全部失败、522 deselected：pytest0.63秒、
+守卫1.171秒、102.1MiB、swap0、exit1。三个失败分别是正式create缺少固定叶、
+check忽略未确认inode，以及remove先删除target后才因非空目录失败。不是缺API或
+import，也不把fixture失败算作READY结果。
+
+获准后候选仅改worker、coordinator及同一纯fixture测试文件：新manifest显式携带
+`socket_directory/socket_file`身份，create才可创建该固定私有树；旧两键/三键manifest
+仍可读取但不拥有新树，发现同名外来树立即拒绝。coordinator保留原5项目录链上限，
+新目录/叶身份独立记录；旧两代receipt缺字段默认None，半套身份或坏类型拒绝。
+所有已知叶与新目录完成读取、完整身份复核后才进入remove；新目录只接受固定单叶，
+异物不清除。正常remove丢返回可仅按既有身份确认已缺失材料，create丢返回不追认。
+新目录之外既有foreign.service保留/报非空合同不变，不扩大清理授权。
+
+必要负控制覆盖文件/目录inode替换、正文修改、文件和目录symlink、外来同名目录、
+旧receipt无所有权、旧manifest拒绝领养，以及新正文实际计入原额度、差1字节拒绝。
+原丢create/remove回包回归同步断言新叶与身份；原精确收费回归增加该固定正文和新manifest
+的真实字节。未增加诊断查询、轮次、期限或原输出限额，也没有真实socket/FFI/manager操作。
+本次作者仅静态回读，未执行测试、检查、格式或Git；候选已冻结交根统一验证和独立后审，
+没有授权或触发新的远端轮次，READY根因和完整cleanup仍未关闭。
+
+#### bootstrap 原始读取的增长探测字节（候选窄修）
+
+根先实收59个bootstrap节点通过（pytest0.80秒、守卫1.356秒、115.5MiB、swap0），
+随后非作者补真实`_read_regular`增长反例：正文恰好耗尽grant时，同inode在初次fstat后、
+实际read前增长，读取器的`limit+1`探测使actual_raw366大于grant365。
+该唯一新节点实际1 failed，pytest0.49秒、守卫1.006秒、104MiB、swap0；
+原错误返回与保守计账没有阻止实际raw读取越1字节，因此不能仅凭`used=grant`判安全。
+
+窄修只在bootstrap每次叶读取前从当前原剩余额度预留1字节，已知固定正文连同探测
+不能容下就提前报output_budget；传给共享读取器的限额也至多为剩余额度减1。
+成功时仍只按实际返回正文计费，未使用的探测预留不重复扣账；读取器原有前后身份、
+长度和读后增长拒绝不改，任何读取失败仍按原grant全额保守记账。
+因此恰好只够正文而不够探测的grant会提前拒绝，不宣称修复后该边界仍执行了增长读取。
+共享`linux_transaction`、测试oracle、原32768总额、512/1024门、期限与其它Native25合同
+均未改变。作者未执行任何检查；该两文件候选已冻结，待根验证，不新增远端轮次授权。
+
+根随后仅对原增长反例实际复验：1 passed，pytest0.12秒、守卫662毫秒、67.6MiB、
+swap0。该结果只闭合bootstrap raw探测越1字节回归，不代表真实READY或cleanup问题已解决。
+
+根继续沿相同守卫收取bootstrap小集60 passed、485 deselected（pytest0.45秒、
+守卫968毫秒、79.5MiB、swap0）；完整七个native相关文件827 passed（pytest2.39秒、
+守卫3.060秒、154.5MiB、swap0）。60项是827项的子集，不重复累计。
+随后对coordinator、worker、peer三个文件执行原严格检查：
+`env MYPYPATH=src:tests python -m mypy --strict --no-incremental --explicit-package-bases`
+通过（守卫5.758秒、289.9MiB、swap0）。全仓Ruff通过；两文件仅排版后，
+全仓378文件格式检查通过（守卫68毫秒、21.7MiB、swap0）。
+非作者审查除已修raw+1外未见新增阻断问题；
+这组离线结果不替代下一次隔离runner上的真实启动、事务与完整cleanup验收。
