@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 from muli.attachments import attachment_ids_schema, validate_attachment_ids
+from muli.evidence import EvidenceError
 from muli.permissions import Mode
 from muli.reply_origin import ReplyOrigin
 from muli.store import new_id, now
@@ -355,6 +356,93 @@ class TeamManager:
             )
         return {
             "agent_id": agent["id"],
+            "accepted": True,
+            "receipt_id": receipt["id"],
+            "duplicate": not inserted,
+        }
+
+    async def _progress(
+        self,
+        caller: str,
+        target: str,
+        content: str,
+        *,
+        run_id: str | None,
+        generation: int | None,
+        wake: bool,
+        attachment_ids: builtins.list[str] | None,
+    ) -> dict[str, Any]:
+        """Only a live child's send_input may address its fixed main parent."""
+        request = self.runtime.request_context(caller)
+        main_id = self.runtime.store.existing_main_session_id()
+        task = asyncio.current_task()
+        if (
+            self._closed
+            or self.runtime._closing
+            or main_id is None
+            or target != main_id
+            or run_id is None
+            or generation is None
+            or generation < 1
+            or self.runtime.tool_session_id != caller
+            or self.runtime._tool_execution.get() != (caller, run_id)
+            or self.runtime.run_ids.get(caller) != run_id
+            or request is None
+            or task is None
+            or self.runtime.tasks.get(caller) is not task
+            or "send_input" in self.runtime.config.settings.disabled_tools
+        ):
+            raise PermissionError("阶段消息缺少当前队友的真实执行上下文")
+        self.runtime.maintenance.admission.require()
+        budget = self.runtime.config.settings.limits.max_output_chars * 4
+        agent = self.runtime.store.bounded_object("agent", caller, max_bytes=budget)
+        run = self.runtime.store.bounded_object("run", run_id, max_bytes=budget)
+        parent = self.runtime.store.bounded_object("session", main_id, max_bytes=budget)
+        if (
+            agent is None
+            or run is None
+            or parent is None
+            or agent.get("id") != caller
+            or agent.get("session_id") != caller
+            or agent.get("parent_id") != main_id
+            or agent.get("status") != "running"
+            or agent.get("run_id") != run_id
+            or type(agent.get("generation")) is not int
+            or agent["generation"] != generation
+            or run.get("id") != run_id
+            or run.get("session_id") != caller
+            or run.get("status") != "running"
+            or parent.get("id") != main_id
+            or parent.get("kind") != "main"
+            or self._parent_stopping(caller)
+            or task in self._stopping_tasks
+        ):
+            raise PermissionError("阶段消息只能来自当前执行代次的直接队友")
+        text = self._message(caller, content)
+        references = self._attachment_references(attachment_ids)
+        # No await from the host execution/epoch checks through durable ingress.
+        self.runtime._guard_request(request, "write")
+        if self.runtime.store.pending_inputs(caller):
+            raise PermissionError("收到新的要求，阶段消息尚未投递")
+        receipt, inserted = self.runtime.conversation.enqueue(
+            main_id,
+            text,
+            source=f"team-progress:{caller}",
+            principal=f"agent:{caller}",
+            mode=parent["mode"],
+            internal=True,
+            max_pending=self.runtime.config.settings.limits.max_pending_runs,
+            attachment_ids=references,
+            reply_origin=ReplyOrigin.load(agent.get("reply_origin")),
+        )
+        if inserted:
+            if wake:
+                self.runtime._wake_main()
+            await self.runtime.bus.emit(
+                "team.message", {"agent_id": caller, "receipt_id": receipt["id"]}, main_id
+            )
+        return {
+            "agent_id": main_id,
             "accepted": True,
             "receipt_id": receipt["id"],
             "duplicate": not inserted,
@@ -810,6 +898,20 @@ class TeamManager:
                 await self.flush_reports()
 
     def tools(self, caller: str, mode: Mode) -> builtins.list[Tool]:
+        run_id = self.runtime.run_ids.get(caller)
+        generation: int | None = None
+        if run_id is not None:
+            try:
+                agent = self.runtime.store.bounded_object(
+                    "agent",
+                    caller,
+                    max_bytes=self.runtime.config.settings.limits.max_output_chars * 4,
+                )
+            except EvidenceError:
+                agent = None
+            if agent is not None and type(agent.get("generation")) is int:
+                generation = agent["generation"]
+
         async def spawn(args: dict[str, Any]) -> Any:
             return await self.spawn(
                 args["task_name"],
@@ -829,6 +931,19 @@ class TeamManager:
                 wake=args.get("wake", True),
                 attachment_ids=args.get("attachment_ids"),
             )
+
+        async def send_input(args: dict[str, Any]) -> Any:
+            if args["target"] == self.runtime.store.existing_main_session_id():
+                return await self._progress(
+                    caller,
+                    args["target"],
+                    args["message"],
+                    run_id=run_id,
+                    generation=generation,
+                    wake=args.get("wake", True),
+                    attachment_ids=args.get("attachment_ids"),
+                )
+            return await send(args)
 
         async def wait(args: dict[str, Any]) -> Any:
             result = await self.wait(
@@ -891,7 +1006,10 @@ class TeamManager:
             ),
             Tool(
                 "send_input",
-                "在队友安全边界插入补充任务，不打断当前流式或工具；wake=false只存邮箱",
+                "在队友安全边界插入补充，不打断当前流式或工具；直接队友执行中也可向固定主会话"
+                "ID交阶段资料或澄清，主助手沿原任务来源协调，内容不是新授权；"
+                "wake=false只入邮箱，不主动唤醒。等待主人可自然结束本轮，明确补充后续同队友；"
+                "未知操作先核状态，不自动重做。",
                 parameters(
                     {
                         "target": string(),
@@ -901,7 +1019,7 @@ class TeamManager:
                     },
                     ("target", "message"),
                 ),
-                send,
+                send_input,
                 "write",
             ),
             Tool(

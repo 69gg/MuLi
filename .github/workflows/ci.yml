@@ -122,10 +122,4 @@ jobs:
       - run: uv sync --locked --extra mcp --extra channels
       - run: >-
           uv run --extra mcp --extra channels pytest -q -o faulthandler_timeout=60
-          tests/test_mcp.py tests/test_channels.py tests/test_mcp_policy.py
-          tests/test_mcp_receive.py tests/test_mcp_receive_integration.py
-          tests/test_mcp_receive_notifications.py tests/test_mcp_resources.py
-          tests/test_mcp_resources_runtime.py tests/test_mcp_resources_sdk.py
-          tests/test_mcp_resource_files.py
-          tests/test_mcp_prompts.py tests/test_mcp_prompts_runtime.py
-          tests/test_mcp_prompts_sdk.py
+          tests/test_mcp*.py tests/test_team_progress*.py tests/test_channels.py

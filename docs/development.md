@@ -47,6 +47,12 @@ Linux CI 的每种 Python 版本使用两份不重叠的测试集合，macOS/Win
 后端分批入口不改变。微型真实 pytest 回归验证无参数全量、参数化并集/交集、
 同文件归属、非法参数与空片，不运行本地完整测试集。
 
+MCP 作业安装 `mcp` 和 `channels` 可选依赖，通过 shell 的文件模式执行全部
+`tests/test_mcp*.py`、`tests/test_team_progress*.py` 及渠道测试。新增 MCP 文件因此自动进入
+该作业，不能只依赖默认依赖矩阵中的收集：需要可选 SDK 的测试在默认安装中可能跳过。
+v2.51 新资源链接旅程已在本地安装的 SDK 下通过；其发行时远端 MCP 作业仍是旧的显式文件表，
+未包含这两份新增文件。本次调整补上覆盖，不能倒推旧发行已经远端运行这些节点。
+
 分片依据为 [pytest collection hook](https://docs.pytest.org/en/stable/reference/reference.html#pytest.hookspec.pytest_collection_modifyitems)
 及 [GitHub matrix](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)；
 接口先经 Context7 检索，再核对已锁定 pytest 8.4.2 源码。
