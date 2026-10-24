@@ -117,7 +117,7 @@ class _ControllerPolicy[RecordT, ObservationT, ProofT](Protocol):
     def restore_prefix_observed(self, record: RecordT, observation: ObservationT) -> bool: ...
     def matches(self, record: RecordT, observation: ObservationT, role: Role) -> bool: ...
     def installed(self, record: RecordT, observation: ObservationT, role: Role) -> bool: ...
-    async def install(self, record: RecordT, role: Role) -> None: ...
+    async def install(self, record: RecordT, role: Role) -> ObservationT | None: ...
     def proof(self, observation: ObservationT) -> ProofT | None: ...
     def accepts(
         self, record: RecordT, proof: ProofT, role: Role, *, released: bool = False
@@ -137,12 +137,14 @@ class _Controller[
         policy: _ControllerPolicy[RecordT, ObservationT, ProofT],
         *,
         operation_timeout: float = 5.0,
+        verify_continuation: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if not 0 < operation_timeout <= 30:
             raise ValueError("invalid_operation_timeout")
         self.control, self._effects, self.clock = control, backend, clock
         self._policy = policy
         self.operation_timeout = operation_timeout
+        self._verify_continuation = verify_continuation
         self._step_lock = asyncio.Lock()
         self._failure_diagnostic_attempted = False
 
@@ -309,6 +311,18 @@ class _Controller[
                         return current
                 return self._failure(current, exc.code)
 
+    async def _installed_after_effect(self, record: RecordT, role: Role) -> bool:
+        confirmation = await self._call(record, lambda: self._policy.install(record, role))
+        if confirmation is None:
+            return False
+        if not self._policy.installed(record, confirmation, role):
+            raise _BackendFailure("backend_failed")
+        # The normal drive-loop authentication precedes every controller step.
+        # Combining these two steps must retain its next-effect authentication.
+        if self._verify_continuation is not None:
+            await self._call(record, self._verify_continuation)
+        return True
+
     async def _step(
         self,
         record: RecordT,
@@ -350,8 +364,11 @@ class _Controller[
                 if observation.service != "stopped" or not observation.writer_free:
                     return self._failure(record, "foreign_state")
                 if not self._policy.installed(record, observation, "target"):
-                    await self._call(record, lambda: self._policy.install(record, "target"))
-                    return record
+                    if not await self._installed_after_effect(record, "target"):
+                        return record
+                    remaining = record.deadline.remaining(self.clock())
+                    if failed := self._deadline_result(record, remaining):
+                        return failed
                 started = self._move(record, phase="activating", intent="start_target")
                 await self._call(started, lambda: self._effects.start(started, "target"))
                 return started
@@ -401,8 +418,11 @@ class _Controller[
                 if observation.service != "stopped" or not observation.writer_free:
                     return self._failure(record, "foreign_state")
                 if not self._policy.installed(record, observation, "base"):
-                    await self._call(record, lambda: self._policy.install(record, "base"))
-                    return record
+                    if not await self._installed_after_effect(record, "base"):
+                        return record
+                    remaining = record.deadline.remaining(self.clock())
+                    if failed := self._deadline_result(record, remaining):
+                        return failed
                 started = self._move(
                     record, phase="rolling_back", intent="start_base", code=record.code
                 )

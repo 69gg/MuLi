@@ -544,7 +544,9 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self._effect_guard(record, None)
         await self._command("stop")
 
-    async def install(self, record: TransactionRecordV2, role: Role, data: RoleSnapshots) -> None:
+    async def install(
+        self, record: TransactionRecordV2, role: Role, data: RoleSnapshots
+    ) -> BindingConfirmation:
         if (record.phase, record.intent, role) not in {
             ("activating", "install_target", "target"),
             ("rolling_back", "restore_base", "base"),
@@ -615,7 +617,10 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 or fresh.disk_unit != record.binding(role).unit.digest
             ):
                 raise ObservationError("managed_unit_not_loaded")
-            self._confirm(record, role, lease, cgroup)
+            disk = self._confirm(record, role, lease, cgroup)
+            return BindingConfirmation(
+                record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
+            )
 
     async def start(self, record: TransactionRecordV2, role: Role) -> None:
         if (record.phase, record.intent, role) not in {

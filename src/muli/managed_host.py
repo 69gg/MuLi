@@ -280,7 +280,11 @@ async def run_managed_helper(
                 operation_timeout=limits.operation_timeout,
             ) as backend:
                 driver = ManagedTransactionController(
-                    control, backend, clock, operation_timeout=limits.operation_timeout
+                    control,
+                    backend,
+                    clock,
+                    operation_timeout=limits.operation_timeout,
+                    verify_continuation=verify_helper,
                 )
 
                 def read() -> TransactionRecordV2:

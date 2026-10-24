@@ -1629,3 +1629,85 @@ guard拒绝零pending/零发布及原异常身份不变、真实CAS多次guard�
 Ruff已通过；格式首查只发现新测试一处纯排版，已格式化，最终386文件格式检查通过。
 禁用增量缓存的严格类型检查146源文件通过（守卫7.902秒、372.7MiB、swap0）。
 上述本地证明不代替Native39真实systemd性能、三事务与清理验收。
+
+### Native39真实验收：清理闭合，三事务仍未闭合
+
+精确签名候选 `9dfee5247d1c34c891c97aa8dd6ed5a6f891aa53` 的
+[CI 40086602632](https://github.com/69gg/MuLi/actions/runs/40086602632) 十项通用检查全部通过，
+仅原生job `120850722108` 失败。严格typed回读artifact `12557216865`，ZIP1892字节，
+SHA-256 `21adf42567d42c9e125fce5cb047e90047dd3907bfd5d84a1904599cacb0e1ca`，
+仍为 `completed=false/TimeoutError/stage=helper_exit`，原60秒总门未提高。
+
+adopt代 `fe159a013df0e5caa26393bbb7d634d1` 的完整历史成本为observed，准确匹配
+PID2383/UID999/invocation `1db8066c5db64c38a0623309560a3371`：checks153次、16438毫秒，
+bus286次、3660毫秒，HTTP12次、1081毫秒。adopt在38127毫秒released、39070毫秒projection；
+switch在39072毫秒prepare，代 `b0078440461f8d0ead3a05c34c86768a` 于41721毫秒prepared、
+56278毫秒install_target，60000毫秒截止。第二代当前成本因identity_changed不可用，
+不能把第一代历史当作第二代成本，也不按跨runner墙钟差直接宣称加速百分比。
+
+本轮首次真实取得 `resources.cleanup=verified`，receipt的mounts为空、user_removed及
+group_removed均为true，证明该专用fixture账户、组与已记录挂载回收闭合；不扩展为真实
+用户部署恢复或三事务业务成功。暂不引入按mtime/identity复用解释器摘要的缓存：现场尚未
+细分binary成本，且重复真实内容核验与元数据缓存并非同等证明。
+
+### 下一窄片：成功安装直接返回严格确认，保留原启动核验
+
+首轮仅新增 `tests/test_managed_install_confirmation.py` 两个目标节点后，根实际收取
+2 failed（pytest3.00秒，守卫3.543秒、64.7MiB、swap0）：两者真实安装均已完成，
+准确在返回None而非BindingConfirmation处红，非fixture/import问题。随后授权本窄片
+生产候选及必要负控；候选尚待根检查，作者未自行运行。复用原backend的真实slot/anchor、journal、三文件CAS、writer lease与
+cgroup文件；仅systemd/process证据及命令执行沿既有Host最小替身，不声称真实服务已验。
+Native39上节现场保持原样，不将本设计当作已实现或已加速。
+
+重复接缝是：`ManagedLinuxBackend.install` 已在原lease与空cgroup下执行完整确认、
+probe/必要reload、再次确认；控制器成功后仍返回旧record。驱动因未推进还会等待一次，
+下轮完整helper核验后，`observe` 又确认三文件并再次probe，才构造安装确认；随后原
+`start` 仍独立完整核验。正常停止分支这一轮observe静态包含14次完整_check与12次应用
+Unit/Service RPC；这里只是源码调用量推导，未测收益，不保证60秒三事务通过。
+
+候选让正式managed安装返回准确 `BindingConfirmation`：position、role、configuration、
+selector（允许确证缺失）、unit和loaded_unit必须与本次材料及实际loaded证据完全一致。
+仅成功末尾可返回；不合成None、历史或部分安装确认。控制器经原截止重核、精确CAS后
+持久化start intent并沿原start执行，省掉上述重复observe。启动自身的15次完整_check、
+两次probe、全部真实内容hash、lease/空cgroup、loaded-unit、原效果前后门不得减少。
+不得跨await复用二进制摘要或用返回值替代start校验，不改变普通V1或持久格式/预算。
+
+当前两个首目标依次为：真实安装返回严格确认后，经正式CAS进入原start且保留其准确
+15-check/两probe；真实ManagedTransactionController单步安装完成后，不再另做一轮
+observe而推进并执行原start。两者均委派真实backend，未用未来缺失API/import制造红。
+shared policy仅增加可选安装观察返回，managed由完整匹配的严格BindingConfirmation
+构造停态安装证明，V1仍返回None、沿原重入观察路径。正式managed_host把同一个
+verify_helper传给续行；回调仍经原_call及原绝对期限约束，完成后再核截止/CAS，不能
+顺便删除原下一效果前的helper认证。直接构造driver可不提供回调，不冒充认证了helper。
+当前Host测试不证明真实helper/PID/cgroup资源认证已贯通。
+
+同一专用文件现补续行helper拒绝/取消、revision CAS/slot/unit/cgroup漂移及原截止失效；
+六个确认字段逐项漂移不得进入helper续行或start；安装回包丢失/取消后新driver重新
+观察，不假定start已发，回退保首因；未知start正常运行或已停止两种重开均不重复命令，
+停止分支仍ambiguous。这些重开只重建controller，另由既有host/真正锁重开组整合验证。
+新增 `tests/test_managed_host_install_confirmation.py` 沿实际run_managed_helper、真实
+journal/anchor/slot材料和原verify_helper，使用既有OS-facing probe与应用效果替身：
+安装后helper PID或kernel-limit证据失效必须先持久失败且零start；不能略过续行认证
+直到下一普通loop才发现。它是正式host接线负控，不称真实systemd资源认证验收。
+作者冻结后由根串行核验；新增21节点整组在原30秒门内硬超时，只有17个进度点，无
+pytest终态，不能记为通过。未提高时限，随后拆成完整不重叠五批、每批仍30秒：
+
+| 范围 | 节点 | pytest / 守卫耗时 | 峰值内存 |
+| --- | ---: | --- | --- |
+| 真实安装与单步续行 | 2 | 4.27 / 4.840秒 | 64.6MiB |
+| 续行拒绝、取消、漂移与截止 | 7 | 10.83 / 11.446秒 | 65.4MiB |
+| 严格确认六字段漂移 | 6 | 9.21 / 9.768秒 | 65.2MiB |
+| 安装丢回包及未知start重开 | 4 | 10.17 / 10.779秒 | 64.8MiB |
+| 正式host认证接线 | 2 | 2.59 / 3.176秒 | 65.2MiB |
+
+五批均exit0、swap0，共21个不同节点。后端、V1/V2控制器、host wiring、事务文件、
+helper成本与guard预算七个相邻文件另189 passed（pytest41.34秒，守卫42.093秒、
+100.9MiB、swap0），不借此前Native39的749节点重复累计本候选覆盖。
+非作者只读生产后审未发现明确P1/P2：原helper认证、截止重核、精确CAS及原start完整
+门保留，V1仍为None旧路径，丢失安装返回和未知start不重复发命令。
+正式host、shared事务记录、Linux控制器、helper、legacy host、停态观察、原生失败与
+maintenance另八文件218 passed（pytest37.53秒，守卫38.311秒、110.7MiB、swap0）。
+与上述组无重复，共428个不同本地节点通过。Ruff通过；格式首查只有两新测试排版，
+修正后388文件格式通过（守卫64毫秒、21.4MiB）；146源文件clean/noincremental strict
+通过（守卫9.192秒、373.9MiB、swap0、exit0）。新签名候选及真实原生CI仍待完成；
+源码推导的节省调用量不代替实际systemd收益或三事务60秒门验收。
