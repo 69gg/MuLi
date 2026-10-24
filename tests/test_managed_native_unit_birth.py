@@ -14,6 +14,7 @@ import pytest
 import test_managed_backend as backend_fixture
 from helpers import managed_native_unit as births
 from helpers import managed_native_worker as worker
+from test_linux_transaction import FakeBus
 from test_managed_native_ci import (
     fixture as fixture,
 )
@@ -31,6 +32,7 @@ from muli.managed_host import managed_helper_arguments
 from muli.management_transaction import TransactionJournal
 from muli.platforms import linux_controller, linux_transaction
 from muli.platforms.managed_deployment import SlotIdentity
+from muli.platforms.managed_probe import _UNIT_PATH
 from muli.platforms.transaction_files import (
     ConfigurationError,
     ConfigurationFile,
@@ -124,10 +126,10 @@ def cleanup_boundaries(
 
         async def _unit_path(self, name: str) -> str:
             assert name == "muli.service"
-            return "/fixed-fixture-unit"
+            return _UNIT_PATH
 
         async def _snapshot(self, path: str) -> SimpleNamespace:
-            assert path == "/fixed-fixture-unit"
+            assert path == _UNIT_PATH
             return SimpleNamespace(
                 fragment=str(unit_path(root)),
                 pid=0 if stopped else 100,
@@ -218,6 +220,141 @@ async def test_generated_helper_tracks_real_cas_then_case_cleanup_unlinks_only_c
     # Re-entering after a lost cleanup reply does not recreate/adopt the leaf.
     await case.cleanup()
     assert not unit_path(root).exists()
+
+
+@pytest.mark.parametrize("fault", [None, "properties", "fragment", "cgroup", "pid", "job"])
+async def test_actual_case_cleanup_preserves_birth_safety_after_stopped_unit_gc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    fault: str | None,
+) -> None:
+    """Real cleanup/birth/locks and typed probe; only OS effects use temporary replies."""
+    root = await observed_root(tmp_path, monkeypatch, fixture)
+    foreign = unit_path(root).with_name("unrelated.service")
+    foreign.write_bytes(b"foreign, not owned")
+    foreign_identity = foreign.stat().st_dev, foreign.stat().st_ino
+    owned_data = unit_path(root).read_bytes()
+    owned_identity = unit_path(root).stat().st_dev, unit_path(root).stat().st_ino
+    birth_data = (root / ".muli-native-unit.json").read_bytes()
+    service = UserService(
+        root / "config.json", root / "data", unit_path(root).parent, platform="linux"
+    )
+    bus = FakeBus(service)
+    bus.rows["ControlGroup"] = ("s", "/fixture-app")
+    cgroup_root = tmp_path / "cgroups"
+    group = cgroup_root / "fixture-app"
+    group.mkdir(parents=True)
+    events = group / "cgroup.events"
+    events.write_bytes(b"populated 1\n")
+    stopped = False
+    commands: list[tuple[str, ...]] = []
+    stopped_properties: list[str] = []
+    original_probe = linux_transaction.SystemdProbe
+    original_cgroup = linux_controller.CgroupObservation
+
+    async def manager(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        assert 0 < timeout <= worker.HTTP_SECONDS
+        assert limit == worker.MAX_BYTES and merge_stderr is False
+        if "ListUnitsByPatterns" in argv:
+            # Keep both actual listing parsers: no helper remains, but the app
+            # is present before its one real Case.command stop boundary.
+            name = argv[-1]
+            assert name == "muli.service" or name.startswith("muli-transaction-")
+            entries = (
+                [[name, "fixture app", "loaded", "active", "running", "", _UNIT_PATH, 0, "", "/"]]
+                if name == "muli.service"
+                else []
+            )
+            return {
+                "exit_code": 0,
+                "output": json.dumps({"type": "a(ssssssouso)", "data": [entries]}),
+            }
+        if stopped and "GetUnit" in argv:
+            assert argv[-1] == "muli.service"
+            return {
+                "exit_code": 1,
+                "output": "",
+                "stderr": "Call failed: Unit muli.service not loaded.\n",
+                "truncated": False,
+            }
+        if "get-property" in argv:
+            assert argv[8] == _UNIT_PATH
+            if stopped:
+                stopped_properties.append(argv[9].rsplit(".", 1)[-1])
+                if fault == "properties":
+                    return {"exit_code": 1, "output": "", "stderr": "", "truncated": False}
+        return await bus(argv, timeout=timeout, limit=limit, merge_stderr=merge_stderr)
+
+    def probe(**kwargs: Any) -> linux_transaction.SystemdProbe:
+        return original_probe(runner=manager, **kwargs)
+
+    def cgroups(path: Path, limit: int) -> linux_controller.CgroupObservation:
+        assert path == Path("/sys/fs/cgroup") and limit == worker.MAX_BYTES
+        return original_cgroup(cgroup_root, limit)
+
+    def membership(name: str, uid: int) -> Path:
+        assert name == "muli-native-cleanup.service" and uid == os.geteuid()
+        return root
+
+    async def command(*argv: str) -> str:
+        nonlocal stopped
+        assert argv == ("systemctl", "--user", "stop", "muli.service")
+        assert not stopped and unit_path(root).is_file()
+        commands.append(argv)
+        stopped = True
+        events.write_bytes(b"populated 1\n" if fault == "cgroup" else b"populated 0\n")
+        # The regular description can still be loaded by Properties; the
+        # collected instance is no longer returned by Manager.GetUnit.
+        bus.rows.update(
+            ActiveState=("s", "inactive"),
+            SubState=("s", "dead"),
+            MainPID=("u", 0),
+            Job=("(uo)", [0, "/"]),
+            InvocationID=("ay", []),
+        )
+        if fault == "fragment":
+            bus.rows["FragmentPath"] = ("s", str(foreign))
+        elif fault == "pid":
+            bus.rows.update(MainPID=("u", 100), InvocationID=("ay", list(range(16))))
+        elif fault == "job":
+            bus.rows.update(
+                Job=("(uo)", [1, "/org/freedesktop/systemd1/job/1"]),
+                InvocationID=("ay", list(range(16))),
+            )
+        return ""
+
+    case = worker.Case(root, seconds=worker.CLEANUP_SECONDS)
+    monkeypatch.setattr(linux_transaction, "SystemdProbe", probe)
+    monkeypatch.setattr(linux_controller, "CgroupObservation", cgroups)
+    monkeypatch.setattr(worker, "membership", membership)
+    monkeypatch.setattr(case, "command", command)
+    if fault is None:
+        await case.cleanup()
+        assert not os.path.lexists(unit_path(root))
+    else:
+        error: type[Exception] = (
+            linux_transaction.ObservationError if fault == "properties" else worker.NativeError
+        )
+        code = (
+            "systemd_observation_unavailable"
+            if fault == "properties"
+            else "native_cleanup_fragment"
+            if fault == "fragment"
+            else "native_service_not_empty"
+        )
+        with pytest.raises(error, match=code):
+            await case.cleanup()
+        assert unit_path(root).read_bytes() == owned_data
+        assert (unit_path(root).stat().st_dev, unit_path(root).stat().st_ino) == owned_identity
+    assert (root / ".muli-native-unit.json").read_bytes() == birth_data
+    assert commands == [("systemctl", "--user", "stop", "muli.service")]
+    assert stopped_properties == (["Unit"] if fault == "properties" else ["Unit", "Service"])
+    assert not os.path.lexists(root / ".muli-native-unit.pending")
+    assert (foreign.stat().st_dev, foreign.stat().st_ino) == foreign_identity
+    assert foreign.read_bytes() == b"foreign, not owned"
 
 
 async def test_failed_original_guard_never_starts_birth_or_file_publication(

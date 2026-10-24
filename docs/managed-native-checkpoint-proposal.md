@@ -1711,3 +1711,50 @@ maintenance另八文件218 passed（pytest37.53秒，守卫38.311秒、110.7MiB�
 修正后388文件格式通过（守卫64毫秒、21.4MiB）；146源文件clean/noincremental strict
 通过（守卫9.192秒、373.9MiB、swap0、exit0）。新签名候选及真实原生CI仍待完成；
 源码推导的节省调用量不代替实际systemd收益或三事务60秒门验收。
+
+### Native40真实结果：局部请求超时与清理失败分别保留
+
+签名提交 `afa37ac75c3280a47c50f882b0328d71ce606f6f` 的
+[CI 40091142140](https://github.com/69gg/MuLi/actions/runs/40091142140) 已终态failure：
+十项通用检查全部success，唯一managed-native作业 `120863893749` 失败。
+artifact `12559147404` 仅1998字节，SHA-256
+`eebb80ff2e1021392cdbbf016526ce28996860010ec598b166235666332974ee`；
+根已核对摘要、ZIP成员及原typed receipt/result，不执行归档内容。
+
+本轮adopt代 `55164643457f607e94eec7a3efe0c3de` 已于48916毫秒released、
+50142毫秒projection；switch于50144毫秒开始prepare，53096毫秒记录prepare后
+以 `TimeoutError/completed=false` 结束。此时尚未到原60秒总截止；
+`Case.http` 另有原2秒单请求期限，现有材料不能断言POST未受理或已经原子受理。
+不得把这次失败写成总门耗尽，也不根据跨runner墙钟差声称优化收益。
+准确adopt helper为PID2662/UID999/invocation
+`be36396930b4430c80358f81b38afd14`，历史成本checks139次/20428毫秒、
+bus274次/4293毫秒、HTTP12次/1378毫秒；没有第二代helper成本证据。
+
+后续独立cleanup步骤实际报 `native_bootstrap_not_empty` 并exit1；
+receipt仍有3个挂载，user_removed与group_removed均false，未取得
+`resources.cleanup=verified`。这与Native39的成功清理是两次不同运行，不能借用旧结论。
+现场是托管runner的专用fixture，不是本机真实用户服务；未进行本机挂载、账户或服务操作。
+
+源码独审另发现可独立验证的cleanup缺口：成功stop后再次通过GetUnit取应用路径，
+合法单元GC会阻断后面的真实birth删除；现有夹具固定保持loaded，未覆盖该窗口。
+该反例尚不能证明本轮现场就是GC。下一片先新增离线真实birth/Case.cleanup反例，
+再复用固定应用单元的规范Properties对象路径，保留fragment、PID/job、空cgroup、
+真实journal/control/writer lease及birth门；不把NoSuchUnit直接解释为安全空态，
+不递归删除未知目录、不增加任何期限。主prepare超时仍是独立未闭合项。
+
+该GC反例已由根准确先红：真实birth、cleanup、typed listing/Properties、stop与临时
+cgroup事件均已通过前置，停后的GetUnit按规范NoSuchUnit失败，1 failed、pytest0.39秒，
+守卫956毫秒、84.9MiB、swap0。首次误将selector传给仅接受文件的backend入口，被守卫
+125拒绝且未运行pytest；随后使用受保护的run -m pytest取得上述实际红，不记拒绝为测试。
+
+窄修只在fixture的两次应用快照中复用已有规范_UNIT_PATH，停后再次核对同一fragment；
+helper的一般查询、成功stop、PID/job/空cgroup、journal锁/writer lease及birth删除门保持。
+原正控与Properties不可用、fragment漂移、非空cgroup、PID和job五类负控共6 passed
+（pytest1.13秒，守卫1.645秒、75.5MiB、swap0、exit0）。负控保留owned叶的字节/inode
+和出生回执；全部保留外来叶、仅stop一次。根非作者完整差异审查未发现明确P1/P2。
+这证明离线反例已修，不代表本轮现场归因、prepare超时或真实清理已验收。
+
+根随后沿原30秒守卫运行birth、原生coordinator、checkpoint及资源envelope四个完整文件，
+690 passed（pytest4.90秒，守卫5.564秒、170.4MiB、swap0、exit0），包含上述6节点，
+不重复累加。Ruff通过，格式首查仅新测试一处列表排版，修正后全仓388文件格式通过。
+本片没有src生产变更，不借用前片146源码严格类型结果声称本片另跑过。

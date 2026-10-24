@@ -4151,6 +4151,7 @@ class Case:
         from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
         from muli.platforms.linux_controller import CgroupObservation
         from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+        from muli.platforms.managed_probe import _UNIT_PATH
 
         settings = fixture(self.root)
         require_environment(self.root, settings["uid"])
@@ -4202,13 +4203,17 @@ class Case:
         service_group = ""
         service_present = await service_exists(probe)
         if service_present:
-            unit = await probe._snapshot(await probe._unit_path("muli.service"))
+            unit = await probe._snapshot(_UNIT_PATH)
             require(
                 Path(unit.fragment) == self.root / "home/.config/systemd/user/muli.service",
                 "native_cleanup_fragment",
             )
             await self.command("systemctl", "--user", "stop", "muli.service")
-            unit = await probe._snapshot(await probe._unit_path("muli.service"))
+            unit = await probe._snapshot(_UNIT_PATH)
+            require(
+                Path(unit.fragment) == self.root / "home/.config/systemd/user/muli.service",
+                "native_cleanup_fragment",
+            )
             require(
                 unit.pid == 0
                 and unit.job == (0, "/")
