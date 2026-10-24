@@ -41,6 +41,22 @@ def config(protocol: ProtocolName = "openai_chat", **options: Any) -> ModelConfi
     )
 
 
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+def test_local_source_message_identity_does_not_enter_provider_request(
+    protocol: ProtocolName,
+) -> None:
+    plain = build_request(config(protocol), [Message("user", "准确正文")], [], stream=False)
+    identified = build_request(
+        config(protocol),
+        [Message("user", "准确正文", source_message_id="host-only-actual-message")],
+        [],
+        stream=False,
+    )
+    assert identified == plain
+    encoded = json.dumps(identified, ensure_ascii=False)
+    assert "source_message_id" not in encoded and "host-only-actual-message" not in encoded
+
+
 def payload(protocol: str) -> JsonObject:
     if protocol == "openai_chat":
         return {

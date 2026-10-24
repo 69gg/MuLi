@@ -4,13 +4,13 @@
 
 它复用 SQLite objects、events、ingress 和 message_order，不启动模型、后台 worker、网络请求或定时重试，不增加依赖。所有方法同步完成，事务内没有 await。宿主负责真实身份认证、`configuration_lock`、配置预算和提交后的事件通知/唤醒。
 
-## 手机控制候选
+## 手机控制
 
-开发中的手机入口复用同一领域层，使用 `owner_control` 的可选 `expected_approved_epoch` 核对状态回执中的双版本；只有传入该参数时才把它纳入请求指纹。既有控制回执查重先于两项版本比较，重投成功操作不会因当前版本已前进而再变更任务。原 Web 请求和指纹保持原样。
+手机入口复用同一领域层，使用 `owner_control` 的可选 `expected_approved_epoch` 核对状态回执中的双版本；只有传入该参数时才把它纳入请求指纹。既有控制回执查重先于两项版本比较，重投成功操作不会因当前版本已前进而再变更任务。原 Web 请求和指纹保持原样。
 
 `Runtime.submit_mobile_task_control` 在配置锁内执行必需的同步最终准入，并保存宿主不可变回执；控制确认回手机，调整产生的主输入仍是受保护的 task_control 引用且 route=null。纯暂停不增加新模型输入，已有待办仍沿原唤醒规则运行。主助手随后仍须读取完整要求、下一轮确认计划并显式派工，未知外发不重试。原手机控制切片的本地定向整合与独立后审证据见[候选记录](mobile-task-control-proposal.md#本地候选与独立后审2026-10-24)，发行状态以[2.45闭合](review-v2.45.md#发版闭合)为准；真实账号仍未验收，平台条件见[渠道](channels.md#手机上的显式任务控制)。
 
-手机重规划后续回复候选为宿主 `owner_control` 增加可选 `reply_origin`，只随首次重规划 ingress 在原控制事务中写入；它独立于 route 和权限，不进入公开 `OwnerControlRequest` 或旧请求指纹。重复领域回执在所有写入之前返回，不补写旧的来源或改派历史入站。可信来源只由 Runtime 的手机最终准入闭包提供。十五文件431项相关整合与全147源码类型检查通过，范围仅为主助手重规划说明，精确远端与发行待验，详见[2.46审查](review-v2.46.md)。
+2.46已发布的手机重规划后续回复为宿主 `owner_control` 增加可选 `reply_origin`，只随首次重规划 ingress 在原控制事务中写入；它独立于 route 和权限，不进入公开 `OwnerControlRequest` 或旧请求指纹。重复领域回执在所有写入之前返回，不补写旧的来源或改派历史入站。可信来源只由 Runtime 的手机最终准入闭包提供。十五文件431项相关整合与全147源码类型检查通过，范围仅为主助手重规划说明，精确远端与正式发行已闭合，详见[2.46审查](review-v2.46.md#发版闭合)。
 
 ## 持久状态与范围
 
@@ -94,6 +94,10 @@ ControlResult 提供 receipt、current、created 和可选 ingress；`public()` 
 - 新 epoch/取消/代次不匹配：标 superseded，不复活任务。
 
 DeliveryResult 包含 state、session_id、changed、wake、ingress、message、path。path=archive 时有真实 message 存档；path=ingress 时有实际 ingress。重试已 delivered 的对象不再改 agent。宿主只在方法返回后依据 wake 调度，并区分“owner 请求已接收”“计划已确认”“通知已投递”“队友实际续办”，不能用 delivered 冒充已经执行。
+
+手机完成回报候选为直接主队友增加可选证明：批准事务从原 owner 控制回执及真实主输入核验来源，保存 `task_plan_delivery.report_source={version:1,owner_receipt_id,reply_origin}`。Runtime 仅在准确通知实际进入本次请求后保存 `agent.report_binding={version:1,delivery_id,notice_id,run_id,generation,completion_revision,reply_origin}`，完成修订指向本次终态；Team 再次核验后与完成事件、报告同事务落盘。archive 须匹配准确存档及下一代；ingress 须核对真实已消费的通知、run_id 和两项 seq，delivered 入队或 pending 不足以绑定。无效、多义或缺失证明保留原派工来源，不查询 latest；旧重复批准原样返回、不补来源，下一代清除旧证明。此候选未改变公开 owner/模型接口，已完成[2.47本地闭合](review-v2.47.md#最终候选准备)，远端与发行待验；行为边界见[完成回报方案](mobile-task-completion-proposal.md)。
+
+准确承接同时要求宿主 `Message.source_message_id` 与完整通知正文匹配；它从实际持久记录赋值，正常 pack 副本保留，模型协议不发送。同正文的普通输入不能代替被裁剪或 hook 移除的通知，宿主身份缺失时不靠正文集合补证。
 
 另一个顺序是：目标仍 running/queued 时通知已投递，旧请求随后才被 epoch 门禁判为 paused。outbox 此时已 delivered，不能依赖 pending flusher 再唤醒。`resume_notified_target` 从当前批准事实推导唯一通知 ID，复用相同代次/完成修订校验，并核实 ingress 的真实 source、principal、route=null 与受保护 task_control 引用。若通知已被 claim，还同时检查历史消息与 ingress 的 input_seq、message seq、run_id 关联；普通输入、已取消 ingress、缺失档案或旧 epoch 不能成为续办凭据。查询使用确定 ID，不扫描全部历史。
 

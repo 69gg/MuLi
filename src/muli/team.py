@@ -64,6 +64,20 @@ class TeamManager:
     ) -> None:
         """Commit the terminal generation even when the identity is already queued again."""
         current = self.get(agent["id"])
+        if "report_binding" in current:
+            agent["report_binding"] = current["report_binding"]
+        binding = (
+            self.runtime.task_control.completed_report_binding(current, run_id)
+            if status == "completed"
+            and run_id is not None
+            and self.runtime.task_control is not None
+            else None
+        )
+        if binding is not None:
+            for kind, report in objects or []:
+                if kind == "team_report" and report.get("id") == run_id:
+                    report["reply_origin"] = binding["reply_origin"]
+                    report["report_binding"] = binding
         budget = self.runtime.config.settings.limits.max_output_chars
         result_chars = len(result)
         result = result[:budget]
@@ -463,6 +477,7 @@ class TeamManager:
                         "任务已暂停，等待主人明确要求重新规划及主助手确认方案",
                         observed_epoch=paused[1],
                     )
+                agent.pop("report_binding", None)
                 agent.update(status="running", generation=agent["generation"] + 1, updated_at=now())
                 run_id = self.runtime._launch(session, agent["role"], cast(Mode, agent["mode"]))
                 agent["run_id"] = run_id

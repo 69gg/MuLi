@@ -138,6 +138,7 @@ class Message:
     images: list[ImageInput] = field(default_factory=list)
     # Host metadata only. Provider codecs deliberately serialize explicit fields.
     preserve_content: bool = False
+    source_message_id: str | None = None
 
 
 @dataclass(slots=True)

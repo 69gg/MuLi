@@ -453,16 +453,22 @@ class Runtime:
         token = self._request_context.set(prepared)
         try:
             try:
+                projected = self.compaction.project(session_id)
                 messages = await self.prepare_context(
-                    session_id, self._history(session_id, pack=False)
+                    session_id, self._history(session_id, pack=False, stored=projected)
                 )
             except ContextLimitError:
                 # Retrying compaction uses the same frozen scope, never a new
                 # epoch attached to the old request's task brief.
                 if not await self.compaction.finish(session_id):
                     raise
+                projected = self.compaction.project(session_id)
                 messages = await self.prepare_context(
-                    session_id, self._history(session_id, pack=False)
+                    session_id, self._history(session_id, pack=False, stored=projected)
+                )
+            if self.task_control is not None and (run_id := self.run_ids.get(session_id)):
+                self.task_control.bind_report_notice(
+                    session_id, run_id, execution, projected, messages
                 )
             return replace(prepared, messages=messages)
         finally:
@@ -1439,8 +1445,15 @@ class Runtime:
                 interrupted=True,
             )
 
-    def _history(self, session_id: str, *, pack: bool = True) -> list[Message]:
-        stored = self.compaction.project(session_id)
+    def _history(
+        self,
+        session_id: str,
+        *,
+        pack: bool = True,
+        stored: list[dict[str, Any]] | None = None,
+    ) -> list[Message]:
+        if stored is None:
+            stored = self.compaction.project(session_id)
         self.compaction.observe(session_id)
         prompt = (
             Path(__file__).with_name("prompts").joinpath("system.txt").read_text(encoding="utf-8")
@@ -1554,6 +1567,7 @@ class Runtime:
                     provider_data=item.get("provider_data", {}),
                     images=[ImageInput(**image) for image in item.get("images", [])],
                     preserve_content=item.get("preserve_content") is True,
+                    source_message_id=item.get("id"),
                 )
             )
         repaired: list[Message] = []

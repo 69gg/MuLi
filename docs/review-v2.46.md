@@ -1,6 +1,6 @@
 # 手机重规划回复与记忆证据评估（2.46.0）
 
-2026-10-24，本地候选。精确远端CI、合并、签名标签和PyPI/GitHub发行尚未验收；本页不把候选版本号当作发行完成。
+2026-10-24，已正式发布。精确候选/main CI、GPG签名及PyPI/GitHub两处发行资产已验收，见下方[发版闭合](#发版闭合)。以下本地候选记录保留其当时证据与边界。
 
 ## 行为与边界
 
@@ -41,3 +41,16 @@
 既有 `scripts/release.py` 以v2.46.0核对源码、兼容声明、CHANGELOG、wheel及sdist一致（174毫秒、19.6MiB）。`scripts/check_wheel.py`只把本地wheel无依赖离线安装到临时目录，验证包内导入、声明、静态资源、API文档、提示词、桌面默认关闭、任务控制、完整ASGI生命周期与CLI版本（1.242秒、100MiB）；均swap0、exit0。没有安装到用户工具环境或启动真实服务。远端发行仍须使用其精确质量作业测试的构件，不能以本地准备代替。
 
 旅程与细节见[后续回复方案](mobile-task-control-proposal.md#手机重规划后续回复切片)、[接办旅程](task-handoff-journey.md)和[Runtime合同](task-control-runtime.md)。每次发行是检查点，下一片继续完整任务最终汇报及主动项目闭环。
+
+## 发版闭合
+
+精确提交 `5a5ae91be7dd86b9f68305c174469e319c66b8aa` 的[候选CI40050511098](https://github.com/69gg/MuLi/actions/runs/40050511098)与[main CI40051161988](https://github.com/69gg/MuLi/actions/runs/40051161988)各十项成功。[PR54](https://github.com/69gg/MuLi/pull/54)以原提交快进合入main，未重写签名；本地提交签名G，GitHub verification为valid。`v2.46.0`注释标签由有效密钥 `23C8AF06EF76B7295409E2AA738DBF23B05B37D4` 签名，`git verify-tag`确认Good signature。
+
+[发行40051756850](https://github.com/69gg/MuLi/actions/runs/40051756850)精确head相同，十项verify及prepare、publish、github-release共十三项全部成功。[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.46.0)于北京时间2026-10-24 10:01:04发布，非draft/prerelease；[PyPI 2.46.0](https://pypi.org/project/muli-agent/2.46.0/)两文件均未yank。仅读取小型元数据，未下载发行构件；两处名称、大小和SHA-256一致：
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.46.0-py3-none-any.whl` | 816508 | `3d75ea84f16551f99473d3b9af7a0df8af7b409307ec9c9d3048fae8c8136be1` |
+| `muli_agent-2.46.0.tar.gz` | 4297306 | `f37a698b0bf429bb809459d359404a6fa6ba4a4bad3fc180f2aa5d0201193d8a` |
+
+首次PyPI条件投影未产出可接纳记录（exit4）；随后直接读取同一版本的有限字段，确认上述完整两文件和未yank状态，不推断首次未接纳的原因。正式发布仍只覆盖上文功能范围：后续队友完成的独立主运行回手机、真实平台送达及原生恢复另行验收。26项记忆评估已随本版发布，固定策略不能证明自然模型判断质量。

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ import pytest
 from test_memory_context import fact
 from test_runtime import make_runtime
 
+from muli.context import context_size
 from muli.media import MediaConfig, MediaService
 from muli.memory_application import MemoryApplication
 from muli.providers import Message, ModelTurn, ToolCall
@@ -363,9 +363,7 @@ async def test_submit_keeps_complete_memory_pages_and_immediately_honors_smaller
         budget = runtime.config.settings.limits.max_context_chars
         assert len(MEMORY_HEADING + payload) <= budget // 4
         assert len(payload) <= runtime.config.settings.memory.context_max_chars
-        assert (
-            len(json.dumps([asdict(message) for message in request], ensure_ascii=False)) <= budget
-        )
+        assert context_size(request) <= budget
         latest_user = next(
             message.content for message in reversed(request) if message.role == "user"
         )

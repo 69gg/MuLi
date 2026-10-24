@@ -5,11 +5,10 @@ from __future__ import annotations
 import builtins
 import json
 from collections.abc import Callable
-from dataclasses import asdict
 from typing import Any, Literal, NotRequired, TypedDict
 
 from muli.config import Limits
-from muli.context import ContextLimitError
+from muli.context import ContextLimitError, context_size
 from muli.events import EventBus
 from muli.providers import Message
 from muli.store import Store, new_id, now
@@ -259,9 +258,7 @@ class Commitments:
                 {"commitment_id": item["id"], "revision": item["revision"], "brief": item["brief"]},
                 ensure_ascii=False,
             )
-            size = len(
-                json.dumps([asdict(Message(role="system", content=content))], ensure_ascii=False)
-            )
+            size = context_size([Message(role="system", content=content)])
             if size > self.max_context_chars():
                 raise ContextLimitError("完整任务说明超过上下文字符预算；请减少说明或提高上限")
         public = self.metadata(item)

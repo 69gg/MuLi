@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from muli.commitments import Commitments
-from muli.context import ContextLimitError
+from muli.context import ContextLimitError, context_size
 from muli.conversation import MAX_EVENT_ID_CHARS, Conversation
 from muli.providers import Message
 from muli.reply_origin import ReplyOrigin
@@ -373,10 +373,8 @@ class TaskControl:
         )
 
     def _budget(self, snapshot: TaskSnapshot) -> None:
-        rendered = json.dumps(
-            [asdict(Message(role="system", content=snapshot.context()))], ensure_ascii=False
-        )
-        if len(rendered) > self.commitments.max_context_chars():
+        size = context_size([Message(role="system", content=snapshot.context())])
+        if size > self.commitments.max_context_chars():
             raise ContextLimitError("完整受控任务说明和方案超过上下文字符预算")
 
     def execution_snapshot(self, session_id: str) -> TaskSnapshot | None:
@@ -631,6 +629,12 @@ class TaskControl:
             if len(normalized) > max_targets:
                 raise ControlUnavailable("targets_full", "方案通知目标超过配置预算")
             item = self._validate_replan(snapshot)
+            report_origin = self._owner_report_origin(
+                snapshot.replan_request_id,
+                snapshot.commitment_id,
+                snapshot.epoch,
+                caller_session_id,
+            )
             deliveries: list[JsonObject] = []
             for target in normalized:
                 agent = self.store.get("agent", target)
@@ -651,6 +655,18 @@ class TaskControl:
                         "expected_status": agent["status"],
                         "state": "pending",
                         "created_at": now(),
+                        **(
+                            {
+                                "report_source": {
+                                    "version": 1,
+                                    "owner_receipt_id": snapshot.replan_request_id,
+                                    "reply_origin": report_origin.dump(),
+                                }
+                            }
+                            if report_origin is not None
+                            and agent.get("parent_id") == caller_session_id
+                            else {}
+                        ),
                     }
                 )
             state = self._state(item)
@@ -680,6 +696,289 @@ class TaskControl:
             for delivery in deliveries:
                 self.store._put("task_plan_delivery", delivery)
             return ControlResult(receipt, self.current(snapshot.commitment_id), True)
+
+    def _owner_report_origin(
+        self, receipt_id: str, commitment_id: str, epoch: int, main_id: str
+    ) -> ReplyOrigin | None:
+        """Read the original authenticated control input, never today's chat destination."""
+        try:
+            self._main(main_id)
+            receipt = self.store.get("task_control_receipt", receipt_id)
+            if (
+                receipt is None
+                or receipt.get("action") != "request_replan"
+                or receipt.get("actor") != "owner"
+                or not isinstance(receipt.get("request_id"), str)
+                or self._receipt_id(commitment_id, "owner", receipt["request_id"]) != receipt_id
+                or receipt.get("commitment_id") != commitment_id
+                or type(receipt.get("epoch")) is not int
+                or receipt.get("epoch") != epoch
+            ):
+                return None
+            row = self.store.db.execute(
+                "SELECT * FROM ingress WHERE id=? AND session_id=?",
+                (receipt.get("ingress_id"), main_id),
+            ).fetchone()
+            if row is None or row["state"] != "delivered":
+                return None
+            payload = json.loads(row["payload"])
+            message = self.store.get("message", row["id"])
+            reference = {"commitment_id": commitment_id, "receipt_id": receipt_id, "epoch": epoch}
+            if (
+                not isinstance(payload, dict)
+                or message is None
+                or payload.get("id") != row["id"]
+                or any(
+                    record.get("session_id") != main_id
+                    or record.get("source") != "task-control"
+                    or record.get("principal") != "owner"
+                    or record.get("route") is not None
+                    or record.get("task_control") != reference
+                    for record in (payload, message)
+                )
+                or message.get("role") != "user"
+                or message.get("run_id") != row["run_id"]
+                or message.get("input_seq") != row["seq"]
+                or message.get("seq") != row["delivered_seq"]
+                or message.get("reply_origin") != payload.get("reply_origin")
+            ):
+                return None
+            origin = ReplyOrigin.load(payload.get("reply_origin"))
+            routes = origin.delivery_routes()
+            if (
+                origin.kind != "channel"
+                or origin.dump() != payload.get("reply_origin")
+                or len(routes) != 1
+                or routes[0].get("kind") != "private"
+                or routes[0].get("sender_id") != routes[0].get("target")
+            ):
+                return None
+            return origin
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return None  # Legacy or damaged source facts never acquire a destination retroactively.
+
+    def _report_candidate(
+        self, agent: JsonObject, run_id: str, notice: JsonObject
+    ) -> JsonObject | None:
+        """Prove one actual notice belongs to this execution, including the parked archive path."""
+        try:
+            self._main(agent["parent_id"])
+            reference = notice.get("task_control")
+            run = self.store.get("run", run_id)
+            if (
+                agent.get("status") != "running"
+                or agent.get("run_id") != run_id
+                or run is None
+                or run.get("session_id") != agent["id"]
+                or run.get("status") not in {"running", "completed"}
+                or not isinstance(reference, dict)
+                or set(reference) != {"commitment_id", "epoch", "delivery_id"}
+                or not isinstance(reference.get("delivery_id"), str)
+                or type(reference.get("epoch")) is not int
+                or notice.get("session_id") != agent["id"]
+                or notice.get("source") != "task-control"
+                or notice.get("principal") != "system:task_control"
+                or notice.get("route") is not None
+                or notice.get("role") != "user"
+                or notice.get("delivery_status") != "delivered"
+                or self.resolve_scope(agent["id"]) != reference["commitment_id"]
+            ):
+                return None
+            delivery = self.store.get("task_plan_delivery", reference["delivery_id"])
+            if (
+                delivery is None
+                or delivery.get("state") != "delivered"
+                or delivery.get("target_session_id") != agent["id"]
+                or delivery.get("commitment_id") != reference["commitment_id"]
+                or type(delivery.get("epoch")) is not int
+                or delivery.get("epoch") != reference["epoch"]
+            ):
+                return None
+            source = delivery.get("report_source")
+            if (
+                not isinstance(source, dict)
+                or set(source) != {"version", "owner_receipt_id", "reply_origin"}
+                or type(source.get("version")) is not int
+                or source["version"] != 1
+                or not isinstance(source.get("owner_receipt_id"), str)
+            ):
+                return None
+            receipt_id = self._receipt_id(
+                delivery["commitment_id"], "main", source["owner_receipt_id"]
+            )
+            receipt = self.store.get("task_control_receipt", receipt_id)
+            if (
+                delivery["id"] != _digest([receipt_id, agent["id"]])
+                or receipt is None
+                or receipt.get("action") != "approve_plan"
+                or receipt.get("actor") != "main"
+                or receipt.get("request_id") != source["owner_receipt_id"]
+                or receipt.get("commitment_id") != delivery["commitment_id"]
+                or receipt.get("epoch") != delivery["epoch"]
+            ):
+                return None
+            origin = self._owner_report_origin(
+                source["owner_receipt_id"],
+                delivery["commitment_id"],
+                delivery["epoch"],
+                agent["parent_id"],
+            )
+            if origin is None or origin.dump() != source["reply_origin"]:
+                return None
+            generation, revision = agent.get("generation"), agent.get("completion_revision", 0)
+            target_generation = delivery.get("target_generation")
+            target_revision = delivery.get("target_completion_revision")
+            if (
+                type(generation) is not int
+                or type(revision) is not int
+                or type(target_generation) is not int
+                or type(target_revision) is not int
+                or min(generation, revision, target_generation, target_revision) < 0
+            ):
+                return None
+            parked = False
+            if generation == target_generation + 1 and revision == target_revision + 1:
+                rows = self.store.db.execute(
+                    "SELECT data FROM events WHERE type='team.finished' AND session_id=? "
+                    "AND json_extract(data,'$.completion_revision')=? LIMIT 2",
+                    (agent["id"], revision),
+                ).fetchall()
+                if len(rows) == 1:
+                    terminal = json.loads(rows[0][0])
+                    parked = (
+                        terminal.get("status") == "paused"
+                        and terminal.get("generation") == target_generation
+                        and delivery.get("expected_status") in {"running", "queued"}
+                    )
+            if delivery.get("path") == "archive":
+                if (
+                    notice["id"] != delivery.get("archive_message_id")
+                    or notice.get("run_id") is not None
+                    or generation != target_generation + 1
+                    or not (
+                        (
+                            delivery.get("expected_status") == "paused"
+                            and revision == target_revision
+                        )
+                        or parked
+                    )
+                ):
+                    return None
+            elif delivery.get("path") == "ingress":
+                row = self.store.db.execute(
+                    "SELECT * FROM ingress WHERE id=? AND session_id=?",
+                    (delivery.get("ingress_id"), agent["id"]),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "delivered"
+                    or row["id"] != notice["id"]
+                    or row["run_id"] != run_id
+                    or notice.get("run_id") != run_id
+                    or notice.get("input_seq") != row["seq"]
+                    or notice.get("seq") != row["delivered_seq"]
+                ):
+                    return None
+                payload = json.loads(row["payload"])
+                if not isinstance(payload, dict) or any(
+                    payload.get(key) != notice.get(key)
+                    for key in ("id", "session_id", "source", "principal", "route", "task_control")
+                ):
+                    return None
+                same_running = (
+                    delivery.get("expected_status") == "running"
+                    and generation == target_generation
+                    and revision == target_revision
+                )
+                next_queued = (
+                    delivery.get("expected_status") == "queued"
+                    and generation == target_generation + 1
+                    and revision == target_revision
+                )
+                if not (same_running or next_queued or parked):
+                    return None
+            else:
+                return None
+            return {
+                "version": 1,
+                "delivery_id": delivery["id"],
+                "notice_id": notice["id"],
+                "run_id": run_id,
+                "generation": generation,
+                "completion_revision": revision + 1,
+                "reply_origin": origin.dump(),
+            }
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return None
+
+    def bind_report_notice(
+        self,
+        session_id: str,
+        run_id: str,
+        snapshot: TaskSnapshot | None,
+        projected: Sequence[JsonObject],
+        messages: Sequence[Message],
+    ) -> None:
+        """Only notices actually retained in this request can bind its own completion report."""
+        agent = self.store.get("agent", session_id)
+        if agent is None or snapshot is None or snapshot.epoch != snapshot.approved_epoch:
+            return
+        retained = {
+            (message.source_message_id, message.content)
+            for message in messages
+            if message.role == "user" and message.source_message_id is not None
+        }
+        candidates: dict[str, JsonObject] = {}
+        for notice in projected:
+            reference = notice.get("task_control")
+            if (
+                notice.get("principal") != "system:task_control"
+                or (notice.get("id"), notice.get("content")) not in retained
+                or not isinstance(reference, dict)
+                or reference.get("commitment_id") != snapshot.commitment_id
+                or reference.get("epoch") != snapshot.epoch
+            ):
+                continue
+            candidate = self._report_candidate(agent, run_id, notice)
+            if candidate is not None:
+                candidates[candidate["delivery_id"]] = candidate
+        if not candidates:
+            return
+        existing = agent.get("report_binding")
+        candidate = next(iter(candidates.values()))
+        if len(candidates) != 1 or (existing is not None and existing != candidate):
+            candidate = {"version": 1, "run_id": run_id, "ambiguous": True}
+        if existing != candidate:
+            self.store.put("agent", {**agent, "report_binding": candidate})
+
+    def completed_report_binding(self, agent: JsonObject, run_id: str) -> JsonObject | None:
+        """Recheck the frozen exact execution before Team commits its terminal fact and report."""
+        binding = agent.get("report_binding")
+        if (
+            not isinstance(binding, dict)
+            or set(binding)
+            != {
+                "version",
+                "delivery_id",
+                "notice_id",
+                "run_id",
+                "generation",
+                "completion_revision",
+                "reply_origin",
+            }
+            or type(binding.get("version")) is not int
+            or binding["version"] != 1
+            or not isinstance(binding.get("notice_id"), str)
+            or not isinstance(binding.get("delivery_id"), str)
+            or type(binding.get("generation")) is not int
+            or type(binding.get("completion_revision")) is not int
+            or binding.get("run_id") != run_id
+        ):
+            return None
+        notice = self.store.get("message", binding["notice_id"])
+        if notice is None:
+            return None
+        return binding if self._report_candidate(agent, run_id, notice) == binding else None
 
     def pending_deliveries(self, limit: int, *, after_id: str | None = None) -> list[JsonObject]:
         _positive(limit, "投递批次")
