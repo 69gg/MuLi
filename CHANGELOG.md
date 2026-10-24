@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- 候选：`commitment_inspect(section="delivery_review", record_id=准确旧单ID)` 可分页对照登记时与当前的完整目标、限制和来源定位，保留顺序及重复，单独呈现历史模型判断；文字变化不代表新要求已满足，不改变任务状态、授权或投递。验证与边界见[方案记录](docs/delivery-change-review-proposal.md)。
+
 ## [2.48.0] — 2026-10-24
 
 - 主助手可用 `task_delivery_record` 显式登记直接队友准确完成代次的本地文本附件验收单，并沿 `commitment_inspect(section="deliveries")` 及认证管理接口查询、分页读取。冻结任务目标、限制和执行版本，机器核对本地副本字节与发布证明，模型判断单独保存；不改变任务状态、授权或投递。

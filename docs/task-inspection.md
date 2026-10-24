@@ -15,6 +15,7 @@
 | `memories` | 必须提供非空 `query`；本地关键词/图候选，`candidate_usage="unknown"` |
 | `handoff`（开发中） | 必填 `agent_id`，指定队友的有限近期证据索引；不自动确认计划或接班 |
 | `deliveries`（候选） | 显式登记的不可变验收单目录，分别呈现宿主文件事实和模型判断，并计算当前/历史状态 |
+| `delivery_review`（候选） | 必填准确验收单 `record_id`，分页对照登记时与当前的完整任务说明，区分文字变化与历史判断 |
 
 主助手填写 `identifier`；绑定队友可省略，只能读取当前任务。每次调用都按真实会话重新解析范围，复制主助手的工具 schema 或旧游标不能继承主身份。Web 使用既有管理认证，不接受请求提供的 agent/owner 身份。任务资料、报告、来源和记忆都不授予新权限。
 
@@ -23,6 +24,12 @@
 目录接受 `limit`（1–100，默认 20）和 `cursor`，返回完整 `items/has_more/next_cursor`。沿返回游标继续，不按全局列表截取后过滤。关联检查只读父链字段；目录不装载队友 prompt/result、工作流 nodes 或报告 content。某项及游标放不下时留给下一页，首项也放不下则明确返回 `output_budget`。
 
 agents/reports/workflows/memories/deliveries 可用同一 section 和 `record_id` 读取一条完整持久 JSON；task 直接读正文。返回 `content/offset_bytes/next_offset_bytes/total_bytes/has_more`。续读同时回传 `revision`、`record_revision`、`next_offset_bytes`，可选 `length_bytes`；按 UTF-8 **字节**位置续读，拼接 content 后解析 JSON。整页元数据与正文共用 `max_output_chars`，保留给下一次模型请求，不能放下时明确拒绝。
+
+要求变化后，可先从 `deliveries` 取得准确旧单，再调用 `commitment_inspect(identifier=任务ID, section="delivery_review", record_id=旧单ID)`，认证管理接口使用相同查询参数。此段没有目录或自动挑选最近一单；正文沿上述分页，并以当前任务 `revision` 和完整复核正文 `record_revision` 同时约束续读。
+
+复核正文的 `recorded/current` 分别给出 task_revision、epoch 和完整规范 brief；`changes.goal/constraints/evidence_refs` 仅表示对应持久字段不相等。限制按各自版本的数组索引定位，保留顺序和重复，调序也算变化；只更新进度而未改说明时，三个变化标记均为 false。两版 evidence_refs 只保留登记的定位/声明，此页不重新读取来源正文，也不因来源已删而重新证明其有效性。
+
+原文件事实仍为 `host_facts`，仅在登记时核验；旧模型判断位于 `historical_model_judgments`，明确 `judgment_scope="recorded_requirements_only"`。宿主不把旧限制索引的 satisfied 迁移给新限制。沐璃可据两版文字另行判断成果可能复用在哪、还需补什么，并说明这是模型建议，不代表宿主或主人验收。此段不重新读附件、不更新旧单、不重派或外发，资料损坏或超预算明确拒绝。实现与离线验收状态见[成果变更复核方案](delivery-change-review-proposal.md)。
 
 正文仅证明 `source_completeness="stored_record_only"`：报告入库前可能已经限长，无法恢复此前丢掉的结果。消息继续用 `conversation_read` 的 session/message/seq 定位；附件使用既有附件工具。记忆及来源可用既有详情和 `memory_source_read` 核对，不能把“相关候选”改写为“任务曾依赖它”。
 

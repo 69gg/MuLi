@@ -140,7 +140,25 @@ class Commitments:
             raise KeyError(identifier)
         return item
 
-    def _validate_brief(self, value: object, *, stored: bool = False) -> dict[str, Any]:
+    def _validate_brief(
+        self, value: object, *, stored: bool = False, resolve_references: bool = True
+    ) -> dict[str, Any]:
+        if type(resolve_references) is not bool or (not resolve_references and stored is not True):
+            raise ValueError("仅规范持久说明可不重新解析原资料")
+        if not resolve_references:
+            # Review two stored declarations without loading their source bodies.
+            # Normal creation/update and all existing callers still resolve refs.
+            try:
+                json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise ValueError("持久任务说明不是有效UTF-8 JSON") from exc
+            if not isinstance(value, dict) or set(value) != {
+                "version",
+                "goal",
+                "constraints",
+                "evidence_refs",
+            }:
+                raise ValueError("持久任务说明缺少完整规范字段")
         keys = {"goal", "constraints", "evidence_refs"} | ({"version"} if stored else set())
         if not isinstance(value, dict) or value.keys() - keys:
             raise ValueError("任务说明包含未知字段或格式无效")
@@ -170,6 +188,29 @@ class Commitments:
                 or not ref["id"].strip()
             ):
                 raise ValueError("任务说明证据引用格式无效")
+            if not resolve_references:
+                if ref["kind"] == "message":
+                    if (
+                        set(ref) != {"kind", "id", "session_id", "seq"}
+                        or not isinstance(ref["session_id"], str)
+                        or not ref["session_id"].strip()
+                        or type(ref["seq"]) is not int
+                        or ref["seq"] < 1
+                    ):
+                        raise ValueError("持久消息引用缺少规范位置")
+                    copied_refs.append(
+                        {
+                            "kind": "message",
+                            "id": ref["id"],
+                            "session_id": ref["session_id"],
+                            "seq": ref["seq"],
+                        }
+                    )
+                elif set(ref) == {"kind", "id"}:
+                    copied_refs.append({"kind": "attachment", "id": ref["id"]})
+                else:
+                    raise ValueError("持久附件引用不能携带消息位置")
+                continue
             if self.store.get(ref["kind"], ref["id"]) is None:
                 raise ValueError("任务说明证据引用不存在或已删除")
             normalized: EvidenceRef = {"kind": ref["kind"], "id": ref["id"]}
