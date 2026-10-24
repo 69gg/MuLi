@@ -518,8 +518,13 @@ def test_ordinary_projection_rejects_transfer_without_writes_or_verification(
         read_projection(host.store),
     )
     with _published(host.journal, data):
-        with pytest.raises(ProjectionError, match="project_controller_transfer_unsupported"):
-            project_final(host.permit, host.store, verify_binding=verify)
+        if terminal:
+            with pytest.raises(ProjectionError, match="project_controller_transfer_unsupported"):
+                project_final(host.permit, host.store, verify_binding=verify)
+        else:
+            # The execution slice permits pending observations after the
+            # original Store/main checks; no final proof or receipt is issued.
+            assert project_final(host.permit, host.store, verify_binding=verify) is None
         assert host.store.db.total_changes == changes
         assert host.store.list("management", 100) == plans
         assert host.store.events() == events

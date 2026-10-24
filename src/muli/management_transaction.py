@@ -20,7 +20,11 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 if TYPE_CHECKING:
-    from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
+    from muli.managed_transaction import (
+        ProjectControllerTransferRecord,
+        ProjectFormatTransitionRecord,
+        TransactionRecordV2,
+    )
 
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$")]
 Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -508,7 +512,13 @@ class TransactionJournal(AbstractContextManager["TransactionJournal"]):
 
     def read_current(
         self,
-    ) -> TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord | None:
+    ) -> (
+        TransactionRecord
+        | TransactionRecordV2
+        | ProjectControllerTransferRecord
+        | ProjectFormatTransitionRecord
+        | None
+    ):
         """Dispatch the one state file without widening the legacy V1 reader."""
         from muli.managed_transaction import parse_managed_record
 
@@ -563,7 +573,13 @@ class JournalControl(FixedLock):
 
     def read_current(
         self,
-    ) -> TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord | None:
+    ) -> (
+        TransactionRecord
+        | TransactionRecordV2
+        | ProjectControllerTransferRecord
+        | ProjectFormatTransitionRecord
+        | None
+    ):
         self.check()
         record = self.journal.read_current()
         try:

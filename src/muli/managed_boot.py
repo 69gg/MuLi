@@ -23,6 +23,7 @@ from muli.config import ConfigFile
 from muli.format_evidence import FormatEvidence, read_format_evidence
 from muli.managed_transaction import (
     ProjectControllerTransferRecord,
+    ProjectFormatTransitionRecord,
     TransactionRecordV2,
     parse_managed_record,
     raw_snapshot,
@@ -231,6 +232,8 @@ class ManagedBootPermit:
         if self.journal.directory.read("state.json", self.journal.limits.max_record_bytes) != raw:
             raise ManagedBootError("managed_record_changed")
         record = parse_managed_record(raw, limits=self.journal.limits)
+        if isinstance(record, ProjectFormatTransitionRecord):
+            raise ManagedBootError("managed_boot_not_permitted")
         if isinstance(record, ProjectControllerTransferRecord) and (
             self.boot == record.identity.origin_boot
         ):

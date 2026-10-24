@@ -17,6 +17,7 @@ from muli.compatibility import CompatibilityManifest, FormatState, assess_compat
 from muli.managed_transaction import (
     ManagedAction,
     ProjectControllerTransferRecord,
+    ProjectFormatTransitionRecord,
     RoleBinding,
     ServiceIdentityV2,
     TransactionRecordV2,
@@ -43,10 +44,10 @@ from muli.management_transaction import (
 )
 
 Component = Literal["configuration", "selector", "unit"]
-_SnapshotRole = Literal["origin", "base", "target"]
+_SnapshotRole = Literal["origin", "base", "target", "source", "candidate", "fallback"]
 _SNAPSHOT_NAME = re.compile(
     r"[a-f0-9]{32}-(?:(?:base|target)(?:\.json|-(?:configuration|selector)\.json|-unit\.bin)"
-    r"|origin-(?:(?:configuration|selector)\.json|unit\.bin))"
+    r"|(?:origin|source|candidate|fallback)-(?:(?:configuration|selector)\.json|unit\.bin))"
 )
 
 
@@ -177,6 +178,8 @@ def prepare_managed(
     base_data.verify(base, limit)
     target_data.verify(target, limit)
     previous = control.read_current()
+    if isinstance(previous, ProjectFormatTransitionRecord):
+        raise TransactionError("project_format_transition_unsupported")
     record = prepare_record_v2(
         request_id=request_id,
         action=action,
@@ -337,6 +340,95 @@ def prepare_transfer_managed(
             raise TransactionError("snapshot_invalid")
     # Count anchor/slot publications and the atomic-replace temporary entry as
     # part of the same directory, rather than failing after publishing them.
+    guard()
+    _collect(control, previous, {**materials, **incoming}, collect=False, retain_incoming=True)
+    _collect(control, previous, {**materials, **incoming}, retain_incoming=True)
+    publish()
+    guard()
+    for name, data in incoming.items():
+        control._replace(name, data)
+    guard()
+    return control._write(record)
+
+
+def prepare_project_format_managed(
+    control: JournalControl,
+    *,
+    record: ProjectFormatTransitionRecord,
+    source_data: RoleSnapshots,
+    candidate_data: RoleSnapshots,
+    fallback_data: RoleSnapshots,
+    source_manifest: CompatibilityManifest,
+    candidate_manifest: CompatibilityManifest,
+    fallback_manifest: CompatibilityManifest,
+    writer: FixedLock,
+    guard: Callable[[], None],
+    materials: dict[str, bytes],
+    publish: Callable[[], None],
+) -> ProjectFormatTransitionRecord:
+    """Publish only prepared fixed-1-to-2 materials, never change a DB marker."""
+    control.check()
+    writer.check()
+    if writer.name != "lease" or _identity(os.fstat(writer.directory.fd)) != _identity(
+        os.fstat(control.journal.writer_directory.fd)
+    ):
+        raise TransactionError("writer_lease_required")
+    limit = control.journal.limits.max_snapshot_bytes
+    for snapshots, binding, manifest, state in (
+        (source_data, record.source.binding, source_manifest, record.source_format),
+        (candidate_data, record.candidate, candidate_manifest, record.target_format),
+        (fallback_data, record.fallback, fallback_manifest, record.target_format),
+    ):
+        snapshots.verify(binding, limit)
+        if compatibility_digest(manifest) != binding.compatibility:
+            raise TransactionError("compatibility_changed")
+        assessment = assess_compatibility(manifest, manifest, state, handoff_protocol=2)
+        if not assessment.format_compatible:
+            raise TransactionError(assessment.code)
+    if not (
+        source_data.configuration == candidate_data.configuration == fallback_data.configuration
+        and source_data.unit == candidate_data.unit == fallback_data.unit
+    ):
+        raise TransactionError("managed_source_changed")
+    previous = control.read_current()
+    if not isinstance(previous, (TransactionRecordV2, ProjectControllerTransferRecord)):
+        raise TransactionError("managed_project_source_required")
+    if not previous.resolved or previous.phase not in {"committed", "rolled_back"}:
+        raise TransactionError("transaction_in_progress")
+    if previous.request_id == record.request_id or previous.generation == record.generation:
+        raise TransactionError("request_conflict")
+    if record.source.projected != ProjectionReceipt(
+        **previous.position.model_dump(), store_instance=previous.identity.store_instance
+    ):
+        raise TransactionError("projection_required")
+    selected = previous.binding("target" if previous.phase == "committed" else "base")
+    if (
+        record.source.binding.model_dump(exclude={"configuration"})
+        != selected.model_dump(exclude={"configuration"})
+        or record.identity.deployment != previous.identity.deployment
+        or (record.identity.store_instance, record.identity.main_session)
+        != (previous.identity.store_instance, previous.identity.main_session)
+        or record.source_format != previous.observed_format
+    ):
+        raise TransactionError("managed_source_changed")
+    read_snapshots(control.journal, previous, "base")
+    read_snapshots(control.journal, previous, "target")
+    if isinstance(previous, ProjectControllerTransferRecord):
+        _read_snapshots(control.journal, previous.generation, previous.origin.binding, "origin")
+    if len(record.model_dump_json().encode()) > control.journal.limits.max_record_bytes:
+        raise TransactionError("record_budget")
+    incoming = {
+        **source_data.entries(record.generation, "source"),
+        **candidate_data.entries(record.generation, "candidate"),
+        **fallback_data.entries(record.generation, "fallback"),
+    }
+    for name, data in incoming.items():
+        try:
+            durable = control.directory.read(name, limit)
+        except FileNotFoundError:
+            continue
+        if durable != data:
+            raise TransactionError("snapshot_invalid")
     guard()
     _collect(control, previous, {**materials, **incoming}, collect=False, retain_incoming=True)
     _collect(control, previous, {**materials, **incoming}, retain_incoming=True)

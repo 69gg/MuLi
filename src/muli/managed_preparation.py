@@ -12,21 +12,23 @@ import json
 import os
 import secrets
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import TypeAdapter
 
-from muli.compatibility import assess_compatibility
+from muli.compatibility import _METADATA_BYTES, FormatState, assess_compatibility
 from muli.config import Settings
-from muli.format_evidence import FormatEvidence, read_format_evidence
+from muli.format_evidence import FORMAT_STATE_KEY, FormatEvidence, read_format_evidence
 from muli.maintenance import BootPermit, MaintenanceError
 from muli.managed_boot import ManagedBootPermit, _transfer_identity_matches
 from muli.managed_journal import (
     RoleSnapshots,
     _read_snapshots,
     prepare_managed,
+    prepare_project_format_managed,
     prepare_transfer_managed,
     read_snapshots,
 )
@@ -34,6 +36,10 @@ from muli.managed_runtime_binding import _legacy_installation
 from muli.managed_transaction import (
     ManagedAction,
     ProjectControllerTransferRecord,
+    ProjectFormatDatabase,
+    ProjectFormatMigration,
+    ProjectFormatSource,
+    ProjectFormatTransitionRecord,
     RoleBinding,
     ServiceIdentityV2,
     TransactionRecordV2,
@@ -57,10 +63,11 @@ from muli.management_transaction import (
     _snapshot,
 )
 from muli.platforms.filesystem_identity import verify_local_filesystems
-from muli.platforms.installation import InstallationManifest
+from muli.platforms.installation import InstallationManifest, _read_file
 from muli.platforms.linux_transaction import clock_reading
 from muli.platforms.managed_deployment import (
     _LAUNCHER_BYTES,
+    _PRIVATE_BYTES,
     DeploymentAnchor,
     DeploymentStore,
     SelectorSnapshot,
@@ -82,7 +89,7 @@ _IDENTIFIER = TypeAdapter(Identifier)
 CurrentRecord = TransactionRecord | TransactionRecordV2 | ProjectControllerTransferRecord
 Permit = BootPermit | ManagedBootPermit
 _ROLES: tuple[Role, ...] = ("base", "target")
-PrepareAction = ManagedAction | Literal["project_controller_transfer"]
+PrepareAction = ManagedAction | Literal["project_controller_transfer", "project_review_1_to_2"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +101,9 @@ class LocalSlotPaths:
 
 @dataclass(frozen=True, slots=True)
 class PreparedManaged:
-    record: TransactionRecordV2 | ProjectControllerTransferRecord = field(repr=False)
+    record: (
+        TransactionRecordV2 | ProjectControllerTransferRecord | ProjectFormatTransitionRecord
+    ) = field(repr=False)
     anchor: DeploymentAnchor = field(repr=False)
 
 
@@ -172,12 +181,14 @@ class ManagedPreparation:
         journal, store = permit.journal, self.runtime.store
         store.revalidate_format()
         previous = journal.read_current()
+        if isinstance(previous, ProjectFormatTransitionRecord):
+            raise MaintenanceError("project_format_transition_unsupported")
         if isinstance(previous, ProjectControllerTransferRecord):
             if (
                 not previous.resolved
                 or not isinstance(permit, ManagedBootPermit)
                 or permit.boot == previous.identity.origin_boot
-                or (item is not None and action != "restart")
+                or (item is not None and action not in {"restart", "project_review_1_to_2"})
             ):
                 raise MaintenanceError("project_controller_transfer_unsupported")
         receipt = read_projection(store)
@@ -429,6 +440,25 @@ class ManagedPreparation:
         ):
             raise MaintenanceError("foreign_service_boot")
 
+    def _project_evidence(self, permit: Permit) -> tuple[ProjectFormatDatabase, bytes]:
+        """Freeze existing main-file identity and a bounded, exact format marker."""
+        _, info = _read_file(permit.journal.database, 0, contents=False, private_owner=True)
+        with closing(self.runtime.store.db.cursor()) as cursor:
+            cursor.row_factory = None
+            rows = cursor.execute(
+                "SELECT CASE WHEN typeof(value) = 'text' "
+                "AND length(CAST(value AS BLOB)) <= ? THEN CAST(value AS BLOB) END "
+                "FROM runtime_state WHERE name = ? LIMIT 2",
+                (_METADATA_BYTES, FORMAT_STATE_KEY),
+            ).fetchmany(2)
+        if len(rows) != 1:
+            raise MaintenanceError("managed_project_marker_invalid")
+        marker: object = rows[0][0]
+        if not isinstance(marker, bytes):
+            raise MaintenanceError("managed_project_marker_invalid")
+        _snapshot(marker, _METADATA_BYTES)
+        return ProjectFormatDatabase(device=info.device, inode=info.inode), marker
+
     async def prepare(
         self,
         item: dict[str, Any],
@@ -445,16 +475,63 @@ class ManagedPreparation:
         if listener_guard is not None:
             listener_guard(target)
         action = item.get("action")
-        if action not in ("adopt", "switch", "configure", "restart", "project_controller_transfer"):
+        if action not in (
+            "adopt",
+            "switch",
+            "configure",
+            "restart",
+            "project_controller_transfer",
+            "project_review_1_to_2",
+        ):
             raise MaintenanceError("transaction_action_invalid")
         action = cast(PrepareAction, action)
         _IDENTIFIER.validate_python(item.get("id"), strict=True)
-        if (candidate is not None) != (action in ("adopt", "switch")):
+        if (candidate is not None) != (action in ("adopt", "switch", "project_review_1_to_2")):
             raise MaintenanceError("managed_candidate_paths_required")
         permit = self._permit()
         self._paths(permit)
         source = self._source(permit, item, action, candidate)
         transfer = action == "project_controller_transfer"
+        project_format = action == "project_review_1_to_2"
+        fallback: SlotIdentity | None = None
+        project_state: FormatState | None = None
+        project_evidence: tuple[ProjectFormatDatabase, bytes] | None = None
+        if project_format:
+            if (
+                not isinstance(permit, ManagedBootPermit)
+                or not isinstance(
+                    source.previous, (TransactionRecordV2, ProjectControllerTransferRecord)
+                )
+                or source.anchor is None
+                or source.anchor.controller_slot != source.slot.digest
+                or target != runtime.config.settings
+            ):
+                raise MaintenanceError("managed_project_source_required")
+            assert source.plan is not None
+            fallback_installation = source.plan.get("fallback_installation")
+            if fallback_installation != item.get("fallback_installation"):
+                raise MaintenanceError("managed_preparation_plan_changed")
+            if (
+                not isinstance(fallback_installation, str)
+                or len(fallback_installation) != 64
+                or any(value not in "0123456789abcdef" for value in fallback_installation)
+            ):
+                raise MaintenanceError("managed_project_fallback_required")
+            with DeploymentStore(
+                permit.journal.directory.path, permit.journal.limits
+            ) as deployments:
+                fallback = deployments.read_slot(fallback_installation)
+            verify_slot_files(fallback)
+            if source.evidence.state.metadata_version != 1 or any(
+                version != 1 for version in source.evidence.state.formats.model_dump().values()
+            ):
+                raise MaintenanceError("managed_project_source_format_invalid")
+            values = source.evidence.state.model_dump()
+            values["formats"].update(objects=2, ingress=2)
+            project_state = FormatState.model_validate(values)
+            project_evidence = self._project_evidence(permit)
+            if FormatState.from_json(project_evidence[1]) != source.evidence.state:
+                raise MaintenanceError("managed_project_marker_invalid")
         if transfer:
             if (
                 not isinstance(permit, ManagedBootPermit)
@@ -481,7 +558,7 @@ class ManagedPreparation:
             verify_current_slot(selected)
             if selected != source.slot or target != runtime.config.settings:
                 raise MaintenanceError("managed_adoption_changed")
-        elif action == "switch":
+        elif action in {"switch", "project_review_1_to_2"}:
             assert source.anchor is not None and candidate is not None
             if target != runtime.config.settings:
                 raise MaintenanceError("managed_switch_changes_configuration")
@@ -497,12 +574,24 @@ class ManagedPreparation:
                 raise MaintenanceError("restart_changes_configuration")
         assessment = assess_compatibility(
             source.slot.compatibility,
-            selected.compatibility,
+            source.slot.compatibility if project_format else selected.compatibility,
             source.evidence.state,
             handoff_protocol=2,
         )
         if not assessment.format_compatible:
             raise MaintenanceError(assessment.code)
+        if project_format:
+            assert fallback is not None and project_state is not None
+            if len(selected.canonical()) > _PRIVATE_BYTES:
+                raise MaintenanceError("managed_record_budget")
+            for slot in (selected, fallback):
+                assessment = assess_compatibility(
+                    slot.compatibility, slot.compatibility, project_state, handoff_protocol=2
+                )
+                if not assessment.format_compatible:
+                    raise MaintenanceError(assessment.code)
+            if len({source.slot.digest, selected.digest, fallback.digest}) != 3:
+                raise MaintenanceError("managed_project_roles_required")
         if action == "switch" and selected.digest == source.slot.digest:
             raise MaintenanceError("managed_switch_requires_different_slot")
         await self._observe_process(permit, source)
@@ -518,7 +607,7 @@ class ManagedPreparation:
         )
         generation = secrets.token_hex(16)
         assert source.plan is not None
-        if transfer and source.plan["status"] == "applying":
+        if (transfer or project_format) and source.plan["status"] == "applying":
             transaction = source.plan.get("transaction")
             if (
                 not isinstance(transaction, dict)
@@ -534,9 +623,11 @@ class ManagedPreparation:
         from muli.candidate_lineage import check_plan_budget
 
         check_plan_budget(queued, journal.limits.max_record_bytes)
-        expected = source.previous
+        expected: CurrentRecord | ProjectFormatTransitionRecord | None = source.previous
         expected_plan = source.plan
-        record: TransactionRecordV2 | ProjectControllerTransferRecord
+        record: (
+            TransactionRecordV2 | ProjectControllerTransferRecord | ProjectFormatTransitionRecord
+        )
         with journal.locked() as control:
 
             def gate() -> None:
@@ -559,6 +650,14 @@ class ManagedPreparation:
                 self._paths(permit)
                 verify_current_slot(source.slot)
                 verify_slot_files(selected)
+                if project_format:
+                    assert fallback is not None
+                    verify_slot_files(fallback)
+                    with DeploymentStore(journal.directory.path, journal.limits) as deployments:
+                        if deployments.read_slot(fallback.digest) != fallback:
+                            raise MaintenanceError("managed_preparation_installation_changed")
+                    if self._project_evidence(permit) != project_evidence:
+                        raise MaintenanceError("managed_preparation_store_changed")
                 if source.manifest is not None:
                     source.manifest.verify()
                 elif isinstance(permit, BootPermit) and isinstance(
@@ -615,6 +714,96 @@ class ManagedPreparation:
                 gate()
 
             validate()
+            if project_format:
+                assert source.anchor is not None and source.projected is not None
+                assert fallback is not None and project_state is not None
+                assert project_evidence is not None
+                anchor = source.anchor
+                limit = journal.limits.max_snapshot_bytes
+
+                def role_material(slot: SlotIdentity) -> tuple[RoleBinding, RoleSnapshots]:
+                    data = RoleSnapshots(
+                        source.data.configuration,
+                        SelectorValue(
+                            deployment=anchor.digest, installation=slot.digest
+                        ).canonical(),
+                        source.data.unit,
+                    )
+                    return RoleBinding(
+                        entry="managed",
+                        installation=slot.digest,
+                        compatibility=slot.compatibility_digest,
+                        configuration=_snapshot(data.configuration, limit),
+                        selector=_snapshot(cast(bytes, data.selector), limit),
+                        unit=raw_snapshot(data.unit, limit),
+                    ), data
+
+                source_binding, source_data = role_material(source.slot)
+                if source_data != source.data:
+                    raise MaintenanceError("managed_source_changed")
+                candidate_binding, candidate_data = role_material(selected)
+                fallback_binding, fallback_data = role_material(fallback)
+                prepared_format = ProjectFormatTransitionRecord(
+                    action="project_review_1_to_2",
+                    request_id=item["id"],
+                    generation=generation,
+                    identity=ServiceIdentityV2(
+                        deployment=anchor.digest,
+                        store_instance=source.evidence.store_instance,
+                        main_session=source.evidence.main_session,
+                        origin_boot=permit.boot,
+                    ),
+                    source=ProjectFormatSource(binding=source_binding, projected=source.projected),
+                    candidate=candidate_binding,
+                    fallback=fallback_binding,
+                    base=source_binding,
+                    target=candidate_binding,
+                    source_format=source.evidence.state,
+                    target_format=project_state,
+                    observed_format=source.evidence.state,
+                    migration=ProjectFormatMigration(
+                        id="project_review_1_to_2",
+                        version=1,
+                        database=project_evidence[0],
+                        source_marker=_snapshot(project_evidence[1], _METADATA_BYTES),
+                        target_marker=_snapshot(
+                            project_state.model_dump_json().encode(), _METADATA_BYTES
+                        ),
+                    ),
+                    deadline=deadline,
+                    challenge=secrets.token_hex(32),
+                )
+
+                def publish_project_format() -> None:
+                    nonlocal expected_plan
+                    runtime.store.event(
+                        "management.preparing", queued, objects=[("management", queued)]
+                    )
+                    expected_plan = queued
+                    with DeploymentStore(journal.directory.path, journal.limits) as deployments:
+                        deployments.publish_slot(selected, guard=gate)
+                        deployments.publish_slot(fallback, guard=gate)
+
+                record = prepare_project_format_managed(
+                    control,
+                    record=prepared_format,
+                    source_data=source_data,
+                    candidate_data=candidate_data,
+                    fallback_data=fallback_data,
+                    source_manifest=source.slot.compatibility,
+                    candidate_manifest=selected.compatibility,
+                    fallback_manifest=fallback.compatibility,
+                    writer=permit.lease,
+                    guard=validate,
+                    materials={
+                        f"slot-{selected.digest}.json": selected.canonical(),
+                        f"slot-{fallback.digest}.json": fallback.canonical(),
+                    },
+                    publish=publish_project_format,
+                )
+                expected = record
+                validate()
+                return PreparedManaged(record, anchor)
             if transfer:
                 assert source.anchor is not None and source.projected is not None
                 # Only the exact standalone launcher shipped with this bridge

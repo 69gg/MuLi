@@ -1,4 +1,4 @@
-# 项目复核的格式 1→2 与托管升级前置（待审、未实现）
+# 项目复核的格式 1→2 与托管升级前置（准备片已验证，迁移未实现）
 
 2026-10-24 发布基线整合：本开发树合并已发布 v2.45.0 的文档检查点 `bcf9aad`，该次合并仅引入文档和测试，没有生产代码改动。合并后的记忆评估、任务续接及项目格式/运行时定向检查实收 **38 passed、6 deselected**（pytest 1.58 秒；守卫 2.331 秒、117.8 MiB、swap 0、exit 0）。这不是新一轮全量后端验证；六项格式 2 正向仍未满足前置，控制权换代和格式迁移仍未发行。
 
@@ -110,3 +110,55 @@ journal 记录的 receipt 只是定位引用，必须从实际 DB 有界重读�
 5. 以实际格式 2 前置运行项目真实 fs_read/无工具两处 owner 屏障、本地中断、独立下一 run 与正常 close/reopen；另跑普通无工具/工具批→同 run 项目段→签名 owner 独立下一 run，核三处实际 claim 的 marker 透传及项目权限。再验旧槽在接触项目 pending/归档状态前拒绝。不能只证明新 reader 拒坏 marker，也不能用 fresh2 测试代替 managed1 升级。
 
 根先审本方案并分配格式/维护实现所有权；未通过上述前置之前，当前候选保持未发行，项目正向测试的真实格式门失败继续保留。
+
+## 独立格式转换动作的准备首片（离线已验证，尚不可执行）
+
+控制权换代执行候选已由根签名为本地检查点 `d7fd657484126c26ee51f1d733c634743d69c300`，不因此开放格式 2。本片仅接独立 `project_review_1_to_2` 的严格 record/parser 与正式 prepare 前置，不改 ordinary `ManagedAction`、same-format `assess_compatibility`、`CURRENT_FORMAT_STATE` 或 Transfer 的全格式 1 合同，不写 SQLite 迁移或新效果循环。生产实现是在根实收下列三个真实目标红后另行授权的，当前仍待根实际验证。
+
+现有 `ManagedPreparation.prepare` 只有 `candidate: LocalSlotPaths`，没有 fallback 参数。候选仍复用该参数；fallback 先通过已有 `DeploymentStore.publish_slot` 登记实际文件，再将该固定动作专属的 `fallback_installation=<完整 slot digest>` 冻结在同一个持久 management item 中。未来分支须从原有界 plan 读完整严格 hash，以同一 retained store 的 `read_slot` 和实际 `verify_slot_files` 复核，不能接任意 path、外来 DTO 或仅信调用者传值。fallback 若缺失、未登记、文件/声明变化或不能读写目标完整状态，必须在 DML、快照写入、GC 与效果之前拒绝；调用参数与持久 item 的差异也不提供新权限。
+
+首片正向材料固定为三个不同的实际安装身份：已换代并精确投影的 source1、candidate2 与 fallback2；source1 由正式新 boot 的 Permit、Runtime、当前配置和真实 projection 证明，不能把历史 health.boot 或原 controller 当运行者。其余两者是已核实际 retained 文件与声明的纯材料，解释器均为既有 fixture 的不可执行占位文件；本片没有证明格式 2 reader 可运行，不能据此发行 candidate/fallback。fallback 格式 2 声明与 candidate 一样按目标完整状态调用原 `assess_compatibility`，source1 则对真实当前完整 1 认证，普通 1→2 switch 仍拒绝。
+
+准备 record 的角色外形为 `source={binding,projected}`、`candidate`、`fallback`；三者不可变，`base` 严格等于 source.binding，`target` 严格等于 candidate。`source_format=observed_format=实际完整1`、`target_format=仅objects/ingress为2的完整状态`。全部九份本代配置/selector/unit材料分别以 source/candidate/fallback 固定角色保存并纳入原目录/临时项预算，不能只保存前代引用；live selector/config/unit、实际 DB inode/marker、前代投影在准备时不动。严格模型冻结迁移 ID `project_review_1_to_2`、版本 1、实际 DB device/inode，以及 source 原始 marker 与 target 固定 canonical marker 的 SnapshotReference；source 原文只从固定 runtime_state 键按既有 metadata 字节上限读出，不修改原文。
+
+新增唯一测试文件 `tests/test_project_format_transition_prepare.py`，复用现有 terminal Transfer 的真实文件/SQLite/新 anchor 与正式 `ManagedBootPermit.acquire → Runtime → project_final → observe_current` 前置，只有原 fixture 的 systemd/process 边界受控，不 mock reader、permit、projection 或准备分派。三节点均调用现有 `prepare` 签名，不导入尚不存在的模型/API：
+
+1. `test_formal_project_format_prepare_freezes_three_roles_without_migration`：实际 candidate2 参数与 retained fallback digest 齐备，期望 prepared、真实 Journal reader 重读、准确三角色/原 receipt/九快照及 live 文件/DB/marker 原样。目前应首先在原 action gate 被 `transaction_action_invalid` 拒绝，而非 missing import/参数错误。
+2. `test_formal_project_format_prepare_rejects_unusable_fallback_before_effects[missing]`：缺固定 fallback 字段必须 `managed_project_fallback_required`；捕获 journal 全文件、live 文件、SQL total_changes、事件位置、plan/receipt/marker 不变。
+3. `test_formal_project_format_prepare_rejects_unusable_fallback_before_effects[format-one]`：使用已登记且字节有效的真实 source1 slot 充当 fallback，原目标状态自比应 `current_format_unreadable`，其余同上零效果。不是坏 digest 或不存在的 slot 造成提前失败。
+
+根唯一守卫实收上述 **3 failed**（pytest 0.50 秒；守卫 1.073 秒、77.3 MiB、swap 0、exit 1）：正向在正式 prepare 的 `transaction_action_invalid`，两个负控也先被此真实 action gate 拒绝，而未到预期 fallback 拒绝；不存在缺导入、缺 API 或无效材料造成的假红。随后根授权本准备片实现。作者没有自行运行检查、格式化、Git、网络或真实服务；候选绿与静态结果尚待根收取。
+
+当前实现只接 `prepared/revision=1/intent=none/activation=pending`，`resolved=False`、`boot_role=None`，health、rollback challenge、首因均为空，rollback_attempted 必须为严格 false。没有状态推进函数、启动许可或迁移 SQL；现有 `advance_managed` 对该实际类型仍拒绝。Journal 按原有 reader 真实判别新 action，ordinary `parse_record_v2` 不接纳其字段。正式 prepare 只接受真实运行且已投影的 managed source；已经换代的 Transfer 可以作为该准备片 source，未 released 或旧 origin 仍不能借此进入。
+
+本代九快照与 candidate/fallback 登记材料先做原 record/entry/原子临时项预算，之后才提交 preparing 事件及材料；先验证前代完整快照与真实 projection，最后发布 state。source 的热配置与三份当前 unit 字节一致，三份 canonical selector 各自绑定同一现有新 anchor 和各自真实 slot。原 writer lease、configuration lock、deadline/rollback reserve、source/config/plan/marker/inode 的同步复核仍保留。此准备片不收养已发布的新动作作为后继或重试，不把不完整发布当成可执行状态。
+
+新增回归仍集中在 `tests/test_project_format_transition_prepare.py`：原三节点、`test_project_format_parser_strict_prepared_materials` 的固定负控（未知顶层/嵌套字段、缺角色/混角色、格式/marker 不符、版本/DB 身份和单向阶段边界）、`test_project_format_prepared_does_not_widen_ordinary_transfer_or_effects`、`test_project_format_directory_budget_rejects_before_plan_or_snapshot_write`。后者实际填充无关目录项，验证预算失败前 journal/live 文件、plan 和 SQL total_changes 不变；成功节点逐份核九材料实际 digest/size，不能用“文件非空”代替身份。效果门回归同时覆盖普通 reader/Transfer 格式 1 不变、Maintenance、投影、boot、helper reader 和 advance 拒绝，原 receipt 保持。
+
+共享 reader 联合仅新增此严格实际类型；四处旧消费者以根批准的窄 guard 拒绝：`Maintenance.current`、`project_final`（原 lease/connection/main 只读门之后、DML 前）、`ManagedBootPermit._record`、`managed_host._entry`。`ManagedPreparation._source` 同样不允许该未执行记录充当新 source。这些拒绝是本片尚未实现执行链的明确边界，不能作为最终升级/恢复功能交付；不放宽 Runtime、Store、Permit 或 launcher，也不把元数据声明称为格式 2 reader 已运行。
+
+### 准备首片的根验证与独立审查
+
+原三个正式 prepare 目标红之后，新文件实收 **25 passed**（pytest3.75秒，守卫4.363秒、
+104MiB、swap0、exit0）。旧事务/Journal三文件 **128 passed**，旧准备/boot/bootstrap/
+projection五文件 **197 passed**。整组七份Transfer测试最初 **156 passed、5 failed**：
+旧断言仍要求所有unreleased都拒绝，或用主nonce测试base角色；它们与已接线的完整driver
+合同不一致。仅两份旧测试与合同说明修正后，七份Transfer和新准备文件合并实收
+**186 passed**（pytest8.83秒，守卫9.432秒、127.4MiB、swap0、exit0）。
+其中已包含前述25项，不重复累计。新的准备记录仍在执行入口拒绝，CURRENT仍为完整格式1。
+
+旧断言修正保留旧origin/无boot_role拒绝、准确角色nonce、未sealed时精确
+`maintenance_incomplete`，以及SQL、事件、receipt、admission、state零变化。
+合法的未released角色只能进入probation；配置与用户输入仍暂停，最终投影为None，
+激活须匹配本次boot的实际健康证明。测试通过正式advance取得可恢复状态，未把
+released历史手工倒退成pending来制造材料。
+
+全148生产源 strict/no-incremental首检暴露Journal循环变量推断冲突，根只更名该变量为
+`snapshots`，修后通过（守卫8.741秒、418.4MiB、swap0、exit0）。Ruff首检两处import
+排版未统一，根仅整理这两处import并格式化改动文件；全仓Ruff及391文件格式检查通过。
+另一位未参与本片实现的Sol独立只读审查三角色实际材料、marker/inode复核、九快照预算、
+state最后发布、执行门拒绝及probation路径，未见确切P1/P2。
+
+上述仅是临时文件、SQLite及受控进程/systemd边界的离线证据；没有迁移用户数据、
+启动真实服务或证明格式2解释器可运行。真正受lease保护的1→2 SQLite事务、
+COMMIT不明恢复及candidate2/fallback2同库启动仍待独立实现和验收。

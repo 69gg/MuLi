@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from muli.maintenance import BootPermit
-from muli.managed_transaction import ProjectControllerTransferRecord, TransactionRecordV2
+from muli.managed_transaction import (
+    ProjectControllerTransferRecord,
+    ProjectFormatTransitionRecord,
+    TransactionRecordV2,
+)
 from muli.management_transaction import ProjectionReceipt, Role, TransactionRecord, _object
 from muli.platforms.transaction_files import _open_directory
 from muli.store import Store, now
@@ -189,6 +193,8 @@ def project_final(
     record = permit.journal.read_current()
     if record is None:
         return None
+    if isinstance(record, ProjectFormatTransitionRecord):
+        raise ProjectionError("project_format_transition_unsupported")
     _check_identity(permit, identity, record)
     # A pending record is an observation, never a final decision or permission.
     # In particular the new probationary host keeps the old durable receipt.

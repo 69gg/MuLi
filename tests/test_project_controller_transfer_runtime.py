@@ -16,7 +16,7 @@ from test_managed_transaction import deadline, move, prepared, proof, verifying
 from muli import managed_preparation, managed_runtime_binding
 from muli.maintenance import MaintenanceError
 from muli.managed_boot import ManagedBootError, ManagedBootPermit
-from muli.managed_journal import RoleSnapshots
+from muli.managed_journal import RoleSnapshots, advance_managed
 from muli.managed_preparation import ManagedPreparation
 from muli.managed_runtime_binding import RuntimeBindingError, verify_running_binding
 from muli.managed_transaction import (
@@ -372,10 +372,27 @@ async def test_terminal_transfer_real_permit_runtime_observe_and_restart(
         with pytest.raises(RuntimeBindingError, match="^runtime_binding_role_changed$"):
             verify_running_binding(permit, runtime.store, source.record, None)
         assert runtime.store.db.total_changes == changes
-        with pytest.raises(MaintenanceError, match="^project_controller_transfer_unsupported$"):
-            runtime.maintenance.readiness(
-                source.record.generation, permit.boot, source.record.challenge
-            )
+        state_bytes = (boot_host.journal.directory.path / "state.json").read_bytes()
+        events = runtime.store.events()
+        admission = runtime.maintenance.admission.allowed
+        if permit.role == "base":
+            # A rollback role must never borrow the target's primary nonce.
+            with pytest.raises(MaintenanceError, match="^transaction_unauthorized$"):
+                runtime.maintenance.readiness(
+                    source.record.generation, permit.boot, source.record.challenge
+                )
+        nonce = (
+            source.record.rollback_challenge if permit.role == "base" else source.record.challenge
+        )
+        assert nonce is not None
+        # RPC dispatch now exists, but this Runtime has not sealed coverage.
+        with pytest.raises(MaintenanceError, match="^maintenance_incomplete$"):
+            runtime.maintenance.readiness(source.record.generation, permit.boot, nonce)
+        assert runtime.store.db.total_changes == changes
+        assert runtime.store.events() == events
+        assert read_projection(runtime.store) == source.origin_receipt
+        assert runtime.maintenance.admission.allowed == admission
+        assert (boot_host.journal.directory.path / "state.json").read_bytes() == state_bytes
         projected = project_final(
             permit, runtime.store, verify_binding=runtime.maintenance.verify_managed
         )
@@ -418,44 +435,66 @@ async def test_terminal_transfer_real_permit_runtime_observe_and_restart(
         await runtime.close()
 
 
-@pytest.mark.parametrize("released", [True, False], ids=["released", "now-unreleased"])
-def test_terminal_transfer_old_entry_plan_is_only_routing(
+@pytest.mark.parametrize("released", [True, False], ids=["released", "pending-probation"])
+async def test_terminal_transfer_old_entry_plan_is_only_routing(
     boot_host: BootHost, monkeypatch: pytest.MonkeyPatch, released: bool
 ) -> None:
     _boot_environment(monkeypatch)
     source = _publish_terminal_transfer(boot_host, "committed")
-    plan = resolve_entry(boot_host.journal.directory.path, purpose="service")
     assert source.record.health is not None
-    changed = ProjectControllerTransferRecord.model_validate(
+    # Publish an eligible old prefix, then advance only through the formal
+    # Journal state API. A released->pending rewrite is not a legal history.
+    starting = ProjectControllerTransferRecord.model_validate(
         {
             **source.record.model_dump(),
-            "revision": source.record.revision + 1,
-            "activation": "released" if released else "pending",
-            "health": {
-                **source.record.health.model_dump(),
-                "admission": "released" if released else "paused",
-            },
+            "revision": source.record.revision - 2,
+            "phase": "activating",
+            "intent": "start_target",
+            "activation": "pending",
+            "health": None,
         }
     )
     with boot_host.journal.locked() as control:
-        control._replace("state.json", changed.model_dump_json().encode())
+        control._write(starting)
+    plan = resolve_entry(boot_host.journal.directory.path, purpose="service")
+    paused = HealthProofV2.model_validate(
+        {**source.record.health.model_dump(), "admission": "paused"}
+    )
+    with boot_host.journal.locked() as control:
+        verifying_record = advance_managed(
+            control, starting.position, TransitionV2(phase="verifying")
+        )
+        changed = advance_managed(
+            control, verifying_record.position, TransitionV2(phase="committed", proof=paused)
+        )
+        if released:
+            changed = advance_managed(
+                control,
+                changed.position,
+                TransitionV2(phase="committed", activation="released", proof=source.record.health),
+            )
+    assert isinstance(changed, ProjectControllerTransferRecord)
     before = database_snapshot(boot_host.journal.database)
-    if not released:
-        with pytest.raises(ManagedBootError, match="^managed_boot_not_permitted$"):
-            unexpected = _acquire_reopened_permit(boot_host, _FRESH_BOOT, plan=plan)
-            unexpected.close_after_writers()
-            unexpected.journal.__exit__()
-    else:
-        permit = _acquire_reopened_permit(boot_host, _FRESH_BOOT, plan=plan)
-        try:
-            assert plan.revision < permit.record.revision
-            assert permit._record() == (changed, "target")
-            assert changed.health is not None
-            assert permit.record == changed and permit.boot != changed.health.boot
-        finally:
-            permit.close_after_writers()
-            permit.journal.__exit__()
+    record_bytes = (boot_host.journal.directory.path / "state.json").read_bytes()
+    permit = _acquire_reopened_permit(boot_host, _FRESH_BOOT, plan=plan)
+    assert plan.revision < permit.record.revision
+    assert permit._record() == (changed, "target")
+    assert changed.health is not None
+    assert permit.record == changed and permit.boot != changed.health.boot
+    assert permit.probation is (not released)
     assert database_snapshot(boot_host.journal.database) == before
+    session = BootSession(permit.journal, permit.lease, permit.config_path, permit)
+    runtime = Runtime(permit.config, Path(source.anchor.data_dir), boot_session=session)
+    try:
+        assert runtime.maintenance.current() == changed
+        assert runtime.maintenance.admission.allowed is released
+        assert not runtime.started and not runtime.tasks
+        assert runtime.maintenance.configuration_blocked
+        assert read_projection(runtime.store) == source.origin_receipt
+    finally:
+        await runtime.close()
+    assert database_snapshot(boot_host.journal.database) == before
+    assert (boot_host.journal.directory.path / "state.json").read_bytes() == record_bytes
 
 
 def test_terminal_transfer_origin_cannot_change_between_acquire_and_open_store(
@@ -485,20 +524,33 @@ def test_terminal_transfer_origin_cannot_change_between_acquire_and_open_store(
 
 
 @pytest.mark.parametrize("invalid", ["origin-boot", "unreleased"])
-def test_terminal_transfer_invalid_boot_is_rejected_before_dml(
+async def test_terminal_transfer_boot_admission_distinguishes_origin_and_probation(
     boot_host: BootHost, monkeypatch: pytest.MonkeyPatch, invalid: str
 ) -> None:
     _boot_environment(monkeypatch)
     source = _publish_terminal_transfer(boot_host, "committed", released=invalid != "unreleased")
     before = database_snapshot(boot_host.journal.database)
     record_bytes = (boot_host.journal.directory.path / "state.json").read_bytes()
-    with pytest.raises(ManagedBootError, match="^managed_boot_not_permitted$"):
-        unexpected = _acquire_reopened_permit(
-            boot_host,
-            source.record.identity.origin_boot if invalid == "origin-boot" else _FRESH_BOOT,
-        )
-        unexpected.close_after_writers()
-        unexpected.journal.__exit__()
+    if invalid == "origin-boot":
+        with pytest.raises(ManagedBootError, match="^managed_boot_not_permitted$"):
+            unexpected = _acquire_reopened_permit(boot_host, source.record.identity.origin_boot)
+            unexpected.close_after_writers()
+            unexpected.journal.__exit__()
+    else:
+        permit = _acquire_reopened_permit(boot_host, _FRESH_BOOT)
+        assert permit.record == source.record and permit.role == "target"
+        assert permit.probation and not source.record.resolved
+        assert database_snapshot(boot_host.journal.database) == before
+        session = BootSession(permit.journal, permit.lease, permit.config_path, permit)
+        runtime = Runtime(permit.config, Path(source.anchor.data_dir), boot_session=session)
+        try:
+            assert runtime.maintenance.current() == source.record
+            assert not runtime.maintenance.admission.allowed
+            assert runtime.maintenance.configuration_blocked
+            assert not runtime.started and not runtime.tasks
+            assert read_projection(runtime.store) == source.origin_receipt
+        finally:
+            await runtime.close()
     assert database_snapshot(boot_host.journal.database) == before
     assert (boot_host.journal.directory.path / "state.json").read_bytes() == record_bytes
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Self
 from muli.managed_transaction import (
     HealthProofV2,
     ProjectControllerTransferRecord,
+    ProjectFormatTransitionRecord,
     TransactionRecordV2,
     format_digest,
 )
@@ -313,6 +314,8 @@ class Maintenance:
 
     def current(self) -> CurrentRecord | None:
         record = self.permit.journal.read_current() if self.permit else None
+        if isinstance(record, ProjectFormatTransitionRecord):
+            raise MaintenanceError("project_format_transition_unsupported")
         if isinstance(record, ProjectControllerTransferRecord) and (
             isinstance(self.permit, BootPermit)
             or self.permit is None

@@ -165,6 +165,8 @@ Journal 在纯门通过后，经同一受限目录读取并验证本代 origin/b
 
 ## 9. 2B：正式 terminal permit 到普通 restart 的读链红测
 
+本节保留 2B 当时的阶段性历史边界；其中“所有 unreleased 拒绝”和“Transfer RPC/执行尚未开放”的表述，现由第12节正式执行接线的合法角色 probation、准确 nonce/覆盖门及 pending 投影只读 noop 合同取代，旧 origin 与无 boot role 阶段仍拒绝，不能把合法 probation 当成 released。
+
 2A 已由根签名为 `f248fc1aabdea307a7370c96fa597bafa100a1c2`（本地、未推）。下一片先仅新增 `tests/test_project_controller_transfer_runtime.py` 的五节点。根唯一守卫已实际收取 **5 failed**，pytest 0.42s、守卫 971ms、峰值 74.9MiB、swap 0、actual exit 1；全部停在正式 `ManagedBootPermit.acquire` → `_record` 的 `managed_boot_verification_failed`，两项预期 `managed_boot_not_permitted` 的负控制也先遇同一接缝。这是完整材料通过正式入口后的行为红，不是 fixture/import 错误。
 
 复用现有 `test_managed_boot.Host` 的真实临时 SQLite、私有 journal、两个已登记安装、launcher/anchor 文件与进程属性边界。先从实际 slot、Store/main、渲染 unit 和 canonical selector 生成合法普通旧代，**通过正式 `ManagedBootPermit.acquire/open_store`、`verify_running_binding`、`project_final` 产生 origin 精确投影**，关闭旧 writer 后再冻结本代 Transfer 九快照与终态。当前 state 始终是严格 `ProjectControllerTransferRecord`；不把它转成普通 V2 交给被测读链，不手工实例化 permit、不替换任何 reader、Maintenance.current、verifier 或 projection checker。
@@ -259,3 +261,22 @@ origin RPC 本片复用真实旧 permit、receipt 与前后文件/记录核验�
 根对上述两项正式入口红的修补及整合实际复验：新三文件 **32 passed**（pytest 3.66s；守卫 4.214s、90.3MiB、swap 0、exit 0）；旧 bootstrap/projection 三文件 **102 passed**（pytest .97s；守卫 1.526s、93.5MiB、swap 0、exit 0）。全 148 生产源 strict/no-incremental 通过（守卫 8.789s、417.9MiB、swap 0、exit 0）。旧 backend 仅缩窄运行 hash/foreign-stop/deadline 关键集合，**12 passed / 22 deselected**（pytest 2.62s；守卫 3.139s、66.2MiB、swap 0、exit 0），不将未重跑的重哈希大集合计作完成。32 已包含先前三入口及两项正式入口，不与历史 30 相加；这些均为根执行的离线回归与类型检查，仍不开放格式 2 或 Project 正向 gate，也不替代真实宿主交接验收。
 
 准备侧三文件最终 **68 passed**（pytest 2.24s；守卫 2.795s、96.6MiB、swap 0、exit 0）。全仓Ruff与390份Python格式最终均通过。另一位未参与本片实现的Sol独立只读审查14份生产文件与4份新增测试，未发现确切新P1/P2；确认origin认证、阶段/方向前缀、lease及空cgroup、九快照总预算和state最后发布均有实际接线。审查不计作额外执行验收，本片保留CURRENT=1和实际格式迁移拒绝门，只保存为后续迁移前置检查点。
+
+2026-10-24 补全旧 Transfer 整组后的合同演进核对：根对七份 Transfer 测试文件的完整 **161 节点实收 156 passed / 5 failed**（pytest 5.63s；守卫 6.400s、113.2MiB、swap 0、exit 1），不能继续用此前仅新三文件 32 绿代表完整旧集合通过。五项失败分别为旧 pending projection 的 unsupported 期待、terminal Runtime 两角色的 readiness unsupported 期待、旧 EntryPlan 的 now-unreleased 期待，以及旧 invalid-boot 的 unreleased 期待。根与独立 Sol 源码核对确认它们仍描述第7/9节尚未开放执行的历史阶段，与本节随后授权的正式 probationary boot 和 pending 投影 noop 冲突；本轮新格式准备片的实际类型拒绝门未改变这些 Transfer 路径。历史红与此前分片证据均保留。
+
+仅修两份旧测试，不改生产或放宽许可：`test_ordinary_projection_rejects_transfer_without_writes_or_verification[False]` 明确得到 None，同时逐项保持 DB total_changes、management/events、旧 receipt、verifier 调用和 state bytes 不变；其 terminal=True 仍要求拒绝旧 BootPermit。terminal Runtime 正向按真实 permit.role 选择主/rollback nonce，覆盖未 seal 的精确 `maintenance_incomplete`，base 再保留错用主 nonce 的 `transaction_unauthorized` 负控；两种拒绝均核无写、无 admission 变化，之后原强投影→观察→普通 restart 旅程不删减。
+
+`test_terminal_transfer_old_entry_plan_is_only_routing` 的两参数改从已安装的合法 start_target 前缀取旧 EntryPlan，再由真实 `advance_managed` 经过 verifying→committed/paused，可选继续 released；不再用人工 released→pending 倒退伪装合法历史。旧 plan 仅负责路由，正式 Permit 重读当前角色/材料/格式/lease；fresh boot 不复用历史 health.boot。当前合法 pending 角色只取得 probation，真实 Runtime 保持 admission paused、配置闭锁、未 started/无任务、旧 receipt 不变；released 参数仍走其当前正式许可。`test_terminal_transfer_boot_admission_distinguishes_origin_and_probation` 保留旧 origin boot 拒绝，并将原 unreleased 一刀切负控改为同样的真实 Runtime probation/paused 边界；acquire 前后及 Runtime 关闭后对照原 DB 逻辑快照/state bytes。prepared/draining/stop_base/install_target 等无 boot role 阶段仍由现有 host 参数负控拒绝，未删减。
+
+上述测试修订尚待根唯一守卫复验，不将断言变更本身算绿。新格式准备片另已由根实收新文件 **25 passed**（pytest 3.75s；守卫 4.363s、104MiB），旧 transaction/journal 三文件 **128 passed**、preparation/boot/bootstrap/projection 五文件 **197 passed**。根随后修正 journal 局部循环变量 shadow 的四项类型错误，仅将最早的 RoleSnapshots 循环变量更名为 snapshots；全 148 生产源 strict/no-incremental 实际 exit 0（守卫 8.741s、418.4MiB、swap 0）。这些结果不抵消完整 Transfer 161 节点的上述失败历史，也不构成格式 2 迁移、真实解释器/服务或项目正向验收。
+
+根对上述修订实际复验：完整七份Transfer加新准备文件 **186 passed**（pytest8.83秒；
+守卫9.432秒、127.4MiB、swap0、exit0），包含全部161个Transfer与25个新准备节点。
+旧backend此前未跑完的22项保持原20秒硬截止，按四组互不重叠选择运行：
+complete-chain **2 passed / 32 deselected**（8.45秒），install/stop前置
+**7 passed / 27 deselected**（4.90秒），配置/恢复/reload顺序
+**6 passed / 28 deselected**（11.69秒），坏候选/健康/start/activation
+**7 passed / 27 deselected**（15.33秒）。四组守卫分别9.100/5.496/12.252/15.880秒，
+峰值71.9/64.8/66.5/66.2MiB，均swap0、exit0；与原12项合为34个不同backend节点。
+未提高期限，也不把此前两次整文件超时改记通过；现有证据支持累计工作量超出20秒，
+各已选小组没有观察到单节点失控。全仓Ruff与391份格式检查通过，首两处import排版红保留。

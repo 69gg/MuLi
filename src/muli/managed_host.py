@@ -98,6 +98,8 @@ def _entry(root: Path) -> _Entry:
         controller = store.read_slot(anchor.controller_slot)
         data = store.directory.read("state.json", anchor.journal.max_record_bytes)
         record = parse_managed_record(data, limits=anchor.journal)
+        if not isinstance(record, (TransactionRecordV2, ProjectControllerTransferRecord)):
+            raise TransactionError("managed_transaction_required")
         if (
             record.identity.deployment != anchor.digest
             or plan.installation != controller.digest

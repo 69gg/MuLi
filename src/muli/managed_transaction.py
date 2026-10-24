@@ -447,6 +447,136 @@ class ProjectControllerTransferRecord(_Protocol2):
         )
 
 
+class ProjectFormatSource(StrictRecord):
+    binding: RoleBinding
+    projected: ProjectionReceipt
+
+
+class ProjectFormatDatabase(StrictRecord):
+    device: int = Field(ge=0, lt=2**64)
+    inode: int = Field(gt=0, lt=2**64)
+
+
+class ProjectFormatMigration(StrictRecord):
+    id: Literal["project_review_1_to_2"]
+    version: int = Field(ge=1, le=1)
+    database: ProjectFormatDatabase
+    source_marker: SnapshotReference
+    target_marker: SnapshotReference
+
+
+class ProjectFormatTransitionRecord(_Protocol2):
+    """Prepared materials only; no SQL transition, boot or effect is authorized."""
+
+    request_id: Identifier
+    generation: Identifier
+    revision: int = Field(default=1, ge=1, le=1)
+    action: Literal["project_review_1_to_2"]
+    identity: ServiceIdentityV2
+    source: ProjectFormatSource
+    candidate: RoleBinding
+    fallback: RoleBinding
+    base: RoleBinding
+    target: RoleBinding
+    source_format: FormatState
+    target_format: FormatState
+    observed_format: FormatState
+    migration: ProjectFormatMigration
+    deadline: Deadline
+    phase: Literal["prepared"] = "prepared"
+    intent: Literal["none"] = "none"
+    activation: Literal["pending"] = "pending"
+    challenge: Identifier = Field(repr=False)
+    rollback_challenge: None = None
+    rollback_attempted: bool = False
+    health: None = None
+    code: None = None
+    failure_code: None = None
+
+    @field_validator("generation")
+    @classmethod
+    def snapshot_generation(cls, value: str) -> str:
+        if re.fullmatch(r"[a-f0-9]{32}", value) is None:
+            raise ValueError("invalid_generation")
+        return value
+
+    @model_validator(mode="after")
+    def consistent(self) -> Self:
+        source = self.source
+        if (
+            self.rollback_attempted
+            or self.base != source.binding
+            or self.target != self.candidate
+            or len(
+                {
+                    source.binding.installation,
+                    self.candidate.installation,
+                    self.fallback.installation,
+                }
+            )
+            != 3
+            or source.projected.generation == self.generation
+            or source.projected.store_instance != self.identity.store_instance
+        ):
+            raise ValueError("invalid_project_format_roles")
+        for binding in (source.binding, self.candidate, self.fallback):
+            if (
+                binding.entry != "managed"
+                or binding.configuration != source.binding.configuration
+                or binding.unit != source.binding.unit
+                or binding.selector is None
+                or binding.selector.digest != binding.selector.semantic_digest
+            ):
+                raise ValueError("invalid_project_format_binding")
+        if (
+            self.observed_format != self.source_format
+            or self.source_format.metadata_version != 1
+            or self.target_format.metadata_version != 1
+            or any(version != 1 for version in self.source_format.formats.model_dump().values())
+            or any(
+                version != (2 if domain in {"objects", "ingress"} else 1)
+                for domain, version in self.target_format.formats.model_dump().items()
+            )
+            or self.migration.source_marker.semantic_digest != format_digest(self.source_format)
+            or self.migration.source_marker.size > _METADATA_BYTES
+            or self.migration.target_marker
+            != _snapshot(self.target_format.model_dump_json().encode(), _METADATA_BYTES)
+        ):
+            raise ValueError("invalid_project_format_evidence")
+        return self
+
+    def binding(self, role: Role) -> RoleBinding:
+        if role not in {"base", "target"}:
+            raise TransactionError("invalid_role")
+        return self.base if role == "base" else self.target
+
+    @property
+    def position(self) -> Revision:
+        return Revision(generation=self.generation, revision=self.revision)
+
+    @property
+    def resolved(self) -> bool:
+        return False
+
+    @property
+    def boot_role(self) -> Role | None:
+        return None
+
+    def public(self) -> dict[str, str | int | bool | None]:
+        return {
+            "protocol": self.protocol,
+            "request_id": self.request_id,
+            "generation": self.generation,
+            "revision": self.revision,
+            "action": self.action,
+            "phase": self.phase,
+            "activation": self.activation,
+            "resolved": False,
+            "code": None,
+            "failure_code": None,
+        }
+
+
 class TransitionV2(StrictRecord):
     phase: Phase
     intent: Intent = "none"
@@ -472,7 +602,7 @@ def parse_record_v2(data: bytes, *, limits: JournalLimits | None = None) -> Tran
 
 def parse_managed_record(
     data: bytes, *, limits: JournalLimits | None = None
-) -> TransactionRecordV2 | ProjectControllerTransferRecord:
+) -> TransactionRecordV2 | ProjectControllerTransferRecord | ProjectFormatTransitionRecord:
     """Bounded action dispatch; ordinary V2 validation remains unchanged."""
     limits = limits or JournalLimits()
     if not isinstance(data, bytes):
@@ -485,6 +615,8 @@ def parse_managed_record(
             raise TransactionError("invalid_record")
         if values.get("action") == "project_controller_transfer":
             return ProjectControllerTransferRecord.model_validate(values)
+        if values.get("action") == "project_review_1_to_2":
+            return ProjectFormatTransitionRecord.model_validate(values)
     except (ValidationError, ValueError, RecursionError):
         raise TransactionError("invalid_record") from None
     return parse_record_v2(data, limits=limits)
