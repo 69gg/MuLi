@@ -7,6 +7,7 @@ running host. A helper may consume the returned generation after this method.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -443,12 +444,30 @@ class ManagedPreparation:
             assert source.anchor is not None and candidate is not None
             if target != runtime.config.settings:
                 raise MaintenanceError("managed_switch_changes_configuration")
-            selected = register_local_slot(
-                candidate.prefix,
-                candidate.python,
-                candidate.package_root,
-                limits=source.anchor.package_limits,
+            registering = asyncio.create_task(
+                asyncio.to_thread(
+                    register_local_slot,
+                    candidate.prefix,
+                    candidate.python,
+                    candidate.package_root,
+                    limits=source.anchor.package_limits,
+                )
             )
+            try:
+                selected = await asyncio.shield(registering)
+            except asyncio.CancelledError:
+                # Retain the preparation owner and its configuration lock until
+                # this file-only job settles, including repeated cancellation.
+                while not registering.done():
+                    try:
+                        await asyncio.shield(registering)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 - collect worker outcome before propagating cancellation
+                        break
+                if registering.done() and not registering.cancelled():
+                    registering.exception()
+                raise
         else:
             selected = source.slot
             if action == "restart" and target != runtime.config.settings:

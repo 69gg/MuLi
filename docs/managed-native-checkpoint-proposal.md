@@ -1758,3 +1758,41 @@ helper的一般查询、成功stop、PID/job/空cgroup、journal锁/writer lease
 690 passed（pytest4.90秒，守卫5.564秒、170.4MiB、swap0、exit0），包含上述6节点，
 不重复累加。Ruff通过，格式首查仅新测试一处列表排版，修正后全仓388文件格式通过。
 本片没有src生产变更，不借用前片146源码严格类型结果声称本片另跑过。
+
+### Native41：真实清理闭合，switch请求仍超时
+
+签名提交 `eeb7d7625dc8cceeaddf51a946bc5173cd940829` 的
+[CI 40093367567](https://github.com/69gg/MuLi/actions/runs/40093367567) 已终态failure：
+十项通用检查全部success，唯一managed-native作业 `120870459301` 失败。
+本轮原生artifact `12559543794` 为1685字节，SHA-256
+`1a62fe292780005beec044c0c81940c44313ec0e0f9fbd0462b1026a46c1d369`；
+根已核对摘要、精确两成员及typed receipt/result，不执行归档内容。
+本轮实际取得 `resources.cleanup=verified`、mounts为空、user_removed及group_removed
+均true；只证明该专用fixture清理完成，不将Native40旧现场倒写为成功。
+
+主结果仍为 `TimeoutError/completed=false/stage=prepare`：adopt代
+`1e911ddb3344093e3d13126b0fb706bc` 于50433毫秒released、51852毫秒projection，
+switch于51853毫秒开始prepare，54826毫秒结束。仍早于60秒总门；原2秒HTTP局部门
+保持，不能从timeline判定请求是否已原子接纳，不盲重投。准确adopt helper为
+PID2842/UID999/invocation `9093100ca8c04022a6a4a5ee08c93bc9`，checks139次/21917毫秒、
+bus274次/4466毫秒、HTTP12次/1490毫秒；不以跨runner时差声称加速。
+
+下一窄片仅将switch候选的纯文件注册卸载到受控线程，来源、SQLite、配置锁和发布门
+仍由原事件循环拥有。原2秒请求与60秒总门不增加，也不承诺单个卸载消除主超时。
+根已沿真实adopt/released后switch的正式准备路径取得响应性首红：prepared、generation、
+目标摘要和journal均通过前置，但注册尚未返回时独立主loop协程无法前进，准确为
+1 failed、pytest1.58秒，守卫2.548秒、72.6MiB、swap0。其余取消/重复取消与候选、
+源unit、原plan漂移负控已冻结，尚待生产实现后的根检查。
+
+根在授权最窄生产修正后实收上述完整新文件6 passed（pytest0.58秒，守卫1.149秒、
+76.6MiB、swap0、exit0）。switch只对三个Path和原PackageLimits执行file-only线程任务；
+shield保留任务引用，取消和重复取消仍等待真实线程结算、取回异常后传播原取消，配置锁
+不提前释放。adopt、后续原进程观察、来源与候选全hash、SQLite、CAS及发布门保持。
+非生产作者对实际代码及测试只读后审无明确P1/P2，不能以方案审替代实际代码审。
+
+六个完整准备、运行绑定、自管理与候选文件整合131 passed（pytest12.69秒，守卫13.593秒、
+186.4MiB、swap0、exit0），包含上述6项，不重复累加。Ruff和389文件格式通过。
+首次strict命令启用explicit-package-bases却漏配MYPYPATH，源码导入被当作Any并报311项；
+未改生产压制错误，按源码根补 `MYPYPATH=src` 后，146源文件strict/no-incremental通过
+（守卫7.898秒、374MiB、swap0、exit0）。本片未改变依赖或发行版本，新的精确签名
+候选及真实原生CI另行验证；这些本地结果仍不证明原2秒请求或60秒三事务已完成。
