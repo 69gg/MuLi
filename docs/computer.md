@@ -72,6 +72,8 @@ PID、句柄或 RuntimeId，不按标题回搜。密码节点不读 Name / Value
 
 `operation_timeout_seconds` 是一次无障碍操作的期限，大于 0、至多 120 秒；`snapshot_ttl_seconds` 同时约束快照与发现引用，大于 0、至多 300 秒，AX 还用它限制整个原生对象会话的绝对寿命。两者必须是有限数值。输出预算仍使用现有 `limits.max_output_chars`，无需再设置另一套预算。旧配置缺少这些字段时使用原来的 12 秒操作期限和 60 秒快照有效期。
 
+AX helper请求帧中的剩余时间同时受原绝对截止与配置操作期限约束；浮点舍入不能把帧值抬高至配置上限以上。启动或等待已消耗的时间不会重新授予，快照寿命和调用方更早的截止仍有效。
+
 `backend=auto` 在 Linux 选择 AT-SPI、macOS 选择 AX、Windows 选择 UIA，其他平台明确报告不可用；显式 `atspi` 或 `ax` 不自动降级。未新增 `uia` 配置枚举，旧配置格式不变。旧配置中已有的 `atspi` 保持原值；macOS 用户需明确改为 `auto` 或 `ax`。Python 路径只影响 Linux 的 AT-SPI/Portal。所有平台仍默认 `enabled=false`。
 
 ## 依据与验证边界

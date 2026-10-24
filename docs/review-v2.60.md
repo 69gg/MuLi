@@ -1,6 +1,9 @@
 # v2.60 本地声纹会话自动语音回复：候选验证记录
 
-状态：本地候选，尚未完成全部相关回归、质量与发行门；不代表远端 CI 或正式发行完成。功能合同见 [voice-reply-proposal.md](voice-reply-proposal.md)。
+状态：本地功能、相关回归、质量与离线包门已闭合。签名候选
+`b65ddf9fb817d3e77c801836696a4d64d050bff3` 已推送至
+[PR #68](https://github.com/69gg/MuLi/pull/68)，首轮远端十一绿、一项失败，尚未正式发行。
+功能合同见 [voice-reply-proposal.md](voice-reply-proposal.md)。
 
 ## 已实收证据
 
@@ -38,3 +41,28 @@
 - PersonalIO 先撤票并收取等待子任务，再关闭设备/媒体；取消 `Runtime.wait()` 的外层等待者保留其已有 shield，不改变主运行结果。票据只在内存中存在，正常重开没有历史补播入口。
 
 另一非测试作者已只读审查独立七边界，未发现明确P1/P2：私有任务字段只作结算屏障，核心结果取真实HTTP、播放器和持久事实；未手造票据或运行来替代入站。此后审不把生命周期测试视为模型或硬件验收。真实麦克风/扬声器、声纹算法识别率、自然模型表现、付费或外部账号服务均未验证。`played` 只表示播放器正常返回，不能证明人耳已听见，已发出的声音也无法追回。
+
+## 首次远端失败与原期限修复
+
+精确首候选的[CI 40091932382](https://github.com/69gg/MuLi/actions/runs/40091932382)
+终态failure，十二作业十一项success。唯一Windows3.12第二片作业 `120866219111`
+为1943 passed、742 skipped、1 failed、1 warning，pytest172.46秒；失败为旧
+`test_ax_lease.py::test_serial_requests_keep_one_process_and_return_only_result`，
+实际helper frame的timeout_seconds为 `2.0000000000000284`，违反原 `<=2` 配置上界。
+其余平台、quality和mcp通过；不能以十一绿替代发行门，也不归因语音断言。
+
+根新增两个受控浮点时钟节点，沿真实AXHelperLease.request、JSON frame、匹配ID的
+_response及原关闭回收，在二进制指数边界确定复现原加减舍入，实收2 failed
+（pytest0.12秒，守卫622毫秒、64.2MiB、swap0）：2秒与0.1秒配置实际分别输出
+2.0000001192092896与0.10000002384185791，未改真实事件循环时钟或扩大断言。
+生产只将frame剩余时间截至配置timeout；原绝对operation_deadline、TTL、caller更早
+deadline、timeout_at、写前末门及取消/unknown回收保持。整lease文件79 passed
+（pytest3.13秒，守卫3.649秒、63.8MiB、swap0、exit0）。非作者源码与回归后审未发现
+明确P1/P2，后续精确签名候选另取完整CI，不盲重跑原失败head。
+
+窄修后的三文件语音正式/生命周期/独立边界复验15 passed（pytest1.66秒，守卫2.581秒、
+140.4MiB）；与lease79节点不重叠，共94个本次后端节点，不把首候选905机械累计为新证据。
+153源码clean/noincremental strict通过（7.930秒、380.2MiB），Ruff与全仓415文件格式通过
+（格式76毫秒、21.8MiB）；83包离线锁70毫秒、29.2MiB。离线重建1.431秒、99.3MiB，
+内容校验174毫秒、19.4MiB，隔离wheel离线安装/导入/兼容/资产/API/提示词/桌面默认值/
+任务控制/lifespan烟测1.242秒、99.9MiB，版本2.60。均exit0、swap0，旧notes未覆写。

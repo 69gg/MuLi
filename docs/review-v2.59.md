@@ -143,4 +143,24 @@ success，包含此前失败的macOS3.12和完整其余平台、quality、mcp。
 候选本次检查通过，不倒推首次超时根因已经修复。首轮失败及受控诊断的限定保留。
 
 随后同步当前发布操作文档的十二项/十五项数量，历史十项/十三项发行证据不改。
+
+## 发行闭合
+
+最终签名提交 `300b68f0066a082e6a6bdf196f31668289858ae0` 的
+[CI 40091072098](https://github.com/69gg/MuLi/actions/runs/40091072098) 十二作业全部success。
+有效GPG签名标签v2.59.0与主分支已原子推送；PR #67于2026-10-24T11:58:19Z合并。
+[Release 40092008397](https://github.com/69gg/MuLi/actions/runs/40092008397) 十五作业全部success，
+包含完整跨平台验证、内容校验、PyPI Trusted Publishing及GitHub Release。
+同SHA的重复main CI `40092007557` 已终态cancelled，不记为通过。
+
+[GitHub v2.59.0](https://github.com/69gg/MuLi/releases/tag/v2.59.0) 于
+2026-10-24T12:07:55Z发布。根只读小体积GitHub/PyPI元数据，确认两平台构件名称、
+大小、SHA-256一致且PyPI未yank，没有下载发行包：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| muli_agent-2.59.0-py3-none-any.whl | 860694 | 9f5609afe619c9347a70009de87164903e998975047332d1e957ce5cf90ff36e |
+| muli_agent-2.59.0.tar.gz | 4570947 | 0170f6fa9dacc094e1a57b7c3e9b1d7df7eae3dd2091b6f5035d410c785a8886 |
+
+此记录写入后继候选，不改已冻结标签；首次macOS失败及未确定根因保留。
 最终文档提交的CI与签名标签、正式发行仍待闭合，不以先前候选绿色替代。
