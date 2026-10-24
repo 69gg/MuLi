@@ -825,7 +825,142 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 },
             )
             assert reassigned.status_code == 200
-            await asyncio.wait_for(replacement_started.wait(), 4)
+            try:
+                await asyncio.wait_for(replacement_started.wait(), 4)
+            except TimeoutError as error:
+
+                def stalled_diagnostic() -> str:
+                    # Read only fixed diagnostic labels, never error text or source bodies.
+                    def state_label(value: Any) -> str:
+                        return (
+                            value
+                            if isinstance(value, str)
+                            and value
+                            in {
+                                "queued",
+                                "running",
+                                "completed",
+                                "failed",
+                                "paused",
+                                "cancelled",
+                                "interrupted",
+                                "idle",
+                                "closed",
+                            }
+                            else "unknown"
+                        )
+
+                    def run_diagnostic(identifier: str) -> dict[str, Any]:
+                        run = runtime.store.get("run", identifier) or {}
+                        diagnostic = run.get("failure_diagnostic") or {}
+                        kind = diagnostic.get("exception_type")
+                        return {
+                            "status": state_label(run.get("status")),
+                            "exception_type": kind
+                            if isinstance(kind, str)
+                            and kind
+                            in {
+                                "AssertionError",
+                                "TypeError",
+                                "ValueError",
+                                "KeyError",
+                                "IndexError",
+                                "RuntimeError",
+                                "TimeoutError",
+                                "OSError",
+                                "PermissionError",
+                                "FileNotFoundError",
+                                "ConnectionError",
+                                "MemoryError",
+                                "RecursionError",
+                                "ExceptionGroup",
+                            }
+                            else "unknown",
+                        }
+
+                    def last_tool(session_id: str) -> dict[str, Any]:
+                        identifiers = {
+                            "handoff-web",
+                            "spawn-draft",
+                            "wait-draft",
+                            "original-evidence",
+                            "source-file",
+                        }
+                        message = next(
+                            (
+                                item
+                                for item in reversed(runtime.store.messages(session_id, limit=8))
+                                if item.get("role") == "tool"
+                                and item.get("tool_call_id") in identifiers
+                            ),
+                            None,
+                        )
+                        if message is None:
+                            return {"call_id": "not_observed"}
+                        try:
+                            payload = json.loads(message["content"])
+                        except (ValueError, TypeError):
+                            payload = None
+                        payload = payload if isinstance(payload, dict) else {}
+                        code = payload.get("code")
+                        failure = payload.get("error")
+                        kind = (
+                            re.fullmatch(
+                                r"工具执行失败：(AssertionError|TypeError|ValueError|KeyError|IndexError|"
+                                r"RuntimeError|TimeoutError|OSError|PermissionError|FileNotFoundError)",
+                                failure,
+                            )
+                            if isinstance(failure, str)
+                            else None
+                        )
+                        return {
+                            "call_id": message["tool_call_id"],
+                            "error": bool(failure),
+                            "exception_type": kind[1] if kind else "unknown",
+                            "code": code
+                            if isinstance(code, str)
+                            and code
+                            in {
+                                "output_budget",
+                                "evidence_changed",
+                                "task_paused",
+                                "invalid_arguments",
+                                "content_unavailable",
+                                "evidence_not_found",
+                            }
+                            else "unknown",
+                        }
+
+                    try:
+                        draft = runtime.team.get("草稿接办者")
+                    except ValueError:
+                        draft = {}
+                    diagnostic = {
+                        "phase": "draft",
+                        "rounds": {"main": main_round, "old": old_round, "draft": draft_round},
+                        "main": run_diagnostic(reassigned.json()["run_id"]),
+                        "main_tool": last_tool(main_id),
+                        "draft_status": state_label(draft.get("status")),
+                        "draft": run_diagnostic(draft.get("run_id", "")),
+                        "draft_tool": last_tool(draft["session_id"])
+                        if draft
+                        else {
+                            "call_id": "not_observed",
+                        },
+                        "pending_approvals": len(runtime.permissions.pending),
+                    }
+                    note = json.dumps(diagnostic, ensure_ascii=True, separators=(",", ":"))
+                    return (
+                        note
+                        if len(note.encode("utf-8")) <= 1024
+                        else ('{"phase":"draft","diagnostic":"output_budget"}')
+                    )
+
+                try:
+                    error.add_note(stalled_diagnostic())
+                except Exception:
+                    error.add_note('{"phase":"draft","diagnostic":"unavailable"}')
+                raise
             without_reference = list(worker_requests[0])
             user_index = next(
                 index for index, message in enumerate(without_reference) if message.role == "user"

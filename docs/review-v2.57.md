@@ -47,6 +47,22 @@ Store对象/事件及渠道outbox。定义和授权同事务；每轮run、occur
 - 离线sdist/wheel构建、v2.57标签与元数据/Changelog校验、安装轮包的导入、静态资源、
   API文档、提示词、桌面默认值、任务控制和应用生命周期烟测通过，无依赖下载。
 
-候选远端和正式发行待验。
+## 首次远端候选与有限诊断
+
+签名候选 `33f77a7` 的 CI `40083519702` 九项成功，唯一失败为 Windows Python3.12
+job `120841711555`：4054 passed、1468 skipped、1 failed（498.36秒）。节点为
+`test_task_handoff_runtime.py::test_owner_replans_failed_unknown_delivery_and_hands_original_evidence_to_draft_worker[onebot-compacted-reopened]`，
+在原第828行等待 `replacement_started` 的4秒门超时；正常压缩/重开、旧投递仍unknown及
+重派请求已先通过。这不是定时委托正式旅程失败，也不能仅凭Timeout推断运行缓慢或尚未spawn。
+
+该Event是在草稿队友第一轮通过来源/工具目录/原资料引用断言后才设置，原日志没有当前
+主/队友轮数及持久失败类型，尚不能区分上游主请求断言、工具回包或队友前置断言。
+根在Linux精确运行该节点1 passed（pytest0.87秒，守卫1.622秒、95.4MiB、swap0），
+该单次通过不证明Windows根因已修。现在仅在原超时处补不超过1KiB安全JSON备注：固定phase、
+三方轮数、准确本次主run与实际草稿run状态/异常类型、有限固定工具call_id/错误类型或code，
+以及审批数量；不输出原资料、错误正文、路径或凭据，不改生产、断言、4秒期限、预算或skip。
+备注后仍抛原TimeoutError。新增诊断本地和下一精确远端候选尚待根验证。
+
+候选完整远端验收和正式发行仍待。
 以上为受控模型策略、合成HTTP及临时Store，不代表自然研究质量或真实平台账号验收，
 正常关闭重开不等于强杀/掉电恢复。守卫数字为对应检查，不能当作整机峰值。
