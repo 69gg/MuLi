@@ -320,12 +320,20 @@ class SystemdProbe:
         unit = await self._properties(path, "Unit", _UNIT_FIELDS)
         service = await self._properties(path, "Service", _SERVICE_FIELDS)
         invocation, job, entries = unit["InvocationID"], unit["Job"], service["ExecStart"]
-        if not isinstance(invocation, list) or len(invocation) != 16:
+        if not isinstance(invocation, list) or len(invocation) not in {0, 16}:
             raise ObservationError("invalid_invocation")
         if any(type(item) is not int or not 0 <= item <= 255 for item in invocation):
             raise ObservationError("invalid_invocation")
         if not isinstance(job, list) or len(job) != 2:
             raise ObservationError("invalid_job")
+        active_state = _string(unit["ActiveState"])
+        pid = _number(service["MainPID"])
+        current_job = (_number(job[0]), _string(job[1]))
+        if not invocation:
+            # systemd encodes an absent ID as an empty ay, not sixteen zero bytes.
+            if active_state not in {"inactive", "failed"} or pid != 0 or current_job != (0, "/"):
+                raise ObservationError("invalid_invocation")
+            invocation = [0] * 16
         if not isinstance(entries, list) or len(entries) != 1:
             raise ObservationError("unsupported_exec_start")
         entry = entries[0]
@@ -334,16 +342,16 @@ class SystemdProbe:
         return UnitSnapshot(
             _string(unit["Id"]),
             _string(unit["LoadState"]),
-            _string(unit["ActiveState"]),
+            active_state,
             _string(unit["SubState"]),
             _string(unit["FragmentPath"]),
             _string(unit["SourcePath"]),
             _strings(unit["DropInPaths"]),
             _boolean(unit["NeedDaemonReload"]),
             bytes(invocation).hex(),
-            (_number(job[0]), _string(job[1])),
+            current_job,
             _string(service["Type"]),
-            _number(service["MainPID"]),
+            pid,
             _cgroup(service["ControlGroup"]),
             _string(entry[0]),
             _strings(entry[1]),

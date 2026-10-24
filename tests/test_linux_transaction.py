@@ -165,6 +165,64 @@ async def test_stopped_snapshot_does_not_claim_writer_or_cgroup_is_empty(tmp_pat
     assert not hasattr(result, "writer_free")
 
 
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+async def test_empty_invocation_only_represents_stopped_absence(tmp_path: Path, state: str) -> None:
+    service, bus, proc = fixture(tmp_path)
+    bus.rows.update(
+        MainPID=("u", 0),
+        ActiveState=("s", state),
+        SubState=("s", "failed" if state == "failed" else "dead"),
+        InvocationID=("ay", []),
+    )
+    result = await SystemdProbe(runner=bus, proc_root=proc).read(service)
+    assert result.process is None and result.unit.invocation == "0" * 32
+    assert result.unit.job == (0, "/") and len(bus.calls) == 5
+
+
+@pytest.mark.parametrize(
+    ("state", "pid", "job"),
+    [
+        ("active", 0, [0, "/"]),
+        ("activating", 0, [0, "/"]),
+        ("failed", 123, [0, "/"]),
+        ("inactive", 123, [0, "/"]),
+        ("inactive", 0, [1, "/org/freedesktop/systemd1/job/1"]),
+        ("failed", 0, [1, "/org/freedesktop/systemd1/job/1"]),
+    ],
+)
+async def test_empty_invocation_cannot_supply_live_or_pending_identity(
+    tmp_path: Path, state: str, pid: int, job: list[object]
+) -> None:
+    service, bus, proc = fixture(tmp_path)
+    bus.rows.update(
+        MainPID=("u", pid), ActiveState=("s", state), Job=("(uo)", job), InvocationID=("ay", [])
+    )
+    with pytest.raises(ObservationError, match="^invalid_invocation$"):
+        await SystemdProbe(runner=bus, proc_root=proc).read(service)
+
+
+@pytest.mark.parametrize(
+    "value", [False, [False] * 16, [-1] * 16, [256] * 16, [0] * 15, [0] * 17, b"\0" * 16]
+)
+async def test_stopped_snapshot_still_rejects_malformed_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    service, bus, proc = fixture(tmp_path)
+    bus.rows.update(MainPID=("u", 0), ActiveState=("s", "inactive"), InvocationID=("ay", value))
+    probe = SystemdProbe(runner=bus, proc_root=proc)
+
+    async def properties(
+        path: str, interface: str, fields: tuple[tuple[str, str], ...]
+    ) -> dict[str, Any]:
+        # Exercise the decoded snapshot boundary, including bytes which JSON
+        # cannot produce; the full read lifecycle has separate tests above.
+        return {name: bus.rows[name][1] for name, _ in fields}
+
+    monkeypatch.setattr(probe, "_properties", properties)
+    with pytest.raises(ObservationError, match="^invalid_invocation$"):
+        await probe._snapshot("/org/freedesktop/systemd1/unit/muli_2eservice")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

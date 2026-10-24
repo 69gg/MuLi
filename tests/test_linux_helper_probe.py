@@ -96,6 +96,16 @@ async def test_helper_requires_actual_process_and_enforced_kernel_limits(tmp_pat
     assert all("Environment" not in call for call in bus.calls)
 
 
+@pytest.mark.parametrize("stopped", [False, True])
+async def test_empty_invocation_never_authenticates_a_helper(tmp_path: Path, stopped: bool) -> None:
+    probe, bus, argv, _, _ = setup(tmp_path)
+    bus.rows["InvocationID"] = ("ay", [])
+    if stopped:
+        bus.rows.update(MainPID=("u", 0), ActiveState=("s", "inactive"), SubState=("s", "dead"))
+    with pytest.raises(ObservationError, match="^(invalid_invocation|unsupported_helper_layout)$"):
+        await probe.read_helper(NAME, argv, HelperLimits())
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

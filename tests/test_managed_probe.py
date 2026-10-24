@@ -192,6 +192,12 @@ async def test_running_unit_needing_reload_never_becomes_health(host: ProbeHost)
         await observe(host)
 
 
+async def test_running_managed_unit_without_invocation_is_not_health(host: ProbeHost) -> None:
+    host.bus.rows["InvocationID"] = ("ay", [])
+    with pytest.raises(ObservationError, match="^invalid_invocation$"):
+        await observe(host)
+
+
 @pytest.mark.parametrize("change", ["pid", "process", "unit"])
 async def test_changed_second_observation_is_rejected(host: ProbeHost, change: str) -> None:
     def modify() -> None:

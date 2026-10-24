@@ -1329,3 +1329,69 @@ Native34修后两文件共14 passed（pytest3.48秒、守卫4.011秒、68.3MiB�
 仅一新测试文件纯格式整理。非作者独审未发现剩余P1/P2，确认安全门和原通用GetUnit
 诊断仍有效。全部root串行守卫、swap0，无资源上限修改或真实本机服务操作；下一
 精确隔离CI仍待运行，未预写事务或cleanup已恢复。
+
+### Native35：官方空InvocationID的停止态观察（先目标回归）
+
+Native34精确签名head `59495171c4372fff6308d7cac925a9b0006b84a3` 的CI
+`40078985786`，managed-native job `120828380913` 再次失败。根已严格校验
+artifact `12553384920`（2025字节，SHA-256
+`e74d42221207be6af4d9f66db8404441726b84b6ea032f82a814a5dd5e0038f1`）。
+本次安全帧已推进到 `ManagedSystemdProbe.read_managed` →
+`SystemdProbe._snapshot` 的 `invalid_invocation`，仍在revision3的stop_base；
+不再是GetUnit失败。其它作业此刻尚未全终态，正式事务及cleanup仍未恢复。
+
+本次Context7 resolve实际返回monthly quota reached，随后核对固定v255 primary：
+[InvocationID属性注册](https://github.com/systemd/systemd/blob/v255/src/core/dbus-unit.c#L876)
+直接使用 `bus_property_get_id128`；该
+[getter](https://github.com/systemd/systemd/blob/v255/src/shared/bus-get-properties.c#L52-L65)
+对零ID返回空 `ay`，非零ID才返回16字节。原停止态fixture使用16个零字节，未覆盖
+官方空数组编码；现场的invalid_invocation本身仍不是导出原始属性值的证据。
+
+先仅修改原二步真实controller/probe回归的停止后属性为 `InvocationID=("ay", [])`。
+首step仍须真实stop成功、返回同revision并释放实际writerlease；第二step仍须通过原
+材料/双读/cgroup门而进入install_target，且总共只stop一次。目标仍为
+`tests/test_managed_stopped_unit_observation.py::test_successful_stop_then_collected_unit_advances_same_revision`。
+生产保持不变，待根先收准确目标红。拟定最小规则仅对真正inactive/failed、PID0、
+job0的空ID使用内部原32零hex表示absence；不放宽其它长度、类型或非法bytes，不给
+running、helper、health凭空创造invocation身份，不新增schema、RPC或时间预算。
+
+根随后实收该目标准确红：1 failed，pytest0.52秒、守卫1.047秒、65.1MiB、swap0。
+首step真实stop、writerlease释放和同revision均通过；第二step进入rolling_back而非
+install_target，安全帧为原_snapshot第324行，与34现场位置一致，但不据此倒推现场
+原值已被观察为 `[]`。
+
+获准后的唯一生产修改在原 `SystemdProbe._snapshot`：原严格Job/MainPID解析提前
+复用；空list只在inactive/failed、严格整数PID0和严格Job `(0, "/")` 时归一为原有
+32零hex。非空仍必须恰16个严格整数byte；bool、负byte、超255、其它长度和bytes对象
+均拒绝。它只表达absence，不证明cgroup空或writerlease可用；原材料、磁盘/进程双读、
+phase、cgroup和lease门不变。running服务的空ID仍被snapshot拒绝；inactive helper
+即便得到absence，也被原read_helper运行布局门拒绝，不能成为健康或boot身份。
+
+保留原真实二步formal和三个停止安全负控；补通用read的inactive/failed空ID正控、
+active/activating/PID非零/job非零拒绝，解码后snapshot边界的非法类型/byte/长度拒绝，
+以及原helper、managed健康入口的无ID拒绝。bytes对象仅用于解码后纯边界，未宣称
+它能由JSON线协议产生。生产与测试只静态读回，作者未执行检查/格式/Git/真实服务；
+修后结果待根收取和非作者独审。
+
+Native34最终除managed-native外，Linux3.12和3.13 shard1也各有两个失败，均为
+`test_managed_bootstrap.py::test_fresh_actual_service_identity_precedes_configuration_and_sqlite`
+的旧绝对RPC次数 `4 == 5` 断言。3.12实收3363 passed、15 skipped、两fail，161.12秒；
+3.13实收3363 passed、15 skipped、两fail，240.76秒；余八个作业通过，不称十通用
+全绿。根独立将该fixture改为准确核两遍Unit/Service固定path属性顺序，保入场前
+writerlease、配置和SQLite原断言：两节点先红2 failed（pytest0.20秒、守卫765毫秒、
+68.1MiB），窄修后2 passed（pytest0.22秒、守卫850毫秒、64.2MiB），均swap0。
+该更改不涉及生产，本片同行提交；原34远端失败历史保留。
+
+Native35根随后实收精准六个selectors共19 passed（pytest0.78秒、守卫1.303秒、
+66.5MiB）；七整文件stopped observation、Linux transaction、helper、managed probe、
+bootstrap、managed controller和controller failure diagnostic共214个不同节点通过
+（pytest6.82秒、守卫7.361秒、87.2MiB）。前述19项和bootstrap两项均在214项内，
+不重复累计。整合首命令误写一个不存在的测试文件，0项、exit4；未改生产，按实际
+文件名更正后才取得上述整组结果。146源码clean strict通过（8.041秒、413.2MiB）；
+全Ruff通过（64毫秒、21.8MiB），382文件格式检查通过（65毫秒、22.1MiB）。所有
+实际检查由根串行守卫完成、swap0；作者未自行执行。
+
+非作者A独立审查生产、18个新增参数节点、原formal及根的bootstrap断言修订，未见
+剩余P1/P2；根也完成整合审查。当前仅本地候选闭合，尚未提交或取得Native35远端
+结果，不称正式事务恢复；已知cleanup所有权P2仍未修，Native34现场原始InvocationID
+值仍未导出，官方空数组规则与离线反例不代替该现场原值证据。源码和测试继续冻结。

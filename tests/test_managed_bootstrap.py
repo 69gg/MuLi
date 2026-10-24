@@ -208,7 +208,18 @@ async def test_fresh_actual_service_identity_precedes_configuration_and_sqlite(
     observed: list[str] = []
 
     def acquire(*args: Any, **kwargs: Any) -> ManagedBootPermit:
-        assert len(host.bus.calls) == 5
+        # Both complete property observations must precede admission. Managed
+        # lookup no longer needs GetUnit, which misses collected stopped units.
+        endpoint = "org.freedesktop.systemd1"
+        assert [call[6:10] for call in host.bus.calls] == [
+            [
+                "get-property",
+                endpoint,
+                "/org/freedesktop/systemd1/unit/muli_2eservice",
+                f"{endpoint}.{interface}",
+            ]
+            for interface in ("Unit", "Service", "Unit", "Service")
+        ]
         with pytest.raises(TransactionError, match="lock_busy"):
             host.journal.writer_lease().__enter__()
         observed.append("admission")

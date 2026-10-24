@@ -79,7 +79,8 @@ async def test_successful_stop_then_collected_unit_advances_same_revision(
             ActiveState=("s", "inactive"),
             SubState=("s", "dead"),
             MainPID=("u", 0),
-            InvocationID=("ay", [0] * 16),
+            # v255 bus_property_get_id128 encodes a missing ID as an empty ay.
+            InvocationID=("ay", []),
             ControlGroup=("s", ""),
         )
         collected = True
