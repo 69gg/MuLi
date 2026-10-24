@@ -565,10 +565,12 @@ def bootstrap_files(
         charge(manifest.encode())
         value = json.loads(manifest)
         require(
-            isinstance(value, dict) and set(value) == {"directories", "file"},
+            isinstance(value, dict)
+            and set(value) in ({"directories", "file"}, {"directories", "file", "mask"}),
             "native_bootstrap_invalid",
         )
         directories, identity = value["directories"], value["file"]
+        mask_identity = value.get("mask")
 
         def pair(item: object) -> bool:
             return (
@@ -581,11 +583,16 @@ def bootstrap_files(
             isinstance(directories, list)
             and 2 <= len(directories) <= 5
             and all(pair(item) for item in directories)
-            and (identity is None or (pair(identity) and len(directories) == 5)),
+            and (identity is None or (pair(identity) and len(directories) == 5))
+            and (
+                mask_identity is None
+                or (pair(mask_identity) and identity is not None and len(directories) == 5)
+            ),
             "native_bootstrap_invalid",
         )
         require(
-            mode != "create" or (len(directories) == 2 and identity is None),
+            mode != "create"
+            or (len(directories) == 2 and identity is None and mask_identity is None),
             "native_bootstrap_invalid",
         )
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -641,66 +648,92 @@ def bootstrap_files(
                 except FileNotFoundError:
                     break
                 raise NativeError("native_bootstrap_unconfirmed")
-        name = user + ".target"
+        target_name = user + ".target"
+        mask_name = "gpg-agent-ssh.socket"
         if len(handles) == 5:
             if mode == "create":
-                data = bootstrap_data()
-                charge(data)
-                descriptor = os.open(
-                    name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    0o644,
-                    dir_fd=handles[-1],
-                )
-                with os.fdopen(descriptor, "wb") as output:
-                    os.fchmod(output.fileno(), 0o644)
-                    output.write(data)
-                    output.flush()
-                    os.fsync(output.fileno())
-                    info = os.fstat(output.fileno())
-                    identity = [info.st_dev, info.st_ino]
-            leaf: os.stat_result | None
-            try:
-                leaf = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
-            except FileNotFoundError:
-                require(mode == "remove" or identity is None, "native_bootstrap_changed")
-                leaf = None
-            if leaf is not None:
+                for name, data in ((target_name, bootstrap_data()), (mask_name, b"")):
+                    charge(data)
+                    descriptor = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        0o644,
+                        dir_fd=handles[-1],
+                    )
+                    with os.fdopen(descriptor, "wb") as output:
+                        os.fchmod(output.fileno(), 0o644)
+                        output.write(data)
+                        output.flush()
+                        os.fsync(output.fileno())
+                        info = os.fstat(output.fileno())
+                        if name == target_name:
+                            identity = [info.st_dev, info.st_ino]
+                        else:
+                            mask_identity = [info.st_dev, info.st_ino]
+            leaves: list[tuple[str, os.stat_result | None]] = []
+            for name, expected, content in (
+                (target_name, identity, bootstrap_data()),
+                (mask_name, mask_identity, b""),
+            ):
+                try:
+                    leaf = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
+                except FileNotFoundError:
+                    require(mode == "remove" or expected is None, "native_bootstrap_changed")
+                    leaves.append((name, None))
+                    continue
                 require(
-                    identity is not None
-                    and [leaf.st_dev, leaf.st_ino] == identity
+                    expected is not None
+                    and [leaf.st_dev, leaf.st_ino] == expected
                     and stat.S_ISREG(leaf.st_mode)
                     and stat.S_IMODE(leaf.st_mode) == 0o644
                     and (leaf.st_uid, leaf.st_gid) == (0, 0),
                     "native_bootstrap_changed",
                 )
-                data = _read_regular(Path(name), limit - used, directory_fd=handles[-1])
-                charge(data)
-                require(data == bootstrap_data(), "native_bootstrap_changed")
-                linked = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
-                require(
-                    all(
-                        getattr(linked, key) == getattr(leaf, key)
-                        for key in (
-                            "st_dev",
-                            "st_ino",
-                            "st_mode",
-                            "st_uid",
-                            "st_gid",
-                            "st_size",
-                            "st_mtime_ns",
-                            "st_ctime_ns",
-                        )
-                    ),
-                    "native_bootstrap_changed",
+                data = _read_regular(
+                    Path(name), min(limit - used, len(content)), directory_fd=handles[-1]
                 )
+                charge(data)
+                require(data == content, "native_bootstrap_changed")
+                leaves.append((name, leaf))
+
+            # Both leaves must be safe before deleting either one. Recheck the
+            # complete set after all reads, including identity and content size.
+            def check_leaves() -> None:
+                for name, leaf in leaves:
+                    try:
+                        linked = os.stat(name, dir_fd=handles[-1], follow_symlinks=False)
+                    except FileNotFoundError:
+                        require(leaf is None, "native_bootstrap_changed")
+                        continue
+                    require(
+                        leaf is not None
+                        and all(
+                            getattr(linked, key) == getattr(leaf, key)
+                            for key in (
+                                "st_dev",
+                                "st_ino",
+                                "st_mode",
+                                "st_uid",
+                                "st_gid",
+                                "st_size",
+                                "st_mtime_ns",
+                                "st_ctime_ns",
+                            )
+                        ),
+                        "native_bootstrap_changed",
+                    )
+
+            check_leaves()
             for index in range(len(handles)):
                 check_directory(index)
             if mode == "remove":
-                if leaf is not None:
-                    remaining(deadline)
-                    os.unlink(name, dir_fd=handles[-1])
+                check_leaves()
+                for name, saved_leaf in leaves:
+                    if saved_leaf is not None:
+                        remaining(deadline)
+                        os.unlink(name, dir_fd=handles[-1])
                 identity = None
+                mask_identity = None
         if mode == "remove":
             for index in range(len(handles) - 1, 1, -1):
                 remaining(deadline)
@@ -711,6 +744,7 @@ def bootstrap_files(
                 os.rmdir(names[index - 1], dir_fd=handles[index - 1])
                 directories.pop()
             identity = None
+            mask_identity = None
         for index in range(len(directories)):
             check_directory(index)
         account = pwd.getpwnam(user)
@@ -719,7 +753,13 @@ def bootstrap_files(
             "native_bootstrap_identity",
         )
         remaining(deadline)
-        return {"code": "verified", "directories": directories, "file": identity, "used": used}
+        return {
+            "code": "verified",
+            "directories": directories,
+            "file": identity,
+            "mask": mask_identity,
+            "used": used,
+        }
     except Exception as error:
         code = str(error) if isinstance(error, NativeError) else "native_bootstrap_invalid"
         return {"code": code, "used": limit}

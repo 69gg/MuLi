@@ -189,3 +189,47 @@ native20 已实际取得同实例用户manager私有peer的 `basic=inactive、NJ
 首次Ruff指出两处导入排序，format check指出四文件排版；根仅执行对应导入整理及格式化。最终五个Python文件Ruff及format check均exit0；`MYPYPATH=src:tests`下两脚本和peer helper的strict/no-incremental检查exit0（守卫5.391秒、285.5MiB/swap0）。格式化后的640项整合结果即上文最终结果。另一位未参与实现的Sol只读后审loader、双身份窗口、真实计费及原限额，未见新增P1/P2，未将审查计作额外测试。
 
 本检查点只完成离线窗口接线和父级结算；没有加载真实libsystemd、连接私有socket、创建原生服务或启动native20。真实ABI/EXTERNAL认证、现场READY与cleanup仍缺独立证据，native19失败保持未关闭。不得从640项通过推出这些外部行为已修复。
+
+### native21 现场判别结果（失败保留）
+
+G签名`a0c9771fc31555adec4ac62513457d0ba6dd7b7a`仅启动一次远端[CI40055483739](https://github.com/69gg/MuLi/actions/runs/40055483739)，原生job120757424198在02:46:57Z仍以`native_deadline_exceeded`结束，清理在02:47:01Z仍报`native_service_cleanup_failed`。零正式事务、无generation，不能记作READY或恢复成功。
+
+实际artifact12545256391为974字节，SHA-256 `a453ac47590b2b0d095e5d17697aa87c34d91a11f4f277c009ac6435b3fd7b9c`。根只下载此小包，经原4096字节档案上限、精确两个成员、原解压读取限额、摘要及实际`fixture_result`/`Receipt.read`核验；本地没有启动真实manager或操作账户、挂载。原schema实际接受本次新投影：manager仍activating/start、basic inactive、NJobs=5；同实例内层查询成功，`pending_job={code:user_job,identifier:gpg-agent-ssh.socket,type:start}`。identifier仍只是状态文字候选，须另核真实unit/Description及依赖，不能仅据名字断言该单元已证实为根因。
+
+本次parent账本19865→24729，raw grant11879，实际reply353字节、child charged4511，settlement validated；没有扩原查询、容量或截止。receipt记录临时用户和组已移除、mounts为0，但这不能替代失败的完整清理验收。后续先对照固定镜像的单元定义与当前fixture环境作可证伪修复，不重跑同一失败head、不延长READY或cleanup期限。
+
+### native21 后的单 socket 隔离对照（已收目标红，候选待验证）
+
+下一候选只在新建临时 UID 的私有 `.config/systemd/user` 中创建固定名
+`gpg-agent-ssh.socket` 的零字节普通文件。v255 将空单元视为 masked；这是对现场
+STATUS 候选的单变量 fixture 隔离，不是已经确认的产品 bug 修复，也不声称已取得
+runner 安装单元的完整正文或确定阻塞发生于哪个 Exec 钩子。
+保留原 basic/dbus 及其余 vendor 图、READY/事务门、查询次数、95秒/5秒期限和
+32768/512/1024 字节限额。[v255 空单元规则](https://github.com/systemd/systemd/blob/v255/man/systemd.unit.xml#L239-L244)。
+
+固定文件沿现有 bootstrap dirfd、NOFOLLOW、O_EXCL、完整目录身份与 root 所有权
+核验创建，单独登记设备/inode；没有任意 unit/path 参数或 symlink 放宽。check/remove
+须先核验两个已登记叶子的身份和精确正文，再删除任一叶子；空文件同 inode 内容变为非空
+也拒绝。外来同名文件、换 inode、symlink、丢失 create 回包均不能领养或删除未知对象。
+清理只删已登记叶子；原非空 foreign 树阻止后续卸载/删账户的门保持。
+旧 receipt 缺少新身份字段时仍可读取并清理原目标，不能据此领养碰巧存在的 mask。
+
+本轮先新增九个真实临时目录回归，调用原 `NativeCI.prepare`、实际
+`bootstrap_files(create/check/remove)` 和持久 receipt，虚拟的仅是现有账户/属主及命令边界。
+覆盖固定空叶子的创建/核验/清理、check/remove 下三类漂移、create 遇外来同名叶子、
+create 成功但回包丢失。根实际收取九项全部失败、506 deselected，pytest1.19秒；
+守卫1.743秒、102.7MiB/swap0、exit1。失败实际到达原bootstrap路径：不创建mask、
+未拒漂移/foreign、remove先删target再因非空目录拒绝；不是未来API或导入失败。
+
+据此已实现固定双叶子候选及独立`bootstrap_mask`身份，当前helper回包必须精确含mask，
+旧receipt和旧两键manifest保持可读但不拥有mask。所有叶子先读验，并再次复核包含原先
+不存在的叶子和目录链接后才删除；正文读取上限还受各固定预期正文长度约束。
+补充旧receipt有/无外来mask、旧manifest、remove成功但回包丢失和坏身份schema回归；
+原manifest与实际回复字节都继续计入原账本，空正文不增加正文读取额度。
+生产/补充回归尚未由作者运行，等待根统一定向、完整native和严格类型检查。
+没有启动真实服务、修改主机单元、发起新的 CI；后续单次远端对照仍须新签名 head、
+完整离线通过及独立审查，只有真实 READY、正式事务和完整 cleanup 都通过才能记成功。
+
+根统一实收目标选择 **10 passed / 512 deselected**（包含新增旧manifest节点；pytest0.51秒，守卫1.023秒、97.9MiB/swap0、exit0），随后完整六个native文件 **750 passed**（pytest2.11秒，守卫2.738秒、146.4MiB/swap0、exit0）。集合有重叠，不重复累计。首次两脚本strict检查指出删除循环复用已推断非空的leaf变量而接收Optional；根仅更名保存叶子的循环变量，不改行为。修后strict/no-incremental通过（守卫5.682秒、289MiB/swap0、exit0）。Ruff通过；格式首检一份测试排版未统一，根只格式化该文件后，三份改动Python的格式均通过。
+
+另一位未参与本片实现的Sol独立只读后审创建、双叶先验、旧receipt/manifest和丢回包路径，未见确切P1/P2。上述均为离线临时文件和受控账户/命令边界；真实GnuPG单元正文和启动钩子的等待位置仍未取得。下一固定签名head只作一次单变量远端对照，保持原basic/dbus、READY和清理准入，不把mask提示当作已经修复生产根因。

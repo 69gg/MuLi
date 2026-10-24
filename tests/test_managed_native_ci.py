@@ -396,6 +396,180 @@ def test_bootstrap_target_is_owned_and_verified_before_manager_start(
     assert receipt.bootstrap_directories == [] and receipt.bootstrap_file is None
 
 
+def test_bootstrap_private_ssh_socket_mask_is_verified_and_removed(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    directory = native.home / ".config/systemd/user"
+    mask = directory / "gpg-agent-ssh.socket"
+    assert mask.is_file() and not mask.is_symlink()
+    assert mask.read_bytes() == b"" and stat.S_IMODE(mask.stat().st_mode) == 0o644
+    saved = json.loads(native.receipt_path.read_bytes())
+    assert saved["bootstrap_mask"] == [mask.stat().st_dev, mask.stat().st_ino]
+    assert sorted(path.name for path in directory.iterdir()) == sorted(
+        [native.receipt.user + ".target", "gpg-agent-ssh.socket"]
+    )
+    native.bootstrap_files("check")
+    ci.NativeCI(native.root, run=commands).cleanup()
+    assert not directory.exists()
+    assert json.loads(native.receipt_path.read_bytes())["bootstrap_mask"] is None
+    assert not commands.accounts and not commands.mounts
+
+
+@pytest.mark.parametrize("mode", ["check", "remove"])
+@pytest.mark.parametrize("change", ["identity", "content", "symlink"])
+def test_bootstrap_ssh_mask_change_rejects_before_removing_owned_target(
+    fixture: tuple[Any, Commands], mode: str, change: str
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    directory = native.home / ".config/systemd/user"
+    mask = directory / "gpg-agent-ssh.socket"
+    target = directory / (native.receipt.user + ".target")
+    # On the old collector this creates an untracked leaf. On the candidate it
+    # changes the exact leaf recorded by the real bootstrap create operation.
+    if mask.exists():
+        if change == "content":
+            mask.write_bytes(b"foreign nonempty unit")
+        else:
+            mask.rename(mask.with_name("saved-mask"))
+    if change == "identity":
+        mask.write_bytes(b"")
+    elif change == "content" and not mask.exists():
+        mask.write_bytes(b"foreign nonempty unit")
+    elif change == "symlink":
+        mask.symlink_to(target.name)
+    before = native.receipt_path.read_bytes()
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        native.bootstrap_files(mode)
+    assert target.read_bytes() == worker.bootstrap_data()
+    assert mask.is_symlink() if change == "symlink" else mask.exists()
+    assert native.receipt_path.read_bytes() == before
+    assert commands.accounts and commands.mounts
+    assert not any("revert" in args or "umount" in args for args in commands.calls)
+
+
+def test_bootstrap_create_never_adopts_existing_ssh_socket_leaf(
+    fixture: tuple[Any, Commands], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, commands = fixture
+    original = worker.bootstrap_data
+
+    def foreign_leaf() -> bytes:
+        mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
+        if not mask.exists():
+            mask.write_bytes(b"foreign unit")
+        return original()
+
+    monkeypatch.setattr(worker, "bootstrap_data", foreign_leaf)
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        native.prepare()
+    mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
+    assert mask.read_bytes() == b"foreign unit"
+    assert not any("start" in args for args in commands.calls)
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert mask.read_bytes() == b"foreign unit" and commands.accounts and commands.mounts
+
+
+def test_bootstrap_ssh_mask_lost_create_reply_stays_unconfirmed(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+
+    def lost(argv: Any, *, seconds: float = 5) -> Any:
+        reply = commands(argv, seconds=seconds)
+        return ci.Reply(1) if "bootstrap-files" in argv and "create" in argv else reply
+
+    native.run = lost
+    with pytest.raises(ci.FixtureError, match="bootstrap_invalid"):
+        native.prepare()
+    mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
+    assert mask.is_file() and mask.read_bytes() == b""
+    before = native.receipt_path.read_bytes()
+    with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+        ci.NativeCI(native.root, run=commands).cleanup()
+    assert mask.is_file() and native.receipt_path.read_bytes() == before
+    assert commands.accounts and commands.mounts
+    assert not any(
+        any(effect in args for effect in ("start", "revert", "umount", "userdel", "groupdel"))
+        for args in commands.calls
+    )
+
+
+@pytest.mark.parametrize("foreign_mask", [False, True])
+def test_bootstrap_legacy_receipt_never_adopts_a_socket_mask(
+    fixture: tuple[Any, Commands], foreign_mask: bool
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
+    mask.unlink()
+    saved = json.loads(native.receipt_path.read_bytes())
+    del saved["bootstrap_mask"]
+    ci.write_json(native.receipt_path, saved)
+    restored = ci.Receipt.read(native.receipt_path)
+    assert restored.bootstrap_mask is None
+    target = mask.with_name(restored.user + ".target")
+    if foreign_mask:
+        mask.write_bytes(b"")
+        with pytest.raises(ci.FixtureError, match="bootstrap_unconfirmed"):
+            ci.NativeCI(native.root, run=commands).cleanup()
+        assert mask.read_bytes() == b"" and target.read_bytes() == worker.bootstrap_data()
+        assert commands.accounts and commands.mounts
+    else:
+        ci.NativeCI(native.root, run=commands).cleanup()
+        assert not mask.parent.exists()
+        assert not commands.accounts and not commands.mounts
+
+
+def test_bootstrap_ssh_mask_lost_remove_reply_rechecks_only_owned_cleanup(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    before = native.receipt_path.read_bytes()
+
+    def lost(argv: Any, *, seconds: float = 5) -> Any:
+        reply = commands(argv, seconds=seconds)
+        return ci.Reply(1) if "bootstrap-files" in argv and "remove" in argv else reply
+
+    native.run = lost
+    with pytest.raises(ci.FixtureError, match="bootstrap_invalid"):
+        native.bootstrap_files("remove")
+    assert not (native.home / ".config").exists()
+    assert native.receipt_path.read_bytes() == before
+    ci.NativeCI(native.root, run=commands).cleanup()
+    assert not commands.accounts and not commands.mounts
+    assert ci.Receipt.read(native.receipt_path).bootstrap_mask is None
+
+
+def test_bootstrap_worker_legacy_manifest_preserves_original_target_contract(
+    fixture: tuple[Any, Commands],
+) -> None:
+    native, commands = fixture
+    native.prepare()
+    mask = native.home / ".config/systemd/user/gpg-agent-ssh.socket"
+    mask.unlink()
+    receipt = native.receipt
+    manifest = json.dumps(
+        {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file}
+    )
+    for mode in ("check", "remove"):
+        observed = commands.bootstrap(
+            mode,
+            receipt.user,
+            receipt.uid,
+            receipt.gid,
+            manifest,
+            worker.time.monotonic() + worker.CLEANUP_SECONDS,
+            worker.MAX_BYTES,
+        )
+        assert observed["code"] == "verified" and observed["mask"] is None
+    assert not mask.parent.exists()
+
+
 def test_bootstrap_create_is_the_only_complete_prestart_leaf_observation(
     fixture: tuple[Any, Commands],
 ) -> None:
@@ -450,7 +624,11 @@ def test_bootstrap_removed_duplicate_check_has_exact_manifest_body_and_reply_cos
     native.prepare()
     receipt = native.receipt
     manifest = json.dumps(
-        {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file},
+        {
+            "directories": receipt.bootstrap_directories,
+            "file": receipt.bootstrap_file,
+            "mask": receipt.bootstrap_mask,
+        },
         separators=(",", ":"),
     )
     before = native.setup_bytes
@@ -798,6 +976,9 @@ def test_bootstrap_low_remaining_allowance_never_calls_helper(
         ("bootstrap_directories", [[True, 1], [2, 3]]),
         ("bootstrap_directories", [[1, 2]]),
         ("bootstrap_file", [True, 1]),
+        ("bootstrap_mask", [True, 1]),
+        ("bootstrap_mask", [1]),
+        ("bootstrap_mask", "not-an-inode"),
     ],
 )
 def test_bootstrap_receipt_rejects_unbounded_or_ambiguous_metadata(

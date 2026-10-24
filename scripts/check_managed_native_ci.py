@@ -1269,6 +1269,7 @@ class Receipt:
     manager_program: str = ""
     bootstrap_directories: list[list[int]] = field(default_factory=list)
     bootstrap_file: list[int] | None = None
+    bootstrap_mask: list[int] | None = None
     mounts: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -1278,6 +1279,8 @@ class Receipt:
             raise FixtureError("native_receipt_owner")
         with path.open("rb") as source:
             value = object_bytes(source.read(OUTPUT_BYTES + 1))
+        if set(value) == set(cls.__dataclass_fields__) - {"bootstrap_mask"}:
+            value["bootstrap_mask"] = None  # Historical receipts own no socket mask.
         if set(value) != set(cls.__dataclass_fields__):
             raise FixtureError("native_receipt_invalid")
         result = cls(**value)
@@ -1355,6 +1358,19 @@ class Receipt:
                     or any(
                         type(part) is not int or not 0 <= part < 2**64
                         for part in result.bootstrap_file
+                    )
+                )
+            )
+            or (
+                result.bootstrap_mask is not None
+                and (
+                    result.bootstrap_file is None
+                    or len(result.bootstrap_directories) != 5
+                    or not isinstance(result.bootstrap_mask, list)
+                    or len(result.bootstrap_mask) != 2
+                    or any(
+                        type(part) is not int or not 0 <= part < 2**64
+                        for part in result.bootstrap_mask
                     )
                 )
             )
@@ -1657,7 +1673,11 @@ class NativeCI:
             raise FixtureError("native_bootstrap_invalid")
         worker = Path(__file__).resolve().parents[1] / "tests/helpers/managed_native_worker.py"
         manifest = json.dumps(
-            {"directories": receipt.bootstrap_directories, "file": receipt.bootstrap_file},
+            {
+                "directories": receipt.bootstrap_directories,
+                "file": receipt.bootstrap_file,
+                "mask": receipt.bootstrap_mask,
+            },
             separators=(",", ":"),
         )
         observed = self.bootstrap_reply(
@@ -1676,9 +1696,10 @@ class NativeCI:
                 manifest,
             )
         )
-        if set(observed) != {"code", "directories", "file", "used"}:
+        if set(observed) != {"code", "directories", "file", "mask", "used"}:
             raise FixtureError("native_bootstrap_invalid")
         directories, identity = observed["directories"], observed["file"]
+        mask_identity = observed["mask"]
 
         def pair(item: object) -> bool:
             return (
@@ -1693,24 +1714,34 @@ class NativeCI:
             or not all(pair(item) for item in directories)
             or directories[:2] != receipt.bootstrap_directories[:2]
             or (identity is not None and (len(directories) != 5 or not pair(identity)))
+            or (
+                mask_identity is not None
+                and (identity is None or len(directories) != 5 or not pair(mask_identity))
+            )
         ):
             raise FixtureError("native_bootstrap_invalid")
         if mode == "check" and (
             directories != receipt.bootstrap_directories
             or identity != receipt.bootstrap_file
+            or mask_identity != receipt.bootstrap_mask
             or identity is None
         ):
             raise FixtureError("native_bootstrap_changed")
-        if mode == "create" and (len(directories) != 5 or identity is None):
+        if mode == "create" and (
+            len(directories) != 5 or identity is None or mask_identity is None
+        ):
             raise FixtureError("native_bootstrap_invalid")
         if mode == "remove" and (
-            identity is not None or directories != receipt.bootstrap_directories[: len(directories)]
+            identity is not None
+            or mask_identity is not None
+            or directories != receipt.bootstrap_directories[: len(directories)]
         ):
             raise FixtureError("native_bootstrap_invalid")
         receipt.bootstrap_directories = (
             [] if mode == "remove" and len(directories) == 2 else directories
         )
         receipt.bootstrap_file = identity
+        receipt.bootstrap_mask = mask_identity
         if self.current_account() != (uid, gid):
             raise FixtureError("native_bootstrap_identity")
         self.save()
