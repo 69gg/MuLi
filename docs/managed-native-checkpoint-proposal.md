@@ -1848,3 +1848,70 @@ start仍完整委派两probe的4次None检查与10次target门；仅同一select
 Ruff通过；格式首查仅新测试一处排版，修正后390文件格式通过。146源文件strict、
 no-incremental且MYPYPATH=src通过（守卫8.193秒、374MiB、swap0、exit0）。
 本片无依赖、发行版本或持久格式变化；新的精确签名候选与原生CI仍需另外验证。
+
+### Native43真实结果：第二代进入start，三事务总门仍未通过
+
+GPG签名提交 `b1dc06ccfeecd3834d1142d1e0e71c19c0eaec10` 的
+[CI 40097893114](https://github.com/69gg/MuLi/actions/runs/40097893114) 已终态failure：
+十项通用检查全部success，唯一managed-native作业 `120883875588` 失败。
+artifact `12562145130` 为1915字节，SHA-256
+`c891664ab7878e8d7af39f6df1d3042a2564c286d39f35ee4149cc5b585fbe99`；
+根只下载该小体积证据，核摘要、精确两成员及typed receipt/result，不执行归档内容。
+本轮cleanup为verified、mounts为空、user_removed和group_removed均true。
+
+adopt代 `9207c55dc3649ded134d2213bdb2a132` 于35932毫秒released、36872毫秒projection；
+switch于36873毫秒开始，第二代 `beda6448b3eeac41d4254aa207094046` 于39131毫秒prepared、
+44086毫秒draining、47875毫秒stop_base、51281毫秒install_target、59220毫秒start_target，
+总60001毫秒以TimeoutError/completed=false/stage=helper_exit结束。未完成第二代启动
+验证或第三事务，不能把合法前缀和清理成功当作完整原生恢复通过。
+
+第一代准确PID2335/UID999/invocation `b02db620c3044954a060c529c1c54b29` 的成本为
+checks135次/13444毫秒、bus274次/3818毫秒、HTTP12次/805毫秒。第二代准确PID2724、
+invocation `7e1f5c1648ee461d86e9d934fd618a5d` 的当前成本仍identity_changed不可用；
+不将第一代成本借为第二代，不按跨runner墙钟差归因或计算加速比例。下一步先审现有
+身份有效观察边界能否保存准确第二代成本，未凭猜测引入跨校验缓存或扩大原截止。
+
+### Native44候选：准确helper的安装返回快照
+
+源码核验发现现成本hook只在atexit发布完整生命周期统计。尚未退出的第二代没有该文件，
+final collector以第二代身份拒绝第一代文件是正确行为；identity_changed也涵盖不合合同
+的形状，不能只据这个标签断定现场原文件内容。只提前读取或放松身份门不能补上数据。
+
+本片仅改CI fixture，不改生产包、期限、依赖或实际效果。生成hook完整委派真实install，
+成功返回且BindingConfirmation.position准确后，每helper至多尝试发布一次固定私人
+helper-costs-checkpoint.json。原异常、取消和返回保留，观察失败不改原成功结果；
+checkpoint含严格sample(kind=install_returned、准确revision)与原五身份/三类累计成本，
+明确只是安装返回时的partial，不表示该进程读取时仍存活或完整生命周期成本。
+
+Case在原fresh-position→helper_empty身份核验之后读取，必须已有准确本代非零PID与
+invocation来源；未曾观测、异代、已invalid或文件漂移不能从checkpoint自证来源。
+复用原安全FD、大小/权限/单链接、前后完整身份与重复JSON键检查；sample revision不能
+晚于当前record。最多缓存三代，完整结果最终仅在原32KiB余额内加helper_cost_samples，
+原当前helper_costs、完整helper_cost_history、identity_changed与事务控制保持独立。
+没有新增RPC、轮询、systemd命令或放宽60秒门。
+
+正式先红为真实生成hook、switch Host.backend.install、原Case身份核验与严格reader：
+install和原确认完整成功，最终旧文件仍被准确拒绝，固定checkpoint却缺失；
+1 failed / pytest1.47秒，守卫2.023秒、69.9MiB、swap0、exit1。不是导入失败或超时。
+实现后8个目标节点通过（pytest2.45秒，守卫2.984秒、75.7MiB、swap0）；
+完整helper_costs文件46 passed（pytest2.57秒，守卫3.096秒、69.4MiB、swap0）。
+真实Case.transaction的fresh-position分支已在离线probe/HTTP下自动消费实际hook文件，
+不以手填resources代替接线；安装失败原异常实例、缺失/失效/漂移来源、坏sample、
+完整成本与partial分离、旧32KiB边界均保留。8项包含在46项内，不重复累计。
+
+非生产作者读实际两脚本后未发现明确P1/P2。本轮只证明离线接线与合同；精确签名候选
+及真实CI仍待执行，尚无第二代现场partial，更不表示原生三事务或超时根因已修复。
+
+根补审发现coordinator在worker最终结果之后还会合并manager/controller事实，新增partial
+可能因此挤掉旧完整成本。正式collect_result近限回归先取得1 failed（pytest0.26秒，
+守卫0.806秒、76.1MiB、swap0、exit1）：输入与合并后的准确预期均通过严格reader前置，
+实际保留partial却缩掉旧helper_costs，整体不等；不是超时。窄修在合并完成后、原完整成本
+压缩之前，按原32KiB门从尾裁去最多三个新增partial，空则省略该字段。相同节点随后
+1 passed（pytest0.17秒，守卫0.711秒、72.1MiB、swap0、exit0），保留原完整成本/history、
+manager事实、首code、timeline和generations；实际差异只读后审未发现明确P1/P2。
+
+随后七个完整fixture文件统一实收790 passed（pytest22.88秒，守卫23.524秒、
+CPU23.343秒、185.8MiB、swap0、exit0），包含上述节点，不再累加先前子集。
+最终两脚本及测试的Ruff通过，三个文件格式检查通过；提交和dispatch尚未完成。
+真实第二代partial采样与完整三事务仍待新的精确候选CI验证，
+不将本地绿倒写为现场超时已修复。

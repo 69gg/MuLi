@@ -1401,6 +1401,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "controller_failure",
             "helper_costs",
             "helper_cost_history",
+            "helper_cost_samples",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1440,12 +1441,15 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             )
         elif name == "controller_failure":
             valid = controller_failure_facts(facts, value)
-        elif name == "helper_cost_history":
+        elif name in {"helper_cost_history", "helper_cost_samples"}:
             valid = isinstance(facts, list) and 1 <= len(facts) <= 3
             seen: set[str] = set()
             if valid:
                 for retained in facts:
-                    if not isinstance(retained, dict) or set(retained) != {"source", "costs"}:
+                    fields = {"source", "costs"}
+                    if name == "helper_cost_samples":
+                        fields.add("sample")
+                    if not isinstance(retained, dict) or set(retained) != fields:
                         valid = False
                         break
                     source = retained["source"]
@@ -1455,6 +1459,13 @@ def fixture_result(data: bytes) -> dict[str, Any]:
                         and isinstance(costs, dict)
                         and costs.get("code") == "observed"
                         and resource_worker().helper_costs_facts(costs, source) is True
+                        and (
+                            name == "helper_cost_history"
+                            or resource_worker().helper_cost_sample_facts(
+                                {"sample": retained["sample"], "costs": costs}, source
+                            )
+                            is True
+                        )
                         and source["generation"] not in seen
                         and any(
                             row["generation"] == source["generation"]
@@ -2659,6 +2670,15 @@ class NativeCI:
             and controller_failure_facts(controller_failure, result)
         ):
             result["resources"]["controller_failure"] = controller_failure
+        samples = result["resources"].get("helper_cost_samples", [])
+        while (
+            samples
+            and len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+            > OUTPUT_BYTES
+        ):
+            samples.pop()
+        if not samples:
+            result["resources"].pop("helper_cost_samples", None)
         if (
             "helper_costs" in result["resources"]
             and len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())

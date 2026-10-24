@@ -3187,6 +3187,23 @@ def helper_costs_facts(value: object, source: object) -> bool:
     )
 
 
+def helper_cost_sample_facts(value: object, source: object) -> bool:
+    """A partial install snapshot never replaces complete helper-exit costs."""
+    if not isinstance(value, dict) or set(value) != {"sample", "costs"}:
+        return False
+    sample, costs = value["sample"], value["costs"]
+    return (
+        isinstance(sample, dict)
+        and set(sample) == {"kind", "revision"}
+        and sample["kind"] == "install_returned"
+        and type(sample["revision"]) is int
+        and 1 <= sample["revision"] <= 2**63 - 1
+        and isinstance(costs, dict)
+        and costs.get("code") == "observed"
+        and helper_costs_facts(costs, source)
+    )
+
+
 def unit_files() -> ModuleType:
     """Load only the fixture's fixed sibling, without changing import paths."""
     if __package__:
@@ -3242,7 +3259,9 @@ def install_unit_birth_hook() -> None:
 def install_helper_cost_hook() -> None:
     """Observe only the exact isolated helper; never change its control flow."""
     try:
+        from muli.managed_controller import BindingConfirmation
         from muli.managed_host import managed_helper_unit_name
+        from muli.managed_journal import RoleSnapshots
         from muli.managed_transaction import TransactionRecordV2
         from muli.management_transaction import TransactionJournal
         from muli.platforms.linux_transaction import SystemdProbe
@@ -3297,7 +3316,7 @@ def install_helper_cost_hook() -> None:
         }
         counts = {name: 0 for name in ("checks", "bus", "http")}
         totals = {name: 0.0 for name in counts}
-        usable, saved = True, False
+        usable, saved, sampled = True, False, False
         clock = time.perf_counter
 
         def begin() -> float | None:
@@ -3327,6 +3346,7 @@ def install_helper_cost_hook() -> None:
         original_check = ManagedLinuxBackend._check
         original_command = SystemdProbe._command
         original_request = ManagedLinuxBackend._request
+        original_install = ManagedLinuxBackend.install
 
         @wraps(original_check)
         def check(*args: Any, **kwargs: Any) -> None:
@@ -3352,38 +3372,77 @@ def install_helper_cost_hook() -> None:
             finally:
                 finish("http", started)
 
+        def publish(path: Path, value: dict[str, Any]) -> None:
+            data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            require(len(data) <= MAX_BYTES, "native_metadata_budget")
+            temporary = path.with_suffix(".tmp")
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.replace(path)
+            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+
+        def snapshot() -> dict[str, Any]:
+            require(usable, "native_profile_invalid")
+            value = {
+                **facts,
+                **{
+                    name: {"count": counts[name], "total_ms": int(elapsed * 1000)}
+                    for name, elapsed in totals.items()
+                },
+            }
+            source = {
+                key: facts[key] for key in ("generation", "helper", "uid", "pid", "invocation")
+            }
+            require(helper_costs_facts(value, source), "native_profile_invalid")
+            return value
+
+        @wraps(original_install)
+        async def install(
+            backend: ManagedLinuxBackend,
+            record: TransactionRecordV2,
+            role: Role,
+            data: RoleSnapshots,
+        ) -> BindingConfirmation | None:
+            nonlocal sampled
+            confirmation = await original_install(backend, record, role, data)
+            if not sampled:
+                sampled = True
+                try:
+                    require(
+                        isinstance(confirmation, BindingConfirmation)
+                        and confirmation.position == record.position
+                        and record.generation == facts["generation"],
+                        "native_profile_invalid",
+                    )
+                    publish(
+                        root / "helper-costs-checkpoint.json",
+                        {
+                            "sample": {"kind": "install_returned", "revision": record.revision},
+                            "costs": snapshot(),
+                        },
+                    )
+                except Exception:
+                    pass  # Partial observation cannot change a successful install.
+            return confirmation
+
         def save() -> None:
             nonlocal saved
             if saved:
                 return
             saved = True
             try:
-                if not usable:
-                    return
-                for name, elapsed in totals.items():
-                    facts[name] = {"count": counts[name], "total_ms": int(elapsed * 1000)}
-                source = {
-                    key: facts[key] for key in ("generation", "helper", "uid", "pid", "invocation")
-                }
-                require(helper_costs_facts(facts, source), "native_profile_invalid")
-                data = json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
-                require(len(data) <= MAX_BYTES, "native_metadata_budget")
-                temporary = root / "helper-costs.tmp"
-                descriptor = os.open(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    0o600,
-                )
-                with os.fdopen(descriptor, "wb") as output:
-                    output.write(data)
-                    output.flush()
-                    os.fsync(output.fileno())
-                temporary.replace(root / "helper-costs.json")
-                directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
+                publish(root / "helper-costs.json", snapshot())
             except Exception:
                 pass  # Observation never replaces the real helper's outcome.
 
@@ -3391,8 +3450,58 @@ def install_helper_cost_hook() -> None:
         ManagedLinuxBackend._check = check
         SystemdProbe._command = command
         ManagedLinuxBackend._request = request
+        ManagedLinuxBackend.install = install
     except Exception:
         return  # A missing observer must not prevent the original helper starting.
+
+
+def _read_helper_cost_json(path: Path, *, deadline: float | None) -> Any:
+    if deadline is not None:
+        remaining(deadline)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_uid == os.geteuid()
+            and not before.st_mode & 0o077
+            and before.st_nlink == 1
+            and before.st_size <= MAX_BYTES,
+            "native_profile_owner",
+        )
+        data = stream.read(MAX_BYTES + 1)
+        after = os.fstat(stream.fileno())
+        current = path.lstat()
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        require(
+            len(data) <= MAX_BYTES
+            and all(
+                getattr(before, field) == getattr(after, field) == getattr(current, field)
+                for field in fields
+            ),
+            "native_profile_changed",
+        )
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            require(key not in value, "native_profile_invalid")
+            value[key] = item
+        return value
+
+    value = json.loads(data, object_pairs_hook=unique)
+    if deadline is not None:
+        remaining(deadline)
+    return value
 
 
 def collect_helper_costs(
@@ -3402,58 +3511,13 @@ def collect_helper_costs(
     deadline: float | None = None,
     completed_generation: str | None = None,
     retained: list[dict[str, Any]] | None = None,
+    samples: list[dict[str, Any]] | None = None,
 ) -> None:
     """One local read after a checked helper exit or final case settlement."""
     facts: dict[str, Any] = {"code": "not_observed", "reason": "unavailable"}
     source = result["resources"].get("helper_source")
     try:
-        if deadline is not None:
-            remaining(deadline)
-        descriptor = os.open(
-            root / "helper-costs.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-        )
-        with os.fdopen(descriptor, "rb") as stream:
-            before = os.fstat(stream.fileno())
-            require(
-                stat.S_ISREG(before.st_mode)
-                and before.st_uid == os.geteuid()
-                and not before.st_mode & 0o077
-                and before.st_nlink == 1
-                and before.st_size <= MAX_BYTES,
-                "native_profile_owner",
-            )
-            data = stream.read(MAX_BYTES + 1)
-            after = os.fstat(stream.fileno())
-            current = (root / "helper-costs.json").lstat()
-            fields = (
-                "st_dev",
-                "st_ino",
-                "st_mode",
-                "st_uid",
-                "st_nlink",
-                "st_size",
-                "st_mtime_ns",
-                "st_ctime_ns",
-            )
-            require(
-                len(data) <= MAX_BYTES
-                and all(
-                    getattr(before, field) == getattr(after, field) == getattr(current, field)
-                    for field in fields
-                ),
-                "native_profile_changed",
-            )
-
-        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-            value: dict[str, Any] = {}
-            for key, item in pairs:
-                require(key not in value, "native_profile_invalid")
-                value[key] = item
-            return value
-
-        value = json.loads(data, object_pairs_hook=unique)
-        if deadline is not None:
-            remaining(deadline)
+        value = _read_helper_cost_json(root / "helper-costs.json", deadline=deadline)
         if helper_costs_facts(value, source) and value.get("code") == "observed":
             facts = value
         else:
@@ -3506,6 +3570,20 @@ def collect_helper_costs(
             break
         history = candidate["resources"]["helper_cost_history"]
         result["resources"]["helper_cost_history"] = history
+    partials = result["resources"].get("helper_cost_samples", [])
+    for row in samples or []:
+        if len(partials) >= 3:
+            break
+        if any(old["source"]["generation"] == row["source"]["generation"] for old in partials):
+            continue
+        candidate = {
+            **result,
+            "resources": {**result["resources"], "helper_cost_samples": [*partials, row]},
+        }
+        if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+            break
+        partials = candidate["resources"]["helper_cost_samples"]
+        result["resources"]["helper_cost_samples"] = partials
 
 
 def install_hook() -> None:
@@ -3579,6 +3657,7 @@ class Case:
         self._invalid_helper_sources: set[str] = set()
         self._helper_source_groups: dict[str, str] = {}
         self._helper_cost_history: list[dict[str, Any]] = []
+        self._helper_cost_samples: list[dict[str, Any]] = []
         self.result: dict[str, Any] = {
             "completed": False,
             "stage": self.stage,
@@ -3711,6 +3790,32 @@ class Case:
             slots = {role: source.read_slot(record.binding(role).installation) for role in roles}
         require(Path(controller.prefix) == self.root / "a", "native_controller_changed")
         return anchor, controller, slots
+
+    def _collect_helper_cost_sample(self, record: TransactionRecordV2) -> None:
+        """Read optional history only after the original helper identity observation."""
+        source = self.result["resources"].get("helper_source")
+        if (
+            len(self._helper_cost_samples) >= 3
+            or record.generation in self._invalid_helper_sources
+            or not isinstance(source, dict)
+            or source.get("generation") != record.generation
+            or any(
+                row["source"]["generation"] == record.generation
+                for row in self._helper_cost_samples
+            )
+        ):
+            return
+        try:
+            value = _read_helper_cost_json(
+                self.root / "helper-costs-checkpoint.json", deadline=self.deadline
+            )
+            if (
+                helper_cost_sample_facts(value, source)
+                and value["sample"]["revision"] <= record.revision
+            ):
+                self._helper_cost_samples.append({"source": dict(source), **value})
+        except Exception:
+            pass  # Missing partial facts never change the transaction or its result.
 
     async def helper_empty(self, probe: SystemdProbe, name: str, argv: tuple[str, ...]) -> bool:
         from muli.platforms.linux_controller import CgroupObservation
@@ -3953,6 +4058,7 @@ class Case:
                             await self.helper_empty(
                                 probe, name, managed_helper_arguments(anchor, controller)
                             )
+                            self._collect_helper_cost_sample(record)
                             position = fresh_position
                         require(
                             record.phase != "recovery_required" and record.activation != "blocked",
@@ -4297,6 +4403,7 @@ async def run(mode: str, root: Path) -> int:
                     case.result,
                     deadline=case.drive_deadline,
                     retained=case._helper_cost_history,
+                    samples=case._helper_cost_samples,
                 )
                 write_json(root / "result.json", case.result)
             except Exception:
