@@ -46,6 +46,8 @@ _COMPONENTS = frozenset(
 _CODES = RECEIVE_FAILURE_CODES | frozenset(
     {
         "runtime_failed",
+        "clock_failed",
+        "clock_recovered",
         "update_failed",
         "management_failed",
         "channel_failed",
@@ -483,6 +485,10 @@ class SystemEvents:
         )
 
     def _persist(self, item: _Metadata) -> bool:
+        # This asynchronous consumer owns no existing transaction. Entering its
+        # context manager would otherwise commit another producer's prefix.
+        if self.store.db.in_transaction:
+            raise RuntimeError("System log storage has an unsettled transaction")
         allowed = self._notification_allowed(item)
         bucket = int(item.captured_at // self._policy.dedup_seconds)
         identity = (
@@ -540,6 +546,8 @@ class SystemEvents:
         return not duplicate
 
     def _prune(self) -> bool:
+        if self.store.db.in_transaction:
+            raise RuntimeError("System log retention has an unsettled transaction")
         # Each transaction handles a bounded suffix. Deleting our own events can
         # leave legal cursor gaps, but must never rewind the shared inbox cursor.
         rows = self.store.db.execute(

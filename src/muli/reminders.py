@@ -37,6 +37,9 @@ class Reminders:
         # Optional explicit delegations share this clock, not Attention's read-only input.
         self.workflow_tick: Callable[[float], Awaitable[None]] | None = None
         self.workflow_due: Callable[[float], float | None] | None = None
+        self._workflow_recover: Callable[[], None] | None = None
+        self._clock_log: Callable[[bool], None] | None = None
+        self._clock_blocked = False
 
     def create(
         self,
@@ -139,11 +142,41 @@ class Reminders:
             self.task = asyncio.create_task(self._run(), name="muli-reminders")
 
     async def close(self) -> None:
-        if self.task:
-            self.task.cancel()
+        task = self.task
+        if task is None:
+            return
+        settled = task.done()
+        try:
+            if not settled:
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self.task
-            self.task = None
+                await task
+        except Exception:
+            if not settled:
+                raise  # A new shutdown failure still belongs to its caller.
+            self._log_clock(True)
+        finally:
+            if self.task is task:
+                self.task = None
+
+    def _log_clock(self, failed: bool) -> None:
+        if self._park_unsettled_transaction():
+            return  # Even an asynchronous log could commit this connection's prefix.
+        if self._clock_log is not None:
+            try:
+                self._clock_log(failed)
+            except Exception:
+                pass  # Optional diagnostics cannot terminate the clock.
+
+    def _park_unsettled_transaction(self) -> bool:
+        # An open transaction after failure has an unknown owner. Never roll it
+        # back or let a later clock effect commit it; a change cannot clear this.
+        if not self._clock_blocked and self.store.db.in_transaction:
+            self._clock_blocked = True
+        return self._clock_blocked
+
+    def _active_reminders(self) -> list[dict[str, Any]]:
+        return [item for item in self.store.list("reminder", 10000) if item["enabled"]]
 
     async def _fire(self, item: dict[str, Any], timestamp: float) -> None:
         await self.admission.wait()
@@ -192,22 +225,85 @@ class Reminders:
         await self.bus.notify()
 
     async def _run(self) -> None:
+        failed_reminders: set[str] = set()
+        retry_reminders: set[str] = set()
+        catalog_failed = False
+        retry_catalog = False
         while True:
             await self.admission.wait()
             self.changed.clear()
-            active = [item for item in self.store.list("reminder", 10000) if item["enabled"]]
+            if self._clock_blocked:
+                await self.changed.wait()
+                continue
             timestamp = now()
-            for item in active:
-                if item["due_at"] <= timestamp:
-                    await self._fire(item, timestamp)
+            if not catalog_failed:
+                try:
+                    active = self._active_reminders()
+                    identifiers = {item["id"] for item in active}
+                except Exception:
+                    if self._park_unsettled_transaction():
+                        continue
+                    if not retry_catalog:
+                        self._log_clock(True)
+                    catalog_failed, retry_catalog = True, False
+                else:
+                    failed_reminders.intersection_update(identifiers)
+                    retry_reminders.intersection_update(identifiers)
+                    for item in active:
+                        if self._clock_blocked:
+                            break
+                        identifier = item["id"]
+                        if identifier in failed_reminders:
+                            continue
+                        try:
+                            if item["due_at"] <= timestamp:
+                                await self._fire(item, timestamp)
+                                if identifier in retry_reminders:
+                                    retry_reminders.remove(identifier)
+                                    self._log_clock(False)
+                        except Exception:
+                            if self._park_unsettled_transaction():
+                                break
+                            if identifier not in retry_reminders:
+                                self._log_clock(True)
+                            retry_reminders.discard(identifier)
+                            failed_reminders.add(identifier)
+            if self._clock_blocked:
+                continue
             if self.workflow_tick is not None:
                 await self.workflow_tick(timestamp)
-            active = [item for item in self.store.list("reminder", 10000) if item["enabled"]]
-            deadlines = [float(item["due_at"]) for item in active]
+            if self._clock_blocked:
+                continue
+            deadlines: list[float] = []
+            if not catalog_failed:
+                try:
+                    active = self._active_reminders()
+                    identifiers = {item["id"] for item in active}
+                    failed_reminders.intersection_update(identifiers)
+                    retry_reminders.intersection_update(identifiers)
+                    deadlines = [
+                        float(item["due_at"])
+                        for item in active
+                        if item["id"] not in failed_reminders
+                    ]
+                except Exception:
+                    if self._park_unsettled_transaction():
+                        continue
+                    if not retry_catalog:
+                        self._log_clock(True)
+                    catalog_failed, retry_catalog = True, False
+                else:
+                    if retry_catalog:
+                        retry_catalog = False
+                        self._log_clock(False)
+            if self._clock_blocked:
+                continue
             if self.workflow_due is not None:
                 due = self.workflow_due(timestamp)
                 if due is not None:
                     deadlines.append(due)
+            if self._clock_blocked:
+                continue
             delay = max(0.01, min(deadlines) - now()) if deadlines else None
             try:
                 if delay is None:
@@ -215,4 +311,13 @@ class Reminders:
                 else:
                     await asyncio.wait_for(self.changed.wait(), delay)
             except TimeoutError:
-                pass
+                if not self.changed.is_set():
+                    continue
+            # Only an actual change permits another attempt. Another healthy
+            # deadline is not evidence that a failed admission became safe.
+            retry_reminders.update(failed_reminders)
+            failed_reminders.clear()
+            retry_catalog = retry_catalog or catalog_failed
+            catalog_failed = False
+            if self._workflow_recover is not None:
+                self._workflow_recover()

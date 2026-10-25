@@ -45,6 +45,8 @@ Attention 使用固定 adapter 注册表，reminder、update、management 的原
 
 system_events / attention 组件不能再次通知；明确 notify=false 的上下文只保留证据。真实 run 引用对应 ingress principal=system:attention 时也只记录，防止一次通知的模型失败持续自我激活。宿主在相关失败边界应提供真实运行归属或上下文。无法归因的第三方线程错误不承诺全部闭环，模块也不扫描宿主 journal 来猜测原因。
 
+v2.66 候选增加事务所有权保护：异步日志持久化与保留清理在进入事务前都拒绝已有未收口事务，不替其它生产者提交或回滚。沿原有界失败计数与清理失败停止路径退出，需检查并显式重配或安全重开；日志不能用来自动修复未知提交结果。原提醒时钟的固定 `clock_failed` / `clock_recovered` 诊断显式 `notify=false`，恢复记录为 warning，默认 error 采集策略可能不保存它。详细反例与验证见[时钟恢复](reminder-clock-recovery.md)。
+
 ## 验证
 
 ### 按需回查

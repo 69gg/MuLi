@@ -191,6 +191,7 @@ class Runtime:
             admission=self.maintenance.admission,
             max_output_chars=lambda: self.config.settings.limits.max_output_chars,
         )
+        self.reminders._clock_log = self._log_clock
         self.conversation = Conversation(self.store)
         self.context_hooks: list[ContextHook] = []
         self.skills_context: ContextHook | None = None
@@ -665,7 +666,28 @@ class Runtime:
         return outcome.receipt
 
     async def task_control_committed(self, result: ControlResult) -> None:
-        await self._notify_task_control()
+        try:
+            await self._notify_task_control()
+        except Exception:
+            # Only this newly committed scheduled input needs a fallback wake:
+            # its next tick cannot recreate the consumed occurrence. Preserve
+            # cancellation and ordinary mobile control's original replay path.
+            ingress = result.ingress
+            with contextlib.suppress(Exception):
+                if (
+                    result.created
+                    and isinstance(result.receipt.get("scheduled_replan"), dict)
+                    and ingress is not None
+                    and not self.reminders._park_unsettled_transaction()
+                    and self.store.db.execute(
+                        "SELECT 1 FROM ingress WHERE id=? AND session_id=? AND state='pending' "
+                        "AND json_extract(payload,'$.task_control.receipt_id')=?",
+                        (ingress["id"], ingress["session_id"], result.receipt["id"]),
+                    ).fetchone()
+                    is not None
+                ):
+                    self._wake_main()
+            raise
 
     async def _notify_task_control(self) -> None:
         await self.bus.notify()
@@ -995,24 +1017,78 @@ class Runtime:
         )
         self.scheduled_workflows = ScheduledWorkflows(self)
         self.scheduled_task_replans = ScheduledTaskReplans(self)
+        self._scheduled_clock_failed: set[str] = set()
+        self._scheduled_clock_retrying: set[str] = set()
         self.workflows.on_idle = lambda: self.reminders.changed.set()
         self.reminders.workflow_tick = self._scheduled_tick
         self.reminders.workflow_due = self._scheduled_due
+        self.reminders._workflow_recover = self._recover_scheduled_clock
         self.reminders.changed.set()
 
+    def _log_clock(self, failed: bool) -> None:
+        if self.reminders._park_unsettled_transaction():
+            return
+        logger = self.system_logger
+        if logger is None:
+            return
+        code = "clock_failed" if failed else "clock_recovered"
+        try:
+            logger.log(
+                logging.ERROR if failed else logging.WARNING,
+                code,
+                extra={"muli_component": "runtime", "muli_code": code, "muli_notify": False},
+            )
+        except Exception:
+            pass  # Diagnostics cannot revive the clock through Attention or stop it.
+
+    def _fail_scheduled_clock(self, branch: str) -> None:
+        if self.reminders._park_unsettled_transaction():
+            return
+        if branch not in self._scheduled_clock_retrying:
+            self._log_clock(True)
+        self._scheduled_clock_retrying.discard(branch)
+        self._scheduled_clock_failed.add(branch)
+
+    def _recover_scheduled_clock(self) -> None:
+        if self.reminders._clock_blocked:
+            return
+        self._scheduled_clock_retrying.update(self._scheduled_clock_failed)
+        self._scheduled_clock_failed.clear()
+
     async def _scheduled_tick(self, timestamp: float) -> None:
-        await self.scheduled_task_replans.tick(timestamp)
-        await self.scheduled_workflows.tick(timestamp)
+        for branch, tick in (
+            ("task_replan", self.scheduled_task_replans.tick),
+            ("workflow", self.scheduled_workflows.tick),
+        ):
+            if self.reminders._clock_blocked:
+                return
+            if branch in self._scheduled_clock_failed:
+                continue
+            try:
+                await tick(timestamp)
+            except Exception:
+                self._fail_scheduled_clock(branch)
 
     def _scheduled_due(self, timestamp: float) -> float | None:
-        deadlines = [
-            due
-            for due in (
-                self.scheduled_task_replans.next_due(timestamp),
-                self.scheduled_workflows.next_due(timestamp),
-            )
-            if due is not None
-        ]
+        deadlines: list[float] = []
+        for branch, next_due in (
+            ("task_replan", self.scheduled_task_replans.next_due),
+            ("workflow", self.scheduled_workflows.next_due),
+        ):
+            if self.reminders._clock_blocked:
+                return None
+            if branch in self._scheduled_clock_failed:
+                continue
+            try:
+                due = next_due(timestamp)
+            except Exception:
+                self._fail_scheduled_clock(branch)
+                continue
+            if branch in self._scheduled_clock_retrying:
+                self._scheduled_clock_retrying.remove(branch)
+                self._log_clock(False)
+            if due is not None:
+                deadlines.append(due)
         return min(deadlines) if deadlines else None
 
     def _store_session(self, session: dict[str, Any], *, previous_mode: str) -> dict[str, Any]:
