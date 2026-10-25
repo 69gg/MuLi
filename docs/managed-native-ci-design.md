@@ -1,8 +1,12 @@
 # 真实 systemd 托管切换 CI 设计
 
-后续候选已合入 v2.72，并在单次同步 `_confirm` 内复用已成功核验、文件身份不变的 package 叶内容摘要。每轮仍完整遍历、打开、核身份和累计资源预算；不同调用、等待两侧与失败 guard 不共享证明。合并后十六文件 336 项通过（79.45 秒、峰值约 150 MiB、swap 0），488 文件 Ruff/格式及 160 源码严格类型检查通过；独立后审未发现 P1/P2。该本地证据仍不代表下面的原生三事务已通过，完整语义见[效果后端](managed-backend.md)。
+后续候选已合入 v2.72。在单次同步 `_confirm` 内复用已成功核验、文件身份不变的 package 叶内容摘要，并将同一次同步安装的三组件循环与首次确认合为一个局部批次。每轮仍完整遍历、打开、核身份和累计资源预算；只有完整 guard 与合法磁盘状态均通过才提升证明，不跨函数返回、等待或独立确认。十七文件 339 项通过（74.87 秒、峰值 150.2 MiB、swap 0），489 文件 Ruff/格式及 160 源码严格类型检查通过；独立后审未发现 P1/P2。新增三项先得到预期的一红两绿，再验证读取减少、等待之后重新认证和跨组件内容漂移拒绝；完整 switch 的三十一次 checks 保持。该本地证据仍不代表下面的原生三事务已通过，完整语义见[效果后端](managed-backend.md)。
 
-最新 [Native50，准确候选 `12d4125`](https://github.com/69gg/MuLi/actions/runs/40191616906) 已全部终态：十项成功，原生和两个 Linux shard1 失败。Windows、macOS 与 Linux shard2 成功；Linux 3.12 shard1 的唯一失败是 `test_managed_host` 局部计量 wrapper 未接收 `verified_python`，不是生产身份门失败。该接缝已修为带类型的真实透传，原 await 两侧认证断言保留；连同同步确认、摘要证据和 guard 预算四文件 57 项通过（19.74 秒、76.8 MiB、swap 0）。新候选仍须完整远端复核。
+该修正的 [Native51，准确签名候选 `1bd713f`](https://github.com/69gg/MuLi/actions/runs/40195589412) 已全部终态，十二项通用作业成功，仅原生 [job `121175612513`](https://github.com/69gg/MuLi/actions/runs/40195589412/job/121175612513) 失败：仍在 60001 毫秒以 `TimeoutError` / `helper_exit` 结束。第一代完整投影为 42384 毫秒；第二代 44601 毫秒 prepared、51001 毫秒 draining、55298 毫秒 stop_base、58822 毫秒 install_target，第三代未开始。cleanup verified；仅获取 2094 字节 evidence，SHA256 `7e5fc065b2c8225a096349433b17bc842393c7004f87f017193f45625c8fa983`，核对两成员及完整合同。
+
+Native51 第一代 backend checks 为 141 次 / 17984 毫秒，host_record 31 次 / 3919 毫秒、bus 291 次 / 4926 毫秒、HTTP 13 次 / 1795 毫秒。该有限观测不能将 checks 拆为哈希、枚举与其它认证成本，也不能单凭相邻运行的总耗时变化归因。下一候选只扩展上述无等待的同步安装批次，不降低文件重验、效果门或期限；其原生结果仍待验收。
+
+前一轮 [Native50，准确候选 `12d4125`](https://github.com/69gg/MuLi/actions/runs/40191616906) 已全部终态：十项成功，原生和两个 Linux shard1 失败。Windows、macOS 与 Linux shard2 成功；Linux 3.12 shard1 的唯一失败是 `test_managed_host` 局部计量 wrapper 未接收 `verified_python`，不是生产身份门失败。该接缝已修为带类型的真实透传，原 await 两侧认证断言保留；连同同步确认、摘要证据和 guard 预算四文件 57 项通过（19.74 秒、76.8 MiB、swap 0）。Native51 已完整复核通用作业，原生失败仍保留。
 
 本轮原生 [job `121163611590`](https://github.com/69gg/MuLi/actions/runs/40191616906/job/121163611590) 仍为 `TimeoutError` / `helper_exit`，60001 毫秒截止。第一代已完整闭合，投影 45686 毫秒；第二代 47853 毫秒 prepared、54390 毫秒 draining、59195 毫秒 stop_base，第三代未开始。cleanup verified。仅取 2086 字节 evidence，SHA256 `a85f44541b0ee8352e499499bd1478fcc82be903df5b24198f153deb8d071c6c`，严格核对两成员及原合同，未下载 package。
 

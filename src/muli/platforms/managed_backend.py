@@ -83,6 +83,12 @@ class _DiskBinding:
         )
 
 
+@dataclass(slots=True)
+class _FileProofs:
+    python: FileFingerprint | None = None
+    packages: PackageProofs | None = None
+
+
 class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     def __init__(
         self,
@@ -372,30 +378,29 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         role: Role,
         lease: FixedLock,
         cgroup: str,
+        *,
+        proofs: _FileProofs | None = None,
     ) -> _DiskBinding:
         expected = _files(record.binding(role))
-        verified_python: FileFingerprint | None = None
-        verified_packages: PackageProofs | None = None
+        batch = _FileProofs() if proofs is None else proofs
 
         def guard() -> None:
-            nonlocal verified_python, verified_packages
             observed_packages: PackageProofs = {}
             self._guard(
                 record,
                 role,
                 lease,
                 cgroup,
-                verified_python=verified_python,
-                verified_packages=verified_packages,
+                verified_python=batch.python,
+                verified_packages=batch.packages,
                 observed_packages=observed_packages,
             )
             if self._disk().digests != expected:
                 raise ObservationError("foreign_managed_binding")
-            # This method never awaits. Only a completed real guard grants the
-            # local Python and package-leaf proofs. Later guards still reopen
-            # every file and rebuild each package walk and aggregate digest.
-            verified_python = self.controller_slot.resolved_python
-            verified_packages = observed_packages
+            # Only the synchronous install-files caller may share its batch.
+            # Every full guard and exact disk check must succeed before promotion.
+            batch.python = self.controller_slot.resolved_python
+            batch.packages = observed_packages
 
         order: tuple[Component, ...] = (
             ("configuration", "selector", "unit")
@@ -625,6 +630,64 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self._effect_guard(record, None)
         await self._command("stop")
 
+    def _install_files(
+        self,
+        record: TransactionRecordV2,
+        role: Role,
+        data: RoleSnapshots,
+        lease: FixedLock,
+        cgroup: str,
+    ) -> None:
+        # This scope never awaits or returns its proofs to the async installer.
+        proofs = _FileProofs()
+
+        def guard() -> None:
+            observed_packages: PackageProofs = {}
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=proofs.python,
+                verified_packages=proofs.packages,
+                observed_packages=observed_packages,
+            )
+            if self._disk().digests not in _prefixes(record):
+                raise ObservationError("foreign_managed_binding")
+            proofs.python = self.controller_slot.resolved_python
+            proofs.packages = observed_packages
+
+        order: tuple[Component, ...] = (
+            ("configuration", "selector", "unit")
+            if role == "target"
+            else ("unit", "selector", "configuration")
+        )
+        for component in order:
+            # The selected replace/confirm guards again before writing or syncing.
+            current = self._disk()
+            if component == "selector":
+                value = (
+                    None
+                    if data.selector is None
+                    else SelectorValue.model_validate_json(data.selector)
+                )
+                with SelectorStore(Path(self.anchor.journal_root)) as selector:
+                    selector.replace(current.selector, value, guard=guard)
+            else:
+                path = (
+                    self.anchor.config_path
+                    if component == "configuration"
+                    else self.anchor.unit_path
+                )
+                desired = data.configuration if component == "configuration" else data.unit
+                snapshot = current.configuration if component == "configuration" else current.unit
+                with ConfigurationFile(Path(path), self.journal.limits.max_snapshot_bytes) as file:
+                    if snapshot.data == desired:
+                        file.confirm(snapshot.digest, guard=guard)
+                    else:
+                        file.replace(snapshot.digest, desired, guard=guard)
+        self._confirm(record, role, lease, cgroup, proofs=proofs)
+
     async def install(
         self, record: TransactionRecordV2, role: Role, data: RoleSnapshots
     ) -> BindingConfirmation:
@@ -650,40 +713,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             guard()
             if before != await self._probe(record):
                 raise ObservationError("transaction_observation_changed")
-            order: tuple[Component, ...] = (
-                ("configuration", "selector", "unit")
-                if role == "target"
-                else ("unit", "selector", "configuration")
-            )
-            for component in order:
-                # The selected replace/confirm guards again before writing or syncing.
-                current = self._disk()
-                if component == "selector":
-                    value = (
-                        None
-                        if data.selector is None
-                        else SelectorValue.model_validate_json(data.selector)
-                    )
-                    with SelectorStore(Path(self.anchor.journal_root)) as selector:
-                        selector.replace(current.selector, value, guard=guard)
-                else:
-                    path = (
-                        self.anchor.config_path
-                        if component == "configuration"
-                        else self.anchor.unit_path
-                    )
-                    desired = data.configuration if component == "configuration" else data.unit
-                    snapshot = (
-                        current.configuration if component == "configuration" else current.unit
-                    )
-                    with ConfigurationFile(
-                        Path(path), self.journal.limits.max_snapshot_bytes
-                    ) as file:
-                        if snapshot.data == desired:
-                            file.confirm(snapshot.digest, guard=guard)
-                        else:
-                            file.replace(snapshot.digest, desired, guard=guard)
-            self._confirm(record, role, lease, cgroup)
+            self._install_files(record, role, data, lease, cgroup)
             fresh = await self._probe(record)
             if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
                 raise ObservationError("transaction_observation_changed")
