@@ -2505,6 +2505,31 @@ class Runtime:
         async def read_conversation(args: dict[str, Any]) -> Any:
             evidence = HistoryEvidence(self.store)
             limits = self.config.settings.limits
+            if args.get("section") == "continuations":
+                if set(args) - {"section", "session_id", "cursor", "limit"}:
+                    raise EvidenceError("invalid_arguments", "延续目录不能混用消息定位或正文参数")
+                caller = self.tool_session_id
+                execution = self._tool_execution.get()
+                if (
+                    caller is None
+                    or caller != args["session_id"]
+                    or caller != self.store.existing_main_session_id()
+                    or execution is None
+                    or execution != (caller, self.run_ids.get(caller))
+                    or self.tasks.get(caller) is not asyncio.current_task()
+                    or self.request_context(caller) is None
+                ):
+                    raise EvidenceError(
+                        "invalid_arguments", "延续目录仅供当前主助手读取自己的直系队友"
+                    )
+                return evidence.continuations(
+                    caller,
+                    cursor=args.get("cursor"),
+                    limit=min(args.get("limit", 20), limits.max_search_results),
+                    max_output_chars=limits.max_output_chars,
+                )
+            if "section" in args or "cursor" in args:
+                raise EvidenceError("invalid_arguments", "section/cursor 仅用于延续目录")
             if "message_id" in args or "seq" in args:
                 if "after" in args or "limit" in args:
                     raise EvidenceError(
@@ -2639,10 +2664,13 @@ class Runtime:
             Tool(
                 "conversation_read",
                 "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content。"
-                "续读使用 revision/next_offset_bytes；不恢复入库前丢失的正文，不读取附件或图片",
+                "续读使用 revision/next_offset_bytes；不恢复入库前丢失的正文，不读取附件或图片。"
+                "section=continuations 仅主助手只读列出直属未完队友，不恢复执行",
                 parameters(
                     {
                         "session_id": string(),
+                        "section": {"type": "string", "enum": ["continuations"]},
+                        "cursor": string(),
                         "after": {"type": "integer", "minimum": 0},
                         "limit": {"type": "integer", "minimum": 1},
                         "message_id": string("与 seq 二选一；不能混用 after/limit"),

@@ -10,6 +10,7 @@
 - [多 agent 协作](workflows.md)：分工、工作流和查看进度。
 - [任务控制](task-control.md)：暂停任务、补充要求与继续。
 - [任务核查](task-inspection.md)：查阅要求、成果和已有依据。
+- [未完成的队友工作](continuations.md)：重新打开后查找直接队友的当前记录。
 - [长对话](context.md)：自动压缩与历史查阅。
 
 ## 文件、电脑与语音

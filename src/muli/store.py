@@ -56,6 +56,7 @@ _UNFINISHED_LIFECYCLE = (
 SQLITE_MAX_INTEGER = (1 << 63) - 1
 _SESSION_RECORD_LIMIT = 101  # A public page of at most 100 plus one lookahead.
 _ATTACHMENT_RECORD_LIMIT = 201  # At most 200 scanned rows plus one lookahead.
+_CONTINUATION_RECORD_LIMIT = 1001  # max_search_results permits at most 1000 candidates.
 
 
 _SESSION_RECORD_UPDATED = _session_record_time("updated_at")
@@ -505,6 +506,84 @@ class Store:
             + predicate
             + f"ORDER BY ({_SESSION_RECORD_SORT}) DESC,objects.id DESC LIMIT ?",
             (metadata_bytes, metadata_bytes, metadata_bytes, query, query, *bounds, limit),
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
+    def continuation_rows(
+        self,
+        main_id: str,
+        *,
+        after_rowid: int,
+        limit: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Limit the indexed parent window before projecting agent/run metadata."""
+        if type(after_rowid) is not int or not 0 <= after_rowid <= SQLITE_MAX_INTEGER:
+            raise ValueError("延续目录行游标必须是有效非负整数")
+        if type(limit) is not int or not 1 <= limit <= _CONTINUATION_RECORD_LIMIT:
+            raise ValueError("延续目录需要有限候选窗口及一个前瞻")
+        if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("延续目录元数据字节预算必须是正整数")
+        columns = [
+            "a.rowid AS rowid",
+            "typeof(a.id) AS agent_key_type",
+            "length(CAST(a.id AS BLOB)) AS agent_key_bytes",
+            "CASE WHEN typeof(a.id)='text' AND length(CAST(a.id AS BLOB))<=:budget "
+            "THEN CAST(a.id AS BLOB) END AS agent_key",
+            "CASE WHEN json_type(a.data,'$.status')='text' "
+            "AND json_extract(a.data,'$.status') IN "
+            "('queued','running','paused','interrupted','cancelled','failed') "
+            "THEN CAST(json_extract(a.data,'$.status') AS BLOB) END AS status",
+        ]
+        for field, name in (
+            ("id", "agent_id"),
+            ("session_id", "session_id"),
+            ("run_id", "run_id"),
+            ("commitment_id", "commitment_id"),
+        ):
+            field_type = f"json_type(a.data,'$.{field}')"
+            value = f"json_extract(a.data,'$.{field}')"
+            columns.extend(
+                (
+                    f"({field_type}) AS {name}_type",
+                    f"length(CAST(({value}) AS BLOB)) AS {name}_bytes",
+                    f"CASE WHEN ({field_type})='text' "
+                    f"AND length(CAST(({value}) AS BLOB))<=:budget "
+                    f"THEN CAST(({value}) AS BLOB) END AS {name}",
+                )
+            )
+        for field in ("generation", "completion_revision"):
+            value = f"json_extract(a.data,'$.{field}')"
+            columns.append(
+                f"CASE WHEN json_type(a.data,'$.{field}')='integer' "
+                f"AND typeof({value})='integer' AND {value}>=0 AND {value}<:max_integer "
+                f"THEN {value} END AS {field}"
+            )
+        cursor = self.db.execute(
+            "WITH candidates AS (SELECT "
+            + ",".join(columns)
+            + " FROM objects a WHERE kind='agent' "
+            "AND json_extract(data,'$.parent_id')=:main_id "
+            "AND rowid>:after_rowid ORDER BY rowid LIMIT :limit) "
+            "SELECT a.*,CASE WHEN json_valid(r.data) THEN CASE "
+            "WHEN json_type(r.data,'$.id')='text' "
+            "AND json_extract(r.data,'$.id')=r.id "
+            "AND json_type(r.data,'$.session_id')='text' "
+            "AND CAST(json_extract(r.data,'$.session_id') AS BLOB)=a.session_id "
+            "THEN 1 ELSE 0 END ELSE 0 END AS run_associated"
+            + " FROM candidates a LEFT JOIN objects r ON r.kind='run' "
+            "AND r.id=CAST(a.run_id AS TEXT) ORDER BY a.rowid",
+            {
+                "main_id": main_id,
+                "after_rowid": after_rowid,
+                "limit": limit,
+                "budget": metadata_bytes,
+                "max_integer": SQLITE_MAX_INTEGER,
+            },
         )
         try:
             for row in cursor:
