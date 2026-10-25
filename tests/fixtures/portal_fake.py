@@ -26,6 +26,9 @@ def main() -> None:
         None,
     )
     connection.set_exit_on_close(False)
+    register_object = getattr(connection, "register_object_with_closures2", None)
+    if register_object is None:
+        register_object = connection.register_object
     desktop = "/org/freedesktop/portal/desktop"
     service = "org.freedesktop.portal.Desktop"
     request_interface = "org.freedesktop.portal.Request"
@@ -87,7 +90,7 @@ def main() -> None:
                 complete()
 
         def register() -> bool:
-            connection.register_object(handle, request_schema.interfaces[0], close, None, None)
+            register_object(handle, request_schema.interfaces[0], close, None, None)
             log({"event": "registered", "handle": handle})
             return False
 
@@ -113,7 +116,7 @@ def main() -> None:
         if settings.get("register_after_close"):
             # Gate registration and the original method reply on the first failed
             # Close, rather than requiring the test parent to run before a timer.
-            placeholder = connection.register_object(
+            placeholder = register_object(
                 handle, request_schema.interfaces[0], missing_close, None, None
             )
         else:
@@ -188,7 +191,7 @@ def main() -> None:
         if not settings.get("register_after_close"):
             GLib.timeout_add(settings.get("reply_delay", 30), reply)
 
-    connection.register_object(desktop, schema.interfaces[0], method, property_value, None)
+    register_object(desktop, schema.interfaces[0], method, property_value, None)
     result = connection.call_sync(
         "org.freedesktop.DBus",
         "/org/freedesktop/DBus",

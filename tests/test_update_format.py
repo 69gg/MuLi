@@ -24,12 +24,21 @@ from muli.store_schema import CHANNEL_SCHEMA
 from muli.updates import Updates
 
 
-def runtime_at(path: Path, *, legacy: bool = False) -> Runtime:
+def runtime_at(path: Path) -> Runtime:
     config = ConfigFile(path / "config.json")
     config.update({"updates": {"check_on_start": False}})
-    if legacy:
-        Store(path / "data" / "muli.sqlite3").close()
     return Runtime(config, path / "data")
+
+
+def legacy_store(path: Path) -> Store:
+    store = Store(path)
+    try:
+        Memory(store)
+        store.db.executescript(CHANNEL_SCHEMA)
+        store.main_session()
+    finally:
+        store.close()
+    return Store.open_existing(path)
 
 
 def manager_for(runtime: Runtime) -> SelfManagement:
@@ -121,11 +130,10 @@ async def test_management_api_keeps_update_diagnostics_readable_after_marker_dam
         await app.state.close()
 
 
-@pytest.mark.parametrize("legacy", [False, True])
 async def test_version_notice_and_context_preserve_actual_installation_capability(
-    tmp_path: Path, legacy: bool
+    tmp_path: Path,
 ) -> None:
-    runtime = runtime_at(tmp_path, legacy=legacy)
+    runtime = runtime_at(tmp_path)
     manager = manager_for(runtime)
     try:
         transport = httpx.MockTransport(
@@ -141,16 +149,36 @@ async def test_version_notice_and_context_preserve_actual_installation_capabilit
         assert "99.0.0 已发布" in notices[0]["content"]
         context = await manager.context(runtime.main_session()["id"], [])
         assert len(context) == 1
-        if legacy:
-            assert "检查安装条件" in notices[0]["content"]
-            assert "真实用户批准" in context[0].content
-        else:
-            assert "先配置来源并核验候选格式" in notices[0]["content"]
-            assert "先配置来源并核验" in context[0].content
-            assert "可更新到" not in context[0].content
+        assert "先配置来源并核验候选格式" in notices[0]["content"]
+        assert "先配置来源并核验" in context[0].content
+        assert "可更新到" not in context[0].content
     finally:
         await manager.close()
         await runtime.close()
+
+
+async def test_legacy_update_diagnostics_do_not_need_runtime_admission(tmp_path: Path) -> None:
+    # Normal Runtime refuses this unmarked store. The low-level diagnostic reader
+    # still reports its original eligibility without manufacturing a new marker.
+    store = legacy_store(tmp_path / "legacy.sqlite3")
+    updates = Updates(ConfigFile(tmp_path / "config.json"), store, EventBus(store))
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200, json={"info": {"name": "muli-agent", "version": "99.0.0"}}
+                )
+            )
+        ) as client:
+            assert (await updates.check(client, independent=True))["available"]
+            assert (await updates.check(client, independent=True))["available"]
+        notices = store.list("notification")
+        assert len(notices) == 1
+        assert "99.0.0 已发布" in notices[0]["content"]
+        assert "检查安装条件" in notices[0]["content"]
+        assert store.format_state is None
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("damaged", [False, True])
@@ -231,7 +259,8 @@ async def test_broken_admission_stays_blocked_and_diagnostic_does_not_raise(
 async def test_update_rechecks_after_uv_directory_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime = runtime_at(tmp_path, legacy=True)
+    store = legacy_store(tmp_path / "legacy.sqlite3")
+    updates = Updates(ConfigFile(tmp_path / "config.json"), store, EventBus(store))
     root = tmp_path / "tools"
     calls: list[list[str]] = []
 
@@ -241,7 +270,7 @@ async def test_update_rechecks_after_uv_directory_observation(
     async def directory(argv: list[str], **kwargs: Any) -> dict[str, Any]:
         calls.append(argv)
         assert argv == ["uv", "tool", "dir"]
-        monkeypatch.setattr(runtime.store, "revalidate_format", invalid)
+        monkeypatch.setattr(store, "revalidate_format", invalid)
         return {"exit_code": 0, "output": str(root)}
 
     monkeypatch.setattr("muli.updates.shutil.which", lambda _: "uv")
@@ -249,24 +278,17 @@ async def test_update_rechecks_after_uv_directory_observation(
     monkeypatch.setattr("muli.updates.sys.prefix", str(root / "muli-agent"))
     try:
         with pytest.raises(ValueError, match="^format_verification_failed$"):
-            await Updates(runtime.config, runtime.store, runtime.bus).apply("99.0.0")
+            await updates.apply("99.0.0")
         assert calls == [["uv", "tool", "dir"]]
     finally:
-        await runtime.close()
+        store.close()
 
 
 def test_unmarked_no_migration_store_still_requires_original_installation_check(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy.sqlite3"
-    store = Store(path)
-    try:
-        Memory(store)
-        store.db.executescript(CHANNEL_SCHEMA)
-        store.main_session()
-    finally:
-        store.close()
-    opened = Store.open_existing(path)
+    opened = legacy_store(path)
     try:
         assert not opened.migration_allowed and opened.format_state is None
         updates = Updates(ConfigFile(tmp_path / "config.json"), opened, EventBus(opened))

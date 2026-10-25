@@ -126,7 +126,7 @@ class Store:
     def open_runtime(cls, path: Path, *, default_mode: str, durable: bool = False) -> Store:
         """Initialize/certify only a database exclusively created by this call.
 
-        Existing unmarked data keeps legacy behavior. No empty-file or schema
+        Existing unmarked data cannot start a Runtime. No empty-file or schema
         heuristic can turn it into a newly created, format-certified database.
         """
         store = cls.__new__(cls)
@@ -164,6 +164,8 @@ class Store:
                 self._admit_format(evidence)
                 self._configure_existing(durable=durable)
             else:
+                if runtime_mode is not None and creation is None:
+                    raise FormatAdmissionError("store_format_upgrade_required")
                 if creation is not None:
                     creation.check()
                 lock.database.chmod(0o600)
@@ -197,6 +199,8 @@ class Store:
         self._admit_format(evidence)
 
     def _admit_format(self, evidence: FormatEvidence) -> None:
+        if self._format_state is not None and evidence.state != self._format_state:
+            raise FormatAdmissionError("store_format_changed")
         require_current_format(evidence)
         validate_existing_schema(self.db)
         identity = evidence.store_instance, evidence.main_session
@@ -916,7 +920,12 @@ class Store:
             return (
                 f"json_type({data},'$.id')='text' AND json_extract({data},'$.id')={key} "
                 f"AND json_type({data},'$.session_id')='text' "
-                f"AND json_extract({data},'$.session_id')=:session_id "
+                f"AND (json_extract({data},'$.session_id')=:session_id OR ("
+                f"json_extract({data},'$.channel_ownership.main_id')=:session_id "
+                f"AND json_extract({data},'$.channel_ownership.agent_id')=json_extract({data},'$.session_id') "
+                f"AND EXISTS(SELECT 1 FROM objects child WHERE child.kind='agent' "
+                f"AND child.id=json_extract({data},'$.session_id') "
+                f"AND json_extract(child.data,'$.parent_id')=:session_id))) "
                 f"AND json_extract({data},'$.role')='user' "
                 f"AND json_extract({data},'$.source')=:source "
                 f"AND json_extract({data},'$.principal')='owner' "
@@ -927,7 +936,6 @@ class Store:
             )
 
         incoming = owner_input("o.data", "o.message_key")
-        predicate = "AND seq<:before_seq " if before_seq is not None else ""
         # Reuse the evidence projection with a zero-byte content window. The CTE
         # supplies an already byte-gated ID and valid JSON, including broken rows.
         evidence_columns = (
@@ -939,6 +947,7 @@ class Store:
         columns = (
             evidence_columns
             + ",o.id_type,o.id_bytes,"
+            + "json_extract(o.data,'$.session_id') AS actual_session_id,"
             + f"CASE WHEN ({incoming}) THEN 'user' END AS channel_role,"
             "CASE WHEN json_type(o.data,'$.created_at') IN ('integer','real') "
             "THEN json_extract(o.data,'$.created_at') END AS created_at,"
@@ -950,10 +959,23 @@ class Store:
             "min(:budget,length(CAST(json_extract(o.data,'$.route.reply_to') AS BLOB)))) "
             "END AS platform_message_id"
         )
+        delegated = (
+            self.db.execute(
+                "SELECT 1 FROM objects WHERE kind='channel_ownership' "
+                "AND json_extract(data,'$.main_id')=? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        )
+        # Once delegation has existed, a bounded global sequence window also
+        # includes its original child sessions. Nonmatching records consume the
+        # page; neither history bodies nor a second conversation are copied.
+        candidate_scope = "" if delegated else "session_id=:session_id AND "
         cursor = self.db.execute(
             "WITH candidates AS (SELECT seq,message_id FROM message_order "
-            "WHERE session_id=:session_id "
-            + predicate
+            "WHERE "
+            + candidate_scope
+            + ("seq<:before_seq " if before_seq is not None else "1=1 ")
             + "ORDER BY seq DESC LIMIT :limit),records AS ("
             "SELECT m.seq,m.message_id AS message_key,typeof(m.message_id) AS id_type,"
             "length(CAST(m.message_id AS BLOB)) AS id_bytes,"
@@ -1346,7 +1368,7 @@ class Store:
     ) -> builtins.list[dict[str, Any]]:
         """At a replay-safe boundary, atomically append inputs and advance delivery state."""
         result: builtins.list[dict[str, Any]] = []
-        destination: tuple[str, str, str] | None = None
+        destination: tuple[str, ...] | None = None
         with self.db:
             rows = self.db.execute(
                 "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
@@ -1359,6 +1381,10 @@ class Store:
                 key = (
                     *origin.destination_key,
                     routing.batch_key if "attention_routing" in payload else "",
+                    json.dumps(
+                        payload.get("channel_ownership"), sort_keys=True, separators=(",", ":")
+                    ),
+                    str(payload.get("channel_ownership_control", False)),
                 )
                 if destination is not None and key != destination:
                     break  # Another recipient waits for the next replay-safe boundary.
@@ -1402,6 +1428,10 @@ class Store:
             message["task_control"] = payload["task_control"]
         if "attention_routing" in payload:
             message["attention_routing"] = FrozenRouting.load(payload["attention_routing"]).dump()
+        if "channel_ownership" in payload:
+            message["channel_ownership"] = payload["channel_ownership"]
+        if "channel_ownership_control" in payload:
+            message["channel_ownership_control"] = payload["channel_ownership_control"]
         if self.get("message", payload["id"]) is not None:
             raise ValueError("输入消息 ID 已经存档，不能覆盖历史")
         self._put("message", message)

@@ -29,7 +29,9 @@ async def event_case(
     config = ConfigFile(tmp_path / "config.json")
     config.update({"workspace_roots": [str(tmp_path)], "updates": {"check_on_start": False}})
     if getattr(request, "param", False):
-        Store(tmp_path / "data" / "muli.sqlite3").close()
+        Store.open_runtime(
+            tmp_path / "data" / "muli.sqlite3", default_mode=config.settings.default_mode
+        ).close()
     runtime = Runtime(config, tmp_path / "data", client_factory=no_model)
     app = create_app(config, runtime=runtime)
     try:
@@ -93,7 +95,7 @@ def test_store_position_reads_only_latest_id_and_survives_reopen(tmp_path: Path)
 
 
 @pytest.mark.parametrize("position", [0, (1 << 53) + 1, SQLITE_MAX_INTEGER])
-@pytest.mark.parametrize("event_case", [False, True], indirect=True, ids=["fresh", "legacy"])
+@pytest.mark.parametrize("event_case", [False, True], indirect=True, ids=["fresh", "reopened"])
 async def test_position_http_is_exact_projected_and_does_not_create_a_session(
     event_case: tuple[Runtime, httpx.AsyncClient],
     monkeypatch: pytest.MonkeyPatch,
@@ -101,10 +103,8 @@ async def test_position_http_is_exact_projected_and_does_not_create_a_session(
 ) -> None:
     runtime, client = event_case
     sessions = runtime.store.list("session")
-    if runtime.store.format_state is None:
-        assert sessions == []
-    else:
-        assert len(sessions) == 1 and sessions[0]["kind"] == "main"
+    assert runtime.store.format_state is not None
+    assert len(sessions) == 1 and sessions[0]["kind"] == "main"
     if position:
         runtime.store.db.execute(
             "INSERT INTO events(id,type,data,created_at) VALUES(?,?,?,1)",

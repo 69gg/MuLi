@@ -12,7 +12,10 @@
 
 MuLi 是面向个人电脑的常驻助手。你可以和她聊天、交办任务、管理文件，也可以从不同消息渠道继续同一段协作。沐璃以十八岁少女为形象，定位为数字生命与本地助手。
 
-![青瓷蓝工作台](docs/screenshots/workbench-desktop.jpg)
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://raw.githubusercontent.com/69gg/MuLi/22433e03284bd8715972a3b71adeb21b1cf239c7/docs/screenshots/workbench-desktop.jpg">
+  <img src="https://raw.githubusercontent.com/69gg/MuLi/22433e03284bd8715972a3b71adeb21b1cf239c7/docs/screenshots/workbench-demo.gif" alt="沐璃新版工作台演示：输入任务、工具调用、人工批准和流式答复" width="960">
+</picture>
 
 - **一起做事**：搜索资料、管理文件，让多个 agent 分工、交流和复核。
 - **记住重要的事**：后台整理偏好、事实与关系，按问题查找记忆，保留可核对的原文。
@@ -39,6 +42,8 @@ MuLi serve
 ```
 
 已有配置时，直接运行 `MuLi serve`。初始化默认尝试下载只读源码参考，不需要时可加 `--no-source`。
+
+保留数据从 v2.71 或更早版本升级时，先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。目前仅提供 Linux 非托管安装的升级入口。
 
 配置、聊天、附件、记忆、插件和日志默认保存在 **`~/MuLi`**。已有配置不会被初始化覆盖；需要自定义位置时，见[配置与维护](docs/operations.md)。
 

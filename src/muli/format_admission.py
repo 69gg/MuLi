@@ -14,7 +14,7 @@ from muli.store_initialization import CreatedDatabase
 
 # Opaque contract IDs, independently versioned when a domain's interpretation
 # changes. These do not claim any resolver context or actual install profile.
-CURRENT_FORMAT_STATE = FormatState(
+LEGACY_FORMAT_STATE = FormatState(
     metadata_version=1,
     formats=FormatVersions(
         database=1,
@@ -22,6 +22,18 @@ CURRENT_FORMAT_STATE = FormatState(
         configuration=1,
         ingress=1,
         outbox=1,
+        memory=1,
+        install_profile=1,
+    ),
+)
+CURRENT_FORMAT_STATE = FormatState(
+    metadata_version=1,
+    formats=FormatVersions(
+        database=1,
+        objects=2,
+        configuration=1,
+        ingress=2,
+        outbox=2,
         memory=1,
         install_profile=1,
     ),
@@ -35,8 +47,15 @@ class FormatAdmissionError(ValueError):
 
 
 def require_current_format(evidence: FormatEvidence) -> None:
+    if evidence.state == LEGACY_FORMAT_STATE:
+        raise FormatAdmissionError("store_format_upgrade_required")
     if evidence.state != CURRENT_FORMAT_STATE:
         raise FormatAdmissionError("store_format_unsupported")
+
+
+def require_channel_ownership_format(state: FormatState | None) -> None:
+    if state != CURRENT_FORMAT_STATE:
+        raise FormatAdmissionError("store_format_upgrade_required")
 
 
 def publish_created_format(db: sqlite3.Connection, creation: CreatedDatabase) -> None:

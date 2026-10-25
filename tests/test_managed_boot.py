@@ -17,6 +17,7 @@ import pytest
 import muli
 from muli import managed_boot, management_transaction
 from muli.config import ConfigFile
+from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.format_evidence import FormatEvidenceError, read_format_evidence
 from muli.managed_boot import ManagedBootError, ManagedBootPermit
 from muli.managed_transaction import (
@@ -79,16 +80,8 @@ def _slot(root: Path, name: str) -> SlotIdentity:
                 "handoff_protocol": 2,
                 "requires_migration": False,
                 "formats": {
-                    name: {"reads": [1], "writes": 1}
-                    for name in (
-                        "database",
-                        "objects",
-                        "configuration",
-                        "ingress",
-                        "outbox",
-                        "memory",
-                        "install_profile",
-                    )
+                    name: {"reads": [version], "writes": version}
+                    for name, version in CURRENT_FORMAT_STATE.formats.model_dump().items()
                 },
             }
         ),

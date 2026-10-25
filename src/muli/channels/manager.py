@@ -55,6 +55,7 @@ class ChannelManager:
         approval_guard: Callable[[ApprovalNotice], dict[str, Any]] | None = None,
         admission: Admission | None = None,
         control_submit: Submit | None = None,
+        ownership_guard: Callable[[object, Mapping[str, Any]], None] | None = None,
     ) -> None:
         self.store, self.bus, self.config, self.submit = store, bus, config, submit
         self.attachments = attachments
@@ -62,6 +63,7 @@ class ChannelManager:
         self.approval_guard = approval_guard
         self.admission = admission or Admission()
         self.control_submit = control_submit
+        self.ownership_guard = ownership_guard
         # Validate before constructing an owned client, including on reconfigure.
         self.store.prepare_channels()
         self._owns_client = client is None
@@ -225,6 +227,13 @@ class ChannelManager:
     def _outbox_guard(
         self, name: str, route: Mapping[str, Any], payload: Mapping[str, Any]
     ) -> None:
+        if "channel_ownership" in payload:
+            try:
+                if self.ownership_guard is None:
+                    raise PermissionError("渠道归属投递没有当前验证者")
+                self.ownership_guard(payload["channel_ownership"], route)
+            except (ValueError, PermissionError) as error:
+                raise _BlockedDelivery(str(error), status_code=403) from None
         if name == "onebot":
             try:
                 self._route(name, route, outbound=True)
@@ -608,6 +617,7 @@ class ChannelManager:
         attention_routing: dict[str, Any] | None = None,
         approval_notice: ApprovalNotice | None = None,
         admission_guard: Callable[[], None] | None = None,
+        ownership: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if admission_guard is not None:
             admission_guard()
@@ -711,6 +721,11 @@ class ChannelManager:
         if admission_guard is not None:
             admission_guard()
         payload: dict[str, Any] = {"parts": parts}
+        if ownership is not None:
+            if self.ownership_guard is None:
+                raise ChannelError("渠道归属投递缺少宿主验证")
+            self.ownership_guard(ownership, selected)
+            payload["channel_ownership"] = dict(ownership)
         if automatic:
             payload["automatic"] = True
         if metadata is not None:

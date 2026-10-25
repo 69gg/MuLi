@@ -194,12 +194,12 @@ def test_existing_unmarked_data_never_receives_a_creation_certificate(
                 old.main_session()
         finally:
             old.close()
-    store = Store.open_runtime(path, default_mode="auto")
-    try:
-        assert store.format_state is None and store.migration_allowed
-        assert read_optional_format_evidence(store.db) is None
-    finally:
-        store.close()
+    before = snapshot(path)
+    with pytest.raises(FormatAdmissionError, match="store_format_upgrade_required"):
+        Store.open_runtime(path, default_mode="auto")
+    assert snapshot(path) == before
+    with closing(sqlite3.connect(path)) as db:
+        assert read_optional_format_evidence(db) is None
 
 
 @pytest.mark.parametrize("failure", ["memory", "channel", "main", "publish"])
@@ -224,11 +224,10 @@ def test_failed_preparation_cannot_be_retried_as_fresh_creation(
             Store.open_runtime(path, default_mode="auto")
     with closing(sqlite3.connect(path)) as db:
         assert read_optional_format_evidence(db) is None
-    reopened = Store.open_runtime(path, default_mode="auto")
-    try:
-        assert reopened.format_state is None
-    finally:
-        reopened.close()
+    before = snapshot(path)
+    with pytest.raises(FormatAdmissionError, match="store_format_upgrade_required"):
+        Store.open_runtime(path, default_mode="auto")
+    assert snapshot(path) == before
 
 
 def test_creation_claim_is_rechecked_before_core_schema_is_written(
@@ -279,11 +278,10 @@ def test_marker_commit_failure_rolls_back_only_the_marker_and_never_reissues_cre
         assert db.execute("SELECT 1 FROM memory_state").fetchone() is not None
         assert db.execute("SELECT count(*) FROM channel_outbox").fetchone()[0] == 0
         assert read_optional_format_evidence(db) is None
-    store = Store.open_runtime(path, default_mode="auto")
-    try:
-        assert store.format_state is None and store.migration_allowed
-    finally:
-        store.close()
+    before = snapshot(path)
+    with pytest.raises(FormatAdmissionError, match="store_format_upgrade_required"):
+        Store.open_runtime(path, default_mode="auto")
+    assert snapshot(path) == before
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows denies replacing the open creation handle")
@@ -341,7 +339,7 @@ def test_admitted_state_never_becomes_legacy_after_its_evidence_is_changed(
                 elif change == "unknown_metadata":
                     data["metadata_version"] = 2
                 elif change == "unknown_domain":
-                    data["formats"]["ingress"] = 2
+                    data["formats"]["ingress"] = 9
                 raw = "invalid JSON" if change == "invalid" else json.dumps(data)
                 store.db.execute(
                     "UPDATE runtime_state SET value=? WHERE name=?", (raw, FORMAT_STATE_KEY)

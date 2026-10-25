@@ -639,7 +639,8 @@ async def test_local_candidate_must_support_the_actual_persistent_formats(host: 
     candidate = _slot(host.root, "incompatible")
     declaration = Path(candidate.declaration.path)
     metadata = json.loads(declaration.read_bytes())
-    metadata["formats"]["outbox"] = {"reads": [2], "writes": 2}
+    outbox = result.record.observed_format.formats.outbox + 1
+    metadata["formats"]["outbox"] = {"reads": [outbox], "writes": outbox}
     declaration.write_text(json.dumps(metadata), encoding="utf-8")
     item = host.plan("switch", name="second")
     before = host.runtime.store.db.total_changes

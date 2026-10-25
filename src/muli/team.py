@@ -325,6 +325,8 @@ class TeamManager:
         attachment_ids: builtins.list[str] | None = None,
     ) -> dict[str, Any]:
         agent = self.get(target)
+        if self.runtime.channel_ownership.for_agent(agent["id"]) is not None:
+            raise PermissionError("该队友正在接管渠道；请使用真实渠道输入，或先收回后再派任务")
         if self._closed:
             raise ValueError("团队正在关闭")
         if wake and agent["status"] in TERMINAL - {"paused"}:
@@ -461,6 +463,8 @@ class TeamManager:
     async def resume(self, target: str) -> dict[str, Any]:
         """Wake a persistent identity without replaying its former side effects."""
         agent = self.get(target)
+        if self.runtime.channel_ownership.for_agent(agent["id"]) is not None:
+            raise PermissionError("受托渠道队友仅由真实渠道输入唤醒，请先收回再恢复普通任务")
         if agent["status"] not in TERMINAL:
             return agent
         if agent["status"] == "paused":
@@ -576,6 +580,24 @@ class TeamManager:
                         observed_epoch=paused[1],
                     )
                 self.runtime.scheduled_task_replans.guard_target_start(agent, session)
+                pending = self.runtime.store.db.execute(
+                    "SELECT json_extract(payload,'$.channel_ownership'),"
+                    "json_object('id',id,'source',json_extract(payload,'$.source'),"
+                    "'principal',json_extract(payload,'$.principal'),'route',json_extract(payload,'$.route')) "
+                    "FROM ingress "
+                    "WHERE session_id=? AND state='pending' ORDER BY seq LIMIT 1",
+                    (agent["id"],),
+                ).fetchone()
+                if pending is not None and pending[0] is not None:
+                    proof = json.loads(pending[0])
+                    self.runtime.channel_ownership.guard(proof, session_id=agent["id"])
+                    agent["channel_ownership"] = proof
+                    agent["channel_reply_origin"] = ReplyOrigin.from_input(
+                        json.loads(pending[1])
+                    ).dump()
+                else:
+                    agent.pop("channel_ownership", None)
+                    agent.pop("channel_reply_origin", None)
                 agent.pop("report_binding", None)
                 agent.update(status="running", generation=agent["generation"] + 1, updated_at=now())
                 run_id = self.runtime._launch(session, agent["role"], cast(Mode, agent["mode"]))
@@ -627,8 +649,13 @@ class TeamManager:
                         },
                         ensure_ascii=False,
                     )[:30000],
-                    "reply_origin": ReplyOrigin.load(agent.get("reply_origin")).dump(),
+                    "reply_origin": ReplyOrigin.load(
+                        agent.get("channel_reply_origin", agent.get("reply_origin"))
+                    ).dump(),
                 }
+                if "channel_ownership" in agent:
+                    report["channel_ownership"] = agent["channel_ownership"]
+                    report["status"] = "local"
                 if (
                     self._closed
                     or self.runtime._closing
@@ -775,9 +802,11 @@ class TeamManager:
     ) -> dict[str, Any]:
         return await self._waiter.wait(targets, timeout=timeout, caller=caller, cursor=cursor)
 
-    async def stop(self, target: str) -> dict[str, Any]:
+    async def stop(self, target: str, *, cancel_pending: bool = True) -> dict[str, Any]:
         agent = self.get(target)
-        async with self._stopping([*self._descendants(agent["id"]), agent]):
+        async with self._stopping(
+            [*self._descendants(agent["id"]), agent], cancel_pending=cancel_pending
+        ):
             pass
         return self.get(agent["id"])
 
@@ -821,6 +850,7 @@ class TeamManager:
         *,
         observers: builtins.list[asyncio.Task[Any]] | None = None,
         report_parent: str | None = None,
+        cancel_pending: bool = True,
     ) -> AsyncIterator[None]:
         # Capture the entire batch before the first await: later resume/send
         # calls belong to a later intent, even for a sibling not yet settled.
@@ -853,8 +883,9 @@ class TeamManager:
                         f"AND json_extract(data,'$.parent_id') IN ({placeholders})",
                         (now(), *parents),
                     )
-            for agent, _ in snapshots:
-                self.runtime.store.cancel_inputs(agent["session_id"])
+            if cancel_pending:
+                for agent, _ in snapshots:
+                    self.runtime.store.cancel_inputs(agent["session_id"])
             for task in tasks:
                 if not task.done() and not task.cancelling():
                     task.cancel()

@@ -38,7 +38,8 @@ def artifact_body(policy: FrozenPolicy, *, change: str = "", payload: int = 1024
     declaration = policy.source.slot.compatibility.model_dump(mode="json")
     declaration["release"] = VERSION
     if change == "format":
-        declaration["formats"]["objects"] = {"reads": [2], "writes": 2}
+        unsupported = CURRENT_FORMAT_STATE.formats.objects + 1
+        declaration["formats"]["objects"] = {"reads": [unsupported], "writes": unsupported}
     elif change == "migration":
         declaration["requires_migration"] = True
     data = io.BytesIO()
