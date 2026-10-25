@@ -52,6 +52,7 @@ from muli.platforms.managed_deployment import (
     resolve_entry,
 )
 from muli.store import Store
+from muli.store_initialization import StoreConstructionLock, StoreInitializationError
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed writer admission")
 _CONFIG = b'{"server":{"port":8766}}'
@@ -281,6 +282,13 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Host]:
                         else permit._unclosed
                     )
                     sqlite3.Connection.close(db)
+                    if isinstance(permit._unclosed, Store):
+                        # The connection is now forcibly closed; release its new
+                        # Runtime lock only in this synthetic-failure teardown.
+                        lock = permit._unclosed._runtime_lock
+                        if lock is not None:
+                            lock.__exit__()
+                            permit._unclosed._runtime_lock = None
                 permit._cleanup_failed = False
                 permit.close_after_writers()
         journal.__exit__()
@@ -314,12 +322,38 @@ def test_real_existing_store_is_read_only_until_returned_then_accepts_business_w
         assert _snapshot(host.journal.database) == before
         store.put("test_private", {"id": "business", "value": "after admission"})
         assert store.get("test_private", "business")["value"] == "after admission"
+        with pytest.raises(StoreInitializationError, match="store_initialization_busy"):
+            Store.open_runtime(host.journal.database, default_mode="auto")
+    with StoreConstructionLock(host.journal.database) as released:
+        released.check()
+    # Closing the Store releases only its Runtime lock, not the boot writer.
+    with pytest.raises(TransactionError, match="lock_busy"):
+        with host.journal.writer_lease():
+            pass
     with pytest.raises(ManagedBootError, match="managed_store_already_opened"):
         permit.open_store()
     permit.close_after_writers()
     permit.close_after_writers()
     with host.journal.writer_lease():
         pass
+
+
+def test_runtime_owner_busy_is_a_closed_factory_failure_not_a_sticky_boot_owner(
+    host: Host,
+) -> None:
+    with closing(
+        Store.open_runtime(host.journal.database, default_mode="auto", durable=True)
+    ) as store:
+        permit = host.acquire()
+        with pytest.raises(ManagedBootError, match="managed_store_unavailable"):
+            permit.open_store()
+        assert not permit._cleanup_failed and permit._unclosed is None
+        assert store.db.execute("SELECT 1").fetchone()[0] == 1
+        permit.close_after_writers()
+        with host.journal.writer_lease():
+            pass
+        with pytest.raises(StoreInitializationError, match="store_initialization_busy"):
+            Store.open_runtime(host.journal.database, default_mode="auto")
 
 
 def test_entry_can_legally_advance_before_or_during_admission(
@@ -672,11 +706,11 @@ def test_same_identity_database_replaced_during_store_open_is_closed(
     original = Store.open_existing
     opened: list[Store] = []
 
-    def replaced(path: Path, *, durable: bool) -> Store:
+    def replaced(path: Path, *, durable: bool, runtime_owner: bool = False) -> Store:
         data = path.read_bytes()
         path.rename(path.with_suffix(".old"))
         path.write_bytes(data)
-        store = original(path, durable=durable)
+        store = original(path, durable=durable, runtime_owner=runtime_owner)
         opened.append(store)
         return store
 
@@ -730,9 +764,9 @@ def test_visible_released_record_requires_a_successful_durability_barrier(
         entered.append("sqlite")
         return original_connect(*args, **kwargs)
 
-    def open_store(path: Path, *, durable: bool) -> Store:
+    def open_store(path: Path, *, durable: bool, runtime_owner: bool = False) -> Store:
         entered.append("store")
-        return original_open(path, durable=durable)
+        return original_open(path, durable=durable, runtime_owner=runtime_owner)
 
     monkeypatch.setattr(
         managed_boot, "sqlite3", SimpleNamespace(**{**vars(sqlite3), "connect": connect})
@@ -805,6 +839,9 @@ def test_failed_store_close_retains_writer_and_database_fd(
     assert permit._database is not None and permit._database.fd is not None
     with pytest.raises(ManagedBootError, match="managed_boot_cleanup_failed"):
         permit.close_after_writers()
+    with pytest.raises(StoreInitializationError, match="store_initialization_busy"):
+        with StoreConstructionLock(host.journal.database):
+            pass
     with pytest.raises(TransactionError, match="lock_busy"):
         with host.journal.writer_lease():
             pass
