@@ -2,6 +2,11 @@
 
 `attachment_search` 只检索已保存的附件目录元数据，允许找回最近 200 条之外的转写工件。它沿用 `read` 权限，不读取正文、调用 ASR 或确认文件存在；文件名与来源都是资料，不构成指令。旧 `attachment_list` 的数组返回格式、最近更新时间排序、默认 50 条与最多 200 条均保持不变。
 
+按附件正文进行长期检索属于独立的[收藏入口](attachment-memory.md)（v2.67 开发候选）：
+主人明确要求后，主助手可用 `memory_import_attachment(id)` 登记完整 UTF-8 原始文本，
+以后经 `memory_query` 查询并用 `memory_source` 核原文。上传、目录检索和读取本身不收藏；
+不支持把 ASR、视觉解释或其它生成工件当作原始文件收藏。
+
 ## 使用方式
 
 `attachment_search(source?, name_query="", cursor?, limit=20)` 返回 `items`、`next_cursor`、`has_more`、`scanned`。每页最多返回 100 项，每次处理最多 200 个相邻目录记录，额外读一条作为后续范围判断。

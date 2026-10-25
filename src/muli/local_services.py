@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from muli.attachment_records import AttachmentRecords
 from muli.attachments import (
+    ATTACHMENT_ID_PATTERN,
     MAX_ATTACHMENT_IDS,
     Attachments,
     attachment_name,
     detected_media,
     file_io,
 )
+from muli.channels.types import NAMES
 from muli.commitments import Commitments
 from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
@@ -165,6 +169,71 @@ class LocalServices:
         if len(data) > max_bytes:
             raise ValueError("附件超过此能力的读取上限")
         return item, data
+
+    async def memory_attachment(self, identifier: str) -> tuple[dict[str, Any], str]:
+        """Read one complete external text snapshot, never a tool-output preview."""
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(ATTACHMENT_ID_PATTERN, identifier) is None
+        ):
+            raise ValueError("附件收藏需要准确的附件 ID")
+        settings = self.runtime.config.settings
+        item = self.runtime.store.bounded_object(
+            "attachment", identifier, max_bytes=settings.limits.max_output_chars * 4
+        )
+        if item is None:
+            raise ValueError("待收藏的附件不存在")
+        source = item.get("source")
+        if (
+            item.get("id") != identifier
+            or not isinstance(source, str)
+            or source not in {"web", "local", "mcp", *("channel:" + name for name in NAMES)}
+            or type(item.get("size")) is not int
+            or item["size"] < 0
+            or not isinstance(item.get("sha256"), str)
+            or re.fullmatch(r"[a-f0-9]{64}", item["sha256"]) is None
+            or type(item.get("created_at")) not in {int, float}
+        ):
+            raise ValueError("附件来源或副本元数据无法核查，生成解释不能作为原始资料收藏")
+        try:
+            if item["created_at"] < 0 or not math.isfinite(item["created_at"]):
+                raise ValueError("附件登记时间无法核查")
+        except OverflowError as error:
+            raise ValueError("附件登记时间无法核查") from error
+        limit = min(
+            settings.limits.max_file_bytes,
+            settings.uploads.max_file_bytes,
+            settings.memory.max_source_chars * 4,
+        )
+        copied, data = await self.read_bytes(identifier, limit)
+        settings = self.runtime.config.settings
+        current = self.runtime.store.bounded_object(
+            "attachment", identifier, max_bytes=settings.limits.max_output_chars * 4
+        )
+        if (
+            copied != item
+            or current != item
+            or len(data) != item["size"]
+            or hashlib.sha256(data).hexdigest() != item["sha256"]
+            or len(data)
+            > min(
+                settings.limits.max_file_bytes,
+                settings.uploads.max_file_bytes,
+                settings.memory.max_source_chars * 4,
+            )
+        ):
+            raise ValueError("附件内容、元数据或读取限额已变化，未收藏")
+        try:
+            content = data.decode("utf-8", errors="strict")
+        except UnicodeError as error:
+            raise ValueError("只能收藏完整 UTF-8 文本附件") from error
+        if (
+            not content.strip()
+            or "\x00" in content
+            or len(content) > settings.memory.max_source_chars
+        ):
+            raise ValueError("附件为空、含二进制数据或超过完整来源上限，未收藏节选")
+        return item, content
 
     def delivery_tools(self, runtime: Runtime) -> list[Tool]:
         identifier = runtime.tool_session_id

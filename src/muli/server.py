@@ -223,7 +223,9 @@ def _create_app(
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
     local_services = LocalServices(runtime, attachments)
     web_voice = WebVoiceInput(local_services)
-    memory_application = MemoryApplication(runtime, local_services.media)
+    memory_application = MemoryApplication(
+        runtime, local_services.media, attachment_reader=local_services.memory_attachment
+    )
     channel_application = ChannelApplication(runtime, attachments)
     personal_io = PersonalIO(runtime, local_services, attachments)
     from muli.integrations.manager import IntegrationManager

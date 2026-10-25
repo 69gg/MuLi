@@ -87,9 +87,14 @@ v2.64 已发行，让队友报告进入长期记忆：主助手直接队友的�
 报告不成为主人偏好或授权，正常完成也不代表任务已经验收。正式测试和实施进度见
 [队友报告记忆](docs/team-report-memory-proposal.md)，精确提交的候选与发行 CI、签名标签及 GitHub/PyPI 两包核验已闭合。
 
-v2.66 候选让提醒和定时委托在单项失败后继续服务：健康入口保留原期限，明确回滚的失败
+v2.67 开发候选支持“留下这份资料，以后问时找原文”：主助手按明确要求收藏准确UTF-8
+附件，复用后台提炼、关系图与可选embedding/reranker；上传不自动收藏，资料不成为主人
+身份或授权。完整跨手机、压缩重开、原文分页及遗忘旅程和778项本地回归通过，远端尚待
+验收，见[附件收藏](docs/attachment-memory.md)。
+
+v2.66 已发行，让提醒和定时委托在单项失败后继续服务：健康入口保留原期限，明确回滚的失败
 仅沿真实事件恢复；已提交的续办输入不会因通知失败悬挂，也不会重复派工。未知事务会
-安全停靠。558项不同本地回归与独立后审通过，正式发行尚待验收，见[时钟恢复](docs/reminder-clock-recovery.md)。
+安全停靠。558项不同本地回归、独立后审、精确远端发行与两包核验已闭合，见[时钟恢复](docs/reminder-clock-recovery.md#发行闭合)。
 
 v2.65 已发行，支持“到约定时间继续原暂停任务”：保留原任务、准确原队友与原回报渠道，
 到期仍由主助手读取完整说明并确认新方案。等待时不调用模型；完整离线旅程、后审与正式发行均已闭合。范围见
@@ -171,6 +176,7 @@ Linux 使用 systemd 用户服务；macOS 使用 LaunchAgent；Windows 使用当
 - [中文唤醒与声纹桥接](docs/voice.md)
 - [完整语音转写与续读](docs/voice-transcripts-design.md)
 - [附件检索与分页](docs/attachment-search.md)
+- [收藏附件与跨渠道原文检索](docs/attachment-memory.md)
 - [工作台交互](docs/frontend.md)
 - [事件订阅与恢复位置](docs/event-subscription.md)
 - [会话恢复与当前执行](docs/session-recovery.md)
