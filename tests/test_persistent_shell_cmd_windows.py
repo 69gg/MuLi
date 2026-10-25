@@ -112,7 +112,13 @@ async def test_forced_cmd_verifies_utf8_and_preserves_unicode_state_in_the_same_
     actual_attach = WindowsShellJob.attach
     actual_spawn = asyncio.create_subprocess_exec
     actual_bootstrap = shell_module.cmd_bootstrap
-    for name in ("__MULI_BOOT_PYTHON", "__MULI_BOOT_HELPER", "__MULI_BOOT_CONFIG"):
+    actual_dispatch = shell_module.dispatch
+    for name in (
+        "__MULI_BOOT_PYTHON",
+        "__MULI_BOOT_HELPER",
+        "__MULI_BOOT_CONFIG",
+        "__MULI_BOOT_ROOT",
+    ):
         monkeypatch.setenv(name, "must-be-overridden")
     parent_environment = dict(os.environ)
 
@@ -134,6 +140,7 @@ async def test_forced_cmd_verifies_utf8_and_preserves_unicode_state_in_the_same_
         assert environment["__MULI_BOOT_HELPER"] == str(Path(protocol_module.__file__).absolute())
         config = Path(environment["__MULI_BOOT_CONFIG"])
         assert config.name == "control.json" and config.parent.parent == protocol_directory
+        assert Path(environment["__MULI_BOOT_ROOT"]) == config.parent
         assert dict(os.environ) == parent_environment
         process = await actual_spawn(*args, **kwargs)
         spawned.append(process.pid)
@@ -145,9 +152,17 @@ async def test_forced_cmd_verifies_utf8_and_preserves_unicode_state_in_the_same_
         assert data.isascii()
         return data
 
+    def dispatch(root: Path, command_id: str, flavor: str) -> bytes:
+        assert attached == spawned and len(attached) == 1
+        assert flavor == "cmd" and root.parent == protocol_directory
+        data = actual_dispatch(root, command_id, flavor)
+        assert data.isascii()
+        return data
+
     monkeypatch.setattr(WindowsShellJob, "attach", attach)
     monkeypatch.setattr(shell_module.asyncio, "create_subprocess_exec", spawn)
     monkeypatch.setattr(shell_module, "cmd_bootstrap", bootstrap)
+    monkeypatch.setattr(shell_module, "dispatch", dispatch)
     manager = cmd_sessions(directory)
     guard_calls = 0
 

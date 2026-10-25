@@ -124,15 +124,19 @@ def write_command(path: Path, command: str, flavor: str, cwd: Path | None) -> No
 
 
 def dispatch(root: Path, command_id: str, flavor: str) -> bytes:
-    script = quote(str(command_file(root, command_id, flavor)), flavor)
+    path = command_file(root, command_id, flavor)
+    script = quote(str(path), flavor)
     helper = quote(str(Path(__file__).absolute()), flavor)
     python = quote(sys.executable, flavor)
     config = quote(str(root / "control.json"), flavor)
     if flavor == "cmd":
+        # Keep pipe input independent of cmd's byte decoding. Unicode host
+        # paths come from the same child environment used by the ready probe.
         text = (
-            f"@call {script} <nul\r\n"
+            f'@call "%__MULI_BOOT_ROOT%\\{path.name}" <nul\r\n'
             '@set "__muli_exit=%errorlevel%"\r\n'
-            f'@{python} -I {helper} {config} {command_id} "%__muli_exit%"\r\n'
+            '@"%__MULI_BOOT_PYTHON%" -I "%__MULI_BOOT_HELPER%" '
+            f'"%__MULI_BOOT_CONFIG%" {command_id} "%__muli_exit%"\r\n'
         )
     elif flavor == "fish":
         text = (
@@ -146,7 +150,7 @@ def dispatch(root: Path, command_id: str, flavor: str) -> bytes:
             "__muli_exit=$?\n"
             f'{python} -I {helper} {config} {command_id} "$__muli_exit"\n'
         )
-    return text.encode("utf-8")
+    return text.encode("ascii" if flavor == "cmd" else "utf-8")
 
 
 def cmd_environment(root: Path) -> dict[str, str]:
@@ -154,6 +158,7 @@ def cmd_environment(root: Path) -> dict[str, str]:
         "__MULI_BOOT_PYTHON": str(Path(sys.executable).absolute()),
         "__MULI_BOOT_HELPER": str(Path(__file__).absolute()),
         "__MULI_BOOT_CONFIG": str((root / "control.json").absolute()),
+        "__MULI_BOOT_ROOT": str(root.absolute()),
     }
     for path in paths.values():
         quote(path, "cmd")
