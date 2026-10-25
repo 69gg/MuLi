@@ -1,5 +1,7 @@
 # 真实 systemd 托管切换 CI 设计
 
+后续候选已合入 v2.72，并在单次同步 `_confirm` 内复用已成功核验、文件身份不变的 package 叶内容摘要。每轮仍完整遍历、打开、核身份和累计资源预算；不同调用、等待两侧与失败 guard 不共享证明。合并后十六文件 336 项通过（79.45 秒、峰值约 150 MiB、swap 0），488 文件 Ruff/格式及 160 源码严格类型检查通过；独立后审未发现 P1/P2。该本地证据仍不代表下面的原生三事务已通过，完整语义见[效果后端](managed-backend.md)。
+
 最新 [Native50，准确候选 `12d4125`](https://github.com/69gg/MuLi/actions/runs/40191616906) 已全部终态：十项成功，原生和两个 Linux shard1 失败。Windows、macOS 与 Linux shard2 成功；Linux 3.12 shard1 的唯一失败是 `test_managed_host` 局部计量 wrapper 未接收 `verified_python`，不是生产身份门失败。该接缝已修为带类型的真实透传，原 await 两侧认证断言保留；连同同步确认、摘要证据和 guard 预算四文件 57 项通过（19.74 秒、76.8 MiB、swap 0）。新候选仍须完整远端复核。
 
 本轮原生 [job `121163611590`](https://github.com/69gg/MuLi/actions/runs/40191616906/job/121163611590) 仍为 `TimeoutError` / `helper_exit`，60001 毫秒截止。第一代已完整闭合，投影 45686 毫秒；第二代 47853 毫秒 prepared、54390 毫秒 draining、59195 毫秒 stop_base，第三代未开始。cleanup verified。仅取 2086 字节 evidence，SHA256 `a85f44541b0ee8352e499499bd1478fcc82be903df5b24198f153deb8d071c6c`，严格核对两成员及原合同，未下载 package。
@@ -16,7 +18,7 @@ Native49 第一代 checks 为 141 次 / 19020 毫秒，仍是整项 backend 检�
 
 上一轮 [Native48](https://github.com/69gg/MuLi/actions/runs/40185853686) 的 `96bb3ec` 原生作业也触及总 60 秒期限；十一项通用作业成功，Windows 3.12 shard2 另有两个既有 UIA 真机探针在原 12 秒期限超时，均确认 cleanup：一个阶段未观察到且 stderr 为空，另一个到达 `uia_initializing`。这些真实失败仍保留，不能归因于 source 去重，也不因 Native49 Windows 成功而消失。其完整边界见[Native48 记录](managed-native-checkpoint-proposal.md#native48真实结果第二次排队成功仍触及总期限)。
 
-当前候选已与 v2.71 主分支整合，保留较新的 Windows UIA probe 与连续终端路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。针对临时服务在多次查询间被回收的竞争，只在 RPC 失败后重新取得精确空列表时确认其已消失；格式、身份错误与取消不会降级。本机未创建测试用户、挂载文件系统或操作真实服务。
+当前候选已与 v2.72 主分支整合，保留较新的 Windows UIA probe、连续终端与渠道接管路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。针对临时服务在多次查询间被回收的竞争，只在 RPC 失败后重新取得精确空列表时确认其已消失；格式、身份错误与取消不会降级。本机未创建测试用户、挂载文件系统或操作真实服务。
 
 Native47 除原生作业外，另有六个平台分片失败，并非通用检查全绿。根核对 Ubuntu 3.12 shard1 的四个失败节点，均为旧测量 stub 未接收 wrapper 已转交的 `verified_python` 关键字，抛出 `TypeError`；该测试接线已修并纳入本地整合，与原生 POST 超时分别记录。十二项通用作业通过属于 Native46，不移用至本轮。
 
