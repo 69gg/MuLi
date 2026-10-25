@@ -216,7 +216,8 @@ def install(root: Path, *, limit: int) -> None:
                 pass  # Stale/missing ownership remains unusable; never re-adopt.
         return installed
 
-    ConfigurationFile.replace = replace
+    # Dedicated CI ownership observation hook; preserve the wrapped CAS operation.
+    ConfigurationFile.replace = replace  # type: ignore[method-assign,assignment]
 
 
 def remove(root: Path, *, limit: int, guard: Callable[[], None]) -> None:

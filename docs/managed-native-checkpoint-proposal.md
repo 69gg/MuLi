@@ -1937,3 +1937,26 @@ checks73次/9105毫秒、bus139次/2495毫秒、HTTP4次/434毫秒；不称已�
 stop_base，60001毫秒以TimeoutError/stage=helper_exit结束，尚未到install。因此只有第一代
 partial，第二代当前成本仍identity_changed不可用。完整三事务未通过，不能把第一代
 采样或清理成功当作超时修复，也不按跨runner墙钟差计算优化收益。
+
+### Native45：整合后临时 helper 终态观察失败
+
+原 PR #37 已同步至签名候选 `dd0c122c9603ce4faa287d7e4f06216f474b7b20`，
+整合 v2.70 并消除合并冲突。[CI 40180376486](https://github.com/69gg/MuLi/actions/runs/40180376486)
+的原生作业 `121129961274` 失败：第一代在 42397 毫秒 released，43327 毫秒
+以 `ObservationError` / `helper_exit` 结束，没有最终投影或第二代。此次不是超时。
+artifact `12593636794` 的 ZIP 为 1662 字节，SHA-256
+`11f64b0de3fff7d8fb92aae245540a702637eeccac9a749d6fae70e177a7d417`；
+两成员、receipt 与 result 已严格核验。cleanup verified，用户和组已移除，mounts 为空。
+
+代码和时间线将失败缩小到 helper 退出观察。原记录没有底层异常帧，不能唯一认定现场原因。
+新增真实 Case + SystemdProbe typed 回归证实：临时 helper 可以在精确列表查询、
+GetUnit、Unit/Service 属性读取之间被回收。旧实现取得 8 failed / 2 passed；其中三个
+成功场景分别在原 RPC 位置抛出 ObservationError，格式与 argv 身份负控继续通过。
+
+窄修仅处理固定 RPC 不可用错误：再作一次精确同名查询，成功空列表才记录 collected。
+非空、失败、坏格式或错名保留原错误；取消正常传播；snapshot 校验和身份门不降级，
+已撤销的历史 source 不因随后回收而恢复。不改生产 probe、期限或资源限制。
+修后新增 11 项及相关四文件共 115 项通过，随后完整 18 文件 1020 项通过
+（64.30 秒、219.1 MiB、swap 0）。另复用已有安全诊断，只在原失败 stderr 输出一次
+有界的产品代码帧，不输出异常正文、真实路径、局部变量或异常链；提取失败不覆盖首因，
+不新增结果字段。原生完整流程仍待新的精确候选验证。

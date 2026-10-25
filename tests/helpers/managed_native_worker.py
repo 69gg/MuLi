@@ -3413,7 +3413,7 @@ def install_helper_cost_hook() -> None:
             record: TransactionRecordV2,
             role: Role,
             data: RoleSnapshots,
-        ) -> BindingConfirmation | None:
+        ) -> BindingConfirmation:
             nonlocal sampled
             confirmation = await original_install(backend, record, role, data)
             if not sampled:
@@ -3447,10 +3447,11 @@ def install_helper_cost_hook() -> None:
                 pass  # Observation never replaces the real helper's outcome.
 
         atexit.register(save)
-        ManagedLinuxBackend._check = check
-        SystemdProbe._command = command
-        ManagedLinuxBackend._request = request
-        ManagedLinuxBackend.install = install
+        # Dedicated CI observation hooks intentionally replace these methods.
+        ManagedLinuxBackend._check = check  # type: ignore[method-assign]
+        SystemdProbe._command = command  # type: ignore[method-assign]
+        ManagedLinuxBackend._request = request  # type: ignore[method-assign]
+        ManagedLinuxBackend.install = install  # type: ignore[method-assign,assignment]
     except Exception:
         return  # A missing observer must not prevent the original helper starting.
 
@@ -3819,11 +3820,30 @@ class Case:
 
     async def helper_empty(self, probe: SystemdProbe, name: str, argv: tuple[str, ...]) -> bool:
         from muli.platforms.linux_controller import CgroupObservation
+        from muli.platforms.linux_transaction import ObservationError
+
+        async def collected_after_failure(error: ObservationError) -> bool:
+            # Transient units may be collected between any two bus calls. Only
+            # a fresh exact empty listing proves this, never a failed query or
+            # a snapshot validation error. Do not rebind any source identity.
+            if error.args != ("systemd_observation_unavailable",):
+                raise error
+            try:
+                exists = await probe.helper_exists(name)
+            except ObservationError:
+                raise error from None
+            if exists:
+                raise error
+            self.note("helper_exit", helper=name, state="collected")
+            return True
 
         if not await probe.helper_exists(name):
             self.note("helper_exit", helper=name, state="collected")
             return True
-        snapshot = await probe._snapshot(await probe._unit_path(name))
+        try:
+            snapshot = await probe._snapshot(await probe._unit_path(name))
+        except ObservationError as error:
+            return await collected_after_failure(error)
         generations = [row for row in self.result["generations"] if row["helper"] == name]
         generation = generations[0]["generation"] if len(generations) == 1 else None
         membership = (
@@ -3869,9 +3889,12 @@ class Case:
                     "invocation": invocation,
                 }
                 self._helper_source_groups[generation] = snapshot.cgroup
-        details = await probe._properties(
-            await probe._unit_path(name), "Service", (("Result", "s"), ("ExecMainStatus", "i"))
-        )
+        try:
+            details = await probe._properties(
+                await probe._unit_path(name), "Service", (("Result", "s"), ("ExecMainStatus", "i"))
+            )
+        except ObservationError as error:
+            return await collected_after_failure(error)
         self.note(
             "helper_exit",
             helper=name,
@@ -4394,6 +4417,16 @@ async def run(mode: str, root: Path) -> int:
             case.note(case.stage)
             write_json(root / "result.json", case.result)
         print("native_" + mode + "_failed:" + case.stage + ":" + code, file=sys.stderr)
+        try:
+            from muli.failure_diagnostics import MAX_FAILURE_BYTES, capture_failure
+
+            diagnostic = json.dumps(
+                capture_failure(error), ensure_ascii=False, separators=(",", ":")
+            )
+            if len(diagnostic.encode("utf-8")) <= MAX_FAILURE_BYTES:
+                print("native_failure_diagnostic:" + diagnostic, file=sys.stderr)
+        except Exception:
+            pass  # Optional safe frames cannot replace the first failure or cleanup.
         return 1
     finally:
         if mode != "cleanup":
