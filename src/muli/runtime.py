@@ -52,6 +52,7 @@ from muli.providers import (
 from muli.reminder_followup import followup_binding, task_status
 from muli.reminders import Reminders
 from muli.reply_origin import ReplyOrigin
+from muli.shell_sessions import ShellSessionError, ShellSessions
 from muli.store import LifecycleKind, Store, new_id, now
 from muli.system_events import SystemEvents, SystemLogger
 from muli.task_control import (
@@ -212,6 +213,9 @@ class Runtime:
         self._plans_dirty = False
         self._coordinator_tools: set[str] = set()
         self._closing = False
+        self._shell_generation = 0
+        self._shell_mode_epochs: dict[str, int] = {}
+        self._shell_requests: dict[str, PreparedRequest] = {}
         self._voice_reply_epoch = 0
         self._voice_reply_changed = asyncio.Event()
         self._stopping: dict[str, int] = {}
@@ -254,6 +258,7 @@ class Runtime:
             and self.team.idle
             and self.compaction.idle
             and self.workflows.idle
+            and not self.shells.live_sessions()
         )
 
     def _configure_compaction(self) -> None:
@@ -666,6 +671,7 @@ class Runtime:
         return outcome.receipt
 
     async def task_control_committed(self, result: ControlResult) -> None:
+        self._invalidate_shell_scopes()
         try:
             await self._notify_task_control()
         except Exception:
@@ -690,6 +696,7 @@ class Runtime:
             raise
 
     async def _notify_task_control(self) -> None:
+        self._invalidate_shell_scopes()
         await self.bus.notify()
         await self.flush_task_plan_deliveries()
         self.team.start()
@@ -804,6 +811,7 @@ class Runtime:
                 admission_guard()
             session = self.main_session()
             active = session["id"] in self.tasks
+            previous_mode = session["mode"]
             selected = mode or session["mode"]
             if selected not in {"ask", "auto", "yolo"}:
                 raise ValueError("未知权限模式")
@@ -847,6 +855,8 @@ class Runtime:
             # from waking their original waiter. A rollback never wakes it.
             for future in superseded:
                 future.set_exception(ApprovalSuperseded())
+            if inserted and principal == "owner" and receipt["state"] == "pending":
+                self.shell_mode_changed(session["id"], previous_mode, session["mode"])
             if inserted and principal == "owner":
                 self._invalidate_voice_reply()
             voice_reply_epoch = self.voice_reply_epoch
@@ -1099,6 +1109,34 @@ class Runtime:
         self.store._put("session", session)
         return session
 
+    def shell_mode_changed(self, session_id: str, previous_mode: str, current_mode: str) -> None:
+        """Called only after committing a mode edit, before its first suspension."""
+        if previous_mode != current_mode:
+            if session_id in self._shell_mode_epochs:
+                self._shell_mode_epochs[session_id] += 1
+            self.shells.invalidate(session_id)
+            self._shell_requests.pop(session_id, None)
+
+    def _invalidate_shell_scopes(self) -> None:
+        for session_id in self.shells.live_sessions():
+            request = self._shell_requests.get(session_id)
+            if request is None:
+                continue
+            try:
+                self._guard_request(request, "destructive")
+            except (ValueError, PermissionError):
+                self.shells.invalidate(session_id)
+                self._shell_requests.pop(session_id, None)
+
+    async def _settle_shell(self, session_id: str) -> None:
+        try:
+            await self.shells.stop(session_id)
+        except ShellSessionError as exc:
+            # A public receipt can exceed its budget after cleanup completed.
+            # Lifecycle callers need ownership settlement, not that receipt.
+            if exc.code != "output_budget":
+                raise
+
     @property
     def busy(self) -> bool:
         return (
@@ -1298,6 +1336,18 @@ class Runtime:
                 Path(__file__).resolve().parent,
             ],
         )
+        if not hasattr(self, "shells"):
+            self.shells = ShellSessions(
+                default_cwd=self.files.roots[0],
+                executable="",
+                max_sessions=lambda: self.config.settings.limits.max_pending_runs,
+                max_output_bytes=lambda: self.config.settings.limits.max_output_chars,
+                max_command_bytes=lambda: self.config.settings.limits.max_file_bytes,
+                max_run_seconds=lambda: self.config.settings.limits.max_run_seconds,
+                max_receipt_chars=lambda: self.config.settings.limits.max_output_chars,
+            )
+        self.shells.default_cwd = self.files.roots[0]
+        self._shell_generation += 1
         self.computer = Computer(
             settings, owner=self._computer_owner, dispatch_guard=self._computer_dispatch_guard
         )
@@ -1326,6 +1376,9 @@ class Runtime:
                 "workflow_schedule_cancel",
                 "task_schedule_replan",
                 "task_schedule_replan_cancel",
+                "shell_run",
+                "shell_read",
+                "shell_stop",
             }
         )
         self._tool_factories.clear()
@@ -1406,6 +1459,7 @@ class Runtime:
         session["updated_at"], session["status"] = now(), "running"
         with self.store.db:
             self._store_session(session, previous_mode=previous_mode)
+        self.shell_mode_changed(session_id, previous_mode, session["mode"])
         message = self.store.add_message(session_id, "user", content)
         if session.get("kind") == "main":
             self._invalidate_voice_reply()
@@ -1478,6 +1532,7 @@ class Runtime:
                 del self._stopping[session_id]
 
     async def stop(self, session_id: str, *, cancel_pending: bool = True) -> None:
+        self.shells.invalidate(session_id)
         invalidate_reply = session_id == self.store.existing_main_session_id()
         if invalidate_reply:
             self._invalidate_voice_reply()
@@ -1509,6 +1564,9 @@ class Runtime:
             cancelled = await self.team._settle([task])
         if expected_run is not None:
             await computer.release_execution(session_id, expected_run)
+        await self._settle_shell(session_id)
+        self._shell_requests.pop(session_id, None)
+        self._shell_mode_epochs.pop(session_id, None)
         if self.run_ids.get(session_id) != expected_run:
             if cancelled:
                 raise asyncio.CancelledError
@@ -1696,8 +1754,19 @@ class Runtime:
             raise
         finally:
             self.system_events.end_run(log_scope)
+            release_cancelled = False
+            if run["status"] != "completed":
+                self.shells.invalidate(session_id)
+                shell_release = asyncio.create_task(self._settle_shell(session_id))
+                release_cancelled = await self.team._settle([shell_release])
+                if shell_release.cancelled():
+                    release_cancelled = True
+                if not shell_release.cancelled() and (shell_error := shell_release.exception()):
+                    run["shell_cleanup_error"] = type(shell_error).__name__
+                self._shell_requests.pop(session_id, None)
+                self._shell_mode_epochs.pop(session_id, None)
             release = asyncio.create_task(computer.release_execution(session_id, run_id))
-            release_cancelled = await self.team._settle([release])
+            release_cancelled = await self.team._settle([release]) or release_cancelled
             if release.cancelled():
                 release_cancelled = True
                 run["cleanup_error"] = "电脑引用回收被取消"
@@ -2207,6 +2276,15 @@ class Runtime:
                     preserve_output = (
                         result_tool is not None and result_tool.preserve_output is True
                     )
+                    if preserve_output and call.name == "shell_run":
+                        # Keep the original argv branch's bounded preview contract.
+                        # Command receipts instead paginate completely in ShellSessions.
+                        try:
+                            shell_arguments = json.loads(call.arguments)
+                        except (ValueError, TypeError):
+                            shell_arguments = None
+                        if isinstance(shell_arguments, dict) and "argv" in shell_arguments:
+                            preserve_output = False
                     output = json.dumps(result, ensure_ascii=False, default=str)
                     content_provenance = "accepted"
                     if len(output) > self.config.settings.limits.max_output_chars:
@@ -2331,6 +2409,7 @@ class Runtime:
         *,
         prepared: PreparedRequest | None = None,
     ) -> Any:
+        shell_epoch: int | None = None
         try:
             if call.name not in tools:
                 raise ValueError("工具未启用")
@@ -2345,6 +2424,12 @@ class Runtime:
             if prepared.session_id != session_id:
                 raise PermissionError("工具请求与真实调用会话不匹配")
             self._guard_request(prepared, tool.risk)
+            if call.name in {"shell_run", "shell_read", "shell_stop"}:
+                live_shells = self.shells.live_sessions()
+                for identifier in tuple(self._shell_mode_epochs):
+                    if identifier not in live_shells and identifier not in self.tasks:
+                        self._shell_mode_epochs.pop(identifier, None)
+                shell_epoch = self._shell_mode_epochs.setdefault(session_id, 0)
             await self.permissions.check(
                 "ask" if tool.requires_approval else mode,
                 call.name,
@@ -2371,6 +2456,11 @@ class Runtime:
                 # Final synchronous fence after the last await. No await may be
                 # added between this check and entering the trusted handler.
                 self._guard_request(prepared, tool.risk)
+                if (
+                    shell_epoch is not None
+                    and self._shell_mode_epochs.get(session_id) != shell_epoch
+                ):
+                    raise PermissionError("shell 审批期间执行模式已改变，请重新规划")
                 if self.store.pending_inputs(session_id):
                     result = {
                         "status": "not_executed",
@@ -2396,6 +2486,8 @@ class Runtime:
             result = {"error": str(exc), "code": exc.code}
         except ComputerError as exc:
             result = exc.as_result()
+        except ShellSessionError as exc:
+            result = {"error": str(exc), "code": exc.code}
         except Exception as exc:
             result = {
                 "error": str(exc)[:1000]
@@ -2411,6 +2503,9 @@ class Runtime:
                 )
                 else f"工具执行失败：{type(exc).__name__}"
             }
+        finally:
+            if shell_epoch is not None and session_id not in self.shells.live_sessions():
+                self._shell_mode_epochs.pop(session_id, None)
         await self._tool_completed(call, result, session_id)
         return result
 
@@ -2467,6 +2562,53 @@ class Runtime:
         return result["allow"], result["reason"][:500]
 
     def _personal_tools(self) -> list[Tool]:
+        shell_manager = self.shells
+        shell_generation = self._shell_generation
+
+        def shell_caller(name: str, risk: str) -> tuple[str, PreparedRequest, Callable[[], None]]:
+            session_id = self.tool_session_id
+            execution = self._tool_execution.get()
+            request = self.request_context(session_id) if session_id is not None else None
+            task = asyncio.current_task()
+            if session_id is None or execution is None or request is None or task is None:
+                raise PermissionError("shell 需要当前会话的真实工具执行")
+            mode_epoch = self._shell_mode_epochs.get(session_id, 0)
+            session = self.store.bounded_object(
+                "session", session_id, max_bytes=self.config.settings.limits.max_output_chars * 4
+            )
+            if session is None or session.get("principal") != "owner":
+                raise PermissionError("shell 仅供主人会话及其委派的助手使用")
+            mode = session["mode"]
+
+            def guard() -> None:
+                if (
+                    self._closing
+                    or not self.maintenance.admission.allowed
+                    or task is not asyncio.current_task()
+                    or task.cancelling()
+                    or self.tasks.get(session_id) is not task
+                    or self.run_ids.get(session_id) != execution[1]
+                    or execution[0] != session_id
+                    or session_id in self._stopping
+                    or name in self.config.settings.disabled_tools
+                    or self.shells is not shell_manager
+                    or self._shell_generation != shell_generation
+                    or self._shell_mode_epochs.get(session_id, 0) != mode_epoch
+                    or self.store.pending_inputs(session_id)
+                ):
+                    raise PermissionError("shell 执行身份、配置或新输入已改变，请重新规划")
+                current = self.store.bounded_object(
+                    "session",
+                    session_id,
+                    max_bytes=self.config.settings.limits.max_output_chars * 4,
+                )
+                if current is None or current.get("mode") != mode:
+                    raise PermissionError("shell 执行模式已改变")
+                self._guard_request(request, risk)
+
+            guard()
+            return session_id, request, guard
+
         async def schedule_task_replan(args: dict[str, Any]) -> Any:
             item = self.scheduled_task_replans.create(**args)
             self.reminders.changed.set()
@@ -2597,13 +2739,52 @@ class Runtime:
             return {"deleted": deleted}
 
         async def shell(args: dict[str, Any]) -> Any:
-            cwd = self.files.path(str(args["cwd"]))
-            return await run_process(
-                args["argv"],
+            session_id, request, guard = shell_caller("shell_run", "destructive")
+            cwd = self.files.path(str(args["cwd"])) if "cwd" in args else None
+            if "argv" in args:
+                return await run_process(
+                    args["argv"],
+                    cwd=cwd,
+                    timeout=30,
+                    limit=self.config.settings.limits.max_output_chars,
+                )
+            if cwd is None:
+                self.files.path(shell_manager.current_cwd(session_id) or str(self.files.roots[0]))
+            live_sessions = shell_manager.live_sessions()
+            for identifier in tuple(self._shell_requests):
+                if identifier not in live_sessions:
+                    self._shell_requests.pop(identifier, None)
+            self._shell_requests[session_id] = replace(request, messages=[])
+            return await shell_manager.execute(
+                session_id,
+                args["command"],
                 cwd=cwd,
-                timeout=30,
-                limit=self.config.settings.limits.max_output_chars,
+                wait_seconds=args.get("wait_seconds", 1),
+                timeout=args.get("timeout"),
+                admission_guard=guard,
             )
+
+        async def read_shell(args: dict[str, Any]) -> Any:
+            session_id, _, guard = shell_caller("shell_read", "read")
+            if "command_id" not in args:
+                if {"cursor", "wait_seconds"} & args.keys():
+                    raise ValueError("shell 输出续读需要 command_id；空参数只查询当前状态")
+                return shell_manager.status(session_id)
+            result = await shell_manager.read(
+                session_id,
+                args["command_id"],
+                cursor=args.get("cursor"),
+                wait_seconds=args.get("wait_seconds", 0),
+            )
+            guard()
+            return result
+
+        async def stop_shell(args: dict[str, Any]) -> Any:
+            session_id, _, guard = shell_caller("shell_stop", "destructive")
+            guard()
+            result = await shell_manager.stop(session_id)
+            self._shell_requests.pop(session_id, None)
+            return result
 
         async def notify(args: dict[str, Any]) -> Any:
             item = self.store.put(
@@ -2798,21 +2979,66 @@ class Runtime:
             ),
             Tool(
                 "shell_run",
-                "执行参数数组命令，最多30秒，不经过shell解释。命令具有当前用户权限；仅在有明确必要时使用",
-                parameters(
-                    {
-                        "argv": {
-                            "type": "array",
-                            "items": string(),
-                            "minItems": 1,
-                            "maxItems": 100,
-                        },
-                        "cwd": string(),
-                    },
-                    ("argv", "cwd"),
-                ),
+                "argv+cwd保持一次性无shell解释、最多30秒；或用command在本会话独立shell执行，"
+                "省cwd沿用目录。两分支互斥。wait_seconds仅等回执，running用shell_read查询，"
+                "不要重发命令。正常回合结束保环境，停止或服务重开不保。均具当前用户权限，非沙箱",
+                {
+                    "type": "object",
+                    "oneOf": [
+                        parameters(
+                            {
+                                "argv": {
+                                    "type": "array",
+                                    "items": string(),
+                                    "minItems": 1,
+                                    "maxItems": 100,
+                                },
+                                "cwd": string(),
+                            },
+                            ("argv", "cwd"),
+                        ),
+                        parameters(
+                            {
+                                "command": {"type": "string", "minLength": 1},
+                                "cwd": string(),
+                                "wait_seconds": {"type": "number", "minimum": 0, "maximum": 10},
+                                "timeout": {"type": "number", "exclusiveMinimum": 0},
+                            },
+                            ("command",),
+                        ),
+                    ],
+                },
                 shell,
                 "destructive",
+                preserve_output=True,
+            ),
+            Tool(
+                "shell_read",
+                "只读本会话shell状态；空参数不启动进程。传command_id及双流cursor续读有界输出，"
+                "wait_seconds最多10秒。exit_code仅completed可信；unknown不能自动重做",
+                parameters(
+                    {
+                        "command_id": {"type": "string", "minLength": 1},
+                        "cursor": parameters(
+                            {
+                                "output": {"type": "integer", "minimum": 0},
+                                "stderr": {"type": "integer", "minimum": 0},
+                            },
+                            ("output", "stderr"),
+                        ),
+                        "wait_seconds": {"type": "number", "minimum": 0, "maximum": 10},
+                    }
+                ),
+                read_shell,
+                preserve_output=True,
+            ),
+            Tool(
+                "shell_stop",
+                "停止本会话shell及其拥有的子树，环境失效；已发生的效果不会回滚。仅停止自己，不选择其它身份",
+                parameters({}),
+                stop_shell,
+                "destructive",
+                preserve_output=True,
             ),
             Tool(
                 "notify",
@@ -2894,6 +3120,7 @@ class Runtime:
 
     async def _close_resources(self) -> None:
         drivers_settled = False
+        shells_settled = False
         try:
             try:
                 await self.maintenance.settle_activation()
@@ -2914,12 +3141,18 @@ class Runtime:
             await self.computer.aclose()
         finally:
             try:
-                await self.system_events.close()
+                # Shell ownership must settle even if an earlier component fails
+                # to close. Keep the writer lease if process cleanup is unknown.
+                await self.shells.aclose()
+                shells_settled = True
             finally:
-                # Earlier failure can leave a producer with ownership of this DB.
-                # Stop the log observer regardless, but never close under live drivers.
-                if drivers_settled:
-                    self.store.close()
-                    self._release_writer()
+                try:
+                    await self.system_events.close()
+                finally:
+                    # Earlier failure can leave a producer with ownership of this DB.
+                    # Stop the log observer regardless, but never close under live drivers.
+                    if drivers_settled and shells_settled:
+                        self.store.close()
+                        self._release_writer()
         if cancelled:
             raise asyncio.CancelledError
