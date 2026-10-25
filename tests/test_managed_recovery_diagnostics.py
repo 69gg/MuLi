@@ -20,6 +20,7 @@ from helpers import managed_recovery_worker as worker
 from muli.managed_controller import ManagedTransactionController
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Activation, Code, Role
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.managed_backend import ManagedLinuxBackend
 from muli.platforms.managed_deployment import SlotIdentity
 
@@ -67,6 +68,7 @@ def test_file_observation_preserves_original_calls_failures_and_lookup_restorati
     monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: clock))
     record = cast(TransactionRecordV2, object())
     slot = cast(SlotIdentity, object())
+    fingerprint = cast(FileFingerprint, object())
     failure = asyncio.CancelledError("private") if cancel else ValueError("private")
     calls: list[str] = []
 
@@ -78,9 +80,10 @@ def test_file_observation_preserves_original_calls_failures_and_lookup_restorati
         if stage == "controller":
             raise failure
 
-    def selected(value: SlotIdentity) -> None:
+    def selected(value: SlotIdentity, *, verified_python: FileFingerprint | None = None) -> None:
         nonlocal clock
         assert value is slot
+        assert verified_python is fingerprint
         calls.append("selected")
         clock += 0.5
         if stage == "selected":
@@ -94,7 +97,7 @@ def test_file_observation_preserves_original_calls_failures_and_lookup_restorati
         if stage == "before":
             raise failure
         managed_deployment.verify_slot_files(slot)
-        vars(managed_backend)["verify_slot_files"](slot)
+        vars(managed_backend)["verify_slot_files"](slot, verified_python=fingerprint)
         clock += 0.125
 
     monkeypatch.setattr(managed_deployment, "verify_slot_files", controller)

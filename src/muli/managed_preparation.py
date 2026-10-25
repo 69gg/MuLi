@@ -60,6 +60,7 @@ from muli.platforms.managed_deployment import (
     SelectorValue,
     SlotIdentity,
     register_local_slot,
+    verify_current_process,
     verify_current_slot,
     verify_slot_files,
 )
@@ -252,7 +253,11 @@ class ManagedPreparation:
                 limits=manifest.package_limits,
             )
             controller = slot
-        verify_current_slot(slot)
+        if anchor is not None and slot == controller:
+            # verify_anchor authenticated these exact files in this synchronous read.
+            verify_current_process(slot)
+        else:
+            verify_current_slot(slot)
         if manifest is not None and (
             manifest.config_path != str(permit.config_path)
             or manifest.data_dir != str(self.runtime.data_dir.absolute())

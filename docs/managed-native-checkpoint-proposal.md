@@ -1,5 +1,7 @@
 # readiness 最后完整轮的小型失败回执（第十九轮已取得历史轮，仍未 READY）
 
+当前最新结果已推进至 Native47：第一代完整闭合，第二次排队请求局部超时，cleanup verified；Native48 同步认证去重候选与真实验收边界见末节。下列早期 readiness 记录保留当时事实。
+
 2026-10-24。根已独审方案和原提交/保存顺序，并通过唯一守卫收齐旧实现三项预期red：pytest 3 failed/0.12秒，守卫597毫秒/66.4 MiB/swap0/exit1；两项缺字段、一项严格五键拒绝，与预期一致。随后实现worker、协调器及新回归，完成根整合与另一Sol独立后审。第十九轮精确候选`db22a5f`现已受测：小回执保住历史pending轮，manager仍未READY、真实事务仍为零，详见末节。此前本地文档HEAD为`1304e1b`，真实第十八轮精确候选为`c0394b0`；本地实现、纯回归与远端结果分别记录。
 
 ## 新事实与问题边界
@@ -2002,3 +2004,47 @@ role 传这一次 Python 指纹；第二槽仍独立打开真实 FD，核路径�
 155 个产品源码严格类型、Ruff 与格式检查通过；两片均由非作者只读后审，未发现
 P1/P2。这里只证明同步重复工作已去除及离线边界保持，不按本地墙钟承诺完整三事务
 能在 60 秒完成。真实原生 CI 仍待精确签名候选验证，原失败和期限保持不变。
+
+### Native47真实结果：第二次排队请求局部超时
+
+准确候选 `575402b` 的 [CI 40184138517](https://github.com/69gg/MuLi/actions/runs/40184138517)
+原生作业失败。第一代 adopt、release、helper collected 与最终投影均已完成；
+47.917 秒开始第二次 POST 排队请求，50.947 秒以 `TimeoutError` 结束，未达到总
+60 秒期限，且没有第二代记录。原 HTTP 客户端仍配置 `HTTP_SECONDS=2`；观察到的
+约 3 秒墙钟间隔不是配置期限变更。cleanup verified，不把清理成功当作三事务通过。
+
+该 POST 只进入 `Management.stage` 持久排队、唤醒及通知，不在 route 内等待 prepare
+完成；后台管理任务随后在同一事件循环执行 prepare。同步文件校验可能延迟 ASGI
+发送响应，是待验证假说。超时既不证明第二请求未受理，也不证明已完成 prepare，
+不能据此盲重投有副作用的 POST，或认定唯一根因已经找到。
+
+本轮另有六个平台分片失败，不是仅原生作业失败。根核对 Ubuntu 3.12 shard1 的
+`test_file_observation_preserves_original_calls_failures_and_lookup_restoration`：
+`False/True × none/selected` 四节点的旧 `selected` stub 不接收 `verified_python`，
+与上一片测量 wrapper 新增的转交参数不匹配，实际抛出 `TypeError`。
+根本地守卫收齐该测试八参数中的 4 failed / 4 passed；同批 distinct slot 独立新 boot
+用例通过，合计 9 节点为 4 failed / 5 passed（pytest 0.49 秒、75.8 MiB、swap 0）。
+窄修仅为 stub 补显式可选 `FileFingerprint` 参数，并以身份断言核实非空指纹完整转交；
+原异常实例、调用次数、计时和 lookup 恢复断言保留，已包含在下述修后整合中。
+Native46 的十二项通用作业通过不作为本轮结果，测试接线失败也不冒充原生超时根因。
+
+### Native48候选：source 同步认证去重，真实结果待验
+
+仅在 `_source` 已通过 `verify_anchor` 完整文件认证，且 source 与 controller 的完整
+`SlotIdentity` 相等时，复用这次文件认证并调用已有 `verify_current_process`；不同 slot
+与无 anchor 分支仍用原 `verify_current_slot`。每次新的 source 读取重新认证，不保留
+跨调用或跨 await 缓存，当前进程身份门与其它来源、文件、事务门不变。
+
+管理层 `verify_source` 只删除紧接 `read_lineage` 前重复的 `current.verify()`；
+`read_lineage` 内首末验证、实际来源比较与 `candidate_guard` 全部保留。
+两个真实目标先红由根合并实收 2 failed（pytest 0.46 秒、守卫 1.077 秒、77.5 MiB、
+swap 0）：source 实际读取 74 字节而期望 37 字节，lineage 实际验证 5 次而期望 4 次。
+这证明同步重复工作存在，不证明它就是远端 POST 超时的唯一原因。
+
+修后八文件整合 161 项通过，包含 source、lineage、切换准备、异步门、候选捕获与
+清理、恢复诊断；pytest 32.88 秒，守卫峰值 150.3 MiB、swap 0。distinct slot 的
+新夹具起初因复用前次 boot 被真实健康证明拒绝，已通过给原完成 helper 传入独立 boot
+修正，不改健康门。生产两处窄修经非作者只读后审，未发现 P1/P2。
+
+真实 CI 尚待精确签名候选验证。没有调整 HTTP 2 秒、总 60 秒或资源上限，没有新增
+skip，不以本片宣称完整原生恢复或超时已解决。

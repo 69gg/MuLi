@@ -1,10 +1,14 @@
 # 真实 systemd 托管切换 CI 设计
 
-最新原生检查是 [Native46](https://github.com/69gg/MuLi/actions/runs/40182350177)：第一轮安装接管、helper 终态与最终投影已完成，第二轮启动目标服务后触及整段 60 秒期限；十二项通用检查通过，资源清理通过，完整三步恢复仍未验收。准确时间及证据见[原生检查记录](managed-native-checkpoint-proposal.md#native46第一代闭合第二代启动仍触及总期限)。下面各轮保留当时事实。
+最新原生检查是 [Native47](https://github.com/69gg/MuLi/actions/runs/40184138517)，准确候选 `575402b` 的原生作业失败：第一代 adopt、release、helper collected 与最终投影均完成；47.917 秒发起第二次 POST 排队请求，50.947 秒以 `TimeoutError` 结束。HTTP 客户端配置仍是 `HTTP_SECONDS=2`，不是 3 秒，也未达到总 60 秒期限。第二次请求是否已受理不能由超时判定；cleanup 已 verified，完整三事务仍未验收。准确边界见[原生检查记录](managed-native-checkpoint-proposal.md#native47真实结果第二次排队请求局部超时)。下面各轮保留当时事实。
 
 当前候选已与 v2.70 主分支整合，保留较新的 Windows UIA probe 路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。针对临时服务在多次查询间被回收的竞争，只在 RPC 失败后重新取得精确空列表时确认其已消失；格式、身份错误与取消不会降级。本机未创建测试用户、挂载文件系统或操作真实服务。
 
-待验的性能修复只去除同步段内重复工作：控制器已完整验证 Python 后，另一安装仍独立打开真实文件、核对路径、全部文件身份、链接链及自己的字节限额，完全相同才复用这一次 SHA；包、声明与 venv 配置仍分别校验。凭据不跨检查或等待保留。helper 循环在刚完成等待后的完整认证后，只为比较进度重新读取当前事务；该读取保留锁、poison、持久性屏障和 V2 类型门，下一控制步骤及每次等待两侧的完整认证保持不变。不提高原 60 秒期限。
+Native47 除原生作业外，另有六个平台分片失败，并非通用检查全绿。根核对 Ubuntu 3.12 shard1 的四个失败节点，均为旧测量 stub 未接收 wrapper 已转交的 `verified_python` 关键字，抛出 `TypeError`；该测试接线已修并纳入本地整合，与原生 POST 超时分别记录。十二项通用作业通过属于 Native46，不移用至本轮。
+
+Native47 已包含同步检查内的 Python 指纹复用及 helper 进度读取去重，不能因第一代完成就认定整链性能问题解决。第二次 POST 只调用 `Management.stage` 排队；真正的 prepare 在同一事件循环的后台管理任务执行。同步 prepare 校验可能阻塞 ASGI 响应发送，是源码支持的待验证假说，不是本轮唯一已证根因。
+
+Native48 候选继续只去除同一同步认证段内的重复工作：`_source` 已由 `verify_anchor` 完整认证 controller，且 source 与 controller 的完整 slot 身份相等时，仅再核当前进程；不同 slot 和无 anchor 分支保留原完整校验。`verify_source` 删除 `read_lineage` 前重复的 `current.verify()`，保留 reader 自身的验证、来源比较与候选门。本地八文件整合 161 项通过，守卫峰值 150.3 MiB、swap 0；非作者后审未发现 P1/P2。没有跨 await 缓存、提高 2 秒 HTTP 或 60 秒总期限、增加 skip；真实 CI 待验，不宣称已解决超时。
 
 ## 目标与范围
 

@@ -409,7 +409,6 @@ class RecoveryHost:
                 )
 
             def verify_source() -> None:
-                current.verify()
                 if read_lineage(self.runtime.store, current, plan_limit=plan_limit) != lineage:
                     raise MaintenanceError("candidate_source_evidence_changed")
                 if candidate_guard is not None:
