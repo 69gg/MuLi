@@ -74,6 +74,7 @@ async def check_installed(target: Path) -> None:
                 for path in (
                     "/",
                     "/app.mjs",
+                    "/conversation-layout.mjs",
                     "/task-control.mjs",
                     "/assets/muli-avatar.svg",
                     "/assets/muli-empty.svg",

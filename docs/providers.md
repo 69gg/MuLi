@@ -165,6 +165,10 @@ async def speak(text: str, settings: ServiceConfig) -> bytes:
 
 embedding 验证返回条数、索引、有限数值和一致维度，结果按输入顺序返回，不生成伪造向量。reranker 沿用 Undefined 的兼容请求格式：`model/query/documents/top_n/return_documents:false`，接受 `results`、`data` 或顶层数组，分数支持 `relevance_score`、`score`、`similarity`，包括有限的数字字符串。缺少 `index` 时按输入顺序解释；负数、越界、重复索引、非有限分数或空结果明确失败，文档始终取原始输入。`/rerank` 是第三方 Cohere 风格的兼容接口，并非 OpenAI 官方 API；具体版本前缀和参数支持应按服务商文档配置。
 
+更换embedding服务后，原资料、事实和关系保留；查询只使用当前模型标识的向量，不把旧
+向量直接交给新模型。v2.68开发候选支持由主人明确选择已有完成来源，沿原单worker
+后台重建向量，不重复提炼或自动全库运行；用法、取消与预算边界见[语义索引接续](memory-reindex.md)。
+
 ASR 默认请求 JSON，支持 `extra_body.response_format` 选择 `json`、`verbose_json`、`diarized_json`、`text`、`srt`、`vtt`，返回对应文本；其他原生选项可写入 `extra_body`，数组转为 multipart 的 `key[]` 字段，嵌套对象序列化为 JSON。文件名只发送 basename，不发送本地目录。`ServiceConfig.response_format` 专用于 TTS。
 
 可选网页录音复用 `media.asr`，以认证的 `/api/media/transcribe` 接口生成草稿；不调用主模型或自动提交对话。启用、格式探测、取消与资源限制见 [网页点击录音](voice.md#网页点击录音)。

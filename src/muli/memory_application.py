@@ -45,6 +45,7 @@ class MemoryApplication:
         runtime.add_tool_provider(self.tools)
         if attachment_reader is not None:
             runtime.add_tool_provider(self.attachment_tools, session_scoped=True)
+        runtime.add_tool_provider(self.index_tools, session_scoped=True)
         runtime.message_hooks.append(self.ingest)
         runtime.memory_context_provider = MemoryContextProvider(
             self._context, composer=self._context_result
@@ -94,6 +95,7 @@ class MemoryApplication:
             media=self.media,
             config=MemoryPipelineConfig(**settings.memory.model_dump()),
             admission=self.runtime.maintenance.admission,
+            max_plan_bytes=settings.limits.max_output_chars * 4,
         )
         pipeline.recover()
         return pipeline
@@ -408,8 +410,14 @@ class MemoryApplication:
         await self.media.aclose()
 
     async def reconfigure(self) -> None:
+        budget = self.runtime.config.settings.limits.max_output_chars * 4
+        self.pipeline.check_index_budget(budget)
+        media = self.media_factory()
+        # Record every actually observed model transition before the first
+        # lifecycle await. B -> C -> B cannot revive C-invalidated work.
+        self.pipeline.check_index_model(MemoryPipeline.embedding_key(media), max_bytes=budget)
         await self.close()
-        self.media = self.media_factory()
+        self.media = media
         self.pipeline = self._pipeline()
         self.runtime.memory_context_provider = MemoryContextProvider(
             self._context, composer=self._context_result
@@ -443,6 +451,7 @@ class MemoryApplication:
         generation: object,
         *,
         expected_request: PreparedRequest | None = None,
+        tool_name: str = "memory_import_attachment",
     ) -> PreparedRequest:
         runtime = self.runtime
         caller = runtime.tool_session_id
@@ -462,9 +471,9 @@ class MemoryApplication:
             or caller in runtime._stopping
             or request is None
             or (expected_request is not None and request is not expected_request)
-            or "memory_import_attachment" in runtime.config.settings.disabled_tools
+            or tool_name in runtime.config.settings.disabled_tools
         ):
-            raise PermissionError("附件收藏需要本次主助手的真实工具执行")
+            raise PermissionError("长期记忆操作需要本次主助手的真实工具执行")
         runtime.maintenance.admission.require()
         budget = runtime.config.settings.limits.max_output_chars * 4
         session = runtime.store.bounded_object("session", caller, max_bytes=budget)
@@ -479,7 +488,7 @@ class MemoryApplication:
             or run.get("session_id") != caller
             or run.get("status") != "running"
         ):
-            raise PermissionError("附件收藏的主助手运行已结束或被替换")
+            raise PermissionError("长期记忆操作的主助手运行已结束或被替换")
         trigger = runtime.store.db.execute(
             "SELECT o.id=? AND json_extract(o.data,'$.principal')='owner' "
             "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
@@ -488,11 +497,75 @@ class MemoryApplication:
             (request.reply_origin.input_id, caller),
         ).fetchone()
         if trigger is None or trigger[0] != 1:
-            raise PermissionError("只有当前真实主人输入可以收藏附件，资料和系统提醒没有此权限")
+            raise PermissionError(
+                "只有当前真实主人输入可以发起长期记忆操作，资料和系统提醒没有此权限"
+            )
         runtime._guard_request(request, "write")
         if runtime.store.pending_inputs(caller):
-            raise PermissionError("读取期间收到新的输入，附件尚未收藏，请重新确认")
+            raise PermissionError("操作期间收到新的输入，请重新确认长期记忆操作")
         return request
+
+    def reindex(self, args: dict[str, Any]) -> dict[str, Any]:
+        """One local service shared by authenticated owner API and tool admission."""
+        action = args.get("action")
+        required = {"action", "source_ids", "key"} if action == "start" else {"action", "plan_id"}
+        if action not in {"start", "status", "cancel"} or args.keys() != required:
+            raise ValueError("索引操作仅接受 start(source_ids,key) 或 status/cancel(plan_id)")
+        if self._closed or self.runtime._closing:
+            raise ValueError("记忆服务正在关闭")
+        if action == "status":
+            return self.pipeline.index_status(args["plan_id"])
+        self.runtime.maintenance.admission.require()
+        if "memory_reindex" in self.runtime.config.settings.disabled_tools:
+            raise ValueError("语义索引工具未启用")
+        if action == "start":
+            return self.pipeline.start_index(args["source_ids"], args["key"])
+        return self.pipeline.cancel_index(args["plan_id"])
+
+    def index_tools(self, runtime: Runtime) -> list[Tool]:
+        caller = runtime.tool_session_id
+        if caller is not None and caller != runtime.store.existing_main_session_id():
+            return []
+        pipeline, generation = self.pipeline, self._attachment_generation
+
+        async def reindex(args: dict[str, Any]) -> Any:
+            self._attachment_guard(pipeline, generation, tool_name="memory_reindex")
+            receipt = self.reindex(args)
+            if args["action"] != "status":
+                await pipeline._publish()
+            return receipt
+
+        return [
+            Tool(
+                "memory_reindex",
+                "主人显式选择已完成提炼的准确来源，使用当前 embedding 后台重建语义索引；"
+                "会向已配置服务发送原有记忆正文，不重新提炼或改原完成作业。"
+                "先核准确来源；start 只传 source_ids/稳定key，status/cancel 只传原 plan_id；"
+                "不自动重建全库，取消后的未知请求不自动重放。"
+                "queued/processing/retry 不是完成；done 仍应核 omitted 和实际查询。",
+                parameters(
+                    {
+                        "action": {"type": "string", "enum": ["start", "status", "cancel"]},
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                            "maxItems": pipeline.config.max_pending_jobs,
+                        },
+                        "key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": pipeline.max_plan_bytes,
+                        },
+                        "plan_id": {"type": "string", "pattern": r"^[a-f0-9]{64}$"},
+                    },
+                    ("action",),
+                ),
+                reindex,
+                "write",
+                preserve_output=True,
+            )
+        ]
 
     def attachment_tools(self, runtime: Runtime) -> list[Tool]:
         reader = self.attachment_reader

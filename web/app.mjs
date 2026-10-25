@@ -8,6 +8,7 @@ import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
 import { createTaskControl, taskControlView } from "./task-control.mjs";
 import { VoiceInput, mergeTranscript } from "./voice-input.mjs";
+import { initializeConversationWidth } from "./conversation-layout.mjs";
 
 const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -89,6 +90,7 @@ const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
 let draftRevision = 0;
+let conversationLayout = null;
 const voiceInput = new VoiceInput({
   upload: uploadFile, transcribe: transcribeAttachment,
   onUploaded: (file) => { state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
@@ -355,6 +357,7 @@ function renderChrome() {
   $("#notification-count").setAttribute("aria-label", `${unread} 条未读通知，${state.approvals.length} 项待批准`);
   $("#inbox-attention").hidden = !needsAttention && !state.approvalsError;
   $("#chat-view").hidden = state.view !== "chat";
+  if (state.view === "chat") conversationLayout?.refresh();
   $("#management-shell").hidden = state.view === "chat";
   $("#settings-toggle").setAttribute("aria-pressed", String(state.view !== "chat"));
 }
@@ -1031,6 +1034,9 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  if (view === "settings" && state.view === "settings" && state.settingsDraft && !state.viewError && !state.viewLoading && $(".settings-layout", $("#other-view"))) {
+    collectSettingsForm(); renderOtherView(); return;
+  }
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
   releaseRecordDirectory();
@@ -1039,7 +1045,9 @@ async function switchView(view, owner = connection) {
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
   const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === view;
+  const changedView = state.view !== view;
   state.view = view; state.viewError = ""; renderChrome();
+  if (changedView) animatePanel(view === "chat" ? $("#chat-view") : $("#management-shell"));
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
   if (view === "records") {
     const slot = recordDirectory = { query: state.recordQuery, cursor: null, starts: [null], page: null, controller: null, error: "", retry: null, dirty: false, root: null };
@@ -1111,13 +1119,41 @@ function renderOtherView() {
   if (state.view === "memories") root.replaceChildren(renderMemories());
   if (state.view === "workflows") { const saved = captureWorkflowView(root); root.replaceChildren(renderWorkflows()); restoreWorkflowView(root, saved); }
   if (state.view === "notifications") root.replaceChildren(renderNotifications());
-  if (state.view === "settings") root.replaceChildren(renderSettings());
+  if (state.view === "settings") {
+    const layout = $(".settings-layout", root);
+    if (layout && state.settingsDraft) {
+      for (const button of $$("[data-settings-tab]", $(".settings-nav", layout))) {
+        const active = button.dataset.settingsTab === state.settingsTab;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-current", active ? "page" : "false");
+      }
+      const panel = $(".settings-content", layout);
+      const changedTab = panel.dataset.settingsTab !== state.settingsTab;
+      panel.replaceChildren(renderSettingsPanel());
+      panel.dataset.settingsTab = state.settingsTab;
+      if (changedTab) animatePanel(panel);
+    } else root.replaceChildren(renderSettings());
+  }
   if (state.view === "uploads") root.replaceChildren(renderUploads());
   if (state.view === "team") { const saved = captureTeamView(root); root.replaceChildren(renderTeam()); restoreTeamView(root, saved); }
   if (state.view === "records") { const content = renderRecords(); if (root.firstElementChild !== content) root.replaceChildren(content); }
   const nav = $(".settings-nav", root);
   const active = $(".settings-nav .active", root);
   if (nav && active && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, active.offsetLeft - nav.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2);
+}
+
+function animatePanel(node) {
+  if (!node?.animate || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  for (const animation of node.getAnimations()) animation.cancel();
+  node.animate([{ opacity: 0.65, transform: "translateY(5px)" }, { opacity: 1, transform: "none" }], { duration: 180, easing: "cubic-bezier(.2,.7,.2,1)" });
+}
+
+function switchSettingsTab(tab) {
+  if (!SETTINGS_GROUPS.some(([key]) => key === tab) || tab === state.settingsTab) return;
+  collectSettingsForm();
+  state.settingsTab = tab;
+  renderOtherView();
+  $("#other-view").scrollTop = 0;
 }
 
 function renderThemeControl() {
@@ -2226,7 +2262,11 @@ function renderSettings() {
   const nav = element("nav", { class: "settings-nav", "aria-label": "设置分组" });
   for (const [key, label] of SETTINGS_GROUPS) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
   const refresh = actionButton("刷新状态", "refresh-settings-status", "text-button", "refresh");
-  if (state.settingsTab === "overview") return element("div", { class: "view-content" }, viewHeading("设置", "告诉沐璃需要调整什么。", refresh), element("div", { class: "settings-layout" }, nav, renderConfigurationOverview()));
+  return element("div", { class: "view-content settings-view" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, element("div", { class: "settings-content", dataset: { settingsTab: state.settingsTab } }, renderSettingsPanel())));
+}
+
+function renderSettingsPanel() {
+  if (state.settingsTab === "overview") return renderConfigurationOverview();
   const form = element("form", { id: "settings-form", class: "settings-panel", onSubmit: saveSettings });
   if (state.settingsTab === "models") form.append(renderModelSettings());
   if (state.settingsTab === "tools") form.append(renderToolSettings());
@@ -2238,7 +2278,7 @@ function renderSettings() {
   if (state.settingsTab === "inputs") form.append(renderInputSettings());
   if (state.settingsTab === "maintenance") form.append(renderMaintenanceSettings());
   form.append(element("p", { class: "form-error", id: "settings-error", hidden: true }), element("div", { class: "settings-footer" }, element("button", { class: "primary-button", type: "submit", text: "保存设置" }), element("span", { class: "settings-save-status", id: "settings-save-status", text: state.settingsSaveStatus, hidden: !state.settingsSaveStatus })));
-  return element("div", { class: "view-content" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, form));
+  return form;
 }
 
 function renderConfigurationOverview() {
@@ -2818,7 +2858,7 @@ document.addEventListener("click", async (event) => {
     if (button.dataset.action) await handleAction(button.dataset.action, button);
     else if (button.dataset.view) await switchView(button.dataset.view);
     else if (button.dataset.session) await loadSession(button.dataset.session, button);
-    else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); $("#other-view").scrollTop = 0; }
+    else if (button.dataset.settingsTab) switchSettingsTab(button.dataset.settingsTab);
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) { cancelMemorySearch(); releaseMemoryPath(); state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
@@ -2902,6 +2942,7 @@ window.addEventListener("pageshow", (event) => { if (event.persisted) recoverCon
 window.addEventListener("pagehide", () => { invalidateConnection(); voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); releaseRecordDirectory(); });
 
 fillIcons();
+conversationLayout = initializeConversationWidth($("#chat-view"));
 initializeTheme(); renderThemeControl();
 document.addEventListener("muli:themechange", renderThemeControl);
 void connect();

@@ -137,6 +137,13 @@ class MemoryInput(Input):
     confidence: float = Field(default=1, ge=0, le=1)
 
 
+class MemoryIndexInput(Input):
+    action: Literal["start", "status", "cancel"]
+    source_ids: list[Annotated[str, Field(min_length=1, strict=True)]] | None = None
+    key: str | None = Field(default=None, min_length=1, strict=True)
+    plan_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$", strict=True)
+
+
 class WorkflowInput(Input):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
@@ -259,6 +266,7 @@ def _create_app(
         if runtime.extensions.configuration_only(config.settings, target):
             await runtime.extensions.apply_locked(target, persist=True)
             return
+        memory_application.pipeline.check_index_budget(target.limits.max_output_chars * 4)
         previous = config.settings.model_copy(deep=True)
 
         async def rebuild() -> None:
@@ -1020,6 +1028,17 @@ def _create_app(
     @app.get("/api/memory/status")
     async def memory_status() -> dict[str, Any]:
         return memory_application.pipeline.status()
+
+    @app.post("/api/memory/reindex")
+    async def memory_reindex(body: MemoryIndexInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = memory_application.reindex(body.model_dump(exclude_none=True))
+            pipeline = memory_application.pipeline
+        if body.action != "status":
+            await pipeline._publish()
+        return result
 
     @app.get("/api/channels")
     async def channel_status() -> dict[str, Any]:
