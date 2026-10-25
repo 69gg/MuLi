@@ -11,8 +11,8 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
+from test_report_origin import assert_channel_message
 from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, completed, eventually, tool_result
 
@@ -21,6 +21,19 @@ from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.server import create_app
 from muli.tools import Handler, Tool, parameters, string
+
+
+def channel_input(runtime: Runtime, messages: list[Message], content: str) -> Message:
+    stored = [
+        message
+        for message in runtime.store.messages(runtime.main_session()["id"])
+        if message["role"] == "user" and message["content"] == content
+    ]
+    assert len(stored) == 1
+    projected = [message for message in messages if message.source_message_id == stored[0]["id"]]
+    assert len(projected) == 1
+    assert_channel_message(projected[0], stored[0])
+    return projected[0]
 
 
 async def test_new_owner_phone_input_replans_main_without_approving_the_old_send(
@@ -92,9 +105,7 @@ async def test_new_owner_phone_input_replans_main_without_approving_the_old_send
             assert main_rounds <= 2 and len(messages) <= 32
             if main_rounds == 1:
                 original_run_id = runtime.run_ids[main_id]
-                assert any(
-                    message.role == "user" and message.content == assignment for message in messages
-                )
+                channel_input(runtime, messages, assignment)
                 assert "channel_send" in {tool["function"]["name"] for tool in tools}
                 turn = ModelTurn(
                     tool_calls=[
@@ -122,10 +133,9 @@ async def test_new_owner_phone_input_replans_main_without_approving_the_old_send
                     for index, message in enumerate(messages)
                     if message.role == "tool" and message.tool_call_id == "send-awaiting-owner"
                 ]
+                incoming = channel_input(runtime, messages, steering)
                 input_positions = [
-                    index
-                    for index, message in enumerate(messages)
-                    if message.role == "user" and message.content == steering
+                    index for index, message in enumerate(messages) if message is incoming
                 ]
                 assert len(call_positions) == len(result_positions) == len(input_positions) == 1
                 assert call_positions[0] < result_positions[0] < input_positions[0]
@@ -246,17 +256,17 @@ async def test_new_owner_phone_input_replans_main_without_approving_the_old_send
             assert reply["reply_origin"]["route"]["target"] == "8"
             assert reply["reply_origin"]["route"]["reply_to"] == "6302"
             await processed_reply(runtime, manager, reply["id"])
+            # Final Web text does not enqueue an external delivery.
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == final_reply
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"] == reply["reply_origin"]["route"]
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+            assert deliveries == []
             sent = [
                 body
                 for body in platform_calls
                 if "".join(segment["data"]["text"] for segment in body["message"]) == final_reply
             ]
-            assert len(sent) == 1 and str(sent[0]["user_id"]) == "8"
+            assert sent == []
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200
             assert any(message["content"] == final_reply for message in history.json()["messages"])
@@ -497,7 +507,9 @@ async def test_owner_input_keeps_the_original_model_stream_running_until_its_bou
             rounds += 1
             assert rounds <= 2
             if rounds == 1:
-                assert not any(message.content == "跨渠道新输入" for message in messages)
+                assert [message.content for message in messages if message.role == "user"] == [
+                    "原主人输入"
+                ]
                 yield StreamEvent("text_delta", text="原回答")
                 entered.set()
                 try:
@@ -508,7 +520,7 @@ async def test_owner_input_keeps_the_original_model_stream_running_until_its_bou
                     raise
                 turn = ModelTurn(content="原回答完整结束")
             else:
-                assert any(message.content == "跨渠道新输入" for message in messages)
+                channel_input(runtime, messages, "跨渠道新输入")
                 assert any(message.content == "原回答完整结束" for message in messages)
                 turn = ModelTurn(content="新输入在下一安全轮处理")
             yield StreamEvent("done", turn=turn)
@@ -524,6 +536,7 @@ async def test_owner_input_keeps_the_original_model_stream_running_until_its_bou
             source="channel:onebot:123",
             route={
                 "name": "onebot",
+                "account_id": "123",
                 "target": "8",
                 "sender_id": "8",
                 "kind": "private",
@@ -536,6 +549,8 @@ async def test_owner_input_keeps_the_original_model_stream_running_until_its_bou
         )
         assert rounds == 1 and not stream_cancelled and not driver.done()
         assert runtime.store.pending_inputs(started["session_id"]) == 1
+        assert incoming["message"]["content"] == "跨渠道新输入"
+        assert incoming["message"]["principal"] == "owner"
         release.set()
         async with asyncio.timeout(3):
             assert await runtime.wait(started["run_id"]) == "新输入在下一安全轮处理"

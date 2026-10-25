@@ -14,6 +14,7 @@ import httpx
 import pytest
 from test_channels import terminal
 from test_mobile_task_control_followup import (
+    approve_reply_send,
     assert_one_replan,
     command_code,
     delivery_text,
@@ -132,6 +133,8 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
     completed_report_id = ""
     alias_id = ""
     removed_notice_ids: list[str] = []
+    completion_receipt: dict[str, Any] = {}
+    prior_delivery_ids: set[str] = set()
 
     async def remove_exact_notice_keep_ordinary_alias(
         session_id: str, messages: list[Message]
@@ -236,23 +239,54 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
                 assert len(seen) == 1
                 turn = ModelTurn(content=other_reply)
             else:
-                assert phase == "completion" and len(seen) == 1
-                report = active_runtime.store.get("team_report", completed_report_id)
-                assert report is not None and report["status"] == "delivered"
-                assert report["execution_status"] == "completed"
-                delivered = [
-                    item
-                    for item in active_runtime.store.messages(main_id)
-                    if item.get("source") == f"team:{worker_id}"
-                    and item.get("content") == report["content"]
-                ]
-                assert len(delivered) == 1
-                assert delivered[0]["run_id"] == run_id
-                assert delivered[0]["source"] == f"team:{worker_id}"
-                assert delivered[0]["principal"] == f"agent:{worker_id}"
-                assert delivered[0]["content"] == report["content"]
-                assert any(worker_result in message.content for message in messages)
-                turn = ModelTurn(content=completion_reply)
+                assert phase == "completion"
+                if len(seen) == 1:
+                    report = active_runtime.store.get("team_report", completed_report_id)
+                    assert report is not None and report["status"] == "delivered"
+                    assert report["execution_status"] == "completed"
+                    delivered = [
+                        item
+                        for item in active_runtime.store.messages(main_id)
+                        if item.get("source") == f"team:{worker_id}"
+                        and item.get("content") == report["content"]
+                    ]
+                    assert len(delivered) == 1
+                    assert delivered[0]["run_id"] == run_id
+                    assert delivered[0]["source"] == f"team:{worker_id}"
+                    assert delivered[0]["principal"] == f"agent:{worker_id}"
+                    assert delivered[0]["content"] == report["content"]
+                    assert any(worker_result in message.content for message in messages)
+                    if damage is None:
+                        # The model explicitly chooses the still-bound owner; a
+                        # report's stored origin alone no longer sends anything.
+                        turn = ModelTurn(
+                            tool_calls=[
+                                call(
+                                    "send-completion",
+                                    "channel_send",
+                                    channel="onebot",
+                                    target="7",
+                                    text=completion_reply,
+                                    idempotency_key="mobile-task-completion",
+                                )
+                            ]
+                        )
+                    else:
+                        turn = ModelTurn(content=completion_reply)
+                else:
+                    assert damage is None and len(seen) == 2
+                    completion_receipt.update(tool_result(messages, "send-completion"))
+                    if outcome == "blocked":
+                        assert "owner_ids" in completion_receipt["error"]
+                    else:
+                        assert "error" not in completion_receipt
+                        assert completion_receipt["state"] in {
+                            "pending",
+                            "sending",
+                            "sent",
+                            "unknown",
+                        }
+                    turn = ModelTurn(content=completion_reply)
             yield StreamEvent("done", turn=turn)
 
     class OriginalWorker(FakeClient):
@@ -363,10 +397,9 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
                 assert await runtime.wait(main_runs["assignment"]) == initial_reply
                 initial_message = completed(runtime, initial_reply)[0]
                 await processed_reply(runtime, manager, initial_message["id"])
-                initial_delivery = next(
-                    item for item in manager.deliveries() if delivery_text(item) == initial_reply
+                assert not any(
+                    delivery_text(item) == initial_reply for item in manager.deliveries()
                 )
-                assert (await terminal(manager, initial_delivery["id"]))["state"] == "sent"
             else:
                 assigned = await web.post(
                     f"/api/sessions/{main_id}/messages",
@@ -534,10 +567,7 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
             }
             replan_message = completed(runtime, replan_reply)[0]
             await processed_reply(runtime, manager, replan_message["id"])
-            replan_delivery = next(
-                item for item in manager.deliveries() if delivery_text(item) == replan_reply
-            )
-            assert (await terminal(manager, replan_delivery["id"]))["state"] == "sent"
+            assert not any(delivery_text(item) == replan_reply for item in manager.deliveries())
             assert replan_message["reply_origin"] == control_origin
             paused_report = runtime.store.get("team_report", old_report["id"])
             assert paused_report["status"] == "delivered"
@@ -614,11 +644,8 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
             assert await runtime.wait(main_runs["other_private"]) == other_reply
             other_message = completed(runtime, other_reply)[0]
             await processed_reply(runtime, manager, other_message["id"])
-            other_delivery = next(
-                item for item in manager.deliveries() if delivery_text(item) == other_reply
-            )
-            assert (await terminal(manager, other_delivery["id"]))["state"] == "sent"
-            assert other_delivery["route"]["target"] == other_delivery["route"]["sender_id"] == "8"
+            assert not any(delivery_text(item) == other_reply for item in manager.deliveries())
+            assert other_message["reply_origin"]["route"]["target"] == "8"
             assert other_message["reply_origin"]["input_id"] != control_origin["input_id"]
             assert main_id not in runtime.tasks and runtime.store.pending_inputs(main_id) == 0
             if damage is not None and damage != "notice_content_alias":
@@ -763,6 +790,7 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
                 assert runtime.store.pending_inputs(main_id) == 0 and main_id not in runtime.tasks
                 assert not main_seen["completion"] and not completion_attempts
                 assert runtime.store.get("team_report", paused_report["id"]) == paused_report
+                prior_delivery_ids = {item["id"] for item in manager.deliveries()}
                 await asyncio.wait_for(app.state.close(), 3)
     finally:
         await runtime.close()
@@ -786,10 +814,18 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
         ):
             assert reopened.store.instance_id == store_instance
             assert reopened.main_session()["id"] == main_id
+            if damage is None:
+                await eventually(reopened, lambda: "completion" in main_runs)
+                await approve_reply_send(reopened, web, main_runs["completion"], completion_reply)
             await eventually(reopened, lambda: bool(completed(reopened, completion_reply)))
             assert await reopened.wait(main_runs["completion"]) == completion_reply
             assert len(set(main_runs.values())) == 4
-            assert [len(main_seen[name]) for name in main_seen] == [3, 3, 1, 1]
+            assert [len(main_seen[name]) for name in main_seen] == [
+                3,
+                3,
+                1,
+                2 if damage is None else 1,
+            ]
             finished = reopened.team.get(worker_id)
             assert finished["commitment_id"] == task_id and finished["parent_id"] == main_id
             assert finished["status"] == "completed" and finished["run_id"] == completed_report_id
@@ -817,25 +853,22 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
                 report = reopened.store.get("team_report", completed_report_id)
                 assert report["reply_origin"] == original_origin
                 assert "report_binding" not in report
-                if original_channel:
-                    assert len(replies) == 1
-                    reply = await terminal(manager, replies[0]["id"])
-                    assert reply["state"] == "sent" and reply["payload"]["automatic"] is True
-                    assert reply["route"] == original_origin["route"]
-                    assert final[0]["delivery_routes"] == [original_origin["route"]]
-                    assert len(completion_attempts) == 1
-                    assert not any(item["route"]["target"] == "7" for item in replies)
-                    assert len(manager.deliveries()) == 7
-                else:
-                    assert replies == [] and completion_attempts == []
-                    assert final[0]["delivery_routes"] == []
-                    assert len(manager.deliveries()) == 5
+                assert replies == [] and completion_attempts == []
+                assert final[0]["delivery_routes"] == (
+                    [original_origin["route"]] if original_channel else []
+                )
+                assert {item["id"] for item in manager.deliveries()} == prior_delivery_ids
                 return
-            assert len(replies) == 1, "独立完成回报须在正常重开后进入原手机7的 outbox"
-            reply = await terminal(manager, replies[0]["id"])
-            completion_delivery_id = reply["id"]
-            assert reply["state"] == outcome and reply["payload"]["automatic"] is True
-            assert reply["route"] == control_origin["route"]
+            if outcome == "blocked":
+                assert "owner_ids" in completion_receipt["error"] and replies == []
+            else:
+                assert len(replies) == 1, "主模型显式发送的真实完成报告进入手机7 outbox"
+                reply = await terminal(manager, replies[0]["id"])
+                completion_delivery_id = reply["id"]
+                assert completion_delivery_id == completion_receipt["id"]
+                assert reply["state"] == outcome
+                assert reply["payload"].get("automatic") is not True
+                assert reply["route"] == control_origin["route"]
             assert final[0]["reply_origin"] == control_origin
             assert final[0]["delivery_routes"] == [control_origin["route"]]
             report = reopened.store.get("team_report", completed_report_id)
@@ -846,18 +879,30 @@ async def test_completed_mobile_plan_returns_to_its_owner_after_another_chat_and
                 for item in requests
                 if any(segment["data"]["text"] == completion_reply for segment in item["message"])
             )
-            automatic = [
-                item for item in manager.deliveries() if item["payload"].get("automatic") is True
+            assert not any(
+                delivery_text(item) in {initial_reply, replan_reply, other_reply}
+                for item in manager.deliveries()
+            )
+            additional = [
+                item for item in manager.deliveries() if item["id"] not in prior_delivery_ids
             ]
-            assert len(automatic) == 3 and {delivery_text(item) for item in automatic} == {
-                replan_reply,
-                other_reply,
-                completion_reply,
-            }
-            assert len(manager.deliveries()) == 6
+            explicit = [item for item in additional if "approval_notice" not in item["payload"]]
+            assert {item["id"] for item in explicit} == (
+                set() if outcome == "blocked" else {completion_delivery_id}
+            )
+            for notice in additional:
+                if "approval_notice" in notice["payload"]:
+                    approval = reopened.store.get(
+                        "approval", notice["payload"]["approval_notice"]["approval_id"]
+                    )
+                    assert approval is not None
+                    assert approval["run_id"] == main_runs["completion"]
+                    assert approval["tool"] == "channel_send"
+                    assert approval["arguments"]["text"] == completion_reply
+                    assert approval["status"] == "approved"
             assert (await phone(web, adjustment_text, 103)).status_code == 200
             assert_one_replan(reopened, task_id, main_id)
-            assert len(main_seen["completion"]) == 1
+            assert len(main_seen["completion"]) == 2
             assert len(reopened.store.list("task_plan_delivery")) == 1
             assert len(reopened.store.messages(main_id)) <= 32
     finally:

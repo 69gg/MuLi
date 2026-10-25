@@ -74,7 +74,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --locked
+      - run: uv sync --locked --extra channels
       - name: Report SQLite runtime
         run: uv run python -c "import sqlite3, sys; print(sys.version); print('SQLite', sqlite3.sqlite_version)"
       - name: Prepare Linux recovery filesystem fixture

@@ -59,6 +59,31 @@ async def processed_reply(runtime: Runtime, manager: ChannelManager, message_id:
         await manager.changed.wait_for(lambda: int(manager._state("events", "0")) >= event["id"])
 
 
+async def approve_reply_send(
+    runtime: Runtime, web: httpx.AsyncClient, run_id: str, text: str
+) -> None:
+    def pending() -> list[dict[str, Any]]:
+        return [
+            item
+            for item in runtime.live_approvals()
+            if item["run_id"] == run_id
+            and item["tool"] == "channel_send"
+            and item["arguments"].get("text") == text
+        ]
+
+    # Preserve the real mode: auto/ask require the owner's actual approval;
+    # an already-yolo run can finish without manufacturing an approval.
+    await eventually(runtime, lambda: bool(pending()) or bool(completed(runtime, text)))
+    approvals = pending()
+    assert len(approvals) <= 1
+    if approvals:
+        approval = approvals[0]
+        assert approval["session_id"] == runtime.main_session()["id"]
+        assert approval["risk"] == "external"
+        response = await web.post(f"/api/approvals/{approval['id']}", json={"decision": "approve"})
+        assert response.status_code == 200 and response.json() == {"resolved": True}
+
+
 def assert_one_replan(runtime: Runtime, task_id: str, main_id: str) -> None:
     receipts = runtime.store.list("task_control_receipt")
     assert (
@@ -308,6 +333,7 @@ async def test_mobile_replan_reply_survives_reopen_without_stealing_an_old_desti
     worker_seen: list[list[Message]] = []
     allow_replan, resumed_worker_entered = asyncio.Event(), asyncio.Event()
     hold_resumed_worker = asyncio.Event()
+    send_receipt: dict[str, Any] = {}
 
     class ReopenedMain(FakeClient):
         async def stream(
@@ -342,10 +368,30 @@ async def test_mobile_replan_reply_survives_reopen_without_stealing_an_old_desti
                         )
                     ]
                 )
-            else:
+            elif len(main_seen) == 3:
                 assert len(main_seen) == 3
                 approved = tool_result(messages, "approve-current")
                 assert approved["current"]["control"]["paused"] is False
+                turn = ModelTurn(
+                    tool_calls=[
+                        call(
+                            "send-followup",
+                            "channel_send",
+                            channel="onebot",
+                            target="7",
+                            text=followup,
+                            idempotency_key="mobile-replan-followup",
+                        )
+                    ]
+                )
+            else:
+                assert len(main_seen) == 4
+                send_receipt.update(tool_result(messages, "send-followup"))
+                if outcome == "blocked":
+                    assert "owner_ids" in send_receipt["error"]
+                else:
+                    assert "error" not in send_receipt
+                    assert send_receipt["state"] in {"pending", "sending", "sent", "unknown"}
                 turn = ModelTurn(content=followup)
             yield StreamEvent("done", turn=turn)
 
@@ -398,10 +444,11 @@ async def test_mobile_replan_reply_survives_reopen_without_stealing_an_old_desti
             )
             replan_run_id = reopened.run_ids[main_id]
             allow_replan.set()
+            await approve_reply_send(reopened, web, replan_run_id, followup)
             await eventually(reopened, lambda: bool(completed(reopened, followup)))
             await asyncio.wait_for(resumed_worker_entered.wait(), 3)
             assert await reopened.wait(replan_run_id) == followup
-            assert len(main_seen) == 3 and len(worker_seen) == 1
+            assert len(main_seen) == 4 and len(worker_seen) == 1
             current = reopened_app.state.local_services.commitments.get(task_id)
             assert current["brief"]["constraints"] == ["不可部署", requirement]
             assert current["control"]["epoch"] == current["control"]["approved_epoch"] == 2
@@ -433,15 +480,24 @@ async def test_mobile_replan_reply_survives_reopen_without_stealing_an_old_desti
             manager = reopened_app.state.channel_application.manager
             await processed_reply(reopened, manager, final[0]["id"])
             replies = [item for item in manager.deliveries() if delivery_text(item) == followup]
-            assert len(replies) == 1, "真实重开后的最终重规划说明必须进入本次发令私聊 outbox"
-            reply = await terminal(manager, replies[0]["id"])
-            followup_id = reply["id"]
-            assert reply["state"] == outcome
-            assert reply["payload"]["automatic"] is True
-            assert reply["route"]["account_id"] == "123"
-            assert reply["route"]["target"] == reply["route"]["sender_id"] == "7"
             assert final[0]["reply_origin"]["kind"] == "channel"
-            assert final[0]["reply_origin"]["route"] == reply["route"]
+            if outcome == "blocked":
+                assert "owner_ids" in send_receipt["error"] and replies == []
+                assert final[0]["reply_origin"]["route"]["target"] == "7"
+            else:
+                assert len(replies) == 1, "只有主模型显式发送的说明进入手机 outbox"
+                reply = await terminal(manager, replies[0]["id"])
+                followup_id = reply["id"]
+                assert followup_id == send_receipt["id"]
+                assert reply["state"] == outcome
+                assert reply["payload"].get("automatic") is not True
+                assert reply["route"]["account_id"] == "123"
+                assert reply["route"]["target"] == reply["route"]["sender_id"] == "7"
+                assert final[0]["reply_origin"]["route"] == reply["route"]
+            assert not any(
+                delivery_text(item) in {initial_reply, old_private_reply}
+                for item in manager.deliveries()
+            )
             assert len(followup_attempts) == (0 if outcome == "blocked" else 1)
             assert all(
                 str(item["user_id"]) == "7"
@@ -450,7 +506,7 @@ async def test_mobile_replan_reply_survives_reopen_without_stealing_an_old_desti
             )
             assert (await phone(web, adjustment_text, 103)).status_code == 200
             assert_one_replan(reopened, task_id, main_id)
-            assert len(completed(reopened, followup)) == 1 and len(main_seen) == 3
+            assert len(completed(reopened, followup)) == 1 and len(main_seen) == 4
             assert len(reopened.store.list("task_plan_delivery")) == 1
             assert len(reopened.store.messages(main_id)) <= 32
     finally:
