@@ -420,10 +420,12 @@ try {
             $script:watch = [Diagnostics.Stopwatch]::StartNew()
             Initialize-Uia
             Check-Deadline
-            $script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-            $script:rows = [Collections.Generic.List[object]]::new()
-            $script:reasons = [Collections.Generic.HashSet[string]]::new()
-            $script:visited = 0
+            if ([string]$request.command -cne 'probe') {
+                $script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+                $script:rows = [Collections.Generic.List[object]]::new()
+                $script:reasons = [Collections.Generic.HashSet[string]]::new()
+                $script:visited = 0
+            }
             switch -CaseSensitive ([string]$request.command) {
                 'probe' {
                     $process = [Diagnostics.Process]::GetCurrentProcess()
