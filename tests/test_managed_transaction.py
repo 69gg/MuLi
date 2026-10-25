@@ -6,7 +6,7 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from muli.compatibility import CompatibilityManifest, FormatContracts, FormatSupport
+from muli.compatibility import CompatibilityManifest, FormatContracts
 from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.managed_transaction import (
     HealthProofV2,
@@ -41,21 +41,17 @@ UNIT = b"[Service]\nExecStart=/retained/python -I /retained/launcher.py\n"
 
 
 def manifest() -> CompatibilityManifest:
-    support = FormatSupport(reads=(1,), writes=1)
     return CompatibilityManifest(
         metadata_version=1,
         distribution="muli-agent",
         release="2.22.0",
         handoff_protocol=2,
         requires_migration=False,
-        formats=FormatContracts(
-            database=support,
-            objects=support,
-            configuration=support,
-            ingress=support,
-            outbox=support,
-            memory=support,
-            install_profile=support,
+        formats=FormatContracts.model_validate(
+            {
+                name: {"reads": (version,), "writes": version}
+                for name, version in CURRENT_FORMAT_STATE.formats.model_dump().items()
+            }
         ),
     )
 
@@ -520,7 +516,8 @@ def test_prepare_requires_actual_matching_compatible_declarations(problem: str) 
     elif problem == "migration":
         declaration["requires_migration"] = True
     elif problem == "format":
-        declaration["formats"]["outbox"] = {"reads": (1, 2), "writes": 2}
+        outbox = CURRENT_FORMAT_STATE.formats.outbox
+        declaration["formats"]["outbox"] = {"reads": (outbox, outbox + 1), "writes": outbox + 1}
     candidate = CompatibilityManifest.model_validate(declaration)
     selected = binding("b").model_dump()
     selected["compatibility"] = "c" * 64 if problem == "digest" else compatibility_digest(candidate)

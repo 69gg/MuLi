@@ -14,7 +14,12 @@ from muli.format_admission import (
     LEGACY_FORMAT_STATE,
     FormatAdmissionError,
 )
-from muli.format_evidence import FORMAT_STATE_KEY, read_format_evidence
+from muli.format_evidence import (
+    FORMAT_STATE_KEY,
+    FormatEvidenceError,
+    read_format_evidence,
+    read_optional_format_evidence,
+)
 from muli.management_transaction import (
     ClockReading,
     Deadline,
@@ -148,6 +153,44 @@ def test_fixed_upgrade_never_guesses_a_source_contract(tmp_path: Path, source: s
     with pytest.raises(
         ValueError, match="store_format_upgrade_source_unsupported|format_marker_missing"
     ):
+        upgrade(path.parent)
+    assert snapshot(path) == before
+
+
+@LINUX
+@pytest.mark.parametrize("source", ["legacy", "current"])
+@pytest.mark.parametrize("key_storage", ["text", "blob"])
+def test_fixed_upgrade_rejects_unknown_reserved_marker_without_changing_any_rows(
+    tmp_path: Path, source: str, key_storage: str
+) -> None:
+    path = legacy_database(tmp_path / "data")
+    state = LEGACY_FORMAT_STATE if source == "legacy" else CURRENT_FORMAT_STATE
+    key: str | bytes = "format_state_v2" if key_storage == "text" else b"format_state_v2"
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(
+            "UPDATE runtime_state SET value=? WHERE name=?",
+            (state.model_dump_json(), FORMAT_STATE_KEY),
+        )
+        db.commit()
+        main = read_format_evidence(db).main_session
+        db.execute(
+            "INSERT INTO ingress(id,session_id,state,payload,received) VALUES(?,?,?,?,?)",
+            ("reserved-marker-input", main, "pending", '{"content":"保留原输入"}', 1.0),
+        )
+        db.execute(
+            "INSERT INTO channel_inbound(id,name,receipt,created_at,fingerprint) "
+            "VALUES('reserved-marker-event','onebot',NULL,1,'original-fingerprint')"
+        )
+        db.execute("INSERT INTO runtime_state(name,value) VALUES(?,?)", (key, "unknown-marker"))
+        db.commit()
+        assert read_format_evidence(db).state == state
+        assert db.execute(
+            "SELECT typeof(name) FROM runtime_state WHERE name=?", (key,)
+        ).fetchone() == (key_storage,)
+        with pytest.raises(FormatEvidenceError, match="format_marker_unknown"):
+            read_optional_format_evidence(db)
+    before = snapshot(path)
+    with pytest.raises(FormatEvidenceError, match="format_marker_unknown"):
         upgrade(path.parent)
     assert snapshot(path) == before
 

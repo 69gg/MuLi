@@ -14,7 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 import muli
-from muli.compatibility import FormatState
+from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.managed_transaction import (
     HealthProofV2,
     RoleBinding,
@@ -41,10 +41,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux retained 
 
 _CONFIG = b'{"setting":"same configuration for both slots"}'
 _UNIT = b"[Service]\nExecStart=/retained/launcher\n"
-_STATE = FormatState.model_validate_json(
-    b'{"metadata_version":1,"formats":{"database":1,"objects":1,"configuration":1,'
-    b'"ingress":1,"outbox":1,"memory":1,"install_profile":1}}'
-)
+_STATE = CURRENT_FORMAT_STATE
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -73,16 +70,8 @@ def _slot(root: Path, name: str) -> SlotIdentity:
     (package / "__main__.py").write_text(observation, encoding="utf-8")
     (package / "managed_host.py").write_text(observation, encoding="utf-8")
     formats = {
-        name: {"reads": [1], "writes": 1}
-        for name in (
-            "database",
-            "objects",
-            "configuration",
-            "ingress",
-            "outbox",
-            "memory",
-            "install_profile",
-        )
+        name: {"reads": [version], "writes": version}
+        for name, version in CURRENT_FORMAT_STATE.formats.model_dump().items()
     }
     (package / "compatibility.json").write_text(
         json.dumps(

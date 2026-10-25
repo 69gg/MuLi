@@ -16,7 +16,7 @@ from muli.format_admission import (
 from muli.format_evidence import (
     FORMAT_STATE_KEY,
     FormatReadLimits,
-    read_format_evidence,
+    read_optional_format_evidence,
 )
 from muli.managed_boot import _DatabaseAnchor
 from muli.management_transaction import TransactionJournal
@@ -59,7 +59,9 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                 )
             ) as db:
                 database.check()
-                evidence = read_format_evidence(db)
+                evidence = read_optional_format_evidence(db)
+                if evidence is None:
+                    raise FormatAdmissionError("store_format_upgrade_source_unsupported")
                 validate_existing_schema(db)
                 if (
                     db.execute(
@@ -113,9 +115,10 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                     if db.in_transaction:
                         db.execute("ROLLBACK")
                 database.check()
-                after = read_format_evidence(db)
+                after = read_optional_format_evidence(db)
                 if (
-                    after.state != CURRENT_FORMAT_STATE
+                    after is None
+                    or after.state != CURRENT_FORMAT_STATE
                     or after.store_instance != evidence.store_instance
                     or after.main_session != evidence.main_session
                 ):
