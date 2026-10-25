@@ -149,17 +149,31 @@ def dispatch(root: Path, command_id: str, flavor: str) -> bytes:
     return text.encode("utf-8")
 
 
-def cmd_bootstrap(root: Path) -> bytes:
-    python = quote(sys.executable, "cmd")
-    helper = quote(str(Path(__file__).absolute()), "cmd")
-    config = quote(str(root / "control.json"), "cmd")
-    # The first two lines are ASCII, independent of the inherited code page.
+def cmd_environment(root: Path) -> dict[str, str]:
+    paths = {
+        "__MULI_BOOT_PYTHON": str(Path(sys.executable).absolute()),
+        "__MULI_BOOT_HELPER": str(Path(__file__).absolute()),
+        "__MULI_BOOT_CONFIG": str((root / "control.json").absolute()),
+    }
+    for path in paths.values():
+        quote(path, "cmd")
+    # Windows inherits this mapping through CreateProcessW's Unicode block.
+    # Replace reserved names, including differently cased inherited entries.
+    environment = {key: value for key, value in os.environ.items() if key.upper() not in paths}
+    environment.update(paths)
+    return environment
+
+
+def cmd_bootstrap() -> bytes:
+    # Keep the entire first write independent of the inherited code page;
+    # cmd expands the Unicode environment values after decoding this ASCII.
     # A missing console/code-page capability fails closed before user input.
     return (
         f"@chcp {_UTF8_CODE_PAGE} >nul\r\n"
         "@if errorlevel 1 exit\r\n"
-        f"@{python} -I {helper} {config} ready 0\r\n"
-    ).encode()
+        '@"%__MULI_BOOT_PYTHON%" -I "%__MULI_BOOT_HELPER%" '
+        '"%__MULI_BOOT_CONFIG%" ready 0\r\n'
+    ).encode("ascii")
 
 
 def powershell_bootstrap(root: Path) -> str:

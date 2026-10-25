@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+import muli.shell_protocol as protocol_module
 import muli.shell_sessions as shell_module
 from muli.platforms.windows_shell import WindowsShellJob
 from muli.shell_protocol import quote
@@ -88,6 +89,9 @@ async def test_forced_cmd_verifies_utf8_and_preserves_unicode_state_in_the_same_
     actual_attach = WindowsShellJob.attach
     actual_spawn = asyncio.create_subprocess_exec
     actual_bootstrap = shell_module.cmd_bootstrap
+    for name in ("__MULI_BOOT_PYTHON", "__MULI_BOOT_HELPER", "__MULI_BOOT_CONFIG"):
+        monkeypatch.setenv(name, "must-be-overridden")
+    parent_environment = dict(os.environ)
 
     def attach(job: WindowsShellJob, pid: int) -> None:
         actual_attach(job, pid)
@@ -101,14 +105,22 @@ async def test_forced_cmd_verifies_utf8_and_preserves_unicode_state_in_the_same_
         assert startup.wShowWindow == int(subprocess.SW_HIDE)
         assert kwargs["stdin"] == asyncio.subprocess.PIPE
         assert kwargs["stdout"] == kwargs["stderr"] == asyncio.subprocess.PIPE
+        environment = kwargs["env"]
+        assert environment is not os.environ
+        assert environment["__MULI_BOOT_PYTHON"] == str(Path(sys.executable).absolute())
+        assert environment["__MULI_BOOT_HELPER"] == str(Path(protocol_module.__file__).absolute())
+        config = Path(environment["__MULI_BOOT_CONFIG"])
+        assert config.name == "control.json" and config.parent.parent == protocol_directory
+        assert dict(os.environ) == parent_environment
         process = await actual_spawn(*args, **kwargs)
         spawned.append(process.pid)
         return process
 
-    def bootstrap(root: Path) -> bytes:
+    def bootstrap() -> bytes:
         assert attached == spawned and len(attached) == 1
-        assert root.parent == protocol_directory
-        return actual_bootstrap(root)
+        data = actual_bootstrap()
+        assert data.isascii()
+        return data
 
     monkeypatch.setattr(WindowsShellJob, "attach", attach)
     monkeypatch.setattr(shell_module.asyncio, "create_subprocess_exec", spawn)
@@ -184,6 +196,7 @@ async def test_forced_cmd_verifies_utf8_and_preserves_unicode_state_in_the_same_
             assert guard_calls == 4 and attached == spawned == [first["shell_pid"]]
     finally:
         await manager.aclose()
+        assert dict(os.environ) == parent_environment
         assert (int(api.GetConsoleCP()), int(api.GetConsoleOutputCP())) == original_console
 
 
@@ -198,9 +211,9 @@ async def test_wrong_cmd_console_code_page_never_reaches_user_dispatch(
     guards = 0
     effect = tmp_path / "must-not-exist.txt"
 
-    def wrong_code_page(root: Path) -> bytes:
+    def wrong_code_page() -> bytes:
         nonlocal bootstraps
-        original = actual_bootstrap(root)
+        original = actual_bootstrap()
         assert original.count(b"@chcp 65001") == 1
         bootstraps += 1
         return original.replace(b"@chcp 65001", b"@chcp 437", 1)

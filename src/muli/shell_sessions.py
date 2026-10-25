@@ -31,6 +31,7 @@ from .shell_protocol import (
     CONTROL_TIMEOUT,
     ShellSpec,
     cmd_bootstrap,
+    cmd_environment,
     command_file,
     dispatch,
     marker,
@@ -346,6 +347,7 @@ class ShellSessions:
             bootstrap.chmod(0o600)
         if shell.state != "starting" or self._closed:
             raise ShellSessionError("invalidated", "shell 启动已撤销")
+        environment = cmd_environment(shell.root) if shell.spec.flavor == "cmd" else None
         if os.name == "nt":
             shell.job = WindowsShellJob()
         console = (
@@ -370,6 +372,7 @@ class ShellSessions:
                 ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=environment,
                 start_new_session=os.name == "posix",
                 **console,
             )
@@ -387,7 +390,7 @@ class ShellSessions:
         if shell.spec.flavor == "cmd":
             if shell.process.stdin is None:
                 raise ShellSessionError("protocol", "shell 输入连接不可用")
-            shell.process.stdin.write(cmd_bootstrap(shell.root))
+            shell.process.stdin.write(cmd_bootstrap())
             await asyncio.wait_for(shell.process.stdin.drain(), CONTROL_TIMEOUT)
         if shell.spec.flavor in {"pwsh", "cmd"}:
             await asyncio.wait_for(shell.ready.wait(), CONTROL_TIMEOUT)
@@ -581,7 +584,13 @@ class ShellSessions:
                 pass
         if shell.server is not None:
             shell.server.close()
-            await shell.server.wait_closed()
+        # Closing the listener leaves existing control connections alive.
+        # Release them before waiting for the server to finish closing.
+        for writer in tuple(shell.writers):
+            writer.close()
+        controls = tuple(shell.controls)
+        for task in controls:
+            task.cancel()
         if shell.job is not None:
             try:
                 shell.job.terminate()
@@ -601,12 +610,12 @@ class ShellSessions:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        for writer in tuple(shell.writers):
-            writer.close()
-        controls = tuple(shell.controls)
-        for task in controls:
-            task.cancel()
         await asyncio.gather(*controls, return_exceptions=True)
+        if shell.server is not None:
+            try:
+                await asyncio.wait_for(shell.server.wait_closed(), CONTROL_TIMEOUT)
+            except (OSError, TimeoutError):
+                failures = True
         if shell.job is not None:
             try:
                 deadline = asyncio.get_running_loop().time() + CONTROL_TIMEOUT
