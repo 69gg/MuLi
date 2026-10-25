@@ -1,10 +1,16 @@
 # 真实 systemd 托管切换 CI 设计
 
+下一候选复用每个实际已打开 FD 的首次身份进行包叶分类，去掉仅用于区分目录、未参与普通叶身份比较的一次 path stat。普通叶仍保留一次真实 open、前后 FD 身份和末次 nofollow path 身份；目录、完整摘要、资源预算与各效果门保持。首红后 31 项针对性验证和十八文件 315 项整合回归通过（74.28 秒、峰值 180.9 MiB、swap 0）；独立后审未发现 P1/P2。远端原生三事务结果仍待验收，不以本地查询次数推断远端耗时，完整合同见[效果后端](managed-backend.md)。
+
 后续候选已合入 v2.72。在单次同步 `_confirm` 内复用已成功核验、文件身份不变的 package 叶内容摘要，并将同一次同步安装的三组件循环与首次确认合为一个局部批次。每轮仍完整遍历、打开、核身份和累计资源预算；只有完整 guard 与合法磁盘状态均通过才提升证明，不跨函数返回、等待或独立确认。十七文件 339 项通过（74.87 秒、峰值 150.2 MiB、swap 0），489 文件 Ruff/格式及 160 源码严格类型检查通过；独立后审未发现 P1/P2。新增三项先得到预期的一红两绿，再验证读取减少、等待之后重新认证和跨组件内容漂移拒绝；完整 switch 的三十一次 checks 保持。该本地证据仍不代表下面的原生三事务已通过，完整语义见[效果后端](managed-backend.md)。
 
-该修正的 [Native51，准确签名候选 `1bd713f`](https://github.com/69gg/MuLi/actions/runs/40195589412) 已全部终态，十二项通用作业成功，仅原生 [job `121175612513`](https://github.com/69gg/MuLi/actions/runs/40195589412/job/121175612513) 失败：仍在 60001 毫秒以 `TimeoutError` / `helper_exit` 结束。第一代完整投影为 42384 毫秒；第二代 44601 毫秒 prepared、51001 毫秒 draining、55298 毫秒 stop_base、58822 毫秒 install_target，第三代未开始。cleanup verified；仅获取 2094 字节 evidence，SHA256 `7e5fc065b2c8225a096349433b17bc842393c7004f87f017193f45625c8fa983`，核对两成员及完整合同。
+同步安装批次的 [Native52，准确签名候选 `a36466d`](https://github.com/69gg/MuLi/actions/runs/40198403849) 已全部终态：十二项通用作业成功，包含 Linux、Windows、macOS 与 MCP；原生 [job `121184143534`](https://github.com/69gg/MuLi/actions/runs/40198403849/job/121184143534) 仍失败，60001 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。第一代完整投影为 40157 毫秒；第二代 42388 毫秒 prepared、48549 毫秒 draining、52636 毫秒 stop_base、56139 毫秒 install_target。cleanup verified；仅获取 2093 字节 evidence，SHA256 `7104641d60d265429e64e542e8786dcd4752dcc3ff503c86ea4108940cf1183f`，核对两成员及完整合同。
 
-Native51 第一代 backend checks 为 141 次 / 17984 毫秒，host_record 31 次 / 3919 毫秒、bus 291 次 / 4926 毫秒、HTTP 13 次 / 1795 毫秒。该有限观测不能将 checks 拆为哈希、枚举与其它认证成本，也不能单凭相邻运行的总耗时变化归因。下一候选只扩展上述无等待的同步安装批次，不降低文件重验、效果门或期限；其原生结果仍待验收。
+Native52 第一代 backend checks 仍为 141 次 / 15463 毫秒，其中 install_target 为 35 次 / 2527 毫秒，start_target 为 38 次 / 4649 毫秒；host_record 31 次 / 4306 毫秒、bus 291 次 / 4786 毫秒、HTTP 13 次 / 1703 毫秒。这些分项保留原计量边界，不能把 checks 当成纯哈希或将相邻运行耗时差归因给单一修改。同步安装片已通过本地验证，完整三事务仍未验收。
+
+此前 [Native51，准确签名候选 `1bd713f`](https://github.com/69gg/MuLi/actions/runs/40195589412) 已全部终态，十二项通用作业成功，仅原生 [job `121175612513`](https://github.com/69gg/MuLi/actions/runs/40195589412/job/121175612513) 失败：仍在 60001 毫秒以 `TimeoutError` / `helper_exit` 结束。第一代完整投影为 42384 毫秒；第二代 44601 毫秒 prepared、51001 毫秒 draining、55298 毫秒 stop_base、58822 毫秒 install_target，第三代未开始。cleanup verified；仅获取 2094 字节 evidence，SHA256 `7e5fc065b2c8225a096349433b17bc842393c7004f87f017193f45625c8fa983`，核对两成员及完整合同。
+
+Native51 第一代 backend checks 为 141 次 / 17984 毫秒，host_record 31 次 / 3919 毫秒、bus 291 次 / 4926 毫秒、HTTP 13 次 / 1795 毫秒。该有限观测不能将 checks 拆为哈希、枚举与其它认证成本，也不能单凭相邻运行的总耗时变化归因。其后的 Native52 只扩展上述无等待的同步安装批次，不降低文件重验、效果门或期限，结果如上。
 
 前一轮 [Native50，准确候选 `12d4125`](https://github.com/69gg/MuLi/actions/runs/40191616906) 已全部终态：十项成功，原生和两个 Linux shard1 失败。Windows、macOS 与 Linux shard2 成功；Linux 3.12 shard1 的唯一失败是 `test_managed_host` 局部计量 wrapper 未接收 `verified_python`，不是生产身份门失败。该接缝已修为带类型的真实透传，原 await 两侧认证断言保留；连同同步确认、摘要证据和 guard 预算四文件 57 项通过（19.74 秒、76.8 MiB、swap 0）。Native51 已完整复核通用作业，原生失败仍保留。
 

@@ -204,22 +204,23 @@ def read_file(path: Path, limit: int, *, private: bool = False) -> tuple[bytes, 
         return read_at(descriptor, path.name, limit, private=private)
 
 
-def _fingerprint_at(
+def _fingerprint_fd(
     parent: int,
     name: str,
     path: Path,
     limit: int,
+    descriptor: int,
+    before: dict[str, int],
     *,
     verified: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+    """Read an already classified descriptor; its caller remains its sole owner."""
     hashed, size = hashlib.sha256(), 0
-    descriptor = os.open(
-        name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
-    )
-    with os.fdopen(descriptor, "rb") as source:
-        before = identity(os.fstat(source.fileno()))
-        if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
-            raise LaunchError("managed_file_unsupported")
+    if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
+        raise LaunchError("managed_file_unsupported")
+    # Closing this buffered view never closes the caller-owned descriptor,
+    # including when fdopen, read or an identity check raises.
+    with os.fdopen(descriptor, "rb", closefd=False) as source:
         # Reusing bytes never replaces this file's independent open, budget
         # check, or descriptor and path identity checks.
         if (
@@ -241,6 +242,24 @@ def _fingerprint_at(
     if before != after or before != identity(os.stat(name, dir_fd=parent, follow_symlinks=False)):
         raise LaunchError("managed_file_changed")
     return {"path": str(path), "identity": before, "digest": checksum}
+
+
+def _fingerprint_at(
+    parent: int,
+    name: str,
+    path: Path,
+    limit: int,
+    *,
+    verified: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
+    )
+    try:
+        before = identity(os.fstat(descriptor))
+        return _fingerprint_fd(parent, name, path, limit, descriptor, before, verified=verified)
+    finally:
+        os.close(descriptor)
 
 
 def fingerprint(
@@ -298,9 +317,8 @@ def package_fingerprint(
     hashed = hashlib.sha256()
     visited, files, size = 0, 0, 0
 
-    def walk(descriptor: int, prefix: str, depth: int) -> None:
+    def walk(descriptor: int, prefix: str, depth: int, before: dict[str, int]) -> None:
         nonlocal visited, files, size
-        before = identity(os.fstat(descriptor))
         names: list[str] = []
         with os.scandir(descriptor) as entries:
             for entry in entries:
@@ -312,44 +330,44 @@ def package_fingerprint(
                 names.append(entry.name)
         for name in sorted(names):
             relative = prefix + name
-            current = identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False))
-            if stat.S_ISDIR(current["mode"]):
-                if depth >= limits["depth"]:
-                    raise LaunchError("managed_package_depth_budget")
-                child = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=descriptor,
-                )
-                try:
-                    if current != identity(os.fstat(child)):
-                        raise LaunchError("managed_file_changed")
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            try:
+                current = identity(os.fstat(child))
+                if stat.S_ISDIR(current["mode"]):
+                    if depth >= limits["depth"]:
+                        raise LaunchError("managed_package_depth_budget")
                     hashed.update(canonical([relative, "directory"]) + b"\n")
-                    walk(child, relative + "/", depth + 1)
+                    walk(child, relative + "/", depth + 1, current)
                     if current != identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False)):
                         raise LaunchError("managed_file_changed")
-                finally:
-                    os.close(child)
-            else:
-                path = root / relative
-                proof = _fingerprint_at(
-                    descriptor,
-                    name,
-                    path,
-                    min(limits["file_bytes"], limits["total_bytes"] - size),
-                    verified=None if verified is None else verified.get(str(path)),
-                )
-                info = _dict(proof["identity"])
-                size += info["size"]
-                files += 1
-                hashed.update(canonical([relative, info["size"], proof["digest"]]) + b"\n")
-                if observed is not None:
-                    observed[str(path)] = proof
+                else:
+                    path = root / relative
+                    proof = _fingerprint_fd(
+                        descriptor,
+                        name,
+                        path,
+                        min(limits["file_bytes"], limits["total_bytes"] - size),
+                        child,
+                        current,
+                        verified=None if verified is None else verified.get(str(path)),
+                    )
+                    info = _dict(proof["identity"])
+                    size += info["size"]
+                    files += 1
+                    hashed.update(canonical([relative, info["size"], proof["digest"]]) + b"\n")
+                    if observed is not None:
+                        observed[str(path)] = proof
+            finally:
+                os.close(child)
         if before != identity(os.fstat(descriptor)):
             raise LaunchError("managed_directory_changed")
 
     with directory(root) as descriptor:
-        walk(descriptor, "", 0)
+        walk(descriptor, "", 0, identity(os.fstat(descriptor)))
     if files == 0:
         raise LaunchError("managed_package_empty")
     return {"root": str(root), "digest": hashed.hexdigest(), "files": files, "size": size}

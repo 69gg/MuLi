@@ -53,7 +53,7 @@ async def test_install_batch_reuses_payload_bytes_without_reducing_guards(
         assert len(observed.opened) == walks, (leaf.name, len(observed.opened), walks)
         assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
         assert observed.fd_stats >= 2 * walks, (leaf.name, observed.fd_stats, walks)
-        assert observed.path_stats >= 2 * walks, (leaf.name, observed.path_stats, walks)
+        assert observed.path_stats == walks, (leaf.name, observed.path_stats, walks)
     for directory, scans in reads.scans.items():
         walks = 31 if directory.is_relative_to(roots["controller"]) else 25
         assert scans == walks, (directory.name, scans, walks)

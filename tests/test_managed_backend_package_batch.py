@@ -187,7 +187,7 @@ def assert_complete_walks(
         assert len(observed.opened) == guards
         assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
         assert observed.fd_stats >= 2 * guards
-        assert observed.path_stats >= 2 * guards
+        assert observed.path_stats == guards
     for directory, scans in reads.scans.items():
         selected = any(directory.is_relative_to(root) for root in roots)
         assert scans == (7 * confirmations if selected else 0)
