@@ -22,4 +22,8 @@ unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh mana
 
 这些模块证据不能证明真实 systemd 用户 manager 的加载或真实服务 exec/激活成功；共享已安装目录被外部程序修改也不是沙箱隔离。生产调用链已接线，另有[真实进程验收](managed-process-recovery.md)；该验收仍使用合成 manager 边界，不代表操作过用户真实服务。
 
-单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次 `verify_anchor` 已完成的文件核验，不再重复扫描同一安装。不同 slot 即使共享完全相同的解释器仍分别核验；结果不跨 `_check` 保存，下一次 guard 会重新读取和核验文件。所有效果前和 await 后的 guard、文件耐久确认及原期限保持原样。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
+单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次 `verify_anchor` 已完成的文件核验，不再重复扫描同一安装。不同 slot 仍分别核验解释器路径、pyvenv、兼容声明与完整 package；共享已验证的解释器时，只复用相同实际文件指纹的 Python SHA。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
+
+一次 `_confirm` 是没有 `await` 的同步批次。其首个 guard 从空 Python 证明开始，只有完整 revision、anchor、slot、deadline、writer lease、空 cgroup 与三文件核验均成功，才在该调用的局部闭包保存 controller 的 `FileFingerprint`。后续 guard 继续重开解释器、核路径与链接链、逐项核七字段 `FileIdentity`，并完整扫描 package；只有路径和身份仍精确相同才省去重复读取 Python 内容。七字段为 device、inode、size、mtime、ctime、mode、uid，现格式没有 nlink，本文不增加格式字段。身份变化会重新读取内容并按冻结安装证据拒绝。已有 selector 的三个文件确认仍执行七次真实 guard；共享解释器的完整内容读取目标为七次降至一次，package 扫描和文件重开次数不减。
+
+局部 Python 证明随 `_confirm` 返回或抛错失效，不保存在 backend 实例上；相邻两个 `_confirm` 即使中间没有 `await` 也重新哈希。install 三组件循环、不同同步调用及等待两侧不共享该批次证明；所有效果前和 await 后的 guard、文件耐久确认及原期限保持原样。这一变化只减少 Python SHA 的重复读取，不代表减少七次完整 guard，也不能将旧计时中的整个 backend 成本按七比一折算。

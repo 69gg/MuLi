@@ -24,11 +24,13 @@ from helpers.uia_probe_diagnostics import (
     observe_pending,
     observe_probe,
     pending_received,
+    probe_facts,
 )
 
 from muli.config import Settings
 from muli.process import _settle_process
 from muli.tools import uia_computer as module
+from muli.tools.ax_lease import AXLeaseError
 from muli.tools.computer import Computer, ComputerError
 
 pytestmark = pytest.mark.skipif(
@@ -116,6 +118,61 @@ async def test_real_windows_probe_does_not_initialize_the_tree_walker(
         assert result["apartment"] == "MTA" and result["has_window"] is False
         assert result["no_profile"] is True and result["non_interactive"] is True
         assert result["module_autoloading"] == "None"
+    finally:
+        await computer.aclose()
+        assert probe.closed and probe._process is not None
+        assert probe._process.returncode is not None
+        assert probe._count == 1 and all(reader.done() for reader in probe._readers)
+
+
+async def test_real_windows_probe_assembly_failure_returns_its_original_error_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = Path(module.__file__).with_name("uia_helper.ps1")
+    source = helper.read_text(encoding="utf-8")
+    loading = (
+        "Microsoft.PowerShell.Utility\\Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes"
+    )
+    assert source.count(loading) == 1
+    script = tmp_path / "owned-probe-assembly-failure.ps1"
+    script.write_bytes(
+        source.replace(
+            loading,
+            "throw [System.InvalidOperationException]::new('muli-test-assembly-failure')",
+        ).encode("utf-8")
+    )
+    computer = Computer(settings(), owner=lambda: ("native-ci", "assembly-failure"))
+
+    def controlled_probe(
+        argv: list[str], *, timeout: float, ttl: float, max_nodes: int, once: bool = False
+    ) -> ProbeHelperLease:
+        assert once and argv[-1] == str(helper)
+        assert timeout == settings().computer.operation_timeout_seconds
+        return ProbeHelperLease(
+            [*argv[:-1], str(script)],
+            timeout=timeout,
+            ttl=ttl,
+            max_nodes=max_nodes,
+            once=once,
+        )
+
+    with monkeypatch.context() as construction:
+        construction.setattr(module, "AXHelperLease", controlled_probe)
+        probe = computer._uia._new_lease(once=True)
+    try:
+        with pytest.raises(AXLeaseError) as caught:
+            await observe_probe(probe)
+        assert caught.value.code == "dependency_missing"
+        assert caught.value.outcome == "not_started"
+        facts = probe_facts(probe, cleanup_failed=False)
+        assert facts["cleanup"] == "confirmed" and facts["sent"] == 1
+        stages = facts["stages"]
+        assert stages[-1] == "uia_host_validated"
+        assert "uia_initializing" in stages
+        assert "uia_add_type_returned" not in stages and "uia_ready" not in stages
+        after = facts["after_cleanup"]
+        assert after["stage_sequence"] == "valid"
+        assert set(after["stage_arrival_ms"]) == set(stages)
     finally:
         await computer.aclose()
         assert probe.closed and probe._process is not None

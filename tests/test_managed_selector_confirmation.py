@@ -12,6 +12,7 @@ from test_managed_backend import host as host
 
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role, TransactionError
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.managed_deployment import SelectorStore
 from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSnapshot
 
@@ -28,8 +29,13 @@ async def test_target_confirmation_uses_seven_real_checks(
     checks: list[tuple[TransactionRecordV2, Role | None]] = []
     original = host.backend._check
 
-    def checked(current: TransactionRecordV2, role: Role | None = None) -> None:
-        original(current, role)
+    def checked(
+        current: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+    ) -> None:
+        original(current, role, verified_python=verified_python)
         checks.append((current, role))
 
     monkeypatch.setattr(host.backend, "_check", checked)

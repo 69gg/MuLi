@@ -13,6 +13,7 @@ from test_managed_backend import host as host
 
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role, TransactionError
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_transaction import ObservationError
 from muli.platforms.managed_backend import _DiskBinding
 from muli.platforms.managed_deployment import (
@@ -34,9 +35,14 @@ async def test_confirm_uses_seven_real_checks_for_present_selector(
     checks: list[tuple[TransactionRecordV2, Role | None]] = []
     original = host.backend._check
 
-    def counted(current: TransactionRecordV2, role: Role | None = None) -> None:
+    def counted(
+        current: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+    ) -> None:
         checks.append((current, role))
-        original(current, role)
+        original(current, role, verified_python=verified_python)
 
     monkeypatch.setattr(host.backend, "_check", counted)
     with host.journal.writer_lease() as lease:
@@ -56,9 +62,14 @@ async def test_install_uses_thirty_one_real_checks_including_both_confirmations(
     checks: list[tuple[TransactionRecordV2, Role | None]] = []
     original = host.backend._check
 
-    def counted(current: TransactionRecordV2, role: Role | None = None) -> None:
+    def counted(
+        current: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+    ) -> None:
         checks.append((current, role))
-        original(current, role)
+        original(current, role, verified_python=verified_python)
 
     monkeypatch.setattr(host.backend, "_check", counted)
     await host.backend.install(record, "target", host.data["target"])

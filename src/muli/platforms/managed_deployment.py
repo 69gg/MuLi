@@ -397,14 +397,18 @@ class DeploymentStore(AbstractContextManager["DeploymentStore"]):
         except (OSError, ValueError):
             raise ManagedDeploymentError("launcher_unavailable") from None
 
-    def verify_anchor(self, anchor: DeploymentAnchor) -> None:
+    def verify_anchor(
+        self, anchor: DeploymentAnchor, *, verified_python: FileFingerprint | None = None
+    ) -> None:
         self._check()
         try:
             if anchor.journal_root != str(self.root) or fingerprint(
                 self.root / LAUNCHER_NAME, _LAUNCHER_BYTES
             ) != anchor.launcher.model_dump(mode="json"):
                 raise ValueError("foreign_launcher")
-            verify_slot_files(self.read_slot(anchor.controller_slot))
+            verify_slot_files(
+                self.read_slot(anchor.controller_slot), verified_python=verified_python
+            )
         except (OSError, ValueError):
             raise ManagedDeploymentError("anchor_unavailable") from None
 

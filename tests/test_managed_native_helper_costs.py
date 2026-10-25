@@ -8,12 +8,15 @@ import builtins
 import copy
 import json
 import os
+import runpy
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from functools import partial
+from importlib.machinery import ModuleSpec
 from pathlib import Path
-from typing import Any
+from types import CoroutineType, FrameType, FunctionType
+from typing import Any, Literal, cast
 
 import pytest
 import test_managed_backend as backend_fixture
@@ -23,8 +26,10 @@ from test_managed_native_ci import fixture as fixture
 from test_managed_native_ci import forbid_real_effects as forbid_real_effects
 
 import muli.managed_host as managed_host
+import muli.platforms.filesystem_identity as filesystem_identity
 from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
-from muli.management_transaction import TransactionError, TransactionJournal
+from muli.managed_transaction import TransactionRecordV2
+from muli.management_transaction import JournalControl, Role, TransactionError, TransactionJournal
 from muli.platforms.linux_transaction import SystemdProbe, UnitSnapshot
 from muli.platforms.managed_backend import ManagedLinuxBackend
 from muli.platforms.managed_deployment import DeploymentAnchor, DeploymentStore, SlotIdentity
@@ -57,6 +62,30 @@ async def test_native_host_record_observer_preserves_actual_failure_and_cancella
     await _exercise_generated_hook(tmp_path, monkeypatch, fixture, True, host_failure=failure)
 
 
+async def test_generated_hook_measures_the_actual_runpy_main_host_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+) -> None:
+    await _exercise_generated_hook(tmp_path, monkeypatch, fixture, True, through_main=True)
+
+
+@pytest.mark.parametrize(
+    "binding_case", ["missing", "existing", "superseded", "wrong_origin", "error", "cancelled"]
+)
+async def test_unbound_main_observer_never_exports_zero_host_cost_or_changes_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    binding_case: Literal[
+        "missing", "existing", "superseded", "wrong_origin", "error", "cancelled"
+    ],
+) -> None:
+    await _exercise_generated_hook(
+        tmp_path, monkeypatch, fixture, True, through_main=True, binding_case=binding_case
+    )
+
+
 async def _exercise_generated_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -64,6 +93,9 @@ async def _exercise_generated_hook(
     include_host_record: bool,
     *,
     host_failure: BaseException | None = None,
+    through_main: bool = False,
+    binding_case: Literal["missing", "existing", "superseded", "wrong_origin", "error", "cancelled"]
+    | None = None,
 ) -> None:
     native, _ = fixture
     native.prepare()
@@ -109,6 +141,11 @@ async def _exercise_generated_hook(
     (root / "fixture.json").chmod(0o600)
     invocation = "b" * 32
     monkeypatch.setenv("INVOCATION_ID", invocation)
+    original_profile = sys.getprofile()
+
+    def foreign_profile(frame: FrameType, event: str, argument: object) -> None:
+        pass
+
     journal_root = root / "data/management/transaction-v1"
     with TransactionJournal(journal_root, root / "data/muli.sqlite3") as journal:
         with journal.locked() as control:
@@ -122,11 +159,63 @@ async def _exercise_generated_hook(
                 monkeypatch.setattr(
                     sys,
                     "orig_argv",
-                    list(helper_argv),
+                    (
+                        list(helper_argv)
+                        if through_main
+                        else [executable, "-I", "-m", "muli.management_helper", str(journal_root)]
+                    ),
                 )
                 monkeypatch.setattr(sys, "argv", list(helper_argv[3:]))
                 monkeypatch.setattr(atexit, "register", register)
+                if not through_main:
+                    # Explicit canonical-only offline entry: it exercises real
+                    # files/backend calls, but makes no runpy binding claim.
+                    monkeypatch.setattr(sys, "argv", ["muli.management_helper", str(journal_root)])
+                if binding_case == "existing":
+                    sys.setprofile(foreign_profile)
+                if binding_case == "wrong_origin":
+                    spec = managed_host.__spec__
+                    assert spec is not None
+                    monkeypatch.setattr(
+                        managed_host,
+                        "__spec__",
+                        ModuleSpec(spec.name, spec.loader, origin="<foreign-host-source>"),
+                    )
+                diagnostic_failures: list[BaseException] = []
+                if binding_case in {"error", "cancelled"}:
+                    original_require = worker.require
+                    diagnostic_failure = (
+                        asyncio.CancelledError("private observer body")
+                        if binding_case == "cancelled"
+                        else RuntimeError("private observer body")
+                    )
+
+                    def fail_binding(condition: bool, code: str) -> None:
+                        if code == "native_profile_main_unconfirmed":
+                            diagnostic_failures.append(diagnostic_failure)
+                            raise diagnostic_failure
+                        original_require(condition, code)
+
+                    monkeypatch.setattr(worker, "require", fail_binding)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
+                if not through_main or binding_case == "existing":
+                    assert sys.getprofile() is (
+                        foreign_profile if binding_case == "existing" else original_profile
+                    )
+                elif binding_case != "superseded":
+                    waiting_profile = sys.getprofile()
+                    assert waiting_profile is not None and waiting_profile is not original_profile
+
+                    def main() -> None:
+                        # Another module's same-named function must not bind
+                        # or end the real -m entry's one-shot observation.
+                        pass
+
+                    main()
+                    assert sys.getprofile() is waiting_profile
+                if binding_case == "superseded":
+                    assert sys.getprofile() is not foreign_profile
+                    sys.setprofile(foreign_profile)
                 if include_host_record:
                     observed_directories: list[tuple[Path, ...]] = []
 
@@ -136,9 +225,68 @@ async def _exercise_generated_hook(
                         observed_directories.append(tuple(directories))
 
                     monkeypatch.setattr(managed_host, "verify_local_filesystems", filesystems)
+                    # runpy imports this function afresh into the real __main__
+                    # namespace; only mount admission remains controlled there.
+                    monkeypatch.setattr(
+                        filesystem_identity, "verify_local_filesystems", filesystems
+                    )
                     journal.database.write_bytes(b"")
                     journal.database.chmod(0o600)
-                    if host_failure is None:
+                    if through_main and binding_case != "missing":
+                        assert host_failure is None
+                        authenticated_records: list[TransactionRecordV2] = []
+
+                        def run_at_service_boundary(coroutine: object) -> TransactionRecordV2:
+                            # Execute the actual -m module and main, stopping
+                            # only where it would enter real systemd operations.
+                            assert isinstance(coroutine, CoroutineType)
+                            try:
+                                frame = coroutine.cr_frame
+                                assert frame is not None
+                                namespace = frame.f_globals
+                                assert namespace is sys.modules["__main__"].__dict__
+                                assert namespace is not managed_host.__dict__
+                                assert namespace["__name__"] == "__main__"
+                                assert namespace["__spec__"].name == "muli.managed_host"
+                                assert sys.getprofile() is (
+                                    foreign_profile
+                                    if binding_case in {"existing", "superseded"}
+                                    else original_profile
+                                )
+                                helper = namespace["run_managed_helper"]
+                                assert isinstance(helper, FunctionType)
+                                assert helper.__code__ is coroutine.cr_code
+                                read_record = cast(
+                                    Callable[
+                                        [JournalControl, DeploymentAnchor],
+                                        tuple[
+                                            TransactionRecordV2,
+                                            SlotIdentity,
+                                            dict[Role, SlotIdentity],
+                                        ],
+                                    ],
+                                    namespace["_record"],
+                                )
+                                current, controller, slots = read_record(control, host.anchor)
+                                assert current == record
+                                assert controller == host.slots["base"] and slots == host.slots
+                                authenticated_records.append(current)
+                                return current
+                            finally:
+                                coroutine.close()
+
+                        with monkeypatch.context() as local:
+                            local.setattr(asyncio, "run", run_at_service_boundary)
+                            with pytest.warns(RuntimeWarning, match="found in sys.modules"):
+                                with pytest.raises(SystemExit) as exited:
+                                    runpy.run_module(
+                                        "muli.managed_host", run_name="__main__", alter_sys=True
+                                    )
+                            assert exited.value.code == 0
+                        assert authenticated_records == [record]
+                    elif host_failure is None:
+                        # This existing fixture deliberately exercises the
+                        # canonical import only, not Python's -m entry point.
                         current, controller, slots = managed_host._record(control, host.anchor)
                         assert current == record
                         assert controller == host.slots["base"] and slots == host.slots
@@ -177,6 +325,19 @@ async def _exercise_generated_hook(
                 assert len(callbacks) == 1
                 callbacks[0]()
                 callbacks[0]()  # The same atexit callback is a single write attempt.
+                if binding_case is not None:
+                    assert not path.exists(), "未绑定真实main时不得发布observed零成本"
+                    assert not (root / "helper-costs-checkpoint.json").exists()
+                    assert sys.getprofile() is (
+                        foreign_profile
+                        if binding_case in {"existing", "superseded"}
+                        else original_profile
+                    )
+                    if binding_case in {"error", "cancelled"}:
+                        assert diagnostic_failures == [diagnostic_failure]
+                    else:
+                        assert diagnostic_failures == []
+                    return
                 facts = json.loads(path.read_text(encoding="utf-8"))
                 assert "private exception body" not in path.read_text(encoding="utf-8")
                 if include_host_record:
@@ -227,6 +388,9 @@ async def _exercise_generated_hook(
                 assert worker.helper_costs_facts(facts, source)
                 assert path.stat().st_mode & 0o077 == 0
             finally:
+                # These tests own their injected profilers; the hook itself
+                # must never clear the foreign owner asserted above.
+                sys.setprofile(original_profile)
                 host.release_writer()
                 await host.backend.__aexit__()
 
@@ -291,8 +455,14 @@ async def test_real_install_publishes_second_helper_partial_before_atexit(
                 argv = managed_helper_arguments(host.anchor, host.slots["base"])
                 monkeypatch.setattr(sys, "prefix", str(root / "a"))
                 monkeypatch.setattr(sys, "executable", argv[0])
-                monkeypatch.setattr(sys, "orig_argv", list(argv))
-                monkeypatch.setattr(sys, "argv", list(argv[3:]))
+                # This offline install fixture has no runpy main; retain the
+                # legacy observation entry, not a fabricated main-bound flag.
+                monkeypatch.setattr(
+                    sys,
+                    "orig_argv",
+                    [argv[0], "-I", "-m", "muli.management_helper", str(journal_root)],
+                )
+                monkeypatch.setattr(sys, "argv", ["muli.management_helper", str(journal_root)])
                 monkeypatch.setattr(atexit, "register", register)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
                 assert len(callbacks) == 1

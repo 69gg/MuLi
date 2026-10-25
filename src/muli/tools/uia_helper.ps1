@@ -21,7 +21,9 @@ $script:traceStages = @(
     'muli-uia-stage=1:request_decoded',
     'muli-uia-stage=1:walker_initializing',
     'muli-uia-stage=1:walker_ready',
-    'muli-uia-stage=1:probe_process_ready'
+    'muli-uia-stage=1:probe_process_ready',
+    'muli-uia-stage=1:uia_host_validated',
+    'muli-uia-stage=1:uia_add_type_returned'
 )
 
 function Write-Stage([int]$index) {
@@ -61,8 +63,10 @@ function Initialize-Uia {
     if ([Threading.Thread]::CurrentThread.GetApartmentState().ToString() -ne 'MTA') {
         Stop-Bridge 'dependency_missing'
     }
+    Write-Stage 14
     try {
         Microsoft.PowerShell.Utility\Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+        Write-Stage 15
         if (-not [System.Windows.Automation.AutomationElement].Assembly.GlobalAssemblyCache -or
             -not [System.Windows.Automation.ControlType].Assembly.GlobalAssemblyCache) {
             Stop-Bridge 'dependency_missing'

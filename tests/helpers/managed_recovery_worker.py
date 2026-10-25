@@ -315,7 +315,13 @@ class ObservedBackend(ManagedLinuxBackend):
     selected_calls: int = 0
     selected_seconds: float = 0.0
 
-    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+    def _check(
+        self,
+        record: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+    ) -> None:
         from muli.platforms import managed_backend, managed_deployment
 
         started = time.monotonic()
@@ -324,11 +330,16 @@ class ObservedBackend(ManagedLinuxBackend):
         # The backend's existing private import is the selected-role lookup seam.
         selected_verify = cast(Callable[..., None], vars(managed_backend)["verify_slot_files"])
 
-        def controller(slot: SlotIdentity) -> None:
+        def controller(
+            slot: SlotIdentity, *, verified_python: FileFingerprint | None = None
+        ) -> None:
             before = time.monotonic()
             self.controller_calls += 1
             try:
-                controller_verify(slot)
+                if verified_python is None:
+                    controller_verify(slot)
+                else:
+                    controller_verify(slot, verified_python=verified_python)
             finally:
                 self.controller_seconds += time.monotonic() - before
 
@@ -347,7 +358,10 @@ class ObservedBackend(ManagedLinuxBackend):
                 patch.object(managed_deployment, "verify_slot_files", controller),
                 patch.object(managed_backend, "verify_slot_files", selected),
             ):
-                super()._check(record, role)
+                if verified_python is None:
+                    super()._check(record, role)
+                else:
+                    super()._check(record, role, verified_python=verified_python)
         finally:
             self.check_seconds += time.monotonic() - started
 

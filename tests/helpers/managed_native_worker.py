@@ -18,8 +18,9 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import closing
 from functools import wraps
+from importlib.machinery import ModuleSpec
 from pathlib import Path
-from types import ModuleType
+from types import FrameType, FunctionType, ModuleType
 from typing import TYPE_CHECKING, Any, NoReturn, cast, get_args
 
 if TYPE_CHECKING:
@@ -30,6 +31,11 @@ if TYPE_CHECKING:
     from muli.store import Store
 
     from .managed_native_peer import PeerFacts
+
+    HostRecordReader = Callable[
+        [JournalControl, DeploymentAnchor],
+        tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]],
+    ]
 
 MAX_BYTES = 32768
 CONTEXT_REPLY_BYTES = 512
@@ -3416,7 +3422,10 @@ def install_helper_cost_hook() -> None:
         original_command = SystemdProbe._command
         original_request = ManagedLinuxBackend._request
         original_install = ManagedLinuxBackend.install
-        original_record = managed_host._record
+        managed_entry = sys.orig_argv[3] == "muli.managed_host"
+        host_bound = not managed_entry
+        host_spec = managed_host.__spec__
+        host_origin = host_spec.origin if host_spec is not None else None
 
         @wraps(original_check)
         def check(*args: Any, **kwargs: Any) -> None:
@@ -3438,15 +3447,67 @@ def install_helper_cost_hook() -> None:
                 except Exception:
                     usable = False
 
-        @wraps(original_record)
-        def host_record(
-            control: JournalControl, anchor: DeploymentAnchor
-        ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
-            started = begin()
+        def observe_record(original: HostRecordReader) -> HostRecordReader:
+            @wraps(original)
+            def host_record(
+                control: JournalControl, anchor: DeploymentAnchor
+            ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+                started = begin()
+                try:
+                    return original(control, anchor)
+                finally:
+                    finish("host_record", started)
+
+            return host_record
+
+        def stop_waiting() -> None:
+            nonlocal usable
             try:
-                return original_record(control, anchor)
+                if sys.getprofile() is bind_main:
+                    sys.setprofile(None)
+            except BaseException:
+                usable = False  # Diagnostic cleanup cannot replace a real outcome.
+
+        def bind_main(frame: FrameType, event: str, argument: object) -> None:
+            nonlocal host_bound, usable
+            if event != "call" or frame.f_code.co_name != "main":
+                return
+            reached_main = False
+            try:
+                module = sys.modules.get("__main__")
+                if module is None or frame.f_globals is not module.__dict__:
+                    return
+                reached_main = True
+                namespace = frame.f_globals
+                spec = namespace.get("__spec__")
+                main = namespace.get("main")
+                original = namespace.get("_record")
+                require(
+                    isinstance(spec, ModuleSpec)
+                    and spec.name == "muli.managed_host"
+                    and isinstance(host_origin, str)
+                    and spec.origin == host_origin
+                    and namespace.get("__file__") == host_origin
+                    and frame.f_code.co_filename == host_origin
+                    and isinstance(main, FunctionType)
+                    and main.__globals__ is namespace
+                    and main.__code__ is frame.f_code
+                    and isinstance(original, FunctionType)
+                    and original.__globals__ is namespace
+                    and original.__code__.co_filename == host_origin
+                    and original.__code__.co_name == "_record",
+                    "native_profile_main_unconfirmed",
+                )
+                namespace["_record"] = observe_record(cast("HostRecordReader", original))
+                host_bound = True
+            except BaseException:
+                reached_main = True
+                usable = False  # A failed observer cannot prevent main from running.
             finally:
-                finish("host_record", started)
+                # Only the first real __main__.main call is observed. Never
+                # clear a profiler installed by a subsequent owner.
+                if reached_main:
+                    stop_waiting()
 
         @wraps(original_command)
         async def command(*args: Any, **kwargs: Any) -> str:
@@ -3485,7 +3546,7 @@ def install_helper_cost_hook() -> None:
                 os.close(directory)
 
         def snapshot() -> dict[str, Any]:
-            require(usable, "native_profile_invalid")
+            require(usable and host_bound, "native_profile_invalid")
             value = {
                 **facts,
                 **{
@@ -3542,6 +3603,7 @@ def install_helper_cost_hook() -> None:
             if saved:
                 return
             saved = True
+            stop_waiting()
             try:
                 publish(root / "helper-costs.json", snapshot())
             except Exception:
@@ -3553,7 +3615,20 @@ def install_helper_cost_hook() -> None:
         SystemdProbe._command = command  # type: ignore[method-assign]
         ManagedLinuxBackend._request = request  # type: ignore[method-assign]
         ManagedLinuxBackend.install = install  # type: ignore[method-assign,assignment]
-        managed_host._record = host_record
+        if managed_entry:
+            # -m re-executes this source as __main__; the canonical import is
+            # not the helper's execution namespace. Bind once before main runs.
+            try:
+                if sys.getprofile() is None:
+                    sys.setprofile(bind_main)
+                else:
+                    usable = False
+            except BaseException:
+                usable = False
+                stop_waiting()
+        else:
+            # Legacy helper and explicit offline fixtures do not run this main.
+            managed_host._record = observe_record(managed_host._record)
     except Exception:
         return  # A missing observer must not prevent the original helper starting.
 

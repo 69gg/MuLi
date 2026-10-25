@@ -34,6 +34,7 @@ from muli.management_transaction import (
     TransactionError,
     TransactionJournal,
 )
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_controller import (
     CgroupObservation,
     transaction_request,
@@ -141,7 +142,13 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     async def __aexit__(self, *args: object) -> None:
         await self.client.aclose()
 
-    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+    def _check(
+        self,
+        record: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+    ) -> None:
         self.control.check()
         if self.control.read_current() != record:
             raise TransactionError("stale_revision")
@@ -153,7 +160,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 or store.read_slot(self.anchor.controller_slot) != self.controller_slot
             ):
                 raise ObservationError("managed_deployment_changed")
-            store.verify_anchor(self.anchor)
+            store.verify_anchor(self.anchor, verified_python=verified_python)
             # The opposite role is frozen metadata, not a requirement that its
             # damaged package remain executable in order to restore the base.
             for selected in _ROLES:
@@ -165,7 +172,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 ):
                     raise ObservationError("managed_slot_changed")
         # verify_anchor authenticated the controller in this synchronous check.
-        # Equal frozen installations share that proof only until this call returns.
+        # Equal frozen installations share this check's full slot verification.
         # Distinct slots still reopen/walk their Python and verify their package;
         # only an identical resolved file identity can reuse the controller SHA.
         if role is not None and self.slots[role] != self.controller_slot:
@@ -173,8 +180,14 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 self.slots[role], verified_python=self.controller_slot.resolved_python
             )
 
-    def _effect_guard(self, record: TransactionRecordV2, role: Role | None) -> None:
-        self._check(record, role)
+    def _effect_guard(
+        self,
+        record: TransactionRecordV2,
+        role: Role | None,
+        *,
+        verified_python: FileFingerprint | None = None,
+    ) -> None:
+        self._check(record, role, verified_python=verified_python)
         remaining = record.deadline.remaining(self.clock())
         if record.phase in {"activating", "verifying"}:
             remaining -= record.deadline.rollback_reserve
@@ -182,9 +195,15 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise TimeoutError
 
     def _guard(
-        self, record: TransactionRecordV2, role: Role, lease: FixedLock, cgroup: str
+        self,
+        record: TransactionRecordV2,
+        role: Role,
+        lease: FixedLock,
+        cgroup: str,
+        *,
+        verified_python: FileFingerprint | None = None,
     ) -> None:
-        self._effect_guard(record, role)
+        self._effect_guard(record, role, verified_python=verified_python)
         lease.check()
         if not self.cgroups.empty(cgroup):
             raise ObservationError("cgroup_not_empty")
@@ -314,11 +333,17 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         cgroup: str,
     ) -> _DiskBinding:
         expected = _files(record.binding(role))
+        verified_python: FileFingerprint | None = None
 
         def guard() -> None:
-            self._guard(record, role, lease, cgroup)
+            nonlocal verified_python
+            self._guard(record, role, lease, cgroup, verified_python=verified_python)
             if self._disk().digests != expected:
                 raise ObservationError("foreign_managed_binding")
+            # This method never awaits. Only a completed real guard grants the
+            # local Python proof; every later guard still reopens its files,
+            # checks identities and hashes each package independently.
+            verified_python = self.controller_slot.resolved_python
 
         order: tuple[Component, ...] = (
             ("configuration", "selector", "unit")
