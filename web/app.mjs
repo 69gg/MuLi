@@ -91,6 +91,11 @@ const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
 let draftRevision = 0;
 let conversationLayout = null;
+let conversationFollowing = true;
+let conversationFollowFrame = null;
+let conversationResizeObserver = null;
+let conversationScrollIntent = null;
+let conversationTouchY = null;
 const voiceInput = new VoiceInput({
   upload: uploadFile, transcribe: transcribeAttachment,
   onUploaded: (file) => { state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
@@ -382,22 +387,80 @@ function renderComposer() {
   $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
   $("#composer-status").textContent = state.uploading ? `正在保存 ${state.uploading} 个附件…` : !state.connected ? state.loading ? "正在连接沐璃" : "等待服务连接" : !state.status?.configured ? "请先配置主模型" : running ? state.session.status === "approval" ? "等待批准 · 可以继续补充" : "正在处理 · 可以继续补充" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
   renderVoiceInput();
-}
-
-function scrollIsNearBottom() {
-  const scroll = $("#conversation-scroll");
-  return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 100;
+  scheduleConversationTail();
 }
 
 function scrollToBottom(force = false, smooth = false) {
-  if (!force && !scrollIsNearBottom()) return;
+  if (!force && !conversationFollowing) return;
+  conversationFollowing = true;
+  conversationScrollIntent = null;
+  writeConversationTail(smooth);
+}
+
+function writeConversationTail(smooth = false) {
+  if (state.view !== "chat") return;
   const scroll = $("#conversation-scroll");
+  if (scroll.clientHeight <= 0) return;
   scroll.scrollTo({ top: scroll.scrollHeight, behavior: smooth ? "smooth" : "instant" });
   $("#scroll-bottom").hidden = true;
 }
 
+function scheduleConversationTail() {
+  if (!conversationResizeObserver && typeof ResizeObserver === "function") {
+    conversationResizeObserver = new ResizeObserver(scheduleConversationTail);
+    for (const selector of ["#conversation-scroll", "#messages", "#approval-region", "#run-status", ".composer-area", "#composer"]) {
+      const node = $(selector);
+      if (node) conversationResizeObserver.observe(node);
+    }
+  }
+  if (state.view !== "chat") return;
+  const follow = () => {
+    conversationFollowFrame = null;
+    if (conversationFollowing && state.view === "chat" && $("#conversation-scroll").clientHeight > 0) writeConversationTail();
+  };
+  if (typeof requestAnimationFrame !== "function") { follow(); return; }
+  if (conversationFollowFrame === null) conversationFollowFrame = requestAnimationFrame(follow);
+}
+
+function mainScrollTarget(event, keyboard = false) {
+  const scroll = $("#conversation-scroll");
+  let node = event.target;
+  while (node && node !== scroll) {
+    if (node.matches?.('.reasoning-content, textarea, input, select, [contenteditable], [role="separator"]')) return false;
+    // Space activates these controls; navigation keys may still scroll the
+    // main viewport, which the following scroll event must confirm.
+    if (keyboard && event.key === " " && node.matches?.("button, summary")) return false;
+    node = node.parentNode;
+  }
+  return node === scroll;
+}
+
+function armConversationScroll(event, kind, upward) {
+  if (event.isTrusted === false || !mainScrollTarget(event, kind === "key")) return;
+  const scroll = $("#conversation-scroll");
+  const intent = { kind, upward, top: scroll.scrollTop };
+  conversationScrollIntent = intent;
+  // Wheel/key default scrolling precedes the frame. A stale gesture must not
+  // later turn a layout/programmatic scroll into an upward reading action.
+  if (kind !== "scrollbar" && typeof requestAnimationFrame === "function") requestAnimationFrame(() => {
+    if (conversationScrollIntent === intent) conversationScrollIntent = null;
+  });
+}
+
+function onConversationScroll() {
+  const scroll = $("#conversation-scroll"), intent = conversationScrollIntent;
+  // Concurrent content growth must not erase a real upward gesture. Clamp the
+  // starting position only to exclude a layout-only reduction of the range.
+  const previousTop = intent && Math.min(intent.top, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+  if (intent && intent.upward !== false && scroll.scrollTop < previousTop) conversationFollowing = false;
+  else if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 1) conversationFollowing = true;
+  if (intent?.kind === "scrollbar") {
+    intent.top = scroll.scrollTop;
+  } else conversationScrollIntent = null;
+  $("#scroll-bottom").hidden = conversationFollowing || !state.session.messages.length;
+}
+
 function renderChat() {
-  const nearBottom = scrollIsNearBottom();
   const items = conversationItems(state.session).filter((item) => item.kind !== "message" || ["user", "assistant"].includes(item.message.role) && (item.message.content || item.message.attachments?.length || item.message.attachment_ids?.length || item.message.pending || item.message.streaming));
   $("#welcome").hidden = !!items.length || busy();
   const container = $("#messages");
@@ -459,8 +522,8 @@ function renderChat() {
   runStatus.classList.toggle("error", !!state.session.error);
   if (state.session.error) runStatus.replaceChildren(icon("info"), element("span", { text: state.session.error }));
   else if (busy()) runStatus.replaceChildren(element("span", { class: "thinking-dots", "aria-hidden": "true" }, element("i"), element("i"), element("i")), element("span", { text: state.session.status === "approval" ? "等待审批" : state.sending ? "正在发送…" : state.session.tools.some((tool) => tool.status === "running") ? "正在使用工具…" : "正在处理…" }));
-  if (nearBottom) scrollToBottom(true);
   renderComposer();
+  scheduleConversationTail();
 }
 
 function renderProcessItem(item, node) {
@@ -524,7 +587,7 @@ function renderApprovalViews() {
 function renderApprovals() {
   const region = $("#approval-region");
   if (state.approvalsError) {
-    region.replaceChildren(element("div", { class: "approval-error", role: "status" }, element("p", { text: state.approvalsError }), actionButton("刷新待批准", "refresh-approvals", "text-button", "refresh"))); return;
+    region.replaceChildren(element("div", { class: "approval-error", role: "status" }, element("p", { text: state.approvalsError }), actionButton("刷新待批准", "refresh-approvals", "text-button", "refresh"))); scheduleConversationTail(); return;
   }
   $(".approval-error", region)?.remove();
   const existing = new Map($$(".approval-item", region).map((node) => [node.dataset.id, node]));
@@ -535,6 +598,7 @@ function renderApprovals() {
     if (!existing.has(approval.id)) region.append(node);
     $$("button", node).forEach((button) => { button.disabled = !!connection?.approvalDecisions.has(approval.id); });
   }
+  scheduleConversationTail();
 }
 
 function queueRender() {
@@ -692,7 +756,7 @@ function startSessionEvents(sessionId, owner = connection) {
   });
 }
 
-function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); }
+function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
 
 async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
@@ -2885,7 +2949,34 @@ $("#mode-select").addEventListener("change", async (event) => {
   renderComposer();
 });
 $("#file-input").addEventListener("change", (event) => { void addFiles(event.target.files); event.target.value = ""; });
-$("#conversation-scroll").addEventListener("scroll", () => { $("#scroll-bottom").hidden = scrollIsNearBottom() || !state.session.messages.length; }, { passive: true });
+$("#conversation-scroll").addEventListener("scroll", onConversationScroll, { passive: true });
+$("#conversation-scroll").addEventListener("wheel", (event) => {
+  if (event.deltaY) armConversationScroll(event, "wheel", event.deltaY < 0);
+}, { passive: true });
+$("#conversation-scroll").addEventListener("keydown", (event) => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (["ArrowUp", "PageUp", "Home"].includes(event.key) || event.key === " " && event.shiftKey) armConversationScroll(event, "key", true);
+  else if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) armConversationScroll(event, "key", false);
+});
+$("#conversation-scroll").addEventListener("touchstart", (event) => {
+  conversationTouchY = mainScrollTarget(event) && event.touches?.length === 1 ? event.touches[0].clientY : null;
+}, { passive: true });
+$("#conversation-scroll").addEventListener("touchmove", (event) => {
+  if (conversationTouchY === null || event.touches?.length !== 1) return;
+  const y = event.touches[0].clientY;
+  if (y !== conversationTouchY) armConversationScroll(event, "touch", y > conversationTouchY);
+  conversationTouchY = y;
+}, { passive: true });
+for (const type of ["touchend", "touchcancel"]) $("#conversation-scroll").addEventListener(type, () => {
+  conversationTouchY = null;
+  if (conversationScrollIntent?.kind === "touch") conversationScrollIntent = null;
+}, { passive: true });
+$("#conversation-scroll").addEventListener("pointerdown", (event) => {
+  if (event.target === event.currentTarget && event.button === 0 && event.pointerType !== "touch") armConversationScroll(event, "scrollbar", null);
+}, { passive: true });
+for (const type of ["pointerup", "pointercancel"]) window.addEventListener(type, () => { if (conversationScrollIntent?.kind === "scrollbar") conversationScrollIntent = null; }, { passive: true });
+window.addEventListener("blur", () => { conversationScrollIntent = null; conversationTouchY = null; });
+window.addEventListener("resize", scheduleConversationTail, { passive: true });
 $("#dialog-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!dialogSubmit) return;

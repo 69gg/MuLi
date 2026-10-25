@@ -87,10 +87,19 @@ class DOMElement {
     return this.attributes[key] ?? this[key];
   }
   addEventListener(name, callback) { (this.events[name] ??= []).push(callback); }
-  dispatch(name) {
-    return Promise.all((this.events[name] ?? []).map((callback) => callback({ target: this, currentTarget: this, preventDefault() {} })));
+  dispatch(name, payload = {}) {
+    const event = { target: this, currentTarget: this, isTrusted: true, preventDefault() {}, ...payload };
+    const results = [];
+    let current = this;
+    while (current) {
+      event.currentTarget = current;
+      results.push(...(current.events[name] ?? []).map((callback) => callback(event)));
+      current = payload.bubbles ? current.parentNode : null;
+    }
+    return Promise.all(results);
   }
   matches(selector) {
+    if (selector.includes(",")) return selector.split(",").some((part) => this.matches(part.trim()));
     const tag = selector.match(/^[a-z][\w-]*/i)?.[0];
     if (tag && this.tagName !== tag.toUpperCase()) return false;
     const id = selector.match(/#([\w-]+)/)?.[1];
@@ -115,7 +124,7 @@ class DOMElement {
   closest(selector) { return this.matches(selector) ? this : this.parentNode?.closest(selector) ?? null; }
 }
 
-function harness() {
+function harness({ realApprovals = false } = {}) {
   const document = {
     activeElement: null, addEventListener() {},
     createTextNode: (text) => new TextNode(text),
@@ -131,12 +140,25 @@ function harness() {
   };
   const scroll = node("div", "conversation-scroll"); scroll.clientHeight = 200;
   const messages = node("div", "messages", scroll);
+  if (realApprovals) node("div", "approval-region", scroll);
   for (const id of ["welcome", "scroll-bottom", "run-status", "composer", "login-form", "message-input", "mode-select", "file-input", "dialog-form", "app-dialog"]) node("div", id);
   const unexpectedRequest = () => { throw new Error("renderer must not call a service"); };
+  const frames = new Map(), resizeObservers = [], windowEvents = {};
+  let nextFrame = 0, composerLayout = () => {};
+  const requestAnimationFrame = (callback) => { frames.set(++nextFrame, callback); return nextFrame; };
+  const cancelAnimationFrame = (identifier) => frames.delete(identifier);
+  class ResizeObserver {
+    constructor(callback) { this.callback = callback; this.targets = new Set(); resizeObservers.push(this); }
+    observe(target) { this.targets.add(target); }
+    unobserve(target) { this.targets.delete(target); }
+    disconnect() { this.targets.clear(); }
+  }
   const context = {
     ...sessionState, document, console, AbortController, TextEncoder, URLSearchParams,
     Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
-    window: { addEventListener() {} },
+    window: { addEventListener: (name, callback) => { (windowEvents[name] ??= []).push(callback); }, requestAnimationFrame, cancelAnimationFrame },
+    requestAnimationFrame, cancelAnimationFrame, ResizeObserver,
+    composerLayout: () => composerLayout(),
     attachmentKind, attachmentURL, formatBytes,
     createTeamPager: () => ({}), captureTeamView: () => null, restoreTeamView() {},
     VoiceInput: class { cancel() {} }, uploadFile: unexpectedRequest, transcribeAttachment: unexpectedRequest,
@@ -145,8 +167,9 @@ function harness() {
     renderMarkdown: (text) => { const result = document.createElement("p"); result.textContent = text; return result; },
   };
   runInNewContext(application + `
-    renderChrome = () => {}; renderComposer = () => {}; renderApprovals = () => {};
-    globalThis.ui = { state, renderChat };
+    renderChrome = () => {}; renderComposer = () => composerLayout();
+    ${realApprovals ? "" : "renderApprovals = () => {};"}
+    globalThis.ui = { state, renderChat, renderApprovalViews };
   `, context);
   const ui = context.ui; ui.state.view = "chat"; ui.state.activeSession = { id: "main" };
   let sequence = 0;
@@ -158,7 +181,20 @@ function harness() {
     emit("message.completed", { message: { id: "owner-1", role: "user", principal: "owner", content: "请查看笔记" } });
     emit("run.started", { run_id: "run-1" });
   };
-  return { ui, document, scroll, messages, emit, start, render: () => ui.renderChat() };
+  return {
+    ui, document, scroll, messages, emit, start, render: () => ui.renderChat(),
+    onComposer: (callback) => { composerLayout = callback; },
+    flushFrames() {
+      for (let cycle = 0; frames.size && cycle < 8; cycle += 1) {
+        const current = [...frames.values()]; frames.clear(); current.forEach((callback) => callback());
+      }
+      assert.equal(frames.size, 0, "following must settle without an animation-frame polling loop");
+    },
+    resized() {
+      for (const observer of resizeObservers) if (observer.targets.size) observer.callback([...observer.targets].map((target) => ({ target })), observer);
+      for (const callback of windowEvents.resize ?? []) callback({ target: context.window });
+    },
+  };
 }
 
 test("the real chat renderer interleaves owner, reasoning, tool and reply in one timeline", () => {
@@ -243,14 +279,140 @@ test("a completed historical thought starts at its beginning rather than inherit
 });
 
 test("new timeline content leaves the main history reader in place and follows an already-bottom reader", () => {
-  const h = harness(); h.start(); h.emit("message.delta", { content: "答".repeat(1200) }); h.render();
+  const h = harness(); h.start(); h.emit("message.delta", { content: "答".repeat(1200) }); h.render(); h.flushFrames();
+  h.scroll.dispatch("wheel", { deltaY: -120 });
   h.scroll.scrollTop = 100; h.scroll.dispatch("scroll"); h.scroll.scrollCalls.length = 0;
-  h.emit("message.delta", { content: "续".repeat(300) }); h.render();
+  h.emit("message.delta", { content: "续".repeat(300) }); h.render(); h.flushFrames();
   assert.equal(h.scroll.scrollTop, 100); assert.equal(h.scroll.scrollCalls.length, 0);
   h.scroll.scrollTop = h.scroll.scrollHeight; h.scroll.dispatch("scroll");
-  h.emit("message.delta", { content: "尾".repeat(300) }); h.render();
+  h.emit("message.delta", { content: "尾".repeat(300) }); h.render(); h.flushFrames();
   assert.equal(h.scroll.scrollCalls.length, 1);
   assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight);
+});
+
+test("an independently arriving real approval stays at the tail even when its height exceeds the old near-bottom threshold", () => {
+  const h = harness({ realApprovals: true }); h.start();
+  h.emit("message.delta", { content: "答".repeat(1100) }); h.render(); h.flushFrames();
+  const before = h.scroll.scrollHeight;
+  h.ui.state.approvals = [{ id: "approval-1", session_id: "main", run_id: "run-1", tool: "fs_write", risk: "write", arguments: { content: "待批参数".repeat(100) } }];
+  h.ui.renderApprovalViews(); h.flushFrames();
+  assert.equal(h.document.querySelectorAll(".approval-item").length, 1);
+  assert.ok(h.scroll.scrollHeight - before > 100, "the actual approval renderer must change scroll geometry first");
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight);
+  h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight);
+});
+
+test("composer layout and later viewport resize follow at the end of the frame without a new message", () => {
+  const h = harness(); h.start(); h.emit("message.delta", { content: "答".repeat(1100) });
+  h.render(); h.flushFrames();
+  h.onComposer(() => { h.scroll.clientHeight = 80; });
+  h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight, "composer changes happen after the old synchronous scroll");
+  h.scroll.clientHeight = 40; h.resized(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight, "asynchronous geometry alone must keep the tail visible");
+});
+
+test("layout-generated scroll does not leave following; a real upward gesture pauses until the user returns to the tail", () => {
+  const h = harness(); h.start(); h.emit("message.delta", { content: "答".repeat(1100) });
+  h.render(); h.flushFrames();
+  h.scroll.scrollTop = 100; h.scroll.dispatch("scroll", { isTrusted: true });
+  h.emit("message.delta", { content: "续".repeat(200) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight, "a scroll event without a user gesture cannot revoke follow mode");
+  h.scroll.dispatch("wheel", { deltaY: -120 });
+  h.scroll.scrollTop = 100; h.scroll.dispatch("scroll");
+  h.emit("message.delta", { content: "停".repeat(200) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, 100);
+  h.scroll.dispatch("wheel", { deltaY: 1000 });
+  h.scroll.scrollTop = h.scroll.scrollHeight; h.scroll.dispatch("scroll");
+  h.emit("message.delta", { content: "尾".repeat(200) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight);
+});
+
+test("scrolling upward inside the real reasoning pane does not cancel main conversation following", () => {
+  const h = harness(); h.start(); h.emit("reasoning.delta", { content: "思".repeat(1100) });
+  h.render(); h.flushFrames();
+  const content = h.messages.querySelector(".reasoning-content");
+  content.dispatch("wheel", { deltaY: -120, bubbles: true });
+  content.scrollTop = 100; content.dispatch("scroll");
+  h.emit("reasoning.delta", { content: "续".repeat(200) }); h.render(); h.flushFrames();
+  assert.equal(content.scrollTop, 100, "the nested reader keeps its own position");
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight, "only the main viewport's own user gesture may pause it");
+});
+
+test("a real upward wheel scroll still pauses when streaming and approval geometry change in the same frame", () => {
+  const h = harness({ realApprovals: true }); h.start();
+  h.emit("message.delta", { content: "答".repeat(1100) }); h.render(); h.flushFrames();
+  const previousHeight = h.scroll.scrollHeight, previousTop = h.scroll.scrollTop;
+  h.scroll.dispatch("wheel", { deltaY: -120 });
+  h.emit("message.delta", { content: "并发流式内容".repeat(80) });
+  h.ui.state.approvals = [{ id: "approval-during-wheel", session_id: "main", run_id: "run-1", tool: "fs_write", risk: "write", arguments: { content: "同时到达的待批参数".repeat(70) } }];
+  h.render();
+  assert.ok(h.scroll.scrollHeight - previousHeight > 100);
+  assert.equal(h.document.querySelectorAll(".approval-item").length, 1);
+  const readingTop = previousTop - 120;
+  h.scroll.scrollTop = readingTop; h.scroll.dispatch("scroll");
+  assert.equal(h.scroll.scrollTop, readingTop, "the real main viewport actually moved upward before frame settlement");
+  h.scroll.scrollCalls.length = 0; h.resized(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, readingTop, "layout growth cannot erase a simultaneous real upward gesture");
+  assert.equal(h.scroll.scrollCalls.length, 0);
+  h.emit("message.delta", { content: "仍在生成".repeat(50) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, readingTop);
+});
+
+test("PageUp from a focused tool summary, message button or link pauses the main viewport it actually scrolls", () => {
+  for (const kind of ["summary", "button", "a"]) {
+    const h = harness(); h.start();
+    h.emit("message.delta", { content: "答".repeat(1100) });
+    h.emit("tool.started", { run_id: "run-1", call_id: "read-keyboard", name: "fs_read", arguments: { path: "notes.txt" } });
+    h.render(); h.flushFrames();
+    let target;
+    if (kind === "summary") target = h.messages.querySelector(".tool-step summary");
+    else if (kind === "button") target = h.messages.querySelector(".message-actions button");
+    else {
+      target = h.document.createElement("a"); target.setAttribute("href", "#message-input");
+      target.textContent = "正文中的链接"; h.messages.querySelector(".message-body").append(target);
+      h.resized(); h.flushFrames();
+    }
+    assert.ok(target); target.focus();
+    const readingTop = h.scroll.scrollTop - 120;
+    target.dispatch("keydown", { key: "PageUp", bubbles: true });
+    // The DOM harness supplies browser geometry/default scrolling only. The
+    // actual registered key and scroll handlers decide whether following stops.
+    h.scroll.scrollTop = readingTop; h.scroll.dispatch("scroll");
+    assert.equal(h.scroll.scrollTop, readingTop);
+    h.scroll.scrollCalls.length = 0;
+    h.emit("message.delta", { content: "按键之后继续生成".repeat(50) }); h.render(); h.flushFrames();
+    assert.equal(h.scroll.scrollTop, readingTop, `${kind} PageUp must retain the reader's main-history position`);
+    assert.equal(h.scroll.scrollCalls.length, 0);
+    assert.equal(h.document.activeElement === target, true);
+  }
+});
+
+test("an upward wheel over a fitting tool result pauses the main viewport it actually scrolls", () => {
+  const h = harness(); h.start();
+  h.emit("message.delta", { content: "答".repeat(1100) });
+  h.emit("tool.started", { run_id: "run-1", call_id: "read-scroll", name: "fs_read", arguments: { path: "notes.txt" } });
+  h.emit("tool.completed", { run_id: "run-1", call_id: "read-scroll", status: "completed", result: { text: "短结果" } });
+  h.render();
+  const tool = h.messages.querySelector(".tool-step"), result = tool.querySelector(".tool-result");
+  tool.open = true;
+  // The real tool renderer creates this pre. A short result fits below its CSS
+  // height cap, so the browser's upward wheel default scrolls the main viewport.
+  result.clientHeight = result.scrollHeight;
+  assert.equal(result.tagName, "PRE");
+  assert.equal(result.scrollHeight, result.clientHeight);
+  h.resized(); h.flushFrames();
+  const readingTop = h.scroll.scrollTop - 120;
+  result.dispatch("wheel", { deltaY: -120, bubbles: true });
+  h.scroll.scrollTop = readingTop; h.scroll.dispatch("scroll");
+  assert.equal(h.scroll.scrollTop, readingTop, "the main viewport really moved upward; the fitting pre did not scroll");
+  assert.equal(result.scrollTop, 0);
+  h.scroll.scrollCalls.length = 0;
+  h.emit("message.delta", { content: "代码块上滚之后继续生成".repeat(50) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, readingTop, "a pre target cannot hide an actual upward main-history scroll");
+  assert.equal(h.scroll.scrollCalls.length, 0);
+  assert.equal(result.scrollTop, 0);
 });
 
 test("the registered mode change handler finishes without the removed timeline renderer", async () => {
