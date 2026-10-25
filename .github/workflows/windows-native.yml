@@ -1,0 +1,43 @@
+name: Windows native diagnostics
+on:
+  push:
+    branches: ['codex/windows-native-*']
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Owned helper dependency probe or complete native journey
+        type: choice
+        options: [probe-dependency, all-native]
+        default: probe-dependency
+permissions:
+  contents: read
+concurrency:
+  group: windows-native-${{ github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - name: Check dependency-only probe through the original owned lease
+        if: ${{ github.event.inputs.suite != 'all-native' }}
+        run: >-
+          uv run pytest -q --tb=short -o faulthandler_timeout=60
+          tests/test_uia_native.py::test_real_windows_probe_does_not_initialize_the_tree_walker
+          --basetemp="${{ runner.temp }}/muli-native-probe"
+      - name: Check all owned native Windows journeys
+        if: ${{ github.event.inputs.suite == 'all-native' }}
+        run: >-
+          uv run pytest -q --tb=short -o faulthandler_timeout=60
+          tests/test_uia_native.py
+          --basetemp="${{ runner.temp }}/muli-native-probe"
