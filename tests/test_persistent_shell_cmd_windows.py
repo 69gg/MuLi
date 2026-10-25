@@ -69,7 +69,30 @@ async def completed(
         receipt = await manager.read(
             session_id, receipt["command_id"], cursor=receipt["next_cursor"], wait_seconds=1
         )
-    assert receipt["state"] == "completed", receipt
+    if receipt["state"] != "completed":
+        snapshot = await manager.read(
+            session_id, receipt["command_id"], cursor={"output": 0, "stderr": 0}
+        )
+        # This fixture retains at most 4096 bytes across both streams. Re-read
+        # all retained output, rather than dumping an already consumed page.
+        diagnostic: dict[str, Any] = {
+            "state": snapshot["state"],
+            "stdout": snapshot["output"],
+            "stderr": snapshot["stderr"],
+            "observed_bytes": snapshot["observed_bytes"],
+            "discarded_bytes": snapshot["discarded_bytes"],
+        }
+        item = manager._commands.get(receipt["command_id"])
+        if item is not None:
+            diagnostic.update(
+                proof=item.proof.is_set(),
+                stdout_fence=item.stdout_fence.is_set(),
+                stderr_fence=item.stderr_fence.is_set(),
+            )
+        message = json.dumps(diagnostic, ensure_ascii=True)
+        if item is not None:
+            message = message.replace(item.shell.secret, "[fixture-protocol-secret]")
+        pytest.fail(message)
     return await manager.read(session_id, receipt["command_id"])
 
 
