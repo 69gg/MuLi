@@ -56,6 +56,7 @@ from muli.platforms.managed_deployment import (
     SlotIdentity,
     verify_slot_files,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.managed_probe import (
     ManagedProbeResult,
     ManagedSystemdProbe,
@@ -148,6 +149,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         self.control.check()
         if self.control.read_current() != record:
@@ -160,7 +163,15 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 or store.read_slot(self.anchor.controller_slot) != self.controller_slot
             ):
                 raise ObservationError("managed_deployment_changed")
-            store.verify_anchor(self.anchor, verified_python=verified_python)
+            if verified_packages is None and observed_packages is None:
+                store.verify_anchor(self.anchor, verified_python=verified_python)
+            else:
+                store.verify_anchor(
+                    self.anchor,
+                    verified_python=verified_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
             # The opposite role is frozen metadata, not a requirement that its
             # damaged package remain executable in order to restore the base.
             for selected in _ROLES:
@@ -176,9 +187,17 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         # Distinct slots still reopen/walk their Python and verify their package;
         # only an identical resolved file identity can reuse the controller SHA.
         if role is not None and self.slots[role] != self.controller_slot:
-            verify_slot_files(
-                self.slots[role], verified_python=self.controller_slot.resolved_python
-            )
+            if verified_packages is None and observed_packages is None:
+                verify_slot_files(
+                    self.slots[role], verified_python=self.controller_slot.resolved_python
+                )
+            else:
+                verify_slot_files(
+                    self.slots[role],
+                    verified_python=self.controller_slot.resolved_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
 
     def _effect_guard(
         self,
@@ -186,8 +205,19 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         role: Role | None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
-        self._check(record, role, verified_python=verified_python)
+        if verified_packages is None and observed_packages is None:
+            self._check(record, role, verified_python=verified_python)
+        else:
+            self._check(
+                record,
+                role,
+                verified_python=verified_python,
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
         remaining = record.deadline.remaining(self.clock())
         if record.phase in {"activating", "verifying"}:
             remaining -= record.deadline.rollback_reserve
@@ -202,8 +232,19 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         cgroup: str,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
-        self._effect_guard(record, role, verified_python=verified_python)
+        if verified_packages is None and observed_packages is None:
+            self._effect_guard(record, role, verified_python=verified_python)
+        else:
+            self._effect_guard(
+                record,
+                role,
+                verified_python=verified_python,
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
         lease.check()
         if not self.cgroups.empty(cgroup):
             raise ObservationError("cgroup_not_empty")
@@ -334,16 +375,27 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     ) -> _DiskBinding:
         expected = _files(record.binding(role))
         verified_python: FileFingerprint | None = None
+        verified_packages: PackageProofs | None = None
 
         def guard() -> None:
-            nonlocal verified_python
-            self._guard(record, role, lease, cgroup, verified_python=verified_python)
+            nonlocal verified_python, verified_packages
+            observed_packages: PackageProofs = {}
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=verified_python,
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
             if self._disk().digests != expected:
                 raise ObservationError("foreign_managed_binding")
             # This method never awaits. Only a completed real guard grants the
-            # local Python proof; every later guard still reopens its files,
-            # checks identities and hashes each package independently.
+            # local Python and package-leaf proofs. Later guards still reopen
+            # every file and rebuild each package walk and aggregate digest.
             verified_python = self.controller_slot.resolved_python
+            verified_packages = observed_packages
 
         order: tuple[Component, ...] = (
             ("configuration", "selector", "unit")

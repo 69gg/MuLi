@@ -22,6 +22,7 @@ from muli.platforms.managed_deployment import (
     SelectorStore,
     SelectorValue,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSnapshot
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed effects/leases")
@@ -40,9 +41,17 @@ async def test_confirm_uses_seven_real_checks_for_present_selector(
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         checks.append((current, role))
-        original(current, role, verified_python=verified_python)
+        original(
+            current,
+            role,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
 
     monkeypatch.setattr(host.backend, "_check", counted)
     with host.journal.writer_lease() as lease:
@@ -67,9 +76,17 @@ async def test_install_uses_thirty_one_real_checks_including_both_confirmations(
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         checks.append((current, role))
-        original(current, role, verified_python=verified_python)
+        original(
+            current,
+            role,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
 
     monkeypatch.setattr(host.backend, "_check", counted)
     await host.backend.install(record, "target", host.data["target"])

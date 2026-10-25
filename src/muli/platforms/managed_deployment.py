@@ -42,6 +42,7 @@ from muli.platforms.managed_launcher import (
     LaunchPlan as EntryPlan,
 )
 from muli.platforms.managed_launcher import (
+    PackageProofs,
     absolute,
     directory,
     fingerprint,
@@ -255,11 +256,24 @@ def register_local_slot(
 
 
 def verify_slot_files(
-    slot: SlotIdentity, *, verified_python: FileFingerprint | None = None
+    slot: SlotIdentity,
+    *,
+    verified_python: FileFingerprint | None = None,
+    verified_packages: PackageProofs | None = None,
+    observed_packages: PackageProofs | None = None,
 ) -> None:
     _platform()
     try:
-        if verified_python is None:
+        if verified_packages is not None or observed_packages is not None:
+            _verify_slot_files(
+                slot.model_dump(mode="json"),
+                verified_python=(
+                    None if verified_python is None else verified_python.model_dump(mode="json")
+                ),
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
+        elif verified_python is None:
             _verify_slot_files(slot.model_dump(mode="json"))
         else:
             _verify_slot_files(
@@ -398,7 +412,12 @@ class DeploymentStore(AbstractContextManager["DeploymentStore"]):
             raise ManagedDeploymentError("launcher_unavailable") from None
 
     def verify_anchor(
-        self, anchor: DeploymentAnchor, *, verified_python: FileFingerprint | None = None
+        self,
+        anchor: DeploymentAnchor,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         self._check()
         try:
@@ -406,9 +425,17 @@ class DeploymentStore(AbstractContextManager["DeploymentStore"]):
                 self.root / LAUNCHER_NAME, _LAUNCHER_BYTES
             ) != anchor.launcher.model_dump(mode="json"):
                 raise ValueError("foreign_launcher")
-            verify_slot_files(
-                self.read_slot(anchor.controller_slot), verified_python=verified_python
-            )
+            if verified_packages is None and observed_packages is None:
+                verify_slot_files(
+                    self.read_slot(anchor.controller_slot), verified_python=verified_python
+                )
+            else:
+                verify_slot_files(
+                    self.read_slot(anchor.controller_slot),
+                    verified_python=verified_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
         except (OSError, ValueError):
             raise ManagedDeploymentError("anchor_unavailable") from None
 

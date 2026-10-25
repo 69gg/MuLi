@@ -21,6 +21,7 @@ from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Revision, Role, TransactionError
 from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_transaction import ObservationError
+from muli.platforms.managed_launcher import PackageProofs
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed effects/leases")
 
@@ -62,9 +63,17 @@ async def test_real_install_returns_exact_confirmation_and_original_start_rechec
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         checks.append((current, role))
-        original_check(current, role, verified_python=verified_python)
+        original_check(
+            current,
+            role,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
 
     monkeypatch.setattr(host.backend, "_check", checked)
     probes = host.probe.count
@@ -100,10 +109,18 @@ async def test_real_managed_step_uses_install_confirmation_without_a_second_obse
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         nonlocal checks
         checks += 1
-        original_check(current, role, verified_python=verified_python)
+        original_check(
+            current,
+            role,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
 
     async def observe(current: TransactionRecordV2) -> ManagedServiceObservation:
         observed.append(current.position)

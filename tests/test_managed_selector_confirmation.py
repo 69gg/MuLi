@@ -14,6 +14,7 @@ from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role, TransactionError
 from muli.platforms.installation import FileFingerprint
 from muli.platforms.managed_deployment import SelectorStore
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.transaction_files import ConfigurationFile, ConfigurationSnapshot
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed selector guards")
@@ -34,8 +35,16 @@ async def test_target_confirmation_uses_seven_real_checks(
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
-        original(current, role, verified_python=verified_python)
+        original(
+            current,
+            role,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
         checks.append((current, role))
 
     monkeypatch.setattr(host.backend, "_check", checked)

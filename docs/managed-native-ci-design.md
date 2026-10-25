@@ -1,10 +1,16 @@
 # 真实 systemd 托管切换 CI 设计
 
-最新检查是 [Native49，准确候选 `e135d4f`](https://github.com/69gg/MuLi/actions/runs/40188324609)：十二项通用作业全部成功，含 Windows；[原生作业 `121153750905`](https://github.com/69gg/MuLi/actions/runs/40188324609/job/121153750905) 仍失败。第一代完整闭合，最终投影为 42546 毫秒；第二次 POST 成功，44524 毫秒 prepared、51272 毫秒 draining、56476 毫秒 stop_base，60000 毫秒以 `TimeoutError` / `helper_exit` 结束。第三事务未开始，cleanup verified，完整三事务仍未验收。
+最新 [Native50，准确候选 `12d4125`](https://github.com/69gg/MuLi/actions/runs/40191616906) 已全部终态：十项成功，原生和两个 Linux shard1 失败。Windows、macOS 与 Linux shard2 成功；Linux 3.12 shard1 的唯一失败是 `test_managed_host` 局部计量 wrapper 未接收 `verified_python`，不是生产身份门失败。该接缝已修为带类型的真实透传，原 await 两侧认证断言保留；连同同步确认、摘要证据和 guard 预算四文件 57 项通过（19.74 秒、76.8 MiB、swap 0）。新候选仍须完整远端复核。
+
+本轮原生 [job `121163611590`](https://github.com/69gg/MuLi/actions/runs/40191616906/job/121163611590) 仍为 `TimeoutError` / `helper_exit`，60001 毫秒截止。第一代已完整闭合，投影 45686 毫秒；第二代 47853 毫秒 prepared、54390 毫秒 draining、59195 毫秒 stop_base，第三代未开始。cleanup verified。仅取 2086 字节 evidence，SHA256 `a85f44541b0ee8352e499499bd1478fcc82be903df5b24198f153deb8d071c6c`，严格核对两成员及原合同，未下载 package。
+
+真实 `-m` 计量本轮首次得到 `host_record` 31 次 / 4414 毫秒；backend checks 为 141 次 / 20225 毫秒、bus 291 次 / 5399 毫秒、HTTP 13 次 / 1656 毫秒。checks 包括完整包枚举和读取，不能称为纯 Python SHA 成本，也不能据总耗时波动判定同步摘要复用没有执行。新计量补齐了观测，不代表三事务或 60 秒合同已通过。
+
+此前 [Native49，准确候选 `e135d4f`](https://github.com/69gg/MuLi/actions/runs/40188324609)：十二项通用作业全部成功，含 Windows；[原生作业 `121153750905`](https://github.com/69gg/MuLi/actions/runs/40188324609/job/121153750905) 仍失败。第一代完整闭合，最终投影为 42546 毫秒；第二次 POST 成功，44524 毫秒 prepared、51272 毫秒 draining、56476 毫秒 stop_base，60000 毫秒以 `TimeoutError` / `helper_exit` 结束。第三事务未开始，cleanup verified，完整三事务仍未验收。
 
 Native49 第一代 checks 为 141 次 / 19020 毫秒，仍是整项 backend 检查耗时，不能称为纯 SHA 成本。回执的 `host_record=0` 是观测缺口：hook 绑定 canonical `muli.managed_host`，实际 `-m` 入口执行于另一份 `__main__`，其调用未被包装；不能解释为没有认证或零成本。
 
-后续本地修正已在真实 `runpy __main__` 路径先复现 `host_record.count=0`，再通过全部 72 项成本回归。临时观测只在精确入口的 `main` 首次调用前绑定实际 `_record` 并撤下自身；未绑定不输出零成本，已有或后来安装的 profiler 均不覆盖。原异常、取消和文件认证仍委派原实现。这只证明离线漏绑修复，新的远端三事务结果仍待验收。
+后续本地修正已在真实 `runpy __main__` 路径先复现 `host_record.count=0`，再通过全部 72 项成本回归。临时观测只在精确入口的 `main` 首次调用前绑定实际 `_record` 并撤下自身；未绑定不输出零成本，已有或后来安装的 profiler 均不覆盖。原异常、取消和文件认证仍委派原实现。Native50 已取得非零真实计量，完整三事务结果仍未验收。
 
 同步 `_confirm` 的后续优化保留七次完整 guard、各槽文件重开与 package 扫描，只复用本次成功校验过且身份未变的 Python 摘要；不同调用重新计算。真实读取计量先得到三项准确首红，修后连同身份漂移负控及既有 backend、确认和恢复回归共 126 项通过（42.55 秒、83.3 MiB、swap 0）。此结果不代表整链七倍提速，也不代表原生 60 秒合同已通过。
 
@@ -20,7 +26,7 @@ Native48 只去除同一同步认证段内的重复工作：`_source` 已由 `ve
 
 Native48 第一代成本为 backend checks135 次 / 17645 毫秒、bus274 次 / 3552 毫秒、HTTP12 次 / 1346 毫秒。原 hook 没有计入 `managed_host._record` 的完整 anchor 与 Python 文件认证，因此 17645 毫秒不能当作全部哈希耗时。Native49 只补有界观测：version2 增加独立 `host_record` 次数/毫秒及固定 phase/intent 分桶，version1 仍严格可读，helper 身份与 32 KiB 总输出门不变。已绑定调用完整委派原函数，异常和取消原样传播，只沿既有 install-returned 快照与 atexit 保存，不逐次写盘、不增加 RPC。本地 canonical 入口首红及其后合计 991 项通过未覆盖上述真实 `-m` 漏绑，不构成观测完整、性能改善或远端三事务通过的证明。
 
-UIA 后续新增诊断的[当前合同](windows-uia-probe-diagnostics-design.md#固定阶段与一次性规则)为十六名称、十四处实际 emitter，旧 0–13 编号不变、14/15 仅追加；旧十四阶段的 512 字节样本保留。stderr 仍完整计费且只留 2048 字节前缀，整条 note 限 4096 字节，原 12 秒不变。本地 65 passed、6 Windows skipped，独立后审无 P1/P2；新增阶段与首达毫秒尚未远端验证，不能借用 Native49 的旧 Windows 成功记录。
+UIA 后续新增诊断的[当前合同](windows-uia-probe-diagnostics-design.md#固定阶段与一次性规则)为十六名称、十四处实际 emitter，旧 0–13 编号不变、14/15 仅追加；旧十四阶段的 512 字节样本保留。stderr 仍完整计费且只留 2048 字节前缀，整条 note 限 4096 字节，原 12 秒不变。本地 65 passed、6 Windows skipped，独立后审无 P1/P2；Native50 Windows 作业成功，尚无本轮失败现场的新阶段记录，不能推定 Native48 的超时根因已消失。
 
 ## 目标与范围
 

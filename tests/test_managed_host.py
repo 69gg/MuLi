@@ -31,13 +31,14 @@ from muli.managed_journal import advance_managed, read_snapshots
 from muli.managed_transaction import TransactionRecordV2, TransitionV2
 from muli.management_transaction import JournalControl, Role, TransactionError, TransactionJournal
 from muli.platforms.filesystem_identity import FilesystemError
-from muli.platforms.installation import HelperLimits
+from muli.platforms.installation import FileFingerprint, HelperLimits
 from muli.platforms.linux_transaction import HelperSnapshot
 from muli.platforms.managed_deployment import (
     DeploymentAnchor,
     ManagedDeploymentError,
     SlotIdentity,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.managed_probe import ManagedSystemdProbe
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed helper/real locks")
@@ -391,10 +392,21 @@ async def test_real_host_authentication_hashes_controller_once_on_each_side_of_h
     original_files = deployment_module.verify_slot_files
     original_process = deployment_module.verify_current_process
 
-    def files(slot: SlotIdentity) -> None:
+    def files(
+        slot: SlotIdentity,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
         assert slot == authentic_current_process
         events.append("files")
-        original_files(slot)
+        original_files(
+            slot,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
 
     def process(slot: SlotIdentity) -> None:
         events.append("process")

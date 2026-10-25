@@ -436,9 +436,17 @@ def track_slot_scans(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     scans: list[Path] = []
     fingerprint = managed_launcher.package_fingerprint
 
-    def observed(root: Path, limits: Mapping[str, int]) -> dict[str, object]:
+    def observed(
+        root: Path,
+        limits: Mapping[str, int],
+        *,
+        verified: dict[str, dict[str, Any]] | None = None,
+        observed: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, object]:
         scans.append(root)
-        return fingerprint(root, limits)
+        if verified is None and observed is None:
+            return fingerprint(root, limits)
+        return fingerprint(root, limits, verified=verified, observed=observed)
 
     monkeypatch.setattr(managed_launcher, "package_fingerprint", observed)
     return scans

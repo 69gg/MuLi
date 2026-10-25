@@ -47,6 +47,7 @@ from muli.platforms.managed_deployment import (
     SelectorValue,
     SlotIdentity,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.managed_probe import (
     ManagedProbeResult,
     ManagedSystemdProbe,
@@ -321,6 +322,8 @@ class ObservedBackend(ManagedLinuxBackend):
         role: Role | None = None,
         *,
         verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
         from muli.platforms import managed_backend, managed_deployment
 
@@ -331,23 +334,48 @@ class ObservedBackend(ManagedLinuxBackend):
         selected_verify = cast(Callable[..., None], vars(managed_backend)["verify_slot_files"])
 
         def controller(
-            slot: SlotIdentity, *, verified_python: FileFingerprint | None = None
+            slot: SlotIdentity,
+            *,
+            verified_python: FileFingerprint | None = None,
+            verified_packages: PackageProofs | None = None,
+            observed_packages: PackageProofs | None = None,
         ) -> None:
             before = time.monotonic()
             self.controller_calls += 1
             try:
-                if verified_python is None:
+                if verified_packages is not None or observed_packages is not None:
+                    controller_verify(
+                        slot,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
+                elif verified_python is None:
                     controller_verify(slot)
                 else:
                     controller_verify(slot, verified_python=verified_python)
             finally:
                 self.controller_seconds += time.monotonic() - before
 
-        def selected(slot: SlotIdentity, *, verified_python: FileFingerprint | None = None) -> None:
+        def selected(
+            slot: SlotIdentity,
+            *,
+            verified_python: FileFingerprint | None = None,
+            verified_packages: PackageProofs | None = None,
+            observed_packages: PackageProofs | None = None,
+        ) -> None:
             before = time.monotonic()
             self.selected_calls += 1
             try:
-                selected_verify(slot, verified_python=verified_python)
+                if verified_packages is None and observed_packages is None:
+                    selected_verify(slot, verified_python=verified_python)
+                else:
+                    selected_verify(
+                        slot,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
             finally:
                 self.selected_seconds += time.monotonic() - before
 
@@ -358,7 +386,15 @@ class ObservedBackend(ManagedLinuxBackend):
                 patch.object(managed_deployment, "verify_slot_files", controller),
                 patch.object(managed_backend, "verify_slot_files", selected),
             ):
-                if verified_python is None:
+                if verified_packages is not None or observed_packages is not None:
+                    super()._check(
+                        record,
+                        role,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
+                elif verified_python is None:
                     super()._check(record, role)
                 else:
                     super()._check(record, role, verified_python=verified_python)

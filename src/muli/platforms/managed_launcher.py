@@ -38,6 +38,8 @@ _PHASES = {
     "recovery_required",
 }
 
+type PackageProofs = dict[str, dict[str, dict[str, Any]]]
+
 
 class LaunchError(ValueError):
     """Never include private paths, raw records or exception text in a result."""
@@ -202,42 +204,50 @@ def read_file(path: Path, limit: int, *, private: bool = False) -> tuple[bytes, 
         return read_at(descriptor, path.name, limit, private=private)
 
 
+def _fingerprint_at(
+    parent: int,
+    name: str,
+    path: Path,
+    limit: int,
+    *,
+    verified: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    hashed, size = hashlib.sha256(), 0
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
+    )
+    with os.fdopen(descriptor, "rb") as source:
+        before = identity(os.fstat(source.fileno()))
+        if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
+            raise LaunchError("managed_file_unsupported")
+        # Reusing bytes never replaces this file's independent open, budget
+        # check, or descriptor and path identity checks.
+        if (
+            verified is not None
+            and verified.get("path") == str(path)
+            and verified.get("identity") == before
+            and type(verified.get("digest")) is str
+            and _DIGEST.fullmatch(verified["digest"]) is not None
+        ):
+            checksum = verified["digest"]
+        else:
+            while chunk := source.read(min(65_536, limit - size + 1)):
+                size += len(chunk)
+                if size > limit:
+                    raise LaunchError("managed_file_unsupported")
+                hashed.update(chunk)
+            checksum = hashed.hexdigest()
+        after = identity(os.fstat(source.fileno()))
+    if before != after or before != identity(os.stat(name, dir_fd=parent, follow_symlinks=False)):
+        raise LaunchError("managed_file_changed")
+    return {"path": str(path), "identity": before, "digest": checksum}
+
+
 def fingerprint(
     path: Path, limit: int, *, verified: dict[str, Any] | None = None
 ) -> dict[str, object]:
-    hashed, size = hashlib.sha256(), 0
     with directory(path.parent) as parent:
-        descriptor = os.open(
-            path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
-        )
-        with os.fdopen(descriptor, "rb") as source:
-            before = identity(os.fstat(source.fileno()))
-            if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
-                raise LaunchError("managed_file_unsupported")
-            # This optional evidence belongs to one caller's synchronous
-            # verification. Reopen and check this file independently even
-            # when another retained slot just authenticated the same bytes.
-            if (
-                verified is not None
-                and verified.get("path") == str(path)
-                and verified.get("identity") == before
-                and type(verified.get("digest")) is str
-                and _DIGEST.fullmatch(verified["digest"]) is not None
-            ):
-                checksum = verified["digest"]
-            else:
-                while chunk := source.read(min(65_536, limit - size + 1)):
-                    size += len(chunk)
-                    if size > limit:
-                        raise LaunchError("managed_file_unsupported")
-                    hashed.update(chunk)
-                checksum = hashed.hexdigest()
-            after = identity(os.fstat(source.fileno()))
-        if before != after or before != identity(
-            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        ):
-            raise LaunchError("managed_file_changed")
-    return {"path": str(path), "identity": before, "digest": checksum}
+        return _fingerprint_at(parent, path.name, path, limit, verified=verified)
 
 
 def python_fingerprint(
@@ -277,7 +287,13 @@ def python_fingerprint(
     return result
 
 
-def package_fingerprint(root: Path, limits: Mapping[str, int]) -> dict[str, object]:
+def package_fingerprint(
+    root: Path,
+    limits: Mapping[str, int],
+    *,
+    verified: dict[str, dict[str, Any]] | None = None,
+    observed: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, object]:
     """Hash a bounded, no-link package without importing it or reading pyc files."""
     hashed = hashlib.sha256()
     visited, files, size = 0, 0, 0
@@ -315,12 +331,20 @@ def package_fingerprint(root: Path, limits: Mapping[str, int]) -> dict[str, obje
                 finally:
                     os.close(child)
             else:
-                data, info = read_at(
-                    descriptor, name, min(limits["file_bytes"], limits["total_bytes"] - size)
+                path = root / relative
+                proof = _fingerprint_at(
+                    descriptor,
+                    name,
+                    path,
+                    min(limits["file_bytes"], limits["total_bytes"] - size),
+                    verified=None if verified is None else verified.get(str(path)),
                 )
+                info = _dict(proof["identity"])
                 size += info["size"]
                 files += 1
-                hashed.update(canonical([relative, info["size"], digest(data)]) + b"\n")
+                hashed.update(canonical([relative, info["size"], proof["digest"]]) + b"\n")
+                if observed is not None:
+                    observed[str(path)] = proof
         if before != identity(os.fstat(descriptor)):
             raise LaunchError("managed_directory_changed")
 
@@ -362,7 +386,11 @@ def _limits(value: object) -> dict[str, int]:
 
 
 def verify_slot_files(
-    slot: dict[str, Any], *, verified_python: dict[str, Any] | None = None
+    slot: dict[str, Any],
+    *,
+    verified_python: dict[str, Any] | None = None,
+    verified_packages: PackageProofs | None = None,
+    observed_packages: PackageProofs | None = None,
 ) -> None:
     _version(slot)
     prefix = absolute(slot.get("prefix"))
@@ -394,9 +422,29 @@ def verify_slot_files(
         or metadata["handoff_protocol"] != 2
         or metadata.get("requires_migration") is not False
         or metadata != slot.get("compatibility")
-        or package_fingerprint(root, limits) != package
     ):
         raise LaunchError("managed_slot_changed")
+    if verified_packages is None and observed_packages is None:
+        if package_fingerprint(root, limits) != package:
+            raise LaunchError("managed_slot_changed")
+    else:
+        # The complete slot includes its exact package root and all limits.
+        # Neither its aggregate package digest nor another role grants leaf
+        # evidence for this scope.
+        scope = digest(canonical(slot))
+        leaves: dict[str, dict[str, Any]] = {}
+        if (
+            package_fingerprint(
+                root,
+                limits,
+                verified=None if verified_packages is None else verified_packages.get(scope),
+                observed=leaves,
+            )
+            != package
+        ):
+            raise LaunchError("managed_slot_changed")
+        if observed_packages is not None:
+            observed_packages[scope] = leaves
 
 
 def _content(root: Path, prefix: str, expected: str) -> tuple[dict[str, Any], bytes]:
