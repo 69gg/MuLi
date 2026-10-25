@@ -21,6 +21,7 @@ from muli.store import Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
 from .types import (
+    MAX_OUTGOING_TEXT_CHARS,
     NAMES,
     ChannelError,
     ChannelsConfig,
@@ -224,6 +225,11 @@ class ChannelManager:
     def _outbox_guard(
         self, name: str, route: Mapping[str, Any], payload: Mapping[str, Any]
     ) -> None:
+        if name == "onebot":
+            try:
+                self._route(name, route, outbound=True)
+            except ChannelError as error:
+                raise _BlockedDelivery(str(error), status_code=error.status_code) from None
         if payload.get("automatic"):
             self._automatic_guard(name, route, payload.get("attention_routing"))
         if "approval_notice" not in payload:
@@ -317,6 +323,8 @@ class ChannelManager:
         profile = self.config.profile(name)
         if not profile.enabled:
             raise ChannelError("渠道未启用", status_code=404)
+        # This shared gate also covers direct receive(), before fingerprints,
+        # attachment staging or a durable inbound receipt can be created.
         route = self._route(
             name,
             {
@@ -599,7 +607,10 @@ class ChannelManager:
         automatic: bool = False,
         attention_routing: dict[str, Any] | None = None,
         approval_notice: ApprovalNotice | None = None,
+        admission_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        if admission_guard is not None:
+            admission_guard()
         profile = self.config.profile(name)
         metadata = (
             FrozenRouting.load(attention_routing).dump() if attention_routing is not None else None
@@ -656,7 +667,7 @@ class ChannelManager:
                 raise ChannelError("当前渠道适配器不支持原生语音发送")
         if (
             not isinstance(text, str)
-            or len(text) > 100000
+            or len(text) > MAX_OUTGOING_TEXT_CHARS
             or len(attachment_ids) > profile.max_attachments
         ):
             raise ChannelError("渠道文本或附件数量超过上限")
@@ -697,6 +708,8 @@ class ChannelManager:
             parts.append(part)
         if self._closed:
             raise ChannelError("渠道管理器已关闭，请使用当前配置重新发送")
+        if admission_guard is not None:
+            admission_guard()
         payload: dict[str, Any] = {"parts": parts}
         if automatic:
             payload["automatic"] = True
@@ -1069,43 +1082,9 @@ class ChannelManager:
                         self._errors["approval_notice"] = str(error)
                     except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
                         self._errors["approval_notice"] = "审批通知来源或摘要无法核验，保留在 Web"
-                if event["type"] == "message.completed":
-                    message = event["data"].get("message", {})
-                    if (
-                        isinstance(message, dict)
-                        and message.get("role") == "assistant"
-                        and not message.get("interrupted")
-                    ):
-                        routes = message.get("delivery_routes", [])
-                        if isinstance(routes, list):
-                            for route in routes[:1]:
-                                if isinstance(route, dict) and route.get("name") in NAMES:
-                                    try:
-                                        await self.enqueue(
-                                            route["name"],
-                                            route.get("target", ""),
-                                            str(message.get("content") or ""),
-                                            message.get("attachment_ids", []),
-                                            event_id=str(message.get("id") or event["id"]),
-                                            route=route,
-                                            automatic=True,
-                                            attention_routing=message.get("attention_routing"),
-                                        )
-                                    except ChannelError as error:
-                                        if error.retryable:
-                                            # Keep the cursor; outbox completion emits a wakeup.
-                                            async with self.bus.changed:
-                                                await self.bus.changed.wait_for(changed)
-                                            break
-                                        self._errors[str(route["name"])] = str(error)
-                                    except Exception as error:
-                                        # One invalid/deleted attachment must not stop all later replies.
-                                        self._errors[str(route["name"])] = type(error).__name__
-                            else:
-                                after = event["id"]
-                                self._set_state("events", str(after))
-                                continue
-                            break
+                # Assistant text/reasoning and tool activity stay in WebUI.
+                # External deliveries require an explicit enqueue; the approval
+                # protocol above retains its own host-authorized notification.
                 after = event["id"]
                 self._set_state("events", str(after))
             else:

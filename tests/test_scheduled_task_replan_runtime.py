@@ -10,7 +10,6 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_mobile_task_control_followup import (
     assert_one_replan,
     command_code,
@@ -177,7 +176,24 @@ async def exercise_original_task_schedule(
             current = rounds[phase]
             if phase == "assignment":
                 if current == 1:
-                    assert any(message.content == assignment for message in messages)
+                    incoming = next(
+                        message
+                        for message in messages
+                        if message.role == "user" and message.content.endswith(assignment)
+                    )
+                    header, content = incoming.content.split("\n", 1)
+                    assert header.startswith(
+                        "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                    )
+                    assert json.loads(header.split("：", 1)[1]) == {
+                        "channel": "onebot",
+                        "account_id": "123",
+                        "sender_id": "7",
+                        "target": "7",
+                        "kind": "private",
+                        "input_id": incoming.source_message_id,
+                    }
+                    assert content == assignment
                     turn = ModelTurn(
                         tool_calls=[
                             call("save-original", "commitment_save", title="项目核查", brief=brief)
@@ -201,9 +217,23 @@ async def exercise_original_task_schedule(
                     worker_id = tool_result(messages, "spawn-original")["id"]
                     turn = ModelTurn(content=assigned_reply)
             elif phase == "other":
-                assert current == 1 and any(
-                    message.content == other_request for message in messages
+                assert current == 1
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(other_request)
                 )
+                header, content = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": "onebot",
+                    "account_id": "123",
+                    "sender_id": "8",
+                    "target": "8",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert content == other_request
                 turn = ModelTurn(content=other_reply)
             elif phase == "replan":
                 run_id = active.run_ids[main_id]
@@ -263,7 +293,24 @@ async def exercise_original_task_schedule(
                 active_run = active.run_ids[main_id]
                 if current == 1:
                     schedule_run = active_run
-                    assert any(message.content == schedule_request for message in messages)
+                    incoming = next(
+                        message
+                        for message in messages
+                        if message.role == "user" and message.content.endswith(schedule_request)
+                    )
+                    header, content = incoming.content.split("\n", 1)
+                    assert header.startswith(
+                        "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                    )
+                    assert json.loads(header.split("：", 1)[1]) == {
+                        "channel": "onebot",
+                        "account_id": "123",
+                        "sender_id": "7",
+                        "target": "7",
+                        "kind": "private",
+                        "input_id": incoming.source_message_id,
+                    }
+                    assert content == schedule_request
                     turn = ModelTurn(
                         tool_calls=[
                             ToolCall(
@@ -445,7 +492,22 @@ async def exercise_original_task_schedule(
                 assert runtime.tool_session_id == main_id
                 request = runtime.request_context(main_id)
                 assert request is not None
-                assert any(message.content == schedule_request for message in request.messages)
+                incoming = next(
+                    message
+                    for message in request.messages
+                    if message.role == "user" and message.content.endswith(schedule_request)
+                )
+                header, content = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": "onebot",
+                    "account_id": "123",
+                    "sender_id": "7",
+                    "target": "7",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert content == schedule_request
                 origin = request.reply_origin.dump()
                 assert origin["kind"] == "channel" and origin["route"]["target"] == "7"
                 # Pause alone must not manufacture a future replan approval.
@@ -479,11 +541,17 @@ async def exercise_original_task_schedule(
             reply = completed(runtime, schedule_reply)[0]
             assert reply["reply_origin"] == owner["reply_origin"]
             await processed_reply(runtime, manager, reply["id"])
-            delivery = next(
+            deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == schedule_reply
-            )
-            assert (await terminal(manager, delivery["id"]))["state"] == "sent"
+            ]
+            assert deliveries == []
+            history = await web.get(f"/api/sessions/{main_id}/messages")
+            assert history.status_code == 200
             assert any(
+                item["id"] == reply["id"] and item["content"] == schedule_reply
+                for item in history.json()["messages"]
+            )
+            assert not any(
                 str(item["user_id"]) == "7"
                 and any(part["data"]["text"] == schedule_reply for part in item["message"])
                 for item in sent
@@ -508,10 +576,10 @@ async def exercise_original_task_schedule(
             other_message = completed(runtime, other_reply)[0]
             assert other_message["reply_origin"]["route"]["target"] == "8"
             await processed_reply(runtime, manager, other_message["id"])
-            other_delivery = next(
+            other_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == other_reply
-            )
-            assert (await terminal(manager, other_delivery["id"]))["state"] == "sent"
+            ]
+            assert other_deliveries == []
             assert runtime.task_control_current(task_id)["control"] == control
             assert not any(
                 item["action"] == "request_replan"
@@ -619,11 +687,10 @@ async def exercise_original_task_schedule(
             planned_message = completed(reopened, replan_reply)[0]
             assert planned_message["reply_origin"] == owner["reply_origin"]
             await processed_reply(reopened, manager, planned_message["id"])
-            planned_delivery = next(
+            planned_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == replan_reply
-            )
-            assert (await terminal(manager, planned_delivery["id"]))["state"] == "sent"
-            assert planned_delivery["route"]["target"] == "7"
+            ]
+            assert planned_deliveries == []
             phase = "completion"
             allow_worker_final.set()
             await wait_agent(reopened, worker_id, "completed")
@@ -641,11 +708,10 @@ async def exercise_original_task_schedule(
             final_message = completed(reopened, completion_reply)[0]
             assert final_message["reply_origin"] == owner["reply_origin"]
             await processed_reply(reopened, manager, final_message["id"])
-            final_delivery = next(
+            final_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == completion_reply
-            )
-            assert (await terminal(manager, final_delivery["id"]))["state"] == "sent"
-            assert final_delivery["route"]["target"] == "7"
+            ]
+            assert final_deliveries == []
             actual_sent = [
                 (str(item["user_id"]), "".join(part["data"]["text"] for part in item["message"]))
                 for item in sent
@@ -653,13 +719,13 @@ async def exercise_original_task_schedule(
             assert (
                 actual_sent.count(("7", replan_reply))
                 == actual_sent.count(("7", completion_reply))
-                == 1
+                == 0
             )
             assert ("8", replan_reply) not in actual_sent and (
                 "8",
                 completion_reply,
             ) not in actual_sent
-            assert actual_sent.count(("8", other_reply)) == 1
+            assert actual_sent.count(("8", other_reply)) == 0
             assert draft.read_text(encoding="utf-8") == draft_text and not forbidden.exists()
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200

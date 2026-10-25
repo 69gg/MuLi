@@ -13,7 +13,6 @@ import httpx
 import pytest
 from test_attention import attention_inputs
 from test_attention import eventually as attention_eventually
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_reminders import ObservedEvent
 from test_runtime import FakeClient, make_runtime
@@ -431,8 +430,7 @@ async def _reschedule_journey(
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == followup["reply"]
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "7"
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+            assert deliveries == []
             response = await web.get(f"/api/sessions/{main_id}/messages", params={"limit": 1})
             assert (
                 response.status_code == 200
@@ -451,7 +449,7 @@ async def _reschedule_journey(
                         if delivery_text(item) == followup["reply"]
                     ]
                 )
-                == 1
+                == 0
             )
             assert all(len(messages) <= 32 for messages in seen["followup"])
             await asyncio.wait_for(reopened_app.state.close(), 3)

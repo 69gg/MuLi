@@ -1,7 +1,7 @@
 """A bound owner's raw phone command resolves a real live permission waiter.
 
 The model policy is fixed; Runtime, Team, OneBot ingress, approval futures,
-filesystem effects and automatic outbox delivery retain their real lifecycle.
+filesystem effects and protocol-notification outbox delivery retain their real lifecycle.
 """
 
 from __future__ import annotations
@@ -106,9 +106,22 @@ async def test_onebot_owner_approves_live_worker_without_retargeting_result(
             role = "assignment" if main_rounds <= 2 else "report"
             assert runs.setdefault(role, runtime.run_ids[main_id]) == runtime.run_ids[main_id]
             if main_rounds == 1:
-                assert any(
-                    message.role == "user" and message.content == assignment for message in messages
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(assignment)
                 )
+                header, content = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": "onebot",
+                    "account_id": "123",
+                    "sender_id": "7",
+                    "target": "7",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert content == assignment
                 assert "spawn_agent" in {tool["function"]["name"] for tool in tools}
                 turn = ModelTurn(
                     tool_calls=[
@@ -336,7 +349,7 @@ async def test_onebot_owner_approves_live_worker_without_retargeting_result(
             result_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == final_reply
             ]
-            assert len(result_deliveries) == 1 and result_deliveries[0]["route"]["target"] == "7"
+            assert result_deliveries == []
             confirmation = [
                 item
                 for item in manager.deliveries()
@@ -348,7 +361,7 @@ async def test_onebot_owner_approves_live_worker_without_retargeting_result(
                 for item in platform_calls
                 if "".join(segment["data"]["text"] for segment in item["message"]) == final_reply
             ]
-            assert len(actual_replies) == 1 and str(actual_replies[0]["user_id"]) == "7"
+            assert actual_replies == []
             assert all(
                 str(item["user_id"]) == "7"
                 for item in platform_calls

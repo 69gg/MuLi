@@ -170,12 +170,12 @@ async def test_main_replies_with_a_real_child_file_on_the_requesting_private_cha
                 turn = ModelTurn(content=report_reply)
             elif phase == "other":
                 assert current == 1
-                assert any(message.content == other_input for message in messages)
+                assert any(message.content.endswith(other_input) for message in messages)
                 turn = ModelTurn(content=other_reply)
             else:
                 assert phase == "files"
                 assert reported_attachment and any(
-                    message.content == request_files for message in messages
+                    message.content.endswith(request_files) for message in messages
                 )
                 if current == 1:
                     reply_files_available = "channel_reply_files" in names
@@ -528,7 +528,7 @@ async def test_unknown_file_reply_survives_reopen_and_exact_envelope_replay_with
             else:
                 assert phase == "files" and observed_attachment
                 if current == 1:
-                    assert any(message.content == request_files for message in messages)
+                    assert any(message.content.endswith(request_files) for message in messages)
                     assert any(tool["function"]["name"] == "channel_reply_files" for tool in tools)
                     turn = ModelTurn(
                         tool_calls=[
@@ -702,7 +702,7 @@ async def test_unknown_file_reply_survives_reopen_and_exact_envelope_replay_with
                 == active_runtime.run_ids[main_id]
             )
             if current == 1:
-                assert any(message.content == reopened_input for message in messages)
+                assert any(message.content.endswith(reopened_input) for message in messages)
                 turn = ModelTurn(tool_calls=[call("status-after-reopen", "channel_status")])
             else:
                 assert current == 2
@@ -760,8 +760,7 @@ async def test_unknown_file_reply_survives_reopen_and_exact_envelope_replay_with
                 for item in reopened_manager.deliveries()
                 if any(part.get("text") == reopened_reply for part in item["payload"]["parts"])
             ]
-            assert len(matching) == 1
-            assert (await terminal(reopened_manager, matching[0]["id"]))["state"] == "sent"
+            assert matching == []
             assert reopened_manager.delivery(unknown["id"]) == unknown and len(files) == 1
             assert [
                 item["id"]

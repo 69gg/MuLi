@@ -158,7 +158,22 @@ async def approval_notice_journey(
                 role = "other" if main_rounds == 3 else "report"
             assert runs.setdefault(role, runtime.run_ids[main_id]) == runtime.run_ids[main_id]
             if main_rounds == 1:
-                assert any(message.content == assignment for message in messages)
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(assignment)
+                )
+                header, text = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": channel,
+                    "account_id": "123",
+                    "sender_id": "7",
+                    "target": "7",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert text == assignment
                 turn = ModelTurn(
                     tool_calls=[
                         call(
@@ -175,7 +190,22 @@ async def approval_notice_journey(
                 worker_id = str(spawned["id"])
                 turn = ModelTurn(content=acknowledgement)
             elif main_rounds == 3:
-                assert any(message.content == other_input for message in messages)
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(other_input)
+                )
+                header, text = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": channel,
+                    "account_id": "123",
+                    "sender_id": "8",
+                    "target": "8",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert text == other_input
                 assert not target.exists()
                 turn = ModelTurn(content=other_reply)
             else:
@@ -433,8 +463,13 @@ async def approval_notice_journey(
                 stopped_deliveries = [
                     item for item in manager.deliveries() if delivery_text(item) == stopped_reply
                 ]
-                assert len(stopped_deliveries) == 1
-                assert (await terminal(manager, stopped_deliveries[0]["id"]))["state"] == "sent"
+                assert stopped_deliveries == []
+                history = await web.get(f"/api/sessions/{main_id}/messages")
+                assert history.status_code == 200
+                assert any(
+                    message["id"] == stopped_message["id"] and message["content"] == stopped_reply
+                    for message in history.json()["messages"]
+                )
                 assert manager.delivery(notice["id"]) == unknown_notice
                 assert write_events("tool.started") == [] and not target.exists()
             else:
@@ -458,9 +493,7 @@ async def approval_notice_journey(
                 deliveries = [
                     item for item in manager.deliveries() if delivery_text(item) == final_reply
                 ]
-                assert len(deliveries) == 1
-                assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
-                assert deliveries[0]["route"] == origin["route"]
+                assert deliveries == []
                 history = await web.get(f"/api/sessions/{main_id}/messages")
                 assert history.status_code == 200
                 assert any(

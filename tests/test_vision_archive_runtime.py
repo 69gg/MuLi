@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_media import PNG
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_runtime import FakeClient, make_runtime
@@ -345,8 +344,13 @@ async def test_archived_vision_survives_compaction_reopen_and_current_phone_retr
             initial = [
                 item for item in manager.deliveries() if delivery_text(item) == replies["archive"]
             ]
-            assert len(initial) == 1 and initial[0]["route"]["target"] == "7"
-            assert (await terminal(manager, initial[0]["id"]))["state"] == "sent"
+            assert initial == []
+            history = await web.get(f"/api/sessions/{main_id}/messages")
+            assert history.status_code == 200
+            assert any(
+                item["id"] == first_reply["id"] and item["content"] == replies["archive"]
+                for item in history.json()["messages"]
+            )
 
             phase = "background"
             created = await web.post(
@@ -427,8 +431,7 @@ async def test_archived_vision_survives_compaction_reopen_and_current_phone_retr
             delivered = [
                 item for item in manager.deliveries() if delivery_text(item) == replies["recover"]
             ]
-            assert len(delivered) == 1 and delivered[0]["route"]["target"] == "8"
-            assert (await terminal(manager, delivered[0]["id"]))["state"] == "sent"
+            assert delivered == []
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200 and any(
                 item["id"] == final["id"] for item in history.json()["messages"]

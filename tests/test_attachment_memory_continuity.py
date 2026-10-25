@@ -12,7 +12,6 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, completed, eventually, tool_result
@@ -112,10 +111,24 @@ async def test_owner_explicitly_collects_uploaded_utf8_through_the_real_phone_ru
             assert runs.setdefault(phase, runtime.run_ids[main_id]) == runtime.run_ids[main_id]
             if phase == "receive":
                 if rounds[phase] == 1:
-                    assert any(
-                        item.role == "user" and item.content == owner_messages[phase]
+                    incoming = next(
+                        item
                         for item in messages
+                        if item.role == "user" and item.content.endswith(owner_messages[phase])
                     )
+                    header, content = incoming.content.split("\n", 1)
+                    assert header.startswith(
+                        "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                    )
+                    assert json.loads(header.split("：", 1)[1]) == {
+                        "channel": "onebot",
+                        "account_id": "123",
+                        "sender_id": "7",
+                        "target": "7",
+                        "kind": "private",
+                        "input_id": incoming.source_message_id,
+                    }
+                    assert content == owner_messages[phase]
                     turn = ModelTurn(
                         tool_calls=[call("find-upload", "attachment_search", name_query=filename)]
                     )
@@ -186,10 +199,15 @@ async def test_owner_explicitly_collects_uploaded_utf8_through_the_real_phone_ru
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == replies[phase]
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "7"
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+            assert deliveries == []
+            history = await web.get(f"/api/sessions/{main_id}/messages")
+            assert history.status_code == 200
+            assert any(
+                item["id"] == received["id"] and item["content"] == replies[phase]
+                for item in history.json()["messages"]
+            )
             # Real upload, owner ingress, directory lookup, main completion and
-            # original private delivery all precede the explicit collection.
+            # Web persistence all precede the explicit collection.
             assert runtime.memory.source(source_id) is None
             assert app.state.memory_application.pipeline.job(source_id) is None
 
@@ -728,8 +746,13 @@ async def test_collected_attachment_survives_compaction_cross_phone_reopen_and_f
                         for item in manager.deliveries()
                         if delivery_text(item) == replies["collect"]
                     ]
-                    assert len(delivered) == 1 and delivered[0]["route"]["target"] == "7"
-                    assert (await terminal(manager, delivered[0]["id"]))["state"] == "sent"
+                    assert delivered == []
+                    visible = await web.get(f"/api/sessions/{main_id}/messages")
+                    assert visible.status_code == 200
+                    assert any(
+                        item["id"] == collected["id"] and item["content"] == replies["collect"]
+                        for item in visible.json()["messages"]
+                    )
                     await speak(
                         web,
                         "other",
@@ -822,8 +845,7 @@ async def test_collected_attachment_survives_compaction_cross_phone_reopen_and_f
                         for item in manager.deliveries()
                         if delivery_text(item) == replies["recall"]
                     ]
-                    assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "8"
-                    assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+                    assert deliveries == []
                     visible = await web.get(f"/api/sessions/{main_id}/messages")
                     assert visible.status_code == 200
                     assert any(

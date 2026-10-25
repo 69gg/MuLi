@@ -11,7 +11,6 @@ from typing import Any
 import httpx
 import pytest
 from test_attachment_memory_continuity import attachment_settings, platform_reply
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, completed, eventually, tool_result
@@ -106,7 +105,24 @@ async def test_phone_owner_discovers_an_interrupted_direct_child_after_normal_re
                 if phase == "assignment":
                     assert rounds[phase] <= 2
                     if rounds[phase] == 1:
-                        assert any(m.role == "user" and m.content == assignment for m in messages)
+                        incoming = next(
+                            m
+                            for m in messages
+                            if m.role == "user" and m.content.endswith(assignment)
+                        )
+                        header, content = incoming.content.split("\n", 1)
+                        assert header.startswith(
+                            "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                        )
+                        assert json.loads(header.split("：", 1)[1]) == {
+                            "channel": "onebot",
+                            "account_id": "123",
+                            "sender_id": "7",
+                            "target": "7",
+                            "kind": "private",
+                            "input_id": incoming.source_message_id,
+                        }
+                        assert content == assignment
                         turn = ModelTurn(
                             tool_calls=[
                                 call(
@@ -126,7 +142,22 @@ async def test_phone_owner_discovers_an_interrupted_direct_child_after_normal_re
                 else:
                     assert phase == "discovery" and rounds[phase] <= 4
                     if rounds[phase] == 1:
-                        assert any(m.role == "user" and m.content == question for m in messages)
+                        incoming = next(
+                            m for m in messages if m.role == "user" and m.content.endswith(question)
+                        )
+                        header, content = incoming.content.split("\n", 1)
+                        assert header.startswith(
+                            "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                        )
+                        assert json.loads(header.split("：", 1)[1]) == {
+                            "channel": "onebot",
+                            "account_id": "123",
+                            "sender_id": "8",
+                            "target": "8",
+                            "kind": "private",
+                            "input_id": incoming.source_message_id,
+                        }
+                        assert content == question
                         tool = next(
                             t for t in tools if t["function"]["name"] == "conversation_read"
                         )
@@ -248,8 +279,13 @@ async def test_phone_owner_discovers_an_interrupted_direct_child_after_normal_re
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == acknowledgement
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "7"
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+            assert deliveries == []
+            history = await web.get(f"/api/sessions/{main_id}/messages")
+            assert history.status_code == 200
+            assert any(
+                item["id"] == reply["id"] and item["content"] == acknowledgement
+                for item in history.json()["messages"]
+            )
             assert not release.is_set() and not cancelled.is_set()
         assert cancelled.is_set(), "normal lifespan close must settle the real running worker"
     finally:
@@ -293,9 +329,7 @@ async def test_phone_owner_discovers_an_interrupted_direct_child_after_normal_re
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == explanation
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "8"
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
-            assert len(sent) == len(before_sent) + 1 and str(sent[-1]["user_id"]) == "8"
+            assert deliveries == [] and sent == before_sent
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200
             assert any(
@@ -313,7 +347,7 @@ async def test_phone_owner_discovers_an_interrupted_direct_child_after_normal_re
             ]
             assert len(effects) == 1 and effects[0]["data"]["call_id"] == "read-before-close"
             assert evidence_path.read_bytes() == evidence_body.encode("utf-8")
-            # All real ingress, close/reopen, current phone delivery and original
+            # All real ingress, close/reopen, current Web reply and original
             # evidence preconditions precede this precise missing-schema target.
             assert schema_available, "conversation_read lacks the explicit continuations section"
             assert "error" not in catalog

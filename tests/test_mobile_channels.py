@@ -200,7 +200,12 @@ async def test_onebot_requires_matching_explicit_account_and_complete_raw_text_a
     else:
         payload.update(message_type="group", group_id=99)
     async with httpx.AsyncClient(transport=httpx.MockTransport(unused)) as client:
-        message = OneBot(configuration, client).webhook(payload)[0]
+        messages = OneBot(configuration, client).webhook(payload)
+        if change in {"self_id", "self_id_type", "notice", "group"}:
+            assert messages == ()
+            return
+        assert len(messages) == 1
+        message = messages[0]
         assert message.control_text == message.control_account_id == ""
 
 
@@ -469,7 +474,7 @@ async def test_application_final_guard_rejects_waiting_control_and_completed_rep
             async with asyncio.timeout(2):
                 await entered.wait()
             if change == "configuration":
-                runtime.config.update({"channels": {"onebot": {"owner_ids": []}}})
+                runtime.config.update({"channels": {"onebot": {"enabled": False, "owner_ids": []}}})
             elif change == "generation":
                 application._generation += 1
             else:
@@ -683,7 +688,7 @@ async def test_application_real_runtime_final_revocation_is_403(
                 runtime.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 1
             )
             if change == "configuration":
-                runtime.config.update({"channels": {"onebot": {"owner_ids": []}}})
+                runtime.config.update({"channels": {"onebot": {"enabled": False, "owner_ids": []}}})
             elif change == "generation":
                 application._generation += 1
             else:

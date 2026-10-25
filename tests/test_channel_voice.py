@@ -18,6 +18,7 @@ from muli.channels import ChannelError, ChannelsConfig
 from muli.channels import manager as channel_manager
 from muli.channels.adapters import QQ
 from muli.channels.types import FileContent
+from muli.providers import ModelTurn, ToolCall
 
 MP3 = b"ID3\x04\x00\x00FAKE_AUDIO"
 OPUS = b"OggS" + b"\x00" * 24 + b"OpusHead" + b"\x00" * 12
@@ -183,6 +184,13 @@ async def test_onebot_voice_queries_capability_and_sends_base64_record(
         identifier = await audio(harness.attachments)
         target = "99" if group else "7"
         route = {"sender_id": "7", "target": target, "kind": "group" if group else "private"}
+        if group:
+            with pytest.raises(ChannelError, match="私聊"):
+                await harness.manager.enqueue(
+                    "onebot", target, attachment_ids=[identifier], route=route, media_mode="voice"
+                )
+            assert calls == [] and harness.manager.deliveries() == []
+            return
         item = await harness.manager.enqueue(
             "onebot", target, attachment_ids=[identifier], route=route, media_mode="voice"
         )
@@ -430,7 +438,8 @@ async def test_shutdown_distinguishes_voice_capability_query_from_started_send(
 
 
 async def test_channel_send_exposes_voice_and_stable_tool_idempotency(tmp_path: Path) -> None:
-    runtime, _ = make_runtime(tmp_path, [])
+    turns: list[ModelTurn] = []
+    runtime, seen = make_runtime(tmp_path, turns)
     runtime.config.update(
         {"channels": {"telegram": {"enabled": True, "owner_ids": ["7"], "token": "123:FAKE"}}}
     )
@@ -447,13 +456,34 @@ async def test_channel_send_exposes_voice_and_stable_tool_idempotency(tmp_path: 
             "media_mode": "voice",
             "idempotency_key": "stable-operation",
         }
-        original = await tool.handler(arguments)
-        assert (await tool.handler(arguments))["id"] == original["id"]
-        with pytest.raises(ChannelError, match="模式不一致"):
-            await tool.handler({**arguments, "media_mode": "file"})
-        for key in ["", "a" * 201, "bad\nkey", 3]:
-            with pytest.raises(ValueError, match="idempotency_key"):
-                await tool.handler({**arguments, "idempotency_key": key})
+        calls = [
+            ToolCall("voice-first", "channel_send", json.dumps(arguments)),
+            ToolCall("voice-duplicate", "channel_send", json.dumps(arguments)),
+            ToolCall(
+                "voice-conflict", "channel_send", json.dumps({**arguments, "media_mode": "file"})
+            ),
+            *[
+                ToolCall(
+                    f"voice-bad-key-{index}",
+                    "channel_send",
+                    json.dumps({**arguments, "idempotency_key": key}),
+                )
+                for index, key in enumerate(["", "a" * 201, "bad\nkey", 3])
+            ],
+        ]
+        turns.extend([ModelTurn(tool_calls=calls), ModelTurn(content="语音已排队，尚未确认送达。")])
+        session = runtime.main_session()
+        await runtime.submit("向已绑定 Telegram 主人发送这条语音。", mode="yolo")
+        assert await runtime.tasks[session["id"]] == "语音已排队，尚未确认送达。"
+        results = {
+            message.tool_call_id: json.loads(message.content)
+            for message in seen[-1]
+            if message.role == "tool"
+        }
+        assert results["voice-first"]["id"] == results["voice-duplicate"]["id"]
+        assert results["voice-first"]["state"] == "pending"
+        assert "模式不一致" in results["voice-conflict"]["error"]
+        assert all("error" in results[f"voice-bad-key-{index}"] for index in range(4))
         assert len(application.manager.deliveries()) == 1
     finally:
         await application.close()

@@ -601,6 +601,12 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             )
             replan_messages = completed(runtime, replan_text)
             assert len(replan_messages) == 1
+            history = await web.get(f"/api/sessions/{main_id}/messages")
+            assert history.status_code == 200
+            assert any(
+                item["id"] == replan_messages[0]["id"] and item["content"] == replan_text
+                for item in history.json()["messages"]
+            )
             if control_channel == "onebot":
                 replan_message = replan_messages[0]
                 await channel_consumed(replan_message["id"])
@@ -609,12 +615,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                     for item in manager.deliveries()
                     if item["payload"].get("automatic") is True
                 ]
-                assert len(automatic) == 1
-                replan_delivery = await terminal(manager, automatic[0]["id"])
-                # A confirmed part clears the retry counter; the HTTP recorder
-                # below proves this automatic reply was actually sent once.
-                assert replan_delivery["state"] == "sent" and replan_delivery["attempts"] == 0
-                assert replan_delivery["payload"]["parts"] == [{"text": replan_text}]
+                assert automatic == []
                 expected_route = {
                     "name": "onebot",
                     "account_id": "123",
@@ -622,7 +623,6 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                     "sender_id": "7",
                     "kind": "private",
                 }
-                assert replan_delivery["route"] == expected_route
                 assert replan_message["delivery_routes"] == [expected_route]
                 assert replan_message["reply_origin"] == {
                     "kind": "channel",
@@ -631,13 +631,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                     ).hexdigest(),
                     "route": expected_route,
                 }
-                assert (
-                    replan_delivery["id"]
-                    == hashlib.sha256(
-                        encoded([replan_message["id"], "onebot", expected_route]).encode()
-                    ).hexdigest()
-                )
-                assert phone_replan_replies == [replan_text]
+                assert phone_replan_replies == []
             closed_reference = next(
                 item["read"]
                 for item in handoff_after["items"]
@@ -663,7 +657,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 await eventually(runtime, lambda: len(phone_confirmations) == 3)
                 await channel_consumed(replan_messages[0]["id"])
                 before_outbox = {item["id"]: item for item in manager.deliveries()}
-                assert len(before_outbox) == 5
+                assert len(before_outbox) == 4
                 assert all(
                     item["state"] == "sent"
                     for identifier, item in before_outbox.items()
@@ -806,7 +800,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                     is None
                 )
                 await eventually(runtime, lambda: len(phone_confirmations) == 4)
-                assert len(manager.deliveries()) == 6
+                assert len(manager.deliveries()) == 5
                 assert runtime.task_control.current(task_id)["control"] == before_control
                 assert runtime.store.list("task_control_receipt") == before_domain
                 assert [
@@ -1015,14 +1009,13 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 assert sorted(phone_confirmations) == sorted(
                     json.loads(receipt)["reply_text"] for receipt in phone_receipts.values()
                 )
-                assert len(manager.deliveries()) == confirmations + 2
+                assert len(manager.deliveries()) == confirmations + 1
                 assert {
                     item["id"]
                     for item in manager.deliveries()
                     if item["payload"].get("automatic") is True
-                } == {replan_delivery["id"]}
-                assert manager.delivery(replan_delivery["id"]) == replan_delivery
-                assert phone_replan_replies == [replan_text]
+                } == set()
+                assert phone_replan_replies == []
             old_calls = [
                 call
                 for item in runtime.store.messages(old_id)

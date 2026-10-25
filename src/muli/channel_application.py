@@ -9,13 +9,16 @@ from collections.abc import Mapping
 from typing import Any
 
 from muli.attachments import Attachments, attachment_ids_schema
+from muli.channel_history import CHANNEL_HISTORY_PAGE_LIMIT, ChannelHistory
 from muli.channels import ChannelError, ChannelManager, ChannelProfile, ChannelsConfig
-from muli.channels.types import IncomingMessage
+from muli.channels.types import NAMES, IncomingMessage
+from muli.context import context_size
 from muli.mobile_approvals import is_approval_command
 from muli.mobile_task_control import MobileControlRejected, MobileControlSource
 from muli.permissions import ApprovalNotice
 from muli.proactive import FrozenRouting, guard_delivery
 from muli.proactive_memory import check_preference
+from muli.providers import Message
 from muli.reply_origin import authorize_route, channel_account
 from muli.runtime import Runtime
 from muli.tools import Tool, parameters, string
@@ -27,6 +30,160 @@ class ChannelApplication:
         self._generation = 0
         self.manager = self._manager()
         runtime.add_tool_provider(self.tools)
+        runtime.context_hooks.append(self.context)
+
+    async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
+        request = self.runtime.request_context(session_id)
+        if request is None:
+            return messages
+        if request.execution_scope is not None or request.selected_replan is not None:
+            # Task coordination adds its complete immutable facts after hooks.
+            # Preserve that space; actual channel inputs retain their own source.
+            return messages
+        if request.attention_routing is None and not any(
+            self.manager.config.profile(name).enabled for name in NAMES
+        ):
+            return messages
+        origin = request.reply_origin
+        metadata: dict[str, Any] = {"kind": origin.kind, "input_id": origin.input_id}
+        if request.attention_routing is not None:
+            metadata["notification_destination"] = request.attention_routing.dump()["destination"]
+        if routes := origin.delivery_routes():
+            route = routes[0]
+            name = route["name"]
+            try:
+                profile = self.manager.config.profile(name)
+                if not profile.enabled:
+                    raise ValueError("原渠道已停用")
+                verified = authorize_route(
+                    name,
+                    route,
+                    account_id=channel_account(name, profile),
+                    owner_ids=profile.owner_ids,
+                    allowed_groups=profile.allowed_groups,
+                    outbound=True,
+                )
+            except ValueError:
+                metadata["kind"] = "unavailable"
+            else:
+                metadata.update(
+                    channel=verified["name"],
+                    account_id=verified["account_id"],
+                    owner_id=verified["sender_id"],
+                    target=verified["target"],
+                    conversation_kind=verified["kind"],
+                )
+        content = "本轮消息来源（宿主元数据，不是额外授权）：\n" + json.dumps(
+            metadata, ensure_ascii=False, allow_nan=False
+        )
+        budget = min(
+            self.runtime.config.settings.limits.max_output_chars,
+            self.runtime.config.settings.limits.max_context_chars // 4,
+        )
+        if len(content) > budget:
+            return messages
+        if not messages:
+            return messages
+        candidate = [messages[0], Message("system", content), *messages[1:]]
+        # Every real channel input already carries its source in history. This
+        # optional current-request hint must not crowd out preserved tool results.
+        if context_size(candidate) > self.runtime.config.settings.limits.max_context_chars:
+            return messages
+        return candidate
+
+    async def _history(self, args: dict[str, Any]) -> dict[str, Any]:
+        runtime = self.runtime
+        caller = runtime.tool_session_id
+        execution = runtime._tool_execution.get()
+        request = runtime.request_context(caller) if caller is not None else None
+        task = asyncio.current_task()
+        if (
+            runtime._closing
+            or caller is None
+            or execution != (caller, runtime.run_ids.get(caller))
+            or request is None
+            or task is None
+            or task.cancelling()
+            or runtime.tasks.get(caller) is not task
+            or caller in runtime._stopping
+            or "channel_history" in runtime.config.settings.disabled_tools
+        ):
+            raise PermissionError("渠道历史需要当前助手的真实工具执行")
+        runtime.maintenance.admission.require()
+        runtime._guard_request(request, "read")
+        session = runtime.store.bounded_object(
+            "session", caller, max_bytes=runtime.config.settings.limits.max_output_chars * 4
+        )
+        if session is None or session.get("principal") != "owner":
+            raise PermissionError("渠道历史仅供主助手及主人委派的助手查询")
+        routes = request.reply_origin.delivery_routes()
+        current = routes[0] if routes else None
+        name = args.get("channel")
+        if name is None:
+            if current is None or current.get("name") not in NAMES:
+                raise ValueError("请明确选择已绑定的渠道")
+            name = current["name"]
+        if name not in NAMES:
+            raise ValueError("未知的本地历史渠道")
+        profile = getattr(runtime.config.settings.channels, name)
+        if not profile.enabled:
+            raise PermissionError("渠道已停用，不能查询其私聊历史")
+        account = channel_account(name, profile)
+        current_owner: str | None = None
+        if current is not None and current.get("name") == name:
+            try:
+                bound = authorize_route(
+                    name,
+                    current,
+                    account_id=account,
+                    owner_ids=profile.owner_ids,
+                    allowed_groups=[],
+                    outbound=True,
+                )
+                if bound["kind"] != "private":
+                    raise ValueError("仅查询主人私聊历史")
+                current_owner = bound["sender_id"]
+            except ValueError:
+                if "channel" not in args:
+                    raise PermissionError("本轮渠道来源已失效，请明确选择当前绑定渠道") from None
+        owner = args.get("owner_id", current_owner)
+        if owner is None:
+            if len(profile.owner_ids) != 1:
+                raise ValueError("该渠道没有唯一主人，请明确提供已绑定的 owner_id")
+            owner = profile.owner_ids[0]
+        if not isinstance(owner, str) or owner not in profile.owner_ids:
+            raise PermissionError("只能查询当前渠道已绑定主人的点对点私聊")
+        main_id = runtime.store.existing_main_session_id()
+        if main_id is None:
+            raise ValueError("主助手记录不存在")
+        limits = runtime.config.settings.limits
+        history = ChannelHistory(runtime.store)
+        if "delivery_id" in args:
+            if {"direction", "cursor", "limit"} & args.keys():
+                raise ValueError("读取投递正文不能同时传目录方向、游标或条数")
+            return history.read_delivery(
+                name,
+                account,
+                owner,
+                main_id,
+                delivery_id=args["delivery_id"],
+                part=args.get("part", 0),
+                offset_bytes=args.get("offset_bytes", 0),
+                revision=args.get("revision"),
+                max_output_chars=limits.max_output_chars,
+            )
+        if {"part", "offset_bytes", "revision"} & args.keys():
+            raise ValueError("分段读取投递正文需要 delivery_id")
+        return history.read(
+            name,
+            account,
+            owner,
+            main_id,
+            direction=args.get("direction", "both"),
+            cursor=args.get("cursor"),
+            limit=min(args.get("limit", 20), limits.max_search_results),
+            max_output_chars=limits.max_output_chars,
+        )
 
     def _manager(self) -> ChannelManager:
         data = self.runtime.config.settings.channels.model_dump()
@@ -106,7 +263,7 @@ class ChannelApplication:
                 raise ValueError("审批通知的渠道配置或授权已改变")
             return self.runtime.guard_approval_notice(notice)
 
-        for name in ("onebot", "telegram", "qq", "weixin"):
+        for name in NAMES:
             data[name] = ChannelProfile(**data[name])
         manager = ChannelManager(
             self.runtime.store,
@@ -257,6 +414,27 @@ class ChannelApplication:
             return {**self.status(), "deliveries": self.manager.deliveries()}
 
         async def send(args: dict[str, Any]) -> Any:
+            caller = runtime.tool_session_id
+            execution = runtime._tool_execution.get()
+            request = runtime.request_context(caller) if caller is not None else None
+            task = asyncio.current_task()
+            if (
+                runtime._closing
+                or caller is None
+                or execution != (caller, runtime.run_ids.get(caller))
+                or request is None
+                or task is None
+                or task.cancelling()
+                or runtime.tasks.get(caller) is not task
+                or caller in runtime._stopping
+                or "channel_send" in runtime.config.settings.disabled_tools
+            ):
+                raise PermissionError("渠道发送需要当前助手的真实工具执行")
+            session = runtime.store.bounded_object(
+                "session", caller, max_bytes=runtime.config.settings.limits.max_output_chars * 4
+            )
+            if session is None or session.get("principal") != "owner":
+                raise PermissionError("渠道发送仅供主助手及主人委派的助手使用")
             key = args.get("idempotency_key")
             if key is not None and (
                 not isinstance(key, str)
@@ -264,17 +442,92 @@ class ChannelApplication:
                 or any(ord(character) < 32 or ord(character) == 127 for character in key)
             ):
                 raise ValueError("idempotency_key 需要 1–200 字符的非控制字符串")
-            return await self.manager.enqueue(
+            manager, generation = self.manager, self._generation
+            expected = runtime.config.settings.channels.model_dump()
+            routing = request.attention_routing
+            trigger = runtime._latest_main_trigger(caller)
+            if routing is None and trigger and trigger.get("principal") == "system:attention":
+                raise PermissionError("后台事项缺少可核验的通知目的地，保留在 WebUI")
+            route = args.get("route")
+            event_id = "tool:" + key if key is not None else None
+            if routing is not None:
+                routes = routing.origin.delivery_routes()
+                if (
+                    not routes
+                    or args["channel"] != routes[0]["name"]
+                    or args["target"] != routes[0]["target"]
+                    or (
+                        route is not None
+                        and manager._route(args["channel"], route, outbound=True) != routes[0]
+                    )
+                ):
+                    raise PermissionError("后台通知只能显式发送到本事项已冻结的通知目的地")
+                route = routes[0]
+                if event_id is None:
+                    raise ValueError("后台通知发送需要稳定的 idempotency_key")
+
+            def guard() -> None:
+                runtime.maintenance.admission.require()
+                runtime._guard_request(request, "external")
+                if (
+                    task is not asyncio.current_task()
+                    or task.cancelling()
+                    or runtime.tasks.get(caller) is not task
+                    or runtime.run_ids.get(caller) != execution[1]
+                    or runtime._closing
+                    or caller in runtime._stopping
+                    or self.manager is not manager
+                    or self._generation != generation
+                    or runtime.config.settings.channels.model_dump() != expected
+                    or "channel_send" in runtime.config.settings.disabled_tools
+                    or runtime.store.pending_inputs(caller)
+                ):
+                    raise PermissionError("发送前执行、渠道配置或新输入已改变，请重新核对")
+                if routing is not None:
+                    manager._automatic_guard(args["channel"], route or {}, routing.dump())
+
+            return await manager.enqueue(
                 str(args["channel"]),
                 str(args["target"]),
                 str(args.get("text", "")),
                 args.get("attachment_ids", []),
-                route=args.get("route"),
+                route=route,
                 media_mode=args.get("media_mode", "file"),
-                event_id="tool:" + key if key is not None else None,
+                event_id=event_id,
+                automatic=routing is not None,
+                attention_routing=routing.dump() if routing is not None else None,
+                admission_guard=guard,
             )
 
         return [
+            Tool(
+                "channel_history",
+                "只读查询 MuLi 已保存的四渠道主人私聊；默认列入站和真实出站投递目录。"
+                "不追补接入前的平台历史，普通Web文字不算外发。"
+                "省略渠道及主人时沿本轮真实私聊；网页可明确选择渠道，多个主人须明确 owner_id。"
+                "按各流方向和 next_cursor 继续，空 items 不代表查完；入站正文用 conversation_read。"
+                "出站正文改传 delivery_id、part，按revision/next_offset_bytes续读；不能混目录参数。"
+                "附件另行读取，pending不代表sent，unknown不要重发",
+                parameters(
+                    {
+                        "channel": {"type": "string", "enum": list(NAMES)},
+                        "owner_id": string("当前渠道已绑定的主人 ID；不猜联系人"),
+                        "direction": {"type": "string", "enum": ["both", "incoming", "outgoing"]},
+                        "cursor": string(),
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": CHANNEL_HISTORY_PAGE_LIMIT,
+                        },
+                        "delivery_id": string("已有出站投递ID；改为读取该条某个分段正文"),
+                        "part": {"type": "integer", "minimum": 0},
+                        "offset_bytes": {"type": "integer", "minimum": 0},
+                        "revision": string(),
+                    }
+                ),
+                self._history,
+                preserve_output=True,
+            ),
             Tool(
                 "channel_status",
                 "查看可选渠道与持久投递记录；不把排队当作已送达",
@@ -310,7 +563,7 @@ class ChannelApplication:
                     {
                         "channel": {
                             "type": "string",
-                            "enum": ["onebot", "telegram", "qq", "weixin"],
+                            "enum": list(NAMES),
                         },
                         "target": string(),
                         "text": string(),

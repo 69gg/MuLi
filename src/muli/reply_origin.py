@@ -42,6 +42,20 @@ def channel_account(name: str, profile: ChannelBinding) -> str:
     return "bot"
 
 
+def validate_onebot_owners(owner_ids: Collection[str], *, enabled: bool) -> None:
+    if enabled and not owner_ids:
+        raise ValueError("启用 OneBot 必须填写主人 QQ 号（owner_ids）")
+    if any(
+        not isinstance(value, str)
+        or len(value) > _ROUTE_FIELD_CHARS
+        or not value.isascii()
+        or not value.isdecimal()
+        or value.startswith("0")
+        for value in owner_ids
+    ):
+        raise ValueError("OneBot 主人 QQ 号（owner_ids）必须是无空格的正整数")
+
+
 def authorize_route(
     name: str,
     route: Mapping[str, Any],
@@ -64,6 +78,8 @@ def authorize_route(
         raise RouteError("渠道路由需要真实 sender_id/target/kind")
     if route.get("name", name) != name or route.get("account_id", account_id) != account_id:
         raise RouteError("渠道路由账号不匹配")
+    if name == "onebot" and (kind != "private" or sender not in owner_ids):
+        raise RouteError("OneBot 仅接受 owner_ids 中已绑定主人的点对点私聊", status_code=403)
     if kind == "group" and target not in allowed_groups:
         raise RouteError("此群未在 allowed_groups 中绑定", status_code=403)
     if kind == "private" and target != sender:

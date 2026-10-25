@@ -15,7 +15,6 @@ from typing import Any
 import httpx
 import pytest
 from test_attention import eventually as settled
-from test_channels import terminal
 from test_mobile_task_control_followup import phone, processed_reply
 from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, completed, eventually
@@ -168,7 +167,25 @@ async def test_verified_voice_final_reply_is_spoken_once_and_mobile_stays_in_the
                 assert json.loads(result.content) == []
                 turn = ModelTurn(content=final_reply)
             else:
-                assert rounds == 3 and messages[-1].content == phone_input
+                assert rounds == 3 and messages[-1].role == "user"
+                identifier = messages[-1].source_message_id
+                assert isinstance(identifier, str)
+                stored_phone = runtime.store.get("message", identifier)
+                assert stored_phone is not None and stored_phone["content"] == phone_input
+                assert stored_phone["principal"] == "owner"
+                assert stored_phone["source"] == "channel:onebot:123"
+                prefix = "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                header, separator, original = messages[-1].content.partition("\n")
+                assert header.startswith(prefix) and separator and original == phone_input
+                route = stored_phone["route"]
+                assert json.loads(header[len(prefix) :]) == {
+                    "channel": "onebot",
+                    "account_id": route["account_id"],
+                    "sender_id": "7",
+                    "target": "7",
+                    "kind": "private",
+                    "input_id": identifier,
+                }
                 assert any(message.content == voice_input for message in messages)
                 assert any(message.content == final_reply for message in messages)
                 turn = ModelTurn(content=phone_reply)
@@ -295,13 +312,7 @@ async def test_verified_voice_final_reply_is_spoken_once_and_mobile_stays_in_the
             phone_message = completed(runtime, phone_reply)[0]
             await processed_reply(runtime, manager, phone_message["id"])
             deliveries = manager.deliveries()
-            assert len(deliveries) == 1
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
-            assert len(phone_requests) == 1 and str(phone_requests[0]["user_id"]) == "7"
-            assert (
-                "".join(part["data"]["text"] for part in phone_requests[0]["message"])
-                == phone_reply
-            )
+            assert deliveries == [] and phone_requests == []
             assert runtime.main_session()["id"] == main_id and rounds == len(seen) == 3
             history = await web.get(f"/api/sessions/{main_id}")
             assert history.status_code == 200

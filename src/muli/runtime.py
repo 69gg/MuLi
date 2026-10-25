@@ -1954,10 +1954,35 @@ class Runtime:
         host_message = Message(role="system", content=prompt)
         messages = [host_message]
         for item in stored:
+            content = item["content"]
+            if item["role"] == "user":
+                origin = ReplyOrigin.from_input(item)
+                if (
+                    item.get("principal") == "owner"
+                    and origin.kind == "channel"
+                    and (routes := origin.delivery_routes())
+                    and item.get("source")
+                    == f"channel:{routes[0]['name']}:{routes[0]['account_id']}"
+                ):
+                    route = routes[0]
+                    source = {
+                        "channel": route["name"],
+                        "account_id": route["account_id"],
+                        "sender_id": route["sender_id"],
+                        "target": route["target"],
+                        "kind": route["kind"],
+                        "input_id": origin.input_id,
+                    }
+                    content = (
+                        "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                        + json.dumps(source, ensure_ascii=False, allow_nan=False)
+                        + "\n"
+                        + content
+                    )
             messages.append(
                 Message(
                     role=item["role"],
-                    content=item["content"],
+                    content=content,
                     tool_calls=[ToolCall(**call) for call in item.get("tool_calls", [])],
                     tool_call_id=item.get("tool_call_id"),
                     reasoning=item.get("reasoning", ""),
@@ -2283,7 +2308,8 @@ class Runtime:
         return {
             name: tool
             for name, tool in tools.items()
-            if name not in disabled and (not attention or tool.risk == "read")
+            if name not in disabled
+            and (not attention or tool.risk == "read" or name == "channel_send")
         }
 
     @staticmethod

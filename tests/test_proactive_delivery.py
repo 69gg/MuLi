@@ -153,18 +153,18 @@ def test_candidate_can_bind_new_group_and_later_revoke_without_retargeting(tmp_p
     config.update(
         {
             "channels": {
-                "onebot": {"account_id": "new", "owner_ids": ["7"], "allowed_groups": ["group"]},
+                "telegram": {"account_id": "new", "owner_ids": ["7"], "allowed_groups": ["group"]},
                 "proactive": {
                     "external_enabled": True,
                     "default_destination": external(
-                        "group", account_id="new", kind="group", sender_id="7"
+                        "group", name="telegram", account_id="new", kind="group", sender_id="7"
                     ),
                 },
             }
         }
     )
     frozen = FrozenRouting.independent(config.settings)
-    config.update({"channels": {"onebot": {"owner_ids": [], "allowed_groups": []}}})
+    config.update({"channels": {"telegram": {"owner_ids": [], "allowed_groups": []}}})
     assert FrozenRouting.independent(config.settings) == frozen
     # Re-enabling a revoked external default does require a valid candidate binding.
     config.update({"channels": {"proactive": {"external_enabled": False}}})
@@ -385,13 +385,29 @@ async def test_tools_capture_prepared_request_not_newest_input_and_management_is
         await runtime.close()
 
 
-async def test_real_runtime_only_complete_final_is_external_and_tokens_remain_streamed(
+async def test_real_runtime_sends_only_explicit_text_and_tokens_remain_streamed(
     tmp_path: Path,
 ) -> None:
     runtime, _ = make_runtime(
         tmp_path,
         [
             ModelTurn(content="正在核实", tool_calls=[ToolCall("read", "read_evidence", "{}")]),
+            ModelTurn(
+                tool_calls=[
+                    ToolCall(
+                        "send-report",
+                        "channel_send",
+                        json.dumps(
+                            {
+                                "channel": "onebot",
+                                "target": "7",
+                                "text": "核实后的完整报告",
+                                "idempotency_key": "verified-report",
+                            }
+                        ),
+                    )
+                ]
+            ),
             ModelTurn(content="核实后的完整报告"),
         ],
     )
@@ -423,6 +439,12 @@ async def test_real_runtime_only_complete_final_is_external_and_tokens_remain_st
         await application.start()
         await update(runtime, independent=True)
         await inbox.start()
+        await eventually(lambda: bool(runtime.permissions.pending))
+        approval_id = next(iter(runtime.permissions.pending))
+        approval = runtime.store.get("approval", approval_id)
+        assert approval is not None and approval["tool"] == "channel_send"
+        assert approval["risk"] == "external" and sent == []
+        await runtime.permissions.resolve(approval_id, "approve")
         await wait_for_reply(runtime, "核实后的完整报告")
         await eventually(lambda: len(sent) == 1 and not runtime.tasks)
         replies = [
@@ -453,25 +475,38 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
 ) -> None:
     config = ConfigFile(tmp_path / "config.json")
     configure(config)
-    destination = route("group", kind="group", sender_id="7") if revocation == "group" else route()
+    name = "telegram" if revocation == "group" else "onebot"
+    destination = (
+        route("group", name=name, kind="group", sender_id="7") if revocation == "group" else route()
+    )
     if revocation == "group":
         config.update(
             {
                 "channels": {
-                    "onebot": {"allowed_groups": ["group"]},
+                    "telegram": {
+                        "enabled": True,
+                        "owner_ids": ["7"],
+                        "allowed_groups": ["group"],
+                    },
                     "proactive": {"default_destination": {"kind": "channel", "route": destination}},
                 }
             }
         )
     frozen = FrozenRouting.independent(config.settings)
-    harness = Harness(tmp_path, ChannelsConfig(onebot=profile(allowed_groups=["group"])), unused)
-    harness.manager._active.add("onebot")
+    harness = Harness(
+        tmp_path,
+        ChannelsConfig(
+            **{name: profile(account_id=destination["account_id"], allowed_groups=["group"])}
+        ),
+        unused,
+    )
+    harness.manager._active.add(name)
     harness.manager.delivery_guard = lambda chosen, meta: guard_delivery(
         config.settings, chosen, meta
     )
     try:
         first = await harness.manager.enqueue(
-            "onebot",
+            name,
             destination["target"],
             "报告",
             event_id="first",
@@ -480,7 +515,7 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
             attention_routing=frozen.dump(),
         )
         unknown = await harness.manager.enqueue(
-            "onebot",
+            name,
             destination["target"],
             "未知",
             event_id="unknown",
@@ -488,6 +523,7 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
             automatic=True,
             attention_routing=frozen.dump(),
         )
+        assert first["state"] == unknown["state"] == "pending"
         with harness.store.db:
             harness.store.db.execute(
                 "UPDATE channel_outbox SET state='unknown' WHERE id=?", (unknown["id"],)
@@ -498,15 +534,18 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
             config.update({"attention": {"enabled": False}})
         elif revocation in {"owner", "group", "account"}:
             changes = (
-                {"owner_ids": []}
+                {"enabled": False, "owner_ids": []}
                 if revocation == "owner"
                 else {"allowed_groups": []}
                 if revocation == "group"
                 else {"account_id": "replacement"}
             )
             harness.manager.config = replace(
-                harness.manager.config, onebot=replace(harness.manager.config.onebot, **changes)
+                harness.manager.config,
+                **{name: replace(harness.manager.config.profile(name), **changes)},
             )
+            if revocation == "group":
+                config.update({"channels": {name: changes}})
         else:
             harness.manager._active.clear()
         changed, more = harness.manager._block_revoked()
@@ -519,7 +558,7 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
             await harness.manager.retry(unknown["id"])
         # Duplicate completion facts cannot reset either terminal state.
         duplicate = await harness.manager.enqueue(
-            "onebot",
+            name,
             destination["target"],
             "报告",
             event_id="first",
@@ -529,7 +568,7 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
         )
         assert duplicate["state"] == "blocked"
         duplicate_unknown = await harness.manager.enqueue(
-            "onebot",
+            name,
             destination["target"],
             "未知",
             event_id="unknown",

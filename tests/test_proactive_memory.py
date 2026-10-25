@@ -237,7 +237,10 @@ async def test_new_items_fall_back_but_old_memory_authority_is_revoked(
     ).origin.delivery_routes() == [route()]
     # An invalid historical binding must not block safe edits, revocation or removal.
     candidate = runtime.config.validate_changes(
-        {"persona": {"append": "unrelated"}, "channels": {"onebot": {"owner_ids": []}}}
+        {
+            "persona": {"append": "unrelated"},
+            "channels": {"onebot": {"enabled": False, "owner_ids": []}},
+        }
     )
     runtime.validate_proactive_settings(candidate)
     candidate = runtime.config.validate_changes(
@@ -405,13 +408,29 @@ async def test_close_await_cannot_commit_stale_preference(
             await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_final_report_uses_frozen_memory_route_and_revocation_blocks_transport(
+async def test_explicit_report_keeps_frozen_memory_scope_and_revocation_blocks_transport(
     tmp_path: Path,
 ) -> None:
     runtime, _ = make_runtime(
         tmp_path,
         [
             ModelTurn(tool_calls=[ToolCall("read", "read_evidence", "{}")]),
+            ModelTurn(
+                tool_calls=[
+                    ToolCall(
+                        "send-revoked",
+                        "channel_send",
+                        json.dumps(
+                            {
+                                "channel": "onebot",
+                                "target": "8",
+                                "text": "按原偏好整理的报告",
+                                "idempotency_key": "revoked-memory-report",
+                            }
+                        ),
+                    )
+                ]
+            ),
             ModelTurn(content="按原偏好整理的报告"),
         ],
     )
@@ -439,10 +458,25 @@ async def test_final_report_uses_frozen_memory_route_and_revocation_blocks_trans
         await application.start()
         await update(runtime, independent=True)
         await inbox.start()
+        await eventually(lambda: bool(runtime.permissions.pending))
+        approval_id = next(iter(runtime.permissions.pending))
+        approval = runtime.store.get("approval", approval_id)
+        assert approval is not None and approval["tool"] == "channel_send"
+        assert approval["risk"] == "external" and sent == []
+        await runtime.permissions.resolve(approval_id, "approve")
         await wait_for_reply(runtime, "按原偏好整理的报告")
-        await eventually(lambda: bool(application.manager.deliveries()))
-        item = application.manager.deliveries()[0]
-        assert item["state"] == "blocked" and item["route"] == route("8")
+        await eventually(lambda: not runtime.tasks)
+        deliveries = application.manager.deliveries()
+        assert all(
+            "approval_notice" in delivery["payload"] and delivery["state"] == "blocked"
+            for delivery in deliveries
+        )
+        result = next(
+            message
+            for message in runtime.store.messages(runtime.main_session()["id"])
+            if message.get("tool_call_id") == "send-revoked"
+        )
+        assert "记忆" in json.loads(result["content"])["error"]
         assert sent == []
         assert application.status()["proactive"]["next_destination"] == external()
         assert application.status()["proactive"]["memory_status"]["reason"] == "missing"

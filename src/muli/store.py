@@ -878,6 +878,281 @@ class Store:
         finally:
             cursor.close()
 
+    def channel_history_rows(
+        self,
+        session_id: str,
+        *,
+        name: str,
+        account_id: str,
+        owner_id: str,
+        before_seq: int | None,
+        limit: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Take one indexed input window, then prove its exact private-chat scope."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("渠道历史需要 1–101 条的有限候选窗口")
+        if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("渠道历史元数据字节预算必须是正整数")
+        if before_seq is not None and (
+            type(before_seq) is not int or not 1 <= before_seq <= SQLITE_MAX_INTEGER
+        ):
+            raise ValueError("渠道历史序列游标无效")
+
+        def private_route(data: str, path: str) -> str:
+            return " AND ".join(
+                f"json_type({data},'$.{path}.{field}')='text' "
+                f"AND json_extract({data},'$.{path}.{field}')={value}"
+                for field, value in (
+                    ("name", ":name"),
+                    ("account_id", ":account_id"),
+                    ("sender_id", ":owner_id"),
+                    ("target", ":owner_id"),
+                    ("kind", "'private'"),
+                )
+            )
+
+        def owner_input(data: str, key: str) -> str:
+            return (
+                f"json_type({data},'$.id')='text' AND json_extract({data},'$.id')={key} "
+                f"AND json_type({data},'$.session_id')='text' "
+                f"AND json_extract({data},'$.session_id')=:session_id "
+                f"AND json_extract({data},'$.role')='user' "
+                f"AND json_extract({data},'$.source')=:source "
+                f"AND json_extract({data},'$.principal')='owner' "
+                f"AND ({private_route(data, 'route')}) "
+                f"AND (json_type({data},'$.route.reply_to') IS NULL "
+                f"OR (json_type({data},'$.route.reply_to')='text' "
+                f"AND length(json_extract({data},'$.route.reply_to'))>0))"
+            )
+
+        incoming = owner_input("o.data", "o.message_key")
+        predicate = "AND seq<:before_seq " if before_seq is not None else ""
+        # Reuse the evidence projection with a zero-byte content window. The CTE
+        # supplies an already byte-gated ID and valid JSON, including broken rows.
+        evidence_columns = (
+            _EVIDENCE_COLUMNS.replace("m.seq", "o.seq")
+            .replace("?", "1", 1)
+            .replace("?", "0", 1)
+            .replace("?", ":budget")
+        )
+        columns = (
+            evidence_columns
+            + ",o.id_type,o.id_bytes,"
+            + f"CASE WHEN ({incoming}) THEN 'user' END AS channel_role,"
+            "CASE WHEN json_type(o.data,'$.created_at') IN ('integer','real') "
+            "THEN json_extract(o.data,'$.created_at') END AS created_at,"
+            "json_type(o.data,'$.route.reply_to') AS platform_message_id_type,"
+            "length(CAST(json_extract(o.data,'$.route.reply_to') AS BLOB)) "
+            "AS platform_message_id_bytes,"
+            "CASE WHEN json_type(o.data,'$.route.reply_to')='text' "
+            "THEN substr(CAST(json_extract(o.data,'$.route.reply_to') AS BLOB),1,"
+            "min(:budget,length(CAST(json_extract(o.data,'$.route.reply_to') AS BLOB)))) "
+            "END AS platform_message_id"
+        )
+        cursor = self.db.execute(
+            "WITH candidates AS (SELECT seq,message_id FROM message_order "
+            "WHERE session_id=:session_id "
+            + predicate
+            + "ORDER BY seq DESC LIMIT :limit),records AS ("
+            "SELECT m.seq,m.message_id AS message_key,typeof(m.message_id) AS id_type,"
+            "length(CAST(m.message_id AS BLOB)) AS id_bytes,"
+            "CASE WHEN typeof(m.message_id)='text' "
+            "AND length(CAST(m.message_id AS BLOB))<=:budget "
+            "THEN CAST(m.message_id AS BLOB) END AS id,"
+            "CASE WHEN json_valid(v.data) THEN v.data ELSE '{}' END AS data "
+            "FROM candidates m LEFT JOIN objects v ON v.kind='message' "
+            "AND v.id=m.message_id) SELECT " + columns + " FROM records o ORDER BY o.seq DESC",
+            {
+                "session_id": session_id,
+                "name": name,
+                "account_id": account_id,
+                "owner_id": owner_id,
+                "source": f"channel:{name}:{account_id}",
+                "before_seq": before_seq,
+                "limit": limit,
+                "budget": metadata_bytes,
+            },
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
+    def channel_delivery_rows(
+        self,
+        *,
+        name: str,
+        account_id: str,
+        owner_id: str,
+        before_rowid: int | None,
+        limit: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Classify a finite outbox rowid window without exporting payloads or routes."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("渠道投递历史需要 1–101 条的有限候选窗口")
+        if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("渠道投递元数据字节预算必须是正整数")
+        if before_rowid is not None and (
+            type(before_rowid) is not int or not 1 <= before_rowid <= SQLITE_MAX_INTEGER
+        ):
+            raise ValueError("渠道投递序列游标无效")
+        route_match = " AND ".join(
+            f"json_type(o.route_data,'$.{field}')='text' "
+            f"AND json_extract(o.route_data,'$.{field}')={value}"
+            for field, value in (
+                ("name", ":name"),
+                ("account_id", ":account_id"),
+                ("sender_id", ":owner_id"),
+                ("target", ":owner_id"),
+                ("kind", "'private'"),
+            )
+        )
+        predicate = "WHERE rowid<:before_rowid " if before_rowid is not None else ""
+        # JSON stays in SQLite. Both text and attachment references may have many
+        # parts; only the complete byte-gated reference list crosses into Python.
+        part_data = "CASE WHEN p.type='object' THEN p.value ELSE '{}' END"
+        valid_part = (
+            f"p.type='object' AND ((json_type({part_data},'$.text')='text' "
+            f"AND json_type({part_data},'$.attachment_id') IS NULL) OR "
+            f"(json_type({part_data},'$.text') IS NULL "
+            f"AND json_type({part_data},'$.attachment_id')='text'))"
+        )
+        cursor = self.db.execute(
+            "WITH candidates AS (SELECT rowid AS seq,id,name,route,payload,state,"
+            "next_part,created_at FROM channel_outbox "
+            + predicate
+            + "ORDER BY rowid DESC LIMIT :limit),records AS ("
+            "SELECT c.*,CASE WHEN json_valid(c.route) THEN c.route ELSE '{}' END AS route_data,"
+            "CASE WHEN json_valid(c.payload) THEN c.payload ELSE '{}' END AS data "
+            "FROM candidates c),scoped AS (SELECT o.seq,o.id,o.state,o.next_part,o.created_at,"
+            f"CASE WHEN o.name=:name AND ({route_match}) "
+            "THEN o.data ELSE '{}' END AS data,"
+            f"CASE WHEN o.name=:name AND ({route_match}) THEN 1 ELSE 0 END AS channel_match "
+            "FROM records o),projected AS (SELECT o.*,"
+            "json_type(o.data,'$.parts') AS parts_type,"
+            "json_array_length(o.data,'$.parts') AS total_parts,"
+            f"(SELECT count(*) FROM json_each(o.data,'$.parts') p "
+            f"WHERE CASE WHEN ({valid_part}) THEN 0 ELSE 1 END=1) "
+            "AS invalid_parts,"
+            f"(SELECT json_group_array(json_extract({part_data},'$.attachment_id')) "
+            "FROM json_each(o.data,'$.parts') p "
+            f"WHERE json_type({part_data},'$.attachment_id') IS NOT NULL) AS attachment_data "
+            "FROM scoped o) SELECT seq,channel_match,typeof(id) AS id_type,"
+            "length(CAST(id AS BLOB)) AS id_bytes,"
+            "CASE WHEN typeof(id)='text' THEN substr(CAST(id AS BLOB),1,"
+            "min(:budget,length(CAST(id AS BLOB)))) END AS id,"
+            "typeof(state) AS state_type,length(CAST(state AS BLOB)) AS state_bytes,"
+            "CASE WHEN typeof(state)='text' THEN substr(CAST(state AS BLOB),1,"
+            "min(:budget,length(CAST(state AS BLOB)))) END AS state,"
+            "CASE WHEN typeof(next_part)='integer' THEN next_part END AS confirmed_parts,"
+            "CASE WHEN typeof(created_at) IN ('integer','real') THEN created_at END AS created_at,"
+            "parts_type,total_parts,invalid_parts,'array' AS attachment_ids_type,"
+            "length(CAST(attachment_data AS BLOB)) AS attachment_ids_bytes,"
+            "substr(CAST(attachment_data AS BLOB),1,"
+            "min(:budget,length(CAST(attachment_data AS BLOB)))) AS attachment_ids "
+            "FROM projected ORDER BY seq DESC",
+            {
+                "name": name,
+                "account_id": account_id,
+                "owner_id": owner_id,
+                "before_rowid": before_rowid,
+                "limit": limit,
+                "budget": metadata_bytes,
+            },
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
+    def channel_delivery_slices(
+        self,
+        *,
+        name: str,
+        account_id: str,
+        owner_id: str,
+        delivery_id: str,
+        part: int,
+        chunk_bytes: int,
+        source_bytes: int,
+        metadata_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Read one proven part in bounded windows within one SQLite read snapshot."""
+        for value in (chunk_bytes, source_bytes, metadata_bytes):
+            if type(value) is not int or not 1 <= value <= SQLITE_MAX_INTEGER:
+                raise ValueError("投递正文窗口与字节上限必须是正整数")
+        if chunk_bytes > 64 * 1024:
+            raise ValueError("投递正文单窗口不能超过 64KiB")
+        if type(part) is not int or not 0 <= part < SQLITE_MAX_INTEGER:
+            raise ValueError("投递分段序号无效")
+        route_match = " AND ".join(
+            f"json_type(o.route_data,'$.{field}')='text' "
+            f"AND json_extract(o.route_data,'$.{field}')={value}"
+            for field, value in (
+                ("name", ":name"),
+                ("account_id", ":account_id"),
+                ("sender_id", ":owner_id"),
+                ("target", ":owner_id"),
+                ("kind", "'private'"),
+            )
+        )
+        cursor = self.db.execute(
+            "WITH RECURSIVE record AS (SELECT rowid AS seq,name,state,next_part,created_at,"
+            "CASE WHEN json_valid(route) THEN route ELSE '{}' END AS route_data,"
+            "CASE WHEN json_valid(payload) THEN payload ELSE '{}' END AS data "
+            "FROM channel_outbox WHERE id=:delivery_id),selected AS ("
+            "SELECT o.seq,o.state,o.next_part,o.created_at,"
+            "json_type(o.data,'$.parts') AS parts_type,"
+            "json_array_length(o.data,'$.parts') AS total_parts,"
+            "json_type(o.data,:part_path) AS part_type,"
+            "CASE WHEN json_type(o.data,:part_path)='object' "
+            "THEN json_extract(o.data,:part_path) ELSE '{}' END AS part_data "
+            f"FROM record o WHERE o.name=:name AND ({route_match})),evidence AS ("
+            "SELECT s.*,json_type(part_data,'$.text') AS text_type,"
+            "json_type(part_data,'$.attachment_id') AS attachment_id_type,"
+            "length(CAST(json_extract(part_data,'$.attachment_id') AS BLOB)) AS attachment_id_bytes,"
+            "CASE WHEN json_type(part_data,'$.attachment_id')='text' THEN "
+            "substr(CAST(json_extract(part_data,'$.attachment_id') AS BLOB),1,"
+            "min(:budget,length(CAST(json_extract(part_data,'$.attachment_id') AS BLOB)))) "
+            "END AS attachment_id,"
+            "CASE WHEN json_type(part_data,'$.text')='text' "
+            "THEN length(CAST(json_extract(part_data,'$.text') AS BLOB)) ELSE 0 END AS total_bytes "
+            "FROM selected s),windows(start) AS (SELECT 0 UNION ALL "
+            "SELECT start+:chunk FROM windows WHERE start+:chunk < "
+            "(SELECT CASE WHEN total_bytes<=:source_bytes THEN total_bytes ELSE 0 END FROM evidence)) "
+            "SELECT e.seq,typeof(e.state) AS state_type,"
+            "length(CAST(e.state AS BLOB)) AS state_bytes,"
+            "CASE WHEN typeof(e.state)='text' THEN substr(CAST(e.state AS BLOB),1,"
+            "min(:budget,length(CAST(e.state AS BLOB)))) END AS state,"
+            "CASE WHEN typeof(e.next_part)='integer' THEN e.next_part END AS confirmed_parts,"
+            "CASE WHEN typeof(e.created_at) IN ('integer','real') THEN e.created_at END AS created_at,"
+            "e.parts_type,e.total_parts,e.part_type,e.text_type,e.attachment_id_type,"
+            "e.attachment_id_bytes,e.attachment_id,e.total_bytes,w.start AS offset_bytes,"
+            "CASE WHEN e.text_type='text' AND e.total_bytes<=:source_bytes THEN "
+            "substr(CAST(json_extract(e.part_data,'$.text') AS BLOB),w.start+1,"
+            "min(:chunk,e.total_bytes-w.start)) ELSE x'' END AS content "
+            "FROM evidence e CROSS JOIN windows w ORDER BY w.start",
+            {
+                "name": name,
+                "account_id": account_id,
+                "owner_id": owner_id,
+                "delivery_id": delivery_id,
+                "part_path": f"$.parts[{part}]",
+                "chunk": chunk_bytes,
+                "source_bytes": source_bytes,
+                "budget": metadata_bytes,
+            },
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            cursor.close()
+
     def message_evidence_max_seq(self, session_id: str) -> int:
         """Return the latest valid mapping without materializing message JSON in Python."""
         row = self.db.execute(

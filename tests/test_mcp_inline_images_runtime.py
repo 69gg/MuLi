@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_mcp_receive import Chunks
 from test_media import PNG
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
@@ -506,13 +505,7 @@ async def test_inline_screenshot_reaches_main_vision_as_original_bytes(
             manager = app.state.channel_application.manager
             await processed_reply(runtime, manager, viewed[0]["id"])
             outbound = [item for item in manager.deliveries() if delivery_text(item) == stage_reply]
-            assert len(outbound) == 1 and outbound[0]["route"]["target"] == "7"
-            assert (await terminal(manager, outbound[0]["id"]))["state"] == "sent"
-            assert all(
-                set(part) == {"text"}
-                for item in manager.deliveries()
-                for part in item["payload"]["parts"]
-            )
+            assert outbound == [] and manager.deliveries() == []
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200
             assert any(

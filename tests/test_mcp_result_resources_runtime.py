@@ -11,7 +11,6 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_mcp_receive import Chunks
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_runtime import FakeClient, make_runtime
@@ -422,15 +421,13 @@ async def test_search_resource_link_reaches_explicit_read_and_original_phone(
             manager = app.state.channel_application.manager
             await processed_reply(runtime, manager, final_message["id"])
             outgoing = [item for item in manager.deliveries() if delivery_text(item) == final_reply]
-            assert len(outgoing) == 1
-            delivery = await terminal(manager, outgoing[0]["id"])
-            assert delivery["state"] == "sent" and delivery["route"]["target"] == "7"
+            assert outgoing == []
             assert (
                 sum(
                     "".join(part["data"]["text"] for part in item["message"]) == final_reply
                     for item in sent
                 )
-                == 1
+                == 0
             )
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200 and final_reply in history.text
@@ -438,7 +435,7 @@ async def test_search_resource_link_reaches_explicit_read_and_original_phone(
             assert methods.count("resources/list") == methods.count("tools/call") == 1
             # Target red: a typed successful search link was lost after real SDK decoding.
             assert search_result.get("resource_links_available") is True, (
-                "真实搜索、accepted 工具回执、队友报告与原私聊回报均完成，"
+                "真实搜索、accepted 工具回执、队友报告与Web回报均完成，"
                 f"但普通目录外的 typed resource_link 仍不可发现：{search_result}"
             )
             assert worker_rounds == 5 and methods.count("resources/read") == 1

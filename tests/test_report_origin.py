@@ -37,6 +37,27 @@ def origin(identifier: str = "owner-input", **changes: str) -> ReplyOrigin:
     return ReplyOrigin.load({"kind": "channel", "input_id": identifier, "route": route(**changes)})
 
 
+def assert_channel_message(message: Message, stored: dict[str, Any]) -> None:
+    prefix = "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+    assert message.role == stored["role"] == "user"
+    assert message.source_message_id == stored["id"]
+    assert stored["principal"] == "owner"
+    destination = stored["route"]
+    assert stored["source"] == f"channel:{destination['name']}:{destination['account_id']}"
+    header, separator, content = message.content.partition("\n")
+    assert separator and header.startswith(prefix)
+    assert json.loads(header.removeprefix(prefix)) == {
+        "channel": destination["name"],
+        "account_id": destination["account_id"],
+        "sender_id": destination["sender_id"],
+        "target": destination["target"],
+        "kind": destination["kind"],
+        "input_id": stored["id"],
+    }
+    assert content == stored["content"]
+    assert message.content.endswith("\n" + stored["content"])
+
+
 async def wait_for_reply(runtime: Runtime, content: str) -> dict[str, Any]:
     def found() -> dict[str, Any] | None:
         return next(
@@ -65,17 +86,10 @@ async def wait_for_channel_cursor(harness: Harness, event_id: int) -> None:
 
 
 async def assistant_event(harness: Harness, identifier: str, destination: dict[str, str]) -> int:
-    await harness.bus.emit(
-        "message.completed",
-        {
-            "message": {
-                "id": identifier,
-                "role": "assistant",
-                "content": "原任务报告",
-                "delivery_routes": [destination],
-            }
-        },
+    harness.store.complete_message(
+        "main", "原任务报告", id=identifier, delivery_routes=[destination]
     )
+    await harness.bus.notify()
     return int(harness.store.db.execute("SELECT max(id) FROM events").fetchone()[0])
 
 
@@ -238,7 +252,14 @@ async def test_two_queued_origins_get_separate_streamed_replies(tmp_path: Path) 
             if message["role"] == "assistant"
         ]
         assert [message["delivery_routes"] for message in replies] == [[route()], [route("8")]]
-        assert [messages[-1].content for messages in seen] == ["A", "B"]
+        inputs = [
+            message
+            for message in runtime.store.messages(session["id"])
+            if message["role"] == "user"
+        ]
+        assert [message["content"] for message in inputs] == ["A", "B"]
+        for messages, stored in zip(seen, inputs, strict=True):
+            assert_channel_message(messages[-1], stored)
         deltas = [
             event["data"]["content"]
             for event in runtime.store.events()
@@ -274,7 +295,10 @@ async def test_new_owner_replaces_attention_source_at_both_continuation_boundari
                     else ModelTurn(tool_calls=[ToolCall("read-fact", "probe", "{}")])
                 )
             else:
-                assert len(self.seen) == 2 and messages[-1].content == "新的主人要求"
+                assert len(self.seen) == 2
+                stored = runtime.store.get("message", messages[-1].source_message_id or "")
+                assert stored is not None and stored["content"] == "新的主人要求"
+                assert_channel_message(messages[-1], stored)
                 turn = ModelTurn(content="按新要求回复")
             yield StreamEvent("done", turn=turn)
 
@@ -541,7 +565,7 @@ async def test_report_origin_and_ingress_handoff_commit_together(
         await runtime.close()
 
 
-async def test_inactive_reply_is_persistently_blocked_until_explicit_validated_retry(
+async def test_local_reply_and_explicit_inactive_outbox_have_independent_lifecycles(
     tmp_path: Path,
 ) -> None:
     calls: list[httpx.Request] = []
@@ -557,7 +581,17 @@ async def test_inactive_reply_is_persistently_blocked_until_explicit_validated_r
         await harness.manager.start()
         event_id = await assistant_event(harness, "report-reply", route())
         await wait_for_channel_cursor(harness, event_id)
-        blocked = harness.manager.deliveries()[0]
+        assert harness.store.get("message", "report-reply")["content"] == "原任务报告"
+        assert harness.manager.deliveries() == [] and calls == []
+        blocked = await harness.manager.enqueue(
+            "onebot",
+            "7",
+            "原任务报告",
+            event_id="explicit-report-reply",
+            route=route(),
+            automatic=True,
+            attention_routing=FrozenRouting.bound(origin()).dump(),
+        )
         assert blocked["state"] == "blocked" and "未启用" in blocked["last_error"]
         assert (await terminal(harness.manager, blocked["id"]))["state"] == "blocked"
         with pytest.raises(ChannelError, match="未启用"):
@@ -579,7 +613,7 @@ async def test_inactive_reply_is_persistently_blocked_until_explicit_validated_r
 
 
 @pytest.mark.parametrize("revocation", ["owner", "account", "group"])
-async def test_revoked_origin_gets_a_blocked_record_without_contacting_platform(
+async def test_local_report_does_not_send_and_explicit_revoked_origin_is_blocked(
     tmp_path: Path, revocation: str
 ) -> None:
     destination = route(kind="group", target="group") if revocation == "group" else route()
@@ -595,7 +629,20 @@ async def test_revoked_origin_gets_a_blocked_record_without_contacting_platform(
         await harness.manager.start()
         event_id = await assistant_event(harness, "report-reply", destination)
         await wait_for_channel_cursor(harness, event_id)
-        item = harness.manager.deliveries()[0]
+        assert harness.store.get("message", "report-reply")["content"] == "原任务报告"
+        assert harness.manager.deliveries() == []
+        frozen = ReplyOrigin.load(
+            {"kind": "channel", "input_id": "report-input", "route": destination}
+        )
+        item = await harness.manager.enqueue(
+            "onebot",
+            destination["target"],
+            "原任务报告",
+            event_id="explicit-report-reply",
+            route=destination,
+            automatic=True,
+            attention_routing=FrozenRouting.bound(frozen).dump(),
+        )
         assert item["state"] == "blocked" and item["route"] == destination
         with pytest.raises(ChannelError):
             await harness.manager.retry(item["id"])
@@ -604,7 +651,7 @@ async def test_revoked_origin_gets_a_blocked_record_without_contacting_platform(
         await harness.close()
 
 
-async def test_replayed_automatic_reply_never_requeues_unknown(tmp_path: Path) -> None:
+async def test_local_report_replay_never_requeues_explicit_unknown_outbox(tmp_path: Path) -> None:
     harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
     try:
         item = await harness.manager.enqueue(
@@ -617,6 +664,7 @@ async def test_replayed_automatic_reply_never_requeues_unknown(tmp_path: Path) -
         await harness.manager.start()
         event_id = await assistant_event(harness, "uncertain", route())
         await wait_for_channel_cursor(harness, event_id)
+        assert harness.store.get("message", "uncertain")["content"] == "原任务报告"
         assert harness.manager.delivery(item["id"])["state"] == "unknown"  # type: ignore[index]
         assert len(harness.manager.deliveries()) == 1
         with pytest.raises(ChannelError, match="结果未知"):

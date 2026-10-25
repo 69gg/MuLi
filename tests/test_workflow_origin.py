@@ -17,6 +17,7 @@ from test_workflow_scope import start_blocked_workflow
 from test_workflows import step
 
 from muli.channels import ChannelError, ChannelsConfig
+from muli.proactive import FrozenRouting
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.reply_origin import ReplyOrigin
 from muli.runtime import PreparedRequest, Runtime, _ExecutionResult
@@ -401,7 +402,7 @@ async def test_team_workflow_keeps_only_the_existing_parent_report_route(tmp_pat
 
 
 @pytest.mark.parametrize("revocation", ["owner", "account", "group"])
-async def test_actual_workflow_message_uses_existing_outbox_revocation_guards(
+async def test_workflow_result_stays_local_and_explicit_outbox_keeps_revocation_guards(
     tmp_path: Path, revocation: str
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
@@ -423,7 +424,17 @@ async def test_actual_workflow_message_uses_existing_outbox_revocation_guards(
         await sink.manager.start()
         event = await sink.bus.emit("message.completed", {"message": message}, parent)
         await wait_for_channel_cursor(sink, event["id"])
-        item = sink.manager.deliveries()[0]
+        assert runtime.store.get("message", message["id"]) == message
+        assert sink.manager.deliveries() == []
+        item = await sink.manager.enqueue(
+            "onebot",
+            destination["target"],
+            message["content"],
+            event_id="explicit-workflow:" + message["id"],
+            route=destination,
+            automatic=True,
+            attention_routing=FrozenRouting.bound(original).dump(),
+        )
         assert item["state"] == "blocked" and item["route"] == destination
         with pytest.raises(ChannelError):
             await sink.manager.retry(item["id"])
@@ -436,7 +447,7 @@ async def test_actual_workflow_message_uses_existing_outbox_revocation_guards(
         await runtime.close()
 
 
-async def test_replayed_workflow_message_never_requeues_a_recovered_unknown_delivery(
+async def test_local_workflow_replay_never_requeues_explicit_recovered_unknown_outbox(
     tmp_path: Path,
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
@@ -456,6 +467,7 @@ async def test_replayed_workflow_message_never_requeues_a_recovered_unknown_deli
         await sink.manager.start()
         event = await sink.bus.emit("message.completed", {"message": message}, parent)
         await wait_for_channel_cursor(sink, event["id"])
+        assert runtime.store.get("message", message["id"]) == message
         assert sink.manager.delivery(item["id"])["state"] == "unknown"  # type: ignore[index]
         assert len(sink.manager.deliveries()) == 1
         with pytest.raises(ChannelError, match="结果未知"):

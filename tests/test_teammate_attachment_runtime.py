@@ -11,7 +11,7 @@ from typing import Any, NoReturn
 
 import httpx
 import pytest
-from test_channels import onebot_body, onebot_event
+from test_channels import consumed, onebot_body, onebot_event
 from test_runtime import FakeClient, make_runtime
 
 from muli.attachments import Attachments
@@ -321,16 +321,9 @@ async def test_web_assignment_mobile_supplement_reads_real_files_and_reports_to_
                 assert pending[0]["source"] == "team:" + session_id
                 asr_release.set()
                 await eventually(runtime, lambda: bool(completed(runtime, "网页任务已完成")))
-                await eventually(
-                    runtime,
-                    lambda: (
-                        bool(manager.deliveries())
-                        and all(item["state"] == "sent" for item in manager.deliveries())
-                    ),
-                )
+                await consumed(manager, runtime.store.events()[-1]["id"])
                 assert len(asr_requests) == len(downloads) == 1
-                assert len(sent) == 1 and sent[0]["user_id"] == "7"
-                assert "移动补充已交给原队友" in str(sent) and "网页任务已完成" not in str(sent)
+                assert manager.deliveries() == [] and sent == []
                 assert completed(runtime, "网页任务已完成")[0]["delivery_routes"] == []
                 assert (
                     completed(runtime, "移动补充已交给原队友")[0]["delivery_routes"][0]["target"]

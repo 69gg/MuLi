@@ -13,7 +13,6 @@ from typing import Any
 import httpx
 import pytest
 from test_attention import eventually as attention_eventually
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_reminders import ObservedEvent
 from test_runtime import FakeClient, make_runtime
@@ -358,8 +357,7 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
             setup_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == replies["setup"]
             ]
-            assert len(setup_deliveries) == 1
-            assert (await terminal(manager, setup_deliveries[0]["id"]))["state"] == "sent"
+            assert setup_deliveries == []
             original_origin = setup_reply["reply_origin"]
             assert (
                 original_origin["route"]["target"] == original_origin["route"]["sender_id"] == "7"
@@ -431,8 +429,7 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
             other_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == replies["other"]
             ]
-            assert len(other_deliveries) == 1
-            assert (await terminal(manager, other_deliveries[0]["id"]))["state"] == "sent"
+            assert other_deliveries == []
             assert other_reply["reply_origin"]["route"]["target"] == "8"
             await asyncio.wait_for(app.state.close(), 3)
     finally:
@@ -444,7 +441,6 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
     active_runtime = reopened
     reopened_app = create_app(reopened.config, reopened.data_dir, reopened)
     notice: dict[str, Any] = {}
-    final_delivery_id = ""
     try:
         async with (
             reopened_app.router.lifespan_context(reopened_app),
@@ -505,11 +501,7 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
             outbound = [
                 item for item in manager.deliveries() if delivery_text(item) == followup["reply"]
             ]
-            assert len(outbound) == 1
-            final_delivery_id = outbound[0]["id"]
-            assert (await terminal(manager, final_delivery_id))["state"] == "sent"
-            assert outbound[0]["route"]["target"] == outbound[0]["route"]["sender_id"] == "7"
-            assert outbound[0]["payload"]["automatic"] is True
+            assert outbound == []
             web_messages = await web.get(f"/api/sessions/{main_id}/messages", params={"limit": 1})
             assert web_messages.status_code == 200
             visible = web_messages.json()["messages"]
@@ -530,7 +522,7 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
                         if delivery_text(item) == followup["reply"]
                     ]
                 )
-                == 1
+                == 0
             )
             await asyncio.wait_for(reopened_app.state.close(), 3)
     finally:
@@ -547,10 +539,7 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
             assert again.store.get("notification", notice["id"]) == notice
             assert again.store.get("reminder", reminder_id)["fired_count"] == 1
             assert rounds["followup"] == 3 and worker_rounds == 3
-            stored_delivery = again_app.state.channel_application.manager.delivery(
-                final_delivery_id
-            )
-            assert stored_delivery is not None and stored_delivery["state"] == "sent"
+            assert completed(again, followup["reply"])[0]["id"] == final_reply[0]["id"]
             assert (
                 len(
                     [
@@ -559,7 +548,7 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
                         if delivery_text(item) == followup["reply"]
                     ]
                 )
-                == 1
+                == 0
             )
             assert again_app.state.local_services.commitments.get(task_id)["status"] == "open"
             await asyncio.wait_for(again_app.state.close(), 3)

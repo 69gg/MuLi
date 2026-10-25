@@ -1,4 +1,4 @@
-"""An authorized future research DAG survives restart and reports to its original phone."""
+"""A future research DAG survives restart and preserves its original reply origin."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any
 
 import httpx
 import pytest
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_reminders import ObservedEvent
 from test_runtime import FakeClient, make_runtime
@@ -136,7 +135,24 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             assert {"clock_now", "reminder_schedule", "workflow_create"} <= names
             if phase == "setup":
                 if current == 1:
-                    assert any(message.content == owner_request for message in messages)
+                    incoming = next(
+                        message
+                        for message in messages
+                        if message.role == "user" and message.content.endswith(owner_request)
+                    )
+                    header, content = incoming.content.split("\n", 1)
+                    assert header.startswith(
+                        "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
+                    )
+                    assert json.loads(header.split("：", 1)[1]) == {
+                        "channel": "onebot",
+                        "account_id": "123",
+                        "sender_id": "7",
+                        "target": "7",
+                        "kind": "private",
+                        "input_id": incoming.source_message_id,
+                    }
+                    assert content == owner_request
                     turn = ModelTurn(tool_calls=[call("check-delegation-time", "clock_now")])
                 elif current == 2:
                     clock_result = tool_result(messages, "check-delegation-time")
@@ -164,9 +180,23 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
                     schedule_result = tool_result(messages, "schedule-reviewed-research")
                     turn = ModelTurn(content=acknowledgement)
             elif phase == "other":
-                assert current == 1 and any(
-                    message.content == other_request for message in messages
+                assert current == 1
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(other_request)
                 )
+                header, content = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": "onebot",
+                    "account_id": "123",
+                    "sender_id": "8",
+                    "target": "8",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert content == other_request
                 turn = ModelTurn(content=other_reply)
             else:
                 assert phase == "cancel"
@@ -324,20 +354,14 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == acknowledgement
             ]
-            assert len(deliveries) == 1
-            delivered = await terminal(manager, deliveries[0]["id"])
-            assert delivered["state"] == "sent" and delivered["route"] == origin["route"]
-            assert len(requests) == 1 and str(requests[0]["user_id"]) == "7"
-            assert (
-                "".join(part["data"]["text"] for part in requests[0]["message"]) == acknowledgement
-            )
+            assert deliveries == [] and requests == []
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200
             assert any(item["content"] == acknowledgement for item in history.json()["messages"])
             # The first target red is the live tool directory, after all current prerequisites.
             assert schedule_available is True, (
                 "真实phone7 owner输入、clock_now、accepted工具回执、正常主运行、"
-                "原7文字投递和Web均已完成，但当前主工具表没有workflow_schedule；"
+                "原7来源与Web回复均已保存且未自动外发，但当前主工具表没有workflow_schedule；"
                 f"实际工具结果：{schedule_result}"
             )
             assert "error" not in schedule_result and isinstance(schedule_result.get("id"), str)
@@ -361,8 +385,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             other_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == other_reply
             ]
-            assert len(other_deliveries) == 1
-            assert (await terminal(manager, other_deliveries[0]["id"]))["state"] == "sent"
+            assert other_deliveries == []
             assert runtime.store.list("workflow_run") == [] and search_requests == []
             assert rounds["worker"] == rounds["reviewer"] == 0
             await asyncio.wait_for(app.state.close(), 3)
@@ -447,15 +470,13 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             manager = reopened_app.state.channel_application.manager
             await processed_reply(reopened, manager, report["id"])
             outputs = [item for item in manager.deliveries() if delivery_text(item) == report_text]
-            assert len(outputs) == 1
-            assert (await terminal(manager, outputs[0]["id"]))["state"] == "sent"
-            assert outputs[0]["route"] == origin["route"]
+            assert outputs == []
             sent_reports = [
                 item
                 for item in requests
                 if "".join(part["data"]["text"] for part in item["message"]) == report_text
             ]
-            assert len(sent_reports) == 1 and str(sent_reports[0]["user_id"]) == "7"
+            assert sent_reports == []
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200
             assert sum(item["content"] == report_text for item in history.json()["messages"]) == 1
@@ -486,8 +507,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             cancel_deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == cancel_reply
             ]
-            assert len(cancel_deliveries) == 1
-            assert (await terminal(manager, cancel_deliveries[0]["id"]))["state"] == "sent"
+            assert cancel_deliveries == []
             # Observe the real scheduler after cancellation at the next weekly boundary.
             while not idle.waits.empty():
                 idle.waits.get_nowait()
@@ -497,6 +517,6 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             assert reopened.store.list("workflow_run", 3) == actual_runs
             assert reopened.store.list("workflow_occurrence", 3) == occurrences
             assert len(search_requests) == 1 and rounds["worker"] == 2 and rounds["reviewer"] == 1
-            assert len([item for item in requests if str(item["user_id"]) == "7"]) == 2
+            assert requests == []
     finally:
         await reopened.close()

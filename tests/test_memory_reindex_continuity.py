@@ -13,7 +13,6 @@ from typing import Any
 import httpx
 import pytest
 from test_attachment_memory_continuity import attachment_settings, platform_reply
-from test_channels import terminal
 from test_mobile_task_control_followup import delivery_text, phone, processed_reply
 from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, completed, eventually, tool_result
@@ -579,8 +578,13 @@ async def exercise_reindex(
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == replies[phase]
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "7"
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+            assert deliveries == []
+            web_messages = await web.get(f"/api/sessions/{main_id}/messages")
+            assert web_messages.status_code == 200
+            assert any(
+                item["id"] == reply["id"] and item["content"] == replies[phase]
+                for item in web_messages.json()["messages"]
+            )
             assert available, "真实主工具目录缺少显式语义索引接续入口"
             assert "error" not in indexed
             plan_id = indexed["plan_id"]
@@ -598,8 +602,13 @@ async def exercise_reindex(
                 current = [
                     item for item in manager.deliveries() if delivery_text(item) == replies[phase]
                 ]
-                assert len(current) == 1 and current[0]["route"]["target"] == "8"
-                assert (await terminal(manager, current[0]["id"]))["state"] == "sent"
+                assert current == []
+                web_messages = await web.get(f"/api/sessions/{main_id}/messages")
+                assert web_messages.status_code == 200
+                assert any(
+                    item["id"] == other_reply["id"] and item["content"] == replies[phase]
+                    for item in web_messages.json()["messages"]
+                )
                 assert not first_release.is_set()
                 first_release.set()
                 await asyncio.wait_for(second_entered.wait(), 4)
@@ -693,8 +702,7 @@ async def exercise_reindex(
             deliveries = [
                 item for item in manager.deliveries() if delivery_text(item) == replies[phase]
             ]
-            assert len(deliveries) == 1 and deliveries[0]["route"]["target"] == "8"
-            assert (await terminal(manager, deliveries[0]["id"]))["state"] == "sent"
+            assert deliveries == []
             web_messages = await web.get(f"/api/sessions/{main_id}/messages")
             assert web_messages.status_code == 200
             assert any(

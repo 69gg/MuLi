@@ -30,11 +30,16 @@ Case = tuple[Runtime, ChannelApplication, list[str]]
 
 @pytest.fixture
 async def reply_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Case]:
+    hold_telegram_poll = asyncio.Event()
+
     async def transport(
         _transport: httpx.AsyncHTTPTransport, request: httpx.Request
     ) -> httpx.Response:
         assert request.url.host == "platform.invalid"
         assert request.method == "POST"
+        if request.url.path.endswith("/getUpdates"):
+            await hold_telegram_poll.wait()
+            raise AssertionError("正常关闭应取消 Telegram 长轮询")
         assert request.url.path in {"/upload_private_file", "/send_private_msg"}
         return httpx.Response(
             200, json={"status": "ok", "retcode": 0, "data": {"message_id": "offline"}}
@@ -273,8 +278,25 @@ async def test_web_unattributed_and_group_requests_never_choose_a_private_fallba
     for source in ("web", "legacy-owner-input"):
         await runtime.submit("只在当前本地会话核对附件。", source=source, event_id=source)
         await finish(runtime, runtime.main_session()["id"], errors)
+    # OneBot now rejects groups before admission. Preserve this tool-origin
+    # boundary with a channel whose configured owner group is actually admitted.
+    runtime.config.update(
+        {
+            "channels": {
+                "telegram": {
+                    "enabled": True,
+                    "account_id": "123",
+                    "token": "123:FAKE_TOKEN",
+                    "base_url": "https://platform.invalid",
+                    "owner_ids": ["7"],
+                    "allowed_groups": ["99"],
+                }
+            }
+        }
+    )
+    await channels.reconfigure()
     await channels.manager.receive(
-        "onebot", IncomingMessage("group-input", "7", "99", "只在群里核对。", kind="group")
+        "telegram", IncomingMessage("group-input", "7", "99", "只在群里核对。", kind="group")
     )
     await finish(runtime, runtime.main_session()["id"], errors)
     assert observed == ["web", "unattributed", "group"]

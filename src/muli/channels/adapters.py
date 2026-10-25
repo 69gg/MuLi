@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Mapping
 from pathlib import PurePath
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -397,14 +397,33 @@ class OneBot(Adapter):
         return (text, account) if is_mobile_control_text(text) else ("", "")
 
     def webhook(self, payload: dict[str, Any]) -> tuple[IncomingMessage, ...]:
-        if payload.get("post_type") not in {"message", "notice"} or payload.get("anonymous"):
+        post_type = payload.get("post_type")
+        if (
+            payload.get("anonymous")
+            or payload.get("group_id") is not None
+            or (post_type == "message" and payload.get("message_type") != "private")
+            or (
+                post_type == "notice"
+                and (
+                    payload.get("notice_type") != "offline_file"
+                    or payload.get("message_type") not in (None, "private")
+                )
+            )
+            or post_type not in ("message", "notice")
+        ):
             return ()
         sender, event_id = identifier(payload.get("user_id")), identifier(payload.get("message_id"))
-        group = identifier(payload.get("group_id"))
-        kind: Literal["private", "group"] = "group" if group else "private"
+        if sender not in self.profile.owner_ids:
+            return ()
+        if self.profile.account_id and (
+            type(payload.get("self_id")) is not int
+            or payload["self_id"] <= 0
+            or str(payload["self_id"]) != self.profile.account_id
+        ):
+            return ()
         text: list[str] = []
         files: list[RemoteFile] = []
-        segments = payload.get("message", [])
+        segments = payload.get("message", []) if post_type == "message" else []
         if isinstance(segments, str):
             text.append(segments)
         elif isinstance(segments, list):
@@ -423,8 +442,7 @@ class OneBot(Adapter):
                             metadata={"type": segment_type},
                         )
                     )
-        notice = payload.get("notice_type")
-        if notice in {"group_upload", "offline_file"}:
+        if post_type == "notice":
             file = object_value(payload.get("file"))
             file_id = identifier(file.get("id"))
             size = file.get("size")
@@ -446,9 +464,9 @@ class OneBot(Adapter):
             IncomingMessage(
                 event_id,
                 sender,
-                group or sender,
+                sender,
                 "".join(text),
-                kind,
+                "private",
                 event_id,
                 tuple(files),
                 control_text=control_text,

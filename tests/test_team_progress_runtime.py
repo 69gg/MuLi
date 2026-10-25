@@ -174,7 +174,22 @@ async def test_running_child_asks_main_on_its_original_phone_while_another_owner
                 runs["acknowledgement"] = runtime.run_ids[main_id]
                 turn = ModelTurn(content=acknowledgement)
             elif main_rounds == 3:
-                assert any(other_input == message.content for message in messages)
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(other_input)
+                )
+                header, content = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": "onebot",
+                    "account_id": "123",
+                    "sender_id": "8",
+                    "target": "8",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert content == other_input
                 assert original not in "\n".join(message.content for message in messages)
                 runs["other"] = runtime.run_ids[main_id]
                 other_entered.set()
@@ -379,15 +394,13 @@ async def test_running_child_asks_main_on_its_original_phone_while_another_owner
             manager = app.state.channel_application.manager
             await processed_reply(runtime, manager, stage_message["id"])
             stages = [item for item in manager.deliveries() if delivery_text(item) == stage_reply]
-            assert len(stages) == 1
-            delivery = await terminal(manager, stages[0]["id"])
-            assert delivery["state"] == "sent" and delivery["route"]["target"] == "7"
+            assert stages == []
             assert (
                 sum(
                     "".join(part["data"]["text"] for part in item["message"]) == stage_reply
                     for item in sent
                 )
-                == 1
+                == 0
             )
             assert not any(
                 str(item["user_id"]) == "8"
@@ -417,7 +430,7 @@ async def test_running_child_asks_main_on_its_original_phone_while_another_owner
             assert all(len(messages) <= 32 for views in seen.values() for messages in views)
             assert (
                 len([item for item in manager.deliveries() if delivery_text(item) == stage_reply])
-                == 1
+                == 0
             )
     finally:
         release_worker.set()
@@ -519,7 +532,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
             first_main_rounds += 1
             seen.append(deepcopy(messages))
             runs["current_main"] = runtime.run_ids[main_id]
-            assert first_main_rounds <= 4
+            assert first_main_rounds <= 5
             if first_main_rounds == 1:
                 turn = ModelTurn(
                     tool_calls=[
@@ -548,7 +561,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
                 stage_reply = f"队友已读资料：{payload['content']}"
                 runs["question"] = runtime.run_ids[main_id]
                 turn = ModelTurn(content=stage_reply)
-            else:
+            elif first_main_rounds == 4:
                 report = next(
                     message
                     for message in reversed(messages)
@@ -558,6 +571,21 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
                 payload = json.loads(report.content.split("\n", 1)[1])
                 assert payload["id"] == worker_id and payload["result"] == first_done
                 runs["boundary"] = runtime.run_ids[main_id]
+                turn = ModelTurn(
+                    tool_calls=[
+                        call(
+                            "send-unconfirmed-boundary",
+                            "channel_send",
+                            channel="onebot",
+                            target="7",
+                            text=boundary_reply,
+                            idempotency_key="progress-boundary-once",
+                        )
+                    ]
+                )
+            else:
+                delivery = tool_result(messages, "send-unconfirmed-boundary")
+                assert isinstance(delivery["id"], str) and "error" not in delivery
                 turn = ModelTurn(content=boundary_reply)
             yield StreamEvent("done", turn=turn)
 
@@ -666,9 +694,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
             stage_message = completed(runtime, stage_reply)[0]
             await processed_reply(runtime, manager, stage_message["id"])
             stages = [item for item in manager.deliveries() if delivery_text(item) == stage_reply]
-            assert len(stages) == 1
-            stage_delivery = await terminal(manager, stages[0]["id"])
-            assert stage_delivery["state"] == "sent" and stage_delivery["route"]["target"] == "7"
+            assert stages == []
             finish_first.set()
             await wait_reply(boundary_reply)
             assert await runtime.wait(runs["boundary"]) == boundary_reply
@@ -688,7 +714,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
                 and old_report["status"] == "delivered"
             )
             assert runtime.conversation.pending(worker_id) == []
-            assert first_main_rounds == 4 and first_worker_rounds == 3
+            assert first_main_rounds == 5 and first_worker_rounds == 3
             await asyncio.wait_for(app.state.close(), 3)
     finally:
         begin_read.set()
@@ -721,9 +747,22 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
             runs["current_main"] = reopened.run_ids[main_id]
             assert resumed_main_rounds <= 3
             if resumed_main_rounds == 1:
-                assert any(
-                    message.role == "user" and message.content == answer for message in messages
+                incoming = next(
+                    message
+                    for message in messages
+                    if message.role == "user" and message.content.endswith(answer)
                 )
+                header, content = incoming.content.split("\n", 1)
+                assert header.startswith("渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）：")
+                assert json.loads(header.split("：", 1)[1]) == {
+                    "channel": "onebot",
+                    "account_id": "123",
+                    "sender_id": "7",
+                    "target": "7",
+                    "kind": "private",
+                    "input_id": incoming.source_message_id,
+                }
+                assert content == answer
                 turn = ModelTurn(
                     tool_calls=[
                         call("answer-same-child", "send_input", target=worker_id, message=answer)
@@ -843,9 +882,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
             assert final_message["reply_origin"] == original_origin
             await processed_reply(reopened, manager, final_message["id"])
             finals = [item for item in manager.deliveries() if delivery_text(item) == final_reply]
-            assert len(finals) == 1
-            delivery = await terminal(manager, finals[0]["id"])
-            assert delivery["state"] == "sent" and delivery["route"] == original_origin["route"]
+            assert finals == []
             assert manager.delivery(unknown["id"]) == unknown
             assert (
                 sum(
@@ -859,7 +896,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
                     "".join(part["data"]["text"] for part in item["message"]) == final_reply
                     for item in sent
                 )
-                == 1
+                == 0
             )
             restored = reopened.team.get(worker_id)
             report = reopened.store.get("team_report", second_worker_run)
@@ -882,7 +919,7 @@ async def test_owner_answer_after_reopen_continues_the_same_child_without_replay
                 for item in reopened.store.messages(main_id)
                 for call in item.get("tool_calls", [])
             ]
-            assert main_calls == ["spawn_agent", "send_input"]
+            assert main_calls == ["spawn_agent", "channel_send", "send_input"]
             history = await web.get(f"/api/sessions/{main_id}/messages")
             assert history.status_code == 200
             assert any(item["content"] == final_reply for item in history.json()["messages"])
