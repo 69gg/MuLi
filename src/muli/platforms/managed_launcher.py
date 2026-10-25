@@ -202,7 +202,9 @@ def read_file(path: Path, limit: int, *, private: bool = False) -> tuple[bytes, 
         return read_at(descriptor, path.name, limit, private=private)
 
 
-def fingerprint(path: Path, limit: int) -> dict[str, object]:
+def fingerprint(
+    path: Path, limit: int, *, verified: dict[str, Any] | None = None
+) -> dict[str, object]:
     hashed, size = hashlib.sha256(), 0
     with directory(path.parent) as parent:
         descriptor = os.open(
@@ -212,20 +214,35 @@ def fingerprint(path: Path, limit: int) -> dict[str, object]:
             before = identity(os.fstat(source.fileno()))
             if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
                 raise LaunchError("managed_file_unsupported")
-            while chunk := source.read(min(65_536, limit - size + 1)):
-                size += len(chunk)
-                if size > limit:
-                    raise LaunchError("managed_file_unsupported")
-                hashed.update(chunk)
+            # This optional evidence belongs to one caller's synchronous
+            # verification. Reopen and check this file independently even
+            # when another retained slot just authenticated the same bytes.
+            if (
+                verified is not None
+                and verified.get("path") == str(path)
+                and verified.get("identity") == before
+                and type(verified.get("digest")) is str
+                and _DIGEST.fullmatch(verified["digest"]) is not None
+            ):
+                checksum = verified["digest"]
+            else:
+                while chunk := source.read(min(65_536, limit - size + 1)):
+                    size += len(chunk)
+                    if size > limit:
+                        raise LaunchError("managed_file_unsupported")
+                    hashed.update(chunk)
+                checksum = hashed.hexdigest()
             after = identity(os.fstat(source.fileno()))
         if before != after or before != identity(
             os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         ):
             raise LaunchError("managed_file_changed")
-    return {"path": str(path), "identity": before, "digest": hashed.hexdigest()}
+    return {"path": str(path), "identity": before, "digest": checksum}
 
 
-def python_fingerprint(entry: Path, limit: int) -> dict[str, object]:
+def python_fingerprint(
+    entry: Path, limit: int, *, verified: dict[str, Any] | None = None
+) -> dict[str, object]:
     """Follow only a bounded chain of final-component interpreter links."""
     target = absolute(str(entry))
     links: list[tuple[Path, dict[str, int], str]] = []
@@ -243,7 +260,11 @@ def python_fingerprint(entry: Path, limit: int) -> dict[str, object]:
                 continue
             if not before["mode"] & 0o111:
                 raise LaunchError("managed_python_not_executable")
-            result = fingerprint(target, limit)
+            result = (
+                fingerprint(target, limit)
+                if verified is None
+                else fingerprint(target, limit, verified=verified)
+            )
             break
     else:
         raise LaunchError("managed_python_link_budget")
@@ -340,7 +361,9 @@ def _limits(value: object) -> dict[str, int]:
     return limits
 
 
-def verify_slot_files(slot: dict[str, Any]) -> None:
+def verify_slot_files(
+    slot: dict[str, Any], *, verified_python: dict[str, Any] | None = None
+) -> None:
     _version(slot)
     prefix = absolute(slot.get("prefix"))
     python = absolute(slot.get("lexical_python"))
@@ -352,7 +375,12 @@ def verify_slot_files(slot: dict[str, Any]) -> None:
     python_bytes = slot.get("python_bytes")
     if type(python_bytes) is not int or not 1 <= python_bytes <= 67_108_864:
         raise LaunchError("managed_record_invalid")
-    if python_fingerprint(python, python_bytes) != slot.get("resolved_python"):
+    actual_python = (
+        python_fingerprint(python, python_bytes)
+        if verified_python is None
+        else python_fingerprint(python, python_bytes, verified=verified_python)
+    )
+    if actual_python != slot.get("resolved_python"):
         raise LaunchError("managed_python_changed")
     if fingerprint(prefix / "pyvenv.cfg", limits["file_bytes"]) != slot.get("pyvenv"):
         raise LaunchError("managed_python_changed")

@@ -31,6 +31,7 @@ from muli.managed_transaction import (
     raw_snapshot,
 )
 from muli.management_transaction import Deadline, Intent, Phase, Role, TransactionJournal, _snapshot
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_transaction import (
     ProbeLimits,
     ProcessIdentity,
@@ -321,9 +322,7 @@ class ObservedBackend(ManagedLinuxBackend):
         self.check_calls += 1
         controller_verify = managed_deployment.verify_slot_files
         # The backend's existing private import is the selected-role lookup seam.
-        selected_verify = cast(
-            Callable[[SlotIdentity], None], vars(managed_backend)["verify_slot_files"]
-        )
+        selected_verify = cast(Callable[..., None], vars(managed_backend)["verify_slot_files"])
 
         def controller(slot: SlotIdentity) -> None:
             before = time.monotonic()
@@ -333,11 +332,11 @@ class ObservedBackend(ManagedLinuxBackend):
             finally:
                 self.controller_seconds += time.monotonic() - before
 
-        def selected(slot: SlotIdentity) -> None:
+        def selected(slot: SlotIdentity, *, verified_python: FileFingerprint | None = None) -> None:
             before = time.monotonic()
             self.selected_calls += 1
             try:
-                selected_verify(slot)
+                selected_verify(slot, verified_python=verified_python)
             finally:
                 self.selected_seconds += time.monotonic() - before
 

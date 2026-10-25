@@ -166,8 +166,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                     raise ObservationError("managed_slot_changed")
         # verify_anchor authenticated the controller in this synchronous check.
         # Equal frozen installations share that proof only until this call returns.
+        # Distinct slots still reopen/walk their Python and verify their package;
+        # only an identical resolved file identity can reuse the controller SHA.
         if role is not None and self.slots[role] != self.controller_slot:
-            verify_slot_files(self.slots[role])
+            verify_slot_files(
+                self.slots[role], verified_python=self.controller_slot.resolved_python
+            )
 
     def _effect_guard(self, record: TransactionRecordV2, role: Role | None) -> None:
         self._check(record, role)

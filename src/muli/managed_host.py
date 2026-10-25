@@ -292,7 +292,12 @@ async def run_managed_helper(
                 )
 
                 def read() -> TransactionRecordV2:
-                    return _record(control, anchor)[0]
+                    # drive_loop has just authenticated the helper; this fresh
+                    # read only detects progress before the driver's own guards.
+                    record = control.read_current()
+                    if not isinstance(record, TransactionRecordV2):
+                        raise TransactionError("managed_transaction_required")
+                    return record
 
                 return await drive_loop(
                     driver.step, read, backend.observe, limits, clock, verify_helper

@@ -254,10 +254,18 @@ def register_local_slot(
         raise ManagedDeploymentError("managed_slot_unsupported") from None
 
 
-def verify_slot_files(slot: SlotIdentity) -> None:
+def verify_slot_files(
+    slot: SlotIdentity, *, verified_python: FileFingerprint | None = None
+) -> None:
     _platform()
     try:
-        _verify_slot_files(slot.model_dump(mode="json"))
+        if verified_python is None:
+            _verify_slot_files(slot.model_dump(mode="json"))
+        else:
+            _verify_slot_files(
+                slot.model_dump(mode="json"),
+                verified_python=verified_python.model_dump(mode="json"),
+            )
     except (OSError, ValueError):
         raise ManagedDeploymentError("managed_slot_changed") from None
 
