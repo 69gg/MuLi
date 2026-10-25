@@ -20,11 +20,11 @@ from contextlib import closing
 from functools import wraps
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast, get_args
 
 if TYPE_CHECKING:
     from muli.managed_transaction import TransactionRecordV2
-    from muli.management_transaction import Role, TransactionJournal
+    from muli.management_transaction import JournalControl, Role, TransactionJournal
     from muli.platforms.linux_transaction import CommandRunner, SystemdProbe
     from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
     from muli.store import Store
@@ -42,6 +42,28 @@ HARNESS_MEMORY = MEMORY // 4
 HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
+# Version-two diagnostic labels, readable by the stdlib-only coordinator.
+HELPER_COST_PHASES = (
+    "prepared",
+    "draining",
+    "activating",
+    "verifying",
+    "rolling_back",
+    "committed",
+    "rolled_back",
+    "aborted",
+    "recovery_required",
+)
+HELPER_COST_INTENTS = (
+    "none",
+    "stop_base",
+    "install_target",
+    "start_target",
+    "stop_target",
+    "restore_base",
+    "start_base",
+    "verify_base",
+)
 PROCESS_STATES = frozenset("RSDZTtXxKWPI")
 SOCKET_SUB_STATES = frozenset(
     {
@@ -3166,12 +3188,14 @@ def helper_costs_facts(value: object, source: object) -> bool:
             "output_budget",
         )
     identity = {"generation", "helper", "uid", "pid", "invocation"}
+    version = value.get("version")
+    extra = {"host_record", "check_breakdown"} if version == 2 else set()
     if (
         not isinstance(source, dict)
         or set(source) != identity
-        or set(value) != identity | {"version", "code", "checks", "bus", "http"}
-        or type(value["version"]) is not int
-        or value["version"] != 1
+        or set(value) != identity | {"version", "code", "checks", "bus", "http"} | extra
+        or type(version) is not int
+        or version not in (1, 2)
         or value["code"] != "observed"
         or any(
             type(value[key]) is not type(source[key]) or value[key] != source[key]
@@ -3179,12 +3203,48 @@ def helper_costs_facts(value: object, source: object) -> bool:
         )
     ):
         return False
-    return all(
-        isinstance(value[name], dict)
-        and set(value[name]) == {"count", "total_ms"}
-        and all(type(item) is int and 0 <= item <= 2**63 - 1 for item in value[name].values())
-        for name in ("checks", "bus", "http")
-    )
+
+    def metric(item: object) -> bool:
+        return (
+            isinstance(item, dict)
+            and set(item) == {"count", "total_ms"}
+            and all(type(number) is int and 0 <= number <= 2**63 - 1 for number in item.values())
+        )
+
+    if not all(metric(value[name]) for name in ("checks", "bus", "http")):
+        return False
+    if version == 1:
+        return True
+    rows = value["check_breakdown"]
+    phases, intents = HELPER_COST_PHASES, HELPER_COST_INTENTS
+    if (
+        not metric(value["host_record"])
+        or not isinstance(rows, list)
+        or len(rows) > len(phases) * len(intents)
+    ):
+        return False
+    seen: set[tuple[str, str]] = set()
+    count, milliseconds = 0, 0
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"phase", "intent", "count", "total_ms"}
+            or type(row["phase"]) is not str
+            or type(row["intent"]) is not str
+            or row["phase"] not in phases
+            or row["intent"] not in intents
+            or not metric({key: row[key] for key in ("count", "total_ms")})
+            or row["count"] == 0
+        ):
+            return False
+        key = row["phase"], row["intent"]
+        if key in seen:
+            return False
+        seen.add(key)
+        count += row["count"]
+        milliseconds += row["total_ms"]
+    # Per-bucket integer truncation can lose milliseconds, never add them.
+    return count == value["checks"]["count"] and milliseconds <= value["checks"]["total_ms"]
 
 
 def helper_cost_sample_facts(value: object, source: object) -> bool:
@@ -3259,11 +3319,12 @@ def install_unit_birth_hook() -> None:
 def install_helper_cost_hook() -> None:
     """Observe only the exact isolated helper; never change its control flow."""
     try:
+        import muli.managed_host as managed_host
         from muli.managed_controller import BindingConfirmation
         from muli.managed_host import managed_helper_unit_name
         from muli.managed_journal import RoleSnapshots
         from muli.managed_transaction import TransactionRecordV2
-        from muli.management_transaction import TransactionJournal
+        from muli.management_transaction import Intent, Phase, TransactionJournal
         from muli.platforms.linux_transaction import SystemdProbe
         from muli.platforms.managed_backend import ManagedLinuxBackend
 
@@ -3289,6 +3350,10 @@ def install_helper_cost_hook() -> None:
             "native_profile_arguments",
         )
         fixture(root)
+        require(
+            get_args(Phase) == HELPER_COST_PHASES and get_args(Intent) == HELPER_COST_INTENTS,
+            "native_profile_contract",
+        )
         info = root.lstat()
         require(
             stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
@@ -3306,7 +3371,7 @@ def install_helper_cost_hook() -> None:
         require(isinstance(record, TransactionRecordV2), "native_profile_record")
         assert isinstance(record, TransactionRecordV2)
         facts: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "code": "observed",
             "generation": record.generation,
             "helper": managed_helper_unit_name(record),
@@ -3314,8 +3379,10 @@ def install_helper_cost_hook() -> None:
             "pid": os.getpid(),
             "invocation": invocation,
         }
-        counts = {name: 0 for name in ("checks", "bus", "http")}
+        counts = {name: 0 for name in ("checks", "bus", "http", "host_record")}
         totals = {name: 0.0 for name in counts}
+        phase_counts: dict[tuple[str, str], int] = {}
+        phase_totals: dict[tuple[str, str], float] = {}
         usable, saved, sampled = True, False, False
         clock = time.perf_counter
 
@@ -3330,31 +3397,56 @@ def install_helper_cost_hook() -> None:
                 usable = False
                 return None
 
-        def finish(name: str, started: float | None) -> None:
+        def finish(name: str, started: float | None) -> float | None:
             nonlocal usable
             try:
                 if started is None:
-                    return
+                    return None
                 elapsed = clock() - started
                 if not math.isfinite(elapsed) or elapsed < 0:
                     raise ValueError
                 counts[name] += 1
                 totals[name] += elapsed
+                return elapsed
             except Exception:
                 usable = False
+                return None
 
         original_check = ManagedLinuxBackend._check
         original_command = SystemdProbe._command
         original_request = ManagedLinuxBackend._request
         original_install = ManagedLinuxBackend.install
+        original_record = managed_host._record
 
         @wraps(original_check)
         def check(*args: Any, **kwargs: Any) -> None:
+            nonlocal usable
             started = begin()
             try:
                 return original_check(*args, **kwargs)
             finally:
-                finish("checks", started)
+                elapsed = finish("checks", started)
+                try:
+                    current = args[1] if len(args) > 1 else kwargs["record"]
+                    if not isinstance(current, TransactionRecordV2) or elapsed is None:
+                        raise ValueError
+                    key = current.phase, current.intent
+                    if key[0] not in get_args(Phase) or key[1] not in get_args(Intent):
+                        raise ValueError
+                    phase_counts[key] = phase_counts.get(key, 0) + 1
+                    phase_totals[key] = phase_totals.get(key, 0.0) + elapsed
+                except Exception:
+                    usable = False
+
+        @wraps(original_record)
+        def host_record(
+            control: JournalControl, anchor: DeploymentAnchor
+        ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+            started = begin()
+            try:
+                return original_record(control, anchor)
+            finally:
+                finish("host_record", started)
 
         @wraps(original_command)
         async def command(*args: Any, **kwargs: Any) -> str:
@@ -3400,6 +3492,15 @@ def install_helper_cost_hook() -> None:
                     name: {"count": counts[name], "total_ms": int(elapsed * 1000)}
                     for name, elapsed in totals.items()
                 },
+                "check_breakdown": [
+                    {
+                        "phase": phase,
+                        "intent": intent,
+                        "count": phase_counts[phase, intent],
+                        "total_ms": int(phase_totals[phase, intent] * 1000),
+                    }
+                    for phase, intent in sorted(phase_counts)
+                ],
             }
             source = {
                 key: facts[key] for key in ("generation", "helper", "uid", "pid", "invocation")
@@ -3452,6 +3553,7 @@ def install_helper_cost_hook() -> None:
         SystemdProbe._command = command  # type: ignore[method-assign]
         ManagedLinuxBackend._request = request  # type: ignore[method-assign]
         ManagedLinuxBackend.install = install  # type: ignore[method-assign,assignment]
+        managed_host._record = host_record
     except Exception:
         return  # A missing observer must not prevent the original helper starting.
 

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
+import builtins
 import copy
 import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -20,17 +22,48 @@ from test_managed_native_ci import ci
 from test_managed_native_ci import fixture as fixture
 from test_managed_native_ci import forbid_real_effects as forbid_real_effects
 
+import muli.managed_host as managed_host
 from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
 from muli.management_transaction import TransactionError, TransactionJournal
 from muli.platforms.linux_transaction import SystemdProbe, UnitSnapshot
 from muli.platforms.managed_backend import ManagedLinuxBackend
-from muli.platforms.managed_deployment import SlotIdentity
+from muli.platforms.managed_deployment import DeploymentAnchor, DeploymentStore, SlotIdentity
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux isolated helper fixture")
 
 
+@pytest.mark.parametrize("include_host_record", [False, True])
 async def test_generated_managed_helper_hook_measures_real_checks_without_changing_their_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: tuple[Any, Any]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    include_host_record: bool,
+) -> None:
+    await _exercise_generated_hook(tmp_path, monkeypatch, fixture, include_host_record)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_native_host_record_observer_preserves_actual_failure_and_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    cancelled: bool,
+) -> None:
+    failure = (
+        asyncio.CancelledError("private exception body")
+        if cancelled
+        else RuntimeError("private exception body")
+    )
+    await _exercise_generated_hook(tmp_path, monkeypatch, fixture, True, host_failure=failure)
+
+
+async def _exercise_generated_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    include_host_record: bool,
+    *,
+    host_failure: BaseException | None = None,
 ) -> None:
     native, _ = fixture
     native.prepare()
@@ -53,6 +86,7 @@ async def test_generated_managed_helper_hook_measures_real_checks_without_changi
     # claim to execute Python -I, PAM, cgroups, or a real systemd helper.
     monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
     for owner, name in (
+        (managed_host, "_record"),
         (ManagedLinuxBackend, "_check"),
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
@@ -93,6 +127,47 @@ async def test_generated_managed_helper_hook_measures_real_checks_without_changi
                 monkeypatch.setattr(sys, "argv", list(helper_argv[3:]))
                 monkeypatch.setattr(atexit, "register", register)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
+                if include_host_record:
+                    observed_directories: list[tuple[Path, ...]] = []
+
+                    def filesystems(directories: Sequence[Path]) -> None:
+                        # Only mount admission is controlled, as in the real
+                        # host fixture; _record's retained-file checks delegate.
+                        observed_directories.append(tuple(directories))
+
+                    monkeypatch.setattr(managed_host, "verify_local_filesystems", filesystems)
+                    journal.database.write_bytes(b"")
+                    journal.database.chmod(0o600)
+                    if host_failure is None:
+                        current, controller, slots = managed_host._record(control, host.anchor)
+                        assert current == record
+                        assert controller == host.slots["base"] and slots == host.slots
+                    else:
+                        original_anchor = DeploymentStore.verify_anchor
+                        authenticated: list[DeploymentAnchor] = []
+
+                        def failing_anchor(
+                            store: DeploymentStore, anchor: DeploymentAnchor
+                        ) -> None:
+                            original_anchor(store, anchor)
+                            authenticated.append(anchor)
+                            assert host_failure is not None
+                            raise host_failure
+
+                        with monkeypatch.context() as local:
+                            local.setattr(DeploymentStore, "verify_anchor", failing_anchor)
+                            with pytest.raises(type(host_failure)) as caught:
+                                managed_host._record(control, host.anchor)
+                            assert caught.value is host_failure
+                        assert authenticated == [host.anchor]
+                    assert observed_directories == [
+                        (
+                            journal.directory.path,
+                            Path(host.anchor.config_path).parent,
+                            journal.database.parent,
+                            journal.writer_directory.path,
+                        )
+                    ]
                 assert host.backend._check(record) is None
                 stale = record.model_copy(update={"revision": record.revision + 1})
                 with pytest.raises(TransactionError, match="^stale_revision$"):
@@ -103,6 +178,13 @@ async def test_generated_managed_helper_hook_measures_real_checks_without_changi
                 callbacks[0]()
                 callbacks[0]()  # The same atexit callback is a single write attempt.
                 facts = json.loads(path.read_text(encoding="utf-8"))
+                assert "private exception body" not in path.read_text(encoding="utf-8")
+                if include_host_record:
+                    assert "host_record" in facts, (
+                        "the helper authenticated real retained files outside backend._check, "
+                        "but its native costs omitted that host authentication"
+                    )
+                    assert facts["host_record"]["count"] == 1
                 assert set(facts) == {
                     "version",
                     "code",
@@ -114,8 +196,10 @@ async def test_generated_managed_helper_hook_measures_real_checks_without_changi
                     "checks",
                     "bus",
                     "http",
+                    "host_record",
+                    "check_breakdown",
                 }
-                assert facts["version"] == 1 and facts["code"] == "observed"
+                assert facts["version"] == 2 and facts["code"] == "observed"
                 assert facts["generation"] == record.generation
                 assert facts["helper"] == managed_helper_unit_name(record)
                 assert (facts["uid"], facts["pid"], facts["invocation"]) == (
@@ -124,10 +208,23 @@ async def test_generated_managed_helper_hook_measures_real_checks_without_changi
                     invocation,
                 )
                 assert facts["checks"]["count"] == 2
-                for name in ("checks", "bus", "http"):
+                for name in ("checks", "bus", "http", "host_record"):
                     assert set(facts[name]) == {"count", "total_ms"}
                     assert all(type(value) is int and value >= 0 for value in facts[name].values())
                 assert facts["bus"]["count"] == facts["http"]["count"] == 0
+                assert facts["host_record"]["count"] == int(include_host_record)
+                assert facts["check_breakdown"] == [
+                    {
+                        "phase": record.phase,
+                        "intent": record.intent,
+                        "count": 2,
+                        "total_ms": facts["checks"]["total_ms"],
+                    }
+                ]
+                source = {
+                    key: facts[key] for key in ("generation", "helper", "uid", "pid", "invocation")
+                }
+                assert worker.helper_costs_facts(facts, source)
                 assert path.stat().st_mode & 0o077 == 0
             finally:
                 host.release_writer()
@@ -175,6 +272,7 @@ async def test_real_install_publishes_second_helper_partial_before_atexit(
 
     monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
     for owner, name in (
+        (managed_host, "_record"),
         (ManagedLinuxBackend, "_check"),
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
@@ -407,7 +505,7 @@ async def test_real_install_publishes_second_helper_partial_before_atexit(
                 await host.backend.__aexit__()
 
 
-def costs_result() -> tuple[dict[str, Any], dict[str, Any]]:
+def costs_result(*, version: int = 1) -> tuple[dict[str, Any], dict[str, Any]]:
     source = {
         "generation": "a" * 32,
         "helper": "muli-transaction-" + "b" * 64 + ".service",
@@ -416,13 +514,18 @@ def costs_result() -> tuple[dict[str, Any], dict[str, Any]]:
         "invocation": "c" * 32,
     }
     facts = {
-        "version": 1,
+        "version": version,
         "code": "observed",
         **source,
         "checks": {"count": 3, "total_ms": 123},
         "bus": {"count": 2, "total_ms": 45},
         "http": {"count": 0, "total_ms": 0},
     }
+    if version == 2:
+        facts.update(
+            host_record={"count": 2, "total_ms": 87},
+            check_breakdown=[{"phase": "prepared", "intent": "none", "count": 3, "total_ms": 123}],
+        )
     result = {
         "completed": False,
         "stage": "transaction",
@@ -436,12 +539,96 @@ def costs_result() -> tuple[dict[str, Any], dict[str, Any]]:
     return result, facts
 
 
-def test_costs_are_collected_once_from_private_file_and_bound_to_helper(tmp_path: Path) -> None:
-    result, facts = costs_result()
+@pytest.mark.parametrize("version", [1, 2])
+def test_costs_are_collected_once_from_private_file_and_bound_to_helper(
+    tmp_path: Path, version: int
+) -> None:
+    result, facts = costs_result(version=version)
     worker.write_json(tmp_path / "helper-costs.json", facts)
     worker.collect_helper_costs(tmp_path, result)
     assert result["resources"]["helper_costs"] == facts
     assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+def test_cost_schema_reader_does_not_import_the_application(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+    forbidden: list[str] = []
+
+    def checked_import(
+        name: str,
+        globals: dict[str, Any] | None = None,
+        locals: dict[str, Any] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> Any:
+        if name == "muli" or name.startswith("muli."):
+            forbidden.append(name)
+            raise AssertionError("coordinator reader imported the application")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", checked_import)
+    for version in (1, 2):
+        result, facts = costs_result(version=version)
+        assert worker.helper_costs_facts(facts, result["resources"]["helper_source"])
+        result["resources"]["helper_costs"] = facts
+        assert ci.fixture_result(json.dumps(result).encode()) == result
+    assert forbidden == []
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "host_bool",
+        "host_extra",
+        "host_missing",
+        "unknown_phase",
+        "unknown_intent",
+        "duplicate_bucket",
+        "count_mismatch",
+        "time_overflow",
+        "row_extra",
+        "zero_bucket",
+        "too_many_buckets",
+        "version_downgrade",
+    ],
+)
+def test_version_two_costs_reject_non_contract_host_and_phase_facts(damage: str) -> None:
+    result, facts = costs_result(version=2)
+    rows = facts["check_breakdown"]
+    if damage == "host_bool":
+        facts["host_record"]["count"] = True
+    elif damage == "host_extra":
+        facts["host_record"]["path"] = "/must-not-export"
+    elif damage == "host_missing":
+        facts.pop("host_record")
+    elif damage == "unknown_phase":
+        rows[0]["phase"] = "private exception body"
+    elif damage == "unknown_intent":
+        rows[0]["intent"] = "unknown"
+    elif damage == "duplicate_bucket":
+        rows.append(copy.deepcopy(rows[0]))
+        facts["checks"]["count"] *= 2
+        facts["checks"]["total_ms"] *= 2
+    elif damage == "count_mismatch":
+        rows[0]["count"] += 1
+    elif damage == "time_overflow":
+        rows[0]["total_ms"] += 1
+    elif damage == "row_extra":
+        rows[0]["exception"] = "private exception body"
+    elif damage == "zero_bucket":
+        rows[0]["count"] = facts["checks"]["count"] = 0
+    elif damage == "too_many_buckets":
+        facts["check_breakdown"] *= (
+            len(worker.HELPER_COST_PHASES) * len(worker.HELPER_COST_INTENTS) + 1
+        )
+    else:
+        facts["version"] = 1
+    result["resources"]["helper_costs"] = facts
+    assert not worker.helper_costs_facts(facts, result["resources"]["helper_source"])
+    with pytest.raises(ci.FixtureError, match="^native_result_invalid$"):
+        ci.fixture_result(json.dumps(result).encode())
 
 
 def test_partial_cost_sample_never_displaces_existing_facts_at_the_original_byte_limit(
@@ -618,8 +805,11 @@ def test_missing_or_untrusted_costs_never_imply_zero(tmp_path: Path, state: str)
     assert ci.fixture_result(json.dumps(result).encode()) == result
 
 
-def test_costs_do_not_displace_existing_result_at_original_byte_limit(tmp_path: Path) -> None:
-    result, facts = costs_result()
+@pytest.mark.parametrize("version", [1, 2])
+def test_costs_do_not_displace_existing_result_at_original_byte_limit(
+    tmp_path: Path, version: int
+) -> None:
+    result, facts = costs_result(version=version)
     worker.write_json(tmp_path / "helper-costs.json", facts)
     # All 64 original timeline rows remain present, even when they leave less
     # space than a complete observer receipt. No source proof is cut to fit.
@@ -650,7 +840,12 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     callbacks: list[object] = []
-    originals = (ManagedLinuxBackend._check, SystemdProbe._command, ManagedLinuxBackend._request)
+    originals = (
+        ManagedLinuxBackend._check,
+        SystemdProbe._command,
+        ManagedLinuxBackend._request,
+        managed_host._record,
+    )
     monkeypatch.setattr(atexit, "register", lambda callback: callbacks.append(callback))
     monkeypatch.setattr(
         sys, "orig_argv", [sys.executable, "-I", "-m", "muli.management_helper", "/wrong"]
@@ -661,6 +856,7 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
         ManagedLinuxBackend._check,
         SystemdProbe._command,
         ManagedLinuxBackend._request,
+        managed_host._record,
     ) == originals
 
 
@@ -696,7 +892,12 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
         accesses.append(root)
         return {}
 
-    originals = (ManagedLinuxBackend._check, SystemdProbe._command, ManagedLinuxBackend._request)
+    originals = (
+        ManagedLinuxBackend._check,
+        SystemdProbe._command,
+        ManagedLinuxBackend._request,
+        managed_host._record,
+    )
     monkeypatch.setattr(sys, "prefix", str(prefix))
     monkeypatch.setattr(sys, "executable", executable)
     monkeypatch.setattr(sys, "orig_argv", arguments)
@@ -708,6 +909,7 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
         ManagedLinuxBackend._check,
         SystemdProbe._command,
         ManagedLinuxBackend._request,
+        managed_host._record,
     ) == originals
 
 

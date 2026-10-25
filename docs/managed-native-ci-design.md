@@ -1,14 +1,16 @@
 # 真实 systemd 托管切换 CI 设计
 
-最新原生检查是 [Native47](https://github.com/69gg/MuLi/actions/runs/40184138517)，准确候选 `575402b` 的原生作业失败：第一代 adopt、release、helper collected 与最终投影均完成；47.917 秒发起第二次 POST 排队请求，50.947 秒以 `TimeoutError` 结束。HTTP 客户端配置仍是 `HTTP_SECONDS=2`，不是 3 秒，也未达到总 60 秒期限。第二次请求是否已受理不能由超时判定；cleanup 已 verified，完整三事务仍未验收。准确边界见[原生检查记录](managed-native-checkpoint-proposal.md#native47真实结果第二次排队请求局部超时)。下面各轮保留当时事实。
+最新原生检查是 [Native48](https://github.com/69gg/MuLi/actions/runs/40185853686)，准确候选 `96bb3ec` 的原生作业失败：第一代最终投影在 38.590 秒完成；第二次 POST 于 38.592 秒发起，40.431 秒已 prepared，随后依次到达 draining、stop_base、install_target，最终在 60.001 秒以 `TimeoutError` / `helper_exit` 结束。第三事务未开始，cleanup verified，完整三事务仍未验收。本轮十一项通用作业成功，Windows 3.12 shard2 另有两个既有 UIA 真机探针在原 12 秒期限超时，均确认 cleanup；一个未观察到阶段且 stderr 为空，另一个到达 `uia_initializing`，不能归因于 source 去重。准确边界见[原生检查记录](managed-native-checkpoint-proposal.md#native48真实结果第二次排队成功仍触及总期限)。下面各轮保留当时事实。
 
 当前候选已与 v2.70 主分支整合，保留较新的 Windows UIA probe 路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。针对临时服务在多次查询间被回收的竞争，只在 RPC 失败后重新取得精确空列表时确认其已消失；格式、身份错误与取消不会降级。本机未创建测试用户、挂载文件系统或操作真实服务。
 
 Native47 除原生作业外，另有六个平台分片失败，并非通用检查全绿。根核对 Ubuntu 3.12 shard1 的四个失败节点，均为旧测量 stub 未接收 wrapper 已转交的 `verified_python` 关键字，抛出 `TypeError`；该测试接线已修并纳入本地整合，与原生 POST 超时分别记录。十二项通用作业通过属于 Native46，不移用至本轮。
 
-Native47 已包含同步检查内的 Python 指纹复用及 helper 进度读取去重，不能因第一代完成就认定整链性能问题解决。第二次 POST 只调用 `Management.stage` 排队；真正的 prepare 在同一事件循环的后台管理任务执行。同步 prepare 校验可能阻塞 ASGI 响应发送，是源码支持的待验证假说，不是本轮唯一已证根因。
+Native47 已包含同步检查内的 Python 指纹复用及 helper 进度读取去重，不能因第一代完成就认定整链性能问题解决。该轮第二次 POST 在 47.917 秒发起、50.947 秒超时，HTTP 配置仍是 2 秒，尚未达到总 60 秒；请求是否受理不能由超时判定。POST 只调用 `Management.stage` 排队；后台同步 prepare 可能阻塞 ASGI 响应发送是未证实假说。Native48 的第二次 POST 和 prepare 已成功，不继续据此假说修改请求链。
 
-Native48 候选继续只去除同一同步认证段内的重复工作：`_source` 已由 `verify_anchor` 完整认证 controller，且 source 与 controller 的完整 slot 身份相等时，仅再核当前进程；不同 slot 和无 anchor 分支保留原完整校验。`verify_source` 删除 `read_lineage` 前重复的 `current.verify()`，保留 reader 自身的验证、来源比较与候选门。本地八文件整合 161 项通过，守卫峰值 150.3 MiB、swap 0；非作者后审未发现 P1/P2。没有跨 await 缓存、提高 2 秒 HTTP 或 60 秒总期限、增加 skip；真实 CI 待验，不宣称已解决超时。
+Native48 只去除同一同步认证段内的重复工作：`_source` 已由 `verify_anchor` 完整认证 controller，且 source 与 controller 的完整 slot 身份相等时，仅再核当前进程；不同 slot 和无 anchor 分支保留原完整校验。`verify_source` 删除 `read_lineage` 前重复的 `current.verify()`，保留 reader 自身的验证、来源比较与候选门。本地八文件整合 161 项通过，守卫峰值 150.3 MiB、swap 0；非作者后审未发现 P1/P2。没有跨 await 缓存、提高 2 秒 HTTP 或 60 秒总期限、增加 skip；上面的真实失败仍保留。
+
+本轮第一代成本为 backend checks135 次 / 17645 毫秒、bus274 次 / 3552 毫秒、HTTP12 次 / 1346 毫秒。原 hook 没有计入 `managed_host._record` 的完整 anchor 与 Python 文件认证，因此 17645 毫秒不能当作全部哈希耗时。后续候选只补有界观测：新版成本回执增加独立 `host_record` 次数/毫秒，以及 backend 检查的固定 phase/intent 分桶；旧版回执仍可读取，helper 身份与 32 KiB 总输出门不变。每次调用完整委派原函数，异常和取消原样传播，只沿既有 install-returned 快照与 atexit 保存，不逐次写盘、不增加 RPC。本地首红已确认真实 host 认证存在而字段缺失；补片与其余原生回归合计 991 项通过，峰值 203 MiB、swap 0。不宣称性能或远端三事务已通过。
 
 ## 目标与范围
 

@@ -1,6 +1,6 @@
 # readiness 最后完整轮的小型失败回执（第十九轮已取得历史轮，仍未 READY）
 
-当前最新结果已推进至 Native47：第一代完整闭合，第二次排队请求局部超时，cleanup verified；Native48 同步认证去重候选与真实验收边界见末节。下列早期 readiness 记录保留当时事实。
+当前最新结果已推进至 Native48：第一代完整闭合，第二次排队与 prepare 成功，第二代在 helper_exit 触及总 60 秒期限，cleanup verified；本轮另有两个 Windows UIA 探针超时。最新有界计量候选与验收边界见末节。下列早期 readiness 记录保留当时事实。
 
 2026-10-24。根已独审方案和原提交/保存顺序，并通过唯一守卫收齐旧实现三项预期red：pytest 3 failed/0.12秒，守卫597毫秒/66.4 MiB/swap0/exit1；两项缺字段、一项严格五键拒绝，与预期一致。随后实现worker、协调器及新回归，完成根整合与另一Sol独立后审。第十九轮精确候选`db22a5f`现已受测：小回执保住历史pending轮，manager仍未READY、真实事务仍为零，详见末节。此前本地文档HEAD为`1304e1b`，真实第十八轮精确候选为`c0394b0`；本地实现、纯回归与远端结果分别记录。
 
@@ -2028,7 +2028,7 @@ P1/P2。这里只证明同步重复工作已去除及离线边界保持，不按
 原异常实例、调用次数、计时和 lookup 恢复断言保留，已包含在下述修后整合中。
 Native46 的十二项通用作业通过不作为本轮结果，测试接线失败也不冒充原生超时根因。
 
-### Native48候选：source 同步认证去重，真实结果待验
+### Native48候选：source 同步认证去重
 
 仅在 `_source` 已通过 `verify_anchor` 完整文件认证，且 source 与 controller 的完整
 `SlotIdentity` 相等时，复用这次文件认证并调用已有 `verify_current_process`；不同 slot
@@ -2046,5 +2046,45 @@ swap 0）：source 实际读取 74 字节而期望 37 字节，lineage 实际验
 新夹具起初因复用前次 boot 被真实健康证明拒绝，已通过给原完成 helper 传入独立 boot
 修正，不改健康门。生产两处窄修经非作者只读后审，未发现 P1/P2。
 
-真实 CI 尚待精确签名候选验证。没有调整 HTTP 2 秒、总 60 秒或资源上限，没有新增
+上段本地验收先于下述真实 CI。没有调整 HTTP 2 秒、总 60 秒或资源上限，没有新增
 skip，不以本片宣称完整原生恢复或超时已解决。
+
+### Native48真实结果：第二次排队成功，仍触及总期限
+
+准确候选 `96bb3ec` 的 [CI 40185853686](https://github.com/69gg/MuLi/actions/runs/40185853686)
+已终态。原生作业 `121146354226` 失败；十一项通用作业成功，Windows 3.12 shard2
+另有两个既有 UIA 真机探针超时。两者保持原 12 秒期限且 cleanup confirmed：一个
+阶段未观察到、stderr 为空，另一个到达 `uia_initializing`。不能将它们归因于 source
+去重，也不能将本轮记为只有原生作业失败。
+
+第一代最终投影在 38590 毫秒完成。第二次 POST 于 38592 毫秒发起，40431 毫秒已
+prepared，45835 毫秒 draining，49736 毫秒 stop_base，52943 毫秒 install_target；
+60001 毫秒以 `TimeoutError` / `helper_exit` 结束，第三事务未开始。cleanup verified。
+本轮没有再现 Native47 的局部 POST 超时，但这不证明此前超时的唯一原因。
+
+第一代完整成本为 checks135 次 / 17645 毫秒、bus274 次 / 3552 毫秒、HTTP12 次 /
+1346 毫秒。第二代 install-returned partial 位于 revision4：checks73 次 / 9542 毫秒、
+bus139 次 / 2006 毫秒、HTTP4 次 / 388 毫秒。partial 不是完整生命周期；不同 runner
+的墙钟结果不作为提速率。
+
+### 后续候选：补齐 host 认证与检查阶段的有界成本口径
+
+现有 `checks` 只包装 `ManagedLinuxBackend._check`，没有统计
+`managed_host._record` 内完整 anchor/controller/Python 文件认证。因而 Native48 的
+17645 毫秒不是全部哈希耗时，不能据此继续猜测某个效果门的收益。
+
+根已取得准确首红：1 failed，pytest 0.41 秒、71.4 MiB、swap 0。真实 `_record` 文件
+认证与原 backend 成功/失败前置均通过，唯一失败是回执缺少 `host_record`，不是模拟
+成本值或缺少调用。候选只增加独立 `host_record` 次数/累计毫秒，以及 backend checks
+按固定 phase/intent 的有限分桶。计时覆盖整个原函数，不能冒称纯 SHA 时间或整机峰值。
+
+成本回执 version2 严格新增这两项，version1 仍可读取。分桶只使用事务协议的固定枚举，
+拒绝未知标签、额外字段、重复分桶、无效整数和总数不一致；coordinator reader 仍仅依赖
+stdlib，不导入完整产品包。原 helper 身份绑定、最多三代历史、32 KiB 总输出、原 deadline
+和先保存功能事实的顺序不变，成本装不下时不能挤掉原事实。
+
+hook 每次完整委派原方法一次，真实异常和取消继续传播；仅复用原 install-returned
+快照与 atexit 输出，不新增 RPC、轮询或逐次写盘。新测试包含真实 `_record` 的异常/取消
+原实例保留、旧版兼容、严格坏值与原字节边界。本地成本回归 65 项及其余十一文件
+原生回归 926 项通过；两次守卫峰值分别为 87.4 MiB、203 MiB，swap 均为 0。
+源码后审未发现新增控制流或放宽校验；远端三事务和性能问题仍未闭合。
