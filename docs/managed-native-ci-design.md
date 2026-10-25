@@ -1,8 +1,8 @@
 # 真实 systemd 托管切换 CI 设计
 
-最新检查点：第十八轮`c0394b0`的精确CI仍为十项成功、native失败，零真实事务，后备诊断整包因原输出门拒绝；清理失败为`native_service_cleanup_failed`。随后小型[最后完整pending轮回执](managed-native-checkpoint-proposal.md)已完成3旧红、54新绿、原native合计560绿、严格静态和独立Sol后审；复用已付读取成本且保持整个1024失败回包、32KiB累计、原期限和成功判定。下一远端候选尚待取得实际结果，不把历史轮当作失败时刻或READY证明；下述旧版本状态保留其当时事实。
+当前检查点是 [Native44](https://github.com/69gg/MuLi/actions/runs/40102230148)：用户服务已启动，安装接管已完成，资源清理通过；后续切换在整段 60 秒期限内未完成，完整三步恢复仍未验收。准确时间、成本及历史证据见[原生检查记录](managed-native-checkpoint-proposal.md#native44真实结果第一代partial已取得第二代尚未安装)。下面各轮保留当时事实，不代表当前仍停在用户服务启动阶段。
 
-状态：CI job、协调脚本和 worker 已实现，含专用 manager 环境、进程/等待观察、定向 journald 与失败后环境/socket 投影。第十五轮全终态10成功1失败，仅native失败；新投影已正向排除 exec 初始 notify 方向、runtime/bus 值及入口类型/owner 的简单错误，manager 仍 activating/start，仍为0个真实事务。账户/组/挂载账本已清除，但服务收尾仍失败，没有正常 cleanup 验收证明。最近合并后整合纯验证为430项通过，详见下文；它不代替原生验收。第十四轮2.5秒失败摘要保留及未就绪事实保留，不用第十五轮覆盖。前三轮均未观察到 worker 结果；第四轮实际进入 drive，完成真实导入、两个 slot 与 kernel 限额核验，然后在标准 unit 默认路径检查失败。第五轮起的 manager 启动原因仍未确定。真实环境修补、三事务和正常服务收尾仍未验收。初始基线为签名候选 `f542d9e78d564a749cb5c5e8568f671b634dcd77`；各轮精确证据与纯验证边界见下文。没有在开发机创建用户、挂载文件系统或操作真实服务。
+当前候选已与 v2.70 主分支整合，保留较新的 Windows UIA probe 路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。不缓存跨等待的认证，也不延长期限。新的原生 CI 结果仍待取得，本机未创建测试用户、挂载文件系统或操作真实服务。
 
 ## 目标与范围
 
@@ -10,7 +10,7 @@
 
 A、B 复制同一个当前 MuLi 包，保留原 `compatibility.json`；依赖来自 CI 已有安装。它证明同版本的两个真实保留环境可以切换、回退，并保持最新数据库，**不证明跨版本发行升级或依赖安装**。现有[两个真实进程回归](managed-process-recovery.md)继续保留原期限和假 manager 边界，不改成这个新案例，也不提高其预算。
 
-实现只改 CI，并新增一个 stdlib 协调脚本、一个测试辅助脚本和对应纯 fixture 测试：`.github/workflows/ci.yml`、`scripts/check_managed_native_ci.py`、`tests/helpers/managed_native_worker.py`、`tests/test_managed_native_ci.py`，以及本设计文档。不修改生产协议、controller、launcher、probe、backend、服务模板或恢复算法，不新增产品配置和恢复账本。
+实现复用产品的托管 controller、launcher、probe 和 backend，由 CI 协调脚本及测试辅助进程验证真实事务。后续修复包含托管运行响应、重复校验和停止后清理；新增对应回归，不新增产品配置或另一份恢复账本。
 
 ## 专用 UID 与已有解释器
 

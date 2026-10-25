@@ -35,6 +35,7 @@ async def prepare_runtime(
     host.source()
     runtime, skills, _, seen = real_runtime(host)
     host.config.settings.models.main.protocol = protocol
+    host.config.settings.models.main.max_output_tokens = 4096 if protocol == "anthropic" else None
     host.config.settings.limits.max_output_chars = output_chars
     host.config.settings.limits.max_context_chars = 6000
     try:

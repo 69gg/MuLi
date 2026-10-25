@@ -6,9 +6,10 @@ PyPI Trusted Publisher 已由维护者登记：项目 `muli-agent`、GitHub owne
 
 发布前同步 pyproject.toml、src/muli/__init__.py、src/muli/compatibility.json、uv.lock 和 CHANGELOG.md；完成独立审查及回归，创建 GPG 签名提交和签名的 `vX.Y.Z` 标签。推送标签后，release.yml 调用完整跨平台 CI，下载该次质量作业实际测试的同一组 wheel/sdist，验证名称/版本/变更记录，再发布 PyPI 和 GitHub Release。不能通过手工在 main 分支点运行绕过标签校验；失败重试需选择原标签。
 
-当前跨平台 CI 为十项，包含 Linux 每种 Python 的两个分片，合计覆盖完整集合且互不重叠；
-发行再加 prepare、publish、github-release 共十三项。每项仍须对精确提交全部通过，
-不能把单片成功当作该平台全量成功；历史版本的八项/十一项证据保持原记录。
+当前跨平台 CI 为十二项：Linux和Windows每种Python各两个文件分片，macOS每种Python
+保持全量，加上quality与mcp；同一平台和Python的两片合计覆盖完整集合且互不重叠。
+发行再加 prepare、publish、github-release 共十五项。每项仍须对精确提交全部通过，
+不能把单片成功当作该平台全量成功；历史版本的八项/十一项及十项/十三项证据保持原记录。
 
 验证以远端工作流结论、PyPI 文件及 GitHub Release 实际状态为准。2.0.0 的 [发布流水线](https://github.com/69gg/MuLi/actions/runs/39288541118) 11 个作业全部通过；PyPI 与 [GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.0.0) 的 wheel 和源码包 SHA-256 分别一致。签名标签指向 `80a40a91fea6351ddc0a48f657671f27b4857f00`。本地开发也可用 `uv tool install .` 验证安装，不能把本地安装成功当作远端发布成功。
 

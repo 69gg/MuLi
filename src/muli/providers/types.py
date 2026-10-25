@@ -23,7 +23,7 @@ class ModelConfig:
     model: str
     base_url: str
     api_key: str = field(default="", repr=False)
-    max_output_tokens: int = 4096
+    max_output_tokens: int | None = None
     timeout: float = 60.0
     max_retries: int = 2
     retry_backoff: float = 0.5
@@ -56,7 +56,13 @@ class ModelConfig:
             _ = parsed.port
         except ValueError:
             raise ValueError("base_url 端口无效") from None
-        if self.max_output_tokens <= 0 or self.max_response_bytes <= 0:
+        if self.max_output_tokens is not None and (
+            type(self.max_output_tokens) is not int or self.max_output_tokens <= 0
+        ):
+            raise ValueError("模型输出 token 限制必须是正整数或 null")
+        if self.protocol == "anthropic" and self.max_output_tokens is None:
+            raise ValueError("Anthropic Messages 必须填写正整数 max_output_tokens")
+        if self.max_response_bytes <= 0:
             raise ValueError("输出限制必须大于零")
         if (
             not math.isfinite(self.timeout)
@@ -138,6 +144,7 @@ class Message:
     images: list[ImageInput] = field(default_factory=list)
     # Host metadata only. Provider codecs deliberately serialize explicit fields.
     preserve_content: bool = False
+    source_message_id: str | None = None
 
 
 @dataclass(slots=True)

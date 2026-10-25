@@ -14,7 +14,10 @@ from muli.providers.types import MessageRole, ProtocolName
 
 
 def size(messages: list[Message]) -> int:
-    return len(json.dumps([asdict(message) for message in messages], ensure_ascii=False))
+    data = [asdict(message) for message in messages]
+    for record in data:
+        record.pop("source_message_id")
+    return len(json.dumps(data, ensure_ascii=False))
 
 
 def tool_turn(content: str, identifier: str = "call_a") -> list[Message]:
@@ -27,7 +30,7 @@ def tool_turn(content: str, identifier: str = "call_a") -> list[Message]:
 def test_fit_is_unchanged_independent_copy_with_native_protocol_data() -> None:
     messages = [
         Message(role="system", content="系统提示"),
-        Message(role="user", content="最新输入"),
+        Message(role="user", content="最新输入", source_message_id="actual-local-message"),
         Message(
             role="assistant",
             content="答复",
@@ -43,6 +46,8 @@ def test_fit_is_unchanged_independent_copy_with_native_protocol_data() -> None:
     snapshot = deepcopy(messages)
     packed = pack_context(messages, size(messages))
     assert packed == snapshot and packed is not messages
+    assert packed[1] is not messages[1]
+    assert packed[1].source_message_id == "actual-local-message"
     packed[-1].provider_data["content_blocks"][0]["signature"] = "different"
     packed[0].content = "different"
     assert messages == snapshot
@@ -259,7 +264,12 @@ def test_packed_turn_still_encodes_with_native_tool_replay(protocol: ProtocolNam
     ]
     packed = pack_context(messages, 2200)
     assert packed[1].provider_data == native and packed[1].tool_calls == [call]
-    config = ModelConfig(protocol=protocol, model="test", base_url="https://example.invalid/v1")
+    config = ModelConfig(
+        protocol=protocol,
+        model="test",
+        base_url="https://example.invalid/v1",
+        max_output_tokens=4096 if protocol == "anthropic" else None,
+    )
     body = build_request(config, packed, [], stream=False)
     encoded = json.dumps(body, ensure_ascii=False)
     assert call.id in encoded and EXCERPT_MARKER in encoded

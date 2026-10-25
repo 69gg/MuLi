@@ -124,7 +124,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     renderChrome = () => {}; renderChat = () => {}; toast = (text) => toasts.push(text); showError = (error) => errors.push(error.message);
     const owner = beginConnection(); owner.ready = true;
     owner.sessions.start(); owner.notifications.start();
-    globalThis.ui = { state, renderWorkflows, switchView, handleAction, startGlobalEvents, showLogin,
+    globalThis.ui = { state, renderWorkflows, switchView, handleAction, startGlobalEvents, showLogin, beginConnection,
       stopEvents() { globalController?.abort(); },
       get activity() { return typeof workflowActivity === "undefined" ? null : workflowActivity; } };
 
@@ -141,6 +141,8 @@ const page = (items, has_more = false) => ({ items, has_more, next_after: has_mo
 const definition = { id: "definition", name: "青瓷工作流", mode: "ask", steps: [], runs: [{ id: "new-completed", status: "completed", nodes: {} }] };
 const definitions = () => ({ items: [structuredClone(definition)] });
 const activeCalls = (h) => h.requests.filter((request) => request.path.startsWith("/workflow-runs/active?"));
+const schedule = (id, extra = {}) => ({ id, name: `定时研究 ${id}`, enabled: true, blocked: false, due_at: 10000, interval_seconds: 604800, last_run_id: null, last_status: null, ...extra });
+const scheduleCalls = (h) => h.requests.filter((request) => request.path.startsWith("/workflow-schedules?"));
 async function click(h, button) {
   assert.ok(button instanceof DOMButton, "expected a real button node");
   for (const handler of h.document.events.click ?? []) await handler({ target: button, preventDefault() {} });
@@ -382,4 +384,215 @@ test("refresh preserves open history and same-run focus, falling back when that 
   const outside = h.document.querySelector("#message-input"); outside.focus();
   h.emitGlobal({ type: "workflow.updated", data: { workflow_id: "unlisted" } }); await flush();
   assert.equal(h.document.activeElement === outside, true); h.ui.stopEvents();
+});
+
+test("scheduled delegations stay lazy and page explicitly using complete cursors and bounded nullable summaries", async () => {
+  const fullID = "scheduled-/完整?cursor\u0000原值";
+  const first = Array.from({ length: 50 }, (_, index) => schedule(index === 49 ? fullID : `scheduled-${index}`, { blocked: index === 0, prompt: "private task body", reply_origin: { private: true } }));
+  const next = [schedule("admitted-once", { due_at: null, last_run_id: "actual-admitted-run", last_status: "running" }), schedule("disabled-legacy", { enabled: false, due_at: null })];
+  const h = harness(async (path) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    assert.ok(path.startsWith("/workflow-schedules?"));
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("limit"), "50");
+    return query.get("after_id") ? page(next) : page(first, true);
+  });
+  await h.ui.switchView("workflows");
+  assert.equal(scheduleCalls(h).length, 0);
+  assert.equal(h.button("toggle-workflow-schedules").getAttribute("aria-expanded"), "false");
+  assert.equal(h.other.querySelector("#workflow-schedules").hidden, true);
+  await click(h, h.button("toggle-workflow-schedules"));
+  assert.equal(scheduleCalls(h).length, 1);
+  assert.equal(scheduleCalls(h)[0].cache, "no-store");
+  assert.equal(new URLSearchParams(scheduleCalls(h)[0].path.split("?")[1]).get("after_id"), "");
+  assert.equal(h.button("toggle-workflow-schedules").getAttribute("aria-expanded"), "true");
+  assert.equal(h.other.querySelectorAll('[data-action="cancel-workflow-schedule"]').length, 50);
+  assert.equal(h.ui.activity.schedulesPage.items[0].prompt, undefined);
+  assert.equal(h.ui.activity.schedulesPage.items[0].reply_origin, undefined);
+  assert.equal(h.other.textContent.includes("private task body"), false);
+  assert.ok(h.other.querySelector("#workflow-schedules").textContent.includes("暂缓执行"));
+  await click(h, h.other.querySelectorAll('[data-action="page-workflow-schedules"]').find((button) => button.dataset.direction === "next"));
+  assert.equal(scheduleCalls(h).length, 2);
+  assert.equal(new URLSearchParams(scheduleCalls(h)[1].path.split("?")[1]).get("after_id"), fullID);
+  assert.deepEqual(Array.from(h.ui.activity.schedulesPage.items, (item) => item.id), ["admitted-once", "disabled-legacy"]);
+  assert.equal(h.ui.activity.schedulesPage.items[0].due_at, null);
+  assert.equal(h.ui.activity.schedulesPage.items[1].last_run_id, null);
+  assert.equal(h.ui.activity.schedulesPage.items[1].last_status, null);
+  assert.equal(h.ui.activity.schedulesError, "");
+  assert.equal(h.other.querySelector("#workflow-schedules").textContent.includes("null"), false);
+  assert.ok(h.other.querySelector("#workflow-schedules").textContent.includes("actual-admitted-run"));
+  assert.ok(h.other.querySelector("#workflow-schedules").textContent.includes("运行中"));
+  assert.ok(h.button("cancel-workflow-schedule", "admitted-once"));
+  assert.equal(h.button("cancel-workflow-schedule", "disabled-legacy") === undefined, true);
+  assert.equal(h.button("cancel-workflow-schedule", fullID) === undefined, true);
+  await click(h, h.other.querySelectorAll('[data-action="page-workflow-schedules"]').find((button) => button.dataset.direction === "previous"));
+  assert.equal(scheduleCalls(h).length, 3);
+  assert.equal(new URLSearchParams(scheduleCalls(h)[2].path.split("?")[1]).get("after_id"), "");
+  assert.deepEqual(Array.from(h.ui.activity.schedulesStarts), [""]);
+  assert.ok(h.button("cancel-workflow-schedule", fullID));
+});
+
+test("a failed schedule cancellation never invents success and a successful retry rereads the real summary", async () => {
+  const pending = deferred(), fullID = "schedule-/中文?\u0000准确";
+  let attempts = 0, stopped = false;
+  const h = harness(async (path, options) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    if (options.method === "POST") {
+      assert.equal(path, `/workflow-schedules/${encodeURIComponent(fullID)}/cancel`);
+      attempts += 1;
+      if (attempts === 1) return pending.promise;
+      stopped = true;
+      return { id: fullID, enabled: false };
+    }
+    assert.ok(path.startsWith("/workflow-schedules?"));
+    return page([schedule(fullID, { enabled: !stopped })]);
+  });
+  await h.ui.switchView("workflows");
+  await click(h, h.button("toggle-workflow-schedules"));
+  const original = h.button("cancel-workflow-schedule", fullID);
+  const cancelling = click(h, original); await flush();
+  assert.equal(attempts, 1);
+  assert.equal(h.button("cancel-workflow-schedule", fullID).disabled, true);
+  assert.equal(h.ui.activity.schedulesPage.items[0].enabled, true);
+  assert.equal(h.toasts.includes("已提交取消请求"), false);
+  await h.ui.handleAction("cancel-workflow-schedule", original);
+  assert.equal(attempts, 1);
+  pending.reject(new ApiError("取消失败，原委托仍有效", 409)); await cancelling;
+  assert.deepEqual(h.errors, ["取消失败，原委托仍有效"]);
+  assert.equal(h.ui.activity.schedulesPage.items[0].enabled, true);
+  assert.equal(h.button("cancel-workflow-schedule", fullID).disabled, false);
+  assert.equal(scheduleCalls(h).length, 1);
+  assert.equal(h.toasts.includes("已提交取消请求"), false);
+  await click(h, h.button("cancel-workflow-schedule", fullID));
+  assert.equal(attempts, 2);
+  assert.equal(scheduleCalls(h).length, 2);
+  assert.equal(h.ui.activity.schedulesPage.items[0].enabled, false);
+  assert.equal(h.button("cancel-workflow-schedule", fullID) === undefined, true);
+  assert.ok(h.toasts.includes("已提交取消请求"));
+});
+
+test("collapsing scheduled delegations aborts the lazy read and a late page cannot replace the reopened head", async () => {
+  const late = deferred(); let reads = 0;
+  const h = harness(async (path) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    assert.ok(path.startsWith("/workflow-schedules?"));
+    reads += 1;
+    return reads === 1 ? late.promise : page([schedule("current-head")]);
+  });
+  await h.ui.switchView("workflows");
+  const opening = click(h, h.button("toggle-workflow-schedules")); await flush();
+  const slot = h.ui.activity;
+  await click(h, h.button("toggle-workflow-schedules"));
+  assert.equal(scheduleCalls(h)[0].signal.aborted, true);
+  assert.equal(slot.schedulesPage === null, true);
+  assert.equal(h.other.querySelector("#workflow-schedules").hidden, true);
+  await click(h, h.button("toggle-workflow-schedules"));
+  assert.equal(scheduleCalls(h).length, 2);
+  assert.ok(h.button("cancel-workflow-schedule", "current-head"));
+  late.resolve(page([schedule("late-collapsed-row")])); await opening;
+  assert.equal(h.ui.activity === slot, true);
+  assert.equal(h.other.textContent.includes("late-collapsed-row"), false);
+  assert.deepEqual(Array.from(slot.schedulesPage.items, (item) => item.id), ["current-head"]);
+});
+
+test("leaving the workflow view invalidates its pending schedules and an old 401 cannot clear the reopened connection", async () => {
+  const late = deferred(); let reads = 0;
+  const h = harness(async (path) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    assert.ok(path.startsWith("/workflow-schedules?"));
+    reads += 1;
+    return reads === 1 ? late.promise : page([schedule("reopened-current")]);
+  });
+  await h.ui.switchView("workflows");
+  const opening = click(h, h.button("toggle-workflow-schedules")); await flush();
+  const oldSlot = h.ui.activity;
+  await h.ui.switchView("chat"); await h.ui.switchView("workflows");
+  assert.equal(scheduleCalls(h)[0].signal.aborted, true);
+  assert.equal(h.ui.activity === oldSlot, false);
+  assert.equal(scheduleCalls(h).length, 1);
+  assert.equal(h.button("toggle-workflow-schedules").getAttribute("aria-expanded"), "false");
+  await click(h, h.button("toggle-workflow-schedules"));
+  late.reject(new ApiError("旧页面的迟到401", 401)); await opening;
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(h.ui.activity === null, false);
+  assert.ok(h.button("cancel-workflow-schedule", "reopened-current"));
+  assert.deepEqual(Array.from(h.ui.activity.schedulesPage.items, (item) => item.id), ["reopened-current"]);
+});
+
+test("authentication loss and pagehide discard schedule summaries and reject late refresh repopulation", async () => {
+  for (const boundary of ["login", "pagehide"]) {
+    const late = deferred(); let reads = 0;
+    const h = harness(async (path) => {
+      if (path === "/workflows") return definitions();
+      if (path.startsWith("/workflow-runs/active?")) return page([]);
+      assert.ok(path.startsWith("/workflow-schedules?"));
+      reads += 1;
+      return reads === 1 ? page([schedule("private-visible-row")]) : late.promise;
+    });
+    await h.ui.switchView("workflows");
+    await click(h, h.button("toggle-workflow-schedules"));
+    assert.ok(h.button("cancel-workflow-schedule", "private-visible-row"));
+    const refreshing = click(h, h.button("refresh-workflow-schedules")); await flush();
+    if (boundary === "login") h.ui.showLogin(); else h.windowEvents.pagehide();
+    assert.equal(h.ui.activity === null, true);
+    assert.equal(scheduleCalls(h)[1].signal.aborted, true);
+    assert.equal(h.other.querySelector("#workflow-schedules")?.textContent ?? "", "");
+    late.resolve(page([schedule("late-private-row")])); await refreshing;
+    assert.equal(h.other.textContent.includes("private-visible-row"), false);
+    assert.equal(h.other.textContent.includes("late-private-row"), false);
+    assert.equal(h.ui.activity === null, true);
+    if (boundary === "login") assert.equal(h.ui.state.auth.authenticated, false);
+  }
+});
+
+test("an old pending schedule cancellation cannot log out or refresh a new authenticated connection", async () => {
+  const lateCancel = deferred(); let reads = 0;
+  const h = harness(async (path, options) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    if (options.method === "POST") {
+      assert.equal(path, "/workflow-schedules/old-cancel/cancel");
+      return lateCancel.promise;
+    }
+    assert.ok(path.startsWith("/workflow-schedules?"));
+    reads += 1;
+    return page([schedule(reads === 1 ? "old-cancel" : "new-private-row")]);
+  });
+  await h.ui.switchView("workflows");
+  await click(h, h.button("toggle-workflow-schedules"));
+  const oldSlot = h.ui.activity;
+  const cancelling = click(h, h.button("cancel-workflow-schedule", "old-cancel")); await flush();
+  const posted = h.requests.find((request) => request.method === "POST");
+  assert.ok(posted);
+  assert.equal(h.toasts.includes("已提交取消请求"), false);
+
+  h.ui.showLogin();
+  assert.equal(h.ui.state.auth.authenticated, false);
+  assert.equal(posted.signal.aborted, true);
+  // Use the real connection lifecycle after a fresh authentication; the harness
+  // does not implement a browser cookie/login server.
+  const owner = h.ui.beginConnection(); owner.ready = true;
+  h.ui.state.auth.authenticated = true;
+  h.document.querySelector("#auth-gate").hidden = true;
+  await h.ui.switchView("workflows");
+  await click(h, h.button("toggle-workflow-schedules"));
+  const newSlot = h.ui.activity;
+  const currentRow = h.button("cancel-workflow-schedule", "new-private-row");
+  assert.equal(newSlot === oldSlot, false);
+  assert.ok(currentRow);
+  const readsBeforeReply = scheduleCalls(h).length;
+
+  lateCancel.reject(new ApiError("旧取消的迟到401", 401)); await cancelling;
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(owner.controller.signal.aborted, false);
+  assert.equal(h.ui.activity === newSlot, true);
+  assert.equal(h.button("cancel-workflow-schedule", "new-private-row") === currentRow, true);
+  assert.deepEqual(Array.from(newSlot.schedulesPage.items, (item) => item.id), ["new-private-row"]);
+  assert.equal(h.document.querySelector("#auth-gate").hidden, true);
+  assert.equal(scheduleCalls(h).length, readsBeforeReply);
+  assert.equal(h.toasts.includes("已提交取消请求"), false);
 });

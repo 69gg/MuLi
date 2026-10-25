@@ -10,14 +10,70 @@ import re
 import time
 from collections.abc import Mapping
 from pathlib import PurePath
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from muli.reply_origin import channel_account
+
 from .crypto import qq_key, sign_qq, verify_qq
 from .http import ChannelHTTP
-from .types import ChannelError, ChannelProfile, FileContent, IncomingMessage, PollBatch, RemoteFile
+from .types import (
+    ChannelError,
+    ChannelProfile,
+    FileContent,
+    IncomingMessage,
+    PollBatch,
+    RemoteFile,
+    is_mobile_control_text,
+)
+
+_TELEGRAM_TEXT_FIELDS = frozenset(
+    {
+        "message_id",
+        "date",
+        "from",
+        "chat",
+        "text",
+        "entities",
+        "has_protected_content",
+        "link_preview_options",
+    }
+)
+_MAX_CONTROL_ENTITIES = 128
+
+
+def _plain_control_entities(text: str, entities: object) -> bool:
+    """Telegram offsets are UTF-16 units; code may occur in added requirements."""
+    if not isinstance(entities, list) or len(entities) > _MAX_CONTROL_ENTITIES:
+        return False
+    stripped = text.lstrip()
+    head_start = len(text) - len(stripped)
+    head_end = head_start + len(stripped.split(maxsplit=1)[0])
+    try:
+        units = len(text.encode("utf-16-le")) // 2
+        start = len(text[:head_start].encode("utf-16-le")) // 2
+        end = len(text[:head_end].encode("utf-16-le")) // 2
+    except UnicodeError:
+        return False
+    for entity in entities:
+        if not isinstance(entity, dict):
+            return False
+        kind, offset, length = entity.get("type"), entity.get("offset"), entity.get("length")
+        if (
+            not isinstance(kind, str)
+            or not kind
+            or type(offset) is not int
+            or type(length) is not int
+            or offset < 0
+            or length <= 0
+            or offset + length > units
+            or kind in {"blockquote", "expandable_blockquote"}
+            or (kind in {"code", "pre"} and offset < end and offset + length > start)
+        ):
+            return False
+    return True
 
 
 def object_value(value: Any) -> dict[str, Any]:
@@ -117,6 +173,33 @@ class Telegram(Adapter):
             raise ChannelError("Telegram 拒绝请求", retryable=result.get("error_code") == 429)
         return result.get("result")
 
+    def _control_evidence(
+        self, payload: dict[str, Any], message: dict[str, Any]
+    ) -> tuple[str, str]:
+        text = message.get("text")
+        sender, chat = object_value(message.get("from")), object_value(message.get("chat"))
+        account, separator, credential = self.profile.secret("token").partition(":")
+        if (
+            not isinstance(text, str)
+            or not is_mobile_control_text(text)
+            or set(payload) - {"update_id", "message"}
+            or set(message) - _TELEGRAM_TEXT_FIELDS
+            or chat.get("type") != "private"
+            or sender.get("is_bot") is not False
+            or type(sender.get("id")) is not int
+            or type(chat.get("id")) is not int
+            or sender["id"] != chat["id"]
+            or sender["id"] <= 0
+            or not separator
+            or not credential
+            or not re.fullmatch(r"[0-9]+", account)
+            or int(account) <= 0
+            or channel_account("telegram", self.profile) != account
+            or not _plain_control_entities(text, message.get("entities", []))
+        ):
+            return "", ""
+        return text, account
+
     def webhook(self, payload: dict[str, Any]) -> tuple[IncomingMessage, ...]:
         event_id = identifier(payload.get("update_id"))
         message = object_value(payload.get("message"))
@@ -148,6 +231,7 @@ class Telegram(Adapter):
                     size=size if type(size) is int and size >= 0 else None,
                 )
             )
+        control_text, control_account = self._control_evidence(payload, message)
         return (
             IncomingMessage(
                 event_id,
@@ -157,6 +241,8 @@ class Telegram(Adapter):
                 "private" if chat_type == "private" else "group",
                 identifier(message.get("message_id")),
                 tuple(files),
+                control_text=control_text,
+                control_account_id=control_account,
             ),
         )
 
@@ -273,15 +359,71 @@ class OneBot(Adapter):
             raise ChannelError("OneBot 拒绝请求")
         return result.get("data")
 
+    def _control_evidence(self, payload: dict[str, Any]) -> tuple[str, str]:
+        segments = payload.get("message")
+        account = self.profile.account_id
+        if (
+            payload.get("post_type") != "message"
+            or payload.get("message_type") != "private"
+            or payload.get("sub_type") not in {"friend", "group", "other"}
+            or payload.get("anonymous")
+            or payload.get("group_id") is not None
+            or type(payload.get("self_id")) is not int
+            or type(payload.get("user_id")) is not int
+            or payload["self_id"] <= 0
+            or payload["user_id"] <= 0
+            or not account
+            or not re.fullmatch(r"[0-9]+", account)
+            or int(account) <= 0
+            or account != identifier(payload.get("self_id"))
+            or not isinstance(segments, list)
+            or not 1 <= len(segments) <= 64
+        ):
+            return "", ""
+        texts: list[str] = []
+        for segment in segments:
+            if not isinstance(segment, dict) or set(segment) != {"type", "data"}:
+                return "", ""
+            data = segment.get("data")
+            if (
+                segment.get("type") != "text"
+                or not isinstance(data, dict)
+                or set(data) != {"text"}
+                or not isinstance(data["text"], str)
+            ):
+                return "", ""
+            texts.append(data["text"])
+        text = "".join(texts)
+        return (text, account) if is_mobile_control_text(text) else ("", "")
+
     def webhook(self, payload: dict[str, Any]) -> tuple[IncomingMessage, ...]:
-        if payload.get("post_type") not in {"message", "notice"} or payload.get("anonymous"):
+        post_type = payload.get("post_type")
+        if (
+            payload.get("anonymous")
+            or payload.get("group_id") is not None
+            or (post_type == "message" and payload.get("message_type") != "private")
+            or (
+                post_type == "notice"
+                and (
+                    payload.get("notice_type") != "offline_file"
+                    or payload.get("message_type") not in (None, "private")
+                )
+            )
+            or post_type not in ("message", "notice")
+        ):
             return ()
         sender, event_id = identifier(payload.get("user_id")), identifier(payload.get("message_id"))
-        group = identifier(payload.get("group_id"))
-        kind: Literal["private", "group"] = "group" if group else "private"
+        if sender not in self.profile.owner_ids:
+            return ()
+        if self.profile.account_id and (
+            type(payload.get("self_id")) is not int
+            or payload["self_id"] <= 0
+            or str(payload["self_id"]) != self.profile.account_id
+        ):
+            return ()
         text: list[str] = []
         files: list[RemoteFile] = []
-        segments = payload.get("message", [])
+        segments = payload.get("message", []) if post_type == "message" else []
         if isinstance(segments, str):
             text.append(segments)
         elif isinstance(segments, list):
@@ -300,8 +442,7 @@ class OneBot(Adapter):
                             metadata={"type": segment_type},
                         )
                     )
-        notice = payload.get("notice_type")
-        if notice in {"group_upload", "offline_file"}:
+        if post_type == "notice":
             file = object_value(payload.get("file"))
             file_id = identifier(file.get("id"))
             size = file.get("size")
@@ -318,9 +459,18 @@ class OneBot(Adapter):
                 event_id = f"file:{payload.get('time', '')}:{file_id}"
         if not sender or not event_id or (not text and not files):
             return ()
+        control_text, control_account = self._control_evidence(payload)
         return (
             IncomingMessage(
-                event_id, sender, group or sender, "".join(text), kind, event_id, tuple(files)
+                event_id,
+                sender,
+                sender,
+                "".join(text),
+                "private",
+                event_id,
+                tuple(files),
+                control_text=control_text,
+                control_account_id=control_account,
             ),
         )
 

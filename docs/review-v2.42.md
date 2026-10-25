@@ -1,6 +1,6 @@
 # 2.42：队友资料显式交接
 
-状态：生产实现、离线完整场景、独立后审修复、全量整合与离线构件检查完成；精确远端候选及发行验证待完成，尚未发布。上一片 2.41 的候选/main 绿色与发行 UIA 超时分别保留，见[对应审查](review-v2.41.md)。本版候选包含其未发行的资料收件目录；不覆盖原签名标签，也不将旧失败改写成成功。
+状态：已正式发布。最终精确签名 `ed2b267` 的候选/main各十项及发行十三项全部成功，PyPI/GitHub两构件大小与SHA-256一致。上一片 2.41 的候选/main绿色与发行UIA超时分别保留，见[对应审查](review-v2.41.md)。本版包含其未发行的资料收件目录；不覆盖原签名标签，也不将旧失败改写成成功。
 
 ## 行为与范围
 
@@ -58,6 +58,19 @@ PR49 的精确签名 `c1f8bbec7df001ea84fc6a4e4095bdb9261ab6d6`，候选 run `40
 独立后续调查确认 2.41 失败只有 utility_ready，下一段先读取 stdin 完整行、解码 JSON 并校验信封，之后才是 probe_received 和 UIA 初始化；没有 COM 或程序集卡住的证据。本片仅补 input_waiting、input_line_received、request_decoded 三个首请求一次性固定点，不加入时间代理、重试、预热、额外 reader 或新的期限。
 
 专用固定投影 18 项、原 pending/host 46 项串行守卫通过，Ruff、格式及限定类型检查通过，最高 314.2 MiB、swap 0。mypy 首次因 helper 模块双名拒绝后，使用其既有包根路径显式检查通过，未改源码掩盖错误。包内 11 行标记 LF 共 361 bytes、CRLF 共 372 bytes，沿原 2048-byte stderr 前缀及总预算；逐字节截断、前置未知行占满前缀、乱序/重复和旧八阶段兼容有纯回归。它只证明完整固定行被宿主观察到，不能证明阶段耗时、READY 或根因已定位；真实 Windows 新诊断尚待远端验收。根静态复核三个点的位置、一次性门及原读/解码/校验顺序保持，未发现 P1/P2。
+
+## 发版闭合
+
+最终精确签名 `ed2b26703380a1250ce2c8ecb5b9c14fc37e307f` 的[候选40013510247](https://github.com/69gg/MuLi/actions/runs/40013510247)与[main40014738737](https://github.com/69gg/MuLi/actions/runs/40014738737)各十项全部成功，[发行40014739124](https://github.com/69gg/MuLi/actions/runs/40014739124)十三项全部成功，含两组原生Windows验证、prepare、publish与GitHub Release。原20秒回退检查未提高期限。main与签名标签`v2.42.0`非force原子推送，PR49原提交合入；签名tag对象`947f17db0e93bd5209709fef84bbb866285d96de`在本地及GitHub API相同，指向上述提交。本地GPG校验为Good signature。
+
+只读取有界PyPI/GitHub元数据，没有下载发行文件，核对[PyPI](https://pypi.org/project/muli-agent/2.42.0/)与[GitHub Release](https://github.com/69gg/MuLi/releases/tag/v2.42.0)均为正式版且两构件完全一致：
+
+| 文件 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `muli_agent-2.42.0-py3-none-any.whl` | 800351 | `20f54ab91580020ce3d1c73ef0293cab6ba15780cf9f7207316b3bfc96f7bf7e` |
+| `muli_agent-2.42.0.tar.gz` | 4144356 | `add7365d06db0809348e63d83f6e28dbf5d59559bb9bc10118f3d6f9bef4ecbc` |
+
+首个元数据脚本误将guard stdout一起重定向进JSON，解析失败；改为guard内部只捕获gh输出后，脚本又错误要求release的`target_commitish`必须是SHA，而实际该字段是main。最终以真实annotated tag对象验证提交，再比较名称、版本、两文件数、大小和摘要，guard75毫秒、16.1MiB、swap0、exit0；不把release分支标签当作精确源证明。上述两次校验脚本错误没有改动发行构件或标签，最终不依赖它们的失败结果作发布声明。
 
 ## 未验收边界
 

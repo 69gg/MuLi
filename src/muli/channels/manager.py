@@ -14,12 +14,22 @@ import httpx
 from muli.attachments import Attachments, file_io
 from muli.events import EventBus
 from muli.maintenance import Admission
+from muli.permissions import ApprovalNotice
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_account
 from muli.store import Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
-from .types import NAMES, ChannelError, ChannelsConfig, FileContent, IncomingMessage, Submit
+from .types import (
+    MAX_OUTGOING_TEXT_CHARS,
+    NAMES,
+    ChannelError,
+    ChannelsConfig,
+    FileContent,
+    IncomingMessage,
+    Submit,
+    is_mobile_control_text,
+)
 from .weixin import Weixin
 
 
@@ -42,12 +52,16 @@ class ChannelManager:
         *,
         client: httpx.AsyncClient | None = None,
         delivery_guard: Callable[[Mapping[str, Any], object], None] | None = None,
+        approval_guard: Callable[[ApprovalNotice], dict[str, Any]] | None = None,
         admission: Admission | None = None,
+        control_submit: Submit | None = None,
     ) -> None:
         self.store, self.bus, self.config, self.submit = store, bus, config, submit
         self.attachments = attachments
         self.delivery_guard = delivery_guard
+        self.approval_guard = approval_guard
         self.admission = admission or Admission()
+        self.control_submit = control_submit
         # Validate before constructing an owned client, including on reconfigure.
         self.store.prepare_channels()
         self._owns_client = client is None
@@ -208,6 +222,34 @@ class ChannelManager:
         except ValueError as error:
             raise _BlockedDelivery(str(error), status_code=403) from None
 
+    def _outbox_guard(
+        self, name: str, route: Mapping[str, Any], payload: Mapping[str, Any]
+    ) -> None:
+        if name == "onebot":
+            try:
+                self._route(name, route, outbound=True)
+            except ChannelError as error:
+                raise _BlockedDelivery(str(error), status_code=error.status_code) from None
+        if payload.get("automatic"):
+            self._automatic_guard(name, route, payload.get("attention_routing"))
+        if "approval_notice" not in payload:
+            return
+        try:
+            notice = ApprovalNotice.load(payload["approval_notice"])
+            if (
+                self._closed
+                or not self.admission.allowed
+                or payload.get("automatic") is not True
+                or notice.reply_origin.delivery_routes() != [dict(route)]
+                or FrozenRouting.bound(notice.reply_origin).dump()
+                != payload.get("attention_routing")
+                or self.approval_guard is None
+            ):
+                raise ValueError("审批通知来源或执行已失效，保留在本地")
+            self.approval_guard(notice)
+        except (ValueError, TypeError, KeyError, RecursionError, OverflowError) as error:
+            raise _BlockedDelivery(str(error), status_code=403) from None
+
     def _block_revoked(self) -> tuple[bool, bool]:
         # Page through pending work, including queues left above a reduced limit.
         # Sent/unknown rows are never reconsidered; each turn parses at most 100.
@@ -223,10 +265,10 @@ class ChannelManager:
         with self.store.db:
             for row in rows:
                 try:
-                    self._automatic_guard(
+                    self._outbox_guard(
                         row["name"],
                         json.loads(row["route"]),
-                        json.loads(row["payload"]).get("attention_routing"),
+                        json.loads(row["payload"]),
                     )
                 except _BlockedDelivery as error:
                     self.store.db.execute(
@@ -281,6 +323,8 @@ class ChannelManager:
         profile = self.config.profile(name)
         if not profile.enabled:
             raise ChannelError("渠道未启用", status_code=404)
+        # This shared gate also covers direct receive(), before fingerprints,
+        # attachment staging or a durable inbound receipt can be created.
         route = self._route(
             name,
             {
@@ -294,14 +338,70 @@ class ChannelManager:
         if not message.event_id or len(message.event_id) > 512 or len(message.text) > 64000:
             raise ChannelError("渠道消息 ID 或内容长度无效")
         trusted = message.sender_id in profile.owner_ids
+        control = is_mobile_control_text(message.text)
+        if control:
+            self.control_guard(name, message, route)
+            if self.control_submit is None:
+                raise ChannelError("手机任务控制服务未启用", status_code=503)
         key = hashlib.sha256(
             encoded([name, self._account(name), message.event_id]).encode("utf-8")
         ).hexdigest()
         try:
-            fingerprint = hashlib.sha256(encoded(asdict(message)).encode("utf-8")).hexdigest()
+            envelope = asdict(message)
+            # Preserve fingerprints of ordinary messages accepted before control
+            # evidence existed. Nonempty evidence remains part of the envelope.
+            for field in ("control_text", "control_account_id"):
+                if not envelope[field]:
+                    del envelope[field]
+            fingerprint = hashlib.sha256(encoded(envelope).encode("utf-8")).hexdigest()
+            legacy_fingerprint = ""
+            if control:
+                old_envelope = dict(envelope)
+                old_envelope.pop("control_text", None)
+                old_envelope.pop("control_account_id", None)
+                legacy_fingerprint = hashlib.sha256(
+                    encoded(old_envelope).encode("utf-8")
+                ).hexdigest()
         except (TypeError, ValueError):
             raise ChannelError("渠道消息信封无法规范化") from None
         async with self._inbound_lock:
+            if control:
+                row = self.store.db.execute(
+                    "SELECT fingerprint IS NULL AS unverified,"
+                    "CASE WHEN typeof(fingerprint)='text' "
+                    "AND length(CAST(fingerprint AS BLOB))=? "
+                    "THEN fingerprint=? COLLATE BINARY ELSE 0 END AS matched,"
+                    "CASE WHEN typeof(fingerprint)='text' "
+                    "AND length(CAST(fingerprint AS BLOB))=? "
+                    "THEN fingerprint=? COLLATE BINARY ELSE 0 END AS legacy_matched,"
+                    "receipt IS NOT NULL AS has_receipt FROM channel_inbound WHERE id=?",
+                    (
+                        len(fingerprint),
+                        fingerprint,
+                        len(legacy_fingerprint),
+                        legacy_fingerprint,
+                        key,
+                    ),
+                ).fetchone()
+                if row is not None:
+                    if row["unverified"] or (row["legacy_matched"] and row["has_receipt"]):
+                        # Refuse only: neither the old JSON nor any of its fields
+                        # become authority, and immutable history stays untouched.
+                        raise ChannelError(
+                            "旧入站回执不是手机任务票据，请重新发送 /任务", status_code=403
+                        )
+                    if not row["matched"]:
+                        raise ChannelError("同一渠道消息 ID 的信封内容不一致", status_code=409)
+                else:
+                    with self.store.db:
+                        self.store.db.execute(
+                            "INSERT INTO channel_inbound(id,name,created_at,fingerprint) "
+                            "VALUES(?,?,?,?)",
+                            (key, name, now(), fingerprint),
+                        )
+                # Only the core service reads and validates a stored control
+                # receipt, under its SQL byte gates and configuration lock.
+                return await self._receive_control(name, message, route, key, None)
             row = self.store.db.execute(
                 "SELECT * FROM channel_inbound WHERE id=?", (key,)
             ).fetchone()
@@ -412,6 +512,47 @@ class ChannelManager:
             )
             return receipt
 
+    def control_guard(self, name: str, message: IncomingMessage, route: Mapping[str, Any]) -> None:
+        """Synchronous source checks, repeated by the runtime's final guard."""
+        if (
+            self._closed
+            or name not in {"telegram", "onebot"}
+            or not self.config.profile(name).enabled
+            or message.sender_id not in self.config.profile(name).owner_ids
+            or message.kind != "private"
+            or message.files
+            or message.context_token
+            or not message.control_text
+            or not is_mobile_control_text(message.control_text)
+            or message.control_text != message.text
+            or not message.control_account_id
+            or message.control_account_id != self._account(name)
+        ):
+            raise ChannelError(
+                "任务控制仅接受当前已绑定主人原始私聊纯文本与可核验账号", status_code=403
+            )
+        self._route(name, route, outbound=True)
+
+    async def _receive_control(
+        self,
+        name: str,
+        message: IncomingMessage,
+        route: dict[str, Any],
+        key: str,
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        assert self.control_submit is not None
+        receipt = await self.control_submit(
+            name=name, message=message, route=route, event_id=key, receipt=previous
+        )
+        # The core service already committed this receipt while holding the
+        # configuration lock. Retrying only repairs this local idempotent queue.
+        reply = receipt.get("reply_text")
+        if not isinstance(reply, str) or not reply:
+            raise ChannelError("手机任务控制回执缺少明确回复")
+        await self.enqueue(name, message.target, reply, route=route, event_id="mobile-task:" + key)
+        return receipt
+
     async def _save_file(self, file: FileContent, name: str) -> dict[str, Any]:
         assert self.attachments is not None
 
@@ -465,13 +606,22 @@ class ChannelManager:
         media_mode: str = "file",
         automatic: bool = False,
         attention_routing: dict[str, Any] | None = None,
+        approval_notice: ApprovalNotice | None = None,
+        admission_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        if admission_guard is not None:
+            admission_guard()
         profile = self.config.profile(name)
         metadata = (
             FrozenRouting.load(attention_routing).dump() if attention_routing is not None else None
         )
         if metadata is not None and not automatic:
             raise ChannelError("主动投递证据只能来自宿主自动回复")
+        notice_data = None
+        if approval_notice is not None:
+            if not automatic or attachment_ids or media_mode != "file":
+                raise ChannelError("审批通知仅接纳宿主纯文本自动投递")
+            notice_data = ApprovalNotice.load(approval_notice.dump()).dump()
         blocked = ""
         if automatic:
             # Preserve the original account and recipient even when today's
@@ -517,7 +667,7 @@ class ChannelManager:
                 raise ChannelError("当前渠道适配器不支持原生语音发送")
         if (
             not isinstance(text, str)
-            or len(text) > 100000
+            or len(text) > MAX_OUTGOING_TEXT_CHARS
             or len(attachment_ids) > profile.max_attachments
         ):
             raise ChannelError("渠道文本或附件数量超过上限")
@@ -558,11 +708,15 @@ class ChannelManager:
             parts.append(part)
         if self._closed:
             raise ChannelError("渠道管理器已关闭，请使用当前配置重新发送")
+        if admission_guard is not None:
+            admission_guard()
         payload: dict[str, Any] = {"parts": parts}
         if automatic:
             payload["automatic"] = True
         if metadata is not None:
             payload["attention_routing"] = metadata
+        if notice_data is not None:
+            payload["approval_notice"] = notice_data
         identifier = (
             hashlib.sha256(encoded([event_id, name, selected]).encode("utf-8")).hexdigest()
             if event_id
@@ -580,6 +734,7 @@ class ChannelManager:
                 plain["parts"] != parts
                 or existing["route"] != selected
                 or existing["payload"].get("attention_routing") != metadata
+                or existing["payload"].get("approval_notice") != notice_data
             ):
                 raise ChannelError("相同投递 ID 的内容或发送模式不一致", status_code=409)
             return existing
@@ -588,7 +743,7 @@ class ChannelManager:
         ).fetchone()[0]
         if automatic and not blocked:
             try:
-                self._automatic_guard(name, selected, metadata)
+                self._outbox_guard(name, selected, payload)
             except _BlockedDelivery as error:
                 blocked = str(error)
         if not blocked and count >= self.config.max_pending_deliveries:
@@ -597,7 +752,7 @@ class ChannelManager:
         with self.store.db:
             if automatic and not blocked:
                 try:
-                    self._automatic_guard(name, selected, metadata)
+                    self._outbox_guard(name, selected, payload)
                 except _BlockedDelivery as error:
                     blocked = str(error)
             if not blocked:
@@ -677,10 +832,7 @@ class ChannelManager:
         if not self.config.profile(item["name"]).enabled:
             raise ChannelError("原回复渠道未启用", status_code=404)
         self._route(item["name"], item["route"], outbound=True)
-        if item["payload"].get("automatic"):
-            self._automatic_guard(
-                item["name"], item["route"], item["payload"].get("attention_routing")
-            )
+        self._outbox_guard(item["name"], item["route"], item["payload"])
         if item["state"] == "blocked" and item["name"] not in self._active:
             raise ChannelError("原回复渠道尚未就绪")
         if (
@@ -789,10 +941,7 @@ class ChannelManager:
                 (now(), item["id"]),
             )
         try:
-            if item["payload"].get("automatic"):
-                self._automatic_guard(
-                    item["name"], item["route"], item["payload"].get("attention_routing")
-                )
+            self._outbox_guard(item["name"], item["route"], item["payload"])
             route = self._route(item["name"], item["route"], outbound=True)
             if item["name"] == "weixin":
                 route["context_token"] = self._state(
@@ -809,10 +958,7 @@ class ChannelManager:
                     if "attachment_id" in part
                     else None
                 )
-                if item["payload"].get("automatic"):
-                    self._automatic_guard(
-                        item["name"], item["route"], item["payload"].get("attention_routing")
-                    )
+                self._outbox_guard(item["name"], item["route"], item["payload"])
                 receipt = await adapter.send(
                     route,
                     part.get("text", ""),
@@ -883,43 +1029,62 @@ class ChannelManager:
 
             events = self.store.events(after, limit=100)
             for event in events:
-                if event["type"] == "message.completed":
-                    message = event["data"].get("message", {})
-                    if (
-                        isinstance(message, dict)
-                        and message.get("role") == "assistant"
-                        and not message.get("interrupted")
-                    ):
-                        routes = message.get("delivery_routes", [])
-                        if isinstance(routes, list):
-                            for route in routes[:1]:
-                                if isinstance(route, dict) and route.get("name") in NAMES:
-                                    try:
-                                        await self.enqueue(
-                                            route["name"],
-                                            route.get("target", ""),
-                                            str(message.get("content") or ""),
-                                            message.get("attachment_ids", []),
-                                            event_id=str(message.get("id") or event["id"]),
-                                            route=route,
-                                            automatic=True,
-                                            attention_routing=message.get("attention_routing"),
-                                        )
-                                    except ChannelError as error:
-                                        if error.retryable:
-                                            # Keep the cursor; outbox completion emits a wakeup.
-                                            async with self.bus.changed:
-                                                await self.bus.changed.wait_for(changed)
-                                            break
-                                        self._errors[str(route["name"])] = str(error)
-                                    except Exception as error:
-                                        # One invalid/deleted attachment must not stop all later replies.
-                                        self._errors[str(route["name"])] = type(error).__name__
-                            else:
-                                after = event["id"]
-                                self._set_state("events", str(after))
-                                continue
+                if event["type"] == "approval.requested" and "approval_notice" in event["data"]:
+                    try:
+                        data = event["data"]
+                        notice = ApprovalNotice.load(data["approval_notice"])
+                        if (
+                            data.get("id") != notice.approval_id
+                            or data.get("session_id") != notice.session_id
+                            or data.get("run_id") != notice.run_id
+                            or event["session_id"] != notice.session_id
+                            or not all(
+                                isinstance(data.get(key), str) and data[key]
+                                for key in ("tool", "risk")
+                            )
+                        ):
+                            raise ValueError("审批通知与原请求不一致")
+                        route = notice.reply_origin.delivery_routes()[0]
+                        name = route["name"]
+                        text = (
+                            f"有工具调用等待主人批准：\n{notice.approval_id}\n"
+                            f"工具：{data['tool']}；风险：{data['risk']}\n"
+                            f"会话：{notice.session_id}\n运行：{notice.run_id}\n"
+                            f"详情：/审批 {notice.approval_id}\n"
+                            f"批准：/批准 {notice.approval_id}\n拒绝：/拒绝 {notice.approval_id}\n"
+                            "批准仅登记决定，不表示操作已执行或成功。"
+                        )
+                        limit = min(
+                            self.config.profile(name).max_message_chars,
+                            4096
+                            if name == "telegram"
+                            else self.config.profile(name).max_message_chars,
+                        )
+                        if len(text) > limit:
+                            raise ChannelError("完整审批通知超过原渠道单条文本预算，保留在 Web")
+                        text.encode("utf-8")
+                        await self.enqueue(
+                            name,
+                            route["target"],
+                            text,
+                            event_id="approval-notice:" + notice.approval_id,
+                            route=route,
+                            automatic=True,
+                            attention_routing=FrozenRouting.bound(notice.reply_origin).dump(),
+                            approval_notice=notice,
+                        )
+                    except ChannelError as error:
+                        if error.retryable:
+                            # Persist first; retain this event while the existing queue drains.
+                            async with self.bus.changed:
+                                await self.bus.changed.wait_for(changed)
                             break
+                        self._errors["approval_notice"] = str(error)
+                    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
+                        self._errors["approval_notice"] = "审批通知来源或摘要无法核验，保留在 Web"
+                # Assistant text/reasoning and tool activity stay in WebUI.
+                # External deliveries require an explicit enqueue; the approval
+                # protocol above retains its own host-authorized notification.
                 after = event["id"]
                 self._set_state("events", str(after))
             else:

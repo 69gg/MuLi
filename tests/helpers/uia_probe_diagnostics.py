@@ -29,6 +29,8 @@ STAGES = (
 _STAGE_LINES = {b"muli-uia-stage=1:" + stage.encode("ascii"): stage for stage in STAGES}
 _NOTE_PREFIX = "uia_probe_diagnostic="
 _NOTE_BYTES = 4096
+_PROBE_PHASES = ("spawn", "send", "response", "cleanup")
+_MAX_MILLISECONDS = 2**31 - 1
 
 PENDING_STAGES = ("script_entered", "input_received")
 _PENDING_LINES = {b"muli-uia-pending=1:" + stage.encode("ascii"): stage for stage in PENDING_STAGES}
@@ -78,7 +80,7 @@ def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]
         and (process is None or type(exit_code) is int)
         and readers_settled
     )
-    return {
+    facts = {
         "stages": stages,
         "stage_sequence": sequence,
         "stderr_prefix_capped": len(data) == MAX_STDERR_BYTES,
@@ -91,6 +93,10 @@ def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]
         "readers_settled": readers_settled,
         "cleanup": "confirmed" if cleanup else "unconfirmed",
     }
+    if isinstance(lease, PendingHelperLease):
+        facts["before_cleanup"] = lease.before_cleanup
+        facts["after_cleanup"] = lease._snapshot()
+    return facts
 
 
 async def observe_probe(lease: AXHelperLease) -> dict[str, Any]:
@@ -139,6 +145,7 @@ class _PendingInput:
         self.lease.drain_started = True
         await self.writer.drain()
         self.lease.drain_returned = True
+        self.lease._input_drained()
 
     def close(self) -> None:
         self.writer.close()
@@ -150,8 +157,16 @@ class _PendingInput:
 class PendingHelperLease(AXHelperLease):
     """Test-only observation of the fourth native case's single owned helper."""
 
-    def __init__(self, argv: list[str], *, timeout: float, ttl: float, max_nodes: int) -> None:
-        super().__init__(argv, timeout=timeout, ttl=ttl, max_nodes=max_nodes)
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        timeout: float,
+        ttl: float,
+        max_nodes: int,
+        once: bool = False,
+    ) -> None:
+        super().__init__(argv, timeout=timeout, ttl=ttl, max_nodes=max_nodes, once=once)
         self.input_observed = False
         self.write_started = self.write_returned = False
         self.drain_started = self.drain_returned = False
@@ -169,10 +184,16 @@ class PendingHelperLease(AXHelperLease):
             )
             self.input_observed = True
 
+    def _input_drained(self) -> None:
+        pass
+
+    def _snapshot(self) -> dict[str, Any]:
+        return pending_snapshot(self)
+
     def _retire(self, error: AXLeaseError | None = None) -> None:
         if self._state not in {"closing", "closed"}:
             try:
-                self.before_cleanup = pending_snapshot(self)
+                self.before_cleanup = self._snapshot()
             except Exception:
                 pass  # First retirement and original error still belong to the base owner.
         super()._retire(error)
@@ -216,6 +237,87 @@ def pending_snapshot(lease: PendingHelperLease) -> dict[str, Any]:
         "stderr_bytes": len(data),
         "stderr_prefix_capped": len(data) == MAX_STDERR_BYTES,
     }
+
+
+class ProbeHelperLease(PendingHelperLease):
+    """Observe the first real probe through the same owned lease operations."""
+
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        timeout: float,
+        ttl: float,
+        max_nodes: int,
+        once: bool = True,
+    ) -> None:
+        super().__init__(argv, timeout=timeout, ttl=ttl, max_nodes=max_nodes, once=once)
+        self._observed_started: float | None = None
+        self._observed_ended: float | None = None
+        self._observed_phase = "not_started"
+        self._observed_phase_started = 0.0
+        self._observed_durations = dict.fromkeys(_PROBE_PHASES, 0.0)
+
+    def _observation_time(self) -> float:
+        return self._loop.time()
+
+    def _observe(self, phase: str) -> None:
+        try:
+            now = self._observation_time()
+            if self._observed_started is None:
+                self._observed_started = now
+            elif self._observed_phase in self._observed_durations:
+                self._observed_durations[self._observed_phase] += max(
+                    0.0, now - self._observed_phase_started
+                )
+            self._observed_phase, self._observed_phase_started = phase, now
+            if phase == "settled":
+                self._observed_ended = now
+        except Exception:
+            pass  # Observation must never change the original lease operation.
+
+    async def _start(self) -> None:
+        self._observe("spawn")
+        await super()._start()
+        self._observe("send")
+
+    def _input_drained(self) -> None:
+        self._observe("response")
+
+    def _retire(self, error: AXLeaseError | None = None) -> None:
+        first = self._state not in {"closing", "closed"}
+        super()._retire(error)
+        if first:
+            self._observe("cleanup")
+
+    async def _finish(self) -> None:
+        try:
+            await super()._finish()
+        finally:
+            self._observe("settled")
+
+    def _snapshot(self) -> dict[str, Any]:
+        facts = pending_snapshot(self)
+        data = bytes(self._stderr[:MAX_STDERR_BYTES])
+        stages, sequence = _stage_facts(data, STAGES, _STAGE_LINES)
+        now = self._observation_time() if self._observed_ended is None else self._observed_ended
+        durations = self._observed_durations.copy()
+        if self._observed_phase in durations:
+            durations[self._observed_phase] += max(0.0, now - self._observed_phase_started)
+        elapsed = 0.0 if self._observed_started is None else now - self._observed_started
+        facts.update(
+            script_stages=stages,
+            stage_sequence=sequence,
+            stderr_kind="empty" if not data else "known_stage" if stages else "unrecognized",
+            phase=self._observed_phase,
+            elapsed_ms=_milliseconds(elapsed),
+            phase_ms={phase: _milliseconds(value) for phase, value in durations.items()},
+        )
+        return facts
+
+
+def _milliseconds(seconds: float) -> int:
+    return int(min(_MAX_MILLISECONDS, max(0.0, seconds) * 1000))
 
 
 def pending_received(lease: PendingHelperLease) -> bool:

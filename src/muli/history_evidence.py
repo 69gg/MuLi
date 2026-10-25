@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from contextlib import closing
 from typing import Any
@@ -19,6 +21,8 @@ from muli.store import Store
 _UTF8_MAX_BYTES = 4
 _SQLITE_MAX_PARAMETER = (1 << 63) - 1
 _OPTIONAL_METADATA = ("source", "principal")
+_CONTINUATION_CURSOR_VERSION = 1
+_CONTINUATION_FILTER = "agents_parent_unfinished"
 
 
 def _archive_sequence(value: int, name: str, *, minimum: int = 0) -> None:
@@ -31,6 +35,146 @@ def _archive_sequence(value: int, name: str, *, minimum: int = 0) -> None:
 class HistoryEvidence:
     def __init__(self, store: Store) -> None:
         self.store = store
+
+    def _continuation_cursor(self, token: str | None, main_id: str, max_output_chars: int) -> int:
+        if token is None:
+            return 0
+        if not isinstance(token, str) or not token:
+            raise EvidenceError("record_cursor_invalid", "延续目录游标无效；请从首页重新读取")
+        if len(token) > max_output_chars:
+            raise EvidenceError("output_budget", "延续目录游标超过当前工具输出预算")
+        try:
+            payload = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
+            if not isinstance(payload, list) or len(payload) != 6:
+                raise ValueError
+            version, section, instance, parent, filters, rowid = payload
+            if (
+                type(version) is not int
+                or version != _CONTINUATION_CURSOR_VERSION
+                or section != "continuations"
+                or instance != self.store.instance_id
+                or parent != main_id
+                or filters != _CONTINUATION_FILTER
+                or type(rowid) is not int
+                or not 1 <= rowid <= _SQLITE_MAX_PARAMETER
+            ):
+                raise ValueError
+            return rowid
+        except (ValueError, TypeError, RecursionError, binascii.Error) as exc:
+            raise EvidenceError(
+                "record_cursor_invalid", "延续目录游标无效或不属于当前资料库和主会话"
+            ) from exc
+
+    def _encode_continuation_cursor(self, main_id: str, rowid: int) -> str:
+        payload = [
+            _CONTINUATION_CURSOR_VERSION,
+            "continuations",
+            self.store.instance_id,
+            main_id,
+            _CONTINUATION_FILTER,
+            rowid,
+        ]
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+    @staticmethod
+    def _continuation_text(row: dict[str, Any], field: str) -> str | None:
+        if row[field + "_type"] != "text":
+            return None
+        raw = row[field]
+        if not isinstance(raw, bytes) or len(raw) != row[field + "_bytes"]:
+            raise EvidenceError("output_budget", "延续目录无法在预算内核查完整身份元数据")
+        try:
+            return decode_utf8(raw, allow_incomplete_tail=False) or None
+        except EvidenceError:
+            return None
+
+    def _continuation_item(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        # SQL classifies status only after selecting the bounded parent window.
+        # Completed and malformed statuses consume a candidate without disclosure.
+        if not isinstance(row["status"], bytes):
+            return None
+        identifier = self._continuation_text(row, "agent_key")
+        stored_id = self._continuation_text(row, "agent_id")
+        session_id = self._continuation_text(row, "session_id")
+        if identifier is None or stored_id != identifier or session_id is None:
+            return None
+        status = row["status"].decode("ascii")
+        run_id = self._continuation_text(row, "run_id")
+        associated = run_id is not None and row["run_associated"] == 1
+        item: dict[str, Any] = {
+            "kind": "agent",
+            "id": identifier,
+            "session_id": session_id,
+            "status": status,
+            "run_id": run_id if associated and status != "queued" else None,
+            "availability": (
+                "historical"
+                if associated and status == "queued"
+                else "available"
+                if associated
+                else "unavailable"
+            ),
+        }
+        for field in ("generation", "completion_revision"):
+            if row[field] is not None:
+                item[field] = row[field]
+        commitment_id = self._continuation_text(row, "commitment_id")
+        if commitment_id is not None:
+            item["commitment_id"] = commitment_id
+        return item
+
+    def continuations(
+        self,
+        main_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 20,
+        max_output_chars: int,
+    ) -> dict[str, Any]:
+        """Observe a finite direct-child window; never resume or infer effects."""
+        validate_integer(limit, "limit", minimum=1)
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
+        after = self._continuation_cursor(cursor, main_id, max_output_chars)
+        result: dict[str, Any] = {
+            "items": [],
+            "omitted": 0,
+            "next_cursor": None,
+            "has_more": False,
+            "consistency": "live",
+            "side_effect_status": "unknown",
+        }
+        if json_size(result) > max_output_chars:
+            raise EvidenceError("output_budget", "延续目录页元数据超过工具输出预算")
+        rows = self.store.continuation_rows(
+            main_id,
+            after_rowid=after,
+            limit=limit + 1,
+            metadata_bytes=max_output_chars * _UTF8_MAX_BYTES,
+        )
+        with closing(rows):
+            row = next(rows, None)
+            consumed = 0
+            while row is not None and consumed < limit:
+                following = next(rows, None)
+                item = self._continuation_item(row)
+                if item is None:
+                    result["omitted"] += 1
+                else:
+                    result["items"].append(item)
+                consumed += 1
+                result["has_more"] = following is not None
+                result["next_cursor"] = (
+                    self._encode_continuation_cursor(main_id, row["rowid"])
+                    if following is not None
+                    else None
+                )
+                # Include the actual cursor/envelope. A legal item is never
+                # dropped or relabelled unavailable merely to fit the page.
+                if json_size(result) > max_output_chars:
+                    raise EvidenceError("output_budget", "延续目录页无法在输出预算内完整返回")
+                row = following
+        return result
 
     def _session(self, session_id: str) -> None:
         if not isinstance(session_id, str) or not session_id:

@@ -23,6 +23,7 @@ from muli.file_inbox import FileInboxProof, FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState, read_message
 from muli.mcp_receive_errors import RECEIVE_FAILURE_CODES
 from muli.proactive import FrozenRouting
+from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id
 
@@ -45,6 +46,8 @@ _COMPONENTS = frozenset(
 _CODES = RECEIVE_FAILURE_CODES | frozenset(
     {
         "runtime_failed",
+        "clock_failed",
+        "clock_recovered",
         "update_failed",
         "management_failed",
         "channel_failed",
@@ -482,6 +485,10 @@ class SystemEvents:
         )
 
     def _persist(self, item: _Metadata) -> bool:
+        # This asynchronous consumer owns no existing transaction. Entering its
+        # context manager would otherwise commit another producer's prefix.
+        if self.store.db.in_transaction:
+            raise RuntimeError("System log storage has an unsettled transaction")
         allowed = self._notification_allowed(item)
         bucket = int(item.captured_at // self._policy.dedup_seconds)
         identity = (
@@ -539,6 +546,8 @@ class SystemEvents:
         return not duplicate
 
     def _prune(self) -> bool:
+        if self.store.db.in_transaction:
+            raise RuntimeError("System log retention has an unsettled transaction")
         # Each transaction handles a bounded suffix. Deleting our own events can
         # leave legal cursor gaps, but must never rewind the shared inbox cursor.
         rows = self.store.db.execute(
@@ -613,6 +622,7 @@ class AttentionSource:
     routing: FrozenRouting = FrozenRouting()
     producer_proof: tuple[str, str] | None = None
     file_inbox_proof: FileInboxProof | None = None
+    reminder_proof: ReminderFollowupProof | None = None
 
 
 def _notification_source(
@@ -620,6 +630,8 @@ def _notification_source(
     event: dict[str, Any],
     enabled: Collection[str],
     policy: SystemEventsSettings | None,
+    *,
+    max_output_chars: int | None = None,
 ) -> AttentionSource | None:
     data, identifier = event["data"], event["data"]["id"]
     notice = store.get("notification", identifier)
@@ -634,6 +646,8 @@ def _notification_source(
             "created_at",
             "routing",
             "producer",
+            "followup",
+            "followup_occurrence",
         )
     ):
         return None
@@ -643,6 +657,7 @@ def _notification_source(
     if not isinstance(notice.get("title"), str) or not isinstance(notice.get("content"), str):
         return None
     routing = FrozenRouting.load(notice.get("routing"))
+    reminder_proof = None
     if kind == "reminder":
         reminder_id = notice.get("reminder_id")
         if not isinstance(reminder_id, str):
@@ -656,6 +671,12 @@ def _notification_source(
             or routing.classification == "independent"
         ):
             return None
+        if "followup" in notice or "followup_occurrence" in notice or "followup" in reminder:
+            if max_output_chars is None:
+                return None
+            reminder_proof = read_followup_notice(store, identifier, max_output_chars)
+            if reminder_proof is None:
+                return None
     else:
         update = store.get("update", "latest")
         if (
@@ -675,6 +696,7 @@ def _notification_source(
         notice["title"] + "\n" + notice["content"],
         "notification:" + identifier,
         routing,
+        reminder_proof=reminder_proof,
     )
 
 
@@ -857,7 +879,6 @@ _ADAPTERS: dict[
         AttentionSource | None,
     ],
 ] = {
-    "notification.created": _notification_source,
     "management.completed": _management_source,
     "management.progress": _management_source,
     "system.log": _log_source,
@@ -872,6 +893,7 @@ def attention_source(
     *,
     chiliarch_policy: ChiliarchAttentionState | None = None,
     file_inbox_policy: FileInboxState | None = None,
+    max_output_chars: int | None = None,
 ) -> AttentionSource | None:
     if event.get("session_id") is not None or not isinstance(event.get("data"), dict):
         return None
@@ -928,6 +950,10 @@ def attention_source(
                 file_inbox_policy.revision,
                 record["proof"]["watcher_generation"],
             ),
+        )
+    if event.get("type") == "notification.created":
+        return _notification_source(
+            store, event, enabled, system_policy, max_output_chars=max_output_chars
         )
     adapter = _ADAPTERS.get(event.get("type", ""))
     return adapter(store, event, enabled, system_policy) if adapter else None

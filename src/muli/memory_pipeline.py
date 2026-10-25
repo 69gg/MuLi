@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
+import sys
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
@@ -13,13 +14,29 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from muli.events import EventBus
+from muli.evidence import EvidenceError, validate_integer
 from muli.maintenance import Admission
 from muli.media import MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
-from muli.memory_context import recalled_for_prompt, render_context
-from muli.store import now
+from muli.memory_context import PromptComposition, compose_context_result
+from muli.store import SQLITE_MAX_INTEGER, now
 
 Extractor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+_INDEX_ACTIVE = frozenset({"queued", "processing", "retry"})
+_INDEX_TERMINAL = frozenset({"done", "failed", "blocked", "cancelled"})
+_INDEX_ERRORS = ("embedding_changed", "index_failed", "index_timeout", "output_budget")
+_INDEX_EXECUTION_FIELDS = ("source_index", "item_index", "attempts", "next_attempt")
+_INDEX_COUNTERS = (
+    "revision",
+    "sources_total",
+    "sources_finished",
+    "vectors_written",
+    "already_current",
+    "omitted",
+    "source_index",
+    "item_index",
+    "attempts",
+)
 
 
 class MemoryMedia(Protocol):
@@ -94,11 +111,16 @@ class MemoryPipeline:
         media: MemoryMedia | None = None,
         config: MemoryPipelineConfig | None = None,
         admission: Admission | None = None,
+        max_plan_bytes: int | None = None,
     ) -> None:
         self.memory, self.bus = memory, bus
         self.config = config or MemoryPipelineConfig()
         self.admission = admission or Admission()
         self.extractor, self.media = extractor, media
+        self.max_plan_bytes = (
+            self.config.max_source_chars * 4 if max_plan_bytes is None else max_plan_bytes
+        )
+        validate_integer(self.max_plan_bytes, "max_plan_bytes", minimum=1)
         self.memory.configure(
             graph_hops=self.config.graph_hops,
             max_graph_edges=self.config.max_graph_edges,
@@ -113,6 +135,7 @@ class MemoryPipeline:
         self._cache: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
         self._cache_revision = memory.revision
         self._last_error = ""
+        self._index_closed = False
 
     def ingest(self, message: Mapping[str, Any], *, trusted_owner: bool = False) -> dict[str, Any]:
         if not self.config.enabled:
@@ -150,11 +173,13 @@ class MemoryPipeline:
         }
 
     def _pending(self) -> int:
-        return int(
+        jobs = int(
             self.memory.store.db.execute(
                 "SELECT count(*) FROM memory_jobs WHERE state IN ('queued','processing','retry')"
             ).fetchone()[0]
         )
+        plan = self._current_index_plan()
+        return jobs + int(plan is not None and plan["state"] in _INDEX_ACTIVE)
 
     def _queue(self, source_id: str) -> bool:
         if self.job(source_id) is not None or self._pending() >= self.config.max_pending_jobs:
@@ -183,6 +208,7 @@ class MemoryPipeline:
         if not self.config.enabled or (self._worker is not None and not self._worker.done()):
             return
         self.recover()
+        self._index_closed = False
         self._worker = asyncio.create_task(self._run(), name="muli-memory")
         self._wake.set()
 
@@ -193,8 +219,21 @@ class MemoryPipeline:
                 "UPDATE memory_jobs SET state='queued',updated_at=? WHERE state='processing'",
                 (now(),),
             )
+        plan = self._current_index_plan()
+        if plan is not None and plan["state"] in _INDEX_ACTIVE:
+            try:
+                self._index_admit(plan)
+            except EvidenceError as error:
+                if error.code != "output_budget":
+                    raise
+                # A smaller output budget may still fit the actual durable
+                # prefix but not its next progress/error update. Retire only
+                # execution cursors; sources and observed counts stay intact.
+                self._block_index(plan, "output_budget")
+        self.check_index_model()
 
     async def close(self) -> None:
+        self._index_closed = True
         worker, self._worker = self._worker, None
         if worker is not None:
             worker.cancel()
@@ -238,7 +277,460 @@ class MemoryPipeline:
             "max_pending_jobs": self.config.max_pending_jobs,
             "last_error": self._last_error,
             "cache_entries": len(self._cache),
+            "index_plan": (
+                self._index_summary(plan) if (plan := self._current_index_plan()) else None
+            ),
         }
+
+    def _index_fit(self, item: dict[str, Any], *, max_bytes: int | None = None) -> None:
+        budget = self.max_plan_bytes
+        if max_bytes is not None:
+            validate_integer(max_bytes, "max_bytes", minimum=1)
+            budget = min(budget, max_bytes)
+        if len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8")) > budget:
+            raise EvidenceError("output_budget", "完整索引计划超过当前元数据字节预算")
+
+    def _index_admit(self, plan: dict[str, Any]) -> None:
+        # Every later mutable field has a finite representation. Reserve it at
+        # admission so an otherwise legal near-limit plan cannot kill the sole
+        # worker when queued becomes processing or progress/error fields grow.
+        projection = {
+            **plan,
+            **dict.fromkeys(_INDEX_COUNTERS, SQLITE_MAX_INTEGER - 1),
+            "state": max(_INDEX_ACTIVE | _INDEX_TERMINAL, key=len),
+            "last_error": max(_INDEX_ERRORS, key=len),
+            **dict.fromkeys(("created_at", "updated_at", "next_attempt"), -sys.float_info.max),
+        }
+        self._index_fit(projection)
+
+    def check_index_budget(self, max_bytes: int) -> None:
+        """Reject an unreadable current plan before stopping its owning worker."""
+        validate_integer(max_bytes, "max_bytes", minimum=1)
+        store = self.memory.store
+        pointer = store.bounded_object("memory_index_state", "current", max_bytes=max_bytes)
+        if pointer is None:
+            return
+        plan_id = pointer.get("plan_id")
+        if not isinstance(plan_id, str):
+            raise EvidenceError("content_unavailable", "当前索引计划定位无效")
+        if store.bounded_object("memory_index_plan", plan_id, max_bytes=max_bytes) is None:
+            raise EvidenceError("content_unavailable", "当前索引计划无法完整核查")
+
+    def _index_plan(self, plan_id: str) -> dict[str, Any] | None:
+        if (
+            not isinstance(plan_id, str)
+            or not plan_id
+            or len(plan_id.encode("utf-8")) > self.max_plan_bytes
+        ):
+            raise ValueError("索引计划 ID 无效")
+        plan = self.memory.store.bounded_object(
+            "memory_index_plan", plan_id, max_bytes=self.max_plan_bytes
+        )
+        if plan is None:
+            return None
+        state = plan.get("state")
+        if (
+            plan.get("version") != 1
+            or type(plan.get("version")) is not int
+            or not isinstance(state, str)
+            or state not in _INDEX_ACTIVE | _INDEX_TERMINAL
+            or not isinstance(plan.get("model_key"), str)
+            or not isinstance(plan.get("sources"), list)
+            or not isinstance(plan.get("last_error"), str)
+        ):
+            raise EvidenceError("content_unavailable", "索引计划无法完整核查")
+        execution_fields = sum(field in plan for field in _INDEX_EXECUTION_FIELDS)
+        if execution_fields not in {0, len(_INDEX_EXECUTION_FIELDS)} or (
+            state in _INDEX_ACTIVE and execution_fields == 0
+        ):
+            raise EvidenceError("content_unavailable", "索引计划执行进度无法核查")
+        for field in _INDEX_COUNTERS:
+            if field in _INDEX_EXECUTION_FIELDS and field not in plan:
+                continue
+            value = plan.get(field)
+            if not isinstance(value, int):
+                raise EvidenceError("content_unavailable", "索引计划进度无法核查")
+            validate_integer(value, field, minimum=1 if field == "revision" else 0)
+        if plan["sources_total"] != len(plan["sources"]) or (
+            execution_fields and plan["source_index"] > len(plan["sources"])
+        ):
+            raise EvidenceError("content_unavailable", "索引计划来源范围无效")
+        if execution_fields:
+            deadline = plan.get("next_attempt")
+            if (
+                not isinstance(deadline, (int, float))
+                or isinstance(deadline, bool)
+                or not math.isfinite(deadline)
+                or deadline < 0
+            ):
+                raise EvidenceError("content_unavailable", "索引计划等待时间无效")
+        for source in plan["sources"]:
+            if (
+                not isinstance(source, dict)
+                or not isinstance(source.get("id"), str)
+                or not isinstance(source.get("digest"), str)
+                or not isinstance(source.get("items"), list)
+            ):
+                raise EvidenceError("content_unavailable", "索引计划来源证明无效")
+            for item in source["items"]:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    raise EvidenceError("content_unavailable", "索引计划条目证明无效")
+                version = item.get("version")
+                if not isinstance(version, int):
+                    raise EvidenceError("content_unavailable", "索引计划条目版本无效")
+                validate_integer(version, "version")
+        if (
+            execution_fields
+            and plan["source_index"] < len(plan["sources"])
+            and plan["item_index"] > len(plan["sources"][plan["source_index"]]["items"])
+        ):
+            raise EvidenceError("content_unavailable", "索引计划条目范围无效")
+        return plan
+
+    def _current_index_plan(self) -> dict[str, Any] | None:
+        pointer = self.memory.store.bounded_object(
+            "memory_index_state", "current", max_bytes=self.max_plan_bytes
+        )
+        if pointer is None:
+            return None
+        plan_id = pointer.get("plan_id")
+        if not isinstance(plan_id, str):
+            raise EvidenceError("content_unavailable", "当前索引计划定位无效")
+        return self._index_plan(plan_id)
+
+    @staticmethod
+    def _index_summary(plan: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "plan_id": plan["id"],
+            **{
+                key: plan[key]
+                for key in (
+                    "state",
+                    "model_key",
+                    "sources_total",
+                    "sources_finished",
+                    "vectors_written",
+                    "already_current",
+                    "omitted",
+                    "last_error",
+                )
+            },
+        }
+
+    def index_status(self, plan_id: str) -> dict[str, Any]:
+        plan = self._index_plan(plan_id)
+        if plan is None:
+            raise KeyError(plan_id)
+        return self._index_summary(plan)
+
+    def _index_save(self, plan: dict[str, Any], *, max_bytes: int | None = None) -> None:
+        plan["updated_at"] = now()
+        self._index_fit(plan, max_bytes=max_bytes)
+        self.memory.store.put("memory_index_plan", plan)
+
+    def _block_index(
+        self, plan: dict[str, Any], reason: str, *, max_bytes: int | None = None
+    ) -> None:
+        blocked = {
+            **plan,
+            "state": "blocked",
+            "last_error": reason,
+            "revision": plan["revision"] + 1,
+        }
+        for field in _INDEX_EXECUTION_FIELDS:
+            blocked.pop(field)
+        self._index_save(blocked, max_bytes=max_bytes)
+
+    def _source_digest(self, source_id: str) -> str | None:
+        row = self.memory.store.db.execute(
+            "SELECT CASE WHEN typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 "
+            "THEN CAST(digest AS BLOB) END AS digest FROM memory_sources s WHERE s.id=? "
+            "AND typeof(content)='text' AND length(CAST(content AS BLOB))<=? "
+            "AND NOT EXISTS (SELECT 1 FROM memory_forgotten_sources f WHERE f.id=s.id)",
+            (source_id, self.config.max_source_chars * 4),
+        ).fetchone()
+        raw = row["digest"] if row is not None else None
+        if not isinstance(raw, bytes):
+            return None
+        try:
+            digest = raw.decode("ascii")
+        except UnicodeError:
+            return None
+        return digest if all(character in "0123456789abcdef" for character in digest) else None
+
+    def _index_source(self, source_id: str) -> dict[str, Any]:
+        digest = self._source_digest(source_id)
+        row = self.memory.store.db.execute(
+            "SELECT CASE WHEN typeof(checkpoint)='text' AND length(CAST(checkpoint AS BLOB))<=? "
+            "THEN CAST(checkpoint AS BLOB) END AS checkpoint FROM memory_jobs "
+            "WHERE source_id=? AND state='done'",
+            (self.max_plan_bytes, source_id),
+        ).fetchone()
+        if digest is None or row is None or row["checkpoint"] is None:
+            raise ValueError("只能重建准确、未遗忘且已完成提炼的来源")
+        try:
+            checkpoint = json.loads(row["checkpoint"].decode("utf-8"))
+            if not isinstance(checkpoint, dict):
+                raise ValueError
+            identifiers = checkpoint["memory_ids"]
+            if (
+                not isinstance(checkpoint.get("extraction"), dict)
+                or not isinstance(identifiers, list)
+                or len(identifiers) > self.config.max_facts_per_source + 1
+                or any(not isinstance(value, str) or not value for value in identifiers)
+                or len(identifiers) != len(set(identifiers))
+            ):
+                raise ValueError
+            json.dumps(checkpoint, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (KeyError, ValueError, TypeError, UnicodeError, RecursionError) as error:
+            raise ValueError("完成作业的有限条目集合无法核查") from error
+        items = []
+        for identifier in sorted(identifiers):
+            version_row = self.memory.store.db.execute(
+                "SELECT CASE WHEN typeof(version)='integer' AND version>0 THEN version END "
+                "FROM memory_meta WHERE memory_id=? AND source_id=? AND status!='superseded'",
+                (identifier, source_id),
+            ).fetchone()
+            items.append(
+                {
+                    "id": identifier,
+                    "version": version_row[0] if version_row and version_row[0] else 0,
+                }
+            )
+        return {"id": source_id, "digest": digest, "items": items}
+
+    def start_index(self, source_ids: list[str], key: str) -> dict[str, Any]:
+        self.admission.require()
+        if (
+            not isinstance(source_ids, list)
+            or not 1 <= len(source_ids) <= self.config.max_pending_jobs
+            or not isinstance(key, str)
+            or not key.strip()
+            or len(key) > self.max_plan_bytes
+        ):
+            raise ValueError("索引需要准确来源 ID 列表和稳定请求键")
+        remaining = self.max_plan_bytes - len(key.encode("utf-8"))
+        for value in source_ids:
+            if not isinstance(value, str) or not value.strip() or len(value) > remaining:
+                raise ValueError("索引来源集合超过当前元数据字节预算")
+            remaining -= len(value.encode("utf-8"))
+            if remaining < 0:
+                raise EvidenceError("output_budget", "完整索引来源集合超过字节预算")
+        identifiers = sorted(set(source_ids))
+        request = {"source_ids": identifiers, "model_key": self._model_key()}
+        self._index_fit({**request, "key": key})
+        request_hash = hashlib.sha256(
+            json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        plan_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        previous = self._index_plan(plan_id)
+        if previous is not None:
+            if previous.get("request_hash") != request_hash:
+                raise EvidenceError("evidence_changed", "同一索引请求键的来源或目标模型不同")
+            return self._index_summary(previous)
+        if self._index_closed or not self.config.enabled or not self._model_key():
+            raise ValueError("记忆或 embedding 未启用，未接纳索引计划")
+        current = self._current_index_plan()
+        if (
+            current is not None and current["state"] in _INDEX_ACTIVE
+        ) or self._pending() >= self.config.max_pending_jobs:
+            raise ValueError("后台记忆配额已满或已有索引计划，请等待或取消")
+        sources = []
+        for identifier in identifiers:
+            sources.append(self._index_source(identifier))
+            self._index_fit({"sources": sources})
+        plan = {
+            "id": plan_id,
+            "version": 1,
+            "revision": 1,
+            "request_hash": request_hash,
+            "model_key": request["model_key"],
+            "sources": sources,
+            "state": "queued",
+            "sources_total": len(sources),
+            "sources_finished": 0,
+            "vectors_written": 0,
+            "already_current": 0,
+            "omitted": 0,
+            "source_index": 0,
+            "item_index": 0,
+            "attempts": 0,
+            "next_attempt": now(),
+            "last_error": "",
+            "created_at": now(),
+            "updated_at": now(),
+        }
+        self._index_admit(plan)
+        self.memory.store.put_many(
+            [
+                ("memory_index_plan", plan),
+                ("memory_index_state", {"id": "current", "plan_id": plan_id}),
+            ]
+        )
+        self._wake.set()
+        return self._index_summary(plan)
+
+    def cancel_index(self, plan_id: str) -> dict[str, Any]:
+        self.admission.require()
+        plan = self._index_plan(plan_id)
+        if plan is None:
+            raise KeyError(plan_id)
+        if plan["state"] in _INDEX_ACTIVE:
+            plan.update(state="cancelled", revision=plan["revision"] + 1)
+            self._index_save(plan)
+            self._wake.set()
+        return self._index_summary(plan)
+
+    def check_index_model(
+        self, model_key: str | None = None, *, max_bytes: int | None = None
+    ) -> None:
+        plan = self._current_index_plan()
+        key = self._model_key() if model_key is None else model_key
+        if plan is not None and plan["state"] in _INDEX_ACTIVE and plan["model_key"] != key:
+            self._block_index(plan, "embedding_changed", max_bytes=max_bytes)
+
+    def _index_live(self, plan: dict[str, Any]) -> bool:
+        if self._index_closed or not self.config.enabled or not self.admission.allowed:
+            return False
+        current = self._current_index_plan()
+        return (
+            current is not None
+            and current["id"] == plan["id"]
+            and current["revision"] == plan["revision"]
+            and current["state"] in _INDEX_ACTIVE
+            and current["model_key"] == plan["model_key"] == self._model_key()
+        )
+
+    def _index_item(
+        self, source_id: str, entry: dict[str, Any], model_key: str
+    ) -> dict[str, Any] | None:
+        if entry["version"] == 0:
+            return None
+        row = self.memory.store.db.execute(
+            "SELECT CASE WHEN typeof(m.content)='text' "
+            "AND length(CAST(m.content AS BLOB))<=? THEN CAST(m.content AS BLOB) END AS content,"
+            "EXISTS(SELECT 1 FROM memory_vectors v WHERE v.memory_id=m.id AND v.model_key=?) AS indexed "
+            "FROM memories m JOIN memory_meta x ON x.memory_id=m.id "
+            "WHERE m.id=? AND x.source_id=? AND typeof(x.version)='integer' "
+            "AND x.version=? AND x.status!='superseded'",
+            (self.config.max_source_chars * 4, model_key, entry["id"], source_id, entry["version"]),
+        ).fetchone()
+        if row is None or row["content"] is None:
+            return None
+        try:
+            content = row["content"].decode("utf-8", errors="strict")
+        except UnicodeError:
+            return None
+        if not content.strip() or len(content) > self.config.max_source_chars:
+            return None
+        return {**entry, "content": content, "indexed": row["indexed"] == 1}
+
+    async def _index_batch(self, plan: dict[str, Any]) -> None:
+        if not self._index_live(plan):
+            return
+        if plan["source_index"] == len(plan["sources"]):
+            plan["state"] = "done"
+            return
+        source = plan["sources"][plan["source_index"]]
+        start = plan["item_index"]
+        entries = source["items"][start : start + self.config.max_facts_per_source]
+        if self._source_digest(source["id"]) != source["digest"]:
+            plan["omitted"] += len(source["items"]) - start
+            plan["source_index"] += 1
+            plan["item_index"] = 0
+            # A forgotten/changed source is classified, not indexed successfully.
+            if plan["source_index"] == len(plan["sources"]):
+                plan["state"] = "done"
+            return
+        vectors: dict[str, list[float]] = {}
+        if entries:
+            media = self.media
+            if media is None:
+                return
+            async with self._media_lock:
+                if not self._index_live(plan) or self.media is not media:
+                    return
+                # Query work may hold this lock while a source is forgotten or
+                # corrected. Build full HTTP input only after acquiring it.
+                inputs = (
+                    [
+                        item
+                        for entry in entries
+                        if (item := self._index_item(source["id"], entry, plan["model_key"]))
+                        is not None
+                        and not item["indexed"]
+                    ]
+                    if self._source_digest(source["id"]) == source["digest"]
+                    else []
+                )
+                result = await media.embed([item["content"] for item in inputs]) if inputs else []
+            if not self._index_live(plan) or self.media is not media:
+                return
+            if len(result) != len(inputs):
+                raise ValueError("向量数量与索引批次数量不一致")
+            vectors = {item["id"]: vector for item, vector in zip(inputs, result, strict=True)}
+        # No await between the final plan/source/item checks and version-CAS.
+        # Each store_vector owns its original commit; a later error must retain
+        # this prefix rather than pretending the entire source was finished.
+        for entry in entries:
+            if not self._index_live(plan):
+                return
+            item = (
+                self._index_item(source["id"], entry, plan["model_key"])
+                if self._source_digest(source["id"]) == source["digest"]
+                else None
+            )
+            if item is None:
+                plan["omitted"] += 1
+            elif item["indexed"]:
+                plan["already_current"] += 1
+            elif entry["id"] in vectors:
+                written = self.memory.store_vector(
+                    entry["id"],
+                    vectors[entry["id"]],
+                    plan["model_key"],
+                    expected_version=entry["version"],
+                )
+                plan["vectors_written" if written else "omitted"] += 1
+            else:
+                plan["omitted"] += 1
+            plan["item_index"] += 1
+        if plan["item_index"] == len(source["items"]):
+            if self._source_digest(source["id"]) == source["digest"]:
+                plan["sources_finished"] += 1
+            plan["source_index"] += 1
+            plan["item_index"] = 0
+        if plan["source_index"] == len(plan["sources"]):
+            plan["state"] = "done"
+
+    async def _run_index(self, plan: dict[str, Any]) -> None:
+        if not self._index_live(plan):
+            return
+        plan.update(state="processing", attempts=plan["attempts"] + 1)
+        self._index_save(plan)
+        try:
+            async with asyncio.timeout(self.config.job_timeout):
+                await self._index_batch(plan)
+        except asyncio.CancelledError:
+            # Normal close cancels only the shared worker. The durable plan and
+            # successfully committed vectors remain resumable without extraction.
+            raise
+        except Exception as error:
+            if not self._index_live(plan):
+                return
+            plan.update(
+                state="failed" if plan["attempts"] >= self.config.max_attempts else "retry",
+                next_attempt=now() + self.config.retry_backoff_seconds * plan["attempts"],
+                last_error="index_timeout" if isinstance(error, TimeoutError) else "index_failed",
+            )
+        else:
+            if not self._index_live(plan):
+                return
+            if plan["state"] == "processing":
+                plan["state"] = "queued"
+            plan.update(attempts=0, next_attempt=now(), last_error="")
+        self._index_save(plan)
+        await self._publish()
 
     async def retry(self, source_id: str | None = None) -> dict[str, Any]:
         available = self.config.max_pending_jobs - self._pending()
@@ -302,9 +794,25 @@ class MemoryPipeline:
                 (now(),),
             ).fetchone()
             if row is None:
+                plan = self._current_index_plan()
+                if (
+                    plan is not None
+                    and plan["state"] in _INDEX_ACTIVE
+                    and plan["next_attempt"] <= now()
+                ):
+                    with self.admission.operation():
+                        await self._run_index(plan)
+                    await asyncio.sleep(0)
+                    continue
                 deadline = self.memory.store.db.execute(
                     "SELECT min(next_attempt) FROM memory_jobs WHERE state IN ('queued','retry')"
                 ).fetchone()[0]
+                if plan is not None and plan["state"] in _INDEX_ACTIVE:
+                    deadline = (
+                        plan["next_attempt"]
+                        if deadline is None
+                        else min(deadline, plan["next_attempt"])
+                    )
                 try:
                     if deadline is None:
                         await self._wake.wait()
@@ -490,9 +998,13 @@ class MemoryPipeline:
             )
 
     def _model_key(self) -> str:
-        if self.media is None or self.media.config.embedding is None:
+        return self.embedding_key(self.media)
+
+    @staticmethod
+    def embedding_key(media: MemoryMedia | None) -> str:
+        if media is None or media.config.embedding is None:
             return ""
-        config = self.media.config.embedding
+        config = media.config.embedding
         return hashlib.sha256(
             json.dumps(
                 [
@@ -645,10 +1157,28 @@ class MemoryPipeline:
         *,
         latest_user_id: str | None = None,
         limit: int | None = None,
+        task_query: str | None = None,
     ) -> str:
+        return self.context_for_prompt_result(
+            query,
+            max_chars,
+            latest_user_id=latest_user_id,
+            limit=limit,
+            task_query=task_query,
+        ).with_task
+
+    def context_for_prompt_result(
+        self,
+        query: str,
+        max_chars: int,
+        *,
+        latest_user_id: str | None = None,
+        limit: int | None = None,
+        task_query: str | None = None,
+    ) -> PromptComposition:
         """宿主已检查当前开关和预算；选材不依赖启动时的旧字符上限。"""
         if max_chars <= 0:
-            return ""
+            return PromptComposition("", "")
         limit = self.config.context_limit if limit is None else limit
         cached = self._cached(query, limit, self.config.graph_hops)
         if cached is None:
@@ -656,14 +1186,13 @@ class MemoryPipeline:
                 if key[0] == query and key[2] == self.config.graph_hops:
                     cached = deepcopy(self._cache[key])
                     break
-        recalled = recalled_for_prompt(
+        return compose_context_result(
             self.memory,
             query,
-            limit,
+            limit=limit,
+            budget=max_chars,
             latest_user_id=latest_user_id,
             cached=cached["memories"] if cached is not None else None,
             hops=self.config.graph_hops,
-        )
-        return render_context(
-            query, recalled, self.memory.owner_profile(limit), limit=limit, budget=max_chars
+            task_query=task_query,
         )

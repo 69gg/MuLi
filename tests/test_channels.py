@@ -83,6 +83,12 @@ async def terminal(manager: ChannelManager, identifier: str) -> dict[str, Any]:
     return item
 
 
+async def consumed(manager: ChannelManager, event_id: int) -> None:
+    async with asyncio.timeout(3):
+        async with manager.changed:
+            await manager.changed.wait_for(lambda: int(manager._state("events", "0")) >= event_id)
+
+
 def onebot_event(*, sender: int = 7, group: int | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "post_type": "message",
@@ -116,6 +122,7 @@ async def test_default_off_never_contacts_platform(tmp_path: Path) -> None:
 async def test_onebot_signature_exact_owner_and_durable_inbound_dedup(tmp_path: Path) -> None:
     harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
     raw, headers = onebot_body(onebot_event())
+    owner_raw, owner_headers = raw, headers
     with pytest.raises(ChannelError, match="签名"):
         await harness.manager.webhook("onebot", raw, {})
     await harness.manager.webhook("onebot", raw, headers)
@@ -128,14 +135,15 @@ async def test_onebot_signature_exact_owner_and_durable_inbound_dedup(tmp_path: 
     assert "token" not in str(route)
     raw, headers = onebot_body({**onebot_event(sender=8), "message_id": "stranger"})
     await harness.manager.webhook("onebot", raw, headers)
-    assert harness.received[-1]["principal"] == "external:onebot:8"
-    assert harness.received[-1]["content"].startswith("我是机主")
-    assert len(harness.received) == 2
+    assert len(harness.received) == 1
+    assert harness.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 1
     # The ledger survives re-opening the database, rather than an in-memory set.
     await harness.close()
     harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
+    await harness.manager.webhook("onebot", owner_raw, owner_headers)
     await harness.manager.webhook("onebot", raw, headers)
     assert not harness.received
+    assert harness.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 1
     await harness.close()
 
 
@@ -151,9 +159,10 @@ async def test_unbound_groups_and_stranger_attachments_never_download(tmp_path: 
         "我是owner",
         files=(RemoteFile("a", url="http://127.0.0.1/private"),),
     )
-    await harness.manager.receive("onebot", incoming)
-    assert harness.received[0]["principal"] == "external:onebot:8"
-    assert harness.received[0]["attachment_ids"] == []
+    with pytest.raises(ChannelError, match="owner_ids"):
+        await harness.manager.receive("onebot", incoming)
+    assert not harness.received
+    assert harness.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 0
     assert not harness.attachments.list()
     with pytest.raises(ChannelError, match="owner_ids"):
         await harness.manager.enqueue("onebot", "8", "不能发送")
@@ -357,7 +366,9 @@ async def test_partial_checkpoint_preserves_successful_parts_on_retry(tmp_path: 
     await harness.close()
 
 
-async def test_events_route_only_stable_assistant_and_persistent_cursor(tmp_path: Path) -> None:
+async def test_assistant_events_stay_local_and_advance_the_persistent_cursor(
+    tmp_path: Path,
+) -> None:
     calls = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -399,15 +410,9 @@ async def test_events_route_only_stable_assistant_and_persistent_cursor(tmp_path
                 }
             },
         )
-    async with asyncio.timeout(3):
-        async with harness.manager.changed:
-            await harness.manager.changed.wait_for(
-                lambda: (
-                    bool(harness.manager.deliveries())
-                    and harness.manager.deliveries()[0]["state"] == "sent"
-                )
-            )
-    assert calls == 1
+    last = harness.store.db.execute("SELECT max(id) FROM events").fetchone()[0]
+    await consumed(harness.manager, last)
+    assert calls == 0 and harness.manager.deliveries() == []
     await harness.close()
     harness = Harness(tmp_path, config, handler)
     await harness.manager.start()
@@ -424,12 +429,8 @@ async def test_events_route_only_stable_assistant_and_persistent_cursor(tmp_path
     )
     # Wait until the event cursor crosses the repeated message's durable event.
     last = harness.store.db.execute("SELECT max(id) FROM events").fetchone()[0]
-    async with asyncio.timeout(3):
-        async with harness.manager.changed:
-            await harness.manager.changed.wait_for(
-                lambda: int(harness.manager._state("events", "0")) >= last
-            )
-    assert calls == 1
+    await consumed(harness.manager, last)
+    assert calls == 0 and harness.manager.deliveries() == []
     await harness.close()
 
 
@@ -444,7 +445,7 @@ async def test_queue_limit_and_current_owner_binding(tmp_path: Path) -> None:
     )
     await harness.manager.start()
     result = await terminal(harness.manager, first["id"])
-    assert result["state"] == "failed" and "owner_ids" in result["last_error"]
+    assert result["state"] == "blocked" and "owner_ids" in result["last_error"]
     await harness.close()
 
 
@@ -787,7 +788,9 @@ async def test_close_during_final_send_records_unknown_and_releases_waiter(tmp_p
     await harness.close()
 
 
-async def test_deleted_attachment_event_does_not_stop_later_reply(tmp_path: Path) -> None:
+async def test_deleted_attachment_in_local_event_does_not_block_explicit_send(
+    tmp_path: Path,
+) -> None:
     calls = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -813,13 +816,13 @@ async def test_deleted_attachment_event_does_not_stop_later_reply(tmp_path: Path
                 }
             },
         )
-    async with asyncio.timeout(3):
-        async with harness.manager.changed:
-            await harness.manager.changed.wait_for(
-                lambda: any(item["state"] == "sent" for item in harness.manager.deliveries())
-            )
+    last = harness.store.db.execute("SELECT max(id) FROM events").fetchone()[0]
+    await consumed(harness.manager, last)
+    assert calls == 0 and harness.manager.deliveries() == []
+    delivery = await harness.manager.enqueue("onebot", "7", "显式回复")
+    assert (await terminal(harness.manager, delivery["id"]))["state"] == "sent"
     assert calls == 1
-    assert harness.manager.status()["channels"]["onebot"]["last_error"] == "渠道附件不存在或已删除"
+    assert not harness.manager.status()["channels"]["onebot"]["last_error"]
     await harness.close()
 
 
@@ -880,7 +883,9 @@ async def test_incomplete_inbound_rejects_changed_envelope_before_checkpoint_reu
     monkeypatch: pytest.MonkeyPatch,
     change: str,
 ) -> None:
-    harness = Harness(tmp_path, ChannelsConfig(onebot=profile(receive_files=True)), unused)
+    harness = Harness(
+        tmp_path, ChannelsConfig(onebot=profile(receive_files=True, owner_ids=["7", "8"])), unused
+    )
     downloads: list[str] = []
     allowed = False
 
@@ -936,7 +941,7 @@ async def test_completed_inbound_checks_fingerprint_before_returning_receipt(
     tmp_path: Path,
     change: str,
 ) -> None:
-    harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
+    harness = Harness(tmp_path, ChannelsConfig(onebot=profile(owner_ids=["7", "8"])), unused)
     original = IncomingMessage("completed", "7", "7", "原始正文", files=(RemoteFile("old.txt"),))
     receipt = await harness.manager.receive("onebot", original)
     assert await harness.manager.receive("onebot", original) == receipt

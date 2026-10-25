@@ -1,18 +1,25 @@
 # 网页录音草稿与本地语音
 
+按用途选择即可，几种功能可以分别开启：
+
+| 用途 | 需要什么 |
+| --- | --- |
+| 网页点麦克风，把录音变成文字草稿 | 浏览器麦克风权限、`web_voice` 和 ASR |
+| 让沐璃转写已有音频 | 音频附件和 ASR |
+| 合成语音附件或通过渠道发送 | TTS；外发另需已配置渠道和权限 |
+| 本机听到唤醒词后接收语音指令 | 录音工具、真实声学桥接、ASR；主人指令还需声纹验证 |
+| 自动播放本次本地语音的最终回答 | 在本地唤醒基础上另开 TTS 和自动回复 |
+
+这些功能默认不会下载本地语音模型。ASR、TTS 的音频或文字会发送到你配置的服务；先确认服务地址、支持格式和费用，配置方法见[模型与媒体服务](providers.md#视觉语音和检索服务)。
+
 ## 网页点击录音
 
-`web_voice.enabled` 默认 `false`，与后台 `voice.enabled` 独立。工作台“语音与采集”设置开启后，还需配置 `media.asr` 的模型、基础地址和凭据。网页不需要安装录音库、本地模型或 FFmpeg；音频只发往当前配置的 OpenAI 兼容 ASR 服务。
+在设置的 **语音与采集** 中打开网页语音输入，并配置 ASR。最小配置示例，需将模型和地址换成实际服务，并向 MuLi 进程提供所选环境变量：
 
 ```json
 {
   "web_voice": {
-    "enabled": false,
-    "max_seconds": 60,
-    "max_file_bytes": 8388608,
-    "max_concurrent": 1,
-    "timeout": 60,
-    "max_text_chars": 64000
+    "enabled": true
   },
   "media": {
     "asr": {
@@ -24,72 +31,124 @@
 }
 ```
 
-在对话输入框点击麦克风，再由浏览器申请权限；点击“停止并转写”才上传并转写。转写只返回可编辑草稿，检查后仍需点击发送，才成为当前登录用户的消息。接口不会调用主模型、提交主人输入、触发记忆提炼或登记语音身份。浏览器权限和这段录音都不构成声纹验证，也不会启用后台唤醒。
+在聊天输入框点击麦克风，允许浏览器录音；点击“停止并转写”后上传并转写。结果是可编辑草稿，检查后仍须点击发送。录音本身不会成为主人指令，也不等于声纹验证。
 
-录音开始时保留输入框和会话快照。期间发生输入、发送或会话切换时，转写保存在独立草稿区，原输入不变；可编辑后选择追加或丢弃。即使文字后来被改回原值，也不会覆盖期间的编辑。取消、切换至其它功能页、页面隐藏或离开页面会停止所有已取得的轨道并中止上传/转写；取消后迟到的结果被丢弃。设备意外结束或权限撤销时丢弃本次未上传录音并提示重试。显式退出登录会取消当前操作并清空内存中的输入和转写草稿，已保存的音频仍在附件库。浏览器的权限请求无法由标准 API 撤回，忽略权限提示时最多保留一个未决请求；若后来批准，已取消录音的轨道会立即关闭。
+如果期间编辑或发送了文字，转写不会覆盖原输入，可以再选择追加或丢弃。取消、离开功能页、页面隐藏或退出会停止当前流程，迟到的结果不会补进输入框。
 
-网页需要 HTTPS 或 localhost 等安全上下文及浏览器的 `getUserMedia` / `MediaRecorder` 支持。远程 HTTP 地址通常不能使用麦克风；通过局域网访问时需提供 HTTPS。格式按浏览器探测选择 WebM/Opus、MP4 或 Ogg/Opus，不要求所有浏览器支持同一种格式。格式不可用或权限拒绝会显示原因，不尝试后台采集。
+网页需要 HTTPS 或 localhost 等安全上下文，以及浏览器录音支持。远程 HTTP 地址通常无法使用麦克风；浏览器选择其支持的 WebM/Opus、MP4 或 Ogg/Opus 格式，不需要本机安装 FFmpeg。
 
-`max_seconds` 为 1–300 秒，浏览器使用单调时钟到期停止；浏览器暂停或延迟计时器时无法保证精确音频时长，服务端不解码音频验证时长。服务端硬限制为文件字节、总转写时间和并发数：文件上限取本节、`uploads.max_file_bytes`、`media.asr.max_input_bytes` 三者最小值，并受附件总配额约束；本节可设 1 KiB–32 MiB。`max_concurrent` 为 1–4，满额立即返回 429，不建立等待队列。`timeout` 为有限正数，最多 300 秒，限制整个服务端读取与 ASR 请求，也用于网页权限、停止、上传和转写各阶段的等待上限。`max_text_chars` 为 1–64000，超限明确失败，不静默截断。
+默认最长录音 60 秒、单文件上限 8 MiB、同时一次转写。实际文件上限还受上传和 ASR 配置约束；浏览器暂停时不能保证精确停止时间。权限、格式、大小或服务不支持时会提示失败。
 
-停止后通过既有 `POST /api/uploads` 保存原音频，再以 `POST /api/media/transcribe`、JSON `{"attachment_id":"附件ID"}` 取得 `{"text":"转写文字","attachment_id":"附件ID","draft":true}`。两个接口沿用登录与同源限制；新接口只接受本地音频附件。请求断开、配置修改及关闭服务会取消正在转写的 HTTP 请求，但取消不能保证已接收音频的上游不计费。音频仍保留在附件目录 `data/attachments/`，转写失败或丢弃文字不会删除音频；可在附件库手动删除。录音不会自动附到聊天消息，只有用户另行选择附件或点击发送文字才进入对话。NDJSON 导出不包含音频文件，备份时应另存附件目录。
-
-网页状态机、ASR 接口和断开处理均以假录音器、假轨道及 HTTP MockTransport 验证；开发验证没有打开实际麦克风或调用付费转写。浏览器行为依据 [getUserMedia](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)、[MediaRecorder.stop](https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/stop)、[MediaStreamTrack.stop](https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack/stop) 官方文档核对。
+上传后的原录音保存在附件库。转写失败或丢弃草稿不会自动删除音频，可在附件库手动删除。取消请求也不能保证服务商不计费；备份录音需保留附件目录，消息导出不包含音频文件。
 
 ## AI 转录、合成与渠道语音
 
-`audio_transcribe(id, language?)` 按需调用当前 ASR 一次，并把完整 UTF-8 转写留存在私有附件库。返回的 `id` 仍为原音频 ID；短结果 `text` 为全文，长结果为预览，另带 `asr_completed=true`、`transcript_id`、`revision`、下载 `url`、`next_offset_bytes` 和 `has_more`。需要全文时用 `audio_transcript_read(id=transcript_id, revision=revision, offset_bytes=next_offset_bytes)` 逐页读取 `content`；字节偏移只能使用返回的游标，不用字符数推算，也无需再次付费转写。
+上传音频后，可以说：“转写这段录音，保留全文，再总结重点。”沐璃使用 `audio_transcribe` 调用 ASR，并将完整转写保存为附件；较长正文分批读取，不必重复转写。若先前已经完成转写但回复丢失，可以按原音频 ID 查找转写附件，再用 `audio_transcript_read` 续读。
 
-两种结果都按完整 JSON 信封遵守 `limits.max_output_chars`。全文字节上限取 `media.asr.max_response_bytes` 与 `uploads.max_file_bytes` 的最小值，并受附件总配额限制；保存/预览失败会明确 `asr_completed=true`，不自动重调 ASR。已保存但响应丢失时，用 `attachment_search(source="asr", name_query="原音频ID")` 查找文件名 `转写-原音频ID.txt` 的工件。沿 `next_cursor` 继续直到 `has_more=false`；空 `items` 也可能还有未扫描范围。找到后以目录的 `id`、`sha256` 作为续读的工件 ID、`revision`。旧 `attachment_list` 仍只列最近一批；[附件检索](attachment-search.md)支持有界分页，目录本身不证明文件存在。续读核对版本、文件大小与完整 SHA-256，文件变化或预算缩小超限时拒绝，不返回混版内容。
+转写内容是资料，不会获得主人身份或新的操作权限。文件已经更改、删除或超过预算时会明确拒绝，不能混用两个版本。全文转写与音频都受媒体和附件配额约束。
 
-转写留存只是原 `read` 工具的受控结果归档，不授予任意目录写权限、自动发送权限或主人身份。内容属于资料而非指令；私有附件不以内联 HTML 显示，下载沿用现有认证。文件与元数据需一起备份，消息 NDJSON 不含附件正文。网页录音草稿和后台唤醒不经过此工具，保持原有处理。实现边界与验证记录见[完整转写工件设计](voice-transcripts-design.md)。
+也可以说：“把这段文字合成语音。”`speech_synthesize` 使用 `media.tts` 保存语音附件，不会自动播放或发送；此用途不需要开启后台麦克风或 `voice.enabled`。
 
-`speech_synthesize(text, voice?)` 调用当前配置的 TTS、保存合成音频并返回本地附件 ID。合成不会自动播放或发出；无需为发送功能打开后台麦克风或唤醒。
+最小 TTS 配置片段：
 
-需要发送原生语音时，再显式调用 `channel_send`，传 `attachment_ids=[合成返回的ID]`、`media_mode="voice"` 和从可信入站取得的已绑定目标/群路由。同一逻辑发送可带稳定 `idempotency_key`；返回排队 ID 后以 `channel_status` 检查状态，不把入队说成已送达。结果 unknown 不自动重发，不能通过改键绕过重复风险。
+```json
+{
+  "media": {
+    "tts": {
+      "model": "填写语音模型ID",
+      "base_url": "https://provider.example/v1",
+      "api_key_env": "MULI_TTS_KEY",
+      "voice": "填写服务支持的音色",
+      "response_format": "mp3"
+    }
+  }
+}
+```
 
-当前显式 voice 支持 Telegram 的 MP3、M4A、Ogg/Opus，以及远端确认 `can_send_record` 的 OneBot；QQ 与微信的这一显式模式尚未支持，会明确拒绝。默认 file 保持各平台原有附件行为。TTS 默认 MP3 可直接走 Telegram 语音；若服务配置生成 WAV、FLAC、PCM 等 Telegram 不支持的格式，需显式选择兼容的 TTS 输出或文件发送，不会自动安装转码器或降级。详见[渠道语音合同](channels.md#显式发送语音)。没有真实平台收发或付费 TTS 验收记录。
+要发到渠道，应另行明确要求发送。沐璃可用 `channel_send` 将附件作为原生语音发送，仍需准确、已授权的目标，并遵守原审批规则：
 
-微信 iLink 入站可接收平台已经提供的 `voice_item.text`，不为此调用或外传音频到 ASR；文字仍按原渠道主人身份与隔离规则处理。只有主人且开启 `receive_files` 时才下载原始录音。附件库可识别 Tencent SILK 标识并保存为 `audio/silk`，仍以文件展示；显式调用 `audio_transcribe` 时，配置的 ASR 是否支持 SILK 由服务决定，不提供自动转码或识别保证。顺序、重复内容与大小限制见[微信入站语音说明](weixin-voice-ingress.md)。
+- Telegram 支持 MP3、M4A、Ogg/Opus。
+- OneBot 需远端确认支持发送录音。
+- QQ、微信目前不支持这一显式语音发送模式；可按各平台能力发送普通文件。
+
+不支持的格式不会自动转码或悄悄改成别的发送方式。发送记录为“待发送”不等于对方收到；“结果未知”时不能假定没发出并自动重发。详见[渠道语音](channels.md#显式发送语音)。
+
+微信入站已经附带的转写文字可直接作为渠道消息使用，不因此调用 ASR。原始音频下载还需主人身份及开启 `receive_files`；SILK 录音是否能转写取决于 ASR 服务，不提供自动转码保证。
 
 ## 本地后台唤醒
 
-voice.enabled 默认 false。未启用时，start 不创建采集任务，listen_once 和 enroll 拒绝录音。模块导入、状态探测与设置读取都不会打开麦克风、下载模型或加载 GPU 推理框架。本轮使用模拟音频与模拟进程验证，未实际录音或播放开发机音频。
+`voice.enabled` 默认关闭。开启前需要：
+
+1. 可用的录音工具和系统麦克风权限；本地播放另需可用播放器。
+2. 用户提供的真实声学唤醒桥接程序。
+3. 已配置的 ASR；要作为主人执行，还需真实声纹桥接及显式录制的参考音频。
+
+默认唤醒词“沐璃”只是交给桥接程序的配置，**项目没有内置中文唤醒模型**。没有声学程序时会显示不可用，不用 ASR 文字匹配冒充唤醒。
+
+在“语音与采集”中可开启语音唤醒、选择设备；桥接命令等字段在该节高级 JSON 配置中填写。以下片段需与 ASR 配置合并，桥接路径应换成真实可执行程序：
+
+```json
+{
+  "voice": {
+    "enabled": true,
+    "wake_word": "沐璃",
+    "device": "auto",
+    "input_device": "",
+    "wake_command": ["/替换为真实路径/wake-bridge"],
+    "speaker_command": ["/替换为真实路径/speaker-bridge"],
+    "tts_enabled": false,
+    "reply_enabled": false
+  }
+}
+```
+
+配置好录音设备后，可请沐璃调用 `voice_enroll` 录制短参考音频，默认 5 秒，允许 1–15 秒且不能超过录音上限。它只保存参考 WAV，不训练声纹模型；必须配置有效的声纹程序才能比对。也可让沐璃用 `media_capabilities` 查看状态，或用 `voice_listen` 做一次有界监听。
 
 ## 处理流程
 
-启用后，需要已安装的录音工具、用户提供的真实声学唤醒命令和已配置的 media.asr。默认唤醒词是“沐璃”，它只是传给声学组件的配置，不代表已经内置中文唤醒模型。没有声学组件时状态明确报告不可用，不把 ASR 字符串匹配当作声学唤醒。
+本地后台先录制短 WAV 片段，只有声学唤醒命中后才补录指令并考虑转写；未命中的片段不会送往 ASR。启用 TTS 且服务可用时可播放“请说”，否则尝试提示音或状态提示。
 
-后台 worker 先录制有限 PCM16 单声道 WAV 片段并交给唤醒组件。未命中立即删除，不调用 ASR。命中后优先通过已开启的 TTS 播放“请说”，未配或失败则尝试短提示音；没有播放组件会发出 voice.prompt 状态事件并记录 played=false。播放进程有 20 秒上限，失败不会伪装成成功。
+配置声纹程序后，指令录音先与参考音频比对，未通过不送 ASR。未配置声纹时，即使能得到转写，也会作为未验证输入隔离，不按主人命令执行。唤醒成功不等于身份验证成功。
 
-然后补录有界指令音频，保留唤醒片段作为前置音频，避免丢掉“沐璃，……”之后紧接的指令。配置声纹组件时，先核对显式录制的参考音频，未通过不调用 ASR；未配置声纹时，回调仍明确 speaker_verified=false。转写复用已配置的 MediaService OpenAI 兼容 ASR，不发送未唤醒片段或声纹参考录音。业务层必须按该身份字段处理权限，唤醒成功本身不等于可信主人身份。
+本次原始录音在流程结束或取消后删除；声纹参考和保存的本地合成语音位于数据目录的 `voice/`。参考音频不会为转写自动上传。关闭服务或禁用功能会停止采集，不会在下次启动补录。
 
-ASR 后回调 `{text,wake_word,speaker_verified,source:"voice"}`。原始唤醒片段和本次指令音频在成功、失败、拒绝及取消后删除；参考录音与显式合成文件留在数据目录 voice/，需要单独备份或删除。合成文件不自动播放；唤醒提示的短音频播放后删除。
+## 本地最终答复自动播放
+
+要朗读本次已验证本地语音的最终回答，须同时开启 `voice.enabled`、`voice.tts_enabled` 和 `voice.reply_enabled`，配置 ASR/TTS，并完成真实声纹桥接和参考注册。自动回复开关可在语音高级 JSON 中设置。
+
+它只播放该次语音请求的最终回答，不朗读工具结果或流式片段。网页、手机输入和网页录音草稿不会取得本地播放资格；原文字答复仍保留在网页。
+
+新主人输入、任务暂停或调整、显式停止、配置变更或关闭可能撤销旧回答的播放。已经发出的声音不能追回，不保证立即静音。等待回答不会取消主运行；实际录音和自动播放相互避让。
+
+可通过 `media_capabilities` 查看最近播放状态。显示已播放只表示播放器正常返回，不证明人耳听见；播放已经开始而结果无法确认时显示未知，不自动重新合成或补播。正常重开也不会恢复旧播放请求。
 
 ## 配置与设备
 
-| 字段 | 默认值 | 含义 |
+| 字段 | 默认值 | 用途 |
 | --- | --- | --- |
-| enabled | false | 允许语音采集 |
-| wake_word | 沐璃 | 交给声学组件的目标词 |
-| device | auto | auto / cpu / rocm / cuda |
-| input_device | 空字符串 | Linux 使用默认设备；macOS / Windows 必须显式指定 |
-| sample_rate | 16000 | 采样率，8000 至 48000 |
-| chunk_seconds | 2 | 唤醒片段长度，最多 10 秒 |
-| max_utterance_seconds | 15 | 包括前置片段的指令录音上限 |
-| cooldown_seconds | 3 | 重复唤醒冷却 |
-| wake_command / speaker_command | [] | 声学唤醒 / 声纹命令 argv |
-| wake_threshold / speaker_threshold | 0.6 / 0.75 | 有限置信度阈值 |
-| max_file_bytes / max_total_bytes | 2000000 / 20000000 | 单文件与目录配额 |
-| tts_enabled | false | 允许调用已配置 TTS；用于“请说”和显式语音合成 |
+| `voice.enabled` | `false` | 开启本地语音采集 |
+| `wake_word` | `沐璃` | 传给声学程序的目标词 |
+| `input_device` | 空 | Linux 使用默认输入；macOS、Windows 需明确指定 |
+| `device` | `auto` | 向桥接传递 `cpu`、`rocm` 或 `cuda` 选择 |
+| `sample_rate` | `16000` | 录音采样率，允许 8000–48000 |
+| `chunk_seconds` | `2` | 单次唤醒片段长度 |
+| `max_utterance_seconds` | `15` | 指令录音总上限，包含前置片段 |
+| `cooldown_seconds` | `3` | 重复唤醒冷却时间 |
+| `wake_threshold` / `speaker_threshold` | `0.6` / `0.75` | 两种声学结果的置信度门槛 |
+| `max_file_bytes` / `max_total_bytes` | `2000000` / `20000000` | 本地语音文件与总容量限制 |
+| `tts_enabled` / `reply_enabled` | 均为 `false` | 本地唤醒提示语 / 最终回答自动播放 |
 
-auto 只探测主机可见的 /dev/kfd、/dev/dri、NVIDIA 设备或工具，优先传递可见加速设备，否则传 CPU。显式请求的 GPU 不可见时报告 CPU 回退。设备可见不证明推理框架或模型能使用它，status.device.runtime_verified=false；桥接组件必须验证支持并处理自身的 CPU 回退。不会探测时装载大模型或安装 CUDA / ROCm。
+除首行外，本表字段均在 `voice` 节。`auto` 只检查可见设备，不加载推理框架；显示 GPU 可见不代表桥接程序已经支持，程序仍须自行处理设备能力。
 
-Linux 录音优先 arecord，其次 ffmpeg PulseAudio；macOS 使用 ffmpeg avfoundation 音频设备，Windows 使用 ffmpeg dshow 音频设备。input_device 以独立参数传递，不经 shell。Linux 播放探测 pw-play、aplay（WAV）、ffplay；macOS 探测 afplay、ffplay；Windows 探测 ffplay 或 PowerShell/.NET WAV 播放。工具存在只表示候选可用，实际权限和编解码支持以执行结果为准。
+Linux 录音优先使用 `arecord`，其次是 FFmpeg 的 PulseAudio；macOS 使用 FFmpeg 的 avfoundation，Windows 使用 FFmpeg 的 dshow。后两者需要填写实际音频设备。
+
+播放会查找系统可用工具：Linux 的 `pw-play`、`aplay` 或 `ffplay`，macOS 的 `afplay` 或 `ffplay`，Windows 的 `ffplay` 或 PowerShell WAV 播放。具体文件是否能播取决于格式与设备，检测到工具不等于已验证硬件。
 
 ## 声学桥接协议
 
-wake_command / speaker_command 是完整 argv 数组，不是 shell 命令字符串。MuLi 通过 stdin 发送单个 JSON 对象，组件必须在有限时间内向 stdout 返回一个 JSON 对象，诊断信息写 stderr。请求示例：
+`wake_command` 和 `speaker_command` 是完整参数数组，不是 shell 命令字符串。MuLi 将一个 JSON 对象写入程序标准输入；程序须在 15 秒内向标准输出返回一个 JSON 对象，诊断信息写标准错误。
+
+唤醒请求示例，其中路径由 MuLi 提供：
 
 ```json
 {
@@ -104,20 +163,20 @@ wake_command / speaker_command 是完整 argv 数组，不是 shell 命令字符
 }
 ```
 
-唤醒返回 `{"detected":true,"score":0.91}`；声纹 operation 为 verify，reference_path 指向已录制参考 WAV，返回 `{"verified":true,"score":0.93}`。结果必须包含真正的布尔值，以及 0 至 1 的有限数值置信度；仅返回 text、字符串 "true"、NaN 或超范围得分都会拒绝。MuLi 检查退出状态、JSON 格式与阈值；这不替代对用户选择的声学模型效果和可信度的验证。
+唤醒结果：
 
-`await worker.enroll(seconds=5)` 是显式录制参考音频入口，要求已启用语音，1 至 15 秒且不超过录音上限。返回本地音频 id/path/name/size/mime_type 和 acoustic_verification_available。它只保存参考 WAV，不宣称已经训练或实现声纹识别；必须配置真正的 speaker_command 才能比对。参考索引保存在 voice/enrollment.txt，重启后读取，不会自动重新录制。
+```json
+{"detected": true, "score": 0.91}
+```
 
-## 模块接线
+声纹请求使用 `operation="verify"`，`reference_path` 指向已注册的参考 WAV；结果为：
 
-`VoiceWorker(config, data_dir, media, on_text, *, recorder=None, wake=None, speaker=None, player=None, on_status=None)` 支持小型本地组件替换。status 同步读取能力；start / stop / aclose 管理后台任务；listen_once 执行一次有限监听；enroll 录制参考；synthesize 保存合成文件，不播放。on_status 可接 SSE，当前提示事件为 `{type:"voice.prompt",prompt:"请说",played,kind,reason}`，kind 是 speech / tone / status；最近结果也在 status.last_prompt 中。
+```json
+{"verified": true, "score": 0.93}
+```
 
-录音与声学处理使用同一异步锁，避免后台监听和录制参考争用麦克风。后台监听、手动 listen_once、enroll 及 synthesize 都登记为当前操作；stop 会取消正在执行或排队的操作，等待录音进程退出和临时文件清理后返回，随后允许再次 start。aclose 是最终关闭，会拒绝新的监听、录制、合成或启动，status.closed=true；即使等待关闭的调用方被取消，也先完成已有操作的清理再传播取消。文件与进程都有限额；取消会终止子进程、删除未完成文件。失败后至少等待两秒再重试，能力缺失时 start 不进入轮询。
-
-转写回调在采集与文件锁释放后执行，可以合成回复语音。整个回调仍属于当前可取消操作；回调内的嵌套 TTS 不会让关闭流程遗漏尚未结束的录音任务。
-
-录音和播放参数依据 [FFmpeg Devices](https://ffmpeg.org/ffmpeg-devices.html) 与 [Arch arecord 手册](https://man.archlinux.org/man/aplay.1.en)。ASR/TTS 的 HTTP 接线、接口兼容性与请求预算复用 [媒体服务](providers.md#视觉语音和检索服务)。
+程序须正常退出，标志必须是真正的布尔值，得分须为 0–1 的有限数值，并达到配置阈值。仅返回文字或字符串 `"true"` 无效。格式校验不代表声学模型准确，实际唤醒和声纹效果需要用户验证。
 
 ## 给队友补充音频资料
 
-主 MuLi 可通过 `spawn_agent` 或 `send_input` 的 `attachment_ids` 显式交付音频引用。队友收到元数据后才按需调用 `audio_transcribe`；交接本身不会启动 ASR。已有转写可传递其工件 ID、revision 与游标，使用 `audio_transcript_read` 续读，避免再次转写。转写仍是资料，不增加主人授权，也不改变原任务汇报目的地。完整调用与校验规则见[资料交接](teammate-attachments.md)。
+可让主沐璃把音频附件交给新队友或已有队友。交接只传资料引用，不自动调用 ASR；队友按需转写。已有完整转写时，交付转写附件和续读信息即可，避免再次付费转写。资料不会扩大队友权限，也不改变原任务的汇报来源，见[资料交接](teammate-attachments.md)。

@@ -66,16 +66,29 @@ async def check_installed(target: Path) -> None:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app), base_url="http://localhost:8765"
             ) as client:
+                image_types = {
+                    "/assets/muli-avatar.webp": "image/webp",
+                    "/assets/muli-empty.webp": "image/webp",
+                    "/assets/muli-icon.png": "image/png",
+                }
                 for path in (
                     "/",
                     "/app.mjs",
+                    "/conversation-layout.mjs",
                     "/task-control.mjs",
                     "/assets/muli-avatar.svg",
                     "/assets/muli-empty.svg",
+                    *image_types,
                     "/api/docs",
                     "/api-docs.mjs",
                 ):
-                    assert (await client.get(path)).status_code == 200, path
+                    response = await client.get(path)
+                    assert response.status_code == 200, path
+                    if path in image_types:
+                        assert (
+                            response.headers.get("content-type", "").split(";", 1)[0]
+                            == image_types[path]
+                        ), path
                 state = (await client.get("/api/status")).json()
                 assert state["version"] == muli.__version__
                 assert state["configured"] is False

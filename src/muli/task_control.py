@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from muli.commitments import Commitments
-from muli.context import ContextLimitError
+from muli.context import ContextLimitError, context_size
 from muli.conversation import MAX_EVENT_ID_CHARS, Conversation
 from muli.providers import Message
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 
 JsonObject = dict[str, Any]
@@ -61,6 +62,27 @@ def _json(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _scheduled_marker(value: object) -> JsonObject:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "schedule_id", "occurrence_id"}
+        or type(value.get("version")) is not int
+        or value["version"] != 1
+        or any(
+            not isinstance(value.get(key), str)
+            or not value[key]
+            or len(value[key]) > MAX_EVENT_ID_CHARS
+            for key in ("schedule_id", "occurrence_id")
+        )
+    ):
+        raise ControlUnavailable("control_invalid", "定时重规划授权标记无效")
+    try:
+        _json(value).encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ControlUnavailable("control_invalid", "定时重规划授权标记无效") from exc
+    return dict(value)
 
 
 def _positive(value: int, name: str) -> None:
@@ -147,6 +169,9 @@ class TaskControl:
         if commitments.store is not store:
             raise ValueError("任务控制与工作账本必须使用同一个 Store")
         self.store, self.commitments = store, commitments
+        self.scheduled_replan_guard: Callable[[JsonObject, Sequence[str] | None], None] | None = (
+            None
+        )
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -177,7 +202,11 @@ class TaskControl:
             return {"epoch": 0, "approved_epoch": 0, "replan_request_id": None, "plan": None}
         if (
             not isinstance(state, dict)
-            or set(state) != {"epoch", "approved_epoch", "replan_request_id", "plan"}
+            or set(state)
+            not in (
+                {"epoch", "approved_epoch", "replan_request_id", "plan"},
+                {"epoch", "approved_epoch", "replan_request_id", "plan", "scheduled_replan"},
+            )
             or type(state.get("epoch")) is not int
             or type(state.get("approved_epoch")) is not int
             or not 0 <= state["approved_epoch"] <= state["epoch"]
@@ -187,6 +216,8 @@ class TaskControl:
             )
         ):
             raise ControlUnavailable("control_invalid", "持久任务控制字段无效")
+        if "scheduled_replan" in state:
+            _scheduled_marker(state["scheduled_replan"])
         plan = state["plan"]
         if plan is not None and (
             not isinstance(plan, dict)
@@ -201,30 +232,57 @@ class TaskControl:
 
     def resolve_scope(self, session_id: str) -> str | None:
         """Follow host lineage, including old workflow runs without an explicit binding."""
+        return self._resolve_scope(session_id)[0]
+
+    def scope_lineage(
+        self, session_id: str, *, max_hops: int, max_bytes: int
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Version only the specified bounded parent chain, without enumerating peers."""
+        if type(max_hops) is not int or max_hops < 1:
+            raise ControlUnavailable("scope_budget", "执行范围父链预算不足")
+        return self._resolve_scope(session_id, max_hops=max_hops, max_bytes=max_bytes)
+
+    def _resolve_scope(
+        self, session_id: str, *, max_hops: int | None = None, max_bytes: int | None = None
+    ) -> tuple[str | None, list[dict[str, Any]]]:
         current: str | None = session_id
         visited: set[str] = set()
         binding: str | None = None
+        frames: list[dict[str, Any]] = []
         while current is not None:
             if current in visited:
                 raise ControlUnavailable("scope_invalid", "执行范围父链包含环")
+            if max_hops is not None and len(visited) >= max_hops:
+                raise ControlUnavailable("scope_budget", "执行范围父链超过核查跳数预算")
             visited.add(current)
-            session_row = self.store.db.execute(
-                "SELECT json_extract(data,'$.kind') AS kind,"
-                "json_extract(data,'$.workflow_id') AS workflow_id,"
-                "json_extract(data,'$.workflow_run_id') AS workflow_run_id "
-                "FROM objects WHERE kind='session' AND id=?",
-                (current,),
-            ).fetchone()
-            if session_row is None:
+            if max_bytes is not None:
+                session = self.store.bounded_object("session", current, max_bytes=max_bytes)
+                agent = self.store.bounded_object("agent", current, max_bytes=max_bytes)
+            else:
+                session_row = self.store.db.execute(
+                    "SELECT json_extract(data,'$.kind') AS kind,"
+                    "json_extract(data,'$.workflow_id') AS workflow_id,"
+                    "json_extract(data,'$.workflow_run_id') AS workflow_run_id "
+                    "FROM objects WHERE kind='session' AND id=?",
+                    (current,),
+                ).fetchone()
+                session = dict(session_row) if session_row is not None else None
+                agent_row = self.store.db.execute(
+                    "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
+                    "json_extract(data,'$.parent_id') AS parent_id "
+                    "FROM objects WHERE kind='agent' AND id=?",
+                    (current,),
+                ).fetchone()
+                agent = dict(agent_row) if agent_row is not None else None
+            if session is None:
                 raise ControlUnavailable("scope_invalid", "执行范围父会话缺失")
-            session = dict(session_row)
-            agent_row = self.store.db.execute(
-                "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
-                "json_extract(data,'$.parent_id') AS parent_id "
-                "FROM objects WHERE kind='agent' AND id=?",
-                (current,),
-            ).fetchone()
-            agent = dict(agent_row) if agent_row is not None else None
+            frame: dict[str, Any] = {}
+            if max_bytes is not None:
+                frame = {
+                    "session_id": current,
+                    "session": _digest(session),
+                    "agent": _digest(agent),
+                }
             if agent is None and session.get("kind") == "team":
                 raise ControlUnavailable("scope_invalid", "团队执行记录缺失")
             if session.get("workflow_id") is not None and not session.get("workflow_run_id"):
@@ -234,15 +292,26 @@ class TaskControl:
             if agent is not None:
                 value, parent = agent.get("commitment_id"), agent.get("parent_id")
             elif session.get("workflow_run_id") is not None:
-                row = self.store.db.execute(
-                    "SELECT json_extract(data,'$.commitment_id'),"
-                    "json_extract(data,'$.parent_session_id') FROM objects "
-                    "WHERE kind='workflow_run' AND id=?",
-                    (session["workflow_run_id"],),
-                ).fetchone()
-                if row is None:
+                workflow_id = session["workflow_run_id"]
+                if not isinstance(workflow_id, str) or not workflow_id:
+                    raise ControlUnavailable("scope_invalid", "执行范围工作流关联无效")
+                if max_bytes is not None:
+                    workflow = self.store.bounded_object(
+                        "workflow_run", workflow_id, max_bytes=max_bytes
+                    )
+                else:
+                    row = self.store.db.execute(
+                        "SELECT json_extract(data,'$.commitment_id') AS commitment_id,"
+                        "json_extract(data,'$.parent_session_id') AS parent_session_id "
+                        "FROM objects WHERE kind='workflow_run' AND id=?",
+                        (workflow_id,),
+                    ).fetchone()
+                    workflow = dict(row) if row is not None else None
+                if workflow is None:
                     raise ControlUnavailable("scope_invalid", "执行范围工作流缺失")
-                value, parent = row[0], row[1]
+                value, parent = workflow.get("commitment_id"), workflow.get("parent_session_id")
+                if max_bytes is not None:
+                    frame["workflow"] = _digest(workflow)
             if value is not None:
                 if (
                     not isinstance(value, str)
@@ -253,8 +322,10 @@ class TaskControl:
                 binding = value
             if parent is not None and (not isinstance(parent, str) or not parent):
                 raise ControlUnavailable("scope_invalid", "执行范围父会话无效")
+            if max_bytes is not None:
+                frames.append(frame)
             current = parent
-        return binding
+        return binding, frames
 
     def _workflow_scope(self, identifier: str) -> str | None:
         row = self.store.db.execute(
@@ -332,10 +403,8 @@ class TaskControl:
         )
 
     def _budget(self, snapshot: TaskSnapshot) -> None:
-        rendered = json.dumps(
-            [asdict(Message(role="system", content=snapshot.context()))], ensure_ascii=False
-        )
-        if len(rendered) > self.commitments.max_context_chars():
+        size = context_size([Message(role="system", content=snapshot.context())])
+        if size > self.commitments.max_context_chars():
             raise ContextLimitError("完整受控任务说明和方案超过上下文字符预算")
 
     def execution_snapshot(self, session_id: str) -> TaskSnapshot | None:
@@ -375,7 +444,35 @@ class TaskControl:
             or receipt.get("epoch") != snapshot.epoch
         ):
             raise ControlUnavailable("receipt_invalid", "缺少可核验的主人重规划回执")
+        if state.get("scheduled_replan") != receipt.get("scheduled_replan"):
+            raise ControlConflict("replan_stale", "定时任务控制与主人回执授权不一致")
+        self._guard_scheduled_replan(receipt)
         return item
+
+    def _guard_scheduled_replan(
+        self, receipt: JsonObject, targets: Sequence[str] | None = None
+    ) -> None:
+        if "scheduled_replan" not in receipt:
+            request_id = receipt.get("request_id")
+            prefix = "scheduled-replan:"
+            if isinstance(request_id, str) and request_id.startswith(prefix):
+                occurrence = self.store.bounded_object(
+                    "task_replan_occurrence",
+                    request_id[len(prefix) :],
+                    max_bytes=(
+                        self.commitments.max_context_chars() + self.commitments.max_output_chars()
+                    )
+                    * 4,
+                )
+                if occurrence is not None and occurrence.get("owner_receipt_id") == receipt.get(
+                    "id"
+                ):
+                    raise ControlUnavailable("schedule_invalid", "定时主人回执缺少其原始授权证明")
+            return
+        _scheduled_marker(receipt["scheduled_replan"])
+        if self.scheduled_replan_guard is None:
+            raise ControlUnavailable("schedule_unavailable", "定时重规划授权核验未接入")
+        self.scheduled_replan_guard(receipt, targets)
 
     def is_current_replan(self, snapshot: TaskSnapshot) -> bool:
         """False means the host must clear its temporary selected-replan state."""
@@ -456,89 +553,144 @@ class TaskControl:
         model_configured: bool,
         max_pending: int,
         active_workflow_ids: Sequence[str] = (),
+        expected_approved_epoch: int | None = None,
+        reply_origin: ReplyOrigin | None = None,
     ) -> ControlResult:
         """Only the authenticated owner endpoint may call this method."""
+        with self._transaction():
+            return self._owner_control_in_transaction(
+                identifier,
+                request,
+                main_session_id=main_session_id,
+                mode=mode,
+                model_configured=model_configured,
+                max_pending=max_pending,
+                active_workflow_ids=active_workflow_ids,
+                expected_approved_epoch=expected_approved_epoch,
+                reply_origin=reply_origin,
+            )
+
+    def _owner_control_in_transaction(
+        self,
+        identifier: str,
+        request: OwnerControlRequest,
+        *,
+        main_session_id: str,
+        mode: str,
+        model_configured: bool,
+        max_pending: int,
+        active_workflow_ids: Sequence[str] = (),
+        expected_approved_epoch: int | None = None,
+        reply_origin: ReplyOrigin | None = None,
+        scheduled_replan: JsonObject | None = None,
+    ) -> ControlResult:
+        """Stage the ordinary owner control while the host owns its one transaction."""
+        if not self.store.db.in_transaction:
+            raise RuntimeError("任务控制同步体需要调用方事务")
+        if scheduled_replan is not None:
+            scheduled_replan = _scheduled_marker(scheduled_replan)
+        if expected_approved_epoch is not None and (
+            type(expected_approved_epoch) is not int
+            or not 0 <= expected_approved_epoch <= request.expected_epoch
+        ):
+            raise ValueError("expected_approved_epoch 必须是有效控制快照")
         self._main(main_session_id)
         key = self._receipt_id(identifier, "owner", request.request_id)
-        fingerprint = _digest({"commitment_id": identifier, **asdict(request)})
-        with self._transaction():
-            duplicate = self._duplicate(key, fingerprint, active_workflow_ids=active_workflow_ids)
-            if duplicate is not None:
-                return duplicate
-            item = self.commitments.get(identifier)
-            state = self._state(item)
-            if state["epoch"] != request.expected_epoch:
-                raise ControlConflict("epoch_conflict", "任务控制版本已改变，请读取当前状态")
-            if (
-                request.action == "pause"
-                and self.scope(identifier, active_workflow_ids=active_workflow_ids)[
-                    "active_workflow_count"
-                ]
-            ):
-                raise ControlConflict("workflow_active", "该任务含活动工作流，请先停止或等待结束")
-            if request.action == "request_replan":
-                if state["epoch"] <= state["approved_epoch"]:
-                    raise ControlConflict("not_paused", "请先暂停任务，再交主助手重新规划")
-                if not model_configured:
-                    raise ControlUnavailable("model_unconfigured", "尚未配置主模型，任务保持暂停")
-                _positive(max_pending, "入站容量")
-                if mode not in {"ask", "auto", "yolo"}:
-                    raise ValueError("执行模式无效")
-                brief = self.commitments._validate_brief(item.get("brief"), stored=True)
-                if request.additional_requirements.strip():
-                    brief["constraints"].append(request.additional_requirements)
-                item["brief"] = brief
-            state = {
-                **state,
-                "epoch": state["epoch"] + 1,
-                "replan_request_id": key if request.action == "request_replan" else None,
-            }
-            item.update(control=state, revision=item["revision"] + 1, updated_at=now())
-            # A pure pause must work even after a context budget reduction.
-            if request.action == "request_replan":
-                self._budget(self._snapshot(main_session_id, item))
-            elif not isinstance(item.get("brief"), dict):
-                raise ControlUnavailable("brief_missing", "任务没有完整说明")
-            receipt: JsonObject = {
-                "id": key,
-                "commitment_id": identifier,
-                "request_id": request.request_id,
-                "fingerprint": fingerprint,
-                "action": request.action,
-                "actor": "owner",
-                "epoch": state["epoch"],
-                "revision": item["revision"],
-                "created_at": now(),
-            }
-            ingress: JsonObject | None = None
-            if request.action == "request_replan":
-                payload = Conversation.payload(
-                    main_session_id,
-                    f"主人通过任务控制入口要求重新规划任务 {identifier}（epoch {state['epoch']}）。"
-                    "先用 commitment_read 读取并选择当前完整说明，再基于下一轮完整快照确认方案；任务仍暂停。",
-                    source="task-control",
-                    principal="owner",
-                    mode=mode,
-                    event_id=key,
-                )
-                payload["task_control"] = {
-                    "commitment_id": identifier,
-                    "receipt_id": key,
-                    "epoch": state["epoch"],
-                }
-                if self.store.pending_inputs(main_session_id) >= max_pending:
-                    raise ControlUnavailable("queue_full", "主会话入站队列已满，任务保持暂停")
-                ingress, _ = self.store._enqueue_input(
-                    payload, max_pending=max_pending, apply_objects_on_duplicate=False
-                )
-                receipt["ingress_id"] = ingress["id"]
-            self._write(item, receipt)
-            return ControlResult(
-                receipt,
-                self.current(identifier, active_workflow_ids=active_workflow_ids),
-                True,
-                ingress,
+        fields = {"commitment_id": identifier, **asdict(request)}
+        # Keep historical fingerprints unchanged. The authenticated mobile event
+        # already binds its source; duplicate receipts never retrofit that source.
+        if expected_approved_epoch is not None:
+            fields["expected_approved_epoch"] = expected_approved_epoch
+        if scheduled_replan is not None:
+            fields["scheduled_replan"] = scheduled_replan
+        fingerprint = _digest(fields)
+        duplicate = self._duplicate(key, fingerprint, active_workflow_ids=active_workflow_ids)
+        if duplicate is not None:
+            return duplicate
+        item = self.commitments.get(identifier)
+        state = self._state(item)
+        if state["epoch"] != request.expected_epoch or (
+            expected_approved_epoch is not None
+            and state["approved_epoch"] != expected_approved_epoch
+        ):
+            raise ControlConflict("epoch_conflict", "任务控制版本已改变，请读取当前状态")
+        if (
+            request.action == "pause"
+            and self.scope(identifier, active_workflow_ids=active_workflow_ids)[
+                "active_workflow_count"
+            ]
+        ):
+            raise ControlConflict("workflow_active", "该任务含活动工作流，请先停止或等待结束")
+        if request.action == "request_replan":
+            if state["epoch"] <= state["approved_epoch"]:
+                raise ControlConflict("not_paused", "请先暂停任务，再交主助手重新规划")
+            if not model_configured:
+                raise ControlUnavailable("model_unconfigured", "尚未配置主模型，任务保持暂停")
+            _positive(max_pending, "入站容量")
+            if mode not in {"ask", "auto", "yolo"}:
+                raise ValueError("执行模式无效")
+            brief = self.commitments._validate_brief(item.get("brief"), stored=True)
+            if request.additional_requirements.strip():
+                brief["constraints"].append(request.additional_requirements)
+            item["brief"] = brief
+        state = {
+            **state,
+            "epoch": state["epoch"] + 1,
+            "replan_request_id": key if request.action == "request_replan" else None,
+        }
+        if scheduled_replan is None:
+            state.pop("scheduled_replan", None)
+        else:
+            state["scheduled_replan"] = dict(scheduled_replan)
+        item.update(control=state, revision=item["revision"] + 1, updated_at=now())
+        # A pure pause must work even after a context budget reduction.
+        if request.action == "request_replan":
+            self._budget(self._snapshot(main_session_id, item))
+        elif not isinstance(item.get("brief"), dict):
+            raise ControlUnavailable("brief_missing", "任务没有完整说明")
+        receipt: JsonObject = {
+            "id": key,
+            "commitment_id": identifier,
+            "request_id": request.request_id,
+            "fingerprint": fingerprint,
+            "action": request.action,
+            "actor": "owner",
+            "epoch": state["epoch"],
+            "revision": item["revision"],
+            "created_at": now(),
+        }
+        if scheduled_replan is not None:
+            receipt["scheduled_replan"] = dict(scheduled_replan)
+        ingress: JsonObject | None = None
+        if request.action == "request_replan":
+            payload = Conversation.payload(
+                main_session_id,
+                f"主人通过任务控制入口要求重新规划任务 {identifier}（epoch {state['epoch']}）。"
+                "先用 commitment_read 读取并选择当前完整说明，再基于下一轮完整快照确认方案；任务仍暂停。",
+                source="task-control",
+                principal="owner",
+                mode=mode,
+                event_id=key,
+                reply_origin=reply_origin,
             )
+            payload["task_control"] = {
+                "commitment_id": identifier,
+                "receipt_id": key,
+                "epoch": state["epoch"],
+            }
+            if self.store.pending_inputs(main_session_id) >= max_pending:
+                raise ControlUnavailable("queue_full", "主会话入站队列已满，任务保持暂停")
+            ingress, _ = self.store._enqueue_input(
+                payload, max_pending=max_pending, apply_objects_on_duplicate=False
+            )
+            receipt["ingress_id"] = ingress["id"]
+        self._write(item, receipt)
+        return ControlResult(
+            receipt,
+            self.current(identifier, active_workflow_ids=active_workflow_ids),
+            True,
+            ingress,
+        )
 
     def approve_plan(
         self,
@@ -574,6 +726,15 @@ class TaskControl:
             if len(normalized) > max_targets:
                 raise ControlUnavailable("targets_full", "方案通知目标超过配置预算")
             item = self._validate_replan(snapshot)
+            owner_receipt = self.store.get("task_control_receipt", snapshot.replan_request_id)
+            assert owner_receipt is not None
+            self._guard_scheduled_replan(owner_receipt, normalized)
+            report_origin = self._owner_report_origin(
+                snapshot.replan_request_id,
+                snapshot.commitment_id,
+                snapshot.epoch,
+                caller_session_id,
+            )
             deliveries: list[JsonObject] = []
             for target in normalized:
                 agent = self.store.get("agent", target)
@@ -594,6 +755,23 @@ class TaskControl:
                         "expected_status": agent["status"],
                         "state": "pending",
                         "created_at": now(),
+                        **(
+                            {"scheduled_owner_receipt_id": snapshot.replan_request_id}
+                            if "scheduled_replan" in owner_receipt
+                            else {}
+                        ),
+                        **(
+                            {
+                                "report_source": {
+                                    "version": 1,
+                                    "owner_receipt_id": snapshot.replan_request_id,
+                                    "reply_origin": report_origin.dump(),
+                                }
+                            }
+                            if report_origin is not None
+                            and agent.get("parent_id") == caller_session_id
+                            else {}
+                        ),
                     }
                 )
             state = self._state(item)
@@ -619,10 +797,314 @@ class TaskControl:
                 "created_at": now(),
                 "target_count": len(deliveries),
             }
+            if "scheduled_replan" in owner_receipt:
+                marker = owner_receipt["scheduled_replan"]
+                occurrence = self.store.get("task_replan_occurrence", marker["occurrence_id"])
+                if occurrence is None:
+                    raise ControlUnavailable("schedule_invalid", "定时接纳事实不存在")
+                self.store._put(
+                    "task_replan_occurrence",
+                    {
+                        **occurrence,
+                        "state": "approved",
+                        "approve_receipt_id": key,
+                        "delivery_id": deliveries[0]["id"],
+                        "updated_at": now(),
+                    },
+                )
+                scheduled = self.store.get("task_replan_schedule", marker["schedule_id"])
+                if scheduled is None:
+                    raise ControlUnavailable("schedule_invalid", "定时约定不存在")
+                self.store._put(
+                    "task_replan_schedule", {**scheduled, "state": "approved", "updated_at": now()}
+                )
             self._write(item, receipt)
             for delivery in deliveries:
                 self.store._put("task_plan_delivery", delivery)
             return ControlResult(receipt, self.current(snapshot.commitment_id), True)
+
+    def _owner_report_origin(
+        self, receipt_id: str, commitment_id: str, epoch: int, main_id: str
+    ) -> ReplyOrigin | None:
+        """Read the original authenticated control input, never today's chat destination."""
+        try:
+            self._main(main_id)
+            receipt = self.store.get("task_control_receipt", receipt_id)
+            if (
+                receipt is None
+                or receipt.get("action") != "request_replan"
+                or receipt.get("actor") != "owner"
+                or not isinstance(receipt.get("request_id"), str)
+                or self._receipt_id(commitment_id, "owner", receipt["request_id"]) != receipt_id
+                or receipt.get("commitment_id") != commitment_id
+                or type(receipt.get("epoch")) is not int
+                or receipt.get("epoch") != epoch
+            ):
+                return None
+            row = self.store.db.execute(
+                "SELECT * FROM ingress WHERE id=? AND session_id=?",
+                (receipt.get("ingress_id"), main_id),
+            ).fetchone()
+            if row is None or row["state"] != "delivered":
+                return None
+            payload = json.loads(row["payload"])
+            message = self.store.get("message", row["id"])
+            reference = {"commitment_id": commitment_id, "receipt_id": receipt_id, "epoch": epoch}
+            if (
+                not isinstance(payload, dict)
+                or message is None
+                or payload.get("id") != row["id"]
+                or any(
+                    record.get("session_id") != main_id
+                    or record.get("source") != "task-control"
+                    or record.get("principal") != "owner"
+                    or record.get("route") is not None
+                    or record.get("task_control") != reference
+                    for record in (payload, message)
+                )
+                or message.get("role") != "user"
+                or message.get("run_id") != row["run_id"]
+                or message.get("input_seq") != row["seq"]
+                or message.get("seq") != row["delivered_seq"]
+                or message.get("reply_origin") != payload.get("reply_origin")
+            ):
+                return None
+            origin = ReplyOrigin.load(payload.get("reply_origin"))
+            routes = origin.delivery_routes()
+            if (
+                origin.kind != "channel"
+                or origin.dump() != payload.get("reply_origin")
+                or len(routes) != 1
+                or routes[0].get("kind") != "private"
+                or routes[0].get("sender_id") != routes[0].get("target")
+            ):
+                return None
+            return origin
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return None  # Legacy or damaged source facts never acquire a destination retroactively.
+
+    def _report_candidate(
+        self, agent: JsonObject, run_id: str, notice: JsonObject
+    ) -> JsonObject | None:
+        """Prove one actual notice belongs to this execution, including the parked archive path."""
+        try:
+            self._main(agent["parent_id"])
+            reference = notice.get("task_control")
+            run = self.store.get("run", run_id)
+            if (
+                agent.get("status") != "running"
+                or agent.get("run_id") != run_id
+                or run is None
+                or run.get("session_id") != agent["id"]
+                or run.get("status") not in {"running", "completed"}
+                or not isinstance(reference, dict)
+                or set(reference) != {"commitment_id", "epoch", "delivery_id"}
+                or not isinstance(reference.get("delivery_id"), str)
+                or type(reference.get("epoch")) is not int
+                or notice.get("session_id") != agent["id"]
+                or notice.get("source") != "task-control"
+                or notice.get("principal") != "system:task_control"
+                or notice.get("route") is not None
+                or notice.get("role") != "user"
+                or notice.get("delivery_status") != "delivered"
+                or self.resolve_scope(agent["id"]) != reference["commitment_id"]
+            ):
+                return None
+            delivery = self.store.get("task_plan_delivery", reference["delivery_id"])
+            if (
+                delivery is None
+                or delivery.get("state") != "delivered"
+                or delivery.get("target_session_id") != agent["id"]
+                or delivery.get("commitment_id") != reference["commitment_id"]
+                or type(delivery.get("epoch")) is not int
+                or delivery.get("epoch") != reference["epoch"]
+            ):
+                return None
+            source = delivery.get("report_source")
+            if (
+                not isinstance(source, dict)
+                or set(source) != {"version", "owner_receipt_id", "reply_origin"}
+                or type(source.get("version")) is not int
+                or source["version"] != 1
+                or not isinstance(source.get("owner_receipt_id"), str)
+            ):
+                return None
+            receipt_id = self._receipt_id(
+                delivery["commitment_id"], "main", source["owner_receipt_id"]
+            )
+            receipt = self.store.get("task_control_receipt", receipt_id)
+            if (
+                delivery["id"] != _digest([receipt_id, agent["id"]])
+                or receipt is None
+                or receipt.get("action") != "approve_plan"
+                or receipt.get("actor") != "main"
+                or receipt.get("request_id") != source["owner_receipt_id"]
+                or receipt.get("commitment_id") != delivery["commitment_id"]
+                or receipt.get("epoch") != delivery["epoch"]
+            ):
+                return None
+            origin = self._owner_report_origin(
+                source["owner_receipt_id"],
+                delivery["commitment_id"],
+                delivery["epoch"],
+                agent["parent_id"],
+            )
+            if origin is None or origin.dump() != source["reply_origin"]:
+                return None
+            generation, revision = agent.get("generation"), agent.get("completion_revision", 0)
+            target_generation = delivery.get("target_generation")
+            target_revision = delivery.get("target_completion_revision")
+            if (
+                type(generation) is not int
+                or type(revision) is not int
+                or type(target_generation) is not int
+                or type(target_revision) is not int
+                or min(generation, revision, target_generation, target_revision) < 0
+            ):
+                return None
+            parked = False
+            if generation == target_generation + 1 and revision == target_revision + 1:
+                rows = self.store.db.execute(
+                    "SELECT data FROM events WHERE type='team.finished' AND session_id=? "
+                    "AND json_extract(data,'$.completion_revision')=? LIMIT 2",
+                    (agent["id"], revision),
+                ).fetchall()
+                if len(rows) == 1:
+                    terminal = json.loads(rows[0][0])
+                    parked = (
+                        terminal.get("status") == "paused"
+                        and terminal.get("generation") == target_generation
+                        and delivery.get("expected_status") in {"running", "queued"}
+                    )
+            if delivery.get("path") == "archive":
+                if (
+                    notice["id"] != delivery.get("archive_message_id")
+                    or notice.get("run_id") is not None
+                    or generation != target_generation + 1
+                    or not (
+                        (
+                            delivery.get("expected_status") == "paused"
+                            and revision == target_revision
+                        )
+                        or parked
+                    )
+                ):
+                    return None
+            elif delivery.get("path") == "ingress":
+                row = self.store.db.execute(
+                    "SELECT * FROM ingress WHERE id=? AND session_id=?",
+                    (delivery.get("ingress_id"), agent["id"]),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "delivered"
+                    or row["id"] != notice["id"]
+                    or row["run_id"] != run_id
+                    or notice.get("run_id") != run_id
+                    or notice.get("input_seq") != row["seq"]
+                    or notice.get("seq") != row["delivered_seq"]
+                ):
+                    return None
+                payload = json.loads(row["payload"])
+                if not isinstance(payload, dict) or any(
+                    payload.get(key) != notice.get(key)
+                    for key in ("id", "session_id", "source", "principal", "route", "task_control")
+                ):
+                    return None
+                same_running = (
+                    delivery.get("expected_status") == "running"
+                    and generation == target_generation
+                    and revision == target_revision
+                )
+                next_queued = (
+                    delivery.get("expected_status") == "queued"
+                    and generation == target_generation + 1
+                    and revision == target_revision
+                )
+                if not (same_running or next_queued or parked):
+                    return None
+            else:
+                return None
+            return {
+                "version": 1,
+                "delivery_id": delivery["id"],
+                "notice_id": notice["id"],
+                "run_id": run_id,
+                "generation": generation,
+                "completion_revision": revision + 1,
+                "reply_origin": origin.dump(),
+            }
+        except (KeyError, TypeError, ValueError, PermissionError):
+            return None
+
+    def bind_report_notice(
+        self,
+        session_id: str,
+        run_id: str,
+        snapshot: TaskSnapshot | None,
+        projected: Sequence[JsonObject],
+        messages: Sequence[Message],
+    ) -> None:
+        """Only notices actually retained in this request can bind its own completion report."""
+        agent = self.store.get("agent", session_id)
+        if agent is None or snapshot is None or snapshot.epoch != snapshot.approved_epoch:
+            return
+        retained = {
+            (message.source_message_id, message.content)
+            for message in messages
+            if message.role == "user" and message.source_message_id is not None
+        }
+        candidates: dict[str, JsonObject] = {}
+        for notice in projected:
+            reference = notice.get("task_control")
+            if (
+                notice.get("principal") != "system:task_control"
+                or (notice.get("id"), notice.get("content")) not in retained
+                or not isinstance(reference, dict)
+                or reference.get("commitment_id") != snapshot.commitment_id
+                or reference.get("epoch") != snapshot.epoch
+            ):
+                continue
+            candidate = self._report_candidate(agent, run_id, notice)
+            if candidate is not None:
+                candidates[candidate["delivery_id"]] = candidate
+        if not candidates:
+            return
+        existing = agent.get("report_binding")
+        candidate = next(iter(candidates.values()))
+        if len(candidates) != 1 or (existing is not None and existing != candidate):
+            candidate = {"version": 1, "run_id": run_id, "ambiguous": True}
+        if existing != candidate:
+            self.store.put("agent", {**agent, "report_binding": candidate})
+
+    def completed_report_binding(self, agent: JsonObject, run_id: str) -> JsonObject | None:
+        """Recheck the frozen exact execution before Team commits its terminal fact and report."""
+        binding = agent.get("report_binding")
+        if (
+            not isinstance(binding, dict)
+            or set(binding)
+            != {
+                "version",
+                "delivery_id",
+                "notice_id",
+                "run_id",
+                "generation",
+                "completion_revision",
+                "reply_origin",
+            }
+            or type(binding.get("version")) is not int
+            or binding["version"] != 1
+            or not isinstance(binding.get("notice_id"), str)
+            or not isinstance(binding.get("delivery_id"), str)
+            or type(binding.get("generation")) is not int
+            or type(binding.get("completion_revision")) is not int
+            or binding.get("run_id") != run_id
+        ):
+            return None
+        notice = self.store.get("message", binding["notice_id"])
+        if notice is None:
+            return None
+        return binding if self._report_candidate(agent, run_id, notice) == binding else None
 
     def pending_deliveries(self, limit: int, *, after_id: str | None = None) -> list[JsonObject]:
         _positive(limit, "投递批次")
@@ -756,6 +1238,19 @@ class TaskControl:
             item = self.commitments.get(delivery["commitment_id"])
             state = self._state(item)
             agent = self.store.get("agent", target)
+            scheduled_receipt = delivery.get("scheduled_owner_receipt_id")
+            if scheduled_receipt is not None:
+                owner_receipt = self.store.get("task_control_receipt", scheduled_receipt)
+                if owner_receipt is None or "scheduled_replan" not in owner_receipt:
+                    raise ControlUnavailable("schedule_invalid", "方案缺少定时主人回执")
+                try:
+                    self._guard_scheduled_replan(owner_receipt, [target])
+                except (ValueError, PermissionError):
+                    self.store._put(
+                        "task_plan_delivery",
+                        {**delivery, "state": "superseded", "updated_at": now()},
+                    )
+                    return DeliveryResult("superseded", target, changed=True)
             matches = (
                 agent is not None
                 and state["epoch"] == state["approved_epoch"] == delivery["epoch"]

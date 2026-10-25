@@ -12,7 +12,7 @@ from test_runtime import FakeClient, make_runtime
 
 from muli.attachments import Attachments
 from muli.commitments import Commitments, TaskBriefInput
-from muli.context import ContextLimitError
+from muli.context import ContextLimitError, context_size
 from muli.events import EventBus
 from muli.local_services import LocalServices
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
@@ -480,9 +480,7 @@ async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path
             message.content for message in messages if message is not brief
         )
         assert runtime.store.get("message", source["id"])["content"] == source["content"]  # type: ignore[index]
-        assert (
-            len(json.dumps([asdict(message) for message in messages], ensure_ascii=False)) <= 7000
-        )
+        assert context_size(messages) <= 7000
     finally:
         await runtime.close()
     reopened = Runtime(runtime.config, runtime.data_dir)

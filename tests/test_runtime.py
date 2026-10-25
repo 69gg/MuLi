@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from muli.config import ConfigFile
+from muli.context import context_size
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.runtime import Runtime
 
@@ -589,7 +589,7 @@ async def test_large_tool_result_is_packed_without_changing_the_journal(
         session = runtime.new_session(mode="yolo")
         started = await runtime.start(session["id"], "概括文件")
         assert await runtime.wait(started["run_id"]) == "已参考头尾证据"
-        assert len(json.dumps([asdict(message) for message in seen[1]], ensure_ascii=False)) <= 4000
+        assert context_size(seen[1]) <= 4000
         packed = seen[1][-1].content
         assert "已节选" in packed and "first-evidence" in packed and "last-evidence" in packed
         saved = next(m for m in runtime.store.messages(session["id"]) if m["role"] == "tool")

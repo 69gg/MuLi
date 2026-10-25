@@ -9,9 +9,17 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from muli.reply_origin import validate_onebot_owners
+
 ChannelName = Literal["onebot", "telegram", "qq", "weixin"]
+MAX_OUTGOING_TEXT_CHARS = 100_000
 NAMES: tuple[ChannelName, ...] = ("onebot", "telegram", "qq", "weixin")
 Submit = Callable[..., Awaitable[dict[str, Any]]]
+
+
+def is_mobile_control_text(text: str) -> bool:
+    """Reserve malformed commands too; this never parses or authorizes one."""
+    return text.lstrip().startswith(("/任务", "/暂停", "/调整", "/审批", "/批准", "/拒绝"))
 
 
 class ChannelError(ValueError):
@@ -130,6 +138,10 @@ class ChannelsConfig:
     retry_backoff_seconds: float = 5.0
 
     def __post_init__(self) -> None:
+        try:
+            validate_onebot_owners(self.onebot.owner_ids, enabled=self.onebot.enabled)
+        except ValueError as error:
+            raise ChannelError(str(error)) from None
         if any(
             type(value) is not int or value < 1
             for value in (self.max_pending_deliveries, self.max_attempts)
@@ -165,6 +177,8 @@ class IncomingMessage:
     reply_to: str = ""
     files: tuple[RemoteFile, ...] = ()
     context_token: str = field(default="", repr=False)
+    control_text: str = ""
+    control_account_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

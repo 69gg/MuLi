@@ -7,18 +7,20 @@ import heapq
 import json
 import math
 import re
+import sqlite3
 import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from muli.evidence import decode_utf8
+from muli.evidence import EvidenceError, decode_utf8
 from muli.memory_schema import SCHEMA
 from muli.store import Store, new_id, now
 from muli.store_schema import validate_existing_schema
 
 LAYERS = frozenset({"identity", "preference", "episodic", "semantic", "procedural"})
+_MAX_QUERY_TERMS = 64
 _KIND_LAYER = {
     "observation": "episodic",
     "fact": "semantic",
@@ -65,6 +67,13 @@ class _Walk:
     edges: list[dict[str, Any]]
     parents: dict[str, dict[str, Any]]
     truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSearch:
+    items: list[dict[str, Any]]
+    candidates_used: int
+    tokens: tuple[str, ...]
 
 
 class Memory:
@@ -284,7 +293,7 @@ class Memory:
         self._query(query)
         limit = max(1, min(limit, 100))
         if query.strip():
-            tokens = sorted(terms(query))[:64]
+            tokens = sorted(terms(query))[:_MAX_QUERY_TERMS]
             if not tokens:
                 return []
             rows = self.store.db.execute(
@@ -790,6 +799,131 @@ class Memory:
         ]
         return result
 
+    def prompt_evidence(
+        self, seed: Mapping[str, Any], *, max_bytes: int
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Recheck one seed and one exact conflict pair without expanding graph or sources."""
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("提示证据字节预算必须是正整数")
+        identifier = seed.get("id")
+        conflicts = seed.get("conflicts")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or not isinstance(conflicts, list)
+            or type(seed.get("version")) is not int
+            or seed["version"] < 1
+        ):
+            return None, None
+        try:
+            if len(identifier.encode("utf-8")) > max_bytes:
+                return None, None
+        except UnicodeError:
+            return None, None
+        remaining = max_bytes
+        for conflict in conflicts:
+            if not isinstance(conflict, str) or not conflict:
+                return None, None
+            try:
+                remaining -= len(conflict.encode("utf-8"))
+            except UnicodeError:
+                return None, None
+            if remaining < 0:
+                return None, None
+        peer_id = conflicts[0] if conflicts else None
+        left, right = sorted((identifier, peer_id)) if peer_id else (identifier, identifier)
+        metadata = (
+            "CASE WHEN typeof(m.id)='text' AND typeof(x.layer)='text' "
+            "AND typeof(m.source)='text' AND typeof(x.status)='text' "
+            "AND typeof(x.claim_key)='text' AND typeof(x.source_id) IN ('null','text') "
+            "AND typeof(x.trusted_owner)='integer' AND typeof(x.version)='integer' "
+            "THEN json_object('id',m.id,'layer',x.layer,'source',m.source,'source_id',x.source_id,"
+            "'trusted_owner',x.trusted_owner,'status',x.status,"
+            "'version',x.version,'claim_key',x.claim_key) END"
+        )
+        try:
+            rows = self.store.db.execute(
+                "WITH requested(slot,id) AS (SELECT 0,? UNION ALL SELECT 1,?) "
+                f"SELECT r.slot,CASE WHEN length(CAST({metadata} AS BLOB))<=? "
+                f"THEN CAST({metadata} AS BLOB) END AS metadata,"
+                "CASE WHEN typeof(m.updated_at) IN ('integer','real') THEN m.updated_at END "
+                "AS updated_at,"
+                "CASE WHEN typeof(m.content)='text' THEN "
+                "substr(CAST(m.content AS BLOB),1,?) END AS content,"
+                "length(CAST(m.content AS BLOB)) AS content_bytes,"
+                "x.source_id IS NULL OR (s.id IS NOT NULL AND "
+                "(x.trusted_owner=0 OR (s.trusted_owner=1 AND s.role='user'))) AS source_valid,"
+                "EXISTS(SELECT 1 FROM memory_conflicts WHERE left_id=? AND right_id=? "
+                "AND resolved_at IS NULL) AS linked "
+                "FROM requested r JOIN memories m ON m.id=r.id "
+                "JOIN memory_meta x ON x.memory_id=m.id "
+                "LEFT JOIN memory_sources s ON s.id=x.source_id",
+                (identifier, peer_id, max_bytes, max_bytes, left, right),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return None, None
+        current: dict[int, dict[str, Any]] = {}
+        linked = False
+        for row in rows:
+            try:
+                item = json.loads(row["metadata"])
+                if isinstance(item, dict):
+                    item["updated_at"] = row["updated_at"]
+                if (
+                    not isinstance(item, dict)
+                    or item.get("id") != (identifier if row["slot"] == 0 else peer_id)
+                    or item.get("layer") not in LAYERS
+                    or item.get("status") not in {"active", "conflict"}
+                    or type(item.get("trusted_owner")) is not int
+                    or item["trusted_owner"] not in (0, 1)
+                    or type(item.get("version")) is not int
+                    or item["version"] < 1
+                    or not isinstance(item.get("source"), str)
+                    or not isinstance(item.get("claim_key"), str)
+                    or not (item.get("source_id") is None or isinstance(item["source_id"], str))
+                    or not isinstance(item.get("updated_at"), (int, float))
+                    or not math.isfinite(item["updated_at"])
+                    or not row["source_valid"]
+                ):
+                    continue
+                _json(item).encode("utf-8")
+                item["trusted_owner"] = bool(item["trusted_owner"])
+                if item["layer"] in {"identity", "preference"} and not item["trusted_owner"]:
+                    continue
+                item["conflicts"] = conflicts if row["slot"] == 0 else [identifier]
+                raw = row["content"]
+                item["content"] = (
+                    decode_utf8(raw, allow_incomplete_tail=len(raw) < row["content_bytes"])
+                    + ("[节选]" if len(raw) < row["content_bytes"] else "")
+                    if isinstance(raw, bytes)
+                    else ""
+                )
+                current[row["slot"]] = item
+                linked = bool(row["linked"])
+            except (ValueError, TypeError, UnicodeError, EvidenceError):
+                continue
+        primary = current.get(0)
+        if primary is None or primary["version"] != seed.get("version"):
+            return None, None
+        if linked and primary["status"] != "conflict":
+            # A current unresolved edge contradicts this row's active status.
+            # Never turn that inconsistent evidence into a normal single-sided fact.
+            return None, None
+        peer = current.get(1)
+        if (
+            primary["status"] != "conflict"
+            or peer is None
+            or not linked
+            or peer["id"] == primary["id"]
+            or peer["status"] != "conflict"
+            or not primary["claim_key"]
+            or any(primary[key] != peer[key] for key in ("claim_key", "layer", "trusted_owner"))
+        ):
+            peer = None
+        elif peer is not None:
+            peer["conflicts_partial"] = True
+        return primary, peer
+
     def revisions(self, identifier: str) -> list[dict[str, Any]]:
         return [
             {
@@ -959,7 +1093,7 @@ class Memory:
             ).fetchall()
         }
         # Longer Chinese names may be embedded in a sentence. Inspect only indexed hits.
-        tokens = sorted(terms(query))[:64]
+        tokens = sorted(terms(query))[:_MAX_QUERY_TERMS]
         if tokens:
             rows = self.store.db.execute(
                 "SELECT DISTINCT e.id,e.canonical FROM memory_entities e "
@@ -974,7 +1108,7 @@ class Memory:
     @staticmethod
     def _seed_terms(query: str) -> list[str]:
         folded = normalize_entity(query)
-        return sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:64]
+        return sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:_MAX_QUERY_TERMS]
 
     def _seed_evidence(self, query: str, seeds: Sequence[str]) -> list[dict[str, Any]]:
         """One bounded supporting contribution per actual seed, with no source body reads."""
@@ -1160,46 +1294,32 @@ class Memory:
         hops: int | None = None,
         layer: str | None = None,
     ) -> list[dict[str, Any]]:
-        self._query(query)
-        if layer is not None and layer not in LAYERS:
-            raise ValueError("未知记忆分层")
-        limit = max(1, min(limit, self.max_candidates))
-        scores: dict[str, float] = {}
-        matched: dict[str, str] = {}
-        graph_paths: dict[str, dict[str, Any]] = {}
-        tokens = sorted(terms(query))[:64]
-        if not query.strip():
-            rows = self.store.db.execute(
-                "SELECT memory_id FROM memory_meta m JOIN memories i ON i.id=m.memory_id "
-                "WHERE m.status!='superseded' ORDER BY i.updated_at DESC LIMIT ?",
-                (self.max_candidates,),
-            ).fetchall()
-            scores = {row[0]: 0.0 for row in rows}
-            matched = dict.fromkeys(scores, "recent")
-        elif tokens:
-            rows = self.store.db.execute(
-                "SELECT t.memory_id,count(*) hits FROM memory_terms t "
-                "JOIN memory_meta m ON m.memory_id=t.memory_id "
-                f"WHERE m.status!='superseded' AND t.term IN ({_slots(tokens)}) "
-                "GROUP BY t.memory_id ORDER BY hits DESC,t.memory_id LIMIT ?",
-                [*tokens, self.max_candidates],
-            ).fetchall()
-            for row in rows:
-                scores[row["memory_id"]] = 2 * row["hits"] / len(tokens)
-                matched[row["memory_id"]] = "lexical"
-        if query.strip():
-            graph = self.traverse(query, hops=hops)
-            seed_evidence = {entry["entity_id"]: entry for entry in graph["alias_evidence"]}
-            for edge, path in zip(graph["edges"], graph["paths"], strict=True):
-                identifier = edge["memory_id"]
-                if identifier not in scores and len(scores) < self.max_candidates:
-                    scores[identifier] = 0.5 / edge["depth"]
-                    matched[identifier] = "graph"
-                    graph_paths[identifier] = {
-                        **path,
-                        "revision": graph["revision"],
-                        "seed": seed_evidence[path["seed_id"]],
-                    }
+        return self._search_result(query, limit, hops=hops, layer=layer).items
+
+    def search_for_prompt(self, query: str, limit: int, *, hops: int | None = None) -> PromptSearch:
+        return self._search_result(query, limit, hops=hops)
+
+    def _lexical_scores(self, tokens: Sequence[str], limit: int) -> dict[str, float]:
+        if not tokens or limit <= 0:
+            return {}
+        rows = self.store.db.execute(
+            "SELECT t.memory_id,count(*) hits FROM memory_terms t "
+            "JOIN memory_meta m ON m.memory_id=t.memory_id "
+            f"WHERE m.status!='superseded' AND t.term IN ({_slots(tokens)}) "
+            "GROUP BY t.memory_id ORDER BY hits DESC,t.memory_id LIMIT ?",
+            [*tokens, limit],
+        ).fetchall()
+        return {row["memory_id"]: 2 * row["hits"] / len(tokens) for row in rows}
+
+    def _rank_search(
+        self,
+        scores: Mapping[str, float],
+        matched: Mapping[str, str],
+        graph_paths: Mapping[str, dict[str, Any]],
+        limit: int,
+        *,
+        layer: str | None = None,
+    ) -> list[dict[str, Any]]:
         ranked = []
         timestamp = now()
         for identifier, score in scores.items():
@@ -1215,6 +1335,73 @@ class Memory:
         return sorted(ranked, key=lambda item: (-item["score"], -item["updated_at"], item["id"]))[
             :limit
         ]
+
+    def task_prompt_candidates(
+        self,
+        query: str,
+        *,
+        candidate_limit: int,
+        excluded_ids: frozenset[str],
+        current_tokens: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        self._query(query)
+        remaining_terms = max(0, _MAX_QUERY_TERMS - len(current_tokens))
+        tokens = sorted(terms(query) - set(current_tokens))[:remaining_terms]
+        limit = max(0, min(candidate_limit, self.max_candidates))
+        # Excluded or invalid rows consume this one SQL slice; never refill it.
+        scores = self._lexical_scores(tokens, limit)
+        eligible = {
+            identifier: score
+            for identifier, score in scores.items()
+            if identifier not in excluded_ids
+        }
+        return self._rank_search(eligible, dict.fromkeys(eligible, "lexical"), {}, limit)
+
+    def _search_result(
+        self,
+        query: str,
+        limit: int,
+        *,
+        hops: int | None = None,
+        layer: str | None = None,
+    ) -> PromptSearch:
+        self._query(query)
+        if layer is not None and layer not in LAYERS:
+            raise ValueError("未知记忆分层")
+        limit = max(1, min(limit, self.max_candidates))
+        scores: dict[str, float] = {}
+        matched: dict[str, str] = {}
+        graph_paths: dict[str, dict[str, Any]] = {}
+        tokens = tuple(sorted(terms(query))[:_MAX_QUERY_TERMS])
+        if not query.strip():
+            rows = self.store.db.execute(
+                "SELECT memory_id FROM memory_meta m JOIN memories i ON i.id=m.memory_id "
+                "WHERE m.status!='superseded' ORDER BY i.updated_at DESC LIMIT ?",
+                (self.max_candidates,),
+            ).fetchall()
+            scores = {row[0]: 0.0 for row in rows}
+            matched = dict.fromkeys(scores, "recent")
+        elif tokens:
+            scores = self._lexical_scores(tokens, self.max_candidates)
+            matched = dict.fromkeys(scores, "lexical")
+        if query.strip():
+            graph = self.traverse(query, hops=hops)
+            seed_evidence = {entry["entity_id"]: entry for entry in graph["alias_evidence"]}
+            for edge, path in zip(graph["edges"], graph["paths"], strict=True):
+                identifier = edge["memory_id"]
+                if identifier not in scores and len(scores) < self.max_candidates:
+                    scores[identifier] = 0.5 / edge["depth"]
+                    matched[identifier] = "graph"
+                    graph_paths[identifier] = {
+                        **path,
+                        "revision": graph["revision"],
+                        "seed": seed_evidence[path["seed_id"]],
+                    }
+        return PromptSearch(
+            self._rank_search(scores, matched, graph_paths, limit, layer=layer),
+            len(scores),
+            tokens,
+        )
 
     def _rebuild_communities(self, affected: set[str]) -> None:
         visited: set[str] = set()

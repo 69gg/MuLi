@@ -55,7 +55,7 @@ async def test_channel_configuration_revocation_rejects_waiting_owner(
                 )
             )
             await asyncio.wait_for(entered.wait(), 2)
-            runtime.config.update({"channels": {"onebot": {"owner_ids": []}}})
+            runtime.config.update({"channels": {"onebot": {"enabled": False, "owner_ids": []}}})
         with pytest.raises(ValueError, match="授权已改变"):
             await task
         assert runtime.store.db.execute("SELECT count(*) FROM ingress").fetchone()[0] == 0
@@ -120,7 +120,8 @@ async def test_signed_webhook_is_independent_of_web_login_but_cannot_impersonate
         rows = runtime.store.db.execute(
             "SELECT state,json_extract(payload,'$.principal') FROM ingress"
         ).fetchall()
-        assert len(rows) == 1 and tuple(rows[0]) == ("quarantined", "external:onebot:8")
+        assert rows == []
+        assert runtime.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 0
         assert not runtime.tasks and not runtime.store.list("message")
         attempts: list[bool] = []
 
@@ -277,14 +278,7 @@ async def test_owner_channel_and_web_share_identity_without_broadcasting_web_rep
                 "onebot", IncomingMessage("owner", "7", "7", "先从渠道沟通")
             )
             await runtime.wait(result["run_id"])
-            async with asyncio.timeout(3):
-                while not manager.deliveries() or manager.deliveries()[0]["state"] != "sent":
-                    revision = runtime.bus.revision
-                    async with runtime.bus.changed:
-                        await runtime.bus.changed.wait_for(
-                            lambda expected=revision: runtime.bus.revision != expected
-                        )
-            assert len(sent) == 1 and sent[0]["user_id"] == "7"
+            assert not manager.deliveries() and not sent
             reply = (
                 await web.post(
                     "/api/sessions/" + result["session_id"] + "/messages",
@@ -293,10 +287,12 @@ async def test_owner_channel_and_web_share_identity_without_broadcasting_web_rep
             ).json()
             await runtime.wait(reply["run_id"])
             assert reply["session_id"] == result["session_id"] == runtime.main_session()["id"]
-            assert [message.content for message in seen[-1] if message.role == "user"] == [
-                "先从渠道沟通",
-                "网页接着说",
-            ]
+            inputs = [message for message in seen[-1] if message.role == "user"]
+            assert len(inputs) == 2
+            assert inputs[0].content.endswith("先从渠道沟通")
+            assert '"channel": "onebot"' in inputs[0].content
+            assert '"sender_id": "7"' in inputs[0].content
+            assert inputs[1].content == "网页接着说"
             completed = [
                 event["data"]["message"]
                 for event in runtime.store.events()
@@ -304,7 +300,7 @@ async def test_owner_channel_and_web_share_identity_without_broadcasting_web_rep
                 and event["data"]["message"]["role"] == "assistant"
             ]
             assert completed[-1]["delivery_routes"] == []
-            assert len(manager.deliveries()) == 1
+            assert not manager.deliveries() and not sent
 
 
 async def test_attention_lifecycle_configuration_and_rollback(

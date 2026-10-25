@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from dataclasses import asdict
 from typing import Any, cast
 
 import pytest
 
-from muli.context import EXCERPT_MARKER, ContextLimitError, pack_context
+from muli.context import EXCERPT_MARKER, ContextLimitError, context_size, pack_context
 from muli.providers import Message, ModelConfig, ToolCall
 from muli.providers.codecs import build_request
 from muli.providers.types import MessageRole, ProtocolName
@@ -38,7 +37,7 @@ def batch(content: str, identifier: str = "call", *, marked: bool = True) -> lis
 
 
 def size(messages: list[Message]) -> int:
-    return len(json.dumps([asdict(message) for message in messages], ensure_ascii=False))
+    return context_size(messages)
 
 
 @pytest.mark.parametrize("trailing", [[], ["system"], ["developer"], ["system", "developer"]])
@@ -155,7 +154,10 @@ def test_host_marker_is_not_serialized_to_provider(protocol: ProtocolName) -> No
     messages = [Message(role="user", content="读取")] + batch(evidence)
     packed = pack_context(messages, 2000)
     config = ModelConfig(
-        protocol=protocol, model="offline-test", base_url="https://example.invalid"
+        protocol=protocol,
+        model="offline-test",
+        base_url="https://example.invalid",
+        max_output_tokens=4096 if protocol == "anthropic" else None,
     )
     body = build_request(config, packed, [], stream=False)
     encoded = json.dumps(body, ensure_ascii=False)

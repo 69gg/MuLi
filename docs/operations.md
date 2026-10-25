@@ -1,100 +1,113 @@
-# 配置、迁移与运维
+# 配置、备份与维护
 
-## 配置入口
+常用配置在工作台“设置”中管理，也可以请沐璃协助修改。`MuLi` 和 `muli` 是同一个命令。
 
-所有常规配置可以从工作台设置页面管理。高级配置为严格 JSON；未知键被拒绝。模型的 reasoning / extra_body / extra_headers 为对象，PATCH 时按整体替换；留空 api_key 保留原密钥，clear_api_key=true 显式清除。读取 API 返回 api_key_set / credential_set，不返回密钥。包含 token 的自定义请求头仅显示占位符。
+## 启动与后台服务
 
-协议基础地址需包含供应商所需版本前缀，例如 `https://provider.example/v1`；不要把 `/chat/completions`、`/responses`、`/messages` 当基础地址。具体字段参见 providers.md。环境变量名称由用户选择，默认不假定任何供应商。
+首次运行使用 `MuLi init`。初始化会保存配置，默认尝试下载只读源码参考，再安装、启用并启动当前用户的后台服务。源码参考可用 `--no-source` 跳过；只想配置、不安装服务时使用 `--no-service`。已有配置不会被初始化覆盖。
 
-搜索服务同样由用户指定，避免默认把个人查询发送到不明公共实例。SearXNG 需开放 JSON 格式；Brave base URL 为其 API 根地址，Tavily 为其服务根地址。
+已经配置好后，运行 `MuLi serve` 可在当前终端启动；不要与已运行的后台服务同时启动。访问终端显示的工作台地址，默认是 `http://127.0.0.1:8765`。前台运行时关闭该进程也会停止服务。
 
-## 旧版本迁移
+后台服务常用命令：
 
-旧基线使用仓库根目录 config.json、history/dialog.json 和导入时启动的 MCP。v1.0.0 使用 XDG 配置与 SQLite 数据；当前版本默认集中到 ~/MuLi，不自动加载旧密钥、不自动启动旧 MCP 命令，也不自动搬移已有数据。可继续通过 MULI_CONFIG / MULI_DATA_DIR 指向旧位置，迁移前保留原文件。
-
-可按以下对应关系在新工作台配置：
-
-| 旧字段 | 新字段 |
+| 命令 | 用途 |
 | --- | --- |
-| model_config.main_model.model_name | models.main.model |
-| model_config.main_model.api_base_url | models.main.base_url |
-| model_config.main_model.api_key | models.main.api_key 或 api_key_env |
-| provider_type=openai/deepseek | protocol=openai_chat |
-| model_config.json_model | 可用作 models.reviewer，需检查该模型支持普通 JSON 输出 |
-| tools_api_config.web_search.base_url | search.base_url |
+| `MuLi service status` | 查看是否安装、运行及最近日志 |
+| `MuLi service install` | 安装服务，不自动启动 |
+| `MuLi service enable` / `disable` | 开启或关闭登录后自动启动 |
+| `MuLi service start` / `stop` | 启动或停止服务 |
+| `MuLi service restart` | 重启服务 |
+| `MuLi doctor` | 查看版本、配置位置、模型与本机能力 |
 
-历史消息不自动转成可信长期记忆；有价值事实可通过记忆入口导入并标明来源。旧 Docker 工具不再默认启动容器，命令工具使用当前用户权限与运行预算。
+启动请求已提交不等于服务已经可用，仍需查看状态和实际访问结果。初始化的服务安装失败时，配置会保留，可以先用 `MuLi serve` 查看原因。
 
-## 无障碍电脑操作
+Linux 使用 systemd 用户服务，macOS 使用 LaunchAgent，Windows 使用当前用户计划任务，不创建管理员级系统服务。Windows 需要当前 Python 环境提供 `pythonw.exe`；缺少服务所需组件时会说明原因。详情见[平台支持](platforms.md)。
 
-Linux 需要桌面会话 D-Bus、AT-SPI、系统 Python GI。Arch Linux 使用系统发行的 python-gobject / at-spi2-core；不需要在 MuLi 虚拟环境编译 GTK。设置 computer.python_path 指向具有 GI 的系统 Python，然后启用电脑工具。先在状态页查看能力。
+## 修改设置
 
-`computer.backend=auto` 按平台选择 Linux AT-SPI、macOS AX 或 Windows 只读 UIA，不在失败后更换后端；旧配置中的显式 `atspi` 不迁移。macOS AX 使用当前 MuLi Python 的系统框架，`python_path` 不影响它。Windows 使用系统 PowerShell/.NET，保持原执行策略，受限环境可能不可用。AX/UIA 能力查询不会弹出辅助功能授权、扫描桌面或保留节点引用；实际授权归属与第三方应用行为仍需本机受控验收。队友不能借用另一个执行的原生引用：先 `computer_release`，再让接手者重新观察。`desktop_busy` 应交回统筹处理，不用模型循环等待。
+模型连接、搜索、文件访问目录、工具开关和执行预算都可在设置中调整。模型基础地址需包含供应商要求的版本前缀，例如 `https://provider.example/v1`，不要填写完整的 `/chat/completions` 等接口地址。搜索服务需要自己配置；SearXNG 必须开启 JSON 输出。详见[模型设置](providers.md)。
 
-`computer.operation_timeout_seconds` 控制单次无障碍 helper 的总期限，默认 12 秒，可配置为大于 0、至多 120 秒的有限数值；`computer.snapshot_ttl_seconds` 控制快照及目标发现引用的有效期，默认 60 秒，至多 300 秒。两者不接受布尔值、字符串或无穷大。旧配置无需修改，缺省时沿用原期限；修改配置不会延长已有操作凭据。
+保存时留空已有密钥通常表示保留原值；需要删除时使用明确的清除操作。界面只显示密钥是否已设置，不会读回明文。高级 JSON 配置不接受未知字段。
 
-Linux/macOS 的操作路径是 snapshot → action/type → 再次 snapshot。快照具有有效期，Linux 操作校验进程及 D-Bus 对象身份，成功或失败都消耗快照。界面不支持的动作不会降级成任意坐标点击。无障碍树不可用时可单独请求截图；截图不产生可执行节点身份，不能代替操作前的快照。实验性 macOS AX 使用归属于当前会话/执行代次的短期 helper 保留原生引用，动作或释放后须重新观察；已完成离线原生接口测试，但真实 TCC 授权和桌面动作尚未实测。开发中的 Windows UIA 仅走 targets → 选定窗口 snapshot → release，动作、输入与任意坐标操作不可用；真实 Windows CI 待验证，见[电脑操作合同](computer.md)。
+普通执行配置不能与正在运行的任务交错修改，先让任务结束或停止任务。MCP、Skills 等扩展的专用重载可在运行期间应用，具体规则见[MCP](mcp.md)和[Skills](skills.md)；用户插件启用状态需要重启。
 
-桌面图像采集另由 computer.capture.enabled 开启，默认关闭。截图与有界录屏保存在数据目录 captures/，随后可作为本地附件使用；不自动上传、不录制声音。工具沿用 computer 风险及 ask/auto/yolo 权限模式。单文件默认 32 MiB、目录默认 200 MiB，默认录屏上限 30 秒、8 fps；超过配额或取消时终止采集进程并删除未完成文件。后端与授权边界见 [平台能力](platforms.md)。
+修改监听地址或端口需要按工作台提示完成配置重启。排队成功不表示新地址已经生效；重启完成后，使用新地址重新连接。
 
-2.1 起支持显式 computer.capture.backend=portal 的 Linux 截图，复用 computer.python_path 的系统 Gio，不要求 AT-SPI 可用。保持 auto 选择顺序；Portal 不提供录屏或失败降级。portal_timeout_seconds 单独控制交互等待，默认 60 秒；可在截图高级配置或管理 API 中调整。能力查询不触发截图授权，真正截图仍可能显示系统对话框；当前只完成私有总线模拟验证，未在真实桌面采集。
+默认只监听本机。监听非回环地址必须设置访问密码；远程使用还需自行提供合适的 HTTPS 入口。网页麦克风在远程 HTTP 页面上通常不可用。不要在进程仍对外监听时通过清空密码来关闭认证。
 
-## 数据与恢复
+## 数据放在哪里
 
-数据目录保存 muli.sqlite3（含 WAL）、文件回收站、attachments/ 附件库，以及启用后生成的 captures/ 和 voice/。备份运行中数据库应使用 SQLite backup API 或停服务后完整复制，不能只复制活跃数据库主文件。配置与数据库包含个人资料，勿提交 Git。网页录音、截图、录屏、声纹参考与合成音频需要另行备份；NDJSON 数据导出不包含这些二进制文件。
+默认主目录是 `~/MuLi`，其中 `~` 表示当前用户的主目录。
 
-新启动工厂独占创建的资料库在核心、记忆、渠道和主身份准备完整后写入格式标记。以后启动先核验其完整合同与身份，未知或损坏标记会明确失败，不静默迁移。历史未标记资料库保持原路径，不根据空文件或相似表结构自动补证。初始化中断留下的未标记库也不会在下次启动自动认证；保留现场供诊断，不要手工删除标记来绕过检查。构造锁只保护初始化，不能当作整个运行期的独占写锁，详见[格式准入](fresh-format-admission.md)。
+| 默认位置 | 内容 |
+| --- | --- |
+| `~/MuLi/config.json` | 配置，可能包含模型和渠道密钥 |
+| `~/MuLi/plugins/`、`~/MuLi/prompts/` | 用户插件与自定义提示词 |
+| `~/MuLi/source/` | 初始化可选下载的只读源码参考，不是当前安装程序 |
+| `~/MuLi/data/muli.sqlite3` | 聊天、运行、任务、记忆、审批及投递记录 |
+| `~/MuLi/data/attachments/` | 上传和保存的附件 |
+| `~/MuLi/data/trash/` | 文件工具的可恢复回收站 |
+| `~/MuLi/data/captures/`、`~/MuLi/data/voice/` | 启用后产生的截图、录屏与本地语音文件 |
+| `~/MuLi/data/logs/service.log` | macOS、Windows 的服务日志；Linux 主要查看用户服务日志 |
 
-已标记资料库目前不支持原位自动更新，因为当前更新器尚不能核验候选版本的完整格式声明。新版发现仍正常工作，`self_status` 和 `/api/management` 返回实际的 `update_capability`；用户批准不能代替兼容证据。旧未标记资料库继续使用原安装检查路径，见[自身管理](self-management.md)。
+模型使用环境变量读取的密钥不在配置文件中，恢复时还需重新提供对应环境变量。Shell 和电脑工具具有当前系统用户的能力，工作目录设置不是操作系统沙箱。
 
-2.22 的本地候选入口在显式迁入后，由固定启动器和 controller 接续同一事务，保留最新数据库。该路径不下载、不创建候选环境；保持原控制安装完整，避免手动原位覆盖。操作合同与验收状态见[本地托管切换](managed-operations.md)。
+### 自定义位置
 
-设置中的“导出个人数据”下载 NDJSON，包含会话、运行、待处理输入、团队与管理账本、记忆原文、事实与关系证据、冲突、社区、修订、向量和渠道投递记录。导出逐批读取，不加载整个数据库，不包含配置文件或渠道协议凭据缓存；它是可读数据导出，不是跨表一致性备份，也不包含附件及文件回收站的实际文件。对话和工具结果本身可能包含用户曾发送的敏感内容。需要可恢复备份时仍使用 SQLite backup 或停服务复制，另行保存配置与本地文件。
+可使用 `MULI_HOME` 修改默认主目录；`MULI_CONFIG` 和 `MULI_DATA_DIR` 分别指定配置文件与数据目录。也可使用全局命令行参数，放在子命令之前：
 
-重启后，残留的未完成运行、审批和工作流标为中断，对应会话回到 idle。恢复先按未完成状态筛选并分批处理，不受较新历史数量影响；已暂停和终态记录保留。可回看已完成步骤，再显式发起新任务；不会自动重放文件写入或桌面点击。chiliarch 收件使用事务先落盘再 ACK，重复身份内容不一致会拒绝。
+```text
+MuLi --config "/绝对路径/config.json" --data-dir "/绝对路径/data" serve
+```
 
-网页当前运行与审批按真实执行槽、未结束 future 和持久状态一起核验，旧 started/requested 事件不重新产生执行或授权。恢复变更带持久失效事件，已有网页重新接通 SSE 也会结束旧运行；未确认的工具结果显示“结果未知”，需先核查实际状态。可见历史与字节预算边界见[会话恢复](session-recovery.md)。
+请将示例替换为本机实际路径。更换位置后，服务管理命令也要使用相同参数；已经安装的后台服务保存了安装时的绝对路径，修改终端环境变量不会自动更新它。托管安装的目录切换应按[本地托管操作](managed-operations.md)处理，不要直接覆盖正在使用的安装。
 
-2.9 为生命周期和精确父运行查询增加两个幂等 SQLite 索引，首次打开旧库需要扫描已有对象一次；后续恢复只取候选 ID，再逐条处理正文。它不删除历史、不重新提炼记忆、不启动模型。工作流设置中的活动入口独立分页，任何未完成执行都会阻止定义删除；仅有终态历史时可以删除定义，运行历史保留。
+## 备份与恢复
 
-2.11 增加会话创建序的幂等 SQLite 索引，旧库首次打开会扫描已有对象建立索引，不改写旧记录或增加归档表。标题查询先筛完整集合再分页，仍需扫描候选标题；无全文索引或语义查询。页只保留连续完整摘要，超长旧标题无法放入预算时明确报错，不裁短 ID 或静默跳过。旧实时首屏与全局 SSE 的资源边界未在本片改变，见[记录目录](session-records.md)。
+需要可以恢复的备份时，最简单的方式是停服务后复制完整目录：
 
-## 服务与故障定位
+1. 让任务结束；若必须中断，先记下尚未确认的操作。使用 `MuLi service stop` 停止后台服务，前台运行则退出该进程，并确认已经停止。
+2. 备份配置目录和整个数据目录。默认可复制完整的 `~/MuLi`，保留可能存在的数据库 `-wal`、`-shm` 文件以及附件、回收站和语音目录。
+3. 另外备份工作目录中由沐璃创建或修改的文件。它们可能位于 `~/MuLi` 之外，不会随应用数据一起备份。
+4. 恢复前保留当前现场；在服务停止时恢复同一份备份中的配置、数据库和文件，再用对应版本与路径启动。
 
-2.14 增加按 `ingress.run_id` 查询的幂等部分索引，首次打开历史库需扫描已有收件。它让很早的注意事项运行也能被精确识别，防止迟到错误再次唤醒模型；不删除历史或启动模型。系统日志只保留有限原记录及对应事件，不限制整个数据库大小，详见[系统事件](system-events.md)。
+运行中备份数据库应使用 SQLite backup 功能，不要只复制正在使用的 `muli.sqlite3` 主文件。配置、对话和工具结果可能包含私密信息，备份也需要按私人资料保存。
 
-- `muli doctor`：版本、配置位置、模型配置状态、桌面与服务能力。
-- `muli service status`：用户服务状态和最近日志。
-- `muli management status`：只读查看现有恢复事务；不打开业务数据库或创建缺失目录。
-- `self_recover` / `POST /api/management/transactions/recover`：先确认当前运行宿主，再接续现有控制者；不创建新代次或延长原期限。
-- `muli management recover`：宿主不在运行时，可从固定控制安装接续现有控制者；不会自动确认其它运行宿主内存中的丢返回绑定。
-- `/api/docs`：自动生成的管理接口文档。
-- `journalctl --user -u muli.service -f`：服务日志。
+设置中的“导出个人数据”会下载 NDJSON，方便阅读聊天、任务、记忆和其它保留记录。它**不是可直接恢复的完整备份**：不包含配置、附件正文、回收站实际文件，也不保证不同数据表处于同一时刻。网页录音、截图、录屏和声纹参考音频都需另行保存。
 
-服务管理按当前系统选择 systemd 用户服务、macOS LaunchAgent 或 Windows 当前用户计划任务。install 只安装，enable 只管理登录自动启动；start、stop、restart 分开执行。不会使用管理员权限或创建系统级服务。Windows 必须有当前 Python 环境对应的 pythonw.exe，避免弹出控制台；服务内重启由独立的一次性计划任务执行，避免结束发起者后无法再启动。macOS / Windows 日志保存至 logs/service.log，单份最多 1 MiB 并保留一个轮转文件。实际平台验证范围见 [平台能力](platforms.md)。
+重启后，未完成的即时运行、审批和工作流会显示为中断，已经暂停的任务仍保持暂停。旧审批不能继续批准，结果未知的文件写入、外发或桌面动作不会自动重做。先查看实际状态，再发起明确的后续请求；持久提醒和定时计划按各自规则继续检查，不等于重新执行旧工具。
 
-Linux 同版本恢复自 2.19.0 起已接入独立控制者、serve bootstrap 和管理事务入口。提交或 helper accepted 只表示请求已保存/提交，最终结果须以 journal 终态及业务投影为准。waiting 等待完整自然空闲，只有 drained 后才暂停新执行；现有 owner 不收尾时有限超时保留原服务。未决代次阻止原始服务控制旁路；安装 unit 与调用者的配置、数据、解释器不符时拒绝操作。验证范围、恢复命令与限制见[同版本恢复入口](linux-recovery-operations.md)，不把离线通过当成真实机器故障注入通过。
+## 从旧配置迁移
 
-交互 `MuLi init` 在配置成功后依次请求 install、enable、start，报告已完成步骤；启动请求被接受不等于服务已健康。`--no-service` 或 `--defaults` 跳过这一步，开发环境建议使用 `MuLi init --no-source --no-service`。启动失败时配置仍保留，可查看 `MuLi service status` 或使用 `MuLi serve` 诊断。
+程序不会自动搬移旧仓库中的 `config.json`、`history/dialog.json` 或早期 XDG 目录，也不会自动加载旧密钥、运行旧 MCP 命令。已有兼容配置和数据可以通过上面的路径参数继续使用；搬移前先备份。
 
-管理服务默认监听回环地址。绑定非回环地址必须配置访问密码；登录使用 HttpOnly、SameSite=Strict cookie，API 拒绝跨源变更与不合法 Host。密码和监听地址可在初始化或设置中配置；外部访问仍需自行提供合适的 HTTPS 入口。
+旧配置不能直接作为当前设置导入时，在新工作台重新填写。常见字段对应如下：
 
-配置修改不能与执行中的任务交错；先停止任务再改执行参数。端口修改在下一次启动生效。桌面授权依赖用户桌面会话，不能用 root 服务替代。
+| 旧字段 | 当前配置 |
+| --- | --- |
+| `model_config.main_model.model_name` | `models.main.model` |
+| `model_config.main_model.api_base_url` | `models.main.base_url` |
+| `model_config.main_model.api_key` | `models.main.api_key` 或 `api_key_env` |
+| `provider_type=openai/deepseek` | `protocol=openai_chat` |
+| `model_config.json_model` | 可配置为 `models.reviewer`，需确认接口兼容 |
+| `tools_api_config.web_search.base_url` | `search.base_url` |
 
-## 主动提醒
+旧聊天记录不自动转成可信记忆。需要保留的资料可通过[记忆入口](memory.md)或[附件收藏](attachment-memory.md)明确加入。
 
-通知页可以创建一次或重复提醒、查看下一次触发、停用和删除；对话工具也可创建提醒。存储使用 Unix 秒，界面按浏览器本地时区显示。重复间隔至少 60 秒。调度器等待最近到期时间或变更通知，空闲不请求模型；停机期间错过的多次重复提醒在恢复时合并为一次，再计算下一次。
+## 更新与故障排查
 
-提醒进入工作台通知列表与 SSE。Linux 可在设置中开启“桌面通知”，复用系统已安装的 `notify-send`，关闭网页后也能接收新提醒；默认关闭。桌面通知失败不影响持久记录，不补发启动前的历史弹窗，也不唤醒关机的电脑。详见 notifications.md。
+发现新版不代表当前安装可以直接原位更新。工作台会显示允许的更新方式；带格式标记的资料库需要核验兼容的托管候选，不能靠一次批准绕过。使用[自身管理](self-management.md)或[本地托管操作](managed-operations.md)的入口，并保留旧安装和备份。
 
-`attention.enabled` 默认开启：新到期提醒、维护终态与发现新版在活动主任务完整结束后形成独立的只读回合，不中断正在进行的工具批次或渠道回复；有主模型配置时触发一次正常回复，可能产生模型费用。系统资料不是用户授权；回复保留在主会话，并按宿主冻结的原请求来源投递。2.16 起启动时自主发现新版可使用明确设置的默认通知渠道，其它未知来源及旧记录留在 WebUI，不广播到历史渠道。首次启用和重新启用跳过先前历史；没有模型配置时只持久保留一批，配置恢复后继续处理。事件消费、去重、队列背压与关闭行为见 [系统注意事项](attention.md)，外发设置与撤销见 [默认通知](channels.md#无发令会话时的默认通知)。
+若出现格式不兼容或标记损坏，先保留文件并查看诊断。不要删除格式标记、手改数据库版本或混用不同备份中的文件来强行启动。
 
-## 资源与平台
+| 问题 | 先做什么 |
+| --- | --- |
+| 工作台打不开 | 用 `MuLi service status` 看服务状态；必要时在终端运行 `MuLi serve` 查看启动错误，避免同时启动两个实例。 |
+| 配置位置或能力不清楚 | 运行 `MuLi doctor`。能力可检测不等于桌面授权已经成功。 |
+| Linux 服务异常 | 查看 `journalctl --user -u muli.service -f`；macOS、Windows 查看数据目录中的服务日志。 |
+| 配置、更新或重启停在恢复阶段 | 先运行 `MuLi management status` 查看；按[恢复操作](linux-recovery-operations.md)接续。宿主不在运行时可用 `MuLi management recover`，不要反复新建相同操作。 |
+| 某次任务失败 | 在工作台保留运行 ID，请沐璃查询故障位置；参见[故障诊断](failure-diagnostics.md)。 |
 
-默认最多两个模型执行并行；主会话未完成任务和工作流运行分别最多八个，排队时间计入超时。上限可从设置的执行预算修改；提高上限前应核对供应商配额。systemd 的默认资源保护为 MemoryMax=512M、CPUQuota=50%、TasksMax=64，可通过用户 unit override 调整。
+默认前台模型执行并发为 2，每次运行最长 600 秒、最多 16 次工具调用；可在执行预算中调整。systemd 用户服务另有默认的 512 MiB 内存、50% CPU 和 64 个任务限制。提高应用预算不会自动提高系统服务限制。
 
-服务与数据库操作支持 Python 3.12+。文件、配置统一使用 UTF-8；POSIX 私人权限位不等同于 Windows ACL 隔离。平台服务、录屏和语音新增适配经过模拟测试，未在本次开发机实际安装服务、采集桌面或录制麦克风；不把能力探测等同于实际桌面授权成功。
-
-语音默认关闭，需要录音工具、真正的声学唤醒桥接和已配置的 ASR。启用声纹验证后还需显式录制参考音频。唤醒后播放“请说”或短提示音；播放不可用会记录状态，不假称已经播放。配置、桥接格式、文件保留和身份边界见 [语音](voice.md)。
-
-网页语音输入另由 `web_voice.enabled` 控制，默认关闭。它使用浏览器权限与现有 ASR，只生成待发送草稿，与后台唤醒独立；远程页面需 HTTPS。音频保存在附件库，取消转写或丢弃文字不会自动删除原音频。详见 [网页点击录音](voice.md#网页点击录音)。
+电脑操作、截图和录屏依赖当前桌面与授权；语音默认关闭，还需要相应录音、声学组件与 ASR/TTS 配置。按需阅读[电脑操作](computer.md)、[平台支持](platforms.md)、[语音](voice.md)、[提醒与主动事项](attention.md)及[桌面通知](notifications.md)。

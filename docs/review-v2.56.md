@@ -1,0 +1,90 @@
+# v2.56 视觉解释存档发行审查
+
+2026-10-24，基线为已发行2.55的签名提交
+`d1f4590d6f12d595b922b90b26d561191964db1a`。本候选支持显式保存一次视觉解释，
+在会话压缩、正常关闭重开后按原图定位并完整回查，使用当前发问来源回复而不重新看图。
+原工具短结果本来已持久进入消息历史；本片补齐完整解释工件与准确原图、模型及提问的绑定。
+
+## 实现和边界
+
+四份生产为 `local_services.py`、`media.py`、`transcripts.py` 及小型 `vision_archives.py`。
+复用原附件、ASR的私有有界hash读取和UTF-8字节分页；不改Runtime、持久格式、依赖或队列。
+`image_describe(archive=true)` 在视觉前核实际原图字节/大小/摘要与附件声明，模型白名单身份
+来自同次真实选型，不在await后重选。完整私有JSON保存原图ID/SHA/大小/MIME、提问、
+实际profile/protocol/model、完整解释和不可信标记；不保存凭据、headers或完整配置。
+
+解释仅为当次历史模型判断，不是主人事实、图中文字执行授权或任务验收。它不自动进入Graph，
+不自动外发，也不自动触发后续模型。原图后来不可用不妨碍历史工件读取，读取工件不证明
+当前原图仍健康。复用原 `attachment_search` 定位及 `attachment_read` 版本/字节游标读全文；
+分页只接纳vision来源，普通/ASR附件的新增分页参数拒绝，原ASR入口及响应上限保持。
+
+保存或预览失败明确 `vision_completed=true,archive_status=unknown`，有已知ID/版本则保留；
+只搜索/读工件确认，内部不重复视觉。取消收取已有文件I/O终态后传播，不伪造成功回执或
+承诺撤回已完成调用、恰好一次提交。完整JSON、原图和最终回包各受原资源与输出预算。
+
+两原工具启用 `preserve_output=True`，让完整末工具批保留到立即下一模型请求。
+默认短字典原样；默认长结果改为工具内最终JSON预算的 `description/content + truncated`，
+不再使用旧Runtime通用 `preview` 封套。这是明确的兼容取舍，不声称大封套逐字兼容；
+不永久钉住历史，当前完整批容不下时仍沿原上下文限制拒绝。
+
+非作者已审四生产及正式旅程，根也完成后审，未发现剩余P1/P2。独立policy不代替源码审查。
+
+## 实际本地验证
+
+- 首正式红：1 failed，pytest0.64秒，守卫1.360秒、92.5MiB、swap0。真实上传、私聊7、
+  Runtime正常收口及accepted错误回执前置通过，准确缺archive schema（ValidationError），
+  当时没有视觉HTTP；该红只证明入口缺口。
+- 修后正式旅程1 passed，pytest0.60秒，守卫1.329秒、95.7MiB、swap0。
+  真实视觉HTTP核原PNG字节/SHA、模型和prompt，总共一次视觉；私聊7存档后，原Compactor
+  摘要回合真实安装且核covered_seq/prefix_digest/原消息不变。正常close/reopen保持同库与
+  主身份，当前私聊8搜索并分页读回完整JSON和解释尾部，模型实际收到全文，仅向8回复，Web可见。
+- 五项独立policy通过：严格参数/默认长短及下一请求完整性、原图实际版本不符零视觉、
+  主/外挂与协议的真实选型及热配置冻结、保存后unknown/取消不重视觉、UTF-8与版本/文件
+  变更以及普通/ASR来源隔离。首次含37既有记录节点的组合为41 passed / 1 fixture failed，
+  原因是两处Store.put夹具多传id；根只修夹具调用，该节点复验1 passed、pytest0.21秒。
+  原37项均通过，未因此修改生产或放宽oracle。
+- 新增6个不同节点（1正式、5policy），既有308个（媒体/ASR/上传103、附件记录37、
+  MCP正式旅程2、发布兼容166），合314个不同本地节点通过；单项复验不重复累计。
+- 全151源码clean strict通过，守卫8.724秒、416.7MiB、swap0。Ruff和404文件格式通过；
+  83包离线锁、离线wheel/sdist构建、发行一致性validate及隔离wheel smoke均通过，无下载。
+
+以上均由根串行沿原本地守卫执行，未提高预算。内存数字是对应检查的守卫值，不是整机峰值。
+主/摘要模型为受控策略，视觉provider与平台HTTP使用离线替身；不证明自然识图、摘要质量、
+真实平台账号或桌面设备联调。正常关闭重开不等于强杀、掉电恢复。
+
+## 远端状态
+
+首签名候选 `58e555a2d508f6adc70fd4176419f1101e8a28f9` 已推送，PR为
+[#64](https://github.com/69gg/MuLi/pull/64)。候选CI `40079788548` 首次Windows3.13
+作业 `120830750028` 为4040 passed、1467 skipped、1 failed：新增正式旅程已完成一次
+视觉存档，随后背景文件读取的固定模型断言失败，压缩和重开部分当次未完成。
+
+根核实原 `Files._read` 用二进制读取再UTF-8解码，保留文件真实换行；测试却以
+`Path.write_text` 写背景，Windows会把LF转为CRLF，而固定模型精确预期LF。
+仅在Linux临时夹具强制写CRLF，即准确复现相同background阶段、第三轮与AssertionError：
+1 failed、pytest4.55秒，守卫5.218秒、94.4MiB、swap0。
+修复只将该背景夹具改为显式UTF-8 `write_bytes`，固定各平台相同输入；生产、所有断言及
+原4秒等待均未改。正式旅程复验1 passed、pytest0.60秒，守卫1.345秒、95.8MiB、swap0。
+这是测试输入的换行错误，不把增加等待或跳过Windows作为修复；单项复验不增加314的不同节点数。
+非作者复核二进制读取、固定字节输入及原严格内容/轮数/预算/等待断言，无P1/P2；定向Ruff和格式通过。
+
+## 发行闭合
+
+修后签名提交 `7beae8e7524c2416344db528dd585e55c29a0fce` 的候选CI
+[`40080446607`](https://github.com/69gg/MuLi/actions/runs/40080446607) 十项全为
+completed/success，包括Linux双Python双分片、macOS/Windows双Python、quality及mcp。
+PR64于2026-10-24T09:17:31Z合入该精确提交；GPG签名标签 `v2.56.0` 与main原子推送。
+重复main CI `40081369564` 最终completed/cancelled，不计为通过。
+
+正式Release [`40081369256`](https://github.com/69gg/MuLi/actions/runs/40081369256)
+十三项全为completed/success。GitHub于2026-10-24T09:25:38Z
+[发布v2.56.0](https://github.com/69gg/MuLi/releases/tag/v2.56.0)。根沿原资源守卫读取
+GitHub/PyPI小型JSON，核标签、两份非yanked构件、文件名、大小及SHA-256一致，未下载包：
+
+| 构件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| wheel | 844768 | `bb8978a4462fc04b89dfcd3ac3f40f78b9c6432cb89e53937863488a100c6668` |
+| sdist | 4500938 | `a5e72e075a447581198af43230cd5ff24b9597e60124c7656d3b9c94600327b6` |
+
+核对守卫1.354秒、47.7MiB、swap0。这闭合发行与公开构件，未升级或重启本机用户服务，
+也不把离线平台旅程扩大为真实账号/设备联调。本节在下一迭代记录，不改冻结发行标签。

@@ -12,6 +12,18 @@
 
 纯 pause 只登记事实，清除旧重规划意图，不增加 main 输入或自动调用模型；无模型配置也可暂停。`request_replan` 明确登记主人重新规划的意图，允许追加完整要求；原始要求不被计划覆盖。启动、确认、输入容量释放和实际完成事件驱动通知投递，没有定时模型轮询。每页受 `limits.max_pending_runs` 限制，越过满邮箱继续扫描；重入事件会请求后续一轮处理，不丢失唯一容量释放唤醒。
 
+手机重规划后续回复在最终准入后的私有提交闭包中，将可信 `MobileControlSource` 转为 `ReplyOrigin`，与 owner 控制事实及 main ingress 同事务保存。公开 `OwnerControlRequest` 和 Web 请求不能指定该来源；既有指纹不变，重复领域回执原样返回，不补改旧 ingress。输入仍为 `source=task-control, principal=owner, route=null`，显式回复来源只用于外发归属，不增加权限。
+
+主会话同一运行的工具批次后和无工具续轮都使用实际 claim 的有限输入列表选择来源。严格匹配 `source=team:<id>, principal=agent:<id>` 的队内报告只补充当前请求证据；若没有其它新输入，沿用前一 `PreparedRequest` 的来源与主动通知选路。新主人输入、提醒等其它真实输入按其持久来源更新。首次准备、新运行及队友自身请求仍沿原规则；报告 metadata 和独立 Attention 路由不变，不查询全历史最近主人，也不保存永久目的地偏好。2.46仅覆盖重规划说明回本次手机，独立完成回报的新增持久关联见下节。该版十五文件431项相关整合、全147源码类型检查和独立后审通过，精确远端矩阵与正式发行已闭合，见[2.46审查](review-v2.46.md#发版闭合)。
+
+## 独立完成回报候选（本地已验证）
+
+后续片在上述运行内保护之外，为主 MuLi 的直接队友保存准确通知与执行关联：批准只从已持久的原 owner 回执取得手机来源；Runtime 每轮准备实际请求时，核验保留的准确通知、当前宿主快照及真实 run/generation。Team 完成时再次校验预期 completion_revision，在原完成事务中仅为该报告覆盖来源，不修改 agent 的派工来源、通用 PreparedRequest 或子代继承。通知仅入队、被其它 run 消费、证明损坏或多义均不能取得手机来源；没有有效证明的报告保留原行为。
+
+实际请求的承接身份由宿主 `Message.source_message_id` 从持久消息传入，经过正常 pack 副本后仍须与完整通知正文同时匹配。不同消息的相同正文不能代替已移除的通知；hook丢失宿主身份时不通过内容猜回。此字段不进入 provider 显式协议或文本预算，未增加公开输入与模型可指定的来源字段。
+
+真实完成报告随后沿原 flush/startup、主 ingress 和独立主运行发布。发送仍重核当前 owner；撤销得到 blocked，unknown 不因正常重开或控制重投重发。范围仅是直接队友该代完成说明，嵌套控制语义及旧报告保持；旧 binary 不兑现新证明，不保证降级后仍回手机。历史三条目标红及身份反例保留；修复后十二参数、21个相关文件411项、静态和离线构件检查已完成[2.47本地闭合](review-v2.47.md#最终候选准备)，远端与发行待验，详见[方案与证据限制](mobile-task-completion-proposal.md)。
+
 ## 同一请求中的完整快照
 
 `PreparedRequest` 分开保存 `execution_scope` 与 `selected_replan`。执行队友和 workflow 节点从真实持久父链继承 scope；主会话仍可协调不同任务，选择待规划任务不会把它绑定成该任务的 worker。
@@ -49,3 +61,21 @@ Runtime 保存 `run.status=paused`、`pause_reason`、`observed_epoch`，发布 
 首版不支持活动 DAG 中途暂停。同 scope 存在 queued/running DAG，或状态已结束但实际收尾 task 尚未完成时，pause 返回 `workflow_active`，不改变控制事实。DAG 首次 await 前同步检查 scope 并登记运行、节点继承绑定；旧节点通过普通执行入口启动也不能逃离门禁。已批准范围可启动新 DAG，独立 DAG 不受无关暂停影响。
 
 `tests/test_task_control_runtime.py` 使用临时 SQLite、假模型、真实 Runtime/Team/AttentionInbox 与 Event 门控验证以上边界，包括原生批次、最后 await、快照冻结、继承身份、满箱恢复、先投递后停靠、报告公平交接和真实系统注意事项。没有调用真实模型、网络或设备。
+
+## 约定时间重新规划原任务（v2.65 已发行）
+
+主人可以明确约定：“这个任务先暂停，明天九点到十点之间交给这位原队友继续。”主助手核实当前时间、完整任务和已停靠的原直系队友后，调用 `task_schedule_replan(task_id,target_id,due_at,expires_at,key)`，保存明确的开始与失效窗口；不是另建独立工作流，也不直接解除暂停。
+
+`task_schedule_replan_list` 分页核查约定：等待表示尚未接纳，到期接纳表示重规划意图与主输入已保存，批准表示主助手真正读取完整说明后，在下一轮确认了原目标的方案。三者均不等于工具已执行、任务完成或交付验收。`task_schedule_replan_cancel(id)` 撤销尚未批准的资格；已批准的执行仍使用原暂停或停止入口，不承诺追回已发生的副作用。
+
+等候复用原提醒时钟与事件唤醒，零 AI 轮询；后台未运行时不唤醒电脑。普通提醒仍只提醒，定时独立工作流仍执行其独立委托。完整到期、正常重开、新代及原路回报的离线旅程、独立后审和正式发行已闭合，范围与回退限制见[约定时间继续原任务](scheduled-task-replans.md#发行闭合)。
+
+v2.66 候选保留原通知取消与手机重投语义。仅本次新建的定时续办输入已经提交，且普通通知异常后仍能点读同一 pending 入站、主会话与控制回执关联时，补发原主循环唤醒；不重新提交、批准或派工。未知事务及单调停靠门拒绝此补唤醒，取消不走补偿。见[时钟恢复](reminder-clock-recovery.md)。
+
+## 显式交付验收候选
+
+主助手可显式调用 `task_delivery_record`，为当前任务版本的一个准确直接队友完成报告和一个本地 UTF-8 附件副本保存验收依据。独立协调 provider 只登记这个 write 工具；队友 schema 不提供它，handler 仍复核真实主会话和运行。原工具 provider、普通 completed、任务状态、方案批准与 owner 权限不变。
+
+宿主从真实 file_publish 的完整 accepted 工具结果、准确调用消息和当前完成事件核关联，再在有限字节窗内读取附件副本。宿主文件事实与逐条模型判断分栏；文件属于本任务、由本代写出及满足要求均不能只凭路径或摘要升级为宿主事实。文件 await 在事务外，末 `BEGIN IMMEDIATE` 中无 await 复核任务 revision/epoch 和完整证据后，将不可变单、同任务去重回执及事件原子保存。owner 在核验期间暂停或追加要求，不能留下成功单。
+
+相同规范参数与去重键只返回原单，内容不同报冲突，不重读文件、不重跑队友；任务要求或执行代次变化后原单保留为历史。读取复用 `commitment_inspect(section=deliveries)` 与原认证 HTTP 入口，不新增前端面板。登记不自动发文件，后续说明沿当前真实来源，显式渠道发送继续沿原授权、撤销和 unknown 回执规则。候选、本地历史红点及待验证范围见[交付验收方案](task-delivery-evidence-proposal.md)，不代表本片已发行。

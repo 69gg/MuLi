@@ -31,6 +31,8 @@ TOOLS: list[JsonObject] = [
 
 
 def config(protocol: ProtocolName = "openai_chat", **options: Any) -> ModelConfig:
+    if protocol == "anthropic":
+        options.setdefault("max_output_tokens", 4096)
     return ModelConfig(
         protocol=protocol,
         model="test-model",
@@ -39,6 +41,22 @@ def config(protocol: ProtocolName = "openai_chat", **options: Any) -> ModelConfi
         retry_backoff=0,
         **options,
     )
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+def test_local_source_message_identity_does_not_enter_provider_request(
+    protocol: ProtocolName,
+) -> None:
+    plain = build_request(config(protocol), [Message("user", "准确正文")], [], stream=False)
+    identified = build_request(
+        config(protocol),
+        [Message("user", "准确正文", source_message_id="host-only-actual-message")],
+        [],
+        stream=False,
+    )
+    assert identified == plain
+    encoded = json.dumps(identified, ensure_ascii=False)
+    assert "source_message_id" not in encoded and "host-only-actual-message" not in encoded
 
 
 def payload(protocol: str) -> JsonObject:
@@ -186,7 +204,7 @@ async def test_native_protocol_tool_roundtrip_and_usage(protocol: ProtocolName) 
         assert requests[0].url.path == "/v1/chat/completions"
         assert requests[0].headers["authorization"] == "Bearer secret-key"
         assert wire["messages"][2] == payload(protocol)["choices"][0]["message"]
-        assert wire["max_completion_tokens"] == 4096
+        assert "max_completion_tokens" not in wire and "max_tokens" not in wire
         assert turn.usage.reasoning_tokens == 2
     elif protocol == "openai_responses":
         assert requests[0].url.path == "/v1/responses"
@@ -198,7 +216,7 @@ async def test_native_protocol_tool_roundtrip_and_usage(protocol: ProtocolName) 
         }
         assert wire["store"] is False
         assert wire["tools"][0]["name"] == "lookup"
-        assert wire["max_output_tokens"] == 4096
+        assert "max_output_tokens" not in wire
     else:
         assert requests[0].url.path == "/v1/messages"
         assert requests[0].headers["x-api-key"] == "secret-key"

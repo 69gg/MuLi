@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from time import monotonic
@@ -27,6 +28,15 @@ _SQL_BYTES = 4096
 _PHASES = ("setup", "begin", "optional", "schema", "marker", "identity", "main_object", "cleanup")
 _OBSERVATION_BYTES = 1024
 _MAX_MILLISECONDS = 2**31 - 1
+thread_time: Callable[[], float] | None = getattr(time, "thread_time", None)
+
+
+def _sample_thread_cpu() -> float | None:
+    # Diagnostic availability must never replace the original admission error.
+    try:
+        return None if thread_time is None else thread_time()
+    except (OSError, NotImplementedError):
+        return None
 
 
 class FormatEvidenceError(ValueError):
@@ -90,9 +100,30 @@ class _Reader:
         self.queries = self.steps = 0
         self.interval = min(100, limits.vm_steps)
         self.interrupted: str | None = None
+        self.begin_call_wall: float | None = None
+        self.begin_call_cpu: float | None = None
+        self.begin_returned_at: float | None = None
+        self.begin_return_gap: float | None = None
+
+    def begin(self) -> None:
+        """Observe the complete original call, not only SQLite execution."""
+        cpu_started = _sample_thread_cpu()
+        started = monotonic()
+        try:
+            _rows(self.db, "BEGIN")
+        finally:
+            ended = monotonic()
+            cpu_ended = _sample_thread_cpu()
+            self.begin_call_wall = max(0.0, ended - started)
+            if cpu_started is not None and cpu_ended is not None:
+                self.begin_call_cpu = max(0.0, cpu_ended - cpu_started)
+        # A raised BEGIN never claims to have returned successfully.
+        self.begin_returned_at = ended
 
     def move(self, phase: str) -> None:
         now = monotonic()
+        if self.phase == "begin" and self.begin_returned_at is not None:
+            self.begin_return_gap = max(0.0, now - self.begin_returned_at)
         self.durations[self.phase] += max(0.0, now - self.phase_started)
         self.phase, self.phase_started = phase, now
 
@@ -110,6 +141,18 @@ class _Reader:
                 "failure_phase": self.failure_phase,
                 "queries": self.queries,
                 "vm_steps": self.steps,
+                "begin_call": {
+                    "wall_ms": None
+                    if self.begin_call_wall is None
+                    else milliseconds(self.begin_call_wall),
+                    "thread_cpu_ms": None
+                    if self.begin_call_cpu is None
+                    else milliseconds(self.begin_call_cpu),
+                    "return_gap_ms": None
+                    if self.begin_return_gap is None
+                    else milliseconds(self.begin_return_gap),
+                    "returned": self.begin_returned_at is not None,
+                },
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -365,7 +408,7 @@ def _read_evidence_inner(
         reader.check()
         reader.move("begin")
         begin_attempted = True
-        _rows(db, "BEGIN")
+        reader.begin()
         result = reader.read_optional() if optional else reader.read()
     except sqlite3.Error as error:
         code = reader.interrupted or (

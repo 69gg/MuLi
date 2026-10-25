@@ -62,6 +62,51 @@ async def test_inspection_authentication_precedes_task_lookup_and_matches_local_
     assert missing.status_code == 404
 
 
+async def test_handoff_api_auth_scope_versions_and_read_only_metadata(
+    inspection_case: tuple[Runtime, LocalServices, httpx.AsyncClient],
+) -> None:
+    runtime, services, client = inspection_case
+    task = await services.commitments.save(
+        "私密接办", brief={"goal": "只交草稿", "constraints": ["不得外发"]}
+    )
+    other = await services.commitments.save("另一任务")
+    worker = bind(runtime, task["id"])
+    agent = runtime.store.get("agent", worker["id"])
+    assert agent is not None
+    runtime.store.put("agent", {**agent, "session_id": worker["id"]})
+    message = runtime.store.add_message(worker["id"], "user", "附件正文不应进入接办目录")
+    runtime.config.update({"server": {"password_hash": hash_password("handoff-password")}})
+    url = f"/api/commitments/{task['id']}/inspection"
+    params = {"section": "handoff", "agent_id": worker["id"]}
+    unauthorized = await client.get(url, params=params)
+    assert unauthorized.status_code == 401
+    assert "私密接办" not in unauthorized.text
+    login = await client.post("/api/auth/login", json={"password": "handoff-password"})
+    assert login.status_code == 200
+    changes = runtime.store.db.total_changes
+    events = runtime.store.event_position()
+    response = await client.get(url, params=params)
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    page = response.json()
+    assert page == services.task_inspection.read(task["id"], **params)
+    assert page["source_completeness"] == "recent_window_only"
+    assert page["execution"]["side_effect_status"] == "unknown"
+    assert page["items"][0]["read"]["seq"] == message["seq"]
+    assert message["content"] not in response.text
+    assert runtime.store.db.total_changes == changes
+    assert runtime.store.event_position() == events
+    assert not runtime.tasks and not runtime._selected_replans
+    cross_task = await client.get(f"/api/commitments/{other['id']}/inspection", params=params)
+    assert cross_task.status_code == 404
+    empty = await client.get(url, params={**params, "agent_id": ""})
+    assert empty.status_code == 422
+    runtime.store.put("message", {**message, "content": "同一原序号已有新版本"})
+    changed = await client.get(url, params={**params, "revision": page["revision"]})
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "evidence_changed"
+
+
 async def test_task_inspection_pages_full_plan_with_utf8_and_leaves_business_state_unchanged(
     inspection_case: tuple[Runtime, LocalServices, httpx.AsyncClient],
 ) -> None:
@@ -313,7 +358,12 @@ async def test_inspection_body_survives_real_runtime_and_codec_or_refuses_lossy_
         runtime.config.update(
             {
                 "persona": {"prompt": "离线核查任务，只读资料"},
-                "models": {"main": {"protocol": protocol}},
+                "models": {
+                    "main": {
+                        "protocol": protocol,
+                        **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
+                    }
+                },
                 "limits": {"max_output_chars": 32000, "max_context_chars": 12000},
                 "compaction": {"enabled": False},
             }

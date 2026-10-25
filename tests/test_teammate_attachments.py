@@ -206,7 +206,8 @@ async def test_tool_dispatch_preserves_internal_sender_and_explicit_references(
         assert payload["principal"] == f"agent:{parent}"
         assert "private-body-marker" not in json.dumps(payload)
         assert runtime.team.get(created["id"])["reply_origin"] == origin
-    assert tools["send_message"].handler is tools["send_input"].handler
+    assert tools["send_message"].parameters == tools["send_input"].parameters
+    assert tools["send_message"].risk == tools["send_input"].risk == "write"
     before = counts(runtime)
     for name in ("spawn_agent", "send_message", "send_input"):
         args = (

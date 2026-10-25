@@ -249,6 +249,14 @@ UIA native 用例超时，连不调用 COM 的 owned-pending 脚本也未观察�
 通过，整轮峰值 94.6 MiB、swap 0。独立 6.1 sol 静态后审未发现确定 P1/P2 或阻断；
 真实 Windows 仍待验证。诊断不是启动失败的修复，后续候选成功也不倒推旧失败已解决。
 
+2.43 候选 `40019282611` 的 Windows 3.12 首 probe 再次在等待原响应时超时，阶段
+为空；完整 traceback 已证明该次 spawn/write/drain 返回。测试侧现复用同一 owned
+lease 的清理前/后快照，补有限 stderr 字节/白名单分类及宿主各阶段相对毫秒，保持
+原工厂 argv、包内脚本、12 秒和一次生命周期。根七文件150项整合、四文件strict
+mypy/Ruff/格式及独立最终后审通过；真实Windows仍待新精确候选验收，
+不输出 stderr 正文或环境，不把新增观察称为根因修复。3.13 的独立格式读取超时仍
+保留真实失败。具体事实与覆盖边界见[首 probe 观察缺口](windows-uia-probe-diagnostics-design.md#243-同次首-probe-观察缺口)。
+
 ## 官方依据
 
 Context7 先查 PowerShell / .NET 接口；模块自动加载问题无匹配时再核微软原文：

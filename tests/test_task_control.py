@@ -360,6 +360,8 @@ def test_confirmation_retry_survives_budget_shrink_and_new_pause(rig: Rig) -> No
     rig.agent()
     selected = rig.replan()
     result = rig.approve(selected, ("worker",))
+    legacy_delivery = rig.store.list("task_plan_delivery")[0]
+    assert "report_source" not in legacy_delivery
     rig.command(OwnerControlRequest("pause", 2, "later-pause"))
     rig.limits.update(context=1, output=1)
     before = durable_state(rig.store)
@@ -373,6 +375,7 @@ def test_confirmation_retry_survives_budget_shrink_and_new_pause(rig: Rig) -> No
     )
     assert retried.receipt == result.receipt
     assert retried.current["control"]["epoch"] == 3
+    assert rig.store.get("task_plan_delivery", legacy_delivery["id"]) == legacy_delivery
     assert durable_state(rig.store) == before
     with pytest.raises(ControlConflict, match="request_id_conflict"):
         rig.control.approve_plan(

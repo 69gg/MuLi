@@ -41,6 +41,8 @@ Team 和 Workflow 的实际模型执行都经过 `Runtime._execute()`，首片�
 
 调用计数是管理器的显式内存状态，不通过模型参数、可继承的 ContextVar 或 TaskSnapshot 授权。任务暂停、新输入和维护门仍在原最终边界复核；取消从真实执行栈释放计数，不把 Task 结束通知当作底层效果已停。
 
+v2.51 的[工具结果资源链接候选](mcp-result-resources-proposal.md)沿用此合同：实际 MCP 发布连同复用连接一起清除结果集合和最新调用 token，Skills-only 不额外清除。已经接纳的旧调用可按原策略返回普通文本；签发结果集合前则须无 await 再核准确 generation、当前连接、usable、receive latch、原绝对期限与最新调用 token。新调用先清旧集合，因此较新失败或取消后，较早调用晚返不能恢复可读引用。不改变旧在途调用的连接 lease 或退休规则；本片验证结果单独记于[2.51候选审查](review-v2.51.md)。
+
 ## 结果策略与资源上界
 
 候选 handler 同时冻结本代 `secrets` 与输出预算。`_result/_sanitize/_redact` 显式消费这份策略，不读取发布后的管理器全局值；旧 header、env 和 Bearer token 在迟到结果中仍被遮盖。策略和 publication token 均不进入模型 schema、公共状态或持久工具正文；不引入另一套 Settings。

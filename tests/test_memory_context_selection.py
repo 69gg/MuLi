@@ -128,7 +128,13 @@ def test_only_exact_initial_automatic_episode_is_excluded(memory: Memory, varian
             )
             memory._bump()
     selected = records(service.cached_context(content, latest_user_id="current"))
-    assert retained["id"] in {item["id"] for item in selected}
+    if variant == "conflict":
+        assert any(
+            item.get("type") == "conflict" and item["seed"]["id"] == retained["id"]
+            for item in selected
+        )
+    else:
+        assert retained["id"] in {item["id"] for item in selected}
     if variant in {"extracted", "other_source"}:
         assert original["id"] not in {item["id"] for item in selected}
     else:

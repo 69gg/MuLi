@@ -11,7 +11,7 @@ import pytest
 from muli.config import ConfigFile
 from muli.integrations.chiliarch import Envelope
 from muli.integrations.manager import IntegrationManager
-from muli.runtime import Runtime
+from muli.runtime import Runtime, _ExecutionResult
 from muli.server import create_app
 from muli.store import Store
 
@@ -56,12 +56,12 @@ async def test_settings_close_blocks_start_until_new_roots_are_active(
 
     async def execute(
         session_id: str, run_id: str, role: str, mode: str, workflow_step: bool
-    ) -> str:
+    ) -> _ExecutionResult:
         observed.append((runtime.model_config("main").model, runtime.files.roots))
         with pytest.raises(PermissionError):
             runtime.files.path(str(old_root))
         assert runtime.files.path(str(new_root)) == new_root
-        return "current boundaries"
+        return _ExecutionResult("current boundaries")
 
     monkeypatch.setattr(integration, "close", paused_close)
     monkeypatch.setattr(runtime, "_execute", execute)

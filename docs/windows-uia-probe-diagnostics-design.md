@@ -1,8 +1,9 @@
 # Windows UIA probe 的固定阶段证据
 
-状态：原八阶段及后续三个首请求输入阶段的受限纯回归已有记录；原十一阶段在
-后续真实 Windows 失败中观察至 `uia_ready`，原超时仍未解决。本轮经根批准增加
-三个原调用边界阶段，已落盘但尚未运行纯回归、格式/类型检查或真实 Windows 验证。
+状态：原八/十一阶段、同次首 probe 观察与 native19 的历史纯回归记录分别保留。
+本次 PR37 整合沿用 main 的 probe 不初始化 walker 行为及原 UTF-8/响应合同，
+保留真实 `probe_process_ready`；两个旧 walker 阶段仅保留名称兼容，不再发出。
+本次合并尚未运行检查或真实 Windows 验证，不能用历史通过记录证明整合已通过。
 独立于已冻结的 Invoke 片；
 不改变已发布标签，不把增加诊断写成已查明或修复启动超时。
 
@@ -38,10 +39,9 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 ## 固定阶段与一次性规则
 
 每行只允许 ASCII 协议 `muli-uia-stage=1:<stage>` 加换行，不含时间、ID、参数或正文。
-每个 helper 用固定十四位状态保存已尝试阶段，每位先置位再尝试写出；每阶段最多一次，
-整生命周期最多十四行，固定字符串预计 LF 合计 465 字节、CRLF 合计 479 字节，
-仍须由纯回归核对不超过原 512 字节标记预算，
-不因重复 probe 或其他请求增长。
+每个 helper 保留固定十四位状态及历史名称编号，每位先置位再尝试写出；每阶段最多一次。
+当前 probe 跳过两个旧 walker 阶段，整生命周期最多十二行；十四名称的历史完整序列
+仍按原 512 字节标记预算核验，不因重复 probe 或其他请求增长。
 
 | stage | 紧邻的代码位置与能够证明的事实 |
 | --- | --- |
@@ -54,8 +54,8 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 | `probe_received` | 首个 probe 的原帧、版本与 limits 校验通过后，初始化前 |
 | `uia_initializing` | 首次 `Initialize-Uia` 的版本/MTA/程序集检查开始前 |
 | `uia_ready` | 原 GAC 检查通过并设置 ready 后 |
-| `walker_initializing` | 首个合法 probe 的原 `ControlViewWalker` 静态 getter 紧前，原 deadline 检查后 |
-| `walker_ready` | 该 getter 返回后；不证明后续 provider 或桌面枚举可用 |
+| `walker_initializing` | native19 历史 probe 的 getter 紧前；当前 probe 不初始化 walker，此名称仅作历史兼容 |
+| `walker_ready` | native19 历史 getter 返回后；当前 helper 不发出，不冒充当前 probe 已执行 getter |
 | `probe_process_ready` | probe 的原 `GetCurrentProcess`、`MainWindowHandle` 读取及 `Dispose` 全部返回后 |
 | `probe_encoded` | 首个 probe 的原成功 `Encode-Result` 返回后，原末次 deadline 检查前 |
 | `probe_write_returned` | 该成功 probe 的原 `$writer.WriteLine` 返回后；不是宿主已收到的证明 |
@@ -63,7 +63,8 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 三个 input 阶段仅位于 `requestCount=0` 分支，不能在解码前声称输入就是 probe。
 前三级和 UIA 初始化各只尝试一次；probe 的固定阶段仅跟踪首个合法 probe，失败也不为
 后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求十四级全序；
-本次 CI 的新建 once probe 才核上述顺序。错误回执不冒充成功 encoded/write 阶段。
+当前 CI 新建 once probe 核上述顺序中跳过两个旧 walker 名称的十二阶段子序列。
+错误回执不冒充成功 encoded/write 阶段，也不为补齐历史阶段重新执行 walker getter。
 
 标记通过 `[Console]::Error.WriteLine` 与 Flush 写出；仅固定字符串，整个写入置于
 best-effort try/catch，不使用 Write-Error 或异常格式化，不输出 `$Error`。
@@ -92,7 +93,7 @@ write_returned 存在而宿主仍无回执可缩小下一轮传输/解码调查�
 
 ## 验收与官方依据
 
-先用纯替身核十四行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
+先用纯替身核十四名称兼容、当前十二处调用及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
 CRLF/半行、未知/重复/乱序输入、2048 字节截断、完整 JSON note 预算。假 lease
 事件门控证明 note 在自有清理后生成、原异常身份/outcome 和取消保留、清理失败不
 伪称回收；既有 reader 继续证明 stderr 全部计费。禁止在 Linux 启动 PS 或桌面。
@@ -177,8 +178,81 @@ pytest 峰 61.8 MiB，整轮峰 314.2 MiB、swap 0，每条均由原 30 秒守�
 以上只证明纯投影/源静态边界；根与独立集成 agent 后审未发现可验证 P1/P2，真实 Windows 新阶段待验。
 没有 PowerShell 语法或实际阶段输出的本地证明，也不把增加三个标记写成已修复超时。
 
+## 2.43 同次首 probe 观察缺口
+
+精确 `e664b2ed9e5aed7c34a87f637b8b965d6ef2e659` 的候选 CI `40019282611`
+最终八项成功、两项 Windows 失败。3.12 job `120639317991` 的三个自有窗口正文
+超时，`3742 passed, 1457 skipped, 3 failed`；首 probe 的完整 traceback 停在原
+`AXHelperLease.request` 等待 `_pending`，证明该次原 spawn、write 和 drain 已返回。
+note 为 `stages=[]/stage_sequence=unobserved`、`sent=1`，仅确认收尾后 lease、
+直接进程和 readers 终态；nonzero 不能反推清理前已经自然退出。
+
+本次与 2.41 的 `utility_ready` 事实不同。最早标记在脚本主体执行后才尝试写出，且为
+best effort；空阶段不能证明脚本未进入，更不能归因 Python 版本、COM、JSON 解码、
+执行策略或调度。旧投影没有 stderr 字节数，零字节、未知短行和半行可给出相同 note。
+原 `_settle_process` 先取消 readers，再丢弃管道余量；清理后前缀不能当作完整 stderr。
+
+### 最小实现与投影
+
+只给测试侧增加 `ProbeHelperLease`，复用 `PendingHelperLease` 已有的原 stdin 包装和
+第一次 `_retire` 前快照。首 native 用例在无 await 的构造范围内临时替换既有 UIA
+工厂的 lease 类，仍由原 `_new_lease(once=True)` 构造完整 argv；随后立即恢复工厂。
+包内 PowerShell 原件、参数、一次 spawn/write/drain、12 秒总期限、TTL、强拥有清理
+与所有原生断言均保留。第四例仍使用原 pending 观察；产品 AXLease 和 PS 源码不改。
+
+原 `uia_probe_diagnostic=` 保留既有字段，增加 `before_cleanup/after_cleanup` 两份
+有限快照。前者在父 `_retire` 改状态和调度原清理任务之前无 await 保存，后者在原
+owner 收尾后读取；投影或时钟失败仍不替换原错误对象、outcome 或取消。原错存在时
+收尾错误不覆盖它；成功路径收尾失败仍传播。每条 note 仍限 4096 ASCII bytes。
+
+两份快照复用固定 spawn/lease/exit 枚举、process 存在、readers 全部终态、0/1 发送
+计数、原输入包装和 write/drain 布尔量。只增加保留前缀的 `stderr_bytes`、原
+`stderr_prefix_capped`、完整白名单 `script_stages/stage_sequence`，以及固定分类：
+`empty` 表示前缀零字节；`known_stage` 表示至少一完整白名单行；`unrecognized`
+涵盖未知内容、非 ASCII 和半行，不输出或进一步识别这些内容。`known_stage` 仍可能
+乱序，由原序列字段表达；capped 只表示可能截断，readers settled 不等于 pipe EOF。
+
+相对耗时仅观察同一 lease 的原边界：`spawn` 从原 `_start` 前至其返回，`send` 从
+该返回至原 drain 返回，`response` 从 drain 返回至第一次退休，`cleanup` 从原退休
+至原 `_finish` 结束。当前 `phase` 另允许 `not_started/settled`；`settled` 只表示
+观察时钟冻结，清理是否成功仍看原 `cleanup` 与进程/readers 状态，不将失败收尾改为
+成功。总 `elapsed_ms` 与四个 `phase_ms` 分别向下取整，负量归零、上限为
+`2**31-1`；阶段分别取整之和可小于总量。没有墙上时间、绝对时间、PID、路径、
+argv、环境、原 stderr、异常或响应正文。所有操作内的采样开销仍计入原期限。
+
+这些量可以区分清理前活着/已退出、零前缀/未知非空前缀，以及原预算主要在哪个宿主
+边界消耗，不能据此区分底层 I/O 与调度或证明任何加载根因。没有额外进程、marker、
+读取协程、预热、重试、策略设置、第二份超时或 CI 调度。
+
+### 纯回归与独立失败边界
+
+根先在原 30 秒统一守卫运行两个反例：清理前仍运行且 stderr 零字节，与清理前已经
+退出且 stderr 含未知短内容。二者先验证原 `AXLeaseError` 身份/outcome、同一 owned
+process、一次发送和一次清理，再要求新前后事实；旧投影均在 `before_cleanup`
+缺失处失败。实际 `2 failed`、pytest 0.07 秒，守卫 590 毫秒、峰值 60.1 MiB、swap 0。
+
+实现后的测试复用原 pending fake harness，另覆盖完整白名单、半行/未知/前缀上限、
+晚 spawn 后准确接管、取消对象、reader 取消而无 EOF、相对毫秒取整/饱和/冻结、
+投影/时钟/收尾故障不覆盖原错，以及首 native 工厂 argv/once 与一次生命周期。
+根先在两个诊断文件完成53项，再整合native fixture/window/buttons/computer/invoke共
+七文件**150 passed**，pytest0.56秒、guard1.160秒、73.3MiB/swap0。限定strict mypy
+指出fake Process身份断言和模块私有绑定的类型表达，保持真实`is`语义修正；四文件
+最终strict mypy、Ruff与格式通过，类型检查608毫秒、242.3MiB。最后工厂命名空间
+表达修正后单项再验1 passed，guard728毫秒、65.3MiB。各步30秒守卫、实际exit0，
+没有在开发机执行真实子进程、PowerShell、COM或桌面。独立最终只读后审确认类型
+表达和工厂恢复断言没有弱化，未发现剩余P1/P2；真实Windows仍待新精确候选验收。
+
+同轮 3.13 job `120639318011` 则为独立的 Runtime 构造失败，UIA 正文通过；
+`test_channel_configuration_revocation_rejects_waiting_owner` 在首行 `make_runtime`
+内的第一次 optional 格式查询返回后触发一秒期限，尚未执行配置撤销主体。
+`format_read_observation` 为 `elapsed_ms=2255`、setup 366 ms、optional 1888 ms、
+queries 1、vm_steps 0；`3744 passed, 1457 skipped, 1 failed`。零 progress 回调不证明
+没有执行 SQLite；该失败仍如实保留。本片不改格式分类或预算，不用假时钟、skip 或
+后续不同候选成功掩盖此真实失败，也不把新增观察称为已修复 3.12 启动超时。
+
 ## native19 Windows 3.13：初始化之后的最小分叉（候选待验）
 
+以下保留 native19 的历史失败与当时方案，不作为当前 helper 的执行顺序。
 原 run `40029000745` 的 Windows 3.13 job `120672256773` 唯一失败仍为首个
 `test_real_windows_system_module_probe_mta_and_owned_unicode_tree`：`read_timeout`，
 调用 12.23 秒；全任务为 3692 passed、2017 skipped、1 failed，151.31 秒。
@@ -186,31 +260,33 @@ pytest 峰 61.8 MiB，整轮峰 314.2 MiB、swap 0，每条均由原 30 秒守�
 清理后的 lease closed/process handle exists/exit nonzero/readers settled/cleanup
 confirmed 只证明该拥有生命周期已收口，不证明 helper 在超时前自然异常退出。
 
-`uia_ready` 只在版本/MTA/程序集 GAC 核验返回后设置。此后原成功路径仍依次执行
-deadline 检查、`TreeWalker.ControlViewWalker` 静态 getter、两个有限容器构造、
-当前 Process 的 `MainWindowHandle` 和 `Dispose`、固定事实字段构造、成功 JSON 编码，
-之后才到 `probe_encoded`。这条 probe 没有调用 `Read-Targets`、`RootElement` 或
-读取 owned Unicode 窗口树；不能把窗口 provider 遍历当已证明原因。原阶段没有时间戳，
-12 秒又覆盖 spawn/导入/发送/响应，故不能区分哪一步阻塞或 `uia_ready` 是否在总期限
-将尽时才出现。后续其它候选 Windows 绿不构成本次超时已修复的证据。
+当时 `uia_ready` 之后的成功路径仍含 `TreeWalker.ControlViewWalker` 静态 getter、
+两个有限容器构造、当前 Process 的 `MainWindowHandle` 和 `Dispose`、字段构造与
+JSON 编码。该 probe 没有调用 `Read-Targets`、`RootElement` 或读取窗口树，不能
+把窗口 provider 遍历当已证明原因。原阶段没有时间戳，12 秒覆盖完整 operation，
+也不能区分哪一步阻塞或 `uia_ready` 是否临近总期限才出现。
 
-本轮仅增加上表三个边界：getter 紧前与返回后、当前进程属性读取及释放返回后；
-原 `probe_encoded` 继续标识 `Encode-Result` 成功返回。原标记编号 0–10 和原调用
-位置保持，新名称只追加为 11–13，由既有先置位、best-effort 固定 stderr writer
-输出；三处只在 `$traceProbe` 内，不跟踪后续 probe 或普通树请求。若 deadline 已
-在 getter 前耗尽，可能只保留 `uia_ready`；若 getter 后缺少后继标记，也仍须考虑
-标记写出/传输失败，不能直接断言该调用永久停滞。事实就绪后至 encoded 之间仍含
-原字段构造和编码，不将缺少 encoded 单独称为 JSON 根因。
+native19 当时在 getter 前后及当前进程属性读取/释放之后追加编号 11–13，分别为
+`walker_initializing`、`walker_ready`、`probe_process_ready`，沿原 best-effort writer，
+不增进程、重试、预热或期限。其原纯回归曾核唯一调用、阶段顺序、旧八/十一阶段兼容、
+重复/逆序和逐字节截断，不能替代真实 PowerShell 执行与因果证明。
 
-不移动或延迟 walker 初始化，不新增或替换属性读取、宿主 observer、进程、argv、
-预热、重试或诊断期限；原 12 秒、2048 字节 stderr 前缀、1 MB 会话累计和 4 KiB
-note 上限均保持。纯回归新增原单次 getter/进程属性调用与阶段相对顺序、旧八与十一
-阶段兼容、新名称重复/逆序；原逐字节/CRLF/前缀截断回归扩展至十四名称。源码静态
-约束不能替代 PowerShell 语法、真实执行、耗时分布或因果证明。
+该历史候选由根在原 30 秒守卫内串行验收：diagnostics、pending observation 与
+computer 三文件共 **68 passed**，pytest0.34s、守卫889ms、65.6MiB、swap0、exit0；
+相关 Python Ruff/格式及明确 `MYPYPATH=src:tests` 的限定 strict mypy 通过，
+类型检查守卫5.972s、331.6MiB、swap0、exit0。没有真实 PowerShell、进程或桌面。
+这些是合并前候选的记录，不证明本次整合通过或原 native19 超时根因已修复。
 
-根已在原30秒守卫内串行验收：专用 diagnostics、pending observation 与 computer
-三文件共 **68 passed**，pytest0.34s、守卫889ms、65.6MiB、swap0、exit0。
-相关 Python Ruff 通过，格式检查发现的一处换行已统一格式化；明确
-`MYPYPATH=src:tests` 的 helper 与专用测试 strict、no-incremental mypy通过，
-守卫5.972s、331.6MiB、swap0、exit0。没有运行真实 PowerShell、进程或桌面；
-这些纯回归不改变原 native19 的失败结论，也不证明超时根因已修复。
+## PR37 与当前 main 整合
+
+main 已将 walker、rows、reasons 与 visited 的初始化放入非 probe 分支。本次采用此
+行为，不能为保留两条历史标记而重新让 probe 访问 walker，也不能在没有实际 getter
+调用时输出 ready 标记。包内十四名称及原编号保留，读者仍可识别旧八、十一与十四
+阶段；当前只发十二个实际边界，包含当前进程读取和 Dispose 返回后的编号 13。
+原 UTF-8 输入、无 BOM 且严格编码的 stdout writer、成功/错误响应帧、Invoke outcome
+和最后写回路径不因冲突处理改变。
+
+对应纯静态回归同步核当前十二处 emitter、非 probe guard 中唯一 getter、真实
+process-ready 的相对顺序；旧十四名称的 codec、重复/逆序和截断回归保留。正式 native
+probe 不初始化 walker、真实窗口树及 Invoke 用例保持，由根统一受限检查和远端
+Windows 验证；本次编辑者未执行检查、实验、Git、PowerShell 或桌面。

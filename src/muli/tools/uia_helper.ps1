@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 
 $script:traceMask = 0
 $script:traceProbeSeen = $false
+# Preserve historical stage indices; probe no longer initializes the tree walker.
 $script:traceStages = @(
     'muli-uia-stage=1:script_entered',
     'muli-uia-stage=1:utility_importing',
@@ -423,12 +424,12 @@ try {
             $script:watch = [Diagnostics.Stopwatch]::StartNew()
             Initialize-Uia
             Check-Deadline
-            if ($traceProbe) { Write-Stage 11 }
-            $script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-            if ($traceProbe) { Write-Stage 12 }
-            $script:rows = [Collections.Generic.List[object]]::new()
-            $script:reasons = [Collections.Generic.HashSet[string]]::new()
-            $script:visited = 0
+            if ([string]$request.command -cne 'probe') {
+                $script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+                $script:rows = [Collections.Generic.List[object]]::new()
+                $script:reasons = [Collections.Generic.HashSet[string]]::new()
+                $script:visited = 0
+            }
             switch -CaseSensitive ([string]$request.command) {
                 'probe' {
                     $process = [Diagnostics.Process]::GetCurrentProcess()

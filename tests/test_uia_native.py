@@ -20,6 +20,7 @@ from helpers.uia_native_startup import observe_native_form
 from helpers.uia_probe_diagnostics import (
     PENDING_SCRIPT,
     PendingHelperLease,
+    ProbeHelperLease,
     observe_pending,
     observe_probe,
     pending_received,
@@ -78,6 +79,50 @@ async def discover(computer: Computer, form: NativeForm) -> str:
     return str(matches[0]["target_id"])
 
 
+async def test_real_windows_probe_does_not_initialize_the_tree_walker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = Path(module.__file__).with_name("uia_helper.ps1")
+    source = helper.read_text(encoding="utf-8")
+    initialization = "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker"
+    assert source.count(initialization) == 1
+    script = tmp_path / "owned-probe-without-walker.ps1"
+    script.write_bytes(
+        source.replace(
+            initialization,
+            "throw [System.InvalidOperationException]::new('muli-test-tree-walker-forbidden')",
+        ).encode("utf-8")
+    )
+    computer = Computer(settings(), owner=lambda: ("native-ci", "probe-without-walker"))
+
+    def owned_probe(
+        argv: list[str], *, timeout: float, ttl: float, max_nodes: int, once: bool = False
+    ) -> ProbeHelperLease:
+        assert once and argv[-1] == str(helper)
+        return ProbeHelperLease(
+            [*argv[:-1], str(script)],
+            timeout=timeout,
+            ttl=ttl,
+            max_nodes=max_nodes,
+            once=once,
+        )
+
+    with monkeypatch.context() as construction:
+        construction.setattr(module, "AXHelperLease", owned_probe)
+        probe = computer._uia._new_lease(once=True)
+    try:
+        result = await observe_probe(probe)
+        assert result["dependency_available"] is True and result["session_accessible"] is None
+        assert result["apartment"] == "MTA" and result["has_window"] is False
+        assert result["no_profile"] is True and result["non_interactive"] is True
+        assert result["module_autoloading"] == "None"
+    finally:
+        await computer.aclose()
+        assert probe.closed and probe._process is not None
+        assert probe._process.returncode is not None
+        assert probe._count == 1 and all(reader.done() for reader in probe._readers)
+
+
 async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
     native_form: NativeForm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -94,7 +139,10 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
         return await original_spawn(*argv, **kwargs)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    probe = computer._uia._new_lease(once=True)
+    # Observe only this original factory call; later UIA leases stay unchanged.
+    with monkeypatch.context() as construction:
+        construction.setattr(module, "AXHelperLease", ProbeHelperLease)
+        probe = computer._uia._new_lease(once=True)
     try:
         result = await observe_probe(probe)
         assert result["apartment"] == "MTA" and result["has_window"] is False

@@ -43,6 +43,7 @@ from muli.platforms.managed_deployment import (
     DeploymentAnchor,
     DeploymentStore,
     SlotIdentity,
+    verify_current_process,
     verify_current_slot,
 )
 from muli.platforms.managed_launcher import resolve_entry
@@ -253,7 +254,9 @@ async def run_managed_helper(
                 current, current_controller, _ = _record(control, anchor)
                 if current.generation != original.generation or current_controller != controller:
                     raise TransactionError("transaction_changed")
-                verify_current_slot(controller)
+                # _record just authenticated all controller files. Only the
+                # current process identity remains in this synchronous segment.
+                verify_current_process(controller)
                 snapshot = await observed.read_helper(
                     managed_helper_unit_name(original),
                     managed_helper_arguments(anchor, controller),
@@ -261,9 +264,10 @@ async def run_managed_helper(
                 )
                 if snapshot.process.pid != os.getpid():
                     raise TransactionError("foreign_helper_process")
-                verify_current_slot(controller)
-                if _record(control, anchor)[0] != current:
+                after, after_controller, _ = _record(control, anchor)
+                if after != current or after_controller != controller:
                     raise TransactionError("transaction_changed")
+                verify_current_process(controller)
 
             # Authenticate the real helper before creating even a backend
             # client; each subsequent drive step repeats this authentication.

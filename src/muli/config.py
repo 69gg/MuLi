@@ -14,7 +14,7 @@ from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from muli.reply_origin import authorize_route, channel_account
+from muli.reply_origin import authorize_route, channel_account, validate_onebot_owners
 from muli.system_events import SystemEventsSettings
 
 
@@ -154,7 +154,7 @@ class ModelProfile(Section):
     base_url: str = ""
     api_key: str = ""
     api_key_env: str = ""
-    max_output_tokens: int = Field(default=4096, ge=128, le=131072)
+    max_output_tokens: int | None = Field(default=None, strict=True, ge=128, le=131072)
     timeout: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=2, ge=0, le=5)
     stream: bool = True
@@ -175,6 +175,12 @@ class ModelProfile(Section):
     @property
     def configured(self) -> bool:
         return bool(self.model and self.base_url)
+
+    @model_validator(mode="after")
+    def required_output_limit(self) -> ModelProfile:
+        if self.configured and self.protocol == "anthropic" and self.max_output_tokens is None:
+            raise ValueError("Anthropic Messages 必须填写正整数 max_output_tokens")
+        return self
 
 
 class Models(Section):
@@ -344,6 +350,7 @@ class VoiceSettings(Section):
     speaker_command: list[str] = Field(default_factory=list)
     speaker_threshold: float = Field(default=0.75, ge=0, le=1)
     tts_enabled: bool = False
+    reply_enabled: bool = False
 
 
 class ChannelProfile(Section):
@@ -444,6 +451,11 @@ class ChannelSettings(Section):
     max_attempts: int = Field(default=3, ge=1)
     retry_backoff_seconds: float = Field(default=5, ge=0)
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
+
+    @model_validator(mode="after")
+    def validate_onebot_owner(self) -> ChannelSettings:
+        validate_onebot_owners(self.onebot.owner_ids, enabled=self.onebot.enabled)
+        return self
 
     def validate_proactive_destination(
         self, destination: WebDestination | ChannelDestination | None = None

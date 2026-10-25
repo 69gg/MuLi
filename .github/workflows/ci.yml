@@ -41,7 +41,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest]
         python: ['3.12', '3.13']
         include:
           - os: ubuntu-latest
@@ -56,13 +56,25 @@ jobs:
           - os: ubuntu-latest
             python: '3.13'
             shard: 2
+          - os: windows-latest
+            python: '3.12'
+            shard: 1
+          - os: windows-latest
+            python: '3.12'
+            shard: 2
+          - os: windows-latest
+            python: '3.13'
+            shard: 1
+          - os: windows-latest
+            python: '3.13'
+            shard: 2
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --locked
+      - run: uv sync --locked --extra channels
       - name: Report SQLite runtime
         run: uv run python -c "import sqlite3, sys; print(sys.version); print('SQLite', sqlite3.sqlite_version)"
       - name: Prepare Linux recovery filesystem fixture
@@ -84,11 +96,11 @@ jobs:
           export MULI_MANAGED_TEST_ROOT="$directory"
           uv run python -c "import os; from pathlib import Path; from muli.platforms.filesystem_identity import verify_local_filesystems; verify_local_filesystems((Path(os.environ['MULI_MANAGED_TEST_ROOT']),))"
           printf 'MULI_MANAGED_TEST_ROOT=%s\n' "$directory" >> "$GITHUB_ENV"
-      - name: Run complete suite on macOS and Windows
-        if: runner.os != 'Linux'
+      - name: Run complete suite on macOS
+        if: ${{ !matrix.shard }}
         run: uv run pytest -q --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
-      - name: Run disjoint Linux suite partition
-        if: runner.os == 'Linux'
+      - name: Run disjoint suite partition
+        if: ${{ matrix.shard }}
         run: uv run pytest -q --muli-ci-shard=${{ matrix.shard }} --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
       - name: Release Linux recovery filesystem fixture
         if: always() && runner.os == 'Linux'
@@ -122,13 +134,7 @@ jobs:
       - run: uv sync --locked --extra mcp --extra channels
       - run: >-
           uv run --extra mcp --extra channels pytest -q -o faulthandler_timeout=60
-          tests/test_mcp.py tests/test_channels.py tests/test_mcp_policy.py
-          tests/test_mcp_receive.py tests/test_mcp_receive_integration.py
-          tests/test_mcp_receive_notifications.py tests/test_mcp_resources.py
-          tests/test_mcp_resources_runtime.py tests/test_mcp_resources_sdk.py
-          tests/test_mcp_resource_files.py
-          tests/test_mcp_prompts.py tests/test_mcp_prompts_runtime.py
-          tests/test_mcp_prompts_sdk.py
+          tests/test_mcp*.py tests/test_team_progress*.py tests/test_channels.py
   managed-native:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

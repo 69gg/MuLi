@@ -6,6 +6,10 @@ dist/
 wheels/
 *.egg-info
 
+# Local illustration originals and rendering scratch files
+output/imagegen/
+tmp/imagegen/
+
 # Virtual environments
 .venv
 

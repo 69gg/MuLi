@@ -131,7 +131,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     refreshSessions = async () => {}; refreshNotifications = async () => {}; queueRender = () => {};
     const owner = beginConnection(); owner.ready = true;
     owner.sessions.start(); owner.notifications.start();
-    globalThis.ui = { state, renderHistoryEntry, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
+    globalThis.ui = { state, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
       get slot() { return historyDialog; }, get draftRevision() { return draftRevision; },
       stopEvents() { globalController?.abort(); sessionController?.abort(); } };
   `, context);
@@ -156,12 +156,10 @@ function contentPage(item, content = item.content, offset = 0, total = item.cont
   return { session_id: "main", message_id: item.id, seq: item.seq, revision: item.revision, role: item.role, content_provenance: item.content_provenance, field: "content", content, total_bytes: total, offset_bytes: offset, length_bytes: length, next_offset_bytes: offset + length, has_more: offset + length < total, ...extra };
 }
 
-test("the main entry is a real button, starts at latest saved records and does not derive a cursor from pending ingress", async () => {
+test("the main archive starts at latest saved records and does not derive a cursor from pending ingress", async () => {
   const h = harness(async () => directory());
   h.ui.state.session.messages = [{ id: "pending", seq: 9000, role: "user", delivery_status: "pending" }];
-  h.ui.renderHistoryEntry(); h.ui.renderHistoryEntry();
-  assert.equal(h.document.querySelectorAll("#history-archive-entry").length, 1);
-  await h.click(h.button("已保存记录", h.document.body));
+  await h.ui.showHistoryArchive("main");
   assert.deepEqual(h.requests.map((entry) => entry.path), ["/sessions/main/messages?limit=50"]);
   assert.equal(h.requests[0].cache, "no-store");
   assert.ok(h.requests[0].signal instanceof AbortSignal);
@@ -360,7 +358,7 @@ test("native replaceChildren converts false and null to text but archive conditi
 
 test("closing an in-flight archive aborts it, clears retained pages and ignores a late response", async () => {
   const gate = deferred(), h = harness(async () => gate.promise);
-  h.ui.renderHistoryEntry(); const trigger = h.button("已保存记录", h.document.body);
+  const trigger = h.node("button", "archive-trigger", h.other);
   const reading = h.ui.showHistoryArchive("main", { trigger }); const slot = h.ui.slot;
   h.dialog.close(); await flush();
   assert.equal(h.requests[0].signal.aborted, true); assert.equal(h.ui.slot === null, true);

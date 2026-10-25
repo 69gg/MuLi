@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
@@ -509,11 +509,30 @@ def _observation(error: FormatEvidenceError) -> dict[str, Any]:
     prefix = "format_read_observation="
     assert notes[0].startswith(prefix)
     value: dict[str, Any] = json.loads(notes[0][len(prefix) :])
-    assert set(value) == {"elapsed_ms", "phase_ms", "failure_phase", "queries", "vm_steps"}
+    assert set(value) == {
+        "elapsed_ms",
+        "phase_ms",
+        "failure_phase",
+        "queries",
+        "vm_steps",
+        "begin_call",
+    }
+    assert all(
+        type(value[key]) is int and 0 <= value[key] <= 2**31 - 1
+        for key in ("elapsed_ms", "queries", "vm_steps")
+    )
     assert set(value["phase_ms"]) == set(evidence_module._PHASES)
     assert value["failure_phase"] in evidence_module._PHASES
     assert all(type(item) is int and 0 <= item <= 2**31 - 1 for item in value["phase_ms"].values())
     assert sum(value["phase_ms"].values()) <= value["elapsed_ms"]
+    begin = value["begin_call"]
+    assert isinstance(begin, dict)
+    assert set(begin) == {"wall_ms", "thread_cpu_ms", "return_gap_ms", "returned"}
+    assert type(begin["returned"]) is bool
+    assert all(
+        begin[key] is None or (type(begin[key]) is int and 0 <= begin[key] <= 2**31 - 1)
+        for key in ("wall_ms", "thread_cpu_ms", "return_gap_ms")
+    )
     return value
 
 
@@ -639,6 +658,19 @@ def test_setup_and_classification_failures_have_bounded_observation(
     assert value["failure_phase"] == phase
     assert "private" not in caught.value.__notes__[0]
     assert not reader.in_transaction
+    if phase == "setup":
+        assert value["begin_call"] == {
+            "wall_ms": None,
+            "thread_cpu_ms": None,
+            "return_gap_ms": None,
+            "returned": False,
+        }
+    elif phase == "begin":
+        assert value["begin_call"]["returned"] is False
+        assert value["begin_call"]["wall_ms"] is not None
+        assert value["begin_call"]["return_gap_ms"] is None
+    else:
+        assert value["begin_call"]["returned"] is True
 
 
 def test_vm_budget_remains_fail_closed_and_observed(
@@ -651,3 +683,134 @@ def test_vm_budget_remains_fail_closed_and_observed(
     value = _observation(caught.value)
     assert value["vm_steps"] == 1
     assert not reader.in_transaction
+
+
+@pytest.mark.parametrize("location", ["inside_call", "after_return"])
+def test_begin_observation_calibrates_call_time_and_return_gap_without_relaxing_deadline(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection],
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    """Calibrate two indistinguishable old observations, not the macOS failure's cause."""
+    path, writer, reader = database
+    with writer:
+        writer.execute(
+            "UPDATE runtime_state SET value=? WHERE name='store_instance_v1'",
+            ("private_begin_secret",),
+        )
+    before = _facts(writer)
+    wall, cpu = [0.0], [0.0]
+    original_rows = evidence_module._rows
+    queries: list[str] = []
+    begin_transactions: list[bool] = []
+
+    def rows(
+        db: sqlite3.Connection,
+        sql: str,
+        parameters: Sequence[object] = (),
+        *,
+        limit: int = 1,
+    ) -> list[tuple[Any, ...]]:
+        result = original_rows(db, sql, parameters, limit=limit)
+        queries.append(sql)
+        if sql == "BEGIN":
+            begin_transactions.append(db.in_transaction)
+            if location == "inside_call":
+                # The real statement returned; only this controlled call's clock advances.
+                wall[0], cpu[0] = 1.004, 0.005
+        return result
+
+    monkeypatch.setattr(evidence_module, "monotonic", lambda: wall[0])
+    monkeypatch.setattr(evidence_module, "thread_time", lambda: cpu[0], raising=False)
+    monkeypatch.setattr(evidence_module, "_rows", rows)
+    if location == "after_return":
+        original_begin = evidence_module._Reader.begin
+
+        def begin(self: evidence_module._Reader) -> None:
+            original_begin(self)
+            assert self.db.in_transaction
+            # This delay is outside the complete original BEGIN call, before the next move.
+            wall[0], cpu[0] = 1.004, 0.005
+
+        monkeypatch.setattr(evidence_module._Reader, "begin", begin)
+
+    with pytest.raises(FormatEvidenceError) as caught:
+        evidence_module.read_optional_format_evidence(reader)
+    error = caught.value
+    assert error.code == str(error) == "format_read_timeout"
+    value = _observation(error)
+    assert value["failure_phase"] == "optional"
+    assert value["elapsed_ms"] == value["phase_ms"]["begin"] == 1004
+    assert value["queries"] == value["vm_steps"] == 0
+    assert value["begin_call"] == {
+        "wall_ms": 1004 if location == "inside_call" else 0,
+        "thread_cpu_ms": 5 if location == "inside_call" else 0,
+        "return_gap_ms": 0 if location == "inside_call" else 1004,
+        "returned": True,
+    }
+    assert begin_transactions == [True]
+    assert queries.count("BEGIN") == queries.count("ROLLBACK") == 1
+    assert not any(sql.startswith("SELECT name,type FROM main.sqlite_schema") for sql in queries)
+    assert not reader.in_transaction and reader.total_changes == 0
+    assert _facts(writer) == before
+    note = error.__notes__[0]
+    assert all(
+        secret not in note for secret in (str(path), "private_begin_secret", "SELECT", "BEGIN")
+    )
+
+
+@pytest.mark.parametrize("cpu_error", [None, OSError, NotImplementedError])
+def test_unavailable_thread_clock_does_not_replace_original_format_timeout(
+    database: tuple[Path, sqlite3.Connection, sqlite3.Connection],
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_error: type[Exception] | None,
+) -> None:
+    path, writer, reader = database
+    before = _facts(writer)
+    clock = [0.0]
+    original_rows = evidence_module._rows
+    queries: list[str] = []
+
+    def rows(
+        db: sqlite3.Connection,
+        sql: str,
+        parameters: Sequence[object] = (),
+        *,
+        limit: int = 1,
+    ) -> list[tuple[Any, ...]]:
+        result = original_rows(db, sql, parameters, limit=limit)
+        queries.append(sql)
+        if sql == "BEGIN":
+            clock[0] = 1.004
+        return result
+
+    def unavailable_cpu() -> float:
+        assert cpu_error is not None
+        raise cpu_error("private_cpu_clock_secret")
+
+    monkeypatch.setattr(evidence_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        evidence_module,
+        "thread_time",
+        None if cpu_error is None else unavailable_cpu,
+        raising=False,
+    )
+    monkeypatch.setattr(evidence_module, "_rows", rows)
+    with pytest.raises(FormatEvidenceError) as caught:
+        evidence_module.read_optional_format_evidence(reader)
+    error = caught.value
+    assert error.code == str(error) == "format_read_timeout"
+    value = _observation(error)
+    assert value["failure_phase"] == "optional" and value["queries"] == 0
+    assert value["begin_call"] == {
+        "wall_ms": 1004,
+        "thread_cpu_ms": None,
+        "return_gap_ms": 0,
+        "returned": True,
+    }
+    assert queries.count("BEGIN") == queries.count("ROLLBACK") == 1
+    assert not reader.in_transaction and reader.total_changes == 0
+    assert _facts(writer) == before
+    assert (
+        str(path) not in error.__notes__[0] and "private_cpu_clock_secret" not in error.__notes__[0]
+    )

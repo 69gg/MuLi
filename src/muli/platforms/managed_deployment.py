@@ -264,9 +264,14 @@ def verify_slot_files(slot: SlotIdentity) -> None:
 
 def verify_current_slot(slot: SlotIdentity) -> None:
     """Verify this process; sharing the same resolved Python is insufficient."""
+    verify_slot_files(slot)
+    verify_current_process(slot)
+
+
+def verify_current_process(slot: SlotIdentity) -> None:
+    """Check process identity after the caller's synchronous full slot check."""
     import muli
 
-    verify_slot_files(slot)
     if (
         str(Path(sys.executable).absolute()) != slot.lexical_python
         or str(Path(sys.prefix).absolute()) != slot.prefix

@@ -137,6 +137,13 @@ class MemoryInput(Input):
     confidence: float = Field(default=1, ge=0, le=1)
 
 
+class MemoryIndexInput(Input):
+    action: Literal["start", "status", "cancel"]
+    source_ids: list[Annotated[str, Field(min_length=1, strict=True)]] | None = None
+    key: str | None = Field(default=None, min_length=1, strict=True)
+    plan_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$", strict=True)
+
+
 class WorkflowInput(Input):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
@@ -168,6 +175,7 @@ class ReminderInput(Input):
     due_at: float
     content: str = Field(default="", max_length=4000)
     interval_seconds: int | None = Field(default=None, ge=60, le=31536000)
+    commitment_id: str | None = Field(default=None, min_length=1)
 
 
 def create_app(
@@ -222,7 +230,9 @@ def _create_app(
     attachments = Attachments(runtime.store, runtime.data_dir / "attachments", config)
     local_services = LocalServices(runtime, attachments)
     web_voice = WebVoiceInput(local_services)
-    memory_application = MemoryApplication(runtime, local_services.media)
+    memory_application = MemoryApplication(
+        runtime, local_services.media, attachment_reader=local_services.memory_attachment
+    )
     channel_application = ChannelApplication(runtime, attachments)
     personal_io = PersonalIO(runtime, local_services, attachments)
     from muli.integrations.manager import IntegrationManager
@@ -256,6 +266,7 @@ def _create_app(
         if runtime.extensions.configuration_only(config.settings, target):
             await runtime.extensions.apply_locked(target, persist=True)
             return
+        memory_application.pipeline.check_index_budget(target.limits.max_output_chars * 4)
         previous = config.settings.model_copy(deep=True)
 
         async def rebuild() -> None:
@@ -715,6 +726,7 @@ def _create_app(
     async def inspect_task(
         identifier: str,
         section: str = "overview",
+        agent_id: Annotated[str | None, Query(min_length=1)] = None,
         cursor: Annotated[str | None, Query(min_length=1)] = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
         query: str | None = None,
@@ -727,6 +739,7 @@ def _create_app(
         return local_services.task_inspection.read(
             identifier,
             section=section,
+            agent_id=agent_id,
             cursor=cursor,
             limit=limit,
             query=query,
@@ -1016,6 +1029,17 @@ def _create_app(
     async def memory_status() -> dict[str, Any]:
         return memory_application.pipeline.status()
 
+    @app.post("/api/memory/reindex")
+    async def memory_reindex(body: MemoryIndexInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = memory_application.reindex(body.model_dump(exclude_none=True))
+            pipeline = memory_application.pipeline
+        if body.action != "status":
+            await pipeline._publish()
+        return result
+
     @app.get("/api/channels")
     async def channel_status() -> dict[str, Any]:
         return {
@@ -1137,14 +1161,17 @@ def _create_app(
 
     @app.patch("/api/sessions/{session_id}")
     async def update_session(session_id: str, body: SessionInput) -> dict[str, Any]:
-        session = runtime.store.get("session", session_id)
-        if not session:
-            raise KeyError(session_id)
-        if session_id in runtime.tasks:
-            raise HTTPException(409, "运行中不能变更会话权限")
-        session.update(body.model_dump(exclude_unset=True, exclude_none=True))
-        session["updated_at"] = now()
-        return runtime.store.put("session", session)
+        async with runtime.configuration_lock:
+            session = runtime.store.get("session", session_id)
+            if not session:
+                raise KeyError(session_id)
+            if session_id in runtime.tasks:
+                raise HTTPException(409, "运行中不能变更会话权限")
+            previous_mode = session["mode"]
+            session.update(body.model_dump(exclude_unset=True, exclude_none=True))
+            session["updated_at"] = now()
+            with runtime.store.db:
+                return runtime._store_session(session, previous_mode=previous_mode)
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:
@@ -1346,6 +1373,21 @@ def _create_app(
     @app.post("/api/workflow-runs/{identifier}/cancel")
     async def cancel_workflow(identifier: str) -> dict[str, Any]:
         return await runtime.workflows.cancel(identifier)
+
+    @app.get("/api/workflow-schedules")
+    async def workflow_schedules(
+        after_id: Annotated[str, Query(max_length=200)] = "",
+        limit: Annotated[int, Query(ge=1, le=50)] = 50,
+    ) -> dict[str, Any]:
+        return runtime.scheduled_workflows.list(after_id=after_id, limit=limit)
+
+    @app.post("/api/workflow-schedules/{identifier}/cancel")
+    async def cancel_workflow_schedule(identifier: str) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            runtime.maintenance.require_configuration()
+            return await runtime.scheduled_workflows.cancel(identifier)
 
     @app.delete("/api/workflows/{identifier}")
     async def delete_workflow(identifier: str) -> dict[str, bool]:

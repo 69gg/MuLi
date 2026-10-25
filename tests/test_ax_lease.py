@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -139,6 +140,48 @@ async def test_serial_requests_keep_one_process_and_return_only_result() -> None
     finally:
         await item.aclose()
     await item.aclose()
+    assert_reaped(item)
+
+
+@pytest.mark.parametrize("timeout", [2.0, 0.1])
+async def test_request_frame_never_rounds_above_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout: float
+) -> None:
+    item = lease(timeout=timeout)
+    # Adjacent values across a binary exponent boundary reproduce the Windows
+    # (now + timeout) - now rounding without changing the real event loop clock.
+    current = math.nextafter(float(2**30), 0.0)
+    loop = Mock(spec=asyncio.AbstractEventLoop, wraps=asyncio.get_running_loop())
+    loop.time.return_value = current
+    monkeypatch.setattr(item, "_loop", loop)
+    item.expires_at = current + 10
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.returncode = 0
+    process.stdin = Mock(spec=asyncio.StreamWriter)
+    process.stdin.drain = AsyncMock(return_value=None)
+
+    def respond(raw: bytes) -> None:
+        request = json.loads(raw)
+        item._response(
+            json.dumps(
+                {
+                    "v": 1,
+                    "request_id": request["request_id"],
+                    "result": {"timeout": request["limits"]["timeout_seconds"]},
+                }
+            ).encode("utf-8")
+        )
+
+    async def start() -> None:
+        item._process, item._state = process, "in_flight"
+
+    process.stdin.write.side_effect = respond
+    monkeypatch.setattr(item, "_start", start)
+    try:
+        result = await item.request("snapshot", {})
+        assert 0 < result["timeout"] <= timeout
+    finally:
+        await item.aclose()
     assert_reaped(item)
 
 

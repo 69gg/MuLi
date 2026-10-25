@@ -399,7 +399,10 @@ class AXHelperLease:
                             "command": command,
                             "payload": payload,
                             "limits": {
-                                "timeout_seconds": max(0, operation_deadline - self._loop.time()),
+                                "timeout_seconds": max(
+                                    0,
+                                    min(self._timeout, operation_deadline - self._loop.time()),
+                                ),
                                 "max_nodes": self._max_nodes,
                                 "max_response_chars": self._max_response_chars,
                             },

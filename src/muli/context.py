@@ -17,13 +17,15 @@ class ContextLimitError(ValueError):
     """保留必要消息和完整协议数据后仍无法满足预算。"""
 
 
-def _size(messages: Sequence[Message]) -> int:
+def context_size(messages: Sequence[Message]) -> int:
+    """Measure JSON text context, excluding inline media bytes and local source identities."""
     return len(json.dumps([_text_data(message) for message in messages], ensure_ascii=False))
 
 
 def _text_data(message: Message) -> dict[str, object]:
     """Inline image bytes have a separate media budget, not a text-token budget."""
     data = asdict(message)
+    data.pop("source_message_id")  # Local provenance is not part of the provider text budget.
     for image in data["images"]:
         image["data"] = f"[inline image: {len(image['data'])} base64 chars]"
     return data
@@ -128,7 +130,7 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
         raise ValueError("上下文字符预算必须是正整数")
     packed = deepcopy(list(messages))
     _validate_pairs(packed)
-    current_size = _size(packed)
+    current_size = context_size(packed)
     if current_size <= max_chars:
         return packed
 
@@ -159,7 +161,7 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
                 break
 
     _validate_pairs(packed)
-    if _size(packed) > max_chars:
+    if context_size(packed) > max_chars:
         raise ContextLimitError(
             "最新用户输入、完整任务说明、系统提示、当前轮原生协议数据或需完整保留的工具结果"
             "超过上下文字符预算；"

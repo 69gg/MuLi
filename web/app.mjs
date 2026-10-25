@@ -1,5 +1,5 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
-import { MODES, createSessionState, applyEvent, hydrateSession, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
+import { MODES, createSessionState, applyEvent, hydrateSession, conversationItems, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
 import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
@@ -8,6 +8,7 @@ import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
 import { createTaskControl, taskControlView } from "./task-control.mjs";
 import { VoiceInput, mergeTranscript } from "./voice-input.mjs";
+import { initializeConversationWidth } from "./conversation-layout.mjs";
 
 const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -53,12 +54,12 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const state = {
   view: "chat", status: null, connected: false, streamConnected: true, loading: true,
   sessions: [], activeSession: null, session: createSessionState(), mode: "auto", sending: false,
-  timelineOpen: false, sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
+  sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
   viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
-  timelineUserChoice: false, mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
-  team: { members: [], messages: [] }, recordQuery: "",
+  mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
+  team: { members: [], messages: [] }, recordQuery: "", approvals: [], approvalsError: "",
   auth: { required: false, authenticated: false },
 };
 let sessionController = null;
@@ -68,7 +69,6 @@ let sessionRequestVersion = 0;
 let viewRequestVersion = 0;
 let queuedRender = false;
 let messageNodes = new Map();
-let toolNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
 let dialogMemoryReturn = null;
@@ -90,6 +90,12 @@ const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
 let draftRevision = 0;
+let conversationLayout = null;
+let conversationFollowing = true;
+let conversationFollowFrame = null;
+let conversationResizeObserver = null;
+let conversationScrollIntent = null;
+let conversationTouchY = null;
 const voiceInput = new VoiceInput({
   upload: uploadFile, transcribe: transcribeAttachment,
   onUploaded: (file) => { state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
@@ -191,15 +197,18 @@ function connectionCurrent(owner) {
 
 function invalidateConnection() {
   const owner = connection; connection = null;
-  owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.controller.abort();
+  owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
   teamPager.invalidate?.();
   state.connected = false; state.streamConnected = false;
+  state.approvals = []; state.approvalsError = "";
+  $("#approval-region")?.replaceChildren();
+  if (state.view === "notifications" && state.notificationTab === "approvals") $("#other-view")?.replaceChildren();
 }
 
 function beginConnection() {
   invalidateConnection();
-  const owner = { controller: new AbortController(), ready: false, position: "0" };
+  const owner = { controller: new AbortController(), ready: false, position: "0", approvalDecisions: new Set(), approvalEpoch: null };
   connection = owner;
   owner.sessions = createSummaryLane({
     current: () => connectionCurrent(owner), read: () => ownedRequest("/sessions", {}, owner),
@@ -215,8 +224,24 @@ function beginConnection() {
     current: () => connectionCurrent(owner), read: () => ownedRequest("/notifications", {}, owner),
     publish: (payload) => {
       state.notifications = collection(payload); renderChrome();
-      if (state.view === "notifications") renderOtherView();
+      if (state.view === "notifications" && state.notificationTab !== "approvals") renderOtherView();
     },
+  });
+  owner.approvals = createSummaryLane({
+    current: () => connectionCurrent(owner),
+    read: async () => {
+      const epoch = owner.approvalEpoch;
+      try { return { epoch, payload: await ownedRequest("/approvals", { cache: "no-store" }, owner) }; }
+      catch (error) { return { epoch, error }; }
+    },
+    publish: ({ epoch, payload, error }) => {
+      if (epoch !== owner.approvalEpoch) return;
+      if (error) throw error;
+      const items = payload?.items;
+      if (!Array.isArray(items) || items.some((item) => !item || typeof item.id !== "string" || !item.id || typeof item.session_id !== "string" || !item.session_id || typeof item.run_id !== "string" || !item.run_id || typeof item.tool !== "string" || typeof item.reason !== "string" || item.status !== "pending" || !item.arguments || typeof item.arguments !== "object" || Array.isArray(item.arguments)) || new Set(items.map((item) => item.id)).size !== items.length) throw new Error("审批目录无效，请刷新。");
+      state.approvals = items; state.approvalsError = ""; renderApprovalViews();
+    },
+    failed: (error) => { state.approvals = []; state.approvalsError = error.message; renderApprovalViews(); },
   });
   return owner;
 }
@@ -331,25 +356,15 @@ function renderChrome() {
   $("#connection-banner").hidden = !warning;
   $("#connection-banner-text").textContent = !state.connected ? "服务暂未连接，输入内容会保留。" : "实时连接中断，正在重新连接。";
   const unread = state.notifications.filter((item) => !item.read).length;
-  $("#notification-count").hidden = !unread;
-  $("#notification-count").textContent = String(unread);
-  $("#inbox-attention").hidden = !unread;
+  const needsAttention = unread + state.approvals.length;
+  $("#notification-count").hidden = !needsAttention;
+  $("#notification-count").textContent = String(needsAttention);
+  $("#notification-count").setAttribute("aria-label", `${unread} 条未读通知，${state.approvals.length} 项待批准`);
+  $("#inbox-attention").hidden = !needsAttention && !state.approvalsError;
   $("#chat-view").hidden = state.view !== "chat";
+  if (state.view === "chat") conversationLayout?.refresh();
   $("#management-shell").hidden = state.view === "chat";
   $("#settings-toggle").setAttribute("aria-pressed", String(state.view !== "chat"));
-  $("#timeline-toggle").hidden = state.view !== "chat";
-  $("#timeline").hidden = state.view !== "chat" || !state.timelineOpen;
-  $("#timeline-toggle").setAttribute("aria-pressed", String(state.timelineOpen));
-  renderHistoryEntry();
-}
-
-function renderHistoryEntry() {
-  let entry = $("#history-archive-entry");
-  if (!entry) {
-    entry = element("div", { id: "history-archive-entry", class: "history-archive-entry" }, element("button", { id: "history-archive-button", type: "button", class: "text-button", text: "已保存记录", onClick: (event) => void showHistoryArchive(state.mainSessionId, { trigger: event.currentTarget }) }));
-    $("#conversation-scroll").prepend(entry);
-  }
-  entry.hidden = state.view !== "chat" || !state.connected || !state.mainSessionId;
 }
 
 function renderSessions() {
@@ -367,49 +382,124 @@ function renderComposer() {
   $("#send-button").setAttribute("aria-label", running ? "发送补充消息" : "发送消息");
   $("#stop-button").hidden = !running;
   $("#stop-button").disabled = state.sending || !state.activeSession;
-  $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "持续对话";
+  $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "";
+  $("#composer-context").hidden = !state.session.queued?.length;
   $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
   $("#composer-status").textContent = state.uploading ? `正在保存 ${state.uploading} 个附件…` : !state.connected ? state.loading ? "正在连接沐璃" : "等待服务连接" : !state.status?.configured ? "请先配置主模型" : running ? state.session.status === "approval" ? "等待批准 · 可以继续补充" : "正在处理 · 可以继续补充" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
   renderVoiceInput();
-}
-
-function scrollIsNearBottom() {
-  const scroll = $("#conversation-scroll");
-  return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 100;
+  scheduleConversationTail();
 }
 
 function scrollToBottom(force = false, smooth = false) {
-  if (!force && !scrollIsNearBottom()) return;
+  if (!force && !conversationFollowing) return;
+  conversationFollowing = true;
+  conversationScrollIntent = null;
+  writeConversationTail(smooth);
+}
+
+function writeConversationTail(smooth = false) {
+  if (state.view !== "chat") return;
   const scroll = $("#conversation-scroll");
+  if (scroll.clientHeight <= 0) return;
   scroll.scrollTo({ top: scroll.scrollHeight, behavior: smooth ? "smooth" : "instant" });
   $("#scroll-bottom").hidden = true;
 }
 
+function scheduleConversationTail() {
+  if (!conversationResizeObserver && typeof ResizeObserver === "function") {
+    conversationResizeObserver = new ResizeObserver(scheduleConversationTail);
+    for (const selector of ["#conversation-scroll", "#messages", "#approval-region", "#run-status", ".composer-area", "#composer"]) {
+      const node = $(selector);
+      if (node) conversationResizeObserver.observe(node);
+    }
+  }
+  if (state.view !== "chat") return;
+  const follow = () => {
+    conversationFollowFrame = null;
+    if (conversationFollowing && state.view === "chat" && $("#conversation-scroll").clientHeight > 0) writeConversationTail();
+  };
+  if (typeof requestAnimationFrame !== "function") { follow(); return; }
+  if (conversationFollowFrame === null) conversationFollowFrame = requestAnimationFrame(follow);
+}
+
+function mainScrollTarget(event, keyboard = false) {
+  const scroll = $("#conversation-scroll");
+  let node = event.target;
+  while (node && node !== scroll) {
+    if (node.matches?.('.reasoning-content, textarea, input, select, [contenteditable], [role="separator"]')) return false;
+    // Space activates these controls; navigation keys may still scroll the
+    // main viewport, which the following scroll event must confirm.
+    if (keyboard && event.key === " " && node.matches?.("button, summary")) return false;
+    node = node.parentNode;
+  }
+  return node === scroll;
+}
+
+function armConversationScroll(event, kind, upward) {
+  if (event.isTrusted === false || !mainScrollTarget(event, kind === "key")) return;
+  const scroll = $("#conversation-scroll");
+  const intent = { kind, upward, top: scroll.scrollTop };
+  conversationScrollIntent = intent;
+  // Wheel/key default scrolling precedes the frame. A stale gesture must not
+  // later turn a layout/programmatic scroll into an upward reading action.
+  if (kind !== "scrollbar" && typeof requestAnimationFrame === "function") requestAnimationFrame(() => {
+    if (conversationScrollIntent === intent) conversationScrollIntent = null;
+  });
+}
+
+function onConversationScroll() {
+  const scroll = $("#conversation-scroll"), intent = conversationScrollIntent;
+  // Concurrent content growth must not erase a real upward gesture. Clamp the
+  // starting position only to exclude a layout-only reduction of the range.
+  const previousTop = intent && Math.min(intent.top, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+  if (intent && intent.upward !== false && scroll.scrollTop < previousTop) conversationFollowing = false;
+  else if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 1) conversationFollowing = true;
+  if (intent?.kind === "scrollbar") {
+    intent.top = scroll.scrollTop;
+  } else conversationScrollIntent = null;
+  $("#scroll-bottom").hidden = conversationFollowing || !state.session.messages.length;
+}
+
 function renderChat() {
-  const nearBottom = scrollIsNearBottom();
-  $("#welcome").hidden = !!state.session.messages.length || busy();
+  const items = conversationItems(state.session).filter((item) => item.kind !== "message" || ["user", "assistant"].includes(item.message.role) && (item.message.content || item.message.attachments?.length || item.message.attachment_ids?.length || item.message.pending || item.message.streaming));
+  $("#welcome").hidden = !!items.length || busy();
   const container = $("#messages");
-  const visibleMessages = state.session.messages.filter((message) => ["user", "assistant"].includes(message.role) && (message.content || message.attachments?.length || message.attachment_ids?.length || message.pending || message.streaming));
-  const ids = new Set(visibleMessages.map((message) => String(message.id)));
+  const ids = new Set(items.map((item) => String(item.id)));
   for (const [id, node] of messageNodes) if (!ids.has(id)) { node.remove(); messageNodes.delete(id); }
-  for (const message of visibleMessages) {
-    const id = String(message.id);
+  for (const [position, item] of items.entries()) {
+    const id = String(item.id);
+    if (item.kind !== "message") {
+      const previous = messageNodes.get(id);
+      const contentChanged = item.kind === "reasoning" && previous?.dataset.content !== item.content;
+      const node = renderProcessItem(item, previous);
+      node.dataset.timelineId = id;
+      messageNodes.set(id, node);
+      if (container.children[position] !== node) container.insertBefore(node, container.children[position] ?? null);
+      if (contentChanged && item.streaming && node.open) {
+        const content = $(".reasoning-content", node);
+        if (content?.dataset.follow !== "false" && content?.clientHeight > 0) content.scrollTop = content.scrollHeight;
+      }
+      continue;
+    }
+    const message = item.message;
     const presentation = messagePresentation(message);
     let node = messageNodes.get(id);
     if (!node) {
-      node = element("article", { class: `message ${presentation.kind}`, dataset: { messageId: id }, "aria-label": presentation.label });
+      node = element("article", { class: `message ${presentation.kind}`, dataset: { timelineId: id }, "aria-label": presentation.label });
       let content = node;
       if (presentation.kind === "system-context") {
         content = element("details", {}, element("summary", { class: "message-heading" }, icon("info"), element("span", { text: presentation.label }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
         node.append(content);
       } else if (message.role !== "user") {
-        content.append(element("div", { class: "message-heading" }, element("span", { class: "message-avatar" }, element("img", { src: "./assets/muli-avatar.svg", alt: "" })), element("span", { text: "沐璃" }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
+        content.append(element("div", { class: "message-heading" }, element("span", { class: "message-avatar" }, element("img", { src: "./assets/muli-avatar.webp", alt: "" })), element("span", { text: "沐璃" }), element("time", { class: "message-time", text: formatTimestamp(message.created_at), dateTime: message.created_at ?? "" })));
       }
       content.append(element("div", { class: "message-body" }));
       content.append(element("div", { class: "message-attachments" }));
       const actions = element("div", { class: "message-actions" }, iconButton("复制消息", "copy-message", "copy", { id }));
-      content.append(actions); messageNodes.set(id, node); container.append(node);
+      content.append(actions); messageNodes.set(id, node);
     }
+    node.dataset.messageId = String(message.id);
+    if (container.children[position] !== node) container.insertBefore(node, container.children[position] ?? null);
     if (node.dataset.content !== message.content) {
       const body = $(".message-body", node);
       if (message.role === "user") body.textContent = message.content ?? "";
@@ -426,70 +516,89 @@ function renderChat() {
     let interruption = $(".interrupted-label", node);
     if (message.interrupted && !interruption) { interruption = element("div", { class: "interrupted-label", text: message.paused ? "生成已暂停" : "生成已停止" }); node.append(interruption); }
   }
-  const reasoning = $("#reasoning-region");
-  reasoning.hidden = !state.session.reasoning;
-  if (state.session.reasoning) {
-    if (!$("details", reasoning)) reasoning.replaceChildren(element("details", {}, element("summary", { text: "思考过程" }), element("div", { class: "reasoning-content" })));
-    $(".reasoning-content", reasoning).textContent = state.session.reasoning;
-  }
   renderApprovals();
   const runStatus = $("#run-status");
   runStatus.hidden = !busy() && !state.session.error;
   runStatus.classList.toggle("error", !!state.session.error);
   if (state.session.error) runStatus.replaceChildren(icon("info"), element("span", { text: state.session.error }));
   else if (busy()) runStatus.replaceChildren(element("span", { class: "thinking-dots", "aria-hidden": "true" }, element("i"), element("i"), element("i")), element("span", { text: state.session.status === "approval" ? "等待审批" : state.sending ? "正在发送…" : state.session.tools.some((tool) => tool.status === "running") ? "正在使用工具…" : "正在处理…" }));
-  if (nearBottom) scrollToBottom(true);
   renderComposer();
-  renderTimeline();
+  scheduleConversationTail();
+}
+
+function renderProcessItem(item, node) {
+  if (item.kind === "reasoning") {
+    if (!node) {
+      const content = element("div", { class: "reasoning-content", role: "region", "aria-label": "思考内容", tabIndex: 0 });
+      content.dataset.follow = "true";
+      content.addEventListener("scroll", () => { content.dataset.follow = String(content.scrollHeight - content.scrollTop - content.clientHeight <= 24); });
+      node = element("details", { class: "reasoning-step", open: true }, element("summary", {}, icon("sparkles"), element("span", { text: "思考过程" })), content);
+    }
+    const content = $(".reasoning-content", node);
+    if (node.dataset.content !== item.content) {
+      content.textContent = item.content;
+      node.dataset.content = item.content;
+    }
+    node.classList.toggle("streaming", !!item.streaming);
+    return node;
+  }
+  const tool = item.tool;
+  if (!node) {
+    node = element("details", { class: "tool-step" },
+      element("summary", {}, icon("terminal"), element("code", { class: "tool-name" }), element("span", { class: "tool-step-status" }), element("time", { class: "tool-time" })),
+      element("div", { class: "tool-section" }, element("div", { class: "tool-step-label", text: "参数" }), element("pre", { class: "tool-arguments" })),
+      element("div", { class: "tool-section tool-result-section" }, element("div", { class: "tool-step-label", text: "结果" }), element("pre", { class: "tool-result" })));
+  }
+  node.className = "tool-step " + tool.status;
+  $(".tool-name", node).textContent = tool.name || "工具调用";
+  $(".tool-step-status", node).textContent = toolStatusLabel(tool);
+  const argumentsText = pretty(tool.arguments ?? "未记录参数"), resultText = pretty(tool.result ?? tool.error ?? "");
+  if (node.dataset.arguments !== argumentsText) { $(".tool-arguments", node).textContent = argumentsText; node.dataset.arguments = argumentsText; }
+  if (node.dataset.result !== resultText) { $(".tool-result", node).textContent = resultText; node.dataset.result = resultText; }
+  $(".tool-result-section", node).hidden = tool.result === undefined && !tool.error;
+  $(".tool-time", node).textContent = formatTimestamp(tool.created_at ?? tool.completed_at);
+  return node;
+}
+
+function approvalCard(approval) {
+  const session = state.sessions.find((item) => item.id === approval.session_id);
+  return element("section", { class: "approval-item", dataset: { id: approval.id }, "aria-label": "工具审批" },
+    element("div", { class: "approval-heading" }, icon("shield"), "需要你的批准"),
+    element("h3", { text: approval.tool }),
+    element("div", { class: "row-meta" }, session?.title && element("span", { text: session.title }), element("span", { text: `会话 ${approval.session_id}` }), element("span", { text: `运行 ${approval.run_id}` })),
+    approval.reason && element("p", { text: approval.reason }),
+    element("pre", { text: pretty(approval.arguments) }),
+    element("div", { class: "approval-actions" }, actionButton("拒绝", "approval", "secondary-button", undefined, { id: approval.id, decision: "reject" }), actionButton("批准执行", "approval", "primary-button", "check", { id: approval.id, decision: "approve" })));
+}
+
+function renderApprovalViews() {
+  const focused = document.activeElement?.closest?.(".approval-item");
+  const focus = focused ? { id: focused.dataset.id, decision: document.activeElement.dataset.decision } : null;
+  renderApprovals(); renderChrome();
+  if (state.view === "notifications" && state.notificationTab === "approvals") renderOtherView();
+  if (focus) {
+    const root = state.view === "chat" ? $("#approval-region") : $("#other-view");
+    const buttons = $$('[data-action="approval"]', root).filter((button) => !button.disabled);
+    const target = buttons.find((button) => button.dataset.id === focus.id && button.dataset.decision === focus.decision) ?? buttons[0] ?? (state.view === "chat" ? $("#message-input") : $('[data-notification-tab="approvals"]', root));
+    target?.focus({ preventScroll: true });
+  }
 }
 
 function renderApprovals() {
   const region = $("#approval-region");
+  if (state.approvalsError) {
+    region.replaceChildren(element("div", { class: "approval-error", role: "status" }, element("p", { text: state.approvalsError }), actionButton("刷新待批准", "refresh-approvals", "text-button", "refresh"))); scheduleConversationTail(); return;
+  }
+  $(".approval-error", region)?.remove();
   const existing = new Map($$(".approval-item", region).map((node) => [node.dataset.id, node]));
-  const ids = new Set(state.session.approvals.map((item) => String(item.id)));
+  const ids = new Set(state.approvals.map((item) => item.id));
   for (const [id, node] of existing) if (!ids.has(id)) node.remove();
-  for (const approval of state.session.approvals) {
-    if (existing.has(String(approval.id))) continue;
-    const node = element("section", { class: "approval-item", dataset: { id: approval.id }, "aria-label": "工具审批" },
-      element("div", { class: "approval-heading" }, icon("shield"), "需要你的批准"),
-      element("h3", { text: typeof approval.tool === "string" ? approval.tool : approval.tool?.name ?? "工具调用" }),
-      approval.reason && element("p", { text: approval.reason }),
-      element("pre", { text: pretty(approval.arguments) }),
-      element("div", { class: "approval-actions" }, actionButton("拒绝", "approval", "secondary-button", undefined, { id: approval.id, decision: "reject" }), actionButton("批准执行", "approval", "primary-button", "check", { id: approval.id, decision: "approve" })));
-    region.append(node);
+  for (const approval of state.approvals) {
+    const node = existing.get(approval.id) ?? approvalCard(approval);
+    if (!existing.has(approval.id)) region.append(node);
+    $$("button", node).forEach((button) => { button.disabled = !!connection?.approvalDecisions.has(approval.id); });
   }
-}
-
-function renderTimeline() {
-  const tools = state.session.tools;
-  const complete = tools.filter((tool) => tool.status !== "running").length;
-  const failed = tools.filter((tool) => tool.status === "failed").length;
-  $("#timeline-summary").textContent = tools.length ? `${complete} / ${tools.length} 项工具调用结束${failed ? ` · ${failed} 项失败` : ""}` : state.activeSession ? "当前会话" : "开始任务后，在这里查看过程";
-  const container = $("#tool-timeline");
-  if (!tools.length) {
-    container.replaceChildren(element("div", { class: "timeline-empty" }, icon("workflow"), "尚无工具调用"));
-    toolNodes = new Map();
-  } else {
-    if (!toolNodes.size) container.replaceChildren();
-    const ids = new Set(tools.map((tool) => String(tool.call_id)));
-    for (const [id, node] of toolNodes) if (!ids.has(id)) { node.remove(); toolNodes.delete(id); }
-    for (const tool of tools) {
-      const id = String(tool.call_id);
-      let node = toolNodes.get(id);
-      if (!node) {
-        node = element("div", { class: "tool-step" }, element("span", { class: "tool-step-dot" }), element("details", {}, element("summary"), element("div", { class: "tool-step-label", text: "参数" }), element("pre", { class: "tool-arguments" }), element("div", { class: "tool-step-label tool-result-label", text: "结果" }), element("pre", { class: "tool-result" })), element("div", { class: "tool-step-status" }));
-        toolNodes.set(id, node); container.append(node);
-      }
-      node.className = `tool-step ${tool.status}`;
-      $("summary", node).textContent = tool.name || "工具调用";
-      $(".tool-arguments", node).textContent = pretty(tool.arguments ?? "未记录参数");
-      $(".tool-result", node).textContent = pretty(tool.result ?? tool.error ?? "");
-      $(".tool-result", node).hidden = tool.result === undefined && !tool.error;
-      $(".tool-result-label", node).hidden = tool.result === undefined && !tool.error;
-      $(".tool-step-status", node).textContent = toolStatusLabel(tool);
-    }
-  }
-  $("#timeline-footer").textContent = `${MODES[state.mode]?.label ?? state.mode} 模式${state.session.status === "cancelled" ? " · 任务已停止" : state.session.status === "paused" ? " · 任务已暂停" : ""}`;
+  scheduleConversationTail();
 }
 
 function queueRender() {
@@ -504,6 +613,11 @@ function refreshSessions(owner = connection) {
 
 function refreshNotifications(owner = connection) {
   return owner?.notifications.request() ?? Promise.resolve(false);
+}
+
+function refreshApprovals(owner = connection) {
+  if (owner) owner.approvalEpoch = Symbol();
+  return owner?.approvals.request() ?? Promise.resolve(false);
 }
 
 async function connect() {
@@ -525,9 +639,9 @@ async function connect() {
     state.connected = false; state.loading = false; renderChrome(); renderComposer();
     return;
   }
-  const notifications = refreshNotifications(owner), sessions = refreshSessions(owner);
-  owner.notifications.start(); owner.sessions.start();
-  const results = await Promise.allSettled([ownedRequest("/status", {}, owner), ownedRequest("/conversation", {}, owner), notifications, sessions, ownedRequest("/uploads", {}, owner)]);
+  const notifications = refreshNotifications(owner), sessions = refreshSessions(owner), approvals = refreshApprovals(owner);
+  owner.notifications.start(); owner.sessions.start(); owner.approvals.start();
+  const results = await Promise.allSettled([ownedRequest("/status", {}, owner), ownedRequest("/conversation", {}, owner), notifications, sessions, ownedRequest("/uploads", {}, owner), approvals]);
   if (!connectionCurrent(owner)) return;
   if (results[0].status === "fulfilled") {
     state.status = results[0].value; state.connected = true;
@@ -569,15 +683,16 @@ function waitToReconnect(milliseconds, signal) {
   });
 }
 
-async function subscribe(path, controller, { cursor = "", onEvent, reportConnection = false, owner = connection } = {}) {
+async function subscribe(path, controller, { cursor = "", onEvent, onReconnect = () => {}, reportConnection = false, owner = connection } = {}) {
   let delay = 1000;
   let after = cursor;
+  let opened = false;
   const current = () => connectionCurrent(owner) && !controller.signal.aborted;
   while (current()) {
     try {
       await readEvents(path, {
         signal: controller.signal, after,
-        onOpen: () => { if (!current()) return; delay = 1000; if (reportConnection) { state.streamConnected = true; renderChrome(); } },
+        onOpen: () => { if (!current()) return; delay = 1000; if (opened) onReconnect(); opened = true; if (reportConnection) { state.streamConnected = true; renderChrome(); } },
         onEvent: (event) => { if (!current()) return; onEvent(event); if (event.id !== undefined && event.id !== null) after = String(event.id); },
         onId: (id) => { if (current()) after = id; },
       });
@@ -596,7 +711,11 @@ function startGlobalEvents(owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   globalController?.abort();
   globalController = new AbortController();
-  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onEvent: (event) => {
+  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onReconnect: () => { void refreshApprovals(owner); }, onEvent: (event) => {
+    if (event.type === "approval.resolved" && typeof event.data?.id === "string") {
+      state.approvals = state.approvals.filter((item) => item.id !== event.data.id); renderApprovalViews();
+    }
+    if (event.type.startsWith("approval.") || ["run.completed", "run.failed", "run.cancelled", "session.recovered"].includes(event.type)) void refreshApprovals(owner);
     if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested", "attention.queued", "ingress.cancelled"].includes(event.type)) void refreshNotifications(owner);
     if (event.type.startsWith("run.") || event.type.startsWith("session.")) void refreshSessions(owner);
     if (event.type === "workflow.updated") {
@@ -631,14 +750,13 @@ function startSessionEvents(sessionId, owner = connection) {
       const next = applyEvent(state.session, event);
       if (next === state.session) return;
       state.session = next;
-      if ((event.type === "tool.started" || event.type === "approval.requested") && !state.timelineUserChoice) state.timelineOpen = true;
       if (["run.completed", "run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
   });
 }
 
-function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); $("#tool-timeline").replaceChildren(); toolNodes = new Map(); }
+function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
 
 async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
@@ -664,7 +782,7 @@ function openHistoryDialog(sessionId, title, trigger, mode) {
   $("#dialog-content").scrollTop = 0;
   const slot = { sessionId: String(sessionId), title, content, trigger, mode, page: null, bodyPage: null, selected: null, controller: null, through: null, before: null, starts: [null], offsets: [0], segment: 0, error: "", retry: null, focusAfterLoad: false, returnMessageId: null };
   historyDialog = slot;
-  dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view };
+  dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view, action: trigger?.dataset.action };
   const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
   return slot;
 }
@@ -892,14 +1010,24 @@ async function sendMessage(event) {
 }
 
 async function approve(id, decision, button) {
-  const node = button.closest(".approval-item");
-  const sessionId = state.activeSession?.id;
-  $$("button", node).forEach((item) => item.disabled = true);
+  const owner = connection;
+  const approval = state.approvals.find((item) => item.id === id);
+  const region = state.view === "chat" ? $("#approval-region") : state.view === "notifications" && state.notificationTab === "approvals" ? $("#other-view") : null;
+  if (!connectionCurrent(owner) || !approval || !region?.contains(button) || owner.approvalDecisions.has(id) || !["approve", "reject"].includes(decision) || button.closest(".approval-item")?.dataset.id !== id) return;
+  owner.approvalDecisions.add(id); renderApprovalViews();
   try {
-    await request(`/approvals/${encodeURIComponent(id)}`, { method: "POST", body: { decision } });
-    if (state.activeSession?.id === sessionId) state.session = applyEvent(state.session, { type: "approval.resolved", data: { id, decision } });
-    renderChat(); toast(decision === "approve" ? "已批准执行" : "已拒绝本次调用");
-  } catch (error) { showError(error); $$("button", node).forEach((item) => item.disabled = false); }
+    const result = await ownedRequest(`/approvals/${encodeURIComponent(id)}`, { method: "POST", body: { decision } }, owner);
+    if (result?.resolved !== true) throw new Error("审批回执无效，请刷新确认。");
+    state.approvals = state.approvals.filter((item) => item.id !== id);
+    if (state.activeSession?.id === approval.session_id) state.session = applyEvent(state.session, { type: "approval.resolved", data: { id, decision } });
+    renderApprovalViews(); toast(decision === "approve" ? "已批准执行" : "已拒绝本次调用");
+    await refreshApprovals(owner);
+  } catch (error) {
+    if (connectionCurrent(owner)) { showError(error); await refreshApprovals(owner); }
+  } finally {
+    owner.approvalDecisions.delete(id);
+    if (connectionCurrent(owner)) renderApprovalViews();
+  }
 }
 
 async function stopRun(button) {
@@ -970,6 +1098,9 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  if (view === "settings" && state.view === "settings" && state.settingsDraft && !state.viewError && !state.viewLoading && $(".settings-layout", $("#other-view"))) {
+    collectSettingsForm(); renderOtherView(); return;
+  }
   cancelMemorySearch(); releaseMemoryPath();
   releaseWorkflowActivity();
   releaseRecordDirectory();
@@ -978,7 +1109,9 @@ async function switchView(view, owner = connection) {
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
   const version = ++viewRequestVersion;
   const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === view;
+  const changedView = state.view !== view;
   state.view = view; state.viewError = ""; renderChrome();
+  if (changedView) animatePanel(view === "chat" ? $("#chat-view") : $("#management-shell"));
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
   if (view === "records") {
     const slot = recordDirectory = { query: state.recordQuery, cursor: null, starts: [null], page: null, controller: null, error: "", retry: null, dirty: false, root: null };
@@ -989,7 +1122,7 @@ async function switchView(view, owner = connection) {
     return;
   }
   if (view === "workflows") {
-    const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "" };
+    const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "", schedulesOpen: false, schedulesPage: null, schedulesAfter: "", schedulesStarts: [""], schedulesController: null, schedulesLoading: false, schedulesError: "", schedulesStopping: new Set() };
     state.workflows = []; state.viewLoading = false; renderOtherView();
     const heading = $(".view-heading h2", $("#other-view"));
     if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
@@ -1016,10 +1149,12 @@ async function switchView(view, owner = connection) {
       state.memoryGraph = results[1].status === "fulfilled" ? results[1].value : { nodes: [], edges: [] };
     }
     if (view === "notifications") {
-      const results = await Promise.allSettled([refreshNotifications(owner), ownedRequest("/reminders", {}, owner)]);
+      const results = await Promise.allSettled([refreshNotifications(owner), ownedRequest("/reminders", {}, owner), refreshApprovals(owner)]);
       if (!current()) return;
-      if (results[0].status === "rejected") throw results[0].reason;
-      if (!results[0].value) throw owner.notifications.error ?? new Error("通知暂时无法读取，请重试。");
+      if (state.notificationTab !== "approvals") {
+        if (results[0].status === "rejected") throw results[0].reason;
+        if (!results[0].value) throw owner.notifications.error ?? new Error("通知暂时无法读取，请重试。");
+      }
       state.reminders = results[1].status === "fulfilled" ? collection(results[1].value) : [];
       state.remindersError = results[1].status === "rejected" ? results[1].reason.message : "";
     }
@@ -1048,13 +1183,41 @@ function renderOtherView() {
   if (state.view === "memories") root.replaceChildren(renderMemories());
   if (state.view === "workflows") { const saved = captureWorkflowView(root); root.replaceChildren(renderWorkflows()); restoreWorkflowView(root, saved); }
   if (state.view === "notifications") root.replaceChildren(renderNotifications());
-  if (state.view === "settings") root.replaceChildren(renderSettings());
+  if (state.view === "settings") {
+    const layout = $(".settings-layout", root);
+    if (layout && state.settingsDraft) {
+      for (const button of $$("[data-settings-tab]", $(".settings-nav", layout))) {
+        const active = button.dataset.settingsTab === state.settingsTab;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-current", active ? "page" : "false");
+      }
+      const panel = $(".settings-content", layout);
+      const changedTab = panel.dataset.settingsTab !== state.settingsTab;
+      panel.replaceChildren(renderSettingsPanel());
+      panel.dataset.settingsTab = state.settingsTab;
+      if (changedTab) animatePanel(panel);
+    } else root.replaceChildren(renderSettings());
+  }
   if (state.view === "uploads") root.replaceChildren(renderUploads());
   if (state.view === "team") { const saved = captureTeamView(root); root.replaceChildren(renderTeam()); restoreTeamView(root, saved); }
   if (state.view === "records") { const content = renderRecords(); if (root.firstElementChild !== content) root.replaceChildren(content); }
   const nav = $(".settings-nav", root);
   const active = $(".settings-nav .active", root);
   if (nav && active && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, active.offsetLeft - nav.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2);
+}
+
+function animatePanel(node) {
+  if (!node?.animate || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  for (const animation of node.getAnimations()) animation.cancel();
+  node.animate([{ opacity: 0.65, transform: "translateY(5px)" }, { opacity: 1, transform: "none" }], { duration: 180, easing: "cubic-bezier(.2,.7,.2,1)" });
+}
+
+function switchSettingsTab(tab) {
+  if (!SETTINGS_GROUPS.some(([key]) => key === tab) || tab === state.settingsTab) return;
+  collectSettingsForm();
+  state.settingsTab = tab;
+  renderOtherView();
+  $("#other-view").scrollTop = 0;
 }
 
 function renderThemeControl() {
@@ -1437,7 +1600,8 @@ function renderRecordList(slot = recordDirectory) {
     const timestamp = session.updated_at ?? session.created_at;
     const title = session.title === null ? "标题未记录" : session.title || "空标题";
     const row = element("article", { class: "record-row" }, element("div", { class: "row-content" }, element("h3", { text: title }), element("div", { class: "row-meta" }, main ? "主对话" : "任务", element("span", { text: Object.hasOwn(statuses, session.status) ? statuses[session.status] : session.status ? `状态：${session.status}` : "状态未记录" }), element("time", { text: timestamp === null ? "日期未记录" : formatTimestamp(timestamp) }))), actionButton(main ? "回到对话" : "查看", "workflow-session", "text-button", undefined, { session: session.id }));
-    if (!main) row.append(iconButton("删除记录", "delete-session", "trash", { id: session.id }));
+    if (main) row.append(element("button", { type: "button", class: "text-button", text: "查看正文归档", dataset: { action: "record-archive", session: session.id }, onClick: (event) => void showHistoryArchive(session.id, { trigger: event.currentTarget, title }) }));
+    else row.append(iconButton("删除记录", "delete-session", "trash", { id: session.id }));
     slot.result.append(row);
   }
   if (!page.items.length) slot.result.append(emptyState("chat", slot.query ? "没有找到记录" : "还没有运行记录"));
@@ -1827,9 +1991,10 @@ function workflowActivityCurrent(slot) {
 
 function releaseWorkflowActivity() {
   const slot = workflowActivity; workflowActivity = null;
-  slot?.controller?.abort(); slot?.definitionsController.abort();
-  if (slot) slot.page = null;
+  slot?.controller?.abort(); slot?.definitionsController.abort(); slot?.schedulesController?.abort();
+  if (slot) { slot.page = null; slot.schedulesPage = null; slot.schedulesStopping.clear(); }
   $("#workflow-active-runs")?.replaceChildren();
+  $("#workflow-schedules")?.replaceChildren();
 }
 
 function workflowActivityPage(payload, after) {
@@ -1930,8 +2095,72 @@ function renderWorkflowActivity() {
   return root;
 }
 
+async function loadWorkflowSchedules(slot, after = "", starts = [""]) {
+  const owner = connection;
+  if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !connectionCurrent(owner)) return;
+  slot.schedulesController?.abort();
+  const controller = slot.schedulesController = new AbortController();
+  slot.schedulesLoading = true; slot.schedulesError = ""; renderOtherView();
+  const current = () => workflowActivityCurrent(slot) && slot.schedulesOpen && connectionCurrent(owner) && slot.schedulesController === controller && !controller.signal.aborted;
+  try {
+    const payload = await ownedRequest(`/workflow-schedules?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" }, owner);
+    if (!current()) return;
+    if (!payload || !Array.isArray(payload.items) || payload.items.length > workflowPageSize || typeof payload.has_more !== "boolean") throw new Error("定时委托响应不完整，请重试。");
+    const seen = new Set();
+    const items = payload.items.map((item) => {
+      if (!item || typeof item.id !== "string" || !item.id || item.id === after || seen.has(item.id) || typeof item.name !== "string" || typeof item.enabled !== "boolean" || !(item.due_at === null || (Number.isFinite(item.due_at) && item.due_at > 0)) || !(item.last_run_id === null || (typeof item.last_run_id === "string" && item.last_run_id)) || !(item.last_status === null || ["pending", "queued", "running", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(item.last_status))) throw new Error("定时委托响应不完整，请重试。");
+      seen.add(item.id);
+      if (typeof item.blocked !== "boolean") throw new Error("定时委托响应不完整，请重试。");
+      return { id: item.id, name: item.name, enabled: item.enabled, blocked: item.blocked, due_at: item.due_at, interval_seconds: item.interval_seconds, last_run_id: item.last_run_id, last_status: item.last_status };
+    });
+    if (payload.has_more ? !items.length || payload.next_after !== items.at(-1).id : payload.next_after !== null) throw new Error("定时委托翻页位置无效，请重新读取。");
+    slot.schedulesPage = { items, has_more: payload.has_more, next_after: payload.next_after };
+    slot.schedulesAfter = after; slot.schedulesStarts = [...starts];
+  } catch (error) { if (current()) slot.schedulesError = error.message; }
+  finally {
+    if (workflowActivityCurrent(slot) && slot.schedulesController === controller) {
+      slot.schedulesController = null; slot.schedulesLoading = false; renderOtherView();
+    }
+  }
+}
+
+function renderWorkflowSchedules() {
+  const slot = workflowActivity;
+  const root = element("section", { id: "workflow-schedules", hidden: !slot?.schedulesOpen });
+  if (!slot?.schedulesOpen) return root;
+  const refresh = actionButton("刷新", "refresh-workflow-schedules", "text-button", "refresh");
+  refresh.disabled = slot.schedulesLoading;
+  root.append(element("div", { class: "list-caption" }, "定时委托", refresh));
+  if (slot.schedulesLoading) root.append(element("p", { class: "workflow-list-status", role: "status", text: "正在读取…" }));
+  if (slot.schedulesError) root.append(element("p", { class: "form-error", role: "alert", text: slot.schedulesError }));
+  if (!slot.schedulesLoading && !slot.schedulesError && !slot.schedulesPage?.items.length) root.append(element("p", { class: "workflow-list-status", text: "暂无定时委托。可在对话中请沐璃安排。" }));
+  for (const item of slot.schedulesPage?.items ?? []) {
+    const status = !item.enabled ? "已停用" : item.blocked ? "暂缓执行" : item.due_at === null ? "无后续计划" : "等待下次执行";
+    const recent = { pending: "等待中", queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", timed_out: "超时" };
+    const content = element("div", { class: "row-content" }, element("h4", { text: item.name }), element("code", { class: "workflow-run-id", text: item.id }), element("div", { class: "row-meta" }, status, item.due_at !== null && element("time", { text: formatTimestamp(item.due_at) })));
+    if (item.last_run_id) content.append(element("div", { class: "row-meta" }, `最近执行：${recent[item.last_status] ?? "状态未记录"}`, element("code", { text: item.last_run_id })));
+    const actions = element("div", { class: "row-actions" });
+    if (item.enabled) {
+      const cancel = actionButton(slot.schedulesStopping.has(item.id) ? "正在提交…" : "取消委托", "cancel-workflow-schedule", "secondary-button", "stop", { id: item.id });
+      cancel.disabled = slot.schedulesLoading || slot.schedulesStopping.has(item.id); actions.append(cancel);
+    }
+    root.append(element("article", { class: "workflow-active-row" }, content, actions));
+  }
+  if (slot.schedulesStarts.length > 1 || slot.schedulesPage?.has_more) {
+    const previous = actionButton("上一页", "page-workflow-schedules", "text-button", undefined, { direction: "previous" });
+    const next = actionButton("下一页", "page-workflow-schedules", "text-button", undefined, { direction: "next" });
+    previous.disabled = slot.schedulesLoading || slot.schedulesStarts.length <= 1;
+    next.disabled = slot.schedulesLoading || !slot.schedulesPage?.has_more;
+    root.append(element("div", { class: "row-actions" }, previous, next));
+  }
+  return root;
+}
+
 function renderWorkflows() {
-  const root = element("div", { class: "view-content" }, viewHeading("工作流", "把重复任务整理成可运行的步骤。", element("div", { class: "view-heading-actions" }, actionButton("从模板开始", "workflow-templates", "secondary-button", "sparkles"), actionButton("新建工作流", "new-workflow", "primary-button", "plus"))), renderWorkflowActivity(), element("div", { class: "list-caption" }, "最近定义", `${state.workflows.length} 个工作流`));
+  const schedules = actionButton("定时委托", "toggle-workflow-schedules", "secondary-button");
+  schedules.setAttribute("aria-expanded", String(!!workflowActivity?.schedulesOpen));
+  schedules.setAttribute("aria-controls", "workflow-schedules");
+  const root = element("div", { class: "view-content" }, viewHeading("工作流", "把重复任务整理成可运行的步骤。", element("div", { class: "view-heading-actions" }, schedules, actionButton("从模板开始", "workflow-templates", "secondary-button", "sparkles"), actionButton("新建工作流", "new-workflow", "primary-button", "plus"))), renderWorkflowActivity(), renderWorkflowSchedules(), element("div", { class: "list-caption" }, "最近定义", `${state.workflows.length} 个工作流`));
   if (workflowActivity?.definitionsLoading) root.append(element("p", { class: "workflow-list-status", text: "正在读取定义…" }));
   else if (workflowActivity?.definitionsError) root.append(element("p", { class: "form-error", role: "alert", text: workflowActivity.definitionsError }), actionButton("重试读取定义", "retry-view", "text-button", "refresh"));
   else if (!state.workflows.length) root.append(emptyState("workflow", "还没有工作流", "创建一个流程，按步骤协作完成任务。"));
@@ -2005,8 +2234,19 @@ async function runWorkflow(id, button) {
 function renderNotifications() {
   const unread = state.notifications.filter((item) => !item.read).length;
   const reminders = state.notificationTab === "reminders";
-  const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "通知视图" }, ...[["inbox", "收件箱"], ["reminders", "提醒"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.notificationTab === key ? "active" : "", text: label, "aria-selected": String(state.notificationTab === key), dataset: { notificationTab: key } })));
-  const root = element("div", { class: "view-content" }, viewHeading("通知", reminders ? "到时间，在这里收到提醒。" : unread ? `${unread} 条未读通知。` : "任务结果与需要处理的消息。", reminders ? actionButton("新建提醒", "new-reminder", "primary-button", "plus") : unread ? actionButton("全部已读", "read-all", "secondary-button", "check") : undefined), tabs);
+  const approvals = state.notificationTab === "approvals";
+  const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "通知视图" }, ...[["inbox", "收件箱"], ["approvals", `待批准${state.approvals.length ? ` ${state.approvals.length}` : ""}`], ["reminders", "提醒"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.notificationTab === key ? "active" : "", text: label, "aria-selected": String(state.notificationTab === key), dataset: { notificationTab: key } })));
+  const root = element("div", { class: "view-content" }, viewHeading("通知", approvals ? "主助手与队友等待你的决定。" : reminders ? "到时间，在这里收到提醒。" : unread ? `${unread} 条未读通知。` : "任务结果与需要处理的消息。", approvals ? actionButton("刷新", "refresh-approvals", "secondary-button", "refresh") : reminders ? actionButton("新建提醒", "new-reminder", "primary-button", "plus") : unread ? actionButton("全部已读", "read-all", "secondary-button", "check") : undefined), tabs);
+  if (approvals) {
+    if (state.approvalsError) root.append(emptyState("info", "暂时无法读取待批准", state.approvalsError));
+    else if (!state.approvals.length) root.append(emptyState("shield", "暂无待批准", "当前没有正在等待的工具调用。"));
+    for (const item of state.approvals) {
+      const node = approvalCard(item);
+      $$("button", node).forEach((button) => { button.disabled = !!connection?.approvalDecisions.has(item.id); });
+      root.append(node);
+    }
+    return root;
+  }
   if (reminders) { root.append(renderReminders()); return root; }
   root.append(element("div", { class: "list-caption" }, `${state.notifications.length} 条通知`, "收件箱"));
   if (!state.notifications.length) root.append(emptyState("inbox", "通知已清空", "任务完成或需要处理时，会显示在这里。"));
@@ -2086,7 +2326,11 @@ function renderSettings() {
   const nav = element("nav", { class: "settings-nav", "aria-label": "设置分组" });
   for (const [key, label] of SETTINGS_GROUPS) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
   const refresh = actionButton("刷新状态", "refresh-settings-status", "text-button", "refresh");
-  if (state.settingsTab === "overview") return element("div", { class: "view-content" }, viewHeading("设置", "告诉沐璃需要调整什么。", refresh), element("div", { class: "settings-layout" }, nav, renderConfigurationOverview()));
+  return element("div", { class: "view-content settings-view" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, element("div", { class: "settings-content", dataset: { settingsTab: state.settingsTab } }, renderSettingsPanel())));
+}
+
+function renderSettingsPanel() {
+  if (state.settingsTab === "overview") return renderConfigurationOverview();
   const form = element("form", { id: "settings-form", class: "settings-panel", onSubmit: saveSettings });
   if (state.settingsTab === "models") form.append(renderModelSettings());
   if (state.settingsTab === "tools") form.append(renderToolSettings());
@@ -2098,7 +2342,7 @@ function renderSettings() {
   if (state.settingsTab === "inputs") form.append(renderInputSettings());
   if (state.settingsTab === "maintenance") form.append(renderMaintenanceSettings());
   form.append(element("p", { class: "form-error", id: "settings-error", hidden: true }), element("div", { class: "settings-footer" }, element("button", { class: "primary-button", type: "submit", text: "保存设置" }), element("span", { class: "settings-save-status", id: "settings-save-status", text: state.settingsSaveStatus, hidden: !state.settingsSaveStatus })));
-  return element("div", { class: "view-content" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, form));
+  return form;
 }
 
 function renderConfigurationOverview() {
@@ -2146,6 +2390,9 @@ function renderChannelSettings() {
   const commonFields = ["enabled", "base_url", "owner_ids", "allowed_groups", "receive_files"];
   for (const [key, label] of CHANNELS) {
     const profile = config[key] ?? {}; const path = `channels.${key}`; const status = channelStatus[key];
+    const enabled = switchField("启用渠道", `${path}.enabled`, profile.enabled);
+    const owner = field(key === "onebot" ? "主人 QQ 号" : "你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", required: key === "onebot" && Boolean(profile.enabled), hint: key === "onebot" ? "启用前必填。每行一个 QQ 号，仅接收主人私聊。" : "每行一个 ID。" });
+    if (key === "onebot") $("input", enabled).addEventListener("change", (event) => { $("textarea", owner).required = event.target.checked; });
     const credentials = element("details", { class: "advanced-settings" }, element("summary", { text: "连接凭据" }));
     for (const [name, title] of [["token", "令牌"], ["webhook_secret", "Webhook 密钥"], ["client_secret", "客户端密钥"]]) {
       credentials.append(field(title, `${path}.${name}`, profile[name] ?? "", { type: "password", placeholder: profile[`${name}_set`] ? "已配置，留空保留" : "按渠道需要填写" }));
@@ -2153,13 +2400,13 @@ function renderChannelSettings() {
     }
     root.append(element("details", { class: "media-profile advanced-settings" },
       element("summary", {}, element("span", { text: label }), element("small", { text: capabilityLabel(status) })),
-      switchField("启用渠道", `${path}.enabled`, profile.enabled),
+      enabled,
       field("服务地址", `${path}.base_url`, profile.base_url ?? "", { type: "url" }),
-      field("你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", hint: "每行一个 ID。" }),
-      field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
+      owner,
+      key !== "onebot" && field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
       switchField("接收附件", `${path}.receive_files`, profile.receive_files), credentials,
       settingsJSON(path, profile, commonFields),
-      status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ["允许的群组", String(status.group_count ?? 0)]]),
+      status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ...(key === "onebot" ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
       status?.last_error && element("p", { class: "form-error", text: status.last_error })));
   }
   root.append(renderProactiveSettings(config), settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, [...CHANNELS.map(([key]) => key), "proactive"]), renderDeliveries()));
@@ -2218,7 +2465,8 @@ function renderProactiveSettings(config) {
 function proactiveRouteFields(destination, path) {
   if (destination.kind !== "channel") return [];
   const route = destination.route;
-  return [field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, [["private", "私聊"], ["group", "已允许的群组"]]), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" })];
+  const kinds = route.name === "onebot" ? [["private", "私聊"]] : [["private", "私聊"], ["group", "已允许的群组"]];
+  return [field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, kinds), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: route.name === "onebot" ? "与私聊收件对象相同。" : "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" })];
 }
 
 function deliveryLabel(value) {
@@ -2286,9 +2534,13 @@ function renderModelSettings() {
   const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "模型角色" });
   for (const [key, label] of MODEL_ROLES) tabs.append(element("button", { type: "button", role: "tab", class: role === key ? "active" : "", text: label, "aria-selected": String(role === key), dataset: { modelRole: key } }));
   const protocol = model.protocol ?? "openai_chat";
+  const protocolField = selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]);
+  const modelField = field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" });
+  const baseField = field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" });
+  const token = field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值", hint: "Anthropic 配置需要填写；其它协议可留空。" });
   const advanced = element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }),
     element("div", { class: "field-row" }, field("Temperature", `${path}.temperature`, model.temperature ?? "", { type: "number", step: .1, min: 0, max: 2, placeholder: "使用模型默认值" }), field("Top P", `${path}.top_p`, model.top_p ?? "", { type: "number", step: .05, min: 0, max: 1, placeholder: "使用模型默认值" })),
-    element("div", { class: "field-row" }, field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值" }), field("超时（秒）", `${path}.timeout`, model.timeout ?? "", { type: "number", min: 1, max: 600, placeholder: "使用服务默认值" })),
+    field("超时（秒）", `${path}.timeout`, model.timeout ?? "", { type: "number", min: 1, max: 600, placeholder: "使用服务默认值" }),
     element("div", { class: "field-row" }, field("重试次数", `${path}.max_retries`, model.max_retries ?? "", { type: "number", min: 0, max: 5, step: 1 }), field("API Key 环境变量", `${path}.api_key_env`, model.api_key_env ?? "", { placeholder: "可选" })),
     field("Reasoning", `${path}.reasoning`, pretty(model.reasoning ?? {}), { type: "textarea", rows: 2, json: true, format: "json" }),
     field("Thinking", `${path}.thinking`, pretty(model.thinking ?? {}), { type: "textarea", rows: 2, json: true, format: "json" }),
@@ -2298,9 +2550,18 @@ function renderModelSettings() {
     field("响应大小上限（字节）", `${path}.max_response_bytes`, model.max_response_bytes ?? "", { type: "number", min: 1024 }),
     switchField("流式输出", `${path}.stream`, model.stream !== false),
     model.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false));
-  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未配置时，工具审查交由你确认。", vision: "主模型不支持图片时，使用此模型识图。" };
-  return element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
-    settingsSection("模型连接", selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]), field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" }), field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" }), field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), switchField("支持图片", `${path}.vision`, model.vision), advanced));
+  const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未单独配置时，复用主模型。", vision: "主模型支持图片时复用主模型；否则需要单独配置支持图片的视觉模型。" };
+  const content = element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
+    settingsSection("模型连接", protocolField, modelField, baseField, field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), token, switchField("支持图片", `${path}.vision`, model.vision), advanced));
+  const protocolInput = $("select", protocolField);
+  const modelInput = $("input", modelField);
+  const baseInput = $("input", baseField);
+  const updateRequired = () => { $("input", token).required = protocolInput.value === "anthropic" && (role === "main" || !!modelInput.value.trim() || !!baseInput.value.trim()); };
+  protocolInput.addEventListener("change", updateRequired);
+  modelInput.addEventListener("input", updateRequired);
+  baseInput.addEventListener("input", updateRequired);
+  updateRequired();
+  return content;
 }
 
 function renderPersonaSettings() {
@@ -2409,9 +2670,13 @@ function collectSettingsForm() {
     let value;
     if (input.type === "checkbox") value = input.checked;
     else if (input.type === "number") {
-      if (!input.value.trim()) continue;
-      value = Number(input.value);
-      if (!Number.isFinite(value)) throw new Error("数值格式不正确。");
+      if (!input.value.trim()) {
+        if (!/^models\.[^.]+\.max_output_tokens$/.test(input.name)) continue;
+        value = null;
+      } else {
+        value = Number(input.value);
+        if (!Number.isFinite(value)) throw new Error("数值格式不正确。");
+      }
     } else if (["json", "json-merge"].includes(input.dataset.format)) {
       try { value = parseJSONField(input.value); } catch { throw new Error(`${input.closest("label")?.firstElementChild?.textContent ?? "参数"} 需要填写有效 JSON 对象。`); }
     } else if (input.dataset.format === "lines") value = input.value.split("\n").map((line) => line.trim()).filter(Boolean);
@@ -2550,16 +2815,16 @@ async function handleAction(action, button) {
     } });
   }
   if (action === "stop-team") { await request(`/team/${encodeURIComponent(button.dataset.id)}/stop`, { method: "POST" }); await refreshTeam(); toast("已发送停止请求"); }
-  if (action === "toggle-timeline") { state.timelineOpen = !state.timelineOpen; state.timelineUserChoice = true; renderChrome(); renderTimeline(); }
   if (action === "model-settings") { state.settingsTab = "models"; await switchView("settings"); }
   if (action === "refresh") { await connect(); if (!["chat", "records"].includes(state.view)) await switchView(state.view); }
   if (action === "retry-view") await switchView(state.view);
   if (action === "scroll-bottom") scrollToBottom(true, true);
   if (action === "stop") await stopRun(button);
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
+  if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") $("#app-dialog").close();
   if (action === "copy-message") {
-    const message = state.session.messages.find((item) => String(item.id) === button.dataset.id);
+    const message = conversationItems(state.session).find((item) => item.kind === "message" && String(item.id) === button.dataset.id)?.message ?? state.session.messages.find((item) => String(item.id) === button.dataset.id);
     if (message) { await navigator.clipboard.writeText(message.content); toast("已复制"); }
   }
   if (action === "delete-session") {
@@ -2586,6 +2851,29 @@ async function handleAction(action, button) {
   if (action === "remove-workflow-step") button.closest(".workflow-step-editor")?.remove();
   if (action === "run-workflow") await runWorkflow(button.dataset.id, button);
   if (action === "workflow-session") await loadSession(button.dataset.session, button);
+  if (action === "toggle-workflow-schedules") {
+    const slot = workflowActivity;
+    if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button)) return;
+    slot.schedulesOpen = !slot.schedulesOpen;
+    if (slot.schedulesOpen) await loadWorkflowSchedules(slot);
+    else { slot.schedulesController?.abort(); slot.schedulesController = null; slot.schedulesLoading = false; slot.schedulesPage = null; renderOtherView(); }
+  }
+  if (["refresh-workflow-schedules", "page-workflow-schedules"].includes(action)) {
+    const slot = workflowActivity;
+    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || slot.schedulesLoading) return;
+    if (action === "refresh-workflow-schedules") await loadWorkflowSchedules(slot);
+    else if (button.dataset.direction === "next" && slot.schedulesPage?.has_more) await loadWorkflowSchedules(slot, slot.schedulesPage.next_after, [...slot.schedulesStarts, slot.schedulesPage.next_after]);
+    else if (button.dataset.direction === "previous" && slot.schedulesStarts.length > 1) await loadWorkflowSchedules(slot, slot.schedulesStarts.at(-2), slot.schedulesStarts.slice(0, -1));
+  }
+  if (action === "cancel-workflow-schedule") {
+    const slot = workflowActivity, id = button.dataset.id, owner = connection;
+    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || !slot.schedulesPage?.items.some((item) => item.id === id && item.enabled) || slot.schedulesStopping.has(id)) return;
+    slot.schedulesStopping.add(id); renderOtherView();
+    try {
+      await ownedRequest(`/workflow-schedules/${encodeURIComponent(id)}/cancel`, { method: "POST" }, owner);
+      if (workflowActivityCurrent(slot) && connectionCurrent(owner)) { toast("已提交取消请求"); await loadWorkflowSchedules(slot, slot.schedulesAfter, slot.schedulesStarts); }
+    } finally { slot.schedulesStopping.delete(id); if (workflowActivityCurrent(slot) && connectionCurrent(owner)) renderOtherView(); }
+  }
   if (["refresh-workflow-runs", "page-workflow-runs"].includes(action)) {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button) || slot.loading) return;
@@ -2638,8 +2926,7 @@ document.addEventListener("click", async (event) => {
     if (button.dataset.action) await handleAction(button.dataset.action, button);
     else if (button.dataset.view) await switchView(button.dataset.view);
     else if (button.dataset.session) await loadSession(button.dataset.session, button);
-    else if (button.dataset.prompt) { if (state.view !== "chat") await switchView("chat"); $("#message-input").value = button.dataset.prompt; resizeComposer(); $("#message-input").focus(); }
-    else if (button.dataset.settingsTab) { collectSettingsForm(); state.settingsTab = button.dataset.settingsTab; renderOtherView(); $("#other-view").scrollTop = 0; }
+    else if (button.dataset.settingsTab) switchSettingsTab(button.dataset.settingsTab);
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) { cancelMemorySearch(); releaseMemoryPath(); state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
@@ -2663,10 +2950,37 @@ $("#mode-select").addEventListener("change", async (event) => {
   const previous = state.mode; state.mode = event.target.value;
   try { if (state.activeSession) { await request(`/sessions/${encodeURIComponent(state.activeSession.id)}`, { method: "PATCH", body: { mode: state.mode } }); state.activeSession.mode = state.mode; } }
   catch (error) { state.mode = previous; showError(error); }
-  renderComposer(); renderTimeline();
+  renderComposer();
 });
 $("#file-input").addEventListener("change", (event) => { void addFiles(event.target.files); event.target.value = ""; });
-$("#conversation-scroll").addEventListener("scroll", () => { $("#scroll-bottom").hidden = scrollIsNearBottom() || !state.session.messages.length; }, { passive: true });
+$("#conversation-scroll").addEventListener("scroll", onConversationScroll, { passive: true });
+$("#conversation-scroll").addEventListener("wheel", (event) => {
+  if (event.deltaY) armConversationScroll(event, "wheel", event.deltaY < 0);
+}, { passive: true });
+$("#conversation-scroll").addEventListener("keydown", (event) => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (["ArrowUp", "PageUp", "Home"].includes(event.key) || event.key === " " && event.shiftKey) armConversationScroll(event, "key", true);
+  else if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) armConversationScroll(event, "key", false);
+});
+$("#conversation-scroll").addEventListener("touchstart", (event) => {
+  conversationTouchY = mainScrollTarget(event) && event.touches?.length === 1 ? event.touches[0].clientY : null;
+}, { passive: true });
+$("#conversation-scroll").addEventListener("touchmove", (event) => {
+  if (conversationTouchY === null || event.touches?.length !== 1) return;
+  const y = event.touches[0].clientY;
+  if (y !== conversationTouchY) armConversationScroll(event, "touch", y > conversationTouchY);
+  conversationTouchY = y;
+}, { passive: true });
+for (const type of ["touchend", "touchcancel"]) $("#conversation-scroll").addEventListener(type, () => {
+  conversationTouchY = null;
+  if (conversationScrollIntent?.kind === "touch") conversationScrollIntent = null;
+}, { passive: true });
+$("#conversation-scroll").addEventListener("pointerdown", (event) => {
+  if (event.target === event.currentTarget && event.button === 0 && event.pointerType !== "touch") armConversationScroll(event, "scrollbar", null);
+}, { passive: true });
+for (const type of ["pointerup", "pointercancel"]) window.addEventListener(type, () => { if (conversationScrollIntent?.kind === "scrollbar") conversationScrollIntent = null; }, { passive: true });
+window.addEventListener("blur", () => { conversationScrollIntent = null; conversationTouchY = null; });
+window.addEventListener("resize", scheduleConversationTail, { passive: true });
 $("#dialog-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!dialogSubmit) return;
@@ -2695,7 +3009,7 @@ $("#app-dialog").addEventListener("close", () => {
   const historyReturn = dialogHistoryReturn; dialogHistoryReturn = null;
   if (state.auth.authenticated && historyReturn?.view === state.view) {
     const action = historyReturn.action ?? "workflow-session";
-    const fallback = state.view === "chat" ? $("#history-archive-button") : $$("[data-action]", $("#other-view")).find((button) => button.dataset.action === action && (action === "delete-session" ? button.dataset.id : button.dataset.session) === historyReturn.sessionId);
+    const fallback = state.view === "chat" ? $("#message-input") : $$("[data-action]", $("#other-view")).find((button) => button.dataset.action === action && (action === "delete-session" ? button.dataset.id : button.dataset.session) === historyReturn.sessionId);
     const target = historyReturn.trigger && document.contains(historyReturn.trigger) ? historyReturn.trigger : fallback;
     if (target) target.focus({ preventScroll: true });
     else if (state.view === "records" && recordDirectoryCurrent(recordDirectory)) recordDirectory.position?.focus({ preventScroll: true });
@@ -2723,6 +3037,7 @@ window.addEventListener("pageshow", (event) => { if (event.persisted) recoverCon
 window.addEventListener("pagehide", () => { invalidateConnection(); voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); releaseRecordDirectory(); });
 
 fillIcons();
+conversationLayout = initializeConversationWidth($("#chat-view"));
 initializeTheme(); renderThemeControl();
 document.addEventListener("muli:themechange", renderThemeControl);
 void connect();

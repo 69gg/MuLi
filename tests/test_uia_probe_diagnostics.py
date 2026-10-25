@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from helpers import uia_probe_diagnostics as diagnostic
+from test_uia_pending_observation import _Harness
 
+from muli.tools import ax_lease, uia_computer
 from muli.tools.ax_lease import MAX_STDERR_BYTES, AXHelperLease, AXLeaseError
 
 STAGES = (
@@ -136,7 +139,7 @@ async def test_native_probe_failure_attaches_fixed_evidence_only_after_owned_cle
         await asyncio.gather(operation, return_exceptions=True)
 
 
-def test_packaged_script_has_fourteen_once_only_fixed_stage_points() -> None:
+def test_packaged_script_keeps_fourteen_stage_names_and_twelve_live_points() -> None:
     from muli.tools import uia_computer
 
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
@@ -149,7 +152,8 @@ def test_packaged_script_has_fourteen_once_only_fixed_stage_points() -> None:
     )
     assert "$script:traceMask -band $bit" in function and "catch { }" in function
     assert "$index -ge $script:traceStages.Length" in function
-    assert source.count("Write-Stage ") == len(STAGES)
+    assert source.count("Write-Stage ") == len(STAGES) - 2
+    assert "Write-Stage 11" not in source and "Write-Stage 12" not in source
     assert "if (-not $script:traceProbeSeen)" in source
     assert source.index("Write-Stage 6") < source.index("$writer.WriteLine($json)")
     assert source.index("Write-Stage 7") > source.index("$writer.WriteLine($json)")
@@ -176,16 +180,23 @@ def test_first_input_stages_surround_the_original_read_and_decode_only() -> None
     assert source.index("Write-Stage 2") < source.index(points[0])
 
 
-def test_probe_native_getters_keep_their_original_single_calls_between_fixed_stages() -> None:
+def test_probe_skips_walker_and_keeps_the_real_process_ready_stage() -> None:
     from muli.tools import uia_computer
 
     assert uia_computer.__file__ is not None
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
+    guard = "if ([string]$request.command -cne 'probe') {"
+    walker = "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker"
+    initialization = source.split(guard, 1)[1].split("\n            }", 1)[0]
+    assert walker in initialization
+    assert "$script:rows = [Collections.Generic.List[object]]::new()" in initialization
+    assert "$script:reasons = [Collections.Generic.HashSet[string]]::new()" in initialization
+    assert "$script:visited = 0" in initialization
     points = (
         "Initialize-Uia\n            Check-Deadline",
-        "if ($traceProbe) { Write-Stage 11 }",
-        "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker",
-        "if ($traceProbe) { Write-Stage 12 }",
+        guard,
+        walker,
+        "switch -CaseSensitive ([string]$request.command)",
         "'probe' {",
         "$process = [Diagnostics.Process]::GetCurrentProcess()",
         "try { $hasWindow = ($process.MainWindowHandle -ne [IntPtr]::Zero) }",
@@ -386,3 +397,323 @@ async def test_success_does_not_swallow_owned_cleanup_failure() -> None:
         await observe_probe(cast(AXHelperLease, probe))
     assert caught.value is failure and not getattr(failure, "__notes__", ())
     assert probe.calls == 1 and not probe.closed
+
+
+@pytest.fixture
+async def owned_probe(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Harness]:
+    with monkeypatch.context() as construction:
+        construction.setattr(diagnostic, "PendingHelperLease", diagnostic.ProbeHelperLease)
+        case = _Harness()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", case.spawn)
+    monkeypatch.setattr(ax_lease, "_settle_process", case.settle)
+    try:
+        yield case
+    finally:
+        case.spawn_release.set()
+        case.cleanup_release.set()
+        case.writer.drain_release.set()
+        try:
+            try:
+                await case.lease.aclose()
+            except AXLeaseError:
+                if case.cleanup_failure is None:
+                    raise
+        finally:
+            for reader in case.lease._readers:
+                reader.cancel()
+            await asyncio.gather(*case.lease._readers, return_exceptions=True)
+
+
+async def _failed_owned_probe_facts(
+    case: _Harness, *, stderr: bytes, exit_code: int | None
+) -> dict[str, Any]:
+    failure = AXLeaseError("read_timeout", "private original timeout")
+    case.process.stderr.feed_data(stderr)
+    operation = asyncio.create_task(diagnostic.observe_probe(case.lease))
+    try:
+        async with asyncio.timeout(2):
+            await case.writer.drain_entered.wait()
+            while bytes(case.lease._stderr) != stderr:
+                await asyncio.sleep(0)
+            case.process.returncode = exit_code
+            assert case.lease._pending is not None
+            case.lease._pending.set_exception(failure)
+            with pytest.raises(AXLeaseError) as caught:
+                await operation
+        assert caught.value is failure and caught.value.outcome == "not_started"
+        assert case.spawns == case.cleanups == 1
+        assert case.lease._process is cast(object, case.process) and case.lease.closed
+        assert len(case.writer.frames) == case.writer.drains == 1
+        assert case.writer.closes == case.writer.waits == 1
+        assert case.process.returncode == 7
+        facts = note(failure)
+        assert facts["cleanup"] == "confirmed"
+        assert "private" not in json.dumps(facts)
+        return facts
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        await case.lease.aclose()
+
+
+async def test_probe_distinguishes_zero_stderr_while_owned_process_was_running(
+    owned_probe: _Harness,
+) -> None:
+    facts = await _failed_owned_probe_facts(owned_probe, stderr=b"", exit_code=None)
+    before, after = facts["before_cleanup"], facts["after_cleanup"]
+    assert before["exit"] == "running" and before["stderr_bytes"] == 0
+    assert before["stderr_kind"] == "empty" and before["phase"] == "response"
+    assert before["script_stages"] == [] and before["stage_sequence"] == "unobserved"
+    assert after["exit"] == "nonzero" and after["readers_settled"] is True
+    assert after["phase"] == "settled" and owned_probe.lease._once is True
+
+
+async def test_probe_distinguishes_unknown_stderr_after_owned_process_had_exited(
+    owned_probe: _Harness,
+) -> None:
+    stderr = b"private unknown host output\r\n"
+    facts = await _failed_owned_probe_facts(owned_probe, stderr=stderr, exit_code=7)
+    before, after = facts["before_cleanup"], facts["after_cleanup"]
+    assert before["exit"] == "nonzero" and before["stderr_bytes"] == len(stderr)
+    assert before["stderr_kind"] == "unrecognized" and before["phase"] == "response"
+    assert before["script_stages"] == [] and before["stage_sequence"] == "unobserved"
+    assert after["exit"] == "nonzero" and after["readers_settled"] is True
+
+
+@pytest.mark.parametrize(
+    ("data", "stages", "kind", "capped"),
+    [
+        (b"", [], "empty", False),
+        (PREFIX + b"script_entered", [], "unrecognized", False),
+        (b"private unknown line\r\n", [], "unrecognized", False),
+        (stage_bytes(*STAGES), list(STAGES), "known_stage", False),
+        (b"x" * MAX_STDERR_BYTES + stage_bytes(*STAGES), [], "unrecognized", True),
+    ],
+    ids=["empty", "partial", "unknown", "known", "capped"],
+)
+async def test_probe_snapshot_keeps_only_bounded_counts_and_known_complete_stages(
+    owned_probe: _Harness, data: bytes, stages: list[str], kind: str, capped: bool
+) -> None:
+    lease = cast(diagnostic.ProbeHelperLease, owned_probe.lease)
+    lease._stderr.extend(data)
+    facts = lease._snapshot()
+    assert facts["stderr_bytes"] == min(len(data), MAX_STDERR_BYTES)
+    assert facts["stderr_kind"] == kind and facts["stderr_prefix_capped"] is capped
+    assert facts["script_stages"] == stages
+    assert facts["stage_sequence"] == ("valid" if stages else "unobserved")
+    assert facts["phase"] == "not_started" and facts["elapsed_ms"] == 0
+    assert set(facts["phase_ms"]) == {"spawn", "send", "response", "cleanup"}
+    assert "private" not in json.dumps(facts)
+
+
+async def test_probe_late_spawn_preserves_original_cancel_and_adopts_same_process(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = owned_probe
+    case.spawn_release.clear()
+    original: list[asyncio.CancelledError] = []
+    request = case.lease.request
+
+    async def capture(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return await request(*args, **kwargs)
+        except asyncio.CancelledError as error:
+            original.append(error)
+            raise
+
+    monkeypatch.setattr(case.lease, "request", capture)
+    operation = asyncio.create_task(diagnostic.observe_probe(case.lease))
+    try:
+        async with asyncio.timeout(2):
+            await case.spawn_entered.wait()
+            operation.cancel("private cancellation")
+            while case.lease.before_cleanup is None:
+                await asyncio.sleep(0)
+            before = case.lease.before_cleanup
+            assert before["spawn"] == "pending" and before["phase"] == "spawn"
+            assert before["process_exists"] is False and before["sent"] == 0
+            assert not operation.done()
+            case.spawn_release.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await operation
+        facts = note(caught.value)
+        assert len(original) == 1 and caught.value is original[0]
+        assert facts["before_cleanup"] == before
+        assert facts["after_cleanup"]["spawn"] == "returned"
+        assert facts["after_cleanup"]["phase"] == "settled"
+        assert facts["cleanup"] == "confirmed"
+        assert case.spawns == case.cleanups == 1 and case.lease._process is cast(
+            object, case.process
+        )
+        assert len(case.writer.frames) == case.writer.drains == 0
+        assert case.writer.closes == case.writer.waits == 1
+        assert "private" not in json.dumps(facts)
+    finally:
+        case.spawn_release.set()
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_observed_probe_full_stage_note_stays_within_original_budget(
+    owned_probe: _Harness,
+) -> None:
+    facts = await _failed_owned_probe_facts(
+        owned_probe, stderr=stage_bytes(*STAGES), exit_code=None
+    )
+    for phase in ("before_cleanup", "after_cleanup"):
+        assert facts[phase]["script_stages"] == list(STAGES)
+        assert facts[phase]["stderr_kind"] == "known_stage"
+        assert facts[phase]["stderr_bytes"] == len(stage_bytes(*STAGES))
+
+
+async def test_probe_cancelled_readers_do_not_claim_pipe_eof(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = owned_probe
+
+    async def settle(
+        process: asyncio.subprocess.Process, readers: list[asyncio.Task[None]], **kwargs: Any
+    ) -> None:
+        assert process is cast(object, case.process) and process.stdin is not None
+        case.cleanups += 1
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        case.process.returncode = 7
+
+    monkeypatch.setattr(ax_lease, "_settle_process", settle)
+    facts = await _failed_owned_probe_facts(case, stderr=b"", exit_code=None)
+    assert facts["after_cleanup"]["readers_settled"] is True
+    assert all(reader.cancelled() for reader in case.lease._readers)
+    assert not case.process.stdout.at_eof() and not case.process.stderr.at_eof()
+
+
+async def test_probe_relative_phase_times_are_floored_bounded_and_frozen_after_cleanup(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lease = cast(diagnostic.ProbeHelperLease, owned_probe.lease)
+    clock = [100.0]
+    monkeypatch.setattr(lease, "_observation_time", lambda: clock[0])
+    lease._observe("spawn")
+    clock[0] += 0.00175
+    lease._observe("send")
+    clock[0] += 0.00225
+    lease._observe("response")
+    clock[0] += 0.00350
+    before = lease._snapshot()
+    assert before["elapsed_ms"] == 7
+    assert before["phase_ms"] == {"spawn": 1, "send": 2, "response": 3, "cleanup": 0}
+    lease._observe("cleanup")
+    clock[0] += 0.00425
+    lease._observe("settled")
+    after = lease._snapshot()
+    assert after["elapsed_ms"] == 11
+    assert after["phase_ms"] == {"spawn": 1, "send": 2, "response": 3, "cleanup": 4}
+    clock[0] += 10_000
+    assert lease._snapshot() == after
+    assert diagnostic._milliseconds(-1.0) == diagnostic._milliseconds(0.0009) == 0
+    assert diagnostic._milliseconds(0.0019) == 1
+    assert diagnostic._milliseconds(float(2**31)) == 2**31 - 1
+
+
+@pytest.mark.parametrize("component", ["snapshot", "projection", "clock", "cleanup"])
+async def test_probe_observation_faults_preserve_original_error_and_cleanup_owner(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    case = owned_probe
+    failure = AXLeaseError("read_timeout", "private original timeout")
+
+    def unavailable(*args: object, **kwargs: object) -> Any:
+        raise RuntimeError("private observation error")
+
+    if component == "snapshot":
+        monkeypatch.setattr(case.lease, "_snapshot", unavailable)
+    elif component == "projection":
+        monkeypatch.setattr(diagnostic, "probe_facts", unavailable)
+    elif component == "clock":
+        monkeypatch.setattr(case.lease, "_observation_time", unavailable)
+    else:
+        case.cleanup_failure = RuntimeError("private cleanup error")
+    operation = asyncio.create_task(diagnostic.observe_probe(case.lease))
+    try:
+        async with asyncio.timeout(2):
+            await case.writer.drain_entered.wait()
+            assert case.lease._pending is not None
+            case.lease._pending.set_exception(failure)
+            with pytest.raises(AXLeaseError) as caught:
+                await operation
+        assert caught.value is failure and caught.value.outcome == "not_started"
+        assert case.spawns == case.cleanups == 1 and case.lease._process is cast(
+            object, case.process
+        )
+        if component == "cleanup":
+            assert note(failure)["cleanup"] == "unconfirmed" and not case.lease.closed
+        else:
+            assert case.lease.closed and not getattr(failure, "__notes__", ())
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_native_first_probe_keeps_original_factory_argv_and_one_owned_lifecycle(
+    owned_probe: _Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test_uia_native as native
+
+    case = owned_probe
+    # This checks the private factory binding restored by monkeypatch.context.
+    factories = vars(uia_computer)
+    original = factories["AXHelperLease"]
+    constructed: list[tuple[list[str], dict[str, Any]]] = []
+    executable = tmp_path / "private-owned-host.exe"
+    monkeypatch.setattr(uia_computer, "_powershell", lambda: executable)
+
+    def construct(argv: list[str], **kwargs: Any) -> AXHelperLease:
+        constructed.append((argv, kwargs))
+        return case.lease
+
+    monkeypatch.setattr(native, "ProbeHelperLease", construct)
+    form = native.NativeForm(cast(asyncio.subprocess.Process, object()), "owned", asyncio.Queue())
+    failure = AXLeaseError("read_timeout", "private original timeout")
+    operation = asyncio.create_task(
+        native.test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
+            form, tmp_path, monkeypatch
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            await case.writer.drain_entered.wait()
+            assert case.lease._pending is not None
+            case.lease._pending.set_exception(failure)
+            with pytest.raises(AXLeaseError) as caught:
+                await operation
+        assert caught.value is failure and factories["AXHelperLease"] is original
+        assert len(constructed) == 1
+        argv, kwargs = constructed[0]
+        module_file = uia_computer.__file__
+        assert module_file is not None
+        expected = [
+            str(executable),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Mta",
+            "-File",
+            str(Path(module_file).with_name("uia_helper.ps1")),
+        ]
+        assert (argv == expected) is True
+        configuration = native.settings().computer
+        assert kwargs == {
+            "timeout": configuration.operation_timeout_seconds,
+            "ttl": configuration.snapshot_ttl_seconds,
+            "max_nodes": configuration.max_nodes,
+            "once": True,
+        }
+        assert case.spawns == case.cleanups == 1
+        assert len(case.writer.frames) == case.writer.drains == 1
+        assert case.lease._once is True and note(failure)["cleanup"] == "confirmed"
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
