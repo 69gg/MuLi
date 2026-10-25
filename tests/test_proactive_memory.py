@@ -23,7 +23,6 @@ from muli.proactive_memory import PREFERENCE_SQL, PreferenceEvidence, check_pref
 from muli.providers import ModelTurn, ToolCall
 from muli.runtime import Runtime
 from muli.server import create_app
-from muli.store import Store
 from muli.tools import Tool, parameters
 
 
@@ -313,16 +312,23 @@ async def test_frozen_proof_survives_restart_and_does_not_turn_into_latest_bindi
     notice = runtime.store.get("notification", "update-99.0.0")
     assert notice is not None
     frozen = FrozenRouting.load(notice["routing"])
-    database = Path(runtime.store.db.execute("PRAGMA database_list").fetchone()[2])
-    reopened = Store(database)
+    assert frozen.memory_evidence is not None
+    instance = runtime.store.instance_id
+    main = runtime.main_session()["id"]
+    await runtime.close()
+    reopened = Runtime(runtime.config, runtime.data_dir, client_factory=runtime.client_factory)
     try:
-        persisted = reopened.get("notification", notice["id"])
+        assert reopened.store.instance_id == instance
+        assert reopened.main_session()["id"] == main
+        persisted = reopened.store.get("notification", notice["id"])
+        assert persisted is not None
         assert FrozenRouting.load(persisted["routing"]) == frozen
+        reopened.config.update({"channels": {"proactive": {"memory_preference": None}}})
+        assert FrozenRouting.independent(reopened.config.settings, reopened.store.db) != frozen
+        await update(reopened, independent=True)
+        assert reopened.store.get("notification", notice["id"])["routing"] == frozen.dump()
     finally:
-        reopened.close()
-    runtime.config.update({"channels": {"proactive": {"memory_preference": None}}})
-    await update(runtime, independent=True)
-    assert runtime.store.get("notification", notice["id"])["routing"] == frozen.dump()
+        await reopened.close()
     assert FrozenRouting.bound(origin()).memory_evidence is None
 
 
