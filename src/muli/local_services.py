@@ -54,6 +54,9 @@ class LocalServices:
             max_handoff_records=lambda: runtime.config.settings.limits.max_search_results,
         )
         runtime.task_control = self.task_control
+        self.task_control.scheduled_replan_guard = lambda receipt, targets: (
+            runtime.scheduled_task_replans.guard_receipt(receipt, targets)
+        )
         runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.add_tool_provider(self.delivery_tools, coordinator=True, session_scoped=True)
         runtime.context_hooks.append(self.context)

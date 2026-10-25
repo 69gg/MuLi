@@ -550,6 +550,12 @@ class Runtime:
 
     def _guard_request(self, request: PreparedRequest, risk: str = "write") -> None:
         self.scheduled_workflows.guard_session(request.session_id)
+        self.scheduled_task_replans.guard_request(
+            request.session_id,
+            self.run_ids.get(request.session_id),
+            request.selected_replan,
+            risk,
+        )
         if self.task_control is not None:
             self.task_control.guard_execution(
                 request.execution_scope, session_id=request.session_id, risk=risk
@@ -804,6 +810,17 @@ class Runtime:
                     if inserted and principal == "owner" and receipt["state"] == "pending"
                     else []
                 )
+                if inserted and principal == "owner" and receipt["state"] == "pending":
+                    self.scheduled_task_replans.owner_input_admitted(session["id"], receipt["id"])
+                if (
+                    principal == "owner"
+                    and not active
+                    and receipt["state"] == "pending"
+                    and self.maintenance.admission.allowed
+                ):
+                    previous_mode = session["mode"]
+                    session["mode"] = selected
+                    self._store_session(session, previous_mode=previous_mode)
             # No await separates committing the new input and cancelled tickets
             # from waking their original waiter. A rollback never wakes it.
             for future in superseded:
@@ -823,8 +840,6 @@ class Runtime:
                 and receipt["state"] == "pending"
                 and self.maintenance.admission.allowed
             ):
-                session["mode"] = selected
-                self.store.put("session", session)
                 if session["id"] not in self._stopping:
                     self._launch(session, "main", cast(Mode, selected))
             run_id = receipt.get("run_id")
@@ -963,6 +978,7 @@ class Runtime:
         return messages
 
     def _configure_workflows(self) -> None:
+        from muli.scheduled_task_replans import ScheduledTaskReplans
         from muli.scheduled_workflows import ScheduledWorkflows
         from muli.workflows import WorkflowEngine
 
@@ -978,10 +994,34 @@ class Runtime:
             scope_admission=self._workflow_admission,
         )
         self.scheduled_workflows = ScheduledWorkflows(self)
+        self.scheduled_task_replans = ScheduledTaskReplans(self)
         self.workflows.on_idle = lambda: self.reminders.changed.set()
-        self.reminders.workflow_tick = self.scheduled_workflows.tick
-        self.reminders.workflow_due = self.scheduled_workflows.next_due
+        self.reminders.workflow_tick = self._scheduled_tick
+        self.reminders.workflow_due = self._scheduled_due
         self.reminders.changed.set()
+
+    async def _scheduled_tick(self, timestamp: float) -> None:
+        await self.scheduled_task_replans.tick(timestamp)
+        await self.scheduled_workflows.tick(timestamp)
+
+    def _scheduled_due(self, timestamp: float) -> float | None:
+        deadlines = [
+            due
+            for due in (
+                self.scheduled_task_replans.next_due(timestamp),
+                self.scheduled_workflows.next_due(timestamp),
+            )
+            if due is not None
+        ]
+        return min(deadlines) if deadlines else None
+
+    def _store_session(self, session: dict[str, Any], *, previous_mode: str) -> dict[str, Any]:
+        """Persist mode edits and revocation in the caller's transaction, without committing."""
+        self.scheduled_task_replans.session_mode_changed(
+            session["id"], previous_mode, session["mode"]
+        )
+        self.store._put("session", session)
+        return session
 
     @property
     def busy(self) -> bool:
@@ -1208,6 +1248,8 @@ class Runtime:
                 "reminder_reschedule",
                 "workflow_schedule",
                 "workflow_schedule_cancel",
+                "task_schedule_replan",
+                "task_schedule_replan_cancel",
             }
         )
         self._tool_factories.clear()
@@ -1280,12 +1322,14 @@ class Runtime:
         # Close an interrupted batch before a new user record hides its open tail.
         # Unknown outcomes are journalled, never retried.
         self._repair_tail(session_id)
+        previous_mode = session["mode"]
         if mode:
             session["mode"] = mode
         if session["title"] == "新会话":
             session["title"] = content[:40]
         session["updated_at"], session["status"] = now(), "running"
-        self.store.put("session", session)
+        with self.store.db:
+            self._store_session(session, previous_mode=previous_mode)
         message = self.store.add_message(session_id, "user", content)
         if session.get("kind") == "main":
             self._invalidate_voice_reply()
@@ -1772,6 +1816,15 @@ class Runtime:
                         "确认只能记录计划，不能覆盖主人原始限制或增加授权；空 targets 不唤醒队友。"
                         "暂停前已进入的操作仍可能收尾，继续时先核查未知结果，不声称已经回滚。"
                     )
+                    if "task_schedule_replan" in self.tools:
+                        prompt += (
+                            "\n主人明确约定到某时段继续原暂停任务时，先核当前时间、完整说明与"
+                            "已停靠的原直系队友，再用 task_schedule_replan 登记准确任务、队友、"
+                            "开始时间、失效时间和稳定去重键；没有明确失效时间先询问。"
+                            "登记不等于已经继续，到期仍先读说明并在下一轮提交新方案；"
+                            "只能通知约定的原队友，不能换人或扩大权限。用列表核查实际状态，"
+                            "未批准前可取消约定；批准后沿原任务暂停或停止入口处理。"
+                        )
         summaries = [item["content"] for item in stored if item.get("compaction_summary")]
         if summaries:
             prompt += "\n\n" + "\n".join(summaries)
@@ -2312,6 +2365,21 @@ class Runtime:
         return result["allow"], result["reason"][:500]
 
     def _personal_tools(self) -> list[Tool]:
+        async def schedule_task_replan(args: dict[str, Any]) -> Any:
+            item = self.scheduled_task_replans.create(**args)
+            self.reminders.changed.set()
+            await self.bus.notify()
+            return item
+
+        async def list_scheduled_task_replans(args: dict[str, Any]) -> Any:
+            return self.scheduled_task_replans.list(**args)
+
+        async def cancel_scheduled_task_replan(args: dict[str, Any]) -> Any:
+            item = self.scheduled_task_replans.cancel(args["id"])
+            self.reminders.changed.set()
+            await self.bus.notify()
+            return item
+
         async def schedule_workflow(args: dict[str, Any]) -> Any:
             item = self.scheduled_workflows.create(**args)
             await self.bus.notify()
@@ -2426,6 +2494,40 @@ class Runtime:
             return item
 
         return [
+            Tool(
+                "task_schedule_replan",
+                "主人明确约定未来重新规划一个已暂停任务，并交给指定原直系队友。"
+                "先核当前时间与完整任务；必须给开始及失效时间，仅登记一次，"
+                "到期仍须读取完整说明并在下一轮批准方案；不等同于已续办或验收。",
+                parameters(
+                    {
+                        "task_id": string(),
+                        "target_id": string(),
+                        "due_at": {"type": "number"},
+                        "expires_at": {"type": "number"},
+                        "key": string("本次约定的稳定去重键"),
+                    },
+                    ("task_id", "target_id", "due_at", "expires_at", "key"),
+                ),
+                schedule_task_replan,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
+                "task_schedule_replan_list",
+                "分页核查原任务的定时续办约定及实际接纳状态；不触发执行",
+                parameters({"after": string(), "limit": {"type": "integer", "minimum": 1}}),
+                list_scheduled_task_replans,
+                preserve_output=True,
+            ),
+            Tool(
+                "task_schedule_replan_cancel",
+                "撤销尚未批准的定时续办资格；已批准的任务使用原任务暂停或停止入口",
+                parameters({"id": string()}, ("id",)),
+                cancel_scheduled_task_replan,
+                "write",
+                preserve_output=True,
+            ),
             Tool(
                 "workflow_schedule",
                 "明确授权未来自动执行固定 worker→reviewer 任务并将文字成果回原私聊/Web。"

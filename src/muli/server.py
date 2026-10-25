@@ -1140,14 +1140,17 @@ def _create_app(
 
     @app.patch("/api/sessions/{session_id}")
     async def update_session(session_id: str, body: SessionInput) -> dict[str, Any]:
-        session = runtime.store.get("session", session_id)
-        if not session:
-            raise KeyError(session_id)
-        if session_id in runtime.tasks:
-            raise HTTPException(409, "运行中不能变更会话权限")
-        session.update(body.model_dump(exclude_unset=True, exclude_none=True))
-        session["updated_at"] = now()
-        return runtime.store.put("session", session)
+        async with runtime.configuration_lock:
+            session = runtime.store.get("session", session_id)
+            if not session:
+                raise KeyError(session_id)
+            if session_id in runtime.tasks:
+                raise HTTPException(409, "运行中不能变更会话权限")
+            previous_mode = session["mode"]
+            session.update(body.model_dump(exclude_unset=True, exclude_none=True))
+            session["updated_at"] = now()
+            with runtime.store.db:
+                return runtime._store_session(session, previous_mode=previous_mode)
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:

@@ -62,6 +62,14 @@ Runtime 保存 `run.status=paused`、`pause_reason`、`observed_epoch`，发布 
 
 `tests/test_task_control_runtime.py` 使用临时 SQLite、假模型、真实 Runtime/Team/AttentionInbox 与 Event 门控验证以上边界，包括原生批次、最后 await、快照冻结、继承身份、满箱恢复、先投递后停靠、报告公平交接和真实系统注意事项。没有调用真实模型、网络或设备。
 
+## 约定时间重新规划原任务（v2.65 开发候选）
+
+主人可以明确约定：“这个任务先暂停，明天九点到十点之间交给这位原队友继续。”主助手核实当前时间、完整任务和已停靠的原直系队友后，调用 `task_schedule_replan(task_id,target_id,due_at,expires_at,key)`，保存明确的开始与失效窗口；不是另建独立工作流，也不直接解除暂停。
+
+`task_schedule_replan_list` 分页核查约定：等待表示尚未接纳，到期接纳表示重规划意图与主输入已保存，批准表示主助手真正读取完整说明后，在下一轮确认了原目标的方案。三者均不等于工具已执行、任务完成或交付验收。`task_schedule_replan_cancel(id)` 撤销尚未批准的资格；已批准的执行仍使用原暂停或停止入口，不承诺追回已发生的副作用。
+
+等候复用原提醒时钟与事件唤醒，零 AI 轮询；后台未运行时不唤醒电脑。普通提醒仍只提醒，定时独立工作流仍执行其独立委托。完整到期、正常重开、新代及原路回报的离线旅程与独立后审已通过，发行检查尚未闭合，范围与回退限制见[约定时间继续原任务](scheduled-task-replans.md)。
+
 ## 显式交付验收候选
 
 主助手可显式调用 `task_delivery_record`，为当前任务版本的一个准确直接队友完成报告和一个本地 UTF-8 附件副本保存验收依据。独立协调 provider 只登记这个 write 工具；队友 schema 不提供它，handler 仍复核真实主会话和运行。原工具 provider、普通 completed、任务状态、方案批准与 owner 权限不变。

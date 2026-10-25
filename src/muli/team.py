@@ -575,6 +575,7 @@ class TeamManager:
                         "任务已暂停，等待主人明确要求重新规划及主助手确认方案",
                         observed_epoch=paused[1],
                     )
+                self.runtime.scheduled_task_replans.guard_target_start(agent, session)
                 agent.pop("report_binding", None)
                 agent.update(status="running", generation=agent["generation"] + 1, updated_at=now())
                 run_id = self.runtime._launch(session, agent["role"], cast(Mode, agent["mode"]))
