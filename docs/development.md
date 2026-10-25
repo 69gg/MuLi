@@ -1,77 +1,74 @@
-# 开发验证与资源保护
+# 开发与验证
 
-本项目的持续开发、测试和审查协作使用 `gpt-6.1-sol`。`gpt-6-astra` 同时最多一个，
-仅按需新开短会话提供项目建议或轻量方案审视，完成后停止；不恢复旧的 Astra 长任务。
-这是开发协作的额度约定，MuLi 用户配置的模型选择仍由其自身配置决定。
+开发前阅读仓库的 `AGENTS.md`。Python 使用类型注释；先了解现有实现，再修改代码，并同步相关使用文档与必要回归。
 
-Linux 本地检查统一经过 `scripts/check_local.py`，使用已有 systemd 用户管理器和 cgroup v2，不安装运行库、不修改系统服务、不会配置开机自启。执行前在服务内部读取自身与共享 slice 的内核控制文件，再启动检查；环境不具备控制能力或任一限制缺失时拒绝执行。
+## 准备环境
 
-| 范围 | 内存 | Swap | CPU | 进程与线程 | 时间 |
-| --- | --- | --- | --- | --- | --- |
-| 全部本地 agent/worktree 的检查合计 | 2 GiB | 0 | 一个逻辑 CPU 的等效时间预算 | 128 | — |
-| 一次检查及其所有子进程 | 1 GiB | 0 | 受上述共享预算约束 | 128 | 运行预算 180 秒，终止宽限 2 秒 |
-
-Node 额外限制 V8 堆为 256 MiB。前端预设按文件单并发，测试超时 15 秒；该超时不能替代进程组期限。禁止 core dump，避免失败生成大文件。普通测试结束、取消、超时和局部 OOM 均由独立 service 回收其子进程，不停止其它检查或 Codex。共享 slice 只有本次登录的运行时配置，不改变 `user.slice` 或其它应用的额度。
-
-```sh
-# 复用已经安装的依赖，不自动同步或下载
-python scripts/check_local.py backend .venv/bin/python
-python scripts/check_local.py frontend tests/frontend/api.test.mjs
-python scripts/check_local.py run -- .venv/bin/python -m pytest -q tests/test_local_check.py
-python scripts/check_local.py --seconds 30 run -- .venv/bin/ruff check .
+```bash
+git clone https://github.com/69gg/MuLi.git
+cd MuLi
+uv sync --locked
+uv run MuLi init --no-source --no-service
+uv run MuLi serve
 ```
 
-其它 worktree 在其自身目录调用主仓库脚本的绝对路径；共享名称固定为 `muli-checks.slice`，每次 service 使用不同名称。脚本输出 service 名称、退出结果、运行时间、内存峰值与 swap 使用，测试失败不会变成成功。只有全部启动前检查通过后才会出现 `Kernel resource limits verified`。
+默认前端不需要 Node 构建；运行前端测试时需要已有 Node。不要为了验证自动下载本地模型、安装大型运行库，或操作真实用户数据和桌面。
 
-`backend` 必须显式指定已有 Python 解释器，不能自动下载或创建环境。核验资源限制后，按当前仓库约定递归发现 `tests/` 下的 `test_*.py` 与 `*_test.py`，固定文件清单；每批最多 32 个文件，使用新 pytest 进程串行运行，避免一个 Python 进程长期保留全套测试对象。也可在解释器后指定测试文件；目录、pytest 选项和不存在的路径拒绝，不悄悄改跑全量。需要 `-k` 等筛选时仍使用 `run -- 解释器 -m pytest ...`。
+## 本机检查入口
 
-所有批次在**同一个** service/cgroup 与总运行期限内，后续批次不重置 180 秒预算，不提高内存或 CPU 限额。第一批失败、进程被信号终止或资源守卫拒绝后停止，不重试或继续其它批；取消仍回收整个 service。新进程释放自身堆，并不承诺所有文件缓存立即归零或任意规模测试一定能在预算内通过。前端保留原验证方式，远端 CI 的分片见下文。
+Linux 本地测试、检查、打包和实验统一经过 `scripts/check_local.py`。它要求 systemd 用户管理器与 cgroup v2，核验内核实际限制后才执行；无法确认限制时停止，不退回无保护运行。
 
-此入口以当时全部 125 个后端文件实际运行四批，3,034 项通过、1 项平台跳过，整个 service 55.278 秒、峰值 846.8 MiB、swap 0；这是单个 cgroup 的整组峰值，不与四个独立 service 的分批峰值混称。随后将目录发现移入资源核验之后，26 项守卫检查与 48 项已有库检查经真实 backend 入口同组通过（峰值 86.7 MiB），Ruff/格式及脚本严格 mypy 通过。小型临时 pytest 替身还验证了真实新 PID、参数顺序和第二批失败后不启动第三批；无需递归运行真实 pytest 或创建额外服务。
+| 范围 | 内存 | Swap | CPU | 进程与线程 | 期限 |
+| --- | --- | --- | --- | --- | --- |
+| 全部 agent 与 worktree 合计 | 2 GiB | 0 | 一个逻辑 CPU 的等效时间预算 | 128 | — |
+| 单次检查及其子进程 | 1 GiB | 0 | 受共享预算限制 | 128 | 最长180秒 |
 
-默认离线设置 `UV_OFFLINE=1`、`UV_NO_SYNC=1`，明确传入 PATH、当前源码路径、Node 堆及数值库单线程环境。其它临时环境不自动继承，确需变量可在受限命令中使用 `env NAME=value`，不得覆盖保护变量。它是开发执行规范，不是恶意代码沙箱，也不阻止用户主动绕开脚本；所有协作 agent 必须遵守仓库 AGENTS.md。
+Node 堆另限256 MiB，前端按文件单并发。取消、超时与局部内存超额会收口该检查的任务组；此入口是开发资源保护，不是恶意代码沙箱，也不提供跨平台等价隔离。
 
-显式设置过的 `UV_CACHE_DIR` 会保留，用于复用已有包和构建缓存；`UV_PYTHON_DOWNLOADS=never` 禁止自动下载解释器。构建依赖不在现有缓存时明确失败，不改为在线下载。首次隔离打包发现遗漏该缓存目录后已补上白名单与回归，随后完全离线构建和安装验收通过。
+常用命令：
 
-优先小范围验证，串行执行较重检查；不要在失败后提高限额或循环重跑。先读取有限错误日志、审查代码和 fixture。比较 DOM 或循环引用对象的身份时断言 `actual === expected` 的布尔结果，避免诊断格式化遍历完整对象图。
+```bash
+python scripts/check_local.py backend .venv/bin/python tests/test_runtime.py
+python scripts/check_local.py frontend tests/frontend/api.test.mjs
+python scripts/check_local.py run -- .venv/bin/ruff check .
+python scripts/check_local.py run -- .venv/bin/ruff format --check .
+python scripts/check_local.py run -- .venv/bin/mypy
+python scripts/check_local.py run -- uv build --offline
+python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
+```
 
-macOS、Windows 和没有 systemd 的 Linux 可继续运行 MuLi 产品；此本地开发入口不声称具备这些平台的等价隔离。托管 CI 在独立运行器执行既有跨平台矩阵，保留 job 硬超时，前端单并发与 Node 堆限制；`faulthandler_timeout` 仅用于诊断，不是进程终止保证。
+其它 worktree 从自己的工作目录调用主仓库脚本的绝对路径，并指定已有解释器。不得绕过守卫、提高限额求通过，或把工具等待时间当成硬超时。命令返回仍在运行时，收取最终退出结果后再启动下一项检查。
 
-Linux 和 Windows CI 的每种 Python 版本使用两份不重叠的测试集合，macOS 继续各跑全套。
-显式 `--muli-ci-shard=1` / `2` 只在 pytest 完成正常收集后，按排序后的文件路径
-交错分组；同文件全部参数化用例和 fixture 生命周期保持在同一作业，不另写一套
-文件发现规则。非法参数和空片失败，没有该选项时行为不变。两片合起来覆盖同一
-收集集合，文件均分不保证耗时均分，所有平台输出 `--durations=20` 供后续定位。
-每项仍为十分钟上限，矩阵最多六项并行；恢复证据名称含分片编号，避免覆盖。
-本配置将测试矩阵从八项扩为十项，通用 CI 从十项扩为十二项（十个测试作业、质量、MCP），
-发行复用它后共十五项。Windows 分片旨在缩短尾部等待；重复的环境准备可能略增总运行器成本，
-不承诺耗时减半或节省总分钟数。该矩阵调整的远端效果待验证，不改写此前十项 CI／十三项发行的历史结果。
-本地守卫与后端分批入口不改变。微型真实 pytest 回归验证无参数全量、参数化并集/交集、
-同文件归属、非法参数与空片，不运行本地完整测试集。
+### 定向与全量验证
 
-MCP 作业安装 `mcp` 和 `channels` 可选依赖，通过 shell 的文件模式执行全部
-`tests/test_mcp*.py`、`tests/test_team_progress*.py` 及渠道测试。新增 MCP 文件因此自动进入
-该作业，不能只依赖默认依赖矩阵中的收集：需要可选 SDK 的测试在默认安装中可能跳过。
-v2.51 新资源链接旅程已在本地安装的 SDK 下通过；其发行时远端 MCP 作业仍是旧的显式文件表，
-未包含这两份新增文件。本次调整补上覆盖，不能倒推旧发行已经远端运行这些节点。
+先运行相关小范围；通过后再按改动范围做整合检查。需要 pytest 的 `-k` 等参数时，通过 `run --` 调用已有解释器。
 
-分片依据为 [pytest collection hook](https://docs.pytest.org/en/stable/reference/reference.html#pytest.hookspec.pytest_collection_modifyitems)
-及 [GitHub matrix](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)；
-接口先经 Context7 检索，再核对已锁定 pytest 8.4.2 源码。
+`backend` 后必须提供解释器，可再列出测试文件；不接受目录或 pytest 选项。不指定文件时发现全套后端测试，在同一个守卫内按最多32个文件串行分批；后续批次不会重置总期限，首批失败即停止。
 
-## 队友进度等待的阶段诊断
+默认设置 `UV_OFFLINE=1`、`UV_NO_SYNC=1`、`UV_PYTHON_DOWNLOADS=never`，复用现有环境和缓存，不自动安装依赖。需要额外变量时，在受限命令中显式使用 `env NAME=value`，不得覆盖保护变量。离线构建缺少依赖时应明确失败。
 
-v2.62正式候选与Release通过，但同提交额外main CI `40100288273` 的Windows3.12第二片
-在 `test_bad_attachment_and_full_parent_inbox_leave_no_partial_progress` 观察到2秒后仍running。
-原满邮箱与坏附件拒绝同步执行，不等待容量；Team.wait超时只返回快照，不取消worker。
-driver可以先发布run.completed，在资源回收后才持久化run终态，因此原running/最后工具
-快照不足以判断等待阶段，不能据此直接归因平台调度或生产死锁。
+失败后先看有限日志和相关代码，不循环触发同一个失控用例。比较 DOM 或含循环引用对象的身份时，断言布尔结果，避免失败报告递归展开整个对象图。
 
-`tests/test_team_progress_policy.py` 保留原2秒与全部行为断言；只在失败时输出≤1KiB的
-固定阶段、0/1/2或other模型轮数、白名单超时原因和四类有界事件计数，不读消息正文。
-独立Event屏障校准完整委派真实资源释放后保持finalizer，观察真实run.completed已发布、
-数据库仍running的窗口；finally释放并观察同一真实worker正常完成，不以取消制造收口。
-本地校准与准确旧节点通过，四个完整相关文件60项通过；校准不是原远端失败的根因复现，
-不得放宽期限、跳过测试，或因后继CI通过就将其记为根因已修复。
+## 托管 CI
 
-实现依据：[systemd 资源控制](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)、[临时服务](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)、[服务期限与 OOM 策略](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)、[Node 测试运行器](https://nodejs.org/api/test.html)。
+CI 验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 Windows 每个版本按测试文件分成两份不重叠集合，macOS 运行完整集合；同文件的参数化用例保持在一起。分片不保证耗时均分。
+
+质量作业检查格式、类型、前端与发行包；可选集成作业另安装 MCP 和渠道依赖，覆盖默认环境可能跳过的 SDK 路径。每项保留 workflow 硬超时、有限并发和 Node 堆限制；诊断用的 `faulthandler_timeout` 不能代替终止期限。
+
+Windows 原生无障碍测试仅在托管 CI 创建并操作自己的临时窗口，本机开发不读取或点击真实桌面。专用诊断工作流与完整跨平台 CI 的覆盖范围不同，不能相互代替。
+
+测试应使用临时目录、假模型和受控 HTTP/SSE。协议回归通过不等于供应商、真实账号、桌面硬件或自然模型效果已经联调；在交付说明中准确标明未验证的部分。
+
+<a id="队友进度等待的阶段诊断"></a>
+
+### 定位等待问题
+
+队友完成事件、资源释放和最终状态保存可能处于不同阶段。诊断时用有界观察分别确认它们，不要仅凭一次等待超时就判断死锁，也不要靠放宽期限、跳过断言或重复运行掩盖问题。
+
+## 提交与发布
+
+保持提交范围清楚，避免混入本地配置、密钥、运行数据和生成草稿。使用仍有效的 GPG 密钥签名；密钥失效时先刷新，不默默降级为无签名提交。
+
+使用文档描述最终功能和操作方法；版本变化写入 [CHANGELOG](../CHANGELOG.md)。调试流水、测试数字和临时审查过程放在开发记录或 PR 中，不追加到用户指南。
+
+发布要求与 Trusted Publisher 配置见[发布说明](publishing.md)。
