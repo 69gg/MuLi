@@ -13,8 +13,8 @@
 MuLi 是面向个人电脑的常驻助手。你可以和她聊天、交办任务、管理文件，也可以从不同消息渠道继续同一段协作。沐璃以十八岁少女为形象，定位为数字生命与本地助手。
 
 <picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="docs/screenshots/workbench-desktop.jpg">
-  <img src="docs/screenshots/workbench-demo.gif" alt="沐璃新版工作台演示：输入任务、工具调用、人工批准和流式答复" width="960">
+  <source media="(prefers-reduced-motion: reduce)" srcset="https://raw.githubusercontent.com/69gg/MuLi/22433e03284bd8715972a3b71adeb21b1cf239c7/docs/screenshots/workbench-desktop.jpg">
+  <img src="https://raw.githubusercontent.com/69gg/MuLi/22433e03284bd8715972a3b71adeb21b1cf239c7/docs/screenshots/workbench-demo.gif" alt="沐璃新版工作台演示：输入任务、工具调用、人工批准和流式答复" width="960">
 </picture>
 
 - **一起做事**：搜索资料、管理文件，让多个 agent 分工、交流和复核。

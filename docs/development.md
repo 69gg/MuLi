@@ -59,6 +59,8 @@ Windows 原生无障碍测试仅在托管 CI 创建并操作自己的临时窗�
 
 测试应使用临时目录、假模型和受控 HTTP/SSE。协议回归通过不等于供应商、真实账号、桌面硬件或自然模型效果已经联调；在交付说明中准确标明未验证的部分。
 
+Portal 回归使用独立的临时 D-Bus 和合成图片。夹具按可用能力选择 Gio 的新对象注册入口，并兼容旧版；保留严格 stderr 检查，不通过过滤警告掩盖接口变化或真实错误。[Gio 注册接口](https://docs.gtk.org/gio/method.DBusConnection.register_object_with_closures2.html)
+
 <a id="队友进度等待的阶段诊断"></a>
 
 ### 定位等待问题
