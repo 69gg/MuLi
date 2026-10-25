@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -104,8 +105,9 @@ def main() -> None:
     commands.add_parser("doctor", help="显示配置和本机能力")
     recovery = commands.add_parser("management", help="查看恢复事务或接续现有控制者")
     recovery.add_argument("action", choices=["status", "recover"])
+    commands.add_parser("upgrade-channel-ownership", help="停机后升级旧渠道数据格式（仅 Linux）")
     args = parser.parse_args()
-    if args.command not in {None, "serve"}:
+    if args.command not in {None, "serve", "upgrade-channel-ownership"}:
         from muli.managed_cli import route_command
 
         arguments = [args.command]
@@ -125,7 +127,17 @@ def main() -> None:
             route_command(args.config, args.data_dir, arguments, managed_root=args.managed_root)
         except (OSError, ValueError) as exc:
             parser.error(getattr(exc, "code", "managed_entry_unavailable"))
-    if args.command == "init":
+    if args.command == "upgrade-channel-ownership":
+        from muli.channel_format_upgrade import upgrade_channel_ownership_format
+
+        try:
+            upgraded = upgrade_channel_ownership_format(
+                args.data_dir, managed_root=args.managed_root
+            )
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            parser.error(getattr(exc, "code", "store_format_upgrade_failed"))
+        print(json.dumps({"upgraded": upgraded}))
+    elif args.command == "init":
         from muli.initialization import clone_source, start_background
         from muli.initialization import initialize as initialize_config
 

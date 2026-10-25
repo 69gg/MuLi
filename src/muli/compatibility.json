@@ -6,10 +6,10 @@
   "requires_migration": false,
   "formats": {
     "database": {"reads": [1], "writes": 1},
-    "objects": {"reads": [1], "writes": 1},
+    "objects": {"reads": [2], "writes": 2},
     "configuration": {"reads": [1], "writes": 1},
-    "ingress": {"reads": [1], "writes": 1},
-    "outbox": {"reads": [1], "writes": 1},
+    "ingress": {"reads": [2], "writes": 2},
+    "outbox": {"reads": [2], "writes": 2},
     "memory": {"reads": [1], "writes": 1},
     "install_profile": {"reads": [1], "writes": 1}
   }

@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from jsonschema import Draft202012Validator
 
+from muli.channel_ownership import ChannelOwnership
 from muli.compaction import Compactor
 from muli.config import ConfigFile, ModelProfile, Settings
 from muli.context import ContextLimitError, context_size, pack_context
@@ -26,6 +27,7 @@ from muli.events import EventBus
 from muli.evidence import EvidenceError
 from muli.extensions import Extensions
 from muli.failure_diagnostics import capture_failure
+from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.history_evidence import HistoryEvidence
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
@@ -87,6 +89,7 @@ class PreparedRequest:
     selected_replan: TaskSnapshot | None = None
     reply_origin: ReplyOrigin = ReplyOrigin()
     attention_routing: FrozenRouting | None = None
+    channel_ownership: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +173,7 @@ class Runtime:
             raise
 
     def _initialize(self) -> None:
+        self.channel_ownership = ChannelOwnership(self)
         self.bus = EventBus(self.store)
         self.system_events = SystemEvents(
             self.store,
@@ -525,6 +529,7 @@ class Runtime:
             selected,
             reply_origin,
             attention_routing,
+            self.channel_ownership.current_proof(session_id, self.run_ids.get(session_id)),
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -550,6 +555,8 @@ class Runtime:
             self._request_context.reset(token)
 
     def _guard_request(self, request: PreparedRequest, risk: str = "write") -> None:
+        if request.channel_ownership is not None:
+            self.channel_ownership.guard(request.channel_ownership, session_id=request.session_id)
         self.scheduled_workflows.guard_session(request.session_id)
         self.scheduled_task_replans.guard_request(
             request.session_id,
@@ -792,6 +799,7 @@ class Runtime:
         route: dict[str, Any] | None = None,
         event_id: str | None = None,
         admission_guard: Callable[[], None] | None = None,
+        _channel_event: str | None = None,
     ) -> dict[str, Any]:
         """Persist cross-channel input without changing an in-flight model request."""
         if not content.strip() and attachment_ids:
@@ -803,6 +811,64 @@ class Runtime:
             if admission_guard is not None:
                 admission_guard()
             session = self.main_session()
+            ownership: dict[str, Any] | None = None
+            if _channel_event is not None:
+                if event_id != _channel_event or route is None:
+                    raise ValueError("渠道入站缺少宿主稳定事件或路由")
+                previous = self.store.db.execute(
+                    "SELECT receipt FROM channel_inbound WHERE id=?", (_channel_event,)
+                ).fetchone()
+                if previous is None:
+                    raise ValueError("渠道入站缺少已核验的接收记录")
+                if previous[0] is not None:
+                    return cast(dict[str, Any], json.loads(previous[0]))
+                legacy_id = hashlib.sha256(
+                    f"{session['id']}\0{source}\0{_channel_event}".encode()
+                ).hexdigest()
+                legacy = self.store.db.execute(
+                    "SELECT payload,state,seq,run_id FROM ingress WHERE id=?", (legacy_id,)
+                ).fetchone()
+                if legacy is not None:
+                    original = json.loads(legacy["payload"])
+                    if any(
+                        original.get(key) != value
+                        for key, value in (
+                            ("content", content),
+                            ("source", source),
+                            ("principal", principal),
+                            ("route", route),
+                            ("attachment_ids", list(attachment_ids or [])),
+                        )
+                    ):
+                        raise ValueError("旧渠道输入与当前信封不一致，不能重新分配")
+                    recovered = {
+                        "session_id": original["session_id"],
+                        "run_id": legacy["run_id"],
+                        "message": {
+                            **original,
+                            "seq": legacy["seq"],
+                            "role": "user",
+                            "delivery_status": legacy["state"],
+                        },
+                        "queued": legacy["state"] == "pending",
+                        "duplicate": True,
+                        "quarantined": legacy["state"] == "quarantined",
+                    }
+                    with self.store.db:
+                        self.store.db.execute(
+                            "UPDATE channel_inbound SET receipt=? WHERE id=? AND receipt IS NULL",
+                            (
+                                json.dumps(recovered, ensure_ascii=False, allow_nan=False),
+                                _channel_event,
+                            ),
+                        )
+                    return recovered
+                if principal == "owner":
+                    destination, ownership = self.channel_ownership.destination(route)
+                    session = self.store.get("session", destination) or {}
+                    if not session:
+                        raise PermissionError("渠道归属会话已不存在")
+            is_main = session.get("kind") == "main"
             active = session["id"] in self.tasks
             selected = mode or session["mode"]
             if selected not in {"ask", "auto", "yolo"}:
@@ -810,7 +876,7 @@ class Runtime:
             if active and mode is not None and mode != session["mode"]:
                 raise ValueError("请在当前运行结束后切换权限模式")
             if principal == "owner":
-                self.model_config("main")
+                self.model_config("main" if is_main else self.team.get(session["id"])["role"])
             payload = self.conversation.payload(
                 session["id"],
                 content,
@@ -821,6 +887,12 @@ class Runtime:
                 route=route,
                 event_id=event_id,
             )
+            if _channel_event is not None and self.store.format_state == CURRENT_FORMAT_STATE:
+                # The adapter's stable key already includes channel and account.
+                # Ownership changes must never manufacture a second input ID.
+                payload["id"] = hashlib.sha256(("channel\0" + _channel_event).encode()).hexdigest()
+            if ownership is not None:
+                payload["channel_ownership"] = ownership
             with self.store.db:
                 receipt, inserted = self.store._enqueue_input(
                     payload,
@@ -829,13 +901,17 @@ class Runtime:
                 )
                 superseded = (
                     self._supersede_main_approvals(session, input_id=receipt["id"])
-                    if inserted and principal == "owner" and receipt["state"] == "pending"
+                    if inserted
+                    and is_main
+                    and principal == "owner"
+                    and receipt["state"] == "pending"
                     else []
                 )
-                if inserted and principal == "owner" and receipt["state"] == "pending":
+                if inserted and is_main and principal == "owner" and receipt["state"] == "pending":
                     self.scheduled_task_replans.owner_input_admitted(session["id"], receipt["id"])
                 if (
                     principal == "owner"
+                    and is_main
                     and not active
                     and receipt["state"] == "pending"
                     and self.maintenance.admission.allowed
@@ -843,6 +919,28 @@ class Runtime:
                     previous_mode = session["mode"]
                     session["mode"] = selected
                     self._store_session(session, previous_mode=previous_mode)
+                if inserted and ownership is not None:
+                    agent = self.team.get(session["id"])
+                    self.store._put(
+                        "agent", {**agent, "status": "queued" if not active else agent["status"]}
+                    )
+                if _channel_event is not None:
+                    # Freeze the first assignment in the same transaction as ingress.
+                    initial_receipt = {
+                        "session_id": session["id"],
+                        "run_id": receipt.get("run_id"),
+                        "message": {**receipt, "role": "user", "delivery_status": receipt["state"]},
+                        "queued": receipt["state"] == "pending",
+                        "duplicate": not inserted,
+                        "quarantined": receipt["state"] == "quarantined",
+                    }
+                    self.store.db.execute(
+                        "UPDATE channel_inbound SET receipt=? WHERE id=? AND receipt IS NULL",
+                        (
+                            json.dumps(initial_receipt, ensure_ascii=False, allow_nan=False),
+                            _channel_event,
+                        ),
+                    )
             # No await separates committing the new input and cancelled tickets
             # from waking their original waiter. A rollback never wakes it.
             for future in superseded:
@@ -858,12 +956,15 @@ class Runtime:
                         hook_errors.append(type(exc).__name__)
             if (
                 principal == "owner"
+                and is_main
                 and not active
                 and receipt["state"] == "pending"
                 and self.maintenance.admission.allowed
             ):
                 if session["id"] not in self._stopping:
                     self._launch(session, "main", cast(Mode, selected))
+            if ownership is not None:
+                self.team.start()
             run_id = receipt.get("run_id")
             if principal == "owner" and receipt["state"] == "pending":
                 run_id = self.run_ids.get(session["id"])
@@ -1096,6 +1197,7 @@ class Runtime:
         self.scheduled_task_replans.session_mode_changed(
             session["id"], previous_mode, session["mode"]
         )
+        self.channel_ownership.mode_changed(session["id"], previous_mode, session["mode"])
         self.store._put("session", session)
         return session
 
@@ -1131,6 +1233,7 @@ class Runtime:
         self.store.revalidate_format()
         if self.busy:
             raise ValueError("请先停止运行中的任务")
+        self.channel_ownership.reconcile()
         self._invalidate_voice_reply()
         await self.compaction.close()
         await self.workflows.close()
@@ -1212,6 +1315,7 @@ class Runtime:
     def guard_approval_notice(self, notice: ApprovalNotice) -> dict[str, Any]:
         """Recheck the actual waiter and run, without selecting a new origin."""
         session_id, run_id = notice.session_id, notice.run_id
+        self.channel_ownership.current_proof(session_id, run_id)
         task = self.tasks.get(session_id)
         if (
             self._closing
@@ -1385,6 +1489,8 @@ class Runtime:
 
     def _start(self, session_id: str, content: str, mode: Mode | None) -> dict[str, Any]:
         self.maintenance.admission.require()
+        if self.channel_ownership.for_agent(session_id) is not None:
+            raise PermissionError("该队友正在接管渠道；请通过真实渠道输入，或先收回再派普通工作")
         session = self.store.get("session", session_id)
         if not session:
             raise KeyError(session_id)
@@ -2045,8 +2151,14 @@ class Runtime:
 
     def _reply_origin(self, session_id: str) -> ReplyOrigin:
         agent = self.store.get("agent", session_id)
-        if agent is not None:
+        ownership = self.channel_ownership.current_proof(session_id, self.run_ids.get(session_id))
+        if agent is not None and ownership is None:
             return ReplyOrigin.load(agent.get("reply_origin"))
+        if ownership is not None:
+            message = self.store.get("message", ownership["input_id"])
+            if message is None:
+                raise PermissionError("渠道归属来源输入已不可用")
+            return ReplyOrigin.from_input(message)
         # Read only provenance, never a potentially large historical message body.
         row = self.store.db.execute(
             "SELECT json_object('id',o.id,'source',json_extract(o.data,'$.source'),"
@@ -2174,20 +2286,28 @@ class Runtime:
                         if session.get("kind") == "main" and not workflow_step
                         else None,
                         prepared.reply_origin
-                        if session.get("kind") == "main" and not workflow_step
+                        if (session.get("kind") == "main" and not workflow_step)
+                        or prepared.channel_ownership is not None
                         else None,
                     )
                 paused: TaskPaused | None = None
+                returned = False
                 for call in turn.tool_calls:
                     spent += 1
-                    if paused is None:
+                    if paused is None and not returned:
                         try:
                             tool = round_tools.get(call.name)
                             self._guard_request(prepared, tool.risk if tool else "write")
                         except TaskPaused as exc:
                             paused = exc
-                    if paused is not None:
-                        result: Any = self._paused_result(paused)
+                    if returned:
+                        result: Any = {
+                            "status": "not_executed",
+                            "reason": "渠道已归还，本批剩余操作未执行",
+                        }
+                        await self._tool_completed(call, result, session_id)
+                    elif paused is not None:
+                        result = self._paused_result(paused)
                         await self._tool_completed(call, result, session_id)
                     elif self.store.pending_inputs(session_id):
                         result = {
@@ -2203,6 +2323,10 @@ class Runtime:
                         except TaskPaused as exc:
                             paused = exc
                             result = self._paused_result(exc)
+                        if call.name == "channel_delegate":
+                            returned = self.channel_ownership.returned(
+                                prepared.channel_ownership, result
+                            )
                     result_tool = round_tools.get(call.name)
                     preserve_output = (
                         result_tool is not None and result_tool.preserve_output is True
@@ -2265,6 +2389,12 @@ class Runtime:
                     )
                 if paused is not None:
                     raise paused
+                if returned:
+                    # A successful return revokes this request deliberately. End
+                    # locally without another model call or a stale effect guard.
+                    final = self.store.complete_message(session_id, "渠道已归还主助手。")
+                    await self.bus.emit("message.completed", {"message": final}, session_id)
+                    return _ExecutionResult(final["content"], reply_origin=prepared.reply_origin)
                 self._guard_request(prepared)
                 claimed = []
                 if round_index < self.config.settings.limits.max_tool_steps:
@@ -2302,6 +2432,30 @@ class Runtime:
             tools = {name: tool for name, tool in tools.items() if tool.risk == "read"}
         elif not workflow_step:
             tools.update({tool.name: tool for tool in self.team.tools(session_id, mode)})
+        if self.channel_ownership.for_agent(session_id) is not None:
+            # Independent follow-up executors need their own ownership contract;
+            # the first slice keeps all work in this actual, revocable request.
+            tools = {
+                name: tool
+                for name, tool in tools.items()
+                if name
+                not in {
+                    "spawn_agent",
+                    "send_message",
+                    "send_input",
+                    "resume_agent",
+                    "workflow_create",
+                    "workflow_schedule",
+                    "task_schedule_replan",
+                }
+            }
+            proof = self.channel_ownership.current_proof(session_id, run_id)
+            if self.channel_ownership.return_request(proof):
+                tools = {
+                    name: tool
+                    for name, tool in tools.items()
+                    if tool.risk == "read" or name == "channel_delegate"
+                }
         disabled = self.config.settings.disabled_tools
         trigger = self._latest_main_trigger(session_id)
         attention = bool(trigger and trigger.get("principal") == "system:attention")
@@ -2345,6 +2499,9 @@ class Runtime:
             if prepared.session_id != session_id:
                 raise PermissionError("工具请求与真实调用会话不匹配")
             self._guard_request(prepared, tool.risk)
+            self.channel_ownership.guard_call(
+                prepared.channel_ownership, call.name, arguments, tool.risk
+            )
             await self.permissions.check(
                 "ask" if tool.requires_approval else mode,
                 call.name,
@@ -2371,6 +2528,9 @@ class Runtime:
                 # Final synchronous fence after the last await. No await may be
                 # added between this check and entering the trusted handler.
                 self._guard_request(prepared, tool.risk)
+                self.channel_ownership.guard_call(
+                    prepared.channel_ownership, call.name, arguments, tool.risk
+                )
                 if self.store.pending_inputs(session_id):
                     result = {
                         "status": "not_executed",

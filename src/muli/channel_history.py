@@ -146,6 +146,7 @@ class ChannelHistory:
             "created_at": row["created_at"],
             "source": metadata["source"],
             "principal": metadata["principal"],
+            "session_id": row["actual_session_id"],
         }
         # This is the original incoming platform ID, never a send confirmation.
         if row["platform_message_id_type"] == "text":

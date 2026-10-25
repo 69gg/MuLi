@@ -46,6 +46,14 @@ class ChannelApplication:
             return messages
         origin = request.reply_origin
         metadata: dict[str, Any] = {"kind": origin.kind, "input_id": origin.input_id}
+        if request.channel_ownership is not None:
+            lease = self.runtime.channel_ownership._get(request.channel_ownership["id"])
+            metadata["channel_ownership"] = {
+                "state": lease["state"] if lease is not None else "unavailable",
+                "scope": "account"
+                if lease is not None and lease["owner_id"] is None
+                else "private",
+            }
         if request.attention_routing is not None:
             metadata["notification_destination"] = request.attention_routing.dump()["destination"]
         if routes := origin.delivery_routes():
@@ -199,7 +207,9 @@ class ChannelApplication:
                 ):
                     raise ValueError("渠道配置或授权已改变，请由当前渠道重新提交消息")
 
-            return await self.runtime.submit(**kwargs, admission_guard=guard)
+            return await self.runtime.submit(
+                **kwargs, admission_guard=guard, _channel_event=kwargs.get("event_id")
+            )
 
         async def control_submit(
             *,
@@ -251,6 +261,9 @@ class ChannelApplication:
         def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:
             guard_delivery(self.runtime.config.settings, route, metadata, db=self.runtime.store.db)
 
+        def ownership_guard(proof: object, route: Mapping[str, Any]) -> None:
+            self.runtime.channel_ownership.guard_destination(proof, route)
+
         def approval_guard(notice: ApprovalNotice) -> dict[str, Any]:
             route = notice.reply_origin.delivery_routes()[0]
             name = route["name"]
@@ -275,6 +288,7 @@ class ChannelApplication:
             approval_guard=approval_guard,
             admission=self.runtime.maintenance.admission,
             control_submit=control_submit,
+            ownership_guard=ownership_guard,
         )
         adapters = dict(manager.adapters)
         manager.recover()
@@ -311,6 +325,7 @@ class ChannelApplication:
 
     async def reconfigure(self) -> None:
         self.runtime.store.revalidate_format()
+        self.runtime.channel_ownership.reconcile()
         await self.close()
         self.manager = self._manager()
         await self.start()
@@ -411,7 +426,57 @@ class ChannelApplication:
 
     def tools(self, runtime: Runtime) -> list[Tool]:
         async def status(args: dict[str, Any]) -> Any:
-            return {**self.status(), "deliveries": self.manager.deliveries()}
+            return {
+                **self.status(),
+                "deliveries": self.manager.deliveries(),
+                "ownership": runtime.channel_ownership.status(),
+            }
+
+        async def delegate(args: dict[str, Any]) -> dict[str, Any]:
+            caller = runtime.tool_session_id
+            execution = runtime._tool_execution.get()
+            request = runtime.request_context(caller) if caller is not None else None
+            task = asyncio.current_task()
+            if (
+                caller is None
+                or execution != (caller, runtime.run_ids.get(caller))
+                or request is None
+                or task is None
+                or task.cancelling()
+                or runtime.tasks.get(caller) is not task
+                or runtime._closing
+                or caller in runtime._stopping
+                or request.attention_routing is not None
+                or "channel_delegate" in runtime.config.settings.disabled_tools
+            ):
+                raise PermissionError("渠道移交需要当前主人委派的真实执行")
+            runtime.maintenance.admission.require()
+            runtime._guard_request(request, "write")
+            if runtime.store.pending_inputs(caller):
+                raise PermissionError("收到新的输入，请重新确认渠道归属")
+            session = runtime.store.get("session", caller)
+            if session is None or session.get("principal") != "owner":
+                raise PermissionError("外部资料或系统事项不能移交渠道")
+            trigger = runtime._latest_main_trigger(caller)
+            if caller == runtime.store.existing_main_session_id() and (
+                trigger is None or trigger.get("principal") != "owner"
+            ):
+                raise PermissionError("渠道移交只能依据主人当前要求")
+            result = runtime.channel_ownership.control(caller, args)
+            if args["action"] == "request_return":
+                runtime.team.start()
+            if (
+                args["action"] == "reclaim"
+                and result["agent_id"] != caller
+                and runtime.channel_ownership.affects_running(result)
+            ):
+                await runtime.team.stop(result["agent_id"], cancel_pending=False)
+                if runtime.store.pending_inputs(result["agent_id"]):
+                    agent = runtime.team.get(result["agent_id"])
+                    runtime.store.put("agent", {**agent, "status": "queued"})
+                    runtime.team.start()
+            await runtime.bus.notify()
+            return result
 
         async def send(args: dict[str, Any]) -> Any:
             caller = runtime.tool_session_id
@@ -497,9 +562,32 @@ class ChannelApplication:
                 automatic=routing is not None,
                 attention_routing=routing.dump() if routing is not None else None,
                 admission_guard=guard,
+                ownership=request.channel_ownership,
             )
 
         return [
+            Tool(
+                "channel_delegate",
+                "将 OneBot 已绑定主人私聊长期交给已完成且空闲的直属队友。"
+                "account覆盖该接入的已授权私聊，private需owner_id且优先；不扩大群或陌生人权限。"
+                "request_return标记请归还，reclaim立即撤销旧资格并停止旧轮；队友return只归还自己的范围。"
+                "普通回答仅在Web，外发仍需显式channel_send；取消的旧输入不会自动重演",
+                parameters(
+                    {
+                        "action": {
+                            "type": "string",
+                            "enum": ["assign", "request_return", "reclaim", "return"],
+                        },
+                        "channel": {"type": "string", "enum": ["onebot"]},
+                        "scope": {"type": "string", "enum": ["account", "private"]},
+                        "owner_id": string("private范围必须选择当前已绑定主人"),
+                        "agent_id": string("assign选择已有直属执行队友准确ID"),
+                    },
+                    ("action", "channel", "scope"),
+                ),
+                delegate,
+                "write",
+            ),
             Tool(
                 "channel_history",
                 "只读查询 MuLi 已保存的四渠道主人私聊；默认列入站和真实出站投递目录。"

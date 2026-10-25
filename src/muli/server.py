@@ -1206,7 +1206,10 @@ def _create_app(
         elif body.attachment_ids:
             raise ValueError("请在主 MuLi 对话中发送附件")
         else:
-            result = await runtime.start(session_id, content, body.mode)
+            try:
+                result = await runtime.start(session_id, content, body.mode)
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
         if "message" in result:
             result["message"] = decorated_message(result["message"])
         return result
