@@ -11,6 +11,7 @@ import httpx
 import pytest
 from test_attention import attention_inputs, eventually, inbox_for, reminder
 from test_channels import Harness, onebot_body, onebot_event, profile, terminal, unused
+from test_fresh_format_admission import snapshot
 from test_maintenance import move
 from test_maintenance_api import prepare
 from test_maintenance_runtime import configured
@@ -20,6 +21,7 @@ from test_voice import FakeDetector, FakeMedia, FakePlayer, FakeRecorder
 from muli.channels import ChannelsConfig, FileContent, IncomingMessage, RemoteFile
 from muli.channels.types import PollBatch
 from muli.config import VoiceSettings
+from muli.format_admission import FormatAdmissionError
 from muli.maintenance import Admission, BootPermit, MaintenanceError
 from muli.management_transaction import TransactionJournal, Transition
 from muli.media import SpeechResult
@@ -292,23 +294,27 @@ async def test_paused_running_channel_accepts_signed_owner_text_without_starting
 
 
 @pytest.mark.parametrize("action", ["configure", "update"])
-async def test_pending_management_plan_waits_without_losing_target_or_calling_service(
+async def test_management_configure_waits_and_unmarked_update_hits_format_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
+    """Configuration waits for a transaction; unmarked Runtime updates cannot queue."""
     if sys.platform != "linux":
         pytest.skip("Linux transaction bootstrap")
     config = configured(tmp_path)
     data = tmp_path / "data"
     if action == "update":
-        # This case exercises the legacy in-place update queue, not marked upgrades.
-        Store(data / "muli.sqlite3").close()
+        database = data / "muli.sqlite3"
+        Store(database).close()
+        before_database = snapshot(database)
+        with pytest.raises(FormatAdmissionError, match="^store_format_upgrade_required$"):
+            Runtime(config, data)
+        assert snapshot(database) == before_database
+        return
     with TransactionJournal(tmp_path / "transactions", data / "muli.sqlite3") as journal:
         permit = BootPermit.acquire(
             journal, config.path, boot="origin", installation="a" * 64, service="b" * 64
         )
         runtime = Runtime(config, data, boot_permit=permit)
-        if action == "update":
-            assert runtime.store.format_state is None
         app = create_app(config, data, runtime)
         calls: list[str] = []
         applied = asyncio.Event()
@@ -318,10 +324,6 @@ async def test_pending_management_plan_waits_without_losing_target_or_calling_se
             applied.set()
             return {"accepted": True}
 
-        async def update(version: str) -> dict[str, Any]:
-            calls.append("update")
-            return {"version": version}
-
         async def configure(target: Any) -> None:
             calls.append("configure")
             applied.set()
@@ -330,13 +332,8 @@ async def test_pending_management_plan_waits_without_losing_target_or_calling_se
             manager = app.state.management
             await manager.close()
             monkeypatch.setattr(manager.service, "action", service)
-            monkeypatch.setattr(manager.updates, "apply", update)
             monkeypatch.setattr(manager, "apply_settings", configure)
-            item = await manager.stage(
-                action,
-                {"persona": {"append": "candidate"}} if action == "configure" else None,
-                "v2.0.0",
-            )
+            item = await manager.stage("configure", {"persona": {"append": "candidate"}})
             path = manager.directory / f"{item['id']}.json"
             before = path.read_bytes()
             record = prepare(journal, runtime)
@@ -354,5 +351,5 @@ async def test_pending_management_plan_waits_without_losing_target_or_calling_se
                 await applied.wait()
                 await eventually(lambda: manager.plans()[0]["status"] == "completed")
             assert not path.exists()
-            assert calls == (["update", "restart"] if action == "update" else [action])
+            assert calls == ["configure"]
             assert record.generation

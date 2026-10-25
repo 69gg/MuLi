@@ -51,7 +51,9 @@ def prepare(root: Path) -> tuple[TransactionRecord, dict[str, Any], dict[str, An
         TransactionJournal(root / "journal", database) as journal,
         journal.writer_lease() as writer,
     ):
-        store = Store(database, durable=True)
+        store = Store.open_runtime(
+            database, default_mode=config.settings.default_mode, durable=True
+        )
         try:
             main = store.main_session()
             with journal.locked() as control:

@@ -43,7 +43,7 @@ async def test_restart_publishes_recovery_for_an_existing_subscriber_without_exe
     config = ConfigFile(tmp_path / "config.json")
     config.update({"updates": {"check_on_start": False}})
     data = tmp_path / "data"
-    store = Store(data / "muli.sqlite3")
+    store = Store.open_runtime(data / "muli.sqlite3", default_mode="ask")
     session = store.main_session("ask")
     sid = str(session["id"])
     store.put("session", {**session, "status": "running"})

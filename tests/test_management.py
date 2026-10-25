@@ -9,21 +9,20 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
+from test_update_format import legacy_store
 
 from muli.config import ConfigFile, Settings
+from muli.events import EventBus
 from muli.management import SelfManagement
 from muli.plugins import PluginManager
 from muli.runtime import Runtime
 from muli.service import UserService
-from muli.store import Store
 from muli.updates import Updates
 
 
-def setup_runtime(tmp_path: Path, *, legacy: bool = False) -> tuple[Runtime, PluginManager]:
+def setup_runtime(tmp_path: Path) -> tuple[Runtime, PluginManager]:
     config = ConfigFile(tmp_path / "config.json")
     config.update({"updates": {"check_on_start": False}})
-    if legacy:
-        Store(tmp_path / "data" / "muli.sqlite3").close()
     runtime = Runtime(config, tmp_path / "data")
     return runtime, PluginManager(runtime, FastAPI(), tmp_path / "plugins")
 
@@ -230,7 +229,7 @@ async def test_version_check_is_bounded_and_notifies_once(tmp_path: Path) -> Non
 async def test_update_refuses_to_change_development_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime, _ = setup_runtime(tmp_path, legacy=True)
+    store = legacy_store(tmp_path / "legacy.sqlite3")
     calls: list[list[str]] = []
 
     async def command(argv: list[str], **kwargs: Any) -> dict[str, Any]:
@@ -244,17 +243,19 @@ async def test_update_refuses_to_change_development_environment(
     monkeypatch.setattr("muli.updates.run_process", command)
     try:
         with pytest.raises(ValueError, match="开发环境"):
-            await Updates(runtime.config, runtime.store, runtime.bus).apply("2.0.0")
+            await Updates(ConfigFile(tmp_path / "config.json"), store, EventBus(store)).apply(
+                "2.0.0"
+            )
         assert calls == [["uv", "tool", "dir"]]
     finally:
-        await runtime.close()
+        store.close()
 
 
 @pytest.mark.parametrize("exit_code", [0, 1])
 async def test_update_retains_uv_tool_requirements_and_reports_constraint_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
 ) -> None:
-    runtime, _ = setup_runtime(tmp_path, legacy=True)
+    store = legacy_store(tmp_path / "legacy.sqlite3")
     root = tmp_path / "tools"
     calls: list[list[str]] = []
 
@@ -268,7 +269,7 @@ async def test_update_retains_uv_tool_requirements_and_reports_constraint_failur
     monkeypatch.setattr("muli.updates.run_process", command)
     monkeypatch.setattr("muli.updates.sys.prefix", str(root / "muli-agent"))
     try:
-        updates = Updates(runtime.config, runtime.store, runtime.bus)
+        updates = Updates(ConfigFile(tmp_path / "config.json"), store, EventBus(store))
         if exit_code:
             with pytest.raises(ValueError, match="原有版本约束"):
                 await updates.apply("2.0.0")
@@ -280,7 +281,7 @@ async def test_update_retains_uv_tool_requirements_and_reports_constraint_failur
             ["uv", "tool", "upgrade", "--no-python-downloads", "muli-agent==2.0.0"],
         ]
     finally:
-        await runtime.close()
+        store.close()
 
 
 async def test_new_plugin_is_visible_before_restart_without_executing_it(tmp_path: Path) -> None:

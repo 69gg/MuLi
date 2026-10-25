@@ -27,7 +27,9 @@ async def records_case(
     config = ConfigFile(tmp_path / "config.json")
     config.update({"workspace_roots": [str(tmp_path)], "updates": {"check_on_start": False}})
     if getattr(request, "param", False):
-        Store(tmp_path / "data" / "muli.sqlite3").close()
+        Store.open_runtime(
+            tmp_path / "data" / "muli.sqlite3", default_mode=config.settings.default_mode
+        ).close()
     runtime = Runtime(config, tmp_path / "data", client_factory=no_model)
     app = create_app(config, runtime=runtime)
     try:
@@ -155,7 +157,7 @@ async def test_directory_cursor_query_binding_and_empty_results_are_distinct(
     assert empty.json() == {"items": [], "next_cursor": None, "has_more": False}
 
 
-@pytest.mark.parametrize("records_case", [False, True], indirect=True, ids=["fresh", "legacy"])
+@pytest.mark.parametrize("records_case", [False, True], indirect=True, ids=["fresh", "reopened"])
 async def test_directory_preserves_empty_text_and_null_metadata_across_http_pages(
     records_case: tuple[Runtime, httpx.AsyncClient],
 ) -> None:
@@ -218,9 +220,9 @@ async def test_invalid_directory_queries_are_rejected_before_reading(
     assert runtime.store.db.total_changes == changes and not runtime.tasks
 
 
-@pytest.mark.parametrize("legacy", [False, True], ids=["fresh", "legacy"])
+@pytest.mark.parametrize("reopened", [False, True], ids=["fresh", "reopened"])
 async def test_directory_requires_login_and_accepts_unicode_length_boundary(
-    tmp_path: Path, legacy: bool
+    tmp_path: Path, reopened: bool
 ) -> None:
     config = ConfigFile(tmp_path / "config.json")
     config.update(
@@ -229,15 +231,15 @@ async def test_directory_requires_login_and_accepts_unicode_length_boundary(
             "server": {"password_hash": hash_password("record-test-password")},
         }
     )
-    if legacy:
-        Store(tmp_path / "data" / "muli.sqlite3").close()
+    if reopened:
+        Store.open_runtime(
+            tmp_path / "data" / "muli.sqlite3", default_mode=config.settings.default_mode
+        ).close()
     runtime = Runtime(config, tmp_path / "data", client_factory=no_model)
     try:
         sessions = runtime.store.list("session")
-        if legacy:
-            assert sessions == []
-        else:
-            assert len(sessions) == 1 and sessions[0]["kind"] == "main"
+        assert runtime.store.format_state is not None
+        assert len(sessions) == 1 and sessions[0]["kind"] == "main"
         app = create_app(config, runtime=runtime)
         changes = runtime.store.db.total_changes
         async with httpx.AsyncClient(
