@@ -2,7 +2,7 @@
 
 最新原生检查是 [Native48](https://github.com/69gg/MuLi/actions/runs/40185853686)，准确候选 `96bb3ec` 的原生作业失败：第一代最终投影在 38.590 秒完成；第二次 POST 于 38.592 秒发起，40.431 秒已 prepared，随后依次到达 draining、stop_base、install_target，最终在 60.001 秒以 `TimeoutError` / `helper_exit` 结束。第三事务未开始，cleanup verified，完整三事务仍未验收。本轮十一项通用作业成功，Windows 3.12 shard2 另有两个既有 UIA 真机探针在原 12 秒期限超时，均确认 cleanup；一个未观察到阶段且 stderr 为空，另一个到达 `uia_initializing`，不能归因于 source 去重。准确边界见[原生检查记录](managed-native-checkpoint-proposal.md#native48真实结果第二次排队成功仍触及总期限)。下面各轮保留当时事实。
 
-当前候选已与 v2.70 主分支整合，保留较新的 Windows UIA probe 路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。针对临时服务在多次查询间被回收的竞争，只在 RPC 失败后重新取得精确空列表时确认其已消失；格式、身份错误与取消不会降级。本机未创建测试用户、挂载文件系统或操作真实服务。
+当前候选已与 v2.71 主分支整合，保留较新的 Windows UIA probe 与连续终端路径。helper 认证只合并同一同步段内重复的完整安装文件扫描；每次等待前后仍各自重新校验文件、事务与进程身份。针对临时服务在多次查询间被回收的竞争，只在 RPC 失败后重新取得精确空列表时确认其已消失；格式、身份错误与取消不会降级。本机未创建测试用户、挂载文件系统或操作真实服务。
 
 Native47 除原生作业外，另有六个平台分片失败，并非通用检查全绿。根核对 Ubuntu 3.12 shard1 的四个失败节点，均为旧测量 stub 未接收 wrapper 已转交的 `verified_python` 关键字，抛出 `TypeError`；该测试接线已修并纳入本地整合，与原生 POST 超时分别记录。十二项通用作业通过属于 Native46，不移用至本轮。
 

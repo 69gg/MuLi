@@ -1171,7 +1171,9 @@ def _create_app(
             session.update(body.model_dump(exclude_unset=True, exclude_none=True))
             session["updated_at"] = now()
             with runtime.store.db:
-                return runtime._store_session(session, previous_mode=previous_mode)
+                updated = runtime._store_session(session, previous_mode=previous_mode)
+            runtime.shell_mode_changed(session_id, previous_mode, session["mode"])
+            return updated
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:
