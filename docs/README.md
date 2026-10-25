@@ -15,6 +15,7 @@
 
 ## 文件、电脑与语音
 
+- [连续终端](shell-sessions.md)：保留目录和环境、查看长命令进度与停止。
 - [队友附件](teammate-attachments.md)：把文件、图片和录音交给队友。
 - [附件检索](attachment-search.md)：查找已保存的附件。
 - [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
