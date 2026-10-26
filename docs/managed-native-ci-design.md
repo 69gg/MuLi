@@ -1,10 +1,18 @@
 # 真实 systemd 托管切换 CI 设计
 
+Native56 候选把运行态观察在 probe 返回后的 controller 认证与紧邻的选中角色认证合为一次同步完整检查。两次真实 probe、readiness、所有包字节与身份核验均保留；局部观察错误仍先核 controller，origin 仍选择完整 base 安装，stop-only 与停止态第三次 probe 沿原门执行。等待后重新读取全部包，不保存或传递认证证明。
+
+新核心回归在旧生产实收两失败一通过，完整快照、health、真实 FD 与字节断言先通过，唯一红为 controller 完整扫描六次而非四次；五项独立错误优先与三安装 origin 边界在旧生产已通过。修后两文件八项通过，十七文件 276 项整合通过（60.94 秒、峰值 105.8 MiB、swap 0），509 文件格式、全量 Ruff、161 份源码严格类型与离线锁检查通过。独立后审无新增 P1/P2；这些本地证据不能代替原生三事务或 60 秒期限验收。
+
 Native55 候选仅将一次同步 backend `_check` 的真实 deployment 认证合成局部批次。anchor、launcher 和每个完整 installation digest 对应的 slot 各实际读取、核摘要与严格解析；controller 和选中角色的完整包扫描之后，统一复核全部叶的七字段身份、根 owner/mode 和完整祖先链。不减少 guard、不跨独立检查或等待保存 metadata，不放宽坏 target 元数据拒绝或原 60 秒期限。
 
 首红实际为两失败一通过：adopt 的 slot 读取四次、switch 的 controller 三次，完整 bytes/SHA、FD 身份与包认证已先成立；独立下一 guard 重读正控已通过。修后八文件 83 项与独立边界 14 项通过，另两项真实根链观察核首末各一次，并确保末次在选中包扫描之后，合计 99 个不同节点。叶替换、同 inode 写回原字节并还原 mtime、根权限/路径变化、三安装完整摘要区分与真实坏包回退均已覆盖。所有本机检查沿原 guard 串行执行、swap 0；远端原生总耗时尚未验证，不据此承诺期限已修复。
 
 合入精确 v2.75 候选 `ed2e6b2` 后，十五文件 350 项整合通过（28.28 秒、峰值 147.1 MiB）；507 文件格式检查、全仓 Ruff、161 份源码严格类型和离线锁文件核验通过。只解决版本记录冲突，未改认证生产或测试期限；独立后审未发现新增 P1/P2。
+
+[Native55，精确签名候选 `a7d6e3f`](https://github.com/69gg/MuLi/actions/runs/40344959847) 已终态：十项通用检查成功，原生和 Windows 3.12 第一分片失败，macOS 3.13 未获 runner 而取消。原生首代投影 38803 毫秒；第二代 `start_target` 58948 毫秒，60000 毫秒以 `TimeoutError` / `helper_exit` 结束，尚不能证明 target 已启动，第三代未开始。2159 字节 evidence 的 SHA256 为 `bb8aa514e7d34a0c4fd761b8398c26e76eb7934421d079c2d6c831faa65affd4`，两成员、完整结果合同和 cleanup 已核，user/group removed、mount 0。
+
+首代 checks 仍为 141 次 / 15820 毫秒，host_record 31 次 / 3713 毫秒、bus 231 次 / 3537 毫秒、HTTP 13 次 / 1677 毫秒；不能将首投影的差值归因于本轮合并。Windows 分片五项 UIA 原生测试均等待响应超时；已有两条完整诊断的写入和 drain 已返回，stderr 与阶段为空，清理确认，根因仍未知。另一条 pending 测试观察到输入标记并通过，不能把它当作失败进程的执行证明。macOS 作业 runner 为空、steps 为零，注释明确报告容量不足。保留全部失败，不提高期限或跳过检查。
 
 Native54 合并两处同步重复工作：解释器终点直接使用已经打开的安全父目录 FD；helper 的 manager 认证按接口合并，一次 `GetUnit` 后，前后两轮各独立读取 Unit 的二十个属性和 Service 的十八个属性，命令数由九次降至五次，三十八个字段仍各读取两次。完整内容摘要、文件与链接身份、typed 解析、限额校验、proc/kernel 双观察、输出预算及绝对期限保留；不跨等待复用证明，也不减少恢复宿主 `_record` 的文件认证。
 

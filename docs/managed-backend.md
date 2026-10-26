@@ -8,6 +8,8 @@
 
 每次同步 `_check` 都从真实私有文件重新认证 anchor、launcher 和各个完整安装摘要对应的 slot。同一安装只读取一次；caller 中冻结的对象只用于比较，不能代替实际字节、SHA 和严格 JSON 解析。controller 与选中角色的完整包认证均位于本批末门之前；随后再次核对所有已读叶的 device、inode、size、mtime、ctime、mode、uid，以及根目录私有权限和完整祖先链。证据只存在于本次函数栈，不跨独立 guard 或等待复用，也不减少效果前检查。损坏的 target 包可沿原流程恢复 base，损坏的 target 元数据仍拒绝。
 
+运行态观察在每次真实 probe 前重新认证，返回后将相邻的 controller 与选中角色核验合为一次完整检查。只在这段不含等待的内部代码中读取当前磁盘、验证进程归属或比较前后观察；局部观察失败时仍先检查 controller，保留原错误优先级。origin 进程继续校验完整 base 安装，stop-only 继续仅认证 controller；readiness 等待后重新读取所有包，不跨等待保存认证证明。停止态确认、第三次 probe 及所有效果前安全门保持原流程。
+
 所有文件修改要求服务已经停止、cgroup 为空，并真实持有现有 writer lease。正向只按配置→selector→unit，回退只按 unit→selector→配置，接受范围是该代冻结正向或反向前缀。不会把三个文件各自的允许值任意组合。已有 desired 内容也调用文件及父目录耐久确认；不存在的 legacy selector 同样确认父目录。selector 只支持本产品 canonical JSON，非 canonical 快照在 prepare 时拒绝，后端再核，不悄悄重新序列化旧证据。
 
 unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh manager 属性证明当前 unit 已加载。命令返回零不算确认。只有同 revision、完整三文件耐久确认、空 cgroup、真实 lease 和 fresh loaded unit 证据才能产生 `BindingConfirmation`；start 在效果前独立重做这些核验。旧 boot、错误 nonce、错误格式/安装/配置证明均不能提交。原 deadline 和回退保留时间不续期；未知 start 不重复发送；激活请求超时或取消后只重观察，不由该后端盲目重发。

@@ -290,12 +290,27 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 raise ObservationError("unsupported_managed_selector")
         return data
 
-    async def _probe(self, record: TransactionRecordV2) -> ManagedProbeResult:
+    async def _probe(
+        self,
+        record: TransactionRecordV2,
+        *,
+        postprocess: Callable[[ManagedProbeResult], Role | None] | None = None,
+    ) -> ManagedProbeResult:
         self._check(record)
         result = await self.probe.read_managed(
             self.journal, record, self.anchor, self.controller_slot, self.slots
         )
-        self._check(record)
+        if postprocess is None:
+            self._check(record)
+        else:
+            try:
+                selected = postprocess(result)
+            except BaseException:
+                # Preserve controller authentication's precedence over a local
+                # observation error, without retaining proofs across the await.
+                self._check(record)
+                raise
+            self._check(record, selected)
         return result
 
     def _disk(self) -> _DiskBinding:
@@ -424,23 +439,32 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         return self._disk()
 
     async def observe(self, record: TransactionRecordV2) -> ManagedServiceObservation:
-        before, disk = await self._probe(record), self._disk()
-        boot = before.service.unit.invocation if before.service.process is not None else None
+        disk: _DiskBinding | None = None
+        boot: str | None = None
         process: ManagedProcessIdentity | None = None
         proof: HealthProofV2 | None = None
-        if boot is not None:
-            role = self._owned(record, before, disk)
+
+        def bind(result: ManagedProbeResult) -> Role | None:
+            nonlocal disk, boot, process
+            disk = self._disk()
+            if result.service.process is None:
+                return None
+            boot = result.service.unit.invocation
+            role = self._owned(record, result, disk)
             selected: Role = "base" if role is None else role
             process = ManagedProcessIdentity(
                 record.binding(selected).entry,
                 record.binding(selected).installation,
                 record.binding(selected).compatibility,
             )
-            if not self._stop_only(record):
-                self._check(record, selected)
-                value = await self._request(record, boot, "readiness")
-                if value is not None:
-                    proof = self._proof(record, boot, value)
+            return None if self._stop_only(record) else selected
+
+        before = await self._probe(record, postprocess=bind)
+        assert disk is not None
+        if boot is not None and not self._stop_only(record):
+            value = await self._request(record, boot, "readiness")
+            if value is not None:
+                proof = self._proof(record, boot, value)
         writer_free, empty = False, False
         available = self.journal.writer_lease()
         lease: FixedLock | None = None
@@ -456,13 +480,17 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             else:
                 available.__exit__()
         confirmation: BindingConfirmation | None = None
-        try:
-            after = await self._probe(record)
-            if before != after or disk != self._disk():
+
+        def match(result: ManagedProbeResult) -> Role | None:
+            if before != result or disk != self._disk():
                 raise ObservationError("transaction_observation_changed")
             if boot is not None and not self._stop_only(record):
                 current_role = self._role(record, boot)
-                self._check(record, "base" if current_role is None else current_role)
+                return "base" if current_role is None else current_role
+            return None
+
+        try:
+            after = await self._probe(record, postprocess=match)
             if self._stopped(after.service) and lease is not None:
                 lease.check()
                 empty = self.cgroups.empty(after.service.unit.cgroup)
