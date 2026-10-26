@@ -338,6 +338,85 @@ async def test_hybrid_rerank_cache_and_revision_invalidation(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("stage", ["embedding", "rerank"])
+async def test_semantic_query_retries_after_transient_failure_without_memory_change(
+    tmp_path: Path, stage: str
+) -> None:
+    class RecoveringMedia(MockMedia):
+        async def rerank(
+            self,
+            query: str,
+            documents: Sequence[str],
+            *,
+            top_n: int | None = None,
+        ) -> list[RerankResult]:
+            if stage == "rerank" and self.rerank_calls == 0:
+                self.rerank_calls += 1
+                raise RuntimeError("SECRET_UPSTREAM_RESPONSE")
+            return await super().rerank(query, documents, top_n=top_n)
+
+    store = Store(tmp_path / "memory.db")
+    memory = Memory(store)
+    media = RecoveringMedia(reranker=stage == "rerank", failures=int(stage == "embedding"))
+    pipeline = MemoryPipeline(memory, media=media)
+    fact = memory.save("归档完成后播放铜铃声", layer="semantic")
+    assert memory.store_vector(fact["id"], [1.0, 0.0], pipeline._model_key())
+    query = "semantic-recovery-query"
+    revision = memory.revision
+    try:
+        assert memory.search(query, hops=0) == []
+        failed = await pipeline.query(query, limit=4, hops=0)
+        assert failed["memories"] == []
+        assert failed["degraded"] == ["semantic_unavailable:RuntimeError"]
+        assert failed["revision"] == memory.revision == revision
+        assert media.embed_calls == [[query]]
+        assert media.rerank_calls == int(stage == "rerank")
+
+        recovered = await pipeline.query(query, limit=4, hops=0)
+        assert media.embed_calls == [[query], [query]]
+        assert media.rerank_calls == (2 if stage == "rerank" else 0)
+        assert [item["id"] for item in recovered["memories"]] == [fact["id"]]
+        assert recovered["memories"][0]["matched_by"] == (
+            "reranked" if stage == "rerank" else "semantic"
+        )
+        assert recovered["degraded"] == []
+        assert recovered["revision"] == memory.revision == revision
+
+        assert await pipeline.query(query, limit=4, hops=0) == recovered
+        assert media.embed_calls == [[query], [query]]
+        assert media.rerank_calls == (2 if stage == "rerank" else 0)
+        assert memory.revision == revision
+    finally:
+        store.close()
+
+
+async def test_vector_scan_limited_query_still_uses_success_cache(tmp_path: Path) -> None:
+    store = Store(tmp_path / "memory.db")
+    memory = Memory(store)
+    media = MockMedia()
+    pipeline = MemoryPipeline(memory, media=media, config=MemoryPipelineConfig(max_vector_scan=1))
+    for content in ("归档完成后播放铜铃声", "任务完成后显示绿灯"):
+        fact = memory.save(content, layer="semantic")
+        assert memory.store_vector(fact["id"], [1.0, 0.0], pipeline._model_key())
+    query = "bounded-vector-query"
+    revision = memory.revision
+    try:
+        assert memory.search(query, hops=0) == []
+        assert memory.vector_count(pipeline._model_key()) == 2
+        result = await pipeline.query(query, limit=4, hops=0)
+        assert len(result["memories"]) == 1
+        assert result["memories"][0]["matched_by"] == "semantic"
+        assert result["degraded"] == ["vector_scan_limited"]
+        assert result["revision"] == memory.revision == revision
+        assert media.embed_calls == [[query]]
+
+        assert await pipeline.query(query, limit=4, hops=0) == result
+        assert media.embed_calls == [[query]] and media.rerank_calls == 0
+        assert memory.revision == revision
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("stage", ["embedding", "rerank"])
 @pytest.mark.parametrize("fail", [False, True])
 async def test_forgetting_during_semantic_query_never_returns_or_recaches_old_evidence(
     tmp_path: Path, stage: str, fail: bool
