@@ -43,7 +43,7 @@ MuLi serve
 
 已有配置时，直接运行 `MuLi serve`。初始化默认尝试下载只读源码参考，不需要时可加 `--no-source`。
 
-保留数据从 v2.71 或更早版本升级时，先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。目前仅提供 Linux 非托管安装的升级入口。
+保留数据从 v2.74 或更早版本升级时，先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。目前仅提供 Linux 非托管安装的升级入口。
 
 配置、聊天、附件、记忆、插件和日志默认保存在 **`~/MuLi`**。已有配置不会被初始化覆盖；需要自定义位置时，见[配置与维护](docs/operations.md)。
 

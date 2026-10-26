@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。完整全 `1` 的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整格式 `1`、`2` 声明的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -28,7 +28,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`objects`、`ingress`、`outbox` 为 `2`，其余四个不透明合同 ID 为 `1`。`2` 增加渠道长期归属及其入站、消息、外发的持久 proof；旧全 `1` 声明仅是固定迁移的源合同。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
+完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`objects`、`ingress`、`outbox` 为 `3`，其余四个不透明合同 ID 为 `1`。格式 `2` 引入 OneBot 长期归属与持久 proof；格式 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。旧格式 `1`、`2` 仅是固定升级的源合同。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |

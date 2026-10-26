@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 
 MAX_ROUTE_CHARS = 4096
 MAX_ORIGIN_ID_CHARS = 512
+PRIVATE_OWNER_CHANNELS: tuple[str, ...] = ("onebot", "telegram", "qq")
 _ROUTE_FIELDS = ("name", "account_id", "target", "sender_id", "kind", "reply_to")
 _ROUTE_FIELD_CHARS = 200
 
@@ -56,6 +57,19 @@ def validate_onebot_owners(owner_ids: Collection[str], *, enabled: bool) -> None
         raise ValueError("OneBot 主人 QQ 号（owner_ids）必须是无空格的正整数")
 
 
+def validate_channel_owners(name: str, owner_ids: Collection[str], *, enabled: bool) -> None:
+    if name == "onebot":
+        validate_onebot_owners(owner_ids, enabled=enabled)
+    elif name in PRIVATE_OWNER_CHANNELS:
+        if enabled and not owner_ids:
+            raise ValueError(f"启用 {name} 必须填写已绑定主人 ID（owner_ids）")
+        if any(
+            not isinstance(value, str) or not value or len(value) > _ROUTE_FIELD_CHARS
+            for value in owner_ids
+        ):
+            raise ValueError("渠道 owner_ids 需要有界的非空用户 ID")
+
+
 def authorize_route(
     name: str,
     route: Mapping[str, Any],
@@ -78,8 +92,9 @@ def authorize_route(
         raise RouteError("渠道路由需要真实 sender_id/target/kind")
     if route.get("name", name) != name or route.get("account_id", account_id) != account_id:
         raise RouteError("渠道路由账号不匹配")
-    if name == "onebot" and (kind != "private" or sender not in owner_ids):
-        raise RouteError("OneBot 仅接受 owner_ids 中已绑定主人的点对点私聊", status_code=403)
+    if name in PRIVATE_OWNER_CHANNELS and (kind != "private" or sender not in owner_ids):
+        label = "OneBot" if name == "onebot" else name
+        raise RouteError(f"{label} 仅接受 owner_ids 中已绑定主人的点对点私聊", status_code=403)
     if kind == "group" and target not in allowed_groups:
         raise RouteError("此群未在 allowed_groups 中绑定", status_code=403)
     if kind == "private" and target != sender:

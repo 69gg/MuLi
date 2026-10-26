@@ -8,6 +8,7 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from muli.channels.types import NAMES
 from muli.format_admission import require_channel_ownership_format
 from muli.reply_origin import authorize_route, channel_account
 from muli.store import SQLITE_MAX_INTEGER, now
@@ -21,16 +22,18 @@ class ChannelOwnership:
         self.runtime = runtime
 
     @staticmethod
-    def identifier(account: str, owner: str | None) -> str:
+    def identifier(name: str, account: str, owner: str | None) -> str:
         return hashlib.sha256(
-            json.dumps(["onebot", account, owner], separators=(",", ":")).encode()
+            json.dumps([name, account, owner], separators=(",", ":")).encode()
         ).hexdigest()
 
-    def _profile(self) -> tuple[str, str]:
-        profile = self.runtime.config.settings.channels.onebot
+    def _profile(self, name: str) -> tuple[str, str]:
+        if name not in NAMES:
+            raise ValueError("未知的渠道归属接入")
+        profile = getattr(self.runtime.config.settings.channels, name)
         if not profile.enabled or not profile.owner_ids:
-            raise PermissionError("请先启用并绑定 OneBot 主人私聊")
-        account = channel_account("onebot", profile)
+            raise PermissionError("请先启用该渠道并绑定主人私聊")
+        account = channel_account(name, profile)
         fingerprint = hashlib.sha256(profile.model_dump_json().encode("utf-8")).hexdigest()
         return account, fingerprint
 
@@ -66,27 +69,32 @@ class ChannelOwnership:
             raise ValueError("渠道归属目录超过当前输出预算")
         return result
 
-    def _scope(self, args: dict[str, Any]) -> tuple[str, str | None, str]:
-        if args.get("channel") != "onebot" or args.get("scope") not in {"account", "private"}:
-            raise ValueError("本版仅支持 OneBot 已绑定主人私聊的接入级或指定私聊归属")
-        account, fingerprint = self._profile()
+    def _scope(self, args: dict[str, Any]) -> tuple[str, str, str | None, str]:
+        name = args.get("channel")
+        if (
+            not isinstance(name, str)
+            or name not in NAMES
+            or args.get("scope") not in {"account", "private"}
+        ):
+            raise ValueError("仅支持已注册渠道已绑定主人私聊的接入级或指定私聊归属")
+        account, fingerprint = self._profile(name)
         owner = args.get("owner_id")
         if args["scope"] == "private":
             if (
                 not isinstance(owner, str)
-                or owner not in self.runtime.config.settings.channels.onebot.owner_ids
+                or owner not in getattr(self.runtime.config.settings.channels, name).owner_ids
             ):
                 raise PermissionError("私聊归属需要当前已绑定的准确 owner_id")
         elif owner is not None:
             raise ValueError("接入级归属不能同时指定 owner_id")
-        return account, owner, fingerprint
+        return name, account, owner, fingerprint
 
     def control(self, caller: str, args: dict[str, Any]) -> dict[str, Any]:
         runtime = self.runtime
         runtime.store.revalidate_format()
         require_channel_ownership_format(runtime.store.format_state)
-        account, owner, fingerprint = self._scope(args)
-        identifier = self.identifier(account, owner)
+        name, account, owner, fingerprint = self._scope(args)
+        identifier = self.identifier(name, account, owner)
         existing = self._get(identifier)
         action = args["action"]
         main_id = runtime.store.existing_main_session_id()
@@ -122,7 +130,7 @@ class ChannelOwnership:
                 raise PermissionError("该范围已被接管，请先明确收回，不隐式替换")
             value = {
                 "id": identifier,
-                "channel": "onebot",
+                "channel": name,
                 "account_id": account,
                 "owner_id": owner,
                 "main_id": main_id,
@@ -140,11 +148,19 @@ class ChannelOwnership:
                 runtime.store._put("channel_ownership", value)
             return value
         if existing is None or existing["state"] == "main":
-            fallback = self._get(self.identifier(account, None)) if owner is not None else None
+            fallback = (
+                self._get(self.identifier(name, account, None)) if owner is not None else None
+            )
             if action != "reclaim" or fallback is None or fallback["state"] == "main":
                 raise ValueError("该范围当前没有受托队友")
             # A private main pin takes precedence over an account assignment.
-            existing = {**fallback, "id": identifier, "owner_id": owner, "epoch": 0}
+            # Repeating a reclaim must never make an old private proof current.
+            existing = {
+                **fallback,
+                "id": identifier,
+                "owner_id": owner,
+                "epoch": existing["epoch"] if existing is not None else 0,
+            }
         if action == "request_return":
             if existing["state"] == "return_requested" and existing.get("return_input_id"):
                 return existing
@@ -185,11 +201,13 @@ class ChannelOwnership:
             if owner is not None:
                 runtime.store.db.execute(
                     "UPDATE ingress SET state='cancelled' WHERE state='pending' "
-                    "AND json_extract(payload,'$.route.name')='onebot' "
+                    "AND json_extract(payload,'$.route.name')=? "
                     "AND json_extract(payload,'$.route.account_id')=? "
+                    "AND json_extract(payload,'$.route.kind')='private' "
+                    "AND json_extract(payload,'$.route.target')=? "
                     "AND json_extract(payload,'$.route.sender_id')=? "
                     "AND json_extract(payload,'$.channel_ownership.main_id')=?",
-                    (account, owner, main_id),
+                    (name, account, owner, owner, main_id),
                 )
         return value
 
@@ -246,7 +264,9 @@ class ChannelOwnership:
             return False
         row = self.runtime.store.db.execute(
             "SELECT json_extract(o.data,'$.channel_ownership.id'),"
-            "json_extract(o.data,'$.route.account_id'),json_extract(o.data,'$.route.sender_id') "
+            "json_extract(o.data,'$.route.name'),json_extract(o.data,'$.route.account_id'),"
+            "json_extract(o.data,'$.route.sender_id'),json_extract(o.data,'$.route.kind'),"
+            "json_extract(o.data,'$.route.target') "
             "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
             "WHERE m.session_id=? AND json_extract(o.data,'$.run_id')=? "
             "AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
@@ -259,8 +279,11 @@ class ChannelOwnership:
                 or (
                     value["owner_id"] is not None
                     and row[0] is not None
-                    and row[1] == value["account_id"]
-                    and row[2] == value["owner_id"]
+                    and row[1] == value["channel"]
+                    and row[2] == value["account_id"]
+                    and row[3] == value["owner_id"]
+                    and row[4] == "private"
+                    and row[5] == value["owner_id"]
                 )
             )
         )
@@ -313,19 +336,22 @@ class ChannelOwnership:
     def destination(self, route: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         runtime = self.runtime
         main = runtime.main_session()["id"]
-        if route.get("name") != "onebot" or route.get("kind") != "private":
+        name = route.get("name")
+        if not isinstance(name, str) or name not in NAMES or route.get("kind") != "private":
             return main, None
-        account, _ = self._profile()
+        account, _ = self._profile(name)
+        if route.get("account_id") != account:
+            raise PermissionError("渠道归属路由缺少当前准确账号")
         authorize_route(
-            "onebot",
+            name,
             route,
             account_id=account,
-            owner_ids=runtime.config.settings.channels.onebot.owner_ids,
+            owner_ids=getattr(runtime.config.settings.channels, name).owner_ids,
             allowed_groups=[],
-            outbound=False,
+            outbound=True,
         )
-        specific = self._get(self.identifier(account, route["sender_id"]))
-        value = specific or self._get(self.identifier(account, None))
+        specific = self._get(self.identifier(name, account, route["sender_id"]))
+        value = specific or self._get(self.identifier(name, account, None))
         if value is None or value["state"] == "main":
             return main, None
         proof = self.proof(value)
@@ -357,12 +383,20 @@ class ChannelOwnership:
             or value.get("main_id") != self.runtime.store.existing_main_session_id()
         ):
             raise PermissionError("渠道归属已收回或被替换，旧轮不得继续执行")
-        account, fingerprint = self._profile()
+        name, owner = value.get("channel"), value.get("owner_id")
+        if not isinstance(name, str) or name not in NAMES or "owner_id" not in value:
+            raise PermissionError("渠道归属范围无效")
+        account, fingerprint = self._profile(name)
+        profile = getattr(self.runtime.config.settings.channels, name)
         session = self.runtime.store.get("session", session_id)
         agent = self.runtime.store.get("agent", session_id)
         if (
             account != value.get("account_id")
             or fingerprint != value.get("profile")
+            or (
+                owner is not None and (not isinstance(owner, str) or owner not in profile.owner_ids)
+            )
+            or value["id"] != self.identifier(name, account, owner)
             or self.runtime.main_session()["mode"] != value.get("main_mode")
             or session is None
             or agent is None
@@ -378,7 +412,7 @@ class ChannelOwnership:
             ):
                 raise PermissionError("渠道归属缺少本批真实运行引用")
             row = self.runtime.store.db.execute(
-                "SELECT json_extract(data,'$.channel_ownership'),json_extract(data,'$.route.sender_id'),"
+                "SELECT json_extract(data,'$.channel_ownership'),json_extract(data,'$.route'),"
                 "json_extract(data,'$.principal'),json_extract(data,'$.source'),"
                 "json_extract(data,'$.channel_ownership_control'),json_type(data,'$.channel_ownership_control') FROM objects "
                 "WHERE kind='message' AND id=? AND json_extract(data,'$.session_id')=? "
@@ -398,10 +432,26 @@ class ChannelOwnership:
                 ):
                     raise PermissionError("归还通知不是该范围本代宿主请求")
                 return
-            if row[2] != "owner":
+            route = json.loads(row[1]) if isinstance(row[1], str) else None
+            if (
+                row[2] != "owner"
+                or row[3] != f"channel:{name}:{account}"
+                or not isinstance(route, dict)
+                or route.get("name") != name
+                or route.get("account_id") != account
+                or route.get("kind") != "private"
+            ):
                 raise PermissionError("渠道执行不是准确主人输入")
-            specific = self._get(self.identifier(account, row[1]))
-            selected = specific or self._get(self.identifier(account, None))
+            bound = authorize_route(
+                name,
+                route,
+                account_id=account,
+                owner_ids=profile.owner_ids,
+                allowed_groups=[],
+                outbound=True,
+            )
+            specific = self._get(self.identifier(name, account, bound["sender_id"]))
+            selected = specific or self._get(self.identifier(name, account, None))
             if selected is None or selected["id"] != value["id"] or selected["state"] == "main":
                 raise PermissionError("该私聊的有效归属已经改变")
 
@@ -426,8 +476,8 @@ class ChannelOwnership:
             if not (
                 name == "channel_delegate"
                 and args.get("action") == "return"
-                and args.get("channel") == "onebot"
                 and value is not None
+                and args.get("channel") == value["channel"]
                 and args.get("scope") == ("account" if value["owner_id"] is None else "private")
                 and args.get("owner_id") == value["owner_id"]
                 and "agent_id" not in args
@@ -447,9 +497,11 @@ class ChannelOwnership:
         original = json.loads(row[0]) if row is not None and row[0] is not None else None
         if not isinstance(original, dict) or any(
             route.get(key) != original.get(key)
-            for key in ("name", "account_id", "kind", "target", "sender_id")
+            for key in ("name", "account_id", "kind", "target", "sender_id", "reply_to")
         ):
-            raise PermissionError("受托队友只能外发到本批实际接纳的私聊，不能换收件人或渠道")
+            raise PermissionError(
+                "受托队友只能外发到本批实际接纳的私聊，不能换收件人、渠道或回复凭据"
+            )
 
     def current_proof(self, session_id: str, run_id: str | None) -> dict[str, Any] | None:
         if run_id is None:

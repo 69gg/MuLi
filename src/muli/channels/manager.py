@@ -16,7 +16,13 @@ from muli.events import EventBus
 from muli.maintenance import Admission
 from muli.permissions import ApprovalNotice
 from muli.proactive import FrozenRouting
-from muli.reply_origin import ReplyOrigin, RouteError, authorize_route, channel_account
+from muli.reply_origin import (
+    PRIVATE_OWNER_CHANNELS,
+    ReplyOrigin,
+    RouteError,
+    authorize_route,
+    channel_account,
+)
 from muli.store import Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
@@ -234,7 +240,7 @@ class ChannelManager:
                 self.ownership_guard(payload["channel_ownership"], route)
             except (ValueError, PermissionError) as error:
                 raise _BlockedDelivery(str(error), status_code=403) from None
-        if name == "onebot":
+        if name in PRIVATE_OWNER_CHANNELS:
             try:
                 self._route(name, route, outbound=True)
             except ChannelError as error:

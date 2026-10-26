@@ -14,7 +14,12 @@ from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from muli.reply_origin import authorize_route, channel_account, validate_onebot_owners
+from muli.reply_origin import (
+    PRIVATE_OWNER_CHANNELS,
+    authorize_route,
+    channel_account,
+    validate_channel_owners,
+)
 from muli.system_events import SystemEventsSettings
 
 
@@ -453,8 +458,10 @@ class ChannelSettings(Section):
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
 
     @model_validator(mode="after")
-    def validate_onebot_owner(self) -> ChannelSettings:
-        validate_onebot_owners(self.onebot.owner_ids, enabled=self.onebot.enabled)
+    def validate_private_owners(self) -> ChannelSettings:
+        for name in PRIVATE_OWNER_CHANNELS:
+            profile: ChannelProfile = getattr(self, name)
+            validate_channel_owners(name, profile.owner_ids, enabled=profile.enabled)
         return self
 
     def validate_proactive_destination(

@@ -842,6 +842,7 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
 ) -> None:
     """Real polling/signed webhook -> main tools; no manufactured request scope."""
     hold_poll = asyncio.Event()
+    poll_advanced = asyncio.Event()
     requests: list[str] = []
     supplied_telegram = False
 
@@ -858,6 +859,7 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
             if boundary == "group":
                 update["message"]["chat"] = {"id": 99, "type": "group"}
             return httpx.Response(200, json={"ok": True, "result": [update]})
+        poll_advanced.set()
         await hold_poll.wait()
         raise AssertionError("正常关闭或换代应取消真实 Telegram 长轮询")
 
@@ -913,7 +915,7 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
                 rounds += 1
                 if rounds == 1:
                     arguments: dict[str, Any] = {}
-                    if phase != "initial":
+                    if phase != "initial" or boundary == "group":
                         arguments = {"channel": channel, "owner_id": "7"}
                     if phase == "cursor":
                         arguments.update(direction="incoming", limit=1)
@@ -925,7 +927,7 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
                     )
                 elif rounds == 2:
                     result = tool_result(messages, "read-extra-channel")
-                    if phase == "reject" or boundary == "group":
+                    if phase == "reject":
                         assert (
                             result.get("error")
                             and "incoming" not in result
@@ -961,30 +963,35 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
                             "owner_id": "7",
                             "session_id": main_id,
                         }
-                        assert (
-                            len(result["incoming"]["items"]) == 1
-                            and result["outgoing"]["items"] == []
-                        )
-                        item = result["incoming"]["items"][0]
-                        stored_original = runtime.store.get("message", item["id"])
-                        assert isinstance(stored_original, dict)
-                        original = stored_original
-                        assert (
-                            original["content"] == original_text
-                            and original["route"]["kind"] == "private"
-                        )
-                        assert original["principal"] == "owner" and item["role"] == "user"
-                        assert_host_origin(messages, runtime, channel, original_text)
-                        turn = ModelTurn(
-                            tool_calls=[
-                                call(
-                                    "read-extra-channel-body",
-                                    "conversation_read",
-                                    session_id=main_id,
-                                    message_id=item["id"],
-                                )
-                            ]
-                        )
+                        if boundary == "group":
+                            assert result["incoming"]["items"] == []
+                            assert result["outgoing"]["items"] == []
+                            turn = ModelTurn(content=final_text)
+                        else:
+                            assert (
+                                len(result["incoming"]["items"]) == 1
+                                and result["outgoing"]["items"] == []
+                            )
+                            item = result["incoming"]["items"][0]
+                            stored_original = runtime.store.get("message", item["id"])
+                            assert isinstance(stored_original, dict)
+                            original = stored_original
+                            assert (
+                                original["content"] == original_text
+                                and original["route"]["kind"] == "private"
+                            )
+                            assert original["principal"] == "owner" and item["role"] == "user"
+                            assert_host_origin(messages, runtime, channel, original_text)
+                            turn = ModelTurn(
+                                tool_calls=[
+                                    call(
+                                        "read-extra-channel-body",
+                                        "conversation_read",
+                                        session_id=main_id,
+                                        message_id=item["id"],
+                                    )
+                                ]
+                            )
                 else:
                     assert rounds == 3 and phase == "initial" and boundary == "current_owner"
                     result = tool_result(messages, "read-extra-channel-body")
@@ -1029,6 +1036,22 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
                 f"/api/channels/{channel}/webhook", content=raw, headers=headers
             )
             assert accepted.status_code == 200
+        group_query = "请从网页只读核对当前主人私聊目录；被忽略的群消息不应在其中。"
+        if boundary == "group":
+            if channel == "telegram":
+                async with asyncio.timeout(4):
+                    await poll_advanced.wait()
+            assert rounds == 0
+            assert (
+                runtime.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 0
+            )
+            assert not [
+                message for message in runtime.store.messages(main_id) if message["role"] == "user"
+            ]
+            queried = await web.post(
+                f"/api/sessions/{main_id}/messages", json={"content": group_query}
+            )
+            assert queried.status_code == 200
         await eventually(runtime, lambda: bool(completed(runtime, final_text)))
         first = completed(runtime, final_text)[0]
         await processed_reply(runtime, app.state.channel_application.manager, first["id"])
@@ -1036,13 +1059,17 @@ async def test_telegram_and_qq_history_uses_real_private_origin_and_current_bind
         stored = [
             message for message in runtime.store.messages(main_id) if message["role"] == "user"
         ]
-        assert len(stored) == 1 and stored[0]["content"] == original_text
-        assert stored[0]["source"] == f"channel:{channel}:123" and stored[0]["principal"] == "owner"
-        assert stored[0]["route"]["kind"] == ("group" if boundary == "group" else "private")
+        assert len(stored) == 1 and stored[0]["principal"] == "owner"
+        if boundary == "group":
+            assert stored[0]["content"] == group_query and stored[0]["source"] == "web"
+        else:
+            assert stored[0]["content"] == original_text
+            assert stored[0]["source"] == f"channel:{channel}:123"
+            assert stored[0]["route"]["kind"] == "private"
         if boundary == "current_owner":
             assert rounds == 3 and original["id"] == stored[0]["id"]
         elif boundary == "group":
-            assert rounds == 2 and rejection.get("error")
+            assert rounds == 2 and not rejection
         else:
             if boundary == "changed_account_cursor":
                 phase = "cursor"

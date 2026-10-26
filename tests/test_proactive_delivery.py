@@ -148,17 +148,36 @@ def test_new_destination_uses_complete_candidate_binding(
     assert not config.path.exists()
 
 
-def test_candidate_can_bind_new_group_and_later_revoke_without_retargeting(tmp_path: Path) -> None:
+def test_candidate_binds_only_private_owners_and_later_revokes_without_retargeting(
+    tmp_path: Path,
+) -> None:
     config = ConfigFile(tmp_path / "config.json")
+    with pytest.raises(ValueError, match="私聊"):
+        config.update(
+            {
+                "channels": {
+                    "telegram": {
+                        "account_id": "new",
+                        "owner_ids": ["7"],
+                        "allowed_groups": ["group"],
+                    },
+                    "proactive": {
+                        "external_enabled": True,
+                        "default_destination": external(
+                            "group", name="telegram", account_id="new", kind="group", sender_id="7"
+                        ),
+                    },
+                }
+            }
+        )
+    assert not config.path.exists()
     config.update(
         {
             "channels": {
                 "telegram": {"account_id": "new", "owner_ids": ["7"], "allowed_groups": ["group"]},
                 "proactive": {
                     "external_enabled": True,
-                    "default_destination": external(
-                        "group", name="telegram", account_id="new", kind="group", sender_id="7"
-                    ),
+                    "default_destination": external("7", name="telegram", account_id="new"),
                 },
             }
         }
@@ -480,18 +499,17 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
         route("group", name=name, kind="group", sender_id="7") if revocation == "group" else route()
     )
     if revocation == "group":
-        config.update(
-            {
-                "channels": {
-                    "telegram": {
-                        "enabled": True,
-                        "owner_ids": ["7"],
-                        "allowed_groups": ["group"],
-                    },
-                    "proactive": {"default_destination": {"kind": "channel", "route": destination}},
-                }
-            }
+        # Reopen a snapshot previously saved with a group default. Choosing a
+        # new group through update() is rejected by the separate candidate test.
+        historical = config.settings.model_dump()
+        historical["channels"]["telegram"].update(
+            enabled=True, owner_ids=["7"], allowed_groups=["group"]
         )
+        historical["channels"]["proactive"]["default_destination"] = {
+            "kind": "channel",
+            "route": destination,
+        }
+        config.replace(Settings.model_validate(historical))
     frozen = FrozenRouting.independent(config.settings)
     harness = Harness(
         tmp_path,
@@ -523,11 +541,22 @@ async def test_revocation_is_durable_blocked_and_never_resets_unknown(
             automatic=True,
             attention_routing=frozen.dump(),
         )
-        assert first["state"] == unknown["state"] == "pending"
+        assert (
+            first["state"]
+            == unknown["state"]
+            == ("blocked" if revocation == "group" else "pending")
+        )
         with harness.store.db:
+            if revocation == "group":
+                # Model an already durable old-version pending row; today's
+                # automatic enqueue must remain blocked even before revocation.
+                harness.store.db.execute(
+                    "UPDATE channel_outbox SET state='pending' WHERE id=?", (first["id"],)
+                )
             harness.store.db.execute(
                 "UPDATE channel_outbox SET state='unknown' WHERE id=?", (unknown["id"],)
             )
+        assert harness.manager.delivery(first["id"])["state"] == "pending"
         if revocation == "pause":
             config.update({"channels": {"proactive": {"external_enabled": False}}})
         elif revocation == "attention":

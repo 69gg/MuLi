@@ -17,8 +17,8 @@ function harness(enabled) {
     return control;
   };
   const context = {
-    state: { settingsDraft: { channels: { onebot: { enabled, owner_ids: ["12345678"], allowed_groups: ["legacy-group"] }, telegram: {} } }, channels: null },
-    CHANNELS: [["onebot", "OneBot"], ["telegram", "Telegram"]],
+    state: { settingsDraft: { channels: { onebot: { enabled, owner_ids: ["12345678"], allowed_groups: ["legacy-group"] }, telegram: { enabled }, qq: { enabled }, weixin: { enabled } } }, channels: null },
+    CHANNELS: [["onebot", "OneBot"], ["telegram", "Telegram"], ["qq", "QQ 官方"], ["weixin", "微信 iLink"]],
     element, field, switchField: (label, name, value) => field(label, name, value),
     selectField: (label, name, value, choices) => field(label, name, value, { choices }),
     $: (selector, parent) => parent.input,
@@ -30,29 +30,38 @@ function harness(enabled) {
   return { context, controls };
 }
 
-test("OneBot activation requires its owner's QQ field without blocking disabled channels", () => {
+test("bot activation requires private owners while preserving Weixin settings", () => {
   const { context, controls } = harness(false);
   context.renderChannelSettings();
-  const owner = controls.get("channels.onebot.owner_ids");
-  assert.equal(owner.label, "主人 QQ 号");
-  assert.equal(owner.input.required, false);
-  const toggle = controls.get("channels.onebot.enabled").input;
-  toggle.events.change({ target: { checked: true } });
-  assert.equal(owner.input.required, true);
-  toggle.events.change({ target: { checked: false } });
-  assert.equal(owner.input.required, false);
-  assert.equal(controls.has("channels.onebot.allowed_groups"), false);
-  assert.equal(controls.has("channels.telegram.allowed_groups"), true);
+  for (const name of ["onebot", "telegram", "qq"]) {
+    const owner = controls.get(`channels.${name}.owner_ids`);
+    assert.equal(owner.label, name === "onebot" ? "主人 QQ 号" : "主人用户 ID");
+    assert.equal(owner.input.required, false);
+    const toggle = controls.get(`channels.${name}.enabled`).input;
+    toggle.events.change({ target: { checked: true } });
+    assert.equal(owner.input.required, true);
+    toggle.events.change({ target: { checked: false } });
+    assert.equal(owner.input.required, false);
+    assert.equal(controls.has(`channels.${name}.allowed_groups`), false);
+  }
+  assert.equal(controls.has("channels.weixin.allowed_groups"), true);
+  assert.equal(controls.get("channels.weixin.owner_ids").label, "你的用户 ID");
+  assert.equal(controls.get("channels.weixin.owner_ids").input.required, false);
   const active = harness(true);
   active.context.renderChannelSettings();
-  assert.equal(active.controls.get("channels.onebot.owner_ids").input.required, true);
+  for (const name of ["onebot", "telegram", "qq"]) {
+    assert.equal(active.controls.get(`channels.${name}.owner_ids`).input.required, true);
+  }
+  assert.equal(active.controls.get("channels.weixin.owner_ids").input.required, false);
 });
 
-test("notification targets offer private chat only for OneBot and retain Telegram group choices", () => {
+test("notification targets offer bot private chats and preserve Weixin choices", () => {
   const { context, controls } = harness(false);
-  for (const name of ["onebot", "telegram"]) {
+  for (const name of ["onebot", "telegram", "qq", "weixin"]) {
     context.proactiveRouteFields({ kind: "channel", route: { name, kind: "private", target: "12345678", sender_id: "12345678" } }, name);
   }
-  assert.deepEqual(JSON.parse(JSON.stringify(controls.get("onebot.kind").options.choices)), [["private", "私聊"]]);
-  assert.deepEqual(JSON.parse(JSON.stringify(controls.get("telegram.kind").options.choices)), [["private", "私聊"], ["group", "已允许的群组"]]);
+  for (const name of ["onebot", "telegram", "qq"]) {
+    assert.deepEqual(JSON.parse(JSON.stringify(controls.get(`${name}.kind`).options.choices)), [["private", "私聊"]]);
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(controls.get("weixin.kind").options.choices)), [["private", "私聊"], ["group", "已允许的群组"]]);
 });
