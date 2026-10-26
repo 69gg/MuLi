@@ -87,6 +87,8 @@ class ManagedControllerBackend(
     Reopening already-desired files still confirms their data/parent durability;
     bytes alone do not establish completion. No start is repeated for a durable
     start intent. observe() must freshly establish a confirmation on reentry.
+    activate() may return a fresh, fully authenticated released observation from
+    its own request; None retains ordinary observation without resending it.
     """
 
     async def install(

@@ -97,7 +97,7 @@ class _ControllerEffects[RecordT, ObservationT](Protocol):
     async def resume(self, record: RecordT) -> None: ...
     async def stop(self, record: RecordT, role: Role) -> None: ...
     async def start(self, record: RecordT, role: Role) -> None: ...
-    async def activate(self, record: RecordT, role: Role) -> None: ...
+    async def activate(self, record: RecordT, role: Role) -> ObservationT | None: ...
 
 
 class _ControllerPolicy[RecordT, ObservationT, ProofT](Protocol):
@@ -230,6 +230,52 @@ class _Controller[
             "verifying",
         }:
             return self._failure(record, "deadline_exceeded")
+        return None
+
+    def _terminal_result(self, record: RecordT, observation: ObservationT) -> RecordT | None:
+        if (
+            not observation.identity_matches
+            or observation.service == "foreign"
+            or not self._policy.allowed(record, observation)
+        ):
+            return self._failure(record, "foreign_state")
+        proof = self._policy.proof(observation)
+        role: Role = "target" if record.phase == "committed" else "base"
+        if (
+            not self._policy.matches(record, observation, role)
+            or observation.service != "running"
+            or observation.writer_free
+        ):
+            return self._failure(record, "health_failed")
+        if observation.activation_failed or observation.health_failed:
+            return self._failure(
+                record,
+                "activation_failed" if observation.activation_failed else "health_failed",
+            )
+        if (
+            proof is not None
+            and self._policy.accepts(record, proof, role, released=True)
+            and proof.boot == observation.boot
+        ):
+            activation: Literal["released", "released_degraded"] = (
+                "released_degraded" if proof.admission == "released_degraded" else "released"
+            )
+            return self._move(
+                record,
+                phase=record.phase,
+                activation=activation,
+                proof=proof,
+                code=record.code,
+            )
+        if proof is None:
+            # Missing HTTP evidence is not an explicit host failure.
+            return record
+        if proof.boot != observation.boot or not self._policy.accepts(record, proof, role):
+            return self._failure(record, "health_failed")
+        if record.health is not None and proof.boot != record.health.boot:
+            return self._move(record, phase=record.phase, proof=proof, code=record.code)
+        if record.activation == "blocked":
+            return record
         return None
 
     async def step(self) -> RecordT:
@@ -462,45 +508,16 @@ class _Controller[
                 return self._move(record, phase="rolled_back", proof=proof, code=record.code)
             return record
         if record.phase in {"committed", "rolled_back"}:
-            proof = self._policy.proof(observation)
+            if result := self._terminal_result(record, observation):
+                return result
             role = "target" if record.phase == "committed" else "base"
-            if (
-                not self._policy.matches(record, observation, role)
-                or observation.service != "running"
-                or observation.writer_free
-            ):
-                return self._failure(record, "health_failed")
-            if observation.activation_failed or observation.health_failed:
-                return self._failure(
-                    record,
-                    "activation_failed" if observation.activation_failed else "health_failed",
-                )
-            if (
-                proof is not None
-                and self._policy.accepts(record, proof, role, released=True)
-                and proof.boot == observation.boot
-            ):
-                activation: Literal["released", "released_degraded"] = (
-                    "released_degraded" if proof.admission == "released_degraded" else "released"
-                )
-                return self._move(
-                    record,
-                    phase=record.phase,
-                    activation=activation,
-                    proof=proof,
-                    code=record.code,
-                )
-            if proof is None:
-                # A missing HTTP observation is not an explicit host failure.
-                # Keep the original deadline and do not resend activation.
-                return record
-            if proof.boot != observation.boot or not self._policy.accepts(record, proof, role):
-                return self._failure(record, "health_failed")
-            if record.health is not None and proof.boot != record.health.boot:
-                return self._move(record, phase=record.phase, proof=proof, code=record.code)
-            if record.activation == "blocked":
-                return record
-            await self._call(record, lambda: self._effects.activate(record, role))
+            receipt = await self._call(record, lambda: self._effects.activate(record, role))
+            if receipt is not None and isinstance(record, TransactionRecordV2):
+                remaining = record.deadline.remaining(self.clock())
+                if failed := self._deadline_result(record, remaining):
+                    return failed
+                if result := self._terminal_result(record, receipt):
+                    return result
             return record
         raise TransactionError("unsupported_phase")
 

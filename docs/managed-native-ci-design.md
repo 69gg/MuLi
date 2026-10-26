@@ -1,10 +1,18 @@
 # 真实 systemd 托管切换 CI 设计
 
+Native57 在 protocol 2 的激活 HTTP 返回后，复用已有 fresh probe、选中角色完整认证及 disk/boot 一致性检查；只有完整 released 回执与实际 writer lease 的 `lock_busy` 同时成立，才返回本次临时观测。controller 随后重核原绝对 deadline，经共用的完整终态判断和原 position CAS 在同一步持久化 released。未知或 paused 回执仍走后续观察，已尝试的激活不重发；`invalid_lock` 等非 busy 错误不能作为持锁证明，回执后的 `clock_invalid` 不能写成功。V1 仍返回 `None`，最后 observe 与原投影路径保留，没有提高期限。
+
+本地十项回执回归已通过；十四文件 283 项整合通过（57.79 秒、峰值 214.8 MiB、swap 0），两组有重叠，不累计计数。另两项真实 lease 文件异常及回执后时钟回退的边界回归通过（0.78 秒、121.7 MiB、swap 0）。512 文件格式、全仓 Ruff、161 份源码严格类型和离线锁检查通过（9.388 秒、峰值 474.8 MiB、swap 0）。独立后审未发现新增 P1/P2；这些本地结果不代表原生三事务或 60 秒期限验收通过。
+
 Native56 候选把运行态观察在 probe 返回后的 controller 认证与紧邻的选中角色认证合为一次同步完整检查。两次真实 probe、readiness、所有包字节与身份核验均保留；局部观察错误仍先核 controller，origin 仍选择完整 base 安装，stop-only 与停止态第三次 probe 沿原门执行。等待后重新读取全部包，不保存或传递认证证明。
 
 新核心回归在旧生产实收两失败一通过，完整快照、health、真实 FD 与字节断言先通过，唯一红为 controller 完整扫描六次而非四次；五项独立错误优先与三安装 origin 边界在旧生产已通过。修后两文件八项通过，十七文件 276 项整合通过（60.94 秒、峰值 105.8 MiB、swap 0），509 文件格式、全量 Ruff、161 份源码严格类型与离线锁检查通过。独立后审无新增 P1/P2；这些本地证据不能代替原生三事务或 60 秒期限验收。
 
 与 v2.76 插件启动恢复、v2.77 记忆查询恢复候选整合后，七文件 126 项通过（20.17 秒、峰值 188.9 MiB、swap 0）。只解决版本记录冲突，未改本轮认证实现或测试期限；v2.77 独立发布检查仍单独核验。
+
+[Native56，精确候选 `bbec9676704f4accb02776436f68478d31ed14d0`](https://github.com/69gg/MuLi/actions/runs/40353509841) 的十三项作业已全部终态：十二项通用作业成功，仅 [managed-native job `121679667236`](https://github.com/69gg/MuLi/actions/runs/40353509841/job/121679667236) 失败，没有其它失败。第一代 verifying 31803、committed 32989、released 37006、projection 37940 毫秒；第二代 prepared 40192、draining 46317、stop_base 49724、install_target 53048、start_target 57649 毫秒，随后 60001 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。
+
+本轮仅获取 2160 字节 evidence（artifact `12664732433`），SHA256 `2d27231faef088b8740f155a5380648caa30227cd4212e5d1472e197aacb2ee3`；两个成员及完整结果合同已核，cleanup verified、user/group removed、mount 0。第一代 checks 为 123 次 / 12833 毫秒，host_record 33 次 / 4180 毫秒、bus 244 次 / 4238 毫秒、HTTP 14 次 / 1831 毫秒。轮询节奏与各项耗时均有变化，不能把相邻总耗时差归因于本轮认证合并，也不能把 checks 当作纯摘要成本；完整三事务仍未验收。
 
 Native55 候选仅将一次同步 backend `_check` 的真实 deployment 认证合成局部批次。anchor、launcher 和每个完整 installation digest 对应的 slot 各实际读取、核摘要与严格解析；controller 和选中角色的完整包扫描之后，统一复核全部叶的七字段身份、根 owner/mode 和完整祖先链。不减少 guard、不跨独立检查或等待保存 metadata，不放宽坏 target 元数据拒绝或原 60 秒期限。
 

@@ -570,7 +570,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
 
     async def _host_command(
         self, record: TransactionRecordV2, action: str, role: Role | None
-    ) -> None:
+    ) -> ManagedServiceObservation | None:
         if (
             action == "drain"
             and (record.phase != "draining" or role is not None)
@@ -596,7 +596,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         if action == "activate":
             attempt = record.generation, boot, role
             if self._activation_attempt == attempt:
-                return
+                return None
             self._activation_attempt = attempt
         value = await self._request(record, boot, action)
         after = await self._probe(record)
@@ -604,10 +604,37 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         if before != after or disk != self._disk():
             raise ObservationError("transaction_observation_changed")
         if value is None:
-            return
+            return None
         if action == "activate":
-            if self._proof(record, boot, value).admission == "blocked":
+            proof = self._proof(record, boot, value)
+            if proof.admission == "blocked":
                 raise ObservationError("transaction_activation_failed")
+            if proof.admission not in {"released", "released_degraded"}:
+                return None
+            available = self.journal.writer_lease()
+            try:
+                available.__enter__()
+            except TransactionError as error:
+                if error.code != "lock_busy":
+                    raise
+            else:
+                available.__exit__()
+                return None
+            selected: Role = "base" if role is None else role
+            binding = record.binding(selected)
+            return ManagedServiceObservation(
+                identity_matches=True,
+                configuration=disk.configuration.digest,
+                selector=None if disk.selector is None else disk.selector.digest,
+                unit=disk.unit.digest,
+                service="running",
+                boot=boot,
+                writer_free=False,
+                process=ManagedProcessIdentity(
+                    binding.entry, binding.installation, binding.compatibility
+                ),
+                health=proof,
+            )
         elif (
             action == "drain"
             and value.get("state") not in {"waiting", "drained"}
@@ -617,6 +644,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             and value.get("boot") != boot
         ):
             raise ObservationError("invalid_transaction_reply")
+        return None
 
     async def drain(self, record: TransactionRecordV2) -> None:
         await self._host_command(record, "drain", None)
@@ -624,8 +652,10 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     async def resume(self, record: TransactionRecordV2) -> None:
         await self._host_command(record, "resume", None)
 
-    async def activate(self, record: TransactionRecordV2, role: Role) -> None:
-        await self._host_command(record, "activate", role)
+    async def activate(
+        self, record: TransactionRecordV2, role: Role
+    ) -> ManagedServiceObservation | None:
+        return await self._host_command(record, "activate", role)
 
     async def stop(self, record: TransactionRecordV2, role: Role) -> None:
         if (record.phase, record.intent, role) not in {
