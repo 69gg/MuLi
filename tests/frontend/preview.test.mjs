@@ -137,6 +137,43 @@ test("preview uploads enforce both total bytes and count without partial metadat
   assert.equal(await (await backend.fetch(`/api/uploads/${saved.id}/content`)).text(), "1234");
 });
 
+test("preview extension reload queues saved in-memory settings and exposes completion on a later read", async (t) => {
+  const scheduled = new Set(), calls = [];
+  t.mock.method(globalThis, "setTimeout", (callback) => { scheduled.add(callback); return callback; });
+  t.mock.method(globalThis, "clearTimeout", (callback) => scheduled.delete(callback));
+  const target = { location: { href: "http://preview.local/preview.html", origin: "http://preview.local" }, fetch: async (...args) => { calls.push(args); throw new Error("preview must stay local"); } };
+  const preview = installPreview({ target }), client = { fetch: target.fetch };
+  t.after(() => preview.dispose());
+  const initial = (await json(client, "/status")).body.extensions;
+  assert.equal(initial.phase, "loaded"); assert.equal(initial.preview, true);
+  assert.equal(initial.skills.count, 2); assert.equal(initial.mcp[0].status, "connected");
+  assert.deepEqual((await json(client, "/extensions")).body, initial);
+  assert.equal(scheduled.size, 0, "status reads do not start a reload or polling");
+  await json(client, "/settings", "PATCH", { mcp: { mcpServers: { [initial.mcp[0].name]: { enabled: false } } } });
+  const saved = structuredClone(preview.state.settings);
+  const queued = await json(client, "/extensions/reload", "POST", {});
+  assert.equal(queued.status, 200); assert.equal(queued.body.phase, "queued");
+  assert.equal(queued.body.generation, initial.generation);
+  assert.deepEqual(queued.body.mcp, initial.mcp);
+  assert.equal((await json(client, "/status")).body.extensions.phase, "queued");
+  assert.equal(scheduled.size, 1);
+  await json(client, "/extensions/reload", "POST", {});
+  assert.equal(scheduled.size, 1, "repeated queued requests share the pending demo work");
+  const complete = scheduled.values().next().value; scheduled.delete(complete); complete();
+  const loaded = (await json(client, "/status")).body;
+  assert.equal(loaded.extensions.phase, "loaded"); assert.equal(loaded.extensions.generation, initial.generation + 1);
+  assert.equal(loaded.extensions.mcp[0].status, "disabled"); assert.deepEqual(loaded.mcp, loaded.extensions.mcp);
+  assert.deepEqual((await json(client, "/extensions")).body, loaded.extensions);
+  assert.deepEqual(preview.state.settings, saved); assert.equal(queued.body.phase, "queued");
+  assert.equal(scheduled.size, 0); assert.equal(calls.length, 0);
+  await json(client, "/extensions/reload", "POST", {});
+  const late = scheduled.values().next().value, pending = preview.state.extensions;
+  preview.dispose(); late();
+  assert.equal(scheduled.size, 0); assert.equal(preview.state.extensions === pending, true);
+  assert.equal((await json(preview, "/extensions")).status, 410);
+  assert.equal(calls.length, 0);
+});
+
 test("preview blocks external fetch and actual anchor navigation while preserving local buttons and owned blobs", async (t) => {
   const calls = [], target = { location: { href: "http://preview.local/preview.html", origin: "http://preview.local" }, fetch: async (...args) => { calls.push(args); return new Response("static"); } };
   const originalFetch = target.fetch;
