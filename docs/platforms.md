@@ -24,6 +24,8 @@ muli service status
 
 服务使用安装时选择的 Python 环境、配置与数据目录。凭据环境变量也必须对后台服务可见，不能只在临时终端里设置。命令不会自动提权；缺少系统工具或用户会话不可用时，查看 `status` 的原因。
 
+同一数据库路径只供一个运行实例使用。后台服务运行时，再启动一份使用相同数据的 MuLi 会被拒绝；前台调试前先停止服务。正常退出或初始化失败完成清理后可以重新启动。升级前仍需退出旧版本，这项互斥不会替你停止旧进程，也不开放其他平台的旧库格式迁移。
+
 | 平台 | 服务方式 | 安装位置 | 日志 |
 | --- | --- | --- | --- |
 | Linux / Arch | `systemd --user` | `$XDG_CONFIG_HOME/systemd/user/muli.service`，默认 `~/.config/systemd/user/muli.service` | `journalctl --user -u muli.service` |

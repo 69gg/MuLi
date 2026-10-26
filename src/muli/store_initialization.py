@@ -1,4 +1,4 @@
-"""Short cooperative constructor lock; not a lifetime database writer lease."""
+"""Cooperative database lock; Runtime owners retain it until connection close."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 
 
 class StoreConstructionLock(AbstractContextManager["StoreConstructionLock"]):
-    """Lock one fixed inode, without polling or retaining it for business work."""
+    """Lock one fixed inode without polling; the caller controls its lifetime."""
 
     def __init__(self, database: Path) -> None:
         self.database = database.resolve()

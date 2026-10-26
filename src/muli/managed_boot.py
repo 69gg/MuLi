@@ -397,9 +397,9 @@ class ManagedBootPermit:
         except (OSError, ValueError, sqlite3.Error):
             raise ManagedBootError("managed_boot_verification_failed") from None
         try:
-            store = Store.open_existing(self.journal.database, durable=True)
+            store = Store.open_existing(self.journal.database, durable=True, runtime_owner=True)
         except ExistingStoreError:
-            # This factory's fixed error is emitted only after its own DB is closed.
+            # This fixed error certifies no connection was opened or its DB closed.
             raise ManagedBootError("managed_store_unavailable") from None
         except BaseException as error:
             # Unknown factory failure cannot certify its internal connection close.

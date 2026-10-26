@@ -26,7 +26,11 @@ from muli.format_evidence import (
 )
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
-from muli.store_initialization import CreatedDatabase, StoreConstructionLock
+from muli.store_initialization import (
+    CreatedDatabase,
+    StoreConstructionLock,
+    StoreInitializationError,
+)
 from muli.store_schema import (
     CHANNEL_SCHEMA,
     CORE_SCHEMA,
@@ -114,6 +118,7 @@ _EVIDENCE_FROM = (
 
 class Store:
     def __init__(self, path: Path, *, durable: bool = False) -> None:
+        self._runtime_lock: StoreConstructionLock | None = None
         try:
             with StoreConstructionLock(path) as lock:
                 self._open_locked(lock, durable=durable)
@@ -124,18 +129,19 @@ class Store:
 
     @classmethod
     def open_runtime(cls, path: Path, *, default_mode: str, durable: bool = False) -> Store:
-        """Initialize/certify only a database exclusively created by this call.
+        """Hold cooperative Runtime ownership until this Store is closed.
 
+        Initialize/certify only a database exclusively created by this call.
         Existing unmarked data cannot start a Runtime. No empty-file or schema
         heuristic can turn it into a newly created, format-certified database.
         """
         store = cls.__new__(cls)
+        store._runtime_lock = None
         try:
-            with StoreConstructionLock(path) as lock:
-                store._open_locked(lock, durable=durable, runtime_mode=default_mode)
+            store._runtime_lock = StoreConstructionLock(path).__enter__()
+            store._open_locked(store._runtime_lock, durable=durable, runtime_mode=default_mode)
         except BaseException:
-            if hasattr(store, "db"):
-                store.db.close()
+            store.close()
             raise
         return store
 
@@ -241,17 +247,33 @@ class Store:
         *,
         durable: bool = False,
         limits: ExistingStoreLimits | None = None,
+        runtime_owner: bool = False,
     ) -> Store:
         """Internal no-migration construction; not compatibility authorization.
 
         The host authenticates paths and exclusively owns the writer lease. This
         method neither creates a missing database nor changes its journal mode.
+        A supported Runtime additionally retains the cooperative constructor
+        lock; ordinary existing-store readers keep their original behavior.
         """
         store = cls.__new__(cls)
+        store._runtime_lock = None
         store._migration_allowed = False
         store._format_state = None
         store._format_identity = None
+        if runtime_owner:
+            try:
+                store._runtime_lock = StoreConstructionLock(path).__enter__()
+            except StoreInitializationError as error:
+                # No SQLite connection has been attempted. The lock factory
+                # closes its descriptor before reporting this fixed failure.
+                raise ExistingStoreError(error.code) from None
+            # Resolve once with the lock. A changed caller symlink must not
+            # redirect this connection to another, unlocked database.
+            path = store._runtime_lock.database
         try:
+            if store._runtime_lock is not None:
+                store._runtime_lock.check()
             store.db = sqlite3.connect(
                 path.absolute().as_uri() + "?mode=rw&cache=private",
                 uri=True,
@@ -259,9 +281,8 @@ class Store:
                 timeout=0,
                 isolation_level="DEFERRED",
             )
-        except sqlite3.Error:
-            raise ExistingStoreError("existing_store_unavailable") from None
-        try:
+            if store._runtime_lock is not None:
+                store._runtime_lock.check()
             format_limits = (
                 FormatReadLimits(seconds=limits.seconds, vm_steps=limits.vm_steps)
                 if limits is not None
@@ -273,9 +294,11 @@ class Store:
             # No SQL, even a connection PRAGMA, precedes bounded validation.
             validate_existing_schema(store.db, limits=limits)
             store._configure_existing(durable=durable)
+            if store._runtime_lock is not None:
+                store._runtime_lock.check()
             return store
         except (FormatEvidenceError, FormatAdmissionError) as error:
-            store.db.close()
+            store.close()
             codes = {
                 "format_read_timeout": "existing_store_read_budget",
                 "format_query_budget": "existing_store_read_budget",
@@ -291,10 +314,10 @@ class Store:
                 error.copy_observation_to(mapped)
             raise mapped from None
         except sqlite3.Error:
-            store.db.close()
+            store.close()
             raise ExistingStoreError("existing_store_unavailable") from None
         except BaseException:
-            store.db.close()
+            store.close()
             raise
 
     @property
@@ -358,7 +381,13 @@ class Store:
         return str(row[0])
 
     def close(self) -> None:
-        self.db.close()
+        # A partly opened factory has no connection yet. Once one exists,
+        # closing it must succeed before another Runtime may acquire this lock.
+        if hasattr(self, "db"):
+            self.db.close()
+        if self._runtime_lock is not None:
+            self._runtime_lock.__exit__()
+            self._runtime_lock = None
 
     def put(self, kind: str, item: dict[str, Any]) -> dict[str, Any]:
         with self.db:
