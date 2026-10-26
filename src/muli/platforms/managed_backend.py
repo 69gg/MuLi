@@ -54,6 +54,7 @@ from muli.platforms.managed_deployment import (
     SelectorStore,
     SelectorValue,
     SlotIdentity,
+    _AuthenticationMismatch,
     verify_slot_files,
 )
 from muli.platforms.managed_launcher import PackageProofs
@@ -163,47 +164,45 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise TransactionError("stale_revision")
         if record.identity.deployment != self.anchor.digest:
             raise ObservationError("managed_deployment_changed")
-        with DeploymentStore(Path(self.anchor.journal_root), self.journal.limits) as store:
+        slots = {self.anchor.controller_slot: self.controller_slot}
+        # The opposite role still requires actual metadata, not an executable
+        # package: a damaged target cannot prevent restoration of the base.
+        for selected in _ROLES:
+            binding, slot = record.binding(selected), self.slots[selected]
             if (
-                store.read_anchor(self.anchor.digest) != self.anchor
-                or store.read_slot(self.anchor.controller_slot) != self.controller_slot
+                binding.installation != slot.digest
+                or binding.compatibility != slot.compatibility_digest
+                or (binding.installation in slots and slots[binding.installation] != slot)
             ):
-                raise ObservationError("managed_deployment_changed")
+                raise ObservationError("managed_slot_changed")
+            slots[binding.installation] = slot
+
+        def verify_selected(slot: SlotIdentity) -> None:
+            # Keep the original selected-role verifier and kwargs boundary. It
+            # receives the actual record parsed inside this synchronous guard.
             if verified_packages is None and observed_packages is None:
-                store.verify_anchor(self.anchor, verified_python=verified_python)
-            else:
-                store.verify_anchor(
-                    self.anchor,
-                    verified_python=verified_python,
-                    verified_packages=verified_packages,
-                    observed_packages=observed_packages,
-                )
-            # The opposite role is frozen metadata, not a requirement that its
-            # damaged package remain executable in order to restore the base.
-            for selected in _ROLES:
-                binding, slot = record.binding(selected), self.slots[selected]
-                if (
-                    binding.installation != slot.digest
-                    or binding.compatibility != slot.compatibility_digest
-                    or store.read_slot(binding.installation) != slot
-                ):
-                    raise ObservationError("managed_slot_changed")
-        # verify_anchor authenticated the controller in this synchronous check.
-        # Equal frozen installations share this check's full slot verification.
-        # Distinct slots still reopen/walk their Python and verify their package;
-        # only an identical resolved file identity can reuse the controller SHA.
-        if role is not None and self.slots[role] != self.controller_slot:
-            if verified_packages is None and observed_packages is None:
-                verify_slot_files(
-                    self.slots[role], verified_python=self.controller_slot.resolved_python
-                )
+                verify_slot_files(slot, verified_python=self.controller_slot.resolved_python)
             else:
                 verify_slot_files(
-                    self.slots[role],
+                    slot,
                     verified_python=self.controller_slot.resolved_python,
                     verified_packages=verified_packages,
                     observed_packages=observed_packages,
                 )
+
+        with DeploymentStore(Path(self.anchor.journal_root), self.journal.limits) as store:
+            try:
+                store._authenticate(
+                    self.anchor,
+                    slots,
+                    selected=None if role is None else record.binding(role).installation,
+                    verify_selected=verify_selected,
+                    verified_python=verified_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
+            except _AuthenticationMismatch as error:
+                raise ObservationError(error.code) from None
 
     def _effect_guard(
         self,

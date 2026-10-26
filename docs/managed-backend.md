@@ -6,6 +6,8 @@
 
 任何效果前重读当前 revision、anchor 和 controller 文件。涉及健康、HTTP 激活、安装或启动时，还核当前角色的实际解释器、pyvenv、MuLi 包与兼容声明。另一角色只读冻结 metadata；损坏的 target 包不会阻止恢复仍完整的 base。仅 `stop_base` / `stop_target` 窗口可凭两次一致的精确进程、boot、argv、real executable、cgroup 和三文件观察停止已登记的损坏进程。该例外不产生健康证明，也不放松 foreign PID 或 cgroup 拒绝。
 
+每次同步 `_check` 都从真实私有文件重新认证 anchor、launcher 和各个完整安装摘要对应的 slot。同一安装只读取一次；caller 中冻结的对象只用于比较，不能代替实际字节、SHA 和严格 JSON 解析。controller 与选中角色的完整包认证均位于本批末门之前；随后再次核对所有已读叶的 device、inode、size、mtime、ctime、mode、uid，以及根目录私有权限和完整祖先链。证据只存在于本次函数栈，不跨独立 guard 或等待复用，也不减少效果前检查。损坏的 target 包可沿原流程恢复 base，损坏的 target 元数据仍拒绝。
+
 所有文件修改要求服务已经停止、cgroup 为空，并真实持有现有 writer lease。正向只按配置→selector→unit，回退只按 unit→selector→配置，接受范围是该代冻结正向或反向前缀。不会把三个文件各自的允许值任意组合。已有 desired 内容也调用文件及父目录耐久确认；不存在的 legacy selector 同样确认父目录。selector 只支持本产品 canonical JSON，非 canonical 快照在 prepare 时拒绝，后端再核，不悄悄重新序列化旧证据。
 
 unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh manager 属性证明当前 unit 已加载。命令返回零不算确认。只有同 revision、完整三文件耐久确认、空 cgroup、真实 lease 和 fresh loaded unit 证据才能产生 `BindingConfirmation`；start 在效果前独立重做这些核验。旧 boot、错误 nonce、错误格式/安装/配置证明均不能提交。原 deadline 和回退保留时间不续期；未知 start 不重复发送；激活请求超时或取消后只重观察，不由该后端盲目重发。
@@ -26,7 +28,7 @@ unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh mana
 
 这些模块证据不能证明真实 systemd 用户 manager 的加载或真实服务 exec/激活成功；共享已安装目录被外部程序修改也不是沙箱隔离。生产调用链已接线，另有[真实进程验收](managed-process-recovery.md)；该验收仍使用合成 manager 边界，不代表操作过用户真实服务。
 
-单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次 `verify_anchor` 已完成的文件核验，不再重复扫描同一安装。不同 slot 仍分别核验解释器路径、pyvenv、兼容声明与完整 package；共享已验证的解释器时，只复用相同实际文件指纹的 Python SHA。包内逐叶证明按完整 canonical slot 的摘要分区，因此 package root、limits 及角色安装证据不同便不混用；分区内再按完整叶路径保存实际读取取得的文件指纹，不把持久化的整体 package 摘要当成逐叶内容证明。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
+单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次同步认证已完成的文件核验，不再重复扫描同一安装。不同 slot 仍分别核验解释器路径、pyvenv、兼容声明与完整 package；共享已验证的解释器时，只复用相同实际文件指纹的 Python SHA。包内逐叶证明按完整 canonical slot 的摘要分区，因此 package root、limits 及角色安装证据不同便不混用；分区内再按完整叶路径保存实际读取取得的文件指纹，不把持久化的整体 package 摘要当成逐叶内容证明。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
 
 解释器链接链到达非链接终点时，直接用当前已安全打开的父目录 FD 调用原 `_fingerprint_at`，不再嵌套重开同一绝对父目录。叶文件仍独立以 nofollow/nonblock 打开，保留完整字节摘要、读取前后 FD 与末次相对路径身份、文件预算，以及外层父目录末次重走和所有链接末次复核。该复用仅限当前同步调用，不新增缓存；下一次独立调用仍重新认证。
 

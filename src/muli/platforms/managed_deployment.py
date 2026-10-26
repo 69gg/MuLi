@@ -11,7 +11,7 @@ import os
 import secrets
 import stat
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,9 +46,11 @@ from muli.platforms.managed_launcher import (
     absolute,
     directory,
     fingerprint,
+    identity,
     object_bytes,
     package_fingerprint,
     python_fingerprint,
+    read_at,
     read_file,
 )
 from muli.platforms.managed_launcher import resolve_entry as resolve_entry
@@ -88,6 +90,10 @@ class ManagedDeploymentError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class _AuthenticationMismatch(ManagedDeploymentError):
+    """An actual parsed record differs from the backend's frozen expectation."""
 
 
 def require_unselected_without_record(root: Path) -> None:
@@ -356,6 +362,120 @@ class DeploymentStore(AbstractContextManager["DeploymentStore"]):
             return result
         except (OSError, ValueError):
             raise ManagedDeploymentError("anchor_unavailable") from None
+
+    def _authenticate(
+        self,
+        anchor: DeploymentAnchor,
+        slots: Mapping[str, SlotIdentity],
+        *,
+        selected: str | None,
+        verify_selected: Callable[[SlotIdentity], None],
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
+        """Authenticate one synchronous backend guard from actual private bytes.
+
+        ``verify_selected`` is the backend's trusted synchronous read-only slot
+        verifier, not an extension hook. All evidence remains on this stack;
+        the final leaf/root fences also follow the selected package scan.
+        """
+        if self._unconfirmed:
+            raise ManagedDeploymentError("managed_write_unconfirmed")
+        self.directory.check()
+        if anchor.controller_slot not in slots or (selected is not None and selected not in slots):
+            raise _AuthenticationMismatch("managed_deployment_changed")
+        with directory(self.root, private=True) as descriptor:
+            retained, current = os.fstat(self.directory.fd), os.fstat(descriptor)
+            if (retained.st_dev, retained.st_ino) != (current.st_dev, current.st_ino):
+                raise ManagedDeploymentError("managed_directory_changed")
+            leaves: dict[str, tuple[dict[str, int], str]] = {}
+
+            def read_record(prefix: str, expected: str, code: str) -> bytes:
+                try:
+                    if len(expected) != 64 or any(
+                        value not in "0123456789abcdef" for value in expected
+                    ):
+                        raise ValueError("managed_digest_invalid")
+                    name = f"{prefix}-{expected}.json"
+                    data, observed = read_at(descriptor, name, _PRIVATE_BYTES, private=True)
+                    if hashlib.sha256(data).hexdigest() != expected:
+                        raise ValueError("managed_record_changed")
+                except (OSError, ValueError):
+                    raise ManagedDeploymentError(code) from None
+                leaves[name] = observed, code
+                return data
+
+            try:
+                actual_anchor = DeploymentAnchor.model_validate(
+                    object_bytes(read_record("anchor", anchor.digest, "anchor_unavailable"))
+                )
+                if actual_anchor.journal_root != str(self.root):
+                    raise ValueError("foreign_root")
+            except (OSError, ValueError):
+                raise ManagedDeploymentError("anchor_unavailable") from None
+            if actual_anchor != anchor:
+                raise _AuthenticationMismatch("managed_deployment_changed")
+
+            def read_slot(expected: str) -> SlotIdentity:
+                try:
+                    data = read_record("slot", expected, "managed_slot_unavailable")
+                    object_bytes(data)
+                    actual = SlotIdentity.model_validate_json(data)
+                except (OSError, ValueError):
+                    raise ManagedDeploymentError("managed_slot_unavailable") from None
+                if actual != slots[expected]:
+                    raise _AuthenticationMismatch(
+                        "managed_deployment_changed"
+                        if expected == anchor.controller_slot
+                        else "managed_slot_changed"
+                    )
+                return actual
+
+            controller = read_slot(anchor.controller_slot)
+            try:
+                data, observed = read_at(descriptor, LAUNCHER_NAME, _LAUNCHER_BYTES, private=True)
+                if {
+                    "path": str(self.root / LAUNCHER_NAME),
+                    "identity": observed,
+                    "digest": hashlib.sha256(data).hexdigest(),
+                } != anchor.launcher.model_dump(mode="json"):
+                    raise ValueError("foreign_launcher")
+                leaves[LAUNCHER_NAME] = observed, "anchor_unavailable"
+                if verified_packages is None and observed_packages is None:
+                    verify_slot_files(controller, verified_python=verified_python)
+                else:
+                    verify_slot_files(
+                        controller,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
+            except (OSError, ValueError):
+                raise ManagedDeploymentError("anchor_unavailable") from None
+            actual_slots = {anchor.controller_slot: controller}
+            for expected in slots:
+                if expected not in actual_slots:
+                    actual_slots[expected] = read_slot(expected)
+            if selected is not None and selected != anchor.controller_slot:
+                verify_selected(actual_slots[selected])
+
+            # Comparing all seven fields also rejects permission changes and a
+            # same-inode rewrite whose caller restored only the old mtime.
+            for name, (observed, code) in leaves.items():
+                try:
+                    if (
+                        identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False))
+                        != observed
+                    ):
+                        raise ValueError("managed_file_changed")
+                except (OSError, ValueError):
+                    raise ManagedDeploymentError(code) from None
+            current = os.fstat(descriptor)
+            if current.st_uid != os.geteuid() or stat.S_IMODE(current.st_mode) != 0o700:
+                raise ManagedDeploymentError("managed_directory_not_private")
+            # directory() performs its final full ancestor walk on normal exit.
+            # On an exception it only closes the fd, preserving that first error.
 
     def _publish(self, name: str, data: bytes, *, guard: Callable[[], None]) -> None:
         if len(data) > _PRIVATE_BYTES:
