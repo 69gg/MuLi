@@ -319,6 +319,10 @@ class SystemdProbe:
     async def _snapshot(self, path: str) -> UnitSnapshot:
         unit = await self._properties(path, "Unit", _UNIT_FIELDS)
         service = await self._properties(path, "Service", _SERVICE_FIELDS)
+        return self._snapshot_values(unit, service)
+
+    @staticmethod
+    def _snapshot_values(unit: dict[str, Any], service: dict[str, Any]) -> UnitSnapshot:
         invocation, job, entries = unit["InvocationID"], unit["Job"], service["ExecStart"]
         if not isinstance(invocation, list) or len(invocation) not in {0, 16}:
             raise ObservationError("invalid_invocation")
@@ -372,7 +376,15 @@ class SystemdProbe:
             raise ObservationError("invalid_unit_path")
         return path
 
-    async def _helper_limits(self, path: str, limits: HelperLimits) -> None:
+    async def _helper_properties(self, path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Each round independently reads both interfaces. The returned values
+        # belong only to this observation, never to a cached manager proof.
+        unit = await self._properties(path, "Unit", _UNIT_FIELDS + _HELPER_UNIT_FIELDS)
+        service = await self._properties(path, "Service", _SERVICE_FIELDS + _HELPER_SERVICE_FIELDS)
+        return unit, service
+
+    @staticmethod
+    def _helper_limits(unit: dict[str, Any], service: dict[str, Any], limits: HelperLimits) -> None:
         expected: dict[str, object] = {
             "Transient": True,
             "CollectMode": "inactive",
@@ -394,11 +406,10 @@ class SystemdProbe:
             "NoNewPrivileges": True,
             "OOMPolicy": "kill",
         }
-        for interface, fields in (
-            ("Unit", _HELPER_UNIT_FIELDS),
-            ("Service", _HELPER_SERVICE_FIELDS),
+        for values, fields in (
+            (unit, _HELPER_UNIT_FIELDS),
+            (service, _HELPER_SERVICE_FIELDS),
         ):
-            values = await self._properties(path, interface, fields)
             for name, signature in fields:
                 raw = values[name]
                 value = (
@@ -509,7 +520,8 @@ class SystemdProbe:
         try:
             async with asyncio.timeout(self.limits.seconds):
                 path = await self._unit_path(name)
-                before = await self._snapshot(path)
+                unit, service = await self._helper_properties(path)
+                before = self._snapshot_values(unit, service)
                 if (
                     before.name != name
                     or before.load_state != "loaded"
@@ -531,7 +543,7 @@ class SystemdProbe:
                     or UNIT in Path(before.cgroup).parts
                 ):
                     raise ObservationError("unsupported_helper_layout")
-                await self._helper_limits(path, limits)
+                self._helper_limits(unit, service, limits)
                 process = self._process(before.pid)
                 if (
                     process.uid != os.geteuid()
@@ -541,8 +553,9 @@ class SystemdProbe:
                 ):
                     raise ObservationError("foreign_helper_process")
                 kernel = self._kernel_limits(before.cgroup, limits)
-                after = await self._snapshot(path)
-                await self._helper_limits(path, limits)
+                unit, service = await self._helper_properties(path)
+                after = self._snapshot_values(unit, service)
+                self._helper_limits(unit, service, limits)
                 if (
                     before != after
                     or process != self._process(process.pid)

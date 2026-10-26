@@ -12,6 +12,10 @@ unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh mana
 
 旧 `LinuxControllerBackend` 仅将原 loopback URL 与有限 nonce HTTP 收发提取为共享函数。protocol 1 的角色判断、proof 核验、效果门和响应语义保持。HTTP 不继承代理、不跟随重定向、不解压，仍限制原始响应 bytes，503 readiness 和传输超时保持原观察语义。
 
+恢复宿主对既有 helper 的只读认证仍执行前后两轮 fresh manager、proc 与 kernel 观察；仅将每轮同一接口的身份与限额属性合为一次 `get-property`。一次 `GetUnit` 加两轮 Unit/Service 请求由九条降至五条，三十八个属性仍各读两次，继续使用原 typed 解析和全部资源/生命周期依赖校验。普通服务 `_snapshot` 的请求保持原样，不在 probe 实例上缓存证明，不减少 `_record` 文件认证，也不改变效果门、取消、输出预算或绝对期限。
+
+新五项回归复用真实 `SystemdProbe`、临时 proc/cgroup 文件与 fake bus。完整快照、三十八字段双读及 proc/kernel 双观察先于计数断言，旧实现实收一失败、四通过（0.09 秒，守卫 612 毫秒、58.3 MiB），唯一红为九不等于五。第二轮资源声明、InvocationID、进程参数或仍在限额内的 kernel 值变化继续拒绝；旧漂移例改在真实 runner 的第二轮字段门注入，仍经过原 parser。修后两文件 62 项通过（0.23 秒、峰值 62.3 MiB），六份调用方文件另有 264 项通过（21.05 秒、89.8 MiB）；独立后审未发现新增 P1/P2。原生三事务仍待验，尚不能推算其总耗时。
+
 验证使用临时 slot 元数据、真实文件 CAS/fsync 和 flock；systemd、进程观察和 HTTP 都是有界 fake。覆盖同配置 switch/adopt、三文件顺序、写入错误和取消后的前缀重入、loaded unit 未生效、坏 target 停止与 base 恢复、foreign 进程拒绝、原 deadline/revision/安装证据重验，以及未知 start/激活超时。
 
 2026-10-21 本地实测全部经统一守卫串行执行，每次硬期限 30 秒，资源上限未提高。新文件 31 项按不重叠主题分三批全部通过：11 项 18.48 秒、9 项 15.13 秒、11 项 12.10 秒；两份旧 V1 controller/backend 文件全 83 项通过，0.53 秒。3 份源码 mypy 与 4 份 Python Ruff/格式通过。最终测试峰值 62.2 MiB，整轮最高为 mypy 的 127.8 MiB，swap 0。
@@ -23,6 +27,10 @@ unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh mana
 这些模块证据不能证明真实 systemd 用户 manager 的加载或真实服务 exec/激活成功；共享已安装目录被外部程序修改也不是沙箱隔离。生产调用链已接线，另有[真实进程验收](managed-process-recovery.md)；该验收仍使用合成 manager 边界，不代表操作过用户真实服务。
 
 单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次 `verify_anchor` 已完成的文件核验，不再重复扫描同一安装。不同 slot 仍分别核验解释器路径、pyvenv、兼容声明与完整 package；共享已验证的解释器时，只复用相同实际文件指纹的 Python SHA。包内逐叶证明按完整 canonical slot 的摘要分区，因此 package root、limits 及角色安装证据不同便不混用；分区内再按完整叶路径保存实际读取取得的文件指纹，不把持久化的整体 package 摘要当成逐叶内容证明。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
+
+解释器链接链到达非链接终点时，直接用当前已安全打开的父目录 FD 调用原 `_fingerprint_at`，不再嵌套重开同一绝对父目录。叶文件仍独立以 nofollow/nonblock 打开，保留完整字节摘要、读取前后 FD 与末次相对路径身份、文件预算，以及外层父目录末次重走和所有链接末次复核。该复用仅限当前同步调用，不新增缓存；下一次独立调用仍重新认证。
+
+新增七项真实临时文件回归，首红实收两失败、五通过：普通文件和三段链接的完整字节、SHA、叶打开及 FD/path 身份断言均先通过，唯一红为终点父目录仍走四次，目标为两次。负控覆盖末父路径替换、先前链接改指向、同 inode 改写并还原 mtime、独立调用重新哈希，以及旧指纹不绕过更小文件预算。修后十九文件共 322 项通过，独立后审未发现新增 P1/P2；新候选原生性能仍待验收，不从遍历次数推算整体耗时。
 
 独立调用一次 `_confirm` 是没有 `await` 的同步批次。其首个 guard 从空 Python 和 package 逐叶证明开始，每个 guard 另建空暂存区；只有完整 revision、anchor、slot、deadline、writer lease、空 cgroup 与三文件核验均成功，才提升本次局部证明。后续 guard 继续重开解释器、核路径与链接链，并完整遍历 package：每个目录和叶文件仍执行原有无链接打开、前后 FD/path 身份核验，逐轮重新累计 entries、深度、文件字节与包总字节、重新构造整体摘要。只有完整叶路径及七字段 `FileIdentity` 都精确相同，才复用此前成功批次 guard 的内容 SHA；七字段为 device、inode、size、mtime、ctime、mode、uid，现格式没有 nlink，本文不增加格式字段。身份变化必须真实重读：Python 仍比较冻结文件指纹，普通包叶则按原整体内容摘要判断；同字节 inode 或权限变化不能被该优化擅自改成一律拒绝。遍历直接复用已打开的父目录 FD 和原 `fingerprint` 安全 stream 主体，不为每叶重新遍历绝对父路径。独立的 launcher、pyvenv 和兼容声明核验保持原样。
 

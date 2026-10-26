@@ -289,10 +289,12 @@ def python_fingerprint(
                 continue
             if not before["mode"] & 0o111:
                 raise LaunchError("managed_python_not_executable")
+            # Keep the independent leaf open and its full identity/hash checks;
+            # this parent's context still rewalks the path before releasing it.
             result = (
-                fingerprint(target, limit)
+                _fingerprint_at(descriptor, target.name, target, limit)
                 if verified is None
-                else fingerprint(target, limit, verified=verified)
+                else _fingerprint_at(descriptor, target.name, target, limit, verified=verified)
             )
             break
     else:

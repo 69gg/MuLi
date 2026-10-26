@@ -91,7 +91,7 @@ async def test_helper_requires_actual_process_and_enforced_kernel_limits(tmp_pat
     assert observed.process.argv == argv
     assert observed.unit.service_type == "exec"
     assert observed.limits.memory_bytes == 128 * 1024 * 1024
-    assert len(bus.calls) == 9
+    assert len(bus.calls) == 5
     assert all("GetUnit" in call or "get-property" in call for call in bus.calls)
     assert all("Environment" not in call for call in bus.calls)
 
@@ -198,23 +198,29 @@ async def test_helper_identity_and_observation_changes_fail_closed(
     elif change == "nested":
         bus.rows["ControlGroup"] = ("s", "/muli.service/" + NAME)
     else:
-        # Trigger on the second Unit read, after kernel and process were captured.
-        original = probe._snapshot
+        # Trigger on the second actual Unit property read, after kernel and
+        # process were captured, regardless of how the interface is batched.
+        original = probe.runner
         calls = 0
 
-        async def snapshot(path: str) -> Any:
+        async def runner(
+            argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+        ) -> dict[str, Any]:
             nonlocal calls
-            calls += 1
-            if calls == 2:
-                if change == "invocation":
-                    bus.rows["InvocationID"] = ("ay", [2] * 16)
-                elif change == "kernel":
-                    (group / "pids.max").write_text("31\n")
-                else:
-                    (proc / "123/cmdline").write_bytes(b"foreign\x00")
-            return await original(path)
+            if "get-property" in argv:
+                fields = argv[argv.index("get-property") + 4 :]
+                if "InvocationID" in fields:
+                    calls += 1
+                    if calls == 2:
+                        if change == "invocation":
+                            bus.rows["InvocationID"] = ("ay", [2] * 16)
+                        elif change == "kernel":
+                            (group / "pids.max").write_text("31\n")
+                        else:
+                            (proc / "123/cmdline").write_bytes(b"foreign\x00")
+            return await original(argv, timeout=timeout, limit=limit, merge_stderr=merge_stderr)
 
-        probe._snapshot = snapshot  # type: ignore[method-assign]
+        probe.runner = runner
     with pytest.raises(ObservationError):
         await probe.read_helper(NAME, argv, HelperLimits())
 
