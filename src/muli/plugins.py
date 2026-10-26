@@ -83,22 +83,36 @@ class PluginManager:
         self._started = True
         self._installed_since_start = False
         self._loaded_settings = self.runtime.config.settings.plugins.model_dump()
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         settings = self.runtime.config.settings.plugins
         if not settings.enabled:
             return
-        for directory in sorted(self.directory.iterdir()):
-            if not directory.is_dir() or directory.is_symlink():
-                continue
-            manifest = directory / "plugin.json"
-            if not manifest.is_file():
-                continue
+        try:
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directories = sorted(self.directory.iterdir())
+        except OSError:
+            self.records.append(
+                {
+                    "id": "__directory__",
+                    "name": "插件目录",
+                    "status": "failed",
+                    "error": "plugin_directory_unavailable",
+                }
+            )
+            return
+        for directory in directories:
             record: dict[str, Any] = {"id": directory.name, "status": "failed", "error": ""}
-            self.records.append(record)
+            recorded = False
             route_count = len(self.app.router.routes)
             module_name = f"_muli_plugin_{directory.name}"
             context: PluginContext | None = None
             try:
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                manifest = directory / "plugin.json"
+                if not manifest.is_file():
+                    continue
+                self.records.append(record)
+                recorded = True
                 if not PLUGIN_ID.fullmatch(directory.name):
                     raise ValueError("插件目录名称无效")
                 if manifest.is_symlink() or manifest.stat().st_size > settings.max_source_bytes:
@@ -147,6 +161,10 @@ class PluginManager:
                 record["status"] = "loaded"
                 record["tools"] = [tool.name for tool in context.tools]
             except Exception as exc:  # user extension failure must not prevent core startup
+                if not recorded:
+                    if not isinstance(exc, OSError):
+                        raise
+                    self.records.append(record)
                 if context is not None:
                     for hook in reversed(context.shutdown_hooks):
                         try:
@@ -156,7 +174,11 @@ class PluginManager:
                             continue
                 del self.app.router.routes[route_count:]
                 sys.modules.pop(module_name, None)
-                record["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+                record["error"] = (
+                    f"{type(exc).__name__}: {str(exc)[:300]}"
+                    if recorded
+                    else "plugin_entry_unavailable"
+                )
         self.runtime.add_tool_provider(lambda _: list(self._tools.values()), replace=True)
         self.runtime.context_hooks.append(self.context)
 

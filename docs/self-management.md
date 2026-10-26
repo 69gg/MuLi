@@ -84,6 +84,8 @@ def setup(api: PluginContext) -> None:
 
 可用 `plugin_install({"id":"personal","files":{...}})` 校验并保存插件文件，**重启后才加载**。安装不会执行插件、覆盖已有目录或自动安装依赖。修改已有插件，或把 ID 加入 `plugins.disabled` 后，也需重启才能生效。通过 `self_status` 查看清单和 `plugins_restart_required`。
 
+关闭 `plugins.enabled` 后，启动时不会创建或扫描插件目录。目录无法创建或列出时，清单报告 `plugin_directory_unavailable`；单个条目无法检查时报告 `plugin_entry_unavailable`，主会话和其他健康插件仍可使用。修复对应路径或权限后正常重启，错误不会在当前进程中被自动重试或清除。
+
 `persona.prompt` 替换基础提示词，`persona.append` 追加个性设定，插件的 `append_prompt` 再追加内容。日常记忆和长对话不需要编写插件，分别见[记忆](memory.md)与[长对话](context.md)。
 
 ## 持续工作账本
