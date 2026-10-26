@@ -43,7 +43,11 @@ MCP 用来连接外部工具服务器。核心聊天不依赖 MCP；需要接入
 
 **目录分片省略 `enabled` 时默认启用，内联配置省略时默认关闭。** 同名服务器或重复 JSON 键会使候选配置失败，不按文件名覆盖。
 
-默认每 2 秒发现变化，并合并短时间内的连续编辑。可设置 `extensions.watch_enabled:false` 关闭自动发现；手动重载使用已认证的 `POST /api/extensions/reload`，请求体为 `{}`。通过 `GET /api/extensions` 或 `self_status` 查看是否生效；`queued` 仅表示已排队。
+默认每 2 秒发现变化，并合并短时间内的连续编辑。可设置 `extensions.watch_enabled:false` 关闭自动发现。在工作台的 **设置 → 连接 → MCP 与 Skills** 点击“重新加载”，按已保存的配置重载两类扩展；当前未保存的草稿不受影响。再点页面上方“刷新状态”查看实际结果：排队不代表已生效，加载失败保留当前可用扩展，需要重启时会明确提示。请求未确认时先刷新核对，不会自动重试。
+
+也可使用已认证的 `POST /api/extensions/reload`（请求体 `{}`），通过 `GET /api/extensions` 或 `self_status` 查看状态。
+
+静态交互预览中的重载仅模拟本页内存里的排队与加载状态，不连接 MCP 服务器或读取本机 Skills。
 
 HTTP/SSE 配置和 Skills 可以在任务运行时更新。候选加载失败时保留上一份可用配置。已有 stdio 服务器的配置变化需要重启，状态会提示 `restart_required`。只修改 `mcp`、`skills`、`extensions` 可走扩展热重载；混合修改模型、渠道等配置时仍需等待空闲。
 

@@ -35,7 +35,7 @@ Skill 的内容是工作资料。即使正文要求调用工具或执行脚本�
 
 ## 更新、重载与停用
 
-修改文件后默认自动发现，也可通过已认证的 `POST /api/extensions/reload`（请求体 `{}`）请求重载，在 `self_status` 或 `GET /api/extensions` 查看结果。关闭 `extensions.watch_enabled` 可停用自动发现；关闭 `skills.enabled` 可停用 Skills。
+修改文件后默认自动发现，也可在工作台 **设置 → 连接 → MCP 与 Skills** 点击“重新加载”，再用页面上方“刷新状态”查看加载结果与 Skill 数量。重载按已保存的配置处理，不保存当前草稿；排队不代表已生效，失败时保留当前可用扩展。也可通过已认证的 `POST /api/extensions/reload`（请求体 `{}`）请求重载，在 `self_status` 或 `GET /api/extensions` 查看结果。关闭 `extensions.watch_enabled` 可停用自动发现；关闭 `skills.enabled` 可停用 Skills。
 
 合法文档变化可在任务运行时生效；当前已准备的请求保留原正文。会话下次准备上下文时，若发现活跃 Skill 已修改或删除，会移除旧指导并提示重新读取，不自动换成另一版。非法 YAML、超限或不完整文件不会替换上一份可用目录。编辑时建议先写临时文件，再完整替换。
 

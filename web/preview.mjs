@@ -9,12 +9,14 @@ const response = (value, status = 200) => new Response(JSON.stringify(value), {
 });
 const failure = (detail, status = 400) => response({ detail, preview: true }, status);
 const model = (name = "") => ({ protocol: "openai_chat", model: name, base_url: "", api_key_set: false, vision: !!name, stream: true, max_output_tokens: null, timeout: 60, max_retries: 1, reasoning: {}, thinking: {}, extra_body: {}, extra_headers: {}, max_response_bytes: 1048576 });
+const mcpStatus = (config) => Object.entries(config?.mcpServers ?? {}).map(([name, server]) => ({ name, status: server.enabled === false ? "disabled" : "connected" }));
 
 /** A fresh tab starts with fresh demo data; credentials are never persisted. */
 export function createPreviewState() {
   const now = timestamp();
   const main = { id: "preview-main", name: "沐璃", title: "与沐璃对话", role: "main", mode: "auto", status: "idle", created_at: now, updated_at: now };
   const notes = "# 项目整理示例\n\n先梳理目标，再分解任务，由队友执行、复核后汇总。\n\n此文件由前端预览生成，没有读取本机项目。\n";
+  const mcp = { mcpServers: { "示例资料库": { url: "https://mcp.preview.invalid/mcp", enabled: true, headers: {} } } };
   return {
     settings: {
       models: { main: model("MuLi · 交互演示"), worker: model(), reviewer: model(), vision: model(), compactor: model(), memory_extractor: model() },
@@ -39,7 +41,7 @@ export function createPreviewState() {
       },
       voice: { enabled: false, tts_enabled: false, reply_enabled: false, wake_command: [], chunk_seconds: 2 },
       web_voice: { enabled: false }, computer: { enabled: false, backend: "atspi", capture: { enabled: false, max_file_bytes: 10485760 } },
-      mcp: { mcpServers: { "示例资料库": { url: "https://mcp.preview.invalid/mcp", enabled: true, headers: {} } } },
+      mcp,
       chiliarch: { enabled: false, base_url: "https://preview.invalid", agent_id: "", credential_set: false },
       plugins: { enabled: true, disabled: [] }, updates: { check_on_start: false },
       notifications: { enabled: false }, server: { host: "127.0.0.1", port: 8765, password_set: false },
@@ -66,6 +68,7 @@ export function createPreviewState() {
     files: new Map([["demo-notes", new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
     management: { plugins: [{ id: "preview-notes", name: "资料整理示例", version: "demo", status: "loaded" }], plans: [], update: { status: "checked", available: false, current: "交互预览", latest: "交互预览", checked_at: now } },
+    extensions: { generation: 1, phase: "loaded", skills: { enabled: true, count: 2 }, mcp: mcpStatus(mcp), preview: true },
     requests: [],
   };
 }
@@ -227,7 +230,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     const selected = candidates.slice(0, limit), more = candidates.length > selected.length;
     return { items: selected, has_more: more, [key]: more ? selected.at(-1).id : null };
   };
-  const status = () => ({ configured: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: Object.entries(state.settings.mcp?.mcpServers ?? {}).map(([name, server]) => ({ name, status: server.enabled === false ? "disabled" : "connected" })), chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+  const status = () => ({ configured: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
 
   async function fetchPreview(input, options = {}) {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url, "http://preview.local");
@@ -248,6 +251,14 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     if (["/auth/login", "/auth/logout"].includes(path) && method === "POST") return response({ authenticated: true, preview: true });
     if (path === "/ui/event-position") return response({ after: String(state.eventId) });
     if (path === "/status" && method === "GET") return response(status());
+    if (path === "/extensions" && method === "GET") return response(state.extensions);
+    if (path === "/extensions/reload" && method === "POST") {
+      if (state.extensions.phase !== "queued") {
+        state.extensions = { ...state.extensions, phase: "queued" };
+        later(() => { state.extensions = { ...state.extensions, generation: state.extensions.generation + 1, phase: "loaded", mcp: mcpStatus(state.settings.mcp) }; });
+      }
+      return response(state.extensions);
+    }
     if (path === "/conversation" && method === "GET") return response(detail(state.sessions[0].id));
     if (path === "/settings") {
       if (method === "GET") return response(state.settings);

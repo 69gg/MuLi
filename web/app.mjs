@@ -67,6 +67,7 @@ let globalController = null;
 let connection = null;
 let sessionRequestVersion = 0;
 let viewRequestVersion = 0;
+let extensionReload = null;
 let queuedRender = false;
 let messageNodes = new Map();
 let dialogSubmit = null;
@@ -2364,8 +2365,9 @@ function settingsSection(title, ...children) {
   return element("section", { class: "settings-section" }, element("h3", { text: title }), children);
 }
 
-async function refreshSettingsResources() {
-  const { values, errors } = await loadSettingsResources(request);
+async function refreshSettingsResources(owner = connection, current = () => true) {
+  const { values, errors } = await loadSettingsResources((path) => ownedRequest(path, {}, owner));
+  if (!connectionCurrent(owner) || !current()) return;
   for (const [key, value] of Object.entries(values)) state[key] = value;
   state.settingsStatusErrors = errors;
 }
@@ -2603,27 +2605,82 @@ function renderToolSettings() {
 
 function renderConnectionSettings() {
   const config = state.settingsDraft.chiliarch ?? {};
-  const status = state.status?.chiliarch;
   const pair = element("div", { class: "pairing-row" }, field("配对码", "pairing-code", "", { placeholder: "输入 Chiliarch 配对码" }), actionButton("配对", "pair-chiliarch", "secondary-button", "link"));
+  return element("div", {}, settingsSection("Chiliarch", switchField("启用 Chiliarch 连接", "chiliarch.enabled", config.enabled), field("服务地址", "chiliarch.base_url", config.base_url ?? "", { type: "url" }), field("Agent ID", "chiliarch.agent_id", config.agent_id ?? "", { placeholder: "配对后自动填写" }), element("div", { id: "chiliarch-status" }, connectionStatus()), element("div", { class: "field-top-space" }, pair)), renderMCPSettings());
+}
+
+function connectionStatus() {
+  const status = state.status?.chiliarch;
   const connectionLabels = { connected: "已连接", retrying: "正在重连", connecting: "正在连接", disabled: "未启用", unpaired: "未配对", disconnected: "未连接", failed: "连接失败" };
   const connectionLabel = status?.connected || status?.status === "connected" ? "已连接" : connectionLabels[status?.status] ?? "未连接";
-  return element("div", {}, settingsSection("Chiliarch", switchField("启用 Chiliarch 连接", "chiliarch.enabled", config.enabled), field("服务地址", "chiliarch.base_url", config.base_url ?? "", { type: "url" }), field("Agent ID", "chiliarch.agent_id", config.agent_id ?? "", { placeholder: "配对后自动填写" }), statusList([["连接", connectionLabel], ["凭据", config.credential_set ? "已配对" : "未配对"]]), status?.last_error && element("p", { class: "form-error", text: status.last_error }), element("div", { class: "field-top-space" }, pair)), renderMCPSettings());
+  return [statusList([["连接", connectionLabel], ["凭据", state.settingsDraft.chiliarch?.credential_set ? "已配对" : "未配对"]]), status?.last_error && element("p", { class: "form-error", text: status.last_error })].filter(Boolean);
 }
 
 function renderMCPSettings() {
   const config = state.settingsDraft.mcp;
-  const section = settingsSection("MCP");
-  const servers = state.status?.mcp;
-  if (Array.isArray(servers) && servers.length) {
-    const labels = { connected: "已连接", disabled: "未启用", connecting: "正在连接", failed: "连接失败", error: "连接失败" };
-    section.append(statusList(servers.map((server) => [server.name, labels[server.status] ?? server.status ?? "未连接"])));
-  }
+  const reload = actionButton("重新加载", "reload-extensions", "text-button", "refresh");
+  reload.disabled = extensionReload?.owner === connection && extensionReload.pending;
+  const section = settingsSection("MCP 与 Skills", element("div", { id: "extensions-status", role: "status", "aria-live": "polite" }, extensionStatus()), reload);
+  section.append(element("p", { class: "settings-role-hint", text: "按已保存的配置重新加载，不会保存当前草稿。" }));
   if (!config || "configured" in config) {
     section.append(element("p", { text: "当前服务暂未提供可编辑的 MCP 配置。" }));
     return section;
   }
   section.append(element("details", { class: "advanced-settings" }, element("summary", { text: "服务器配置" }), field("MCP JSON", "mcp", pretty(config), { type: "textarea", rows: 10, json: true, format: "json", hint: "使用 mcpServers。保留 •••• 可沿用密钥，删除服务器即可移除连接。" })));
   return section;
+}
+
+function extensionStatus() {
+  const status = state.status?.extensions;
+  const labels = { discovered: "等待加载", queued: "已排队", preparing: "正在加载", loaded: "已加载", failed: "加载失败", restart_required: "需要重启" };
+  const skills = status?.skills;
+  const content = [statusList([["扩展", labels[status?.phase] ?? "状态未知"], ["Skills", skills?.enabled === false ? "未启用" : Number.isSafeInteger(skills?.count) ? `${skills.count} 项` : "状态未知"]])];
+  const hint = ({ queued: "重载已排队，尚未生效。", failed: "加载失败，保留当前可用扩展。", restart_required: "需要重启后才能应用，当前可用扩展保留。" })[status?.phase];
+  if (hint) content.push(element("p", { class: "settings-role-hint", text: hint }));
+  const attempt = extensionReload?.owner === connection ? extensionReload : null;
+  if (attempt?.error) content.push(element("p", { class: "form-error", text: attempt.error }));
+  const servers = status?.mcp ?? state.status?.mcp;
+  if (Array.isArray(servers) && servers.length) {
+    const labels = { connected: "已连接", disabled: "未启用", connecting: "正在连接", failed: "连接失败", error: "连接失败" };
+    content.push(statusList(servers.map((server) => [server.name, labels[server.status] ?? server.status ?? "未连接"])));
+  }
+  return content;
+}
+
+function refreshExtensionsView() {
+  if (state.view !== "settings" || state.settingsTab !== "connections") return;
+  $("#extensions-status")?.replaceChildren(...extensionStatus());
+  $("#chiliarch-status")?.replaceChildren(...connectionStatus());
+  const pending = extensionReload?.owner === connection && extensionReload.pending;
+  for (const action of ["reload-extensions", "refresh-settings-status"]) {
+    const button = $(`[data-action="${action}"]`, $("#other-view"));
+    if (button) button.disabled = pending;
+  }
+}
+
+async function requestExtensions(reload) {
+  const owner = connection, version = viewRequestVersion;
+  if (!connectionCurrent(owner) || state.view !== "settings" || state.settingsTab !== "connections" || (extensionReload?.owner === owner && extensionReload.pending)) return;
+  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "settings";
+  const attempt = extensionReload = { owner, pending: true, error: "" };
+  const focused = document.activeElement;
+  refreshExtensionsView();
+  try {
+    if (reload) {
+      const value = await ownedRequest("/extensions/reload", { method: "POST", body: {} }, owner);
+      if (!current()) return;
+      if (!value || typeof value.phase !== "string") throw new Error("扩展状态暂不可用");
+      state.status = { ...state.status, extensions: value, mcp: value.mcp };
+    } else await refreshSettingsResources(owner, current);
+  } catch {
+    if (current()) attempt.error = reload ? "重载请求未确认，请刷新状态核对。" : "暂时无法读取扩展状态，请刷新后重试。";
+  } finally {
+    attempt.pending = false;
+    if (connectionCurrent(owner) && extensionReload === attempt) {
+      refreshExtensionsView();
+      if (current() && document.activeElement === document.body && $("#other-view").contains(focused) && !focused.disabled) focused.focus({ preventScroll: true });
+    }
+  }
 }
 
 function statusList(entries) {
@@ -2907,7 +2964,11 @@ async function handleAction(action, button) {
   if (action === "pair-chiliarch") await pairChiliarch(button);
   if (action === "service") await serviceAction(button.dataset.command);
   if (action === "refresh-service") await refreshService();
-  if (action === "refresh-settings-status") { collectSettingsForm(); button.disabled = true; try { await refreshSettingsResources(); renderOtherView(); renderChrome(); } finally { button.disabled = false; } }
+  if (action === "reload-extensions") await requestExtensions(true);
+  if (action === "refresh-settings-status") {
+    if (state.view === "settings" && state.settingsTab === "connections") return requestExtensions(false);
+    collectSettingsForm(); button.disabled = true; try { await refreshSettingsResources(); renderOtherView(); renderChrome(); } finally { button.disabled = false; }
+  }
   if (action === "retry-delivery") {
     const delivery = state.channels?.deliveries?.find((item) => item.id === button.dataset.id);
     if (!delivery) throw new Error("发送记录已变化，请刷新状态。");
