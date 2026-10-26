@@ -1072,6 +1072,7 @@ class MemoryPipeline:
         local = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
         items = local
         degraded: list[str] = []
+        semantic_failed = False
 
         def refreshed_local() -> dict[str, Any]:
             # Awaited model/lock work may outlive edits or a source-level forget.
@@ -1129,12 +1130,13 @@ class MemoryPipeline:
                                 for result in ranked
                             ]
             except Exception as error:
+                semantic_failed = True
                 degraded.append("semantic_unavailable:" + type(error).__name__)
                 items = local
         if self.memory.revision != revision:
             return refreshed_local()
         result = self._result(items[:limit], degraded)
-        if use_semantic:
+        if use_semantic and not semantic_failed:
             self._remember(query, limit, chosen_hops, result)
         return result
 
