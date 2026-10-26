@@ -514,6 +514,11 @@ class ChannelApplication:
             if routing is None and trigger and trigger.get("principal") == "system:attention":
                 raise PermissionError("后台事项缺少可核验的通知目的地，保留在 WebUI")
             route = args.get("route")
+            if request.channel_ownership is not None and route is None:
+                routes = request.reply_origin.delivery_routes()
+                if not routes:
+                    raise PermissionError("受托队友外发缺少本批真实私聊来源")
+                route = routes[0]
             event_id = "tool:" + key if key is not None else None
             if routing is not None:
                 routes = routing.origin.delivery_routes()
@@ -568,7 +573,7 @@ class ChannelApplication:
         return [
             Tool(
                 "channel_delegate",
-                "将 OneBot 已绑定主人私聊长期交给已完成且空闲的直属队友。"
+                "将已注册渠道的已绑定主人私聊长期交给已完成且空闲的直属队友。"
                 "account覆盖该接入的已授权私聊，private需owner_id且优先；不扩大群或陌生人权限。"
                 "request_return标记请归还，reclaim立即撤销旧资格并停止旧轮；队友return只归还自己的范围。"
                 "普通回答仅在Web，外发仍需显式channel_send；取消的旧输入不会自动重演",
@@ -578,7 +583,7 @@ class ChannelApplication:
                             "type": "string",
                             "enum": ["assign", "request_return", "reclaim", "return"],
                         },
-                        "channel": {"type": "string", "enum": ["onebot"]},
+                        "channel": {"type": "string", "enum": list(NAMES)},
                         "scope": {"type": "string", "enum": ["account", "private"]},
                         "owner_id": string("private范围必须选择当前已绑定主人"),
                         "agent_id": string("assign选择已有直属执行队友准确ID"),
@@ -646,7 +651,9 @@ class ChannelApplication:
             ),
             Tool(
                 "channel_send",
-                "向已绑定渠道发送文字或附件；media_mode=voice显式发送单个语音附件，默认保持文件路径；重试同一逻辑发送保持idempotency_key，结果未知不自动重发，返回排队ID不代表送达",
+                "向已绑定渠道发送文字或附件。受托队友仅能回复本批真实私聊，省略route自动沿用原消息凭据。"
+                "media_mode=voice显式发送单个语音附件，默认保持文件路径；"
+                "重试同一逻辑发送保持idempotency_key，结果未知不自动重发，返回排队ID不代表送达",
                 parameters(
                     {
                         "channel": {
@@ -673,7 +680,7 @@ class ChannelApplication:
                         },
                         "route": {
                             "type": "object",
-                            "description": "群消息需从可信入站复制name/target/kind/sender_id/reply_to路由，不猜测收件人",
+                            "description": "受托队友可省略，宿主沿用本批真实私聊来源；显式指定须保留准确收件人、渠道及reply_to，不猜测回复凭据",
                         },
                     },
                     ("channel", "target"),

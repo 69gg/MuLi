@@ -28,10 +28,10 @@ TARGET = FormatState(
     metadata_version=1,
     formats=FormatVersions(
         database=1,
-        objects=2,
+        objects=3,
         configuration=1,
-        ingress=2,
-        outbox=2,
+        ingress=3,
+        outbox=3,
         memory=1,
         install_profile=1,
     ),

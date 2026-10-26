@@ -2390,9 +2390,10 @@ function renderChannelSettings() {
   const commonFields = ["enabled", "base_url", "owner_ids", "allowed_groups", "receive_files"];
   for (const [key, label] of CHANNELS) {
     const profile = config[key] ?? {}; const path = `channels.${key}`; const status = channelStatus[key];
+    const privateOwner = ["onebot", "telegram", "qq"].includes(key);
     const enabled = switchField("启用渠道", `${path}.enabled`, profile.enabled);
-    const owner = field(key === "onebot" ? "主人 QQ 号" : "你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", required: key === "onebot" && Boolean(profile.enabled), hint: key === "onebot" ? "启用前必填。每行一个 QQ 号，仅接收主人私聊。" : "每行一个 ID。" });
-    if (key === "onebot") $("input", enabled).addEventListener("change", (event) => { $("textarea", owner).required = event.target.checked; });
+    const owner = field(key === "onebot" ? "主人 QQ 号" : privateOwner ? "主人用户 ID" : "你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", required: privateOwner && Boolean(profile.enabled), hint: key === "onebot" ? "启用前必填。每行一个 QQ 号，仅接收主人私聊。" : privateOwner ? "启用前必填。每行一个平台用户 ID，仅接收主人私聊。" : "每行一个 ID。" });
+    if (privateOwner) $("input", enabled).addEventListener("change", (event) => { $("textarea", owner).required = event.target.checked; });
     const credentials = element("details", { class: "advanced-settings" }, element("summary", { text: "连接凭据" }));
     for (const [name, title] of [["token", "令牌"], ["webhook_secret", "Webhook 密钥"], ["client_secret", "客户端密钥"]]) {
       credentials.append(field(title, `${path}.${name}`, profile[name] ?? "", { type: "password", placeholder: profile[`${name}_set`] ? "已配置，留空保留" : "按渠道需要填写" }));
@@ -2403,10 +2404,10 @@ function renderChannelSettings() {
       enabled,
       field("服务地址", `${path}.base_url`, profile.base_url ?? "", { type: "url" }),
       owner,
-      key !== "onebot" && field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
+      !privateOwner && field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
       switchField("接收附件", `${path}.receive_files`, profile.receive_files), credentials,
       settingsJSON(path, profile, commonFields),
-      status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ...(key === "onebot" ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
+      status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ...(privateOwner ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
       status?.last_error && element("p", { class: "form-error", text: status.last_error })));
   }
   root.append(renderProactiveSettings(config), settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, [...CHANNELS.map(([key]) => key), "proactive"]), renderDeliveries()));
@@ -2465,8 +2466,9 @@ function renderProactiveSettings(config) {
 function proactiveRouteFields(destination, path) {
   if (destination.kind !== "channel") return [];
   const route = destination.route;
-  const kinds = route.name === "onebot" ? [["private", "私聊"]] : [["private", "私聊"], ["group", "已允许的群组"]];
-  return [field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, kinds), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: route.name === "onebot" ? "与私聊收件对象相同。" : "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" })];
+  const privateOwner = ["onebot", "telegram", "qq"].includes(route.name);
+  const kinds = privateOwner ? [["private", "私聊"]] : [["private", "私聊"], ["group", "已允许的群组"]];
+  return [field("机器人账号 ID", `${path}.account_id`, route.account_id, { required: true, maxLength: 200 }), selectField("会话类型", `${path}.kind`, route.kind, kinds), field("收件对象 ID", `${path}.target`, route.target, { required: true, maxLength: 200 }), field("已绑定的主人 ID", `${path}.sender_id`, route.sender_id, { required: true, maxLength: 200, hint: privateOwner ? "与私聊收件对象相同。" : "私聊时与收件对象相同；群聊需明确主人和 allowed_groups，不能自动选取。" })];
 }
 
 function deliveryLabel(value) {

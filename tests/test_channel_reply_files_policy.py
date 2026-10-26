@@ -18,7 +18,7 @@ from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, tool_result
 
 from muli.channel_application import ChannelApplication
-from muli.channels import IncomingMessage
+from muli.channels import ChannelError, IncomingMessage
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.server import create_app
@@ -278,8 +278,8 @@ async def test_web_unattributed_and_group_requests_never_choose_a_private_fallba
     for source in ("web", "legacy-owner-input"):
         await runtime.submit("只在当前本地会话核对附件。", source=source, event_id=source)
         await finish(runtime, runtime.main_session()["id"], errors)
-    # OneBot now rejects groups before admission. Preserve this tool-origin
-    # boundary with a channel whose configured owner group is actually admitted.
+    # Telegram also rejects groups before admission, rather than creating a
+    # model turn which could choose a private attachment destination.
     runtime.config.update(
         {
             "channels": {
@@ -295,11 +295,15 @@ async def test_web_unattributed_and_group_requests_never_choose_a_private_fallba
         }
     )
     await channels.reconfigure()
-    await channels.manager.receive(
-        "telegram", IncomingMessage("group-input", "7", "99", "只在群里核对。", kind="group")
-    )
-    await finish(runtime, runtime.main_session()["id"], errors)
-    assert observed == ["web", "unattributed", "group"]
+    before = runtime.store.messages(runtime.main_session()["id"])
+    with pytest.raises(ChannelError) as refused:
+        await channels.manager.receive(
+            "telegram", IncomingMessage("group-input", "7", "99", "只在群里核对。", kind="group")
+        )
+    assert refused.value.status_code == 403
+    assert runtime.store.messages(runtime.main_session()["id"]) == before
+    assert runtime.store.pending_inputs(runtime.main_session()["id"]) == 0
+    assert observed == ["web", "unattributed"]
     assert not outbox(runtime)
 
 

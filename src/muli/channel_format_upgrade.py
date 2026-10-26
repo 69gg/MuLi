@@ -11,6 +11,7 @@ from muli.compatibility import FormatState
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     LEGACY_FORMAT_STATE,
+    PREVIOUS_FORMAT_STATE,
     FormatAdmissionError,
 )
 from muli.format_evidence import (
@@ -26,7 +27,7 @@ from muli.store_schema import validate_existing_schema
 
 
 def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | None = None) -> bool:
-    """Change only the exact legacy marker while owning all cooperative writers.
+    """Upgrade either exact supported predecessor while owning cooperative writers.
 
     Existing receipts, ingress and history keep their bytes and identifiers. The
     new reader owns their legacy replay semantics; no ownership is inferred here.
@@ -79,7 +80,7 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                     raise FormatAdmissionError("store_format_managed_upgrade_unsupported")
                 if evidence.state == CURRENT_FORMAT_STATE:
                     return False
-                if evidence.state != LEGACY_FORMAT_STATE:
+                if evidence.state not in (LEGACY_FORMAT_STATE, PREVIOUS_FORMAT_STATE):
                     raise FormatAdmissionError("store_format_upgrade_source_unsupported")
                 db.execute("PRAGMA synchronous=FULL")
                 if db.execute("PRAGMA synchronous").fetchone()[0] != 2:

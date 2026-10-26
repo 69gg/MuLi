@@ -200,22 +200,30 @@ async def test_shared_onebot_route_gate_rejects_direct_input_and_old_group_outbo
         await harness.close()
 
 
-async def test_other_channel_group_and_stranger_quarantine_semantics_are_unchanged(
+async def test_telegram_also_rejects_groups_and_strangers_before_admission(
     tmp_path: Path,
 ) -> None:
     harness = Harness(tmp_path, ChannelsConfig(telegram=profile(allowed_groups=["99"])), unused)
     try:
-        await harness.manager.receive(
-            "telegram", IncomingMessage("group-owner", "7", "99", "原群消息", kind="group")
-        )
-        await harness.manager.receive(
-            "telegram", IncomingMessage("private-stranger", "8", "8", "原隔离输入")
-        )
-        assert [item["principal"] for item in harness.received] == ["owner", "external:telegram:8"]
-        group = await harness.manager.enqueue(
-            "telegram", "99", "原群回复", route={"sender_id": "7", "target": "99", "kind": "group"}
-        )
-        assert group["state"] == "pending" and group["route"]["kind"] == "group"
+        for message in (
+            IncomingMessage("group-owner", "7", "99", "原群消息", kind="group"),
+            IncomingMessage("private-stranger", "8", "8", "原隔离输入"),
+        ):
+            with pytest.raises(ChannelError) as refused:
+                await harness.manager.receive("telegram", message)
+            assert refused.value.status_code == 403
+        assert not harness.received
+        assert harness.store.db.execute("SELECT count(*) FROM channel_inbound").fetchone()[0] == 0
+        assert not harness.attachments.list()
+        with pytest.raises(ChannelError) as refused:
+            await harness.manager.enqueue(
+                "telegram",
+                "99",
+                "原群回复",
+                route={"sender_id": "7", "target": "99", "kind": "group"},
+            )
+        assert refused.value.status_code == 403
+        assert harness.store.db.execute("SELECT count(*) FROM channel_outbox").fetchone()[0] == 0
     finally:
         await harness.close()
 
