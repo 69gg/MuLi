@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import * as sessionState from "../../web/state.mjs";
+import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachments.mjs";
 
 const app = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
@@ -161,7 +162,7 @@ function harness({ realApprovals = false } = {}) {
     composerLayout: () => composerLayout(),
     attachmentKind, attachmentURL, formatBytes,
     createTeamPager: () => ({}), captureTeamView: () => null, restoreTeamView() {},
-    VoiceInput: class { cancel() {} }, uploadFile: unexpectedRequest, transcribeAttachment: unexpectedRequest,
+    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, uploadFile: unexpectedRequest, transcribeAttachment: unexpectedRequest,
     apiRequest: unexpectedRequest, readEvents: unexpectedRequest,
     sessionStorage: {}, setTimeout: () => 0, clearTimeout() {},
     renderMarkdown: (text) => { const result = document.createElement("p"); result.textContent = text; return result; },

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
+import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 import { MODES, createSessionState, hydrateSession, applyEvent, isRunning } from "../../web/state.mjs";
 import { createTeamPager } from "../../web/team.mjs";
 
@@ -114,7 +115,7 @@ function harness(t, handler = async (path) => payload(path)) {
     window: { addEventListener(name, callback) { windowEvents[name] = callback; } },
     AbortController, URLSearchParams, TextEncoder, console, queueMicrotask, toasts, errors,
     MODES, createSessionState, hydrateSession, applyEvent, isRunning, createTeamPager,
-    VoiceInput: class { cancel() {} }, uploadFile() {}, transcribeAttachment() {},
+    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, uploadFile() {}, transcribeAttachment() {},
     captureTeamView: () => null, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: String, formatFullDate: String,
     setTimeout(callback, delay) { const id = ++timerSequence; timers.set(id, { callback, delay }); return id; },
