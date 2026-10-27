@@ -20,6 +20,16 @@ test("protocol parameter objects replace atomically so removed keys are not reta
   assert.deepEqual(settingsPatch(original, { models: { main: { reasoning: {}, thinking: {}, extra_body: {} } } }), { models: { main: { reasoning: {}, thinking: {}, extra_body: {} } } });
 });
 
+test("embedding query parameters replace or clear without changing document options", () => {
+  const original = { media: { embedding: { document_instruction: "passage: ", query_instruction: "query: ", extra_body: { task: "document" }, query_extra_body: { task: "query", removed: true } } } };
+  const draft = structuredClone(original);
+  draft.media.embedding.query_extra_body = { task: "new-query" };
+  assert.deepEqual(settingsPatch(original, draft), { media: { embedding: { query_extra_body: { task: "new-query" } } } });
+  draft.media.embedding.query_extra_body = {};
+  assert.deepEqual(settingsPatch(original, draft), { media: { embedding: { query_extra_body: {} } } });
+  assert.deepEqual(original.media.embedding.extra_body, { task: "document" });
+});
+
 test("switching settings groups retains independent role drafts", () => {
   const draft = { models: { main: { model: "main" } } };
   setPath(draft, "models.worker.model", "worker");

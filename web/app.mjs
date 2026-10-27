@@ -2774,10 +2774,11 @@ function renderMediaSettings() {
   for (const [key, label] of [["embedding", "嵌入"], ["reranker", "重排序"], ["asr", "语音识别"], ["tts", "语音合成"]]) {
     const path = `media.${key}`; const config = state.settingsDraft.media?.[key] ?? {};
     const details = element("details", { class: "media-profile advanced-settings" }, element("summary", {}, element("span", { text: label }), element("small", { text: config.model || "未配置" })), field("模型", `${path}.model`, config.model ?? ""), field("服务地址", `${path}.base_url`, config.base_url ?? "", { type: "url" }), field("API Key", `${path}.api_key`, "", { type: "password", placeholder: config.api_key_set ? "已配置，留空保留" : "可选" }));
-    if (key === "embedding") details.append(field("维数", `${path}.dimensions`, config.dimensions ?? "", { type: "number", min: 1 }), field("查询指令", `${path}.query_instruction`, config.query_instruction ?? "", { type: "textarea", rows: 2 }));
+    if (key === "embedding") details.append(field("维数", `${path}.dimensions`, config.dimensions ?? "", { type: "number", min: 1 }), field("文档前缀", `${path}.document_instruction`, config.document_instruction ?? "", { type: "textarea", rows: 2, format: "raw" }), field("查询前缀", `${path}.query_instruction`, config.query_instruction ?? "", { type: "textarea", rows: 2, format: "raw" }));
     if (key === "asr") details.append(field("语言", `${path}.language`, config.language ?? "", { placeholder: "自动识别" }));
     if (key === "tts") details.append(field("声音", `${path}.voice`, config.voice ?? ""), field("音频格式", `${path}.response_format`, config.response_format ?? "mp3"), field("语速", `${path}.speed`, config.speed ?? "", { type: "number", min: .01, max: 4, step: .1 }), field("朗读要求", `${path}.instructions`, config.instructions ?? "", { type: "textarea", rows: 2 }));
     details.append(element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }), field("API Key 环境变量", `${path}.api_key_env`, config.api_key_env ?? ""), field("超时（秒）", `${path}.timeout`, config.timeout ?? "", { type: "number", min: 1, max: 600 }), field("Extra body", `${path}.extra_body`, pretty(config.extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }), field("Extra headers", `${path}.extra_headers`, pretty(config.extra_headers ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }), config.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false)));
+    if (key === "embedding") $("details.advanced-settings", details).append(field("查询专用参数", `${path}.query_extra_body`, pretty(config.query_extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }));
     root.append(details);
   }
   root.append(settingsSection("记忆与上下文", settingsJSON("memory", state.settingsDraft.memory ?? {}, [], 10, "记忆处理"), settingsJSON("compaction", state.settingsDraft.compaction ?? {}, [], 7, "上下文压缩"), state.settingsDraft.attention && settingsJSON("attention", state.settingsDraft.attention, [], 7, "主动关注")));
@@ -2936,7 +2937,7 @@ function collectSettingsForm() {
       try { value = parseJSONField(input.value); } catch { throw new Error(`${input.closest("label")?.firstElementChild?.textContent ?? "参数"} 需要填写有效 JSON 对象。`); }
     } else if (input.dataset.format === "lines") value = input.value.split("\n").map((line) => line.trim()).filter(Boolean);
     else if (input.dataset.format === "nullable") value = input.value.trim() || null;
-    else value = input.type === "password" ? input.value : input.value.trim();
+    else value = input.type === "password" || input.dataset.format === "raw" ? input.value : input.value.trim();
     if (input.dataset.format === "json-merge") mergeSettingsExtras(state.settingsDraft, input.name, value);
     else setPath(state.settingsDraft, input.name, value);
   }

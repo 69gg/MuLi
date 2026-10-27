@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from muli.events import EventBus
 from muli.evidence import EvidenceError, validate_integer
 from muli.maintenance import Admission
-from muli.media import MediaConfig, RerankResult
+from muli.media import EmbeddingPurpose, MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
 from muli.memory_chunks import ChunkPlan, restore_plan
 from muli.memory_context import PromptComposition, compose_context_result
@@ -44,7 +44,9 @@ _INDEX_COUNTERS = (
 class MemoryMedia(Protocol):
     config: MediaConfig
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    async def embed(
+        self, texts: Sequence[str], *, purpose: EmbeddingPurpose = "document"
+    ) -> list[list[float]]: ...
 
     async def rerank(
         self,
@@ -764,7 +766,11 @@ class MemoryPipeline:
                     if self._source_digest(source["id"]) == source["digest"]
                     else []
                 )
-                result = await media.embed([item["content"] for item in inputs]) if inputs else []
+                result = (
+                    await media.embed([item["content"] for item in inputs], purpose="document")
+                    if inputs
+                    else []
+                )
             if not self._index_live(plan) or self.media is not media:
                 return
             if len(result) != len(inputs):
@@ -1214,7 +1220,11 @@ class MemoryPipeline:
                     )
                     if item is not None and not item["indexed"]:
                         inputs.append(item)
-                vectors = await media.embed([item["content"] for item in inputs]) if inputs else []
+                vectors = (
+                    await media.embed([item["content"] for item in inputs], purpose="document")
+                    if inputs
+                    else []
+                )
             if not live():
                 raise ValueError("在途向量的来源或模型已失效")
             if len(vectors) != len(inputs):
@@ -1237,15 +1247,18 @@ class MemoryPipeline:
         if media is None or media.config.embedding is None:
             return ""
         config = media.config.embedding
+        identity: list[Any] = [
+            config.base_url.rstrip("/"),
+            config.model,
+            config.dimensions,
+            config.query_instruction,
+            config.extra_body,
+        ]
+        if config.document_instruction:
+            identity.append(config.document_instruction)
         return hashlib.sha256(
             json.dumps(
-                [
-                    config.base_url.rstrip("/"),
-                    config.model,
-                    config.dimensions,
-                    config.query_instruction,
-                    config.extra_body,
-                ],
+                identity,
                 ensure_ascii=False,
                 sort_keys=True,
                 allow_nan=False,
@@ -1321,7 +1334,7 @@ class MemoryPipeline:
                             return refreshed_local()
                         semantic: list[dict[str, Any]] = []
                         if self.media.config.embedding is not None:
-                            vectors = await self.media.embed([query])
+                            vectors = await self.media.embed([query], purpose="query")
                             if self.memory.revision != revision:
                                 return refreshed_local()
                             if len(vectors) != 1:

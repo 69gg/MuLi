@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from test_memory_pipeline import MockMedia, done, message
@@ -49,8 +49,10 @@ class HeldMedia(MockMedia):
         super().__init__()
         self.entered, self.release = asyncio.Event(), asyncio.Event()
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        vectors = await super().embed(texts)
+    async def embed(
+        self, texts: Sequence[str], *, purpose: Literal["document", "query"] = "document"
+    ) -> list[list[float]]:
+        vectors = await super().embed(texts, purpose=purpose)
         if len(self.embed_calls) == 1:
             self.entered.set()
             await self.release.wait()
@@ -58,11 +60,13 @@ class HeldMedia(MockMedia):
 
 
 class FailSecondBatch(MockMedia):
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: Sequence[str], *, purpose: Literal["document", "query"] = "document"
+    ) -> list[list[float]]:
         if len(self.embed_calls) == 1:
             self.embed_calls.append(list(texts))
             raise RuntimeError("controlled second embedding batch failure")
-        return await super().embed(texts)
+        return await super().embed(texts, purpose=purpose)
 
 
 async def test_ordinary_chunk_job_forgotten_while_waiting_for_media_lock_sends_nothing(
