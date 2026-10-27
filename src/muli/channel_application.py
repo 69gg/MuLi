@@ -309,6 +309,7 @@ class ChannelApplication:
                     "startup_update_check",
                     "extensions_watch",
                     "mcp_connection",
+                    "voice_listener",
                     "chiliarch_message",
                     "file_inbox",
                 ],

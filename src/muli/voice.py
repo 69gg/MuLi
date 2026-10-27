@@ -21,6 +21,7 @@ from muli.maintenance import Admission
 from muli.media import MediaService
 from muli.platforms.files import LocalFiles, artifact
 from muli.process import run_process
+from muli.voice_health import VOICE_LISTENER_FAILED, VOICE_UNAVAILABLE
 
 VoiceCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -334,6 +335,7 @@ class VoiceWorker:
         player: Player | None = None,
         on_status: VoiceCallback | None = None,
         admission: Admission | None = None,
+        on_fault: Callable[[str, str], None] | None = None,
     ) -> None:
         self.config, self.media, self.on_text = config, media, on_text
         self.admission = admission or Admission()
@@ -342,6 +344,12 @@ class VoiceWorker:
         self.wake = wake or CommandDetector(config, "wake")
         self.speaker = speaker or CommandDetector(config, "verify")
         self.player, self.on_status = player or SystemPlayer(), on_status
+        self.on_fault = on_fault
+        self._health: dict[str, str | None] = {
+            "state": "idle",
+            "code": None,
+            "occurrence_id": None,
+        }
         self._task: asyncio.Task[None] | None = None
         self._setup_task: asyncio.Task[dict[str, Any]] | None = None
         self._setup: dict[str, Any] = {"state": "idle"}
@@ -408,6 +416,7 @@ class VoiceWorker:
             "last_prompt": self.last_prompt,
             "last_reply": dict(self.last_reply),
             "setup": dict(self._setup),
+            "health": dict(self._health),
             "reason": "语音服务已关闭"
             if self._closed
             else "语音服务正在停止"
@@ -427,10 +436,37 @@ class VoiceWorker:
                 return
             if self._task is not None and not self._task.done():
                 return
-            if not self.status()["available"]:
-                self.last_error = str(self.status()["reason"])
+            status = self.status()
+            if not status["available"]:
+                self.last_error = str(status["reason"])
+                self._background_fault(VOICE_UNAVAILABLE)
                 return
             self._task = asyncio.create_task(self._loop())
+
+    def _background_current(self) -> bool:
+        return (
+            self.config.enabled
+            and not self._closed
+            and not self._stopping
+            and self._task is asyncio.current_task()
+        )
+
+    def _background_fault(self, code: str) -> None:
+        if (
+            not self.config.enabled
+            or self._closed
+            or self._stopping
+            or self._health["state"] == "failed"
+        ):
+            return
+        occurrence = uuid4().hex
+        self._health = {"state": "failed", "code": code, "occurrence_id": occurrence}
+        if self.on_fault is not None:
+            try:
+                self.on_fault(code, occurrence)
+            except Exception:
+                # Notification is best effort and cannot change recording/retry behavior.
+                pass
 
     @asynccontextmanager
     async def _operation(self) -> AsyncIterator[None]:
@@ -879,10 +915,15 @@ class VoiceWorker:
         while self.config.enabled and self._task is asyncio.current_task():
             try:
                 await self.listen_once()
+                if self._background_current():
+                    self._health = {"state": "ready", "code": None, "occurrence_id": None}
+                    self.last_error = ""
                 await asyncio.sleep(0)  # Let a maintenance request claim the safe cycle boundary.
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = str(exc)
+                if self._background_current():
+                    self._background_fault(VOICE_LISTENER_FAILED)
                 # A missing device/model never creates a busy retry loop.
                 await asyncio.sleep(max(2, self.config.cooldown_seconds))

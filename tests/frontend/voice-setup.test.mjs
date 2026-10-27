@@ -110,3 +110,15 @@ test("the app uses connection-owned requests for setup and cancellation", async 
   await state.voiceSetupController.run("verify");
   assert.equal(calls[0][0], "/voice/setup");
 });
+
+test("voice summary distinguishes actual background history from a successful preflight", async () => {
+  const source = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("function voiceStatusSummary("), end = source.indexOf("function renderVoiceSetupControls(", start);
+  const render = runInNewContext(source.slice(start, end) + "; voiceStatusSummary;", { statusList: (rows) => rows, capabilityLabel: () => "预检可用" });
+  const label = (status) => render({ enabled: true, available: true, wake: { available: true }, ...status }).find(([name]) => name === "后台监听")[1];
+  assert.equal(label({}), "尚未验证");
+  assert.equal(label({ health: { state: "idle" } }), "尚未验证");
+  assert.equal(label({ health: { state: "ready" } }), "最近正常");
+  assert.equal(label({ health: { state: "failed" } }), "故障");
+  assert.equal(label({ enabled: false, health: { state: "ready" } }), "已关闭");
+});

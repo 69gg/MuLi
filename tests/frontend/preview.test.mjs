@@ -63,6 +63,7 @@ test("preview local voice setup confirms, enrolls and verifies without submittin
   const status = await json(backend, "/voice");
   assert.equal(status.body.preview, true); assert.equal(status.body.available, false);
   assert.equal(status.body.enabled, false); assert.equal(status.body.speaker.enrolled, true);
+  assert.equal(status.body.health.state, "idle");
   assert.equal((await json(backend, "/voice/setup/cancel", "POST", { id: enrollment.body.id })).status, 409);
   assert.equal((await json(backend, "/voice/setup/cancel", "POST", { id: check.body.id })).body.id, check.body.id);
   assert.deepEqual(backend.state.messages, before);

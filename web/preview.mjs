@@ -414,7 +414,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     }
     if (path === "/media/transcribe" && method === "POST") return response({ text: "这是一段演示转写。你可以编辑文字，再决定是否发送。", preview: true });
     if (path === "/channels" && method === "GET") return response({ channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: 0 }, deliveries: [], proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
-    if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
+    if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, health: { state: "idle", code: null, occurrence_id: null }, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
     if (path === "/voice/setup" && method === "POST") {
       if (body.confirmed !== true) return failure("请确认本次模拟录音。", 400);
       if (state.settings.voice.enabled) return failure("请先关闭后台语音唤醒。", 409);

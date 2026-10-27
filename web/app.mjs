@@ -2689,7 +2689,8 @@ function renderVoiceSetup() {
 }
 
 function voiceStatusSummary(status) {
-  return statusList([["状态", capabilityLabel(status)], ["录音后端", status.recorder?.backend || "未检测到"], ["声学唤醒", status.wake?.available ? "预检可用" : "未就绪"], ["参考声纹", status.speaker?.enrolled ? "已录制" : "未录制"], ["语音识别", status.asr ? "已配置" : "未配置"], ["提示播放", status.playback?.backend || "未检测到"], ["设备选择", status.wake?.configured_provider ?? status.device?.selected ?? "状态未知"], ["设备运行验证", status.device?.runtime_verified ? "已验证" : "尚未验证"]]);
+  const health = !status.enabled ? "已关闭" : ({ idle: "尚未验证", ready: "最近正常", failed: "故障" })[status.health?.state] ?? "尚未验证";
+  return statusList([["状态", capabilityLabel(status)], ["后台监听", health], ["录音后端", status.recorder?.backend || "未检测到"], ["声学唤醒", status.wake?.available ? "预检可用" : "未就绪"], ["参考声纹", status.speaker?.enrolled ? "已录制" : "未录制"], ["语音识别", status.asr ? "已配置" : "未配置"], ["提示播放", status.playback?.backend || "未检测到"], ["设备选择", status.wake?.configured_provider ?? status.device?.selected ?? "状态未知"], ["设备运行验证", status.device?.runtime_verified ? "已验证" : "尚未验证"]]);
 }
 
 function renderVoiceSetupControls() {

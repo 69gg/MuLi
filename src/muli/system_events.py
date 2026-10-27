@@ -28,6 +28,7 @@ from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id
 from muli.update_evidence import update_notice_available
+from muli.voice_health import VOICE_FAILURE_CODES
 
 LogLevel = Literal["warning", "error", "critical"]
 _LEVELS = {"warning": logging.WARNING, "error": logging.ERROR, "critical": logging.CRITICAL}
@@ -45,26 +46,36 @@ _COMPONENTS = frozenset(
         "unknown",
     }
 )
-_CODES = RECEIVE_FAILURE_CODES | frozenset(
-    {
-        "runtime_failed",
-        "clock_failed",
-        "clock_recovered",
-        "update_failed",
-        "management_failed",
-        "channel_failed",
-        "media_failed",
-        "plugin_failed",
-        "extension_reload_failed",
-        "unknown",
-    }
+_CODES = (
+    RECEIVE_FAILURE_CODES
+    | VOICE_FAILURE_CODES
+    | frozenset(
+        {
+            "runtime_failed",
+            "clock_failed",
+            "clock_recovered",
+            "update_failed",
+            "management_failed",
+            "channel_failed",
+            "media_failed",
+            "plugin_failed",
+            "extension_reload_failed",
+            "unknown",
+        }
+    )
 )
 _EXTRA_FIELDS = ("muli_component", "muli_code", "muli_run_id", "muli_session_id", "muli_notify")
 _BATCH_SIZE = 32
 _MAX_COUNT = (1 << 63) - 1
 _SOURCE_FIELDS = ("id", "level", "component", "code", "run_id", "session_id", "first_at", "notify")
 _ROUTING_FIELDS = ("producer", "occurrence_id", "routing")
-LogProducer = Literal["legacy_local", "runtime_request", "extensions_watch", "mcp_connection"]
+LogProducer = Literal[
+    "legacy_local", "runtime_request", "extensions_watch", "mcp_connection", "voice_listener"
+]
+_HOST_FAILURES: dict[str, tuple[str, frozenset[str]]] = {
+    "mcp_connection": ("extensions", RECEIVE_FAILURE_CODES),
+    "voice_listener": ("media", VOICE_FAILURE_CODES),
+}
 
 
 class SystemEventsSettings(BaseModel):
@@ -284,12 +295,21 @@ class SystemEvents:
 
     def mcp_receive_failed(self, code: str, occurrence_id: str) -> None:
         """Only a published connection's first receive latch claims this host source."""
+        self._host_failure("mcp_connection", code, occurrence_id)
+
+    def voice_listener_failed(self, code: str, occurrence_id: str) -> None:
+        """Only the current background voice worker may claim this fixed source."""
+        self._host_failure("voice_listener", code, occurrence_id)
+
+    def _host_failure(self, producer: LogProducer, code: str, occurrence_id: str) -> None:
         task = _current_task()
+        specification = _HOST_FAILURES.get(producer)
         if (
             self._adapter is None
             or task is None
+            or specification is None
             or type(code) is not str
-            or code not in RECEIVE_FAILURE_CODES
+            or code not in specification[1]
             or _reference(occurrence_id) is None
         ):
             return
@@ -299,12 +319,12 @@ class SystemEvents:
                 notify=previous.notify,
                 instance_id=self._instance_id,
                 owner=task,
-                producer="mcp_connection",
+                producer=producer,
                 occurrence_id=occurrence_id,
             )
         )
         try:
-            self._adapter.error(code, extra={"muli_component": "extensions", "muli_code": code})
+            self._adapter.error(code, extra={"muli_component": specification[0], "muli_code": code})
         finally:
             _CONTEXT.reset(token)
 
@@ -427,13 +447,13 @@ class SystemEvents:
             ):
                 producer, occurrence = "extensions_watch", context.occurrence_id
             elif (
-                component == "extensions"
-                and code in RECEIVE_FAILURE_CODES
-                and context.producer == "mcp_connection"
+                context.producer in _HOST_FAILURES
+                and component == _HOST_FAILURES[context.producer][0]
+                and code in _HOST_FAILURES[context.producer][1]
                 and run_id is None
                 and session_id is None
             ):
-                producer, occurrence = "mcp_connection", context.occurrence_id
+                producer, occurrence = context.producer, context.occurrence_id
         metadata = _Metadata(
             severity,
             component,
@@ -495,7 +515,7 @@ class SystemEvents:
         bucket = int(item.captured_at // self._policy.dedup_seconds)
         identity = (
             (item.component, item.code, item.producer, item.occurrence_id)
-            if item.producer == "mcp_connection"
+            if item.producer in _HOST_FAILURES
             else (
                 item.level,
                 item.component,
@@ -519,7 +539,7 @@ class SystemEvents:
             else:
                 routing = (
                     self._independent_routing()
-                    if item.producer in {"extensions_watch", "mcp_connection"}
+                    if (item.producer == "extensions_watch" or item.producer in _HOST_FAILURES)
                     and self._independent_routing is not None
                     else item.routing
                 )
@@ -774,11 +794,12 @@ def _valid_log_routing(record: dict[str, Any], data: dict[str, Any]) -> bool:
             and occurrence is None
             and routing.classification == "bound"
         )
-    if producer == "mcp_connection":
+    if type(producer) is str and producer in _HOST_FAILURES:
+        component, codes = _HOST_FAILURES[producer]
         return (
-            record["component"] == "extensions"
+            record["component"] == component
             and type(record["code"]) is str
-            and record["code"] in RECEIVE_FAILURE_CODES
+            and record["code"] in codes
             and record["run_id"] is None
             and record["session_id"] is None
             and _reference(occurrence) is not None

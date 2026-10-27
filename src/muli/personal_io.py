@@ -255,12 +255,29 @@ class PersonalIO:
         async def on_text(event: dict[str, Any]) -> None:
             await self._on_voice(worker, generation, event)
 
+        def on_fault(code: str, occurrence_id: str) -> None:
+            task = asyncio.current_task()
+            if (
+                self._closed
+                or self.runtime._closing
+                or self.voice is not worker
+                or self._generation != generation
+                or worker._closed
+                or worker._stopping
+                or not worker.config.enabled
+                or task is None
+                or task.cancelling()
+            ):
+                return
+            self.runtime.system_events.voice_listener_failed(code, occurrence_id)
+
         worker = VoiceWorker(
             self.runtime.config.settings.voice,
             self.runtime.data_dir,
             self.media,
             on_text,
             on_status=self.on_voice_status,
+            on_fault=on_fault,
             admission=self.runtime.maintenance.admission,
         )
         return worker

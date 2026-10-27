@@ -2,6 +2,8 @@
 
 状态：核心模块已接入 Runtime、配置、Attention 与应用状态；早期整版验证记录见[评审](review-v2.14.md)。主会话真实请求失败的原路归属与扩展目录自主 watch 的独立失败通知见[来源设计](system-error-origin-design.md)；后续增加[MCP 连接首次接收故障](mcp-receive-notification-design.md)。自动生产边界是主助手、队友和工作流实际 Runtime 执行失败、自主 watch 的失败状态转移，以及当前已发布 HTTP/SSE 连接的首次接收失败；不宣称已经收集所有第三方日志或所有组件的被捕获异常。
 
+自 2.88 起还接入已启用[后台语音的故障期](superpowers/specs/2026-10-28-voice-health-design.md)。它复用宿主固定事实入口、独立目的地冻结与只读 Attention，不覆盖手动录音或设置验证，也不代表第三方声学引擎的全部内部错误已接入。
+
 配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 只关闭既有 reminder/update/management 三类。
 
 Linux [资料收件目录](file-inbox.md)是独立的 `file_inbox.observed` 宿主来源，不伪装成日志，也不受日志严重级别控制。它通过内核事件生成有限元数据与覆盖缺口，默认关闭；沿同一 Attention 只读回合和冻结主动路由处理。目录事件不会触发 owner hooks 或自动取得整理、外发及配置权限。
@@ -19,6 +21,8 @@ Runtime 在其它组件启动前建立私有 logger，在关闭 Store 前移除�
 
 MCP 宿主入口 `mcp_receive_failed(code, occurrence_id)` 另接受六个共用固定码：`mcp_receive_budget_exceeded`、`mcp_receive_encoding_unsupported`、`mcp_receive_charset_unsupported`、`mcp_receive_headers_invalid`、`mcp_receive_stream_unsupported`、`mcp_receive_failed`。只有该入口的可信 Task/实例上下文能赋予 `mcp_connection` 来源，普通 logger extra 不能取得独立路由；固定码可供 `self_events` 精确查询。
 
+语音宿主入口 `voice_listener_failed(code, occurrence_id)` 仅接受 `voice_unavailable`、`voice_listener_failed` 两个固定码，组件为 `media`，来源为 `voice_listener`。它与 MCP 共用有限宿主注册表、当前 Task/实例校验和独立路由逻辑，清除复制的请求身份但保留外层 `notify=false`。同一 occurrence 跨时间窗重报只增加计数，保留首次通知资格与目的地；普通日志不能取得该来源。录音、转写、模型路径与异常正文均不进入这一接口。
+
 ## 失败来源与投递
 
 只有主会话非 Workflow 的 `_drive` 可以使用当前 `PreparedRequest.reply_origin`。每次准备入口及领取下一批输入之前清空旧来源，构造成功后、首个 hook await 前绑定同一个不可变来源；新 claim/构造前失败保持本地，不能回退到上一请求或最近渠道。请求正常返回后清空，后续子工作流等待失败仍本地。复制上下文的子任务或其它 Runtime 不继承父请求的运行/路由；显式 notify=false 的抑制保留。Team、工作流已有终态报告不新增外发。
@@ -26,6 +30,8 @@ MCP 宿主入口 `mcp_receive_failed(code, occurrence_id)` 另接受六个共用
 扩展自主 fingerprint 失败或目录变更对应的候选发布失败，只在新的失败状态转移通知一次。有限失败签名不因 busy/queued/preparing 重置，成功恢复后可再次通知；每个真实转移有独立 occurrence ID，不被普通去重窗口吞掉。手动重载和 catalog 回调虽由 watch 执行，但没有目录请求代号的证明，不能使用独立默认。启动/配置加载失败及普通 logger extra 也不能声明这一生产者。
 
 当前已发布 HTTP/SSE 连接 first-latch 后先撤销新派发并强拥有退休，再尽力提交 `mcp_connection` 固定事实。共享连接换 schema 代次不换 occurrence；候选、已退休连接、stdio、正常取消及 Runtime 关闭期间不新报。来源不继承任何当前 run、请求或复制 Task 的渠道，显式 `notify=false` 仍保留。前台工具回执与独立连接通知可以同时存在，不重连、不重放；callback 失败不改变原 latch 和清理。
+
+语音 worker 在启动预检不可用或后台真实监听失败时生成一个故障 occurrence；重复启动或失败重试不重复通知，只有真实监听成功完成才清除旧错误并重新允许报告新故障。预检通过不证明恢复。PersonalIO 在同步回调入队前验证当前 worker、配置代次及关闭、停止、禁用、取消状态，旧 worker 的迟到结果不能冒用新配置。手动录音、验证与正常取消不生成后台故障通知；原有重试冷却不变。
 
 新增 producer/occurrence/routing 与 system.log 原事件同事务保存并校验；旧记录缺少这些字段仍留本地，不回填。主请求来源在捕获时固定，独立默认/记忆证据在首次 `_persist` 固定，之后不按当前默认重新选址。路由不进入 Attention 资料正文，通知仍使用只读模型整理、既有回执与 outbox；撤销后 blocked，unknown 不自动重发，accepted 不等于平台送达。
 
