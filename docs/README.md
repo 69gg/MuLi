@@ -20,6 +20,7 @@
 - [附件检索](attachment-search.md)：查找已保存的附件。
 - [文档阅读](document-reading.md)：按需读取 PDF、DOCX 和长正文。
 - [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
+- [长资料检索](memory-chunks.md)：后台分块、续接与索引设置。
 - [电脑操作](computer.md)：应用、窗口和无障碍操作。
 - [平台支持](platforms.md)：后台服务、截图和录屏。
 - [语音](voice.md)：录音、转写、合成与可选唤醒。

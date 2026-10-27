@@ -16,8 +16,9 @@ from muli.attachment_memory_source import (
     restore_attachment_source,
 )
 from muli.attachments import ATTACHMENT_ID_PATTERN
-from muli.evidence import EvidenceError, validate_integer
+from muli.evidence import EvidenceError, json_size, validate_integer
 from muli.media import MediaService
+from muli.memory_chunks import MemoryChunkSettings
 from muli.memory_context import MemoryContextProvider, PromptComposition
 from muli.memory_evidence import MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
@@ -532,7 +533,25 @@ class MemoryApplication:
                 await pipeline._publish()
             return receipt
 
+        async def configure_chunks(args: dict[str, Any]) -> Any:
+            self._attachment_guard(pipeline, generation, tool_name="memory_chunk_configure")
+            settings = MemoryChunkSettings.model_validate(args)
+            result = {"settings": settings.model_dump(mode="json")}
+            if json_size(result) > runtime.config.settings.limits.max_output_chars:
+                raise EvidenceError("output_budget", "记忆分块设置超过工具输出预算")
+            pipeline.source_chunks.settings.replace(settings)
+            return result
+
         return [
+            Tool(
+                "memory_chunk_configure",
+                "按主人要求完整调整长期资料分块参数；先用memory_chunk_settings_read查看现值。"
+                "只影响后续新计划，已开始的计划按冻结参数续接，不重跑已完成来源。",
+                MemoryChunkSettings.model_json_schema(),
+                configure_chunks,
+                "write",
+                preserve_output=True,
+            ),
             Tool(
                 "memory_reindex",
                 "主人显式选择已完成提炼的准确来源，使用当前 embedding 后台重建语义索引；"
@@ -561,7 +580,7 @@ class MemoryApplication:
                 reindex,
                 "write",
                 preserve_output=True,
-            )
+            ),
         ]
 
     def attachment_tools(self, runtime: Runtime) -> list[Tool]:
@@ -645,6 +664,14 @@ class MemoryApplication:
         ]
 
     def tools(self, runtime: Runtime) -> list[Tool]:
+        async def chunk_settings(args: dict[str, Any]) -> Any:
+            result = {
+                "settings": self.pipeline.source_chunks.settings.read().model_dump(mode="json")
+            }
+            if json_size(result) > runtime.config.settings.limits.max_output_chars:
+                raise EvidenceError("output_budget", "记忆分块设置超过工具输出预算")
+            return result
+
         async def query(args: dict[str, Any]) -> Any:
             return await self.query(
                 str(args["query"]), limit=int(args.get("limit", 8)), hops=args.get("hops")
@@ -672,6 +699,13 @@ class MemoryApplication:
             return result
 
         return [
+            Tool(
+                "memory_chunk_settings_read",
+                "查看本地长期资料分块设置，不运行提炼或向量服务",
+                parameters({}),
+                chunk_settings,
+                preserve_output=True,
+            ),
             Tool(
                 "memory_query",
                 "融合关键词、向量、关系和社区检索记忆；graph_via 为实际召回路径，"

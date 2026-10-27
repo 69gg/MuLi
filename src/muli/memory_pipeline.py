@@ -18,7 +18,9 @@ from muli.evidence import EvidenceError, validate_integer
 from muli.maintenance import Admission
 from muli.media import MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
+from muli.memory_chunks import ChunkPlan, restore_plan
 from muli.memory_context import PromptComposition, compose_context_result
+from muli.memory_source_chunks import SourceChunks
 from muli.store import SQLITE_MAX_INTEGER, now
 
 Extractor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -136,6 +138,7 @@ class MemoryPipeline:
         self._cache_revision = memory.revision
         self._last_error = ""
         self._index_closed = False
+        self.source_chunks = SourceChunks(memory)
 
     def ingest(self, message: Mapping[str, Any], *, trusted_owner: bool = False) -> dict[str, Any]:
         if not self.config.enabled:
@@ -287,7 +290,20 @@ class MemoryPipeline:
         if max_bytes is not None:
             validate_integer(max_bytes, "max_bytes", minimum=1)
             budget = min(budget, max_bytes)
-        if len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8")) > budget:
+        projection = deepcopy(item)
+        for source in projection.get("sources", []):
+            record = source.get("chunk_record")
+            if record is not None:
+                # A selected old source may create chunks after admission.
+                # Reserve their complete progress and fixed-size IDs now.
+                record["memory_ids"] = ["f" * 32] * len(record["memory_ids"])
+                record["next_index"] = record["plan"]["count"]
+                for entry in source["items"][source["chunk_offset"] :]:
+                    entry["version"] = SQLITE_MAX_INTEGER - 1
+        if (
+            len(json.dumps(projection, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            > budget
+        ):
             raise EvidenceError("output_budget", "完整索引计划超过当前元数据字节预算")
 
     def _index_admit(self, plan: dict[str, Any]) -> None:
@@ -372,6 +388,41 @@ class MemoryPipeline:
                 or not isinstance(source.get("items"), list)
             ):
                 raise EvidenceError("content_unavailable", "索引计划来源证明无效")
+            if "chunk_batch_size" in source and (
+                type(source["chunk_batch_size"]) is not int
+                or not 1 <= source["chunk_batch_size"] <= 16
+            ):
+                raise EvidenceError("content_unavailable", "原文块索引批次无效")
+            if "chunk_record" in source or "chunk_offset" in source:
+                try:
+                    record = source["chunk_record"]
+                    if not isinstance(record, dict) or set(record) != {
+                        "plan",
+                        "next_index",
+                        "memory_ids",
+                    }:
+                        raise ValueError
+                    chunk_plan = ChunkPlan(**record["plan"])
+                    offset = source["chunk_offset"]
+                    cursor, identifiers = record["next_index"], record["memory_ids"]
+                    if (
+                        chunk_plan.source_digest != source["digest"]
+                        or type(offset) is not int
+                        or not 0 <= offset <= len(source["items"])
+                        or len(source["items"]) - offset != chunk_plan.count
+                        or type(cursor) is not int
+                        or not 0 <= cursor <= chunk_plan.count
+                        or not isinstance(identifiers, list)
+                        or len(identifiers) != chunk_plan.count
+                        or any(
+                            not isinstance(value, str) or (value and len(value) != 32)
+                            for value in identifiers
+                        )
+                        or any(identifiers[cursor:])
+                    ):
+                        raise ValueError
+                except (KeyError, TypeError, ValueError) as error:
+                    raise EvidenceError("content_unavailable", "原文块索引证明无效") from error
             for item in source["items"]:
                 if not isinstance(item, dict) or not isinstance(item.get("id"), str):
                     raise EvidenceError("content_unavailable", "索引计划条目证明无效")
@@ -484,8 +535,19 @@ class MemoryPipeline:
             json.dumps(checkpoint, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (KeyError, ValueError, TypeError, UnicodeError, RecursionError) as error:
             raise ValueError("完成作业的有限条目集合无法核查") from error
+        original = self.memory.source(source_id)
+        if original is None:
+            raise ValueError("重建来源已遗忘")
+        record = checkpoint.get("source_chunks")
+        if record is None:
+            record = self.source_chunks.new_record(original)
+        chunk_ids = self.source_chunks.validate(original, record)
+        backfill = record["next_index"] < record["plan"]["count"]
+        episode = self.memory.automatic_episode_id(source_id) if record["plan"]["count"] else None
         items = []
-        for identifier in sorted(identifiers):
+        for identifier in sorted(set(identifiers) | (set() if backfill else set(chunk_ids))):
+            if identifier == episode:
+                continue
             version_row = self.memory.store.db.execute(
                 "SELECT CASE WHEN typeof(version)='integer' AND version>0 THEN version END "
                 "FROM memory_meta WHERE memory_id=? AND source_id=? AND status!='superseded'",
@@ -497,7 +559,13 @@ class MemoryPipeline:
                     "version": version_row[0] if version_row and version_row[0] else 0,
                 }
             )
-        return {"id": source_id, "digest": digest, "items": items}
+        result: dict[str, Any] = {"id": source_id, "digest": digest, "items": items}
+        if record["plan"]["count"]:
+            result["chunk_batch_size"] = record["plan"]["batch_size"]
+        if backfill:
+            result.update(chunk_record=deepcopy(record), chunk_offset=len(items))
+            items.extend({"id": "_" * 32, "version": 0} for _ in record["memory_ids"])
+        return result
 
     def start_index(self, source_ids: list[str], key: str) -> dict[str, Any]:
         self.admission.require()
@@ -633,7 +701,6 @@ class MemoryPipeline:
             return
         source = plan["sources"][plan["source_index"]]
         start = plan["item_index"]
-        entries = source["items"][start : start + self.config.max_facts_per_source]
         if self._source_digest(source["id"]) != source["digest"]:
             plan["omitted"] += len(source["items"]) - start
             plan["source_index"] += 1
@@ -642,6 +709,40 @@ class MemoryPipeline:
             if plan["source_index"] == len(plan["sources"]):
                 plan["state"] = "done"
             return
+        if "chunk_record" in source:
+            original = self.memory.source(source["id"])
+            if original is None:
+                return
+
+            def persist_chunks() -> bool:
+                if not self._index_live(plan):
+                    return False
+                self._index_save(plan)
+                return True
+
+            prepared = await self.source_chunks.prepare(
+                original,
+                source["chunk_record"],
+                live=lambda: (
+                    self._index_live(plan) and self._source_digest(source["id"]) == source["digest"]
+                ),
+                persist=persist_chunks,
+            )
+            if prepared is None or not self._index_live(plan):
+                return
+            for index, identifier in enumerate(source["chunk_record"]["memory_ids"]):
+                item = self.memory.get(identifier) if identifier else None
+                source["items"][source["chunk_offset"] + index] = {
+                    "id": identifier or "_" * 32,
+                    "version": item["version"] if item is not None else 0,
+                }
+            del source["chunk_record"], source["chunk_offset"]
+            self._index_save(plan)
+        batch_size = min(
+            self.config.max_facts_per_source,
+            source.get("chunk_batch_size", self.config.max_facts_per_source),
+        )
+        entries = source["items"][start : start + batch_size]
         vectors: dict[str, list[float]] = {}
         if entries:
             media = self.media
@@ -963,27 +1064,37 @@ class MemoryPipeline:
             checkpoint["memory_ids"] = [row[0] for row in rows]
             if not self._checkpoint(source_id, checkpoint):
                 return
-        if (
-            self.media is not None
-            and self.media.config.embedding is not None
-            and not checkpoint.get("embedded")
-        ):
-            items = [
-                item
-                for identifier in checkpoint["memory_ids"]
-                if (item := self.memory.get(identifier)) is not None
-            ]
-            if items:
-                async with self._media_lock:
-                    vectors = await self.media.embed([item["content"] for item in items])
-                if self.memory.source(source_id) is None:
-                    return
-                if len(vectors) != len(items):
-                    raise ValueError("向量数量与记忆数量不一致")
-                for item, vector in zip(items, vectors, strict=True):
-                    self.memory.store_vector(
-                        item["id"], vector, self._model_key(), expected_version=item["version"]
-                    )
+        if "source_chunks" not in checkpoint:
+            checkpoint["source_chunks"] = self.source_chunks.new_record(source)
+            if not self._checkpoint(source_id, checkpoint):
+                return
+
+        def live() -> bool:
+            return bool(self._source_digest(source_id) == source["digest"])
+
+        chunk_ids = await self.source_chunks.prepare(
+            source,
+            checkpoint["source_chunks"],
+            live=live,
+            persist=lambda: self._checkpoint(source_id, checkpoint),
+        )
+        if chunk_ids is None:
+            if self.memory.source(source_id) is not None:
+                raise ValueError("原文块来源已变化或超过当前限额")
+            return
+        identifiers = list(dict.fromkeys([*checkpoint["memory_ids"], *chunk_ids]))
+        if checkpoint["source_chunks"]["plan"]["count"]:
+            # Raw chunks already cover the entire source. Do not send the
+            # duplicate 12k archive prefix as an oversized embedding input.
+            episode = self.memory.automatic_episode_id(source_id)
+            identifiers = [identifier for identifier in identifiers if identifier != episode]
+        if self.media is not None and self.media.config.embedding is not None:
+            policy = restore_plan(
+                checkpoint["source_chunks"]["plan"], source["digest"], source["content"]
+            )
+            await self._embed_source(source, identifiers, batch_size=policy.batch_size)
+            if not live():
+                return
             checkpoint["embedded"] = True
             if not self._checkpoint(source_id, checkpoint):
                 return
@@ -994,8 +1105,56 @@ class MemoryPipeline:
             )
         if self.bus is not None and self.memory.source(source_id) is not None:
             await self.bus.emit(
-                "memory.updated", {"source_id": source_id, "memory_ids": checkpoint["memory_ids"]}
+                "memory.updated", {"source_id": source_id, "memory_ids": identifiers}
             )
+
+    async def _embed_source(
+        self, source: dict[str, Any], identifiers: list[str], *, batch_size: int
+    ) -> None:
+        media, model_key = self.media, self._model_key()
+        if media is None or media.config.embedding is None:
+            return
+
+        def live() -> bool:
+            return (
+                self.media is media
+                and self._model_key() == model_key
+                and self._source_digest(source["id"]) == source["digest"]
+            )
+
+        for start in range(0, len(identifiers), batch_size):
+            async with self._media_lock:
+                if not live():
+                    raise ValueError("语义服务或原文来源已变化")
+                inputs = []
+                # Build HTTP input only after acquiring the lock. A query may
+                # have held it while the owner forgot or corrected a source.
+                for identifier in identifiers[start : start + batch_size]:
+                    row = self.memory.store.db.execute(
+                        "SELECT version FROM memory_meta WHERE memory_id=? AND source_id=?",
+                        (identifier, source["id"]),
+                    ).fetchone()
+                    if row is None or type(row["version"]) is not int:
+                        continue
+                    item = self._index_item(
+                        source["id"], {"id": identifier, "version": row["version"]}, model_key
+                    )
+                    if item is not None and not item["indexed"]:
+                        inputs.append(item)
+                vectors = await media.embed([item["content"] for item in inputs]) if inputs else []
+            if not live():
+                raise ValueError("在途向量的来源或模型已失效")
+            if len(vectors) != len(inputs):
+                raise ValueError("向量数量与记忆批次不一致")
+            for item, vector in zip(inputs, vectors, strict=True):
+                current = self._index_item(source["id"], item, model_key)
+                if current is None:
+                    raise ValueError("在途向量的条目版本已变化")
+                if not self.memory.store_vector(
+                    item["id"], vector, model_key, expected_version=item["version"]
+                ):
+                    raise ValueError("在途向量的条目版本已变化")
+            await asyncio.sleep(0)
 
     def _model_key(self) -> str:
         return self.embedding_key(self.media)
