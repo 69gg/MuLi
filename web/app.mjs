@@ -2575,7 +2575,7 @@ function renderChannelSettings() {
       !privateOwner && field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
       switchField("接收附件", `${path}.receive_files`, profile.receive_files), credentials,
       settingsJSON(path, profile, commonFields),
-      status && statusList([["运行", capabilityLabel(status)], ["已授权用户", String(status.owner_count ?? 0)], ...(privateOwner ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
+      status && statusList([["运行", capabilityLabel(status)], ...(status.receive_health ? [["后台接收", !status.enabled ? "已关闭" : ({ idle: "尚未验证", ready: "最近正常", failed: "故障" })[status.receive_health.state] ?? "尚未验证"]] : []), ["已授权用户", String(status.owner_count ?? 0)], ...(privateOwner ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
       status?.last_error && element("p", { class: "form-error", text: status.last_error })));
   }
   root.append(renderProactiveSettings(config), settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, [...CHANNELS.map(([key]) => key), "proactive"]), renderDeliveries()));

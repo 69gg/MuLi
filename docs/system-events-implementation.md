@@ -4,6 +4,8 @@
 
 自 2.88 起还接入已启用[后台语音的故障期](superpowers/specs/2026-10-28-voice-health-design.md)。它复用宿主固定事实入口、独立目的地冻结与只读 Attention，不覆盖手动录音或设置验证，也不代表第三方声学引擎的全部内部错误已接入。
 
+自 2.89 起沿同一链接入[Telegram、微信后台接收故障期](superpowers/specs/2026-10-28-channel-receive-health-design.md)，不新增 AI 轮询或把 webhook 安静当故障。
+
 配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 只关闭既有 reminder/update/management 三类。
 
 Linux [资料收件目录](file-inbox.md)是独立的 `file_inbox.observed` 宿主来源，不伪装成日志，也不受日志严重级别控制。它通过内核事件生成有限元数据与覆盖缺口，默认关闭；沿同一 Attention 只读回合和冻结主动路由处理。目录事件不会触发 owner hooks 或自动取得整理、外发及配置权限。
@@ -22,6 +24,8 @@ Runtime 在其它组件启动前建立私有 logger，在关闭 Store 前移除�
 MCP 宿主入口 `mcp_receive_failed(code, occurrence_id)` 另接受六个共用固定码：`mcp_receive_budget_exceeded`、`mcp_receive_encoding_unsupported`、`mcp_receive_charset_unsupported`、`mcp_receive_headers_invalid`、`mcp_receive_stream_unsupported`、`mcp_receive_failed`。只有该入口的可信 Task/实例上下文能赋予 `mcp_connection` 来源，普通 logger extra 不能取得独立路由；固定码可供 `self_events` 精确查询。
 
 语音宿主入口 `voice_listener_failed(code, occurrence_id)` 仅接受 `voice_unavailable`、`voice_listener_failed` 两个固定码，组件为 `media`，来源为 `voice_listener`。它与 MCP 共用有限宿主注册表、当前 Task/实例校验和独立路由逻辑，清除复制的请求身份但保留外层 `notify=false`。同一 occurrence 跨时间窗重报只增加计数，保留首次通知资格与目的地；普通日志不能取得该来源。录音、转写、模型路径与异常正文均不进入这一接口。
+
+渠道宿主入口 `channel_receive_failed(code, occurrence_id)` 来源为 `channel_receiver`、组件为 `channels`，固定码为 `telegram_receive_unavailable`、`telegram_receive_failed`、`weixin_receive_unavailable`、`weixin_receive_failed`。复用同一注册表和 occurrence 去重合同。应用回调同步核验当前 manager、配置代次及快照、关闭和取消；后台 worker 只有实际批次处理并保存游标后才重置故障期。重复相同失败不重复持久化完整渠道状态，错误说明变化或恢复仍发布；不修改消息和 outbox 协议。
 
 ## 失败来源与投递
 

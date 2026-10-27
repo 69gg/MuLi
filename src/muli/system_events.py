@@ -19,6 +19,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from muli import __version__
+from muli.channel_health import CHANNEL_RECEIVE_FAILURE_CODES
 from muli.events import EventBus
 from muli.file_inbox import FileInboxProof, FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState, read_message
@@ -49,6 +50,7 @@ _COMPONENTS = frozenset(
 _CODES = (
     RECEIVE_FAILURE_CODES
     | VOICE_FAILURE_CODES
+    | CHANNEL_RECEIVE_FAILURE_CODES
     | frozenset(
         {
             "runtime_failed",
@@ -70,11 +72,17 @@ _MAX_COUNT = (1 << 63) - 1
 _SOURCE_FIELDS = ("id", "level", "component", "code", "run_id", "session_id", "first_at", "notify")
 _ROUTING_FIELDS = ("producer", "occurrence_id", "routing")
 LogProducer = Literal[
-    "legacy_local", "runtime_request", "extensions_watch", "mcp_connection", "voice_listener"
+    "legacy_local",
+    "runtime_request",
+    "extensions_watch",
+    "mcp_connection",
+    "voice_listener",
+    "channel_receiver",
 ]
 _HOST_FAILURES: dict[str, tuple[str, frozenset[str]]] = {
     "mcp_connection": ("extensions", RECEIVE_FAILURE_CODES),
     "voice_listener": ("media", VOICE_FAILURE_CODES),
+    "channel_receiver": ("channels", CHANNEL_RECEIVE_FAILURE_CODES),
 }
 
 
@@ -300,6 +308,10 @@ class SystemEvents:
     def voice_listener_failed(self, code: str, occurrence_id: str) -> None:
         """Only the current background voice worker may claim this fixed source."""
         self._host_failure("voice_listener", code, occurrence_id)
+
+    def channel_receive_failed(self, code: str, occurrence_id: str) -> None:
+        """Only a current background receiver may claim this host source."""
+        self._host_failure("channel_receiver", code, occurrence_id)
 
     def _host_failure(self, producer: LogProducer, code: str, occurrence_id: str) -> None:
         task = _current_task()

@@ -65,3 +65,17 @@ test("notification targets offer bot private chats and preserve Weixin choices",
   }
   assert.deepEqual(JSON.parse(JSON.stringify(controls.get("weixin.kind").options.choices)), [["private", "私聊"], ["group", "已允许的群组"]]);
 });
+
+test("background receive status distinguishes actual history from activation and webhook silence", () => {
+  const { context } = harness(true);
+  const rows = [];
+  context.statusList = (items) => { rows.push(...items); return null; };
+  context.state.channels = { channels: { onebot: { enabled: true, active: true }, telegram: { enabled: true, active: true, receive_health: { state: "idle" } }, weixin: { enabled: true, active: true, receive_health: { state: "failed" } } } };
+  context.renderChannelSettings();
+  assert.deepEqual(rows.filter(([name]) => name === "后台接收").map(([, value]) => value), ["尚未验证", "故障"]);
+  rows.length = 0;
+  context.state.channels.channels.telegram.receive_health.state = "ready";
+  context.state.channels.channels.weixin.enabled = false;
+  context.renderChannelSettings();
+  assert.deepEqual(rows.filter(([name]) => name === "后台接收").map(([, value]) => value), ["最近正常", "已关闭"]);
+});

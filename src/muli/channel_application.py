@@ -264,6 +264,20 @@ class ChannelApplication:
         def ownership_guard(proof: object, route: Mapping[str, Any]) -> None:
             self.runtime.channel_ownership.guard_destination(proof, route)
 
+        def on_receive_fault(code: str, occurrence_id: str) -> None:
+            task = asyncio.current_task()
+            if (
+                self.runtime._closing
+                or manager is not self.manager
+                or generation != self._generation
+                or expected != self.runtime.config.settings.channels.model_dump()
+                or manager._closed
+                or task is None
+                or task.cancelling()
+            ):
+                return
+            self.runtime.system_events.channel_receive_failed(code, occurrence_id)
+
         def approval_guard(notice: ApprovalNotice) -> dict[str, Any]:
             route = notice.reply_origin.delivery_routes()[0]
             name = route["name"]
@@ -289,6 +303,7 @@ class ChannelApplication:
             admission=self.runtime.maintenance.admission,
             control_submit=control_submit,
             ownership_guard=ownership_guard,
+            on_receive_fault=on_receive_fault,
         )
         adapters = dict(manager.adapters)
         manager.recover()
@@ -310,6 +325,7 @@ class ChannelApplication:
                     "extensions_watch",
                     "mcp_connection",
                     "voice_listener",
+                    "channel_receiver",
                     "chiliarch_message",
                     "file_inbox",
                 ],

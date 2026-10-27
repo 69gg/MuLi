@@ -50,6 +50,15 @@ async function json(backend, path, method = "GET", body) {
   return { status: result.status, body: await result.json() };
 }
 
+test("preview activation never claims that a real channel receiver was verified", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  backend.state.settings.channels.telegram.enabled = true;
+  const { body } = await json(backend, "/channels");
+  assert.equal(body.channels.telegram.enabled, true);
+  for (const name of ["telegram", "weixin"]) assert.deepEqual(body.channels[name].receive_health, { state: "idle", code: null, occurrence_id: null });
+  for (const name of ["onebot", "qq"]) assert.equal(Object.hasOwn(body.channels[name], "receive_health"), false);
+});
+
 test("preview local voice setup confirms, enrolls and verifies without submitting a message", async (t) => {
   const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
   const before = structuredClone(backend.state.messages);
