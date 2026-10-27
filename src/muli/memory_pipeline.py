@@ -189,11 +189,11 @@ class MemoryPipeline:
             return False
         timestamp = now()
         with self.memory.store.db:
-            self.memory.store.db.execute(
+            cursor = self.memory.store.db.execute(
                 "INSERT OR IGNORE INTO memory_jobs VALUES(?,?,?,0,?,'','{}',?,?)",
                 (source_id, source_id, "queued", timestamp, timestamp, timestamp),
             )
-        return True
+        return cursor.rowcount == 1
 
     def _admit_deferred(self) -> None:
         available = self.config.max_pending_jobs - self._pending()
@@ -832,6 +832,79 @@ class MemoryPipeline:
             plan.update(attempts=0, next_attempt=now(), last_error="")
         self._index_save(plan)
         await self._publish()
+
+    def retry_source(
+        self, source_id: str, revision: str, *, max_output_chars: int
+    ) -> dict[str, Any]:
+        """Admit exactly one observed source; unrelated deferred work stays untouched."""
+        self.admission.require()
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
+        if (
+            not isinstance(source_id, str)
+            or not 1 <= len(source_id) <= 200
+            or not isinstance(revision, str)
+            or len(revision) != 64
+            or any(character not in "0123456789abcdef" for character in revision)
+        ):
+            raise EvidenceError("invalid_arguments", "重试需要准确来源 ID 和原文 revision")
+        try:
+            source_id.encode("utf-8")
+        except UnicodeError as error:
+            raise EvidenceError("invalid_arguments", "来源 ID 包含无效 Unicode 字符") from error
+        if not self.config.enabled or self._index_closed:
+            raise ValueError("记忆处理未启用或正在关闭")
+        if self.memory.store.db.in_transaction:
+            raise EvidenceError("content_unavailable", "存在尚未收口的数据库事务，未重试来源")
+        digest = self._source_digest(source_id)
+        if digest is None:
+            raise EvidenceError("evidence_not_found", "来源已忘记、不存在或超过当前读取上限")
+        if digest != revision:
+            raise EvidenceError("evidence_changed", "原文版本已变化，请重新核查来源")
+        row = self.memory.store.db.execute(
+            "SELECT CASE WHEN state IN ('queued','processing','retry','failed','done') "
+            "THEN state END AS state FROM memory_jobs WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        previous = row["state"] if row is not None else "deferred"
+        if previous is None:
+            raise EvidenceError("content_unavailable", "来源的整理状态无法核查")
+        eligible = previous in {"failed", "deferred"}
+        accepted = eligible and self._pending() < self.config.max_pending_jobs
+        receipt = {
+            "source_id": source_id,
+            "revision": revision,
+            "previous_state": previous,
+            "state": "queued" if accepted else previous,
+            "accepted": accepted,
+            "reason": (
+                "queued"
+                if accepted
+                else "capacity_full"
+                if eligible
+                else "already_done"
+                if previous == "done"
+                else "already_pending"
+            ),
+        }
+        # Reserve the longer boolean spelling before any durable mutation.
+        if len(json.dumps({**receipt, "accepted": False}, ensure_ascii=False)) > max_output_chars:
+            raise EvidenceError("output_budget", "完整来源重试回执超过当前输出预算")
+        if not accepted:
+            return receipt
+        if previous == "failed":
+            timestamp = now()
+            with self.memory.store.db:
+                updated = self.memory.store.db.execute(
+                    "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,"
+                    "last_error='',updated_at=? WHERE source_id=? AND state='failed'",
+                    (timestamp, timestamp, source_id),
+                )
+                if updated.rowcount != 1:
+                    raise EvidenceError("evidence_changed", "来源作业已变化，未重新登记")
+        elif not self._queue(source_id):
+            raise EvidenceError("evidence_changed", "来源作业已变化，未重新登记")
+        self._wake.set()
+        return receipt
 
     async def retry(self, source_id: str | None = None) -> dict[str, Any]:
         available = self.config.max_pending_jobs - self._pending()

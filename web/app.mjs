@@ -78,6 +78,10 @@ let memoryDialog = null;
 let memoryPath = null;
 let memoryPathSequence = 0;
 let memorySearchController = null;
+let memorySources = null;
+let memorySourceRetry = null;
+const memorySourcePageSize = 20;
+const memoryJobStates = { queued: "已排队", processing: "整理中", retry: "等待自动重试", failed: "整理失败", done: "整理完成", deferred: "等待接纳" };
 let historyDialog = null;
 let dialogHistoryReturn = null;
 const historyPageSize = 50;
@@ -278,6 +282,7 @@ function showLogin() {
   releaseMemoryDialog();
   releaseHistoryDialog();
   cancelMemorySearch(); releaseMemoryPath();
+  releaseMemorySources();
   releaseWorkflowActivity();
   releaseRecordDirectory(); state.recordQuery = "";
   dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null;
@@ -1044,6 +1049,7 @@ function resizeComposer() {
 }
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, onSubmit }) {
+  releaseMemorySourceRetry();
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
@@ -1103,6 +1109,7 @@ async function switchView(view, owner = connection) {
     collectSettingsForm(); renderOtherView(); return;
   }
   cancelMemorySearch(); releaseMemoryPath();
+  releaseMemorySources();
   releaseWorkflowActivity();
   releaseRecordDirectory();
   if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
@@ -1114,6 +1121,11 @@ async function switchView(view, owner = connection) {
   state.view = view; state.viewError = ""; renderChrome();
   if (changedView) animatePanel(view === "chat" ? $("#chat-view") : $("#management-shell"));
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
+  if (view === "memories" && state.memoryTab === "sources") {
+    state.viewLoading = false; renderOtherView();
+    await loadMemorySources(memorySources);
+    return;
+  }
   if (view === "records") {
     const slot = recordDirectory = { query: state.recordQuery, cursor: null, starts: [null], page: null, controller: null, error: "", retry: null, dirty: false, root: null };
     state.viewLoading = false; renderOtherView();
@@ -1614,9 +1626,13 @@ function renderMemories() {
   const form = element("form", { class: "content-toolbar", onSubmit: async (event) => {
     event.preventDefault(); await searchMemories(search.value.trim());
   } }, element("div", { class: "search-field" }, icon("search"), search), element("button", { class: "secondary-button", type: "submit", text: "检索" }));
-  const tabs = element("div", { class: "role-tabs memory-tabs", role: "tablist", "aria-label": "记忆视图" }, ...[["list", "记忆列表"], ["graph", "关系图"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.memoryTab === key ? "active" : "", text: label, "aria-selected": String(state.memoryTab === key), dataset: { memoryTab: key } })));
+  const tabs = element("div", { class: "role-tabs memory-tabs", role: "tablist", "aria-label": "记忆视图" }, ...[["list", "记忆列表"], ["sources", "来源"], ["graph", "关系图"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.memoryTab === key ? "active" : "", text: label, "aria-selected": String(state.memoryTab === key), dataset: { memoryTab: key } })));
   const root = element("div", { class: "view-content" }, viewHeading("记忆", "保留偏好、事实与长期上下文。", actionButton("新增记忆", "new-memory", "primary-button", "plus")), tabs);
   if (state.memoryTab === "graph") { root.append(renderMemoryGraph()); return root; }
+  if (state.memoryTab === "sources") {
+    memorySources ??= { filter: state.memorySourceState ?? "", page: null, cursor: null, controller: null, error: "", receipt: null };
+    root.append(renderMemorySources(memorySources)); return root;
+  }
   root.append(form, element("div", { class: "list-caption" }, `${state.memories.length} 条记忆`, state.memoryQuery ? `“${state.memoryQuery}”` : "全部记忆"));
   if (!state.memories.length) root.append(emptyState("memory", state.memoryQuery ? "没有找到相关记忆" : "还没有记忆", state.memoryQuery ? "换个关键词试试。" : "添加希望沐璃记住的内容。"));
   for (const item of state.memories) {
@@ -1635,6 +1651,141 @@ function renderMemories() {
 }
 
 function cancelMemorySearch() { memorySearchController?.abort(); memorySearchController = null; }
+
+function releaseMemorySourceRetry() {
+  const pending = memorySourceRetry; memorySourceRetry = null;
+  pending?.controller?.abort();
+  if (pending && $("#app-dialog").open && $("#dialog-content").firstElementChild === pending.content) $("#app-dialog").close();
+}
+
+function releaseMemorySources() {
+  const slot = memorySources; memorySources = null;
+  slot?.controller?.abort(); releaseMemorySourceRetry();
+  if (slot) { slot.page = null; slot.receipt = null; slot.result?.replaceChildren(); slot.receiptRegion?.replaceChildren(); slot.notice?.replaceChildren(); slot.root?.replaceChildren(); }
+}
+
+function memorySourcesCurrent(slot) {
+  return !!slot && memorySources === slot && state.auth.authenticated && state.view === "memories" && state.memoryTab === "sources";
+}
+
+function memorySourceActionCurrent(slot, trigger) {
+  return memorySourcesCurrent(slot) && !slot.controller && !!trigger && !trigger.disabled && $("#other-view").contains(slot.root) && slot.result.contains(trigger);
+}
+
+async function selectMemoryTab(tab) {
+  cancelMemorySearch(); releaseMemoryPath(); releaseMemorySources();
+  if (memoryDialog?.catalogSource) { $("#app-dialog").close(); releaseMemoryDialog(); }
+  state.memoryTab = tab; renderOtherView();
+  if (tab === "sources") await loadMemorySources(memorySources);
+}
+
+function memorySourcePage(payload, cursor) {
+  if (!payload || !Array.isArray(payload.items) || !Number.isSafeInteger(payload.examined) || payload.examined < 0 || payload.examined > memorySourcePageSize || !Number.isSafeInteger(payload.omitted) || payload.omitted < 0 || payload.items.length + payload.omitted !== payload.examined || payload.consistency !== "live" || payload.order !== "newest_registered_first" || typeof payload.has_more !== "boolean") throw new Error("来源目录响应不完整，请刷新。");
+  if (payload.has_more ? typeof payload.next_cursor !== "string" || !payload.next_cursor || payload.next_cursor === cursor || !payload.examined : payload.next_cursor !== null) throw new Error("来源目录续页位置无效，请刷新。");
+  const seen = new Set();
+  for (const item of payload.items) {
+    if (!item || typeof item.source_id !== "string" || !item.source_id || seen.has(item.source_id) || ![item.source, item.session_id, item.principal].every((value) => typeof value === "string") || !["user", "assistant", "tool"].includes(item.role) || typeof item.trusted_owner !== "boolean" || (item.trusted_owner && item.role !== "user") || typeof item.revision !== "string" || !/^[a-f0-9]{64}$/.test(item.revision) || !Number.isFinite(item.created_at) || !Number.isSafeInteger(item.total_bytes) || item.total_bytes < 0 || !item.job || !Object.hasOwn(memoryJobStates, item.job.state) || !Number.isSafeInteger(item.job.attempts) || item.job.attempts < 0 || typeof item.job.last_error !== "string") throw new Error("来源身份或整理状态不完整，请刷新。");
+    seen.add(item.source_id);
+  }
+  return payload;
+}
+
+function renderMemorySources(slot) {
+  slot.filterInput = element("select", { "aria-label": "来源整理状态" }, element("option", { value: "", text: "全部状态" }), ...Object.entries(memoryJobStates).map(([key, label]) => element("option", { value: key, text: label })));
+  slot.filterInput.value = slot.filter;
+  slot.filterInput.addEventListener("change", () => void loadMemorySources(slot, { filter: slot.filterInput.value }));
+  slot.refresh = element("button", { type: "button", class: "secondary-button", text: "刷新来源", onClick: () => void loadMemorySources(slot) });
+  slot.next = element("button", { type: "button", class: "secondary-button", text: "继续翻页", onClick: () => void loadMemorySources(slot, { cursor: slot.page?.next_cursor }) });
+  slot.position = element("p", { class: "settings-role-hint", role: "status", tabIndex: -1 });
+  slot.result = element("div"); slot.notice = element("div", { "aria-live": "polite" }); slot.receiptRegion = element("div", { "aria-live": "polite" });
+  slot.root = element("section", { "aria-label": "已保存来源" }, element("div", { class: "content-toolbar" }, element("label", {}, "整理状态", slot.filterInput), slot.refresh), element("p", { class: "settings-role-hint", text: "查看已保存资料及整理进度。" }), slot.position, slot.notice, slot.receiptRegion, slot.result, slot.next);
+  updateMemorySources(slot); return slot.root;
+}
+
+function memoryRetryReceipt(receipt) {
+  const reason = { queued: "已接纳到后台队列，尚未完成整理", already_pending: "已有待处理作业，未重复排队", already_done: "作业已经完成，未重新执行", capacity_full: "后台容量已满，本次未接纳" }[receipt.reason];
+  return element("div", { class: "advanced-settings" }, element("p", { role: "status", text: reason }), statusList([["来源 ID", receipt.source_id], ["来源版本", receipt.revision], ["原状态", memoryJobStates[receipt.previous_state]], ["当前状态", memoryJobStates[receipt.state]], ["本次接纳", receipt.accepted ? "是" : "否"]]), element("p", { class: "settings-role-hint", text: "请刷新来源目录核对后续状态；排队不代表完成。" }));
+}
+
+function updateMemorySources(slot) {
+  if (!slot.root) return;
+  const loading = !!slot.controller, page = slot.page;
+  const focused = slot.result.contains(document.activeElement);
+  slot.root.setAttribute("aria-busy", String(loading)); slot.filterInput.disabled = loading; slot.refresh.disabled = loading;
+  slot.next.disabled = loading || !page?.has_more;
+  slot.position.textContent = loading ? "正在读取来源…" : page ? `本页 ${page.items.length} 个来源 · 检查 ${page.examined} 个 · 略过 ${page.omitted} 个 · ${page.has_more ? "仍可继续翻页" : "已到末尾"}` : "尚未读取来源。";
+  slot.notice.replaceChildren();
+  if (slot.error) slot.notice.append(element("p", { class: "form-error", role: "status", text: slot.error }), element("button", { type: "button", class: "text-button", text: "重试读取", disabled: loading, onClick: () => void loadMemorySources(slot, slot.retry) }));
+  slot.receiptRegion.replaceChildren(...(slot.receipt ? [memoryRetryReceipt(slot.receipt)] : []));
+  slot.result.replaceChildren();
+  if (page && !page.items.length) slot.result.append(element("p", { class: "settings-role-hint", text: page.has_more ? "本窗口没有匹配来源，请继续翻页。" : "本窗口没有匹配来源。" }));
+  for (const item of page?.items ?? []) {
+    const read = element("button", { type: "button", class: "text-button", text: "核原文", disabled: loading, onClick: () => void showCatalogSource(slot, item, read) });
+    const actions = element("div", { class: "row-actions" }, read);
+    if (["failed", "deferred"].includes(item.job.state)) {
+      const retry = element("button", { type: "button", class: "text-button", text: "重试此来源", disabled: loading, onClick: () => confirmMemorySourceRetry(slot, item, retry) });
+      actions.append(retry);
+    }
+    const details = element("details", { class: "advanced-settings" }, element("summary", { text: "来源详情" }), statusList([["来源", item.source], ["身份", item.principal], ["角色", item.role], ["原会话", item.session_id || "未记录"], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]));
+    slot.result.append(element("article", { class: "memory-row" }, element("div", { class: "row-icon" }, icon("memory")), element("div", { class: "row-content" }, element("p", { class: "memory-source-content", text: item.source_id }), element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryJobStates[item.job.state] }), element("time", { text: formatTimestamp(item.created_at) }), `${item.total_bytes} 字节 · 尝试 ${item.job.attempts} 次`), details, item.job.last_error && element("p", { class: "form-error", text: item.job.last_error })), actions));
+  }
+  if (focused) slot.position.focus({ preventScroll: true });
+}
+
+async function loadMemorySources(slot, { cursor = null, filter = slot?.filter ?? "" } = {}) {
+  if (!memorySourcesCurrent(slot)) return;
+  slot.controller?.abort();
+  if (filter !== slot.filter) { slot.page = null; slot.cursor = null; slot.receipt = null; }
+  slot.filter = filter; state.memorySourceState = filter; slot.filterInput.value = filter;
+  const controller = new AbortController(); slot.controller = controller;
+  const owner = connection, current = () => memorySourcesCurrent(slot) && slot.controller === controller && connectionCurrent(owner);
+  slot.error = ""; slot.retry = { cursor, filter }; updateMemorySources(slot);
+  try {
+    const query = new URLSearchParams({ limit: String(memorySourcePageSize) });
+    if (cursor) query.set("cursor", cursor);
+    if (filter) query.set("state", filter);
+    const payload = await request(`/memory/sources?${query}`, { signal: controller.signal, cache: "no-store" });
+    if (!current()) return;
+    slot.page = memorySourcePage(payload, cursor); slot.cursor = cursor;
+  } catch (error) {
+    if (current() && !controller.signal.aborted) slot.error = error.message;
+  } finally {
+    if (current()) { slot.controller = null; updateMemorySources(slot); }
+  }
+}
+
+function confirmMemorySourceRetry(slot, item, trigger) {
+  if (!memorySourceActionCurrent(slot, trigger)) return;
+  const content = element("div", {}, element("p", { text: "只重试这一准确来源，保留已有进度。可能向已配置的提炼或向量服务发送正文；未确认保存的请求可能再次收费。排队不代表完成。" }), statusList([["来源 ID", item.source_id], ["来源版本", item.revision], ["目录读取时状态", memoryJobStates[item.job.state]]]));
+  openDialog({ title: "重试来源整理", content, submitLabel: "确认重试", onSubmit: async () => {
+    const current = () => memorySourceRetry === pending && memorySourceActionCurrent(slot, trigger) && $("#app-dialog").open && $("#dialog-content").firstElementChild === content;
+    if (!current()) throw new Error("来源目录已关闭，请重新确认。");
+    if (pending.controller) throw new Error("请求已经提交，请等待实际回执。");
+    const controller = new AbortController(); pending.controller = controller;
+    try {
+      const receipt = await request("/memory/sources/retry", { method: "POST", signal: controller.signal, body: JSON.stringify({ source_id: item.source_id, revision: item.revision }) });
+      if (!current()) return;
+      if (receipt?.source_id !== item.source_id || receipt.revision !== item.revision || !Object.hasOwn(memoryJobStates, receipt.previous_state) || !Object.hasOwn(memoryJobStates, receipt.state) || typeof receipt.accepted !== "boolean" || !["queued", "already_pending", "already_done", "capacity_full"].includes(receipt.reason)) throw new Error("重试回执不完整，请刷新来源状态核查，勿直接重复请求。");
+      slot.receipt = receipt; updateMemorySources(slot);
+      content.replaceChildren(memoryRetryReceipt(receipt)); dialogSubmit = null;
+      $("#dialog-submit").hidden = true;
+      $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = "关闭";
+    } finally { if (memorySourceRetry === pending) pending.controller = null; }
+  } });
+  const pending = memorySourceRetry = { content, controller: null };
+}
+
+async function showCatalogSource(catalog, item, trigger) {
+  if (!memorySourceActionCurrent(catalog, trigger)) return;
+  const content = element("div", { class: "memory-verification" });
+  openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger });
+  const origin = { ...item, id: item.source_id, digest: item.revision };
+  const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [0], pageIndex: 0, page: null, editing: false };
+  memoryDialog = slot;
+  slot.sourceRegion = element("div", { class: "memory-source-page", "aria-live": "polite" });
+  content.append(statusList([["来源 ID", item.source_id], ["身份", item.principal], ["角色", item.role], ["来源", item.source], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]), slot.sourceRegion);
+  await loadMemorySource(slot, 0, 0);
+}
 
 async function searchMemories(query) {
   cancelMemorySearch(); releaseMemoryPath();
@@ -1827,7 +1978,10 @@ function memoryUnavailable(slot, message) {
   resetMemoryReads(slot); slot.item = null; slot.editing = false;
   dialogSubmit = null; $("#dialog-submit").hidden = true;
   $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = "关闭";
-  slot.content.replaceChildren(element("p", { role: "status", text: message }), element("button", { type: "button", class: "secondary-button", text: "重新核查", onClick: () => void refreshMemoryEvidence(slot) }));
+  slot.content.replaceChildren(element("p", { role: "status", text: message }), element("button", { type: "button", class: "secondary-button", text: slot.catalogSource ? "刷新来源目录" : "重新核查", onClick: () => {
+    if (slot.catalogSource) { $("#app-dialog").close(); void loadMemorySources(memorySources); }
+    else void refreshMemoryEvidence(slot);
+  } }));
 }
 
 function invalidateMemoryEvidence(event) {
@@ -1921,7 +2075,7 @@ function renderMemoryEvidence(slot) {
 
 function validMemorySource(page, slot, offset) {
   const origin = slot.item.origin;
-  return page?.memory_id === slot.id && page.source_id === slot.item.source_id && page.source_id === origin.id && page.revision === origin.digest && page.field === "content" && typeof page.content === "string"
+  return (slot.catalogSource ? page?.memory_id === undefined : page?.memory_id === slot.id) && page?.source_id === slot.item.source_id && page.source_id === origin.id && page.revision === origin.digest && page.field === "content" && typeof page.content === "string"
     && [page.offset_bytes, page.length_bytes, page.next_offset_bytes, page.total_bytes].every((value) => Number.isSafeInteger(value) && value >= 0)
     && page.offset_bytes === offset && page.length_bytes === new TextEncoder().encode(page.content).length && page.next_offset_bytes === offset + page.length_bytes
     && typeof page.has_more === "boolean" && page.has_more === (page.next_offset_bytes < page.total_bytes) && page.next_offset_bytes <= page.total_bytes && (!page.has_more || page.length_bytes > 0);
@@ -1935,7 +2089,9 @@ async function loadMemorySource(slot, offset, index) {
   slot.sourceError = ""; slot.sourceRetry = { offset, index }; renderMemorySource(slot);
   try {
     const query = new URLSearchParams({ offset_bytes: String(offset), revision: origin.digest });
-    const page = await request(`/memories/${encodeURIComponent(slot.id)}/source?${query}`, { signal: controller.signal, cache: "no-store" });
+    if (slot.catalogSource) query.set("id", slot.sourceId);
+    const path = slot.catalogSource ? `/memory/source?${query}` : `/memories/${encodeURIComponent(slot.id)}/source?${query}`;
+    const page = await request(path, { signal: controller.signal, cache: "no-store" });
     if (!memoryDialogCurrent(slot) || slot.sourceController !== controller) return;
     if (!validMemorySource(page, slot, offset)) { memoryUnavailable(slot, "原文响应不一致，请重新核查。"); return; }
     slot.page = page; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
@@ -2991,7 +3147,7 @@ document.addEventListener("click", async (event) => {
     else if (button.dataset.session) await loadSession(button.dataset.session, button);
     else if (button.dataset.settingsTab) switchSettingsTab(button.dataset.settingsTab);
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
-    else if (button.dataset.memoryTab) { cancelMemorySearch(); releaseMemoryPath(); state.memoryTab = button.dataset.memoryTab; renderOtherView(); }
+    else if (button.dataset.memoryTab) await selectMemoryTab(button.dataset.memoryTab);
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
   } catch (error) { showError(error); }
 });
@@ -3057,6 +3213,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
 });
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseMemorySourceRetry();
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog();
@@ -3097,7 +3254,7 @@ function recoverConnection() {
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); recoverConnection(); });
 window.addEventListener("online", recoverConnection);
 window.addEventListener("pageshow", (event) => { if (event.persisted) recoverConnection(); });
-window.addEventListener("pagehide", () => { invalidateConnection(); voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseWorkflowActivity(); releaseRecordDirectory(); });
+window.addEventListener("pagehide", () => { invalidateConnection(); voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseMemorySources(); releaseWorkflowActivity(); releaseRecordDirectory(); });
 
 fillIcons();
 conversationLayout = initializeConversationWidth($("#chat-view"));

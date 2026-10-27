@@ -542,7 +542,31 @@ class MemoryApplication:
             pipeline.source_chunks.settings.replace(settings)
             return result
 
+        async def retry_source(args: dict[str, Any]) -> Any:
+            self._attachment_guard(pipeline, generation, tool_name="memory_retry_source")
+            result = self.retry_source(args)
+            if result["accepted"]:
+                await pipeline._publish(result["source_id"])
+            return result
+
         return [
+            Tool(
+                "memory_retry_source",
+                "主人明确要求后，按memory_sources/memory_source返回的准确source_id和revision，"
+                "仅重新登记这一份failed或deferred来源，保留已有处理进度；"
+                "会继续已配置提炼/embedding，未确认保存的外部请求可能重复收费。"
+                "不会重置已完成或正在处理的作业，accepted/queued只表示接纳，不是整理完成",
+                parameters(
+                    {
+                        "source_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                    },
+                    ("source_id", "revision"),
+                ),
+                retry_source,
+                "write",
+                preserve_output=True,
+            ),
             Tool(
                 "memory_chunk_configure",
                 "按主人要求完整调整长期资料分块参数；先用memory_chunk_settings_read查看现值。"
@@ -582,6 +606,20 @@ class MemoryApplication:
                 preserve_output=True,
             ),
         ]
+
+    def retry_source(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Share exact source admission between the authenticated API and main tool."""
+        if args.keys() != {"source_id", "revision"}:
+            raise EvidenceError("invalid_arguments", "重试来源只接受 source_id 和 revision")
+        if self._closed or self.runtime._closing or not self.runtime.config.settings.memory.enabled:
+            raise ValueError("记忆处理未启用或正在关闭")
+        if "memory_retry_source" in self.runtime.config.settings.disabled_tools:
+            raise ValueError("来源重试工具未启用")
+        return self.pipeline.retry_source(
+            args["source_id"],
+            args["revision"],
+            max_output_chars=self.runtime.config.settings.limits.max_output_chars,
+        )
 
     def attachment_tools(self, runtime: Runtime) -> list[Tool]:
         reader = self.attachment_reader

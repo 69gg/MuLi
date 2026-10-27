@@ -52,7 +52,7 @@ from muli.management import SelfManagement
 from muli.management_transaction import ClockReading
 from muli.mcp_policy import ReceivePolicy
 from muli.memory_application import MemoryApplication
-from muli.memory_evidence import MemoryEvidence, memory_listing
+from muli.memory_evidence import SOURCE_PAGE_LIMIT, MemoryEvidence, memory_listing
 from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
@@ -142,6 +142,11 @@ class MemoryIndexInput(Input):
     source_ids: list[Annotated[str, Field(min_length=1, strict=True)]] | None = None
     key: str | None = Field(default=None, min_length=1, strict=True)
     plan_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$", strict=True)
+
+
+class MemorySourceRetryInput(Input):
+    source_id: str = Field(min_length=1, max_length=200, strict=True)
+    revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
 class WorkflowInput(Input):
@@ -1031,6 +1036,46 @@ def _create_app(
     @app.get("/api/memory/status")
     async def memory_status() -> dict[str, Any]:
         return memory_application.pipeline.status()
+
+    @app.get("/api/memory/sources")
+    async def memory_sources(
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=SOURCE_PAGE_LIMIT)] = 20,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        return MemoryEvidence(runtime.memory).sources(
+            cursor=cursor,
+            limit=limit,
+            state=state,
+            max_output_chars=config.settings.limits.max_output_chars,
+        )
+
+    @app.get("/api/memory/source")
+    async def read_memory_source(
+        identifier: Annotated[str, Query(alias="id", min_length=1, max_length=200)],
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+        revision: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    ) -> dict[str, Any]:
+        return MemoryEvidence(runtime.memory).read(
+            identifier,
+            by_memory=False,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
+            revision=revision,
+            max_output_chars=config.settings.limits.max_output_chars,
+        )
+
+    @app.post("/api/memory/sources/retry")
+    async def retry_memory_source(body: MemorySourceRetryInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = memory_application.retry_source(body.model_dump())
+            pipeline = memory_application.pipeline
+        if result["accepted"]:
+            await pipeline._publish(result["source_id"])
+        return result
 
     @app.post("/api/memory/reindex")
     async def memory_reindex(body: MemoryIndexInput) -> dict[str, Any]:
