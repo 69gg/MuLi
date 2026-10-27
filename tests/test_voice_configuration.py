@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,8 @@ async def test_prepare_reuses_exact_private_snapshot_without_applying_or_loading
     assert load_config(path).wake is not None
     second = await prepare_acoustic(values, files, max_output_chars=10000, guard=allowed)
     assert second == result and list(files.root.iterdir()) == [path]
-    assert path.stat().st_mode & 0o077 == 0
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o077 == 0
 
 
 async def test_preparation_output_and_caller_gates_precede_any_write(tmp_path: Path) -> None:

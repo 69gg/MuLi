@@ -45,7 +45,9 @@ async def tool(rig: MemoryRig, name: str, **args: Any) -> dict[str, Any]:
 def pdf_command(rig: MemoryRig, text: str) -> None:
     store = DocumentSettingsStore(rig.runtime.store)
     values = store.read().model_dump()
-    values["pdf_command"] = [sys.executable, "-c", f"print({text!r})"]
+    output = (text + "\n").encode("utf-8")
+    script = f"import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write({output!r})"
+    values["pdf_command"] = [sys.executable, "-c", script]
     store.replace(DocumentSettings.model_validate(values))
 
 
@@ -155,6 +157,7 @@ async def test_changed_extraction_never_appends_or_replaces_a_collected_version(
         item = await rig.upload(pdf())
         pdf_command(rig, "第一版完整正文")
         first = await tool(rig, "document_read", id=item["id"])
+        assert "error" not in first, first
         pdf_command(rig, "第二版正文")
         stale = await tool(
             rig, "memory_import_attachment", id=item["id"], revision=first["revision"]
@@ -196,6 +199,7 @@ async def test_invalid_document_never_becomes_a_memory_source(tmp_path: Path, fa
             docx("".join(f"必须完整保存的正文{index}。\n" for index in range(300)))
         )
         page = await tool(rig, "document_read", id=item["id"])
+        assert "error" not in page, page
         args = {"id": item["id"], "revision": page["revision"]}
         if failure == "missing_revision":
             args.pop("revision")
@@ -258,6 +262,7 @@ async def test_installed_pdf_converter_can_collect_its_complete_text_layer(tmp_p
     async with actual_app(tmp_path) as rig:
         item = await rig.upload(pdf())
         page = await tool(rig, "document_read", id=item["id"])
+        assert "error" not in page, page
         result = await tool(
             rig, "memory_import_attachment", id=item["id"], revision=page["revision"]
         )

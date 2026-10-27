@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -79,7 +80,9 @@ async def test_setup_enrollment_preserves_disabled_voice_and_private_reference(
     }
     pointer = worker.files.root / "enrollment.txt"
     reference = worker.files.root / (pointer.read_text(encoding="utf-8") + ".wav")
-    assert reference.is_file() and reference.stat().st_mode & 0o777 == 0o600
+    assert reference.is_file()
+    if os.name == "posix":
+        assert reference.stat().st_mode & 0o777 == 0o600
     assert recorder.calls == [1]
     assert worker.config.enabled is False and worker.status()["running"] is False
     assert str(tmp_path) not in json.dumps(receipt)

@@ -331,6 +331,7 @@ async def test_real_installed_pdf_converter_reads_generated_document(pdf_host: H
     configure_document(pdf_host, {"pdf_command": [converter]})
     item = await pdf_host.save(pdf(), "sample.pdf")
     result = await pdf_host.drive("document_read", id=item["id"])
+    assert "error" not in result, result
     assert result["format"] == "pdf" and result["scope"] == "pdf_text_layer"
     assert result["source_revision"] == item["sha256"]
     assert "MULI DOCUMENT END" in result["content"] and not result["has_more"]
