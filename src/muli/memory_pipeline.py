@@ -136,7 +136,9 @@ class MemoryPipeline:
         self.changed = asyncio.Condition()
         self._worker: asyncio.Task[None] | None = None
         self._media_lock = asyncio.Lock()
-        self._cache: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int, int, tuple[str, ...] | None], dict[str, Any]] = (
+            OrderedDict()
+        )
         self._cache_revision = memory.revision
         self._last_error = ""
         self._index_closed = False
@@ -1265,23 +1267,44 @@ class MemoryPipeline:
             ).encode("utf-8")
         ).hexdigest()
 
-    def _cached(self, query: str, limit: int, hops: int) -> dict[str, Any] | None:
+    def _cached(
+        self, query: str, limit: int, hops: int, source_ids: tuple[str, ...] | None = None
+    ) -> dict[str, Any] | None:
         if self._cache_revision != self.memory.revision:
             self._cache.clear()
             self._cache_revision = self.memory.revision
-        key = (query, limit, hops)
+        key = (query, limit, hops, source_ids)
         if key not in self._cache:
             return None
         self._cache.move_to_end(key)
         return deepcopy(self._cache[key])
 
-    def _remember(self, query: str, limit: int, hops: int, result: dict[str, Any]) -> None:
-        self._cached(query, limit, hops)
-        self._cache[(query, limit, hops)] = deepcopy(result)
+    def _remember(
+        self,
+        query: str,
+        limit: int,
+        hops: int,
+        result: dict[str, Any],
+        source_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        self._cached(query, limit, hops, source_ids)
+        key = (query, limit, hops, source_ids)
+        self._cache[key] = deepcopy(result)
         while len(self._cache) > self.config.cache_entries:
-            self._cache.popitem(last=False)
+            scoped_key = next(
+                (cached_key for cached_key in self._cache if cached_key[3] is not None), None
+            )
+            if scoped_key is None:
+                self._cache.popitem(last=False)
+            else:
+                del self._cache[scoped_key]
 
-    def _result(self, items: list[dict[str, Any]], degraded: list[str]) -> dict[str, Any]:
+    def _result(
+        self,
+        items: list[dict[str, Any]],
+        degraded: list[str],
+        source_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         sources = []
         for identifier in dict.fromkeys(
             item["source_id"] for item in items if item["source_id"] is not None
@@ -1289,13 +1312,18 @@ class MemoryPipeline:
             source = self.memory.source(identifier, max_chars=300)
             if source is not None:
                 sources.append(source)
-        return {
+        result = {
             "memories": items,
-            "communities": self.memory.communities_for([item["id"] for item in items]),
+            "communities": self.memory.communities_for(
+                [item["id"] for item in items], source_ids=source_ids
+            ),
             "sources": sources,
             "degraded": degraded,
             "revision": self.memory.revision,
         }
+        if source_ids is not None:
+            result["source_ids"] = list(source_ids)
+        return result
 
     async def query(
         self,
@@ -1304,17 +1332,21 @@ class MemoryPipeline:
         *,
         hops: int | None = None,
         use_semantic: bool = True,
+        source_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         chosen_hops = self.config.graph_hops if hops is None else hops
         self.memory._query(query)
+        scope = self.memory.source_scope(source_ids)
         if type(chosen_hops) is not int or not 0 <= chosen_hops <= 8:
             raise ValueError("记忆 hops 必须在 0 到 8 之间")
         limit = max(1, min(limit, self.config.max_candidates))
-        cached = self._cached(query, limit, chosen_hops) if use_semantic else None
+        cached = self._cached(query, limit, chosen_hops, scope) if use_semantic else None
         if cached is not None:
             return cached
         revision = self.memory.revision
-        local = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
+        local = self.memory.search(
+            query, self.config.max_candidates, hops=chosen_hops, source_ids=scope
+        )
         items = local
         degraded: list[str] = []
         semantic_failed = False
@@ -1323,8 +1355,10 @@ class MemoryPipeline:
             # Awaited model/lock work may outlive edits or a source-level forget.
             # Return a current local projection once; never retry the network or
             # associate candidates from the old revision with the new cache.
-            current = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
-            return self._result(current[:limit], [*degraded, "memory_changed"])
+            current = self.memory.search(
+                query, self.config.max_candidates, hops=chosen_hops, source_ids=scope
+            )
+            return self._result(current[:limit], [*degraded, "memory_changed"], scope)
 
         if use_semantic and query.strip() and self.media is not None:
             try:
@@ -1340,10 +1374,13 @@ class MemoryPipeline:
                             if len(vectors) != 1:
                                 raise ValueError("查询向量数量错误")
                             semantic = self.memory.vector_search(
-                                vectors[0], self._model_key(), self.config.max_candidates
+                                vectors[0],
+                                self._model_key(),
+                                self.config.max_candidates,
+                                source_ids=scope,
                             )
                             if (
-                                self.memory.vector_count(self._model_key())
+                                self.memory.vector_count(self._model_key(), source_ids=scope)
                                 > self.config.max_vector_scan
                             ):
                                 degraded.append("vector_scan_limited")
@@ -1380,9 +1417,9 @@ class MemoryPipeline:
                 items = local
         if self.memory.revision != revision:
             return refreshed_local()
-        result = self._result(items[:limit], degraded)
+        result = self._result(items[:limit], degraded, scope)
         if use_semantic and not semantic_failed:
-            self._remember(query, limit, chosen_hops, result)
+            self._remember(query, limit, chosen_hops, result, scope)
         return result
 
     def cached_context(
@@ -1430,7 +1467,7 @@ class MemoryPipeline:
         cached = self._cached(query, limit, self.config.graph_hops)
         if cached is None:
             for key in reversed(self._cache):
-                if key[0] == query and key[2] == self.config.graph_hops:
+                if key[0] == query and key[2] == self.config.graph_hops and key[3] is None:
                     cached = deepcopy(self._cache[key])
                     break
         return compose_context_result(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -131,9 +131,10 @@ async def test_background_documents_and_cached_queries_use_distinct_embedding_re
                 *,
                 hops: int | None = None,
                 layer: str | None = None,
+                source_ids: Sequence[str] | None = None,
             ) -> list[dict[str, Any]]:
                 local_queries.append(query)
-                return search(query, limit, hops=hops, layer=layer)
+                return search(query, limit, hops=hops, layer=layer, source_ids=source_ids)
 
             monkeypatch.setattr(pipeline.memory, "search", observed_search)
             result = await pipeline.query(query)

@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -426,8 +426,15 @@ class MemoryApplication:
         )
         await self.start()
 
-    async def query(self, query: str, limit: int = 8, *, hops: int | None = None) -> dict[str, Any]:
-        result = await self.pipeline.query(query, limit=limit, hops=hops)
+    async def query(
+        self,
+        query: str,
+        limit: int = 8,
+        *,
+        hops: int | None = None,
+        source_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        result = await self.pipeline.query(query, limit=limit, hops=hops, source_ids=source_ids)
         return query_result(
             result, max_output_chars=self.runtime.config.settings.limits.max_output_chars
         )
@@ -712,7 +719,10 @@ class MemoryApplication:
 
         async def query(args: dict[str, Any]) -> Any:
             return await self.query(
-                str(args["query"]), limit=int(args.get("limit", 8)), hops=args.get("hops")
+                str(args["query"]),
+                limit=int(args.get("limit", 8)),
+                hops=args.get("hops"),
+                source_ids=args.get("source_ids"),
             )
 
         async def source(args: dict[str, Any]) -> Any:
@@ -755,12 +765,19 @@ class MemoryApplication:
             Tool(
                 "memory_query",
                 "融合关键词、向量、关系和社区检索记忆；graph_via 为实际召回路径，"
-                "truncated/omitted 表示预算省略；语义服务失败时降级本地",
+                "truncated/omitted 表示预算省略；语义服务失败时降级本地；"
+                "source_ids 可限定已知来源，空列表无效，不传则全库查询",
                 parameters(
                     {
                         "query": string(),
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                         "hops": {"type": "integer", "minimum": 0, "maximum": 8},
+                        "source_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": self.pipeline.config.max_candidates,
+                            "items": {"type": "string", "minLength": 1},
+                        },
                     },
                     ("query",),
                 ),

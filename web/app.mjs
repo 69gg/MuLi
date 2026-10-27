@@ -56,7 +56,7 @@ const state = {
   view: "chat", status: null, connected: false, streamConnected: true, loading: true,
   sessions: [], activeSession: null, session: createSessionState(), mode: "auto", sending: false,
   sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
-  viewError: "", viewLoading: false, memoryQuery: "", settings: null, settingsTab: "overview",
+  viewError: "", viewLoading: false, memoryQuery: "", memorySourceId: null, memoryQueryPartial: false, memoryQueryDegraded: false, settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
   mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
@@ -1163,11 +1163,13 @@ async function switchView(view, owner = connection) {
     if (view === "uploads") { const payload = await ownedRequest("/uploads", {}, owner); if (current()) state.uploads = collection(payload); }
     if (view === "team") { const page = await teamPager.load({}, (path) => ownedRequest(path, {}, owner)); if (current() && page) state.team = page; }
     if (view === "memories") {
-      const query = state.memoryQuery;
-      const results = await Promise.allSettled([ownedRequest(`/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`, {}, owner), ownedRequest("/memories/graph", {}, owner)]);
-      if (!current() || query !== state.memoryQuery || !state.auth.authenticated) return;
+      const query = state.memoryQuery, sourceId = state.memorySourceId;
+      const results = await Promise.allSettled([ownedRequest(memorySearchPath(query, sourceId), {}, owner), ownedRequest("/memories/graph", {}, owner)]);
+      if (!current() || query !== state.memoryQuery || sourceId !== state.memorySourceId || !state.auth.authenticated) return;
       if (results[0].status === "rejected") throw results[0].reason;
-      state.memories = collection(results[0].value);
+      state.memories = memorySearchItems(results[0].value, sourceId);
+      state.memoryQueryPartial = !!sourceId && results[0].value.truncated === true;
+      state.memoryQueryDegraded = !!sourceId && results[0].value.degraded?.some((code) => code.startsWith("semantic_unavailable:")) === true;
       state.memoryGraph = results[1].status === "fulfilled" ? results[1].value : { nodes: [], edges: [] };
     }
     if (view === "notifications") {
@@ -1631,7 +1633,7 @@ function renderRecordList(slot = recordDirectory) {
 
 function renderMemories() {
   releaseMemoryPath();
-  const search = element("input", { type: "search", name: "memory-search", id: "memory-search", value: state.memoryQuery, placeholder: "检索内容、实体或偏好", "aria-label": "检索记忆" });
+  const search = element("input", { type: "search", name: "memory-search", id: "memory-search", value: state.memoryQuery, placeholder: state.memorySourceId ? "在此来源内检索" : "检索内容、实体或偏好", "aria-label": "检索记忆" });
   const form = element("form", { class: "content-toolbar", onSubmit: async (event) => {
     event.preventDefault(); await searchMemories(search.value.trim());
   } }, element("div", { class: "search-field" }, icon("search"), search), element("button", { class: "secondary-button", type: "submit", text: "检索" }));
@@ -1642,10 +1644,13 @@ function renderMemories() {
     memorySources ??= { filter: state.memorySourceState ?? "", page: null, cursor: null, controller: null, error: "", receipt: null };
     root.append(renderMemorySources(memorySources)); return root;
   }
-  root.append(form, element("div", { class: "list-caption" }, `${state.memories.length} 条记忆`, state.memoryQuery ? `“${state.memoryQuery}”` : "全部记忆"));
+  if (state.memorySourceId) root.append(element("div", { class: "list-caption" }, "仅此来源", element("span", { class: "memory-source-content", text: state.memorySourceId }), element("button", { type: "button", class: "text-button", text: "查全库", dataset: { memoryGlobal: "true" }, onClick: () => void changeMemorySource(null) })));
+  root.append(form, element("div", { class: "list-caption" }, `${state.memories.length} 条记忆`, state.memoryQuery ? `“${state.memoryQuery}”` : state.memorySourceId ? "来源内结果" : "全部记忆"));
+  if (state.memorySourceId && state.memoryQueryPartial) root.append(element("p", { class: "settings-notice", role: "status", text: "部分结果因预算省略，可以缩小查询后重试。" }));
+  if (state.memorySourceId && state.memoryQueryDegraded) root.append(element("p", { class: "settings-notice", role: "status", text: "语义检索暂不可用，已使用本地结果。" }));
   if (!state.memories.length) root.append(emptyState("memory", state.memoryQuery ? "没有找到相关记忆" : "还没有记忆", state.memoryQuery ? "换个关键词试试。" : "添加希望沐璃记住的内容。"));
   for (const item of state.memories) {
-    const meta = element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryKind(item.kind) }), memoryNeedsReview(item) && element("span", { class: "row-tag", text: "待核对" }), ...(item.entities ?? []).map((entity) => element("span", { text: typeof entity === "string" ? entity : entity.name ?? "" })), element("time", { text: formatTimestamp(item.updated_at ?? item.created_at) }), item.matched_by && element("span", { text: { text: "文本匹配", lexical: "文本匹配", graph: "关系匹配", "graph+text": "文本与关系匹配" }[item.matched_by] ?? item.matched_by }));
+    const meta = element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryKind(item.kind) }), memoryNeedsReview(item) && element("span", { class: "row-tag", text: "待核对" }), ...(item.entities ?? []).map((entity) => element("span", { text: typeof entity === "string" ? entity : entity.name ?? "" })), element("time", { text: formatTimestamp(item.updated_at ?? item.created_at) }), item.matched_by && element("span", { text: { text: "文本匹配", lexical: "文本匹配", graph: "关系匹配", "graph+text": "文本与关系匹配", semantic: "语义匹配", hybrid: "融合匹配", reranked: "重排匹配" }[item.matched_by] ?? item.matched_by }));
     const content = element("div", { class: "row-content" }, element("p", { text: item.content }), meta);
     if (item.path_omitted === true) meta.append(element("span", { class: "memory-path-note", text: "召回路径因预算省略" }));
     else if (state.memoryQuery && memoryGraphPath(item)) {
@@ -1730,7 +1735,8 @@ function updateMemorySources(slot) {
   if (page && !page.items.length) slot.result.append(element("p", { class: "settings-role-hint", text: page.has_more ? "本窗口没有匹配来源，请继续翻页。" : "本窗口没有匹配来源。" }));
   for (const item of page?.items ?? []) {
     const read = element("button", { type: "button", class: "text-button", text: "核原文", disabled: loading, onClick: () => void showCatalogSource(slot, item, read) });
-    const actions = element("div", { class: "row-actions" }, read);
+    const search = element("button", { type: "button", class: "text-button", text: "在此来源内查找", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, search)) void changeMemorySource(item.source_id); } });
+    const actions = element("div", { class: "row-actions" }, read, search);
     if (["failed", "deferred"].includes(item.job.state)) {
       const retry = element("button", { type: "button", class: "text-button", text: "重试此来源", disabled: loading, onClick: () => confirmMemorySourceRetry(slot, item, retry) });
       actions.append(retry);
@@ -1796,15 +1802,36 @@ async function showCatalogSource(catalog, item, trigger) {
   await loadMemorySource(slot, 0, 0);
 }
 
+function memorySearchPath(query, sourceId = null) {
+  if (sourceId) return `/memory/query?${new URLSearchParams({ query, source_id: sourceId, limit: String(memorySourcePageSize) })}`;
+  return `/memories${query ? `?query=${encodeURIComponent(query)}` : ""}`;
+}
+
+function memorySearchItems(payload, sourceId) {
+  if (!sourceId) return collection(payload);
+  if (!Array.isArray(payload?.source_ids) || payload.source_ids.length !== 1 || payload.source_ids[0] !== sourceId || !Array.isArray(payload.memories) || payload.memories.some((item) => item.source_id !== sourceId)) throw new Error("来源检索响应不匹配，请重新检索。");
+  return payload.memories;
+}
+
+async function changeMemorySource(sourceId) {
+  if (sourceId) state.memoryQuery = "";
+  state.memorySourceId = sourceId; state.memories = []; state.memoryQueryPartial = false; state.memoryQueryDegraded = false;
+  await selectMemoryTab("list");
+  await searchMemories(state.memoryQuery);
+}
+
 async function searchMemories(query) {
   cancelMemorySearch(); releaseMemoryPath();
   const controller = new AbortController(), version = ++viewRequestVersion;
   memorySearchController = controller; state.memoryQuery = query;
-  const current = () => memorySearchController === controller && version === viewRequestVersion && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
+  const sourceId = state.memorySourceId;
+  const current = () => memorySearchController === controller && version === viewRequestVersion && sourceId === state.memorySourceId && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
   try {
-    const payload = await request(`/memories?query=${encodeURIComponent(query)}`, { signal: controller.signal, cache: "no-store" });
+    const payload = await request(memorySearchPath(query, sourceId), { signal: controller.signal, cache: "no-store" });
     if (!current()) return;
-    state.memories = collection(payload); renderOtherView(); $("#memory-search")?.focus();
+    state.memories = memorySearchItems(payload, sourceId); state.memoryQueryPartial = !!sourceId && payload.truncated === true;
+    state.memoryQueryDegraded = !!sourceId && payload.degraded?.some((code) => code.startsWith("semantic_unavailable:")) === true;
+    renderOtherView(); $("#memory-search")?.focus();
   } catch (error) { if (current() && !controller.signal.aborted) showError(error); }
   finally { if (memorySearchController === controller) memorySearchController = null; }
 }
@@ -1825,7 +1852,7 @@ function memoryGraphPath(item) {
 }
 
 function memoryPathCurrent(slot) {
-  return memoryPath === slot && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && $("#other-view").contains(slot.region) && !slot.region.hidden;
+  return memoryPath === slot && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && state.memorySourceId === slot.sourceId && $("#other-view").contains(slot.region) && !slot.region.hidden;
 }
 
 function releaseMemoryPath() {
@@ -1856,7 +1883,7 @@ async function toggleMemoryPath(id, button, region, query) {
   if (state.view !== "memories" || state.memoryTab !== "list" || state.memoryQuery !== query || !root.contains(button) || !root.contains(region)) return;
   if (memoryPath?.button === button) { releaseMemoryPath(); button.focus({ preventScroll: true }); return; }
   releaseMemoryPath();
-  const slot = { id: String(id), query, button, region, controller: null, via: null };
+  const slot = { id: String(id), query, sourceId: state.memorySourceId, button, region, controller: null, via: null };
   memoryPath = slot; region.hidden = false; button.setAttribute("aria-expanded", "true");
   await loadMemoryPath(slot);
 }
@@ -1868,9 +1895,9 @@ async function loadMemoryPath(slot) {
   if (slot.region.contains(document.activeElement)) slot.button.focus({ preventScroll: true });
   slot.region.replaceChildren(element("p", { role: "status", text: "正在读取路径…" }));
   try {
-    const payload = await request(`/memories?query=${encodeURIComponent(slot.query)}`, { signal: controller.signal, cache: "no-store" });
+    const payload = await request(memorySearchPath(slot.query, slot.sourceId), { signal: controller.signal, cache: "no-store" });
     if (!memoryPathCurrent(slot) || slot.controller !== controller) return;
-    const item = collection(payload).find((item) => String(item.id) === slot.id), via = memoryGraphPath(item);
+    const item = memorySearchItems(payload, slot.sourceId).find((item) => String(item.id) === slot.id), via = memoryGraphPath(item);
     if (item?.path_omitted === true) { memoryPathNotice(slot, "召回路径因预算省略，请重新检索。"); return; }
     if (!via || (payload.revision !== undefined && payload.revision !== via.revision)) { memoryPathNotice(slot, "当前未返回该路径，请重新检索。"); return; }
     slot.via = via; renderMemoryPath(slot, payload.truncated === true);

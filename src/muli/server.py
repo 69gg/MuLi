@@ -1143,8 +1143,17 @@ def _create_app(
             raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/memory/query")
-    async def memory_query(query: str, limit: int = 8) -> dict[str, Any]:
-        return await memory_application.query(query, limit=min(max(1, limit), 100))
+    async def memory_query(
+        query: str,
+        limit: int = 8,
+        source_id: Annotated[list[str] | None, Query()] = None,
+    ) -> dict[str, Any]:
+        try:
+            return await memory_application.query(
+                query, limit=min(max(1, limit), 100), source_ids=source_id
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.patch("/api/settings")
     async def update_settings(changes: dict[str, Any]) -> dict[str, Any]:

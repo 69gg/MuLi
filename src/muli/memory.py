@@ -21,6 +21,7 @@ from muli.store_schema import validate_existing_schema
 
 LAYERS = frozenset({"identity", "preference", "episodic", "semantic", "procedural"})
 _MAX_QUERY_TERMS = 64
+_MAX_QUERY_CHARS = 12000
 _KIND_LAYER = {
     "observation": "episodic",
     "fact": "semantic",
@@ -1076,22 +1077,61 @@ class Memory:
 
     @staticmethod
     def _query(query: str) -> None:
-        if not isinstance(query, str) or len(query) > 12000:
+        if not isinstance(query, str) or len(query) > _MAX_QUERY_CHARS:
             raise ValueError("记忆查询长度不能超过 12000 字符")
 
-    def _seeds(self, query: str) -> set[str]:
+    def source_scope(self, source_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+        """核验精确来源集合；无效或空范围从不退回全库。"""
+        if source_ids is None:
+            return None
+        if (
+            not isinstance(source_ids, (list, tuple))
+            or not 1 <= len(source_ids) <= self.max_candidates
+            or any(not isinstance(value, str) or not value for value in source_ids)
+        ):
+            raise ValueError("查询来源必须是限额内的非空来源 ID 列表")
+        if sum(len(value) for value in source_ids) > _MAX_QUERY_CHARS:
+            raise ValueError("查询来源 ID 总长度超过记忆查询上限")
+        try:
+            for value in source_ids:
+                value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("查询来源 ID 包含无效 Unicode 字符") from error
+        return tuple(sorted(set(source_ids)))
+
+    @staticmethod
+    def _scope_clause(source_ids: tuple[str, ...] | None) -> str:
+        return "" if source_ids is None else f" AND m.source_id IN ({_slots(source_ids)})"
+
+    def _seeds(self, query: str, *, source_ids: tuple[str, ...] | None = None) -> set[str]:
         folded = normalize_entity(query)
         candidates = self._seed_terms(query)
         if not candidates:
             return set()
-        seeds = {
-            row[0]
-            for row in self.store.db.execute(
+        scope_clause = self._scope_clause(source_ids)
+        if source_ids is None:
+            rows = self.store.db.execute(
                 f"SELECT DISTINCT entity_id FROM memory_aliases WHERE alias IN ({_slots(candidates)}) "
                 "ORDER BY entity_id LIMIT ?",
                 [*candidates, self.max_candidates],
             ).fetchall()
-        }
+        else:
+            # A global alias lookup may be owned by another source. Only actual
+            # scoped contributions or canonical mentions can establish a seed.
+            rows = self.store.db.execute(
+                "SELECT entity_id FROM ("
+                "SELECT e.id entity_id FROM memory_entities e "
+                "JOIN memory_mentions mm ON mm.entity_id=e.id "
+                "JOIN memory_meta m ON m.memory_id=mm.memory_id "
+                f"WHERE e.canonical IN ({_slots(candidates)}) AND m.status!='superseded'"
+                f"{scope_clause} UNION "
+                "SELECT p.entity_id FROM memory_alias_evidence p "
+                "JOIN memory_meta m ON m.memory_id=p.memory_id "
+                f"WHERE p.alias IN ({_slots(candidates)}) AND p.source_id IS m.source_id "
+                f"AND m.status!='superseded'{scope_clause}) ORDER BY entity_id LIMIT ?",
+                [*candidates, *source_ids, *candidates, *source_ids, self.max_candidates],
+            ).fetchall()
+        seeds = {row[0] for row in rows}
         # Longer Chinese names may be embedded in a sentence. Inspect only indexed hits.
         tokens = sorted(terms(query))[:_MAX_QUERY_TERMS]
         if tokens:
@@ -1099,8 +1139,11 @@ class Memory:
                 "SELECT DISTINCT e.id,e.canonical FROM memory_entities e "
                 "JOIN memory_mentions mm ON mm.entity_id=e.id "
                 "JOIN memory_terms t ON t.memory_id=mm.memory_id "
-                f"WHERE t.term IN ({_slots(tokens)}) ORDER BY e.id LIMIT ?",
-                [*tokens, self.max_candidates],
+                + ("JOIN memory_meta m ON m.memory_id=mm.memory_id " if source_ids else "")
+                + f"WHERE t.term IN ({_slots(tokens)})"
+                + (f" AND m.status!='superseded'{scope_clause}" if source_ids else "")
+                + " ORDER BY e.id LIMIT ?",
+                [*tokens, *(source_ids or ()), self.max_candidates],
             ).fetchall()
             seeds.update(row["id"] for row in rows if row["canonical"] in folded)
         return seeds
@@ -1110,8 +1153,16 @@ class Memory:
         folded = normalize_entity(query)
         return sorted({folded, *terms(query), *re.findall(r"[\w]+", folded)})[:_MAX_QUERY_TERMS]
 
-    def _seed_evidence(self, query: str, seeds: Sequence[str]) -> list[dict[str, Any]]:
+    def _seed_evidence(
+        self,
+        query: str,
+        seeds: Sequence[str],
+        *,
+        source_ids: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
         """One bounded supporting contribution per actual seed, with no source body reads."""
+        if source_ids is not None:
+            return self._scoped_seed_evidence(query, seeds, source_ids)
         candidates = self._seed_terms(query)
         result: list[dict[str, Any]] = []
         for identifier in seeds:
@@ -1161,12 +1212,66 @@ class Memory:
             result.append(entry)
         return result
 
+    def _scoped_seed_evidence(
+        self, query: str, seeds: Sequence[str], source_ids: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        candidates = self._seed_terms(query)
+        scope_clause = self._scope_clause(source_ids)
+        result: list[dict[str, Any]] = []
+        for identifier in seeds:
+            entity = self.store.db.execute(
+                "SELECT canonical,name FROM memory_entities WHERE id=?", (identifier,)
+            ).fetchone()
+            if entity is None:
+                continue
+            alias_row = self.store.db.execute(
+                "SELECT p.alias FROM memory_alias_evidence p "
+                "JOIN memory_meta m ON m.memory_id=p.memory_id "
+                f"WHERE p.entity_id=? AND p.alias IN ({_slots(candidates)}) "
+                "AND p.source_id IS m.source_id AND m.status!='superseded'"
+                f"{scope_clause} ORDER BY p.alias LIMIT 1",
+                [identifier, *candidates, *source_ids],
+            ).fetchone()
+            if alias_row is not None:
+                alias = alias_row["alias"]
+                proofs = self.store.db.execute(
+                    "SELECT p.memory_id,p.source_id FROM memory_alias_evidence p "
+                    "JOIN memory_meta m ON m.memory_id=p.memory_id "
+                    "WHERE p.entity_id=? AND p.alias=? AND p.source_id IS m.source_id "
+                    f"AND m.status!='superseded'{scope_clause} ORDER BY p.memory_id LIMIT 2",
+                    [identifier, alias, *source_ids],
+                ).fetchall()
+            else:
+                alias = entity["canonical"]
+                proofs = self.store.db.execute(
+                    "SELECT mm.memory_id,m.source_id FROM memory_mentions mm "
+                    "JOIN memory_meta m ON m.memory_id=mm.memory_id "
+                    f"WHERE mm.entity_id=? AND m.status!='superseded'{scope_clause} "
+                    "ORDER BY mm.memory_id LIMIT 2",
+                    [identifier, *source_ids],
+                ).fetchall()
+            if proofs:
+                result.append(
+                    {
+                        "entity_id": identifier,
+                        "canonical": entity["canonical"],
+                        "name": entity["name"],
+                        "alias": alias,
+                        "kind": "source",
+                        "memory_id": proofs[0]["memory_id"],
+                        "source_id": proofs[0]["source_id"],
+                        "has_more": len(proofs) > 1,
+                    }
+                )
+        return result
+
     def _walk(
         self,
         seeds: set[str],
         hops: int,
         *,
         node_limit: int | None = None,
+        source_ids: tuple[str, ...] | None = None,
     ) -> _Walk:
         node_limit = node_limit or self.max_candidates
         nodes = {identifier: 0 for identifier in sorted(seeds)[:node_limit]}
@@ -1175,6 +1280,8 @@ class Memory:
         edges: list[dict[str, Any]] = []
         parents: dict[str, dict[str, Any]] = {}
         truncated = len(seeds) > node_limit
+        scope_clause = self._scope_clause(source_ids)
+        valid_source = " AND e.source_id IS m.source_id" if source_ids else ""
         for depth in range(1, hops + 1):
             if not frontier or len(edges) >= self.max_graph_edges:
                 truncated |= bool(frontier)
@@ -1187,9 +1294,9 @@ class Memory:
                 "JOIN memory_entities o ON o.id=e.object_id "
                 "JOIN memory_meta m ON m.memory_id=e.memory_id "
                 f"WHERE m.status!='superseded' AND (e.subject_id IN ({_slots(ordered)}) "
-                f"OR e.object_id IN ({_slots(ordered)})) "
+                f"OR e.object_id IN ({_slots(ordered)})){scope_clause}{valid_source} "
                 "ORDER BY e.memory_id,e.subject_id,e.predicate,e.object_id LIMIT ?",
-                [*ordered, *ordered, remaining + len(seen_edges) + 1],
+                [*ordered, *ordered, *(source_ids or ()), remaining + len(seen_edges) + 1],
             ).fetchall()
             next_frontier: set[str] = set()
             for row in rows:
@@ -1238,13 +1345,20 @@ class Memory:
             seed = str(previous["from_id"])
         return {"seed_id": seed, "steps": list(reversed(steps)), "complete": True}
 
-    def traverse(self, entity: str, *, hops: int | None = None) -> dict[str, Any]:
+    def traverse(
+        self,
+        entity: str,
+        *,
+        hops: int | None = None,
+        source_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         self._query(entity)
+        scope = self.source_scope(source_ids)
         chosen_hops = self.graph_hops if hops is None else hops
         if type(chosen_hops) is not int or not 0 <= chosen_hops <= 8:
             raise ValueError("图查询 hops 必须在 0 到 8 之间")
         revision = self.revision
-        walk = self._walk(self._seeds(entity), chosen_hops)
+        walk = self._walk(self._seeds(entity, source_ids=scope), chosen_hops, source_ids=scope)
         names = []
         for identifier, depth in walk.nodes.items():
             row = self.store.db.execute(
@@ -1266,7 +1380,7 @@ class Memory:
             "hops": chosen_hops,
             "truncated": walk.truncated,
             "revision": revision,
-            "alias_evidence": self._seed_evidence(entity, seeds),
+            "alias_evidence": self._seed_evidence(entity, seeds, source_ids=scope),
             "paths": [self._walk_path(edge["traversal"], walk.parents) for edge in walk.edges],
         }
 
@@ -1293,21 +1407,31 @@ class Memory:
         *,
         hops: int | None = None,
         layer: str | None = None,
+        source_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        return self._search_result(query, limit, hops=hops, layer=layer).items
+        return self._search_result(
+            query, limit, hops=hops, layer=layer, source_ids=source_ids
+        ).items
 
     def search_for_prompt(self, query: str, limit: int, *, hops: int | None = None) -> PromptSearch:
         return self._search_result(query, limit, hops=hops)
 
-    def _lexical_scores(self, tokens: Sequence[str], limit: int) -> dict[str, float]:
+    def _lexical_scores(
+        self,
+        tokens: Sequence[str],
+        limit: int,
+        *,
+        source_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, float]:
         if not tokens or limit <= 0:
             return {}
         rows = self.store.db.execute(
             "SELECT t.memory_id,count(*) hits FROM memory_terms t "
             "JOIN memory_meta m ON m.memory_id=t.memory_id "
-            f"WHERE m.status!='superseded' AND t.term IN ({_slots(tokens)}) "
+            f"WHERE m.status!='superseded' AND t.term IN ({_slots(tokens)})"
+            f"{self._scope_clause(source_ids)} "
             "GROUP BY t.memory_id ORDER BY hits DESC,t.memory_id LIMIT ?",
-            [*tokens, limit],
+            [*tokens, *(source_ids or ()), limit],
         ).fetchall()
         return {row["memory_id"]: 2 * row["hits"] / len(tokens) for row in rows}
 
@@ -1364,8 +1488,10 @@ class Memory:
         *,
         hops: int | None = None,
         layer: str | None = None,
+        source_ids: Sequence[str] | None = None,
     ) -> PromptSearch:
         self._query(query)
+        scope = self.source_scope(source_ids)
         if layer is not None and layer not in LAYERS:
             raise ValueError("未知记忆分层")
         limit = max(1, min(limit, self.max_candidates))
@@ -1376,16 +1502,17 @@ class Memory:
         if not query.strip():
             rows = self.store.db.execute(
                 "SELECT memory_id FROM memory_meta m JOIN memories i ON i.id=m.memory_id "
-                "WHERE m.status!='superseded' ORDER BY i.updated_at DESC LIMIT ?",
-                (self.max_candidates,),
+                f"WHERE m.status!='superseded'{self._scope_clause(scope)} "
+                "ORDER BY i.updated_at DESC LIMIT ?",
+                [*(scope or ()), self.max_candidates],
             ).fetchall()
             scores = {row[0]: 0.0 for row in rows}
             matched = dict.fromkeys(scores, "recent")
         elif tokens:
-            scores = self._lexical_scores(tokens, self.max_candidates)
+            scores = self._lexical_scores(tokens, self.max_candidates, source_ids=scope)
             matched = dict.fromkeys(scores, "lexical")
         if query.strip():
-            graph = self.traverse(query, hops=hops)
+            graph = self.traverse(query, hops=hops, source_ids=scope)
             seed_evidence = {entry["entity_id"]: entry for entry in graph["alias_evidence"]}
             for edge, path in zip(graph["edges"], graph["paths"], strict=True):
                 identifier = edge["memory_id"]
@@ -1403,6 +1530,53 @@ class Memory:
             tokens,
         )
 
+    def _community_projection(
+        self, walk: _Walk, *, source_ids: tuple[str, ...] | None = None
+    ) -> dict[str, Any] | None:
+        """Build one bounded community from current members without writing it."""
+        ordered = sorted(walk.nodes)
+        if not ordered:
+            return None
+        rows = self.store.db.execute(
+            "SELECT DISTINCT m.memory_id FROM memory_mentions mm "
+            "JOIN memory_meta m ON m.memory_id=mm.memory_id "
+            f"WHERE m.status!='superseded' AND mm.entity_id IN ({_slots(ordered)})"
+            f"{self._scope_clause(source_ids)} ORDER BY m.memory_id LIMIT ?",
+            [*ordered, *(source_ids or ()), 2 * self.max_community_members + 1],
+        ).fetchall()
+        items = [
+            item
+            for row in rows[: 2 * self.max_community_members]
+            if (item := self.get(row[0])) is not None
+        ]
+        if not items:
+            return None
+        entity_rows = self.store.db.execute(
+            f"SELECT name FROM memory_entities WHERE id IN ({_slots(ordered)}) ORDER BY canonical",
+            ordered,
+        ).fetchall()
+        names = [str(row[0]) for row in entity_rows]
+        identity = _json(
+            ordered if source_ids is None else {"nodes": ordered, "sources": source_ids}
+        )
+        identifier = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        if source_ids is not None:
+            identifier = "scoped:" + identifier
+        return {
+            "id": identifier,
+            "title": "、".join(names[:4]),
+            "summary": "\n".join(f"[{item['id']}] {item['content'][:180]}" for item in items),
+            "entities": names,
+            "evidence": [item["id"] for item in items],
+            "source_ids": sorted(
+                {item["source_id"] for item in items if item["source_id"] is not None}
+            ),
+            "truncated": walk.truncated or len(rows) > 2 * self.max_community_members,
+            "updated_at": now()
+            if source_ids is None
+            else max(item["updated_at"] for item in items),
+        }
+
     def _rebuild_communities(self, affected: set[str]) -> None:
         visited: set[str] = set()
         for seed in sorted(affected):
@@ -1413,7 +1587,6 @@ class Memory:
                 self.max_community_members,
                 node_limit=self.max_community_members,
             )
-            truncated = walk.truncated
             visited.update(walk.nodes)
             ordered = sorted(walk.nodes)
             if not ordered:
@@ -1423,46 +1596,26 @@ class Memory:
                 f"FROM memory_community_nodes WHERE entity_id IN ({_slots(ordered)}))",
                 ordered,
             )
-            rows = self.store.db.execute(
-                "SELECT DISTINCT m.memory_id FROM memory_mentions mm "
-                "JOIN memory_meta m ON m.memory_id=mm.memory_id "
-                f"WHERE m.status!='superseded' AND mm.entity_id IN ({_slots(ordered)}) "
-                "ORDER BY m.memory_id LIMIT ?",
-                [*ordered, 2 * self.max_community_members + 1],
-            ).fetchall()
-            truncated |= len(rows) > 2 * self.max_community_members
-            items = [
-                item
-                for row in rows[: 2 * self.max_community_members]
-                if (item := self.get(row[0])) is not None
-            ]
-            if not items:
+            community = self._community_projection(walk)
+            if community is None:
                 continue
-            entity_rows = self.store.db.execute(
-                f"SELECT name FROM memory_entities WHERE id IN ({_slots(ordered)}) ORDER BY canonical",
-                ordered,
-            ).fetchall()
-            names = [str(row[0]) for row in entity_rows]
-            identifier = hashlib.sha256(_json(ordered).encode("utf-8")).hexdigest()
-            evidence = [item["id"] for item in items]
-            sources = sorted({item["source_id"] for item in items if item["source_id"] is not None})
-            summary = "\n".join(f"[{item['id']}] {item['content'][:180]}" for item in items)
+            identifier = community["id"]
             self.store.db.execute(
                 "INSERT INTO memory_communities VALUES(?,?,?,?,?,?,?,?)",
                 (
                     identifier,
-                    "、".join(names[:4]),
-                    summary,
-                    _json(names),
-                    _json(evidence),
-                    _json(sources),
-                    int(truncated),
-                    now(),
+                    community["title"],
+                    community["summary"],
+                    _json(community["entities"]),
+                    _json(community["evidence"]),
+                    _json(community["source_ids"]),
+                    int(community["truncated"]),
+                    community["updated_at"],
                 ),
             )
             self.store.db.executemany(
                 "INSERT INTO memory_community_members VALUES(?,?)",
-                ((identifier, item) for item in evidence),
+                ((identifier, item) for item in community["evidence"]),
             )
             self.store.db.executemany(
                 "INSERT INTO memory_community_nodes VALUES(?,?)",
@@ -1496,10 +1649,19 @@ class Memory:
         item["truncated"] = bool(item["truncated"])
         return item
 
-    def communities_for(self, identifiers: Sequence[str], limit: int = 4) -> list[dict[str, Any]]:
+    def communities_for(
+        self,
+        identifiers: Sequence[str],
+        limit: int = 4,
+        *,
+        source_ids: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        scope = self.source_scope(source_ids)
         chosen = list(dict.fromkeys(identifiers))[: self.max_candidates]
         if not chosen:
             return []
+        if scope is not None:
+            return self._scoped_communities(chosen, scope, max(1, limit))
         rows = self.store.db.execute(
             "SELECT DISTINCT c.* FROM memory_communities c JOIN memory_community_members m "
             f"ON m.community_id=c.id WHERE m.memory_id IN ({_slots(chosen)}) "
@@ -1507,6 +1669,37 @@ class Memory:
             [*chosen, max(1, limit)],
         ).fetchall()
         return [self._community(dict(row)) for row in rows]
+
+    def _scoped_communities(
+        self, identifiers: Sequence[str], source_ids: tuple[str, ...], limit: int
+    ) -> list[dict[str, Any]]:
+        rows = self.store.db.execute(
+            "SELECT DISTINCT mm.entity_id FROM memory_mentions mm "
+            "JOIN memory_meta m ON m.memory_id=mm.memory_id "
+            f"WHERE mm.memory_id IN ({_slots(identifiers)}) AND m.status!='superseded'"
+            f"{self._scope_clause(source_ids)} ORDER BY mm.entity_id LIMIT ?",
+            [*identifiers, *source_ids, self.max_candidates + 1],
+        ).fetchall()
+        visited: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for row in rows[: self.max_candidates]:
+            seed = row["entity_id"]
+            if seed in visited:
+                continue
+            walk = self._walk(
+                {seed},
+                self.max_community_members,
+                node_limit=self.max_community_members,
+                source_ids=source_ids,
+            )
+            walk.truncated |= len(rows) > self.max_candidates
+            visited.update(walk.nodes)
+            community = self._community_projection(walk, source_ids=source_ids)
+            if community is not None:
+                result.append(community)
+                if len(result) >= limit:
+                    break
+        return result
 
     @staticmethod
     def _vector(vector: Sequence[float]) -> tuple[list[float], float]:
@@ -1550,12 +1743,13 @@ class Memory:
             self._bump()
         return True
 
-    def vector_count(self, model_key: str) -> int:
+    def vector_count(self, model_key: str, *, source_ids: Sequence[str] | None = None) -> int:
+        scope = self.source_scope(source_ids)
         return int(
             self.store.db.execute(
                 "SELECT count(*) FROM memory_vectors v JOIN memory_meta m ON m.memory_id=v.memory_id "
-                "WHERE v.model_key=? AND m.status!='superseded'",
-                (model_key,),
+                f"WHERE v.model_key=? AND m.status!='superseded'{self._scope_clause(scope)}",
+                [model_key, *(scope or ())],
             ).fetchone()[0]
         )
 
@@ -1564,14 +1758,18 @@ class Memory:
         vector: Sequence[float],
         model_key: str,
         limit: int = 20,
+        *,
+        source_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
+        scope = self.source_scope(source_ids)
         values, norm = self._vector(vector)
         limit = max(1, min(limit, self.max_candidates))
         cursor = self.store.db.execute(
             "SELECT v.* FROM memory_vectors v JOIN memory_meta m ON m.memory_id=v.memory_id "
             "JOIN memories i ON i.id=v.memory_id WHERE v.model_key=? AND v.dimensions=? "
-            "AND m.status!='superseded' ORDER BY i.updated_at DESC,v.memory_id LIMIT ?",
-            (model_key, len(values), self.max_vector_scan),
+            f"AND m.status!='superseded'{self._scope_clause(scope)} "
+            "ORDER BY i.updated_at DESC,v.memory_id LIMIT ?",
+            [model_key, len(values), *(scope or ()), self.max_vector_scan],
         )
         best: list[tuple[float, str]] = []
         for row in cursor:

@@ -36,6 +36,8 @@ def query_result(result: dict[str, Any], *, max_output_chars: int) -> dict[str, 
         "truncated": False,
         "omitted": omitted,
     }
+    if "source_ids" in result:
+        page["source_ids"] = list(result["source_ids"])
     if json_size(page) > max_output_chars:
         raise EvidenceError("output_budget", "记忆查询定位元数据超过输出预算")
     # Reserve the longer false spelling throughout. Metadata, including counts,
