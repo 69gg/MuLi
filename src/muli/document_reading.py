@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from muli.attachment_io import read_verified_window
@@ -23,6 +24,31 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentView:
+    content: bytes
+    source_revision: str
+    revision: str
+    format: str
+    scope: str
+
+    def metadata(self) -> dict[str, str]:
+        return {
+            "format": self.format,
+            "scope": self.scope,
+            "source_revision": self.source_revision,
+            "revision": self.revision,
+        }
+
+
+def document_revision(source_revision: str, content: bytes) -> str:
+    digest = hashlib.sha256(
+        b"muli-document-text-v1\x00" + source_revision.encode("ascii") + b"\x00"
+    )
+    digest.update(content)
+    return digest.hexdigest()
+
+
 async def read_document(
     attachments: Attachments,
     identifier: str,
@@ -31,11 +57,27 @@ async def read_document(
     offset_bytes: int = 0,
 ) -> dict[str, Any]:
     validate_integer(offset_bytes, "offset_bytes")
-    if (offset_bytes and revision is None) or (
-        revision is not None
-        and (not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{64}", revision) is None)
-    ):
+    if offset_bytes and revision is None:
         raise EvidenceError("invalid_arguments", "续读文档必须携带上一页的 revision")
+    view = await document_view(attachments, identifier, revision=revision)
+    current_limit = attachments.config.settings.limits.max_output_chars
+    return content_page(
+        {"id": identifier, **view.metadata()},
+        view.content[offset_bytes : offset_bytes + current_limit * 4],
+        offset_bytes=offset_bytes,
+        total_bytes=len(view.content),
+        max_output_chars=current_limit,
+    )
+
+
+async def document_view(
+    attachments: Attachments, identifier: str, *, revision: str | None = None
+) -> DocumentView:
+    """Verify and extract one complete snapshot shared by reading and collection."""
+    if revision is not None and (
+        not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{64}", revision) is None
+    ):
+        raise EvidenceError("invalid_arguments", "文档 revision 必须是完整的 SHA-256 摘要")
     item = attachments.get(identifier)
     source_revision, size = item.get("sha256"), item.get("size")
     settings = attachments.config.settings
@@ -104,27 +146,10 @@ async def read_document(
         raise EvidenceError("document_budget", "文档提取正文超过限制，未返回节选")
     if b"\x00" in extracted:
         raise EvidenceError("document_encoding", "提取正文包含无效文本，未返回替代字符")
-    digest = hashlib.sha256(
-        b"muli-document-text-v1\x00" + source_revision.encode("ascii") + b"\x00"
-    )
-    digest.update(extracted)
-    current_revision = digest.hexdigest()
+    current_revision = document_revision(source_revision, extracted)
     if revision is not None and revision != current_revision:
         raise EvidenceError("revision_changed", "文档或提取结果版本已变化，请重新读取首页")
-    current_limit = attachments.config.settings.limits.max_output_chars
-    return content_page(
-        {
-            "id": identifier,
-            "format": format_name,
-            "scope": scope,
-            "source_revision": source_revision,
-            "revision": current_revision,
-        },
-        extracted[offset_bytes : offset_bytes + current_limit * 4],
-        offset_bytes=offset_bytes,
-        total_bytes=len(extracted),
-        max_output_chars=current_limit,
-    )
+    return DocumentView(extracted, source_revision, current_revision, format_name, scope)
 
 
 async def _read_pdf(source: bytes, settings: DocumentSettings, deadline: float) -> bytes:

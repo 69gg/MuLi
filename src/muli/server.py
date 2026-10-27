@@ -231,7 +231,10 @@ def _create_app(
     local_services = LocalServices(runtime, attachments)
     web_voice = WebVoiceInput(local_services)
     memory_application = MemoryApplication(
-        runtime, local_services.media, attachment_reader=local_services.memory_attachment
+        runtime,
+        local_services.media,
+        attachment_reader=local_services.memory_attachment,
+        document_reader=local_services.memory_document,
     )
     channel_application = ChannelApplication(runtime, attachments)
     personal_io = PersonalIO(runtime, local_services, attachments)

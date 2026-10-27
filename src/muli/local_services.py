@@ -21,7 +21,7 @@ from muli.attachments import (
 )
 from muli.channels.types import NAMES
 from muli.commitments import Commitments
-from muli.document_reading import read_document
+from muli.document_reading import DocumentView, document_view, read_document
 from muli.document_settings import DocumentSettings, DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size
 from muli.media import MediaConfig, MediaService, ServiceConfig
@@ -175,8 +175,7 @@ class LocalServices:
             raise ValueError("附件超过此能力的读取上限")
         return item, data
 
-    async def memory_attachment(self, identifier: str) -> tuple[dict[str, Any], str]:
-        """Read one complete external text snapshot, never a tool-output preview."""
+    def _memory_attachment_item(self, identifier: str) -> dict[str, Any]:
         if (
             not isinstance(identifier, str)
             or re.fullmatch(ATTACHMENT_ID_PATTERN, identifier) is None
@@ -205,6 +204,12 @@ class LocalServices:
                 raise ValueError("附件登记时间无法核查")
         except OverflowError as error:
             raise ValueError("附件登记时间无法核查") from error
+        return item
+
+    async def memory_attachment(self, identifier: str) -> tuple[dict[str, Any], str]:
+        """Read one complete external text snapshot, never a tool-output preview."""
+        item = self._memory_attachment_item(identifier)
+        settings = self.runtime.config.settings
         limit = min(
             settings.limits.max_file_bytes,
             settings.uploads.max_file_bytes,
@@ -228,6 +233,8 @@ class LocalServices:
             )
         ):
             raise ValueError("附件内容、元数据或读取限额已变化，未收藏")
+        if data.startswith((b"%PDF-", b"PK\x03\x04")):
+            raise ValueError("PDF、DOCX 请先 document_read，再携带 revision 收藏提取正文")
         try:
             content = data.decode("utf-8", errors="strict")
         except UnicodeError as error:
@@ -239,6 +246,31 @@ class LocalServices:
         ):
             raise ValueError("附件为空、含二进制数据或超过完整来源上限，未收藏节选")
         return item, content
+
+    async def memory_document(
+        self, identifier: str, revision: str
+    ) -> tuple[dict[str, Any], DocumentView]:
+        """Collect only the complete verified version explicitly read by the caller."""
+        item = self._memory_attachment_item(identifier)
+        settings = self.runtime.config.settings
+        if item["size"] > min(settings.limits.max_file_bytes, settings.uploads.max_file_bytes):
+            raise ValueError("文档超过当前文件读取上限，未收藏")
+        view = await document_view(self.attachments, identifier, revision=revision)
+        settings = self.runtime.config.settings
+        if (
+            self._memory_attachment_item(identifier) != item
+            or view.source_revision != item["sha256"]
+            or item["size"] > min(settings.limits.max_file_bytes, settings.uploads.max_file_bytes)
+        ):
+            raise ValueError("文档内容、来源或读取限额已变化，未收藏")
+        content = view.content.decode("utf-8", errors="strict")
+        if (
+            not content.strip()
+            or "\x00" in content
+            or len(content) > settings.memory.max_source_chars
+        ):
+            raise ValueError("文档正文为空、无效或超过完整来源上限，未收藏节选")
+        return item, view
 
     def delivery_tools(self, runtime: Runtime) -> list[Tool]:
         identifier = runtime.tool_session_id
