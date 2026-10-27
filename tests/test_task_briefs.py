@@ -462,15 +462,13 @@ async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path
         "长任务", brief={"goal": "继续核查项目", "constraints": [marker]}
     )
     session = bind(runtime, item["id"])
+    runtime.store.add_message(session["id"], "assistant", "准备接收完整项目资料")
     source = runtime.store.add_message(session["id"], "user", "头" * 5000 + marker + "尾" * 5000)
     runtime.store.add_message(session["id"], "assistant", "先检查")
     runtime.store.add_message(session["id"], "user", "继续")
     try:
-        records = runtime.store.messages(session["id"])
-        await runtime.compaction._prepare(
-            session["id"], records[:2], {}, runtime._compaction_fingerprint()
-        )
-        assert runtime.compaction.adopt(session["id"])
+        runtime.compaction.observe(session["id"])
+        await asyncio.wait_for(runtime.compaction.finish(session["id"]), 2)
         active = runtime.store.get("compaction", session["id"])
         assert active is not None and marker not in active["summary"]
         messages = await runtime._next_context(session["id"])

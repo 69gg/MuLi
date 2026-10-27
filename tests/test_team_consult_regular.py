@@ -11,7 +11,6 @@ from typing import Any, NoReturn
 import httpx
 import pytest
 from test_runtime import FakeClient, make_runtime
-from test_task_briefs import attach_services
 from test_teammate_attachment_runtime import call, tool_result
 
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
@@ -330,7 +329,7 @@ async def test_regular_worker_consults_its_real_main_without_a_channel(
         await runtime.close()
 
 
-@pytest.mark.parametrize("kind", ["reviewer", "grandchild", "commitment", "workflow"])
+@pytest.mark.parametrize("kind", ["reviewer", "grandchild", "workflow"])
 async def test_consult_entry_remains_absent_in_other_real_execution_kinds(
     tmp_path: Path, kind: str
 ) -> None:
@@ -373,25 +372,17 @@ async def test_consult_entry_remains_absent_in_other_real_execution_kinds(
             assert finished["status"] == "completed"
         else:
             parent_id = main_id
-            commitment_id: str | None = None
             if kind == "grandchild":
                 parent = await runtime.team.spawn("直属父队友", "完成父任务", parent_id=main_id)
                 await until(
                     runtime, lambda: runtime.team.get(parent["id"])["status"] == "completed"
                 )
                 parent_id = parent["id"]
-            elif kind == "commitment":
-                services = attach_services(runtime, tmp_path)
-                commitment = await services.commitments.save(
-                    "有范围的任务", brief={"goal": "只读核查资料", "constraints": ["不得写入"]}
-                )
-                commitment_id = commitment["id"]
             agent = await runtime.team.spawn(
                 "入口对照队友",
                 "按当前真实执行边界完成核查",
                 parent_id=parent_id,
                 role="reviewer" if kind == "reviewer" else "worker",
-                commitment_id=commitment_id,
             )
             target = agent["id"]
             await until(runtime, lambda: runtime.team.get(target)["status"] == "completed")
@@ -401,8 +392,6 @@ async def test_consult_entry_remains_absent_in_other_real_execution_kinds(
                 assert actual["role"] == "reviewer"
             elif kind == "grandchild":
                 assert actual["parent_id"] != main_id
-            else:
-                assert actual["commitment_id"] == commitment_id
         assert target in observed
         assert "team_consult" not in observed[target]
     finally:

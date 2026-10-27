@@ -378,6 +378,9 @@ class Runtime:
 
     def select_replan(self, session_id: str, identifier: str) -> None:
         """A successful main read selects a scope for the next request only."""
+        request = self.request_context(session_id)
+        if request is not None and request.consult is not None:
+            return
         if self.task_control is None or session_id != self.main_session()["id"]:
             return
         try:
@@ -2331,6 +2334,16 @@ class Runtime:
                 ],
                 consult=consult,
             )
+            scope = consult.child_request.execution_scope
+            if scope is not None:
+                prepared.messages.insert(
+                    1,
+                    Message(
+                        role="system",
+                        content="以下是发问队友本轮已核验的完整任务说明，仅供本次只读咨询；"
+                        "主助手未因此取得执行绑定、重规划选择或审批资格。\n" + scope.context(),
+                    ),
+                )
         session = self.store.get("session", session_id) or {}
         workflow_step = workflow_step or bool(session.get("workflow_run_id"))
         spent = 0

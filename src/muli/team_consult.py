@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from muli.store import new_id, now
+from muli.task_control import TaskPaused
 
 if TYPE_CHECKING:
     from muli.runtime import PreparedRequest
@@ -55,7 +56,6 @@ class TeamConsult:
             agent
             and agent.get("parent_id") == runtime.store.existing_main_session_id()
             and agent.get("role") == "worker"
-            and agent.get("commitment_id") is None
             and agent.get("status") == "running"
             and agent.get("run_id") == run_id
             and agent.get("generation") == generation
@@ -94,7 +94,6 @@ class TeamConsult:
             or agent.get("parent_id") != request.main_id
             or agent.get("session_id") != request.child_id
             or agent.get("role") != "worker"
-            or agent.get("commitment_id") is not None
             or agent.get("status") != "running"
             or agent.get("run_id") != request.child_run_id
             or type(agent.get("generation")) is not int
@@ -106,12 +105,27 @@ class TeamConsult:
             or session is None
             or session.get("workflow_run_id")
             or request.child_request.consult is not None
-            or request.child_request.execution_scope is not None
             or request.child_request.selected_replan is not None
             or runtime.store.pending_inputs(request.child_id)
         ):
             raise PermissionError("咨询所属队友执行已改变或收到新输入")
         runtime._guard_request(request.child_request, "read")
+        scope = request.child_request.execution_scope
+        if scope is not None:
+            control = runtime.task_control
+            if control is None:
+                raise PermissionError("咨询所依的任务控制服务已不可用")
+            # Advice belongs to the original active plan. Ordinary read tools
+            # remain usable while paused; consultation cannot revive that plan.
+            try:
+                control.guard_execution(scope, session_id=request.child_id, risk="write")
+            except TaskPaused as error:
+                raise PermissionError("咨询所依的任务已暂停或执行版本已改变") from error
+            current = control.execution_snapshot(request.child_id)
+            if current is None or replace(current, revision=scope.revision) != scope:
+                raise PermissionError("咨询所依的任务说明或方案已改变")
+        elif agent.get("commitment_id") is not None:
+            raise PermissionError("绑定任务的咨询缺少原执行范围快照")
         proof = runtime.channel_ownership.current_proof(request.child_id, request.child_run_id)
         if proof != request.proof or request.child_request.channel_ownership != request.proof:
             raise PermissionError("咨询不再属于原运行实际接纳的渠道输入")
