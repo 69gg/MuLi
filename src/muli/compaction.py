@@ -194,10 +194,35 @@ class Compactor:
         groups = closed_groups(records)
         if len(groups) < 3:
             return
+        # A live input can follow a completed batch before its first model read.
+        # Keep that entire batch and its following inputs out of the summary;
+        # foreground pressure must not bypass complete-result preservation.
+        boundary = len(groups) - 1
+        while (
+            boundary >= 0
+            and len(groups[boundary]) == 1
+            and groups[boundary][0]["role"] in {"user", "system", "developer"}
+        ):
+            boundary -= 1
+        pending_result = boundary >= 0 and any(
+            item["role"] == "tool" and item.get("preserve_content") is True
+            for item in groups[boundary]
+        )
+        if pending_result:
+            # The bounded prefix may end before a later consuming assistant.
+            # Read only its durable sequence, never load the omitted bodies.
+            latest = self.store.db.execute(
+                "SELECT m.seq FROM message_order m JOIN objects o "
+                "ON o.kind='message' AND o.id=m.message_id WHERE m.session_id=? "
+                "AND json_extract(o.data,'$.role')='assistant' ORDER BY m.seq DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            pending_result = latest is not None and latest[0] == groups[boundary][0]["seq"]
+        available = groups[:boundary] if pending_result else groups[:-1]
         selected: list[dict[str, Any]] = []
         target = self.max_chars() * (1 - self.settings().target_ratio)
         size = 0
-        for group in groups[:-1]:
+        for group in available:
             selected.extend(group)
             size += sum(message_text_size(item) for item in group)
             if size >= target:

@@ -106,8 +106,9 @@ def _older_turns(messages: Sequence[Message]) -> list[list[Message]]:
 def _preserved_results(messages: Sequence[Message]) -> set[int]:
     """Protect host-marked results only until their immediate next model request."""
     index = len(messages) - 1
-    # Extension hooks may append fixed context after a completed tool batch.
-    while index >= 0 and messages[index].role in _PINNED_ROLES:
+    # New input is inserted at the tool boundary, before the model has read its
+    # results. Only a subsequent assistant response consumes this batch.
+    while index >= 0 and messages[index].role in _PINNED_ROLES | {"user"}:
         index -= 1
     preserved: set[int] = set()
     while index >= 0 and messages[index].role == "tool":
@@ -124,7 +125,7 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
     不补齐、不执行工具；调用方须先为中断且结果未知的调用补明确的未知结果。
     最新用户输入、系统提示、工具参数、思考和 provider_data 均不截断。
     最新完整工具批次中的宿主 preserve_content 标记同样保留完整正文；
-    新回答、输入或工具批次后，旧标记不再阻止正常节选。
+    新输入不消耗待读回执；新回答或工具批次后，旧标记才允许正常节选。
     """
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError("上下文字符预算必须是正整数")
@@ -150,7 +151,10 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
             if current_size <= max_chars:
                 break
     if current_size > max_chars:
+        protected = {id(packed[index]) for index in preserved}
         for turn in _older_turns(packed):
+            if any(id(message) in protected for message in turn):
+                continue
             removed = {id(message) for message in turn}
             packed = [message for message in packed if id(message) not in removed]
             # 列表元素之间的默认 JSON 分隔符是两个字符；最后一轮始终保留。
