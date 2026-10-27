@@ -21,6 +21,8 @@
 
 结果中的目录项提供附件 ID、名称、来源、类型、大小、摘要和下载入口，不直接提供文件正文。选中后再按资料类型读取。
 
+PDF 和 DOCX 可用 `document_read` 继续读取提取正文，范围与配置见[文档阅读](document-reading.md)。
+
 ## 找回转写和视觉解释
 
 **录音转写：** 按 `source="asr"`、`name_query="原音频ID"` 查找。取得工件 ID 与 `sha256` 后，用 `audio_transcript_read` 读取已保存的转写，并按回包继续翻页，不需要再次调用 ASR。

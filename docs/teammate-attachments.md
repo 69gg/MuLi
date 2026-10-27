@@ -40,6 +40,7 @@
 | 资料 | 读取方式 |
 | --- | --- |
 | UTF-8 文本附件 | `attachment_read`；长文显式 `offset_bytes=0` 读取首页，再按返回版本和字节位置续读 |
+| PDF / DOCX | `document_read` 按版本继续读取提取正文；PDF 需要已有本地转换器，见[文档阅读](document-reading.md) |
 | 图片 | `image_describe`，需要可用的视觉配置 |
 | 音频 | `audio_transcribe`，需要 ASR 服务 |
 | 已保存的长转写 | 用返回的 `transcript_id` 和续读信息调用 `audio_transcript_read` |
