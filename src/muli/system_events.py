@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from muli import __version__
 from muli.events import EventBus
 from muli.file_inbox import FileInboxProof, FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState, read_message
@@ -26,6 +27,7 @@ from muli.proactive import FrozenRouting
 from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id
+from muli.update_evidence import update_notice_available
 
 LogLevel = Literal["warning", "error", "critical"]
 _LEVELS = {"warning": logging.WARNING, "error": logging.ERROR, "critical": logging.CRITICAL}
@@ -648,6 +650,7 @@ def _notification_source(
             "producer",
             "followup",
             "followup_occurrence",
+            "update_evidence",
         )
     ):
         return None
@@ -680,10 +683,9 @@ def _notification_source(
     else:
         update = store.get("update", "latest")
         if (
-            update is None
-            or update.get("available") is not True
-            or update.get("status") != "checked"
-            or identifier != "update-" + str(update.get("latest", ""))
+            ("update_evidence" in notice) != ("update_evidence" in data)
+            or not update_notice_available(notice, update, __version__)
+            or not update_notice_available(data, update, __version__)
             or (
                 routing.classification == "independent"
                 and notice.get("producer") != "startup_update_check"
