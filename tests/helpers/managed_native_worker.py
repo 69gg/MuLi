@@ -3956,6 +3956,29 @@ class Case:
             raise NativeError("native_managed_record_required")
         return record
 
+    async def observed_record(self, journal: TransactionJournal) -> TransactionRecordV2 | None:
+        """Defer an unaccepted read after atomic publication, within the same deadline."""
+        from muli.management_transaction import TransactionError
+
+        remaining(self.deadline)
+        try:
+            return self.record(journal)
+        except TransactionError as error:
+            if error.code != "file_changed":
+                if error.code in {
+                    "file_budget",
+                    "file_not_private_regular",
+                    "invalid_record",
+                    "directory_changed",
+                }:
+                    self.note("record_read_failed", state=error.code)
+                raise
+            # No record or side effect was accepted. Keep all file validation
+            # and let the original loop acquire a fresh complete snapshot.
+            self.note("record_read_deferred", state="file_changed")
+            await self.pause()
+            return None
+
     def deployment(
         self, journal: TransactionJournal, record: TransactionRecordV2
     ) -> tuple[DeploymentAnchor, SlotIdentity, dict[Role, SlotIdentity]]:
@@ -4227,7 +4250,9 @@ class Case:
                 ):
                     journal = self.journal()
                 if journal is not None:
-                    record = self.record(journal)
+                    record = await self.observed_record(journal)
+                    if record is None:
+                        continue
                     if record.request_id == request_id:
                         name = managed_helper_unit_name(record)
                         history = self.result["generations"]
