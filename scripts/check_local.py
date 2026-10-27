@@ -13,11 +13,12 @@ from pathlib import Path
 
 # Operator policy: shared across repositories/worktrees, not multiplied per agent.
 SLICE = "muli-checks.slice"
-MEMORY_BYTES = 1024**3
-SHARED_MEMORY_BYTES = 2 * MEMORY_BYTES
-TASKS = 128
+MEMORY_BYTES = 768 * 1024**2
+SHARED_MEMORY_BYTES = 1024**3
+CPU_PERCENT = 50
+TASKS = 96
 MAX_SECONDS = 180
-NODE_HEAP_MB = 256
+NODE_HEAP_MB = 192
 NODE_TEST_TIMEOUT_MS = 15000
 MANAGER_TIMEOUT = 10
 BACKEND_BATCH_FILES = 32
@@ -39,8 +40,8 @@ def verify_group(path: Path, memory: int, *, service: bool = False) -> None:
         if value == "max" or int(value) > maximum:
             raise RuntimeError(f"Resource limit not enforced: {name}={value}")
     quota, period = (path / "cpu.max").read_text().split()
-    if quota == "max" or int(quota) > int(period):
-        raise RuntimeError("CPU quota exceeds one CPU")
+    if quota == "max" or int(quota) * 100 > int(period) * CPU_PERCENT:
+        raise RuntimeError(f"CPU quota exceeds {CPU_PERCENT}% of one CPU")
     if service and (path / "memory.oom.group").read_text().strip() != "1":
         raise RuntimeError("Whole-service OOM cleanup is not enabled")
 
@@ -199,7 +200,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
         SLICE,
         f"MemoryMax={SHARED_MEMORY_BYTES}",
         "MemorySwapMax=0",
-        "CPUQuota=100%",
+        f"CPUQuota={CPU_PERCENT}%",
         f"TasksMax={TASKS}",
     )
     manager("start", SLICE)
@@ -207,7 +208,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
     properties = {
         "MemoryMax": str(MEMORY_BYTES),
         "MemorySwapMax": "0",
-        "CPUQuota": "100%",
+        "CPUQuota": f"{CPU_PERCENT}%",
         "TasksMax": str(TASKS),
         "OOMPolicy": "kill",
         "KillMode": "control-group",
@@ -257,7 +258,12 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
         "--",
         *command,
     ]
-    print(f"{unit}: 1 GiB / shared 2 GiB, swap 0, shared 1 CPU, {seconds}s", flush=True)
+    print(
+        f"{unit}: {MEMORY_BYTES // 1024**2} MiB / "
+        f"shared {SHARED_MEMORY_BYTES // 1024**2} MiB, swap 0, "
+        f"shared CPU {CPU_PERCENT}%, {seconds}s",
+        flush=True,
+    )
     previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
 
     def interrupted(signum: int, frame: object) -> None:

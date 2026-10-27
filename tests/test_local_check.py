@@ -26,10 +26,10 @@ def checker() -> ModuleType:
 @pytest.fixture
 def group(tmp_path: Path) -> Path:
     for name, value in {
-        "memory.max": str(1024**3),
+        "memory.max": str(768 * 1024**2),
         "memory.swap.max": "0",
-        "pids.max": "128",
-        "cpu.max": "100000 100000",
+        "pids.max": "96",
+        "cpu.max": "50000 100000",
         "memory.oom.group": "1",
     }.items():
         (tmp_path / name).write_text(value)
@@ -41,11 +41,13 @@ def group(tmp_path: Path) -> Path:
     [
         ("memory.max", "max"),
         ("memory.max", str(2 * 1024**3)),
+        ("memory.max", str(1024**3)),
         ("memory.swap.max", "1"),
         ("pids.max", "max"),
-        ("pids.max", "129"),
+        ("pids.max", "97"),
         ("cpu.max", "max 100000"),
         ("cpu.max", "100001 100000"),
+        ("cpu.max", "50001 100000"),
         ("memory.oom.group", "0"),
     ],
 )
@@ -119,7 +121,10 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
     def cancelled(command: list[str], **kwargs: Any) -> None:
         assert "--slice=muli-checks.slice" in command
         assert "--setenv=UV_OFFLINE=1" in command
-        assert "--setenv=NODE_OPTIONS=--max-old-space-size=256" in command
+        assert "--setenv=NODE_OPTIONS=--max-old-space-size=192" in command
+        assert "--property=MemoryMax=805306368" in command
+        assert "--property=CPUQuota=50%" in command
+        assert "--property=TasksMax=96" in command
         assert "--setenv=UV_CACHE_DIR=/existing-uv-cache" in command
         assert "--setenv=UV_PYTHON_DOWNLOADS=never" in command
         assert all("PRIVATE_TEST_TOKEN" not in argument for argument in command)
@@ -141,6 +146,9 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
     assert checker.run(["/tools/python", "-V"], 1) == (124 if cleaned else 125)
     assert len(stopped) == 1 and stopped[0].endswith(".service")
     assert calls[0][2] == checker.SLICE
+    assert "MemoryMax=1073741824" in calls[0]
+    assert "CPUQuota=50%" in calls[0]
+    assert "TasksMax=96" in calls[0]
     assert all("stop" not in call for call in calls)
 
 

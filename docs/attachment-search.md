@@ -27,9 +27,15 @@
 
 **视觉解释：** 只有看图时显式使用 `image_describe(..., archive=true)` 才会存档。可以按 `source="vision"`、`name_query="原图ID"` 找回，用工件 ID 与摘要调用 `attachment_read`，继续读取原提问、解释及原图版本，不再次调用视觉。
 
-视觉解释用 `attachment_read` 的 `revision` 和 `offset_bytes` 续读；转写使用 `audio_transcript_read`。普通附件不能借这两个视觉分页参数分段读取。
+视觉解释用 `attachment_read` 的 `revision` 和 `offset_bytes` 续读；转写使用 `audio_transcript_read`。
 
 历史视觉解释即使仍可读，也不证明原图现在存在或没有改变；解释本身仍是模型资料，不是主人确认的事实。
+
+## 继续阅读长文本
+
+普通 UTF-8 文本使用 `attachment_read(id, offset_bytes=0)` 取得带版本的首页。后续回传同一 `id`、返回的 `revision`，并把 `next_offset_bytes` 作为下一次的 `offset_bytes`；直到 `has_more=false` 才读完。位置按 UTF-8 字节计算，不是字符数，不能自行加减。也可以用目录摘要作为 `revision` 从首页读取。
+
+不传分页参数时仍返回原有的 `id/content/truncated` 预览；`truncated=true` 表示只看到了部分正文，可重新显式读取首页。分页不会绕过文本读取上限：每页都会核验整个文件的版本、UTF-8 编码及二进制标记，正文和定位信息一同计入输出预算。版本变化、文件不可用或校验失败时会明确报错；不要把错误当成 EOF，也不要把不同版本的页拼接起来。
 
 ## 游标和有界行为
 

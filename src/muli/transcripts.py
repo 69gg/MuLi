@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import os
 import re
-import stat
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any, Literal
 
+from muli.attachment_io import read_verified_window
 from muli.attachments import Attachments, file_io
 from muli.evidence import EvidenceError, content_page, validate_integer
 
@@ -31,10 +29,6 @@ async def _owned[T](operation: Coroutine[Any, Any, T]) -> T:
         if not task.cancelled():
             task.exception()
         raise
-
-
-def _version(info: os.stat_result) -> tuple[int, int, int, int, int]:
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
 async def _read_verified_artifact(
@@ -72,41 +66,15 @@ async def _read_verified_artifact(
     window = attachments.config.settings.limits.max_output_chars * 4
 
     def read_page() -> bytes:
-        before = path.lstat()
-        if not stat.S_ISREG(before.st_mode):
-            raise EvidenceError(f"{prefix}_changed", f"{label}工件已变化")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+        return read_verified_window(
+            path,
+            expected=expected,
+            size=size,
+            offset_bytes=offset_bytes,
+            window=window,
+            prefix=prefix,
+            label=label,
         )
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as handle:
-            opened = os.fstat(handle.fileno())
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_size != size
-                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
-            ):
-                raise EvidenceError(f"{prefix}_changed", f"{label}工件已变化")
-            digest = hashlib.sha256()
-            remaining = size
-            while remaining:
-                chunk = handle.read(min(65536, remaining))
-                if not chunk:
-                    raise EvidenceError(f"{prefix}_changed", f"{label}工件已变化")
-                digest.update(chunk)
-                remaining -= len(chunk)
-            if handle.read(1) or digest.hexdigest() != expected:
-                raise EvidenceError(f"{prefix}_changed", f"{label}工件摘要不匹配")
-            handle.seek(offset_bytes)
-            raw = handle.read(min(window, size - offset_bytes))
-            if _version(opened) != _version(os.fstat(handle.fileno())):
-                raise EvidenceError(f"{prefix}_changed", f"{label}读取期间已变化")
-        if _version(before) != _version(path.lstat()):
-            raise EvidenceError(f"{prefix}_changed", f"{label}路径已变化")
-        return raw
 
     try:
         raw = await _owned(file_io(read_page))

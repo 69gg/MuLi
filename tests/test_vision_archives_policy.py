@@ -457,8 +457,13 @@ async def test_utf8_revision_pages_and_existing_attachment_sources_remain_separa
             "truncated": False,
         }
         for arguments in ({"offset_bytes": 0}, {"revision": item["sha256"]}):
-            with pytest.raises(ValueError):
-                await host.call("attachment_read", id=item["id"], **arguments)
+            if source == "asr":
+                with pytest.raises(ValueError):
+                    await host.call("attachment_read", id=item["id"], **arguments)
+            else:
+                page = await host.call("attachment_read", id=item["id"], **arguments)
+                assert page["content"] == "短文本🙂" and page["revision"] == item["sha256"]
+                assert not page["has_more"]
         if source == "asr":
             transcript = await host.call(
                 "audio_transcript_read", id=item["id"], revision=item["sha256"]
