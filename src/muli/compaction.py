@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -101,6 +101,8 @@ class Compactor:
         self._attempted: dict[str, tuple[int, int, str]] = {}
         self._capacity = asyncio.Semaphore(1)
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._forget_tasks: dict[str, asyncio.Task[None]] = {}
 
     def status(self, session_id: str) -> dict[str, Any]:
         active = self.store.get("compaction", session_id) or {}
@@ -115,10 +117,16 @@ class Compactor:
 
     @property
     def idle(self) -> bool:
-        return not self._tasks
+        return (
+            not self._tasks
+            and not self._forget_tasks
+            and (self._close_task is None or self._close_task.done())
+        )
 
     async def finish(self, session_id: str) -> bool:
         """One foreground-pressure fallback; ordinary turns never await summaries."""
+        if self._closed or session_id in self._forget_tasks:
+            return False
         task = self._tasks.get(session_id)
         if task is not None:
             await asyncio.shield(task)
@@ -162,6 +170,7 @@ class Compactor:
             or not self.settings().enabled
             or session_id in self._tasks
             or session_id in self._ready
+            or session_id in self._forget_tasks
         ):
             return
         if len(self._tasks) + len(self._ready) >= self.max_jobs():
@@ -208,12 +217,17 @@ class Compactor:
         task.add_done_callback(lambda completed: self._done(session_id, completed))
 
     def _done(self, session_id: str, task: asyncio.Task[None]) -> None:
-        if self._tasks.get(session_id) is task:
+        owned = self._tasks.get(session_id) is task
+        if owned:
             self._tasks.pop(session_id, None)
         if not task.cancelled():
             task.exception()
+        if not owned:
+            return
         if session_id not in self._ready:
             self._attempted.pop(session_id, None)
+        if self._closed or session_id in self._forget_tasks:
+            return
         # Idle and paused sessions have no live replay to invalidate. Adoption
         # still checks the immutable prefix and releases their pending-job budget.
         session = self.store.get("session", session_id)
@@ -235,6 +249,8 @@ class Compactor:
             source = extract(records, previous_text, self.max_chars())
             try:
                 async with self._capacity:
+                    if not self._current(session_id):
+                        return
                     text = await self.summarize(source, policy.max_summary_tokens)
                 if text.strip():
                     summary, kind = text[:budget], "semantic"
@@ -242,6 +258,8 @@ class Compactor:
                 raise
             except Exception:
                 pass  # One failure degrades this prefix; no background retry loop.
+        if not self._current(session_id):
+            return
         anchor = next(
             (item for item in reversed(records) if item["role"] == "user"), previous.get("anchor")
         )
@@ -260,6 +278,8 @@ class Compactor:
         )
 
     def adopt(self, session_id: str) -> bool:
+        if self._closed or session_id in self._forget_tasks:
+            return False
         candidate = self._ready.pop(session_id, None)
         if candidate is not None:
             self._attempted.pop(session_id, None)
@@ -295,23 +315,73 @@ class Compactor:
         self.store.put_many([("compaction_snapshot", snapshot), ("compaction", active)])
         return True
 
-    async def close(self) -> None:
-        self._closed = True
-        tasks = list(self._tasks.values())
+    def _current(self, session_id: str) -> bool:
+        task = asyncio.current_task()
+        return (
+            not self._closed
+            and session_id not in self._forget_tasks
+            and task is not None
+            and not task.cancelling()
+            and self._tasks.get(session_id) is task
+        )
+
+    @staticmethod
+    async def _cancel_jobs(tasks: Sequence[asyncio.Task[None]]) -> None:
         for task in tasks:
-            task.cancel()
+            if not task.done() and not task.cancelling():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    async def _settle(cleanup: asyncio.Task[None]) -> None:
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close(), name="muli-compaction-close")
+        await self._settle(self._close_task)
+
+    async def _close(self) -> None:
+        await self._cancel_jobs(list(self._tasks.values()))
+        await asyncio.gather(*list(self._forget_tasks.values()), return_exceptions=True)
         self._tasks.clear()
         self._ready.clear()
         self._attempted.clear()
 
     async def forget(self, session_id: str) -> None:
         """Settle in-flight work before removing every derived summary for a session."""
+        if self._closed:
+            raise ValueError("压缩器已关闭")
+        cleanup = self._forget_tasks.get(session_id)
+        if cleanup is None:
+            cleanup = asyncio.create_task(
+                self._forget(session_id), name=f"muli-compaction-forget-{session_id}"
+            )
+            self._forget_tasks[session_id] = cleanup
+            cleanup.add_done_callback(lambda task: self._forgotten(session_id, task))
+        await self._settle(cleanup)
+
+    def _forgotten(self, session_id: str, task: asyncio.Task[None]) -> None:
+        if self._forget_tasks.get(session_id) is task:
+            self._forget_tasks.pop(session_id, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _forget(self, session_id: str) -> None:
         task = self._tasks.get(session_id)
         if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._tasks.pop(session_id, None)
+            await self._cancel_jobs([task])
+        if self._tasks.get(session_id) is task:
+            self._tasks.pop(session_id, None)
         self._ready.pop(session_id, None)
         self._attempted.pop(session_id, None)
         with self.store.db:
