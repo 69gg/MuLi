@@ -20,7 +20,7 @@ from muli.evidence import EvidenceError, json_size, validate_integer
 from muli.media import MediaService
 from muli.memory_chunks import MemoryChunkSettings
 from muli.memory_context import MemoryContextProvider, PromptComposition
-from muli.memory_evidence import MemoryEvidence, query_result
+from muli.memory_evidence import SOURCE_JOB_STATES, SOURCE_PAGE_LIMIT, MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
 from muli.providers import Message
 from muli.runtime import PreparedRequest, Runtime
@@ -687,6 +687,14 @@ class MemoryApplication:
                 max_output_chars=runtime.config.settings.limits.max_output_chars,
             )
 
+        async def sources(args: dict[str, Any]) -> Any:
+            return MemoryEvidence(runtime.memory).sources(
+                cursor=args.get("cursor"),
+                limit=args.get("limit", 20),
+                state=args.get("state"),
+                max_output_chars=runtime.config.settings.limits.max_output_chars,
+            )
+
         async def conflicts(args: dict[str, Any]) -> Any:
             return [item for item in runtime.memory.conflicts() if item["resolved_at"] is None]
 
@@ -719,6 +727,21 @@ class MemoryApplication:
                     ("query",),
                 ),
                 query,
+                preserve_output=True,
+            ),
+            Tool(
+                "memory_sources",
+                "按入库顺序分页列出已保存来源及整理状态，不读正文、不运行模型或重建；"
+                "state可筛选失败等状态，limit限制检查数，空页has_more仍须用next_cursor续页；"
+                "得到source_id后用memory_source核对原文，done不保证当前模型索引完整",
+                parameters(
+                    {
+                        "cursor": string(),
+                        "limit": {"type": "integer", "minimum": 1, "maximum": SOURCE_PAGE_LIMIT},
+                        "state": {"type": "string", "enum": list(SOURCE_JOB_STATES)},
+                    }
+                ),
+                sources,
                 preserve_output=True,
             ),
             Tool(
