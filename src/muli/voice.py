@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 from muli.config import VoiceSettings
 from muli.maintenance import Admission
@@ -342,6 +343,8 @@ class VoiceWorker:
         self.speaker = speaker or CommandDetector(config, "verify")
         self.player, self.on_status = player or SystemPlayer(), on_status
         self._task: asyncio.Task[None] | None = None
+        self._setup_task: asyncio.Task[dict[str, Any]] | None = None
+        self._setup: dict[str, Any] = {"state": "idle"}
         self._operations: set[asyncio.Task[Any]] = set()
         self._lifecycle_lock = asyncio.Lock()
         self._stopping = False
@@ -404,6 +407,7 @@ class VoiceWorker:
             "playback": self.player.status(),
             "last_prompt": self.last_prompt,
             "last_reply": dict(self.last_reply),
+            "setup": dict(self._setup),
             "reason": "语音服务已关闭"
             if self._closed
             else "语音服务正在停止"
@@ -460,13 +464,18 @@ class VoiceWorker:
                 tasks = self._operations.copy()
                 if self._task is not None:
                     tasks.add(self._task)
+                if self._setup_task is not None:
+                    tasks.add(self._setup_task)
                 self._task = None
                 tasks.discard(caller)
                 for task in tasks:
-                    task.cancel()
+                    if task is not self._setup_task or not task.cancelling():
+                        task.cancel()
             try:
                 # A callback may itself call stop; do not hold its lifecycle lock while joining it.
                 await asyncio.gather(*tasks, return_exceptions=True)
+                if self._setup_task is not None and self._setup_task.cancelled():
+                    self._setup = {**self._setup, "state": "cancelled"}
             finally:
                 async with self._lifecycle_lock:
                     self._stops -= 1
@@ -487,8 +496,8 @@ class VoiceWorker:
         self._closed = True
         await self.stop()
 
-    async def _record(self, seconds: float) -> Path:
-        if not self.config.enabled:
+    async def _record(self, seconds: float, *, _setup: bool = False) -> Path:
+        if not self.config.enabled and not (_setup and asyncio.current_task() is self._setup_task):
             raise ValueError("语音采集尚未启用")
         path = self.files.allocate(".wav")
         try:
@@ -506,32 +515,197 @@ class VoiceWorker:
             path.unlink(missing_ok=True)
             raise
 
-    async def enroll(self, seconds: float = 5) -> dict[str, Any]:
+    def _enrollment_seconds(self, seconds: float) -> None:
         if (
             isinstance(seconds, bool)
-            or not math.isfinite(seconds)
+            or not isinstance(seconds, (int, float))
             or not 1 <= seconds <= min(15, self.config.max_utterance_seconds)
+            or not math.isfinite(seconds)
         ):
             raise ValueError("声纹参考时长须为 1 至 15 秒且不超过录音上限")
+
+    def _save_reference(self, path: Path) -> None:
+        pointer = self.files.root / "enrollment.txt"
+        try:
+            if pointer.is_symlink():
+                raise ValueError("声纹参考索引不能是符号链接")
+            if self.files.used_bytes() + 32 > self.config.max_total_bytes:
+                raise ValueError("声纹参考超过本地容量限制")
+            pointer.write_text(path.stem, encoding="utf-8")
+            pointer.chmod(0o600)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        self._reference = path
+
+    async def enroll(self, seconds: float = 5) -> dict[str, Any]:
+        self._enrollment_seconds(seconds)
         async with self._operation(), self._capture_lock, self.files.lock:
             path = await self._record(seconds)
-            pointer = self.files.root / "enrollment.txt"
-            try:
-                if pointer.is_symlink():
-                    raise ValueError("声纹参考索引不能是符号链接")
-                if self.files.used_bytes() + 32 > self.config.max_total_bytes:
-                    raise ValueError("声纹参考超过本地容量限制")
-                pointer.write_text(path.stem, encoding="utf-8")
-                pointer.chmod(0o600)
-            except BaseException:
-                path.unlink(missing_ok=True)
-                raise
-            self._reference = path
+            self._save_reference(path)
             return artifact(
                 path,
                 "audio/wav",
                 acoustic_verification_available=self.speaker.status().get("available", False),
             )
+
+    def _setup_current(self) -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        if self._closed or self._stopping:
+            raise ValueError("语音服务已关闭或正在停止")
+        if self.config.enabled:
+            raise ValueError("请先关闭后台语音唤醒再进行设置录音")
+
+    def _setup_ready(self, operation: str) -> None:
+        self._setup_current()
+        if not self.recorder.status().get("available"):
+            raise ValueError("录音后端不可用")
+        speaker = self.speaker.status()
+        if operation == "enroll":
+            if not speaker.get("configured") or not speaker.get("available"):
+                raise ValueError("声纹模型尚未就绪")
+        else:
+            if not self.wake.status().get("available"):
+                raise ValueError("唤醒模型尚未就绪")
+            if speaker.get("configured"):
+                if not speaker.get("available") or self._reference is None:
+                    raise ValueError("声纹模型或参考录音尚未就绪")
+                self.files.validate(self._reference)
+
+    async def _capture_setup(
+        self, operation: str, seconds: float, guard: Callable[[], None] | None
+    ) -> dict[str, Any]:
+        try:
+            async with self._operation(), self._capture_lock, self.files.lock:
+                self._setup_ready(operation)
+                if guard is not None:
+                    guard()
+                path = await self._record(seconds, _setup=True)
+                retained = False
+                try:
+                    self._setup_ready(operation)
+                    if guard is not None:
+                        guard()
+                    if operation == "enroll":
+                        self._save_reference(path)
+                        retained = True
+                        result = {"enrolled": True}
+                    else:
+                        self._setup = {**self._setup, "state": "comparing"}
+                        detected = await self.wake.detect(path)
+                        self._setup_current()
+                        if guard is not None:
+                            guard()
+                        configured = bool(self.speaker.status().get("configured"))
+                        verified = False
+                        if configured:
+                            verified = await self.speaker.detect(path, reference=self._reference)
+                            self._setup_current()
+                            if guard is not None:
+                                guard()
+                        result = {
+                            "wake_detected": bool(detected),
+                            "speaker_configured": configured,
+                            "speaker_verified": bool(verified),
+                        }
+                    self._setup = {**self._setup, "state": "completed", **result}
+                    return dict(self._setup)
+                finally:
+                    if not retained:
+                        path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            self._setup = {**self._setup, "state": "cancelled"}
+            raise
+        except Exception:
+            self._setup = {**self._setup, "state": "error"}
+            raise
+
+    async def _run_setup(
+        self,
+        operation: str,
+        seconds: float,
+        guard: Callable[[], None] | None,
+        identifier: str | None,
+    ) -> dict[str, Any]:
+        if self._setup_task is not None and not self._setup_task.done():
+            raise ValueError("已有语音设置操作正在进行")
+        self._enrollment_seconds(seconds)
+        self._setup = {
+            "id": identifier or str(uuid4()),
+            "operation": operation,
+            "state": "error",
+            "requested_seconds": seconds,
+        }
+        self._setup_ready(operation)
+        if guard is not None:
+            guard()
+        self._setup = {**self._setup, "state": "recording"}
+        task = asyncio.create_task(self._capture_setup(operation, seconds, guard))
+        self._setup_task = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._cancel_setup_task(task)
+            raise
+        finally:
+            if self._setup_task is task:
+                self._setup_task = None
+
+    async def _cancel_setup_task(self, task: asyncio.Task[dict[str, Any]]) -> bool:
+        if not task.cancelling():
+            task.cancel()
+
+        async def settle() -> None:
+            await asyncio.gather(task, return_exceptions=True)
+
+        cleanup = asyncio.create_task(settle())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if task.cancelled() and self._setup_task is task:
+            self._setup = {**self._setup, "state": "cancelled"}
+        return cancelled
+
+    async def setup_enroll(
+        self,
+        seconds: float = 5,
+        *,
+        guard: Callable[[], None] | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Explicit finite enrollment while background voice remains disabled."""
+        return await self._run_setup("enroll", seconds, guard, identifier)
+
+    async def setup_verify(
+        self,
+        seconds: float = 5,
+        *,
+        guard: Callable[[], None] | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Return acoustic decisions without ASR, playback or owner submission."""
+        return await self._run_setup("verify", seconds, guard, identifier)
+
+    async def cancel_setup(self, identifier: str | None = None) -> dict[str, Any]:
+        receipt = dict(self._setup)
+        if identifier is not None and receipt.get("id") != identifier:
+            raise ValueError("语音设置已变化，未取消其它操作")
+        task = self._setup_task
+        if task is not None and not task.done():
+            if await self._cancel_setup_task(task):
+                raise asyncio.CancelledError
+            if task.cancelled():
+                return {**receipt, "state": "cancelled"}
+            if task.exception() is not None:
+                return {**receipt, "state": "error"}
+            return task.result()
+        return receipt
 
     async def listen_once(self) -> dict[str, Any] | None:
         if not self.config.enabled:

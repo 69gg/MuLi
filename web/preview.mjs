@@ -73,6 +73,7 @@ export function createPreviewState() {
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
     management: { plugins: [{ id: "preview-notes", name: "资料整理示例", version: "demo", status: "loaded" }], plans: [], update: { status: "checked", available: false, current: "交互预览", latest: "交互预览", checked_at: now } },
     extensions: { generation: 1, phase: "loaded", skills: { enabled: true, count: 2 }, mcp: mcpStatus(mcp), preview: true },
+    voiceSetup: { state: "idle", preview: true }, voiceEnrolled: false,
     requests: [],
   };
 }
@@ -413,7 +414,23 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     }
     if (path === "/media/transcribe" && method === "POST") return response({ text: "这是一段演示转写。你可以编辑文字，再决定是否发送。", preview: true });
     if (path === "/channels" && method === "GET") return response({ channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: 0 }, deliveries: [], proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
-    if (path === "/voice" && method === "GET") return response({ enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, reason: "前端预览不访问麦克风或声学设备。" });
+    if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
+    if (path === "/voice/setup" && method === "POST") {
+      if (body.confirmed !== true) return failure("请确认本次模拟录音。", 400);
+      if (state.settings.voice.enabled) return failure("请先关闭后台语音唤醒。", 409);
+      if (!["enroll", "verify"].includes(body.operation)) return failure("未知设置操作。", 422);
+      const seconds = body.seconds ?? 5;
+      if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 1 || seconds > 15) return failure("录音时长无效。", 422);
+      if (body.operation === "verify" && !state.voiceEnrolled) return failure("请先录制参考声纹。", 409);
+      state.voiceSetup = { id: body.id ?? crypto.randomUUID(), operation: body.operation, state: "completed", requested_seconds: seconds, preview: true, ...(body.operation === "enroll" ? { enrolled: true } : { wake_detected: true, speaker_configured: true, speaker_verified: true }) };
+      if (body.operation === "enroll") state.voiceEnrolled = true;
+      return response(state.voiceSetup);
+    }
+    if (path === "/voice/setup/cancel" && method === "POST") {
+      if (typeof body.id !== "string" || !body.id) return failure("缺少本次设置标识。", 422);
+      if (body.id !== state.voiceSetup.id) return failure("语音设置已变化，未取消其它操作。", 409);
+      return response(state.voiceSetup);
+    }
     if (path === "/capture" && method === "GET") return response({ enabled: state.settings.computer.capture.enabled, available: false, running: false, reason: "前端预览不读取桌面或摄像头。" });
     if (path === "/service") {
       if (method === "GET") return response(state.service);

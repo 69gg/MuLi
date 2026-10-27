@@ -8,6 +8,7 @@ import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
 import { createTaskControl, taskControlView } from "./task-control.mjs";
 import { VoiceInput, mergeTranscript } from "./voice-input.mjs";
+import { VoiceSetup, voiceSetupLabel } from "./voice-setup.mjs";
 import { initializeConversationWidth } from "./conversation-layout.mjs";
 
 const ICONS = {
@@ -101,6 +102,12 @@ let conversationFollowFrame = null;
 let conversationResizeObserver = null;
 let conversationScrollIntent = null;
 let conversationTouchY = null;
+const voiceSetup = new VoiceSetup({
+  request: (...args) => ownedRequest(...args),
+  active: () => state.connected && state.view === "settings" && state.settingsTab === "inputs",
+  onChange: () => renderVoiceSetupControls(),
+});
+state.voiceSetupController = voiceSetup;
 const voiceInput = new VoiceInput({
   upload: uploadFile, transcribe: transcribeAttachment,
   onUploaded: (file) => { state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
@@ -201,6 +208,7 @@ function connectionCurrent(owner) {
 }
 
 function invalidateConnection() {
+  state.voiceSetupController?.release();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -1105,6 +1113,7 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  if (view !== "settings") state.voiceSetupController?.release();
   if (view === "settings" && state.view === "settings" && state.settingsDraft && !state.viewError && !state.viewLoading && $(".settings-layout", $("#other-view"))) {
     collectSettingsForm(); renderOtherView(); return;
   }
@@ -2487,6 +2496,7 @@ function renderSettings() {
 }
 
 function renderSettingsPanel() {
+  if (state.settingsTab !== "inputs") state.voiceSetupController?.release();
   if (state.settingsTab === "overview") return renderConfigurationOverview();
   const form = element("form", { id: "settings-form", class: "settings-panel", onSubmit: saveSettings });
   if (state.settingsTab === "models") form.append(renderModelSettings());
@@ -2646,7 +2656,7 @@ function renderInputSettings() {
   const voice = state.settingsDraft.voice ?? {};
   const capture = state.settingsDraft.computer?.capture ?? {};
   const voiceStatus = state.voice; const captureStatus = state.capture;
-  const voiceState = voiceStatus && statusList([["状态", capabilityLabel(voiceStatus)], ["录音后端", voiceStatus.recorder?.backend || "未检测到"], ["声学唤醒", voiceStatus.wake?.available ? "已检测" : "未就绪"], ["参考声纹", voiceStatus.speaker?.enrolled ? "已录制" : "未录制"], ["语音识别", voiceStatus.asr ? "已配置" : "未配置"], ["提示播放", voiceStatus.playback?.backend || "未检测到"], ["运行设备", voiceStatus.device?.selected ?? "状态未知"], ["设备运行验证", voiceStatus.device?.runtime_verified ? "已验证" : "尚未验证"]]);
+  const voiceState = element("div", { id: "voice-status-summary" }, voiceStatus && voiceStatusSummary(voiceStatus));
   const captureState = captureStatus && statusList([["状态", capabilityLabel(captureStatus)], ["截图后端", captureStatus.screenshot?.backend || "未检测到"], ["录屏后端", captureStatus.recording?.backend || "未检测到"], ["采集权限", captureStatus.permission_verified ? "已验证" : "尚未验证"]]);
   return element("div", {},
     settingsSection("网页语音输入", switchField("允许点击录音并生成草稿", "web_voice.enabled", state.settingsDraft.web_voice?.enabled), element("p", { text: "需要配置 ASR。转写只进入可编辑草稿，点击发送后才成为用户消息；与后台唤醒独立。" }), settingsJSON("web_voice", state.settingsDraft.web_voice ?? {}, ["enabled"])),
@@ -2658,6 +2668,7 @@ function renderInputSettings() {
       selectField("计算设备", "voice.device", voice.device ?? "auto", [["auto", "自动"], ["cpu", "CPU"], ["rocm", "ROCm"], ["cuda", "CUDA"]]),
       field("录音设备", "voice.input_device", voice.input_device ?? "", { placeholder: "使用系统默认设备", hint: voiceStatus?.recorder?.reason || undefined }),
       switchField("合成唤醒提示语", "voice.tts_enabled", voice.tts_enabled),
+      renderVoiceSetup(),
       settingsJSON("voice", voice, ["enabled", "wake_word", "device", "input_device", "tts_enabled"], 10),
       element("button", { type: "button", class: "text-button field-top-space", text: "设置语音识别与合成模型", dataset: { settingsTab: "media" } }), statusDetails(voiceStatus)),
     settingsSection("截图与录屏", settingsResourceError("capture"), captureState,
@@ -2667,6 +2678,34 @@ function renderInputSettings() {
       field("采集设备", "computer.capture.device", capture.device ?? "", { placeholder: "使用当前图形会话" }),
       element("div", { class: "field-row" }, field("最长录屏（秒）", "computer.capture.max_seconds", capture.max_seconds ?? "", { type: "number", min: 1, max: 300 }), field("录屏帧率", "computer.capture.fps", capture.fps ?? "", { type: "number", min: 1, max: 30 })),
       settingsJSON("computer.capture", capture, ["enabled", "backend", "device", "max_seconds", "fps"]), statusDetails(captureStatus)));
+}
+
+function renderVoiceSetup() {
+  const root = element("div", { class: "field-top-space", id: "voice-setup-controls" },
+    element("p", { id: "voice-setup-result", class: "settings-role-hint", "aria-live": "polite", text: voiceSetupLabel(voiceSetup.status()) }),
+    element("div", { class: "field-row" }, actionButton("协助配置", "voice-setup-help", "text-button", "chat"), actionButton("录制参考", "voice-setup-enroll", "text-button", "mic"), actionButton("验证一次", "voice-setup-verify", "text-button", "check"), actionButton("取消", "voice-setup-cancel", "text-button", "stop")));
+  queueMicrotask(renderVoiceSetupControls);
+  return root;
+}
+
+function voiceStatusSummary(status) {
+  return statusList([["状态", capabilityLabel(status)], ["录音后端", status.recorder?.backend || "未检测到"], ["声学唤醒", status.wake?.available ? "预检可用" : "未就绪"], ["参考声纹", status.speaker?.enrolled ? "已录制" : "未录制"], ["语音识别", status.asr ? "已配置" : "未配置"], ["提示播放", status.playback?.backend || "未检测到"], ["设备选择", status.wake?.configured_provider ?? status.device?.selected ?? "状态未知"], ["设备运行验证", status.device?.runtime_verified ? "已验证" : "尚未验证"]]);
+}
+
+function renderVoiceSetupControls() {
+  const root = $("#voice-setup-controls");
+  if (!root || state.view !== "settings" || state.settingsTab !== "inputs") return;
+  const setup = voiceSetup.status(), status = state.voice ?? {};
+  const summary = $("#voice-status-summary");
+  if (summary && state.voice) summary.replaceChildren(voiceStatusSummary(status));
+  const busy = ["recording", "stopping"].includes(setup.phase);
+  $("#voice-setup-result", root).textContent = status.enabled && !busy ? "先保存关闭后台唤醒，再进行单次设置。" : voiceSetupLabel(setup);
+  for (const operation of ["enroll", "verify"]) {
+    const button = $(`[data-action="voice-setup-${operation}"]`, root);
+    button.disabled = busy || !state.connected || !!status.enabled;
+  }
+  const cancel = $('[data-action="voice-setup-cancel"]', root);
+  cancel.hidden = !busy; cancel.disabled = setup.phase === "stopping";
 }
 
 function renderMaintenanceSettings() {
@@ -2987,6 +3026,29 @@ async function refreshService() {
 }
 
 async function handleAction(action, button) {
+  if (action === "voice-setup-help") {
+    state.voiceSetupController?.release();
+    await switchView("chat");
+    const input = $("#message-input");
+    if (!input.value.trim()) input.value = "请帮我配置本地语音：先检查状态并准备已有本地模型的配置，保持后台唤醒关闭，再指导我明确登记声纹和做一次有限验证。不要自动安装依赖或下载模型。";
+    else toast("已保留草稿，可以直接请沐璃协助配置语音。");
+    draftRevision += 1; resizeComposer(); $("#message-input").focus();
+  }
+  if (["voice-setup-enroll", "voice-setup-verify"].includes(action)) {
+    const operation = action === "voice-setup-enroll" ? "enroll" : "verify";
+    const root = $("#voice-setup-controls"), owner = connection, generation = voiceSetup.generation;
+    confirmAction(operation === "enroll" ? "录制参考声纹" : "验证本地语音", state.voice?.preview ? "仅模拟一次设置，不访问麦克风或声学设备。" : "将使用本机麦克风录制 5 秒，仅在本地登记或比对，不转写、不发送消息。", state.voice?.preview ? "模拟录音" : "开始录音", async () => {
+      if (connectionCurrent(owner) && generation === voiceSetup.generation && root?.isConnected && root.contains(button)) {
+        $("#app-dialog").close();
+        const result = await voiceSetup.run(operation);
+        if (result && connectionCurrent(owner) && state.view === "settings" && state.settingsTab === "inputs") {
+          await refreshSettingsResources(owner, () => state.view === "settings" && state.settingsTab === "inputs");
+          renderVoiceSetupControls();
+        }
+      }
+    });
+  }
+  if (action === "voice-setup-cancel") await voiceSetup.stop();
   if (action === "toggle-theme") { toggleTheme(); renderThemeControl(); }
   if (action === "logout") {
     voiceInput.cancel(); state.voiceDraft = null; $("#voice-draft-text").value = "";
@@ -3251,7 +3313,10 @@ function recoverConnection() {
   if (document.visibilityState === "visible" && !connectionCurrent(connection) && $("#auth-gate").hidden) void connect();
 }
 
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") voiceInput.cancel(); recoverConnection(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") { voiceInput.cancel(); state.voiceSetupController?.release(); }
+  recoverConnection();
+});
 window.addEventListener("online", recoverConnection);
 window.addEventListener("pageshow", (event) => { if (event.persisted) recoverConnection(); });
 window.addEventListener("pagehide", () => { invalidateConnection(); voiceInput.cancel(); if (memoryDialog || historyDialog) $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); cancelMemorySearch(); releaseMemoryPath(); releaseMemorySources(); releaseWorkflowActivity(); releaseRecordDirectory(); });

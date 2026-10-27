@@ -50,6 +50,24 @@ async function json(backend, path, method = "GET", body) {
   return { status: result.status, body: await result.json() };
 }
 
+test("preview local voice setup confirms, enrolls and verifies without submitting a message", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  const before = structuredClone(backend.state.messages);
+  assert.equal((await json(backend, "/voice/setup", "POST", { operation: "enroll", confirmed: false })).status, 400);
+  assert.equal((await json(backend, "/voice/setup", "POST", { operation: "verify", confirmed: true })).status, 409);
+  const enrollment = await json(backend, "/voice/setup", "POST", { operation: "enroll", confirmed: true, seconds: 5 });
+  assert.equal(enrollment.body.preview, true); assert.equal(enrollment.body.enrolled, true);
+  const check = await json(backend, "/voice/setup", "POST", { operation: "verify", confirmed: true, seconds: 5 });
+  assert.equal(check.body.state, "completed"); assert.equal(check.body.preview, true);
+  assert.equal(check.body.wake_detected, true); assert.equal(check.body.speaker_verified, true);
+  const status = await json(backend, "/voice");
+  assert.equal(status.body.preview, true); assert.equal(status.body.available, false);
+  assert.equal(status.body.enabled, false); assert.equal(status.body.speaker.enrolled, true);
+  assert.equal((await json(backend, "/voice/setup/cancel", "POST", { id: enrollment.body.id })).status, 409);
+  assert.equal((await json(backend, "/voice/setup/cancel", "POST", { id: check.body.id })).body.id, check.body.id);
+  assert.deepEqual(backend.state.messages, before);
+});
+
 /** Consume the real demo SSE endpoint, including its normal abort cleanup. */
 async function demo(t) {
   const backend = createPreviewBackend({ delay: 0 });

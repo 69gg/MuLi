@@ -98,7 +98,11 @@ def _paths(config: BridgeConfig, operation: str) -> dict[str, str]:
 
 def check_config(path: Path) -> dict[str, Any]:
     """Metadata-only inspection; does not import native code or inspect model weights."""
-    config = load_config(path)
+    return inspect_config(load_config(path))
+
+
+def inspect_config(config: BridgeConfig) -> dict[str, Any]:
+    """Share the same metadata preflight with the owner configuration workflow."""
     if config.wake is not None:
         _paths(config, "wake")
     if config.speaker is not None:
