@@ -202,6 +202,50 @@ class CommandDetector:
     def status(self) -> dict[str, Any]:
         configured = bool(self.command)
         available = configured and shutil.which(self.command[0]) is not None
+        if (
+            available
+            and len(self.command) == 5
+            and self.command[1:4] == ["-m", "muli.acoustic_bridge", "--config"]
+            # Keep venv paths: distinct venvs can symlink to the same binary but
+            # have different installed packages. Never preflight the wrong one.
+            and Path(shutil.which(self.command[0]) or "").absolute()
+            == Path(sys.executable).absolute()
+        ):
+            from muli.acoustic_bridge import check_config
+
+            try:
+                report = check_config(Path(self.command[4]))
+                operation = "wake" if self.operation == "wake" else "speaker"
+                available = report["available"] and report[f"{operation}_configured"]
+                if (
+                    self.config.device != "auto"
+                    and self.config.device != report["configured_provider"]
+                ):
+                    available = False
+                    report["reason"] = "声学 provider 与请求设备不一致；此适配器不支持 ROCm"
+                if (
+                    self.operation == "wake"
+                    and report["wake_sample_rate"] != self.config.sample_rate
+                ):
+                    available = False
+                    report["reason"] = "录音与唤醒模型的采样率不一致"
+                return {
+                    **report,
+                    "configured": configured,
+                    "available": available,
+                    "backend": "sherpa-onnx",
+                    "reason": (
+                        report["reason"] or f"尚未配置{operation}声学模型" if not available else ""
+                    ),
+                }
+            except (OSError, ValueError, ImportError):
+                return {
+                    "configured": configured,
+                    "available": False,
+                    "backend": "sherpa-onnx",
+                    "runtime_verified": False,
+                    "reason": "本地声学配置或模型文件不可用；不会录音或自动下载",
+                }
         return {
             "configured": configured,
             "available": available,
@@ -224,6 +268,11 @@ class CommandDetector:
             "requested_device": self.config.device,
             "wake_word": self.config.wake_word,
             "reference_path": str(reference) if reference is not None else None,
+            "threshold": (
+                self.config.wake_threshold
+                if self.operation == "wake"
+                else self.config.speaker_threshold
+            ),
         }
         response = await run_process(
             list(self.command),
@@ -241,12 +290,25 @@ class CommandDetector:
         flag = "detected" if self.operation == "wake" else "verified"
         if not isinstance(payload, dict) or type(payload.get(flag)) is not bool:
             raise ValueError("声学模型桥接缺少明确布尔结果")
+        if payload.get("score_kind") == "decision":
+            threshold = payload.get("threshold")
+            if (
+                self.operation != "wake"
+                or isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or threshold != self.config.wake_threshold
+                or not math.isfinite(threshold)
+            ):
+                raise ValueError("唤醒决定须使用当前配置的真实模型阈值")
+            return bool(payload[flag])
+        if payload.get("score_kind", "confidence") != "confidence":
+            raise ValueError("未知声学模型得分类型")
         score = payload.get("score")
         if (
             isinstance(score, bool)
             or not isinstance(score, (float, int))
-            or not math.isfinite(score)
             or not 0 <= score <= 1
+            or not math.isfinite(score)
         ):
             raise ValueError("声学模型桥接置信度须为 0 至 1 的有限数")
         threshold = (
