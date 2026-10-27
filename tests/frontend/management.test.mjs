@@ -84,7 +84,7 @@ test("noncandidate plans cannot borrow candidate preparation labels", () => {
   }
 });
 
-test("management plan list renders update recovery labels without changing its layout", () => {
+test("management renders plugin faults and update recovery without changing its layout", () => {
   const source = readFileSync(new URL("../../web/app.mjs", import.meta.url), "utf8");
   const start = source.indexOf("function renderMaintenanceSettings()");
   const end = source.indexOf("function renderModelSettings()", start);
@@ -95,20 +95,22 @@ test("management plan list renders update recovery labels without changing its l
       { action: "switch", operation: "update", status: "applying", phase: "candidate_cleanup_required" },
       { action: "switch", status: "applying", phase: "candidate_cleanup_required" },
       { action: "adopt", status: "pending" },
-    ] } },
+    ], plugins: [{ id: "guard", status: "degraded", error: "plugin_context_failed", error_type: "TimeoutError" }] } },
     element, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, formatFullDate: String,
     settingsSection: (title, ...children) => element("section", { title }, ...children),
     settingsResourceError: () => null, settingsJSON: () => null, statusList: () => null,
     switchField: () => null, field: () => null, actionButton: () => null,
   };
   runInNewContext(source.slice(start, end), context, { timeout: 1000 });
-  const pending = [context.renderMaintenanceSettings()]; const headings = [];
+  const pending = [context.renderMaintenanceSettings()]; const headings = []; const errors = [];
   while (pending.length) {
     const node = pending.shift();
     if (node.props.class === "management-item-heading") headings.push(node.children.map((child) => child.props.text));
+    if (node.props.class === "form-error") errors.push(node.props.text);
     pending.push(...node.children);
   }
-  assert.deepEqual(headings, [["版本更新", "等待恢复"], ["切换版本", "正在应用"], ["托管服务", "待应用"]]);
+  assert.deepEqual(headings, [["guard", "运行异常"], ["版本更新", "等待恢复"], ["切换版本", "正在应用"], ["托管服务", "待应用"]]);
+  assert.deepEqual(errors, ["上下文处理失败 · TimeoutError"]);
 });
 
 test("a failed or missing update check never becomes an up-to-date claim", () => {

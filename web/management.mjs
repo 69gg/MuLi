@@ -24,7 +24,7 @@ export function capabilityLabel(status) {
 }
 
 export function managementLabel(value) {
-  return ({ pending: "待应用", applying: "正在应用", completed: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", sent: "已发送", sending: "发送中", unknown: "结果未知", loaded: "已加载", disabled: "未启用", error: "加载失败" })[value] ?? value ?? "状态未知";
+  return ({ pending: "待应用", applying: "正在应用", completed: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", sent: "已发送", sending: "发送中", unknown: "结果未知", loaded: "已加载", degraded: "运行异常", disabled: "未启用", error: "加载失败" })[value] ?? value ?? "状态未知";
 }
 
 export function managementActionLabel(plan) {

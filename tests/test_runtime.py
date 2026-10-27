@@ -584,7 +584,13 @@ async def test_large_tool_result_is_packed_without_changing_the_journal(
             ModelTurn(content="已参考头尾证据"),
         ],
     )
-    runtime.config.update({"limits": {"max_context_chars": 4000}})
+    runtime.config.update(
+        {
+            "persona": {"prompt": "你是简短的测试助手。"},
+            "compaction": {"enabled": False},
+            "limits": {"max_context_chars": 4000},
+        }
+    )
     try:
         session = runtime.new_session(mode="yolo")
         started = await runtime.start(session["id"], "概括文件")

@@ -105,6 +105,9 @@ def main() -> None:
     commands.add_parser("doctor", help="显示配置和本机能力")
     recovery = commands.add_parser("management", help="查看恢复事务或接续现有控制者")
     recovery.add_argument("action", choices=["status", "recover"])
+    plugins = commands.add_parser("plugins", help="检查插件，或停机后调整下次启动的启停设置")
+    plugins.add_argument("action", choices=["inspect", "enable", "disable"])
+    plugins.add_argument("identifier", help="插件目录 ID")
     commands.add_parser("upgrade-channel-ownership", help="停机后升级旧渠道数据格式（仅 Linux）")
     args = parser.parse_args()
     if args.command not in {None, "serve", "upgrade-channel-ownership"}:
@@ -113,6 +116,8 @@ def main() -> None:
         arguments = [args.command]
         if args.command in {"service", "management"}:
             arguments.append(args.action)
+        elif args.command == "plugins":
+            arguments.extend([args.action, args.identifier])
         elif args.command == "init":
             arguments.extend(
                 flag
@@ -201,6 +206,31 @@ def main() -> None:
             )
         except (OSError, ValueError) as exc:
             parser.error(getattr(exc, "code", "management_unavailable"))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "plugins":
+        try:
+            if args.action == "inspect":
+                from muli.plugins import inspect_plugin
+
+                config = ConfigFile(args.config)
+                result = inspect_plugin(
+                    config.path.resolve().parent / "plugins",
+                    args.identifier,
+                    config.settings.plugins,
+                )
+            else:
+                from muli.plugin_recovery import set_plugin_disabled
+
+                result = asyncio.run(
+                    set_plugin_disabled(
+                        UserService(args.config, args.data_dir),
+                        args.identifier,
+                        args.action == "disable",
+                        managed_root=args.managed_root,
+                    )
+                )
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            parser.error(getattr(exc, "code", "plugin_operation_failed"))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "doctor":
         from muli.notifications import notification_capability

@@ -59,7 +59,7 @@ MCP 和 Skills 支持目录发现与热重载，Python 插件启停或修改仍�
 
 ## 插件目录
 
-默认目录为 `~/MuLi/plugins/<id>/`；使用自定义配置文件位置时，插件目录位于该配置旁。插件是用户信任的 Python 代码，使用与 MuLi 进程相同的权限，不是隔离沙箱。
+默认目录为 `~/MuLi/plugins/<id>/`；使用自定义配置文件位置时，插件目录位于实际配置文件旁。插件是用户信任的 Python 代码，使用与 MuLi 进程相同的权限，不是隔离沙箱。
 
 每个插件包含 `plugin.json` 和 Python 入口，例如：
 
@@ -85,6 +85,21 @@ def setup(api: PluginContext) -> None:
 可用 `plugin_install({"id":"personal","files":{...}})` 校验并保存插件文件，**重启后才加载**。安装不会执行插件、覆盖已有目录或自动安装依赖。修改已有插件，或把 ID 加入 `plugins.disabled` 后，也需重启才能生效。通过 `self_status` 查看清单和 `plugins_restart_required`。
 
 关闭 `plugins.enabled` 后，启动时不会创建或扫描插件目录。目录无法创建或列出时，清单报告 `plugin_directory_unavailable`；单个条目无法检查时报告 `plugin_entry_unavailable`，主会话和其他健康插件仍可使用。修复对应路径或权限后正常重启，错误不会在当前进程中被自动重试或清除。
+
+上下文钩子报错、超时或返回格式无效时，插件状态变为 `degraded`，显示失败阶段和异常类别。该次请求继续失败，不会自动跳过插件；后续正常执行成功，才清除这项故障状态。取消请求不算插件故障。
+
+插件导致对话无法继续时，可以在终端检查和调整下次启动设置：
+
+```sh
+MuLi plugins inspect personal
+MuLi service stop
+MuLi plugins disable personal
+MuLi service start
+```
+
+`inspect` 只检查指定插件的清单与入口结构，不执行其代码；`ready` 表示结构可用，不能证明运行健康。`disable` 和 `enable` 目前仅支持 Linux，需要已安装且确认停止的用户服务；恢复操作未结束、安装身份不符或配置被同时修改时会拒绝，不自动重启。使用自定义路径时，在 `plugins` 前传入同一组 `--config`、`--data-dir`。
+
+修复后，可停机运行 `MuLi plugins enable personal` 再启动。两条变更命令只修改 `plugins.disabled` 中的对应 ID，不删插件或资料；`enable` 不会覆盖全局 `plugins.enabled` 或插件清单里的停用设置。可信 Python 插件的既有副作用无法靠停用回滚。
 
 `persona.prompt` 替换基础提示词，`persona.append` 追加个性设定，插件的 `append_prompt` 再追加内容。日常记忆和长对话不需要编写插件，分别见[记忆](memory.md)与[长对话](context.md)。
 

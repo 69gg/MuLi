@@ -84,7 +84,16 @@ def test_missing_state_with_selector_cannot_delegate_to_ordinary_cli(tmp_path: P
         managed_cli.route_command(tmp_path / "config.json", tmp_path, ("init", "--defaults"))
 
 
-@pytest.mark.parametrize("arguments", [("doctor",), ("init", "--defaults"), ("service", "stop")])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("doctor",),
+        ("init", "--defaults"),
+        ("service", "stop"),
+        ("plugins", "inspect", "guard"),
+        ("plugins", "disable", "guard"),
+    ],
+)
 def test_unresolved_blocks_ordinary_commands_before_exec(
     deployment: Deployment, monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
 ) -> None:
