@@ -25,7 +25,7 @@ class ConsultRequest:
     question: str
     child_task: asyncio.Task[str]
     child_request: PreparedRequest
-    proof: dict[str, Any]
+    proof: dict[str, Any] | None
     future: asyncio.Future[dict[str, Any]]
     deadline: float
     input_seq: int
@@ -51,15 +51,22 @@ class TeamConsult:
         ):
             return False
         agent = runtime.store.get("agent", child_id)
-        return bool(
+        eligible = bool(
             agent
             and agent.get("parent_id") == runtime.store.existing_main_session_id()
-            and agent.get("role") != "reviewer"
+            and agent.get("role") == "worker"
             and agent.get("commitment_id") is None
             and agent.get("status") == "running"
             and agent.get("run_id") == run_id
             and agent.get("generation") == generation
-            and runtime.channel_ownership.current_proof(child_id, run_id) is not None
+        )
+        if not eligible:
+            return False
+        # An ordinary direct worker uses its live parent/run/generation. A
+        # channel worker must still prove the input it actually accepted.
+        return (
+            runtime.channel_ownership.current_proof(child_id, run_id) is not None
+            or runtime.channel_ownership.for_agent(child_id) is None
         )
 
     def guard_child(self, request: ConsultRequest) -> None:
@@ -86,7 +93,7 @@ class TeamConsult:
             or agent is None
             or agent.get("parent_id") != request.main_id
             or agent.get("session_id") != request.child_id
-            or agent.get("role") == "reviewer"
+            or agent.get("role") != "worker"
             or agent.get("commitment_id") is not None
             or agent.get("status") != "running"
             or agent.get("run_id") != request.child_run_id
@@ -108,6 +115,11 @@ class TeamConsult:
         proof = runtime.channel_ownership.current_proof(request.child_id, request.child_run_id)
         if proof != request.proof or request.child_request.channel_ownership != request.proof:
             raise PermissionError("咨询不再属于原运行实际接纳的渠道输入")
+        if (
+            request.proof is None
+            and runtime.channel_ownership.for_agent(request.child_id) is not None
+        ):
+            raise PermissionError("普通队友咨询期间渠道归属已改变")
         if runtime.channel_ownership.return_request(proof):
             raise PermissionError("归还控制通知不能发起咨询")
 
@@ -122,11 +134,12 @@ class TeamConsult:
         runtime = self.team.runtime
         prepared = runtime.request_context(child_id)
         task = runtime.tasks.get(child_id)
+        main_id = runtime.store.existing_main_session_id()
         if (
             run_id is None
             or generation is None
+            or main_id is None
             or prepared is None
-            or prepared.channel_ownership is None
             or asyncio.current_task() is not task
             or task is None
             or runtime.tool_session_id != child_id
@@ -148,7 +161,7 @@ class TeamConsult:
             raise ValueError("本轮已有尚未收口的咨询")
         request = ConsultRequest(
             new_id(),
-            prepared.channel_ownership["main_id"],
+            main_id,
             child_id,
             run_id,
             generation,
