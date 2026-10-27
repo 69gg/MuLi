@@ -222,12 +222,16 @@ class Compactor:
         selected: list[dict[str, Any]] = []
         target = self.max_chars() * (1 - self.settings().target_ratio)
         size = 0
+        has_assistant = False
         for group in available:
             selected.extend(group)
             size += sum(message_text_size(item) for item in group)
-            if size >= target:
+            has_assistant = has_assistant or any(item["role"] == "assistant" for item in group)
+            # A long first input can meet the target before its completed reply.
+            # Continue through whole groups until the prefix is eligible.
+            if size >= target and has_assistant:
                 break
-        if not selected or not any(item["role"] == "assistant" for item in selected):
+        if not has_assistant:
             return
         fingerprint = self.fingerprint()
         attempt = (int(active.get("generation", 0)), int(selected[-1]["seq"]), fingerprint)
