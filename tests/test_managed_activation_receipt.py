@@ -28,11 +28,29 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed a
 
 
 async def reach(controller: ManagedTransactionController, phase: Phase) -> TransactionRecordV2:
-    for _ in range(16):
-        record = await controller.step()
-        if record.phase == phase:
-            return record
-        assert not record.resolved and record.activation != "blocked"
+    original = controller.backend.observe
+    missing = False
+
+    async def observe(record: TransactionRecordV2) -> ManagedServiceObservation:
+        nonlocal missing
+        observation = await original(record)
+        if not missing and (record.phase, record.intent) == ("activating", "start_target"):
+            missing = True
+            return replace(observation, health=None)
+        return observation
+
+    with pytest.MonkeyPatch.context() as patch:
+        if phase == "verifying":
+            # Only this fixture requests an observable intermediate decision.
+            # Keep all real observation gates, then withhold its proof once.
+            patch.setattr(controller.backend, "observe", observe)
+        for _ in range(16):
+            record = await controller.step()
+            if record.phase == phase:
+                if phase == "verifying":
+                    assert missing and record.health is None
+                return record
+            assert not record.resolved and record.activation != "blocked"
     raise AssertionError("the real controller did not reach the fixture decision")
 
 

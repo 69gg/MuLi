@@ -369,6 +369,52 @@ class _Controller[
             await self._call(record, self._verify_continuation)
         return True
 
+    def _paused_health_result(
+        self,
+        record: RecordT,
+        observation: ObservationT,
+        role: Role,
+        *,
+        defer_invalid: bool = False,
+    ) -> RecordT:
+        """Share the original complete paused-health gates for both decisions."""
+        proof = self._policy.proof(observation)
+        if (
+            not self._policy.matches(record, observation, role)
+            or observation.service != "running"
+            or observation.writer_free
+            or observation.health_failed
+            or (
+                proof is not None
+                and (
+                    proof.boot != observation.boot or not self._policy.accepts(record, proof, role)
+                )
+            )
+        ):
+            return record if defer_invalid else self._failure(record, "health_failed")
+        if proof is None:
+            return record
+        return self._move(
+            record,
+            phase="committed" if role == "target" else "rolled_back",
+            proof=proof,
+            code=record.code if role == "base" else None,
+        )
+
+    def _started_health_result(
+        self, record: RecordT, observation: ObservationT, role: Role
+    ) -> RecordT:
+        """Only V2 may consume this observation after its first durable CAS."""
+        if not isinstance(record, TransactionRecordV2):
+            return record
+        remaining = record.deadline.remaining(self.clock())
+        if failed := self._deadline_result(record, remaining):
+            return failed
+        # No await/effect: the original intermediate revision remains durable
+        # if proof is absent/invalid or the second CAS fails. Activation belongs
+        # to the next independently authenticated controller step.
+        return self._paused_health_result(record, observation, role, defer_invalid=True)
+
     async def _step(
         self,
         record: RecordT,
@@ -423,28 +469,15 @@ class _Controller[
                 and observation.boot != record.identity.origin_boot
                 and self._policy.matches(record, observation, "target")
             ):
-                return self._move(record, phase="verifying")
+                verifying = self._move(record, phase="verifying")
+                return self._started_health_result(verifying, observation, "target")
             if observation.service in {"starting", "stopping"}:
                 return record
             # The start intent may have survived a crash before or after the
             # command. An inactive target is ambiguous, never an automatic retry.
             return self._failure(record, "ambiguous_start")
         if record.phase == "verifying":
-            if (
-                not self._policy.matches(record, observation, "target")
-                or observation.health_failed
-                or observation.service != "running"
-                or observation.writer_free
-            ):
-                return self._failure(record, "health_failed")
-            proof = self._policy.proof(observation)
-            if proof is not None:
-                if proof.boot != observation.boot or not self._policy.accepts(
-                    record, proof, "target"
-                ):
-                    return self._failure(record, "health_failed")
-                return self._move(record, phase="committed", proof=proof)
-            return record
+            return self._paused_health_result(record, observation, "target")
         if record.phase == "rolling_back":
             if record.intent == "stop_target":
                 if observation.service == "running":
@@ -480,33 +513,17 @@ class _Controller[
                     and observation.boot != record.identity.origin_boot
                     and self._policy.matches(record, observation, "base")
                 ):
-                    return self._move(
+                    verifying = self._move(
                         record,
                         phase="rolling_back",
                         intent="verify_base",
                         code=record.code,
                     )
+                    return self._started_health_result(verifying, observation, "base")
                 if observation.service in {"starting", "stopping"}:
                     return record
                 return self._failure(record, "ambiguous_start")
-            proof = self._policy.proof(observation)
-            if (
-                not self._policy.matches(record, observation, "base")
-                or observation.service != "running"
-                or observation.writer_free
-                or observation.health_failed
-                or (
-                    proof is not None
-                    and (
-                        proof.boot != observation.boot
-                        or not self._policy.accepts(record, proof, "base")
-                    )
-                )
-            ):
-                return self._failure(record, "health_failed")
-            if proof is not None:
-                return self._move(record, phase="rolled_back", proof=proof, code=record.code)
-            return record
+            return self._paused_health_result(record, observation, "base")
         if record.phase in {"committed", "rolled_back"}:
             if result := self._terminal_result(record, observation):
                 return result

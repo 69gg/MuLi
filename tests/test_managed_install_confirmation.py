@@ -336,11 +336,25 @@ async def test_unknown_start_reopens_without_repeating_the_command(
     monkeypatch.setattr(host.backend, "start", original_start)
     if stopped:
         host.stopped()
+    original_observe = host.backend.observe
+    missing = False
+
+    async def observe(current: TransactionRecordV2) -> ManagedServiceObservation:
+        nonlocal missing
+        observation = await original_observe(current)
+        if not missing and observation.service == "running" and current.intent == "start_target":
+            missing = True
+            return replace(observation, health=None)
+        return observation
+
+    # Retain the explicit unknown-proof reentry case, even though a complete
+    # fresh health observation can now also finish the durable decision.
+    monkeypatch.setattr(host.backend, "observe", observe)
     reopened = ManagedTransactionController(host.control, host.backend, host.clock)
     current = await reopened.step()
     assert host.commands == ["start"]
     if stopped:
         assert (current.phase, current.code) == ("rolling_back", "ambiguous_start")
     else:
-        assert current.phase == "verifying"
+        assert missing and current.phase == "verifying" and current.health is None
     assert current.deadline == record.deadline

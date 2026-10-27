@@ -16,6 +16,8 @@ unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh mana
 
 protocol 2 可直接消费本次激活请求返回的完整 released 证明。回执先经过原有请求后真实 probe、完整角色包认证与进程、boot、三文件一致性门，再同步确认 writer 仍被占用；意外取得 writer lease 时释放新句柄并回落普通观察，不触碰服务原有锁。控制器复用完整终态判定，重新核原绝对期限，以原 revision 做 CAS；中间不再等待。缺失、失返或 paused 回执仍沿原路径，blocked 与 foreign 仍拒绝。回执不缓存，最终观察、精确投影及 helper 退出屏障保留；protocol 1 继续原流程。
 
+protocol 2 在启动目标或恢复 base 后，也可直接消费本次完整观察中的 paused 健康证明。控制器仍先以真实 CAS 持久化 `verifying` 或 `verify_base`，再核原时钟、绝对期限与回退保留时间，通过原全部健康门后，以新 revision 完成第二次 CAS。两次决策之间没有等待或服务效果；缺失或无效证明只保留原中间态，CAS 失败不会返回虚构成功。此时仍是等待激活的持久决策，激活、最终观察、精确投影及 helper 退出屏障保持独立；protocol 1 不合并步骤。新候选的原生三事务仍待验收。
+
 旧 `LinuxControllerBackend` 仅将原 loopback URL 与有限 nonce HTTP 收发提取为共享函数。protocol 1 的角色判断、proof 核验、效果门和响应语义保持。HTTP 不继承代理、不跟随重定向、不解压，仍限制原始响应 bytes，503 readiness 和传输超时保持原观察语义。
 
 恢复宿主对既有 helper 的只读认证仍执行前后两轮 fresh manager、proc 与 kernel 观察；仅将每轮同一接口的身份与限额属性合为一次 `get-property`。一次 `GetUnit` 加两轮 Unit/Service 请求由九条降至五条，三十八个属性仍各读两次，继续使用原 typed 解析和全部资源/生命周期依赖校验。普通服务 `_snapshot` 的请求保持原样，不在 probe 实例上缓存证明，不减少 `_record` 文件认证，也不改变效果门、取消、输出预算或绝对期限。

@@ -1,10 +1,18 @@
 # 真实 systemd 托管切换 CI 设计
 
+Native58 工作树保留启动后的真实中间态 CAS，并仅在同次完整 V2 健康观察通过原健康门时，于同步段复核时钟与期限、用新的 position 完成第二次 CAS。目标与回退分别持久化 verifying / verify_base 后再决定 committed / rolled_back，激活仍由后续独立步骤处理。缺失或无效 proof 保留中间态等待新观察；V1、最终 observe 和投影门保持。
+
+两条真实 backend 核心回归在旧生产实际失败，V1 正控先通过；修后新文件 20 项通过（13.43 秒、峰值 71 MiB），五份相关旧路径 160 项通过（42.48 秒、峰值 79.2 MiB），均 swap 0。覆盖同次完整认证、真实两次持久化 CAS、无 yield、坏 proof、时钟、回退保留时间与 CAS 失败；原故障注入夹具显式保留缺 proof 的中间态。改动源码严格类型检查通过（12.147 秒、峰值 287.6 MiB），Ruff 与五份改动 Python 的格式检查通过。独立后审未发现新增 P1/P2。检查使用更低的单次 768 MiB、共享 1 GiB、半核 CPU 与原硬期限。本地结果只用于核对候选，真实 systemd 三事务仍须由新 head 的托管 CI 验收，不作为已通过的证明。
+
 Native57 在 protocol 2 的激活 HTTP 返回后，复用已有 fresh probe、选中角色完整认证及 disk/boot 一致性检查；只有完整 released 回执与实际 writer lease 的 `lock_busy` 同时成立，才返回本次临时观测。controller 随后重核原绝对 deadline，经共用的完整终态判断和原 position CAS 在同一步持久化 released。未知或 paused 回执仍走后续观察，已尝试的激活不重发；`invalid_lock` 等非 busy 错误不能作为持锁证明，回执后的 `clock_invalid` 不能写成功。V1 仍返回 `None`，最后 observe 与原投影路径保留，没有提高期限。
 
 本地十项回执回归已通过；十四文件 283 项整合通过（57.79 秒、峰值 214.8 MiB、swap 0），两组有重叠，不累计计数。另两项真实 lease 文件异常及回执后时钟回退的边界回归通过（0.78 秒、121.7 MiB、swap 0）。512 文件格式、全仓 Ruff、161 份源码严格类型和离线锁检查通过（9.388 秒、峰值 474.8 MiB、swap 0）。独立后审未发现新增 P1/P2；这些本地结果不代表原生三事务或 60 秒期限验收通过。
 
-与 v2.78 的设置重载候选整合后，七文件 146 项通过（6.80 秒、峰值 226 MiB、swap 0），512 文件格式、全仓 Ruff、161 份源码严格类型与离线锁检查通过。该整合未改认证实现、数据格式或原生期限，真实三事务仍待新候选 CI 核验。
+与 v2.78 的设置重载候选整合后，七文件 146 项通过（6.80 秒、峰值 226 MiB、swap 0），512 文件格式、全仓 Ruff、161 份源码严格类型与离线锁检查通过。该整合未改认证实现、数据格式或原生期限。
+
+[Native57，精确签名候选 `753eb47ed0522fd7100f12f1d3a2c9c0face817b`](https://github.com/69gg/MuLi/actions/runs/40358529906) 已全部终态：十二项通用作业成功，仅真实 systemd 作业失败。前两代完整投影为 27895、50473 毫秒；第三代 prepared 52524、draining 56663、stop_base 59183 毫秒，60000 毫秒以 `TimeoutError` / `helper_exit` 结束，三事务仍未验收。2507 字节 evidence 的 SHA256 为 `dd0d24d8b44e42419b8da377bf116da39047e431554ffdb0bea8e40f2e71dfe5`；两成员、完整结果合同及 cleanup 已核，user/group removed、mount 0。
+
+前两代 checks 分别为 119 次 / 8858 毫秒、115 次 / 9346 毫秒；host_record 为 31 次 / 3392 毫秒、29 次 / 2552 毫秒，bus 为 231 次 / 2698 毫秒、218 次 / 3459 毫秒，HTTP 为 13 次 / 928 毫秒、12 次 / 1113 毫秒。次数与各项耗时都有变化，不能把相邻总耗时差全部归因于激活回执，也不将本次两事务完成视为三事务通过。不增加原期限或跳过检查，保持草稿。
 
 Native56 候选把运行态观察在 probe 返回后的 controller 认证与紧邻的选中角色认证合为一次同步完整检查。两次真实 probe、readiness、所有包字节与身份核验均保留；局部观察错误仍先核 controller，origin 仍选择完整 base 安装，stop-only 与停止态第三次 probe 沿原门执行。等待后重新读取全部包，不保存或传递认证证明。
 
