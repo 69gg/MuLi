@@ -911,6 +911,7 @@ def _create_app(
             "attention": attention.status(),
             "file_inbox": file_inbox.status(),
             "system_events": runtime.system_events.status(),
+            "topic_reminders": runtime.topic_reminders.status(),
             "limits": settings.limits.model_dump(),
         }
 
@@ -954,6 +955,7 @@ def _create_app(
             "update_capability": management.updates.capability(),
             "extensions": runtime.extensions.status(),
             "system_events": runtime.system_events.status(),
+            "topic_reminders": runtime.topic_reminders.status(),
         }
 
     @app.get("/api/management/transactions/current")
@@ -1308,7 +1310,12 @@ def _create_app(
         attachments.validate_references(body.attachment_ids)
         content = body.content or ("请查看附件" if body.attachment_ids else "")
         if session_id == runtime.main_session()["id"]:
-            result = await runtime.submit(content, body.mode, attachment_ids=body.attachment_ids)
+            result = await runtime.submit(
+                content,
+                body.mode,
+                attachment_ids=body.attachment_ids,
+                _owner_text_chars=len(body.content) if body.content.strip() else None,
+            )
         elif body.attachment_ids:
             raise ValueError("请在主 MuLi 对话中发送附件")
         else:

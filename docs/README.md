@@ -37,6 +37,7 @@
 - [通讯渠道](channels.md)：接入聊天平台、收发文件与手机审批。
 - [chiliarch](chiliarch.md)：配对与接收任务。
 - [提醒与主动事项](attention.md)：提醒、任务复盘和定时委托。
+- [话题提醒](topic-reminders.md)：下次提到指定文字时，在网页提醒一次。
 - [桌面通知](notifications.md)：在桌面接收提示。
 - [资料收件目录](file-inbox.md)：接收指定目录中的新资料。
 

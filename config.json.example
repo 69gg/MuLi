@@ -439,6 +439,11 @@
     "max_chars": 4000,
     "coalesce_seconds": 0.25
   },
+  "topic_reminders": {
+    "max_active": 32,
+    "max_keyword_chars": 120,
+    "batch_size": 8
+  },
   "limits": {
     "max_parallel_agents": 2,
     "max_pending_runs": 8,
