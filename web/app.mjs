@@ -1807,15 +1807,23 @@ async function showCatalogSource(catalog, item, trigger) {
   await openCatalogSource(item, trigger);
 }
 
-async function openCatalogSource(item, trigger) {
+async function openCatalogSource(item, trigger, { anchor = null, comparisonReturn = null } = {}) {
+  const offset = anchor?.offset ?? 0;
   const content = element("div", { class: "memory-verification" });
   openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger });
   const origin = { ...item, id: item.source_id, digest: item.revision };
-  const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [0], pageIndex: 0, page: null, editing: false };
+  const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [offset], sourceStart: offset, sourceAnchor: anchor, comparisonReturn, comparisonSources: comparisonReturn ? [comparisonReturn.pair.left_id, comparisonReturn.pair.right_id] : undefined, pageIndex: 0, page: null, editing: false };
   memoryDialog = slot;
+  if (comparisonReturn) {
+    const back = element("button", { type: "button", class: "text-button", text: "返回这段差异", onClick: () => {
+      if (memoryDialogCurrent(slot) && content.contains(back) && slot.comparisonReturn === comparisonReturn) void openSourceComparison(comparisonReturn.pair, comparisonReturn.trigger, comparisonReturn.cursor, comparisonReturn.focus);
+    } });
+    content.append(back);
+  }
   slot.sourceRegion = element("div", { class: "memory-source-page", "aria-live": "polite" });
   content.append(statusList([["来源 ID", item.source_id], ["身份", item.principal], ["角色", item.role], ["来源", item.source], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]), slot.sourceRegion);
-  await loadMemorySource(slot, 0, 0);
+  if (anchor?.empty && offset === item.total_bytes) renderMemorySource(slot);
+  else await loadMemorySource(slot, offset, 0);
 }
 
 function sourceComparisonPage(value, pair, cursor) {
@@ -1841,15 +1849,28 @@ function sourceComparisonPage(value, pair, cursor) {
 
 async function showSourceComparison(catalog, right, trigger) {
   if (!memorySourceActionCurrent(catalog, trigger) || !catalog.compareLeft) return;
-  const content = element("div", { class: "memory-verification" });
   const pair = { left_id: catalog.compareLeft.source_id, left_revision: catalog.compareLeft.revision, right_id: right.source_id, right_revision: right.revision };
-  openDialog({ title: "资料变化", content, readOnly: true, returnMemoryId: right.source_id, returnMemoryTrigger: trigger });
-  const slot = { id: right.source_id, catalogSource: true, content, comparisonSources: [pair.left_id, pair.right_id], comparisonPair: pair, offsets: [0], pageIndex: 0, page: null, editing: false };
-  memoryDialog = slot;
-  await loadSourceComparison(slot);
+  await openSourceComparison(pair, trigger);
 }
 
-async function loadSourceComparison(slot, cursor = null) {
+async function openSourceComparison(pair, trigger, cursor = null, focus = null) {
+  const content = element("div", { class: "memory-verification" });
+  openDialog({ title: "资料变化", content, readOnly: true, returnMemoryId: pair.right_id, returnMemoryTrigger: trigger });
+  const slot = { id: pair.right_id, catalogSource: true, content, comparisonSources: [pair.left_id, pair.right_id], comparisonPair: { ...pair }, catalogTrigger: trigger, comparisonCursor: cursor, offsets: [0], pageIndex: 0, page: null, editing: false };
+  memoryDialog = slot;
+  await loadSourceComparison(slot, cursor, focus);
+}
+
+function comparisonSourceButton(slot, source, focus, text, anchor = null) {
+  const button = element("button", { type: "button", class: "text-button", text, "data-source-comparison-ref": focus, onClick: () => {
+    if (!memoryDialogCurrent(slot) || !slot.content.contains(button)) return;
+    const comparisonReturn = { pair: { ...slot.comparisonPair }, cursor: slot.comparisonCursor, focus, trigger: slot.catalogTrigger };
+    void openCatalogSource(source, slot.catalogTrigger, { anchor, comparisonReturn });
+  } });
+  return button;
+}
+
+async function loadSourceComparison(slot, cursor = null, focus = null) {
   if (!memoryDialogCurrent(slot)) return;
   slot.sourceController?.abort();
   const controller = new AbortController(); slot.sourceController = controller;
@@ -1859,21 +1880,26 @@ async function loadSourceComparison(slot, cursor = null) {
     const payload = await request("/memory/sources/compare", { method: "POST", body: { ...slot.comparisonPair, ...(cursor ? { cursor } : {}) }, signal: controller.signal });
     if (!current()) return;
     const page = sourceComparisonPage(payload, slot.comparisonPair, cursor);
+    slot.comparisonCursor = cursor;
     slot.content.replaceChildren(element("p", { role: "status", text: page.status === "equal" ? "两份已保存正文一致。" : page.has_more ? "本段变化 · 仍有后续差异" : "本段变化 · 已到末尾" }));
     for (const side of ["left", "right"]) {
       const source = page[side];
-      const read = element("button", { type: "button", class: "text-button", text: `核对${side === "left" ? "左" : "右"}侧原文`, onClick: () => { if (memoryDialogCurrent(slot)) void openCatalogSource(source, read); } });
+      const read = comparisonSourceButton(slot, source, `header:${side}`, `核对${side === "left" ? "左" : "右"}侧原文`);
       slot.content.append(element("p", { class: "settings-role-hint", text: `${side === "left" ? "左侧" : "右侧"}：${source.source_id} · ${source.scope}` }), read);
     }
-    for (const item of page.items) {
+    for (const [index, item] of page.items.entries()) {
       const block = element("section", { class: "advanced-settings" }, element("h3", { text: { insert: "新增", delete: "删除", replace: "替换" }[item.kind] }));
       for (const side of ["left", "right"]) {
         const change = item[side];
-        block.append(element("p", { class: "settings-role-hint", text: `${side === "left" ? "左侧" : "右侧"} · 字节 ${change.offset_bytes}–${change.offset_bytes + change.length_bytes}` }), element("pre", { class: "memory-source-content", text: change.length_bytes ? change.content : "（此处无正文）" }));
+        block.append(element("p", { class: "settings-role-hint", text: `${side === "left" ? "左侧" : "右侧"} · 字节 ${change.offset_bytes}–${change.offset_bytes + change.length_bytes}` }), element("pre", { class: "memory-source-content", text: change.length_bytes ? change.content : "（此处无正文）" }), comparisonSourceButton(slot, page[side], `${index}:${side}`, `核对${side === "left" ? "左" : "右"}侧此处原文`, { offset: change.read_arguments.offset_bytes, empty: change.length_bytes === 0 }));
       }
       slot.content.append(block);
     }
-    if (page.has_more) slot.content.append(element("button", { type: "button", class: "secondary-button", text: "继续核对差异", onClick: () => void loadSourceComparison(slot, page.next_cursor) }));
+    if (page.has_more) {
+      const next = element("button", { type: "button", class: "secondary-button", text: "继续核对差异", onClick: () => { if (memoryDialogCurrent(slot) && slot.content.contains(next)) void loadSourceComparison(slot, page.next_cursor); } });
+      slot.content.append(next);
+    }
+    if (focus) slot.content.querySelector(`[data-source-comparison-ref="${focus}"]`)?.focus({ preventScroll: true });
   } catch (error) {
     if (current()) memoryUnavailable(slot, error.message);
   } finally { if (slot.sourceController === controller) slot.sourceController = null; }
@@ -2074,6 +2100,7 @@ function resetMemoryReads(slot) {
   for (const key of ["readController", "sourceController", "historyController"]) { slot[key]?.abort(); slot[key] = null; }
   slot.sourceRegion?.replaceChildren(); slot.historyList?.replaceChildren();
   slot.page = null; slot.offsets = [0]; slot.pageIndex = 0;
+  slot.comparisonReturn = null; slot.sourceAnchor = null; slot.sourceStart = 0;
 }
 
 function releaseMemoryDialog() {
@@ -2222,13 +2249,25 @@ function renderMemorySource(slot) {
   const focused = slot.sourceRegion.contains(document.activeElement);
   slot.sourceRegion.setAttribute("aria-busy", String(!!slot.sourceController));
   slot.sourceRegion.replaceChildren();
+  if (slot.sourceAnchor) {
+    const anchor = slot.sourceAnchor, end = anchor.empty && anchor.offset === slot.item.origin.total_bytes;
+    slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: end ? anchor.offset ? "变化位置在原文末尾，此侧没有对应正文。" : "比较结果中此侧正文为空。" : anchor.empty ? "此侧没有对应正文；下面从变化位置继续阅读。" : "从这处变化开始核对原文。" }));
+  }
   if (page) {
     slot.sourceRegion.append(element("p", { class: "memory-source-content", text: page.content }));
-    const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: !!slot.sourceController || slot.pageIndex === 0, onClick: () => void loadMemorySource(slot, slot.offsets[slot.pageIndex - 1], slot.pageIndex - 1) });
-    const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1) });
-    const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
+    const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: !!slot.sourceController || slot.pageIndex === 0, onClick: () => { if (slot.sourceRegion.contains(previous) && slot.pageIndex > 0) void loadMemorySource(slot, slot.offsets[slot.pageIndex - 1], slot.pageIndex - 1); } });
+    const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => { if (slot.sourceRegion.contains(next) && page.has_more) void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1); } });
+    const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `${slot.sourceStart > 0 ? "从变化位置起 · " : ""}第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
     slot.sourceRegion.append(element("nav", { class: "memory-source-navigation", "aria-label": "原文分段" }, previous, position, next));
     if (focused) position.focus({ preventScroll: true });
+  }
+  if (slot.sourceStart > 0) {
+    const start = element("button", { type: "button", class: "text-button", text: "从头阅读", disabled: !!slot.sourceController, onClick: () => {
+      if (!memoryDialogCurrent(slot) || !slot.sourceRegion.contains(start) || slot.sourceController) return;
+      slot.page = null; slot.offsets = [0]; slot.pageIndex = 0; slot.sourceStart = 0; slot.sourceAnchor = null;
+      void loadMemorySource(slot, 0, 0);
+    } });
+    slot.sourceRegion.append(start);
   }
   if (slot.sourceController) slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: "正在读取…" }));
   if (slot.sourceError) slot.sourceRegion.append(element("p", { class: "form-error", text: slot.sourceError }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemorySource(slot, slot.sourceRetry.offset, slot.sourceRetry.index) }));
