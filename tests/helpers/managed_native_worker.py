@@ -21,7 +21,7 @@ from functools import wraps
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import FrameType, FunctionType, ModuleType
-from typing import TYPE_CHECKING, Any, NoReturn, cast, get_args
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast, get_args
 
 if TYPE_CHECKING:
     from muli.managed_transaction import TransactionRecordV2
@@ -49,6 +49,11 @@ HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
+HELPER_START_BOUNDARIES = ("start_entered", "start_command_entered", "start_command_returned")
+HELPER_START_MODES = (
+    ("activating", "start_target", "target"),
+    ("rolling_back", "start_base", "base"),
+)
 # Version-two diagnostic labels, readable by the stdlib-only coordinator.
 HELPER_COST_PHASES = (
     "prepared",
@@ -3283,6 +3288,26 @@ def helper_cost_sample_facts(value: object, source: object) -> bool:
     )
 
 
+def helper_start_sample_facts(value: object, source: object) -> bool:
+    """Only fixed positive start facts may accompany an authenticated cost snapshot."""
+    if not isinstance(value, dict) or set(value) != {"sample", "costs"}:
+        return False
+    sample, costs = value["sample"], value["costs"]
+    return (
+        isinstance(sample, dict)
+        and set(sample) == {"kind", "revision", "phase", "intent", "role", "elapsed_ms"}
+        and sample["kind"] in HELPER_START_BOUNDARIES
+        and (sample["phase"], sample["intent"], sample["role"]) in HELPER_START_MODES
+        and type(sample["revision"]) is int
+        and 1 <= sample["revision"] <= 2**63 - 1
+        and type(sample["elapsed_ms"]) is int
+        and 0 <= sample["elapsed_ms"] <= 2**63 - 1
+        and isinstance(costs, dict)
+        and costs.get("code") == "observed"
+        and helper_costs_facts(costs, source)
+    )
+
+
 def unit_files() -> ModuleType:
     """Load only the fixture's fixed sibling, without changing import paths."""
     if __package__:
@@ -3440,6 +3465,14 @@ def install_helper_cost_hook() -> None:
         original_command = SystemdProbe._command
         original_request = ManagedLinuxBackend._request
         original_install = ManagedLinuxBackend.install
+        original_start = ManagedLinuxBackend.start
+        original_backend_command = ManagedLinuxBackend._command
+        start_context: (
+            tuple[ManagedLinuxBackend, TransactionRecordV2, Role, float, asyncio.Task[Any] | None]
+            | None
+        ) = None
+        start_boundary = -1
+        start_command_active = False
         managed_entry = sys.orig_argv[3] == "muli.managed_host"
         host_bound = not managed_entry
         host_spec = managed_host.__spec__
@@ -3604,6 +3637,103 @@ def install_helper_cost_hook() -> None:
             require(helper_costs_facts(value, source), "native_profile_invalid")
             return value
 
+        def start_checkpoint(
+            kind: str,
+            context: tuple[
+                ManagedLinuxBackend, TransactionRecordV2, Role, float, asyncio.Task[Any] | None
+            ],
+        ) -> None:
+            nonlocal start_boundary
+            try:
+                index = HELPER_START_BOUNDARIES.index(kind)
+                if start_context is not context or index <= start_boundary:
+                    return
+                # An observer failure consumes this attempt; never retry in a loop.
+                start_boundary = index
+                _, current, role, started, _ = context
+                elapsed = clock() - started
+                require(math.isfinite(elapsed) and elapsed >= 0, "native_profile_invalid")
+                publish(
+                    root / "helper-start-checkpoint.json",
+                    {
+                        "sample": {
+                            "kind": kind,
+                            "revision": current.revision,
+                            "phase": current.phase,
+                            "intent": current.intent,
+                            "role": role,
+                            "elapsed_ms": int(elapsed * 1000),
+                        },
+                        "costs": snapshot(),
+                    },
+                )
+            except Exception:
+                pass  # Ordinary diagnostic failures cannot change the real operation.
+
+        @wraps(original_start)
+        async def start(
+            backend: ManagedLinuxBackend, record: TransactionRecordV2, role: Role
+        ) -> None:
+            nonlocal start_context, start_boundary, start_command_active
+            context: (
+                tuple[
+                    ManagedLinuxBackend, TransactionRecordV2, Role, float, asyncio.Task[Any] | None
+                ]
+                | None
+            ) = None
+            try:
+                try:
+                    if (
+                        start_context is None
+                        and record.generation == facts["generation"]
+                        and managed_helper_unit_name(record) == facts["helper"]
+                        and (record.phase, record.intent, role) in HELPER_START_MODES
+                    ):
+                        started = clock()
+                        require(math.isfinite(started), "native_profile_invalid")
+                        context = backend, record, role, started, asyncio.current_task()
+                        start_context, start_boundary = context, -1
+                        start_checkpoint("start_entered", context)
+                except Exception:
+                    pass
+                return await original_start(backend, record, role)
+            finally:
+                if context is not None and start_context is context:
+                    start_context = None  # Identity only; never retain any file/security proof.
+                    start_boundary = -1
+                    start_command_active = False
+
+        @wraps(original_backend_command)
+        async def backend_command(
+            backend: ManagedLinuxBackend, action: Literal["start", "stop", "daemon-reload"]
+        ) -> None:
+            nonlocal start_command_active
+            context = start_context
+            observed = False
+            try:
+                observed = (
+                    context is not None
+                    and context[0] is backend
+                    and context[4] is asyncio.current_task()
+                    and action == "start"
+                    and not start_command_active
+                )
+            except Exception:
+                pass
+            if observed:
+                start_command_active = True
+            try:
+                if observed:
+                    assert context is not None
+                    start_checkpoint("start_command_entered", context)
+                await original_backend_command(backend, action)
+                if observed:
+                    assert context is not None
+                    start_checkpoint("start_command_returned", context)
+            finally:
+                if observed:
+                    start_command_active = False
+
         @wraps(original_install)
         async def install(
             backend: ManagedLinuxBackend,
@@ -3656,6 +3786,8 @@ def install_helper_cost_hook() -> None:
         SystemdProbe._command = command  # type: ignore[method-assign]
         ManagedLinuxBackend._request = request  # type: ignore[method-assign]
         ManagedLinuxBackend.install = install  # type: ignore[method-assign,assignment]
+        ManagedLinuxBackend.start = start  # type: ignore[method-assign]
+        ManagedLinuxBackend._command = backend_command  # type: ignore[method-assign]
         if managed_entry:
             # -m re-executes this source as __main__; the canonical import is
             # not the helper's execution namespace. Bind once before main runs.
@@ -3731,6 +3863,7 @@ def collect_helper_costs(
     completed_generation: str | None = None,
     retained: list[dict[str, Any]] | None = None,
     samples: list[dict[str, Any]] | None = None,
+    start_samples: list[dict[str, Any]] | None = None,
 ) -> None:
     """One local read after a checked helper exit or final case settlement."""
     facts: dict[str, Any] = {"code": "not_observed", "reason": "unavailable"}
@@ -3758,6 +3891,8 @@ def collect_helper_costs(
         ):
             retained.append({"source": dict(source), "costs": facts})
         return  # Optional diagnostics cannot occupy later transaction-note space.
+    # New optional starts may never displace already accepted cost/cleanup facts.
+    previous_starts = result["resources"].pop("helper_start_samples", [])
     result["resources"]["helper_costs"] = facts
     if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
         result["resources"]["helper_costs"] = {"code": "not_observed", "reason": "output_budget"}
@@ -3803,6 +3938,20 @@ def collect_helper_costs(
             break
         partials = candidate["resources"]["helper_cost_samples"]
         result["resources"]["helper_cost_samples"] = partials
+    starts: list[dict[str, Any]] = []
+    for row in previous_starts if start_samples is None else start_samples:
+        if len(starts) >= 3:
+            break
+        if any(old["source"]["generation"] == row["source"]["generation"] for old in starts):
+            continue
+        candidate = {
+            **result,
+            "resources": {**result["resources"], "helper_start_samples": [*starts, row]},
+        }
+        if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+            break
+        starts.append(row)
+        result["resources"]["helper_start_samples"] = list(starts)
 
 
 def install_hook() -> None:
@@ -3877,6 +4026,7 @@ class Case:
         self._helper_source_groups: dict[str, str] = {}
         self._helper_cost_history: list[dict[str, Any]] = []
         self._helper_cost_samples: list[dict[str, Any]] = []
+        self._helper_start_samples: list[dict[str, Any]] = []
         self.result: dict[str, Any] = {
             "completed": False,
             "stage": self.stage,
@@ -4059,6 +4209,82 @@ class Case:
         except Exception:
             pass  # Missing partial facts never change the transaction or its result.
 
+    def _discard_helper_start_samples(self, generation: str) -> None:
+        self._helper_start_samples[:] = [
+            row for row in self._helper_start_samples if row["source"]["generation"] != generation
+        ]
+        resources = self.result["resources"]
+        if "helper_start_samples" in resources:
+            rows = [
+                row
+                for row in resources["helper_start_samples"]
+                if row["source"]["generation"] != generation
+            ]
+            if rows:
+                resources["helper_start_samples"] = rows
+            else:
+                resources.pop("helper_start_samples")
+
+    def _collect_helper_start_sample(
+        self, record: TransactionRecordV2, *, deadline: float | None = None
+    ) -> None:
+        """Reuse an accepted source on the existing poll, including unchanged revisions."""
+        source = self.result["resources"].get("helper_source")
+        if (
+            record.generation in self._invalid_helper_sources
+            or not isinstance(source, dict)
+            or source.get("generation") != record.generation
+        ):
+            self._discard_helper_start_samples(record.generation)
+            return
+        if not any(
+            row["generation"] == source["generation"] and row["helper"] == source["helper"]
+            for row in self.result["generations"]
+        ):
+            return
+        old = next(
+            (
+                row
+                for row in self._helper_start_samples
+                if row["source"]["generation"] == record.generation
+            ),
+            None,
+        )
+        if old is not None and old["source"] != source:
+            self._discard_helper_start_samples(record.generation)
+            return
+        try:
+            value = _read_helper_cost_json(
+                self.root / "helper-start-checkpoint.json",
+                deadline=self.deadline if deadline is None else deadline,
+            )
+            if not helper_start_sample_facts(value, source):
+                return
+            sample = value["sample"]
+            if sample["revision"] > record.revision or not any(
+                row.get("stage") == "transaction"
+                and row.get("generation") == record.generation
+                and all(row.get(key) == sample[key] for key in ("revision", "phase", "intent"))
+                for row in self.result["timeline"]
+            ):
+                return
+            if old is not None:
+                previous = old["sample"]
+                current_key = sample["revision"], HELPER_START_BOUNDARIES.index(sample["kind"])
+                old_key = previous["revision"], HELPER_START_BOUNDARIES.index(previous["kind"])
+                if current_key <= old_key or (
+                    sample["revision"] == previous["revision"]
+                    and sample["elapsed_ms"] < previous["elapsed_ms"]
+                ):
+                    return
+            accepted = {"source": dict(source), **value}
+            if old is not None:
+                self._helper_start_samples[self._helper_start_samples.index(old)] = accepted
+            elif len(self._helper_start_samples) < 3:
+                self._helper_start_samples.append(accepted)
+        except Exception:
+            pass  # Ordinary local observation failures cannot replace the real outcome.
+
     async def helper_empty(self, probe: SystemdProbe, name: str, argv: tuple[str, ...]) -> bool:
         from muli.platforms.linux_controller import CgroupObservation
         from muli.platforms.linux_transaction import ObservationError
@@ -4094,6 +4320,7 @@ class Case:
             snapshot.name != name or snapshot.argv != argv or not membership
         ):
             self._invalid_helper_sources.add(generation)
+            self._discard_helper_start_samples(generation)
             self.result["resources"].pop("helper_source", None)
         require(snapshot.name == name and snapshot.argv == argv, "native_helper_identity")
         require(membership, "native_helper_membership")
@@ -4115,6 +4342,7 @@ class Case:
             ):
                 self._invalid_helper_sources.add(generation)
             if generation in self._invalid_helper_sources:
+                self._discard_helper_start_samples(generation)
                 self.result["resources"].pop("helper_source", None)
             elif (
                 0 < snapshot.pid < 2**31
@@ -4326,6 +4554,7 @@ class Case:
                             )
                             self._collect_helper_cost_sample(record)
                             position = fresh_position
+                        self._collect_helper_start_sample(record)
                         require(
                             record.phase != "recovery_required" and record.activation != "blocked",
                             "native_transaction_blocked",
@@ -4674,12 +4903,23 @@ async def run(mode: str, root: Path) -> int:
     finally:
         if mode != "cleanup":
             try:
+                if isinstance(case.result["resources"].get("helper_source"), dict):
+                    final_deadline = case.drive_deadline or case.deadline
+                    remaining(final_deadline)
+                    with case.journal() as journal:
+                        case._collect_helper_start_sample(
+                            case.record(journal), deadline=final_deadline
+                        )
+            except Exception:
+                pass  # A missing final boundary cannot replace the original case outcome.
+            try:
                 collect_helper_costs(
                     root,
                     case.result,
                     deadline=case.drive_deadline,
                     retained=case._helper_cost_history,
                     samples=case._helper_cost_samples,
+                    start_samples=case._helper_start_samples,
                 )
                 write_json(root / "result.json", case.result)
             except Exception:

@@ -1402,6 +1402,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "helper_costs",
             "helper_cost_history",
             "helper_cost_samples",
+            "helper_start_samples",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1441,13 +1442,13 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             )
         elif name == "controller_failure":
             valid = controller_failure_facts(facts, value)
-        elif name in {"helper_cost_history", "helper_cost_samples"}:
+        elif name in {"helper_cost_history", "helper_cost_samples", "helper_start_samples"}:
             valid = isinstance(facts, list) and 1 <= len(facts) <= 3
             seen: set[str] = set()
             if valid:
                 for retained in facts:
                     fields = {"source", "costs"}
-                    if name == "helper_cost_samples":
+                    if name != "helper_cost_history":
                         fields.add("sample")
                     if not isinstance(retained, dict) or set(retained) != fields:
                         valid = False
@@ -1461,10 +1462,35 @@ def fixture_result(data: bytes) -> dict[str, Any]:
                         and resource_worker().helper_costs_facts(costs, source) is True
                         and (
                             name == "helper_cost_history"
-                            or resource_worker().helper_cost_sample_facts(
-                                {"sample": retained["sample"], "costs": costs}, source
+                            or (
+                                name == "helper_cost_samples"
+                                and resource_worker().helper_cost_sample_facts(
+                                    {"sample": retained["sample"], "costs": costs}, source
+                                )
+                                is True
                             )
-                            is True
+                            or (
+                                name == "helper_start_samples"
+                                and resource_worker().helper_start_sample_facts(
+                                    {"sample": retained["sample"], "costs": costs}, source
+                                )
+                                is True
+                                and any(
+                                    row.get("stage") == "transaction"
+                                    and row.get("generation") == source["generation"]
+                                    and all(
+                                        row.get(key) == retained["sample"][key]
+                                        for key in ("revision", "phase", "intent")
+                                    )
+                                    for row in value["timeline"]
+                                )
+                                and (
+                                    not isinstance(resources.get("helper_source"), dict)
+                                    or resources["helper_source"].get("generation")
+                                    != source["generation"]
+                                    or resources["helper_source"] == source
+                                )
+                            )
                         )
                         and source["generation"] not in seen
                         and any(
@@ -2670,6 +2696,15 @@ class NativeCI:
             and controller_failure_facts(controller_failure, result)
         ):
             result["resources"]["controller_failure"] = controller_failure
+        starts = result["resources"].get("helper_start_samples", [])
+        while (
+            starts
+            and len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+            > OUTPUT_BYTES
+        ):
+            starts.pop()
+        if not starts:
+            result["resources"].pop("helper_start_samples", None)
         samples = result["resources"].get("helper_cost_samples", [])
         while (
             samples

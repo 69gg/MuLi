@@ -124,6 +124,8 @@ async def _exercise_generated_hook(
         (ManagedLinuxBackend, "_check"),
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
+        (ManagedLinuxBackend, "start"),
+        (ManagedLinuxBackend, "_command"),
         (SystemdProbe, "_command"),
         (managed_deployment, "verify_slot_files"),
         (managed_backend, "verify_slot_files"),
@@ -455,6 +457,8 @@ async def test_real_install_publishes_second_helper_partial_before_atexit(
         (ManagedLinuxBackend, "_check"),
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
+        (ManagedLinuxBackend, "start"),
+        (ManagedLinuxBackend, "_command"),
         (SystemdProbe, "_command"),
         (managed_deployment, "verify_slot_files"),
         (managed_backend, "verify_slot_files"),
@@ -1079,6 +1083,8 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
     callbacks: list[object] = []
     originals = (
         ManagedLinuxBackend._check,
+        ManagedLinuxBackend.start,
+        ManagedLinuxBackend._command,
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
@@ -1093,6 +1099,8 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
     assert callbacks == []
     assert (
         ManagedLinuxBackend._check,
+        ManagedLinuxBackend.start,
+        ManagedLinuxBackend._command,
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
@@ -1135,6 +1143,8 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
 
     originals = (
         ManagedLinuxBackend._check,
+        ManagedLinuxBackend.start,
+        ManagedLinuxBackend._command,
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
@@ -1150,6 +1160,8 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
     assert accesses == [] and callbacks == []
     assert (
         ManagedLinuxBackend._check,
+        ManagedLinuxBackend.start,
+        ManagedLinuxBackend._command,
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
@@ -1418,6 +1430,8 @@ async def slot_cost_observer(
         (ManagedLinuxBackend, "_check"),
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
+        (ManagedLinuxBackend, "start"),
+        (ManagedLinuxBackend, "_command"),
         (SystemdProbe, "_command"),
         (managed_deployment, "verify_slot_files"),
         (managed_backend, "verify_slot_files"),

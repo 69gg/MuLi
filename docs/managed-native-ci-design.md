@@ -1,5 +1,10 @@
 # 真实 systemd 托管切换 CI 设计
 
+Native65 诊断候选在原 helper 成本 hook 中增加 start 进入、命令进入及正常返回三个正向边界，
+每代仅保留最新固定快照，沿既有 poll 与最终收集读取；source、revision、mode 及输出预算
+继续严格校验。[边界合同与离线回归范围](managed-native-start-boundaries.md) 单独说明，
+这里不据实现声明检查通过、原生事务通过或性能改善。
+
 Native63 将启动前初始完整 guard 与紧邻的 `_confirm` 合为同一同步内容证明批次：第一个 writer-held guard 成功后才收集并传递 Python/package 字节证明，原 1＋7 道 guard、独立 open/身份/遍历/预算、controller 优先、writer/cgroup、revision、时钟和三文件检查全部保留；下一次 await 前丢弃局部证明。它不减少等待后的读取，不扩展到独立 confirmation。真实旧码为 2 failed / 6 passed（6.75 秒），两红只发生在所有实际启动与认证断言通过之后的重复字节预算；修后八项通过（7.12 秒；守卫 8.374 秒、峰值 68.8 MiB、swap 0），包含内容变化后恢复 mtime、双角色损坏优先级与 await 后重读。十文件 115 项关联整合通过（111.53 秒；守卫 112.814 秒、峰值 95.6 MiB），181 份源码非增量严格类型通过（守卫 27.302 秒、峰值 475.9 MiB），均 swap 0，重叠计数不累计。独立只读后审未发现有据 P1/P2；冻结构件和新 head 原生验收仍待收取，不据此宣称 CI 性能收益。
 
 Native62 精确签名 `9d107bb6` 的原生 job `122577871418` 已失败：adopt 投影为 35060 毫秒，第二代 start_target 为 55021 毫秒，60002 毫秒以 `TimeoutError` 结束，第三代未开始；其它平台作业当时仍在运行，尚不称十二项通用检查已完成。首代 checks 113 次 / 11721 毫秒，其中 controller 113 次 / 11043 毫秒，selected 0；host_record 29 次 / 3612 毫秒、bus 218 次 / 3989 毫秒、HTTP 12 次 / 1442 毫秒。嵌套计时不相加，运行间的整体波动不归因给单一修改。2184 字节 evidence（artifact `12784589288`）SHA256 为 `5c0cf5ef6b6586baddb9a37359e028e714f61a7b7bbab761eb44a956c977284b`；严格读端、cleanup verified、user/group removed 和空 mounts 已核验。Native63 同时整合已通过 PR CI 并签名打标的 v2.99.0 主线；未以合并或局部读取减少替代原生三事务验收。
