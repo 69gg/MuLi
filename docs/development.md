@@ -55,7 +55,7 @@ python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 
 ## 托管 CI
 
-CI 共14项作业，验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 每个版本按测试文件分成两份不重叠集合，Windows 分成三份，macOS 运行完整集合；同文件的参数化用例与夹具生命周期保持在一起。分组使用仓库相对文件名的稳定摘要，新增文件不会重排已有文件；pytest 自身的发现与忽略规则保持生效，分片不保证耗时均分。
+CI 共17项作业，包含14项后端测试分片、质量、MCP 与 Linux 原生作业，验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 macOS 每个版本按测试文件分成两份不重叠集合，Windows 分成三份；全部分片合起来覆盖完整测试集合，同文件的参数化用例与夹具生命周期保持在一起。分组使用仓库相对文件名的稳定摘要，新增文件不会重排已有文件；pytest 自身的发现与忽略规则保持生效，分片不保证耗时均分。正式发布复用这17项验证，并另运行准备、PyPI 发布与 GitHub Release，共20项作业。
 
 分片只在指定 `--muli-ci-shard` 时启用，编号从1开始；`--muli-ci-shards` 默认2，可选2或3。编号超出总数或所选组没有用例时明确报错，不把覆盖缺口当作通过。
 

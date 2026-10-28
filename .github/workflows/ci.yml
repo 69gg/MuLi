@@ -43,9 +43,23 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        os: [macos-latest]
-        python: ['3.12', '3.13']
         include:
+          - os: macos-latest
+            python: '3.12'
+            shard: 1
+            shards: 2
+          - os: macos-latest
+            python: '3.12'
+            shard: 2
+            shards: 2
+          - os: macos-latest
+            python: '3.13'
+            shard: 1
+            shards: 2
+          - os: macos-latest
+            python: '3.13'
+            shard: 2
+            shards: 2
           - os: ubuntu-latest
             python: '3.12'
             shard: 1
@@ -140,11 +154,7 @@ jobs:
           export MULI_MANAGED_TEST_ROOT="$directory"
           uv run python -c "import os; from pathlib import Path; from muli.platforms.filesystem_identity import verify_local_filesystems; verify_local_filesystems((Path(os.environ['MULI_MANAGED_TEST_ROOT']),))"
           printf 'MULI_MANAGED_TEST_ROOT=%s\n' "$directory" >> "$GITHUB_ENV"
-      - name: Run complete suite on macOS
-        if: ${{ !matrix.shard }}
-        run: uv run pytest -q --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
       - name: Run disjoint suite partition
-        if: ${{ matrix.shard }}
         run: uv run pytest -q --muli-ci-shard=${{ matrix.shard }} --muli-ci-shards=${{ matrix.shards }} --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
       - name: Release Linux recovery filesystem fixture
         if: always() && runner.os == 'Linux'

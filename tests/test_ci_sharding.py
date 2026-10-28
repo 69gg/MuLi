@@ -8,6 +8,7 @@ from typing import cast
 
 import conftest as ci_sharding
 import pytest
+import yaml
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,45 @@ def test_groups_cover_the_collected_items_once_without_splitting_files(
     assert set.union(*groups) == {item.nodeid for item in items}
     assert sum(map(len, groups)) == len(items)
     assert all(len(indices) == 1 for indices in file_groups.values())
+
+
+def test_workflow_matrix_covers_each_runner_with_complete_disjoint_partitions(
+    tmp_path: Path,
+) -> None:
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    suite = workflow["jobs"]["tests"]
+    matrix = suite["strategy"]["matrix"]
+    assert set(matrix) == {"include"}
+    entries = matrix["include"]
+    assert len(entries) == 14
+    items = sample_items(tmp_path)
+    for operating_system, shards in (
+        ("ubuntu-latest", 2),
+        ("macos-latest", 2),
+        ("windows-latest", 3),
+    ):
+        for python in ("3.12", "3.13"):
+            rows = [
+                row for row in entries if (row["os"], row["python"]) == (operating_system, python)
+            ]
+            assert sorted(row["shard"] for row in rows) == list(range(1, shards + 1))
+            assert all(row["shards"] == shards for row in rows)
+            selected: set[str] = set()
+            for row in rows:
+                config = CollectionConfig(
+                    tmp_path,
+                    options(f"--muli-ci-shard={row['shard']}", f"--muli-ci-shards={shards}"),
+                )
+                ids = {item.nodeid for item in select(config, items)}
+                assert ids and selected.isdisjoint(ids)
+                selected.update(ids)
+            assert selected == {item.nodeid for item in items}
+    commands = [step for step in suite["steps"] if step.get("run", "").startswith("uv run pytest ")]
+    (partition,) = commands
+    assert "if" not in partition
+    assert "--muli-ci-shard=${{ matrix.shard }}" in partition["run"]
+    assert "--muli-ci-shards=${{ matrix.shards }}" in partition["run"]
 
 
 @pytest.mark.parametrize("shards", [2, 3])
