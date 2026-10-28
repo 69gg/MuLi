@@ -1471,16 +1471,22 @@ def _create_app(
     async def workflow_schedules(
         after_id: Annotated[str, Query(max_length=200)] = "",
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
+        after_kind: Literal["workflow_schedule", "calendar_workflow_schedule"] | None = None,
     ) -> dict[str, Any]:
-        return runtime.scheduled_workflows.list(after_id=after_id, limit=limit)
+        return runtime.scheduled_workflows.list(
+            after_id=after_id, after_kind=after_kind, limit=limit
+        )
 
     @app.post("/api/workflow-schedules/{identifier}/cancel")
-    async def cancel_workflow_schedule(identifier: str) -> dict[str, Any]:
+    async def cancel_workflow_schedule(
+        identifier: str,
+        kind: Literal["workflow_schedule", "calendar_workflow_schedule"] = "workflow_schedule",
+    ) -> dict[str, Any]:
         async with runtime.configuration_lock:
             if configuration_closing:
                 raise MaintenanceError("transaction_unavailable", "service_closing")
             runtime.maintenance.require_configuration()
-            return await runtime.scheduled_workflows.cancel(identifier)
+            return await runtime.scheduled_workflows.cancel(identifier, kind=kind)
 
     @app.delete("/api/workflows/{identifier}")
     async def delete_workflow(identifier: str) -> dict[str, bool]:

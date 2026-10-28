@@ -12,11 +12,17 @@ from typing import TYPE_CHECKING, Any
 from muli.channels.types import NAMES
 from muli.evidence import EvidenceError
 from muli.proactive import FrozenRouting
+from muli.reminder_calendar import CalendarRule, next_after, normalize_calendar
 from muli.reminder_followup import task_status
 from muli.reply_origin import ReplyOrigin, authorize_route, channel_account
 from muli.store import new_id, now
 from muli.task_control import TaskSnapshot
-from muli.workflows import ScheduledOccurrence, WorkflowEngine
+from muli.workflows import (
+    SCHEDULE_OCCURRENCE_KINDS,
+    ScheduledOccurrence,
+    WorkflowEngine,
+    scheduled_occurrence_kind,
+)
 
 if TYPE_CHECKING:
     from muli.runtime import PreparedRequest, Runtime
@@ -24,12 +30,19 @@ if TYPE_CHECKING:
 JsonObject = dict[str, Any]
 _MODES = ("ask", "auto", "yolo")
 _ACTIVE = {"pending", "queued", "running"}
+_OCCURRENCE_SCHEDULE_KINDS: dict[str, str] = {
+    occurrence: schedule for schedule, occurrence in SCHEDULE_OCCURRENCE_KINDS.items()
+}
 
 
 def _digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=True, sort_keys=True, allow_nan=False).encode("ascii")
     ).hexdigest()
+
+
+def _authorization(item: JsonObject, kind: str) -> str:
+    return _digest(item if kind == "workflow_schedule" else [kind, item])
 
 
 class ScheduledWorkflows:
@@ -128,9 +141,11 @@ class ScheduledWorkflows:
         version: int,
         mode: str | None = None,
         *,
+        kind: str = "workflow_schedule",
         check_destination: bool = True,
         definition: JsonObject | None = None,
     ) -> str:
+        scheduled_occurrence_kind(kind)
         runtime = self.runtime
         if (
             runtime._closing
@@ -138,9 +153,17 @@ class ScheduledWorkflows:
             or item["version"] != version
             or item.get("active") is not True
             or "workflow_schedule" in runtime.config.settings.disabled_tools
+            or (
+                kind == "calendar_workflow_schedule"
+                and "workflow_schedule_calendar" in runtime.config.settings.disabled_tools
+            )
             or item.get("creator_session_id") != self.store.existing_main_session_id()
         ):
             raise PermissionError("定时委托授权已撤销或失效")
+        if kind == "calendar_workflow_schedule":
+            normalize_calendar(item.get("calendar"))
+            if item.get("interval_seconds") is not None:
+                raise PermissionError("日历委托不能使用固定秒数间隔")
         runtime.maintenance.admission.require()
         session = self._read("session", item["creator_session_id"])
         frozen_mode, current_mode = item.get("mode"), session.get("mode")
@@ -209,6 +232,33 @@ class ScheduledWorkflows:
     def create(
         self, name: str, prompt: str, due_at: float, interval_seconds: int | None = None
     ) -> JsonObject:
+        return self._create(name, prompt, due_at, interval_seconds)
+
+    def create_calendar(
+        self, name: str, prompt: str, timezone: str, local_time: str, weekdays: list[int]
+    ) -> JsonObject:
+        calendar = normalize_calendar(
+            {"version": 1, "timezone": timezone, "local_time": local_time, "weekdays": weekdays}
+        )
+        return self._create(
+            name,
+            prompt,
+            next_after(calendar, now()),
+            kind="calendar_workflow_schedule",
+            calendar=calendar,
+        )
+
+    def _create(
+        self,
+        name: str,
+        prompt: str,
+        due_at: float,
+        interval_seconds: int | None = None,
+        *,
+        kind: str = "workflow_schedule",
+        calendar: CalendarRule | None = None,
+    ) -> JsonObject:
+        scheduled_occurrence_kind(kind)
         caller, run_id, request, mode = self._caller()
         try:
             finite = type(due_at) in {int, float} and math.isfinite(due_at)
@@ -241,8 +291,9 @@ class ScheduledWorkflows:
         if proof is None:
             raise PermissionError("系统通知或队友资料不能授予定时委托")
         count = self.store.db.execute(
-            "SELECT count(*) FROM objects WHERE kind='workflow_schedule' "
-            "AND json_extract(data,'$.active')=1 AND json_extract(data,'$.next_due_at') IS NOT NULL"
+            "SELECT count(*) FROM objects WHERE kind IN (?,?) "
+            "AND json_extract(data,'$.active')=1 AND json_extract(data,'$.next_due_at') IS NOT NULL",
+            tuple(SCHEDULE_OCCURRENCE_KINDS),
         ).fetchone()[0]
         if count >= self.runtime.config.settings.limits.max_pending_runs:
             raise ValueError("未来定时委托已达到待办上限")
@@ -269,21 +320,24 @@ class ScheduledWorkflows:
             "created_at": now(),
             "updated_at": now(),
         }
+        if kind == "calendar_workflow_schedule":
+            item["calendar"] = normalize_calendar(calendar)
         if len(json.dumps(item, ensure_ascii=False).encode("utf-8")) > self._budget:
             raise EvidenceError("output_budget", "完整委托与授权超过保存预算")
-        self._authorize(item, 1, definition=workflow)
-        result = self._output({**self._summary(item), "due_at": due_at})
+        self._authorize(item, 1, kind=kind, definition=workflow)
+        result = self._output({**self._summary(item, kind=kind), "due_at": due_at})
         self.store.event(
             "workflow_schedule.updated",
             result,
-            objects=[("workflow", workflow), ("workflow_schedule", item)],
+            objects=[("workflow", workflow), (kind, item)],
         )
         self.runtime.reminders.changed.set()
         return result
 
-    def _summary(self, item: JsonObject) -> JsonObject:
+    def _summary(self, item: JsonObject, *, kind: str = "workflow_schedule") -> JsonObject:
+        occurrence_kind = scheduled_occurrence_kind(kind)
         occurrence = (
-            self._read("workflow_occurrence", item["last_occurrence_id"])
+            self._read(occurrence_kind, item["last_occurrence_id"])
             if item.get("last_occurrence_id")
             else None
         )
@@ -303,8 +357,9 @@ class ScheduledWorkflows:
                 "timed_out",
             }:
                 status = row[0]
-        return {
+        result: JsonObject = {
             "id": item["id"],
+            "kind": kind,
             "name": item["name"],
             "version": item["version"],
             "enabled": item["active"],
@@ -319,51 +374,62 @@ class ScheduledWorkflows:
             "last_run_id": occurrence.get("run_id") if occurrence else None,
             "last_status": status,
         }
+        if kind == "calendar_workflow_schedule":
+            result["calendar"] = normalize_calendar(item.get("calendar"))
+        return result
 
-    def list(self, *, after_id: str = "", limit: int = 50) -> JsonObject:
+    def list(
+        self, *, after_id: str = "", after_kind: str | None = None, limit: int = 50
+    ) -> JsonObject:
         if type(limit) is not int or limit < 1 or not isinstance(after_id, str):
             raise ValueError("列表游标或数量无效")
+        if after_kind is not None:
+            scheduled_occurrence_kind(after_kind)
         limit = min(limit, self.runtime.config.settings.limits.max_search_results)
+        cursor = "id>?" if after_kind is None else "(id,kind)>(?,?)"
+        arguments = (after_id,) if after_kind is None else (after_id, after_kind)
         rows = self.store.db.execute(
-            "SELECT id FROM objects WHERE kind='workflow_schedule' AND id>? ORDER BY id LIMIT ?",
-            (after_id, limit + 1),
+            "SELECT id,kind FROM objects WHERE kind IN (?,?) AND "
+            + cursor
+            + " ORDER BY id,kind LIMIT ?",
+            (*SCHEDULE_OCCURRENCE_KINDS, *arguments, limit + 1),
         ).fetchall()
-        identifiers = [str(row[0]) for row in rows[:limit]]
+        page = rows[:limit]
         return self._output(
             {
-                "items": [
-                    self._summary(self._read("workflow_schedule", key)) for key in identifiers
-                ],
-                "next_after": identifiers[-1] if len(rows) > limit else None,
+                "items": [self._summary(self._read(row[1], row[0]), kind=row[1]) for row in page],
+                "next_after": str(page[-1][0]) if len(rows) > limit else None,
+                "next_after_kind": str(page[-1][1]) if len(rows) > limit else None,
                 "has_more": len(rows) > limit,
             }
         )
 
-    async def cancel(self, identifier: str) -> JsonObject:
+    async def cancel(self, identifier: str, *, kind: str = "workflow_schedule") -> JsonObject:
         # Tool/API callers already own their ordinary authentication and write gate.
+        occurrence_kind = scheduled_occurrence_kind(kind)
         self.runtime.maintenance.admission.require()
         if self.runtime._closing:
             raise PermissionError("运行时正在关闭")
-        item = self._read("workflow_schedule", identifier)
+        item = self._read(kind, identifier)
         if item["active"]:
             item.update(
                 active=False, version=item["version"] + 1, next_due_at=None, updated_at=now()
             )
-            self.store.put("workflow_schedule", item)
+            self.store.put(kind, item)
         self.runtime.reminders.changed.set()
         rows = self.store.db.execute(
-            "SELECT id FROM objects WHERE kind='workflow_occurrence' "
+            "SELECT id FROM objects WHERE kind=? "
             "AND json_extract(data,'$.schedule_id')=? AND json_extract(data,'$.status')='running'",
-            (identifier,),
+            (occurrence_kind, identifier),
         ).fetchall()
         for row in rows:
-            occurrence = self._read("workflow_occurrence", row[0])
+            occurrence = self._read(occurrence_kind, row[0])
             run = self._read("workflow_run", occurrence["run_id"])
-            if not self._matches_run(item, occurrence, run):
+            if not self._matches_run(item, occurrence, run, kind=kind):
                 raise PermissionError("定时委托的运行关联无法核验，未取消其它运行")
             await self.runtime.workflows.cancel(occurrence["run_id"])
-        await self.runtime.bus.emit("workflow_schedule.updated", self._summary(item))
-        return self._output(self._summary(item))
+        await self.runtime.bus.emit("workflow_schedule.updated", self._summary(item, kind=kind))
+        return self._output(self._summary(item, kind=kind))
 
     def _binding(self, session_id: str) -> tuple[JsonObject, JsonObject] | None:
         row = self.store.db.execute(
@@ -375,7 +441,8 @@ class ScheduledWorkflows:
         if row is None:
             return None
         scheduled_run = self.store.db.execute(
-            "SELECT 1 FROM objects WHERE kind='workflow_run' AND id=? "
+            "SELECT json_type(data,'$.schedule_kind'),json_extract(data,'$.schedule_kind') "
+            "FROM objects WHERE kind='workflow_run' AND id=? "
             "AND json_type(data,'$.scheduled_occurrence_id') IS NOT NULL",
             (row[1],),
         ).fetchone()
@@ -387,9 +454,16 @@ class ScheduledWorkflows:
             raise PermissionError("定时委托节点正在停止")
         session = self._read("session", session_id)
         raw = session.get("scheduled_workflow")
+        kind = "workflow_schedule"
+        keys = {"schedule_id", "version", "occurrence_id", "run_id"}
+        if isinstance(raw, dict) and "schedule_kind" in raw:
+            if raw["schedule_kind"] != "calendar_workflow_schedule":
+                raise PermissionError("定时委托的节点类型无效")
+            kind = raw["schedule_kind"]
+            keys.add("schedule_kind")
         if (
             not isinstance(raw, dict)
-            or set(raw) != {"schedule_id", "version", "occurrence_id", "run_id"}
+            or set(raw) != keys
             or type(raw["version"]) is not int
             or any(
                 not isinstance(raw[key], str) or not raw[key]
@@ -397,10 +471,15 @@ class ScheduledWorkflows:
             )
             or raw["run_id"] != session.get("workflow_run_id")
             or session.get("workflow_node_id") not in {"work", "review"}
+            or (
+                scheduled_run[0] is not None
+                if kind == "workflow_schedule"
+                else scheduled_run[0] != "text" or scheduled_run[1] != kind
+            )
         ):
             raise PermissionError("定时委托的节点关联无效")
-        item = self._read("workflow_schedule", raw["schedule_id"])
-        occurrence = self._read("workflow_occurrence", raw["occurrence_id"])
+        item = self._read(kind, raw["schedule_id"])
+        occurrence = self._read(scheduled_occurrence_kind(kind), raw["occurrence_id"])
         proof = self.store.db.execute(
             "SELECT 1 FROM objects WHERE kind='workflow_run' AND id=? "
             "AND json_extract(data,'$.schedule_id')=? "
@@ -422,10 +501,10 @@ class ScheduledWorkflows:
             or occurrence.get("schedule_id") != item["id"]
             or occurrence.get("version") != raw["version"]
             or occurrence.get("status") != "running"
-            or occurrence.get("authorization") != _digest(item)
+            or occurrence.get("authorization") != _authorization(item, kind)
         ):
             raise PermissionError("定时委托的发生轮次关联已改变")
-        self._authorize(item, raw["version"], occurrence.get("mode"))
+        self._authorize(item, raw["version"], occurrence.get("mode"), kind=kind)
         return item, occurrence
 
     def guard_session(self, session_id: str) -> None:
@@ -439,9 +518,21 @@ class ScheduledWorkflows:
         return True, replace(snapshot, session_id=session_id) if snapshot else None
 
     @staticmethod
-    def _matches_run(item: JsonObject, occurrence: JsonObject, run: JsonObject) -> bool:
+    def _matches_run(
+        item: JsonObject,
+        occurrence: JsonObject,
+        run: JsonObject,
+        *,
+        kind: str = "workflow_schedule",
+    ) -> bool:
+        scheduled_occurrence_kind(kind)
         return bool(
-            run.get("id") == occurrence.get("run_id")
+            (
+                "schedule_kind" not in run
+                if kind == "workflow_schedule"
+                else run.get("schedule_kind") == kind
+            )
+            and run.get("id") == occurrence.get("run_id")
             and run.get("schedule_id") == item.get("id") == occurrence.get("schedule_id")
             and run.get("schedule_version") == occurrence.get("version")
             and run.get("scheduled_occurrence_id") == occurrence.get("id")
@@ -453,19 +544,21 @@ class ScheduledWorkflows:
 
     def _settle(self) -> bool:
         changed = False
-        after = ""
+        after_id, after_kind = "", ""
         limit = self.runtime.config.settings.limits.max_pending_runs
         while rows := self.store.db.execute(
-            "SELECT id FROM objects WHERE kind='workflow_occurrence' AND id>? "
-            "AND json_extract(data,'$.status')='running' ORDER BY id LIMIT ?",
-            (after, limit),
+            "SELECT id,kind FROM objects WHERE kind IN (?,?) AND (id,kind)>(?,?) "
+            "AND json_extract(data,'$.status')='running' ORDER BY id,kind LIMIT ?",
+            (*SCHEDULE_OCCURRENCE_KINDS.values(), after_id, after_kind, limit),
         ).fetchall():
-            after = str(rows[-1][0])
+            after_id, after_kind = str(rows[-1][0]), str(rows[-1][1])
             for row in rows:
-                occurrence = self._read("workflow_occurrence", row[0])
+                occurrence_kind = row[1]
+                kind = _OCCURRENCE_SCHEDULE_KINDS[occurrence_kind]
+                occurrence = self._read(occurrence_kind, row[0])
                 run = self._read("workflow_run", occurrence["run_id"])
-                item = self._read("workflow_schedule", occurrence["schedule_id"])
-                if not self._matches_run(item, occurrence, run):
+                item = self._read(kind, occurrence["schedule_id"])
+                if not self._matches_run(item, occurrence, run, kind=kind):
                     raise PermissionError("定时委托的终态关联无法核验")
                 if run["status"] in _ACTIVE:
                     continue
@@ -476,10 +569,14 @@ class ScheduledWorkflows:
                         # Local publication retains the original destination; the
                         # existing automatic outbox gate records revoked routing as blocked.
                         self._authorize(
-                            item, occurrence["version"], occurrence["mode"], check_destination=False
+                            item,
+                            occurrence["version"],
+                            occurrence["mode"],
+                            kind=kind,
+                            check_destination=False,
                         )
                         if (
-                            occurrence["authorization"] != _digest(item)
+                            occurrence["authorization"] != _authorization(item, kind)
                             or run.get("scheduled_occurrence_id") != occurrence["id"]
                             or run.get("schedule_id") != item["id"]
                             or run.get("reply_origin") != item["reply_origin"]
@@ -495,15 +592,13 @@ class ScheduledWorkflows:
                                 (run["name"] + "\n" + run.get("result", ""))[
                                     : self.runtime.config.settings.limits.max_output_chars
                                 ],
-                                objects=[
-                                    ("workflow_occurrence", {**updated, "publication": "recorded"})
-                                ],
+                                objects=[(occurrence_kind, {**updated, "publication": "recorded"})],
                                 routing=FrozenRouting.bound(
                                     ReplyOrigin.load(item["reply_origin"])
                                 ).dump(),
                             )
                         continue
-                self.store.put("workflow_occurrence", updated)
+                self.store.put(occurrence_kind, updated)
         return changed
 
     async def tick(self, timestamp: float) -> None:
@@ -511,36 +606,50 @@ class ScheduledWorkflows:
         changed = False
         try:
             async with runtime.configuration_lock:
+                timestamp = now()
                 if runtime._closing or not runtime.maintenance.admission.allowed:
                     return
                 changed = self._settle()
                 if runtime.attention_busy or not runtime.workflows.accepting_runs:
                     return
                 rows = self.store.db.execute(
-                    "SELECT id FROM objects WHERE kind='workflow_schedule' "
+                    "SELECT id,kind FROM objects WHERE kind IN (?,?) "
                     "AND json_extract(data,'$.active')=1 "
                     "AND json_extract(data,'$.next_due_at')<=? "
-                    "ORDER BY json_extract(data,'$.next_due_at'),id LIMIT ?",
-                    (timestamp, runtime.config.settings.limits.max_pending_runs),
+                    "ORDER BY json_extract(data,'$.next_due_at'),id,kind LIMIT ?",
+                    (
+                        *SCHEDULE_OCCURRENCE_KINDS,
+                        timestamp,
+                        runtime.config.settings.limits.max_pending_runs,
+                    ),
                 ).fetchall()
                 for row in rows:
-                    item = self._read("workflow_schedule", row[0])
+                    kind = row[1]
+                    occurrence_kind = scheduled_occurrence_kind(kind)
+                    item = self._read(kind, row[0])
                     try:
-                        mode = self._authorize(item, item["version"])
+                        mode = self._authorize(item, item["version"], kind=kind)
                     except (ValueError, PermissionError) as exc:
                         item["blocked"] = type(exc).__name__
-                        self.store.put("workflow_schedule", item)
+                        self.store.put(kind, item)
                         continue
                     due = item["next_due_at"]
-                    identifier = _digest([item["id"], item["version"], due])
-                    if self.store.get("workflow_occurrence", identifier) is not None:
-                        continue  # A lost reply cannot authorize a second start.
-                    interval = item["interval_seconds"]
-                    next_due = (
-                        due + (math.floor(max(0, timestamp - due) / interval) + 1) * interval
-                        if interval
-                        else None
+                    identity = [item["id"], item["version"], due]
+                    identifier = _digest(
+                        identity if kind == "workflow_schedule" else [kind, *identity]
                     )
+                    if self.store.get(occurrence_kind, identifier) is not None:
+                        continue  # A lost reply cannot authorize a second start.
+                    next_due: float | None
+                    if kind == "calendar_workflow_schedule":
+                        next_due = next_after(item["calendar"], timestamp)
+                    else:
+                        interval = item["interval_seconds"]
+                        next_due = (
+                            due + (math.floor(max(0, timestamp - due) / interval) + 1) * interval
+                            if interval
+                            else None
+                        )
                     item.update(
                         next_due_at=next_due,
                         fired_count=item["fired_count"] + 1,
@@ -554,7 +663,7 @@ class ScheduledWorkflows:
                         "version": item["version"],
                         "due_at": due,
                         "status": "running",
-                        "authorization": _digest(item),
+                        "authorization": _authorization(item, kind),
                         "created_at": now(),
                         "updated_at": now(),
                     }
@@ -563,7 +672,7 @@ class ScheduledWorkflows:
                         parent_session_id=item["creator_session_id"],
                         request_snapshot=self._snapshot(item),
                         reply_origin=ReplyOrigin.load(item["reply_origin"]),
-                        scheduled=ScheduledOccurrence(item, occurrence, mode),
+                        scheduled=ScheduledOccurrence(item, occurrence, mode, schedule_kind=kind),
                     )
                     changed = True
                     break
@@ -573,10 +682,11 @@ class ScheduledWorkflows:
 
     def next_due(self, timestamp: float) -> float | None:
         row = self.store.db.execute(
-            "SELECT json_extract(data,'$.next_due_at') FROM objects WHERE kind='workflow_schedule' "
+            "SELECT json_extract(data,'$.next_due_at') FROM objects WHERE kind IN (?,?) "
             "AND json_extract(data,'$.active')=1 AND json_extract(data,'$.next_due_at') IS NOT NULL "
             "AND json_extract(data,'$.blocked') IS NULL "
-            "ORDER BY json_extract(data,'$.next_due_at') LIMIT 1"
+            "ORDER BY json_extract(data,'$.next_due_at') LIMIT 1",
+            tuple(SCHEDULE_OCCURRENCE_KINDS),
         ).fetchone()
         if row is None:
             return None

@@ -66,7 +66,10 @@ export function createPreviewState() {
       { id: "demo-reviewer", session_id: "preview-reviewer", name: "独立复核", role: "reviewer", parent_id: main.id, task: "检查整理结果是否遗漏边界", status: "completed", generation: 1, last_message: "已核对范围，保留需要你确认的事项。", created_at: now - 3500 },
     ], teamMessages: [],
     workflows: [{ id: "workflow-review", name: "资料整理与复核", description: "先整理资料，再独立复核，最后汇总为一份简报。", mode: "auto", steps: [{ id: "research", title: "整理资料", role: "worker", prompt: "整理资料与来源。", depends_on: [] }, { id: "review", title: "独立复核", role: "reviewer", prompt: "核对结论与来源。", depends_on: ["research"] }], runs: [], created_at: now - 86400, updated_at: now - 3600 }],
-    workflowRuns: [], schedules: [{ id: "schedule-weekly", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null }],
+    workflowRuns: [], schedules: [
+      { id: "schedule-weekly", kind: "workflow_schedule", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null },
+      { id: "schedule-calendar", kind: "calendar_workflow_schedule", name: "早晨资料简报", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "08:00", weekdays: [1, 2, 3, 4, 5] }, enabled: true, blocked: false, due_at: now + 7200, interval_seconds: null, last_run_id: null, last_status: null },
+    ],
     reminders: [
       { id: "reminder-review", kind: "reminder", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now },
       { id: "calendar-study", kind: "calendar_reminder", title: "早晨背单词", content: "每天留一点时间复习。", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "07:30", weekdays: [1, 2, 3, 4, 5] }, due_at: now + 7200, interval_seconds: null, enabled: true, fired_count: 0, created_at: now },
@@ -407,8 +410,24 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     }
     if (path === "/workflow-runs/active" && method === "GET") return response(page(state.workflowRuns.filter((item) => ["pending", "queued", "running"].includes(item.status)), url));
     if (parts[0] === "workflow-runs" && parts[2] === "cancel" && method === "POST") { const item = state.workflowRuns.find((entry) => entry.id === id); if (item) { item.status = "cancelled"; emit("workflow.updated", { workflow_id: item.workflow_id, run: item }); return response({ cancelled: true }); } }
-    if (path === "/workflow-schedules" && method === "GET") return response(page(state.schedules, url));
-    if (parts[0] === "workflow-schedules" && parts[2] === "cancel" && method === "POST") { const item = state.schedules.find((entry) => entry.id === id); if (item) { item.enabled = false; return response({ cancelled: true }); } }
+    if (path === "/workflow-schedules" && method === "GET") {
+      const after = url.searchParams.get("after_id") ?? "", afterKind = url.searchParams.get("after_kind");
+      if (afterKind !== null && !["workflow_schedule", "calendar_workflow_schedule"].includes(afterKind)) return response({ detail: "委托类别无效" }, 422);
+      const kindOf = (item) => item.kind === undefined ? "workflow_schedule" : item.kind;
+      const sorted = state.schedules.map((item) => ({ ...item, kind: kindOf(item) })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
+      const candidates = sorted.filter((item) => item.id > after || (afterKind !== null && item.id === after && item.kind > afterKind));
+      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 20));
+      const items = candidates.slice(0, limit), hasMore = candidates.length > items.length;
+      return response({ items, has_more: hasMore, next_after: hasMore ? items.at(-1).id : null, next_after_kind: hasMore ? items.at(-1).kind : null });
+    }
+    if (parts[0] === "workflow-schedules" && parts[2] === "cancel" && method === "POST") {
+      const kind = url.searchParams.get("kind") ?? "workflow_schedule";
+      if (!["workflow_schedule", "calendar_workflow_schedule"].includes(kind)) return response({ detail: "委托类别无效" }, 422);
+      const item = state.schedules.find((entry) => entry.id === id && (entry.kind === undefined ? "workflow_schedule" : entry.kind) === kind);
+      if (!item) return response({ detail: "委托不存在" }, 404);
+      item.enabled = false; item.active = false; item.due_at = null; item.next_due_at = null;
+      emit("workflow_schedule.updated", { ...item, kind }); return response({ ...item, kind });
+    }
     if (parts[0] === "uploads") {
       if (parts.length === 1 && method === "GET") return response({ items: state.uploads });
       if (parts.length === 1 && method === "POST") {

@@ -53,6 +53,7 @@ async def test_schedule_directory_pages_without_authorization_payloads(
     assert first["next_after"] == "schedule-049"
     assert set(first["items"][0]) == {
         "id",
+        "kind",
         "name",
         "version",
         "enabled",
@@ -77,6 +78,61 @@ async def test_schedule_directory_pages_without_authorization_payloads(
     ).json()
     assert [item["id"] for item in last["items"]] == [f"schedule-{i:03d}" for i in range(50, 55)]
     assert last["has_more"] is False and last["next_after"] is None
+
+
+async def test_calendar_directory_and_cancel_use_the_host_kind_even_when_ids_match(
+    case: tuple[Runtime, httpx.AsyncClient],
+) -> None:
+    runtime, client = case
+    ordinary = schedule(runtime, "same-id")
+    rule = {"version": 1, "timezone": "Asia/Shanghai", "local_time": "08:00", "weekdays": [1]}
+    runtime.store.put(
+        "calendar_workflow_schedule",
+        {**ordinary, "kind": "workflow_schedule", "calendar": rule, "interval_seconds": None},
+    )
+    first = (await client.get("/api/workflow-schedules", params={"limit": 1})).json()
+    assert len(first["items"]) == 1
+    assert first["items"][0]["kind"] == first["next_after_kind"] == "calendar_workflow_schedule"
+    assert first["items"][0]["calendar"] == rule
+    assert first["next_after"] == "same-id" and first["has_more"] is True
+    following = (
+        await client.get(
+            "/api/workflow-schedules",
+            params={
+                "after_id": first["next_after"],
+                "after_kind": first["next_after_kind"],
+                "limit": 1,
+            },
+        )
+    ).json()
+    assert [item["kind"] for item in following["items"]] == ["workflow_schedule"]
+    assert following["has_more"] is False and following["next_after_kind"] is None
+    assert "private-" not in json.dumps(first) + json.dumps(following)
+    cancelled = await client.post(
+        "/api/workflow-schedules/same-id/cancel",
+        params={"kind": "calendar_workflow_schedule"},
+        json={},
+    )
+    assert cancelled.status_code == 200 and cancelled.json()["kind"] == "calendar_workflow_schedule"
+    assert runtime.store.get("calendar_workflow_schedule", "same-id")["active"] is False
+    assert runtime.store.get("workflow_schedule", "same-id") == ordinary
+    assert (
+        await client.post(
+            "/api/workflow-schedules/same-id/cancel", params={"kind": "unknown"}, json={}
+        )
+    ).status_code == 422
+    assert (
+        await client.get("/api/workflow-schedules", params={"after_kind": "unknown"})
+    ).status_code == 422
+    runtime.store.delete("calendar_workflow_schedule", "same-id")
+    assert (
+        await client.post(
+            "/api/workflow-schedules/same-id/cancel",
+            params={"kind": "calendar_workflow_schedule"},
+            json={},
+        )
+    ).status_code == 400
+    assert runtime.store.get("workflow_schedule", "same-id") == ordinary
 
 
 @pytest.mark.parametrize(

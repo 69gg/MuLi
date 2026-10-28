@@ -22,6 +22,7 @@ from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, tool_result
 
 import muli.reminders as reminders_module
+import muli.scheduled_workflows as scheduled_workflows_module
 from muli.config import ConfigFile
 from muli.permissions import Mode
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
@@ -319,6 +320,7 @@ async def test_ask_approval_and_current_mode_tightening_never_expand_scheduled_p
     await owner_turn(runtime, [], mode="ask", nodes=nodes)
     clock = due_at
     monkeypatch.setattr(reminders_module, "now", lambda: clock)
+    monkeypatch.setattr(scheduled_workflows_module, "now", lambda: clock)
     idle = ObservedEvent()
     runtime.reminders.changed = idle
     await runtime.reminders.start()
@@ -371,6 +373,7 @@ async def test_busy_main_defers_due_then_missed_periods_coalesce_without_duplica
         await entered.wait()
     clock = due_at + 180
     monkeypatch.setattr(reminders_module, "now", lambda: clock)
+    monkeypatch.setattr(scheduled_workflows_module, "now", lambda: clock)
     idle = ObservedEvent()
     runtime.reminders.changed = idle
     await runtime.reminders.start()
@@ -440,6 +443,7 @@ async def test_cancel_revokes_version_before_settling_tool_wait_and_prevents_new
 
     monkeypatch.setattr(runtime.bus, "emit", gate)
     monkeypatch.setattr(reminders_module, "now", lambda: due_at)
+    monkeypatch.setattr(scheduled_workflows_module, "now", lambda: due_at)
     await runtime.reminders.start()
     try:
         async with asyncio.timeout(3):
@@ -484,6 +488,7 @@ async def test_restart_admits_pending_once_but_interrupted_written_node_is_never
     second = Runtime(ConfigFile(config_path), data_dir, client_factory=completed_factory)
     clock = due_at
     monkeypatch.setattr(reminders_module, "now", lambda: clock)
+    monkeypatch.setattr(scheduled_workflows_module, "now", lambda: clock)
     idle = ObservedEvent()
     second.reminders.changed = idle
     snapshot_dir = tmp_path / "running-snapshot"

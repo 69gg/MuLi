@@ -22,6 +22,16 @@ _ROLES = frozenset({"main", "worker", "reviewer"})
 _MODES = frozenset({"ask", "auto", "yolo"})
 _UNFINISHED = frozenset({"pending", "queued", "running"})
 _FAILED = frozenset({"failed", "skipped", "cancelled", "interrupted"})
+SCHEDULE_OCCURRENCE_KINDS: dict[str, str] = {
+    "workflow_schedule": "workflow_occurrence",
+    "calendar_workflow_schedule": "calendar_workflow_occurrence",
+}
+
+
+def scheduled_occurrence_kind(schedule_kind: str) -> str:
+    if not isinstance(schedule_kind, str) or schedule_kind not in SCHEDULE_OCCURRENCE_KINDS:
+        raise ValueError("定时委托类型无效")
+    return SCHEDULE_OCCURRENCE_KINDS[schedule_kind]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +41,10 @@ class ScheduledOccurrence:
     schedule: JsonObject
     occurrence: JsonObject
     mode: str
+    schedule_kind: str = "workflow_schedule"
+
+    def __post_init__(self) -> None:
+        scheduled_occurrence_kind(self.schedule_kind)
 
 
 class WorkflowEngine:
@@ -298,9 +312,14 @@ class WorkflowEngine:
         mode = workflow["mode"] if scheduled is None else scheduled.mode
         if mode not in _MODES:
             raise ValueError("工作流执行模式无效")
+        occurrence_kind = (
+            scheduled_occurrence_kind(scheduled.schedule_kind)
+            if scheduled is not None
+            else "workflow_occurrence"
+        )
         if (
             scheduled is not None
-            and self.store.get("workflow_occurrence", scheduled.occurrence["id"]) is not None
+            and self.store.get(occurrence_kind, scheduled.occurrence["id"]) is not None
         ):
             raise ValueError("该定时轮次已经接纳，不能重新执行")
         if not self.accepting_runs:
@@ -336,9 +355,11 @@ class WorkflowEngine:
                 schedule_version=scheduled.schedule["version"],
                 scheduled_occurrence_id=scheduled.occurrence["id"],
             )
+            if scheduled.schedule_kind != "workflow_schedule":
+                run["schedule_kind"] = scheduled.schedule_kind
             occurrence = {**scheduled.occurrence, "run_id": identifier, "mode": mode}
             associations.extend(
-                [("workflow_schedule", scheduled.schedule), ("workflow_occurrence", occurrence)]
+                [(scheduled.schedule_kind, scheduled.schedule), (occurrence_kind, occurrence)]
             )
         for step in steps:
             session_id = new_id()
@@ -361,6 +382,8 @@ class WorkflowEngine:
                     "occurrence_id": run["scheduled_occurrence_id"],
                     "run_id": identifier,
                 }
+                if scheduled.schedule_kind != "workflow_schedule":
+                    session["scheduled_workflow"]["schedule_kind"] = scheduled.schedule_kind
             associations.append(("session", session))
             run["nodes"][step["id"]] = {
                 **deepcopy(step),

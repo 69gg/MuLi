@@ -15,6 +15,7 @@ from test_scheduled_task_replan_guards import paused_schedule
 from test_task_control_runtime import wait_agent
 
 import muli.reminders as reminders_module
+import muli.scheduled_workflows as scheduled_workflows_module
 from muli.providers import ModelTurn, ToolCall
 from muli.store import now
 
@@ -25,6 +26,7 @@ async def test_rolled_back_delegation_keeps_clock_alive_and_recovers_on_real_cha
     timestamp = now()
     due_at = timestamp + 60
     monkeypatch.setattr(reminders_module, "now", lambda: timestamp)
+    monkeypatch.setattr(scheduled_workflows_module, "now", lambda: timestamp)
     runtime, _ = make_runtime(
         tmp_path,
         [

@@ -1568,6 +1568,7 @@ class Runtime:
                 "reminder_cancel",
                 "reminder_reschedule",
                 "workflow_schedule",
+                "workflow_schedule_calendar",
                 "workflow_schedule_cancel",
                 "task_schedule_replan",
                 "task_schedule_replan_cancel",
@@ -2764,6 +2765,7 @@ class Runtime:
                     "resume_agent",
                     "workflow_create",
                     "workflow_schedule",
+                    "workflow_schedule_calendar",
                     "task_schedule_replan",
                 }
             }
@@ -3029,12 +3031,19 @@ class Runtime:
             await self.bus.notify()
             return item
 
+        async def schedule_calendar_workflow(args: dict[str, Any]) -> Any:
+            item = self.scheduled_workflows.create_calendar(**args)
+            await self.bus.notify()
+            return item
+
         async def list_scheduled_workflows(args: dict[str, Any]) -> Any:
             return self.scheduled_workflows.list(**args)
 
         async def cancel_scheduled_workflow(args: dict[str, Any]) -> Any:
             self.scheduled_workflows._caller()
-            return await self.scheduled_workflows.cancel(args["id"])
+            return await self.scheduled_workflows.cancel(
+                args["id"], kind=args.get("kind", "workflow_schedule")
+            )
 
         async def current_time(args: dict[str, Any]) -> Any:
             zone = args.get("timezone")
@@ -3275,16 +3284,61 @@ class Runtime:
                 preserve_output=True,
             ),
             Tool(
+                "workflow_schedule_calendar",
+                "按明确地区的当地时分(HH:MM)和ISO星期(1周一、7周日)，执行已获主人授权的 worker→reviewer 委托。"
+                "先核实时区与时间；不因普通提醒取得执行权；审批门保留，错过多次合并一次。",
+                parameters(
+                    {
+                        "name": string(),
+                        "prompt": string(),
+                        "timezone": string(),
+                        "local_time": {
+                            "type": "string",
+                            "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+                        },
+                        "weekdays": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 7,
+                            "uniqueItems": True,
+                            "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                        },
+                    },
+                    ("name", "prompt", "timezone", "local_time", "weekdays"),
+                ),
+                schedule_calendar_workflow,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
                 "workflow_schedule_list",
-                "分页查看定时委托和最近一次真实运行状态",
-                parameters({"after_id": string(), "limit": {"type": "integer", "minimum": 1}}),
+                "分页查看两类定时委托和最近真实运行；续页使用 next_after 与 next_after_kind",
+                parameters(
+                    {
+                        "after_id": string(),
+                        "after_kind": {
+                            "type": "string",
+                            "enum": ["workflow_schedule", "calendar_workflow_schedule"],
+                        },
+                        "limit": {"type": "integer", "minimum": 1},
+                    }
+                ),
                 list_scheduled_workflows,
                 preserve_output=True,
             ),
             Tool(
                 "workflow_schedule_cancel",
                 "撤销定时委托并精确取消其已接纳运行；不追回已派发副作用",
-                parameters({"id": string()}, ("id",)),
+                parameters(
+                    {
+                        "id": string(),
+                        "kind": {
+                            "type": "string",
+                            "enum": ["workflow_schedule", "calendar_workflow_schedule"],
+                        },
+                    },
+                    ("id",),
+                ),
                 cancel_scheduled_workflow,
                 "write",
                 preserve_output=True,

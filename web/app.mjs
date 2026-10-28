@@ -2242,7 +2242,7 @@ function captureWorkflowView(root) {
   const inside = root.contains(focused);
   return {
     inside, action: inside ? focused?.dataset?.action : null,
-    id: focused?.dataset?.id, direction: focused?.dataset?.direction,
+    id: focused?.dataset?.id, kind: focused?.dataset?.kind, direction: focused?.dataset?.direction,
     heading: inside ? focused?.getAttribute("id") : null,
     summary: inside && focused?.tagName === "SUMMARY" ? focused.closest("[data-workflow-history-run]")?.dataset.workflowHistoryRun : null,
     open: $$("[data-workflow-history-run]", root).filter((node) => node.open).map((node) => node.dataset.workflowHistoryRun),
@@ -2254,7 +2254,7 @@ function restoreWorkflowView(root, saved) {
   const histories = $$("[data-workflow-history-run]", root);
   for (const details of histories) details.open = saved.open.includes(details.dataset.workflowHistoryRun);
   if (!saved.inside) return;
-  const button = saved.action && $$("[data-action]", root).find((node) => node.dataset.action === saved.action && node.dataset.id === saved.id && node.dataset.direction === saved.direction);
+  const button = saved.action && $$("[data-action]", root).find((node) => node.dataset.action === saved.action && node.dataset.id === saved.id && node.dataset.kind === saved.kind && node.dataset.direction === saved.direction);
   const summary = saved.summary && histories.find((node) => node.dataset.workflowHistoryRun === saved.summary)?.querySelector("summary");
   const heading = saved.heading && $$("[id]", root).find((node) => node.getAttribute("id") === saved.heading);
   const target = button && !button.disabled ? button : summary || heading || $("#workflow-active-heading", root);
@@ -2288,6 +2288,9 @@ function renderWorkflowActivity() {
   return root;
 }
 
+function workflowScheduleKind(item) { return item.kind === undefined ? "workflow_schedule" : item.kind; }
+function workflowScheduleKey(kind, id) { return JSON.stringify([kind, id]); }
+
 async function loadWorkflowSchedules(slot, after = "", starts = [""]) {
   const owner = connection;
   if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !connectionCurrent(owner)) return;
@@ -2296,18 +2299,25 @@ async function loadWorkflowSchedules(slot, after = "", starts = [""]) {
   slot.schedulesLoading = true; slot.schedulesError = ""; renderOtherView();
   const current = () => workflowActivityCurrent(slot) && slot.schedulesOpen && connectionCurrent(owner) && slot.schedulesController === controller && !controller.signal.aborted;
   try {
-    const payload = await ownedRequest(`/workflow-schedules?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" }, owner);
+    const cursor = typeof after === "string" ? { id: after, kind: null } : after;
+    const query = new URLSearchParams({ after_id: cursor.id, limit: workflowPageSize });
+    if (cursor.kind !== null) query.set("after_kind", cursor.kind);
+    const payload = await ownedRequest(`/workflow-schedules?${query}`, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     if (!payload || !Array.isArray(payload.items) || payload.items.length > workflowPageSize || typeof payload.has_more !== "boolean") throw new Error("定时委托响应不完整，请重试。");
     const seen = new Set();
     const items = payload.items.map((item) => {
-      if (!item || typeof item.id !== "string" || !item.id || item.id === after || seen.has(item.id) || typeof item.name !== "string" || typeof item.enabled !== "boolean" || !(item.due_at === null || (Number.isFinite(item.due_at) && item.due_at > 0)) || !(item.last_run_id === null || (typeof item.last_run_id === "string" && item.last_run_id)) || !(item.last_status === null || ["pending", "queued", "running", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(item.last_status))) throw new Error("定时委托响应不完整，请重试。");
-      seen.add(item.id);
+      const kind = item && workflowScheduleKind(item), key = workflowScheduleKey(kind, item?.id);
+      if (!item || !["workflow_schedule", "calendar_workflow_schedule"].includes(kind) || typeof item.id !== "string" || !item.id || (item.id === cursor.id && (cursor.kind === null || kind <= cursor.kind)) || seen.has(key) || typeof item.name !== "string" || typeof item.enabled !== "boolean" || !(item.due_at === null || (Number.isFinite(item.due_at) && item.due_at > 0)) || !(item.last_run_id === null || (typeof item.last_run_id === "string" && item.last_run_id)) || !(item.last_status === null || ["pending", "queued", "running", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(item.last_status))) throw new Error("定时委托响应不完整，请重试。");
+      seen.add(key);
       if (typeof item.blocked !== "boolean") throw new Error("定时委托响应不完整，请重试。");
-      return { id: item.id, name: item.name, enabled: item.enabled, blocked: item.blocked, due_at: item.due_at, interval_seconds: item.interval_seconds, last_run_id: item.last_run_id, last_status: item.last_status };
+      return { id: item.id, kind, calendar_label: kind === "calendar_workflow_schedule" ? calendarLabel(item.calendar) : null, name: item.name, enabled: item.enabled, blocked: item.blocked, due_at: item.due_at, interval_seconds: item.interval_seconds, last_run_id: item.last_run_id, last_status: item.last_status };
     });
     if (payload.has_more ? !items.length || payload.next_after !== items.at(-1).id : payload.next_after !== null) throw new Error("定时委托翻页位置无效，请重新读取。");
-    slot.schedulesPage = { items, has_more: payload.has_more, next_after: payload.next_after };
+    const modern = payload.next_after_kind !== undefined || payload.items.some((item) => item.kind !== undefined);
+    if (modern && (payload.has_more ? payload.next_after_kind !== items.at(-1).kind : payload.next_after_kind !== null)) throw new Error("定时委托翻页类别无效，请重新读取。");
+    const next = modern && payload.has_more ? { id: payload.next_after, kind: payload.next_after_kind } : payload.next_after;
+    slot.schedulesPage = { items, has_more: payload.has_more, next_after: payload.next_after, next_cursor: next };
     slot.schedulesAfter = after; slot.schedulesStarts = [...starts];
   } catch (error) { if (current()) slot.schedulesError = error.message; }
   finally {
@@ -2331,11 +2341,13 @@ function renderWorkflowSchedules() {
     const status = !item.enabled ? "已停用" : item.blocked ? "暂缓执行" : item.due_at === null ? "无后续计划" : "等待下次执行";
     const recent = { pending: "等待中", queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", timed_out: "超时" };
     const content = element("div", { class: "row-content" }, element("h4", { text: item.name }), element("code", { class: "workflow-run-id", text: item.id }), element("div", { class: "row-meta" }, status, item.due_at !== null && element("time", { text: formatTimestamp(item.due_at) })));
+    if (item.calendar_label) content.append(element("div", { class: "row-meta", text: item.calendar_label }));
     if (item.last_run_id) content.append(element("div", { class: "row-meta" }, `最近执行：${recent[item.last_status] ?? "状态未记录"}`, element("code", { text: item.last_run_id })));
     const actions = element("div", { class: "row-actions" });
     if (item.enabled) {
-      const cancel = actionButton(slot.schedulesStopping.has(item.id) ? "正在提交…" : "取消委托", "cancel-workflow-schedule", "secondary-button", "stop", { id: item.id });
-      cancel.disabled = slot.schedulesLoading || slot.schedulesStopping.has(item.id); actions.append(cancel);
+      const key = workflowScheduleKey(item.kind, item.id);
+      const cancel = actionButton(slot.schedulesStopping.has(key) ? "正在提交…" : "取消委托", "cancel-workflow-schedule", "secondary-button", "stop", { id: item.id, kind: item.kind });
+      cancel.disabled = slot.schedulesLoading || slot.schedulesStopping.has(key); actions.append(cancel);
     }
     root.append(element("article", { class: "workflow-active-row" }, content, actions));
   }
@@ -3190,17 +3202,19 @@ async function handleAction(action, button) {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || slot.schedulesLoading) return;
     if (action === "refresh-workflow-schedules") await loadWorkflowSchedules(slot);
-    else if (button.dataset.direction === "next" && slot.schedulesPage?.has_more) await loadWorkflowSchedules(slot, slot.schedulesPage.next_after, [...slot.schedulesStarts, slot.schedulesPage.next_after]);
+    else if (button.dataset.direction === "next" && slot.schedulesPage?.has_more) await loadWorkflowSchedules(slot, slot.schedulesPage.next_cursor, [...slot.schedulesStarts, slot.schedulesPage.next_cursor]);
     else if (button.dataset.direction === "previous" && slot.schedulesStarts.length > 1) await loadWorkflowSchedules(slot, slot.schedulesStarts.at(-2), slot.schedulesStarts.slice(0, -1));
   }
   if (action === "cancel-workflow-schedule") {
     const slot = workflowActivity, id = button.dataset.id, owner = connection;
-    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || !slot.schedulesPage?.items.some((item) => item.id === id && item.enabled) || slot.schedulesStopping.has(id)) return;
-    slot.schedulesStopping.add(id); renderOtherView();
+    const kind = workflowScheduleKind(button.dataset), key = workflowScheduleKey(kind, id);
+    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || !slot.schedulesPage?.items.some((item) => item.id === id && item.kind === kind && item.enabled) || slot.schedulesStopping.has(key)) return;
+    slot.schedulesStopping.add(key); renderOtherView();
     try {
-      await ownedRequest(`/workflow-schedules/${encodeURIComponent(id)}/cancel`, { method: "POST" }, owner);
+      const query = kind === "workflow_schedule" ? "" : `?${new URLSearchParams({ kind })}`;
+      await ownedRequest(`/workflow-schedules/${encodeURIComponent(id)}/cancel${query}`, { method: "POST" }, owner);
       if (workflowActivityCurrent(slot) && connectionCurrent(owner)) { toast("已提交取消请求"); await loadWorkflowSchedules(slot, slot.schedulesAfter, slot.schedulesStarts); }
-    } finally { slot.schedulesStopping.delete(id); if (workflowActivityCurrent(slot) && connectionCurrent(owner)) renderOtherView(); }
+    } finally { slot.schedulesStopping.delete(key); if (workflowActivityCurrent(slot) && connectionCurrent(owner)) renderOtherView(); }
   }
   if (["refresh-workflow-runs", "page-workflow-runs"].includes(action)) {
     const slot = workflowActivity;

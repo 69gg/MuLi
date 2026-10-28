@@ -50,6 +50,27 @@ async function json(backend, path, method = "GET", body) {
   return { status: result.status, body: await result.json() };
 }
 
+test("preview calendar schedule paging and cancellation preserve the exact kind", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  const base = { id: "same-id", name: "合成定时委托", enabled: true, due_at: 10000 };
+  backend.state.schedules = [{ ...base, kind: "calendar_workflow_schedule" }, { ...base, kind: "workflow_schedule" }];
+  const first = await json(backend, "/workflow-schedules?limit=1");
+  assert.equal(first.body.next_after, "same-id");
+  assert.equal(first.body.next_after_kind, "calendar_workflow_schedule");
+  const next = await json(backend, "/workflow-schedules?limit=1&after_id=same-id&after_kind=calendar_workflow_schedule");
+  assert.deepEqual(next.body.items.map((item) => item.kind), ["workflow_schedule"]);
+  assert.equal(next.body.next_after_kind, null);
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel?kind=calendar_workflow_schedule", "POST")).status, 200);
+  assert.equal(backend.state.schedules[0].enabled, false);
+  assert.equal(backend.state.schedules[1].enabled, true);
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel", "POST")).body.kind, "workflow_schedule");
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel?kind=unknown", "POST")).status, 422);
+  assert.equal((await json(backend, "/workflow-schedules?after_kind=unknown")).status, 422);
+  backend.state.schedules = [{ ...base }];
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel?kind=calendar_workflow_schedule", "POST")).status, 404);
+  assert.equal(backend.state.schedules[0].enabled, true);
+});
+
 test("preview activation never claims that a real channel receiver was verified", async (t) => {
   const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
   backend.state.settings.channels.telegram.enabled = true;

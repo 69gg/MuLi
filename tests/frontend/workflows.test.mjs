@@ -144,11 +144,93 @@ const definitions = () => ({ items: [structuredClone(definition)] });
 const activeCalls = (h) => h.requests.filter((request) => request.path.startsWith("/workflow-runs/active?"));
 const schedule = (id, extra = {}) => ({ id, name: `定时研究 ${id}`, enabled: true, blocked: false, due_at: 10000, interval_seconds: 604800, last_run_id: null, last_status: null, ...extra });
 const scheduleCalls = (h) => h.requests.filter((request) => request.path.startsWith("/workflow-schedules?"));
+const schedulePage = (items, has_more = false) => ({ ...page(items, has_more), next_after_kind: has_more ? items.at(-1).kind : null });
 async function click(h, button) {
   assert.ok(button instanceof DOMButton, "expected a real button node");
   for (const handler of h.document.events.click ?? []) await handler({ target: button, preventDefault() {} });
   await flush();
 }
+
+test("calendar and interval schedules with one ID cancel only the chosen kind", async () => {
+  const items = [
+    schedule("same-id", { kind: "calendar_workflow_schedule", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "08:00", weekdays: [1, 3] }, prompt: "private-calendar-task" }),
+    schedule("same-id", { kind: "workflow_schedule" }),
+  ];
+  const h = harness(async (path, options) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    if (options.method === "POST") {
+      assert.equal(path, "/workflow-schedules/same-id/cancel?kind=calendar_workflow_schedule");
+      items[0].enabled = false; return { ...items[0] };
+    }
+    return schedulePage(items);
+  });
+  await h.ui.switchView("workflows"); await click(h, h.button("toggle-workflow-schedules"));
+  assert.equal(h.ui.activity.schedulesError, "");
+  assert.ok(h.other.textContent.includes("Asia/Shanghai · 08:00 · 周一、周三"));
+  assert.equal(h.other.textContent.includes("private-calendar-task"), false);
+  const buttons = h.other.querySelectorAll('[data-action="cancel-workflow-schedule"]');
+  assert.equal(buttons.length, 2);
+  await click(h, buttons.find((button) => button.dataset.kind === "calendar_workflow_schedule"));
+  assert.equal(items[0].enabled, false); assert.equal(items[1].enabled, true);
+  const remaining = h.other.querySelectorAll('[data-action="cancel-workflow-schedule"]');
+  assert.equal(remaining.length, 1); assert.equal(remaining[0].dataset.kind, "workflow_schedule");
+  assert.equal(h.errors.length, 0);
+});
+
+test("schedule paging carries kind across identical IDs and restores the first page", async () => {
+  const first = schedule("same-id", { kind: "calendar_workflow_schedule" });
+  const second = schedule("same-id", { kind: "workflow_schedule" });
+  const h = harness(async (path) => {
+    if (path === "/workflows") return definitions();
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    const query = new URLSearchParams(path.split("?")[1]);
+    if (!query.get("after_id")) return schedulePage([first], true);
+    assert.equal(query.get("after_id"), "same-id");
+    assert.equal(query.get("after_kind"), "calendar_workflow_schedule");
+    return schedulePage([second]);
+  });
+  await h.ui.switchView("workflows"); await click(h, h.button("toggle-workflow-schedules"));
+  await click(h, h.other.querySelectorAll('[data-action="page-workflow-schedules"]').find((button) => button.dataset.direction === "next"));
+  assert.equal(h.ui.activity.schedulesError, "");
+  assert.equal(h.ui.activity.schedulesPage.items[0].kind, "workflow_schedule");
+  await click(h, h.other.querySelectorAll('[data-action="page-workflow-schedules"]').find((button) => button.dataset.direction === "previous"));
+  assert.equal(h.ui.activity.schedulesPage.items[0].kind, "calendar_workflow_schedule");
+  assert.equal(new URLSearchParams(scheduleCalls(h).at(-1).path.split("?")[1]).has("after_kind"), false);
+});
+
+test("workflow events preserve the focused schedule kind before keyboard cancellation", async (t) => {
+  const items = [schedule("same-id", { kind: "calendar_workflow_schedule" }), schedule("same-id", { kind: "workflow_schedule" })];
+  const h = harness(async (path, options) => {
+    if (path === "/workflows") return definitions();
+    if (path === "/sessions") return { items: [] };
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    if (options.method === "POST") {
+      assert.equal(path, "/workflow-schedules/same-id/cancel");
+      items[1].enabled = false; return { ...items[1] };
+    }
+    return schedulePage(items);
+  });
+  await h.ui.switchView("workflows"); await click(h, h.button("toggle-workflow-schedules"));
+  h.ui.startGlobalEvents(); t.after(() => h.ui.stopEvents());
+  h.other.querySelectorAll('[data-action="cancel-workflow-schedule"]').find((button) => button.dataset.kind === "workflow_schedule").focus();
+  h.emitGlobal({ type: "workflow.updated", data: { workflow_id: "unlisted" } }); await flush();
+  const focused = h.document.activeElement;
+  assert.equal(focused.dataset.action, "cancel-workflow-schedule");
+  assert.equal(focused.dataset.kind, "workflow_schedule");
+  assert.equal(h.other.contains(focused), true);
+  await click(h, focused);
+  assert.equal(items[0].enabled, true); assert.equal(items[1].enabled, false);
+});
+
+test("schedule directory rejects unknown kinds and incomplete modern cursors", async () => {
+  for (const payload of [schedulePage([schedule("bad", { kind: "unknown" })]), page([schedule("bad", { kind: "calendar_workflow_schedule" })], true)]) {
+    const h = harness(async (path) => path === "/workflows" ? definitions() : path.startsWith("/workflow-runs/active?") ? page([]) : payload);
+    await h.ui.switchView("workflows"); await click(h, h.button("toggle-workflow-schedules"));
+    assert.ok(h.ui.activity.schedulesError);
+    assert.equal(h.other.querySelectorAll('[data-action="cancel-workflow-schedule"]').length, 0);
+  }
+});
 
 test("all active runs have independent stop buttons even when recent history is completed or the definition is absent", async () => {
   const active = [run("old-running"), run("same-definition-queued", "queued"), run("unlisted-definition", "pending", { workflow_id: "old-definition", name: "旧定义任务" })];
