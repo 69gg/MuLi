@@ -25,7 +25,7 @@ from muli.runtime import Runtime
 from muli.server import create_app
 
 
-def call(identifier: str, name: str, **arguments: Any) -> ToolCall:
+def call(identifier: str, name: str, /, **arguments: Any) -> ToolCall:
     return ToolCall(identifier, name, json.dumps(arguments, ensure_ascii=False))
 
 

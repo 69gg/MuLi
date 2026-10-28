@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from muli.attachments import Attachments, file_io
+from muli.channel_health import POLLING_FAILURES
 from muli.events import EventBus
 from muli.maintenance import Admission
 from muli.permissions import ApprovalNotice
@@ -62,6 +63,7 @@ class ChannelManager:
         admission: Admission | None = None,
         control_submit: Submit | None = None,
         ownership_guard: Callable[[object, Mapping[str, Any]], None] | None = None,
+        on_receive_fault: Callable[[str, str], None] | None = None,
     ) -> None:
         self.store, self.bus, self.config, self.submit = store, bus, config, submit
         self.attachments = attachments
@@ -70,6 +72,7 @@ class ChannelManager:
         self.admission = admission or Admission()
         self.control_submit = control_submit
         self.ownership_guard = ownership_guard
+        self.on_receive_fault = on_receive_fault
         # Validate before constructing an owned client, including on reconfigure.
         self.store.prepare_channels()
         self._owns_client = client is None
@@ -87,6 +90,10 @@ class ChannelManager:
         self.changed = asyncio.Condition()
         self._inbound_lock = asyncio.Lock()
         self._errors: dict[str, str] = {}
+        self._receive_health: dict[str, dict[str, str | None]] = {
+            name: {"state": "idle", "code": None, "occurrence_id": None}
+            for name in POLLING_FAILURES
+        }
         self._active: set[str] = set()
         self._closed = False
         self._stopped = False
@@ -111,12 +118,14 @@ class ChannelManager:
     async def start(self) -> None:
         if self._tasks or self._closed:
             return
+        receive_failed = False
         for name in NAMES:
             if self.config.profile(name).enabled:
                 try:
                     self.adapters[name].ready()
                 except ChannelError as error:
                     self._errors[name] = str(error)
+                    receive_failed = self._receive_fault(name, unavailable=True) or receive_failed
                 else:
                     self._active.add(name)
         self.recover()
@@ -124,12 +133,14 @@ class ChannelManager:
             asyncio.create_task(self._outbox(), name="muli-channel-outbox"),
             asyncio.create_task(self._events(), name="muli-channel-events"),
         ]
-        for name in ("telegram", "weixin"):
-            if name in self._active:
+        for poll_name in POLLING_FAILURES:
+            if poll_name in self._active:
                 self._tasks.append(
-                    asyncio.create_task(self._poll(name), name="muli-channel-" + name)
+                    asyncio.create_task(self._poll(poll_name), name="muli-channel-" + poll_name)
                 )
         self._wake.set()
+        if receive_failed:
+            await self._publish()
 
     def recover(self) -> None:
         """Pure local crash recovery; probation never needs to start adapters."""
@@ -196,6 +207,8 @@ class ChannelManager:
                 "voice_mime_types": sorted(self.adapters[name].voice_mime_types),
                 "last_error": self._errors.get(name, ""),
             }
+            if name in self._receive_health:
+                channels[name]["receive_health"] = dict(self._receive_health[name])
         return {
             "running": bool(self._tasks),
             "channels": channels,
@@ -578,11 +591,45 @@ class ChannelManager:
             chunks(), file.name, file.mime_type, source="channel:" + name
         )
 
+    def _receive_current(self, name: str) -> bool:
+        task = asyncio.current_task()
+        return (
+            not self._closed
+            and self.config.profile(name).enabled
+            and task is not None
+            and not task.cancelling()
+            and task in self._tasks
+        )
+
+    def _receive_fault(self, name: str, *, unavailable: bool = False) -> bool:
+        task = asyncio.current_task()
+        if (
+            name not in self._receive_health
+            or self._closed
+            or not self.config.profile(name).enabled
+            or task is None
+            or task.cancelling()
+            or self._receive_health[name]["state"] == "failed"
+        ):
+            return False
+        code = POLLING_FAILURES[name][0 if unavailable else 1]
+        occurrence = new_id()
+        self._receive_health[name] = {"state": "failed", "code": code, "occurrence_id": occurrence}
+        if self.on_receive_fault is not None:
+            try:
+                self.on_receive_fault(code, occurrence)
+            except Exception:
+                # Diagnostics must not change the original retry/cursor behavior.
+                pass
+        return True
+
     async def _poll(self, name: str) -> None:
         key = "poll:" + name + ":" + self._account(name)
-        while True:
+        while self._receive_current(name):
             try:
                 batch = await self.adapters[name].poll(self._state(key))
+                if not self._receive_current(name):
+                    return
                 for message in batch.messages:
                     try:
                         await self.receive(name, message)
@@ -590,18 +637,28 @@ class ChannelManager:
                         if error.status_code == 403:
                             continue  # Unbound groups are not a retryable delivery.
                         raise
+                if not self._receive_current(name):
+                    return
                 self._set_state(key, batch.cursor)
-                self._errors.pop(name, None)
+                recovered = self._receive_health[name]["state"] != "ready"
+                self._receive_health[name] = {"state": "ready", "code": None, "occurrence_id": None}
+                had_error = self._errors.pop(name, None) is not None
+                if recovered or had_error:
+                    await self._publish()
                 if not batch.messages:
                     # Real servers long-poll; this also bounds an immediate empty/error response loop.
                     await asyncio.sleep(min(1.0, self.config.retry_backoff_seconds or 0.1))
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                self._errors[name] = (
-                    str(error) if isinstance(error, ChannelError) else type(error).__name__
-                )
-                await self._publish()
+                if not self._receive_current(name):
+                    return
+                detail = str(error) if isinstance(error, ChannelError) else type(error).__name__
+                changed = self._errors.get(name) != detail
+                self._errors[name] = detail
+                failed = self._receive_fault(name)
+                if failed or changed:
+                    await self._publish()
                 delay = max(
                     self.config.retry_backoff_seconds,
                     error.retry_after if isinstance(error, ChannelError) else 0,

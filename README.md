@@ -17,7 +17,7 @@ MuLi 是面向个人电脑的常驻助手。你可以和她聊天、交办任务
   <img src="https://raw.githubusercontent.com/69gg/MuLi/22433e03284bd8715972a3b71adeb21b1cf239c7/docs/screenshots/workbench-demo.gif" alt="沐璃新版工作台演示：输入任务、工具调用、人工批准和流式答复" width="960">
 </picture>
 
-- **一起做事**：搜索资料、管理文件，让多个 agent 分工、交流和复核。
+- **一起做事**：搜索资料、管理文件、阅读与收藏 PDF、DOCX 正文，让多个 agent 分工、交流和复核。
 - **记住重要的事**：后台整理偏好、事实与关系，按问题查找记忆，保留可核对的原文。
 - **随时联系**：网页之外，可选接入 Telegram、OneBot/NapCat、QQ 官方机器人、微信 iLink 和 chiliarch。
 - **使用电脑**：按平台提供无障碍操作、截图与录屏，可收发文件、图片和语音。

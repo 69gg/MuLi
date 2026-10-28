@@ -46,6 +46,7 @@ from muli.platforms.managed_deployment import (
     verify_slot_files,
 )
 from muli.platforms.managed_launcher import directory, python_fingerprint
+from muli.zip_directory import ZipDirectoryError, check_zip_directory
 
 if TYPE_CHECKING:
     from muli.managed_preparation import LocalSlotPaths
@@ -54,7 +55,6 @@ if TYPE_CHECKING:
 _DIGEST = TypeAdapter(Digest)
 _IDENTIFIER = TypeAdapter(Identifier)
 _CHUNK = 65_536
-_EOCD = struct.Struct("<4s4H2IH")
 _UV_VERSIONS = frozenset({"0.13.0", "0.13.1"})
 _UV_OUTPUT = re.compile(r"uv (0\.13\.[01])(?: \([a-zA-Z0-9 .:+_-]+\))?\n?\Z")
 
@@ -179,27 +179,16 @@ def _archive(
     source: BinaryIO, size: int, limits: CandidateLimits, deadline: float
 ) -> tuple[int, int]:
     # Bound the central directory before ZipFile builds its complete ZipInfos.
-    source.seek(max(0, size - (_EOCD.size + 65_535)))
-    tail = source.read(_EOCD.size + 65_535)
-    position = tail.rfind(b"PK\x05\x06")
-    if position < 0 or position + _EOCD.size > len(tail):
-        raise CandidateError("candidate_wheel_invalid")
-    _, disk, central_disk, disk_count, count, central_size, offset, comment = _EOCD.unpack_from(
-        tail, position
-    )
-    if (
-        disk != 0
-        or central_disk != 0
-        or disk_count != count
-        or count == 0
-        or count == 65_535
-        or count > limits.archive_entries
-        or central_size > limits.central_directory_bytes
-        or offset + central_size != size - _EOCD.size - comment
-        or position + _EOCD.size + comment != len(tail)
-    ):
-        raise CandidateError("candidate_archive_budget")
-    source.seek(0)
+    try:
+        count = check_zip_directory(
+            source,
+            size,
+            max_entries=limits.archive_entries,
+            max_directory_bytes=limits.central_directory_bytes,
+        )
+    except ZipDirectoryError as exc:
+        code = "candidate_wheel_invalid" if exc.reason == "invalid" else "candidate_archive_budget"
+        raise CandidateError(code) from None
     expanded = 0
     names: set[str] = set()
     try:

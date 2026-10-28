@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
+import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 
 // Run the actual application functions and registered dialog close handler.
 // No browser library, server, model, account or real database is involved.
@@ -98,6 +99,19 @@ function sourcePage(item, content, offset = 0, total = offset + Buffer.byteLengt
   return { memory_id: item.id, source_id: item.source_id, ...item.origin, field: "content", revision: item.origin.digest, content, offset_bytes: offset, length_bytes: length, next_offset_bytes: offset + length, total_bytes: total, has_more: offset + length < total, ...extra };
 }
 
+function catalogSource(overrides = {}) {
+  return { source_id: "attachment:source?&one", source: "attachment:document:v1", session_id: "original-session", role: "tool", principal: "external:attachment", trusted_owner: false, revision: "a".repeat(64), created_at: 1, total_bytes: 24, job: { state: "failed", attempts: 2, last_error: "RuntimeError" }, ...overrides };
+}
+
+function catalogPage(items = [], overrides = {}) {
+  return { items, examined: items.length, omitted: 0, has_more: false, next_cursor: null, consistency: "live", order: "newest_registered_first", ...overrides };
+}
+
+async function openCatalog(h) {
+  h.ui.useMemoryViews(); h.other.replaceChildren(h.ui.renderMemories());
+  await clickMemoryButton(h, h.other.querySelector('[data-memory-tab="sources"]'));
+}
+
 function harness(handler = async () => { throw new Error("unexpected request"); }) {
   const document = { events: {}, activeElement: null, createTextNode: (text) => new TextNode(text), addEventListener(name, callback) { (this.events[name] ??= []).push(callback); } };
   document.createElement = (tag) => tag === "button" ? new DOMButton(tag, document) : new DOMElement(tag, document);
@@ -121,7 +135,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     setTimeout: () => 0, clearTimeout() {},
     createSessionState: () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
     uploadFile() {}, transcribeAttachment() {},
-    VoiceInput: class { cancel() {} }, restoreTeamView() {}, sessionStorage: {},
+    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
@@ -139,7 +153,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
       activateConnection,
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       stopEvents() { globalController?.abort(); },
-      get slot() { return memoryDialog; }, get path() { return memoryPath; }, get submit() { return dialogSubmit; } };
+      get slot() { return memoryDialog; }, get path() { return memoryPath; }, get catalog() { return memorySources; }, get submit() { return dialogSubmit; } };
   `, context);
   const ui = context.ui; ui.state.view = "memories"; ui.state.auth.authenticated = true;
   const body = () => document.querySelector("#dialog-content").textContent;
@@ -147,6 +161,184 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const expand = async (text) => { const details = dialog.querySelectorAll("details").find((entry) => entry.firstElementChild.textContent === text); assert.ok(details, `missing ${text}`); details.open = true; await details.dispatch("toggle"); await flush(); };
   return { ui, requests, document, dialog, form, other, body, button, expand, windowEvents, emitGlobal: (event) => globalEvent(event) };
 }
+
+test("source tab explicitly advances empty candidate windows and keeps its outer layout", async () => {
+  const item = catalogSource();
+  const h = harness(async (path) => {
+    assert.ok(path.startsWith("/memory/sources?"));
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("limit"), "20");
+    return query.get("cursor") || query.get("state") ? catalogPage([item]) : catalogPage([], { examined: 2, omitted: 2, has_more: true, next_cursor: "next-window" });
+  });
+  await openCatalog(h);
+  const root = h.other.firstElementChild, panel = h.ui.catalog;
+  assert.equal(h.requests.length, 1); assert.ok(h.other.textContent.includes("本窗口没有匹配来源，请继续翻页"));
+  assert.equal(h.button("继续翻页", h.other).disabled, false);
+  await clickMemoryButton(h, h.button("继续翻页", h.other));
+  assert.equal(new URLSearchParams(h.requests[1].path.split("?")[1]).get("cursor"), "next-window");
+  assert.equal(h.other.firstElementChild === root, true); assert.equal(h.ui.catalog === panel, true);
+  for (const text of [item.source_id, item.principal, item.source, item.session_id, "整理失败", "RuntimeError"]) assert.ok(h.other.textContent.includes(text), text);
+  assert.ok(h.other.textContent.includes("查看已保存资料及整理进度。"));
+  const details = h.other.querySelector(".memory-row details.advanced-settings");
+  assert.ok(details); assert.equal(details.firstElementChild.textContent, "来源详情"); assert.equal(details.open, false);
+  assert.equal(h.requests.length, 2); assert.equal(h.button("继续翻页", h.other).disabled, true);
+  const filter = h.other.querySelector('select[aria-label="来源整理状态"]');
+  filter.value = "failed"; await filter.dispatch("change"); await flush();
+  const filtered = new URLSearchParams(h.requests[2].path.split("?")[1]);
+  assert.equal(filtered.get("state"), "failed"); assert.equal(filtered.has("cursor"), false);
+  await clickMemoryButton(h, h.button("刷新来源", h.other));
+  assert.equal(h.requests.length, 4); assert.equal(h.requests[3].path, h.requests[2].path);
+  assert.equal(h.other.firstElementChild === root, true);
+});
+
+test("a catalog source opens bounded source-only retrieval and can return to the global query", async () => {
+  const source = catalogSource(), scoped = fixtureMemory("scoped", { source_id: source.source_id, content: "仅此资料的备份步骤", matched_by: "reranked" }), global = fixtureMemory("global", { content: "全库结果" });
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([source]);
+    if (path.startsWith("/memory/query?")) {
+      const parameters = new URLSearchParams(path.split("?")[1]);
+      assert.equal(parameters.get("source_id"), source.source_id); assert.equal(parameters.get("limit"), "20");
+      return { memories: [scoped], source_ids: [source.source_id], truncated: true, degraded: ["semantic_unavailable:TimeoutError"] };
+    }
+    assert.equal(path, "/memories?query=%E5%A4%87%E4%BB%BD"); return { items: [global] };
+  });
+  await openCatalog(h); await clickMemoryButton(h, h.button("在此来源内查找", h.other));
+  assert.equal(h.ui.state.memoryTab, "list"); assert.equal(h.ui.state.memorySourceId, source.source_id);
+  assert.ok(h.other.textContent.includes(source.source_id)); assert.ok(h.other.textContent.includes(scoped.content));
+  assert.ok(h.other.textContent.includes("部分结果因预算省略")); assert.ok(h.other.textContent.includes("语义检索暂不可用"));
+  assert.equal(h.other.querySelector("#memory-search").getAttribute("placeholder"), "在此来源内检索");
+  await h.ui.searchMemories("备份");
+  assert.equal(new URLSearchParams(h.requests.at(-1).path.split("?")[1]).get("query"), "备份");
+  await clickMemoryButton(h, h.button("查全库", h.other));
+  assert.equal(h.ui.state.memorySourceId, null); assert.equal(h.ui.state.memoryQuery, "备份");
+  assert.ok(h.other.textContent.includes(global.content)); assert.equal(h.other.textContent.includes(scoped.content), false);
+  assert.equal(h.other.textContent.includes("语义检索暂不可用"), false);
+});
+
+test("switching out of a source cancels late retrieval rather than reviving scoped results", async () => {
+  const pending = deferred(), source = catalogSource(), stale = fixtureMemory("stale", { source_id: source.source_id, content: "STALE_SCOPE_BODY" }), current = fixtureMemory("current", { content: "CURRENT_GLOBAL_BODY" });
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([source]) : path.startsWith("/memory/query?") ? pending.promise : { items: [current] });
+  await openCatalog(h); await clickMemoryButton(h, h.button("在此来源内查找", h.other));
+  const scopedRequest = h.requests.at(-1);
+  await clickMemoryButton(h, h.button("查全库", h.other)); assert.equal(scopedRequest.signal.aborted, true);
+  pending.resolve({ source_ids: [source.source_id], memories: [stale], degraded: [], truncated: false }); await flush();
+  assert.equal(h.ui.state.memorySourceId, null); assert.equal(h.ui.state.memories[0].id, current.id);
+  assert.equal(h.other.textContent.includes(stale.content), false); assert.ok(h.other.textContent.includes(current.content));
+});
+
+test("source query rejects a response with mismatched scope rather than showing another source", async () => {
+  const source = catalogSource(), foreign = fixtureMemory("foreign", { source_id: "another-source", content: "不得展示另一来源正文" });
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([source]) : { source_ids: [source.source_id], memories: [foreign], degraded: [], truncated: false });
+  await openCatalog(h); await clickMemoryButton(h, h.button("在此来源内查找", h.other));
+  assert.equal(h.ui.state.memorySourceId, source.source_id); assert.equal(h.ui.state.memories.length, 0);
+  assert.equal(h.other.textContent.includes(foreign.content), false);
+  assert.equal(h.requests.length, 2, "scope mismatch must not fall back to a global request");
+});
+
+test("retained source action buttons cannot reopen a reader or retry after paging or leaving", async () => {
+  const first = catalogSource(), second = catalogSource({ source_id: "second-source" });
+  const h = harness(async (path) => {
+    assert.ok(path.startsWith("/memory/sources?"));
+    const cursor = new URLSearchParams(path.split("?")[1]).get("cursor");
+    return cursor ? catalogPage([second]) : catalogPage([first], { has_more: true, next_cursor: "second-window" });
+  });
+  await openCatalog(h);
+  const oldRead = h.button("核原文", h.other), oldRetry = h.button("重试此来源", h.other);
+  await clickMemoryButton(h, h.button("继续翻页", h.other));
+  assert.equal(h.requests.length, 2);
+  await clickMemoryButton(h, oldRead); await clickMemoryButton(h, oldRetry);
+  assert.equal(h.requests.length, 2); assert.equal(h.dialog.open, false); assert.equal(h.ui.slot === null, true);
+  const readBeforeLeave = h.button("核原文", h.other), retryBeforeLeave = h.button("重试此来源", h.other);
+  await h.ui.switchView("chat");
+  assert.equal(h.ui.catalog === null, true);
+  await clickMemoryButton(h, readBeforeLeave); await clickMemoryButton(h, retryBeforeLeave);
+  assert.equal(h.requests.length, 2); assert.equal(h.dialog.open, false); assert.equal(h.ui.slot === null, true);
+});
+
+test("leaving the sources tab or losing authentication discards a late private catalog", async () => {
+  for (const leave of [async (h) => clickMemoryButton(h, h.other.querySelector('[data-memory-tab="graph"]')), async (h) => h.ui.showLogin(), async (h) => h.windowEvents.pagehide()]) {
+    const pending = deferred(), h = harness(async () => pending.promise);
+    const opening = openCatalog(h); await flush();
+    const signal = h.requests[0].signal;
+    await leave(h); assert.equal(signal.aborted, true); assert.equal(h.ui.catalog === null, true);
+    pending.resolve(catalogPage([catalogSource({ principal: "LATE_PRIVATE_CATALOG" })])); await opening;
+    assert.equal(h.other.textContent.includes("LATE_PRIVATE_CATALOG"), false);
+    assert.equal(h.ui.catalog === null, true);
+  }
+});
+
+test("catalog source reader uses exact source identity and UTF-8 paging without a memory id", async () => {
+  const first = "目录原文🙂", last = "<script>字面尾部</script>";
+  const offset = Buffer.byteLength(first), total = offset + Buffer.byteLength(last);
+  const item = catalogSource({ total_bytes: total });
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([item]);
+    assert.ok(path.startsWith("/memory/source?"));
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("id"), item.source_id); assert.equal(query.get("revision"), item.revision);
+    const start = Number(query.get("offset_bytes")), content = start === 0 ? first : last;
+    return { source_id: item.source_id, revision: item.revision, field: "content", content, offset_bytes: start, length_bytes: Buffer.byteLength(content), next_offset_bytes: start + Buffer.byteLength(content), total_bytes: total, has_more: start === 0 };
+  });
+  await openCatalog(h); assert.equal(h.requests.length, 1);
+  await clickMemoryButton(h, h.button("核原文", h.other));
+  assert.ok(h.body().includes(first)); assert.equal(h.requests.length, 2);
+  await clickMemoryButton(h, h.button("下一段"));
+  assert.ok(h.body().includes(last)); assert.equal(h.body().includes(first), false);
+  assert.equal(h.dialog.querySelectorAll("script").length, 0); assert.equal(h.button("下一段").disabled, true);
+  assert.equal(new URLSearchParams(h.requests.at(-1).path.split("?")[1]).get("offset_bytes"), String(offset));
+  await clickMemoryButton(h, h.button("上一段"));
+  assert.ok(h.body().includes(first)); assert.equal(h.body().includes(last), false);
+});
+
+test("closing the catalog source reader aborts and rejects a late body", async () => {
+  const pending = deferred(), item = catalogSource();
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([item]) : pending.promise);
+  await openCatalog(h);
+  await clickMemoryButton(h, h.button("核原文", h.other));
+  const signal = h.requests.at(-1).signal, slot = h.ui.slot;
+  h.dialog.close(); await flush();
+  assert.equal(signal.aborted, true); assert.equal(h.ui.slot === null, true);
+  pending.resolve({ source_id: item.source_id, revision: item.revision, field: "content", content: "LATE_PRIVATE_BODY", offset_bytes: 0, length_bytes: 17, next_offset_bytes: 17, total_bytes: 17, has_more: false });
+  await flush();
+  assert.equal(h.body(), ""); assert.equal(slot.sourceRegion.textContent, ""); assert.equal(h.dialog.open, false);
+});
+
+test("single-source retry requires confirmation and renders the actual receipt without polling", async () => {
+  for (const [reason, state, accepted, description] of [["queued", "queued", true, "尚未完成整理"], ["already_pending", "processing", false, "未重复排队"], ["already_done", "done", false, "未重新执行"], ["capacity_full", "failed", false, "本次未接纳"]]) {
+    const item = catalogSource();
+    const h = harness(async (path, options) => {
+      if (path.startsWith("/memory/sources?")) return catalogPage([item]);
+      assert.equal(path, "/memory/sources/retry"); assert.equal(options.method, "POST");
+      assert.deepEqual(JSON.parse(options.body), { source_id: item.source_id, revision: item.revision });
+      return { source_id: item.source_id, revision: item.revision, previous_state: "failed", state, accepted, reason };
+    });
+    await openCatalog(h);
+    await clickMemoryButton(h, h.button("重试此来源", h.other));
+    assert.equal(h.requests.length, 1); assert.equal(h.dialog.open, true);
+    assert.ok(h.body().includes(item.source_id) && h.body().includes(item.revision) && h.body().includes("可能再次收费"));
+    assert.equal(h.document.querySelector("#dialog-submit").textContent, "确认重试");
+    await h.form.dispatch("submit");
+    assert.equal(h.requests.length, 2); assert.equal(h.dialog.open, true); assert.equal(h.ui.submit, null);
+    assert.ok(h.body().includes(description)); assert.ok(h.other.textContent.includes(description));
+    assert.ok(h.body().includes("排队不代表完成"));
+    h.dialog.close(); await flush();
+    assert.equal(h.requests.length, 2); assert.ok(h.other.textContent.includes(description));
+  }
+});
+
+test("closing an in-flight source retry aborts and a late receipt cannot replace another dialog", async () => {
+  const pending = deferred(), item = catalogSource();
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([item]) : pending.promise);
+  await openCatalog(h); await clickMemoryButton(h, h.button("重试此来源", h.other));
+  const submission = h.form.dispatch("submit"), signal = h.requests.at(-1).signal;
+  h.dialog.close(); await flush(); assert.equal(signal.aborted, true);
+  h.ui.openDialog({ title: "另一对话框", content: h.document.createTextNode("保留当前内容"), readOnly: true });
+  pending.resolve({ source_id: item.source_id, revision: item.revision, previous_state: "failed", state: "queued", accepted: true, reason: "queued" });
+  await submission;
+  assert.equal(h.document.querySelector("#dialog-title").textContent, "另一对话框");
+  assert.equal(h.body(), "保留当前内容"); assert.equal(h.ui.catalog.receipt, null);
+  assert.equal(h.requests.length, 2);
+});
 
 test("every memory has real check/edit/delete buttons even without relations or an origin", () => {
   const h = harness();
@@ -483,6 +675,32 @@ function mountGraphResults(h, items, query = "Lumi") {
   h.other.replaceChildren(h.ui.renderMemories());
   return h.other.querySelector("[data-memory-path]");
 }
+
+test("fresh graph evidence stays in the chosen source and a scope change aborts the reader", async () => {
+  const source = catalogSource({ source_id: "source-one" }), item = graphMemory(), pending = deferred();
+  item.graph_via.seed.source_id = source.source_id;
+  for (const step of item.graph_via.steps) step.source_id = source.source_id;
+  let queries = 0;
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([source]);
+    if (path.startsWith("/memory/query?")) {
+      const params = new URLSearchParams(path.split("?")[1]);
+      assert.equal(params.get("source_id"), source.source_id);
+      queries += 1;
+      return queries <= 2 ? { source_ids: [source.source_id], memories: [item] } : pending.promise;
+    }
+    assert.equal(path, "/memories?query=Lumi"); return { items: [] };
+  });
+  await openCatalog(h); await clickMemoryButton(h, h.button("在此来源内查找", h.other));
+  await h.ui.searchMemories("Lumi");
+  await clickMemoryButton(h, h.other.querySelector("[data-memory-path]"));
+  const signal = h.requests.at(-1).signal;
+  assert.equal(queries, 3); assert.ok(h.ui.path);
+  await clickMemoryButton(h, h.button("查全库", h.other));
+  assert.equal(signal.aborted, true); assert.equal(h.ui.path === null, true);
+  pending.resolve({ source_ids: [source.source_id], memories: [item] }); await flush();
+  assert.equal(h.ui.path === null, true); assert.equal(h.other.textContent.includes(item.content), false);
+});
 
 async function clickMemoryButton(h, button) {
   assert.ok(button instanceof DOMButton);

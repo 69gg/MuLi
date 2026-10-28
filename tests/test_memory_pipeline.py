@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -46,7 +46,9 @@ class MockMedia:
         self.rerank_calls = 0
         self.failures = failures
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: Sequence[str], *, purpose: Literal["document", "query"] = "document"
+    ) -> list[list[float]]:
         self.embed_calls.append(list(texts))
         if self.failures:
             self.failures -= 1
@@ -81,10 +83,12 @@ class PausedQueryMedia(MockMedia):
             if self.fail:
                 raise RuntimeError("query failed after memory changed")
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: Sequence[str], *, purpose: Literal["document", "query"] = "document"
+    ) -> list[list[float]]:
         self.embedding_attempts += 1
         await self._pause("embedding")
-        return await super().embed(texts)
+        return await super().embed(texts, purpose=purpose)
 
     async def rerank(
         self,
@@ -512,7 +516,9 @@ async def test_forgetting_while_waiting_for_media_lock_skips_network_entirely(
 
 async def test_semantic_timeout_degrades_to_local_without_secret_errors(tmp_path: Path) -> None:
     class SlowMedia(MockMedia):
-        async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        async def embed(
+            self, texts: Sequence[str], *, purpose: Literal["document", "query"] = "document"
+        ) -> list[list[float]]:
             await asyncio.Event().wait()
             return []
 

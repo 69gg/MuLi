@@ -202,7 +202,9 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                     turn = ModelTurn(
                         tool_calls=[
                             call("brief", "commitment_read", identifier=task_id),
-                            call("corrected-memory", "memory_query", query="发布限制"),
+                            # The journey checks the owner's corrected fact, not
+                            # the unrelated long episode used to trigger compaction.
+                            call("corrected-memory", "memory_query", query="发布限制", limit=1),
                             call(
                                 "handoff-before",
                                 "commitment_inspect",

@@ -3,10 +3,80 @@ import assert from "node:assert/strict";
 import { createSSEParser } from "../../web/api.mjs";
 import { createPreviewState, createPreviewBackend, installPreview, installPreviewNavigation } from "../../web/preview.mjs";
 
+test("preview source discovery, UTF-8 reads and exact retries stay in local demo state", async (t) => {
+  const scheduled = new Set();
+  t.mock.method(globalThis, "setTimeout", (callback) => { scheduled.add(callback); return callback; });
+  t.mock.method(globalThis, "clearTimeout", (callback) => scheduled.delete(callback));
+  const backend = createPreviewBackend();
+  t.after(() => backend.dispose());
+  const read = async (path, options) => backend.fetch(`/api${path}`, options);
+  const post = async (body) => read("/memory/sources/retry", { method: "POST", body: JSON.stringify(body) });
+  const first = await (await read("/memory/sources?state=done&limit=1")).json();
+  assert.deepEqual(first.items, []); assert.equal(first.examined, 1); assert.equal(first.has_more, true);
+  const next = await (await read(`/memory/sources?state=done&limit=1&cursor=${encodeURIComponent(first.next_cursor)}`)).json();
+  assert.equal(next.items.length, 1); assert.equal(next.has_more, false);
+  assert.equal((await read(`/memory/sources?state=failed&cursor=${encodeURIComponent(first.next_cursor)}`)).status, 400);
+  const item = next.items[0];
+  assert.equal(Object.hasOwn(item, "content"), false);
+  let text = "", offset = 0;
+  for (let count = 0; count < 100; count++) {
+    const result = await read(`/memory/source?${new URLSearchParams({ id: item.source_id, revision: item.revision, offset_bytes: String(offset), length_bytes: "8" })}`);
+    assert.equal(result.status, 200);
+    const page = await result.json();
+    assert.equal(page.source_id, item.source_id); assert.equal(page.revision, item.revision);
+    assert.equal(page.memory_id, undefined);
+    assert.equal(new TextEncoder().encode(page.content).length, page.length_bytes);
+    text += page.content;
+    if (!page.has_more) break;
+    assert.ok(page.next_offset_bytes > offset); offset = page.next_offset_bytes;
+  }
+  assert.equal(text, backend.state.memorySources.find((entry) => entry.source_id === item.source_id).content);
+  const failed = backend.state.memorySources.find((entry) => entry.job.state === "failed");
+  const request = { source_id: failed.source_id, revision: failed.revision };
+  assert.equal((await post({ ...request, revision: "0".repeat(64) })).status, 409);
+  assert.equal(failed.job.state, "failed"); assert.equal(scheduled.size, 0);
+  const receipt = await (await post(request)).json();
+  assert.equal(receipt.accepted, true); assert.equal(receipt.state, "queued");
+  assert.equal((await (await post(request)).json()).reason, "already_pending");
+  assert.equal(scheduled.size, 2);
+  for (const callback of [...scheduled]) { scheduled.delete(callback); callback(); }
+  assert.equal(failed.job.state, "done");
+  assert.equal((await (await post(request)).json()).reason, "already_done");
+  assert.equal(backend.state.memorySources.find((entry) => entry.source_id === item.source_id).job.state, "done");
+});
+
 async function json(backend, path, method = "GET", body) {
   const result = await backend.fetch(`/api${path}`, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   return { status: result.status, body: await result.json() };
 }
+
+test("preview activation never claims that a real channel receiver was verified", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  backend.state.settings.channels.telegram.enabled = true;
+  const { body } = await json(backend, "/channels");
+  assert.equal(body.channels.telegram.enabled, true);
+  for (const name of ["telegram", "weixin"]) assert.deepEqual(body.channels[name].receive_health, { state: "idle", code: null, occurrence_id: null });
+  for (const name of ["onebot", "qq"]) assert.equal(Object.hasOwn(body.channels[name], "receive_health"), false);
+});
+
+test("preview local voice setup confirms, enrolls and verifies without submitting a message", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  const before = structuredClone(backend.state.messages);
+  assert.equal((await json(backend, "/voice/setup", "POST", { operation: "enroll", confirmed: false })).status, 400);
+  assert.equal((await json(backend, "/voice/setup", "POST", { operation: "verify", confirmed: true })).status, 409);
+  const enrollment = await json(backend, "/voice/setup", "POST", { operation: "enroll", confirmed: true, seconds: 5 });
+  assert.equal(enrollment.body.preview, true); assert.equal(enrollment.body.enrolled, true);
+  const check = await json(backend, "/voice/setup", "POST", { operation: "verify", confirmed: true, seconds: 5 });
+  assert.equal(check.body.state, "completed"); assert.equal(check.body.preview, true);
+  assert.equal(check.body.wake_detected, true); assert.equal(check.body.speaker_verified, true);
+  const status = await json(backend, "/voice");
+  assert.equal(status.body.preview, true); assert.equal(status.body.available, false);
+  assert.equal(status.body.enabled, false); assert.equal(status.body.speaker.enrolled, true);
+  assert.equal(status.body.health.state, "idle");
+  assert.equal((await json(backend, "/voice/setup/cancel", "POST", { id: enrollment.body.id })).status, 409);
+  assert.equal((await json(backend, "/voice/setup/cancel", "POST", { id: check.body.id })).body.id, check.body.id);
+  assert.deepEqual(backend.state.messages, before);
+});
 
 /** Consume the real demo SSE endpoint, including its normal abort cleanup. */
 async function demo(t) {

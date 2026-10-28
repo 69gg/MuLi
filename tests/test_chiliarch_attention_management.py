@@ -78,7 +78,12 @@ async def test_policy_api_requires_owner_same_origin_and_json(integration_host: 
         assert "fixture-secret" not in response.text and len(response.json()["revision"]) == 32
         assert (await client.get(POLICY)).json() == response.json()
         assert host.runtime.config.path.read_bytes() == before
-        assert host.runtime.config.settings.attention.events == ["reminder", "management", "update"]
+        assert host.runtime.config.settings.attention.events == [
+            "reminder",
+            "management",
+            "update",
+            "memory",
+        ]
 
 
 @pytest.mark.parametrize(

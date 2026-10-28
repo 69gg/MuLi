@@ -1,8 +1,12 @@
 # 真实 systemd 托管切换 CI 设计
 
+Native62 整合已发布的 v2.98.0 主线，保留 Native61 的完整认证优化及原生 CI。唯一文本冲突位于 Changelog，未发布原生改动与主线版本记录均保留；自动合并的进程工具同时保留二进制 stdin、严格输出、取消清理及原终止宽限，工作流同时保留 Windows Poppler 与原生资源包络、清理和证据上传。独立只读整合后审未发现有证据的 P1/P2。十二文件 268 项整合通过（105.11 秒；守卫 106.676 秒、峰值 157.6 MiB、swap 0），涵盖原认证链以及进程、真实文档读取；此前不存在的单一测试文件路径被守卫拒绝后，按仓库实际分文件入口重新执行，未绕过守卫。178 份源码以非增量严格类型检查通过（守卫 24.403 秒、峰值 472.1 MiB、swap 0）；冻结构件与新整合提交的真实 CI 仍待收取，不将合并成功当作原生验收成功。
+
 Native61 只合并 `_host_command` 在 HTTP 返回、第二次 fresh probe 之后的一处同步重复 controller 认证。原 `_probe` 已在返回前完整认证 controller，外侧紧邻的角色检查又完整认证一次；现在复用既有 `postprocess`，让该 probe 的末尾检查直接认证选中角色，保留 `role=None` 对应 base。controller 仍先于 selected 完整认证，probe 前后分别从实际文件认证；全部包字节、SHA、私有元数据、进程与三文件一致性、proof、真实 writer lease 及原绝对期限保持。没有跨 await 传递或缓存认证证明，没有改遍历或合并其它检查。
 
 新增真实认证回归已在旧生产收取 4 failed / 7 passed（8.43 秒；守卫 9.632 秒、峰值 68.8 MiB、swap 0）。drain、resume、target/base 激活四项均先通过真实完整包遍历、角色、两次 fresh probe、HTTP、临时 journal 与 writer lease 断言，两项激活另核对完整回执 proof，最终仅因尾部 controller 扫描两次而非一次失败。七项负控先通过：末次 probe 期间破坏 controller、selected 或两者仍按原 controller 优先顺序拒绝；base 三条路径不认证损坏的 opposite 包；真实 journal revision 更新后仍拒绝旧记录。target 激活还核对实际 FD 打开、前后身份、目录枚举、完整字节与 SHA 读取。修后 11 项通过（7.97 秒；守卫 9.256 秒、峰值 67.9 MiB），八文件 234 项整合通过（98.20 秒；守卫 99.494 秒、峰值 112.3 MiB、swap 0），两组重叠，不累计。独立后审未发现有源码证据的 P1/P2；本次局部减少重复认证不证明足以满足 60 秒或真实三事务验收，PR 保持草稿。
+
+Native61 精确签名 `dbf3b3a` 的手动 CI `40613279221` 已收齐十三项终态：十二项通用作业成功，仅 managed-native 失败。首次 adopt 与正常 A→B switch 的完整投影分别为 22366、41196 毫秒；第三笔 B→A 已到预期的目标拒绝注入，53542 毫秒 start_target、57662 毫秒 rolling_back/stop_target、59932 毫秒 restore_base，60000 毫秒触及整轮原绝对期限，未取得回退完成投影。实际异常帧为 HTTP 拒绝，控制器记录 `backend_failed`；这与夹具主动设置 maintenance unsupported 的预期回退路径相符。回执未直接记录 HTTP 状态，不能声称已排除其它拒绝原因，也不能据此改动生产失败决策；回退仍未完整验收。两完整代的 checks 均为 109 次，分别 7187、7610 毫秒；controller 同为 109 次，分别 6867、6276 毫秒，selected 分别为 0 次 / 0、49 次 / 1161 毫秒。子项不能与 checks 相加，也不能将相邻运行全部墙钟差归因于单处优化。2864 字节 evidence（artifact `12783513805`）的 SHA256 为 `5039cbda536cffe44366fb0feff520a2c2f25737ba790efca2d842507e8e592e`；严格读端、cleanup verified、user/group removed 及空 mounts 已核验。PR 仍为草稿，Native62 整合后须由新 head 重新验收。
 
 Native60 只增加有界成本观测。version3 在原 `checks`、`host_record` 和 phase/intent 统计外，增加固定的 `slot_files_controller` 与 `slot_files_selected` 两个 count/total_ms 桶；只在同步 backend `_check` 内包装两处实际绑定，宿主 `_record` 的独立认证不混入。原 verifier 的参数、返回与异常均完整委派且只调用一次，失败认证也计入实际成本；计时失败使成本不可观测，不发布 observed 零成本。该作用域在 `_check` 返回或抛出时结束，不跨 await 保存任何认证证明。
 

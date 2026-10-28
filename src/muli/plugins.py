@@ -19,12 +19,81 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from muli.config import PluginSettings
 from muli.providers import Message
 from muli.runtime import ClientFactory, ContextHook, Runtime
 from muli.tools import Tool
 
 LifecycleHook = Callable[[], Awaitable[None]]
 PLUGIN_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+
+
+def _manifest(directory: Path, max_source_bytes: int) -> dict[str, Any]:
+    if not PLUGIN_ID.fullmatch(directory.name):
+        raise ValueError("插件目录名称无效")
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("插件目录无效")
+    manifest = directory / "plugin.json"
+    if (
+        manifest.is_symlink()
+        or not manifest.is_file()
+        or manifest.stat().st_size > max_source_bytes
+    ):
+        raise ValueError("插件清单无效或过大")
+    with manifest.open("rb") as source:
+        raw = source.read(max_source_bytes + 1)
+    if len(raw) > max_source_bytes:
+        raise ValueError("插件清单无效或过大")
+    data = json.loads(raw.decode("utf-8"))
+    if (
+        not isinstance(data, dict)
+        or data.get("id") != directory.name
+        or data.get("api_version") != 1
+    ):
+        raise ValueError("插件ID或API版本不匹配")
+    return data
+
+
+def _entry(directory: Path, data: dict[str, Any], max_source_bytes: int) -> Path:
+    entry = directory / str(data.get("entry", "main.py"))
+    if (
+        entry.is_symlink()
+        or not entry.resolve().is_relative_to(directory.resolve())
+        or entry.suffix != ".py"
+        or not entry.is_file()
+    ):
+        raise ValueError("插件入口必须是插件目录内的Python文件")
+    if entry.stat().st_size > max_source_bytes:
+        raise ValueError("插件入口超过大小限制")
+    return entry
+
+
+def inspect_plugin(directory: Path, identifier: str, settings: PluginSettings) -> dict[str, Any]:
+    """Check one installed structure without importing or executing its entry."""
+    if not PLUGIN_ID.fullmatch(identifier):
+        raise ValueError("plugin_id_invalid")
+    result: dict[str, Any] = {
+        "id": identifier,
+        "configured_enabled": settings.enabled and identifier not in settings.disabled,
+        "code_executed": False,
+        "runtime_health": "not_checked",
+    }
+    try:
+        package = directory / identifier
+        data = _manifest(package, settings.max_source_bytes)
+        entry = _entry(package, data, settings.max_source_bytes)
+        enabled = result["configured_enabled"] and data.get("enabled", True) is not False
+        result.update(
+            name=str(data.get("name", identifier))[:120],
+            version=str(data.get("version", ""))[:80],
+            entry=entry.relative_to(package).as_posix(),
+            status="ready" if enabled else "disabled",
+        )
+    except (OSError, ValueError) as error:
+        result.update(
+            status="invalid", error="plugin_structure_invalid", error_type=type(error).__name__
+        )
+    return result
 
 
 @dataclass
@@ -113,13 +182,7 @@ class PluginManager:
                     continue
                 self.records.append(record)
                 recorded = True
-                if not PLUGIN_ID.fullmatch(directory.name):
-                    raise ValueError("插件目录名称无效")
-                if manifest.is_symlink() or manifest.stat().st_size > settings.max_source_bytes:
-                    raise ValueError("插件清单无效或过大")
-                data = json.loads(manifest.read_text(encoding="utf-8"))
-                if data.get("id") != directory.name or data.get("api_version") != 1:
-                    raise ValueError("插件ID或API版本不匹配")
+                data = _manifest(directory, settings.max_source_bytes)
                 record.update(
                     name=str(data.get("name", directory.name))[:120],
                     version=str(data.get("version", ""))[:80],
@@ -127,15 +190,7 @@ class PluginManager:
                 if directory.name in settings.disabled or data.get("enabled", True) is False:
                     record["status"] = "disabled"
                     continue
-                entry = directory / str(data.get("entry", "main.py"))
-                if (
-                    entry.is_symlink()
-                    or not entry.resolve().is_relative_to(directory.resolve())
-                    or entry.suffix != ".py"
-                ):
-                    raise ValueError("插件入口必须位于插件目录内")
-                if entry.stat().st_size > settings.max_source_bytes:
-                    raise ValueError("插件入口超过大小限制")
+                entry = _entry(directory, data, settings.max_source_bytes)
                 spec = importlib.util.spec_from_file_location(
                     module_name, entry, submodule_search_locations=[str(directory)]
                 )
@@ -184,11 +239,30 @@ class PluginManager:
 
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         for context in self.contexts:
-            if context.prompt:
-                messages = [Message(role="system", content=context.prompt), *messages]
-            for hook in context.context_hooks:
-                async with asyncio.timeout(self.runtime.config.settings.plugins.hook_timeout):
-                    messages = await hook(session_id, messages)
+            record = next(item for item in self.records if item["id"] == context.identifier)
+            try:
+                if context.prompt:
+                    messages = [Message(role="system", content=context.prompt), *messages]
+                for hook in context.context_hooks:
+                    async with asyncio.timeout(self.runtime.config.settings.plugins.hook_timeout):
+                        result = await hook(session_id, messages)
+                    if not isinstance(result, list) or any(
+                        not isinstance(item, Message) for item in result
+                    ):
+                        raise TypeError("插件上下文钩子必须返回消息列表")
+                    messages = result
+            except Exception as error:
+                record.update(
+                    status="degraded",
+                    error="plugin_context_failed",
+                    phase="context",
+                    error_type=type(error).__name__[:80],
+                )
+                raise
+            if record.get("error") == "plugin_context_failed":
+                record.update(status="loaded", error="")
+                record.pop("phase", None)
+                record.pop("error_type", None)
         return messages
 
     async def close(self) -> None:

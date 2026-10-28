@@ -20,10 +20,10 @@ Linux 本地测试、检查、打包和实验统一经过 `scripts/check_local.p
 
 | 范围 | 内存 | Swap | CPU | 进程与线程 | 期限 |
 | --- | --- | --- | --- | --- | --- |
-| 全部 agent 与 worktree 合计 | 2 GiB | 0 | 一个逻辑 CPU 的等效时间预算 | 128 | — |
-| 单次检查及其子进程 | 1 GiB | 0 | 受共享预算限制 | 128 | 最长180秒 |
+| 全部 agent 与 worktree 合计 | 1 GiB | 0 | 半个逻辑 CPU 的等效时间预算 | 96 | — |
+| 单次检查及其子进程 | 768 MiB | 0 | 受共享预算限制 | 96 | 最长180秒 |
 
-Node 堆另限256 MiB，前端按文件单并发。取消、超时与局部内存超额会收口该检查的任务组；此入口是开发资源保护，不是恶意代码沙箱，也不提供跨平台等价隔离。
+Node 堆另限192 MiB，前端按文件单并发。先运行相关小组，本地检查串行执行；超出限额时停止并缩小验证范围，不提高上限。取消、超时与局部内存超额会收口该检查的任务组；此入口是开发资源保护，不是恶意代码沙箱，也不提供跨平台等价隔离。
 
 常用命令：
 
@@ -38,6 +38,10 @@ python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 ```
 
 其它 worktree 从自己的工作目录调用主仓库脚本的绝对路径，并指定已有解释器。不得绕过守卫、提高限额求通过，或把工具等待时间当成硬超时。命令返回仍在运行时，收取最终退出结果后再启动下一项检查。
+
+守卫统一将 `TMPDIR` 设置为脚本所属仓库的 `.local-check-artifacts/tmp`，覆盖继承的临时目录设置。跨 worktree 调用同一主仓库脚本时，共用该磁盘目录，执行工作目录仍是当前 worktree。入口创建的 `.local-check-artifacts` 和 `tmp` 必须是当前用户拥有的普通目录，权限为 `0700`；符号链接、其它所有者或非私有权限都会拒绝执行，不自动修正已有目录。
+
+入口通过有界的 `findmnt -T 目录 -n -o FSTYPE` 核验临时目录所在文件系统，拒绝 `tmpfs`、`ramfs`、`devtmpfs`，也拒绝空白、多行、命令失败或工具不可用的结果，不退回 `/tmp`。临时数据保存在磁盘上，避免 RAM 文件系统残留持续占用共享 cgroup 内存预算；入口不自动删除工件，已有临时记录和冻结工件继续保留，迁移的旧路径也可保留为符号链接供追溯。
 
 ### 定向与全量验证
 
@@ -54,6 +58,8 @@ python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 CI 验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 Windows 每个版本按测试文件分成两份不重叠集合，macOS 运行完整集合；同文件的参数化用例保持在一起。分片不保证耗时均分。
 
 质量作业检查格式、类型、前端与发行包；可选集成作业另安装 MCP 和渠道依赖，覆盖默认环境可能跳过的 SDK 路径。每项保留 workflow 硬超时、有限并发和 Node 堆限制；诊断用的 `faulthandler_timeout` 不能代替终止期限。
+
+Windows 托管矩阵通过 [MSYS2 官方 action](https://github.com/msys2/setup-msys2) 复用 runner 已有环境，安装 [UCRT64 Poppler](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-poppler)，把其程序目录放到测试 PATH 前面并记录版本。这样真实 PDF 用例使用支持标准输入的转换器，避免命中 Git for Windows 附带的同名 Xpdf 程序。下载与安装仅发生在托管 runner；本机离线检查不安装转换器，也不改变真实文档用例的断言或可选依赖缺失行为。
 
 Windows 原生无障碍测试仅在托管 CI 创建并操作自己的临时窗口，本机开发不读取或点击真实桌面。专用诊断工作流与完整跨平台 CI 的覆盖范围不同，不能相互代替。
 

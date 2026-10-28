@@ -16,10 +16,17 @@ from typing import Any, Protocol
 from muli.events import EventBus
 from muli.evidence import EvidenceError, validate_integer
 from muli.maintenance import Admission
-from muli.media import MediaConfig, RerankResult
+from muli.media import EmbeddingPurpose, MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
+from muli.memory_chunks import ChunkPlan, restore_plan
 from muli.memory_context import PromptComposition, compose_context_result
-from muli.store import SQLITE_MAX_INTEGER, now
+from muli.memory_source_chunks import SourceChunks
+from muli.memory_source_failure import (
+    MemorySourceFailure,
+    attachment_revision,
+)
+from muli.proactive import FrozenRouting
+from muli.store import SQLITE_MAX_INTEGER, new_id, now
 
 Extractor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 _INDEX_ACTIVE = frozenset({"queued", "processing", "retry"})
@@ -42,7 +49,9 @@ _INDEX_COUNTERS = (
 class MemoryMedia(Protocol):
     config: MediaConfig
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    async def embed(
+        self, texts: Sequence[str], *, purpose: EmbeddingPurpose = "document"
+    ) -> list[list[float]]: ...
 
     async def rerank(
         self,
@@ -112,11 +121,13 @@ class MemoryPipeline:
         config: MemoryPipelineConfig | None = None,
         admission: Admission | None = None,
         max_plan_bytes: int | None = None,
+        failure_routing: Callable[[], FrozenRouting | None] | None = None,
     ) -> None:
         self.memory, self.bus = memory, bus
         self.config = config or MemoryPipelineConfig()
         self.admission = admission or Admission()
         self.extractor, self.media = extractor, media
+        self.failure_routing = failure_routing
         self.max_plan_bytes = (
             self.config.max_source_chars * 4 if max_plan_bytes is None else max_plan_bytes
         )
@@ -132,10 +143,13 @@ class MemoryPipeline:
         self.changed = asyncio.Condition()
         self._worker: asyncio.Task[None] | None = None
         self._media_lock = asyncio.Lock()
-        self._cache: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int, int, tuple[str, ...] | None], dict[str, Any]] = (
+            OrderedDict()
+        )
         self._cache_revision = memory.revision
         self._last_error = ""
         self._index_closed = False
+        self.source_chunks = SourceChunks(memory)
 
     def ingest(self, message: Mapping[str, Any], *, trusted_owner: bool = False) -> dict[str, Any]:
         if not self.config.enabled:
@@ -186,11 +200,11 @@ class MemoryPipeline:
             return False
         timestamp = now()
         with self.memory.store.db:
-            self.memory.store.db.execute(
+            cursor = self.memory.store.db.execute(
                 "INSERT OR IGNORE INTO memory_jobs VALUES(?,?,?,0,?,'','{}',?,?)",
                 (source_id, source_id, "queued", timestamp, timestamp, timestamp),
             )
-        return True
+        return cursor.rowcount == 1
 
     def _admit_deferred(self) -> None:
         available = self.config.max_pending_jobs - self._pending()
@@ -287,7 +301,20 @@ class MemoryPipeline:
         if max_bytes is not None:
             validate_integer(max_bytes, "max_bytes", minimum=1)
             budget = min(budget, max_bytes)
-        if len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8")) > budget:
+        projection = deepcopy(item)
+        for source in projection.get("sources", []):
+            record = source.get("chunk_record")
+            if record is not None:
+                # A selected old source may create chunks after admission.
+                # Reserve their complete progress and fixed-size IDs now.
+                record["memory_ids"] = ["f" * 32] * len(record["memory_ids"])
+                record["next_index"] = record["plan"]["count"]
+                for entry in source["items"][source["chunk_offset"] :]:
+                    entry["version"] = SQLITE_MAX_INTEGER - 1
+        if (
+            len(json.dumps(projection, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            > budget
+        ):
             raise EvidenceError("output_budget", "完整索引计划超过当前元数据字节预算")
 
     def _index_admit(self, plan: dict[str, Any]) -> None:
@@ -372,6 +399,41 @@ class MemoryPipeline:
                 or not isinstance(source.get("items"), list)
             ):
                 raise EvidenceError("content_unavailable", "索引计划来源证明无效")
+            if "chunk_batch_size" in source and (
+                type(source["chunk_batch_size"]) is not int
+                or not 1 <= source["chunk_batch_size"] <= 16
+            ):
+                raise EvidenceError("content_unavailable", "原文块索引批次无效")
+            if "chunk_record" in source or "chunk_offset" in source:
+                try:
+                    record = source["chunk_record"]
+                    if not isinstance(record, dict) or set(record) != {
+                        "plan",
+                        "next_index",
+                        "memory_ids",
+                    }:
+                        raise ValueError
+                    chunk_plan = ChunkPlan(**record["plan"])
+                    offset = source["chunk_offset"]
+                    cursor, identifiers = record["next_index"], record["memory_ids"]
+                    if (
+                        chunk_plan.source_digest != source["digest"]
+                        or type(offset) is not int
+                        or not 0 <= offset <= len(source["items"])
+                        or len(source["items"]) - offset != chunk_plan.count
+                        or type(cursor) is not int
+                        or not 0 <= cursor <= chunk_plan.count
+                        or not isinstance(identifiers, list)
+                        or len(identifiers) != chunk_plan.count
+                        or any(
+                            not isinstance(value, str) or (value and len(value) != 32)
+                            for value in identifiers
+                        )
+                        or any(identifiers[cursor:])
+                    ):
+                        raise ValueError
+                except (KeyError, TypeError, ValueError) as error:
+                    raise EvidenceError("content_unavailable", "原文块索引证明无效") from error
             for item in source["items"]:
                 if not isinstance(item, dict) or not isinstance(item.get("id"), str):
                     raise EvidenceError("content_unavailable", "索引计划条目证明无效")
@@ -484,8 +546,19 @@ class MemoryPipeline:
             json.dumps(checkpoint, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (KeyError, ValueError, TypeError, UnicodeError, RecursionError) as error:
             raise ValueError("完成作业的有限条目集合无法核查") from error
+        original = self.memory.source(source_id)
+        if original is None:
+            raise ValueError("重建来源已遗忘")
+        record = checkpoint.get("source_chunks")
+        if record is None:
+            record = self.source_chunks.new_record(original)
+        chunk_ids = self.source_chunks.validate(original, record)
+        backfill = record["next_index"] < record["plan"]["count"]
+        episode = self.memory.automatic_episode_id(source_id) if record["plan"]["count"] else None
         items = []
-        for identifier in sorted(identifiers):
+        for identifier in sorted(set(identifiers) | (set() if backfill else set(chunk_ids))):
+            if identifier == episode:
+                continue
             version_row = self.memory.store.db.execute(
                 "SELECT CASE WHEN typeof(version)='integer' AND version>0 THEN version END "
                 "FROM memory_meta WHERE memory_id=? AND source_id=? AND status!='superseded'",
@@ -497,7 +570,13 @@ class MemoryPipeline:
                     "version": version_row[0] if version_row and version_row[0] else 0,
                 }
             )
-        return {"id": source_id, "digest": digest, "items": items}
+        result: dict[str, Any] = {"id": source_id, "digest": digest, "items": items}
+        if record["plan"]["count"]:
+            result["chunk_batch_size"] = record["plan"]["batch_size"]
+        if backfill:
+            result.update(chunk_record=deepcopy(record), chunk_offset=len(items))
+            items.extend({"id": "_" * 32, "version": 0} for _ in record["memory_ids"])
+        return result
 
     def start_index(self, source_ids: list[str], key: str) -> dict[str, Any]:
         self.admission.require()
@@ -633,7 +712,6 @@ class MemoryPipeline:
             return
         source = plan["sources"][plan["source_index"]]
         start = plan["item_index"]
-        entries = source["items"][start : start + self.config.max_facts_per_source]
         if self._source_digest(source["id"]) != source["digest"]:
             plan["omitted"] += len(source["items"]) - start
             plan["source_index"] += 1
@@ -642,6 +720,40 @@ class MemoryPipeline:
             if plan["source_index"] == len(plan["sources"]):
                 plan["state"] = "done"
             return
+        if "chunk_record" in source:
+            original = self.memory.source(source["id"])
+            if original is None:
+                return
+
+            def persist_chunks() -> bool:
+                if not self._index_live(plan):
+                    return False
+                self._index_save(plan)
+                return True
+
+            prepared = await self.source_chunks.prepare(
+                original,
+                source["chunk_record"],
+                live=lambda: (
+                    self._index_live(plan) and self._source_digest(source["id"]) == source["digest"]
+                ),
+                persist=persist_chunks,
+            )
+            if prepared is None or not self._index_live(plan):
+                return
+            for index, identifier in enumerate(source["chunk_record"]["memory_ids"]):
+                item = self.memory.get(identifier) if identifier else None
+                source["items"][source["chunk_offset"] + index] = {
+                    "id": identifier or "_" * 32,
+                    "version": item["version"] if item is not None else 0,
+                }
+            del source["chunk_record"], source["chunk_offset"]
+            self._index_save(plan)
+        batch_size = min(
+            self.config.max_facts_per_source,
+            source.get("chunk_batch_size", self.config.max_facts_per_source),
+        )
+        entries = source["items"][start : start + batch_size]
         vectors: dict[str, list[float]] = {}
         if entries:
             media = self.media
@@ -663,7 +775,11 @@ class MemoryPipeline:
                     if self._source_digest(source["id"]) == source["digest"]
                     else []
                 )
-                result = await media.embed([item["content"] for item in inputs]) if inputs else []
+                result = (
+                    await media.embed([item["content"] for item in inputs], purpose="document")
+                    if inputs
+                    else []
+                )
             if not self._index_live(plan) or self.media is not media:
                 return
             if len(result) != len(inputs):
@@ -732,6 +848,80 @@ class MemoryPipeline:
         self._index_save(plan)
         await self._publish()
 
+    def retry_source(
+        self, source_id: str, revision: str, *, max_output_chars: int
+    ) -> dict[str, Any]:
+        """Admit exactly one observed source; unrelated deferred work stays untouched."""
+        self.admission.require()
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
+        if (
+            not isinstance(source_id, str)
+            or not 1 <= len(source_id) <= 200
+            or not isinstance(revision, str)
+            or len(revision) != 64
+            or any(character not in "0123456789abcdef" for character in revision)
+        ):
+            raise EvidenceError("invalid_arguments", "重试需要准确来源 ID 和原文 revision")
+        try:
+            source_id.encode("utf-8")
+        except UnicodeError as error:
+            raise EvidenceError("invalid_arguments", "来源 ID 包含无效 Unicode 字符") from error
+        if not self.config.enabled or self._index_closed:
+            raise ValueError("记忆处理未启用或正在关闭")
+        if self.memory.store.db.in_transaction:
+            raise EvidenceError("content_unavailable", "存在尚未收口的数据库事务，未重试来源")
+        digest = self._source_digest(source_id)
+        if digest is None:
+            raise EvidenceError("evidence_not_found", "来源已忘记、不存在或超过当前读取上限")
+        if digest != revision:
+            raise EvidenceError("evidence_changed", "原文版本已变化，请重新核查来源")
+        row = self.memory.store.db.execute(
+            "SELECT CASE WHEN state IN ('queued','processing','retry','failed','done') "
+            "THEN state END AS state FROM memory_jobs WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        previous = row["state"] if row is not None else "deferred"
+        if previous is None:
+            raise EvidenceError("content_unavailable", "来源的整理状态无法核查")
+        eligible = previous in {"failed", "deferred"}
+        accepted = eligible and self._pending() < self.config.max_pending_jobs
+        receipt = {
+            "source_id": source_id,
+            "revision": revision,
+            "previous_state": previous,
+            "state": "queued" if accepted else previous,
+            "accepted": accepted,
+            "reason": (
+                "queued"
+                if accepted
+                else "capacity_full"
+                if eligible
+                else "already_done"
+                if previous == "done"
+                else "already_pending"
+            ),
+        }
+        # Reserve the longer boolean spelling before any durable mutation.
+        if len(json.dumps({**receipt, "accepted": False}, ensure_ascii=False)) > max_output_chars:
+            raise EvidenceError("output_budget", "完整来源重试回执超过当前输出预算")
+        if not accepted:
+            return receipt
+        if previous == "failed":
+            timestamp = now()
+            with self.memory.store.db:
+                updated = self.memory.store.db.execute(
+                    "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,"
+                    "last_error='',checkpoint=json_remove(checkpoint,'$.source_failure'),"
+                    "updated_at=? WHERE source_id=? AND state='failed'",
+                    (timestamp, timestamp, source_id),
+                )
+                if updated.rowcount != 1:
+                    raise EvidenceError("evidence_changed", "来源作业已变化，未重新登记")
+        elif not self._queue(source_id):
+            raise EvidenceError("evidence_changed", "来源作业已变化，未重新登记")
+        self._wake.set()
+        return receipt
+
     async def retry(self, source_id: str | None = None) -> dict[str, Any]:
         available = self.config.max_pending_jobs - self._pending()
         if available > 0:
@@ -745,7 +935,8 @@ class MemoryPipeline:
             ).fetchall()
             with self.memory.store.db:
                 self.memory.store.db.executemany(
-                    "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,last_error='',updated_at=? "
+                    "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,last_error='',"
+                    "checkpoint=json_remove(checkpoint,'$.source_failure'),updated_at=? "
                     "WHERE source_id=?",
                     ((now(), now(), row[0]) for row in rows),
                 )
@@ -767,13 +958,84 @@ class MemoryPipeline:
             await self.changed.wait_for(terminal)
         return self.job(source_id)
 
-    async def _publish(self, source_id: str | None = None) -> None:
+    def _publish_source_failure(self, source_id: str, revision: str, data: dict[str, Any]) -> bool:
+        """Commit the finite proof and its existing status event before any await."""
+        if self.bus is None or self.failure_routing is None or self._index_closed:
+            return False
+        store = self.memory.store
+        # Never let optional notification persistence commit someone else's work.
+        if store.db.in_transaction:
+            return False
+        try:
+            routing = self.failure_routing()
+            if (
+                routing is None
+                or attachment_revision(
+                    store, source_id, max_source_chars=self.config.max_source_chars
+                )
+                != revision
+            ):
+                return False
+            row = store.db.execute(
+                "SELECT CASE WHEN typeof(updated_at) IN ('integer','real') "
+                "THEN updated_at END AS updated_at FROM memory_jobs WHERE source_id=? AND state='failed'",
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            proof = MemorySourceFailure.load(
+                MemorySourceFailure(
+                    new_id(), source_id, revision, row["updated_at"], routing
+                ).dump(),
+                max_bytes=self.max_plan_bytes,
+            )
+            if proof is None:
+                return False
+            payload = {**data, "id": proof.identifier, "source_failure": proof.dump()}
+            if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > self.max_plan_bytes:
+                return False
+            encoded = json.dumps(proof.dump(), ensure_ascii=False, allow_nan=False)
+            with store.db:
+                updated = store.db.execute(
+                    "UPDATE memory_jobs SET checkpoint=json_set(checkpoint,'$.source_failure',json(?)) "
+                    "WHERE source_id=? AND state='failed' AND updated_at=? "
+                    "AND typeof(checkpoint)='text' AND length(CAST(checkpoint AS BLOB))<=? "
+                    "AND CASE WHEN json_valid(checkpoint) THEN "
+                    "length(CAST(json_set(checkpoint,'$.source_failure',json(?)) AS BLOB))<=? END",
+                    (
+                        encoded,
+                        source_id,
+                        proof.failed_at,
+                        self.max_plan_bytes,
+                        encoded,
+                        self.max_plan_bytes,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    return False
+                store._event("memory.pipeline.updated", payload)
+            return True
+        except Exception:
+            # The original failed state is already durable. An unavailable or
+            # oversized notice must not replace it or erase successful prefixes.
+            return False
+
+    async def _publish(
+        self, source_id: str | None = None, *, failed_revision: str | None = None
+    ) -> None:
+        data = {"source_id": source_id, **self.status()}
+        persisted = bool(
+            source_id is not None
+            and failed_revision is not None
+            and self._publish_source_failure(source_id, failed_revision, data)
+        )
         async with self.changed:
             self.changed.notify_all()
         if self.bus is not None:
-            await self.bus.emit(
-                "memory.pipeline.updated", {"source_id": source_id, **self.status()}
-            )
+            if persisted:
+                await self.bus.notify()
+            else:
+                await self.bus.emit("memory.pipeline.updated", data)
 
     def _checkpoint(self, source_id: str, checkpoint: Mapping[str, Any]) -> bool:
         with self.memory.store.db:
@@ -827,11 +1089,18 @@ class MemoryPipeline:
             await asyncio.sleep(0)
 
     async def _run_job(self, source_id: str) -> None:
+        if self._index_closed:
+            return
+        revision = self._source_digest(source_id)
+        failed_revision: str | None = None
         with self.memory.store.db:
-            self.memory.store.db.execute(
-                "UPDATE memory_jobs SET state='processing',attempts=attempts+1,updated_at=? WHERE source_id=?",
+            updated = self.memory.store.db.execute(
+                "UPDATE memory_jobs SET state='processing',attempts=attempts+1,updated_at=? "
+                "WHERE source_id=? AND state IN ('queued','retry')",
                 (now(), source_id),
             )
+        if updated.rowcount != 1:
+            return
         try:
             async with asyncio.timeout(self.config.job_timeout):
                 await self._process(source_id)
@@ -854,7 +1123,9 @@ class MemoryPipeline:
                         "UPDATE memory_jobs SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE source_id=?",
                         (state, now() + delay, self._last_error, now(), source_id),
                     )
-        await self._publish(source_id)
+                if state == "failed":
+                    failed_revision = revision
+        await self._publish(source_id, failed_revision=failed_revision)
 
     def _validated(self, payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -963,27 +1234,37 @@ class MemoryPipeline:
             checkpoint["memory_ids"] = [row[0] for row in rows]
             if not self._checkpoint(source_id, checkpoint):
                 return
-        if (
-            self.media is not None
-            and self.media.config.embedding is not None
-            and not checkpoint.get("embedded")
-        ):
-            items = [
-                item
-                for identifier in checkpoint["memory_ids"]
-                if (item := self.memory.get(identifier)) is not None
-            ]
-            if items:
-                async with self._media_lock:
-                    vectors = await self.media.embed([item["content"] for item in items])
-                if self.memory.source(source_id) is None:
-                    return
-                if len(vectors) != len(items):
-                    raise ValueError("向量数量与记忆数量不一致")
-                for item, vector in zip(items, vectors, strict=True):
-                    self.memory.store_vector(
-                        item["id"], vector, self._model_key(), expected_version=item["version"]
-                    )
+        if "source_chunks" not in checkpoint:
+            checkpoint["source_chunks"] = self.source_chunks.new_record(source)
+            if not self._checkpoint(source_id, checkpoint):
+                return
+
+        def live() -> bool:
+            return bool(self._source_digest(source_id) == source["digest"])
+
+        chunk_ids = await self.source_chunks.prepare(
+            source,
+            checkpoint["source_chunks"],
+            live=live,
+            persist=lambda: self._checkpoint(source_id, checkpoint),
+        )
+        if chunk_ids is None:
+            if self.memory.source(source_id) is not None:
+                raise ValueError("原文块来源已变化或超过当前限额")
+            return
+        identifiers = list(dict.fromkeys([*checkpoint["memory_ids"], *chunk_ids]))
+        if checkpoint["source_chunks"]["plan"]["count"]:
+            # Raw chunks already cover the entire source. Do not send the
+            # duplicate 12k archive prefix as an oversized embedding input.
+            episode = self.memory.automatic_episode_id(source_id)
+            identifiers = [identifier for identifier in identifiers if identifier != episode]
+        if self.media is not None and self.media.config.embedding is not None:
+            policy = restore_plan(
+                checkpoint["source_chunks"]["plan"], source["digest"], source["content"]
+            )
+            await self._embed_source(source, identifiers, batch_size=policy.batch_size)
+            if not live():
+                return
             checkpoint["embedded"] = True
             if not self._checkpoint(source_id, checkpoint):
                 return
@@ -994,8 +1275,60 @@ class MemoryPipeline:
             )
         if self.bus is not None and self.memory.source(source_id) is not None:
             await self.bus.emit(
-                "memory.updated", {"source_id": source_id, "memory_ids": checkpoint["memory_ids"]}
+                "memory.updated", {"source_id": source_id, "memory_ids": identifiers}
             )
+
+    async def _embed_source(
+        self, source: dict[str, Any], identifiers: list[str], *, batch_size: int
+    ) -> None:
+        media, model_key = self.media, self._model_key()
+        if media is None or media.config.embedding is None:
+            return
+
+        def live() -> bool:
+            return (
+                self.media is media
+                and self._model_key() == model_key
+                and self._source_digest(source["id"]) == source["digest"]
+            )
+
+        for start in range(0, len(identifiers), batch_size):
+            async with self._media_lock:
+                if not live():
+                    raise ValueError("语义服务或原文来源已变化")
+                inputs = []
+                # Build HTTP input only after acquiring the lock. A query may
+                # have held it while the owner forgot or corrected a source.
+                for identifier in identifiers[start : start + batch_size]:
+                    row = self.memory.store.db.execute(
+                        "SELECT version FROM memory_meta WHERE memory_id=? AND source_id=?",
+                        (identifier, source["id"]),
+                    ).fetchone()
+                    if row is None or type(row["version"]) is not int:
+                        continue
+                    item = self._index_item(
+                        source["id"], {"id": identifier, "version": row["version"]}, model_key
+                    )
+                    if item is not None and not item["indexed"]:
+                        inputs.append(item)
+                vectors = (
+                    await media.embed([item["content"] for item in inputs], purpose="document")
+                    if inputs
+                    else []
+                )
+            if not live():
+                raise ValueError("在途向量的来源或模型已失效")
+            if len(vectors) != len(inputs):
+                raise ValueError("向量数量与记忆批次不一致")
+            for item, vector in zip(inputs, vectors, strict=True):
+                current = self._index_item(source["id"], item, model_key)
+                if current is None:
+                    raise ValueError("在途向量的条目版本已变化")
+                if not self.memory.store_vector(
+                    item["id"], vector, model_key, expected_version=item["version"]
+                ):
+                    raise ValueError("在途向量的条目版本已变化")
+            await asyncio.sleep(0)
 
     def _model_key(self) -> str:
         return self.embedding_key(self.media)
@@ -1005,38 +1338,62 @@ class MemoryPipeline:
         if media is None or media.config.embedding is None:
             return ""
         config = media.config.embedding
+        identity: list[Any] = [
+            config.base_url.rstrip("/"),
+            config.model,
+            config.dimensions,
+            config.query_instruction,
+            config.extra_body,
+        ]
+        if config.document_instruction:
+            identity.append(config.document_instruction)
         return hashlib.sha256(
             json.dumps(
-                [
-                    config.base_url.rstrip("/"),
-                    config.model,
-                    config.dimensions,
-                    config.query_instruction,
-                    config.extra_body,
-                ],
+                identity,
                 ensure_ascii=False,
                 sort_keys=True,
                 allow_nan=False,
             ).encode("utf-8")
         ).hexdigest()
 
-    def _cached(self, query: str, limit: int, hops: int) -> dict[str, Any] | None:
+    def _cached(
+        self, query: str, limit: int, hops: int, source_ids: tuple[str, ...] | None = None
+    ) -> dict[str, Any] | None:
         if self._cache_revision != self.memory.revision:
             self._cache.clear()
             self._cache_revision = self.memory.revision
-        key = (query, limit, hops)
+        key = (query, limit, hops, source_ids)
         if key not in self._cache:
             return None
         self._cache.move_to_end(key)
         return deepcopy(self._cache[key])
 
-    def _remember(self, query: str, limit: int, hops: int, result: dict[str, Any]) -> None:
-        self._cached(query, limit, hops)
-        self._cache[(query, limit, hops)] = deepcopy(result)
+    def _remember(
+        self,
+        query: str,
+        limit: int,
+        hops: int,
+        result: dict[str, Any],
+        source_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        self._cached(query, limit, hops, source_ids)
+        key = (query, limit, hops, source_ids)
+        self._cache[key] = deepcopy(result)
         while len(self._cache) > self.config.cache_entries:
-            self._cache.popitem(last=False)
+            scoped_key = next(
+                (cached_key for cached_key in self._cache if cached_key[3] is not None), None
+            )
+            if scoped_key is None:
+                self._cache.popitem(last=False)
+            else:
+                del self._cache[scoped_key]
 
-    def _result(self, items: list[dict[str, Any]], degraded: list[str]) -> dict[str, Any]:
+    def _result(
+        self,
+        items: list[dict[str, Any]],
+        degraded: list[str],
+        source_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         sources = []
         for identifier in dict.fromkeys(
             item["source_id"] for item in items if item["source_id"] is not None
@@ -1044,13 +1401,18 @@ class MemoryPipeline:
             source = self.memory.source(identifier, max_chars=300)
             if source is not None:
                 sources.append(source)
-        return {
+        result = {
             "memories": items,
-            "communities": self.memory.communities_for([item["id"] for item in items]),
+            "communities": self.memory.communities_for(
+                [item["id"] for item in items], source_ids=source_ids
+            ),
             "sources": sources,
             "degraded": degraded,
             "revision": self.memory.revision,
         }
+        if source_ids is not None:
+            result["source_ids"] = list(source_ids)
+        return result
 
     async def query(
         self,
@@ -1059,17 +1421,21 @@ class MemoryPipeline:
         *,
         hops: int | None = None,
         use_semantic: bool = True,
+        source_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         chosen_hops = self.config.graph_hops if hops is None else hops
         self.memory._query(query)
+        scope = self.memory.source_scope(source_ids)
         if type(chosen_hops) is not int or not 0 <= chosen_hops <= 8:
             raise ValueError("记忆 hops 必须在 0 到 8 之间")
         limit = max(1, min(limit, self.config.max_candidates))
-        cached = self._cached(query, limit, chosen_hops) if use_semantic else None
+        cached = self._cached(query, limit, chosen_hops, scope) if use_semantic else None
         if cached is not None:
             return cached
         revision = self.memory.revision
-        local = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
+        local = self.memory.search(
+            query, self.config.max_candidates, hops=chosen_hops, source_ids=scope
+        )
         items = local
         degraded: list[str] = []
         semantic_failed = False
@@ -1078,8 +1444,10 @@ class MemoryPipeline:
             # Awaited model/lock work may outlive edits or a source-level forget.
             # Return a current local projection once; never retry the network or
             # associate candidates from the old revision with the new cache.
-            current = self.memory.search(query, self.config.max_candidates, hops=chosen_hops)
-            return self._result(current[:limit], [*degraded, "memory_changed"])
+            current = self.memory.search(
+                query, self.config.max_candidates, hops=chosen_hops, source_ids=scope
+            )
+            return self._result(current[:limit], [*degraded, "memory_changed"], scope)
 
         if use_semantic and query.strip() and self.media is not None:
             try:
@@ -1089,16 +1457,19 @@ class MemoryPipeline:
                             return refreshed_local()
                         semantic: list[dict[str, Any]] = []
                         if self.media.config.embedding is not None:
-                            vectors = await self.media.embed([query])
+                            vectors = await self.media.embed([query], purpose="query")
                             if self.memory.revision != revision:
                                 return refreshed_local()
                             if len(vectors) != 1:
                                 raise ValueError("查询向量数量错误")
                             semantic = self.memory.vector_search(
-                                vectors[0], self._model_key(), self.config.max_candidates
+                                vectors[0],
+                                self._model_key(),
+                                self.config.max_candidates,
+                                source_ids=scope,
                             )
                             if (
-                                self.memory.vector_count(self._model_key())
+                                self.memory.vector_count(self._model_key(), source_ids=scope)
                                 > self.config.max_vector_scan
                             ):
                                 degraded.append("vector_scan_limited")
@@ -1135,9 +1506,9 @@ class MemoryPipeline:
                 items = local
         if self.memory.revision != revision:
             return refreshed_local()
-        result = self._result(items[:limit], degraded)
+        result = self._result(items[:limit], degraded, scope)
         if use_semantic and not semantic_failed:
-            self._remember(query, limit, chosen_hops, result)
+            self._remember(query, limit, chosen_hops, result, scope)
         return result
 
     def cached_context(
@@ -1185,7 +1556,7 @@ class MemoryPipeline:
         cached = self._cached(query, limit, self.config.graph_hops)
         if cached is None:
             for key in reversed(self._cache):
-                if key[0] == query and key[2] == self.config.graph_hops:
+                if key[0] == query and key[2] == self.config.graph_hops and key[3] is None:
                     cached = deepcopy(self._cache[key])
                     break
         return compose_context_result(

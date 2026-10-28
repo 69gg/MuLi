@@ -8,7 +8,7 @@ import math
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Self
+from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -43,6 +43,8 @@ _SPEECH_FORMATS = {
     "pcm": ("audio/pcm", ".pcm"),
 }
 
+EmbeddingPurpose = Literal["document", "query"]
+
 
 @dataclass(frozen=True, slots=True)
 class ImageDescription:
@@ -74,6 +76,8 @@ class ServiceConfig:
     response_format: str = "mp3"
     speed: float | None = None
     instructions: str = ""
+    document_instruction: str = ""
+    query_extra_body: JsonObject = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.base_url)
@@ -376,16 +380,28 @@ class MediaService:
             model.max_response_bytes,
         )
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: Sequence[str], *, purpose: EmbeddingPurpose = "document"
+    ) -> list[list[float]]:
         config = self._service("embedding")
+        if purpose not in {"document", "query"}:
+            raise ProviderError("embedding purpose 必须是 document 或 query")
         if isinstance(texts, (str, bytes)):
             raise ProviderError("embedding 输入必须是文本数组")
         if not texts:
             return []
         if any(not isinstance(text, str) or not text.strip() for text in texts):
             raise ProviderError("embedding 输入必须是非空文本")
-        body = self._body(config, {"input", "dimensions", "encoding_format"})
-        body.update(input=list(texts), encoding_format="float")
+        request_config = (
+            replace(config, extra_body={**config.extra_body, **config.query_extra_body})
+            if purpose == "query"
+            else config
+        )
+        instruction = (
+            config.query_instruction if purpose == "query" else config.document_instruction
+        )
+        body = self._body(request_config, {"input", "dimensions", "encoding_format"})
+        body.update(input=[instruction + text for text in texts], encoding_format="float")
         if config.dimensions is not None:
             body["dimensions"] = config.dimensions
         value = _json_value(await self._send(config, "/embeddings", body))
@@ -521,6 +537,7 @@ class MediaService:
 
 
 __all__ = [
+    "EmbeddingPurpose",
     "MediaConfig",
     "MediaService",
     "RerankResult",

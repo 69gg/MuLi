@@ -1,6 +1,6 @@
 const REDACTED_FIELDS = new Set(["api_key_set", "credential_set", "key_set", "api_key_env_set", "password_set", "password_hash", "token_set", "webhook_secret_set", "client_secret_set"]);
 const SECRET_FIELDS = new Set(["api_key", "password", "credential", "token", "webhook_secret", "client_secret"]);
-const ATOMIC_OBJECTS = new Set(["reasoning", "thinking", "extra_body", "extra_headers", "mcp"]);
+const ATOMIC_OBJECTS = new Set(["reasoning", "thinking", "extra_body", "query_extra_body", "extra_headers", "mcp"]);
 
 export const MODEL_ROLES = [["main", "主模型"], ["reviewer", "审阅"], ["worker", "执行"], ["vision", "视觉"], ["compactor", "压缩"], ["memory_extractor", "记忆提取"]];
 export const SETTINGS_GROUPS = [["overview", "概览"], ["models", "模型"], ["persona", "称呼与提示词"], ["tools", "权限与工具"], ["connections", "连接"], ["channels", "消息渠道"], ["inputs", "语音与采集"], ["media", "媒体与检索"], ["maintenance", "扩展与维护"], ["system", "系统"]];

@@ -93,10 +93,14 @@ def test_latest_complete_page_that_cannot_fit_fails_without_excerpting() -> None
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
-def test_new_input_or_answer_expires_old_page_preservation(role: MessageRole) -> None:
+def test_only_answer_consumes_old_page_and_new_input_keeps_preservation(role: MessageRole) -> None:
     evidence = page("old", 1000)
     messages = [Message(role="user", content="读取")] + batch(evidence)
     messages.append(Message(role=role, content="新输入或已消费的答复"))
+    if role == "user":
+        with pytest.raises(ContextLimitError):
+            pack_context(messages, 1400)
+        return
     packed = pack_context(messages, 1400)
     result = next(message for message in packed if message.role == "tool")
     assert result.content != evidence and EXCERPT_MARKER in result.content
@@ -105,9 +109,11 @@ def test_new_input_or_answer_expires_old_page_preservation(role: MessageRole) ->
 
 def test_old_marked_page_turn_can_still_be_removed_whole() -> None:
     messages = [Message(role="user", content="旧输入" * 1000)] + batch(page("old"))
+    original_result = messages[-1]
+    messages.append(Message(role="assistant", content="已处理原始回执"))
     latest = Message(role="user", content="最新要求")
     packed = pack_context([*messages, latest], 800)
-    assert packed == [latest] and messages[-1].preserve_content is True
+    assert packed == [latest] and original_result.preserve_content is True
 
 
 def test_next_tool_batch_expires_old_marker_in_same_user_turn() -> None:

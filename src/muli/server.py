@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import unquote
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -52,7 +53,7 @@ from muli.management import SelfManagement
 from muli.management_transaction import ClockReading
 from muli.mcp_policy import ReceivePolicy
 from muli.memory_application import MemoryApplication
-from muli.memory_evidence import MemoryEvidence, memory_listing
+from muli.memory_evidence import SOURCE_PAGE_LIMIT, MemoryEvidence, memory_listing
 from muli.middleware import BodyLimitMiddleware
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
@@ -60,6 +61,7 @@ from muli.plugins import PluginManager
 from muli.process import _wait_cleanup
 from muli.providers import ProviderError
 from muli.reply_origin import ReplyOrigin
+from muli.request_operation import request_operation
 from muli.runtime import Runtime
 from muli.service import UserService
 from muli.session_records import SessionRecords
@@ -84,6 +86,17 @@ def _web_archive_result(result: dict[str, Any]) -> dict[str, Any]:
 
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class VoiceSetupInput(Input):
+    id: UUID = Field(default_factory=uuid4)
+    operation: Literal["enroll", "verify"]
+    confirmed: bool = Field(strict=True)
+    seconds: float = Field(default=5, ge=1, le=15, strict=True, allow_inf_nan=False)
+
+
+class VoiceSetupCancelInput(Input):
+    id: UUID
 
 
 class SessionInput(Input):
@@ -142,6 +155,11 @@ class MemoryIndexInput(Input):
     source_ids: list[Annotated[str, Field(min_length=1, strict=True)]] | None = None
     key: str | None = Field(default=None, min_length=1, strict=True)
     plan_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$", strict=True)
+
+
+class MemorySourceRetryInput(Input):
+    source_id: str = Field(min_length=1, max_length=200, strict=True)
+    revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
 class WorkflowInput(Input):
@@ -231,7 +249,10 @@ def _create_app(
     local_services = LocalServices(runtime, attachments)
     web_voice = WebVoiceInput(local_services)
     memory_application = MemoryApplication(
-        runtime, local_services.media, attachment_reader=local_services.memory_attachment
+        runtime,
+        local_services.media,
+        attachment_reader=local_services.memory_attachment,
+        document_reader=local_services.memory_document,
     )
     channel_application = ChannelApplication(runtime, attachments)
     personal_io = PersonalIO(runtime, local_services, attachments)
@@ -658,39 +679,16 @@ def _create_app(
     async def transcribe_audio(body: TranscriptionInput, request: Request) -> dict[str, Any]:
         """转写本地音频，只返回待用户编辑与发送的草稿，不提交对话。"""
 
-        async def disconnected() -> None:
-            # FastAPI has already consumed the JSON body. Await the ASGI event;
-            # do not periodically poll or leave a paid request behind an abort.
-            while (await request.receive())["type"] != "http.disconnect":
-                pass
-
-        operation = asyncio.create_task(web_voice.transcribe(body.attachment_id))
-        disconnect = asyncio.create_task(disconnected())
         try:
-            done, _ = await asyncio.wait(
-                (operation, disconnect), return_when=asyncio.FIRST_COMPLETED
+            return await request_operation(
+                request, web_voice.transcribe(body.attachment_id), cancelled_message="转写已取消"
             )
-            if disconnect in done:
-                raise HTTPException(499, "转写已取消")
-            return await operation
         except WebVoiceError as exc:
             raise HTTPException(exc.status_code, str(exc)) from exc
         except ProviderError as exc:
             raise HTTPException(502, str(exc)) from exc
         except TimeoutError as exc:
             raise HTTPException(504, "转写达到时间上限") from exc
-        finally:
-            operation.cancel()
-            disconnect.cancel()
-            cleanup = asyncio.gather(operation, disconnect, return_exceptions=True)
-            cancelled = False
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    cancelled = True
-            if cancelled:
-                raise asyncio.CancelledError
 
     @app.get("/api/commitments")
     async def commitments(status: str = "active") -> dict[str, Any]:
@@ -1029,6 +1027,46 @@ def _create_app(
     async def memory_status() -> dict[str, Any]:
         return memory_application.pipeline.status()
 
+    @app.get("/api/memory/sources")
+    async def memory_sources(
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=SOURCE_PAGE_LIMIT)] = 20,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        return MemoryEvidence(runtime.memory).sources(
+            cursor=cursor,
+            limit=limit,
+            state=state,
+            max_output_chars=config.settings.limits.max_output_chars,
+        )
+
+    @app.get("/api/memory/source")
+    async def read_memory_source(
+        identifier: Annotated[str, Query(alias="id", min_length=1, max_length=200)],
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+        revision: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    ) -> dict[str, Any]:
+        return MemoryEvidence(runtime.memory).read(
+            identifier,
+            by_memory=False,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
+            revision=revision,
+            max_output_chars=config.settings.limits.max_output_chars,
+        )
+
+    @app.post("/api/memory/sources/retry")
+    async def retry_memory_source(body: MemorySourceRetryInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            result = memory_application.retry_source(body.model_dump())
+            pipeline = memory_application.pipeline
+        if result["accepted"]:
+            await pipeline._publish(result["source_id"])
+        return result
+
     @app.post("/api/memory/reindex")
     async def memory_reindex(body: MemoryIndexInput) -> dict[str, Any]:
         async with runtime.configuration_lock:
@@ -1071,11 +1109,51 @@ def _create_app(
 
     @app.get("/api/voice")
     async def voice_status() -> dict[str, Any]:
-        return personal_io.voice.status()
+        from muli.voice_configuration import setup_guidance
+
+        result = personal_io.voice.status()
+        return {**result, "setup_next_step": setup_guidance(result)["next_step"]}
+
+    @app.post("/api/voice/setup")
+    async def voice_setup(body: VoiceSetupInput, request: Request) -> dict[str, Any]:
+        if not body.confirmed:
+            raise HTTPException(400, "请明确确认本次有限录音")
+        try:
+            return await request_operation(
+                request,
+                personal_io.voice_setup(body.operation, body.seconds, identifier=str(body.id)),
+            )
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            raise HTTPException(409, "本次语音设置已取消") from None
+
+    @app.post("/api/voice/setup/cancel")
+    async def cancel_voice_setup(body: VoiceSetupCancelInput) -> dict[str, Any]:
+        try:
+            return await personal_io.voice_setup("cancel", identifier=str(body.id))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/memory/query")
-    async def memory_query(query: str, limit: int = 8) -> dict[str, Any]:
-        return await memory_application.query(query, limit=min(max(1, limit), 100))
+    async def memory_query(
+        query: str,
+        limit: int = 8,
+        source_id: Annotated[list[str] | None, Query()] = None,
+    ) -> dict[str, Any]:
+        try:
+            return await memory_application.query(
+                query, limit=min(max(1, limit), 100), source_ids=source_id
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.patch("/api/settings")
     async def update_settings(changes: dict[str, Any]) -> dict[str, Any]:

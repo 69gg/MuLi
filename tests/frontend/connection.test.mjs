@@ -5,6 +5,7 @@ import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
 import { createSessionState, hydrateSession, applyEvent, isRunning } from "../../web/state.mjs";
 import { createTeamPager } from "../../web/team.mjs";
+import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 
 // Exercise the real connection code; controlled promises/timers create races
 // without a browser, network, service, wall-clock retry or large object diff.
@@ -46,7 +47,7 @@ function harness(t, handler = async (path) => payload(path)) {
   const context = {
     document, window: { addEventListener(name, callback) { windowEvents[name] = callback; } },
     AbortController, URLSearchParams, console,
-    createSessionState, hydrateSession, applyEvent, isRunning, createTeamPager,
+    createSessionState, hydrateSession, applyEvent, isRunning, createTeamPager, VoiceSetup, voiceSetupLabel,
     VoiceInput: class { cancel() {} }, uploadFile() {}, transcribeAttachment() {},
     setTimeout(callback, delay) { const id = ++timerSequence; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -125,6 +126,21 @@ test("a replacement connection rejects late reads and old 401 without logging ou
   assert.equal(await outcome, "AbortError");
   assert.equal(h.ui.owner === owner, true); assert.equal(h.ui.state.auth.authenticated, true);
   assert.equal(h.requests[0].signal.aborted, true);
+});
+
+test("a replaced voice setup cannot publish or log out a new connection on late 401", async (t) => {
+  const late = deferred();
+  const h = harness(t, async (path) => path === "/voice/setup" ? late.promise : payload(path));
+  h.ui.activate();
+  Object.assign(h.ui.state, { connected: true, view: "settings", settingsTab: "inputs" });
+  const setup = h.ui.state.voiceSetupController, recording = setup.run("enroll");
+  const request = h.requests.find((item) => item.path === "/voice/setup");
+  assert.equal(setup.status().phase, "recording");
+  const owner = h.ui.activate(); late.reject(new ApiError("old login expired", 401));
+  await recording;
+  assert.equal(request.signal.aborted, true);
+  assert.equal(h.ui.owner === owner, true); assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(setup.status().phase, "idle"); assert.equal(setup.status().error, "");
 });
 
 test("an old bootstrap cannot hydrate or start streams after a new connection finishes", async (t) => {

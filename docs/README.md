@@ -7,6 +7,7 @@
 - [工作台](frontend.md)：聊天、审批、附件、主题与设置。
 - [模型](providers.md)：连接服务、推理参数、视觉和检索模型。
 - [个人记忆](memory.md)：自动整理、检索、原文核对与遗忘。
+- [来源目录](memory-sources.md)：浏览已保存资料、定位整理失败的来源。
 - [多 agent 协作](workflows.md)：分工、工作流和查看进度。
 - [任务控制](task-control.md)：暂停任务、补充要求与继续。
 - [任务核查](task-inspection.md)：查阅要求、成果和已有依据。
@@ -18,10 +19,13 @@
 - [连续终端](shell-sessions.md)：保留目录和环境、查看长命令进度与停止。
 - [队友附件](teammate-attachments.md)：把文件、图片和录音交给队友。
 - [附件检索](attachment-search.md)：查找已保存的附件。
+- [文档阅读](document-reading.md)：按需读取 PDF、DOCX 和长正文。
 - [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
+- [长资料检索](memory-chunks.md)：后台分块、续接与索引设置。
 - [电脑操作](computer.md)：应用、窗口和无障碍操作。
 - [平台支持](platforms.md)：后台服务、截图和录屏。
 - [语音](voice.md)：录音、转写、合成与可选唤醒。
+- [本地声学引擎](local-acoustic.md)：让沐璃协助接入已有模型，关闭后台也可登记和验证。
 
 ## 消息与提醒
 

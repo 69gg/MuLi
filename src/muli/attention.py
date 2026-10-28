@@ -12,6 +12,7 @@ from typing import Any
 from muli.config import AttentionSettings
 from muli.file_inbox import FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState
+from muli.memory_source_failure import failure_current
 from muli.proactive import FrozenRouting
 from muli.reminder_followup import read_followup_notice
 from muli.runtime import Runtime
@@ -132,6 +133,11 @@ class AttentionInbox:
             chiliarch_policy=chiliarch_policy,
             file_inbox_policy=self._file_inbox_settings() if self._file_inbox_settings else None,
             max_output_chars=self.runtime.config.settings.limits.max_output_chars,
+            memory_source_chars=(
+                self.runtime.config.settings.memory.max_source_chars
+                if self.runtime.config.settings.memory.enabled
+                else None
+            ),
         )
         if source is None:
             return None
@@ -150,6 +156,7 @@ class AttentionInbox:
             if source.file_inbox_proof
             else None,
             "reminder_proof": source.reminder_proof,
+            "memory_failure_proof": source.memory_failure_proof,
             **({"followup": source.reminder_proof.binding()} if source.reminder_proof else {}),
         }
 
@@ -176,6 +183,7 @@ class AttentionInbox:
                         "producer_proof",
                         "file_inbox_proof",
                         "reminder_proof",
+                        "memory_failure_proof",
                     }
                 }
                 for record in records
@@ -240,8 +248,14 @@ class AttentionInbox:
             policy.max_chars, max(512, self.runtime.config.settings.limits.max_context_chars // 4)
         )
         for event in events:
+            # One source per batch lets a later retry/forget revoke its pending
+            # input without cancelling an unrelated source or ordinary reminder.
+            if records and records[0]["memory_failure_proof"] is not None:
+                break
             record = self._record(event, policy, system_policy, chiliarch_policy)
             if record is not None and record["receipt_id"] not in seen:
+                if records and record["memory_failure_proof"] is not None:
+                    break
                 if records and bool(records[0]["file_inbox_proof"]) != bool(
                     record["file_inbox_proof"]
                 ):
@@ -252,6 +266,11 @@ class AttentionInbox:
                 if len(self._content([*records, record])) > budget:
                     if records:
                         break
+                    if record["memory_failure_proof"] is not None:
+                        # Source/revision identities are indivisible evidence.
+                        # Keep the durable failed job; never publish half an ID.
+                        after = event["id"]
+                        continue
                     while len(self._content([record])) > budget and record["detail"]:
                         record["detail"] = record["detail"][: len(record["detail"]) // 2]
                     record["detail"] += " [资料节选，完整内容见对应记录]"
@@ -285,6 +304,18 @@ class AttentionInbox:
             ):
                 raise ValueError("注意事项策略已改变")
             for record in records:
+                memory_proof = record["memory_failure_proof"]
+                if memory_proof is not None and (
+                    not self.runtime.config.settings.memory.enabled
+                    or not failure_current(
+                        self.store,
+                        memory_proof,
+                        max_source_chars=self.runtime.config.settings.memory.max_source_chars,
+                        max_output_chars=self.runtime.config.settings.limits.max_output_chars,
+                        verify_attachment=True,
+                    )
+                ):
+                    raise _ProducerPolicyChanged("资料整理失败依据已失效")
                 reminder_proof = record["reminder_proof"]
                 if (
                     reminder_proof is not None
@@ -347,6 +378,11 @@ class AttentionInbox:
                         if record["producer_proof"] is not None
                         else {}
                     ),
+                    **(
+                        {"memory_failure_proof": record["memory_failure_proof"].dump()}
+                        if record["memory_failure_proof"] is not None
+                        else {}
+                    ),
                 },
             )
             for record in records
@@ -368,6 +404,7 @@ class AttentionInbox:
                 objects=objects,
                 admission_guard=guard,
                 routing=routing,
+                memory_failure=records[0]["memory_failure_proof"],
             )
         except _ProducerPolicyChanged:
             # Reconsume the bounded journal suffix so stale source facts cannot

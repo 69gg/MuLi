@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import sqlite3
 import sys
@@ -21,6 +20,8 @@ from muli.process import run_process
 from muli.providers.http import read_response
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, now
+from muli.update_evidence import release_version as release_version
+from muli.update_evidence import update_evidence
 
 
 def direct_environment() -> dict[str, str]:
@@ -35,13 +36,6 @@ def direct_environment() -> dict[str, str]:
             "ftp_proxy",
         }
     }
-
-
-def release_version(value: str) -> tuple[int, int, int]:
-    if not re.fullmatch(r"\d+\.\d+\.\d+", value) or len(value) > 40:
-        raise ValueError("只支持正式发布版本号")
-    major, minor, patch = value.split(".")
-    return int(major), int(minor), int(patch)
 
 
 class UpdateCapability(TypedDict):
@@ -144,6 +138,7 @@ class Updates:
                         else "当前资料库需要托管候选更新，先配置来源并核验候选格式。"
                     ),
                     "source": "update",
+                    "update_evidence": update_evidence(item),
                     "read": False,
                     "created_at": now(),
                     "producer": "startup_update_check" if independent else "update_check",

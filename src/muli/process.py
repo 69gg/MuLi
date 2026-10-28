@@ -138,12 +138,16 @@ async def run_process(
     timeout: float = 15,
     limit: int = 24000,
     input_text: str | None = None,
+    input_bytes: bytes | None = None,
     merge_stderr: bool = True,
+    strict_output: bool = False,
     env: dict[str, str] | None = None,
     terminate_grace: float = 0,
 ) -> dict[str, Any]:
     if not argv or any("\x00" in arg for arg in argv):
         raise ValueError("命令参数无效")
+    if input_text is not None and input_bytes is not None:
+        raise ValueError("stdin 文本与二进制输入不能同时提供")
     if not math.isfinite(terminate_grace) or terminate_grace < 0:
         raise ValueError("进程清理宽限须为有限非负数")
     # Own creation before the first await. A late-returning handle after cancel
@@ -152,7 +156,11 @@ async def run_process(
         asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
+            stdin=(
+                asyncio.subprocess.PIPE
+                if input_text is not None or input_bytes is not None
+                else asyncio.subprocess.DEVNULL
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE,
             start_new_session=os.name == "posix",
@@ -174,8 +182,9 @@ async def run_process(
         process = await asyncio.shield(starting)
 
         async def write_input() -> None:
-            if input_text is not None and process.stdin:
-                process.stdin.write(input_text.encode())
+            if process.stdin is not None:
+                data = input_bytes if input_bytes is not None else (input_text or "").encode()
+                process.stdin.write(data)
                 await process.stdin.drain()
                 process.stdin.close()
 
@@ -206,7 +215,7 @@ async def run_process(
                 raise asyncio.CancelledError
     return {
         "exit_code": process.returncode,
-        "output": output.decode(errors="replace"),
-        "stderr": error.decode(errors="replace"),
+        "output": output.decode(errors="strict" if strict_output else "replace"),
+        "stderr": error.decode(errors="strict" if strict_output else "replace"),
         "truncated": False,
     }

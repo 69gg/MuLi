@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
+import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 import { createSessionState, applyEvent, messagePresentation, isRunning } from "../../web/state.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachments.mjs";
 
@@ -121,7 +122,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     createSessionState, applyEvent, messagePresentation, isRunning, attachmentKind, attachmentURL, formatBytes,
     createTeamPager: () => ({}), captureTeamView: () => null, restoreTeamView() {},
     renderMarkdown: (text) => { const node = document.createElement("p"); node.textContent = text; return node; },
-    uploadFile() {}, transcribeAttachment() {}, VoiceInput: class { cancel() {} }, sessionStorage: {},
+    uploadFile() {}, transcribeAttachment() {}, VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, sessionStorage: {},
     formatTimestamp: String, formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (path, options) => { streams.set(path, options.onEvent); await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },

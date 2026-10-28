@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -288,9 +289,13 @@ async def test_query_hot_budget_change_returns_structured_error_in_actual_tool_r
         query = application.query
 
         async def shrink_after_query(
-            text: str, limit: int = 8, *, hops: int | None = None
+            text: str,
+            limit: int = 8,
+            *,
+            hops: int | None = None,
+            source_ids: Sequence[str] | None = None,
         ) -> dict[str, Any]:
-            result = await query(text, limit=limit, hops=hops)
+            result = await query(text, limit=limit, hops=hops, source_ids=source_ids)
             assert json_size(result) > 1000
             runtime.config.update({"limits": {"max_output_chars": 1000}})
             return result

@@ -6,6 +6,7 @@ import { runInNewContext } from "node:vm";
 // Compare DOM/slot identity through booleans: failed object diffs traverse the cyclic mock graph.
 import { MODES } from "../../web/state.mjs";
 import { ApiError } from "../../web/api.mjs";
+import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 
 // Run the actual application functions and registered click/dialog/SSE handlers.
 // No browser library, server, model, account or real database is involved.
@@ -114,7 +115,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     setTimeout: () => 0, clearTimeout() {},
     createSessionState: () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
     uploadFile() {}, transcribeAttachment() {},
-    VoiceInput: class { cancel() {} }, restoreTeamView() {}, sessionStorage: {},
+    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },

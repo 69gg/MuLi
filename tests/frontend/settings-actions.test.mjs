@@ -45,6 +45,25 @@ function harness(controls, respond) {
   return { context, state, submit, errorNode, statusNode, calls, notices, renders, event };
 }
 
+test("embedding prefix separators survive collection, group switches and saving", async () => {
+  const document = control("media.embedding.document_instruction", "  passage: \n", "textarea");
+  const query = control("media.embedding.query_instruction", "query:\n", "textarea");
+  document.dataset.format = query.dataset.format = "raw";
+  const model = control("media.embedding.model", "  embedding-model  ");
+  const applied = { ...structuredClone(original), media: { embedding: { document_instruction: document.value, query_instruction: query.value, model: "embedding-model" } } };
+  const h = harness([document, query, model], async (_path, options) => options ? {} : applied);
+  // Group navigation collects the outgoing form without saving it yet.
+  h.context.collectSettingsForm();
+  assert.equal(h.state.settingsDraft.media.embedding.document_instruction, document.value);
+  assert.equal(h.state.settingsDraft.media.embedding.query_instruction, query.value);
+  assert.equal(h.state.settingsDraft.media.embedding.model, "embedding-model");
+  assert.equal(h.calls.length, 0);
+  await h.context.saveSettings(h.event);
+  assert.deepEqual(h.calls[0], { path: "/settings", options: { method: "PATCH", body: { media: applied.media } } });
+  assert.equal(h.state.settingsDraft.media.embedding.document_instruction, document.value);
+  assert.equal(h.state.settingsDraft.media.embedding.query_instruction, query.value);
+});
+
 test("clearing an optional model token limit PATCHes null without clearing other numeric settings", async () => {
   const applied = { ...structuredClone(original), models: { main: { max_output_tokens: null, timeout: 30 } } };
   const h = harness([control("models.main.max_output_tokens", "", "number"), control("models.main.timeout", "", "number")], async (_path, options) => options ? {} : applied);

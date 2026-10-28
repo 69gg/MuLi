@@ -57,6 +57,10 @@ export function createPreviewState() {
       { id: "memory-style", content: "你偏好简洁的中文说明，先给结论，再给必要依据。", kind: "preference", layer: "preference", source: "演示手动记录", source_id: null, trusted_owner: true, confidence: 1, version: 1, status: "active", entities: ["你", "中文说明"], relations: [{ subject: "你", predicate: "偏好", object: "中文说明" }], created_at: now - 7200, updated_at: now - 7200 },
       { id: "memory-project", content: "项目整理时，先确认当前目标，再把执行和复核交给不同队友。", kind: "procedural", layer: "procedural", source: "演示手动记录", source_id: null, trusted_owner: true, confidence: 1, version: 1, status: "active", entities: ["项目整理", "协作"], relations: [{ subject: "项目整理", predicate: "使用", object: "协作" }], created_at: now - 3600, updated_at: now - 3600 },
     ], memoryHistory: {},
+    memorySources: [
+      { source_id: "preview-source-notes", source: "前端演示资料", content: notes, session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "a".repeat(64), created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
+      { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
+    ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),
     members: [
       { id: "demo-researcher", session_id: "preview-researcher", name: "资料整理", role: "worker", parent_id: main.id, task: "整理示例项目结构与待办", status: "completed", generation: 1, last_message: "结构梳理与清单已完成。", created_at: now - 3600 },
       { id: "demo-reviewer", session_id: "preview-reviewer", name: "独立复核", role: "reviewer", parent_id: main.id, task: "检查整理结果是否遗漏边界", status: "completed", generation: 1, last_message: "已核对范围，保留需要你确认的事项。", created_at: now - 3500 },
@@ -69,6 +73,7 @@ export function createPreviewState() {
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
     management: { plugins: [{ id: "preview-notes", name: "资料整理示例", version: "demo", status: "loaded" }], plans: [], update: { status: "checked", available: false, current: "交互预览", latest: "交互预览", checked_at: now } },
     extensions: { generation: 1, phase: "loaded", skills: { enabled: true, count: 2 }, mcp: mcpStatus(mcp), preview: true },
+    voiceSetup: { state: "idle", preview: true }, voiceEnrolled: false,
     requests: [],
   };
 }
@@ -314,6 +319,52 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (item && method === "PATCH") { merge(item, body); emit("reminder.updated", item); return response(item); }
       if (item && method === "DELETE") { state.reminders = state.reminders.filter((entry) => entry.id !== id); return response({ deleted: true }); }
     }
+    if (path === "/memory/sources" && method === "GET") {
+      const filter = url.searchParams.get("state") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);
+      const states = ["queued", "processing", "retry", "failed", "done", "deferred"];
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (filter && !states.includes(filter))) return failure("来源目录参数无效。", 422);
+      let start = 0;
+      if (url.searchParams.has("cursor")) {
+        let token; try { token = JSON.parse(url.searchParams.get("cursor")); } catch { return failure("演示来源目录游标无效。"); }
+        if (!Array.isArray(token) || token.length !== 2 || token[0] !== filter || !Number.isInteger(token[1]) || token[1] < 0 || token[1] > state.memorySources.length) return failure("演示来源目录游标不属于当前筛选。");
+        start = token[1];
+      }
+      const candidates = state.memorySources.slice(start, start + limit), items = candidates.filter((item) => !filter || item.job.state === filter).map(({ content, ...item }) => item);
+      const next = start + candidates.length, more = next < state.memorySources.length;
+      return response({ items, examined: candidates.length, omitted: candidates.length - items.length, has_more: more, next_cursor: more ? JSON.stringify([filter, next]) : null, consistency: "live", order: "newest_registered_first" });
+    }
+    if (path === "/memory/source" && method === "GET") {
+      const item = state.memorySources.find((entry) => entry.source_id === url.searchParams.get("id"));
+      if (!item) return failure("演示来源不存在。", 404);
+      const offset = Number(url.searchParams.get("offset_bytes") ?? 0), length = Number(url.searchParams.get("length_bytes") ?? state.settings.limits.max_output_chars);
+      const revision = url.searchParams.get("revision"), raw = encoder.encode(item.content);
+      if (revision !== null && revision !== item.revision) return failure("演示来源版本已经变化。", 409);
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > raw.length || (offset && !revision) || !Number.isSafeInteger(length) || length < 1 || (raw[offset] >= 0x80 && raw[offset] <= 0xbf)) return failure("原文字节位置无效。");
+      let end = Math.min(raw.length, offset + Math.min(length, state.settings.limits.max_output_chars * 4)), content;
+      while (end >= offset) {
+        try { content = new TextDecoder("utf-8", { fatal: true }).decode(raw.slice(offset, end)); break; } catch { end--; }
+      }
+      if (!content && offset < raw.length) return failure("本段不足以容纳一个完整字符。");
+      const { content: original, job, ...metadata } = item;
+      return response({ ...metadata, id: item.source_id, digest: item.revision, field: "content", content, offset_bytes: offset, length_bytes: end - offset, next_offset_bytes: end, total_bytes: raw.length, has_more: end < raw.length, truncated: offset > 0 || end < raw.length });
+    }
+    if (path === "/memory/sources/retry" && method === "POST") {
+      if (Object.keys(body).sort().join(",") !== "revision,source_id") return failure("只接受准确来源和版本。", 422);
+      if (!state.settings.memory.enabled || state.settings.disabled_tools.includes("memory_retry_source")) return failure("演示记忆重试未启用。");
+      const item = state.memorySources.find((entry) => entry.source_id === body.source_id);
+      if (!item) return failure("演示来源不存在。", 404);
+      if (item.revision !== body.revision) return failure("演示来源版本已经变化。", 409);
+      const previous = item.job.state, eligible = ["failed", "deferred"].includes(previous);
+      const pending = state.memorySources.filter((entry) => ["queued", "processing", "retry"].includes(entry.job.state)).length;
+      const accepted = eligible && pending < (state.settings.memory.max_pending_jobs ?? state.previewLimits.max_items);
+      const receipt = { source_id: item.source_id, revision: item.revision, previous_state: previous, state: accepted ? "queued" : previous, accepted, reason: accepted ? "queued" : eligible ? "capacity_full" : previous === "done" ? "already_done" : "already_pending" };
+      if (accepted) {
+        item.job = { state: "queued", attempts: 0, last_error: "" };
+        later(() => { item.job.state = "processing"; item.job.attempts = 1; emit("memory.pipeline", { source_id: item.source_id }); });
+        later(() => { item.job.state = "done"; emit("memory.updated", { memory_ids: [], source_id: item.source_id }); }, delay * 2);
+      }
+      return response(receipt);
+    }
     if (parts[0] === "memories") {
       if (id === "graph" && method === "GET") { const edges = state.memories.flatMap((item) => item.relations ?? []); return response({ nodes: [...new Set(edges.flatMap((edge) => [edge.subject, edge.object]))], edges }); }
       if (parts.length === 1 && method === "GET") { const query = (url.searchParams.get("query") ?? "").toLowerCase(); return response({ items: state.memories.filter((item) => item.content.toLowerCase().includes(query)), revision: state.eventId }); }
@@ -362,8 +413,24 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (["content", "download"].includes(parts[2]) && method === "GET") return state.files.has(id) ? new Response(state.files.get(id)) : failure("演示附件不存在。", 404);
     }
     if (path === "/media/transcribe" && method === "POST") return response({ text: "这是一段演示转写。你可以编辑文字，再决定是否发送。", preview: true });
-    if (path === "/channels" && method === "GET") return response({ channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: 0 }, deliveries: [], proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
-    if (path === "/voice" && method === "GET") return response({ enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, reason: "前端预览不访问麦克风或声学设备。" });
+    if (path === "/channels" && method === "GET") return response({ channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: 0 }, deliveries: [], proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
+    if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, health: { state: "idle", code: null, occurrence_id: null }, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
+    if (path === "/voice/setup" && method === "POST") {
+      if (body.confirmed !== true) return failure("请确认本次模拟录音。", 400);
+      if (state.settings.voice.enabled) return failure("请先关闭后台语音唤醒。", 409);
+      if (!["enroll", "verify"].includes(body.operation)) return failure("未知设置操作。", 422);
+      const seconds = body.seconds ?? 5;
+      if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 1 || seconds > 15) return failure("录音时长无效。", 422);
+      if (body.operation === "verify" && !state.voiceEnrolled) return failure("请先录制参考声纹。", 409);
+      state.voiceSetup = { id: body.id ?? crypto.randomUUID(), operation: body.operation, state: "completed", requested_seconds: seconds, preview: true, ...(body.operation === "enroll" ? { enrolled: true } : { wake_detected: true, speaker_configured: true, speaker_verified: true }) };
+      if (body.operation === "enroll") state.voiceEnrolled = true;
+      return response(state.voiceSetup);
+    }
+    if (path === "/voice/setup/cancel" && method === "POST") {
+      if (typeof body.id !== "string" || !body.id) return failure("缺少本次设置标识。", 422);
+      if (body.id !== state.voiceSetup.id) return failure("语音设置已变化，未取消其它操作。", 409);
+      return response(state.voiceSetup);
+    }
     if (path === "/capture" && method === "GET") return response({ enabled: state.settings.computer.capture.enabled, available: false, running: false, reason: "前端预览不读取桌面或摄像头。" });
     if (path === "/service") {
       if (method === "GET") return response(state.service);

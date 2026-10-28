@@ -209,6 +209,8 @@ class HTTPServiceProfile(Section):
     extra_headers: dict[str, str] = Field(default_factory=dict)
     dimensions: int | None = Field(default=None, ge=1)
     query_instruction: str = ""
+    document_instruction: str = ""
+    query_extra_body: dict[str, Any] = Field(default_factory=dict)
     language: str = ""
     voice: str = ""
     response_format: str = "mp3"
@@ -510,8 +512,8 @@ class DesktopNotifications(Section):
     expire_ms: int = Field(default=8000, ge=1000, le=60000)
 
 
-AttentionEvent = Literal["reminder", "management", "update"]
-ATTENTION_EVENTS: tuple[AttentionEvent, ...] = ("reminder", "management", "update")
+AttentionEvent = Literal["reminder", "management", "update", "memory"]
+ATTENTION_EVENTS: tuple[AttentionEvent, ...] = ("reminder", "management", "update", "memory")
 
 
 class AttentionSettings(Section):
@@ -781,7 +783,7 @@ class ConfigFile:
                     target[key] = {
                         k: target[key].get(k, "") if v == "••••" else v for k, v in value.items()
                     }
-                elif key in {"extra_body", "reasoning", "thinking"}:
+                elif key in {"extra_body", "query_extra_body", "reasoning", "thinking"}:
                     target[key] = value
                 else:
                     cls._merge(target[key], value, (*path, key))

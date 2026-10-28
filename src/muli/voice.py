@@ -14,12 +14,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 from muli.config import VoiceSettings
 from muli.maintenance import Admission
 from muli.media import MediaService
 from muli.platforms.files import LocalFiles, artifact
 from muli.process import run_process
+from muli.voice_health import VOICE_LISTENER_FAILED, VOICE_UNAVAILABLE
 
 VoiceCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -202,6 +204,50 @@ class CommandDetector:
     def status(self) -> dict[str, Any]:
         configured = bool(self.command)
         available = configured and shutil.which(self.command[0]) is not None
+        if (
+            available
+            and len(self.command) == 5
+            and self.command[1:4] == ["-m", "muli.acoustic_bridge", "--config"]
+            # Keep venv paths: distinct venvs can symlink to the same binary but
+            # have different installed packages. Never preflight the wrong one.
+            and Path(shutil.which(self.command[0]) or "").absolute()
+            == Path(sys.executable).absolute()
+        ):
+            from muli.acoustic_bridge import check_config
+
+            try:
+                report = check_config(Path(self.command[4]))
+                operation = "wake" if self.operation == "wake" else "speaker"
+                available = report["available"] and report[f"{operation}_configured"]
+                if (
+                    self.config.device != "auto"
+                    and self.config.device != report["configured_provider"]
+                ):
+                    available = False
+                    report["reason"] = "声学 provider 与请求设备不一致；此适配器不支持 ROCm"
+                if (
+                    self.operation == "wake"
+                    and report["wake_sample_rate"] != self.config.sample_rate
+                ):
+                    available = False
+                    report["reason"] = "录音与唤醒模型的采样率不一致"
+                return {
+                    **report,
+                    "configured": configured,
+                    "available": available,
+                    "backend": "sherpa-onnx",
+                    "reason": (
+                        report["reason"] or f"尚未配置{operation}声学模型" if not available else ""
+                    ),
+                }
+            except (OSError, ValueError, ImportError):
+                return {
+                    "configured": configured,
+                    "available": False,
+                    "backend": "sherpa-onnx",
+                    "runtime_verified": False,
+                    "reason": "本地声学配置或模型文件不可用；不会录音或自动下载",
+                }
         return {
             "configured": configured,
             "available": available,
@@ -224,6 +270,11 @@ class CommandDetector:
             "requested_device": self.config.device,
             "wake_word": self.config.wake_word,
             "reference_path": str(reference) if reference is not None else None,
+            "threshold": (
+                self.config.wake_threshold
+                if self.operation == "wake"
+                else self.config.speaker_threshold
+            ),
         }
         response = await run_process(
             list(self.command),
@@ -241,12 +292,25 @@ class CommandDetector:
         flag = "detected" if self.operation == "wake" else "verified"
         if not isinstance(payload, dict) or type(payload.get(flag)) is not bool:
             raise ValueError("声学模型桥接缺少明确布尔结果")
+        if payload.get("score_kind") == "decision":
+            threshold = payload.get("threshold")
+            if (
+                self.operation != "wake"
+                or isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or threshold != self.config.wake_threshold
+                or not math.isfinite(threshold)
+            ):
+                raise ValueError("唤醒决定须使用当前配置的真实模型阈值")
+            return bool(payload[flag])
+        if payload.get("score_kind", "confidence") != "confidence":
+            raise ValueError("未知声学模型得分类型")
         score = payload.get("score")
         if (
             isinstance(score, bool)
             or not isinstance(score, (float, int))
-            or not math.isfinite(score)
             or not 0 <= score <= 1
+            or not math.isfinite(score)
         ):
             raise ValueError("声学模型桥接置信度须为 0 至 1 的有限数")
         threshold = (
@@ -271,6 +335,7 @@ class VoiceWorker:
         player: Player | None = None,
         on_status: VoiceCallback | None = None,
         admission: Admission | None = None,
+        on_fault: Callable[[str, str], None] | None = None,
     ) -> None:
         self.config, self.media, self.on_text = config, media, on_text
         self.admission = admission or Admission()
@@ -279,7 +344,15 @@ class VoiceWorker:
         self.wake = wake or CommandDetector(config, "wake")
         self.speaker = speaker or CommandDetector(config, "verify")
         self.player, self.on_status = player or SystemPlayer(), on_status
+        self.on_fault = on_fault
+        self._health: dict[str, str | None] = {
+            "state": "idle",
+            "code": None,
+            "occurrence_id": None,
+        }
         self._task: asyncio.Task[None] | None = None
+        self._setup_task: asyncio.Task[dict[str, Any]] | None = None
+        self._setup: dict[str, Any] = {"state": "idle"}
         self._operations: set[asyncio.Task[Any]] = set()
         self._lifecycle_lock = asyncio.Lock()
         self._stopping = False
@@ -342,6 +415,8 @@ class VoiceWorker:
             "playback": self.player.status(),
             "last_prompt": self.last_prompt,
             "last_reply": dict(self.last_reply),
+            "setup": dict(self._setup),
+            "health": dict(self._health),
             "reason": "语音服务已关闭"
             if self._closed
             else "语音服务正在停止"
@@ -361,10 +436,37 @@ class VoiceWorker:
                 return
             if self._task is not None and not self._task.done():
                 return
-            if not self.status()["available"]:
-                self.last_error = str(self.status()["reason"])
+            status = self.status()
+            if not status["available"]:
+                self.last_error = str(status["reason"])
+                self._background_fault(VOICE_UNAVAILABLE)
                 return
             self._task = asyncio.create_task(self._loop())
+
+    def _background_current(self) -> bool:
+        return (
+            self.config.enabled
+            and not self._closed
+            and not self._stopping
+            and self._task is asyncio.current_task()
+        )
+
+    def _background_fault(self, code: str) -> None:
+        if (
+            not self.config.enabled
+            or self._closed
+            or self._stopping
+            or self._health["state"] == "failed"
+        ):
+            return
+        occurrence = uuid4().hex
+        self._health = {"state": "failed", "code": code, "occurrence_id": occurrence}
+        if self.on_fault is not None:
+            try:
+                self.on_fault(code, occurrence)
+            except Exception:
+                # Notification is best effort and cannot change recording/retry behavior.
+                pass
 
     @asynccontextmanager
     async def _operation(self) -> AsyncIterator[None]:
@@ -398,13 +500,18 @@ class VoiceWorker:
                 tasks = self._operations.copy()
                 if self._task is not None:
                     tasks.add(self._task)
+                if self._setup_task is not None:
+                    tasks.add(self._setup_task)
                 self._task = None
                 tasks.discard(caller)
                 for task in tasks:
-                    task.cancel()
+                    if task is not self._setup_task or not task.cancelling():
+                        task.cancel()
             try:
                 # A callback may itself call stop; do not hold its lifecycle lock while joining it.
                 await asyncio.gather(*tasks, return_exceptions=True)
+                if self._setup_task is not None and self._setup_task.cancelled():
+                    self._setup = {**self._setup, "state": "cancelled"}
             finally:
                 async with self._lifecycle_lock:
                     self._stops -= 1
@@ -425,8 +532,8 @@ class VoiceWorker:
         self._closed = True
         await self.stop()
 
-    async def _record(self, seconds: float) -> Path:
-        if not self.config.enabled:
+    async def _record(self, seconds: float, *, _setup: bool = False) -> Path:
+        if not self.config.enabled and not (_setup and asyncio.current_task() is self._setup_task):
             raise ValueError("语音采集尚未启用")
         path = self.files.allocate(".wav")
         try:
@@ -444,32 +551,197 @@ class VoiceWorker:
             path.unlink(missing_ok=True)
             raise
 
-    async def enroll(self, seconds: float = 5) -> dict[str, Any]:
+    def _enrollment_seconds(self, seconds: float) -> None:
         if (
             isinstance(seconds, bool)
-            or not math.isfinite(seconds)
+            or not isinstance(seconds, (int, float))
             or not 1 <= seconds <= min(15, self.config.max_utterance_seconds)
+            or not math.isfinite(seconds)
         ):
             raise ValueError("声纹参考时长须为 1 至 15 秒且不超过录音上限")
+
+    def _save_reference(self, path: Path) -> None:
+        pointer = self.files.root / "enrollment.txt"
+        try:
+            if pointer.is_symlink():
+                raise ValueError("声纹参考索引不能是符号链接")
+            if self.files.used_bytes() + 32 > self.config.max_total_bytes:
+                raise ValueError("声纹参考超过本地容量限制")
+            pointer.write_text(path.stem, encoding="utf-8")
+            pointer.chmod(0o600)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        self._reference = path
+
+    async def enroll(self, seconds: float = 5) -> dict[str, Any]:
+        self._enrollment_seconds(seconds)
         async with self._operation(), self._capture_lock, self.files.lock:
             path = await self._record(seconds)
-            pointer = self.files.root / "enrollment.txt"
-            try:
-                if pointer.is_symlink():
-                    raise ValueError("声纹参考索引不能是符号链接")
-                if self.files.used_bytes() + 32 > self.config.max_total_bytes:
-                    raise ValueError("声纹参考超过本地容量限制")
-                pointer.write_text(path.stem, encoding="utf-8")
-                pointer.chmod(0o600)
-            except BaseException:
-                path.unlink(missing_ok=True)
-                raise
-            self._reference = path
+            self._save_reference(path)
             return artifact(
                 path,
                 "audio/wav",
                 acoustic_verification_available=self.speaker.status().get("available", False),
             )
+
+    def _setup_current(self) -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        if self._closed or self._stopping:
+            raise ValueError("语音服务已关闭或正在停止")
+        if self.config.enabled:
+            raise ValueError("请先关闭后台语音唤醒再进行设置录音")
+
+    def _setup_ready(self, operation: str) -> None:
+        self._setup_current()
+        if not self.recorder.status().get("available"):
+            raise ValueError("录音后端不可用")
+        speaker = self.speaker.status()
+        if operation == "enroll":
+            if not speaker.get("configured") or not speaker.get("available"):
+                raise ValueError("声纹模型尚未就绪")
+        else:
+            if not self.wake.status().get("available"):
+                raise ValueError("唤醒模型尚未就绪")
+            if speaker.get("configured"):
+                if not speaker.get("available") or self._reference is None:
+                    raise ValueError("声纹模型或参考录音尚未就绪")
+                self.files.validate(self._reference)
+
+    async def _capture_setup(
+        self, operation: str, seconds: float, guard: Callable[[], None] | None
+    ) -> dict[str, Any]:
+        try:
+            async with self._operation(), self._capture_lock, self.files.lock:
+                self._setup_ready(operation)
+                if guard is not None:
+                    guard()
+                path = await self._record(seconds, _setup=True)
+                retained = False
+                try:
+                    self._setup_ready(operation)
+                    if guard is not None:
+                        guard()
+                    if operation == "enroll":
+                        self._save_reference(path)
+                        retained = True
+                        result = {"enrolled": True}
+                    else:
+                        self._setup = {**self._setup, "state": "comparing"}
+                        detected = await self.wake.detect(path)
+                        self._setup_current()
+                        if guard is not None:
+                            guard()
+                        configured = bool(self.speaker.status().get("configured"))
+                        verified = False
+                        if configured:
+                            verified = await self.speaker.detect(path, reference=self._reference)
+                            self._setup_current()
+                            if guard is not None:
+                                guard()
+                        result = {
+                            "wake_detected": bool(detected),
+                            "speaker_configured": configured,
+                            "speaker_verified": bool(verified),
+                        }
+                    self._setup = {**self._setup, "state": "completed", **result}
+                    return dict(self._setup)
+                finally:
+                    if not retained:
+                        path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            self._setup = {**self._setup, "state": "cancelled"}
+            raise
+        except Exception:
+            self._setup = {**self._setup, "state": "error"}
+            raise
+
+    async def _run_setup(
+        self,
+        operation: str,
+        seconds: float,
+        guard: Callable[[], None] | None,
+        identifier: str | None,
+    ) -> dict[str, Any]:
+        if self._setup_task is not None and not self._setup_task.done():
+            raise ValueError("已有语音设置操作正在进行")
+        self._enrollment_seconds(seconds)
+        self._setup = {
+            "id": identifier or str(uuid4()),
+            "operation": operation,
+            "state": "error",
+            "requested_seconds": seconds,
+        }
+        self._setup_ready(operation)
+        if guard is not None:
+            guard()
+        self._setup = {**self._setup, "state": "recording"}
+        task = asyncio.create_task(self._capture_setup(operation, seconds, guard))
+        self._setup_task = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._cancel_setup_task(task)
+            raise
+        finally:
+            if self._setup_task is task:
+                self._setup_task = None
+
+    async def _cancel_setup_task(self, task: asyncio.Task[dict[str, Any]]) -> bool:
+        if not task.cancelling():
+            task.cancel()
+
+        async def settle() -> None:
+            await asyncio.gather(task, return_exceptions=True)
+
+        cleanup = asyncio.create_task(settle())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if task.cancelled() and self._setup_task is task:
+            self._setup = {**self._setup, "state": "cancelled"}
+        return cancelled
+
+    async def setup_enroll(
+        self,
+        seconds: float = 5,
+        *,
+        guard: Callable[[], None] | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Explicit finite enrollment while background voice remains disabled."""
+        return await self._run_setup("enroll", seconds, guard, identifier)
+
+    async def setup_verify(
+        self,
+        seconds: float = 5,
+        *,
+        guard: Callable[[], None] | None = None,
+        identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Return acoustic decisions without ASR, playback or owner submission."""
+        return await self._run_setup("verify", seconds, guard, identifier)
+
+    async def cancel_setup(self, identifier: str | None = None) -> dict[str, Any]:
+        receipt = dict(self._setup)
+        if identifier is not None and receipt.get("id") != identifier:
+            raise ValueError("语音设置已变化，未取消其它操作")
+        task = self._setup_task
+        if task is not None and not task.done():
+            if await self._cancel_setup_task(task):
+                raise asyncio.CancelledError
+            if task.cancelled():
+                return {**receipt, "state": "cancelled"}
+            if task.exception() is not None:
+                return {**receipt, "state": "error"}
+            return task.result()
+        return receipt
 
     async def listen_once(self) -> dict[str, Any] | None:
         if not self.config.enabled:
@@ -643,10 +915,15 @@ class VoiceWorker:
         while self.config.enabled and self._task is asyncio.current_task():
             try:
                 await self.listen_once()
+                if self._background_current():
+                    self._health = {"state": "ready", "code": None, "occurrence_id": None}
+                    self.last_error = ""
                 await asyncio.sleep(0)  # Let a maintenance request claim the safe cycle boundary.
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = str(exc)
+                if self._background_current():
+                    self._background_fault(VOICE_LISTENER_FAILED)
                 # A missing device/model never creates a busy retry loop.
                 await asyncio.sleep(max(2, self.config.cooldown_seconds))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -163,6 +164,31 @@ def main() -> None:
             env=environment,
             check=True,
         )
+        config, data = Path(directory) / "cli-config.json", Path(directory) / "cli-data"
+        inspection = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "muli",
+                "--config",
+                str(config),
+                "--data-dir",
+                str(data),
+                "plugins",
+                "inspect",
+                "wheel-smoke",
+            ],
+            cwd=directory,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        result = json.loads(inspection.stdout)
+        assert result["status"] == "invalid" and result["code_executed"] is False
+        assert result["runtime_health"] == "not_checked"
+        assert not config.exists() and not data.exists()
 
 
 if __name__ == "__main__":
