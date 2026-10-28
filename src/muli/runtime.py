@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,7 @@ from muli.extensions import Extensions
 from muli.failure_diagnostics import capture_failure
 from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.history_evidence import HistoryEvidence
+from muli.history_find import HistoryFind
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
@@ -3118,6 +3120,19 @@ class Runtime:
                 max_output_chars=limits.max_output_chars,
             )
 
+        async def find_conversation(args: dict[str, Any]) -> Any:
+            limits = self.config.settings.limits
+            return HistoryFind(self.store).find(
+                args["session_id"],
+                args["query"],
+                cursor=args.get("cursor"),
+                limit=min(args.get("limit", 20), limits.max_search_results),
+                max_output_chars=limits.max_output_chars,
+                max_results=limits.max_search_results,
+                max_context_chars=limits.max_context_chars,
+                deadline=monotonic() + limits.max_search_seconds,
+            )
+
         async def remember(args: dict[str, Any]) -> Any:
             item = self.memory.save(**args)
             await self.bus.emit(
@@ -3294,6 +3309,23 @@ class Runtime:
                     ("session_id",),
                 ),
                 read_conversation,
+                preserve_output=True,
+            ),
+            Tool(
+                "conversation_find",
+                "在指定已知会话的已存正文中按区分大小写的字面文字定位，返回出处及"
+                "conversation_read 参数。cursor 原样续查；无正文、附件检索或执行动作。"
+                "检查 has_more、omitted_total 和来源；无命中不代表原资料不存在",
+                parameters(
+                    {
+                        "session_id": string(),
+                        "query": string("要找的原文片段；按字面匹配，区分大小写"),
+                        "cursor": string("原样使用同一会话和查询返回的 next_cursor"),
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    ("session_id", "query"),
+                ),
+                find_conversation,
                 preserve_output=True,
             ),
             Tool(

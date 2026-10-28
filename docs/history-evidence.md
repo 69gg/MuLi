@@ -6,6 +6,8 @@
 
 ## 定位与读取
 
+知道来源会话、但不记得消息位置时，可以先用 [`conversation_find`](history-find.md) 按原文片段查找，再把返回的 `read_arguments` 交给 `conversation_read`。查找只返回位置和来源，不能代替阅读正文；预算中止或遗漏不表示已经查全。
+
 先列出消息：
 
 ```json
