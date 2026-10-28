@@ -41,3 +41,8 @@ source 撤销时移除对应 start 样本。最终可选 `resources.helper_start
 离线回归使用真实小临时 journal、现有 slot / backend fixture 和受控命令 runner，
 不启动 manager 或 subprocess。检查由主任务通过 `scripts/check_local.py` 串行执行；
 本说明本身不声明离线或托管验收通过。
+
+工作进程失败时，协调器只向 CI 日志转发已有 `native_failure_diagnostic:` 中
+经公共验证器认可的一份包内安全位置。缺失、重复、超限或损坏的诊断均不转发，
+也不回显原命令输出、异常正文或路径；原退出错误、收取及清理顺序保持不变。
+`helper_exit` 是最近观测阶段标签，不能替代安全帧来指认真正抛错位置。

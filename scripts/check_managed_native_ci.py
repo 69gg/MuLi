@@ -1117,6 +1117,36 @@ def failure_diagnostic_module() -> ModuleType:
     return module
 
 
+def project_worker_failure(data: bytes) -> None:
+    """Expose only one validated safe location, never captured command output."""
+    if type(data) is not bytes or len(data) > OUTPUT_BYTES:
+        return
+    prefix = b"native_failure_diagnostic:"
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate_diagnostic_key")
+            value[key] = item
+        return value
+
+    try:
+        candidates = [line[len(prefix) :] for line in data.split(b"\n") if line.startswith(prefix)]
+        if len(candidates) != 1:
+            return
+        module = failure_diagnostic_module()
+        if len(candidates[0]) > module.MAX_FAILURE_BYTES:
+            return
+        value = json.loads(candidates[0].decode("utf-8", errors="strict"), object_pairs_hook=unique)
+        diagnostic = module.validate_failure_diagnostic(value)
+        if diagnostic is not None:
+            encoded = json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))
+            print(prefix.decode("ascii") + encoded, file=sys.stderr)
+    except Exception:
+        pass  # Optional diagnostics must preserve the first client error and cleanup.
+
+
 def helper_source_facts(value: object) -> bool:
     return (
         isinstance(value, dict)
@@ -2920,6 +2950,7 @@ class NativeCI:
             client_status = reply.code
             client_failure = command_code(reply.code, reply.output)
             if client_status:
+                project_worker_failure(reply.output)
                 raise FixtureError("native_command_failed")
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             failed = True

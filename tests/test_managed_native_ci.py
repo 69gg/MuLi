@@ -5651,6 +5651,75 @@ def test_result_collection_failure_preserves_first_client_error(
         native.execute()
 
 
+def _safe_worker_failure_line() -> bytes:
+    diagnostic = {
+        "schema_version": 1,
+        "scope": "muli_package_only",
+        "exception_type": "unknown",
+        "frames": [{"module": "muli.platforms.systemd", "function": "Probe.read", "line": 42}],
+        "truncated": False,
+    }
+    return b"native_failure_diagnostic:" + json.dumps(diagnostic).encode("utf-8")
+
+
+def test_failed_client_projects_only_validated_safe_worker_frames(
+    fixture: tuple[Any, Commands],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    native, commands = fixture
+    commands.fail_case = True
+    original = native.call
+
+    def call(argv: Any, *, seconds: float = 5, output_bytes: int | None = None) -> Any:
+        reply = original(argv, seconds=seconds, output_bytes=output_bytes)
+        if argv[-2] == "drive":
+            return ci.Reply(
+                reply.code, b"private/path secret\n" + _safe_worker_failure_line() + b"\n"
+            )
+        return reply
+
+    monkeypatch.setattr(native, "call", call)
+    with pytest.raises(ci.FixtureError, match="^native_command_failed$"):
+        native.execute()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip().encode("utf-8") == _safe_worker_failure_line().replace(b" ", b"")
+    assert "private" not in captured.err and "secret" not in captured.err
+    assert json.loads((native.root / "result.json").read_text())["completed"] is False
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["absent", "duplicate", "utf8", "json", "keys", "private", "large", "budget", "extractor"],
+)
+def test_worker_failure_projection_rejects_untrusted_or_unavailable_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], change: str
+) -> None:
+    valid = _safe_worker_failure_line()
+    prefix = b"native_failure_diagnostic:"
+    data = {
+        "absent": b"private arbitrary stderr\n",
+        "duplicate": valid + b"\n" + valid,
+        "utf8": prefix + b"\xff",
+        "json": prefix + b"{",
+        "keys": valid.replace(b'"schema_version": 1', b'"schema_version": 1, "schema_version": 1'),
+        "private": valid.replace(b'"frames": [', b'"path": "/private/secret", "frames": ['),
+        "large": prefix + b" " * 4097,
+        "budget": b"x" * (ci.OUTPUT_BYTES + 1),
+        "extractor": valid,
+    }[change]
+    if change == "extractor":
+
+        def fail() -> NoReturn:
+            raise ValueError("private extractor failure")
+
+        monkeypatch.setattr(ci, "failure_diagnostic_module", fail)
+    ci.project_worker_failure(data)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
 @pytest.mark.parametrize(
     "change",
     [

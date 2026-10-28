@@ -1,5 +1,11 @@
 # 真实 systemd 托管切换 CI 设计
 
+当前仍未通过原生三事务验收。签名候选 `2f8a8999` 的
+[CI](https://github.com/69gg/MuLi/actions/runs/40672773630) 十四项通用检查成功，
+原生在第二次 release 后以 `ObservationError` 失败，清理已核验；最近的
+`helper_exit` 阶段标签不足以定位抛错。协调器现仅转发工作进程已经生成且通过公共
+验证器的安全帧，以便下一候选保留真实故障位置；不修改产品判断或原时限。
+
 Native65 诊断候选在原 helper 成本 hook 中增加 start 进入、命令进入及正常返回三个正向边界，
 每代仅保留最新固定快照，沿既有 poll 与最终收集读取；source、revision、mode 及输出预算
 继续严格校验。[边界合同与离线回归范围](managed-native-start-boundaries.md) 单独说明，
