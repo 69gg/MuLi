@@ -19,6 +19,7 @@
 - [连续终端](shell-sessions.md)：保留目录和环境、查看长命令进度与停止。
 - [队友附件](teammate-attachments.md)：把文件、图片和录音交给队友。
 - [附件检索](attachment-search.md)：查找已保存的附件。
+- [正文定位](attachment-find.md)：在一份资料里找文字，再阅读命中处。
 - [文档阅读](document-reading.md)：按需读取 PDF、DOCX 和长正文。
 - [续读书签](reading-bookmarks.md)：明确保存位置，压缩、重开或换渠道后继续阅读。
 - [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
