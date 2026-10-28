@@ -59,6 +59,8 @@ CI 验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 Windows 每�
 
 质量作业检查格式、类型、前端与发行包；可选集成作业另安装 MCP 和渠道依赖，覆盖默认环境可能跳过的 SDK 路径。每项保留 workflow 硬超时、有限并发和 Node 堆限制；诊断用的 `faulthandler_timeout` 不能代替终止期限。
 
+Windows 托管矩阵通过 [MSYS2 官方 action](https://github.com/msys2/setup-msys2) 复用 runner 已有环境，安装 [UCRT64 Poppler](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-poppler)，把其程序目录放到测试 PATH 前面并记录版本。这样真实 PDF 用例使用支持标准输入的转换器，避免命中 Git for Windows 附带的同名 Xpdf 程序。下载与安装仅发生在托管 runner；本机离线检查不安装转换器，也不改变真实文档用例的断言或可选依赖缺失行为。
+
 Windows 原生无障碍测试仅在托管 CI 创建并操作自己的临时窗口，本机开发不读取或点击真实桌面。专用诊断工作流与完整跨平台 CI 的覆盖范围不同，不能相互代替。
 
 测试应使用临时目录、假模型和受控 HTTP/SSE。协议回归通过不等于供应商、真实账号、桌面硬件或自然模型效果已经联调；在交付说明中准确标明未验证的部分。
