@@ -16,6 +16,6 @@
 
 依据：[PyPI 版本 JSON](https://docs.pypi.org/api/json/)、[HTTPX 原始流](https://www.python-httpx.org/quickstart/#streaming-responses)、[环境变量隔离](https://www.python-httpx.org/environment_variables/)、[uv cache](https://docs.astral.sh/uv/concepts/cache/)。HTTPX 的流与显式关闭合同已通过 Context7 及本机已安装 HTTPX/httpcore/AnyIO 源码核对。
 
-本片在共享资源守卫内分组完成 162 个不同用例：新增 `test_candidate_online.py` 37 项、`test_candidate_download.py` 19 项、`test_candidate_online_management.py` 17 项，共 73 项；旧 `test_candidate_preparation.py` / `test_candidate_update_capture.py` 51 项，旧管理、策略 API 和清理恢复三文件 38 项，共 89 项。独立复审补充的完整宿主反例先证实旧收尾会提交调用者事务，修复后三种事务模式保持原计划、事件、文件与 owner 事务；最后新管理 17 项与旧管理 38 项同组 55 项通过，13.91 秒/197.8 MiB。全部相关测试最大峰值 197.8 MiB、swap 0。6 个修改源码严格 mypy、10 个 Python 文件 Ruff/格式与差异空白检查通过，最后改动另作对应源码与测试静态复核。首轮测试夹具漏注入一个 fixture、启动恢复例未带实际 attempt 路径，均修正夹具后通过；产品预算和断言未放宽。
+离线回归分别验证客户端构造耗尽绝对期限，以及已进入响应后的真实计时器取消和关闭，避免将启动开销误当成响应停滞。关闭失败、重复取消和持久收尾失败均须保留原错误及所有权；不延长产品期限或让清理成功代替材料接纳。
 
 网络使用 MockTransport 和小型合成 wheel，Store、文件身份与管理来源核验使用真实临时文件和 SQLite；所有候选进程默认硬拒意外 spawn。已覆盖事实漂移、同版本竞争材料、原始错误 body 限额、关闭失败与重复取消、兼容拒绝、提交丢返回及重启不重装。没有真实构件下载、uv 安装、系统服务切换或发布平台矩阵验收，不把这些回归称为完整在线更新成功。

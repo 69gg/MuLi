@@ -241,26 +241,36 @@ async def test_raw_body_budget_and_transport_contract_apply_to_all_responses(
     assert stream.is_closed
 
 
-async def test_absolute_deadline_closes_a_stalled_response(frozen: FrozenPolicy) -> None:
+async def test_absolute_deadline_closes_a_stalled_response(
+    frozen: FrozenPolicy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from muli import candidate_online
+
+    entered = asyncio.Event()
+
     class Stalled(Chunks):
         async def __aiter__(self) -> AsyncIterator[bytes]:
+            entered.set()
             await asyncio.Event().wait()
             yield b"unreachable"
 
+    # Exercise the real 10ms response timer, independently of client construction.
+    # The paired TLS-construction test verifies that setup cannot renew a deadline.
+    monkeypatch.setattr(candidate_online, "time", SimpleNamespace(monotonic=lambda: 0.0))
     body = Stalled()
     with pytest.raises(CandidateError, match="candidate_online_unavailable"):
         await receive(
             URL,
             settings=OnlineSettings(),
             limit=1024,
-            deadline=asyncio.get_running_loop().time() + 0.01,
+            deadline=0.01,
             close_seconds=frozen.expected.limits.stop_seconds,
             media_types=frozenset({"application/json"}),
             consume=lambda _: None,
             verify=lambda: None,
             transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body)),
         )
-    assert body.closed
+    assert entered.is_set() and body.closed
 
 
 @pytest.mark.parametrize("failure", ["timeout", "error"])

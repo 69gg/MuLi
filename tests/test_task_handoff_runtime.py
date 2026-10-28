@@ -82,6 +82,7 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence_to_draft_worker(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     control_channel: str,
     compact_and_reopen: bool,
 ) -> None:
@@ -147,6 +148,11 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
     phone_receipts: dict[str, str] = {}
     unexpected_requests: list[tuple[str, str]] = []
     worker_requests: list[list[Message]] = []
+    failure_log_ids: set[str] = set()
+    failure_notices: list[tuple[str, str]] = []
+    failure_notice_ready = asyncio.Event()
+    failure_notice_release = asyncio.Event()
+    failure_notice_text = "原执行者故障已知悉；旧投递结果未知，不得重试"
     replacement_started = asyncio.Event()
     draft_release = asyncio.Event()
 
@@ -158,6 +164,24 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             if phase == "reopened-idle":
                 unexpected_requests.append((phase, "main"))
                 raise AssertionError("正常重开与手机重投不能自行唤醒主模型")
+            latest_user = next(message for message in reversed(messages) if message.role == "user")
+            assert latest_user.source_message_id is not None
+            source = runtime.store.get("message", latest_user.source_message_id)
+            if source is not None and source.get("source") == "system:attention":
+                # A delayed failure notice is an independent, legitimate input;
+                # recognize its host provenance, never a quoted marker in history.
+                failure_notices.append((phase, source["id"]))
+                assert len(failure_notices) == 1
+                assert source["principal"] == "system:attention"
+                notices = json.loads(source["content"].splitlines()[-1])
+                assert len(notices) == 1 and notices[0]["kind"] == "system_log"
+                assert notices[0]["record_id"] in failure_log_ids
+                record = runtime.store.get("system_log", notices[0]["record_id"])
+                assert record is not None and record["code"] == "runtime_failed"
+                assert record["session_id"] == old_id
+                assert record["run_id"] == runtime.team.get(old_id)["run_id"]
+                yield StreamEvent("done", turn=ModelTurn(content=failure_notice_text))
+                return
             main_round += 1
             if phase == "initial":
                 if main_round == 1:
@@ -499,6 +523,23 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
 
     runtime.client_factory = factory  # type: ignore[assignment]
     scenario_factory = runtime.client_factory
+    submit_attention = runtime.submit_attention
+
+    async def hold_failure_notice(
+        content: str, event_id: str, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        for kind, value in kwargs["objects"]:
+            if kind != "attention_receipt" or value.get("kind") != "system_log":
+                continue
+            record = runtime.store.get("system_log", value["record_id"])
+            if record is not None and record.get("session_id") == old_id:
+                assert record["code"] == "runtime_failed"
+                failure_log_ids.add(record["id"])
+                failure_notice_ready.set()
+                await failure_notice_release.wait()
+        return await submit_attention(content, event_id, **kwargs)
+
+    monkeypatch.setattr(runtime, "submit_attention", hold_failure_notice)
     # PluginManager captures its base factory while create_app composes the application.
     app = create_app(runtime.config, runtime=runtime)
     original_manager = app.state.channel_application.manager
@@ -534,6 +575,9 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 runtime,
                 lambda: bool(completed(runtime, "旧执行者失败；已有外发结果未知，暂不重试")),
             )
+            # Attention admission follows active runs and team report delivery.
+            # Hold that real notification across the phase change deterministically.
+            await asyncio.wait_for(failure_notice_ready.wait(), 4)
             assert old["reply_origin"]["kind"] == "web"
             assert old["reply_origin"]["input_id"] == assigned.json()["message"]["id"]
             assert manager.delivery(delivery_id)["state"] == "unknown"
@@ -601,6 +645,15 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 runtime,
                 lambda: bool(completed(runtime, replan_text)),
             )
+            assert main_round == 4
+            failure_notice_release.set()
+            await eventually(runtime, lambda: bool(completed(runtime, failure_notice_text)))
+            pending = runtime.tasks.get(main_id)
+            if pending is not None:
+                await asyncio.wait_for(asyncio.shield(pending), 4)
+            assert main_round == 4
+            assert len(failure_notices) == 1 and failure_notices[0][0] == "replan"
+            assert not unexpected_requests
             replan_messages = completed(runtime, replan_text)
             assert len(replan_messages) == 1
             history = await web.get(f"/api/sessions/{main_id}/messages")
@@ -1004,6 +1057,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             assert manager.delivery(delivery_id)["attempts"] == 1
             assert manager.delivery(delivery_id)["next_part"] == 0
             assert manager.delivery(delivery_id)["receipts"] == []
+            assert len(failure_notices) == 1
             assert len(worker_requests) == 3 and not unexpected_requests
             if control_channel == "onebot":
                 confirmations = 4 if compact_and_reopen else 3
@@ -1033,5 +1087,6 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 item["name"] not in {"channel_send", "audio_transcribe"} for item in new_calls
             )
     finally:
+        failure_notice_release.set()
         draft_release.set()
         await runtime.close()
