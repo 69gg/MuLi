@@ -27,11 +27,16 @@ STAGES = (
     "probe_received",
     "uia_initializing",
     "uia_ready",
+    "walker_initializing",
+    "walker_ready",
+    "probe_process_ready",
     "probe_encoded",
     "probe_write_returned",
 )
 PREFIX = b"muli-uia-stage=1:"
 NOTE_PREFIX = "uia_probe_diagnostic="
+UIA_INITIALIZATION_STAGES = ("uia_host_validated", "uia_add_type_returned")
+ALL_STAGES = (*STAGES[:8], *UIA_INITIALIZATION_STAGES, *STAGES[8:])
 
 
 def stage_bytes(*stages: str) -> bytes:
@@ -136,20 +141,77 @@ async def test_native_probe_failure_attaches_fixed_evidence_only_after_owned_cle
         await asyncio.gather(operation, return_exceptions=True)
 
 
-def test_packaged_script_has_eleven_once_only_fixed_stage_points() -> None:
+@pytest.mark.parametrize(
+    ("code", "outcome"), [("read_timeout", "not_started"), ("dependency_missing", "unknown")]
+)
+async def test_native_assembly_negative_control_preserves_unexpected_error_and_its_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, outcome: str
+) -> None:
+    import test_uia_native as native
+
+    failure = AXLeaseError(code, "original private failure", outcome)
+    probe = _Probe(failure=failure, stderr=stage_bytes(*STAGES[:4]))
+
+    class Computer:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._uia = SimpleNamespace(_new_lease=lambda **_: probe)
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(native, "Computer", Computer)
+    with pytest.raises(AXLeaseError) as caught:
+        await native.test_real_windows_probe_assembly_failure_returns_its_original_error_and_cleans_up(
+            tmp_path, monkeypatch
+        )
+    assert caught.value is failure and (failure.code, failure.outcome) == (code, outcome)
+    assert note(failure)["cleanup"] == "confirmed"
+    assert probe.calls == 1 and probe.closed
+
+
+async def test_native_assembly_negative_control_retains_the_original_unexpected_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test_uia_native as native
+
+    failure = AXLeaseError("read_timeout", "original private failure")
+    probe = _Probe(failure=failure, stderr=stage_bytes(*STAGES[:4]))
+
+    class Computer:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._uia = SimpleNamespace(_new_lease=lambda **_: probe)
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(native, "Computer", Computer)
+    with pytest.raises(AXLeaseError) as caught:
+        await native.test_real_windows_probe_assembly_failure_returns_its_original_error_and_cleans_up(
+            tmp_path, monkeypatch
+        )
+    assert caught.value is failure
+    assert isinstance(failure.__cause__, AssertionError)
+    facts = note(failure)
+    assert facts["cleanup"] == "confirmed" and facts["stages"] == list(STAGES[:4])
+    assert probe.closed and probe.calls == 1
+
+
+def test_packaged_script_keeps_sixteen_stage_names_and_fourteen_live_points() -> None:
     from muli.tools import uia_computer
 
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
-    lines = [PREFIX.decode() + stage for stage in STAGES]
+    lines = [PREFIX.decode() + stage for stage in ALL_STAGES]
     assert all(source.count("'" + line + "'") == 1 for line in lines)
     assert len(stage_bytes(*STAGES)) <= 512
+    assert len(stage_bytes(*ALL_STAGES)) <= MAX_STDERR_BYTES
     function = source.split("function Write-Stage", 1)[1].split("\nWrite-Stage 0", 1)[0]
     assert function.index("$script:traceMask = $script:traceMask -bor $bit") < function.index(
         "[Console]::Error.WriteLine"
     )
     assert "$script:traceMask -band $bit" in function and "catch { }" in function
     assert "$index -ge $script:traceStages.Length" in function
-    assert source.count("Write-Stage ") == len(STAGES)
+    assert source.count("Write-Stage ") == len(ALL_STAGES) - 2
+    assert "Write-Stage 11" not in source and "Write-Stage 12" not in source
     assert "if (-not $script:traceProbeSeen)" in source
     assert source.index("Write-Stage 6") < source.index("$writer.WriteLine($json)")
     assert source.index("Write-Stage 7") > source.index("$writer.WriteLine($json)")
@@ -176,6 +238,117 @@ def test_first_input_stages_surround_the_original_read_and_decode_only() -> None
     assert source.index("Write-Stage 2") < source.index(points[0])
 
 
+def test_probe_skips_tree_loading_and_walker_and_keeps_the_real_process_ready_stage() -> None:
+    from muli.tools import uia_computer
+
+    assert uia_computer.__file__ is not None
+    source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
+    guard = "if ([string]$request.command -cne 'probe') {"
+    loading = ". ([System.IO.Path]::Combine($PSScriptRoot, 'uia_tree.ps1'))"
+    walker = "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker"
+    initialization = source.split(guard, 1)[1].split("\n            }", 1)[0]
+    assert "$script:treeLoaded = $false" in source
+    assert "if (-not $script:treeLoaded) {" in initialization
+    assert loading in initialization
+    assert "$script:treeLoaded = $true\n                    Check-Deadline" in initialization
+    assert source.count(loading) == source.count("$script:treeLoaded = $true") == 1
+    assert source.count("uia_tree.ps1") == 1
+    assert walker in initialization
+    assert "$script:rows = [Collections.Generic.List[object]]::new()" in initialization
+    assert "$script:reasons = [Collections.Generic.HashSet[string]]::new()" in initialization
+    assert "$script:visited = 0" in initialization
+    points = (
+        "Initialize-Uia\n            Check-Deadline",
+        guard,
+        "if (-not $script:treeLoaded) {",
+        loading,
+        "$script:treeLoaded = $true\n                    Check-Deadline",
+        walker,
+        "switch -CaseSensitive ([string]$request.command)",
+        "'probe' {",
+        "$process = [Diagnostics.Process]::GetCurrentProcess()",
+        "try { $hasWindow = ($process.MainWindowHandle -ne [IntPtr]::Zero) }",
+        "finally { $process.Dispose() }",
+        "if ($traceProbe) { Write-Stage 13 }",
+        "$json = Encode-Result $requestId @{",
+        "Write-Stage 6",
+    )
+    positions = [source.index(point) for point in points]
+    assert positions == sorted(positions)
+    assert all(source.count(point) == 1 for point in points[1:-1])
+    assert source.index("$traceProbe = $true") < positions[0]
+
+
+def test_packaged_tree_functions_keep_their_responsibilities_separate_from_the_probe() -> None:
+    helper = Path(uia_computer.__file__).with_name("uia_helper.ps1")
+    source = helper.read_text(encoding="utf-8")
+    tree = helper.with_name("uia_tree.ps1").read_text(encoding="utf-8")
+    for name in (
+        "Add-Omission",
+        "Read-Node",
+        "Window-Stamp",
+        "Same-Window",
+        "Read-Children",
+        "Read-Targets",
+        "Read-Snapshot",
+        "Invoke-Node",
+        "Tree-Result",
+        "Fits-Frame",
+        "Keep-References",
+        "Tree-Frame",
+    ):
+        assert tree.count("function " + name) == 1
+        assert "function " + name not in source
+    for name in (
+        "Write-Stage",
+        "Initialize-Uia",
+        "Check-Deadline",
+        "Read-BoundedLine",
+        "Encode-Result",
+    ):
+        assert source.count("function " + name) == 1
+        assert "function " + name not in tree
+    assert "Microsoft.PowerShell.Utility\\Add-Type" not in tree
+    assert "Import-Module" not in tree and "StartNew" not in tree
+    assert "$pattern.Invoke()" in tree and "function Invoke-Node" not in source
+
+
+def test_probe_initialization_stages_surround_existing_checks_and_assembly_load() -> None:
+    source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
+    trace = source.split("$script:traceStages = @(", 1)[1].split("\n)", 1)[0]
+    assert all(trace.count("'" + PREFIX.decode() + stage + "'") == 1 for stage in STAGES)
+    for stage in UIA_INITIALIZATION_STAGES:
+        assert trace.count("'" + PREFIX.decode() + stage + "'") == 1
+    assert trace.index("probe_process_ready") < trace.index(UIA_INITIALIZATION_STAGES[0])
+    initialization = source.split("function Initialize-Uia {", 1)[1].split(
+        "\nfunction Check-Deadline", 1
+    )[0]
+    points = (
+        "Write-Stage 4",
+        "$PSVersionTable.PSVersion.Major -ne 5",
+        "[Threading.Thread]::CurrentThread.GetApartmentState()",
+        "Write-Stage 14",
+        "Microsoft.PowerShell.Utility\\Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes",
+        "Write-Stage 15",
+        "[System.Windows.Automation.AutomationElement].Assembly.GlobalAssemblyCache",
+        "[System.Windows.Automation.ControlType].Assembly.GlobalAssemblyCache",
+        "$script:ready = $true",
+        "Write-Stage 5",
+    )
+    positions = [initialization.index(point) for point in points]
+    assert positions == sorted(positions)
+    assert initialization.count(points[4]) == 1
+
+
+def test_probe_parser_accepts_new_initialization_markers_and_original_fourteen_stages() -> None:
+    for stages in (STAGES, ALL_STAGES):
+        result = diagnostic.probe_facts(
+            cast(AXHelperLease, _Probe(stderr=stage_bytes(*stages))), cleanup_failed=False
+        )
+        assert result["stages"] == list(stages)
+        assert result["stage_sequence"] == "valid"
+
+
 def test_every_bounded_prefix_keeps_only_complete_in_order_input_stage_lines() -> None:
     from helpers.uia_probe_diagnostics import probe_facts
 
@@ -196,11 +369,38 @@ def test_every_bounded_prefix_keeps_only_complete_in_order_input_stage_lines() -
 def test_old_eight_stage_prefix_remains_valid_without_new_input_markers() -> None:
     from helpers.uia_probe_diagnostics import probe_facts
 
-    stages = tuple(stage for stage in STAGES if stage not in STAGES[3:6])
+    stages = tuple(
+        stage
+        for stage in STAGES
+        if stage
+        not in {
+            "input_waiting",
+            "input_line_received",
+            "request_decoded",
+            "walker_initializing",
+            "walker_ready",
+            "probe_process_ready",
+        }
+    )
     result = probe_facts(
         cast(AXHelperLease, _Probe(stderr=stage_bytes(*stages))), cleanup_failed=False
     )
     assert len(stages) == 8
+    assert result["stages"] == list(stages) and result["stage_sequence"] == "valid"
+
+
+def test_old_eleven_stage_prefix_remains_valid_without_native_getter_markers() -> None:
+    from helpers.uia_probe_diagnostics import probe_facts
+
+    stages = tuple(
+        stage
+        for stage in STAGES
+        if stage not in {"walker_initializing", "walker_ready", "probe_process_ready"}
+    )
+    result = probe_facts(
+        cast(AXHelperLease, _Probe(stderr=stage_bytes(*stages))), cleanup_failed=False
+    )
+    assert len(stages) == 11
     assert result["stages"] == list(stages) and result["stage_sequence"] == "valid"
 
 
@@ -238,6 +438,12 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
             ["request_decoded", "input_line_received"],
             "invalid",
         ),
+        (stage_bytes("walker_ready", "walker_ready"), ["walker_ready"], "invalid"),
+        (
+            stage_bytes("probe_process_ready", "walker_ready"),
+            ["probe_process_ready", "walker_ready"],
+            "invalid",
+        ),
     ],
     ids=[
         "unknown",
@@ -247,6 +453,8 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
         "fixed-only",
         "input-duplicate",
         "input-out-of-order",
+        "walker-duplicate",
+        "native-getter-out-of-order",
     ],
 )
 def test_only_complete_known_lines_contribute_stage_evidence(
@@ -363,7 +571,7 @@ async def _failed_owned_probe_facts(
     try:
         async with asyncio.timeout(2):
             await case.writer.drain_entered.wait()
-            while bytes(case.lease._stderr) != stderr:
+            while bytes(case.lease._stderr) != stderr[:MAX_STDERR_BYTES]:
                 await asyncio.sleep(0)
             case.process.returncode = exit_code
             assert case.lease._pending is not None
@@ -396,6 +604,133 @@ async def test_probe_distinguishes_zero_stderr_while_owned_process_was_running(
     assert before["script_stages"] == [] and before["stage_sequence"] == "unobserved"
     assert after["exit"] == "nonzero" and after["readers_settled"] is True
     assert after["phase"] == "settled" and owned_probe.lease._once is True
+
+
+async def test_probe_records_first_complete_stage_arrival_on_original_stderr_reader(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = owned_probe
+    lease = cast(diagnostic.ProbeHelperLease, case.lease)
+    clock = [100.0]
+    monkeypatch.setattr(lease, "_observation_time", lambda: clock[0])
+    operation = asyncio.create_task(diagnostic.observe_probe(lease))
+    received = b""
+
+    async def feed(data: bytes, elapsed: float) -> None:
+        nonlocal received
+        clock[0] = 100.0 + elapsed
+        received += data
+        case.process.stderr.feed_data(data)
+        async with asyncio.timeout(2):
+            while bytes(lease._stderr) != received:
+                await asyncio.sleep(0)
+
+    try:
+        async with asyncio.timeout(2):
+            await case.writer.drain_entered.wait()
+        await feed(stage_bytes("script_entered", "uia_initializing"), 0.125)
+        assert lease._snapshot()["stage_arrival_ms"] == {
+            "script_entered": 125,
+            "uia_initializing": 125,
+        }
+        partial = stage_bytes(UIA_INITIALIZATION_STAGES[0])
+        await feed(partial[:-1], 0.125)
+        assert UIA_INITIALIZATION_STAGES[0] not in lease._snapshot()["stage_arrival_ms"]
+        await feed(partial[-1:], 0.250)
+        await feed(
+            stage_bytes(*UIA_INITIALIZATION_STAGES) + b"private-host-value=hidden\r\n",
+            0.500,
+        )
+        expected = {
+            "script_entered": 125,
+            "uia_initializing": 125,
+            UIA_INITIALIZATION_STAGES[0]: 250,
+            UIA_INITIALIZATION_STAGES[1]: 500,
+        }
+        snapshot = lease._snapshot()
+        assert snapshot["stage_arrival_ms"] == expected
+        assert snapshot["stderr_observation"] == "attached"
+        assert bytes(lease._observed_stderr) == received
+        assert snapshot["stage_sequence"] == "invalid"  # Duplicate kept by original parser.
+        assert bytes(lease._stderr) == received  # Original reader retained every byte unchanged.
+        failure = AXLeaseError("read_timeout", "private original failure")
+        assert lease._pending is not None
+        lease._pending.set_exception(failure)
+        async with asyncio.timeout(2):
+            with pytest.raises(AXLeaseError) as caught:
+                await operation
+        assert caught.value is failure
+        facts = note(failure)
+        assert facts["before_cleanup"]["stage_arrival_ms"] == expected
+        assert facts["after_cleanup"]["stage_arrival_ms"] == expected
+        assert facts["cleanup"] == "confirmed" and "private" not in json.dumps(facts)
+        assert case.spawns == case.cleanups == case.writer.drains == 1
+        assert len(case.writer.frames) == case.writer.closes == case.writer.waits == 1
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (b"private-host-value=hidden\r\n", []),
+        (PREFIX + b"uia_host_validated\r", []),
+        (stage_bytes(*ALL_STAGES), list(ALL_STAGES)),
+        (b"x" * MAX_STDERR_BYTES + stage_bytes(*ALL_STAGES), []),
+    ],
+    ids=["unknown", "incomplete", "all-known", "outside-retained-prefix"],
+)
+async def test_stage_arrival_records_only_complete_fixed_lines_in_original_prefix(
+    owned_probe: _Harness, stderr: bytes, expected: list[str]
+) -> None:
+    facts = await _failed_owned_probe_facts(owned_probe, stderr=stderr, exit_code=None)
+    for phase in ("before_cleanup", "after_cleanup"):
+        arrivals = facts[phase]["stage_arrival_ms"]
+        assert list(arrivals) == expected
+        assert all(type(value) is int and 0 <= value <= 2**31 - 1 for value in arrivals.values())
+    assert owned_probe.lease._budget.used == len(stderr)
+    assert "private" not in json.dumps(facts)
+
+
+async def test_stage_arrival_clock_failure_keeps_original_pipe_and_error_instance(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = owned_probe
+    lease = cast(diagnostic.ProbeHelperLease, case.lease)
+    operation = asyncio.create_task(diagnostic.observe_probe(lease))
+    failure = AXLeaseError("read_timeout", "private original failure")
+    stderr = stage_bytes("uia_initializing", *UIA_INITIALIZATION_STAGES)
+
+    def unavailable() -> float:
+        raise RuntimeError("private observation fault")
+
+    try:
+        async with asyncio.timeout(2):
+            await case.writer.drain_entered.wait()
+        with monkeypatch.context() as observation:
+            observation.setattr(lease, "_observation_time", unavailable)
+            case.process.stderr.feed_data(stderr)
+            async with asyncio.timeout(2):
+                while bytes(lease._stderr) != stderr:
+                    await asyncio.sleep(0)
+        assert lease._snapshot()["stage_arrival_ms"] == {}
+        assert lease._snapshot()["script_stages"] == [
+            "uia_initializing",
+            *UIA_INITIALIZATION_STAGES,
+        ]
+        assert lease._pending is not None
+        lease._pending.set_exception(failure)
+        async with asyncio.timeout(2):
+            with pytest.raises(AXLeaseError) as caught:
+                await operation
+        assert caught.value is failure
+        assert note(failure)["cleanup"] == "confirmed"
+        assert case.spawns == case.cleanups == case.writer.drains == 1
+        assert lease._budget.used == len(stderr)
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
 
 
 async def test_probe_distinguishes_unknown_stderr_after_owned_process_had_exited(
@@ -488,15 +823,23 @@ async def test_probe_late_spawn_preserves_original_cancel_and_adopts_same_proces
 
 
 async def test_observed_probe_full_stage_note_stays_within_original_budget(
-    owned_probe: _Harness,
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    lease = cast(diagnostic.ProbeHelperLease, owned_probe.lease)
+    monkeypatch.setattr(
+        lease,
+        "_observation_time",
+        lambda: 100.0 if lease.state == "new" else 100.0 + float(2**31),
+    )
     facts = await _failed_owned_probe_facts(
-        owned_probe, stderr=stage_bytes(*STAGES), exit_code=None
+        owned_probe, stderr=stage_bytes(*ALL_STAGES), exit_code=None
     )
     for phase in ("before_cleanup", "after_cleanup"):
-        assert facts[phase]["script_stages"] == list(STAGES)
+        assert facts[phase]["script_stages"] == list(ALL_STAGES)
         assert facts[phase]["stderr_kind"] == "known_stage"
-        assert facts[phase]["stderr_bytes"] == len(stage_bytes(*STAGES))
+        assert facts[phase]["stderr_bytes"] == len(stage_bytes(*ALL_STAGES))
+        assert list(facts[phase]["stage_arrival_ms"]) == list(ALL_STAGES)
+        assert set(facts[phase]["stage_arrival_ms"].values()) == {2**31 - 1}
 
 
 async def test_probe_cancelled_readers_do_not_claim_pipe_eof(

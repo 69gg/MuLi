@@ -1,260 +1,106 @@
 # Windows UIA 窗口与按钮
 
-状态：Windows UIA 只读后端已随 2.32.0 发布。最终精确候选和 main 各八项、
-发行十一项检查全部成功，包含 Windows 3.12/3.13 的三个真实原生用例。
-前两轮失败仍保留在[发行审查](review-v2.32.md)，不反推旧夹具超时的唯一原因。
-没有在开发机调用 PowerShell、读取桌面、安装组件或修改执行策略。
+Windows UIA 后端可发现窗口、读取所选窗口的树，并对本次快照中明确提供能力的普通
+按钮执行一次 `invoke`。电脑能力默认关闭；在现有配置中设置 `computer.enabled=true`、
+`computer.backend=auto` 后，Windows 自动使用 UIA。显式 `atspi` / `ax` 不降级，
+不新增 `uia` 配置取值。
 
-当前开发片增加普通按钮的一次 `invoke`，输入继续不可用；受限本地回归与静态检查
-已通过，最终独立实现审查与真实 Windows 动作验收仍待完成。下面明确区分已发布只读首片的历史
-证据和新能力，不能把历史只读矩阵当作按钮动作已经通过。详见[Invoke 设计](windows-uia-actions-design.md)。
+## 使用方式
 
-2.32.1 后续 main 的 Windows 3.12 在测试目标窗夹具启动时再次超时，发行矩阵仍全部
-通过。本轮仅把被读取的测试目标从额外 PowerShell/WinForms 进程改为 stdlib Win32
-临时窗口；产品 PowerShell/MTA 桥接、12 秒期限和三项原生断言不变，尚待新矩阵验证。
-首个整合 `753e0e5` 矩阵为 6/8：两项 Windows 在目标已就绪后的严格 PID 比较失败，
-已定位 Windows venv 启动器与实际 Python 为不同进程。测试目标现直接使用 CPython
-基础解释器，保持同 PID 校验；修后远端待验。
-零阶段事实、这次不同的失败与覆盖边界见[目标窗夹具记录](uia-native-win32-fixture-review.md)。
+| 工具 | 用法与结果 |
+| --- | --- |
+| `computer_targets({})` | 有界读取桌面的直接顶层窗口，返回 `scope=desktop_windows` 和临时 `target_id`。 |
+| `computer_snapshot({"target_id":"当前窗口标识"})` | 读取选定窗口，返回 `scope=window`、`snapshot_id` 和节点 `id`、`parent_id`、`depth`。 |
+| `computer_action({"snapshot_id":"当前快照","node_id":"按钮节点","action":"invoke"})` | 只调用本次快照中实际展示且具有 `actions=["invoke"]` 的按钮，一次尝试后消费整个快照。 |
+| `computer_release({})` | 释放当前执行持有的窗口引用与 helper。 |
 
-## 使用范围
+先发现窗口，再读取快照。未知、失效或缺少窗口标识均拒绝，不回退整个桌面，也不按
+标题寻找替代窗口。Windows 不接受 `application_id` 展开；`computer_type` 继续拒绝，
+不使用键盘、焦点、坐标或其他模式兜底。动作沿用现有 `computer` 风险门，发现、
+读取与释放沿用读取权限。
 
-保留主配置格式和 `computer.backend` 的现有取值。电脑能力仍默认关闭；启用后，
-`backend=auto` 在 Windows 选择 UIA。显式 `atspi` / `ax` 不降级，不新增 `uia`
-配置枚举；旧固定恢复控制器仍可解析同一份配置。
+每个新观察消费旧发现与快照。引用只属于当前执行；另一个执行收到 `desktop_busy`，
+旧执行不能释放新执行的引用。最终派发前重新检查真实执行、新输入、暂停和关闭。
 
-- `computer_targets({})` 有界读取桌面的直接顶层窗口，返回 `scope=desktop_windows`
-  与当前调用者持有的临时 `target_id`。Windows 首片不接受 `application_id` 展开。
-- `computer_snapshot({"target_id": "当前窗口标识"})` 读取该窗口的树，返回
-  `scope=window`、`snapshot_id`、节点 `id` / `parent_id` / `depth`。必须先发现窗口；
-  不传标识、未知或失效标识都拒绝，不回退整个桌面，也不按标题寻找替代窗口。
-- `computer_release({})` 释放当前执行的引用。外部原生引用、PID、窗口句柄、模块路径
-  与 UIA RuntimeId 不提供给模型。另一个执行收到 `desktop_busy`，旧执行不能释放新执行。
-- `computer_action({"snapshot_id":"当前快照","node_id":"按钮节点","action":"invoke"})`
-  只接受该快照实际展示、明确非密码且启用的普通 Button；`computer_type` 继续拒绝。
-  动作保留原 `computer` 风险门，发现、读取与释放沿用读取权限，不新增授权旁路。
+## 内容与动作限制
 
-每个新观察消费旧发现与快照。树只是当时的外部资料，不是原子桌面快照；名称本身
-不能授权操作，只有本次公开快照中的临时标识与明确能力才可用于一次尝试。
-UIA 的 Name 可能包含普通应用文字；首片不读取 ValuePattern / TextPattern。明确密码
-节点先核 `IsPassword`，再决定是否读取 Name；密码节点返回空名称和 `protected=true`。
-只有能取得 InvokePattern 的普通非密码、启用 Button 才提供 `actions=["invoke"]`、
-`read_only=false`；其它节点保持 `read_only=true`、`actions=[]`。所有节点的
-`editable=false`，不读 Value/Text，也不使用键盘、焦点、坐标或另一模式兜底。
+树是当时的外部资料，不是原子桌面快照；名称本身不能授权操作。UIA 的 Name 可能
+包含应用文字，后端不读取 ValuePattern / TextPattern。明确密码节点先核
+`IsPassword`，再决定是否读取 Name；密码节点返回空名称和 `protected=true`。
+
+只有能取得 InvokePattern 的普通、非密码、启用 Button 才提供
+`actions=["invoke"]`、`read_only=false`；其余节点保持 `actions=[]`、
+`read_only=true`，所有节点均为 `editable=false`。IsPassword 依赖 provider 声明，
+不能识别所有未标记的秘密。
+
+Invoke 前重新检查原对象的密码属性、Button 角色、启用状态、非保护名称、同
+PID / 窗口句柄 / 进程启动时间，以及最多 12 层原窗口父链。关闭或变化的窗口拒绝，
+不使用 RuntimeId、标题或句柄重新寻找控件。它不保证应用内部节点在读取期间未变。
+
+成功回执为 `{"ok":true,"outcome":"accepted","effect_verified":false}`，只表示原生
+调用被接受。进入原生 Invoke 后的异常、丢回执或超时均保守报告
+`action_unknown_outcome/unknown`；调用前拒绝保留 `not_started`。取消不撤销已经
+发生的界面效果，清理失败不把 accepted / unknown 改为可重试错误。没有自动重放；
+失败或结果不确定后，必须重新观察。
 
 ## 固定系统桥接
 
-宿主以 `GetSystemDirectoryW` 定位系统 Windows PowerShell 5.1，不从 PATH 选择程序。
-固定参数为 `-NoLogo -NoProfile -NonInteractive -Mta -File` 加随包提供的
-`tools/uia_helper.ps1`，启动使用已有 `CREATE_NO_WINDOW`。没有用户可注入的命令、脚本
-路径或 PowerShell 参数，也不使用 `-Command` / `-ExecutionPolicy Bypass`。
+宿主通过 `GetSystemDirectoryW` 定位系统 Windows PowerShell 5.1，不从 PATH
+选择程序。固定参数为 `-NoLogo -NoProfile -NonInteractive -Mta -File` 加随包的
+`tools/uia_helper.ps1`，启动使用 `CREATE_NO_WINDOW`；脚本路径与参数不接受用户输入。
 
-脚本关闭模块自动加载，只从 `$PSHOME/Modules/Microsoft.PowerShell.Utility/` 的固定
-manifest 显式导入 Add-Type 与 JSON 命令，并核实际模块路径。模块命令使用限定名。
-Add-Type 只加载系统 UIAutomationClient / UIAutomationTypes 程序集，并核 GAC；
-不传 C# 源码、MemberDefinition 或编译选项，不安装 SDK / Pythonnet，不派生外部命令。
-脚本资源沿用现有 Hatch 包目录，安装后 smoke 只核资源路径及严格 UTF-8 可读性。
+脚本关闭模块自动加载，只从 `$PSHOME/Modules/Microsoft.PowerShell.Utility/`
+的固定 manifest 显式导入 Add-Type 与 JSON 命令，并核实际模块路径。模块命令使用
+限定名。Add-Type 只加载系统 UIAutomationClient / UIAutomationTypes 程序集并核
+GAC；不编译 C#、安装 SDK / Pythonnet 或派生外部命令。
 
-系统 PowerShell、.NET Framework UIA 或当前会话不可用时固定报告失败。脚本仍受系统
-执行策略约束；没有脚本签名的安装在受限环境中可能不可用。MuLi 不修改执行策略，
-不提示提权、不使用其他宿主绕过策略。状态探测只证明桥接依赖与 MTA 可运行，不枚举
-桌面；`session_accessible` 保持未知，不能据此承诺任意应用或隔离桌面可读。
+首次非 probe 请求才从主脚本所在目录的固定 `uia_tree.ps1` 加载原有树与动作函数，
+在当前 helper 作用域保留并复用；不搜索 PATH 或用户脚本目录。加载计入原操作期限，
+文件缺失或加载失败沿用现有固定错误与清理。probe 不读取该文件，仍执行相同的
+真实 PowerShell 5.1、MTA 和 GAC 依赖检查。两个脚本随包安装，安装后 smoke 核验
+各自位置、严格 UTF-8 可读性与函数职责。
 
-## 引用、期限与预算
+系统 PowerShell、.NET Framework UIA 或当前会话不可用时固定失败。脚本仍受系统
+执行策略约束；无签名脚本在受限环境中可能不可用。MuLi 不修改执行策略或授权，
+不使用 `-ExecutionPolicy Bypass` 或其他宿主绕过策略。状态 probe 只证明桥接依赖
+与 MTA 可运行，不枚举桌面；`session_accessible` 保持未知，不能承诺任意应用或
+隔离桌面可读。
 
-同一个短期 MTA helper 持有实际 `AutomationElement`，不持久保存 RuntimeId 后回搜。
-选定窗口在读取前后核 PID、原生窗口句柄和该进程启动时间，并继续使用原对象；窗口
-销毁或原生调用失败时拒绝。它不保证应用内部节点在读取过程中从未变化。
+## 期限、预算与清理
 
-复用 `AXHelperLease` 的有界 JSON-lines 传输、绝对 TTL、调用者代次和强拥有回收，
-不修改 AX 原生实现。`snapshot_ttl_seconds` 从 helper 创建开始计时，读取与状态查询
-不续期；`operation_timeout_seconds` 覆盖启动和该次请求。新观察使旧标识失效；取消、
-超时、格式错误、执行结束、重载与关闭都回收准确的 helper。回收未确认时保留占用和
-固定错误，不把计数或空引用当成退出证明。
+复用 `AXHelperLease` 的有界 JSON-lines 传输、绝对 TTL 和强拥有回收。
+`snapshot_ttl_seconds` 从 helper 创建开始计时，读取与状态查询不续期；
+`operation_timeout_seconds` 覆盖启动与本次请求，默认 12 秒。取消、超时、格式
+错误、执行结束、重载和关闭均回收准确的 helper。回收未确认时继续保留占用与固定错误。
 
-新观察尝试、有效快照的一次操作尝试都在首个 await 前消费旧操作凭据。坏节点、
-不支持操作、取消与失败不会复活旧凭据。宿主只缓存最终 JSON 中实际展示的节点；
-helper 同样只保留已装箱节点的实际对象。最终 write 前复用 Runtime 的同步
-dispatch_guard，重新检查真实执行、新输入、暂停与关闭。Invoke 前向原对象核密码、
-Button 角色、启用、非保护名称、同 PID/窗口 stamp 及最多 12 层原窗口父链；
-不使用 RuntimeId、标题或句柄寻找替代控件。
+逐节点使用 ControlView TreeWalker，不使用整桌面 `FindAll(Descendants)`。
+`computer.max_nodes` 限制访问尝试，桌面根也消耗预算；属性调用与窗口身份复核
+不另计节点。相对深度最多 12、每个节点的直接子项最多 100。省略报告原因，
+未知子树数量不捏造精确值；不完整结果不能证明窗口或控件不存在。
 
-成功仅表示 `{"ok":true,"outcome":"accepted","effect_verified":false}`。进入原生
-Invoke 后的异常、丢回执或超时均保守为 `action_unknown_outcome/unknown`；调用前拒绝
-保留 `not_started`。取消不撤销已经发生的界面效果，清理失败不将 accepted/unknown
-改成可重试错误。不自动重放，下一步需重新观察。
+完整 helper JSON 信封同时受 60000 字符和 250000 UTF-8 字节上限约束，保留完整
+节点前缀及省略信息；宿主再按 `limits.max_output_chars` 限制公开 JSON。
+单 helper 最多 16 请求，单请求最多 64 KiB，stdout / stderr 合计最多 1000000
+字节。宿主和 helper 都只保留最终实际展示节点的引用。
 
-Windows 的现有进程原语只终止并等待自有的直接 helper。桥接没有显式派生子进程，
-但系统 UIA 可能使用 COM / 跨位数代理；本片不拥有、终止或宣称回收这些系统 broker。
+外部 provider 可能阻塞或先分配内存，遍历预算不是系统 COM 内存硬上限。Windows
+进程原语只终止并等待自有的直接 helper；系统 UIA 可能使用 COM 或跨位数代理，
+后端不拥有或宣称回收这些系统 broker。
 
-逐节点使用 ControlView TreeWalker，不使用整桌面 `FindAll(Descendants)`。单次节点预算
-复用 `computer.max_nodes`；桌面根与 Read-Node 访问尝试消耗预算。每个属性调用和前后
-窗口身份复核不另计为节点，因此节点数不是 COM 调用数。相对深度最多 12、直接子项
-最多 100；省略只报告原因，未知子树数量不捏造精确值。
+## 当前验证边界
 
-helper 的完整 JSON 信封同时受 60000 字符与 250000 UTF-8 字节上限约束，保留完整节点
-前缀并注明省略。宿主再按现有 `limits.max_output_chars` 计完整公开 JSON，复用父节点
-先于子节点的装箱逻辑。单 helper 仍最多 16 请求、单请求 64 KiB、stdout/stderr 合计
-1000000 字节。不完整结果不能证明某个窗口或控件不存在。外部 provider 可能阻塞或
-内部先分配内存，不能把遍历预算说成系统 COM 内存硬上限。
+本次拆分减少 probe 入口携带的树与动作定义，不证明冷启动超时的根因或超时已修复。
+已在托管 Windows 的 Python 3.12、3.13 环境验证延迟加载、依赖正负控、
+自有临时窗口读取、一次按钮操作与清理，保留原期限和协议。
+这项验证不代表任意应用、隔离桌面或本机用户桌面均可用。
 
-## 已发布只读首片的检查与后续记录
-
-所有本地命令经 `scripts/check_local.py` 串行、每组 30 秒，单次 1 GiB / 共享 2 GiB、
-swap 0 / 一逻辑 CPU 上限不变：
-
-- 新宿主 fake 27 项通过；真实 Windows 文件在 Linux 明确跳过 3 项。
-- 既有 AXComputer / Computer targets / integration 合计 83 项通过。
-- 既有 lease 76 项通过；总计 186 项通过、3 项原生 Windows 跳过。
-- 六份 Python 的 Ruff / 格式与两份源码 strict mypy 通过。峰值 128.7 MiB，swap 0。
-  首轮 Linux ctypes stub 缺 WinDLL 类型，改为现有 Windows 适配器相同的按需 loader
-  后通过；旧 auto Windows unavailable 预期只改为 uia，禁用不启动断言保留。
-
-上述本地结果本身不证明 PowerShell 脚本语法、系统模块实际布局或 UIA 已工作。
-`test_uia_native.py` 只在 hosted Windows CI 创建自己的临时标准 Win32 窗口；若未在
-Windows CI 执行，不能把 skip 当作验收。用例要求：
-
-1. 系统 Utility 的实际路径、自动加载关闭、真实 NoProfile / NonInteractive / MTA、
-   helper 无自有窗口、CREATE_NO_WINDOW，以及独立 PSModulePath 下依然能解析和编码 JSON。
-2. 实际选定临时窗口读回 Unicode，密码名称和值不出现在结果，所有节点只读；释放只
-   回收 reader，临时目标仍存活。关闭该目标后旧引用拒绝，不重新按标题搜。
-3. 固定 test-only PowerShell sleeper 已进入等待后，取消请求必须确认直接 helper 已退出。
-   该项是进程/协议收尾验证，不冒称实际阻塞 provider 已测试。
-
-根分支另完成 428 项整合回归、全仓静态及完整离线构建/安装 smoke，安装后脚本资源
-完整性已验证。精确候选 `6a8ad38` 的 CI `39554055600` 在 Windows 3.12/3.13
-实际通过上述三个用例；同一轮 Ubuntu 3.13 的旧回滚用例失败。后续精确候选
-`c60a77bb396d9ecfbc063284e1b71350c7e35891` 的 CI `39557587927` 为 7/8，
-原 Ubuntu 3.13 回退用例通过，但 Windows 3.12 的
-`test_real_windows_system_module_probe_mta_and_owned_unicode_tree` 在夹具等待首次
-Shown 回执时触及原 12 秒期限。其测试正文尚未执行；现有日志没有脚本阶段或 stderr
-事实，不能判定具体卡点。其余两项原生用例和 Windows 3.13 均通过。
-
-当前仅为该夹具增加固定阶段和退出/回收诊断，stdout/stderr 并发消费、合计仍限
-4096 字节；异常在强拥有清理完成后附有界固定标量，不输出 stderr 正文。原 12 秒
-启动总期限、三个原生断言和 hosted Windows CI 门均不变，没有预热或新增跳过。
-本地新增 9 项纯假流回归通过，宿主 27 项通过、3 项原生 Windows 仅按原规则跳过；
-三份测试 Python 的 Ruff、格式和 strict mypy 通过，整轮峰值 189 MiB、swap 0。
-这些本地结果只证明诊断与清理逻辑；随后精确 `b30fdd2` 的完整候选、main 和
-发行矩阵均通过，真实 Windows 验收由该轮 CI 提供。详见
-[启动诊断记录](uia-native-startup-review.md)。
-完整计数、失败定位和后续结果见[2.32 审查](review-v2.32.md)。
-没有执行用户桌面动作、截图、输入、授权修改或系统 broker 清理。
-
-当前目标夹具不再需要独立 PowerShell/.NET/WinForms 启动。固定 Python `-I -B` 子进程
-只创建自有窗口及 STATIC、密码 EDIT、BUTTON；消息循环实际处理自有就绪消息后才返回
-原 PID/标题回执，继续服从原 12 秒启动总期限与合计 4 KiB 管道/诊断预算。隐藏的前置
-STATIC 依微软标准控件合同提供密码 EDIT 的 Name，本身不作为 UIA 节点暴露；原私有
-label/value 不泄露、protected 空 name 和只读断言保留。受控宿主测试另拒绝 protected
-非空 name 回执；它不等于动态证明 PowerShell Name getter 从未调用。
-新目标的真实 UIA 可枚举性、密码 Name 关联与无窗口启动仍须由 Windows CI 证明；
-不能用 Linux fake API 结果替代，也不把去除额外依赖说成查明旧 PS 启动根因。
-初版新纯 fixture 11 项、既有 startup 9 项及 host 27 项合计 47 项通过，原 native
-3 项在 Linux 跳过，静态通过；随后首个整合矩阵的两个 Windows 作业在严格 PID 比较
-失败。修正仅把 stdlib-only 目标入口改为 Windows CPython 的 `sys._base_executable`，
-不接受子 PID；缺失/非绝对入口拒绝，产品 PS/MTA 与预算未改。纯消息派发→原就绪
-reader 的端到端旧码红、修后绿；16 fixture + 9 startup + 27 host 共 52 项通过、
-3 原 native Linux skip，四份 Python 静态通过，本轮最高 145.2 MiB、swap 0。
-精确候选、job、历史首轮静态与远端待验边界见上述目标夹具记录。
-这里的远端待验是该夹具修正时的状态；随后精确 `1cf078d` 的 2.33.0 候选、main
-及发行矩阵均成功，已提供该只读夹具在双 Windows 矩阵的实际验收，不能用它替代
-本次新增 Invoke 动作的验证。
-
-## 本片 Invoke 验证
-
-修改前两条真实宿主反例已失败，证明旧快照不能提供按钮能力且旧 UIA 错误转换丢失
-unknown outcome；详见[设计中的红例记录](windows-uia-actions-design.md)。本地回归
-仅使用假 lease、真实 Runtime/Store 和纯 Win32 调用替身，明确拒绝真实子进程。
-专用 Invoke 29 项、宿主/启动/窗口夹具 63 项、既有 Computer/AX 纯回归 101 项通过，
-合计 193 个不同用例（40 新增、153 既有）；专用首轮 28 项与后续 29 项重叠，
-不重复累计。4 项 hosted Windows 原生用例在 Linux 按原门控跳过。
-9 份 Python 的 Ruff/格式与两份源码 strict mypy 通过；pytest 峰值 67.2 MiB，
-类型检查峰值 213.4 MiB，swap 0，每条命令仍由原 30 秒守卫串行执行。
-最终独立静态实现后审未发现确定 P1/P2，没有运行开发机 PowerShell 或桌面。
-
-原有三项 hosted Windows 原生用例与 12 秒启动、4 KiB 两管道/诊断预算保留；新用例
-只操作自身临时窗的 BUTTON。标准控件的 `WM_COMMAND/BN_CLICKED` 必须同时匹配
-原父 HWND、控制 ID 与按钮 HWND，才发送一次固定计数。helper 的 accepted 与该
-计数分别断言并共用原操作期限。禁用按钮及密码无 Invoke，旧快照不能再次调用。
-输出 reader 在 readiness 后继续消费同一 stdout，按钮事件仍计入原 4 KiB 总额，
-重复或错误事件使夹具失败并强拥有回收。首轮 Windows 验收事实与剩余修复见下一节，
-不以 Linux fake 或只读历史通过替代实际 provider 证据。
-
-## 首轮 Windows 验收与按钮范围断言
-
-精确 `415187c66d33837ff5a4765b9c0ee9ec384d1642` 的 CI `39602031782` 为 7 成功、
-3 失败。Windows 3.12 job `119228670548` 和 3.13 job `119228670422` 都在首个
-原生用例的按钮全集断言失败：同一自有窗口还包含普通标题栏按钮，原测试错误地要求
-所有具有 Invoke 能力的节点只能是专属按钮。两组都已通过 probe 的前置断言，并在
-独立 Invoke 用例分别实际收到 `BN_CLICKED`；这些成功不等于整个矩阵已通过。
-
-窄修只按专属 `BUTTON_NAME` 精确定位唯一节点，仍要求 `actions=["invoke"]` 且
-非只读；其他合法按钮可以存在，不用系统按钮的英文名称作白名单。密码保护、禁用
-按钮拒绝、单次快照、实际点击计数及原 12 秒期限均保持。
-
-纯回归直接调用原 native 测试函数，只替换 Computer/lease/进程边界；额外 Unicode
-按钮在旧断言下稳定失败（0.12 秒、57.3 MiB）。修后 5 项通过（0.11 秒、56.7 MiB），
-含额外按钮成功及专属按钮缺失、重复、无 Invoke、只读四项拒绝。两份 Python 的
-Ruff/format-check 和 strict mypy 通过；首轮 mypy 仅报测试引用未显式导出的
-`native.subprocess`，改为直接导入同一标准库模块后通过。整轮峰 195.3 MiB、swap 0；
-没有运行本机 PS、子进程或桌面，修后的真实 Windows 矩阵仍待验。
-
-## 后续 probe 阶段证据
-
-2.36 发行的 Windows 3.12 job `119210252707` 曾在目标窗已经就绪后，独立 PS
-probe 等待回执超时；现有日志不足以区分启动、模块导入、UIA 初始化与写回阶段。
-初版观测仅给精确包内脚本增加每 helper 最多八行固定 stderr 标记，仍计入原会话
-预算；CI 在自有 helper 收尾后，只附固定阶段和回收标量。没有扩大 12 秒、修改
-MTA/执行策略、预热或自动重试，生产 API 不返回原始 stderr。缺少标记不等于确定
-停滞原因，WriteLine 返回也不等于宿主已经收到。实现与真实 Windows 验证状态见
-[阶段证据设计](windows-uia-probe-diagnostics-design.md)；不把观测片描述成根因修复。
-本地仅运行 13 新增与 42 既有纯用例，三份 Python 静态及新 helper 类型检查通过，
-峰值 67.9 MiB、swap 0；独立静态后审未发现确定 P1/P2，真实脚本阶段输出仍待验。
-
-后续 2.41 精确 `b89a3dc` 的候选和 main 各十项成功，但发行 `40004425177` 的
-Windows 3.13 job `120588588362` 再次在 probe 等待回执时超时，发布步骤未执行。
-note 仅见前三阶段至 `utility_ready`，原 helper 与 readers 已收尾；这没有显示进入
-UIA 初始化，也不能从清理后的非零退出判定自然失败原因。
-
-本轮只补首请求的 `input_waiting`、`input_line_received`、`request_decoded`，分别
-紧邻原输入读取之前、取得完整行之后、原 JSON 转换返回之后。全 helper 最多十一行，
-仍沿用原 stderr 前缀与会话总额，12 秒不变；不输出内容、不增加重试或计时代理。
-LF 全十一行 361 字节、CRLF 372 字节，仍低于原 512 字节标记总量与 2048 字节
-保留前缀。未知 stderr 可遮住标记，只有完整已知行参与顺序判断；缺失不等于停滞，
-阶段间耗时也不能据此推定。18 项专用与 46 项既有纯回归共 64 项通过，两份 Python
-静态通过，pytest 峰 61.8 MiB、整轮峰 314.2 MiB、swap 0；没有运行 PS、真实进程或
-桌面，新阶段的独立实现后审与真实 Windows 待验。增加观测不代表已修复超时，完整
-事实、失败记录与逐字节前缀边界见上述阶段证据设计。
-
-## 同进程启动判别（尚未实测）
-
-旧候选 `691ea5c` 的 CI `39979235619`、Windows 3.13 job `120501823249` 四项
-UIA native 用例超时，连不调用 COM 的 owned-pending 脚本也未观察到读后标记。
-首 probe 的 stages 为空，只能说明没有观察到；清理后的非零退出不能证明自然失败。
-
-后续窄观测只在第四例原有进程中增加 ReadLine 前/后的两个固定 stderr 标记，并在
-测试侧记录原 spawn/write/drain 及清理前后状态。没有新增启动、重试、管道、查询或
-产品配置，原 12 秒和强拥有清理保持；异常仅在收尾后附不超过 4 KiB 的固定标量，
-不输出任意 stderr 或环境。实现与待验证边界见
-[同进程观测合同](windows-uia-pending-observation-design.md)。本片新增 19 个纯 fake
-节点，与相关既有回归共 74 项通过；三份 Python Ruff/格式与 helper strict mypy
-通过，整轮峰值 94.6 MiB、swap 0。独立 6.1 sol 静态后审未发现确定 P1/P2 或阻断；
-真实 Windows 仍待验证。诊断不是启动失败的修复，后续候选成功也不倒推旧失败已解决。
-
-2.43 候选 `40019282611` 的 Windows 3.12 首 probe 再次在等待原响应时超时，阶段
-为空；完整 traceback 已证明该次 spawn/write/drain 返回。测试侧现复用同一 owned
-lease 的清理前/后快照，补有限 stderr 字节/白名单分类及宿主各阶段相对毫秒，保持
-原工厂 argv、包内脚本、12 秒和一次生命周期。根七文件150项整合、四文件strict
-mypy/Ruff/格式及独立最终后审通过；真实Windows仍待新精确候选验收，
-不输出 stderr 正文或环境，不把新增观察称为根因修复。3.13 的独立格式读取超时仍
-保留真实失败。具体事实与覆盖边界见[首 probe 观察缺口](windows-uia-probe-diagnostics-design.md#243-同次首-probe-观察缺口)。
+历史 CI 与诊断证据保留在[启动诊断记录](uia-native-startup-review.md)、
+[目标窗夹具记录](uia-native-win32-fixture-review.md)及
+[探针诊断设计](windows-uia-probe-diagnostics-design.md)。
 
 ## 官方依据
 
-Context7 先查 PowerShell / .NET 接口；模块自动加载问题无匹配时再核微软原文：
-
-- [Windows PowerShell 5.1 启动参数](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe?view=powershell-5.1)：NoProfile、NonInteractive 与 MTA。
-- [Import-Module](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/import-module?view=powershell-5.1) 与 [系统模块目录](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-5.1)：显式路径导入，避免依赖用户模块搜索。
-- [Add-Type](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/add-type?view=powershell-5.1)：AssemblyName 加载已有程序集与源码编译是不同参数集。
-- [UIA 线程模型](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)、[TreeWalker](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/navigate-among-ui-automation-elements-with-treewalker) 与 [RuntimeId](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-getruntimeid)：独立 MTA、有限树遍历与非持久身份。
-- [进程创建标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)、[ConvertTo-Json](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/convertto-json?view=powershell-5.1) 与 [Console 编码](https://learn.microsoft.com/en-us/dotnet/api/system.console.outputencoding?view=netframework-4.8.1)：无控制台、显式 JSON 深度和 UTF-8 传输。
+- [Windows PowerShell 5.1 参数](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe?view=powershell-5.1)：NoProfile、NonInteractive 与 MTA。
+- [Import-Module](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/import-module?view=powershell-5.1) 与[系统模块目录](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-5.1)：固定路径导入。
+- [PowerShell 作用域](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_scopes?view=powershell-5.1)：dot-source 在当前作用域添加函数。
+- [Add-Type](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/add-type?view=powershell-5.1)、[UIA 线程模型](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading)与[TreeWalker](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/navigate-among-ui-automation-elements-with-treewalker)：系统程序集与 MTA 中的有限遍历。

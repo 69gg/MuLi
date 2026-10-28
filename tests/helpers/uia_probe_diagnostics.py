@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -19,7 +20,12 @@ STAGES = (
     "request_decoded",
     "probe_received",
     "uia_initializing",
+    "uia_host_validated",
+    "uia_add_type_returned",
     "uia_ready",
+    "walker_initializing",
+    "walker_ready",
+    "probe_process_ready",
     "probe_encoded",
     "probe_write_returned",
 )
@@ -242,6 +248,18 @@ def pending_snapshot(lease: PendingHelperLease) -> dict[str, Any]:
     }
 
 
+class _ProbeStderr:
+    """Delegate the original pipe read; retain only arrival times of fixed lines."""
+
+    def __init__(self, stream: asyncio.StreamReader, lease: ProbeHelperLease) -> None:
+        self.stream, self.lease = stream, lease
+
+    async def read(self, size: int) -> bytes:
+        chunk = await self.stream.read(size)
+        self.lease._record_stage_arrivals(chunk)
+        return chunk
+
+
 class ProbeHelperLease(PendingHelperLease):
     """Observe the first real probe through the same owned lease operations."""
 
@@ -260,6 +278,7 @@ class ProbeHelperLease(PendingHelperLease):
         self._observed_phase = "not_started"
         self._observed_phase_started = 0.0
         self._observed_durations = dict.fromkeys(_PROBE_PHASES, 0.0)
+        self._stage_arrival_ms: dict[str, int] = {}
         self._observed_stderr = bytearray()
         self._observed_stderr_attached = False
         self._observed_stderr_failed = False
@@ -290,10 +309,6 @@ class ProbeHelperLease(PendingHelperLease):
         except Exception:
             self._observed_stderr_failed = True
 
-    async def _read_stderr(self, stream: asyncio.StreamReader) -> None:
-        self._observe_stderr_reads(stream)
-        await super()._read_stderr(stream)
-
     def _observation_time(self) -> float:
         return self._loop.time()
 
@@ -316,6 +331,31 @@ class ProbeHelperLease(PendingHelperLease):
         self._observe("spawn")
         await super()._start()
         self._observe("send")
+
+    async def _read_stderr(self, stream: asyncio.StreamReader) -> None:
+        self._observe_stderr_reads(stream)
+        await super()._read_stderr(cast(asyncio.StreamReader, _ProbeStderr(stream, self)))
+
+    def _record_stage_arrivals(self, chunk: bytes) -> None:
+        try:
+            if not chunk or self._observed_started is None:
+                return
+            room = max(0, MAX_STDERR_BYTES - len(self._stderr))
+            if room == 0:
+                return
+            data = bytes(self._stderr[:MAX_STDERR_BYTES]) + chunk[:room]
+            stages, _ = _stage_facts(data, STAGES, _STAGE_LINES)
+            pending = [stage for stage in stages if stage not in self._stage_arrival_ms]
+            if not pending:
+                return
+            elapsed = self._observation_time() - self._observed_started
+            if not math.isfinite(elapsed) or elapsed < 0:
+                return
+            milliseconds = _milliseconds(elapsed)
+            for stage in pending:
+                self._stage_arrival_ms[stage] = milliseconds
+        except Exception:
+            pass  # Pipe ownership, byte charging and the original error remain unchanged.
 
     def _input_drained(self) -> None:
         self._observe("response")
@@ -354,6 +394,11 @@ class ProbeHelperLease(PendingHelperLease):
             phase=self._observed_phase,
             elapsed_ms=_milliseconds(elapsed),
             phase_ms={phase: _milliseconds(value) for phase, value in durations.items()},
+            stage_arrival_ms={
+                stage: self._stage_arrival_ms[stage]
+                for stage in stages
+                if stage in self._stage_arrival_ms
+            },
         )
         return facts
 
