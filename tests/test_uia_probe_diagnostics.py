@@ -471,6 +471,9 @@ async def test_probe_late_spawn_preserves_original_cancel_and_adopts_same_proces
         assert facts["before_cleanup"] == before
         assert facts["after_cleanup"]["spawn"] == "returned"
         assert facts["after_cleanup"]["phase"] == "settled"
+        for phase in ("before_cleanup", "after_cleanup"):
+            assert facts[phase]["stderr_observation"] == "unavailable"
+            assert facts[phase]["stderr_eof_observed"] is None
         assert facts["cleanup"] == "confirmed"
         assert case.spawns == case.cleanups == 1 and case.lease._process is cast(
             object, case.process
@@ -518,6 +521,137 @@ async def test_probe_cancelled_readers_do_not_claim_pipe_eof(
     assert facts["after_cleanup"]["readers_settled"] is True
     assert all(reader.cancelled() for reader in case.lease._readers)
     assert not case.process.stdout.at_eof() and not case.process.stderr.at_eof()
+    assert facts["after_cleanup"]["stderr_eof_observed"] is not True
+
+
+@pytest.mark.parametrize("split_before_cleanup", [False, True])
+async def test_probe_observes_same_stderr_reads_after_original_reader_is_cancelled(
+    owned_probe: _Harness, monkeypatch: pytest.MonkeyPatch, split_before_cleanup: bool
+) -> None:
+    case = owned_probe
+    lease = cast(diagnostic.ProbeHelperLease, case.lease)
+    stderr = case.process.stderr
+    complete = stage_bytes(*STAGES[:2])
+    boundary = len(PREFIX) + 5 if split_before_cleanup else 0
+    early, late = complete[:boundary], complete[boundary:]
+    failure = AXLeaseError("read_timeout", "private original timeout")
+    original_transport = getattr(stderr, "_transport", None)
+
+    async def settle(
+        process: asyncio.subprocess.Process, readers: list[asyncio.Task[None]], **kwargs: Any
+    ) -> None:
+        case.cleanups += 1
+        case.cleanup_entered.set()
+        assert (process is cast(object, case.process)) is True
+        assert (process.stderr is stderr) is True
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+        assert process.stdin is not None
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        stderr.feed_data(late)
+        assert await stderr.read(4096) == late
+        stderr.feed_eof()
+        assert await stderr.read(4096) == b""
+        case.process.stdout.feed_eof()
+        case.process.returncode = 7
+
+    monkeypatch.setattr(ax_lease, "_settle_process", settle)
+    stderr.feed_data(early)
+    operation = asyncio.create_task(diagnostic.observe_probe(lease))
+    try:
+        async with asyncio.timeout(2):
+            await case.writer.drain_entered.wait()
+            while not lease._observed_stderr_attached or bytes(lease._stderr) != early:
+                await asyncio.sleep(0)
+            assert lease._pending is not None
+            lease._pending.set_exception(failure)
+            with pytest.raises(AXLeaseError) as caught:
+                await operation
+        assert caught.value is failure
+        facts = note(failure)
+        before, after = facts["before_cleanup"], facts["after_cleanup"]
+        assert before["stderr_bytes"] == len(early)
+        assert before["script_stages"] == [] and before["stderr_eof_observed"] is False
+        assert after["stderr_bytes"] == len(complete)
+        assert after["script_stages"] == list(STAGES[:2])
+        assert after["stage_sequence"] == "valid" and after["stderr_eof_observed"] is True
+        assert after["stderr_observation"] == "attached"
+        assert facts["stages"] == list(STAGES[:2]) and facts["cleanup"] == "confirmed"
+        assert lease.before_cleanup == before and bytes(lease._stderr) == early
+        assert bytes(lease._observed_stderr) == complete
+        assert lease._budget.used == len(early)
+        assert (case.process.stderr is stderr) is True
+        assert (getattr(stderr, "_transport", None) is original_transport) is True
+        assert case.spawns == case.cleanups == 1
+        assert len(case.writer.frames) == case.writer.drains == 1
+        assert case.writer.closes == case.writer.waits == 1
+        assert "private" not in json.dumps(facts)
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["cancel", "error"])
+async def test_probe_stderr_observer_preserves_original_read_failure(
+    owned_probe: _Harness, kind: str
+) -> None:
+    lease = cast(diagnostic.ProbeHelperLease, owned_probe.lease)
+    failure: BaseException = (
+        asyncio.CancelledError("private cancellation")
+        if kind == "cancel"
+        else OSError("private read failure")
+    )
+    calls: list[int] = []
+
+    async def read(n: int = -1) -> bytes:
+        calls.append(n)
+        raise failure
+
+    stream = cast(asyncio.StreamReader, SimpleNamespace(read=read))
+    lease._observe_stderr_reads(stream)
+    with pytest.raises(type(failure)) as caught:
+        await stream.read(n=4096)
+    assert caught.value is failure and calls == [4096]
+    assert lease._observed_stderr_attached and not lease._observed_stderr_failed
+    assert not lease._observed_stderr_eof and not lease._observed_stderr
+
+
+async def test_probe_stderr_observer_keeps_one_bounded_prefix_and_nonzero_read_eof(
+    owned_probe: _Harness,
+) -> None:
+    lease = cast(diagnostic.ProbeHelperLease, owned_probe.lease)
+    chunks = [
+        stage_bytes(STAGES[0]),
+        b"private" * MAX_STDERR_BYTES,
+        stage_bytes(STAGES[1]),
+        b"",
+        b"",
+    ]
+    calls: list[int] = []
+
+    async def read(n: int = -1) -> bytes:
+        chunk = chunks[len(calls)]
+        calls.append(n)
+        return chunk
+
+    stream = cast(asyncio.StreamReader, SimpleNamespace(read=read))
+    lease._observe_stderr_reads(stream)
+    wrapped_read = stream.read
+    lease._observe_stderr_reads(stream)
+    assert (stream.read is wrapped_read) is True
+    for size, chunk in zip((17, 4096, 4096, 0), chunks[:4], strict=True):
+        assert (await stream.read(size) is chunk) is True
+    assert not lease._observed_stderr_eof
+    assert await stream.read(4096) == b"" and lease._observed_stderr_eof
+    assert calls == [17, 4096, 4096, 0, 4096]
+    assert bytes(lease._observed_stderr) == b"".join(chunks[:3])[:MAX_STDERR_BYTES]
+    facts = lease._snapshot()
+    assert facts["stderr_bytes"] == MAX_STDERR_BYTES and facts["stderr_prefix_capped"] is True
+    assert facts["script_stages"] == [STAGES[0]] and facts["stage_sequence"] == "valid"
+    assert facts["stderr_eof_observed"] is True and "private" not in json.dumps(facts)
+    assert not lease._stderr and lease._budget.used == 0
 
 
 async def test_probe_relative_phase_times_are_floored_bounded_and_frozen_after_cleanup(

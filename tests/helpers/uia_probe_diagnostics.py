@@ -61,8 +61,14 @@ def _stage_facts(
     return stages, "invalid" if invalid else "valid" if stages else "unobserved"
 
 
+def _stderr_prefix(lease: AXHelperLease) -> bytes:
+    if isinstance(lease, ProbeHelperLease) and lease._observed_stderr_attached:
+        return bytes(lease._observed_stderr)
+    return bytes(lease._stderr[:MAX_STDERR_BYTES])
+
+
 def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]:
-    data = bytes(lease._stderr[:MAX_STDERR_BYTES])
+    data = _stderr_prefix(lease)
     stages, sequence = _stage_facts(data, STAGES, _STAGE_LINES)
 
     process = lease._process
@@ -197,7 +203,7 @@ class PendingHelperLease(AXHelperLease):
 
 
 def pending_snapshot(lease: PendingHelperLease) -> dict[str, Any]:
-    data = bytes(lease._stderr[:MAX_STDERR_BYTES])
+    data = _stderr_prefix(lease)
     stages, sequence = _stage_facts(data, PENDING_STAGES, _PENDING_LINES)
     starting = lease._starting
     spawn = "not_started"
@@ -254,6 +260,39 @@ class ProbeHelperLease(PendingHelperLease):
         self._observed_phase = "not_started"
         self._observed_phase_started = 0.0
         self._observed_durations = dict.fromkeys(_PROBE_PHASES, 0.0)
+        self._observed_stderr = bytearray()
+        self._observed_stderr_attached = False
+        self._observed_stderr_failed = False
+        self._observed_stderr_eof = False
+
+    def _observe_stderr_reads(self, stream: asyncio.StreamReader) -> None:
+        """Observe existing reads, including cleanup's discard of this same stream."""
+        if self._observed_stderr_attached:
+            return
+        try:
+            original_read = stream.read
+
+            async def observed_read(n: int = -1) -> bytes:
+                chunk = await original_read(n)
+                try:
+                    remaining = max(0, MAX_STDERR_BYTES - len(self._observed_stderr))
+                    self._observed_stderr.extend(chunk[:remaining])
+                    if n != 0 and not chunk:
+                        self._observed_stderr_eof = True
+                except Exception:
+                    self._observed_stderr_failed = True
+                return chunk
+
+            # Keep Process.stderr, its transport and at_eof() unchanged. Both
+            # the lease reader and existing cleanup discard call this method.
+            stream.read = observed_read  # type: ignore[method-assign]
+            self._observed_stderr_attached = True
+        except Exception:
+            self._observed_stderr_failed = True
+
+    async def _read_stderr(self, stream: asyncio.StreamReader) -> None:
+        self._observe_stderr_reads(stream)
+        await super()._read_stderr(stream)
 
     def _observation_time(self) -> float:
         return self._loop.time()
@@ -295,7 +334,7 @@ class ProbeHelperLease(PendingHelperLease):
 
     def _snapshot(self) -> dict[str, Any]:
         facts = pending_snapshot(self)
-        data = bytes(self._stderr[:MAX_STDERR_BYTES])
+        data = _stderr_prefix(self)
         stages, sequence = _stage_facts(data, STAGES, _STAGE_LINES)
         now = self._observation_time() if self._observed_ended is None else self._observed_ended
         durations = self._observed_durations.copy()
@@ -306,6 +345,12 @@ class ProbeHelperLease(PendingHelperLease):
             script_stages=stages,
             stage_sequence=sequence,
             stderr_kind="empty" if not data else "known_stage" if stages else "unrecognized",
+            stderr_observation="attached"
+            if self._observed_stderr_attached and not self._observed_stderr_failed
+            else "unavailable",
+            stderr_eof_observed=self._observed_stderr_eof
+            if self._observed_stderr_attached and not self._observed_stderr_failed
+            else None,
             phase=self._observed_phase,
             elapsed_ms=_milliseconds(elapsed),
             phase_ms={phase: _milliseconds(value) for phase, value in durations.items()},

@@ -86,6 +86,13 @@ lease.closed、process 存在、退出类别 running/zero/nonzero/unavailable、
 write_returned 存在而宿主仍无回执可缩小下一轮传输/解码调查范围，不证明宿主接收。
 这些标记不参与授权、动作 outcome、重试或恢复决策。
 
+当前 probe 已补充[清理阶段的输出观察](superpowers/specs/2026-10-28-windows-probe-evidence.md)：
+在同一 stderr stream 的原有读取上保留独立、有界的观察前缀，使原 reader 取消后
+cleanup discard 读到的阶段也可进入失败投影，并增加 `stderr_observation` 与
+`stderr_eof_observed`。这不增加读取、任务或期限；阶段在清理期被观察到不能倒推
+它的写出时间。未附着、观察失败或截断时仍不能把空前缀解释成无输出。下文保留
+先前候选的验证记录，这项诊断改进不代表原生响应超时的根因已解决。
+
 ## 验收与官方依据
 
 先用纯替身核十一行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
