@@ -20,6 +20,7 @@
 - [队友附件](teammate-attachments.md)：把文件、图片和录音交给队友。
 - [附件检索](attachment-search.md)：查找已保存的附件。
 - [文档阅读](document-reading.md)：按需读取 PDF、DOCX 和长正文。
+- [续读书签](reading-bookmarks.md)：明确保存位置，压缩、重开或换渠道后继续阅读。
 - [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
 - [长资料检索](memory-chunks.md)：后台分块、续接与索引设置。
 - [电脑操作](computer.md)：应用、窗口和无障碍操作。

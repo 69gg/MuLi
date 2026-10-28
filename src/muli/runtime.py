@@ -82,6 +82,7 @@ from muli.tools.web import Web
 
 if TYPE_CHECKING:
     from muli.platforms.linux_bootstrap import BootSession
+    from muli.reading_pages import ReadingPages
 
 ClientFactory = Callable[[ModelConfig], ModelClient]
 ContextHook = Callable[[str, list[Message]], Awaitable[list[Message]]]
@@ -100,6 +101,7 @@ class PreparedRequest:
     channel_ownership: dict[str, Any] | None = None
     consult: ConsultRequest | None = None
     memory_failure: MemorySourceFailure | None = None
+    tool_batch_seq: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +223,7 @@ class Runtime:
             "muli_request", default=None
         )
         self.task_control: TaskControl | None = None
+        self.reading_pages: ReadingPages | None = None
         self._selected_replans: dict[str, str] = {}
         self._flushing_plans = False
         self._plans_dirty = False
@@ -2540,6 +2543,8 @@ class Runtime:
                         else {}
                     ),
                 )
+                if turn.tool_calls:
+                    prepared = replace(prepared, tool_batch_seq=assistant_message["seq"])
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
@@ -2654,6 +2659,18 @@ class Runtime:
                         content_provenance=content_provenance,
                         preserve_content=preserve_content,
                     )
+                    if self.reading_pages is not None:
+                        reading_page = self.reading_pages.completed(
+                            prepared,
+                            session_id,
+                            run_id,
+                            assistant_message,
+                            call,
+                            result,
+                            tool_message,
+                        )
+                        if reading_page is not None:
+                            tool_message["reading_page"] = reading_page
                     publication = completed_publication(
                         self,
                         prepared,

@@ -411,7 +411,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             )
             if self._disk().digests != expected:
                 raise ObservationError("foreign_managed_binding")
-            # Only the synchronous install-files caller may share its batch.
+            # Only the synchronous install-files or start caller may share its batch.
             # Every full guard and exact disk check must succeed before promotion.
             batch.python = self.controller_slot.resolved_python
             batch.packages = observed_packages
@@ -805,8 +805,21 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise ObservationError("transaction_service_not_stopped")
         with self.journal.writer_lease() as lease:
             cgroup = before.service.unit.cgroup
-            self._guard(record, role, lease, cgroup)
-            disk = self._confirm(record, role, lease, cgroup)
+            observed_packages: PackageProofs = {}
+            self._guard(record, role, lease, cgroup, observed_packages=observed_packages)
+            # Only the successful writer-held guard lends bytes to this
+            # synchronous confirmation; discard them before the next await.
+            disk = self._confirm(
+                record,
+                role,
+                lease,
+                cgroup,
+                proofs=_FileProofs(
+                    python=self.controller_slot.resolved_python,
+                    packages=observed_packages,
+                ),
+            )
+            del observed_packages
             fresh = await self._probe(record)
             if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
                 raise ObservationError("transaction_observation_changed")

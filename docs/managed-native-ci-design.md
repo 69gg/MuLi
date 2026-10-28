@@ -1,6 +1,12 @@
 # 真实 systemd 托管切换 CI 设计
 
+Native63 将启动前初始完整 guard 与紧邻的 `_confirm` 合为同一同步内容证明批次：第一个 writer-held guard 成功后才收集并传递 Python/package 字节证明，原 1＋7 道 guard、独立 open/身份/遍历/预算、controller 优先、writer/cgroup、revision、时钟和三文件检查全部保留；下一次 await 前丢弃局部证明。它不减少等待后的读取，不扩展到独立 confirmation。真实旧码为 2 failed / 6 passed（6.75 秒），两红只发生在所有实际启动与认证断言通过之后的重复字节预算；修后八项通过（7.12 秒；守卫 8.374 秒、峰值 68.8 MiB、swap 0），包含内容变化后恢复 mtime、双角色损坏优先级与 await 后重读。十文件 115 项关联整合通过（111.53 秒；守卫 112.814 秒、峰值 95.6 MiB），181 份源码非增量严格类型通过（守卫 27.302 秒、峰值 475.9 MiB），均 swap 0，重叠计数不累计。独立只读后审未发现有据 P1/P2；冻结构件和新 head 原生验收仍待收取，不据此宣称 CI 性能收益。
+
+Native62 精确签名 `9d107bb6` 的原生 job `122577871418` 已失败：adopt 投影为 35060 毫秒，第二代 start_target 为 55021 毫秒，60002 毫秒以 `TimeoutError` 结束，第三代未开始；其它平台作业当时仍在运行，尚不称十二项通用检查已完成。首代 checks 113 次 / 11721 毫秒，其中 controller 113 次 / 11043 毫秒，selected 0；host_record 29 次 / 3612 毫秒、bus 218 次 / 3989 毫秒、HTTP 12 次 / 1442 毫秒。嵌套计时不相加，运行间的整体波动不归因给单一修改。2184 字节 evidence（artifact `12784589288`）SHA256 为 `5c0cf5ef6b6586baddb9a37359e028e714f61a7b7bbab761eb44a956c977284b`；严格读端、cleanup verified、user/group removed 和空 mounts 已核验。Native63 同时整合已通过 PR CI 并签名打标的 v2.99.0 主线；未以合并或局部读取减少替代原生三事务验收。
+
 Native62 整合已发布的 v2.98.0 主线，保留 Native61 的完整认证优化及原生 CI。唯一文本冲突位于 Changelog，未发布原生改动与主线版本记录均保留；自动合并的进程工具同时保留二进制 stdin、严格输出、取消清理及原终止宽限，工作流同时保留 Windows Poppler 与原生资源包络、清理和证据上传。独立只读整合后审未发现有证据的 P1/P2。十二文件 268 项整合通过（105.11 秒；守卫 106.676 秒、峰值 157.6 MiB、swap 0），涵盖原认证链以及进程、真实文档读取；此前不存在的单一测试文件路径被守卫拒绝后，按仓库实际分文件入口重新执行，未绕过守卫。178 份源码以非增量严格类型检查通过（守卫 24.403 秒、峰值 472.1 MiB、swap 0）；冻结构件与新整合提交的真实 CI 仍待收取，不将合并成功当作原生验收成功。
+
+其后已收齐 Native62 十三项 CI 终态：十一项通用作业成功，Windows 3.12 shard2 为 cancelled，原生作业失败。取消不是通过，不使用其它提交的绿灯补齐该分片；Native63 须重新运行完整矩阵。上述“待收取”描述保留当时的验证阶段，最终结果以本段及前面的精确原生 evidence 为准。
 
 Native61 只合并 `_host_command` 在 HTTP 返回、第二次 fresh probe 之后的一处同步重复 controller 认证。原 `_probe` 已在返回前完整认证 controller，外侧紧邻的角色检查又完整认证一次；现在复用既有 `postprocess`，让该 probe 的末尾检查直接认证选中角色，保留 `role=None` 对应 base。controller 仍先于 selected 完整认证，probe 前后分别从实际文件认证；全部包字节、SHA、私有元数据、进程与三文件一致性、proof、真实 writer lease 及原绝对期限保持。没有跨 await 传递或缓存认证证明，没有改遍历或合并其它检查。
 
