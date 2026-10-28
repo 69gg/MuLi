@@ -1,5 +1,10 @@
 # 原生夹具的 start 与失败入口正向边界
 
+当前托管候选为一次去观察扰动的对照，生成 hook 只取消成本观察器的安装调用；
+下述观察器及正向边界实现继续保留，由离线正控显式安装并覆盖真实 `runpy`。
+unit birth、serve 及第三事务故障注入、完整三事务与原期限和验收门均保持；
+尚无观察器扰动的因果结论，也不表示原生验收已通过。
+
 `start_target` / `start_base` journal intent 在调用 backend 前已持久化，不能证明
 服务命令已经分派。仅原生测试 helper 的现有 cost hook 包装实际
 `ManagedLinuxBackend.start` 与 `_command`，发布以下正向事实：

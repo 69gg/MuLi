@@ -2574,11 +2574,6 @@ class NativeCI:
             "        from managed_native_worker import install_unit_birth_hook\n"
             "        install_unit_birth_hook()\n"
             "    except Exception:\n"
-            "        pass\n"
-            "    try:\n"
-            "        from managed_native_worker import install_helper_cost_hook\n"
-            "        install_helper_cost_hook()\n"
-            "    except Exception:\n"
             "        pass\n",
             encoding="utf-8",
         )

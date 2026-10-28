@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from types import CodeType, CoroutineType
+from types import CodeType, CoroutineType, FrameType
 from typing import Any
 
 import pytest
@@ -107,6 +107,83 @@ async def entry_environment(
             managed_helper_arguments(anchor, controller),
             hook,
         )
+
+
+@pytest.mark.parametrize(
+    "entry", ["managed_host", "management_helper", "serve", "other_module", "unisolated_helper"]
+)
+@pytest.mark.parametrize("existing_profile", [False, True])
+async def test_generated_hook_omits_cost_observer_and_preserves_birth_and_serve(
+    entry_environment: EntryEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    existing_profile: bool,
+) -> None:
+    """执行实际生成文本；吞异常不能掩盖成本安装器被调用。"""
+    env = entry_environment
+    argv = list(env.argv)
+    if entry == "management_helper":
+        argv = [argv[0], "-I", "-m", "muli.management_helper", str(env.journal.directory.path)]
+    elif entry == "serve":
+        argv = [argv[0], "-I", "-m", "muli", "serve"]
+    elif entry == "other_module":
+        argv = [argv[0], "-I", "-m", "muli"]
+    elif entry == "unisolated_helper":
+        argv.remove("-I")
+    calls = {"cost": 0, "birth": 0, "serve": 0}
+
+    def install_cost() -> None:
+        calls["cost"] += 1
+        raise RuntimeError("成本观察器不应由生成 hook 安装")
+
+    def install_birth() -> None:
+        calls["birth"] += 1
+
+    def install_service() -> None:
+        calls["serve"] += 1
+
+    def foreign_profile(frame: FrameType, event: str, argument: object) -> None:
+        pass
+
+    bindings = tuple(
+        (owner, name, getattr(owner, name))
+        for owner, name in (
+            (managed_host, "main"),
+            (managed_host, "_entry"),
+            (managed_host, "_record"),
+            (managed_host, "run_managed_helper"),
+            (ManagedLinuxBackend, "_check"),
+            (ManagedLinuxBackend, "_request"),
+            (ManagedLinuxBackend, "install"),
+            (ManagedLinuxBackend, "start"),
+            (ManagedLinuxBackend, "_command"),
+            (SystemdProbe, "_command"),
+            (managed_deployment, "verify_slot_files"),
+            (managed_backend, "verify_slot_files"),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
+    monkeypatch.setattr(worker, "install_helper_cost_hook", install_cost)
+    monkeypatch.setattr(worker, "install_unit_birth_hook", install_birth)
+    monkeypatch.setattr(worker, "install_hook", install_service)
+    monkeypatch.setattr(sys, "prefix", env.controller.prefix)
+    monkeypatch.setattr(sys, "executable", argv[0])
+    monkeypatch.setattr(sys, "orig_argv", argv)
+    monkeypatch.setattr(sys, "argv", argv[3:])
+    original_profile = sys.getprofile()
+    try:
+        profile = foreign_profile if existing_profile else None
+        sys.setprofile(profile)
+        exec(compile(env.hook, "<fixture-helper-hook>", "exec"), {})
+        assert calls == {
+            "cost": 0,
+            "birth": int(entry in {"managed_host", "management_helper"}),
+            "serve": int(entry == "serve"),
+        }
+        assert sys.getprofile() is profile
+        assert all(getattr(owner, name) is original for owner, name, original in bindings)
+    finally:
+        sys.setprofile(original_profile)
 
 
 @pytest.mark.parametrize(
@@ -219,6 +296,8 @@ async def test_real_runpy_entry_preserves_original_calls_failure_and_cancellatio
     profile = sys.getprofile()
     try:
         exec(compile(env.hook, "<fixture-helper-hook>", "exec"), {})
+        # 入口正控继续验证真实 runpy；观察器由夹具显式安装。
+        worker.install_helper_cost_hook()
         with monkeypatch.context() as local:
             local.setattr(asyncio, "run", capture_run)
             with pytest.warns(RuntimeWarning, match="found in sys.modules"):

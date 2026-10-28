@@ -240,6 +240,8 @@ async def _exercise_generated_hook(
 
                     monkeypatch.setattr(worker, "require", fail_binding)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
+                # 成本正控显式安装保留的观察器；托管生成 hook 不再安装它。
+                worker.install_helper_cost_hook()
                 if not through_main or binding_case == "existing":
                     assert sys.getprofile() is (
                         foreign_profile if binding_case == "existing" else original_profile
@@ -530,6 +532,7 @@ async def test_real_install_publishes_second_helper_partial_before_atexit(
                 monkeypatch.setattr(sys, "argv", ["muli.management_helper", str(journal_root)])
                 monkeypatch.setattr(atexit, "register", register)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
+                worker.install_helper_cost_hook()
                 assert len(callbacks) == 1
 
                 case = worker.Case(root)
@@ -1531,6 +1534,7 @@ async def slot_cost_observer(
                     worker, "time", SimpleNamespace(**(vars(worker.time) | {"perf_counter": clock}))
                 )
                 exec(compile(hook, "<fixture-slot-cost-hook>", "exec"), {})
+                worker.install_helper_cost_hook()
                 assert len(callbacks) == 1
                 assert clock.calls == []
 
