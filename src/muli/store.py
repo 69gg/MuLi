@@ -8,6 +8,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Generator
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Literal
 
@@ -455,6 +456,129 @@ class Store:
         except (ValueError, TypeError, RecursionError, UnicodeError) as exc:
             raise EvidenceError("content_unavailable", "持久对象无法完整核查") from exc
         return item
+
+    def ingress_audit_window(
+        self, *, before_seq: int | None, limit: int
+    ) -> Generator[int, None, None]:
+        """Seek a finite ingress key window before inspecting any envelope."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("入站核查窗口超过既有候选上限")
+        if before_seq is not None and (
+            type(before_seq) is not int or not 1 <= before_seq <= SQLITE_MAX_INTEGER
+        ):
+            raise ValueError("入站核查续页位置无效")
+        predicate = " WHERE seq<?" if before_seq is not None else ""
+        bounds = (before_seq, limit) if before_seq is not None else (limit,)
+        with closing(
+            self.db.execute(
+                "SELECT seq FROM ingress" + predicate + " ORDER BY seq DESC LIMIT ?", bounds
+            )
+        ) as rows:
+            for row in rows:
+                yield int(row[0])
+
+    def ingress_audit_probe(
+        self,
+        main_id: str,
+        *,
+        seq: int | None = None,
+        input_id: str | None = None,
+        cached_parents: tuple[str, ...] = (),
+        max_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Size the entire next unit in SQL, returning identities only if it fits.
+
+        The parent lookup is a primary-key point read, with no JSON extraction.
+        Cached parents have already consumed this page's raw budget. Even the
+        relational identity strings stay in SQLite when the remaining budget
+        cannot contain the complete payload, parent and identity working set.
+        """
+        if type(max_bytes) is not int or not 1 <= max_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("入站核查字节预算必须是正整数")
+        if (seq is None) == (input_id is None) or len(cached_parents) >= _SESSION_RECORD_LIMIT:
+            raise ValueError("入站核查定位或父对象缓存无效")
+        if seq is not None and (type(seq) is not int or not 1 <= seq <= SQLITE_MAX_INTEGER):
+            raise ValueError("入站核查序号无效")
+        if input_id is not None and (not isinstance(input_id, str) or not input_id):
+            raise ValueError("入站核查主键无效")
+        predicate, identifier = ("seq=?", seq) if seq is not None else ("id=?", input_id)
+        cached = (
+            " OR session_id IN (" + ",".join("?" for _ in cached_parents) + ")"
+            if cached_parents
+            else ""
+        )
+        parent_needed = "NOT (session_id=?" + cached + ")"
+        query = (
+            "WITH candidate AS (SELECT *,typeof(id) AS id_type,"
+            "typeof(session_id) AS session_id_type,typeof(state) AS state_type,"
+            "length(CAST(id AS BLOB)) AS id_bytes,"
+            "length(CAST(session_id AS BLOB)) AS session_id_bytes,"
+            "length(CAST(state AS BLOB)) AS state_bytes,"
+            "typeof(payload) AS payload_type,length(CAST(payload AS BLOB)) AS payload_bytes,"
+            + parent_needed
+            + " AS parent_needed FROM ingress WHERE "
+            + predicate
+            + "), sized AS (SELECT *,"
+            "CASE WHEN parent_needed THEN (SELECT length(CAST(data AS BLOB)) "
+            "FROM objects WHERE kind='agent' AND objects.id=candidate.session_id) END AS parent_bytes,"
+            "CASE WHEN parent_needed THEN (SELECT typeof(data) FROM objects "
+            "WHERE kind='agent' AND objects.id=candidate.session_id) END AS parent_type "
+            "FROM candidate), unit AS (SELECT *,"
+            "id_bytes+session_id_bytes+state_bytes+payload_bytes+coalesce(parent_bytes,0) "
+            "AS required_bytes FROM sized) SELECT seq,id_type,session_id_type,state_type,"
+            "id_bytes,session_id_bytes,state_bytes,payload_type,payload_bytes,"
+            "parent_needed,parent_bytes,parent_type,required_bytes,"
+            "CASE WHEN required_bytes<=? THEN CAST(id AS BLOB) END AS id,"
+            "CASE WHEN required_bytes<=? THEN CAST(session_id AS BLOB) END AS session_id,"
+            "CASE WHEN required_bytes<=? THEN CAST(state AS BLOB) END AS state,"
+            "CASE WHEN typeof(received) IN ('integer','real') THEN received END AS received,"
+            "typeof(delivered_seq) AS delivered_type,"
+            "CASE WHEN typeof(delivered_seq)='integer' THEN delivered_seq END AS delivered_seq "
+            "FROM unit"
+        )
+        with closing(
+            self.db.execute(
+                query, (main_id, *cached_parents, identifier, max_bytes, max_bytes, max_bytes)
+            )
+        ) as rows:
+            row = rows.fetchone()
+            return dict(row) if row is not None else None
+
+    def ingress_audit_bytes(
+        self, seq: int, *, parent: bool = False, max_bytes: int
+    ) -> bytes | None:
+        """Read complete original bytes after a SQL byte gate; never parse a prefix."""
+        if type(seq) is not int or not 1 <= seq <= SQLITE_MAX_INTEGER:
+            raise ValueError("入站核查序号无效")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("入站核查字节预算必须是正整数")
+        column, source = (
+            (
+                "data",
+                "objects WHERE kind='agent' AND id=(SELECT session_id FROM ingress WHERE seq=?)",
+            )
+            if parent
+            else ("payload", "ingress WHERE seq=?")
+        )
+        with closing(
+            self.db.execute(
+                f"SELECT typeof({column}) AS storage_type,length(CAST({column} AS BLOB)) AS size,"
+                f"CASE WHEN typeof({column})='text' AND length(CAST({column} AS BLOB))<=? "
+                f"THEN CAST({column} AS BLOB) END AS data FROM {source}",
+                (max_bytes, seq),
+            )
+        ) as rows:
+            row = rows.fetchone()
+        if row is None:
+            return None
+        if type(row["size"]) is not int:
+            raise EvidenceError("content_unavailable", "入站核查对象无法完整读取")
+        if row["size"] > max_bytes:
+            raise EvidenceError("output_budget", "完整入站核查对象超过字节预算")
+        raw = row["data"]
+        if row["storage_type"] != "text" or not isinstance(raw, bytes):
+            raise EvidenceError("content_unavailable", "入站核查对象无法完整读取")
+        return raw
 
     def commitment_directory_window(
         self, *, before_id: str | None, limit: int, key_bytes: int
