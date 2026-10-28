@@ -50,6 +50,10 @@ HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
 HELPER_START_BOUNDARIES = ("start_entered", "start_command_entered", "start_command_returned")
+BINDING_COST_ROWS = 64
+BINDING_COST_PREFIXES = 8
+BINDING_COST_SOURCES = 4
+BINDING_COST_SOURCE_FIELDS = ("uid", "pid", "invocation", "boot", "slot")
 HELPER_ENTRY_BOUNDARIES = (
     "main_entered",
     "entry_dispatch",
@@ -3172,6 +3176,7 @@ def describe() -> dict[str, Any]:
         "executable": str(executable),
         "dependencies": str(Path(sysconfig.get_paths()["purelib"]).resolve(strict=True)),
         "package": str(package),
+        "files": observed["files"],
         "size": observed["size"],
         "digest": observed["digest"],
         "limits": limits.model_dump(mode="json"),
@@ -4328,6 +4333,493 @@ def collect_helper_costs(
                 }
 
 
+def binding_unavailable(reason: str = "unavailable") -> dict[str, Any]:
+    return {"code": "not_observed", "reason": reason}
+
+
+def _binding_number(value: object, *, positive: bool = False) -> bool:
+    return type(value) is int and int(positive) <= value <= 2**63 - 1
+
+
+def _binding_digest(value: object, digits: int = 64) -> bool:
+    return (
+        isinstance(value, str) and re.fullmatch(r"[a-f0-9]{" + str(digits) + "}", value) is not None
+    )
+
+
+def _binding_missing(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"code", "reason"}
+        and value["code"] == "not_observed"
+        and isinstance(value["reason"], str)
+        and value["reason"]
+        in {"unavailable", "identity_changed", "clock_invalid", "output_budget", "unbound"}
+    )
+
+
+def _binding_package(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"files", "size", "digest"}
+        and _binding_number(value["files"], positive=True)
+        and _binding_number(value["size"])
+        and _binding_digest(value["digest"])
+    )
+
+
+def binding_inputs_facts(value: object) -> bool:
+    """Validate the projection without importing or walking the installed package."""
+    if _binding_missing(value):
+        return True
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "code", "description", "slots"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["code"] != "observed"
+        or not _binding_package(value["description"])
+        or not isinstance(value["slots"], dict)
+        or set(value["slots"]) != {"a", "b"}
+    ):
+        return False
+    for slot in value["slots"].values():
+        if (
+            not isinstance(slot, dict)
+            or set(slot) != {"digest", "package", "python", "package_limits", "python_bytes"}
+            or not _binding_digest(slot["digest"])
+            or slot["package"] != value["description"]
+            or not isinstance(slot["python"], dict)
+            or set(slot["python"]) != {"size", "digest"}
+            or not _binding_digest(slot["python"]["digest"])
+            or not _binding_number(slot["python"]["size"], positive=True)
+            or not _binding_number(slot["python_bytes"], positive=True)
+            or slot["python"]["size"] > slot["python_bytes"]
+            or not isinstance(slot["package_limits"], dict)
+            or set(slot["package_limits"]) != {"entries", "total_bytes", "file_bytes", "depth"}
+            or not all(
+                _binding_number(item, positive=True) for item in slot["package_limits"].values()
+            )
+            or slot["package"]["files"] > slot["package_limits"]["entries"]
+            or slot["package"]["size"] > slot["package_limits"]["total_bytes"]
+        ):
+            return False
+    return True
+
+
+def binding_inputs(slots: dict[str, SlotIdentity], description: object) -> dict[str, Any]:
+    """Use only fingerprints already returned by describe/register_local_slot."""
+    value: dict[str, Any] = {
+        "version": 1,
+        "code": "observed",
+        "description": description,
+        "slots": {
+            name: {
+                "digest": slot.digest,
+                "package": {key: getattr(slot.package, key) for key in ("files", "size", "digest")},
+                "python": {
+                    "size": slot.resolved_python.identity.size,
+                    "digest": slot.resolved_python.digest,
+                },
+                "package_limits": slot.package_limits.model_dump(mode="json"),
+                "python_bytes": slot.python_bytes,
+            }
+            for name, slot in slots.items()
+        },
+    }
+    return value if binding_inputs_facts(value) else binding_unavailable()
+
+
+def _binding_source_facts(source: object) -> bool:
+    return (
+        isinstance(source, dict)
+        and set(source) == set(BINDING_COST_SOURCE_FIELDS)
+        and _binding_number(source["uid"])
+        and _binding_number(source["pid"], positive=True)
+        and source["pid"] < 2**31
+        and _binding_digest(source["invocation"], 32)
+        and source["invocation"] != "0" * 32
+        and source["boot"] == source["invocation"]
+        and _binding_digest(source["slot"])
+    )
+
+
+def binding_snapshot_facts(value: object, source: object) -> bool:
+    if _binding_missing(value):
+        return True
+    if (
+        not _binding_source_facts(source)
+        or not isinstance(value, dict)
+        or set(value) != {"version", "code", "source", "scope", "rows", "prior_publications"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["code"] != "observed"
+        or value["source"] != source
+        or not _binding_source_facts(value["source"])
+        or value["scope"] not in ("prefix", "final")
+        or not isinstance(value["rows"], list)
+        or not 1 <= len(value["rows"]) <= BINDING_COST_ROWS
+    ):
+        return False
+    publications = value["prior_publications"]
+    if (
+        not isinstance(publications, dict)
+        or set(publications) != {"count", "wall_ns", "cpu_ns"}
+        or not all(_binding_number(item) for item in publications.values())
+        or publications["count"] > BINDING_COST_PREFIXES
+    ):
+        return False
+    seen: set[tuple[str, int, str]] = set()
+    for row in value["rows"]:
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "generation",
+                "revision",
+                "role",
+                "entered",
+                "returned",
+                "raised",
+                "wall_ns",
+                "cpu_ns",
+            }
+            or not _binding_digest(row["generation"], 32)
+            or not _binding_number(row["revision"], positive=True)
+            or row["role"] not in ("origin", "base", "target")
+            or not all(
+                _binding_number(row[key])
+                for key in ("entered", "returned", "raised", "wall_ns", "cpu_ns")
+            )
+            or row["entered"] == 0
+            or row["entered"] != row["returned"] + row["raised"]
+        ):
+            return False
+        key = row["generation"], row["revision"], row["role"]
+        if key in seen:
+            return False
+        seen.add(key)
+    return True
+
+
+def _binding_source_matches(source: object, result: dict[str, Any]) -> bool:
+    inputs = result["resources"].get("binding_inputs")
+    return (
+        _binding_source_facts(source)
+        and isinstance(source, dict)
+        and isinstance(inputs, dict)
+        and inputs.get("code") == "observed"
+        and binding_inputs_facts(inputs)
+        and source["slot"] in {slot["digest"] for slot in inputs["slots"].values()}
+        and any(
+            row.get("stage") in {"origin_ready", "projection"}
+            and row.get("pid") == source["pid"]
+            and row.get("boot") == source["boot"]
+            for row in result["timeline"]
+        )
+    )
+
+
+def binding_costs_facts(value: object, result: dict[str, Any]) -> bool:
+    """Costs can accompany only the app sources independently observed by this case."""
+    if _binding_missing(value):
+        return True
+    inputs = result["resources"].get("binding_inputs")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "code", "reason", "sources"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["code"] != "partial"
+        or value["reason"] != "observed_sources_only"
+        or not isinstance(value["sources"], list)
+        or not 1 <= len(value["sources"]) <= BINDING_COST_SOURCES
+        or not isinstance(inputs, dict)
+        or inputs.get("code") != "observed"
+        or not binding_inputs_facts(inputs)
+    ):
+        return False
+    seen: set[tuple[int, str]] = set()
+    revisions: dict[str, int] = {}
+    generations = {row["generation"] for row in result["generations"]}
+    for row in result["timeline"]:
+        if (
+            row.get("stage") == "transaction"
+            and row.get("generation") in generations
+            and "revision" in row
+        ):
+            generation = row["generation"]
+            revisions[generation] = max(revisions.get(generation, 0), row["revision"])
+    for sample in value["sources"]:
+        if not isinstance(sample, dict) or set(sample) != {"source", "costs"}:
+            return False
+        source, costs = sample["source"], sample["costs"]
+        if (
+            not _binding_source_matches(source, result)
+            or not binding_snapshot_facts(costs, source)
+            or (source["pid"], source["invocation"]) in seen
+        ):
+            return False
+        seen.add((source["pid"], source["invocation"]))
+        if costs.get("code") == "observed" and any(
+            row["revision"] > revisions.get(row["generation"], 0) for row in costs["rows"]
+        ):
+            return False
+    return True
+
+
+def trim_binding_diagnostics(result: dict[str, Any]) -> None:
+    """The original timeline, failure and cleanup always win the original byte budget."""
+    for name in ("binding_costs", "binding_inputs"):
+        if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
+            return
+        if name in result["resources"]:
+            result["resources"][name] = binding_unavailable("output_budget")
+            if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+                result["resources"].pop(name)
+
+
+def collect_binding_costs(
+    root: Path, result: dict[str, Any], sources: list[dict[str, Any]], *, deadline: float | None
+) -> None:
+    samples: list[dict[str, Any]] = []
+    for source in sources[:BINDING_COST_SOURCES]:
+        if not _binding_source_matches(source, result):
+            continue  # An unproved source cannot authorize even a diagnostic read.
+        costs = binding_unavailable()
+        try:
+            path = root / f"binding-costs-{source['pid']}-{source['invocation']}.json"
+            observed = _read_helper_cost_json(path, deadline=deadline)
+            candidate = {
+                "version": 1,
+                "code": "partial",
+                "reason": "observed_sources_only",
+                "sources": [{"source": source, "costs": observed}],
+            }
+            # A source may publish a new revision just before the worker times
+            # out. Reject only its snapshot, preserving authenticated history.
+            costs = (
+                observed
+                if binding_costs_facts(candidate, result)
+                else binding_unavailable("identity_changed")
+            )
+        except Exception:
+            pass  # A missing/late/untrusted observer file never supplies a zero total.
+        samples.append({"source": source, "costs": costs})
+    value = {
+        "version": 1,
+        "code": "partial",
+        "reason": "observed_sources_only",
+        "sources": samples,
+    }
+    result["resources"]["binding_costs"] = (
+        value if samples and binding_costs_facts(value, result) else binding_unavailable()
+    )
+    trim_binding_diagnostics(result)
+
+
+class BindingCosts:
+    """Observe the synchronous canonical binding; never lend a proof to another call."""
+
+    def __init__(self, root: Path, original: Callable[..., Any], invocation: str) -> None:
+        self.root = root
+        self.source: dict[str, Any] = {
+            "uid": os.geteuid(),
+            "pid": os.getpid(),
+            "invocation": invocation,
+            "boot": invocation,
+        }
+        self.rows: dict[tuple[str, int, str], dict[str, Any]] = {}
+        self.reason = ""
+        self.bound = False
+        self.prefixes = 0
+        self.terminal = False
+        self.last_position: tuple[str, int, str] | None = None
+        self.published_position: tuple[str, int, str] | None = None
+        self.publications = {"count": 0, "wall_ns": 0, "cpu_ns": 0}
+        self.last_clock: tuple[int, int] | None = None
+
+        @wraps(original)
+        def verify(*args: Any, **kwargs: Any) -> Any:
+            row = self.enter(args, kwargs)
+            started = self.clock()
+            returned = False
+            try:
+                value = original(*args, **kwargs)
+                returned = True
+                return value
+            finally:
+                ended = self.clock()
+                if row is not None:
+                    row["returned" if returned else "raised"] += 1
+                    if started is not None and ended is not None:
+                        for key, before, after in zip(
+                            ("wall_ns", "cpu_ns"), started, ended, strict=True
+                        ):
+                            if after < before:
+                                self.reason = "clock_invalid"
+                            else:
+                                row[key] += after - before
+
+        self.verify = verify
+
+    def clock(self) -> tuple[int, int] | None:
+        try:
+            values = time.perf_counter_ns(), time.process_time_ns()
+            if not all(_binding_number(value) for value in values):
+                raise ValueError
+            if self.last_clock is not None and any(
+                after < before for before, after in zip(self.last_clock, values, strict=True)
+            ):
+                raise ValueError
+            self.last_clock = values
+            return values
+        except BaseException:
+            self.reason = "clock_invalid"
+            return None
+
+    def enter(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            from muli.managed_transaction import TransactionRecordV2
+
+            permit = args[0] if args else kwargs["permit"]
+            record = args[2] if len(args) > 2 else kwargs["record"]
+            role = args[3] if len(args) > 3 else kwargs["role"]
+            if not isinstance(record, TransactionRecordV2) or role not in (None, "base", "target"):
+                raise ValueError
+            slot = record.binding(role or "base").installation
+            if (os.geteuid(), os.getpid(), os.environ.get("INVOCATION_ID"), permit.boot) != tuple(
+                self.source[key] for key in ("uid", "pid", "invocation", "boot")
+            ) or self.source.get("slot", slot) != slot:
+                raise ValueError
+            self.source["slot"] = slot
+            key = record.generation, record.revision, role or "origin"
+            if key not in self.rows:
+                if len(self.rows) >= BINDING_COST_ROWS:
+                    self.reason = "output_budget"
+                    return None
+                self.rows[key] = {
+                    "generation": key[0],
+                    "revision": key[1],
+                    "role": key[2],
+                    "entered": 0,
+                    "returned": 0,
+                    "raised": 0,
+                    "wall_ns": 0,
+                    "cpu_ns": 0,
+                }
+            self.last_position = key
+            self.rows[key]["entered"] += 1
+            return self.rows[key]
+        except BaseException:
+            self.reason = "identity_changed"
+            return None
+
+    def attach(self, app: Any) -> None:
+        try:
+            verify = app.state.runtime.maintenance._managed_verifier
+            self.bound = isinstance(verify, FunctionType) and any(
+                cell.cell_contents is self.verify for cell in verify.__closure__ or ()
+            )
+            app.add_middleware(BindingCostMiddleware, observer=self)
+        except BaseException:
+            self.reason = "unbound"
+
+    def snapshot(self, *, final: bool) -> dict[str, Any]:
+        if self.reason or not self.bound or not self.rows:
+            return binding_unavailable(
+                self.reason or ("unbound" if not self.bound else "unavailable")
+            )
+        return {
+            "version": 1,
+            "code": "observed",
+            "source": dict(self.source),
+            "scope": "final" if final else "prefix",
+            "rows": [dict(row) for row in self.rows.values()],
+            "prior_publications": dict(self.publications),
+        }
+
+    def publish(self, *, final: bool = False) -> None:
+        if self.terminal or (
+            not final
+            and (
+                self.prefixes >= BINDING_COST_PREFIXES
+                or self.last_position == self.published_position
+            )
+        ):
+            return
+        # Failed writes consume the same finite allowance; no HTTP retry can
+        # turn an unavailable observer into an unbounded write/fsync loop.
+        self.prefixes += int(not final)
+        self.terminal = final
+        self.published_position = self.last_position
+        path = self.root / f"binding-costs-{self.source['pid']}-{self.source['invocation']}.json"
+        try:
+            started = self.clock()
+            write_json(path, self.snapshot(final=final))
+            ended = self.clock()
+            if (
+                started is None
+                or ended is None
+                or any(after < before for before, after in zip(started, ended, strict=True))
+            ):
+                self.reason = "clock_invalid"
+                path.unlink(missing_ok=True)
+                return
+            self.publications["count"] += 1
+            self.publications["wall_ns"] += ended[0] - started[0]
+            self.publications["cpu_ns"] += ended[1] - started[1]
+        except BaseException:
+            self.reason = "unavailable"
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+class BindingCostMiddleware:
+    def __init__(self, app: Callable[..., Awaitable[None]], observer: BindingCosts) -> None:
+        self.app, self.observer = app, observer
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        final = False
+        returned = False
+
+        async def observed_send(message: dict[str, Any]) -> None:
+            nonlocal final
+            await send(message)
+            final = message["type"] == "lifespan.shutdown.complete" or final
+
+        try:
+            await self.app(scope, receive, observed_send)
+            returned = True
+        finally:
+            if scope["type"] in {"http", "lifespan"}:
+                self.observer.publish(final=final and returned)
+
+
+def install_binding_cost_hook() -> BindingCosts | None:
+    try:
+        from muli import managed_runtime_binding
+
+        prefix = Path(sys.prefix)
+        root = prefix.parent
+        require(
+            prefix.name in {"a", "b"} and sys.executable == str(prefix / "bin/python"),
+            "native_profile_role",
+        )
+        fixture(root)
+        invocation = os.environ.get("INVOCATION_ID", "")
+        require(
+            _binding_digest(invocation, 32) and invocation != "0" * 32, "native_profile_invocation"
+        )
+        observer = BindingCosts(root, managed_runtime_binding.verify_running_binding, invocation)
+        managed_runtime_binding.verify_running_binding = observer.verify
+        return observer
+    except Exception:
+        return None
+
+
 def install_hook() -> None:
     """Wrap only the app factory; the real bootstrap and health path stay intact."""
     from fastapi import FastAPI
@@ -4337,12 +4829,15 @@ def install_hook() -> None:
     from muli.managed_transaction import TransactionRecordV2
 
     original = server.create_app
+    observer = install_binding_cost_hook()
 
     def application(*args: Any, **kwargs: Any) -> FastAPI:
         app: FastAPI = original(*args, **kwargs)
         runtime = app.state.runtime
         require_environment(runtime.config.path.parent, os.geteuid())
         runtime.client_factory = forbidden_model
+        if observer is not None:
+            observer.attach(app)
         permit = runtime.maintenance.permit
         if (
             not isinstance(permit, ManagedBootPermit)
@@ -4401,6 +4896,8 @@ class Case:
         self._helper_cost_history: list[dict[str, Any]] = []
         self._helper_cost_samples: list[dict[str, Any]] = []
         self._helper_start_samples: list[dict[str, Any]] = []
+        self._binding_inputs: dict[str, Any] = binding_unavailable()
+        self._binding_sources: list[dict[str, Any]] = []
         self._failure_helper_attempted = False
         self.result: dict[str, Any] = {
             "completed": False,
@@ -4463,7 +4960,24 @@ class Case:
             require(len(timeline) < 64, "native_timeline_budget")
             timeline.append(row)
             self._notes[stage] = facts
+            trim_binding_diagnostics(self.result)
             write_json(self.root / "result.json", self.result)
+
+    def binding_source(self, pid: int, invocation: str, slot: SlotIdentity) -> None:
+        """Remember only a process already accepted at origin/projection boundaries."""
+        source = {
+            "uid": os.geteuid(),
+            "pid": pid,
+            "invocation": invocation,
+            "boot": invocation,
+            "slot": slot.digest,
+        }
+        if (
+            _binding_source_facts(source)
+            and source not in self._binding_sources
+            and len(self._binding_sources) < BINDING_COST_SOURCES
+        ):
+            self._binding_sources.append(source)
 
     def require_start_time(self) -> None:
         """Imports or queueing cannot turn a late worker into a fresh 60s case."""
@@ -5180,6 +5694,7 @@ class Case:
                                 boot=unit.invocation,
                                 pid=unit.pid,
                             )
+                            self.binding_source(unit.pid, unit.invocation, slots[expected_role])
                             return unit.invocation
                 await self.pause()
         finally:
@@ -5239,6 +5754,7 @@ class Case:
             slot = register_local_slot(prefix, prefix / "bin/python", package)
             require(slot.package.digest == settings["package_digest"], "native_package_changed")
             slots[name] = slot
+        self._binding_inputs = binding_inputs(slots, settings.get("binding_package"))
         self.note("slots_verified")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -5303,6 +5819,7 @@ class Case:
                 "native_origin_membership",
             )
             self.note("origin_ready", boot=initial.unit.invocation, pid=initial.unit.pid)
+            self.binding_source(initial.unit.pid, initial.unit.invocation, slots["a"])
             self.freeze_initial()
             boot = await self.transaction(
                 client, password, "adopt", slots["a"], initial.unit.invocation
@@ -5492,6 +6009,10 @@ async def run(mode: str, root: Path) -> int:
                     retained=case._helper_cost_history,
                     samples=case._helper_cost_samples,
                     start_samples=case._helper_start_samples,
+                )
+                case.result["resources"]["binding_inputs"] = case._binding_inputs
+                collect_binding_costs(
+                    root, case.result, case._binding_sources, deadline=case.drive_deadline
                 )
                 write_json(root / "result.json", case.result)
             except Exception:

@@ -1444,6 +1444,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "helper_start_samples",
             "helper_source_observation",
             "helper_entry_checkpoint",
+            "binding_inputs",
+            "binding_costs",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1596,6 +1598,10 @@ def fixture_result(data: bytes) -> dict[str, Any]:
                         for row in history
                     )
                 )
+        elif name == "binding_inputs":
+            valid = resource_worker().binding_inputs_facts(facts) is True
+        elif name == "binding_costs":
+            valid = resource_worker().binding_costs_facts(facts, value) is True
         elif name == "manager_failure":
             valid = manager_failure_facts(facts)
         elif name == "manager_readiness":
@@ -2612,6 +2618,9 @@ class NativeCI:
                 "harness_seconds": HARNESS_SECONDS,
                 "http_bytes": description["http_bytes"],
                 "package_digest": description["digest"],
+                "binding_package": {
+                    key: description.get(key) for key in ("files", "size", "digest")
+                },
                 "harness_unit": "muli-native-" + uuid.uuid4().hex + ".service",
             },
         )
@@ -2772,6 +2781,7 @@ class NativeCI:
             and controller_failure_facts(controller_failure, result)
         ):
             result["resources"]["controller_failure"] = controller_failure
+        resource_worker().trim_binding_diagnostics(result)
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > OUTPUT_BYTES:
             result["resources"].pop("helper_entry_checkpoint", None)
         starts = result["resources"].get("helper_start_samples", [])
@@ -3423,6 +3433,7 @@ class NativeCI:
             raise FixtureError("native_cleanup_deadline")
         if result is not None:
             result["resources"]["cleanup"] = "failed" if failure else "verified"
+            resource_worker().trim_binding_diagnostics(result)
             write_json(self.root / "result.json", result)
         if failure:
             raise FixtureError("native_service_cleanup_failed")
