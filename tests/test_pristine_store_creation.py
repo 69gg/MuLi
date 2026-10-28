@@ -103,10 +103,12 @@ def test_dangling_sidecar_symlinks_are_not_absence(tmp_path: Path, suffix: str) 
             pytest.skip("Creating a real symlink requires Windows symlink permission")
         raise
     assert not sidecar.exists() and sidecar.is_symlink()
+    retained_target = sidecar.readlink()
     with pytest.raises(StoreInitializationError) as caught:
         Store.open_runtime(path, default_mode="auto").close()
     assert caught.value.code == "store_creation_not_pristine"
-    assert sidecar.is_symlink() and sidecar.readlink() == target
+    assert not sidecar.exists()
+    assert sidecar.is_symlink() and sidecar.readlink() == retained_target
     assert path.read_bytes() == b""
 
 
