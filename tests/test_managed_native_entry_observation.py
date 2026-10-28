@@ -113,7 +113,7 @@ async def entry_environment(
     "entry", ["managed_host", "management_helper", "serve", "other_module", "unisolated_helper"]
 )
 @pytest.mark.parametrize("existing_profile", [False, True])
-async def test_generated_hook_omits_cost_observer_and_preserves_birth_and_serve(
+async def test_generated_hook_omits_broad_cost_observer_and_preserves_birth_and_serve(
     entry_environment: EntryEnvironment,
     monkeypatch: pytest.MonkeyPatch,
     entry: str,
@@ -130,7 +130,7 @@ async def test_generated_hook_omits_cost_observer_and_preserves_birth_and_serve(
         argv = [argv[0], "-I", "-m", "muli"]
     elif entry == "unisolated_helper":
         argv.remove("-I")
-    calls = {"cost": 0, "birth": 0, "serve": 0}
+    calls = {"cost": 0, "guard": 0, "birth": 0, "serve": 0}
 
     def install_cost() -> None:
         calls["cost"] += 1
@@ -138,6 +138,9 @@ async def test_generated_hook_omits_cost_observer_and_preserves_birth_and_serve(
 
     def install_birth() -> None:
         calls["birth"] += 1
+
+    def install_guard() -> None:
+        calls["guard"] += 1
 
     def install_service() -> None:
         calls["serve"] += 1
@@ -164,6 +167,7 @@ async def test_generated_hook_omits_cost_observer_and_preserves_birth_and_serve(
     )
     monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
     monkeypatch.setattr(worker, "install_helper_cost_hook", install_cost)
+    monkeypatch.setattr(worker, "install_helper_guard_cost_hook", install_guard)
     monkeypatch.setattr(worker, "install_unit_birth_hook", install_birth)
     monkeypatch.setattr(worker, "install_hook", install_service)
     monkeypatch.setattr(sys, "prefix", env.controller.prefix)
@@ -177,6 +181,7 @@ async def test_generated_hook_omits_cost_observer_and_preserves_birth_and_serve(
         exec(compile(env.hook, "<fixture-helper-hook>", "exec"), {})
         assert calls == {
             "cost": 0,
+            "guard": int(entry == "managed_host"),
             "birth": int(entry in {"managed_host", "management_helper"}),
             "serve": int(entry == "serve"),
         }
@@ -295,6 +300,9 @@ async def test_real_runpy_entry_preserves_original_calls_failure_and_cancellatio
     monkeypatch.setattr(os, "fsync", fsync)
     profile = sys.getprofile()
     try:
+        # Keep this explicit broad-entry positive control independent of the
+        # new generated narrow observer's one-shot profiler.
+        monkeypatch.setattr(worker, "install_helper_guard_cost_hook", lambda: None)
         exec(compile(env.hook, "<fixture-helper-hook>", "exec"), {})
         # 入口正控继续验证真实 runpy；观察器由夹具显式安装。
         worker.install_helper_cost_hook()

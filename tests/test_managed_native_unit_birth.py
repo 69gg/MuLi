@@ -86,6 +86,7 @@ async def observed_root(
     # this test exercises the generated birth observer rather than that observer.
     monkeypatch.setattr(ConfigurationFile, "replace", ConfigurationFile.replace)
     monkeypatch.setattr(worker, "install_helper_cost_hook", lambda: None)
+    monkeypatch.setattr(worker, "install_helper_guard_cost_hook", lambda: None)
     with TransactionJournal(
         root / "data/management/transaction-v1", root / "data/muli.sqlite3"
     ) as journal:

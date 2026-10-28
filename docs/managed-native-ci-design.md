@@ -1,15 +1,55 @@
 # 真实 systemd 托管切换 CI 设计
 
-当前仍未通过原生三事务验收。最近一次原生验收候选 `6b6fc56a` 的
-[CI](https://github.com/69gg/MuLi/actions/runs/40682871409) 十一项成功、四项失败。
-首代 adopt 在 36625 毫秒完成完整投影；第二代在 57480 毫秒进入 start_target，
-整轮在原 60 秒期限超时，第三代未开始。临时账户、用户组和挂载清理已核验。
+当前仍未通过原生三事务验收。最近一次候选 `b9cbf779` 的
+[原生作业](https://github.com/69gg/MuLi/actions/runs/40779572918/job/123137511753)
+首代 adopt 在 35352 毫秒完成完整投影；第二代在 55244 毫秒进入 start_target，
+60002 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。cleanup 已核验。
+应用 canonical 绑定只观察到两个已独立认证的 source，不能覆盖 helper 成本或补为零。
 
-当前候选只实施一次去观察扰动的托管对照：prepare 生成 hook 不再导入或调用
+此前去观察扰动的托管对照使 prepare 生成 hook 不再导入或调用
 `install_helper_cost_hook()`，worker 中观察器实现保留，离线正控显式安装并继续覆盖
 真实 `runpy` 入口。unit birth 与 serve hook 保留，第三笔 target A / base B 故障注入、
 完整三事务、Case60 / harness90 / cleanup5、资源、认证、终态投影及 parser 成功条件保持。
-已有约 9 秒计量是原产品扫描成本，不能当作观察器自身开销；本对照尚无因果或原生通过结论。
+已有约 9 秒计量是原产品扫描成本，不能当作观察器自身开销；移除完整 installer
+仍未使原生门禁通过，不能据此认定观察器无成本或成为瓶颈。
+
+本片新增独立 `helper_guard_costs` version1 部分诊断，只由精确
+`-I -m muli.managed_host --root <固定journal> run` 的生成 hook 安装。
+它以 canonical spec、origin、main 与 `_record` code 身份一次绑定真实 `__main__`，
+随后撤下自身 profiler；已有或后来安装的 profiler 不覆盖。只包装真实 `_record`
+和 backend `_check`，不恢复旧 installer 的 bus、HTTP、start、install 或入口多层包装。
+来源 generation/helper 从原 `_record` 成功返回的真实 record 取得，不新增 journal 读取。
+
+每次原函数恰执行一次，原返回对象、异常及取消对象继续传播。内存累计
+entered/returned/raised、`perf_counter_ns` 墙钟和 `process_time_ns` CPU，最多64个位置。
+`_check` 按实际 record 参数的 generation/revision/phase/intent 分桶；成功 `_record`
+只按真实返回 record 分桶，失败时没有已返回位置，放入固定 `unpositioned_raised` 桶，
+不读取第二份 state 或借用上次 revision。首个 `_record` 独立列出；未绑定来源不导出零成本。
+这些同步函数中的完整认证不减少、不跨调用或 await 复用任何授权结果。
+
+每 helper 最多尝试两个 prefix（首个成功 `_check`、首个 install_target `_check`）
+和一次正常 atexit 尾部；失败同样消耗额度，不重试、不轮询、不 fsync。
+按 PID/invocation 分开的私有有界 JSON 以原子替换发布；发布计时在 guard 计时之外，
+`prior_publications` 只含此前已经完成的发布，最后一次写入自身的完整开销没有后续快照补报。
+prefix 仅是已返回调用的下界，final 只表示该 helper 经过正常退出回调。
+强杀不运行尾部，未达首边界、来源未绑定或写入失败都允许 `not_observed`。
+
+收取只复用原 helper 观察、正常退出和原 failure collection 机会，不增加 probe 或等待。
+每代来源及已接受历史最多保留三份，复用原 no-follow、owner/mode、普通单链接文件、
+前后身份和32KiB读取上限；无独立来源证明不读成本文件。严格拒绝未来 revision、
+错误来源和异常时钟；下一代缺失或坏快照不能抹去已接受历史，重复读到同一快照
+保留首次已接受的收取事实，新的有效快照仍可更新。快照 `monotonic_ns`
+与 `collected_ns` 分开，晚于 Case 截止的来源继续携带原 `failure_collection` 时间证明，
+不能把收取时刻倒填成期限内进度。结果固定为 `partial/observed_helper_sources_only`，
+不将未测 bus/HTTP 补零塞入旧完整 schema；原 timeline、失败、来源与 cleanup 优先于新字段，
+所有诊断仍共用原32KiB总输出门。
+
+离线回归从实际生成 hook 和真实 `runpy __main__` 进入，覆盖原认证、同步边界、
+await 两侧独立调用、返回/异常 identity、确定性双时钟、有限发布与无 fsync；
+另从新 Python 解释器在独占临时目录启动自有子进程，不继承 pytest 观察器；
+以 pipe 握手后仅强杀并有限等待该 child，核对真实 PID 来源和已落地 prefix。
+开发检查由 `scripts/check_local.py` 串行执行；本片尚未取得新的 hosted Native 实测，
+不承诺原60秒门禁已修复，也不把未知的 launcher/import/entry 时间归因于这两个 guard。
 
 原生完成屏障在非终态保留完整 helper 观察；resolved 后只以原精确
 listing 证明 unit 已消失，再继续原最终投影。该路径已完成首代投影，但仍未取得真实三事务验收，

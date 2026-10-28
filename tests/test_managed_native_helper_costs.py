@@ -1,4 +1,4 @@
-"""Offline startup-hook observation; no interpreter or manager is launched."""
+"""Offline hooks; only a fresh private Python child exercises kill, never a manager."""
 
 from __future__ import annotations
 
@@ -9,12 +9,15 @@ import copy
 import json
 import os
 import runpy
+import select
+import signal
 import sys
-from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import replace
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
 from functools import partial
 from importlib.machinery import ModuleSpec
 from pathlib import Path
+from subprocess import PIPE, Popen
 from types import CoroutineType, FrameType, FunctionType, SimpleNamespace
 from typing import Any, Literal, cast
 
@@ -24,17 +27,21 @@ from helpers import managed_native_worker as worker
 from test_managed_native_ci import ci
 from test_managed_native_ci import fixture as fixture
 from test_managed_native_ci import forbid_real_effects as forbid_real_effects
+from test_management_helper import Probe as HelperProbe
 
+import muli
 import muli.managed_host as managed_host
 import muli.platforms.filesystem_identity as filesystem_identity
 import muli.platforms.managed_backend as managed_backend
 import muli.platforms.managed_deployment as managed_deployment
+from muli.managed_controller import ManagedTransactionController
 from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import JournalControl, Role, TransactionError, TransactionJournal
-from muli.platforms.linux_transaction import SystemdProbe, UnitSnapshot
+from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe, UnitSnapshot
 from muli.platforms.managed_backend import ManagedLinuxBackend
 from muli.platforms.managed_deployment import DeploymentAnchor, DeploymentStore, SlotIdentity
+from muli.platforms.managed_probe import ManagedSystemdProbe
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux isolated helper fixture")
 
@@ -239,6 +246,8 @@ async def _exercise_generated_hook(
                         original_require(condition, code)
 
                     monkeypatch.setattr(worker, "require", fail_binding)
+                # This archived broad-observer positive control owns its profiler.
+                monkeypatch.setattr(worker, "install_helper_guard_cost_hook", lambda: None)
                 exec(compile(hook, "<fixture-helper-hook>", "exec"), {})
                 # 成本正控显式安装保留的观察器；托管生成 hook 不再安装它。
                 worker.install_helper_cost_hook()
@@ -1666,3 +1675,818 @@ async def test_native_slot_costs_timer_failure_never_changes_authentication_or_e
         assert clock.errors == []
     assert [name for name, _, _ in clock.calls] == ["controller", "selected"]
     assert save() is None, "lost slot costs must never be exported as observed zero cost"
+
+
+@dataclass
+class _GuardFixture:
+    root: Path
+    host: backend_fixture.Host
+    read_record: Callable[..., tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]]
+    observer: worker.HelperGuardCosts
+    run_helper: Callable[..., Awaitable[TransactionRecordV2]]
+    interpreter: str
+
+    @property
+    def path(self) -> Path:
+        source = self.observer.source
+        return self.root / f"helper-guard-costs-{source['pid']}-{source['invocation']}.json"
+
+
+@pytest.fixture
+async def helper_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[_GuardFixture]:
+    """Enter the real prepare-generated hook and real runpy main, without a manager."""
+    native, _ = fixture
+    native.prepare()
+    root = tmp_path / "guard-helper"
+    root.mkdir(mode=0o700)
+    original_slot = backend_fixture._slot
+    monkeypatch.setattr(
+        backend_fixture,
+        "_slot",
+        lambda directory, name: original_slot(directory, {"base": "a", "target": "b"}[name]),
+    )
+    worker.write_json(
+        root / "fixture.json",
+        {
+            "uid": os.geteuid(),
+            "memory": worker.MEMORY,
+            "tasks": worker.TASKS,
+            "harness_memory": worker.HARNESS_MEMORY,
+            "harness_tasks": worker.HARNESS_TASKS,
+            "seconds": worker.CASE_SECONDS,
+            "cleanup_seconds": worker.CLEANUP_SECONDS,
+            "harness_seconds": worker.HARNESS_SECONDS,
+            "http_bytes": worker.MAX_BYTES,
+            "harness_unit": "muli-native-" + "a" * 32 + ".service",
+        },
+    )
+    monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
+    monkeypatch.setenv("INVOCATION_ID", "b" * 32)
+    monkeypatch.setattr(ManagedLinuxBackend, "_check", ManagedLinuxBackend._check)
+    monkeypatch.setattr(filesystem_identity, "verify_local_filesystems", lambda paths: None)
+    callbacks: list[Callable[..., Any]] = []
+    namespaces: list[dict[str, Any]] = []
+
+    def register(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Callable[..., Any]:
+        assert not args and not kwargs
+        callbacks.append(function)
+        return function
+
+    profile, interpreter = sys.getprofile(), sys.executable
+    mode = getattr(request, "param", None)
+
+    def foreign(frame: FrameType, event: str, argument: object) -> None:
+        pass
+
+    journal_root = root / "data/management/transaction-v1"
+    with TransactionJournal(journal_root, root / "data/muli.sqlite3") as journal:
+        with journal.locked() as control:
+            host = backend_fixture.Host(root, journal, control, "switch", change_config=False)
+            try:
+                journal.database.write_bytes(b"")
+                journal.database.chmod(0o600)
+                argv = managed_helper_arguments(host.anchor, host.slots["base"])
+                monkeypatch.setattr(sys, "prefix", str(root / "a"))
+                monkeypatch.setattr(sys, "executable", argv[0])
+                monkeypatch.setattr(sys, "orig_argv", list(argv))
+                monkeypatch.setattr(sys, "argv", list(argv[3:]))
+                monkeypatch.setattr(atexit, "register", register)
+                if mode == "wrong_origin":
+                    spec = managed_host.__spec__
+                    assert spec is not None
+                    monkeypatch.setattr(
+                        managed_host,
+                        "__spec__",
+                        ModuleSpec(spec.name, spec.loader, origin="<foreign>"),
+                    )
+                elif mode in {"replaced_main", "replaced_record"}:
+
+                    def replaced(*args: Any, **kwargs: Any) -> None:
+                        raise AssertionError("a canonical replacement must not run")
+
+                    monkeypatch.setattr(
+                        managed_host, "main" if mode == "replaced_main" else "_record", replaced
+                    )
+                sys.setprofile(None)
+                hook = (native.volume / "_muli_native_ci_hook.py").read_text(encoding="utf-8")
+                exec(compile(hook, "<actual-generated-guard-hook>", "exec"), {})
+                assert len(callbacks) == 1 and sys.getprofile() is not None
+                if mode == "superseded":
+                    sys.setprofile(foreign)
+
+                def capture(coroutine: object) -> TransactionRecordV2:
+                    assert isinstance(coroutine, CoroutineType)
+                    try:
+                        assert coroutine.cr_frame is not None
+                        namespace = coroutine.cr_frame.f_globals
+                        assert namespace is sys.modules["__main__"].__dict__
+                        assert namespace is not managed_host.__dict__
+                        namespaces.append(namespace)
+                        return host.record()
+                    finally:
+                        coroutine.close()
+
+                with monkeypatch.context() as local:
+                    local.setattr(asyncio, "run", capture)
+                    with pytest.warns(RuntimeWarning, match="found in sys.modules"):
+                        with pytest.raises(SystemExit) as exited:
+                            runpy.run_module(
+                                "muli.managed_host", run_name="__main__", alter_sys=True
+                            )
+                    assert exited.value.code == 0
+                assert sys.getprofile() is (foreign if mode == "superseded" else None)
+                observer = cast(worker.HelperGuardCosts, callbacks[0].__self__)
+                assert observer.bound is (mode is None) and len(namespaces) == 1
+                yield _GuardFixture(
+                    root,
+                    host,
+                    namespaces[0]["_record"],
+                    observer,
+                    namespaces[0]["run_managed_helper"],
+                    interpreter,
+                )
+            finally:
+                sys.setprofile(profile)
+                host.release_writer()
+                await host.backend.__aexit__()
+
+
+def _guard_result(guard: _GuardFixture) -> dict[str, Any]:
+    record, source = guard.host.record(), dict(guard.observer.source)
+    return {
+        "completed": False,
+        "stage": "transaction",
+        "code": "TimeoutError",
+        "timeline": [
+            {
+                "stage": "transaction",
+                "elapsed_ms": 1,
+                "generation": record.generation,
+                "revision": record.revision,
+                "phase": record.phase,
+                "intent": record.intent,
+                "code": record.code,
+                "failure_code": record.failure_code,
+                "rollback_attempted": record.rollback_attempted,
+            },
+            {
+                "stage": "helper_exit",
+                "elapsed_ms": 2,
+                "helper": source["helper"],
+                "state": "active",
+                "pid": source["pid"],
+                "result": "success",
+                "exit_status": 0,
+                "observation": "present",
+            },
+        ],
+        "generations": [
+            {
+                "deployment": record.identity.deployment,
+                "generation": record.generation,
+                "helper": source["helper"],
+            }
+        ],
+        "resources": {"helper_source": source},
+    }
+
+
+async def test_narrow_generated_hook_measures_real_guards_and_preserves_each_await_side(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, ticks = helper_guard, {"wall": 0, "cpu": 0}
+
+    def tick(name: str, amount: int) -> int:
+        ticks[name] += amount
+        return ticks[name]
+
+    monkeypatch.setattr(
+        worker,
+        "time",
+        SimpleNamespace(
+            **(
+                vars(worker.time)
+                | {
+                    "perf_counter_ns": partial(tick, "wall", 100),
+                    "process_time_ns": partial(tick, "cpu", 10),
+                }
+            )
+        ),
+    )
+    host, observer = guard.host, guard.observer
+    record, controller, slots = guard.read_record(host.control, host.anchor)
+    assert record == host.record() and controller == host.slots["base"] and slots == host.slots
+    sentinel = object()
+    observed: list[int] = []
+
+    async def read(*args: Any, **kwargs: Any) -> Any:
+        observed.append(observer.totals["checks"]["entered"])
+        await asyncio.sleep(0)
+        observed.append(observer.totals["checks"]["entered"])
+        return sentinel
+
+    monkeypatch.setattr(host.backend.probe, "read_managed", read)
+    assert await host.backend._probe(record) is sentinel
+    assert observed == [1, 1] and observer.totals["checks"]["entered"] == 2
+    await asyncio.sleep(0)
+    assert guard.read_record(host.control, host.anchor)[0] == record
+    observer.save()
+    facts = worker.read_json(guard.path)
+    assert facts["host_record"] == {
+        "entered": 2,
+        "returned": 2,
+        "raised": 0,
+        "wall_ns": 200,
+        "cpu_ns": 20,
+    }
+    assert facts["checks"] == facts["host_record"]
+    assert facts["first_record"] == {
+        "outcome": "returned",
+        "position": {
+            key: getattr(record, key) for key in ("generation", "revision", "phase", "intent")
+        },
+        "wall_ns": 100,
+        "cpu_ns": 10,
+    }
+    assert facts["unpositioned_raised"] == observer.metric()
+    assert {row["metric"] for row in facts["rows"]} == {"host_record", "checks"}
+    assert worker.helper_guard_snapshot_facts(facts, observer.source)
+    assert not (guard.root / "helper-costs.json").exists()
+    assert not (guard.root / "helper-entry-checkpoint.json").exists()
+    result, retained = _guard_result(guard), []
+    worker.collect_helper_guard_costs(
+        guard.root,
+        result,
+        [{"source": dict(observer.source), "observation": None}],
+        retained,
+        deadline=None,
+    )
+    assert result["resources"]["helper_guard_costs"]["sources"][0]["costs"] == facts
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+@pytest.mark.parametrize(
+    "helper_guard",
+    ["wrong_origin", "replaced_main", "replaced_record", "superseded"],
+    indirect=True,
+)
+async def test_narrow_unbound_actual_main_does_not_publish_or_replace_foreign_profile(
+    helper_guard: _GuardFixture,
+) -> None:
+    guard = helper_guard
+    assert guard.read_record(guard.host.control, guard.host.anchor)[0] == guard.host.record()
+    assert guard.host.backend._check(guard.host.record()) is None
+    guard.observer.save()
+    assert not guard.observer.bound and not guard.path.exists()
+    assert guard.observer.rows == {}
+
+
+async def test_narrow_actual_helper_read_await_keeps_both_real_host_authentications(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, counts, helper = helper_guard, [], HelperProbe()
+    failure = RuntimeError("stop before effects")
+
+    class Probe(ManagedSystemdProbe):
+        async def read_helper(self, name: str, argv: tuple[str, ...], limits: Any) -> Any:
+            counts.append(guard.observer.totals["host_record"]["entered"])
+            await asyncio.sleep(0)
+            counts.append(guard.observer.totals["host_record"]["entered"])
+            return await helper.read_helper(name, argv, limits)
+
+    async def step(controller: ManagedTransactionController) -> TransactionRecordV2:
+        raise failure
+
+    guard.host.release_writer()
+    guard.host.control.__exit__()
+    monkeypatch.setattr(
+        muli, "__file__", str(Path(guard.host.slots["base"].package.root) / "__init__.py")
+    )
+    monkeypatch.setattr(ManagedTransactionController, "step", step)
+    with pytest.raises(RuntimeError) as caught:
+        await guard.run_helper(
+            guard.root / "data/management/transaction-v1",
+            probe=Probe(limits=ProbeLimits(seconds=guard.host.anchor.helper.operation_timeout / 4)),
+            clock=guard.host.clock,
+        )
+    assert caught.value is failure
+    assert counts == [2, 2, 4, 4]
+    assert guard.observer.totals["host_record"]["returned"] == 5
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_narrow_real_guard_failures_keep_identity_and_host_failure_has_no_fabricated_position(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    guard, failure = (
+        helper_guard,
+        asyncio.CancelledError("PRIVATE") if cancelled else RuntimeError("PRIVATE"),
+    )
+    host, observer = guard.host, guard.observer
+    record = guard.read_record(host.control, host.anchor)[0]
+    original_anchor = DeploymentStore.verify_anchor
+
+    def anchor(store: DeploymentStore, selected: DeploymentAnchor) -> None:
+        original_anchor(store, selected)
+        raise failure
+
+    with monkeypatch.context() as local:
+        local.setattr(DeploymentStore, "verify_anchor", anchor)
+        with pytest.raises(type(failure)) as caught:
+            guard.read_record(host.control, host.anchor)
+        assert caught.value is failure
+    original_authenticate = DeploymentStore._authenticate
+
+    def authenticate(*args: Any, **kwargs: Any) -> None:
+        original_authenticate(*args, **kwargs)
+        raise failure
+
+    with monkeypatch.context() as local:
+        local.setattr(DeploymentStore, "_authenticate", authenticate)
+        with pytest.raises(type(failure)) as caught:
+            host.backend._check(record)
+        assert caught.value is failure
+    observer.save()
+    facts = worker.read_json(guard.path)
+    assert facts["host_record"]["entered"] == 2 and facts["host_record"]["raised"] == 1
+    assert facts["unpositioned_raised"]["entered"] == facts["unpositioned_raised"]["raised"] == 1
+    assert facts["checks"]["entered"] == facts["checks"]["raised"] == 1
+    assert "PRIVATE" not in json.dumps(facts)
+    assert all(
+        row["costs"]["raised"] == 0 for row in facts["rows"] if row["metric"] == "host_record"
+    )
+    assert worker.helper_guard_snapshot_facts(facts, observer.source)
+
+
+async def test_narrow_observer_preserves_original_return_object_and_first_failed_record(
+    helper_guard: _GuardFixture,
+) -> None:
+    guard, failure = helper_guard, asyncio.CancelledError("PRIVATE")
+    host, observer = guard.host, guard.observer
+    value = (host.record(), host.slots["base"], host.slots)
+
+    def original(
+        control: JournalControl, anchor: DeploymentAnchor
+    ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+        return value
+
+    def failed(control: JournalControl, anchor: DeploymentAnchor) -> Any:
+        raise failure
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        observer.record(failed)(host.control, host.anchor)
+    assert caught.value is failure
+    assert observer.record(original)(host.control, host.anchor) is value
+    observer.save()
+    facts = worker.read_json(guard.path)
+    assert (
+        facts["first_record"]["outcome"] == "raised" and facts["first_record"]["position"] is None
+    )
+    assert facts["unpositioned_raised"]["raised"] == 1
+    assert worker.helper_guard_snapshot_facts(facts, observer.source)
+
+
+async def test_narrow_publication_has_two_finite_prefixes_one_tail_and_no_fsync(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, snapshots, syncs = helper_guard, [], []
+    original_replace, original_fsync = Path.replace, os.fsync
+
+    def replace_file(path: Path, target: Path) -> Path:
+        result = original_replace(path, target)
+        if target.name.startswith("helper-guard-costs-"):
+            snapshots.append(worker.read_json(target))
+        return result
+
+    def fsync(descriptor: int) -> None:
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code is worker.HelperGuardCosts.publish.__code__:
+                syncs.append(descriptor)
+                break
+            frame = frame.f_back
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(Path, "replace", replace_file)
+    monkeypatch.setattr(os, "fsync", fsync)
+    host, observer = guard.host, guard.observer
+    record = guard.read_record(host.control, host.anchor)[0]
+    for _ in range(4):
+        host.backend._check(record)
+    assert len(snapshots) == 1 and snapshots[0]["checks"]["entered"] == 1
+    installing = host.install_intent()
+    for _ in range(4):
+        host.backend._check(installing)
+    observer.save()
+    observer.save()
+    assert [row["boundary"] for row in snapshots] == [*worker.HELPER_GUARD_PREFIXES, "normal_exit"]
+    assert snapshots[-1]["checks"]["entered"] == 8
+    assert snapshots[-1]["attempts"] == {"prefix": 2, "final": 1}
+    assert snapshots[-1]["prior_publications"]["count"] == 2 and syncs == []
+
+
+async def test_narrow_failed_publications_consume_allowance_and_preserve_old_prefix(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, attempts = helper_guard, []
+    host, observer = guard.host, guard.observer
+    record = guard.read_record(host.control, host.anchor)[0]
+    host.backend._check(record)
+    original = guard.path.read_bytes()
+    replace_file = Path.replace
+
+    def failed(path: Path, target: Path) -> Path:
+        if target == guard.path:
+            attempts.append(target)
+            raise OSError("PRIVATE")
+        return replace_file(path, target)
+
+    monkeypatch.setattr(Path, "replace", failed)
+    installing = host.install_intent()
+    for _ in range(3):
+        host.backend._check(installing)
+    observer.save()
+    observer.save()
+    assert len(attempts) == 2 and observer.attempts == {"prefix": 2, "final": 1}
+    assert guard.path.read_bytes() == original
+
+
+async def test_narrow_clock_failure_keeps_actual_authentication_without_zero_receipt(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard = helper_guard
+
+    def failed() -> int:
+        raise asyncio.CancelledError("PRIVATE")
+
+    monkeypatch.setattr(
+        worker, "time", SimpleNamespace(**(vars(worker.time) | {"perf_counter_ns": failed}))
+    )
+    assert guard.read_record(guard.host.control, guard.host.anchor)[0] == guard.host.record()
+    assert guard.host.backend._check(guard.host.record()) is None
+    guard.observer.save()
+    assert not guard.path.exists() and guard.observer.reason == "clock_invalid"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "wrong_source",
+        "future_revision",
+        "future_clock",
+        "bad_count",
+        "public",
+        "oversized",
+        "symlink",
+    ],
+)
+async def test_narrow_collection_rejects_bad_snapshot_without_erasing_accepted_history(
+    helper_guard: _GuardFixture, damage: str
+) -> None:
+    guard = helper_guard
+    record = guard.read_record(guard.host.control, guard.host.anchor)[0]
+    guard.host.backend._check(record)
+    result, retained = _guard_result(guard), []
+    sources = [{"source": dict(guard.observer.source), "observation": None}]
+    worker.collect_helper_guard_costs(guard.root, result, sources, retained, deadline=None)
+    accepted = copy.deepcopy(retained)
+    facts = worker.read_json(guard.path)
+    if damage == "wrong_source":
+        facts["source"]["pid"] += 1
+    elif damage == "future_revision":
+        facts["rows"][0]["position"]["revision"] += 1
+    elif damage == "future_clock":
+        facts["monotonic_ns"] = 2**63 - 1
+    elif damage == "bad_count":
+        facts["checks"]["entered"] = True
+    guard.path.write_text(json.dumps(facts), encoding="utf-8")
+    if damage == "public":
+        guard.path.chmod(0o644)
+    elif damage == "oversized":
+        guard.path.write_bytes(b" " * (worker.MAX_BYTES + 1))
+    elif damage == "symlink":
+        other = guard.path.with_name("other.json")
+        guard.path.rename(other)
+        guard.path.symlink_to(other)
+    worker.collect_helper_guard_costs(guard.root, result, sources, retained, deadline=None)
+    assert retained == accepted
+    assert result["resources"]["helper_guard_costs"]["sources"] == accepted
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+@pytest.mark.parametrize(
+    "damage", ["wrong_root", "recover", "missing_run", "extra_argument", "foreign_profile"]
+)
+def test_narrow_rejects_inexact_entry_or_foreign_profile_before_fixture_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    prefix = tmp_path / "a"
+    executable = str(prefix / "bin/python")
+    argv = [
+        executable,
+        "-I",
+        "-m",
+        "muli.managed_host",
+        "--root",
+        str(tmp_path / "data/management/transaction-v1"),
+        "run",
+    ]
+    if damage == "wrong_root":
+        argv[-2] = str(tmp_path / "foreign")
+    elif damage == "recover":
+        argv[-1] = "recover"
+    elif damage == "missing_run":
+        argv.pop()
+    elif damage == "extra_argument":
+        argv.append("unexpected")
+    accesses: list[Path] = []
+    callbacks: list[object] = []
+    original = ManagedLinuxBackend._check
+
+    def foreign(frame: FrameType, event: str, argument: object) -> None:
+        pass
+
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setattr(sys, "executable", executable)
+    monkeypatch.setattr(sys, "orig_argv", argv)
+    monkeypatch.setattr(worker, "fixture", lambda root: accesses.append(root))
+    monkeypatch.setattr(atexit, "register", lambda callback: callbacks.append(callback))
+    previous = sys.getprofile()
+    try:
+        owner = foreign if damage == "foreign_profile" else None
+        sys.setprofile(owner)
+        worker.install_helper_guard_cost_hook()
+        assert accesses == callbacks == [] and ManagedLinuxBackend._check is original
+        assert sys.getprofile() is owner
+    finally:
+        sys.setprofile(previous)
+
+
+async def test_narrow_missing_next_generation_keeps_authenticated_history(
+    helper_guard: _GuardFixture,
+) -> None:
+    guard = helper_guard
+    record = guard.read_record(guard.host.control, guard.host.anchor)[0]
+    guard.host.backend._check(record)
+    result, retained = _guard_result(guard), []
+    old_source = {"source": dict(guard.observer.source), "observation": None}
+    worker.collect_helper_guard_costs(guard.root, result, [old_source], retained, deadline=None)
+    accepted = copy.deepcopy(retained[0])
+    # Reader-only next-source fixture: it does not claim to launch a second helper.
+    next_record = record.model_copy(update={"generation": "c" * 32})
+    source = {
+        **guard.observer.source,
+        "generation": next_record.generation,
+        "helper": managed_helper_unit_name(next_record),
+        "pid": os.getpid() + 1,
+    }
+    result["generations"].append(
+        {
+            "deployment": record.identity.deployment,
+            "generation": source["generation"],
+            "helper": source["helper"],
+        }
+    )
+    result["timeline"].extend(
+        [
+            {**result["timeline"][0], "generation": source["generation"]},
+            {**result["timeline"][1], "helper": source["helper"], "pid": source["pid"]},
+        ]
+    )
+    result["resources"]["helper_source"] = source
+    worker.collect_helper_guard_costs(
+        guard.root,
+        result,
+        [old_source, {"source": source, "observation": None}],
+        retained,
+        deadline=None,
+    )
+    assert retained[0] == accepted and retained[1]["costs"] == worker.binding_unavailable()
+    assert result["resources"]["helper_guard_costs"]["sources"] == retained
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+    guard.observer.save()
+    worker.collect_helper_guard_costs(guard.root, result, [old_source], retained, deadline=None)
+    assert retained[0]["costs"]["scope"] == "final"
+    assert retained[0]["collected_ns"] >= accepted["collected_ns"]
+    assert retained[1]["costs"] == worker.binding_unavailable()
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+async def test_narrow_late_source_and_snapshot_keep_separate_original_deadline_facts(
+    helper_guard: _GuardFixture,
+) -> None:
+    guard = helper_guard
+    record = guard.read_record(guard.host.control, guard.host.anchor)[0]
+    guard.host.backend._check(record)
+    result = _guard_result(guard)
+    result["timeline"] = result["timeline"][:1]
+    started = worker.time.monotonic_ns() - 61 * 10**9
+    observation = {
+        "source": dict(guard.observer.source),
+        "kind": "failure_collection",
+        "started_ns": started,
+        "case_deadline_ns": started + 60 * 10**9,
+        "observed_ns": started + 60 * 10**9 + 10**7,
+        "elapsed_ms": 60010,
+    }
+    result["resources"]["helper_source_observation"] = observation
+    costs = worker.read_json(guard.path)
+    costs["monotonic_ns"] = observation["case_deadline_ns"] + 5 * 10**6
+    guard.path.write_text(json.dumps(costs), encoding="utf-8")
+    worker.collect_helper_guard_costs(
+        guard.root,
+        result,
+        [{"source": dict(guard.observer.source), "observation": observation}],
+        [],
+        deadline=None,
+    )
+    sample = result["resources"]["helper_guard_costs"]["sources"][0]
+    assert sample["observation"] == observation
+    assert (
+        observation["case_deadline_ns"]
+        < sample["costs"]["monotonic_ns"]
+        < observation["observed_ns"]
+        < sample["collected_ns"]
+    )
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+    del result["resources"]["helper_source_observation"]
+    assert not worker.helper_guard_costs_facts(result["resources"]["helper_guard_costs"], result)
+
+
+async def test_narrow_costs_yield_the_original_total_result_budget(
+    helper_guard: _GuardFixture,
+) -> None:
+    guard = helper_guard
+    record = guard.read_record(guard.host.control, guard.host.anchor)[0]
+    guard.host.backend._check(record)
+    result = _guard_result(guard)
+    worker.collect_helper_guard_costs(
+        guard.root,
+        result,
+        [{"source": dict(guard.observer.source), "observation": None}],
+        [],
+        deadline=None,
+    )
+    costs = result["resources"].pop("helper_guard_costs")
+    row = {
+        "stage": "transaction",
+        "elapsed_ms": 1,
+        **{name: "x" * 100 for name in ("request_id", "boot", "result")},
+    }
+    result["timeline"].extend(dict(row) for _ in range(62))
+    for name in ("helper", "state"):
+        for item in result["timeline"]:
+            if name in item:
+                continue
+            used = len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+            capacity = worker.MAX_BYTES - 1 - used - len(f',"{name}":""')
+            if capacity >= 0:
+                item[name] = "x" * min(100, capacity)
+    before = copy.deepcopy(result)
+    original_data = json.dumps(before, sort_keys=True, separators=(",", ":")).encode()
+    assert len(original_data) < worker.MAX_BYTES
+    assert ci.fixture_result(original_data) == before
+    result["resources"]["helper_guard_costs"] = costs
+    worker.trim_binding_diagnostics(result)
+    final_data = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    assert len(final_data) <= worker.MAX_BYTES
+    assert ci.fixture_result(final_data) == result
+    observed = result["resources"].pop("helper_guard_costs", None)
+    assert observed is None or observed == worker.binding_unavailable("output_budget")
+    assert result == before
+
+
+async def test_narrow_unproved_source_cannot_authorize_a_read(
+    helper_guard: _GuardFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, reads = helper_guard, []
+    record = guard.read_record(guard.host.control, guard.host.anchor)[0]
+    guard.host.backend._check(record)
+    result = _guard_result(guard)
+    result["timeline"] = result["timeline"][:1]
+    monkeypatch.setattr(
+        worker, "_read_helper_cost_json", lambda *args, **kwargs: reads.append(args)
+    )
+    worker.collect_helper_guard_costs(
+        guard.root,
+        result,
+        [{"source": dict(guard.observer.source), "observation": None}],
+        [],
+        deadline=None,
+    )
+    assert reads == [] and result["resources"]["helper_guard_costs"] == worker.binding_unavailable()
+
+
+@pytest.mark.parametrize("with_prefix", [False, True])
+async def test_narrow_owned_child_kill_retains_only_a_handshaken_prefix(
+    helper_guard: _GuardFixture, with_prefix: bool
+) -> None:
+    """Kill only our fresh Python child; no systemd, desktop or user process is used."""
+    guard = helper_guard
+    record = guard.read_record(guard.host.control, guard.host.anchor)[0]
+    child_root = guard.root / "owned-child"
+    child_root.mkdir(mode=0o700)
+    record_path = child_root / "record.json"
+    record_path.write_text(record.model_dump_json(), encoding="utf-8")
+    record_path.chmod(0o600)
+    # Publication/kill coverage only; the real generated hook and authorizations
+    # have their separate cases above. No pytest state or observer is inherited.
+    code = """
+from __future__ import annotations
+
+import atexit
+import os
+import sys
+from pathlib import Path
+
+sys.path[:0] = sys.argv[1:3]
+from helpers import managed_native_worker as worker
+from muli.managed_transaction import TransactionRecordV2
+
+root = Path(sys.argv[3])
+record = TransactionRecordV2.model_validate_json((root / "record.json").read_bytes())
+invocation = "b" * 32
+os.environ["INVOCATION_ID"] = invocation
+observer = worker.HelperGuardCosts(root, invocation)
+observer.bound = True
+atexit.register(observer.save)
+
+def read_record(control: object, anchor: object) -> tuple[TransactionRecordV2, None, dict[str, object]]:
+    return record, None, {}
+
+def check_record(backend: object, current: TransactionRecordV2) -> None:
+    pass
+
+if sys.argv[4] == "1":
+    observer.record(read_record)(None, None)
+    observer.check(check_record)(None, record)
+os.write(1, b"ready")
+os.read(0, 1)
+"""
+    # This saved constructor permits this one owned child while the ordinary
+    # native command entry points remain forbidden by forbid_real_effects.
+    child = Popen(
+        [
+            guard.interpreter,
+            "-I",
+            "-B",
+            "-c",
+            code,
+            str(Path(muli.__file__).resolve().parent.parent),
+            str(Path(worker.__file__).resolve().parent.parent),
+            str(child_root),
+            "1" if with_prefix else "0",
+        ],
+        cwd=child_root,
+        stdin=PIPE,
+        stdout=PIPE,
+        stderr=PIPE,
+    )
+    ready = b""
+    try:
+        assert child.stdout is not None
+        readable, _, _ = select.select([child.stdout], [], [], 5)
+        if readable:
+            ready = os.read(child.stdout.fileno(), 5)
+    finally:
+        try:
+            child.kill()
+            _, errors = child.communicate(timeout=5)
+        finally:
+            for stream in (child.stdin, child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+    assert ready == b"ready", errors.decode(errors="replace")
+    assert child.returncode == -signal.SIGKILL
+    source = {
+        "generation": record.generation,
+        "helper": managed_helper_unit_name(record),
+        "uid": os.geteuid(),
+        "pid": child.pid,
+        "invocation": "b" * 32,
+    }
+    path = child_root / f"helper-guard-costs-{child.pid}-{'b' * 32}.json"
+    if with_prefix:
+        costs = worker._read_helper_cost_json(path, deadline=None)
+        assert costs["scope"] == "prefix" and costs["attempts"] == {"prefix": 1, "final": 0}
+        assert worker.helper_guard_snapshot_facts(costs, source)
+    else:
+        assert not path.exists()
+    result = _guard_result(guard)
+    result["resources"]["helper_source"] = source
+    result["timeline"][-1]["pid"] = child.pid
+    retained: list[dict[str, Any]] = []
+    worker.collect_helper_guard_costs(
+        child_root, result, [{"source": source, "observation": None}], retained, deadline=None
+    )
+    saved = result["resources"]["helper_guard_costs"]["sources"][0]["costs"]
+    if with_prefix:
+        assert saved.get("scope") == "prefix"
+    else:
+        assert saved == worker.binding_unavailable()
+    assert ci.fixture_result(json.dumps(result).encode()) == result

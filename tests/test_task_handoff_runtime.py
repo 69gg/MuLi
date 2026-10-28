@@ -20,6 +20,7 @@ from test_runtime import FakeClient, make_runtime
 from test_task_control_runtime import wait_agent
 from test_teammate_attachment_runtime import completed, eventually, tool_result
 
+from muli.attention import AttentionInbox
 from muli.channels.manager import encoded
 from muli.compaction import closed_groups
 from muli.config import ConfigFile
@@ -148,11 +149,6 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
     phone_receipts: dict[str, str] = {}
     unexpected_requests: list[tuple[str, str]] = []
     worker_requests: list[list[Message]] = []
-    failure_log_ids: set[str] = set()
-    failure_notices: list[tuple[str, str]] = []
-    failure_notice_ready = asyncio.Event()
-    failure_notice_release = asyncio.Event()
-    failure_notice_text = "原执行者故障已知悉；旧投递结果未知，不得重试"
     replacement_started = asyncio.Event()
     draft_release = asyncio.Event()
 
@@ -164,24 +160,6 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             if phase == "reopened-idle":
                 unexpected_requests.append((phase, "main"))
                 raise AssertionError("正常重开与手机重投不能自行唤醒主模型")
-            latest_user = next(message for message in reversed(messages) if message.role == "user")
-            assert latest_user.source_message_id is not None
-            source = runtime.store.get("message", latest_user.source_message_id)
-            if source is not None and source.get("source") == "system:attention":
-                # A delayed failure notice is an independent, legitimate input;
-                # recognize its host provenance, never a quoted marker in history.
-                failure_notices.append((phase, source["id"]))
-                assert len(failure_notices) == 1
-                assert source["principal"] == "system:attention"
-                notices = json.loads(source["content"].splitlines()[-1])
-                assert len(notices) == 1 and notices[0]["kind"] == "system_log"
-                assert notices[0]["record_id"] in failure_log_ids
-                record = runtime.store.get("system_log", notices[0]["record_id"])
-                assert record is not None and record["code"] == "runtime_failed"
-                assert record["session_id"] == old_id
-                assert record["run_id"] == runtime.team.get(old_id)["run_id"]
-                yield StreamEvent("done", turn=ModelTurn(content=failure_notice_text))
-                return
             main_round += 1
             if phase == "initial":
                 if main_round == 1:
@@ -523,27 +501,21 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
 
     runtime.client_factory = factory  # type: ignore[assignment]
     scenario_factory = runtime.client_factory
-    submit_attention = runtime.submit_attention
-
-    async def hold_failure_notice(
-        content: str, event_id: str, **kwargs: Any
-    ) -> dict[str, Any] | None:
-        for kind, value in kwargs["objects"]:
-            if kind != "attention_receipt" or value.get("kind") != "system_log":
-                continue
-            record = runtime.store.get("system_log", value["record_id"])
-            if record is not None and record.get("session_id") == old_id:
-                assert record["code"] == "runtime_failed"
-                failure_log_ids.add(record["id"])
-                failure_notice_ready.set()
-                await failure_notice_release.wait()
-        return await submit_attention(content, event_id, **kwargs)
-
-    monkeypatch.setattr(runtime, "submit_attention", hold_failure_notice)
     # PluginManager captures its base factory while create_app composes the application.
     app = create_app(runtime.config, runtime=runtime)
     original_manager = app.state.channel_application.manager
     manager = original_manager
+    inbox: AttentionInbox = app.state.attention
+    attention_changed = asyncio.Condition()
+    original_consume = inbox._consume
+
+    async def observe_consume() -> bool:
+        progressed = await original_consume()
+        async with attention_changed:
+            attention_changed.notify_all()
+        return progressed
+
+    monkeypatch.setattr(inbox, "_consume", observe_consume)
     try:
         async with AsyncExitStack() as stage:
             web = await enter_application(stage)
@@ -575,9 +547,81 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 runtime,
                 lambda: bool(completed(runtime, "旧执行者失败；已有外发结果未知，暂不重试")),
             )
-            # Attention admission follows active runs and team report delivery.
-            # Hold that real notification across the phase change deterministically.
-            await asyncio.wait_for(failure_notice_ready.wait(), 4)
+            failed_run_id = old["run_id"]
+
+            def failure_log_persisted() -> bool:
+                return runtime.system_events.status()["queued"] == 0 and any(
+                    record.get("session_id") == old_id and record.get("run_id") == failed_run_id
+                    for record in runtime.store.list("system_log")
+                )
+
+            await eventually(runtime, failure_log_persisted)
+            failure_logs = [
+                record
+                for record in runtime.store.list("system_log")
+                if record.get("session_id") == old_id and record.get("run_id") == failed_run_id
+            ]
+            assert len(failure_logs) == 1
+            failure_log = failure_logs[0]
+            assert failure_log["component"] == "runtime" and failure_log["code"] == "runtime_failed"
+            assert failure_log["notify"] is False and failure_log["producer"] == "legacy_local"
+            assert failure_log["routing"]["classification"] == "legacy_local"
+            failure_event = runtime.store.events(failure_log["event_id"] - 1, limit=1)[0]
+            assert failure_event["id"] == failure_log["event_id"]
+            assert failure_event["type"] == "system.log"
+            for field in ("id", "session_id", "run_id", "notify", "producer", "routing"):
+                assert failure_event["data"][field] == failure_log[field]
+            failure_report = runtime.store.get("team_report", failed_run_id)
+            assert failure_report is not None
+            assert failure_report["agent_id"] == old_id and failure_report["parent_id"] == main_id
+            assert failure_report["execution_status"] == "failed"
+            assert failure_report["status"] == "delivered"
+            assert failure_report["reply_origin"] == old["reply_origin"]
+            failed_run = runtime.store.get("run", failed_run_id)
+            assert failed_run is not None and failed_run["session_id"] == old_id
+            assert failed_run["status"] == "failed"
+
+            # A retained log is evidence, not a second input after its parent report.
+            # Observe a real, completed consumer pass before asserting its absence.
+            async with asyncio.timeout(4), attention_changed:
+                await attention_changed.wait_for(
+                    lambda: (
+                        inbox.cursor >= failure_log["event_id"]
+                        and inbox.cursor == runtime.store.event_position()
+                        and not runtime.tasks
+                        and runtime.system_events.status()["queued"] == 0
+                    )
+                )
+
+            def assert_failure_reported_once() -> None:
+                reports = [
+                    report
+                    for report in runtime.store.list("team_report")
+                    if report.get("agent_id") == old_id
+                ]
+                assert reports == [failure_report]
+                assert runtime.store.get("system_log", failure_log["id"]) == failure_log
+                report_inputs = runtime.store.db.execute(
+                    "SELECT id,state FROM ingress WHERE session_id=? "
+                    "AND json_extract(payload,'$.source')=? "
+                    "AND json_extract(payload,'$.principal')=?",
+                    (main_id, "team:" + old_id, "agent:" + old_id),
+                ).fetchall()
+                assert len(report_inputs) == 1 and report_inputs[0]["state"] == "delivered"
+                assert not [
+                    receipt
+                    for receipt in runtime.store.list("attention_receipt")
+                    if receipt["kind"] == "system_log" and receipt["record_id"] == failure_log["id"]
+                ]
+                attention_inputs = runtime.store.db.execute(
+                    "SELECT id FROM ingress WHERE session_id=? "
+                    "AND json_extract(payload,'$.source')='system:attention' "
+                    "AND json_extract(payload,'$.principal')='system:attention'",
+                    (main_id,),
+                ).fetchall()
+                assert attention_inputs == []
+
+            assert_failure_reported_once()
             assert old["reply_origin"]["kind"] == "web"
             assert old["reply_origin"]["input_id"] == assigned.json()["message"]["id"]
             assert manager.delivery(delivery_id)["state"] == "unknown"
@@ -646,13 +690,6 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 lambda: bool(completed(runtime, replan_text)),
             )
             assert main_round == 4
-            failure_notice_release.set()
-            await eventually(runtime, lambda: bool(completed(runtime, failure_notice_text)))
-            pending = runtime.tasks.get(main_id)
-            if pending is not None:
-                await asyncio.wait_for(asyncio.shield(pending), 4)
-            assert main_round == 4
-            assert len(failure_notices) == 1 and failure_notices[0][0] == "replan"
             assert not unexpected_requests
             replan_messages = completed(runtime, replan_text)
             assert len(replan_messages) == 1
@@ -1057,7 +1094,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             assert manager.delivery(delivery_id)["attempts"] == 1
             assert manager.delivery(delivery_id)["next_part"] == 0
             assert manager.delivery(delivery_id)["receipts"] == []
-            assert len(failure_notices) == 1
+            assert_failure_reported_once()
             assert len(worker_requests) == 3 and not unexpected_requests
             if control_channel == "onebot":
                 confirmations = 4 if compact_and_reopen else 3
@@ -1087,6 +1124,5 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 item["name"] not in {"channel_send", "audio_transcribe"} for item in new_calls
             )
     finally:
-        failure_notice_release.set()
         draft_release.set()
         await runtime.close()

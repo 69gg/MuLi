@@ -1439,6 +1439,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "helper_source",
             "controller_failure",
             "helper_costs",
+            "helper_guard_costs",
             "helper_cost_history",
             "helper_cost_samples",
             "helper_start_samples",
@@ -1600,6 +1601,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
                 )
         elif name == "binding_inputs":
             valid = resource_worker().binding_inputs_facts(facts) is True
+        elif name == "helper_guard_costs":
+            valid = resource_worker().helper_guard_costs_facts(facts, value) is True
         elif name == "binding_costs":
             valid = resource_worker().binding_costs_facts(facts, value) is True
         elif name == "manager_failure":
@@ -2580,7 +2583,13 @@ class NativeCI:
             "        from managed_native_worker import install_unit_birth_hook\n"
             "        install_unit_birth_hook()\n"
             "    except Exception:\n"
-            "        pass\n",
+            "        pass\n"
+            "    if sys.orig_argv[1:4] == ['-I', '-m', 'muli.managed_host']:\n"
+            "        try:\n"
+            "            from managed_native_worker import install_helper_guard_cost_hook\n"
+            "            install_helper_guard_cost_hook()\n"
+            "        except Exception:\n"
+            "            pass\n",
             encoding="utf-8",
         )
         self.sudo(

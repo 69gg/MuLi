@@ -49,6 +49,8 @@ HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
+HELPER_GUARD_ROWS = 64
+HELPER_GUARD_PREFIXES = ("first_check_returned", "first_install_target_check_returned")
 HELPER_START_BOUNDARIES = ("start_entered", "start_command_entered", "start_command_returned")
 BINDING_COST_ROWS = 64
 BINDING_COST_PREFIXES = 8
@@ -4570,7 +4572,7 @@ def binding_costs_facts(value: object, result: dict[str, Any]) -> bool:
 
 def trim_binding_diagnostics(result: dict[str, Any]) -> None:
     """The original timeline, failure and cleanup always win the original byte budget."""
-    for name in ("binding_costs", "binding_inputs"):
+    for name in ("helper_guard_costs", "binding_costs", "binding_inputs"):
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
             return
         if name in result["resources"]:
@@ -4616,6 +4618,608 @@ def collect_binding_costs(
         value if samples and binding_costs_facts(value, result) else binding_unavailable()
     )
     trim_binding_diagnostics(result)
+
+
+def _helper_guard_source_facts(source: object) -> bool:
+    return (
+        isinstance(source, dict)
+        and set(source) == {"generation", "helper", "uid", "pid", "invocation"}
+        and _binding_digest(source["generation"], 32)
+        and isinstance(source["helper"], str)
+        and re.fullmatch(r"muli-transaction-[a-f0-9]{64}\.service", source["helper"]) is not None
+        and _binding_number(source["uid"])
+        and _binding_number(source["pid"], positive=True)
+        and source["pid"] < 2**31
+        and _binding_digest(source["invocation"], 32)
+        and source["invocation"] != "0" * 32
+    )
+
+
+def _helper_guard_position(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"generation", "revision", "phase", "intent"}
+        and _binding_digest(value["generation"], 32)
+        and _binding_number(value["revision"], positive=True)
+        and value["phase"] in HELPER_COST_PHASES
+        and value["intent"] in HELPER_COST_INTENTS
+    )
+
+
+def _helper_guard_metric(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"entered", "returned", "raised", "wall_ns", "cpu_ns"}
+        and all(_binding_number(number) for number in value.values())
+        and value["entered"] == value["returned"] + value["raised"]
+    )
+
+
+def helper_guard_snapshot_facts(value: object, source: object) -> bool:
+    """Only the two synchronous guards are covered, including their real failures."""
+    if _binding_missing(value):
+        return True
+    if (
+        not _helper_guard_source_facts(source)
+        or not isinstance(value, dict)
+        or set(value)
+        != {
+            "version",
+            "code",
+            "source",
+            "scope",
+            "boundary",
+            "monotonic_ns",
+            "rows",
+            "host_record",
+            "checks",
+            "unpositioned_raised",
+            "first_record",
+            "attempts",
+            "prior_publications",
+        }
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["code"] != "observed"
+        or value["source"] != source
+        or not _helper_guard_source_facts(value["source"])
+        or value["scope"] not in ("prefix", "final")
+        or value["boundary"] not in (*HELPER_GUARD_PREFIXES, "normal_exit")
+        or (value["scope"] == "final") != (value["boundary"] == "normal_exit")
+        or not _binding_number(value["monotonic_ns"], positive=True)
+        or not isinstance(value["rows"], list)
+        or not 1 <= len(value["rows"]) <= HELPER_GUARD_ROWS
+        or not all(
+            _helper_guard_metric(value[name])
+            for name in ("host_record", "checks", "unpositioned_raised")
+        )
+    ):
+        return False
+    assert isinstance(source, dict)
+    first, attempts, publications = (
+        value[name] for name in ("first_record", "attempts", "prior_publications")
+    )
+    if (
+        not isinstance(first, dict)
+        or set(first) != {"outcome", "position", "wall_ns", "cpu_ns"}
+        or first["outcome"] not in ("returned", "raised")
+        or not all(_binding_number(first[name]) for name in ("wall_ns", "cpu_ns"))
+        or (first["outcome"] == "returned" and not _helper_guard_position(first["position"]))
+        or (first["outcome"] == "raised" and first["position"] is not None)
+        or not isinstance(attempts, dict)
+        or set(attempts) != {"prefix", "final"}
+        or type(attempts["prefix"]) is not int
+        or not 0 <= attempts["prefix"] <= len(HELPER_GUARD_PREFIXES)
+        or type(attempts["final"]) is not int
+        or attempts["final"] != int(value["scope"] == "final")
+        or (value["scope"] == "prefix" and attempts["prefix"] == 0)
+        or not isinstance(publications, dict)
+        or set(publications) != {"count", "wall_ns", "cpu_ns"}
+        or not all(_binding_number(number) for number in publications.values())
+        or publications["count"] >= attempts["prefix"] + attempts["final"]
+    ):
+        return False
+    unpositioned = value["unpositioned_raised"]
+    if unpositioned["returned"] != 0 or value["host_record"]["entered"] == 0:
+        return False
+    seen: set[tuple[str, str, int, str, str]] = set()
+    totals = {name: {key: 0 for key in value[name]} for name in ("host_record", "checks")}
+    for row in value["rows"]:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"metric", "position", "costs"}
+            or not isinstance(row["metric"], str)
+            or row["metric"] not in totals
+            or not _helper_guard_position(row["position"])
+            or row["position"]["generation"] != source["generation"]
+            or not _helper_guard_metric(row["costs"])
+            or row["costs"]["entered"] == 0
+            or (row["metric"] == "host_record" and row["costs"]["raised"] != 0)
+        ):
+            return False
+        position = row["position"]
+        key = (
+            row["metric"],
+            position["generation"],
+            position["revision"],
+            position["phase"],
+            position["intent"],
+        )
+        if key in seen:
+            return False
+        seen.add(key)
+        for name, number in row["costs"].items():
+            totals[row["metric"]][name] += number
+    for key, number in unpositioned.items():
+        totals["host_record"][key] += number
+    return (
+        all(totals[name] == value[name] for name in totals)
+        and value["host_record"][first["outcome"]] > 0
+        and all(first[key] <= value["host_record"][key] for key in ("wall_ns", "cpu_ns"))
+        and (first["position"] is None or first["position"]["generation"] == source["generation"])
+    )
+
+
+def _helper_guard_source_matches(item: object, result: dict[str, Any]) -> bool:
+    if not isinstance(item, dict) or set(item) != {"source", "observation"}:
+        return False
+    source, observation = item["source"], item["observation"]
+    if not _helper_guard_source_facts(source) or not any(
+        row["generation"] == source["generation"] and row["helper"] == source["helper"]
+        for row in result["generations"]
+    ):
+        return False
+    if observation is not None:
+        return (
+            helper_source_observation_facts(observation, source)
+            and observation == result["resources"].get("helper_source_observation")
+            and source == result["resources"].get("helper_source")
+        )
+    return any(
+        row.get("stage") == "helper_exit"
+        and row.get("helper") == source["helper"]
+        and row.get("pid") == source["pid"]
+        and row.get("observation") == "present"
+        for row in result["timeline"]
+    )
+
+
+def helper_guard_costs_facts(value: object, result: dict[str, Any]) -> bool:
+    if _binding_missing(value):
+        return True
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "code", "reason", "sources"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["code"] != "partial"
+        or value["reason"] != "observed_helper_sources_only"
+        or not isinstance(value["sources"], list)
+        or not 1 <= len(value["sources"]) <= 3
+    ):
+        return False
+    revisions: dict[str, int] = {}
+    for row in result["timeline"]:
+        if row.get("stage") == "transaction" and "generation" in row and "revision" in row:
+            generation = row["generation"]
+            revisions[generation] = max(revisions.get(generation, 0), row["revision"])
+    seen: set[str] = set()
+    for sample in value["sources"]:
+        if (
+            not isinstance(sample, dict)
+            or set(sample) != {"source", "observation", "collected_ns", "costs"}
+            or not _helper_guard_source_matches(
+                {key: sample[key] for key in ("source", "observation")}, result
+            )
+            or not _binding_number(sample["collected_ns"], positive=True)
+            or not helper_guard_snapshot_facts(sample["costs"], sample["source"])
+            or sample["source"]["generation"] in seen
+        ):
+            return False
+        source, costs = sample["source"], sample["costs"]
+        seen.add(source["generation"])
+        if costs.get("code") == "observed" and (
+            costs["monotonic_ns"] > sample["collected_ns"]
+            or any(
+                row["position"]["revision"] > revisions.get(source["generation"], 0)
+                for row in costs["rows"]
+            )
+            or (
+                costs["first_record"]["position"] is not None
+                and costs["first_record"]["position"]["revision"]
+                > revisions.get(source["generation"], 0)
+            )
+            or (
+                sample["observation"] is not None
+                and costs["monotonic_ns"] < sample["observation"]["started_ns"]
+            )
+            or (
+                sample["observation"] is not None
+                and sample["observation"]["observed_ns"] > sample["collected_ns"]
+            )
+        ):
+            return False
+    return True
+
+
+def collect_helper_guard_costs(
+    root: Path,
+    result: dict[str, Any],
+    sources: list[dict[str, Any]],
+    retained: list[dict[str, Any]],
+    *,
+    deadline: float | None,
+    completed_generation: str | None = None,
+) -> None:
+    """Reuse original helper proofs and exit/failure collection opportunities only."""
+    for item in sources[:3]:
+        if not _helper_guard_source_matches(item, result):
+            continue
+        source = item["source"]
+        if completed_generation is not None and source["generation"] != completed_generation:
+            continue
+        old = next((row for row in retained if row["source"] == source), None)
+        # A completed generation was already read at its original exit boundary.
+        if (
+            completed_generation is None
+            and old is not None
+            and old["costs"].get("scope") == "final"
+        ):
+            continue
+        sample = {**item, "collected_ns": time.monotonic_ns(), "costs": binding_unavailable()}
+        try:
+            path = root / f"helper-guard-costs-{source['pid']}-{source['invocation']}.json"
+            sample["costs"] = _read_helper_cost_json(path, deadline=deadline)
+            sample["collected_ns"] = time.monotonic_ns()
+            candidate = {
+                "version": 1,
+                "code": "partial",
+                "reason": "observed_helper_sources_only",
+                "sources": [sample],
+            }
+            if not helper_guard_costs_facts(candidate, result):
+                sample["costs"] = binding_unavailable("identity_changed")
+        except Exception:
+            pass
+        if old is None:
+            retained.append(sample)
+        elif (
+            sample["costs"].get("code") == "observed"
+            and sample["costs"] != old["costs"]
+            and sample["costs"]["monotonic_ns"] >= old["costs"].get("monotonic_ns", 0)
+        ):
+            # Re-reading the same receipt must not rewrite its original collection fact.
+            retained[retained.index(old)] = sample
+    if completed_generation is not None:
+        return
+    samples = [
+        row
+        for row in retained
+        if _helper_guard_source_matches(
+            {key: row[key] for key in ("source", "observation")}, result
+        )
+    ]
+    value = {
+        "version": 1,
+        "code": "partial",
+        "reason": "observed_helper_sources_only",
+        "sources": samples,
+    }
+    result["resources"]["helper_guard_costs"] = (
+        value if samples and helper_guard_costs_facts(value, result) else binding_unavailable()
+    )
+    trim_binding_diagnostics(result)
+
+
+class HelperGuardCosts:
+    """Memory-only accounting around the real synchronous authorization calls."""
+
+    def __init__(self, root: Path, invocation: str) -> None:
+        self.root = root
+        self.source: dict[str, Any] = {
+            "uid": os.geteuid(),
+            "pid": os.getpid(),
+            "invocation": invocation,
+        }
+        self.rows: dict[tuple[str, str, int, str, str], dict[str, Any]] = {}
+        self.totals = {
+            name: self.metric() for name in ("host_record", "checks", "unpositioned_raised")
+        }
+        self.first_record: dict[str, Any] | None = None
+        self.reason = ""
+        self.bound = False
+        self.attempts = {"prefix": 0, "final": 0}
+        self.boundaries: set[str] = set()
+        self.publications = {"count": 0, "wall_ns": 0, "cpu_ns": 0}
+        self.last_clock: tuple[int, int] | None = None
+
+    @staticmethod
+    def metric() -> dict[str, int]:
+        return {key: 0 for key in ("entered", "returned", "raised", "wall_ns", "cpu_ns")}
+
+    def clock(self) -> tuple[int, int] | None:
+        try:
+            value = time.perf_counter_ns(), time.process_time_ns()
+            if (
+                not all(_binding_number(number) for number in value)
+                or self.last_clock is not None
+                and any(
+                    after < before for before, after in zip(self.last_clock, value, strict=True)
+                )
+            ):
+                raise ValueError
+            self.last_clock = value
+            return value
+        except BaseException:
+            self.reason = "clock_invalid"
+            return None
+
+    def finish_call(
+        self, name: str, current: object, returned: bool, started: tuple[int, int] | None
+    ) -> None:
+        try:
+            ended = self.clock()
+            from muli.managed_host import managed_helper_unit_name
+            from muli.managed_transaction import TransactionRecordV2
+
+            if started is None or ended is None:
+                return
+            wall, cpu = (after - before for before, after in zip(started, ended, strict=True))
+            metric = {
+                "entered": 1,
+                "returned": int(returned),
+                "raised": int(not returned),
+                "wall_ns": wall,
+                "cpu_ns": cpu,
+            }
+            position: dict[str, Any] | None = None
+            if isinstance(current, TransactionRecordV2):
+                position = {
+                    key: getattr(current, key)
+                    for key in ("generation", "revision", "phase", "intent")
+                }
+                if not _helper_guard_position(position):
+                    raise ValueError
+                identity = {
+                    "generation": current.generation,
+                    "helper": managed_helper_unit_name(current),
+                }
+                if any(self.source.get(key, value) != value for key, value in identity.items()):
+                    raise ValueError
+                self.source.update(identity)
+                row_key = (
+                    name,
+                    position["generation"],
+                    position["revision"],
+                    position["phase"],
+                    position["intent"],
+                )
+                if row_key not in self.rows:
+                    if len(self.rows) >= HELPER_GUARD_ROWS:
+                        self.reason = "output_budget"
+                        return
+                    self.rows[row_key] = {
+                        "metric": name,
+                        "position": position,
+                        "costs": self.metric(),
+                    }
+                bucket = self.rows[row_key]["costs"]
+            elif name == "host_record" and not returned:
+                bucket = self.totals["unpositioned_raised"]
+            else:
+                raise ValueError
+            for key, number in metric.items():
+                self.totals[name][key] += number
+                bucket[key] += number
+            if name == "host_record" and self.first_record is None:
+                self.first_record = {
+                    "outcome": "returned" if returned else "raised",
+                    "position": position,
+                    "wall_ns": wall,
+                    "cpu_ns": cpu,
+                }
+        except BaseException:
+            self.reason = "identity_changed"
+
+    def record(self, original: HostRecordReader) -> HostRecordReader:
+        @wraps(original)
+        def observed(
+            control: JournalControl, anchor: DeploymentAnchor
+        ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+            started, returned = self.clock(), False
+            current: object = None
+            try:
+                value = original(control, anchor)
+                current, returned = value[0], True
+                return value
+            finally:
+                self.finish_call("host_record", current, returned, started)
+
+        return observed
+
+    def check(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(original)
+        def observed(*args: Any, **kwargs: Any) -> Any:
+            started, returned = self.clock(), False
+            try:
+                value = original(*args, **kwargs)
+                returned = True
+                return value
+            finally:
+                try:
+                    current = args[1] if len(args) > 1 else kwargs["record"]
+                    self.finish_call("checks", current, returned, started)
+                    if returned:
+                        self.publish("first_check_returned")
+                        if current.intent == "install_target":
+                            self.publish("first_install_target_check_returned")
+                except BaseException:
+                    self.reason = "identity_changed"
+
+        return observed
+
+    def snapshot(self, boundary: str) -> dict[str, Any]:
+        if (os.geteuid(), os.getpid(), os.environ.get("INVOCATION_ID")) != tuple(
+            self.source[key] for key in ("uid", "pid", "invocation")
+        ):
+            self.reason = "identity_changed"
+        if self.reason or not self.bound or self.first_record is None or not self.rows:
+            return binding_unavailable(self.reason or "unbound")
+        value = {
+            "version": 1,
+            "code": "observed",
+            "source": dict(self.source),
+            "scope": "final" if boundary == "normal_exit" else "prefix",
+            "boundary": boundary,
+            "monotonic_ns": time.monotonic_ns(),
+            "rows": [{**row, "costs": dict(row["costs"])} for row in self.rows.values()],
+            **{key: dict(value) for key, value in self.totals.items()},
+            "first_record": self.first_record,
+            "attempts": dict(self.attempts),
+            "prior_publications": dict(self.publications),
+        }
+        return (
+            value
+            if helper_guard_snapshot_facts(value, self.source)
+            else binding_unavailable("identity_changed")
+        )
+
+    def publish(self, boundary: str) -> None:
+        if boundary in self.boundaries or self.attempts["final"]:
+            return
+        self.boundaries.add(boundary)
+        self.attempts["final" if boundary == "normal_exit" else "prefix"] += 1
+        temporary: Path | None = None
+        try:
+            value = self.snapshot(boundary)
+            if value.get("code") != "observed":
+                return
+            data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            require(len(data) <= MAX_BYTES, "native_metadata_budget")
+            path = (
+                self.root
+                / f"helper-guard-costs-{self.source['pid']}-{self.source['invocation']}.json"
+            )
+            target = path.with_suffix(".tmp")
+            started = self.clock()
+            descriptor = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+            )
+            temporary = target
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(data)
+            target.replace(path)
+            temporary = None
+            ended = self.clock()
+            if started is not None and ended is not None:
+                self.publications["count"] += 1
+                self.publications["wall_ns"] += ended[0] - started[0]
+                self.publications["cpu_ns"] += ended[1] - started[1]
+        except BaseException:
+            pass  # A failed attempt preserves the preceding prefix and consumes its allowance.
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    def save(self) -> None:
+        self.publish("normal_exit")
+
+
+def install_helper_guard_cost_hook() -> None:
+    """Bind only the exact -m main namespace, without reviving the broad observer."""
+    bind_main: Callable[[FrameType, str, object], None] | None = None
+    try:
+        prefix = Path(sys.prefix)
+        root = prefix.parent
+        require(
+            prefix.name in {"a", "b"}
+            and sys.executable == str(prefix / "bin/python")
+            and sys.orig_argv
+            == [
+                sys.executable,
+                "-I",
+                "-m",
+                "muli.managed_host",
+                "--root",
+                str(root / "data/management/transaction-v1"),
+                "run",
+            ],
+            "native_guard_arguments",
+        )
+        require(sys.getprofile() is None, "native_guard_unbound")
+        fixture(root)
+        info = root.lstat()
+        invocation = os.environ.get("INVOCATION_ID", "")
+        require(
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == os.geteuid()
+            and not info.st_mode & 0o077
+            and _binding_digest(invocation, 32)
+            and invocation != "0" * 32,
+            "native_guard_source",
+        )
+        import muli.managed_host as managed_host
+        from muli.platforms.managed_backend import ManagedLinuxBackend
+
+        observer = HelperGuardCosts(root, invocation)
+        spec = managed_host.__spec__
+        origin = spec.origin if spec is not None else None
+
+        def stop_waiting() -> None:
+            try:
+                if sys.getprofile() is bind:
+                    sys.setprofile(None)
+            except BaseException:
+                observer.reason = "unbound"
+
+        def bind(frame: FrameType, event: str, argument: object) -> None:
+            if event != "call" or frame.f_code.co_name != "main":
+                return
+            module = sys.modules.get("__main__")
+            if module is None or frame.f_globals is not module.__dict__:
+                return
+            try:
+                namespace = frame.f_globals
+                actual_spec, main, original = (
+                    namespace.get(key) for key in ("__spec__", "main", "_record")
+                )
+                require(
+                    isinstance(actual_spec, ModuleSpec)
+                    and actual_spec.name == "muli.managed_host"
+                    and isinstance(origin, str)
+                    and actual_spec.origin == origin
+                    and namespace.get("__file__") == origin
+                    and frame.f_code.co_filename == origin
+                    and isinstance(main, FunctionType)
+                    and main.__globals__ is namespace
+                    and main.__code__ is frame.f_code
+                    and main.__code__ == managed_host.main.__code__
+                    and isinstance(original, FunctionType)
+                    and original.__globals__ is namespace
+                    and original.__code__.co_filename == origin
+                    and original.__code__ == managed_host._record.__code__,
+                    "native_guard_unbound",
+                )
+                namespace["_record"] = observer.record(cast("HostRecordReader", original))
+                ManagedLinuxBackend._check = observer.check(ManagedLinuxBackend._check)  # type: ignore[method-assign]
+                observer.bound = True
+            except BaseException:
+                observer.reason = "unbound"
+            finally:
+                stop_waiting()
+
+        bind_main = bind
+        sys.setprofile(bind)
+        atexit.register(observer.save)
+    except BaseException:
+        try:
+            if bind_main is not None and sys.getprofile() is bind_main:
+                sys.setprofile(None)
+        except BaseException:
+            pass
 
 
 class BindingCosts:
@@ -4896,6 +5500,8 @@ class Case:
         self._helper_cost_history: list[dict[str, Any]] = []
         self._helper_cost_samples: list[dict[str, Any]] = []
         self._helper_start_samples: list[dict[str, Any]] = []
+        self._helper_guard_sources: list[dict[str, Any]] = []
+        self._helper_guard_history: list[dict[str, Any]] = []
         self._binding_inputs: dict[str, Any] = binding_unavailable()
         self._binding_sources: list[dict[str, Any]] = []
         self._failure_helper_attempted = False
@@ -5128,6 +5734,26 @@ class Case:
                 and current["source"].get("generation") == generation
             ):
                 resources.pop(name)
+        for rows in (self._helper_guard_sources, self._helper_guard_history):
+            rows[:] = [row for row in rows if row["source"]["generation"] != generation]
+        resources.pop("helper_guard_costs", None)
+
+    def _remember_helper_guard_source(self, observation: dict[str, Any] | None = None) -> None:
+        source = self.result["resources"].get("helper_source")
+        item = {
+            "source": dict(source) if isinstance(source, dict) else source,
+            "observation": observation,
+        }
+        if (
+            len(self._helper_guard_sources) < 3
+            and _helper_guard_source_matches(item, self.result)
+            and source["generation"] not in self._invalid_helper_sources
+            and not any(
+                row["source"]["generation"] == source["generation"]
+                for row in self._helper_guard_sources
+            )
+        ):
+            self._helper_guard_sources.append(item)
 
     async def _collect_failure_helper_source(self, *, deadline: float) -> None:
         """One fresh pending-helper proof, solely inside the original failure window."""
@@ -5249,6 +5875,7 @@ class Case:
                 resources["helper_source"] = source
                 resources["helper_source_observation"] = observation
                 self._helper_source_groups[record.generation] = unit.cgroup
+                self._remember_helper_guard_source(observation)
                 self._collect_helper_entry_checkpoint(after, deadline=deadline)
 
     def _collect_helper_entry_checkpoint(
@@ -5448,6 +6075,7 @@ class Case:
             exit_status=details["ExecMainStatus"],
             observation="present",
         )
+        self._remember_helper_guard_source()
         return (
             snapshot.active_state == "inactive"
             and snapshot.pid == 0
@@ -5655,6 +6283,14 @@ class Case:
                                 deadline=self.deadline,
                                 completed_generation=record.generation,
                                 retained=self._helper_cost_history,
+                            )
+                            collect_helper_guard_costs(
+                                self.root,
+                                self.result,
+                                self._helper_guard_sources,
+                                self._helper_guard_history,
+                                deadline=self.deadline,
+                                completed_generation=record.generation,
                             )
                             # A resolved HTTP response can precede helper lock release.
                             with journal.locked():
@@ -6013,6 +6649,13 @@ async def run(mode: str, root: Path) -> int:
                 case.result["resources"]["binding_inputs"] = case._binding_inputs
                 collect_binding_costs(
                     root, case.result, case._binding_sources, deadline=case.drive_deadline
+                )
+                collect_helper_guard_costs(
+                    root,
+                    case.result,
+                    case._helper_guard_sources,
+                    case._helper_guard_history,
+                    deadline=case.drive_deadline,
                 )
                 write_json(root / "result.json", case.result)
             except Exception:
