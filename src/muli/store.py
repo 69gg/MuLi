@@ -154,6 +154,8 @@ class Store:
         lock.check()
         creation = CreatedDatabase.claim(lock.database)
         try:
+            if creation is not None:
+                creation.check_pristine()
             self.db = sqlite3.connect(
                 lock.database.as_uri() + "?mode=rw&cache=private",
                 uri=True,
@@ -161,11 +163,9 @@ class Store:
                 timeout=0,
                 isolation_level="DEFERRED",
             )
-            if creation is not None:
-                creation.check()
-            # Classification occurs under the constructor lock and before
-            # any ordinary DDL, backfill, chmod or new identity.
-            evidence = read_optional_format_evidence(self.db)
+            # Only this call's pristine O_EXCL claim can omit classification.
+            # Existing files still pass the reader before any ordinary write.
+            evidence = read_optional_format_evidence(self.db) if creation is None else None
             if evidence is not None:
                 self._admit_format(evidence)
                 self._configure_existing(durable=durable)
@@ -173,7 +173,7 @@ class Store:
                 if runtime_mode is not None and creation is None:
                     raise FormatAdmissionError("store_format_upgrade_required")
                 if creation is not None:
-                    creation.check()
+                    creation.check_pristine()
                 lock.database.chmod(0o600)
                 self._initialize(durable=durable)
                 if creation is not None and runtime_mode is not None:

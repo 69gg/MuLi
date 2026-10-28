@@ -122,6 +122,31 @@ class CreatedDatabase(AbstractContextManager["CreatedDatabase"]):
         ):
             raise StoreInitializationError("store_creation_identity_changed")
 
+    def check_pristine(self) -> None:
+        """Require untouched creation before initialization, under the cooperative lock.
+
+        This is not an atomic exclusion of arbitrary external writers. Never use
+        it after this factory starts writing its own schema or SQLite sidecars.
+        """
+        try:
+            self.check()
+            descriptor = self.fd
+            if descriptor is None:
+                raise StoreInitializationError("store_creation_claim_closed")
+            if os.fstat(descriptor).st_size != 0:
+                raise StoreInitializationError("store_creation_not_pristine")
+            for suffix in ("-wal", "-shm", "-journal"):
+                try:
+                    self.path.with_name(self.path.name + suffix).lstat()
+                except FileNotFoundError:
+                    continue
+                raise StoreInitializationError("store_creation_not_pristine")
+            self.check()
+            if os.fstat(descriptor).st_size != 0:
+                raise StoreInitializationError("store_creation_not_pristine")
+        except OSError:
+            raise StoreInitializationError("store_creation_not_pristine") from None
+
     def __exit__(self, *args: object) -> None:
         if self.fd is not None:
             descriptor, self.fd = self.fd, None

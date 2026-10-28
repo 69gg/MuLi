@@ -87,6 +87,7 @@ uv tool install 'muli-agent[channels]'
 - [多 agent 协作](docs/workflows.md)
 - [消息渠道与文件收发](docs/channels.md)
 - [语音与唤醒](docs/voice.md)
+- [提醒与主动事项](docs/attention.md)
 - [MCP、Skills 与插件](docs/README.md#扩展与维护)
 - [全部使用指南](docs/README.md)
 

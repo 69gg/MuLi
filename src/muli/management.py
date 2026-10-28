@@ -970,6 +970,7 @@ class SelfManagement:
                 "update_capability": self.updates.capability(),
                 "extensions": runtime.extensions.status(),
                 "system_events": runtime.system_events.status(),
+                "topic_reminders": runtime.topic_reminders.status(),
             }
 
         async def logs(args: dict[str, Any]) -> Any:

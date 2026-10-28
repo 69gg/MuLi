@@ -13,6 +13,7 @@ from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
 
 MAX_EVENT_ID_CHARS = 512
+MAX_CONTENT_CHARS = 64000
 
 
 class Conversation:
@@ -93,7 +94,7 @@ class Conversation:
         attention_memory_failure: MemorySourceFailure | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
-        if not content.strip() or len(content) > 64000:
+        if not content.strip() or len(content) > MAX_CONTENT_CHARS:
             raise ValueError("消息需为1–64000字符")
         if not source or len(source) > 120 or not principal or len(principal) > 256:
             raise ValueError("消息来源或身份无效")

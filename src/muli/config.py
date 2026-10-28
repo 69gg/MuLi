@@ -584,6 +584,12 @@ class ExtensionSettings(Section):
     candidate_timeout_seconds: float = Field(default=30, gt=0, le=180, allow_inf_nan=False)
 
 
+class TopicReminderSettings(Section):
+    max_active: int = Field(default=32, ge=1, le=256, strict=True)
+    max_keyword_chars: int = Field(default=120, ge=1, le=512, strict=True)
+    batch_size: int = Field(default=8, ge=1, le=64, strict=True)
+
+
 class Settings(Section):
     models: Models = Field(default_factory=Models)
     media: MediaSettings = Field(default_factory=MediaSettings)
@@ -606,6 +612,7 @@ class Settings(Section):
     chiliarch: Chiliarch = Field(default_factory=Chiliarch)
     notifications: DesktopNotifications = Field(default_factory=DesktopNotifications)
     attention: AttentionSettings = Field(default_factory=AttentionSettings)
+    topic_reminders: TopicReminderSettings = Field(default_factory=TopicReminderSettings)
     system_events: SystemEventsSettings = Field(default_factory=SystemEventsSettings)
     limits: Limits = Field(default_factory=Limits)
     server: Server = Field(default_factory=Server)

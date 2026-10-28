@@ -8,13 +8,13 @@
 
 `Runtime.__init__` 将 `ConfigFile.settings.default_mode` 交给内部 `Store.open_runtime` 工厂。三种默认模式 `ask/auto/yolo` 沿用配置验证结果，创建对应的 owner 主会话；重开时不因默认模式变化而替换既有主身份或模式。
 
-1. 普通 `Store(path)` 与工厂先取得相同规范数据库路径的短构造锁，然后重新读取当前标记分类。不存在“锁外判定 legacy，等待后照旧迁移”的分支。
-2. 工厂保留独占创建的文件描述符。连接建立后、分类后进入初始化前、各准备阶段及最终发布前，均复核创建句柄与当前路径的 `dev/ino`、普通文件和单链接身份。不从 SQLite 空文件或 schema 猜测创建资格。
+1. 普通 `Store(path)` 与工厂先取得相同规范数据库路径的构造锁。已有文件在锁内读取当前标记分类，不沿用锁外判断。
+2. 本次独占创建的文件在 SQLite 连接前和初始化写入前，还须确认同一创建句柄仍为零字节，且 `-wal`、`-shm`、`-journal` 均不存在。悬空链接和无法核实的状态也拒绝，不删除或截断原文件。只有这份一次性空白证明可以省去首次 legacy 分类；普通已有空文件没有该资格。各准备阶段及最终发布前继续核对 `dev/ino`、普通文件和单链接身份，最终发布前的标记复查不变。
 3. 无标记新库复用实际 Store 初始化、`Memory.__init__`、`Store.prepare_channels` 和 `main_session(default_mode)`。渠道只准备共享 DDL，不创建 HTTP client，不运行渠道恢复。随后只读核齐 core、memory、channel 三组与 Store/main 身份。
 4. 再次确认路径、构造锁和无完整标记，设置并核验 `synchronous=FULL`，在显式 `BEGIN IMMEDIATE` / `COMMIT` 中插入完整七领域声明。此前准备允许分多个事务提交；不把 `with db` 或 `executescript` 当作整个初始化的原子事务。
 5. 发布后重读格式和身份，通过后返回 `migration_allowed=False` 的 Store。此时才进入 Runtime 的 Memory 构造、`Runtime._recover`，以及之后的 `ChannelApplication._manager` / `ChannelManager.recover`。后两者可执行正常恢复业务写入，不能先迁移再宣称准入。
 
-普通 `Store(path)` 仍可创建仅 core 的未标记库，避免轻量内部用途被强制变成完整 Runtime。但它打开已经标记的库时，与工厂一样先准入并禁止迁移。`Store.open_existing` 仍只打开已有文件，不新建构造锁、不 mkdir/chmod；它不迁移，并要求可信宿主持有路径及 writer 所有权。
+普通 `Store(path)` 仍可创建仅 core 的未标记库，避免轻量内部用途被强制变成完整 Runtime。但它打开已经标记的库时，与工厂一样先准入并禁止迁移。`Store.open_existing` 只打开已有文件，默认不新建构造锁或调整权限；内部 Runtime 使用 `runtime_owner=True` 时会持有同一构造锁直到连接关闭。该入口不迁移，路径与 writer 所有权仍由可信宿主核验。
 
 ### 短锁与失败边界
 
@@ -54,15 +54,6 @@ Runtime 与 ChannelApplication 重配置入口先核；server 在关闭可用组
 
 与本片配套的更新能力检查会重核 admitted 状态，已标记库暂拒 Runtime 内原位自动升级，直到完整候选切换接通；legacy 沿用原安装检查。版本查询与通知仍可用，不许诺批准即可安装。`format_state` 不等于 `migration_allowed`：已有禁止迁移入口也可打开无标记 legacy。跨 data-dir 共享同一 uv 环境、手工外部升级或直接运行不识别 marker 的旧程序，不在当前 Runtime 封口的全局控制范围内。
 
-## 验证记录
+## 回归范围
 
-全部本地执行经过 `/data0/MuLi/scripts/check_local.py`，每次 1 GiB、共享 2 GiB、swap 0、共享一个 CPU、最长 180 秒。使用小型临时数据库和 fake 组件，没有读取用户库、调用模型、下载、安装或重启服务。
-
-- fresh + 既有禁止迁移 + 格式读取器：先有 144 项通过，1.21 秒，峰值 114.2 MiB。首轮发现旧入口 cleanup 错误码遗漏，修复映回 `existing_store_cleanup_failed` 后通过，未放宽预算。补完最后三例后，同三组最终 147 项通过，1.27 秒，峰值 120.6 MiB；这次使用 30 秒硬限，其中新增文件共 44 项。
-- 实际 Runtime、渠道、配置恢复、Extensions 与 cleanup 回归：92 项通过，2.49 秒，峰值 137 MiB。与上一组有一项 cleanup 重叠，不把两组相加声称唯一 case 数。
-- server close-await 与权限断言尾差曾仅重验新增文件：42 项通过，0.85 秒，峰值 99.7 MiB。随后增加 NOCASE 分类的 marked/legacy 两例，在上述最终 147 项中验收；没有将不同轮次计数混成更多唯一 case。
-- 九个已改源码严格 mypy 通过；十二个 Python 文件 Ruff/format 通过，最终测试尾差也单独通过。server 新增管理能力字段依赖另一片 Updates 实现，管理 API 能力回归与完整整合由主树执行。
-
-真实子进程回归在父工厂持锁、core 已提交但 full marker 尚未发布时，分别调用普通 Store 和 Runtime 工厂；两者均固定 busy、父库事实不变，之后父可完成发布并以 marked/禁止迁移重开。三个重开入口也保留额外插件私有表、索引和一行资料。准备/COMMIT 拒绝后的重开不补证；标记损坏、结构/局部身份缺失与 BLOB 命名族均无迁移写入。
-
-POSIX 真实路径替换反例证明连接到旧库时在 chmod/core DDL 前拒绝；Windows 禁止替换持有中的创建句柄，此例明确跳过，其余创建检查、锁和子进程回归仍运行。Windows/macOS 的静态官方 API 审查已完成，远端实际执行仍待整合 CI；本机结果不替代跨平台证据。没有验收真实 A/B 切换、历史库补证、任意插件认证或实际安装 profile 重建。
+使用小型临时数据库验证独占创建、同文件内容变化、SQLite 辅助文件、首次写入前的持久级别、格式发布、失败重开、已有数据只读拒绝和合作构造器互斥。格式读取器仍验证原期限、隔离、WAL 快照和连接状态恢复。执行方式与资源保护见[开发与验证](development.md)；离线替身不代替跨平台 CI 或真实 A/B 切换验收。

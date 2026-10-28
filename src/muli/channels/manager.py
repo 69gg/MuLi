@@ -519,6 +519,9 @@ class ChannelManager:
                         route=route,
                         event_id=key,
                         attachment_ids=files,
+                        _owner_text_chars=len(message.text)
+                        if trusted and message.text.strip()
+                        else None,
                     )
                 except ValueError:
                     if trusted:

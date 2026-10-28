@@ -47,6 +47,7 @@ from muli.memory_source_failure import (
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
+from muli.owner_text import OwnerTextKind, owner_text_marker
 from muli.permissions import ApprovalNotice, ApprovalSuperseded, Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
 from muli.process import run_process
@@ -81,6 +82,7 @@ from muli.tools.computer import Computer, ComputerError
 from muli.tools.files import Files
 from muli.tools.mcp import MCPManager
 from muli.tools.web import Web
+from muli.topic_reminders import TopicReminders
 
 if TYPE_CHECKING:
     from muli.platforms.linux_bootstrap import BootSession
@@ -210,6 +212,13 @@ class Runtime:
             max_output_chars=lambda: self.config.settings.limits.max_output_chars,
         )
         self.reminders._clock_log = self._log_clock
+        self.topic_reminders = TopicReminders(
+            self.store,
+            self.bus,
+            settings=lambda: self.config.settings.topic_reminders,
+            admission=self.maintenance.admission,
+            max_output_chars=lambda: self.config.settings.limits.max_output_chars,
+        )
         self.conversation = Conversation(self.store)
         self.context_hooks: list[ContextHook] = []
         self.skills_context: ContextHook | None = None
@@ -838,8 +847,10 @@ class Runtime:
         event_id: str | None = None,
         admission_guard: Callable[[], None] | None = None,
         _channel_event: str | None = None,
+        _owner_text_chars: int | None = None,
     ) -> dict[str, Any]:
         """Persist cross-channel input without changing an in-flight model request."""
+        original_text_present = bool(content.strip())
         if not content.strip() and attachment_ids:
             content = "请查看附件"
         hook_errors: list[str] = []
@@ -850,11 +861,13 @@ class Runtime:
                 admission_guard()
             session = self.main_session()
             ownership: dict[str, Any] | None = None
+            verified_channel_text = False
             if _channel_event is not None:
                 if event_id != _channel_event or route is None:
                     raise ValueError("渠道入站缺少宿主稳定事件或路由")
                 previous = self.store.db.execute(
-                    "SELECT receipt FROM channel_inbound WHERE id=?", (_channel_event,)
+                    "SELECT receipt,name,fingerprint FROM channel_inbound WHERE id=?",
+                    (_channel_event,),
                 ).fetchone()
                 if previous is None:
                     raise ValueError("渠道入站缺少已核验的接收记录")
@@ -901,6 +914,12 @@ class Runtime:
                             ),
                         )
                     return recovered
+                verified_channel_text = (
+                    admission_guard is not None
+                    and previous["name"] == route.get("name")
+                    and isinstance(previous["fingerprint"], str)
+                    and bool(previous["fingerprint"])
+                )
                 if principal == "owner":
                     destination, ownership = self.channel_ownership.destination(route)
                     session = self.store.get("session", destination) or {}
@@ -932,6 +951,41 @@ class Runtime:
                 payload["id"] = hashlib.sha256(("channel\0" + _channel_event).encode()).hexdigest()
             if ownership is not None:
                 payload["channel_ownership"] = ownership
+            existing_input = (
+                self.store.db.execute(
+                    "SELECT payload FROM ingress WHERE id=?", (payload["id"],)
+                ).fetchone()
+                if _channel_event is not None
+                else None
+            )
+            if existing_input is not None:
+                # Metadata is frozen at first admission. Old stable inputs may
+                # lack the new field; a retry must neither upgrade nor conflict.
+                original_payload = json.loads(existing_input["payload"])
+                if "owner_text" in original_payload:
+                    payload["owner_text"] = original_payload["owner_text"]
+            elif (
+                original_text_present
+                and is_main
+                and session["id"] == self.store.existing_main_session_id()
+                and principal == "owner"
+            ):
+                text_kind: OwnerTextKind | None = None
+                if (
+                    source == "web"
+                    and route is None
+                    and event_id is None
+                    and _channel_event is None
+                ):
+                    text_kind = "web"
+                elif verified_channel_text:
+                    # ChannelApplication's current-config guard and the stable
+                    # inbound receipt were verified before ownership selection.
+                    text_kind = "channel"
+                if text_kind is not None:
+                    marker = owner_text_marker(payload, _owner_text_chars, kind=text_kind)
+                    if marker is not None:
+                        payload["owner_text"] = marker
             with self.store.db:
                 receipt, inserted = self.store._enqueue_input(
                     payload,
@@ -982,6 +1036,8 @@ class Runtime:
                     )
             # No await separates committing the new input and cancelled tickets
             # from waking their original waiter. A rollback never wakes it.
+            if inserted and "owner_text" in receipt:
+                self.topic_reminders.changed.set()
             for future in superseded:
                 future.set_exception(ApprovalSuperseded())
             if inserted and principal == "owner" and receipt["state"] == "pending":
@@ -1371,6 +1427,7 @@ class Runtime:
         self.configure()
         self._configure_workflows()
         self._configure_compaction()
+        self.topic_reminders.changed.set()
         if self.started:
             self.system_logger = await self.system_events.reconfigure()
             await self._start_mcp()
@@ -1392,6 +1449,7 @@ class Runtime:
         await self._start_mcp()
         await self.notifications.start()
         await self.reminders.start()
+        await self.topic_reminders.start()
         self.started = True
         self._wake_main()
         self.team.start()
@@ -1567,6 +1625,8 @@ class Runtime:
                 "reminder_schedule_calendar",
                 "reminder_cancel",
                 "reminder_reschedule",
+                "topic_reminder_create",
+                "topic_reminder_cancel",
                 "workflow_schedule",
                 "workflow_schedule_calendar",
                 "workflow_schedule_cancel",
@@ -3063,6 +3123,27 @@ class Runtime:
         async def list_reminders(args: dict[str, Any]) -> Any:
             return self.reminders.records()
 
+        def topic_caller() -> tuple[str, str]:
+            caller, _, request, _ = self.scheduled_workflows._caller()
+            identifier = request.reply_origin.input_id
+            if identifier is None:
+                raise PermissionError("话题提醒需要当前主人原文")
+            self.topic_reminders.require_owner_input(caller, identifier)
+            return caller, identifier
+
+        async def create_topic_reminder(args: dict[str, Any]) -> Any:
+            caller, identifier = topic_caller()
+            return self.topic_reminders.create(caller, identifier, **args)
+
+        async def list_topic_reminders(args: dict[str, Any]) -> Any:
+            caller, _ = topic_caller()
+            return self.topic_reminders.records(caller, **args)
+
+        async def cancel_topic_reminder(args: dict[str, Any]) -> Any:
+            caller, _ = topic_caller()
+            item = self.topic_reminders.cancel(caller, args["id"])
+            return {key: item[key] for key in ("id", "state", "updated_at")}
+
         async def cancel_reminder(args: dict[str, Any]) -> Any:
             return {"deleted": self.reminders.delete(args["id"], kind=args.get("kind", "reminder"))}
 
@@ -3473,6 +3554,43 @@ class Runtime:
                 "write",
             ),
             Tool(
+                "topic_reminder_create",
+                "登记一次性话题提醒：登记后首次在主人新原文中出现 keyword 字面子串时，"
+                "在本地通知中心提醒一次。区分大小写，不扫描附件或旧消息，不自动执行或外发。",
+                parameters(
+                    {
+                        "keyword": string("主人明确指定的原文字词，不使用正则或语义匹配"),
+                        "title": string(),
+                        "content": string(),
+                        "key": string("本次主人请求内的稳定登记键；同键重试不重复登记"),
+                    },
+                    ("keyword", "title", "key"),
+                ),
+                create_topic_reminder,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
+                "topic_reminder_list",
+                "分页查看话题提醒的字词、标题及状态；after_id 用上一页末条 ID，不返回正文",
+                parameters(
+                    {
+                        "after_id": string(),
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    }
+                ),
+                list_topic_reminders,
+                preserve_output=True,
+            ),
+            Tool(
+                "topic_reminder_cancel",
+                "取消准确 ID 的话题提醒，保留记录；已发出的网页通知不撤回",
+                parameters({"id": string()}, ("id",)),
+                cancel_topic_reminder,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
                 "memory_recall",
                 "检索个人记忆与两跳关系证据",
                 parameters({"query": string()}, ("query",)),
@@ -3663,6 +3781,7 @@ class Runtime:
             await self.extensions.close()
             await self.compaction.close()
             await self.team.close()
+            await self.topic_reminders.close()
             await self.reminders.close()
             await self.workflows.close()
             for task in list(self.tasks.values()):
