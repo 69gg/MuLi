@@ -6,14 +6,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from test_mcp import FakeClient, settings
+from test_mcp import FakeClient, settings, stdio_settings
 
 from muli.tools.mcp import MCPLimits, MCPManager, MCPPrepareError
 
 
-async def test_only_published_tokens_can_call_and_catalog_refresh_revokes_old_handlers() -> None:
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_only_published_tokens_can_call_and_catalog_refresh_revokes_old_handlers(
+    transport: str,
+) -> None:
     client = FakeClient()
-    manager = MCPManager(settings(), client_factory=lambda *_: client)
+    config = settings() if transport == "http" else stdio_settings()
+    manager = MCPManager(config, client_factory=lambda *_: client)
     try:
         old = (await manager.start())[0]
         candidate = await manager.prepare(manager.config, refresh={"test"})
@@ -28,30 +32,39 @@ async def test_only_published_tokens_can_call_and_catalog_refresh_revokes_old_ha
         await manager.close()
 
 
-async def test_discard_or_failed_candidate_keeps_the_original_token_and_bounds_preparation() -> (
-    None
-):
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_discard_or_failed_candidate_keeps_the_original_token_and_bounds_preparation(
+    transport: str,
+) -> None:
     old, new = FakeClient(), FakeClient(failure=True)
-    manager = MCPManager(
-        settings(),
-        client_factory=lambda source, _: old if source["url"].endswith("/mcp") else new,
+    clients = iter((old, new))
+    config = settings() if transport == "http" else stdio_settings()
+    target = (
+        settings(url="https://unused.invalid/new")
+        if transport == "http"
+        else stdio_settings(args=["changed.py"])
     )
+    manager = MCPManager(config, client_factory=lambda *_: next(clients))
     try:
         tool = (await manager.start())[0]
         candidate = await manager.prepare(manager.config)
         with pytest.raises(MCPPrepareError, match="candidate_pending"):
-            await manager.prepare(settings(url="https://unused.invalid/new"))
+            await manager.prepare(target)
+        assert new.entered == 0
         await manager.discard(candidate)
         assert old.closed == 0 and not (await tool.handler({"q": "丢弃后"}))["is_error"]
         with pytest.raises(MCPPrepareError):
-            await manager.prepare(settings(url="https://unused.invalid/new"))
+            await manager.prepare(target)
         assert new.closed == 1 and old.closed == 0
         assert not (await tool.handler({"q": "候选失败后"}))["is_error"]
     finally:
         await manager.close()
 
 
-async def test_cancelled_catalog_candidate_settles_and_releases_the_next_preparation() -> None:
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_cancelled_catalog_candidate_settles_and_releases_the_next_preparation(
+    transport: str,
+) -> None:
     listing, closing, finish_close = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     class CancelledCandidate(FakeClient):
@@ -67,11 +80,16 @@ async def test_cancelled_catalog_candidate_settles_and_releases_the_next_prepara
 
     old, cancelled, replacement = FakeClient(), CancelledCandidate(), FakeClient(names=["new"])
     clients = iter((old, cancelled, replacement))
-    manager = MCPManager(settings(), client_factory=lambda *_: next(clients))
+    config = settings() if transport == "http" else stdio_settings()
+    manager = MCPManager(config, client_factory=lambda *_: next(clients))
     preparing: asyncio.Task[Any] | None = None
     try:
         tool = (await manager.start())[0]
-        target = settings(url="https://unused.invalid/new")
+        target = (
+            settings(url="https://unused.invalid/new")
+            if transport == "http"
+            else stdio_settings(args=["changed.py"])
+        )
         preparing = asyncio.create_task(manager.prepare(target))
         await asyncio.wait_for(listing.wait(), 2)
         preparing.cancel()
@@ -99,7 +117,10 @@ async def test_cancelled_catalog_candidate_settles_and_releases_the_next_prepara
         await manager.close()
 
 
-async def test_two_admitted_calls_drain_before_close_and_prevent_a_third_client_set() -> None:
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_two_admitted_calls_drain_before_close_and_prevent_a_third_client_set(
+    transport: str,
+) -> None:
     entered = [asyncio.Event(), asyncio.Event()]
     release = [asyncio.Event(), asyncio.Event()]
 
@@ -115,26 +136,38 @@ async def test_two_admitted_calls_drain_before_close_and_prevent_a_third_client_
             )
 
     old, new = Gated(), FakeClient()
-    factory_calls: list[str] = []
+    factory_calls: list[bool] = []
 
     def factory(source: dict[str, Any], _: float) -> FakeClient:
-        factory_calls.append(source["url"])
+        factory_calls.append(True)
         return old if len(factory_calls) == 1 else new
 
-    manager = MCPManager(settings(), client_factory=factory)
+    config = settings() if transport == "http" else stdio_settings()
+    target = (
+        settings(url="https://unused.invalid/new")
+        if transport == "http"
+        else stdio_settings(args=["changed.py"])
+    )
+    third = (
+        settings(url="https://unused.invalid/third")
+        if transport == "http"
+        else stdio_settings(args=["third.py"])
+    )
+    manager = MCPManager(config, client_factory=factory)
     tasks: list[asyncio.Task[Any]] = []
     try:
         tool = (await manager.start())[0]
         tasks = [asyncio.create_task(tool.handler({"index": index})) for index in range(2)]
         async with asyncio.timeout(2):
             await asyncio.gather(*(item.wait() for item in entered))
-        candidate = await manager.prepare(settings(url="https://unused.invalid/new"))
+        candidate = await manager.prepare(target)
         retired = manager.publish(candidate)
         assert manager.draining == 1 and manager.pending_cleanup == 1 and old.closed == 0
         assert (await tool.handler({"index": 0}))["code"] == "generation_changed"
         with pytest.raises(MCPPrepareError, match="generation_draining"):
-            await manager.prepare(settings(url="https://unused.invalid/third"))
+            await manager.prepare(third)
         assert len(factory_calls) == 2
+        assert not (await manager.tools[0].handler({"q": "新代继续服务"}))["is_error"]
         release[0].set()
         await asyncio.wait_for(tasks[0], 2)
         assert old.closed == 0 and manager.draining == 1
@@ -153,7 +186,10 @@ async def test_two_admitted_calls_drain_before_close_and_prevent_a_third_client_
         await manager.close()
 
 
-async def test_delayed_result_keeps_old_secret_redaction_and_old_output_limit() -> None:
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_delayed_result_keeps_old_secret_redaction_and_old_output_limit(
+    transport: str,
+) -> None:
     entered, release = asyncio.Event(), asyncio.Event()
     secret = "old-fixture-secret"
 
@@ -177,21 +213,41 @@ async def test_delayed_result_keeps_old_secret_redaction_and_old_output_limit() 
                 name, arguments, timeout=timeout, raise_on_error=raise_on_error
             )
 
-    old, new = Gated(result=result), FakeClient()
+    new_secret = "new-fixture-secret"
+    old = Gated(result=result)
+    new = FakeClient(
+        result=SimpleNamespace(
+            is_error=False,
+            content=[SimpleNamespace(type="text", text=new_secret)],
+            structured_content=None,
+        )
+    )
+    clients = iter((old, new))
+    config = (
+        settings(headers={"Authorization": f"Bearer {secret}"})
+        if transport == "http"
+        else stdio_settings(env={"TOKEN": secret})
+    )
+    target = (
+        settings(url="https://unused.invalid/new", headers={"Authorization": new_secret})
+        if transport == "http"
+        else stdio_settings(env={"TOKEN": new_secret})
+    )
     manager = MCPManager(
-        settings(headers={"Authorization": f"Bearer {secret}"}),
+        config,
         max_output_chars=512,
-        client_factory=lambda source, _: old if source["url"].endswith("/mcp") else new,
+        client_factory=lambda *_: next(clients),
     )
     task: asyncio.Task[Any] | None = None
     try:
         tool = (await manager.start())[0]
         task = asyncio.create_task(tool.handler({"q": "迟到"}))
         await asyncio.wait_for(entered.wait(), 2)
-        candidate = await manager.prepare(
-            settings(url="https://unused.invalid/new"), limits=MCPLimits(max_output_chars=128)
-        )
+        candidate = await manager.prepare(target, limits=MCPLimits(max_output_chars=128))
         retired = manager.publish(candidate)
+        current = await manager.tools[0].handler({"q": "新代脱敏"})
+        assert current["content"][0]["text"] == "••••"
+        assert len(json.dumps(current, ensure_ascii=False)) <= 128
         release.set()
         value = await asyncio.wait_for(task, 2)
         encoded = json.dumps(value, ensure_ascii=False)
@@ -206,7 +262,8 @@ async def test_delayed_result_keeps_old_secret_redaction_and_old_output_limit() 
         await manager.close()
 
 
-async def test_cancelled_sdk_must_settle_before_retired_connection_closes() -> None:
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_cancelled_sdk_must_settle_before_retired_connection_closes(transport: str) -> None:
     entered, cancelling, settle = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     class Gated(FakeClient):
@@ -223,16 +280,20 @@ async def test_cancelled_sdk_must_settle_before_retired_connection_closes() -> N
                 raise
 
     old, new = Gated(), FakeClient()
-    manager = MCPManager(
-        settings(),
-        client_factory=lambda source, _: old if source["url"].endswith("/mcp") else new,
+    clients = iter((old, new))
+    config = settings() if transport == "http" else stdio_settings()
+    target = (
+        settings(url="https://unused.invalid/new")
+        if transport == "http"
+        else stdio_settings(args=["changed.py"])
     )
+    manager = MCPManager(config, client_factory=lambda *_: next(clients))
     task: asyncio.Task[Any] | None = None
     try:
         tool = (await manager.start())[0]
         task = asyncio.create_task(tool.handler({"q": "取消"}))
         await asyncio.wait_for(entered.wait(), 2)
-        retired = manager.publish(await manager.prepare(settings(url="https://unused.invalid/new")))
+        retired = manager.publish(await manager.prepare(target))
         task.cancel()
         await asyncio.wait_for(cancelling.wait(), 2)
         assert manager.draining == 1 and old.closed == 0

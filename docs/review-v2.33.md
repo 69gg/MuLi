@@ -15,6 +15,8 @@ Linux 托管服务原生整链仍在独立 PR37，不能由这里的成功结果
 Skills-only 保持独立，不撤销 MCP。完整配置、模型/渠道混合修改、维护事务
 和已有 stdio 配置替换保留各自边界，不增加自动重试、安装或跨进程旧连接恢复。
 详见[用户说明](mcp.md)与[设计及旧新合同表](mcp-live-generation-design.md)。
+这里的 stdio 替换边界是 2.33 历史合同；现行同名候选热切换见
+[同名 stdio 设计](superpowers/specs/2026-10-28-mcp-stdio-swap-design.md)。
 
 签名实现 `e8abb2c2cb9af9f5cfacf13aff5739946863e9c0` 整合为 `c9ccd04`。
 真实 Runtime/Team 的旧行为先以 `runtime_busy` 失败；作者随后完成 16 个文件

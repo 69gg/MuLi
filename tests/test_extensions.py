@@ -24,11 +24,19 @@ from muli.skills import SkillLoadError, SkillSnapshot, _secure_read_supported
 from muli.tools.mcp import MCPClient, MCPManager, MCPPrepareError
 
 
-def server(url: str = "old", *, enabled: bool = True) -> dict[str, Any]:
+def server(url: str = "old", *, enabled: bool = True, transport: str = "http") -> dict[str, Any]:
+    if transport == "stdio":
+        return {
+            "enabled": enabled,
+            "transport": "stdio",
+            "command": "python",
+            "args": [f"{url}.py"],
+            "env": {"TOKEN": "env-secret"},
+        }
     return {"enabled": enabled, "url": f"https://example.test/{url}"}
 
 
-def setup_runtime(tmp_path: Path) -> Runtime:
+def setup_runtime(tmp_path: Path, *, transport: str = "http") -> Runtime:
     config = ConfigFile(tmp_path / "config.json")
     config.update(
         {
@@ -39,7 +47,7 @@ def setup_runtime(tmp_path: Path) -> Runtime:
                 "debounce_seconds": 0,
                 "scan_interval_seconds": 0.25,
             },
-            "mcp": {"mcpServers": {"old": server()}},
+            "mcp": {"mcpServers": {"old": server(transport=transport)}},
             "updates": {"check_on_start": False},
         }
     )
@@ -555,19 +563,25 @@ def test_source_swapped_at_open_boundary_is_rejected_without_blocking(
     assert swapped
 
 
-async def test_failed_reload_keeps_config_catalog_and_active_connection(tmp_path: Path) -> None:
-    runtime = setup_runtime(tmp_path)
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_failed_reload_keeps_config_catalog_and_active_connection(
+    tmp_path: Path, transport: str
+) -> None:
+    runtime = setup_runtime(tmp_path, transport=transport)
     old, failed = FakeClient(), FakeClient(failure=True)
+    clients = iter((old, failed))
     runtime.mcp = MCPManager(
         runtime.config.settings.mcp,
-        client_factory=lambda config, timeout: old if config["url"].endswith("/old") else failed,
+        client_factory=lambda *_: next(clients),
     )
     try:
         await runtime.extensions.load_initial()
         generation = runtime.extensions.generation
         original_config = runtime.config.path.read_bytes()
         original_tool = runtime.mcp.tools[0]
-        target = runtime.config.validate_changes({"mcp": {"mcpServers": {"new": server("new")}}})
+        target = runtime.config.validate_changes(
+            {"mcp": {"mcpServers": {"old": server("new", transport=transport)}}}
+        )
         async with runtime.configuration_lock:
             with pytest.raises(ExtensionError, match="server_unavailable"):
                 await runtime.extensions.apply_locked(target, persist=True)
@@ -624,8 +638,9 @@ async def test_durable_busy_owners_allow_pure_extension_publication(
 
 
 @pytest.mark.parametrize("change", ["source", "shutdown"])
+@pytest.mark.parametrize("transport", ["http", "stdio"])
 async def test_changed_sources_or_shutdown_discard_the_prepared_candidate(
-    tmp_path: Path, change: str
+    tmp_path: Path, change: str, transport: str
 ) -> None:
     ready, release = asyncio.Event(), asyncio.Event()
 
@@ -635,17 +650,18 @@ async def test_changed_sources_or_shutdown_discard_the_prepared_candidate(
             await release.wait()
             return await super().list_tools()
 
-    runtime = setup_runtime(tmp_path)
+    runtime = setup_runtime(tmp_path, transport=transport)
     old, new = FakeClient(), GatedList()
+    clients = iter((old, new))
     runtime.mcp = MCPManager(
         runtime.config.settings.mcp,
-        client_factory=lambda config, timeout: old if config["url"].endswith("/old") else new,
+        client_factory=lambda *_: next(clients),
     )
 
     async def reload() -> None:
         async with runtime.configuration_lock:
             target = runtime.config.validate_changes(
-                {"mcp": {"mcpServers": {"new": server("new")}}}
+                {"mcp": {"mcpServers": {"old": server("new", transport=transport)}}}
             )
             await runtime.extensions.apply_locked(target, persist=True)
 
@@ -653,6 +669,8 @@ async def test_changed_sources_or_shutdown_discard_the_prepared_candidate(
     try:
         await runtime.extensions.load_initial()
         generation = runtime.extensions.generation
+        original_config = runtime.config.path.read_bytes()
+        original_tool = runtime.mcp.tools[0]
         operation = asyncio.create_task(reload())
         await asyncio.wait_for(ready.wait(), timeout=2)
         if change == "source":
@@ -664,8 +682,11 @@ async def test_changed_sources_or_shutdown_discard_the_prepared_candidate(
         with pytest.raises(ExtensionError, match=code):
             await operation
         assert runtime.extensions.generation == generation
+        assert runtime.config.path.read_bytes() == original_config
+        assert runtime.tools[original_tool.name] is original_tool
         assert old.closed == 0 and new.closed == 1
         assert set(runtime.config.settings.mcp["mcpServers"]) == {"old"}
+        assert not (await original_tool.handler({"q": "候选丢弃后"}))["is_error"]
     finally:
         release.set()
         if operation is not None:
@@ -673,20 +694,26 @@ async def test_changed_sources_or_shutdown_discard_the_prepared_candidate(
         await runtime.close()
 
 
+@pytest.mark.parametrize("transport", ["http", "stdio"])
 async def test_config_save_failure_discards_candidate_without_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transport: str
 ) -> None:
-    runtime = setup_runtime(tmp_path)
+    runtime = setup_runtime(tmp_path, transport=transport)
     old, new = FakeClient(), FakeClient(names=["new"])
+    clients = iter((old, new))
     runtime.mcp = MCPManager(
         runtime.config.settings.mcp,
-        client_factory=lambda config, timeout: old if config["url"].endswith("/old") else new,
+        client_factory=lambda *_: next(clients),
     )
     try:
         await runtime.extensions.load_initial()
         generation = runtime.extensions.generation
         before = runtime.config.settings
-        target = runtime.config.validate_changes({"mcp": {"mcpServers": {"new": server("new")}}})
+        original_config = runtime.config.path.read_bytes()
+        original_tool = runtime.mcp.tools[0]
+        target = runtime.config.validate_changes(
+            {"mcp": {"mcpServers": {"old": server("new", transport=transport)}}}
+        )
 
         def fail_save(settings: Settings) -> Settings:
             raise OSError("private-fixture-value")
@@ -696,8 +723,11 @@ async def test_config_save_failure_discards_candidate_without_publication(
             with pytest.raises(ExtensionError, match="config_save_failed"):
                 await runtime.extensions.apply_locked(target, persist=True)
         assert runtime.config.settings is before
+        assert runtime.config.path.read_bytes() == original_config
         assert runtime.extensions.generation == generation
+        assert runtime.tools[original_tool.name] is original_tool
         assert old.closed == 0 and new.closed == 1
+        assert not (await original_tool.handler({"q": "保存失败后"}))["is_error"]
         assert runtime.extensions.status()["last_apply"] == {
             "configuration": "save_failed",
             "published": False,
@@ -708,25 +738,27 @@ async def test_config_save_failure_discards_candidate_without_publication(
         await runtime.close()
 
 
+@pytest.mark.parametrize("transport", ["http", "stdio"])
 async def test_candidate_total_deadline_does_not_retry_or_close_old_connection(
-    tmp_path: Path,
+    tmp_path: Path, transport: str
 ) -> None:
     class WaitingClient(FakeClient):
         async def list_tools(self) -> list[Any]:
             await asyncio.Event().wait()
             return []
 
-    runtime = setup_runtime(tmp_path)
+    runtime = setup_runtime(tmp_path, transport=transport)
     old, waiting = FakeClient(), WaitingClient()
+    clients = iter((old, waiting))
     runtime.mcp = MCPManager(
         runtime.config.settings.mcp,
-        client_factory=lambda config, timeout: old if config["url"].endswith("/old") else waiting,
+        client_factory=lambda *_: next(clients),
     )
     try:
         await runtime.extensions.load_initial()
         target = runtime.config.validate_changes(
             {
-                "mcp": {"mcpServers": {"new": server("new")}},
+                "mcp": {"mcpServers": {"old": server("new", transport=transport)}},
                 "extensions": {"candidate_timeout_seconds": 0.05},
             }
         )
@@ -739,10 +771,13 @@ async def test_candidate_total_deadline_does_not_retry_or_close_old_connection(
         await runtime.close()
 
 
+@pytest.mark.parametrize("transport", ["http", "stdio"])
 async def test_reload_publishes_while_busy_but_waits_for_the_configuration_lock(
-    tmp_path: Path,
+    tmp_path: Path, transport: str
 ) -> None:
     runtime = setup_runtime(tmp_path)
+    runtime.config.update({"mcp": {"mcpServers": {}}})
+    fragment(tmp_path, "current.json", {"mcpServers": {"old": server(transport=transport)}})
     clients: list[FakeClient] = []
 
     def factory(config: dict[str, Any], timeout: float) -> MCPClient:
@@ -763,7 +798,13 @@ async def test_reload_publishes_while_busy_but_waits_for_the_configuration_lock(
     try:
         await runtime.extensions.load_initial()
         generation = runtime.extensions.generation
-        fragment(tmp_path, "new.json", {"mcpServers": {"new": server("new")}})
+        original_config = runtime.config.path.read_bytes()
+        original_tool = runtime.mcp.tools[0]
+        fragment(
+            tmp_path,
+            "current.json",
+            {"mcpServers": {"old": server("new", transport=transport)}},
+        )
         async with runtime.configuration_lock:
             runtime.extensions.start()
             runtime.extensions.request_reload()
@@ -774,9 +815,15 @@ async def test_reload_publishes_while_busy_but_waits_for_the_configuration_lock(
             while runtime.extensions.generation == generation:
                 await asyncio.sleep(0.01)
         assert len(clients) == 2
-        assert clients[0].closed == 0
+        async with asyncio.timeout(2):
+            while runtime.mcp.pending_cleanup:
+                await asyncio.sleep(0)
+        assert clients[0].closed == 1 and clients[1].closed == 0
         assert not work.done() and runtime.busy
-        assert {item["name"] for item in runtime.mcp.status()} == {"old", "new"}
+        assert {item["name"] for item in runtime.mcp.status()} == {"old"}
+        assert runtime.config.path.read_bytes() == original_config
+        assert (await original_tool.handler({"q": "旧目录"}))["code"] == "generation_changed"
+        assert not (await runtime.mcp.tools[0].handler({"q": "新目录"}))["is_error"]
     finally:
         release.set()
         await work

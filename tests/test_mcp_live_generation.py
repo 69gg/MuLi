@@ -34,8 +34,11 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-async def host(tmp_path: Path) -> AsyncIterator[tuple[Runtime, FakeClient, FakeClient]]:
-    runtime = setup_runtime(tmp_path)
+async def host(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> AsyncIterator[tuple[Runtime, FakeClient, FakeClient]]:
+    transport = getattr(request, "param", "http")
+    runtime = setup_runtime(tmp_path, transport=transport)
     runtime.config.update(
         {
             "compaction": {"enabled": False},
@@ -43,9 +46,10 @@ async def host(tmp_path: Path) -> AsyncIterator[tuple[Runtime, FakeClient, FakeC
         }
     )
     old, new = FakeClient(names=["before"]), FakeClient(names=["after"])
+    clients = iter((old, new))
     runtime.mcp = MCPManager(
         runtime.config.settings.mcp,
-        client_factory=lambda source, _: old if source["url"].endswith("/old") else new,
+        client_factory=lambda *_: next(clients),
     )
     try:
         await runtime.extensions.load_initial()
@@ -56,7 +60,8 @@ async def host(tmp_path: Path) -> AsyncIterator[tuple[Runtime, FakeClient, FakeC
 
 async def publish(runtime: Runtime, *, remove: bool = False) -> None:
     target = runtime.config.settings.model_copy(deep=True)
-    target.mcp = {"mcpServers": {} if remove else {"old": server("new")}}
+    transport = target.mcp["mcpServers"]["old"].get("transport", "http")
+    target.mcp = {"mcpServers": {} if remove else {"old": server("new", transport=transport)}}
     async with runtime.configuration_lock:
         await runtime.extensions.apply_locked(target, persist=True)
 
@@ -137,6 +142,7 @@ async def test_running_team_uses_new_generation_after_its_old_model_batch(
 
 
 @pytest.mark.parametrize("remove", [False, True], ids=["replace", "delete"])
+@pytest.mark.parametrize("host", ["http", "stdio"], indirect=True)
 async def test_approval_does_not_authorize_an_endpoint_revoked_while_waiting(
     host: tuple[Runtime, FakeClient, FakeClient], remove: bool
 ) -> None:
@@ -165,6 +171,7 @@ async def test_approval_does_not_authorize_an_endpoint_revoked_while_waiting(
     assert old.calls == new.calls == []
 
 
+@pytest.mark.parametrize("host", ["http", "stdio"], indirect=True)
 async def test_only_the_admitted_first_call_of_an_old_batch_finishes(
     host: tuple[Runtime, FakeClient, FakeClient], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -202,11 +209,13 @@ async def test_only_the_admitted_first_call_of_an_old_batch_finishes(
         await publish(runtime)
         assert runtime.mcp.draining == 1 and old.closed == 0
         current = runtime.config.path.read_bytes()
+        transport = runtime.mcp.status()[0]["transport"]
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://localhost"
         ) as api:
             response = await api.patch(
-                "/api/settings", json={"mcp": {"mcpServers": {"old": server("third")}}}
+                "/api/settings",
+                json={"mcp": {"mcpServers": {"old": server("third", transport=transport)}}},
             )
         assert response.status_code == 409 and response.json()["detail"] == "generation_draining"
         assert runtime.config.path.read_bytes() == current
@@ -435,6 +444,7 @@ async def test_failed_configuration_save_keeps_the_old_handler_authorized(
     assert not (await tool.handler({"q": "仍是原代"}))["is_error"]
 
 
+@pytest.mark.parametrize("host", ["http", "stdio"], indirect=True)
 async def test_self_configure_publishes_a_pure_extension_plan_during_its_own_run(
     host: tuple[Runtime, FakeClient, FakeClient],
 ) -> None:
@@ -442,7 +452,8 @@ async def test_self_configure_publishes_a_pure_extension_plan_during_its_own_run
     app = create_app(runtime.config, runtime=runtime)
     manager: SelfManagement = app.state.management
     entered, release = asyncio.Event(), asyncio.Event()
-    changes = {"mcp": {"mcpServers": {"old": server("new")}}}
+    transport = runtime.mcp.status()[0]["transport"]
+    changes = {"mcp": {"mcpServers": {"old": server("new", transport=transport)}}}
 
     class Client(FakeModel):
         async def stream(
@@ -489,10 +500,12 @@ async def test_self_configure_publishes_a_pure_extension_plan_during_its_own_run
         await manager.close()
 
 
+@pytest.mark.parametrize("host", ["http", "stdio"], indirect=True)
 async def test_settings_api_can_publish_extensions_but_keeps_mixed_configuration_idle_gate(
     host: tuple[Runtime, FakeClient, FakeClient],
 ) -> None:
     runtime, _, new = host
+    transport = runtime.mcp.status()[0]["transport"]
     app = create_app(runtime.config, runtime=runtime)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -520,7 +533,8 @@ async def test_settings_api_can_publish_extensions_but_keeps_mixed_configuration
             )
             assert response.status_code == 409 and new.entered == 0
             response = await api.patch(
-                "/api/settings", json={"mcp": {"mcpServers": {"old": server("new")}}}
+                "/api/settings",
+                json={"mcp": {"mcpServers": {"old": server("new", transport=transport)}}},
             )
             assert response.status_code == 200 and new.entered == 1 and runtime.busy
         release.set()
