@@ -20,7 +20,8 @@ def facade(*, output_chars: int = 24000) -> Computer:
                 "computer": {"enabled": True, "backend": "atspi", "max_nodes": 10},
                 "limits": {"max_output_chars": output_chars},
             }
-        )
+        ),
+        owner=lambda: ("computer-integration-tests", "run-1"),
     )
 
 
@@ -29,6 +30,7 @@ def install_runner(monkeypatch: pytest.MonkeyPatch, desktop: FakeNode) -> list[d
     requests: list[dict[str, Any]] = []
 
     async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        kwargs["input_guard"]()
         request = json.loads(kwargs["input_text"])
         requests.append(request)
         response = atspi_helper.main(request)
@@ -120,6 +122,7 @@ async def test_truncated_native_omission_details_never_become_exact_public_total
     computer = facade()
 
     async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        kwargs["input_guard"]()
         return {
             "exit_code": 0,
             "output": json.dumps(
@@ -155,10 +158,10 @@ async def test_new_discovery_cancelled_while_snapshot_runs_prevents_old_target_p
     original_call = computer.call
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def paused_call(request: dict[str, Any]) -> dict[str, Any]:
+    async def paused_call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         entered.set()
         await release.wait()
-        return await original_call(request)
+        return await original_call(request, **kwargs)
 
     monkeypatch.setattr(computer, "call", paused_call)
     reading = asyncio.create_task(computer.snapshot({"target_id": identifier}))

@@ -7,7 +7,7 @@ import math
 import os
 import signal
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -135,6 +135,7 @@ async def run_process(
     limit: int = 24000,
     input_text: str | None = None,
     input_bytes: bytes | None = None,
+    input_guard: Callable[[], None] | None = None,
     merge_stderr: bool = True,
     strict_output: bool = False,
     env: dict[str, str] | None = None,
@@ -180,6 +181,8 @@ async def run_process(
         async def write_input() -> None:
             if process.stdin is not None:
                 data = input_bytes if input_bytes is not None else (input_text or "").encode()
+                if input_guard is not None:
+                    input_guard()
                 process.stdin.write(data)
                 await process.stdin.drain()
                 process.stdin.close()
