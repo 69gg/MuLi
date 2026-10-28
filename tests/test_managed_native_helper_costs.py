@@ -73,14 +73,31 @@ async def test_generated_hook_measures_the_actual_runpy_main_host_record(
 
 
 @pytest.mark.parametrize(
-    "binding_case", ["missing", "existing", "superseded", "wrong_origin", "error", "cancelled"]
+    "binding_case",
+    [
+        "missing",
+        "existing",
+        "superseded",
+        "wrong_origin",
+        "replaced_main",
+        "replaced_entry",
+        "error",
+        "cancelled",
+    ],
 )
 async def test_unbound_main_observer_never_exports_zero_host_cost_or_changes_main(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fixture: tuple[Any, Any],
     binding_case: Literal[
-        "missing", "existing", "superseded", "wrong_origin", "error", "cancelled"
+        "missing",
+        "existing",
+        "superseded",
+        "wrong_origin",
+        "replaced_main",
+        "replaced_entry",
+        "error",
+        "cancelled",
     ],
 ) -> None:
     await _exercise_generated_hook(
@@ -96,7 +113,16 @@ async def _exercise_generated_hook(
     *,
     host_failure: BaseException | None = None,
     through_main: bool = False,
-    binding_case: Literal["missing", "existing", "superseded", "wrong_origin", "error", "cancelled"]
+    binding_case: Literal[
+        "missing",
+        "existing",
+        "superseded",
+        "wrong_origin",
+        "replaced_main",
+        "replaced_entry",
+        "error",
+        "cancelled",
+    ]
     | None = None,
 ) -> None:
     native, _ = fixture
@@ -186,6 +212,16 @@ async def _exercise_generated_hook(
                         managed_host,
                         "__spec__",
                         ModuleSpec(spec.name, spec.loader, origin="<foreign-host-source>"),
+                    )
+                if binding_case in {"replaced_main", "replaced_entry"}:
+
+                    def replaced(*args: Any, **kwargs: Any) -> None:
+                        raise AssertionError("canonical replacement must never be invoked")
+
+                    monkeypatch.setattr(
+                        managed_host,
+                        "main" if binding_case == "replaced_main" else "_entry",
+                        replaced,
                     )
                 diagnostic_failures: list[BaseException] = []
                 if binding_case in {"error", "cancelled"}:
@@ -334,6 +370,7 @@ async def _exercise_generated_hook(
                 if binding_case is not None:
                     assert not path.exists(), "未绑定真实main时不得发布observed零成本"
                     assert not (root / "helper-costs-checkpoint.json").exists()
+                    assert not (root / "helper-entry-checkpoint.json").exists()
                     assert sys.getprofile() is (
                         foreign_profile
                         if binding_case in {"existing", "superseded"}
@@ -345,6 +382,13 @@ async def _exercise_generated_hook(
                         assert diagnostic_failures == []
                     return
                 facts = json.loads(path.read_text(encoding="utf-8"))
+                entry_path = root / "helper-entry-checkpoint.json"
+                if through_main:
+                    assert worker.read_json(entry_path)["boundary"] == "main_entered"
+                else:
+                    assert not entry_path.exists(), (
+                        "canonical-only calls cannot establish main entry"
+                    )
                 assert "private exception body" not in path.read_text(encoding="utf-8")
                 if include_host_record:
                     assert "host_record" in facts, (

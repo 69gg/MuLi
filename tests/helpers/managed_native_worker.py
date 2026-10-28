@@ -20,7 +20,7 @@ from contextlib import closing
 from functools import wraps
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from types import FrameType, FunctionType, ModuleType
+from types import CodeType, FrameType, FunctionType, MethodType, ModuleType
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast, get_args
 
 if TYPE_CHECKING:
@@ -50,6 +50,24 @@ HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
 HELPER_START_BOUNDARIES = ("start_entered", "start_command_entered", "start_command_returned")
+HELPER_ENTRY_BOUNDARIES = (
+    "main_entered",
+    "entry_dispatch",
+    "entry_returned",
+    "initial_record_dispatch",
+    "initial_record_returned",
+    "verify_record_dispatch",
+    "verify_record_returned",
+    "verify_process_dispatch",
+    "verify_process_returned",
+    "read_helper_dispatch",
+    "read_helper_returned",
+    "after_record_dispatch",
+    "after_record_returned",
+    "after_process_dispatch",
+    "after_process_returned",
+    "step_dispatch",
+)
 HELPER_START_MODES = (
     ("activating", "start_target", "target"),
     ("rolling_back", "start_base", "base"),
@@ -3308,6 +3326,67 @@ def helper_start_sample_facts(value: object, source: object) -> bool:
     )
 
 
+def helper_entry_checkpoint_facts(
+    value: object,
+    source: object,
+    *,
+    validate_diagnostic: Callable[[object], object] | None = None,
+) -> bool:
+    """A fixed progress file is evidence only after independent source authentication."""
+    identity = {"generation", "helper", "uid", "pid", "invocation"}
+    fields = identity | {"version", "revision", "boundary", "monotonic_ns", "outcome"}
+    if (
+        not isinstance(value, dict)
+        or not isinstance(source, dict)
+        or set(source) != identity
+        or set(value) not in (fields, fields | {"diagnostic"})
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or any(
+            type(value[key]) is not type(source[key]) or value[key] != source[key]
+            for key in identity
+        )
+        or type(value["revision"]) is not int
+        or not 1 <= value["revision"] <= 2**63 - 1
+        or type(value["monotonic_ns"]) is not int
+        or not 0 <= value["monotonic_ns"] <= 2**63 - 1
+        or value["boundary"] not in HELPER_ENTRY_BOUNDARIES
+        or value["outcome"] not in ("progress", "failed", "cancelled")
+    ):
+        return False
+    return "diagnostic" not in value or (
+        value["outcome"] != "progress"
+        and validate_diagnostic is not None
+        and validate_diagnostic(value["diagnostic"]) is not None
+    )
+
+
+def helper_source_observation_facts(value: object, source: object) -> bool:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"source", "kind", "started_ns", "observed_ns", "case_deadline_ns", "elapsed_ms"}
+        or value["kind"] != "failure_collection"
+        or not isinstance(source, dict)
+        or not isinstance(value["source"], dict)
+        or value["source"] != source
+        or any(type(value["source"][key]) is not type(item) for key, item in source.items())
+        or any(
+            type(value[key]) is not int or not 0 <= value[key] <= 2**63 - 1
+            for key in ("started_ns", "observed_ns", "case_deadline_ns", "elapsed_ms")
+        )
+    ):
+        return False
+    return (
+        value["started_ns"] <= value["observed_ns"]
+        and value["started_ns"]
+        < value["case_deadline_ns"]
+        <= value["started_ns"] + CASE_SECONDS * 10**9
+        and value["elapsed_ms"] == (value["observed_ns"] - value["started_ns"]) // 10**6
+        and value["elapsed_ms"] <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 1000
+    )
+
+
 def unit_files() -> ModuleType:
     """Load only the fixture's fixed sibling, without changing import paths."""
     if __package__:
@@ -3560,14 +3639,16 @@ def install_helper_cost_hook() -> None:
                     and isinstance(main, FunctionType)
                     and main.__globals__ is namespace
                     and main.__code__ is frame.f_code
+                    and main.__code__ == managed_host.main.__code__
                     and isinstance(original, FunctionType)
                     and original.__globals__ is namespace
                     and original.__code__.co_filename == host_origin
-                    and original.__code__.co_name == "_record",
+                    and original.__code__.co_name == "_record"
+                    and original.__code__ == managed_host._record.__code__,
                     "native_profile_main_unconfirmed",
                 )
-                namespace["_record"] = observe_record(cast("HostRecordReader", original))
                 host_bound = True
+                bind_entry(namespace, cast("HostRecordReader", original))
             except BaseException:
                 reached_main = True
                 usable = False  # A failed observer cannot prevent main from running.
@@ -3593,7 +3674,7 @@ def install_helper_cost_hook() -> None:
             finally:
                 finish("http", started)
 
-        def publish(path: Path, value: dict[str, Any]) -> None:
+        def publish(path: Path, value: dict[str, Any], *, durable: bool = True) -> None:
             data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
             require(len(data) <= MAX_BYTES, "native_metadata_budget")
             temporary = path.with_suffix(".tmp")
@@ -3605,13 +3686,268 @@ def install_helper_cost_hook() -> None:
             with os.fdopen(descriptor, "wb") as output:
                 output.write(data)
                 output.flush()
-                os.fsync(output.fileno())
+                if durable:
+                    os.fsync(output.fileno())
             temporary.replace(path)
-            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            if durable:
+                directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+
+        def bind_entry(namespace: dict[str, Any], original_record: HostRecordReader) -> None:
+            """Bind only this main's calls; never inspect coroutine/frame locals."""
+            original_entry = namespace.get("_entry")
+            run_function = namespace.get("run_managed_helper")
+            original_process = namespace.get("verify_current_process")
+            original_probe = namespace.get("ManagedSystemdProbe")
+            original_loop = namespace.get("drive_loop")
+            driver_class = managed_host.ManagedTransactionController
+            driver_step = driver_class.step
+            for name, function in (
+                ("_entry", original_entry),
+                ("run_managed_helper", run_function),
+            ):
+                canonical = getattr(managed_host, name)
+                require(
+                    isinstance(function, FunctionType)
+                    and function.__globals__ is namespace
+                    and function.__code__.co_filename == host_origin
+                    and function.__code__ == canonical.__code__,
+                    "native_profile_main_unconfirmed",
+                )
+            require(
+                original_process is managed_host.verify_current_process
+                and original_probe is managed_host.ManagedSystemdProbe
+                and original_loop is managed_host.drive_loop,
+                "native_profile_main_unconfirmed",
+            )
+            assert isinstance(run_function, FunctionType)
+            verify_codes = [
+                item
+                for item in run_function.__code__.co_consts
+                if isinstance(item, CodeType) and item.co_name == "verify_helper"
+            ]
+            require(len(verify_codes) == 1, "native_profile_main_unconfirmed")
+            verify_code = verify_codes[0]
+            entry_task: asyncio.Task[Any] | None = None
+            entry_value: Any = None
+            entry_control: JournalControl | None = None
+            entry_controller: SlotIdentity | None = None
+            record_calls = 0
+            boundary = "main_entered"
+            failed, step_seen = False, False
+            read_record = observe_record(original_record)
+
+            def checkpoint(kind: str, error: BaseException | None = None) -> None:
+                nonlocal boundary, failed
+                try:
+                    if failed:
+                        return
+                    if error is None and HELPER_ENTRY_BOUNDARIES.index(
+                        kind
+                    ) < HELPER_ENTRY_BOUNDARIES.index(boundary):
+                        return
+                    boundary = kind
+                    value: dict[str, Any] = {
+                        "version": 1,
+                        **{
+                            key: facts[key]
+                            for key in ("generation", "helper", "uid", "pid", "invocation")
+                        },
+                        "revision": record.revision,
+                        "boundary": kind,
+                        "monotonic_ns": time.monotonic_ns(),
+                        "outcome": "progress",
+                    }
+                    if error is not None:
+                        failed = True
+                        value["outcome"] = (
+                            "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+                        )
+                        from muli.failure_diagnostics import (
+                            capture_failure,
+                            validate_failure_diagnostic,
+                        )
+
+                        diagnostic = capture_failure(error)
+                        if validate_failure_diagnostic(diagnostic) is not None:
+                            value["diagnostic"] = diagnostic
+                    publish(root / "helper-entry-checkpoint.json", value, durable=False)
+                except BaseException:
+                    pass  # Even an interrupted observer must preserve the original call/error.
+
+            def same_task() -> bool:
+                try:
+                    return entry_task is not None and asyncio.current_task() is entry_task
+                except RuntimeError:
+                    return False
+
+            def caller_is(frame: FrameType, code: CodeType) -> bool:
+                return frame.f_globals is namespace and frame.f_code is code
+
+            @wraps(original_entry)
+            def entry(path: Path) -> Any:
+                nonlocal entry_task, entry_value
+                scoped = False
+                try:
+                    scoped = (
+                        entry_task is None
+                        and path == journal_root
+                        and caller_is(sys._getframe(1), run_function.__code__)
+                    )
+                    if scoped:
+                        entry_task = asyncio.current_task()
+                        scoped = entry_task is not None
+                except Exception:
+                    pass
+                if scoped:
+                    checkpoint("entry_dispatch")
+                try:
+                    value = original_entry(path)
+                except BaseException as error:
+                    if scoped:
+                        checkpoint("entry_dispatch", error)
+                    raise
+                if scoped:
+                    entry_value = (
+                        value  # Diagnostic object identity, never an authentication cache.
+                    )
+                    checkpoint("entry_returned")
+                return value
+
+            @wraps(original_record)
+            def host_record(
+                control: JournalControl, anchor: DeploymentAnchor
+            ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+                nonlocal record_calls, entry_control, entry_controller
+                kind: str | None = None
+                caller = sys._getframe(1)
+                if (
+                    same_task()
+                    and entry_value is not None
+                    and anchor is entry_value.anchor
+                    and not failed
+                ):
+                    if record_calls == 0 and caller_is(caller, run_function.__code__):
+                        entry_control = control
+                        kind = "initial_record"
+                    elif (
+                        control is entry_control
+                        and record_calls == 1
+                        and caller_is(caller, verify_code)
+                    ):
+                        kind = "verify_record"
+                    elif (
+                        control is entry_control
+                        and record_calls == 2
+                        and boundary == "read_helper_returned"
+                        and caller_is(caller, verify_code)
+                    ):
+                        kind = "after_record"
+                if kind is not None:
+                    record_calls += 1
+                    checkpoint(kind + "_dispatch")
+                try:
+                    value = read_record(control, anchor)
+                except BaseException as error:
+                    if kind is not None:
+                        checkpoint(kind + "_dispatch", error)
+                    raise
+                if kind is not None:
+                    if kind == "initial_record":
+                        entry_controller = value[1]
+                    checkpoint(kind + "_returned")
+                return value
+
+            @wraps(original_process)
+            def process(controller: SlotIdentity) -> None:
+                kind: str | None = None
+                if (
+                    same_task()
+                    and controller is entry_controller
+                    and caller_is(sys._getframe(1), verify_code)
+                ):
+                    if boundary == "verify_record_returned":
+                        kind = "verify_process"
+                    elif boundary == "after_record_returned":
+                        kind = "after_process"
+                if kind is not None:
+                    checkpoint(kind + "_dispatch")
+                try:
+                    original_process(controller)
+                except BaseException as error:
+                    if kind is not None:
+                        checkpoint(kind + "_dispatch", error)
+                    raise
+                if kind is not None:
+                    checkpoint(kind + "_returned")
+
+            @wraps(original_probe)
+            def probe(*args: Any, **kwargs: Any) -> Any:
+                observed = original_probe(*args, **kwargs)
+                if not same_task() or not caller_is(sys._getframe(1), run_function.__code__):
+                    return observed
+                original_read = observed.read_helper
+
+                @wraps(original_read)
+                async def read(*read_args: Any, **read_kwargs: Any) -> Any:
+                    scoped = (
+                        same_task()
+                        and boundary == "verify_process_returned"
+                        and caller_is(sys._getframe(1), verify_code)
+                    )
+                    if scoped:
+                        checkpoint("read_helper_dispatch")
+                    try:
+                        value = await original_read(*read_args, **read_kwargs)
+                    except BaseException as error:
+                        if scoped:
+                            checkpoint("read_helper_dispatch", error)
+                        raise
+                    if scoped:
+                        checkpoint("read_helper_returned")
+                    return value
+
+                observed.read_helper = read
+                return observed
+
+            @wraps(original_loop)
+            async def drive_loop(*args: Any, **kwargs: Any) -> Any:
+                original_step = args[0] if args else None
+                scoped = (
+                    same_task()
+                    and boundary == "after_process_returned"
+                    and isinstance(original_step, MethodType)
+                    and isinstance(original_step.__self__, driver_class)
+                    and original_step.__func__ is driver_step
+                )
+                if not scoped:
+                    return await original_loop(*args, **kwargs)
+
+                @wraps(original_step)
+                async def step(*step_args: Any, **step_kwargs: Any) -> Any:
+                    nonlocal step_seen
+                    first = same_task() and not step_seen
+                    if first:
+                        step_seen = True
+                        checkpoint("step_dispatch")
+                    try:
+                        return await original_step(*step_args, **step_kwargs)
+                    except BaseException as error:
+                        if first:
+                            checkpoint("step_dispatch", error)
+                        raise
+
+                return await original_loop(step, *args[1:], **kwargs)
+
+            namespace["_entry"] = entry
+            namespace["_record"] = host_record
+            namespace["verify_current_process"] = process
+            namespace["ManagedSystemdProbe"] = probe
+            namespace["drive_loop"] = drive_loop
+            checkpoint("main_entered")
 
         def snapshot() -> dict[str, Any]:
             require(usable and host_bound, "native_profile_invalid")
@@ -3855,6 +4191,18 @@ def _read_helper_cost_json(path: Path, *, deadline: float | None) -> Any:
     return value
 
 
+def discard_helper_source_samples(resources: dict[str, Any], source: object) -> None:
+    """Withdraw optional samples whose source observation cannot be exported."""
+    if not isinstance(source, dict):
+        return
+    for name in ("helper_start_samples", "helper_cost_samples"):
+        samples = [row for row in resources.get(name, []) if row.get("source") != source]
+        if samples:
+            resources[name] = samples
+        else:
+            resources.pop(name, None)
+
+
 def collect_helper_costs(
     root: Path,
     result: dict[str, Any],
@@ -3892,6 +4240,8 @@ def collect_helper_costs(
             retained.append({"source": dict(source), "costs": facts})
         return  # Optional diagnostics cannot occupy later transaction-note space.
     # New optional starts may never displace already accepted cost/cleanup facts.
+    previous_entry = result["resources"].pop("helper_entry_checkpoint", None)
+    previous_observation = result["resources"].pop("helper_source_observation", None)
     previous_starts = result["resources"].pop("helper_start_samples", [])
     result["resources"]["helper_costs"] = facts
     if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
@@ -3952,6 +4302,30 @@ def collect_helper_costs(
             break
         starts.append(row)
         result["resources"]["helper_start_samples"] = list(starts)
+    # Failure-entry facts are last: they cannot evict accepted costs or cleanup.
+    for name, item in (
+        ("helper_source_observation", previous_observation),
+        ("helper_entry_checkpoint", previous_entry),
+    ):
+        if item is None or (
+            name == "helper_entry_checkpoint"
+            and "helper_source_observation" not in result["resources"]
+        ):
+            continue
+        candidate = {**result, "resources": {**result["resources"], name: item}}
+        if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
+            result["resources"][name] = item
+        elif name == "helper_source_observation":
+            # Do not leave a newly adopted source looking like a pre-deadline proof.
+            discard_helper_source_samples(result["resources"], item["source"])
+            result["resources"].pop("helper_source", None)
+            result["resources"].pop("controller_failure", None)
+            costs = result["resources"].get("helper_costs")
+            if isinstance(costs, dict) and costs.get("code") == "observed":
+                result["resources"]["helper_costs"] = {
+                    "code": "not_observed",
+                    "reason": "output_budget",
+                }
 
 
 def install_hook() -> None:
@@ -4027,6 +4401,7 @@ class Case:
         self._helper_cost_history: list[dict[str, Any]] = []
         self._helper_cost_samples: list[dict[str, Any]] = []
         self._helper_start_samples: list[dict[str, Any]] = []
+        self._failure_helper_attempted = False
         self.result: dict[str, Any] = {
             "completed": False,
             "stage": self.stage,
@@ -4220,20 +4595,181 @@ class Case:
             pass  # Missing partial facts never change the transaction or its result.
 
     def _discard_helper_start_samples(self, generation: str) -> None:
-        self._helper_start_samples[:] = [
-            row for row in self._helper_start_samples if row["source"]["generation"] != generation
-        ]
+        for rows in (self._helper_start_samples, self._helper_cost_samples):
+            rows[:] = [row for row in rows if row["source"]["generation"] != generation]
         resources = self.result["resources"]
-        if "helper_start_samples" in resources:
+        for name in ("helper_start_samples", "helper_cost_samples"):
             rows = [
-                row
-                for row in resources["helper_start_samples"]
-                if row["source"]["generation"] != generation
+                row for row in resources.get(name, []) if row["source"]["generation"] != generation
             ]
             if rows:
-                resources["helper_start_samples"] = rows
+                resources[name] = rows
             else:
-                resources.pop("helper_start_samples")
+                resources.pop(name, None)
+        for name in ("helper_entry_checkpoint", "helper_source_observation"):
+            current = resources.get(name)
+            if isinstance(current, dict) and (
+                current.get("generation") == generation
+                or isinstance(current.get("source"), dict)
+                and current["source"].get("generation") == generation
+            ):
+                resources.pop(name)
+
+    async def _collect_failure_helper_source(self, *, deadline: float) -> None:
+        """One fresh pending-helper proof, solely inside the original failure window."""
+        if self._failure_helper_attempted or self.result["completed"] or not self.result["code"]:
+            return
+        self._failure_helper_attempted = True  # A failed attempt is never retried.
+        from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
+        from muli.platforms.linux_transaction import ProbeLimits, SystemdProbe
+
+        async with asyncio.timeout(remaining(deadline)):
+            with self.journal() as journal:
+                record = self.record(journal)
+                history = self.result["generations"]
+                if (
+                    not history
+                    or record.resolved
+                    or record.generation in self._invalid_helper_sources
+                    or history[-1]
+                    != {
+                        "deployment": record.identity.deployment,
+                        "generation": record.generation,
+                        "helper": managed_helper_unit_name(record),
+                    }
+                ):
+                    return
+                anchor, controller, _ = self.deployment(journal, record)
+                name = managed_helper_unit_name(record)
+                argv = managed_helper_arguments(anchor, controller)
+                probe = SystemdProbe(
+                    limits=ProbeLimits(
+                        seconds=min(HTTP_SECONDS, remaining(deadline)),
+                        command_bytes=MAX_BYTES,
+                        file_bytes=MAX_BYTES,
+                    )
+                )
+                snapshot = await probe.read_helper(name, argv, anchor.helper)
+                after = self.record(journal)
+                remaining(deadline)
+                require(
+                    after.generation == record.generation
+                    and after.identity.deployment == record.identity.deployment
+                    and after.revision >= record.revision
+                    and not after.resolved
+                    and managed_helper_unit_name(after) == name,
+                    "native_generation_changed",
+                )
+                unit, process = snapshot.unit, snapshot.process
+                require(
+                    unit.name == name
+                    and unit.argv == argv
+                    and unit.pid == process.pid
+                    and process.uid == os.geteuid()
+                    and unit.cgroup == process.cgroup
+                    and f"user@{os.geteuid()}.service" in Path(unit.cgroup).parts
+                    and 0 < unit.pid < 2**31
+                    and re.fullmatch(r"[a-f0-9]{32}", unit.invocation) is not None
+                    and unit.invocation != "0" * 32,
+                    "native_helper_identity",
+                )
+                source = {
+                    "generation": record.generation,
+                    "helper": name,
+                    "uid": process.uid,
+                    "pid": process.pid,
+                    "invocation": unit.invocation,
+                }
+                resources = self.result["resources"]
+                previous = resources.get("helper_source")
+                if (
+                    isinstance(previous, dict)
+                    and previous["generation"] == record.generation
+                    and (
+                        previous != source
+                        or self._helper_source_groups.get(record.generation, unit.cgroup)
+                        != unit.cgroup
+                    )
+                ):
+                    self._invalid_helper_sources.add(record.generation)
+                    self._discard_helper_start_samples(record.generation)
+                    resources.pop("helper_source", None)
+                    return
+                observed = time.monotonic_ns()
+                started = int(self.start * 10**9)
+                observation = {
+                    "source": dict(source),
+                    "kind": "failure_collection",
+                    "started_ns": started,
+                    "observed_ns": observed,
+                    "case_deadline_ns": started + int((self.deadline - self.start) * 10**9),
+                    "elapsed_ms": (observed - started) // 10**6,
+                }
+                require(
+                    helper_source_observation_facts(observation, source), "native_profile_invalid"
+                )
+                resources.pop("helper_entry_checkpoint", None)
+                if previous != source:
+                    resources.pop("helper_costs", None)
+                    resources.pop("controller_failure", None)
+                for rows in (self._helper_start_samples, self._helper_cost_samples):
+                    rows[:] = [
+                        row
+                        for row in rows
+                        if row["source"]["generation"] != record.generation
+                        or row["source"] == source
+                    ]
+                for key in ("helper_start_samples", "helper_cost_samples"):
+                    rows = resources.get(key)
+                    if isinstance(rows, list):
+                        kept = [
+                            row
+                            for row in rows
+                            if row["source"]["generation"] != record.generation
+                            or row["source"] == source
+                        ]
+                        if kept:
+                            resources[key] = kept
+                        else:
+                            resources.pop(key)
+                resources["helper_source"] = source
+                resources["helper_source_observation"] = observation
+                self._helper_source_groups[record.generation] = unit.cgroup
+                self._collect_helper_entry_checkpoint(after, deadline=deadline)
+
+    def _collect_helper_entry_checkpoint(
+        self, record: TransactionRecordV2, *, deadline: float
+    ) -> None:
+        from muli.failure_diagnostics import validate_failure_diagnostic
+
+        resources = self.result["resources"]
+        source = resources.get("helper_source")
+        observation = resources.get("helper_source_observation")
+        if (
+            not helper_source_observation_facts(observation, source)
+            or record.generation in self._invalid_helper_sources
+        ):
+            return
+        try:
+            value = _read_helper_cost_json(
+                self.root / "helper-entry-checkpoint.json", deadline=deadline
+            )
+        except Exception:
+            return  # A missing/unsafe fixed file cannot revoke a completed source proof.
+        if (
+            helper_entry_checkpoint_facts(
+                value, source, validate_diagnostic=validate_failure_diagnostic
+            )
+            and value["revision"] <= record.revision
+            and observation["started_ns"] <= value["monotonic_ns"] <= observation["observed_ns"]
+            and any(
+                row.get("stage") == "transaction"
+                and row.get("generation") == record.generation
+                and row.get("revision") == value["revision"]
+                for row in self.result["timeline"]
+            )
+        ):
+            resources["helper_entry_checkpoint"] = value
 
     def _collect_helper_start_sample(
         self, record: TransactionRecordV2, *, deadline: float | None = None
@@ -4931,6 +5467,13 @@ async def run(mode: str, root: Path) -> int:
         return 1
     finally:
         if mode != "cleanup":
+            try:
+                if case.result["code"]:
+                    await case._collect_failure_helper_source(
+                        deadline=case.drive_deadline or case.deadline
+                    )
+            except BaseException:
+                pass  # The first result was saved before this single optional failure probe.
             try:
                 if isinstance(case.result["resources"].get("helper_source"), dict):
                     final_deadline = case.drive_deadline or case.deadline

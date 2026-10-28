@@ -582,6 +582,79 @@ def test_native_start_optional_budget_preserves_install_complete_costs_and_clean
     assert result == before
 
 
+def test_failure_collection_budget_withdraws_late_samples_but_preserves_old_history(
+    tmp_path: Path,
+) -> None:
+    result, facts = costs_result(version=3)
+    start = _start_row(result, facts)
+    source = result["resources"]["helper_source"]
+    old_source = {
+        **source,
+        "generation": "e" * 32,
+        "helper": "muli-transaction-" + "f" * 64 + ".service",
+        "invocation": "1" * 32,
+    }
+    old_facts = {**copy.deepcopy(facts), **old_source}
+    old_start = {**copy.deepcopy(start), "source": old_source, "costs": old_facts}
+    install = {
+        "source": copy.deepcopy(source),
+        "sample": {"kind": "install_returned", "revision": 3},
+        "costs": copy.deepcopy(facts),
+    }
+    old_install = {**copy.deepcopy(install), "source": old_source, "costs": old_facts}
+    result["generations"].insert(
+        0,
+        {
+            "deployment": "2" * 64,
+            "generation": old_source["generation"],
+            "helper": old_source["helper"],
+        },
+    )
+    result["timeline"].insert(0, {**result["timeline"][0], "generation": old_source["generation"]})
+    result["resources"].update(
+        helper_costs=copy.deepcopy(facts),
+        helper_cost_history=[{"source": old_source, "costs": old_facts}],
+        helper_cost_samples=[old_install, install],
+        helper_start_samples=[old_start, start],
+        cleanup="verified",
+    )
+    while len(result["timeline"]) < 64:
+        result["timeline"].append({"stage": "transaction", "elapsed_ms": 1, "result": "x" * 100})
+    for name in ("helper", "state", "request_id", "boot", "generation"):
+        for row in result["timeline"][2:]:
+            used = len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode())
+            capacity = worker.MAX_BYTES - 1 - used - len(f',"{name}":""')
+            if capacity >= 0:
+                row[name] = "x" * min(100, capacity)
+    wire = json.dumps(result, separators=(",", ":")).encode()
+    assert worker.MAX_BYTES - 100 < len(wire) < worker.MAX_BYTES
+    assert ci.fixture_result(wire) == result  # Both late samples fit on their own.
+    observation = {
+        "source": copy.deepcopy(source),
+        "kind": "failure_collection",
+        "started_ns": 10**9,
+        "observed_ns": 61 * 10**9,
+        "case_deadline_ns": 61 * 10**9,
+        "elapsed_ms": 60_000,
+    }
+    result["resources"]["helper_source_observation"] = observation
+    assert len(json.dumps(result, separators=(",", ":")).encode()) > worker.MAX_BYTES
+    result["resources"]["helper_start_samples"] = [old_start]
+    result["resources"]["helper_cost_samples"] = [old_install]
+    assert ci.fixture_result(json.dumps(result, separators=(",", ":")).encode()) == result
+    expected = copy.deepcopy(result)
+    expected["resources"].pop("helper_source_observation")
+    expected["resources"].pop("helper_source")
+    expected["resources"]["helper_costs"] = {"code": "not_observed", "reason": "output_budget"}
+
+    worker.write_json(tmp_path / "helper-costs.json", facts)
+    worker.collect_helper_costs(
+        tmp_path, result, samples=[install], start_samples=[old_start, start]
+    )
+    assert ci.fixture_result(json.dumps(result, separators=(",", ":")).encode()) == expected
+    assert result == expected  # Old samples/history, first error, timeline and cleanup survive.
+
+
 def test_native_start_manager_merge_drops_starts_before_install_or_complete_costs(
     fixture: tuple[Any, Any],
 ) -> None:

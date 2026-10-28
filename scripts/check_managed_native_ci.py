@@ -1442,6 +1442,8 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "helper_cost_history",
             "helper_cost_samples",
             "helper_start_samples",
+            "helper_source_observation",
+            "helper_entry_checkpoint",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1481,6 +1483,46 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             )
         elif name == "controller_failure":
             valid = controller_failure_facts(facts, value)
+        elif name == "helper_source_observation":
+            source = resources.get("helper_source")
+            valid = (
+                not value["completed"]
+                and bool(value["code"])
+                and helper_source_facts(source)
+                and resource_worker().helper_source_observation_facts(facts, source) is True
+                and bool(history)
+                and history[-1]["generation"] == source["generation"]
+                and history[-1]["helper"] == source["helper"]
+            )
+        elif name == "helper_entry_checkpoint":
+            source = resources.get("helper_source")
+            observation = resources.get("helper_source_observation")
+            valid = (
+                helper_source_facts(source)
+                and resource_worker().helper_source_observation_facts(observation, source) is True
+                and resource_worker().helper_entry_checkpoint_facts(
+                    facts,
+                    source,
+                    validate_diagnostic=failure_diagnostic_module().validate_failure_diagnostic,
+                )
+                is True
+                and observation["started_ns"] <= facts["monotonic_ns"] <= observation["observed_ns"]
+                and any(
+                    row.get("stage") == "transaction"
+                    and row.get("generation") == source["generation"]
+                    and row.get("revision") == facts["revision"]
+                    for row in timeline
+                )
+                and facts["revision"]
+                <= max(
+                    (
+                        row.get("revision", 0)
+                        for row in timeline
+                        if row.get("generation") == source["generation"]
+                    ),
+                    default=0,
+                )
+            )
         elif name in {"helper_cost_history", "helper_cost_samples", "helper_start_samples"}:
             valid = isinstance(facts, list) and 1 <= len(facts) <= 3
             seen: set[str] = set()
@@ -2735,6 +2777,8 @@ class NativeCI:
             and controller_failure_facts(controller_failure, result)
         ):
             result["resources"]["controller_failure"] = controller_failure
+        if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > OUTPUT_BYTES:
+            result["resources"].pop("helper_entry_checkpoint", None)
         starts = result["resources"].get("helper_start_samples", [])
         while (
             starts
@@ -2767,6 +2811,14 @@ class NativeCI:
                 > OUTPUT_BYTES
             ):
                 result["resources"].pop("helper_costs")
+        if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > OUTPUT_BYTES:
+            observation = result["resources"].pop("helper_source_observation", None)
+            if observation is not None:
+                resource_worker().discard_helper_source_samples(
+                    result["resources"], observation["source"]
+                )
+                result["resources"].pop("helper_source", None)
+                result["resources"].pop("controller_failure", None)
         write_json(self.root / "result.json", result)
         return result
 
@@ -2901,6 +2953,9 @@ class NativeCI:
             if time.monotonic() >= deadline:
                 return
             data = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
+            if len(data) > OUTPUT_BYTES:
+                candidate["resources"].pop("helper_entry_checkpoint", None)
+                data = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
             if len(data) > OUTPUT_BYTES:
                 candidate["resources"]["controller_failure"] = {
                     "code": "not_observed",
