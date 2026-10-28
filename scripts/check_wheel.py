@@ -48,8 +48,14 @@ async def check_installed(target: Path) -> None:
     assert uia_script.resolve().is_relative_to(target.resolve())
     uia_source = uia_script.read_bytes().decode("utf-8", errors="strict")
     assert "function Initialize-Uia" in uia_source
-    assert "function Read-Snapshot" in uia_source
     assert "$PSModuleAutoLoadingPreference = 'None'" in uia_source
+    assert ". ([System.IO.Path]::Combine($PSScriptRoot, 'uia_tree.ps1'))" in uia_source
+    uia_tree_script = uia_script.with_name("uia_tree.ps1")
+    assert uia_tree_script.resolve().is_relative_to(target.resolve())
+    uia_tree_source = uia_tree_script.read_bytes().decode("utf-8", errors="strict")
+    assert "function Read-Snapshot" in uia_tree_source
+    assert "function Invoke-Node" in uia_tree_source
+    assert "function Encode-Result" in uia_source
     with (Path(muli.__file__).parent / "compatibility.json").open("rb") as stream:
         declaration = CompatibilityManifest.from_json(stream.read(16_384 + 1))
     assert declaration.release == muli.__version__

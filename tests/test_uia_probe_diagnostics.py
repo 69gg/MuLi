@@ -141,6 +141,61 @@ async def test_native_probe_failure_attaches_fixed_evidence_only_after_owned_cle
         await asyncio.gather(operation, return_exceptions=True)
 
 
+@pytest.mark.parametrize(
+    ("code", "outcome"), [("read_timeout", "not_started"), ("dependency_missing", "unknown")]
+)
+async def test_native_assembly_negative_control_preserves_unexpected_error_and_its_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, outcome: str
+) -> None:
+    import test_uia_native as native
+
+    failure = AXLeaseError(code, "original private failure", outcome)
+    probe = _Probe(failure=failure, stderr=stage_bytes(*STAGES[:4]))
+
+    class Computer:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._uia = SimpleNamespace(_new_lease=lambda **_: probe)
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(native, "Computer", Computer)
+    with pytest.raises(AXLeaseError) as caught:
+        await native.test_real_windows_probe_assembly_failure_returns_its_original_error_and_cleans_up(
+            tmp_path, monkeypatch
+        )
+    assert caught.value is failure and (failure.code, failure.outcome) == (code, outcome)
+    assert note(failure)["cleanup"] == "confirmed"
+    assert probe.calls == 1 and probe.closed
+
+
+async def test_native_assembly_negative_control_retains_the_original_unexpected_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test_uia_native as native
+
+    failure = AXLeaseError("read_timeout", "original private failure")
+    probe = _Probe(failure=failure, stderr=stage_bytes(*STAGES[:4]))
+
+    class Computer:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._uia = SimpleNamespace(_new_lease=lambda **_: probe)
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(native, "Computer", Computer)
+    with pytest.raises(AXLeaseError) as caught:
+        await native.test_real_windows_probe_assembly_failure_returns_its_original_error_and_cleans_up(
+            tmp_path, monkeypatch
+        )
+    assert caught.value is failure
+    assert isinstance(failure.__cause__, AssertionError)
+    facts = note(failure)
+    assert facts["cleanup"] == "confirmed" and facts["stages"] == list(STAGES[:4])
+    assert probe.closed and probe.calls == 1
+
+
 def test_packaged_script_keeps_sixteen_stage_names_and_fourteen_live_points() -> None:
     from muli.tools import uia_computer
 
@@ -183,14 +238,21 @@ def test_first_input_stages_surround_the_original_read_and_decode_only() -> None
     assert source.index("Write-Stage 2") < source.index(points[0])
 
 
-def test_probe_skips_walker_and_keeps_the_real_process_ready_stage() -> None:
+def test_probe_skips_tree_loading_and_walker_and_keeps_the_real_process_ready_stage() -> None:
     from muli.tools import uia_computer
 
     assert uia_computer.__file__ is not None
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
     guard = "if ([string]$request.command -cne 'probe') {"
+    loading = ". ([System.IO.Path]::Combine($PSScriptRoot, 'uia_tree.ps1'))"
     walker = "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker"
     initialization = source.split(guard, 1)[1].split("\n            }", 1)[0]
+    assert "$script:treeLoaded = $false" in source
+    assert "if (-not $script:treeLoaded) {" in initialization
+    assert loading in initialization
+    assert "$script:treeLoaded = $true\n                    Check-Deadline" in initialization
+    assert source.count(loading) == source.count("$script:treeLoaded = $true") == 1
+    assert source.count("uia_tree.ps1") == 1
     assert walker in initialization
     assert "$script:rows = [Collections.Generic.List[object]]::new()" in initialization
     assert "$script:reasons = [Collections.Generic.HashSet[string]]::new()" in initialization
@@ -198,6 +260,9 @@ def test_probe_skips_walker_and_keeps_the_real_process_ready_stage() -> None:
     points = (
         "Initialize-Uia\n            Check-Deadline",
         guard,
+        "if (-not $script:treeLoaded) {",
+        loading,
+        "$script:treeLoaded = $true\n                    Check-Deadline",
         walker,
         "switch -CaseSensitive ([string]$request.command)",
         "'probe' {",
@@ -210,8 +275,42 @@ def test_probe_skips_walker_and_keeps_the_real_process_ready_stage() -> None:
     )
     positions = [source.index(point) for point in points]
     assert positions == sorted(positions)
-    assert all(source.count(point) == 1 for point in points[1:10])
+    assert all(source.count(point) == 1 for point in points[1:-1])
     assert source.index("$traceProbe = $true") < positions[0]
+
+
+def test_packaged_tree_functions_keep_their_responsibilities_separate_from_the_probe() -> None:
+    helper = Path(uia_computer.__file__).with_name("uia_helper.ps1")
+    source = helper.read_text(encoding="utf-8")
+    tree = helper.with_name("uia_tree.ps1").read_text(encoding="utf-8")
+    for name in (
+        "Add-Omission",
+        "Read-Node",
+        "Window-Stamp",
+        "Same-Window",
+        "Read-Children",
+        "Read-Targets",
+        "Read-Snapshot",
+        "Invoke-Node",
+        "Tree-Result",
+        "Fits-Frame",
+        "Keep-References",
+        "Tree-Frame",
+    ):
+        assert tree.count("function " + name) == 1
+        assert "function " + name not in source
+    for name in (
+        "Write-Stage",
+        "Initialize-Uia",
+        "Check-Deadline",
+        "Read-BoundedLine",
+        "Encode-Result",
+    ):
+        assert source.count("function " + name) == 1
+        assert "function " + name not in tree
+    assert "Microsoft.PowerShell.Utility\\Add-Type" not in tree
+    assert "Import-Module" not in tree and "StartNew" not in tree
+    assert "$pattern.Invoke()" in tree and "function Invoke-Node" not in source
 
 
 def test_probe_initialization_stages_surround_existing_checks_and_assembly_load() -> None:

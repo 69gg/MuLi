@@ -30,7 +30,7 @@ from helpers.uia_probe_diagnostics import (
 from muli.config import Settings
 from muli.process import _settle_process
 from muli.tools import uia_computer as module
-from muli.tools.ax_lease import AXLeaseError
+from muli.tools.ax_lease import AXHelperLease, AXLeaseError
 from muli.tools.computer import Computer, ComputerError
 
 pytestmark = pytest.mark.skipif(
@@ -81,8 +81,9 @@ async def discover(computer: Computer, form: NativeForm) -> str:
     return str(matches[0]["target_id"])
 
 
-async def test_real_windows_probe_does_not_initialize_the_tree_walker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("tree_source", [None, "throw 'muli-test-tree-script-forbidden'\n"])
+async def test_real_windows_probe_does_not_load_tree_script_or_initialize_the_tree_walker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_source: str | None
 ) -> None:
     helper = Path(module.__file__).with_name("uia_helper.ps1")
     source = helper.read_text(encoding="utf-8")
@@ -95,6 +96,8 @@ async def test_real_windows_probe_does_not_initialize_the_tree_walker(
             "throw [System.InvalidOperationException]::new('muli-test-tree-walker-forbidden')",
         ).encode("utf-8")
     )
+    if tree_source is not None:
+        script.with_name("uia_tree.ps1").write_text(tree_source, encoding="utf-8")
     computer = Computer(settings(), owner=lambda: ("native-ci", "probe-without-walker"))
 
     def owned_probe(
@@ -118,6 +121,9 @@ async def test_real_windows_probe_does_not_initialize_the_tree_walker(
         assert result["apartment"] == "MTA" and result["has_window"] is False
         assert result["no_profile"] is True and result["non_interactive"] is True
         assert result["module_autoloading"] == "None"
+        facts = probe_facts(probe, cleanup_failed=False)
+        assert "uia_host_validated" in facts["stages"]
+        assert "uia_add_type_returned" in facts["stages"] and "uia_ready" in facts["stages"]
     finally:
         await computer.aclose()
         assert probe.closed and probe._process is not None
@@ -162,17 +168,21 @@ async def test_real_windows_probe_assembly_failure_returns_its_original_error_an
     try:
         with pytest.raises(AXLeaseError) as caught:
             await observe_probe(probe)
-        assert caught.value.code == "dependency_missing"
-        assert caught.value.outcome == "not_started"
-        facts = probe_facts(probe, cleanup_failed=False)
-        assert facts["cleanup"] == "confirmed" and facts["sent"] == 1
-        stages = facts["stages"]
-        assert stages[-1] == "uia_host_validated"
-        assert "uia_initializing" in stages
-        assert "uia_add_type_returned" not in stages and "uia_ready" not in stages
-        after = facts["after_cleanup"]
-        assert after["stage_sequence"] == "valid"
-        assert set(after["stage_arrival_ms"]) == set(stages)
+        try:
+            assert caught.value.code == "dependency_missing"
+            assert caught.value.outcome == "not_started"
+            facts = probe_facts(probe, cleanup_failed=False)
+            assert facts["cleanup"] == "confirmed" and facts["sent"] == 1
+            stages = facts["stages"]
+            assert stages[-1] == "uia_host_validated"
+            assert "uia_initializing" in stages
+            assert "uia_add_type_returned" not in stages and "uia_ready" not in stages
+            after = facts["after_cleanup"]
+            assert after["stage_sequence"] == "valid"
+            assert set(after["stage_arrival_ms"]) == set(stages)
+        except AssertionError as mismatch:
+            # Retain the original error, outcome and bounded diagnostic note.
+            raise caught.value from mismatch
     finally:
         await computer.aclose()
         assert probe.closed and probe._process is not None
@@ -244,6 +254,62 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
             assert "-NoProfile" in argv and "-Mta" in argv and "-NonInteractive" in argv
             assert kwargs["creationflags"] & int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             assert not any("ExecutionPolicy" in arg or arg == "-Command" for arg in argv)
+    finally:
+        await computer.aclose()
+
+
+async def test_real_windows_tree_loads_once_and_preserves_owned_button_actions(
+    native_form: NativeForm, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = Path(module.__file__).with_name("uia_helper.ps1")
+    script = tmp_path / helper.name
+    tree = script.with_name("uia_tree.ps1")
+    script.write_bytes(helper.read_bytes())
+    tree.write_bytes(helper.with_name(tree.name).read_bytes())
+    original_lease = module.AXHelperLease
+    leases: list[AXHelperLease] = []
+
+    def owned_tree(
+        argv: list[str], *, timeout: float, ttl: float, max_nodes: int, once: bool = False
+    ) -> AXHelperLease:
+        assert not once and argv[-1] == str(helper)
+        lease = original_lease(
+            [*argv[:-1], str(script)],
+            timeout=timeout,
+            ttl=ttl,
+            max_nodes=max_nodes,
+            once=once,
+        )
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(module, "AXHelperLease", owned_tree)
+    computer = Computer(settings(), owner=lambda: ("native-ci", "lazy-tree"))
+    try:
+        identifier = await discover(computer, native_form)
+        assert len(leases) == 1
+        lease = leases[0]
+        assert computer._uia._lease is lease and lease._process is not None
+        # A later request must use the functions already loaded in this helper.
+        tree.write_text("throw 'muli-test-tree-script-loaded-again'\n", encoding="utf-8")
+        snapshot = await computer.snapshot({"target_id": identifier})
+        assert computer._uia._lease is lease and len(leases) == 1
+        buttons = [
+            item for item in snapshot["nodes"] if item["name"] == uia_native_window.BUTTON_NAME
+        ]
+        assert len(buttons) == 1 and buttons[0]["actions"] == ["invoke"]
+        deadline = asyncio.get_running_loop().time() + computer.config.operation_timeout_seconds
+        async with asyncio.timeout_at(deadline):
+            assert await computer.action(
+                {
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "node_id": buttons[0]["id"],
+                    "action": "invoke",
+                }
+            ) == {"ok": True, "outcome": "accepted", "effect_verified": False}
+            assert await native_form.button_events.get() == 1
+        assert len(leases) == 1 and lease.closed and lease._process.returncode is not None
+        assert native_form.process.returncode is None
     finally:
         await computer.aclose()
 
