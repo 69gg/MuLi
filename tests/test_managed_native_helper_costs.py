@@ -10,12 +10,12 @@ import json
 import os
 import runpy
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from functools import partial
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from types import CoroutineType, FrameType, FunctionType
+from types import CoroutineType, FrameType, FunctionType, SimpleNamespace
 from typing import Any, Literal, cast
 
 import pytest
@@ -27,6 +27,8 @@ from test_managed_native_ci import forbid_real_effects as forbid_real_effects
 
 import muli.managed_host as managed_host
 import muli.platforms.filesystem_identity as filesystem_identity
+import muli.platforms.managed_backend as managed_backend
+import muli.platforms.managed_deployment as managed_deployment
 from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import JournalControl, Role, TransactionError, TransactionJournal
@@ -123,6 +125,8 @@ async def _exercise_generated_hook(
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
         (SystemdProbe, "_command"),
+        (managed_deployment, "verify_slot_files"),
+        (managed_backend, "verify_slot_files"),
     ):
         monkeypatch.setattr(owner, name, getattr(owner, name))
     fixture_data = {
@@ -359,8 +363,10 @@ async def _exercise_generated_hook(
                     "http",
                     "host_record",
                     "check_breakdown",
+                    "slot_files_controller",
+                    "slot_files_selected",
                 }
-                assert facts["version"] == 2 and facts["code"] == "observed"
+                assert facts["version"] == 3 and facts["code"] == "observed"
                 assert facts["generation"] == record.generation
                 assert facts["helper"] == managed_helper_unit_name(record)
                 assert (facts["uid"], facts["pid"], facts["invocation"]) == (
@@ -369,11 +375,20 @@ async def _exercise_generated_hook(
                     invocation,
                 )
                 assert facts["checks"]["count"] == 2
-                for name in ("checks", "bus", "http", "host_record"):
+                for name in (
+                    "checks",
+                    "bus",
+                    "http",
+                    "host_record",
+                    "slot_files_controller",
+                    "slot_files_selected",
+                ):
                     assert set(facts[name]) == {"count", "total_ms"}
                     assert all(type(value) is int and value >= 0 for value in facts[name].values())
                 assert facts["bus"]["count"] == facts["http"]["count"] == 0
                 assert facts["host_record"]["count"] == int(include_host_record)
+                assert facts["slot_files_controller"]["count"] == 1
+                assert facts["slot_files_selected"] == {"count": 0, "total_ms": 0}
                 assert facts["check_breakdown"] == [
                     {
                         "phase": record.phase,
@@ -441,6 +456,8 @@ async def test_real_install_publishes_second_helper_partial_before_atexit(
         (ManagedLinuxBackend, "_request"),
         (ManagedLinuxBackend, "install"),
         (SystemdProbe, "_command"),
+        (managed_deployment, "verify_slot_files"),
+        (managed_backend, "verify_slot_files"),
     ):
         monkeypatch.setattr(owner, name, getattr(owner, name))
     invocation = "b" * 32
@@ -691,10 +708,15 @@ def costs_result(*, version: int = 1) -> tuple[dict[str, Any], dict[str, Any]]:
         "bus": {"count": 2, "total_ms": 45},
         "http": {"count": 0, "total_ms": 0},
     }
-    if version == 2:
+    if version in (2, 3):
         facts.update(
             host_record={"count": 2, "total_ms": 87},
             check_breakdown=[{"phase": "prepared", "intent": "none", "count": 3, "total_ms": 123}],
+        )
+    if version == 3:
+        facts.update(
+            slot_files_controller={"count": 3, "total_ms": 60},
+            slot_files_selected={"count": 2, "total_ms": 30},
         )
     result = {
         "completed": False,
@@ -709,7 +731,7 @@ def costs_result(*, version: int = 1) -> tuple[dict[str, Any], dict[str, Any]]:
     return result, facts
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_costs_are_collected_once_from_private_file_and_bound_to_helper(
     tmp_path: Path, version: int
 ) -> None:
@@ -739,7 +761,7 @@ def test_cost_schema_reader_does_not_import_the_application(
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", checked_import)
-    for version in (1, 2):
+    for version in (1, 2, 3):
         result, facts = costs_result(version=version)
         assert worker.helper_costs_facts(facts, result["resources"]["helper_source"])
         result["resources"]["helper_costs"] = facts
@@ -801,12 +823,56 @@ def test_version_two_costs_reject_non_contract_host_and_phase_facts(damage: str)
         ci.fixture_result(json.dumps(result).encode())
 
 
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_controller",
+        "missing_selected",
+        "controller_bool",
+        "selected_negative",
+        "metric_extra",
+        "time_outside_checks",
+        "controller_count",
+        "selected_count",
+        "downgrade",
+        "unknown_bucket",
+    ],
+)
+def test_version_three_costs_reject_non_contract_slot_facts(damage: str) -> None:
+    result, facts = costs_result(version=3)
+    if damage == "missing_controller":
+        facts.pop("slot_files_controller")
+    elif damage == "missing_selected":
+        facts.pop("slot_files_selected")
+    elif damage == "controller_bool":
+        facts["slot_files_controller"]["count"] = True
+    elif damage == "selected_negative":
+        facts["slot_files_selected"]["total_ms"] = -1
+    elif damage == "metric_extra":
+        facts["slot_files_selected"]["path"] = "/must-not-export"
+    elif damage == "time_outside_checks":
+        facts["slot_files_selected"]["total_ms"] = facts["checks"]["total_ms"]
+    elif damage == "controller_count":
+        facts["slot_files_controller"]["count"] = facts["checks"]["count"] + 1
+    elif damage == "selected_count":
+        facts["slot_files_selected"]["count"] = facts["slot_files_controller"]["count"] + 1
+    elif damage == "downgrade":
+        facts["version"] = 2
+    else:
+        facts["slot_files_other"] = {"count": 0, "total_ms": 0}
+    result["resources"]["helper_costs"] = facts
+    assert not worker.helper_costs_facts(facts, result["resources"]["helper_source"])
+    with pytest.raises(ci.FixtureError, match="^native_result_invalid$"):
+        ci.fixture_result(json.dumps(result).encode())
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_partial_cost_sample_never_displaces_existing_facts_at_the_original_byte_limit(
-    tmp_path: Path,
+    tmp_path: Path, version: int
 ) -> None:
     # This is a final-settlement reader/budget fixture, not a claim that a
     # controller ran. The real hook/install/Case path is exercised above.
-    result, facts = costs_result()
+    result, facts = costs_result(version=version)
     result["resources"]["helper_costs"] = copy.deepcopy(facts)
     source = copy.deepcopy(result["resources"]["helper_source"])
     samples: list[dict[str, Any]] = [
@@ -836,8 +902,9 @@ def test_partial_cost_sample_never_displaces_existing_facts_at_the_original_byte
     assert ci.fixture_result(json.dumps(result, separators=(",", ":")).encode()) == result
 
 
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_coordinator_manager_merge_discards_only_partial_costs_at_the_original_byte_limit(
-    fixture: tuple[Any, Any],
+    fixture: tuple[Any, Any], version: int
 ) -> None:
     native, commands = fixture
     native.prepare()
@@ -846,7 +913,7 @@ def test_coordinator_manager_merge_discards_only_partial_costs_at_the_original_b
 
     # Valid reader materials stand in for an already settled worker reply;
     # collection itself uses the real coordinator and Commands' fixed cat seam.
-    result, facts = costs_result()
+    result, facts = costs_result(version=version)
     source = copy.deepcopy(result["resources"]["helper_source"])
     result["resources"].update(
         helper_costs=copy.deepcopy(facts),
@@ -975,7 +1042,7 @@ def test_missing_or_untrusted_costs_never_imply_zero(tmp_path: Path, state: str)
     assert ci.fixture_result(json.dumps(result).encode()) == result
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_costs_do_not_displace_existing_result_at_original_byte_limit(
     tmp_path: Path, version: int
 ) -> None:
@@ -1015,6 +1082,8 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
+        managed_deployment.verify_slot_files,
+        managed_backend.verify_slot_files,
     )
     monkeypatch.setattr(atexit, "register", lambda callback: callbacks.append(callback))
     monkeypatch.setattr(
@@ -1027,6 +1096,8 @@ def test_observer_setup_rejection_preserves_original_helper_methods(
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
+        managed_deployment.verify_slot_files,
+        managed_backend.verify_slot_files,
     ) == originals
 
 
@@ -1067,6 +1138,8 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
+        managed_deployment.verify_slot_files,
+        managed_backend.verify_slot_files,
     )
     monkeypatch.setattr(sys, "prefix", str(prefix))
     monkeypatch.setattr(sys, "executable", executable)
@@ -1080,6 +1153,8 @@ def test_managed_helper_observer_rejects_nonexact_arguments_before_fixture_acces
         SystemdProbe._command,
         ManagedLinuxBackend._request,
         managed_host._record,
+        managed_deployment.verify_slot_files,
+        managed_backend.verify_slot_files,
     ) == originals
 
 
@@ -1226,10 +1301,11 @@ def test_cost_history_artifact_rejects_non_contract_rows(damage: str) -> None:
         ci.fixture_result(json.dumps(result).encode())
 
 
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_cost_history_never_displaces_existing_result_at_the_original_byte_limit(
-    tmp_path: Path,
+    tmp_path: Path, version: int
 ) -> None:
-    result, facts = costs_result()
+    result, facts = costs_result(version=version)
     cache: list[dict[str, Any]] = []
     worker.write_json(tmp_path / "helper-costs.json", facts)
     worker.collect_helper_costs(
@@ -1274,3 +1350,257 @@ def test_cost_history_never_displaces_existing_result_at_the_original_byte_limit
     assert result["resources"]["helper_cost_history"] == retained
     assert result == before
     assert ci.fixture_result(json.dumps(result, separators=(",", ":")).encode()) == result
+
+
+class _SlotCostClock:
+    """Charge deterministic time only to real, delegated slot verification."""
+
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+        self.fail_on_slot_exit = False
+        self.fail_next = False
+        self.calls: list[tuple[str, SlotIdentity, dict[str, Any]]] = []
+        self.errors: list[BaseException] = []
+
+    def __call__(self) -> float:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("private slot timing failure")
+        return self.elapsed
+
+    def observe(self, name: str, original: Callable[..., None]) -> Callable[..., None]:
+        def verify(*args: Any, **kwargs: Any) -> None:
+            slot = args[0] if args else kwargs["slot"]
+            assert isinstance(slot, SlotIdentity)
+            self.calls.append((name, slot, dict(kwargs)))
+            try:
+                return original(*args, **kwargs)
+            except BaseException as error:
+                self.errors.append(error)
+                raise
+            finally:
+                # Binary fractions avoid millisecond truncation ambiguity.
+                self.elapsed += 0.125 if name == "controller" else 0.25
+                if self.fail_on_slot_exit:
+                    self.fail_next = True
+
+        return verify
+
+
+@pytest.fixture
+async def slot_cost_observer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+) -> AsyncIterator[
+    tuple[backend_fixture.Host, _SlotCostClock, Callable[[], dict[str, Any] | None]]
+]:
+    native, _ = fixture
+    native.prepare()
+    hook = (native.volume / "_muli_native_ci_hook.py").read_text(encoding="utf-8")
+    root = tmp_path / "slot-cost-helper"
+    root.mkdir(mode=0o700)
+    original_slot = backend_fixture._slot
+
+    def slot(directory: Path, name: str) -> SlotIdentity:
+        return original_slot(directory, {"base": "a", "target": "b"}[name])
+
+    monkeypatch.setattr(backend_fixture, "_slot", slot)
+    monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
+    callbacks: list[Callable[[], Any]] = []
+
+    def register(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Callable[..., Any]:
+        callbacks.append(partial(function, *args, **kwargs))
+        return function
+
+    for owner, name in (
+        (managed_host, "_record"),
+        (ManagedLinuxBackend, "_check"),
+        (ManagedLinuxBackend, "_request"),
+        (ManagedLinuxBackend, "install"),
+        (SystemdProbe, "_command"),
+        (managed_deployment, "verify_slot_files"),
+        (managed_backend, "verify_slot_files"),
+    ):
+        monkeypatch.setattr(owner, name, getattr(owner, name))
+    worker.write_json(
+        root / "fixture.json",
+        {
+            "uid": os.geteuid(),
+            "memory": worker.MEMORY,
+            "tasks": worker.TASKS,
+            "harness_memory": worker.HARNESS_MEMORY,
+            "harness_tasks": worker.HARNESS_TASKS,
+            "seconds": worker.CASE_SECONDS,
+            "cleanup_seconds": worker.CLEANUP_SECONDS,
+            "harness_seconds": worker.HARNESS_SECONDS,
+            "http_bytes": worker.MAX_BYTES,
+            "harness_unit": "muli-native-" + "a" * 32 + ".service",
+        },
+    )
+    monkeypatch.setenv("INVOCATION_ID", "b" * 32)
+    journal_root = root / "data/management/transaction-v1"
+    with TransactionJournal(journal_root, root / "data/muli.sqlite3") as journal:
+        with journal.locked() as control:
+            host = backend_fixture.Host(root, journal, control, "switch", change_config=False)
+            try:
+                # _record still authenticates actual retained files; only mount
+                # admission is controlled, as in the existing host fixture.
+                monkeypatch.setattr(managed_host, "verify_local_filesystems", lambda paths: None)
+                journal.database.write_bytes(b"")
+                journal.database.chmod(0o600)
+                argv = managed_helper_arguments(host.anchor, host.slots["base"])
+                monkeypatch.setattr(sys, "prefix", str(root / "a"))
+                monkeypatch.setattr(sys, "executable", argv[0])
+                monkeypatch.setattr(
+                    sys,
+                    "orig_argv",
+                    [argv[0], "-I", "-m", "muli.management_helper", str(journal_root)],
+                )
+                monkeypatch.setattr(sys, "argv", ["muli.management_helper", str(journal_root)])
+                monkeypatch.setattr(atexit, "register", register)
+                clock = _SlotCostClock()
+                for module, name in (
+                    (managed_deployment, "controller"),
+                    (managed_backend, "selected"),
+                ):
+                    monkeypatch.setattr(
+                        module, "verify_slot_files", clock.observe(name, module.verify_slot_files)
+                    )
+                # Only the worker's observation clock changes; pytest, the
+                # actual backend and its deadlines retain their real clocks.
+                monkeypatch.setattr(
+                    worker, "time", SimpleNamespace(**(vars(worker.time) | {"perf_counter": clock}))
+                )
+                exec(compile(hook, "<fixture-slot-cost-hook>", "exec"), {})
+                assert len(callbacks) == 1
+                assert clock.calls == []
+
+                def save() -> dict[str, Any] | None:
+                    callbacks[0]()
+                    path = root / "helper-costs.json"
+                    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+                yield host, clock, save
+            finally:
+                host.release_writer()
+                await host.backend.__aexit__()
+
+
+async def test_native_slot_costs_exclude_host_authentication_and_measure_both_real_bindings(
+    slot_cost_observer: tuple[
+        backend_fixture.Host, _SlotCostClock, Callable[[], dict[str, Any] | None]
+    ],
+) -> None:
+    host, clock, save = slot_cost_observer
+    record = host.record()
+    assert host.slots["base"].digest != host.slots["target"].digest
+    current, controller, slots = managed_host._record(host.control, host.anchor)
+    assert current == record and controller == host.slots["base"] and slots == host.slots
+    observed_packages: dict[str, Any] = {}
+    assert host.backend._check(record, "target", observed_packages=observed_packages) is None
+    assert len(observed_packages) == 2  # Both complete real package scans delegated.
+    stale = record.model_copy(update={"revision": record.revision + 1})
+    with pytest.raises(TransactionError, match="^stale_revision$"):
+        host.backend._check(stale, "target")
+    assert managed_host._record(host.control, host.anchor)[0] == record
+    assert [name for name, _, _ in clock.calls] == [
+        "controller",
+        "controller",
+        "selected",
+        "controller",
+    ]
+    for name, actual, kwargs in clock.calls[1:3]:
+        assert actual == host.slots["base" if name == "controller" else "target"]
+        assert kwargs["observed_packages"] is observed_packages
+    facts = save()
+    assert facts is not None and facts["code"] == "observed"
+    assert facts["checks"] == {"count": 2, "total_ms": 375}
+    assert facts["host_record"] == {"count": 2, "total_ms": 250}
+    assert facts.get("slot_files_controller") == {"count": 1, "total_ms": 125}, (
+        "complete controller verification inside _check is missing or includes host._record"
+    )
+    assert facts.get("slot_files_selected") == {"count": 1, "total_ms": 250}, (
+        "the separately bound selected-slot verifier was not measured"
+    )
+    assert facts["version"] == 3
+    source = {key: facts[key] for key in ("generation", "helper", "uid", "pid", "invocation")}
+    result = {
+        "completed": False,
+        "stage": "transaction",
+        "code": "TimeoutError",
+        "timeline": [],
+        "generations": [
+            {
+                "deployment": host.anchor.digest,
+                "generation": record.generation,
+                "helper": facts["helper"],
+            }
+        ],
+        "resources": {"helper_source": source},
+    }
+    retained: list[dict[str, Any]] = []
+    root = Path(host.slots["base"].prefix).parent
+    worker.collect_helper_costs(
+        root, result, completed_generation=record.generation, retained=retained
+    )
+    partial = {"sample": {"kind": "install_returned", "revision": record.revision}, "costs": facts}
+    # Reader-only partial fixture; actual install-returned publication retains
+    # its separate real-install regression above.
+    assert worker.helper_cost_sample_facts(partial, source)
+    samples = [{"source": source, **partial}]
+    worker.collect_helper_costs(root, result, retained=retained, samples=samples)
+    assert result["resources"]["helper_costs"] == facts
+    assert result["resources"]["helper_cost_history"] == [{"source": source, "costs": facts}]
+    assert result["resources"]["helper_cost_samples"] == samples
+    assert ci.fixture_result(json.dumps(result).encode()) == result
+
+
+async def test_native_slot_costs_preserve_the_actual_bad_target_error_once(
+    slot_cost_observer: tuple[
+        backend_fixture.Host, _SlotCostClock, Callable[[], dict[str, Any] | None]
+    ],
+) -> None:
+    host, clock, save = slot_cost_observer
+    target = Path(host.slots["target"].package.root) / "__init__.py"
+    target.write_bytes(b"# actual changed target package\n")
+    with pytest.raises(
+        managed_deployment.ManagedDeploymentError, match="^managed_slot_changed$"
+    ) as caught:
+        host.backend._check(host.record(), "target")
+    assert clock.errors == [caught.value]
+    assert clock.errors[0] is caught.value
+    assert [name for name, _, _ in clock.calls] == ["controller", "selected"]
+    assert managed_host._record(host.control, host.anchor)[0] == host.record()
+    facts = save()
+    assert facts is not None and facts["checks"] == {"count": 1, "total_ms": 375}
+    assert facts.get("slot_files_controller") == {"count": 1, "total_ms": 125}
+    assert facts.get("slot_files_selected") == {"count": 1, "total_ms": 250}, (
+        "failed real selected verification must be timed once without replacing its exception"
+    )
+
+
+@pytest.mark.parametrize("bad_target", [False, True])
+async def test_native_slot_costs_timer_failure_never_changes_authentication_or_exports_zero(
+    slot_cost_observer: tuple[
+        backend_fixture.Host, _SlotCostClock, Callable[[], dict[str, Any] | None]
+    ],
+    bad_target: bool,
+) -> None:
+    host, clock, save = slot_cost_observer
+    if bad_target:
+        target = Path(host.slots["target"].package.root) / "__init__.py"
+        target.write_bytes(b"# actual changed target package\n")
+    clock.fail_on_slot_exit = True
+    if bad_target:
+        with pytest.raises(
+            managed_deployment.ManagedDeploymentError, match="^managed_slot_changed$"
+        ) as caught:
+            host.backend._check(host.record(), "target")
+        assert clock.errors == [caught.value]
+        assert clock.errors[0] is caught.value
+    else:
+        assert host.backend._check(host.record(), "target") is None
+        assert clock.errors == []
+    assert [name for name, _, _ in clock.calls] == ["controller", "selected"]
+    assert save() is None, "lost slot costs must never be exported as observed zero cost"

@@ -48,6 +48,7 @@ HARNESS_MEMORY = MEMORY // 4
 HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
+HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
 # Version-two diagnostic labels, readable by the stdlib-only coordinator.
 HELPER_COST_PHASES = (
     "prepared",
@@ -3195,13 +3196,15 @@ def helper_costs_facts(value: object, source: object) -> bool:
         )
     identity = {"generation", "helper", "uid", "pid", "invocation"}
     version = value.get("version")
-    extra = {"host_record", "check_breakdown"} if version == 2 else set()
+    extra = {"host_record", "check_breakdown"} if version in (2, 3) else set()
+    if version == 3:
+        extra.update(HELPER_COST_SLOT_METRICS)
     if (
         not isinstance(source, dict)
         or set(source) != identity
         or set(value) != identity | {"version", "code", "checks", "bus", "http"} | extra
         or type(version) is not int
-        or version not in (1, 2)
+        or version not in (1, 2, 3)
         or value["code"] != "observed"
         or any(
             type(value[key]) is not type(source[key]) or value[key] != source[key]
@@ -3221,6 +3224,16 @@ def helper_costs_facts(value: object, source: object) -> bool:
         return False
     if version == 1:
         return True
+    if version == 3:
+        if not all(metric(value[name]) for name in HELPER_COST_SLOT_METRICS):
+            return False
+        controller, selected = (value[name] for name in HELPER_COST_SLOT_METRICS)
+        if (
+            selected["count"] > controller["count"]
+            or controller["count"] > value["checks"]["count"]
+            or controller["total_ms"] + selected["total_ms"] > value["checks"]["total_ms"]
+        ):
+            return False
     rows = value["check_breakdown"]
     phases, intents = HELPER_COST_PHASES, HELPER_COST_INTENTS
     if (
@@ -3326,6 +3339,8 @@ def install_helper_cost_hook() -> None:
     """Observe only the exact isolated helper; never change its control flow."""
     try:
         import muli.managed_host as managed_host
+        import muli.platforms.managed_backend as managed_backend
+        import muli.platforms.managed_deployment as managed_deployment
         from muli.managed_controller import BindingConfirmation
         from muli.managed_host import managed_helper_unit_name
         from muli.managed_journal import RoleSnapshots
@@ -3377,7 +3392,7 @@ def install_helper_cost_hook() -> None:
         require(isinstance(record, TransactionRecordV2), "native_profile_record")
         assert isinstance(record, TransactionRecordV2)
         facts: dict[str, Any] = {
-            "version": 2,
+            "version": 3,
             "code": "observed",
             "generation": record.generation,
             "helper": managed_helper_unit_name(record),
@@ -3385,11 +3400,14 @@ def install_helper_cost_hook() -> None:
             "pid": os.getpid(),
             "invocation": invocation,
         }
-        counts = {name: 0 for name in ("checks", "bus", "http", "host_record")}
+        counts = {
+            name: 0 for name in ("checks", "bus", "http", "host_record", *HELPER_COST_SLOT_METRICS)
+        }
         totals = {name: 0.0 for name in counts}
         phase_counts: dict[tuple[str, str], int] = {}
         phase_totals: dict[tuple[str, str], float] = {}
         usable, saved, sampled = True, False, False
+        check_depth = 0
         clock = time.perf_counter
 
         def begin() -> float | None:
@@ -3429,11 +3447,13 @@ def install_helper_cost_hook() -> None:
 
         @wraps(original_check)
         def check(*args: Any, **kwargs: Any) -> None:
-            nonlocal usable
+            nonlocal usable, check_depth
             started = begin()
+            check_depth += 1
             try:
                 return original_check(*args, **kwargs)
             finally:
+                check_depth -= 1
                 elapsed = finish("checks", started)
                 try:
                     current = args[1] if len(args) > 1 else kwargs["record"]
@@ -3446,6 +3466,21 @@ def install_helper_cost_hook() -> None:
                     phase_totals[key] = phase_totals.get(key, 0.0) + elapsed
                 except Exception:
                     usable = False
+
+        def observe_slot_files(name: str, original: Callable[..., None]) -> Callable[..., None]:
+            @wraps(original)
+            def slot_files(*args: Any, **kwargs: Any) -> None:
+                # _check is synchronous: the scope ends before any await and
+                # excludes the host's independent controller authentication.
+                if not check_depth:
+                    return original(*args, **kwargs)
+                started = begin()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    finish(name, started)
+
+            return slot_files
 
         def observe_record(original: HostRecordReader) -> HostRecordReader:
             @wraps(original)
@@ -3611,6 +3646,12 @@ def install_helper_cost_hook() -> None:
 
         atexit.register(save)
         # Dedicated CI observation hooks intentionally replace these methods.
+        managed_deployment.verify_slot_files = observe_slot_files(
+            HELPER_COST_SLOT_METRICS[0], managed_deployment.verify_slot_files
+        )
+        managed_backend.verify_slot_files = observe_slot_files(
+            HELPER_COST_SLOT_METRICS[1], managed_backend.verify_slot_files
+        )
         ManagedLinuxBackend._check = check  # type: ignore[method-assign]
         SystemdProbe._command = command  # type: ignore[method-assign]
         ManagedLinuxBackend._request = request  # type: ignore[method-assign]
