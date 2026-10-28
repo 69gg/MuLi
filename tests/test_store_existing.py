@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import stat
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from muli import store_schema
 from muli.attachments import Attachments
 from muli.channel_application import ChannelApplication
 from muli.channels import ChannelManager, ChannelProfile, ChannelsConfig
@@ -499,6 +501,169 @@ async def test_elapsed_read_budget_rejects_without_partial_migration(
     assert readings >= 2
     assert mutations == [] and snapshot(database) == before
     assert_closed(connections)
+
+
+def schema_budget_note(error: ExistingStoreError) -> dict[str, Any]:
+    assert str(error) == error.code == "existing_store_read_budget"
+    assert len(error.__notes__) == 1
+    prefix = "existing_store_read_observation="
+    note = error.__notes__[0]
+    assert note.startswith(prefix) and len(note.encode()) <= 512
+    value: dict[str, Any] = json.loads(note[len(prefix) :])
+    assert set(value) == {"group", "phase", "trigger", "steps", "vm_limit"}
+    return value
+
+
+async def test_schema_budget_note_records_first_vm_gate_without_an_extra_clock_read(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    readings = 0
+
+    def clock() -> float:
+        nonlocal readings
+        readings += 1
+        return 0.0 if readings == 1 else 2.0
+
+    monkeypatch.setattr(store_schema, "monotonic", clock)
+    with closing(sqlite3.connect(database)) as db:
+        with pytest.raises(ExistingStoreError) as caught:
+            validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
+        assert schema_budget_note(caught.value) == {
+            "group": "all",
+            "phase": "setup",
+            "trigger": "vm_steps",
+            "steps": 1,
+            "vm_limit": 1,
+        }
+        assert readings == 1  # Preserve OR short-circuit; wall-clock state was not sampled.
+        assert not db.in_transaction and db.execute("PRAGMA query_only").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("expire_before_scan", [True, False])
+async def test_schema_budget_note_distinguishes_progress_and_final_wall_gate(
+    database: Path, monkeypatch: pytest.MonkeyPatch, expire_before_scan: bool
+) -> None:
+    now = 0.0
+    original = store_schema._validate_definitions
+
+    def clock() -> float:
+        return now
+
+    def definitions(
+        db: sqlite3.Connection,
+        definitions: tuple[store_schema._Definition, ...],
+        limits: ExistingStoreLimits,
+    ) -> None:
+        nonlocal now
+        if expire_before_scan:
+            now = 2.0
+        original(db, definitions, limits)
+        now = 2.0
+
+    monkeypatch.setattr(store_schema, "monotonic", clock)
+    monkeypatch.setattr(store_schema, "_validate_definitions", definitions)
+    with closing(sqlite3.connect(database)) as db:
+        previous = db.total_changes
+        with pytest.raises(ExistingStoreError) as caught:
+            validate_existing_schema(db, "channel")
+        note = schema_budget_note(caught.value)
+        assert note["group"] == "channel" and note["trigger"] == "wall_clock"
+        assert note["phase"] == ("schema" if expire_before_scan else "complete")
+        assert 0 <= note["steps"] < note["vm_limit"] == ExistingStoreLimits().vm_steps
+        assert db.total_changes == previous and not db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 0
+        assert db.execute("SELECT 1").fetchone() == (1,)
+
+
+async def test_schema_budget_note_does_not_replace_cleanup_failure(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CleanupFailure(sqlite3.Connection):
+        def set_progress_handler(
+            self, progress_handler: Callable[[], int] | None, n: int = 1000
+        ) -> None:
+            super().set_progress_handler(progress_handler, n)
+            if progress_handler is None:
+                raise sqlite3.OperationalError("private cleanup details")
+
+    monkeypatch.setattr(store_schema, "monotonic", lambda: 0.0)
+    with closing(sqlite3.connect(database, factory=CleanupFailure)) as db:
+        with pytest.raises(ExistingStoreError, match="^existing_store_cleanup_failed$") as caught:
+            validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
+        assert not hasattr(caught.value, "__notes__")
+
+
+async def test_schema_budget_note_failure_preserves_the_original_rejection(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_note(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("private diagnostic details")
+
+    monkeypatch.setattr(store_schema, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(store_schema.json, "dumps", fail_note)
+    with closing(sqlite3.connect(database)) as db:
+        with pytest.raises(ExistingStoreError, match="^existing_store_read_budget$") as caught:
+            validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
+        assert not hasattr(caught.value, "__notes__")
+        assert not db.in_transaction and db.execute("SELECT 1").fetchone() == (1,)
+
+
+async def test_unrelated_schema_error_does_not_gain_a_budget_note(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_scan(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("private SQL and database content")
+
+    monkeypatch.setattr(store_schema, "_validate_definitions", fail_scan)
+    with closing(sqlite3.connect(database)) as db:
+        with pytest.raises(ExistingStoreError, match="^existing_store_unavailable$") as caught:
+            validate_existing_schema(db)
+        assert not hasattr(caught.value, "__notes__")
+        assert not db.in_transaction and db.execute("SELECT 1").fetchone() == (1,)
+
+
+async def test_current_format_channel_read_budget_precedes_client_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "current.sqlite3"
+    store = Store.open_runtime(path, default_mode="ask")
+    before = snapshot(path)
+    original = store_schema._validate_definitions
+    now = 0.0
+    clients: list[None] = []
+
+    def clock() -> float:
+        return now
+
+    def definitions(
+        db: sqlite3.Connection,
+        definitions: tuple[store_schema._Definition, ...],
+        limits: ExistingStoreLimits,
+    ) -> None:
+        nonlocal now
+        now = 2.0
+        original(db, definitions, limits)
+
+    def client(**kwargs: Any) -> httpx.AsyncClient:
+        clients.append(None)
+        raise AssertionError("client must not be created after rejected read admission")
+
+    try:
+        assert store.format_state is not None
+        changes = store.db.total_changes
+        monkeypatch.setattr(store_schema, "monotonic", clock)
+        monkeypatch.setattr(store_schema, "_validate_definitions", definitions)
+        monkeypatch.setattr("muli.channels.manager.httpx.AsyncClient", client)
+        with pytest.raises(ExistingStoreError) as caught:
+            ChannelManager(store, EventBus(store), ChannelsConfig(), no_submit)
+        note = schema_budget_note(caught.value)
+        assert note["group"] == "all" and note["phase"] == "schema"
+        assert note["trigger"] == "wall_clock" and not clients
+        assert store.db.total_changes == changes and snapshot(path) == before
+        assert not store.db.in_transaction
+        assert store.db.execute("PRAGMA query_only").fetchone()[0] == 0
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("group", ["all", "core", "memory", "channel"])

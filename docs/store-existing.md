@@ -34,6 +34,8 @@ Memory/ChannelManager 的内部复核要求该 Store 连接没有活跃事务、
 
 VM 步数按至多 100 条指令回调累计，每条语句末尾还有小于该间隔的余量；快语句可不触发回调，语句数量和源码大小仍有限，最后再次核期限。底层阻塞 I/O 不受 Python callback 的硬期限保证，执行宿主仍需进程级资源和期限保护。WAL/SHM 辅助文件可能被 SQLite 访问或创建，因此“零迁移/业务写入”不等于“目录完全零变化”；不使用 immutable 忽略实时 WAL。错误使用固定 `ExistingStoreError.code`，不回显数据库正文。
 
+结构校验超出预算时，日志额外附上固定的 `existing_store_read_observation`：校验范围、阶段、首次拒绝的时间或指令门限，以及指令计数和上限。它使用 Python 的[异常附注](https://docs.python.org/3.12/library/exceptions.html#BaseException.add_note)，不改变错误码，不包含路径、SQL、数据库内容或底层错误原文。指令门限先命中时保持原短路，不额外读取时钟，因此不推断两项是否同时超限；计数仍是回调累计值。诊断生成失败不改变拒绝，清理失败仍优先报告。没有自动重试或扩大预算；新日志也不能反推旧失败的具体原因。
+
 ## 验证边界
 
 新增小型临时数据库回归覆盖从连接创建时就拒绝所有 DDL/DML、三组缺表/索引/marker、同名但不同表达式/partial/unique/主键、渠道缺列、owner 身份、零回填、失败关闭、预算与事务/设置恢复，以及核验后真实记忆和 outbox 业务可写。另用测试内注入让真实 Runtime 和 ChannelApplication 重新配置复用已有入口，禁止 DDL 而保留合法本地恢复写入；这不是正式 Runtime 接线。
