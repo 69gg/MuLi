@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -17,7 +18,7 @@ from test_managed_backend_python_proof import observe_python_reads
 from test_managed_backend_python_proof import shared_host as shared_host
 
 from muli.managed_transaction import TransactionRecordV2
-from muli.management_transaction import FixedLock, Role, TransactionJournal
+from muli.management_transaction import FixedLock, Role, TransactionError, TransactionJournal
 from muli.platforms.managed_backend import _DiskBinding, _FileProofs
 from muli.platforms.managed_deployment import (
     DeploymentAnchor,
@@ -57,6 +58,260 @@ def rewrite_with_restored_mtime(path: Path, contents: bytes, before: os.stat_res
         before.st_mtime_ns,
     )
     assert after.st_ctime_ns != before.st_ctime_ns
+
+
+def at_start_writer_release(
+    host: Host, monkeypatch: pytest.MonkeyPatch, on_release: Callable[[], None]
+) -> list[int]:
+    """Inject only after the real start writer closes, before its final effect guard."""
+    releases: list[int] = []
+    original = FixedLock.__exit__
+
+    def released(lease: FixedLock, *args: object) -> None:
+        writer = lease.directory is host.journal.writer_directory and lease.fd is not None
+        original(lease, *args)
+        if writer and not releases:
+            assert lease.fd is None
+            releases.append(host.probe.count)
+            on_release()
+
+    monkeypatch.setattr(FixedLock, "__exit__", released)
+    return releases
+
+
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_start_final_effect_reuses_only_its_adjacent_writer_guard_bytes(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, role: Role
+) -> None:
+    record = await prepare_start(shared_host, role)
+    disk, commands = shared_host.backend._disk().digests, list(shared_host.commands)
+    reads = observe_payloads(shared_host, monkeypatch)
+    python = observe_python_reads(shared_host, monkeypatch)
+    checks = observe_checks(shared_host, monkeypatch)
+    before: dict[Path, tuple[int, int, int, int]] = {}
+    scans: dict[Path, int] = {}
+    python_before: list[tuple[int, int]] = []
+
+    def released() -> None:
+        assert len(checks) == 13
+        before.update(
+            {
+                path: (leaf.bytes, len(leaf.opened), leaf.fd_stats, leaf.path_stats)
+                for path, leaf in reads.leaves.items()
+            }
+        )
+        scans.update(reads.scans)
+        python_before.append((python.bytes, len(python.opened)))
+
+    releases = at_start_writer_release(shared_host, monkeypatch, released)
+
+    await shared_host.backend.start(record, role)
+
+    assert releases == [2] and len(python_before) == 1
+    assert len(checks) == 14 and all(current == record for current, _selected in checks)
+    assert sum(selected is None for _current, selected in checks) == 4
+    assert sum(selected == role for _current, selected in checks) == 10
+    assert shared_host.probe.count == 2 and shared_host.commands == [*commands, "start"]
+    assert shared_host.record().position == record.position
+    assert shared_host.backend._disk().digests == disk
+    assert shared_host.writer is not None
+    shared_host.writer.check()
+
+    roots = {
+        Path(shared_host.backend.controller_slot.package.root),
+        Path(shared_host.slots[role].package.root),
+    }
+    for path, leaf in reads.leaves.items():
+        walks = int(any(path.is_relative_to(root) for root in roots))
+        assert len(leaf.opened) - before[path][1] == walks
+        assert leaf.fd_stats - before[path][2] >= 2 * walks
+        assert leaf.path_stats - before[path][3] == walks
+        assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in leaf.opened)
+    for directory, count in reads.scans.items():
+        assert count - scans[directory] == int(
+            any(directory.is_relative_to(root) for root in roots)
+        )
+    python_opens = 1 if shared_host.slots[role] == shared_host.backend.controller_slot else 2
+    assert len(python.opened) - python_before[0][1] == python_opens
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in python.opened)
+
+    # All 14 checks, real independent opens and the successful start precede
+    # this byte assertion. The old final effect rereads one complete copy.
+    actual = {str(path): leaf.bytes - before[path][0] for path, leaf in reads.leaves.items()}
+    actual["python"] = python.bytes - python_before[0][0]
+    assert actual == {key: 0 for key in actual}
+
+
+@pytest.mark.parametrize("changed", ["controller", "selected", "both", "python", "replacement"])
+async def test_start_final_effect_rejects_file_changes_after_writer_release(
+    shared_host: Host,
+    monkeypatch: pytest.MonkeyPatch,
+    changed: Literal["controller", "selected", "both", "python", "replacement"],
+) -> None:
+    record = await prepare_start(shared_host, "target")
+    disk, commands = shared_host.backend._disk().digests, list(shared_host.commands)
+    controller = Path(shared_host.backend.controller_slot.package.root) / "batch_payload/first.bin"
+    selected = Path(shared_host.slots["target"].package.root) / "batch_payload/first.bin"
+    paths = (
+        [Path(shared_host.backend.controller_slot.resolved_python.path)]
+        if changed == "python"
+        else [selected, controller]
+        if changed == "both"
+        else [selected]
+        if changed == "selected"
+        else [controller]
+    )
+    originals = {path: (path.read_bytes(), path.stat()) for path in paths}
+    reads = observe_payloads(shared_host, monkeypatch)
+    python = observe_python_reads(shared_host, monkeypatch)
+    checks = observe_checks(shared_host, monkeypatch)
+    before_bytes: dict[Path, int] = {}
+    before_python: list[int] = []
+
+    def released() -> None:
+        assert len(checks) == 13
+        before_bytes.update({path: leaf.bytes for path, leaf in reads.leaves.items()})
+        before_python.append(python.bytes)
+        if changed == "replacement":
+            contents, identity = originals[controller]
+            replacement = controller.with_name(controller.name + ".replacement")
+            replacement.write_bytes(bytes([contents[0] ^ 0xFF]) + contents[1:])
+            replacement.chmod(stat.S_IMODE(identity.st_mode))
+            os.utime(replacement, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+            replacement.replace(controller)
+            after = controller.stat()
+            assert (after.st_dev, after.st_ino) != (identity.st_dev, identity.st_ino)
+            assert (after.st_size, after.st_mtime_ns) == (identity.st_size, identity.st_mtime_ns)
+        else:
+            for path in paths:
+                contents, identity = originals[path]
+                rewrite_with_restored_mtime(path, contents, identity)
+
+    releases = at_start_writer_release(shared_host, monkeypatch, released)
+    code = "managed_slot_changed" if changed == "selected" else "anchor_unavailable"
+
+    with pytest.raises(ManagedDeploymentError, match=f"^{code}$"):
+        await shared_host.backend.start(record, "target")
+
+    assert releases == [2] and len(before_python) == 1 and len(checks) == 14
+    assert shared_host.probe.count == 2 and shared_host.commands == commands
+    assert shared_host.record().position == record.position
+    assert shared_host.backend._disk().digests == disk
+    assert shared_host.writer is None
+    with shared_host.journal.writer_lease() as lease:
+        lease.check()
+    if changed == "python":
+        assert python.bytes - before_python[0] >= len(originals[paths[0]][0])
+    else:
+        damaged = selected if changed == "selected" else controller
+        assert reads.leaves[damaged].bytes - before_bytes[damaged] >= reads.sizes[damaged]
+        if changed == "both":
+            # Two real files changed after the writer closed. Controller
+            # authentication must still reject before revisiting selected.
+            assert reads.leaves[selected].bytes == before_bytes[selected]
+
+
+async def test_start_final_effect_rechecks_revision_after_writer_release(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = await prepare_start(shared_host, "target")
+    disk, commands = shared_host.backend._disk().digests, list(shared_host.commands)
+    checks = observe_checks(shared_host, monkeypatch)
+    advanced: list[TransactionRecordV2] = []
+
+    def released() -> None:
+        assert len(checks) == 13
+        # The actual lease is free: another real writer can enter and advance
+        # the persistent journal before command authorization is revisited.
+        with shared_host.journal.writer_lease() as lease:
+            lease.check()
+            advanced.append(shared_host.move("verifying"))
+
+    releases = at_start_writer_release(shared_host, monkeypatch, released)
+
+    with pytest.raises(TransactionError, match="^stale_revision$"):
+        await shared_host.backend.start(record, "target")
+
+    assert releases == [2] and len(advanced) == 1 and len(checks) == 14
+    assert advanced[0].revision == record.revision + 1
+    assert shared_host.record() == advanced[0]
+    assert shared_host.backend._disk().digests == disk
+    assert shared_host.probe.count == 2 and shared_host.commands == commands
+    assert shared_host.writer is None
+    with shared_host.journal.writer_lease() as lease:
+        lease.check()
+
+
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_start_final_effect_rechecks_deadline_after_writer_release(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, role: Role
+) -> None:
+    record = await prepare_start(shared_host, role)
+    disk, commands = shared_host.backend._disk().digests, list(shared_host.commands)
+    checks = observe_checks(shared_host, monkeypatch)
+
+    def released() -> None:
+        assert len(checks) == 13
+        shared_host.clock.elapsed = record.deadline.seconds - (
+            record.deadline.rollback_reserve if role == "target" else 0
+        )
+
+    releases = at_start_writer_release(shared_host, monkeypatch, released)
+    with pytest.raises(TimeoutError):
+        await shared_host.backend.start(record, role)
+
+    assert releases == [2] and len(checks) == 14
+    assert shared_host.probe.count == 2 and shared_host.commands == commands
+    assert shared_host.record().position == record.position
+    assert shared_host.backend._disk().digests == disk
+    assert shared_host.writer is None
+    with shared_host.journal.writer_lease() as lease:
+        lease.check()
+
+
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_next_start_reads_fresh_bytes_before_its_first_probe(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, role: Role
+) -> None:
+    record = await prepare_start(shared_host, role)
+    disk, commands = shared_host.backend._disk().digests, list(shared_host.commands)
+    reads = observe_payloads(shared_host, monkeypatch)
+    python = observe_python_reads(shared_host, monkeypatch)
+    checks = observe_checks(shared_host, monkeypatch)
+    await shared_host.backend.start(record, role)
+    first_bytes = {path: leaf.bytes for path, leaf in reads.leaves.items()}
+    first_python, first_probes = python.bytes, shared_host.probe.count
+    assert len(checks) == 14 and first_probes == 2
+    shared_host.stopped()
+    entered: list[int] = []
+    entry_bytes: dict[Path, int] = {}
+    entry_python: list[int] = []
+
+    def before_read(count: int) -> None:
+        if count == first_probes + 1:
+            assert not entered and len(checks) == 15
+            entered.append(count)
+            entry_bytes.update(
+                {path: leaf.bytes - first_bytes[path] for path, leaf in reads.leaves.items()}
+            )
+            entry_python.append(python.bytes - first_python)
+
+    shared_host.probe.before_read = before_read
+
+    await shared_host.backend.start(record, role)
+
+    assert entered == [3] and shared_host.probe.count == 4 and len(checks) == 28
+    assert shared_host.commands == [*commands, "start", "start"]
+    assert shared_host.record().position == record.position
+    assert shared_host.backend._disk().digests == disk
+    assert shared_host.writer is not None
+    shared_host.writer.check()
+    controller = Path(shared_host.backend.controller_slot.package.root)
+    for path, leaf in reads.leaves.items():
+        assert entry_bytes[path] == (reads.sizes[path] if path.is_relative_to(controller) else 0)
+        assert leaf.bytes - first_bytes[path] == first_bytes[path]
+    assert entry_python == [shared_host.backend.controller_slot.resolved_python.identity.size]
+    assert python.bytes - first_python == first_python
 
 
 @pytest.mark.parametrize("role", ["target", "base"])
@@ -272,12 +527,17 @@ async def test_start_confirmation_proof_does_not_cross_the_next_probe_await(
     controller = Path(shared_host.backend.controller_slot.package.root)
     selected_root = Path(shared_host.slots[role].package.root)
     for leaf, observed in reads.leaves.items():
+        # The first two post-await guards read fresh bytes. Only the final
+        # adjacent writer/effect pair may share them; all three walks remain.
         copies = (
+            2 if leaf.is_relative_to(controller) else 1 if leaf.is_relative_to(selected_root) else 0
+        )
+        walks = (
             3 if leaf.is_relative_to(controller) else 2 if leaf.is_relative_to(selected_root) else 0
         )
         actual = observed.bytes - before_bytes[leaf]
         assert actual == reads.sizes[leaf] * copies, (leaf.name, actual, copies)
-        assert len(observed.opened) - before_opens[leaf] == copies
+        assert len(observed.opened) - before_opens[leaf] == walks
         assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
     for directory, count in reads.scans.items():
         copies = (
@@ -289,6 +549,6 @@ async def test_start_confirmation_proof_does_not_cross_the_next_probe_await(
         )
         assert count - before_scans[directory] == copies
     python_size = shared_host.backend.controller_slot.resolved_python.identity.size
-    assert python.bytes - before_python == 3 * python_size
+    assert python.bytes - before_python == 2 * python_size
     assert shared_host.writer is not None
     shared_host.writer.check()
