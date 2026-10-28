@@ -55,7 +55,9 @@ python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 
 ## 托管 CI
 
-CI 验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 Windows 每个版本按测试文件分成两份不重叠集合，macOS 运行完整集合；同文件的参数化用例保持在一起。分片不保证耗时均分。
+CI 共14项作业，验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 每个版本按测试文件分成两份不重叠集合，Windows 分成三份，macOS 运行完整集合；同文件的参数化用例与夹具生命周期保持在一起。分组使用仓库相对文件名的稳定摘要，新增文件不会重排已有文件；pytest 自身的发现与忽略规则保持生效，分片不保证耗时均分。
+
+分片只在指定 `--muli-ci-shard` 时启用，编号从1开始；`--muli-ci-shards` 默认2，可选2或3。编号超出总数或所选组没有用例时明确报错，不把覆盖缺口当作通过。
 
 质量作业检查格式、类型、前端与发行包；可选集成作业另安装 MCP 和渠道依赖，覆盖默认环境可能跳过的 SDK 路径。每项保留 workflow 硬超时、有限并发和 Node 堆限制；诊断用的 `faulthandler_timeout` 不能代替终止期限。
 
@@ -80,3 +82,5 @@ Portal 回归使用独立的临时 D-Bus 和合成图片。夹具按可用能力
 使用文档描述最终功能和操作方法；版本变化写入 [CHANGELOG](../CHANGELOG.md)。调试流水、测试数字和临时审查过程放在开发记录或 PR 中，不追加到用户指南。
 
 发布要求与 Trusted Publisher 配置见[发布说明](publishing.md)。
+
+`pyproject.toml` 将 Hatchling 构建后端固定为精确版本，本地与 CI 使用同一版本，避免浮动后端改变 wheel 元数据及摘要。`scripts/release.py` 使用标准库核验实际 wheel 的唯一 `Generator` 与项目声明一致；缺失、重复、版本漂移或浮动依赖都会拒绝发布。升级后端时同时更新精确声明，并重新验证、构建和冻结产物。

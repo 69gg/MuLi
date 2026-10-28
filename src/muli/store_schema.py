@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from collections.abc import Iterator
@@ -285,7 +286,8 @@ def validate_existing_schema(
     steps = 0
     interval = min(_PROGRESS_INTERVAL, limits.vm_steps)
     begun = installed = False
-    interrupted = False
+    interrupted: Literal["vm_steps", "wall_clock"] | None = None
+    phase: Literal["setup", "schema", "core_markers", "memory_markers", "complete"] = "setup"
     query_only: int | None = None
     busy_timeout: int | None = None
     saved_limits: dict[int, int] = {}
@@ -293,8 +295,36 @@ def validate_existing_schema(
     def progress() -> int:
         nonlocal steps, interrupted
         steps += interval
-        interrupted = steps >= limits.vm_steps or monotonic() >= deadline
-        return int(interrupted)
+        # Preserve the original short-circuit and clock reads. This records the
+        # first rejecting gate; a VM rejection does not sample the wall clock.
+        if steps >= limits.vm_steps:
+            interrupted = "vm_steps"
+        elif monotonic() >= deadline:
+            interrupted = "wall_clock"
+        else:
+            interrupted = None
+        return int(interrupted is not None)
+
+    def budget_error(trigger: Literal["vm_steps", "wall_clock"]) -> ExistingStoreError:
+        error = ExistingStoreError("existing_store_read_budget")
+        try:
+            error.add_note(
+                "existing_store_read_observation="
+                + json.dumps(
+                    {
+                        "group": group,
+                        "phase": phase,
+                        "trigger": trigger,
+                        "steps": steps,
+                        "vm_limit": limits.vm_steps,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:
+            pass  # Optional diagnostics must not replace the original rejection.
+        return error
 
     try:
         try:
@@ -328,13 +358,16 @@ def validate_existing_schema(
                 raise ExistingStoreError("existing_store_journal_unsupported")
             db.execute("BEGIN")
             begun = True
+            phase = "schema"
             _validate_definitions(db, definitions, limits)
             if group in {"all", "core"}:
+                phase = "core_markers"
                 if _text(db, "message_sequence_v1") != "done":
                     raise ExistingStoreError("existing_store_marker_invalid")
                 _text(db, "store_instance_v1")
                 read_existing_main(db, _text(db, "main_session"), maximum=limits.main_object_bytes)
             if group in {"all", "memory"}:
+                phase = "memory_markers"
                 for name, expected in (("revision", None), ("alias_evidence_version", 1)):
                     kind, value = _row(
                         db,
@@ -348,8 +381,9 @@ def validate_existing_schema(
                         or (expected is not None and value != expected)
                     ):
                         raise ExistingStoreError("existing_store_marker_invalid")
+            phase = "complete"
             if monotonic() >= deadline:
-                raise ExistingStoreError("existing_store_read_budget")
+                raise budget_error("wall_clock")
         finally:
             failed = False
             if installed:
@@ -377,5 +411,6 @@ def validate_existing_schema(
             if failed:
                 raise ExistingStoreError("existing_store_cleanup_failed")
     except (sqlite3.Error, UnicodeError):
-        code = "existing_store_read_budget" if interrupted else "existing_store_unavailable"
-        raise ExistingStoreError(code) from None
+        if interrupted is not None:
+            raise budget_error(interrupted) from None
+        raise ExistingStoreError("existing_store_unavailable") from None

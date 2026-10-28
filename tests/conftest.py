@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -9,9 +10,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--muli-ci-shard",
         type=int,
-        choices=(1, 2),
+        choices=(1, 2, 3),
         default=None,
-        help="Run one of two disjoint file groups after normal pytest collection.",
+        help="Run one disjoint file group after normal pytest collection (one-based index).",
+    )
+    parser.addoption(
+        "--muli-ci-shards",
+        type=int,
+        choices=(2, 3),
+        default=2,
+        help="Total file groups when --muli-ci-shard is enabled (default: 2).",
     )
 
 
@@ -20,10 +28,22 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     shard = config.getoption("--muli-ci-shard")
     if shard is None:
         return
-    # Keep a file's parameterized cases and fixture lifetime together. Both jobs
+    shards = config.getoption("--muli-ci-shards")
+    if not 1 <= shard <= shards:
+        raise pytest.UsageError("--muli-ci-shard must be between 1 and --muli-ci-shards")
+    # Keep a file's parameterized cases and fixture lifetime together. All jobs
     # collect normally, so pytest's own discovery and ignore rules remain authoritative.
-    files = sorted({item.path for item in items})
-    membership = {name: index % 2 + 1 for index, name in enumerate(files)}
+    membership: dict[Path, int] = {}
+    for path in {item.path for item in items}:
+        try:
+            name = path.relative_to(config.rootpath).as_posix()
+        except ValueError as error:
+            raise pytest.UsageError(
+                "MuLi CI shards require test files inside pytest rootdir"
+            ) from error
+        # Relative POSIX names stay stable across runners and added test files.
+        digest = hashlib.sha256(name.encode("utf-8")).digest()
+        membership[path] = int.from_bytes(digest, "big") % shards + 1
     selected: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:

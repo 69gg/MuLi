@@ -743,7 +743,7 @@ function startGlobalEvents(owner = connection) {
     }
     if (event.type === "reminder.updated") {
       const item = event.data;
-      if (item?.id) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id)];
+      if (item?.id && ["reminder", "calendar_reminder"].includes(reminderKind(item))) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id || reminderKind(entry) !== reminderKind(item))];
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
     if (event.type.startsWith("team.") && state.view === "team") void refreshTeam({}, owner);
@@ -1711,8 +1711,10 @@ function renderMemorySources(slot) {
   slot.refresh = element("button", { type: "button", class: "secondary-button", text: "刷新来源", onClick: () => void loadMemorySources(slot) });
   slot.next = element("button", { type: "button", class: "secondary-button", text: "继续翻页", onClick: () => void loadMemorySources(slot, { cursor: slot.page?.next_cursor }) });
   slot.position = element("p", { class: "settings-role-hint", role: "status", tabIndex: -1 });
+  slot.compareNotice = element("p", { class: "settings-role-hint", role: "status" });
+  slot.clearCompare = element("button", { type: "button", class: "text-button", text: "清除比较选择", hidden: true, onClick: () => { if (memorySourcesCurrent(slot)) { slot.compareLeft = null; updateMemorySources(slot); } } });
   slot.result = element("div"); slot.notice = element("div", { "aria-live": "polite" }); slot.receiptRegion = element("div", { "aria-live": "polite" });
-  slot.root = element("section", { "aria-label": "已保存来源" }, element("div", { class: "content-toolbar" }, element("label", {}, "整理状态", slot.filterInput), slot.refresh), element("p", { class: "settings-role-hint", text: "查看已保存资料及整理进度。" }), slot.position, slot.notice, slot.receiptRegion, slot.result, slot.next);
+  slot.root = element("section", { "aria-label": "已保存来源" }, element("div", { class: "content-toolbar" }, element("label", {}, "整理状态", slot.filterInput), slot.refresh, slot.clearCompare), element("p", { class: "settings-role-hint", text: "查看已保存资料及整理进度。" }), slot.compareNotice, slot.position, slot.notice, slot.receiptRegion, slot.result, slot.next);
   updateMemorySources(slot); return slot.root;
 }
 
@@ -1727,6 +1729,8 @@ function updateMemorySources(slot) {
   const focused = slot.result.contains(document.activeElement);
   slot.root.setAttribute("aria-busy", String(loading)); slot.filterInput.disabled = loading; slot.refresh.disabled = loading;
   slot.next.disabled = loading || !page?.has_more;
+  slot.clearCompare.hidden = !slot.compareLeft; slot.clearCompare.disabled = loading;
+  slot.compareNotice.textContent = slot.compareLeft ? `已选左侧：${slot.compareLeft.source_id} · 选择另一份资料比较。` : "";
   slot.position.textContent = loading ? "正在读取来源…" : page ? `本页 ${page.items.length} 个来源 · 检查 ${page.examined} 个 · 略过 ${page.omitted} 个 · ${page.has_more ? "仍可继续翻页" : "已到末尾"}` : "尚未读取来源。";
   slot.notice.replaceChildren();
   if (slot.error) slot.notice.append(element("p", { class: "form-error", role: "status", text: slot.error }), element("button", { type: "button", class: "text-button", text: "重试读取", disabled: loading, onClick: () => void loadMemorySources(slot, slot.retry) }));
@@ -1737,6 +1741,14 @@ function updateMemorySources(slot) {
     const read = element("button", { type: "button", class: "text-button", text: "核原文", disabled: loading, onClick: () => void showCatalogSource(slot, item, read) });
     const search = element("button", { type: "button", class: "text-button", text: "在此来源内查找", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, search)) void changeMemorySource(item.source_id); } });
     const actions = element("div", { class: "row-actions" }, read, search);
+    if (/^attachment:[a-f0-9]{32}$/.test(item.source_id) && item.principal === "external:attachment" && item.role === "tool" && !item.trusted_owner) {
+      const left = element("button", { type: "button", class: "text-button", text: "选作比较左侧", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, left)) { slot.compareLeft = { source_id: item.source_id, revision: item.revision }; updateMemorySources(slot); } } });
+      actions.append(left);
+      if (slot.compareLeft) {
+        const compare = element("button", { type: "button", class: "text-button", text: "与所选比较", disabled: loading || slot.compareLeft.source_id === item.source_id, onClick: () => void showSourceComparison(slot, item, compare) });
+        actions.append(compare);
+      }
+    }
     if (["failed", "deferred"].includes(item.job.state)) {
       const retry = element("button", { type: "button", class: "text-button", text: "重试此来源", disabled: loading, onClick: () => confirmMemorySourceRetry(slot, item, retry) });
       actions.append(retry);
@@ -1792,14 +1804,105 @@ function confirmMemorySourceRetry(slot, item, trigger) {
 
 async function showCatalogSource(catalog, item, trigger) {
   if (!memorySourceActionCurrent(catalog, trigger)) return;
+  await openCatalogSource(item, trigger);
+}
+
+async function openCatalogSource(item, trigger, { anchor = null, comparisonReturn = null } = {}) {
+  const offset = anchor?.offset ?? 0;
   const content = element("div", { class: "memory-verification" });
   openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger });
   const origin = { ...item, id: item.source_id, digest: item.revision };
-  const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [0], pageIndex: 0, page: null, editing: false };
+  const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [offset], sourceStart: offset, sourceAnchor: anchor, comparisonReturn, comparisonSources: comparisonReturn ? [comparisonReturn.pair.left_id, comparisonReturn.pair.right_id] : undefined, pageIndex: 0, page: null, editing: false };
   memoryDialog = slot;
+  if (comparisonReturn) {
+    const back = element("button", { type: "button", class: "text-button", text: "返回这段差异", onClick: () => {
+      if (memoryDialogCurrent(slot) && content.contains(back) && slot.comparisonReturn === comparisonReturn) void openSourceComparison(comparisonReturn.pair, comparisonReturn.trigger, comparisonReturn.cursor, comparisonReturn.focus);
+    } });
+    content.append(back);
+  }
   slot.sourceRegion = element("div", { class: "memory-source-page", "aria-live": "polite" });
   content.append(statusList([["来源 ID", item.source_id], ["身份", item.principal], ["角色", item.role], ["来源", item.source], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]), slot.sourceRegion);
-  await loadMemorySource(slot, 0, 0);
+  if (anchor?.empty && offset === item.total_bytes) renderMemorySource(slot);
+  else await loadMemorySource(slot, offset, 0);
+}
+
+function sourceComparisonPage(value, pair, cursor) {
+  const bad = () => { throw new Error("资料比较响应不完整，请重新核对。"); };
+  if (!value || !["equal", "changed"].includes(value.status) || value.algorithm !== "line_sequence_matcher_v1" || !Array.isArray(value.items) || typeof value.has_more !== "boolean") bad();
+  if (value.has_more ? typeof value.next_cursor !== "string" || !value.next_cursor || value.next_cursor === cursor || !value.items.length : value.next_cursor !== null) bad();
+  for (const side of ["left", "right"]) {
+    const source = value[side];
+    if (!source || source.source_id !== pair[`${side}_id`] || source.revision !== pair[`${side}_revision`] || !Number.isSafeInteger(source.total_bytes) || source.total_bytes < 0 || ![source.source, source.session_id, source.principal, source.scope, source.format].every((field) => typeof field === "string") || source.role !== "tool" || source.principal !== "external:attachment" || source.trusted_owner !== false) bad();
+    if (source.attachment_id !== source.source_id.slice("attachment:".length) || !/^[a-f0-9]{32}$/.test(source.attachment_id) || !/^[a-f0-9]{64}$/.test(source.source_revision) || !Number.isFinite(source.created_at) || source.created_at < 0 || source.scope !== { text: "utf8_text", pdf: "pdf_text_layer", docx: "docx_main_body_text" }[source.format] || (source.format === "text" ? source.document_revision !== null : typeof source.document_revision !== "string" || !/^[a-f0-9]{64}$/.test(source.document_revision))) bad();
+  }
+  if ((value.status === "equal") !== (value.items.length === 0 && !value.has_more)) bad();
+  for (const item of value.items) {
+    if (!item || !["insert", "delete", "replace"].includes(item.kind)) bad();
+    for (const side of ["left", "right"]) {
+      const change = item[side], read = change?.read_arguments;
+      if (!change || typeof change.content !== "string" || !Number.isSafeInteger(change.offset_bytes) || change.offset_bytes < 0 || !Number.isSafeInteger(change.length_bytes) || change.length_bytes < 0 || !Number.isSafeInteger(change.offset_bytes + change.length_bytes) || change.offset_bytes + change.length_bytes > value[side].total_bytes || new TextEncoder().encode(change.content).length !== change.length_bytes || !read || read.id !== pair[`${side}_id`] || read.revision !== pair[`${side}_revision`] || read.offset_bytes !== change.offset_bytes || (change.length_bytes ? read.length_bytes !== change.length_bytes : Object.hasOwn(read, "length_bytes"))) bad();
+    }
+    if (item.kind === "insert" ? item.left.length_bytes !== 0 || item.right.length_bytes === 0 : item.kind === "delete" ? item.right.length_bytes !== 0 || item.left.length_bytes === 0 : !item.left.length_bytes || !item.right.length_bytes) bad();
+  }
+  return value;
+}
+
+async function showSourceComparison(catalog, right, trigger) {
+  if (!memorySourceActionCurrent(catalog, trigger) || !catalog.compareLeft) return;
+  const pair = { left_id: catalog.compareLeft.source_id, left_revision: catalog.compareLeft.revision, right_id: right.source_id, right_revision: right.revision };
+  await openSourceComparison(pair, trigger);
+}
+
+async function openSourceComparison(pair, trigger, cursor = null, focus = null) {
+  const content = element("div", { class: "memory-verification" });
+  openDialog({ title: "资料变化", content, readOnly: true, returnMemoryId: pair.right_id, returnMemoryTrigger: trigger });
+  const slot = { id: pair.right_id, catalogSource: true, content, comparisonSources: [pair.left_id, pair.right_id], comparisonPair: { ...pair }, catalogTrigger: trigger, comparisonCursor: cursor, offsets: [0], pageIndex: 0, page: null, editing: false };
+  memoryDialog = slot;
+  await loadSourceComparison(slot, cursor, focus);
+}
+
+function comparisonSourceButton(slot, source, focus, text, anchor = null) {
+  const button = element("button", { type: "button", class: "text-button", text, "data-source-comparison-ref": focus, onClick: () => {
+    if (!memoryDialogCurrent(slot) || !slot.content.contains(button)) return;
+    const comparisonReturn = { pair: { ...slot.comparisonPair }, cursor: slot.comparisonCursor, focus, trigger: slot.catalogTrigger };
+    void openCatalogSource(source, slot.catalogTrigger, { anchor, comparisonReturn });
+  } });
+  return button;
+}
+
+async function loadSourceComparison(slot, cursor = null, focus = null) {
+  if (!memoryDialogCurrent(slot)) return;
+  slot.sourceController?.abort();
+  const controller = new AbortController(); slot.sourceController = controller;
+  const current = () => memoryDialogCurrent(slot) && slot.sourceController === controller;
+  slot.content.replaceChildren(element("p", { role: "status", text: "正在核对原文变化…" }));
+  try {
+    const payload = await request("/memory/sources/compare", { method: "POST", body: { ...slot.comparisonPair, ...(cursor ? { cursor } : {}) }, signal: controller.signal });
+    if (!current()) return;
+    const page = sourceComparisonPage(payload, slot.comparisonPair, cursor);
+    slot.comparisonCursor = cursor;
+    slot.content.replaceChildren(element("p", { role: "status", text: page.status === "equal" ? "两份已保存正文一致。" : page.has_more ? "本段变化 · 仍有后续差异" : "本段变化 · 已到末尾" }));
+    for (const side of ["left", "right"]) {
+      const source = page[side];
+      const read = comparisonSourceButton(slot, source, `header:${side}`, `核对${side === "left" ? "左" : "右"}侧原文`);
+      slot.content.append(element("p", { class: "settings-role-hint", text: `${side === "left" ? "左侧" : "右侧"}：${source.source_id} · ${source.scope}` }), read);
+    }
+    for (const [index, item] of page.items.entries()) {
+      const block = element("section", { class: "advanced-settings" }, element("h3", { text: { insert: "新增", delete: "删除", replace: "替换" }[item.kind] }));
+      for (const side of ["left", "right"]) {
+        const change = item[side];
+        block.append(element("p", { class: "settings-role-hint", text: `${side === "left" ? "左侧" : "右侧"} · 字节 ${change.offset_bytes}–${change.offset_bytes + change.length_bytes}` }), element("pre", { class: "memory-source-content", text: change.length_bytes ? change.content : "（此处无正文）" }), comparisonSourceButton(slot, page[side], `${index}:${side}`, `核对${side === "left" ? "左" : "右"}侧此处原文`, { offset: change.read_arguments.offset_bytes, empty: change.length_bytes === 0 }));
+      }
+      slot.content.append(block);
+    }
+    if (page.has_more) {
+      const next = element("button", { type: "button", class: "secondary-button", text: "继续核对差异", onClick: () => { if (memoryDialogCurrent(slot) && slot.content.contains(next)) void loadSourceComparison(slot, page.next_cursor); } });
+      slot.content.append(next);
+    }
+    if (focus) slot.content.querySelector(`[data-source-comparison-ref="${focus}"]`)?.focus({ preventScroll: true });
+  } catch (error) {
+    if (current()) memoryUnavailable(slot, error.message);
+  } finally { if (slot.sourceController === controller) slot.sourceController = null; }
 }
 
 function memorySearchPath(query, sourceId = null) {
@@ -1997,6 +2100,7 @@ function resetMemoryReads(slot) {
   for (const key of ["readController", "sourceController", "historyController"]) { slot[key]?.abort(); slot[key] = null; }
   slot.sourceRegion?.replaceChildren(); slot.historyList?.replaceChildren();
   slot.page = null; slot.offsets = [0]; slot.pageIndex = 0;
+  slot.comparisonReturn = null; slot.sourceAnchor = null; slot.sourceStart = 0;
 }
 
 function releaseMemoryDialog() {
@@ -2025,7 +2129,7 @@ function invalidateMemoryEvidence(event) {
   if (!slot || !memoryDialogCurrent(slot)) return;
   const data = event.data ?? {};
   const sourceUnresolved = slot.sourceId === undefined && !!slot.readController;
-  if (!(data.memory_ids ?? []).includes(slot.id) && !(data.source_id && (data.source_id === slot.sourceId || sourceUnresolved))) return;
+  if (!(data.memory_ids ?? []).includes(slot.id) && !(data.source_id && (data.source_id === slot.sourceId || slot.comparisonSources?.includes(data.source_id) || sourceUnresolved))) return;
   resetMemoryReads(slot);
   if (slot.editing) {
     slot.invalidated = true; $("#dialog-submit").disabled = true;
@@ -2145,13 +2249,25 @@ function renderMemorySource(slot) {
   const focused = slot.sourceRegion.contains(document.activeElement);
   slot.sourceRegion.setAttribute("aria-busy", String(!!slot.sourceController));
   slot.sourceRegion.replaceChildren();
+  if (slot.sourceAnchor) {
+    const anchor = slot.sourceAnchor, end = anchor.empty && anchor.offset === slot.item.origin.total_bytes;
+    slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: end ? anchor.offset ? "变化位置在原文末尾，此侧没有对应正文。" : "比较结果中此侧正文为空。" : anchor.empty ? "此侧没有对应正文；下面从变化位置继续阅读。" : "从这处变化开始核对原文。" }));
+  }
   if (page) {
     slot.sourceRegion.append(element("p", { class: "memory-source-content", text: page.content }));
-    const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: !!slot.sourceController || slot.pageIndex === 0, onClick: () => void loadMemorySource(slot, slot.offsets[slot.pageIndex - 1], slot.pageIndex - 1) });
-    const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1) });
-    const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
+    const previous = element("button", { type: "button", class: "text-button", text: "上一段", disabled: !!slot.sourceController || slot.pageIndex === 0, onClick: () => { if (slot.sourceRegion.contains(previous) && slot.pageIndex > 0) void loadMemorySource(slot, slot.offsets[slot.pageIndex - 1], slot.pageIndex - 1); } });
+    const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => { if (slot.sourceRegion.contains(next) && page.has_more) void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1); } });
+    const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `${slot.sourceStart > 0 ? "从变化位置起 · " : ""}第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
     slot.sourceRegion.append(element("nav", { class: "memory-source-navigation", "aria-label": "原文分段" }, previous, position, next));
     if (focused) position.focus({ preventScroll: true });
+  }
+  if (slot.sourceStart > 0) {
+    const start = element("button", { type: "button", class: "text-button", text: "从头阅读", disabled: !!slot.sourceController, onClick: () => {
+      if (!memoryDialogCurrent(slot) || !slot.sourceRegion.contains(start) || slot.sourceController) return;
+      slot.page = null; slot.offsets = [0]; slot.pageIndex = 0; slot.sourceStart = 0; slot.sourceAnchor = null;
+      void loadMemorySource(slot, 0, 0);
+    } });
+    slot.sourceRegion.append(start);
   }
   if (slot.sourceController) slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: "正在读取…" }));
   if (slot.sourceError) slot.sourceRegion.append(element("p", { class: "form-error", text: slot.sourceError }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemorySource(slot, slot.sourceRetry.offset, slot.sourceRetry.index) }));
@@ -2242,7 +2358,7 @@ function captureWorkflowView(root) {
   const inside = root.contains(focused);
   return {
     inside, action: inside ? focused?.dataset?.action : null,
-    id: focused?.dataset?.id, direction: focused?.dataset?.direction,
+    id: focused?.dataset?.id, kind: focused?.dataset?.kind, direction: focused?.dataset?.direction,
     heading: inside ? focused?.getAttribute("id") : null,
     summary: inside && focused?.tagName === "SUMMARY" ? focused.closest("[data-workflow-history-run]")?.dataset.workflowHistoryRun : null,
     open: $$("[data-workflow-history-run]", root).filter((node) => node.open).map((node) => node.dataset.workflowHistoryRun),
@@ -2254,7 +2370,7 @@ function restoreWorkflowView(root, saved) {
   const histories = $$("[data-workflow-history-run]", root);
   for (const details of histories) details.open = saved.open.includes(details.dataset.workflowHistoryRun);
   if (!saved.inside) return;
-  const button = saved.action && $$("[data-action]", root).find((node) => node.dataset.action === saved.action && node.dataset.id === saved.id && node.dataset.direction === saved.direction);
+  const button = saved.action && $$("[data-action]", root).find((node) => node.dataset.action === saved.action && node.dataset.id === saved.id && node.dataset.kind === saved.kind && node.dataset.direction === saved.direction);
   const summary = saved.summary && histories.find((node) => node.dataset.workflowHistoryRun === saved.summary)?.querySelector("summary");
   const heading = saved.heading && $$("[id]", root).find((node) => node.getAttribute("id") === saved.heading);
   const target = button && !button.disabled ? button : summary || heading || $("#workflow-active-heading", root);
@@ -2288,6 +2404,9 @@ function renderWorkflowActivity() {
   return root;
 }
 
+function workflowScheduleKind(item) { return item.kind === undefined ? "workflow_schedule" : item.kind; }
+function workflowScheduleKey(kind, id) { return JSON.stringify([kind, id]); }
+
 async function loadWorkflowSchedules(slot, after = "", starts = [""]) {
   const owner = connection;
   if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !connectionCurrent(owner)) return;
@@ -2296,18 +2415,25 @@ async function loadWorkflowSchedules(slot, after = "", starts = [""]) {
   slot.schedulesLoading = true; slot.schedulesError = ""; renderOtherView();
   const current = () => workflowActivityCurrent(slot) && slot.schedulesOpen && connectionCurrent(owner) && slot.schedulesController === controller && !controller.signal.aborted;
   try {
-    const payload = await ownedRequest(`/workflow-schedules?${new URLSearchParams({ after_id: after, limit: workflowPageSize })}`, { signal: controller.signal, cache: "no-store" }, owner);
+    const cursor = typeof after === "string" ? { id: after, kind: null } : after;
+    const query = new URLSearchParams({ after_id: cursor.id, limit: workflowPageSize });
+    if (cursor.kind !== null) query.set("after_kind", cursor.kind);
+    const payload = await ownedRequest(`/workflow-schedules?${query}`, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     if (!payload || !Array.isArray(payload.items) || payload.items.length > workflowPageSize || typeof payload.has_more !== "boolean") throw new Error("定时委托响应不完整，请重试。");
     const seen = new Set();
     const items = payload.items.map((item) => {
-      if (!item || typeof item.id !== "string" || !item.id || item.id === after || seen.has(item.id) || typeof item.name !== "string" || typeof item.enabled !== "boolean" || !(item.due_at === null || (Number.isFinite(item.due_at) && item.due_at > 0)) || !(item.last_run_id === null || (typeof item.last_run_id === "string" && item.last_run_id)) || !(item.last_status === null || ["pending", "queued", "running", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(item.last_status))) throw new Error("定时委托响应不完整，请重试。");
-      seen.add(item.id);
+      const kind = item && workflowScheduleKind(item), key = workflowScheduleKey(kind, item?.id);
+      if (!item || !["workflow_schedule", "calendar_workflow_schedule"].includes(kind) || typeof item.id !== "string" || !item.id || (item.id === cursor.id && (cursor.kind === null || kind <= cursor.kind)) || seen.has(key) || typeof item.name !== "string" || typeof item.enabled !== "boolean" || !(item.due_at === null || (Number.isFinite(item.due_at) && item.due_at > 0)) || !(item.last_run_id === null || (typeof item.last_run_id === "string" && item.last_run_id)) || !(item.last_status === null || ["pending", "queued", "running", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(item.last_status))) throw new Error("定时委托响应不完整，请重试。");
+      seen.add(key);
       if (typeof item.blocked !== "boolean") throw new Error("定时委托响应不完整，请重试。");
-      return { id: item.id, name: item.name, enabled: item.enabled, blocked: item.blocked, due_at: item.due_at, interval_seconds: item.interval_seconds, last_run_id: item.last_run_id, last_status: item.last_status };
+      return { id: item.id, kind, calendar_label: kind === "calendar_workflow_schedule" ? calendarLabel(item.calendar) : null, name: item.name, enabled: item.enabled, blocked: item.blocked, due_at: item.due_at, interval_seconds: item.interval_seconds, last_run_id: item.last_run_id, last_status: item.last_status };
     });
     if (payload.has_more ? !items.length || payload.next_after !== items.at(-1).id : payload.next_after !== null) throw new Error("定时委托翻页位置无效，请重新读取。");
-    slot.schedulesPage = { items, has_more: payload.has_more, next_after: payload.next_after };
+    const modern = payload.next_after_kind !== undefined || payload.items.some((item) => item.kind !== undefined);
+    if (modern && (payload.has_more ? payload.next_after_kind !== items.at(-1).kind : payload.next_after_kind !== null)) throw new Error("定时委托翻页类别无效，请重新读取。");
+    const next = modern && payload.has_more ? { id: payload.next_after, kind: payload.next_after_kind } : payload.next_after;
+    slot.schedulesPage = { items, has_more: payload.has_more, next_after: payload.next_after, next_cursor: next };
     slot.schedulesAfter = after; slot.schedulesStarts = [...starts];
   } catch (error) { if (current()) slot.schedulesError = error.message; }
   finally {
@@ -2331,11 +2457,13 @@ function renderWorkflowSchedules() {
     const status = !item.enabled ? "已停用" : item.blocked ? "暂缓执行" : item.due_at === null ? "无后续计划" : "等待下次执行";
     const recent = { pending: "等待中", queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断", timed_out: "超时" };
     const content = element("div", { class: "row-content" }, element("h4", { text: item.name }), element("code", { class: "workflow-run-id", text: item.id }), element("div", { class: "row-meta" }, status, item.due_at !== null && element("time", { text: formatTimestamp(item.due_at) })));
+    if (item.calendar_label) content.append(element("div", { class: "row-meta", text: item.calendar_label }));
     if (item.last_run_id) content.append(element("div", { class: "row-meta" }, `最近执行：${recent[item.last_status] ?? "状态未记录"}`, element("code", { text: item.last_run_id })));
     const actions = element("div", { class: "row-actions" });
     if (item.enabled) {
-      const cancel = actionButton(slot.schedulesStopping.has(item.id) ? "正在提交…" : "取消委托", "cancel-workflow-schedule", "secondary-button", "stop", { id: item.id });
-      cancel.disabled = slot.schedulesLoading || slot.schedulesStopping.has(item.id); actions.append(cancel);
+      const key = workflowScheduleKey(item.kind, item.id);
+      const cancel = actionButton(slot.schedulesStopping.has(key) ? "正在提交…" : "取消委托", "cancel-workflow-schedule", "secondary-button", "stop", { id: item.id, kind: item.kind });
+      cancel.disabled = slot.schedulesLoading || slot.schedulesStopping.has(key); actions.append(cancel);
     }
     root.append(element("article", { class: "workflow-active-row" }, content, actions));
   }
@@ -2459,6 +2587,22 @@ function intervalLabel(seconds) {
   return `每 ${seconds} 秒`;
 }
 
+function reminderKind(item) { return item.kind === undefined ? "reminder" : item.kind; }
+
+function findReminder(id, kind = "reminder") {
+  if (!["reminder", "calendar_reminder"].includes(kind)) return undefined;
+  return state.reminders.find((entry) => String(entry.id) === String(id) && reminderKind(entry) === kind);
+}
+
+function reminderPath(item) { return `/reminders/${encodeURIComponent(item.id)}?${new URLSearchParams({ kind: reminderKind(item) })}`; }
+
+function calendarLabel(rule) {
+  if (!rule || typeof rule.timezone !== "string" || typeof rule.local_time !== "string" || !Array.isArray(rule.weekdays)) return "日历规则不可用";
+  const days = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  const weekdays = rule.weekdays.length === 7 ? "每天" : rule.weekdays.map((day) => days[day]).join("、");
+  return `${rule.timezone} · ${rule.local_time} · ${weekdays}`;
+}
+
 function renderReminders() {
   if (state.remindersError) {
     const empty = emptyState("info", "暂时无法读取提醒", state.remindersError);
@@ -2469,14 +2613,17 @@ function renderReminders() {
   if (!state.reminders.length) root.append(emptyState("bell", "还没有提醒", "选择时间，添加一次或重复提醒。"));
   const sorted = [...state.reminders].sort((first, second) => Number(second.enabled) - Number(first.enabled) || first.due_at - second.due_at);
   for (const item of sorted) {
-    const completed = !item.enabled && !item.interval_seconds && item.fired_count > 0;
-    root.append(element("article", { class: `notification-row reminder-row${item.enabled ? "" : " paused"}` }, element("div", { class: "row-icon" }, icon("bell")), element("div", { class: "row-content" }, element("h3", { text: item.title }), item.content && element("p", { text: item.content }), element("div", { class: "row-meta" }, element("time", { text: formatFullDate(item.due_at) }), element("span", { class: "row-tag", text: intervalLabel(item.interval_seconds) }), element("span", { text: item.enabled ? "已启用" : completed ? "已完成" : "已暂停" }), item.fired_count > 0 && element("span", { text: `已提醒 ${item.fired_count} 次` }))), element("div", { class: "row-actions" }, actionButton("改期", "edit-reminder", "text-button", undefined, { id: item.id }), iconButton(item.enabled ? "暂停提醒" : "启用提醒", "toggle-reminder", item.enabled ? "stop" : "play", { id: item.id }), iconButton("删除提醒", "delete-reminder", "trash", { id: item.id }))));
+    const kind = reminderKind(item), calendar = kind === "calendar_reminder";
+    const completed = !calendar && !item.enabled && !item.interval_seconds && item.fired_count > 0;
+    root.append(element("article", { class: `notification-row reminder-row${item.enabled ? "" : " paused"}` }, element("div", { class: "row-icon" }, icon("bell")), element("div", { class: "row-content" }, element("h3", { text: item.title }), item.content && element("p", { text: item.content }), element("div", { class: "row-meta" }, element("time", { text: formatFullDate(item.due_at) }), element("span", { class: "row-tag", text: calendar ? calendarLabel(item.calendar) : intervalLabel(item.interval_seconds) }), element("span", { text: item.enabled ? "已启用" : completed ? "已完成" : "已暂停" }), item.fired_count > 0 && element("span", { text: `已提醒 ${item.fired_count} 次` }))), element("div", { class: "row-actions" }, actionButton("改期", "edit-reminder", "text-button", undefined, { id: item.id, kind }), iconButton(item.enabled ? "暂停提醒" : "启用提醒", "toggle-reminder", item.enabled ? "stop" : "play", { id: item.id, kind }), iconButton("删除提醒", "delete-reminder", "trash", { id: item.id, kind }))));
   }
   return root;
 }
 
-function editReminder(id) {
-  const item = state.reminders.find((entry) => String(entry.id) === String(id));
+function editReminder(id, kind = "reminder") {
+  const item = id === undefined ? null : findReminder(id, kind);
+  if (id !== undefined && !item) return;
+  const calendar = item && reminderKind(item) === "calendar_reminder";
   const standardIntervals = [3600, 86400, 604800];
   const intervalValue = !item?.interval_seconds ? "once" : standardIntervals.includes(item.interval_seconds) ? String(item.interval_seconds) : "custom";
   const custom = field("间隔（秒）", "custom-interval", item?.interval_seconds ?? 3600, { type: "number", min: 60, max: 31536000 });
@@ -2484,27 +2631,30 @@ function editReminder(id) {
   const interval = selectField("重复", "interval", intervalValue, [["once", "不重复"], ["3600", "每小时"], ["86400", "每天"], ["604800", "每周"], ["custom", "自定义"]]);
   $("select", interval).addEventListener("change", (event) => { custom.hidden = event.target.value !== "custom"; });
   const due = item?.due_at > Date.now() / 1000 ? item.due_at : Date.now() / 1000 + 3600;
-  const content = element("div", {}, field("标题", "title", item?.title ?? "", { required: true, maxLength: 120 }), field("时间", "due_at", toDateTimeLocal(due), { type: "datetime-local", required: true }), interval, custom, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 3, placeholder: "可选", maxLength: 4000 }), item && switchField("启用提醒", "enabled", item.enabled));
+  const content = element("div", {}, field("标题", "title", item?.title ?? "", { required: true, maxLength: 120 }), field("时间", "due_at", toDateTimeLocal(due), { type: "datetime-local", required: true }), !calendar && interval, !calendar && custom, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 3, placeholder: "可选", maxLength: 4000 }), item && switchField("启用提醒", "enabled", item.enabled));
   openDialog({ title: item ? "编辑提醒" : "新建提醒", content, submitLabel: item ? "保存提醒" : "创建提醒", onSubmit: async (form) => {
     const data = new FormData(form);
     const dueAt = fromDateTimeLocal(String(data.get("due_at")));
     const enabled = item ? data.get("enabled") === "on" : true;
     if (enabled && dueAt <= Date.now() / 1000) throw new Error("请选择一个未来时间。");
-    const selected = data.get("interval");
-    const intervalSeconds = selected === "once" ? null : selected === "custom" ? Number(data.get("custom-interval")) : Number(selected);
-    if (intervalSeconds !== null && (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 31536000)) throw new Error("重复间隔需为 60 秒至一年。");
-    const payload = { title: String(data.get("title")).trim(), content: String(data.get("content")).trim(), due_at: dueAt, interval_seconds: intervalSeconds, ...(item ? { enabled } : {}) };
-    await request(item ? `/reminders/${encodeURIComponent(item.id)}` : "/reminders", { method: item ? "PATCH" : "POST", body: payload });
+    const payload = { title: String(data.get("title")).trim(), content: String(data.get("content")).trim(), due_at: dueAt, ...(item ? { enabled } : {}) };
+    if (!calendar) {
+      const selected = data.get("interval");
+      const intervalSeconds = selected === "once" ? null : selected === "custom" ? Number(data.get("custom-interval")) : Number(selected);
+      if (intervalSeconds !== null && (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 31536000)) throw new Error("重复间隔需为 60 秒至一年。");
+      payload.interval_seconds = intervalSeconds;
+    }
+    await request(item ? reminderPath(item) : "/reminders", { method: item ? "PATCH" : "POST", body: payload });
     toast(item ? "提醒已更新" : "提醒已创建"); await switchView("notifications");
   } });
 }
 
-async function toggleReminder(id, button) {
-  const item = state.reminders.find((entry) => String(entry.id) === String(id));
+async function toggleReminder(id, button, kind = "reminder") {
+  const item = findReminder(id, kind);
   if (!item) return;
-  if (!item.enabled && item.due_at <= Date.now() / 1000) { editReminder(id); return; }
+  if (!item.enabled && item.due_at <= Date.now() / 1000) { editReminder(id, kind); return; }
   button.disabled = true;
-  try { await request(`/reminders/${encodeURIComponent(id)}`, { method: "PATCH", body: { enabled: !item.enabled } }); await switchView("notifications"); }
+  try { await request(reminderPath(item), { method: "PATCH", body: { enabled: !item.enabled } }); await switchView("notifications"); }
   finally { button.disabled = false; }
 }
 
@@ -3168,17 +3318,19 @@ async function handleAction(action, button) {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || slot.schedulesLoading) return;
     if (action === "refresh-workflow-schedules") await loadWorkflowSchedules(slot);
-    else if (button.dataset.direction === "next" && slot.schedulesPage?.has_more) await loadWorkflowSchedules(slot, slot.schedulesPage.next_after, [...slot.schedulesStarts, slot.schedulesPage.next_after]);
+    else if (button.dataset.direction === "next" && slot.schedulesPage?.has_more) await loadWorkflowSchedules(slot, slot.schedulesPage.next_cursor, [...slot.schedulesStarts, slot.schedulesPage.next_cursor]);
     else if (button.dataset.direction === "previous" && slot.schedulesStarts.length > 1) await loadWorkflowSchedules(slot, slot.schedulesStarts.at(-2), slot.schedulesStarts.slice(0, -1));
   }
   if (action === "cancel-workflow-schedule") {
     const slot = workflowActivity, id = button.dataset.id, owner = connection;
-    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || !slot.schedulesPage?.items.some((item) => item.id === id && item.enabled) || slot.schedulesStopping.has(id)) return;
-    slot.schedulesStopping.add(id); renderOtherView();
+    const kind = workflowScheduleKind(button.dataset), key = workflowScheduleKey(kind, id);
+    if (!workflowActivityCurrent(slot) || !slot.schedulesOpen || !$("#workflow-schedules")?.contains(button) || !slot.schedulesPage?.items.some((item) => item.id === id && item.kind === kind && item.enabled) || slot.schedulesStopping.has(key)) return;
+    slot.schedulesStopping.add(key); renderOtherView();
     try {
-      await ownedRequest(`/workflow-schedules/${encodeURIComponent(id)}/cancel`, { method: "POST" }, owner);
+      const query = kind === "workflow_schedule" ? "" : `?${new URLSearchParams({ kind })}`;
+      await ownedRequest(`/workflow-schedules/${encodeURIComponent(id)}/cancel${query}`, { method: "POST" }, owner);
       if (workflowActivityCurrent(slot) && connectionCurrent(owner)) { toast("已提交取消请求"); await loadWorkflowSchedules(slot, slot.schedulesAfter, slot.schedulesStarts); }
-    } finally { slot.schedulesStopping.delete(id); if (workflowActivityCurrent(slot) && connectionCurrent(owner)) renderOtherView(); }
+    } finally { slot.schedulesStopping.delete(key); if (workflowActivityCurrent(slot) && connectionCurrent(owner)) renderOtherView(); }
   }
   if (["refresh-workflow-runs", "page-workflow-runs"].includes(action)) {
     const slot = workflowActivity;
@@ -3199,9 +3351,12 @@ async function handleAction(action, button) {
   if (action === "delete-workflow") confirmAction("删除工作流", "此工作流定义会被删除，已有会话保留。", "删除工作流", async () => { await request(`/workflows/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("workflows"); toast("工作流已删除"); });
   if (action === "read-notification") await markRead(button.dataset.id);
   if (action === "new-reminder") editReminder();
-  if (action === "edit-reminder") editReminder(button.dataset.id);
-  if (action === "toggle-reminder") await toggleReminder(button.dataset.id, button);
-  if (action === "delete-reminder") confirmAction("删除提醒", "删除后不再发送这条提醒，已收到的通知会保留。", "删除提醒", async () => { await request(`/reminders/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("notifications"); toast("提醒已删除"); });
+  if (action === "edit-reminder") editReminder(button.dataset.id, button.dataset.kind);
+  if (action === "toggle-reminder") await toggleReminder(button.dataset.id, button, button.dataset.kind);
+  if (action === "delete-reminder") {
+    const item = findReminder(button.dataset.id, button.dataset.kind);
+    if (item) confirmAction("删除提醒", "删除后不再发送这条提醒，已收到的通知会保留。", "删除提醒", async () => { await request(reminderPath(item), { method: "DELETE" }); await switchView("notifications"); toast("提醒已删除"); });
+  }
   if (action === "read-all") {
     const results = await Promise.allSettled(state.notifications.filter((item) => !item.read).map((item) => request(`/notifications/${encodeURIComponent(item.id)}`, { method: "PATCH", body: { read: true } })));
     if (results.some((result) => result.status === "rejected")) toast("部分通知未能更新，请重试。", true);

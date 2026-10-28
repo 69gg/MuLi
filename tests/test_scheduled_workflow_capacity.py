@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from test_runtime import make_runtime
 from test_workflows import step
 
+import muli.scheduled_workflows as scheduled_workflows_module
 from muli.providers import ModelTurn, ToolCall
 from muli.server import create_app
 from muli.store import now
@@ -18,6 +20,7 @@ from muli.store import now
 
 async def test_due_delegation_waits_for_real_terminal_finalizer_without_advancing_occurrence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     due_at = now() + 60
     runtime, _ = make_runtime(
@@ -115,6 +118,7 @@ async def test_due_delegation_waits_for_real_terminal_finalizer_without_advancin
         assert not runtime.attention_busy
         assert not runtime.workflows._tasks[blocker_id].done()
         runtime.reminders.changed.clear()
+        monkeypatch.setattr(scheduled_workflows_module, "now", lambda: due_at)
 
         # This is the real clock callback. Capacity exhaustion must return,
         # not throw into Reminders._run or write an occurrence before admission.

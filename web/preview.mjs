@@ -60,14 +60,21 @@ export function createPreviewState() {
     memorySources: [
       { source_id: "preview-source-notes", source: "前端演示资料", content: notes, session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "a".repeat(64), created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
       { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
+      ...[["e", "c", "1", "期限：七日\n材料：学生证\n"], ["f", "d", "2", "期限：十日\n材料：身份证\n"]].map(([id, original, revision, content]) => ({ source_id: `attachment:${id.repeat(32)}`, source: `attachment:${id.repeat(32)}:${original.repeat(64)}`, content, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false, revision: revision.repeat(64), source_revision: original.repeat(64), format: "text", scope: "utf8_text", document_revision: null, attachment_id: id.repeat(32), created_at: now - 1800, job: { state: "done", attempts: 1, last_error: "" }, comparisonDemo: true })),
     ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),
     members: [
       { id: "demo-researcher", session_id: "preview-researcher", name: "资料整理", role: "worker", parent_id: main.id, task: "整理示例项目结构与待办", status: "completed", generation: 1, last_message: "结构梳理与清单已完成。", created_at: now - 3600 },
       { id: "demo-reviewer", session_id: "preview-reviewer", name: "独立复核", role: "reviewer", parent_id: main.id, task: "检查整理结果是否遗漏边界", status: "completed", generation: 1, last_message: "已核对范围，保留需要你确认的事项。", created_at: now - 3500 },
     ], teamMessages: [],
     workflows: [{ id: "workflow-review", name: "资料整理与复核", description: "先整理资料，再独立复核，最后汇总为一份简报。", mode: "auto", steps: [{ id: "research", title: "整理资料", role: "worker", prompt: "整理资料与来源。", depends_on: [] }, { id: "review", title: "独立复核", role: "reviewer", prompt: "核对结论与来源。", depends_on: ["research"] }], runs: [], created_at: now - 86400, updated_at: now - 3600 }],
-    workflowRuns: [], schedules: [{ id: "schedule-weekly", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null }],
-    reminders: [{ id: "reminder-review", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now }],
+    workflowRuns: [], schedules: [
+      { id: "schedule-weekly", kind: "workflow_schedule", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null },
+      { id: "schedule-calendar", kind: "calendar_workflow_schedule", name: "早晨资料简报", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "08:00", weekdays: [1, 2, 3, 4, 5] }, enabled: true, blocked: false, due_at: now + 7200, interval_seconds: null, last_run_id: null, last_status: null },
+    ],
+    reminders: [
+      { id: "reminder-review", kind: "reminder", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now },
+      { id: "calendar-study", kind: "calendar_reminder", title: "早晨背单词", content: "每天留一点时间复习。", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "07:30", weekdays: [1, 2, 3, 4, 5] }, due_at: now + 7200, interval_seconds: null, enabled: true, fired_count: 0, created_at: now },
+    ],
     uploads: [{ id: "demo-notes", name: "项目整理示例.md", mime_type: "text/markdown", size: encoder.encode(notes).length, source: "preview", created_at: now - 3600 }],
     files: new Map([["demo-notes", new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
@@ -313,11 +320,19 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (item && method === "PATCH") { item.read = body.read === true; emit("notification.updated", item); return response(item); }
     }
     if (parts[0] === "reminders") {
-      if (parts.length === 1 && method === "GET") return response({ items: state.reminders });
-      if (parts.length === 1 && method === "POST") { if (atCapacity(state.reminders)) return failure("演示提醒数量已达上限。", 429); const item = { ...body, id: identifier("reminder"), enabled: true, fired_count: 0, created_at: timestamp() }; state.reminders.unshift(item); emit("reminder.updated", item); return response(item); }
-      const item = state.reminders.find((entry) => entry.id === id);
-      if (item && method === "PATCH") { merge(item, body); emit("reminder.updated", item); return response(item); }
-      if (item && method === "DELETE") { state.reminders = state.reminders.filter((entry) => entry.id !== id); return response({ deleted: true }); }
+      const reminderKind = (item) => item.kind === undefined ? "reminder" : item.kind;
+      if (parts.length === 1 && method === "GET") return response({ items: state.reminders.map((item) => ({ ...item, kind: reminderKind(item) })) });
+      if (parts.length === 1 && method === "POST") { if (atCapacity(state.reminders)) return failure("演示提醒数量已达上限。", 429); const item = { ...body, kind: "reminder", id: identifier("reminder"), enabled: true, fired_count: 0, created_at: timestamp() }; state.reminders.unshift(item); emit("reminder.updated", item); return response(item); }
+      const kind = url.searchParams.get("kind") ?? "reminder";
+      if (!["reminder", "calendar_reminder"].includes(kind)) return failure("提醒类别无效。", 422);
+      const item = state.reminders.find((entry) => entry.id === id && reminderKind(entry) === kind);
+      if (item && method === "PATCH") {
+        const fields = ["title", "content", "due_at", "enabled", ...(kind === "reminder" ? ["interval_seconds"] : [])];
+        if (Object.keys(body).some((key) => !fields.includes(key))) return failure("提醒更新字段无效。");
+        merge(item, body); item.kind = kind; emit("reminder.updated", item); return response(item);
+      }
+      if (item && method === "DELETE") { state.reminders = state.reminders.filter((entry) => entry.id !== id || reminderKind(entry) !== kind); return response({ deleted: true }); }
+      return failure("没有这条演示提醒。", 404);
     }
     if (path === "/memory/sources" && method === "GET") {
       const filter = url.searchParams.get("state") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);
@@ -347,6 +362,18 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (!content && offset < raw.length) return failure("本段不足以容纳一个完整字符。");
       const { content: original, job, ...metadata } = item;
       return response({ ...metadata, id: item.source_id, digest: item.revision, field: "content", content, offset_bytes: offset, length_bytes: end - offset, next_offset_bytes: end, total_bytes: raw.length, has_more: end < raw.length, truncated: offset > 0 || end < raw.length });
+    }
+    if (path === "/memory/sources/compare" && method === "POST") {
+      if (Object.keys(body).some((key) => !["left_id", "left_revision", "right_id", "right_revision", "cursor"].includes(key))) return failure("比较参数无效。", 422);
+      const left = state.memorySources.find((item) => item.source_id === body.left_id && item.comparisonDemo);
+      const right = state.memorySources.find((item) => item.source_id === body.right_id && item.comparisonDemo);
+      if (!left || !right) return failure("没有这份演示比较资料。", 404);
+      if (body.left_revision !== left.revision || body.right_revision !== right.revision) return failure("演示来源版本已经变化。", 409);
+      if (body.cursor != null) return failure("这组演示变化只有一页，请从头核对。");
+      const identity = ({ content, job, comparisonDemo, ...item }) => item;
+      const side = (item) => ({ offset_bytes: 0, length_bytes: item.total_bytes, content: item.content, read_arguments: { id: item.source_id, revision: item.revision, offset_bytes: 0, length_bytes: item.total_bytes } });
+      const equal = left.source_id === right.source_id;
+      return response({ status: equal ? "equal" : "changed", algorithm: "line_sequence_matcher_v1", left: identity(left), right: identity(right), items: equal ? [] : [{ kind: "replace", left: side(left), right: side(right) }], has_more: false, next_cursor: null });
     }
     if (path === "/memory/sources/retry" && method === "POST") {
       if (Object.keys(body).sort().join(",") !== "revision,source_id") return failure("只接受准确来源和版本。", 422);
@@ -396,8 +423,24 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     }
     if (path === "/workflow-runs/active" && method === "GET") return response(page(state.workflowRuns.filter((item) => ["pending", "queued", "running"].includes(item.status)), url));
     if (parts[0] === "workflow-runs" && parts[2] === "cancel" && method === "POST") { const item = state.workflowRuns.find((entry) => entry.id === id); if (item) { item.status = "cancelled"; emit("workflow.updated", { workflow_id: item.workflow_id, run: item }); return response({ cancelled: true }); } }
-    if (path === "/workflow-schedules" && method === "GET") return response(page(state.schedules, url));
-    if (parts[0] === "workflow-schedules" && parts[2] === "cancel" && method === "POST") { const item = state.schedules.find((entry) => entry.id === id); if (item) { item.enabled = false; return response({ cancelled: true }); } }
+    if (path === "/workflow-schedules" && method === "GET") {
+      const after = url.searchParams.get("after_id") ?? "", afterKind = url.searchParams.get("after_kind");
+      if (afterKind !== null && !["workflow_schedule", "calendar_workflow_schedule"].includes(afterKind)) return response({ detail: "委托类别无效" }, 422);
+      const kindOf = (item) => item.kind === undefined ? "workflow_schedule" : item.kind;
+      const sorted = state.schedules.map((item) => ({ ...item, kind: kindOf(item) })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
+      const candidates = sorted.filter((item) => item.id > after || (afterKind !== null && item.id === after && item.kind > afterKind));
+      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 20));
+      const items = candidates.slice(0, limit), hasMore = candidates.length > items.length;
+      return response({ items, has_more: hasMore, next_after: hasMore ? items.at(-1).id : null, next_after_kind: hasMore ? items.at(-1).kind : null });
+    }
+    if (parts[0] === "workflow-schedules" && parts[2] === "cancel" && method === "POST") {
+      const kind = url.searchParams.get("kind") ?? "workflow_schedule";
+      if (!["workflow_schedule", "calendar_workflow_schedule"].includes(kind)) return response({ detail: "委托类别无效" }, 422);
+      const item = state.schedules.find((entry) => entry.id === id && (entry.kind === undefined ? "workflow_schedule" : entry.kind) === kind);
+      if (!item) return response({ detail: "委托不存在" }, 404);
+      item.enabled = false; item.active = false; item.due_at = null; item.next_due_at = null;
+      emit("workflow_schedule.updated", { ...item, kind }); return response({ ...item, kind });
+    }
     if (parts[0] === "uploads") {
       if (parts.length === 1 && method === "GET") return response({ items: state.uploads });
       if (parts.length === 1 && method === "POST") {

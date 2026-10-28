@@ -43,7 +43,20 @@ def source_file(archive: tarfile.TarFile, name: str) -> bytes:
 
 
 def validate(root: Path, tag: str, dist: Path) -> str:
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = configuration["project"]
+    build_system = configuration.get("build-system", {})
+    requirements = build_system.get("requires", [])
+    backend_pin = (
+        re.fullmatch(r"hatchling==([0-9]+(?:\.[0-9]+)*)", requirements[0])
+        if isinstance(requirements, list)
+        and len(requirements) == 1
+        and isinstance(requirements[0], str)
+        else None
+    )
+    if build_system.get("build-backend") != "hatchling.build" or backend_pin is None:
+        raise ValueError("发行构建必须声明唯一的 hatchling 精确版本")
+    expected_generator = f"hatchling {backend_pin.group(1)}"
     version = project["version"]
     if tag != f"v{version}" or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("发布标签必须与正式版本元数据一致")
@@ -81,6 +94,13 @@ def validate(root: Path, tag: str, dist: Path) -> str:
         if len(metadata_names) != 1:
             raise ValueError("wheel 元数据不唯一")
         metadata = archive.read(metadata_names[0]).decode("utf-8")
+        wheel_metadata = email.parser.Parser().parsestr(
+            wheel_file(archive, metadata_names[0].removesuffix("METADATA") + "WHEEL").decode(
+                "utf-8"
+            )
+        )
+        if wheel_metadata.get_all("Generator") != [expected_generator]:
+            raise ValueError("wheel Generator 与构建后端声明不一致或不唯一")
         if (
             wheel_file(archive, "muli/compatibility.json") != declaration
             or wheel_file(archive, "muli/__init__.py") != runtime_bytes

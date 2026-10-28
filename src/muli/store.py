@@ -457,19 +457,39 @@ class Store:
         return item
 
     def message_evidence_window(
-        self, session_id: str, *, limit: int, metadata_bytes: int
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        metadata_bytes: int,
+        through_seq: int | None = None,
+        before_seq: int | None = None,
     ) -> builtins.list[dict[str, Any]]:
-        """Take raw indexed mappings first: broken rows consume the finite window."""
+        """Seek raw mappings first; optional sequence bounds never filter on JSON."""
         if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
             raise ValueError("消息窗口需要 1–101 条映射")
         if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
             raise ValueError("映射字节预算必须是正整数")
+        predicate = ""
+        bounds: tuple[int, ...] = ()
+        if through_seq is not None:
+            if type(through_seq) is not int or not 0 <= through_seq <= SQLITE_MAX_INTEGER:
+                raise ValueError("映射上界必须是有效的非负序号")
+            predicate += " AND seq<=?"
+            bounds += (through_seq,)
+        if before_seq is not None:
+            if type(before_seq) is not int or not 1 <= before_seq <= SQLITE_MAX_INTEGER:
+                raise ValueError("映射续页位置必须是有效的正序号")
+            predicate += " AND seq<?"
+            bounds += (before_seq,)
         rows = self.db.execute(
             "SELECT seq,CASE WHEN typeof(message_id)='text' "
             "AND length(CAST(message_id AS BLOB)) BETWEEN 1 AND ? "
             "THEN CAST(message_id AS BLOB) END "
-            "AS message_id FROM message_order WHERE session_id=? ORDER BY seq DESC LIMIT ?",
-            (metadata_bytes, session_id, limit),
+            "AS message_id FROM message_order WHERE session_id=?"
+            + predicate
+            + " ORDER BY seq DESC LIMIT ?",
+            (metadata_bytes, session_id, *bounds, limit),
         )
         mappings: builtins.list[dict[str, Any]] = []
         for row in rows:

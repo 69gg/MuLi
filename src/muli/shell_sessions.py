@@ -265,6 +265,13 @@ class ShellSessions:
             self._sessions[session_id] = shell
         item = _Command(secrets.token_hex(16), shell, asyncio.get_running_loop().time() + duration)
         try:
+            metadata = self._receipt_metadata(item, _empty_cursor())
+            # Immutable identity is a conservative lower bound; keep the full
+            # receipt check after startup and adjacent to command dispatch.
+            self._receipt_budget(
+                {key: metadata[key] for key in ("session_id", "command_id", "os_epoch")},
+                before_dispatch=True,
+            )
             self._retain_command(item)
         except Exception:
             if fresh:

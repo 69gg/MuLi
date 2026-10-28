@@ -11,6 +11,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from test_attention import attention_inputs, eventually
+from test_reminders import fire_due
 from test_runtime import make_runtime
 
 from muli.providers import Message, ModelTurn
@@ -93,7 +94,7 @@ async def test_explicit_change_revokes_the_notice_at_final_admission(
 
     monkeypatch.setattr(runtime, "submit_attention", observed)
     async with runtime.configuration_lock:
-        await runtime.reminders._fire(item, item["due_at"])
+        await fire_due(runtime.reminders, item)
         identifier = f"reminder:{item['id']}:{item['due_at']}"
         event = notice_event(runtime, identifier)
         await asyncio.wait_for(attempted.wait(), 3)
@@ -146,7 +147,7 @@ async def test_explicit_change_revokes_the_notice_at_final_admission(
     ordinary = ordinary_response.json()
     assert ordinary_response.status_code == 200
     assert "followup" not in ordinary and "followup_revision" not in ordinary
-    await runtime.reminders._fire(ordinary, ordinary["due_at"])
+    await fire_due(runtime.reminders, ordinary)
     await eventually(lambda: len(seen) == 1 and not runtime.tasks)
     assert "仍有效的普通提醒" in seen[0][-1].content
     assert "必须撤销的旧复盘" not in seen[0][-1].content
@@ -184,7 +185,7 @@ async def test_stale_scheduler_snapshot_cannot_mix_old_text_with_new_binding(
     assert response.status_code == 200
     current = response.json()
     # Pass the actual earlier scheduler snapshot through its normal admitted path.
-    await runtime.reminders._fire(stale, stale["due_at"])
+    await fire_due(runtime.reminders, stale)
     identifier = f"reminder:{stale['id']}:{stale['due_at']}"
     notice = runtime.store.get("notification", identifier)
     assert notice["title"] == "新文案" and notice["content"] == "新约定"
@@ -214,7 +215,7 @@ async def test_natural_recurrence_and_task_revision_do_not_revoke_earlier_occurr
     )
     assert response.status_code == 200
     first = response.json()
-    await runtime.reminders._fire(first, first["due_at"])
+    await fire_due(runtime.reminders, first)
     identifier = f"reminder:{first['id']}:{first['due_at']}"
     proof = read_followup_notice(runtime.store, identifier, 6000)
     assert proof is not None
@@ -222,7 +223,7 @@ async def test_natural_recurrence_and_task_revision_do_not_revoke_earlier_occurr
         task["title"], identifier=task["id"], brief={"goal": "新要求", "constraints": []}
     )
     second = runtime.store.get("reminder", first["id"])
-    await runtime.reminders._fire(second, second["due_at"])
+    await fire_due(runtime.reminders, second)
     assert read_followup_notice(runtime.store, identifier, 6000) == proof
     later = f"reminder:{second['id']}:{second['due_at']}"
     later_proof = read_followup_notice(runtime.store, later, 6000)
@@ -273,7 +274,7 @@ async def test_damaged_followup_notice_cannot_fall_back_to_an_ordinary_reminder(
     )
     assert response.status_code == 200
     item = response.json()
-    await runtime.reminders._fire(item, item["due_at"])
+    await fire_due(runtime.reminders, item)
     identifier = f"reminder:{item['id']}:{item['due_at']}"
     assert read_followup_notice(runtime.store, identifier, 6000) is not None
     # Honest reader corruption: change only the binding version of an actual notice.

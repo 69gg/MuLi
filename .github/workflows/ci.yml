@@ -47,27 +47,43 @@ jobs:
           - os: ubuntu-latest
             python: '3.12'
             shard: 1
+            shards: 2
           - os: ubuntu-latest
             python: '3.12'
             shard: 2
+            shards: 2
           - os: ubuntu-latest
             python: '3.13'
             shard: 1
+            shards: 2
           - os: ubuntu-latest
             python: '3.13'
             shard: 2
+            shards: 2
           - os: windows-latest
             python: '3.12'
             shard: 1
+            shards: 3
           - os: windows-latest
             python: '3.12'
             shard: 2
+            shards: 3
+          - os: windows-latest
+            python: '3.12'
+            shard: 3
+            shards: 3
           - os: windows-latest
             python: '3.13'
             shard: 1
+            shards: 3
           - os: windows-latest
             python: '3.13'
             shard: 2
+            shards: 3
+          - os: windows-latest
+            python: '3.13'
+            shard: 3
+            shards: 3
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +143,7 @@ jobs:
         run: uv run pytest -q --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
       - name: Run disjoint suite partition
         if: ${{ matrix.shard }}
-        run: uv run pytest -q --muli-ci-shard=${{ matrix.shard }} --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
+        run: uv run pytest -q --muli-ci-shard=${{ matrix.shard }} --muli-ci-shards=${{ matrix.shards }} --durations=20 -o faulthandler_timeout=60 --basetemp="${{ runner.temp }}/muli-pytest"
       - name: Release Linux recovery filesystem fixture
         if: always() && runner.os == 'Linux'
         shell: bash

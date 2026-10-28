@@ -718,6 +718,230 @@ test("DOM replacement keeps primitive text values rather than filtering boolean 
   root.replaceChildren(); assert.equal(root.childNodes.length, 0);
 });
 
+function comparisonChange(source, offset, content) {
+  return { offset_bytes: offset, length_bytes: Buffer.byteLength(content), content, read_arguments: { id: source.source_id, revision: source.revision, offset_bytes: offset, ...(content ? { length_bytes: Buffer.byteLength(content) } : {}) } };
+}
+
+function comparisonOriginalPage(source, content, offset = 0) {
+  const length = Buffer.byteLength(content);
+  return { source_id: source.source_id, revision: source.revision, field: "content", content, offset_bytes: offset, length_bytes: length, next_offset_bytes: offset + length, total_bytes: source.total_bytes, has_more: offset + length < source.total_bytes };
+}
+
+function comparisonFixture() {
+  const left = catalogSource({ source_id: `attachment:${"a".repeat(32)}`, session_id: "", total_bytes: 8 });
+  const right = catalogSource({ source_id: `attachment:${"b".repeat(32)}`, session_id: "", revision: "b".repeat(64), total_bytes: 12 });
+  const identity = (source) => ({ ...source, attachment_id: source.source_id.slice(11), format: "text", scope: "utf8_text", source_revision: "c".repeat(64), document_revision: null });
+  const header = { status: "changed", algorithm: "line_sequence_matcher_v1", left: identity(left), right: identity(right) };
+  return { left, right, first: { ...header, items: [{ kind: "replace", left: comparisonChange(left, 0, "甲\n"), right: comparisonChange(right, 0, "乙\n") }], has_more: true, next_cursor: "signed-next" }, last: { ...header, items: [{ kind: "insert", left: comparisonChange(left, 8, ""), right: comparisonChange(right, 8, "新\n") }], has_more: false, next_cursor: null } };
+}
+
+function comparisonContextFixture() {
+  const f = comparisonFixture(), prefix = "前🙂\0\n", tail = "<script>尾\n</script>", offset = Buffer.byteLength(prefix);
+  for (const side of ["left", "right"]) {
+    const change = f.first.items[0][side].content;
+    f[side].total_bytes = Buffer.byteLength(prefix + change + tail);
+    f.first[side].total_bytes = f[side].total_bytes;
+    f.first.items[0][side] = comparisonChange(f[side], offset, change);
+  }
+  f.first.has_more = false; f.first.next_cursor = null;
+  return { ...f, prefix, tail, offset };
+}
+
+async function beginComparison(h) {
+  await openCatalog(h);
+  await clickMemoryButton(h, h.other.querySelectorAll("button").filter((button) => button.textContent === "选作比较左侧")[0]);
+  await clickMemoryButton(h, h.other.querySelectorAll("button").filter((button) => button.textContent === "与所选比较")[1]);
+}
+
+test("explicit source comparison keeps ordered revisions and advances complete diff pages", async () => {
+  const f = comparisonFixture();
+  const h = harness(async (path, options) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    assert.equal(path, "/memory/sources/compare");
+    assert.equal(options.method, "POST");
+    assert.deepEqual({ ...options.body }, { left_id: f.left.source_id, left_revision: f.left.revision, right_id: f.right.source_id, right_revision: f.right.revision, ...(options.body.cursor ? { cursor: "signed-next" } : {}) });
+    return options.body.cursor ? f.last : f.first;
+  });
+  await beginComparison(h);
+  assert.ok(h.body().includes("仍有后续差异")); assert.ok(h.body().includes("甲\n"));
+  assert.ok(h.button("核对左侧原文")); assert.ok(h.button("核对右侧原文"));
+  const oldRead = h.button("核对左侧此处原文"), oldNext = h.button("继续核对差异");
+  await clickMemoryButton(h, h.button("继续核对差异"));
+  assert.ok(h.body().includes("已到末尾")); assert.ok(h.body().includes("新增")); assert.ok(h.body().includes("新\n"));
+  assert.equal(h.requests.filter((request) => request.path === "/memory/sources/compare").length, 2);
+  assert.equal(h.button("继续核对差异"), undefined);
+  const count = h.requests.length;
+  await clickMemoryButton(h, oldRead); await clickMemoryButton(h, oldNext);
+  assert.equal(h.requests.length, count); assert.ok(h.body().includes("新\n"));
+});
+
+for (const side of ["left", "right"]) test(`a ${side} difference opens its UTF-8 byte position and reuses bounded original paging`, async () => {
+  const f = comparisonContextFixture(), change = f.first.items[0][side], source = f[side];
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    if (path === "/memory/sources/compare") return f.first;
+    assert.ok(path.startsWith("/memory/source?"));
+    const query = new URLSearchParams(path.split("?")[1]), offset = Number(query.get("offset_bytes"));
+    assert.equal(query.get("id"), source.source_id); assert.equal(query.get("revision"), source.revision);
+    assert.equal(query.has("length_bytes"), false);
+    assert.ok([0, f.offset, f.offset + change.length_bytes].includes(offset));
+    const content = offset === 0 ? f.prefix : offset === f.offset ? change.content : f.tail;
+    return comparisonOriginalPage(source, content, offset);
+  });
+  await beginComparison(h);
+  const catalogTrigger = h.ui.slot.catalogTrigger;
+  await clickMemoryButton(h, h.button(`核对${side === "left" ? "左" : "右"}侧此处原文`));
+  assert.equal(Number(new URLSearchParams(h.requests.at(-1).path.split("?")[1]).get("offset_bytes")), f.offset);
+  assert.ok(h.body().includes(change.content)); assert.ok(h.body().includes("从变化位置起 · 第 1 段"));
+  assert.equal(h.button("上一段").disabled, true); assert.deepEqual([...h.ui.slot.offsets], [f.offset]);
+  const oldNext = h.button("下一段");
+  await clickMemoryButton(h, oldNext);
+  assert.ok(h.body().includes(f.tail)); assert.equal(h.body().includes(change.content), false);
+  assert.equal(h.dialog.querySelectorAll("script").length, 0);
+  const count = h.requests.length; await clickMemoryButton(h, oldNext); assert.equal(h.requests.length, count);
+  await clickMemoryButton(h, h.button("上一段"));
+  assert.ok(h.body().includes(change.content)); assert.equal(h.body().includes(f.tail), false);
+  await clickMemoryButton(h, h.button("从头阅读"));
+  assert.ok(h.body().includes(f.prefix)); assert.equal(h.body().includes(change.content), false);
+  assert.deepEqual([...h.ui.slot.offsets], [0]); assert.equal(h.button("从头阅读"), undefined);
+  assert.equal(new URLSearchParams(h.requests.at(-1).path.split("?")[1]).get("offset_bytes"), "0");
+  h.dialog.close(); await flush();
+  assert.equal(h.document.activeElement === catalogTrigger, true);
+  assert.equal(h.requests.some((entry) => entry.path.includes("/sessions/")), false);
+});
+
+test("returning from an original rereads the same diff cursor and restores its entry then the catalog trigger", async () => {
+  const f = comparisonFixture(), returned = deferred(); let comparisons = 0;
+  const h = harness(async (path, options) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    if (path === "/memory/sources/compare") {
+      comparisons++;
+      if (comparisons > 1) assert.equal(options.body.cursor, "signed-next");
+      return comparisons === 1 ? f.first : comparisons === 2 ? f.last : returned.promise;
+    }
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("id"), f.right.source_id); assert.equal(query.get("revision"), f.right.revision);
+    assert.equal(query.get("offset_bytes"), "8");
+    return comparisonOriginalPage(f.right, "新\n", 8);
+  });
+  await beginComparison(h); const catalogTrigger = h.ui.slot.catalogTrigger;
+  await clickMemoryButton(h, h.button("继续核对差异"));
+  const oldSlot = h.ui.slot, oldEntry = h.button("核对右侧此处原文");
+  await clickMemoryButton(h, oldEntry);
+  assert.equal(oldSlot.content.textContent, ""); assert.equal(oldSlot.page, null);
+  const sourceSlot = h.ui.slot, back = h.button("返回这段差异");
+  assert.deepEqual(Object.keys(sourceSlot.comparisonReturn).sort(), ["cursor", "focus", "pair", "trigger"]);
+  await clickMemoryButton(h, back);
+  assert.equal(comparisons, 3); assert.equal(h.body().includes("新\n"), false);
+  assert.equal(sourceSlot.content.textContent, ""); assert.equal(sourceSlot.comparisonReturn, null);
+  const request = h.requests.at(-1);
+  assert.deepEqual({ ...request.body }, { left_id: f.left.source_id, left_revision: f.left.revision, right_id: f.right.source_id, right_revision: f.right.revision, cursor: "signed-next" });
+  returned.resolve(f.last); await flush();
+  assert.ok(h.body().includes("新\n")); assert.equal(h.document.activeElement === h.button("核对右侧此处原文"), true);
+  assert.equal(h.document.activeElement === oldEntry, false);
+  const count = h.requests.length; await clickMemoryButton(h, back); await clickMemoryButton(h, oldEntry);
+  assert.equal(h.requests.length, count);
+  h.dialog.close(); await flush();
+  assert.equal(h.document.activeElement === catalogTrigger, true);
+});
+
+for (const [name, side, offset, total] of [["insert position", "left", 4, 8], ["delete position", "right", 4, 12], ["EOF", "left", 8, 8], ["empty source", "left", 0, 0]]) test(`an empty comparison side at ${name} is an anchor rather than invented original text`, async () => {
+  const f = comparisonFixture(), other = side === "left" ? "right" : "left";
+  f[side].total_bytes = total; f.first[side].total_bytes = total;
+  if (!total) { f[other].total_bytes = 4; f.first[other].total_bytes = 4; }
+  f.first.items = [{ kind: side === "left" ? "insert" : "delete", [side]: comparisonChange(f[side], offset, ""), [other]: comparisonChange(f[other], offset, "新\n") }];
+  f.first.has_more = false; f.first.next_cursor = null;
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    if (path === "/memory/sources/compare") return f.first;
+    const query = new URLSearchParams(path.split("?")[1]), start = Number(query.get("offset_bytes"));
+    assert.equal(query.get("id"), f[side].source_id); assert.equal(query.get("revision"), f[side].revision);
+    assert.equal(query.has("length_bytes"), false);
+    assert.ok(start === offset && offset < total || start === 0);
+    return comparisonOriginalPage(f[side], start === 0 ? "前\n" : "尾\n".repeat((total - offset) / 4), start);
+  });
+  await beginComparison(h); const count = h.requests.length;
+  await clickMemoryButton(h, h.button(`核对${side === "left" ? "左" : "右"}侧此处原文`));
+  if (offset === total) {
+    assert.equal(h.requests.length, count); assert.equal(h.ui.slot.page, null);
+    assert.ok(h.body().includes(total ? "变化位置在原文末尾" : "此侧正文为空"));
+    assert.equal(h.body().includes("第 1 段"), false);
+  } else {
+    assert.equal(h.requests.length, count + 1); assert.ok(h.body().includes("此侧没有对应正文"));
+    assert.equal(h.ui.slot.page.offset_bytes, offset); assert.ok(h.body().includes("尾\n"));
+  }
+  assert.ok(h.button("返回这段差异"));
+  if (offset) {
+    await clickMemoryButton(h, h.button("从头阅读"));
+    assert.equal(h.ui.slot.page.offset_bytes, 0); assert.ok(h.body().includes("前\n"));
+    assert.equal(h.body().includes("变化位置在原文末尾"), false);
+  } else assert.equal(h.button("从头阅读"), undefined);
+});
+
+for (const forgotten of ["left", "right"]) test(`forgetting the ${forgotten} source while reading the other invalidates the original and return path`, async () => {
+  const f = comparisonContextFixture(), side = forgotten === "left" ? "right" : "left", next = deferred(), change = f.first.items[0][side];
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    if (path === "/memory/sources/compare") return f.first;
+    const offset = Number(new URLSearchParams(path.split("?")[1]).get("offset_bytes"));
+    return offset === f.offset ? comparisonOriginalPage(f[side], change.content, offset) : next.promise;
+  });
+  await beginComparison(h);
+  const oldEntry = h.button(`核对${side === "left" ? "左" : "右"}侧此处原文`);
+  await clickMemoryButton(h, oldEntry);
+  const back = h.button("返回这段差异"), start = h.button("从头阅读");
+  assert.deepEqual([...h.ui.slot.comparisonSources], [f.left.source_id, f.right.source_id]);
+  await clickMemoryButton(h, h.button("下一段")); const pending = h.requests.at(-1);
+  h.ui.startGlobalEvents();
+  h.emitGlobal({ type: "memory.forgotten", data: { source_id: f[forgotten].source_id } });
+  assert.equal(pending.signal.aborted, true); assert.equal(h.ui.slot.page, null); assert.equal(h.ui.slot.comparisonReturn, null);
+  assert.equal(h.body().includes(change.content), false); assert.equal(h.button("返回这段差异"), undefined);
+  const count = h.requests.length;
+  await clickMemoryButton(h, back); await clickMemoryButton(h, start); await clickMemoryButton(h, oldEntry);
+  assert.equal(h.requests.length, count);
+  next.resolve(comparisonOriginalPage(f[side], f.tail, f.offset + change.length_bytes)); await flush();
+  assert.equal(h.body().includes(f.tail), false); assert.equal(h.button("返回这段差异"), undefined);
+  h.ui.stopEvents();
+});
+
+for (const status of [404, 409]) test(`a positioned original ${status} clears its comparison return context`, async () => {
+  const f = comparisonContextFixture();
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    if (path === "/memory/sources/compare") return f.first;
+    throw new ApiError("原文已变化", status);
+  });
+  await beginComparison(h); const entry = h.button("核对左侧此处原文");
+  await clickMemoryButton(h, entry);
+  assert.equal(h.ui.slot.page, null); assert.equal(h.ui.slot.comparisonReturn, null);
+  assert.equal(h.button("返回这段差异"), undefined); assert.equal(h.body().includes("甲\n"), false);
+  assert.ok(h.body().includes(status === 404 ? "原文已不可用" : "原文已更新"));
+  const count = h.requests.length; await clickMemoryButton(h, entry); assert.equal(h.requests.length, count);
+  assert.equal(h.requests.some((request) => request.path.includes("/sessions/")), false);
+});
+
+test("comparison rejects incomplete source identity before displaying its body", async () => {
+  const f = comparisonFixture(), malformed = structuredClone(f.first);
+  delete malformed.left.source_revision;
+  malformed.items[0].left.content = "LEAK";
+  malformed.items[0].left.length_bytes = 4;
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([f.left, f.right]) : malformed);
+  await beginComparison(h);
+  assert.ok(h.body().includes("响应不完整")); assert.equal(h.body().includes("LEAK"), false);
+});
+
+for (const action of ["close", "forget-left", "forget-right"]) test(`comparison ${action} aborts a pending request and discards its late result`, async () => {
+  const f = comparisonFixture(), pending = deferred();
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([f.left, f.right]) : pending.promise);
+  await beginComparison(h);
+  const request = h.requests.at(-1);
+  if (action === "close") h.dialog.close();
+  else h.ui.invalidateMemoryEvidence({ data: { source_id: action === "forget-left" ? f.left.source_id : f.right.source_id } });
+  await flush(); assert.equal(request.signal.aborted, true);
+  pending.resolve(f.first); await flush();
+  assert.equal(h.body().includes("甲\n"), false); assert.equal(h.button("继续核对差异"), undefined);
+});
+
 test("graph path renders only nodes for complete results and adds one note for truncated results", async () => {
   for (const truncated of [false, undefined, null, true]) {
     const item = graphMemory(), h = harness(async () => ({ items: [item], truncated }));

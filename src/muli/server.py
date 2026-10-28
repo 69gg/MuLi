@@ -162,6 +162,15 @@ class MemorySourceRetryInput(Input):
     revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
+class MemorySourceCompareInput(Input):
+    left_id: str = Field(min_length=1, max_length=200, strict=True)
+    left_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    right_id: str = Field(min_length=1, max_length=200, strict=True)
+    right_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    cursor: str | None = Field(default=None, min_length=1, strict=True)
+    view: Literal["changes", "overview"] = "changes"
+
+
 class WorkflowInput(Input):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
@@ -194,6 +203,16 @@ class ReminderInput(Input):
     content: str = Field(default="", max_length=4000)
     interval_seconds: int | None = Field(default=None, ge=60, le=31536000)
     commitment_id: str | None = Field(default=None, min_length=1)
+
+
+class CalendarReminderInput(Input):
+    title: str = Field(min_length=1, max_length=120)
+    timezone: str = Field(min_length=1, max_length=200)
+    local_time: str = Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+    weekdays: list[Annotated[int, Field(strict=True, ge=1, le=7)]] = Field(
+        min_length=1, max_length=7
+    )
+    content: str = Field(default="", max_length=4000)
 
 
 def create_app(
@@ -379,6 +398,7 @@ def _create_app(
     async def close_resources() -> None:
         nonlocal configuration_closing
         configuration_closing = True
+        await memory_application.close_comparisons()
         try:
             await runtime.maintenance.settle_activation()
         except Exception:
@@ -1056,6 +1076,12 @@ def _create_app(
             max_output_chars=config.settings.limits.max_output_chars,
         )
 
+    @app.post("/api/memory/sources/compare")
+    async def compare_memory_sources(body: MemorySourceCompareInput) -> dict[str, Any]:
+        if configuration_closing:
+            raise MaintenanceError("transaction_unavailable", "service_closing")
+        return await memory_application.compare_sources(body.model_dump(exclude_none=True))
+
     @app.post("/api/memory/sources/retry")
     async def retry_memory_source(body: MemorySourceRetryInput) -> dict[str, Any]:
         async with runtime.configuration_lock:
@@ -1461,16 +1487,22 @@ def _create_app(
     async def workflow_schedules(
         after_id: Annotated[str, Query(max_length=200)] = "",
         limit: Annotated[int, Query(ge=1, le=50)] = 50,
+        after_kind: Literal["workflow_schedule", "calendar_workflow_schedule"] | None = None,
     ) -> dict[str, Any]:
-        return runtime.scheduled_workflows.list(after_id=after_id, limit=limit)
+        return runtime.scheduled_workflows.list(
+            after_id=after_id, after_kind=after_kind, limit=limit
+        )
 
     @app.post("/api/workflow-schedules/{identifier}/cancel")
-    async def cancel_workflow_schedule(identifier: str) -> dict[str, Any]:
+    async def cancel_workflow_schedule(
+        identifier: str,
+        kind: Literal["workflow_schedule", "calendar_workflow_schedule"] = "workflow_schedule",
+    ) -> dict[str, Any]:
         async with runtime.configuration_lock:
             if configuration_closing:
                 raise MaintenanceError("transaction_unavailable", "service_closing")
             runtime.maintenance.require_configuration()
-            return await runtime.scheduled_workflows.cancel(identifier)
+            return await runtime.scheduled_workflows.cancel(identifier, kind=kind)
 
     @app.delete("/api/workflows/{identifier}")
     async def delete_workflow(identifier: str) -> dict[str, bool]:
@@ -1484,7 +1516,7 @@ def _create_app(
 
     @app.get("/api/reminders")
     async def reminders() -> dict[str, Any]:
-        return {"items": runtime.store.list("reminder")}
+        return {"items": runtime.reminders.records()}
 
     @app.post("/api/reminders")
     async def create_reminder(body: ReminderInput) -> dict[str, Any]:
@@ -1492,15 +1524,29 @@ def _create_app(
         await runtime.bus.emit("reminder.updated", item)
         return item
 
+    @app.post("/api/calendar-reminders")
+    async def create_calendar_reminder(body: CalendarReminderInput) -> dict[str, Any]:
+        item = runtime.reminders.create_calendar(
+            **body.model_dump(), reply_origin=ReplyOrigin("web")
+        )
+        await runtime.bus.emit("reminder.updated", item)
+        return item
+
     @app.patch("/api/reminders/{identifier}")
-    async def edit_reminder(identifier: str, changes: dict[str, Any]) -> dict[str, Any]:
-        item = runtime.reminders.update(identifier, changes)
+    async def edit_reminder(
+        identifier: str,
+        changes: dict[str, Any],
+        kind: Literal["reminder", "calendar_reminder"] = "reminder",
+    ) -> dict[str, Any]:
+        item = runtime.reminders.update(identifier, changes, kind=kind)
         await runtime.bus.emit("reminder.updated", item)
         return item
 
     @app.delete("/api/reminders/{identifier}")
-    async def delete_reminder(identifier: str) -> dict[str, bool]:
-        return {"deleted": runtime.reminders.delete(identifier)}
+    async def delete_reminder(
+        identifier: str, kind: Literal["reminder", "calendar_reminder"] = "reminder"
+    ) -> dict[str, bool]:
+        return {"deleted": runtime.reminders.delete(identifier, kind=kind)}
 
     @app.patch("/api/notifications/{identifier}")
     async def notification_read(identifier: str, body: dict[str, bool]) -> dict[str, Any]:

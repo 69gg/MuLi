@@ -14,6 +14,21 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/release.py"
 Artifact = Literal["source", "wheel", "sdist"]
 PackageFile = Literal["compatibility.json", "__init__.py"]
+
+
+@pytest.fixture(autouse=True)
+def release_stdio_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Match the parent decoder even when a child inherits a legacy console encoding.
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+
+
+BACKEND_VERSION = "7.4.2"
+WHEEL_METADATA = (
+    "Wheel-Version: 1.0\n"
+    f"Generator: hatchling {BACKEND_VERSION}\n"
+    "Root-Is-Purelib: true\n"
+    "Tag: py3-none-any\n"
+).encode()
 RUNTIME = b'__version__ = "2.0.0"\n'
 DECLARATION = json.dumps(
     {
@@ -43,6 +58,8 @@ def release_project(
     *,
     wheel_name: str = "muli-agent",
     wheel_version: str = "2.0.0",
+    backend_requirement: str = f"hatchling=={BACKEND_VERSION}",
+    wheel_metadata: bytes | None = WHEEL_METADATA,
     declaration: bytes = DECLARATION,
     change: tuple[Artifact, PackageFile, bytes | None] | None = None,
     duplicate: Literal["wheel", "sdist"] | None = None,
@@ -60,7 +77,10 @@ def release_project(
     (root / "src/muli").mkdir(parents=True)
     (root / "dist").mkdir()
     (root / "pyproject.toml").write_text(
-        '[project]\nname="muli-agent"\nversion="2.0.0"\n', encoding="utf-8"
+        '[project]\nname="muli-agent"\nversion="2.0.0"\n'
+        f"[build-system]\nrequires={json.dumps([backend_requirement])}\n"
+        'build-backend="hatchling.build"\n',
+        encoding="utf-8",
     )
     for name, content in files("source").items():
         (root / "src/muli" / name).write_bytes(content)
@@ -71,6 +91,8 @@ def release_project(
         archive.writestr(
             "muli_agent-2.0.0.dist-info/METADATA", f"Name: {wheel_name}\nVersion: {wheel_version}\n"
         )
+        if wheel_metadata is not None:
+            archive.writestr("muli_agent-2.0.0.dist-info/WHEEL", wheel_metadata)
         for name, content in files("wheel").items():
             archive.writestr("muli/" + name, content)
         if duplicate == "wheel":
@@ -104,6 +126,92 @@ def test_release_checks_exact_tested_artifacts_and_extracts_only_current_notes(
     )
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "release-notes.md").read_text(encoding="utf-8") == "已验证功能。\n"
+
+
+@pytest.mark.parametrize("backend_version", ["0.99.1", "10.20.30"])
+def test_release_accepts_the_project_backend_pin_instead_of_a_fixed_generator(
+    tmp_path: Path, backend_version: str
+) -> None:
+    release_project(
+        tmp_path,
+        backend_requirement=f"hatchling=={backend_version}",
+        wheel_metadata=WHEEL_METADATA.replace(
+            f"hatchling {BACKEND_VERSION}".encode(), f"hatchling {backend_version}".encode()
+        ),
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--tag", "v2.0.0"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "release-notes.md").read_text(encoding="utf-8") == "已验证功能。\n"
+
+
+@pytest.mark.parametrize(
+    "wheel_metadata",
+    [
+        WHEEL_METADATA.replace(b"hatchling 7.4.2", b"hatchling 7.4.3"),
+        WHEEL_METADATA.replace(b"Generator: hatchling 7.4.2\n", b""),
+        WHEEL_METADATA + b"Generator: hatchling 7.4.2\n",
+        WHEEL_METADATA + b"generator: hatchling 7.4.3\n",
+    ],
+    ids=["backend-drift", "missing-generator", "duplicate-generator", "case-varied-duplicate"],
+)
+def test_release_rejects_generator_drift_or_ambiguity_with_matching_package_bytes(
+    tmp_path: Path, wheel_metadata: bytes
+) -> None:
+    release_project(tmp_path, wheel_metadata=wheel_metadata)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--tag", "v2.0.0"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=5,
+    )
+    assert result.returncode != 0
+    assert "wheel Generator 与构建后端声明不一致或不唯一" in result.stderr
+    assert not (tmp_path / "release-notes.md").exists()
+
+
+def test_release_rejects_missing_wheel_metadata(tmp_path: Path) -> None:
+    release_project(tmp_path, wheel_metadata=None)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--tag", "v2.0.0"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=5,
+    )
+    assert result.returncode != 0
+    assert "wheel 声明或版本文件缺失或不唯一" in result.stderr
+    assert not (tmp_path / "release-notes.md").exists()
+
+
+@pytest.mark.parametrize(
+    "backend_requirement",
+    ["hatchling", "hatchling>=1.27,<2", "hatchling==7.*", "hatchling~=7.4.2"],
+)
+def test_release_rejects_floating_backend_even_when_the_generator_matches(
+    tmp_path: Path, backend_requirement: str
+) -> None:
+    release_project(tmp_path, backend_requirement=backend_requirement)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--tag", "v2.0.0"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=5,
+    )
+    assert result.returncode != 0
+    assert "发行构建必须声明唯一的 hatchling 精确版本" in result.stderr
+    assert not (tmp_path / "release-notes.md").exists()
 
 
 @pytest.mark.parametrize(

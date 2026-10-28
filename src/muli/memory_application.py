@@ -16,6 +16,7 @@ from muli.attachment_memory_source import (
     restore_attachment_source,
 )
 from muli.attachments import ATTACHMENT_ID_PATTERN
+from muli.document_settings import DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size, validate_integer
 from muli.media import MediaService
 from muli.memory_chunks import MemoryChunkSettings
@@ -25,6 +26,7 @@ from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
 from muli.proactive import FrozenRouting
 from muli.providers import Message
 from muli.runtime import PreparedRequest, Runtime
+from muli.source_comparison import ComparisonPolicy, compare_sources
 from muli.tools import Tool, parameters, string
 
 if TYPE_CHECKING:
@@ -51,6 +53,8 @@ class MemoryApplication:
         self.pipeline = self._pipeline()
         self._recovery: asyncio.Task[None] | None = None
         self._closed = True
+        self._comparison_open = True
+        self._comparisons: set[asyncio.Task[dict[str, Any]]] = set()
         self._report_observer: Callable[[str, int], None] | None = None
         self.report_error = ""
         self.attachment_error = ""
@@ -265,6 +269,7 @@ class MemoryApplication:
     async def start(self) -> None:
         self._attachment_generation = object()
         self._closed = False
+        self._comparison_open = True
 
         def observe(session_id: str, revision: int) -> None:
             # A retained callback from an earlier lifecycle cannot use its
@@ -414,6 +419,7 @@ class MemoryApplication:
     async def close(self) -> None:
         self._closed = True
         self._attachment_generation = object()
+        await self.close_comparisons()
         if self.runtime.team.report_observer is self._report_observer:
             self.runtime.team.report_observer = None
         self._report_observer = None
@@ -423,6 +429,14 @@ class MemoryApplication:
             self._recovery = None
         await self.pipeline.close()
         await self.media.aclose()
+
+    async def close_comparisons(self) -> None:
+        self._comparison_open = False
+        tasks = tuple(self._comparisons)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def reconfigure(self) -> None:
         budget = self.runtime.config.settings.limits.max_output_chars * 4
@@ -451,6 +465,51 @@ class MemoryApplication:
         return query_result(
             result, max_output_chars=self.runtime.config.settings.limits.max_output_chars
         )
+
+    def _comparison_policy(self) -> ComparisonPolicy:
+        settings = self.runtime.config.settings
+        documents = DocumentSettingsStore(self.runtime.store).read()
+        return ComparisonPolicy(
+            max_source_chars=settings.memory.max_source_chars,
+            max_input_bytes=min(settings.limits.max_file_bytes, documents.max_extracted_bytes),
+            max_lines=settings.limits.max_search_entries,
+            max_output_chars=settings.limits.max_output_chars,
+            timeout_seconds=documents.timeout_seconds,
+        )
+
+    async def compare_sources(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Share the same bounded read service between agent tools and owner API."""
+        runtime = self.runtime
+        policy = self._comparison_policy()
+        generation = self._attachment_generation
+        caller = runtime.tool_session_id
+        request = runtime.request_context(caller) if caller is not None else None
+
+        def check() -> None:
+            if (
+                runtime._closing
+                or not self._comparison_open
+                or self._attachment_generation is not generation
+                or "memory_compare_sources" in runtime.config.settings.disabled_tools
+                or self._comparison_policy() != policy
+            ):
+                raise EvidenceError("comparison_changed", "比较期间服务或策略变化，请重新核对")
+            runtime.maintenance.admission.require()
+            if request is not None:
+                runtime._guard_request(request, "read")
+
+        check()
+        if len(self._comparisons) >= runtime.config.settings.limits.max_parallel_agents:
+            raise EvidenceError("comparison_busy", "本地比较容量已满，请等当前比较结束")
+        with runtime.maintenance.admission.operation():
+            task = asyncio.create_task(
+                compare_sources(runtime.memory, policy=policy, check=check, **args)
+            )
+            self._comparisons.add(task)
+            try:
+                return await task
+            finally:
+                self._comparisons.discard(task)
 
     @staticmethod
     def _attachment_source(
@@ -756,6 +815,9 @@ class MemoryApplication:
                 max_output_chars=runtime.config.settings.limits.max_output_chars,
             )
 
+        async def compare(args: dict[str, Any]) -> Any:
+            return await self.compare_sources(args)
+
         async def conflicts(args: dict[str, Any]) -> Any:
             return [item for item in runtime.memory.conflicts() if item["resolved_at"] is None]
 
@@ -825,6 +887,30 @@ class MemoryApplication:
                     ("id",),
                 ),
                 source,
+                preserve_output=True,
+            ),
+            Tool(
+                "memory_compare_sources",
+                "按指定左右顺序逐行核对两份明确收藏附件的原文变化；"
+                "先用memory_sources或memory_source取得双方准确source_id及revision。"
+                "仅比较已保存正文，不推定新旧、不比较私人备注；差异包含双方原文与UTF-8位置，"
+                "长资料可先用view=overview获取变化组总数及行/字节坐标，目录不含正文；"
+                "需用memory_source按坐标读取关注的原文，空侧仅表示插入点；"
+                "读完目录不代表读过正文，行/字节数是受影响整行，不能推断语义重要性；"
+                "has_more时用同一双方身份和next_cursor续查，未查全不宣称全部一致；"
+                "不收藏、改写、调用模型或外发",
+                parameters(
+                    {
+                        "left_id": string(),
+                        "left_revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                        "right_id": string(),
+                        "right_revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                        "cursor": string(),
+                        "view": {"type": "string", "enum": ["changes", "overview"]},
+                    },
+                    ("left_id", "left_revision", "right_id", "right_revision"),
+                ),
+                compare,
                 preserve_output=True,
             ),
             Tool("memory_conflicts", "查看相互矛盾且尚未处理的记忆证据", parameters({}), conflicts),

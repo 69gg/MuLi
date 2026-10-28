@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from test_reminders import fire_due
 from test_runtime import FakeClient, make_runtime, workflow_call
 
 from muli.attention import AttentionInbox
@@ -619,7 +620,7 @@ async def test_real_attention_resumes_after_recovering_old_live_workflow(tmp_pat
     try:
         await inbox.start()
         item = recovered.reminders.create("恢复后资料", now() + 60, "不要求重做旧副作用")
-        await recovered.reminders._fire(item, item["due_at"])
+        await fire_due(recovered.reminders, item)
         await asyncio.wait_for(delivered.wait(), 2)
         assert len(seen) == 1
         assert recovered.store.get("workflow_run", scenario.child_id)["status"] == "interrupted"  # type: ignore[index]

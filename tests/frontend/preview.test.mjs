@@ -14,7 +14,7 @@ test("preview source discovery, UTF-8 reads and exact retries stay in local demo
   const first = await (await read("/memory/sources?state=done&limit=1")).json();
   assert.deepEqual(first.items, []); assert.equal(first.examined, 1); assert.equal(first.has_more, true);
   const next = await (await read(`/memory/sources?state=done&limit=1&cursor=${encodeURIComponent(first.next_cursor)}`)).json();
-  assert.equal(next.items.length, 1); assert.equal(next.has_more, false);
+  assert.equal(next.items.length, 1); assert.equal(next.has_more, true);
   assert.equal((await read(`/memory/sources?state=failed&cursor=${encodeURIComponent(first.next_cursor)}`)).status, 400);
   const item = next.items[0];
   assert.equal(Object.hasOwn(item, "content"), false);
@@ -45,10 +45,51 @@ test("preview source discovery, UTF-8 reads and exact retries stay in local demo
   assert.equal(backend.state.memorySources.find((entry) => entry.source_id === item.source_id).job.state, "done");
 });
 
+test("preview compares its explicit demo pair and retains exact readable source coordinates", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const sources = backend.state.memorySources.filter((item) => item.comparisonDemo);
+  assert.equal(sources.length, 2);
+  const [left, right] = sources;
+  const pair = { left_id: left.source_id, left_revision: left.revision, right_id: right.source_id, right_revision: right.revision };
+  const compare = (body) => backend.fetch("/api/memory/sources/compare", { method: "POST", body: JSON.stringify(body) });
+  const response = await compare(pair); assert.equal(response.status, 200);
+  const page = await response.json(); assert.equal(page.status, "changed"); assert.equal(page.has_more, false);
+  for (const side of ["left", "right"]) {
+    const change = page.items[0][side];
+    const read = await backend.fetch(`/api/memory/source?${new URLSearchParams(change.read_arguments)}`);
+    assert.equal((await read.json()).content, change.content);
+  }
+  assert.equal((await compare({ ...pair, right_revision: "0".repeat(64) })).status, 409);
+  assert.equal((await compare({ ...pair, cursor: "unrelated" })).status, 400);
+  assert.equal((await (await compare({ ...pair, right_id: left.source_id, right_revision: left.revision })).json()).status, "equal");
+  assert.equal(backend.state.memorySources.length, 4);
+});
+
 async function json(backend, path, method = "GET", body) {
   const result = await backend.fetch(`/api${path}`, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   return { status: result.status, body: await result.json() };
 }
+
+test("preview calendar schedule paging and cancellation preserve the exact kind", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  const base = { id: "same-id", name: "合成定时委托", enabled: true, due_at: 10000 };
+  backend.state.schedules = [{ ...base, kind: "calendar_workflow_schedule" }, { ...base, kind: "workflow_schedule" }];
+  const first = await json(backend, "/workflow-schedules?limit=1");
+  assert.equal(first.body.next_after, "same-id");
+  assert.equal(first.body.next_after_kind, "calendar_workflow_schedule");
+  const next = await json(backend, "/workflow-schedules?limit=1&after_id=same-id&after_kind=calendar_workflow_schedule");
+  assert.deepEqual(next.body.items.map((item) => item.kind), ["workflow_schedule"]);
+  assert.equal(next.body.next_after_kind, null);
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel?kind=calendar_workflow_schedule", "POST")).status, 200);
+  assert.equal(backend.state.schedules[0].enabled, false);
+  assert.equal(backend.state.schedules[1].enabled, true);
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel", "POST")).body.kind, "workflow_schedule");
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel?kind=unknown", "POST")).status, 422);
+  assert.equal((await json(backend, "/workflow-schedules?after_kind=unknown")).status, 422);
+  backend.state.schedules = [{ ...base }];
+  assert.equal((await json(backend, "/workflow-schedules/same-id/cancel?kind=calendar_workflow_schedule", "POST")).status, 404);
+  assert.equal(backend.state.schedules[0].enabled, true);
+});
 
 test("preview activation never claims that a real channel receiver was verified", async (t) => {
   const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());

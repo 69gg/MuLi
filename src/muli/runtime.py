@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,7 @@ from muli.extensions import Extensions
 from muli.failure_diagnostics import capture_failure
 from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.history_evidence import HistoryEvidence
+from muli.history_find import HistoryFind
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
@@ -58,7 +60,7 @@ from muli.providers import (
     ToolCall,
 )
 from muli.reminder_followup import followup_binding, task_status
-from muli.reminders import Reminders
+from muli.reminders import Reminders, reminder_kind
 from muli.reply_origin import ReplyOrigin
 from muli.shell_sessions import ShellSessionError, ShellSessions
 from muli.store import LifecycleKind, Store, new_id, now
@@ -1562,9 +1564,11 @@ class Runtime:
         self._coordinator_tools.update(
             {
                 "reminder_schedule",
+                "reminder_schedule_calendar",
                 "reminder_cancel",
                 "reminder_reschedule",
                 "workflow_schedule",
+                "workflow_schedule_calendar",
                 "workflow_schedule_cancel",
                 "task_schedule_replan",
                 "task_schedule_replan_cancel",
@@ -2761,6 +2765,7 @@ class Runtime:
                     "resume_agent",
                     "workflow_create",
                     "workflow_schedule",
+                    "workflow_schedule_calendar",
                     "task_schedule_replan",
                 }
             }
@@ -3026,12 +3031,19 @@ class Runtime:
             await self.bus.notify()
             return item
 
+        async def schedule_calendar_workflow(args: dict[str, Any]) -> Any:
+            item = self.scheduled_workflows.create_calendar(**args)
+            await self.bus.notify()
+            return item
+
         async def list_scheduled_workflows(args: dict[str, Any]) -> Any:
             return self.scheduled_workflows.list(**args)
 
         async def cancel_scheduled_workflow(args: dict[str, Any]) -> Any:
             self.scheduled_workflows._caller()
-            return await self.scheduled_workflows.cancel(args["id"])
+            return await self.scheduled_workflows.cancel(
+                args["id"], kind=args.get("kind", "workflow_schedule")
+            )
 
         async def current_time(args: dict[str, Any]) -> Any:
             zone = args.get("timezone")
@@ -3043,24 +3055,32 @@ class Runtime:
             await self.bus.emit("reminder.updated", item)
             return item
 
+        async def schedule_calendar(args: dict[str, Any]) -> Any:
+            item = self.reminders.create_calendar(**args, reply_origin=self.current_reply_origin())
+            await self.bus.emit("reminder.updated", item)
+            return item
+
         async def list_reminders(args: dict[str, Any]) -> Any:
-            return self.store.list("reminder")
+            return self.reminders.records()
 
         async def cancel_reminder(args: dict[str, Any]) -> Any:
-            return {"deleted": self.reminders.delete(args["id"])}
+            return {"deleted": self.reminders.delete(args["id"], kind=args.get("kind", "reminder"))}
 
         async def reschedule_reminder(args: dict[str, Any]) -> Any:
             self.maintenance.admission.require()
-            item = self.store.get("reminder", args["id"])
+            kind = reminder_kind(args.get("kind", "reminder"))
+            item = self.store.get(kind, args["id"])
             if item is None:
                 raise KeyError(args["id"])
-            binding = followup_binding(item)
+            binding = followup_binding(item) if kind == "reminder" else None
             if binding is not None and task_status(
                 self.store, binding["commitment_id"], self.config.settings.limits.max_output_chars
             ) in {"done", "cancelled"}:
                 raise ValueError("已完成或已取消的目标不能重新约定复盘")
             # No await between validating the current binding and the original update.
-            updated = self.reminders.update(args["id"], {"due_at": args["due_at"], "enabled": True})
+            updated = self.reminders.update(
+                args["id"], {"due_at": args["due_at"], "enabled": True}, kind=kind
+            )
             await self.bus.emit("reminder.updated", updated)
             return updated
 
@@ -3116,6 +3136,19 @@ class Runtime:
                 after=args.get("after", 0),
                 limit=min(args.get("limit", 20), limits.max_search_results),
                 max_output_chars=limits.max_output_chars,
+            )
+
+        async def find_conversation(args: dict[str, Any]) -> Any:
+            limits = self.config.settings.limits
+            return HistoryFind(self.store).find(
+                args["session_id"],
+                args["query"],
+                cursor=args.get("cursor"),
+                limit=min(args.get("limit", 20), limits.max_search_results),
+                max_output_chars=limits.max_output_chars,
+                max_results=limits.max_search_results,
+                max_context_chars=limits.max_context_chars,
+                deadline=monotonic() + limits.max_search_seconds,
             )
 
         async def remember(args: dict[str, Any]) -> Any:
@@ -3251,16 +3284,61 @@ class Runtime:
                 preserve_output=True,
             ),
             Tool(
+                "workflow_schedule_calendar",
+                "按明确地区的当地时分(HH:MM)和ISO星期(1周一、7周日)，执行已获主人授权的 worker→reviewer 委托。"
+                "先核实时区与时间；不因普通提醒取得执行权；审批门保留，错过多次合并一次。",
+                parameters(
+                    {
+                        "name": string(),
+                        "prompt": string(),
+                        "timezone": string(),
+                        "local_time": {
+                            "type": "string",
+                            "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+                        },
+                        "weekdays": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 7,
+                            "uniqueItems": True,
+                            "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                        },
+                    },
+                    ("name", "prompt", "timezone", "local_time", "weekdays"),
+                ),
+                schedule_calendar_workflow,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
                 "workflow_schedule_list",
-                "分页查看定时委托和最近一次真实运行状态",
-                parameters({"after_id": string(), "limit": {"type": "integer", "minimum": 1}}),
+                "分页查看两类定时委托和最近真实运行；续页使用 next_after 与 next_after_kind",
+                parameters(
+                    {
+                        "after_id": string(),
+                        "after_kind": {
+                            "type": "string",
+                            "enum": ["workflow_schedule", "calendar_workflow_schedule"],
+                        },
+                        "limit": {"type": "integer", "minimum": 1},
+                    }
+                ),
                 list_scheduled_workflows,
                 preserve_output=True,
             ),
             Tool(
                 "workflow_schedule_cancel",
                 "撤销定时委托并精确取消其已接纳运行；不追回已派发副作用",
-                parameters({"id": string()}, ("id",)),
+                parameters(
+                    {
+                        "id": string(),
+                        "kind": {
+                            "type": "string",
+                            "enum": ["workflow_schedule", "calendar_workflow_schedule"],
+                        },
+                    },
+                    ("id",),
+                ),
                 cancel_scheduled_workflow,
                 "write",
                 preserve_output=True,
@@ -3297,6 +3375,23 @@ class Runtime:
                 preserve_output=True,
             ),
             Tool(
+                "conversation_find",
+                "在指定已知会话的已存正文中按区分大小写的字面文字定位，返回出处及"
+                "conversation_read 参数。cursor 原样续查；无正文、附件检索或执行动作。"
+                "检查 has_more、omitted_total 和来源；无命中不代表原资料不存在",
+                parameters(
+                    {
+                        "session_id": string(),
+                        "query": string("要找的原文片段；按字面匹配，区分大小写"),
+                        "cursor": string("原样使用同一会话和查询返回的 next_cursor"),
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    ("session_id", "query"),
+                ),
+                find_conversation,
+                preserve_output=True,
+            ),
+            Tool(
                 "clock_now",
                 "读取当前时间和Unix时间戳，可指定IANA时区",
                 parameters({"timezone": string()}),
@@ -3320,11 +3415,45 @@ class Runtime:
                 schedule,
                 "write",
             ),
-            Tool("reminder_list", "查看提醒及下一次触发时间", parameters({}), list_reminders),
+            Tool(
+                "reminder_schedule_calendar",
+                "按指定地区当地时间重复提醒。weekdays为ISO星期1至7，工作日仅指周一至周五；"
+                "夏令时不存在的时刻跳过该日，重复时刻只取较早一次。停机错过合并一次。",
+                parameters(
+                    {
+                        "title": string(),
+                        "timezone": string("明确IANA地区，如Asia/Shanghai"),
+                        "local_time": string("当地24小时制HH:MM"),
+                        "weekdays": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 7,
+                            "uniqueItems": True,
+                            "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                        },
+                        "content": string(),
+                    },
+                    ("title", "timezone", "local_time", "weekdays"),
+                ),
+                schedule_calendar,
+                "write",
+            ),
+            Tool(
+                "reminder_list",
+                "查看提醒类型、规则及下一次触发时间",
+                parameters({}),
+                list_reminders,
+            ),
             Tool(
                 "reminder_cancel",
                 "删除指定提醒",
-                parameters({"id": string()}, ("id",)),
+                parameters(
+                    {
+                        "id": string(),
+                        "kind": {"type": "string", "enum": ["reminder", "calendar_reminder"]},
+                    },
+                    ("id",),
+                ),
                 cancel_reminder,
                 "write",
             ),
@@ -3332,7 +3461,14 @@ class Runtime:
                 "reminder_reschedule",
                 "将已有提醒改到未来 Unix 秒并重新启用；保留原 ID、历史和回复渠道。"
                 "先读取准确提醒 ID；周期提醒只改下一次时间，不撤回已经处理的通知。",
-                parameters({"id": string(), "due_at": {"type": "number"}}, ("id", "due_at")),
+                parameters(
+                    {
+                        "id": string(),
+                        "due_at": {"type": "number"},
+                        "kind": {"type": "string", "enum": ["reminder", "calendar_reminder"]},
+                    },
+                    ("id", "due_at"),
+                ),
                 reschedule_reminder,
                 "write",
             ),

@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI
 from test_attention import attention_inputs, eventually, inbox_for, offline_runtime
 from test_channels import Harness, profile, terminal, unused
+from test_reminders import fire_due
 from test_report_origin import origin, route, wait_for_reply
 from test_runtime import make_runtime
 
@@ -66,7 +67,7 @@ async def update(runtime: Runtime, *, independent: bool = False) -> dict[str, An
 
 async def fire(runtime: Runtime, reply: ReplyOrigin | None = None) -> dict[str, Any]:
     item = runtime.reminders.create("原任务提醒", now() + 60, reply_origin=reply)
-    await runtime.reminders._fire(item, item["due_at"])
+    await fire_due(runtime.reminders, item)
     notice = runtime.store.get("notification", f"reminder:{item['id']}:{item['due_at']}")
     assert notice is not None
     return notice
@@ -220,7 +221,7 @@ async def test_producer_atomic_rollback_and_reopen(
         with monkeypatch.context() as patch:
             patch.setattr(runtime.store, "_event", fail_after_event)
             with pytest.raises(ValueError, match="injected"):
-                await runtime.reminders._fire(item, item["due_at"])
+                await fire_due(runtime.reminders, item)
             with pytest.raises(ValueError, match="injected"):
                 await update(runtime, independent=True)
             with pytest.raises(ValueError, match="injected"):
@@ -229,7 +230,7 @@ async def test_producer_atomic_rollback_and_reopen(
         assert runtime.store.get("reminder", item["id"])["fired_count"] == 0
         assert not runtime.store.list("notification") and not runtime.store.list("update")
         assert runtime.store.messages("rollback") == []
-        await runtime.reminders._fire(item, item["due_at"])
+        await fire_due(runtime.reminders, item)
         await update(runtime, independent=True)
         message = runtime.store.complete_message(
             "rollback", "原子完整终答", delivery_routes=[route()]
@@ -309,7 +310,7 @@ async def test_direct_update_and_preexisting_reminder_stay_local(tmp_path: Path)
         item = runtime.reminders.create("旧记录", now() + 60)
         item.pop("routing")
         runtime.store.put("reminder", item)
-        await runtime.reminders._fire(item, item["due_at"])
+        await fire_due(runtime.reminders, item)
         await inbox.start()
         await eventually(lambda: bool(attention_inputs(runtime)))
         assert len(attention_inputs(runtime)) == 1

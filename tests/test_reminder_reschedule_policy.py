@@ -16,6 +16,7 @@ from typing import Any, NoReturn
 import httpx
 import pytest
 from test_attention import eventually
+from test_reminders import fire_due
 from test_runtime import FakeClient, make_runtime
 from test_task_briefs import attach_services
 from test_teammate_attachment_runtime import call, tool_result
@@ -109,7 +110,11 @@ async def execute(
                 assert bool(selected) is available
                 if available:
                     schema = selected[0]["parameters"]
-                    assert set(schema["properties"]) == {"id", "due_at"}
+                    assert set(schema["properties"]) == {"id", "due_at", "kind"}
+                    assert schema["properties"]["kind"] == {
+                        "type": "string",
+                        "enum": ["reminder", "calendar_reminder"],
+                    }
                     assert set(schema["required"]) == {"id", "due_at"}
                     assert schema["additionalProperties"] is False
                     assert runtime.session_tools(runtime.main_session()["id"])[TOOL].risk == "write"
@@ -158,7 +163,7 @@ async def test_ordinary_reschedule_keeps_identity_routing_content_interval_and_c
         "保留原约定", now() + 600, "不能换标题或来源", 120, reply_origin=original_origin()
     )
     # A real fire supplies nonzero occurrence history; no Attention consumer runs.
-    await runtime.reminders._fire(item, item["due_at"])
+    await fire_due(runtime.reminders, item)
     before = runtime.reminders.update(item["id"], {"enabled": False})
     assert before["fired_count"] == 1 and before["last_fired_at"] == item["due_at"]
     notices = runtime.store.list("notification")

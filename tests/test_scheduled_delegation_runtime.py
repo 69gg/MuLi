@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -16,6 +18,7 @@ from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, completed, eventually, tool_result
 
 import muli.reminders as reminders_module
+import muli.scheduled_workflows as scheduled_workflows_module
 from muli.config import ConfigFile
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.runtime import Runtime
@@ -23,13 +26,27 @@ from muli.server import create_app
 from muli.store import now
 
 
+@pytest.mark.parametrize("calendar", [False, True], ids=["interval", "calendar"])
 async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calendar: bool
 ) -> None:
-    owner_request = (
-        "请在一分钟后首次搜索并整理合成研究主题，以后每周执行一次。"
-        "交给执行队友和独立评审，只将文字成果发回这里；不自动发送文件。"
+    calendar_due = datetime.fromtimestamp(now() + 120, ZoneInfo("Asia/Shanghai")).replace(
+        second=0, microsecond=0
     )
+    calendar_rule: dict[str, Any] = {
+        "version": 1,
+        "timezone": "Asia/Shanghai",
+        "local_time": calendar_due.strftime("%H:%M"),
+        "weekdays": list(range(1, 8)),
+    }
+    schedule_kind = "calendar_workflow_schedule" if calendar else "workflow_schedule"
+    occurrence_kind = "calendar_workflow_occurrence" if calendar else "workflow_occurrence"
+    schedule_tool = "workflow_schedule_calendar" if calendar else "workflow_schedule"
+    owner_request = (
+        f"请按上海时间每天{calendar_rule['local_time']}搜索并整理合成研究主题。"
+        if calendar
+        else "请在一分钟后首次搜索并整理合成研究主题，以后每周执行一次。"
+    ) + "交给执行队友和独立评审，只将文字成果发回这里；不自动发送文件。"
     prompt = "搜索合成研究主题，整理来源与未核验事项，经独立评审后交回文字摘要。"
     acknowledgement = "定时研究委托请求已处理；是否登记以实际工具回执为准。"
     other_request = "这里只是另一私聊的普通问候，不更改原定时委托。"
@@ -72,6 +89,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", offline_http)
     scheduler_now = now()
     monkeypatch.setattr(reminders_module, "now", lambda: scheduler_now)
+    monkeypatch.setattr(scheduled_workflows_module, "now", lambda: scheduler_now)
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update(
         {
@@ -156,21 +174,23 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
                     turn = ModelTurn(tool_calls=[call("check-delegation-time", "clock_now")])
                 elif current == 2:
                     clock_result = tool_result(messages, "check-delegation-time")
-                    due_at = float(clock_result["unix"]) + 60
-                    schedule_available = "workflow_schedule" in names
+                    due_at = (
+                        calendar_due.timestamp() if calendar else float(clock_result["unix"]) + 60
+                    )
+                    assert due_at > float(clock_result["unix"])
+                    schedule_available = schedule_tool in names
+                    arguments: dict[str, Any] = {"name": schedule_name, "prompt": prompt}
+                    arguments.update(
+                        {key: value for key, value in calendar_rule.items() if key != "version"}
+                        if calendar
+                        else {"due_at": due_at, "interval_seconds": interval_seconds}
+                    )
                     turn = ModelTurn(
                         tool_calls=[
                             ToolCall(
                                 "schedule-reviewed-research",
-                                "workflow_schedule",
-                                json.dumps(
-                                    {
-                                        "name": schedule_name,
-                                        "prompt": prompt,
-                                        "due_at": due_at,
-                                        "interval_seconds": interval_seconds,
-                                    }
-                                ),
+                                schedule_tool,
+                                json.dumps(arguments),
                             )
                         ]
                     )
@@ -207,7 +227,9 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
                 elif current == 2:
                     listing = tool_result(messages, "list-delegations")
                     candidates = [
-                        item for item in listing["items"] if item["id"] == schedule_result["id"]
+                        item
+                        for item in listing["items"]
+                        if item["id"] == schedule_result["id"] and item["kind"] == schedule_kind
                     ]
                     assert len(candidates) == 1
                     turn = ModelTurn(
@@ -216,6 +238,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
                                 "cancel-delegation",
                                 "workflow_schedule_cancel",
                                 id=candidates[0]["id"],
+                                kind=candidates[0]["kind"],
                             )
                         ]
                     )
@@ -344,7 +367,9 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
                 actual = [item for item in messages if item.get("tool_call_id") == identifier]
                 assert len(actual) == 1 and actual[0]["content_provenance"] == "accepted"
                 assert json.loads(actual[0]["content"]) == expected
-            assert due_at == float(clock_result["unix"]) + 60
+            assert due_at == (
+                calendar_due.timestamp() if calendar else float(clock_result["unix"]) + 60
+            )
             # Scheduling must not run the DAG during its creating owner request.
             assert runtime.store.list("workflow_run") == []
             reply = completed(runtime, acknowledgement)
@@ -361,18 +386,20 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             # The first target red is the live tool directory, after all current prerequisites.
             assert schedule_available is True, (
                 "真实phone7 owner输入、clock_now、accepted工具回执、正常主运行、"
-                "原7来源与Web回复均已保存且未自动外发，但当前主工具表没有workflow_schedule；"
+                f"原7来源与Web回复均已保存且未自动外发，但当前主工具表没有{schedule_tool}；"
                 f"实际工具结果：{schedule_result}"
             )
             assert "error" not in schedule_result and isinstance(schedule_result.get("id"), str)
             schedule_id = schedule_result["id"]
-            scheduled = runtime.store.get("workflow_schedule", schedule_id)
+            scheduled = runtime.store.get(schedule_kind, schedule_id)
             assert scheduled is not None and scheduled["active"] is True
             assert scheduled["next_due_at"] == due_at and scheduled["fired_count"] == 0
             assert scheduled["reply_origin"] == origin
             assert scheduled["creator_session_id"] == main_id
             assert scheduled["creator_run_id"] == runs["setup"]
-            assert scheduled["interval_seconds"] == interval_seconds
+            assert scheduled["interval_seconds"] == (None if calendar else interval_seconds)
+            if calendar:
+                assert scheduled["calendar"] == calendar_rule
 
             phase = "other"
             assert (await phone(web, other_request, 5702, sender=8)).status_code == 200
@@ -410,7 +437,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
                 and reopened.main_session()["id"] == main_id
             )
             await asyncio.wait_for(idle.waits.get(), 3)
-            assert reopened.store.get("workflow_schedule", schedule_id) == scheduled
+            assert reopened.store.get(schedule_kind, schedule_id) == scheduled
             assert reopened.store.list("workflow_run") == [] and search_requests == []
             scheduler_now = due_at
             idle.set()
@@ -458,7 +485,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             assert report is not None and report["content"] == report_text
             assert report["session_id"] == main_id and report["reply_origin"] == origin
             assert report["workflow_run_id"] == workflow["id"]
-            occurrences = reopened.store.list("workflow_occurrence", 3)
+            occurrences = reopened.store.list(occurrence_kind, 3)
             assert len(occurrences) == 1
             occurrence = occurrences[0]
             assert occurrence["id"] == workflow["scheduled_occurrence_id"]
@@ -481,14 +508,14 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             assert history.status_code == 200
             assert sum(item["content"] == report_text for item in history.json()["messages"]) == 1
             assert rounds == {"setup": 3, "other": 1, "worker": 2, "reviewer": 1, "cancel": 0}
-            after_first = reopened.store.get("workflow_schedule", schedule_id)
+            after_first = reopened.store.get(schedule_kind, schedule_id)
             assert after_first["fired_count"] == 1 and after_first["active"] is True
-            assert after_first["next_due_at"] == due_at + interval_seconds
+            assert after_first["next_due_at"] == due_at + (86400 if calendar else interval_seconds)
             await asyncio.wait_for(idle.waits.get(), 3)
             idle.set()
             await asyncio.wait_for(idle.waits.get(), 3)
             assert reopened.store.list("workflow_run", 3) == actual_runs
-            assert reopened.store.list("workflow_occurrence", 3) == occurrences
+            assert reopened.store.list(occurrence_kind, 3) == occurrences
             assert len(search_requests) == 1
 
             phase = "cancel"
@@ -496,7 +523,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             await eventually(reopened, finished)
             assert await reopened.wait(runs[phase]) == cancel_reply
             assert "error" not in cancellation and rounds["cancel"] == 3
-            cancelled = reopened.store.get("workflow_schedule", schedule_id)
+            cancelled = reopened.store.get(schedule_kind, schedule_id)
             assert cancelled["active"] is False and cancelled["version"] > after_first["version"]
             cancel_message = completed(reopened, cancel_reply)
             assert (
@@ -515,7 +542,7 @@ async def test_owner_schedules_a_reviewed_delegation_through_the_real_phone_runt
             idle.set()
             await asyncio.wait_for(idle.waits.get(), 3)
             assert reopened.store.list("workflow_run", 3) == actual_runs
-            assert reopened.store.list("workflow_occurrence", 3) == occurrences
+            assert reopened.store.list(occurrence_kind, 3) == occurrences
             assert len(search_requests) == 1 and rounds["worker"] == 2 and rounds["reviewer"] == 1
             assert requests == []
     finally:
