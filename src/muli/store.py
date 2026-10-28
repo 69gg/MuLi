@@ -25,6 +25,7 @@ from muli.format_evidence import (
     FormatReadLimits,
     read_optional_format_evidence,
 )
+from muli.management_transaction import _object
 from muli.proactive import FrozenRouting
 from muli.reply_origin import ReplyOrigin
 from muli.store_initialization import (
@@ -429,7 +430,7 @@ class Store:
         return json.loads(row[0]) if row else None
 
     def bounded_object(
-        self, kind: str, identifier: str, *, max_bytes: int
+        self, kind: str, identifier: str, *, max_bytes: int, strict_json: bool = False
     ) -> dict[str, Any] | None:
         """Point-read complete JSON only after SQLite has checked its byte budget."""
         if type(max_bytes) is not int or not 1 <= max_bytes <= SQLITE_MAX_INTEGER:
@@ -448,7 +449,7 @@ class Store:
             raw = row["data"]
             if raw is None:
                 raise ValueError
-            item = json.loads(raw.decode("utf-8"))
+            item = _object(bytes(raw)) if strict_json else json.loads(raw.decode("utf-8"))
             if not isinstance(item, dict) or item.get("id") != identifier:
                 raise ValueError
             # Digests and tool output must also be valid UTF-8, including escaped strings.

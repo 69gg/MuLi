@@ -63,6 +63,7 @@ from muli.providers import (
 from muli.reminder_followup import followup_binding, task_status
 from muli.reminders import Reminders, reminder_kind
 from muli.reply_origin import ReplyOrigin
+from muli.shell_receipts import ShellReceipts
 from muli.shell_sessions import ShellSessionError, ShellSessions
 from muli.store import LifecycleKind, Store, new_id, now
 from muli.system_events import SystemEvents, SystemLogger
@@ -190,6 +191,7 @@ class Runtime:
 
     def _initialize(self) -> None:
         self.channel_ownership = ChannelOwnership(self)
+        self.shell_receipts = ShellReceipts(self.store)
         self.bus = EventBus(self.store)
         self.system_events = SystemEvents(
             self.store,
@@ -3281,12 +3283,24 @@ class Runtime:
                 if {"cursor", "wait_seconds"} & args.keys():
                     raise ValueError("shell 输出续读需要 command_id；空参数只查询当前状态")
                 return shell_manager.status(session_id)
-            result = await shell_manager.read(
-                session_id,
-                args["command_id"],
-                cursor=args.get("cursor"),
-                wait_seconds=args.get("wait_seconds", 0),
-            )
+            try:
+                result = await shell_manager.read(
+                    session_id,
+                    args["command_id"],
+                    cursor=args.get("cursor"),
+                    wait_seconds=args.get("wait_seconds", 0),
+                )
+            except ShellSessionError as exc:
+                if exc.code != "not_found":
+                    raise
+                guard()
+                result = self.shell_receipts.read(
+                    session_id,
+                    args["command_id"],
+                    cursor=args.get("cursor"),
+                    output_limit=self.config.settings.limits.max_output_chars,
+                    receipt_limit=self.config.settings.limits.max_output_chars,
+                )
             guard()
             return result
 
@@ -3666,7 +3680,8 @@ class Runtime:
             Tool(
                 "shell_read",
                 "只读本会话shell状态；空参数不启动进程。传command_id及双流cursor续读有界输出，"
-                "wait_seconds最多10秒。exit_code仅completed可信；unknown不能自动重做",
+                "正常重开可读保留回执，不恢复进程。wait_seconds最多10秒。"
+                "exit_code仅completed可信；unknown或记录缺失不能自动重做",
                 parameters(
                     {
                         "command_id": {"type": "string", "minLength": 1},
@@ -3798,6 +3813,12 @@ class Runtime:
                 # to close. Keep the writer lease if process cleanup is unknown.
                 await self.shells.aclose()
                 shells_settled = True
+                if drivers_settled:
+                    self.shell_receipts.archive(
+                        self.shells,
+                        max_records=self.config.settings.limits.max_pending_runs,
+                        output_limit=self.config.settings.limits.max_output_chars,
+                    )
             finally:
                 try:
                     await self.system_events.close()

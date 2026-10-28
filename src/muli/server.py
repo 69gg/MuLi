@@ -1296,6 +1296,7 @@ def _create_app(
         await runtime.stop(session_id)
         await runtime.compaction.forget(session_id)
         with runtime.store.db:
+            runtime.shell_receipts.delete_session(session_id)
             runtime.store.db.execute(
                 "DELETE FROM objects WHERE kind IN ('message','run','approval') AND json_extract(data,'$.session_id')=?",
                 (session_id,),
@@ -1303,7 +1304,12 @@ def _create_app(
             runtime.store.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
             runtime.store.db.execute("DELETE FROM ingress WHERE session_id=?", (session_id,))
             runtime.store.db.execute("DELETE FROM message_order WHERE session_id=?", (session_id,))
-        return {"deleted": runtime.store.delete("session", session_id)}
+            deleted = bool(
+                runtime.store.db.execute(
+                    "DELETE FROM objects WHERE kind='session' AND id=?", (session_id,)
+                ).rowcount
+            )
+        return {"deleted": deleted}
 
     @app.post("/api/sessions/{session_id}/messages")
     async def send_message(session_id: str, body: ChatInput) -> dict[str, Any]:

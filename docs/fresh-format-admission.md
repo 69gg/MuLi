@@ -42,6 +42,16 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 以上声明绑定当前可信应用代码的解释合同，不声称审计数据库内所有额外 SQL、插件或历史手工写入。额外插件私有表/其私有索引可保留；这不是插件完整性或任意触发器认证。正常配置和安装真实性仍由各自宿主核验负责。
 
+### 可淘汰的 shell 回执记录
+
+`objects.kind='shell_receipt'`、`version=1` 是正常关闭时生成的独立证据记录，内部键由真实会话与命令编号组成；`shell.receipt_stored` 事件仅含内部键及来源，其 `events.id AUTOINCREMENT` 定义跨关闭和批内保留次序。回执不包含命令正文、环境、shell secret、PID 连接或执行授权，不改变 run/approval/unknown、渠道或主配置语义，不恢复进程，也不自动重放。因此沿用当前七领域 ID，独立版本不能替代相应语义改变时的合同审查。
+
+格式固定上界集中在 `shell_receipts`：原始 retained bytes 最多 100000，非空段数不超过 retained bytes，完整 JSON envelope 最多 8 MiB，非 output 元数据最多 512 KiB，计数不超过 SQLite 最大整数。写入先核最坏编码开销和实际完整大小；读取在 SQL 内先核 envelope 和元数据，再点读单条、拒绝重复 JSON key、未来版本、非法 Base64、不连续偏移或计数不等式，最后构造 `_Output`。旧大记录的读取门不随当前页帽缩小；验证后按当前输出额度裁剪，分页保持原始 byte 游标和 UTF-8 终态规则。
+
+只有当前真实调用资格下、本会话 live 查找的确切 `not_found` 才能回退读取，其他游标、预算或执行错误保持原拒绝。正常收口成功与归档成功独立记账，归档失败回滚并传播，已收口的 Store/writer 仍正常释放；未收口时不伪造成功。普通会话删除与回执清理处于同一同步事务，归档前再次确认会话存在。
+
+当前格式的真实 Runtime 重开与通用 Store 保留未知功能记录分别有回归。通用 Store 回归使用当前代码，不是基线旧发行包的实际运行证据；旧读取器忽略该 kind/事件的判断还依赖原有读取路径的源码审查，不能据此宣称任意历史包已验证兼容。敏感内容保留与崩溃边界见[连续终端会话](shell-sessions.md#正常重开后查回执)。
+
 ## 已标记库的持续约束
 
 `read_optional_format_evidence` 在有界快照中区分真正缺失、有效完整标记与错误。缺少 `runtime_state` 表可视为 legacy；目录按 SQLite 的 NOCASE 名称规则定位，再拒绝非 canonical 名称，避免 `RUNTIME_STATE` 被误当缺表。不可读/错误类型的表、未知命名族、坏 JSON、部分领域、未知 metadata 或当前不支持的合同 ID 都拒绝。`runtime_state.name` 非 STRICT TEXT 仍可存 BLOB，所以 TEXT 与 BLOB 的 `format_state_` 前缀分别用主键范围查询；BLOB-only 和合法 TEXT 与 BLOB 冲突均不能降为 legacy。最多三次分类查询加五次完整证据查询，沿用默认八次查询预算。

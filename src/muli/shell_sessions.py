@@ -115,6 +115,116 @@ class _Output:
         return output, error, {"output": next_output, "stderr": next_error}
 
 
+def _read_cursor(cursor: OutputCursor | None, output: _Output) -> OutputCursor:
+    if cursor is None:
+        return _empty_cursor()
+    if (
+        not isinstance(cursor, dict)
+        or set(cursor) != set(_STREAMS)
+        or any(
+            type(cursor[stream]) is not int
+            or cursor[stream] < 0
+            or cursor[stream] > output.observed_by_stream[stream]
+            for stream in _STREAMS
+        )
+    ):
+        raise ShellSessionError("invalid_cursor", "shell 输出游标无效")
+    return cursor.copy()
+
+
+def _receipt_budget(
+    receipt: dict[str, Any], maximum: int | None, *, before_dispatch: bool = False
+) -> int | None:
+    if maximum is None:
+        return None
+    if type(maximum) is not int or maximum < 1:
+        raise ShellSessionError("invalid_argument", "shell 回执预算必须是正整数")
+    if json_size(receipt) > maximum:
+        raise ShellSessionError(
+            "output_budget",
+            "shell 完整回执元数据超过预算，本次命令尚未派发"
+            if before_dispatch
+            else "shell 完整回执元数据超过预算；请核查原命令，不要重新执行",
+        )
+    return maximum
+
+
+def _receipt_page(
+    output: _Output,
+    result: dict[str, Any],
+    cursor: OutputCursor,
+    *,
+    maximum: int | None,
+    final: bool,
+) -> dict[str, Any]:
+    """One byte-cursor pager for live pipes and validated, process-free evidence."""
+    start: OutputCursor = {
+        "output": max(cursor["output"], output.discarded_by_stream["output"]),
+        "stderr": max(cursor["stderr"], output.discarded_by_stream["stderr"]),
+    }
+    maximum = _receipt_budget(result, maximum)
+
+    def select(stream: StreamName, count: int) -> int:
+        text, next_cursor = output.read_stream(stream, cursor[stream], final=final, max_bytes=count)
+        result[stream] = text
+        result["next_cursor"][stream] = next_cursor
+        return next_cursor
+
+    remaining = {stream: output.observed_by_stream[stream] - start[stream] for stream in _STREAMS}
+    full_cursor = {stream: select(stream, remaining[stream]) for stream in _STREAMS}
+    if maximum is None or json_size(result) <= maximum:
+        return result
+    for stream in _STREAMS:
+        select(stream, 0)
+    base_size = json_size(result)
+    available = maximum - base_size
+    minimum: dict[StreamName, int] = {}
+    for stream in _STREAMS:
+        if full_cursor[stream] == start[stream]:
+            continue
+        for count in range(1, min(4, remaining[stream]) + 1):
+            if select(stream, count) > start[stream]:
+                minimum[stream] = json_size(result) - base_size
+                break
+        select(stream, 0)
+    order: list[StreamName] = []
+    for offset, stream, data in output.chunks:
+        if stream in minimum and stream not in order and offset + len(data) > start[stream]:
+            order.append(stream)
+    shares: dict[StreamName, int] = {"output": 0, "stderr": 0}
+    if len(minimum) == 2 and sum(minimum.values()) <= available:
+        shares["output"] = min(
+            max(available // 2, minimum["output"]), available - minimum["stderr"]
+        )
+        shares["stderr"] = available - shares["output"]
+    else:
+        for stream in order:
+            if minimum[stream] <= available:
+                shares[stream] = available
+                break
+
+    def fit(stream: StreamName, limit: int) -> None:
+        low, high = 0, remaining[stream]
+        while low < high:
+            middle = (low + high + 1) // 2
+            select(stream, middle)
+            if json_size(result) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        select(stream, low)
+
+    for stream in _STREAMS:
+        fit(stream, json_size(result) + shares[stream])
+    for stream in order:
+        fit(stream, maximum)
+    if all(result["next_cursor"][stream] == start[stream] for stream in _STREAMS):
+        raise ShellSessionError(
+            "output_budget", "shell 预算不足以返回完整字符及续读元数据，请勿重新执行命令"
+        )
+    return result
+
+
 @dataclass(slots=True)
 class _Command:
     id: str
@@ -680,20 +790,7 @@ class ShellSessions:
         item = self._commands.get(command_id)
         if item is None or item.shell.session_id != session_id:
             raise ShellSessionError("not_found", "该会话没有可读的 shell 命令记录")
-        if cursor is None:
-            cursor = _empty_cursor()
-        if (
-            not isinstance(cursor, dict)
-            or set(cursor) != set(_STREAMS)
-            or any(
-                type(cursor[stream]) is not int
-                or cursor[stream] < 0
-                or cursor[stream] > item.output.observed_by_stream[stream]
-                for stream in _STREAMS
-            )
-        ):
-            raise ShellSessionError("invalid_cursor", "shell 输出游标无效")
-        cursor = cursor.copy()
+        cursor = _read_cursor(cursor, item.output)
         if wait and item.state == "running" and item.output.read(cursor)[2] == cursor:
             item.changed.clear()
             with contextlib.suppress(TimeoutError):
@@ -703,19 +800,8 @@ class ShellSessions:
     def _receipt_budget(
         self, receipt: dict[str, Any], *, before_dispatch: bool = False
     ) -> int | None:
-        if self._max_receipt_chars is None:
-            return None
-        maximum = self._max_receipt_chars()
-        if type(maximum) is not int or maximum < 1:
-            raise ShellSessionError("invalid_argument", "shell 回执预算必须是正整数")
-        if json_size(receipt) > maximum:
-            raise ShellSessionError(
-                "output_budget",
-                "shell 完整回执元数据超过预算，本次命令尚未派发"
-                if before_dispatch
-                else "shell 完整回执元数据超过预算；请核查原命令，不要重新执行",
-            )
-        return maximum
+        maximum = self._max_receipt_chars() if self._max_receipt_chars is not None else None
+        return _receipt_budget(receipt, maximum, before_dispatch=before_dispatch)
 
     def _empty(self, session_id: str) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -792,80 +878,9 @@ class ShellSessions:
 
     def _receipt(self, item: _Command, cursor: OutputCursor) -> dict[str, Any]:
         item.output.trim(self._output_limit())
-        start: OutputCursor = {
-            "output": max(cursor["output"], item.output.discarded_by_stream["output"]),
-            "stderr": max(cursor["stderr"], item.output.discarded_by_stream["stderr"]),
-        }
         result = self._receipt_metadata(item, cursor)
-        maximum = self._receipt_budget(result)
-
-        def select(stream: StreamName, count: int) -> int:
-            text, next_cursor = item.output.read_stream(
-                stream, cursor[stream], final=item.done.is_set(), max_bytes=count
-            )
-            result[stream] = text
-            result["next_cursor"][stream] = next_cursor
-            return next_cursor
-
-        remaining = {
-            stream: item.output.observed_by_stream[stream] - start[stream] for stream in _STREAMS
-        }
-        full_cursor = {stream: select(stream, remaining[stream]) for stream in _STREAMS}
-        if maximum is None or json_size(result) <= maximum:
-            return result
-        for stream in _STREAMS:
-            select(stream, 0)
-        base_size = json_size(result)
-        available = maximum - base_size
-        minimum: dict[StreamName, int] = {}
-        for stream in _STREAMS:
-            if full_cursor[stream] == start[stream]:
-                continue
-            # A complete UTF-8 unit needs at most four source bytes. Invalid
-            # input and a completion boundary's tail use the same decoder.
-            for count in range(1, min(4, remaining[stream]) + 1):
-                if select(stream, count) > start[stream]:
-                    minimum[stream] = json_size(result) - base_size
-                    break
-            select(stream, 0)
-        order: list[StreamName] = []
-        for offset, stream, data in item.output.chunks:
-            if stream in minimum and stream not in order and offset + len(data) > start[stream]:
-                order.append(stream)
-        shares: dict[StreamName, int] = {"output": 0, "stderr": 0}
-        if len(minimum) == 2 and sum(minimum.values()) <= available:
-            shares["output"] = min(
-                max(available // 2, minimum["output"]), available - minimum["stderr"]
-            )
-            shares["stderr"] = available - shares["output"]
-        else:
-            for stream in order:
-                if minimum[stream] <= available:
-                    shares[stream] = available
-                    break
-
-        def fit(stream: StreamName, limit: int) -> None:
-            low, high = 0, remaining[stream]
-            while low < high:
-                middle = (low + high + 1) // 2
-                select(stream, middle)
-                if json_size(result) <= limit:
-                    low = middle
-                else:
-                    high = middle - 1
-            select(stream, low)
-
-        for stream in _STREAMS:
-            fit(stream, json_size(result) + shares[stream])
-        # Reuse an underspent half without reserving another output buffer or
-        # a mutable round-robin ledger. The oldest unread stream gets first use.
-        for stream in order:
-            fit(stream, maximum)
-        if all(result["next_cursor"][stream] == start[stream] for stream in _STREAMS):
-            raise ShellSessionError(
-                "output_budget", "shell 预算不足以返回完整字符及续读元数据，请勿重新执行命令"
-            )
-        return result
+        maximum = self._max_receipt_chars() if self._max_receipt_chars is not None else None
+        return _receipt_page(item.output, result, cursor, maximum=maximum, final=item.done.is_set())
 
     async def aclose(self) -> None:
         self._closed = True
