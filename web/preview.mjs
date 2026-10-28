@@ -60,6 +60,7 @@ export function createPreviewState() {
     memorySources: [
       { source_id: "preview-source-notes", source: "前端演示资料", content: notes, session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "a".repeat(64), created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
       { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
+      ...[["e", "c", "1", "期限：七日\n材料：学生证\n"], ["f", "d", "2", "期限：十日\n材料：身份证\n"]].map(([id, original, revision, content]) => ({ source_id: `attachment:${id.repeat(32)}`, source: `attachment:${id.repeat(32)}:${original.repeat(64)}`, content, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false, revision: revision.repeat(64), source_revision: original.repeat(64), format: "text", scope: "utf8_text", document_revision: null, attachment_id: id.repeat(32), created_at: now - 1800, job: { state: "done", attempts: 1, last_error: "" }, comparisonDemo: true })),
     ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),
     members: [
       { id: "demo-researcher", session_id: "preview-researcher", name: "资料整理", role: "worker", parent_id: main.id, task: "整理示例项目结构与待办", status: "completed", generation: 1, last_message: "结构梳理与清单已完成。", created_at: now - 3600 },
@@ -361,6 +362,18 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (!content && offset < raw.length) return failure("本段不足以容纳一个完整字符。");
       const { content: original, job, ...metadata } = item;
       return response({ ...metadata, id: item.source_id, digest: item.revision, field: "content", content, offset_bytes: offset, length_bytes: end - offset, next_offset_bytes: end, total_bytes: raw.length, has_more: end < raw.length, truncated: offset > 0 || end < raw.length });
+    }
+    if (path === "/memory/sources/compare" && method === "POST") {
+      if (Object.keys(body).some((key) => !["left_id", "left_revision", "right_id", "right_revision", "cursor"].includes(key))) return failure("比较参数无效。", 422);
+      const left = state.memorySources.find((item) => item.source_id === body.left_id && item.comparisonDemo);
+      const right = state.memorySources.find((item) => item.source_id === body.right_id && item.comparisonDemo);
+      if (!left || !right) return failure("没有这份演示比较资料。", 404);
+      if (body.left_revision !== left.revision || body.right_revision !== right.revision) return failure("演示来源版本已经变化。", 409);
+      if (body.cursor != null) return failure("这组演示变化只有一页，请从头核对。");
+      const identity = ({ content, job, comparisonDemo, ...item }) => item;
+      const side = (item) => ({ offset_bytes: 0, length_bytes: item.total_bytes, content: item.content, read_arguments: { id: item.source_id, revision: item.revision, offset_bytes: 0, length_bytes: item.total_bytes } });
+      const equal = left.source_id === right.source_id;
+      return response({ status: equal ? "equal" : "changed", algorithm: "line_sequence_matcher_v1", left: identity(left), right: identity(right), items: equal ? [] : [{ kind: "replace", left: side(left), right: side(right) }], has_more: false, next_cursor: null });
     }
     if (path === "/memory/sources/retry" && method === "POST") {
       if (Object.keys(body).sort().join(",") !== "revision,source_id") return failure("只接受准确来源和版本。", 422);

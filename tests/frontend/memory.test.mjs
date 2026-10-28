@@ -718,6 +718,61 @@ test("DOM replacement keeps primitive text values rather than filtering boolean 
   root.replaceChildren(); assert.equal(root.childNodes.length, 0);
 });
 
+function comparisonFixture() {
+  const left = catalogSource({ source_id: `attachment:${"a".repeat(32)}`, session_id: "", total_bytes: 8 });
+  const right = catalogSource({ source_id: `attachment:${"b".repeat(32)}`, session_id: "", revision: "b".repeat(64), total_bytes: 12 });
+  const identity = (source) => ({ ...source, attachment_id: source.source_id.slice(11), format: "text", scope: "utf8_text", source_revision: "c".repeat(64), document_revision: null });
+  const side = (source, offset, content) => ({ offset_bytes: offset, length_bytes: Buffer.byteLength(content), content, read_arguments: { id: source.source_id, revision: source.revision, offset_bytes: offset, ...(content ? { length_bytes: Buffer.byteLength(content) } : {}) } });
+  const header = { status: "changed", algorithm: "line_sequence_matcher_v1", left: identity(left), right: identity(right) };
+  return { left, right, first: { ...header, items: [{ kind: "replace", left: side(left, 0, "甲\n"), right: side(right, 0, "乙\n") }], has_more: true, next_cursor: "signed-next" }, last: { ...header, items: [{ kind: "insert", left: side(left, 8, ""), right: side(right, 8, "新\n") }], has_more: false, next_cursor: null } };
+}
+
+async function beginComparison(h) {
+  await openCatalog(h);
+  await clickMemoryButton(h, h.other.querySelectorAll("button").filter((button) => button.textContent === "选作比较左侧")[0]);
+  await clickMemoryButton(h, h.other.querySelectorAll("button").filter((button) => button.textContent === "与所选比较")[1]);
+}
+
+test("explicit source comparison keeps ordered revisions and advances complete diff pages", async () => {
+  const f = comparisonFixture();
+  const h = harness(async (path, options) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([f.left, f.right]);
+    assert.equal(path, "/memory/sources/compare");
+    assert.equal(options.method, "POST");
+    assert.deepEqual({ ...options.body }, { left_id: f.left.source_id, left_revision: f.left.revision, right_id: f.right.source_id, right_revision: f.right.revision, ...(options.body.cursor ? { cursor: "signed-next" } : {}) });
+    return options.body.cursor ? f.last : f.first;
+  });
+  await beginComparison(h);
+  assert.ok(h.body().includes("仍有后续差异")); assert.ok(h.body().includes("甲\n"));
+  assert.ok(h.button("核对左侧原文")); assert.ok(h.button("核对右侧原文"));
+  await clickMemoryButton(h, h.button("继续核对差异"));
+  assert.ok(h.body().includes("已到末尾")); assert.ok(h.body().includes("新增")); assert.ok(h.body().includes("新\n"));
+  assert.equal(h.requests.filter((request) => request.path === "/memory/sources/compare").length, 2);
+  assert.equal(h.button("继续核对差异"), undefined);
+});
+
+test("comparison rejects incomplete source identity before displaying its body", async () => {
+  const f = comparisonFixture(), malformed = structuredClone(f.first);
+  delete malformed.left.source_revision;
+  malformed.items[0].left.content = "LEAK";
+  malformed.items[0].left.length_bytes = 4;
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([f.left, f.right]) : malformed);
+  await beginComparison(h);
+  assert.ok(h.body().includes("响应不完整")); assert.equal(h.body().includes("LEAK"), false);
+});
+
+for (const action of ["close", "forget-left", "forget-right"]) test(`comparison ${action} aborts a pending request and discards its late result`, async () => {
+  const f = comparisonFixture(), pending = deferred();
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([f.left, f.right]) : pending.promise);
+  await beginComparison(h);
+  const request = h.requests.at(-1);
+  if (action === "close") h.dialog.close();
+  else h.ui.invalidateMemoryEvidence({ data: { source_id: action === "forget-left" ? f.left.source_id : f.right.source_id } });
+  await flush(); assert.equal(request.signal.aborted, true);
+  pending.resolve(f.first); await flush();
+  assert.equal(h.body().includes("甲\n"), false); assert.equal(h.button("继续核对差异"), undefined);
+});
+
 test("graph path renders only nodes for complete results and adds one note for truncated results", async () => {
   for (const truncated of [false, undefined, null, true]) {
     const item = graphMemory(), h = harness(async () => ({ items: [item], truncated }));

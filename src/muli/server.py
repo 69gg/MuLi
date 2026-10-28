@@ -162,6 +162,14 @@ class MemorySourceRetryInput(Input):
     revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
+class MemorySourceCompareInput(Input):
+    left_id: str = Field(min_length=1, max_length=200, strict=True)
+    left_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    right_id: str = Field(min_length=1, max_length=200, strict=True)
+    right_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    cursor: str | None = Field(default=None, min_length=1, strict=True)
+
+
 class WorkflowInput(Input):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
@@ -389,6 +397,7 @@ def _create_app(
     async def close_resources() -> None:
         nonlocal configuration_closing
         configuration_closing = True
+        await memory_application.close_comparisons()
         try:
             await runtime.maintenance.settle_activation()
         except Exception:
@@ -1065,6 +1074,12 @@ def _create_app(
             revision=revision,
             max_output_chars=config.settings.limits.max_output_chars,
         )
+
+    @app.post("/api/memory/sources/compare")
+    async def compare_memory_sources(body: MemorySourceCompareInput) -> dict[str, Any]:
+        if configuration_closing:
+            raise MaintenanceError("transaction_unavailable", "service_closing")
+        return await memory_application.compare_sources(body.model_dump(exclude_none=True))
 
     @app.post("/api/memory/sources/retry")
     async def retry_memory_source(body: MemorySourceRetryInput) -> dict[str, Any]:

@@ -8,6 +8,7 @@
 - [模型](providers.md)：连接服务、推理参数、视觉和检索模型。
 - [个人记忆](memory.md)：自动整理、检索、原文核对与遗忘。
 - [来源目录](memory-sources.md)：浏览已保存资料、定位整理失败的来源。
+- [资料变化](source-comparison.md)：核对两份已收藏正文的增删改动。
 - [多 agent 协作](workflows.md)：分工、工作流和查看进度。
 - [任务控制](task-control.md)：暂停任务、补充要求与继续。
 - [任务核查](task-inspection.md)：查阅要求、成果和已有依据。
