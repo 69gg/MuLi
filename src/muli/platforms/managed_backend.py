@@ -599,8 +599,11 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 return None
             self._activation_attempt = attempt
         value = await self._request(record, boot, action)
-        after = await self._probe(record)
-        self._check(record, "base" if role is None else role)
+        # Its post-probe role guard includes the full controller authentication;
+        # do not repeat that scan in the same synchronous segment.
+        after = await self._probe(
+            record, postprocess=lambda _result: "base" if role is None else role
+        )
         if before != after or disk != self._disk():
             raise ObservationError("transaction_observation_changed")
         if value is None:

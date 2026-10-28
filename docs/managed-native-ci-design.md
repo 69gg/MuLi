@@ -1,10 +1,16 @@
 # 真实 systemd 托管切换 CI 设计
 
-Native60 候选只增加有界成本观测。version3 在原 `checks`、`host_record` 和 phase/intent 统计外，增加固定的 `slot_files_controller` 与 `slot_files_selected` 两个 count/total_ms 桶；只在同步 backend `_check` 内包装两处实际绑定，宿主 `_record` 的独立认证不混入。原 verifier 的参数、返回与异常均完整委派且只调用一次，失败认证也计入实际成本；计时失败使成本不可观测，不发布 observed 零成本。该作用域在 `_check` 返回或抛出时结束，不跨 await 保存任何认证证明。
+Native61 只合并 `_host_command` 在 HTTP 返回、第二次 fresh probe 之后的一处同步重复 controller 认证。原 `_probe` 已在返回前完整认证 controller，外侧紧邻的角色检查又完整认证一次；现在复用既有 `postprocess`，让该 probe 的末尾检查直接认证选中角色，保留 `role=None` 对应 base。controller 仍先于 selected 完整认证，probe 前后分别从实际文件认证；全部包字节、SHA、私有元数据、进程与三文件一致性、proof、真实 writer lease 及原绝对期限保持。没有跨 await 传递或缓存认证证明，没有改遍历或合并其它检查。
+
+新增真实认证回归已在旧生产收取 4 failed / 7 passed（8.43 秒；守卫 9.632 秒、峰值 68.8 MiB、swap 0）。drain、resume、target/base 激活四项均先通过真实完整包遍历、角色、两次 fresh probe、HTTP、临时 journal 与 writer lease 断言，两项激活另核对完整回执 proof，最终仅因尾部 controller 扫描两次而非一次失败。七项负控先通过：末次 probe 期间破坏 controller、selected 或两者仍按原 controller 优先顺序拒绝；base 三条路径不认证损坏的 opposite 包；真实 journal revision 更新后仍拒绝旧记录。target 激活还核对实际 FD 打开、前后身份、目录枚举、完整字节与 SHA 读取。修后 11 项通过（7.97 秒；守卫 9.256 秒、峰值 67.9 MiB），八文件 234 项整合通过（98.20 秒；守卫 99.494 秒、峰值 112.3 MiB、swap 0），两组重叠，不累计。独立后审未发现有源码证据的 P1/P2；本次局部减少重复认证不证明足以满足 60 秒或真实三事务验收，PR 保持草稿。
+
+Native60 只增加有界成本观测。version3 在原 `checks`、`host_record` 和 phase/intent 统计外，增加固定的 `slot_files_controller` 与 `slot_files_selected` 两个 count/total_ms 桶；只在同步 backend `_check` 内包装两处实际绑定，宿主 `_record` 的独立认证不混入。原 verifier 的参数、返回与异常均完整委派且只调用一次，失败认证也计入实际成本；计时失败使成本不可观测，不发布 observed 零成本。该作用域在 `_check` 返回或抛出时结束，不跨 await 保存任何认证证明。
 
 两桶是 `checks` 的子项，包含完整槽位文件认证中的读取、身份、枚举与摘要等工作，不能称作纯摘要成本，也不能与 `checks` 再次相加。version1/version2 仍严格可读；version3 的两个固定桶仅接受有界非负整数，不接纳额外路径、异常或动态标签，次数及耗时不得超过所属检查。沿原 install-returned 快照与 atexit 发布，current/history/partial 和协调器共用严格读端，不增加采样点、文件读取、worker 或期限，保留原 32 KiB 总输出门以及全部文件、角色、proof 和最终投影门。
 
 真实生成 hook 的离线首红已收取 2 failed / 2 passed（3.20 秒；守卫 4.720 秒、峰值 77.8 MiB、swap 0）：双槽完整认证、宿主桶外负控、真实坏 target 认证异常身份和恰一次委派均先成立，两红仅缺新 controller 成本桶；计时失败时真实认证成功与失败两正控先通过。实现后 14 项定向回归通过（3.30 秒、82.4 MiB），四文件 718 项整合通过（43.40 秒；守卫 44.836 秒、峰值 169.9 MiB、swap 0），两组存在重叠，不累计。独立静态后审未发现有证据的 P1/P2；尚不据此宣称性能改善或真实三事务通过。
+
+Native60 精确签名 `5a54325` 的十三项真实 CI 已全部终态：十二项通用作业成功，仅 managed-native 失败。首次 adopt 完整投影为 34114 毫秒；该代 `checks` 为 115 次 / 12059 毫秒，其中 `slot_files_controller` 为 115 次 / 11480 毫秒、`slot_files_selected` 为 0，独立 `host_record` 为 29 次 / 3476 毫秒。controller 桶覆盖解释器、pyvenv、声明、逐文件读取与身份、目录枚举和 SHA 等完整认证，不能称作纯哈希，也不能与所属 `checks` 再次相加；这些统计不证明其占全部事务墙钟的比例或完整根因。第二代 install-returned 部分样本为 `checks` 67 次 / 7244 毫秒、controller 67 次 / 6367 毫秒、selected 25 次 / 771 毫秒；start_target 已为 53436 毫秒，随后在原 60000 毫秒期限以 `TimeoutError` 结束，第三代未开始。2184 字节 evidence（artifact `12783180192`）的 SHA256 为 `072c005290c5683eba16881d830cd3aa3123e0acf3c277915cb6da8e2d08c566`；原严格读端与 cleanup verified、user/group removed、空 mounts 已核验。该真实失败保留，不能将本地通过或观测补齐写成三事务通过。
 
 Native59 候选只调整 CI 的只读观察：私有 journal 若以 `file_changed` 拒绝正在原子替换的状态文件，本次不产生事务或成功证据，沿原观察循环与绝对期限重新读取。其他读取错误继续失败，并仅保留白名单中的固定错误码。文件、目录、身份、事务和最终投影校验、60 秒期限及产品 controller 保持原合同。新增离线用例使用真实原子替换与真实 journal，覆盖旧直接读取的拒绝、重新读取，以及坏 JSON、文件超额和私有权限异常。
 
