@@ -622,39 +622,82 @@ class Store:
         before_seq: int | None = None,
     ) -> builtins.list[dict[str, Any]]:
         """Seek raw mappings first; optional sequence bounds never filter on JSON."""
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("消息窗口需要明确的非空会话身份")
+        return self._message_mapping_window(
+            session_id,
+            limit=limit,
+            metadata_bytes=metadata_bytes,
+            through_seq=through_seq,
+            before_seq=before_seq,
+        )
+
+    def history_evidence_window(
+        self,
+        *,
+        limit: int,
+        metadata_bytes: int,
+        through_seq: int | None = None,
+        before_seq: int | None = None,
+    ) -> builtins.list[dict[str, Any]]:
+        """Seek one global raw mapping window, before any scope or JSON inspection."""
+        return self._message_mapping_window(
+            None,
+            limit=limit,
+            metadata_bytes=metadata_bytes,
+            through_seq=through_seq,
+            before_seq=before_seq,
+        )
+
+    def _message_mapping_window(
+        self,
+        session_id: str | None,
+        *,
+        limit: int,
+        metadata_bytes: int,
+        through_seq: int | None,
+        before_seq: int | None,
+    ) -> builtins.list[dict[str, Any]]:
         if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
             raise ValueError("消息窗口需要 1–101 条映射")
         if type(metadata_bytes) is not int or not 1 <= metadata_bytes <= SQLITE_MAX_INTEGER:
             raise ValueError("映射字节预算必须是正整数")
-        predicate = ""
-        bounds: tuple[int, ...] = ()
+        predicate = " WHERE session_id=?" if session_id is not None else " WHERE 1=1"
+        arguments: tuple[str | int, ...] = (session_id,) if session_id is not None else ()
         if through_seq is not None:
             if type(through_seq) is not int or not 0 <= through_seq <= SQLITE_MAX_INTEGER:
                 raise ValueError("映射上界必须是有效的非负序号")
             predicate += " AND seq<=?"
-            bounds += (through_seq,)
+            arguments += (through_seq,)
         if before_seq is not None:
             if type(before_seq) is not int or not 1 <= before_seq <= SQLITE_MAX_INTEGER:
                 raise ValueError("映射续页位置必须是有效的正序号")
             predicate += " AND seq<?"
-            bounds += (before_seq,)
+            arguments += (before_seq,)
+        session_column = (
+            "CASE WHEN typeof(session_id)='text' "
+            "AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ? "
+            "THEN CAST(session_id AS BLOB) END AS session_id,"
+            if session_id is None
+            else ""
+        )
+        metadata_arguments = (metadata_bytes,) * (2 if session_id is None else 1)
         rows = self.db.execute(
-            "SELECT seq,CASE WHEN typeof(message_id)='text' "
+            "SELECT seq," + session_column + "CASE WHEN typeof(message_id)='text' "
             "AND length(CAST(message_id AS BLOB)) BETWEEN 1 AND ? "
             "THEN CAST(message_id AS BLOB) END "
-            "AS message_id FROM message_order WHERE session_id=?"
-            + predicate
-            + " ORDER BY seq DESC LIMIT ?",
-            (metadata_bytes, session_id, *bounds, limit),
+            "AS message_id FROM message_order" + predicate + " ORDER BY seq DESC LIMIT ?",
+            (*metadata_arguments, *arguments, limit),
         )
         mappings: builtins.list[dict[str, Any]] = []
         for row in rows:
             mapping = dict(row)
-            raw = mapping["message_id"]
-            try:
-                mapping["message_id"] = raw.decode("utf-8") if raw is not None else None
-            except UnicodeError:
-                mapping["message_id"] = None
+            for name in ("session_id", "message_id") if session_id is None else ("message_id",):
+                raw = mapping[name]
+                try:
+                    mapping[name] = raw.decode("utf-8") if raw is not None else None
+                except UnicodeError:
+                    mapping[name] = None
             mappings.append(mapping)
         return mappings
 

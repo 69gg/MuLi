@@ -242,6 +242,8 @@ class Runtime:
         self._tool_execution: ContextVar[tuple[str, str] | None] = ContextVar(
             "muli_tool_execution", default=None
         )
+        self._active_tool: ContextVar[Tool | None] = ContextVar("muli_active_tool", default=None)
+        self._history_find_runtime_id = new_id()
         self._request_context: ContextVar[PreparedRequest | None] = ContextVar(
             "muli_request", default=None
         )
@@ -2693,6 +2695,7 @@ class Runtime:
                             session,
                             spent,
                             consult=consult,
+                            prepared=prepared,
                         )
                         async for event in client.stream(
                             messages, [tool.schema() for tool in round_tools.values()]
@@ -2940,12 +2943,34 @@ class Runtime:
         spent: int,
         *,
         consult: ConsultRequest | None = None,
+        prepared: PreparedRequest | None = None,
     ) -> dict[str, Tool]:
         # Materialize after capacity admission. One dict binds the schemas and
         # handlers for this whole response, including approval waits and pairing.
         if spent >= self.config.settings.limits.max_tool_steps:
             return {}
         tools = self.session_tools(session_id)
+        owner_input = prepared.reply_origin.input_id if prepared is not None else None
+        history_input = (
+            consult is None
+            and not workflow_step
+            and session.get("kind") == "main"
+            and session_id == self.store.existing_main_session_id()
+            and owner_input is not None
+            and self.store.db.execute(
+                "SELECT CASE WHEN typeof(payload)='text' AND length(CAST(payload AS BLOB))<=? "
+                "THEN CASE WHEN json_valid(payload) THEN json_extract(payload,'$.principal') END END "
+                "FROM ingress WHERE id=? AND session_id=? AND run_id=? AND state='delivered'",
+                (
+                    self.config.settings.limits.max_context_chars * 4,
+                    owner_input,
+                    session_id,
+                    run_id,
+                ),
+            ).fetchone()
+        )
+        if not history_input or history_input[0] != "owner":
+            tools.pop("history_find", None)
         if consult is not None:
             self.team.consult.guard_control(consult, session_id)
             return {
@@ -3065,6 +3090,7 @@ class Runtime:
             token = self._tool_session.set(session_id)
             execution_token = self._tool_execution.set((session_id, run_id))
             request_token = self._request_context.set(prepared)
+            active_token = self._active_tool.set(tool)
             try:
                 # Final synchronous fence after the last await. No await may be
                 # added between this check and entering the trusted handler.
@@ -3085,6 +3111,7 @@ class Runtime:
                 else:
                     result = await tool.handler(arguments)
             finally:
+                self._active_tool.reset(active_token)
                 self._request_context.reset(request_token)
                 self._tool_execution.reset(execution_token)
                 self._tool_session.reset(token)
@@ -3386,6 +3413,50 @@ class Runtime:
                 deadline=monotonic() + limits.max_search_seconds,
             )
 
+        async def find_history(args: dict[str, Any]) -> Any:
+            caller = self.tool_session_id
+            execution = self._tool_execution.get()
+            request = self.request_context(caller) if caller is not None else None
+            active_tool = self._active_tool.get()
+            task = asyncio.current_task()
+            if (
+                self._closing
+                or caller is None
+                or caller != self.store.existing_main_session_id()
+                or execution is None
+                or execution != (caller, self.run_ids.get(caller))
+                or request is None
+                or request.consult is not None
+                or request.reply_origin.input_id is None
+                or task is None
+                or task.cancelling()
+                or self.tasks.get(caller) is not task
+                or caller in self._stopping
+                or active_tool is None
+                or active_tool.name != "history_find"
+                or active_tool.handler is not find_history
+                or "history_find" in self.config.settings.disabled_tools
+            ):
+                raise PermissionError("跨会话查找仅供真实主人当前请求中的主助手直接调用")
+            self.maintenance.admission.require()
+            self._guard_request(request, "read")
+            if self.store.pending_inputs(caller):
+                raise PermissionError("收到新输入，请先重新规划历史查找")
+            limits = self.config.settings.limits
+            return HistoryFind(self.store).find_owned(
+                caller,
+                args["query"],
+                run_id=execution[1],
+                input_id=request.reply_origin.input_id,
+                runtime_id=self._history_find_runtime_id,
+                cursor=args.get("cursor"),
+                limit=min(args.get("limit", 20), limits.max_search_results),
+                max_output_chars=limits.max_output_chars,
+                max_results=limits.max_search_results,
+                max_context_chars=limits.max_context_chars,
+                deadline=monotonic() + limits.max_search_seconds,
+            )
+
         async def remember(args: dict[str, Any]) -> Any:
             item = self.memory.save(**args)
             await self.bus.emit(
@@ -3636,6 +3707,23 @@ class Runtime:
                     ("session_id", "query"),
                 ),
                 find_conversation,
+                preserve_output=True,
+            ),
+            Tool(
+                "history_find",
+                "主助手在当前主人请求中，按区分大小写的字面文字定位自己及现存直属队友的旧原文。"
+                "返回真实出处与 conversation_read 参数；本次主运行排除。"
+                "cursor 仅同一主运行内续查，换运行或重开须重新查询；"
+                "检查 has_more、omitted_total 与来源，无命中不代表查全，不恢复队友或重跑工具",
+                parameters(
+                    {
+                        "query": string("要找的已保存原文片段；按字面匹配，区分大小写"),
+                        "cursor": string("原样使用同一主运行和查询返回的 next_cursor"),
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    ("query",),
+                ),
+                find_history,
                 preserve_output=True,
             ),
             Tool(
