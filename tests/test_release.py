@@ -14,6 +14,14 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/release.py"
 Artifact = Literal["source", "wheel", "sdist"]
 PackageFile = Literal["compatibility.json", "__init__.py"]
+
+
+@pytest.fixture(autouse=True)
+def release_stdio_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Match the parent decoder even when a child inherits a legacy console encoding.
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+
+
 BACKEND_VERSION = "7.4.2"
 WHEEL_METADATA = (
     "Wheel-Version: 1.0\n"
