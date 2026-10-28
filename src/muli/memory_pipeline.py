@@ -25,6 +25,7 @@ from muli.memory_source_failure import (
     MemorySourceFailure,
     attachment_revision,
 )
+from muli.memory_watches import record_source_completion
 from muli.proactive import FrozenRouting
 from muli.store import SQLITE_MAX_INTEGER, new_id, now
 
@@ -1268,11 +1269,22 @@ class MemoryPipeline:
             checkpoint["embedded"] = True
             if not self._checkpoint(source_id, checkpoint):
                 return
+        if self._index_closed or not live():
+            return
         with self.memory.store.db:
-            self.memory.store.db.execute(
-                "UPDATE memory_jobs SET state='done',last_error='',updated_at=? WHERE source_id=?",
-                (now(), source_id),
+            updated = self.memory.store.db.execute(
+                "UPDATE memory_jobs SET state='done',last_error='',updated_at=? "
+                "WHERE source_id=? AND state='processing' AND EXISTS "
+                "(SELECT 1 FROM memory_sources s WHERE s.id=? AND s.digest=?)",
+                (now(), source_id, source_id, source["digest"]),
             )
+            if updated.rowcount == 1:
+                record_source_completion(
+                    self.memory.store,
+                    source_id,
+                    source["digest"],
+                    max_source_chars=self.config.max_source_chars,
+                )
         if self.bus is not None and self.memory.source(source_id) is not None:
             await self.bus.emit(
                 "memory.updated", {"source_id": source_id, "memory_ids": identifiers}

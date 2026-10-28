@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整格式 `1`、`2` 声明的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整全 `1`、旧 OneBot 三域 `2` 或长期问题关注加入前四渠道三域 `3` 声明的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -28,19 +28,27 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`objects`、`ingress`、`outbox` 为 `3`，其余四个不透明合同 ID 为 `1`。格式 `2` 引入 OneBot 长期归属与持久 proof；格式 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。旧格式 `1`、`2` 仅是固定升级的源合同。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
+完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=1`、`install_profile=1`。原三域 `2` 引入 OneBot 长期归属与持久 proof；原三域 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。长期问题关注新增主配置和可撤销输入 proof，因此只改变 `configuration`、`ingress` 两域。旧完整三域 `3`、其余四域 `1` 固定保存为 `PRE_MEMORY_WATCH_FORMAT_STATE`，与原全 `1`、三域 `2` 都只作为显式停机升级源，不能直接启动。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |
 | `database` | 共享 core、memory、channel DDL 与索引；WAL；消息插入序号；`message_sequence_v1='done'`；1–96 UTF-8 bytes 的 Store/main 身份；主对象 `id` 对应、`kind='main'`、`principal='owner'`。不扫描所有业务行或替缺失派生行回填。 | `Store._initialize/_put/main_session`、`validate_existing_schema`、`read_format_evidence`；共享声明见 `store_schema` 与 `memory_schema`。 |
 | `objects` | `(kind,id)` 主键下的 JSON 对象、事件与消息顺序；run/session/approval/任务快照的原有状态语义；持久 approval 不等于当前活跃 future。执行身份、权限快照与 ReplyOrigin 分离；unknown 外部效果不能被重启或合成错误收据伪装成安全重试。压缩保留原始证据与来源边界。 | `Store._put/event/messages`、`Runtime._recover/_execute`、Permissions、TeamManager、WorkflowEngine、Compactor 与 Conversation。 |
-| `configuration` | 缺文件采用 `Settings` 默认；Pydantic 沿用现有类型转换，未知字段拒绝，并非 `strict=True` JSON 合同。`validate_changes` 递归合并，渠道 destination/memory preference 等既有整体替换规则继续；候选配置仍需原有来源、授权及生命周期核验。外部 JSON 配置的原始 bytes/路径真实性不由数据库 marker 证明。 | `ConfigFile.__init__/validate_changes/_merge/replace`、Settings、server 的 `apply_configuration` 与 `Extensions.apply_locked`。 |
-| `ingress` | 持久输入 ID、原 payload 比较、有限队列及 pending/delivered/cancelled/quarantined 状态；完整 route/proof 与 principal 独立冻结；同来源前缀合批而不混入另一来源，领取与恢复维持已有原子性。来源文本与模型输出不能自行提升权限或猜收件人。 | `Store._enqueue_input/claim_inputs`、`Runtime.submit/_claim_inputs/_recover`、Conversation、AttentionInbox、渠道入站。 |
+| `configuration` | 缺文件采用 `Settings` 默认；Pydantic 沿用现有类型转换，未知字段拒绝，并非 `strict=True` JSON 合同。包含长期问题关注的 `memory_watches` 设置，完整序列化会写出其默认值。`validate_changes` 递归合并，渠道 destination/memory preference 等既有整体替换规则继续；候选配置仍需原有来源、授权及生命周期核验。外部 JSON 配置的原始 bytes/路径真实性不由数据库 marker 证明。 | `ConfigFile.__init__/validate_changes/_merge/replace`、Settings、server 的 `apply_configuration` 与 `Extensions.apply_locked`。 |
+| `ingress` | 持久输入 ID、原 payload 比较、有限队列及 pending/delivered/cancelled/quarantined 状态；完整 route/proof 与 principal 独立冻结；同来源前缀合批而不混入另一来源，领取与恢复维持已有原子性。`attention_memory_watch` 只允许本机宿主关注证明，按证明独立合批，在领取、模型请求及输出前复核当前关注、来源和生命周期；取消或遗忘后旧证明失效。来源文本与模型输出不能自行提升权限或猜收件人。 | `Store._enqueue_input/claim_inputs`、`Runtime.submit/_claim_inputs/_recover`、Conversation、AttentionInbox、渠道入站。 |
 | `outbox` | `channel_outbox` 的原 payload、media mode、route、proactive/proof、分片游标及收据；相同幂等键不同 payload 拒绝。`sending` 恢复为 unknown，unknown 不自动重发，blocked 需显式现有重试/重验。默认附件行为保留，voice 仅显式选择；发送时继续核当前授权与冻结来源。 | `ChannelManager.enqueue/recover`、发送循环及重试、`ChannelApplication`、`FrozenRouting/guard_delivery`、原平台 adapter。 |
 | `memory` | 原始 source/revision、记忆事实及版本、别名证据、关系与派生检索结构；`revision` 为非负 INTEGER，`alias_evidence_version=1`。记忆绑定以 ID/version/source 元数据证明核验，不能由记忆正文自动授予渠道地址权限。禁止迁移重开不重建 meta、别名、词索引或关系。 | `Memory.__init__/_migrate_alias_evidence/register_source/save/edit/resolve_conflict`、MemoryPipeline、`proactive_memory.check_preference`。 |
 | `install_profile` | 接受尚未准备任何实例 profile/receipt 的缺省状态；本片不制造持久实例 profile。已有安装意图仅按 pinned uv adapter 有界解析，保留主 requirement/extras/with/constraints/overrides/python/entrypoint 与已支持 options；结果仍是 `intent_parsed/context_required`。索引/约束/凭据来源及 ResolverContext 未核齐时不能变成可安装证明。 | `parse_install_intent`、`InstallationReceipt/read_install_receipt`，以及现有安装 manifest 的独立核验；这些证据不由七 ID 自动生成。 |
 
 以上声明绑定当前可信应用代码的解释合同，不声称审计数据库内所有额外 SQL、插件或历史手工写入。额外插件私有表/其私有索引可保留；这不是插件完整性或任意触发器认证。正常配置和安装真实性仍由各自宿主核验负责。
+
+### 长期问题关注的格式边界
+
+`memory_watch`、`memory_watch_match`、`memory_source_completion` 是独立 `version=1` 功能记录；`memory_jobs.checkpoint.source_completion` 是可选的完成证明。真实后台 job 进入 `done` 与完成事件、canonical object 和 checkpoint 证明同事务保存，发现服务随后核对准确来源及修订。旧 `done` 没有完成证明不会补造事件，也不会扫描此前已整理完的资料。新增这些记录不重解释原有 source、revision、forget、run 或 unknown 状态，`objects=3`、`memory=1` 保留。
+
+主配置新增字段会让拒绝未知字段的旧版无法读取保存后的完整配置；新输入 proof 也不能被旧版当普通 `system:attention` 消费。2.112 的旧读取路径只识别整理失败证明，既不按 watch proof 独立合批，也不在取消或遗忘后核验它。因此新合同必须显式拒绝旧 reader；即使本机尚未登记关注，也不沿用旧完整声明。
+
+固定升级只在既有独占保护下原子转换精确 marker，不改 DDL 或业务行，也不改外部配置文件。旧配置缺少 `memory_watches` 时新版采用默认值；这不证明配置文件来源真实，更不表示旧库可跳过升级直接准入。回归保留 2.112 的冻结准入源码和 manifest，执行旧准入函数核对新 marker 被拒；它使用当前未变的格式模型和证据读取器，不是运行旧发行包的完整验证。
 
 ### 可淘汰的 shell 回执记录
 

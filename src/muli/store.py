@@ -1600,6 +1600,14 @@ class Store:
                     if payload.get("principal") == "system:attention"
                     and "attention_memory_failure" in payload
                     else "",
+                    json.dumps(
+                        payload["attention_memory_watch"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if payload.get("principal") == "system:attention"
+                    and "attention_memory_watch" in payload
+                    else "",
                 )
                 if destination is not None and key != destination:
                     break  # Another recipient waits for the next replay-safe boundary.

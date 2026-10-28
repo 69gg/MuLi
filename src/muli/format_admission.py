@@ -38,13 +38,25 @@ PREVIOUS_FORMAT_STATE = FormatState(
         install_profile=1,
     ),
 )
-CURRENT_FORMAT_STATE = FormatState(
+PRE_MEMORY_WATCH_FORMAT_STATE = FormatState(
     metadata_version=1,
     formats=FormatVersions(
         database=1,
         objects=3,
         configuration=1,
         ingress=3,
+        outbox=3,
+        memory=1,
+        install_profile=1,
+    ),
+)
+CURRENT_FORMAT_STATE = FormatState(
+    metadata_version=1,
+    formats=FormatVersions(
+        database=1,
+        objects=3,
+        configuration=2,
+        ingress=4,
         outbox=3,
         memory=1,
         install_profile=1,
@@ -59,7 +71,11 @@ class FormatAdmissionError(ValueError):
 
 
 def require_current_format(evidence: FormatEvidence) -> None:
-    if evidence.state in (LEGACY_FORMAT_STATE, PREVIOUS_FORMAT_STATE):
+    if evidence.state in (
+        LEGACY_FORMAT_STATE,
+        PREVIOUS_FORMAT_STATE,
+        PRE_MEMORY_WATCH_FORMAT_STATE,
+    ):
         raise FormatAdmissionError("store_format_upgrade_required")
     if evidence.state != CURRENT_FORMAT_STATE:
         raise FormatAdmissionError("store_format_unsupported")

@@ -12,7 +12,12 @@ import pytest
 from test_channel_format_upgrade import legacy_database, snapshot, upgrade
 
 from muli.compatibility import FormatState, FormatVersions
-from muli.format_admission import FormatAdmissionError
+from muli.config import ConfigFile, MemoryWatchSettings
+from muli.format_admission import (
+    CURRENT_FORMAT_STATE,
+    PRE_MEMORY_WATCH_FORMAT_STATE,
+    FormatAdmissionError,
+)
 from muli.format_evidence import (
     FORMAT_STATE_KEY,
     FormatEvidenceError,
@@ -25,6 +30,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux exclusive
 
 
 def format_state(channel_version: int) -> FormatState:
+    # These are exact historical contracts, not the current write format.
     return FormatState(
         metadata_version=1,
         formats=FormatVersions(
@@ -39,7 +45,7 @@ def format_state(channel_version: int) -> FormatState:
     )
 
 
-TARGET = format_state(3)
+TARGET = CURRENT_FORMAT_STATE
 
 
 def set_marker(path: Path, state: FormatState) -> None:
@@ -57,7 +63,7 @@ def predecessor_database(data_dir: Path, version: int) -> Path:
     return path
 
 
-@pytest.mark.parametrize("source_version", [1, 2], ids=["source1", "source2"])
+@pytest.mark.parametrize("source_version", [1, 2, 3], ids=["source1", "source2", "source3"])
 def test_normal_reader_requires_upgrade_for_each_known_predecessor(
     tmp_path: Path, source_version: int
 ) -> None:
@@ -68,8 +74,18 @@ def test_normal_reader_requires_upgrade_for_each_known_predecessor(
     assert snapshot(path) == before
 
 
-@pytest.mark.parametrize("source_version", [1, 2], ids=["source1", "source2"])
-def test_cli_upgrades_each_supported_predecessor_directly_to_format_three(
+def test_pre_watch_upgrade_preserves_the_existing_configuration_file(tmp_path: Path) -> None:
+    path = predecessor_database(tmp_path / "data", 3)
+    config_path = tmp_path / "config.json"
+    original = b'{\n  "memory": {"enabled": true}\n}\n'
+    config_path.write_bytes(original)
+    assert upgrade(path.parent)
+    assert config_path.read_bytes() == original
+    assert ConfigFile(config_path).settings.memory_watches == MemoryWatchSettings()
+
+
+@pytest.mark.parametrize("source_version", [1, 2, 3], ids=["source1", "source2", "source3"])
+def test_cli_upgrades_each_supported_predecessor_directly_to_current_format(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -201,13 +217,16 @@ def test_format_two_mixed_with_target_domain_is_not_a_supported_predecessor(tmp_
     assert snapshot(path) == before
 
 
-def test_format_two_upgrade_cannot_pass_a_live_runtime_construction_lock(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_version", [2, 3])
+def test_upgrade_cannot_pass_a_live_runtime_construction_lock(
+    tmp_path: Path, source_version: int
+) -> None:
     path = tmp_path / "data" / "muli.sqlite3"
     live = Store.open_runtime(path, default_mode="auto")
     try:
         # Retain the actual runtime's lifetime lock while staging the old marker.
         # No old-version process or admission is simulated by a fake lock object.
-        set_marker(path, format_state(2))
+        set_marker(path, format_state(source_version))
         before = snapshot(path)
         with pytest.raises(StoreInitializationError, match="store_initialization_busy"):
             upgrade(path.parent)
@@ -216,10 +235,11 @@ def test_format_two_upgrade_cannot_pass_a_live_runtime_construction_lock(tmp_pat
         live.close()
 
 
-def test_format_two_commit_denial_rolls_back_without_rewriting_business_rows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source_version", [2, 3])
+def test_commit_denial_rolls_back_without_rewriting_business_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_version: int
 ) -> None:
-    path = predecessor_database(tmp_path / "data", 2)
+    path = predecessor_database(tmp_path / "data", source_version)
     before = snapshot(path)
     connect = sqlite3.connect
     commits: list[bool] = []
@@ -240,4 +260,23 @@ def test_format_two_commit_denial_rolls_back_without_rewriting_business_rows(
         with pytest.raises(sqlite3.DatabaseError):
             upgrade(path.parent)
     assert commits == [True]
+    assert snapshot(path) == before
+
+
+@pytest.mark.parametrize("changed_domain", ["configuration", "ingress"])
+def test_partial_memory_watch_contract_is_not_a_supported_predecessor(
+    tmp_path: Path, changed_domain: str
+) -> None:
+    path = predecessor_database(tmp_path / "data", 3)
+    mixed = PRE_MEMORY_WATCH_FORMAT_STATE.model_copy(
+        update={
+            "formats": PRE_MEMORY_WATCH_FORMAT_STATE.formats.model_copy(
+                update={changed_domain: getattr(TARGET.formats, changed_domain)}
+            )
+        }
+    )
+    set_marker(path, mixed)
+    before = snapshot(path)
+    with pytest.raises(FormatAdmissionError, match="store_format_upgrade_source_unsupported"):
+        upgrade(path.parent)
     assert snapshot(path) == before

@@ -25,6 +25,7 @@ from muli.file_inbox import FileInboxProof, FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState, read_message
 from muli.mcp_receive_errors import RECEIVE_FAILURE_CODES
 from muli.memory_source_failure import MemorySourceFailure, failure_current
+from muli.memory_watches import MATCH_EVENT, MemoryWatchMatch, match_current
 from muli.proactive import FrozenRouting
 from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
@@ -659,6 +660,7 @@ class AttentionSource:
     file_inbox_proof: FileInboxProof | None = None
     reminder_proof: ReminderFollowupProof | None = None
     memory_failure_proof: MemorySourceFailure | None = None
+    memory_watch_proof: MemoryWatchMatch | None = None
 
 
 def _notification_source(
@@ -982,6 +984,31 @@ def attention_source(
             "memory.failure:" + proof.identifier,
             proof.routing,
             memory_failure_proof=proof,
+        )
+    if event.get("type") == MATCH_EVENT:
+        if "memory" not in enabled or max_output_chars is None or memory_source_chars is None:
+            return None
+        watch_proof = MemoryWatchMatch.load(
+            event["data"].get("match"), max_bytes=max_output_chars * 4
+        )
+        if (
+            watch_proof is None
+            or watch_proof.identifier != identifier
+            or not match_current(
+                store,
+                watch_proof,
+                max_source_chars=memory_source_chars,
+                max_output_chars=max_output_chars,
+                defer_budget=True,
+            )
+        ):
+            return None
+        return AttentionSource(
+            "memory",
+            watch_proof.identifier,
+            watch_proof.detail(),
+            "memory.watch:" + watch_proof.identifier,
+            memory_watch_proof=watch_proof,
         )
     if event.get("type") == "notification.created" and (
         event["data"].get("source") == "chiliarch"
