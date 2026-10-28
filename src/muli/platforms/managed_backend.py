@@ -294,9 +294,15 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self,
         record: TransactionRecordV2,
         *,
+        preflight: Callable[[], None] | None = None,
         postprocess: Callable[[ManagedProbeResult], Role | None] | None = None,
     ) -> ManagedProbeResult:
-        self._check(record)
+        if preflight is None:
+            self._check(record)
+        else:
+            # An adjacent stronger synchronous guard includes authentication.
+            # Its result never replaces the independent post-await check.
+            preflight()
         result = await self.probe.read_managed(
             self.journal, record, self.anchor, self.controller_slot, self.slots
         )
@@ -758,8 +764,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise ObservationError("transaction_effect_not_permitted")
         if data != self._desired(record, role):
             raise ObservationError("transaction_snapshot_changed")
-        self._check(record, role)
-        before = await self._probe(record)
+        before = await self._probe(record, preflight=lambda: self._check(record, role))
         if not self._stopped(before.service):
             raise ObservationError("transaction_service_not_stopped")
         with self.journal.writer_lease() as lease:
@@ -770,8 +775,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 if self._disk().digests not in _prefixes(record):
                     raise ObservationError("foreign_managed_binding")
 
-            guard()
-            if before != await self._probe(record):
+            if before != await self._probe(record, preflight=guard):
                 raise ObservationError("transaction_observation_changed")
             self._install_files(record, role, data, lease, cgroup)
             fresh = await self._probe(record)
@@ -780,8 +784,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             if not fresh.unit_confirmed:
                 guard()
                 await self._command("daemon-reload")
-                guard()
-                fresh = await self._probe(record)
+                fresh = await self._probe(record, preflight=guard)
             if (
                 not self._stopped(fresh.service)
                 or not fresh.unit_confirmed

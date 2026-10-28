@@ -14,6 +14,7 @@ from test_managed_backend_package_batch import observe_checks, observe_payloads
 from test_managed_backend_package_batch import package_payloads as package_payloads
 from test_managed_backend_python_proof import shared_host as shared_host
 
+from muli.managed_controller import BindingConfirmation
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import Role, TransactionJournal
 from muli.platforms.managed_deployment import (
@@ -29,10 +30,20 @@ from muli.platforms.managed_probe import ManagedProbeResult
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux retained install identities")
 
 
-async def test_install_batch_reuses_payload_bytes_without_reducing_guards(
-    shared_host: Host, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_install_batch_reuses_payload_bytes_with_all_required_guards(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, role: Role
 ) -> None:
     record = shared_host.install_intent()
+    if role == "base":
+        await shared_host.backend.install(record, "target", shared_host.data["target"])
+        shared_host.move("rolling_back", "stop_target", code="backend_failed")
+        record = shared_host.move("rolling_back", "restore_base", code="backend_failed")
+        # An opposite damaged package must not prevent real restoration.
+        leaf = Path(shared_host.slots["target"].package.root) / "batch_payload/first.bin"
+        contents = leaf.read_bytes()
+        leaf.write_bytes(bytes([contents[0] ^ 0xFF]) + contents[1:])
+        shared_host.probe.count = 0
     roots = {
         "controller": Path(shared_host.backend.controller_slot.package.root),
         "target": Path(shared_host.slots["target"].package.root),
@@ -41,41 +52,53 @@ async def test_install_batch_reuses_payload_bytes_without_reducing_guards(
     reads = observe_payloads(shared_host, monkeypatch)
     checks = observe_checks(shared_host, monkeypatch)
 
-    await shared_host.backend.install(record, "target", shared_host.data["target"])
+    confirmation = await shared_host.backend.install(record, role, shared_host.data[role])
 
-    # All original guards, walks and independent file identities precede the
-    # byte-count oracle. A cheaper or omitted guard must not make this pass.
-    assert len(checks) == 31
-    assert checks.count((record, "target")) == 25
-    assert checks.count((record, None)) == 6
+    assert shared_host.probe.count == 3
+    assert shared_host.commands == []
+    assert shared_host.record().position == record.position
+    disk = shared_host.backend._disk()
+    assert disk.configuration.data == shared_host.data[role].configuration
+    assert disk.selector is not None and disk.selector.value == shared_host.selector(role)
+    assert disk.unit.data == shared_host.data[role].unit
+    binding = record.binding(role)
+    assert confirmation == BindingConfirmation(
+        record.position,
+        role,
+        binding.configuration.digest,
+        None if binding.selector is None else binding.selector.digest,
+        binding.unit.digest,
+        binding.unit.digest,
+    )
+
+    # Only two adjacent controller-only scans disappear; all selected guards,
+    # independent identities and the two confirmations still execute.
+    assert len(checks) == 29
+    assert checks.count((record, role)) == 25
+    assert checks.count((record, None)) == 4
+    selected_walks = 25 if role == "target" else 0
     for leaf, observed in reads.leaves.items():
-        walks = 31 if leaf.is_relative_to(roots["controller"]) else 25
+        walks = 29 if leaf.is_relative_to(roots["controller"]) else selected_walks
         assert len(observed.opened) == walks, (leaf.name, len(observed.opened), walks)
         assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
         assert observed.fd_stats >= 2 * walks, (leaf.name, observed.fd_stats, walks)
         assert observed.path_stats == walks, (leaf.name, observed.path_stats, walks)
     for directory, scans in reads.scans.items():
-        walks = 31 if directory.is_relative_to(roots["controller"]) else 25
+        walks = 29 if directory.is_relative_to(roots["controller"]) else selected_walks
         assert scans == walks, (directory.name, scans, walks)
-    assert shared_host.probe.count == 3
-    assert shared_host.commands == []
-    assert shared_host.record().position == record.position
-    disk = shared_host.backend._disk()
-    assert disk.configuration.data == shared_host.data["target"].configuration
-    assert disk.selector is not None and disk.selector.value == shared_host.selector("target")
-    assert disk.unit.data == shared_host.data["target"].unit
 
     actual_bytes: dict[str, int] = {}
     expected_bytes: dict[str, int] = {}
+    selected_copies = 4 if role == "target" else 0
     for leaf, observed in reads.leaves.items():
         name = "controller" if leaf.is_relative_to(roots["controller"]) else "target"
         key = f"{name}/{leaf.relative_to(roots[name]).as_posix()}"
         actual_bytes[key] = observed.bytes
         # The synchronous component loop and its first confirmation become one
         # batch. Pre-probe guards and the final independent confirmation remain.
-        expected_bytes[key] = reads.sizes[leaf] * (10 if name == "controller" else 4)
-    # Before batching, this reads 19/13 copies respectively. Keep this
-    # failure to plain strings and integers, never a Host/identity object graph.
+        copies = 8 if name == "controller" else selected_copies
+        expected_bytes[key] = reads.sizes[leaf] * copies
+    # Keep this failure to plain strings and integers, never a Host/identity graph.
     assert actual_bytes == expected_bytes
 
 
@@ -152,7 +175,7 @@ async def test_install_batch_rehashes_a_cross_component_ctime_change_and_rejects
         assert not bytes_before_change
         # The first component completed two real guards. The selector must
         # still delegate its first guard before any selector publication.
-        assert len(checks) == 8
+        assert len(checks) == 6
         bytes_before_change.append(reads.leaves[leaf].bytes)
         with leaf.open("r+b") as output:
             output.write(bytes([contents[0] ^ 0xFF]) + contents[1:])

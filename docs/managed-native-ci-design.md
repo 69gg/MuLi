@@ -1,14 +1,21 @@
 # 真实 systemd 托管切换 CI 设计
 
-当前仍未通过原生三事务验收。签名候选 `70bd8fc6` 的
-[CI](https://github.com/69gg/MuLi/actions/runs/40676273514) 十三项成功，原生检查与
-macOS 3.13 失败。原生在首次 adopt 的 committed/released 后，helper 快照因
-`unsupported_exec_start` 拒绝；清理已核验，实际 ExecStart 形状尚未知。
-macOS 在结构校验的首个 100 VM steps 检查点触及原 1 秒期限，尚未确定耗时根因。
+当前仍未通过原生三事务验收。最近一次原生验收候选 `6b6fc56a` 的
+[CI](https://github.com/69gg/MuLi/actions/runs/40682871409) 十一项成功、四项失败。
+首代 adopt 在 36625 毫秒完成完整投影；第二代在 57480 毫秒进入 start_target，
+整轮在原 60 秒期限超时，第三代未开始。临时账户、用户组和挂载清理已核验。
 
-当前候选修正原生完成屏障：非终态保留完整 helper 观察；resolved 后只以原精确
-listing 证明 unit 已消失，再继续原最终投影。尚未取得新候选的真实三事务验收，
+原生完成屏障在非终态保留完整 helper 观察；resolved 后只以原精确
+listing 证明 unit 已消失，再继续原最终投影。该路径已完成首代投影，但仍未取得真实三事务验收，
 不放宽产品解析、来源认证或原时限。协调器继续只转发已脱敏并通过公共验证器的帧。
+
+安装 probe 可直接执行调用方已有的同步强 guard，默认仍为原 controller 检查。
+首次角色检查、writer-held 检查，以及 reload 返回后的 writer-held 检查分别替代
+相邻的 controller-only 重验；不需 reload 时减少两次完整 controller 扫描，需要时减少三次。
+selected、lease、cgroup、期限、三文件前缀及异常优先级保持，每次 probe 返回后仍独立认证，
+不跨 await 保存内容证明。认证与安装边界 28 项、既有恢复与取消 5 项离线回归通过；
+Native67 既有整轮 60 秒失败仍未修复，
+这项常数扫描减少不证明原生三事务通过或总耗时达标。
 
 Native65 诊断候选在原 helper 成本 hook 中增加 start 进入、命令进入及正常返回三个正向边界，
 每代仅保留最新固定快照，沿既有 poll 与最终收集读取；source、revision、mode 及输出预算

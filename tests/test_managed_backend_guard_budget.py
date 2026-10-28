@@ -64,7 +64,7 @@ async def test_confirm_uses_seven_real_checks_for_present_selector(
     assert host.record() == record and host.commands == []
 
 
-async def test_install_uses_thirty_one_real_checks_including_both_confirmations(
+async def test_install_uses_twenty_nine_real_checks_including_both_confirmations(
     host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     record = host.install_intent()
@@ -91,10 +91,10 @@ async def test_install_uses_thirty_one_real_checks_including_both_confirmations(
     monkeypatch.setattr(host.backend, "_check", counted)
     await host.backend.install(record, "target", host.data["target"])
 
-    # Two full confirmations and the replaced selector's final confirmation
-    # each lose one duplicate guard. Probe checks and absence guards are unchanged.
-    assert len(checks) == 31
-    assert checks.count((record, None)) == 6
+    # Role and writer-held preflight guards include controller authentication;
+    # both confirmations and every independent post-probe check remain.
+    assert len(checks) == 29
+    assert checks.count((record, None)) == 4
     assert checks.count((record, "target")) == 25
     assert host.backend._disk().digests == (
         record.target.configuration.digest,
