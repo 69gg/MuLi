@@ -1,10 +1,14 @@
 # 真实 systemd 托管切换 CI 设计
 
-当前仍未通过原生三事务验收。签名候选 `2f8a8999` 的
-[CI](https://github.com/69gg/MuLi/actions/runs/40672773630) 十四项通用检查成功，
-原生在第二次 release 后以 `ObservationError` 失败，清理已核验；最近的
-`helper_exit` 阶段标签不足以定位抛错。协调器现仅转发工作进程已经生成且通过公共
-验证器的安全帧，以便下一候选保留真实故障位置；不修改产品判断或原时限。
+当前仍未通过原生三事务验收。签名候选 `70bd8fc6` 的
+[CI](https://github.com/69gg/MuLi/actions/runs/40676273514) 十三项成功，原生检查与
+macOS 3.13 失败。原生在首次 adopt 的 committed/released 后，helper 快照因
+`unsupported_exec_start` 拒绝；清理已核验，实际 ExecStart 形状尚未知。
+macOS 在结构校验的首个 100 VM steps 检查点触及原 1 秒期限，尚未确定耗时根因。
+
+当前候选修正原生完成屏障：非终态保留完整 helper 观察；resolved 后只以原精确
+listing 证明 unit 已消失，再继续原最终投影。尚未取得新候选的真实三事务验收，
+不放宽产品解析、来源认证或原时限。协调器继续只转发已脱敏并通过公共验证器的帧。
 
 Native65 诊断候选在原 helper 成本 hook 中增加 start 进入、命令进入及正常返回三个正向边界，
 每代仅保留最新固定快照，沿既有 poll 与最终收集读取；source、revision、mode 及输出预算

@@ -4548,10 +4548,11 @@ class Case:
                                 failure_code=record.failure_code,
                                 rollback_attempted=record.rollback_attempted,
                             )
-                            anchor, controller, _ = self.deployment(journal, record)
-                            await self.helper_empty(
-                                probe, name, managed_helper_arguments(anchor, controller)
-                            )
+                            if not record.resolved:
+                                anchor, controller, _ = self.deployment(journal, record)
+                                await self.helper_empty(
+                                    probe, name, managed_helper_arguments(anchor, controller)
+                                )
                             self._collect_helper_cost_sample(record)
                             position = fresh_position
                         self._collect_helper_start_sample(record)
@@ -4565,11 +4566,13 @@ class Case:
                             and current.get("transaction") == record.public()
                         ):
                             anchor, controller, slots = self.deployment(journal, record)
-                            if not await self.helper_empty(
-                                probe, name, managed_helper_arguments(anchor, controller)
-                            ):
+                            # After release, completion needs exact absence, not
+                            # the configuration of a disappearing transient unit.
+                            # A listing cannot create or restore a source identity.
+                            if await probe.helper_exists(name):
                                 await self.pause()
                                 continue
+                            self.note("helper_exit", helper=name, state="collected")
                             collect_helper_costs(
                                 self.root,
                                 self.result,

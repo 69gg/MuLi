@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from muli import failure_diagnostics
 from muli.management_transaction import TransactionError
 from muli.platforms.linux_transaction import (
     ObservationError,
@@ -154,6 +155,26 @@ async def test_standard_service_is_observed_without_manager_mutations(tmp_path: 
     assert len(bus.calls) == 5
     assert all("GetUnit" in c or "get-property" in c for c in bus.calls)
     assert all("Environment" not in c for c in bus.calls)
+
+
+async def test_real_service_reader_remains_owned_in_exec_start_failure_diagnostic(
+    tmp_path: Path,
+) -> None:
+    service, bus, proc = fixture(tmp_path)
+    signature, _ = bus.rows["ExecStart"]
+    bus.rows["ExecStart"] = (signature, [])
+    with pytest.raises(ObservationError, match="^unsupported_exec_start$") as caught:
+        await SystemdProbe(runner=bus, proc_root=proc).read(service)
+    diagnostic = failure_diagnostics.capture_failure(caught.value)
+    assert failure_diagnostics.validate_failure_diagnostic(diagnostic) is not None
+    assert diagnostic["truncated"] is False
+    owned = diagnostic["frames"][-3:]
+    assert [(frame["module"], frame["function"]) for frame in owned] == [
+        ("muli.platforms.linux_transaction", "SystemdProbe.read"),
+        ("muli.platforms.linux_transaction", "SystemdProbe._snapshot"),
+        ("muli.platforms.linux_transaction", "SystemdProbe._snapshot_values"),
+    ]
+    assert all(type(frame["line"]) is int for frame in owned)
 
 
 async def test_stopped_snapshot_does_not_claim_writer_or_cgroup_is_empty(tmp_path: Path) -> None:

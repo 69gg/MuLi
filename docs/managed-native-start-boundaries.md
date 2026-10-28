@@ -46,3 +46,10 @@ source 撤销时移除对应 start 样本。最终可选 `resources.helper_start
 经公共验证器认可的一份包内安全位置。缺失、重复、超限或损坏的诊断均不转发，
 也不回显原命令输出、异常正文或路径；原退出错误、收取及清理顺序保持不变。
 `helper_exit` 是最近观测阶段标签，不能替代安全帧来指认真正抛错位置。
+
+事务尚未 resolved 时，原 helper 配置、进程身份和来源撤销观察保持不变；包括 blocked
+与 recovery_required。resolved 后只用原精确 unit listing 等待 helper 真正消失，存在
+时继续原 poll，查询失败或无效时仍失败。只有成功解析的精确空 listing 才进入最终
+成本收取与原 journal、运行角色、数据库和路由投影校验，不再读取退出期间的配置快照。
+终态保留的 source 只是此前认证的历史身份，不能表示当前健康；缺失或已撤销的 source
+不会从 listing、成本文件或 start 文件建立、恢复或重绑。预算、期限及 reader 数量不变。

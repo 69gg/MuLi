@@ -12,6 +12,7 @@ from test_linux_transaction import FakeBus, write_stat
 from test_managed_launcher import _CONFIG, Deployment
 from test_managed_launcher import deployment as deployment
 
+from muli import failure_diagnostics
 from muli.managed_journal import RoleSnapshots
 from muli.managed_transaction import TransactionRecordV2, raw_snapshot
 from muli.management_transaction import TransactionJournal
@@ -130,6 +131,25 @@ async def test_stable_unit_and_exec_role_have_distinct_verified_arguments(host: 
     assert result.service.process.argv != result.service.unit.argv
     assert host.deployment.base.resolved_python == host.deployment.target.resolved_python
     assert all("GetUnit" in call or "get-property" in call for call in host.bus.calls)
+
+
+async def test_real_managed_reader_remains_owned_in_exec_start_failure_diagnostic(
+    host: ProbeHost,
+) -> None:
+    signature, _ = host.bus.rows["ExecStart"]
+    host.bus.rows["ExecStart"] = (signature, [])
+    with pytest.raises(ObservationError, match="^unsupported_exec_start$") as caught:
+        await observe(host)
+    diagnostic = failure_diagnostics.capture_failure(caught.value)
+    assert failure_diagnostics.validate_failure_diagnostic(diagnostic) is not None
+    assert diagnostic["truncated"] is False
+    owned = diagnostic["frames"][-3:]
+    assert [(frame["module"], frame["function"]) for frame in owned] == [
+        ("muli.platforms.managed_probe", "ManagedSystemdProbe.read_managed"),
+        ("muli.platforms.linux_transaction", "SystemdProbe._snapshot"),
+        ("muli.platforms.linux_transaction", "SystemdProbe._snapshot_values"),
+    ]
+    assert all(type(frame["line"]) is int for frame in owned)
 
 
 async def test_same_binary_cannot_hide_a_foreign_lexical_python(host: ProbeHost) -> None:

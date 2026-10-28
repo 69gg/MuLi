@@ -182,6 +182,35 @@ async def test_malformed_snapshot_cannot_be_reclassified_as_collected(
     assert collection.case.result["resources"]["helper_source"] == collection.source
 
 
+@pytest.mark.parametrize("shape", ["empty", "two-entries", "non-list"])
+async def test_unsupported_exec_start_cannot_be_reclassified_as_collected(
+    collection: CollectionCase, shape: str
+) -> None:
+    collection.bus.arm("disabled")
+    signature, valid_entries = collection.bus.original.rows["ExecStart"]
+    assert isinstance(valid_entries, list) and len(valid_entries) == 1
+    entries: object
+    if shape == "empty":
+        entries = []
+    elif shape == "two-entries":
+        entries = [copy.deepcopy(valid_entries[0]), copy.deepcopy(valid_entries[0])]
+    else:
+        entries = None
+    # Retain the accepted typed envelope while the real parser rejects its data.
+    collection.bus.original.rows["ExecStart"] = (signature, entries)
+    source = collection.case.result["resources"]["helper_source"]
+    timeline = copy.deepcopy(collection.case.result["timeline"])
+    with pytest.raises(ObservationError, match="^unsupported_exec_start$") as caught:
+        await collection.case.helper_empty(collection.probe, NAME, collection.argv)
+    assert caught.value.args == ("unsupported_exec_start",)
+    assert not collection.bus.failed and collection.bus.listings == 1
+    assert collection.bus.lookups == 1 and len(collection.bus.calls) == 4
+    assert collection.case.result["resources"]["helper_source"] is source
+    assert source == collection.source
+    assert collection.case.result["timeline"] == timeline
+    assert collection.case.result["completed"] is False
+
+
 async def test_helper_argv_drift_keeps_original_source_revocation_and_error(
     collection: CollectionCase,
 ) -> None:
