@@ -141,7 +141,8 @@ def main() -> None:
         result = {"error": error.code, "message": "comparison budget exceeded"}
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         result = {"error": "comparison_worker_invalid", "message": "invalid comparison input"}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    # Keep the pipe protocol UTF-8 even when Windows selects an ANSI encoding.
+    sys.stdout.buffer.write(json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8"))
 
 
 if __name__ == "__main__":

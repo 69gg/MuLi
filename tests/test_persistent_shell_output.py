@@ -408,7 +408,17 @@ async def test_read_metadata_budget_failure_preserves_the_real_command_and_outpu
 
 async def test_impossible_metadata_budget_rejects_before_the_real_shell_command_dispatch(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    spawned = 0
+    original_spawn = asyncio.create_subprocess_exec
+
+    async def observed_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        nonlocal spawned
+        spawned += 1
+        return await original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", observed_spawn)
     spec = select_shell()
     script, effect = tmp_path / "receipt-effect.py", tmp_path / "must-not-exist.txt"
     script.write_text(
@@ -437,6 +447,41 @@ async def test_impossible_metadata_budget_rejects_before_the_real_shell_command_
             assert not effect.exists()
             assert manager.live_sessions() == ()
             assert not manager.is_running("owner") and manager.current_cwd("owner") is None
+            assert spawned == 0
+    finally:
+        await manager.aclose()
+
+
+async def test_identity_budget_rejection_keeps_an_idle_shell_and_its_previous_receipt(
+    tmp_path: Path,
+) -> None:
+    manager = ShellSessions(
+        default_cwd=tmp_path,
+        executable=select_shell().executable,
+        max_sessions=lambda: 1,
+        max_output_bytes=lambda: 4096,
+        max_command_bytes=lambda: 4096,
+        max_run_seconds=lambda: 3,
+        max_receipt_chars=lambda: 1,
+    )
+    directory = tempfile.TemporaryDirectory(prefix="muli-shell-admission-")
+    shell = _Shell("owner", select_shell(), directory, str(tmp_path), state="idle")
+    previous = _Command("previous", shell, asyncio.get_running_loop().time() + 3)
+    previous.state = "completed"
+    previous.exit_code = 0
+    shell.current = previous
+    manager._sessions["owner"] = shell
+    manager._retain_command(previous)
+    try:
+        with pytest.raises(ShellSessionError) as rejected:
+            await manager.execute("owner", "must-not-dispatch", admission_guard=lambda: None)
+        assert rejected.value.code == "output_budget"
+        assert (manager._sessions["owner"] is shell) is True
+        assert (shell.current is previous) is True
+        assert shell.state == "idle" and shell.boot is None and shell.process is None
+        assert list(manager._commands) == [previous.id]
+        assert (manager._commands[previous.id] is previous) is True
+        assert previous.state == "completed" and previous.exit_code == 0
     finally:
         await manager.aclose()
 
