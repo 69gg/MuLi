@@ -22,6 +22,7 @@
 - [正文定位](attachment-find.md)：在一份资料里找文字，再阅读命中处。
 - [文档阅读](document-reading.md)：按需读取 PDF、DOCX 和长正文。
 - [续读书签](reading-bookmarks.md)：明确保存位置，压缩、重开或换渠道后继续阅读。
+- [摘录卡](reading-excerpts.md)：明确保存读过的原文、私人备注和续读出处。
 - [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
 - [长资料检索](memory-chunks.md)：后台分块、续接与索引设置。
 - [电脑操作](computer.md)：应用、窗口和无障碍操作。

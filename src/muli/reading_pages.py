@@ -438,6 +438,20 @@ class ReadingPages:
         before_seq: int,
         main_id: str,
     ) -> tuple[dict[str, Any], str | None]:
+        page, policy, _ = self.source_content(
+            message_id, message_revision, before_seq=before_seq, main_id=main_id
+        )
+        return page, policy
+
+    def source_content(
+        self,
+        message_id: str,
+        message_revision: str,
+        *,
+        before_seq: int,
+        main_id: str,
+    ) -> tuple[dict[str, Any], str | None, str]:
+        """Return host-authenticated archived text without extracting the source again."""
         try:
             return self._source(
                 message_id, message_revision, before_seq=before_seq, main_id=main_id
@@ -452,7 +466,7 @@ class ReadingPages:
         *,
         before_seq: int,
         main_id: str,
-    ) -> tuple[dict[str, Any], str | None]:
+    ) -> tuple[dict[str, Any], str | None, str]:
         validate_integer(before_seq, "before_seq", minimum=1)
         metadata = self._message(
             _host(message_id),
@@ -564,9 +578,13 @@ class ReadingPages:
             _revision(policy)
         elif policy is not None:
             raise _unavailable()
-        return {
-            **{field: proof[field] for field in _SOURCE_FIELDS},
-            **page,
-            "source_message_id": message_id,
-            "source_message_revision": message_revision,
-        }, policy
+        return (
+            {
+                **{field: proof[field] for field in _SOURCE_FIELDS},
+                **page,
+                "source_message_id": message_id,
+                "source_message_revision": message_revision,
+            },
+            policy,
+            result["content"],
+        )
