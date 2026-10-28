@@ -123,6 +123,14 @@ def settings(**server: Any) -> JsonObject:
     return {"mcpServers": {"test": {"enabled": True, "url": "https://example.test/mcp", **server}}}
 
 
+def stdio_settings(**server: Any) -> JsonObject:
+    return {
+        "mcpServers": {
+            "test": {"enabled": True, "command": "python", "args": ["installed.py"], **server}
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_no_server_starts_without_explicit_boolean_enable() -> None:
     calls: list[JsonObject] = []
@@ -453,21 +461,24 @@ async def test_empty_opaque_cursor_keeps_existing_page_guards(
         ([(["one"], "two"), (["one"], None)], MCPLimits(), "catalog_invalid"),
     ],
 )
+@pytest.mark.parametrize("transport", ["http", "stdio"])
 async def test_incomplete_candidate_never_replaces_current_catalog(
-    pages: list[tuple[list[str], str | None]], limits: MCPLimits, code: str
+    pages: list[tuple[list[str], str | None]], limits: MCPLimits, code: str, transport: str
 ) -> None:
     original = FakeClient()
     replacement = PagedClient(pages)
-    manager = MCPManager(
-        settings(),
-        client_factory=lambda server, timeout: (
-            original if server["url"].endswith("/mcp") else replacement
-        ),
+    clients = iter((original, replacement))
+    config = settings() if transport == "http" else stdio_settings()
+    target = (
+        settings(url="https://example.test/new")
+        if transport == "http"
+        else stdio_settings(args=["changed.py"])
     )
+    manager = MCPManager(config, client_factory=lambda *_: next(clients))
     try:
         old_tools = await manager.start()
         with pytest.raises(MCPPrepareError) as failed:
-            await manager.prepare(settings(url="https://example.test/new"), limits=limits)
+            await manager.prepare(target, limits=limits)
         assert failed.value.code == code
         assert manager.tools == old_tools
         assert original.closed == 0 and replacement.closed == 1
@@ -501,19 +512,73 @@ async def test_failed_candidate_closes_only_new_connections_not_reused() -> None
         await manager.close()
 
 
-async def test_changed_stdio_requires_restart_without_closing_active_process() -> None:
-    client = FakeClient()
-    config = settings(command="python", args=["installed.py"])
-    config["mcpServers"]["test"].pop("url")
-    manager = MCPManager(config, client_factory=lambda server, timeout: client)
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"command": "python3"},
+        {"args": ["changed.py"]},
+        {"env": {"TOKEN": "new-fixture-secret"}},
+        {"cwd": "changed-workdir"},
+        {"timeout": 2},
+        {"args": ["changed.py"], "env": {"TOKEN": "new-fixture-secret"}},
+        {"transport": "http", "url": "https://example.test/new"},
+        {"transport": "sse", "url": "https://example.test/new"},
+    ],
+    ids=["command", "args", "env", "cwd", "timeout", "args-env", "to-http", "to-sse"],
+)
+async def test_same_name_stdio_change_publishes_an_independent_candidate(
+    change: JsonObject,
+) -> None:
+    class Replacement(FakeClient):
+        async def list_tools(self) -> list[Any]:
+            tools = await super().list_tools()
+            tools[0].inputSchema["properties"]["q"] = {"type": "integer"}
+            return tools
+
+    old = FakeClient()
+    new = Replacement(
+        result=SimpleNamespace(
+            is_error=False,
+            content=[SimpleNamespace(type="text", text="新代")],
+            structured_content=None,
+        )
+    )
+    clients = iter((old, new))
+    config = stdio_settings(env={"TOKEN": "old-fixture-secret"}, cwd="original-workdir", timeout=1)
+    observed: list[tuple[JsonObject, float]] = []
+
+    def factory(server: JsonObject, timeout: float) -> MCPClient:
+        observed.append((server, timeout))
+        return next(clients)
+
+    manager = MCPManager(config, client_factory=factory)
     try:
-        await manager.start()
+        old_tool = (await manager.start())[0]
         target = json.loads(json.dumps(config))
-        target["mcpServers"]["test"]["args"] = ["changed.py"]
-        with pytest.raises(MCPPrepareError, match="restart_required"):
+        if change.get("transport") in {"http", "sse"}:
+            target["mcpServers"]["test"] = {"enabled": True, **change}
+        else:
+            target["mcpServers"]["test"].update(change)
+        candidate = await manager.prepare(target)
+        assert old.entered == new.entered == 1 and old.closed == new.closed == 0
+        with pytest.raises(MCPPrepareError, match="candidate_pending"):
             await manager.prepare(target)
-        assert client.entered == 1 and client.closed == 0
-        assert not (await manager.tools[0].handler({"q": "old"}))["is_error"]
+        assert len(observed) == 2
+        expected, timeout = manager._server(target["mcpServers"]["test"])
+        definition_matches = observed[1][0] == expected
+        assert definition_matches and observed[1][1] == timeout
+        assert candidate.tools[0].parameters != old_tool.parameters
+        assert (await candidate.tools[0].handler({"q": 1}))["code"] == "generation_changed"
+        assert new.calls == []
+        assert not (await old_tool.handler({"q": "发布前"}))["is_error"]
+        retired = manager.publish(candidate)
+        assert manager.tools[0].name == old_tool.name
+        assert (await old_tool.handler({"q": "旧代"}))["code"] == "generation_changed"
+        assert (await manager.tools[0].handler({"q": 1}))["content"][0]["text"] == "新代"
+        assert len(old.calls) == len(new.calls) == 1
+        assert new.calls[0]["timeout"] == timeout
+        await manager.retire(retired)
+        assert old.closed == old.exited == 1 and new.closed == 0
     finally:
         await manager.close()
 
@@ -606,7 +671,8 @@ async def test_repeated_caller_cancellation_does_not_cancel_owned_cleanup() -> N
         await manager.close()
 
 
-async def test_failed_retirement_stays_owned_and_shutdown_reclaims_it() -> None:
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_failed_retirement_stays_owned_and_shutdown_reclaims_it(transport: str) -> None:
     class FailOnce(FakeClient):
         async def close(self) -> None:
             await super().close()
@@ -614,13 +680,17 @@ async def test_failed_retirement_stays_owned_and_shutdown_reclaims_it() -> None:
                 raise RuntimeError("synthetic close failure")
 
     old, new = FailOnce(), FakeClient(names=["new"])
-    manager = MCPManager(
-        settings(),
-        client_factory=lambda server, timeout: old if server["url"].endswith("/mcp") else new,
+    clients = iter((old, new))
+    config = settings() if transport == "http" else stdio_settings()
+    target = (
+        settings(url="https://example.test/new")
+        if transport == "http"
+        else stdio_settings(args=["changed.py"])
     )
+    manager = MCPManager(config, client_factory=lambda *_: next(clients))
     try:
         await manager.start()
-        candidate = await manager.prepare(settings(url="https://example.test/new"))
+        candidate = await manager.prepare(target)
         assert not await manager.retire(manager.publish(candidate))
         assert len(manager._retiring) == 1 and old.closed == 1
         with pytest.raises(MCPPrepareError, match="restart_required"):

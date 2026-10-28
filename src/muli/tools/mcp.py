@@ -717,8 +717,6 @@ class MCPManager:
                             async with asyncio.timeout(timeout):
                                 catalog = await self._catalog(connection.client, limits)
                     else:
-                        if previous is not None and previous.server["transport"] == "stdio":
-                            raise MCPPrepareError("restart_required", name)
                         stack = AsyncExitStack()
                         holder: list[_Connection] = []
                         receive = ReceiveState(receive_policy)
