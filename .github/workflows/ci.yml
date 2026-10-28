@@ -11,6 +11,8 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 jobs:
+  linux-native:
+    uses: ./.github/workflows/linux-native.yml
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 10

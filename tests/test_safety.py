@@ -6,7 +6,6 @@ import os
 import socket
 import sys
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -400,7 +399,10 @@ async def test_computer_protocol_uses_stdout_without_warning_pollution(
 
     monkeypatch.setattr(computer_module, "run_process", subprocess_with_warning)
     monkeypatch.setattr(computer_module.sys, "platform", "linux")
-    computer = Computer(Settings(computer={"enabled": True, "backend": "atspi"}))  # type: ignore[arg-type]
+    computer = Computer(
+        Settings.model_validate({"computer": {"enabled": True, "backend": "atspi"}}),
+        owner=lambda: ("safety-tests", "stderr-isolation"),
+    )
     assert await computer.call({"operation": "snapshot"}) == {"nodes": []}
 
 
@@ -467,29 +469,41 @@ def test_atspi_identity_rejects_same_label_replacement() -> None:
 def test_concurrent_computer_actions_cannot_reuse_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+
     async def scenario() -> None:
-        computer = Computer(Settings.model_validate({"computer": {"backend": "atspi"}}))
-        computer.snapshot_id, computer.snapshot_time = "snapshot", time.monotonic()
-        computer.nodes = {
-            "n0": {
-                "name": "确认",
-                "role": "button",
-                "pid": 42,
-                "path": [0],
-                "identity": {"object_path": "/button/1", "bus_name": ":1.42"},
-                "actions": ["click"],
-            }
+        computer = Computer(
+            Settings.model_validate({"computer": {"backend": "atspi", "enabled": True}}),
+            owner=lambda: ("safety-tests", "single-action"),
+        )
+        native = {
+            "name": "确认",
+            "role": "button",
+            "pid": 42,
+            "path": [0],
+            "identity": {"object_path": "/button/1", "bus_name": ":1.42"},
+            "actions": ["click"],
+            "editable": False,
         }
         calls = 0
 
-        async def call(_: dict[str, Any]) -> dict[str, Any]:
+        async def call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
             nonlocal calls
+            if request["operation"] == "snapshot":
+                return {
+                    "nodes": [native],
+                    "complete": True,
+                    "truncated": False,
+                    "visited": 1,
+                    "omissions": [],
+                }
             calls += 1
             await asyncio.sleep(0)
             return {"ok": True}
 
         monkeypatch.setattr(computer, "call", call)
-        arguments = {"snapshot_id": "snapshot", "node_id": "n0", "action": "click"}
+        observed = await computer.snapshot({})
+        arguments = {"snapshot_id": observed["snapshot_id"], "node_id": "n0", "action": "click"}
         results = await asyncio.gather(
             computer.action(arguments),
             computer.action(arguments),

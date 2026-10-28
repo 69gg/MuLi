@@ -95,6 +95,12 @@ class Computer:
         self._snapshot_generation = 0
         self._discovery_generation = 0
         self._lock = asyncio.Lock()
+        self._owner = owner or (lambda: None)
+        self._dispatch_guard = dispatch_guard
+        self._atspi_owner: tuple[str, str] | None = None
+        self._atspi_generation = 0
+        self._atspi_deadline = 0.0
+        self._atspi_closed = False
         self.backend = (
             {"linux": "atspi", "darwin": "ax", "win32": "uia"}.get(sys.platform, "unavailable")
             if self.config.backend == "auto"
@@ -108,18 +114,92 @@ class Computer:
         self._ax = AXComputer(self, owner=owner, dispatch_guard=dispatch_guard)
         self._uia = UIAComputer(self, owner=owner, dispatch_guard=dispatch_guard)
 
-    async def call(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _atspi_available(self) -> None:
         if not self.config.enabled:
             raise ComputerError("disabled", "电脑操作尚未启用")
         if self.backend != "atspi" or sys.platform != "linux":
             raise ComputerError("backend_unavailable", "当前平台无法使用所选无障碍后端")
+        if self._atspi_closed:
+            raise ComputerError("backend_closed", "电脑后端已关闭")
+
+    def _retire_atspi(self) -> None:
+        self._atspi_generation += 1
+        self._atspi_owner, self._atspi_deadline = None, 0.0
+        self._clear_snapshot()
+        self._discovery_generation += 1
+        self.discovery_id, self.discovery_time, self._targets = "", 0.0, {}
+
+    def _atspi_caller(self, *, claim: bool = False, targeted: bool = False) -> tuple[str, str]:
+        self._atspi_available()
+        owner = self._owner()
+        if owner is None:
+            raise ComputerError("caller_unavailable", "无障碍引用需要真实执行会话")
+        now = time.monotonic()
+        if self._atspi_owner is not None and now >= self._atspi_deadline:
+            previous_owner = self._atspi_owner
+            self._retire_atspi()
+            if targeted and previous_owner == owner:
+                raise ComputerError("target_expired", "发现结果已过期，请重新发现应用")
+        if self._atspi_owner is not None and self._atspi_owner != owner:
+            raise ComputerError("desktop_busy", "桌面由其他执行持有，请先由它释放引用")
+        if claim and self._atspi_owner is None:
+            self._atspi_owner = owner
+            self._atspi_deadline = now + self.config.snapshot_ttl_seconds
+        return owner
+
+    def _atspi_current(
+        self, owner: tuple[str, str], generation: int, *, targeted: bool = False
+    ) -> None:
+        self._atspi_available()
+        if self._owner() != owner:
+            raise ComputerError("execution_changed", "执行已结束或被新的执行替换")
+        if self._atspi_owner != owner or generation != self._atspi_generation:
+            raise ComputerError("stale_snapshot", "本次无障碍引用已失效，请重新观察")
+        if time.monotonic() >= self._atspi_deadline:
+            self._retire_atspi()
+            if targeted:
+                raise ComputerError("target_expired", "发现结果已过期，请重新发现应用")
+            raise ComputerError("stale_snapshot", "本次无障碍引用已过期，请重新观察")
+
+    async def call(
+        self, request: dict[str, Any], *, before_send: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
+        self._atspi_available()
         action = request.get("operation") in {"action", "type"}
+        if request.get("operation") != "probe":
+            owner = self._atspi_caller(claim=before_send is None)
+            generation = self._atspi_generation
+            reference_guard = before_send
+
+            def current() -> None:
+                self._atspi_current(owner, generation)
+                if reference_guard is not None:
+                    reference_guard()
+
+            before_send = current
+        runtime_guard = self._dispatch_guard() if action and self._dispatch_guard else None
+        dispatched = False
+        guard_error: BaseException | None = None
+
+        def input_guard() -> None:
+            nonlocal dispatched, guard_error
+            try:
+                self._atspi_available()
+                if before_send is not None:
+                    before_send()
+                if runtime_guard is not None:
+                    runtime_guard()
+            except BaseException as exc:
+                guard_error = exc
+                raise
+            # This callback and run_process's first write have no await between them.
+            dispatched = True
 
         def failure(code: str, message: str) -> ComputerError:
             return ComputerError(
-                "action_unknown_outcome" if action else code,
+                "action_unknown_outcome" if action and dispatched else code,
                 message,
-                "unknown" if action else "not_started",
+                "unknown" if action and dispatched else "not_started",
             )
 
         try:
@@ -128,16 +208,23 @@ class Computer:
                 timeout=self.config.operation_timeout_seconds,
                 limit=_HELPER_RESPONSE_BYTES,
                 input_text=json.dumps({**request, "max_response_chars": _HELPER_RESPONSE_CHARS}),
+                input_guard=input_guard,
                 merge_stderr=False,
             )
-        except FileNotFoundError as exc:
-            raise ComputerError("dependency_missing", "无法启动系统 Python 无障碍后端") from exc
-        except TimeoutError as exc:
-            raise failure("read_timeout", "无障碍操作超时；请重新观察，勿自动重试动作") from exc
-        except ValueError as exc:
-            raise failure("limit_exceeded", "无障碍后端响应超过限制") from exc
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            if exc is guard_error or isinstance(exc, ComputerError):
+                raise
+            if isinstance(exc, FileNotFoundError):
+                raise ComputerError("dependency_missing", "无法启动系统 Python 无障碍后端") from exc
+            if isinstance(exc, TimeoutError):
+                raise failure("read_timeout", "无障碍操作超时；请重新观察，勿自动重试动作") from exc
+            if isinstance(exc, ValueError):
+                raise failure("limit_exceeded", "无障碍后端响应超过限制") from exc
             raise failure("backend_unavailable", "无法运行无障碍后端") from exc
+        if not action:
+            self._atspi_available()
+            if before_send is not None:
+                before_send()
         try:
             data = json.loads(result["output"])
         except (ValueError, TypeError, KeyError) as exc:
@@ -389,6 +476,8 @@ class Computer:
             return await self._ax.targets(arguments)
         if self.backend == "uia":
             return await self._uia.targets(arguments)
+        owner = self._atspi_caller(claim=True, targeted="application_id" in arguments)
+        owner_generation = self._atspi_generation
         selected: _Target | None = None
         selection_error: ComputerError | None = None
         try:
@@ -402,17 +491,21 @@ class Computer:
         self.discovery_id, self.discovery_time, self._targets = "", 0.0, {}
         if selection_error:
             raise selection_error
-        async with self._lock:
+
+        def current() -> None:
+            self._atspi_current(owner, owner_generation, targeted=selected is not None)
             if generation != self._discovery_generation:
                 raise ComputerError("target_changed", "发现已被新的请求替换，请重新发现应用")
             if selected and time.monotonic() >= selected_deadline:
                 raise ComputerError("target_expired", "发现结果已过期，请重新发现应用")
+
+        async with self._lock:
+            current()
             request: dict[str, Any] = {"operation": "targets", "max_nodes": self.config.max_nodes}
             if selected:
                 request["target"] = self._locator(selected.node)
-            data = await self.call(request)
-            if generation != self._discovery_generation:
-                raise ComputerError("target_changed", "发现已被新的请求替换，请重新发现应用")
+            data = await self.call(request, before_send=current)
+            current()
             native = data.get("targets")
             if not isinstance(native, list) or len(native) > self.config.max_nodes:
                 raise ComputerError("protocol_error", "无障碍目标列表格式无效")
@@ -455,20 +548,28 @@ class Computer:
             return await self._ax.snapshot(arguments)
         if self.backend == "uia":
             return await self._uia.snapshot(arguments)
+        owner = self._atspi_caller(claim=True, targeted="target_id" in arguments)
+        owner_generation = self._atspi_generation
         generation = self._clear_snapshot()
         selected = self._target(arguments["target_id"]) if "target_id" in arguments else None
         discovery_id = self.discovery_id
-        async with self._lock:
+
+        def current() -> None:
+            self._atspi_current(owner, owner_generation, targeted=selected is not None)
             if generation != self._snapshot_generation:
                 raise ComputerError("stale_snapshot", "快照已被新的读取替换，请重新读取桌面")
             if selected:
                 self._target(arguments["target_id"])
+                if discovery_id != self.discovery_id:
+                    raise ComputerError("target_changed", "所选目标已被新的发现替换")
+
+        async with self._lock:
+            current()
             request: dict[str, Any] = {"operation": "snapshot", "max_nodes": self.config.max_nodes}
             if selected:
                 request["target"] = self._locator(selected.node)
-            data = await self.call(request)
-            if generation != self._snapshot_generation:
-                raise ComputerError("stale_snapshot", "快照已被新的读取替换，请重新读取桌面")
+            data = await self.call(request, before_send=current)
+            current()
             if selected and (
                 discovery_id != self.discovery_id
                 or self._target(arguments["target_id"]) is not selected
@@ -523,7 +624,10 @@ class Computer:
             return await self._ax.action(arguments)
         if self.backend == "uia":
             return await self._uia.action(arguments)
+        owner = self._atspi_caller()
+        owner_generation = self._atspi_generation
         async with self._lock:
+            self._atspi_current(owner, owner_generation)
             if (
                 not self.snapshot_id
                 or arguments["snapshot_id"] != self.snapshot_id
@@ -531,7 +635,7 @@ class Computer:
             ):
                 raise ComputerError("stale_snapshot", "快照已过期，请重新读取桌面")
             node = self.nodes.get(str(arguments["node_id"]))
-            self._clear_snapshot()
+            generation = self._clear_snapshot()
             if node is None:
                 raise ComputerError("stale_node", "节点不在当前快照中")
             if "text" in arguments and not node.get("editable"):
@@ -544,23 +648,35 @@ class Computer:
                 **self._locator(node),
                 **{key: arguments[key] for key in ("text", "action") if key in arguments},
             }
+
+            def current() -> None:
+                self._atspi_current(owner, owner_generation)
+                if generation != self._snapshot_generation:
+                    raise ComputerError("stale_snapshot", "快照已被新的读取替换，请重新观察")
+
             # A snapshot authorizes one action only, including concurrent callers.
-            return await self.call(request)
+            return await self.call(request, before_send=current)
 
     async def release(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.backend == "ax":
             return await self._ax.release()
         if self.backend == "uia":
             return await self._uia.release()
+        self._atspi_caller()
+        self._retire_atspi()
         return {"released": True}
 
     async def release_execution(self, session_id: str, run_id: str) -> None:
+        if self._atspi_owner == (session_id, run_id):
+            self._retire_atspi()
         try:
             await self._ax.release_execution((session_id, run_id))
         finally:
             await self._uia.release_execution((session_id, run_id))
 
     async def aclose(self) -> None:
+        self._atspi_closed = True
+        self._retire_atspi()
         try:
             await self._ax.aclose()
         finally:
@@ -583,7 +699,7 @@ class Computer:
             ),
             Tool(
                 "computer_release",
-                "释放当前执行持有的 macOS/Windows 无障碍引用；委派其他 agent 前先释放，让它重新观察",
+                "释放当前执行持有的无障碍引用；委派其他 agent 前先释放，让它重新观察",
                 parameters({}),
                 self.release,
             ),

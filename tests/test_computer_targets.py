@@ -13,6 +13,11 @@ from muli.config import Settings
 from muli.tools.computer import Computer, ComputerError
 
 
+@pytest.fixture(autouse=True)
+def linux_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(computer_module.sys, "platform", "linux")
+
+
 def node(path: list[int], *, name: str = "核查", **changes: Any) -> dict[str, Any]:
     return {
         "path": path,
@@ -51,7 +56,8 @@ def computer(**sections: Any) -> Computer:
                 "computer": {"enabled": True, "backend": "atspi", **sections.pop("computer", {})},
                 **sections,
             }
-        )
+        ),
+        owner=lambda: ("computer-target-tests", "run-1"),
     )
 
 
@@ -60,7 +66,7 @@ def fake_helper(
 ) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
-    async def call(request: dict[str, Any]) -> dict[str, Any]:
+    async def call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         calls.append(deepcopy(request))
         response = responses.pop(0)
         if isinstance(response, BaseException):
@@ -421,7 +427,7 @@ async def test_cancelled_helper_read_and_action_never_restore_consumed_credentia
     entered = asyncio.Event()
     block = False
 
-    async def call(request: dict[str, Any]) -> dict[str, Any]:
+    async def call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         if block:
             entered.set()
             await asyncio.Event().wait()
@@ -456,7 +462,7 @@ async def test_late_snapshot_success_cannot_revive_token_after_newer_invalid_att
     target = computer()
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def call(request: dict[str, Any]) -> dict[str, Any]:
+    async def call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         entered.set()
         await release.wait()
         return frame("nodes", [node([0])])
@@ -478,7 +484,7 @@ async def test_late_discovery_success_cannot_revive_cache_after_newer_failed_att
     target = computer()
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def call(request: dict[str, Any]) -> dict[str, Any]:
+    async def call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         entered.set()
         await release.wait()
         return frame("targets", [node([0])])
@@ -512,7 +518,7 @@ async def test_concurrent_actions_consume_one_snapshot_and_stale_actions_cannot_
     entered, release = asyncio.Event(), asyncio.Event()
     calls = 0
 
-    async def call(request: dict[str, Any]) -> dict[str, Any]:
+    async def call(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         nonlocal calls
         if request["operation"] == "snapshot":
             return frame("nodes", [node([0])])
@@ -591,6 +597,7 @@ async def test_helper_process_uses_configured_deadline_and_finite_native_frame_b
     calls: list[tuple[list[str], dict[str, Any]]] = []
 
     async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        kwargs["input_guard"]()
         calls.append((argv, kwargs))
         return {
             "exit_code": 0,
@@ -615,6 +622,7 @@ async def test_helper_location_budget_failure_keeps_stable_semantic_code(
     target = computer()
 
     async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        kwargs["input_guard"]()
         return {
             "exit_code": 1,
             "output": json.dumps(
@@ -650,6 +658,7 @@ async def test_process_failures_are_structured_and_do_not_echo_raw_diagnostics(
     target = computer()
 
     async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        kwargs["input_guard"]()
         raise exception
 
     monkeypatch.setattr(computer_module, "run_process", run)
@@ -676,6 +685,7 @@ async def test_malformed_native_responses_fail_with_stable_code(
     target = computer()
 
     async def run(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        kwargs["input_guard"]()
         return {"exit_code": 1, "output": json.dumps(data)}
 
     monkeypatch.setattr(computer_module, "run_process", run)
