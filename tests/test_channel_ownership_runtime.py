@@ -27,6 +27,8 @@ async def complete_assignment(
     *,
     owner_mode: Mode = "yolo",
     owner_ids: list[str] | None = None,
+    receive_files: bool = False,
+    max_output_chars: int = 6000,
 ) -> None:
     network_requests = 0
 
@@ -59,7 +61,11 @@ async def complete_assignment(
             "attention": {"enabled": False},
             "memory": {"auto_extract": False},
             "extensions": {"watch_enabled": False},
-            "limits": {"max_context_chars": 16000, "max_output_chars": 6000, "max_pending_runs": 3},
+            "limits": {
+                "max_context_chars": 16000,
+                "max_output_chars": max_output_chars,
+                "max_pending_runs": 3,
+            },
             "models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}},
             "channels": {
                 "onebot": {
@@ -68,6 +74,7 @@ async def complete_assignment(
                     "base_url": "https://onebot.invalid",
                     "webhook_secret": "FAKE_WEBHOOK",
                     "owner_ids": owner_ids if owner_ids is not None else ["7"],
+                    "receive_files": receive_files,
                 }
             },
         }

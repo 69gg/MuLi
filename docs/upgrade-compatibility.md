@@ -14,6 +14,8 @@
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 
+正常关闭后的有限 shell 回执同样采用独立 `shell_receipt/version=1`，可淘汰且不含执行授权，不改配置或既有 unknown/权限语义；当前读取器对坏或未来记录返回 `content_unavailable`。格式上界、淘汰顺序及证据范围见[功能记录合同](fresh-format-admission.md#可淘汰的-shell-回执记录)。通用 Store 保留未知 kind 的回归与源码审查不等于实际运行旧发行包，不能扩大为任意历史包兼容承诺。
+
 现有 Hatch `packages=["src/muli"]` 将包内非 Python 资产一并选入，不需要另造 manifest 生成器或增加强制覆盖规则，见 [Hatch 文件选择](https://hatch.pypa.io/latest/config/build/#file-selection)。构建必须保留源码中的真实文件；进程回归复制整个有界 MuLi 包并沿用它，不再临时写出一份自报声明。
 
 现有 CI 继续构建一次，并将同一 wheel/sdist 交给发布作业。`scripts/check_wheel.py` 在源码目录外安装 wheel 后，先在安装目录有界读取声明，复用 `CompatibilityManifest.from_json` 核严格 16 KiB 合同、正式版本、协议与七领域精确读写 ID，再构造临时应用做原有 smoke。它证明被测安装包携带本版本声明，不认证候选依赖环境、真实服务或历史库。

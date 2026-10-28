@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import builtins
 import json
+import time
 from collections.abc import Callable
 from typing import Any, Literal, NotRequired, TypedDict
 
+from muli.commitment_directory import CommitmentDirectory
 from muli.config import Limits
 from muli.context import ContextLimitError, context_size
 from muli.events import EventBus
 from muli.providers import Message
-from muli.store import Store, new_id, now
+from muli.store import _SESSION_RECORD_LIMIT, Store, new_id, now
 from muli.tools import Tool, parameters, string
 
 STATES = ("open", "in_progress", "blocked", "done", "cancelled")
@@ -45,11 +47,13 @@ class Commitments:
         *,
         max_context_chars: Callable[[], int] | None = None,
         max_output_chars: Callable[[], int] | None = None,
+        limits: Callable[[], Limits] | None = None,
     ) -> None:
         self.store, self.bus = store, bus
         defaults = Limits()
-        self.max_context_chars = max_context_chars or (lambda: defaults.max_context_chars)
-        self.max_output_chars = max_output_chars or (lambda: defaults.max_output_chars)
+        self.limits = limits or (lambda: defaults)
+        self.max_context_chars = max_context_chars or (lambda: self.limits().max_context_chars)
+        self.max_output_chars = max_output_chars or (lambda: self.limits().max_output_chars)
 
     def list(self, status: str = "active", limit: int = 100) -> list[dict[str, Any]]:
         if status not in {*STATES, "active", "all"}:
@@ -69,8 +73,33 @@ class Commitments:
             for row in self.store.db.execute(query, values)
         ]
 
-    def metadata(self, item: dict[str, Any]) -> dict[str, Any]:
+    def directory(
+        self, *, status: str = "active", cursor: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        limits = self.limits()
+        return CommitmentDirectory(
+            self.store,
+            lambda item, maximum: self.metadata(item, max_output_chars=maximum),
+            STATES,
+        ).directory(
+            status=status,
+            cursor=cursor,
+            limit=limit,
+            max_output_chars=self.max_output_chars(),
+            max_context_chars=self.max_context_chars(),
+            max_results=limits.max_search_results,
+            deadline=time.monotonic() + limits.max_search_seconds,
+        )
+
+    def metadata(
+        self, item: dict[str, Any], *, max_output_chars: int | None = None
+    ) -> dict[str, Any]:
         """Bounded public projection; full briefs belong to scoped reads only."""
+        budget = self.max_output_chars()
+        if max_output_chars is not None:
+            if type(max_output_chars) is not int or max_output_chars < 1:
+                raise ValueError("工作账本元数据预算必须是正整数")
+            budget = min(budget, max_output_chars)
         result = {
             key: item[key]
             for key in ("id", "status", "revision", "created_at", "updated_at")
@@ -100,7 +129,7 @@ class Commitments:
         for key in ("title", "next_step", "assignee", "evidence", "source_id"):
             if key in item:
                 candidate = {**result, key: item[key]}
-                if len(json.dumps(candidate, ensure_ascii=False)) <= self.max_output_chars():
+                if len(json.dumps(candidate, ensure_ascii=False)) <= budget:
                     result = candidate
                 else:
                     result["details_omitted"] = True
@@ -109,15 +138,12 @@ class Commitments:
                         while low < high:
                             middle = (low + high + 1) // 2
                             candidate = {**result, key: item[key][:middle]}
-                            if (
-                                len(json.dumps(candidate, ensure_ascii=False))
-                                <= self.max_output_chars()
-                            ):
+                            if len(json.dumps(candidate, ensure_ascii=False)) <= budget:
                                 low = middle
                             else:
                                 high = middle - 1
                         result[key] = item[key][:low]
-        if len(json.dumps(result, ensure_ascii=False)) > self.max_output_chars():
+        if len(json.dumps(result, ensure_ascii=False)) > budget:
             raise ValueError("工作账本元数据超过工具输出预算")
         if not result["details_omitted"]:
             del result["details_omitted"]
@@ -399,6 +425,11 @@ class Commitments:
                 items.append(item)
             return items
 
+        async def directory_items(args: dict[str, Any]) -> Any:
+            if args.keys() - {"status", "cursor", "limit"}:
+                raise ValueError("账本目录参数无效")
+            return self.directory(**args)
+
         async def save_item(args: dict[str, Any]) -> Any:
             if args.keys() - _SAVE_FIELDS:
                 raise ValueError("承诺写入包含未知或受保护参数")
@@ -455,6 +486,24 @@ class Commitments:
                 "查看独立于会话压缩的持续工作账本索引",
                 parameters({"status": {"type": "string", "enum": ["active", "all", *STATES]}}),
                 list_items,
+            ),
+            Tool(
+                "commitment_directory",
+                "续页查看持续工作账本元数据；空页仍按 next_cursor 继续，遗漏与实时遍历不等于查全；正文仍须范围内 commitment_read",
+                parameters(
+                    {
+                        "status": {"type": "string", "enum": ["active", "all", *STATES]},
+                        "cursor": string("前页完整 next_cursor；须保持同一状态筛选"),
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": _SESSION_RECORD_LIMIT - 1,
+                        },
+                    }
+                ),
+                directory_items,
+                "read",
+                preserve_output=True,
             ),
             Tool(
                 "commitment_save",

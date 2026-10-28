@@ -29,6 +29,16 @@ commitment_read 接受 identifier、offset、limit、revision。text 是规范 J
 
 Python 内部 Commitments.get(identifier, revision=None) 返回完整记录，供已认证的按需详情入口使用；不能把它直接注册成不受范围约束的模型工具。列表不会一次载入所有任务正文。
 
+## 可续元数据目录
+
+不知道旧任务 ID 时使用 `commitment_directory({"status":"active","limit":20})`。它返回 `items`、`has_more`、`next_cursor`，后续把完整游标与同一 `status` 传回；即使 `items` 为空，只要 `has_more=true` 仍需续页。`status` 接受 `active`、`all` 及已有任务状态，单页最多 100 项。旧 `commitment_list`、Python `Commitments.list` 及 Web 列表保持原来的近期数组接口，不自动改成分页对象。
+
+每页遵守现有搜索、上下文、输出和时间预算。`scanned`、`json_bytes` 表示核查量，`omitted` 和 `omitted_total` 表示本页及累计遗漏；空记录等损坏数据计入 `invalid`，不会阻塞正常续页。`stopped` 说明中止原因，`end` 表示到尾；有遗漏时不能声称查全，无法安全保存完整游标时会明确报错。
+
+游标绑定同一资料库和状态，正常重开后仍可继续。目录是实时遍历，编辑不重排已走过的 ID；后来新增或改变状态的任务可能需要重新从首页查找，不是跨页快照。
+
+目录只提供现有白名单元数据和 `has_brief`，不解析证据目标、不选择重新规划、不修改任务或批准执行。它沿用旧索引的元数据可见范围；队友即使翻到别人的 ID，`commitment_read` 仍只允许自己的绑定，转发主助手 handler 或工作流也不会增加正文权限。
+
 ## 绑定和上下文
 
 一棵团队树绑定一个 commitment_id，子孙继承且不能换绑。主会话在 spawn_agent 中为新树选择已有完整说明；旧调用省略绑定仍可运行。未绑定队友不能显示成已获得完整说明。

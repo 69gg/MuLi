@@ -30,8 +30,17 @@ async def assigned(
     *,
     mode: Mode = "yolo",
     owner_ids: list[str] | None = None,
+    receive_files: bool = False,
+    max_output_chars: int = 6000,
 ) -> AsyncIterator[tuple[Runtime, Any, httpx.AsyncClient, str]]:
-    await complete_assignment(tmp_path, monkeypatch, owner_mode=mode, owner_ids=owner_ids)
+    await complete_assignment(
+        tmp_path,
+        monkeypatch,
+        owner_mode=mode,
+        owner_ids=owner_ids,
+        receive_files=receive_files,
+        max_output_chars=max_output_chars,
+    )
     runtime, _ = make_runtime(tmp_path, [])
     child = runtime.team.list()[0]
     assert child["status"] == "completed" and child["generation"] == 1

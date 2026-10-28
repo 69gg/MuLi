@@ -54,6 +54,7 @@ class LocalServices:
             runtime.bus,
             max_context_chars=lambda: runtime.config.settings.limits.max_context_chars,
             max_output_chars=lambda: runtime.config.settings.limits.max_output_chars,
+            limits=lambda: runtime.config.settings.limits,
         )
         self.task_control = TaskControl(runtime.store, self.commitments)
         self.task_delivery = TaskDelivery(
