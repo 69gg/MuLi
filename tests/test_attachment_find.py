@@ -550,14 +550,30 @@ async def test_real_source_changes_during_the_actual_docx_extraction_are_rejecte
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_search_deadline_fails_without_claiming_no_matches(host: Host) -> None:
+@pytest.mark.parametrize("ticks", [(10.0, 11.0), (10.0, 10.25, 10.5, 11.0)])
+async def test_search_deadline_fails_without_claiming_no_matches(
+    host: Host, monkeypatch: pytest.MonkeyPatch, ticks: tuple[float, ...]
+) -> None:
+    from muli import attachment_find
+
     item = await host.save(b"needle", "deadline.txt")
-    host.runtime.config.update({"limits": {"max_search_seconds": 1e-12}})
+    host.runtime.config.update({"limits": {"max_search_seconds": 1}})
+    clock = iter(ticks)
+    observed: list[float] = []
+
+    def now() -> float:
+        value = next(clock)
+        observed.append(value)
+        return value
+
+    # Only this search clock is controlled; Runtime and file I/O keep theirs.
+    monkeypatch.setattr(attachment_find, "monotonic", now)
     with pytest.raises(EvidenceError) as caught:
         await find_attachment(
             host.attachments, item["id"], reader="attachment_read", query="absent"
         )
     assert caught.value.code == "attachment_find_timeout"
+    assert observed == list(ticks)
 
 
 async def test_empty_pdf_text_layer_keeps_its_actual_scope(pdf_host: Host) -> None:
