@@ -76,14 +76,15 @@ def application(tmp_path: Path) -> tuple[Runtime, FastAPI]:
     return runtime, create_app(runtime.config, runtime=runtime)
 
 
+@pytest.mark.parametrize("view", ["changes", "overview"])
 async def test_service_capacity_close_reaps_worker_and_reconfigure_reopens(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: str
 ) -> None:
     runtime, app = application(tmp_path)
     service = app.state.memory_application
     left = saved(runtime, "a" * 32, "共同条款\n旧要求🙂\n")
     right = saved(runtime, "b" * 32, "共同条款\n新要求🙂\n")
-    selected = arguments(left, right)
+    selected = {**arguments(left, right), "view": view}
     module = comparison._WORKER
     worker = paused_worker(tmp_path, monkeypatch)
     request = asyncio.create_task(service.compare_sources(selected))
@@ -110,8 +111,12 @@ async def test_service_capacity_close_reaps_worker_and_reconfigure_reopens(
         await service.reconfigure()
         page = await service.compare_sources(selected)
         assert page["status"] == "changed" and not page["has_more"]
-        assert page["items"][0]["left"]["content"] == "旧要求🙂\n"
-        assert page["items"][0]["right"]["content"] == "新要求🙂\n"
+        if view == "changes":
+            assert page["items"][0]["left"]["content"] == "旧要求🙂\n"
+            assert page["items"][0]["right"]["content"] == "新要求🙂\n"
+        else:
+            assert page["totals"]["change_groups"] == 1
+            assert "content" not in page["items"][0]["left"]
     finally:
         request.cancel()
         await asyncio.gather(request, return_exceptions=True)
@@ -176,13 +181,14 @@ async def test_api_close_reaps_inflight_worker_before_runtime_closes_and_rejects
 
 
 @pytest.mark.parametrize("setting", ["runtime_limit", "document_policy"])
+@pytest.mark.parametrize("view", ["changes", "overview"])
 async def test_api_rejects_completed_worker_result_if_policy_changed_during_await(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setting: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setting: str, view: str
 ) -> None:
     runtime, app = application(tmp_path)
     left = saved(runtime, "a" * 32, "共同条款\n旧要求🙂\n")
     right = saved(runtime, "b" * 32, "共同条款\n新要求🙂\n")
-    selected = arguments(left, right)
+    selected = {**arguments(left, right), "view": view}
     completed, release_result = asyncio.Event(), asyncio.Event()
     run_process = comparison.run_process
     results: list[dict[str, Any]] = []

@@ -894,6 +894,9 @@ class MemoryApplication:
                 "按指定左右顺序逐行核对两份明确收藏附件的原文变化；"
                 "先用memory_sources或memory_source取得双方准确source_id及revision。"
                 "仅比较已保存正文，不推定新旧、不比较私人备注；差异包含双方原文与UTF-8位置，"
+                "长资料可先用view=overview获取变化组总数及行/字节坐标，目录不含正文；"
+                "需用memory_source按坐标读取关注的原文，空侧仅表示插入点；"
+                "读完目录不代表读过正文，行/字节数是受影响整行，不能推断语义重要性；"
                 "has_more时用同一双方身份和next_cursor续查，未查全不宣称全部一致；"
                 "不收藏、改写、调用模型或外发",
                 parameters(
@@ -903,6 +906,7 @@ class MemoryApplication:
                         "right_id": string(),
                         "right_revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
                         "cursor": string(),
+                        "view": {"type": "string", "enum": ["changes", "overview"]},
                     },
                     ("left_id", "left_revision", "right_id", "right_revision"),
                 ),

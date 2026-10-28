@@ -168,6 +168,7 @@ class MemorySourceCompareInput(Input):
     right_id: str = Field(min_length=1, max_length=200, strict=True)
     right_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
     cursor: str | None = Field(default=None, min_length=1, strict=True)
+    view: Literal["changes", "overview"] = "changes"
 
 
 class WorkflowInput(Input):

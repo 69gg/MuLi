@@ -210,10 +210,23 @@ def _read_arguments(source: _Source, offset: int, length: int) -> dict[str, Any]
     return arguments
 
 
-def _checked_items(payload: Any, left: _Source, right: _Source) -> list[dict[str, Any]]:
+def _line_offsets(raw: bytes) -> list[int]:
+    offsets = [0]
+    while offsets[-1] < len(raw):
+        end = raw.find(b"\n", offsets[-1])
+        offsets.append(len(raw) if end < 0 else end + 1)
+    return offsets
+
+
+def _checked_items(
+    payload: Any, left: _Source, right: _Source, *, overview: bool = False
+) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError("items must be an array")
     previous = {"left": 0, "right": 0}
+    line_offsets = (
+        {"left": _line_offsets(left.raw), "right": _line_offsets(right.raw)} if overview else {}
+    )
     for item in payload:
         if not isinstance(item, dict) or set(item) != {"kind", "left", "right"}:
             raise ValueError("invalid comparison item")
@@ -222,12 +235,9 @@ def _checked_items(payload: Any, left: _Source, right: _Source) -> list[dict[str
         lengths: list[int] = []
         for name, source in (("left", left), ("right", right)):
             side = item[name]
-            if not isinstance(side, dict) or set(side) != {
-                "offset_bytes",
-                "length_bytes",
-                "content",
-                "read_arguments",
-            }:
+            fields = {"offset_bytes", "length_bytes", "read_arguments"}
+            fields.update({"start_line", "end_line"} if overview else {"content"})
+            if not isinstance(side, dict) or set(side) != fields:
                 raise ValueError("invalid comparison side")
             offset, length = side["offset_bytes"], side["length_bytes"]
             if (
@@ -236,11 +246,24 @@ def _checked_items(payload: Any, left: _Source, right: _Source) -> list[dict[str
                 or offset < previous[name]
                 or length < 0
                 or offset + length > len(source.raw)
-                or not isinstance(side["content"], str)
-                or side["content"].encode("utf-8") != source.raw[offset : offset + length]
                 or side["read_arguments"] != _read_arguments(source, offset, length)
             ):
                 raise ValueError("comparison coordinates differ from source bytes")
+            if overview:
+                start, end = side["start_line"], side["end_line"]
+                offsets = line_offsets[name]
+                if (
+                    type(start) is not int
+                    or type(end) is not int
+                    or not 0 <= start <= end < len(offsets)
+                    or (offset, offset + length) != (offsets[start], offsets[end])
+                ):
+                    raise ValueError("comparison line and byte coordinates differ")
+            elif (
+                not isinstance(side["content"], str)
+                or side["content"].encode("utf-8") != source.raw[offset : offset + length]
+            ):
+                raise ValueError("comparison text differs from source bytes")
             previous[name] = offset + length
             lengths.append(length)
         if (
@@ -249,6 +272,66 @@ def _checked_items(payload: Any, left: _Source, right: _Source) -> list[dict[str
             or (item["kind"] == "replace" and not all(lengths))
         ):
             raise ValueError("comparison operation and spans differ")
+    return payload
+
+
+def _checked_totals(
+    payload: Any,
+    items: list[dict[str, Any]],
+    left: _Source,
+    right: _Source,
+    *,
+    status: str,
+    has_more: bool,
+) -> dict[str, int]:
+    page = dict.fromkeys(
+        (
+            "change_groups",
+            "insert_groups",
+            "delete_groups",
+            "replace_groups",
+            "removed_lines",
+            "added_lines",
+            "removed_bytes",
+            "added_bytes",
+        ),
+        0,
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.keys() != page.keys()
+        or any(type(value) is not int or value < 0 for value in payload.values())
+    ):
+        raise ValueError("invalid overview totals")
+    for item in items:
+        page["change_groups"] += 1
+        page[f"{item['kind']}_groups"] += 1
+        for name, prefix in (("left", "removed"), ("right", "added")):
+            side = item[name]
+            page[f"{prefix}_lines"] += side["end_line"] - side["start_line"]
+            page[f"{prefix}_bytes"] += side["length_bytes"]
+    if (
+        payload["change_groups"]
+        != sum(payload[f"{kind}_groups"] for kind in ("insert", "delete", "replace"))
+        or (payload["change_groups"] == 0) != (status == "equal")
+        or any(payload[key] < value for key, value in page.items())
+        or (not has_more and payload != page)
+        or (has_more and payload["change_groups"] <= len(items))
+    ):
+        raise ValueError("overview totals and change groups differ")
+    for source, prefix, kind in ((left, "removed", "delete"), (right, "added", "insert")):
+        lines, size = payload[f"{prefix}_lines"], payload[f"{prefix}_bytes"]
+        groups = payload[f"{kind}_groups"] + payload["replace_groups"]
+        total_lines = source.raw.count(b"\n") + int(
+            bool(source.raw) and not source.raw.endswith(b"\n")
+        )
+        if (
+            not groups <= lines <= total_lines
+            or not lines <= size <= len(source.raw)
+            or (groups == 0) != (lines == 0)
+            or (lines == 0) != (size == 0)
+        ):
+            raise ValueError("overview totals exceed source spans")
     return payload
 
 
@@ -261,6 +344,7 @@ async def compare_sources(
     right_revision: str,
     policy: ComparisonPolicy,
     cursor: str | None = None,
+    view: str = "changes",
     check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Compare retained text only; live callers fence request and policy in check.
@@ -269,20 +353,29 @@ async def compare_sources(
     authentication is in RAM and expires on Store close/reopen or process restart.
     """
     policy.validate()
+    if not isinstance(view, str) or view not in {"changes", "overview"}:
+        raise EvidenceError("invalid_arguments", "比较视图必须是 changes 或 overview")
+    overview = view == "overview"
     if check is not None:
         check()
     left = _load(memory, left_id, left_revision, policy)
     right = _load(memory, right_id, right_revision, policy)
-    binding = {
+    binding: dict[str, Any] = {
         "algorithm": ALGORITHM,
         "instance": memory.store.instance_id,
         "left": [left_id, left_revision],
         "right": [right_id, right_revision],
         "policy": asdict(policy),
     }
+    if overview:
+        # Keep the original body cursor contract unchanged and authenticate the
+        # directory's separate, versioned contract before accepting its position.
+        binding.update({"view": "overview", "overview_version": 1})
     key = _cursor_key(memory.store)
     position = _decode_cursor(cursor, binding, key, policy)
     template = {"algorithm": ALGORITHM, "left": left.identity, "right": right.identity}
+    if overview:
+        template["view"] = "overview"
     reserve = len(_encode_cursor(binding, 2 * policy.max_lines, key))
     request = _json(
         {
@@ -293,6 +386,7 @@ async def compare_sources(
             "max_output_chars": policy.max_output_chars,
             "position": position,
             "cursor_chars": reserve,
+            "view": view,
         }
     )
     try:
@@ -335,12 +429,15 @@ async def compare_sources(
             raise EvidenceError(
                 payload["error"], "原文行数或单个差异块超过当前比较额度，未省略变化"
             )
-        if set(payload) != {"status", "items", "next_index"}:
+        fields = {"status", "items", "next_index"}
+        if overview and not position:
+            fields.add("totals")
+        if set(payload) != fields:
             raise ValueError("unexpected worker fields")
         status, next_index = payload["status"], payload["next_index"]
         if status not in {"equal", "changed"}:
             raise ValueError("invalid comparison status")
-        items = _checked_items(payload["items"], left, right)
+        items = _checked_items(payload["items"], left, right, overview=overview)
         if next_index is not None and (
             type(next_index) is not int or not position < next_index <= 2 * policy.max_lines
         ):
@@ -349,6 +446,16 @@ async def compare_sources(
             status == "changed" and not items
         ):
             raise ValueError("comparison cannot silently skip a changed block")
+        details = {}
+        if overview and not position:
+            details["totals"] = _checked_totals(
+                payload["totals"],
+                items,
+                left,
+                right,
+                status=status,
+                has_more=next_index is not None,
+            )
     except EvidenceError:
         raise
     except (ValueError, TypeError, UnicodeError, RecursionError) as error:
@@ -357,6 +464,7 @@ async def compare_sources(
         ) from error
     page = {
         **template,
+        **details,
         "status": status,
         "items": items,
         "has_more": next_index is not None,

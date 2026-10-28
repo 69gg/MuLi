@@ -6,6 +6,7 @@ import argparse
 import difflib
 import json
 import sys
+from collections.abc import Iterable
 from typing import Any
 
 
@@ -33,7 +34,13 @@ def _lines(text: str, maximum: int) -> tuple[list[str], list[int], list[int]]:
 
 
 def _side(
-    identity: dict[str, Any], lines: list[str], offsets: list[int], start: int, end: int
+    identity: dict[str, Any],
+    lines: list[str],
+    offsets: list[int],
+    start: int,
+    end: int,
+    *,
+    overview: bool = False,
 ) -> dict[str, Any]:
     offset, length = offsets[start], offsets[end] - offsets[start]
     arguments: dict[str, Any] = {
@@ -46,9 +53,41 @@ def _side(
     return {
         "offset_bytes": offset,
         "length_bytes": length,
-        "content": "".join(lines[start:end]),
+        **(
+            {"start_line": start, "end_line": end}
+            if overview
+            else {"content": "".join(lines[start:end])}
+        ),
         "read_arguments": arguments,
     }
+
+
+def _totals(
+    operations: Iterable[tuple[str, int, int, int, int]], left: list[int], right: list[int]
+) -> dict[str, int]:
+    totals = dict.fromkeys(
+        (
+            "change_groups",
+            "insert_groups",
+            "delete_groups",
+            "replace_groups",
+            "removed_lines",
+            "added_lines",
+            "removed_bytes",
+            "added_bytes",
+        ),
+        0,
+    )
+    for kind, a_start, a_end, b_start, b_end in operations:
+        if kind == "equal":
+            continue
+        totals["change_groups"] += 1
+        totals[f"{kind}_groups"] += 1
+        totals["removed_lines"] += a_end - a_start
+        totals["added_lines"] += b_end - b_start
+        totals["removed_bytes"] += left[a_end] - left[a_start]
+        totals["added_bytes"] += right[b_end] - right[b_start]
+    return totals
 
 
 def compare_page(request: dict[str, Any]) -> dict[str, Any]:
@@ -56,6 +95,7 @@ def compare_page(request: dict[str, Any]) -> dict[str, Any]:
     maximum, budget = request["max_lines"], request["max_output_chars"]
     position, cursor_chars = request["position"], request["cursor_chars"]
     template = request["template"]
+    view = request.get("view", "changes")
     if (
         not isinstance(left, str)
         or not isinstance(right, str)
@@ -68,6 +108,8 @@ def compare_page(request: dict[str, Any]) -> dict[str, Any]:
         or type(cursor_chars) is not int
         or cursor_chars <= 0
         or not isinstance(template, dict)
+        or not isinstance(view, str)
+        or view not in {"changes", "overview"}
     ):
         raise ValueError("invalid worker request")
     left_lines, left_bytes, left_chars = _lines(left, maximum)
@@ -81,11 +123,21 @@ def compare_page(request: dict[str, Any]) -> dict[str, Any]:
     if position and (position >= len(operations) or operations[position][0] == "equal"):
         raise ValueError("invalid continuation position")
     status = "changed" if changed else "equal"
+    overview = view == "overview"
+    details = (
+        {"totals": _totals(operations, left_bytes, right_bytes)}
+        if overview and not position
+        else {}
+    )
     items: list[dict[str, Any]] = []
+
+    def result(next_index: int | None) -> dict[str, Any]:
+        return {"status": status, "items": items, "next_index": next_index, **details}
 
     def fits(candidate: list[dict[str, Any]], has_more: bool) -> bool:
         page = {
             **template,
+            **details,
             "status": status,
             "items": candidate,
             "has_more": has_more,
@@ -99,28 +151,32 @@ def compare_page(request: dict[str, Any]) -> dict[str, Any]:
             continue
         # Never join/serialize an arbitrarily large changed block merely to
         # discover that the public page cannot contain it.
-        if (
+        if not overview and (
             left_chars[a_end] - left_chars[a_start] + right_chars[b_end] - right_chars[b_start]
             > budget
         ):
             if items:
-                return {"status": status, "items": items, "next_index": index}
+                return result(index)
             raise _BudgetError("comparison_block_budget")
         item = {
             "kind": kind,
-            "left": _side(template["left"], left_lines, left_bytes, a_start, a_end),
-            "right": _side(template["right"], right_lines, right_bytes, b_start, b_end),
+            "left": _side(
+                template["left"], left_lines, left_bytes, a_start, a_end, overview=overview
+            ),
+            "right": _side(
+                template["right"], right_lines, right_bytes, b_start, b_end, overview=overview
+            ),
         }
         # Reserve a signed continuation even when this proves to be the final
         # block; a later block must never make an already accepted prefix grow.
         if not fits([*items, item], True):
             if not items:
                 raise _BudgetError("comparison_block_budget")
-            return {"status": status, "items": items, "next_index": index}
+            return result(index)
         items.append(item)
     if not fits(items, False):
         raise _BudgetError("output_budget")
-    return {"status": status, "items": items, "next_index": None}
+    return result(None)
 
 
 def main() -> None:

@@ -34,8 +34,10 @@ def arguments(left: dict[str, Any], right: dict[str, Any]) -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize("view", ["changes", "overview"])
 async def test_owner_api_compares_saved_bodies_and_rereads_exact_utf8_positions(
     tmp_path: Path,
+    view: str,
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update({"updates": {"check_on_start": False}, "memory": {"enabled": False}})
@@ -46,7 +48,9 @@ async def test_owner_api_compares_saved_bodies_and_rereads_exact_utf8_positions(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765"
         ) as client:
-            response = await client.post("/api/memory/sources/compare", json=arguments(left, right))
+            response = await client.post(
+                "/api/memory/sources/compare", json={**arguments(left, right), "view": view}
+            )
             assert response.status_code == 200, response.text
             page = response.json()
             assert page["status"] == "changed" and not page["has_more"]
@@ -55,11 +59,22 @@ async def test_owner_api_compares_saved_bodies_and_rereads_exact_utf8_positions(
                 for side in ("left", "right"):
                     change = item[side]
                     if not change["length_bytes"]:
-                        assert change["content"] == ""
+                        if view == "changes":
+                            assert change["content"] == ""
                         continue
                     read = await client.get("/api/memory/source", params=change["read_arguments"])
                     assert read.status_code == 200
-                    assert read.json()["content"] == change["content"]
+                    if view == "changes":
+                        assert read.json()["content"] == change["content"]
+                    else:
+                        assert "content" not in change
+                        assert read.json()["content"] in {
+                            "期限：七日\n",
+                            "期限：十日\n",
+                            "新增要求",
+                        }
+            if view == "overview":
+                assert page["totals"]["change_groups"] == 2
             equal = await client.post("/api/memory/sources/compare", json=arguments(left, left))
             assert equal.status_code == 200 and equal.json()["status"] == "equal"
             invalid = await client.post(
@@ -71,6 +86,10 @@ async def test_owner_api_compares_saved_bodies_and_rereads_exact_utf8_positions(
                 "/api/memory/sources/compare", json={**arguments(left, right), "unrelated": True}
             )
             assert extra.status_code == 422
+            bad_view = await client.post(
+                "/api/memory/sources/compare", json={**arguments(left, right), "view": "summary"}
+            )
+            assert bad_view.status_code == 422
             assert (
                 runtime.store.db.execute("SELECT count(*) FROM memory_sources").fetchone()[0] == 2
             )
@@ -79,8 +98,9 @@ async def test_owner_api_compares_saved_bodies_and_rereads_exact_utf8_positions(
 
 
 @pytest.mark.parametrize("member", [False, True], ids=["main", "teammate"])
+@pytest.mark.parametrize("view", ["changes", "overview"])
 async def test_real_agent_tool_round_preserves_exact_comparison_without_auto_ingest(
-    tmp_path: Path, member: bool
+    tmp_path: Path, member: bool, view: str
 ) -> None:
     turns: list[ModelTurn] = []
     runtime, seen = make_runtime(tmp_path, turns)
@@ -102,13 +122,38 @@ async def test_real_agent_tool_round_preserves_exact_comparison_without_auto_ing
             ModelTurn(
                 tool_calls=[
                     ToolCall(
-                        "compare", "memory_compare_sources", json.dumps(arguments(left, right))
+                        "compare",
+                        "memory_compare_sources",
+                        json.dumps({**arguments(left, right), "view": view}),
                     )
                 ]
             ),
-            ModelTurn(content="已核对原文"),
         ]
     )
+    if view == "overview":
+        turns.append(
+            ModelTurn(
+                tool_calls=[
+                    ToolCall(
+                        f"read-{name}",
+                        "memory_source",
+                        json.dumps(
+                            {
+                                "id": source["id"],
+                                "revision": source["digest"],
+                                "offset_bytes": 0,
+                                "length_bytes": len(text.encode()),
+                            }
+                        ),
+                    )
+                    for name, source, text in (
+                        ("left", left, "旧要求🙂\n"),
+                        ("right", right, "新要求🙂\n"),
+                    )
+                ]
+            )
+        )
+    turns.append(ModelTurn(content="已核对原文"))
     try:
         if member:
             child = await runtime.team.spawn(
@@ -128,6 +173,13 @@ async def test_real_agent_tool_round_preserves_exact_comparison_without_auto_ing
         assert value["left"]["revision"] == left["digest"]
         assert value["right"]["revision"] == right["digest"]
         assert len(value["items"]) == 1 and not value["has_more"]
+        if view == "overview":
+            assert "旧要求" not in result.content and "新要求" not in result.content
+            for name, expected in (("left", "旧要求🙂\n"), ("right", "新要求🙂\n")):
+                read = next(
+                    message for message in seen[-1] if message.tool_call_id == f"read-{name}"
+                )
+                assert json.loads(read.content)["content"] == expected
         assert runtime.store.db.execute("SELECT count(*) FROM memory_sources").fetchone()[0] == 2
     finally:
         await app.state.close()
