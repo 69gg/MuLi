@@ -107,6 +107,8 @@ MuLi service start
 
 `commitment_save` / `commitment_list` 保存承诺的标题、下一步、负责人、来源和状态。完成需填写证据，取消需说明理由；对话摘要变化或换入口不会删除账本。
 
+不知道旧任务 ID 时可用 `commitment_directory` 持续翻页查看元数据；空页也须按 `has_more` 和完整 `next_cursor` 判断是否继续。它报告候选、JSON 字节、遗漏及中止原因，沿用既有搜索与输出预算；实时遍历不代表跨页快照或查全，旧近期数组列表保持兼容。
+
 任务说明可保存完整目标、限制与证据引用，仅真实主会话可编辑正文。`commitment_inspect` 可查看关联计划、队友报告、工作流与依据。读取、保存说明或模型自报完成都不等同于批准执行或外部验收。
 
 详见[任务说明](task-briefs.md)与[任务检查](task-inspection.md)。

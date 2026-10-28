@@ -456,6 +456,37 @@ class Store:
             raise EvidenceError("content_unavailable", "持久对象无法完整核查") from exc
         return item
 
+    def commitment_directory_window(
+        self, *, before_id: str | None, limit: int, key_bytes: int
+    ) -> Generator[dict[str, Any], None, None]:
+        """Stream a finite raw-key seek; gate each complete key inside SQLite."""
+        if type(limit) is not int or not 1 <= limit <= _CONTINUATION_RECORD_LIMIT:
+            raise ValueError("账本目录窗口超过既有候选上限")
+        if type(key_bytes) is not int or not 1 <= key_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("账本目录主键字节预算必须是正整数")
+        predicate = ""
+        bounds: tuple[str, ...] = ()
+        if before_id is not None:
+            if not isinstance(before_id, str) or not before_id:
+                raise ValueError("账本目录续页位置必须是完整主键")
+            predicate = " AND objects.id<?"
+            bounds = (before_id,)
+        # No JSON projection or status filter precedes the finite key window.
+        # Yielding keeps only the current bounded key in Python, even when the
+        # configured candidate cap is larger than the public item page.
+        rows = self.db.execute(
+            "SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND ? "
+            "THEN CAST(id AS BLOB) END AS id FROM objects WHERE kind='commitment'"
+            + predicate
+            + " ORDER BY objects.id DESC LIMIT ?",
+            (key_bytes, *bounds, limit),
+        )
+        try:
+            for row in rows:
+                yield dict(row)
+        finally:
+            rows.close()
+
     def message_evidence_window(
         self,
         session_id: str,
