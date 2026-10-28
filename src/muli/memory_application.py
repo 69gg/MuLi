@@ -22,6 +22,7 @@ from muli.memory_chunks import MemoryChunkSettings
 from muli.memory_context import MemoryContextProvider, PromptComposition
 from muli.memory_evidence import SOURCE_JOB_STATES, SOURCE_PAGE_LIMIT, MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
+from muli.proactive import FrozenRouting
 from muli.providers import Message
 from muli.runtime import PreparedRequest, Runtime
 from muli.tools import Tool, parameters, string
@@ -108,6 +109,18 @@ class MemoryApplication:
             admission=self.runtime.maintenance.admission,
             max_plan_bytes=settings.limits.max_output_chars * 4,
         )
+
+        def failure_routing() -> FrozenRouting | None:
+            if (
+                self._closed
+                or self.runtime._closing
+                or self.pipeline is not pipeline
+                or not self.runtime.config.settings.memory.enabled
+            ):
+                return None
+            return FrozenRouting.independent(self.runtime.config.settings, self.runtime.store.db)
+
+        pipeline.failure_routing = failure_routing
         pipeline.recover()
         return pipeline
 

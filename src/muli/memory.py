@@ -58,6 +58,21 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False)
 
 
+def source_digest(source: Mapping[str, Any], *, trusted_owner: bool) -> str:
+    """Use the same complete source identity for registration and host proofs."""
+    return hashlib.sha256(
+        _json(
+            {
+                **{
+                    key: source[key]
+                    for key in ("content", "source", "session_id", "role", "principal")
+                },
+                "trusted_owner": trusted_owner,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _slots(values: Sequence[Any]) -> str:
     return ",".join("?" for _ in values)
 
@@ -218,18 +233,16 @@ class Memory:
         ):
             raise ValueError("原始来源身份或渠道字段无效")
         trusted = trusted_owner is True and role == "user"
-        digest = hashlib.sha256(
-            _json(
-                {
-                    "content": content,
-                    "source": source,
-                    "session_id": session_id,
-                    "role": role,
-                    "principal": principal,
-                    "trusted_owner": trusted,
-                }
-            ).encode("utf-8")
-        ).hexdigest()
+        digest = source_digest(
+            {
+                "content": content,
+                "source": source,
+                "session_id": session_id,
+                "role": role,
+                "principal": principal,
+            },
+            trusted_owner=trusted,
+        )
         existing = self.source(identifier)
         if existing is not None:
             if existing["digest"] != digest:

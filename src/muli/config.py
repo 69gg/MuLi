@@ -512,8 +512,8 @@ class DesktopNotifications(Section):
     expire_ms: int = Field(default=8000, ge=1000, le=60000)
 
 
-AttentionEvent = Literal["reminder", "management", "update"]
-ATTENTION_EVENTS: tuple[AttentionEvent, ...] = ("reminder", "management", "update")
+AttentionEvent = Literal["reminder", "management", "update", "memory"]
+ATTENTION_EVENTS: tuple[AttentionEvent, ...] = ("reminder", "management", "update", "memory")
 
 
 class AttentionSettings(Section):

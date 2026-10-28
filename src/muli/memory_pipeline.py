@@ -21,7 +21,12 @@ from muli.memory import LAYERS, Memory, normalize_entity
 from muli.memory_chunks import ChunkPlan, restore_plan
 from muli.memory_context import PromptComposition, compose_context_result
 from muli.memory_source_chunks import SourceChunks
-from muli.store import SQLITE_MAX_INTEGER, now
+from muli.memory_source_failure import (
+    MemorySourceFailure,
+    attachment_revision,
+)
+from muli.proactive import FrozenRouting
+from muli.store import SQLITE_MAX_INTEGER, new_id, now
 
 Extractor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 _INDEX_ACTIVE = frozenset({"queued", "processing", "retry"})
@@ -116,11 +121,13 @@ class MemoryPipeline:
         config: MemoryPipelineConfig | None = None,
         admission: Admission | None = None,
         max_plan_bytes: int | None = None,
+        failure_routing: Callable[[], FrozenRouting | None] | None = None,
     ) -> None:
         self.memory, self.bus = memory, bus
         self.config = config or MemoryPipelineConfig()
         self.admission = admission or Admission()
         self.extractor, self.media = extractor, media
+        self.failure_routing = failure_routing
         self.max_plan_bytes = (
             self.config.max_source_chars * 4 if max_plan_bytes is None else max_plan_bytes
         )
@@ -904,7 +911,8 @@ class MemoryPipeline:
             with self.memory.store.db:
                 updated = self.memory.store.db.execute(
                     "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,"
-                    "last_error='',updated_at=? WHERE source_id=? AND state='failed'",
+                    "last_error='',checkpoint=json_remove(checkpoint,'$.source_failure'),"
+                    "updated_at=? WHERE source_id=? AND state='failed'",
                     (timestamp, timestamp, source_id),
                 )
                 if updated.rowcount != 1:
@@ -927,7 +935,8 @@ class MemoryPipeline:
             ).fetchall()
             with self.memory.store.db:
                 self.memory.store.db.executemany(
-                    "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,last_error='',updated_at=? "
+                    "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,last_error='',"
+                    "checkpoint=json_remove(checkpoint,'$.source_failure'),updated_at=? "
                     "WHERE source_id=?",
                     ((now(), now(), row[0]) for row in rows),
                 )
@@ -949,13 +958,84 @@ class MemoryPipeline:
             await self.changed.wait_for(terminal)
         return self.job(source_id)
 
-    async def _publish(self, source_id: str | None = None) -> None:
+    def _publish_source_failure(self, source_id: str, revision: str, data: dict[str, Any]) -> bool:
+        """Commit the finite proof and its existing status event before any await."""
+        if self.bus is None or self.failure_routing is None or self._index_closed:
+            return False
+        store = self.memory.store
+        # Never let optional notification persistence commit someone else's work.
+        if store.db.in_transaction:
+            return False
+        try:
+            routing = self.failure_routing()
+            if (
+                routing is None
+                or attachment_revision(
+                    store, source_id, max_source_chars=self.config.max_source_chars
+                )
+                != revision
+            ):
+                return False
+            row = store.db.execute(
+                "SELECT CASE WHEN typeof(updated_at) IN ('integer','real') "
+                "THEN updated_at END AS updated_at FROM memory_jobs WHERE source_id=? AND state='failed'",
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            proof = MemorySourceFailure.load(
+                MemorySourceFailure(
+                    new_id(), source_id, revision, row["updated_at"], routing
+                ).dump(),
+                max_bytes=self.max_plan_bytes,
+            )
+            if proof is None:
+                return False
+            payload = {**data, "id": proof.identifier, "source_failure": proof.dump()}
+            if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > self.max_plan_bytes:
+                return False
+            encoded = json.dumps(proof.dump(), ensure_ascii=False, allow_nan=False)
+            with store.db:
+                updated = store.db.execute(
+                    "UPDATE memory_jobs SET checkpoint=json_set(checkpoint,'$.source_failure',json(?)) "
+                    "WHERE source_id=? AND state='failed' AND updated_at=? "
+                    "AND typeof(checkpoint)='text' AND length(CAST(checkpoint AS BLOB))<=? "
+                    "AND CASE WHEN json_valid(checkpoint) THEN "
+                    "length(CAST(json_set(checkpoint,'$.source_failure',json(?)) AS BLOB))<=? END",
+                    (
+                        encoded,
+                        source_id,
+                        proof.failed_at,
+                        self.max_plan_bytes,
+                        encoded,
+                        self.max_plan_bytes,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    return False
+                store._event("memory.pipeline.updated", payload)
+            return True
+        except Exception:
+            # The original failed state is already durable. An unavailable or
+            # oversized notice must not replace it or erase successful prefixes.
+            return False
+
+    async def _publish(
+        self, source_id: str | None = None, *, failed_revision: str | None = None
+    ) -> None:
+        data = {"source_id": source_id, **self.status()}
+        persisted = bool(
+            source_id is not None
+            and failed_revision is not None
+            and self._publish_source_failure(source_id, failed_revision, data)
+        )
         async with self.changed:
             self.changed.notify_all()
         if self.bus is not None:
-            await self.bus.emit(
-                "memory.pipeline.updated", {"source_id": source_id, **self.status()}
-            )
+            if persisted:
+                await self.bus.notify()
+            else:
+                await self.bus.emit("memory.pipeline.updated", data)
 
     def _checkpoint(self, source_id: str, checkpoint: Mapping[str, Any]) -> bool:
         with self.memory.store.db:
@@ -1009,11 +1089,18 @@ class MemoryPipeline:
             await asyncio.sleep(0)
 
     async def _run_job(self, source_id: str) -> None:
+        if self._index_closed:
+            return
+        revision = self._source_digest(source_id)
+        failed_revision: str | None = None
         with self.memory.store.db:
-            self.memory.store.db.execute(
-                "UPDATE memory_jobs SET state='processing',attempts=attempts+1,updated_at=? WHERE source_id=?",
+            updated = self.memory.store.db.execute(
+                "UPDATE memory_jobs SET state='processing',attempts=attempts+1,updated_at=? "
+                "WHERE source_id=? AND state IN ('queued','retry')",
                 (now(), source_id),
             )
+        if updated.rowcount != 1:
+            return
         try:
             async with asyncio.timeout(self.config.job_timeout):
                 await self._process(source_id)
@@ -1036,7 +1123,9 @@ class MemoryPipeline:
                         "UPDATE memory_jobs SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE source_id=?",
                         (state, now() + delay, self._last_error, now(), source_id),
                     )
-        await self._publish(source_id)
+                if state == "failed":
+                    failed_revision = revision
+        await self._publish(source_id, failed_revision=failed_revision)
 
     def _validated(self, payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):

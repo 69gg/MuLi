@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from muli.attachments import MAX_ATTACHMENT_IDS
+from muli.memory_source_failure import MAX_FAILURE_PROOF_BYTES, MemorySourceFailure
 from muli.proactive import FrozenRouting
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
@@ -54,6 +55,7 @@ class Conversation:
         objects: list[tuple[str, dict[str, Any]]] | None = None,
         reply_origin: ReplyOrigin | None = None,
         attention_routing: FrozenRouting | None = None,
+        attention_memory_failure: MemorySourceFailure | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload = self.payload(
             session_id,
@@ -66,6 +68,7 @@ class Conversation:
             event_id=event_id,
             reply_origin=reply_origin,
             attention_routing=attention_routing,
+            attention_memory_failure=attention_memory_failure,
         )
         return self.store.enqueue_input(
             payload,
@@ -87,6 +90,7 @@ class Conversation:
         event_id: str | None = None,
         reply_origin: ReplyOrigin | None = None,
         attention_routing: FrozenRouting | None = None,
+        attention_memory_failure: MemorySourceFailure | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > 64000:
@@ -128,4 +132,15 @@ class Conversation:
                 raise ValueError("主动通知选路仅允许系统注意事项入口")
             payload["attention_routing"] = attention_routing.dump()
             payload["reply_origin"] = attention_routing.reply_origin(identifier).dump()
+        if attention_memory_failure is not None:
+            if (
+                principal != "system:attention"
+                or source != "system:attention"
+                or MemorySourceFailure.load(
+                    attention_memory_failure.dump(), max_bytes=MAX_FAILURE_PROOF_BYTES
+                )
+                != attention_memory_failure
+            ):
+                raise ValueError("记忆整理提醒仅允许有界宿主证明")
+            payload["attention_memory_failure"] = attention_memory_failure.dump()
         return payload

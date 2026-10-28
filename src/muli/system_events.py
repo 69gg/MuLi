@@ -24,6 +24,7 @@ from muli.events import EventBus
 from muli.file_inbox import FileInboxProof, FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState, read_message
 from muli.mcp_receive_errors import RECEIVE_FAILURE_CODES
+from muli.memory_source_failure import MemorySourceFailure, failure_current
 from muli.proactive import FrozenRouting
 from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
@@ -657,6 +658,7 @@ class AttentionSource:
     producer_proof: tuple[str, str] | None = None
     file_inbox_proof: FileInboxProof | None = None
     reminder_proof: ReminderFollowupProof | None = None
+    memory_failure_proof: MemorySourceFailure | None = None
 
 
 def _notification_source(
@@ -929,6 +931,7 @@ def attention_source(
     chiliarch_policy: ChiliarchAttentionState | None = None,
     file_inbox_policy: FileInboxState | None = None,
     max_output_chars: int | None = None,
+    memory_source_chars: int | None = None,
 ) -> AttentionSource | None:
     if event.get("session_id") is not None or not isinstance(event.get("data"), dict):
         return None
@@ -938,6 +941,33 @@ def attention_source(
         or re.fullmatch(r"[A-Za-z0-9:._+\-]{1,160}", identifier) is None
     ):
         return None
+    if event.get("type") == "memory.pipeline.updated":
+        if "memory" not in enabled or max_output_chars is None or memory_source_chars is None:
+            return None
+        proof = MemorySourceFailure.load(
+            event["data"].get("source_failure"), max_bytes=max_output_chars * 4
+        )
+        if (
+            proof is None
+            or proof.identifier != identifier
+            or event["data"].get("source_id") != proof.source_id
+            or not failure_current(
+                store,
+                proof,
+                max_source_chars=memory_source_chars,
+                max_output_chars=max_output_chars,
+                verify_attachment=True,
+            )
+        ):
+            return None
+        return AttentionSource(
+            "memory",
+            proof.identifier,
+            proof.detail(),
+            "memory.failure:" + proof.identifier,
+            proof.routing,
+            memory_failure_proof=proof,
+        )
     if event.get("type") == "notification.created" and (
         event["data"].get("source") == "chiliarch"
         or event["data"].get("producer") == "chiliarch_message"

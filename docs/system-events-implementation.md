@@ -6,7 +6,7 @@
 
 自 2.89 起沿同一链接入[Telegram、微信后台接收故障期](superpowers/specs/2026-10-28-channel-receive-health-design.md)，不新增 AI 轮询或把 webhook 安静当故障。
 
-配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 只关闭既有 reminder/update/management 三类。
+配置位于 `system_events`，可通过设置 API 或 `self_configure` 更新：`enabled=true`、`notify_enabled=true`、`capture_level="error"`、`notify_level="error"`、`queue_capacity=128`、`max_records=1000`、`dedup_seconds=60`。级别支持 warning/error/critical。`attention.enabled=false` 是全部系统注意事项的总开关，`attention.events=[]` 关闭 reminder/update/management/memory 四类；其中 memory 直接核验收藏资料失败证明，不经过日志采集。
 
 Linux [资料收件目录](file-inbox.md)是独立的 `file_inbox.observed` 宿主来源，不伪装成日志，也不受日志严重级别控制。它通过内核事件生成有限元数据与覆盖缺口，默认关闭；沿同一 Attention 只读回合和冻结主动路由处理。目录事件不会触发 owner hooks 或自动取得整理、外发及配置权限。
 
@@ -17,7 +17,7 @@ Runtime 在其它组件启动前建立私有 logger，在关闭 Store 前移除�
 - `SystemEventsSettings` 是不依赖 `config.py` 的独立 Pydantic 模型。默认 enabled / notify_enabled 为 true，录入与通知阈值均 error，可设 warning 或 critical；待处理队列、保留记录、重复时间窗均有界。
 - `SystemEvents(store, bus, settings_callable, independent_routing=optional_callable)` 复用宿主 Store 与 EventBus；`await start(instance_logger)` 返回绑定本采集实例的 logger adapter。同步选择器仅在明确自主 watch 或 MCP 连接故障的新记录首次持久化时调用，不在 Handler 线程读配置或 SQLite。旧三参数构造仍保持本地兼容。宿主须使用该 adapter；无归属的原始第三方日志不自动认领，多个 Runtime 共用基础 logger 乃至同一 Store 也不会交叉捕获。Logger 的原等级仍然生效，例如宿主设为 critical 时不能声称捕获了 error。
 - `status()` 返回有限计数与固定错误码；`reconfigure()` 重新读取策略；`close()` 先卸载自己的 handler，再关闭接收、统计丢弃队列并停消费者，不删除其它实例的处理器，不调整 logger 级别或全局 logging 配置。
-- `AttentionInbox(runtime, system_settings=optional_callable)` 保持旧构造兼容。未传时不消费日志来源；传入后仍受 attention.enabled 总开关约束，旧 attention.events 三项保持原含义。
+- `AttentionInbox(runtime, system_settings=optional_callable)` 保持旧构造兼容。未传时不消费日志来源；传入后仍受 attention.enabled 总开关约束，既有 attention.events 三项保持原含义，新增 memory 独立控制收藏资料整理失败。
 
 宿主调用示例为 `logger.error("服务日志中的详情", extra={"muli_component": "runtime", "muli_code": "runtime_failed", "muli_run_id": run_id, "muli_session_id": session_id})`；logger 为返回的 adapter。组件白名单是 runtime / update / management / channels / media / plugins / extensions / attention / system_events / unknown；代码白名单是 runtime_failed / update_failed / management_failed / channel_failed / media_failed / plugin_failed / extension_reload_failed / unknown。不接受任意 logger 名或 extra 作为新枚举。`system_log_context(run_id=..., session_id=..., notify=False)` 可标注当前异步调用链；内层不能解除外层通知抑制。
 

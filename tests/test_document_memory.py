@@ -13,6 +13,7 @@ import pytest
 from test_attachment_memory_policy import MemoryRig, actual_app
 from test_attachment_memory_policy import offline as offline
 from test_document_reading import docx, pdf
+from test_document_reading import installed_pdf_diagnostic as installed_pdf_diagnostic
 from test_runtime import FakeClient
 
 from muli.document_settings import DocumentSettings, DocumentSettingsStore
@@ -256,13 +257,15 @@ async def test_document_conversion_await_preserves_owner_and_generation_fences(
         rig.absent(item["id"])
 
 
-async def test_installed_pdf_converter_can_collect_its_complete_text_layer(tmp_path: Path) -> None:
+async def test_installed_pdf_converter_can_collect_its_complete_text_layer(
+    tmp_path: Path, installed_pdf_diagnostic: dict[str, Any]
+) -> None:
     if shutil.which("pdftotext") is None:
         pytest.skip("installed converter is optional; no download")
     async with actual_app(tmp_path) as rig:
         item = await rig.upload(pdf())
         page = await tool(rig, "document_read", id=item["id"])
-        assert "error" not in page, page
+        assert "error" not in page, {"result": page, **installed_pdf_diagnostic}
         result = await tool(
             rig, "memory_import_attachment", id=item["id"], revision=page["revision"]
         )

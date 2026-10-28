@@ -6,6 +6,7 @@ import argparse
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import uuid
@@ -32,6 +33,40 @@ def manager(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         timeout=MANAGER_TIMEOUT,
     )
+
+
+def local_temp_directory() -> Path:
+    """Keep persistent check scratch files on verified disk, outside tmpfs budgets."""
+    artifacts = Path(__file__).resolve().parents[1] / ".local-check-artifacts"
+    temporary = artifacts / "tmp"
+    for path in (artifacts, temporary):
+        path.mkdir(mode=0o700, exist_ok=True)
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise RuntimeError(f"Temporary directory must be an owner-only directory: {path}")
+    result = subprocess.run(
+        ["findmnt", "-T", str(temporary), "-n", "-o", "FSTYPE"],
+        check=True,
+        text=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=MANAGER_TIMEOUT,
+    )
+    lines = result.stdout.splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise RuntimeError("Cannot verify temporary directory filesystem")
+    filesystem = lines[0].strip()
+    if any(character.isspace() for character in filesystem) or filesystem in {
+        "tmpfs",
+        "ramfs",
+        "devtmpfs",
+    }:
+        raise RuntimeError(f"Temporary directory requires a disk filesystem: {filesystem}")
+    return temporary
 
 
 def verify_group(path: Path, memory: int, *, service: bool = False) -> None:
@@ -194,6 +229,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
         raise RuntimeError("Local checks require Linux cgroup v2; no unbounded fallback")
     if not 1 <= seconds <= MAX_SECONDS:
         raise ValueError(f"seconds must be between 1 and {MAX_SECONDS}")
+    temporary = local_temp_directory()
     manager(
         "set-property",
         "--runtime",
@@ -222,6 +258,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
     }
     environment = {
         "PATH": os.environ.get("PATH", os.defpath),
+        "TMPDIR": str(temporary),
         "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
         "PYTHONPATH": str(Path.cwd() / "src"),
         "UV_OFFLINE": "1",

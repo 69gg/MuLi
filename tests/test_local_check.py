@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import stat
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +22,30 @@ def checker() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def local_repository(checker: ModuleType, monkeypatch: Any, tmp_path: Path) -> Path:
+    repository = tmp_path / "repository"
+    (repository / "scripts").mkdir(parents=True)
+    monkeypatch.setattr(checker, "__file__", str(repository / "scripts/check_local.py"))
+    monkeypatch.setattr(checker.sys, "platform", "linux")
+    monkeypatch.setattr(checker.os, "getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(checker.Path, "is_file", lambda _: True)
+    original = checker.Path.lstat
+    private_paths = {
+        repository / ".local-check-artifacts",
+        repository / ".local-check-artifacts/tmp",
+    }
+
+    def private_metadata(path: Path) -> Any:
+        # Controlled Linux metadata keeps these no-service unit tests portable.
+        if path in private_paths:
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000)
+        return original(path)
+
+    monkeypatch.setattr(checker.Path, "lstat", private_metadata)
+    return repository
 
 
 @pytest.fixture
@@ -109,7 +134,7 @@ def test_command_failure_is_not_systemd_clean_signal_exit(
 
 @pytest.mark.parametrize("cleaned", [True, False])
 def test_cancel_cleans_own_service_and_keeps_shared_budget(
-    checker: ModuleType, monkeypatch: Any, cleaned: bool
+    checker: ModuleType, monkeypatch: Any, local_repository: Path, tmp_path: Path, cleaned: bool
 ) -> None:
     calls: list[tuple[str, ...]] = []
     stopped: list[str] = []
@@ -118,8 +143,17 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
         calls.append(args)
         return subprocess.CompletedProcess([], 0, stdout="")
 
-    def cancelled(command: list[str], **kwargs: Any) -> None:
+    def cancelled(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        temporary = local_repository / ".local-check-artifacts/tmp"
+        if command[0] == "findmnt":
+            assert command == ["findmnt", "-T", str(temporary), "-n", "-o", "FSTYPE"]
+            assert kwargs["check"] is True
+            assert kwargs["timeout"] == checker.MANAGER_TIMEOUT
+            return subprocess.CompletedProcess(command, 0, stdout="btrfs\n")
         assert "--slice=muli-checks.slice" in command
+        assert f"--setenv=TMPDIR={temporary}" in command
+        assert "--setenv=TMPDIR=/inherited-ram-temp" not in command
+        assert f"--working-directory={tmp_path}" in command
         assert "--setenv=UV_OFFLINE=1" in command
         assert "--setenv=NODE_OPTIONS=--max-old-space-size=192" in command
         assert "--property=MemoryMax=805306368" in command
@@ -135,6 +169,8 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
         return cleaned
 
     monkeypatch.setattr(checker.sys, "platform", "linux")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TMPDIR", "/inherited-ram-temp")
     monkeypatch.setenv("UV_CACHE_DIR", "/existing-uv-cache")
     monkeypatch.setenv("PRIVATE_TEST_TOKEN", "synthetic-not-forwarded")
     monkeypatch.setattr(checker.os, "getuid", lambda: 1000, raising=False)
@@ -150,6 +186,89 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
     assert "CPUQuota=50%" in calls[0]
     assert "TasksMax=96" in calls[0]
     assert all("stop" not in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "filesystem",
+    ["tmpfs\n", "ramfs\n", "devtmpfs\n", "", "\n", "btrfs\next4\n", "btrfs ext4\n"],
+)
+def test_ram_or_unverified_temporary_filesystem_refuses_service(
+    checker: ModuleType, monkeypatch: Any, local_repository: Path, filesystem: str
+) -> None:
+    def findmnt(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert command[0] == "findmnt"
+        assert command[2] == str(local_repository / ".local-check-artifacts/tmp")
+        return subprocess.CompletedProcess(command, 0, stdout=filesystem)
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("service was touched before temporary storage was verified")
+
+    monkeypatch.setattr(checker.subprocess, "run", findmnt)
+    monkeypatch.setattr(checker, "manager", unexpected)
+    with pytest.raises(RuntimeError, match="temporary directory|disk filesystem"):
+        checker.run(["target"], 1)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("findmnt"),
+        subprocess.CalledProcessError(1, ["findmnt"]),
+        subprocess.TimeoutExpired(["findmnt"], 10),
+    ],
+)
+def test_unavailable_or_failed_findmnt_refuses_service(
+    checker: ModuleType,
+    monkeypatch: Any,
+    local_repository: Path,
+    error: OSError | subprocess.SubprocessError,
+) -> None:
+    def failed(command: list[str], **kwargs: Any) -> None:
+        assert command[0] == "findmnt"
+        raise error
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("service was touched after temporary storage verification failed")
+
+    monkeypatch.setattr(checker.subprocess, "run", failed)
+    monkeypatch.setattr(checker, "manager", unexpected)
+    with pytest.raises(type(error)):
+        checker.run(["target"], 1)
+
+
+@pytest.mark.parametrize("leaf", [".local-check-artifacts", ".local-check-artifacts/tmp"])
+@pytest.mark.parametrize(
+    ("mode", "uid"),
+    [
+        (stat.S_IFLNK | 0o700, 1000),
+        (stat.S_IFREG | 0o700, 1000),
+        (stat.S_IFDIR | 0o700, 1001),
+        (stat.S_IFDIR | 0o750, 1000),
+    ],
+)
+def test_temporary_directory_requires_private_owner_directory(
+    checker: ModuleType,
+    monkeypatch: Any,
+    local_repository: Path,
+    leaf: str,
+    mode: int,
+    uid: int,
+) -> None:
+    original = checker.Path.lstat
+
+    def invalid_metadata(path: Path) -> Any:
+        if path == local_repository / leaf:
+            return SimpleNamespace(st_mode=mode, st_uid=uid)
+        return original(path)
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("unsafe temporary directory reached a command or service")
+
+    monkeypatch.setattr(checker.Path, "lstat", invalid_metadata)
+    monkeypatch.setattr(checker.subprocess, "run", unexpected)
+    monkeypatch.setattr(checker, "manager", unexpected)
+    with pytest.raises(RuntimeError, match="owner-only directory"):
+        checker.run(["target"], 1)
 
 
 def test_no_unbounded_fallback(checker: ModuleType, monkeypatch: Any) -> None:

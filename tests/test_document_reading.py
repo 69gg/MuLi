@@ -324,14 +324,33 @@ def pdf() -> bytes:
     return bytes(result)
 
 
-async def test_real_installed_pdf_converter_reads_generated_document(pdf_host: Host) -> None:
+@pytest.fixture
+def installed_pdf_diagnostic(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    import muli.document_reading as module
+
+    diagnostic: dict[str, Any] = {}
+    original = module.run_process
+
+    async def observed(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        diagnostic["resolved_path"] = shutil.which(argv[0])
+        result = await original(argv, **kwargs)
+        diagnostic.update(exit_code=result["exit_code"], stderr=result["stderr"][:2048])
+        return result
+
+    monkeypatch.setattr(module, "run_process", observed)
+    return diagnostic
+
+
+async def test_real_installed_pdf_converter_reads_generated_document(
+    pdf_host: Host, installed_pdf_diagnostic: dict[str, Any]
+) -> None:
     converter = shutil.which("pdftotext")
     if converter is None:
         pytest.skip("optional local pdftotext is not installed; never downloaded by this test")
     configure_document(pdf_host, {"pdf_command": [converter]})
     item = await pdf_host.save(pdf(), "sample.pdf")
     result = await pdf_host.drive("document_read", id=item["id"])
-    assert "error" not in result, result
+    assert "error" not in result, {"result": result, **installed_pdf_diagnostic}
     assert result["format"] == "pdf" and result["scope"] == "pdf_text_layer"
     assert result["source_revision"] == item["sha256"]
     assert "MULI DOCUMENT END" in result["content"] and not result["has_more"]

@@ -26,7 +26,7 @@ DOCX 阅读不保留排版、自动编号外观、页眉页脚、批注、公式
 
 ## PDF 转换器与设置
 
-DOCX 不需要额外安装库。PDF 默认查找已有的 `pdftotext`；未安装时会提示转换器不可用，不会自动下载安装。Linux 优先使用系统已有程序，macOS 和 Windows 也可配置可执行文件路径。
+DOCX 不需要额外安装库。PDF 需要支持从标准输入读取 PDF 的 Poppler `pdftotext`，默认查找本机已有程序；未安装时会提示转换器不可用，不会自动下载安装。Linux 优先使用系统已有程序，macOS 和 Windows 也可配置可执行文件路径。同名的 Xpdf 程序不支持这一输入方式；若系统中有多个版本，请指定 Poppler 程序的完整路径。
 
 可以直接请沐璃帮助查看或调整文档设置，即时生效。它使用独立记录，保留原有主配置格式；不需要修改 `config.json`。对应工具是 `document_settings_read` 和主助手使用的 `document_configure`，修改时先查看当前值并保留仍需使用的参数。
 

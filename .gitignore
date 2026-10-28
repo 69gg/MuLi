@@ -10,6 +10,9 @@ wheels/
 output/imagegen/
 tmp/imagegen/
 
+# Persistent local check scratch files and frozen evidence
+.local-check-artifacts/
+
 # Virtual environments
 .venv
 

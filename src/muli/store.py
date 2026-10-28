@@ -1414,6 +1414,16 @@ class Store:
                         payload.get("channel_ownership"), sort_keys=True, separators=(",", ":")
                     ),
                     str(payload.get("channel_ownership_control", False)),
+                    # A finite host proof freezes one independently revocable
+                    # source. Equal routes must not merge different failures.
+                    json.dumps(
+                        payload["attention_memory_failure"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if payload.get("principal") == "system:attention"
+                    and "attention_memory_failure" in payload
+                    else "",
                 )
                 if destination is not None and key != destination:
                     break  # Another recipient waits for the next replay-safe boundary.

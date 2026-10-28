@@ -36,6 +36,12 @@ from muli.management_transaction import Role
 from muli.mcp_policy import ReceivePolicyStore
 from muli.memory import Memory
 from muli.memory_context import MemoryContextProvider, PromptComposition, compose_context_result
+from muli.memory_source_failure import (
+    MemorySourceFailure,
+    MemorySourceFailureExpired,
+    failure_current,
+    input_failure,
+)
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
@@ -93,6 +99,7 @@ class PreparedRequest:
     attention_routing: FrozenRouting | None = None
     channel_ownership: dict[str, Any] | None = None
     consult: ConsultRequest | None = None
+    memory_failure: MemorySourceFailure | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -505,6 +512,7 @@ class Runtime:
                     self._selected_replans.pop(session_id, None)
         reply_origin = self._reply_origin(session_id)
         attention_routing = self._attention_routing(session_id)
+        memory_failure = self._attention_memory_failure(session_id)
         if (
             previous is not None
             and (self.store.get("session", session_id) or {}).get("kind") == "main"
@@ -524,6 +532,9 @@ class Runtime:
                 # A report is evidence for this running request, not a new owner
                 # request. A later run triggered by that report keeps its origin.
                 reply_origin, attention_routing = previous.reply_origin, previous.attention_routing
+                memory_failure = previous.memory_failure
+                if memory_failure is not None and not self._memory_failure_allowed(memory_failure):
+                    raise MemorySourceFailureExpired("资料整理失败依据已失效")
             else:
                 reply_origin = ReplyOrigin.from_input(trigger)
                 attention_routing = (
@@ -540,6 +551,7 @@ class Runtime:
             reply_origin,
             attention_routing,
             self.channel_ownership.current_proof(session_id, self.run_ids.get(session_id)),
+            memory_failure=memory_failure,
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -565,6 +577,10 @@ class Runtime:
             self._request_context.reset(token)
 
     def _guard_request(self, request: PreparedRequest, risk: str | None = None) -> None:
+        if request.memory_failure is not None and not self._memory_failure_allowed(
+            request.memory_failure
+        ):
+            raise MemorySourceFailureExpired("资料整理失败依据已失效")
         risk = risk or ("read" if request.consult is not None else "write")
         if request.consult is not None:
             if not isinstance(request.consult, ConsultRequest) or risk != "read":
@@ -1080,6 +1096,7 @@ class Runtime:
         objects: list[tuple[str, dict[str, Any]]],
         admission_guard: Callable[[], None] | None = None,
         routing: FrozenRouting | None = None,
+        memory_failure: MemorySourceFailure | None = None,
     ) -> dict[str, Any] | None:
         """Admit idle-only facts atomically; execution and report handoff defer admission."""
         async with self.configuration_lock:
@@ -1087,6 +1104,10 @@ class Runtime:
                 raise ValueError("运行时正在关闭")
             if admission_guard is not None:
                 admission_guard()
+            if memory_failure is not None and not self._memory_failure_allowed(
+                memory_failure, verify_attachment=True
+            ):
+                raise MemorySourceFailureExpired("资料整理失败依据已失效")
             session = self.main_session()
             if self.attention_busy or not self.maintenance.admission.allowed:
                 return None
@@ -1101,6 +1122,7 @@ class Runtime:
                 max_pending=self.config.settings.limits.max_pending_runs,
                 objects=objects,
                 attention_routing=routing,
+                attention_memory_failure=memory_failure,
             )
             if inserted:
                 self._invalidate_voice_reply()
@@ -1109,7 +1131,59 @@ class Runtime:
             await self.bus.emit("attention.queued", {"message": receipt}, session["id"])
         return receipt
 
-    async def _claim_inputs(self, session_id: str, run_id: str) -> list[dict[str, Any]]:
+    def _memory_failure_allowed(
+        self, proof: MemorySourceFailure, *, verify_attachment: bool = False
+    ) -> bool:
+        settings = self.config.settings
+        return (
+            settings.attention.enabled
+            and "memory" in settings.attention.events
+            and settings.memory.enabled
+            and failure_current(
+                self.store,
+                proof,
+                max_source_chars=settings.memory.max_source_chars,
+                max_output_chars=settings.limits.max_output_chars,
+                verify_attachment=verify_attachment,
+            )
+        )
+
+    def _cancel_stale_memory_inputs(self, session_id: str) -> bool:
+        # Inspect only the same finite pending window claim_inputs may consume.
+        rows = self.store.db.execute(
+            "SELECT seq,CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))<=200 "
+            "THEN id END AS id,json_extract(payload,'$.principal')='system:attention' AS attention,"
+            "json_type(payload,'$.attention_memory_failure') AS marked "
+            "FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
+            (session_id, self.config.settings.limits.max_pending_runs),
+        ).fetchall()
+        cancelled = False
+        for row in rows:
+            if not row["attention"] or row["marked"] is None:
+                continue
+            proof = None
+            if row["id"] is not None:
+                _, proof = input_failure(
+                    self.store,
+                    row["id"],
+                    max_output_chars=self.config.settings.limits.max_output_chars,
+                )
+            if proof is not None and self._memory_failure_allowed(proof, verify_attachment=True):
+                continue
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE ingress SET state='cancelled' WHERE seq=? AND session_id=? AND state='pending' "
+                    "AND json_extract(payload,'$.principal')='system:attention'",
+                    (row["seq"], session_id),
+                )
+            cancelled = True
+        return cancelled
+
+    async def _claim_inputs(
+        self, session_id: str, run_id: str, *, discard_stale: bool = True
+    ) -> list[dict[str, Any]]:
+        if discard_stale:
+            self._cancel_stale_memory_inputs(session_id)
         messages = self.store.claim_inputs(
             session_id,
             run_id,
@@ -1856,6 +1930,14 @@ class Runtime:
             run["status"] = "cancelled"
             await self.bus.emit("run.cancelled", {"run_id": run_id}, session_id)
             raise
+        except MemorySourceFailureExpired:
+            run.update(status="cancelled", result="", cancel_reason="memory_source_failure_expired")
+            await self.bus.emit(
+                "run.cancelled",
+                {"run_id": run_id, "reason": "memory_source_failure_expired"},
+                session_id,
+            )
+            return ""
         except TaskPaused as exc:
             run.update(status="paused", pause_reason=str(exc), observed_epoch=exc.observed_epoch)
             self.store.put("run", run)
@@ -2290,6 +2372,25 @@ class Runtime:
             return None
         return FrozenRouting.load(json.loads(row[1]))
 
+    def _attention_memory_failure(self, session_id: str) -> MemorySourceFailure | None:
+        row = self.store.db.execute(
+            "SELECT CASE WHEN typeof(o.id)='text' AND length(CAST(o.id AS BLOB))<=200 "
+            "THEN o.id END AS id,json_extract(o.data,'$.principal')='system:attention' AS attention "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None or not row["attention"]:
+            return None
+        if row["id"] is None:
+            raise MemorySourceFailureExpired("资料整理失败输入身份无法核对")
+        marked, proof = input_failure(
+            self.store, row["id"], max_output_chars=self.config.settings.limits.max_output_chars
+        )
+        if marked and (proof is None or not self._memory_failure_allowed(proof)):
+            raise MemorySourceFailureExpired("资料整理失败依据已失效")
+        return proof
+
     async def _execute(
         self,
         session_id: str,
@@ -2302,7 +2403,10 @@ class Runtime:
     ) -> _ExecutionResult:
         self._repair_tail(session_id)
         if consult is None:
-            await self._claim_inputs(session_id, run_id)
+            discarded = self._cancel_stale_memory_inputs(session_id)
+            claimed = await self._claim_inputs(session_id, run_id, discard_stale=False)
+            if discarded and not claimed:
+                return _ExecutionResult("")
             prepared = await self._prepare_request(session_id)
         else:
             self.team.consult.guard_control(consult, session_id)
@@ -2377,6 +2481,8 @@ class Runtime:
                         async for event in client.stream(
                             messages, [tool.schema() for tool in round_tools.values()]
                         ):
+                            if prepared.memory_failure is not None:
+                                self._guard_request(prepared)
                             if event.kind in {"text_delta", "reasoning_delta"}:
                                 if event.kind == "text_delta":
                                     partial += event.text
@@ -2389,8 +2495,8 @@ class Runtime:
                                 )
                             elif event.kind == "done":
                                 turn = event.turn
-                except BaseException:
-                    if partial:
+                except BaseException as error:
+                    if partial and not isinstance(error, MemorySourceFailureExpired):
                         self.store.complete_message(
                             session_id,
                             partial,
@@ -2400,6 +2506,8 @@ class Runtime:
                         )
                         await self.bus.notify()
                     raise
+                if prepared.memory_failure is not None:
+                    self._guard_request(prepared)
                 if turn is None:
                     raise ValueError("模型响应未完整结束")
                 if consult is not None:
@@ -2435,16 +2543,16 @@ class Runtime:
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
-                    claimed: list[dict[str, Any]] = []
+                    claimed = []
                     if consult is None and round_index < self.config.settings.limits.max_tool_steps:
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
-                    self._guard_request(prepared)
                     if claimed:
                         prepared = await self._prepare_request(
                             session_id, previous=prepared, claimed_inputs=claimed
                         )
                         continue
+                    self._guard_request(prepared)
                     if consult is None:
                         self.compaction.observe(session_id)
                     return _ExecutionResult(
