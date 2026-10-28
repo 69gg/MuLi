@@ -17,8 +17,9 @@ def test_durable_connection_overrides_normal_before_first_schema_write(
 
     def normal_connection(*args: Any, **kwargs: Any) -> sqlite3.Connection:
         db = connect(*args, **kwargs)
-        db.execute("PRAGMA journal_mode=WAL")
+        # Configure the connection only; Store owns the first database write.
         db.execute("PRAGMA synchronous=NORMAL")
+        assert db.execute("PRAGMA synchronous").fetchone()[0] == 1
 
         def trace(sql: str) -> None:
             if sql.lstrip().startswith(("CREATE", "INSERT", "UPDATE")):
