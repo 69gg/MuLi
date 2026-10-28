@@ -309,7 +309,7 @@ class CommitmentDirectory:
                         omit(identifier, "missing")
                         continue
                     size = size_row["size"]
-                    if size_row["storage_type"] != "text" or type(size) is not int or size < 0:
+                    if size_row["storage_type"] != "text" or type(size) is not int or size <= 0:
                         omit(identifier, "invalid")
                         continue
                     if size > budget.raw:

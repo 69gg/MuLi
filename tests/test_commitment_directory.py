@@ -275,6 +275,45 @@ def test_raw_budget_retries_the_first_unloaded_row_on_the_next_page(
     assert reads[-1] == (older["id"], context * 4)
 
 
+def test_empty_json_after_exact_raw_exhaustion_preserves_progress_and_continuation(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    older = ledger.put("a")
+    broken = ledger.put("y")
+    newer = ledger.put("z", evidence="e" * 400)
+    with ledger.store.db:
+        ledger.store.db.execute(
+            "UPDATE objects SET data=data||? WHERE kind='commitment' AND id=?",
+            (" " * (-ledger.size(newer["id"]) % 4), newer["id"]),
+        )
+        ledger.store.db.execute(
+            "UPDATE objects SET data='' WHERE kind='commitment' AND id=?", (broken["id"],)
+        )
+    size = ledger.size(newer["id"])
+    assert size % 4 == 0 and size > ledger.size(older["id"])
+    bounded = ledger.store.bounded_object
+    reads: list[tuple[str, int]] = []
+
+    def observed(kind: str, identifier: str, *, max_bytes: int) -> dict[str, Any] | None:
+        reads.append((identifier, max_bytes))
+        return bounded(kind, identifier, max_bytes=max_bytes)
+
+    monkeypatch.setattr(ledger.store, "bounded_object", observed)
+    first = ledger.directory(max_context_chars=size // 4, max_results=3)
+    assert [item["id"] for item in first["items"]] == [newer["id"]]
+    assert first["json_bytes"] == size and first["stopped"] == "raw_budget"
+    assert first["omitted"]["invalid"] == first["omitted_total"] == 1
+    assert first["next_cursor"] and not ledger.store.db.in_transaction
+    second = ledger.directory(
+        cursor=first["next_cursor"], max_context_chars=size // 4, max_results=3
+    )
+    assert [item["id"] for item in second["items"]] == [older["id"]]
+    assert second["has_more"] is False and second["omitted_total"] == 1
+    assert reads == [(newer["id"], size), (older["id"], size)]
+    assert not ledger.store.db.in_transaction
+    assert ledger.size(broken["id"]) == 0
+
+
 def test_complete_output_shell_reserves_cursor_counts_and_escaped_metadata(ledger: Ledger) -> None:
     records = [ledger.put(f"task-{index}", title="\x01" * 239) for index in range(5)]
     results = pages(ledger, max_output_chars=900, max_results=5)

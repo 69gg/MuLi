@@ -33,11 +33,9 @@ Python 内部 Commitments.get(identifier, revision=None) 返回完整记录，�
 
 不知道旧任务 ID 时使用 `commitment_directory({"status":"active","limit":20})`。它返回 `items`、`has_more`、`next_cursor`，后续把完整游标与同一 `status` 传回；即使 `items` 为空，只要 `has_more=true` 仍需续页。`status` 接受 `active`、`all` 及已有任务状态，单页最多 100 项。旧 `commitment_list`、Python `Commitments.list` 及 Web 列表保持原来的近期数组接口，不自动改成分页对象。
 
-目录按不可变 ID 倒序 seek，先取得至多 `max_search_results` 个候选及一个前瞻，再核完整持久 JSON 的 UTF-8 字节数；超过 `max_context_chars*4` 的对象不会先把 brief 或方案正文载入 Python。状态不符及坏行也占候选、已载入 JSON 也占字节额度，不会为了凑满结果补扫全库。单次返回把完整外壳、计数、元数据及游标一起计入 `max_output_chars`，并沿用入口取得的 `max_search_seconds` 绝对期限。SQL 长度核验及 SQLite 内部 I/O 不因此获得硬超时或固定成本保证。
+每页遵守现有搜索、上下文、输出和时间预算。`scanned`、`json_bytes` 表示核查量，`omitted` 和 `omitted_total` 表示本页及累计遗漏；空记录等损坏数据计入 `invalid`，不会阻塞正常续页。`stopped` 说明中止原因，`end` 表示到尾；有遗漏时不能声称查全，无法安全保存完整游标时会明确报错。
 
-`scanned`、`json_bytes` 记录本页核查量，`omitted` 分别报告 `oversized`、`invalid`、`missing`，`omitted_total` 随游标累计；存在遗漏时不能声称查全。`stopped` 区分条数、候选、原始字节、输出、期限预算及 `end` 到尾。超过整页原始字节预算的对象会记遗漏并推进；仅剩余额度不够的下一项留给后页。异常巨主键无法安全装入游标或不是完整 UTF-8 时明确失败，不截键、替换字符或伪称到尾。
-
-游标绑定资料库实例、目录用途和状态，正常重开同库仍可用，跨库或更换状态会拒绝。`consistency="bounded_live"` 表示跨页实时遍历：编辑不重排已经走过的 ID，删除位置行不妨碍续页；后来插入在已过位置的项或已过项的状态变化可能不出现在当前遍历，重新首页才能纳入。这不是跨页快照，也不代表全库无遗漏。
+游标绑定同一资料库和状态，正常重开后仍可继续。目录是实时遍历，编辑不重排已走过的 ID；后来新增或改变状态的任务可能需要重新从首页查找，不是跨页快照。
 
 目录只提供现有白名单元数据和 `has_brief`，不解析证据目标、不选择重新规划、不修改任务或批准执行。它沿用旧索引的元数据可见范围；队友即使翻到别人的 ID，`commitment_read` 仍只允许自己的绑定，转发主助手 handler 或工作流也不会增加正文权限。
 
