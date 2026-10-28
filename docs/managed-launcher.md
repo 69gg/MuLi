@@ -109,6 +109,14 @@ InvocationID/cgroup 下的实际 slot argv；两个 venv 共享 real executable 
 现有 `SystemdProbe.read` 的 V1 约束保持不变。子进程的 bootstrap 在 ConfigFile/Store 前
 重读当前代、获得 writer lease，并调用当前 slot、格式及角色准入核验。
 
+一次同步 `resolve_entry` 内，controller 的完整静态认证成功后，可将本次实际观察到
+的 Python/package 内容 proof 交给 selected 验证。selected 仍独立打开文件、核自己的
+预算和七字段身份、复核链接与祖先路径、完整遍历包树；不同 slot 的同形包不共享叶
+proof。复用只省内容读取，不跳过任何 selected 验证，也不把真实二进制相同当成
+相同安装。proof 不进入返回的 `LaunchPlan`，下一次路由重新读取，不能穿过 exec、
+bootstrap 的实际 probe await 或 BootPermit 观察。recover 不选择 selected，保持原来的
+controller 验证，不额外采集 package proof。
+
 `cli` 仅在 V2 已 resolved 时按终态 role 委托；任何未解决代均返回
 `transaction_in_progress`，不能在 committed 但尚未激活时把普通 CLI 委托给 base。
 CLI 参数不能覆盖 anchor 的 config/data/root；保留长选项及其 argparse 有效缩写
@@ -128,15 +136,14 @@ CLI 参数不能覆盖 anchor 的 config/data/root；保留长选项及其 argpa
 数据库或候选代码，不修 selector、不重新捕获安装、不制造新事务。
 anchor 变化明确报告 `anchor_unavailable`；保留的 Python 自身无法运行时不承诺软件自愈。
 
-## 本片验证
+## 验证范围
 
-已通过受限 `tests/test_managed_launcher.py` 的 37 项回归，含两个临时 venv
-共用同一个真实二进制时的词法入口区分、实际同 PID exec、坏 selector 的固定 controller
-恢复、坏候选不导入的 repair、fsync 失败后不能当作成功收据，以及初建临时文件
-fsync 消耗最后期限后不发布 selector，以及真实 argparse 接受路径缩写覆盖时 launcher
-仍明确拒绝。最终用例 6.01 秒，三源码严格 mypy 与四文件 Ruff/format 通过，
-尾轮最高 70.5 MiB、swap 0，未提高开发资源限制。
-没有运行真实 systemd、外部模型、uv 安装或用户数据库。
+`test_managed_launcher.py` 覆盖解释器入口区分、exec、固定 controller 恢复、只读
+repair、持久化失败和参数覆盖拒绝。`test_managed_startup_file_proofs.py` 另核对实际
+文件读取与包遍历、每次路由重新验证，以及两侧验证之间的内容、链接和预算变化。
+
+这些本机回归不启动真实用户服务。真实接管、更新、回退与原 60 秒事务限制仍由托管
+Native 验收确认，不能用读取次数减少代替实际运行结果。
 
 原有设计参见 [可恢复管理](recoverable-management-design.md)、
 [无迁移启动](no-migration-startup-design.md) 与 [兼容声明](upgrade-compatibility.md)。

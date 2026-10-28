@@ -58,9 +58,18 @@ rename 已可见、目录同步却失败的 `released` 当作已持久放行。
 
 ## 实际文件与同连接证据
 
-所选 slot 使用现有 `verify_current_slot`，核实际当前 Python 词法入口、prefix、
-真实导入路径及静态文件。固定 controller 的静态身份也必须仍可验证。未选中 slot
+所选 slot 先用现有 `verify_slot_files` 核静态文件，再用 `verify_current_process` 核
+实际当前 Python 词法入口、prefix 与真实导入路径，保持 `verify_current_slot` 的完整
+检查顺序。固定 controller 的静态身份也必须仍可验证。未选中 slot
 不执行文件核验，损坏 target 不能因此阻止健康 base 回退；这不证明另一侧仍可启动。
+
+每个同步 `_observe` 只在 controller 完整验证成功后，将本次真实读取产生的 Python
+与 package 叶内容 proof 交给紧邻的 selected 静态验证。selected 仍独立打开解释器、
+核自己的预算和完整七字段身份、逐级复核路径，并重新遍历完整包树；包 proof 只按
+完整 slot 作用域匹配，不因两个包的摘要相同而跨根复用。共享真实 Python 不能跳过
+selected 的包或当前进程身份核验。proof 仅在本次 `_observe` 栈上，不保存在 permit：
+`acquire` 的前后观察、`open_store` 的前后观察，以及 SQLite 格式快照两侧，每次均
+重新读取内容；即使没有 `await` 也不合并独立观察。
 
 actual config、selector、unit 使用已有有界 nofollow 文件读取和精确快照合同。
 unit 按原始字节而非 JSON 校验；managed role 的 unit 必须对应 anchor 冻结的 unit。
@@ -106,25 +115,14 @@ DDL/backfill/新身份；返回业务 Store 前，在该同一连接上再次读
 
 ## 验证边界
 
-终态已投影后的配置准入尾片新增 16 项参数化回归，同连接回执接口新增 1 项并强化
-外层事务保持断言。当前 boot 63 项、投影 42 项和运行绑定 33 项合计 138 项通过
-（pytest 2.36 秒，service 2.848 秒，峰值 121.1 MiB、swap 0）；四份 Python 文件
-Ruff/格式和两处源码严格 mypy 通过，静态检查最高 122.8 MiB。覆盖四种终态、缺失/
-错误/畸形/超大回执、未决代同形回执不放宽、acquire→open_store 配置变化、准入观察
-中变化、实际返回 Store 连接再次核回执，以及不改写历史或创建额外 Store。
+回归覆盖启动准入、配置与安装身份变化、数据库连接复核、目录持久化失败和失败关闭。
+启动文件验证另检查同槽与不同槽、实际打开与目录遍历、独立观察重新读取，以及内容、
+链接和预算变化；对应测试为 `test_managed_boot.py`、`test_managed_runtime_binding.py`
+和 `test_managed_startup_file_proofs.py`。
 
-新增单文件 47 项回归通过（pytest 0.94 秒，受限 service 1.436 秒，峰值 85.8 MiB、
-swap 0）；两处源码严格 mypy、三份 Python 文件 Ruff 和格式检查通过，静态检查最高
-127.2 MiB。全部经统一守卫，单次 1 GiB、共享 2 GiB、30 秒硬限。
-
-回归只使用临时数据库、合成安装声明、模块局部的进程身份替身及协议 fixture，
-不启动真实 systemd、模型、候选解释器或用户数据库。包含实际 Store 无迁移打开后
-业务可写、合法 revision 推进与本次读取倒退拒绝、坏 target 不妨碍 base 准入、实际
-配置/selector/unit/slot 改变、同内容 DB inode 替换、marker/主身份变化及失败关闭
-仍保留 writer lease。两个目录同步失败用例先在旧链均得到 `DID NOT RAISE`：真实
-state rename 已可见、随后目录同步持续 EIO，修后在 acquire 或 open_store 阶段均
-拒绝，且不进入 SQLite/Store 工厂。
-既有 launcher 的验证证据见[固定入口](managed-launcher.md)，不计作本片测试结果。
+本机验证使用临时数据库、合成安装声明和进程身份替身，不启动真实用户服务。
+真实 systemd 接管、更新与回退仍需托管 Native 验收；局部减少读取不能证明原 60 秒
+三事务验收达标。[固定入口](managed-launcher.md)说明关联的路由与恢复边界。
 
 Python 的 [SQLite URI](https://docs.python.org/3/library/sqlite3.html#how-to-work-with-sqlite-uris)
 用于禁止缺文件创建，Pydantic 的

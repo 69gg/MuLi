@@ -538,7 +538,11 @@ def resolve_entry(root: Path, *, purpose: str, arguments: Sequence[str] = ()) ->
     route_role = None if purpose == "recover" else _role(record, purpose)
     deployment, anchor = _anchor(root, record)
     controller, _ = _content(root, "slot", _hash(anchor.get("controller_slot")))
-    verify_slot_files(controller)
+    controller_packages: PackageProofs = {}
+    if purpose == "recover":
+        verify_slot_files(controller)
+    else:
+        verify_slot_files(controller, observed_packages=controller_packages)
     if purpose == "recover":
         if arguments:
             raise LaunchError("managed_arguments_invalid")
@@ -590,7 +594,13 @@ def resolve_entry(root: Path, *, purpose: str, arguments: Sequence[str] = ()) ->
     else:
         raise LaunchError("managed_record_invalid")
     slot, _ = _content(root, "slot", installation)
-    verify_slot_files(slot)
+    # Only this successful controller check lends content inside this routing
+    # call. The selected slot still reopens files and walks its complete tree.
+    verify_slot_files(
+        slot,
+        verified_python=_dict(controller["resolved_python"]),
+        verified_packages=controller_packages,
+    )
     python = absolute(slot.get("lexical_python"))
     config = absolute(anchor.get("config_path"))
     data_dir = absolute(anchor.get("data_dir"))
