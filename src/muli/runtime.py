@@ -1901,6 +1901,14 @@ class Runtime:
             is not None
         )
         log_session = self.store.get("session", session_id) or {}
+        # Team registered this exact generation before its driver could run.
+        # Freeze only this run's terminal-failure notice before asynchronous logs
+        # can be consumed ahead of the terminal report's durable transaction.
+        notify_failure = (
+            not attention_origin
+            and consult is None
+            and not self.team.owns_run_report(session_id, run_id)
+        )
         log_scope = self.system_events.begin_run(
             run_id,
             session_id,
@@ -2030,7 +2038,7 @@ class Runtime:
                         "muli_code": "runtime_failed",
                         "muli_run_id": run_id,
                         "muli_session_id": session_id,
-                        "muli_notify": not attention_origin and consult is None,
+                        "muli_notify": notify_failure,
                     },
                 )
             reason = (

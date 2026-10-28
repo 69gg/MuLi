@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -9,10 +11,11 @@ from typing import Any
 
 import pytest
 from test_attention import attention_inputs, eventually
+from test_channel_ownership_policy import assigned, receive
 from test_runtime import FakeClient, make_runtime
 
 from muli.attention import AttentionInbox
-from muli.providers import Message, ModelTurn, StreamEvent
+from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.store import new_id
 
@@ -39,6 +42,432 @@ def fail_streams(runtime: Runtime, seen: list[list[Message]], *, count: int | No
             yield StreamEvent("done", turn=ModelTurn(content="已告知系统运行失败"))
 
     runtime.client_factory = lambda _: Failed([], seen)  # type: ignore[assignment,return-value]
+
+
+async def consume_until_idle(
+    runtime: Runtime, inbox: AttentionInbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    consumed = asyncio.Event()
+    original_consume = inbox._consume
+
+    async def observe_consume() -> bool:
+        progressed = await original_consume()
+        if (
+            inbox.cursor == runtime.store.event_position()
+            and not runtime.tasks
+            and runtime.system_events.status()["queued"] == 0
+        ):
+            consumed.set()
+        return progressed
+
+    monkeypatch.setattr(inbox, "_consume", observe_consume)
+    await inbox.start()
+    await asyncio.wait_for(consumed.wait(), 3)
+    await inbox.close()
+
+
+async def test_team_failure_with_durable_parent_report_does_not_reenter_main_via_system_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, main_requests = make_runtime(tmp_path, [])
+    # Construct the real consumer before the failure, but start it only after
+    # the original report and the asynchronous log have both fully settled.
+    inbox = inbox_for(runtime)
+    runtime.config.update(
+        {"models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}}}
+    )
+    await runtime.reconfigure()
+
+    def factory(config: ModelConfig) -> FakeClient:
+        class Client(FakeClient):
+            async def stream(
+                self, messages: list[Message], tools: list[dict[str, Any]]
+            ) -> AsyncIterator[StreamEvent]:
+                if config.model == "worker":
+                    raise ValueError("offline-worker-failure")
+                self.seen.append(list(messages))
+                assert len(self.seen) == 1, "原失败已有父报告，故障日志不应再次调用主模型"
+                yield StreamEvent("done", turn=ModelTurn(content="terminal-report-handled"))
+
+        return Client([], main_requests)
+
+    runtime.client_factory = factory  # type: ignore[assignment]
+    try:
+        await runtime.startup()
+        main_id = runtime.main_session()["id"]
+        worker = await runtime.team.spawn("failed-worker", "offline failure", parent_id=main_id)
+        team_tasks = tuple(runtime.team._tasks)
+        assert team_tasks
+        await asyncio.wait_for(asyncio.gather(*(asyncio.shield(task) for task in team_tasks)), 3)
+        if main_task := runtime.tasks.get(main_id):
+            await asyncio.wait_for(asyncio.shield(main_task), 3)
+        worker = runtime.team.get(worker["id"])
+        failed_run_id = worker["run_id"]
+        assert worker["status"] == "failed"
+        assert runtime.store.get("run", failed_run_id)["status"] == "failed"
+        report = runtime.store.get("team_report", failed_run_id)
+        assert report is not None
+        assert report["agent_id"] == worker["id"] and report["parent_id"] == main_id
+        assert report["execution_status"] == "failed" and report["status"] == "delivered"
+        report_inputs = runtime.store.db.execute(
+            "SELECT id,state,run_id FROM ingress WHERE session_id=? "
+            "AND json_extract(payload,'$.source')=? "
+            "AND json_extract(payload,'$.principal')=?",
+            (main_id, "team:" + worker["id"], "agent:" + worker["id"]),
+        ).fetchall()
+        assert len(report_inputs) == 1 and report_inputs[0]["state"] == "delivered"
+        assert len(main_requests) == 1 and not runtime.attention_busy
+
+        def log_persisted() -> bool:
+            return runtime.system_events.status()["queued"] == 0 and any(
+                record.get("run_id") == failed_run_id for record in runtime.store.list("system_log")
+            )
+
+        async with asyncio.timeout(3), runtime.bus.changed:
+            await runtime.bus.changed.wait_for(log_persisted)
+        failure_logs = [
+            record
+            for record in runtime.store.list("system_log")
+            if record.get("run_id") == failed_run_id
+        ]
+        assert len(failure_logs) == 1
+        failure_log = failure_logs[0]
+        assert failure_log["session_id"] == worker["id"]
+        assert failure_log["component"] == "runtime" and failure_log["code"] == "runtime_failed"
+
+        consumed = asyncio.Event()
+        original_consume = inbox._consume
+
+        async def observe_consume() -> bool:
+            progressed = await original_consume()
+            if (
+                inbox.cursor == runtime.store.event_position()
+                and not runtime.tasks
+                and runtime.system_events.status()["queued"] == 0
+            ):
+                consumed.set()
+            return progressed
+
+        # Observe a completed pass through the real scheduler; do not inject a
+        # log, report, attention receipt or ingress to manufacture the evidence.
+        monkeypatch.setattr(inbox, "_consume", observe_consume)
+        await inbox.start()
+        await asyncio.wait_for(consumed.wait(), 3)
+        await inbox.close()
+        log_receipts = [
+            receipt
+            for receipt in runtime.store.list("attention_receipt")
+            if receipt["kind"] == "system_log" and receipt["record_id"] == failure_log["id"]
+        ]
+        log_input_ids = {
+            hashlib.sha256(
+                f"{main_id}\0system:attention\0{receipt['batch_id']}".encode()
+            ).hexdigest()
+            for receipt in log_receipts
+        }
+        log_inputs = [
+            (row["id"], row["run_id"])
+            for row in runtime.store.db.execute(
+                "SELECT id,run_id FROM ingress WHERE session_id=? "
+                "AND json_extract(payload,'$.source')='system:attention' "
+                "AND json_extract(payload,'$.principal')='system:attention'",
+                (main_id,),
+            )
+            if row["id"] in log_input_ids
+        ]
+        assert log_inputs == [], f"failed_run={failed_run_id}; system_log={failure_log['id']}"
+        assert log_receipts == [] and len(main_requests) == 1
+        assert runtime.store.get("team_report", failed_run_id) == report
+        assert runtime.system_events.status()["queued"] == 0
+    finally:
+        await inbox.close()
+        await runtime.close()
+
+
+async def test_component_error_during_real_team_run_remains_notifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, main_requests = make_runtime(tmp_path, [])
+    inbox = inbox_for(runtime)
+    runtime.config.update(
+        {"models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}}}
+    )
+    await runtime.reconfigure()
+
+    def factory(config: ModelConfig) -> FakeClient:
+        class Client(FakeClient):
+            async def stream(
+                self, messages: list[Message], tools: list[dict[str, Any]]
+            ) -> AsyncIterator[StreamEvent]:
+                if config.model == "worker":
+                    assert runtime.system_logger is not None
+                    runtime.system_logger.error(
+                        "offline-component-failure",
+                        extra={"muli_component": "media", "muli_code": "media_failed"},
+                    )
+                else:
+                    self.seen.append(list(messages))
+                yield StreamEvent("done", turn=ModelTurn(content="handled"))
+
+        return Client([], main_requests)
+
+    runtime.client_factory = factory  # type: ignore[assignment]
+    try:
+        await runtime.startup()
+        main_id = runtime.main_session()["id"]
+        worker = await runtime.team.spawn("successful-worker", "offline task", parent_id=main_id)
+        await asyncio.wait_for(
+            asyncio.gather(*(asyncio.shield(task) for task in tuple(runtime.team._tasks))), 3
+        )
+        if main_task := runtime.tasks.get(main_id):
+            await asyncio.wait_for(asyncio.shield(main_task), 3)
+        worker = runtime.team.get(worker["id"])
+        assert worker["status"] == "completed" and len(main_requests) == 1
+        report = runtime.store.get("team_report", worker["run_id"])
+        assert report is not None and report["status"] == "delivered"
+        async with asyncio.timeout(3), runtime.bus.changed:
+            await runtime.bus.changed.wait_for(
+                lambda: (
+                    runtime.system_events.status()["persisted"] == 1
+                    and runtime.system_events.status()["queued"] == 0
+                )
+            )
+        record = runtime.store.list("system_log")[0]
+        assert record["run_id"] == worker["run_id"] and record["session_id"] == worker["id"]
+        assert record["component"] == "media" and record["code"] == "media_failed"
+        assert record["notify"] is True
+        await consume_until_idle(runtime, inbox, monkeypatch)
+        receipts = runtime.store.list("attention_receipt")
+        assert len(receipts) == 1 and receipts[0]["record_id"] == record["id"]
+        assert len(attention_inputs(runtime)) == 1 and len(main_requests) == 2
+        assert runtime.store.get("team_report", worker["run_id"]) == report
+    finally:
+        await inbox.close()
+        await runtime.close()
+
+
+async def test_owned_team_failure_with_local_report_keeps_system_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The shared prefix assigns a real, completed child through the owner's
+    # channel_delegate tool; the next real webhook reopens that same child.
+    async with assigned(tmp_path, monkeypatch) as (runtime, app, web, child_id):
+        inbox: AttentionInbox = app.state.attention
+        runtime.config.update({"attention": {"enabled": True, "coalesce_seconds": 0}})
+        # First enable skips old history. Establish that cursor before this
+        # failure, then let this same application consumer run after it settles.
+        await inbox.start()
+        await inbox.close()
+        main_id = runtime.main_session()["id"]
+        incoming = "受托渠道本轮仅核查本地状态。"
+        main_requests: list[list[Message]] = []
+        worker_requests: list[list[Message]] = []
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        def factory(config: ModelConfig) -> FakeClient:
+            class Client(FakeClient):
+                async def stream(
+                    self, messages: list[Message], tools: list[dict[str, Any]]
+                ) -> AsyncIterator[StreamEvent]:
+                    if config.model == "worker":
+                        worker_requests.append(list(messages))
+                        entered.set()
+                        await release.wait()
+                        raise ValueError("offline-owned-worker-failure")
+                    self.seen.append(list(messages))
+                    assert len(self.seen) == 1, "本地队友报告仅应产生一次独立故障提醒"
+                    trigger = runtime._latest_main_trigger(main_id)
+                    assert trigger is not None
+                    assert trigger["source"] == trigger["principal"] == "system:attention"
+                    yield StreamEvent("done", turn=ModelTurn(content="owned-failure-noted"))
+
+            return Client([], main_requests)
+
+        runtime.client_factory = factory  # type: ignore[assignment]
+        try:
+            lease = runtime.channel_ownership.for_agent(child_id)
+            assert lease is not None and lease["state"] == "active"
+            assert lease["main_id"] == main_id and lease["agent_id"] == child_id
+            manager = app.state.channel_application.manager
+            assert manager.deliveries() == []
+            await receive(web, incoming)
+            await asyncio.wait_for(entered.wait(), 3)
+            worker = runtime.team.get(child_id)
+            failed_run_id = worker["run_id"]
+            assert worker["generation"] == 2 and worker["status"] == "running"
+            supplied = next(
+                item
+                for item in runtime.store.messages(child_id)
+                if item["role"] == "user" and item["content"] == incoming
+            )
+            proof = runtime.channel_ownership.proof(lease)
+            assert supplied["channel_ownership"] == worker["channel_ownership"] == proof
+            assert supplied["run_id"] == failed_run_id
+            assert supplied["principal"] == "owner" and supplied["route"]["name"] == "onebot"
+            assert supplied["route"]["sender_id"] == supplied["route"]["target"] == "7"
+            assert len(worker_requests) == 1 and any(
+                message.source_message_id == supplied["id"] for message in worker_requests[0]
+            )
+            team_tasks = tuple(runtime.team._tasks)
+            assert team_tasks and not main_requests
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(task) for task in team_tasks)), 3
+            )
+            worker = runtime.team.get(child_id)
+            assert worker["status"] == "failed" and worker["run_id"] == failed_run_id
+            assert runtime.store.get("run", failed_run_id)["status"] == "failed"
+            report = runtime.store.get("team_report", failed_run_id)
+            assert report is not None and report["status"] == "local"
+            assert report["agent_id"] == child_id and report["parent_id"] == main_id
+            assert report["execution_status"] == "failed" and report["channel_ownership"] == proof
+            assert report["reply_origin"]["input_id"] == supplied["id"]
+            report_input_id = hashlib.sha256(
+                f"{main_id}\0team:{child_id}\0result:{failed_run_id}".encode()
+            ).hexdigest()
+            assert (
+                runtime.store.db.execute(
+                    "SELECT 1 FROM ingress WHERE id=?", (report_input_id,)
+                ).fetchone()
+                is None
+            )
+            assert not main_requests and not runtime.attention_busy
+            assert runtime.store.pending_inputs(main_id) == 0 and main_id not in runtime.tasks
+
+            def log_persisted() -> bool:
+                return runtime.system_events.status()["queued"] == 0 and any(
+                    record.get("run_id") == failed_run_id
+                    for record in runtime.store.list("system_log")
+                )
+
+            async with asyncio.timeout(3), runtime.bus.changed:
+                await runtime.bus.changed.wait_for(log_persisted)
+            records = [
+                record
+                for record in runtime.store.list("system_log")
+                if record.get("run_id") == failed_run_id
+            ]
+            assert len(records) == 1
+            record = records[0]
+            assert record["session_id"] == child_id
+            assert record["component"] == "runtime" and record["code"] == "runtime_failed"
+            await consume_until_idle(runtime, inbox, monkeypatch)
+            receipts = [
+                item
+                for item in runtime.store.list("attention_receipt")
+                if item["kind"] == "system_log" and item["record_id"] == record["id"]
+            ]
+            assert record["notify"] is True
+            assert len(receipts) == 1
+            notice_input_id = hashlib.sha256(
+                f"{main_id}\0system:attention\0{receipts[0]['batch_id']}".encode()
+            ).hexdigest()
+            notices = runtime.store.db.execute(
+                "SELECT id,run_id,state,payload FROM ingress WHERE session_id=? "
+                "AND json_extract(payload,'$.source')='system:attention' "
+                "AND json_extract(payload,'$.principal')='system:attention'",
+                (main_id,),
+            ).fetchall()
+            assert len(notices) == 1 and notices[0]["id"] == notice_input_id
+            notice = notices[0]
+            assert notice["state"] == "delivered" and len(main_requests) == 1
+            assert runtime.store.get("run", notice["run_id"])["status"] == "completed"
+            assert runtime.store.get("team_report", failed_run_id) == report
+            assert runtime.channel_ownership.for_agent(child_id) == lease
+            assert manager.deliveries() == [] and runtime.system_events.status()["queued"] == 0
+        finally:
+            release.set()
+            await inbox.close()
+
+
+@pytest.mark.parametrize("missing_proof", ["team_kind_only", "old_agent_run", "no_active_runner"])
+async def test_failure_without_exact_live_team_report_owner_keeps_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_proof: str
+) -> None:
+    runtime, main_requests = make_runtime(tmp_path, [])
+    inbox = inbox_for(runtime)
+    runtime.config.update(
+        {"models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}}}
+    )
+    await runtime.reconfigure()
+
+    def factory(config: ModelConfig) -> FakeClient:
+        class Client(FakeClient):
+            async def stream(
+                self, messages: list[Message], tools: list[dict[str, Any]]
+            ) -> AsyncIterator[StreamEvent]:
+                if config.model == "worker":
+                    raise ValueError("offline-worker-failure")
+                self.seen.append(list(messages))
+                yield StreamEvent("done", turn=ModelTurn(content="handled"))
+
+        return Client([], main_requests)
+
+    runtime.client_factory = factory  # type: ignore[assignment]
+    original_emit = runtime.bus.emit
+    invalidated: list[str] = []
+
+    async def invalidate_report_owner(
+        event_type: str, data: dict[str, Any], session_id: str | None = None
+    ) -> dict[str, Any]:
+        agent = data.get("agent", {})
+        if not invalidated and event_type == "team.updated" and agent.get("status") == "running":
+            # Team has registered its real driver and persisted the generation,
+            # but the first await has not yet allowed that driver to start.
+            if missing_proof == "old_agent_run":
+                runtime.store.put("agent", {**agent, "run_id": new_id()})
+            elif missing_proof == "no_active_runner":
+                runner = runtime.team._active.pop(agent["id"])
+                assert runner is asyncio.current_task()
+            invalidated.append(missing_proof)
+        return await original_emit(event_type, data, session_id)
+
+    monkeypatch.setattr(runtime.bus, "emit", invalidate_report_owner)
+    try:
+        await runtime.startup()
+        main_id = runtime.main_session()["id"]
+        if missing_proof == "team_kind_only":
+            session = runtime.new_session()
+            session["kind"] = "team"
+            runtime.store.put("session", session)
+            runtime.store.add_message(session["id"], "user", "offline task")
+            failed_run_id = runtime._launch(session, "worker", "ask")
+            with pytest.raises(ValueError, match="offline-worker-failure"):
+                await runtime.wait(failed_run_id)
+            assert runtime.store.get("agent", session["id"]) is None
+            assert runtime.store.get("team_report", failed_run_id) is None
+            assert len(main_requests) == 0
+        else:
+            worker = await runtime.team.spawn("unproven-worker", "offline task", parent_id=main_id)
+            await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(task) for task in tuple(runtime.team._tasks))), 3
+            )
+            if main_task := runtime.tasks.get(main_id):
+                await asyncio.wait_for(asyncio.shield(main_task), 3)
+            worker = runtime.team.get(worker["id"])
+            failed_run_id = worker["run_id"]
+            assert invalidated == [missing_proof]
+            assert worker["status"] == "failed" and len(main_requests) == 1
+        baseline_requests = len(main_requests)
+        async with asyncio.timeout(3), runtime.bus.changed:
+            await runtime.bus.changed.wait_for(
+                lambda: (
+                    runtime.system_events.status()["persisted"] == 1
+                    and runtime.system_events.status()["queued"] == 0
+                )
+            )
+        record = runtime.store.list("system_log")[0]
+        assert record["run_id"] == failed_run_id
+        assert record["component"] == "runtime" and record["code"] == "runtime_failed"
+        assert record["notify"] is True
+        await consume_until_idle(runtime, inbox, monkeypatch)
+        receipts = runtime.store.list("attention_receipt")
+        assert len(receipts) == 1 and receipts[0]["record_id"] == record["id"]
+        assert len(attention_inputs(runtime)) == 1
+        assert len(main_requests) == baseline_requests + 1
+    finally:
+        await inbox.close()
+        await runtime.close()
 
 
 @pytest.mark.parametrize("notification_fails", [False, True])

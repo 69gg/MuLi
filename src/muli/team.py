@@ -375,6 +375,44 @@ class TeamManager:
             "duplicate": not inserted,
         }
 
+    def owns_run_report(self, session_id: str, run_id: str) -> bool:
+        """Only a live managed generation owns its terminal parent-report path."""
+        runner = self._active.get(session_id)
+        driver = asyncio.current_task()
+        if (
+            runner is None
+            or runner.done()
+            or runner not in self._tasks
+            or driver is None
+            or self.runtime.tasks.get(session_id) is not driver
+            or self.runtime.run_ids.get(session_id) != run_id
+        ):
+            return False
+        agent = self.runtime.store.get("agent", session_id)
+        run = self.runtime.store.get("run", run_id)
+        if (
+            agent is None
+            or run is None
+            or agent.get("id") != session_id
+            or agent.get("session_id") != session_id
+            or agent.get("status") != "running"
+            or agent.get("run_id") != run_id
+            or "channel_ownership" in agent
+            or type(agent.get("generation")) is not int
+            or agent["generation"] < 1
+            or run.get("id") != run_id
+            or run.get("session_id") != session_id
+            or run.get("status") not in {"queued", "running"}
+            or not isinstance(agent.get("parent_id"), str)
+        ):
+            return False
+        parent = self.runtime.store.get("session", agent["parent_id"])
+        return (
+            parent is not None
+            and parent.get("id") == agent["parent_id"]
+            and parent.get("kind") in {"main", "team"}
+        )
+
     async def _progress(
         self,
         caller: str,
