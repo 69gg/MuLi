@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import math
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -12,9 +13,25 @@ from muli.events import EventBus
 from muli.evidence import validate_integer
 from muli.maintenance import Admission
 from muli.proactive import FrozenRouting
+from muli.reminder_calendar import next_after, normalize_calendar
 from muli.reminder_followup import followup_binding, task_status
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
+
+_REMINDER_KINDS = ("reminder", "calendar_reminder")
+_FOLLOWUP_FIELDS = ("commitment_id", "followup", "followup_revision", "followup_occurrence")
+
+
+def reminder_kind(value: object) -> str:
+    if not isinstance(value, str) or value not in _REMINDER_KINDS:
+        raise ValueError("未知提醒类型")
+    return value
+
+
+def _calendar_rule(item: dict[str, Any]) -> dict[str, Any]:
+    if any(field in item for field in _FOLLOWUP_FIELDS) or item.get("interval_seconds") is not None:
+        raise ValueError("日历提醒不能绑定任务或固定间隔")
+    return dict(normalize_calendar(item.get("calendar")))
 
 
 class Reminders:
@@ -57,7 +74,48 @@ class Reminders:
             raise ValueError("提醒时间必须在未来")
         if interval_seconds is not None and not 60 <= interval_seconds <= 31_536_000:
             raise ValueError("重复间隔需为60秒至一年")
-        item = {
+        item = self._record(title, content, due_at, interval_seconds, reply_origin)
+        if commitment_id is not None:
+            self._bind(item, commitment_id, 1)
+        self.store.put("reminder", item)
+        self.changed.set()
+        return item
+
+    def create_calendar(
+        self,
+        title: str,
+        timezone: str,
+        local_time: str,
+        weekdays: list[int],
+        content: str = "",
+        *,
+        reply_origin: ReplyOrigin | None = None,
+    ) -> dict[str, Any]:
+        if not title.strip() or len(title) > 120 or len(content) > 4000:
+            raise ValueError("提醒标题或内容长度无效")
+        rule = normalize_calendar(
+            {
+                "version": 1,
+                "timezone": timezone,
+                "local_time": local_time,
+                "weekdays": weekdays,
+            }
+        )
+        item = self._record(title, content, next_after(rule, now()), None, reply_origin)
+        item["calendar"] = rule
+        self.store.put("calendar_reminder", item)
+        self.changed.set()
+        return {**item, "kind": "calendar_reminder"}
+
+    @staticmethod
+    def _record(
+        title: str,
+        content: str,
+        due_at: float,
+        interval_seconds: int | None,
+        reply_origin: ReplyOrigin | None,
+    ) -> dict[str, Any]:
+        return {
             "id": new_id(),
             "title": title.strip(),
             "content": content,
@@ -69,16 +127,19 @@ class Reminders:
             "fired_count": 0,
             "routing": FrozenRouting.bound(reply_origin or ReplyOrigin()).dump(),
         }
-        if commitment_id is not None:
-            self._bind(item, commitment_id, 1)
-        self.store.put("reminder", item)
-        self.changed.set()
-        return item
 
-    def update(self, identifier: str, changes: dict[str, Any]) -> dict[str, Any]:
-        item = self.store.get("reminder", identifier)
+    def update(
+        self, identifier: str, changes: dict[str, Any], *, kind: str = "reminder"
+    ) -> dict[str, Any]:
+        kind = reminder_kind(kind)
+        item = self.store.get(kind, identifier)
         if item is None:
             raise KeyError(identifier)
+        item.pop("kind", None)  # Namespace is host metadata, never a persisted selector.
+        if kind == "calendar_reminder":
+            _calendar_rule(item)
+            if set(changes) & {"interval_seconds", "commitment_id"}:
+                raise ValueError("日历提醒只能调整下一次时间或提醒内容")
         if set(changes) - {
             "title",
             "content",
@@ -123,17 +184,17 @@ class Reminders:
             candidate["followup_revision"] = revision
             if selected is not None:
                 self._bind(candidate, selected, revision)
-        self.store.put("reminder", candidate)
+        self.store.put(kind, candidate)
         self.changed.set()
-        return candidate
+        return {**candidate, "kind": kind} if kind == "calendar_reminder" else candidate
 
     def _bind(self, item: dict[str, Any], identifier: str, revision: int) -> None:
         task_status(self.store, identifier, self.max_output_chars())
         item["followup_revision"] = revision
         item["followup"] = {"version": 1, "commitment_id": identifier, "revision": revision}
 
-    def delete(self, identifier: str) -> bool:
-        deleted = self.store.delete("reminder", identifier)
+    def delete(self, identifier: str, *, kind: str = "reminder") -> bool:
+        deleted = self.store.delete(reminder_kind(kind), identifier)
         self.changed.set()
         return deleted
 
@@ -175,23 +236,43 @@ class Reminders:
             self._clock_blocked = True
         return self._clock_blocked
 
+    def records(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.store.db.execute(
+            "SELECT kind,id,data FROM objects WHERE kind IN (?,?) ORDER BY updated DESC LIMIT ?",
+            (*_REMINDER_KINDS, limit),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = json.loads(row["data"])
+            if not isinstance(item, dict) or item.get("id") != row["id"]:
+                raise ValueError("提醒记录身份无效")
+            result.append({**item, "kind": row["kind"]})
+        return result
+
     def _active_reminders(self) -> list[dict[str, Any]]:
-        return [item for item in self.store.list("reminder", 10000) if item["enabled"]]
+        return [item for item in self.records(10000) if item["enabled"]]
 
     async def _fire(self, item: dict[str, Any], timestamp: float) -> None:
         await self.admission.wait()
         with self.admission.operation():
-            await self._fire_admitted(item, timestamp)
+            await self._fire_admitted(item, now())
 
     async def _fire_admitted(self, item: dict[str, Any], timestamp: float) -> None:
-        current = self.store.get("reminder", item["id"])
-        if not current or not current["enabled"] or current["due_at"] != item["due_at"]:
+        kind = reminder_kind(item.get("kind", "reminder"))
+        current = self.store.get(kind, item["id"])
+        if (
+            not current
+            or not current["enabled"]
+            or current["due_at"] != item["due_at"]
+            or current["due_at"] > timestamp
+        ):
             return
-        binding = followup_binding(current)
-        # A task-bound reminder uses one current snapshot after the admission await.
-        selected = current if "followup_revision" in current else item
+        calendar = _calendar_rule(current) if kind == "calendar_reminder" else None
+        current.pop("kind", None)
+        binding = followup_binding(current) if calendar is None else None
+        selected = current
         notice = {
-            "id": f"reminder:{selected['id']}:{selected['due_at']}",
+            "id": f"{kind}:{selected['id']}:{selected['due_at']}",
             "title": selected["title"],
             "content": selected["content"],
             "source": "reminder",
@@ -200,6 +281,8 @@ class Reminders:
             "reminder_id": item["id"],
             "routing": FrozenRouting.load(current.get("routing")).dump(),
         }
+        if calendar is not None:
+            notice["reminder_kind"] = kind
         if binding is not None:
             notice["followup"] = binding
             notice["followup_occurrence"] = {
@@ -209,7 +292,9 @@ class Reminders:
         interval = selected["interval_seconds"]
         current["last_fired_at"] = timestamp
         current["fired_count"] += 1
-        if interval:
+        if calendar is not None:
+            current["due_at"] = next_after(calendar, timestamp)
+        elif interval:
             # Coalesce missed occurrences after downtime; never emit a catch-up storm.
             missed = math.floor(max(0, timestamp - selected["due_at"]) / interval) + 1
             current["due_at"] = selected["due_at"] + missed * interval
@@ -219,14 +304,14 @@ class Reminders:
             self.store._event(
                 "notification.created",
                 notice,
-                objects=[("notification", notice), ("reminder", current)],
+                objects=[("notification", notice), (kind, current)],
             )
-            self.store._event("reminder.updated", current)
+            self.store._event("reminder.updated", {**current, "kind": kind})
         await self.bus.notify()
 
     async def _run(self) -> None:
-        failed_reminders: set[str] = set()
-        retry_reminders: set[str] = set()
+        failed_reminders: set[tuple[str, str]] = set()
+        retry_reminders: set[tuple[str, str]] = set()
         catalog_failed = False
         retry_catalog = False
         while True:
@@ -239,7 +324,7 @@ class Reminders:
             if not catalog_failed:
                 try:
                     active = self._active_reminders()
-                    identifiers = {item["id"] for item in active}
+                    identifiers = {(item["kind"], item["id"]) for item in active}
                 except Exception:
                     if self._park_unsettled_transaction():
                         continue
@@ -252,7 +337,7 @@ class Reminders:
                     for item in active:
                         if self._clock_blocked:
                             break
-                        identifier = item["id"]
+                        identifier = (item["kind"], item["id"])
                         if identifier in failed_reminders:
                             continue
                         try:
@@ -278,13 +363,13 @@ class Reminders:
             if not catalog_failed:
                 try:
                     active = self._active_reminders()
-                    identifiers = {item["id"] for item in active}
+                    identifiers = {(item["kind"], item["id"]) for item in active}
                     failed_reminders.intersection_update(identifiers)
                     retry_reminders.intersection_update(identifiers)
                     deadlines = [
                         float(item["due_at"])
                         for item in active
-                        if item["id"] not in failed_reminders
+                        if (item["kind"], item["id"]) not in failed_reminders
                     ]
                 except Exception:
                     if self._park_unsettled_transaction():

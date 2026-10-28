@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -9,6 +10,13 @@ import muli.reminders as reminders
 from muli.events import EventBus
 from muli.reminders import Reminders
 from muli.store import Store, now
+
+
+async def fire_due(engine: Reminders, item: dict[str, Any]) -> None:
+    """Advance the actual clock for tests that previously passed a future snapshot."""
+    with pytest.MonkeyPatch.context() as clock:
+        clock.setattr(reminders, "now", lambda: item["due_at"])
+        await engine._fire(item, item["due_at"])
 
 
 class ObservedEvent(asyncio.Event):
@@ -87,11 +95,14 @@ async def test_early_wakeups_and_clock_rollback_do_not_fire_before_deadline(
         store.close()
 
 
-async def test_missed_recurrences_coalesce_without_storm(tmp_path: Path) -> None:
+async def test_missed_recurrences_coalesce_without_storm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = Store(tmp_path / "state.db")
     engine = Reminders(store, EventBus(store))
     item = engine.create("每分钟", now() + 5, interval_seconds=60)
     timestamp = item["due_at"] + 180
+    monkeypatch.setattr(reminders, "now", lambda: timestamp)
     await engine._fire(item, timestamp)
     await engine._fire(item, timestamp)
     assert len(store.list("notification")) == 1

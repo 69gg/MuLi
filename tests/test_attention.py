@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
+from test_reminders import fire_due
 from test_runtime import FakeClient, make_runtime
 
 from muli.attention import AttentionInbox
@@ -36,7 +37,7 @@ async def reminder(
     runtime: Runtime, title: str = "喝水", content: str = "提醒资料"
 ) -> dict[str, Any]:
     item = runtime.reminders.create(title, now() + 60, content)
-    await runtime.reminders._fire(item, item["due_at"])
+    await fire_due(runtime.reminders, item)
     notice = runtime.store.get("notification", f"reminder:{item['id']}:{item['due_at']}")
     assert notice is not None
     return notice

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from test_reminders import fire_due
 
 import muli.notifications as notifications
 from muli.config import ConfigFile, DesktopNotifications, Settings
@@ -307,7 +308,7 @@ async def test_timeout_isolated_from_reminders_and_worker_can_recover(
     await notifier.start()
     reminders = Reminders(notifier.store, notifier.bus)
     reminder = reminders.create("应该正常触发", now() + 1, "正文")
-    await reminders._fire(reminder, now() + 1)
+    await fire_due(reminders, reminder)
     await until(lambda: notifier.status()["failed"] == 1)
     assert cancelled.is_set() and notifier.status()["status"] == "error"
     assert len(notifier.store.list("notification")) == 1

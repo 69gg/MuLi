@@ -688,6 +688,10 @@ def _notification_source(
         )
     ):
         return None
+    if ("reminder_kind" in data) != ("reminder_kind" in notice) or data.get(
+        "reminder_kind"
+    ) != notice.get("reminder_kind"):
+        return None
     kind = notice.get("source")
     if kind not in {"reminder", "update"} or kind not in enabled:
         return None
@@ -699,16 +703,27 @@ def _notification_source(
         reminder_id = notice.get("reminder_id")
         if not isinstance(reminder_id, str):
             return None
-        reminder = store.get("reminder", reminder_id)
+        namespace = notice.get("reminder_kind", "reminder")
+        if not isinstance(namespace, str) or namespace not in {"reminder", "calendar_reminder"}:
+            return None
+        reminder = store.get(namespace, reminder_id)
         if (
             reminder is None
             or not reminder.get("fired_count")
-            or not identifier.startswith(f"reminder:{reminder_id}:")
+            or not identifier.startswith(f"{namespace}:{reminder_id}:")
             or routing != FrozenRouting.load(reminder.get("routing"))
             or routing.classification == "independent"
         ):
             return None
-        if "followup" in notice or "followup_occurrence" in notice or "followup" in reminder:
+        if namespace == "calendar_reminder" and any(
+            field in record
+            for record in (data, notice, reminder)
+            for field in ("commitment_id", "followup", "followup_revision", "followup_occurrence")
+        ):
+            return None
+        if namespace == "reminder" and (
+            "followup" in notice or "followup_occurrence" in notice or "followup" in reminder
+        ):
             if max_output_chars is None:
                 return None
             reminder_proof = read_followup_notice(store, identifier, max_output_chars)

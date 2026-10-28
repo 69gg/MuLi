@@ -743,7 +743,7 @@ function startGlobalEvents(owner = connection) {
     }
     if (event.type === "reminder.updated") {
       const item = event.data;
-      if (item?.id) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id)];
+      if (item?.id && ["reminder", "calendar_reminder"].includes(reminderKind(item))) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id || reminderKind(entry) !== reminderKind(item))];
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
     if (event.type.startsWith("team.") && state.view === "team") void refreshTeam({}, owner);
@@ -2459,6 +2459,22 @@ function intervalLabel(seconds) {
   return `每 ${seconds} 秒`;
 }
 
+function reminderKind(item) { return item.kind === undefined ? "reminder" : item.kind; }
+
+function findReminder(id, kind = "reminder") {
+  if (!["reminder", "calendar_reminder"].includes(kind)) return undefined;
+  return state.reminders.find((entry) => String(entry.id) === String(id) && reminderKind(entry) === kind);
+}
+
+function reminderPath(item) { return `/reminders/${encodeURIComponent(item.id)}?${new URLSearchParams({ kind: reminderKind(item) })}`; }
+
+function calendarLabel(rule) {
+  if (!rule || typeof rule.timezone !== "string" || typeof rule.local_time !== "string" || !Array.isArray(rule.weekdays)) return "日历规则不可用";
+  const days = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  const weekdays = rule.weekdays.length === 7 ? "每天" : rule.weekdays.map((day) => days[day]).join("、");
+  return `${rule.timezone} · ${rule.local_time} · ${weekdays}`;
+}
+
 function renderReminders() {
   if (state.remindersError) {
     const empty = emptyState("info", "暂时无法读取提醒", state.remindersError);
@@ -2469,14 +2485,17 @@ function renderReminders() {
   if (!state.reminders.length) root.append(emptyState("bell", "还没有提醒", "选择时间，添加一次或重复提醒。"));
   const sorted = [...state.reminders].sort((first, second) => Number(second.enabled) - Number(first.enabled) || first.due_at - second.due_at);
   for (const item of sorted) {
-    const completed = !item.enabled && !item.interval_seconds && item.fired_count > 0;
-    root.append(element("article", { class: `notification-row reminder-row${item.enabled ? "" : " paused"}` }, element("div", { class: "row-icon" }, icon("bell")), element("div", { class: "row-content" }, element("h3", { text: item.title }), item.content && element("p", { text: item.content }), element("div", { class: "row-meta" }, element("time", { text: formatFullDate(item.due_at) }), element("span", { class: "row-tag", text: intervalLabel(item.interval_seconds) }), element("span", { text: item.enabled ? "已启用" : completed ? "已完成" : "已暂停" }), item.fired_count > 0 && element("span", { text: `已提醒 ${item.fired_count} 次` }))), element("div", { class: "row-actions" }, actionButton("改期", "edit-reminder", "text-button", undefined, { id: item.id }), iconButton(item.enabled ? "暂停提醒" : "启用提醒", "toggle-reminder", item.enabled ? "stop" : "play", { id: item.id }), iconButton("删除提醒", "delete-reminder", "trash", { id: item.id }))));
+    const kind = reminderKind(item), calendar = kind === "calendar_reminder";
+    const completed = !calendar && !item.enabled && !item.interval_seconds && item.fired_count > 0;
+    root.append(element("article", { class: `notification-row reminder-row${item.enabled ? "" : " paused"}` }, element("div", { class: "row-icon" }, icon("bell")), element("div", { class: "row-content" }, element("h3", { text: item.title }), item.content && element("p", { text: item.content }), element("div", { class: "row-meta" }, element("time", { text: formatFullDate(item.due_at) }), element("span", { class: "row-tag", text: calendar ? calendarLabel(item.calendar) : intervalLabel(item.interval_seconds) }), element("span", { text: item.enabled ? "已启用" : completed ? "已完成" : "已暂停" }), item.fired_count > 0 && element("span", { text: `已提醒 ${item.fired_count} 次` }))), element("div", { class: "row-actions" }, actionButton("改期", "edit-reminder", "text-button", undefined, { id: item.id, kind }), iconButton(item.enabled ? "暂停提醒" : "启用提醒", "toggle-reminder", item.enabled ? "stop" : "play", { id: item.id, kind }), iconButton("删除提醒", "delete-reminder", "trash", { id: item.id, kind }))));
   }
   return root;
 }
 
-function editReminder(id) {
-  const item = state.reminders.find((entry) => String(entry.id) === String(id));
+function editReminder(id, kind = "reminder") {
+  const item = id === undefined ? null : findReminder(id, kind);
+  if (id !== undefined && !item) return;
+  const calendar = item && reminderKind(item) === "calendar_reminder";
   const standardIntervals = [3600, 86400, 604800];
   const intervalValue = !item?.interval_seconds ? "once" : standardIntervals.includes(item.interval_seconds) ? String(item.interval_seconds) : "custom";
   const custom = field("间隔（秒）", "custom-interval", item?.interval_seconds ?? 3600, { type: "number", min: 60, max: 31536000 });
@@ -2484,27 +2503,30 @@ function editReminder(id) {
   const interval = selectField("重复", "interval", intervalValue, [["once", "不重复"], ["3600", "每小时"], ["86400", "每天"], ["604800", "每周"], ["custom", "自定义"]]);
   $("select", interval).addEventListener("change", (event) => { custom.hidden = event.target.value !== "custom"; });
   const due = item?.due_at > Date.now() / 1000 ? item.due_at : Date.now() / 1000 + 3600;
-  const content = element("div", {}, field("标题", "title", item?.title ?? "", { required: true, maxLength: 120 }), field("时间", "due_at", toDateTimeLocal(due), { type: "datetime-local", required: true }), interval, custom, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 3, placeholder: "可选", maxLength: 4000 }), item && switchField("启用提醒", "enabled", item.enabled));
+  const content = element("div", {}, field("标题", "title", item?.title ?? "", { required: true, maxLength: 120 }), field("时间", "due_at", toDateTimeLocal(due), { type: "datetime-local", required: true }), !calendar && interval, !calendar && custom, field("内容", "content", item?.content ?? "", { type: "textarea", rows: 3, placeholder: "可选", maxLength: 4000 }), item && switchField("启用提醒", "enabled", item.enabled));
   openDialog({ title: item ? "编辑提醒" : "新建提醒", content, submitLabel: item ? "保存提醒" : "创建提醒", onSubmit: async (form) => {
     const data = new FormData(form);
     const dueAt = fromDateTimeLocal(String(data.get("due_at")));
     const enabled = item ? data.get("enabled") === "on" : true;
     if (enabled && dueAt <= Date.now() / 1000) throw new Error("请选择一个未来时间。");
-    const selected = data.get("interval");
-    const intervalSeconds = selected === "once" ? null : selected === "custom" ? Number(data.get("custom-interval")) : Number(selected);
-    if (intervalSeconds !== null && (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 31536000)) throw new Error("重复间隔需为 60 秒至一年。");
-    const payload = { title: String(data.get("title")).trim(), content: String(data.get("content")).trim(), due_at: dueAt, interval_seconds: intervalSeconds, ...(item ? { enabled } : {}) };
-    await request(item ? `/reminders/${encodeURIComponent(item.id)}` : "/reminders", { method: item ? "PATCH" : "POST", body: payload });
+    const payload = { title: String(data.get("title")).trim(), content: String(data.get("content")).trim(), due_at: dueAt, ...(item ? { enabled } : {}) };
+    if (!calendar) {
+      const selected = data.get("interval");
+      const intervalSeconds = selected === "once" ? null : selected === "custom" ? Number(data.get("custom-interval")) : Number(selected);
+      if (intervalSeconds !== null && (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 31536000)) throw new Error("重复间隔需为 60 秒至一年。");
+      payload.interval_seconds = intervalSeconds;
+    }
+    await request(item ? reminderPath(item) : "/reminders", { method: item ? "PATCH" : "POST", body: payload });
     toast(item ? "提醒已更新" : "提醒已创建"); await switchView("notifications");
   } });
 }
 
-async function toggleReminder(id, button) {
-  const item = state.reminders.find((entry) => String(entry.id) === String(id));
+async function toggleReminder(id, button, kind = "reminder") {
+  const item = findReminder(id, kind);
   if (!item) return;
-  if (!item.enabled && item.due_at <= Date.now() / 1000) { editReminder(id); return; }
+  if (!item.enabled && item.due_at <= Date.now() / 1000) { editReminder(id, kind); return; }
   button.disabled = true;
-  try { await request(`/reminders/${encodeURIComponent(id)}`, { method: "PATCH", body: { enabled: !item.enabled } }); await switchView("notifications"); }
+  try { await request(reminderPath(item), { method: "PATCH", body: { enabled: !item.enabled } }); await switchView("notifications"); }
   finally { button.disabled = false; }
 }
 
@@ -3199,9 +3221,12 @@ async function handleAction(action, button) {
   if (action === "delete-workflow") confirmAction("删除工作流", "此工作流定义会被删除，已有会话保留。", "删除工作流", async () => { await request(`/workflows/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("workflows"); toast("工作流已删除"); });
   if (action === "read-notification") await markRead(button.dataset.id);
   if (action === "new-reminder") editReminder();
-  if (action === "edit-reminder") editReminder(button.dataset.id);
-  if (action === "toggle-reminder") await toggleReminder(button.dataset.id, button);
-  if (action === "delete-reminder") confirmAction("删除提醒", "删除后不再发送这条提醒，已收到的通知会保留。", "删除提醒", async () => { await request(`/reminders/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("notifications"); toast("提醒已删除"); });
+  if (action === "edit-reminder") editReminder(button.dataset.id, button.dataset.kind);
+  if (action === "toggle-reminder") await toggleReminder(button.dataset.id, button, button.dataset.kind);
+  if (action === "delete-reminder") {
+    const item = findReminder(button.dataset.id, button.dataset.kind);
+    if (item) confirmAction("删除提醒", "删除后不再发送这条提醒，已收到的通知会保留。", "删除提醒", async () => { await request(reminderPath(item), { method: "DELETE" }); await switchView("notifications"); toast("提醒已删除"); });
+  }
   if (action === "read-all") {
     const results = await Promise.allSettled(state.notifications.filter((item) => !item.read).map((item) => request(`/notifications/${encodeURIComponent(item.id)}`, { method: "PATCH", body: { read: true } })));
     if (results.some((result) => result.status === "rejected")) toast("部分通知未能更新，请重试。", true);

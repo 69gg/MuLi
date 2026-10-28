@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from test_reminders import fire_due
+
 from muli.commitments import Commitments
 from muli.events import EventBus
 from muli.reminder_followup import read_followup_notice
@@ -30,7 +32,7 @@ async def test_oversized_integer_timestamp_rejects_only_the_corrupt_notice(tmp_p
             commitment_id=task["id"],
             reply_origin=ReplyOrigin("web"),
         )
-        await reminders._fire(item, item["due_at"])
+        await fire_due(reminders, item)
         identifier = f"reminder:{item['id']}:{item['due_at']}"
         event = next(
             event
@@ -63,7 +65,7 @@ async def test_oversized_integer_timestamp_rejects_only_the_corrupt_notice(tmp_p
         # The same production source reader still selects a subsequent real,
         # ordinary notice; this is source isolation, not a model-consumption claim.
         following = reminders.create("后续有效提醒", now() + 120)
-        await reminders._fire(following, following["due_at"])
+        await fire_due(reminders, following)
         following_id = f"reminder:{following['id']}:{following['due_at']}"
         following_event = next(
             current

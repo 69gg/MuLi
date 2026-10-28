@@ -60,7 +60,7 @@ from muli.providers import (
     ToolCall,
 )
 from muli.reminder_followup import followup_binding, task_status
-from muli.reminders import Reminders
+from muli.reminders import Reminders, reminder_kind
 from muli.reply_origin import ReplyOrigin
 from muli.shell_sessions import ShellSessionError, ShellSessions
 from muli.store import LifecycleKind, Store, new_id, now
@@ -1564,6 +1564,7 @@ class Runtime:
         self._coordinator_tools.update(
             {
                 "reminder_schedule",
+                "reminder_schedule_calendar",
                 "reminder_cancel",
                 "reminder_reschedule",
                 "workflow_schedule",
@@ -3045,24 +3046,32 @@ class Runtime:
             await self.bus.emit("reminder.updated", item)
             return item
 
+        async def schedule_calendar(args: dict[str, Any]) -> Any:
+            item = self.reminders.create_calendar(**args, reply_origin=self.current_reply_origin())
+            await self.bus.emit("reminder.updated", item)
+            return item
+
         async def list_reminders(args: dict[str, Any]) -> Any:
-            return self.store.list("reminder")
+            return self.reminders.records()
 
         async def cancel_reminder(args: dict[str, Any]) -> Any:
-            return {"deleted": self.reminders.delete(args["id"])}
+            return {"deleted": self.reminders.delete(args["id"], kind=args.get("kind", "reminder"))}
 
         async def reschedule_reminder(args: dict[str, Any]) -> Any:
             self.maintenance.admission.require()
-            item = self.store.get("reminder", args["id"])
+            kind = reminder_kind(args.get("kind", "reminder"))
+            item = self.store.get(kind, args["id"])
             if item is None:
                 raise KeyError(args["id"])
-            binding = followup_binding(item)
+            binding = followup_binding(item) if kind == "reminder" else None
             if binding is not None and task_status(
                 self.store, binding["commitment_id"], self.config.settings.limits.max_output_chars
             ) in {"done", "cancelled"}:
                 raise ValueError("已完成或已取消的目标不能重新约定复盘")
             # No await between validating the current binding and the original update.
-            updated = self.reminders.update(args["id"], {"due_at": args["due_at"], "enabled": True})
+            updated = self.reminders.update(
+                args["id"], {"due_at": args["due_at"], "enabled": True}, kind=kind
+            )
             await self.bus.emit("reminder.updated", updated)
             return updated
 
@@ -3352,11 +3361,45 @@ class Runtime:
                 schedule,
                 "write",
             ),
-            Tool("reminder_list", "查看提醒及下一次触发时间", parameters({}), list_reminders),
+            Tool(
+                "reminder_schedule_calendar",
+                "按指定地区当地时间重复提醒。weekdays为ISO星期1至7，工作日仅指周一至周五；"
+                "夏令时不存在的时刻跳过该日，重复时刻只取较早一次。停机错过合并一次。",
+                parameters(
+                    {
+                        "title": string(),
+                        "timezone": string("明确IANA地区，如Asia/Shanghai"),
+                        "local_time": string("当地24小时制HH:MM"),
+                        "weekdays": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 7,
+                            "uniqueItems": True,
+                            "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                        },
+                        "content": string(),
+                    },
+                    ("title", "timezone", "local_time", "weekdays"),
+                ),
+                schedule_calendar,
+                "write",
+            ),
+            Tool(
+                "reminder_list",
+                "查看提醒类型、规则及下一次触发时间",
+                parameters({}),
+                list_reminders,
+            ),
             Tool(
                 "reminder_cancel",
                 "删除指定提醒",
-                parameters({"id": string()}, ("id",)),
+                parameters(
+                    {
+                        "id": string(),
+                        "kind": {"type": "string", "enum": ["reminder", "calendar_reminder"]},
+                    },
+                    ("id",),
+                ),
                 cancel_reminder,
                 "write",
             ),
@@ -3364,7 +3407,14 @@ class Runtime:
                 "reminder_reschedule",
                 "将已有提醒改到未来 Unix 秒并重新启用；保留原 ID、历史和回复渠道。"
                 "先读取准确提醒 ID；周期提醒只改下一次时间，不撤回已经处理的通知。",
-                parameters({"id": string(), "due_at": {"type": "number"}}, ("id", "due_at")),
+                parameters(
+                    {
+                        "id": string(),
+                        "due_at": {"type": "number"},
+                        "kind": {"type": "string", "enum": ["reminder", "calendar_reminder"]},
+                    },
+                    ("id", "due_at"),
+                ),
                 reschedule_reminder,
                 "write",
             ),

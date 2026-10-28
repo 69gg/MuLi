@@ -67,7 +67,10 @@ export function createPreviewState() {
     ], teamMessages: [],
     workflows: [{ id: "workflow-review", name: "资料整理与复核", description: "先整理资料，再独立复核，最后汇总为一份简报。", mode: "auto", steps: [{ id: "research", title: "整理资料", role: "worker", prompt: "整理资料与来源。", depends_on: [] }, { id: "review", title: "独立复核", role: "reviewer", prompt: "核对结论与来源。", depends_on: ["research"] }], runs: [], created_at: now - 86400, updated_at: now - 3600 }],
     workflowRuns: [], schedules: [{ id: "schedule-weekly", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null }],
-    reminders: [{ id: "reminder-review", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now }],
+    reminders: [
+      { id: "reminder-review", kind: "reminder", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now },
+      { id: "calendar-study", kind: "calendar_reminder", title: "早晨背单词", content: "每天留一点时间复习。", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "07:30", weekdays: [1, 2, 3, 4, 5] }, due_at: now + 7200, interval_seconds: null, enabled: true, fired_count: 0, created_at: now },
+    ],
     uploads: [{ id: "demo-notes", name: "项目整理示例.md", mime_type: "text/markdown", size: encoder.encode(notes).length, source: "preview", created_at: now - 3600 }],
     files: new Map([["demo-notes", new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
@@ -313,11 +316,19 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (item && method === "PATCH") { item.read = body.read === true; emit("notification.updated", item); return response(item); }
     }
     if (parts[0] === "reminders") {
-      if (parts.length === 1 && method === "GET") return response({ items: state.reminders });
-      if (parts.length === 1 && method === "POST") { if (atCapacity(state.reminders)) return failure("演示提醒数量已达上限。", 429); const item = { ...body, id: identifier("reminder"), enabled: true, fired_count: 0, created_at: timestamp() }; state.reminders.unshift(item); emit("reminder.updated", item); return response(item); }
-      const item = state.reminders.find((entry) => entry.id === id);
-      if (item && method === "PATCH") { merge(item, body); emit("reminder.updated", item); return response(item); }
-      if (item && method === "DELETE") { state.reminders = state.reminders.filter((entry) => entry.id !== id); return response({ deleted: true }); }
+      const reminderKind = (item) => item.kind === undefined ? "reminder" : item.kind;
+      if (parts.length === 1 && method === "GET") return response({ items: state.reminders.map((item) => ({ ...item, kind: reminderKind(item) })) });
+      if (parts.length === 1 && method === "POST") { if (atCapacity(state.reminders)) return failure("演示提醒数量已达上限。", 429); const item = { ...body, kind: "reminder", id: identifier("reminder"), enabled: true, fired_count: 0, created_at: timestamp() }; state.reminders.unshift(item); emit("reminder.updated", item); return response(item); }
+      const kind = url.searchParams.get("kind") ?? "reminder";
+      if (!["reminder", "calendar_reminder"].includes(kind)) return failure("提醒类别无效。", 422);
+      const item = state.reminders.find((entry) => entry.id === id && reminderKind(entry) === kind);
+      if (item && method === "PATCH") {
+        const fields = ["title", "content", "due_at", "enabled", ...(kind === "reminder" ? ["interval_seconds"] : [])];
+        if (Object.keys(body).some((key) => !fields.includes(key))) return failure("提醒更新字段无效。");
+        merge(item, body); item.kind = kind; emit("reminder.updated", item); return response(item);
+      }
+      if (item && method === "DELETE") { state.reminders = state.reminders.filter((entry) => entry.id !== id || reminderKind(entry) !== kind); return response({ deleted: true }); }
+      return failure("没有这条演示提醒。", 404);
     }
     if (path === "/memory/sources" && method === "GET") {
       const filter = url.searchParams.get("state") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);
