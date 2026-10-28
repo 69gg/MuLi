@@ -26,6 +26,8 @@ from muli.document_settings import DocumentSettings, DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size
 from muli.media import MediaConfig, MediaService, ServiceConfig
 from muli.providers import Message
+from muli.reading_application import ReadingApplication
+from muli.reading_pages import ReadingPages
 from muli.runtime import Runtime
 from muli.task_control import TaskControl
 from muli.task_delivery import TaskDelivery
@@ -63,6 +65,11 @@ class LocalServices:
             max_handoff_records=lambda: runtime.config.settings.limits.max_search_results,
         )
         runtime.task_control = self.task_control
+        self.reading_pages = ReadingPages(
+            runtime, self.task_control, self.task_inspection, self.document_settings
+        )
+        runtime.reading_pages = self.reading_pages
+        self.reading_application = ReadingApplication(runtime, attachments, self.reading_pages)
         self.task_control.scheduled_replan_guard = lambda receipt, targets: (
             runtime.scheduled_task_replans.guard_receipt(receipt, targets)
         )
@@ -375,12 +382,14 @@ class LocalServices:
             if "revision" in args or "offset_bytes" in args:
                 if source == "asr":
                     raise ValueError("转写分页请用 audio_transcript_read")
-                return await read_attachment_text(
+                capture = self.reading_pages.capture()
+                result = await read_attachment_text(
                     self.attachments,
                     identifier,
                     revision=args.get("revision"),
                     offset_bytes=args.get("offset_bytes", 0),
                 )
+                return self.reading_pages.stage(result, "attachment_read", capture=capture)
             item, data = await self.read_bytes(
                 identifier, runtime.config.settings.limits.max_file_bytes
             )
@@ -399,12 +408,15 @@ class LocalServices:
             )
 
         async def read_doc(args: dict[str, Any]) -> Any:
-            return await read_document(
+            capture = self.reading_pages.capture()
+            policy = self.reading_pages.document_policy()
+            result = await read_document(
                 self.attachments,
                 str(args["id"]),
                 revision=args.get("revision"),
                 offset_bytes=args.get("offset_bytes", 0),
             )
+            return self.reading_pages.stage(result, "document_read", capture=capture, policy=policy)
 
         def document_policy(settings: DocumentSettings) -> dict[str, Any]:
             result = {"settings": settings.model_dump(mode="json")}
