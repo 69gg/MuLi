@@ -1337,6 +1337,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
         "state",
         "boot",
         "result",
+        "observation",
     }
     revision_fields = {"revision", "intent", "code", "failure_code", "rollback_attempted"}
     intents = {
@@ -1382,6 +1383,14 @@ def fixture_result(data: bytes) -> dict[str, Any]:
                 for key in ("code", "failure_code")
             )
             or type(row["rollback_attempted"]) is not bool
+        ):
+            raise FixtureError("native_result_invalid")
+        if "observation" in row and (
+            row["stage"] != "helper_exit"
+            or not isinstance(row.get("helper"), str)
+            or not isinstance(row.get("state"), str)
+            or row["observation"] not in ("never_observed", "present", "absent_after_present")
+            or (row["state"] == "collected") != (row["observation"] != "present")
         ):
             raise FixtureError("native_result_invalid")
         for name, fact in row.items():

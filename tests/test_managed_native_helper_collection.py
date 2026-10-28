@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from helpers import managed_native_worker as worker
 from test_linux_helper_probe import NAME, HelperBus, setup
+from test_managed_native_ci import ci
 from test_managed_native_ci import forbid_real_effects as forbid_real_effects
 
 from muli import failure_diagnostics
@@ -154,6 +155,83 @@ async def test_actual_helper_collection_requires_a_fresh_exact_empty_listing(
     final = collection.case.result["timeline"][-1]
     assert final["stage"] == "helper_exit" and final["state"] == "collected"
     assert final["helper"] == NAME
+    assert final["observation"] == "absent_after_present"
+
+
+async def test_prepared_helper_absence_does_not_claim_a_start_or_exit(
+    collection: CollectionCase, tmp_path: Path
+) -> None:
+    root = tmp_path / "sequence"
+    root.mkdir()
+    case = worker.Case(root)
+    case.result["generations"] = copy.deepcopy(collection.case.result["generations"])
+    case.note(
+        "transaction",
+        request_id="b" * 32,
+        generation="a" * 32,
+        phase="prepared",
+        activation="pending",
+        revision=1,
+        intent="none",
+        code=None,
+        failure_code=None,
+        rollback_attempted=False,
+    )
+    listing = collection.bus.original.listing
+    collection.bus.original.listing = [[]]
+    assert await case.helper_empty(collection.probe, NAME, collection.argv)
+    assert case.result["timeline"][-1]["observation"] == "never_observed"
+    assert "helper_source" not in case.result["resources"]
+
+    collection.bus.original.listing = listing
+    assert not await case.helper_empty(collection.probe, NAME, collection.argv)
+    present = case.result["timeline"][-1]
+    assert present["state"] == "active" and present["observation"] == "present"
+    source = copy.deepcopy(case.result["resources"]["helper_source"])
+
+    collection.bus.original.listing = [[]]
+    assert await case.helper_empty(collection.probe, NAME, collection.argv)
+    observations = [
+        row["observation"] for row in case.result["timeline"] if row["stage"] == "helper_exit"
+    ]
+    assert observations == ["never_observed", "present", "absent_after_present"]
+    assert case.result["resources"]["helper_source"] == source
+    assert case.result["completed"] is False
+    assert ci.fixture_result(json.dumps(case.result).encode()) == case.result
+
+    legacy = copy.deepcopy(case.result)
+    for row in legacy["timeline"]:
+        row.pop("observation", None)
+    assert ci.fixture_result(json.dumps(legacy).encode()) == legacy
+
+
+@pytest.mark.parametrize(
+    ("stage", "state", "observation"),
+    [
+        ("helper_exit", "collected", "present"),
+        ("helper_exit", "active", "never_observed"),
+        ("helper_exit", "active", "absent_after_present"),
+        ("helper_exit", "collected", "unknown"),
+        ("transaction", "collected", "never_observed"),
+    ],
+)
+def test_helper_observation_rejects_unknown_or_conflicting_semantics(
+    tmp_path: Path, stage: str, state: str, observation: str
+) -> None:
+    case = worker.Case(tmp_path)
+    with pytest.raises(worker.NativeError, match="^native_fact_invalid$"):
+        case.note(stage, helper=NAME, state=state, observation=observation)
+    case.result["timeline"] = [
+        {
+            "elapsed_ms": 0,
+            "stage": stage,
+            "helper": NAME,
+            "state": state,
+            "observation": observation,
+        }
+    ]
+    with pytest.raises(ci.FixtureError, match="^native_result_invalid$"):
+        ci.fixture_result(json.dumps(case.result).encode())
 
 
 @pytest.mark.parametrize("recheck", ["exists", "failed", "malformed", "wrong_name", "cancel"])

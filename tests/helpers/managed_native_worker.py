@@ -4050,8 +4050,18 @@ class Case:
             "boot",
             "result",
             "exit_status",
+            "observation",
         } | revision_fields
         require(set(facts).issubset(allowed), "native_fact_invalid")
+        if "observation" in facts:
+            require(
+                stage == "helper_exit"
+                and isinstance(facts.get("helper"), str)
+                and isinstance(facts.get("state"), str)
+                and facts["observation"] in ("never_observed", "present", "absent_after_present")
+                and (facts["state"] == "collected") == (facts["observation"] != "present"),
+                "native_fact_invalid",
+            )
         if revision_fields.intersection(facts):
             from typing import get_args
 
@@ -4285,6 +4295,21 @@ class Case:
         except Exception:
             pass  # Ordinary local observation failures cannot replace the real outcome.
 
+    def note_helper_absence(self, name: str) -> None:
+        """An empty listing proves absence, not a prior start or exit."""
+        observed = any(
+            row.get("stage") == "helper_exit"
+            and row.get("helper") == name
+            and row.get("state") not in (None, "collected")
+            for row in self.result["timeline"]
+        )
+        self.note(
+            "helper_exit",
+            helper=name,
+            state="collected",
+            observation="absent_after_present" if observed else "never_observed",
+        )
+
     async def helper_empty(self, probe: SystemdProbe, name: str, argv: tuple[str, ...]) -> bool:
         from muli.platforms.linux_controller import CgroupObservation
         from muli.platforms.linux_transaction import ObservationError
@@ -4301,11 +4326,11 @@ class Case:
                 raise error from None
             if exists:
                 raise error
-            self.note("helper_exit", helper=name, state="collected")
+            self.note_helper_absence(name)
             return True
 
         if not await probe.helper_exists(name):
-            self.note("helper_exit", helper=name, state="collected")
+            self.note_helper_absence(name)
             return True
         try:
             snapshot = await probe._snapshot(await probe._unit_path(name))
@@ -4371,6 +4396,7 @@ class Case:
             pid=snapshot.pid,
             result=details["Result"],
             exit_status=details["ExecMainStatus"],
+            observation="present",
         )
         return (
             snapshot.active_state == "inactive"
@@ -4572,7 +4598,7 @@ class Case:
                             if await probe.helper_exists(name):
                                 await self.pause()
                                 continue
-                            self.note("helper_exit", helper=name, state="collected")
+                            self.note_helper_absence(name)
                             collect_helper_costs(
                                 self.root,
                                 self.result,

@@ -47,6 +47,21 @@ source 撤销时移除对应 start 样本。最终可选 `resources.helper_start
 也不回显原命令输出、异常正文或路径；原退出错误、收取及清理顺序保持不变。
 `helper_exit` 是最近观测阶段标签，不能替代安全帧来指认真正抛错位置。
 
+为兼容既有回执，helper 观察仍使用 `stage=helper_exit`；空 listing 仍保留
+`state=collected`，但这两个历史标签都不能证明 helper 曾启动或已经退出。新增可选
+`observation` 只表达原观察实际得到的事实：`never_observed` 表示精确 listing 为空，
+且本轮 timeline 尚无同名 helper 的完整成功观察；`present` 表示原完整观察成功；
+`absent_after_present` 表示完整观察之后再次取得精确空 listing。后者仍不证明成功
+启动、健康或正常退出。旧回执缺少此字段仍有效；新字段只允许用于 helper 观察，
+且必须与原 state 一致。判定只读取原有有界 timeline，不增加查询或建立、恢复 source。
+
+`CASE_SECONDS=60` 是原生 worker 的整轮夹具预算：`Case` 从构造时起建立一个单调
+deadline，`run()` 用同一个 `asyncio.timeout` 包围 `drive()` 的导入、初始服务启动、
+adopt A、switch B、故意目标失败的 switch A，以及每笔完整投影。它不是每笔产品
+事务的期限；产品 record/anchor 的 helper deadline 和 rollback reserve 独立保留。
+最后阶段为 prepared 且 `never_observed` 时，只能报告本轮未观察到 helper，不能
+据此指认前置身份拒绝或目标故障注入已经执行。
+
 事务尚未 resolved 时，原 helper 配置、进程身份和来源撤销观察保持不变；包括 blocked
 与 recovery_required。resolved 后只用原精确 unit listing 等待 helper 真正消失，存在
 时继续原 poll，查询失败或无效时仍失败。只有成功解析的精确空 listing 才进入最终
