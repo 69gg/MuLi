@@ -563,16 +563,14 @@ async def test_owner_stop_and_task_pause_close_shell_after_worker_run_has_return
         "import time\n"
         f"release = Path({str(release)!r})\n"
         "print('COMMAND_ACTIVE', flush=True)\n"
-        "deadline = time.monotonic() + 2\n"
-        "while not release.exists() and time.monotonic() < deadline:\n"
+        "while not release.exists():\n"
         "    time.sleep(0.01)\n"
-        "if not release.exists():\n"
-        "    raise SystemExit(7)\n"
         f"Path({str(effect)!r}).write_text('must not happen', encoding='utf-8')\n",
         encoding="utf-8",
     )
     target = task_id = ""
     running: dict[str, Any] = {}
+    reply = "受控 shell 任务已委派，实际命令状态以回执为准。"
     settled = asyncio.Event()
     original_cleanup = runtime.shells._cleanup
 
@@ -592,11 +590,27 @@ async def test_owner_stop_and_task_pause_close_shell_after_worker_run_has_return
             "controlled-command",
             "shell_run",
             command=shell_python_command(boot["flavor"], script),
-            wait_seconds=1,
+            wait_seconds=0,
             timeout=3,
         )
+        assert "error" not in running and running["state"] == "running", running
+        command_id = running["command_id"]
+        output = running["output"]
+        attempt = 0
+        while "COMMAND_ACTIVE" not in output:
+            running = yield call(
+                f"controlled-command-ready-{attempt}",
+                "shell_read",
+                command_id=command_id,
+                cursor=running["next_cursor"],
+                wait_seconds=1,
+            )
+            assert "error" not in running and running["state"] == "running", running
+            assert running["command_id"] == command_id
+            output += running["output"]
+            attempt += 1
         assert "error" not in running and running["state"] == "running"
-        assert running["exit_code"] is None and "COMMAND_ACTIVE" in running["output"]
+        assert running["exit_code"] is None and "COMMAND_ACTIVE" in output
         assert not effect.exists()
         return "命令仍在运行，当前队友回合已经返回。"
 
@@ -617,21 +631,38 @@ async def test_owner_stop_and_task_pause_close_shell_after_worker_run_has_return
             commitment_id=task_id,
         )
         target = spawned["id"]
-        waited = yield call("wait-controlled-shell", "wait_agents", targets=[target], timeout=2)
-        assert waited["agents"][0]["status"] == "completed"
-        return "队友回合已结束，长命令仍等待主人决定。"
+        return reply
 
     worker_dialogue = ShellDialogue(worker_script())
     main_dialogue = ShellDialogue(main_script())
 
+    class MainClient(ShellClient):
+        async def stream(
+            self, messages: list[Message], tools: list[dict[str, Any]]
+        ) -> AsyncIterator[StreamEvent]:
+            if target:
+                # A real Team report may arrive during this run or wake main later.
+                yield StreamEvent("done", turn=ModelTurn(content=reply))
+            else:
+                async for event in super().stream(messages, tools):
+                    yield event
+
     def factory(config: ModelConfig) -> FakeClient:
-        return ShellClient(worker_dialogue if config.model == "worker" else main_dialogue)
+        if config.model == "worker":
+            return ShellClient(worker_dialogue)
+        return MainClient(main_dialogue)
 
     runtime.client_factory = factory
     try:
         started = await runtime.submit("建立可随时停止的受控 shell 任务。", mode="yolo")
         async with asyncio.timeout(4):
-            assert await runtime.wait(started["run_id"]) == "队友回合已结束，长命令仍等待主人决定。"
+            assert await runtime.wait(started["run_id"]) == reply
+            # Team commits its terminal status only after Runtime.wait returns.
+            # Subscribe before checking, without blocking a parent model response.
+            async with runtime.bus.changed:
+                await runtime.bus.changed.wait_for(
+                    lambda: runtime.team.get(target)["status"] not in {"queued", "running"}
+                )
         agent = runtime.team.get(target)
         assert agent["status"] == "completed" and agent["generation"] == 1
         assert agent["commitment_id"] == task_id and agent["parent_id"] == started["session_id"]
