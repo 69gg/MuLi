@@ -82,7 +82,7 @@ async def discover(computer: Computer, form: NativeForm) -> str:
 
 
 @pytest.mark.parametrize("tree_source", [None, "throw 'muli-test-tree-script-forbidden'\n"])
-async def test_real_windows_probe_does_not_load_tree_script_or_initialize_the_tree_walker(
+async def test_real_windows_probe_does_not_initialize_the_tree_walker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_source: str | None
 ) -> None:
     helper = Path(module.__file__).with_name("uia_helper.ps1")
