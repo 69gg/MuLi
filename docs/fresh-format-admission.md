@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整全 `1`、旧 OneBot 三域 `2` 或长期问题关注加入前四渠道三域 `3` 声明的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不发布静态兼容 manifest、protocol 2、A/B selector 或跨版本启动许可。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整全 `1`、旧 OneBot 三域 `2`、长期问题关注前四渠道格式或转写收藏前 2.114 精确格式的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -28,7 +28,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=1`、`install_profile=1`。原三域 `2` 引入 OneBot 长期归属与持久 proof；原三域 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。长期问题关注新增主配置和可撤销输入 proof，因此只改变 `configuration`、`ingress` 两域。旧完整三域 `3`、其余四域 `1` 固定保存为 `PRE_MEMORY_WATCH_FORMAT_STATE`，与原全 `1`、三域 `2` 都只作为显式停机升级源，不能直接启动。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
+完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=2`、`install_profile=1`。原三域 `2` 引入 OneBot 长期归属与持久 proof；原三域 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。长期问题关注改变 `configuration`、`ingress` 两域；ASR 转写收藏只改变 `memory` 的来源解释范围。旧完整三域 `3`、其余四域 `1` 保存为 `PRE_MEMORY_WATCH_FORMAT_STATE`；2.114 的完整合同保存为 `PRE_TRANSCRIPT_MEMORY_FORMAT_STATE`。它们与原全 `1`、三域 `2` 都只作为显式停机升级源，不能直接启动。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |
@@ -44,9 +44,17 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ### 长期问题关注的格式边界
 
-`memory_watch`、`memory_watch_match`、`memory_source_completion` 是独立 `version=1` 功能记录；`memory_jobs.checkpoint.source_completion` 是可选的完成证明。真实后台 job 进入 `done` 与完成事件、canonical object 和 checkpoint 证明同事务保存，发现服务随后核对准确来源及修订。旧 `done` 没有完成证明不会补造事件，也不会扫描此前已整理完的资料。新增这些记录不重解释原有 source、revision、forget、run 或 unknown 状态，`objects=3`、`memory=1` 保留。
+`memory_watch`、`memory_watch_match`、`memory_source_completion` 是独立 `version=1` 功能记录；`memory_jobs.checkpoint.source_completion` 是可选的完成证明。真实后台 job 进入 `done` 与完成事件、canonical object 和 checkpoint 证明同事务保存，发现服务随后核对准确来源及修订。旧 `done` 没有完成证明不会补造事件，也不会扫描此前已整理完的资料。该功能加入时不重解释原有 source、revision、forget、run 或 unknown 状态，当时保留 `objects=3`、`memory=1`；后续 ASR 来源合同单独改为 `memory=2`，不改这些证明字段。
 
 主配置新增字段会让拒绝未知字段的旧版无法读取保存后的完整配置；新输入 proof 也不能被旧版当普通 `system:attention` 消费。2.112 的旧读取路径只识别整理失败证明，既不按 watch proof 独立合批，也不在取消或遗忘后核验它。因此新合同必须显式拒绝旧 reader；即使本机尚未登记关注，也不沿用旧完整声明。
+
+### ASR 转写来源的格式边界
+
+`memory=2` 新增 `attachment:<转写ID>:transcript:v1:asr_text:<工件SHA256>`，明确来源是已保存的派生转写，原文保持工件字节。普通 SHA marker 和 `document:v1` 的旧编码不变，新版可在升级后的库中恢复它们。
+
+2.114 只恢复纯摘要或六段文档 marker。让新 marker 继续声明 `memory=1` 会使旧版接纳整库，却拒绝缺 episode/job 的来源恢复、失败证明和关注核验。把新来源伪装成普通文本则会丢失转写身份。因此无 DDL 变化也需要新的来源解释合同。对象/输入 proof 字段、版本、遗忘、授权和 unknown 语义均不变，其余六领域保持原值；不新增 `objects=4`。
+
+冻结的 2.114 format reader、attachment source reader 与 manifest 及原字节出处见 [fixture 说明](../tests/fixtures/format-v2.114.md)。它们用于源码 oracle，不表示实际安装或运行了旧发行包。已有库必须经固定停机升级，不在正常启动时写 marker。
 
 固定升级只在既有独占保护下原子转换精确 marker，不改 DDL 或业务行，也不改外部配置文件。旧配置缺少 `memory_watches` 时新版采用默认值；这不证明配置文件来源真实，更不表示旧库可跳过升级直接准入。回归保留 2.112 的冻结准入源码和 manifest，执行旧准入函数核对新 marker 被拒；它使用当前未变的格式模型和证据读取器，不是运行旧发行包的完整验证。
 

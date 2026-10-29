@@ -939,6 +939,34 @@ _ADAPTERS: dict[
 }
 
 
+def _memory_source_detail(store: Store, source_id: str, detail: str) -> str:
+    """Describe the current verified source without changing a durable proof's shape."""
+    from muli.attachment_memory_source import (
+        MAX_ATTACHMENT_SOURCE_BYTES,
+        TRANSCRIPT_NOTICE,
+        TRANSCRIPT_SCOPE,
+        attachment_source_metadata,
+    )
+
+    row = store.db.execute(
+        "SELECT source FROM memory_sources WHERE id=? AND typeof(source)='text' "
+        "AND length(CAST(source AS BLOB))<=?",
+        (source_id, MAX_ATTACHMENT_SOURCE_BYTES),
+    ).fetchone()
+    if row is None:
+        raise ValueError("资料来源已失效")
+    metadata = attachment_source_metadata(source_id.removeprefix("attachment:"), row["source"])
+    if metadata["scope"] != TRANSCRIPT_SCOPE:
+        return detail
+    payload = json.loads(detail)
+    payload.update(
+        source=row["source"],
+        evidence_scope=TRANSCRIPT_SCOPE,
+        notice=TRANSCRIPT_NOTICE + payload["notice"],
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def attention_source(
     store: Store,
     event: dict[str, Any],
@@ -980,7 +1008,7 @@ def attention_source(
         return AttentionSource(
             "memory",
             proof.identifier,
-            proof.detail(),
+            _memory_source_detail(store, proof.source_id, proof.detail()),
             "memory.failure:" + proof.identifier,
             proof.routing,
             memory_failure_proof=proof,
@@ -1006,7 +1034,7 @@ def attention_source(
         return AttentionSource(
             "memory",
             watch_proof.identifier,
-            watch_proof.detail(),
+            _memory_source_detail(store, watch_proof.source_id, watch_proof.detail()),
             "memory.watch:" + watch_proof.identifier,
             memory_watch_proof=watch_proof,
         )

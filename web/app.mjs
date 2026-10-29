@@ -1704,6 +1704,10 @@ function memorySourcePage(payload, cursor) {
   return payload;
 }
 
+function memorySourceNotice(source) {
+  return /^attachment:[a-f0-9]{32}:transcript:v1:asr_text:[a-f0-9]{64}$/.test(source ?? "") ? "ASR 转写文本；仅核验已保存转写，不证明原音频、说话者或转写准确性。" : "";
+}
+
 function renderMemorySources(slot) {
   slot.filterInput = element("select", { "aria-label": "来源整理状态" }, element("option", { value: "", text: "全部状态" }), ...Object.entries(memoryJobStates).map(([key, label]) => element("option", { value: key, text: label })));
   slot.filterInput.value = slot.filter;
@@ -1754,6 +1758,7 @@ function updateMemorySources(slot) {
       actions.append(retry);
     }
     const details = element("details", { class: "advanced-settings" }, element("summary", { text: "来源详情" }), statusList([["来源", item.source], ["身份", item.principal], ["角色", item.role], ["原会话", item.session_id || "未记录"], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]));
+    if (memorySourceNotice(item.source)) details.append(element("p", { class: "settings-role-hint", text: memorySourceNotice(item.source) }));
     slot.result.append(element("article", { class: "memory-row" }, element("div", { class: "row-icon" }, icon("memory")), element("div", { class: "row-content" }, element("p", { class: "memory-source-content", text: item.source_id }), element("div", { class: "row-meta" }, element("span", { class: "row-tag", text: memoryJobStates[item.job.state] }), element("time", { text: formatTimestamp(item.created_at) }), `${item.total_bytes} 字节 · 尝试 ${item.job.attempts} 次`), details, item.job.last_error && element("p", { class: "form-error", text: item.job.last_error })), actions));
   }
   if (focused) slot.position.focus({ preventScroll: true });
@@ -1822,6 +1827,7 @@ async function openCatalogSource(item, trigger, { anchor = null, comparisonRetur
   }
   slot.sourceRegion = element("div", { class: "memory-source-page", "aria-live": "polite" });
   content.append(statusList([["来源 ID", item.source_id], ["身份", item.principal], ["角色", item.role], ["来源", item.source], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]), slot.sourceRegion);
+  if (memorySourceNotice(item.source)) content.append(element("p", { class: "settings-role-hint", text: memorySourceNotice(item.source) }));
   if (anchor?.empty && offset === item.total_bytes) renderMemorySource(slot);
   else await loadMemorySource(slot, offset, 0);
 }
@@ -1833,7 +1839,8 @@ function sourceComparisonPage(value, pair, cursor) {
   for (const side of ["left", "right"]) {
     const source = value[side];
     if (!source || source.source_id !== pair[`${side}_id`] || source.revision !== pair[`${side}_revision`] || !Number.isSafeInteger(source.total_bytes) || source.total_bytes < 0 || ![source.source, source.session_id, source.principal, source.scope, source.format].every((field) => typeof field === "string") || source.role !== "tool" || source.principal !== "external:attachment" || source.trusted_owner !== false) bad();
-    if (source.attachment_id !== source.source_id.slice("attachment:".length) || !/^[a-f0-9]{32}$/.test(source.attachment_id) || !/^[a-f0-9]{64}$/.test(source.source_revision) || !Number.isFinite(source.created_at) || source.created_at < 0 || source.scope !== { text: "utf8_text", pdf: "pdf_text_layer", docx: "docx_main_body_text" }[source.format] || (source.format === "text" ? source.document_revision !== null : typeof source.document_revision !== "string" || !/^[a-f0-9]{64}$/.test(source.document_revision))) bad();
+    if (source.attachment_id !== source.source_id.slice("attachment:".length) || !/^[a-f0-9]{32}$/.test(source.attachment_id) || !/^[a-f0-9]{64}$/.test(source.source_revision) || !Number.isFinite(source.created_at) || source.created_at < 0 || source.scope !== { text: "utf8_text", pdf: "pdf_text_layer", docx: "docx_main_body_text", asr: "asr_transcript_text" }[source.format] || (["text", "asr"].includes(source.format) ? source.document_revision !== null : typeof source.document_revision !== "string" || !/^[a-f0-9]{64}$/.test(source.document_revision))) bad();
+    if (source.format === "asr" && source.source !== `${source.source_id}:transcript:v1:asr_text:${source.source_revision}`) bad();
   }
   if ((value.status === "equal") !== (value.items.length === 0 && !value.has_more)) bad();
   for (const item of value.items) {
@@ -1886,6 +1893,7 @@ async function loadSourceComparison(slot, cursor = null, focus = null) {
       const source = page[side];
       const read = comparisonSourceButton(slot, source, `header:${side}`, `核对${side === "left" ? "左" : "右"}侧原文`);
       slot.content.append(element("p", { class: "settings-role-hint", text: `${side === "left" ? "左侧" : "右侧"}：${source.source_id} · ${source.scope}` }), read);
+      if (memorySourceNotice(source.source)) slot.content.append(element("p", { class: "settings-role-hint", text: memorySourceNotice(source.source) }));
     }
     for (const [index, item] of page.items.entries()) {
       const block = element("section", { class: "advanced-settings" }, element("h3", { text: { insert: "新增", delete: "删除", replace: "替换" }[item.kind] }));
@@ -2199,6 +2207,7 @@ function renderMemoryEvidence(slot) {
   const origin = item.origin;
   if (origin) {
     slot.content.append(element("h3", { class: "memory-section-title", text: "原始来源" }), statusList([["身份", origin.principal ?? "未记录"], ["角色", origin.role ?? "未记录"], ["渠道", origin.source ?? "未记录"], ["来源可信标记", trusted(origin.trusted_owner)], ["时间", formatTimestamp(origin.created_at)]]));
+    if (memorySourceNotice(origin.source)) slot.content.append(element("p", { class: "settings-role-hint", text: memorySourceNotice(origin.source) }));
     slot.sourceRegion = element("div", { class: "memory-source-page", "aria-live": "polite" });
     const source = element("details", { class: "advanced-settings memory-source" }, element("summary", { text: "查看原文" }), slot.sourceRegion);
     source.addEventListener("toggle", () => { if (slot.content.contains(source) && source.open && !slot.page && !slot.sourceController) void loadMemorySource(slot, 0, 0); });

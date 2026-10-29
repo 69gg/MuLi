@@ -29,6 +29,7 @@ from muli.memory_watches import (
     record_source_completion,
 )
 from muli.store import SQLITE_MAX_INTEGER, Store, new_id, now
+from muli.system_events import attention_source
 
 
 @dataclass
@@ -50,9 +51,18 @@ class Harness:
             key=key,
         )
 
-    def collect(self, content: str = "例题：传送带题目先分析功能关系，再核对滑动阶段。") -> str:
+    def collect(
+        self,
+        content: str = "例题：传送带题目先分析功能关系，再核对滑动阶段。",
+        *,
+        transcript: bool = False,
+    ) -> str:
         source = attachment_source(
-            new_id(), content, hashlib.sha256(content.encode("utf-8")).hexdigest(), now()
+            new_id(),
+            content,
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            now(),
+            transcript=transcript,
         )
         self.pipeline.ingest(source)
         return str(source["id"])
@@ -101,11 +111,12 @@ async def rig(tmp_path: Path) -> AsyncIterator[Harness]:
         harness.store.close()
 
 
+@pytest.mark.parametrize("transcript", [False, True])
 async def test_completion_is_canonical_and_match_keeps_one_current_continuous_quote(
-    rig: Harness,
+    rig: Harness, transcript: bool
 ) -> None:
     watch = rig.create()
-    source_id = rig.collect()
+    source_id = rig.collect(transcript=transcript)
     await rig.pipeline._run_job(source_id)
     events = rig.events(COMPLETION_EVENT)
     job = rig.pipeline.job(source_id)
@@ -123,6 +134,33 @@ async def test_completion_is_canonical_and_match_keeps_one_current_continuous_qu
     assert match_current(rig.store, proof, max_source_chars=64000, max_output_chars=6000)
     assert json.loads(proof.detail())["read_tool"] == "memory_source"
     assert rig.watches.records(rig.main_id)[0]["created_after_event"] < proof.completion_event
+    public = attention_source(
+        rig.store,
+        rig.events(MATCH_EVENT)[0],
+        ("memory",),
+        max_output_chars=6000,
+        memory_source_chars=64000,
+    )
+    assert public is not None
+    detail = json.loads(public.detail)
+    if transcript:
+        assert detail["evidence_scope"] == "asr_transcript_text"
+        assert ":transcript:v1:asr_text:" in detail["source"]
+        assert "不证明原音频" in detail["notice"]
+    else:
+        assert "evidence_scope" not in detail
+    assert rig.pipeline.memory.forget_source(source_id)
+    assert not match_current(rig.store, proof, max_source_chars=64000, max_output_chars=6000)
+    assert (
+        attention_source(
+            rig.store,
+            rig.events(MATCH_EVENT)[0],
+            ("memory",),
+            max_output_chars=6000,
+            memory_source_chars=64000,
+        )
+        is None
+    )
 
 
 async def test_completion_event_failure_rolls_back_done_and_first_token(

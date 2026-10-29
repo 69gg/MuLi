@@ -376,12 +376,22 @@ async def test_collected_attachment_cannot_supply_owner_identity_preference_or_a
         )
 
 
+@pytest.mark.parametrize("transcript", [False, True])
 async def test_source_commit_episode_rollback_recovers_once_and_forget_never_revives(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript: bool
 ) -> None:
+    from test_document_memory import tool
+
     extracted: list[str] = []
     owner_entered, owner_release = asyncio.Event(), asyncio.Event()
     text = "EPISODE-GAP:完整附件资料只能精确补齐一次。"
+
+    async def collect(rig: MemoryRig, item: dict[str, Any]) -> dict[str, Any]:
+        if transcript:
+            return await tool(
+                rig, "memory_import_transcript", id=item["id"], revision=item["sha256"]
+            )
+        return await rig.import_attachment(item["id"])
 
     async def slow_owner(source: dict[str, Any]) -> dict[str, Any]:
         if source["id"].startswith("attachment:"):
@@ -392,7 +402,14 @@ async def test_source_commit_episode_rollback_recovers_once_and_forget_never_rev
         return {"memories": [], "aliases": {}}
 
     async with actual_app(tmp_path, extractor=slow_owner) as rig:
-        item = await rig.upload(text.encode("utf-8"))
+        if transcript:
+            # The gap begins after ASR storage. No original audio is needed to
+            # repair a retained transcript; ASR execution has its own journey.
+            receipt = await rig.app.state.local_services.transcripts.save("b" * 32, text)
+            assert "error" not in receipt
+            item = rig.attachments.get(receipt["transcript_id"])
+        else:
+            item = await rig.upload(text.encode("utf-8"))
         source_id = "attachment:" + item["id"]
         errors: list[sqlite3.IntegrityError] = []
         original = rig.runtime.memory.save
@@ -416,11 +433,13 @@ async def test_source_commit_episode_rollback_recovers_once_and_forget_never_rev
         try:
             with monkeypatch.context() as patch:
                 patch.setattr(rig.runtime.memory, "save", observe_save)
-                result = await rig.import_attachment(item["id"])
+                result = await collect(rig, item)
             await asyncio.wait_for(owner_entered.wait(), timeout=3)
             assert "error" in result and len(errors) == 1
             source = rig.runtime.memory.source(source_id)
             assert source is not None and source["content"] == text
+            if transcript:
+                assert source["source"] == f"{source_id}:transcript:v1:asr_text:{item['sha256']}"
             assert rig.runtime.memory.automatic_episode_id(source_id) is None
             assert rig.memory.pipeline.job(source_id) is None
         finally:
@@ -446,7 +465,7 @@ async def test_source_commit_episode_rollback_recovers_once_and_forget_never_rev
         assert again.runtime.memory.automatic_episode_id(source_id) == episode_id
         assert again.memory.pipeline.job(source_id) == done
         assert extracted == [source_id]
-        result = await again.import_attachment(item["id"])
+        result = await collect(again, item)
         assert result["source_id"] == source_id and result["state"] == "done"
         assert again.memory.pipeline.job(source_id) == done
         assert extracted == [source_id]
@@ -458,7 +477,7 @@ async def test_source_commit_episode_rollback_recovers_once_and_forget_never_rev
     async with actual_app(tmp_path, extractor=record) as forgotten:
         forgotten.absent(item["id"])
         assert forgotten.attachments.path(item["id"]).read_bytes() == text.encode("utf-8")
-        result = await forgotten.import_attachment(item["id"])
+        result = await collect(forgotten, item)
         assert result["source_id"] == source_id and result["state"] == "forgotten"
         forgotten.absent(item["id"])
         assert extracted == [source_id]

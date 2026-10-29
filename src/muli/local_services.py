@@ -281,6 +281,34 @@ class LocalServices:
             raise ValueError("文档正文为空、无效或超过完整来源上限，未收藏节选")
         return item, view
 
+    async def memory_transcript(self, identifier: str, revision: str) -> tuple[dict[str, Any], str]:
+        """Collect exactly one existing complete ASR artifact, never its source audio."""
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(ATTACHMENT_ID_PATTERN, identifier) is None
+        ):
+            raise ValueError("转写收藏需要准确的转写工件 ID")
+
+        def byte_limit() -> int:
+            settings = self.runtime.config.settings
+            return min(
+                settings.limits.max_file_bytes,
+                settings.uploads.max_file_bytes,
+                settings.memory.max_source_chars * 4,
+            )
+
+        item, raw = await self.transcripts.read_complete(
+            identifier, revision=revision, max_bytes=byte_limit
+        )
+        content = raw.decode("utf-8", errors="strict")
+        if (
+            not content.strip()
+            or "\x00" in content
+            or len(content) > self.runtime.config.settings.memory.max_source_chars
+        ):
+            raise ValueError("转写为空、无效或超过完整来源上限，未收藏节选")
+        return item, content
+
     def delivery_tools(self, runtime: Runtime) -> list[Tool]:
         identifier = runtime.tool_session_id
         if identifier is not None and identifier != runtime.store.existing_main_session_id():

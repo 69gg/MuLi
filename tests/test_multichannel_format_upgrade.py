@@ -16,6 +16,7 @@ from muli.config import ConfigFile, MemoryWatchSettings
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     PRE_MEMORY_WATCH_FORMAT_STATE,
+    PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
 from muli.format_evidence import (
@@ -280,3 +281,34 @@ def test_partial_memory_watch_contract_is_not_a_supported_predecessor(
     with pytest.raises(FormatAdmissionError, match="store_format_upgrade_source_unsupported"):
         upgrade(path.parent)
     assert snapshot(path) == before
+
+
+def test_pre_transcript_contract_requires_explicit_marker_only_upgrade(tmp_path: Path) -> None:
+    path = legacy_database(tmp_path / "data")
+    set_marker(path, PRE_TRANSCRIPT_MEMORY_FORMAT_STATE)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(
+            "INSERT INTO channel_outbox(id,name,route,payload,state,next_attempt,created_at,updated_at) "
+            "VALUES('unknown-transcript-upgrade','onebot','{}','{}','unknown',0,1,1)"
+        )
+        db.commit()
+        evidence = read_optional_format_evidence(db)
+        assert evidence is not None
+        identity = evidence.store_instance, evidence.main_session
+    original = snapshot(path)
+    with pytest.raises(FormatAdmissionError, match="store_format_upgrade_required"):
+        Store.open_runtime(path, default_mode="auto")
+    assert snapshot(path) == original
+    business = snapshot(path, omit_marker=True)
+    assert upgrade(path.parent)
+    assert snapshot(path, omit_marker=True) == business
+    reopened = Store.open_runtime(path, default_mode="auto")
+    try:
+        assert reopened.format_state == CURRENT_FORMAT_STATE
+        current = read_optional_format_evidence(reopened.db)
+        assert current is not None
+        assert (current.store_instance, current.main_session) == identity
+    finally:
+        reopened.close()
+    assert not upgrade(path.parent)
+    assert snapshot(path, omit_marker=True) == business

@@ -25,7 +25,7 @@
 - [文档阅读](document-reading.md)：按需读取 PDF、DOCX 和长正文。
 - [续读书签](reading-bookmarks.md)：明确保存位置，压缩、重开或换渠道后继续阅读。
 - [摘录卡](reading-excerpts.md)：明确保存读过的原文、私人备注和续读出处。
-- [收藏资料](attachment-memory.md)：将附件明确加入长期记忆。
+- [收藏资料](attachment-memory.md)：将附件或已有完整 ASR 转写明确加入长期记忆。
 - [长资料检索](memory-chunks.md)：后台分块、续接与索引设置。
 - [电脑操作](computer.md)：应用、窗口和无障碍操作。
 - [平台支持](platforms.md)：后台服务、截图和录屏。
