@@ -721,7 +721,9 @@ async def test_saved_asr_chunks_and_relations_survive_phone_to_web_reopen_and_fo
                         )
                         unit_background = "普通无关背景，只读并核对已有结果，不新增主人偏好。\n"
                         background_text = unit_background * (threshold // len(unit_background) + 20)
-                        background.write_text(background_text, encoding="utf-8")
+                        background_bytes = background_text.encode("utf-8")
+                        background.write_bytes(background_bytes)
+                        assert background.read_bytes() == background_bytes
                         background_result = await dispatch(
                             web, "background", "fs_read", {"path": str(background)}, mobile=True
                         )

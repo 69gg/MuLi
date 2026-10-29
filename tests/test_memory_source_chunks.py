@@ -87,6 +87,7 @@ async def test_full_source_semantic_tail_survives_explicit_model_reindex(
     async with actual_app(tmp_path) as rig:
         rig.runtime.config.update(
             {
+                "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
                 "memory": {"auto_extract": False},
                 "media": {
                     "embedding": {"model": "chunks-a", "base_url": "https://chunks.invalid/v1"}
