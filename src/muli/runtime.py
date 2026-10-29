@@ -76,7 +76,7 @@ from muli.reminder_followup import followup_binding, task_status
 from muli.reminders import Reminders, reminder_kind
 from muli.reply_origin import ReplyOrigin
 from muli.shell_receipts import ShellReceipts
-from muli.shell_sessions import ShellSessionError, ShellSessions
+from muli.shell_sessions import ShellFinished, ShellSessionError, ShellSessions
 from muli.store import LifecycleKind, Store, new_id, now
 from muli.system_events import SystemEvents, SystemLogger
 from muli.task_control import (
@@ -1813,6 +1813,50 @@ class Runtime:
         if not self._closing:
             self.system_events.mcp_receive_failed(code, occurrence_id)
 
+    async def _shell_finished(self, result: ShellFinished) -> None:
+        # Dispatch already admitted the real owner. Completion can outlive that
+        # run or ordinary newer input, but cannot recreate a deleted identity.
+        session = self.store.get("session", result.session_id)
+        if (
+            session is None
+            or session.get("kind") != "main"
+            or session.get("principal") != "owner"
+            or self.store.existing_main_session_id() != result.session_id
+        ):
+            return
+        if result.state == "completed":
+            if type(result.exit_code) is not int:
+                return
+            title = "shell 命令已结束"
+            detail = f"已结束，退出码 {result.exit_code}。"
+        elif result.state == "timed_out":
+            title = "shell 命令执行超时"
+            detail = "已超时，进程树已收口；没有认证退出码。"
+        elif result.state == "stopped":
+            title = "shell 命令已停止"
+            detail = "已停止，进程树已收口；没有认证退出码。"
+        elif result.state == "unknown":
+            title = "shell 命令状态未知"
+            detail = "的完成状态无法确认；请勿直接重做命令。"
+        else:
+            return
+        identifier = f"shell:{result.session_id}:{result.os_epoch}:{result.command_id}"
+        if self.store.get("notification", identifier) is not None:
+            return
+        item = {
+            "id": identifier,
+            "title": title,
+            "content": f"命令 {result.command_id} {detail}请在原会话显式读取保留回执核查输出。",
+            "source": "shell",
+            "session_id": result.session_id,
+            "read": False,
+            "created_at": now(),
+        }
+        self.store.event(
+            "notification.created", item, result.session_id, objects=[("notification", item)]
+        )
+        await self.bus.notify()
+
     def configure(self) -> None:
         settings = self.config.settings
         self.capacity = asyncio.Semaphore(settings.limits.max_parallel_agents)
@@ -1836,6 +1880,7 @@ class Runtime:
                 max_command_bytes=lambda: self.config.settings.limits.max_file_bytes,
                 max_run_seconds=lambda: self.config.settings.limits.max_run_seconds,
                 max_receipt_chars=lambda: self.config.settings.limits.max_output_chars,
+                on_finish=self._shell_finished,
             )
         self.shells.default_cwd = self.files.roots[0]
         self._shell_generation += 1
@@ -3581,6 +3626,25 @@ class Runtime:
 
         async def shell(args: dict[str, Any]) -> Any:
             session_id, request, guard = shell_caller("shell_run", "destructive")
+            notify_on_finish: bool = args.get("notify_on_finish", False)
+            if type(notify_on_finish) is not bool:
+                raise ValueError("shell 完成通知选择必须是布尔值")
+            if "argv" in args and "notify_on_finish" in args:
+                raise ValueError("一次性 argv 分支不接受完成通知参数")
+
+            def dispatch_guard() -> None:
+                guard()
+                if notify_on_finish:
+                    # Reuse the existing current-main/current-owner-input gate;
+                    # the shell guard still owns dispatch and destructive risk.
+                    try:
+                        self.scheduled_workflows._caller()
+                    except PermissionError:
+                        raise PermissionError(
+                            "完成通知仅供真实主人当前请求中的主 MuLi 登记，队友不能登记"
+                        ) from None
+
+            dispatch_guard()
             cwd = self.files.path(str(args["cwd"])) if "cwd" in args else None
             if "argv" in args:
                 return await run_process(
@@ -3602,7 +3666,8 @@ class Runtime:
                 cwd=cwd,
                 wait_seconds=args.get("wait_seconds", 1),
                 timeout=args.get("timeout"),
-                admission_guard=guard,
+                notify_on_finish=notify_on_finish,
+                admission_guard=dispatch_guard,
             )
 
         async def read_shell(args: dict[str, Any]) -> Any:
@@ -3991,6 +4056,7 @@ class Runtime:
                 "shell_run",
                 "argv+cwd保持一次性无shell解释、最多30秒；或用command在本会话独立shell执行，"
                 "省cwd沿用目录。两分支互斥。wait_seconds仅等回执，running用shell_read查询，"
+                "notify_on_finish仅真实主人主助手可选，登记Web终态通知，不自动读输出或外发。"
                 "不要重发命令。正常回合结束保环境，停止或服务重开不保。均具当前用户权限，非沙箱",
                 {
                     "type": "object",
@@ -4013,6 +4079,7 @@ class Runtime:
                                 "cwd": string(),
                                 "wait_seconds": {"type": "number", "minimum": 0, "maximum": 10},
                                 "timeout": {"type": "number", "exclusiveMinimum": 0},
+                                "notify_on_finish": {"type": "boolean", "default": False},
                             },
                             ("command",),
                         ),
