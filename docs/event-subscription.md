@@ -33,7 +33,7 @@
 
 每次建立连接都创建新的 owner，替换时先取消旧 owner 和订阅。认证完成后先获取 P，再启动 status、conversation、sessions、notifications、uploads 事实读取。只有当前 owner 可以采用结果及启动流；全局流从 P 继续，会话流仍使用 conversation 提供的恢复游标。位置不可用时显示断连，不偷偷回退到全部历史。
 
-主会话快照在一个无 await 步骤内采集 `live` 与全局 `after`，先由历史恢复文本，再用真实执行槽与有效审批 future 校正当前事实。会话流严格从该 `after` 继续，reducer 的快照下界只过滤后来的旧 SSE 帧，不过滤快照内部历史。启动时实际校正的状态与窄 `session.recovered` 同事务保存，已有页面跨服务重启仍可在原游标后结束旧运行和审批；详见[会话恢复](session-recovery.md)。
+主会话快照在一个无 await 步骤内采集 `live` 与全局 `after`，先由历史恢复文本，再用真实执行槽与有效审批 future 校正当前事实。会话流严格从该 `after` 继续，reducer 的快照下界只过滤后来的旧 SSE 帧，不过滤快照内部历史。启动时实际校正的状态与窄 `session.recovered` 同事务保存，已有页面跨服务重启仍可在原游标后结束旧运行和审批；详见[会话恢复技术归档](../devarchive/session-recovery-design.md)。
 
 sessions 与 notifications 各保留一次在途读取和一个共享后继轮次。事件突发只把后继轮次标记为需要读取；显式调用得到覆盖自身触发的轮次结果，不等待未来事件安静下来。读取失败结束当前尝试，等待真正的新触发才重试。退出连接立即结算等待者并丢弃迟到结果，旧请求的 401 不退出新登录。
 

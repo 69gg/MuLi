@@ -7,21 +7,49 @@ import builtins
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from muli.attachments import attachment_ids_schema, validate_attachment_ids
-from muli.evidence import EvidenceError
+from muli.evidence import EvidenceError, json_size
 from muli.permissions import Mode
 from muli.reply_origin import ReplyOrigin
+from muli.shell_sessions import ShellFinished, ShellFinishObserver, ShellSessions
 from muli.store import new_id, now
-from muli.task_control import ControlConflict, TaskPaused
+from muli.task_control import ControlConflict, TaskPaused, TaskSnapshot
 from muli.team_consult import TeamConsult
 from muli.team_wait import TERMINAL, TeamWait
 from muli.tools import Tool, parameters, string
 
 if TYPE_CHECKING:
     from muli.attachments import Attachments
-    from muli.runtime import Runtime
+    from muli.providers import ToolCall
+    from muli.runtime import PreparedRequest, Runtime
+
+
+@dataclass(slots=True)
+class ShellContinuation:
+    session_id: str
+    parent_id: str
+    run_id: str
+    generation: int
+    revision: int
+    snapshot: TaskSnapshot
+    origin: ReplyOrigin
+    mode: Mode
+    parent_mode: str
+    manager: ShellSessions
+    manager_generation: int
+    evidence: dict[str, Any]
+    batch_seq: int
+    observer: ShellFinishObserver | None = None
+    finished: ShellFinished | None = None
+    paired: bool = False
+    reserved: bool = False
+    bound_run_id: str | None = None
+    admitted: bool = False
+    model_started: bool = False
+    revoked_reason: str = ""
 
 
 class TeamManager:
@@ -40,6 +68,9 @@ class TeamManager:
         self._reports_dirty = False
         self.report_observer: Callable[[str, int], None] | None = None
         self.report_observer_error = ""
+        self._shell_evidence: dict[str, dict[str, Any]] = {}
+        self._shell_continuations: dict[str, ShellContinuation] = {}
+        self._shell_waiting_runs: set[str] = set()
         rows = runtime.store.db.execute(
             "SELECT data FROM objects WHERE kind='agent' AND json_extract(data,'$.status')='running'"
         ).fetchall()
@@ -173,15 +204,259 @@ class TeamManager:
             agent = json.loads(rows[0][0])
         return agent
 
-    def _admit(self) -> None:
+    def _admit(self, *, replacing: str | None = None) -> None:
         self.runtime.maintenance.admission.require()
         if self._closed:
             raise ValueError("团队正在关闭")
-        count = self.runtime.store.db.execute(
-            "SELECT count(*) FROM objects WHERE kind='agent' AND json_extract(data,'$.status') IN ('queued','running','paused')"
-        ).fetchone()[0]
-        if count >= self.runtime.config.settings.limits.max_pending_runs:
+        identities = {
+            row[0]
+            for row in self.runtime.store.db.execute(
+                "SELECT id FROM objects WHERE kind='agent' "
+                "AND json_extract(data,'$.status') IN ('queued','running','paused')"
+            )
+        }
+        identities.update(key for key in self._shell_continuations if key != replacing)
+        if len(identities) >= self.runtime.config.settings.limits.max_pending_runs:
             raise ValueError("团队未完成任务已达到配置上限；历史队友数量不受此限制")
+
+    def cancel_shell_continuation(self, session_id: str, reason: str) -> None:
+        record = self._shell_continuations.pop(session_id, None)
+        if record is None:
+            return
+        record.revoked_reason = reason
+        if record.observer is not None:
+            record.manager.unwatch_finish(
+                session_id, record.evidence["command_id"], record.observer
+            )
+        parent = self.runtime.store.get("session", record.parent_id)
+        if parent is None:
+            return
+        notice = {
+            "id": f"shell-continuation:{session_id}:{record.evidence['os_epoch']}:{record.evidence['command_id']}",
+            "title": "命令自动续办已停止",
+            "content": f"任务 {record.snapshot.commitment_id}，命令 {record.evidence['command_id']}："
+            f"{reason}。登记仅当前服务实例有效；重启后不会自动续办，请先核查原回执。",
+            "source": "shell-continuation",
+            "session_id": record.parent_id,
+            "read": False,
+            "created_at": now(),
+        }
+        self.runtime.store.event(
+            "notification.created", notice, record.parent_id, objects=[("notification", notice)]
+        )
+
+    def guard_shell_continuation(self, record: ShellContinuation, *, bound: bool = False) -> None:
+        runtime = self.runtime
+        agent = self.get(record.session_id)
+        session = runtime.store.get("session", record.session_id) or {}
+        parent = runtime.store.get("session", record.parent_id) or {}
+        task = runtime.store.get("commitment", record.snapshot.commitment_id) or {}
+        revision = record.revision + int(bound or agent.get("status") == "completed")
+        if (
+            self._shell_continuations.get(record.session_id) is not record
+            or record.revoked_reason
+            or self._closed
+            or runtime._closing
+            or not runtime.maintenance.admission.allowed
+            or record.session_id in runtime._stopping
+            or self._parent_stopping(record.session_id)
+            or runtime.shells is not record.manager
+            or runtime._shell_generation != record.manager_generation
+            or parent.get("id") != runtime.store.existing_main_session_id()
+            or parent.get("kind") != "main"
+            or parent.get("principal") != "owner"
+            or parent.get("mode") != record.parent_mode
+            or session.get("kind") != "team"
+            or session.get("principal") != "owner"
+            or session.get("mode") != record.mode
+            or agent.get("mode") != record.mode
+            or agent.get("parent_id") != record.parent_id
+            or agent.get("session_id") != record.session_id
+            or agent.get("role") != "worker"
+            or session.get("workflow_run_id")
+            or agent.get("generation") != record.generation + int(bound)
+            or agent.get("completion_revision") != revision
+            or agent.get("run_id") != (record.bound_run_id if bound else record.run_id)
+            or agent.get("status") not in ({"running"} if bound else {"running", "completed"})
+            or runtime.channel_ownership.for_agent(record.session_id) is not None
+            or {"shell_run", "shell_read", "shell_continue_on_finish"}
+            & set(runtime.config.settings.disabled_tools)
+            or runtime.task_control is None
+            or task.get("status") in {None, "done", "cancelled"}
+            or runtime.task_control.execution_snapshot(record.session_id) != record.snapshot
+            or (bound and not record.admitted)
+            or (bound and runtime.run_ids.get(record.session_id) != record.bound_run_id)
+            or (
+                record.finished is not None
+                and (
+                    record.finished.session_id != record.session_id
+                    or record.finished.command_id != record.evidence["command_id"]
+                    or record.finished.os_epoch != record.evidence["os_epoch"]
+                    or (
+                        record.finished.state == "completed"
+                        and type(record.finished.exit_code) is not int
+                    )
+                )
+            )
+        ):
+            raise PermissionError("原命令续办的身份、任务版本或执行资格已改变")
+        runtime.task_control.guard_execution(
+            record.snapshot, session_id=record.session_id, risk="write"
+        )
+        # Reuse only the existing source verifier, never a scheduling receipt.
+        runtime.scheduled_task_replans._source(
+            {"reply_origin": record.origin.dump(), "creator_session_id": record.parent_id}
+        )
+
+    def request_shell_continuation(
+        self, session_id: str, run_id: str, request: PreparedRequest, command_id: str
+    ) -> dict[str, Any]:
+        evidence = self._shell_evidence.get(session_id)
+        snapshot = request.execution_scope
+        if (
+            not self.owns_run_report(session_id, run_id)
+            or snapshot is None
+            or request.tool_batch_seq is None
+            or evidence is None
+            or evidence["run_id"] != run_id
+            or evidence["command_id"] != command_id
+        ):
+            raise PermissionError("续办需要当前原直系队友的完整任务和真实命令工具回执")
+        row = self.runtime.store.db.execute(
+            "SELECT message_id FROM message_order WHERE session_id=? AND seq=?",
+            (session_id, request.tool_batch_seq),
+        ).fetchone()
+        assistant = self.runtime.store.bounded_object(
+            "message",
+            row[0] if row else "",
+            max_bytes=self.runtime.config.settings.limits.max_context_chars * 4,
+        )
+        calls = assistant.get("tool_calls", []) if assistant else []
+        if len(calls) != 1 or calls[0].get("name") != "shell_continue_on_finish":
+            raise ValueError("命令完成续办必须是本批唯一工具调用")
+        agent = self.get(session_id)
+        parent = self.runtime.store.get("session", agent["parent_id"]) or {}
+        record = ShellContinuation(
+            session_id,
+            agent["parent_id"],
+            run_id,
+            agent["generation"],
+            agent.get("completion_revision", 0),
+            snapshot,
+            ReplyOrigin.load(agent.get("reply_origin")),
+            cast(Mode, agent["mode"]),
+            parent.get("mode", ""),
+            self.runtime.shells,
+            self.runtime._shell_generation,
+            dict(evidence),
+            request.tool_batch_seq,
+        )
+        receipt = {
+            "registered": True,
+            "command_id": command_id,
+            "scope": "current_service_instance",
+            "automatic_resume_after_restart": False,
+            "notice": "仅当前服务实例有效；服务重启后不会自动续办。原命令结束不等于任务验收。",
+        }
+        if json_size(receipt) > self.runtime.config.settings.limits.max_output_chars:
+            raise EvidenceError("output_budget", "无法完整交付续办登记回执，未登记")
+        if session_id in self._shell_continuations:
+            raise ValueError("当前队友已有命令完成续办登记")
+        self._shell_continuations[session_id] = record
+        try:
+            self.guard_shell_continuation(record)
+        except Exception:
+            self._shell_continuations.pop(session_id, None)
+            raise
+        return receipt
+
+    def shell_tool_completed(
+        self,
+        session_id: str,
+        run_id: str,
+        request: PreparedRequest,
+        assistant: dict[str, Any],
+        call: ToolCall,
+        result: Any,
+        message: dict[str, Any],
+    ) -> bool:
+        if not isinstance(result, dict) or message.get("content_provenance") != "accepted":
+            if call.name == "shell_continue_on_finish":
+                self.cancel_shell_continuation(session_id, "登记回执未完整交付，未取得续办资格")
+            return False
+        if call.name in {"shell_run", "shell_read"} and isinstance(result.get("command_id"), str):
+            if call.name == "shell_run":
+                self._shell_evidence[session_id] = {
+                    "run_id": run_id,
+                    "command_id": result["command_id"],
+                    "os_epoch": result["os_epoch"],
+                    "assistant_message_id": assistant["id"],
+                    "call_id": call.id,
+                    "tool_message_id": message["id"],
+                    "cursor": result["next_cursor"].copy(),
+                }
+            elif (evidence := self._shell_evidence.get(session_id)) and (
+                evidence["command_id"],
+                evidence["os_epoch"],
+            ) == (result["command_id"], result.get("os_epoch")):
+                evidence["cursor"] = result["next_cursor"].copy()
+        record = self._shell_continuations.get(session_id)
+        if call.name != "shell_continue_on_finish" or not result.get("registered"):
+            return False
+        # Complete accepted pairing ends the original turn even if a control
+        # change revoked the registration during tool completion publication.
+        self._shell_waiting_runs.add(run_id)
+        if record is None:
+            return True
+        if record.run_id != run_id or record.batch_seq != assistant.get("seq"):
+            return False
+        record.evidence.update(
+            registration_assistant_message_id=assistant["id"],
+            registration_call_id=call.id,
+            registration_tool_message_id=message["id"],
+        )
+        try:
+            self.guard_shell_continuation(record)
+            if self.runtime.store.pending_inputs(session_id):
+                raise PermissionError("收到独立新输入，自动续办让位于正常输入")
+            record.paired = True
+
+            def observed(fact: ShellFinished) -> None:
+                if self._shell_continuations.get(session_id) is record:
+                    record.finished = fact
+                    self._schedule_shell_continuations()
+
+            record.observer = observed
+            record.finished = record.manager.watch_finish(
+                session_id, result["command_id"], observed
+            )
+        except (ValueError, PermissionError):
+            self.cancel_shell_continuation(session_id, "登记后的原任务或命令资格已失效")
+        return True
+
+    def _schedule_shell_continuations(self) -> None:
+        # The shell observer calls this before any await: only memory and task
+        # registration are allowed here, never persistence or model operations.
+        if self._closed or self.runtime._closing or not self.runtime.maintenance.admission.allowed:
+            return
+        for record in tuple(self._shell_continuations.values()):
+            if (
+                not record.paired
+                or record.finished is None
+                or record.reserved
+                or record.session_id in self._active
+                or record.session_id in self.runtime.tasks
+                or len(self._active) >= self.runtime.config.settings.limits.max_pending_runs
+            ):
+                continue
+            record.reserved = True
+            task = asyncio.create_task(
+                self._run(record.session_id, shell_continuation=record),
+                name=f"muli-shell-continuation-{record.session_id}",
+            )
+            self._active[record.session_id] = task
+            self._tasks.add(task)
+            task.add_done_callback(self._done)
 
     def _parent_stopping(self, parent_id: str) -> bool:
         visited: set[str] = set()
@@ -332,7 +607,7 @@ class TeamManager:
         if self._closed:
             raise ValueError("团队正在关闭")
         if wake and agent["status"] in TERMINAL - {"paused"}:
-            self._admit()
+            self._admit(replacing=agent["id"])
         origin = sender or self.runtime.main_session()["id"]
         if (
             origin != self.runtime.main_session()["id"]
@@ -362,6 +637,8 @@ class TeamManager:
         )
         if receipt["state"] != "pending" and updated is not agent:
             self.runtime.store.put("agent", agent)
+        if inserted and receipt["state"] == "pending":
+            self.cancel_shell_continuation(agent["id"], "收到独立新输入，自动续办让位于正常输入")
         if wake:
             self.start()
         if inserted:
@@ -513,7 +790,7 @@ class TeamManager:
             agent["status"] = "queued"
             self.runtime.store.put("agent", agent)
         else:
-            self._admit()
+            self._admit(replacing=agent["id"])
         if not self.runtime.store.pending_inputs(agent["session_id"]):
             await self.send(
                 agent["id"],
@@ -549,6 +826,7 @@ class TeamManager:
                 self._active[agent["id"]] = task
                 self._tasks.add(task)
                 task.add_done_callback(self._done)
+        self._schedule_shell_continuations()
 
     @property
     def idle(self) -> bool:
@@ -598,61 +876,159 @@ class TeamManager:
         if not task.cancelled():
             task.exception()
 
-    async def _run(self, identifier: str) -> None:
-        agent = self.get(identifier)
+    def _launch_agent(
+        self, agent: dict[str, Any], shell_continuation: ShellContinuation | None = None
+    ) -> str:
+        session = self.runtime.store.get("session", agent["session_id"])
+        assert session is not None
+        paused = self._paused_scope(agent["session_id"])
+        if paused is not None:
+            raise TaskPaused(
+                "task_paused",
+                "任务已暂停，等待主人明确要求重新规划及主助手确认方案",
+                observed_epoch=paused[1],
+            )
+        self.runtime.scheduled_task_replans.guard_target_start(agent, session)
+        pending = self.runtime.store.db.execute(
+            "SELECT json_extract(payload,'$.channel_ownership'),"
+            "json_object('id',id,'source',json_extract(payload,'$.source'),"
+            "'principal',json_extract(payload,'$.principal'),'route',json_extract(payload,'$.route')) "
+            "FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT 1",
+            (agent["id"],),
+        ).fetchone()
+        if pending is not None and pending[0] is not None:
+            proof = json.loads(pending[0])
+            self.runtime.channel_ownership.guard(proof, session_id=agent["id"])
+            agent["channel_ownership"] = proof
+            agent["channel_reply_origin"] = ReplyOrigin.from_input(json.loads(pending[1])).dump()
+        else:
+            agent.pop("channel_ownership", None)
+            agent.pop("channel_reply_origin", None)
+        agent.pop("report_binding", None)
+        agent.update(status="running", generation=agent["generation"] + 1, updated_at=now())
+        run_id = (
+            self.runtime._launch(session, agent["role"], cast(Mode, agent["mode"]))
+            if shell_continuation is None
+            else self.runtime._launch(
+                session,
+                agent["role"],
+                cast(Mode, agent["mode"]),
+                shell_continuation=shell_continuation,
+            )
+        )
+        agent["run_id"] = run_id
+        if shell_continuation is None:
+            self.runtime.store.put("agent", agent)
+        else:
+            fact = shell_continuation.finished
+            assert fact is not None
+            payload = self.runtime.conversation.payload(
+                agent["id"],
+                "原命令已经认证结束；这是工具事实，不是新的主人授权。按原编号和游标显式核查，"
+                "不得重做结果未知的操作。\n"
+                + json.dumps(
+                    {
+                        "command_id": fact.command_id,
+                        "os_epoch": fact.os_epoch,
+                        "state": fact.state,
+                        "exit_code": fact.exit_code,
+                        "evidence": shell_continuation.evidence,
+                    },
+                    ensure_ascii=False,
+                ),
+                source="shell-continuation",
+                principal="system:shell",
+                mode=agent["mode"],
+            )
+            with self.runtime.store.db:
+                notice = self.runtime.store._archive_input(payload, received=now(), run_id=run_id)
+                self.runtime.store._put("agent", agent)
+                self.runtime.store._event(
+                    "shell.continuation.started",
+                    {"run_id": run_id, "message_id": notice["id"], "command_id": fact.command_id},
+                    agent["id"],
+                )
+            shell_continuation.admitted = True
+        return run_id
+
+    async def _run(
+        self, identifier: str, *, shell_continuation: ShellContinuation | None = None
+    ) -> None:
+        agent = self.runtime.store.get("agent", identifier)
+        if agent is None:
+            self.cancel_shell_continuation(identifier, "原队友身份已不存在")
+            self._active.pop(identifier, None)
+            self.start()
+            await self.runtime.bus.notify()
+            return
         result, status = "", "failed"
         run_id: str | None = None
+        boot_error: Exception | None = None
+        if shell_continuation is not None:
+            try:
+                async with self.runtime.configuration_lock:
+                    agent = self.get(identifier)
+                    record = shell_continuation
+                    if self.runtime.store.pending_inputs(identifier) or agent["status"] == "queued":
+                        self.cancel_shell_continuation(identifier, "收到独立新输入，自动续办让位")
+                    else:
+                        self.guard_shell_continuation(record)
+                        fact = record.finished
+                        if fact is None or fact.state != "completed":
+                            self.cancel_shell_continuation(
+                                identifier,
+                                f"原命令终态为 {fact.state if fact else 'unknown'}，未自动续办",
+                            )
+                        elif agent["status"] == "completed":
+                            run_id = self._launch_agent(agent, record)
+            except asyncio.CancelledError:
+                self.cancel_shell_continuation(identifier, "自动续办预约已取消，未进入模型")
+                raise
+            except Exception as exc:
+                boot_error = exc
+                self.cancel_shell_continuation(identifier, "开代核验或事实归档失败，未自动续办")
+                candidate = shell_continuation.bound_run_id
+                if (
+                    candidate
+                    and self.runtime.run_ids.get(identifier) == candidate
+                    and identifier in self.runtime.tasks
+                ):
+                    run_id = candidate
+            finally:
+                if run_id is None:
+                    if self._active.get(identifier) is asyncio.current_task():
+                        self._active.pop(identifier, None)
+                    self.start()
+                    await self.runtime.bus.notify()
+            if run_id is None:
+                return
         try:
-            async with self.runtime.configuration_lock:
-                if self._closed or self.runtime._closing:
-                    status = "interrupted"
-                    return
-                session = self.runtime.store.get("session", agent["session_id"])
-                assert session is not None
-                paused = self._paused_scope(agent["session_id"])
-                if paused is not None:
-                    # Parking needs only durable control facts, never the full
-                    # brief budget. Hot-shrinking that budget cannot turn a
-                    # resumable pause into a failed execution.
-                    raise TaskPaused(
-                        "task_paused",
-                        "任务已暂停，等待主人明确要求重新规划及主助手确认方案",
-                        observed_epoch=paused[1],
-                    )
-                self.runtime.scheduled_task_replans.guard_target_start(agent, session)
-                pending = self.runtime.store.db.execute(
-                    "SELECT json_extract(payload,'$.channel_ownership'),"
-                    "json_object('id',id,'source',json_extract(payload,'$.source'),"
-                    "'principal',json_extract(payload,'$.principal'),'route',json_extract(payload,'$.route')) "
-                    "FROM ingress "
-                    "WHERE session_id=? AND state='pending' ORDER BY seq LIMIT 1",
-                    (agent["id"],),
-                ).fetchone()
-                if pending is not None and pending[0] is not None:
-                    proof = json.loads(pending[0])
-                    self.runtime.channel_ownership.guard(proof, session_id=agent["id"])
-                    agent["channel_ownership"] = proof
-                    agent["channel_reply_origin"] = ReplyOrigin.from_input(
-                        json.loads(pending[1])
-                    ).dump()
-                else:
-                    agent.pop("channel_ownership", None)
-                    agent.pop("channel_reply_origin", None)
-                agent.pop("report_binding", None)
-                agent.update(status="running", generation=agent["generation"] + 1, updated_at=now())
-                run_id = self.runtime._launch(session, agent["role"], cast(Mode, agent["mode"]))
-                agent["run_id"] = run_id
-                self.runtime.store.put("agent", agent)
+            if shell_continuation is None:
+                async with self.runtime.configuration_lock:
+                    if self._closed or self.runtime._closing:
+                        status = "interrupted"
+                        return
+                    run_id = self._launch_agent(agent)
+            assert run_id is not None
             await self.runtime.bus.emit("team.updated", {"agent": agent})
             result = await self.runtime.wait(run_id)
+            if boot_error is not None:
+                raise boot_error
             status = "completed"
         except asyncio.CancelledError:
             status = "interrupted" if self._closed else "cancelled"
-            await self.runtime.stop(
-                agent["session_id"],
-                cancel_pending=not self._closed
-                and asyncio.current_task() not in self._stopping_tasks,
-            )
+            if shell_continuation is None:
+                await self.runtime.stop(
+                    agent["session_id"],
+                    cancel_pending=not self._closed
+                    and asyncio.current_task() not in self._stopping_tasks,
+                )
+            elif self.runtime.run_ids.get(identifier) == run_id:
+                driver = self.runtime.tasks.get(identifier)
+                if driver is not None:
+                    if not driver.done() and not driver.cancelling():
+                        driver.cancel()
+                    await self._settle([driver])
             raise
         except TaskPaused as exc:
             status, result = "paused", str(exc)
@@ -664,13 +1040,41 @@ class TeamManager:
                 else f"队友执行失败：{type(exc).__name__}"
             )
         finally:
+            waiting = run_id in self._shell_waiting_runs
+            if run_id is not None:
+                self._shell_waiting_runs.discard(run_id)
+            self._shell_evidence.pop(identifier, None)
+            registration = self._shell_continuations.get(identifier)
+            if (
+                registration is not None
+                and registration.run_id == run_id
+                and not registration.paired
+            ):
+                self.cancel_shell_continuation(identifier, "登记回执未完整配对，未取得自动续办资格")
+            if waiting and status != "completed":
+                self.cancel_shell_continuation(identifier, "原执行未正常完成，自动续办已撤销")
+                waiting = False
+            if (
+                shell_continuation is not None
+                and self._shell_continuations.get(identifier) is shell_continuation
+            ):
+                if status != "completed":
+                    self.cancel_shell_continuation(
+                        identifier, f"续办运行以 {status} 结束：{result[:200]}"
+                    )
+                else:
+                    self._shell_continuations.pop(identifier, None)
             agent.update(
                 status=status,
                 result=result[: self.runtime.config.settings.limits.max_output_chars],
                 run_id=run_id,
             )
             writes = []
-            if run_id or status == "paused":
+            if (
+                (run_id or status == "paused")
+                and not waiting
+                and (shell_continuation is None or shell_continuation.model_started)
+            ):
                 # Result and notification intent commit together. A full parent
                 # mailbox cannot silently lose a completed child's report.
                 report = {
@@ -715,6 +1119,15 @@ class TeamManager:
                 requeue=(
                     status == "completed"
                     and bool(self.runtime.store.pending_inputs(agent["session_id"]))
+                )
+                or (
+                    shell_continuation is not None
+                    and bool(self.runtime.store.pending_inputs(identifier))
+                    and not self._closed
+                    and not self.runtime._closing
+                    and identifier not in self.runtime._stopping
+                    and not self._parent_stopping(identifier)
+                    and not self._scope_paused(identifier)
                 )
                 or (
                     status == "paused"
@@ -848,6 +1261,7 @@ class TeamManager:
             [*self._descendants(agent["id"]), agent], cancel_pending=cancel_pending
         ):
             pass
+        await self.runtime.bus.notify()
         return self.get(agent["id"])
 
     def _descendants(self, parent_id: str) -> builtins.list[dict[str, Any]]:
@@ -897,6 +1311,7 @@ class TeamManager:
         snapshots = [(agent, self._active.get(agent["id"])) for agent in agents]
         for agent, _ in snapshots:
             self.consult.invalidate(agent["id"], "咨询所属队友已停止")
+            self.cancel_shell_continuation(agent["id"], "队友已被显式停止")
         tasks = [task for _, task in snapshots if task is not None]
         executions: set[asyncio.Task[Any]] = {*tasks, *(observers or [])}
         for agent, _ in snapshots:
@@ -1183,6 +1598,8 @@ class TeamManager:
 
     async def close(self) -> None:
         self._closed = True
+        for identifier in tuple(self._shell_continuations):
+            self.cancel_shell_continuation(identifier, "服务正在关闭，自动续办不会在重启后恢复")
         self.consult.invalidate(None, "团队正在关闭，咨询不再接收回答")
         # The execution slot is released before report delivery. Keep observing
         # that finalizer even if the same identity has already started again.

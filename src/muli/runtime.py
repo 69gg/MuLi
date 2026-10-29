@@ -88,7 +88,7 @@ from muli.task_control import (
     TaskSnapshot,
 )
 from muli.task_file_publication import completed_publication
-from muli.team import TeamManager
+from muli.team import ShellContinuation, TeamManager
 from muli.team_consult import ConsultRequest
 from muli.tools import Tool, parameters, string
 from muli.tools.computer import Computer, ComputerError
@@ -123,6 +123,7 @@ class PreparedRequest:
     memory_watch_guard: Callable[[MemoryWatchMatch], bool] | None = None
     memory_watch_chars: int = 0
     tool_batch_seq: int | None = None
+    shell_continuation: ShellContinuation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,6 +765,16 @@ class Runtime:
             self._request_context.reset(token)
 
     def _guard_request(self, request: PreparedRequest, risk: str | None = None) -> None:
+        if request.shell_continuation is not None and not self.store.pending_inputs(
+            request.session_id
+        ):
+            try:
+                self.team.guard_shell_continuation(request.shell_continuation, bound=True)
+            except (ValueError, PermissionError):
+                self.team.cancel_shell_continuation(
+                    request.session_id, "原任务或来源执行资格已失效"
+                )
+                raise
         if request.memory_failure is not None and not self._memory_failure_allowed(
             request.memory_failure
         ):
@@ -1482,6 +1493,10 @@ class Runtime:
     async def _claim_inputs(
         self, session_id: str, run_id: str, *, discard_stale: bool = True
     ) -> list[dict[str, Any]]:
+        if self.store.pending_inputs(session_id):
+            record = self.team._shell_continuations.get(session_id)
+            if record is not None and record.bound_run_id == run_id:
+                self.team.cancel_shell_continuation(session_id, "独立新输入优先，旧自动续办已撤销")
         if discard_stale:
             self._cancel_stale_memory_inputs(session_id)
         messages = self.store.claim_inputs(
@@ -1599,12 +1614,20 @@ class Runtime:
     def shell_mode_changed(self, session_id: str, previous_mode: str, current_mode: str) -> None:
         """Called only after committing a mode edit, before its first suspension."""
         if previous_mode != current_mode:
+            for record in tuple(self.team._shell_continuations.values()):
+                if session_id in {record.session_id, record.parent_id}:
+                    self.team.cancel_shell_continuation(record.session_id, "权限模式已经改变")
             if session_id in self._shell_mode_epochs:
                 self._shell_mode_epochs[session_id] += 1
             self.shells.invalidate(session_id)
             self._shell_requests.pop(session_id, None)
 
     def _invalidate_shell_scopes(self) -> None:
+        for record in tuple(self.team._shell_continuations.values()):
+            try:
+                self.team.guard_shell_continuation(record, bound=record.bound_run_id is not None)
+            except (ValueError, PermissionError):
+                self.team.cancel_shell_continuation(record.session_id, "原任务或控制版本已经改变")
         for session_id in self.shells.live_sessions():
             request = self._shell_requests.get(session_id)
             if request is None:
@@ -2017,6 +2040,7 @@ class Runtime:
         mode: Mode,
         *,
         consult: ConsultRequest | None = None,
+        shell_continuation: ShellContinuation | None = None,
     ) -> str:
         self.maintenance.admission.require()
         session_id = session["id"]
@@ -2025,6 +2049,8 @@ class Runtime:
         session["status"], session["updated_at"] = "running", now()
         self.store.put("session", session)
         run_id = new_id()
+        if shell_continuation is not None:
+            shell_continuation.bound_run_id = run_id
         self.run_ids[session_id] = run_id
         self.store.put(
             "run",
@@ -2037,10 +2063,15 @@ class Runtime:
                 "mode": mode,
             },
         )
-        task = asyncio.create_task(
+        driver = (
             self._drive(session_id, run_id, role, mode, consult=consult)
             if consult is not None
-            else self._drive(session_id, run_id, role, mode),
+            else self._drive(session_id, run_id, role, mode, shell_continuation=shell_continuation)
+            if shell_continuation is not None
+            else self._drive(session_id, run_id, role, mode)
+        )
+        task = asyncio.create_task(
+            driver,
             name=f"muli-{run_id}",
         )
         self.tasks[session_id] = task
@@ -2087,6 +2118,9 @@ class Runtime:
                 del self._stopping[session_id]
 
     async def stop(self, session_id: str, *, cancel_pending: bool = True) -> None:
+        for record in tuple(self.team._shell_continuations.values()):
+            if session_id in {record.session_id, record.parent_id}:
+                self.team.cancel_shell_continuation(record.session_id, "会话已被显式停止")
         self.team.consult.invalidate(session_id, "会话已停止，咨询不再接收回答")
         self.shells.invalidate(session_id)
         invalidate_reply = session_id == self.store.existing_main_session_id()
@@ -2164,6 +2198,7 @@ class Runtime:
         workflow_step: bool = False,
         *,
         consult: ConsultRequest | None = None,
+        shell_continuation: ShellContinuation | None = None,
     ) -> str:
         computer = self.computer
         run = {
@@ -2192,6 +2227,7 @@ class Runtime:
         notify_failure = (
             not attention_origin
             and consult is None
+            and shell_continuation is None
             and not self.team.owns_run_report(session_id, run_id)
         )
         log_scope = self.system_events.begin_run(
@@ -2213,6 +2249,15 @@ class Runtime:
                         session_id, run_id, role, mode, workflow_step, consult=consult
                     )
                     if consult is not None
+                    else await self._execute(
+                        session_id,
+                        run_id,
+                        role,
+                        mode,
+                        workflow_step,
+                        shell_continuation=shell_continuation,
+                    )
+                    if shell_continuation is not None
                     else await self._execute(session_id, run_id, role, mode, workflow_step)
                 )
                 result = execution_result.content
@@ -2783,7 +2828,22 @@ class Runtime:
         workflow_step: bool,
         *,
         consult: ConsultRequest | None = None,
+        shell_continuation: ShellContinuation | None = None,
     ) -> _ExecutionResult:
+        continuation_driver = shell_continuation
+        if shell_continuation is not None:
+            if not shell_continuation.admitted:
+                self.team.cancel_shell_continuation(session_id, "续办事实未成功归档，未进入模型")
+                return _ExecutionResult("自动续办未执行；请核查原任务和命令回执。")
+            if self.store.pending_inputs(session_id):
+                self.team.cancel_shell_continuation(session_id, "独立新输入优先，旧自动续办已撤销")
+                shell_continuation = None
+            else:
+                try:
+                    self.team.guard_shell_continuation(shell_continuation, bound=True)
+                except (ValueError, PermissionError):
+                    self.team.cancel_shell_continuation(session_id, "原命令续办在模型准入前失效")
+                    return _ExecutionResult("自动续办未执行；请核查原任务和命令回执。")
         self._repair_tail(session_id)
         if consult is None:
             discarded = self._cancel_stale_memory_inputs(session_id)
@@ -2791,6 +2851,7 @@ class Runtime:
             if discarded and not claimed:
                 return _ExecutionResult("")
             prepared = await self._prepare_request(session_id)
+            prepared = replace(prepared, shell_continuation=shell_continuation)
         else:
             self.team.consult.guard_control(consult, session_id)
             question = self.store.add_message(
@@ -2835,7 +2896,17 @@ class Runtime:
         workflow_step = workflow_step or bool(session.get("workflow_run_id"))
         spent = 0
         async with self.client_factory(self.model_config(role)) as client:
-            for round_index in range(self.config.settings.limits.max_tool_steps + 1):
+            round_index = 0
+            while round_index <= self.config.settings.limits.max_tool_steps:
+                if shell_continuation is not None and self.store.pending_inputs(session_id):
+                    self.team.cancel_shell_continuation(
+                        session_id, "独立新输入优先，旧自动续办已撤销"
+                    )
+                    shell_continuation = None
+                    claimed = await self._claim_inputs(session_id, run_id)
+                    prepared = await self._prepare_request(
+                        session_id, previous=prepared, claimed_inputs=claimed
+                    )
                 self._guard_request(prepared)
                 messages = pack_context(
                     prepared.messages, self.config.settings.limits.max_context_chars
@@ -2849,6 +2920,10 @@ class Runtime:
                 )
                 try:
                     async with self.capacity:
+                        if shell_continuation is not None and self.store.pending_inputs(session_id):
+                            # Release capacity before claiming the independent
+                            # input at the next safe boundary; no model was called.
+                            continue
                         # Capacity and extension hooks may have suspended this
                         # request. Its original brief/epoch must still authorize
                         # entry before any network/model operation begins.
@@ -2864,6 +2939,8 @@ class Runtime:
                             consult=consult,
                             prepared=prepared,
                         )
+                        if continuation_driver is not None:
+                            continuation_driver.model_started = True
                         async for event in client.stream(
                             messages, [tool.schema() for tool in round_tools.values()]
                         ):
@@ -2941,9 +3018,11 @@ class Runtime:
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
                     if claimed:
+                        shell_continuation = None
                         prepared = await self._prepare_request(
                             session_id, previous=prepared, claimed_inputs=claimed
                         )
+                        round_index += 1
                         continue
                     self._guard_request(prepared)
                     if consult is None:
@@ -3077,6 +3156,14 @@ class Runtime:
                             else []
                         )
                     )
+                    if self.team.shell_tool_completed(
+                        session_id, run_id, prepared, assistant_message, call, result, tool_message
+                    ):
+                        return _ExecutionResult(
+                            "已登记原命令完成续办；正在等待，任务未验收。仅本实例有效，重启后不会自动续办。"
+                            if session_id in self.team._shell_continuations
+                            else "命令续办登记已撤销；任务未验收，请核查原任务与命令回执。"
+                        )
                 if paused is not None:
                     raise paused
                 if returned:
@@ -3097,6 +3184,12 @@ class Runtime:
                         session_id, previous=prepared, claimed_inputs=claimed
                     )
                 )
+                if shell_continuation is not None:
+                    if claimed:
+                        shell_continuation = None
+                    else:
+                        prepared = replace(prepared, shell_continuation=shell_continuation)
+                round_index += 1
             raise ValueError("模型调用达到步骤上限")
 
     def _round_tools(
@@ -3183,6 +3276,15 @@ class Runtime:
                     if tool.risk == "read" or name == "channel_delegate"
                 }
         disabled = self.config.settings.disabled_tools
+        agent = self.store.get("agent", session_id)
+        if (
+            workflow_step
+            or role != "worker"
+            or agent is None
+            or agent.get("parent_id") != self.store.existing_main_session_id()
+            or self.channel_ownership.for_agent(session_id) is not None
+        ):
+            tools.pop("shell_continue_on_finish", None)
         trigger = self._latest_main_trigger(session_id)
         attention = bool(trigger and trigger.get("principal") == "system:attention")
         return {
@@ -3229,7 +3331,13 @@ class Runtime:
             self.channel_ownership.guard_call(
                 prepared.channel_ownership, call.name, arguments, tool.risk
             )
-            if call.name in {"shell_run", "shell_read", "shell_history", "shell_stop"}:
+            if call.name in {
+                "shell_run",
+                "shell_read",
+                "shell_history",
+                "shell_stop",
+                "shell_continue_on_finish",
+            }:
                 live_shells = self.shells.live_sessions()
                 for identifier in tuple(self._shell_mode_epochs):
                     if identifier not in live_shells and identifier not in self.tasks:
@@ -3714,6 +3822,15 @@ class Runtime:
             guard()
             return result
 
+        async def continue_shell(args: dict[str, Any]) -> Any:
+            session_id, request, guard = shell_caller("shell_continue_on_finish", "write")
+            guard()
+            execution = self._tool_execution.get()
+            assert execution is not None
+            return self.team.request_shell_continuation(
+                session_id, execution[1], request, args["command_id"]
+            )
+
         async def stop_shell(args: dict[str, Any]) -> Any:
             session_id, _, guard = shell_caller("shell_stop", "destructive")
             guard()
@@ -4138,6 +4255,16 @@ class Runtime:
                     }
                 ),
                 read_shell,
+                preserve_output=True,
+            ),
+            Tool(
+                "shell_continue_on_finish",
+                "仅原直系队友为本代真实命令登记一次完成续办；本批只能调用此工具。"
+                "登记后本代结束，等待不调用模型；只在当前服务实例有效，重启不自动续办。"
+                "真实结束后原队友按原编号和游标显式核查；不是任务验收或新增授权。",
+                parameters({"command_id": string()}, ("command_id",)),
+                continue_shell,
+                "write",
                 preserve_output=True,
             ),
             Tool(

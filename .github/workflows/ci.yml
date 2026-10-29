@@ -101,8 +101,17 @@ jobs:
             shard: 3
             shards: 3
     runs-on: ${{ matrix.os }}
+    env:
+      MULI_PREVIOUS_SOURCE_ROOT: ${{ github.workspace }}/.local-check-artifacts/previous-consumer
     steps:
       - uses: actions/checkout@v4
+      - name: Check out the frozen recovery consumer
+        uses: actions/checkout@v4
+        with:
+          repository: 69gg/MuLi
+          ref: dff5772bec99e8127d1b926c147332bfd29fdc8c
+          path: .local-check-artifacts/previous-consumer
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
