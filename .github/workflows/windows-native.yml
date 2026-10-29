@@ -15,7 +15,32 @@ concurrency:
   group: windows-native-${{ github.ref_name }}
   cancel-in-progress: true
 jobs:
+  probe:
+    if: ${{ github.event_name == 'push' || github.event.inputs.suite == 'probe-dependency' }}
+    name: Probe (${{ matrix.python }}, ${{ matrix.spawn_mode }})
+    runs-on: windows-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        python: ['3.12', '3.13']
+        spawn_mode: [create-no-window, default]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - name: Compare only the owned dependency probe's console creation mode
+        env:
+          MULI_TEST_UIA_PROBE_SPAWN_MODE: ${{ matrix.spawn_mode }}
+        run: >-
+          uv run pytest -q -s --tb=short -o faulthandler_timeout=60
+          tests/test_uia_native.py::test_real_windows_probe_does_not_initialize_the_tree_walker
+          --basetemp="${{ runner.temp }}/muli-native-probe"
   native:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.suite == 'all-native' }}
     runs-on: windows-latest
     timeout-minutes: 5
     strategy:
@@ -29,14 +54,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
-      - name: Check dependency-only probe through the original owned lease
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.suite == 'probe-dependency' }}
-        run: >-
-          uv run pytest -q --tb=short -o faulthandler_timeout=60
-          tests/test_uia_native.py::test_real_windows_probe_does_not_initialize_the_tree_walker
-          --basetemp="${{ runner.temp }}/muli-native-probe"
       - name: Check all owned native Windows journeys
-        if: ${{ github.event_name == 'push' || github.event.inputs.suite == 'all-native' }}
         run: >-
           uv run pytest -q --tb=short -o faulthandler_timeout=60
           tests/test_uia_native.py
