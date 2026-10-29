@@ -35,6 +35,8 @@ PDF 和 DOCX 可用 `document_read` 继续读取提取正文，范围与配置�
 
 历史视觉解释即使仍可读，也不证明原图现在存在或没有改变；解释本身仍是模型资料，不是主人确认的事实。
 
+**网页静态快照：** 明确使用 `web_capture` 后，按 `source="webpage"` 和网址主机名查询，取得附件 ID，再用 `attachment_read(id, offset_bytes=0)` 阅读。正常续读不重新请求网站，范围见[网页留存](web-reading.md)。
+
 ## 继续阅读长文本
 
 普通 UTF-8 文本使用 `attachment_read(id, offset_bytes=0)` 取得带版本的首页。后续回传同一 `id`、返回的 `revision`，并把 `next_offset_bytes` 作为下一次的 `offset_bytes`；直到 `has_more=false` 才读完。位置按 UTF-8 字节计算，不是字符数，不能自行加减。也可以用目录摘要作为 `revision` 从首页读取。

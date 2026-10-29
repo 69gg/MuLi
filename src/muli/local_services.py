@@ -39,6 +39,7 @@ from muli.tools.mcp_catalog import ContentError, fits_output
 from muli.tools.mcp_resources import ResourceSaveTarget
 from muli.transcripts import AudioTranscripts
 from muli.vision_archives import VisionArchives, bounded_preview
+from muli.web_reading import WebReading
 
 
 class LocalServices:
@@ -72,11 +73,13 @@ class LocalServices:
         )
         runtime.reading_pages = self.reading_pages
         self.reading_application = ReadingApplication(runtime, attachments, self.reading_pages)
+        self.web_reading = WebReading(runtime, attachments, self.reading_application)
         self.task_control.scheduled_replan_guard = lambda receipt, targets: (
             runtime.scheduled_task_replans.guard_receipt(receipt, targets)
         )
         runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.add_tool_provider(self.delivery_tools, coordinator=True, session_scoped=True)
+        runtime.add_tool_provider(self.web_reading.tools, coordinator=True, session_scoped=True)
         runtime.context_hooks.append(self.context)
 
     def media(self) -> MediaService:
