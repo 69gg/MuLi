@@ -120,8 +120,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self.anchor, self.controller_slot, self.slots = anchor, controller_slot, dict(slots)
         self.journal, self.control, self.clock = journal, control, clock
         self.operation_timeout, self.runner = operation_timeout, runner
-        self.probe = probe or ManagedSystemdProbe(
-            runner=runner, limits=ProbeLimits(seconds=operation_timeout / 4)
+        self.probe = (
+            probe
+            if probe is not None
+            else ManagedSystemdProbe(
+                runner=runner, limits=ProbeLimits(seconds=operation_timeout / 4)
+            )
         )
         if self.probe.limits.seconds > operation_timeout / 4:
             raise ObservationError("invalid_probe_timeout")

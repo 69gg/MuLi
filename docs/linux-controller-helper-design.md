@@ -72,6 +72,24 @@ transient 在 user manager／机器整体重启后可能不存在。受支持服
 
 持久 blocked 仅阻止其 health.boot 对应实例；新实例本地仍暂停，返回同代 paused 证明，控制者先持久重绑为 pending 后才允许 activate。本实例 activation 失败始终 blocked，不因换记录而自行重试。成功 activation 的实际宿主此后可继续可靠接收签名主人输入，即使执行门再次暂停；仍不启动模型／外发，重复 webhook 只持久接受一次。被动初始实例和激活失败实例均不因这个入口而获得权限。
 
+## 托管 helper 的同轮接口观察
+
+托管 V2 的 `run_managed_helper` 只在自行构造 `ManagedSystemdProbe` 且
+`runner is run_process` 时启用内部 `join_interface_reads`。通用 probe 默认 false，
+注入 runner 仍串行，注入 probe 原样采用其策略；ensure、manager 与 setup 不自动启用。
+这不是用户配置或新的 D-Bus 传输层，共用额度在 await 后才扣减的执行器不可自动并发。
+
+启用后，每轮 Unit 与 Service 各执行一次原白名单 `_properties`，由一个 TaskGroup
+拥有两条任务。普通异常保存为结果，Unit 失败时取消 Service，收取完成后抛原 Unit
+异常；Unit 成功后才消费 Service 结果，外部取消继续传播。GetUnit 仍在两轮前，
+第一轮两组收齐才执行原文件、proc、kernel 检查，之后才能开始第二轮；第二轮收齐后
+仍执行前后匹配、身份与原绝对期限核验。并发不提供原子 snapshot，也不提供新的内容凭证。
+
+每组原字段与顺序、typed 解析、no-autostart/no-interactive、timeout、stdout/stderr
+共享的单命令字节额度及进程收尾合同保持。只重叠同轮等待，最多两个 busctl；
+命令总数、属性 RPC、内容扫描与认证工作不减少，不跨 await 复用任何文件证明。
+离线调度与真实 helper 启用路由分别验证，合成并发不能证明真实三事务在60秒内通过。
+
 ## 离线验收与来源
 
 本 backend 的最小反证包含：启动窗口未持 lease 不过早 verifying、HTTP 前后 InvocationID 变化、原 boot 被拒作新健康、超限／重定向／压缩响应、已有 stop job、MainPID=0 但 cgroup 非空、lease 被占、CAS 冲突／desired 可见但 fsync 持续失败不得 start、同步确认后期限耗尽、激活响应丢失／取消后不重复 POST、真实控制者配合假服务完成 commit 及单次 rollback。测试仅替身，全部 guard 串行。

@@ -262,9 +262,11 @@ class SystemdProbe:
         limits: ProbeLimits | None = None,
         proc_root: Path = Path("/proc"),
         cgroup_root: Path = Path("/sys/fs/cgroup"),
+        join_interface_reads: bool = False,
     ) -> None:
         self.runner, self.limits, self.proc_root = runner, limits or ProbeLimits(), proc_root
         self.cgroup_root = cgroup_root
+        self._join_interface_reads = join_interface_reads
 
     async def _command(self, *arguments: str) -> str:
         result = await self.runner(
@@ -316,9 +318,44 @@ class SystemdProbe:
             for line, (name, signature) in zip(lines, fields, strict=True)
         }
 
+    async def _interface_properties(
+        self,
+        path: str,
+        unit_fields: tuple[tuple[str, str], ...],
+        service_fields: tuple[tuple[str, str], ...],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not self._join_interface_reads:
+            unit = await self._properties(path, "Unit", unit_fields)
+            service = await self._properties(path, "Service", service_fields)
+            return unit, service
+
+        async def read(
+            interface: str, fields: tuple[tuple[str, str], ...]
+        ) -> dict[str, Any] | Exception:
+            try:
+                return await self._properties(path, interface, fields)
+            except Exception as error:
+                # Keep Unit's original error priority without wrapping it in an
+                # ExceptionGroup. Cancellation remains owned by the TaskGroup.
+                return error
+
+        async with asyncio.TaskGroup() as group:
+            unit_task = group.create_task(read("Unit", unit_fields))
+            service_task = group.create_task(read("Service", service_fields))
+            unit_result = await unit_task
+            if isinstance(unit_result, Exception):
+                service_task.cancel()
+
+        # Both branches have settled before returning data or the original error.
+        if isinstance(unit_result, Exception):
+            raise unit_result
+        service_result = service_task.result()
+        if isinstance(service_result, Exception):
+            raise service_result
+        return unit_result, service_result
+
     async def _snapshot(self, path: str) -> UnitSnapshot:
-        unit = await self._properties(path, "Unit", _UNIT_FIELDS)
-        service = await self._properties(path, "Service", _SERVICE_FIELDS)
+        unit, service = await self._interface_properties(path, _UNIT_FIELDS, _SERVICE_FIELDS)
         return self._snapshot_values(unit, service)
 
     @staticmethod
@@ -379,9 +416,9 @@ class SystemdProbe:
     async def _helper_properties(self, path: str) -> tuple[dict[str, Any], dict[str, Any]]:
         # Each round independently reads both interfaces. The returned values
         # belong only to this observation, never to a cached manager proof.
-        unit = await self._properties(path, "Unit", _UNIT_FIELDS + _HELPER_UNIT_FIELDS)
-        service = await self._properties(path, "Service", _SERVICE_FIELDS + _HELPER_SERVICE_FIELDS)
-        return unit, service
+        return await self._interface_properties(
+            path, _UNIT_FIELDS + _HELPER_UNIT_FIELDS, _SERVICE_FIELDS + _HELPER_SERVICE_FIELDS
+        )
 
     @staticmethod
     def _helper_limits(unit: dict[str, Any], service: dict[str, Any], limits: HelperLimits) -> None:

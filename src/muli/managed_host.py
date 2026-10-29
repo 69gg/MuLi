@@ -240,9 +240,13 @@ async def run_managed_helper(
 ) -> TransactionRecordV2:
     entry = _entry(root)
     anchor, limits = entry.anchor, entry.anchor.helper
-    observed = probe or ManagedSystemdProbe(
-        runner=runner, limits=ProbeLimits(seconds=limits.operation_timeout / 4)
-    )
+    observed = probe
+    if observed is None:
+        observed = ManagedSystemdProbe(
+            runner=runner,
+            limits=ProbeLimits(seconds=limits.operation_timeout / 4),
+            join_interface_reads=runner is run_process,
+        )
     if observed.limits.seconds > limits.operation_timeout / 4:
         raise TransactionError("invalid_probe_timeout")
     with TransactionJournal(

@@ -1,6 +1,16 @@
 # 真实 systemd 托管切换 CI 设计
 
-当前仍未通过原生三事务验收。最近一次候选 `b9cbf779` 的
+托管 helper 只在自建 probe 且 `runner is run_process` 时启用内部
+`join_interface_reads`；通用 probe 默认串行，注入 probe 原样保留身份与策略，
+注入 runner、manager 与 setup 不自动启用。同轮 Unit/Service 复用原白名单 busctl，
+两组收齐后才组装 snapshot、进行中间校验和下一轮。GetUnit、前后观察、typed 解析、
+原单命令双 pipe 字节门、期限、完整认证及效果前 guard 保持，不使用 GetAll 或
+请求 Environment。TaskGroup 拥有每轮两条任务，保留 Unit 普通错误优先，收取后
+才返回原异常或数据，外部取消继续传播。共享剩余额度在 await 后扣减的执行器不可
+自动并发。该结构只重叠等待，不减少 RPC、扫描或总 CPU 工作；离线调度与启用路由
+分别验证，不能替代原 Case60 / harness90 / cleanup5 和资源门内三代完整投影验收。
+
+当前仍未通过原生三事务验收。此前候选 `b9cbf779` 的
 [原生作业](https://github.com/69gg/MuLi/actions/runs/40779572918/job/123137511753)
 首代 adopt 在 35352 毫秒完成完整投影；第二代在 55244 毫秒进入 start_target，
 60002 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。cleanup 已核验。
