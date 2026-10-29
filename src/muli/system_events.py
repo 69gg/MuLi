@@ -947,6 +947,7 @@ def _memory_source_detail(store: Store, source_id: str, detail: str) -> str:
         TRANSCRIPT_SCOPE,
         attachment_source_metadata,
     )
+    from muli.webpage_snapshot import WEBPAGE_NOTICE
 
     row = store.db.execute(
         "SELECT source FROM memory_sources WHERE id=? AND typeof(source)='text' "
@@ -956,13 +957,14 @@ def _memory_source_detail(store: Store, source_id: str, detail: str) -> str:
     if row is None:
         raise ValueError("资料来源已失效")
     metadata = attachment_source_metadata(source_id.removeprefix("attachment:"), row["source"])
-    if metadata["scope"] != TRANSCRIPT_SCOPE:
+    if metadata["scope"] != TRANSCRIPT_SCOPE and metadata["format"] != "webpage":
         return detail
+    notice = WEBPAGE_NOTICE if metadata["format"] == "webpage" else TRANSCRIPT_NOTICE
     payload = json.loads(detail)
     payload.update(
         source=row["source"],
-        evidence_scope=TRANSCRIPT_SCOPE,
-        notice=TRANSCRIPT_NOTICE + payload["notice"],
+        evidence_scope=metadata["scope"],
+        notice=notice + payload["notice"],
     )
     return json.dumps(payload, ensure_ascii=False)
 

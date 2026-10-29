@@ -13,6 +13,7 @@ from muli.format_admission import (
     LEGACY_FORMAT_STATE,
     PRE_MEMORY_WATCH_FORMAT_STATE,
     PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
+    PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     PREVIOUS_FORMAT_STATE,
     FormatAdmissionError,
 )
@@ -87,6 +88,7 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                     PREVIOUS_FORMAT_STATE,
                     PRE_MEMORY_WATCH_FORMAT_STATE,
                     PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
+                    PRE_WEBPAGE_MEMORY_FORMAT_STATE,
                 ):
                     raise FormatAdmissionError("store_format_upgrade_source_unsupported")
                 db.execute("PRAGMA synchronous=FULL")

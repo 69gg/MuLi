@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from muli.attachment_find import find_attachment
+from muli.attachment_io import read_verified_window
 from muli.attachment_records import _MAX_PAGE_ITEMS, _MAX_QUERY_CHARS, AttachmentRecords
 from muli.attachment_text import read_attachment_text
 from muli.attachments import (
@@ -37,9 +38,10 @@ from muli.task_inspection import TaskInspection
 from muli.tools import Tool, parameters, string
 from muli.tools.mcp_catalog import ContentError, fits_output
 from muli.tools.mcp_resources import ResourceSaveTarget
-from muli.transcripts import AudioTranscripts
+from muli.transcripts import AudioTranscripts, _owned
 from muli.vision_archives import VisionArchives, bounded_preview
 from muli.web_reading import WebReading
+from muli.webpage_snapshot import parse_webpage_snapshot
 
 
 class LocalServices:
@@ -310,6 +312,67 @@ class LocalServices:
             or len(content) > self.runtime.config.settings.memory.max_source_chars
         ):
             raise ValueError("转写为空、无效或超过完整来源上限，未收藏节选")
+        return item, content
+
+    async def memory_webpage(self, identifier: str, revision: str) -> tuple[dict[str, Any], str]:
+        """Read a complete existing host-captured webpage without any network work."""
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(ATTACHMENT_ID_PATTERN, identifier) is None
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[a-f0-9]{64}", revision) is None
+        ):
+            raise ValueError("网页收藏需要准确快照 ID 和完整 revision")
+
+        def metadata() -> dict[str, Any] | None:
+            return self.runtime.store.bounded_object(
+                "attachment",
+                identifier,
+                max_bytes=self.runtime.config.settings.limits.max_output_chars * 4,
+            )
+
+        def byte_limit() -> int:
+            settings = self.runtime.config.settings
+            return min(
+                settings.limits.max_file_bytes,
+                settings.uploads.max_file_bytes,
+                settings.memory.max_source_chars * 4,
+            )
+
+        item = metadata()
+        if (
+            item is None
+            or item.get("id") != identifier
+            or item.get("source") != "webpage"
+            or item.get("sha256") != revision
+            or type(item.get("size")) is not int
+            or not 0 <= item["size"] <= byte_limit()
+        ):
+            raise ValueError("网页快照不存在、来源或版本无效，或超过完整读取上限")
+        path = self.attachments.path(identifier)
+
+        def read() -> bytes:
+            return read_verified_window(
+                path,
+                expected=revision,
+                size=item["size"],
+                offset_bytes=0,
+                window=item["size"],
+                prefix="webpage",
+                label="网页快照",
+                validate_text=True,
+            )
+
+        try:
+            raw = await _owned(file_io(read))
+        except OSError as error:
+            raise ValueError("网页快照文件不可用") from error
+        if metadata() != item or len(raw) != item["size"] or len(raw) > byte_limit():
+            raise ValueError("网页快照元数据或读取上限已变化，未收藏")
+        content = raw.decode("utf-8", errors="strict")
+        if len(content) > self.runtime.config.settings.memory.max_source_chars:
+            raise ValueError("完整网页快照超过当前来源字符上限，未收藏节选")
+        parse_webpage_snapshot(content)
         return item, content
 
     def delivery_tools(self, runtime: Runtime) -> list[Tool]:

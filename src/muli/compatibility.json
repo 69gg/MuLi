@@ -1,7 +1,7 @@
 {
   "metadata_version": 1,
   "distribution": "muli-agent",
-  "release": "2.118.0",
+  "release": "2.119.0",
   "handoff_protocol": 2,
   "requires_migration": false,
   "formats": {
@@ -10,7 +10,7 @@
     "configuration": {"reads": [2], "writes": 2},
     "ingress": {"reads": [4], "writes": 4},
     "outbox": {"reads": [3], "writes": 3},
-    "memory": {"reads": [2], "writes": 2},
+    "memory": {"reads": [3], "writes": 3},
     "install_profile": {"reads": [1], "writes": 1}
   }
 }

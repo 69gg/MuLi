@@ -13,6 +13,7 @@ from types import ModuleType
 import pytest
 from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model, snapshot
+from test_webpage_memory_format import frozen_m_bytes, frozen_m_reader
 
 from muli.attachment_memory_source import attachment_source, restore_attachment_source
 from muli.compatibility import CompatibilityManifest, assess_compatibility
@@ -21,6 +22,7 @@ from muli.document_reading import document_revision
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
+    PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
 from muli.format_evidence import FORMAT_STATE_KEY, read_optional_format_evidence
@@ -54,14 +56,15 @@ def test_h_format_reader_and_manifest_reject_new_source_contract(database: Path)
     raw = (_FIXTURES / "compatibility_v2_114.json").read_bytes()
     assert hashlib.sha256(raw).hexdigest() == _H_BYTES["compatibility_v2_114.json"]
     manifest = CompatibilityManifest.from_json(raw)
-    current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
-    )
+    # Keep the historical ASR1 -> ASR2 assertion even as current advances to 3.
+    asr = frozen_m_reader("format_admission_v2_118.py")
+    current = CompatibilityManifest.from_json(frozen_m_bytes("compatibility_v2_118.json"))
     assert manifest.release == "2.114.0"
     assert manifest.formats.memory.reads == (1,) and manifest.formats.memory.writes == 1
     assert current.formats.memory.reads == (2,) and current.formats.memory.writes == 2
     assert old.CURRENT_FORMAT_STATE == PRE_TRANSCRIPT_MEMORY_FORMAT_STATE
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    assert asr.CURRENT_FORMAT_STATE == PRE_WEBPAGE_MEMORY_FORMAT_STATE
+    assert asr.CURRENT_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "memory": 2,
     }
@@ -70,10 +73,13 @@ def test_h_format_reader_and_manifest_reject_new_source_contract(database: Path)
         evidence = read_optional_format_evidence(db)
         assert evidence is not None and evidence.state == CURRENT_FORMAT_STATE
         old.require_current_format(replace(evidence, state=PRE_TRANSCRIPT_MEMORY_FORMAT_STATE))
+        asr.require_current_format(replace(evidence, state=PRE_WEBPAGE_MEMORY_FORMAT_STATE))
+        with pytest.raises(old.FormatAdmissionError, match="store_format_unsupported"):
+            old.require_current_format(replace(evidence, state=PRE_WEBPAGE_MEMORY_FORMAT_STATE))
         with pytest.raises(old.FormatAdmissionError, match="store_format_unsupported"):
             old.require_current_format(evidence)
         assert db.total_changes == 0
-    for state in (PRE_TRANSCRIPT_MEMORY_FORMAT_STATE, CURRENT_FORMAT_STATE):
+    for state in (PRE_TRANSCRIPT_MEMORY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE):
         assessment = assess_compatibility(manifest, current, state, handoff_protocol=2)
         assert not assessment.format_compatible and assessment.domain == "memory"
     assert snapshot(database) == before

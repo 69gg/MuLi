@@ -1,6 +1,6 @@
 # 停机升级已有数据格式
 
-2.115 的完整 ASR 转写收藏需要能准确解释派生来源的记忆合同：`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=2`、`install_profile=1`。各平台新装直接使用此完整格式，无需操作。已有数据包括 2.114 的长期问题关注格式也需显式升级；启动时若提示 `store_format_upgrade_required`，先完成下述步骤。
+已留存网页快照的明确长期收藏需要能准确解释网页来源的记忆合同：`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=3`、`install_profile=1`。各平台新装直接使用此完整格式，无需操作。已有数据包括 2.115 至 2.118 使用的 `memory=2` 及更早格式都需显式升级；启动时若提示 `store_format_upgrade_required`，先完成下述步骤。
 
 ## Linux 独立安装
 
@@ -12,7 +12,7 @@ muli --data-dir "/path/to/your-data" upgrade-channel-ownership
 
 将路径换成实际数据目录。命令只升级数据，不启动或停止服务，也不安装依赖。成功输出 `{"upgraded": true}`；已经升级时输出 `{"upgraded": false}`。之后使用原来的配置和数据目录启动新版，旧版本不能再打开升级后的数据。
 
-命令沿用 `upgrade-channel-ownership` 名称，支持以下四种精确完整源合同；表中均为七域的完整值，不按单个版本数字猜测：
+命令沿用 `upgrade-channel-ownership` 名称，支持以下五种精确完整源合同；表中均为七域的完整值，不按单个版本数字猜测：
 
 | 旧合同 | database | objects | configuration | ingress | outbox | memory | install_profile |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -20,10 +20,11 @@ muli --data-dir "/path/to/your-data" upgrade-channel-ownership
 | 原 OneBot 接管格式 | 1 | 2 | 1 | 2 | 2 | 1 | 1 |
 | 长期问题关注前的四渠道格式 | 1 | 3 | 1 | 3 | 3 | 1 | 1 |
 | 转写收藏前的长期问题关注格式（2.113/2.114） | 1 | 3 | 2 | 4 | 3 | 1 | 1 |
+| 网页收藏前的转写来源格式（2.115 至 2.118） | 1 | 3 | 2 | 4 | 3 | 2 | 1 |
 
-每种源合同都直接升级到上述当前完整格式。升级在既有独占保护和原子提交中仅转换格式 marker，不改表结构或业务行；原身份、会话、历史、渠道归属与投递记录保留，不重发旧消息，`unknown` 投递仍需先核查。主配置文件不由此命令改写，缺少 `memory_watches` 时新版采用默认设置；已经整理完的旧资料不会为新关注补扫。
+每种源合同都直接升级到上述当前完整格式。升级在既有独占保护和原子提交中仅转换格式 marker，不改表结构或业务行；原身份、会话、历史、渠道归属、来源 ID/摘要/全文、遗忘标记、任务/checkpoint、关注证明与投递记录保留，不重发旧消息，`unknown` 投递仍需先核查。主配置文件不由此命令改写，缺少 `memory_watches` 时新版采用默认设置；已经整理完的旧资料不会为新关注补扫，既有网页附件也不会自动收藏。
 
-新主配置字段和可撤销输入证明不受更早 reader 支持；2.114 的来源恢复器也不能解释新的 ASR marker，无法准确恢复来源或核验失败/关注证明。因此即使没有业务行迁移，也不能让旧库直接启动新版或让旧版打开升级后的库。升级保留旧文本/文档来源字节，新版在升级后的 `memory=2` 库中继续准确解释它们。`requires_migration=false` 只描述当前格式上的同格式更新判定，不能替代这次停机升级；托管跨格式切换仍不支持。
+新主配置字段和可撤销输入证明不受更早 reader 支持；2.114 的来源恢复器不能解释 ASR marker，`memory=2` 的来源恢复器也不能解释新的 `attachment:<id>:webpage:v1:<scope>:<sha256>` marker。网页范围仅为 `http_utf8_text_v1` 或 `html_static_text_v1`，不能伪装成普通文本来源交给旧 reader。因此即使没有业务行迁移，也不能让旧库直接启动新版或让旧版打开升级后的库。新版在升级后的 `memory=3` 库中继续准确解释保留原字节的旧文本、文档和 ASR 来源；这不代表旧版可以回滚打开同一份已升级数据。`requires_migration=false` 只描述当前格式上的同格式更新判定，不能替代这次停机升级；托管跨格式切换仍不支持。
 
 ## 不支持或失败时
 
