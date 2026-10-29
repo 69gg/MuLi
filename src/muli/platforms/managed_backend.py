@@ -296,7 +296,11 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         *,
         preflight: Callable[[], None] | None = None,
         postprocess: Callable[[ManagedProbeResult], Role | None] | None = None,
+        postproofs: _FileProofs | None = None,
     ) -> ManagedProbeResult:
+        if postproofs is not None:
+            postproofs.python = None
+            postproofs.packages = None
         if preflight is None:
             self._check(record)
         else:
@@ -306,8 +310,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         result = await self.probe.read_managed(
             self.journal, record, self.anchor, self.controller_slot, self.slots
         )
+        observed_packages: PackageProofs | None = {} if postproofs is not None else None
         if postprocess is None:
-            self._check(record)
+            if observed_packages is None:
+                self._check(record)
+            else:
+                self._check(record, observed_packages=observed_packages)
         else:
             try:
                 selected = postprocess(result)
@@ -316,7 +324,15 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 # observation error, without retaining proofs across the await.
                 self._check(record)
                 raise
-            self._check(record, selected)
+            if observed_packages is None:
+                self._check(record, selected)
+            else:
+                self._check(record, selected, observed_packages=observed_packages)
+        if postproofs is not None:
+            # Publish only after the independent post-await authentication and
+            # its final metadata/root fences have all returned successfully.
+            postproofs.python = self.controller_slot.resolved_python
+            postproofs.packages = observed_packages
         return result
 
     def _disk(self) -> _DiskBinding:
@@ -805,13 +821,23 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         }:
             raise ObservationError("transaction_effect_not_permitted")
         self._desired(record, role)
-        before = await self._probe(record)
+        postproofs = _FileProofs()
+        before = await self._probe(record, postproofs=postproofs)
         if not self._stopped(before.service):
             raise ObservationError("transaction_service_not_stopped")
         with self.journal.writer_lease() as lease:
             cgroup = before.service.unit.cgroup
             observed_packages: PackageProofs = {}
-            self._guard(record, role, lease, cgroup, observed_packages=observed_packages)
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=postproofs.python,
+                verified_packages=postproofs.packages,
+                observed_packages=observed_packages,
+            )
+            del postproofs
             # Only the successful writer-held guard lends bytes to this
             # synchronous confirmation; discard them before the next await.
             disk = self._confirm(

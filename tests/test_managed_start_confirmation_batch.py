@@ -6,9 +6,9 @@ import asyncio
 import os
 import stat
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from test_managed_backend import Host
@@ -19,6 +19,8 @@ from test_managed_backend_python_proof import shared_host as shared_host
 
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import FixedLock, Role, TransactionError, TransactionJournal
+from muli.platforms import managed_deployment, managed_launcher
+from muli.platforms.linux_transaction import ObservationError
 from muli.platforms.managed_backend import _DiskBinding, _FileProofs
 from muli.platforms.managed_deployment import (
     DeploymentAnchor,
@@ -552,3 +554,338 @@ async def test_start_confirmation_proof_does_not_cross_the_next_probe_await(
     assert python.bytes - before_python == 2 * python_size
     assert shared_host.writer is not None
     shared_host.writer.check()
+
+
+async def test_start_first_probe_reuses_only_its_fresh_post_guard_bytes(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = shared_host
+    record = await prepare_start(host, "target")
+    controller = Path(host.backend.controller_slot.package.root)
+    selected = Path(host.slots["target"].package.root)
+    assert controller != selected
+    assert host.backend.controller_slot.resolved_python == host.slots["target"].resolved_python
+    disk, commands = host.backend._disk(), list(host.commands)
+    state_path = host.journal.directory.path / "state.json"
+    state_bytes = state_path.read_bytes()
+    reads = observe_payloads(host, monkeypatch)
+    python = observe_python_reads(host, monkeypatch)
+    checks = observe_checks(host, monkeypatch)
+    expected = {
+        Path(slot.package.root): slot.package.model_dump(mode="json")
+        for slot in (host.backend.controller_slot, host.slots["target"])
+    }
+    complete_reads = {root: 0 for root in expected}
+    fingerprint = managed_launcher.package_fingerprint
+
+    def scanned(
+        root: Path,
+        limits: Mapping[str, int],
+        *,
+        verified: dict[str, dict[str, Any]] | None = None,
+        observed: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, object]:
+        # Delegate every real walk, including the existing synchronous batches.
+        # A missing exact-slot leaf proof still reads the complete real package.
+        result = fingerprint(root, limits, verified=verified, observed=observed)
+        complete = result == expected[root]
+        assert complete
+        if verified is None:
+            complete_reads[root] += 1
+        return result
+
+    argv_seen: list[tuple[str, ...]] = []
+    runner = host.backend.runner
+
+    async def run(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        assert timeout == host.probe.limits.seconds and limit == host.probe.limits.command_bytes
+        assert merge_stderr is False
+        argv_seen.append(tuple(argv))
+        return await runner(argv, timeout=timeout, limit=limit, merge_stderr=merge_stderr)
+
+    monkeypatch.setattr(managed_launcher, "package_fingerprint", scanned)
+    monkeypatch.setattr(host.backend, "runner", run)
+
+    assert await host.backend.start(record, "target") is None
+
+    assert argv_seen == [
+        (
+            "systemctl",
+            "--user",
+            "--no-block",
+            "--job-mode=fail",
+            "start",
+            host.backend.service.unit,
+        )
+    ]
+    assert host.commands == [*commands, "start"] and host.probe.count == 2
+    assert len(checks) == 14 and all(current == record for current, _role in checks)
+    assert sum(role is None for _current, role in checks) == 4
+    assert sum(role == "target" for _current, role in checks) == 10
+    assert host.transport.calls == [] and state_path.read_bytes() == state_bytes
+    assert host.record() == record and host.record().deadline == record.deadline
+    same_disk = host.backend._disk() == disk
+    assert same_disk
+    assert host.probe.snapshot.process is not None
+    assert host.probe.snapshot.process.argv == host.arguments("target")
+    assert host.writer is not None
+    host.writer.check()
+    host.control.check()
+
+    controller_copies = complete_reads[controller]
+    assert controller_copies > 0 and complete_reads[selected] == 2
+    for leaf, observed in reads.leaves.items():
+        root = controller if leaf.is_relative_to(controller) else selected
+        assert leaf.is_relative_to(root)
+        walks = 14 if root == controller else 10
+        assert len(observed.opened) == walks
+        assert observed.fd_stats >= 2 * walks and observed.path_stats == walks
+        assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
+        assert observed.bytes == reads.sizes[leaf] * complete_reads[root]
+    for directory, count in reads.scans.items():
+        root = controller if directory.is_relative_to(controller) else selected
+        assert directory.is_relative_to(root)
+        assert count == (14 if root == controller else 10)
+    assert len(python.opened) == 24
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in python.opened)
+    assert (
+        python.bytes
+        == controller_copies * host.backend.controller_slot.resolved_python.identity.size
+    )
+    # All actual bytes, effects, independent opens and 14 checks precede this
+    # red: only the first post-probe/writer-guard pair may share controller bytes.
+    assert controller_copies == 5
+
+
+@pytest.mark.parametrize("failure_kind", ["metadata", "error", "cancel"])
+async def test_first_probe_does_not_publish_proofs_before_its_final_fence_returns(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+) -> None:
+    host = shared_host
+    record = await prepare_start(host, "target")
+    disk, commands = host.backend._disk(), list(host.commands)
+    state_path = host.journal.directory.path / "state.json"
+    state_bytes = state_path.read_bytes()
+    reads = observe_payloads(host, monkeypatch)
+    python = observe_python_reads(host, monkeypatch)
+    checks = observe_checks(host, monkeypatch)
+    proofs = _FileProofs()
+    controller = host.backend.controller_slot
+    metadata_path = host.journal.directory.path / f"slot-{controller.digest}.json"
+    mode = stat.S_IMODE(metadata_path.stat().st_mode)
+    failure = (
+        RuntimeError("post-check failed") if failure_kind == "error" else asyncio.CancelledError()
+    )
+    entered: list[bool] = []
+    original = managed_deployment._MetadataScope._finish
+
+    def finish(metadata: managed_deployment._MetadataScope) -> None:
+        if host.probe.count == 1:
+            assert not entered and len(checks) == 2
+            entered.append(True)
+            assert proofs.python is None and proofs.packages is None
+            if failure_kind == "metadata":
+                metadata_path.chmod(0o644)
+            original(metadata)
+            # Even an exception after the real leaf fence cannot publish the
+            # already observed package: the surrounding check has not returned.
+            raise failure
+        original(metadata)
+
+    monkeypatch.setattr(managed_deployment._MetadataScope, "_finish", finish)
+    expected = ManagedDeploymentError if failure_kind == "metadata" else type(failure)
+    try:
+        with pytest.raises(expected) as caught:
+            await host.backend._probe(record, postproofs=proofs)
+    finally:
+        metadata_path.chmod(mode)
+
+    if failure_kind == "metadata":
+        assert str(caught.value) == "managed_slot_unavailable"
+    else:
+        assert caught.value is failure
+    assert entered == [True] and proofs.python is None and proofs.packages is None
+    controller_root = Path(controller.package.root)
+    for path, observed in reads.leaves.items():
+        copies = 2 if path.is_relative_to(controller_root) else 0
+        assert observed.bytes == copies * reads.sizes[path]
+    assert python.bytes == 2 * controller.resolved_python.identity.size
+    assert len(checks) == 2 and host.probe.count == 1
+    assert host.commands == commands and host.transport.calls == []
+    assert host.record() == record and state_path.read_bytes() == state_bytes
+    same_disk = host.backend._disk() == disk
+    assert same_disk and host.writer is None
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
+
+
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("controller", "anchor_unavailable"),
+        ("selected", "managed_slot_changed"),
+        ("python", "anchor_unavailable"),
+        ("anchor", "anchor_unavailable"),
+        ("revision", "stale_revision"),
+    ],
+)
+async def test_start_first_probe_rechecks_changes_made_during_its_await(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, fault: str, code: str
+) -> None:
+    host = shared_host
+    record = expected_record = await prepare_start(host, "target")
+    disk, commands, service = host.backend._disk(), list(host.commands), host.probe.snapshot
+    original = host.probe.read_managed
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def gated(
+        journal: TransactionJournal,
+        current: TransactionRecordV2,
+        anchor: DeploymentAnchor,
+        controller_slot: SlotIdentity,
+        slots: dict[Role, SlotIdentity],
+    ) -> ManagedProbeResult:
+        result = await original(journal, current, anchor, controller_slot, slots)
+        assert host.probe.count == 1
+        entered.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(host.probe, "read_managed", gated)
+    task = asyncio.create_task(host.backend.start(record, "target"))
+    try:
+        async with asyncio.timeout(host.backend.operation_timeout):
+            await entered.wait()
+            assert not task.done()
+            if fault == "revision":
+                with host.journal.writer_lease() as lease:
+                    lease.check()
+                    expected_record = host.move("verifying")
+            else:
+                path = (
+                    Path(host.backend.controller_slot.resolved_python.path)
+                    if fault == "python"
+                    else host.journal.directory.path / f"anchor-{host.anchor.digest}.json"
+                    if fault == "anchor"
+                    else Path(host.slots["target" if fault == "selected" else "base"].package.root)
+                    / "batch_payload/first.bin"
+                )
+                rewrite_with_restored_mtime(path, path.read_bytes(), path.stat())
+            release.set()
+            expected = TransactionError if fault == "revision" else ManagedDeploymentError
+            with pytest.raises(expected, match=f"^{code}$"):
+                await task
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert host.probe.count == 1 and host.probe.snapshot == service
+    assert host.commands == commands and host.transport.calls == []
+    assert host.record() == expected_record and expected_record.deadline == record.deadline
+    same_disk = host.backend._disk() == disk
+    assert same_disk and host.writer is None
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
+
+
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("controller", "anchor_unavailable"),
+        ("selected", "managed_slot_changed"),
+        ("python", "anchor_unavailable"),
+        ("python-replaced", "anchor_unavailable"),
+        ("anchor", "anchor_unavailable"),
+        ("slot", "managed_slot_unavailable"),
+        ("lease", "lock_not_owned"),
+        ("deadline", ""),
+        ("deadline-controller", "anchor_unavailable"),
+        ("cgroup", "cgroup_not_empty"),
+    ],
+)
+async def test_start_first_guard_rechecks_changes_after_the_probe_returns(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, fault: str, code: str
+) -> None:
+    host = shared_host
+    record = await prepare_start(host, "target")
+    disk, commands, service = host.backend._disk(), list(host.commands), host.probe.snapshot
+    state_path = host.journal.directory.path / "state.json"
+    state_bytes = state_path.read_bytes()
+    checks = observe_checks(host, monkeypatch)
+    original = FixedLock.__enter__
+    entered: list[FixedLock] = []
+    lock_path = host.journal.writer_directory.path / "lease"
+    retained = lock_path.with_name(lock_path.name + ".retained")
+
+    def writer(lease: FixedLock) -> FixedLock:
+        result = original(lease)
+        if lease.directory is host.journal.writer_directory and not entered:
+            assert host.probe.count == 1 and len(checks) == 2
+            entered.append(lease)
+            if fault in {"deadline", "deadline-controller"}:
+                host.clock.elapsed = record.deadline.seconds - record.deadline.rollback_reserve
+            if fault == "lease":
+                assert not retained.exists()
+                lock_path.rename(retained)
+                lock_path.write_bytes(b"")
+                lock_path.chmod(0o600)
+            elif fault == "cgroup":
+                host.events.write_bytes(b"populated 1\n")
+            elif fault == "python-replaced":
+                path = Path(host.backend.controller_slot.resolved_python.path)
+                before = path.stat()
+                replacement = path.with_name(path.name + ".replacement")
+                replacement.write_bytes(path.read_bytes())
+                replacement.chmod(stat.S_IMODE(before.st_mode))
+                os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+                replacement.replace(path)
+                after = path.stat()
+                assert (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+            elif fault in {"controller", "selected", "python", "deadline-controller"}:
+                path = (
+                    Path(host.backend.controller_slot.resolved_python.path)
+                    if fault == "python"
+                    else Path(host.slots["target" if fault == "selected" else "base"].package.root)
+                    / "batch_payload/first.bin"
+                )
+                rewrite_with_restored_mtime(path, path.read_bytes(), path.stat())
+            elif fault in {"anchor", "slot"}:
+                digest = host.anchor.digest if fault == "anchor" else host.slots["target"].digest
+                path = host.journal.directory.path / f"{fault}-{digest}.json"
+                path.write_bytes(b"{}")
+        return result
+
+    monkeypatch.setattr(FixedLock, "__enter__", writer)
+    expected = (
+        TimeoutError
+        if fault == "deadline"
+        else TransactionError
+        if fault == "lease"
+        else ObservationError
+        if fault == "cgroup"
+        else ManagedDeploymentError
+    )
+    try:
+        with pytest.raises(expected, match=f"^{code}$"):
+            await host.backend.start(record, "target")
+    finally:
+        if retained.exists():
+            lock_path.unlink()
+            retained.rename(lock_path)
+
+    assert len(entered) == 1 and entered[0].fd is None and len(checks) == 3
+    assert host.probe.count == 1 and host.probe.snapshot == service
+    assert host.commands == commands and host.transport.calls == []
+    assert host.record() == record and state_path.read_bytes() == state_bytes
+    same_disk = host.backend._disk() == disk
+    assert same_disk and host.writer is None
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
