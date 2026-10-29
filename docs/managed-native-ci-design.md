@@ -154,13 +154,13 @@ Native54 合并两处同步重复工作：解释器终点直接使用已经打�
 
 Native54 第一代 checks 为 141 次 / 15945 毫秒、host_record 31 次 / 3810 毫秒、bus 231 次 / 4866 毫秒、HTTP 13 次 / 1830 毫秒。bus 调用从 291 减为 231 的结果已实际观察到；其它成本也随运行变化，不能把相邻总耗时差归因于本轮优化，或将 checks 当成纯摘要计算。
 
-最新候选复用每个实际已打开 FD 的首次身份进行包叶分类，去掉仅用于区分目录、未参与普通叶身份比较的一次 path stat。普通叶仍保留一次真实 open、前后 FD 身份和末次 nofollow path 身份；目录、完整摘要、资源预算与各效果门保持。首红后 31 项针对性验证和十八文件 315 项整合回归通过（74.28 秒、峰值 180.9 MiB、swap 0）；490 文件 Ruff/格式和 160 个源码严格类型检查通过，独立后审未发现 P1/P2。完整合同见[效果后端](managed-backend.md)。
+最新候选复用每个实际已打开 FD 的首次身份进行包叶分类，去掉仅用于区分目录、未参与普通叶身份比较的一次 path stat。普通叶仍保留一次真实 open、前后 FD 身份和末次 nofollow path 身份；目录、完整摘要、资源预算与各效果门保持。首红后 31 项针对性验证和十八文件 315 项整合回归通过（74.28 秒、峰值 180.9 MiB、swap 0）；490 文件 Ruff/格式和 160 个源码严格类型检查通过，独立后审未发现 P1/P2。完整合同见[效果后端](../devarchive/managed-backend-authentication-design.md)。
 
 [Native53，准确签名候选 `d86a4bf`](https://github.com/69gg/MuLi/actions/runs/40202322156) 已全部终态：十二项通用作业成功，包含 Linux、Windows、macOS 与 MCP；仅原生 [job `121195909369`](https://github.com/69gg/MuLi/actions/runs/40202322156/job/121195909369) 仍失败。前两代分别在 26011 和 49507 毫秒完成投影；第三代 51388 毫秒 prepared、55481 毫秒 draining、58196 毫秒 stop_base，随后 60001 毫秒以 `TimeoutError` / `helper_exit` 结束，尚未进入本轮失败回退。cleanup verified；仅获取 2492 字节 evidence，SHA256 `bb540a66ab5f887111035bde7c476690289a1fc50522ad1e3215d55cad81126e`，核对两成员及完整结果合同。原生三事务仍未验收。
 
 Native53 两个完整代的 backend checks 均 141 次，分别 10409 / 10942 毫秒；host_record 均 31 次、2577 / 2540 毫秒，bus 均 291 次、2872 / 2888 毫秒，HTTP 均 13 次、1033 / 943 毫秒。相邻运行多项耗时均变化，不能将全部差值归因于分类查询修改，也不能把 checks 视为纯 SHA 成本。
 
-后续候选已合入 v2.72。在单次同步 `_confirm` 内复用已成功核验、文件身份不变的 package 叶内容摘要，并将同一次同步安装的三组件循环与首次确认合为一个局部批次。每轮仍完整遍历、打开、核身份和累计资源预算；只有完整 guard 与合法磁盘状态均通过才提升证明，不跨函数返回、等待或独立确认。十七文件 339 项通过（74.87 秒、峰值 150.2 MiB、swap 0），489 文件 Ruff/格式及 160 源码严格类型检查通过；独立后审未发现 P1/P2。新增三项先得到预期的一红两绿，再验证读取减少、等待之后重新认证和跨组件内容漂移拒绝；完整 switch 的三十一次 checks 保持。该本地证据仍不代表下面的原生三事务已通过，完整语义见[效果后端](managed-backend.md)。
+后续候选已合入 v2.72。在单次同步 `_confirm` 内复用已成功核验、文件身份不变的 package 叶内容摘要，并将同一次同步安装的三组件循环与首次确认合为一个局部批次。每轮仍完整遍历、打开、核身份和累计资源预算；只有完整 guard 与合法磁盘状态均通过才提升证明，不跨函数返回、等待或独立确认。十七文件 339 项通过（74.87 秒、峰值 150.2 MiB、swap 0），489 文件 Ruff/格式及 160 源码严格类型检查通过；独立后审未发现 P1/P2。新增三项先得到预期的一红两绿，再验证读取减少、等待之后重新认证和跨组件内容漂移拒绝；完整 switch 的三十一次 checks 保持。该本地证据仍不代表下面的原生三事务已通过，完整语义见[效果后端](../devarchive/managed-backend-authentication-design.md)。
 
 同步安装批次的 [Native52，准确签名候选 `a36466d`](https://github.com/69gg/MuLi/actions/runs/40198403849) 已全部终态：十二项通用作业成功，包含 Linux、Windows、macOS 与 MCP；原生 [job `121184143534`](https://github.com/69gg/MuLi/actions/runs/40198403849/job/121184143534) 仍失败，60001 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。第一代完整投影为 40157 毫秒；第二代 42388 毫秒 prepared、48549 毫秒 draining、52636 毫秒 stop_base、56139 毫秒 install_target。cleanup verified；仅获取 2093 字节 evidence，SHA256 `7104641d60d265429e64e542e8786dcd4752dcc3ff503c86ea4108940cf1183f`，核对两成员及完整合同。
 

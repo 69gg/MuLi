@@ -56,7 +56,7 @@ async def test_host_command_authenticates_the_post_http_probe_boundary_once(
     disk, service = host.backend._disk(), host.probe.snapshot
     commands, http_start = list(host.commands), len(host.transport.calls)
     host.probe.count = 0
-    scans = observe_complete_package_scans(host, monkeypatch)
+    scans = observe_complete_package_scans(host, monkeypatch, adjacent_proofs=True)
     probes = observe_probes(host, monkeypatch)
     reads = observe_payloads(host, monkeypatch) if command == "activate-target" else None
     post_probe_scans: dict[Path, int] = {}
@@ -107,7 +107,9 @@ async def test_host_command_authenticates_the_post_http_probe_boundary_once(
         assert result is None
     assert host.admission == ("paused" if action == "drain" else "released")
     if reads is not None:
-        assert_actual_payload_reads(reads, scans)
+        assert_actual_payload_reads(
+            reads, scans, reused={Path(host.backend.controller_slot.package.root): 1}
+        )
     controller = Path(host.backend.controller_slot.package.root)
     selected_root = Path(host.slots[selected].package.root)
     if selected_root != controller:

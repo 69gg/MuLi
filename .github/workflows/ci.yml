@@ -110,7 +110,10 @@ jobs:
       - name: Install Windows PDF converter
         if: runner.os == 'Windows'
         id: pdf-msys2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        env:
+          # 已核对固定提交中的内部开关，避开曾同步失败的重定向镜像。
+          __SETUP_MSYS2_USE_MAIN_MIRROR_ONLY: 'true'
         with:
           msystem: UCRT64
           release: false

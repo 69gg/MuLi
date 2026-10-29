@@ -18,7 +18,7 @@ import secrets
 import subprocess
 import tempfile
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -43,6 +43,18 @@ from .shell_protocol import (
 StreamName = Literal["output", "stderr"]
 Guard = Callable[[], None]
 _STREAMS: tuple[StreamName, StreamName] = ("output", "stderr")
+
+
+@dataclass(frozen=True, slots=True)
+class ShellFinished:
+    session_id: str
+    command_id: str
+    os_epoch: str
+    state: str
+    exit_code: int | None
+
+
+FinishCallback = Callable[[ShellFinished], Awaitable[None]]
 
 
 class OutputCursor(TypedDict):
@@ -240,6 +252,9 @@ class _Command:
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     done: asyncio.Event = field(default_factory=asyncio.Event)
     monitor: asyncio.Task[None] | None = None
+    notify_on_finish: bool = False
+    dispatched: bool = False
+    finish_attempted: bool = False
 
 
 @dataclass(slots=True)
@@ -283,6 +298,7 @@ class ShellSessions:
         max_command_bytes: Callable[[], int],
         max_run_seconds: Callable[[], float],
         max_receipt_chars: Callable[[], int] | None = None,
+        on_finish: FinishCallback | None = None,
     ) -> None:
         self.default_cwd = default_cwd
         self.executable = executable
@@ -291,6 +307,7 @@ class ShellSessions:
         self._max_command_bytes = max_command_bytes
         self._max_run_seconds = max_run_seconds
         self._max_receipt_chars = max_receipt_chars
+        self._on_finish = on_finish
         self._sessions: dict[str, _Shell] = {}
         self._commands: OrderedDict[str, _Command] = OrderedDict()
         self._closed = False
@@ -326,7 +343,13 @@ class ShellSessions:
         limit = max(1, self._max_sessions())
         while len(self._commands) >= limit:
             removable = next(
-                (key for key, item in self._commands.items() if item.state != "running"), None
+                (
+                    key
+                    for key, item in self._commands.items()
+                    if item.state != "running"
+                    and (not item.notify_on_finish or item.monitor is None or item.monitor.done())
+                ),
+                None,
             )
             if removable is None:
                 raise ShellSessionError("capacity", "shell 命令记录容量已满")
@@ -341,8 +364,11 @@ class ShellSessions:
         cwd: Path | None = None,
         wait_seconds: float = 1,
         timeout: float | None = None,
+        notify_on_finish: bool = False,
         admission_guard: Guard,
     ) -> dict[str, Any]:
+        if type(notify_on_finish) is not bool:
+            raise ShellSessionError("invalid_argument", "shell 完成通知选择必须是布尔值")
         wait = self._number(wait_seconds, maximum=10, zero=True)
         maximum = self._max_run_seconds()
         duration = self._number(
@@ -373,13 +399,28 @@ class ShellSessions:
             directory = tempfile.TemporaryDirectory(prefix="muli-shell-")
             shell = _Shell(session_id, spec, directory, str(initial))
             self._sessions[session_id] = shell
-        item = _Command(secrets.token_hex(16), shell, asyncio.get_running_loop().time() + duration)
+        item = _Command(
+            secrets.token_hex(16),
+            shell,
+            asyncio.get_running_loop().time() + duration,
+            notify_on_finish=notify_on_finish,
+        )
         try:
             metadata = self._receipt_metadata(item, _empty_cursor())
             # Immutable identity is a conservative lower bound; keep the full
             # receipt check after startup and adjacent to command dispatch.
             self._receipt_budget(
-                {key: metadata[key] for key in ("session_id", "command_id", "os_epoch")},
+                {
+                    key: metadata[key]
+                    for key in (
+                        "session_id",
+                        "command_id",
+                        "os_epoch",
+                        "notify_on_finish",
+                        "notification_destination",
+                    )
+                    if key in metadata
+                },
                 before_dispatch=True,
             )
             self._retain_command(item)
@@ -423,6 +464,7 @@ class ShellSessions:
                     raise ShellSessionError("protocol", "shell 输入连接不可用")
                 writer = process.stdin
                 writer.write(dispatch(shell.root, item.id, shell.spec.flavor))
+            item.dispatched = True
             await asyncio.wait_for(writer.drain(), CONTROL_TIMEOUT)
             if wait:
                 with contextlib.suppress(TimeoutError):
@@ -661,12 +703,41 @@ class ShellSessions:
                 item.changed.set()
                 with contextlib.suppress(OSError):
                     command_file(shell.root, item.id, shell.spec.flavor).unlink(missing_ok=True)
+                await self._finish(item)
             else:
                 await asyncio.shield(self._retire(shell, "unknown" if ready else "timed_out"))
         finally:
             proof.cancel()
             lost.cancel()
             await asyncio.gather(proof, lost, return_exceptions=True)
+
+    async def _finish(self, item: _Command) -> None:
+        if (
+            not item.notify_on_finish
+            or not item.dispatched
+            or not item.done.is_set()
+            or item.finish_attempted
+            or self._on_finish is None
+        ):
+            return
+        # Claim before suspension: a concurrent retire must neither publish
+        # twice nor detach a callback from its original monitor/cleanup owner.
+        item.finish_attempted = True
+        try:
+            await self._on_finish(
+                ShellFinished(
+                    item.shell.session_id,
+                    item.id,
+                    item.shell.epoch,
+                    item.state,
+                    item.exit_code if item.state == "completed" else None,
+                )
+            )
+        except (Exception, asyncio.CancelledError):
+            # This optional local notice never rewrites the observed command
+            # outcome or prevents process cleanup. Recovery is an explicit read,
+            # not an automatic command replay or detached notification retry.
+            pass
 
     async def _watch(self, shell: _Shell) -> None:
         process = shell.process
@@ -716,8 +787,11 @@ class ShellSessions:
         tasks = [*shell.readers]
         if shell.watcher is not None:
             tasks.append(shell.watcher)
-        if shell.current is not None and shell.current.monitor is not None:
-            tasks.append(shell.current.monitor)
+        tasks.extend(
+            item.monitor
+            for item in self._commands.values()
+            if item.shell is shell and item.monitor is not None
+        )
         if shell.process is not None:
             try:
                 await _settle_process(shell.process, tasks)
@@ -752,6 +826,8 @@ class ShellSessions:
                 shell.current.state = "unknown"
             shell.current.done.set()
             shell.current.changed.set()
+        if shell.current is not None:
+            await self._finish(shell.current)
         if not failures:
             if self._sessions.get(shell.session_id) is shell:
                 del self._sessions[shell.session_id]
@@ -874,6 +950,11 @@ class ShellSessions:
             "discarded_bytes": item.output.discarded,
             "truncated": item.output.discarded > 0,
             "output_scope": "shell",
+            **(
+                {"notify_on_finish": True, "notification_destination": "web"}
+                if item.notify_on_finish
+                else {}
+            ),
         }
 
     def _receipt(self, item: _Command, cursor: OutputCursor) -> dict[str, Any]:

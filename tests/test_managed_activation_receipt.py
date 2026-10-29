@@ -98,7 +98,7 @@ async def test_valid_activation_reply_releases_the_same_controller_step(
     original_writer_is_held(host, writer)
     disk, service = host.backend._disk(), host.probe.snapshot
     commands, transport_start = list(host.commands), len(host.transport.calls)
-    scans = observe_complete_package_scans(host, monkeypatch)
+    scans = observe_complete_package_scans(host, monkeypatch, adjacent_proofs=True)
     probes = observe_probes(host, monkeypatch)
     reply_scans: dict[Path, int] = {}
     reply_probe_counts: list[int] = []

@@ -59,7 +59,9 @@ def observe_probes(host: Host, monkeypatch: pytest.MonkeyPatch) -> list[ManagedP
     return results
 
 
-def observe_complete_package_scans(host: Host, monkeypatch: pytest.MonkeyPatch) -> dict[Path, int]:
+def observe_complete_package_scans(
+    host: Host, monkeypatch: pytest.MonkeyPatch, *, adjacent_proofs: bool = False
+) -> dict[Path, int]:
     expected = {
         Path(slot.package.root): slot.package.model_dump(mode="json")
         for slot in (host.backend.controller_slot, *host.slots.values())
@@ -74,10 +76,14 @@ def observe_complete_package_scans(host: Host, monkeypatch: pytest.MonkeyPatch) 
         verified: dict[str, dict[str, Any]] | None = None,
         observed: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, object]:
-        # Every admitted scan still runs the complete original bytes/SHA walk.
-        # Neither await boundary may inherit a previous package proof.
-        assert verified is None and observed is None
-        result = original(root, limits)
+        # Ordinary observations retain independent full bytes at every await
+        # boundary. Effect tests may explicitly observe adjacent byte proofs;
+        # they still count every real original walk and its complete digest.
+        if adjacent_proofs:
+            result = original(root, limits, verified=verified, observed=observed)
+        else:
+            assert verified is None and observed is None
+            result = original(root, limits)
         complete = result == expected[root]
         assert complete
         counts[root] += 1
@@ -87,15 +93,23 @@ def observe_complete_package_scans(host: Host, monkeypatch: pytest.MonkeyPatch) 
     return counts
 
 
-def assert_actual_payload_reads(reads: PackageReads, scans: dict[Path, int]) -> None:
+def assert_actual_payload_reads(
+    reads: PackageReads,
+    scans: dict[Path, int],
+    *,
+    reused: Mapping[Path, int] | None = None,
+) -> None:
     for leaf, observed in reads.leaves.items():
-        copies = next(count for root, count in scans.items() if leaf.is_relative_to(root))
+        root = next(root for root in scans if leaf.is_relative_to(root))
+        copies = scans[root]
         assert copies > 0
         assert len(observed.opened) == copies
         assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
         assert observed.fd_stats >= 2 * copies
         assert observed.path_stats == copies
-        assert observed.bytes == reads.sizes[leaf] * copies
+        content_copies = copies - (0 if reused is None else reused.get(root, 0))
+        assert content_copies >= 0
+        assert observed.bytes == reads.sizes[leaf] * content_copies
     for directory, count in reads.scans.items():
         copies = next(value for root, value in scans.items() if directory.is_relative_to(root))
         assert count == copies
@@ -117,7 +131,7 @@ async def test_stop_reuses_one_complete_preflight_before_its_second_probe(
     writer.check()
     writer_info = os.fstat(writer.fd)
     probes = observe_probes(host, monkeypatch)
-    scans = observe_complete_package_scans(host, monkeypatch)
+    scans = observe_complete_package_scans(host, monkeypatch, adjacent_proofs=True)
     python_reads = observe_python_reads(host, monkeypatch)
     reads = observe_payloads(host, monkeypatch)
     checks = observe_checks(host, monkeypatch)
@@ -166,20 +180,24 @@ async def test_stop_reuses_one_complete_preflight_before_its_second_probe(
     copies = scans[controller]
     assert copies > 0 and scans[target] == 0
     assert checks == [(record, None)] * copies
-    assert python_reads.bytes == host.backend.controller_slot.resolved_python.identity.size * copies
+    content_copies = copies - 2
+    assert python_reads.bytes == (
+        host.backend.controller_slot.resolved_python.identity.size * content_copies
+    )
     assert len(python_reads.opened) == copies
     assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in python_reads.opened)
     for leaf, observed in reads.leaves.items():
         expected = copies if leaf.is_relative_to(controller) else 0
         assert leaf.is_relative_to(controller) or leaf.is_relative_to(target)
-        assert observed.bytes == reads.sizes[leaf] * expected
+        expected_content = content_copies if leaf.is_relative_to(controller) else 0
+        assert observed.bytes == reads.sizes[leaf] * expected_content
         assert len(observed.opened) == expected
         assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
         assert observed.fd_stats >= 2 * expected and observed.path_stats == expected
     for directory, count in reads.scans.items():
         assert count == (copies if directory.is_relative_to(controller) else 0)
-    # Keep all actual effects, complete bytes and lock/state assertions ahead of
-    # the old-code red: the adjacent effect guard and probe precheck duplicate a scan.
+    # All five independent authentication walks and lock/state gates remain;
+    # only the two adjacent byte copies use their successful post-probe proofs.
     assert copies == 5
 
 

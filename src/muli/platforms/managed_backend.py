@@ -609,7 +609,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             )
         ):
             raise ObservationError("transaction_effect_not_permitted")
-        before, disk = await self._probe(record), self._disk()
+        postproofs = _FileProofs()
+        before, disk = await self._probe(record, postproofs=postproofs), self._disk()
         boot = before.service.unit.invocation
         if (
             before.service.unit.active_state != "active"
@@ -618,7 +619,13 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             and (record.health is None or record.health.boot != boot)
         ):
             raise ObservationError("foreign_transaction_process")
-        self._effect_guard(record, "base" if role is None else role)
+        self._effect_guard(
+            record,
+            "base" if role is None else role,
+            verified_python=postproofs.python,
+            verified_packages=postproofs.packages,
+        )
+        del postproofs
         if action == "activate":
             attempt = record.generation, boot, role
             if self._activation_attempt == attempt:
@@ -693,7 +700,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             ("rolling_back", "stop_target", "target"),
         }:
             raise ObservationError("transaction_effect_not_permitted")
-        before, disk = await self._probe(record), self._disk()
+        postproofs = _FileProofs()
+        before, disk = await self._probe(record, postproofs=postproofs), self._disk()
         if self._stopped(before.service):
             return
         expected = (
@@ -708,14 +716,34 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             or before.service.unit.active_state == "deactivating"
         ):
             return
+
+        def preflight() -> None:
+            self._effect_guard(
+                record,
+                None,
+                verified_python=postproofs.python,
+                verified_packages=postproofs.packages,
+            )
+            # These bytes belong only to the preceding post-await guard.
+            # Clear them before _probe enters its next real observation await.
+            postproofs.python = None
+            postproofs.packages = None
+
         # Stop-only may terminate a precisely observed broken slot. It neither
         # grants health nor requires that slot's damaged package to run again.
+        final_postproofs = _FileProofs()
         if (
-            before != await self._probe(record, preflight=lambda: self._effect_guard(record, None))
+            before != await self._probe(record, preflight=preflight, postproofs=final_postproofs)
             or disk != self._disk()
         ):
             raise ObservationError("transaction_observation_changed")
-        self._effect_guard(record, None)
+        self._effect_guard(
+            record,
+            None,
+            verified_python=final_postproofs.python,
+            verified_packages=final_postproofs.packages,
+        )
+        del final_postproofs
         await self._command("stop")
 
     def _install_files(

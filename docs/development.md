@@ -53,6 +53,12 @@ python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 
 失败后先看有限日志和相关代码，不循环触发同一个失控用例。比较 DOM 或含循环引用对象的身份时，断言布尔结果，避免失败报告递归展开整个对象图。
 
+### YAML 依赖的类型检查
+
+PyYAML 当前没有类型声明；`pyproject.toml` 仅为 `yaml.*` 设置库专用 `ignore_missing_imports`，统一覆盖根模块及子模块，不在每个导入上重复行内 ignore。YAML 导入值仍按 `Any` 处理；业务代码的严格检查与 unused-ignore 检查继续生效。
+
+`tests/test_typecheck_yaml.py` 使用实际项目配置和 YAML 导入，分别检查冷缓存、依赖类型变化后的暖缓存，并验证业务返回类型错误与多余 ignore 仍会报错。测试使用独立临时缓存，固定三次子进程检查，每次最多20秒，不安装依赖或重试。
+
 ## 托管 CI
 
 CI 共17项作业，包含14项后端测试分片、质量、MCP 与 Linux 原生作业，验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 macOS 每个版本按测试文件分成两份不重叠集合，Windows 分成三份；全部分片合起来覆盖完整测试集合，同文件的参数化用例与夹具生命周期保持在一起。分组使用仓库相对文件名的稳定摘要，新增文件不会重排已有文件；pytest 自身的发现与忽略规则保持生效，分片不保证耗时均分。正式发布复用这17项验证，并另运行准备、PyPI 发布与 GitHub Release，共20项作业。
@@ -63,7 +69,7 @@ CI 共17项作业，包含14项后端测试分片、质量、MCP 与 Linux 原�
 
 质量作业检查格式、类型、前端与发行包；可选集成作业另安装 MCP 和渠道依赖，覆盖默认环境可能跳过的 SDK 路径。每项保留 workflow 硬超时、有限并发和 Node 堆限制；诊断用的 `faulthandler_timeout` 不能代替终止期限。
 
-Windows 托管矩阵通过 [MSYS2 官方 action](https://github.com/msys2/setup-msys2) 复用 runner 已有环境，安装 [UCRT64 Poppler](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-poppler)，把其程序目录放到测试 PATH 前面并记录版本。这样真实 PDF 用例使用支持标准输入的转换器，避免命中 Git for Windows 附带的同名 Xpdf 程序。下载与安装仅发生在托管 runner；本机离线检查不安装转换器，也不改变真实文档用例的断言或可选依赖缺失行为。
+Windows 托管矩阵通过 [MSYS2 官方 action](https://github.com/msys2/setup-msys2) 复用 runner 已有环境，安装 [UCRT64 Poppler](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-poppler)，把其程序目录放到测试 PATH 前面并记录版本。安装步骤固定已核对的 action 提交，通过该实现支持的内部环境变量 `__SETUP_MSYS2_USE_MAIN_MIRROR_ONLY=true` 选择官方 `repo.msys2.org` 主镜像，避开曾在 pytest 前同步失败的重定向源；该开关不是公开输入，升级 action 时须重新核对[实现](https://github.com/msys2/setup-msys2/blob/ec48f7c5447b3140e2b088413ae3a55687bccb6e/index.js)。完整系统升级、签名校验及转换器版本检查保持启用。这样真实 PDF 用例使用支持标准输入的转换器，避免命中 Git for Windows 附带的同名 Xpdf 程序。下载与安装仅发生在托管 runner；本机离线检查不安装转换器，也不改变真实文档用例的断言或可选依赖缺失行为。
 
 Windows 原生无障碍测试仅在托管 CI 创建并操作自己的临时窗口，本机开发不读取或点击真实桌面。专用诊断工作流与完整跨平台 CI 的覆盖范围不同，不能相互代替。
 
