@@ -83,6 +83,10 @@ let memorySources = null;
 let memorySourceRetry = null;
 const memorySourcePageSize = 20;
 const memoryJobStates = { queued: "已排队", processing: "整理中", retry: "等待自动重试", failed: "整理失败", done: "整理完成", deferred: "等待接纳" };
+let memoryWatches = null;
+let memoryWatchCancel = null;
+const memoryWatchPending = new Map();
+const memoryWatchPageSize = 20;
 let historyDialog = null;
 let dialogHistoryReturn = null;
 const historyPageSize = 50;
@@ -209,6 +213,7 @@ function connectionCurrent(owner) {
 
 function invalidateConnection() {
   state.voiceSetupController?.release();
+  releaseMemoryWatches();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -1058,6 +1063,7 @@ function resizeComposer() {
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, onSubmit }) {
   releaseMemorySourceRetry();
+  releaseMemoryWatchCancel();
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
@@ -1119,6 +1125,7 @@ async function switchView(view, owner = connection) {
   }
   cancelMemorySearch(); releaseMemoryPath();
   releaseMemorySources();
+  releaseMemoryWatches();
   releaseWorkflowActivity();
   releaseRecordDirectory();
   if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
@@ -1133,6 +1140,11 @@ async function switchView(view, owner = connection) {
   if (view === "memories" && state.memoryTab === "sources") {
     state.viewLoading = false; renderOtherView();
     await loadMemorySources(memorySources);
+    return;
+  }
+  if (view === "memories" && state.memoryTab === "watches") {
+    state.viewLoading = false; renderOtherView();
+    await loadMemoryWatches(memoryWatches);
     return;
   }
   if (view === "records") {
@@ -1637,12 +1649,16 @@ function renderMemories() {
   const form = element("form", { class: "content-toolbar", onSubmit: async (event) => {
     event.preventDefault(); await searchMemories(search.value.trim());
   } }, element("div", { class: "search-field" }, icon("search"), search), element("button", { class: "secondary-button", type: "submit", text: "检索" }));
-  const tabs = element("div", { class: "role-tabs memory-tabs", role: "tablist", "aria-label": "记忆视图" }, ...[["list", "记忆列表"], ["sources", "来源"], ["graph", "关系图"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.memoryTab === key ? "active" : "", text: label, "aria-selected": String(state.memoryTab === key), dataset: { memoryTab: key } })));
+  const tabs = element("div", { class: "role-tabs memory-tabs", role: "tablist", "aria-label": "记忆视图" }, ...[["list", "记忆列表"], ["sources", "来源"], ["watches", "长期留意"], ["graph", "关系图"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.memoryTab === key ? "active" : "", text: label, "aria-selected": String(state.memoryTab === key), dataset: { memoryTab: key } })));
   const root = element("div", { class: "view-content" }, viewHeading("记忆", "保留偏好、事实与长期上下文。", actionButton("新增记忆", "new-memory", "primary-button", "plus")), tabs);
   if (state.memoryTab === "graph") { root.append(renderMemoryGraph()); return root; }
   if (state.memoryTab === "sources") {
     memorySources ??= { filter: state.memorySourceState ?? "", page: null, cursor: null, controller: null, error: "", receipt: null };
     root.append(renderMemorySources(memorySources)); return root;
+  }
+  if (state.memoryTab === "watches") {
+    memoryWatches ??= { owner: connection, page: null, after: "", starts: [""], controller: null, error: "", notice: "", fresh: false };
+    root.append(renderMemoryWatches(memoryWatches)); return root;
   }
   if (state.memorySourceId) root.append(element("div", { class: "list-caption" }, "仅此来源", element("span", { class: "memory-source-content", text: state.memorySourceId }), element("button", { type: "button", class: "text-button", text: "查全库", dataset: { memoryGlobal: "true" }, onClick: () => void changeMemorySource(null) })));
   root.append(form, element("div", { class: "list-caption" }, `${state.memories.length} 条记忆`, state.memoryQuery ? `“${state.memoryQuery}”` : state.memorySourceId ? "来源内结果" : "全部记忆"));
@@ -1687,10 +1703,137 @@ function memorySourceActionCurrent(slot, trigger) {
 }
 
 async function selectMemoryTab(tab) {
-  cancelMemorySearch(); releaseMemoryPath(); releaseMemorySources();
+  cancelMemorySearch(); releaseMemoryPath(); releaseMemorySources(); releaseMemoryWatches();
   if (memoryDialog?.catalogSource) { $("#app-dialog").close(); releaseMemoryDialog(); }
   state.memoryTab = tab; renderOtherView();
   if (tab === "sources") await loadMemorySources(memorySources);
+  if (tab === "watches") await loadMemoryWatches(memoryWatches);
+}
+
+function releaseMemoryWatchCancel() {
+  const pending = memoryWatchCancel; memoryWatchCancel = null;
+  const attempt = pending?.attempt;
+  if (attempt && memoryWatchPending.get(pending.item.id) === attempt && attempt.state === "pending") {
+    attempt.state = "unknown"; attempt.controller.abort();
+  }
+  if (pending && $("#app-dialog").open && $("#dialog-content").firstElementChild === pending.content) $("#app-dialog").close();
+}
+
+function releaseMemoryWatches() {
+  const slot = memoryWatches; memoryWatches = null;
+  slot?.controller?.abort(); releaseMemoryWatchCancel();
+  if (slot) { slot.page = null; slot.fresh = false; slot.root?.replaceChildren(); }
+}
+
+function memoryWatchesCurrent(slot) {
+  return !!slot && memoryWatches === slot && connectionCurrent(slot.owner) && state.auth.authenticated && state.view === "memories" && state.memoryTab === "watches";
+}
+
+function memoryWatchActionCurrent(slot, item, trigger) {
+  return memoryWatchesCurrent(slot) && slot.fresh && !slot.controller && !slot.page.processing.paused && item.state === "active" && !memoryWatchPending.has(item.id) && slot.page.items.includes(item) && !!trigger && !trigger.disabled && trigger.dataset.watchId === item.id && trigger.dataset.watchRevision === String(item.revision) && $("#other-view").contains(slot.root) && slot.result.contains(trigger);
+}
+
+function memoryWatchPage(value, after) {
+  const bad = () => { throw new Error("长期留意清单无法完整核查，请刷新。"); };
+  if (!value || value.after_id !== after || !Array.isArray(value.items) || value.items.length > memoryWatchPageSize || typeof value.has_more !== "boolean" || !value.processing || typeof value.processing.enabled !== "boolean" || typeof value.processing.paused !== "boolean") bad();
+  if (value.has_more !== (value.items.length === memoryWatchPageSize) || (value.has_more ? value.next_after_id !== value.items.at(-1)?.id : value.next_after_id !== null)) bad();
+  let previous = after;
+  for (const item of value.items) {
+    const preference = item?.reply_preference;
+    if (!item || typeof item.id !== "string" || !/^[a-f0-9]{64}$/.test(item.id) || item.id <= previous || typeof item.question !== "string" || !item.question.trim() || !Array.isArray(item.match_terms) || !item.match_terms.length || item.match_terms.some((term) => typeof term !== "string" || !term.trim()) || new Set(item.match_terms).size !== item.match_terms.length || !["active", "cancelled"].includes(item.state) || !Number.isSafeInteger(item.revision) || item.revision < 1 || !preference || !["default_web", "registered_web", "registered_channel"].includes(preference.kind)) bad();
+    if (preference.kind === "registered_channel" ? !CHANNELS.some(([name]) => name === preference.channel) : Object.hasOwn(preference, "channel")) bad();
+    previous = item.id;
+  }
+  return value;
+}
+
+function memoryWatchPreference(preference) {
+  if (preference.kind === "registered_channel") return `登记时渠道 · ${CHANNELS.find(([name]) => name === preference.channel)[1]}`;
+  return preference.kind === "registered_web" ? "登记时 Web" : "默认 Web";
+}
+
+function renderMemoryWatches(slot) {
+  slot.refresh = element("button", { type: "button", class: "secondary-button", text: "刷新清单", onClick: () => void loadMemoryWatches(slot) });
+  slot.previous = element("button", { type: "button", class: "text-button", text: "上一页", onClick: () => void loadMemoryWatches(slot, slot.starts.slice(0, -1)) });
+  slot.next = element("button", { type: "button", class: "text-button", text: "继续翻页", onClick: () => void loadMemoryWatches(slot, [...slot.starts, slot.page.next_after_id]) });
+  slot.position = element("p", { class: "settings-role-hint", role: "status" });
+  slot.noticeRegion = element("p", { class: "settings-notice", role: "status" }); slot.result = element("div");
+  slot.root = element("section", { "aria-label": "长期留意清单" }, element("div", { class: "content-toolbar" }, slot.refresh), element("p", { class: "settings-role-hint", text: "在主对话中告诉沐璃要长期留意的问题。" }), slot.position, slot.noticeRegion, slot.result, element("div", { class: "content-toolbar" }, slot.previous, slot.next));
+  updateMemoryWatches(slot); return slot.root;
+}
+
+function updateMemoryWatches(slot) {
+  if (!slot.root) return;
+  const loading = !!slot.controller, page = slot.page;
+  slot.root.setAttribute("aria-busy", String(loading)); slot.refresh.disabled = loading;
+  slot.previous.disabled = loading || slot.starts.length < 2;
+  slot.next.disabled = loading || !slot.fresh || !page?.has_more;
+  slot.position.textContent = loading ? "正在读取长期留意清单…" : slot.error ? `读取失败：${slot.error}，当前清单未确认。` : page ? `第 ${slot.starts.length} 页 · ${page.items.length} 条${page.has_more ? "，仍可继续翻页" : "，已读到本次目录末尾"}` : "尚未读取清单。";
+  slot.noticeRegion.textContent = [slot.notice, page?.processing.paused ? "维护期间只读，暂不能停止。" : page && !page.processing.enabled ? "资料检查未启用，仍可管理登记。" : ""].filter(Boolean).join(" ");
+  slot.noticeRegion.hidden = !slot.noticeRegion.textContent;
+  slot.result.replaceChildren();
+  if (!page) return;
+  if (!page.items.length && slot.fresh) slot.result.append(element("p", { class: "settings-role-hint", text: slot.after ? "这个窗口没有更多登记。" : "还没有长期留意登记。" }));
+  for (const item of page.items) {
+    const pending = memoryWatchPending.get(item.id);
+    const stop = element("button", { type: "button", class: "text-button", text: "停止留意", disabled: loading || !slot.fresh || page.processing.paused || item.state !== "active" || !!pending, dataset: { watchId: item.id, watchRevision: String(item.revision) }, onClick: () => confirmMemoryWatchCancel(slot, item, stop) });
+    const stateLabel = pending?.state === "pending" ? "正在提交停止请求" : pending ? "停止结果未确认，请先刷新核对" : item.state === "cancelled" ? "已停止" : "已登记";
+    const content = element("div", { class: "row-content" }, element("p", { text: item.question }), element("p", { class: "settings-role-hint", text: `同时匹配：${item.match_terms.join("、")}` }), element("div", { class: "row-meta" }, element("span", { text: stateLabel }), element("span", { text: memoryWatchPreference(item.reply_preference) })));
+    slot.result.append(element("article", { class: "memory-row" }, content, element("div", { class: "row-actions" }, stop)));
+  }
+}
+
+async function loadMemoryWatches(slot, starts = slot?.starts) {
+  if (!memoryWatchesCurrent(slot) || !starts?.length) return;
+  slot.controller?.abort();
+  const after = starts.at(-1), controller = new AbortController(); slot.controller = controller;
+  const current = () => memoryWatchesCurrent(slot) && slot.controller === controller;
+  // A read begun before an unknown result cannot unlock that later attempt.
+  const unknown = new Map([...memoryWatchPending].filter(([, attempt]) => attempt.state === "unknown"));
+  slot.error = ""; slot.fresh = false; updateMemoryWatches(slot);
+  try {
+    const query = new URLSearchParams({ limit: String(memoryWatchPageSize), after_id: after });
+    const payload = await ownedRequest(`/memory/watches?${query}`, { cache: "no-store", signal: controller.signal }, slot.owner);
+    if (!current()) return;
+    const page = memoryWatchPage(payload, after);
+    let reconciled = false;
+    for (const item of page.items) if (unknown.has(item.id) && memoryWatchPending.get(item.id) === unknown.get(item.id)) { memoryWatchPending.delete(item.id); reconciled = true; }
+    if (reconciled) slot.notice = "已重新读取当前窗口，请核对状态。";
+    slot.page = page; slot.after = after; slot.starts = starts; slot.fresh = true;
+  } catch (error) {
+    if (current() && !controller.signal.aborted) slot.error = error.message;
+  } finally {
+    if (current()) { slot.controller = null; updateMemoryWatches(slot); }
+  }
+}
+
+function confirmMemoryWatchCancel(slot, item, trigger) {
+  if (!memoryWatchActionCurrent(slot, item, trigger)) return;
+  const content = element("div", {}, element("p", { text: item.question }), element("p", { class: "settings-role-hint", text: "停止留意并保留记录。" }));
+  openDialog({ title: "停止长期留意", content, submitLabel: "确认停止", danger: true, onSubmit: async () => {
+    if (memoryWatchCancel !== pending || !memoryWatchActionCurrent(slot, item, trigger) || !$("#app-dialog").open || $("#dialog-content").firstElementChild !== content) throw new Error("清单已变化，请刷新并重新确认这一条。");
+    const attempt = { state: "pending", controller: new AbortController() };
+    pending.attempt = attempt; memoryWatchPending.set(item.id, attempt); updateMemoryWatches(slot);
+    const visible = () => memoryWatchCancel === pending && $("#app-dialog").open && $("#dialog-content").firstElementChild === content;
+    try {
+      const receipt = await ownedRequest("/memory/watches/cancel", { method: "POST", body: JSON.stringify({ id: item.id }), signal: attempt.controller.signal }, slot.owner);
+      if (receipt?.id !== item.id || receipt.state !== "cancelled" || !Number.isSafeInteger(receipt.revision) || receipt.revision <= item.revision) throw new Error("停止回执无法完整核查");
+      if (memoryWatchPending.get(item.id) !== attempt) return;
+      memoryWatchPending.delete(item.id);
+      if (!memoryWatchesCurrent(slot)) return;
+      slot.notice = "已停止这条长期留意。";
+      if (visible()) { content.replaceChildren(element("p", { role: "status", text: slot.notice })); dialogSubmit = null; $("#dialog-submit").hidden = true; }
+    } catch {
+      if (memoryWatchPending.get(item.id) !== attempt) return;
+      attempt.state = "unknown";
+      if (!memoryWatchesCurrent(slot)) return;
+      slot.notice = "停止结果未确认，先读取清单核对。";
+      if (visible()) { content.replaceChildren(element("p", { role: "status", text: slot.notice })); dialogSubmit = null; $("#dialog-submit").hidden = true; }
+    } finally {
+      if (memoryWatchesCurrent(slot)) await loadMemoryWatches(slot);
+    }
+  } });
+  const pending = memoryWatchCancel = { item, content, attempt: null };
 }
 
 function memorySourcePage(payload, cursor) {
@@ -3517,6 +3660,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
   releaseMemorySourceRetry();
+  releaseMemoryWatchCancel();
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog();
