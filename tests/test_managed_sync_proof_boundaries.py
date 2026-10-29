@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -17,11 +18,17 @@ from test_managed_backend_package_batch import package_payloads as package_paylo
 from test_managed_backend_python_proof import observe_python_reads
 from test_managed_backend_python_proof import shared_host as shared_host
 from test_managed_start_confirmation_batch import rewrite_with_restored_mtime
-from test_managed_sync_proof_continuity import expected_confirmation, prepare_stopped
+from test_managed_sync_proof_continuity import (
+    ReadSnapshot,
+    assert_span_walks,
+    expected_confirmation,
+    prepare_stopped,
+    snapshot,
+)
 
 from muli.managed_controller import BindingConfirmation, ManagedServiceObservation
 from muli.managed_transaction import TransactionRecordV2
-from muli.management_transaction import Role, TransactionError, TransactionJournal
+from muli.management_transaction import FixedLock, Role, TransactionError, TransactionJournal
 from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_transaction import ObservationError
 from muli.platforms.managed_backend import _FileProofs
@@ -35,7 +42,14 @@ from muli.platforms.managed_probe import ManagedProbeResult
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux real synchronous boundaries")
 
-type Window = Literal["observe", "install-files", "install-final"]
+type Window = Literal["observe", "install-preflight", "install-files", "install-final"]
+
+_HANDOFF_PROBES: dict[Window, int] = {
+    "observe": 2,
+    "install-preflight": 1,
+    "install-files": 2,
+    "install-final": 3,
+}
 
 
 async def prepare_window(host: Host, window: Window) -> TransactionRecordV2:
@@ -71,7 +85,7 @@ def at_handoff(
         result = await original(
             current, preflight=preflight, postprocess=postprocess, postproofs=postproofs
         )
-        target = 3 if window == "install-final" else 2
+        target = _HANDOFF_PROBES[window]
         if host.probe.count == target and not entered:
             entered.append(target)
             if postproofs is not None:
@@ -96,7 +110,135 @@ def replace_leaf(path: Path, *, changed: bool) -> None:
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
 
 
-@pytest.mark.parametrize("window", ["observe", "install-files", "install-final"])
+@pytest.mark.parametrize("fault", ["running", "busy", "error", "disk"])
+async def test_install_initial_proof_is_discarded_on_early_exit(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    host = shared_host
+    record = await prepare_window(host, "install-preflight")
+    state_path = host.journal.directory.path / "state.json"
+    state = state_path.read_bytes()
+    failure = RuntimeError("post_probe_failure")
+    disk: list[tuple[str, str | None, str]] = []
+    if fault == "running":
+        host.probe.snapshot = replace(
+            host.probe.snapshot,
+            unit=replace(host.probe.snapshot.unit, active_state="active", sub_state="running"),
+        )
+
+    def change() -> None:
+        if fault == "busy":
+            # A distinct real flock owns the original lease before install
+            # attempts acquisition. Its ownership must survive the failure.
+            host.writer = host.journal.writer_lease().__enter__()
+        elif fault == "disk":
+            Path(host.anchor.config_path).write_bytes(b"foreign binding bytes")
+        disk.append(host.backend._disk().digests)
+        if fault == "error":
+            raise failure
+
+    entered, batches = at_handoff(host, monkeypatch, "install-preflight", change)
+    errors: dict[str, type[Exception]] = {
+        "running": ObservationError,
+        "busy": TransactionError,
+        "error": RuntimeError,
+        "disk": ObservationError,
+    }
+    code = {
+        "running": "transaction_service_not_stopped",
+        "busy": "lock_busy",
+        "error": "post_probe_failure",
+        "disk": "foreign_managed_binding",
+    }[fault]
+    try:
+        with pytest.raises(errors[fault], match=f"^{code}$") as caught:
+            await dispatch(host, record, "install-preflight")
+        if fault == "error":
+            assert caught.value is failure
+        if fault == "busy":
+            assert host.writer is not None
+            host.writer.check()
+    finally:
+        host.release_writer()
+
+    assert entered == [1] and len(batches) == 1 and len(disk) == 1
+    assert batches[0].python is None and batches[0].packages is None
+    assert host.probe.count == 1 and host.backend._disk().digests == disk[0]
+    assert host.record() == record and state_path.read_bytes() == state
+    assert host.commands == [] and host.transport.calls == [] and host.writer is None
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
+
+
+@pytest.mark.parametrize("shared_host", ["different-binary"], indirect=True)
+async def test_install_initial_handoff_still_reads_a_distinct_selected_python(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = shared_host
+    record = await prepare_window(host, "install-preflight")
+    controller_python = host.backend.controller_slot.resolved_python
+    selected_python = host.slots["target"].resolved_python
+    assert controller_python.digest == selected_python.digest
+    assert controller_python != selected_python
+    reads = observe_payloads(host, monkeypatch)
+    python = observe_python_reads(host, monkeypatch)
+    checks = observe_checks(host, monkeypatch)
+    before: list[ReadSnapshot] = []
+    after: list[ReadSnapshot] = []
+    original = host.backend._check
+    entered, batches = at_handoff(
+        host,
+        monkeypatch,
+        "install-preflight",
+        lambda: before.append(snapshot(reads, python, checks)),
+    )
+
+    def checked(
+        current: TransactionRecordV2,
+        selected: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
+        original(
+            current,
+            selected,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
+        if entered and not after:
+            after.append(snapshot(reads, python, checks))
+
+    monkeypatch.setattr(host.backend, "_check", checked)
+
+    confirmation = await host.backend.install(record, "target", host.data["target"])
+
+    assert confirmation == expected_confirmation(record, "target")
+    assert len(before) == len(after) == 1 and len(checks) == 29
+    assert_span_walks(host, "target", reads, python, before[0], after[0], 1)
+    assert after[0].python_bytes - before[0].python_bytes == selected_python.identity.size
+    controller_root = Path(host.backend.controller_slot.package.root)
+    selected_root = Path(host.slots["target"].package.root)
+    for path, size in reads.sizes.items():
+        expected = size if path.is_relative_to(selected_root) else 0
+        assert after[0].leaves[path][0] - before[0].leaves[path][0] == expected
+        if path.is_relative_to(controller_root):
+            assert expected == 0
+    assert entered == [1] and len(batches) == 1
+    assert batches[0].python is None and batches[0].packages is None
+    assert host.probe.count == 3 and host.commands == [] and host.transport.calls == []
+    assert host.record() == record and host.writer is None
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
+
+
+@pytest.mark.parametrize(
+    "window", ["observe", "install-preflight", "install-files", "install-final"]
+)
 @pytest.mark.parametrize(
     ("fault", "code"),
     [
@@ -153,9 +295,32 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
         if fault == "revision":
             current = host.move("activating", "start_target")
         elif fault == "lease":
-            lock.rename(retained_lock)
-            lock.write_bytes(b"")
-            lock.chmod(0o600)
+
+            def replace_lock() -> None:
+                lock.rename(retained_lock)
+                lock.write_bytes(b"")
+                lock.chmod(0o600)
+
+            if window == "install-preflight":
+                # Probe 1 returns before acquisition. Replace only after the
+                # real flock belongs to this operation, before its preflight.
+                original_enter = FixedLock.__enter__
+                replaced: list[FixedLock] = []
+
+                def acquired(lease: FixedLock) -> FixedLock:
+                    result = original_enter(lease)
+                    if (
+                        lease.directory is host.journal.writer_directory
+                        and lease.name == "lease"
+                        and not replaced
+                    ):
+                        replaced.append(lease)
+                        replace_lock()
+                    return result
+
+                monkeypatch.setattr(FixedLock, "__enter__", acquired)
+            else:
+                replace_lock()
         elif fault == "permission":
             metadata.chmod(0o644)
         elif fault in {"controller-parent", "selected-parent"}:
@@ -209,7 +374,7 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
             lock.unlink()
             retained_lock.rename(lock)
 
-    assert entered == [3 if window == "install-final" else 2] and len(checkpoint) == 1
+    assert entered == [_HANDOFF_PROBES[window]] and len(checkpoint) == 1
     disk, state, before_checks, before_python = checkpoint[0]
     assert len(checks) - before_checks == (0 if window == "observe" and fault == "lease" else 1)
     assert host.probe.count == entered[0]
@@ -240,7 +405,9 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
         assert reads.leaves[selected].bytes == before_payload[selected]
 
 
-@pytest.mark.parametrize("window", ["observe", "install-files", "install-final"])
+@pytest.mark.parametrize(
+    "window", ["observe", "install-preflight", "install-files", "install-final"]
+)
 async def test_same_bytes_on_new_package_inode_are_reopened_and_fully_read(
     shared_host: Host, monkeypatch: pytest.MonkeyPatch, window: Window
 ) -> None:
@@ -295,7 +462,9 @@ async def test_same_bytes_on_new_package_inode_are_reopened_and_fully_read(
     assert host.writer is None
 
 
-@pytest.mark.parametrize("window", ["observe", "install-files", "install-final"])
+@pytest.mark.parametrize(
+    "window", ["observe", "install-preflight", "install-files", "install-final"]
+)
 async def test_handoff_rechecks_empty_cgroup_before_file_confirmation(
     shared_host: Host, monkeypatch: pytest.MonkeyPatch, window: Window
 ) -> None:
@@ -315,13 +484,15 @@ async def test_handoff_rechecks_empty_cgroup_before_file_confirmation(
         with pytest.raises(ObservationError, match="^cgroup_not_empty$"):
             await dispatch(host, record, window)
 
-    assert entered == [3 if window == "install-final" else 2]
+    assert entered == [_HANDOFF_PROBES[window]]
     assert host.probe.count == entered[0] and host.backend._disk().digests == disk[0]
     assert host.commands == [] and host.transport.calls == [] and host.record() == record
     assert host.writer is None
 
 
-@pytest.mark.parametrize("window", ["observe", "install-files", "install-final"])
+@pytest.mark.parametrize(
+    "window", ["observe", "install-preflight", "install-files", "install-final"]
+)
 @pytest.mark.parametrize("fault", ["controller", "python", "cancel"])
 async def test_next_real_await_discards_bytes_and_rejects_changed_payload(
     shared_host: Host, monkeypatch: pytest.MonkeyPatch, window: Window, fault: str
@@ -339,7 +510,7 @@ async def test_next_real_await_discards_bytes_and_rejects_changed_payload(
     entered, release, settled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     handoffs, batches = at_handoff(host, monkeypatch, window, lambda: None)
     original = host.probe.read_managed
-    next_probe = 4 if window == "install-final" else 3
+    next_probe = _HANDOFF_PROBES[window] + 1
     cancellations: list[asyncio.CancelledError] = []
 
     async def probe(

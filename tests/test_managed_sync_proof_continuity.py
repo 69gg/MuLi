@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from muli.managed_journal import RoleSnapshots
 from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import FixedLock, Role
 from muli.platforms.managed_backend import _DiskBinding, _FileProofs
+from muli.platforms.managed_probe import ManagedProbeResult
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux real synchronous proofs")
 
@@ -171,6 +173,85 @@ async def test_observe_second_probe_lends_controller_bytes_to_stopped_confirmati
     assert len(spans) == 1
     before, after = spans[0]
     assert_span_walks(host, role, reads, python, before, after, 7)
+    assert_only_unverified_selected_bytes(host, role, reads, before, after)
+
+
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_install_first_probe_lends_controller_bytes_to_writer_preflight(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, role: Role
+) -> None:
+    host = shared_host
+    record = await prepare_stopped(host, role, installed=False)
+    commands = list(host.commands)
+    state_path = host.journal.directory.path / "state.json"
+    state = state_path.read_bytes()
+    reads = observe_payloads(host, monkeypatch)
+    python = observe_python_reads(host, monkeypatch)
+    checks = observe_checks(host, monkeypatch)
+    original = host.backend._probe
+    handoff_start: ReadSnapshot | None = None
+    spans: list[tuple[ReadSnapshot, ReadSnapshot]] = []
+    # This positive window uses the existing shared-interpreter fixture. A
+    # different selected Python still needs its own complete content read.
+    assert host.backend.controller_slot.resolved_python == host.slots[role].resolved_python
+
+    async def probe(
+        current: TransactionRecordV2,
+        *,
+        preflight: Callable[[], None] | None = None,
+        postprocess: Callable[[ManagedProbeResult], Role | None] | None = None,
+        postproofs: _FileProofs | None = None,
+    ) -> ManagedProbeResult:
+        nonlocal handoff_start
+        if host.probe.count == 1:
+            assert preflight is not None
+            original_preflight: Callable[[], None] = preflight
+
+            def measured_preflight() -> None:
+                assert handoff_start is not None and not spans
+                assert checks == [(record, role), (record, None)]
+                original_preflight()
+                spans.append((handoff_start, snapshot(reads, python, checks)))
+
+            preflight = measured_preflight
+        result = await original(
+            current, preflight=preflight, postprocess=postprocess, postproofs=postproofs
+        )
+        if host.probe.count == 1:
+            assert handoff_start is None
+            # Start only after the first real post-await authentication and
+            # its final root/metadata fences returned. No new await is added.
+            handoff_start = snapshot(reads, python, checks)
+        return result
+
+    monkeypatch.setattr(host.backend, "_probe", probe)
+
+    confirmation = await host.backend.install(record, role, host.data[role])
+
+    assert confirmation == expected_confirmation(record, role)
+    assert checks == (
+        [(record, value) for value in (role, None, role, None)]
+        + [(record, role)] * 16
+        + [(record, None)] * 2
+        + [(record, role)] * 7
+    )
+    assert host.probe.count == 3 and host.commands == commands and host.transport.calls == []
+    same_record = host.record() == record
+    assert same_record and state_path.read_bytes() == state and host.writer is None
+    assert host.record().deadline == record.deadline
+    assert host.backend._disk().digests == (
+        confirmation.configuration,
+        confirmation.selector,
+        confirmation.unit,
+    )
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
+    assert len(spans) == 1
+    before, after = spans[0]
+    assert_span_walks(host, role, reads, python, before, after, 1)
+    # The payload observer counts its two real fixture leaves, not every
+    # package member. Keep the original guard/opens/fences before the bytes.
     assert_only_unverified_selected_bytes(host, role, reads, before, after)
 
 

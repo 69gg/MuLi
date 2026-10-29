@@ -830,49 +830,69 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise ObservationError("transaction_effect_not_permitted")
         if data != self._desired(record, role):
             raise ObservationError("transaction_snapshot_changed")
-        before = await self._probe(record, preflight=lambda: self._check(record, role))
-        if not self._stopped(before.service):
-            raise ObservationError("transaction_service_not_stopped")
-        with self.journal.writer_lease() as lease:
-            cgroup = before.service.unit.cgroup
+        initial_postproofs = _FileProofs()
+        try:
+            before = await self._probe(
+                record, preflight=lambda: self._check(record, role), postproofs=initial_postproofs
+            )
+            if not self._stopped(before.service):
+                raise ObservationError("transaction_service_not_stopped")
+            with self.journal.writer_lease() as lease:
+                cgroup = before.service.unit.cgroup
 
-            def guard() -> None:
-                self._guard(record, role, lease, cgroup)
-                if self._disk().digests not in _prefixes(record):
-                    raise ObservationError("foreign_managed_binding")
+                def guard() -> None:
+                    try:
+                        self._guard(
+                            record,
+                            role,
+                            lease,
+                            cgroup,
+                            verified_python=initial_postproofs.python,
+                            verified_packages=initial_postproofs.packages,
+                        )
+                        if self._disk().digests not in _prefixes(record):
+                            raise ObservationError("foreign_managed_binding")
+                    finally:
+                        initial_postproofs.python = None
+                        initial_postproofs.packages = None
 
-            postproofs = _FileProofs()
-            try:
-                if before != await self._probe(record, preflight=guard, postproofs=postproofs):
-                    raise ObservationError("transaction_observation_changed")
-                self._install_files(record, role, data, lease, cgroup, proofs=postproofs)
-            finally:
-                postproofs.python = None
-                postproofs.packages = None
-            final_postproofs = _FileProofs()
-            try:
-                fresh = await self._probe(record, postproofs=final_postproofs)
-                if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
-                    raise ObservationError("transaction_observation_changed")
-                if not fresh.unit_confirmed:
-                    guard()
+                postproofs = _FileProofs()
+                try:
+                    if before != await self._probe(record, preflight=guard, postproofs=postproofs):
+                        raise ObservationError("transaction_observation_changed")
+                    self._install_files(record, role, data, lease, cgroup, proofs=postproofs)
+                finally:
+                    postproofs.python = None
+                    postproofs.packages = None
+                final_postproofs = _FileProofs()
+                try:
+                    fresh = await self._probe(record, postproofs=final_postproofs)
+                    if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
+                        raise ObservationError("transaction_observation_changed")
+                    if not fresh.unit_confirmed:
+                        guard()
+                        final_postproofs.python = None
+                        final_postproofs.packages = None
+                        await self._command("daemon-reload")
+                        fresh = await self._probe(
+                            record, preflight=guard, postproofs=final_postproofs
+                        )
+                    if (
+                        not self._stopped(fresh.service)
+                        or not fresh.unit_confirmed
+                        or fresh.disk_unit != record.binding(role).unit.digest
+                    ):
+                        raise ObservationError("managed_unit_not_loaded")
+                    disk = self._confirm(record, role, lease, cgroup, proofs=final_postproofs)
+                    return BindingConfirmation(
+                        record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
+                    )
+                finally:
                     final_postproofs.python = None
                     final_postproofs.packages = None
-                    await self._command("daemon-reload")
-                    fresh = await self._probe(record, preflight=guard, postproofs=final_postproofs)
-                if (
-                    not self._stopped(fresh.service)
-                    or not fresh.unit_confirmed
-                    or fresh.disk_unit != record.binding(role).unit.digest
-                ):
-                    raise ObservationError("managed_unit_not_loaded")
-                disk = self._confirm(record, role, lease, cgroup, proofs=final_postproofs)
-                return BindingConfirmation(
-                    record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
-                )
-            finally:
-                final_postproofs.python = None
-                final_postproofs.packages = None
+        finally:
+            initial_postproofs.python = None
+            initial_postproofs.packages = None
 
     async def start(self, record: TransactionRecordV2, role: Role) -> None:
         if (record.phase, record.intent, role) not in {
