@@ -60,6 +60,7 @@ async def _journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, prefer_or
     notice_messages: list[Message] = []
     upload_id = ""
     watch_id = ""
+    public_watch: dict[str, Any] = {}
     replies = {
         "create": "资料关注登记轮结束。",
         "other-private": "已收到另一位已绑定主人的普通私聊。",
@@ -224,6 +225,15 @@ async def _journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, prefer_or
                         and stored["created_input_id"] == original_origin["input_id"]
                     )
                     assert stored["main_session_id"] == main_id
+                    catalog = await web.get("/api/memory/watches")
+                    assert catalog.status_code == 200
+                    (public_watch,) = catalog.json()["items"]
+                    assert public_watch["id"] == watch_id and public_watch["question"] == question
+                    assert public_watch["reply_preference"] == (
+                        {"kind": "registered_channel", "channel": "onebot"}
+                        if prefer_origin
+                        else {"kind": "default_web"}
+                    )
                     continue
 
                 assert active.store.get("memory_watch", watch_id)["state"] == "active"
@@ -248,6 +258,8 @@ async def _journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, prefer_or
                 reply = await finish(phase)
                 await processed_reply(active, manager, reply["id"])
                 assert ReplyOrigin.from_input(response.json()["message"]).kind == "web"
+                catalog = await web.get("/api/memory/watches")
+                assert catalog.status_code == 200 and catalog.json()["items"] == [public_watch]
                 no_external_send()
 
                 uploaded = await web.post(
@@ -324,6 +336,20 @@ async def _journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, prefer_or
                 combined = "\n".join(message.content for message in notice_messages)
                 assert all(value in combined for value in (question, quote, source_id))
                 assert not reply["tool_calls"]
+                no_external_send()
+                before_management = dict(rounds)
+                cancelled = await web.post("/api/memory/watches/cancel", json={"id": watch_id})
+                assert cancelled.status_code == 200
+                assert cancelled.json() == {
+                    "id": watch_id,
+                    "state": "cancelled",
+                    "revision": public_watch["revision"] + 1,
+                }
+                final = (await web.get("/api/memory/watches")).json()["items"]
+                assert final == [
+                    {**public_watch, "state": "cancelled", "revision": cancelled.json()["revision"]}
+                ]
+                assert rounds == before_management
                 no_external_send()
     finally:
         await active.close()

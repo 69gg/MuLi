@@ -162,6 +162,10 @@ class MemorySourceRetryInput(Input):
     revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
+class MemoryWatchCancelInput(Input):
+    id: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+
+
 class MemorySourceCompareInput(Input):
     left_id: str = Field(min_length=1, max_length=200, strict=True)
     left_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
@@ -1053,6 +1057,29 @@ def _create_app(
     @app.get("/api/memory/status")
     async def memory_status() -> dict[str, Any]:
         return memory_application.pipeline.status()
+
+    @app.get("/api/memory/watches")
+    async def memory_watches(
+        after_id: Annotated[str, Query(pattern=r"^(?:[a-f0-9]{64})?$")] = "",
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, Any]:
+        try:
+            return memory_application.watch_page(after_id=after_id, limit=limit)
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+
+    @app.post("/api/memory/watches/cancel")
+    async def cancel_memory_watch(body: MemoryWatchCancelInput) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            main_id = runtime.store.existing_main_session_id()
+            if main_id is None:
+                raise ValueError("主会话身份无法核查")
+            try:
+                return await memory_application.cancel_watch(main_id, body.id)
+            except PermissionError as error:
+                raise HTTPException(status_code=403, detail=str(error)) from error
 
     @app.get("/api/memory/sources")
     async def memory_sources(

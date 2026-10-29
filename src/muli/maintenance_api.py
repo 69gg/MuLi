@@ -108,6 +108,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/integrations/chiliarch/attention",
         "/api/extensions",
         "/api/memory/status",
+        "/api/memory/watches",
         "/api/channels",
         "/api/approvals",
         "/api/notifications",
