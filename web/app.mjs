@@ -2,7 +2,7 @@ import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } f
 import { MODES, createSessionState, applyEvent, hydrateSession, conversationItems, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
-import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
+import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, managementRecoveryView, managementRecoveryReplyLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
@@ -58,7 +58,7 @@ const state = {
   sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
   viewError: "", viewLoading: false, memoryQuery: "", memorySourceId: null, memoryQueryPartial: false, memoryQueryDegraded: false, settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
-  management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {},
+  management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {}, managementRecoveryAttempt: null, managementReadVersion: 0,
   mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
   team: { members: [], messages: [] }, recordQuery: "", approvals: [], approvalsError: "",
   auth: { required: false, authenticated: false },
@@ -2678,6 +2678,7 @@ function renderSettings() {
   const nav = element("nav", { class: "settings-nav", "aria-label": "设置分组" });
   for (const [key, label] of SETTINGS_GROUPS) nav.append(element("button", { type: "button", class: state.settingsTab === key ? "active" : "", text: label, dataset: { settingsTab: key }, "aria-current": state.settingsTab === key ? "page" : "false" }));
   const refresh = actionButton("刷新状态", "refresh-settings-status", "text-button", "refresh");
+  refresh.disabled = state.settingsTab === "maintenance" && !!state.managementRecoveryAttempt?.pending;
   return element("div", { class: "view-content settings-view" }, viewHeading("设置", "模型、工具与本地运行配置。", refresh), element("div", { class: "settings-layout" }, nav, element("div", { class: "settings-content", dataset: { settingsTab: state.settingsTab } }, renderSettingsPanel())));
 }
 
@@ -2718,10 +2719,19 @@ function settingsSection(title, ...children) {
 }
 
 async function refreshSettingsResources(owner = connection, current = () => true) {
-  const { values, errors } = await loadSettingsResources((path) => ownedRequest(path, {}, owner));
+  const readVersion = state.managementReadVersion = (state.managementReadVersion ?? 0) + 1;
+  const attempt = state.managementRecoveryAttempt, canConfirm = attempt && !attempt.pending;
+  const { values, errors } = await loadSettingsResources((path) => ownedRequest(path, path === "/management" ? { cache: "no-store" } : {}, owner));
   if (!connectionCurrent(owner) || !current()) return;
-  for (const [key, value] of Object.entries(values)) state[key] = value;
+  // Only the newest read may publish management state or confirm this request.
+  const managementCurrent = state.managementRecoveryAttempt === attempt && state.managementReadVersion === readVersion;
+  for (const [key, value] of Object.entries(values)) if (key !== "management" || managementCurrent) state[key] = value;
+  if (!managementCurrent) {
+    delete errors.management;
+    if (state.settingsStatusErrors.management) errors.management = state.settingsStatusErrors.management;
+  }
   state.settingsStatusErrors = errors;
+  if (canConfirm && managementCurrent && !attempt.pending && !Object.hasOwn(errors, "management")) attempt.confirmed = true;
 }
 
 function settingsResourceError(key) {
@@ -2895,6 +2905,43 @@ function renderVoiceSetupControls() {
   cancel.hidden = !busy; cancel.disabled = setup.phase === "stopping";
 }
 
+function managementRecoveryContent() {
+  const view = managementRecoveryView(state.management), attempt = state.managementRecoveryAttempt;
+  const locked = attempt && (!attempt.confirmed || (attempt.key === view.key && !attempt.retryable));
+  const button = view.canRecover && actionButton(attempt?.pending ? "正在接续…" : locked ? "已请求接续" : "接续当前操作", "recover-management-current", "secondary-button", "refresh");
+  if (button) button.disabled = !!locked || state.viewLoading;
+  const hint = locked && !attempt.confirmed ? attempt.message : locked && view.canRecover ? "接续已请求，当前操作尚未结束。请继续刷新状态核对。" : view.hint;
+  return [statusList(view.entries), element("p", { class: "settings-notice", text: hint }), button && element("div", { class: "service-actions" }, button)];
+}
+
+function refreshManagementRecoveryView() {
+  if (state.view !== "settings" || state.settingsTab !== "maintenance") return;
+  $("#management-current-recovery")?.replaceChildren(...managementRecoveryContent());
+  const refresh = $('[data-action="refresh-settings-status"]', $("#other-view"));
+  if (refresh) refresh.disabled = !!state.managementRecoveryAttempt?.pending;
+}
+
+async function recoverCurrentManagement() {
+  const owner = connection, view = managementRecoveryView(state.management), previous = state.managementRecoveryAttempt;
+  if (!connectionCurrent(owner) || state.view !== "settings" || state.settingsTab !== "maintenance" || state.viewLoading
+    || state.settingsStatusErrors.management || !view.canRecover || (previous && (!previous.confirmed || (previous.key === view.key && !previous.retryable)))) return;
+  collectSettingsForm();
+  const attempt = state.managementRecoveryAttempt = { owner, key: view.key, pending: true, confirmed: false, retryable: false, message: "正在请求接续，请稍候核对状态。" };
+  refreshManagementRecoveryView();
+  try {
+    const reply = await ownedRequest("/management/transactions/recover", { method: "POST", body: {} }, owner);
+    // Busy explicitly did not start another helper/cleanup; unavailable may be
+    // a launch timeout, so it keeps the same conservative lock as a lost reply.
+    attempt.retryable = ["controller_busy", "candidate_cleanup_busy"].includes(reply?.helper);
+    attempt.message = managementRecoveryReplyLabel(reply);
+  } catch {
+    attempt.message = "接续结果未知，请刷新状态核对，不要重复提交。";
+  } finally {
+    attempt.pending = false;
+    if (state.managementRecoveryAttempt === attempt && connectionCurrent(owner)) refreshManagementRecoveryView();
+  }
+}
+
 function renderMaintenanceSettings() {
   const config = state.settingsDraft; const management = state.management;
   const plugins = config.plugins ?? {}; const updates = config.updates ?? {};
@@ -2909,7 +2956,7 @@ function renderMaintenanceSettings() {
     settingsSection("本地插件", switchField("启用插件", "plugins.enabled", plugins.enabled), field("禁用的插件 ID", "plugins.disabled", (plugins.disabled ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }), inventory,
       management?.plugins_restart_required && element("p", { class: "settings-notice", text: "插件配置已保存，重启后生效。" }), settingsJSON("plugins", plugins, ["enabled", "disabled"])),
     settingsSection("版本更新", statusList([["状态", updateLabel(management)], ["当前版本", update?.current ?? state.status?.version], ["最新版本", update?.latest], ["上次检查", update?.checked_at ? formatFullDate(update.checked_at) : "—"]]), switchField("启动时检查更新", "updates.check_on_start", updates.check_on_start), settingsJSON("updates", updates, ["check_on_start"]), actionButton("交给沐璃检查", "configure-prompt", "text-button", "chat", { prompt: "请检查 MuLi 的更新状态，有更新时先告诉我版本与变更。" })),
-    settingsSection("管理操作", plans),
+    settingsSection("管理操作", element("div", { id: "management-current-recovery", class: "management-item", "aria-live": "polite" }, ...managementRecoveryContent()), plans),
     state.status?.server?.restart_required && element("p", { class: "settings-notice", text: "监听配置已保存，重启后生效。" }));
 }
 
@@ -3376,6 +3423,7 @@ async function handleAction(action, button) {
   if (action === "service") await serviceAction(button.dataset.command);
   if (action === "refresh-service") await refreshService();
   if (action === "reload-extensions") await requestExtensions(true);
+  if (action === "recover-management-current") await recoverCurrentManagement();
   if (action === "refresh-settings-status") {
     if (state.view === "settings" && state.settingsTab === "connections") return requestExtensions(false);
     collectSettingsForm(); button.disabled = true; try { await refreshSettingsResources(); renderOtherView(); renderChrome(); } finally { button.disabled = false; }
