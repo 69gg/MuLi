@@ -59,7 +59,10 @@ class EntryEnvironment:
 
 @pytest.fixture
 async def entry_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: tuple[Any, Any]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: tuple[Any, Any],
+    request: pytest.FixtureRequest,
 ) -> AsyncIterator[EntryEnvironment]:
     native, _ = fixture
     native.prepare()
@@ -72,6 +75,13 @@ async def entry_environment(
         return original_slot(directory, {"base": "a", "target": "b"}[name])
 
     monkeypatch.setattr(backend_fixture, "_slot", slot)
+    generation = getattr(request, "param", None)
+    if generation is not None:
+        monkeypatch.setattr(
+            backend_fixture,
+            "prepare_managed",
+            partial(backend_fixture.prepare_managed, generation=generation),
+        )
     worker.write_json(
         root / "fixture.json",
         {
@@ -573,6 +583,12 @@ async def test_failure_window_rejects_bad_or_revoked_source_without_retry(
 
 
 @pytest.mark.parametrize(
+    "entry_environment",
+    ["e" * 32, "a" * 32],
+    indirect=True,
+    ids=["generation-first-e", "generation-first-other"],
+)
+@pytest.mark.parametrize(
     "damage",
     [
         "generation",
@@ -607,15 +623,22 @@ async def test_failure_entry_reader_rejects_unbound_future_or_dangerous_files(
         "monotonic_ns": observation["observed_ns"],
         "outcome": "progress",
     }
+    path = env.root / "helper-entry-checkpoint.json"
+    worker.write_json(path, value)
+    case._collect_helper_entry_checkpoint(
+        env.record, deadline=worker.time.monotonic() + worker.HTTP_SECONDS
+    )
+    assert case.result["resources"].pop("helper_entry_checkpoint") == value
     if damage in {"generation", "helper", "invocation"}:
-        value[damage] = "e" + value[damage][1:]
+        previous = value[damage]
+        value[damage] = ("f" if previous[0] == "e" else "e") + previous[1:]
+        assert value[damage] != previous
     elif damage == "pid":
         value[damage] += 1
     elif damage in {"future_revision", "unknown_revision"}:
         value["revision"] += 1 if damage == "future_revision" else -1
     elif damage == "future_time":
         value["monotonic_ns"] += 1
-    path = env.root / "helper-entry-checkpoint.json"
     worker.write_json(path, value)
     if damage == "symlink":
         path.rename(path.with_name("foreign.json"))

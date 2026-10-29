@@ -22,6 +22,12 @@ controller-python -I -m muli.managed_host --root ROOT run
 
 `run` 在构造 backend 前核实际 helper 的 PID 等于当前 PID，且精确 argv 指向固定 controller。随后在同一个 journal controller 锁下使用 `ManagedTransactionController` 与 `ManagedLinuxBackend`，每个驱动 step 前再次核固定 anchor/controller、实际 helper 和 fresh record。base/target 的冻结 slot 元数据、兼容声明摘要、七领域声明与 snapshots 都必须一致；不会把 slot 声明当成环境/依赖认证。这里不先核对侧包文件，以免坏 target 阻止已冻结的 base 回退；实际 effects backend 对当前 role 的包、三文件、loaded unit、writer lease 和 cgroup 保留原有核验。
 
+每次同步 `_record` 新建一个私有元数据作用域，与 backend 复用实际 root FD、字节读取和围栏实现。anchor 和 launcher 各实际读取一次；同一个完整 slot digest 的私有字节只读取、核摘要并严格解析一次。因此 adopt、普通 switch、controller/base/target 三个完整身份不同的情况，分别读取一、二、三份 slot 元数据。共享 Python、包或兼容声明不合并不同完整 digest；每次 `_record` 都重新完整认证 controller 的 Python 和包，不扩大已有 `PackageProofs`。
+
+原读取顺序仍为 anchor、launcher/controller 认证、controller、首个 current、base/target 与各自快照、兼容检查、末次 current。命中本次已解析的 slot 时，在该逻辑读取位置用相对 root FD 的 nofollow stat 核对第一次真实读取的七字段身份，避免后面的 journal 或快照错误抢先掩盖已变的元数据。launcher/controller 小区段继续将错误包装为 `anchor_unavailable`，后续 slot、journal、快照和兼容错误保留原异常。
+
+正常返回前新增全体已读元数据叶的七字段末次围栏，并复核 root 的 owner/私有权限及完整祖先路径链；替换 inode、同 inode 改写后恢复原字节和 mtime、权限或祖先变化都撤销本次证明。异常路径仅关闭作用域 FD，保留最先发生的错误；两次真实 current 读取及 journal-directory fsync、原锁和快照检查保持。作用域在函数返回或抛错时结束，既不跨独立调用，也不跨 helper 观察的 await；等待两侧分别重新读取元数据并完整扫描 controller。
+
 驱动循环只提取到 V1/V2 共用的 typed `drive_loop`，不合并两种 proof 或角色语义。resolved、`recovery_required` 或 `activation=blocked` 即返回；取消传播并保留已耐久 intent，不在 finally 重试未知 start/activate。最终只读 hint 的丢失不能撤销 `released` 或再发 activate。V1 的公开入口、unit 名、资源参数与效果行为保持原样。
 
 CLI 只接受精确的 `--root ROOT recover|run` 三参数，不接受缩写、额外参数或环境中的目标选择；错误仅输出固定 reason，不输出配置、nonce 或原始异常。缺失 root 不创建目录。所有 helper 所依赖路径须通过既有本地文件系统 verifier，既有/读取失败 unit 不能降级为另起进程。

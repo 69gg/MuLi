@@ -133,11 +133,14 @@ def _record(
     # constructing an application connection/configuration writer.
     _read_file(Path(anchor.config_path), 0, contents=False, private_owner=True)
     _read_file(journal.database, 0, contents=False, private_owner=True)
-    with DeploymentStore(journal.directory.path, journal.limits) as store:
-        if store.read_anchor(anchor.digest) != anchor:
+    with (
+        DeploymentStore(journal.directory.path, journal.limits) as store,
+        store._metadata_scope() as metadata,
+    ):
+        if metadata.read_anchor(anchor.digest) != anchor:
             raise TransactionError("managed_deployment_changed")
-        store.verify_anchor(anchor)
-        controller = store.read_slot(anchor.controller_slot)
+        metadata.verify_anchor(anchor)
+        controller = metadata.read_slot(anchor.controller_slot)
         record = control.read_current()
         if not isinstance(record, TransactionRecordV2):
             raise TransactionError("managed_transaction_required")
@@ -150,7 +153,7 @@ def _record(
         slots: dict[Role, SlotIdentity] = {}
         for role in _ROLES:
             binding = record.binding(role)
-            slot = store.read_slot(binding.installation)
+            slot = metadata.read_slot(binding.installation)
             if slot.compatibility_digest != binding.compatibility:
                 raise TransactionError("managed_compatibility_changed")
             read_snapshots(journal, record, role)

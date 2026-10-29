@@ -8,6 +8,8 @@
 
 每次同步 `_check` 都从真实私有文件重新认证 anchor、launcher 和各个完整安装摘要对应的 slot。同一安装只读取一次；caller 中冻结的对象只用于比较，不能代替实际字节、SHA 和严格 JSON 解析。controller 与选中角色的完整包认证均位于本批末门之前；随后再次核对所有已读叶的 device、inode、size、mtime、ctime、mode、uid，以及根目录私有权限和完整祖先链。证据只存在于本次函数栈，不跨独立 guard 或等待复用，也不减少效果前检查。损坏的 target 包可沿原流程恢复 base，损坏的 target 元数据仍拒绝。
 
+底层私有元数据作用域也供[固定 controller 宿主](managed-host.md)使用，入口分别保留认证次序和异常策略。backend 仍先读 controller 元数据并与冻结预期比较，失败为 `managed_slot_unavailable` 或原 `_AuthenticationMismatch`；后者只由 backend 映射为 `ObservationError`。随后 launcher/controller 内容认证的小区段才包装为 `anchor_unavailable`。host 则在该小区段内先核 launcher，再读 controller 元数据和完整内容，不能把两入口的初始错误顺序统一。作用域复用命中仍即时核对原七字段身份，正常退出才执行全体叶/root 围栏；body 已发生的 journal fsync、快照或 selected 认证错误不会被退出检查覆盖。现有独立 guard、选中角色内容认证及 Python/package 证明的传递范围保持原样。
+
 运行态观察在每次真实 probe 前重新认证，返回后将相邻的 controller 与选中角色核验合为一次完整检查。只在这段不含等待的内部代码中读取当前磁盘、验证进程归属或比较前后观察；局部观察失败时仍先检查 controller，保留原错误优先级。origin 进程继续校验完整 base 安装，stop-only 继续仅认证 controller；readiness 等待后重新读取所有包，不跨等待保存认证证明。停止态确认、第三次 probe 及所有效果前安全门保持原流程。
 
 所有文件修改要求服务已经停止、cgroup 为空，并真实持有现有 writer lease。正向只按配置→selector→unit，回退只按 unit→selector→配置，接受范围是该代冻结正向或反向前缀。不会把三个文件各自的允许值任意组合。已有 desired 内容也调用文件及父目录耐久确认；不存在的 legacy selector 同样确认父目录。selector 只支持本产品 canonical JSON，非 canonical 快照在 prepare 时拒绝，后端再核，不悄悄重新序列化旧证据。
