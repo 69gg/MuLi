@@ -61,6 +61,10 @@ PyYAML 当前没有类型声明；`pyproject.toml` 仅为 `yaml.*` 设置库专�
 
 ## 托管 CI
 
+队友命令续办的恢复回归需要一份独立的旧版源码。CI 通过 [checkout](https://github.com/actions/checkout) 在忽略目录内检出固定的 2.123.0 提交，并用 `MULI_PREVIOUS_SOURCE_ROOT` 指向它；恢复子进程会核对实际导入位置，分别验证旧版和候选版，不使用候选实现替代旧消费者。
+
+本机运行 `tests/test_shell_continue_recovery.py` 时，在受限命令中设置 `env MULI_PREVIOUS_SOURCE_ROOT=/path/to/previous-checkout`，指向已有的固定旧版源码根目录。该夹具仅使用临时资料库，缺少旧源码时明确失败，不自动下载或跳过。其首批完整恢复旅程仅适用于 POSIX；Windows 仍运行独立的 Shell 观察者与既有恢复回归。
+
 CI 共17项作业，包含14项后端测试分片、质量、MCP 与 Linux 原生作业，验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 macOS 每个版本按测试文件分成两份不重叠集合，Windows 分成三份；全部分片合起来覆盖完整测试集合，同文件的参数化用例与夹具生命周期保持在一起。分组使用仓库相对文件名的稳定摘要，新增文件不会重排已有文件；pytest 自身的发现与忽略规则保持生效，分片不保证耗时均分。正式发布复用这17项验证，并另运行准备、PyPI 发布与 GitHub Release，共20项作业。
 
 冻结的旧版兼容性夹具按原始字节核验；`.gitattributes` 对这些文件关闭文本转换，避免 Windows 的自动换行转换改变历史证据。新增此类夹具时，同步声明其检出规则，保留原始摘要断言。

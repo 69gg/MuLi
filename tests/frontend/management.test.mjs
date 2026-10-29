@@ -99,7 +99,7 @@ test("management renders plugin faults and update recovery without changing its 
     element, managementLabel, managementActionLabel, managementPlanLabel, updateLabel, formatFullDate: String,
     settingsSection: (title, ...children) => element("section", { title }, ...children),
     settingsResourceError: () => null, settingsJSON: () => null, statusList: () => null,
-    switchField: () => null, field: () => null, actionButton: () => null,
+    switchField: () => null, field: () => null, actionButton: () => null, managementRecoveryContent: () => [],
   };
   runInNewContext(source.slice(start, end), context, { timeout: 1000 });
   const pending = [context.renderMaintenanceSettings()]; const headings = []; const errors = [];

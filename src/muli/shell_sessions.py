@@ -55,6 +55,7 @@ class ShellFinished:
 
 
 FinishCallback = Callable[[ShellFinished], Awaitable[None]]
+ShellFinishObserver = Callable[[ShellFinished], None]
 
 
 class OutputCursor(TypedDict):
@@ -255,6 +256,8 @@ class _Command:
     notify_on_finish: bool = False
     dispatched: bool = False
     finish_attempted: bool = False
+    finish_observer: ShellFinishObserver | None = None
+    finished: ShellFinished | None = None
 
 
 @dataclass(slots=True)
@@ -323,6 +326,53 @@ class ShellSessions:
         shell = self._sessions.get(session_id)
         return shell.cwd if shell is not None else None
 
+    def watch_finish(
+        self, session_id: str, command_id: str, callback: ShellFinishObserver
+    ) -> ShellFinished | None:
+        """Observe one dispatched command without waiting or reading its output.
+
+        Observers run synchronously under the existing monitor/cleanup owner.
+        They may latch the fact and schedule existing work, but must not block.
+        A terminal command returns its fact directly instead of calling back.
+        """
+        if self._closed:
+            raise ShellSessionError("closed", "shell 管理器已关闭")
+        item = self._commands.get(command_id)
+        if item is None or item.shell.session_id != session_id or not item.dispatched:
+            raise ShellSessionError("not_found", "该会话没有已派发的 shell 命令记录")
+        if not callable(callback):
+            raise ShellSessionError("invalid_argument", "shell 完成观察者必须可调用")
+        if item.done.is_set() and item.state != "running":
+            return self._finished(item)
+        if item.finish_observer is not None and item.finish_observer is not callback:
+            raise ShellSessionError("conflict", "该 shell 命令已有其他完成观察者")
+        item.finish_observer = callback
+        return None
+
+    def unwatch_finish(
+        self, session_id: str, command_id: str, callback: ShellFinishObserver
+    ) -> None:
+        """Withdraw only this exact observer, including during manager close."""
+        item = self._commands.get(command_id)
+        if (
+            item is not None
+            and item.shell.session_id == session_id
+            and item.finish_observer is callback
+        ):
+            item.finish_observer = None
+
+    @staticmethod
+    def _finished(item: _Command) -> ShellFinished:
+        if item.finished is None:
+            item.finished = ShellFinished(
+                item.shell.session_id,
+                item.id,
+                item.shell.epoch,
+                item.state,
+                item.exit_code if item.state == "completed" else None,
+            )
+        return item.finished
+
     @staticmethod
     def _number(value: float, *, maximum: float, zero: bool) -> float:
         if (
@@ -347,6 +397,7 @@ class ShellSessions:
                     key
                     for key, item in self._commands.items()
                     if item.state != "running"
+                    and item.finish_observer is None
                     and (not item.notify_on_finish or item.monitor is None or item.monitor.done())
                 ),
                 None,
@@ -712,6 +763,17 @@ class ShellSessions:
             await asyncio.gather(proof, lost, return_exceptions=True)
 
     async def _finish(self, item: _Command) -> None:
+        if item.dispatched and item.done.is_set():
+            result = self._finished(item)
+            callback = item.finish_observer
+            # Claim before the old async notice can suspend or be cancelled.
+            # An observer cannot retain or replace this command's cleanup owner.
+            item.finish_observer = None
+            if callback is not None:
+                try:
+                    callback(result)
+                except (Exception, asyncio.CancelledError):
+                    pass
         if (
             not item.notify_on_finish
             or not item.dispatched
@@ -724,15 +786,7 @@ class ShellSessions:
         # twice nor detach a callback from its original monitor/cleanup owner.
         item.finish_attempted = True
         try:
-            await self._on_finish(
-                ShellFinished(
-                    item.shell.session_id,
-                    item.id,
-                    item.shell.epoch,
-                    item.state,
-                    item.exit_code if item.state == "completed" else None,
-                )
-            )
+            await self._on_finish(self._finished(item))
         except (Exception, asyncio.CancelledError):
             # This optional local notice never rewrites the observed command
             # outcome or prevents process cleanup. Recovery is an explicit read,
@@ -743,10 +797,20 @@ class ShellSessions:
         process = shell.process
         if process is None:
             return
-        await process.wait()
+        watching_input = os.name == "posix" and process.stdin is not None
+        if watching_input and process.stdin is not None:
+            # Commands receive /dev/null, so this is the host's dispatch pipe.
+            # Losing it invalidates the shell even while descendants retain
+            # stdout/stderr and prevent Process.wait() from returning.
+            with contextlib.suppress(ConnectionError, OSError):
+                await process.stdin.wait_closed()
+        else:
+            await process.wait()
         shell.lost.set()
         if shell.state not in {"stopping", "closed", "blocked"}:
-            await asyncio.shield(self._retire(shell, "unknown"))
+            cleanup = self._retire(shell, "unknown")
+            if not watching_input:
+                await asyncio.shield(cleanup)
 
     def _retire(self, shell: _Shell, outcome: str) -> asyncio.Task[None]:
         if shell.cleanup is not None:
@@ -758,6 +822,16 @@ class ShellSessions:
             shell.current.exit_code = None
         shell.cleanup = asyncio.create_task(self._cleanup(shell))
         return shell.cleanup
+
+    @staticmethod
+    def _abort_input(process: asyncio.subprocess.Process) -> None:
+        writer = process.stdin
+        if writer is not None and (
+            not writer.is_closing() or writer.transport.get_write_buffer_size() > 0
+        ):
+            # A flushing close can still retain a full dispatch buffer. Abort
+            # only a live/buffered transport; already closed pipes need no call.
+            writer.transport.abort()
 
     async def _cleanup(self, shell: _Shell) -> None:
         failures = False
@@ -785,7 +859,14 @@ class ShellSessions:
             except OSError:
                 failures = True
         tasks = [*shell.readers]
-        if shell.watcher is not None:
+        watching_input = (
+            os.name == "posix" and shell.process is not None and shell.process.stdin is not None
+        )
+        if watching_input and shell.process is not None:
+            # Dispatch is already revoked. Complete the shared close future
+            # before settlement's finite wait can cancel a flushing close.
+            self._abort_input(shell.process)
+        if shell.watcher is not None and not watching_input:
             tasks.append(shell.watcher)
         tasks.extend(
             item.monitor
@@ -801,6 +882,13 @@ class ShellSessions:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        if shell.watcher is not None and watching_input:
+            # wait_closed shares the stream protocol's close future. Cancelling
+            # this watcher would cancel that same future. Even failed settlement
+            # must close its owned input without waiting for buffered writes.
+            if not shell.watcher.done() and shell.process is not None:
+                self._abort_input(shell.process)
+            await asyncio.gather(shell.watcher, return_exceptions=True)
         await asyncio.gather(*controls, return_exceptions=True)
         if shell.server is not None:
             try:

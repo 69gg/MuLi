@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Generator
 from contextlib import closing
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal
 
 from muli.compatibility import FormatState
@@ -55,6 +56,7 @@ from muli.store_schema import (
 LifecycleKind = Literal["session", "run", "approval", "workflow_run"]
 _LIFECYCLE_KINDS = ("session", "run", "approval", "workflow_run")
 _LIFECYCLE_PAGE_SIZE = 100
+_FORMAT_REVALIDATION_READS = 2
 _UNFINISHED_LIFECYCLE = (
     "kind IN ('session','run','approval','workflow_run') "
     "AND json_extract(data,'$.status') IN ('pending','queued','running') "
@@ -218,12 +220,44 @@ class Store:
         self._migration_allowed = False
 
     def revalidate_format(self) -> None:
-        """Admitted data never falls back to legacy if its marker is removed."""
-        if self._format_state is not None:
-            evidence = read_optional_format_evidence(self.db)
-            if evidence is None:
-                raise FormatAdmissionError("store_format_marker_missing")
-            self._admit_format(evidence)
+        """Recheck admitted data with bounded recovery of cleaned-up read timeouts.
+
+        The outer checkpoint budget includes reads and cleanup, not the separate
+        schema admission below. A later read gets only the remaining time; this
+        is neither an enlarged single-read limit nor an OS-level hard deadline.
+        """
+        if self._format_state is None:
+            return
+        limits = FormatReadLimits()
+        attempts = 1 if self.migration_allowed else _FORMAT_REVALIDATION_READS
+        deadline = monotonic() + attempts * limits.seconds
+        last_timeout: FormatEvidenceError | None = None
+        for attempt in range(attempts):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                if last_timeout is not None:
+                    raise last_timeout
+                raise FormatEvidenceError("format_read_timeout")
+            try:
+                evidence = read_optional_format_evidence(
+                    self.db,
+                    limits=limits.model_copy(update={"seconds": min(limits.seconds, remaining)}),
+                )
+            except FormatEvidenceError as error:
+                if (
+                    error.code != "format_read_timeout"
+                    or self.db.in_transaction
+                    or attempt + 1 == attempts
+                ):
+                    raise
+                last_timeout = error
+            else:
+                if monotonic() >= deadline:
+                    raise FormatEvidenceError("format_read_timeout")
+                if evidence is None:
+                    raise FormatAdmissionError("store_format_marker_missing")
+                self._admit_format(evidence)
+                return
 
     @property
     def format_state(self) -> FormatState | None:
