@@ -323,7 +323,12 @@ async def test_final_stream_idle_boundary_adopts_ready_summary_and_releases_job_
 ) -> None:
     runtime, seen = make_runtime(tmp_path, [])
     runtime.config.update(
-        {"limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000}}
+        {
+            # Exercise summary adoption under the original budget independently
+            # of unrelated additions to the shipped persona.
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
+            "limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000},
+        }
     )
     await runtime.reconfigure()
     prepared, release = asyncio.Event(), asyncio.Event()
