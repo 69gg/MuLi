@@ -10,13 +10,17 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。`configuration`、`memory` 为 `reads=[2]`、`writes=2`，`ingress` 为 `reads=[4]`、`writes=4`；`objects`、`outbox` 仍为 `reads=[3]`、`writes=3`，`database`、`install_profile` 仍为 `reads=[1]`、`writes=1`，对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧全 `1`、三域 `2`、长期问题关注前的三域 `3` 或 2.114 的 `memory=1` 完整库可直接启动新版。旧库需要[显式停机固定升级](channel-ownership-format-upgrade.md)；现有托管同格式协议继续拒绝跨格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。七域当前精确读写值为：`database`、`install_profile` 的 `reads=[1]`、`writes=1`；`configuration` 的 `reads=[2]`、`writes=2`；`objects`、`outbox`、`memory` 的 `reads=[3]`、`writes=3`；`ingress` 的 `reads=[4]`、`writes=4`。它们对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧全 `1`、三域 `2`、长期问题关注前的三域 `3`、2.114 的 `memory=1` 或网页收藏前 `memory=2` 完整库可直接启动新版。非托管 Linux 的五种精确旧合同、非托管 macOS 的精确网页收藏前合同 `(1,3,2,4,3,2,1)` 需要[显式停机固定升级](channel-ownership-format-upgrade.md)，macOS 还须满足物理路径、权限与无托管痕迹条件；托管跨格式切换、其它 macOS 旧格式与 Windows 旧库升级仍拒绝，各平台新装直接使用当前格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 
 长期问题关注增加主配置 `memory_watches`，所以 `configuration` 改为 `2`；新增输入 `attention_memory_watch` 绑定可独立撤销的关注和来源证明，所以 `ingress` 改为 `4`。旧读取器不能忽略这些证明后继续调用模型或输出。独立版本化的 watch/match/completion 对象和可选 checkpoint 不重解释既有对象或原文修订，其他五域保持原值。即使没有 DDL 或业务行转换，也必须先在停机边界升级精确完整 marker；这不是托管同格式更新或旧版回退许可。详细边界见[长期问题关注合同](fresh-format-admission.md#长期问题关注的格式边界)。
 
-后续的 ASR 转写收藏需要 `memory=2`，其余六域不变。新来源明确保留派生转写身份，2.114 的恢复器不能解释它，不能以“表结构没变”认定兼容。新版能读取升级后留下的旧文本/文档 payload，不代表声明支持直接打开 `memory=1` 的库。失败/关注 proof 的持久字段不变，提醒说明从当前已核验来源计算。边界及冻结旧 reader 证据见 [ASR 来源合同](fresh-format-admission.md#asr-转写来源的格式边界)。
+ASR 转写收藏曾将 `memory=1` 扩为 `memory=2`，其余六域不变。新来源明确保留派生转写身份，2.114 的恢复器不能解释它，不能以“表结构没变”认定兼容。新版能读取升级后留下的旧文本/文档 payload，不代表声明支持直接打开 `memory=1` 的库。失败/关注 proof 的持久字段不变，提醒说明从当前已核验来源计算。边界及冻结旧 reader 证据见 [ASR 来源合同](fresh-format-admission.md#asr-转写来源的格式边界)。
+
+本次明确收藏已留存网页快照将 `memory` 扩为 `3`，其余六域继续保持原值。新 marker `attachment:<id>:webpage:v1:<scope>:<sha256>` 只接受 `http_utf8_text_v1`、`html_static_text_v1`；来源头与完整正文共同绑定摘要，保留外部身份。网页收藏前的 `memory=2` reader 会拒绝该 marker，不能让新来源伪装成普通文本，也不能用未改 DDL 推导格式兼容。新 reader 在升级后的库中继续恢复原有文本、文档和 ASR 来源；已有精确完整 `(1,3,2,4,3,2,1)` 库须在受支持的停机入口升级到 `(1,3,2,4,3,3,1)`，即使尚未收藏网页也不能直接准入。
+
+网页来源只在主人明确选择准确快照、主助手调用 `memory_import_webpage(id, revision)` 后登记；捕获、阅读、摘录和重开不自动入库。该入口核验本地完整快照，不再抓取网站，后台继续遵守既有提炼、遗忘及模型请求边界。格式变更不放宽普通附件白名单、主人身份或来源授权。来源字节、旧 reader 的实际拒绝和 fixture 证据范围见[网页来源合同](fresh-format-admission.md#网页快照来源的格式边界)。
 
 正常关闭后的有限 shell 回执同样采用独立 `shell_receipt/version=1`，可淘汰且不含执行授权，不改配置或既有 unknown/权限语义；当前读取器对坏或未来记录返回 `content_unavailable`。格式上界、淘汰顺序及证据范围见[功能记录合同](fresh-format-admission.md#可淘汰的-shell-回执记录)。通用 Store 保留未知 kind 的回归与源码审查不等于实际运行旧发行包，不能扩大为任意历史包兼容承诺。
 
@@ -70,6 +74,8 @@ result = assess_compatibility(base, candidate, current, handoff_protocol=protoco
 原始纯判定回归使用内存中的测试声明，覆盖七领域、双方读写、未知/缺失/非法版本、迁移和交接协议拒绝、严格有界 JSON、不可变声明以及禁止数据库/文件 I/O。这里的可变格式 ID 和版本仍为夹具。2.22 另增直接读取真实源资产的版本/七领域一致性回归、wheel/sdist 缺失/重复/超限/内容不符的发布反证，并让真实进程回归直接沿用包内资产。
 
 长期问题关注的格式回归冻结 2.112 的实际准入模块及随包 manifest：旧、新完整声明不能通过同格式判定，旧准入函数拒绝新 marker；新 Runtime 在恢复业务前拒绝旧 marker。固定停机升级覆盖精确源合同与业务字节保留。冻结旧模块使用当前未变的格式模型和证据读取器，不能称为真实 2.112 发行包运行证据，也没有下载旧包或验证任意历史版本。
+
+网页来源的格式回归另保留签名基线 `4c069a12cfe2bcbab062db44105c10de669861f3` 的 [2.118 准入 reader](../tests/fixtures/format_admission_v2_118.py)、[来源 reader](../tests/fixtures/attachment_memory_source_v2_118.py) 和 [manifest](../tests/fixtures/compatibility_v2_118.json) 原字节，摘要由[格式测试](../tests/test_webpage_memory_format.py)固定核验。它们覆盖旧 `memory=2` reader/声明拒绝新完整合同和网页 marker、新版保留旧来源解释、旧库构造早拒，以及显式升级时保留来源、遗忘、任务/checkpoint、关注和投递事实。测试复用当前未变共享模型与证据读取器，不表示安装运行旧发行包；ASR 的 2.114 `memory=1` 到 `memory=2` 历史 fixture 与断言继续保留，不改称直接证明网页格式兼容。
 
 原始纯判定的 145 项定向测试已于 2026-10-21 通过共享 guard，用时 0.15 秒、峰值 53.7 MiB；当时两文件 Ruff 与格式检查、单源码严格 mypy 通过，全部 swap 0。
 

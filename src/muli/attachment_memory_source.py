@@ -10,6 +10,7 @@ from typing import Any, TypedDict
 
 from muli.attachments import ATTACHMENT_ID_PATTERN
 from muli.document_reading import document_revision
+from muli.webpage_snapshot import WEBPAGE_SCOPES, parse_webpage_snapshot
 
 MAX_ATTACHMENT_SOURCE_BYTES = 1000
 TRANSCRIPT_SCOPE = "asr_transcript_text"
@@ -34,6 +35,7 @@ def attachment_source(
     *,
     document: Mapping[str, str] | None = None,
     transcript: bool = False,
+    webpage: bool = False,
 ) -> dict[str, Any]:
     """Keep one stable source ID; bind a document's full text to its read view."""
     if not isinstance(identifier, str) or re.fullmatch(ATTACHMENT_ID_PATTERN, identifier) is None:
@@ -53,10 +55,16 @@ def attachment_source(
     source_id = "attachment:" + identifier
     if type(transcript) is not bool or (transcript and document is not None):
         raise ValueError("转写与文档来源范围不能混用")
+    if type(webpage) is not bool or (webpage and (transcript or document is not None)):
+        raise ValueError("网页来源范围不能与其它附件范围混用")
     if document is None:
         if hashlib.sha256(raw).hexdigest() != checksum:
             raise ValueError("附件正文与原始摘要不一致")
-        marker = source_id + (":transcript:v1:asr_text:" if transcript else ":") + checksum
+        if webpage:
+            snapshot = parse_webpage_snapshot(content)
+            marker = f"{source_id}:webpage:v1:{snapshot.scope}:{checksum}"
+        else:
+            marker = source_id + (":transcript:v1:asr_text:" if transcript else ":") + checksum
     else:
         if set(document) != _DOCUMENT_FIELDS or any(
             not isinstance(value, str) for value in document.values()
@@ -115,6 +123,15 @@ def attachment_source_metadata(identifier: str, marker: str) -> AttachmentSource
             "document_revision": None,
         }
     parts = value.split(":")
+    if len(parts) == 4 and parts[:2] == ["webpage", "v1"]:
+        if parts[2] not in WEBPAGE_SCOPES or _DIGEST.fullmatch(parts[3]) is None:
+            raise ValueError("已收藏网页范围或摘要无效")
+        return {
+            "format": "webpage",
+            "scope": parts[2],
+            "source_revision": parts[3],
+            "document_revision": None,
+        }
     if len(parts) == 4 and parts[:3] == ["transcript", "v1", "asr_text"]:
         if _DIGEST.fullmatch(parts[3]) is None:
             raise ValueError("已收藏转写摘要无效")
@@ -146,6 +163,13 @@ def restore_attachment_source(
 ) -> dict[str, Any]:
     """Validate a saved source without reopening an attachment or re-extracting it."""
     metadata = attachment_source_metadata(identifier, marker)
+    if metadata["format"] == "webpage":
+        source = attachment_source(
+            identifier, content, metadata["source_revision"], created_at, webpage=True
+        )
+        if source["source"] != marker:
+            raise ValueError("已收藏网页来源范围与完整正文不一致")
+        return source
     revision = metadata["document_revision"]
     if revision is None:
         return attachment_source(

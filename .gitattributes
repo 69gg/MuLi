@@ -4,3 +4,6 @@
 /tests/fixtures/format_admission_v2_114.py -text
 /tests/fixtures/attachment_memory_source_v2_114.py -text
 /tests/fixtures/compatibility_v2_114.json -text
+/tests/fixtures/format_admission_v2_118.py -text
+/tests/fixtures/attachment_memory_source_v2_118.py -text
+/tests/fixtures/compatibility_v2_118.json -text

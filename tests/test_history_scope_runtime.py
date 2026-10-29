@@ -194,6 +194,9 @@ async def test_owner_finds_completed_delegated_original_after_compaction_and_nor
         instance_id = first.store.instance_id
         first.config.update(
             {
+                # Keep the archived receipt within the original fixture budget;
+                # shipped persona growth is outside this compaction/reopen journey.
+                "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
                 "memory": {"enabled": False, "auto_extract": False},
                 "compaction": {"enabled": False},
             }

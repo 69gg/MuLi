@@ -9,9 +9,11 @@ from typing import Any
 
 import pytest
 
+from muli.compatibility import FormatState
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     LEGACY_FORMAT_STATE,
+    PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
 from muli.format_evidence import (
@@ -33,14 +35,14 @@ from muli.store_initialization import StoreConstructionLock, StoreInitialization
 LINUX = pytest.mark.skipif(sys.platform != "linux", reason="Linux exclusive fixed upgrade")
 
 
-def legacy_database(data_dir: Path) -> Path:
+def legacy_database(data_dir: Path, *, state: FormatState = LEGACY_FORMAT_STATE) -> Path:
     path = data_dir / "muli.sqlite3"
     store = Store.open_runtime(path, default_mode="auto")
     try:
         with store.db:
             store.db.execute(
                 "UPDATE runtime_state SET value=? WHERE name=?",
-                (LEGACY_FORMAT_STATE.model_dump_json(), FORMAT_STATE_KEY),
+                (state.model_dump_json(), FORMAT_STATE_KEY),
             )
     finally:
         store.close()
@@ -101,9 +103,16 @@ def test_upgrade_preserves_null_receipts_pending_ingress_and_unknown_outbox(tmp_
 
 
 @LINUX
+@pytest.mark.parametrize(
+    "source_state",
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
+    ids=["legacy", "memory2"],
+)
 @pytest.mark.parametrize("lock", ["writer", "other_root_writer", "controller", "constructor"])
-def test_fixed_upgrade_refuses_real_cooperative_lock_owners(tmp_path: Path, lock: str) -> None:
-    path = legacy_database(tmp_path / "data")
+def test_fixed_upgrade_refuses_real_cooperative_lock_owners(
+    tmp_path: Path, lock: str, source_state: FormatState
+) -> None:
+    path = legacy_database(tmp_path / "data", state=source_state)
     before = snapshot(path)
     root = (
         tmp_path / "custom-journal"
@@ -130,16 +139,23 @@ def test_fixed_upgrade_refuses_real_cooperative_lock_owners(tmp_path: Path, lock
 
 
 @LINUX
+@pytest.mark.parametrize(
+    "source_state",
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
+    ids=["legacy", "memory2"],
+)
 @pytest.mark.parametrize("source", ["unmarked", "mixed", "unknown"])
-def test_fixed_upgrade_never_guesses_a_source_contract(tmp_path: Path, source: str) -> None:
-    path = legacy_database(tmp_path / "data")
+def test_fixed_upgrade_never_guesses_a_source_contract(
+    tmp_path: Path, source: str, source_state: FormatState
+) -> None:
+    path = legacy_database(tmp_path / "data", state=source_state)
     with closing(sqlite3.connect(path)) as db:
         if source == "unmarked":
             db.execute("DELETE FROM runtime_state WHERE name=?", (FORMAT_STATE_KEY,))
         else:
-            state = LEGACY_FORMAT_STATE.model_copy(
+            state = source_state.model_copy(
                 update={
-                    "formats": LEGACY_FORMAT_STATE.formats.model_copy(
+                    "formats": source_state.formats.model_copy(
                         update={"objects": 2} if source == "mixed" else {"memory": 9}
                     )
                 }
@@ -158,13 +174,17 @@ def test_fixed_upgrade_never_guesses_a_source_contract(tmp_path: Path, source: s
 
 
 @LINUX
-@pytest.mark.parametrize("source", ["legacy", "current"])
+@pytest.mark.parametrize("source", ["legacy", "memory2", "current"])
 @pytest.mark.parametrize("key_storage", ["text", "blob"])
 def test_fixed_upgrade_rejects_unknown_reserved_marker_without_changing_any_rows(
     tmp_path: Path, source: str, key_storage: str
 ) -> None:
     path = legacy_database(tmp_path / "data")
-    state = LEGACY_FORMAT_STATE if source == "legacy" else CURRENT_FORMAT_STATE
+    state = {
+        "legacy": LEGACY_FORMAT_STATE,
+        "memory2": PRE_WEBPAGE_MEMORY_FORMAT_STATE,
+        "current": CURRENT_FORMAT_STATE,
+    }[source]
     key: str | bytes = "format_state_v2" if key_storage == "text" else b"format_state_v2"
     with closing(sqlite3.connect(path)) as db:
         db.execute(
@@ -216,11 +236,18 @@ def test_live_store_rejects_a_marker_change_without_changing_its_admitted_state(
 
 @LINUX
 @pytest.mark.parametrize(
+    "source_state",
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
+    ids=["legacy", "memory2"],
+)
+@pytest.mark.parametrize(
     "managed",
     ["record", "projection", "explicit_root", "queued_adopt", "prepared_switch", "transaction"],
 )
-def test_fixed_upgrade_refuses_managed_ownership(tmp_path: Path, managed: str) -> None:
-    path = legacy_database(tmp_path / "data")
+def test_fixed_upgrade_refuses_managed_ownership(
+    tmp_path: Path, managed: str, source_state: FormatState
+) -> None:
+    path = legacy_database(tmp_path / "data", state=source_state)
     root = path.parent / "management" / "transaction-v1"
     if managed == "record":
         with closing(sqlite3.connect(path)) as db:
@@ -274,10 +301,15 @@ def test_fixed_upgrade_refuses_managed_ownership(tmp_path: Path, managed: str) -
 
 
 @LINUX
+@pytest.mark.parametrize(
+    "source_state",
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
+    ids=["legacy", "memory2"],
+)
 def test_commit_denial_rolls_back_the_real_marker_transaction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_state: FormatState
 ) -> None:
-    path = legacy_database(tmp_path / "data")
+    path = legacy_database(tmp_path / "data", state=source_state)
     before = snapshot(path)
     connect = sqlite3.connect
     commits: list[bool] = []
@@ -301,13 +333,14 @@ def test_commit_denial_rolls_back_the_real_marker_transaction(
     assert snapshot(path) == before
 
 
+@pytest.mark.parametrize("platform", ["win32", "unknown"])
 def test_non_linux_upgrade_refuses_before_touching_the_data_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
     from muli.channel_format_upgrade import upgrade_channel_ownership_format
 
     data_dir = tmp_path / "not-created"
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", platform)
     with pytest.raises(FormatAdmissionError, match="store_format_upgrade_platform_unsupported"):
         upgrade_channel_ownership_format(data_dir)
     assert not data_dir.exists()
