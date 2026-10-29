@@ -10,6 +10,8 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Self
 
+from muli.platforms.transaction_files import _open_directory
+
 
 class StoreInitializationError(ValueError):
     def __init__(self, code: str) -> None:
@@ -24,20 +26,54 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 class StoreConstructionLock(AbstractContextManager["StoreConstructionLock"]):
     """Lock one fixed inode without polling; the caller controls its lifetime."""
 
-    def __init__(self, database: Path) -> None:
-        self.database = database.resolve()
+    def __init__(self, database: Path, *, existing_parent: int | None = None) -> None:
+        self._existing_parent = existing_parent
+        if existing_parent is None:
+            self.database = database.resolve()
+        else:
+            if (
+                sys.platform == "win32"
+                or type(existing_parent) is not int
+                or existing_parent < 0
+                or not database.is_absolute()
+                or ".." in database.parts
+                or os.open not in os.supports_dir_fd
+                or os.stat not in os.supports_dir_fd
+                or os.stat not in os.supports_follow_symlinks
+                or not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC"))
+            ):
+                raise StoreInitializationError("store_initialization_existing_parent_unsupported")
+            self.database = database
         self.path = self.database.with_name("." + self.database.name + "-initialization.lock")
         self.fd: int | None = None
+
+    def _check_parent(self) -> None:
+        if self._existing_parent is None:
+            return
+        current = _open_directory(self.database.parent)
+        try:
+            parent = os.fstat(self._existing_parent)
+            if not stat.S_ISDIR(parent.st_mode) or _identity(parent) != _identity(
+                os.fstat(current)
+            ):
+                raise StoreInitializationError("store_initialization_parent_changed")
+        finally:
+            os.close(current)
 
     def __enter__(self) -> Self:
         if self.fd is not None:
             raise StoreInitializationError("store_initialization_lock_owned")
-        self.database.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            self.path,
-            os.O_CREAT | os.O_RDWR | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
+        if self._existing_parent is None:
+            self.database.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._check_parent()
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if self._existing_parent is None:
+            descriptor = os.open(self.path, flags, 0o600)
+        else:
+            descriptor = os.open(
+                self.path.name, flags | os.O_CLOEXEC, 0o600, dir_fd=self._existing_parent
+            )
         try:
             os.set_inheritable(descriptor, False)
             info = os.fstat(descriptor)
@@ -70,8 +106,24 @@ class StoreConstructionLock(AbstractContextManager["StoreConstructionLock"]):
             raise
 
     def check(self) -> None:
-        if self.fd is None or _identity(os.fstat(self.fd)) != _identity(self.path.lstat()):
+        self._check_parent()
+        if self.fd is None:
             raise StoreInitializationError("store_initialization_lock_changed")
+        info = os.fstat(self.fd)
+        current = (
+            self.path.lstat()
+            if self._existing_parent is None
+            else os.stat(self.path.name, dir_fd=self._existing_parent, follow_symlinks=False)
+        )
+        if _identity(info) != _identity(current):
+            raise StoreInitializationError("store_initialization_lock_changed")
+        if self._existing_parent is not None and (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise StoreInitializationError("store_initialization_lock_invalid")
 
     def __exit__(self, *args: object) -> None:
         if self.fd is not None:
