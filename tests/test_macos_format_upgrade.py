@@ -20,6 +20,7 @@ from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     LEGACY_FORMAT_STATE,
     PRE_MEMORY_WATCH_FORMAT_STATE,
+    PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
     PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
     PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     PREVIOUS_FORMAT_STATE,
@@ -44,10 +45,15 @@ def forbid_connection(*args: Any, **kwargs: Any) -> sqlite3.Connection:
 
 
 @POSIX
-def test_darwin_exact_memory2_upgrade_preserves_rows_and_store_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "state",
+    [PRE_WEBPAGE_MEMORY_FORMAT_STATE, PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE],
+    ids=["memory2", "memory3"],
+)
+def test_darwin_exact_memory_upgrade_preserves_rows_and_store_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: FormatState
 ) -> None:
-    path = legacy_database(tmp_path.resolve() / "data", state=PRE_WEBPAGE_MEMORY_FORMAT_STATE)
+    path = legacy_database(tmp_path.resolve() / "data", state=state)
     before = snapshot(path, omit_marker=True)
     with closing(sqlite3.connect(path)) as db:
         original = read_format_evidence(db)
@@ -106,10 +112,11 @@ def test_existing_parent_lock_never_recreates_or_writes_a_replacement_directory(
         PRE_MEMORY_WATCH_FORMAT_STATE,
         PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
         PRE_WEBPAGE_MEMORY_FORMAT_STATE,
+        PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
     ],
-    ids=["legacy", "channel2", "channel3", "memory1", "memory2"],
+    ids=["legacy", "channel2", "channel3", "memory1", "memory2", "memory3"],
 )
-def test_linux_preserves_all_five_exact_predecessors(tmp_path: Path, state: FormatState) -> None:
+def test_linux_preserves_all_exact_predecessors(tmp_path: Path, state: FormatState) -> None:
     path = legacy_database(tmp_path.resolve() / "data", state=state)
     before = snapshot(path, omit_marker=True)
     assert upgrade(path.parent) is True

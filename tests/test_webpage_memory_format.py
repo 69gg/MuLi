@@ -98,11 +98,11 @@ def test_m_reader_and_manifest_refuse_webpage_memory_contract(database: Path) ->
     )
     assert manifest.release == "2.118.0"
     assert manifest.formats.memory.reads == (2,) and manifest.formats.memory.writes == 2
-    assert current.formats.memory.reads == (3,) and current.formats.memory.writes == 3
+    assert current.formats.memory.reads == (4,) and current.formats.memory.writes == 4
     assert old.CURRENT_FORMAT_STATE == PRE_WEBPAGE_MEMORY_FORMAT_STATE
     assert CURRENT_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
-        "memory": 3,
+        "memory": 4,
     }
     before = snapshot(database)
     with closing(sqlite3.connect(database)) as db:

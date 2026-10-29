@@ -19,6 +19,8 @@ from muli.service import UserService
 
 DEFAULT_LOG_LINES = 40
 MAX_LOG_LINES = 200
+DEFAULT_LOG_SEGMENT = "current"
+LOG_SEGMENTS = (DEFAULT_LOG_SEGMENT, "previous")
 LOG_TIMEOUT = 5
 _MASK = "[hidden]"
 
@@ -121,14 +123,18 @@ async def read_service_logs(
     config: ConfigFile,
     *,
     lines: int = DEFAULT_LOG_LINES,
+    segment: str = DEFAULT_LOG_SEGMENT,
     mcp_config: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if type(lines) is not int or not 1 <= lines <= MAX_LOG_LINES:
         raise ValueError(f"lines 必须为 1 至 {MAX_LOG_LINES} 的整数")
+    if type(segment) is not str or segment not in LOG_SEGMENTS:
+        raise ValueError("segment 必须为 current 或 previous")
     budget = config.settings.limits.max_output_chars
     secrets = _secrets(config, mcp_config() if mcp_config is not None else None)
     result: dict[str, Any] = {
         "source": "journal" if service.platform == "linux" else "service_file",
+        "segment": segment,
         "status": "unavailable",
         "text": "",
         "truncated": False,
@@ -137,6 +143,9 @@ async def read_service_logs(
     }
     try:
         if service.platform == "linux":
+            if segment == "previous":
+                result["reason"] = "previous_segment_unsupported"
+                return result
             if not shutil.which("journalctl"):
                 result["reason"] = "journal_unavailable"
                 return result
@@ -161,9 +170,10 @@ async def read_service_logs(
                 return result
             text = str(response["output"])
         elif service.platform in {"darwin", "win32"}:
-            text, result["truncated"] = await file_io(
-                lambda: _file_tail(service.log_path, budget, lines)
-            )
+            path = service.log_path
+            if segment == "previous":
+                path = path.with_suffix(path.suffix + ".1")
+            text, result["truncated"] = await file_io(lambda: _file_tail(path, budget, lines))
         else:
             result["reason"] = "platform_unsupported"
             return result

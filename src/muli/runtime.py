@@ -54,6 +54,7 @@ from muli.memory_watches import (
     MemoryWatchMatchExpired,
     input_match,
     match_current,
+    match_routing,
 )
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
@@ -769,6 +770,8 @@ class Runtime:
             raise MemorySourceFailureExpired("资料整理失败依据已失效")
         if request.memory_watch is not None and (
             request.memory_watch_guard is not self.memory_watch_guard
+            or (request.attention_routing or FrozenRouting())
+            != match_routing(self.store, request.memory_watch)
             or not self._memory_watch_allowed(
                 request.memory_watch, content_chars=request.memory_watch_chars
             )
@@ -1351,7 +1354,7 @@ class Runtime:
                 raise MemorySourceFailureExpired("资料整理失败依据已失效")
             if memory_watch is not None and (
                 memory_failure is not None
-                or routing not in (None, FrozenRouting())
+                or (routing or FrozenRouting()) != match_routing(self.store, memory_watch)
                 or not self._memory_watch_allowed(memory_watch, content_chars=len(content))
             ):
                 raise MemoryWatchMatchExpired("长期问题回访依据已失效")
@@ -2778,7 +2781,9 @@ class Runtime:
                 turn: ModelTurn | None = None
                 partial = ""
                 delivery_routes = (
-                    prepared.reply_origin.delivery_routes() if session.get("kind") == "main" else []
+                    prepared.reply_origin.delivery_routes()
+                    if session.get("kind") == "main" and prepared.memory_watch is None
+                    else []
                 )
                 try:
                     async with self.capacity:

@@ -25,7 +25,7 @@ from muli.file_inbox import FileInboxProof, FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState, read_message
 from muli.mcp_receive_errors import RECEIVE_FAILURE_CODES
 from muli.memory_source_failure import MemorySourceFailure, failure_current
-from muli.memory_watches import MATCH_EVENT, MemoryWatchMatch, match_current
+from muli.memory_watches import MATCH_EVENT, MemoryWatchMatch, match_current, match_routing
 from muli.proactive import FrozenRouting
 from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
@@ -1033,11 +1033,23 @@ def attention_source(
             )
         ):
             return None
+        routing = match_routing(store, watch_proof)
+        if routing is None:
+            return None
+        detail = json.loads(watch_proof.detail())
+        if routing.classification == "bound":
+            detail["reply_preference"] = {
+                "origin": routing.origin.dump(),
+                "notice": "宿主核对的原来源偏好，不是新授权；仅Web说明不外发，发送须AI显式调用原渠道工具并遵守当前审批。",
+            }
         return AttentionSource(
             "memory",
             watch_proof.identifier,
-            _memory_source_detail(store, watch_proof.source_id, watch_proof.detail()),
+            _memory_source_detail(
+                store, watch_proof.source_id, json.dumps(detail, ensure_ascii=False)
+            ),
             "memory.watch:" + watch_proof.identifier,
+            routing,
             memory_watch_proof=watch_proof,
         )
     if event.get("type") == "notification.created" and (

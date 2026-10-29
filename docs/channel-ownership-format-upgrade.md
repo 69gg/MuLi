@@ -1,6 +1,6 @@
 # 停机升级已有数据格式
 
-已留存网页快照的明确长期收藏需要能准确解释网页来源的记忆合同：`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=3`、`install_profile=1`。各平台新装直接使用此完整格式，无需操作。已有数据包括 2.115 至 2.118 使用的 `memory=2` 及更早格式都需显式升级；启动时若提示 `store_format_upgrade_required`，先完成下述步骤。
+资料关注保存真实来源偏好需要新的记忆解释合同：`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=4`、`install_profile=1`。各平台新装直接使用此完整格式，无需操作。已有 `memory=3`、2.115 至 2.118 使用的 `memory=2` 及更早格式都需显式升级；启动时若提示 `store_format_upgrade_required`，先完成下述步骤。
 
 ## Linux 独立安装
 
@@ -12,7 +12,7 @@ muli --data-dir "/path/to/your-data" upgrade-channel-ownership
 
 将路径换成实际数据目录。命令只升级数据，不启动或停止服务，也不安装依赖。成功输出 `{"upgraded": true}`；已经升级时输出 `{"upgraded": false}`。之后使用原来的配置和数据目录启动新版，旧版本不能再打开升级后的数据。
 
-命令沿用 `upgrade-channel-ownership` 名称，支持以下五种精确完整源合同；表中均为七域的完整值，不按单个版本数字猜测：
+命令沿用 `upgrade-channel-ownership` 名称，支持以下六种精确完整源合同；表中均为七域的完整值，不按单个版本数字猜测：
 
 | 旧合同 | database | objects | configuration | ingress | outbox | memory | install_profile |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -21,10 +21,11 @@ muli --data-dir "/path/to/your-data" upgrade-channel-ownership
 | 长期问题关注前的四渠道格式 | 1 | 3 | 1 | 3 | 3 | 1 | 1 |
 | 转写收藏前的长期问题关注格式（2.113/2.114） | 1 | 3 | 2 | 4 | 3 | 1 | 1 |
 | 网页收藏前的转写来源格式（2.115 至 2.118） | 1 | 3 | 2 | 4 | 3 | 2 | 1 |
+| 保存关注来源偏好前的网页来源格式（2.119/2.120） | 1 | 3 | 2 | 4 | 3 | 3 | 1 |
 
 ## macOS 独立安装
 
-使用同一命令和停机、完整备份步骤，但只接纳 `metadata_version=1` 且七域精确为 `(1,3,2,4,3,2,1)` 的网页收藏前格式，升级到 `(1,3,2,4,3,3,1)`。不能只按 `memory=2` 判断；当前完整格式返回 `{"upgraded": false}`，其它旧合同仍拒绝。
+使用同一命令和停机、完整备份步骤，但只接纳 `metadata_version=1` 且七域精确为 `(1,3,2,4,3,2,1)` 或 `(1,3,2,4,3,3,1)` 的完整旧格式，升级到 `(1,3,2,4,3,4,1)`。不能只按 `memory=2/3` 判断；当前完整格式返回 `{"upgraded": false}`，其它旧合同仍拒绝。
 
 传入已有数据目录的物理路径。路径中的任何符号链接及 `..` 都会被拒绝，命令不跟随链接、重建目录或修权限；例如系统 `/tmp`、`/var` 别名须改用相应的 `/private/...` 物理路径。数据目录须归当前用户，owner 具有读写执行权限，group/other 没有写权限（常见 `0700`、`0750`、`0755` 均可）；数据库须归当前用户、为单链接普通文件且权限精确为 `0600`。路径按[目录 fd 与 no-follow](https://docs.python.org/3/library/os.html#os.open)检查，不先用链接解析把原输入变成另一条路径。
 
@@ -36,7 +37,7 @@ muli --data-dir "/path/to/your-data" upgrade-channel-ownership
 
 升级与 Runtime 使用同一固定锁，竞争立即失败；macOS 在已锚定的既有目录中取锁，路径换代时拒绝，退出不删除锁文件。SQLite 使用已有的 `synchronous=FULL` 提交要求，这不等于断电硬件验收；合法连接仍可能使用 WAL/SHM，不能由业务行不变推导物理文件完全不变。
 
-新主配置字段和可撤销输入证明不受更早 reader 支持；2.114 的来源恢复器不能解释 ASR marker，`memory=2` 的来源恢复器也不能解释新的 `attachment:<id>:webpage:v1:<scope>:<sha256>` marker。网页范围仅为 `http_utf8_text_v1` 或 `html_static_text_v1`，不能伪装成普通文本来源交给旧 reader。因此即使没有业务行迁移，也不能让旧库直接启动新版或让旧版打开升级后的库。新版在升级后的 `memory=3` 库中继续准确解释保留原字节的旧文本、文档和 ASR 来源；这不代表旧版可以回滚打开同一份已升级数据。`requires_migration=false` 只描述当前格式上的同格式更新判定，不能替代这次停机升级；托管跨格式切换仍不支持。
+新主配置字段和可撤销输入证明不受更早 reader 支持；2.114 的来源恢复器不能解释 ASR marker，`memory=2` 的来源恢复器也不能解释 `attachment:<id>:webpage:v1:<scope>:<sha256>` marker。网页范围仅为 `http_utf8_text_v1` 或 `html_static_text_v1`，不能伪装成普通文本来源交给旧 reader。`memory=3` reader 不理解新 v2 关注的来源偏好，不能忽略后继续处理；旧 v1 关注升级后保持 Web 偏好。因此即使没有业务行迁移，也不能让旧库直接启动新版或让旧版打开升级后的库。新版在升级后的 `memory=4` 库中继续准确解释保留原字节的旧文本、文档、ASR 和网页来源；这不代表旧版可以回滚打开同一份已升级数据。`requires_migration=false` 只描述当前格式上的同格式更新判定，不能替代这次停机升级；托管跨格式切换仍不支持。
 
 ## 不支持或失败时
 

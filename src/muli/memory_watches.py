@@ -16,6 +16,8 @@ from muli.events import EventBus
 from muli.evidence import EvidenceError
 from muli.maintenance import Admission
 from muli.memory_source_failure import attachment_revision
+from muli.proactive import FrozenRouting
+from muli.reply_origin import ReplyOrigin
 from muli.store import SQLITE_MAX_INTEGER, Store
 
 if TYPE_CHECKING:
@@ -81,6 +83,45 @@ def _position(value: object, *, positive: bool = False) -> int:
     return value
 
 
+def _routing(store: Store, watch: dict[str, Any]) -> FrozenRouting:
+    if watch["version"] == 1:
+        return FrozenRouting()
+    value = watch["routing"]
+    routing = FrozenRouting.load(value)
+    if routing.dump() != value or routing.classification not in {"legacy_local", "bound"}:
+        raise ValueError("资料关注的来源偏好无法核查")
+    if routing.classification == "bound":
+        # Only finite host provenance crosses into Python, never owner text.
+        row = store.db.execute(
+            "WITH original AS (SELECT CASE WHEN json_valid(payload) THEN json_object("
+            "'id',json_extract(payload,'$.id'),'session_id',json_extract(payload,'$.session_id'),"
+            "'principal',json_extract(payload,'$.principal'),'source',json_extract(payload,'$.source'),"
+            "'route',json_extract(payload,'$.route'),'reply_origin',json_extract(payload,'$.reply_origin')) "
+            "END AS data FROM ingress WHERE id=? AND session_id=? AND state='delivered') "
+            "SELECT CASE WHEN length(CAST(data AS BLOB))<=? THEN CAST(data AS BLOB) END FROM original",
+            (watch["created_input_id"], watch["main_session_id"], MAX_MATCH_PROOF_BYTES),
+        ).fetchone()
+        if row is None or not isinstance(row[0], bytes):
+            raise ValueError("资料关注的主人原输入无法核查")
+        original = json.loads(row[0])
+        # from_input prefers a saved reply_origin. Independently reconstruct
+        # from the real source/route so a stale or altered field cannot hide
+        # behind that saved snapshot; raw snapshots must also be canonical.
+        saved_origin = original.pop("reply_origin")
+        actual_origin = ReplyOrigin.from_input(original)
+        if (
+            original["id"] != watch["created_input_id"]
+            or original["session_id"] != watch["main_session_id"]
+            or original["principal"] != "owner"
+            or routing.origin.input_id != watch["created_input_id"]
+            or actual_origin != routing.origin
+            or (saved_origin is not None and saved_origin != actual_origin.dump())
+            or original["route"] != actual_origin.dump().get("route")
+        ):
+            raise ValueError("资料关注的偏好与真实主人来源不一致")
+    return routing
+
+
 def _watch(store: Store, identifier: str) -> dict[str, Any]:
     item = store.bounded_object(
         _WATCH_KIND, identifier, max_bytes=MAX_MATCH_PROOF_BYTES, strict_json=True
@@ -88,9 +129,9 @@ def _watch(store: Store, identifier: str) -> dict[str, Any]:
     if (
         item is None
         or item.get("id") != identifier
-        or set(item) != _WATCH_FIELDS
         or type(item.get("version")) is not int
-        or item["version"] != 1
+        or item["version"] not in {1, 2}
+        or set(item) != (_WATCH_FIELDS if item["version"] == 1 else _WATCH_FIELDS | {"routing"})
         or item.get("state") not in {"active", "cancelled"}
         or not isinstance(item.get("match_terms"), list)
         or not item["match_terms"]
@@ -111,6 +152,7 @@ def _watch(store: Store, identifier: str) -> dict[str, Any]:
         _WATCH_KIND, item["main_session_id"], item["created_input_id"], item["key"]
     ):
         raise ValueError("资料关注持久身份无效")
+    _routing(store, item)
     return item
 
 
@@ -385,6 +427,26 @@ def match_current(
         return False
 
 
+def match_routing(store: Store, proof: MemoryWatchMatch) -> FrozenRouting | None:
+    """Resolve the canonical watch's original preference, never new authority."""
+    try:
+        watch = _watch(store, proof.watch_id)
+        canonical = store.bounded_object(
+            _MATCH_KIND, proof.identifier, max_bytes=MAX_MATCH_PROOF_BYTES, strict_json=True
+        )
+        if (
+            canonical != proof.dump()
+            or watch["state"] != "active"
+            or watch["revision"] != proof.watch_revision
+            or watch["question"] != proof.question
+            or not _main_current(store, watch["main_session_id"])
+        ):
+            return None
+        return _routing(store, watch)
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, sqlite3.Error):
+        return None
+
+
 def input_match(
     store: Store, identifier: str, *, max_output_chars: int
 ) -> tuple[bool, MemoryWatchMatch | None]:
@@ -472,10 +534,24 @@ class MemoryWatches:
         match_terms: list[str],
         *,
         key: str,
+        routing: FrozenRouting | None = None,
     ) -> dict[str, Any]:
         policy = self.settings()
+        if routing is None:
+            routing = FrozenRouting()
         for value in (main_session_id, input_id, question, key):
             _text(value)
+        if not isinstance(routing, FrozenRouting) or FrozenRouting.load(routing.dump()) != routing:
+            raise ValueError("资料关注需要宿主冻结的来源偏好")
+        _routing(
+            self.store,
+            {
+                "version": 2,
+                "main_session_id": main_session_id,
+                "created_input_id": input_id,
+                "routing": routing.dump(),
+            },
+        )
         if (
             not isinstance(match_terms, list)
             or not 1 <= len(match_terms) <= policy.max_match_terms
@@ -493,7 +569,11 @@ class MemoryWatches:
             )
             if previous is not None:
                 result = _watch(self.store, identifier)
-                if result["question"] != question or result["match_terms"] != match_terms:
+                if (
+                    result["question"] != question
+                    or result["match_terms"] != match_terms
+                    or _routing(self.store, result) != routing
+                ):
                     raise ValueError("相同资料关注 key 的登记内容不一致")
             else:
                 if len(self._active()) >= policy.max_active:
@@ -501,12 +581,13 @@ class MemoryWatches:
                 position = self.store.event_position()
                 result = {
                     "id": identifier,
-                    "version": 1,
+                    "version": 2,
                     "main_session_id": main_session_id,
                     "created_input_id": input_id,
                     "key": key,
                     "question": question,
                     "match_terms": list(match_terms),
+                    "routing": routing.dump(),
                     "state": "active",
                     "revision": 1,
                     "created_after_event": position,

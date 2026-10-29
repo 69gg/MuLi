@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整全 `1`、旧 OneBot 三域 `2`、长期问题关注前四渠道格式、转写收藏前 2.114 精确格式或网页收藏前 `memory=2` 精确格式的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)。非托管 macOS 仅支持其中完整网页收藏前格式 `(1,3,2,4,3,2,1)`，并须满足指南中的既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)列出的六种精确完整前序：全 `1`、旧 OneBot 三域 `2`、长期问题关注前四渠道格式、转写收藏前 2.114 格式、网页收藏前 `memory=2` 格式及来源偏好前 `memory=3` 格式。非托管 macOS 仅支持其中完整 `(1,3,2,4,3,2,1)` 或 `(1,3,2,4,3,3,1)`，并须满足指南中的既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -30,7 +30,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=3`、`install_profile=1`。原三域 `2` 引入 OneBot 长期归属与持久 proof；原三域 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。长期问题关注改变 `configuration`、`ingress` 两域；ASR 转写收藏将 `memory` 从 `1` 扩为 `2`，本次网页收藏再扩为 `3`，其余六域保持原值。旧完整三域 `3`、其余四域 `1` 保存为 `PRE_MEMORY_WATCH_FORMAT_STATE`；2.114 的完整合同保存为 `PRE_TRANSCRIPT_MEMORY_FORMAT_STATE`；网页收藏前的完整 `memory=2` 合同保存为 `PRE_WEBPAGE_MEMORY_FORMAT_STATE`。它们与原全 `1`、三域 `2` 都只作为显式停机升级源，不能直接启动。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
+完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=4`、`install_profile=1`。原三域 `2` 引入 OneBot 长期归属与持久 proof；原三域 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。长期问题关注改变 `configuration`、`ingress` 两域；ASR 转写收藏将 `memory` 从 `1` 扩为 `2`，网页收藏再扩为 `3`，本次保存关注来源偏好扩为 `4`，其余六域保持原值。旧完整三域 `3`、其余四域 `1` 保存为 `PRE_MEMORY_WATCH_FORMAT_STATE`；2.114 的完整合同保存为 `PRE_TRANSCRIPT_MEMORY_FORMAT_STATE`；网页收藏前的完整 `memory=2` 合同保存为 `PRE_WEBPAGE_MEMORY_FORMAT_STATE`；来源偏好前的完整 `memory=3` 合同保存为 `PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE`。它们与原全 `1`、三域 `2` 都只作为显式停机升级源，不能直接启动。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |
@@ -46,13 +46,19 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ### 长期问题关注的格式边界
 
-`memory_watch`、`memory_watch_match`、`memory_source_completion` 是独立 `version=1` 功能记录；`memory_jobs.checkpoint.source_completion` 是可选的完成证明。真实后台 job 进入 `done` 与完成事件、canonical object 和 checkpoint 证明同事务保存，发现服务随后核对准确来源及修订。旧 `done` 没有完成证明不会补造事件，也不会扫描此前已整理完的资料。该功能加入时不重解释原有 source、revision、forget、run 或 unknown 状态，当时保留 `objects=3`、`memory=1`；后续 ASR 来源合同改为 `memory=2`、网页来源合同改为 `memory=3`，均不改这些证明字段。
+最初的 `memory_watch`、`memory_watch_match`、`memory_source_completion` 是独立 `version=1` 功能记录；`memory_jobs.checkpoint.source_completion` 是可选的完成证明。真实后台 job 进入 `done` 与完成事件、canonical object 和 checkpoint 证明同事务保存，发现服务随后核对准确来源及修订。旧 `done` 没有完成证明不会补造事件，也不会扫描此前已整理完的资料。该功能加入时不重解释原有 source、revision、forget、run 或 unknown 状态，当时保留 `objects=3`、`memory=1`；后续 ASR 来源合同改为 `memory=2`、网页来源合同改为 `memory=3`，均不改这些证明字段。
+
+本次 `memory=4` 的新 `memory_watch/version=2` 增加严格规范化的 `routing`：只允许规范 Web-local，或从登记轮真实主人输入冻结的 bound 原来源；完整字段、输入 ID、主会话、principal 和已保存原来源必须一致，不能容错回落后接纳坏路由。旧 v1 继续按 Web 解释，match/completion/checkpoint、ingress 与 outbox 的编码不变。事件仅携带原 match proof，选路回查 canonical watch；相同路线的不同 proof 仍独立合批。Web attention 内容整体预算包含原身份和非授权说明；普通文字与异常 partial 的回复路线为空，AI 显式发送入队前仍核当前渠道、原审批和当前 proof，不把偏好当成新权限。
+
+原运输配置、主人绑定与 manager 代次在入队及每段实际发送前核对，配置对象漂移时拒绝继续；已完成分段的收据保留。主动通知默认目的地变化不会重定向已冻结的原来源，当前主动通知权限与记忆依据继续由原 `guard_delivery` 核验。
+
+[`format_admission_v2_120.py`](../tests/fixtures/format_admission_v2_120.py) 和 [`compatibility_v2_120.json`](../tests/fixtures/compatibility_v2_120.json) 保留签名 P `c55546bbc1687c7e183f1e5ba7c671a7443dfb2a` 的原字节；[来源偏好格式回归](../tests/test_memory_watch_origin_format.py) 用其源码 reader 证明 memory4 被拒。它复用当前未变的模型与格式证据读取器，不是旧 wheel 或旧发行环境的运行证明。精确 Linux/macOS 独立安装停机升级只改允许的完整 marker，保留原 v1 关注、来源和业务行；托管及 Windows 旧库升级范围不扩大。
 
 主配置新增字段会让拒绝未知字段的旧版无法读取保存后的完整配置；新输入 proof 也不能被旧版当普通 `system:attention` 消费。2.112 的旧读取路径只识别整理失败证明，既不按 watch proof 独立合批，也不在取消或遗忘后核验它。因此新合同必须显式拒绝旧 reader；即使本机尚未登记关注，也不沿用旧完整声明。
 
 ### ASR 转写来源的格式边界
 
-ASR 转写收藏将当时的 `memory=1` 扩为 `memory=2`，新增 `attachment:<转写ID>:transcript:v1:asr_text:<工件SHA256>`，明确来源是已保存的派生转写，原文保持工件字节。普通 SHA marker 和 `document:v1` 的旧编码不变；当前 `memory=3` 继续在升级后的库中恢复这些来源。
+ASR 转写收藏将当时的 `memory=1` 扩为 `memory=2`，新增 `attachment:<转写ID>:transcript:v1:asr_text:<工件SHA256>`，明确来源是已保存的派生转写，原文保持工件字节。普通 SHA marker 和 `document:v1` 的旧编码不变；当前 `memory=4` 继续在升级后的库中恢复这些来源。
 
 2.114 只恢复纯摘要或六段文档 marker。让新 marker 继续声明 `memory=1` 会使旧版接纳整库，却拒绝缺 episode/job 的来源恢复、失败证明和关注核验。把新来源伪装成普通文本则会丢失转写身份。因此无 DDL 变化也需要新的来源解释合同。对象/输入 proof 字段、版本、遗忘、授权和 unknown 语义均不变，其余六领域保持原值；不新增 `objects=4`。
 
@@ -64,7 +70,7 @@ ASR 转写收藏将当时的 `memory=1` 扩为 `memory=2`，新增 `attachment:<
 
 主人明确选定已留存快照后，主助手才可调用 `memory_import_webpage(id, revision)`，其中 `revision` 是该快照的完整附件摘要。只核验和登记本地全文，不重抓网站，也不只收藏阅读页、预览或摘录。默认捕获、阅读、书签、摘录、压缩和重开均不自动收藏；后台沿用既有提炼、分块、embedding 与遗忘边界，可能按已配置服务发送正文。收藏回执仅报告实际后台状态，不证明网页真实或当前有效。
 
-网页收藏前的 `memory=2` reader 只识别文本、文档和 ASR 来源，拒绝网页 marker；继续沿用旧完整声明会让整库准入与来源恢复的解释不一致。因此即使 DDL 没变，也须使用新完整合同。符合停机入口条件的非托管 Linux、macOS 已有库必须停机，将精确旧七域 `(1,3,2,4,3,2,1)` 原子升级为当前 `(1,3,2,4,3,3,1)`；新建库直接发布当前合同。托管同格式协议不支持这次跨格式切换，Windows 的旧库仍拒绝升级；不能用旧版回退打开已升级数据。
+网页收藏前的 `memory=2` reader 只识别文本、文档和 ASR 来源，拒绝网页 marker；继续沿用旧完整声明会让整库准入与来源恢复的解释不一致。因此即使 DDL 没变，也须使用新完整合同。网页收藏当时的目标为 `(1,3,2,4,3,3,1)`；本次来源偏好继续扩为 `(1,3,2,4,3,4,1)`，符合停机入口条件的非托管 Linux、macOS 旧库按[当前升级说明](channel-ownership-format-upgrade.md)直接升到当前合同。新建库直接发布当前合同；托管同格式协议不支持这次跨格式切换，Windows 的旧库仍拒绝升级，不能用旧版回退打开已升级数据。
 
 [`format_admission_v2_118.py`](../tests/fixtures/format_admission_v2_118.py)、[`attachment_memory_source_v2_118.py`](../tests/fixtures/attachment_memory_source_v2_118.py) 与 [`compatibility_v2_118.json`](../tests/fixtures/compatibility_v2_118.json) 来自签名基线 `4c069a12cfe2bcbab062db44105c10de669861f3`，已由宿主核对签名 Git 对象和其冻结源码的原始字节；预期摘要固定在[格式回归](../tests/test_webpage_memory_format.py)。回归执行冻结旧 reader，并复用当前未变的共享模型与证据读取器；这不是旧 wheel、旧发行环境或任意历史版本的运行验证。
 
