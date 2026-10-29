@@ -94,10 +94,12 @@ async def test_normal_reopen_reads_unseen_shell_tail_without_replaying_command(
     recovered_pages: list[dict[str, Any]] = []
     empty_before: dict[str, Any] = {}
     empty_after: dict[str, Any] = {}
+    live_history: dict[str, Any] = {}
+    discovered: dict[str, Any] = {}
     reopened: Runtime | None = None
 
     def launch_script() -> ShellScript:
-        nonlocal launched, original_cursor
+        nonlocal launched, original_cursor, live_history
         boot = yield from completed_shell(
             call("receipt-boot", "shell_run", command="echo RECEIPT_BOOT", cwd=str(tmp_path))
         )
@@ -129,17 +131,21 @@ async def test_normal_reopen_reads_unseen_shell_tail_without_replaying_command(
                 for stream in prefixes
             ):
                 break
+        live_history = yield call("receipt-live-history", "shell_history")
         return "运行回执已返回，本轮不等命令结束。"
 
     def read_script() -> ShellScript:
-        nonlocal empty_before, empty_after
+        nonlocal empty_before, empty_after, discovered
         empty_before = yield call("reopened-empty-before", "shell_read")
+        discovered = yield call("reopened-history", "shell_history", limit=1)
+        assert "error" not in discovered and len(discovered["items"]) == 1, discovered
+        selected = discovered["items"][0]["command_id"]
         cursor = original_cursor.copy()
         for index in range(4):
             page = yield call(
                 f"reopened-page-{index}",
                 "shell_read",
-                command_id=launched["command_id"],
+                command_id=selected,
                 cursor=cursor,
             )
             recovered_pages.append(page)
@@ -174,6 +180,7 @@ async def test_normal_reopen_reads_unseen_shell_tail_without_replaying_command(
             assert "".join(page[stream] for page in prefix_pages) == prefixes[stream]
             assert original_cursor[stream] == len(prefixes[stream].encode("utf-8"))
         assert launched["session_id"] == session_id and launched["shell_pid"] is not None
+        assert live_history["items"] == [] and live_history["next_cursor"] is None
         command = runtime.shells._commands[launched["command_id"]]
         assert command.state == "running" and not command.done.is_set()
 
@@ -198,7 +205,7 @@ async def test_normal_reopen_reads_unseen_shell_tail_without_replaying_command(
             event["data"]
             for event in runtime.store.events(session_id=session_id)
             if event["type"] == "tool.completed"
-            and event["data"].get("name") in {"shell_run", "shell_read"}
+            and event["data"].get("name") in {"shell_run", "shell_read", "shell_history"}
         ]
         assert len(old_events) == len(old_tools)
         for marker in (f"未读尾出-{nonce}", f"未读尾错-{nonce}"):
@@ -238,7 +245,7 @@ async def test_normal_reopen_reads_unseen_shell_tail_without_replaying_command(
             for event in reopened.store.events(session_id=session_id)
             if (event["data"].get("call_id") or "").startswith("reopened-")
         ]
-        assert all(event["name"] == "shell_read" for event in new_events)
+        assert all(event["name"] in {"shell_read", "shell_history"} for event in new_events)
         assert any(
             event.get("call_id") == "reopened-page-0" and "arguments" in event
             for event in new_events
@@ -249,10 +256,23 @@ async def test_normal_reopen_reads_unseen_shell_tail_without_replaying_command(
             if event.get("call_id", "").startswith("reopened-page-") and "result" in event
         ] == stored_pages
 
-        # Establish the real completed command and unchanged side effect before
-        # the intended product red: today's authorized read returns not_found.
+        # Directory discovery and exact reading must keep the same real command
+        # and its single side effect; neither lookup creates a replacement shell.
         assert counter.read_text(encoding="utf-8").splitlines() == [nonce]
         assert reopened.shells.live_sessions() == ()
+        assert discovered["session_id"] == session_id
+        assert discovered["receipt_source"] == "stored"
+        assert discovered["shell_state"] == "closed" and discovered["shell_pid"] is None
+        assert discovered["order"] == "archive_event_desc"
+        assert discovered["items"][0]["command_id"] == launched["command_id"]
+        assert discovered["items"][0]["os_epoch"] == launched["os_epoch"]
+        assert discovered["items"][0]["state"] == "completed"
+        assert discovered["items"][0]["truncated"] is False
+        assert len(json.dumps(discovered, ensure_ascii=False)) <= page_budget
+        assert all(
+            marker not in json.dumps(discovered, ensure_ascii=False)
+            for marker in (f"未读尾出-{nonce}", f"未读尾错-{nonce}")
+        )
         assert command.done.is_set() and command.proof.is_set()
         assert command.stdout_fence.is_set() and command.stderr_fence.is_set()
         assert command.state == "completed" and command.exit_code == 0

@@ -5,9 +5,13 @@ from __future__ import annotations
 import base64
 import json
 import re
+import sqlite3
 from collections import deque
+from contextlib import closing
 from typing import Any
 
+from .evidence import json_size
+from .management_transaction import _object
 from .shell_sessions import (
     OutputCursor,
     ShellSessionError,
@@ -61,11 +65,9 @@ def _json_bytes(value: dict[str, Any]) -> int:
     return len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8"))
 
 
-def _decode(
-    record: dict[str, Any], session_id: str, command_id: str
-) -> tuple[dict[str, Any], _Output]:
+def _metadata(record: dict[str, Any], session_id: str, command_id: str) -> dict[str, Any]:
     if (
-        set(record) != _RECORD_FIELDS
+        set(record) != _RECORD_FIELDS - {"output"}
         or type(record["version"]) is not int
         or record["version"] != RECEIPT_VERSION
         or record["id"] != receipt_key(session_id, command_id)
@@ -75,8 +77,7 @@ def _decode(
     ):
         raise ValueError("unsupported shell evidence")
     _count(record["event_id"], minimum=1)
-    header = {key: value for key, value in record.items() if key != "output"}
-    if _json_bytes(header) > MAX_METADATA_BYTES:
+    if _json_bytes(record) > MAX_METADATA_BYTES:
         raise ValueError("shell evidence metadata exceeds format bound")
     metadata = record["metadata"]
     if not isinstance(metadata, dict) or set(metadata) != _METADATA_FIELDS:
@@ -100,6 +101,17 @@ def _decode(
             raise ValueError("invalid shell evidence exit status")
     elif exit_code is not None:
         raise ValueError("unfinished shell evidence cannot certify an exit")
+    return metadata
+
+
+def _decode(
+    record: dict[str, Any], session_id: str, command_id: str
+) -> tuple[dict[str, Any], _Output]:
+    if set(record) != _RECORD_FIELDS:
+        raise ValueError("unsupported shell evidence")
+    metadata = _metadata(
+        {key: value for key, value in record.items() if key != "output"}, session_id, command_id
+    )
     body = record["output"]
     if not isinstance(body, dict) or set(body) != _OUTPUT_FIELDS:
         raise ValueError("invalid shell evidence output")
@@ -294,6 +306,144 @@ class ShellReceipts:
         self.store.db.execute(
             "DELETE FROM events WHERE type=? AND session_id=?", (RECEIPT_EVENT, session_id)
         )
+
+    def history(
+        self,
+        session_id: str,
+        *,
+        cursor: int | None = None,
+        limit: int,
+        output_limit: int,
+        receipt_limit: int,
+    ) -> dict[str, Any]:
+        """List stored headers by archive event; never decode retained output."""
+        _count(limit, minimum=1)
+        _count(limit + 1, minimum=1)
+        _count(output_limit, minimum=1)
+        _count(receipt_limit, minimum=1)
+        before = None if cursor is None else _count(cursor, minimum=1)
+        if not self._session_exists(session_id):
+            raise ShellSessionError("not_found", "该会话不存在，无法查询 shell 回执目录")
+        result: dict[str, Any] = {
+            "session_id": session_id,
+            "receipt_source": "stored",
+            "shell_state": "closed",
+            "shell_pid": None,
+            "order": "archive_event_desc",
+            "items": [],
+            "next_cursor": None,
+        }
+        if json_size(result) > receipt_limit:
+            raise ShellSessionError("output_budget", "shell 回执目录元数据超过当前输出预算")
+        prefix = json.dumps([session_id], ensure_ascii=True, separators=(",", ":"))[:-1] + ","
+        try:
+            # A producer event with a missing/invalid object is unavailable evidence,
+            # not proof that this session has no archived commands.
+            orphan = self.store.db.execute(
+                "SELECT 1 FROM events AS e LEFT JOIN objects AS o ON o.kind=? "
+                "AND o.id=CASE WHEN typeof(e.data)='text' "
+                "AND length(CAST(e.data AS BLOB))<=? THEN CASE WHEN json_valid(e.data) "
+                "THEN json_extract(e.data,'$.id') END END "
+                "AND substr(o.id,1,length(?))=? "
+                "WHERE e.type=? AND e.session_id=? AND o.id IS NULL LIMIT 1",
+                (RECEIPT_KIND, MAX_METADATA_BYTES, prefix, prefix, RECEIPT_EVENT, session_id),
+            ).fetchone()
+            if orphan is not None:
+                raise ValueError("unbound shell receipt event")
+            query = (
+                "WITH owned AS (SELECT id,CASE WHEN typeof(data)='text' "
+                "AND length(CAST(data AS BLOB))<=? THEN CASE WHEN json_valid(data) "
+                "THEN data END END AS data FROM objects WHERE kind=? AND "
+                "(substr(id,1,length(?))=? OR CASE WHEN typeof(data)='text' "
+                "AND length(CAST(data AS BLOB))<=? THEN CASE WHEN json_valid(data) "
+                "THEN json_extract(data,'$.session_id') END END=?)), "
+                "headers AS (SELECT id,json_remove(data,'$.output') AS header,"
+                "CASE WHEN json_type(data,'$.output.observed')='integer' "
+                "THEN json_extract(data,'$.output.observed') END AS observed,"
+                "CASE WHEN json_type(data,'$.output.retained')='integer' "
+                "THEN json_extract(data,'$.output.retained') END AS retained,"
+                "CASE WHEN json_type(data,'$.output.discarded')='integer' "
+                "THEN json_extract(data,'$.output.discarded') END AS discarded FROM owned) "
+                "SELECT h.id,CASE WHEN length(CAST(h.header AS BLOB))<=? "
+                "THEN CAST(h.header AS BLOB) END AS header,h.observed,h.retained,h.discarded,"
+                "e.id AS position,e.type,e.session_id,"
+                "CASE WHEN typeof(e.data)='text' AND length(CAST(e.data AS BLOB))<=? "
+                "THEN CAST(e.data AS BLOB) END AS event_data "
+                "FROM headers AS h LEFT JOIN events AS e ON e.id=json_extract(h.header,'$.event_id') "
+                "WHERE (? IS NULL OR coalesce(e.id,0)<?) "
+                "ORDER BY coalesce(e.id,0) DESC,h.id DESC LIMIT ?"
+            )
+            with closing(
+                self.store.db.execute(
+                    query,
+                    (
+                        MAX_ENVELOPE_BYTES,
+                        RECEIPT_KIND,
+                        prefix,
+                        prefix,
+                        MAX_ENVELOPE_BYTES,
+                        session_id,
+                        MAX_METADATA_BYTES,
+                        MAX_METADATA_BYTES,
+                        before,
+                        before,
+                        limit + 1,
+                    ),
+                )
+            ) as rows:
+                previous: int | None = None
+                row = rows.fetchone()
+                for _ in range(limit):
+                    if row is None:
+                        break
+                    following = rows.fetchone()
+                    if row["header"] is None or row["event_data"] is None:
+                        raise ValueError("unavailable shell receipt header")
+                    header = _object(row["header"])
+                    command_id = header["command_id"]
+                    metadata = _metadata(header, session_id, command_id)
+                    position = _count(row["position"], minimum=1)
+                    if (
+                        row["id"] != header["id"]
+                        or header["event_id"] != position
+                        or row["type"] != RECEIPT_EVENT
+                        or row["session_id"] != session_id
+                        or _object(row["event_data"])
+                        != {"id": header["id"], "source": RECEIPT_KIND}
+                    ):
+                        raise ValueError("unbound shell receipt identity")
+                    observed, retained, discarded = (
+                        _count(row[name]) for name in ("observed", "retained", "discarded")
+                    )
+                    if retained > MAX_RAW_BYTES or observed != retained + discarded:
+                        raise ValueError("inconsistent shell receipt counts")
+                    entry = {
+                        "command_id": command_id,
+                        "event_id": position,
+                        "os_epoch": metadata["os_epoch"],
+                        "state": metadata["state"],
+                        "exit_code": metadata["exit_code"],
+                        "truncated": discarded > 0 or retained > min(MAX_RAW_BYTES, output_limit),
+                    }
+                    result["items"].append(entry)
+                    result["next_cursor"] = None if following is None else position
+                    if json_size(result) > receipt_limit:
+                        result["items"].pop()
+                        if previous is None:
+                            raise ShellSessionError(
+                                "output_budget", "shell 回执目录单项超过当前输出预算"
+                            )
+                        result["next_cursor"] = previous
+                        break
+                    previous = position
+                    row = following
+        except (sqlite3.Error, ValueError, TypeError, KeyError, RecursionError) as exc:
+            if isinstance(exc, ShellSessionError):
+                raise
+            raise ShellSessionError(
+                "content_unavailable", "持久 shell 回执目录无法完整核查"
+            ) from exc
+        return result
 
     def read(
         self,

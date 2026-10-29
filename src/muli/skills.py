@@ -11,15 +11,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
-import yaml  # type: ignore[import-untyped]
-from yaml.events import (  # type: ignore[import-untyped]
+import yaml
+from yaml.events import (
     AliasEvent,
     CollectionEndEvent,
     CollectionStartEvent,
     DocumentStartEvent,
     ScalarEvent,
 )
-from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode  # type: ignore[import-untyped]
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from muli.attachments import file_io
 from muli.config import SkillsSettings, default_home
