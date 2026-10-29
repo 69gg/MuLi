@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from muli.evidence import EvidenceError, decode_utf8
+from muli.evidence import EvidenceError, decode_utf8, validate_integer
 from muli.memory_schema import SCHEMA
 from muli.store import Store, new_id, now
 from muli.store_schema import validate_existing_schema
@@ -542,10 +542,15 @@ class Memory:
         aliases: Mapping[str, str],
         dedup_key: str | None,
         preserve_metadata: bool = False,
+        expected_version: int | None = None,
     ) -> str:
         existing = self.get(identifier) if identifier else None
         if identifier and existing is None:
             raise KeyError(identifier)
+        if expected_version is not None:
+            validate_integer(expected_version, "expected_version", minimum=1)
+            if existing is None or existing["version"] != expected_version:
+                raise EvidenceError("evidence_changed", "记忆版本已变化，请重新核对后再更正")
         if preserve_metadata and existing is not None:
             source_id, quote = existing["source_id"], existing["quote"]
             trusted_owner, claim_key = existing["trusted_owner"], existing["claim_key"]
@@ -574,16 +579,31 @@ class Memory:
                 "SELECT memory_id FROM memory_meta WHERE dedup_key=?", (dedup_key,)
             ).fetchone()
             if duplicate is not None and duplicate[0] != identifier:
+                if expected_version is not None:
+                    raise EvidenceError("evidence_changed", "记忆版本已变化，请重新核对后再更正")
                 if self._aliases(aliases, source_id, str(duplicate[0])):
                     self._bump()
                 return str(duplicate[0])
         identifier = identifier or new_id()
         if existing is not None:
+            if expected_version is not None:
+                # This conditional history insert is the first write. It
+                # acquires SQLite's write lock and rejects a concurrent edit
+                # even if it committed after our last read under DEFERRED.
+                cursor = self.store.db.execute(
+                    "INSERT INTO memory_revisions(memory_id,snapshot,changed_at) "
+                    "SELECT ?,?,? FROM memory_meta "
+                    "WHERE memory_id=? AND typeof(version)='integer' AND version=?",
+                    (identifier, _json(existing), now(), identifier, expected_version),
+                )
+                if cursor.rowcount != 1:
+                    raise EvidenceError("evidence_changed", "记忆版本已变化，请重新核对后再更正")
             self._invalidate_communities([identifier])
-            self.store.db.execute(
-                "INSERT INTO memory_revisions(memory_id,snapshot,changed_at) VALUES(?,?,?)",
-                (identifier, _json(existing), now()),
-            )
+            if expected_version is None:
+                self.store.db.execute(
+                    "INSERT INTO memory_revisions(memory_id,snapshot,changed_at) VALUES(?,?,?)",
+                    (identifier, _json(existing), now()),
+                )
             self.store.db.execute("DELETE FROM memory_vectors WHERE memory_id=?", (identifier,))
             if not preserve_metadata:
                 self._replace_alias_contributions(identifier)
@@ -696,18 +716,28 @@ class Memory:
         assert result is not None
         return result
 
-    def edit(self, identifier: str, **changes: Any) -> dict[str, Any]:
+    def edit(
+        self, identifier: str, *, expected_version: int | None = None, **changes: Any
+    ) -> dict[str, Any]:
         """Correct visible fields without silently replacing host-owned provenance."""
         allowed = {"content", "kind", "source", "entities", "relations", "confidence"}
         if changes.keys() - allowed:
             raise ValueError("更正仅接受内容、类型、来源标签、实体、关系和置信度")
+        if expected_version is not None:
+            validate_integer(expected_version, "expected_version", minimum=1)
         with self.store.db:
             existing = self.get(identifier)
             if existing is None:
                 raise KeyError(identifier)
+            if expected_version is not None:
+                validate_integer(existing["version"], "version", minimum=1)
+                if existing["version"] != expected_version:
+                    raise EvidenceError("evidence_changed", "记忆版本已变化，请重新核对后再更正")
             values = {key: changes.get(key, existing[key]) for key in allowed}
             if all(values[key] == existing[key] for key in allowed):
                 return existing
+            if expected_version is not None:
+                validate_integer(existing["version"] + 1, "version", minimum=1)
             previous_entities = self._memory_entity_ids(identifier)
             saved = self._save(
                 **values,
@@ -720,6 +750,7 @@ class Memory:
                 aliases={},
                 dedup_key=None,
                 preserve_metadata=True,
+                expected_version=expected_version,
             )
             self._rebuild_communities(previous_entities | self._memory_entity_ids(saved))
             self._purge_orphans()
