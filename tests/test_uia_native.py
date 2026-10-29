@@ -27,6 +27,7 @@ from helpers.uia_probe_diagnostics import (
     pending_received,
     probe_facts,
 )
+from helpers.uia_probe_spawn import install_probe_spawn, probe_spawn_mode
 
 from muli.config import Settings
 from muli.process import _settle_process
@@ -86,6 +87,7 @@ async def discover(computer: Computer, form: NativeForm) -> str:
 async def test_real_windows_probe_does_not_initialize_the_tree_walker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_source: str | None
 ) -> None:
+    spawn_mode = probe_spawn_mode()
     helper = Path(module.__file__).with_name("uia_helper.ps1")
     source = helper.read_text(encoding="utf-8")
     initialization = "$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker"
@@ -116,20 +118,24 @@ async def test_real_windows_probe_does_not_initialize_the_tree_walker(
     with monkeypatch.context() as construction:
         construction.setattr(module, "AXHelperLease", owned_probe)
         probe = computer._uia._new_lease(once=True)
-    try:
-        result = await observe_probe(probe)
-        assert result["dependency_available"] is True and result["session_accessible"] is None
-        assert result["apartment"] == "MTA" and result["has_window"] is False
-        assert result["no_profile"] is True and result["non_interactive"] is True
-        assert result["module_autoloading"] == "None"
-        facts = probe_facts(probe, cleanup_failed=False)
-        assert "uia_host_validated" in facts["stages"]
-        assert "uia_add_type_returned" in facts["stages"] and "uia_ready" in facts["stages"]
-    finally:
-        await computer.aclose()
-        assert probe.closed and probe._process is not None
-        assert probe._process.returncode is not None
-        assert probe._count == 1 and all(reader.done() for reader in probe._readers)
+    with monkeypatch.context() as spawning:
+        controlled = install_probe_spawn(spawning, probe._argv, spawn_mode)
+        try:
+            result = await observe_probe(probe)
+            if controlled is not None:
+                assert controlled.calls == 1
+            assert result["dependency_available"] is True and result["session_accessible"] is None
+            assert result["apartment"] == "MTA" and result["has_window"] is False
+            assert result["no_profile"] is True and result["non_interactive"] is True
+            assert result["module_autoloading"] == "None"
+            facts = probe_facts(probe, cleanup_failed=False)
+            assert "uia_host_validated" in facts["stages"]
+            assert "uia_add_type_returned" in facts["stages"] and "uia_ready" in facts["stages"]
+        finally:
+            await computer.aclose()
+            assert probe.closed and probe._process is not None
+            assert probe._process.returncode is not None
+            assert probe._count == 1 and all(reader.done() for reader in probe._readers)
 
 
 async def test_real_windows_probe_assembly_failure_returns_its_original_error_and_cleans_up(
