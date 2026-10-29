@@ -68,6 +68,7 @@ class LocalServices:
             self.task_control,
             runtime.memory,
             max_handoff_records=lambda: runtime.config.settings.limits.max_search_results,
+            current_wait=runtime.inspect_task_wait,
         )
         runtime.task_control = self.task_control
         self.reading_pages = ReadingPages(
