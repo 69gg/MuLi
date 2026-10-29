@@ -377,6 +377,7 @@ def _create_app(
     runtime.maintenance.on_configuration_release(wake_onboarding)
 
     async def activate_components() -> None:
+        runtime._main_wake_deferred = True
         await plugins.load()
         if runtime.maintenance.permit and runtime.maintenance.permit.probation:
             await runtime.activate_components()
@@ -389,6 +390,8 @@ def _create_app(
         await personal_io.start()
         await integration.start()
         await management.start()
+        runtime._main_wake_deferred = False
+        runtime._wake_main()
         await onboarding()
 
     runtime.maintenance.bind_activation(activate_components)

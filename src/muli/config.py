@@ -590,6 +590,14 @@ class TopicReminderSettings(Section):
     batch_size: int = Field(default=8, ge=1, le=64, strict=True)
 
 
+class MemoryWatchSettings(Section):
+    max_active: int = Field(default=32, ge=1, le=256, strict=True)
+    max_match_terms: int = Field(default=8, ge=1, le=32, strict=True)
+    max_term_chars: int = Field(default=120, ge=1, le=512, strict=True)
+    max_quote_chars: int = Field(default=1200, ge=1, le=12000, strict=True)
+    batch_size: int = Field(default=8, ge=1, le=64, strict=True)
+
+
 class Settings(Section):
     models: Models = Field(default_factory=Models)
     media: MediaSettings = Field(default_factory=MediaSettings)
@@ -613,6 +621,7 @@ class Settings(Section):
     notifications: DesktopNotifications = Field(default_factory=DesktopNotifications)
     attention: AttentionSettings = Field(default_factory=AttentionSettings)
     topic_reminders: TopicReminderSettings = Field(default_factory=TopicReminderSettings)
+    memory_watches: MemoryWatchSettings = Field(default_factory=MemoryWatchSettings)
     system_events: SystemEventsSettings = Field(default_factory=SystemEventsSettings)
     limits: Limits = Field(default_factory=Limits)
     server: Server = Field(default_factory=Server)

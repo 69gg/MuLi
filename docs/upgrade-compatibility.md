@@ -10,9 +10,11 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的当前正式版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。`objects`、`ingress`、`outbox` 的 `reads=[3]`、`writes=3`；其余四域仍为 `reads=[1]`、`writes=1`，对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧格式 `1`、`2` 库可直接启动新版。旧库需要[显式停机固定升级](channel-ownership-format-upgrade.md)；现有托管同格式协议继续拒绝跨格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的当前正式版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。`configuration` 为 `reads=[2]`、`writes=2`，`ingress` 为 `reads=[4]`、`writes=4`；`objects`、`outbox` 仍为 `reads=[3]`、`writes=3`，`database`、`memory`、`install_profile` 仍为 `reads=[1]`、`writes=1`，对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧全 `1`、三域 `2` 或长期问题关注前的三域 `3` 库可直接启动新版。旧库需要[显式停机固定升级](channel-ownership-format-upgrade.md)；现有托管同格式协议继续拒绝跨格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
+
+长期问题关注增加主配置 `memory_watches`，所以 `configuration` 改为 `2`；新增输入 `attention_memory_watch` 绑定可独立撤销的关注和来源证明，所以 `ingress` 改为 `4`。旧读取器不能忽略这些证明后继续调用模型或输出。独立版本化的 watch/match/completion 对象和可选 checkpoint 不重解释既有对象或原文修订，其他五域保持原值。即使没有 DDL 或业务行转换，也必须先在停机边界升级精确完整 marker；这不是托管同格式更新或旧版回退许可。详细边界见[长期问题关注合同](fresh-format-admission.md#长期问题关注的格式边界)。
 
 正常关闭后的有限 shell 回执同样采用独立 `shell_receipt/version=1`，可淘汰且不含执行授权，不改配置或既有 unknown/权限语义；当前读取器对坏或未来记录返回 `content_unavailable`。格式上界、淘汰顺序及证据范围见[功能记录合同](fresh-format-admission.md#可淘汰的-shell-回执记录)。通用 Store 保留未知 kind 的回归与源码审查不等于实际运行旧发行包，不能扩大为任意历史包兼容承诺。
 
@@ -64,6 +66,8 @@ result = assess_compatibility(base, candidate, current, handoff_protocol=protoco
 ## 验证范围
 
 原始纯判定回归使用内存中的测试声明，覆盖七领域、双方读写、未知/缺失/非法版本、迁移和交接协议拒绝、严格有界 JSON、不可变声明以及禁止数据库/文件 I/O。这里的可变格式 ID 和版本仍为夹具。2.22 另增直接读取真实源资产的版本/七领域一致性回归、wheel/sdist 缺失/重复/超限/内容不符的发布反证，并让真实进程回归直接沿用包内资产。
+
+长期问题关注的格式回归冻结 2.112 的实际准入模块及随包 manifest：旧、新完整声明不能通过同格式判定，旧准入函数拒绝新 marker；新 Runtime 在恢复业务前拒绝旧 marker。固定停机升级覆盖精确源合同与业务字节保留。冻结旧模块使用当前未变的格式模型和证据读取器，不能称为真实 2.112 发行包运行证据，也没有下载旧包或验证任意历史版本。
 
 原始纯判定的 145 项定向测试已于 2026-10-21 通过共享 guard，用时 0.15 秒、峰值 53.7 MiB；当时两文件 Ruff 与格式检查、单源码严格 mypy 通过，全部 swap 0。
 

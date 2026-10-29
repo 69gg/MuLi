@@ -44,6 +44,12 @@ from muli.memory_source_failure import (
     failure_current,
     input_failure,
 )
+from muli.memory_watches import (
+    MemoryWatchMatch,
+    MemoryWatchMatchExpired,
+    input_match,
+    match_current,
+)
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
@@ -106,6 +112,9 @@ class PreparedRequest:
     channel_ownership: dict[str, Any] | None = None
     consult: ConsultRequest | None = None
     memory_failure: MemorySourceFailure | None = None
+    memory_watch: MemoryWatchMatch | None = None
+    memory_watch_guard: Callable[[MemoryWatchMatch], bool] | None = None
+    memory_watch_chars: int = 0
     tool_batch_seq: int | None = None
 
 
@@ -226,12 +235,15 @@ class Runtime:
         self.skills_context: ContextHook | None = None
         self.message_hooks: list[MessageHook] = []
         self.memory_context_provider: Callable[[str], str] | None = None
+        self.memory_watch_guard: Callable[[MemoryWatchMatch], bool] | None = None
         self._tool_providers: list[tuple[ToolProvider, bool, bool, bool]] = []
         self._tool_factories: dict[str, ToolProvider] = {}
         self._tool_session: ContextVar[str | None] = ContextVar("muli_tool_session", default=None)
         self._tool_execution: ContextVar[tuple[str, str] | None] = ContextVar(
             "muli_tool_execution", default=None
         )
+        self._active_tool: ContextVar[Tool | None] = ContextVar("muli_active_tool", default=None)
+        self._history_find_runtime_id = new_id()
         self._request_context: ContextVar[PreparedRequest | None] = ContextVar(
             "muli_request", default=None
         )
@@ -242,6 +254,7 @@ class Runtime:
         self._plans_dirty = False
         self._coordinator_tools: set[str] = set()
         self._closing = False
+        self._main_wake_deferred = False
         self._shell_generation = 0
         self._shell_mode_epochs: dict[str, int] = {}
         self._shell_requests: dict[str, PreparedRequest] = {}
@@ -458,6 +471,9 @@ class Runtime:
         host = deepcopy(history.host_message) if history is not None else None
         for hook in self.context_hooks:
             messages = await hook(session_id, messages)
+            request = self.request_context(session_id)
+            if request is not None and request.memory_watch is not None:
+                self._guard_request(request)
         retained_host = (
             history is not None
             and host is not None
@@ -480,6 +496,8 @@ class Runtime:
             ]
         if self.skills_context is not None:
             messages = await self.skills_context(session_id, messages)
+            if request is not None and request.memory_watch is not None:
+                self._guard_request(request)
         packed = pack_context(messages, self.config.settings.limits.max_context_chars)
         if retained_host and history is not None and host is not None:
             return self._append_task_memory(packed, host, history.system_with_task)
@@ -529,6 +547,9 @@ class Runtime:
         reply_origin = self._reply_origin(session_id)
         attention_routing = self._attention_routing(session_id)
         memory_failure = self._attention_memory_failure(session_id)
+        memory_watch = self._attention_memory_watch(session_id)
+        memory_watch_guard = self.memory_watch_guard if memory_watch is not None else None
+        memory_watch_chars = self._attention_memory_watch_chars(session_id) if memory_watch else 0
         if (
             previous is not None
             and (self.store.get("session", session_id) or {}).get("kind") == "main"
@@ -551,6 +572,16 @@ class Runtime:
                 memory_failure = previous.memory_failure
                 if memory_failure is not None and not self._memory_failure_allowed(memory_failure):
                     raise MemorySourceFailureExpired("资料整理失败依据已失效")
+                memory_watch = previous.memory_watch
+                memory_watch_guard = previous.memory_watch_guard
+                memory_watch_chars = previous.memory_watch_chars
+                if memory_watch is not None and (
+                    memory_watch_guard is not self.memory_watch_guard
+                    or not self._memory_watch_allowed(
+                        memory_watch, content_chars=memory_watch_chars
+                    )
+                ):
+                    raise MemoryWatchMatchExpired("长期问题回访依据已失效")
             else:
                 reply_origin = ReplyOrigin.from_input(trigger)
                 attention_routing = (
@@ -568,6 +599,9 @@ class Runtime:
             attention_routing,
             self.channel_ownership.current_proof(session_id, self.run_ids.get(session_id)),
             memory_failure=memory_failure,
+            memory_watch=memory_watch,
+            memory_watch_guard=memory_watch_guard,
+            memory_watch_chars=memory_watch_chars,
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -584,6 +618,8 @@ class Runtime:
                 projected = self.compaction.project(session_id)
                 history = self._history_context(session_id, stored=projected)
                 messages = await self.prepare_context(session_id, history.messages, history=history)
+            if prepared.memory_watch is not None:
+                self._guard_request(prepared)
             if self.task_control is not None and (run_id := self.run_ids.get(session_id)):
                 self.task_control.bind_report_notice(
                     session_id, run_id, execution, projected, messages
@@ -597,6 +633,13 @@ class Runtime:
             request.memory_failure
         ):
             raise MemorySourceFailureExpired("资料整理失败依据已失效")
+        if request.memory_watch is not None and (
+            request.memory_watch_guard is not self.memory_watch_guard
+            or not self._memory_watch_allowed(
+                request.memory_watch, content_chars=request.memory_watch_chars
+            )
+        ):
+            raise MemoryWatchMatchExpired("长期问题回访依据已失效")
         risk = risk or ("read" if request.consult is not None else "write")
         if request.consult is not None:
             if not isinstance(request.consult, ConsultRequest) or risk != "read":
@@ -1135,7 +1178,7 @@ class Runtime:
     def _wake_main(self) -> None:
         self.reminders.changed.set()
         self.maintenance.reconcile()
-        if self._closing or not self.maintenance.admission.allowed:
+        if self._closing or self._main_wake_deferred or not self.maintenance.admission.allowed:
             return
         session = self.main_session()
         if session["id"] not in self._stopping and session["id"] not in self.tasks:
@@ -1160,6 +1203,7 @@ class Runtime:
         admission_guard: Callable[[], None] | None = None,
         routing: FrozenRouting | None = None,
         memory_failure: MemorySourceFailure | None = None,
+        memory_watch: MemoryWatchMatch | None = None,
     ) -> dict[str, Any] | None:
         """Admit idle-only facts atomically; execution and report handoff defer admission."""
         async with self.configuration_lock:
@@ -1171,6 +1215,12 @@ class Runtime:
                 memory_failure, verify_attachment=True
             ):
                 raise MemorySourceFailureExpired("资料整理失败依据已失效")
+            if memory_watch is not None and (
+                memory_failure is not None
+                or routing not in (None, FrozenRouting())
+                or not self._memory_watch_allowed(memory_watch, content_chars=len(content))
+            ):
+                raise MemoryWatchMatchExpired("长期问题回访依据已失效")
             session = self.main_session()
             if self.attention_busy or not self.maintenance.admission.allowed:
                 return None
@@ -1186,6 +1236,7 @@ class Runtime:
                 objects=objects,
                 attention_routing=routing,
                 attention_memory_failure=memory_failure,
+                attention_memory_watch=memory_watch,
             )
             if inserted:
                 self._invalidate_voice_reply()
@@ -1211,27 +1262,76 @@ class Runtime:
             )
         )
 
+    @property
+    def attention_budget(self) -> int:
+        settings = self.config.settings
+        return min(settings.attention.max_chars, max(512, settings.limits.max_context_chars // 4))
+
+    def _memory_watch_allowed(
+        self, proof: MemoryWatchMatch, *, content_chars: int | None = None
+    ) -> bool:
+        settings = self.config.settings
+        guard = self.memory_watch_guard
+        return (
+            not self._closing
+            and settings.attention.enabled
+            and "memory" in settings.attention.events
+            and settings.memory.enabled
+            and guard is not None
+            and guard(proof)
+            and (content_chars is None or 0 < content_chars <= self.attention_budget)
+            and match_current(
+                self.store,
+                proof,
+                max_source_chars=settings.memory.max_source_chars,
+                max_output_chars=settings.limits.max_output_chars,
+            )
+        )
+
     def _cancel_stale_memory_inputs(self, session_id: str) -> bool:
         # Inspect only the same finite pending window claim_inputs may consume.
         rows = self.store.db.execute(
             "SELECT seq,CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))<=200 "
             "THEN id END AS id,json_extract(payload,'$.principal')='system:attention' AS attention,"
-            "json_type(payload,'$.attention_memory_failure') AS marked "
+            "json_type(payload,'$.attention_memory_failure') AS marked,"
+            "json_type(payload,'$.attention_memory_watch') AS watch_marked,"
+            "length(json_extract(payload,'$.content')) AS content_chars "
             "FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
             (session_id, self.config.settings.limits.max_pending_runs),
         ).fetchall()
         cancelled = False
         for row in rows:
-            if not row["attention"] or row["marked"] is None:
+            if not row["attention"] or (row["marked"] is None and row["watch_marked"] is None):
                 continue
-            proof = None
-            if row["id"] is not None:
-                _, proof = input_failure(
-                    self.store,
-                    row["id"],
-                    max_output_chars=self.config.settings.limits.max_output_chars,
+            valid = row["marked"] is None or row["watch_marked"] is None
+            if row["marked"] is not None:
+                failure = None
+                if row["id"] is not None:
+                    _, failure = input_failure(
+                        self.store,
+                        row["id"],
+                        max_output_chars=self.config.settings.limits.max_output_chars,
+                    )
+                valid = (
+                    valid
+                    and failure is not None
+                    and self._memory_failure_allowed(failure, verify_attachment=True)
                 )
-            if proof is not None and self._memory_failure_allowed(proof, verify_attachment=True):
+            if row["watch_marked"] is not None:
+                watch = None
+                if row["id"] is not None:
+                    _, watch = input_match(
+                        self.store,
+                        row["id"],
+                        max_output_chars=self.config.settings.limits.max_output_chars,
+                    )
+                valid = (
+                    valid
+                    and watch is not None
+                    and type(row["content_chars"]) is int
+                    and self._memory_watch_allowed(watch, content_chars=row["content_chars"])
+                )
+            if valid:
                 continue
             with self.store.db:
                 self.store.db.execute(
@@ -2015,6 +2115,14 @@ class Runtime:
                 session_id,
             )
             return ""
+        except MemoryWatchMatchExpired:
+            run.update(status="cancelled", result="", cancel_reason="memory_watch_match_expired")
+            await self.bus.emit(
+                "run.cancelled",
+                {"run_id": run_id, "reason": "memory_watch_match_expired"},
+                session_id,
+            )
+            return ""
         except TaskPaused as exc:
             run.update(status="paused", pause_reason=str(exc), observed_epoch=exc.observed_epoch)
             self.store.put("run", run)
@@ -2468,6 +2576,39 @@ class Runtime:
             raise MemorySourceFailureExpired("资料整理失败依据已失效")
         return proof
 
+    def _attention_memory_watch(self, session_id: str) -> MemoryWatchMatch | None:
+        row = self.store.db.execute(
+            "SELECT CASE WHEN typeof(o.id)='text' AND length(CAST(o.id AS BLOB))<=200 "
+            "THEN o.id END AS id,json_extract(o.data,'$.principal')='system:attention' AS attention "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None or not row["attention"]:
+            return None
+        if row["id"] is None:
+            raise MemoryWatchMatchExpired("长期问题回访输入身份无法核对")
+        marked, proof = input_match(
+            self.store, row["id"], max_output_chars=self.config.settings.limits.max_output_chars
+        )
+        if marked and (
+            proof is None
+            or not self._memory_watch_allowed(
+                proof, content_chars=self._attention_memory_watch_chars(session_id)
+            )
+        ):
+            raise MemoryWatchMatchExpired("长期问题回访依据已失效")
+        return proof
+
+    def _attention_memory_watch_chars(self, session_id: str) -> int:
+        row = self.store.db.execute(
+            "SELECT length(json_extract(o.data,'$.content')) AS content_chars "
+            "FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
+            "WHERE m.session_id=? AND json_extract(o.data,'$.role')='user' ORDER BY m.seq DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return row["content_chars"] if row is not None and type(row["content_chars"]) is int else 0
+
     async def _execute(
         self,
         session_id: str,
@@ -2554,11 +2695,15 @@ class Runtime:
                             session,
                             spent,
                             consult=consult,
+                            prepared=prepared,
                         )
                         async for event in client.stream(
                             messages, [tool.schema() for tool in round_tools.values()]
                         ):
-                            if prepared.memory_failure is not None:
+                            if (
+                                prepared.memory_failure is not None
+                                or prepared.memory_watch is not None
+                            ):
                                 self._guard_request(prepared)
                             if event.kind in {"text_delta", "reasoning_delta"}:
                                 if event.kind == "text_delta":
@@ -2573,7 +2718,9 @@ class Runtime:
                             elif event.kind == "done":
                                 turn = event.turn
                 except BaseException as error:
-                    if partial and not isinstance(error, MemorySourceFailureExpired):
+                    if partial and not isinstance(
+                        error, (MemorySourceFailureExpired, MemoryWatchMatchExpired)
+                    ):
                         self.store.complete_message(
                             session_id,
                             partial,
@@ -2583,7 +2730,7 @@ class Runtime:
                         )
                         await self.bus.notify()
                     raise
-                if prepared.memory_failure is not None:
+                if prepared.memory_failure is not None or prepared.memory_watch is not None:
                     self._guard_request(prepared)
                 if turn is None:
                     raise ValueError("模型响应未完整结束")
@@ -2796,12 +2943,34 @@ class Runtime:
         spent: int,
         *,
         consult: ConsultRequest | None = None,
+        prepared: PreparedRequest | None = None,
     ) -> dict[str, Tool]:
         # Materialize after capacity admission. One dict binds the schemas and
         # handlers for this whole response, including approval waits and pairing.
         if spent >= self.config.settings.limits.max_tool_steps:
             return {}
         tools = self.session_tools(session_id)
+        owner_input = prepared.reply_origin.input_id if prepared is not None else None
+        history_input = (
+            consult is None
+            and not workflow_step
+            and session.get("kind") == "main"
+            and session_id == self.store.existing_main_session_id()
+            and owner_input is not None
+            and self.store.db.execute(
+                "SELECT CASE WHEN typeof(payload)='text' AND length(CAST(payload AS BLOB))<=? "
+                "THEN CASE WHEN json_valid(payload) THEN json_extract(payload,'$.principal') END END "
+                "FROM ingress WHERE id=? AND session_id=? AND run_id=? AND state='delivered'",
+                (
+                    self.config.settings.limits.max_context_chars * 4,
+                    owner_input,
+                    session_id,
+                    run_id,
+                ),
+            ).fetchone()
+        )
+        if not history_input or history_input[0] != "owner":
+            tools.pop("history_find", None)
         if consult is not None:
             self.team.consult.guard_control(consult, session_id)
             return {
@@ -2921,6 +3090,7 @@ class Runtime:
             token = self._tool_session.set(session_id)
             execution_token = self._tool_execution.set((session_id, run_id))
             request_token = self._request_context.set(prepared)
+            active_token = self._active_tool.set(tool)
             try:
                 # Final synchronous fence after the last await. No await may be
                 # added between this check and entering the trusted handler.
@@ -2941,6 +3111,7 @@ class Runtime:
                 else:
                     result = await tool.handler(arguments)
             finally:
+                self._active_tool.reset(active_token)
                 self._request_context.reset(request_token)
                 self._tool_execution.reset(execution_token)
                 self._tool_session.reset(token)
@@ -3242,6 +3413,50 @@ class Runtime:
                 deadline=monotonic() + limits.max_search_seconds,
             )
 
+        async def find_history(args: dict[str, Any]) -> Any:
+            caller = self.tool_session_id
+            execution = self._tool_execution.get()
+            request = self.request_context(caller) if caller is not None else None
+            active_tool = self._active_tool.get()
+            task = asyncio.current_task()
+            if (
+                self._closing
+                or caller is None
+                or caller != self.store.existing_main_session_id()
+                or execution is None
+                or execution != (caller, self.run_ids.get(caller))
+                or request is None
+                or request.consult is not None
+                or request.reply_origin.input_id is None
+                or task is None
+                or task.cancelling()
+                or self.tasks.get(caller) is not task
+                or caller in self._stopping
+                or active_tool is None
+                or active_tool.name != "history_find"
+                or active_tool.handler is not find_history
+                or "history_find" in self.config.settings.disabled_tools
+            ):
+                raise PermissionError("跨会话查找仅供真实主人当前请求中的主助手直接调用")
+            self.maintenance.admission.require()
+            self._guard_request(request, "read")
+            if self.store.pending_inputs(caller):
+                raise PermissionError("收到新输入，请先重新规划历史查找")
+            limits = self.config.settings.limits
+            return HistoryFind(self.store).find_owned(
+                caller,
+                args["query"],
+                run_id=execution[1],
+                input_id=request.reply_origin.input_id,
+                runtime_id=self._history_find_runtime_id,
+                cursor=args.get("cursor"),
+                limit=min(args.get("limit", 20), limits.max_search_results),
+                max_output_chars=limits.max_output_chars,
+                max_results=limits.max_search_results,
+                max_context_chars=limits.max_context_chars,
+                deadline=monotonic() + limits.max_search_seconds,
+            )
+
         async def remember(args: dict[str, Any]) -> Any:
             item = self.memory.save(**args)
             await self.bus.emit(
@@ -3492,6 +3707,23 @@ class Runtime:
                     ("session_id", "query"),
                 ),
                 find_conversation,
+                preserve_output=True,
+            ),
+            Tool(
+                "history_find",
+                "主助手在当前主人请求中，按区分大小写的字面文字定位自己及现存直属队友的旧原文。"
+                "返回真实出处与 conversation_read 参数；本次主运行排除。"
+                "cursor 仅同一主运行内续查，换运行或重开须重新查询；"
+                "检查 has_more、omitted_total 与来源，无命中不代表查全，不恢复队友或重跑工具",
+                parameters(
+                    {
+                        "query": string("要找的已保存原文片段；按字面匹配，区分大小写"),
+                        "cursor": string("原样使用同一主运行和查询返回的 next_cursor"),
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    ("query",),
+                ),
+                find_history,
                 preserve_output=True,
             ),
             Tool(

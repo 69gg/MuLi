@@ -8,6 +8,7 @@ from typing import Any
 
 from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.memory_source_failure import MAX_FAILURE_PROOF_BYTES, MemorySourceFailure
+from muli.memory_watches import MAX_MATCH_PROOF_BYTES, MemoryWatchMatch
 from muli.proactive import FrozenRouting
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
@@ -57,6 +58,7 @@ class Conversation:
         reply_origin: ReplyOrigin | None = None,
         attention_routing: FrozenRouting | None = None,
         attention_memory_failure: MemorySourceFailure | None = None,
+        attention_memory_watch: MemoryWatchMatch | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload = self.payload(
             session_id,
@@ -70,6 +72,7 @@ class Conversation:
             reply_origin=reply_origin,
             attention_routing=attention_routing,
             attention_memory_failure=attention_memory_failure,
+            attention_memory_watch=attention_memory_watch,
         )
         return self.store.enqueue_input(
             payload,
@@ -92,6 +95,7 @@ class Conversation:
         reply_origin: ReplyOrigin | None = None,
         attention_routing: FrozenRouting | None = None,
         attention_memory_failure: MemorySourceFailure | None = None,
+        attention_memory_watch: MemoryWatchMatch | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > MAX_CONTENT_CHARS:
@@ -144,4 +148,20 @@ class Conversation:
             ):
                 raise ValueError("记忆整理提醒仅允许有界宿主证明")
             payload["attention_memory_failure"] = attention_memory_failure.dump()
+        if attention_memory_watch is not None:
+            if (
+                principal != "system:attention"
+                or source != "system:attention"
+                or attention_memory_failure is not None
+                or attention_routing not in (None, FrozenRouting())
+                or (reply_origin is not None and bool(reply_origin.delivery_routes()))
+                or MemoryWatchMatch.load(
+                    attention_memory_watch.dump(), max_bytes=MAX_MATCH_PROOF_BYTES
+                )
+                != attention_memory_watch
+            ):
+                raise ValueError("长期问题回访仅允许本机有界宿主证明")
+            payload["attention_memory_watch"] = attention_memory_watch.dump()
+            payload["attention_routing"] = FrozenRouting().dump()
+            payload["reply_origin"] = FrozenRouting().reply_origin(identifier).dump()
         return payload

@@ -23,6 +23,7 @@ from muli.memory_chunks import MemoryChunkSettings
 from muli.memory_context import MemoryContextProvider, PromptComposition
 from muli.memory_evidence import SOURCE_JOB_STATES, SOURCE_PAGE_LIMIT, MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
+from muli.memory_watches import MemoryWatches, MemoryWatchMatch
 from muli.proactive import FrozenRouting
 from muli.providers import Message
 from muli.runtime import PreparedRequest, Runtime
@@ -58,10 +59,13 @@ class MemoryApplication:
         self._report_observer: Callable[[str, int], None] | None = None
         self.report_error = ""
         self.attachment_error = ""
+        self.watches = self._watches()
+        self._watch_guard: Callable[[MemoryWatchMatch], bool] | None = None
         runtime.add_tool_provider(self.tools)
         if attachment_reader is not None or document_reader is not None:
             runtime.add_tool_provider(self.attachment_tools, session_scoped=True)
         runtime.add_tool_provider(self.index_tools, session_scoped=True)
+        runtime.add_tool_provider(self.watch_tools, session_scoped=True)
         runtime.message_hooks.append(self.ingest)
         runtime.memory_context_provider = MemoryContextProvider(
             self._context, composer=self._context_result
@@ -127,6 +131,27 @@ class MemoryApplication:
         pipeline.failure_routing = failure_routing
         pipeline.recover()
         return pipeline
+
+    def _watch_enabled(self) -> bool:
+        settings = self.runtime.config.settings
+        return (
+            not self._closed
+            and not self.runtime._closing
+            and settings.memory.enabled
+            and settings.attention.enabled
+            and "memory" in settings.attention.events
+        )
+
+    def _watches(self) -> MemoryWatches:
+        return MemoryWatches(
+            self.runtime.store,
+            self.runtime.bus,
+            settings=lambda: self.runtime.config.settings.memory_watches,
+            enabled=self._watch_enabled,
+            max_source_chars=lambda: self.runtime.config.settings.memory.max_source_chars,
+            max_output_chars=lambda: self.runtime.config.settings.limits.max_output_chars,
+            admission=self.runtime.maintenance.admission,
+        )
 
     def ingest(self, message: dict[str, Any], trusted_owner: bool) -> None:
         # Quarantined strangers cannot trigger background inference or alter owner memory.
@@ -270,6 +295,13 @@ class MemoryApplication:
         self._attachment_generation = object()
         self._closed = False
         self._comparison_open = True
+        watches = self.watches
+
+        def watch_guard(proof: MemoryWatchMatch) -> bool:
+            return self.watches is watches and self._watch_enabled()
+
+        self._watch_guard = watch_guard
+        self.runtime.memory_watch_guard = watch_guard
 
         def observe(session_id: str, revision: int) -> None:
             # A retained callback from an earlier lifecycle cannot use its
@@ -280,6 +312,8 @@ class MemoryApplication:
         self._report_observer = observe
         self.runtime.team.report_observer = observe
         await self.pipeline.start()
+        await self.watches.start()
+        await self.runtime.bus.notify()
         self._recovery = asyncio.create_task(self._recover())
 
     @property
@@ -419,6 +453,10 @@ class MemoryApplication:
     async def close(self) -> None:
         self._closed = True
         self._attachment_generation = object()
+        if self.runtime.memory_watch_guard is self._watch_guard:
+            self.runtime.memory_watch_guard = None
+        self._watch_guard = None
+        await self.watches.close()
         await self.close_comparisons()
         if self.runtime.team.report_observer is self._report_observer:
             self.runtime.team.report_observer = None
@@ -448,6 +486,7 @@ class MemoryApplication:
         await self.close()
         self.media = media
         self.pipeline = self._pipeline()
+        self.watches = self._watches()
         self.runtime.memory_context_provider = MemoryContextProvider(
             self._context, composer=self._context_result
         )
@@ -598,6 +637,92 @@ class MemoryApplication:
         if action == "start":
             return self.pipeline.start_index(args["source_ids"], args["key"])
         return self.pipeline.cancel_index(args["plan_id"])
+
+    def watch_tools(self, runtime: Runtime) -> list[Tool]:
+        caller = runtime.tool_session_id
+        if caller is not None and caller != runtime.store.existing_main_session_id():
+            return []
+        pipeline, generation, watches = self.pipeline, self._attachment_generation, self.watches
+
+        def owner(tool_name: str) -> tuple[str, str]:
+            request = self._attachment_guard(pipeline, generation, tool_name=tool_name)
+            if self.watches is not watches:
+                raise PermissionError("问题关注服务已更换，请重新查看当前工具")
+            session_id, input_id = request.session_id, request.reply_origin.input_id
+            if input_id is None:
+                raise PermissionError("问题关注需要本次主人原始输入")
+            runtime.topic_reminders.require_owner_input(session_id, input_id)
+            return session_id, input_id
+
+        async def create_watch(args: dict[str, Any]) -> Any:
+            session_id, input_id = owner("memory_watch_create")
+            if not self._watch_enabled():
+                raise ValueError("请先启用长期记忆和记忆注意事项")
+            return watches.create(session_id, input_id, **args)
+
+        async def list_watches(args: dict[str, Any]) -> Any:
+            session_id, _ = owner("memory_watch_list")
+            return watches.records(session_id, **args)
+
+        async def cancel_watch(args: dict[str, Any]) -> Any:
+            session_id, _ = owner("memory_watch_cancel")
+            result = watches.cancel(session_id, args["id"])
+            # Let Attention and the runtime invalidate already queued evidence.
+            await runtime.bus.notify()
+            return result
+
+        settings = runtime.config.settings.memory_watches
+        return [
+            Tool(
+                "memory_watch_create",
+                "主人明确要求长期留意一个问题时登记关注；question说明问题，match_terms为主人"
+                "确认的短语组合，key为本次操作的稳定标识。只检查登记以后完成整理的明确收藏资料；"
+                "同一段当前原文包含全部短语才产生线索，在Web主会话带出处回访。"
+                "不扫描已完成旧资料，不自动调用远端检索，也不授权外部渠道发送；不保证语义覆盖。",
+                parameters(
+                    {
+                        "question": string("要持续关注的问题"),
+                        "match_terms": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": settings.max_match_terms,
+                            "uniqueItems": True,
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": settings.max_term_chars,
+                            },
+                        },
+                        "key": string("本次登记的稳定标识"),
+                    },
+                    ("question", "match_terms", "key"),
+                ),
+                create_watch,
+                "write",
+                preserve_output=True,
+            ),
+            Tool(
+                "memory_watch_list",
+                "查看主人的长期问题关注及处理状态；按返回的准确id取消，不能把未检查当成无相关资料。",
+                parameters(
+                    {
+                        "after_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                ),
+                list_watches,
+                "read",
+                preserve_output=True,
+            ),
+            Tool(
+                "memory_watch_cancel",
+                "按主人要求取消准确id的问题关注；保留取消记录，使已经排队的旧线索失效。",
+                parameters({"id": string("memory_watch_list返回的准确id")}, ("id",)),
+                cancel_watch,
+                "write",
+                preserve_output=True,
+            ),
+        ]
 
     def index_tools(self, runtime: Runtime) -> list[Tool]:
         caller = runtime.tool_session_id

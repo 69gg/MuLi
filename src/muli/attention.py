@@ -10,9 +10,11 @@ from dataclasses import asdict
 from typing import Any
 
 from muli.config import AttentionSettings
+from muli.evidence import EvidenceError
 from muli.file_inbox import FileInboxState, read_record
 from muli.integrations.attention import ChiliarchAttentionState
 from muli.memory_source_failure import failure_current
+from muli.memory_watches import MATCH_EVENT, MAX_MATCH_PROOF_BYTES
 from muli.proactive import FrozenRouting
 from muli.reminder_followup import read_followup_notice
 from muli.runtime import Runtime
@@ -132,7 +134,13 @@ class AttentionInbox:
             system_policy,
             chiliarch_policy=chiliarch_policy,
             file_inbox_policy=self._file_inbox_settings() if self._file_inbox_settings else None,
-            max_output_chars=self.runtime.config.settings.limits.max_output_chars,
+            # Canonical watch evidence must survive a temporarily smaller output
+            # budget. Selection below defers the whole event without advancing it.
+            max_output_chars=(
+                MAX_MATCH_PROOF_BYTES
+                if event.get("type") == MATCH_EVENT
+                else self.runtime.config.settings.limits.max_output_chars
+            ),
             memory_source_chars=(
                 self.runtime.config.settings.memory.max_source_chars
                 if self.runtime.config.settings.memory.enabled
@@ -157,6 +165,7 @@ class AttentionInbox:
             else None,
             "reminder_proof": source.reminder_proof,
             "memory_failure_proof": source.memory_failure_proof,
+            "memory_watch_proof": source.memory_watch_proof,
             **({"followup": source.reminder_proof.binding()} if source.reminder_proof else {}),
         }
 
@@ -184,6 +193,7 @@ class AttentionInbox:
                         "file_inbox_proof",
                         "reminder_proof",
                         "memory_failure_proof",
+                        "memory_watch_proof",
                     }
                 }
                 for record in records
@@ -234,9 +244,15 @@ class AttentionInbox:
                 else "events"
             )
             return False
-        if policy.coalesce_seconds and any(
-            self._record(event, policy, system_policy, chiliarch_policy) for event in events
-        ):
+        try:
+            coalesce = policy.coalesce_seconds and any(
+                self._record(event, policy, system_policy, chiliarch_policy) for event in events
+            )
+        except EvidenceError as error:
+            if error.code != "output_budget":
+                raise
+            coalesce = False
+        if coalesce:
             self._waiting = "coalescing"
             await asyncio.sleep(policy.coalesce_seconds)
             events = self.store.events(self.cursor, limit=policy.batch_size)
@@ -244,17 +260,31 @@ class AttentionInbox:
         routing: FrozenRouting | None = None
         seen: set[str] = set()
         after = self.cursor
-        budget = min(
-            policy.max_chars, max(512, self.runtime.config.settings.limits.max_context_chars // 4)
-        )
+        budget = self.runtime.attention_budget
         for event in events:
             # One source per batch lets a later retry/forget revoke its pending
             # input without cancelling an unrelated source or ordinary reminder.
-            if records and records[0]["memory_failure_proof"] is not None:
+            if records and (
+                records[0]["memory_failure_proof"] is not None
+                or records[0]["memory_watch_proof"] is not None
+            ):
                 break
-            record = self._record(event, policy, system_policy, chiliarch_policy)
+            try:
+                record = self._record(event, policy, system_policy, chiliarch_policy)
+            except EvidenceError as error:
+                if error.code != "output_budget":
+                    raise
+                if records:
+                    break
+                if after != self.cursor:
+                    self.store.put("attention_state", self._state(after, True))
+                self._waiting = "budget"
+                return False
             if record is not None and record["receipt_id"] not in seen:
-                if records and record["memory_failure_proof"] is not None:
+                if records and (
+                    record["memory_failure_proof"] is not None
+                    or record["memory_watch_proof"] is not None
+                ):
                     break
                 if records and bool(records[0]["file_inbox_proof"]) != bool(
                     record["file_inbox_proof"]
@@ -263,6 +293,30 @@ class AttentionInbox:
                 selected = FrozenRouting.load(record["routing"])
                 if routing is not None and routing.batch_key != selected.batch_key:
                     break
+                watch_proof = record["memory_watch_proof"]
+                current_watch_guard = self.runtime.memory_watch_guard
+                if watch_proof is not None and (
+                    current_watch_guard is None or not current_watch_guard(watch_proof)
+                ):
+                    # Attention starts before MemoryApplication. Retain durable
+                    # leads until the current application's producer is ready.
+                    if records:
+                        break
+                    if after != self.cursor:
+                        self.store.put("attention_state", self._state(after, True))
+                    self._waiting = "producer"
+                    return False
+                if watch_proof is not None and not self.runtime._memory_watch_allowed(
+                    watch_proof, content_chars=len(self._content([record]))
+                ):
+                    # Question/source/continuous quote are one indivisible proof.
+                    # Keep the journal event pending until the budget permits it.
+                    if records:
+                        break
+                    if after != self.cursor:
+                        self.store.put("attention_state", self._state(after, True))
+                    self._waiting = "budget"
+                    return False
                 if len(self._content([*records, record])) > budget:
                     if records:
                         break
@@ -294,6 +348,7 @@ class AttentionInbox:
             self._waiting = "backpressure"
             return False
         generation = self._generation
+        watch_guard = self.runtime.memory_watch_guard
 
         def guard() -> None:
             if (
@@ -304,6 +359,14 @@ class AttentionInbox:
             ):
                 raise ValueError("注意事项策略已改变")
             for record in records:
+                watch_proof = record["memory_watch_proof"]
+                if watch_proof is not None and (
+                    watch_guard is not self.runtime.memory_watch_guard
+                    or not self.runtime._memory_watch_allowed(
+                        watch_proof, content_chars=len(self._content([record]))
+                    )
+                ):
+                    raise _ProducerPolicyChanged("长期问题回访依据已失效")
                 memory_proof = record["memory_failure_proof"]
                 if memory_proof is not None and (
                     not self.runtime.config.settings.memory.enabled
@@ -383,6 +446,11 @@ class AttentionInbox:
                         if record["memory_failure_proof"] is not None
                         else {}
                     ),
+                    **(
+                        {"memory_watch_proof": record["memory_watch_proof"].dump()}
+                        if record["memory_watch_proof"] is not None
+                        else {}
+                    ),
                 },
             )
             for record in records
@@ -405,6 +473,11 @@ class AttentionInbox:
                 admission_guard=guard,
                 routing=routing,
                 memory_failure=records[0]["memory_failure_proof"],
+                **(
+                    {"memory_watch": records[0]["memory_watch_proof"]}
+                    if records[0]["memory_watch_proof"] is not None
+                    else {}
+                ),
             )
         except _ProducerPolicyChanged:
             # Reconsume the bounded journal suffix so stale source facts cannot

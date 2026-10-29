@@ -1,0 +1,3 @@
+# These frozen compatibility fixtures are verified as exact historical bytes.
+/tests/fixtures/format_admission_v2_112.py -text
+/tests/fixtures/compatibility_v2_112.json -text

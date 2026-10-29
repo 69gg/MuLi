@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib.util
 import json
 import os
 import sqlite3
@@ -8,6 +10,7 @@ import stat
 import subprocess
 import sys
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +24,11 @@ from muli.channels import ChannelManager, ChannelsConfig
 from muli.config import ConfigFile
 from muli.events import EventBus
 from muli.extensions import ExtensionError
-from muli.format_admission import CURRENT_FORMAT_STATE, FormatAdmissionError
+from muli.format_admission import (
+    CURRENT_FORMAT_STATE,
+    PRE_MEMORY_WATCH_FORMAT_STATE,
+    FormatAdmissionError,
+)
 from muli.format_evidence import (
     FORMAT_STATE_KEY,
     FormatEvidenceError,
@@ -101,6 +108,77 @@ def deny_construction_writes(
 
     monkeypatch.setattr(sqlite3, "connect", guarded)
     return connections, mutations
+
+
+@pytest.mark.parametrize("opener", ["ordinary", "runtime", "existing"])
+def test_pre_watch_marker_is_refused_before_any_construction_write(
+    database: Path, monkeypatch: pytest.MonkeyPatch, opener: str
+) -> None:
+    with closing(sqlite3.connect(database)) as db:
+        db.execute(
+            "UPDATE runtime_state SET value=? WHERE name=?",
+            (PRE_MEMORY_WATCH_FORMAT_STATE.model_dump_json(), FORMAT_STATE_KEY),
+        )
+        db.commit()
+    before = snapshot(database)
+    connections, mutations = deny_construction_writes(monkeypatch)
+    with pytest.raises(
+        (FormatAdmissionError, ExistingStoreError), match="store_format_upgrade_required"
+    ):
+        if opener == "ordinary":
+            Store(database)
+        elif opener == "runtime":
+            Store.open_runtime(database, default_mode="auto")
+        else:
+            Store.open_existing(database)
+    assert mutations == [] and snapshot(database) == before
+    for db in connections:
+        with pytest.raises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+
+
+def test_pre_watch_runtime_rejects_before_business_recovery(
+    database: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with closing(sqlite3.connect(database)) as db:
+        db.execute(
+            "UPDATE runtime_state SET value=? WHERE name=?",
+            (PRE_MEMORY_WATCH_FORMAT_STATE.model_dump_json(), FORMAT_STATE_KEY),
+        )
+        db.commit()
+    before = snapshot(database)
+
+    def forbidden_recovery(runtime: Runtime) -> None:
+        raise AssertionError("The pre-watch marker must fail before business recovery")
+
+    monkeypatch.setattr(Runtime, "_recover", forbidden_recovery)
+    _, mutations = deny_construction_writes(monkeypatch)
+    with pytest.raises(FormatAdmissionError, match="store_format_upgrade_required"):
+        Runtime(ConfigFile(tmp_path / "config.json"), database.parent, no_model)
+    assert mutations == [] and snapshot(database) == before
+
+
+def test_frozen_v2_112_reader_refuses_the_new_marker(database: Path) -> None:
+    # See fixtures/format-v2.112.md: this runs frozen reader code with the
+    # current unchanged evidence models, not an installed old release package.
+    path = Path(__file__).parent / "fixtures" / "format_admission_v2_112.py"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        "34983abfaef33790d6517805a5b11edf6afb8f7a1d56ab282c12199a1f53618d"
+    )
+    spec = importlib.util.spec_from_file_location("muli_frozen_format_admission_v2_112", path)
+    assert spec is not None and spec.loader is not None
+    old_reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old_reader)
+    assert old_reader.CURRENT_FORMAT_STATE == PRE_MEMORY_WATCH_FORMAT_STATE
+    before = snapshot(database)
+    with closing(sqlite3.connect(database)) as db:
+        evidence = read_optional_format_evidence(db)
+        assert evidence is not None and evidence.state == CURRENT_FORMAT_STATE
+        old_reader.require_current_format(replace(evidence, state=PRE_MEMORY_WATCH_FORMAT_STATE))
+        with pytest.raises(old_reader.FormatAdmissionError, match="store_format_unsupported"):
+            old_reader.require_current_format(evidence)
+        assert db.total_changes == 0
+    assert snapshot(database) == before
 
 
 @pytest.mark.parametrize("mode", ["ask", "auto", "yolo"])

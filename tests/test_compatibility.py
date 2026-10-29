@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable
@@ -18,7 +19,7 @@ from muli.compatibility import (
     FormatSupport,
     assess_compatibility,
 )
-from muli.format_admission import CURRENT_FORMAT_STATE
+from muli.format_admission import CURRENT_FORMAT_STATE, PRE_MEMORY_WATCH_FORMAT_STATE
 
 DOMAINS: tuple[FormatDomain, ...] = (
     "database",
@@ -59,10 +60,14 @@ def state(data: dict[str, Any] | None = None) -> FormatState:
     return FormatState.from_json(encode(state_data() if data is None else data))
 
 
-def test_shipped_declaration_matches_current_release_and_persisted_contracts() -> None:
+def shipped_manifest() -> CompatibilityManifest:
     assert muli.__file__ is not None
     with (Path(muli.__file__).parent / "compatibility.json").open("rb") as stream:
-        shipped = CompatibilityManifest.from_json(stream.read(16_384 + 1))
+        return CompatibilityManifest.from_json(stream.read(16_384 + 1))
+
+
+def test_shipped_declaration_matches_current_release_and_persisted_contracts() -> None:
+    shipped = shipped_manifest()
     assert shipped.release == muli.__version__
     assert assess_compatibility(
         shipped, shipped, CURRENT_FORMAT_STATE, handoff_protocol=2
@@ -71,6 +76,47 @@ def test_shipped_declaration_matches_current_release_and_persisted_contracts() -
         version = getattr(CURRENT_FORMAT_STATE.formats, domain)
         support = getattr(shipped.formats, domain)
         assert support.reads == (version,) and support.writes == version
+
+
+@pytest.mark.parametrize("current_side", ["before_upgrade", "after_upgrade"])
+def test_frozen_pre_watch_manifest_does_not_permit_a_same_format_switch(
+    current_side: str,
+) -> None:
+    previous_path = Path(__file__).parent / "fixtures" / "compatibility_v2_112.json"
+    previous_bytes = previous_path.read_bytes()
+    assert hashlib.sha256(previous_bytes).hexdigest() == (
+        "74a875e76c16e35e59e110fb45e4eccfcae8f9cfe905ea89fd170df3375eb6a7"
+    )
+    previous = CompatibilityManifest.from_json(previous_bytes)
+    assert previous.release == "2.112.0"
+    for domain in DOMAINS:
+        version = getattr(PRE_MEMORY_WATCH_FORMAT_STATE.formats, domain)
+        support = getattr(previous.formats, domain)
+        assert support.reads == (version,) and support.writes == version
+    shipped = shipped_manifest()
+    assert not previous.requires_migration and not shipped.requires_migration
+    current = (
+        PRE_MEMORY_WATCH_FORMAT_STATE if current_side == "before_upgrade" else CURRENT_FORMAT_STATE
+    )
+    result = assess_compatibility(previous, shipped, current, handoff_protocol=2)
+    assert not result.format_compatible
+    assert result.code == "current_format_unreadable" and result.domain == "configuration"
+    assert result.side == ("candidate" if current_side == "before_upgrade" else "base")
+
+
+def test_watch_ingress_contract_is_independently_unreadable_by_the_frozen_manifest() -> None:
+    previous_data = json.loads(
+        (Path(__file__).parent / "fixtures" / "compatibility_v2_112.json").read_bytes()
+    )
+    # Isolate ingress: matching the new configuration contract must not conceal
+    # the old reader's missing cancellation and independently revocable proof.
+    previous_data["formats"]["configuration"] = {"reads": [2], "writes": 2}
+    result = assess_compatibility(
+        manifest(previous_data), shipped_manifest(), CURRENT_FORMAT_STATE, handoff_protocol=2
+    )
+    assert not result.format_compatible
+    assert result.code == "current_format_unreadable" and result.domain == "ingress"
+    assert result.side == "base"
 
 
 @pytest.mark.parametrize("release", ["2.18.0", "2.19.0", "2.9.0"])

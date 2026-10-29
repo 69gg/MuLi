@@ -1,4 +1,4 @@
-"""Bounded, read-only literal search of explicitly selected saved history."""
+"""Bounded, read-only literal search of explicitly selected or host-scoped history."""
 
 from __future__ import annotations
 
@@ -15,17 +15,43 @@ from typing import Any
 from muli.attachment_records import _MAX_QUERY_CHARS
 from muli.evidence import EvidenceError, decode_utf8, json_size, validate_integer
 from muli.history_evidence import HistoryEvidence
+from muli.management_transaction import _object
 from muli.store import _SESSION_RECORD_LIMIT, SQLITE_MAX_INTEGER, Store
 
 _VERSION = 1
 _DOMAIN = "history_content_find"
+_OWNED_DOMAIN = "owner_history_content_find"
 _OMISSIONS = ("invalid_mapping", "missing", "oversized", "invalid_message")
-_Scope = tuple[str, str, str]
 _Current = tuple[int, str, str, str, int]
 
 
 class _Expired(Exception):
     pass
+
+
+class _RawLimit(Exception):
+    def __init__(self, *, oversized: bool) -> None:
+        self.oversized = oversized
+
+
+@dataclass(frozen=True)
+class _OwnerRequest:
+    root: str
+    run: str
+    input_id: str
+    runtime_id: str
+
+
+@dataclass(frozen=True)
+class _OwnedScope:
+    instance: str
+    root: str
+    run: str
+    runtime_id: str
+    query: str
+
+
+_Scope = tuple[str, str, str] | _OwnedScope
 
 
 @dataclass(frozen=True)
@@ -34,6 +60,7 @@ class _State:
     before: int | None = None
     current: _Current | None = None
     omitted: int = 0
+    excluded_from: int | None = None
 
 
 @dataclass(frozen=True)
@@ -111,30 +138,48 @@ class HistoryFind:
             raise EvidenceError("history_find_identity_unavailable", "资料库身份缺失或超过预算")
         return decode_utf8(row["value"], allow_incomplete_tail=False)
 
-    def _window(self, session: str, state: _State | None, budget: _Budget) -> list[dict[str, Any]]:
+    def _window(self, scope: _Scope, state: _State | None, budget: _Budget) -> list[dict[str, Any]]:
         upper = state.through if state is not None else None
         if state is not None and state.current is not None:
             upper = min(state.through, state.current[0])
         # Do not join objects, inspect JSON, or filter malformed mappings here.
-        return self.store.message_evidence_window(
-            session,
-            through_seq=upper,
-            before_seq=state.before if state is not None else None,
-            limit=budget.candidates + 1,
-            metadata_bytes=budget.mapping_id,
-        )
+        arguments: dict[str, Any] = {
+            "through_seq": upper,
+            "before_seq": state.before if state is not None else None,
+            "limit": budget.candidates + 1,
+            "metadata_bytes": budget.mapping_id,
+        }
+        if isinstance(scope, _OwnedScope):
+            return self.store.history_evidence_window(**arguments)
+        return self.store.message_evidence_window(scope[1], **arguments)
 
     @staticmethod
     def _encode(scope: _Scope, state: _State) -> str:
-        value = [
-            _VERSION,
-            _DOMAIN,
-            *scope,
-            state.through,
-            state.before,
-            state.current,
-            state.omitted,
-        ]
+        if isinstance(scope, _OwnedScope):
+            value: list[Any] = [
+                _VERSION,
+                _OWNED_DOMAIN,
+                scope.instance,
+                scope.root,
+                scope.run,
+                scope.runtime_id,
+                scope.query,
+                state.through,
+                state.before,
+                state.current,
+                state.omitted,
+                state.excluded_from,
+            ]
+        else:
+            value = [
+                _VERSION,
+                _DOMAIN,
+                *scope,
+                state.through,
+                state.before,
+                state.current,
+                state.omitted,
+            ]
         return base64.urlsafe_b64encode(
             json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
                 "utf-8"
@@ -149,13 +194,46 @@ class HistoryFind:
             raise EvidenceError("output_budget", "本次预算不足以核查完整历史查找游标")
         try:
             data = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
-            if not isinstance(data, list) or len(data) != 9:
+            if not isinstance(data, list):
                 raise ValueError
-            version, domain, instance, session, query, through, before, current, omitted = data
-            if type(version) is not int or version != _VERSION or domain != _DOMAIN:
-                raise ValueError
-            if (instance, session, query) != scope:
-                raise ValueError
+            excluded_from: int | None = None
+            if isinstance(scope, _OwnedScope):
+                if len(data) != 12:
+                    raise ValueError
+                (
+                    version,
+                    domain,
+                    instance,
+                    root,
+                    run,
+                    runtime_id,
+                    query,
+                    through,
+                    before,
+                    current,
+                    omitted,
+                    excluded_from,
+                ) = data
+                if (
+                    type(version) is not int
+                    or version != _VERSION
+                    or domain != _OWNED_DOMAIN
+                    or (instance, root, query) != (scope.instance, scope.root, scope.query)
+                ):
+                    raise ValueError
+                if (run, runtime_id) != (scope.run, scope.runtime_id):
+                    raise EvidenceError(
+                        "history_find_cursor_expired", "跨会话游标仅可在原主运行内续查，请重新查询"
+                    )
+                excluded_from = _integer(excluded_from, minimum=1)
+            else:
+                if len(data) != 9:
+                    raise ValueError
+                version, domain, instance, session, query, through, before, current, omitted = data
+                if type(version) is not int or version != _VERSION or domain != _DOMAIN:
+                    raise ValueError
+                if (instance, session, query) != scope:
+                    raise ValueError
             through = _integer(through)
             omitted = _integer(omitted)
             if before is not None:
@@ -180,8 +258,10 @@ class HistoryFind:
                 ):
                     raise ValueError
                 position = (sequence, identifier, revision, fingerprint, offset)
-            return _State(through, before, position, omitted)
+            return _State(through, before, position, omitted, excluded_from)
         except (ValueError, TypeError, RecursionError, UnicodeError, binascii.Error) as exc:
+            if isinstance(exc, EvidenceError) and exc.code == "history_find_cursor_expired":
+                raise
             raise EvidenceError(
                 "history_find_cursor_invalid", "游标无效或不属于本次资料库、会话和查询"
             ) from exc
@@ -221,6 +301,7 @@ class HistoryFind:
             before=SQLITE_MAX_INTEGER,
             current=current,
             omitted=SQLITE_MAX_INTEGER,
+            excluded_from=SQLITE_MAX_INTEGER if isinstance(scope, _OwnedScope) else None,
         )
         stats = _Stats(budget.candidates, budget.raw, dict.fromkeys(_OMISSIONS, budget.candidates))
         return (
@@ -270,7 +351,7 @@ class HistoryFind:
 
     @staticmethod
     def _item(
-        scope: _Scope,
+        session_id: str,
         metadata: dict[str, Any],
         record: dict[str, Any],
         fingerprint: str,
@@ -291,12 +372,208 @@ class HistoryFind:
             "offset_bytes": offset,
             "length_bytes": length,
             "read_arguments": {
-                "session_id": scope[1],
+                "session_id": session_id,
                 "message_id": metadata["id"],
                 "revision": metadata["revision"],
                 "offset_bytes": offset,
             },
         }
+
+    def _scope_object(
+        self,
+        kind: str,
+        identifier: str,
+        budget: _Budget,
+        stats: _Stats,
+        deadline: float,
+    ) -> dict[str, Any] | None:
+        """Charge complete authority metadata to the same page's raw budget."""
+        _check(deadline)
+        row = self.store.db.execute(
+            "SELECT typeof(data) AS storage_type,length(CAST(data AS BLOB)) AS size "
+            "FROM objects WHERE kind=? AND id=?",
+            (kind, identifier),
+        ).fetchone()
+        if row is None:
+            return None
+        size = row["size"]
+        if row["storage_type"] != "text" or type(size) is not int or size < 1:
+            raise EvidenceError("content_unavailable", "资料范围身份元数据已损坏")
+        if size > budget.raw - stats.json_bytes:
+            raise _RawLimit(oversized=size > budget.raw)
+        stats.json_bytes += size
+        record = self.store.bounded_object(kind, identifier, max_bytes=size, strict_json=True)
+        _check(deadline)
+        return record
+
+    def _owner_boundary(
+        self, owner: _OwnerRequest, budget: _Budget, stats: _Stats, deadline: float
+    ) -> int:
+        session = self._scope_object("session", owner.root, budget, stats, deadline)
+        run = self._scope_object("run", owner.run, budget, stats, deadline)
+        if (
+            self.store.existing_main_session_id() != owner.root
+            or session is None
+            or session.get("kind") != "main"
+            or session.get("principal") != "owner"
+            or any(
+                name in session for name in ("workflow_id", "workflow_run_id", "workflow_node_id")
+            )
+            or run is None
+            or run.get("session_id") != owner.root
+            or run.get("status") != "running"
+        ):
+            raise EvidenceError("history_find_authority_unavailable", "主助手当前执行身份无法核验")
+        remaining = budget.raw - stats.json_bytes
+        row = self.store.db.execute(
+            "SELECT seq,delivered_seq,typeof(payload) AS payload_type,"
+            "length(CAST(payload AS BLOB)) AS size,"
+            "CASE WHEN typeof(payload)='text' AND length(CAST(payload AS BLOB))<=? "
+            "THEN CAST(payload AS BLOB) END AS payload FROM ingress "
+            "WHERE id=? AND session_id=? AND run_id=? AND state='delivered'",
+            (remaining, owner.input_id, owner.root, owner.run),
+        ).fetchone()
+        if row is None:
+            raise EvidenceError(
+                "history_find_authority_unavailable", "需要当前运行已接纳的主人原始输入"
+            )
+        size = row["size"]
+        if row["payload_type"] != "text" or type(size) is not int or size < 0:
+            raise EvidenceError("history_find_authority_unavailable", "主人原始输入无法完整核验")
+        if size > remaining:
+            raise _RawLimit(oversized=size > budget.raw)
+        stats.json_bytes += size
+        try:
+            payload = _object(row["payload"])
+            valid = (
+                payload.get("id") == owner.input_id
+                and payload.get("session_id") == owner.root
+                and payload.get("principal") == "owner"
+                and isinstance(payload.get("source"), str)
+                and bool(payload["source"])
+                and isinstance(payload.get("content"), str)
+            )
+            json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, RecursionError, UnicodeError) as exc:
+            raise EvidenceError(
+                "history_find_authority_unavailable", "主人原始输入无法完整核验"
+            ) from exc
+        _check(deadline)
+        if not valid or not self._input_mapping(owner.root, owner.input_id, row["delivered_seq"]):
+            raise EvidenceError(
+                "history_find_authority_unavailable", "当前输入不是已归档的真实主人请求"
+            )
+        # claim_inputs archives ingress in seq order. The run_id index includes
+        # rowid/seq, so its first row is also this run's earliest delivered mapping.
+        first = self.store.db.execute(
+            "SELECT session_id=? AS same_session,state='delivered' AS delivered,delivered_seq,"
+            "CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND ? "
+            "THEN CAST(id AS BLOB) END AS input_id FROM ingress "
+            "WHERE run_id=? ORDER BY seq LIMIT 1",
+            (owner.root, budget.mapping_id, owner.run),
+        ).fetchone()
+        _check(deadline)
+        if (
+            first is None
+            or first["same_session"] != 1
+            or first["delivered"] != 1
+            or not isinstance(first["input_id"], bytes)
+        ):
+            raise EvidenceError(
+                "history_find_authority_unavailable", "当前主运行的原始归档边界无法核验"
+            )
+        identifier = decode_utf8(first["input_id"], allow_incomplete_tail=False)
+        boundary = first["delivered_seq"]
+        if not self._input_mapping(owner.root, identifier, boundary):
+            raise EvidenceError(
+                "history_find_authority_unavailable", "当前主运行的归档边界已经失效"
+            )
+        stats.json_bytes += len(first["input_id"])
+        if stats.json_bytes > budget.raw:
+            raise _RawLimit(oversized=False)
+        return int(boundary)
+
+    def _input_mapping(self, session_id: str, identifier: str, sequence: object) -> bool:
+        return (
+            type(sequence) is int
+            and 1 <= sequence <= SQLITE_MAX_INTEGER
+            and self.store.db.execute(
+                "SELECT 1 FROM message_order WHERE seq=? AND message_id=? AND session_id=?",
+                (sequence, identifier, session_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _in_scope(
+        self,
+        session_id: str,
+        scope: _OwnedScope,
+        cache: dict[str, bool],
+        budget: _Budget,
+        stats: _Stats,
+        deadline: float,
+    ) -> bool:
+        if session_id == scope.root:
+            return True
+        if session_id in cache:
+            return cache[session_id]
+        session = self._scope_object("session", session_id, budget, stats, deadline)
+        if session is None:
+            raise EvidenceError("history_find_scope_missing", "来源会话身份已缺失")
+        if session.get("kind") != "team" or any(
+            name in session for name in ("workflow_id", "workflow_run_id", "workflow_node_id")
+        ):
+            cache[session_id] = False
+            return False
+        agent = self._scope_object("agent", session_id, budget, stats, deadline)
+        if agent is None:
+            raise EvidenceError("history_find_scope_missing", "来源队友关联已缺失")
+        if any(name in agent for name in ("workflow_id", "workflow_run_id", "workflow_node_id")):
+            cache[session_id] = False
+            return False
+        parent_id: object = agent.get("parent_id")
+        role: object = session.get("role")
+        if (
+            session.get("principal") != "owner"
+            or not isinstance(role, str)
+            or role not in {"worker", "reviewer"}
+            or agent.get("session_id") != session_id
+            or agent.get("role") != role
+            or not isinstance(parent_id, str)
+            or not parent_id
+        ):
+            raise EvidenceError("history_find_scope_invalid", "来源队友关联无法完整核验")
+        included = parent_id == scope.root
+        cache[session_id] = included
+        return included
+
+    def find_owned(
+        self,
+        root_session_id: str,
+        query: str,
+        *,
+        run_id: str,
+        input_id: str,
+        runtime_id: str,
+        cursor: str | None = None,
+        limit: int = 20,
+        max_output_chars: int,
+        max_results: int,
+        max_context_chars: int,
+        deadline: float,
+    ) -> dict[str, Any]:
+        """The Runtime supplies current owner authority, never model-selected scope."""
+        return self.find(
+            root_session_id,
+            query,
+            cursor=cursor,
+            limit=limit,
+            max_output_chars=max_output_chars,
+            max_results=max_results,
+            max_context_chars=max_context_chars,
+            deadline=deadline,
+            _owner=_OwnerRequest(root_session_id, run_id, input_id, runtime_id),
+        )
 
     def find(
         self,
@@ -309,6 +586,7 @@ class HistoryFind:
         max_results: int,
         max_context_chars: int,
         deadline: float,
+        _owner: _OwnerRequest | None = None,
     ) -> dict[str, Any]:
         for name, value in (
             ("max_output_chars", max_output_chars),
@@ -348,18 +626,63 @@ class HistoryFind:
         try:
             _check(deadline)
             self.store.db.execute("BEGIN")
-            self.evidence._session(session_id)
-            scope = (self._instance(maximum), session_id, _hash(needle))
+            instance = self._instance(maximum)
+            scope: _Scope
+            if _owner is None:
+                self.evidence._session(session_id)
+                scope = (instance, session_id, _hash(needle))
+            else:
+                for name, identity in (
+                    ("run_id", _owner.run),
+                    ("input_id", _owner.input_id),
+                    ("runtime_id", _owner.runtime_id),
+                ):
+                    _text(identity, maximum=maximum, name=name)
+                if _owner.root != session_id:
+                    raise EvidenceError("invalid_arguments", "主助手范围与宿主身份不匹配")
+                scope = _OwnedScope(
+                    instance, session_id, _owner.run, _owner.runtime_id, _hash(needle)
+                )
             state = self._decode(cursor, scope, budget) if cursor is not None else None
+            stats = _Stats()
+            boundary: int | None = None
+            if _owner is not None:
+                stats.json_bytes = len(instance.encode("utf-8"))
+                boundary = self._owner_boundary(_owner, budget, stats, deadline)
+                if state is not None and state.excluded_from != boundary:
+                    raise EvidenceError(
+                        "history_find_changed", "主运行的原始排除边界已变化，请重新查询"
+                    )
+                budget = replace(
+                    budget,
+                    mapping_id=max(
+                        1,
+                        min(
+                            maximum,
+                            (budget.raw - stats.json_bytes) // (2 * (budget.candidates + 1)),
+                        ),
+                    ),
+                )
             if state is not None and state.current is not None:
                 if len(state.current[1].encode("utf-8")) > budget.mapping_id:
                     raise EvidenceError("output_budget", "当前消息身份已超过本次映射预算")
             _check(deadline)
-            rows = self._window(session_id, state, budget)
-            state = state or _State(rows[0]["seq"] if rows else 0)
+            rows = self._window(scope, state, budget)
+            if _owner is not None:
+                stats.json_bytes += sum(
+                    len(value.encode("utf-8"))
+                    for row in rows
+                    for name in ("session_id", "message_id")
+                    if isinstance(value := row[name], str)
+                )
+                if stats.json_bytes > budget.raw:
+                    raise _RawLimit(oversized=False)
+            state = state or _State(rows[0]["seq"] if rows else 0, excluded_from=boundary)
             return self._search(
-                scope, state, rows, needle, min(limit, candidates), budget, deadline
+                scope, state, rows, needle, min(limit, candidates), budget, deadline, stats=stats
             )
+        except _RawLimit as exc:
+            raise EvidenceError("output_budget", "预算不足以完整核查当前主人与资料范围") from exc
         except _Expired as exc:
             raise EvidenceError(
                 "history_find_timeout", "历史查找未在原期限内取得可交付进展"
@@ -379,12 +702,17 @@ class HistoryFind:
         limit: int,
         budget: _Budget,
         deadline: float,
+        *,
+        stats: _Stats | None = None,
     ) -> dict[str, Any]:
-        stats = _Stats()
+        stats = stats if stats is not None else _Stats()
         items: list[dict[str, Any]] = []
+        scope_cache: dict[str, bool] = {}
         progress = False
 
         def finish(reason: str | None, *, more: bool = True) -> dict[str, Any]:
+            if isinstance(scope, _OwnedScope) and reason == "raw_budget" and not progress:
+                raise EvidenceError("output_budget", "预算不足以核查首条候选的完整身份与原件")
             result = self._packet(scope, state, items, stats, reason=reason, more=more)
             if json_size(result) > budget.output:
                 raise EvidenceError("output_budget", "预算不足以完整返回历史位置、计数和游标")
@@ -407,11 +735,56 @@ class HistoryFind:
                 expected = state.current
                 stats.scanned += 1
                 identifier = raw_id if isinstance(raw_id, str) else None
+                session_id = row.get("session_id") if isinstance(scope, _OwnedScope) else scope[1]
                 if expected is not None and (sequence != expected[0] or identifier != expected[1]):
                     raise EvidenceError("history_find_changed", "续查中的消息映射已经变化或删除")
-                if identifier is None:
+                if identifier is None or not isinstance(session_id, str):
+                    if expected is not None:
+                        raise EvidenceError("history_find_changed", "续查中的来源会话映射已经损坏")
                     omit(sequence, "invalid_mapping")
                     continue
+                if isinstance(scope, _OwnedScope):
+                    if session_id == scope.root and sequence >= int(state.excluded_from or 0):
+                        if expected is not None:
+                            raise EvidenceError(
+                                "history_find_cursor_invalid", "续查位置属于本次主运行"
+                            )
+                        state = replace(state, before=sequence, current=None)
+                        progress = True
+                        continue
+                    try:
+                        included = self._in_scope(
+                            session_id, scope, scope_cache, budget, stats, deadline
+                        )
+                    except _RawLimit as exc:
+                        if not exc.oversized:
+                            return finish("raw_budget")
+                        if expected is not None:
+                            raise EvidenceError(
+                                "output_budget", "续查来源身份超过本次核查预算"
+                            ) from exc
+                        omit(sequence, "oversized")
+                        continue
+                    except EvidenceError as exc:
+                        if expected is not None:
+                            raise EvidenceError(
+                                "history_find_changed", "续查来源关联已变化或损坏"
+                            ) from exc
+                        omit(
+                            sequence,
+                            "missing"
+                            if exc.code == "history_find_scope_missing"
+                            else "invalid_mapping",
+                        )
+                        continue
+                    if not included:
+                        if expected is not None:
+                            raise EvidenceError(
+                                "history_find_changed", "续查来源已不属于当前直属范围"
+                            )
+                        state = replace(state, before=sequence, current=None)
+                        progress = True
+                        continue
                 size_row = self.store.db.execute(
                     "SELECT typeof(data) AS storage_type,length(CAST(data AS BLOB)) AS size "
                     "FROM objects WHERE kind='message' AND id=?",
@@ -443,7 +816,7 @@ class HistoryFind:
                     _check(deadline)
                     if (
                         record is None
-                        or record.get("session_id") != scope[1]
+                        or record.get("session_id") != session_id
                         or not isinstance(record.get("content"), str)
                         or self._invalid_json(identifier)
                     ):
@@ -500,7 +873,9 @@ class HistoryFind:
                             following,
                         ),
                     )
-                    item = self._item(scope, metadata, record, fingerprint, found, len(needle))
+                    item = self._item(session_id, metadata, record, fingerprint, found, len(needle))
+                    if isinstance(scope, _OwnedScope):
+                        item["session_id"] = session_id
                     fits = self._fits(scope, after, [*items, item], budget)
                     _check(deadline)
                     if not fits:
