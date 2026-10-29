@@ -108,7 +108,7 @@ MuLi --config "/绝对路径/config.json" --data-dir "/绝对路径/data" serve
 | --- | --- |
 | 工作台打不开 | 用 `MuLi service status` 看服务状态；必要时在终端运行 `MuLi serve` 查看启动错误，避免同时启动两个实例。 |
 | 配置位置或能力不清楚 | 运行 `MuLi doctor`。能力可检测不等于桌面授权已经成功。 |
-| Linux 服务异常 | 查看 `journalctl --user -u muli.service -f`；macOS、Windows 查看数据目录中的服务日志。 |
+| Linux 服务异常 | 查看 `journalctl --user -u muli.service -f`；macOS、Windows 查看数据目录中的服务日志，需要保留的上一轮转文件时可请沐璃用 `self_logs({"segment":"previous"})` 读取，见[自身日志](self-management.md#主动读取自身日志)。 |
 | 配置、更新或重启停在恢复阶段 | 先运行 `MuLi management status` 查看；按[恢复操作](linux-recovery-operations.md)接续。宿主不在运行时可用 `MuLi management recover`，不要反复新建相同操作。 |
 | 某次任务失败 | 在工作台保留运行 ID，请沐璃查询故障位置；参见[故障诊断](failure-diagnostics.md)。 |
 

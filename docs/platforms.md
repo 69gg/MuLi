@@ -34,7 +34,7 @@ muli service status
 
 Linux 默认限制为 `MemoryMax=512M`、`CPUQuota=50%`、`TasksMax=64`，可通过用户 unit override 调整。`enable` 不会同时启动服务。受管理的恢复入口要求标准服务配置及可核验的安装；自定义 unit 或 drop-in 可能无法自动恢复，见 [Linux 恢复操作](linux-recovery-operations.md)。普通前台运行、macOS 和 Windows 不提供同等的 Linux 恢复保证。
 
-macOS 安装后默认 `RunAtLoad=false`、`KeepAlive=false`，不承诺失败后自动重启。Windows 需要当前 Python 环境的 `pythonw.exe`，不回退到弹出控制台的 `python.exe`；任务不使用 SYSTEM、管理员权限或保存密码。Windows 重启通过一次性助手任务完成，异常可查看 `logs/restart.log`。macOS 和 Windows 服务日志每份最多 1 MiB，并保留一份轮转文件。
+macOS 安装后默认 `RunAtLoad=false`、`KeepAlive=false`，不承诺失败后自动重启。Windows 需要当前 Python 环境的 `pythonw.exe`，不回退到弹出控制台的 `python.exe`；任务不使用 SYSTEM、管理员权限或保存密码。Windows 重启通过一次性助手任务完成，异常可查看 `logs/restart.log`。macOS 和 Windows 服务日志每份最多 1 MiB，并保留一份 `logs/service.log.1` 轮转文件；可用 `self_logs({"segment":"previous"})` 按现有脱敏和输出额度读取，详见[自身日志](self-management.md#主动读取自身日志)。它不读取独立的 restart.log，也不增加日志留存量。
 
 ## 截图与录屏
 
