@@ -39,3 +39,9 @@ worker 只记忆已经由原 `origin_ready` 或最终 `projection` 的真实进�
 新增 `tests/test_managed_native_binding_costs.py`，覆盖生成 serve hook 命中真实 Runtime 闭包、独立调用的文件证明、原返回/异常 identity、成功激活仍验证四次、同一 receipt 的重复投影不新增绑定、计时失败、有限发布与正常终态、来源/权限/体积拒绝、多 source 中新 revision 快照不抹掉已认证历史、输入指纹复用和结果预算。测试使用原仓库的合成槽与临时数据库，并禁止真实子进程；没有触碰用户数据或桌面。
 
 开发检查须通过 `scripts/check_local.py` 串行收取守卫终态。离线回归通过只证明观察器与控制流约束，不提供 hosted 成本或完整三事务达标证据。
+
+## Helper 启动区间
+
+窄 `helper_guard_costs` 可附带独立 version 1 的 `startup`，只记生成 hook、worker/host 导入、真实 main 绑定和首次 `_entry` 前后的八个固定 wall/本进程 CPU 点。complete 仅表示八点齐全，不代表启动成功；partial/null 或字段缺失都不代表零成本。原 first_record/source 门之前失败时，可能完全没有启动快照。
+
+启动点共用原发布次数和 32 KiB 额度，超额时先裁 startup，再裁原可选明细；不改变产品认证、等待、期限或三事务验收。时基、身份、异常和 decoder 合同见[开发归档](../devarchive/managed-backend-authentication-design.md)。尚无本片 hosted 实测或已验证性能收益。

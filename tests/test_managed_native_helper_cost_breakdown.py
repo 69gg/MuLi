@@ -589,6 +589,7 @@ async def test_fixed_detail_yields_snapshot_budget_without_extra_publications(
     guard.host.backend._check(guard.host.install_intent())
     legacy = copy.deepcopy(snapshots[-1])
     legacy.pop("breakdown")
+    legacy.pop("startup", None)
     lowered = len(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()) + 128
     assert lowered < worker.MAX_BYTES
     monkeypatch.setattr(worker, "MAX_BYTES", lowered)
@@ -597,7 +598,7 @@ async def test_fixed_detail_yields_snapshot_budget_without_extra_publications(
     assert [row["boundary"] for row in snapshots] == [*worker.HELPER_GUARD_PREFIXES, "normal_exit"]
     assert all("breakdown" in row for row in snapshots[:2])
     final = snapshots[-1]
-    assert "breakdown" not in final and final["checks"]["returned"] == 2
+    assert "breakdown" not in final and "startup" not in final and final["checks"]["returned"] == 2
     assert final["attempts"] == {"prefix": 2, "final": 1}
     assert final["prior_publications"]["count"] == 2
     assert len(guard.path.read_bytes()) <= lowered
@@ -620,6 +621,7 @@ async def test_fixed_detail_yields_aggregate_budget_before_original_guard_receip
     )
     expected = copy.deepcopy(result)
     expected["resources"]["helper_guard_costs"]["sources"][0]["costs"].pop("breakdown")
+    expected["resources"]["helper_guard_costs"]["sources"][0]["costs"].pop("startup", None)
     lowered = len(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode())
     assert lowered < worker.MAX_BYTES
     monkeypatch.setattr(worker, "MAX_BYTES", lowered)

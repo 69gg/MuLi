@@ -149,7 +149,9 @@ async def test_generated_hook_omits_broad_cost_observer_and_preserves_birth_and_
     def install_birth() -> None:
         calls["birth"] += 1
 
-    def install_guard() -> None:
+    def install_guard(*, startup_points: object = None) -> None:
+        assert isinstance(startup_points, list)
+        assert [point[0] for point in startup_points] == list(worker.HELPER_STARTUP_POINTS[:3])
         calls["guard"] += 1
 
     def install_service() -> None:

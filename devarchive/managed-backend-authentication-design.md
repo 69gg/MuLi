@@ -84,3 +84,11 @@ FD 分类首红实收一失败三通过（0.79 秒、65.1 MiB、swap 0）：完�
 RPC 仅包装原 `SystemdProbe._command`，固定分类为 GetUnit、Unit、Service、other，保留原 runner 身份、参数和 TaskGroup 并发。记录 entered/returned/raised 与包含调度等待的 wall；不记录可被并发重复覆盖的单 RPC helper CPU。entered 表示方法进入，不证明已经创建 busctl 子进程；在途调用使该次明细暂报 `detail_reason: in_flight`，不提供不守恒的完成合计。GetUnit wall 只是原串行 GetUnit 可移除时的乐观上界，不是实际净收益；spawn、busctl CPU、D-Bus 和调度分项仍未知，wall−CPU 也不是已测 throttle。
 
 明细自身统计失败只令 `breakdown` unavailable 并给出固定 `detail_reason`，原 guard 结果、返回对象、异常/取消身份和旧 `reason` 不变。原 32 KiB、64 行、两个 prefix 与一个 final 上限及发布机会保持；单快照和聚合超界均先丢明细，再沿旧诊断裁剪顺序处理，原 failure/timeline/cleanup 优先。新 reader 接受不带明细的旧快照；不宣称旧 reader 接受新增字段，也不从测量本身推断优化收益或原生三事务验收通过。
+
+后续启动定位仍只扩展同一窄 helper 诊断，不调整产品实现、service 导入、文件认证或证明寿命。可选 `startup` 子对象使用独立 version 1，固定字段为 `version/clock/state/reason/points`；`clock` 为 `monotonic_ns/process_time_ns`，`state` 只允许 complete、partial、unavailable，reason 使用有限机器码，points 恰为以下八项：hook_entered、worker_import_returned、unit_birth_returned、host_import_dispatch、host_import_returned、main_entered、entry_dispatch、entry_returned。每项仅为严格非负整数 wall_ns/cpu_ns 或 null；拒绝 bool、倒序、额外点和任意私密文字，缺失或失败不填零。新 decoder 接受完全不含 startup 的旧快照，不能据此声称旧 reader 支持新字段。
+
+最早三点来自 prepare 实际生成的 fixture hook：第一次加载 time 后、导入 worker 前，worker 导入返回后，以及原 unit_birth 函数返回后。unit_birth 自己吞掉观察失败，因此第三点不代表 unit 所有权观察成功。host 导入前后两点使用独立内存时钟；现有唯一 profile 仅等待精确的实际 `-m` main，核其 ModuleSpec、文件、globals 和 canonical main/_record code 后立即撤回。只有同次核准实际 namespace 的 `_entry` 是同 globals/filename/canonical code 的原函数，才在绑定时记 main_entered，并在该 namespace 放一层透传 wrapper 记录首次 `_entry` 调用前及正常返回后；原调用每次恰一次，原返回对象、异常及取消身份不变。再次调用仍正常执行业务，但不添加或覆盖八个点。startup 的打点、绑定或统计故障不覆盖原 guard reason。
+
+早期读数必须沿原 fixture、UID/PID/INVOCATION_ID、真实 main 和 helper source 门才能导出；未绑定的 startup 只给 unavailable/null。原 first_record、rows 与 source 条件和发布机会不变：过早异常、绑定失败或 kill 可能完全没有启动 payload，不为补齐数据增加文件、发布、轮询或重试。能发布的 partial 也不证明覆盖全部启动。startup 搭原两个 prefix 和一个 final；单快照与聚合都先裁 startup，再裁 breakdown，仍不够才沿旧整体诊断退让，保留原 failure/timeline/cleanup。
+
+这些点不读取 `/proc` 或文件叶，不持有认证证明，不增加 profile 或通用模块跟踪。time 首次导入、进入 hook 之前的 Python/系统调度仍未覆盖；main_entered 是通过身份门后的绑定点。wall 是同一单调时基下的有限区间，CPU 仅代表 helper 本进程；不同进程的 wall/CPU、包含式 guard 成本及 prepared→draining 间隔不能直接相加或当作可删除时间。离线新回归须实际 await helper coroutine 到真实 `_entry` 保留文件认证，再在受控 controller step 停下；只关闭 coroutine 不能证明入口两点。新候选尚未取得 hosted 数据，已验证性能收益仍为零，原生失败和原限额继续保留。

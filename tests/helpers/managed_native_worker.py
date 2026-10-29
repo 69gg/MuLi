@@ -60,6 +60,24 @@ HELPER_GUARD_DETAIL_METRICS = (
 )
 HELPER_GUARD_PROOF_ROLES = ("python", "package", "other")
 HELPER_GUARD_RPC_KINDS = ("GetUnit", "Unit", "Service", "other")
+HELPER_STARTUP_POINTS = (
+    "hook_entered",
+    "worker_import_returned",
+    "unit_birth_returned",
+    "host_import_dispatch",
+    "host_import_returned",
+    "main_entered",
+    "entry_dispatch",
+    "entry_returned",
+)
+HELPER_STARTUP_REASONS = {
+    "points_missing",
+    "clock_invalid",
+    "capture_invalid",
+    "entry_raised",
+    "unbound",
+    "statistics_failed",
+}
 HELPER_START_BOUNDARIES = ("start_entered", "start_command_entered", "start_command_returned")
 BINDING_COST_ROWS = 64
 BINDING_COST_PREFIXES = 8
@@ -4581,12 +4599,13 @@ def binding_costs_facts(value: object, result: dict[str, Any]) -> bool:
 
 def trim_binding_diagnostics(result: dict[str, Any]) -> None:
     """The original timeline, failure and cleanup always win the original byte budget."""
-    if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
-        costs = result["resources"].get("helper_guard_costs")
-        if isinstance(costs, dict) and isinstance(costs.get("sources"), list):
-            for sample in costs["sources"]:
-                if isinstance(sample, dict) and isinstance(sample.get("costs"), dict):
-                    sample["costs"].pop("breakdown", None)
+    for detail in ("startup", "breakdown"):
+        if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+            costs = result["resources"].get("helper_guard_costs")
+            if isinstance(costs, dict) and isinstance(costs.get("sources"), list):
+                for sample in costs["sources"]:
+                    if isinstance(sample, dict) and isinstance(sample.get("costs"), dict):
+                        sample["costs"].pop(detail, None)
     for name in ("helper_guard_costs", "binding_costs", "binding_inputs"):
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
             return
@@ -4762,6 +4781,55 @@ def _helper_guard_breakdown_facts(value: object) -> bool:
     return True
 
 
+def helper_startup_facts(value: object) -> bool:
+    """Eight optional same-process points, never a startup or readiness verdict."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "clock", "state", "reason", "points"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["clock"] != "monotonic_ns/process_time_ns"
+        or not isinstance(value["state"], str)
+        or value["state"] not in {"complete", "partial", "unavailable"}
+        or not isinstance(value["reason"], str)
+        or value["reason"] not in {"", *HELPER_STARTUP_REASONS}
+        or not isinstance(value["points"], dict)
+        or set(value["points"]) != set(HELPER_STARTUP_POINTS)
+    ):
+        return False
+    previous: tuple[int, int] | None = None
+    count = 0
+    for name in HELPER_STARTUP_POINTS:
+        point = value["points"][name]
+        if point is None:
+            continue
+        if (
+            not isinstance(point, dict)
+            or set(point) != {"wall_ns", "cpu_ns"}
+            or not all(_binding_number(point[key]) for key in ("wall_ns", "cpu_ns"))
+        ):
+            return False
+        current = point["wall_ns"], point["cpu_ns"]
+        if previous is not None and any(
+            after < before for before, after in zip(previous, current, strict=True)
+        ):
+            return False
+        previous, count = current, count + 1
+    if value["state"] == "complete":
+        return count == len(HELPER_STARTUP_POINTS) and value["reason"] == ""
+    if value["state"] == "unavailable":
+        return count == 0 and value["reason"] in HELPER_STARTUP_REASONS
+    return (
+        0 < count < len(HELPER_STARTUP_POINTS)
+        and value["reason"] in HELPER_STARTUP_REASONS - {"unbound"}
+        and (
+            value["reason"] != "entry_raised"
+            or value["points"]["entry_dispatch"] is not None
+            and value["points"]["entry_returned"] is None
+        )
+    )
+
+
 def helper_guard_snapshot_facts(value: object, source: object) -> bool:
     """Only the two synchronous guards are covered, including their real failures."""
     if _binding_missing(value):
@@ -4769,7 +4837,7 @@ def helper_guard_snapshot_facts(value: object, source: object) -> bool:
     if (
         not _helper_guard_source_facts(source)
         or not isinstance(value, dict)
-        or set(value) - {"breakdown"}
+        or set(value) - {"breakdown", "startup"}
         != {
             "version",
             "code",
@@ -4802,6 +4870,8 @@ def helper_guard_snapshot_facts(value: object, source: object) -> bool:
         )
         or "breakdown" in value
         and not _helper_guard_breakdown_facts(value["breakdown"])
+        or "startup" in value
+        and not helper_startup_facts(value["startup"])
     ):
         return False
     assert isinstance(source, dict)
@@ -5032,6 +5102,101 @@ def collect_helper_guard_costs(
     trim_binding_diagnostics(result)
 
 
+def helper_startup_unavailable(reason: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "clock": "monotonic_ns/process_time_ns",
+        "state": "unavailable",
+        "reason": reason if reason in HELPER_STARTUP_REASONS else "statistics_failed",
+        "points": dict.fromkeys(HELPER_STARTUP_POINTS),
+    }
+
+
+class HelperStartup:
+    """Only eight memory observations; failures never change guard statistics."""
+
+    def __init__(self, early: object) -> None:
+        self.points: dict[str, dict[str, int] | None] = dict.fromkeys(HELPER_STARTUP_POINTS)
+        self.seen: set[str] = set()
+        self.last: tuple[int, int] | None = None
+        self.reason = ""
+        self.bound = False
+        if not isinstance(early, list) or len(early) > 3:
+            self.reason = "capture_invalid"
+            return
+        for index, point in enumerate(early):
+            if (
+                not isinstance(point, tuple)
+                or len(point) != 3
+                or point[0] != HELPER_STARTUP_POINTS[index]
+            ):
+                self.points = dict.fromkeys(HELPER_STARTUP_POINTS)
+                self.reason = "capture_invalid"
+                return
+            self.seen.add(point[0])
+            self._point(point[0], (point[1], point[2]))
+
+    def _point(self, name: str, values: tuple[object, object]) -> None:
+        current = cast(tuple[int, int], values)
+        if not all(_binding_number(value) for value in values) or (
+            self.last is not None
+            and any(after < before for before, after in zip(self.last, current, strict=True))
+        ):
+            self.reason = self.reason or "clock_invalid"
+            return
+        wall, cpu = current
+        self.points[name] = {"wall_ns": wall, "cpu_ns": cpu}
+        self.last = wall, cpu
+
+    def mark(self, name: str) -> bool:
+        """At most one attempt per fixed point, including a failed clock read."""
+        try:
+            if name not in HELPER_STARTUP_POINTS or name in self.seen:
+                return False
+            self.seen.add(name)
+            try:
+                values: tuple[object, object] = time.monotonic_ns(), time.process_time_ns()
+            except BaseException:
+                values = None, None
+            self._point(name, values)
+            return True
+        except BaseException:
+            self.reason = "statistics_failed"
+            return False
+
+    def entry(self, original: Callable[[Path], Any]) -> Callable[[Path], Any]:
+        @wraps(original)
+        def observed(root: Path) -> Any:
+            tracked = self.mark("entry_dispatch")
+            try:
+                value = original(root)
+            except BaseException:
+                if tracked:
+                    self.reason = self.reason or "entry_raised"
+                raise
+            if tracked:
+                self.mark("entry_returned")
+            return value
+
+        return observed
+
+    def snapshot(self) -> dict[str, Any]:
+        if not self.bound:
+            return helper_startup_unavailable("unbound")
+        count = sum(point is not None for point in self.points.values())
+        complete = count == len(self.points) and not self.reason
+        return {
+            "version": 1,
+            "clock": "monotonic_ns/process_time_ns",
+            "state": "complete" if complete else "partial" if count else "unavailable",
+            "reason": self.reason or ("points_missing" if count != len(self.points) else ""),
+            "points": {
+                name: dict(point) if point is not None else None
+                for name, point in self.points.items()
+            },
+        }
+
+
 class HelperGuardCosts:
     """Memory-only accounting around the real synchronous authorization calls."""
 
@@ -5047,6 +5212,7 @@ class HelperGuardCosts:
             name: self.metric() for name in ("host_record", "checks", "unpositioned_raised")
         }
         self.first_record: dict[str, Any] | None = None
+        self.startup: HelperStartup | None = None
         self.reason = ""
         self.bound = False
         self.attempts = {"prefix": 0, "final": 0}
@@ -5483,6 +5649,14 @@ class HelperGuardCosts:
             "attempts": dict(self.attempts),
             "prior_publications": dict(self.publications),
         }
+        if self.startup is not None:
+            try:
+                startup = self.startup.snapshot()
+                if not helper_startup_facts(startup):
+                    raise ValueError("startup_unavailable")
+                value["startup"] = startup
+            except BaseException:
+                value["startup"] = helper_startup_unavailable("statistics_failed")
         if self.detail_bound or self.detail_reason:
             try:
                 detail = self.breakdown()
@@ -5513,9 +5687,10 @@ class HelperGuardCosts:
             if value.get("code") != "observed":
                 return
             data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-            if len(data) > MAX_BYTES and "breakdown" in value:
-                value.pop("breakdown")
-                data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            for detail in ("startup", "breakdown"):
+                if len(data) > MAX_BYTES and detail in value:
+                    value.pop(detail)
+                    data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
             require(len(data) <= MAX_BYTES, "native_metadata_budget")
             path = (
                 self.root
@@ -5549,7 +5724,7 @@ class HelperGuardCosts:
         self.publish("normal_exit")
 
 
-def install_helper_guard_cost_hook() -> None:
+def install_helper_guard_cost_hook(*, startup_points: object = None) -> None:
     """Bind only the exact -m main namespace, without reviving the broad observer."""
     bind_main: Callable[[FrameType, str, object], None] | None = None
     try:
@@ -5582,10 +5757,19 @@ def install_helper_guard_cost_hook() -> None:
             and invocation != "0" * 32,
             "native_guard_source",
         )
+        try:
+            startup: HelperStartup | None = HelperStartup(startup_points)
+        except BaseException:
+            startup = None
+        if startup is not None:
+            startup.mark("host_import_dispatch")
         import muli.managed_host as managed_host
         from muli.platforms.managed_backend import ManagedLinuxBackend
 
+        if startup is not None:
+            startup.mark("host_import_returned")
         observer = HelperGuardCosts(root, invocation)
+        observer.startup = startup
         spec = managed_host.__spec__
         origin = spec.origin if spec is not None else None
 
@@ -5624,8 +5808,25 @@ def install_helper_guard_cost_hook() -> None:
                     and original.__code__ == managed_host._record.__code__,
                     "native_guard_unbound",
                 )
+                stop_waiting()
                 namespace["_record"] = observer.record(cast("HostRecordReader", original))
                 ManagedLinuxBackend._check = observer.check(ManagedLinuxBackend._check)  # type: ignore[method-assign]
+                if startup is not None:
+                    try:
+                        entry = namespace.get("_entry")
+                        if (
+                            isinstance(entry, FunctionType)
+                            and entry.__globals__ is namespace
+                            and entry.__code__.co_filename == origin
+                            and entry.__code__ == managed_host._entry.__code__
+                        ):
+                            startup.bound = True
+                            startup.mark("main_entered")
+                            namespace["_entry"] = startup.entry(entry)
+                        else:
+                            startup.reason = "unbound"
+                    except BaseException:
+                        startup.bound = False
                 observer.bound = True
                 observer.install_detail_hooks()
             except BaseException:

@@ -1778,14 +1778,31 @@ async def helper_guard(
                         "__spec__",
                         ModuleSpec(spec.name, spec.loader, origin="<foreign>"),
                     )
-                elif mode in {"replaced_main", "replaced_record"}:
+                elif mode in {"replaced_main", "replaced_record", "replaced_entry"}:
 
                     def replaced(*args: Any, **kwargs: Any) -> None:
                         raise AssertionError("a canonical replacement must not run")
 
                     monkeypatch.setattr(
-                        managed_host, "main" if mode == "replaced_main" else "_record", replaced
+                        managed_host,
+                        {
+                            "replaced_main": "main",
+                            "replaced_record": "_record",
+                            "replaced_entry": "_entry",
+                        }[mode],
+                        replaced,
                     )
+                elif mode == "foreign_entry_globals":
+                    require = worker.require
+
+                    def transplant(condition: bool, code: str) -> None:
+                        require(condition, code)
+                        namespace = sys._getframe(1).f_locals.get("namespace")
+                        if code == "native_guard_unbound" and isinstance(namespace, dict):
+                            entry = namespace["_entry"]
+                            namespace["_entry"] = FunctionType(entry.__code__, dict(namespace))
+
+                    monkeypatch.setattr(worker, "require", transplant)
                 sys.setprofile(None)
                 hook = (native.volume / "_muli_native_ci_hook.py").read_text(encoding="utf-8")
                 exec(compile(hook, "<actual-generated-guard-hook>", "exec"), {})
@@ -1815,7 +1832,10 @@ async def helper_guard(
                     assert exited.value.code == 0
                 assert sys.getprofile() is (foreign if mode == "superseded" else None)
                 observer = cast(worker.HelperGuardCosts, callbacks[0].__self__)
-                assert observer.bound is (mode is None) and len(namespaces) == 1
+                assert (
+                    observer.bound is (mode in {None, "replaced_entry", "foreign_entry_globals"})
+                    and len(namespaces) == 1
+                )
                 yield _GuardFixture(
                     root,
                     host,
