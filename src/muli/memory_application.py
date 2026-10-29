@@ -22,7 +22,7 @@ from muli.document_settings import DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size, validate_integer
 from muli.media import MediaService
 from muli.memory_chunks import MemoryChunkSettings
-from muli.memory_context import MemoryContextProvider, PromptComposition
+from muli.memory_context import MemoryContextProvider, PromptComposition, _PromptBudget
 from muli.memory_evidence import SOURCE_JOB_STATES, SOURCE_PAGE_LIMIT, MemoryEvidence, query_result
 from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
 from muli.memory_watches import MemoryWatches, MemoryWatchMatch
@@ -75,7 +75,9 @@ class MemoryApplication:
         runtime.add_tool_provider(self.watch_tools, session_scoped=True)
         runtime.message_hooks.append(self.ingest)
         runtime.memory_context_provider = MemoryContextProvider(
-            self._context, composer=self._context_result
+            self._context,
+            composer=self._context_result,
+            request_composer=self._context_for_request,
         )
 
     def _context(
@@ -97,6 +99,7 @@ class MemoryApplication:
         *,
         latest_user_id: str | None = None,
         task_query: str | None = None,
+        prompt_budget: _PromptBudget | None = None,
     ) -> PromptComposition:
         settings = self.runtime.config.settings.memory
         if not settings.enabled:
@@ -110,6 +113,23 @@ class MemoryApplication:
             latest_user_id=latest_user_id,
             limit=settings.context_limit,
             task_query=task_query,
+            prompt_budget=prompt_budget,
+        )
+
+    def _context_for_request(
+        self,
+        query: str,
+        budget: _PromptBudget,
+        *,
+        latest_user_id: str | None = None,
+        task_query: str | None = None,
+    ) -> PromptComposition:
+        return self._context_result(
+            query,
+            budget.char_limit,
+            latest_user_id=latest_user_id,
+            task_query=task_query,
+            prompt_budget=budget,
         )
 
     def _pipeline(self) -> MemoryPipeline:
@@ -495,7 +515,9 @@ class MemoryApplication:
         self.pipeline = self._pipeline()
         self.watches = self._watches()
         self.runtime.memory_context_provider = MemoryContextProvider(
-            self._context, composer=self._context_result
+            self._context,
+            composer=self._context_result,
+            request_composer=self._context_for_request,
         )
         await self.start()
 

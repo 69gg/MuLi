@@ -19,7 +19,7 @@ from muli.maintenance import Admission
 from muli.media import EmbeddingPurpose, MediaConfig, RerankResult
 from muli.memory import LAYERS, Memory, normalize_entity
 from muli.memory_chunks import ChunkPlan, restore_plan
-from muli.memory_context import PromptComposition, compose_context_result
+from muli.memory_context import PromptComposition, _PromptBudget, compose_context_result
 from muli.memory_source_chunks import SourceChunks
 from muli.memory_source_failure import (
     MemorySourceFailure,
@@ -1560,6 +1560,7 @@ class MemoryPipeline:
         latest_user_id: str | None = None,
         limit: int | None = None,
         task_query: str | None = None,
+        prompt_budget: _PromptBudget | None = None,
     ) -> PromptComposition:
         """宿主已检查当前开关和预算；选材不依赖启动时的旧字符上限。"""
         if max_chars <= 0:
@@ -1580,4 +1581,5 @@ class MemoryPipeline:
             cached=cached["memories"] if cached is not None else None,
             hops=self.config.graph_hops,
             task_query=task_query,
+            prompt_budget=prompt_budget,
         )

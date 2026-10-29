@@ -119,16 +119,8 @@ def _preserved_results(messages: Sequence[Message]) -> set[int]:
     return preserved
 
 
-def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
-    """先节选文本，再整体移出旧轮次；返回独立副本，严格遵守 JSON 字符预算。
-
-    不补齐、不执行工具；调用方须先为中断且结果未知的调用补明确的未知结果。
-    最新用户输入、系统提示、工具参数、思考和 provider_data 均不截断。
-    最新完整工具批次中的宿主 preserve_content 标记同样保留完整正文；
-    新输入不消耗待读回执；新回答或工具批次后，旧标记才允许正常节选。
-    """
-    if type(max_chars) is not int or max_chars < 1:
-        raise ValueError("上下文字符预算必须是正整数")
+def _reduce_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
+    """让最终打包与最低必要占用共用完全相同的节选及保护规则。"""
     packed = deepcopy(list(messages))
     _validate_pairs(packed)
     current_size = context_size(packed)
@@ -165,6 +157,25 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
                 break
 
     _validate_pairs(packed)
+    return packed
+
+
+def minimum_context(messages: Sequence[Message]) -> list[Message]:
+    """返回可合法缩减到的最小副本，仅用于计算可选资料的最高余量。"""
+    return _reduce_context(messages, 0)
+
+
+def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
+    """先节选文本，再整体移出旧轮次；返回独立副本，严格遵守 JSON 字符预算。
+
+    不补齐、不执行工具；调用方须先为中断且结果未知的调用补明确的未知结果。
+    最新用户输入、系统提示、工具参数、思考和 provider_data 均不截断。
+    最新完整工具批次中的宿主 preserve_content 标记同样保留完整正文；
+    新输入不消耗待读回执；新回答或工具批次后，旧标记才允许正常节选。
+    """
+    if type(max_chars) is not int or max_chars < 1:
+        raise ValueError("上下文字符预算必须是正整数")
+    packed = _reduce_context(messages, max_chars)
     if context_size(packed) > max_chars:
         raise ContextLimitError(
             "最新用户输入、完整任务说明、系统提示、当前轮原生协议数据或需完整保留的工具结果"

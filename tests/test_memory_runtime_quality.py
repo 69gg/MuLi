@@ -45,10 +45,11 @@ async def memory_runtime(
 
 
 def memory_payload(request: list[Message]) -> str:
-    assert request[0].role == "system"
-    _, separator, payload = request[0].content.partition(MEMORY_HEADING)
-    assert separator, "实际模型请求没有自动记忆资料块"
-    return payload
+    blocks = [message for message in request if MEMORY_HEADING in message.content]
+    assert len(blocks) == 1, "实际模型请求应有唯一自动记忆资料消息"
+    message = blocks[0]
+    assert message.role == "system" and message.content.startswith(MEMORY_HEADING)
+    return message.content.removeprefix(MEMORY_HEADING)
 
 
 def memory_records(request: list[Message]) -> list[dict[str, Any]]:
