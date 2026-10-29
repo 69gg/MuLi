@@ -2298,23 +2298,25 @@ async function showMemoryEvidence(id, { editing = false, trigger = null } = {}) 
 }
 
 async function refreshMemoryEvidence(slot, editing = false) {
-  if (!memoryDialogCurrent(slot)) return;
+  const owner = connection;
+  if (!connectionCurrent(owner) || !memoryDialogCurrent(slot)) return;
   resetMemoryReads(slot); slot.item = null; slot.editing = false; slot.invalidated = false;
   dialogSubmit = null; $("#dialog-submit").hidden = true; $("#dialog-submit").disabled = false;
   $("#dialog-error").hidden = true;
   $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = "关闭";
   slot.content.replaceChildren(element("p", { role: "status", text: "正在核查…" }));
   const controller = new AbortController(); slot.readController = controller;
+  const current = () => connectionCurrent(owner) && memoryDialogCurrent(slot) && slot.readController === controller && !controller.signal.aborted;
   try {
-    const item = await request(`/memories/${encodeURIComponent(slot.id)}`, { signal: controller.signal, cache: "no-store" });
-    if (!memoryDialogCurrent(slot) || slot.readController !== controller) return;
+    const item = await ownedRequest(`/memories/${encodeURIComponent(slot.id)}`, { signal: controller.signal, cache: "no-store" }, owner);
+    if (!current()) return;
     if (String(item?.id) !== slot.id) throw new Error("记忆响应不一致，请重新核查。");
     slot.item = item; slot.sourceId = item.source_id;
     if (editing) renderMemoryCorrection(slot);
     else renderMemoryEvidence(slot);
   } catch (error) {
-    if (memoryDialogCurrent(slot) && slot.readController === controller) memoryUnavailable(slot, error.status === 404 ? "记忆已不可用。" : error.message);
-  } finally { if (slot.readController === controller) slot.readController = null; }
+    if (current()) memoryUnavailable(slot, error.status === 404 ? "记忆已不可用。" : error.message);
+  } finally { if (current()) slot.readController = null; }
 }
 
 function renderMemoryCorrection(slot) {
@@ -2374,25 +2376,27 @@ function validMemorySource(page, slot, offset) {
 }
 
 async function loadMemorySource(slot, offset, index) {
-  if (!memoryDialogCurrent(slot) || slot.editing || slot.sourceController || !slot.item?.origin) return;
+  const owner = connection;
+  if (!connectionCurrent(owner) || !memoryDialogCurrent(slot) || slot.editing || slot.sourceController || !slot.item?.origin) return;
   const origin = slot.item.origin;
   if (!origin.digest || origin.id !== slot.item.source_id) { memoryUnavailable(slot, "原文关联已变化，请重新核查。"); return; }
   const controller = new AbortController(); slot.sourceController = controller;
+  const current = () => connectionCurrent(owner) && memoryDialogCurrent(slot) && slot.sourceController === controller && !controller.signal.aborted;
   slot.sourceError = ""; slot.sourceRetry = { offset, index }; renderMemorySource(slot);
   try {
     const query = new URLSearchParams({ offset_bytes: String(offset), revision: origin.digest });
     if (slot.catalogSource) query.set("id", slot.sourceId);
     const path = slot.catalogSource ? `/memory/source?${query}` : `/memories/${encodeURIComponent(slot.id)}/source?${query}`;
-    const page = await request(path, { signal: controller.signal, cache: "no-store" });
-    if (!memoryDialogCurrent(slot) || slot.sourceController !== controller) return;
+    const page = await ownedRequest(path, { signal: controller.signal, cache: "no-store" }, owner);
+    if (!current()) return;
     if (!validMemorySource(page, slot, offset)) { memoryUnavailable(slot, "原文响应不一致，请重新核查。"); return; }
     slot.page = page; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
   } catch (error) {
-    if (!memoryDialogCurrent(slot) || slot.sourceController !== controller) return;
+    if (!current()) return;
     if ([404, 409].includes(error.status)) { memoryUnavailable(slot, error.status === 404 ? "原文已不可用。" : "原文已更新，请重新核查。"); return; }
     slot.sourceError = error.message;
   } finally {
-    if (memoryDialogCurrent(slot) && slot.sourceController === controller) { slot.sourceController = null; renderMemorySource(slot); }
+    if (current()) { slot.sourceController = null; renderMemorySource(slot); }
   }
 }
 
@@ -2426,12 +2430,14 @@ function renderMemorySource(slot) {
 }
 
 async function loadMemoryHistory(slot) {
-  if (!memoryDialogCurrent(slot) || slot.editing || slot.historyController) return;
+  const owner = connection;
+  if (!connectionCurrent(owner) || !memoryDialogCurrent(slot) || slot.editing || slot.historyController) return;
   const controller = new AbortController(); slot.historyController = controller;
+  const current = () => connectionCurrent(owner) && memoryDialogCurrent(slot) && slot.historyController === controller && !controller.signal.aborted;
   slot.historyList.replaceChildren(element("p", { class: "settings-role-hint", text: "正在读取…" }));
   try {
-    const revisions = collection(await request(`/memories/${encodeURIComponent(slot.id)}/revisions`, { signal: controller.signal, cache: "no-store" }));
-    if (!memoryDialogCurrent(slot) || slot.historyController !== controller) return;
+    const revisions = collection(await ownedRequest(`/memories/${encodeURIComponent(slot.id)}/revisions`, { signal: controller.signal, cache: "no-store" }, owner));
+    if (!current()) return;
     slot.historyList.replaceChildren();
     if (!revisions.length) slot.historyList.append(element("p", { class: "settings-role-hint", text: "暂无修改记录。" }));
     for (const revision of revisions) {
@@ -2440,10 +2446,10 @@ async function loadMemoryHistory(slot) {
     }
     slot.historyLoaded = true;
   } catch (error) {
-    if (!memoryDialogCurrent(slot) || slot.historyController !== controller) return;
+    if (!current()) return;
     if ([404, 409].includes(error.status)) { memoryUnavailable(slot, "记忆已变化，请重新核查。"); return; }
     slot.historyList.replaceChildren(element("p", { class: "form-error", text: error.message }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemoryHistory(slot) }));
-  } finally { if (slot.historyController === controller) slot.historyController = null; }
+  } finally { if (current()) slot.historyController = null; }
 }
 
 function workflowActivityCurrent(slot) {

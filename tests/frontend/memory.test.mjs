@@ -441,6 +441,47 @@ test("switching entries ignores a late old detail and does not replace the curre
   assert.equal(h.ui.slot.id, other.id); assert.ok(h.body().includes(other.content)); assert.equal(h.body().includes("当前记忆："), false);
 });
 
+for (const reader of ["detail", "source", "history"]) {
+  test(`a previous connection's late ${reader} 401 cannot log out or clear the new memory dialog`, async () => {
+    const pending = deferred(), item = fixtureMemory();
+    const other = fixtureMemory("memory-two", { content: "NEW_CONNECTION_MEMORY" });
+    const itemPath = `/memories/${item.id}`, otherPath = `/memories/${other.id}`;
+    const h = harness(async (path) => {
+      if (path === otherPath) return other;
+      if (path === itemPath) return reader === "detail" ? pending.promise : item;
+      if (reader === "source" && path.startsWith(`${itemPath}/source?`)) return pending.promise;
+      if (reader === "history" && path === `${itemPath}/revisions`) return pending.promise;
+      throw new Error(`unexpected request: ${path}`);
+    });
+    const opening = h.ui.showMemoryEvidence(item.id);
+    if (reader !== "detail") {
+      await opening;
+      await h.expand(reader === "source" ? "查看原文" : "修改历史");
+    }
+    const oldRequest = h.requests.at(-1);
+    assert.equal(oldRequest.cache, "no-store"); assert.equal(oldRequest.signal.aborted, false);
+    h.ui.activateConnection();
+    await h.ui.showMemoryEvidence(other.id);
+    const slot = h.ui.slot, body = h.body(), action = h.button("更正");
+    const title = h.document.querySelector("#dialog-title").textContent;
+    const requestCount = reader === "detail" ? 2 : 3;
+    assert.equal(oldRequest.signal.aborted, true);
+    assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.dialog.open, true);
+    assert.equal(slot.id, other.id); assert.ok(body.includes(other.content)); assert.ok(action);
+    assert.equal(h.requests.length, requestCount); assert.equal(h.requests.at(-1).path, otherPath);
+
+    // The handler deliberately ignores abort: a queued old 401 still reaches the real request helper.
+    pending.reject(new ApiError("OLD_CONNECTION_401", 401));
+    await opening; await flush();
+    assert.equal(h.ui.state.auth.authenticated, true);
+    assert.equal(h.ui.slot === slot, true); assert.equal(h.dialog.open, true);
+    assert.equal(h.body(), body); assert.equal(h.document.querySelector("#dialog-title").textContent, title);
+    assert.equal(h.button("更正") === action, true);
+    assert.equal(h.requests.length, requestCount, "a stale read must not retry or reopen evidence");
+    assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+  });
+}
+
 test("closing aborts and clears source/history, and both late responses remain invisible", async () => {
   const source = deferred(), history = deferred(), item = fixtureMemory();
   const h = harness(async (path) => path.includes("/source?") ? source.promise : path.endsWith("/revisions") ? history.promise : item);
