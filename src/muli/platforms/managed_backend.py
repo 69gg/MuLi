@@ -437,7 +437,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             )
             if self._disk().digests != expected:
                 raise ObservationError("foreign_managed_binding")
-            # Only the synchronous install-files or start caller may share its batch.
+            # Only an adjacent synchronous file caller may share its batch.
             # Every full guard and exact disk check must succeed before promotion.
             batch.python = self.controller_slot.resolved_python
             batch.packages = observed_packages
@@ -515,8 +515,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 return "base" if current_role is None else current_role
             return None
 
+        postproofs = _FileProofs() if lease is not None else None
         try:
-            after = await self._probe(record, postprocess=match)
+            if postproofs is None:
+                after = await self._probe(record, postprocess=match)
+            else:
+                after = await self._probe(record, postprocess=match, postproofs=postproofs)
             if self._stopped(after.service) and lease is not None:
                 lease.check()
                 empty = self.cgroups.empty(after.service.unit.cgroup)
@@ -525,7 +529,13 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 )
                 if empty and disk.digests == _files(record.binding(desired)):
                     self._desired(record, desired)
-                    disk = self._confirm(record, desired, lease, after.service.unit.cgroup)
+                    disk = self._confirm(
+                        record, desired, lease, after.service.unit.cgroup, proofs=postproofs
+                    )
+                    # The following observation must authenticate its own bytes.
+                    assert postproofs is not None
+                    postproofs.python = None
+                    postproofs.packages = None
                     confirmed = await self._probe(record)
                     if confirmed != after or disk != self._disk():
                         raise ObservationError("transaction_observation_changed")
@@ -534,6 +544,9 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                             record.position, desired, *disk.digests, loaded_unit=disk.unit.digest
                         )
         finally:
+            if postproofs is not None:
+                postproofs.python = None
+                postproofs.packages = None
             if lease is not None:
                 lease.__exit__()
         state: Literal["running", "stopped", "starting", "stopping", "foreign"]
@@ -753,9 +766,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         data: RoleSnapshots,
         lease: FixedLock,
         cgroup: str,
+        *,
+        proofs: _FileProofs | None = None,
     ) -> None:
-        # This scope never awaits or returns its proofs to the async installer.
-        proofs = _FileProofs()
+        # The caller may lend its immediately preceding post-probe bytes only
+        # to this synchronous scope, then clears them before the next await.
+        batch = _FileProofs() if proofs is None else proofs
 
         def guard() -> None:
             observed_packages: PackageProofs = {}
@@ -764,14 +780,14 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 role,
                 lease,
                 cgroup,
-                verified_python=proofs.python,
-                verified_packages=proofs.packages,
+                verified_python=batch.python,
+                verified_packages=batch.packages,
                 observed_packages=observed_packages,
             )
             if self._disk().digests not in _prefixes(record):
                 raise ObservationError("foreign_managed_binding")
-            proofs.python = self.controller_slot.resolved_python
-            proofs.packages = observed_packages
+            batch.python = self.controller_slot.resolved_python
+            batch.packages = observed_packages
 
         order: tuple[Component, ...] = (
             ("configuration", "selector", "unit")
@@ -802,7 +818,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                         file.confirm(snapshot.digest, guard=guard)
                     else:
                         file.replace(snapshot.digest, desired, guard=guard)
-        self._confirm(record, role, lease, cgroup, proofs=proofs)
+        self._confirm(record, role, lease, cgroup, proofs=batch)
 
     async def install(
         self, record: TransactionRecordV2, role: Role, data: RoleSnapshots
@@ -825,26 +841,38 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 if self._disk().digests not in _prefixes(record):
                     raise ObservationError("foreign_managed_binding")
 
-            if before != await self._probe(record, preflight=guard):
-                raise ObservationError("transaction_observation_changed")
-            self._install_files(record, role, data, lease, cgroup)
-            fresh = await self._probe(record)
-            if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
-                raise ObservationError("transaction_observation_changed")
-            if not fresh.unit_confirmed:
-                guard()
-                await self._command("daemon-reload")
-                fresh = await self._probe(record, preflight=guard)
-            if (
-                not self._stopped(fresh.service)
-                or not fresh.unit_confirmed
-                or fresh.disk_unit != record.binding(role).unit.digest
-            ):
-                raise ObservationError("managed_unit_not_loaded")
-            disk = self._confirm(record, role, lease, cgroup)
-            return BindingConfirmation(
-                record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
-            )
+            postproofs = _FileProofs()
+            try:
+                if before != await self._probe(record, preflight=guard, postproofs=postproofs):
+                    raise ObservationError("transaction_observation_changed")
+                self._install_files(record, role, data, lease, cgroup, proofs=postproofs)
+            finally:
+                postproofs.python = None
+                postproofs.packages = None
+            final_postproofs = _FileProofs()
+            try:
+                fresh = await self._probe(record, postproofs=final_postproofs)
+                if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
+                    raise ObservationError("transaction_observation_changed")
+                if not fresh.unit_confirmed:
+                    guard()
+                    final_postproofs.python = None
+                    final_postproofs.packages = None
+                    await self._command("daemon-reload")
+                    fresh = await self._probe(record, preflight=guard, postproofs=final_postproofs)
+                if (
+                    not self._stopped(fresh.service)
+                    or not fresh.unit_confirmed
+                    or fresh.disk_unit != record.binding(role).unit.digest
+                ):
+                    raise ObservationError("managed_unit_not_loaded")
+                disk = self._confirm(record, role, lease, cgroup, proofs=final_postproofs)
+                return BindingConfirmation(
+                    record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
+                )
+            finally:
+                final_postproofs.python = None
+                final_postproofs.packages = None
 
     async def start(self, record: TransactionRecordV2, role: Role) -> None:
         if (record.phase, record.intent, role) not in {

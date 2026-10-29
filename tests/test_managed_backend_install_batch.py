@@ -94,9 +94,9 @@ async def test_install_batch_reuses_payload_bytes_with_all_required_guards(
         name = "controller" if leaf.is_relative_to(roots["controller"]) else "target"
         key = f"{name}/{leaf.relative_to(roots[name]).as_posix()}"
         actual_bytes[key] = observed.bytes
-        # The synchronous component loop and its first confirmation become one
-        # batch. Pre-probe guards and the final independent confirmation remain.
-        copies = 8 if name == "controller" else selected_copies
+        # Both post-probe guards lend controller bytes to their adjacent file
+        # batches. Every pre-probe guard and fresh post-await read remains.
+        copies = 6 if name == "controller" else selected_copies
         expected_bytes[key] = reads.sizes[leaf] * copies
     # Keep this failure to plain strings and integers, never a Host/identity graph.
     assert actual_bytes == expected_bytes
@@ -106,7 +106,6 @@ async def test_install_batch_proof_ends_before_the_third_probe_await(
     shared_host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     record = shared_host.install_intent()
-    controller = Path(shared_host.backend.controller_slot.package.root)
     reads = observe_payloads(shared_host, monkeypatch)
     checks = observe_checks(shared_host, monkeypatch)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -144,9 +143,10 @@ async def test_install_batch_proof_ends_before_the_third_probe_await(
     assert entered.is_set() and shared_host.probe.count == 3
     assert len(checks) - checks_at_await == 8
     for leaf, observed in reads.leaves.items():
-        # The probe's post-await controller guard hashes once, then the final
-        # confirmation must start fresh for both controller and selected slot.
-        copies = 2 if leaf.is_relative_to(controller) else 1
+        # The probe independently reads controller bytes after its await; only
+        # those new bytes may reach the adjacent final confirmation. The target
+        # has not yet been authenticated in this segment, so it is fully read.
+        copies = 1
         actual = observed.bytes - bytes_at_await[leaf]
         assert actual == reads.sizes[leaf] * copies, (leaf.name, actual, copies)
     assert shared_host.record().position == record.position

@@ -10,11 +10,27 @@
 自动并发。该结构只重叠等待，不减少 RPC、扫描或总 CPU 工作；离线调度与启用路由
 分别验证，不能替代原 Case60 / harness90 / cleanup5 和资源门内三代完整投影验收。
 
-当前仍未通过原生三事务验收。此前候选 `b9cbf779` 的
-[原生作业](https://github.com/69gg/MuLi/actions/runs/40779572918/job/123137511753)
-首代 adopt 在 35352 毫秒完成完整投影；第二代在 55244 毫秒进入 start_target，
-60002 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。cleanup 已核验。
-应用 canonical 绑定只观察到两个已独立认证的 source，不能覆盖 helper 成本或补为零。
+当前仍未通过原生三事务验收。候选 H `6f3eac519b0da5c1fcc88085788a8d859efe1119` 的
+[原生作业](https://github.com/69gg/MuLi/actions/runs/40929886029/job/123645186901)
+首代 adopt 在 34624 毫秒完成完整投影；第二代在 53955 毫秒进入 start_target，
+60000 毫秒以 `TimeoutError` / `helper_exit` 结束，第三代未开始。cleanup 已核验，
+其余十七项作业成功。既有完整 Python 为 31625840 字节、每安装包为 199 文件 /
+3408537 字节；helper 原限额为 25% CPU，不能将 manager 的 100% 配额当作 helper 配额。
+应用 canonical 绑定成本只覆盖已独立认证的应用 source，不能覆盖 helper 成本或补为零。
+
+下一最小候选只接通现有 `_FileProofs` 的三段同步交接：停止态观察第二次 probe 到
+确认、安装 writer-held probe 到三文件效果、安装最终 probe 到确认（含 reload 分支）。
+全部原 guard 和效果仍执行；只复用独立 post-await 完整认证刚读到的精确身份内容，
+选中 role 无证明仍完整读取。下一真实 await 及失败退出前显式清空证明，不缓存整次
+检查、元数据、revision、期限、租约或 cgroup 授权。运行态普通 observation 保持原接口。
+
+三条实际 payload 计数红测覆盖 target/base 和 reload，共八项：H 上原操作、完整
+`_check` 序列、FD/path 身份、枚举、lease/CAS 和效果断言均先通过，唯一失败是三个
+同步段分别多读一份 controller/Python 内容（7.88 秒；守卫 8.939 秒、峰值 76.5 MiB）。
+新增独立负控覆盖文件/元数据变化、同字节新 inode、私有权限与路径、角色完整读取、
+revision/lease/deadline/cgroup、错误优先级及下一实际 await 内的变化和取消。
+修后回归、独立审查和新的精确候选原生验收仍待收取；这些读取计数不证明原 60 秒
+三事务门已解决，完整 fixture、原限额与 Case60 / harness90 / cleanup5 保持。
 
 此前去观察扰动的托管对照使 prepare 生成 hook 不再导入或调用
 `install_helper_cost_hook()`，worker 中观察器实现保留，离线正控显式安装并继续覆盖
