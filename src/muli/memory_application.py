@@ -832,6 +832,70 @@ class MemoryApplication:
             return []
         pipeline, generation = self.pipeline, self._attachment_generation
 
+        async def correct(args: dict[str, Any]) -> dict[str, Any]:
+            active_tool = runtime._active_tool.get()
+            if (
+                active_tool is None
+                or active_tool.name != "memory_correct"
+                or active_tool.handler is not correct
+            ):
+                raise PermissionError("记忆更正需要本次主助手的真实工具调用")
+            self._attachment_guard(pipeline, generation, tool_name="memory_correct")
+            if not runtime.config.settings.memory.enabled:
+                raise PermissionError("记忆未启用，不能更正")
+            if args.keys() != {"id", "expected_version", "content", "entities", "relations"}:
+                raise EvidenceError(
+                    "invalid_arguments", "更正只接受准确 ID、版本、正文和完整实体关系"
+                )
+            identifier = args["id"]
+            if not isinstance(identifier, str) or not identifier:
+                raise EvidenceError("invalid_arguments", "更正需要准确的记忆 ID")
+            validate_integer(args["expected_version"], "expected_version", minimum=1)
+            if (
+                not isinstance(args["content"], str)
+                or not isinstance(args["entities"], list)
+                or not isinstance(args["relations"], list)
+                or any(
+                    not isinstance(edge, dict) or edge.keys() != {"subject", "predicate", "object"}
+                    for edge in args["relations"]
+                )
+            ):
+                raise EvidenceError("invalid_arguments", "正文、完整实体列表或完整关系列表格式无效")
+            item = runtime.memory.get(identifier)
+            if item is None:
+                raise EvidenceError("evidence_not_found", "记忆不存在或已忘记")
+            if item["kind"] not in {"fact", "preference", "procedure"}:
+                raise EvidenceError("invalid_arguments", "只能更正事实、偏好或步骤，不修改原文副本")
+            if item["status"] == "superseded":
+                raise EvidenceError("evidence_changed", "该记忆已被取代，请重新核对当前结论")
+            validate_integer(item["version"], "version", minimum=1)
+            if item["version"] != args["expected_version"]:
+                raise EvidenceError("evidence_changed", "记忆版本已变化，请重新核对后再更正")
+            changes = {key: args[key] for key in ("content", "entities", "relations")}
+            changes["content"] = changes["content"].strip()
+            changed = any(changes[key] != item[key] for key in changes)
+            next_version = item["version"] + int(changed)
+            validate_integer(next_version, "version", minimum=1)
+            receipt = {
+                "id": identifier,
+                "old_version": item["version"],
+                "new_version": next_version,
+                "changed": changed,
+            }
+            if json_size(receipt) > runtime.config.settings.limits.max_output_chars:
+                raise EvidenceError("output_budget", "记忆更正回执超过输出预算，未更正")
+            # No await separates owner admission, the complete receipt budget
+            # and Memory.edit's final version check and existing atomic writer.
+            updated = runtime.memory.edit(
+                identifier, expected_version=args["expected_version"], **changes
+            )
+            if changed:
+                await runtime.bus.emit(
+                    "memory.updated",
+                    {"memory_ids": [identifier], "source_id": updated["source_id"]},
+                )
+            return receipt
+
         async def reindex(args: dict[str, Any]) -> Any:
             self._attachment_guard(pipeline, generation, tool_name="memory_reindex")
             receipt = self.reindex(args)
@@ -856,6 +920,30 @@ class MemoryApplication:
             return result
 
         return [
+            Tool(
+                "memory_correct",
+                "主人明确要求后，按 memory_query 返回的准确条目 ID 和 version 更正一条事实、偏好或步骤；"
+                "正文、实体和关系完整替换，保留来源身份、原文和修订；过期先重新核对，不自动重写",
+                parameters(
+                    {
+                        "id": string("memory_query 返回的准确条目 ID，不是来源 ID"),
+                        "expected_version": {"type": "integer", "minimum": 1},
+                        "content": string("更正后的完整结论；不修改来源原文"),
+                        "entities": {"type": "array", "items": string()},
+                        "relations": {
+                            "type": "array",
+                            "items": parameters(
+                                {"subject": string(), "predicate": string(), "object": string()},
+                                ("subject", "predicate", "object"),
+                            ),
+                        },
+                    },
+                    ("id", "expected_version", "content", "entities", "relations"),
+                ),
+                correct,
+                "write",
+                preserve_output=True,
+            ),
             Tool(
                 "memory_retry_source",
                 "主人明确要求后，按memory_sources/memory_source返回的准确source_id和revision，"
