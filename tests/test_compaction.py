@@ -277,7 +277,12 @@ async def test_background_summary_never_takes_the_only_foreground_slot(
     tmp_path: Path, foreground: str
 ) -> None:
     runtime, seen = make_runtime(tmp_path, [])
-    runtime.config.update({"limits": {"max_parallel_agents": 1, "max_context_chars": 5000}})
+    runtime.config.update(
+        {
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
+            "limits": {"max_parallel_agents": 1, "max_context_chars": 5000},
+        }
+    )
     await runtime.reconfigure()
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -318,7 +323,12 @@ async def test_final_stream_idle_boundary_adopts_ready_summary_and_releases_job_
 ) -> None:
     runtime, seen = make_runtime(tmp_path, [])
     runtime.config.update(
-        {"limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000}}
+        {
+            # Exercise summary adoption under the original budget independently
+            # of unrelated additions to the shipped persona.
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
+            "limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000},
+        }
     )
     await runtime.reconfigure()
     prepared, release = asyncio.Event(), asyncio.Event()
@@ -368,7 +378,14 @@ async def test_terminal_run_releases_summary_budget_for_another_session(
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [ModelTurn(content="本轮完成")])
     runtime.config.update(
-        {"limits": {"max_parallel_agents": 1, "max_pending_runs": 1, "max_context_chars": 5000}}
+        {
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
+            "limits": {
+                "max_parallel_agents": 1,
+                "max_pending_runs": 1,
+                "max_context_chars": 5000,
+            },
+        }
     )
     await runtime.reconfigure()
     foreground_entered, foreground_release = asyncio.Event(), asyncio.Event()

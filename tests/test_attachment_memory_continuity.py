@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -378,9 +378,17 @@ async def test_collected_attachment_survives_compaction_cross_phone_reopen_and_f
             self.role = role
             self.round = 0
 
-        async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+        async def complete(
+            self,
+            messages: list[Message],
+            tools: Any = (),
+            *,
+            attempt_guard: Callable[[], None] | None = None,
+        ) -> ModelTurn:
             if self.role == "reviewer":
-                return await super().complete(messages, tools)
+                return await super().complete(messages, tools, attempt_guard=attempt_guard)
+            if attempt_guard is not None:
+                attempt_guard()
             assert not tools
             if self.role == "compactor":
                 return ModelTurn(content=summary)

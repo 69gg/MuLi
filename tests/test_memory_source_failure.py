@@ -55,7 +55,7 @@ def pipeline(tmp_path: Path) -> Iterator[MemoryPipeline]:
 
 def collect(pipeline: MemoryPipeline, *, format_name: str = "text") -> str:
     identifier, text = new_id(), "私有收藏正文🙂：核对所有附件摘要。"
-    if format_name == "text":
+    if format_name in {"text", "asr"}:
         checksum = hashlib.sha256(text.encode()).hexdigest()
         document = None
     else:
@@ -66,7 +66,9 @@ def collect(pipeline: MemoryPipeline, *, format_name: str = "text") -> str:
             "source_revision": checksum,
             "revision": document_revision(checksum, text.encode()),
         }
-    source = attachment_source(identifier, text, checksum, now(), document=document)
+    source = attachment_source(
+        identifier, text, checksum, now(), document=document, transcript=format_name == "asr"
+    )
     pipeline.ingest(source)
     return source["id"]
 
@@ -89,7 +91,7 @@ def source_for(pipeline: MemoryPipeline, event: dict[str, Any]) -> AttentionSour
     )
 
 
-@pytest.mark.parametrize("format_name", ["text", "pdf", "docx"])
+@pytest.mark.parametrize("format_name", ["text", "pdf", "docx", "asr"])
 async def test_real_collected_source_has_one_complete_private_terminal_proof(
     pipeline: MemoryPipeline, format_name: str
 ) -> None:
@@ -113,6 +115,12 @@ async def test_real_collected_source_has_one_complete_private_terminal_proof(
     assert detail["source_id"] == source_id and detail["revision"] == proof.revision
     assert "私有收藏正文" not in source.detail
     assert "PRIVATE_SOURCE_OR_UPSTREAM_CREDENTIAL" not in json.dumps(events)
+    if format_name == "asr":
+        assert detail["evidence_scope"] == "asr_transcript_text"
+        assert ":transcript:v1:asr_text:" in detail["source"]
+        assert "不证明原音频" in detail["notice"]
+    else:
+        assert "evidence_scope" not in detail
     await pipeline._publish(source_id)
     await pipeline._run_job(source_id)
     assert len(failure_events(pipeline.memory.store)) == 1

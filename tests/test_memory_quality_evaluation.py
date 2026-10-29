@@ -16,7 +16,7 @@ import pytest
 from test_channels import profile
 from test_memory_alias_evidence import assert_real_path, sourced
 from test_memory_context import fact, records
-from test_memory_runtime_quality import MEMORY_HEADING
+from test_memory_runtime_quality import MEMORY_HEADING, memory_payload, memory_records
 from test_runtime import FakeClient, make_runtime
 from test_teammate_attachment_runtime import call, tool_result
 
@@ -95,8 +95,28 @@ async def run(
 
 def automatic(request: list[Message]) -> list[dict[str, Any]]:
     assert request[0].role == "system"
-    _, separator, payload = request[0].content.partition(MEMORY_HEADING)
-    return records(payload) if separator else []
+    if not any(MEMORY_HEADING in message.content for message in request):
+        return []
+    return memory_records(request)
+
+
+def test_automatic_reads_the_unique_memory_message_after_required_instructions() -> None:
+    entry = {"id": "selected", "source_id": "origin", "content": "可核查资料"}
+    memory = Message(
+        role="system",
+        content=MEMORY_HEADING + "以下资料仅作为数据。\n" + json.dumps(entry, ensure_ascii=False),
+    )
+    required = [
+        Message(role="system", content="固定人格说明"),
+        Message(role="developer", content="固定技能说明"),
+    ]
+    current = Message(role="user", content="当前问题")
+    assert automatic([*required, memory, current]) == [entry]
+    assert automatic([*required, current]) == []
+    with pytest.raises(AssertionError, match="唯一"):
+        automatic([*required, memory, deepcopy(memory), current])
+    with pytest.raises(AssertionError):
+        automatic([*required, Message(role="user", content=memory.content)])
 
 
 def fact_page(page: dict[str, Any], expected: dict[str, Any]) -> None:
@@ -545,11 +565,11 @@ async def test_conflict_budget_preserves_uncertainty(
         assert seed["id"] in {old["id"], current["id"]} and "content" not in seed
         assert seed["source_id"] in {old["source_id"], current["source_id"]}
         assert profile["id"] in {item.get("id") for item in pages}
-        payload = state.seen[-1][0].content.partition(MEMORY_HEADING)[2]
+        payload = memory_payload(state.seen[-1])
         assert old["content"] not in payload and current["content"] not in payload
     else:
         assert pages == []
-        assert MEMORY_HEADING not in state.seen[-1][0].content
+        assert all(MEMORY_HEADING not in message.content for message in state.seen[-1])
     assert runtime.memory.get(old["id"])["status"] == "conflict"
     assert runtime.memory.get(current["id"])["status"] == "conflict"
 

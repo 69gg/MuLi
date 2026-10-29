@@ -108,7 +108,7 @@ def main() -> None:
     plugins = commands.add_parser("plugins", help="检查插件，或停机后调整下次启动的启停设置")
     plugins.add_argument("action", choices=["inspect", "enable", "disable"])
     plugins.add_argument("identifier", help="插件目录 ID")
-    commands.add_parser("upgrade-channel-ownership", help="停机后升级旧渠道数据格式（仅 Linux）")
+    commands.add_parser("upgrade-channel-ownership", help="停机后升级支持的旧数据格式（仅 Linux）")
     args = parser.parse_args()
     if args.command not in {None, "serve", "upgrade-channel-ownership"}:
         from muli.managed_cli import route_command

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Self
@@ -112,16 +112,29 @@ class ModelClient:
             raise ProviderError("模型请求头配置无效") from None
 
     async def complete(
-        self, messages: Sequence[Message], tools: Sequence[JsonObject] = ()
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[JsonObject] = (),
+        *,
+        attempt_guard: Callable[[], None] | None = None,
     ) -> ModelTurn:
         """stream 配置控制上游请求方式，调用方始终获得完整回合。"""
-        async for event in self.stream(messages, tools):
+        events = (
+            self.stream(messages, tools)
+            if attempt_guard is None
+            else self.stream(messages, tools, attempt_guard=attempt_guard)
+        )
+        async for event in events:
             if event.kind == "done" and event.turn is not None:
                 return event.turn
         raise ProviderError("模型没有返回完整回合")
 
     async def stream(
-        self, messages: Sequence[Message], tools: Sequence[JsonObject] = ()
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[JsonObject] = (),
+        *,
+        attempt_guard: Callable[[], None] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """done 前不执行工具；任何对外增量发出后均不自动重试。"""
         if self._closed:
@@ -130,6 +143,9 @@ class ModelClient:
         url = self.config.base_url.rstrip("/") + _ENDPOINTS[self.config.protocol]
         emitted = False
         for attempt in range(self.config.max_retries + 1):
+            # A rejected source is not an upstream failure and must never retry.
+            if attempt_guard is not None:
+                attempt_guard()
             error: ProviderError
             try:
                 async with self._client.stream(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -152,7 +152,15 @@ async def test_completed_report_is_recalled_with_its_source_after_team_compactio
             super().__init__([], [])
             self.role, self.round = role, 0
 
-        async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+        async def complete(
+            self,
+            messages: list[Message],
+            tools: Any = (),
+            *,
+            attempt_guard: Callable[[], None] | None = None,
+        ) -> ModelTurn:
+            if attempt_guard is not None:
+                attempt_guard()
             if self.role in complete_calls:
                 complete_calls[self.role] += 1
             assert self.role == "memory-extractor" and not tools

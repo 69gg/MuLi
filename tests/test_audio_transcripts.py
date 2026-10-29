@@ -339,6 +339,49 @@ async def test_reader_rejects_same_size_hash_drift(host: Host) -> None:
     assert caught.value.code == "transcript_changed"
 
 
+async def test_complete_reader_uses_saved_bytes_beyond_preview_without_another_asr(
+    host: Host,
+) -> None:
+    host.text = ("完整转写🙂\n" * 300) + "只在全文末段的标记"
+    result = await host.transcribe()
+    expected = host.text.encode("utf-8")
+    assert result["has_more"] and "只在全文末段的标记" not in result["text"]
+    limit = [len(expected)]
+    item, raw = await host.services.transcripts.read_complete(
+        result["transcript_id"], revision=result["revision"], max_bytes=lambda: limit[0]
+    )
+    assert raw == expected and len(raw) == item["size"]
+    assert item["source"] == "asr" and item["sha256"] == result["revision"]
+    limit[0] -= 1
+    with pytest.raises(EvidenceError):
+        await host.services.transcripts.read_complete(
+            result["transcript_id"], revision=result["revision"], max_bytes=lambda: limit[0]
+        )
+    assert len(host.requests) == 1
+
+
+async def test_complete_reader_rechecks_hot_budget_after_owned_read(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import muli.transcripts as module
+
+    result = await host.transcribe()
+    limit = [host.attachments.get(result["transcript_id"])["size"]]
+    original = module.file_io
+
+    async def shrink(operation: Callable[[], bytes]) -> bytes:
+        raw = await original(operation)
+        limit[0] -= 1
+        return raw
+
+    monkeypatch.setattr(module, "file_io", shrink)
+    with pytest.raises(EvidenceError, match="读取上限"):
+        await host.services.transcripts.read_complete(
+            result["transcript_id"], revision=result["revision"], max_bytes=lambda: limit[0]
+        )
+    assert len(host.requests) == 1
+
+
 async def test_reader_rejects_metadata_change_during_owned_file_read(
     host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -39,6 +39,7 @@ from muli.tools.mcp_catalog import ContentError, fits_output
 from muli.tools.mcp_resources import ResourceSaveTarget
 from muli.transcripts import AudioTranscripts
 from muli.vision_archives import VisionArchives, bounded_preview
+from muli.web_reading import WebReading
 
 
 class LocalServices:
@@ -72,11 +73,13 @@ class LocalServices:
         )
         runtime.reading_pages = self.reading_pages
         self.reading_application = ReadingApplication(runtime, attachments, self.reading_pages)
+        self.web_reading = WebReading(runtime, attachments, self.reading_application)
         self.task_control.scheduled_replan_guard = lambda receipt, targets: (
             runtime.scheduled_task_replans.guard_receipt(receipt, targets)
         )
         runtime.add_tool_provider(self.tools, session_scoped=True)
         runtime.add_tool_provider(self.delivery_tools, coordinator=True, session_scoped=True)
+        runtime.add_tool_provider(self.web_reading.tools, coordinator=True, session_scoped=True)
         runtime.context_hooks.append(self.context)
 
     def media(self) -> MediaService:
@@ -280,6 +283,34 @@ class LocalServices:
         ):
             raise ValueError("文档正文为空、无效或超过完整来源上限，未收藏节选")
         return item, view
+
+    async def memory_transcript(self, identifier: str, revision: str) -> tuple[dict[str, Any], str]:
+        """Collect exactly one existing complete ASR artifact, never its source audio."""
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(ATTACHMENT_ID_PATTERN, identifier) is None
+        ):
+            raise ValueError("转写收藏需要准确的转写工件 ID")
+
+        def byte_limit() -> int:
+            settings = self.runtime.config.settings
+            return min(
+                settings.limits.max_file_bytes,
+                settings.uploads.max_file_bytes,
+                settings.memory.max_source_chars * 4,
+            )
+
+        item, raw = await self.transcripts.read_complete(
+            identifier, revision=revision, max_bytes=byte_limit
+        )
+        content = raw.decode("utf-8", errors="strict")
+        if (
+            not content.strip()
+            or "\x00" in content
+            or len(content) > self.runtime.config.settings.memory.max_source_chars
+        ):
+            raise ValueError("转写为空、无效或超过完整来源上限，未收藏节选")
+        return item, content
 
     def delivery_tools(self, runtime: Runtime) -> list[Tool]:
         identifier = runtime.tool_session_id

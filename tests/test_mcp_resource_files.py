@@ -55,6 +55,7 @@ async def test_explicit_resource_save_persists_one_complete_attachment_through_r
     runtime = setup_runtime(tmp_path)
     runtime.config.update(
         {
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
             "models": {
                 "main": {
                     "model": "offline",

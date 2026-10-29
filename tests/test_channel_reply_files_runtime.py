@@ -447,6 +447,9 @@ async def test_unknown_file_reply_survives_reopen_and_exact_envelope_replay_with
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update(
         {
+            # Delivery persistence and replay use the same bounded fixture on
+            # reopen; shipping persona growth must not clip the status JSON.
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
             "default_mode": "yolo",
             "updates": {"check_on_start": False},
             "memory": {"auto_extract": False},

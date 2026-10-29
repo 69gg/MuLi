@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from muli.attachment_memory_source import attachment_source
 from muli.attachments import Attachments
 from muli.config import ConfigFile, ModelProfile, Settings
 from muli.local_services import LocalServices
@@ -245,10 +248,23 @@ async def test_internal_compaction_and_extraction_keep_their_original_caps(
         memory = MemoryApplication(runtime, lambda: MediaService(MediaConfig()))
         try:
             assert await runtime._summarize("待压缩资料", 512) == "有界摘要"
-            assert await memory.extract({"content": "只读来源", "trusted_owner": False}) == {
+            attachments = Attachments(runtime.store, tmp_path / "attachments", config)
+
+            async def chunks() -> AsyncIterator[bytes]:
+                yield "只读来源".encode()
+
+            item = await attachments.save(chunks(), "caps.txt", "text/plain", source="web")
+            source = attachment_source(item["id"], "只读来源", item["sha256"], item["created_at"])
+            memory.pipeline.ingest(source, trusted_owner=False)
+            await memory.start()
+            job = await asyncio.wait_for(memory.pipeline.wait(source["id"]), 4)
+            assert job is not None and job["state"] == "done"
+            assert job["checkpoint"]["extraction"] == {
                 "memories": [],
                 "aliases": {},
+                "rejected_untrusted_owner_claims": 0,
             }
+            assert len(requests) == 2
             assert requests[0]["max_completion_tokens"] == (128 if user_cap is not None else 512)
             assert requests[1]["max_completion_tokens"] == (128 if user_cap is not None else 4096)
             assert runtime.model_config("main").max_output_tokens == user_cap

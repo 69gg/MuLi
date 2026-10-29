@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -177,9 +177,17 @@ async def exercise_reindex(
             super().__init__([], [])
             self.role = role
 
-        async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+        async def complete(
+            self,
+            messages: list[Message],
+            tools: Any = (),
+            *,
+            attempt_guard: Callable[[], None] | None = None,
+        ) -> ModelTurn:
             if self.role == "reviewer":
-                return await super().complete(messages, tools)
+                return await super().complete(messages, tools, attempt_guard=attempt_guard)
+            if attempt_guard is not None:
+                attempt_guard()
             assert self.role == "memory-extractor" and not tools
             source = json.loads(messages[-1].content)
             memories: list[dict[str, Any]] = []

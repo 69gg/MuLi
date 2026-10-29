@@ -164,10 +164,18 @@ class Attachments:
         return int(row[0])
 
     async def save(
-        self, chunks: AsyncIterator[bytes], name: str, mime_type: str = "", *, source: str = "web"
+        self,
+        chunks: AsyncIterator[bytes],
+        name: str,
+        mime_type: str = "",
+        *,
+        source: str = "web",
+        commit_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         name = attachment_name(name)
         async with self.capacity:
+            if commit_guard is not None:
+                commit_guard()
             identifier = new_id()
             fd, temporary = tempfile.mkstemp(prefix=".upload-", dir=self.directory)
             target = self.directory / identifier
@@ -202,6 +210,8 @@ class Attachments:
                     "source": source,
                     "created_at": now(),
                 }
+                if commit_guard is not None:
+                    commit_guard()
                 os.replace(temporary, target)
                 self.store.put("attachment", item)
                 return self.public(item)

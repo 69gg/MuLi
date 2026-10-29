@@ -10,11 +10,13 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的当前正式版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。`configuration` 为 `reads=[2]`、`writes=2`，`ingress` 为 `reads=[4]`、`writes=4`；`objects`、`outbox` 仍为 `reads=[3]`、`writes=3`，`database`、`memory`、`install_profile` 仍为 `reads=[1]`、`writes=1`，对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧全 `1`、三域 `2` 或长期问题关注前的三域 `3` 库可直接启动新版。旧库需要[显式停机固定升级](channel-ownership-format-upgrade.md)；现有托管同格式协议继续拒绝跨格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。`configuration`、`memory` 为 `reads=[2]`、`writes=2`，`ingress` 为 `reads=[4]`、`writes=4`；`objects`、`outbox` 仍为 `reads=[3]`、`writes=3`，`database`、`install_profile` 仍为 `reads=[1]`、`writes=1`，对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧全 `1`、三域 `2`、长期问题关注前的三域 `3` 或 2.114 的 `memory=1` 完整库可直接启动新版。旧库需要[显式停机固定升级](channel-ownership-format-upgrade.md)；现有托管同格式协议继续拒绝跨格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 
 长期问题关注增加主配置 `memory_watches`，所以 `configuration` 改为 `2`；新增输入 `attention_memory_watch` 绑定可独立撤销的关注和来源证明，所以 `ingress` 改为 `4`。旧读取器不能忽略这些证明后继续调用模型或输出。独立版本化的 watch/match/completion 对象和可选 checkpoint 不重解释既有对象或原文修订，其他五域保持原值。即使没有 DDL 或业务行转换，也必须先在停机边界升级精确完整 marker；这不是托管同格式更新或旧版回退许可。详细边界见[长期问题关注合同](fresh-format-admission.md#长期问题关注的格式边界)。
+
+后续的 ASR 转写收藏需要 `memory=2`，其余六域不变。新来源明确保留派生转写身份，2.114 的恢复器不能解释它，不能以“表结构没变”认定兼容。新版能读取升级后留下的旧文本/文档 payload，不代表声明支持直接打开 `memory=1` 的库。失败/关注 proof 的持久字段不变，提醒说明从当前已核验来源计算。边界及冻结旧 reader 证据见 [ASR 来源合同](fresh-format-admission.md#asr-转写来源的格式边界)。
 
 正常关闭后的有限 shell 回执同样采用独立 `shell_receipt/version=1`，可淘汰且不含执行授权，不改配置或既有 unknown/权限语义；当前读取器对坏或未来记录返回 `content_unavailable`。格式上界、淘汰顺序及证据范围见[功能记录合同](fresh-format-admission.md#可淘汰的-shell-回执记录)。通用 Store 保留未知 kind 的回归与源码审查不等于实际运行旧发行包，不能扩大为任意历史包兼容承诺。
 

@@ -30,6 +30,8 @@
 
 到期给模型的可信事实条目公开 `followup` 定位，来源核验仍由宿主完成，正文不构成授权。沿原 Attention 只读工具限制，实际读取 `commitment_read` 和 `commitment_inspect(section=deliveries)`；有记录时再按准确单 ID 读取正文。回复区分登记时的宿主文件事实、模型判断、仍未验证的要求和下一步。旧单保留历史标记，不能用作当前验收。
 
+`commitment_read` 返回的当前任务页会完整送达下一次模型请求，与 `commitment_inspect` 一致。自动记忆或历史整理不会截断该页的 JSON 和正文；分页参数、读取范围和输出预算保持原有限制。必要内容整体放不下时会明确报错，助手可改读更小的页。
+
 `done/cancelled` 任务终止只读跟进；暂停或结果未知不触发恢复、批准、派工或重发。绑定不增加执行权限，不修改任务状态，也不自动发送文件。结果沿已有原来源投递和发送时 owner 重核；unknown 保留原回执，不重发。本片复用原 scheduler、Attention、ReplyOrigin 和 Store，不增加数据库、轮询模型或新前端面板。
 
 ## 单一正式旅程与首红边界

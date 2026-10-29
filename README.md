@@ -17,8 +17,8 @@ MuLi 是面向个人电脑的常驻助手。你可以和她聊天、交办任务
   <img src="https://raw.githubusercontent.com/69gg/MuLi/22433e03284bd8715972a3b71adeb21b1cf239c7/docs/screenshots/workbench-demo.gif" alt="沐璃新版工作台演示：输入任务、工具调用、人工批准和流式答复" width="960">
 </picture>
 
-- **一起做事**：搜索资料、管理文件、阅读与收藏 PDF、DOCX 正文，让多个 agent 分工、交流和复核。
-- **记住重要的事**：后台整理偏好、事实与关系，按问题查找记忆，保留可核对的原文。
+- **一起做事**：搜索资料、管理文件、阅读与收藏 PDF、DOCX 正文，[留存公开网页静态文本](docs/web-reading.md)并跨渠道续读，让多个 agent 分工、交流和复核。
+- **记住重要的事**：后台整理偏好、事实与关系，可明确收藏已有完整语音转写，按内容找回并核对转写文本。
 - **随时联系**：网页之外，可选接入 Telegram、OneBot/NapCat、QQ 官方机器人、微信 iLink 和 chiliarch。
 - **使用电脑**：按平台提供无障碍操作、截图与录屏，可收发文件、图片和语音。
 - **按你的习惯扩展**：配置模型、MCP、Agent Skills 和用户插件，通过自然语言让沐璃协助设置。
@@ -43,7 +43,7 @@ MuLi serve
 
 已有配置时，直接运行 `MuLi serve`。初始化默认尝试下载只读源码参考，不需要时可加 `--no-source`。
 
-保留数据从 v2.74 或更早版本升级时，先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。目前仅提供 Linux 非托管安装的升级入口。
+保留数据升级到 v2.115 时，包括 v2.114 的资料库，先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。目前仅提供 Linux 非托管安装的升级入口；其它平台和托管安装的旧库继续使用原版本，新装不受影响。
 
 配置、聊天、附件、记忆、插件和日志默认保存在 **`~/MuLi`**。已有配置不会被初始化覆盖；需要自定义位置时，见[配置与维护](docs/operations.md)。
 

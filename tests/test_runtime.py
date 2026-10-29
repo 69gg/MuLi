@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,15 @@ class FakeClient:
             yield StreamEvent("text_delta", text=turn.content)
         yield StreamEvent("done", turn=turn)
 
-    async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+    async def complete(
+        self,
+        messages: list[Message],
+        tools: Any = (),
+        *,
+        attempt_guard: Callable[[], None] | None = None,
+    ) -> ModelTurn:
+        if attempt_guard is not None:
+            attempt_guard()
         return ModelTurn(content='{"allow":true,"reason":"有界操作"}')
 
 
