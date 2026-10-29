@@ -333,7 +333,7 @@ def test_commit_denial_rolls_back_the_real_marker_transaction(
     assert snapshot(path) == before
 
 
-@pytest.mark.parametrize("platform", ["darwin", "win32"])
+@pytest.mark.parametrize("platform", ["win32", "unknown"])
 def test_non_linux_upgrade_refuses_before_touching_the_data_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:

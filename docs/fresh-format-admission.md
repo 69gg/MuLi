@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整全 `1`、旧 OneBot 三域 `2`、长期问题关注前四渠道格式、转写收藏前 2.114 精确格式或网页收藏前 `memory=2` 精确格式的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)。macOS、Windows 旧库与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。具有完整全 `1`、旧 OneBot 三域 `2`、长期问题关注前四渠道格式、转写收藏前 2.114 精确格式或网页收藏前 `memory=2` 精确格式的非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)。非托管 macOS 仅支持其中完整网页收藏前格式 `(1,3,2,4,3,2,1)`，并须满足指南中的既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -20,7 +20,9 @@
 
 锁使用数据库规范路径同目录下的固定 `.<数据库名>-initialization.lock`，POSIX 使用 `flock(LOCK_EX|LOCK_NB)`，Windows 使用 `msvcrt.locking(LK_NBLCK, 1)`。Windows 加解锁前均 seek 到 byte 0，锁区允许位于 EOF 后，无需写入占位字节。竞争立即以固定 `store_initialization_busy` 失败，不轮询，不退回无保护初始化；释放只关闭/解锁，不删除固定 inode。POSIX 还核验锁文件归属及私有权限，不 chmod 已有锁。[Python fcntl](https://docs.python.org/3/library/fcntl.html#fcntl.flock)、[Python msvcrt](https://docs.python.org/3/library/msvcrt.html#msvcrt.locking)
 
-文件描述符不可被 exec/subprocess 继承；这不等于对纯 fork 隔离描述符。构造链不使用 fork。该锁只串行合作构造器的分类与准备，不是运行期 writer lease，也不阻止已运行实例或任意同权限外部程序改库、换路径或改安装环境。规范路径可归并普通路径别名，不提供任意硬链接发现或恶意 ABA 防护。
+macOS 停机升级复用此固定锁，借用已锚定的既有父目录 fd，不 resolve、mkdir 或关闭所借 fd；进入及提交前后重核词法父路径、数据库、权限与固定锁身份。普通 Runtime 的规范路径和建目录默认行为不变。升级器在确认 SQLite 关闭后才释放独占；关闭失败保留资源，由显式 `retry_close()` 只重试清理。
+
+文件描述符不可被 exec/subprocess 继承；这不等于对纯 fork 隔离描述符。构造链不使用 fork。普通 `Store(path)` 只在构造期持锁；合作 Runtime 持有同一固定锁直到连接关闭，停机升级因此会拒绝仍在运行的合作实例。该锁不能阻止不合作的外部程序改库、换路径或改安装环境。规范路径可归并普通路径别名，不提供任意硬链接发现或恶意 ABA 防护。
 
 准备、核验或 marker 提交之前失败，连接和创建句柄关闭，文件不删除，已提交的准备事实可以保留为无标记 legacy。下一次打开已有文件没有独占创建资格，不自动补证，正常 Runtime 拒绝该库。若 COMMIT 或其后核验报错，调用者得不到可用 Store；不宣称能撤销可能已经提交的 marker。重开按实际持久事实重新分类：当前有效标记走禁止迁移，旧格式和无标记库不能进入正常 Runtime，坏标记直接拒绝。
 
@@ -62,7 +64,7 @@ ASR 转写收藏将当时的 `memory=1` 扩为 `memory=2`，新增 `attachment:<
 
 主人明确选定已留存快照后，主助手才可调用 `memory_import_webpage(id, revision)`，其中 `revision` 是该快照的完整附件摘要。只核验和登记本地全文，不重抓网站，也不只收藏阅读页、预览或摘录。默认捕获、阅读、书签、摘录、压缩和重开均不自动收藏；后台沿用既有提炼、分块、embedding 与遗忘边界，可能按已配置服务发送正文。收藏回执仅报告实际后台状态，不证明网页真实或当前有效。
 
-网页收藏前的 `memory=2` reader 只识别文本、文档和 ASR 来源，拒绝网页 marker；继续沿用旧完整声明会让整库准入与来源恢复的解释不一致。因此即使 DDL 没变，也须使用新完整合同。非托管 Linux 已有库必须停机，将精确旧七域 `(1,3,2,4,3,2,1)` 原子升级为当前 `(1,3,2,4,3,3,1)`；新建库直接发布当前合同。托管同格式协议不支持这次跨格式切换，macOS、Windows 的旧库仍拒绝升级；不能用旧版回退打开已升级数据。
+网页收藏前的 `memory=2` reader 只识别文本、文档和 ASR 来源，拒绝网页 marker；继续沿用旧完整声明会让整库准入与来源恢复的解释不一致。因此即使 DDL 没变，也须使用新完整合同。符合停机入口条件的非托管 Linux、macOS 已有库必须停机，将精确旧七域 `(1,3,2,4,3,2,1)` 原子升级为当前 `(1,3,2,4,3,3,1)`；新建库直接发布当前合同。托管同格式协议不支持这次跨格式切换，Windows 的旧库仍拒绝升级；不能用旧版回退打开已升级数据。
 
 [`format_admission_v2_118.py`](../tests/fixtures/format_admission_v2_118.py)、[`attachment_memory_source_v2_118.py`](../tests/fixtures/attachment_memory_source_v2_118.py) 与 [`compatibility_v2_118.json`](../tests/fixtures/compatibility_v2_118.json) 来自签名基线 `4c069a12cfe2bcbab062db44105c10de669861f3`，已由宿主核对签名 Git 对象和其冻结源码的原始字节；预期摘要固定在[格式回归](../tests/test_webpage_memory_format.py)。回归执行冻结旧 reader，并复用当前未变的共享模型与证据读取器；这不是旧 wheel、旧发行环境或任意历史版本的运行验证。
 

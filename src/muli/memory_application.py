@@ -642,6 +642,9 @@ class MemoryApplication:
         tool_name: str = "memory_import_attachment",
     ) -> PreparedRequest:
         runtime = self.runtime
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
         caller = runtime.tool_session_id
         owner = runtime._tool_execution.get()
         request = runtime.request_context(caller) if caller is not None else None
@@ -964,9 +967,10 @@ class MemoryApplication:
             def guard(expected_request: PreparedRequest | None = None) -> PreparedRequest:
                 active_tool = runtime._active_tool.get()
                 task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise asyncio.CancelledError
                 if (
                     task is None
-                    or task.cancelling()
                     or active_tool is None
                     or active_tool.name != tool_name
                     or active_tool.handler is not collect_transcript

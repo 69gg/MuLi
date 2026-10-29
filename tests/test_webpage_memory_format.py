@@ -202,11 +202,11 @@ def test_memory2_is_refused_before_construction_writes_or_business_recovery(
             db.execute("SELECT 1")
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux exclusive fixed upgrade")
+@pytest.mark.skipif(sys.platform not in {"linux", "darwin"}, reason="POSIX stopped fixed upgrade")
 async def test_memory2_upgrade_preserves_sources_checkpoints_tombstones_and_watch_proofs(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "data" / "muli.sqlite3"
+    path = tmp_path.resolve() / "data" / "muli.sqlite3"
     store = Store.open_runtime(path, default_mode="auto")
     memory, bus = Memory(store), EventBus(store)
     pipeline = MemoryPipeline(memory, bus, config=MemoryPipelineConfig(auto_extract=False))
