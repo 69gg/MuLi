@@ -851,11 +851,21 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 ),
             )
             del observed_packages
-            fresh = await self._probe(record)
+            final_postproofs = _FileProofs()
+            fresh = await self._probe(record, postproofs=final_postproofs)
             if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
                 raise ObservationError("transaction_observation_changed")
             effect_packages: PackageProofs = {}
-            self._guard(record, role, lease, cgroup, observed_packages=effect_packages)
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=final_postproofs.python,
+                verified_packages=final_postproofs.packages,
+                observed_packages=effect_packages,
+            )
+            del final_postproofs
         # Only this successful post-await guard lends bytes to its adjacent
         # effect check. Reopen and verify identities; discard before dispatch.
         self._effect_guard(
