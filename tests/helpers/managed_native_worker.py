@@ -51,6 +51,15 @@ POLL_SECONDS = 0.1
 HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
 HELPER_GUARD_ROWS = 64
 HELPER_GUARD_PREFIXES = ("first_check_returned", "first_install_target_check_returned")
+HELPER_GUARD_DETAIL_OWNERS = ("host_record", "checks")
+HELPER_GUARD_DETAIL_METRICS = (
+    "private_record",
+    "record_canonical",
+    "python_verify",
+    "package_verify",
+)
+HELPER_GUARD_PROOF_ROLES = ("python", "package", "other")
+HELPER_GUARD_RPC_KINDS = ("GetUnit", "Unit", "Service", "other")
 HELPER_START_BOUNDARIES = ("start_entered", "start_command_entered", "start_command_returned")
 BINDING_COST_ROWS = 64
 BINDING_COST_PREFIXES = 8
@@ -4572,6 +4581,12 @@ def binding_costs_facts(value: object, result: dict[str, Any]) -> bool:
 
 def trim_binding_diagnostics(result: dict[str, Any]) -> None:
     """The original timeline, failure and cleanup always win the original byte budget."""
+    if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
+        costs = result["resources"].get("helper_guard_costs")
+        if isinstance(costs, dict) and isinstance(costs.get("sources"), list):
+            for sample in costs["sources"]:
+                if isinstance(sample, dict) and isinstance(sample.get("costs"), dict):
+                    sample["costs"].pop("breakdown", None)
     for name in ("helper_guard_costs", "binding_costs", "binding_inputs"):
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
             return
@@ -4655,6 +4670,98 @@ def _helper_guard_metric(value: object) -> bool:
     )
 
 
+def _helper_guard_breakdown_facts(value: object) -> bool:
+    """A finite observed subset; these inclusive costs never form a partition."""
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value["version"] != 1
+    ):
+        return False
+    if value.get("code") == "unavailable":
+        return (
+            set(value) == {"version", "code", "detail_reason"}
+            and isinstance(value["detail_reason"], str)
+            and value["detail_reason"]
+            in {"unbound", "clock_invalid", "statistics_failed", "in_flight"}
+        )
+    if (
+        set(value) != {"version", "code", "owners", "rpc"}
+        or value["code"] != "observed"
+        or not isinstance(value["owners"], dict)
+        or set(value["owners"]) != set(HELPER_GUARD_DETAIL_OWNERS)
+        or not isinstance(value["rpc"], dict)
+        or set(value["rpc"]) != set(HELPER_GUARD_RPC_KINDS)
+    ):
+        return False
+    for owner in value["owners"].values():
+        if not isinstance(owner, dict) or set(owner) != {*HELPER_GUARD_DETAIL_METRICS, "fileproof"}:
+            return False
+        for name in HELPER_GUARD_DETAIL_METRICS:
+            metric = owner[name]
+            if name == "private_record":
+                if (
+                    not isinstance(metric, dict)
+                    or set(metric)
+                    != {"entered", "returned", "raised", "wall_ns", "cpu_ns", "successful_bytes"}
+                    or not _binding_number(metric["successful_bytes"])
+                    or metric["returned"] == 0
+                    and metric["successful_bytes"] != 0
+                ):
+                    return False
+                metric = {
+                    key: number for key, number in metric.items() if key != "successful_bytes"
+                }
+            if (
+                not _helper_guard_metric(metric)
+                or metric["entered"] == 0
+                and (metric["wall_ns"] != 0 or metric["cpu_ns"] != 0)
+            ):
+                return False
+        proofs = owner["fileproof"]
+        if not isinstance(proofs, dict) or set(proofs) != set(HELPER_GUARD_PROOF_ROLES):
+            return False
+        for proof in proofs.values():
+            if (
+                not isinstance(proof, dict)
+                or set(proof)
+                != {
+                    "entered",
+                    "returned",
+                    "raised",
+                    "full_reads",
+                    "full_read_bytes",
+                    "proof_hits",
+                    "proof_hit_bytes",
+                    "raised_bytes",
+                }
+                or not all(
+                    _binding_number(number)
+                    for key, number in proof.items()
+                    if key != "raised_bytes"
+                )
+                or proof["raised_bytes"] is not None
+                or proof["entered"] != proof["returned"] + proof["raised"]
+                or proof["returned"] != proof["full_reads"] + proof["proof_hits"]
+                or proof["full_reads"] == 0
+                and proof["full_read_bytes"] != 0
+                or proof["proof_hits"] == 0
+                and proof["proof_hit_bytes"] != 0
+            ):
+                return False
+    for metric in value["rpc"].values():
+        if (
+            not isinstance(metric, dict)
+            or set(metric) != {"entered", "returned", "raised", "wall_ns"}
+            or not all(_binding_number(number) for number in metric.values())
+            or metric["entered"] != metric["returned"] + metric["raised"]
+            or metric["entered"] == 0
+            and metric["wall_ns"] != 0
+        ):
+            return False
+    return True
+
+
 def helper_guard_snapshot_facts(value: object, source: object) -> bool:
     """Only the two synchronous guards are covered, including their real failures."""
     if _binding_missing(value):
@@ -4662,7 +4769,7 @@ def helper_guard_snapshot_facts(value: object, source: object) -> bool:
     if (
         not _helper_guard_source_facts(source)
         or not isinstance(value, dict)
-        or set(value)
+        or set(value) - {"breakdown"}
         != {
             "version",
             "code",
@@ -4693,9 +4800,23 @@ def helper_guard_snapshot_facts(value: object, source: object) -> bool:
             _helper_guard_metric(value[name])
             for name in ("host_record", "checks", "unpositioned_raised")
         )
+        or "breakdown" in value
+        and not _helper_guard_breakdown_facts(value["breakdown"])
     ):
         return False
     assert isinstance(source, dict)
+    detail = value.get("breakdown")
+    if isinstance(detail, dict) and detail.get("code") == "observed":
+        for owner in HELPER_GUARD_DETAIL_OWNERS:
+            if value[owner]["entered"] == 0 and (
+                any(
+                    detail["owners"][owner][name]["entered"] for name in HELPER_GUARD_DETAIL_METRICS
+                )
+                or any(
+                    metric["entered"] for metric in detail["owners"][owner]["fileproof"].values()
+                )
+            ):
+                return False
     first, attempts, publications = (
         value[name] for name in ("first_record", "attempts", "prior_publications")
     )
@@ -4932,6 +5053,37 @@ class HelperGuardCosts:
         self.boundaries: set[str] = set()
         self.publications = {"count": 0, "wall_ns": 0, "cpu_ns": 0}
         self.last_clock: tuple[int, int] | None = None
+        self.detail_owner: Literal["host_record", "checks"] | None = None
+        self.detail_role: Literal["python", "package", "other"] = "other"
+        self.detail_reason = ""
+        self.detail_bound = False
+        self.detail_last_clock: tuple[int, int] | None = None
+        self.rpc_last_wall: int | None = None
+        self.detail_owners: dict[str, dict[str, Any]] = {
+            owner: {
+                **{name: self.metric() for name in HELPER_GUARD_DETAIL_METRICS},
+                "fileproof": {
+                    role: {
+                        "entered": 0,
+                        "returned": 0,
+                        "raised": 0,
+                        "full_reads": 0,
+                        "full_read_bytes": 0,
+                        "proof_hits": 0,
+                        "proof_hit_bytes": 0,
+                        "raised_bytes": None,
+                    }
+                    for role in HELPER_GUARD_PROOF_ROLES
+                },
+            }
+            for owner in HELPER_GUARD_DETAIL_OWNERS
+        }
+        for detail in self.detail_owners.values():
+            detail["private_record"]["successful_bytes"] = 0
+        self.detail_rpc: dict[str, dict[str, int]] = {
+            kind: {key: 0 for key in ("entered", "returned", "raised", "wall_ns")}
+            for kind in HELPER_GUARD_RPC_KINDS
+        }
 
     @staticmethod
     def metric() -> dict[str, int]:
@@ -4953,6 +5105,255 @@ class HelperGuardCosts:
         except BaseException:
             self.reason = "clock_invalid"
             return None
+
+    def detail_clock(self) -> tuple[int, int] | None:
+        try:
+            value = time.perf_counter_ns(), time.process_time_ns()
+            if (
+                not all(_binding_number(number) for number in value)
+                or self.detail_last_clock is not None
+                and any(
+                    after < before
+                    for before, after in zip(self.detail_last_clock, value, strict=True)
+                )
+            ):
+                raise ValueError
+            self.detail_last_clock = value
+            return value
+        except BaseException:
+            self.detail_reason = "clock_invalid"
+            return None
+
+    def rpc_clock(self) -> int | None:
+        try:
+            value = time.perf_counter_ns()
+            if (
+                not _binding_number(value)
+                or self.rpc_last_wall is not None
+                and value < self.rpc_last_wall
+            ):
+                raise ValueError
+            self.rpc_last_wall = value
+            return value
+        except BaseException:
+            self.detail_reason = "clock_invalid"
+            return None
+
+    def finish_detail(
+        self,
+        owner: str,
+        name: str,
+        returned: bool,
+        started: tuple[int, int] | None,
+        value: object,
+    ) -> None:
+        ended = self.detail_clock()
+        if self.detail_reason or started is None or ended is None:
+            return
+        metric = self.detail_owners[owner][name]
+        metric["entered"] += 1
+        metric["returned" if returned else "raised"] += 1
+        metric["wall_ns"] += ended[0] - started[0]
+        metric["cpu_ns"] += ended[1] - started[1]
+        if name == "private_record" and returned:
+            if not isinstance(value, bytes):
+                raise ValueError
+            metric["successful_bytes"] += len(value)
+
+    def detail_sync(
+        self,
+        name: Literal["private_record", "record_canonical", "python_verify", "package_verify"],
+        original: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        @wraps(original)
+        def observed(*args: Any, **kwargs: Any) -> Any:
+            owner = self.detail_owner
+            if owner is None or self.detail_reason:
+                return original(*args, **kwargs)
+            previous, returned = self.detail_role, False
+            value: Any = None
+            started: tuple[int, int] | None = None
+            try:
+                started = self.detail_clock()
+            except BaseException:
+                self.detail_reason = "statistics_failed"
+            if name in {"python_verify", "package_verify"}:
+                self.detail_role = "python" if name == "python_verify" else "package"
+            try:
+                value = original(*args, **kwargs)
+                returned = True
+                return value
+            finally:
+                self.detail_role = previous
+                try:
+                    self.finish_detail(owner, name, returned, started, value)
+                except BaseException:
+                    self.detail_reason = "statistics_failed"
+
+        return observed
+
+    def finish_fileproof(
+        self, owner: str, role: str, returned: bool, proof_hit: bool, size: int
+    ) -> None:
+        if self.detail_reason:
+            return
+        metric = self.detail_owners[owner]["fileproof"][role]
+        metric["entered"] += 1
+        metric["returned" if returned else "raised"] += 1
+        if returned:
+            if not _binding_number(size):
+                raise ValueError
+            metric["proof_hits" if proof_hit else "full_reads"] += 1
+            metric["proof_hit_bytes" if proof_hit else "full_read_bytes"] += size
+
+    def detail_fileproof(
+        self, original: Callable[..., dict[str, object]]
+    ) -> Callable[..., dict[str, object]]:
+        from muli.platforms.managed_launcher import _DIGEST
+
+        @wraps(original)
+        def observed(
+            parent: int,
+            name: str,
+            path: Path,
+            limit: int,
+            descriptor: int,
+            before: dict[str, int],
+            *,
+            verified: dict[str, Any] | None = None,
+        ) -> dict[str, object]:
+            owner, role = self.detail_owner, self.detail_role
+            if owner is None or self.detail_reason:
+                return original(parent, name, path, limit, descriptor, before, verified=verified)
+            proof_hit, returned, size = False, False, 0
+            try:
+                # Only duplicate the original pure proof condition. Never open,
+                # stat, read a clock or inspect the descriptor in this wrapper.
+                if type(before) is not dict or verified is not None and type(verified) is not dict:
+                    raise ValueError
+                proof_hit = (
+                    verified is not None
+                    and verified.get("path") == str(path)
+                    and verified.get("identity") == before
+                    and type(verified.get("digest")) is str
+                    and _DIGEST.fullmatch(verified["digest"]) is not None
+                )
+            except BaseException:
+                self.detail_reason = "statistics_failed"
+            try:
+                value = original(parent, name, path, limit, descriptor, before, verified=verified)
+                returned = True
+                if not self.detail_reason:
+                    try:
+                        size = before["size"]
+                    except BaseException:
+                        self.detail_reason = "statistics_failed"
+                return value
+            finally:
+                try:
+                    self.finish_fileproof(owner, role, returned, proof_hit, size)
+                except BaseException:
+                    self.detail_reason = "statistics_failed"
+
+        return observed
+
+    def detail_command(
+        self, original: Callable[..., Awaitable[str]]
+    ) -> Callable[..., Awaitable[str]]:
+        from muli.platforms.linux_transaction import _BUS, _MANAGER
+
+        @wraps(original)
+        async def observed(probe: SystemdProbe, *arguments: str) -> str:
+            if self.detail_reason:
+                return await original(probe, *arguments)
+            kind, returned = "other", False
+            started: int | None = None
+            try:
+                if len(arguments) == 7 and arguments[:6] == (
+                    "call",
+                    _BUS,
+                    _MANAGER,
+                    _BUS + ".Manager",
+                    "GetUnit",
+                    "s",
+                ):
+                    kind = "GetUnit"
+                elif len(arguments) >= 5 and arguments[:2] == ("get-property", _BUS):
+                    if arguments[3] in {_BUS + ".Unit", _BUS + ".Service"}:
+                        kind = arguments[3].removeprefix(_BUS + ".")
+                started = self.rpc_clock()
+                self.detail_rpc[kind]["entered"] += 1
+            except BaseException:
+                self.detail_reason = "statistics_failed"
+            try:
+                value = await original(probe, *arguments)
+                returned = True
+                return value
+            finally:
+                try:
+                    ended = self.rpc_clock()
+                    if not self.detail_reason and started is not None and ended is not None:
+                        self.detail_rpc[kind]["returned" if returned else "raised"] += 1
+                        self.detail_rpc[kind]["wall_ns"] += ended - started
+                except BaseException:
+                    self.detail_reason = "statistics_failed"
+
+        return observed
+
+    def install_detail_hooks(self) -> None:
+        try:
+            from muli.platforms import managed_deployment, managed_launcher
+            from muli.platforms.linux_transaction import SystemdProbe
+
+            if (
+                managed_deployment.python_fingerprint is not managed_launcher.python_fingerprint
+                or managed_deployment.package_fingerprint
+                is not managed_launcher.package_fingerprint
+            ):
+                raise ValueError
+            private_record = self.detail_sync(
+                "private_record", managed_deployment._MetadataScope._read_record
+            )
+            canonical = self.detail_sync(
+                "record_canonical", managed_deployment._ManagedRecord.canonical
+            )
+            python = self.detail_sync("python_verify", managed_launcher.python_fingerprint)
+            package = self.detail_sync("package_verify", managed_launcher.package_fingerprint)
+            fileproof = self.detail_fileproof(managed_launcher._fingerprint_fd)
+            command = self.detail_command(SystemdProbe._command)
+            managed_deployment._MetadataScope._read_record = private_record  # type: ignore[method-assign]
+            managed_deployment._ManagedRecord.canonical = canonical  # type: ignore[method-assign]
+            managed_deployment.python_fingerprint = managed_launcher.python_fingerprint = python
+            managed_deployment.package_fingerprint = managed_launcher.package_fingerprint = package
+            managed_launcher._fingerprint_fd = fileproof
+            SystemdProbe._command = command  # type: ignore[method-assign]
+            self.detail_bound = True
+        except BaseException:
+            self.detail_reason = "unbound"
+
+    def breakdown(self) -> dict[str, Any]:
+        reason = self.detail_reason
+        if not reason and any(
+            metric["entered"] != metric["returned"] + metric["raised"]
+            for metric in self.detail_rpc.values()
+        ):
+            reason = "in_flight"
+        if reason:
+            return {"version": 1, "code": "unavailable", "detail_reason": reason}
+        return {
+            "version": 1,
+            "code": "observed",
+            "owners": {
+                owner: {
+                    **{name: dict(detail[name]) for name in HELPER_GUARD_DETAIL_METRICS},
+                    "fileproof": {
+                        role: dict(metric) for role, metric in detail["fileproof"].items()
+                    },
+                }
+                for owner, detail in self.detail_owners.items()
+            },
+            "rpc": {kind: dict(metric) for kind, metric in self.detail_rpc.items()},
+        }
 
     def finish_call(
         self, name: str, current: object, returned: bool, started: tuple[int, int] | None
@@ -5026,6 +5427,7 @@ class HelperGuardCosts:
         def observed(
             control: JournalControl, anchor: DeploymentAnchor
         ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+            previous, self.detail_owner = self.detail_owner, "host_record"
             started, returned = self.clock(), False
             current: object = None
             try:
@@ -5033,6 +5435,7 @@ class HelperGuardCosts:
                 current, returned = value[0], True
                 return value
             finally:
+                self.detail_owner = previous
                 self.finish_call("host_record", current, returned, started)
 
         return observed
@@ -5040,12 +5443,14 @@ class HelperGuardCosts:
     def check(self, original: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(original)
         def observed(*args: Any, **kwargs: Any) -> Any:
+            previous, self.detail_owner = self.detail_owner, "checks"
             started, returned = self.clock(), False
             try:
                 value = original(*args, **kwargs)
                 returned = True
                 return value
             finally:
+                self.detail_owner = previous
                 try:
                     current = args[1] if len(args) > 1 else kwargs["record"]
                     self.finish_call("checks", current, returned, started)
@@ -5078,6 +5483,19 @@ class HelperGuardCosts:
             "attempts": dict(self.attempts),
             "prior_publications": dict(self.publications),
         }
+        if self.detail_bound or self.detail_reason:
+            try:
+                detail = self.breakdown()
+                if not _helper_guard_breakdown_facts(detail):
+                    raise ValueError
+                value["breakdown"] = detail
+            except BaseException:
+                self.detail_reason = "statistics_failed"
+                value["breakdown"] = {
+                    "version": 1,
+                    "code": "unavailable",
+                    "detail_reason": self.detail_reason,
+                }
         return (
             value
             if helper_guard_snapshot_facts(value, self.source)
@@ -5095,6 +5513,9 @@ class HelperGuardCosts:
             if value.get("code") != "observed":
                 return
             data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            if len(data) > MAX_BYTES and "breakdown" in value:
+                value.pop("breakdown")
+                data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
             require(len(data) <= MAX_BYTES, "native_metadata_budget")
             path = (
                 self.root
@@ -5206,6 +5627,7 @@ def install_helper_guard_cost_hook() -> None:
                 namespace["_record"] = observer.record(cast("HostRecordReader", original))
                 ManagedLinuxBackend._check = observer.check(ManagedLinuxBackend._check)  # type: ignore[method-assign]
                 observer.bound = True
+                observer.install_detail_hooks()
             except BaseException:
                 observer.reason = "unbound"
             finally:

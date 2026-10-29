@@ -34,6 +34,7 @@ import muli.managed_host as managed_host
 import muli.platforms.filesystem_identity as filesystem_identity
 import muli.platforms.managed_backend as managed_backend
 import muli.platforms.managed_deployment as managed_deployment
+import muli.platforms.managed_launcher as managed_launcher
 from muli.managed_controller import ManagedTransactionController
 from muli.managed_host import managed_helper_arguments, managed_helper_unit_name
 from muli.managed_transaction import TransactionRecordV2
@@ -1730,6 +1731,17 @@ async def helper_guard(
     monkeypatch.setitem(sys.modules, "managed_native_worker", worker)
     monkeypatch.setenv("INVOCATION_ID", "b" * 32)
     monkeypatch.setattr(ManagedLinuxBackend, "_check", ManagedLinuxBackend._check)
+    for owner, name in (
+        (managed_deployment._MetadataScope, "_read_record"),
+        (managed_deployment._ManagedRecord, "canonical"),
+        (managed_deployment, "python_fingerprint"),
+        (managed_deployment, "package_fingerprint"),
+        (managed_launcher, "python_fingerprint"),
+        (managed_launcher, "package_fingerprint"),
+        (managed_launcher, "_fingerprint_fd"),
+        (SystemdProbe, "_command"),
+    ):
+        monkeypatch.setattr(owner, name, getattr(owner, name))
     monkeypatch.setattr(filesystem_identity, "verify_local_filesystems", lambda paths: None)
     callbacks: list[Callable[..., Any]] = []
     namespaces: list[dict[str, Any]] = []
@@ -1881,6 +1893,9 @@ async def test_narrow_generated_hook_measures_real_guards_and_preserves_each_awa
         ),
     )
     host, observer = guard.host, guard.observer
+    # This original outer-clock regression keeps its independent clock stream;
+    # the fixed subsets have their own real-clock and failure cases.
+    monkeypatch.setattr(observer, "detail_clock", lambda: (0, 0))
     record, controller, slots = guard.read_record(host.control, host.anchor)
     assert record == host.record() and controller == host.slots["base"] and slots == host.slots
     sentinel = object()

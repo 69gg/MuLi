@@ -68,3 +68,11 @@ package walk 的类型分类现在直接使用一次 `O_NOFOLLOW | O_NONBLOCK` �
 每个新 FD 都由紧贴 `open` 的调用方 `try/finally` 唯一拥有和关闭。内部读取主体只创建 `closefd=False` 的缓冲视图，视图关闭不接管真实 FD；正常返回、取消、fdopen/读取/身份/递归/预算异常都由原调用方收尾，不为分类后再打开同一叶文件。该变化不减少任何完整 guard、目录遍历、内容摘要、逐轮预算、writer lease、CAS、fsync 或等待两侧认证，也不延长局部证明寿命。
 
 FD 分类首红实收一失败三通过（0.79 秒、65.1 MiB、swap 0）：完整摘要、真实 open、FD 检查、内容字节与目录 scandir 断言均先通过，唯一失败是普通叶仍执行两次 path stat。修后 31 项针对性验证通过，涵盖异常收尾、取消、末路径替换、枚举后类型变化和四预算；随后十八文件 315 项整合回归通过（74.28 秒、峰值 180.9 MiB、swap 0）。所有本机检查经过原资源守卫，独立后审未发现 P1/P2。尚未取得新候选的远端原生结果，不能把少一次分类查询换算为三事务总耗时。
+
+后续固定成本测量仅扩展原生 CI worker 的窄 `helper_guard_costs`，不修改产品实现或任何认证、等待与期限。旧 version 1 快照可附带独立 version 1 的 `breakdown`：只在 `host_record`、`checks` 两个同步 owner 内统计 `_MetadataScope._read_record` 的 private read/hash/叶身份检查及成功返回字节，`_ManagedRecord.canonical`，以及 Python/package 文件核验的包含式 wall 与 helper-process CPU。后两项包含内部文件工作，不能再与其他包含式总量相加。严格解码、目录/祖先链、其他 guard 剩余成本与 hook 前启动区间仍未单独测量；本候选也不新增 `read_helper`/`read_managed` 外层 CPU hook。
+
+逐叶 `_fingerprint_fd` 不读取时钟、不新增 open/stat/read：按原函数相同的纯输入条件区分成功 full-read 与 proof-hit，按 Python/package/other 三个固定同步角色累计成功次数与原完整身份核验支持的 size 字节。零字节文件仍算一次完整读取；异常只计 raised，异常前实际读取字节以 `raised_bytes: null` 明确保持未知，不能填零。角色不依据路径猜测，不保存文件名、内容、指纹或跨等待证明。
+
+RPC 仅包装原 `SystemdProbe._command`，固定分类为 GetUnit、Unit、Service、other，保留原 runner 身份、参数和 TaskGroup 并发。记录 entered/returned/raised 与包含调度等待的 wall；不记录可被并发重复覆盖的单 RPC helper CPU。entered 表示方法进入，不证明已经创建 busctl 子进程；在途调用使该次明细暂报 `detail_reason: in_flight`，不提供不守恒的完成合计。GetUnit wall 只是原串行 GetUnit 可移除时的乐观上界，不是实际净收益；spawn、busctl CPU、D-Bus 和调度分项仍未知，wall−CPU 也不是已测 throttle。
+
+明细自身统计失败只令 `breakdown` unavailable 并给出固定 `detail_reason`，原 guard 结果、返回对象、异常/取消身份和旧 `reason` 不变。原 32 KiB、64 行、两个 prefix 与一个 final 上限及发布机会保持；单快照和聚合超界均先丢明细，再沿旧诊断裁剪顺序处理，原 failure/timeline/cleanup 优先。新 reader 接受不带明细的旧快照；不宣称旧 reader 接受新增字段，也不从测量本身推断优化收益或原生三事务验收通过。
