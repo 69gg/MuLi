@@ -24,7 +24,7 @@ from muli.media import MediaService
 from muli.memory_chunks import MemoryChunkSettings
 from muli.memory_context import MemoryContextProvider, PromptComposition, _PromptBudget
 from muli.memory_evidence import SOURCE_JOB_STATES, SOURCE_PAGE_LIMIT, MemoryEvidence, query_result
-from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig
+from muli.memory_pipeline import MemoryPipeline, MemoryPipelineConfig, MemorySourceInvalidated
 from muli.memory_watches import MemoryWatches, MemoryWatchMatch
 from muli.proactive import FrozenRouting
 from muli.providers import Message
@@ -135,10 +135,15 @@ class MemoryApplication:
     def _pipeline(self) -> MemoryPipeline:
         settings = self.runtime.config.settings
         configured = settings.models.main.configured or settings.models.memory_extractor.configured
+
+        async def extract(source: dict[str, Any]) -> dict[str, Any]:
+            # The callback belongs to its birth pipeline, even after reconfigure.
+            return await self.extract(source, pipeline=pipeline)
+
         pipeline = MemoryPipeline(
             self.runtime.memory,
             self.runtime.bus,
-            extractor=self.extract if configured else None,
+            extractor=extract if configured else None,
             media=self.media,
             config=MemoryPipelineConfig(**settings.memory.model_dump()),
             admission=self.runtime.maintenance.admission,
@@ -276,12 +281,37 @@ class MemoryApplication:
             # have been interrupted. The original pipeline owns all deduplication.
             self.pipeline.ingest(source, trusted_owner=False)
 
-    async def extract(self, source: dict[str, Any]) -> dict[str, Any]:
-        await self.runtime.maintenance.admission.wait()
-        with self.runtime.maintenance.admission.operation():
-            return await self._extract_admitted(source)
+    async def extract(self, source: dict[str, Any], *, pipeline: MemoryPipeline) -> dict[str, Any]:
+        identifier, revision = source.get("id"), source.get("digest")
+        if not isinstance(identifier, str) or not isinstance(revision, str):
+            raise ValueError("记忆提炼需要完整来源身份与版本")
+        generation, task = self._attachment_generation, asyncio.current_task()
 
-    async def _extract_admitted(self, source: dict[str, Any]) -> dict[str, Any]:
+        def guard() -> None:
+            if task is not None and task.cancelling():
+                raise asyncio.CancelledError
+            settings = self.runtime.config.settings.memory
+            if (
+                task is None
+                or asyncio.current_task() is not task
+                or self._closed
+                or self.runtime._closing
+                or self.pipeline is not pipeline
+                or self._attachment_generation is not generation
+                or not settings.enabled
+                or len(source["content"]) > settings.max_source_chars
+            ):
+                raise MemorySourceInvalidated("记忆提炼的来源或生命周期已失效")
+            pipeline.require_source(identifier, revision)
+
+        await pipeline.admission.wait()
+        with pipeline.admission.operation():
+            guard()
+            return await self._extract_admitted(source, attempt_guard=guard)
+
+    async def _extract_admitted(
+        self, source: dict[str, Any], *, attempt_guard: Callable[[], None]
+    ) -> dict[str, Any]:
         profile = self.runtime.model_config("memory_extractor")
         profile = replace(
             profile,
@@ -304,13 +334,21 @@ class MemoryApplication:
         )
         # The pipeline has one worker. A slow background request must not hold the
         # foreground model slot and stall the only conversation.
-        async with self.runtime.client_factory(profile) as client:
-            result = await client.complete(
-                [
-                    Message(role="system", content=instructions),
-                    Message(role="user", content=json.dumps(source, ensure_ascii=False)),
-                ]
-            )
+        try:
+            async with self.runtime.client_factory(profile) as client:
+                result = await client.complete(
+                    [
+                        Message(role="system", content=instructions),
+                        Message(role="user", content=json.dumps(source, ensure_ascii=False)),
+                    ],
+                    attempt_guard=attempt_guard,
+                )
+        except Exception:
+            # A late upstream error cannot fail a source revoked during close.
+            # Actual task cancellation remains a BaseException and propagates.
+            attempt_guard()
+            raise
+        attempt_guard()
         if result.tool_calls:
             raise ValueError("记忆提炼不能调用工具")
         data = json.loads(result.content)

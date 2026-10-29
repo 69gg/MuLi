@@ -47,6 +47,10 @@ _INDEX_COUNTERS = (
 )
 
 
+class MemorySourceInvalidated(ValueError):
+    """Discard an obsolete attempt without failing or cancelling its worker."""
+
+
 class MemoryMedia(Protocol):
     config: MediaConfig
 
@@ -520,6 +524,24 @@ class MemoryPipeline:
         except UnicodeError:
             return None
         return digest if all(character in "0123456789abcdef" for character in digest) else None
+
+    def source_current(self, source_id: str, revision: str | None) -> bool:
+        """Check one bounded source identity, including its forgotten tombstone."""
+        return revision is not None and self._source_digest(source_id) == revision
+
+    def require_source(self, source_id: str, revision: str) -> None:
+        """Admit another attempt only for this worker's still-current source."""
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        self.admission.require()
+        if (
+            self._index_closed
+            or task is None
+            or task is not self._worker
+            or not self.source_current(source_id, revision)
+        ):
+            raise MemorySourceInvalidated("记忆来源或处理生命周期已失效")
 
     def _index_source(self, source_id: str) -> dict[str, Any]:
         digest = self._source_digest(source_id)
@@ -1106,26 +1128,35 @@ class MemoryPipeline:
             async with asyncio.timeout(self.config.job_timeout):
                 await self._process(source_id)
         except asyncio.CancelledError:
-            with self.memory.store.db:
-                self.memory.store.db.execute(
-                    "UPDATE memory_jobs SET state='queued',updated_at=? WHERE source_id=? AND state='processing'",
-                    (now(), source_id),
-                )
-            raise
-        except Exception as error:
-            # Upstream bodies may contain credentials: only persist the exception class.
-            self._last_error = type(error).__name__
-            job = self.job(source_id)
-            if job is not None:
-                state = "failed" if job["attempts"] >= self.config.max_attempts else "retry"
-                delay = self.config.retry_backoff_seconds * job["attempts"]
+            if self.source_current(source_id, revision):
                 with self.memory.store.db:
                     self.memory.store.db.execute(
-                        "UPDATE memory_jobs SET state=?,next_attempt=?,last_error=?,updated_at=? WHERE source_id=?",
-                        (state, now() + delay, self._last_error, now(), source_id),
+                        "UPDATE memory_jobs SET state='queued',updated_at=? "
+                        "WHERE source_id=? AND state='processing'",
+                        (now(), source_id),
                     )
-                if state == "failed":
-                    failed_revision = revision
+            raise
+        except MemorySourceInvalidated:
+            # Closing may revoke the application before it can cancel this worker.
+            # Leave any replacement job untouched, without manufacturing a failure.
+            pass
+        except Exception as error:
+            if not self._index_closed and self.source_current(source_id, revision):
+                # A stale attempt cannot change a replacement source's job.
+                # Upstream bodies may contain credentials: keep only the class.
+                self._last_error = type(error).__name__
+                job = self.job(source_id)
+                if job is not None:
+                    state = "failed" if job["attempts"] >= self.config.max_attempts else "retry"
+                    delay = self.config.retry_backoff_seconds * job["attempts"]
+                    with self.memory.store.db:
+                        self.memory.store.db.execute(
+                            "UPDATE memory_jobs SET state=?,next_attempt=?,last_error=?,updated_at=? "
+                            "WHERE source_id=?",
+                            (state, now() + delay, self._last_error, now(), source_id),
+                        )
+                    if state == "failed":
+                        failed_revision = revision
         await self._publish(source_id, failed_revision=failed_revision)
 
     def _validated(self, payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
@@ -1215,12 +1246,21 @@ class MemoryPipeline:
         source, job = self.memory.source(source_id), self.job(source_id)
         if source is None or job is None:
             return
+
+        def live() -> bool:
+            return not self._index_closed and self.source_current(source_id, source["digest"])
+
+        if not live():
+            return
         checkpoint = job["checkpoint"]
         if "extraction" not in checkpoint:
             payload: dict[str, Any] = {"memories": [], "aliases": {}}
             if self.config.auto_extract and self.extractor is not None:
                 payload = await self.extractor(deepcopy(source))
-            if self.memory.source(source_id) is None:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise asyncio.CancelledError
+            if not live():
                 return
             checkpoint["extraction"] = self._validated(payload, source)
             if not self._checkpoint(source_id, checkpoint):
@@ -1239,9 +1279,6 @@ class MemoryPipeline:
             checkpoint["source_chunks"] = self.source_chunks.new_record(source)
             if not self._checkpoint(source_id, checkpoint):
                 return
-
-        def live() -> bool:
-            return bool(self._source_digest(source_id) == source["digest"])
 
         chunk_ids = await self.source_chunks.prepare(
             source,

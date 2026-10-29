@@ -188,9 +188,17 @@ async def indexed_app(
                 super().__init__([], [])
                 self.role = role
 
-            async def complete(self, messages: list[Message], tools: Any = ()) -> ModelTurn:
+            async def complete(
+                self,
+                messages: list[Message],
+                tools: Any = (),
+                *,
+                attempt_guard: Callable[[], None] | None = None,
+            ) -> ModelTurn:
                 if self.role != "index-policy-extractor":
-                    return await super().complete(messages, tools)
+                    return await super().complete(messages, tools, attempt_guard=attempt_guard)
+                if attempt_guard is not None:
+                    attempt_guard()
                 assert not tools
                 source = json.loads(messages[-1].content)
                 memories: list[dict[str, Any]] = []

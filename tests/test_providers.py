@@ -520,6 +520,69 @@ async def test_transient_failure_retries_before_output(initial_status: int) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+@pytest.mark.parametrize("entry", ["complete", "stream"])
+@pytest.mark.parametrize("reject_attempt", [1, 2])
+async def test_attempt_guard_rejection_never_becomes_a_provider_retry(
+    protocol: ProtocolName, entry: str, reject_attempt: int
+) -> None:
+    calls, checks = 0, 0
+    rejection = ProviderError("source invalidated", retryable=True)
+
+    def guard() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == reject_attempt:
+            raise rejection
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503) if calls == 1 else httpx.Response(200, json=payload(protocol))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = ModelClient(config(protocol, stream=False), http)
+        with pytest.raises(ProviderError) as error:
+            if entry == "complete":
+                await client.complete([Message("user", "hi")], attempt_guard=guard)
+            else:
+                async for _ in client.stream([Message("user", "hi")], attempt_guard=guard):
+                    pass
+    assert error.value is rejection
+    assert calls == reject_attempt - 1 and checks == reject_attempt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])
+@pytest.mark.parametrize("entry", ["complete", "stream"])
+async def test_attempt_guard_allows_unchanged_source_retry(
+    protocol: ProtocolName, entry: str
+) -> None:
+    calls, checks = 0, 0
+
+    def guard() -> None:
+        nonlocal checks
+        checks += 1
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503) if calls == 1 else httpx.Response(200, json=payload(protocol))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = ModelClient(config(protocol, stream=False), http)
+        if entry == "complete":
+            turn = await client.complete([Message("user", "hi")], attempt_guard=guard)
+        else:
+            events = [
+                event async for event in client.stream([Message("user", "hi")], attempt_guard=guard)
+            ]
+            turn = events[-1].turn
+        assert turn is not None and turn.content == "你好"
+    assert calls == checks == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("visible", [False, True])
 async def test_stream_disconnect_retries_only_before_output(visible: bool) -> None:
     calls = 0
