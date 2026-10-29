@@ -553,7 +553,7 @@ async def test_swallowed_task_cancellation_cannot_commit_a_late_transcript_read(
         # Session-scoped tools bind the reader while preparing the next real
         # tool round, so install the proxy before submitting that round.
         monkeypatch.setattr(rig.memory, "transcript_reader", late_reader)
-        receipt, call_id = await start_tool(
+        receipt, _ = await start_tool(
             rig, "memory_import_transcript", id=identifier, revision=transcript["revision"]
         )
         session_id = rig.runtime.main_session()["id"]
@@ -567,14 +567,19 @@ async def test_swallowed_task_cancellation_cannot_commit_a_late_transcript_read(
             rig.absent(identifier)
         finally:
             release.set()
-            await rig.settle(receipt)
-        result = rig.result(call_id)
-        record = next(
-            item
-            for item in rig.runtime.store.messages(session_id)
-            if item.get("tool_call_id") == call_id
-        )
-        assert record["content_provenance"] == "accepted"
-        assert "error" in result, result
+            # settle() requires completed; cancellation must reach the real
+            # task and run terminal state instead of becoming a tool error.
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=4)
         rig.absent(identifier)
         assert len(requests) == 1
+        run = rig.runtime.store.get("run", receipt["run_id"])
+        assert run is not None
+        assert run["status"] == "cancelled", run["status"]
+        assert task.cancelled()
+        events = [
+            event
+            for event in rig.runtime.store.events(limit=1000)
+            if event["data"].get("run_id") == receipt["run_id"]
+        ]
+        assert any(event["type"] == "run.cancelled" for event in events)
+        assert not any(event["type"] == "run.completed" for event in events)
