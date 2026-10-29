@@ -43,7 +43,7 @@ MuLi serve
 
 已有配置时，直接运行 `MuLi serve`。初始化默认尝试下载只读源码参考，不需要时可加 `--no-source`。
 
-当前版本使用 `memory=3`；已有旧格式资料库须先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。非托管 Linux 支持指南列出的五种精确旧格式，macOS 仅支持网页收藏前的完整 `memory=2` 格式；Windows、其它 macOS 旧格式和托管安装的旧库继续使用原版本，新装不受影响。
+当前源码使用 `memory=4`，可为资料关注保存登记轮的真实来源偏好；回访仍在 Web，外发须 AI 显式调用渠道工具并经过原审批。已有旧格式资料库须先完成[停机数据升级](docs/channel-ownership-format-upgrade.md)。非托管 Linux 支持指南列出的六种精确旧格式，macOS 仅支持完整 `memory=2/3` 前序合同；Windows、其它 macOS 旧格式和托管安装的旧库继续使用原版本，新装不受影响。
 
 配置、聊天、附件、记忆、插件和日志默认保存在 **`~/MuLi`**。已有配置不会被初始化覆盖；需要自定义位置时，见[配置与维护](docs/operations.md)。
 

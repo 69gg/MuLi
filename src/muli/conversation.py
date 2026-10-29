@@ -8,7 +8,7 @@ from typing import Any
 
 from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.memory_source_failure import MAX_FAILURE_PROOF_BYTES, MemorySourceFailure
-from muli.memory_watches import MAX_MATCH_PROOF_BYTES, MemoryWatchMatch
+from muli.memory_watches import MAX_MATCH_PROOF_BYTES, MemoryWatchMatch, match_routing
 from muli.proactive import FrozenRouting
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
@@ -60,6 +60,22 @@ class Conversation:
         attention_memory_failure: MemorySourceFailure | None = None,
         attention_memory_watch: MemoryWatchMatch | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        watch_routing: FrozenRouting | None = None
+        if attention_memory_watch is not None:
+            watch_routing = match_routing(self.store, attention_memory_watch)
+            if (
+                watch_routing is None
+                or (attention_routing or FrozenRouting()) != watch_routing
+                or (
+                    reply_origin is not None
+                    and (
+                        reply_origin != watch_routing.origin
+                        if watch_routing.classification == "bound"
+                        else bool(reply_origin.delivery_routes())
+                    )
+                )
+            ):
+                raise ValueError("长期问题回访需要当前宿主证明及准确原来源偏好")
         payload = self.payload(
             session_id,
             content,
@@ -69,11 +85,16 @@ class Conversation:
             attachment_ids=attachment_ids,
             route=route,
             event_id=event_id,
-            reply_origin=reply_origin,
-            attention_routing=attention_routing,
+            reply_origin=None if attention_memory_watch is not None else reply_origin,
+            attention_routing=None if attention_memory_watch is not None else attention_routing,
             attention_memory_failure=attention_memory_failure,
             attention_memory_watch=attention_memory_watch,
         )
+        if watch_routing is not None:
+            # Only this Store-bound admission may replace the static local
+            # builder's routing with the already checked canonical preference.
+            payload["attention_routing"] = watch_routing.dump()
+            payload["reply_origin"] = watch_routing.reply_origin(payload["id"]).dump()
         return self.store.enqueue_input(
             payload,
             max_pending=max_pending,

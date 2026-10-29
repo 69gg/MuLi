@@ -15,6 +15,7 @@ from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     LEGACY_FORMAT_STATE,
     PRE_MEMORY_WATCH_FORMAT_STATE,
+    PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
     PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
     PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     PREVIOUS_FORMAT_STATE,
@@ -226,7 +227,10 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                 raise FormatAdmissionError("store_format_changed")
 
             checks = (construction.check, lambda: _check_darwin(database))
-            predecessors = (PRE_WEBPAGE_MEMORY_FORMAT_STATE,)
+            predecessors = (
+                PRE_WEBPAGE_MEMORY_FORMAT_STATE,
+                PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
+            )
         else:
             root = path.parent / "management" / "transaction-v1"
             journal = owner.stack.enter_context(TransactionJournal(root, path))
@@ -248,6 +252,7 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                 PRE_MEMORY_WATCH_FORMAT_STATE,
                 PRE_TRANSCRIPT_MEMORY_FORMAT_STATE,
                 PRE_WEBPAGE_MEMORY_FORMAT_STATE,
+                PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
             )
 
         def check() -> None:

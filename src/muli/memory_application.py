@@ -719,7 +719,7 @@ class MemoryApplication:
             return []
         pipeline, generation, watches = self.pipeline, self._attachment_generation, self.watches
 
-        def owner(tool_name: str) -> tuple[str, str]:
+        def owner(tool_name: str) -> PreparedRequest:
             request = self._attachment_guard(pipeline, generation, tool_name=tool_name)
             if self.watches is not watches:
                 raise PermissionError("问题关注服务已更换，请重新查看当前工具")
@@ -727,21 +727,41 @@ class MemoryApplication:
             if input_id is None:
                 raise PermissionError("问题关注需要本次主人原始输入")
             runtime.topic_reminders.require_owner_input(session_id, input_id)
-            return session_id, input_id
+            return request
 
         async def create_watch(args: dict[str, Any]) -> Any:
-            session_id, input_id = owner("memory_watch_create")
+            request = owner("memory_watch_create")
+            if args.keys() - {"question", "match_terms", "key", "reply_preference"}:
+                raise ValueError("资料关注不接受模型指定的账号或路由")
+            preference = args.get("reply_preference", "web")
+            if not isinstance(preference, str) or preference not in {"web", "origin"}:
+                raise ValueError("reply_preference 仅支持 web 或 origin")
             if not self._watch_enabled():
                 raise ValueError("请先启用长期记忆和记忆注意事项")
-            return watches.create(session_id, input_id, **args)
+            routing = FrozenRouting()
+            if preference == "origin":
+                routing = FrozenRouting.bound(request.reply_origin)
+                if routing.classification != "bound":
+                    raise PermissionError("本轮缺少可核验的主人原来源")
+            input_id = request.reply_origin.input_id
+            if input_id is None:
+                raise PermissionError("资料关注需要主人原输入身份")
+            return watches.create(
+                request.session_id,
+                input_id,
+                args["question"],
+                args["match_terms"],
+                key=args["key"],
+                routing=routing,
+            )
 
         async def list_watches(args: dict[str, Any]) -> Any:
-            session_id, _ = owner("memory_watch_list")
-            return watches.records(session_id, **args)
+            request = owner("memory_watch_list")
+            return watches.records(request.session_id, **args)
 
         async def cancel_watch(args: dict[str, Any]) -> Any:
-            session_id, _ = owner("memory_watch_cancel")
-            result = watches.cancel(session_id, args["id"])
+            request = owner("memory_watch_cancel")
+            result = watches.cancel(request.session_id, args["id"])
             # Let Attention and the runtime invalidate already queued evidence.
             await runtime.bus.notify()
             return result
@@ -753,7 +773,9 @@ class MemoryApplication:
                 "主人明确要求长期留意一个问题时登记关注；question说明问题，match_terms为主人"
                 "确认的短语组合，key为本次操作的稳定标识。只检查登记以后完成整理的明确收藏资料；"
                 "同一段当前原文包含全部短语才产生线索，在Web主会话带出处回访。"
-                "不扫描已完成旧资料，不自动调用远端检索，也不授权外部渠道发送；不保证语义覆盖。",
+                "reply_preference默认web；origin只保存本次真实主人来源偏好，供主AI回访时核对。"
+                "普通说明仍在Web，外发必须显式调用渠道工具并遵守原审批。"
+                "不扫描已完成旧资料，不自动调用远端检索，也不增加发送权限；不保证语义覆盖。",
                 parameters(
                     {
                         "question": string("要持续关注的问题"),
@@ -769,6 +791,11 @@ class MemoryApplication:
                             },
                         },
                         "key": string("本次登记的稳定标识"),
+                        "reply_preference": {
+                            "type": "string",
+                            "enum": ["web", "origin"],
+                            "description": "默认web；origin参考本次真实来源，不是额外外发授权",
+                        },
                     },
                     ("question", "match_terms", "key"),
                 ),

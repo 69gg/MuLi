@@ -13,6 +13,7 @@ from muli.compatibility import FormatState
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     LEGACY_FORMAT_STATE,
+    PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
     PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
@@ -105,8 +106,8 @@ def test_upgrade_preserves_null_receipts_pending_ingress_and_unknown_outbox(tmp_
 @LINUX
 @pytest.mark.parametrize(
     "source_state",
-    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
-    ids=["legacy", "memory2"],
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE, PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE],
+    ids=["legacy", "memory2", "memory3"],
 )
 @pytest.mark.parametrize("lock", ["writer", "other_root_writer", "controller", "constructor"])
 def test_fixed_upgrade_refuses_real_cooperative_lock_owners(
@@ -141,8 +142,8 @@ def test_fixed_upgrade_refuses_real_cooperative_lock_owners(
 @LINUX
 @pytest.mark.parametrize(
     "source_state",
-    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
-    ids=["legacy", "memory2"],
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE, PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE],
+    ids=["legacy", "memory2", "memory3"],
 )
 @pytest.mark.parametrize("source", ["unmarked", "mixed", "unknown"])
 def test_fixed_upgrade_never_guesses_a_source_contract(
@@ -174,7 +175,7 @@ def test_fixed_upgrade_never_guesses_a_source_contract(
 
 
 @LINUX
-@pytest.mark.parametrize("source", ["legacy", "memory2", "current"])
+@pytest.mark.parametrize("source", ["legacy", "memory2", "memory3", "current"])
 @pytest.mark.parametrize("key_storage", ["text", "blob"])
 def test_fixed_upgrade_rejects_unknown_reserved_marker_without_changing_any_rows(
     tmp_path: Path, source: str, key_storage: str
@@ -183,6 +184,7 @@ def test_fixed_upgrade_rejects_unknown_reserved_marker_without_changing_any_rows
     state = {
         "legacy": LEGACY_FORMAT_STATE,
         "memory2": PRE_WEBPAGE_MEMORY_FORMAT_STATE,
+        "memory3": PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
         "current": CURRENT_FORMAT_STATE,
     }[source]
     key: str | bytes = "format_state_v2" if key_storage == "text" else b"format_state_v2"
@@ -237,8 +239,8 @@ def test_live_store_rejects_a_marker_change_without_changing_its_admitted_state(
 @LINUX
 @pytest.mark.parametrize(
     "source_state",
-    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
-    ids=["legacy", "memory2"],
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE, PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE],
+    ids=["legacy", "memory2", "memory3"],
 )
 @pytest.mark.parametrize(
     "managed",
@@ -303,8 +305,8 @@ def test_fixed_upgrade_refuses_managed_ownership(
 @LINUX
 @pytest.mark.parametrize(
     "source_state",
-    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE],
-    ids=["legacy", "memory2"],
+    [LEGACY_FORMAT_STATE, PRE_WEBPAGE_MEMORY_FORMAT_STATE, PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE],
+    ids=["legacy", "memory2", "memory3"],
 )
 def test_commit_denial_rolls_back_the_real_marker_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_state: FormatState

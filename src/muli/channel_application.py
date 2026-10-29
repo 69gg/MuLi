@@ -237,6 +237,9 @@ class ChannelApplication:
         data = self.runtime.config.settings.channels.model_dump()
         data.pop("proactive")
         expected = self.runtime.config.settings.channels.model_dump()
+        transport_settings = {
+            name: value for name, value in expected.items() if name != "proactive"
+        }
         generation = self._generation
 
         async def submit(**kwargs: Any) -> dict[str, Any]:
@@ -299,6 +302,13 @@ class ChannelApplication:
                 ) from None
 
         def delivery_guard(route: Mapping[str, Any], metadata: object) -> None:
+            if (
+                manager is not self.manager
+                or generation != self._generation
+                or transport_settings
+                != self.runtime.config.settings.channels.model_dump(exclude={"proactive"})
+            ):
+                raise ValueError("渠道配置或运行代次已改变，请使用当前渠道配置重新核对")
             guard_delivery(self.runtime.config.settings, route, metadata, db=self.runtime.store.db)
 
         def ownership_guard(proof: object, route: Mapping[str, Any]) -> None:
