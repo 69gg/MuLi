@@ -133,6 +133,7 @@ async def test_runtime_reconfigure_discards_revoked_summary_and_new_compactor_ca
     )
     runtime.config.update(
         {
+            "persona": {"prompt": "你是本地助手，请完成当前用户的任务。"},
             "limits": {"max_context_chars": 5000},
             "updates": {"check_on_start": False},
             "extensions": {"watch_enabled": False},
