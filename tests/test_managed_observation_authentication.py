@@ -2,24 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from test_managed_backend import Host
 from test_managed_backend import host as host
-from test_managed_backend_package_batch import PackageReads, observe_payloads
+from test_managed_backend_package_batch import PackageReads, observe_checks, observe_payloads
 from test_managed_backend_package_batch import package_payloads as package_payloads
+from test_managed_backend_python_proof import observe_python_reads
 from test_managed_deployment_authentication_batch import bounded_slots as bounded_slots
 
 from muli.managed_controller import ManagedProcessIdentity, ManagedServiceObservation
 from muli.managed_transaction import TransactionRecordV2
-from muli.management_transaction import Role, TransactionJournal
+from muli.management_transaction import Role, TransactionError, TransactionJournal
 from muli.platforms import managed_launcher
-from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
+from muli.platforms.managed_backend import _DiskBinding
+from muli.platforms.managed_deployment import DeploymentAnchor, ManagedDeploymentError, SlotIdentity
 from muli.platforms.managed_probe import ManagedProbeResult
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed observations")
@@ -95,6 +99,88 @@ def assert_actual_payload_reads(reads: PackageReads, scans: dict[Path, int]) -> 
     for directory, count in reads.scans.items():
         copies = next(value for root, value in scans.items() if directory.is_relative_to(root))
         assert count == copies
+
+
+async def test_stop_reuses_one_complete_preflight_before_its_second_probe(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host.move("draining")
+    record = host.move("activating", "stop_base")
+    controller = Path(host.backend.controller_slot.package.root)
+    target = Path(host.slots["target"].package.root)
+    assert controller != target
+    disk, service = host.backend._disk(), host.probe.snapshot
+    state_path = host.journal.directory.path / "state.json"
+    state_bytes = state_path.read_bytes()
+    writer = host.writer
+    assert writer is not None and writer.fd is not None
+    writer.check()
+    writer_info = os.fstat(writer.fd)
+    probes = observe_probes(host, monkeypatch)
+    scans = observe_complete_package_scans(host, monkeypatch)
+    python_reads = observe_python_reads(host, monkeypatch)
+    reads = observe_payloads(host, monkeypatch)
+    checks = observe_checks(host, monkeypatch)
+    commands: list[tuple[str, ...]] = []
+    original_runner = host.backend.runner
+
+    async def run(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        commands.append(tuple(argv))
+        return await original_runner(argv, timeout=timeout, limit=limit, merge_stderr=merge_stderr)
+
+    monkeypatch.setattr(host.backend, "runner", run)
+
+    assert await host.backend.stop(record, "base") is None
+
+    assert commands == [
+        (
+            "systemctl",
+            "--user",
+            "--no-block",
+            "--job-mode=fail",
+            "stop",
+            host.backend.service.unit,
+        )
+    ]
+    assert host.commands == ["stop"] and host.transport.calls == []
+    assert len(probes) == host.probe.count == 2
+    for probe in probes:
+        same_service = probe.service == service
+        assert same_service and probe.process_roles == ("base",) and probe.unit_confirmed
+        assert probe.disk_unit == record.base.unit.digest
+    assert host.backend._stopped(host.probe.snapshot)
+    assert host.writer is None and writer.fd is None
+    current_record = host.record()
+    assert current_record == record and current_record.deadline == record.deadline
+    assert state_path.read_bytes() == state_bytes and host.backend._disk() == disk
+    host.control.check()
+    with host.journal.writer_lease() as available:
+        available.check()
+        assert available.fd is not None
+        current = os.fstat(available.fd)
+        assert (current.st_dev, current.st_ino) == (writer_info.st_dev, writer_info.st_ino)
+    host.control.check()
+
+    copies = scans[controller]
+    assert copies > 0 and scans[target] == 0
+    assert checks == [(record, None)] * copies
+    assert python_reads.bytes == host.backend.controller_slot.resolved_python.identity.size * copies
+    assert len(python_reads.opened) == copies
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in python_reads.opened)
+    for leaf, observed in reads.leaves.items():
+        expected = copies if leaf.is_relative_to(controller) else 0
+        assert leaf.is_relative_to(controller) or leaf.is_relative_to(target)
+        assert observed.bytes == reads.sizes[leaf] * expected
+        assert len(observed.opened) == expected
+        assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed.opened)
+        assert observed.fd_stats >= 2 * expected and observed.path_stats == expected
+    for directory, count in reads.scans.items():
+        assert count == (copies if directory.is_relative_to(controller) else 0)
+    # Keep all actual effects, complete bytes and lock/state assertions ahead of
+    # the old-code red: the adjacent effect guard and probe precheck duplicate a scan.
+    assert copies == 5
 
 
 @pytest.mark.parametrize(
@@ -183,3 +269,160 @@ async def test_next_observation_independently_reads_every_package_again(
     assert same_record
     assert host.writer is not None
     host.writer.check()
+
+
+def _pause_second_stop_probe(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> tuple[asyncio.Event, asyncio.Future[None], list[BaseException]]:
+    entered = asyncio.Event()
+    release: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    errors: list[BaseException] = []
+    original, calls = host.probe.read_managed, 0
+
+    async def read(
+        journal: TransactionJournal,
+        record: TransactionRecordV2,
+        anchor: DeploymentAnchor,
+        controller: SlotIdentity,
+        slots: dict[Role, SlotIdentity],
+    ) -> ManagedProbeResult:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            try:
+                await release
+            except BaseException as error:
+                errors.append(error)
+                raise
+        return await original(journal, record, anchor, controller, slots)
+
+    monkeypatch.setattr(host.probe, "read_managed", read)
+    return entered, release, errors
+
+
+@pytest.mark.parametrize(
+    ("fault", "code"),
+    [
+        ("package", "anchor_unavailable"),
+        ("anchor", "anchor_unavailable"),
+        ("slot", "managed_slot_unavailable"),
+        ("revision", "stale_revision"),
+        ("package-and-observation", "anchor_unavailable"),
+    ],
+)
+async def test_stop_reauthenticates_actual_evidence_after_its_second_await(
+    host: Host, monkeypatch: pytest.MonkeyPatch, fault: str, code: str
+) -> None:
+    host.move("draining")
+    record = expected_record = host.move("activating", "stop_base")
+    disk, service, writer = host.backend._disk(), host.probe.snapshot, host.writer
+    assert writer is not None
+    entered, release, errors = _pause_second_stop_probe(host, monkeypatch)
+    task = asyncio.create_task(host.backend.stop(record, "base"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        root, controller = host.journal.directory.path, host.backend.controller_slot
+        if fault.startswith("package"):
+            Path(controller.package.root, "__main__.py").write_bytes(b"changed during await")
+            if fault == "package-and-observation":
+                host.probe.snapshot = replace(
+                    service, unit=replace(service.unit, job=(7, "/job/7"))
+                )
+        elif fault in {"anchor", "slot"}:
+            digest = host.anchor.digest if fault == "anchor" else controller.digest
+            (root / f"{fault}-{digest}.json").write_bytes(b"changed private metadata")
+        else:
+            expected_record = host.move("activating", "install_target")
+        release.set_result(None)
+        expected = TransactionError if fault == "revision" else ManagedDeploymentError
+        with pytest.raises(expected, match=f"^{code}$"):
+            await task
+    finally:
+        if not release.done():
+            release.cancel()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert host.probe.count == 2 and not errors
+    assert host.commands == [] and host.transport.calls == []
+    assert host.backend._disk() == disk and host.writer is writer
+    assert host.probe.snapshot.process == service.process
+    assert host.record() == expected_record and expected_record.deadline == record.deadline
+    writer.check()
+    host.control.check()
+
+
+@pytest.mark.parametrize("failure_kind", ["error", "cancel", "task-cancel"])
+async def test_stop_preserves_second_probe_failure_and_cancellation_identity(
+    host: Host, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+) -> None:
+    host.move("draining")
+    record = host.move("activating", "stop_base")
+    disk, service, writer = host.backend._disk(), host.probe.snapshot, host.writer
+    assert writer is not None
+    state_path = host.journal.directory.path / "state.json"
+    state_bytes = state_path.read_bytes()
+    entered, release, errors = _pause_second_stop_probe(host, monkeypatch)
+    failure = RuntimeError("probe failed") if failure_kind == "error" else asyncio.CancelledError()
+    task = asyncio.create_task(host.backend.stop(record, "base"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        if failure_kind == "task-cancel":
+            assert task.cancel()
+        else:
+            release.set_exception(failure)
+        with pytest.raises(type(failure)) as caught:
+            await task
+        assert len(errors) == 1 and caught.value is errors[0]
+        if failure_kind != "task-cancel":
+            assert caught.value is failure
+    finally:
+        if not release.done():
+            release.cancel()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert host.probe.count == 1 and host.commands == [] and host.transport.calls == []
+    assert host.probe.snapshot == service and host.backend._disk() == disk
+    assert host.record() == record and state_path.read_bytes() == state_bytes
+    assert host.writer is writer
+    writer.check()
+    host.control.check()
+
+
+@pytest.mark.parametrize("corrupt_controller", [False, True])
+async def test_stop_final_effect_guard_rechecks_authentication_before_original_deadline(
+    host: Host, monkeypatch: pytest.MonkeyPatch, corrupt_controller: bool
+) -> None:
+    host.move("draining")
+    record = host.move("activating", "stop_base")
+    disk, service, writer = host.backend._disk(), host.probe.snapshot, host.writer
+    assert writer is not None
+    original_disk, reads = host.backend._disk, 0
+
+    def read() -> _DiskBinding:
+        nonlocal reads
+        result = original_disk()
+        reads += 1
+        if reads == 2:
+            host.clock.elapsed = record.deadline.seconds
+            if corrupt_controller:
+                Path(host.backend.controller_slot.package.root, "__main__.py").write_bytes(
+                    b"changed before final effect"
+                )
+        return result
+
+    monkeypatch.setattr(host.backend, "_disk", read)
+    expected = ManagedDeploymentError if corrupt_controller else TimeoutError
+    with pytest.raises(expected) as caught:
+        await host.backend.stop(record, "base")
+    if corrupt_controller:
+        assert str(caught.value) == "anchor_unavailable"
+    assert reads == 2 and host.probe.count == 2
+    assert host.commands == [] and host.transport.calls == []
+    assert host.probe.snapshot == service and original_disk() == disk
+    assert host.record() == record and host.record().deadline == record.deadline
+    assert host.writer is writer
+    writer.check()
+    host.control.check()

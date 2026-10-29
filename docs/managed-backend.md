@@ -12,6 +12,8 @@
 
 运行态观察在每次真实 probe 前重新认证，返回后将相邻的 controller 与选中角色核验合为一次完整检查。只在这段不含等待的内部代码中读取当前磁盘、验证进程归属或比较前后观察；局部观察失败时仍先检查 controller，保留原错误优先级。origin 进程继续校验完整 base 安装，stop-only 继续仅认证 controller；readiness 等待后重新读取所有包，不跨等待保存认证证明。停止态确认、第三次 probe 及所有效果前安全门保持原流程。
 
+停止流程的第二次 probe 前由效果门完成完整认证与期限检查，复用为该次 probe 的前置门；返回后的独立认证和停止命令前的效果门保留。
+
 所有文件修改要求服务已经停止、cgroup 为空，并真实持有现有 writer lease。正向只按配置→selector→unit，回退只按 unit→selector→配置，接受范围是该代冻结正向或反向前缀。不会把三个文件各自的允许值任意组合。已有 desired 内容也调用文件及父目录耐久确认；不存在的 legacy selector 同样确认父目录。selector 只支持本产品 canonical JSON，非 canonical 快照在 prepare 时拒绝，后端再核，不悄悄重新序列化旧证据。
 
 unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh manager 属性证明当前 unit 已加载。命令返回零不算确认。只有同 revision、完整三文件耐久确认、空 cgroup、真实 lease 和 fresh loaded unit 证据才能产生 `BindingConfirmation`；start 在效果前独立重做这些核验。旧 boot、错误 nonce、错误格式/安装/配置证明均不能提交。原 deadline 和回退保留时间不续期；未知 start 不重复发送；激活请求超时或取消后只重观察，不由该后端盲目重发。

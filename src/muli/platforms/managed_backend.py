@@ -690,8 +690,10 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             return
         # Stop-only may terminate a precisely observed broken slot. It neither
         # grants health nor requires that slot's damaged package to run again.
-        self._effect_guard(record, None)
-        if before != await self._probe(record) or disk != self._disk():
+        if (
+            before != await self._probe(record, preflight=lambda: self._effect_guard(record, None))
+            or disk != self._disk()
+        ):
             raise ObservationError("transaction_observation_changed")
         self._effect_guard(record, None)
         await self._command("stop")
