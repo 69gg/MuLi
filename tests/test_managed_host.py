@@ -89,7 +89,6 @@ def current_controller(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     def verify(slot: SlotIdentity) -> None:
         verified.append(slot.digest)
 
-    monkeypatch.setattr(host_module, "verify_current_slot", verify)
     monkeypatch.setattr(host_module, "verify_current_process", verify)
     return verified
 
@@ -431,11 +430,10 @@ async def test_real_host_authentication_hashes_controller_once_on_each_side_of_h
             environment.journal.directory.path, probe=probe, clock=environment.clock
         )
 
-    # Entry and initial _record retain their original three full file checks.
+    # Entry and initial _record each retain their complete file check.
     # Authentication then requires exactly one complete check before the RPC
     # and another after it, with exact current-process validation on both sides.
     assert events == [
-        "files",
         "files",
         "process",
         "files",

@@ -44,7 +44,6 @@ from muli.platforms.managed_deployment import (
     DeploymentStore,
     SlotIdentity,
     verify_current_process,
-    verify_current_slot,
 )
 from muli.platforms.managed_launcher import resolve_entry
 from muli.platforms.managed_probe import ManagedSystemdProbe
@@ -101,7 +100,8 @@ def _entry(root: Path) -> _Entry:
         ):
             raise TransactionError("managed_entry_changed")
         store.verify_anchor(anchor)
-        verify_current_slot(controller)
+        # The adjacent anchor check already authenticated these controller files.
+        verify_current_process(controller)
         if store.directory.read("state.json", anchor.journal.max_record_bytes) != data:
             raise TransactionError("managed_entry_changed")
         return _Entry(record, anchor, controller)

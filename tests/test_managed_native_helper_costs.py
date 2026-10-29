@@ -344,19 +344,21 @@ async def _exercise_generated_hook(
                         assert current == record
                         assert controller == host.slots["base"] and slots == host.slots
                     else:
-                        original_anchor = DeploymentStore.verify_anchor
+                        original_anchor = managed_deployment._MetadataScope.verify_anchor
                         authenticated: list[DeploymentAnchor] = []
 
                         def failing_anchor(
-                            store: DeploymentStore, anchor: DeploymentAnchor
+                            scope: managed_deployment._MetadataScope, anchor: DeploymentAnchor
                         ) -> None:
-                            original_anchor(store, anchor)
+                            original_anchor(scope, anchor)
                             authenticated.append(anchor)
                             assert host_failure is not None
                             raise host_failure
 
                         with monkeypatch.context() as local:
-                            local.setattr(DeploymentStore, "verify_anchor", failing_anchor)
+                            local.setattr(
+                                managed_deployment._MetadataScope, "verify_anchor", failing_anchor
+                            )
                             with pytest.raises(type(host_failure)) as caught:
                                 managed_host._record(control, host.anchor)
                             assert caught.value is host_failure
@@ -1989,14 +1991,14 @@ async def test_narrow_real_guard_failures_keep_identity_and_host_failure_has_no_
     )
     host, observer = guard.host, guard.observer
     record = guard.read_record(host.control, host.anchor)[0]
-    original_anchor = DeploymentStore.verify_anchor
+    original_anchor = managed_deployment._MetadataScope.verify_anchor
 
-    def anchor(store: DeploymentStore, selected: DeploymentAnchor) -> None:
-        original_anchor(store, selected)
+    def anchor(scope: managed_deployment._MetadataScope, selected: DeploymentAnchor) -> None:
+        original_anchor(scope, selected)
         raise failure
 
     with monkeypatch.context() as local:
-        local.setattr(DeploymentStore, "verify_anchor", anchor)
+        local.setattr(managed_deployment._MetadataScope, "verify_anchor", anchor)
         with pytest.raises(type(failure)) as caught:
             guard.read_record(host.control, host.anchor)
         assert caught.value is failure

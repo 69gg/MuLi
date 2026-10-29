@@ -6,7 +6,7 @@ import errno
 import os
 import sys
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,7 +21,9 @@ from test_managed_backend_python_proof import observe_python_reads
 from test_managed_deployment_authentication_batch import bounded_slots as bounded_slots
 from test_managed_deployment_authentication_batch import observe_metadata
 from test_managed_host import filesystems as filesystems
+from test_managed_observation_authentication import observe_complete_package_scans
 
+import muli
 import muli.managed_host as host_module
 import muli.platforms.managed_deployment as deployment_module
 from muli.managed_journal import RoleSnapshots
@@ -56,6 +58,119 @@ async def metadata_host(tmp_path: Path, request: pytest.FixtureRequest) -> Async
             finally:
                 value.release_writer()
                 await value.backend.__aexit__()
+
+
+async def test_typed_entry_authenticates_controller_once_and_keeps_process_and_final_state(
+    metadata_host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = metadata_host
+    root, controller = host.journal.directory.path, host.backend.controller_slot
+    package = Path(controller.package.root)
+    state_path = root / "state.json"
+    state_bytes, record = state_path.read_bytes(), host.record()
+    original_fingerprint = managed_launcher.package_fingerprint
+    scans = observe_complete_package_scans(host, monkeypatch)
+    python_reads = observe_python_reads(host, monkeypatch)
+    original_route = host_module.resolve_entry
+    original_process = deployment_module.verify_current_process
+    routes: list[managed_launcher.LaunchPlan] = []
+    processes: list[SlotIdentity] = []
+
+    def unchanged() -> None:
+        pass
+
+    after_route: Callable[[], None] = unchanged
+    after_process: Callable[[], None] = unchanged
+    observing_positive = True
+
+    def route(path: Path, *, purpose: str) -> managed_launcher.LaunchPlan:
+        before_scans, before_python = dict(scans), python_reads.bytes
+        plan = original_route(path, purpose=purpose)
+        assert path == root and purpose == "recover" and plan.role == "controller"
+        assert plan.deployment == host.anchor.digest and plan.installation == controller.digest
+        assert plan.generation == record.generation and plan.revision == record.revision
+        assert plan.state_digest == managed_launcher.digest(state_bytes)
+        assert plan.python == Path(controller.lexical_python)
+        if observing_positive:
+            assert python_reads.bytes - before_python == controller.resolved_python.identity.size
+            assert {path: scans[path] - count for path, count in before_scans.items()} == {
+                path: int(path == package) for path in scans
+            }
+        routes.append(plan)
+        after_route()
+        return plan
+
+    def process(slot: SlotIdentity) -> None:
+        processes.append(slot)
+        original_process(slot)
+        after_process()
+
+    monkeypatch.setattr(sys, "executable", controller.lexical_python)
+    monkeypatch.setattr(sys, "prefix", controller.prefix)
+    monkeypatch.setattr(muli, "__file__", str(package / "__init__.py"))
+    monkeypatch.setattr(host_module, "resolve_entry", route)
+    monkeypatch.setattr(host_module, "verify_current_process", process)
+    monkeypatch.setattr(deployment_module, "verify_current_process", process)
+
+    entry = host_module._entry(root)
+
+    assert entry.anchor == host.anchor and entry.controller == controller
+    assert entry.record == record and state_path.read_bytes() == state_bytes
+    assert processes == [controller] and len(routes) == 1
+    typed_scans = scans[package] - len(routes)
+    typed_python_bytes = python_reads.bytes - controller.resolved_python.identity.size
+    typed_python_opens = len(python_reads.opened) - len(routes)
+    assert typed_scans > 0 and typed_python_opens == typed_scans
+    assert typed_python_bytes == controller.resolved_python.identity.size * typed_scans
+    assert scans[Path(host.slots["target"].package.root)] == 0
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in python_reads.opened)
+    # Fault cases must reach the real verifier's rejection, not the positive spy.
+    observing_positive = False
+    monkeypatch.setattr(managed_launcher, "package_fingerprint", original_fingerprint)
+
+    leaf = package / "__main__.py"
+    original_leaf = leaf.read_bytes()
+
+    def damage_package() -> None:
+        leaf.write_bytes(original_leaf + b"\n# changed after actual routing\n")
+
+    after_route = damage_package
+    try:
+        with monkeypatch.context() as local:
+            local.setattr(sys, "executable", host.slots["target"].lexical_python)
+            with pytest.raises(ManagedDeploymentError, match="^anchor_unavailable$"):
+                host_module._entry(root)
+    finally:
+        leaf.write_bytes(original_leaf)
+        after_route = unchanged
+    # Actual typed package authentication must precede a wrong-process error.
+    assert processes == [controller]
+
+    with monkeypatch.context() as local:
+        local.setattr(sys, "executable", host.slots["target"].lexical_python)
+        with pytest.raises(ManagedDeploymentError, match="^managed_process_mismatch$"):
+            host_module._entry(root)
+    assert processes == [controller, controller]
+
+    def change_final_state() -> None:
+        state_path.write_bytes(state_bytes + b"\n")
+
+    after_process = change_final_state
+    try:
+        with pytest.raises(TransactionError, match="^managed_entry_changed$"):
+            host_module._entry(root)
+    finally:
+        state_path.write_bytes(state_bytes)
+        after_process = unchanged
+    assert processes == [controller] * 3 and len(routes) == 4
+    assert host.record() == record and state_path.read_bytes() == state_bytes
+    host.control.check()
+    if host.writer is not None:
+        host.writer.check()
+    assert host.probe.count == 0 and host.commands == [] and host.transport.calls == []
+    # All real routing, bytes, process and refusal checks precede the old-code red:
+    # its typed entry verifies the same complete controller twice, instead of once.
+    assert typed_scans == 1
 
 
 @pytest.mark.parametrize("metadata_host", ["adopt", "switch", "three"], indirect=True)

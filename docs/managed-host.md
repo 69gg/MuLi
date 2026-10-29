@@ -10,6 +10,8 @@ controller-python -I -m muli.managed_host --root ROOT recover
 
 `recover` 使用现有 launcher 的只读恢复路由核验 root、V2 record、固定 anchor 和 controller，再在原 journal 锁下调用 `ensure_managed_helper`。它不读取当前 selector、不导入 selected target，不构造 Runtime、Store 或 effects backend，也不直接 stop、install、start 或 activate。root 使用 anchor 冻结的路径；数据库须为 Runtime 既有的 `data_dir/muli.sqlite3`。配置/数据库只核无链接路径链及普通所有者文件，不读取 SQLite 内容。
 
+固定入口完整认证 controller 文件后，紧邻只核当前进程身份，避免重复扫描同一解释器和包；只读路由与等待两侧的独立认证保持。
+
 `ensure_managed_helper(control, anchor)` 已由管理宿主复用，调用者已持有同 journal 锁。调用进程可为当前 base/target；新 helper 的 executable 始终来自固定 controller。unit 名由 protocol 2、deployment digest 与完整 generation 共同摘要得到。同一代只使用该名称；已存在时必须通过现有 `SystemdProbe.read_helper` 核验 argv、PID、cgroup、资源属性及内核限制，不能 reset、改名或另起 helper。只有明确不存在时才调用一次 `systemd-run`，成功仅返回 `accepted`，不声称运行或恢复成功。
 
 实际 transient helper 命令为：
