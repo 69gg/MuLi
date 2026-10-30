@@ -279,8 +279,16 @@ async def test_same_names_do_not_hide_changed_constraints_or_index_definitions(
         db.executescript(sql)
     before = snapshot(database)
     connections, mutations = prohibit_writes(monkeypatch)
-    with pytest.raises(ExistingStoreError, match="existing_store_schema_unsupported"):
-        Store.open_existing(database)
+
+    # This checks schema diagnostics; scheduling gaps belong to the separate
+    # wall-clock budget tests below, rather than racing this exact error code.
+    def schema_clock() -> float:
+        return 0.0
+
+    with monkeypatch.context() as schema_time:
+        schema_time.setattr(store_schema, "monotonic", schema_clock)
+        with pytest.raises(ExistingStoreError, match="existing_store_schema_unsupported"):
+            Store.open_existing(database)
     assert mutations == [] and snapshot(database) == before
     assert_closed(connections)
 
