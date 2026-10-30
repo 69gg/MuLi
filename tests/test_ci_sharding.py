@@ -73,7 +73,7 @@ def assignment(root: Path, items: list[CollectedItem], shards: int) -> dict[str,
     return groups
 
 
-@pytest.mark.parametrize("shards", [2, 3])
+@pytest.mark.parametrize("shards", [2, 3, 4])
 def test_groups_cover_the_collected_items_once_without_splitting_files(
     tmp_path: Path, shards: int
 ) -> None:
@@ -103,15 +103,18 @@ def test_workflow_matrix_covers_each_runner_with_complete_disjoint_partitions(
     path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     suite = workflow["jobs"]["tests"]
+    assert suite["timeout-minutes"] == 10
+    assert suite["strategy"]["max-parallel"] == 6
+    assert suite["strategy"]["fail-fast"] is False
     matrix = suite["strategy"]["matrix"]
     assert set(matrix) == {"include"}
     entries = matrix["include"]
-    assert len(entries) == 14
+    assert len(entries) == 16
     items = sample_items(tmp_path)
     for operating_system, shards in (
         ("ubuntu-latest", 2),
         ("macos-latest", 2),
-        ("windows-latest", 3),
+        ("windows-latest", 4),
     ):
         for python in ("3.12", "3.13"):
             rows = [
@@ -136,7 +139,7 @@ def test_workflow_matrix_covers_each_runner_with_complete_disjoint_partitions(
     assert "--muli-ci-shards=${{ matrix.shards }}" in partition["run"]
 
 
-@pytest.mark.parametrize("shards", [2, 3])
+@pytest.mark.parametrize("shards", [2, 3, 4])
 def test_adding_a_file_does_not_move_existing_cases(tmp_path: Path, shards: int) -> None:
     items = sample_items(tmp_path)
     before = assignment(tmp_path, items, shards)
@@ -146,7 +149,7 @@ def test_adding_a_file_does_not_move_existing_cases(tmp_path: Path, shards: int)
     assert set(after) == {*before, added.nodeid}
 
 
-@pytest.mark.parametrize("shards", [2, 3])
+@pytest.mark.parametrize("shards", [2, 3, 4])
 def test_checkout_location_does_not_change_groups(tmp_path: Path, shards: int) -> None:
     first, second = tmp_path / "first-checkout", tmp_path / "different-checkout"
     assert assignment(first, sample_items(first), shards) == assignment(
@@ -154,7 +157,7 @@ def test_checkout_location_does_not_change_groups(tmp_path: Path, shards: int) -
     )
 
 
-@pytest.mark.parametrize("arguments", [(), ("--muli-ci-shards=3",)])
+@pytest.mark.parametrize("arguments", [(), ("--muli-ci-shards=3",), ("--muli-ci-shards=4",)])
 def test_without_a_shard_collection_and_hooks_are_untouched(
     tmp_path: Path, arguments: tuple[str, ...]
 ) -> None:
@@ -179,10 +182,10 @@ def test_default_group_count_matches_explicit_two(tmp_path: Path) -> None:
     [
         "--muli-ci-shard=0",
         "--muli-ci-shard=-1",
-        "--muli-ci-shard=4",
+        "--muli-ci-shard=5",
         "--muli-ci-shard=invalid",
         "--muli-ci-shards=1",
-        "--muli-ci-shards=4",
+        "--muli-ci-shards=5",
         "--muli-ci-shards=invalid",
     ],
 )
@@ -194,7 +197,14 @@ def test_invalid_options_are_rejected(argument: str, capsys: pytest.CaptureFixtu
 
 
 @pytest.mark.parametrize(
-    "arguments", [("--muli-ci-shard=3",), ("--muli-ci-shard=3", "--muli-ci-shards=2")]
+    "arguments",
+    [
+        ("--muli-ci-shard=3",),
+        ("--muli-ci-shard=3", "--muli-ci-shards=2"),
+        ("--muli-ci-shard=4",),
+        ("--muli-ci-shard=4", "--muli-ci-shards=2"),
+        ("--muli-ci-shard=4", "--muli-ci-shards=3"),
+    ],
 )
 def test_index_outside_the_total_is_rejected_before_selection(
     tmp_path: Path, arguments: tuple[str, ...]
@@ -206,7 +216,7 @@ def test_index_outside_the_total_is_rejected_before_selection(
     assert config.hook.calls == []
 
 
-@pytest.mark.parametrize("shards", [2, 3])
+@pytest.mark.parametrize("shards", [2, 3, 4])
 def test_empty_groups_are_errors_instead_of_green_coverage_gaps(
     tmp_path: Path, shards: int
 ) -> None:

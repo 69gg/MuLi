@@ -79,27 +79,35 @@ jobs:
           - os: windows-latest
             python: '3.12'
             shard: 1
-            shards: 3
+            shards: 4
           - os: windows-latest
             python: '3.12'
             shard: 2
-            shards: 3
+            shards: 4
           - os: windows-latest
             python: '3.12'
             shard: 3
-            shards: 3
+            shards: 4
+          - os: windows-latest
+            python: '3.12'
+            shard: 4
+            shards: 4
           - os: windows-latest
             python: '3.13'
             shard: 1
-            shards: 3
+            shards: 4
           - os: windows-latest
             python: '3.13'
             shard: 2
-            shards: 3
+            shards: 4
           - os: windows-latest
             python: '3.13'
             shard: 3
-            shards: 3
+            shards: 4
+          - os: windows-latest
+            python: '3.13'
+            shard: 4
+            shards: 4
     runs-on: ${{ matrix.os }}
     env:
       MULI_PREVIOUS_SOURCE_ROOT: ${{ github.workspace }}/.local-check-artifacts/previous-consumer
