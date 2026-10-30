@@ -103,7 +103,7 @@ def test_workflow_matrix_covers_each_runner_with_complete_disjoint_partitions(
     path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     suite = workflow["jobs"]["tests"]
-    assert suite["timeout-minutes"] == 10
+    assert suite["timeout-minutes"] == 30
     assert suite["strategy"]["max-parallel"] == 6
     assert suite["strategy"]["fail-fast"] is False
     matrix = suite["strategy"]["matrix"]

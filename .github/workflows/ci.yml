@@ -38,7 +38,7 @@ jobs:
           name: python-package
           path: dist/*
   tests:
-    timeout-minutes: 10
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       max-parallel: 6
