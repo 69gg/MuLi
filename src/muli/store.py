@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -14,7 +15,7 @@ from time import monotonic
 from typing import Any, Literal
 
 from muli.compatibility import FormatState
-from muli.evidence import EvidenceError
+from muli.evidence import EvidenceError, MessageEvidenceField, validate_integer
 from muli.format_admission import (
     FormatAdmissionError,
     publish_created_format,
@@ -95,11 +96,7 @@ def message_text_size(record: dict[str, Any]) -> int:
 _EVIDENCE_METADATA = ("role", "source", "principal", "evidence_revision", "attachment_ids")
 # Older SQLite versions narrow substr lengths to 32 bits. The actual BLOB size
 # is sufficient for any requested window and keeps large valid budgets portable.
-_EVIDENCE_COLUMNS = (
-    "o.id,m.seq,json_type(o.data,'$.content') AS content_type,"
-    "length(CAST(json_extract(o.data,'$.content') AS BLOB)) AS content_bytes,"
-    "coalesce(substr(CAST(json_extract(o.data,'$.content') AS BLOB),?,"
-    "min(?,length(CAST(json_extract(o.data,'$.content') AS BLOB)))),x'') AS content,"
+_EVIDENCE_METADATA_COLUMNS = (
     "CASE json_extract(o.data,'$.content_provenance') "
     "WHEN 'accepted' THEN 'accepted' WHEN 'runtime_excerpt' THEN 'runtime_excerpt' "
     "ELSE 'unknown' END AS content_provenance,"
@@ -113,6 +110,24 @@ _EVIDENCE_COLUMNS = (
         for field in _EVIDENCE_METADATA
     )
 )
+_MESSAGE_EVIDENCE_PATHS = {"content": "$.content", "tool_calls": "$.tool_calls"}
+
+
+def _message_evidence_columns(field: MessageEvidenceField) -> str:
+    # Only host-owned paths may reach SQL; this is not a general JSON reader.
+    if not isinstance(field, str) or field not in _MESSAGE_EVIDENCE_PATHS:
+        raise EvidenceError("invalid_arguments", "field 仅支持 content 或 tool_calls")
+    path = _MESSAGE_EVIDENCE_PATHS[field]
+    return (
+        f"o.id,m.seq,json_type(o.data,'{path}') AS content_type,"
+        f"length(CAST(json_extract(o.data,'{path}') AS BLOB)) AS content_bytes,"
+        f"coalesce(substr(CAST(json_extract(o.data,'{path}') AS BLOB),?,"
+        f"min(?,length(CAST(json_extract(o.data,'{path}') AS BLOB)))),x'') AS content,"
+        + _EVIDENCE_METADATA_COLUMNS
+    )
+
+
+_EVIDENCE_COLUMNS = _message_evidence_columns("content")
 _EVIDENCE_FROM = (
     " FROM message_order m JOIN objects o ON o.kind='message' AND o.id=m.message_id "
     "WHERE m.session_id=? AND json_type(o.data,'$.session_id')='text' "
@@ -1781,22 +1796,117 @@ class Store:
         offset_bytes: int,
         length_bytes: int,
         metadata_bytes: int,
+        field: MessageEvidenceField = "content",
+        deadline: float | None = None,
     ) -> dict[str, Any] | None:
-        """Read metadata and one content window from a single current SQLite row."""
+        """Read metadata and one whitelisted field window, never the full message."""
         if (message_id is None) == (seq is None):
             raise ValueError("message_id 和 seq 必须且只能提供一个")
         predicate = "AND m.message_id=?" if message_id is not None else "AND m.seq=?"
-        row = self.db.execute(
-            "SELECT " + _EVIDENCE_COLUMNS + _EVIDENCE_FROM + predicate,
-            (
-                offset_bytes + 1,
-                length_bytes,
-                *([metadata_bytes] * len(_EVIDENCE_METADATA)),
-                session_id,
-                message_id if message_id is not None else seq,
-            ),
-        ).fetchone()
+        sql = "SELECT " + _message_evidence_columns(field) + _EVIDENCE_FROM + predicate
+        if field == "tool_calls":
+            validate_integer(offset_bytes, "offset_bytes")
+            for name, value in (("length_bytes", length_bytes), ("metadata_bytes", metadata_bytes)):
+                if type(value) is not int or value != SQLITE_MAX_INTEGER:
+                    validate_integer(value, name, minimum=1)
+        bounds = (
+            offset_bytes + 1,
+            length_bytes,
+            *([metadata_bytes] * len(_EVIDENCE_METADATA)),
+            session_id,
+            message_id if message_id is not None else seq,
+        )
+        if field == "tool_calls":
+            return self._tool_call_evidence_slice(sql, bounds, deadline=deadline)
+        row = self.db.execute(sql, bounds).fetchone()
         return dict(row) if row is not None else None
+
+    def _tool_call_evidence_slice(
+        self, sql: str, bounds: tuple[Any, ...], *, deadline: float | None
+    ) -> dict[str, Any] | None:
+        """Own a short read-only connection instead of replacing a shared handler."""
+        if (
+            type(self.db) is not sqlite3.Connection
+            or self.db.text_factory is not str
+            or self.db.row_factory is not sqlite3.Row
+        ):
+            raise EvidenceError("content_unavailable", "工具调用档案需要资料库自有的标准连接")
+        if self.db.in_transaction or self._channel_reference_read_active:
+            raise EvidenceError(
+                "evidence_transaction_active", "工具调用读取不能接管已有事务或读取范围"
+            )
+        limits = ExistingStoreLimits()
+        if deadline is not None:
+            try:
+                valid_deadline = type(deadline) in {int, float} and math.isfinite(deadline)
+            except OverflowError:
+                valid_deadline = False
+            if not valid_deadline:
+                raise EvidenceError("invalid_arguments", "工具调用读取需要有限的宿主绝对期限")
+        local_deadline = monotonic() + limits.seconds
+        read_deadline = min(deadline, local_deadline) if deadline is not None else local_deadline
+        steps = 0
+        interval = min(100, limits.vm_steps)
+        interrupted = False
+
+        def progress() -> int:
+            nonlocal steps, interrupted
+            steps += interval
+            interrupted = steps >= limits.vm_steps or monotonic() >= read_deadline
+            return int(interrupted)
+
+        def check() -> None:
+            if interrupted or monotonic() >= read_deadline:
+                raise EvidenceError(
+                    "evidence_read_budget", "工具调用读取达到 SQLite 工作量或时间预算"
+                )
+
+        try:
+            check()
+            with closing(self.db.execute("PRAGMA database_list")) as rows:
+                database = next((row["file"] for row in rows if row["name"] == "main"), None)
+            if not isinstance(database, str) or not database:
+                raise EvidenceError("content_unavailable", "工具调用档案不支持无独立文件的资料库")
+            instance = self.instance_id
+            check()
+            # Same URI convention as Store construction. mode=ro cannot create,
+            # migrate or write the file, and timeout=0 never waits on a writer.
+            with closing(
+                sqlite3.connect(
+                    Path(database).as_uri() + "?mode=ro&cache=private",
+                    uri=True,
+                    timeout=0,
+                    isolation_level="DEFERRED",
+                )
+            ) as reader:
+                reader.row_factory = sqlite3.Row
+                reader.set_progress_handler(progress, interval)
+                reader.execute("BEGIN")
+                same_instance = reader.execute(
+                    "SELECT 1 FROM runtime_state WHERE name='store_instance_v1' AND value=?",
+                    (instance,),
+                ).fetchone()
+                if same_instance is None:
+                    raise EvidenceError("content_unavailable", "工具调用档案的资料库身份已变化")
+                row = reader.execute(sql, bounds).fetchone()
+                check()
+                return dict(row) if row is not None else None
+        except sqlite3.Error as exc:
+            if (
+                interrupted
+                or monotonic() >= read_deadline
+                or getattr(exc, "sqlite_errorcode", None)
+                in {
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                    sqlite3.SQLITE_TOOBIG,
+                    sqlite3.SQLITE_NOMEM,
+                }
+            ):
+                raise EvidenceError(
+                    "evidence_read_budget", "工具调用档案未能在 SQLite 读取预算内完成"
+                ) from exc
+            raise EvidenceError("content_unavailable", "工具调用档案的本地只读核验失败") from exc
 
     def replay_messages(
         self, session_id: str, *, after: int = 0, limit: int = 1000

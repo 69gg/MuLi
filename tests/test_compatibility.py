@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from test_compaction_objects_format import frozen_e141_bytes
 
 import muli
 from muli.compatibility import (
@@ -19,7 +20,11 @@ from muli.compatibility import (
     FormatSupport,
     assess_compatibility,
 )
-from muli.format_admission import CURRENT_FORMAT_STATE, PRE_MEMORY_WATCH_FORMAT_STATE
+from muli.format_admission import (
+    CURRENT_FORMAT_STATE,
+    PRE_MEMORY_WATCH_FORMAT_STATE,
+    PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
+)
 
 DOMAINS: tuple[FormatDomain, ...] = (
     "database",
@@ -93,12 +98,17 @@ def test_frozen_pre_watch_manifest_does_not_permit_a_same_format_switch(
         version = getattr(PRE_MEMORY_WATCH_FORMAT_STATE.formats, domain)
         support = getattr(previous.formats, domain)
         assert support.reads == (version,) and support.writes == version
-    shipped = shipped_manifest()
-    assert not previous.requires_migration and not shipped.requires_migration
-    current = (
-        PRE_MEMORY_WATCH_FORMAT_STATE if current_side == "before_upgrade" else CURRENT_FORMAT_STATE
+    # Keep the original configuration boundary independent of the later objects4 contract.
+    before_compaction = CompatibilityManifest.from_json(
+        frozen_e141_bytes("compatibility_v2_141.json")
     )
-    result = assess_compatibility(previous, shipped, current, handoff_protocol=2)
+    assert not previous.requires_migration and not before_compaction.requires_migration
+    current = (
+        PRE_MEMORY_WATCH_FORMAT_STATE
+        if current_side == "before_upgrade"
+        else PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+    )
+    result = assess_compatibility(previous, before_compaction, current, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "current_format_unreadable" and result.domain == "configuration"
     assert result.side == ("candidate" if current_side == "before_upgrade" else "base")
@@ -111,8 +121,14 @@ def test_watch_ingress_contract_is_independently_unreadable_by_the_frozen_manife
     # Isolate ingress: matching the new configuration contract must not conceal
     # the old reader's missing cancellation and independently revocable proof.
     previous_data["formats"]["configuration"] = {"reads": [2], "writes": 2}
+    before_compaction = CompatibilityManifest.from_json(
+        frozen_e141_bytes("compatibility_v2_141.json")
+    )
     result = assess_compatibility(
-        manifest(previous_data), shipped_manifest(), CURRENT_FORMAT_STATE, handoff_protocol=2
+        manifest(previous_data),
+        before_compaction,
+        PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
+        handoff_protocol=2,
     )
     assert not result.format_compatible
     assert result.code == "current_format_unreadable" and result.domain == "ingress"

@@ -21,7 +21,7 @@ from jsonschema import Draft202012Validator
 
 from muli.channel_ownership import ChannelOwnership
 from muli.channels.types import normalize_channel_reference
-from muli.compaction import Compactor
+from muli.compaction import Candidate, Compactor
 from muli.config import ConfigFile, ModelProfile, Settings
 from muli.context import ContextLimitError, context_size, minimum_context, pack_context
 from muli.conversation import Conversation
@@ -147,6 +147,7 @@ class _HistoryContext:
     query: str
     latest_user_id: str | None
     task_query: str | None
+    summary_message: Message | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +155,8 @@ class _RequiredContext:
     messages: list[Message]
     minimum: list[Message]
     host_message: Message | None
+    summary_message: Message | None = None
+    preserved_ids: frozenset[str] = frozenset()
 
 
 class Runtime:
@@ -548,12 +551,20 @@ class Runtime:
         messages: list[Message],
         *,
         history: _HistoryContext | None = None,
+        preserved_ids: frozenset[str] = frozenset(),
     ) -> _RequiredContext:
         host = deepcopy(history.host_message) if history is not None else None
+        summary = deepcopy(history.summary_message) if history is not None else None
+        preserved = {
+            identifier: [
+                deepcopy(message) for message in messages if message.source_message_id == identifier
+            ]
+            for identifier in preserved_ids
+        }
         for hook in self.context_hooks:
             messages = await hook(session_id, messages)
             request = self.request_context(session_id)
-            if request is not None and request.memory_watch is not None:
+            if request is not None:
                 self._guard_request(request)
         retained_host = (
             history is not None
@@ -577,7 +588,7 @@ class Runtime:
             ]
         if self.skills_context is not None:
             messages = await self.skills_context(session_id, messages)
-            if request is not None and request.memory_watch is not None:
+            if request is not None:
                 self._guard_request(request)
         if not (
             retained_host
@@ -587,12 +598,18 @@ class Runtime:
             and sum(message == host for message in messages) == 1
         ):
             host = None
-        minimum = minimum_context(messages)
-        if context_size(minimum) > self.config.settings.limits.max_context_chars:
-            # Only necessary-context failures may trigger the existing compaction
-            # retry. No memory callback has been invoked at this point.
-            pack_context(minimum, self.config.settings.limits.max_context_chars)
-        return _RequiredContext(messages, minimum, host)
+        if summary is not None and (
+            sum(message == summary for message in messages) != 1
+            or sum(message.source_message_id == summary.source_message_id for message in messages)
+            != 1
+        ):
+            summary = None
+        for identifier, expected in preserved.items():
+            actual = [message for message in messages if message.source_message_id == identifier]
+            if len(expected) != 1 or actual != expected:
+                raise ContextLimitError("扩展或技能更改了本轮必须原样保留的输入或工具批次")
+        minimum = minimum_context(messages, preserved_ids=preserved_ids)
+        return _RequiredContext(messages, minimum, host, summary, preserved_ids)
 
     @staticmethod
     def _insert_memory_context(messages: Sequence[Message], memory: Message) -> list[Message]:
@@ -612,7 +629,7 @@ class Runtime:
         maximum = self.config.settings.limits.max_context_chars
         minimum_size = context_size(required.minimum)
         if minimum_size > maximum:
-            pack_context(required.minimum, maximum)
+            pack_context(required.minimum, maximum, preserved_ids=required.preserved_ids)
         composition = PromptComposition("", "")
         settings = self.config.settings.memory
         char_limit = min(
@@ -670,7 +687,7 @@ class Runtime:
             if memory is not None
             else required.messages
         )
-        packed = pack_context(messages, maximum)
+        packed = pack_context(messages, maximum, preserved_ids=required.preserved_ids)
         if required.host_message is not None:
             return self._append_task_memory(
                 packed, required.host_message, memory, composition.with_task
@@ -798,22 +815,43 @@ class Runtime:
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
         try:
-            try:
-                projected = self.compaction.project(session_id)
-                history = self._history_context(session_id, stored=projected)
-                required = await self._prepare_required_context(
-                    session_id, history.messages, history=history
+            projected = self.compaction.project(session_id)
+            history = self._history_context(session_id, stored=projected, observe=False)
+            canonical = deepcopy(history.messages)
+            run_id = self.run_ids.get(session_id)
+            active = self.store.get("compaction", session_id) or {}
+            anchor_ids = {
+                item["id"]
+                for item in active.get("anchors", [])
+                if run_id is None or item.get("run_id") == run_id
+            }
+            legacy_anchor = active.get("anchor")
+            if legacy_anchor and (run_id is None or legacy_anchor.get("run_id") == run_id):
+                anchor_ids.add(legacy_anchor["id"])
+            preserved_ids = frozenset(
+                item["id"]
+                for item in projected
+                if item["role"] == "user"
+                and (
+                    item["id"] in anchor_ids
+                    or (run_id is not None and item.get("run_id") == run_id)
                 )
-            except ContextLimitError:
-                # Retrying compaction uses the same frozen scope, never a new
-                # epoch attached to the old request's task brief.
-                if not await self.compaction.finish(session_id):
-                    raise
-                projected = self.compaction.project(session_id)
-                history = self._history_context(session_id, stored=projected)
-                required = await self._prepare_required_context(
-                    session_id, history.messages, history=history
-                )
+            )
+            required = await self._prepare_required_context(
+                session_id, history.messages, history=history, preserved_ids=preserved_ids
+            )
+            self._guard_request(prepared)
+            if context_size(required.minimum) > self.config.settings.limits.max_context_chars:
+                # Only the explicit, local minimum state admits this one retry.
+                # Hook, skills and provider exceptions retain their identity.
+                pressure = await self._pressure_context(prepared, projected, canonical, required)
+                self._guard_request(prepared)
+                if pressure is not None:
+                    projected, history, required = pressure
+            else:
+                # Fixed required facts must fit before admitting optional
+                # background work. Pressure plans preflight their own tail.
+                self.compaction.observe(session_id)
             # Provider failures, including ContextLimitError, retain their identity
             # and cannot repeat hooks, skills or an arbitrary memory callback.
             messages = self._pack_memory_context(required, history)
@@ -826,6 +864,149 @@ class Runtime:
             return replace(prepared, messages=messages)
         finally:
             self._request_context.reset(token)
+
+    async def _pressure_context(
+        self,
+        prepared: PreparedRequest,
+        projected: list[dict[str, Any]],
+        canonical: list[Message],
+        original: _RequiredContext,
+    ) -> tuple[list[dict[str, Any]], _HistoryContext, _RequiredContext] | None:
+        """Preview one existing checkpoint against this request before committing it."""
+        if not self.config.settings.compaction.enabled:
+            return None
+        session_id = prepared.session_id
+        run_id = self.run_ids.get(session_id)
+        identities = [
+            message.source_message_id
+            for message in original.messages
+            if message.role not in {"system", "developer"}
+        ]
+        if None in identities or len(set(identities)) != len(identities):
+            return None
+        minimum_users = {
+            message.source_message_id for message in original.minimum if message.role == "user"
+        }
+        anchors = [
+            item
+            for item in projected
+            if item["role"] == "user"
+            and (
+                item.get("id") in minimum_users
+                or (run_id is not None and item.get("run_id") == run_id)
+            )
+        ]
+        preserved_ids = {item["id"] for item in anchors}
+        # Owner inputs following a completed batch do not consume it. Ordinary
+        # results get the same whole-batch protection as accepted protected ones.
+        index = len(canonical) - 1
+        while index >= 0 and canonical[index].role in {"system", "developer", "user"}:
+            index -= 1
+        while index >= 0 and canonical[index].role == "tool":
+            identifier = canonical[index].source_message_id
+            if identifier is None:
+                return None
+            preserved_ids.add(identifier)
+            index -= 1
+        if index >= 0 and canonical[index].tool_calls:
+            identifier = canonical[index].source_message_id
+            if identifier is None:
+                return None
+            preserved_ids.add(identifier)
+        frozen_ids = frozenset(preserved_ids)
+        expected = {
+            identifier: [
+                message for message in canonical if message.source_message_id == identifier
+            ]
+            for identifier in frozen_ids
+        }
+        if any(len(messages) != 1 for messages in expected.values()):
+            return None
+
+        def guard() -> None:
+            self._guard_request(prepared)
+            if self.store.pending_inputs(session_id):
+                raise ContextLimitError(
+                    "整理上下文期间收到新输入；本次旧请求停止，待安全边界重新领取"
+                )
+
+        guard()
+        candidate: Candidate | None = await self.compaction.pressure_candidate(session_id, anchors)
+        if candidate is None:
+            guard()
+            return None
+        adopted = False
+        try:
+            guard()
+            preview = self.compaction.project(
+                session_id, candidate=replace(candidate, summary=""), adopt_ready=False
+            )
+            history = self._history_context(
+                session_id, stored=preview, separate_summary=True, observe=False
+            )
+            required = await self._prepare_required_context(
+                session_id, history.messages, history=history, preserved_ids=frozen_ids
+            )
+            guard()
+            summary = required.summary_message
+            maximum = self.config.settings.limits.max_context_chars
+            fixed_size = context_size(required.minimum)
+            if summary is None or fixed_size > maximum:
+                return None
+            for identifier, messages in expected.items():
+                matches = [
+                    message
+                    for message in required.messages
+                    if message.source_message_id == identifier
+                ]
+                if matches != messages:
+                    return None
+            policy = self.config.settings.compaction
+            budget = min(
+                max(128, int(maximum * policy.target_ratio) // 2),
+                int((maximum - fixed_size) * policy.target_ratio),
+            )
+            rendered = await self.compaction.render_pressure(candidate, budget)
+            guard()
+            if rendered is None:
+                return None
+            candidate = rendered
+
+            def with_body(length: int) -> _RequiredContext:
+                addition = replace(summary, content=summary.content + candidate.summary[:length])
+                messages = [
+                    addition if message.source_message_id == summary.source_message_id else message
+                    for message in required.messages
+                ]
+                return replace(
+                    required,
+                    messages=messages,
+                    minimum=minimum_context(messages, preserved_ids=frozen_ids),
+                    summary_message=addition,
+                )
+
+            low, high = 0, len(candidate.summary)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if context_size(with_body(middle).minimum) <= maximum:
+                    low = middle
+                else:
+                    high = middle - 1
+            fitted = with_body(low)
+            if context_size(fitted.minimum) >= context_size(original.minimum):
+                return None
+            # Validate pairing and the final JSON budget before touching active.
+            pack_context(fitted.messages, maximum, preserved_ids=frozen_ids)
+            guard()
+            adopted = self.compaction.adopt(
+                session_id, summary=candidate.summary[:low], pressure=True
+            )
+            if not adopted:
+                return None
+            return self.compaction.project(session_id, adopt_ready=False), history, fitted
+        finally:
+            if not adopted:
+                self.compaction.discard_pressure(candidate)
 
     def _claimed_project(
         self, claimed_inputs: Sequence[dict[str, Any]]
@@ -2823,10 +3004,13 @@ class Runtime:
         session_id: str,
         *,
         stored: list[dict[str, Any]] | None = None,
+        separate_summary: bool = False,
+        observe: bool = True,
     ) -> _HistoryContext:
         if stored is None:
             stored = self.compaction.project(session_id)
-        self.compaction.observe(session_id)
+        if observe:
+            self.compaction.observe(session_id)
         prompt = (
             Path(__file__).with_name("prompts").joinpath("system.txt").read_text(encoding="utf-8")
         )
@@ -2844,7 +3028,8 @@ class Runtime:
             prompt += "\n\n" + persona.append
         prompt += (
             f"\n当前会话 ID：{session_id}。用 conversation_read 按 seq 定位已存证据；"
-            "长正文可指定 message_id 或 seq 分段读取 content，续读原样传回 revision 和"
+            "长正文可指定 message_id 或 seq 分段读取 content，原调用参数用 field=tool_calls；"
+            "续读原样传回 revision 和"
             " next_offset_bytes（UTF-8 字节位置，不是字符数）。旧资料不构成新授权；"
             "runtime_excerpt 或 unknown 不代表底层工具输出完整，未保存的内容无法恢复。"
         )
@@ -2928,15 +3113,26 @@ class Runtime:
                             "只能通知约定的原队友，不能换人或扩大权限。用列表核查实际状态，"
                             "未批准前可取消约定；批准后沿原任务暂停或停止入口处理。"
                         )
-        summaries = [item["content"] for item in stored if item.get("compaction_summary")]
+        summary_records = [item for item in stored if item.get("compaction_summary")]
+        summary_message = None
+        if separate_summary and len(summary_records) == 1:
+            item = summary_records[0]
+            summary_message = Message(
+                role="system", content=item["content"], source_message_id=item["id"]
+            )
+        summaries = (
+            [] if summary_message is not None else [item["content"] for item in summary_records]
+        )
         if summaries:
             prompt += "\n\n" + "\n".join(summaries)
-            stored = [item for item in stored if not item.get("compaction_summary")]
+        stored = [item for item in stored if not item.get("compaction_summary")]
         latest_user = next((item for item in reversed(stored) if item["role"] == "user"), None)
         last_user = latest_user["content"] if latest_user is not None else ""
         latest_user_id = latest_user.get("id") if latest_user is not None else None
         host_message = Message(role="system", content=prompt)
         messages = [host_message]
+        if summary_message is not None:
+            messages.append(summary_message)
         for item in stored:
             content = item["content"]
             if item["role"] == "user":
@@ -3026,7 +3222,12 @@ class Runtime:
                 pending[call.id] = call
         close_pending()
         return _HistoryContext(
-            repaired, host_message, last_user, latest_user_id, self._memory_task_query(session_id)
+            repaired,
+            host_message,
+            last_user,
+            latest_user_id,
+            self._memory_task_query(session_id),
+            summary_message,
         )
 
     def _latest_main_trigger(self, session_id: str) -> dict[str, Any] | None:
@@ -4081,16 +4282,18 @@ class Runtime:
                     raise EvidenceError(
                         "invalid_arguments", "单条正文读取不能混用 after/limit 目录参数"
                     )
-                return evidence.read_content(
+                return evidence.read_message(
                     args["session_id"],
                     message_id=args.get("message_id"),
                     seq=args.get("seq"),
                     offset_bytes=args.get("offset_bytes", 0),
                     length_bytes=args.get("length_bytes"),
                     revision=args.get("revision"),
+                    field=args.get("field", "content"),
+                    deadline=monotonic() + limits.max_search_seconds,
                     max_output_chars=limits.max_output_chars,
                 )
-            if {"offset_bytes", "length_bytes", "revision"}.intersection(args):
+            if {"offset_bytes", "length_bytes", "revision", "field"}.intersection(args):
                 raise EvidenceError("invalid_arguments", "正文续读参数需要 message_id 或 seq")
             return evidence.read(
                 args["session_id"],
@@ -4377,7 +4580,8 @@ class Runtime:
             ),
             Tool(
                 "conversation_read",
-                "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content。"
+                "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content；"
+                "field=tool_calls 分页核已存原调用数组，参数仍是原字符串，不执行调用。"
                 "续读使用 revision/next_offset_bytes；不恢复入库前丢失的正文，不读取附件或图片。"
                 "section=continuations 仅主助手只读列出直属未完队友；main_recovery 仅真实主人"
                 "当前请求中的主助手发现本会话已恢复的中断主运行与有限原输入起点，不恢复执行",
@@ -4390,6 +4594,7 @@ class Runtime:
                         "limit": {"type": "integer", "minimum": 1},
                         "message_id": string("与 seq 二选一；不能混用 after/limit"),
                         "seq": {"type": "integer", "minimum": 1},
+                        "field": {"type": "string", "enum": ["content", "tool_calls"]},
                         "offset_bytes": {
                             "type": "integer",
                             "minimum": 0,

@@ -17,6 +17,7 @@ import httpx
 import pytest
 from test_channel_format_upgrade import legacy_database, upgrade
 from test_channel_format_upgrade import snapshot as stored_rows
+from test_compaction_objects_format import frozen_e141_bytes
 from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model, snapshot
 from test_project_inbox_format import upgrade_platform
@@ -29,6 +30,7 @@ from muli.conversation import Conversation
 from muli.evidence import EvidenceError
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
+    PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
     PRE_OWNER_QUESTION_FORMAT_STATE,
     FormatAdmissionError,
     require_current_format,
@@ -75,9 +77,9 @@ def frozen_e140_module(name: str) -> ModuleType:
     return module
 
 
-def current_manifest() -> CompatibilityManifest:
-    path = Path(__file__).parents[1] / "src" / "muli" / "compatibility.json"
-    return CompatibilityManifest.from_json(path.read_bytes())
+def owner_answer_manifest() -> CompatibilityManifest:
+    # Keep the historical ingress6 -> ingress7 boundary isolated as objects advances.
+    return CompatibilityManifest.from_json(frozen_e141_bytes("compatibility_v2_141.json"))
 
 
 def test_e140_actual_admission_refuses_ingress7_before_business_writes(database: Path) -> None:
@@ -88,14 +90,18 @@ def test_e140_actual_admission_refuses_ingress7_before_business_writes(database:
         evidence = read_format_evidence(db)
         old.require_current_format(replace(evidence, state=PRE_OWNER_QUESTION_FORMAT_STATE))
         with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
-            old.require_current_format(evidence)
+            # Isolate the actual ingress6 -> ingress7 boundary from the later
+            # objects4 change in the current database's marker.
+            old.require_current_format(
+                replace(evidence, state=PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE)
+            )
         assert db.total_changes == 0
     assert snapshot(database) == before
 
 
 def test_current_admission_requires_explicit_upgrade_from_actual_ingress6(database: Path) -> None:
     old = frozen_e140_module("format_admission_v2_140.py")
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    assert PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "ingress": 7,
     }
@@ -124,14 +130,18 @@ def test_managed_same_format_switch_refuses_both_owner_answer_directions(
     after_upgrade: bool, reverse: bool
 ) -> None:
     previous = CompatibilityManifest.from_json(frozen_e140_bytes("compatibility_v2_140.json"))
-    current = current_manifest()
+    current = owner_answer_manifest()
     assert previous.release == "2.140.0"
     assert previous.formats.ingress.reads == (6,) and previous.formats.ingress.writes == 6
     assert current.formats.ingress.reads == (7,) and current.formats.ingress.writes == 7
     assert current.formats.model_dump(exclude={"ingress"}) == previous.formats.model_dump(
         exclude={"ingress"}
     )
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_OWNER_QUESTION_FORMAT_STATE
+    state = (
+        PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+        if after_upgrade
+        else PRE_OWNER_QUESTION_FORMAT_STATE
+    )
     base, candidate = (current, previous) if reverse else (previous, current)
     result = assess_compatibility(base, candidate, state, handoff_protocol=2)
     assert not result.format_compatible
@@ -141,7 +151,7 @@ def test_managed_same_format_switch_refuses_both_owner_answer_directions(
         previous, previous, PRE_OWNER_QUESTION_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
     assert assess_compatibility(
-        current, current, CURRENT_FORMAT_STATE, handoff_protocol=2
+        current, current, PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
 
 
@@ -160,9 +170,13 @@ def test_reading_both_ingress_contracts_cannot_authorize_owner_answer_write_chan
                 )
             }
         )
-        for manifest in (previous, current_manifest())
+        for manifest in (previous, owner_answer_manifest())
     )
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_OWNER_QUESTION_FORMAT_STATE
+    state = (
+        PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+        if after_upgrade
+        else PRE_OWNER_QUESTION_FORMAT_STATE
+    )
     result = assess_compatibility(declarations[0], declarations[1], state, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "write_format_change" and result.domain == "ingress"

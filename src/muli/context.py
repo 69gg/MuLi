@@ -119,7 +119,9 @@ def _preserved_results(messages: Sequence[Message]) -> set[int]:
     return preserved
 
 
-def _reduce_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
+def _reduce_context(
+    messages: Sequence[Message], max_chars: int, preserved_ids: frozenset[str] = frozenset()
+) -> list[Message]:
     """让最终打包与最低必要占用共用完全相同的节选及保护规则。"""
     packed = deepcopy(list(messages))
     _validate_pairs(packed)
@@ -133,6 +135,8 @@ def _reduce_context(messages: Sequence[Message], max_chars: int) -> list[Message
         -1,
     )
     for index, message in enumerate(packed):
+        if message.source_message_id in preserved_ids:
+            continue
         if (message.role == "tool" and index not in preserved) or (
             index < last_user
             and message.role == "assistant"
@@ -145,7 +149,10 @@ def _reduce_context(messages: Sequence[Message], max_chars: int) -> list[Message
     if current_size > max_chars:
         protected = {id(packed[index]) for index in preserved}
         for turn in _older_turns(packed):
-            if any(id(message) in protected for message in turn):
+            if any(
+                id(message) in protected or message.source_message_id in preserved_ids
+                for message in turn
+            ):
                 continue
             removed = {id(message) for message in turn}
             packed = [message for message in packed if id(message) not in removed]
@@ -160,12 +167,19 @@ def _reduce_context(messages: Sequence[Message], max_chars: int) -> list[Message
     return packed
 
 
-def minimum_context(messages: Sequence[Message]) -> list[Message]:
+def minimum_context(
+    messages: Sequence[Message], *, preserved_ids: frozenset[str] = frozenset()
+) -> list[Message]:
     """返回可合法缩减到的最小副本，仅用于计算可选资料的最高余量。"""
-    return _reduce_context(messages, 0)
+    return _reduce_context(messages, 0, preserved_ids)
 
 
-def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
+def pack_context(
+    messages: Sequence[Message],
+    max_chars: int,
+    *,
+    preserved_ids: frozenset[str] = frozenset(),
+) -> list[Message]:
     """先节选文本，再整体移出旧轮次；返回独立副本，严格遵守 JSON 字符预算。
 
     不补齐、不执行工具；调用方须先为中断且结果未知的调用补明确的未知结果。
@@ -175,7 +189,7 @@ def pack_context(messages: Sequence[Message], max_chars: int) -> list[Message]:
     """
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError("上下文字符预算必须是正整数")
-    packed = _reduce_context(messages, max_chars)
+    packed = _reduce_context(messages, max_chars, preserved_ids)
     if context_size(packed) > max_chars:
         raise ContextLimitError(
             "最新用户输入、完整任务说明、系统提示、当前轮原生协议数据或需完整保留的工具结果"

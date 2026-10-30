@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
 _UTF8_MAX_BYTES = 4
+MessageEvidenceField = Literal["content", "tool_calls"]
 
 
 class EvidenceError(ValueError):
@@ -56,6 +57,7 @@ def content_page(
     total_bytes: int,
     max_output_chars: int,
     omit_optional: Callable[[dict[str, Any]], bool] | None = None,
+    field: MessageEvidenceField = "content",
 ) -> dict[str, Any]:
     """Fit one SQL byte window without changing provenance or UTF-8 coordinates."""
     if offset_bytes > total_bytes:
@@ -63,7 +65,7 @@ def content_page(
     text = decode_utf8(raw, allow_incomplete_tail=True)
     result = {
         **metadata,
-        "field": "content",
+        "field": field,
         "offset_bytes": offset_bytes,
         "total_bytes": total_bytes,
     }

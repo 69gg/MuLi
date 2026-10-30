@@ -15,7 +15,7 @@ async def summary(source: str, max_tokens: int) -> str:
 
 
 @pytest.mark.parametrize("preserve", [True, False])
-async def test_background_prefix_keeps_only_unconsumed_host_marked_results(
+async def test_background_prefix_keeps_unconsumed_results_until_assistant_response(
     tmp_path: Path,
     preserve: bool,
 ) -> None:
@@ -57,18 +57,17 @@ async def test_background_prefix_keeps_only_unconsumed_host_marked_results(
         assert await compactor.finish(session_id)
         active = store.get("compaction", session_id)
         assert active is not None
-        assert (active["covered_seq"] < result_seq) is preserve
-        if preserve:
-            projected = compactor.project(session_id)
-            assert (
-                next(item for item in projected if item.get("id") == result["id"])["content"]
-                == result["content"]
-            )
-            store.add_message(session_id, "assistant", "模型已读过完整回执并回应")
-            store.add_message(session_id, "user", "新任务")
-            compactor.observe(session_id)
-            assert await compactor.finish(session_id)
-            assert store.get("compaction", session_id)["covered_seq"] >= result_seq
+        assert active["covered_seq"] < result_seq
+        projected = compactor.project(session_id)
+        assert (
+            next(item for item in projected if item.get("id") == result["id"])["content"]
+            == result["content"]
+        )
+        store.add_message(session_id, "assistant", "模型已读过完整回执并回应")
+        store.add_message(session_id, "user", "新任务")
+        compactor.observe(session_id)
+        assert await compactor.finish(session_id)
+        assert store.get("compaction", session_id)["covered_seq"] >= result_seq
         assert store.messages(session_id)[: len(records)] == records
     finally:
         await compactor.close()

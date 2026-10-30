@@ -33,6 +33,7 @@ def history(store: Store, session: str = "session") -> list[dict[str, Any]]:
     )
     store.add_message(session, "tool", "已执行证据" * 300, tool_call_id="a")
     store.add_message(session, "tool", "结果未知，先检查" * 300, tool_call_id="b")
+    store.add_message(session, "assistant", "已读完这批回执，继续保留未知状态。")
     store.add_message(session, "user", "最新要求必须完整保留")
     return store.messages(session)
 
@@ -419,6 +420,10 @@ async def test_terminal_run_releases_summary_budget_for_another_session(
         session = runtime.main_session()
         session_id = session["id"]
         original = history(runtime.store, session_id)
+        # Exercise terminal cleanup independently of request preflight, which must
+        # finish required hooks before admitting optional background summaries.
+        runtime.compaction.observe(session_id)
+        assert runtime.compaction.status(session_id)["running"]
         started = await runtime.submit("继续", mode="yolo")
         await asyncio.wait_for(foreground_entered.wait(), 2)
         await asyncio.wait_for(first_entered.wait(), 2)

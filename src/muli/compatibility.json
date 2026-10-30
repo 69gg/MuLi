@@ -1,12 +1,12 @@
 {
   "metadata_version": 1,
   "distribution": "muli-agent",
-  "release": "2.141.0",
+  "release": "2.142.0",
   "handoff_protocol": 2,
   "requires_migration": false,
   "formats": {
     "database": {"reads": [1], "writes": 1},
-    "objects": {"reads": [3], "writes": 3},
+    "objects": {"reads": [4], "writes": 4},
     "configuration": {"reads": [2], "writes": 2},
     "ingress": {"reads": [7], "writes": 7},
     "outbox": {"reads": [3], "writes": 3},

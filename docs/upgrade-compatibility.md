@@ -10,7 +10,9 @@
 
 ## 随包声明与发行检查
 
-随包 [`compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的版本、元数据版本 1 和交接协议 2。当前七域精确读写为 `(1,3,2,7,3,5,1)`，与[当前合同](fresh-format-admission.md#当前七领域合同)一致。`requires_migration=false` 只允许当前格式上的同格式判定。已有 Linux/macOS 独立资料库须沿[停机指南](channel-ownership-format-upgrade.md)核对精确前序；托管跨格式切换和 Windows 旧库升级仍拒绝。新装直接使用当前格式。安装配置格式 `1` 仍允许缺省状态，不制造安装或环境验证回执。版本整合须同步项目版本、模块版本、锁文件与随包声明。
+随包 [`compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的版本、元数据版本 1 和交接协议 2。当前七域精确读写为 `(1,4,2,7,3,5,1)`，与[当前合同](fresh-format-admission.md#当前七领域合同)一致。`requires_migration=false` 只允许当前格式上的同格式判定。已有 Linux/macOS 独立资料库须沿[停机指南](channel-ownership-format-upgrade.md)核对精确前序；托管跨格式切换和 Windows 旧库升级仍拒绝。新装直接使用当前格式。安装配置格式 `1` 仍允许缺省状态，不制造安装或环境验证回执。版本整合须同步项目版本、模块版本、锁文件与随包声明。
+
+压缩快照的多条主人原输入由可选 `anchors` 保留，将 objects 从3提升到4，其余六域不变。旧2.141候选只投影单 `anchor`，继续声明objects3会使整库准入与回放解释不一致；因此只声明 `reads=[4], writes=4`，不扩大旧合同读取白名单。新 reader 能在升级后读取原单 `anchor` 快照，不代表正常启动可以直接打开旧完整 `(1,3,2,7,3,5,1)`。该精确前序只允许在受支持的独立安装停机边界转换marker，不重写消息、旧快照或登记问题，不重放任务及unknown出站。`requires_migration=false` 沿用当前同格式协议的含义，不能作为这次跨格式切换许可；双方向同格式判断均拒绝。旧候选来源、实际准入与受限诊断的证据边界见[压缩格式说明](fresh-format-admission.md#同运行多条主人原输入的压缩格式边界)。
 
 登记问题的答案续接使用 ingress7：原问题、主人原答、准确任务和原队友必须从邮箱保留到归档，领取状态也在同一事务更新。旧6 reader不能忽略这些证明继续运行，因此双方同格式切换仍须拒绝。精确旧完整 `(1,3,2,6,3,5,1)` 只能沿受支持的停机入口转换；原件与方法级反证范围见[2.140来源说明](../tests/fixtures/format-v2.140.md)。
 

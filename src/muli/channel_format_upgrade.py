@@ -17,6 +17,7 @@ from muli.format_admission import (
     PRE_CHANNEL_REFERENCE_FORMAT_STATE,
     PRE_MEMORY_WATCH_FORMAT_STATE,
     PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
+    PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
     PRE_OWNER_QUESTION_FORMAT_STATE,
     PRE_PROJECT_INBOX_FORMAT_STATE,
     PRE_REPLY_MEMORY_FORMAT_STATE,
@@ -238,6 +239,7 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                 PRE_REPLY_MEMORY_FORMAT_STATE,
                 PRE_CHANNEL_REFERENCE_FORMAT_STATE,
                 PRE_OWNER_QUESTION_FORMAT_STATE,
+                PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
             )
         else:
             root = path.parent / "management" / "transaction-v1"
@@ -265,6 +267,7 @@ def upgrade_channel_ownership_format(data_dir: Path, *, managed_root: Path | Non
                 PRE_REPLY_MEMORY_FORMAT_STATE,
                 PRE_CHANNEL_REFERENCE_FORMAT_STATE,
                 PRE_OWNER_QUESTION_FORMAT_STATE,
+                PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
             )
 
         def check() -> None:

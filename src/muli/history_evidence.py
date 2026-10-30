@@ -13,6 +13,7 @@ from typing import Any
 from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.evidence import (
     EvidenceError,
+    MessageEvidenceField,
     content_page,
     decode_utf8,
     json_size,
@@ -627,6 +628,33 @@ class HistoryEvidence:
         revision: str | None = None,
         max_output_chars: int,
     ) -> dict[str, Any]:
+        """Keep the original content-only API, output and validation order."""
+        return self.read_message(
+            session_id,
+            message_id=message_id,
+            seq=seq,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
+            revision=revision,
+            max_output_chars=max_output_chars,
+        )
+
+    def read_message(
+        self,
+        session_id: str,
+        *,
+        message_id: str | None = None,
+        seq: int | None = None,
+        offset_bytes: int = 0,
+        length_bytes: int | None = None,
+        revision: str | None = None,
+        field: MessageEvidenceField = "content",
+        deadline: float | None = None,
+        max_output_chars: int,
+    ) -> dict[str, Any]:
+        """Page one saved field; reading tool arguments never resumes a call."""
+        if field not in ("content", "tool_calls"):
+            raise EvidenceError("invalid_arguments", "field 仅支持 content 或 tool_calls")
         validate_integer(offset_bytes, "offset_bytes")
         validate_integer(max_output_chars, "max_output_chars", minimum=1)
         if (message_id is None) == (seq is None) or (
@@ -644,16 +672,18 @@ class HistoryEvidence:
         if offset_bytes and revision is None:
             raise EvidenceError("invalid_arguments", "续读必须提供上一页 revision")
         self._session(session_id)
+        window_bytes = max_output_chars * _UTF8_MAX_BYTES
+        if field == "tool_calls":
+            window_bytes = min(window_bytes, _SQLITE_MAX_PARAMETER)
         row = self.store.message_evidence_slice(
             session_id,
             message_id=message_id,
             seq=seq,
             offset_bytes=offset_bytes,
-            length_bytes=min(
-                length_bytes or max_output_chars * _UTF8_MAX_BYTES,
-                max_output_chars * _UTF8_MAX_BYTES,
-            ),
-            metadata_bytes=max_output_chars * _UTF8_MAX_BYTES,
+            length_bytes=min(length_bytes or window_bytes, window_bytes),
+            metadata_bytes=window_bytes,
+            field=field,
+            deadline=deadline,
         )
         if row is None:
             raise EvidenceError("evidence_not_found", "消息不存在、已删除或不属于此会话")
@@ -662,8 +692,19 @@ class HistoryEvidence:
             raise EvidenceError(
                 "evidence_changed", "消息已更新；请从 offset_bytes=0 重新读取当前版本"
             )
-        if row["content_type"] != "text":
+        if field == "content" and row["content_type"] != "text":
             raise EvidenceError("content_unavailable", "此消息没有可读取的字符串 content 字段")
+        if field == "tool_calls":
+            if row["content_type"] is None:
+                raise EvidenceError(
+                    "field_missing", "此消息未保存 tool_calls 字段，不能据此确认原调用为空"
+                )
+            if row["content_type"] != "array":
+                raise EvidenceError("content_unavailable", "此消息的 tool_calls 字段不是有效数组")
+            # content_provenance describes saved result text. It says nothing
+            # about argument completeness or any external operation's outcome.
+            result.pop("content_provenance")
+            result["side_effect_status"] = "unknown"
         result.update(session_id=session_id, message_id=result.pop("id"))
         return content_page(
             result,
@@ -672,4 +713,5 @@ class HistoryEvidence:
             total_bytes=row["content_bytes"],
             max_output_chars=max_output_chars,
             omit_optional=self._omit_optional,
+            field=field,
         )

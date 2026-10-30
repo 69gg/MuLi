@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，局部迁移标记不能替代完整声明。非托管 Linux 接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的八种精确前序；非托管 macOS 接纳其中完整 `(1,3,2,4,3,2,1)`、`(1,3,2,4,3,3,1)`、`(1,3,2,4,3,4,1)` 或 `(1,3,2,5,3,4,1)`，并须满足既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，局部迁移标记不能替代完整声明。非托管 Linux 接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的精确前序；非托管 macOS 接纳其中完整 `(1,3,2,4,3,2,1)`、`(1,3,2,4,3,3,1)`、`(1,3,2,4,3,4,1)`、`(1,3,2,5,3,4,1)`、`(1,3,2,5,3,5,1)`、`(1,3,2,6,3,5,1)` 或 `(1,3,2,7,3,5,1)`，并须满足既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -30,14 +30,14 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-当前完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，七域依次为 `(1,3,2,7,3,5,1)`。主人问题的准确续接将 ingress 从 `6` 改为 `7`；渠道原生引用此前从 `5` 改为 `6`，明确收藏主答复将 memory 从 `4` 改为 `5`。各精确完整前序保留在准入模块与[停机升级指南](channel-ownership-format-upgrade.md)，不会只比较单个数字或因表结构相同放行。
+当前完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，七域依次为 `(1,4,2,7,3,5,1)`。压缩快照保留同 run 多条主人原输入，将 objects 从 `3` 改为 `4`；主人问题的准确续接此前将 ingress 从 `6` 改为 `7`，渠道原生引用从 `5` 改为 `6`，明确收藏主答复将 memory 从 `4` 改为 `5`。各精确完整前序保留在准入模块与[停机升级指南](channel-ownership-format-upgrade.md)，不会只比较单个数字或因表结构相同放行。
 
-`owner_question_answer` 从输入到归档保留同一问题、答案、任务和原队友证明，准确领取时在同一事务复核并更新状态，不与另一问题混批。旧 reader 会忽略这些约束，因此必须拒绝新库。独立问题记录不是执行锁，objects 合同仍为 `3`；任务完成与主人验收不由答案记录代替。真实旧源码与方法级反证的范围见[冻结来源说明](../tests/fixtures/format-v2.140.md)。
+`owner_question_answer` 从输入到归档保留同一问题、答案、任务和原队友证明，准确领取时在同一事务复核并更新状态，不与另一问题混批。旧 reader 会忽略这些约束，因此必须拒绝新库。登记问题续接当时保留 objects3；本次压缩合同独立提升到 objects4，原 ingress7 约束继续保留。独立问题记录不是执行锁，任务完成与主人验收不由答案记录代替。真实旧源码与方法级反证的范围见[冻结来源说明](../tests/fixtures/format-v2.140.md)。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |
 | `database` | 共享 core、memory、channel DDL 与索引；WAL；消息插入序号；`message_sequence_v1='done'`；1–96 UTF-8 bytes 的 Store/main 身份；主对象 `id` 对应、`kind='main'`、`principal='owner'`。不扫描所有业务行或替缺失派生行回填。 | `Store._initialize/_put/main_session`、`validate_existing_schema`、`read_format_evidence`；共享声明见 `store_schema` 与 `memory_schema`。 |
-| `objects` | `(kind,id)` 主键下的 JSON 对象、事件与消息顺序；run/session/approval/任务快照的原有状态语义；持久 approval 不等于当前活跃 future。执行身份、权限快照与 ReplyOrigin 分离；unknown 外部效果不能被重启或合成错误收据伪装成安全重试。压缩保留原始证据与来源边界。 | `Store._put/event/messages`、`Runtime._recover/_execute`、Permissions、TeamManager、WorkflowEngine、Compactor 与 Conversation。 |
+| `objects` | `(kind,id)` 主键下的 JSON 对象、事件与消息顺序；run/session/approval/任务快照的原有状态语义；持久 approval 不等于当前活跃 future。执行身份、权限快照与 ReplyOrigin 分离；unknown 外部效果不能被重启或合成错误收据伪装成安全重试。压缩保留原始证据与来源边界，快照可用 `anchors` 保留同 run 多条主人原输入，继续读取原单 `anchor` 快照。 | `Store._put/event/messages`、`Runtime._recover/_execute`、Permissions、TeamManager、WorkflowEngine、Compactor 与 Conversation。 |
 | `configuration` | 缺文件采用 `Settings` 默认；Pydantic 沿用现有类型转换，未知字段拒绝，并非 `strict=True` JSON 合同。包含长期问题关注的 `memory_watches` 设置，完整序列化会写出其默认值。`validate_changes` 递归合并，渠道 destination/memory preference 等既有整体替换规则继续；候选配置仍需原有来源、授权及生命周期核验。外部 JSON 配置的原始 bytes/路径真实性不由数据库 marker 证明。 | `ConfigFile.__init__/validate_changes/_merge/replace`、Settings、server 的 `apply_configuration` 与 `Extensions.apply_locked`。 |
 | `ingress` | 持久输入 ID、原 payload 比较、有限队列及 pending/delivered/cancelled/quarantined 状态；完整 route/proof 与 principal 独立冻结；同来源前缀合批而不混入另一来源，领取与恢复维持已有原子性。`attention_memory_watch` 只允许本机宿主关注证明，按证明独立合批，在领取、模型请求及输出前复核当前关注、来源和生命周期；取消或遗忘后旧证明失效。来源文本与模型输出不能自行提升权限或猜收件人。 | `Store._enqueue_input/claim_inputs`、`Runtime.submit/_claim_inputs/_recover`、Conversation、AttentionInbox、渠道入站。 |
 | `outbox` | `channel_outbox` 的原 payload、media mode、route、proactive/proof、分片游标及收据；相同幂等键不同 payload 拒绝。`sending` 恢复为 unknown，unknown 不自动重发，blocked 需显式现有重试/重验。默认附件行为保留，voice 仅显式选择；发送时继续核当前授权与冻结来源。 | `ChannelManager.enqueue/recover`、发送循环及重试、`ChannelApplication`、`FrozenRouting/guard_delivery`、原平台 adapter。 |
@@ -45,6 +45,16 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 | `install_profile` | 接受尚未准备任何实例 profile/receipt 的缺省状态；本片不制造持久实例 profile。已有安装意图仅按 pinned uv adapter 有界解析，保留主 requirement/extras/with/constraints/overrides/python/entrypoint 与已支持 options；结果仍是 `intent_parsed/context_required`。索引/约束/凭据来源及 ResolverContext 未核齐时不能变成可安装证明。 | `parse_install_intent`、`InstallationReceipt/read_install_receipt`，以及现有安装 manifest 的独立核验；这些证据不由七 ID 自动生成。 |
 
 以上声明绑定当前可信应用代码的解释合同，不声称审计数据库内所有额外 SQL、插件或历史手工写入。额外插件私有表/其私有索引可保留；这不是插件完整性或任意触发器认证。正常配置和安装真实性仍由各自宿主核验负责。
+
+### 同运行多条主人原输入的压缩格式边界
+
+`objects=4` 解释压缩快照中可选的 `anchors`：同一 run 的多条主人原输入必须在压缩后的投影中继续保留，不能只留下最后一条。新 reader 继续解释没有 `anchors` 的原单 `anchor` 快照；旧 snapshot 和原始消息不因此重写，摘要也不能替代主人原输入的身份或授权。
+
+2.141 候选的旧 `Compactor.project()` 只读取 `anchor`，不解释 `anchors`，静态上会漏掉新快照中其余主人输入。该解释变化属于 objects 合同，即使 DDL 不变、字段可选，也不能继续声明 objects3。当前完整格式只声明读取和写入 objects4；实际旧 admission 必须拒绝新 marker，当前 admission 对完整 `(1,3,2,7,3,5,1)` 则要求显式停机升级，双方向托管同格式切换都拒绝。
+
+前序源码来源为签名 Good 候选 `0c630d4696913850750b3d08126ba30d1552496c`，版本 `2.141.0`，不代表已发布或安装了旧 wheel。[格式回归](../tests/test_compaction_objects_format.py)执行冻结旧准入函数，复用当前共享的格式证据模型和 Store 构造支撑；这不等于完整运行旧版。旧 reader 绕过准入的投影诊断与真实准入拒绝是两类证据，不能相互替代。
+
+停机升级仅将已列明的完整前序 marker 转为当前格式，仍沿原独占、持久性、CAS 和关闭边界。新增前序与当前仅 objects3→4，其余六域精确相同。升级不改原 messages、旧 `compaction` / `compaction_snapshot` 或主人问题记录，不领取 pending、不执行任务，也不重放 unknown 投递。Windows 与托管跨格式升级范围保持原有拒绝；已有可支持的 Linux/macOS 独立资料库仍须先停机并完整备份。
 
 ### 项目资料复核的格式边界
 
@@ -80,7 +90,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ASR 转写收藏将当时的 `memory=1` 扩为 `memory=2`，新增 `attachment:<转写ID>:transcript:v1:asr_text:<工件SHA256>`，明确来源是已保存的派生转写，原文保持工件字节。普通 SHA marker 和 `document:v1` 的旧编码不变；当前 `memory=5` 继续在升级后的库中恢复这些来源。
 
-2.114 只恢复纯摘要或六段文档 marker。让新 marker 继续声明 `memory=1` 会使旧版接纳整库，却拒绝缺 episode/job 的来源恢复、失败证明和关注核验。把新来源伪装成普通文本则会丢失转写身份。因此无 DDL 变化也需要新的来源解释合同。对象/输入 proof 字段、版本、遗忘、授权和 unknown 语义均不变，其余六领域保持原值；不新增 `objects=4`。
+2.114 只恢复纯摘要或六段文档 marker。让新 marker 继续声明 `memory=1` 会使旧版接纳整库，却拒绝缺 episode/job 的来源恢复、失败证明和关注核验。把新来源伪装成普通文本则会丢失转写身份。因此无 DDL 变化也需要新的来源解释合同。对象/输入 proof 字段、版本、遗忘、授权和 unknown 语义均不变，当时其余六领域保持原值，没有新增 `objects=4`。
 
 冻结的 2.114 format reader、attachment source reader 与 manifest 及原字节出处见 [fixture 说明](../tests/fixtures/format-v2.114.md)。它们用于源码 oracle，不表示实际安装或运行了旧发行包。已有库必须经固定停机升级，不在正常启动时写 marker。
 
