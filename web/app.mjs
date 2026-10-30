@@ -2255,7 +2255,7 @@ function memoryGraphPath(item) {
 }
 
 function memoryPathCurrent(slot) {
-  return memoryPath === slot && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && state.memorySourceId === slot.sourceId && $("#other-view").contains(slot.region) && !slot.region.hidden;
+  return !!slot && memoryPath === slot && connectionCurrent(slot.owner) && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && state.memorySourceId === slot.sourceId && $("#other-view").contains(slot.region) && !slot.region.hidden;
 }
 
 function releaseMemoryPath() {
@@ -2286,19 +2286,20 @@ async function toggleMemoryPath(id, button, region, query) {
   if (state.view !== "memories" || state.memoryTab !== "list" || state.memoryQuery !== query || !root.contains(button) || !root.contains(region)) return;
   if (memoryPath?.button === button) { releaseMemoryPath(); button.focus({ preventScroll: true }); return; }
   releaseMemoryPath();
-  const slot = { id: String(id), query, sourceId: state.memorySourceId, button, region, controller: null, via: null };
+  const slot = { owner: connection, id: String(id), query, sourceId: state.memorySourceId, button, region, controller: null, via: null };
   memoryPath = slot; region.hidden = false; button.setAttribute("aria-expanded", "true");
   await loadMemoryPath(slot);
 }
 
 async function loadMemoryPath(slot) {
   if (!memoryPathCurrent(slot)) return;
+  const owner = slot.owner;
   slot.controller?.abort(); slot.via = null;
   const controller = new AbortController(); slot.controller = controller;
   if (slot.region.contains(document.activeElement)) slot.button.focus({ preventScroll: true });
   slot.region.replaceChildren(element("p", { role: "status", text: "正在读取路径…" }));
   try {
-    const payload = await request(memorySearchPath(slot.query, slot.sourceId), { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(memorySearchPath(slot.query, slot.sourceId), { signal: controller.signal, cache: "no-store" }, owner);
     if (!memoryPathCurrent(slot) || slot.controller !== controller) return;
     const item = memorySearchItems(payload, slot.sourceId).find((item) => String(item.id) === slot.id), via = memoryGraphPath(item);
     if (item?.path_omitted === true) { memoryPathNotice(slot, "召回路径因预算省略，请重新检索。"); return; }

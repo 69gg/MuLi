@@ -1606,6 +1606,101 @@ test("a changed query cancels its path and old search responses cannot replace t
   assert.equal(h.ui.state.memoryQuery, "new"); assert.equal(h.ui.state.memories[0].id, latest.id); assert.ok(h.other.textContent.includes(latest.content)); assert.equal(region.textContent, "");
 });
 
+test("memory path rejects a previous connection's late 401 without clearing the new path or evidence dialog", async () => {
+  const old = deferred(), item = graphMemory("old-connection-path"), latest = graphMemory("new-connection-path");
+  latest.content = "NEW_CONNECTION_PATH_RESULT";
+  let reads = 0;
+  const h = harness(async (path) => {
+    if (path === "/memories?query=Lumi") return ++reads === 1 ? old.promise : { items: [latest], revision: 7 };
+    if (path === "/memories/graph") return { nodes: [], edges: [] };
+    if (path === `/memories/${latest.id}`) return latest;
+    throw new Error(`unexpected request: ${path}`);
+  });
+  await clickMemoryButton(h, mountGraphResults(h, [item]));
+  const oldPath = h.ui.path, oldRequest = h.requests[0];
+  assert.equal(oldRequest.path, "/memories?query=Lumi"); assert.equal(oldRequest.cache, "no-store");
+  assert.equal(oldRequest.signal.aborted, false); assert.equal(oldPath.id, item.id);
+
+  h.ui.activateConnection(); await h.ui.switchView("memories");
+  assert.equal(oldRequest.signal.aborted, true); assert.equal(oldPath.region.textContent, "");
+  assert.equal(h.ui.state.memories[0].id, latest.id); assert.ok(h.other.textContent.includes(latest.content));
+  await clickMemoryButton(h, h.other.querySelector("[data-memory-path]"));
+  const currentPath = h.ui.path;
+  assert.equal(currentPath.id, latest.id); assert.ok(currentPath.region.textContent.includes("本次检索路径"));
+  await clickMemoryButton(h, currentPath.region.querySelector('[data-memory-path-ref="step-1"]'));
+  const slot = h.ui.slot, body = h.body(), action = h.button("更正"), list = h.other.firstElementChild;
+  assert.equal(slot.id, latest.id); assert.equal(h.dialog.open, true); assert.ok(action);
+  assert.equal(h.ui.state.auth.authenticated, true); assert.ok(body.includes(latest.content));
+  assert.equal(reads, 3); assert.equal(h.requests.length, 5);
+
+  // The old transport can still deliver an error after its real signal was aborted.
+  old.reject(new ApiError("OLD_CONNECTION_PATH_401", 401)); await flush();
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(h.ui.path === currentPath, true); assert.ok(currentPath.region.textContent.includes("本次检索路径"));
+  assert.equal(h.ui.slot === slot, true); assert.equal(h.dialog.open, true); assert.equal(h.body(), body);
+  assert.equal(h.button("更正") === action, true); assert.equal(h.other.firstElementChild === list, true);
+  assert.equal(h.requests.length, 5); assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+});
+
+test("memory path rejects an aborted query's late 401 on the same connection", async () => {
+  const old = deferred(), item = graphMemory("old-query-path"), latest = graphMemory("new-query-path");
+  latest.content = "NEW_QUERY_PATH_RESULT";
+  const h = harness(async (path) => {
+    if (path === "/memories?query=Lumi") return old.promise;
+    if (path === "/memories?query=new") return { items: [latest], revision: 7 };
+    if (path === `/memories/${latest.id}`) return latest;
+    throw new Error(`unexpected request: ${path}`);
+  });
+  await clickMemoryButton(h, mountGraphResults(h, [item]));
+  const oldPath = h.ui.path, oldRequest = h.requests[0];
+  assert.equal(oldRequest.path, "/memories?query=Lumi"); assert.equal(oldRequest.cache, "no-store");
+  assert.equal(oldRequest.signal.aborted, false);
+  h.other.querySelector("#memory-search").value = "new";
+  await h.other.querySelector("form").dispatch("submit");
+  assert.equal(oldRequest.signal.aborted, true); assert.equal(oldPath.region.textContent, "");
+  assert.equal(h.ui.state.memoryQuery, "new"); assert.equal(h.ui.state.memories[0].id, latest.id);
+  await clickMemoryButton(h, h.other.querySelector("[data-memory-path]"));
+  const currentPath = h.ui.path;
+  assert.equal(currentPath.id, latest.id); assert.ok(currentPath.region.textContent.includes("本次检索路径"));
+  await clickMemoryButton(h, currentPath.region.querySelector('[data-memory-path-ref="step-1"]'));
+  const slot = h.ui.slot, body = h.body(), action = h.button("更正"), list = h.other.firstElementChild;
+  assert.equal(slot.id, latest.id); assert.equal(h.dialog.open, true); assert.ok(action);
+  assert.equal(h.ui.state.auth.authenticated, true); assert.ok(body.includes(latest.content));
+  assert.equal(h.requests.length, 4);
+
+  old.reject(new ApiError("ABORTED_QUERY_PATH_401", 401)); await flush();
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(h.ui.path === currentPath, true); assert.ok(currentPath.region.textContent.includes("本次检索路径"));
+  assert.equal(h.ui.slot === slot, true); assert.equal(h.dialog.open, true); assert.equal(h.body(), body);
+  assert.equal(h.button("更正") === action, true); assert.equal(h.other.firstElementChild === list, true);
+  assert.equal(h.ui.state.memoryQuery, "new"); assert.equal(h.ui.state.memories[0].id, latest.id);
+  assert.equal(h.requests.length, 4); assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+});
+
+test("memory path preserves a current 401's login requirement and clears its evidence dialog", async () => {
+  const pending = deferred(), item = graphMemory("current-path");
+  const h = harness(async (path) => {
+    if (path === "/memories?query=current") return pending.promise;
+    if (path === `/memories/${item.id}`) return item;
+    throw new Error(`unexpected request: ${path}`);
+  });
+  await clickMemoryButton(h, mountGraphResults(h, [item], "current"));
+  const path = h.ui.path, request = h.requests[0];
+  assert.equal(request.path, "/memories?query=current"); assert.equal(request.cache, "no-store");
+  assert.equal(request.signal.aborted, false);
+  await clickMemoryButton(h, h.other.querySelector('[data-action="memory-evidence"]'));
+  assert.equal(h.ui.slot.id, item.id); assert.equal(h.dialog.open, true); assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(request.signal.aborted, false); assert.equal(h.requests.length, 2);
+
+  pending.reject(new ApiError("CURRENT_PATH_401", 401)); await flush();
+  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.path === null, true);
+  assert.equal(path.region.textContent, ""); assert.equal(h.ui.slot === null, true);
+  assert.equal(h.dialog.open, false); assert.equal(h.body(), "");
+  assert.equal(h.document.querySelector(".app-shell").inert, true);
+  assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
+  assert.equal(h.requests.length, 2); assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+});
+
 test("memory search rejects a previous connection's late 401 without clearing the new evidence dialog", async () => {
   const old = deferred(), latest = fixtureMemory("new-connection-memory", { content: "NEW_CONNECTION_SEARCH_RESULT" });
   let searches = 0;
