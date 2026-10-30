@@ -384,9 +384,54 @@ async def test_new_owner_input_is_processed_when_previous_notice_expires_around_
         if expiry == "after_claim":
             assert runtime.memory.forget_source(source_id)
         finish_flush.set()
-        await eventually(
-            lambda: not runtime.tasks and inbox.cursor == runtime.store.event_position()
-        )
+        try:
+            await eventually(
+                lambda: not runtime.tasks and inbox.cursor == runtime.store.event_position()
+            )
+        except TimeoutError:
+            # Keep one bounded, payload-free snapshot before cleanup destroys the
+            # actual waiter. Do not turn an unexplained wait into a longer one.
+            def task_view(task: asyncio.Task[Any] | None) -> dict[str, Any]:
+                if task is None:
+                    return {"present": False}
+                return {
+                    "done": task.done(),
+                    "cancelling": task.cancelling(),
+                    "stack": [
+                        {
+                            "file": Path(frame.f_code.co_filename).name,
+                            "function": frame.f_code.co_name,
+                            "line": frame.f_lineno,
+                        }
+                        for frame in task.get_stack(limit=2)
+                    ],
+                }
+
+            pytest.fail(
+                "owner_notice_settlement="
+                + json.dumps(
+                    {
+                        "seen": len(seen),
+                        "drivers": {
+                            identifier: task_view(task)
+                            for identifier, task in runtime.tasks.items()
+                        },
+                        "finalizers": [task_view(task) for task in runtime._session_finalizers],
+                        "attention": inbox.status(),
+                        "attention_task": task_view(inbox._task),
+                        "bus_revision": runtime.bus.revision,
+                        "event_position": runtime.store.event_position(),
+                        "events": [
+                            dict(row)
+                            for row in runtime.store.db.execute(
+                                "SELECT id,type FROM events ORDER BY id DESC LIMIT 8"
+                            )
+                        ],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
 
         # An archived/delivered receipt alone does not mean the model handled it.
         # Wait only for terminal drivers so loss fails these business assertions.
