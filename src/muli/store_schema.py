@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import sys
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
-from time import monotonic
+from time import monotonic, perf_counter
 from typing import Any, Literal
 
 from pydantic import Field
@@ -21,6 +23,26 @@ _IDENTITY_BYTES = 96
 _MAIN_OBJECT_BYTES = 16_384
 _PROGRESS_INTERVAL = 100
 _SQL_BYTES = 4096
+_OBSERVATION_BYTES = 512
+_MAX_MILLISECONDS = 2**31 - 1
+thread_time: Callable[[], float] | None = getattr(time, "thread_time", None)
+
+
+def _sample_observation_clock(clock: Callable[[], float] | None) -> float | None:
+    try:
+        value = None if clock is None else clock()
+        return value if value is not None and math.isfinite(value) else None
+    except Exception:
+        return None  # Optional timing must not change admission or replace its failure.
+
+
+def _observation_milliseconds(started: float | None, ended: float | None) -> int | None:
+    if started is None or ended is None:
+        return None
+    elapsed = ended - started
+    if not math.isfinite(elapsed) or elapsed < 0:
+        return None
+    return int(min(_MAX_MILLISECONDS, elapsed * 1000))
 
 
 def session_record_time(field: str) -> str:
@@ -301,6 +323,15 @@ def validate_existing_schema(
     limits = limits or ExistingStoreLimits()
     definitions = _definitions(group, limits)
     deadline = monotonic() + limits.seconds
+
+    # Independent observations leave the budget clock's reads and gates unchanged.
+    def sample() -> tuple[float | None, float | None]:
+        return _sample_observation_clock(perf_counter), _sample_observation_clock(thread_time)
+
+    started = sample()
+    schema_started: tuple[float | None, float | None] | None = None
+    schema_ended: tuple[float | None, float | None] | None = None
+    rejected: tuple[float | None, float | None] | None = None
     steps = 0
     interval = min(_PROGRESS_INTERVAL, limits.vm_steps)
     begun = installed = False
@@ -311,7 +342,7 @@ def validate_existing_schema(
     saved_limits: dict[int, int] = {}
 
     def progress() -> int:
-        nonlocal steps, interrupted
+        nonlocal steps, interrupted, rejected
         steps += interval
         # Preserve the original short-circuit and clock reads. This records the
         # first rejecting gate; a VM rejection does not sample the wall clock.
@@ -321,25 +352,56 @@ def validate_existing_schema(
             interrupted = "wall_clock"
         else:
             interrupted = None
+        if interrupted is not None:
+            rejected = sample()
         return int(interrupted is not None)
 
     def budget_error(trigger: Literal["vm_steps", "wall_clock"]) -> ExistingStoreError:
         error = ExistingStoreError("existing_store_read_budget")
-        try:
-            error.add_note(
-                "existing_store_read_observation="
-                + json.dumps(
-                    {
-                        "group": group,
-                        "phase": phase,
-                        "trigger": trigger,
-                        "steps": steps,
-                        "vm_limit": limits.vm_steps,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+
+        def add_observation(value: dict[str, Any]) -> bool:
+            note = "existing_store_read_observation=" + json.dumps(
+                value, sort_keys=True, separators=(",", ":")
             )
+            if len(note.encode("utf-8")) > _OBSERVATION_BYTES:
+                return False
+            error.add_note(note)
+            return True
+
+        observation: dict[str, Any] = {
+            "group": group,
+            "phase": phase,
+            "trigger": trigger,
+            "steps": steps,
+            "vm_limit": limits.vm_steps,
+        }
+        try:
+            # Snapshot the rejecting gate, not SQLite unwinding or connection cleanup.
+            ended = rejected or (None, None)
+            boundary = schema_started or ended
+            schema_end = schema_ended or ended
+            if add_observation(
+                {
+                    **observation,
+                    "timing": {
+                        "elapsed_ms": _observation_milliseconds(started[0], ended[0]),
+                        "before_schema_ms": _observation_milliseconds(started[0], boundary[0]),
+                        "schema_ms": None
+                        if schema_started is None
+                        else _observation_milliseconds(schema_started[0], schema_end[0]),
+                        "thread_cpu_ms": _observation_milliseconds(started[1], ended[1]),
+                        "before_schema_cpu_ms": _observation_milliseconds(started[1], boundary[1]),
+                        "schema_cpu_ms": None
+                        if schema_started is None
+                        else _observation_milliseconds(schema_started[1], schema_end[1]),
+                    },
+                }
+            ):
+                return error
+        except Exception:
+            pass  # Preserve the original five fields if the new observation cannot be added.
+        try:
+            add_observation(observation)
         except Exception:
             pass  # Optional diagnostics must not replace the original rejection.
         return error
@@ -377,7 +439,9 @@ def validate_existing_schema(
             db.execute("BEGIN")
             begun = True
             phase = "schema"
+            schema_started = sample()
             _validate_definitions(db, definitions, limits)
+            schema_ended = sample()
             if group in {"all", "core"}:
                 phase = "core_markers"
                 if _text(db, "message_sequence_v1") != "done":
@@ -401,6 +465,7 @@ def validate_existing_schema(
                         raise ExistingStoreError("existing_store_marker_invalid")
             phase = "complete"
             if monotonic() >= deadline:
+                rejected = sample()
                 raise budget_error("wall_clock")
         finally:
             failed = False

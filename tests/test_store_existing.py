@@ -518,7 +518,21 @@ def schema_budget_note(error: ExistingStoreError) -> dict[str, Any]:
     note = error.__notes__[0]
     assert note.startswith(prefix) and len(note.encode()) <= 512
     value: dict[str, Any] = json.loads(note[len(prefix) :])
-    assert set(value) == {"group", "phase", "trigger", "steps", "vm_limit"}
+    fields = {"group", "phase", "trigger", "steps", "vm_limit"}
+    assert set(value) in (fields, fields | {"timing"})
+    if "timing" in value:
+        assert set(value["timing"]) == {
+            "elapsed_ms",
+            "before_schema_ms",
+            "schema_ms",
+            "thread_cpu_ms",
+            "before_schema_cpu_ms",
+            "schema_cpu_ms",
+        }
+        assert all(
+            item is None or (type(item) is int and 0 <= item <= 2**31 - 1)
+            for item in value["timing"].values()
+        )
     return value
 
 
@@ -536,7 +550,8 @@ async def test_schema_budget_note_records_first_vm_gate_without_an_extra_clock_r
     with closing(sqlite3.connect(database)) as db:
         with pytest.raises(ExistingStoreError) as caught:
             validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
-        assert schema_budget_note(caught.value) == {
+        note = schema_budget_note(caught.value)
+        assert {key: value for key, value in note.items() if key != "timing"} == {
             "group": "all",
             "phase": "setup",
             "trigger": "vm_steps",
@@ -581,6 +596,260 @@ async def test_schema_budget_note_distinguishes_progress_and_final_wall_gate(
         assert db.total_changes == previous and not db.in_transaction
         assert db.execute("PRAGMA query_only").fetchone()[0] == 0
         assert db.execute("SELECT 1").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("delay", ["before_schema", "inside_schema"])
+async def test_schema_budget_note_separates_setup_and_schema_time_without_relaxing_wall_gate(
+    database: Path, monkeypatch: pytest.MonkeyPatch, delay: str
+) -> None:
+    """Calibrate equal old observations without claiming the macOS failure's cause."""
+    before = snapshot(database)
+    connections, mutations = prohibit_writes(monkeypatch)
+    wall, cpu = 0.0, 0.0
+    clock_readings: list[tuple[str, float]] = []
+    outside_readings = 0
+    inside_progress = False
+    progress_results: list[int] = []
+    progress_intervals: list[int] = []
+    begin_states: list[bool] = []
+    schema_calls: list[None] = []
+    statements: list[str] = []
+    original = store_schema._validate_definitions
+
+    def clock() -> float:
+        nonlocal outside_readings
+        if inside_progress:
+            stage = "progress"
+        else:
+            stage = ("deadline", "busy_timeout", "extra")[min(outside_readings, 2)]
+            outside_readings += 1
+        clock_readings.append((stage, wall))
+        return wall
+
+    class BoundaryConnection(sqlite3.Connection):
+        def set_progress_handler(
+            self, progress_handler: Callable[[], int] | None, n: int = 1000
+        ) -> None:
+            progress_intervals.append(n)
+            if progress_handler is None:
+                super().set_progress_handler(None, n)
+                return
+
+            def observed() -> int:
+                nonlocal inside_progress
+                inside_progress = True
+                try:
+                    result = progress_handler()
+                finally:
+                    inside_progress = False
+                progress_results.append(result)
+                return result
+
+            super().set_progress_handler(observed, n)
+
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            nonlocal wall, cpu
+            result = super().execute(sql, parameters)
+            if sql == "BEGIN":
+                begin_states.append(self.in_transaction)
+                if delay == "before_schema":
+                    # The original BEGIN returned; schema admission has not been entered.
+                    wall, cpu = 2.0, 0.125
+            elif sql == "ROLLBACK":
+                # Cleanup is outside the rejecting gate's timing snapshot.
+                wall, cpu = 10.0, 1.0
+            return result
+
+    def definitions(
+        db: sqlite3.Connection,
+        definitions: tuple[store_schema._Definition, ...],
+        limits: ExistingStoreLimits,
+    ) -> None:
+        nonlocal wall, cpu
+        schema_calls.append(None)
+        if delay == "inside_schema":
+            # Enter the complete original scan call, then advance only controlled clocks.
+            wall, cpu = 2.0, 0.125
+        original(db, definitions, limits)
+
+    monkeypatch.setattr(store_schema, "monotonic", clock)
+    # Independent diagnostic clocks must not add budget-clock reads, even when unavailable
+    # on the old source. The first red must be the missing observation, not an import error.
+    monkeypatch.setattr(store_schema, "perf_counter", lambda: wall, raising=False)
+    monkeypatch.setattr(store_schema, "thread_time", lambda: cpu, raising=False)
+    monkeypatch.setattr(store_schema, "_validate_definitions", definitions)
+    with closing(sqlite3.connect(database, factory=BoundaryConnection)) as db:
+        db.set_trace_callback(statements.append)
+        previous_limits = {
+            category: db.getlimit(category)
+            for category in (sqlite3.SQLITE_LIMIT_LENGTH, sqlite3.SQLITE_LIMIT_SQL_LENGTH)
+        }
+        previous_query_only = db.execute("PRAGMA query_only").fetchone()[0]
+        previous_busy_timeout = db.execute("PRAGMA busy_timeout").fetchone()[0]
+        changes = db.total_changes
+        with pytest.raises(ExistingStoreError) as caught:
+            validate_existing_schema(db)
+        note = schema_budget_note(caught.value)
+        assert {key: note[key] for key in ("group", "phase", "trigger", "steps", "vm_limit")} == {
+            "group": "all",
+            "phase": "schema",
+            "trigger": "wall_clock",
+            "steps": len(progress_results) * 100,
+            "vm_limit": 200_000,
+        }
+        assert progress_intervals == [100, 0]
+        assert progress_results and progress_results[-1] == 1
+        assert progress_results[:-1] == [0] * (len(progress_results) - 1)
+        assert [(stage, value) for stage, value in clock_readings if stage != "progress"] == [
+            ("deadline", 0.0),
+            ("busy_timeout", 0.0),
+        ]
+        assert [value for stage, value in clock_readings if stage == "progress"] == [0.0] * (
+            len(progress_results) - 1
+        ) + [2.0]
+        assert schema_calls == [None] and begin_states == [True]
+        assert statements.count("BEGIN") == statements.count("ROLLBACK") == 1
+        assert db.total_changes == changes and not db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == previous_query_only
+        assert db.execute("PRAGMA busy_timeout").fetchone()[0] == previous_busy_timeout
+        assert all(db.getlimit(category) == value for category, value in previous_limits.items())
+        assert db.execute("SELECT length(?)", ("x" * 100_000,)).fetchone() == (100_000,)
+        assert db.execute("SELECT 1").fetchone() == (1,)
+        assert all(secret not in caught.value.__notes__[0] for secret in (str(database), "SELECT"))
+        clock_readings.clear()
+        outside_readings = 0
+        progress_results.clear()
+        progress_intervals.clear()
+        with pytest.raises(ExistingStoreError) as vm_caught:
+            validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
+        vm_note = schema_budget_note(vm_caught.value)
+        assert vm_note["trigger"] == "vm_steps" and vm_note["steps"] == 1
+        assert progress_intervals == [1, 0] and progress_results == [1]
+        assert clock_readings == [("deadline", 10.0)]  # VM rejection samples no budget clock.
+        assert not db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == previous_query_only
+        assert db.execute("PRAGMA busy_timeout").fetchone()[0] == previous_busy_timeout
+        assert db.execute("SELECT 1").fetchone() == (1,)
+    assert mutations == [] and snapshot(database) == before
+    assert_closed(connections)
+    assert note.get("timing") == {
+        "elapsed_ms": 2000,
+        "before_schema_ms": 2000 if delay == "before_schema" else 0,
+        "schema_ms": 2000 if delay == "inside_schema" else 0,
+        "thread_cpu_ms": 125,
+        "before_schema_cpu_ms": 125 if delay == "before_schema" else 0,
+        "schema_cpu_ms": 125 if delay == "inside_schema" else 0,
+    }
+
+
+@pytest.mark.parametrize("clock_name", ["perf_counter", "thread_time"])
+@pytest.mark.parametrize("clock_error", [None, OSError, NotImplementedError, RuntimeError])
+async def test_schema_budget_timing_clock_failure_keeps_the_original_rejection(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock_name: str,
+    clock_error: type[Exception] | None,
+) -> None:
+    readings = 0
+
+    def clock() -> float:
+        nonlocal readings
+        readings += 1
+        return 0.0
+
+    def unavailable() -> float:
+        assert clock_error is not None
+        raise clock_error("private_observation_clock_failure")
+
+    monkeypatch.setattr(store_schema, "monotonic", clock)
+    monkeypatch.setattr(store_schema, "perf_counter", lambda: 0.0)
+    monkeypatch.setattr(store_schema, "thread_time", lambda: 0.0)
+    monkeypatch.setattr(store_schema, clock_name, None if clock_error is None else unavailable)
+    with closing(sqlite3.connect(database)) as db:
+        changes = db.total_changes
+        with pytest.raises(ExistingStoreError) as caught:
+            validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
+        note = schema_budget_note(caught.value)
+        assert note["trigger"] == "vm_steps" and note["steps"] == 1
+        assert note["timing"] == {
+            "elapsed_ms": None if clock_name == "perf_counter" else 0,
+            "before_schema_ms": None if clock_name == "perf_counter" else 0,
+            "schema_ms": None,
+            "thread_cpu_ms": None if clock_name == "thread_time" else 0,
+            "before_schema_cpu_ms": None if clock_name == "thread_time" else 0,
+            "schema_cpu_ms": None,
+        }
+        assert readings == 1
+        assert db.total_changes == changes and not db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 0
+        assert db.execute("SELECT 1").fetchone() == (1,)
+        assert "private_observation_clock_failure" not in caught.value.__notes__[0]
+
+
+@pytest.mark.parametrize("ending", [float("nan"), float("inf"), -float("inf"), -1.0, 1e308])
+async def test_schema_budget_timing_invalid_samples_are_null_and_large_elapsed_is_bounded(
+    database: Path, monkeypatch: pytest.MonkeyPatch, ending: float
+) -> None:
+    wall, observed = 0.0, 0.0
+    original = store_schema._validate_definitions
+
+    def definitions(
+        db: sqlite3.Connection,
+        definitions: tuple[store_schema._Definition, ...],
+        limits: ExistingStoreLimits,
+    ) -> None:
+        nonlocal wall, observed
+        wall, observed = 2.0, ending
+        original(db, definitions, limits)
+
+    monkeypatch.setattr(store_schema, "monotonic", lambda: wall)
+    monkeypatch.setattr(store_schema, "perf_counter", lambda: observed)
+    monkeypatch.setattr(store_schema, "thread_time", lambda: observed)
+    monkeypatch.setattr(store_schema, "_validate_definitions", definitions)
+    with closing(sqlite3.connect(database)) as db:
+        changes = db.total_changes
+        with pytest.raises(ExistingStoreError) as caught:
+            validate_existing_schema(db)
+        note = schema_budget_note(caught.value)
+        assert note["phase"] == "schema" and note["trigger"] == "wall_clock"
+        expected = 2**31 - 1 if ending == 1e308 else None
+        assert note["timing"] == {
+            "elapsed_ms": expected,
+            "before_schema_ms": 0,
+            "schema_ms": expected,
+            "thread_cpu_ms": expected,
+            "before_schema_cpu_ms": 0,
+            "schema_cpu_ms": expected,
+        }
+        assert db.total_changes == changes and not db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 0
+        assert db.execute("SELECT 1").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("failure", ["raise", "oversized"])
+async def test_schema_budget_timing_note_failure_preserves_the_original_five_fields(
+    database: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    original = store_schema.json.dumps
+
+    def dumps(value: dict[str, Any], **kwargs: Any) -> str:
+        if "timing" in value:
+            if failure == "raise":
+                raise RuntimeError("private_timing_note_failure")
+            return "x" * 513
+        return original(value, **kwargs)
+
+    monkeypatch.setattr(store_schema, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(store_schema.json, "dumps", dumps)
+    with closing(sqlite3.connect(database)) as db:
+        with pytest.raises(ExistingStoreError) as caught:
+            validate_existing_schema(db, limits=ExistingStoreLimits(vm_steps=1))
+        note = schema_budget_note(caught.value)
+        assert set(note) == {"group", "phase", "trigger", "steps", "vm_limit"}
+        assert note["trigger"] == "vm_steps" and note["steps"] == 1
+        assert not db.in_transaction and db.execute("PRAGMA query_only").fetchone()[0] == 0
+        assert db.execute("SELECT 1").fetchone() == (1,)
+        assert "private_timing_note_failure" not in caught.value.__notes__[0]
 
 
 async def test_schema_budget_note_does_not_replace_cleanup_failure(
