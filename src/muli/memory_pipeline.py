@@ -1069,6 +1069,7 @@ class MemoryPipeline:
         return cursor.rowcount > 0
 
     async def _run(self) -> None:
+        prefer_index = False
         while True:
             await self.admission.wait()
             self._wake.clear()
@@ -1078,17 +1079,19 @@ class MemoryPipeline:
                 "ORDER BY next_attempt,created_at,source_id LIMIT 1",
                 (now(),),
             ).fetchone()
+            plan = self._current_index_plan()
+            if (
+                plan is not None
+                and plan["state"] in _INDEX_ACTIVE
+                and plan["next_attempt"] <= now()
+                and (row is None or prefer_index)
+            ):
+                with self.admission.operation():
+                    await self._run_index(plan)
+                prefer_index = False
+                await asyncio.sleep(0)
+                continue
             if row is None:
-                plan = self._current_index_plan()
-                if (
-                    plan is not None
-                    and plan["state"] in _INDEX_ACTIVE
-                    and plan["next_attempt"] <= now()
-                ):
-                    with self.admission.operation():
-                        await self._run_index(plan)
-                    await asyncio.sleep(0)
-                    continue
                 deadline = self.memory.store.db.execute(
                     "SELECT min(next_attempt) FROM memory_jobs WHERE state IN ('queued','retry')"
                 ).fetchone()[0]
@@ -1109,6 +1112,7 @@ class MemoryPipeline:
             source_id = str(row[0])
             with self.admission.operation():
                 await self._run_job(source_id)
+            prefer_index = True
             await asyncio.sleep(0)
 
     async def _run_job(self, source_id: str) -> None:
