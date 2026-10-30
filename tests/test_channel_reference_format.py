@@ -19,6 +19,7 @@ from test_channel_format_upgrade import legacy_database, upgrade
 from test_channel_format_upgrade import snapshot as stored_rows
 from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model, snapshot
+from test_owner_questions_format import frozen_e140_bytes, frozen_e140_module
 from test_project_inbox_format import upgrade_platform
 
 from muli.channels import ChannelManager
@@ -29,6 +30,7 @@ from muli.conversation import Conversation
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     PRE_CHANNEL_REFERENCE_FORMAT_STATE,
+    PRE_OWNER_QUESTION_FORMAT_STATE,
     FormatAdmissionError,
     require_current_format,
 )
@@ -69,9 +71,9 @@ def frozen_e139_reader() -> ModuleType:
     return reader
 
 
-def current_manifest() -> CompatibilityManifest:
-    path = Path(__file__).parents[1] / "src" / "muli" / "compatibility.json"
-    return CompatibilityManifest.from_json(path.read_bytes())
+def native_reference_manifest() -> CompatibilityManifest:
+    # Preserve the actual ingress5 -> ingress6 boundary as later objects advance.
+    return CompatibilityManifest.from_json(frozen_e140_bytes("compatibility_v2_140.json"))
 
 
 def test_e139_actual_consumer_refuses_current_ingress_before_business_writes(
@@ -79,10 +81,26 @@ def test_e139_actual_consumer_refuses_current_ingress_before_business_writes(
 ) -> None:
     old = frozen_e139_reader()
     assert old.CURRENT_FORMAT_STATE == PRE_CHANNEL_REFERENCE_FORMAT_STATE
+    native_reference = frozen_e140_module("format_admission_v2_140.py")
+    assert native_reference.CURRENT_FORMAT_STATE == PRE_OWNER_QUESTION_FORMAT_STATE
+    assert native_reference.CURRENT_FORMAT_STATE.formats.model_dump() == {
+        **old.CURRENT_FORMAT_STATE.formats.model_dump(),
+        "ingress": 6,
+    }
     before = snapshot(database)
     with closing(sqlite3.connect(database)) as db:
         evidence = read_format_evidence(db)
-        old.require_current_format(replace(evidence, state=PRE_CHANNEL_REFERENCE_FORMAT_STATE))
+        previous = replace(evidence, state=old.CURRENT_FORMAT_STATE)
+        historical = replace(evidence, state=native_reference.CURRENT_FORMAT_STATE)
+        old.require_current_format(previous)
+        native_reference.require_current_format(historical)
+        with pytest.raises(
+            native_reference.FormatAdmissionError, match="^store_format_upgrade_required$"
+        ):
+            native_reference.require_current_format(previous)
+        with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
+            old.require_current_format(historical)
+        assert evidence.state == CURRENT_FORMAT_STATE
         with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
             old.require_current_format(evidence)
         assert db.total_changes == 0
@@ -91,12 +109,10 @@ def test_e139_actual_consumer_refuses_current_ingress_before_business_writes(
 
 def test_current_consumer_requires_explicit_upgrade_from_exact_ingress5(database: Path) -> None:
     old = frozen_e139_reader()
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
-        **old.CURRENT_FORMAT_STATE.formats.model_dump(),
-        "ingress": 7,
-    }
+    assert old.CURRENT_FORMAT_STATE == PRE_CHANNEL_REFERENCE_FORMAT_STATE
     with closing(sqlite3.connect(database)) as db:
         evidence = read_format_evidence(db)
+        assert evidence.state == CURRENT_FORMAT_STATE
         previous = replace(evidence, state=old.CURRENT_FORMAT_STATE)
         old.require_current_format(previous)
         with pytest.raises(FormatAdmissionError, match="^store_format_upgrade_required$"):
@@ -105,20 +121,21 @@ def test_current_consumer_requires_explicit_upgrade_from_exact_ingress5(database
         assert db.total_changes == 0
 
 
-@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress7"])
+@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress6"])
 @pytest.mark.parametrize("reverse", [False, True], ids=["upgrade", "downgrade"])
 def test_managed_same_format_switch_refuses_both_native_reference_directions(
     after_upgrade: bool, reverse: bool
 ) -> None:
     previous = CompatibilityManifest.from_json(frozen_e139_bytes("compatibility_v2_139.json"))
-    current = current_manifest()
+    current = native_reference_manifest()
     assert previous.release == "2.139.0"
+    assert current.release == "2.140.0"
     assert previous.formats.ingress.reads == (5,) and previous.formats.ingress.writes == 5
-    assert current.formats.ingress.reads == (7,) and current.formats.ingress.writes == 7
+    assert current.formats.ingress.reads == (6,) and current.formats.ingress.writes == 6
     assert current.formats.model_dump(exclude={"ingress"}) == previous.formats.model_dump(
         exclude={"ingress"}
     )
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_CHANNEL_REFERENCE_FORMAT_STATE
+    state = PRE_OWNER_QUESTION_FORMAT_STATE if after_upgrade else PRE_CHANNEL_REFERENCE_FORMAT_STATE
     base, candidate = (current, previous) if reverse else (previous, current)
     result = assess_compatibility(base, candidate, state, handoff_protocol=2)
     assert not result.format_compatible
@@ -128,11 +145,11 @@ def test_managed_same_format_switch_refuses_both_native_reference_directions(
         previous, previous, PRE_CHANNEL_REFERENCE_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
     assert assess_compatibility(
-        current, current, CURRENT_FORMAT_STATE, handoff_protocol=2
+        current, current, PRE_OWNER_QUESTION_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
 
 
-@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress7"])
+@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress6"])
 def test_reading_both_ingress_contracts_does_not_authorize_cross_format_writes(
     after_upgrade: bool,
 ) -> None:
@@ -142,14 +159,14 @@ def test_reading_both_ingress_contracts_does_not_authorize_cross_format_writes(
             update={
                 "formats": manifest.formats.model_copy(
                     update={
-                        "ingress": manifest.formats.ingress.model_copy(update={"reads": (5, 7)})
+                        "ingress": manifest.formats.ingress.model_copy(update={"reads": (5, 6)})
                     }
                 )
             }
         )
-        for manifest in (previous, current_manifest())
+        for manifest in (previous, native_reference_manifest())
     )
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_CHANNEL_REFERENCE_FORMAT_STATE
+    state = PRE_OWNER_QUESTION_FORMAT_STATE if after_upgrade else PRE_CHANNEL_REFERENCE_FORMAT_STATE
     result = assess_compatibility(declarations[0], declarations[1], state, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "write_format_change" and result.domain == "ingress"

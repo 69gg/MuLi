@@ -462,6 +462,7 @@ def failure_probe(
     original = SystemdProbe
 
     def factory(*, limits: ProbeLimits) -> SystemdProbe:
+        assert 0 < limits.seconds <= worker.CASE_PROBE_SECONDS
         return original(runner=bus, limits=limits, proc_root=proc, cgroup_root=probe.cgroup_root)
 
     monkeypatch.setattr(linux_transaction, "SystemdProbe", factory)
@@ -507,7 +508,7 @@ async def test_failure_window_authenticates_pending_source_once_without_transact
         "outcome": "progress",
     }
     worker.write_json(env.root / "helper-entry-checkpoint.json", value)
-    collection_deadline: float = worker.time.monotonic() + worker.HTTP_SECONDS
+    collection_deadline: float = worker.time.monotonic() + worker.CASE_PROBE_SECONDS
     assert 0 < case.start < case.deadline < worker.time.monotonic() < collection_deadline
     await case._collect_failure_helper_source(deadline=collection_deadline)
     assert len(bus.calls) == 5  # read_helper's full double-sided RPC/proc/kernel proof.
@@ -577,14 +578,14 @@ async def test_failure_window_rejects_bad_or_revoked_source_without_retry(
             worker.write_json(env.journal.directory.path / "state.json", value)
 
         bus.before_second = changed_generation
-    deadline = worker.time.monotonic() + (worker.HTTP_SECONDS if damage != "deadline" else -1)
+    deadline = worker.time.monotonic() + (worker.CASE_PROBE_SECONDS if damage != "deadline" else -1)
     try:
         await case._collect_failure_helper_source(deadline=deadline)
     except (ValueError, TimeoutError):
         pass
     calls = len(bus.calls)
     await case._collect_failure_helper_source(
-        deadline=worker.time.monotonic() + worker.HTTP_SECONDS
+        deadline=worker.time.monotonic() + worker.CASE_PROBE_SECONDS
     )
     assert len(bus.calls) == calls <= 5
     assert "helper_source_observation" not in case.result["resources"]
@@ -625,7 +626,7 @@ async def test_failure_entry_reader_rejects_unbound_future_or_dangerous_files(
     env = entry_environment
     case = _case(env)
     await case._collect_failure_helper_source(
-        deadline=worker.time.monotonic() + worker.HTTP_SECONDS
+        deadline=worker.time.monotonic() + worker.CASE_PROBE_SECONDS
     )
     source = case.result["resources"]["helper_source"]
     observation = case.result["resources"]["helper_source_observation"]
@@ -640,7 +641,7 @@ async def test_failure_entry_reader_rejects_unbound_future_or_dangerous_files(
     path = env.root / "helper-entry-checkpoint.json"
     worker.write_json(path, value)
     case._collect_helper_entry_checkpoint(
-        env.record, deadline=worker.time.monotonic() + worker.HTTP_SECONDS
+        env.record, deadline=worker.time.monotonic() + worker.CASE_PROBE_SECONDS
     )
     assert case.result["resources"].pop("helper_entry_checkpoint") == value
     if damage in {"generation", "helper", "invocation"}:
@@ -668,7 +669,7 @@ async def test_failure_entry_reader_rejects_unbound_future_or_dangerous_files(
         os.mkfifo(path)
     try:
         case._collect_helper_entry_checkpoint(
-            env.record, deadline=worker.time.monotonic() + worker.HTTP_SECONDS
+            env.record, deadline=worker.time.monotonic() + worker.CASE_PROBE_SECONDS
         )
     except (OSError, ValueError):
         pass
@@ -693,7 +694,7 @@ async def test_entry_artifact_parser_requires_current_source_window_and_exact_fi
     env = entry_environment
     case = _case(env)
     await case._collect_failure_helper_source(
-        deadline=worker.time.monotonic() + worker.HTTP_SECONDS
+        deadline=worker.time.monotonic() + worker.CASE_PROBE_SECONDS
     )
     source = case.result["resources"]["helper_source"]
     observation = case.result["resources"]["helper_source_observation"]

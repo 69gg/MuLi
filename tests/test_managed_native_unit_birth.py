@@ -257,7 +257,7 @@ async def test_actual_case_cleanup_preserves_birth_safety_after_stopped_unit_gc(
     async def manager(
         argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
     ) -> dict[str, Any]:
-        assert 0 < timeout <= worker.HTTP_SECONDS
+        assert 0 < timeout <= worker.CASE_PROBE_SECONDS
         assert limit == worker.MAX_BYTES and merge_stderr is False
         if "ListUnitsByPatterns" in argv:
             # Keep both actual listing parsers: no helper remains, but the app

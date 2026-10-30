@@ -55,7 +55,8 @@ ready 后再次核 bootstrap 文件，并仅为该 manager 归一化 `XDG_CONFIG
 | 协调器 execute | 入口起统一 840 秒，prepare、manager 观察、drive 和原启动诊断共同消耗 |
 | 业务入场 | 协调器必须严格多于 720 秒剩余量；worker 入场及启动标准服务前须多于整轮 600 秒，并再次核原 Case 截止，不允许迟到后重开预算 |
 | 普通命令与 setup 诊断 | 默认每次最多 5 秒，且不越共享绝对截止；manager 观察在原 parent 截止内留 60 秒失败回执窗 |
-| 单次 HTTP | 请求、响应与关闭合计 `min(2 秒, remaining)`；响应流式计入原 `JournalLimits.max_record_bytes` |
+| 单次 HTTP | 请求、响应与关闭合计 `min(30 秒, remaining)`；客户端使用独立同值期限，响应流式计入原 `JournalLimits.max_record_bytes` |
+| Case 探针与失败收取 | 单次仍最多 2 秒，失败收取与 cleanup 的探针再裁到原绝对截止；不借用 HTTP 期限 |
 | cleanup | 效果与证明共用入口起 120 秒绝对期限，不能用于继续事务或健康工作 |
 | 最末客户端回收 | 失败时原进程组 SIGKILL 后最多再用 120 秒 reap；只回收客户端，不能执行其它效果或发布 verified |
 | setup 观察字节 | 累计 32 KiB；双 pipe、proc、内部回包及最终 JSON 按各现有协议计费，未知返回保守占满授额 |
