@@ -52,6 +52,8 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 原运输配置、主人绑定与 manager 代次在入队及每段实际发送前核对，配置对象漂移时拒绝继续；已完成分段的收据保留。主动通知默认目的地变化不会重定向已冻结的原来源，当前主动通知权限与记忆依据继续由原 `guard_delivery` 核验。
 
+已认证网页管理使用 `GET /api/memory/watches`（`after_id`、`limit`，最多100个候选）及 `POST /api/memory/watches/cancel`（正文只含准确 `id`）。读取完整校验全部有限候选后，仅返回准确 `id`、问题、短语、状态、修订和有限来源偏好的完整条目前缀，不返回原路由或地址；整个页遵守配置字符预算和65536字节上限。`has_more` 为真时，以最后实际返回条目的 `next_after_id` 继续；短页也可继续，满窗口可能还需读取空末页。单条或分页元数据放不下仍报错；模型列表保持原整列表预算。取消继续沿原准入、事务及通知失效链，重复取消同一条已停止登记返回原状态，不自动重发未确认的请求。这些管理读取不改变持久记录格式。
+
 [`format_admission_v2_120.py`](../tests/fixtures/format_admission_v2_120.py) 和 [`compatibility_v2_120.json`](../tests/fixtures/compatibility_v2_120.json) 保留签名 P `c55546bbc1687c7e183f1e5ba7c671a7443dfb2a` 的原字节；[来源偏好格式回归](../tests/test_memory_watch_origin_format.py) 用其源码 reader 证明 memory4 被拒。它复用当前未变的模型与格式证据读取器，不是旧 wheel 或旧发行环境的运行证明。精确 Linux/macOS 独立安装停机升级只改允许的完整 marker，保留原 v1 关注、来源和业务行；托管及 Windows 旧库升级范围不扩大。
 
 主配置新增字段会让拒绝未知字段的旧版无法读取保存后的完整配置；新输入 proof 也不能被旧版当普通 `system:attention` 消费。2.112 的旧读取路径只识别整理失败证明，既不按 watch proof 独立合批，也不在取消或遗忘后核验它。因此新合同必须显式拒绝旧 reader；即使本机尚未登记关注，也不沿用旧完整声明。

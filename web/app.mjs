@@ -1736,7 +1736,7 @@ function memoryWatchActionCurrent(slot, item, trigger) {
 function memoryWatchPage(value, after) {
   const bad = () => { throw new Error("长期留意清单无法完整核查，请刷新。"); };
   if (!value || value.after_id !== after || !Array.isArray(value.items) || value.items.length > memoryWatchPageSize || typeof value.has_more !== "boolean" || !value.processing || typeof value.processing.enabled !== "boolean" || typeof value.processing.paused !== "boolean") bad();
-  if (value.has_more !== (value.items.length === memoryWatchPageSize) || (value.has_more ? value.next_after_id !== value.items.at(-1)?.id : value.next_after_id !== null)) bad();
+  if ((value.items.length === memoryWatchPageSize && !value.has_more) || (value.has_more ? !value.items.length || value.next_after_id !== value.items.at(-1)?.id : value.next_after_id !== null)) bad();
   let previous = after;
   for (const item of value.items) {
     const preference = item?.reply_preference;

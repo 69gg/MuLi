@@ -29,6 +29,45 @@ test("preview watch paging and exact cancellation stay local, including disabled
   assert.deepEqual(backend.state.memoryWatches[1], other);
 });
 
+test("preview watch pages keep whole long questions and exact cancellation across short pages", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  backend.state.memoryWatches.forEach((item, index) => { item.question = `问题${index}：` + "完整背景".repeat(250); item.state = "active"; item.revision = 1; });
+  backend.state.settings.limits.max_output_chars = 2500;
+  const original = structuredClone(backend.state.memoryWatches), received = [];
+  let after = "";
+  for (let index = 0; index < original.length; index++) {
+    const response = await json(backend, `/memory/watches?after_id=${after}`);
+    assert.equal(response.status, 200);
+    const page = response.body;
+    assert.equal(page.after_id, after); assert.ok(page.items.length > 0);
+    if (index === 0) { assert.ok(page.items.length < original.length); assert.equal(page.has_more, true); }
+    assert.deepEqual(page.items, original.slice(received.length, received.length + page.items.length));
+    received.push(...page.items);
+    if (!page.has_more) { assert.equal(page.next_after_id, null); break; }
+    assert.equal(page.next_after_id, page.items.at(-1).id); after = page.next_after_id;
+  }
+  assert.deepEqual(received, original); assert.deepEqual(backend.state.memoryWatches, original);
+  assert.equal(backend.state.requests.some(({ method }) => method === "POST"), false);
+  const target = received.at(-1), stopped = await json(backend, "/memory/watches/cancel", "POST", { id: target.id });
+  assert.equal(stopped.status, 200); assert.equal(stopped.body.id, target.id);
+  assert.equal(stopped.body.state, "cancelled"); assert.equal(stopped.body.revision, target.revision + 1);
+  for (const item of original.filter((item) => item.id !== target.id)) {
+    assert.deepEqual(backend.state.memoryWatches.find((current) => current.id === item.id), item);
+  }
+  assert.equal(backend.state.requests.filter(({ method }) => method === "POST").length, 1);
+});
+
+test("preview does not replace an overbudget whole watch with a successful empty page", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  backend.state.memoryWatches = [{ ...backend.state.memoryWatches[0], question: "完整背景".repeat(300) }];
+  backend.state.settings.limits.max_output_chars = 1000;
+  const original = structuredClone(backend.state.memoryWatches);
+  const response = await json(backend, "/memory/watches");
+  assert.equal(response.status, 400); assert.equal(response.body.detail.code, "output_budget");
+  assert.equal(Object.hasOwn(response.body, "items"), false);
+  assert.deepEqual(backend.state.memoryWatches, original);
+});
+
 test("preview source discovery, UTF-8 reads and exact retries stay in local demo state", async (t) => {
   const scheduled = new Set();
   t.mock.method(globalThis, "setTimeout", (callback) => { scheduled.add(callback); return callback; });

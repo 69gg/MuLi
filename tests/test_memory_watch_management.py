@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -14,11 +15,14 @@ from test_attachment_memory_policy import offline as offline
 from test_attention import attention_inputs, eventually
 from test_report_origin import route
 
+import muli.memory_watches as watch_module
 from muli.attachment_memory_source import attachment_source
+from muli.config import Limits
+from muli.evidence import EvidenceError
 from muli.proactive import FrozenRouting
 from muli.providers import ModelConfig
 from muli.reply_origin import ReplyOrigin
-from muli.store import new_id, now
+from muli.store import Store, new_id, now
 
 
 def register(
@@ -107,7 +111,80 @@ async def test_public_page_projects_only_verified_finite_preference(
             )
 
 
-async def test_full_bounded_window_requires_another_read_and_budget_failure_is_not_empty(
+async def test_default_page_keeps_complete_long_records_and_advances_only_returned_ids(
+    tmp_path: Path,
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        watches = [
+            register(rig, key=str(index), question=f"问题{index}：" + "完整背景" * 250)
+            for index in range(3)
+        ]
+        ordered = sorted(watches, key=lambda item: item["id"])
+        rig.runtime.config.update({"limits": {"max_output_chars": 2500}})
+        after = ""
+        seen: list[dict[str, Any]] = []
+        async with connection(rig) as client:
+            for index in range(len(watches)):
+                response = await client.get(
+                    "/api/memory/watches", params={"after_id": after} if after else None
+                )
+                assert response.status_code == 200
+                page = response.json()
+                assert response.headers["cache-control"] == "no-store"
+                assert len(response.text) <= 2500
+                assert page["after_id"] == after and page["items"]
+                items = page["items"]
+                if index == 0:
+                    assert len(items) < len(watches)
+                    assert page["has_more"]
+                    assert page["next_after_id"] != ordered[-1]["id"]
+                expected = ordered[len(seen) : len(seen) + len(items)]
+                assert items == [
+                    {
+                        **{
+                            field: watch[field]
+                            for field in ("id", "question", "match_terms", "state", "revision")
+                        },
+                        "reply_preference": {"kind": "default_web"},
+                    }
+                    for watch in expected
+                ]
+                seen.extend(items)
+                assert page["has_more"] is (len(seen) < len(watches))
+                if not page["has_more"]:
+                    assert page["next_after_id"] is None
+                    break
+                assert page["next_after_id"] == items[-1]["id"]
+                assert page["next_after_id"] > after
+                after = page["next_after_id"]
+            else:
+                pytest.fail("有限完整记录未能通过实际返回游标读完")
+        assert [item["id"] for item in seen] == [item["id"] for item in ordered]
+        for watch in watches:
+            assert rig.runtime.store.get("memory_watch", watch["id"]) == watch
+        target = seen[-1]
+        async with connection(rig) as client:
+            stopped = await client.post("/api/memory/watches/cancel", json={"id": target["id"]})
+            assert stopped.status_code == 200
+            assert stopped.json() == {
+                "id": target["id"],
+                "state": "cancelled",
+                "revision": target["revision"] + 1,
+            }
+            readback = await client.get("/api/memory/watches", params={"after_id": seen[-2]["id"]})
+            assert readback.status_code == 200
+            assert readback.json()["items"] == [
+                {**target, "state": "cancelled", "revision": target["revision"] + 1}
+            ]
+        for watch in watches:
+            assert rig.runtime.store.get("memory_watch", watch["id"]) == (
+                {**watch, "state": "cancelled", "revision": watch["revision"] + 1}
+                if watch["id"] == target["id"]
+                else watch
+            )
+
+
+async def test_full_bounded_window_still_requires_another_read_with_budget_pages(
     tmp_path: Path,
 ) -> None:
     async with actual_app(tmp_path) as rig:
@@ -115,9 +192,11 @@ async def test_full_bounded_window_requires_another_read_and_budget_failure_is_n
         ordered = sorted(item["id"] for item in watches)
         rig.runtime.config.update({"limits": {"max_output_chars": 2500}})
         async with connection(rig) as client:
-            failed = await client.get("/api/memory/watches", params={"limit": 3})
-            assert failed.status_code == 400 and failed.json()["detail"]["code"] == "output_budget"
-            assert "items" not in failed.json()
+            shortened = await client.get("/api/memory/watches", params={"limit": 3})
+            assert shortened.status_code == 200
+            page = shortened.json()
+            assert 0 < len(page["items"]) < len(watches) and page["has_more"]
+            assert page["next_after_id"] == page["items"][-1]["id"]
             after = ""
             seen: list[str] = []
             for expected in ordered:
@@ -141,6 +220,214 @@ async def test_full_bounded_window_requires_another_read_and_budget_failure_is_n
             assert (
                 await client.get("/api/memory/watches", params={"after_id": "wrong"})
             ).status_code == 422
+
+
+async def test_model_records_keep_the_original_complete_list_budget(tmp_path: Path) -> None:
+    async with actual_app(tmp_path) as rig:
+        watches = [register(rig, key=str(index), question="完整问题" * 250) for index in range(3)]
+        main_id = rig.runtime.main_session()["id"]
+        assert len(rig.memory.watch_records(main_id)) == len(watches)
+        rig.runtime.config.update({"limits": {"max_output_chars": 2500}})
+        with pytest.raises(EvidenceError) as failed:
+            rig.memory.watch_records(main_id)
+        assert failed.value.code == "output_budget"
+
+
+@pytest.mark.parametrize("damage", ["routing", "oversized", "duplicate_json"])
+async def test_unreturned_tail_must_pass_full_validation_before_any_budget_prefix(
+    tmp_path: Path, damage: str
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        watches = [
+            register(rig, key=str(index), question="完整问题" * 250, preference="channel")
+            for index in range(3)
+        ]
+        tail = json.loads(json.dumps(max(watches, key=lambda item: item["id"])))
+        if damage == "duplicate_json":
+            duplicate = json.dumps(tail, ensure_ascii=False)[:-1] + ', "revision": 1}'
+            with rig.runtime.store.db:
+                rig.runtime.store.db.execute(
+                    "UPDATE objects SET data=? WHERE kind='memory_watch' AND id=?",
+                    (duplicate, tail["id"]),
+                )
+        else:
+            if damage == "routing":
+                tail["routing"]["destination"]["route"]["target"] = "other-recipient"
+            else:
+                tail["question"] = "大" * 23000
+            rig.runtime.store.put("memory_watch", tail)
+        rig.runtime.config.update({"limits": {"max_output_chars": 2500}})
+        async with connection(rig) as client:
+            response = await client.get("/api/memory/watches")
+        assert response.status_code == 400 and "items" not in response.json()
+        assert "other-recipient" not in response.text
+        if damage in {"oversized", "duplicate_json"}:
+            assert (
+                response.json()["detail"]["code"]
+                == {
+                    "oversized": "output_budget",
+                    "duplicate_json": "content_unavailable",
+                }[damage]
+            )
+
+
+async def test_self_consistent_other_main_record_is_not_a_public_budget_prefix(
+    tmp_path: Path,
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        watch = register(rig)
+        foreign = {**watch, "main_session_id": new_id()}
+        foreign["id"] = watch_module._identity(
+            "memory_watch", foreign["main_session_id"], foreign["created_input_id"], foreign["key"]
+        )
+        rig.runtime.store.put("memory_watch", foreign)
+        assert watch_module._watch(rig.runtime.store, foreign["id"]) == foreign
+        async with connection(rig) as client:
+            response = await client.get("/api/memory/watches")
+        assert response.status_code == 403 and "items" not in response.json()
+
+
+async def test_each_request_validates_only_its_one_finite_window_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        watches = [
+            register(rig, key=str(index), question="完整问题" * 250, preference="channel")
+            for index in range(3)
+        ]
+        ordered = sorted(watches, key=lambda item: item["id"])
+        outside = {**ordered[-1], "question": "大" * 23000}
+        rig.runtime.store.put("memory_watch", outside)
+        rig.runtime.config.update({"limits": {"max_output_chars": 2500}})
+        read_watch, read_routing = watch_module._watch, watch_module._routing
+        load_routing, output_fits = FrozenRouting.load, rig.memory.watches.output_fits
+        verified: list[str] = []
+        routing: list[str] = []
+        loaded: list[str] = []
+        expected_inputs = [item["created_input_id"] for item in ordered[:2]]
+
+        def counted_watch(store: Store, identifier: str) -> dict[str, Any]:
+            verified.append(identifier)
+            return read_watch(store, identifier)
+
+        def counted_routing(store: Store, watch: dict[str, Any]) -> FrozenRouting:
+            routing.append(watch["id"])
+            return read_routing(store, watch)
+
+        def counted_load(value: object) -> FrozenRouting:
+            if isinstance(value, dict) and isinstance(value.get("source_input_id"), str):
+                loaded.append(value["source_input_id"])
+            return load_routing(value)
+
+        def checked_fit(value: object, max_output_chars: int) -> bool:
+            assert loaded == expected_inputs * 2  # Complete validation, then every projection.
+            return output_fits(value, max_output_chars)
+
+        monkeypatch.setattr(watch_module, "_watch", counted_watch)
+        monkeypatch.setattr(watch_module, "_routing", counted_routing)
+        monkeypatch.setattr(FrozenRouting, "load", staticmethod(counted_load))
+        monkeypatch.setattr(rig.memory.watches, "output_fits", checked_fit)
+        statements: list[str] = []
+        rig.runtime.store.db.set_trace_callback(statements.append)
+        try:
+            async with connection(rig) as client:
+                response = await client.get("/api/memory/watches", params={"limit": 2})
+        finally:
+            rig.runtime.store.db.set_trace_callback(None)
+        assert response.status_code == 200
+        page = response.json()
+        assert 0 < len(page["items"]) < 2 and page["has_more"]
+        assert page["next_after_id"] == ordered[0]["id"]
+        assert verified == routing == [item["id"] for item in ordered[:2]]
+        windows = [
+            sql for sql in statements if "FROM objects WHERE kind='memory_watch' AND id>" in sql
+        ]
+        assert len(windows) == 1 and windows[0].rstrip().endswith("LIMIT 2")
+
+
+@pytest.mark.parametrize("count", [1, 2])
+async def test_complete_final_page_is_admitted_at_its_exact_character_budget(
+    tmp_path: Path, count: int
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        for index in range(count):
+            register(rig, key=str(index), question="完整背景" * 250)
+        async with connection(rig) as client:
+            initial = await client.get("/api/memory/watches")
+            assert initial.status_code == 200
+            complete = initial.json()
+            exact = len(json.dumps(complete, ensure_ascii=False, allow_nan=False))
+            assert 1000 < exact < rig.runtime.config.settings.limits.max_output_chars
+            rig.runtime.config.update({"limits": {"max_output_chars": exact}})
+            admitted = await client.get("/api/memory/watches")
+            assert admitted.status_code == 200 and admitted.json() == complete
+            rig.runtime.config.update({"limits": {"max_output_chars": exact - 1}})
+            reduced = await client.get("/api/memory/watches")
+            if count == 1:
+                assert reduced.status_code == 400
+                assert reduced.json()["detail"]["code"] == "output_budget"
+                assert "items" not in reduced.json()
+            else:
+                assert reduced.status_code == 200
+                page = reduced.json()
+                assert len(page["items"]) == 1 and page["has_more"]
+                assert page["next_after_id"] == page["items"][-1]["id"]
+
+
+async def test_public_page_keeps_the_existing_utf8_byte_cap_with_legal_unicode_records(
+    tmp_path: Path,
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        # actual_app uses 6000; isolate the fixed byte gate under the declared
+        # default character budget, before admitting each complete watch.
+        char_budget = Limits().max_output_chars
+        rig.runtime.config.update({"limits": {"max_output_chars": char_budget}})
+        watches = [register(rig, key=str(index), question="🙂" * 5500) for index in range(3)]
+        assert len(json.dumps(watches, ensure_ascii=False, allow_nan=False)) <= char_budget
+        assert sum(len(item["question"].encode("utf-8")) for item in watches) > (
+            watch_module.MAX_MATCH_PROOF_BYTES
+        )
+        async with connection(rig) as client:
+            response = await client.get("/api/memory/watches")
+        assert response.status_code == 200
+        page = response.json()
+        assert 0 < len(page["items"]) < len(watches) and page["has_more"]
+        assert len(response.content) <= watch_module.MAX_MATCH_PROOF_BYTES
+        assert len(json.dumps(page, ensure_ascii=False)) <= (
+            rig.runtime.config.settings.limits.max_output_chars
+        )
+        originals = {item["id"]: item for item in watches}
+        for item in page["items"]:
+            assert item["question"] == originals[item["id"]]["question"]
+
+
+async def test_a_single_public_record_that_cannot_fit_is_still_an_error(tmp_path: Path) -> None:
+    async with actual_app(tmp_path) as rig:
+        watch = register(rig, question="完整背景" * 300)
+        rig.runtime.config.update({"limits": {"max_output_chars": 1000}})
+        async with connection(rig) as client:
+            response = await client.get("/api/memory/watches")
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "output_budget"
+        assert "items" not in response.json()
+        assert rig.runtime.store.get("memory_watch", watch["id"]) == watch
+
+
+async def test_empty_end_is_valid_but_overbudget_metadata_is_not_empty_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with actual_app(tmp_path) as rig:
+        async with connection(rig) as client:
+            empty = await client.get("/api/memory/watches")
+            assert empty.status_code == 200 and empty.json()["items"] == []
+            assert not empty.json()["has_more"] and empty.json()["next_after_id"] is None
+            # The public configuration minimum normally admits this small header.
+            # Fault-inject the existing budget provider to test the metadata gate.
+            monkeypatch.setattr(rig.memory.watches, "max_output_chars", lambda: 1)
+            response = await client.get("/api/memory/watches")
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "output_budget"
+        assert "items" not in response.json()
 
 
 @pytest.mark.parametrize("damage", ["routing", "oversized"])
