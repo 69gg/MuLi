@@ -857,39 +857,55 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                         initial_postproofs.packages = None
 
                 postproofs = _FileProofs()
+
+                def final_preflight() -> None:
+                    try:
+                        self._check(
+                            record,
+                            verified_python=postproofs.python,
+                            verified_packages=postproofs.packages,
+                        )
+                    finally:
+                        # The final synchronous file confirmation lends only
+                        # content, never authentication across the probe await.
+                        postproofs.python = None
+                        postproofs.packages = None
+
                 try:
                     if before != await self._probe(record, preflight=guard, postproofs=postproofs):
                         raise ObservationError("transaction_observation_changed")
                     self._install_files(record, role, data, lease, cgroup, proofs=postproofs)
+                    final_postproofs = _FileProofs()
+                    try:
+                        fresh = await self._probe(
+                            record, preflight=final_preflight, postproofs=final_postproofs
+                        )
+                        if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
+                            raise ObservationError("transaction_observation_changed")
+                        if not fresh.unit_confirmed:
+                            guard()
+                            final_postproofs.python = None
+                            final_postproofs.packages = None
+                            await self._command("daemon-reload")
+                            fresh = await self._probe(
+                                record, preflight=guard, postproofs=final_postproofs
+                            )
+                        if (
+                            not self._stopped(fresh.service)
+                            or not fresh.unit_confirmed
+                            or fresh.disk_unit != record.binding(role).unit.digest
+                        ):
+                            raise ObservationError("managed_unit_not_loaded")
+                        disk = self._confirm(record, role, lease, cgroup, proofs=final_postproofs)
+                        return BindingConfirmation(
+                            record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
+                        )
+                    finally:
+                        final_postproofs.python = None
+                        final_postproofs.packages = None
                 finally:
                     postproofs.python = None
                     postproofs.packages = None
-                final_postproofs = _FileProofs()
-                try:
-                    fresh = await self._probe(record, postproofs=final_postproofs)
-                    if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
-                        raise ObservationError("transaction_observation_changed")
-                    if not fresh.unit_confirmed:
-                        guard()
-                        final_postproofs.python = None
-                        final_postproofs.packages = None
-                        await self._command("daemon-reload")
-                        fresh = await self._probe(
-                            record, preflight=guard, postproofs=final_postproofs
-                        )
-                    if (
-                        not self._stopped(fresh.service)
-                        or not fresh.unit_confirmed
-                        or fresh.disk_unit != record.binding(role).unit.digest
-                    ):
-                        raise ObservationError("managed_unit_not_loaded")
-                    disk = self._confirm(record, role, lease, cgroup, proofs=final_postproofs)
-                    return BindingConfirmation(
-                        record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
-                    )
-                finally:
-                    final_postproofs.python = None
-                    final_postproofs.packages = None
         finally:
             initial_postproofs.python = None
             initial_postproofs.packages = None

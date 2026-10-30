@@ -1,5 +1,26 @@
 # 真实 systemd 托管切换 CI 设计
 
+本轮只减少安装末尾的一条同步内容重复：真实 `_install_files` 的最终 `_confirm`
+已经完整认证并核对磁盘后，将既有 `_FileProofs` 交给紧邻最终 probe 的原
+`_check(record)` preflight。该次原角色仍为 `None`，全部身份、metadata、目录枚举、
+FD/path-stat 和认证顺序保留；仅精确身份未变的 Python/包叶内容可复用。
+preflight 的 `finally` 在进入实际 `read_managed` await 前清空借用证明；外层
+`finally` 也覆盖文件安装失败。probe 的 post-await 认证使用独立完整读取，
+只由该新结果支持后续最终确认。角色、revision、deadline、lease 和 cgroup 授权不缓存，
+原 reload 与异常/取消路径保持；没有新增缓存、跳过 hash 或改变任何时间/资源上限。
+
+修前冻结的真实安装基线 `target/base` 两参数均只在末尾“同步新增内容字节为零”
+断言失败（2 项失败、2.69 秒；守卫 3.706 秒、峰值 69.4 MiB）；原完整安装、
+29 次精确角色顺序、三次 probe、disk/state/lease/deadline/命令和 await 后独立读取
+断言已先通过。离线 fixture 的共享 Python 为 65,796 字节，包观察器仅计两叶
+256+175=431 字节/根，不代表线上约 31 MB 的解释器或完整包。
+正式回归保留该真实调用窗口，并为新交接点复用内容/ctime、inode、权限、parent、
+metadata、revision、错误优先级和效果授权负控；实际 await 内继续检查内容变更、
+同一取消对象传播及证明清除。冻结的原失败基线修后两参数通过，另有 213 项相关
+回归经本机资源守卫串行通过；原生完整切换仍须托管 CI 验证。
+这至多去掉该边的一份内容读取，不能据此认定 60 秒失败根因或原生三事务已修复；
+Case60 / harness90 / cleanup5、全部 hash 和完整三事务验收保持。
+
 worker 另可输出一份 `resources.worker_await` version1 取消位置。它用于区分最后
 timeline 标签与真正被外层取消的等待：`helper_exit` 只表示此前记录过 helper 状态，
 不能据此认定正在等待 helper 退出。本字段也不是 helper 自己的执行栈。

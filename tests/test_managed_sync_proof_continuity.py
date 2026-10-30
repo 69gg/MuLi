@@ -19,8 +19,9 @@ from test_managed_backend_python_proof import shared_host as shared_host
 from muli.managed_controller import BindingConfirmation
 from muli.managed_journal import RoleSnapshots
 from muli.managed_transaction import TransactionRecordV2
-from muli.management_transaction import FixedLock, Role
+from muli.management_transaction import FixedLock, Role, TransactionJournal
 from muli.platforms.managed_backend import _DiskBinding, _FileProofs
+from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
 from muli.platforms.managed_probe import ManagedProbeResult
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux real synchronous proofs")
@@ -312,6 +313,149 @@ async def test_install_writer_probe_lends_controller_bytes_to_file_effects(
     before, after = spans[0]
     assert_span_walks(host, role, reads, python, before, after, 16)
     assert_only_unverified_selected_bytes(host, role, reads, before, after)
+
+
+@pytest.mark.parametrize("role", ["target", "base"])
+async def test_install_files_lends_controller_bytes_to_final_probe_preflight(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, role: Role
+) -> None:
+    host = shared_host
+    record = await prepare_stopped(host, role, installed=False)
+    controller = Path(host.backend.controller_slot.package.root)
+    target = Path(host.slots["target"].package.root)
+    assert controller != target
+    assert host.backend.controller_slot.resolved_python == host.slots[role].resolved_python
+    python_size = host.backend.controller_slot.resolved_python.identity.size
+    if role == "base":
+        damaged = target / "batch_payload/first.bin"
+        assert damaged.read_bytes().endswith(b"damaged opposite package")
+    commands, transport_calls = list(host.commands), list(host.transport.calls)
+    state_path = host.journal.directory.path / "state.json"
+    state = state_path.read_bytes()
+    service, cgroup_events = host.probe.snapshot, host.events.read_bytes()
+    operation_timeout, probe_limits = host.backend.operation_timeout, host.probe.limits
+    reads = observe_payloads(host, monkeypatch)
+    python = observe_python_reads(host, monkeypatch)
+    checks = observe_checks(host, monkeypatch)
+    original_files, original_read = host.backend._install_files, host.probe.read_managed
+    file_returns: list[ReadSnapshot] = []
+    final_probe_entries: list[ReadSnapshot] = []
+    file_batches: list[_FileProofs] = []
+    file_leases: list[FixedLock] = []
+    lease_identities: list[tuple[int, int]] = []
+    probes: list[ManagedProbeResult] = []
+
+    def install_files(
+        current: TransactionRecordV2,
+        selected: Role,
+        data: RoleSnapshots,
+        lease: FixedLock,
+        cgroup: str,
+        *,
+        proofs: _FileProofs | None = None,
+    ) -> None:
+        original_files(current, selected, data, lease, cgroup, proofs=proofs)
+        # The actual final _confirm returned; no await or substitute file effect.
+        file_returns.append(snapshot(reads, python, checks))
+        assert proofs is not None and proofs.python is not None and proofs.packages is not None
+        file_batches.append(proofs)
+        file_leases.append(lease)
+        lease.check()
+        assert lease.fd is not None
+        info = os.fstat(lease.fd)
+        lease_identities.append((info.st_dev, info.st_ino))
+
+    async def read_managed(
+        journal: TransactionJournal,
+        current: TransactionRecordV2,
+        anchor: DeploymentAnchor,
+        controller_slot: SlotIdentity,
+        slots: dict[Role, SlotIdentity],
+    ) -> ManagedProbeResult:
+        if host.probe.count == 2:
+            # Snapshot after the real synchronous preflight, before delegating
+            # the third manager read. The borrowed proof must already be gone.
+            final_probe_entries.append(snapshot(reads, python, checks))
+            assert len(file_batches) == 1
+            assert file_batches[0].python is None and file_batches[0].packages is None
+            file_leases[0].check()
+        result = await original_read(journal, current, anchor, controller_slot, slots)
+        probes.append(result)
+        return result
+
+    monkeypatch.setattr(host.backend, "_install_files", install_files)
+    monkeypatch.setattr(host.probe, "read_managed", read_managed)
+
+    confirmation = await host.backend.install(record, role, host.data[role])
+
+    assert confirmation == expected_confirmation(record, role)
+    expected_roles: list[Role | None] = (
+        [role, None, role, None] + [role] * 16 + [None] * 2 + [role] * 7
+    )
+    assert len(checks) == 29 and all(current is record for current, _ in checks)
+    assert [selected for _, selected in checks] == expected_roles
+    assert host.probe.count == len(probes) == 3
+    assert all(result.service == service and result.process_roles == () for result in probes)
+    assert all(result.unit_confirmed for result in probes)
+    assert probes[-1].disk_unit == record.binding(role).unit.digest
+    assert host.commands == commands and host.transport.calls == transport_calls == []
+    same_record = host.record() == record
+    assert same_record and state_path.read_bytes() == state
+    assert host.record().deadline == record.deadline
+    assert host.backend.operation_timeout == operation_timeout and host.probe.limits == probe_limits
+    assert host.events.read_bytes() == cgroup_events and host.writer is None
+    disk = host.backend._disk()
+    assert disk.configuration.data == host.data[role].configuration
+    assert disk.selector is not None and disk.selector.value == host.selector(role)
+    assert disk.unit.data == host.data[role].unit
+    assert disk.digests == (confirmation.configuration, confirmation.selector, confirmation.unit)
+    assert len(file_leases) == len(lease_identities) == 1 and file_leases[0].fd is None
+    assert file_batches[0].python is None and file_batches[0].packages is None
+    with host.journal.writer_lease() as available:
+        available.check()
+        assert available.fd is not None
+        info = os.fstat(available.fd)
+        assert (info.st_dev, info.st_ino) == lease_identities[0]
+    host.control.check()
+
+    for path, leaf in reads.leaves.items():
+        walks = 29 if path.is_relative_to(controller) else 25 if role == "target" else 0
+        assert len(leaf.opened) == walks, str(path)
+        assert leaf.fd_stats >= 2 * walks and leaf.path_stats == walks, str(path)
+        assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in leaf.opened)
+    for directory, count in reads.scans.items():
+        walks = 29 if directory.is_relative_to(controller) else 25 if role == "target" else 0
+        assert count == walks, str(directory)
+    assert len(python.opened) == len(checks) + sum(selected == "target" for _, selected in checks)
+    assert all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in python.opened)
+    assert len(file_returns) == len(final_probe_entries) == 1
+    before, after = file_returns[0], final_probe_entries[0]
+    assert before.checks == 20 and after.checks == 21 and len(checks) - after.checks == 8
+    assert after.python_opens - before.python_opens == 1
+    for path in reads.leaves:
+        walks = 1 if path.is_relative_to(controller) else 0
+        assert after.leaves[path][1] - before.leaves[path][1] == walks, str(path)
+        assert after.leaves[path][2] - before.leaves[path][2] >= 2 * walks, str(path)
+        assert after.leaves[path][3] - before.leaves[path][3] == walks, str(path)
+        if not walks:
+            assert after.leaves[path][0] == before.leaves[path][0], str(path)
+    for directory in reads.scans:
+        walks = 1 if directory.is_relative_to(controller) else 0
+        assert after.scans[directory] - before.scans[directory] == walks, str(directory)
+
+    # The next actual manager await keeps its independent full authentication.
+    assert python.bytes - after.python_bytes == python_size
+    for path, size in reads.sizes.items():
+        copies = 1 if path.is_relative_to(controller) or role == "target" else 0
+        assert reads.leaves[path].bytes - after.leaves[path][0] == size * copies, str(path)
+    extra_content = {
+        path.relative_to(controller).as_posix(): after.leaves[path][0] - before.leaves[path][0]
+        for path in reads.leaves
+        if path.is_relative_to(controller)
+    }
+    extra_content["python"] = after.python_bytes - before.python_bytes
+    # Only the two fixture leaves are metered, not all package members.
+    assert extra_content == dict.fromkeys(extra_content, 0)
 
 
 @pytest.mark.parametrize("role", ["target", "base"])

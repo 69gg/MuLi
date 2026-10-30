@@ -94,10 +94,10 @@ async def test_install_batch_reuses_payload_bytes_with_all_required_guards(
         name = "controller" if leaf.is_relative_to(roots["controller"]) else "target"
         key = f"{name}/{leaf.relative_to(roots[name]).as_posix()}"
         actual_bytes[key] = observed.bytes
-        # The first post-check now also lends to the writer preflight. Full
-        # controller reads remain at the first preflight, all three post-checks
-        # and the final probe preflight; different selected roots still read four.
-        copies = 5 if name == "controller" else selected_copies
+        # Adjacent file proofs also lend to the final probe preflight. Full
+        # controller reads remain at the first preflight and all three independent
+        # post-checks; different selected roots still read four complete copies.
+        copies = 4 if name == "controller" else selected_copies
         expected_bytes[key] = reads.sizes[leaf] * copies
     # Keep this failure to plain strings and integers, never a Host/identity graph.
     assert actual_bytes == expected_bytes
