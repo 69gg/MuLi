@@ -74,7 +74,7 @@ function harness({ reduced = false, respond } = {}) {
   };
   const context = {
     Node, document, state, connection: owner, SETTINGS_GROUPS, setPath, parseJSONField, loadSettingsResources,
-    AbortController, extensionReload: null, viewRequestVersion: 0,
+    AbortController, extensionReload: null, viewRequestVersion: 0, ownerQuestionDialog: null,
     $: (selector, node = document) => node.querySelector(selector),
     $$: (selector, node = document) => node.querySelectorAll(selector),
     connectionCurrent: (candidate) => candidate === context.connection && !candidate.controller.signal.aborted,
@@ -103,6 +103,8 @@ function harness({ reduced = false, respond } = {}) {
     section("function element(", "function icon("),
     section("function viewHeading(", "function emptyState("),
     section("function emptyState(", "async function switchView("),
+    // Settings starts without a task question, but navigation uses the real cleanup.
+    section("function releaseOwnerQuestionDialog(", "function ownerQuestionPage("),
     section("async function switchView(", "function renderOtherView("),
     section("function renderOtherView(", "function renderThemeControl("),
     section("function renderSettings()", "function renderConfigurationOverview("),
