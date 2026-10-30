@@ -4,11 +4,12 @@ import { runInNewContext } from "node:vm";
 import { attachmentKind, attachmentURL, formatBytes } from "../../../web/attachments.mjs";
 import { CHANNELS, capabilityLabel, loadSettingsResources, managementRecoveryView, updateLabel } from "../../../web/management.mjs";
 import { setPath, mergeSettingsExtras, settingsExtras, settingsPatch, changesListener, SETTINGS_GROUPS } from "../../../web/settings.mjs";
-import { MODES, applyEvent, createSessionState, isRunning, parseJSONField } from "../../../web/state.mjs";
+import { MODES, applyEvent, createSessionState, hydrateSession, isRunning, parseJSONField } from "../../../web/state.mjs";
 import { mergeTranscript } from "../../../web/voice-input.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../../web/voice-setup.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "../../../web/team.mjs";
 import { createTaskControl, taskControlView } from "../../../web/task-control.mjs";
+import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../../web/composer-draft.mjs";
 
 // Run the actual application functions and registered dialog close handler.
 // No browser library, server, model, account or real database is involved.
@@ -97,7 +98,7 @@ export class DOMElement {
 
 export class DOMButton extends DOMElement {}
 
-export function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false, team = false, upload = () => {}, transcribe = () => {}, createVoiceInput = null, voiceControls = false } = {}) {
+export function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false, team = false, upload = () => {}, transcribe = () => {}, createVoiceInput = null, voiceControls = false, storage = null } = {}) {
   const document = { events: {}, activeElement: null, createTextNode: (text) => new TextNode(text), addEventListener(name, callback) { (this.events[name] ??= []).push(callback); } };
   document.createElement = (tag) => tag === "button" ? new DOMButton(tag, document) : new DOMElement(tag, document);
   document.createElementNS = (_namespace, tag) => document.createElement(tag);
@@ -129,6 +130,9 @@ export function harness(handler = async () => { throw new Error("unexpected requ
       }
     }
     // These cases exercise the real composer and submit handlers, without browser layout.
+    node("div", "composer-draft-state"); node("span", "composer-draft-status");
+    node("button", "composer-draft-recheck").dataset.action = "retry-composer-attachments";
+    node("button", "composer-draft-discard").dataset.action = "discard-composer-draft";
     document.querySelector("#conversation-scroll").clientHeight = 0;
   }
   const requests = [], windowEvents = {}, savedTaskControls = new Map(); let globalEvent = null, nextMessage = 0, voiceCallbacks = null;
@@ -143,14 +147,15 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     AbortController, TextEncoder, URLSearchParams, structuredClone, console, queueMicrotask,
     crypto: { randomUUID: () => `memory-draft-${++nextMessage}` },
     setTimeout: () => 0, clearTimeout() {},
-    MODES, applyEvent, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript, setPath, mergeSettingsExtras, settingsPatch, changesListener, loadSettingsResources, parseJSONField,
+    MODES, applyEvent, hydrateSession, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript, setPath, mergeSettingsExtras, settingsPatch, changesListener, loadSettingsResources, parseJSONField,
     createSessionState: composer ? createSessionState : () => ({ messages: [] }),
     createTeamPager: team ? createTeamPager : () => ({}), captureTeamView: team ? captureTeamView : () => null,
     createTaskControl, taskControlView,
+    composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
     uploadFile: upload, transcribeAttachment: transcribe,
     VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; if (createVoiceInput) return createVoiceInput(callbacks); } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, managementRecoveryView, updateLabel, settingsExtras, SETTINGS_GROUPS,
     restoreTeamView: team ? restoreTeamView : () => {},
-    sessionStorage: team ? taskStorage : {},
+    sessionStorage: storage ?? (team ? taskStorage : {}),
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
@@ -166,7 +171,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     };
     activateConnection();
     globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, captureVoiceDraft, renderComposerAttachments,
-      activateConnection,
+      activateConnection, connect,
       get capabilityCatalogSlot() { return capabilityCatalog; },
       watchPending(id) { return memoryWatchPending.has(id); },
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },

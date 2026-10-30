@@ -1,4 +1,5 @@
 import test from "node:test";
+import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../web/composer-draft.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -116,6 +117,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const heading = node("div", "other-heading", other); heading.className = "view-heading"; node("h2", "view-title", heading);
   const requests = [], windowEvents = {}, streams = new Map();
   const context = {
+    composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
     document, Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
     window: { addEventListener: (name, callback) => { windowEvents[name] = callback; } },
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,

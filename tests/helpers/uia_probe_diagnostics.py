@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from muli.tools.ax_lease import MAX_STDERR_BYTES, AXHelperLease, AXLeaseError
 
@@ -110,6 +110,26 @@ def probe_facts(lease: AXHelperLease, *, cleanup_failed: bool) -> dict[str, Any]
     return facts
 
 
+def _add_probe_note(
+    error: BaseException,
+    lease: AXHelperLease,
+    *,
+    cleanup_failed: bool,
+    command: Literal["probe", "targets"] = "probe",
+) -> None:
+    try:
+        facts = probe_facts(lease, cleanup_failed=cleanup_failed)
+        if command == "targets":
+            facts["command"] = "targets"
+        encoded = _NOTE_PREFIX + json.dumps(
+            facts, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+        )
+        if len(encoded.encode("ascii")) <= _NOTE_BYTES:
+            BaseException.add_note(error, encoded)
+    except Exception:
+        pass  # Evidence must never replace the original failure.
+
+
 async def observe_probe(lease: AXHelperLease) -> dict[str, Any]:
     """Keep the original error/outcome, including cancellation and sticky close."""
     failure: BaseException | None = None
@@ -128,17 +148,7 @@ async def observe_probe(lease: AXHelperLease) -> dict[str, Any]:
             if failure is None:
                 raise
         if failure is not None:
-            try:
-                encoded = _NOTE_PREFIX + json.dumps(
-                    probe_facts(lease, cleanup_failed=cleanup_failed),
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-                if len(encoded.encode("ascii")) <= _NOTE_BYTES:
-                    BaseException.add_note(failure, encoded)
-            except Exception:
-                pass  # Evidence must never replace the original failure.
+            _add_probe_note(failure, lease, cleanup_failed=cleanup_failed)
 
 
 class _PendingInput:

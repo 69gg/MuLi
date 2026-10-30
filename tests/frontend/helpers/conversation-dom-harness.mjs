@@ -4,6 +4,7 @@ import { runInNewContext } from "node:vm";
 import * as sessionState from "../../../web/state.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../../web/voice-setup.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "../../../web/attachments.mjs";
+import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../../web/composer-draft.mjs";
 
 const app = await readFile(new URL("../../../web/app.mjs", import.meta.url), "utf8");
 const application = app.slice(app.indexOf("const ICONS ="), app.indexOf("\nfillIcons();"));
@@ -172,6 +173,7 @@ export function harness({ realApprovals = false, interactive = false, handler = 
     disconnect() { this.targets.clear(); }
   }
   const context = {
+    composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
     ...sessionState, document, console, AbortController, TextEncoder, URLSearchParams, queueMicrotask,
     Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
     window: { addEventListener: (name, callback) => { (windowEvents[name] ??= []).push(callback); }, requestAnimationFrame, cancelAnimationFrame },

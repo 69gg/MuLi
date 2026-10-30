@@ -1,4 +1,5 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
+import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "./composer-draft.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, conversationItems, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
@@ -121,6 +122,16 @@ const taskControlModels = new Map();
 const taskControlStoragePrefix = "muli.task-control:";
 const teamPager = createTeamPager(request);
 let draftRevision = 0;
+let composerDraftBinding = null;
+let composerPendingEdit = null;
+let composerAttachmentCheck = null;
+let composerSubmission = null;
+let composerDraftNote = "";
+let composerStorageWarning = false;
+const composerUploads = new Set();
+const previewDraftValues = new Map();
+const previewDraftStorage = { getItem: (key) => previewDraftValues.get(key) ?? null, setItem: (key, value) => previewDraftValues.set(key, value), removeItem: (key) => previewDraftValues.delete(key) };
+const composerDraft = createComposerDraft({ storage: () => state.status?.preview ? previewDraftStorage : sessionStorage, maxTextChars: $("#message-input").maxLength || 64000 });
 let conversationLayout = null;
 let conversationFollowing = true;
 let conversationFollowFrame = null;
@@ -144,7 +155,7 @@ const voiceInput = new VoiceInput({
     const input = $("#message-input");
     const merged = mergeTranscript(draft.context, captureDraft(), draft.text);
     if (merged !== null && merged.length <= (state.status?.web_voice?.max_text_chars ?? 64000)) {
-      input.value = merged; draftRevision += 1; resizeComposer(); input.focus();
+      input.value = merged; composerChanged(); resizeComposer(); input.focus();
       toast("转写已加入草稿，检查后点击发送。");
     } else {
       state.voiceDraft = draft;
@@ -159,14 +170,120 @@ function captureDraft() {
   return { session: state.activeSession?.id, revision: draftRevision, text: $("#message-input").value };
 }
 
+function currentComposerIdentity() {
+  return state.activeSession?.id === state.mainSessionId ? composerIdentity(state.status?.store_instance_id, state.mainSessionId) : null;
+}
+
+function composerChanged() {
+  draftRevision += 1;
+  const owner = connection;
+  if (!connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || (state.mainSessionId && state.activeSession?.id !== state.mainSessionId)) return;
+  const identity = currentComposerIdentity();
+  if (!state.connected || !sameComposerIdentity(identity, composerDraftBinding)) {
+    // Only an actual edit may await this owner's identity check; renders and send refills never qualify.
+    composerPendingEdit = { owner, revision: draftRevision, identity: composerDraftBinding };
+    return;
+  }
+  composerPendingEdit = null;
+  saveComposerSnapshot(identity);
+}
+
+function saveComposerSnapshot(identity) {
+  const saved = composerDraft.save(identity, $("#message-input").value, state.attachments);
+  if (!saved) composerStorageWarning = true;
+  composerDraftNote = saved ? "已暂存本页草稿，尚未发送。" : "浏览器草稿未能保存，请保留当前页面。";
+}
+
+function stopComposerOperations() {
+  composerPendingEdit = null;
+  composerAttachmentCheck?.controller.abort(); composerAttachmentCheck = null;
+  for (const controller of composerUploads) controller.abort();
+  composerUploads.clear(); state.uploading = 0;
+  composerSubmission = null; state.sending = false;
+}
+
+function composerContextCurrent(owner, identity, session, version) {
+  return connectionCurrent(owner) && owner.ready && state.connected && state.auth.authenticated && session === state.mainSessionId && session === state.activeSession?.id
+    && version === sessionRequestVersion && identity === state.status?.store_instance_id;
+}
+
+function renderComposerDraft() {
+  const blocked = state.attachments.some((file) => file.draftStatus);
+  const text = blocked ? "附件尚未全部核查，请核查或移除后再发送。" : composerDraftNote || (composerStorageWarning ? "浏览器草稿未能保存，请保留当前页面。" : "");
+  $("#composer-draft-state").hidden = !text && !$("#message-input").value && !state.attachments.length;
+  $("#composer-draft-status").textContent = text;
+  $("#composer-draft-recheck").hidden = !blocked;
+  $("#composer-draft-recheck").disabled = !!composerAttachmentCheck;
+  $("#composer-draft-discard").disabled = !$("#message-input").value && !state.attachments.length;
+}
+
+function discardComposerDraft() {
+  stopComposerOperations(); voiceInput.cancel();
+  const cleared = composerDraft.clear();
+  $("#message-input").value = ""; state.attachments = []; draftRevision += 1;
+  composerDraftNote = cleared ? "" : "浏览器草稿未能清除，请清除本页站点存储后再退出。";
+  composerStorageWarning ||= !cleared;
+  if (!cleared) toast(composerDraftNote, true);
+  renderComposerAttachments(); resizeComposer();
+}
+
+async function restoreComposerDraft(owner, revision) {
+  const identity = currentComposerIdentity();
+  if (!identity || !connectionCurrent(owner) || !state.auth.authenticated || !state.connected) return;
+  const pendingEdit = composerPendingEdit; composerPendingEdit = null;
+  const changed = composerDraftBinding && !sameComposerIdentity(identity, composerDraftBinding);
+  if (changed) {
+    stopComposerOperations(); voiceInput.cancel();
+    $("#message-input").value = ""; state.attachments = []; state.voiceDraft = null; $("#voice-draft-text").value = ""; draftRevision += 1;
+    composerDraft.clear(); composerDraftNote = "";
+  }
+  composerDraftBinding = identity;
+  const saved = composerDraft.read(identity);
+  if (saved.unavailable) { composerStorageWarning = true; composerDraftNote = "浏览器草稿无法读取，请保留当前页面。"; }
+  if (!changed && draftRevision === revision && !$("#message-input").value && !state.attachments.length && saved.record) {
+    $("#message-input").value = saved.record.text;
+    state.attachments = saved.record.attachments.map((file) => ({ ...file, draftStatus: "checking" }));
+    draftRevision += 1; composerDraftNote = "已恢复本页草稿，尚未发送。";
+  }
+  if (!changed && pendingEdit?.owner === owner && pendingEdit.revision === draftRevision && (!pendingEdit.identity || sameComposerIdentity(pendingEdit.identity, identity)) && !saved.invalid && !saved.unavailable) saveComposerSnapshot(identity);
+  renderComposerAttachments(); resizeComposer();
+  if (state.attachments.some((file) => file.draftStatus)) await checkComposerAttachments(owner);
+}
+
+async function checkComposerAttachments(owner = connection) {
+  const identity = currentComposerIdentity();
+  if (!identity || !sameComposerIdentity(identity, composerDraftBinding) || !connectionCurrent(owner) || !state.auth.authenticated || !state.connected) return;
+  const files = state.attachments.filter((file) => file.draftStatus);
+  if (!files.length) return;
+  composerAttachmentCheck?.controller.abort();
+  const slot = composerAttachmentCheck = { owner, identity, files, controller: new AbortController() };
+  const current = () => composerAttachmentCheck === slot && !slot.controller.signal.aborted && sameComposerIdentity(identity, currentComposerIdentity()) && state.auth.authenticated && state.connected;
+  renderComposerDraft();
+  try {
+    const ids = files.map((file) => file.id), params = new URLSearchParams(); for (const id of ids) params.append("ids", id);
+    const response = await ownedRequest(`/uploads?${params}`, { signal: slot.controller.signal, cache: "no-store" }, owner, current);
+    const items = response?.items, missing = response?.unavailable_ids;
+    if (!Array.isArray(items) || !Array.isArray(missing) || items.some((file) => !validDraftAttachment(file) || typeof file.mime_type !== "string" || !Number.isSafeInteger(file.size) || file.size < 0)
+      || items.length + missing.length !== ids.length || new Set([...items.map((file) => file.id), ...missing]).size !== ids.length
+      || [...items.map((file) => file.id), ...missing].some((id) => !ids.includes(id))
+      || items.some((file, index) => file.id !== ids.filter((id) => !missing.includes(id))[index]) || missing.some((id, index) => id !== ids.filter((id) => missing.includes(id))[index])) throw new Error("附件核查回执不完整，请重查。");
+    if (!current()) return;
+    state.attachments = state.attachments.map((file) => !files.includes(file) ? file : items.find((entry) => entry.id === file.id) ?? { ...file, draftStatus: "unavailable" });
+  } catch (error) {
+    if (current() && error.name !== "AbortError") state.attachments = state.attachments.map((file) => files.includes(file) ? { ...file, draftStatus: "failed" } : file);
+  } finally {
+    if (current()) { composerAttachmentCheck = null; renderComposerAttachments(); }
+  }
+}
+
 function captureVoiceDraft() {
-  return { ...captureDraft(), owner: connection, sessionVersion: sessionRequestVersion };
+  return { ...captureDraft(), owner: connection, store: state.status?.store_instance_id, sessionVersion: sessionRequestVersion };
 }
 
 // Same-chat navigation keeps VoiceInput valid; leaving chat cancels its generation.
 function voiceContextCurrent(context) {
   return !!context && connectionCurrent(context.owner) && context.owner.ready && state.connected && state.auth.authenticated
-    && state.view === "chat" && document.visibilityState !== "hidden" && context.sessionVersion === sessionRequestVersion
+    && state.view === "chat" && document.visibilityState !== "hidden" && context.sessionVersion === sessionRequestVersion && context.store === state.status?.store_instance_id
     && !!state.mainSessionId && context.session === state.mainSessionId && state.activeSession?.id === state.mainSessionId;
 }
 
@@ -246,6 +363,7 @@ function connectionCurrent(owner) {
 }
 
 function invalidateConnection() {
+  stopComposerOperations();
   voiceInput.cancel();
   releaseSavedAudioDialog();
   state.voiceSetupController?.release();
@@ -444,7 +562,7 @@ function renderComposer() {
   const running = busy();
   $("#mode-select").value = state.mode;
   $("#mode-select").disabled = running;
-  $("#send-button").disabled = (!input.value.trim() && !state.attachments.length) || state.sending || state.uploading > 0 || !state.activeSession || !state.connected;
+  $("#send-button").disabled = (!input.value.trim() && !state.attachments.length) || state.sending || state.uploading > 0 || !state.activeSession || !state.connected || state.attachments.some((file) => file.draftStatus);
   $("#send-button").setAttribute("aria-label", running ? "发送补充消息" : "发送消息");
   $("#stop-button").hidden = !running;
   $("#stop-button").disabled = state.sending || !state.activeSession;
@@ -453,6 +571,7 @@ function renderComposer() {
   $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
   $("#composer-status").textContent = state.uploading ? `正在保存 ${state.uploading} 个附件…` : !state.connected ? state.loading ? "正在连接沐璃" : "等待服务连接" : !state.status?.configured ? "请先配置主模型" : running ? state.session.status === "approval" ? "等待批准 · 可以继续补充" : "正在处理 · 可以继续补充" : `${state.status.model} · ${MODES[state.mode]?.label ?? state.mode}`;
   renderVoiceInput();
+  renderComposerDraft();
   scheduleConversationTail();
 }
 
@@ -698,6 +817,7 @@ function refreshApprovals(owner = connection) {
 
 async function connect() {
   const owner = beginConnection();
+  const composerRevision = draftRevision;
   state.loading = true; $(".app-shell").inert = true; renderChrome();
   try {
     const auth = await ownedRequest("/auth/status", {}, owner);
@@ -734,6 +854,8 @@ async function connect() {
     } catch { state.connected = false; }
   } else { state.connected = false; }
   if (results[4].status === "fulfilled") state.uploads = collection(results[4].value);
+  if (state.connected && results[0].status === "fulfilled" && results[1].status === "fulfilled") await restoreComposerDraft(owner, composerRevision);
+  if (!connectionCurrent(owner)) return;
   state.loading = false;
   renderChrome(); renderSessions(); renderChat();
   if (state.connected) { startGlobalEvents(owner); revalidateVisibleState(owner); }
@@ -1064,17 +1186,23 @@ function acceptChatSubmission(result) {
 async function sendMessage(event) {
   event.preventDefault();
   const input = $("#message-input");
-  const content = input.value.trim();
+  const originalText = input.value, content = originalText.trim();
   if ((!content && !state.attachments.length) || state.sending || state.uploading || !state.connected || !state.activeSession) return;
+  if (state.attachments.some((file) => file.draftStatus)) { composerDraftNote = "请先核查或移除未确认的附件。"; renderComposerDraft(); return; }
   if (!state.status?.configured) { state.settingsTab = "models"; await switchView("settings"); toast("先配置一个主模型，即可开始对话。"); return; }
+  if (composerDraftBinding && !composerDraft.consume()) { composerDraftNote = "浏览器草稿未能清除，尚未发送；请先处理存储问题再重试。"; renderComposerDraft(); return; }
+  composerPendingEdit = null;
+  const owner = connection, store = state.status?.store_instance_id, targetSession = state.activeSession;
   const intentVersion = sessionRequestVersion;
   const mode = state.mode;
   const wasRunning = busy();
   const attachments = [...state.attachments];
-  let targetSession = state.activeSession;
+  const submission = composerSubmission = {};
   let pendingId = null;
-  const stillCurrent = () => intentVersion === sessionRequestVersion && (!targetSession || state.activeSession?.id === targetSession.id);
+  const stillCurrent = () => composerSubmission === submission && composerContextCurrent(owner, store, targetSession.id, intentVersion);
   input.value = ""; draftRevision += 1; state.attachments = []; renderComposerAttachments(); resizeComposer();
+  const emptyRevision = draftRevision;
+  composerDraftNote = "";
   state.sending = true; renderComposer();
   try {
     if (stillCurrent()) {
@@ -1083,22 +1211,30 @@ async function sendMessage(event) {
       renderChat(); scrollToBottom(true);
     }
     try {
-      const result = await request(`/sessions/${encodeURIComponent(targetSession.id)}/messages`, { method: "POST", body: { content, mode, attachment_ids: attachments.map((file) => file.id) } });
+      const result = await ownedRequest(`/sessions/${encodeURIComponent(targetSession.id)}/messages`, { method: "POST", body: { content, mode, attachment_ids: attachments.map((file) => file.id) } }, owner, stillCurrent);
       if (stillCurrent()) {
         acceptChatSubmission(result);
         state.sending = false;
         if (result.queued && wasRunning) toast("补充消息已排队");
       }
-      void refreshSessions();
+      if (stillCurrent()) void refreshSessions(owner);
     } catch (error) {
       if (stillCurrent()) state.session.messages = state.session.messages.filter((message) => message.id !== pendingId);
       throw error;
     }
   } catch (error) {
-    showError(error);
-    if (stillCurrent()) { state.sending = false; if (!input.value) input.value = content; state.attachments = [...attachments, ...state.attachments.filter((file) => !attachments.some((existing) => existing.id === file.id))]; renderComposerAttachments(); resizeComposer(); }
+    if (stillCurrent()) {
+      if (error.name !== "AbortError") showError(error);
+      state.sending = false;
+      if (draftRevision === emptyRevision && !input.value && !state.attachments.length) {
+        input.value = originalText; state.attachments = attachments; draftRevision += 1;
+        composerDraftNote = "发送结果未确认，请先核查记录；重新编辑后才保存为新草稿。";
+        // A lost receipt is not a fresh unsent draft. Only another edit saves it.
+        renderComposerAttachments(); resizeComposer();
+      }
+    }
   }
-  renderChrome(); renderChat();
+  if (stillCurrent()) { composerSubmission = null; renderChrome(); renderChat(); renderComposer(); }
 }
 
 async function approve(id, decision, button) {
@@ -1493,23 +1629,35 @@ async function generateAnswerSpeech(slot) {
 function renderComposerAttachments() {
   const root = $("#composer-attachments");
   root.hidden = !state.attachments.length;
-  root.replaceChildren(...state.attachments.map((file) => renderAttachment(file, { compact: true, removable: true })));
+  const labels = { checking: "待核查", unavailable: "附件不可用", failed: "核查失败" };
+  root.replaceChildren(...state.attachments.map((file) => file.draftStatus
+    ? element("div", { class: "attachment draft-attachment", title: file.id }, element("span", { class: "attachment-name", text: file.name }), element("small", { text: labels[file.draftStatus] }), iconButton("移除附件引用", "remove-attachment", "close", { id: file.id }))
+    : renderAttachment(file, { compact: true, removable: true })));
   renderComposer();
 }
 
 async function addFiles(files) {
   const pending = [...files];
+  if (!pending.length) return;
+  const owner = connection, store = state.status?.store_instance_id, main = state.mainSessionId, version = sessionRequestVersion;
+  const controller = new AbortController(); composerUploads.add(controller);
+  const current = () => composerUploads.has(controller) && !controller.signal.aborted && composerContextCurrent(owner, store, main, version);
+  if (!current()) { composerUploads.delete(controller); return; }
+  draftRevision += 1;
   state.uploading += pending.length; renderComposer();
   for (const file of pending) {
+    if (!current()) break;
     try {
-      const uploaded = await uploadFile(file);
+      const uploaded = await uploadFile(file, { signal: controller.signal });
+      if (!current()) break;
       state.uploads = [uploaded, ...state.uploads.filter((entry) => entry.id !== uploaded.id)];
-      if (!state.attachments.some((entry) => entry.id === uploaded.id)) state.attachments.push(uploaded);
+      if (!state.attachments.some((entry) => entry.id === uploaded.id)) { state.attachments.push(uploaded); composerChanged(); }
       renderComposerAttachments();
-    } catch (error) { if (error.status === 401) showLogin(); toast(`${file.name}：${error.message}`, true); }
-    finally { state.uploading -= 1; renderComposer(); }
+    } catch (error) { if (current()) { if (error.status === 401) showLogin(); toast(`${file.name}：${error.message}`, true); } }
+    finally { if (current()) { state.uploading -= 1; renderComposer(); } }
   }
-  if (state.view === "uploads") renderOtherView();
+  if (current() && state.view === "uploads") renderOtherView();
+  composerUploads.delete(controller);
 }
 
 async function refreshUploads(owner = connection) {
@@ -2061,7 +2209,7 @@ async function prepareTaskQuestion(slot, detail, trigger) {
   if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
   const current = captureDraft();
   if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入任务。"); return; }
-  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  if (merged !== draft.text) { input.value = merged; composerChanged(); }
   resizeComposer(); input.focus();
 }
 
@@ -3411,7 +3559,7 @@ async function prepareSourceQuestion(slot, page, trigger) {
   if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
   const current = captureDraft();
   if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
-  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  if (merged !== draft.text) { input.value = merged; composerChanged(); }
   resizeComposer(); input.focus();
 }
 
@@ -3673,7 +3821,7 @@ async function prepareWorkflowSourceDraft(identifier, trigger) {
     if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
     const next = captureDraft();
     if (next.session !== draft.session || next.revision !== draft.revision || next.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
-    if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+    if (merged !== draft.text) { input.value = merged; composerChanged(); }
     resizeComposer(); input.focus();
   } catch (error) {
     if (current() && error.name !== "AbortError") showError(error);
@@ -4020,7 +4168,7 @@ async function prepareNotificationQuestion(slot, record, trigger) {
   if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
   const current = captureDraft();
   if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入通知。"); return; }
-  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  if (merged !== draft.text) { input.value = merged; composerChanged(); }
   resizeComposer(); input.focus();
 }
 
@@ -4143,7 +4291,7 @@ function renderConfigurationOverview() {
     const content = input.value.trim();
     if (!content) return;
     await switchView("chat");
-    $("#message-input").value = `请调整沐璃的配置：\n${content}`; resizeComposer();
+    $("#message-input").value = `请调整沐璃的配置：\n${content}`; composerChanged(); resizeComposer();
     if (state.status?.configured) $("#composer").requestSubmit();
   } }, element("label", { class: "field" }, element("span", { text: "想调整什么？" }), element("textarea", { rows: 4, placeholder: "例如：每天晚上九点提醒我整理笔记", required: true, "aria-label": "配置要求" })), element("button", { type: "submit", class: "primary-button", text: "交给沐璃" }));
   const examples = element("div", { class: "configuration-examples" });
@@ -5074,9 +5222,9 @@ async function handleAction(action, button) {
     state.voiceSetupController?.release();
     await switchView("chat");
     const input = $("#message-input");
-    if (!input.value.trim()) input.value = "请帮我配置本地语音：先检查状态并准备已有本地模型的配置，保持后台唤醒关闭，再指导我明确登记声纹和做一次有限验证。不要自动安装依赖或下载模型。";
+    if (!input.value.trim()) { input.value = "请帮我配置本地语音：先检查状态并准备已有本地模型的配置，保持后台唤醒关闭，再指导我明确登记声纹和做一次有限验证。不要自动安装依赖或下载模型。"; composerChanged(); }
     else toast("已保留草稿，可以直接请沐璃协助配置语音。");
-    draftRevision += 1; resizeComposer(); $("#message-input").focus();
+    resizeComposer(); $("#message-input").focus();
   }
   if (["voice-setup-enroll", "voice-setup-verify"].includes(action)) {
     const operation = action === "voice-setup-enroll" ? "enroll" : "verify";
@@ -5095,9 +5243,11 @@ async function handleAction(action, button) {
   if (action === "voice-setup-cancel") await voiceSetup.stop();
   if (action === "toggle-theme") { toggleTheme(); renderThemeControl(); }
   if (action === "logout") {
+    discardComposerDraft();
     voiceInput.cancel(); state.voiceDraft = null; $("#voice-draft-text").value = "";
-    $("#message-input").value = ""; draftRevision += 1; resizeComposer();
-    await request("/auth/logout", { method: "POST" }); state.settings = null; state.settingsDraft = null; state.status = null; state.session = createSessionState(); resetMessageNodes(); showLogin();
+    state.settings = null; state.settingsDraft = null; state.session = createSessionState(); resetMessageNodes(); showLogin();
+    composerDraftBinding = null;
+    try { await apiRequest("/auth/logout", { method: "POST" }); } catch (error) { if (!connection && !state.auth.authenticated) showError(error); }
   }
   if (action === "open-settings") { state.settingsTab = "overview"; await switchView("settings"); }
   if (action === "attach-files") $("#file-input").click();
@@ -5119,17 +5269,22 @@ async function handleAction(action, button) {
     const text = $("#voice-draft-text").value;
     const merged = input.value ? `${input.value}\n${text}` : text;
     if (merged.length > (state.status?.web_voice?.max_text_chars ?? 64000)) throw new Error("合并后的草稿超过上限，请先缩短内容。");
-    input.value = merged; draftRevision += 1; state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); resizeComposer(); input.focus();
+    input.value = merged; composerChanged(); state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); resizeComposer(); input.focus();
   }
-  if (action === "remove-attachment") { state.attachments = state.attachments.filter((file) => file.id !== button.dataset.id); renderComposerAttachments(); }
+  if (action === "remove-attachment") { const selected = state.attachments.filter((file) => file.id !== button.dataset.id); if (selected.length !== state.attachments.length) { state.attachments = selected; composerChanged(); } renderComposerAttachments(); }
   if (action === "use-attachment") {
     const file = state.uploads.find((entry) => entry.id === button.dataset.id);
-    if (file && !state.attachments.some((entry) => entry.id === file.id)) state.attachments.push(file);
+    if (file && !state.attachments.some((entry) => entry.id === file.id)) {
+      if (state.attachments.length >= MAX_DRAFT_ATTACHMENTS) throw new Error(`最多选择 ${MAX_DRAFT_ATTACHMENTS} 个附件。`);
+      state.attachments.push(file); composerChanged();
+    }
     renderComposerAttachments(); await switchView("chat");
   }
   if (action === "transcribe-saved-audio") openSavedAudio(button);
+  if (action === "retry-composer-attachments") await checkComposerAttachments();
+  if (action === "discard-composer-draft") discardComposerDraft();
   if (action === "collect-attachment") await openAttachmentCollection(state.uploads.find((entry) => entry.id === button.dataset.id), button);
-  if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
+  if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; composerChanged(); resizeComposer(); }
   if (action === "refresh-team") await refreshTeam();
   if (action === "view-task-brief") await showTaskBrief(button.dataset.commitment);
   if (action === "filter-team") await refreshTeam({ offset: 0, activeOnly: button.dataset.active === "true" });
@@ -5298,7 +5453,7 @@ $("#login-form").addEventListener("submit", async (event) => {
   catch (error) { $("#login-error").textContent = error.message; $("#login-error").hidden = false; }
   finally { button.disabled = false; }
 });
-$("#message-input").addEventListener("input", () => { draftRevision += 1; resizeComposer(); });
+$("#message-input").addEventListener("input", () => { composerChanged(); resizeComposer(); });
 $("#message-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
 });

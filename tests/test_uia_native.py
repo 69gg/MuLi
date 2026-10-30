@@ -21,6 +21,7 @@ from helpers.uia_probe_diagnostics import (
     PENDING_SCRIPT,
     PendingHelperLease,
     ProbeHelperLease,
+    _add_probe_note,
     observe_pending,
     observe_probe,
     pending_received,
@@ -206,10 +207,21 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
         return await original_spawn(*argv, **kwargs)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    # Observe only this original factory call; later UIA leases stay unchanged.
+    # Each observation keeps the original factory arguments and cleanup owner.
     with monkeypatch.context() as construction:
         construction.setattr(module, "AXHelperLease", ProbeHelperLease)
         probe = computer._uia._new_lease(once=True)
+    targets_leases: list[ProbeHelperLease] = []
+    targets_failure: BaseException | None = None
+    main_failure: BaseException | None = None
+
+    def observe_targets(
+        argv: list[str], *, timeout: float, ttl: float, max_nodes: int, once: bool = False
+    ) -> ProbeHelperLease:
+        lease = ProbeHelperLease(argv, timeout=timeout, ttl=ttl, max_nodes=max_nodes, once=once)
+        targets_leases.append(lease)
+        return lease
+
     try:
         result = await observe_probe(probe)
         assert result["apartment"] == "MTA" and result["has_window"] is False
@@ -225,8 +237,18 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
         assert probe.closed and probe._process is not None
         assert probe._process.returncode is not None
 
-        identifier = await discover(computer, native_form)
+        with monkeypatch.context() as construction:
+            construction.setattr(module, "AXHelperLease", observe_targets)
+            try:
+                identifier = await discover(computer, native_form)
+            except BaseException as error:
+                targets_failure = error
+                raise
+        assert len(targets_leases) == 1
+        observed = targets_leases[0]
+        assert observed._once is False and computer._uia._lease is observed
         snapshot = await computer.snapshot({"target_id": identifier})
+        assert computer._uia._lease is observed
         encoded = json.dumps(snapshot, ensure_ascii=False)
         assert len(encoded) <= computer.settings.limits.max_output_chars
         assert '中文🌊 "quote" \\ slash' in [item["name"] for item in snapshot["nodes"]]
@@ -254,8 +276,24 @@ async def test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
             assert "-NoProfile" in argv and "-Mta" in argv and "-NonInteractive" in argv
             assert kwargs["creationflags"] & int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             assert not any("ExecutionPolicy" in arg or arg == "-Command" for arg in argv)
+    except BaseException as error:
+        main_failure = error
+        raise
     finally:
-        await computer.aclose()
+        cleanup_failed = False
+        try:
+            await computer.aclose()
+        except BaseException:
+            cleanup_failed = True
+            if main_failure is None:
+                raise
+        if targets_failure is not None and len(targets_leases) == 1:
+            _add_probe_note(
+                targets_failure,
+                targets_leases[0],
+                cleanup_failed=cleanup_failed,
+                command="targets",
+            )
 
 
 async def test_real_windows_tree_loads_once_and_preserves_owned_button_actions(

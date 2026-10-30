@@ -735,8 +735,27 @@ def _create_app(
         ]
 
     @app.get("/api/uploads")
-    async def list_uploads() -> dict[str, Any]:
-        return {"items": attachments.list(), "used_bytes": attachments.used_bytes()}
+    async def list_uploads(
+        ids: Annotated[list[str] | None, Query(max_length=MAX_ATTACHMENT_IDS)] = None,
+    ) -> dict[str, Any]:
+        """列出最近附件，或按有序 ID 核对元数据与可用性；不读取文件正文。"""
+        if ids is None:
+            return {"items": attachments.list(), "used_bytes": attachments.used_bytes()}
+        try:
+            identifiers = validate_attachment_ids(ids)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        items: list[dict[str, Any]] = []
+        unavailable_ids: list[str] = []
+        for identifier in identifiers:
+            try:
+                item = attachments.get(identifier)
+                attachments.path(identifier)
+            except (KeyError, FileNotFoundError):
+                unavailable_ids.append(identifier)
+            else:
+                items.append(attachments.public(item))
+        return {"items": items, "unavailable_ids": unavailable_ids}
 
     @app.get("/api/media")
     async def media_status() -> dict[str, Any]:
@@ -1021,6 +1040,7 @@ def _create_app(
         settings = config.settings
         return {
             "version": __version__,
+            "store_instance_id": runtime.store.instance_id,
             "configured": settings.models.main.configured,
             "model": settings.models.main.model,
             "provider": settings.models.main.protocol,

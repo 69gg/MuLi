@@ -52,6 +52,7 @@ export function createPreviewState() {
     };
   });
   return {
+    store_instance_id: (++sequence).toString(16).padStart(32, "0"),
     settings: {
       models: { main: model("MuLi · 交互演示"), worker: model(), reviewer: model(), vision: model(), compactor: model(), memory_extractor: model() },
       persona: { name: "沐璃", user_name: "你", introduction: "陪你把想法慢慢变成可完成的事。", prompt: "用自然、清楚的中文交流，尊重主人的选择。", append: "需要操作前，先说明计划与影响。" },
@@ -440,7 +441,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     if (path === "/auth/status") return response({ required: false, authenticated: true });
     if (["/auth/login", "/auth/logout"].includes(path) && method === "POST") return response({ authenticated: true, preview: true });
     if (path === "/ui/event-position") return response({ after: String(state.eventId) });
-    if (path === "/status" && method === "GET") return response({ ...status(), web_voice: webVoiceStatus() });
+    if (path === "/status" && method === "GET") return response({ ...status(), store_instance_id: state.store_instance_id, web_voice: webVoiceStatus() });
     if (path === "/capabilities" && method === "GET") return capabilityResponse(capabilityDirectory());
     const capabilityMatch = /^\/capabilities\/tools\/([^/]+)$/u.exec(path);
     if (capabilityMatch && method === "GET") {
@@ -808,7 +809,13 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       emit("workflow_schedule.updated", { ...item, kind }); return response({ ...item, kind });
     }
     if (parts[0] === "uploads") {
-      if (parts.length === 1 && method === "GET") return response({ items: state.uploads });
+      if (parts.length === 1 && method === "GET") {
+        if (!url.searchParams.has("ids")) return response({ items: state.uploads });
+        const ids = url.searchParams.getAll("ids");
+        if (ids.length > 32 || ids.some((value) => !/^[a-f0-9]{32}$/u.test(value)) || new Set(ids).size !== ids.length) return failure("附件引用必须是有界、准确且不重复的 ID。", 422);
+        const items = ids.flatMap((id) => state.files.has(id) ? state.uploads.filter((file) => file.id === id) : []);
+        return response({ items, unavailable_ids: ids.filter((id) => !items.some((file) => file.id === id)) });
+      }
       if (parts.length === 3 && ((parts[2] === "memory-preview" && method === "GET") || (parts[2] === "memory-collection" && method === "POST"))) {
         if (state.settings.disabled_tools.includes("memory_import_attachment")) return failure("附件收藏工具未启用。");
         if (method === "POST" && (Object.keys(body).sort().join(",") !== "document_revision,registered_revision,source_revision" || ![body.source_revision, body.registered_revision].every((value) => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value)) || body.document_revision !== null)) return failure("请提交这次准备的准确资料版本。", 422);

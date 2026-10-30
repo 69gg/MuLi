@@ -1,4 +1,5 @@
 import test from "node:test";
+import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../web/composer-draft.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -46,6 +47,7 @@ function harness(t, handler = async (path) => payload(path)) {
     return nodes.get(selector);
   }
   const context = {
+    composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
     document, window: { addEventListener(name, callback) { windowEvents[name] = callback; } },
     AbortController, URLSearchParams, console,
     createSessionState, hydrateSession, applyEvent, isRunning, createTeamPager, VoiceSetup, voiceSetupLabel,

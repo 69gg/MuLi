@@ -1,4 +1,5 @@
 import test from "node:test";
+import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../web/composer-draft.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -111,6 +112,7 @@ function harness(t, handler = async (path) => payload(path)) {
   for (const id of ["auth-gate", "login-password", "composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll", "approval-region", "other-view"]) node("div", id);
   let timerSequence = 0;
   const context = {
+    composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
     document, Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
     window: { addEventListener(name, callback) { windowEvents[name] = callback; } },
     AbortController, URLSearchParams, TextEncoder, console, queueMicrotask, toasts, errors,

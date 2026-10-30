@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
-from pathlib import Path
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from helpers import uia_probe_diagnostics as diagnostic
-from test_uia_pending_observation import _Harness
+from test_uia_computer import frame, record
+from test_uia_pending_observation import _Harness, _Input
+from test_uia_pending_observation import _Process as PipeProcess
 
 from muli.tools import ax_lease, uia_computer
+from muli.tools import computer as computer_module
 from muli.tools.ax_lease import MAX_STDERR_BYTES, AXHelperLease, AXLeaseError
+from muli.tools.computer import Computer, ComputerError
 
 STAGES = (
     "script_entered",
@@ -1185,3 +1191,484 @@ async def test_native_first_probe_keeps_original_factory_argv_and_one_owned_life
     finally:
         operation.cancel()
         await asyncio.gather(operation, return_exceptions=True)
+
+
+@dataclass
+class _NativeTargetsCase:
+    writers: list[_Input]
+    processes: list[PipeProcess]
+    target: SimpleNamespace
+    executable: Path
+    original_factory: Any
+    spawn_entered: asyncio.Event = field(default_factory=asyncio.Event)
+    spawn_release: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_entered: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_release: asyncio.Event = field(default_factory=asyncio.Event)
+    spawns: list[tuple[tuple[str, ...], dict[str, Any]]] = field(default_factory=list)
+    settled: list[PipeProcess] = field(default_factory=list)
+    computers: list[Computer] = field(default_factory=list)
+    leases: list[diagnostic.ProbeHelperLease] = field(default_factory=list)
+    target_errors: list[BaseException] = field(default_factory=list)
+    snapshot_errors: list[BaseException] = field(default_factory=list)
+    timers: list[asyncio.Timeout] = field(default_factory=list)
+    cleanup_failure: BaseException | None = None
+    final_failure: BaseException | None = None
+    close_main_error: BaseException | None = None
+    close_calls: int = 0
+    release_returned: bool = False
+    operation: asyncio.Task[None] = field(init=False)
+
+    @property
+    def ordinary(self) -> diagnostic.ProbeHelperLease:
+        return self.leases[1]
+
+    def reply(self, index: int, *, result: dict[str, Any]) -> None:
+        request = json.loads(self.writers[index].frames[-1])
+        self.processes[index].stdout.feed_data(
+            json.dumps({"v": 1, "request_id": request["request_id"], "result": result}).encode()
+            + b"\n"
+        )
+
+    async def next_frame(self, count: int) -> dict[str, Any]:
+        async with asyncio.timeout(2):
+            while len(self.writers[1].frames) < count:
+                await asyncio.sleep(0)
+        return cast(dict[str, Any], json.loads(self.writers[1].frames[count - 1]))
+
+    def assert_owned_cleanup(self, *, ordinary_writes: int = 1) -> None:
+        assert (self.settled == self.processes) is True
+        assert self.target.returncode is None and len(self.spawns) == len(self.leases) == 2
+        assert all(lease.closed for lease in self.leases)
+        for index, (lease, process, writer) in enumerate(
+            zip(self.leases, self.processes, self.writers, strict=True)
+        ):
+            assert lease._process is cast(object, process) and process.returncode == 7
+            assert all(reader.done() for reader in lease._readers)
+            expected = 1 if index == 0 else ordinary_writes
+            assert len(writer.frames) == writer.drains == lease._count == expected
+            assert writer.closes == writer.waits == 1
+        assert vars(uia_computer)["AXHelperLease"] is self.original_factory
+
+
+@asynccontextmanager
+async def _native_first_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, hold_spawn: bool = False
+) -> AsyncIterator[_NativeTargetsCase]:
+    import test_uia_native as native
+
+    writers = [_Input(), _Input()]
+    processes = [PipeProcess(writer) for writer in writers]
+    for index, process in enumerate(processes, start=1):
+        monkeypatch.setattr(process, "pid", index, raising=False)
+    target = SimpleNamespace(pid=3, returncode=None)
+    form = native.NativeForm(cast(asyncio.subprocess.Process, target), "owned", asyncio.Queue())
+    flags = SimpleNamespace(CREATE_NO_WINDOW=1)
+    monkeypatch.setattr(computer_module, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(uia_computer, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(ax_lease, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(ax_lease, "subprocess", flags)
+    monkeypatch.setattr(native, "subprocess", flags)
+    executable = tmp_path / "owned-host.exe"
+    monkeypatch.setattr(uia_computer, "_powershell", lambda: executable)
+    case = _NativeTargetsCase(
+        writers, processes, target, executable, vars(uia_computer)["AXHelperLease"]
+    )
+    if not hold_spawn:
+        case.spawn_release.set()
+
+    async def spawn(*argv: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        index = len(case.spawns)
+        assert index < len(processes), "No additional helper may be started"
+        case.spawns.append((argv, kwargs))
+        if index == 1:
+            case.spawn_entered.set()
+            await case.spawn_release.wait()
+        return cast(asyncio.subprocess.Process, processes[index])
+
+    async def settle(
+        process: asyncio.subprocess.Process, readers: list[asyncio.Task[None]], **kwargs: Any
+    ) -> None:
+        assert any(process is item for item in processes)
+        owned = cast(PipeProcess, process)
+        assert not any(owned is item for item in case.settled)
+        case.settled.append(owned)
+        if owned is processes[1]:
+            case.cleanup_entered.set()
+            await case.cleanup_release.wait()
+            if case.cleanup_failure is not None:
+                raise case.cleanup_failure
+        assert process.stdin is not None
+        process.stdin.close()
+        await process.stdin.wait_closed()
+        owned.returncode = 7
+        owned.stdout.feed_eof()
+        owned.stderr.feed_eof()
+        await asyncio.gather(*readers)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(ax_lease, "_settle_process", settle)
+    original_computer = native.Computer
+
+    def computer(*args: Any, **kwargs: Any) -> Computer:
+        instance = original_computer(*args, **kwargs)
+        original_targets = instance.targets
+        original_snapshot = instance.snapshot
+        original_release = instance.release
+        original_close = instance.aclose
+
+        async def targets(arguments: dict[str, Any]) -> dict[str, Any]:
+            try:
+                return await original_targets(arguments)
+            except BaseException as error:
+                case.target_errors.append(error)
+                raise
+
+        async def snapshot(arguments: dict[str, Any]) -> dict[str, Any]:
+            try:
+                return await original_snapshot(arguments)
+            except BaseException as error:
+                case.snapshot_errors.append(error)
+                raise
+
+        async def release(arguments: dict[str, Any]) -> dict[str, Any]:
+            result = await original_release(arguments)
+            case.release_returned = True
+            return result
+
+        async def close() -> None:
+            case.close_calls += 1
+            case.close_main_error = sys.exception()
+            await original_close()
+            if case.final_failure is not None:
+                raise case.final_failure
+
+        monkeypatch.setattr(instance, "targets", targets)
+        monkeypatch.setattr(instance, "snapshot", snapshot)
+        monkeypatch.setattr(instance, "release", release)
+        monkeypatch.setattr(instance, "aclose", close)
+        case.computers.append(instance)
+        return instance
+
+    monkeypatch.setattr(native, "Computer", computer)
+
+    def observe_lease(
+        argv: list[str], *, timeout: float, ttl: float, max_nodes: int, once: bool = True
+    ) -> diagnostic.ProbeHelperLease:
+        configuration = native.settings().computer
+        assert timeout == configuration.operation_timeout_seconds
+        assert ttl == configuration.snapshot_ttl_seconds and max_nodes == configuration.max_nodes
+        assert once is (len(case.leases) == 0)
+        before = asyncio.get_running_loop().time()
+        lease = diagnostic.ProbeHelperLease(
+            argv, timeout=timeout, ttl=ttl, max_nodes=max_nodes, once=once
+        )
+        assert before + ttl <= lease.expires_at <= asyncio.get_running_loop().time() + ttl
+        case.leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(native, "ProbeHelperLease", observe_lease)
+    original_timeout = asyncio.timeout_at
+    operation: asyncio.Task[None] | None = None
+
+    def timeout_at(when: float) -> asyncio.Timeout:
+        timer = original_timeout(when)
+        if (
+            asyncio.current_task() is operation
+            and processes[0].returncode is not None
+            and len(case.timers) < 2
+        ):
+            case.timers.append(timer)
+        return timer
+
+    monkeypatch.setattr(asyncio, "timeout_at", timeout_at)
+    operation = asyncio.create_task(
+        native.test_real_windows_system_module_probe_mta_and_owned_unicode_tree(
+            form, tmp_path, monkeypatch
+        )
+    )
+    case.operation = operation
+    try:
+        async with asyncio.timeout(2):
+            await writers[0].drain_entered.wait()
+            probe_frame = json.loads(writers[0].frames[0])
+            assert probe_frame["command"] == "probe" and probe_frame["payload"] == {}
+            home = PureWindowsPath("C:/owned-fixture/WindowsPowerShell/v1.0")
+            result = {
+                "backend": "uia",
+                "apartment": "MTA",
+                "dependency_available": True,
+                "session_accessible": None,
+                "discovery_scope": "desktop_windows",
+                "helper_pid": processes[0].pid,
+                "no_profile": True,
+                "non_interactive": True,
+                "has_window": False,
+                "module_autoloading": "None",
+                "powershell_home": str(home),
+                "utility_path": str(
+                    home / "Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1"
+                ),
+            }
+            case.reply(0, result=result)
+            await case.spawn_entered.wait()
+            assert len(case.computers) == 1 and len(case.leases) == 2
+            probe = case.leases[0]
+            assert probe._once is True and probe.closed and probe._count == 1
+            assert probe._process is cast(object, processes[0])
+            assert processes[0].returncode is not None and writers[0].closes == 1
+            assert all(reader.done() for reader in probe._readers)
+            assert case.computers[0]._uia._lease is case.ordinary
+            assert case.ordinary._once is False
+            if not hold_spawn:
+                await writers[1].drain_entered.wait()
+                assert case.ordinary._process is cast(object, processes[1])
+        yield case
+    finally:
+        case.spawn_release.set()
+        case.cleanup_release.set()
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        for lease in case.leases:
+            for reader in lease._readers:
+                reader.cancel()
+            await asyncio.gather(*lease._readers, return_exceptions=True)
+
+
+async def _expire_first_targets(case: _NativeTargetsCase) -> ComputerError:
+    async with asyncio.timeout(2):
+        frame = await case.next_frame(1)
+        assert frame["command"] == "targets" and frame["payload"] == {}
+        assert len(case.timers) == 2 and case.timers[0].when() == case.timers[1].when()
+        inner_deadline = case.timers[1].when()
+        case.timers[0].reschedule(asyncio.get_running_loop().time())
+        await case.cleanup_entered.wait()
+        assert not case.operation.done() and not case.target_errors
+        assert case.processes[1].returncode is None and len(case.ordinary._readers) == 2
+        case.cleanup_release.set()
+        with pytest.raises(ComputerError) as caught:
+            await case.operation
+    failure = caught.value
+    assert len(case.target_errors) == 1 and failure is case.target_errors[0]
+    assert (failure.code, failure.outcome) == ("read_timeout", "not_started")
+    assert isinstance(failure.__cause__, TimeoutError)
+    assert case.timers[0].expired() and not case.timers[1].expired()
+    assert case.timers[1].when() == inner_deadline
+    assert case.close_calls == 1 and case.close_main_error is failure
+    return failure
+
+
+async def test_native_first_targets_outer_timeout_keeps_exact_lease_and_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test_uia_native as native
+
+    async with _native_first_targets(tmp_path, monkeypatch) as case:
+        ordinary = case.ordinary
+        started = ordinary._observed_started
+        assert started is not None
+        monkeypatch.setattr(ordinary, "_observation_time", lambda: started + float(2**31))
+        stages = (
+            *diagnostic.STAGES[:6],
+            "uia_initializing",
+            *UIA_INITIALIZATION_STAGES,
+            "uia_ready",
+        )
+        stderr = stage_bytes(*stages) + b"private target diagnostic body\n"
+        case.processes[1].stderr.feed_data(stderr)
+        async with asyncio.timeout(2):
+            while bytes(ordinary._stderr) != stderr:
+                await asyncio.sleep(0)
+        failure = await _expire_first_targets(case)
+        case.assert_owned_cleanup()
+        expected_argv = [
+            str(case.executable),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Mta",
+            "-File",
+            str(Path(uia_computer.__file__).with_name("uia_helper.ps1")),
+        ]
+        configuration = native.settings().computer
+        for argv, kwargs in case.spawns:
+            assert list(argv) == expected_argv
+            assert kwargs["creationflags"] == 1 and kwargs["start_new_session"] is False
+            assert kwargs["env"]["PSModulePath"] == str(tmp_path / "untrusted-modules")
+        assert ordinary._argv == tuple(expected_argv)
+        assert ordinary._timeout == configuration.operation_timeout_seconds
+        assert ordinary._max_nodes == configuration.max_nodes
+        assert ordinary.expires_at > asyncio.get_running_loop().time()
+        assert any(value.startswith(NOTE_PREFIX) for value in getattr(failure, "__notes__", ())), (
+            "ordinary first-targets failure must carry its own diagnostic note after cleanup"
+        )
+        facts = note(failure)
+        assert facts["command"] == "targets" and facts["cleanup"] == "confirmed"
+        assert facts["sent"] == 1 and facts["stages"] == list(stages)
+        assert facts["stage_sequence"] == "valid" and "private" not in json.dumps(facts)
+        assert facts["before_cleanup"]["exit"] == "running"
+        assert facts["after_cleanup"]["exit"] == "nonzero"
+        for phase in ("before_cleanup", "after_cleanup"):
+            snapshot = facts[phase]
+            assert snapshot["elapsed_ms"] == 2**31 - 1
+            assert list(snapshot["stage_arrival_ms"]) == list(stages)
+            assert set(snapshot["stage_arrival_ms"].values()) == {2**31 - 1}
+            assert all(0 <= value <= 2**31 - 1 for value in snapshot["phase_ms"].values())
+
+
+async def test_native_first_targets_cancel_adopts_late_owned_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _native_first_targets(tmp_path, monkeypatch, hold_spawn=True) as case:
+        ordinary = case.ordinary
+        async with asyncio.timeout(2):
+            case.operation.cancel("private cancellation")
+            while ordinary.before_cleanup is None:
+                await asyncio.sleep(0)
+            before = ordinary.before_cleanup
+            assert before["spawn"] == "pending" and before["phase"] == "spawn"
+            assert before["process_exists"] is False and before["sent"] == 0
+            assert not case.operation.done() and not case.target_errors
+            case.spawn_release.set()
+            await case.cleanup_entered.wait()
+            assert ordinary._process is cast(object, case.processes[1])
+            assert not case.operation.done() and not case.target_errors
+            case.cleanup_release.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await case.operation
+        assert len(case.target_errors) == 1 and caught.value is case.target_errors[0]
+        assert caught.value.args == ("private cancellation",)
+        case.assert_owned_cleanup(ordinary_writes=0)
+        facts = note(caught.value)
+        assert facts["command"] == "targets" and facts["cleanup"] == "confirmed"
+        assert facts["sent"] == 0 and facts["before_cleanup"] == before
+        assert facts["after_cleanup"]["spawn"] == "returned"
+        assert facts["after_cleanup"]["phase"] == "settled"
+        assert not ordinary._readers and "private" not in json.dumps(facts)
+
+
+async def test_native_first_targets_projection_fault_preserves_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _native_first_targets(tmp_path, monkeypatch) as case:
+
+        def unavailable(*args: object, **kwargs: object) -> dict[str, Any]:
+            raise RuntimeError("private projection failure")
+
+        monkeypatch.setattr(diagnostic, "probe_facts", unavailable)
+        failure = await _expire_first_targets(case)
+        case.assert_owned_cleanup()
+        assert not getattr(failure, "__notes__", ())
+
+
+async def test_native_first_targets_cleanup_fault_preserves_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _native_first_targets(tmp_path, monkeypatch) as case:
+        case.cleanup_failure = RuntimeError("private cleanup failure")
+        failure = await _expire_first_targets(case)
+        assert (case.settled == case.processes) is True
+        assert not case.ordinary.closed and case.processes[1].returncode is None
+        assert any(not reader.done() for reader in case.ordinary._readers)
+        assert case.ordinary._count == 1 and len(case.spawns) == 2
+        assert case.writers[1].closes == case.writers[1].waits == 0
+        facts = note(failure)
+        assert facts["command"] == "targets" and facts["cleanup"] == "unconfirmed"
+        assert facts["after_cleanup"]["exit"] == "running"
+        assert facts["readers_settled"] is False and "private" not in json.dumps(facts)
+
+
+async def _complete_first_targets(case: _NativeTargetsCase) -> dict[str, Any]:
+    request = await case.next_frame(1)
+    assert request["command"] == "targets" and request["payload"] == {}
+    case.reply(1, result=frame(rows=[record(name="owned")]))
+    request = await case.next_frame(2)
+    assert request["command"] == "snapshot" and request["payload"] == {"target_ref_id": "window"}
+    assert vars(uia_computer)["AXHelperLease"] is case.original_factory
+    assert case.computers[0]._uia._lease is case.ordinary and case.ordinary._count == 2
+    assert not case.target_errors and len(case.spawns) == len(case.leases) == 2
+    return request
+
+
+async def test_native_first_targets_success_does_not_label_later_snapshot_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _native_first_targets(tmp_path, monkeypatch) as case:
+        request = await _complete_first_targets(case)
+        case.processes[1].stdout.feed_data(
+            json.dumps(
+                {
+                    "v": 1,
+                    "request_id": request["request_id"],
+                    "error": {
+                        "code": "element_unavailable",
+                        "message": "private snapshot failure",
+                        "outcome": "not_started",
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+        case.cleanup_release.set()
+        async with asyncio.timeout(2):
+            with pytest.raises(ComputerError) as caught:
+                await case.operation
+        assert len(case.snapshot_errors) == 1 and caught.value is case.snapshot_errors[0]
+        assert (caught.value.code, caught.value.outcome) == ("element_unavailable", "not_started")
+        assert isinstance(caught.value.__cause__, AXLeaseError)
+        assert not getattr(caught.value, "__notes__", ())
+        case.assert_owned_cleanup(ordinary_writes=2)
+
+
+async def test_native_first_targets_success_keeps_cleanup_failure_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test_uia_native as native
+
+    async with _native_first_targets(tmp_path, monkeypatch) as case:
+        await _complete_first_targets(case)
+        failure = RuntimeError("private final close failure")
+        case.final_failure = failure
+        case.reply(
+            1,
+            result=frame(
+                "snapshot",
+                [
+                    record(name="owned"),
+                    record(
+                        "unicode",
+                        parent_ref_id="window",
+                        depth=1,
+                        kind="node",
+                        name='中文🌊 "quote" \\ slash',
+                    ),
+                    record(
+                        "protected",
+                        parent_ref_id="window",
+                        depth=1,
+                        kind="node",
+                        name="",
+                        protected=True,
+                    ),
+                    record(
+                        "button",
+                        parent_ref_id="window",
+                        depth=1,
+                        kind="node",
+                        name=native.uia_native_window.BUTTON_NAME,
+                        role="ControlType.Button",
+                        actions=["invoke"],
+                        read_only=False,
+                    ),
+                ],
+            ),
+        )
+        async with asyncio.timeout(2):
+            await case.cleanup_entered.wait()
+            assert not case.release_returned and not case.operation.done()
+            case.cleanup_release.set()
+            with pytest.raises(RuntimeError) as caught:
+                await case.operation
+        assert caught.value is failure and not getattr(failure, "__notes__", ())
+        assert case.release_returned and case.close_calls == 1 and case.close_main_error is None
+        assert not case.target_errors and not case.snapshot_errors
+        case.assert_owned_cleanup(ordinary_writes=2)
