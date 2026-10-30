@@ -30,7 +30,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=5`、`outbox=3`、`memory=5`、`install_profile=1`。此前七域完整前序保留为显式停机升级源；项目资料复核曾将 ingress 从 `4` 扩为 `5`，原完整 `(1,3,2,4,3,4,1)` 保存为 `PRE_PROJECT_INBOX_FORMAT_STATE`。本次明确收藏主答复只将 memory 从 `4` 扩为 `5`，原完整 `(1,3,2,5,3,4,1)` 保存为 `PRE_REPLY_MEMORY_FORMAT_STATE`；不改变任务、未知回执、输入或主配置合同。ID 不是大小可比较的 schema 版本；不能仅靠表结构相同沿用一个已经改变的解释合同。
+当前完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，七域依次为 `(1,3,2,6,3,5,1)`。渠道原生引用将 ingress 从 `5` 改为 `6`，明确收藏主答复此前将 memory 从 `4` 改为 `5`。各精确完整前序保留在准入模块与[停机升级指南](channel-ownership-format-upgrade.md)，不会只比较单个数字或因表结构相同放行。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |

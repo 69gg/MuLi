@@ -42,7 +42,9 @@ async def test_current_control_receipt_reaches_core_without_raw_manager_read(
     assert message.control_text == message.text == "/任务"
     assert message.control_account_id == "123"
     key = hashlib.sha256(encoded(["onebot", "123", message.event_id]).encode()).hexdigest()
-    fingerprint = hashlib.sha256(encoded(asdict(message)).encode()).hexdigest()
+    envelope = asdict(message)
+    assert envelope.pop("channel_reference") is None
+    fingerprint = hashlib.sha256(encoded(envelope).encode()).hexdigest()
     budget = harness.attachments.config.settings.limits.max_output_chars
     raw = {
         "bad-json": b"{",

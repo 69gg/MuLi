@@ -36,7 +36,14 @@ STAGES = (
 PREFIX = b"muli-uia-stage=1:"
 NOTE_PREFIX = "uia_probe_diagnostic="
 UIA_INITIALIZATION_STAGES = ("uia_host_validated", "uia_add_type_returned")
-ALL_STAGES = (*STAGES[:8], *UIA_INITIALIZATION_STAGES, *STAGES[8:])
+WATCH_STAGES = ("watch_starting", "watch_ready")
+ALL_STAGES = (
+    *STAGES[:7],
+    *WATCH_STAGES,
+    STAGES[7],
+    *UIA_INITIALIZATION_STAGES,
+    *STAGES[8:],
+)
 
 
 def stage_bytes(*stages: str) -> bytes:
@@ -196,7 +203,7 @@ async def test_native_assembly_negative_control_retains_the_original_unexpected_
     assert probe.closed and probe.calls == 1
 
 
-def test_packaged_script_keeps_sixteen_stage_names_and_fourteen_live_points() -> None:
+def test_packaged_script_keeps_eighteen_stage_names_and_sixteen_live_points() -> None:
     from muli.tools import uia_computer
 
     source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
@@ -215,6 +222,24 @@ def test_packaged_script_keeps_sixteen_stage_names_and_fourteen_live_points() ->
     assert "if (-not $script:traceProbeSeen)" in source
     assert source.index("Write-Stage 6") < source.index("$writer.WriteLine($json)")
     assert source.index("Write-Stage 7") > source.index("$writer.WriteLine($json)")
+
+
+def test_probe_watch_stages_append_physical_indices_and_surround_the_original_clock() -> None:
+    source = Path(uia_computer.__file__).with_name("uia_helper.ps1").read_text(encoding="utf-8")
+    trace = source.split("$script:traceStages = @(\n", 1)[1].split("\n)", 1)[0]
+    physical = tuple(line.strip().removesuffix(",").strip("'") for line in trace.splitlines())
+    assert physical[14:16] == tuple(PREFIX.decode() + stage for stage in UIA_INITIALIZATION_STAGES)
+    assert physical[16:] == tuple(PREFIX.decode() + stage for stage in WATCH_STAGES)
+    points = (
+        "Write-Stage 3",
+        "if ($traceProbe) { Write-Stage 16 }",
+        "$script:watch = [Diagnostics.Stopwatch]::StartNew()",
+        "if ($traceProbe) { Write-Stage 17 }",
+        "Initialize-Uia\n            Check-Deadline",
+    )
+    positions = [source.index(point) for point in points]
+    assert positions == sorted(positions)
+    assert all(source.count(point) == 1 for point in points[1:])
 
 
 def test_first_input_stages_surround_the_original_read_and_decode_only() -> None:
@@ -444,6 +469,24 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
             ["probe_process_ready", "walker_ready"],
             "invalid",
         ),
+        (PREFIX + b"watch_starting\r", [], "unobserved"),
+        (
+            stage_bytes("probe_received", *WATCH_STAGES, "uia_initializing"),
+            ["probe_received", *WATCH_STAGES, "uia_initializing"],
+            "valid",
+        ),
+        (
+            stage_bytes("watch_ready", "uia_initializing"),
+            ["watch_ready", "uia_initializing"],
+            "valid",
+        ),
+        (stage_bytes("watch_starting", "watch_starting"), ["watch_starting"], "invalid"),
+        (stage_bytes(*reversed(WATCH_STAGES)), list(reversed(WATCH_STAGES)), "invalid"),
+        (
+            stage_bytes("uia_initializing", "watch_ready"),
+            ["uia_initializing", "watch_ready"],
+            "invalid",
+        ),
     ],
     ids=[
         "unknown",
@@ -455,6 +498,12 @@ def test_projection_is_bounded_and_never_exports_unknown_stderr() -> None:
         "input-out-of-order",
         "walker-duplicate",
         "native-getter-out-of-order",
+        "watch-partial",
+        "watch-complete",
+        "watch-start-unobserved",
+        "watch-duplicate",
+        "watch-out-of-order",
+        "watch-after-initialization",
     ],
 )
 def test_only_complete_known_lines_contribute_stage_evidence(
@@ -676,10 +725,22 @@ async def test_probe_records_first_complete_stage_arrival_on_original_stderr_rea
     [
         (b"private-host-value=hidden\r\n", []),
         (PREFIX + b"uia_host_validated\r", []),
+        (PREFIX + b"watch_ready\r", []),
+        (
+            stage_bytes("probe_received", *WATCH_STAGES, "uia_initializing"),
+            ["probe_received", *WATCH_STAGES, "uia_initializing"],
+        ),
         (stage_bytes(*ALL_STAGES), list(ALL_STAGES)),
         (b"x" * MAX_STDERR_BYTES + stage_bytes(*ALL_STAGES), []),
     ],
-    ids=["unknown", "incomplete", "all-known", "outside-retained-prefix"],
+    ids=[
+        "unknown",
+        "incomplete",
+        "watch-incomplete",
+        "watch-complete",
+        "all-known",
+        "outside-retained-prefix",
+    ],
 )
 async def test_stage_arrival_records_only_complete_fixed_lines_in_original_prefix(
     owned_probe: _Harness, stderr: bytes, expected: list[str]
