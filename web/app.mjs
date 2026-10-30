@@ -2079,13 +2079,14 @@ async function changeMemorySource(sourceId) {
 }
 
 async function searchMemories(query) {
+  const owner = connection;
   cancelMemorySearch(); releaseMemoryPath();
   const controller = new AbortController(), version = ++viewRequestVersion;
   memorySearchController = controller; state.memoryQuery = query;
   const sourceId = state.memorySourceId;
-  const current = () => memorySearchController === controller && version === viewRequestVersion && sourceId === state.memorySourceId && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
+  const current = () => connectionCurrent(owner) && memorySearchController === controller && version === viewRequestVersion && sourceId === state.memorySourceId && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
   try {
-    const payload = await request(memorySearchPath(query, sourceId), { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(memorySearchPath(query, sourceId), { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     state.memories = memorySearchItems(payload, sourceId); state.memoryQueryPartial = !!sourceId && payload.truncated === true;
     state.memoryQueryDegraded = !!sourceId && payload.degraded?.some((code) => code.startsWith("semantic_unavailable:")) === true;

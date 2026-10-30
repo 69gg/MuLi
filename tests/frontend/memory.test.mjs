@@ -1690,6 +1690,94 @@ test("a changed query cancels its path and old search responses cannot replace t
   assert.equal(h.ui.state.memoryQuery, "new"); assert.equal(h.ui.state.memories[0].id, latest.id); assert.ok(h.other.textContent.includes(latest.content)); assert.equal(region.textContent, "");
 });
 
+test("memory search rejects a previous connection's late 401 without clearing the new evidence dialog", async () => {
+  const old = deferred(), latest = fixtureMemory("new-connection-memory", { content: "NEW_CONNECTION_SEARCH_RESULT" });
+  let searches = 0;
+  const h = harness(async (path) => {
+    if (path === "/memories?query=old") return ++searches === 1 ? old.promise : { items: [latest] };
+    if (path === "/memories/graph") return { nodes: [], edges: [] };
+    if (path === `/memories/${latest.id}`) return latest;
+    throw new Error(`unexpected request: ${path}`);
+  });
+  h.ui.useMemoryViews(); h.other.replaceChildren(h.ui.renderMemories());
+  h.other.querySelector("#memory-search").value = "old";
+  const searching = h.other.querySelector("form").dispatch("submit"), oldRequest = h.requests.at(-1);
+  assert.equal(oldRequest.path, "/memories?query=old"); assert.equal(oldRequest.cache, "no-store");
+  assert.equal(oldRequest.signal.aborted, false);
+
+  h.ui.activateConnection(); await h.ui.switchView("memories");
+  assert.equal(oldRequest.signal.aborted, true); assert.equal(h.ui.state.memories[0].id, latest.id);
+  assert.ok(h.other.textContent.includes(latest.content));
+  await clickMemoryButton(h, h.other.querySelector('[data-action="memory-evidence"]'));
+  const slot = h.ui.slot, body = h.body(), action = h.button("更正"), list = h.other.firstElementChild;
+  const title = h.document.querySelector("#dialog-title").textContent;
+  assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.dialog.open, true);
+  assert.equal(slot.id, latest.id); assert.ok(body.includes(latest.content)); assert.ok(action);
+  assert.equal(h.requests.length, 4); assert.equal(searches, 2);
+
+  // A queued error is delivered despite abort, through the actual request helper.
+  old.reject(new ApiError("OLD_CONNECTION_SEARCH_401", 401)); await searching; await flush();
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(h.ui.slot === slot, true); assert.equal(h.dialog.open, true);
+  assert.equal(h.body(), body); assert.equal(h.document.querySelector("#dialog-title").textContent, title);
+  assert.equal(h.button("更正") === action, true); assert.equal(h.other.firstElementChild === list, true);
+  assert.equal(h.ui.state.memories[0].id, latest.id); assert.equal(h.requests.length, 4);
+  assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+});
+
+test("memory search rejects an aborted query's late 401 on the same connection", async () => {
+  const old = deferred(), latest = fixtureMemory("latest-query-memory", { content: "LATEST_QUERY_RESULT" });
+  const h = harness(async (path) => {
+    if (path === "/memories?query=old") return old.promise;
+    if (path === "/memories?query=new") return { items: [latest] };
+    if (path === `/memories/${latest.id}`) return latest;
+    throw new Error(`unexpected request: ${path}`);
+  });
+  h.ui.useMemoryViews(); h.other.replaceChildren(h.ui.renderMemories());
+  const input = h.other.querySelector("#memory-search"), form = h.other.querySelector("form");
+  input.value = "old";
+  const searching = form.dispatch("submit"), oldRequest = h.requests.at(-1);
+  assert.equal(oldRequest.cache, "no-store"); assert.equal(oldRequest.signal.aborted, false);
+  input.value = "new"; await form.dispatch("submit");
+  assert.equal(oldRequest.signal.aborted, true); assert.equal(h.ui.state.memoryQuery, "new");
+  assert.equal(h.ui.state.memories[0].id, latest.id); assert.ok(h.other.textContent.includes(latest.content));
+  await clickMemoryButton(h, h.other.querySelector('[data-action="memory-evidence"]'));
+  const slot = h.ui.slot, body = h.body(), action = h.button("更正"), list = h.other.firstElementChild;
+  assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.dialog.open, true); assert.ok(action);
+  assert.equal(h.requests.length, 3);
+
+  old.reject(new ApiError("ABORTED_QUERY_SEARCH_401", 401)); await searching; await flush();
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(h.ui.slot === slot, true); assert.equal(h.dialog.open, true); assert.equal(h.body(), body);
+  assert.equal(h.button("更正") === action, true); assert.equal(h.other.firstElementChild === list, true);
+  assert.equal(h.ui.state.memoryQuery, "new"); assert.equal(h.ui.state.memories[0].id, latest.id);
+  assert.equal(h.requests.length, 3); assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+});
+
+test("memory search preserves a current 401's login requirement", async () => {
+  const pending = deferred(), item = fixtureMemory("current-search-memory");
+  const h = harness(async (path) => {
+    if (path === "/memories?query=current") return pending.promise;
+    if (path === `/memories/${item.id}`) return item;
+    throw new Error(`unexpected request: ${path}`);
+  });
+  h.ui.useMemoryViews(); h.ui.state.memories = [item]; h.other.replaceChildren(h.ui.renderMemories());
+  h.other.querySelector("#memory-search").value = "current";
+  const searching = h.other.querySelector("form").dispatch("submit"), searchRequest = h.requests.at(-1);
+  assert.equal(searchRequest.path, "/memories?query=current"); assert.equal(searchRequest.cache, "no-store");
+  assert.equal(searchRequest.signal.aborted, false);
+  await clickMemoryButton(h, h.other.querySelector('[data-action="memory-evidence"]'));
+  assert.equal(h.ui.slot.id, item.id); assert.equal(h.dialog.open, true); assert.equal(h.ui.state.auth.authenticated, true);
+  assert.equal(searchRequest.signal.aborted, false); assert.equal(h.requests.length, 2);
+
+  pending.reject(new ApiError("CURRENT_SEARCH_401", 401)); await searching; await flush();
+  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.slot === null, true);
+  assert.equal(h.dialog.open, false); assert.equal(h.body(), "");
+  assert.equal(h.document.querySelector(".app-shell").inert, true);
+  assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
+  assert.equal(h.requests.length, 2); assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+});
+
 test("view/tab changes, rerenders and pagehide clear pending path data without allowing late revival", async () => {
   for (const leave of [
     (h) => h.ui.switchView("chat"),
