@@ -669,8 +669,21 @@ async def test_main_recovery_rejects_independent_and_relayed_handler_calls(tmp_p
         await runtime.close()
 
 
-@pytest.mark.parametrize("choice", ["default", "disabled", "persona"])
-async def test_main_recovery_hint_tracks_the_actual_read_tool_and_custom_persona(
+@pytest.mark.parametrize(
+    "choice",
+    [
+        "default",
+        "disabled",
+        "missing",
+        "persona",
+        "independent",
+        "team",
+        "workflow",
+        "other_main",
+        "non_owner",
+    ],
+)
+async def test_main_recovery_hint_only_reaches_the_current_owner_main_with_its_read_tool(
     tmp_path: Path, choice: str
 ) -> None:
     runtime = await configured(tmp_path)
@@ -680,9 +693,26 @@ async def test_main_recovery_hint_tracks_the_actual_read_tool_and_custom_persona
         elif choice == "persona":
             runtime.config.update({"persona": {"prompt": "用户定制人格正文"}})
         await runtime.reconfigure()
-        main_id = runtime.main_session()["id"]
-        prompt = runtime._history_context(main_id).messages[0].content
-        assert ("section=main_recovery" in prompt) is (choice == "default")
+        session = runtime.main_session()
+        if choice == "missing":
+            runtime.tools.pop("conversation_read")
+        elif choice in {"independent", "team", "workflow", "other_main"}:
+            session = runtime.new_session()
+            if choice != "independent":
+                session = runtime.store.put(
+                    "session",
+                    {
+                        **session,
+                        "kind": "main" if choice == "other_main" else choice,
+                        "role": "main" if choice == "other_main" else "worker",
+                        "principal": "owner",
+                    },
+                )
+        elif choice == "non_owner":
+            session = runtime.store.put("session", {**session, "principal": "agent:other"})
+        prompt = runtime._history_context(session["id"]).messages[0].content
+        for guidance in ("section=main_recovery", "宿主恢复记录", "first_input"):
+            assert (guidance in prompt) is (choice == "default")
         if choice == "persona":
             assert prompt.startswith("用户定制人格正文")
     finally:

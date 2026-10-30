@@ -2712,9 +2712,11 @@ class Runtime:
                 prompt += (
                     "\n主人要核查主助手自己上次的中断时，用 conversation_read 的 "
                     "section=main_recovery 只读本会话宿主已恢复且仍中断的历史运行；"
-                    "first_input 仅为 start_only 起点，available 时再用 read_arguments 核原文。"
+                    "宿主恢复记录只证明当时保存的关联与恢复时间，不证明中断时间。"
+                    "first_input 仅为 start_only 的有限输入起点，不等于完整请求或全部工具现场；"
+                    "available 时再用 read_arguments 核原文，缺失或变化的原文与未知结果须保留未知。"
                     "按 has_more/next_cursor 续查，omitted 或空候选页不表示查全；"
-                    "恢复时间不是中断时间，中断历史不等于待办，也不恢复旧授权或重放工具。"
+                    "中断历史不等于待办，也不恢复旧授权或重放工具。"
                 )
             if (
                 not persona.prompt
