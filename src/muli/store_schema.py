@@ -39,6 +39,24 @@ SESSION_DIRECTORY_SCHEMA = (
     f"ON objects(kind,({SESSION_RECORD_SORT}) DESC,id DESC) WHERE kind='session'"
 )
 
+# This optional performance index is deliberately outside CORE_SCHEMA and the
+# objects4 admission contract. Only explicit, owned server activation prepares it.
+NOTIFICATION_RECORD_BYTES = 65_536
+_NOTIFICATION_CREATED_VALUE = "json_extract(data,'$.created_at')"
+NOTIFICATION_RECORD_SORT = (
+    "CASE WHEN typeof(data)='text' "
+    f"AND length(CAST(data AS BLOB))<={NOTIFICATION_RECORD_BYTES} THEN "
+    "CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object' "
+    "AND json_type(data,'$.created_at') IN ('integer','real') "
+    f"AND {_NOTIFICATION_CREATED_VALUE}>0 "
+    f"AND {_NOTIFICATION_CREATED_VALUE}<={sys.float_info.max!r} "
+    f"THEN {_NOTIFICATION_CREATED_VALUE} ELSE 0 END ELSE 0 END ELSE 0 END"
+)
+NOTIFICATION_DIRECTORY_SCHEMA = (
+    "CREATE INDEX IF NOT EXISTS notifications_created_directory "
+    f"ON objects(kind,({NOTIFICATION_RECORD_SORT}) DESC,id DESC) WHERE kind='notification'"
+)
+
 # These are the ordinary constructors' declarations, not a second schema model.
 CORE_SCHEMA = """
             CREATE TABLE IF NOT EXISTS objects (

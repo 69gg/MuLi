@@ -55,7 +55,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const state = {
   view: "chat", status: null, connected: false, streamConnected: true, loading: true,
   sessions: [], activeSession: null, session: createSessionState(), mode: "auto", sending: false,
-  sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
+  sessionsError: "", workflows: [], memories: [], notifications: [], reminders: [], notificationTab: "inbox", notificationStatus: "all", remindersError: "", memoryGraph: { nodes: [], edges: [] }, memoryTab: "list", graphEntity: "",
   viewError: "", viewLoading: false, memoryQuery: "", memorySourceId: null, memoryQueryPartial: false, memoryQueryDegraded: false, settings: null, settingsTab: "overview",
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {}, managementRecoveryAttempt: null, managementReadVersion: 0,
@@ -77,6 +77,10 @@ let dialogTeamView = null;
 let dialogTaskReturn = null;
 let dialogMemoryReturn = null;
 let dialogUploadReturn = null;
+let dialogNotificationReturn = null;
+let notificationDirectory = null;
+let notificationDetail = null;
+const notificationPageSize = 20;
 let answerSpeechDialog = null;
 let answerSpeechResults = [];
 let attachmentCollectionDialog = null;
@@ -235,6 +239,9 @@ function invalidateConnection() {
   closeChannelDeliveryDialog();
   releaseCapabilityCatalog();
   releaseTaskDirectory();
+  releaseNotificationDirectory();
+  if (historyDialog && $("#dialog-content").firstElementChild === historyDialog.content) $("#app-dialog").close();
+  releaseHistoryDialog(); dialogHistoryReturn = null;
   releaseOwnerQuestionDialog({ close: true });
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
@@ -264,7 +271,6 @@ function beginConnection() {
     current: () => connectionCurrent(owner), read: () => ownedRequest("/notifications", {}, owner),
     publish: (payload) => {
       state.notifications = collection(payload); renderChrome();
-      if (state.view === "notifications" && state.notificationTab !== "approvals") renderOtherView();
     },
   });
   owner.approvals = createSummaryLane({
@@ -400,7 +406,9 @@ function renderChrome() {
   const needsAttention = unread + state.approvals.length;
   $("#notification-count").hidden = !needsAttention;
   $("#notification-count").textContent = String(needsAttention);
-  $("#notification-count").setAttribute("aria-label", `${unread} 条未读通知，${state.approvals.length} 项待批准`);
+  const notificationScope = `最近通知窗口（最多 200 条）中 ${unread} 条未读，${state.approvals.length} 项待批准`;
+  $("#notification-count").setAttribute("aria-label", notificationScope);
+  $("#notification-count").setAttribute("title", notificationScope);
   $("#inbox-attention").hidden = !needsAttention && !state.approvalsError;
   $("#chat-view").hidden = state.view !== "chat";
   if (state.view === "chat") conversationLayout?.refresh();
@@ -764,12 +772,13 @@ function startGlobalEvents(owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   globalController?.abort();
   globalController = new AbortController();
-  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onDisconnect: releaseAnswerSpeech, onReconnect: () => { releaseAnswerSpeech(); void refreshApprovals(owner); }, onEvent: (event) => {
+  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onDisconnect: releaseAnswerSpeech, onReconnect: () => { releaseAnswerSpeech(); markNotificationDirectoryDirty(); void refreshApprovals(owner); }, onEvent: (event) => {
     if (event.type === "approval.resolved" && typeof event.data?.id === "string") {
       state.approvals = state.approvals.filter((item) => item.id !== event.data.id); renderApprovalViews();
     }
     if (event.type.startsWith("approval.") || ["run.completed", "run.failed", "run.cancelled", "session.recovered"].includes(event.type)) void refreshApprovals(owner);
     if (["notification.created", "notification.updated", "run.completed", "run.failed", "approval.requested", "attention.queued", "ingress.cancelled"].includes(event.type)) void refreshNotifications(owner);
+    if (["notification.created", "notification.updated"].includes(event.type)) markNotificationDirectoryDirty(event);
     if (event.type.startsWith("run.") || event.type.startsWith("session.")) void refreshSessions(owner);
     if (event.type === "workflow.updated") {
       const workflow = state.workflows.find((item) => item.id === event.data?.workflow_id);
@@ -832,14 +841,14 @@ function releaseHistoryDialog() {
 }
 
 function historyDialogCurrent(slot) {
-  return historyDialog === slot && state.auth.authenticated && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+  return !!slot && historyDialog === slot && connectionCurrent(slot.owner) && state.auth.authenticated && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
 }
 
 function openHistoryDialog(sessionId, title, trigger, mode) {
   const content = element("div", { class: "history-archive" });
   openDialog({ title, content, readOnly: true });
   $("#dialog-content").scrollTop = 0;
-  const slot = { sessionId: String(sessionId), title, content, trigger, mode, page: null, bodyPage: null, selected: null, controller: null, through: null, before: null, starts: [null], offsets: [0], segment: 0, error: "", retry: null, focusAfterLoad: false, returnMessageId: null };
+  const slot = { owner: connection, sessionId: String(sessionId), title, content, trigger, mode, page: null, bodyPage: null, selected: null, controller: null, through: null, before: null, starts: [null], offsets: [0], segment: 0, error: "", retry: null, focusAfterLoad: false, returnMessageId: null };
   historyDialog = slot;
   dialogHistoryReturn = { trigger, sessionId: slot.sessionId, view: state.view, action: trigger?.dataset.action };
   const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
@@ -849,10 +858,11 @@ function openHistoryDialog(sessionId, title, trigger, mode) {
 async function loadSessionRecord(slot) {
   if (!historyDialogCurrent(slot)) return;
   slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const current = () => historyDialogCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
   slot.content.replaceChildren(element("p", { role: "status", text: "正在读取记录…" }));
   try {
-    const detail = await request(`/sessions/${encodeURIComponent(slot.sessionId)}`, { signal: controller.signal, cache: "no-store" });
-    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    const detail = await ownedRequest(`/sessions/${encodeURIComponent(slot.sessionId)}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
     if (detail?.session?.id !== slot.sessionId || !Array.isArray(detail.messages)) throw new Error("记录响应不一致，请重新读取。");
     slot.title = detail.session.title || "运行记录";
     $("#dialog-title").textContent = slot.title;
@@ -865,9 +875,9 @@ async function loadSessionRecord(slot) {
     if (content.children.length === 1) content.append(emptyState("chat", "还没有消息"));
     slot.content.replaceChildren(content);
   } catch (error) {
-    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    if (!current()) return;
     slot.content.replaceChildren(element("p", { class: "form-error", text: error.message }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadSessionRecord(slot) }));
-  } finally { if (slot.controller === controller) slot.controller = null; }
+  } finally { if (current()) slot.controller = null; }
 }
 
 function historyRole(message) {
@@ -914,6 +924,7 @@ async function loadHistoryPage(slot, before = null, starts = [null], returnMessa
   if (!historyDialogCurrent(slot)) return;
   slot.focusAfterLoad = slot.content.contains(document.activeElement);
   slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const current = () => historyDialogCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
   slot.mode = "list"; slot.page = null; slot.bodyPage = null; slot.selected = null;
   slot.error = ""; slot.retry = () => void loadHistoryPage(slot, before, starts, returnMessageId);
   renderHistoryDialog(slot);
@@ -921,16 +932,16 @@ async function loadHistoryPage(slot, before = null, starts = [null], returnMessa
     const query = new URLSearchParams({ limit: String(historyPageSize) });
     if (before !== null) query.set("before_seq", String(before));
     if (slot.through !== null) query.set("through_seq", String(slot.through));
-    const payload = await request(`/sessions/${encodeURIComponent(slot.sessionId)}/messages?${query}`, { signal: controller.signal, cache: "no-store" });
-    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    const payload = await ownedRequest(`/sessions/${encodeURIComponent(slot.sessionId)}/messages?${query}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
     slot.page = historyDirectory(payload, slot.sessionId, before, slot.through);
     slot.through = payload.through_seq; slot.before = before; slot.starts = starts; slot.returnMessageId = returnMessageId;
   } catch (error) {
-    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    if (!current()) return;
     slot.error = error.status === 404 ? "记录已不可用。" : error.message;
     if (error.status === 404) slot.retry = null;
   } finally {
-    if (historyDialogCurrent(slot) && slot.controller === controller) { slot.controller = null; renderHistoryDialog(slot); }
+    if (current()) { slot.controller = null; renderHistoryDialog(slot); }
   }
 }
 
@@ -952,21 +963,22 @@ async function loadHistoryContent(slot, offset, segment) {
   if (!historyDialogCurrent(slot) || !slot.selected) return;
   slot.focusAfterLoad = slot.content.contains(document.activeElement);
   slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const current = () => historyDialogCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
   slot.mode = "body"; slot.bodyPage = null; slot.error = "";
   slot.retry = () => void loadHistoryContent(slot, offset, segment);
   renderHistoryDialog(slot);
   try {
     const query = new URLSearchParams({ offset_bytes: String(offset), revision: slot.selected.revision });
-    const page = await request(`/sessions/${encodeURIComponent(slot.sessionId)}/messages/${encodeURIComponent(slot.selected.id)}/content?${query}`, { signal: controller.signal, cache: "no-store" });
-    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    const page = await ownedRequest(`/sessions/${encodeURIComponent(slot.sessionId)}/messages/${encodeURIComponent(slot.selected.id)}/content?${query}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
     if (!historyContentValid(page, slot, offset)) throw new Error("正文响应不一致，请返回记录重新读取。");
     slot.bodyPage = page; slot.offsets = [...slot.offsets.slice(0, segment), offset]; slot.segment = segment;
   } catch (error) {
-    if (!historyDialogCurrent(slot) || slot.controller !== controller) return;
+    if (!current()) return;
     slot.error = error.status === 404 ? "正文已不可用，请返回记录。" : error.status === 409 ? "正文已更新，请返回记录重新选择。" : error.message;
     if ([404, 409].includes(error.status)) { slot.retry = null; slot.offsets = [0]; slot.segment = 0; }
   } finally {
-    if (historyDialogCurrent(slot) && slot.controller === controller) { slot.controller = null; renderHistoryDialog(slot); }
+    if (current()) { slot.controller = null; renderHistoryDialog(slot); }
   }
 }
 
@@ -1113,6 +1125,7 @@ function openDialog({ title, content, submitLabel = "保存", danger = false, re
   releaseMemoryWatchCancel();
   releaseTaskDialog();
   releaseTaskDirectoryDialog();
+  releaseNotificationDetail(); dialogNotificationReturn = null;
   dialogTaskReturn = null;
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
@@ -1185,6 +1198,7 @@ async function switchView(view, owner = connection) {
   releaseWorkflowActivity();
   releaseRecordDirectory();
   releaseTaskDirectory();
+  releaseNotificationDirectory();
   if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
@@ -1220,6 +1234,18 @@ async function switchView(view, owner = connection) {
     await loadRecordDirectory(slot, { query: state.recordQuery });
     return;
   }
+  if (view === "notifications") {
+    const slot = state.notificationTab === "inbox" ? createNotificationDirectory(owner) : null;
+    state.viewLoading = false; renderOtherView();
+    const reminders = ownedRequest("/reminders", {}, owner, current).then((payload) => {
+      if (current()) { state.reminders = collection(payload); state.remindersError = ""; }
+    }).catch((error) => {
+      if (current()) { state.reminders = []; state.remindersError = error.message; }
+    }).finally(() => { if (current() && state.notificationTab === "reminders") renderOtherView(); });
+    await Promise.allSettled([refreshNotifications(owner), refreshApprovals(owner), reminders, slot ? loadNotificationDirectory(slot) : Promise.resolve()]);
+    if (current()) { const heading = $(".view-heading h2", $("#other-view")); if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); } }
+    return;
+  }
   if (view === "workflows") {
     const slot = workflowActivity = { page: null, after: "", starts: [""], controller: null, loading: false, error: "", refreshPending: false, definitionsController: new AbortController(), definitionsLoading: true, definitionsError: "", schedulesOpen: false, schedulesPage: null, schedulesAfter: "", schedulesStarts: [""], schedulesController: null, schedulesLoading: false, schedulesError: "", schedulesStopping: new Set() };
     state.workflows = []; state.viewLoading = false; renderOtherView();
@@ -1248,16 +1274,6 @@ async function switchView(view, owner = connection) {
       state.memoryQueryPartial = !!sourceId && results[0].value.truncated === true;
       state.memoryQueryDegraded = !!sourceId && results[0].value.degraded?.some((code) => code.startsWith("semantic_unavailable:")) === true;
       state.memoryGraph = results[1].status === "fulfilled" ? results[1].value : { nodes: [], edges: [] };
-    }
-    if (view === "notifications") {
-      const results = await Promise.allSettled([refreshNotifications(owner), ownedRequest("/reminders", {}, owner), refreshApprovals(owner)]);
-      if (!current()) return;
-      if (state.notificationTab !== "approvals") {
-        if (results[0].status === "rejected") throw results[0].reason;
-        if (!results[0].value) throw owner.notifications.error ?? new Error("通知暂时无法读取，请重试。");
-      }
-      state.reminders = results[1].status === "fulfilled" ? collection(results[1].value) : [];
-      state.remindersError = results[1].status === "rejected" ? results[1].reason.message : "";
     }
     if (view === "settings") {
       const dirty = state.settingsDraft && Object.keys(settingsPatch(state.settings, state.settingsDraft)).length;
@@ -3574,11 +3590,11 @@ async function runWorkflow(id, button) {
 }
 
 function renderNotifications() {
-  const unread = state.notifications.filter((item) => !item.read).length;
   const reminders = state.notificationTab === "reminders";
   const approvals = state.notificationTab === "approvals";
+  if (!reminders && !approvals && notificationDirectory?.root) return notificationDirectory.root;
   const tabs = element("div", { class: "role-tabs", role: "tablist", "aria-label": "通知视图" }, ...[["inbox", "收件箱"], ["approvals", `待批准${state.approvals.length ? ` ${state.approvals.length}` : ""}`], ["reminders", "提醒"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.notificationTab === key ? "active" : "", text: label, "aria-selected": String(state.notificationTab === key), dataset: { notificationTab: key } })));
-  const root = element("div", { class: "view-content" }, viewHeading("通知", approvals ? "主助手与队友等待你的决定。" : reminders ? "到时间，在这里收到提醒。" : unread ? `${unread} 条未读通知。` : "任务结果与需要处理的消息。", approvals ? actionButton("刷新", "refresh-approvals", "secondary-button", "refresh") : reminders ? actionButton("新建提醒", "new-reminder", "primary-button", "plus") : unread ? actionButton("全部已读", "read-all", "secondary-button", "check") : undefined), tabs);
+  const root = element("div", { class: "view-content" }, viewHeading("通知", approvals ? "主助手与队友等待你的决定。" : reminders ? "到时间，在这里收到提醒。" : "按保存时间翻阅通知，核对原文后可回主对话提问。", approvals ? actionButton("刷新", "refresh-approvals", "secondary-button", "refresh") : reminders ? actionButton("新建提醒", "new-reminder", "primary-button", "plus") : undefined), tabs);
   if (approvals) {
     if (state.approvalsError) root.append(emptyState("info", "暂时无法读取待批准", state.approvalsError));
     else if (!state.approvals.length) root.append(emptyState("shield", "暂无待批准", "当前没有正在等待的工具调用。"));
@@ -3590,13 +3606,281 @@ function renderNotifications() {
     return root;
   }
   if (reminders) { root.append(renderReminders()); return root; }
-  root.append(element("div", { class: "list-caption" }, `${state.notifications.length} 条通知`, "收件箱"));
-  if (!state.notifications.length) root.append(emptyState("inbox", "通知已清空", "任务完成或需要处理时，会显示在这里。"));
-  for (const item of state.notifications) {
-    const content = element("div", { class: "row-content" }, element("h3", { text: item.title || item.type || "任务通知" }), (item.content || item.message || item.body) && element("p", { text: item.content || item.message || item.body }), element("div", { class: "row-meta" }, element("time", { text: formatTimestamp(item.created_at) }), item.session_id && actionButton("查看会话", "notification-session", "text-button", undefined, { id: item.id, session: item.session_id })));
-    root.append(element("article", { class: `notification-row${item.read ? "" : " unread"}` }, element("div", { class: "row-icon" }, icon(item.type?.includes("approval") ? "shield" : "bell")), content, !item.read && iconButton("标为已读", "read-notification", "check", { id: item.id })));
-  }
+  const slot = notificationDirectory;
+  if (!slot) return root;
+  slot.filter = element("select", { "aria-label": "通知筛选", onChange: () => { if (notificationDirectoryCurrent(slot) && slot.root.contains(slot.filter)) void loadNotificationDirectory(slot, { status: slot.filter.value, focus: true }); } }, element("option", { value: "all", text: "全部通知" }), element("option", { value: "unread", text: "未读通知" })); slot.filter.value = slot.status;
+  slot.refresh = element("button", { type: "button", class: "secondary-button", text: "刷新通知", onClick: () => { if (notificationDirectoryCurrent(slot) && !slot.refresh.disabled) void loadNotificationDirectory(slot, { focus: true }); } });
+  slot.mark = element("button", { type: "button", class: "text-button", text: "本页标为已读", disabled: true, onClick: () => void markNotificationPageRead(slot) });
+  slot.notice = element("p", { class: "record-list-status", role: "status", hidden: true });
+  slot.navigation = element("nav", { class: "record-pagination", "aria-label": "通知目录分页" });
+  slot.result = element("div", { id: "notification-directory-result", "aria-busy": "false" });
+  root.className += " notification-directory";
+  root.append(element("div", { class: "content-toolbar" }, slot.filter, slot.refresh, slot.mark), element("p", { class: "settings-role-hint", text: "下方只统计本页；侧栏徽标统计最近通知窗口（最多 200 条）及待批准事项。已读不代表已处理。" }), slot.notice, slot.navigation, slot.result);
+  slot.root = root;
   return root;
+}
+
+function createNotificationDirectory(owner) {
+  return notificationDirectory = { owner, status: state.notificationStatus, cursor: null, starts: [null], page: null, controller: null, markingController: null, error: "", retry: null, dirty: false, mutationNotice: "", root: null };
+}
+
+function notificationDirectoryCurrent(slot) {
+  return !!slot && notificationDirectory === slot && connectionCurrent(slot.owner) && state.auth.authenticated && state.view === "notifications" && state.notificationTab === "inbox" && $("#other-view").firstElementChild === slot.root;
+}
+
+function releaseNotificationDirectory() {
+  const slot = notificationDirectory; notificationDirectory = null;
+  releaseNotificationDetail({ close: true }); dialogNotificationReturn = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.markingController?.abort();
+  slot.page = null; slot.retry = null; slot.starts = []; slot.root?.replaceChildren();
+}
+
+async function selectNotificationTab(tab, trigger) {
+  const owner = connection;
+  if (!["inbox", "approvals", "reminders"].includes(tab) || state.view !== "notifications" || !connectionCurrent(owner) || !state.auth.authenticated || !$("#other-view").contains(trigger)) return;
+  releaseNotificationDirectory(); state.notificationTab = tab;
+  const slot = tab === "inbox" ? createNotificationDirectory(owner) : null;
+  renderOtherView();
+  if (slot) await loadNotificationDirectory(slot);
+}
+
+function notificationDirectoryPage(payload, status, cursor, starts) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  const fail = () => { throw new Error("通知目录响应不完整，请重新读取。"); };
+  if (!payload || !Array.isArray(payload.items) || payload.items.length > notificationPageSize || !count(payload.scanned) || !count(payload.json_bytes) || !payload.omitted || ["invalid", "oversized", "status_unknown"].some((key) => !count(payload.omitted[key])) || payload.consistency !== "bounded_live" || !["end", "limit", "candidate_budget", "raw_budget", "output_budget", "deadline"].includes(payload.stopped) || typeof payload.has_more !== "boolean" || payload.has_more !== (payload.stopped !== "end")) fail();
+  const omitted = payload.omitted.invalid + payload.omitted.oversized + payload.omitted.status_unknown;
+  if (!Number.isSafeInteger(omitted) || payload.items.length + omitted > payload.scanned || payload.has_more && !payload.scanned) fail();
+  const seen = new Set();
+  for (const item of payload.items) {
+    if (!item || typeof item.id !== "string" || !item.id || seen.has(item.id) || !/^[a-f0-9]{64}$/.test(item.revision) || item.title !== null && typeof item.title !== "string" || item.source !== null && typeof item.source !== "string" || item.read !== null && typeof item.read !== "boolean" || status === "unread" && item.read !== false || item.created_at !== null && !(typeof item.created_at === "number" && item.created_at > 0 && Number.isFinite(item.created_at))) fail();
+    seen.add(item.id);
+  }
+  if (payload.has_more ? typeof payload.next_cursor !== "string" || !payload.next_cursor || payload.next_cursor === cursor || starts.includes(payload.next_cursor) : payload.next_cursor !== null) throw new Error("通知目录翻页位置无效，请重新读取。");
+  return { ...payload, omitted_total: omitted };
+}
+
+function renderNotificationDirectoryNotice(slot) {
+  if (!notificationDirectoryCurrent(slot)) return;
+  const busy = !!slot.controller || !!slot.markingController;
+  slot.refresh.disabled = busy;
+  slot.mark.disabled = busy || !slot.page?.items.some((item) => item.read === false);
+  slot.notice.textContent = [slot.controller ? "正在读取通知…" : slot.markingController ? "正在标记本页已读状态…" : slot.dirty ? "通知有更新，可刷新首页查看。" : "", slot.mutationNotice].filter(Boolean).join(" ");
+  slot.notice.hidden = !slot.notice.textContent;
+}
+
+function markNotificationDirectoryDirty(event) {
+  const slot = notificationDirectory;
+  if (notificationDirectoryCurrent(slot)) { slot.dirty = true; renderNotificationDirectoryNotice(slot); }
+  const detail = notificationDetail;
+  if (notificationDetailCurrent(detail) && (!event || event.data?.id === detail.id)) {
+    detail.dirty = true; detail.controller?.abort(); detail.controller = null;
+    if (!detail.record) { detail.chunks = []; detail.offset = 0; detail.total = null; }
+    renderNotificationDetail(detail);
+  }
+}
+
+async function loadNotificationDirectory(slot, { status = slot.status, cursor = null, starts = [null], focus = false, notice = "" } = {}) {
+  if (!notificationDirectoryCurrent(slot) || !["all", "unread"].includes(status)) return;
+  slot.controller?.abort(); slot.markingController?.abort(); slot.markingController = null;
+  releaseNotificationDetail({ close: true }); dialogNotificationReturn = null;
+  const controller = slot.controller = new AbortController();
+  Object.assign(slot, { status, cursor, starts: [...starts], page: null, error: "", retry: { status, cursor, starts: [...starts], focus }, dirty: false, mutationNotice: notice });
+  state.notificationStatus = status; slot.filter.value = status;
+  renderNotificationList(slot);
+  if (focus && !$("#app-dialog").open) $("#other-view").scrollTop = 0;
+  const current = () => notificationDirectoryCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const params = new URLSearchParams({ status, limit: String(notificationPageSize) });
+    if (cursor !== null) params.set("cursor", cursor);
+    const payload = await ownedRequest(`/notification-directory?${params}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (current()) { slot.page = notificationDirectoryPage(payload, status, cursor, starts); slot.retry = null; }
+  } catch (error) { if (current()) slot.error = error.status === 404 ? "当前服务尚不支持通知历史目录。" : error.message; }
+  finally {
+    if (current()) {
+      slot.controller = null;
+      const restoreFocus = focus && !$("#app-dialog").open && (slot.navigation.contains(document.activeElement) || document.activeElement === document.body);
+      renderNotificationList(slot); if (restoreFocus) slot.position.focus({ preventScroll: true });
+    }
+  }
+}
+
+function renderNotificationList(slot) {
+  if (!notificationDirectoryCurrent(slot)) return;
+  renderNotificationDirectoryNotice(slot);
+  const page = slot.page, busy = !!slot.controller || !!slot.markingController;
+  const unread = page?.items.filter((item) => item.read === false).length ?? 0;
+  slot.position = element("span", { class: "record-page-position", tabIndex: -1, text: `第 ${slot.starts.length} 页${page ? ` · 本页 ${page.items.length} 条，${unread} 条未读${page.has_more ? " · 尚有后页" : " · 已到末尾"}` : ""}` });
+  const previous = element("button", { type: "button", class: "text-button", text: "较新一页", disabled: busy || slot.starts.length < 2, onClick: () => { if (notificationDirectoryCurrent(slot) && slot.navigation.contains(previous) && !previous.disabled) void loadNotificationDirectory(slot, { cursor: slot.starts.at(-2), starts: slot.starts.slice(0, -1), focus: true }); } });
+  const next = element("button", { type: "button", class: "text-button", text: "更早一页", disabled: busy || !page?.has_more, onClick: () => { if (notificationDirectoryCurrent(slot) && slot.navigation.contains(next) && !next.disabled) void loadNotificationDirectory(slot, { cursor: page.next_cursor, starts: [...slot.starts, page.next_cursor], focus: true }); } });
+  slot.navigation.replaceChildren(previous, slot.position, next);
+  slot.result.setAttribute("aria-busy", String(busy)); slot.result.replaceChildren();
+  if (slot.error) {
+    const retry = element("button", { type: "button", class: "secondary-button", text: "重试读取通知", onClick: () => { if (notificationDirectoryCurrent(slot) && slot.result.contains(retry) && slot.retry) void loadNotificationDirectory(slot, slot.retry); } });
+    slot.result.append(element("p", { class: "form-error", role: "alert", text: slot.error }), retry);
+  }
+  if (!page) return;
+  if (page.omitted_total) slot.result.append(element("p", { class: "settings-role-hint", text: `本页未能显示 ${page.omitted_total} 条：记录无效 ${page.omitted.invalid} 条、超出核查预算 ${page.omitted.oversized} 条、已读状态未知 ${page.omitted.status_unknown} 条。` }));
+  for (const item of page.items) {
+    const check = element("button", { type: "button", class: "text-button", text: "核对原文", dataset: { notificationId: item.id }, disabled: busy, onClick: () => void showNotificationDetail(slot, item, check) });
+    const content = element("div", { class: "row-content" }, element("h3", { text: item.title === null ? "标题未记录" : item.title || "空标题" }), element("div", { class: "row-meta" }, element("time", { text: notificationTimeLabel(item.created_at) }), element("span", { text: item.source === null ? "来源未记录" : `来源：${item.source}` }), element("span", { text: item.read === null ? "已读状态未记录" : item.read ? "已读" : "未读" }), check));
+    const row = element("article", { class: `notification-row${item.read === false ? " unread" : ""}` }, element("div", { class: "row-icon" }, icon("bell")), content);
+    if (item.read === false) {
+      const mark = element("button", { type: "button", class: "icon-button", "aria-label": "标为已读", title: "标为已读", disabled: busy, onClick: () => { if (notificationDirectoryCurrent(slot) && slot.page === page && slot.result.contains(mark) && !mark.disabled) void markNotificationPageRead(slot, item.id); } }, icon("check")); row.append(mark);
+    }
+    slot.result.append(row);
+  }
+  if (!page.items.length) slot.result.append(emptyState("inbox", page.has_more ? "本页没有可展示的通知" : page.omitted_total ? "本页通知暂不可核查" : slot.status === "unread" ? "本次筛选没有未读通知" : "尚无通知", page.has_more ? "仍有后页，可继续翻阅。" : page.omitted_total ? "请核对上方遗漏说明。" : ""));
+}
+
+async function markNotificationPageRead(slot, id = null) {
+  if (!notificationDirectoryCurrent(slot) || slot.controller || slot.markingController || !slot.page) return;
+  const page = slot.page, status = slot.status, cursor = slot.cursor, starts = [...slot.starts];
+  const ids = page.items.filter((item) => item.read === false && (id === null || item.id === id)).map((item) => item.id);
+  if (!ids.length) return;
+  const controller = slot.markingController = new AbortController(); renderNotificationList(slot);
+  const current = () => notificationDirectoryCurrent(slot) && slot.page === page && slot.status === status && slot.markingController === controller && !controller.signal.aborted;
+  let failed = false;
+  try {
+    for (const identifier of ids) {
+      try { await ownedRequest(`/notifications/${encodeURIComponent(identifier)}`, { method: "PATCH", body: { read: true }, signal: controller.signal }, slot.owner, current); }
+      catch { if (!current()) return; failed = true; }
+      if (!current()) return;
+    }
+    await refreshNotifications(slot.owner);
+    if (!current()) return;
+    slot.markingController = null;
+    await loadNotificationDirectory(slot, { status, cursor, starts, notice: failed ? "部分标读结果未确认，请先核对本页已读状态。" : "本页所选通知已标为已读；已读不代表已处理。" });
+  } finally { if (slot.markingController === controller) { slot.markingController = null; if (notificationDirectoryCurrent(slot)) renderNotificationList(slot); } }
+}
+
+function notificationDetailCurrent(slot) {
+  return !!slot && notificationDetail === slot && notificationDirectoryCurrent(slot.directory) && connectionCurrent(slot.owner) && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function releaseNotificationDetail({ close = false } = {}) {
+  const slot = notificationDetail; notificationDetail = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null; slot.record = null; slot.raw = ""; slot.chunks = [];
+  if ($("#dialog-content").firstElementChild === slot.content && close) $("#app-dialog").close();
+  slot.content.replaceChildren();
+}
+
+async function showNotificationDetail(directory, item, trigger) {
+  if (!notificationDirectoryCurrent(directory) || directory.controller || directory.markingController || !directory.page?.items.includes(item) || !directory.result.contains(trigger) || trigger.disabled) return;
+  const slot = { directory, owner: directory.owner, id: item.id, revision: item.revision, controller: null, chunks: [], raw: "", offset: 0, total: null, record: null, dirty: false, error: "", content: element("div", { class: "notification-detail" }) };
+  openDialog({ title: "核对通知原文", content: slot.content, readOnly: true });
+  notificationDetail = slot; dialogNotificationReturn = { directory, trigger };
+  await loadNotificationDetail(slot);
+}
+
+function notificationContentPage(page, slot) {
+  const budget = (state.status?.limits?.max_context_chars ?? $("#message-input").maxLength) * 4;
+  if (!page || page.id !== slot.id || !/^[a-f0-9]{64}$/.test(page.revision) || slot.revision !== null && page.revision !== slot.revision || page.format !== "json" || page.field !== "content" || typeof page.content !== "string" || ["offset_bytes", "length_bytes", "next_offset_bytes", "total_bytes"].some((field) => !Number.isSafeInteger(page[field]) || page[field] < 0) || page.offset_bytes !== slot.offset || page.length_bytes !== new TextEncoder().encode(page.content).length || page.next_offset_bytes !== slot.offset + page.length_bytes || page.next_offset_bytes > page.total_bytes || typeof page.has_more !== "boolean" || page.has_more !== (page.next_offset_bytes < page.total_bytes) || page.has_more && !page.length_bytes || slot.total !== null && page.total_bytes !== slot.total || !Number.isSafeInteger(budget) || budget < 1 || page.total_bytes > budget) throw new Error("通知原文范围或版本无法完整核对，请重新核查。");
+  return page;
+}
+
+async function loadNotificationDetail(slot, { restart = false } = {}) {
+  if (!notificationDetailCurrent(slot) || slot.controller) return;
+  if (restart) Object.assign(slot, { revision: null, chunks: [], raw: "", offset: 0, total: null, record: null, dirty: false });
+  if (slot.dirty) return;
+  const controller = slot.controller = new AbortController(); slot.error = ""; renderNotificationDetail(slot);
+  const current = () => notificationDetailCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const params = new URLSearchParams({ offset_bytes: String(slot.offset) });
+    if (slot.revision !== null) params.set("revision", slot.revision);
+    const page = await ownedRequest(`/notifications/${encodeURIComponent(slot.id)}?${params}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    notificationContentPage(page, slot);
+    slot.revision = page.revision; slot.total = page.total_bytes; slot.offset = page.next_offset_bytes; slot.chunks.push(page.content);
+    if (!page.has_more) {
+      const raw = slot.chunks.join(""), record = JSON.parse(raw);
+      if (!record || typeof record !== "object" || Array.isArray(record) || record.id !== slot.id) throw new Error("通知原文身份不一致，请重新核查。");
+      slot.record = record; slot.raw = raw; slot.chunks = [];
+    }
+  } catch (error) {
+    if (current()) {
+      slot.error = error.status === 409 ? "通知已变化，请重新核查当前保存的原文。" : error.status === 404 ? "这条通知已不可用。" : error instanceof SyntaxError ? "通知原文响应不完整，请重新核查。" : error.message;
+      slot.record = null; slot.raw = ""; slot.chunks = []; slot.offset = 0; slot.total = null;
+    }
+  } finally { if (current()) { slot.controller = null; renderNotificationDetail(slot); } }
+}
+
+function notificationReferenceHasNoNumbers(value) {
+  let exact = true;
+  JSON.stringify(value, (_key, item) => { if (typeof item === "number") exact = false; return item; });
+  return exact;
+}
+
+function notificationReferences(record, excludeNumbers = false) {
+  return Object.fromEntries(["source", "session_id", "reminder_id", "reminder_kind", "topic_reminder_id", "matched_input_id", "matched_seq", "followup", "followup_occurrence", "routing"].filter((key) => Object.hasOwn(record, key) && (!excludeNumbers || notificationReferenceHasNoNumbers(record[key]))).map((key) => [key, record[key]]));
+}
+
+function notificationTimeLabel(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "时间未记录";
+  return Number.isFinite(new Date(value * 1000).getTime()) ? formatTimestamp(value) : "时间无法显示";
+}
+
+function renderNotificationDetail(slot) {
+  if (!notificationDetailCurrent(slot)) return;
+  const root = slot.content, record = slot.record, value = (item) => typeof item === "string" ? item : typeof item === "number" ? "数值请核对完整记录" : JSON.stringify(item, (_key, entry) => typeof entry === "number" ? "数值请核对完整记录" : entry);
+  root.replaceChildren();
+  if (slot.dirty) root.append(element("p", { class: "settings-role-hint", role: "status", text: record ? "通知有更新，以下完整正文仅为上次观察，请重新核查。" : "通知有更新，请重新核查当前保存的原文。" }));
+  if (slot.error) root.append(element("p", { class: "form-error", role: "alert", text: slot.error }));
+  if (slot.controller) root.append(element("p", { role: "status", text: "正在读取通知原文…" }));
+  if (record) {
+    root.append(element("h3", { text: typeof record.title === "string" ? record.title || "空标题" : "标题未记录" }), element("div", { class: "row-meta" }, element("time", { text: notificationTimeLabel(record.created_at) }), element("span", { text: record.read === true ? "已读" : record.read === false ? "未读" : "已读状态未记录" })));
+    const fields = ["content", "message", "body"].filter((key) => Object.hasOwn(record, key));
+    for (const field of fields) {
+      if (fields.length > 1) root.append(element("h4", { text: `保存的正文（${field}）` }));
+      root.append(element("pre", { class: "memory-source-content", text: value(record[field]) }));
+    }
+    if (!fields.length) root.append(element("p", { text: "正文未记录。" }));
+    const actions = element("div", { class: "task-control-actions" });
+    if (typeof record.session_id === "string" && record.session_id) {
+      const session = element("button", { type: "button", class: "text-button", text: "查看原会话", disabled: !!slot.controller || slot.dirty, onClick: () => { if (notificationDetailCurrent(slot) && root.contains(session) && !session.disabled && slot.record === record) { $("#app-dialog").close(); void loadSession(record.session_id); } } }); actions.append(session);
+    }
+    if (!slot.error && !slot.dirty && !slot.controller) {
+      const question = element("button", { type: "button", class: "secondary-button", text: "带着通知提问", disabled: !slot.owner.ready || !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareNotificationQuestion(slot, record, question) }); actions.append(question);
+    }
+    if (actions.children.length) root.append(actions);
+    root.append(element("p", { class: "settings-role-hint", text: "这是当时记录，当前约定需另行核对；已读不代表已处理。" }));
+  } else if (slot.total !== null) root.append(element("p", { text: `已读取 ${slot.offset}/${slot.total} 字节，尚未读完完整通知。` }));
+  if (!slot.controller && !slot.error && !slot.dirty && !record && slot.total !== null && slot.offset < slot.total) {
+    const next = element("button", { type: "button", class: "text-button", text: "继续读取通知", onClick: () => { if (notificationDetailCurrent(slot) && root.contains(next) && !slot.controller) void loadNotificationDetail(slot); } }); root.append(next);
+  }
+  if (!slot.controller && (slot.error || slot.dirty)) {
+    const reread = element("button", { type: "button", class: "text-button", text: "重新核查通知", onClick: () => { if (notificationDetailCurrent(slot) && root.contains(reread)) void loadNotificationDetail(slot, { restart: true }); } }); root.append(reread);
+  }
+  const metadata = element("details", { class: "advanced-settings notification-origin" }, element("summary", { text: "来源与完整记录" }), statusList([["通知 ID", slot.id], ["原文版本", slot.revision ?? "正在核查"]]));
+  if (record) {
+    const labels = { source: "保存的来源", session_id: "原会话", reminder_id: "原提醒 ID", reminder_kind: "原提醒类型", topic_reminder_id: "话题提醒 ID", matched_input_id: "原输入 ID", matched_seq: "原输入序号", followup: "原跟进关联", followup_occurrence: "原跟进次数", routing: "保存的渠道偏好" };
+    const references = notificationReferences(record);
+    metadata.append(statusList(Object.entries(references).map(([key, item]) => [labels[key], value(item)])));
+    if (!Object.hasOwn(record, "source") || record.source === null) metadata.append(element("p", { class: "settings-role-hint", text: "来源未记录。" }));
+    if (Object.hasOwn(record, "routing")) metadata.append(element("p", { class: "settings-role-hint", text: "保存的渠道偏好不证明平台送达。" }));
+    metadata.append(element("details", { class: "advanced-settings" }, element("summary", { text: "已保存的完整记录" }), element("pre", { class: "memory-source-content", text: slot.raw })));
+  }
+  root.append(metadata);
+}
+
+async function prepareNotificationQuestion(slot, record, trigger) {
+  const owner = slot.owner;
+  if (!notificationDetailCurrent(slot) || !owner.ready || !state.auth.authenticated || !state.connected || slot.controller || slot.error || slot.dirty || slot.record !== record || !slot.content.contains(trigger) || trigger.disabled) return;
+  const main = state.mainSessionId, draft = captureDraft();
+  if (!main || draft.session !== main) return;
+  const sources = notificationReferences(record, true);
+  const reference = `参考通知：请先用 notification_read 按以下 id 和 revision 核对保存的完整原文与来源，再回答我的问题；原提醒的当前约定须另外核查，已读不代表已处理。\n${JSON.stringify({ id: slot.id, revision: slot.revision })}${Object.keys(sources).length ? `\n已保存的来源定位：${JSON.stringify(sources)}` : ""}`;
+  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+  const input = $("#message-input");
+  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入通知。", true); return; }
+  const navigation = viewRequestVersion + 1;
+  await switchView("chat", owner);
+  if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+  const current = captureDraft();
+  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入通知。"); return; }
+  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  resizeComposer(); input.focus();
 }
 
 function intervalLabel(seconds) {
@@ -4794,7 +5078,7 @@ async function handleAction(action, button) {
     } finally { workflowStopping.delete(id); if (workflowActivityCurrent(slot)) renderOtherView(); }
   }
   if (action === "delete-workflow") confirmAction("删除工作流", "此工作流定义会被删除，已有会话保留。", "删除工作流", async () => { await request(`/workflows/${encodeURIComponent(button.dataset.id)}`, { method: "DELETE" }); await switchView("workflows"); toast("工作流已删除"); });
-  if (action === "read-notification") await markRead(button.dataset.id);
+  if (action === "read-notification" && notificationDirectoryCurrent(notificationDirectory) && notificationDirectory.result.contains(button)) await markNotificationPageRead(notificationDirectory, button.dataset.id);
   if (action === "new-reminder") editReminder();
   if (action === "edit-reminder") editReminder(button.dataset.id, button.dataset.kind);
   if (action === "toggle-reminder") await toggleReminder(button.dataset.id, button, button.dataset.kind);
@@ -4803,11 +5087,8 @@ async function handleAction(action, button) {
     if (item) confirmAction("删除提醒", "删除后不再发送这条提醒，已收到的通知会保留。", "删除提醒", async () => { await request(reminderPath(item), { method: "DELETE" }); await switchView("notifications"); toast("提醒已删除"); });
   }
   if (action === "read-all") {
-    const results = await Promise.allSettled(state.notifications.filter((item) => !item.read).map((item) => request(`/notifications/${encodeURIComponent(item.id)}`, { method: "PATCH", body: { read: true } })));
-    if (results.some((result) => result.status === "rejected")) toast("部分通知未能更新，请重试。", true);
-    await refreshNotifications();
+    if (notificationDirectoryCurrent(notificationDirectory) && notificationDirectory.mark === button) await markNotificationPageRead(notificationDirectory);
   }
-  if (action === "notification-session") { await markRead(button.dataset.id); await loadSession(button.dataset.session); }
   if (action === "pair-chiliarch") await pairChiliarch(button);
   if (action === "service") await serviceAction(button.dataset.command);
   if (action === "refresh-service") await refreshService();
@@ -4853,7 +5134,7 @@ document.addEventListener("click", async (event) => {
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) await selectMemoryTab(button.dataset.memoryTab);
     else if (button.dataset.teamTab) await selectTeamTab(button.dataset.teamTab, button);
-    else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
+    else if (button.dataset.notificationTab) await selectNotificationTab(button.dataset.notificationTab, button);
   } catch (error) { showError(error); }
 });
 
@@ -4919,6 +5200,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
 $("#app-dialog").addEventListener("cancel", () => {
   if (ownerQuestionCurrent(ownerQuestionDialog)) releaseOwnerQuestionDialog();
   if (taskDirectoryDialog && $("#dialog-content").firstElementChild === taskDirectoryDialog.content) releaseTaskDirectoryDialog();
+  if (notificationDetail && $("#dialog-content").firstElementChild === notificationDetail.content) releaseNotificationDetail();
   if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) releaseChannelDeliveryDialog();
   if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
   if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
@@ -4932,6 +5214,7 @@ $("#app-dialog").addEventListener("close", () => {
   releaseMemoryWatchCancel();
   releaseTaskDialog();
   releaseTaskDirectoryDialog();
+  releaseNotificationDetail();
   releaseMemoryDialog();
   releaseHistoryDialog();
   releaseChannelDeliveryDialog();
@@ -4951,6 +5234,11 @@ $("#app-dialog").addEventListener("close", () => {
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
   const taskReturn = dialogTaskReturn; dialogTaskReturn = null;
   if (taskReturn && taskDirectoryCurrent(taskReturn.directory) && taskReturn.directory.result.contains(taskReturn.trigger)) taskReturn.trigger.focus({ preventScroll: true });
+  const notificationReturn = dialogNotificationReturn; dialogNotificationReturn = null;
+  if (notificationReturn && notificationDirectoryCurrent(notificationReturn.directory)) {
+    const target = notificationReturn.directory.result.contains(notificationReturn.trigger) ? notificationReturn.trigger : notificationReturn.directory.position;
+    target?.focus({ preventScroll: true });
+  }
   const memoryReturn = dialogMemoryReturn; dialogMemoryReturn = null;
   if (state.auth.authenticated && state.view === "memories" && memoryReturn) {
     const root = $("#other-view"), fallback = $$("[data-action=memory-evidence]", root).find((button) => button.dataset.id === memoryReturn.id);

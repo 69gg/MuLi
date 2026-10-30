@@ -9,6 +9,7 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import unquote
 from uuid import UUID, uuid4
@@ -57,6 +58,7 @@ from muli.mcp_policy import ReceivePolicy
 from muli.memory_application import MemoryApplication
 from muli.memory_evidence import SOURCE_PAGE_LIMIT, MemoryEvidence, memory_listing
 from muli.middleware import BodyLimitMiddleware
+from muli.notification_history import NotificationHistory
 from muli.permissions import Mode
 from muli.personal_io import PersonalIO
 from muli.plugins import PluginManager
@@ -408,6 +410,12 @@ def _create_app(
     runtime.maintenance.on_configuration_release(wake_onboarding)
 
     async def activate_components() -> None:
+        # This callback also runs only after a managed boot has a durable final
+        # decision. Passive/probation construction never prepares derived DDL.
+        try:
+            runtime.store.prepare_notification_history()
+        except EvidenceError:
+            pass  # Optional history failure must not prevent ordinary startup.
         runtime._main_wake_deferred = True
         await plugins.load()
         if runtime.maintenance.permit and runtime.maintenance.permit.probation:
@@ -1783,6 +1791,43 @@ def _create_app(
     @app.get("/api/notifications")
     async def notifications() -> dict[str, Any]:
         return {"items": runtime.store.list("notification")}
+
+    @app.get("/api/notification-directory")
+    async def notification_directory(
+        status: Literal["all", "unread"] = "all",
+        cursor: Annotated[str | None, Query(min_length=1, max_length=_HISTORY_OUTPUT_CHARS)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, Any]:
+        limits = config.settings.limits
+        return NotificationHistory(runtime.store).directory(
+            status=status,
+            cursor=cursor,
+            limit=limit,
+            max_output_chars=min(limits.max_output_chars, _HISTORY_OUTPUT_CHARS),
+            max_results=limits.max_search_results,
+            max_context_chars=limits.max_context_chars,
+            deadline=monotonic() + limits.max_search_seconds,
+        )
+
+    @app.get("/api/notifications/{identifier:path}")
+    async def notification_detail(
+        identifier: str,
+        offset_bytes: Annotated[int, Query(ge=0, lt=SQLITE_MAX_INTEGER)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1, lt=SQLITE_MAX_INTEGER)] = None,
+        revision: Annotated[
+            str | None, Query(min_length=1, max_length=_HISTORY_OUTPUT_CHARS)
+        ] = None,
+    ) -> dict[str, Any]:
+        limits = config.settings.limits
+        return NotificationHistory(runtime.store).read(
+            identifier,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
+            revision=revision,
+            max_output_chars=min(limits.max_output_chars, _HISTORY_OUTPUT_CHARS),
+            max_context_chars=limits.max_context_chars,
+            deadline=monotonic() + limits.max_search_seconds,
+        )
 
     @app.get("/api/reminders")
     async def reminders() -> dict[str, Any]:

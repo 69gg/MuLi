@@ -1,6 +1,7 @@
 /** Browser-only interactive demo. Nothing in this module calls a MuLi server. */
 const encoder = new TextEncoder();
 const watchOutputBytes = 64 * 1024; // Server MAX_MATCH_PROOF_BYTES, also for the demo envelope.
+const notificationHistoryBytes = 64 * 1024; // Server notification raw-record ceiling.
 const previewNotesUploadId = "b".repeat(32);
 const commitmentStates = ["open", "in_progress", "blocked", "done", "cancelled"];
 const clone = (value) => structuredClone(value);
@@ -84,8 +85,10 @@ export function createPreviewState() {
     sessions: [main], messages: { [main.id]: [] }, runs: {}, approvals: [], events: [], eventId: 0,
     channelDeliveries: [{ id: "preview-delivery", channel: "onebot", account_id: "preview-bot", owner_id: "7", state: "unknown", confirmed_parts: 1, created_at: now - 1800, parts: [{ text: "这是本页模拟保存的发送正文🙂。\n记录与平台确认状态仅用于演示，没有连接真实消息渠道。" }, { attachment_id: previewNotesUploadId }, { text: "这是尚未确认的后续模拟分段。" }] }],
     notifications: [
-      { id: "notice-welcome", title: "欢迎来到沐璃", content: "这是可操作的前端预览。发一条消息，体验规划、工具轨迹、审批和流式回答；设置只保存在当前页面。", type: "info", read: false, created_at: now },
-      { id: "notice-review", title: "示例周报已整理", content: "队友已完成资料整理与交叉复核，示例附件可在附件页下载。", type: "task", read: true, created_at: now - 3600 },
+      { id: "notice-welcome", title: "欢迎来到沐璃", content: "这是可操作的前端预览。发一条消息，体验规划、工具轨迹、审批和流式回答；设置只保存在当前页面。", source: "preview", session_id: main.id, type: "info", read: false, created_at: now },
+      { id: "notice-review", title: "示例周报已整理", content: "本页模拟：队友完成资料整理与交叉复核，示例附件可在附件页下载。没有真实队友或外发。", source: "preview", session_id: main.id, type: "task", read: true, created_at: now - 3600 },
+      ...Array.from({ length: 20 }, (_, index) => ({ id: `notice-history-${index + 1}`, title: `以前的通知示例 ${index + 1}`, content: `本页内存示例 ${index + 1}：这段通知原文用于体验稳定翻页与按需核查，不对应真实任务或执行。`, source: "preview", read: index % 4 !== 0, created_at: now - (index + 2) * 3600 })),
+      { id: "notice-old-reminder", title: "以前约好的每周回顾（本页示例）", content: "本页模拟保存的原提醒🙂：回顾已有成果、尚未核验的部分和下一步。\n原文中段：先核对当时约定，再讨论现在是否需要调整。\n查看或标为已读都不代表本周回顾已经处理。", source: "reminder", session_id: main.id, reminder_id: "reminder-review", reminder_kind: "reminder", routing: { kind: "registered_web" }, read: false, created_at: now - 5 * 86400 },
     ],
     memories: [
       { id: "memory-style", content: "你偏好简洁的中文说明，先给结论，再给必要依据。", kind: "preference", layer: "preference", source: "演示手动记录", source_id: null, trusted_owner: true, confidence: 1, version: 1, status: "active", entities: ["你", "中文说明"], relations: [{ subject: "你", predicate: "偏好", object: "中文说明" }], created_at: now - 7200, updated_at: now - 7200 },
@@ -145,6 +148,7 @@ function merge(target, changes) {
 /** Exported for offline tests; the same handlers power the actual app preview. */
 export function createPreviewBackend({ state = createPreviewState(), delay = 140 } = {}) {
   const listeners = new Set(), timers = new Set(), pendingDecisions = new Map();
+  const notificationCursorScope = identifier("preview-notification-history");
   let disposed = false;
   const later = (fn, milliseconds = delay) => {
     const timer = setTimeout(() => { timers.delete(timer); if (!disposed) fn(); }, milliseconds);
@@ -314,6 +318,84 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     return [...new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", raw))].map((value) => value.toString(16).padStart(2, "0")).join("");
   };
   const collectionFits = (value) => Array.from(JSON.stringify(value)).length <= state.settings.limits.max_output_chars;
+  const notificationFailure = (code, message, status = 400) => failure({ code, message }, status);
+  const notificationFits = (value) => Array.from(JSON.stringify(value)).length <= Math.min(state.settings.limits.max_output_chars, 32000);
+  const notificationRawBudget = () => Math.min(notificationHistoryBytes, state.settings.limits.max_context_chars * 4);
+  const notificationTime = (value) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+  const compareNotificationKeys = (left, right) => {
+    if (left.time !== right.time) return left.time < right.time ? -1 : 1;
+    const a = Array.from(left.id, (char) => char.codePointAt(0)), b = Array.from(right.id, (char) => char.codePointAt(0));
+    for (let index = 0; index < Math.min(a.length, b.length); index++) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+    return Math.sign(a.length - b.length);
+  };
+  async function notificationDirectory(url) {
+    const params = url.searchParams, status = params.get("status") ?? "all", limit = Number(params.get("limit") ?? 20), cursor = params.get("cursor");
+    if ([...params.keys()].some((key) => !["status", "limit", "cursor"].includes(key) || params.getAll(key).length !== 1) || !["all", "unread"].includes(status) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100 || cursor === "") return notificationFailure("invalid_arguments", "演示通知目录参数无效。", 422);
+    let before = null;
+    if (cursor !== null) {
+      try {
+        const token = JSON.parse(cursor);
+        if (!Array.isArray(token) || token.length !== 5 || token[0] !== "preview-notifications" || token[1] !== notificationCursorScope || token[2] !== status || typeof token[3] !== "number" || !Number.isFinite(token[3]) || token[3] < 0 || typeof token[4] !== "string" || !token[4]) throw new Error("cursor");
+        before = { time: token[3], id: token[4] };
+      } catch { return notificationFailure("notification_cursor_invalid", "演示通知游标无效或不属于当前筛选。"); }
+    }
+    const candidates = state.notifications.map((item, index) => ({ item, id: typeof item?.id === "string" && item.id ? item.id : `preview-invalid-${index}`, time: notificationTime(item?.created_at) })).filter((entry) => before === null || compareNotificationKeys(entry, before) < 0).sort((left, right) => -compareNotificationKeys(left, right));
+    const rawBudget = notificationRawBudget(), candidateBudget = Math.min(state.settings.limits.max_search_results ?? state.previewLimits.max_items, 100);
+    let result = { items: [], scanned: 0, json_bytes: 0, omitted: { invalid: 0, oversized: 0, status_unknown: 0 } }, position = null, index = 0, stopped = "end";
+    const packet = (value, key, reason) => ({ ...value, has_more: reason !== "end", next_cursor: reason !== "end" && key ? JSON.stringify(["preview-notifications", notificationCursorScope, status, key.time, key.id]) : null, stopped: reason, consistency: "bounded_live", preview: true });
+    if (!notificationFits(packet(result, candidates[0] ?? { time: 0, id: "empty" }, candidates.length ? "candidate_budget" : "end"))) return notificationFailure("output_budget", "预算不足以返回通知目录与续页坐标。");
+    while (index < candidates.length) {
+      if (result.items.length >= limit) { stopped = "limit"; break; }
+      if (result.scanned >= candidateBudget) { stopped = "candidate_budget"; break; }
+      const entry = candidates[index], item = entry.item, next = clone(result);
+      let raw;
+      try { raw = encoder.encode(JSON.stringify(item)); } catch { raw = null; }
+      const valid = item && typeof item === "object" && !Array.isArray(item) && item.id === entry.id && ["title", "source"].every((field) => item[field] == null || typeof item[field] === "string");
+      if (!raw || !valid) next.omitted.invalid++;
+      else if (raw.length > rawBudget) next.omitted.oversized++;
+      else {
+        if (raw.length > rawBudget - next.json_bytes) { stopped = "raw_budget"; break; }
+        next.json_bytes += raw.length;
+        const read = typeof item.read === "boolean" ? item.read : null;
+        if (status === "unread" && read === null) next.omitted.status_unknown++;
+        else if (status === "all" || read === false) {
+          const metadata = { id: item.id, title: item.title ?? null, source: item.source ?? null, created_at: entry.time || null, read, revision: await sha256(raw) };
+          const trial = { ...next, items: [...next.items, metadata], scanned: next.scanned + 1 };
+          if (!notificationFits(packet(trial, entry, index + 1 < candidates.length ? "candidate_budget" : "end"))) {
+            if (next.items.length) { stopped = "output_budget"; break; }
+            next.omitted.oversized++;
+          } else next.items.push(metadata);
+        }
+      }
+      next.scanned++;
+      if (!notificationFits(packet(next, entry, index + 1 < candidates.length ? "candidate_budget" : "end"))) return notificationFailure("output_budget", "预算不足以完整说明本页通知与遗漏。");
+      result = next; position = entry; index++;
+    }
+    if (index === candidates.length) stopped = "end";
+    if (stopped !== "end" && !position) return notificationFailure("output_budget", "本次预算不足以取得可续读的通知位置。");
+    return response(packet(result, position, stopped));
+  }
+  async function notificationContent(item, url) {
+    const params = url.searchParams, offset = Number(params.get("offset_bytes") ?? 0), length = Number(params.get("length_bytes") ?? notificationRawBudget()), revision = params.get("revision");
+    if ([...params.keys()].some((key) => !["offset_bytes", "length_bytes", "revision"].includes(key) || params.getAll(key).length !== 1) || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || revision === "" || offset > 0 && revision === null) return notificationFailure("invalid_arguments", "演示通知原文坐标无效，续读须保持原文版本。", 422);
+    if (!item || typeof item.id !== "string" || !item.id) return notificationFailure("evidence_not_found", "没有这条演示通知。", 404);
+    const raw = encoder.encode(JSON.stringify(item));
+    if (raw.length > notificationRawBudget()) return notificationFailure("notification_record_oversized", "这条演示通知超过完整核查的字节预算。");
+    const digest = await sha256(raw);
+    if (revision !== null && revision !== digest) return notificationFailure("evidence_changed", "演示通知原文已变化，请从头重新核查。", 409);
+    if (offset > raw.length || raw[offset] >= 0x80 && raw[offset] <= 0xbf) return notificationFailure("invalid_offset", "请使用上一页的准确字节位置续读通知。");
+    let end = Math.min(raw.length, offset + length);
+    while (end > offset && raw[end] >= 0x80 && raw[end] <= 0xbf) end--;
+    const text = Array.from(new TextDecoder("utf-8", { fatal: true }).decode(raw.slice(offset, end)));
+    const page = (count) => {
+      const content = text.slice(0, count).join(""), size = encoder.encode(content).length;
+      return { id: item.id, revision: digest, format: "json", field: "content", content, offset_bytes: offset, length_bytes: size, next_offset_bytes: offset + size, total_bytes: raw.length, has_more: offset + size < raw.length, preview: true };
+    };
+    let low = 0, high = text.length;
+    while (low < high) { const middle = Math.ceil((low + high) / 2); if (notificationFits(page(middle))) low = middle; else high = middle - 1; }
+    const result = page(low);
+    return !notificationFits(result) || !low && result.has_more ? notificationFailure("output_budget", "预算不足以返回完整字符与通知原文坐标。") : response(result);
+  }
   async function collectionSnapshot(id) {
     const file = state.uploads.find((entry) => entry.id === id), blob = state.files.get(id);
     if (!file || !blob || !/^[a-f0-9]{32}$/u.test(id)) throw new Error("没有这份演示附件。");
@@ -520,10 +602,12 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       later(() => decision?.(body.decision === "approve"), 60);
       return response({ resolved: true });
     }
+    if (path === "/notification-directory" && method === "GET") return notificationDirectory(url);
     if (parts[0] === "notifications") {
-      if (parts.length === 1 && method === "GET") return response({ items: state.notifications });
+      if (parts.length === 1 && method === "GET") return response({ items: state.notifications.slice(0, 200) });
       const item = state.notifications.find((entry) => entry.id === id);
-      if (item && method === "PATCH") { item.read = body.read === true; emit("notification.updated", item); return response(item); }
+      if (parts.length === 2 && method === "GET") return notificationContent(item, url);
+      if (item && parts.length === 2 && method === "PATCH") { item.read = body.read === true; emit("notification.updated", item); return response(item); }
     }
     if (parts[0] === "reminders") {
       const reminderKind = (item) => item.kind === undefined ? "reminder" : item.kind;

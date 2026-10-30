@@ -38,6 +38,8 @@ from muli.store_initialization import (
 from muli.store_schema import (
     CHANNEL_SCHEMA,
     CORE_SCHEMA,
+    NOTIFICATION_DIRECTORY_SCHEMA,
+    NOTIFICATION_RECORD_SORT,
     SESSION_DIRECTORY_SCHEMA,
     ExistingStoreError,
     ExistingStoreLimits,
@@ -900,6 +902,140 @@ class Store:
                 yield dict(row)
         finally:
             cursor.close()
+
+    def notification_history_index(self) -> bool:
+        """Check the optional derived DDL; reads never create or repair it."""
+        maximum = len(NOTIFICATION_DIRECTORY_SCHEMA.encode("utf-8"))
+        with closing(self.db.cursor()) as cursor:
+            row = cursor.execute(
+                "SELECT type,CASE WHEN length(CAST(sql AS BLOB))<=? "
+                "THEN CAST(sql AS BLOB) END AS sql FROM main.sqlite_schema "
+                "WHERE name='notifications_created_directory' LIMIT 1",
+                (maximum,),
+            ).fetchone()
+        return (
+            row is not None
+            and row["type"] == "index"
+            and row["sql"] == NOTIFICATION_DIRECTORY_SCHEMA.replace(" IF NOT EXISTS", "").encode()
+        )
+
+    def prepare_notification_history(self, *, limits: ExistingStoreLimits | None = None) -> None:
+        """Explicit owned activation only: prepare an optional index with bounded SQL work.
+
+        Failure must leave the ordinary objects4 contract and connection usable;
+        the directory then reports unavailable while exact-ID reads still work.
+        """
+        limits = limits or ExistingStoreLimits()
+        if self._runtime_lock is None or self.format_state is None or self.db.in_transaction:
+            raise EvidenceError(
+                "notification_directory_unavailable", "通知目录索引准备需要已准入的独占写入者"
+            )
+        self._runtime_lock.check()
+        self.revalidate_format()
+        deadline = monotonic() + limits.seconds
+        interval = min(100, limits.vm_steps)
+        steps = 0
+        begun = installed = False
+        timeout = int(self.db.execute("PRAGMA busy_timeout").fetchone()[0])
+
+        def progress() -> int:
+            nonlocal steps
+            steps += interval
+            return int(steps >= limits.vm_steps or monotonic() >= deadline)
+
+        try:
+            self.db.set_progress_handler(progress, interval)
+            installed = True
+            self.db.execute(f"PRAGMA busy_timeout={min(timeout, int(limits.seconds * 1000))}")
+            if self.notification_history_index():
+                return
+            if self.db.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE name='notifications_created_directory' LIMIT 1"
+            ).fetchone():
+                raise EvidenceError(
+                    "notification_directory_unavailable", "同名通知目录索引不符合声明，未自动修复"
+                )
+            self.db.execute("BEGIN")
+            begun = True
+            self.db.execute(NOTIFICATION_DIRECTORY_SCHEMA)
+            if monotonic() >= deadline or not self.notification_history_index():
+                raise EvidenceError(
+                    "notification_directory_unavailable", "通知目录索引未在预算内完整准备"
+                )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            raise EvidenceError(
+                "notification_directory_unavailable", "通知目录索引准备超过预算或本地不可用"
+            ) from exc
+        finally:
+            if installed:
+                self.db.set_progress_handler(None, 0)
+            if begun and self.db.in_transaction:
+                self.db.rollback()
+            self.db.execute(f"PRAGMA busy_timeout={timeout}")
+
+    def notification_directory_rows(
+        self,
+        *,
+        after: tuple[int | float, str] | None,
+        limit: int,
+        key_bytes: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Seek a fixed raw candidate window before JSON inspection or unread filtering."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("通知目录需要至多 100 个候选和一个前瞻")
+        if type(key_bytes) is not int or not 1 <= key_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("通知目录 ID 字节预算必须是正整数")
+        chronological = f"({NOTIFICATION_RECORD_SORT}) DESC,objects.id DESC"
+        windows: builtins.list[tuple[str, tuple[int | float | str, ...], str]] = [
+            ("", (), chronological)
+        ]
+        if after is not None:
+            # Seek both indexed columns in the equal-time group first. A tuple
+            # inequality alone can leave SQLite scanning all earlier IDs in a
+            # large tie (including every unknown timestamp) on every next page.
+            # In that equality window, order only the actual ID index column:
+            # repeating the constant complex expression can force a temp sort.
+            windows = [
+                (
+                    f"AND ({NOTIFICATION_RECORD_SORT})=? AND objects.id<? ",
+                    after,
+                    "objects.id DESC",
+                ),
+                (f"AND ({NOTIFICATION_RECORD_SORT})<? ", (after[0],), chronological),
+            ]
+        remaining = limit
+        for predicate, bounds, ordering in windows:
+            cursor = self.db.execute(
+                "SELECT CASE WHEN length(CAST(objects.id AS BLOB))<=? "
+                "THEN CAST(objects.id AS BLOB) END AS id,"
+                f"({NOTIFICATION_RECORD_SORT}) AS sort_created_at "
+                "FROM objects INDEXED BY notifications_created_directory "
+                "WHERE kind='notification' " + predicate + f"ORDER BY {ordering} LIMIT ?",
+                (key_bytes, *bounds, remaining),
+            )
+            try:
+                for row in cursor:
+                    remaining -= 1
+                    yield dict(row)
+            finally:
+                cursor.close()
+            if not remaining:
+                return
+
+    def notification_record_bytes(
+        self, identifier: str, *, max_bytes: int
+    ) -> dict[str, Any] | None:
+        """Read an exact-ID raw JSON only when SQLite proves its complete byte bound."""
+        if type(max_bytes) is not int or not 1 <= max_bytes <= SQLITE_MAX_INTEGER:
+            raise ValueError("通知原文核查字节预算必须是正整数")
+        row = self.db.execute(
+            "SELECT typeof(data) AS storage_type,length(CAST(data AS BLOB)) AS size,"
+            "CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
+            "THEN CAST(data AS BLOB) END AS raw FROM objects WHERE kind='notification' AND id=?",
+            (max_bytes, identifier),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def continuation_rows(
         self,

@@ -60,6 +60,7 @@ from muli.memory_watches import (
 )
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
+from muli.notification_history import NotificationHistory
 from muli.notifications import DesktopNotifier
 from muli.owner_questions import OwnerQuestions
 from muli.owner_text import OwnerTextKind, owner_text_marker
@@ -3784,6 +3785,7 @@ class Runtime:
         )
         if not history_input or history_input[0] != "owner":
             tools.pop("history_find", None)
+            tools.pop("notification_read", None)
         if "memory_import_reply" in tools and (
             consult is not None
             or workflow_step
@@ -4466,6 +4468,37 @@ class Runtime:
             await self.bus.emit("notification.created", item)
             return item
 
+        async def read_notification(args: dict[str, Any]) -> Any:
+            caller, run_id, _ = owner_history_call("notification_read", read_notification)
+            request = self.request_context(caller)
+            if request is None or self._owner_round_input(request, run_id) is None:
+                raise PermissionError("通知原文仅供真实主人当前请求中的主助手核查")
+            limits = self.config.settings.limits
+            reader = NotificationHistory(self.store)
+            if "id" in args:
+                if set(args) - {"id", "offset_bytes", "length_bytes", "revision"}:
+                    raise EvidenceError("invalid_arguments", "通知原文读取不能混用目录参数")
+                return reader.read(
+                    args["id"],
+                    offset_bytes=args.get("offset_bytes", 0),
+                    length_bytes=args.get("length_bytes"),
+                    revision=args.get("revision"),
+                    max_output_chars=limits.max_output_chars,
+                    max_context_chars=limits.max_context_chars,
+                    deadline=monotonic() + limits.max_search_seconds,
+                )
+            if set(args) - {"status", "cursor", "limit"}:
+                raise EvidenceError("invalid_arguments", "通知正文续读参数需要准确 id")
+            return reader.directory(
+                status=args.get("status", "all"),
+                cursor=args.get("cursor"),
+                limit=args.get("limit", 20),
+                max_output_chars=limits.max_output_chars,
+                max_results=limits.max_search_results,
+                max_context_chars=limits.max_context_chars,
+                deadline=monotonic() + limits.max_search_seconds,
+            )
+
         return [
             Tool(
                 "task_schedule_replan",
@@ -4890,6 +4923,26 @@ class Runtime:
                 parameters({}),
                 stop_shell,
                 "destructive",
+                preserve_output=True,
+            ),
+            Tool(
+                "notification_read",
+                "仅真实主人当前请求中的主助手只读核查保存通知。无id按created_at/id翻目录，status仅all/unread；"
+                "检查has_more、omitted与stopped，空页不代表查全。给准确id分页读取原JSON字节，"
+                "续读使用revision/next_offset_bytes，收齐后再解释来源；标已读也会改变保存版本。"
+                "不读取关联任务全文，不标已读、不恢复执行、不外发；通知不证明送达或任务验收",
+                parameters(
+                    {
+                        "id": string("准确的持久通知 ID"),
+                        "status": {"type": "string", "enum": ["all", "unread"]},
+                        "cursor": string("原样续读同一资料库和状态的 next_cursor"),
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "offset_bytes": {"type": "integer", "minimum": 0},
+                        "length_bytes": {"type": "integer", "minimum": 1},
+                        "revision": string("非零 offset 必须提供上一页的保存版本"),
+                    }
+                ),
+                read_notification,
                 preserve_output=True,
             ),
             Tool(

@@ -110,6 +110,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
   const actions = node("div", "dialog-actions", form); actions.className = "dialog-actions";
   const close = node("button", "dialog-close", actions); close.dataset.action = "close-dialog"; node("button", "dialog-submit", actions);
   const other = node("div", "other-view"); const shell = node("div", "app-shell"); shell.className = "app-shell";
+  node("div", "approval-region");
   node("div", "auth-gate"); node("input", "login-password");
   for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll"]) node(id === "message-input" ? "textarea" : "div", id);
   if (composer) {
@@ -153,7 +154,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     ${composer ? "renderSessions = () => {};" : ""}
     const activateConnection = () => {
       const owner = beginConnection(); owner.ready = true;
-      owner.sessions.start(); owner.notifications.start(); return owner;
+      owner.sessions.start(); owner.notifications.start(); owner.approvals.start(); return owner;
     };
     activateConnection();
     globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, renderComposerAttachments,
@@ -163,11 +164,15 @@ export function harness(handler = async () => { throw new Error("unexpected requ
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       useUploadViews() { renderOtherView = () => { if (state.view === "uploads") realOtherView(); }; },
       useTeamViews() { renderOtherView = () => { if (state.view === "team") realOtherView(); }; },
+      useNotificationViews() { renderOtherView = () => { if (state.view === "notifications") realOtherView(); }; },
       revalidateVisibleState() { revalidateVisibleState(connection); },
       useSettingsViews() { renderOtherView = () => { if (state.view === "settings") realOtherView(); }; renderOtherView(); },
       get taskDirectorySlot() { return typeof taskDirectory === "undefined" ? null : taskDirectory; },
       get taskDetailSlot() { return typeof taskDirectoryDialog === "undefined" ? null : taskDirectoryDialog; },
       get taskControlSlot() { return taskDialog; }, get taskControls() { return taskControlModels; },
+      get notificationDirectorySlot() { return typeof notificationDirectory === "undefined" ? null : notificationDirectory; },
+      get notificationDetailSlot() { return typeof notificationDetail === "undefined" ? null : notificationDetail; },
+      get historySlot() { return historyDialog; },
       stopEvents() { globalController?.abort(); },
       get channelDeliverySlot() { return channelDeliveryDialog; },
       get slot() { return memoryDialog; }, get path() { return memoryPath; }, get catalog() { return memorySources; }, get watches() { return memoryWatches; }, get submit() { return dialogSubmit; } };
