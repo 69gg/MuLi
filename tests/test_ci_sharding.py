@@ -109,10 +109,10 @@ def test_workflow_matrix_covers_each_runner_with_complete_disjoint_partitions(
     matrix = suite["strategy"]["matrix"]
     assert set(matrix) == {"include"}
     entries = matrix["include"]
-    assert len(entries) == 16
+    assert len(entries) == 18
     items = sample_items(tmp_path)
     for operating_system, shards in (
-        ("ubuntu-latest", 2),
+        ("ubuntu-latest", 3),
         ("macos-latest", 2),
         ("windows-latest", 4),
     ):

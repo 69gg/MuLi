@@ -17,3 +17,9 @@
 /tests/fixtures/workflow_source_v2_138/runtime_drive.py.txt -text
 /tests/fixtures/workflow_source_v2_138/compatibility.json -text
 /tests/fixtures/workflow_source_v2_138/manifest.json -text
+# Shared source consumers are also compared against historical bytes.
+/src/muli/store.py text eol=lf
+/src/muli/events.py text eol=lf
+/src/muli/reply_origin.py text eol=lf
+/src/muli/task_control.py text eol=lf
+/src/muli/runtime.py text eol=lf
