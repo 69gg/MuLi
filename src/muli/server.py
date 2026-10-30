@@ -30,6 +30,7 @@ from muli.attention import AttentionInbox
 from muli.auth import COOKIE_NAME, Authentication
 from muli.candidate_online import OnlineSettings
 from muli.candidate_policy import CandidateSettings
+from muli.capability_catalog import CapabilityCatalog, CapabilityCatalogError
 from muli.channel_application import ChannelApplication
 from muli.channel_history import CHANNEL_HISTORY_PAGE_LIMIT
 from muli.channels import ChannelError
@@ -486,6 +487,7 @@ def _create_app(
     app.state.web_voice = web_voice
     app.state.saved_answer_voice = saved_answer_voice
     plugins = PluginManager(runtime, app, config.path.resolve().parent / "plugins")
+    capabilities = CapabilityCatalog(runtime, plugins)
 
     def legacy_plugins_present() -> bool:
         if plugins.contexts or any(item["status"] == "failed" for item in plugins.inventory()):
@@ -935,6 +937,63 @@ def _create_app(
     @app.post("/api/team/{identifier}/stop")
     async def stop_agent(identifier: str) -> dict[str, Any]:
         return await runtime.team.stop(identifier)
+
+    @app.get(
+        "/api/capabilities",
+        description=(
+            "只读列出当前服务的完整轻量已注册工具目录（scope=registered_tools、complete=true），"
+            "不含 parameters；名称、用途和来源供客户端搜索筛选。enabled 仅反映已保存的停用设置，"
+            "目录不代表任一模型轮的会话、角色和权限裁剪结果。revision 是进程内唯一当前列表及对象"
+            "观察身份；同名对象替换、列表元数据、真实来源或停用设置变化会使旧详情失效。"
+            "不调用 schema/provider factory、模型、远程 RPC、插件 hook 或重载，不扫描配置目录。"
+            "成功 JSON envelope 受 limits.max_output_chars * 4 的 UTF-8 字节预算约束，"
+            "默认 96000 字节；超限整条拒绝，不返回部分目录。认证与同源规则保持，no-store；"
+            "维护状态仅精确放行本 GET 及 /api/capabilities/tools/{identifier} 的 GET。"
+        ),
+        responses={
+            413: {"description": "capability_payload_too_large：完整列表超过现有输出预算"},
+            422: {
+                "description": "capability_contract_invalid：非 JSON 元数据；"
+                "capability_contract_sensitive：真实注册名称或风险标签包含已发布代的已知凭据，整条拒绝"
+            },
+        },
+    )
+    async def capability_list() -> JSONResponse:
+        try:
+            return JSONResponse(capabilities.listing())
+        except CapabilityCatalogError as error:
+            raise HTTPException(error.status_code, {"code": error.code}) from None
+
+    @app.get(
+        "/api/capabilities/tools/{identifier}",
+        description=(
+            "只读展开 scope=registered_tools 的一个工具，revision 必须来自当前完整列表。"
+            "返回真实已注册 Tool.parameters 的完整 JSON，保留 required、enum、嵌套及 $ref，"
+            "不调用可覆盖的 schema 方法、provider factory、handler、模型、RPC、插件 hook 或重载。"
+            "revision 仅标识进程内当前列表和对象；同名替换使旧详情 409，不保存历史契约。"
+            "同一对象的参数就地更新时读取当前数据，不承诺旧参数回放或本轮可执行权限。"
+            "整个成功 JSON envelope 受 limits.max_output_chars * 4 UTF-8 字节预算限制，"
+            "默认 96000 字节。超限 413，非法 JSON/非有限数/循环 422；参数包含已发布 MCP 代"
+            "已知凭据时整体 422，不删字段、不截 JSON、不把脱敏内容称为原契约。"
+            "no-store；维护时仅精确放行单段非空 identifier 的本 GET，不放行其他子路径或写请求。"
+        ),
+        responses={
+            404: {"description": "capability_not_found：当前 revision 内没有该不透明工具 id"},
+            409: {"description": "capability_catalog_stale：观察已变化，需刷新完整目录"},
+            413: {"description": "capability_payload_too_large：完整契约超过现有 UTF-8 字节预算"},
+            422: {
+                "description": "revision 缺失或查询参数无效；capability_contract_invalid："
+                "契约不是完整合法 JSON；capability_contract_sensitive：含已知凭据，完整契约被拒绝"
+            },
+        },
+    )
+    async def capability_detail(
+        identifier: str, revision: Annotated[str, Query(min_length=1, max_length=200)]
+    ) -> JSONResponse:
+        try:
+            return JSONResponse(capabilities.detail(identifier, revision))
+        except CapabilityCatalogError as error:
+            raise HTTPException(error.status_code, {"code": error.code}) from None
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:

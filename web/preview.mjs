@@ -264,6 +264,15 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     return { items: selected, has_more: more, [key]: more ? selected.at(-1).id : null };
   };
   const status = () => ({ configured: true, preview: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+  let capabilityObservation = null;
+  const capabilityDirectory = () => {
+    const tools = status().tools.map((tool) => ({ ...tool, requires_approval: false, origin: { kind: "unrecorded" } }));
+    const signature = JSON.stringify(tools);
+    if (capabilityObservation?.signature !== signature) capabilityObservation = { signature, revision: identifier("catalog"), items: tools.map((tool) => ({ id: identifier("capability"), ...tool })) };
+    return { scope: "registered_tools", revision: capabilityObservation.revision, complete: true, items: capabilityObservation.items, preview: true };
+  };
+  const capabilityResponse = (value) => encoder.encode(JSON.stringify(value)).byteLength <= state.settings.limits.max_output_chars * 4
+    ? response(value) : failure({ code: "capability_payload_too_large" }, 413);
 
   // This local demo backend reads only its bounded in-memory text blobs. It does
   // not pretend to extract PDF/DOCX or use these digests to authorize real work.
@@ -305,6 +314,17 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     if (["/auth/login", "/auth/logout"].includes(path) && method === "POST") return response({ authenticated: true, preview: true });
     if (path === "/ui/event-position") return response({ after: String(state.eventId) });
     if (path === "/status" && method === "GET") return response(status());
+    if (path === "/capabilities" && method === "GET") return capabilityResponse(capabilityDirectory());
+    const capabilityMatch = /^\/capabilities\/tools\/([^/]+)$/u.exec(path);
+    if (capabilityMatch && method === "GET") {
+      const catalog = capabilityDirectory(), revision = url.searchParams.get("revision");
+      if (!revision) return failure({ code: "capability_revision_required" }, 422);
+      if (revision !== catalog.revision) return failure({ code: "capability_catalog_stale" }, 409);
+      const tool = catalog.items.find((item) => item.id === decodeURIComponent(capabilityMatch[1]));
+      if (!tool) return failure({ code: "capability_not_found" }, 404);
+      // These are explicitly simulated contracts, without a real tool executor.
+      return capabilityResponse({ scope: catalog.scope, revision, tool: { ...tool, parameters: { type: "object", properties: {}, additionalProperties: true } }, preview: true });
+    }
     if (path === "/extensions" && method === "GET") return response(state.extensions);
     if (path === "/extensions/reload" && method === "POST") {
       if (state.extensions.phase !== "queued") {

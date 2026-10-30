@@ -48,6 +48,7 @@ function harness({ initial = management(), respond } = {}) {
     settingsResourceError: () => null, settingsJSON: () => null, switchField: () => null, field: () => null,
     formatFullDate: String, renderChrome() {}, showLogin() {},
     syncChannelDeliveryScope() {},
+    capabilityCatalog: null, releaseCapabilityCatalog() {},
     renderOtherView: () => context.refreshManagementRecoveryView(),
   };
   runInNewContext([

@@ -69,6 +69,7 @@ let connection = null;
 let sessionRequestVersion = 0;
 let viewRequestVersion = 0;
 let extensionReload = null;
+let capabilityCatalog = null;
 let queuedRender = false;
 let messageNodes = new Map();
 let dialogSubmit = null;
@@ -225,6 +226,7 @@ function invalidateConnection() {
   releaseAttachmentCollection();
   releaseMemoryWatches();
   closeChannelDeliveryDialog();
+  releaseCapabilityCatalog();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -1151,6 +1153,7 @@ function emptyState(iconName, title, description) {
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   if (channelDeliveryDialog && (view !== "settings" || state.settingsTab !== "channels")) closeChannelDeliveryDialog();
+  if (view !== "settings") releaseCapabilityCatalog();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
   if (view !== "settings") state.voiceSetupController?.release();
@@ -1244,6 +1247,7 @@ async function switchView(view, owner = connection) {
 
 function renderOtherView() {
   syncChannelDeliveryScope();
+  syncCapabilityCatalogScope();
   const root = $("#other-view");
   if (state.viewLoading) { root.replaceChildren(element("div", { class: "view-content" }, emptyState("refresh", "正在读取…"))); return; }
   if (state.viewError) {
@@ -1264,6 +1268,7 @@ function renderOtherView() {
       }
       const panel = $(".settings-content", layout);
       const changedTab = panel.dataset.settingsTab !== state.settingsTab;
+      if (panel.dataset.settingsTab === "tools" && capabilityCatalog?.draft === state.settingsDraft) collectSettingsForm();
       panel.replaceChildren(renderSettingsPanel());
       panel.dataset.settingsTab = state.settingsTab;
       if (changedTab) animatePanel(panel);
@@ -1275,6 +1280,7 @@ function renderOtherView() {
   const nav = $(".settings-nav", root);
   const active = $(".settings-nav .active", root);
   if (nav && active && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, active.offsetLeft - nav.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2);
+  if (state.view === "settings" && state.settingsTab === "tools" && capabilityCatalog && !capabilityCatalog.requested) void loadCapabilityCatalog(capabilityCatalog);
 }
 
 function animatePanel(node) {
@@ -1287,6 +1293,7 @@ function switchSettingsTab(tab) {
   if (!SETTINGS_GROUPS.some(([key]) => key === tab) || tab === state.settingsTab) return;
   closeChannelDeliveryDialog();
   collectSettingsForm();
+  releaseCapabilityCatalog();
   state.settingsTab = tab;
   renderOtherView();
   $("#other-view").scrollTop = 0;
@@ -3688,15 +3695,184 @@ function renderToolSettings() {
   const config = state.settingsDraft;
   const search = config.search ?? {};
   const computer = config.computer ?? {};
-  const list = element("div");
-  for (const tool of state.status?.tools ?? []) {
-    list.append(element("div", { class: "tool-permission-row" }, element("div", {}, element("h4", { text: tool.name }), element("p", { text: tool.description || (tool.enabled === false ? "未启用" : "已启用") })), element("span", { class: "row-tag", text: tool.risk || "工具" }), element("input", { type: "checkbox", class: "switch", name: `tool-enabled:${tool.name}`, checked: !(config.disabled_tools ?? []).includes(tool.name), role: "switch", "aria-label": `启用 ${tool.name}` })));
-  }
   return element("div", {},
     settingsSection("执行权限", selectField("默认模式", "default_mode", config.default_mode ?? "auto", Object.entries(MODES).map(([key, mode]) => [key, `${mode.label} · ${mode.description}`])), field("允许的工作目录", "workspace_roots", (config.workspace_roots ?? []).join("\n"), { type: "textarea", rows: 3, format: "lines", hint: "每行一个目录。" })),
     settingsSection("联网搜索", selectField("服务", "search.provider", search.provider ?? "searxng", [["searxng", "SearXNG"], ["brave", "Brave Search"], ["tavily", "Tavily"]]), field("服务地址", "search.base_url", search.base_url ?? "", { type: "url" }), element("div", { class: "field-row" }, field("API Key 环境变量", "search.api_key_env", search.api_key_env ?? ""), field("结果数量", "search.max_results", search.max_results ?? "", { type: "number", min: 1, max: 20 })), field("API Key", "search.api_key", search.api_key ?? "", { type: "password", placeholder: search.api_key_set ? "已配置，留空保留" : "可选" }), search.api_key_set && switchField("清除已存 API Key", "search.clear_api_key", false)),
     settingsSection("电脑操作", switchField("启用电脑操作", "computer.enabled", computer.enabled), field("后端", "computer.backend", computer.backend ?? "auto"), field("Linux Python 路径", "computer.python_path", computer.python_path ?? "", { placeholder: "使用默认运行环境" }), element("p", { text: state.status?.computer?.available ? "电脑操作已就绪。" : state.status?.computer?.reason || "电脑操作暂不可用。" })),
-    list.children.length ? settingsSection("已注册工具", list) : null);
+    renderCapabilityCatalog());
+}
+
+function releaseCapabilityCatalog() {
+  const slot = capabilityCatalog;
+  capabilityCatalog = null;
+  slot?.controller?.abort();
+  slot?.detailController?.abort();
+}
+
+function capabilityCatalogCurrent(slot) {
+  return !!slot && capabilityCatalog === slot && connectionCurrent(slot.owner) && state.auth.authenticated
+    && state.view === "settings" && state.settingsTab === "tools" && slot.draft === state.settingsDraft && slot.viewVersion === viewRequestVersion;
+}
+
+function syncCapabilityCatalogScope() {
+  if (capabilityCatalog && !capabilityCatalogCurrent(capabilityCatalog)) releaseCapabilityCatalog();
+}
+
+function clearCapabilityTool(slot) {
+  slot.detailController?.abort(); slot.detailController = null;
+  slot.detailVersion += 1; slot.selected = null; slot.detail = null; slot.detailLoading = false; slot.detailError = "";
+}
+
+function capabilityOriginLabel(origin, remote = true) {
+  if (origin.kind === "mcp") return `MCP · ${origin.server}${remote ? ` · ${origin.remote_name}` : ""}`;
+  if (origin.kind === "mcp_interface") return "MCP 接口";
+  if (origin.kind === "plugin") return `插件 · ${origin.plugin_id}`;
+  return "来源未记录 · 本地注册集合";
+}
+
+function capabilityOriginKey(origin) {
+  return JSON.stringify([origin.kind, origin.kind === "mcp" ? origin.server : origin.kind === "plugin" ? origin.plugin_id : null]);
+}
+
+function validCapabilityTool(tool) {
+  if (!tool || typeof tool.id !== "string" || !tool.id || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string"
+    || typeof tool.risk !== "string" || typeof tool.requires_approval !== "boolean" || typeof tool.enabled !== "boolean") return false;
+  const origin = tool.origin;
+  return !!origin && (origin.kind === "unrecorded" || origin.kind === "mcp_interface"
+    || origin.kind === "mcp" && typeof origin.server === "string" && typeof origin.remote_name === "string"
+    || origin.kind === "plugin" && typeof origin.plugin_id === "string");
+}
+
+function capabilityReadError(error, detail = false) {
+  const code = error.details?.detail?.code;
+  if (code === "capability_catalog_stale" || error.status === 409) return "工具目录已变化，请刷新目录后重新查看参数。";
+  if (code === "capability_contract_sensitive") return detail ? "参数契约包含敏感值，无法完整显示。" : "工具目录包含敏感值，无法完整显示。";
+  if (code === "capability_contract_invalid") return "工具契约不是可完整显示的 JSON，未显示参数。";
+  if (code === "capability_payload_too_large" || error.status === 413) return detail ? "参数契约超过当前显示限额，无法完整显示。" : "工具目录超过当前显示限额，未显示不完整列表。";
+  if (code === "capability_not_found" || error.status === 404 && detail) return "该工具详情已不可用，请刷新目录。";
+  return detail ? "暂时无法读取完整参数，请重试或刷新目录。" : "暂时无法读取工具目录，请刷新目录重试。";
+}
+
+function capabilityDraftLabel(tool) {
+  const enabled = !(state.settingsDraft.disabled_tools ?? []).includes(tool.name);
+  return `草稿：${enabled ? "启用" : "停用"}${enabled !== tool.enabled ? "（尚未保存）" : ""}`;
+}
+
+function renderCapabilityCatalog() {
+  syncCapabilityCatalogScope();
+  const slot = capabilityCatalog ??= { owner: connection, draft: state.settingsDraft, viewVersion: viewRequestVersion, requested: false, loading: false, version: 0,
+    controller: null, page: null, error: "", query: "", source: "", selected: null, detail: null, detailError: "", detailLoading: false, detailController: null, detailVersion: 0, root: null };
+  const search = element("input", { type: "search", value: slot.query, placeholder: "搜索名称、用途或来源", "aria-label": "搜索工具" });
+  const source = element("select", { "aria-label": "工具来源" });
+  const refresh = actionButton("刷新目录", "refresh-capability-catalog", "text-button", "refresh");
+  const root = settingsSection("已注册工具",
+    element("p", { text: `${state.status?.preview ? "这是当前页面内存中的模拟工具目录。" : "这里只展示当前服务已注册的工具。"}启用状态不代表某一轮模型获准调用；开关修改草稿，保存设置后生效。` }),
+    element("div", { class: "field-row" }, element("label", { class: "field" }, element("span", { text: "搜索工具" }), search), element("label", { class: "field" }, element("span", { text: "工具来源" }), source)),
+    element("div", { class: "capability-catalog-actions" }, refresh,
+      element("button", { type: "button", class: "text-button", text: "MCP 与 Skills 设置", dataset: { settingsTab: "connections" } }),
+      element("button", { type: "button", class: "text-button", text: "本地插件设置", dataset: { settingsTab: "maintenance" } })),
+    element("p", { id: "capability-catalog-status", role: "status", "aria-live": "polite" }),
+    element("div", { id: "capability-catalog-results" }), element("div", { id: "capability-catalog-detail" }));
+  slot.root = root;
+  search.addEventListener("input", () => {
+    if (!capabilityCatalogCurrent(slot) || slot.root !== root) return;
+    collectSettingsForm(); slot.query = search.value; clearCapabilityTool(slot); updateCapabilityCatalog(slot);
+  });
+  source.addEventListener("change", () => {
+    if (!capabilityCatalogCurrent(slot) || slot.root !== root) return;
+    collectSettingsForm(); slot.source = source.value; clearCapabilityTool(slot); updateCapabilityCatalog(slot);
+  });
+  updateCapabilityOrigins(slot);
+  updateCapabilityCatalog(slot, false);
+  return root;
+}
+
+function updateCapabilityOrigins(slot) {
+  const source = $('select[aria-label="工具来源"]', slot.root);
+  const origins = new Map((slot.page?.items ?? []).map((tool) => [capabilityOriginKey(tool.origin), capabilityOriginLabel(tool.origin, false)]));
+  if (slot.source && !origins.has(slot.source)) slot.source = "";
+  source.replaceChildren(element("option", { value: "", text: "全部来源" }), ...[...origins].map(([value, text]) => element("option", { value, text })));
+  source.value = slot.source;
+}
+
+function updateCapabilityCatalog(slot, collect = true) {
+  if (!capabilityCatalogCurrent(slot) || !slot.root) return;
+  if (collect) collectSettingsForm();
+  const refresh = $('[data-action="refresh-capability-catalog"]', slot.root);
+  refresh.disabled = slot.loading;
+  const status = $("#capability-catalog-status", slot.root);
+  const query = slot.query.trim().toLocaleLowerCase();
+  const items = (slot.page?.items ?? []).filter((tool) => (!slot.source || capabilityOriginKey(tool.origin) === slot.source)
+    && (!query || `${tool.name}\n${tool.description}\n${capabilityOriginLabel(tool.origin)}`.toLocaleLowerCase().includes(query)));
+  status.textContent = slot.loading ? "正在读取已注册工具…" : slot.error || (slot.page ? `显示 ${items.length} / ${slot.page.items.length} 个已注册工具。` : "尚未读取工具目录。");
+  status.className = slot.error ? "form-error" : "settings-role-hint";
+  const list = $("#capability-catalog-results", slot.root);
+  list.replaceChildren();
+  if (slot.page && !items.length) list.append(element("p", { class: "settings-role-hint", text: slot.page.items.length ? "没有匹配的工具，请调整搜索或来源筛选。" : "当前服务尚未注册工具。" }));
+  for (const tool of items) {
+    const draft = element("p", { text: capabilityDraftLabel(tool) });
+    const toggle = element("input", { type: "checkbox", class: "switch", name: `tool-enabled:${tool.name}`, checked: !(state.settingsDraft.disabled_tools ?? []).includes(tool.name), role: "switch", "aria-label": `启用 ${tool.name}` });
+    toggle.addEventListener("change", () => { if (capabilityCatalogCurrent(slot) && slot.root.contains(toggle)) { collectSettingsForm(); draft.textContent = capabilityDraftLabel(tool); } });
+    const view = actionButton("查看参数", "view-capability-tool", "text-button", undefined, { capabilityId: tool.id });
+    list.append(element("div", { class: "tool-permission-row" }, element("div", {}, element("h4", { text: tool.name }), element("p", { text: tool.description }),
+      element("p", { text: capabilityOriginLabel(tool.origin) }), element("p", { text: `已保存：${tool.enabled ? "启用" : "停用"}` }), draft,
+      element("p", { text: tool.requires_approval ? "调用需要审批" : "仍受当前执行模式与权限限制" }), view), element("span", { class: "row-tag", text: tool.risk || "工具" }), toggle));
+  }
+  const detail = $("#capability-catalog-detail", slot.root);
+  detail.replaceChildren();
+  if (slot.selected) {
+    detail.append(element("h4", { text: slot.selected.name }), actionButton("关闭参数", "close-capability-tool", "text-button"));
+    if (slot.detailLoading) detail.append(element("p", { role: "status", text: "正在读取完整参数…" }));
+    else if (slot.detailError) detail.append(element("p", { class: "form-error", role: "status", text: slot.detailError }));
+    else if (slot.detail) detail.append(element("details", { class: "advanced-settings", open: true }, element("summary", { text: "完整参数 JSON" }), element("pre", { class: "service-log", text: pretty(slot.detail.parameters) })));
+  }
+}
+
+async function loadCapabilityCatalog(slot = capabilityCatalog) {
+  if (!capabilityCatalogCurrent(slot)) return;
+  collectSettingsForm();
+  slot.controller?.abort(); clearCapabilityTool(slot);
+  const controller = new AbortController(), version = ++slot.version;
+  slot.controller = controller; slot.requested = true; slot.loading = true; slot.error = ""; slot.page = null;
+  const current = () => capabilityCatalogCurrent(slot) && slot.version === version;
+  updateCapabilityCatalog(slot);
+  try {
+    const page = await ownedRequest("/capabilities", { cache: "no-store", signal: controller.signal }, slot.owner, current);
+    if (!current()) return;
+    if (page?.scope !== "registered_tools" || typeof page.revision !== "string" || !page.revision || page.complete !== true || !Array.isArray(page.items)
+      || !page.items.every(validCapabilityTool) || new Set(page.items.map((tool) => tool.id)).size !== page.items.length) throw new Error("工具目录响应无效");
+    collectSettingsForm(); slot.page = page;
+    updateCapabilityOrigins(slot);
+  } catch (error) {
+    if (current() && error.name !== "AbortError") { collectSettingsForm(); slot.page = null; slot.error = capabilityReadError(error); }
+  } finally {
+    if (current()) { slot.loading = false; slot.controller = null; updateCapabilityCatalog(slot); }
+  }
+}
+
+async function loadCapabilityTool(id) {
+  const slot = capabilityCatalog, selected = slot?.page?.items.find((tool) => tool.id === id);
+  if (!capabilityCatalogCurrent(slot) || !selected || slot.loading) return;
+  collectSettingsForm(); clearCapabilityTool(slot);
+  const controller = new AbortController(), version = slot.detailVersion, revision = slot.page.revision;
+  slot.selected = selected; slot.detailController = controller; slot.detailLoading = true;
+  const current = () => capabilityCatalogCurrent(slot) && slot.detailVersion === version && slot.selected === selected && slot.page?.revision === revision;
+  updateCapabilityCatalog(slot);
+  try {
+    const page = await ownedRequest(`/capabilities/tools/${encodeURIComponent(selected.id)}?${new URLSearchParams({ revision })}`, { cache: "no-store", signal: controller.signal }, slot.owner, current);
+    if (!current()) return;
+    if (page?.scope !== "registered_tools" || page.revision !== revision || !validCapabilityTool(page.tool) || page.tool.id !== selected.id || page.tool.name !== selected.name
+      || !page.tool.parameters || typeof page.tool.parameters !== "object" || Array.isArray(page.tool.parameters)) throw new Error("工具参数响应无效");
+    collectSettingsForm(); slot.detail = page.tool;
+  } catch (error) {
+    if (current() && error.name !== "AbortError") {
+      collectSettingsForm(); slot.detailError = capabilityReadError(error, true);
+      if (error.status === 409) { slot.error = slot.detailError; slot.page = null; clearCapabilityTool(slot); }
+    }
+  } finally {
+    if (current()) { slot.detailLoading = false; slot.detailController = null; updateCapabilityCatalog(slot); }
+    else if (capabilityCatalogCurrent(slot) && !slot.page) updateCapabilityCatalog(slot);
+  }
 }
 
 function renderConnectionSettings() {
@@ -3877,6 +4053,7 @@ async function saveSettings(event) {
     const results = await Promise.allSettled([request("/settings"), refreshSettingsResources()]);
     if (results[0].status === "fulfilled") { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); }
     if (results[1].status === "fulfilled" && !state.activeSession) state.mode = state.status?.mode || "auto";
+    releaseCapabilityCatalog();
     state.settingsSaveStatus = "已保存"; renderOtherView(); renderChrome(); renderComposer(); toast("设置已保存");
   } catch (error) { displaySettingsError(error); }
   finally { submit.disabled = false; }
@@ -4098,9 +4275,21 @@ async function handleAction(action, button) {
   if (action === "refresh-service") await refreshService();
   if (action === "reload-extensions") await requestExtensions(true);
   if (action === "recover-management-current") await recoverCurrentManagement();
+  if (["refresh-capability-catalog", "view-capability-tool", "close-capability-tool"].includes(action)) {
+    const slot = capabilityCatalog;
+    if (!capabilityCatalogCurrent(slot) || !slot.root.contains(button)) return;
+    if (action === "refresh-capability-catalog") return loadCapabilityCatalog(slot);
+    if (action === "view-capability-tool") return loadCapabilityTool(button.dataset.capabilityId);
+    collectSettingsForm(); clearCapabilityTool(slot); updateCapabilityCatalog(slot); return;
+  }
   if (action === "refresh-settings-status") {
     if (state.view === "settings" && state.settingsTab === "connections") return requestExtensions(false);
-    collectSettingsForm(); button.disabled = true; try { await refreshSettingsResources(); renderOtherView(); renderChrome(); } finally { button.disabled = false; }
+    const catalog = capabilityCatalog;
+    collectSettingsForm(); button.disabled = true; try {
+      await refreshSettingsResources();
+      if (catalog && capabilityCatalog === catalog) { if (capabilityCatalogCurrent(catalog)) collectSettingsForm(); releaseCapabilityCatalog(); }
+      renderOtherView(); renderChrome();
+    } finally { button.disabled = false; }
   }
   if (action === "retry-delivery") {
     const delivery = state.channels?.deliveries?.find((item) => item.id === button.dataset.id);

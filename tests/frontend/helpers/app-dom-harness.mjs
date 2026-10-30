@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { attachmentKind, attachmentURL, formatBytes } from "../../../web/attachments.mjs";
-import { CHANNELS, capabilityLabel } from "../../../web/management.mjs";
-import { setPath, mergeSettingsExtras, settingsExtras, SETTINGS_GROUPS } from "../../../web/settings.mjs";
+import { CHANNELS, capabilityLabel, loadSettingsResources, managementRecoveryView, updateLabel } from "../../../web/management.mjs";
+import { setPath, mergeSettingsExtras, settingsExtras, settingsPatch, changesListener, SETTINGS_GROUPS } from "../../../web/settings.mjs";
 import { MODES, applyEvent, createSessionState, isRunning, parseJSONField } from "../../../web/state.mjs";
 import { mergeTranscript } from "../../../web/voice-input.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../../web/voice-setup.mjs";
@@ -26,6 +26,7 @@ export class DOMElement {
     this.tagName = tag.toUpperCase(); this.document = document; this.childNodes = []; this.parentNode = null;
     this.dataset = {}; this.attributes = {}; this.events = {}; this.className = "";
     this._value = ""; this.name = ""; this.type = ""; this.hidden = false; this.disabled = false; this.open = false; this.style = {};
+    if (this.tagName === "INPUT") this.checked = false;
     this.classList = { toggle() {}, add() {}, remove() {} };
   }
   get children() { return this.childNodes.filter((node) => node instanceof DOMElement); }
@@ -123,13 +124,13 @@ export function harness(handler = async () => { throw new Error("unexpected requ
   const context = {
     document, Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
     window: { addEventListener: (name, callback) => { windowEvents[name] = callback; } },
-    AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,
+    AbortController, TextEncoder, URLSearchParams, structuredClone, console, queueMicrotask,
     crypto: { randomUUID: () => `memory-draft-${++nextMessage}` },
     setTimeout: () => 0, clearTimeout() {},
-    MODES, applyEvent, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript, setPath, mergeSettingsExtras, parseJSONField,
+    MODES, applyEvent, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript, setPath, mergeSettingsExtras, settingsPatch, changesListener, loadSettingsResources, parseJSONField,
     createSessionState: composer ? createSessionState : () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
     uploadFile() {}, transcribeAttachment() {},
-    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, settingsExtras, SETTINGS_GROUPS, restoreTeamView() {}, sessionStorage: {},
+    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, managementRecoveryView, updateLabel, settingsExtras, SETTINGS_GROUPS, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
@@ -146,6 +147,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     activateConnection();
     globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, renderComposerAttachments,
       activateConnection,
+      get capabilityCatalogSlot() { return capabilityCatalog; },
       watchPending(id) { return memoryWatchPending.has(id); },
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       useUploadViews() { renderOtherView = () => { if (state.view === "uploads") realOtherView(); }; },

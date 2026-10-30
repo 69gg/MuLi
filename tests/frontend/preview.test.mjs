@@ -221,6 +221,30 @@ async function json(backend, path, method = "GET", body) {
   return { status: result.status, body: await result.json() };
 }
 
+test("preview registered-tool catalog uses opaque observations and complete simulated contracts", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  const before = structuredClone({ messages: backend.state.messages, runs: backend.state.runs, events: backend.state.events });
+  const result = await json(backend, "/capabilities");
+  assert.equal(result.status, 200); assert.equal(result.body.complete, true); assert.equal(result.body.scope, "registered_tools"); assert.equal(result.body.preview, true);
+  const catalog = result.body, tool = catalog.items[0];
+  assert.ok(tool.id); assert.notEqual(tool.id, tool.name); assert.deepEqual(tool.origin, { kind: "unrecorded" });
+  assert.equal(Object.hasOwn(tool, "parameters"), false);
+  const read = () => json(backend, `/capabilities/tools/${encodeURIComponent(tool.id)}?${new URLSearchParams({ revision: catalog.revision })}`);
+  const contract = await read();
+  assert.equal(contract.status, 200); assert.equal(contract.body.revision, catalog.revision); assert.equal(contract.body.tool.id, tool.id);
+  assert.deepEqual(contract.body.tool.parameters, { type: "object", properties: {}, additionalProperties: true });
+  assert.equal((await json(backend, `/capabilities/tools/${encodeURIComponent(tool.id)}`)).status, 422);
+  assert.equal((await json(backend, `/capabilities/tools/missing?${new URLSearchParams({ revision: catalog.revision })}`)).status, 404);
+  assert.deepEqual(backend.state.messages, before.messages); assert.deepEqual(backend.state.runs, before.runs); assert.deepEqual(backend.state.events, before.events);
+  await json(backend, "/settings", "PATCH", { disabled_tools: [tool.name] });
+  const stale = await read(); assert.equal(stale.status, 409); assert.equal(stale.body.detail.code, "capability_catalog_stale");
+  const fresh = await json(backend, "/capabilities");
+  assert.notEqual(fresh.body.revision, catalog.revision); assert.equal(fresh.body.items.find((item) => item.name === tool.name).enabled, false);
+  backend.state.settings.limits.max_output_chars = 1;
+  const rejected = await json(backend, "/capabilities");
+  assert.equal(rejected.status, 413); assert.equal(rejected.body.detail.code, "capability_payload_too_large"); assert.equal(Object.hasOwn(rejected.body, "items"), false);
+});
+
 test("preview calendar schedule paging and cancellation preserve the exact kind", async (t) => {
   const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
   const base = { id: "same-id", name: "合成定时委托", enabled: true, due_at: 10000 };
