@@ -13,7 +13,9 @@ from muli.channel_history import CHANNEL_HISTORY_PAGE_LIMIT, ChannelHistory
 from muli.channel_ingress_audit import ChannelIngressAudit
 from muli.channels import ChannelError, ChannelManager, ChannelProfile, ChannelsConfig
 from muli.channels.types import NAMES, IncomingMessage
+from muli.config import ChannelProfile as ConfigChannelProfile
 from muli.context import context_size
+from muli.evidence import EvidenceError
 from muli.mobile_approvals import is_approval_command
 from muli.mobile_task_control import MobileControlRejected, MobileControlSource
 from muli.permissions import ApprovalNotice
@@ -132,11 +134,7 @@ class ChannelApplication:
             if current is None or current.get("name") not in NAMES:
                 raise ValueError("请明确选择已绑定的渠道")
             name = current["name"]
-        if name not in NAMES:
-            raise ValueError("未知的本地历史渠道")
-        profile = getattr(runtime.config.settings.channels, name)
-        if not profile.enabled:
-            raise PermissionError("渠道已停用，不能查询其私聊历史")
+        profile = self._history_profile(name)
         account = channel_account(name, profile)
         current_owner: str | None = None
         if current is not None and current.get("name") == name:
@@ -155,13 +153,7 @@ class ChannelApplication:
             except ValueError:
                 if "channel" not in args:
                     raise PermissionError("本轮渠道来源已失效，请明确选择当前绑定渠道") from None
-        owner = args.get("owner_id", current_owner)
-        if owner is None:
-            if len(profile.owner_ids) != 1:
-                raise ValueError("该渠道没有唯一主人，请明确提供已绑定的 owner_id")
-            owner = profile.owner_ids[0]
-        if not isinstance(owner, str) or owner not in profile.owner_ids:
-            raise PermissionError("只能查询当前渠道已绑定主人的点对点私聊")
+        owner = self._history_owner(profile, args.get("owner_id", current_owner))
         main_id = runtime.store.existing_main_session_id()
         if main_id is None:
             raise ValueError("主助手记录不存在")
@@ -231,6 +223,75 @@ class ChannelApplication:
             cursor=args.get("cursor"),
             limit=min(args.get("limit", 20), limits.max_search_results),
             max_output_chars=limits.max_output_chars,
+        )
+
+    def _history_profile(self, name: str) -> ConfigChannelProfile:
+        if name not in NAMES:
+            raise ValueError("未知的本地历史渠道")
+        profile: ConfigChannelProfile = getattr(self.runtime.config.settings.channels, name)
+        if not profile.enabled:
+            raise PermissionError("渠道已停用，不能查询其私聊历史")
+        return profile
+
+    @staticmethod
+    def _history_owner(profile: ConfigChannelProfile, owner: Any) -> str:
+        if owner is None:
+            if len(profile.owner_ids) != 1:
+                raise ValueError("该渠道没有唯一主人，请明确提供已绑定的 owner_id")
+            owner = profile.owner_ids[0]
+        if not isinstance(owner, str) or owner not in profile.owner_ids:
+            raise PermissionError("只能查询当前渠道已绑定主人的点对点私聊")
+        return owner
+
+    def _delivery_scope(self, name: str, owner_id: str) -> tuple[str, str, str, str]:
+        profile = self._history_profile(name)
+        owner = self._history_owner(profile, owner_id)
+        main_id = self.runtime.store.existing_main_session_id()
+        if main_id is None:
+            raise EvidenceError("evidence_not_found", "主助手记录不存在")
+        return name, channel_account(name, profile), owner, main_id
+
+    def delivery_history(
+        self, name: str, owner_id: str, *, cursor: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        """Read one current private outbox page under the caller's configuration lock."""
+        limits = self.runtime.config.settings.limits
+        result = ChannelHistory(self.runtime.store).read(
+            *self._delivery_scope(name, owner_id),
+            direction="outgoing",
+            cursor=cursor,
+            limit=min(limit, limits.max_search_results),
+            max_output_chars=limits.max_output_chars,
+        )
+        outgoing = result.pop("outgoing")
+        result.pop("incoming")
+        return {
+            **result,
+            **outgoing,
+            "items": [
+                {key: value for key, value in item.items() if key != "seq"}
+                for item in outgoing["items"]
+            ],
+        }
+
+    def delivery_content(
+        self,
+        name: str,
+        owner_id: str,
+        *,
+        delivery_id: str,
+        part: int = 0,
+        offset_bytes: int = 0,
+        revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Read an exact saved part; this does not enter the model tool boundary."""
+        return ChannelHistory(self.runtime.store).read_delivery(
+            *self._delivery_scope(name, owner_id),
+            delivery_id=delivery_id,
+            part=part,
+            offset_bytes=offset_bytes,
+            revision=revision,
+            max_output_chars=self.runtime.config.settings.limits.max_output_chars,
         )
 
     def _manager(self) -> ChannelManager:

@@ -85,6 +85,7 @@ function harness({ reduced = false, respond } = {}) {
     saveSettings() {},
     releaseAttachmentCollection() {},
     releaseAnswerSpeech() {},
+    channelDeliveryDialog: null, closeChannelDeliveryDialog() {}, syncChannelDeliveryScope() {},
   };
   const control = (name, value) => { const node = new Node("input"); node.name = name; node.value = value; return node; };
   Object.assign(context, {

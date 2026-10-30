@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { attachmentKind, attachmentURL, formatBytes } from "../../../web/attachments.mjs";
-import { CHANNELS } from "../../../web/management.mjs";
-import { MODES, applyEvent, createSessionState, isRunning } from "../../../web/state.mjs";
+import { CHANNELS, capabilityLabel } from "../../../web/management.mjs";
+import { setPath, mergeSettingsExtras, settingsExtras, SETTINGS_GROUPS } from "../../../web/settings.mjs";
+import { MODES, applyEvent, createSessionState, isRunning, parseJSONField } from "../../../web/state.mjs";
 import { mergeTranscript } from "../../../web/voice-input.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../../web/voice-setup.mjs";
 
@@ -125,10 +126,10 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,
     crypto: { randomUUID: () => `memory-draft-${++nextMessage}` },
     setTimeout: () => 0, clearTimeout() {},
-    MODES, applyEvent, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript,
+    MODES, applyEvent, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript, setPath, mergeSettingsExtras, parseJSONField,
     createSessionState: composer ? createSessionState : () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
     uploadFile() {}, transcribeAttachment() {},
-    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, restoreTeamView() {}, sessionStorage: {},
+    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, settingsExtras, SETTINGS_GROUPS, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
@@ -148,7 +149,9 @@ export function harness(handler = async () => { throw new Error("unexpected requ
       watchPending(id) { return memoryWatchPending.has(id); },
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       useUploadViews() { renderOtherView = () => { if (state.view === "uploads") realOtherView(); }; },
+      useSettingsViews() { renderOtherView = () => { if (state.view === "settings") realOtherView(); }; renderOtherView(); },
       stopEvents() { globalController?.abort(); },
+      get channelDeliverySlot() { return channelDeliveryDialog; },
       get slot() { return memoryDialog; }, get path() { return memoryPath; }, get catalog() { return memorySources; }, get watches() { return memoryWatches; }, get submit() { return dialogSubmit; } };
   `, context);
   const ui = context.ui; ui.state.view = "memories"; ui.state.auth.authenticated = true;

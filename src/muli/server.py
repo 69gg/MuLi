@@ -31,6 +31,7 @@ from muli.auth import COOKIE_NAME, Authentication
 from muli.candidate_online import OnlineSettings
 from muli.candidate_policy import CandidateSettings
 from muli.channel_application import ChannelApplication
+from muli.channel_history import CHANNEL_HISTORY_PAGE_LIMIT
 from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
 from muli.conversation import MAX_EVENT_ID_CHARS
@@ -1198,6 +1199,68 @@ def _create_app(
             **channel_application.status(),
             "deliveries": channel_application.manager.deliveries(),
         }
+
+    @app.get(
+        "/api/channels/deliveries",
+        description=(
+            "只读查询 MuLi 本地保存的当前绑定主人私聊发送记录。账号与主会话由当前配置确定；"
+            "游标不透明，目录不含正文或原始投递元数据，读取不会发送或重试。"
+        ),
+        responses={
+            400: {"description": "读取器拒绝无效游标、范围或输出预算"},
+            403: {"description": "渠道已停用或主人绑定已撤销"},
+            404: {"description": "不存在已保存的主会话"},
+            422: {"description": "查询参数缺失或未通过类型、边界校验"},
+        },
+    )
+    async def channel_deliveries(
+        channel: Annotated[str, Query(min_length=1)],
+        owner_id: Annotated[str, Query(min_length=1)],
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=CHANNEL_HISTORY_PAGE_LIMIT)] = 20,
+    ) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            try:
+                return channel_application.delivery_history(
+                    channel, owner_id, cursor=cursor, limit=limit
+                )
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
+
+    @app.get(
+        "/api/channels/deliveries/{identifier}/content",
+        description=(
+            "只读核查当前绑定主人私聊的准确发送分段。文本按 UTF-8 字节窗口返回，续读须携带"
+            "该分段 revision；附件分段只返回准确引用和空正文。平台确认不表示已读或已播放。"
+        ),
+        responses={
+            400: {"description": "读取器拒绝无效偏移、分段、范围或输出预算"},
+            403: {"description": "渠道已停用或主人绑定已撤销"},
+            404: {"description": "主会话、投递或分段不存在，或投递不属于当前私聊范围"},
+            409: {"description": "该分段正文已变化，需从字节偏移 0 重新读取"},
+            422: {"description": "查询参数缺失或未通过类型、边界校验"},
+        },
+    )
+    async def channel_delivery_content(
+        identifier: str,
+        channel: Annotated[str, Query(min_length=1)],
+        owner_id: Annotated[str, Query(min_length=1)],
+        part: Annotated[int, Query(ge=0)] = 0,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        revision: Annotated[str | None, Query(min_length=1)] = None,
+    ) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            try:
+                return channel_application.delivery_content(
+                    channel,
+                    owner_id,
+                    delivery_id=identifier,
+                    part=part,
+                    offset_bytes=offset_bytes,
+                    revision=revision,
+                )
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
 
     @app.post("/api/channels/{name}/webhook")
     async def channel_webhook(name: str, request: Request) -> dict[str, Any]:

@@ -72,6 +72,7 @@ function harness(items = pair()) {
     connection: { ready: true, position: "0" }, globalController: null,
     connectionCurrent: () => true, renderOtherView: () => {},
     releaseAnswerSpeech() {},
+    channelDeliveryDialog: null, channelDeliveryDialogCurrent: () => false,
     refreshApprovals: async () => {}, refreshNotifications: async () => {}, refreshSessions: async () => {},
     subscribe: (_path, _controller, options) => { globalEvent = options.onEvent; },
     FormData: class {

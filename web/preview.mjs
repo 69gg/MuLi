@@ -64,6 +64,7 @@ export function createPreviewState() {
     },
     previewLimits: { max_upload_bytes: 20971520, max_uploads: 20, max_items: 50, max_message_chars: 64000 },
     sessions: [main], messages: { [main.id]: [] }, runs: {}, approvals: [], events: [], eventId: 0,
+    channelDeliveries: [{ id: "preview-delivery", channel: "onebot", account_id: "preview-bot", owner_id: "7", state: "unknown", confirmed_parts: 1, created_at: now - 1800, parts: [{ text: "这是本页模拟保存的发送正文🙂。\n记录与平台确认状态仅用于演示，没有连接真实消息渠道。" }, { attachment_id: previewNotesUploadId }, { text: "这是尚未确认的后续模拟分段。" }] }],
     notifications: [
       { id: "notice-welcome", title: "欢迎来到沐璃", content: "这是可操作的前端预览。发一条消息，体验规划、工具轨迹、审批和流式回答；设置只保存在当前页面。", type: "info", read: false, created_at: now },
       { id: "notice-review", title: "示例周报已整理", content: "队友已完成资料整理与交叉复核，示例附件可在附件页下载。", type: "task", read: true, created_at: now - 3600 },
@@ -565,7 +566,49 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (["content", "download"].includes(parts[2]) && method === "GET") return state.files.has(id) ? new Response(state.files.get(id)) : failure("演示附件不存在。", 404);
     }
     if (path === "/media/transcribe" && method === "POST") return response({ text: "这是一段演示转写。你可以编辑文字，再决定是否发送。", preview: true });
-    if (path === "/channels" && method === "GET") return response({ channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: 0 }, deliveries: [], proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
+    if (parts[0] === "channels" && parts[1] === "deliveries" && method === "GET") {
+      const channel = url.searchParams.get("channel"), ownerId = url.searchParams.get("owner_id"), profile = state.settings.channels[channel];
+      if (!profile?.enabled || !profile.owner_ids?.includes(ownerId)) return failure("当前演示渠道或主人绑定已不可读取。", 403);
+      const header = { source: "local", coverage: "saved_by_muli", consistency: "live", channel, account_id: profile.account_id ?? "preview-bot", owner_id: ownerId, session_id: state.sessions[0].id, preview: true };
+      const records = state.channelDeliveries.filter((item) => item.channel === channel && item.account_id === header.account_id && item.owner_id === ownerId);
+      const metadata = (item) => ({ state: item.state, confirmed_parts: item.confirmed_parts, total_parts: item.parts.length, created_at: item.created_at });
+      if (parts.length === 2) {
+        const limit = Number(url.searchParams.get("limit") ?? 20), cursor = url.searchParams.get("cursor"), prefix = ["preview-deliveries", channel, header.account_id, ownerId, header.session_id];
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return failure("演示记录分页参数无效。", 422);
+        let start = 0;
+        if (cursor !== null) {
+          try {
+            const value = JSON.parse(cursor);
+            if (!Array.isArray(value) || value.length !== 6 || !prefix.every((field, index) => field === value[index]) || !Number.isSafeInteger(value[5]) || value[5] < 0) throw new Error("cursor");
+            start = value[5];
+          } catch { return failure("演示游标不属于当前渠道与主人。", 400); }
+        }
+        const selected = records.slice(start, start + limit).map((item) => ({ id: item.id, kind: "delivery", role: "assistant", ...metadata(item), attachment_ids: item.parts.flatMap((part) => part.attachment_id ? [part.attachment_id] : []) }));
+        const result = () => ({ ...header, items: selected, omitted: 0, next_cursor: start + selected.length < records.length ? JSON.stringify([...prefix, start + selected.length]) : null, has_more: start + selected.length < records.length });
+        while (selected.length && !collectionFits(result())) selected.pop();
+        if (!collectionFits(result()) || !selected.length && start < records.length) return failure("演示发送记录超过当前输出预算。", 400);
+        return response(result());
+      }
+      if (parts.length === 4 && parts[3] === "content") {
+        const item = records.find((record) => record.id === parts[2]), part = Number(url.searchParams.get("part") ?? 0), offset = Number(url.searchParams.get("offset_bytes") ?? 0);
+        if (!Number.isSafeInteger(part) || part < 0 || !Number.isSafeInteger(offset) || offset < 0) return failure("演示分段或字节位置无效。", 422);
+        if (!item || part >= item.parts.length) return failure("没有这个演示发送分段。", 404);
+        const selected = item.parts[part], attachmentIds = selected.attachment_id ? [selected.attachment_id] : [], raw = encoder.encode(selected.text ?? "");
+        const revision = `sha256:${await sha256(encoder.encode(JSON.stringify([item.id, part, selected.text ?? "", attachmentIds])))}`, requestedRevision = url.searchParams.get("revision");
+        if (requestedRevision !== null && requestedRevision !== revision) return failure("演示发送分段已经变化。", 409);
+        if (offset > raw.length || offset && !requestedRevision || raw[offset] >= 0x80 && raw[offset] <= 0xbf) return failure("演示发送正文位置无效。", 400);
+        const base = { ...header, delivery_id: item.id, part, ...metadata(item), attachment_ids: attachmentIds, revision, field: "content", offset_bytes: offset, total_bytes: raw.length };
+        let end = Math.min(raw.length, offset + state.settings.limits.max_output_chars), content = "", value;
+        for (; end >= offset; end--) {
+          try { content = new TextDecoder("utf-8", { fatal: true }).decode(raw.slice(offset, end)); } catch { continue; }
+          value = { ...base, content, length_bytes: end - offset, next_offset_bytes: end, has_more: end < raw.length };
+          if (collectionFits(value)) break;
+        }
+        if (end < offset || end === offset && end < raw.length) return failure("演示发送正文超过当前输出预算。", 400);
+        return response(value);
+      }
+    }
+    if (path === "/channels" && method === "GET") return response({ preview: true, channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: state.channelDeliveries.length }, deliveries: state.channelDeliveries.map((item) => ({ id: item.id, name: item.channel, target: item.owner_id, state: item.state, created_at: item.created_at })), proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
     if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, health: { state: "idle", code: null, occurrence_id: null }, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
     if (path === "/voice/setup" && method === "POST") {
       if (body.confirmed !== true) return failure("请确认本次模拟录音。", 400);

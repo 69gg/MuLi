@@ -110,6 +110,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/memory/status",
         "/api/memory/watches",
         "/api/channels",
+        "/api/channels/deliveries",
         "/api/approvals",
         "/api/notifications",
         "/api/reminders",
@@ -125,6 +126,13 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
     # These route families only read local Store/evidence/files. Capture, voice,
     # semantic queries, media/service probes and future APIs remain closed.
     parts = path.split("/")
+    if (
+        len(parts) == 6
+        and parts[2:4] == ["channels", "deliveries"]
+        and parts[4]
+        and parts[5] == "content"
+    ):
+        return True
     if len(parts) >= 4 and parts[2] == "sessions":
         return (
             len(parts) == 4

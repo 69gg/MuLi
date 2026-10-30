@@ -95,6 +95,9 @@ const memoryWatchPageSize = 20;
 let historyDialog = null;
 let dialogHistoryReturn = null;
 const historyPageSize = 50;
+let channelDeliveryDialog = null;
+let dialogChannelDeliveryReturn = null;
+const channelDeliveryPageSize = 20;
 let workflowActivity = null;
 const workflowStopping = new Set();
 const workflowPageSize = 50;
@@ -221,6 +224,7 @@ function invalidateConnection() {
   releaseAnswerSpeech();
   releaseAttachmentCollection();
   releaseMemoryWatches();
+  closeChannelDeliveryDialog();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -773,6 +777,10 @@ function startGlobalEvents(owner = connection) {
     if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog(taskDialog, owner);
     if (["memory.updated", "memory.forgotten"].includes(event.type)) { invalidateMemoryPath(); invalidateMemoryEvidence(event); }
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads(owner);
+    if (event.type === "channel.updated" && channelDeliveryDialogCurrent(channelDeliveryDialog)) {
+      channelDeliveryDialog.dirty = true;
+      if (channelDeliveryDialog.dirtyNotice) channelDeliveryDialog.dirtyNotice.hidden = false;
+    }
   } });
 }
 
@@ -1088,6 +1096,7 @@ function openDialog({ title, content, submitLabel = "保存", danger = false, re
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
+  releaseChannelDeliveryDialog(); dialogChannelDeliveryReturn = null;
   dialogMemoryReturn = returnMemoryId ? { id: returnMemoryId, trigger: returnMemoryTrigger, pathButton: returnMemoryTrigger?.dataset.memoryPathRef ? memoryPath?.button : null } : null;
   dialogUploadReturn = returnUploadTrigger ? { trigger: returnUploadTrigger, owner: connection } : null;
   const teamView = captureTeamView($("#other-view"));
@@ -1141,6 +1150,7 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  if (channelDeliveryDialog && (view !== "settings" || state.settingsTab !== "channels")) closeChannelDeliveryDialog();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
   if (view !== "settings") state.voiceSetupController?.release();
@@ -1233,6 +1243,7 @@ async function switchView(view, owner = connection) {
 }
 
 function renderOtherView() {
+  syncChannelDeliveryScope();
   const root = $("#other-view");
   if (state.viewLoading) { root.replaceChildren(element("div", { class: "view-content" }, emptyState("refresh", "正在读取…"))); return; }
   if (state.viewError) {
@@ -1274,6 +1285,7 @@ function animatePanel(node) {
 
 function switchSettingsTab(tab) {
   if (!SETTINGS_GROUPS.some(([key]) => key === tab) || tab === state.settingsTab) return;
+  closeChannelDeliveryDialog();
   collectSettingsForm();
   state.settingsTab = tab;
   renderOtherView();
@@ -3187,6 +3199,7 @@ async function refreshSettingsResources(owner = connection, current = () => true
     if (state.settingsStatusErrors.management) errors.management = state.settingsStatusErrors.management;
   }
   state.settingsStatusErrors = errors;
+  syncChannelDeliveryScope();
   if (canConfirm && managementCurrent && !attempt.pending && !Object.hasOwn(errors, "management")) attempt.confirmed = true;
 }
 
@@ -3298,10 +3311,207 @@ function deliveryLabel(value) {
 function renderDeliveries() {
   if (!state.channels) return null;
   const details = element("details", { class: "advanced-settings" }, element("summary", { text: "最近发送记录" }));
+  details.append(actionButton("查看发送内容", "channel-deliveries", "text-button field-top-space", "search"));
   const deliveries = state.channels.deliveries ?? [];
   if (!deliveries.length) details.append(element("p", { class: "settings-role-hint", text: "暂无发送记录。" }));
   for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown", "blocked"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
   return details;
+}
+
+function channelDeliveryScopes() {
+  if (state.settingsStatusErrors.channels || !state.mainSessionId) return [];
+  return CHANNELS.flatMap(([channel]) => {
+    const profile = state.settings?.channels?.[channel], status = state.channels?.channels?.[channel];
+    if (!profile?.enabled || status?.enabled !== true || typeof status.account_id !== "string" || !status.account_id || !Array.isArray(profile.owner_ids)) return [];
+    return [...new Set(profile.owner_ids)].filter((owner) => typeof owner === "string" && owner).map((ownerId) => ({ channel, ownerId, accountId: status.account_id, sessionId: state.mainSessionId, profile: JSON.stringify(profile) }));
+  });
+}
+
+function sameChannelDeliveryScope(left, right) {
+  return !!left && !!right && ["channel", "ownerId", "accountId", "sessionId", "profile"].every((key) => left[key] === right[key]);
+}
+
+function channelDeliveryDialogCurrent(slot) {
+  return !!slot && channelDeliveryDialog === slot && connectionCurrent(slot.owner) && state.auth.authenticated && state.view === "settings" && state.settingsTab === "channels"
+    && document.visibilityState !== "hidden" && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content
+    && (!slot.scope || channelDeliveryScopes().some((scope) => sameChannelDeliveryScope(scope, slot.scope)));
+}
+
+function releaseChannelDeliveryDialog() {
+  const slot = channelDeliveryDialog; channelDeliveryDialog = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.scope = null; slot.page = null; slot.bodyPage = null; slot.selected = null; slot.retry = null;
+  slot.starts = []; slot.offsets = []; slot.content.replaceChildren();
+}
+
+function closeChannelDeliveryDialog() {
+  if (!channelDeliveryDialog) return;
+  const owned = $("#dialog-content").firstElementChild === channelDeliveryDialog.content;
+  releaseChannelDeliveryDialog();
+  if (owned) $("#app-dialog").close();
+}
+
+function syncChannelDeliveryScope() {
+  if (channelDeliveryDialog && !channelDeliveryDialogCurrent(channelDeliveryDialog)) closeChannelDeliveryDialog();
+}
+
+function showChannelDeliveries(trigger) {
+  if (state.view !== "settings" || state.settingsTab !== "channels" || !connectionCurrent(connection) || !state.auth.authenticated) return;
+  const content = element("div", { class: "history-archive" });
+  openDialog({ title: "查看发送内容", content, readOnly: true });
+  const slot = channelDeliveryDialog = { owner: connection, content, scope: channelDeliveryScopes()[0] ?? null, controller: null, mode: "list", page: null, bodyPage: null, selected: null, cursor: null, starts: [null], offsets: [0], part: 0, offset: 0, revision: null, totalBytes: null, error: "", retry: null, dirty: false, focusAfterLoad: false, returnId: null };
+  dialogChannelDeliveryReturn = { owner: connection, trigger };
+  renderChannelDeliveryDialog(slot);
+  const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
+}
+
+function selectChannelDeliveryScope(slot, channel, ownerId = null) {
+  if (!channelDeliveryDialogCurrent(slot)) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.scope = channelDeliveryScopes().find((scope) => scope.channel === channel && (ownerId === null || scope.ownerId === ownerId)) ?? null;
+  slot.mode = "list"; slot.page = null; slot.bodyPage = null; slot.selected = null;
+  slot.cursor = null; slot.starts = [null]; slot.offsets = [0]; slot.part = 0; slot.offset = 0; slot.revision = null; slot.totalBytes = null;
+  slot.error = ""; slot.retry = null; slot.dirty = false;
+  renderChannelDeliveryDialog(slot);
+  $(`[name="${ownerId === null ? "delivery-channel" : "delivery-owner"}"]`, slot.content)?.focus({ preventScroll: true });
+}
+
+function channelDeliveryHeaderValid(page, scope) {
+  return page?.source === "local" && page.coverage === "saved_by_muli" && page.consistency === "live" && page.channel === scope.channel && page.owner_id === scope.ownerId && page.account_id === scope.accountId && page.session_id === scope.sessionId;
+}
+
+function channelDeliveryMetadataValid(item) {
+  return item && ["pending", "retry", "sending", "sent", "failed", "blocked", "unknown"].includes(item.state)
+    && Number.isSafeInteger(item.total_parts) && item.total_parts > 0 && Number.isSafeInteger(item.confirmed_parts) && item.confirmed_parts >= 0 && item.confirmed_parts <= item.total_parts
+    && typeof item.created_at === "number" && Number.isFinite(item.created_at) && item.created_at > 0
+    && Array.isArray(item.attachment_ids) && item.attachment_ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256);
+}
+
+function channelDeliveryDirectoryValid(page, scope, cursor) {
+  return channelDeliveryHeaderValid(page, scope) && Array.isArray(page.items) && page.items.length <= channelDeliveryPageSize
+    && page.items.every((item) => channelDeliveryMetadataValid(item) && item.kind === "delivery" && item.role === "assistant" && typeof item.id === "string" && item.id && !item.id.includes("\0"))
+    && new Set(page.items.map((item) => item.id)).size === page.items.length && Number.isSafeInteger(page.omitted) && page.omitted >= 0 && typeof page.has_more === "boolean"
+    && (page.has_more ? typeof page.next_cursor === "string" && !!page.next_cursor && page.next_cursor !== cursor : page.next_cursor === null);
+}
+
+async function loadChannelDeliveryPage(slot, cursor = null, starts = [null], returnId = null) {
+  if (!channelDeliveryDialogCurrent(slot) || !slot.scope) return;
+  slot.focusAfterLoad = slot.content.contains(document.activeElement);
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const scope = slot.scope;
+  const current = () => channelDeliveryDialogCurrent(slot) && slot.controller === controller && slot.scope === scope;
+  slot.mode = "list"; slot.page = null; slot.bodyPage = null; slot.selected = null; slot.error = "";
+  slot.retry = () => void loadChannelDeliveryPage(slot, cursor, starts, returnId);
+  slot.revision = null; slot.totalBytes = null; slot.offsets = [0];
+  renderChannelDeliveryDialog(slot);
+  try {
+    const query = new URLSearchParams({ channel: scope.channel, owner_id: scope.ownerId, limit: String(channelDeliveryPageSize) });
+    if (cursor !== null) query.set("cursor", cursor);
+    const page = await ownedRequest(`/channels/deliveries?${query}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    if (!channelDeliveryDirectoryValid(page, scope, cursor)) throw new Error("发送记录响应不一致，请重新读取。");
+    slot.page = page; slot.cursor = cursor; slot.starts = starts; slot.returnId = returnId; slot.dirty = false;
+  } catch (error) {
+    if (!current()) return;
+    slot.error = error.status === 403 ? "当前渠道或主人绑定已不可读取，请刷新渠道状态重新选择。" : error.status === 404 ? "当前主会话或发送记录已不可用。" : error.message;
+    if (error.status === 403) slot.retry = null;
+  } finally {
+    if (current()) { slot.controller = null; renderChannelDeliveryDialog(slot); }
+  }
+}
+
+function channelDeliveryContentValid(page, slot, part, offset, revision, totalBytes) {
+  return channelDeliveryHeaderValid(page, slot.scope) && channelDeliveryMetadataValid(page) && page.delivery_id === slot.selected.id && page.part === part && page.total_parts === slot.selected.total_parts
+    && typeof page.revision === "string" && !!page.revision && (revision === null || page.revision === revision) && page.field === "content" && typeof page.content === "string"
+    && [page.offset_bytes, page.total_bytes, page.length_bytes, page.next_offset_bytes].every((value) => Number.isSafeInteger(value) && value >= 0)
+    && page.offset_bytes === offset && (totalBytes === null || page.total_bytes === totalBytes) && page.length_bytes === new TextEncoder().encode(page.content).length
+    && page.next_offset_bytes === offset + page.length_bytes && page.next_offset_bytes <= page.total_bytes && typeof page.has_more === "boolean" && page.has_more === (page.next_offset_bytes < page.total_bytes)
+    && (!page.has_more || page.length_bytes > 0) && (!page.attachment_ids.length || page.total_bytes === 0);
+}
+
+async function selectChannelDelivery(slot, item) {
+  if (!channelDeliveryDialogCurrent(slot)) return;
+  slot.selected = item; slot.page = null;
+  await loadChannelDeliveryContent(slot, 0);
+}
+
+async function loadChannelDeliveryContent(slot, part, offset = 0, offsets = [0], revision = null, totalBytes = null) {
+  if (!channelDeliveryDialogCurrent(slot) || !slot.selected || !Number.isSafeInteger(part) || part < 0 || part >= slot.selected.total_parts) return;
+  slot.focusAfterLoad = slot.content.contains(document.activeElement);
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const scope = slot.scope, selected = slot.selected;
+  const current = () => channelDeliveryDialogCurrent(slot) && slot.controller === controller && slot.scope === scope && slot.selected === selected;
+  slot.mode = "body"; slot.bodyPage = null; slot.part = part; slot.offset = offset; slot.revision = revision; slot.totalBytes = totalBytes; slot.offsets = offsets; slot.error = "";
+  slot.retry = () => void loadChannelDeliveryContent(slot, part, offset, offsets, revision, totalBytes);
+  renderChannelDeliveryDialog(slot);
+  try {
+    const query = new URLSearchParams({ channel: scope.channel, owner_id: scope.ownerId, part: String(part), offset_bytes: String(offset) });
+    if (revision !== null) query.set("revision", revision);
+    const page = await ownedRequest(`/channels/deliveries/${encodeURIComponent(selected.id)}/content?${query}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    if (!channelDeliveryContentValid(page, slot, part, offset, revision, totalBytes)) throw new Error("分段正文响应不一致，请返回记录重新选择。");
+    slot.bodyPage = page; slot.revision = page.revision; slot.totalBytes = page.total_bytes;
+  } catch (error) {
+    if (!current()) return;
+    slot.error = error.status === 403 ? "当前渠道或主人绑定已不可读取，请刷新渠道状态重新选择。" : error.status === 404 ? "所选发送分段已不可用，请返回记录。" : error.status === 409 ? "所选发送分段已更新，请返回记录重新选择。" : error.message;
+    if ([403, 404, 409].includes(error.status)) { slot.retry = null; slot.offsets = [0]; slot.revision = null; slot.totalBytes = null; }
+  } finally {
+    if (current()) { slot.controller = null; renderChannelDeliveryDialog(slot); }
+  }
+}
+
+function channelDeliveryPartLabel(item, part) {
+  return part < item.confirmed_parts ? "平台已确认" : item.state === "unknown" && part === item.confirmed_parts ? "结果未知" : "尚未确认";
+}
+
+function renderChannelDeliveryAttachments(ids) {
+  return ids.map((id) => {
+    const file = state.uploads.find((entry) => entry.id === id);
+    return element("div", {}, element("p", { class: "history-note", text: `附件引用：${id}` }), file ? renderAttachment(file, { compact: true }) : element("p", { class: "history-note", text: "当前页面未载入此附件的元信息，可按准确引用核查。" }));
+  });
+}
+
+function renderChannelDeliveryDialog(slot) {
+  if (!channelDeliveryDialogCurrent(slot)) return;
+  const root = slot.content, focus = slot.focusAfterLoad && (root.contains(document.activeElement) || document.activeElement === document.body);
+  root.setAttribute("aria-busy", String(!!slot.controller)); root.replaceChildren();
+  if (slot.controller) $("#dialog-content").scrollTop = 0;
+  const scopes = channelDeliveryScopes(), channels = CHANNELS.filter(([name]) => scopes.some((scope) => scope.channel === name));
+  if (!slot.scope) { root.append(element("p", { role: "status", text: "请先应用一个已启用渠道和主人私聊绑定，再从这里核查发送记录。" })); return; }
+  const channel = selectField("消息渠道", "delivery-channel", slot.scope.channel, channels);
+  const owners = scopes.filter((scope) => scope.channel === slot.scope.channel).map((scope) => [scope.ownerId, scope.ownerId]);
+  const owner = selectField("主人私聊", "delivery-owner", slot.scope.ownerId, owners);
+  $("select", channel).addEventListener("change", (event) => selectChannelDeliveryScope(slot, event.target.value));
+  $("select", owner).addEventListener("change", (event) => selectChannelDeliveryScope(slot, slot.scope.channel, event.target.value));
+  root.append(element("div", { class: "field-row" }, channel, owner), element("p", { class: "history-note", text: `MuLi 本地保存的发送记录 · 账号 ${slot.scope.accountId} · 主人私聊 ${slot.scope.ownerId}。平台已确认不表示已读或已播放。` }));
+  if (state.channels?.preview === true) root.append(element("p", { class: "settings-notice", text: "当前显示本页模拟记录，没有连接或读取真实消息渠道。" }));
+  slot.dirtyNotice = element("p", { class: "settings-notice", role: "status", text: "渠道状态已有更新，可返回记录后手动刷新。", hidden: !slot.dirty }); root.append(slot.dirtyNotice);
+  if (slot.mode === "list") {
+    root.append(element("button", { type: "button", class: "text-button", text: slot.page ? "刷新记录" : "读取记录", onClick: () => void loadChannelDeliveryPage(slot) }));
+    if (slot.page) {
+      root.append(element("nav", { class: "history-navigation", "aria-label": "发送记录分页" }, element("button", { type: "button", class: "text-button", text: "上一页", disabled: slot.starts.length < 2, onClick: () => void loadChannelDeliveryPage(slot, slot.starts.at(-2), slot.starts.slice(0, -1)) }), element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.starts.length} 页 · ${slot.page.has_more ? "尚有更早记录" : "本次查询已到末页"}` }), element("button", { type: "button", class: "text-button", text: "下一页", disabled: !slot.page.has_more, onClick: () => void loadChannelDeliveryPage(slot, slot.page.next_cursor, [...slot.starts, slot.page.next_cursor]) })));
+      if (slot.page.omitted) root.append(element("p", { class: "history-note", text: `此页有 ${slot.page.omitted} 条候选记录未能完整核验，已省略。` }));
+      for (const item of slot.page.items) root.append(element("article", { class: "history-message" }, element("p", { text: `${deliveryLabel(item.state)} · 平台已确认 ${item.confirmed_parts}/${item.total_parts} 分段 · ${formatFullDate(item.created_at)}` }), element("p", { class: "history-note", text: `投递 ID：${item.id}` }), renderChannelDeliveryAttachments(item.attachment_ids), element("button", { type: "button", class: "text-button", text: "查看分段", dataset: { channelDeliveryId: item.id }, onClick: () => void selectChannelDelivery(slot, item) })));
+      if (!slot.page.items.length) root.append(element("p", { role: "status", text: slot.page.has_more ? "此页没有可展示记录，仍可手动读取下一页。" : "此页没有保存的发送记录。" }));
+    }
+  } else {
+    root.append(element("button", { type: "button", class: "text-button", text: "返回记录", onClick: () => void loadChannelDeliveryPage(slot, slot.cursor, slot.starts, slot.selected.id) }));
+    const item = slot.bodyPage ?? slot.selected;
+    root.append(element("p", { class: "history-note", text: `投递 ID：${slot.selected.id} · ${deliveryLabel(item.state)} · 平台已确认 ${item.confirmed_parts}/${item.total_parts} 分段` }), element("nav", { class: "history-navigation", "aria-label": "发送分段" }, element("button", { type: "button", class: "text-button", text: "上一分段", disabled: slot.part === 0, onClick: () => void loadChannelDeliveryContent(slot, slot.part - 1) }), element("span", { class: "history-position", tabIndex: -1, text: `分段 ${slot.part + 1}/${item.total_parts} · ${channelDeliveryPartLabel(item, slot.part)}` }), element("button", { type: "button", class: "text-button", text: "下一分段", disabled: slot.part + 1 >= item.total_parts, onClick: () => void loadChannelDeliveryContent(slot, slot.part + 1) })));
+    const page = slot.bodyPage;
+    if (page) {
+      root.append(element("nav", { class: "history-navigation", "aria-label": "分段正文窗口" }, element("button", { type: "button", class: "text-button", text: "上一窗口", disabled: slot.offsets.length < 2, onClick: () => void loadChannelDeliveryContent(slot, slot.part, slot.offsets.at(-2), slot.offsets.slice(0, -1), slot.revision, slot.totalBytes) }), element("span", { class: "history-position", tabIndex: -1, text: `字节 ${page.offset_bytes}–${page.next_offset_bytes}/${page.total_bytes} · ${page.has_more ? "尚有后文" : "已到本分段末尾"}` }), element("button", { type: "button", class: "text-button", text: "下一窗口", disabled: !page.has_more, onClick: () => void loadChannelDeliveryContent(slot, slot.part, page.next_offset_bytes, [...slot.offsets, page.next_offset_bytes], slot.revision, slot.totalBytes) })));
+      if (page.attachment_ids.length) root.append(...renderChannelDeliveryAttachments(page.attachment_ids));
+      else root.append(element("pre", { class: "history-content", text: page.content }));
+    }
+  }
+  if (slot.controller) root.append(element("p", { class: "history-note", role: "status", text: "正在读取…" }));
+  if (slot.error) root.append(element("p", { class: "form-error", role: "alert", text: slot.error }), slot.retry && element("button", { type: "button", class: "text-button", text: "重试读取", onClick: slot.retry }));
+  if (!slot.controller && slot.focusAfterLoad) {
+    if (focus) (slot.returnId && $$("[data-channel-delivery-id]", root).find((button) => button.dataset.channelDeliveryId === slot.returnId) || $(".history-position", root) || $("#dialog-title")).focus({ preventScroll: true });
+    slot.focusAfterLoad = false;
+  }
 }
 
 function renderInputSettings() {
@@ -3717,6 +3927,7 @@ async function refreshService() {
 }
 
 async function handleAction(action, button) {
+  if (action === "channel-deliveries") showChannelDeliveries(button);
   if (action === "generate-answer-speech") openAnswerSpeech(button);
   if (action === "voice-setup-help") {
     state.voiceSetupController?.release();
@@ -3793,7 +4004,8 @@ async function handleAction(action, button) {
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
   if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") {
-    if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
+    if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) closeChannelDeliveryDialog();
+    else if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
     else if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
     else $("#app-dialog").close();
   }
@@ -3977,6 +4189,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   finally { if (current()) submit.disabled = false; }
 });
 $("#app-dialog").addEventListener("cancel", () => {
+  if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) releaseChannelDeliveryDialog();
   if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
   if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
 });
@@ -3989,6 +4202,13 @@ $("#app-dialog").addEventListener("close", () => {
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog();
+  releaseChannelDeliveryDialog();
+  const channelReturn = dialogChannelDeliveryReturn; dialogChannelDeliveryReturn = null;
+  if (channelReturn && connectionCurrent(channelReturn.owner) && state.auth.authenticated && state.view === "settings" && state.settingsTab === "channels") {
+    const root = $("#other-view");
+    const target = root.contains(channelReturn.trigger) ? channelReturn.trigger : $('[data-action="channel-deliveries"]', root);
+    target?.focus({ preventScroll: true });
+  }
   const saved = dialogTeamView; dialogTeamView = null;
   const uploadReturn = dialogUploadReturn; dialogUploadReturn = null;
   if (uploadReturn && connectionCurrent(uploadReturn.owner) && state.auth.authenticated && state.view === "uploads") {
@@ -4030,7 +4250,7 @@ function recoverConnection() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") { releaseAnswerSpeech(); voiceInput.cancel(); state.voiceSetupController?.release(); }
+  if (document.visibilityState === "hidden") { closeChannelDeliveryDialog(); releaseAnswerSpeech(); voiceInput.cancel(); state.voiceSetupController?.release(); }
   recoverConnection();
 });
 window.addEventListener("online", recoverConnection);
