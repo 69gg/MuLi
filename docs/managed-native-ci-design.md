@@ -2,7 +2,7 @@
 
 这项 CI 用真实用户服务验证同一数据库上的 adopt、切换与故障回退。本文说明夹具的运行边界、证据含义和维护约束；逐次修改、红绿日志及历史构件留在 PR 和 CI 中。
 
-**完整原生验收尚未通过。** 最近收齐终态的精确候选 `7e2685c5aa4e5dca0585ddbd673efebc967bad9e`，在 [CI 41060731223（attempt 1）](https://github.com/69gg/MuLi/actions/runs/41060731223/attempts/1) 中十七项成功、managed-native 一项失败。前两代已完成完整投影，第三代 helper 已观察为 present，但未完成回滚；整轮触及原 60 秒期限。`cleanup=verified` 只证明清理，不补齐第三事务。当前相邻同步内容证明的本地调整也没有新的原生通过证据。
+验收结果以对应候选的 `managed-native` 作业为准，须同时核对三次事务和独立清理的完整结果。`cleanup=verified` 只证明清理，不能代替事务完成。
 
 ## 覆盖范围与入口
 

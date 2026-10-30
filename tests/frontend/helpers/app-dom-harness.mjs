@@ -97,7 +97,7 @@ export class DOMElement {
 
 export class DOMButton extends DOMElement {}
 
-export function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false, team = false, upload = () => {} } = {}) {
+export function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false, team = false, upload = () => {}, transcribe = () => {}, createVoiceInput = null, voiceControls = false } = {}) {
   const document = { events: {}, activeElement: null, createTextNode: (text) => new TextNode(text), addEventListener(name, callback) { (this.events[name] ??= []).push(callback); } };
   document.createElement = (tag) => tag === "button" ? new DOMButton(tag, document) : new DOMElement(tag, document);
   document.createElementNS = (_namespace, tag) => document.createElement(tag);
@@ -119,7 +119,15 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     assert.ok(Number.isSafeInteger(input.maxLength) && input.maxLength > 0);
     input.setAttribute("maxlength", String(input.maxLength));
     input.scrollHeight = 24;
-    for (const id of ["send-button", "stop-button", "composer-context", "composer-status", "composer-attachments", "voice-button", "voice-progress", "voice-status", "voice-stop", "voice-draft", "voice-draft-text", "chat-view"]) node("div", id);
+    for (const id of ["send-button", "stop-button", "composer-context", "composer-status", "composer-attachments", "voice-button", "voice-progress", "voice-status", "voice-stop", "voice-draft", "voice-draft-text", "chat-view"]) {
+      const control = node(voiceControls && ["voice-button", "voice-stop"].includes(id) ? "button" : "div", id);
+      if (voiceControls && control.tagName === "BUTTON") {
+        const markup = index.match(new RegExp(`<button\\b[^>]*\\bid="${id}"[^>]*>`))?.[0];
+        assert.ok(markup, `missing original voice control ${id}`);
+        control.dataset.action = markup.match(/\bdata-action="([^"]+)"/)?.[1];
+        assert.ok(control.dataset.action);
+      }
+    }
     // These cases exercise the real composer and submit handlers, without browser layout.
     document.querySelector("#conversation-scroll").clientHeight = 0;
   }
@@ -139,8 +147,8 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     createSessionState: composer ? createSessionState : () => ({ messages: [] }),
     createTeamPager: team ? createTeamPager : () => ({}), captureTeamView: team ? captureTeamView : () => null,
     createTaskControl, taskControlView,
-    uploadFile: upload, transcribeAttachment() {},
-    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, managementRecoveryView, updateLabel, settingsExtras, SETTINGS_GROUPS,
+    uploadFile: upload, transcribeAttachment: transcribe,
+    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; if (createVoiceInput) return createVoiceInput(callbacks); } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, managementRecoveryView, updateLabel, settingsExtras, SETTINGS_GROUPS,
     restoreTeamView: team ? restoreTeamView : () => {},
     sessionStorage: team ? taskStorage : {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
@@ -157,7 +165,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
       owner.sessions.start(); owner.notifications.start(); owner.approvals.start(); return owner;
     };
     activateConnection();
-    globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, renderComposerAttachments,
+    globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, captureVoiceDraft, renderComposerAttachments,
       activateConnection,
       get capabilityCatalogSlot() { return capabilityCatalog; },
       watchPending(id) { return memoryWatchPending.has(id); },
@@ -181,7 +189,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
   const body = () => document.querySelector("#dialog-content").textContent;
   const button = (text, root = dialog) => root.querySelectorAll("button").find((entry) => entry.textContent === text);
   const expand = async (text) => { const details = dialog.querySelectorAll("details").find((entry) => entry.firstElementChild.textContent === text); assert.ok(details, `missing ${text}`); details.open = true; await details.dispatch("toggle"); await flush(); };
-  return { ui, requests, document, dialog, form, other, body, button, expand, windowEvents, savedTaskControls, taskStorage, emitGlobal: (event) => globalEvent(event), publishVoiceDraft: (draft) => voiceCallbacks.onDraft(draft) };
+  return { ui, requests, document, dialog, form, other, body, button, expand, windowEvents, savedTaskControls, taskStorage, emitGlobal: (event) => globalEvent(event), publishVoiceDraft: (draft) => voiceCallbacks.onDraft({ ...draft, context: { ...ui.captureVoiceDraft(), ...draft.context } }) };
 }
 
 export async function clickMemoryButton(h, button) {

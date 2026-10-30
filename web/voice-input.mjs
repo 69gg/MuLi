@@ -1,4 +1,6 @@
-/** Click-to-record audio; cancelled generations can never publish a draft. */
+import { attachmentKind } from "./attachments.mjs";
+
+/** One audio input at a time; cancelled generations can never publish a draft. */
 const MIME_TYPES = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus", "audio/webm"];
 
 export function recordingSupport({ secure = globalThis.isSecureContext, devices = globalThis.navigator?.mediaDevices, Recorder = globalThis.MediaRecorder } = {}) {
@@ -41,8 +43,9 @@ export class VoiceInput {
 
   fail(session, error) {
     if (!this.active(session)) return;
+    if (this.phase === "transcribing" && !error.status) error = new Error(`${error.message || "转写结果未确认。"} 转写可能已到 ASR，再次操作可能计费。`);
     this.cancel();
-    this.onError(error);
+    this.onError(error, session.context);
   }
 
   cancel() {
@@ -123,6 +126,33 @@ export class VoiceInput {
     }
   }
 
+  async startSaved(limits, context, attachment) {
+    if (!limits?.available) throw new Error("请先启用网页语音输入并配置 ASR。");
+    if (this.permission || this.phase !== "idle") throw new Error("请先结束当前录音或转写，并处理麦克风权限提示。");
+    if (!attachment?.id || attachmentKind(attachment) !== "audio") throw new Error("请选择已保存的音频附件。");
+    if (!Number.isSafeInteger(attachment.size) || attachment.size <= 0 || attachment.size > limits.max_file_bytes) throw new Error("音频为空或超过网页转写大小上限。");
+    const session = { generation: ++this.generation, controller: new AbortController(), context, limits: { ...limits } };
+    this.current = session;
+    await this.transcribeSaved(session, attachment);
+  }
+
+  async transcribeSaved(session, attachment) {
+    this.change("transcribing");
+    this.deadline(session, session.limits.timeout, "转写超时，草稿保持不变。");
+    try {
+      const result = await this.transcribe(attachment.id, { signal: session.controller.signal });
+      if (!this.active(session)) return;
+      if (typeof result?.text !== "string" || !result.text.trim()) throw new Error("没有识别到文字，请重试。");
+      if (result.text.length > session.limits.max_text_chars) throw new Error("转写文字超过草稿上限，请拆分录音。");
+      this.onDraft({ ...result, context: session.context, attachment });
+      this.cancel();
+    } catch (error) {
+      if (error.name !== "AbortError") this.fail(session, error);
+    } finally {
+      this.clearDeadline(session);
+    }
+  }
+
   async stop() {
     const session = this.current;
     if (!session || this.phase !== "recording") return;
@@ -142,14 +172,8 @@ export class VoiceInput {
       this.deadline(session, session.limits.timeout, "保存录音超时，已取消。");
       const attachment = await this.upload(file, { signal: session.controller.signal });
       if (!this.active(session)) return;
-      this.onUploaded(attachment);
-      this.change("transcribing");
-      this.deadline(session, session.limits.timeout, "转写超时，草稿保持不变。");
-      const result = await this.transcribe(attachment.id, { signal: session.controller.signal });
-      if (!this.active(session)) return;
-      if (typeof result?.text !== "string" || !result.text.trim()) throw new Error("没有识别到文字，请重试。");
-      this.onDraft({ ...result, context: session.context, attachment });
-      this.cancel();
+      this.onUploaded(attachment, session.context);
+      await this.transcribeSaved(session, attachment);
     } catch (error) {
       if (error.name !== "AbortError") this.fail(session, error);
     } finally {

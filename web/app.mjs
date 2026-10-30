@@ -84,6 +84,7 @@ const notificationPageSize = 20;
 let answerSpeechDialog = null;
 let answerSpeechResults = [];
 let attachmentCollectionDialog = null;
+let savedAudioDialog = null;
 const attachmentCollectionAttempts = new Map();
 let taskDialog = null;
 let taskDirectory = null;
@@ -134,10 +135,12 @@ const voiceSetup = new VoiceSetup({
 state.voiceSetupController = voiceSetup;
 const voiceInput = new VoiceInput({
   upload: uploadFile, transcribe: transcribeAttachment,
-  onUploaded: (file) => { state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
+  onUploaded: (file, context) => { if (voiceContextCurrent(context)) state.uploads = [file, ...state.uploads.filter((entry) => entry.id !== file.id)]; },
   onChange: () => renderVoiceInput(),
-  onError: (error) => { if (error.status === 401) showLogin(); showError(error); },
+  onError: (error, context) => { if (!voiceContextCurrent(context)) return; if (error.status === 401) showLogin(); showError(error); },
   onDraft: (draft) => {
+    if (!voiceContextCurrent(draft.context)) return;
+    if (state.voiceDraft) { toast("请先处理已有转写草稿，原录音仍在附件中。", true); return; }
     const input = $("#message-input");
     const merged = mergeTranscript(draft.context, captureDraft(), draft.text);
     if (merged !== null && merged.length <= (state.status?.web_voice?.max_text_chars ?? 64000)) {
@@ -154,6 +157,17 @@ const voiceInput = new VoiceInput({
 
 function captureDraft() {
   return { session: state.activeSession?.id, revision: draftRevision, text: $("#message-input").value };
+}
+
+function captureVoiceDraft() {
+  return { ...captureDraft(), owner: connection, sessionVersion: sessionRequestVersion };
+}
+
+// Same-chat navigation keeps VoiceInput valid; leaving chat cancels its generation.
+function voiceContextCurrent(context) {
+  return !!context && connectionCurrent(context.owner) && context.owner.ready && state.connected && state.auth.authenticated
+    && state.view === "chat" && document.visibilityState !== "hidden" && context.sessionVersion === sessionRequestVersion
+    && !!state.mainSessionId && context.session === state.mainSessionId && state.activeSession?.id === state.mainSessionId;
 }
 
 function renderVoiceInput() {
@@ -232,6 +246,8 @@ function connectionCurrent(owner) {
 }
 
 function invalidateConnection() {
+  voiceInput.cancel();
+  releaseSavedAudioDialog();
   state.voiceSetupController?.release();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
@@ -1119,6 +1135,7 @@ function resizeComposer() {
 }
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, returnUploadTrigger = null, onSubmit }) {
+  releaseSavedAudioDialog();
   releaseOwnerQuestionDialog();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
@@ -1184,6 +1201,7 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  releaseSavedAudioDialog();
   releaseOwnerQuestionDialog({ close: true });
   releaseTaskDialog({ close: true });
   if (channelDeliveryDialog && (view !== "settings" || state.settingsTab !== "channels")) closeChannelDeliveryDialog();
@@ -1502,11 +1520,69 @@ async function refreshUploads(owner = connection) {
 }
 
 function renderUploads() {
+  releaseSavedAudioDialog();
   releaseAttachmentCollection();
   const root = element("div", { class: "view-content" }, viewHeading("附件", "文件保存在本地，发送时只引用附件。", actionButton("添加文件", "attach-files", "primary-button", "plus")));
   if (!state.uploads.length) root.append(emptyState("attachment", "还没有附件", "图片、文档与音视频都可以添加。"));
-  for (const file of state.uploads) root.append(element("article", { class: "upload-row" }, renderAttachment(file), element("div", { class: "row-actions" }, actionButton("收藏", "collect-attachment", "text-button", null, { id: file.id }), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id }))));
+  for (const file of state.uploads) {
+    const actions = element("div", { class: "row-actions" }, actionButton("收藏", "collect-attachment", "text-button", null, { id: file.id }), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id }));
+    if (attachmentKind(file) === "audio") {
+      const button = actionButton("转写为草稿", "transcribe-saved-audio", "text-button", null, { id: file.id });
+      const reason = savedAudioUnavailable(file);
+      button.disabled = !!reason; button.title = reason || "使用已保存的录音生成可编辑草稿";
+      actions.append(button);
+    }
+    root.append(element("article", { class: "upload-row" }, renderAttachment(file), actions));
+  }
   return root;
+}
+
+function savedAudioUnavailable(file) {
+  if (!state.connected || !state.auth.authenticated) return "请先连接工作台。";
+  if (!state.status?.web_voice?.available) return "请先启用网页语音输入并配置 ASR。";
+  if (!state.mainSessionId || state.activeSession?.id !== state.mainSessionId) return "请先回到当前主对话。";
+  if (attachmentKind(file) !== "audio" || !Number.isSafeInteger(file.size) || file.size <= 0 || file.size > state.status.web_voice.max_file_bytes) return "音频为空或超过网页转写大小上限。";
+  if (state.voiceDraft) return "请先处理已有转写草稿。";
+  const voice = voiceInput.status();
+  if (voice.phase !== "idle" || voice.pendingPermission) return "请先结束当前录音或转写，并处理麦克风权限提示。";
+  return "";
+}
+
+function releaseSavedAudioDialog() {
+  const slot = savedAudioDialog; savedAudioDialog = null;
+  if (slot && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) { dialogSubmit = null; $("#app-dialog").close(); }
+}
+
+function savedAudioCurrent(slot) {
+  return !!slot && savedAudioDialog === slot && connectionCurrent(slot.owner) && slot.owner.ready && state.auth.authenticated && state.connected
+    && state.view === "uploads" && document.visibilityState !== "hidden" && slot.viewVersion === viewRequestVersion && slot.main === state.mainSessionId && state.activeSession?.id === slot.main
+    && $("#other-view").contains(slot.trigger) && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content
+    && state.uploads.some((file) => ["id", "name", "mime_type", "size"].every((key) => file[key] === slot.file[key]));
+}
+
+function openSavedAudio(trigger) {
+  const file = state.uploads.find((entry) => entry.id === trigger.dataset.id), owner = connection;
+  if (!file || !connectionCurrent(owner) || !owner.ready || state.view !== "uploads" || document.visibilityState === "hidden" || !$("#other-view").contains(trigger)) return;
+  const reason = savedAudioUnavailable(file); if (reason) throw new Error(reason);
+  const content = element("div", {}, element("p", { text: state.status?.preview
+    ? `仅在本页内存模拟“${file.name}”的转写，不连接 ASR。草稿由你检查后发送。`
+    : `将“${file.name}”发送给当前已配置的 ASR，只生成可编辑草稿，由你检查后发送。` }));
+  if (!state.status?.preview) content.append(element("p", { class: "settings-role-hint", text: "开始后取消或失联仍可能已转写和计费，再次操作可能重复计费。" }));
+  openDialog({ title: "转写为草稿", content, submitLabel: "确认转写", returnUploadTrigger: trigger, onSubmit: () => startSavedAudio(slot) });
+  const slot = savedAudioDialog = { owner, file: Object.freeze({ ...file }), content, trigger, main: state.mainSessionId, viewVersion: viewRequestVersion };
+}
+
+async function startSavedAudio(slot) {
+  if (!savedAudioCurrent(slot)) return;
+  const reason = savedAudioUnavailable(slot.file); if (reason) throw new Error(reason);
+  const before = captureDraft(), input = $("#message-input"), navigation = viewRequestVersion + 1;
+  releaseSavedAudioDialog();
+  await switchView("chat", slot.owner);
+  const context = captureVoiceDraft();
+  if (!voiceContextCurrent(context) || context.owner !== slot.owner || viewRequestVersion !== navigation || state.mainSessionId !== slot.main || $("#message-input") !== input
+    || context.session !== before.session || context.revision !== before.revision || context.text !== before.text || savedAudioUnavailable(slot.file)
+    || !state.uploads.some((file) => ["id", "name", "mime_type", "size"].every((key) => file[key] === slot.file[key]))) return;
+  await voiceInput.startSaved(state.status.web_voice, context, slot.file);
 }
 
 function releaseAttachmentCollection() {
@@ -5027,10 +5103,16 @@ async function handleAction(action, button) {
   if (action === "attach-files") $("#file-input").click();
   if (action === "voice-record") {
     if (state.voiceDraft) throw new Error("请先处理已有转写草稿。");
-    await voiceInput.start(state.status?.web_voice, captureDraft());
+    const context = captureVoiceDraft();
+    if (!voiceContextCurrent(context)) throw new Error("请先连接当前主对话。");
+    await voiceInput.start(state.status?.web_voice, context);
   }
   if (action === "voice-stop") await voiceInput.stop();
-  if (action === "voice-cancel") voiceInput.cancel();
+  if (action === "voice-cancel") {
+    const transcribing = voiceInput.status().phase === "transcribing";
+    voiceInput.cancel();
+    if (transcribing) toast(state.status?.preview ? "已停止本页模拟转写。" : "已停止等待；转写可能已到 ASR，再次操作可能计费。");
+  }
   if (action === "voice-draft-dismiss") { state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); }
   if (action === "voice-draft-append") {
     const input = $("#message-input");
@@ -5045,6 +5127,7 @@ async function handleAction(action, button) {
     if (file && !state.attachments.some((entry) => entry.id === file.id)) state.attachments.push(file);
     renderComposerAttachments(); await switchView("chat");
   }
+  if (action === "transcribe-saved-audio") openSavedAudio(button);
   if (action === "collect-attachment") await openAttachmentCollection(state.uploads.find((entry) => entry.id === button.dataset.id), button);
   if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
   if (action === "refresh-team") await refreshTeam();
@@ -5069,7 +5152,8 @@ async function handleAction(action, button) {
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
   if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") {
-    if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) closeChannelDeliveryDialog();
+    if (savedAudioDialog && $("#dialog-content").firstElementChild === savedAudioDialog.content) releaseSavedAudioDialog();
+    else if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) closeChannelDeliveryDialog();
     else if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
     else if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
     else $("#app-dialog").close();
@@ -5265,6 +5349,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   finally { if (current()) submit.disabled = false; }
 });
 $("#app-dialog").addEventListener("cancel", () => {
+  if (savedAudioDialog && $("#dialog-content").firstElementChild === savedAudioDialog.content) releaseSavedAudioDialog();
   if (ownerQuestionCurrent(ownerQuestionDialog)) releaseOwnerQuestionDialog();
   if (taskDirectoryDialog && $("#dialog-content").firstElementChild === taskDirectoryDialog.content) releaseTaskDirectoryDialog();
   if (notificationDetail && $("#dialog-content").firstElementChild === notificationDetail.content) releaseNotificationDetail();
@@ -5274,6 +5359,7 @@ $("#app-dialog").addEventListener("cancel", () => {
 });
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseSavedAudioDialog();
   releaseOwnerQuestionDialog();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
@@ -5339,7 +5425,7 @@ function recoverConnection() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") { closeChannelDeliveryDialog(); releaseAnswerSpeech(); voiceInput.cancel(); state.voiceSetupController?.release(); }
+  if (document.visibilityState === "hidden") { releaseSavedAudioDialog(); closeChannelDeliveryDialog(); releaseAnswerSpeech(); voiceInput.cancel(); state.voiceSetupController?.release(); }
   recoverConnection();
 });
 window.addEventListener("online", recoverConnection);

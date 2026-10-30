@@ -42,7 +42,7 @@ function harness(options = {}) {
     return options.permission ? options.permission.promise : Promise.resolve(stream);
   } };
   const voice = new VoiceInput({
-    secure: true, devices, Recorder,
+    secure: options.secure ?? true, devices, Recorder,
     upload: async (file, settings) => {
       calls.uploads.push({ file, settings });
       return options.upload ? options.upload(file, settings) : { id: "uploaded", name: file.name };
@@ -245,3 +245,97 @@ test("a stale result cannot overwrite typing, a replacement draft, or another se
   assert.equal(mergeTranscript(CONTEXT, { ...CONTEXT, session: "other" }, "转写"), null);
   assert.equal(mergeTranscript({ ...CONTEXT, text: "" }, { ...CONTEXT, text: "" }, "<script>plain text</script>"), "<script>plain text</script>");
 });
+
+const SAVED_AUDIO = { id: "same-saved-audio", name: "已保存录音.webm", mime_type: "audio/webm", size: 40 };
+
+test("saved audio skips microphone support and upload while using the original attachment and draft contract", async () => {
+  const h = harness({ secure: false });
+  assert.match(h.voice.support(), /HTTPS/);
+  await h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO);
+  assert.deepEqual(h.calls.permissions, []); assert.deepEqual(h.calls.uploads, []);
+  assert.deepEqual(h.calls.transcriptions.map((call) => call.id), [SAVED_AUDIO.id]);
+  assert.equal(h.calls.drafts[0].attachment === SAVED_AUDIO, true);
+  assert.equal(h.calls.drafts[0].context === CONTEXT, true);
+  assert.equal(h.calls.drafts[0].text, "转写草稿"); assert.equal(h.voice.status().phase, "idle");
+  assert.equal(h.timers.size, 0);
+});
+
+test("saved audio refuses disabled policy, non-audio, empty or oversized attachments before ASR", async () => {
+  const h = harness();
+  await assert.rejects(h.voice.startSaved({ ...LIMITS, available: false }, CONTEXT, SAVED_AUDIO), /启用/);
+  for (const attachment of [{ ...SAVED_AUDIO, mime_type: "text/plain" }, { ...SAVED_AUDIO, size: 0 }, { ...SAVED_AUDIO, size: LIMITS.max_file_bytes + 1 }]) {
+    await assert.rejects(h.voice.startSaved(LIMITS, CONTEXT, attachment), /音频/);
+  }
+  assert.deepEqual(h.calls.permissions, []); assert.deepEqual(h.calls.uploads, []); assert.deepEqual(h.calls.transcriptions, []);
+});
+
+test("saved audio shares the recorder mutex and cannot consume an outstanding permission prompt", async () => {
+  const recording = harness(); await recording.voice.start(LIMITS, CONTEXT);
+  await assert.rejects(recording.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO), /当前录音/);
+  assert.equal(recording.voice.status().phase, "recording"); assert.equal(recording.calls.transcriptions.length, 0);
+  recording.voice.cancel();
+  const permission = deferred(), waiting = harness({ permission });
+  const starting = waiting.voice.start(LIMITS, CONTEXT); waiting.voice.cancel(); await starting;
+  assert.equal(waiting.voice.status().pendingPermission, true);
+  await assert.rejects(waiting.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO), /权限提示/);
+  assert.equal(waiting.calls.permissions.length, 1); assert.equal(waiting.calls.transcriptions.length, 0);
+  permission.resolve(waiting.stream); await tick();
+  await waiting.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO);
+  assert.equal(waiting.calls.permissions.length, 1); assert.equal(waiting.calls.transcriptions[0].id, SAVED_AUDIO.id);
+  assert.equal(waiting.calls.uploads.length, 0); assert.ok(waiting.tracks.every((track) => track.stops > 0));
+});
+
+test("an active saved-audio transcription blocks another saved request and a microphone recording", async () => {
+  const pending = deferred(), h = harness({ transcribe: () => pending.promise });
+  const first = h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO);
+  assert.equal(h.voice.status().phase, "transcribing");
+  await assert.rejects(h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO), /当前录音/);
+  await h.voice.start(LIMITS, CONTEXT);
+  assert.equal(h.calls.permissions.length, 0); assert.equal(h.calls.transcriptions.length, 1);
+  h.voice.cancel(); assert.equal(h.calls.transcriptions[0].settings.signal.aborted, true);
+  pending.resolve({ text: "撤销后的识别文字", draft: true }); await first;
+  assert.equal(h.calls.drafts.length, 0); assert.equal(h.timers.size, 0);
+});
+
+test("an unknown saved-audio failure explains possible ASR billing and only an explicit retry uses the same ID", async () => {
+  let count = 0;
+  const h = harness({ transcribe: async () => {
+    if (++count === 1) throw new Error("连接已中断。");
+    return { text: "主动重试的结果", draft: true };
+  } });
+  await h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO);
+  assert.equal(h.calls.errors.length, 1); assert.match(h.calls.errors[0].message, /可能已到 ASR/); assert.match(h.calls.errors[0].message, /再次.*计费/);
+  assert.equal(h.calls.transcriptions.length, 1); assert.equal(h.calls.drafts.length, 0);
+  await h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO);
+  assert.deepEqual(h.calls.transcriptions.map((call) => call.id), [SAVED_AUDIO.id, SAVED_AUDIO.id]);
+  assert.equal(h.calls.drafts.length, 1); assert.equal(h.calls.uploads.length, 0);
+});
+
+test("saved-audio timeout aborts without accepting late text or retrying", async () => {
+  const pending = deferred(), h = harness({ transcribe: () => pending.promise });
+  const running = h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO);
+  h.fire(); assert.equal(h.calls.transcriptions[0].settings.signal.aborted, true);
+  assert.match(h.calls.errors[0].message, /转写超时/); assert.match(h.calls.errors[0].message, /可能.*计费/);
+  pending.resolve({ text: "超时后的旧结果", draft: true }); await running;
+  assert.equal(h.calls.drafts.length, 0); assert.equal(h.calls.transcriptions.length, 1); assert.equal(h.timers.size, 0);
+});
+
+test("a revoked saved-audio 401 and finally cannot unlock or clear the next operation deadline", async () => {
+  const first = deferred(), next = deferred(); let count = 0;
+  const h = harness({ transcribe: () => (++count === 1 ? first.promise : next.promise) });
+  const old = h.voice.startSaved(LIMITS, CONTEXT, SAVED_AUDIO); h.voice.cancel();
+  const current = h.voice.startSaved(LIMITS, { ...CONTEXT, revision: 2 }, SAVED_AUDIO);
+  first.reject(Object.assign(new Error("旧请求401"), { status: 401 })); await old;
+  assert.equal(h.calls.errors.length, 0); assert.equal(h.voice.status().phase, "transcribing"); assert.equal(h.timers.size, 1);
+  assert.equal(h.calls.transcriptions[1].settings.signal.aborted, false);
+  next.resolve({ text: "当前操作的结果", draft: true }); await current;
+  assert.equal(h.calls.drafts.length, 1); assert.equal(h.calls.drafts[0].text, "当前操作的结果"); assert.equal(h.timers.size, 0);
+});
+
+for (const text of ["", "  ", "超过上限的完整文字"]) {
+  test(`invalid saved-audio text ${JSON.stringify(text)} never partially enters a draft`, async () => {
+    const h = harness({ transcribe: async () => ({ text, draft: true }) });
+    await h.voice.startSaved({ ...LIMITS, max_text_chars: 4 }, CONTEXT, SAVED_AUDIO);
+    assert.equal(h.calls.drafts.length, 0); assert.equal(h.calls.errors.length, 1); assert.equal(h.voice.status().phase, "idle");
+  });
+}

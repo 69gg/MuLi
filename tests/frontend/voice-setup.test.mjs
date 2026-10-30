@@ -79,7 +79,8 @@ test("hidden page stops both voice entry flows while visible page only reconnect
   const end = source.indexOf("\n});", start) + "\n});".length;
   const events = [], calls = [];
   const document = { visibilityState: "visible", addEventListener: (name, listener) => events.push([name, listener]) };
-  runInNewContext(source.slice(start, end), { document, closeChannelDeliveryDialog() {}, releaseAnswerSpeech() {}, voiceInput: { cancel: () => calls.push("draft") }, state: { voiceSetupController: { release: () => calls.push("setup") } }, recoverConnection: () => calls.push("recover") });
+  const releaseSavedAudio = source.slice(source.indexOf("function releaseSavedAudioDialog("), source.indexOf("function savedAudioCurrent("));
+  runInNewContext(releaseSavedAudio + source.slice(start, end), { document, savedAudioDialog: null, closeChannelDeliveryDialog() {}, releaseAnswerSpeech() {}, voiceInput: { cancel: () => calls.push("draft") }, state: { voiceSetupController: { release: () => calls.push("setup") } }, recoverConnection: () => calls.push("recover") });
   assert.equal(events[0][0], "visibilitychange");
   events[0][1](); assert.deepEqual(calls, ["recover"]);
   calls.length = 0; document.visibilityState = "hidden";

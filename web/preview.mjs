@@ -74,7 +74,7 @@ export function createPreviewState() {
         tts: { model: "preview-tts", base_url: "https://preview.invalid/v1", voice: "沐璃" },
       },
       voice: { enabled: false, tts_enabled: false, reply_enabled: false, wake_command: [], chunk_seconds: 2 },
-      web_voice: { enabled: false }, computer: { enabled: false, backend: "atspi", capture: { enabled: false, max_file_bytes: 10485760 } },
+      web_voice: { enabled: false, max_seconds: 60, max_file_bytes: 8388608, max_concurrent: 1, timeout: 60, max_text_chars: 64000 }, computer: { enabled: false, backend: "atspi", capture: { enabled: false, max_file_bytes: 10485760 } },
       mcp,
       chiliarch: { enabled: false, base_url: "https://preview.invalid", agent_id: "", credential_set: false },
       plugins: { enabled: true, disabled: [] }, updates: { check_on_start: false },
@@ -309,6 +309,10 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     return { items: selected, has_more: more, [key]: more ? selected.at(-1).id : null };
   };
   const status = () => ({ configured: true, preview: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+  const webVoiceStatus = () => {
+    const policy = state.settings.web_voice, configured = !!state.settings.media.asr.model;
+    return { ...policy, configured, available: policy.enabled && configured, active: 0, max_file_bytes: Math.min(policy.max_file_bytes, state.settings.uploads.max_file_bytes) };
+  };
   let capabilityObservation = null;
   const capabilityDirectory = () => {
     const tools = status().tools.map((tool) => ({ ...tool, requires_approval: false, origin: { kind: "unrecorded" } }));
@@ -436,7 +440,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     if (path === "/auth/status") return response({ required: false, authenticated: true });
     if (["/auth/login", "/auth/logout"].includes(path) && method === "POST") return response({ authenticated: true, preview: true });
     if (path === "/ui/event-position") return response({ after: String(state.eventId) });
-    if (path === "/status" && method === "GET") return response(status());
+    if (path === "/status" && method === "GET") return response({ ...status(), web_voice: webVoiceStatus() });
     if (path === "/capabilities" && method === "GET") return capabilityResponse(capabilityDirectory());
     const capabilityMatch = /^\/capabilities\/tools\/([^/]+)$/u.exec(path);
     if (capabilityMatch && method === "GET") {
@@ -838,7 +842,19 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       }
       if (["content", "download"].includes(parts[2]) && method === "GET") return state.files.has(id) ? new Response(state.files.get(id)) : failure("演示附件不存在。", 404);
     }
-    if (path === "/media/transcribe" && method === "POST") return response({ text: "这是一段演示转写。你可以编辑文字，再决定是否发送。", preview: true });
+    if (path === "/media/transcribe" && method === "POST") {
+      if (Object.keys(body).length !== 1 || typeof body.attachment_id !== "string" || !body.attachment_id) return failure("请选择准确的已有音频附件。", 422);
+      const policy = webVoiceStatus();
+      if (!policy.enabled) return failure("网页语音输入未启用。", 403);
+      if (!policy.configured) return failure("请先配置 ASR 模型服务。", 409);
+      const file = state.uploads.find((entry) => entry.id === body.attachment_id), blob = state.files.get(body.attachment_id);
+      if (!file || !blob) return failure("没有这份演示附件。", 404);
+      if (!["audio/wav", "audio/mpeg", "audio/ogg", "audio/flac", "audio/mp4", "audio/webm"].includes(file.mime_type)) return failure("网页转写需要音频附件。", 415);
+      if (!file.size || file.size > policy.max_file_bytes) return failure("音频为空或超过网页转写大小限制。", 413);
+      const text = "这是一段演示转写。你可以编辑文字，再决定是否发送。";
+      if (text.length > policy.max_text_chars) return failure("转写文字超过草稿上限，请拆分录音。", 413);
+      return response({ text, attachment_id: file.id, draft: true, preview: true });
+    }
     if (parts[0] === "channels" && parts[1] === "deliveries" && method === "GET") {
       const channel = url.searchParams.get("channel"), ownerId = url.searchParams.get("owner_id"), profile = state.settings.channels[channel];
       if (!profile?.enabled || !profile.owner_ids?.includes(ownerId)) return failure("当前演示渠道或主人绑定已不可读取。", 403);
