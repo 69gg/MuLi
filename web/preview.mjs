@@ -13,6 +13,18 @@ const failure = (detail, status = 400) => response({ detail, preview: true }, st
 const model = (name = "") => ({ protocol: "openai_chat", model: name, base_url: "", api_key_set: false, vision: !!name, stream: true, max_output_tokens: null, timeout: 60, max_retries: 1, reasoning: {}, thinking: {}, extra_body: {}, extra_headers: {}, max_response_bytes: 1048576 });
 const mcpStatus = (config) => Object.entries(config?.mcpServers ?? {}).map(([name, server]) => ({ name, status: server.enabled === false ? "disabled" : "connected" }));
 
+// A short local WAV tone demonstrates attachment controls, not speech synthesis.
+function previewSpeechAudio() {
+  const rate = 8000, samples = rate / 4, bytes = new Uint8Array(44 + samples * 2), data = new DataView(bytes.buffer);
+  const text = (offset, value) => bytes.set(encoder.encode(value), offset);
+  text(0, "RIFF"); data.setUint32(4, bytes.length - 8, true); text(8, "WAVE"); text(12, "fmt ");
+  data.setUint32(16, 16, true); data.setUint16(20, 1, true); data.setUint16(22, 1, true);
+  data.setUint32(24, rate, true); data.setUint32(28, rate * 2, true); data.setUint16(32, 2, true); data.setUint16(34, 16, true);
+  text(36, "data"); data.setUint32(40, samples * 2, true);
+  for (let index = 0; index < samples; index++) data.setInt16(44 + index * 2, Math.round(4000 * (1 - index / samples) * Math.sin(2 * Math.PI * 440 * index / rate)), true);
+  return new Blob([bytes], { type: "audio/wav" });
+}
+
 /** A fresh tab starts with fresh demo data; credentials are never persisted. */
 export function createPreviewState() {
   const now = timestamp();
@@ -132,12 +144,12 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
   const activeRun = (id) => Object.values(state.runs).find((run) => run.session_id === id && ["running", "approval", "queued"].includes(run.status));
   const addMessage = (sessionId, role, content, attachmentIds = []) => {
     const list = state.messages[sessionId] ??= [];
-    const item = { id: identifier("message"), session_id: sessionId, role, principal: role === "user" ? "owner" : "assistant", source: "web", content, created_at: timestamp(), delivery_status: "delivered", seq: (list.at(-1)?.seq ?? 0) + 1, revision: "preview-1", attachment_ids: attachmentIds, attachments: state.uploads.filter((file) => attachmentIds.includes(file.id)) };
+    const item = { id: identifier("message"), session_id: sessionId, role, principal: role === "user" ? "owner" : "assistant", source: "web", content, created_at: timestamp(), delivery_status: "delivered", seq: (list.at(-1)?.seq ?? 0) + 1, revision: "preview-1", evidence_revision: identifier("revision"), attachment_ids: attachmentIds, attachments: state.uploads.filter((file) => attachmentIds.includes(file.id)) };
     list.push(item); if (list.length > 100) list.splice(0, list.length - 100); return item;
   };
   const detail = (id) => {
     const item = session(id), run = activeRun(id);
-    return { session: item, messages: state.messages[id] ?? [], events: [], after: String(state.eventId), live: { session_id: id, status: run?.status ?? "idle", run_id: run?.id ?? null, pending_approvals: state.approvals.filter((approval) => approval.session_id === id && approval.status === "pending") } };
+    return { session: item, messages: state.messages[id] ?? [], events: state.events.filter((event) => event.session_id === id), after: String(state.eventId), live: { session_id: id, status: run?.status ?? "idle", run_id: run?.id ?? null, pending_approvals: state.approvals.filter((approval) => approval.session_id === id && approval.status === "pending") } };
   };
   const tool = (run, name, args, result, complete) => {
     if (run.status !== "running") return;
@@ -152,7 +164,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (run.status !== "running") return;
       if (offset < chunks.length) { emit("message.delta", { content: chunks[offset++], run_id: run.id }, run.session_id); later(write, Math.min(delay, 35)); return; }
       const message = addMessage(run.session_id, "assistant", text, attachmentIds);
-      run.status = "completed"; run.result = text;
+      run.status = "completed"; run.result = text; run.result_message_id = message.id;
       const item = session(run.session_id); if (item) { item.status = "idle"; item.updated_at = timestamp(); }
       emit("message.completed", { message, run_id: run.id }, run.session_id);
       emit("run.completed", { run_id: run.id, result_message_id: message.id }, run.session_id);
@@ -250,7 +262,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     const selected = candidates.slice(0, limit), more = candidates.length > selected.length;
     return { items: selected, has_more: more, [key]: more ? selected.at(-1).id : null };
   };
-  const status = () => ({ configured: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+  const status = () => ({ configured: true, preview: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
 
   // This local demo backend reads only its bounded in-memory text blobs. It does
   // not pretend to extract PDF/DOCX or use these digests to authorize real work.
@@ -315,7 +327,21 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (parts.length === 2 && method === "PATCH" && session(id)) { merge(session(id), { mode: body.mode ?? session(id).mode }); emit("session.updated", session(id), id); return response(session(id)); }
       if (parts.length === 2 && method === "DELETE" && id !== state.sessions[0].id) { state.sessions = state.sessions.filter((item) => item.id !== id); return response({ deleted: true }); }
       if (parts[2] === "stop" && method === "POST") { for (const run of Object.values(state.runs).filter((entry) => entry.session_id === id && ["running", "approval", "queued"].includes(entry.status))) cancelRun(run); return response({ stopped: true }); }
-      if (parts[2] === "messages" && method === "POST" && session(id)) {
+      if (parts.length === 5 && parts[2] === "messages" && parts[4] === "speech" && method === "POST") {
+        if (Object.keys(body).sort().join(",") !== "confirmed,revision,run_id" || body.confirmed !== true || typeof body.run_id !== "string" || typeof body.revision !== "string") return failure("请确认这条准确版本的完整演示答复。", 422);
+        const message = state.messages[id]?.find((item) => item.id === parts[3]), run = state.runs[body.run_id];
+        if (id !== state.sessions[0].id || !message || message.role !== "assistant" || message.interrupted || message.tool_calls?.length || !message.content.trim()
+          || message.evidence_revision !== body.revision || run?.session_id !== id || run.status !== "completed" || run.result_message_id !== message.id || run.result !== message.content) return failure("这条演示答复的完整来源已变化。", 409);
+        if (state.settings.disabled_tools.includes("speech_synthesize")) return failure("语音生成工具未启用。");
+        const blob = previewSpeechAudio(), totalBytes = [...state.files.values()].reduce((total, file) => total + file.size, 0);
+        if (blob.size > state.settings.uploads.max_file_bytes || totalBytes + blob.size > state.previewLimits.max_upload_bytes) return failure("演示附件容量已达上限。", 413);
+        if (state.files.size >= state.previewLimits.max_uploads) return failure("演示附件数量已达上限。", 429);
+        const fileId = (++sequence).toString(16).padStart(32, "0");
+        const attachment = { id: fileId, name: "演示提示音.wav", mime_type: blob.type, size: blob.size, source: "tts", created_at: timestamp(), url: `/api/uploads/${fileId}/download`, preview_url: `/api/uploads/${fileId}/content`, kind: "audio" };
+        state.uploads.unshift(attachment); state.files.set(fileId, blob); emit("upload.created", attachment);
+        return response({ session_id: id, run_id: run.id, message_id: message.id, revision: body.revision, attachment, preview: true });
+      }
+      if (parts.length === 3 && parts[2] === "messages" && method === "POST" && session(id)) {
         if (typeof body.content !== "string" || !body.content.trim()) return failure("先写一点想做的事吧。");
         if (body.content.length > state.previewLimits.max_message_chars) return failure("消息超过前端预览长度上限。", 413);
         if (pendingRuns().length >= runLimit()) return failure("演示任务队列已满，请完成审批或停止当前任务后再发送。", 429);

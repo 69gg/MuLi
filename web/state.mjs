@@ -10,7 +10,7 @@ export function createSessionState(messages = []) {
     timeline: messages.filter((message) => ["user", "assistant"].includes(message.role)).map((message) => ({ id: `message:${message.id}`, kind: "message", message })),
     timelineRound: 0, timelineSerial: 0,
     status: "idle", runId: null, cursor: "", seen: new Set(), error: "",
-    snapshotAfter: "", terminalRun: null,
+    snapshotAfter: "", terminalRun: null, replyCandidates: [],
     queued: [...new Set(messages.filter((message) => message.role === "user" && message.delivery_status === "pending").map((message) => String(message.id)))],
   };
 }
@@ -148,6 +148,30 @@ function conversationEntries(state) {
   // Preserve the composer's visible slot before projecting the next SSE event.
   const pending = state.messages.filter((message) => message.pending && !represented.has(String(message.id)));
   return [...items, ...pending.map((message) => ({ id: `message:${message.id}`, kind: "message", message }))];
+}
+
+// Keep only exact candidates observed in this message/event window. In
+// particular, a newer canonical revision cannot inherit an older run's proof
+// while hydrateSession replays its original message.completed event.
+function projectReplyCandidates(previous, next, event) {
+  const data = event.data ?? {}, runId = data.run_id ?? event.run_id ?? next.runId;
+  let candidates = (previous.replyCandidates ?? []).filter((candidate) => next.messages.some((message) => message.id === candidate.message_id && message.evidence_revision === candidate.revision));
+  if (event.type === "run.started") candidates = candidates.filter((candidate) => candidate.completed);
+  if (event.type === "message.completed" && data.message?.role === "assistant" && typeof runId === "string" && runId) {
+    const raw = data.message, canonical = next.messages.find((message) => message.id === raw.id);
+    if (canonical && typeof raw.evidence_revision === "string" && raw.evidence_revision && raw.evidence_revision === canonical.evidence_revision) {
+      const existing = candidates.find((candidate) => candidate.message_id === raw.id);
+      if (!existing || existing.run_id !== runId || existing.revision !== raw.evidence_revision) {
+        candidates = [...candidates.filter((candidate) => candidate.message_id !== raw.id), { run_id: runId, message_id: raw.id, revision: raw.evidence_revision, completed: false }];
+      }
+    }
+  }
+  if (event.type === "run.completed" && typeof data.run_id === "string" && data.run_id && (!previous.runId || previous.runId === data.run_id)) {
+    candidates = candidates.filter((candidate) => candidate.run_id !== data.run_id || candidate.message_id === data.result_message_id)
+      .map((candidate) => candidate.run_id === data.run_id && candidate.message_id === data.result_message_id ? { ...candidate, completed: true } : candidate);
+  }
+  if (["run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) candidates = candidates.filter((candidate) => candidate.completed || candidate.run_id !== runId);
+  return { ...next, replyCandidates: candidates };
 }
 
 /** Entries are ready to render in order: message, reasoning, or tool. */
@@ -289,7 +313,7 @@ export function applyEvent(state, event, { history = false } = {}) {
     default:
       break;
   }
-  return projectConversation(state, next, event, history);
+  return projectConversation(state, projectReplyCandidates(state, next, event), event, history);
 }
 
 function reconcileLive(state, detail) {

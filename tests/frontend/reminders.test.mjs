@@ -71,6 +71,7 @@ function harness(items = pair()) {
     switchView: async () => {}, toast: (message) => messages.push(message),
     connection: { ready: true, position: "0" }, globalController: null,
     connectionCurrent: () => true, renderOtherView: () => {},
+    releaseAnswerSpeech() {},
     refreshApprovals: async () => {}, refreshNotifications: async () => {}, refreshSessions: async () => {},
     subscribe: (_path, _controller, options) => { globalEvent = options.onEvent; },
     FormData: class {

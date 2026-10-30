@@ -26,7 +26,7 @@ from muli.commitments import Commitments
 from muli.document_reading import DocumentView, document_view, read_document
 from muli.document_settings import DocumentSettings, DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size
-from muli.media import MediaConfig, MediaService, ServiceConfig
+from muli.media import MediaConfig, MediaService, ServiceConfig, SpeechResult
 from muli.providers import Message
 from muli.reading_application import ReadingApplication
 from muli.reading_pages import ReadingPages
@@ -104,6 +104,22 @@ class LocalServices:
             if settings.models.main.configured
             else None,
             max_image_bytes=settings.uploads.max_file_bytes,
+        )
+
+    async def save_speech(
+        self, result: SpeechResult, *, commit_guard: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
+        """Store already synthesized audio; callers retain their own authorization."""
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield result.data
+
+        return await self.attachments.save(
+            chunks(),
+            f"沐璃语音{result.extension}",
+            result.mime_type,
+            source="tts",
+            commit_guard=commit_guard,
         )
 
     def mcp_resource_target(self, name: str) -> ResourceSaveTarget:
@@ -611,16 +627,7 @@ class LocalServices:
         async def speech(args: dict[str, Any]) -> Any:
             async with self.media() as media:
                 result = await media.synthesize(str(args["text"]), voice=args.get("voice"))
-
-            async def chunks() -> AsyncIterator[bytes]:
-                yield result.data
-
-            return await self.attachments.save(
-                chunks(),
-                f"沐璃语音{result.extension}",
-                result.mime_type,
-                source="tts",
-            )
+            return await self.save_speech(result)
 
         async def publish(args: dict[str, Any]) -> Any:
             path: Path = runtime.files.path(str(args["path"]))

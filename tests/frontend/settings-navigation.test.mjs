@@ -84,6 +84,7 @@ function harness({ reduced = false, respond } = {}) {
     showError: (error) => { throw error; },
     saveSettings() {},
     releaseAttachmentCollection() {},
+    releaseAnswerSpeech() {},
   };
   const control = (name, value) => { const node = new Node("input"); node.name = name; node.value = value; return node; };
   Object.assign(context, {

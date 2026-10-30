@@ -75,6 +75,8 @@ let dialogSubmit = null;
 let dialogTeamView = null;
 let dialogMemoryReturn = null;
 let dialogUploadReturn = null;
+let answerSpeechDialog = null;
+let answerSpeechResults = [];
 let attachmentCollectionDialog = null;
 const attachmentCollectionAttempts = new Map();
 let taskDialog = null;
@@ -216,6 +218,7 @@ function connectionCurrent(owner) {
 
 function invalidateConnection() {
   state.voiceSetupController?.release();
+  releaseAnswerSpeech();
   releaseAttachmentCollection();
   releaseMemoryWatches();
   const owner = connection; connection = null;
@@ -269,9 +272,9 @@ function beginConnection() {
 }
 
 /** Raw API calls keep a previous connection's 401 out of the login handler. */
-async function ownedRequest(path, options = {}, owner = connection) {
+async function ownedRequest(path, options = {}, owner = connection, current = () => true) {
   const cancelled = () => Object.assign(new Error("读取已失效"), { name: "AbortError" });
-  if (!connectionCurrent(owner)) throw cancelled();
+  if (!connectionCurrent(owner) || !current()) throw cancelled();
   const controller = new AbortController();
   const signals = [owner.controller.signal, options.signal].filter(Boolean);
   const abort = () => controller.abort();
@@ -281,10 +284,10 @@ async function ownedRequest(path, options = {}, owner = connection) {
   }
   try {
     const result = await apiRequest(path, { ...options, signal: controller.signal });
-    if (!connectionCurrent(owner) || controller.signal.aborted) throw cancelled();
+    if (!connectionCurrent(owner) || controller.signal.aborted || !current()) throw cancelled();
     return result;
   } catch (error) {
-    if (!connectionCurrent(owner) || controller.signal.aborted) throw cancelled();
+    if (!connectionCurrent(owner) || controller.signal.aborted || !current()) throw cancelled();
     if (error.status === 401) showLogin();
     throw error;
   } finally {
@@ -484,7 +487,9 @@ function onConversationScroll() {
 }
 
 function renderChat() {
+  syncAnswerSpeech();
   const items = conversationItems(state.session).filter((item) => item.kind !== "message" || ["user", "assistant"].includes(item.message.role) && (item.message.content || item.message.attachments?.length || item.message.attachment_ids?.length || item.message.pending || item.message.streaming));
+  const lastParts = new Map(items.filter((item) => item.kind === "message").map((item) => [String(item.message.id), String(item.id)]));
   $("#welcome").hidden = !!items.length || busy();
   const container = $("#messages");
   const ids = new Set(items.map((item) => String(item.id)));
@@ -530,6 +535,14 @@ function renderChat() {
       node.dataset.content = message.content ?? "";
     }
     node.classList.toggle("streaming", !!message.streaming);
+    const binding = lastParts.get(String(message.id)) === id ? savedAnswerBinding(String(message.id)) : null;
+    let speechAction = $('[data-action="generate-answer-speech"]', node);
+    if (binding && !speechAction) {
+      speechAction = actionButton("生成语音", "generate-answer-speech", "text-button", "play", { id: binding.message_id });
+      $(".message-actions", node).append(speechAction);
+    }
+    if (!binding) speechAction?.remove();
+    else Object.assign(speechAction.dataset, { run: binding.run_id, revision: binding.revision });
     const attachments = message.attachments ?? (message.attachment_ids ?? []).map((attachmentId) => state.uploads.find((file) => file.id === attachmentId) ?? { id: attachmentId, name: "附件" });
     const attachmentKey = JSON.stringify(attachments);
     if (node.dataset.attachments !== attachmentKey) {
@@ -706,7 +719,7 @@ function waitToReconnect(milliseconds, signal) {
   });
 }
 
-async function subscribe(path, controller, { cursor = "", onEvent, onReconnect = () => {}, reportConnection = false, owner = connection } = {}) {
+async function subscribe(path, controller, { cursor = "", onEvent, onReconnect = () => {}, onDisconnect = () => {}, reportConnection = false, owner = connection } = {}) {
   let delay = 1000;
   let after = cursor;
   let opened = false;
@@ -724,6 +737,7 @@ async function subscribe(path, controller, { cursor = "", onEvent, onReconnect =
       if (error.status === 401) { showLogin(); return; }
     }
     if (!current()) return;
+    onDisconnect();
     if (reportConnection) { state.streamConnected = false; renderChrome(); }
     await waitToReconnect(delay, controller.signal);
     delay = Math.min(delay * 2, 12000);
@@ -734,7 +748,7 @@ function startGlobalEvents(owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   globalController?.abort();
   globalController = new AbortController();
-  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onReconnect: () => { void refreshApprovals(owner); }, onEvent: (event) => {
+  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onDisconnect: releaseAnswerSpeech, onReconnect: () => { releaseAnswerSpeech(); void refreshApprovals(owner); }, onEvent: (event) => {
     if (event.type === "approval.resolved" && typeof event.data?.id === "string") {
       state.approvals = state.approvals.filter((item) => item.id !== event.data.id); renderApprovalViews();
     }
@@ -767,19 +781,20 @@ function startSessionEvents(sessionId, owner = connection) {
   sessionController?.abort();
   sessionController = new AbortController();
   void subscribe(`/sessions/${encodeURIComponent(sessionId)}/events`, sessionController, {
-    cursor: state.session.cursor, owner,
+    cursor: state.session.cursor, owner, onDisconnect: releaseAnswerSpeech, onReconnect: releaseAnswerSpeech,
     onEvent: (event) => {
       if (event.session_id && event.session_id !== state.activeSession?.id) return;
       const next = applyEvent(state.session, event);
       if (next === state.session) return;
       state.session = next;
+      syncAnswerSpeech();
       if (["run.completed", "run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
   });
 }
 
-function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
+function resetMessageNodes() { releaseAnswerSpeech(); $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
 
 async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
@@ -1066,6 +1081,7 @@ function resizeComposer() {
 }
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, returnUploadTrigger = null, onSubmit }) {
+  releaseAnswerSpeech();
   releaseAttachmentCollection();
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
@@ -1125,6 +1141,7 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  releaseAnswerSpeech();
   releaseAttachmentCollection();
   if (view !== "settings") state.voiceSetupController?.release();
   if (view === "settings" && state.view === "settings" && state.settingsDraft && !state.viewError && !state.viewLoading && $(".settings-layout", $("#other-view"))) {
@@ -1272,12 +1289,122 @@ function renderThemeControl() {
 }
 
 function renderAttachment(file, { compact = false, removable = false } = {}) {
-  const kind = attachmentKind(file);
+  const kind = file.preview_url === null ? "file" : attachmentKind(file);
   const root = element("div", { class: `attachment ${compact ? "compact" : kind}` });
   if (!compact && kind === "image") root.append(element("a", { href: attachmentURL(file), target: "_blank", rel: "noopener", class: "attachment-preview", "aria-label": `查看 ${file.name}` }, element("img", { src: attachmentURL(file), alt: file.name || "图片附件", loading: "lazy" })));
   if (!compact && (kind === "audio" || kind === "video")) root.append(element(kind, { src: attachmentURL(file), controls: true, preload: "metadata", "aria-label": file.name || "媒体附件" }));
   root.append(element("div", { class: "attachment-info" }, icon(kind === "file" ? "attachment" : kind === "image" ? "sparkles" : "play"), element("span", { class: "attachment-name", text: file.name || "附件", title: file.name }), element("small", { text: formatBytes(file.size) }), removable ? iconButton("移除附件引用", "remove-attachment", "close", { id: file.id }) : element("a", { href: attachmentURL(file, true), download: file.name || "", class: "icon-button", "aria-label": `下载 ${file.name || "附件"}`, title: "下载" }, icon("download"))));
   return root;
+}
+
+function sameSavedAnswer(left, right) {
+  return !!left && !!right && ["session_id", "run_id", "message_id", "revision"].every((key) => left[key] === right[key]);
+}
+
+function savedAnswerBinding(messageId) {
+  const sessionId = state.mainSessionId;
+  if (!sessionId || state.activeSession?.id !== sessionId) return null;
+  const message = state.session.messages.find((item) => item.id === messageId);
+  if (!message || message.session_id !== sessionId || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim()
+    || message.pending || message.streaming || message.interrupted || message.paused || message.content_truncated || message.content_unavailable || message.content_provenance === "runtime_excerpt"
+    || message.tool_calls && (!Array.isArray(message.tool_calls) || message.tool_calls.length)
+    || typeof message.evidence_revision !== "string" || !message.evidence_revision.trim()) return null;
+  const candidate = state.session.replyCandidates?.find((item) => item.completed === true && item.message_id === message.id && item.revision === message.evidence_revision && typeof item.run_id === "string" && item.run_id);
+  return candidate ? Object.freeze({ session_id: sessionId, run_id: candidate.run_id, message_id: message.id, revision: message.evidence_revision }) : null;
+}
+
+function answerSpeechCurrent(slot) {
+  return !!slot && answerSpeechDialog === slot && connectionCurrent(slot.owner) && slot.owner.ready && slot.viewVersion === viewRequestVersion
+    && state.auth.authenticated && state.connected && state.streamConnected && state.view === "chat" && document.visibilityState !== "hidden"
+    && sameSavedAnswer(slot.binding, savedAnswerBinding(slot.binding.message_id)) && !slot.controller?.signal.aborted
+    && $("#messages").contains(slot.trigger) && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function releaseAnswerSpeech() {
+  const slot = answerSpeechDialog; answerSpeechDialog = null;
+  if (!slot) return;
+  if (slot.controller) {
+    slot.result.phase = "unknown"; slot.result.error = "";
+    slot.controller.abort(); slot.controller = null;
+  }
+  if ($("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) { dialogSubmit = null; $("#app-dialog").close(); }
+}
+
+function syncAnswerSpeech() {
+  if (answerSpeechDialog && !answerSpeechCurrent(answerSpeechDialog)) releaseAnswerSpeech();
+  answerSpeechResults = answerSpeechResults.filter((result) => sameSavedAnswer(result.binding, savedAnswerBinding(result.binding.message_id)));
+}
+
+function answerSpeechAttachment(value, binding) {
+  const file = value?.attachment;
+  if (!sameSavedAnswer(value, binding) || !file || typeof file.id !== "string" || !/^[a-f0-9]{32}$/.test(file.id)
+    || file.source !== "tts" || typeof file.name !== "string" || !file.name.trim() || typeof file.mime_type !== "string" || !file.mime_type
+    || !Number.isSafeInteger(file.size) || file.size <= 0 || file.url !== attachmentURL(file, true)
+    || (file.preview_url === null ? file.kind !== "file" : file.preview_url !== attachmentURL(file) || file.kind !== "audio" || !file.mime_type.startsWith("audio/"))) throw new Error("生成回执无法完整核查。");
+  return file;
+}
+
+function renderAnswerSpeech(slot) {
+  if (!answerSpeechCurrent(slot)) return;
+  const result = slot.result, phase = slot.confirmAgain ? "ready" : result.phase;
+  const submit = $("#dialog-submit"), focused = slot.content.contains(document.activeElement) || document.activeElement === submit;
+  slot.content.replaceChildren(); slot.content.setAttribute("aria-busy", String(phase === "pending"));
+  submit.textContent = "确认生成"; submit.hidden = phase !== "ready"; submit.disabled = phase === "pending";
+  dialogSubmit = phase === "ready" ? () => generateAnswerSpeech(slot) : null;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = phase === "ready" ? "取消" : "关闭";
+  if (phase === "ready") {
+    slot.content.append(element("p", { text: slot.preview ? "仅演示：在本页生成一段示例音频，供手动播放或下载。" : "这条完整答复会发送给配置的语音服务，并保存为音频附件。" }));
+    if (result.attempted) slot.content.append(element("p", { class: "settings-role-hint", text: slot.preview ? "再次生成仍只使用本页演示数据。" : "再次生成可能重复计费。" }));
+  } else if (phase === "pending") slot.content.append(element("p", { role: "status", text: "正在生成语音…" }));
+  else if (phase === "saved") {
+    slot.content.append(element("p", { role: "status", text: slot.preview ? "演示音频已生成，仅为本页示例提示音。" : "音频已保存。" }), renderAttachment(result.attachment));
+  } else {
+    slot.content.append(element("p", { role: "status", text: "生成结果未确认，可能已计费。" }));
+    if (result.error) slot.content.append(element("p", { class: "form-error", text: result.error }));
+  }
+  if (["saved", "unknown"].includes(phase)) {
+    const again = element("button", { type: "button", class: "text-button", text: "重新生成", onClick: () => {
+      if (answerSpeechCurrent(slot) && slot.content.contains(again)) { slot.confirmAgain = true; renderAnswerSpeech(slot); }
+    } });
+    slot.content.append(again);
+  }
+  if (focused) (phase === "ready" ? submit : $("#dialog-close")).focus({ preventScroll: true });
+}
+
+function openAnswerSpeech(trigger) {
+  const owner = connection, binding = savedAnswerBinding(trigger.dataset.id);
+  if (!binding || !connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || !state.connected || !state.streamConnected || state.view !== "chat" || document.visibilityState === "hidden"
+    || !$("#messages").contains(trigger) || trigger.dataset.run !== binding.run_id || trigger.dataset.revision !== binding.revision) return;
+  if (answerSpeechCurrent(answerSpeechDialog) && sameSavedAnswer(answerSpeechDialog.binding, binding)) return;
+  const content = element("div");
+  openDialog({ title: "生成语音", content, readOnly: true });
+  syncAnswerSpeech();
+  let result = answerSpeechResults.find((item) => sameSavedAnswer(item.binding, binding));
+  if (!result) { result = { binding, phase: "ready", attempted: false, attachment: null, error: "" }; answerSpeechResults.push(result); }
+  const slot = answerSpeechDialog = { owner, binding, result, trigger, content, viewVersion: viewRequestVersion, controller: null, confirmAgain: false, preview: state.status?.preview === true };
+  renderAnswerSpeech(slot);
+}
+
+async function generateAnswerSpeech(slot) {
+  if (!answerSpeechCurrent(slot) || slot.controller || !slot.confirmAgain && slot.result.phase !== "ready") return;
+  const controller = new AbortController(), result = slot.result;
+  slot.controller = controller; slot.confirmAgain = false;
+  result.phase = "pending"; result.attempted = true; result.attachment = null; result.error = "";
+  renderAnswerSpeech(slot);
+  try {
+    const binding = slot.binding;
+    const receipt = await ownedRequest(`/sessions/${encodeURIComponent(binding.session_id)}/messages/${encodeURIComponent(binding.message_id)}/speech`, {
+      method: "POST", body: { run_id: binding.run_id, revision: binding.revision, confirmed: true }, cache: "no-store", signal: controller.signal,
+    }, slot.owner, () => answerSpeechCurrent(slot) && slot.controller === controller);
+    const attachment = answerSpeechAttachment(receipt, binding);
+    if (!answerSpeechCurrent(slot) || slot.controller !== controller) return;
+    result.attachment = attachment; result.phase = "saved";
+  } catch (error) {
+    if (!answerSpeechCurrent(slot) || slot.controller !== controller) { if (answerSpeechDialog === slot) releaseAnswerSpeech(); return; }
+    result.phase = "unknown"; result.error = error.message ?? String(error);
+  } finally {
+    if (answerSpeechCurrent(slot) && slot.controller === controller) { slot.controller = null; renderAnswerSpeech(slot); }
+  }
 }
 
 function renderComposerAttachments() {
@@ -3590,6 +3717,7 @@ async function refreshService() {
 }
 
 async function handleAction(action, button) {
+  if (action === "generate-answer-speech") openAnswerSpeech(button);
   if (action === "voice-setup-help") {
     state.voiceSetupController?.release();
     await switchView("chat");
@@ -3665,7 +3793,8 @@ async function handleAction(action, button) {
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
   if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") {
-    if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
+    if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
+    else if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
     else $("#app-dialog").close();
   }
   if (action === "copy-message") {
@@ -3848,10 +3977,12 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   finally { if (current()) submit.disabled = false; }
 });
 $("#app-dialog").addEventListener("cancel", () => {
+  if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
   if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
 });
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseAnswerSpeech();
   releaseAttachmentCollection();
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
@@ -3899,7 +4030,7 @@ function recoverConnection() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") { voiceInput.cancel(); state.voiceSetupController?.release(); }
+  if (document.visibilityState === "hidden") { releaseAnswerSpeech(); voiceInput.cancel(); state.voiceSetupController?.release(); }
   recoverConnection();
 });
 window.addEventListener("online", recoverConnection);

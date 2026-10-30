@@ -63,6 +63,7 @@ from muli.providers import ProviderError
 from muli.reply_origin import ReplyOrigin
 from muli.request_operation import request_operation
 from muli.runtime import Runtime
+from muli.saved_answer_voice import SavedAnswerVoice, SavedAnswerVoiceError
 from muli.service import UserService
 from muli.session_records import SessionRecords
 from muli.store import SQLITE_MAX_INTEGER, now
@@ -119,6 +120,12 @@ class ChatInput(Input):
 
 class TranscriptionInput(Input):
     attachment_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class SavedAnswerSpeechInput(Input):
+    run_id: str = Field(min_length=1, max_length=200, strict=True)
+    revision: str = Field(min_length=1, max_length=200, strict=True)
+    confirmed: bool = Field(strict=True)
 
 
 class AttachmentCollectionInput(Input):
@@ -296,6 +303,8 @@ def _create_app(
     runtime.maintenance.owner("memory_recovery", lambda: memory_application.idle)
     runtime.maintenance.owner("personal_io", lambda: personal_io.idle)
     configuration_closing = False
+    saved_answer_voice = SavedAnswerVoice(local_services, closing=lambda: configuration_closing)
+    runtime.maintenance.owner("saved_answer_voice", lambda: saved_answer_voice.idle)
     onboarding_task: asyncio.Task[None] | None = None
     runtime.maintenance.owner(
         "onboarding", lambda: onboarding_task is None or onboarding_task.done()
@@ -317,7 +326,11 @@ def _create_app(
             )
         runtime.validate_proactive_settings(target)
         if runtime.extensions.configuration_only(config.settings, target):
-            await runtime.extensions.apply_locked(target, persist=True)
+            saved_answer_voice.invalidate()
+            try:
+                await runtime.extensions.apply_locked(target, persist=True)
+            finally:
+                saved_answer_voice.reopen()
             return
         memory_application.pipeline.check_index_budget(target.limits.max_output_chars * 4)
         previous = config.settings.model_copy(deep=True)
@@ -331,6 +344,7 @@ def _create_app(
             await file_inbox.reconfigure()
             await attention.reconfigure()
             await web_voice.reconfigure()
+            saved_answer_voice.reopen()
 
         async def apply() -> None:
             try:
@@ -353,6 +367,7 @@ def _create_app(
 
         # The caller keeps configuration_lock until commit or recovery settles.
         # Disconnecting an observer must not strand half of the application stopped.
+        saved_answer_voice.invalidate()
         applying = asyncio.create_task(apply(), name="muli-configuration")
         if await _wait_cleanup(applying):
             raise asyncio.CancelledError
@@ -414,6 +429,8 @@ def _create_app(
     async def close_resources() -> None:
         nonlocal configuration_closing
         configuration_closing = True
+        # Invalidate before awaiting a configuration owner; join only outside its lock.
+        await saved_answer_voice.aclose()
         await memory_application.close_comparisons()
         try:
             await runtime.maintenance.settle_activation()
@@ -466,6 +483,7 @@ def _create_app(
     app.state.attachments, app.state.authentication = attachments, authentication
     app.state.local_services = local_services
     app.state.web_voice = web_voice
+    app.state.saved_answer_voice = saved_answer_voice
     plugins = PluginManager(runtime, app, config.path.resolve().parent / "plugins")
 
     def legacy_plugins_present() -> bool:
@@ -495,6 +513,7 @@ def _create_app(
             "integration",
             "memory_recovery",
             "personal_io",
+            "saved_answer_voice",
             "management",
             "onboarding",
         }
@@ -1347,6 +1366,28 @@ def _create_app(
                 updated = runtime._store_session(session, previous_mode=previous_mode)
             runtime.shell_mode_changed(session_id, previous_mode, session["mode"])
             return updated
+
+    @app.post("/api/sessions/{session_id}/messages/{message_id}/speech")
+    async def saved_answer_speech(
+        session_id: str, message_id: str, body: SavedAnswerSpeechInput, request: Request
+    ) -> dict[str, Any]:
+        if body.confirmed is not True:
+            raise HTTPException(400, "请明确确认将这条完整答复发送给语音服务并保存附件")
+        try:
+            return await request_operation(
+                request,
+                saved_answer_voice.synthesize(session_id, body.run_id, message_id, body.revision),
+                cancelled_message="语音请求已取消，执行结果未知且可能已计费；请勿自动重新生成",
+            )
+        except SavedAnswerVoiceError as error:
+            raise HTTPException(error.status_code, str(error)) from error
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            raise HTTPException(
+                409, "语音请求因关闭或配置变化取消，执行结果未知且可能已计费；请勿自动重新生成"
+            ) from None
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:
