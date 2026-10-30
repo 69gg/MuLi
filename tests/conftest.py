@@ -10,14 +10,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--muli-ci-shard",
         type=int,
-        choices=(1, 2, 3),
+        choices=(1, 2, 3, 4),
         default=None,
         help="Run one disjoint file group after normal pytest collection (one-based index).",
     )
     parser.addoption(
         "--muli-ci-shards",
         type=int,
-        choices=(2, 3),
+        choices=(2, 3, 4),
         default=2,
         help="Total file groups when --muli-ci-shard is enabled (default: 2).",
     )
