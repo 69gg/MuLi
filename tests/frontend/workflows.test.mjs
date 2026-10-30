@@ -122,7 +122,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     FormData: class { constructor(root) { this.values = new Map(root.querySelectorAll("[name]").map((input) => [input.name, input.value])); } get(name) { return this.values.get(name) ?? null; } },
   };
   runInNewContext(application + `
-    renderChrome = () => {}; renderChat = () => {}; toast = (text) => toasts.push(text); showError = (error) => errors.push(error.message);
+    renderChrome = () => {}; renderChat = () => {}; resizeComposer = () => {}; toast = (text) => toasts.push(text); showError = (error) => errors.push(error.message);
     const owner = beginConnection(); owner.ready = true;
     owner.sessions.start(); owner.notifications.start();
     globalThis.ui = { state, renderWorkflows, switchView, handleAction, startGlobalEvents, showLogin, beginConnection,
@@ -678,4 +678,65 @@ test("an old pending schedule cancellation cannot log out or refresh a new authe
   assert.equal(h.document.querySelector("#auth-gate").hidden, true);
   assert.equal(scheduleCalls(h).length, readsBeforeReply);
   assert.equal(h.toasts.includes("已提交取消请求"), false);
+});
+
+async function sourceDraftHarness(inspect) {
+  const source = run("source-result", "failed", { parent_session_id: "main", nodes: {} });
+  const h = harness(async (path) => {
+    if (path === "/workflows") return { items: [{ ...definition, runs: [source] }] };
+    if (path.startsWith("/workflow-runs/active?")) return page([]);
+    assert.equal(path, "/workflow-runs/source-result/inspection");
+    return inspect();
+  });
+  h.ui.state.connected = true;
+  h.ui.state.mainSessionId = "main";
+  h.ui.state.activeSession = { id: "main" };
+  const input = h.document.querySelector("#message-input");
+  input.value = "沿用原资料，只做新的本地草稿。";
+  input.maxLength = 10000;
+  await h.ui.switchView("workflows");
+  return { h, input };
+}
+
+test("workflow source action appends an exact reference without sending or losing attachments and voice", async () => {
+  const revision = "a".repeat(64);
+  const { h, input } = await sourceDraftHarness(() => ({ run_id: "source-result", revision }));
+  const attachments = h.ui.state.attachments = [{ id: "local-file" }];
+  const voice = h.ui.state.voiceDraft = { text: "待处理的转写" };
+  await click(h, h.button("workflow-source-draft", "source-result"));
+  assert.equal(h.ui.state.view, "chat");
+  assert.ok(input.value.startsWith("沿用原资料，只做新的本地草稿。\n\n"));
+  assert.ok(input.value.includes(JSON.stringify({ run_id: "source-result", revision })));
+  assert.equal(h.ui.state.attachments === attachments, true);
+  assert.equal(h.ui.state.voiceDraft === voice, true);
+  assert.equal(h.document.activeElement === input, true);
+  assert.equal(h.requests.some((request) => request.method === "POST"), false);
+  assert.deepEqual(h.errors, []);
+});
+
+test("late workflow source reading cannot replace an edited draft or a new navigation", async (t) => {
+  for (const change of ["draft", "navigation"]) await t.test(change, async () => {
+    const pending = deferred();
+    const { h, input } = await sourceDraftHarness(() => pending.promise);
+    const reading = click(h, h.button("workflow-source-draft", "source-result"));
+    await flush();
+    input.value = "后来输入的新要求";
+    if (change === "navigation") await h.ui.switchView("chat");
+    pending.resolve({ run_id: "source-result", revision: "b".repeat(64) });
+    await reading;
+    assert.equal(input.value, "后来输入的新要求");
+    assert.equal(h.ui.state.view, change === "navigation" ? "chat" : "workflows");
+    assert.equal(h.requests.some((request) => request.method === "POST"), false);
+    assert.deepEqual(h.errors, []);
+  });
+});
+
+test("invalid workflow source evidence leaves the current draft intact", async () => {
+  const { h, input } = await sourceDraftHarness(() => ({ run_id: "other-result", revision: "c".repeat(64) }));
+  const text = input.value;
+  await click(h, h.button("workflow-source-draft", "source-result"));
+  assert.equal(input.value, text);
+  assert.equal(h.ui.state.view, "workflows");
+  assert.equal(h.errors.length, 1);
+  assert.equal(h.button("workflow-source-draft", "source-result").disabled, false);
 });

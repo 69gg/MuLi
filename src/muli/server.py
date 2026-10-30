@@ -71,6 +71,7 @@ from muli.session_records import SessionRecords
 from muli.store import SQLITE_MAX_INTEGER, now
 from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
+from muli.workflow_sources import WorkflowSources
 
 if TYPE_CHECKING:
     from muli.platforms.linux_bootstrap import BootSession
@@ -1722,6 +1723,22 @@ def _create_app(
     async def create_workflow(body: WorkflowInput) -> dict[str, Any]:
         return runtime.workflows.create(
             body.name, body.steps, body.description, body.mode or config.settings.default_mode
+        )
+
+    @app.get("/api/workflow-runs/{identifier}/inspection")
+    async def inspect_workflow_run(
+        identifier: str,
+        node_id: str | None = None,
+        revision: str | None = None,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+    ) -> dict[str, Any]:
+        return WorkflowSources(runtime).inspect(
+            identifier,
+            node_id=node_id,
+            revision=revision,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
         )
 
     @app.post("/api/workflows/{identifier}/run")

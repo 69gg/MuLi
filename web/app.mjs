@@ -3025,7 +3025,7 @@ function workflowActivityCurrent(slot) {
 
 function releaseWorkflowActivity() {
   const slot = workflowActivity; workflowActivity = null;
-  slot?.controller?.abort(); slot?.definitionsController.abort(); slot?.schedulesController?.abort();
+  slot?.controller?.abort(); slot?.definitionsController.abort(); slot?.schedulesController?.abort(); slot?.sourceController?.abort();
   if (slot) { slot.page = null; slot.schedulesPage = null; slot.schedulesStopping.clear(); }
   $("#workflow-active-runs")?.replaceChildren();
   $("#workflow-schedules")?.replaceChildren();
@@ -3227,7 +3227,41 @@ function renderWorkflowRun(run) {
   for (const node of Object.values(run.nodes ?? {})) details.append(element("div", { class: "workflow-run-node" }, element("span", { class: "workflow-node-status", text: labels[node.status] ?? node.status }), element("span", { text: node.title ?? node.id }), node.session_id && actionButton("会话", "workflow-session", "text-button", undefined, { session: node.session_id })));
   if (run.result) details.append(element("div", { class: "workflow-run-result" }, renderMarkdown(run.result)));
   if (run.error) details.append(element("p", { class: "form-error", text: run.error }));
+  if (["completed", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status) && run.parent_session_id === state.mainSessionId && !run.commitment_id && !run.schedule_id) details.append(actionButton("带资料继续", "workflow-source-draft", "text-button", undefined, { id: run.id }));
   return details;
+}
+
+async function prepareWorkflowSourceDraft(identifier, trigger) {
+  const slot = workflowActivity, owner = connection, version = viewRequestVersion;
+  const selected = () => state.workflows.flatMap((item) => item.runs ?? []).find((run) => run.id === identifier);
+  const observed = selected(), main = state.mainSessionId, draft = captureDraft(), input = $("#message-input");
+  if (!workflowActivityCurrent(slot) || !connectionCurrent(owner) || !owner.ready || !state.connected || !main || draft.session !== main || !$("#other-view").contains(trigger) || trigger.closest("[data-workflow-history-run]")?.dataset.workflowHistoryRun !== identifier || trigger.disabled || !observed) return;
+  slot.sourceController?.abort();
+  const controller = slot.sourceController = new AbortController();
+  const current = () => connectionCurrent(owner) && workflowActivityCurrent(slot) && slot.sourceController === controller && !controller.signal.aborted && viewRequestVersion === version && selected() === observed && $("#other-view").contains(trigger);
+  trigger.disabled = true;
+  try {
+    const evidence = await ownedRequest(`/workflow-runs/${encodeURIComponent(identifier)}/inspection`, { signal: controller.signal, cache: "no-store" }, owner, current);
+    if (!current()) return;
+    if (evidence?.run_id !== identifier || typeof evidence.revision !== "string" || !/^[a-f0-9]{64}$/.test(evidence.revision)) throw new Error("工作流资料响应不完整，请重新读取。");
+    const reference = `参考工作流资料：请先用 workflow_inspect 核对下列运行和版本，再按我的新要求安排后续工作；不要重做旧操作。\n${JSON.stringify({ run_id: identifier, revision: evidence.revision })}`;
+    const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+    if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入资料。", true); return; }
+    const latest = captureDraft();
+    if (latest.session !== draft.session || latest.revision !== draft.revision || latest.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+    const navigation = viewRequestVersion + 1;
+    await switchView("chat", owner);
+    if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+    const next = captureDraft();
+    if (next.session !== draft.session || next.revision !== draft.revision || next.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+    if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+    resizeComposer(); input.focus();
+  } catch (error) {
+    if (current() && error.name !== "AbortError") showError(error);
+  } finally {
+    if (slot.sourceController === controller) slot.sourceController = null;
+    if (connectionCurrent(owner) && $("#other-view").contains(trigger)) trigger.disabled = false;
+  }
 }
 
 function workflowTemplates() {
@@ -4455,6 +4489,7 @@ async function handleAction(action, button) {
   if (action === "remove-workflow-step") button.closest(".workflow-step-editor")?.remove();
   if (action === "run-workflow") await runWorkflow(button.dataset.id, button);
   if (action === "workflow-session") await loadSession(button.dataset.session, button);
+  if (action === "workflow-source-draft") await prepareWorkflowSourceDraft(button.dataset.id, button);
   if (action === "toggle-workflow-schedules") {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button)) return;

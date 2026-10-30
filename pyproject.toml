@@ -1,6 +1,6 @@
 [project]
 name = "muli-agent"
-version = "2.138.0"
+version = "2.139.0"
 description = "沐璃：事件驱动的本地数字生命与私人多 agent 助手"
 authors = [{name = "Null", email = "pylindex@qq.com"}]
 license = "MIT"

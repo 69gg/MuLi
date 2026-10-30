@@ -1399,10 +1399,7 @@ class MemoryApplication:
                     tool_name=tool_name,
                 )
                 execution = runtime._tool_execution.get()
-                if (
-                    execution is None
-                    or runtime._reply_memory_owner_input(request, execution[1]) is None
-                ):
+                if execution is None or runtime._owner_round_input(request, execution[1]) is None:
                     raise PermissionError("只有本次精确投递的主人主轮可以收藏历史答复")
                 return request
 
@@ -1454,7 +1451,7 @@ class MemoryApplication:
                 execution = runtime._tool_execution.get()
                 if execution is None:
                     raise PermissionError("本次答复收藏的真实执行已失效")
-                owner_input = runtime._reply_memory_owner_input(request, execution[1])
+                owner_input = runtime._owner_round_input(request, execution[1])
                 if owner_input is None:
                     raise PermissionError("本次答复收藏的主人投递依据已失效")
                 evidence = HistoryEvidence(runtime.store)._completed_reply(

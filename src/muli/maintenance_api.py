@@ -145,6 +145,8 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         )
     if len(parts) >= 4 and parts[2] == "memories":
         return len(parts) == 4 or (len(parts) == 5 and parts[4] in {"source", "revisions"})
+    if len(parts) == 5 and parts[2] == "workflow-runs":
+        return bool(parts[3]) and parts[4] == "inspection"
     return (len(parts) == 4 and parts[2] == "commitments") or (
         len(parts) == 5 and parts[2] == "uploads" and parts[4] in {"download", "content"}
     )

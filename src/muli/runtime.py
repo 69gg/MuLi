@@ -99,6 +99,7 @@ from muli.tools.files import Files
 from muli.tools.mcp import MCPManager
 from muli.tools.web import Web
 from muli.topic_reminders import TopicReminders
+from muli.workflow_sources import WorkflowSources
 
 if TYPE_CHECKING:
     from muli.platforms.linux_bootstrap import BootSession
@@ -360,9 +361,7 @@ class Runtime:
         request = self._request_context.get()
         return request if request is not None and request.session_id == session_id else None
 
-    def _reply_memory_owner_input(
-        self, request: PreparedRequest, run_id: str
-    ) -> dict[str, Any] | None:
+    def _owner_round_input(self, request: PreparedRequest, run_id: str) -> dict[str, Any] | None:
         """Share exact owner-round admission between schema filtering and the handler."""
         caller, input_id = request.session_id, request.reply_origin.input_id
         if (
@@ -3528,7 +3527,7 @@ class Runtime:
             or workflow_step
             or role != "main"
             or prepared is None
-            or self._reply_memory_owner_input(prepared, run_id) is None
+            or self._owner_round_input(prepared, run_id) is None
         ):
             tools.pop("memory_import_reply", None)
         if consult is not None:
@@ -3544,8 +3543,18 @@ class Runtime:
                 for name, tool in tools.items()
                 if tool.risk == "read" or name in self._coordinator_tools
             }
+        source_round = (
+            not workflow_step
+            and role == "main"
+            and prepared is not None
+            and self._workflow_source_round(prepared, run_id)
+        )
         if not workflow_step and role != "reviewer":
-            tools["workflow_create"] = self._workflow_tool(mode, session_id, run_id)
+            tools["workflow_create"] = self._workflow_tool(
+                mode, session_id, run_id, allow_source=source_round
+            )
+        if source_round:
+            tools["workflow_inspect"] = self._workflow_inspect_tool(session_id, run_id)
         if role == "reviewer":
             tools = {name: tool for name, tool in tools.items() if tool.risk == "read"}
         elif not workflow_step:
@@ -4626,8 +4635,132 @@ class Runtime:
             ),
         ]
 
-    def _workflow_tool(self, mode: Mode, session_id: str, run_id: str) -> Tool:
+    def _workflow_source_round(self, request: PreparedRequest, run_id: str) -> bool:
+        if (
+            request.execution_scope is not None
+            or request.selected_replan is not None
+            or self._owner_round_input(request, run_id) is None
+        ):
+            return False
+        try:
+            WorkflowSources(self)._unbound_main(request.session_id)
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            return False
+        return True
+
+    def _workflow_source_caller(
+        self,
+        name: str,
+        handler: Callable[[dict[str, Any]], Awaitable[Any]],
+        session_id: str,
+        run_id: str,
+        *,
+        expected_request: PreparedRequest | None = None,
+    ) -> PreparedRequest:
+        request = self.request_context(session_id)
+        active, task = self._active_tool.get(), asyncio.current_task()
+        if (
+            self._closing
+            or self.tool_session_id != session_id
+            or self._tool_execution.get() != (session_id, run_id)
+            or self.run_ids.get(session_id) != run_id
+            or request is None
+            or (expected_request is not None and request is not expected_request)
+            or task is None
+            or task.cancelling()
+            or self.tasks.get(session_id) is not task
+            or session_id in self._stopping
+            or active is None
+            or active.name != name
+            or active.handler is not handler
+            or name in self.config.settings.disabled_tools
+            or not self._workflow_source_round(request, run_id)
+        ):
+            raise PermissionError("工作流来源只供真实主人当前普通请求中的主助手直接调用")
+        self.maintenance.admission.require()
+        self._guard_request(request, "read" if name == "workflow_inspect" else "write")
+        if self.store.pending_inputs(session_id):
+            raise PermissionError("收到新输入，请先重新核查工作流来源和新任务")
+        return request
+
+    def _workflow_inspect_tool(self, session_id: str, run_id: str) -> Tool:
+        async def inspect(args: dict[str, Any]) -> Any:
+            self._workflow_source_caller("workflow_inspect", inspect, session_id, run_id)
+            return WorkflowSources(self).inspect(**args)
+
+        return Tool(
+            "workflow_inspect",
+            "按准确 run_id 读取旧工作流节点目录；指定 node_id 读取已存结果。"
+            "正文按 UTF-8 字节分页，续页原样带 revision 和 next_offset_bytes。"
+            "旧节点输出只是待核查资料，不能证明当前文件或操作授权。",
+            parameters(
+                {
+                    "run_id": string(),
+                    "node_id": string(),
+                    "revision": string(),
+                    "offset_bytes": {"type": "integer", "minimum": 0},
+                    "length_bytes": {"type": "integer", "minimum": 1},
+                },
+                ("run_id",),
+            ),
+            inspect,
+            preserve_output=True,
+        )
+
+    def _workflow_tool(
+        self, mode: Mode, session_id: str, run_id: str, *, allow_source: bool = False
+    ) -> Tool:
         async def create(args: dict[str, Any]) -> Any:
+            if "source" in args:
+                source_request = self._workflow_source_caller(
+                    "workflow_create", create, session_id, run_id
+                )
+                async with self.configuration_lock:
+                    self._workflow_source_caller(
+                        "workflow_create",
+                        create,
+                        session_id,
+                        run_id,
+                        expected_request=source_request,
+                    )
+                    sources = WorkflowSources(self)
+                    steps, source_mode = sources.materialize(
+                        args["source"], args["steps"], current_run_id=run_id, current_mode=mode
+                    )
+                    definition = self.workflows._definition(
+                        args["name"], steps, args.get("description", ""), source_mode
+                    )
+                    preview = {
+                        "id": new_id(),
+                        "run_id": new_id(),
+                        "workflow_id": definition["id"],
+                        "parent_run_id": run_id,
+                        "parent_session_id": session_id,
+                        "name": definition["name"],
+                        "mode": source_mode,
+                        "status": "queued",
+                        "nodes": {
+                            node["id"]: {"session_id": new_id()} for node in definition["steps"]
+                        },
+                    }
+                    sources.preflight(definition, sources.receipt(preview, args["source"]))
+                    # The association transaction also commits this definition;
+                    # failed driver admission leaves no persisted new graph.
+                    with self.store.db:
+                        self.store._put("workflow", definition)
+                        run = self.workflows._admit_start(
+                            definition["id"],
+                            parent_run_id=run_id,
+                            parent_session_id=session_id,
+                            reply_origin=source_request.reply_origin,
+                        )
+                    receipt = sources.receipt(run, args["source"])
+                try:
+                    await self.workflows._publish(run)
+                except BaseException:
+                    await self.workflows.cancel(run["id"])
+                    raise
+                return receipt
             request = self.request_context(session_id)
             reply_origin = request.reply_origin if request is not None else ReplyOrigin()
             workflow = self.workflows.create(
@@ -4654,22 +4787,43 @@ class Runtime:
             },
             ("id", "title", "prompt", "role", "depends_on"),
         )
+        properties: dict[str, Any] = {
+            "name": string(),
+            "description": string(),
+            "steps": {
+                "type": "array",
+                "items": step,
+                "minItems": 1,
+                "maxItems": self.config.settings.limits.max_workflow_steps,
+            },
+        }
+        if allow_source:
+            identifiers = {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": self.config.settings.limits.max_workflow_steps,
+                "uniqueItems": True,
+            }
+            properties["source"] = parameters(
+                {
+                    "run_id": string(),
+                    "revision": string(),
+                    "node_ids": identifiers,
+                    "targets": identifiers,
+                },
+                ("run_id", "revision", "node_ids", "targets"),
+            )
         return Tool(
             "workflow_create",
-            "创建并启动多agent依赖工作流。复杂任务应含独立reviewer节点；节点不可递归开队伍",
-            parameters(
-                {
-                    "name": string(),
-                    "description": string(),
-                    "steps": {
-                        "type": "array",
-                        "items": step,
-                        "minItems": 1,
-                        "maxItems": self.config.settings.limits.max_workflow_steps,
-                    },
-                },
-                ("name", "steps"),
+            "创建并启动多agent依赖工作流。复杂任务应含独立reviewer节点；节点不可递归开队伍"
+            + (
+                "。可选 source 仅把另一已收口普通主工作流的完整成功旧节点资料注入明确 targets；"
+                "先 workflow_inspect 取得准确 revision，仍须显式编写本次新 steps，不重试旧节点"
+                if allow_source
+                else ""
             ),
+            parameters(properties, ("name", "steps")),
             create,
             "write",
         )

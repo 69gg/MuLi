@@ -13,3 +13,7 @@
 /tests/fixtures/compatibility_v2_136.json -text
 /tests/fixtures/format_admission_v2_137.py -text
 /tests/fixtures/compatibility_v2_137.json -text
+/tests/fixtures/workflow_source_v2_138/workflows.py -text
+/tests/fixtures/workflow_source_v2_138/runtime_drive.py.txt -text
+/tests/fixtures/workflow_source_v2_138/compatibility.json -text
+/tests/fixtures/workflow_source_v2_138/manifest.json -text
