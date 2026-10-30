@@ -263,9 +263,9 @@ class LocalServices:
         return item, content
 
     async def memory_document(
-        self, identifier: str, revision: str
+        self, identifier: str, revision: str | None
     ) -> tuple[dict[str, Any], DocumentView]:
-        """Collect only the complete verified version explicitly read by the caller."""
+        """Verify the complete document, optionally pinned to an explicitly read version."""
         item = self._memory_attachment_item(identifier)
         settings = self.runtime.config.settings
         if item["size"] > min(settings.limits.max_file_bytes, settings.uploads.max_file_bytes):
@@ -286,6 +286,23 @@ class LocalServices:
         ):
             raise ValueError("文档正文为空、无效或超过完整来源上限，未收藏节选")
         return item, view
+
+    async def prepare_memory_attachment(
+        self, identifier: str
+    ) -> tuple[dict[str, Any], str, dict[str, str] | None]:
+        """Select a full verifier from a small hint; the hint never authenticates content."""
+        self._memory_attachment_item(identifier)
+
+        def prefix() -> bytes:
+            with self.attachments.path(identifier).open("rb") as handle:
+                return handle.read(5)
+
+        header = await file_io(prefix)
+        if header.startswith((b"%PDF-", b"PK\x03\x04")):
+            item, view = await self.memory_document(identifier, None)
+            return item, view.content.decode("utf-8", errors="strict"), view.metadata()
+        item, content = await self.memory_attachment(identifier)
+        return item, content, None
 
     async def memory_transcript(self, identifier: str, revision: str) -> tuple[dict[str, Any], str]:
         """Collect exactly one existing complete ASR artifact, never its source audio."""

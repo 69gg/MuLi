@@ -74,6 +74,9 @@ let messageNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
 let dialogMemoryReturn = null;
+let dialogUploadReturn = null;
+let attachmentCollectionDialog = null;
+const attachmentCollectionAttempts = new Map();
 let taskDialog = null;
 let memoryDialog = null;
 let memoryPath = null;
@@ -213,6 +216,7 @@ function connectionCurrent(owner) {
 
 function invalidateConnection() {
   state.voiceSetupController?.release();
+  releaseAttachmentCollection();
   releaseMemoryWatches();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
@@ -298,7 +302,7 @@ function showLogin() {
   releaseMemorySources();
   releaseWorkflowActivity();
   releaseRecordDirectory(); state.recordQuery = "";
-  dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null;
+  dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null; dialogUploadReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
   state.connected = false; state.loading = false; state.auth.authenticated = false;
@@ -1061,13 +1065,15 @@ function resizeComposer() {
   const input = $("#message-input"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 220)}px`; renderComposer();
 }
 
-function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, onSubmit }) {
+function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, returnUploadTrigger = null, onSubmit }) {
+  releaseAttachmentCollection();
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
   dialogMemoryReturn = returnMemoryId ? { id: returnMemoryId, trigger: returnMemoryTrigger, pathButton: returnMemoryTrigger?.dataset.memoryPathRef ? memoryPath?.button : null } : null;
+  dialogUploadReturn = returnUploadTrigger ? { trigger: returnUploadTrigger, owner: connection } : null;
   const teamView = captureTeamView($("#other-view"));
   dialogTeamView = teamView?.inside ? teamView : null;
   $("#dialog-title").textContent = title;
@@ -1119,6 +1125,7 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  releaseAttachmentCollection();
   if (view !== "settings") state.voiceSetupController?.release();
   if (view === "settings" && state.view === "settings" && state.settingsDraft && !state.viewError && !state.viewLoading && $(".settings-layout", $("#other-view"))) {
     collectSettingsForm(); renderOtherView(); return;
@@ -1303,10 +1310,147 @@ async function refreshUploads(owner = connection) {
 }
 
 function renderUploads() {
+  releaseAttachmentCollection();
   const root = element("div", { class: "view-content" }, viewHeading("附件", "文件保存在本地，发送时只引用附件。", actionButton("添加文件", "attach-files", "primary-button", "plus")));
   if (!state.uploads.length) root.append(emptyState("attachment", "还没有附件", "图片、文档与音视频都可以添加。"));
-  for (const file of state.uploads) root.append(element("article", { class: "upload-row" }, renderAttachment(file), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id })));
+  for (const file of state.uploads) root.append(element("article", { class: "upload-row" }, renderAttachment(file), element("div", { class: "row-actions" }, actionButton("收藏", "collect-attachment", "text-button", null, { id: file.id }), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id }))));
   return root;
+}
+
+function releaseAttachmentCollection() {
+  const slot = attachmentCollectionDialog; attachmentCollectionDialog = null;
+  if (!slot) return;
+  slot.controller?.abort();
+  if (slot.attempt?.state === "pending" && attachmentCollectionAttempts.get(slot.file.id) === slot.attempt) {
+    slot.attempt.state = "unknown"; slot.attempt.controller.abort();
+  }
+  if ($("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) { dialogSubmit = null; $("#app-dialog").close(); }
+}
+
+function attachmentCollectionCurrent(slot) {
+  return !!slot && attachmentCollectionDialog === slot && connectionCurrent(slot.owner) && slot.owner.ready && slot.viewVersion === viewRequestVersion && state.auth.authenticated && state.view === "uploads" && $("#other-view").contains(slot.trigger) && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function attachmentCollectionIdentity(value, id) {
+  const digest = (field) => typeof field === "string" && /^[a-f0-9]{64}$/.test(field);
+  if (!value || typeof id !== "string" || value.attachment_id !== id || !/^[a-f0-9]{32}$/.test(id) || value.source_id !== `attachment:${id}` || !digest(value.source_revision) || !digest(value.registered_revision) || value.session_id !== "" || value.role !== "tool" || value.principal !== "external:attachment" || value.trusted_owner !== false || typeof value.source !== "string") return false;
+  const scopes = { text: "utf8_text", pdf: "pdf_text_layer", docx: "docx_main_body_text" };
+  if (typeof value.format !== "string" || !Object.hasOwn(scopes, value.format) || value.scope !== scopes[value.format] || (value.format === "text" ? value.document_revision !== null : !digest(value.document_revision))) return false;
+  const marker = value.source.split(":");
+  return marker[0] === "attachment" && marker[1] === id && (value.format === "text"
+    ? marker.length === 3 && marker[2] === value.source_revision
+    : marker.length === 8 && marker[2] === "document" && marker[3] === "v1" && marker[4] === value.format && marker[5] === value.scope && marker[6] === value.source_revision && marker[7] === value.document_revision);
+}
+
+function attachmentCollectionPreview(value, id) {
+  if (!attachmentCollectionIdentity(value, id) || typeof value.filename !== "string" || !value.filename || value.read_only !== true || typeof value.processing_notice !== "string" || !value.processing_notice.trim() || value.field !== "content" || typeof value.content !== "string") throw new Error("资料预览无法完整核查，请重新准备。");
+  const length = new TextEncoder().encode(value.content).length;
+  if (![value.offset_bytes, value.length_bytes, value.next_offset_bytes, value.total_bytes].every((field) => Number.isSafeInteger(field) && field >= 0) || value.offset_bytes !== 0 || value.length_bytes !== length || value.next_offset_bytes !== length || length > value.total_bytes || value.total_bytes === 0 || typeof value.has_more !== "boolean" || value.has_more !== (length < value.total_bytes) || !length) throw new Error("资料预览范围不一致，请重新准备。");
+  return value;
+}
+
+function attachmentCollectionBinding(page) {
+  return Object.freeze(Object.fromEntries(["attachment_id", "source_revision", "format", "scope", "document_revision", "source_id", "registered_revision", "source", "session_id", "role", "principal", "trusted_owner", "total_bytes"].map((key) => [key, page[key]])));
+}
+
+function attachmentCollectionReceipt(value, binding) {
+  return attachmentCollectionIdentity(value, binding.attachment_id) && Object.keys(binding).filter((key) => key !== "total_bytes").every((key) => value[key] === binding[key]) && typeof value.created === "boolean" && typeof value.state === "string" && (Object.hasOwn(memoryJobStates, value.state) || ["disabled", "forgotten"].includes(value.state)) && (!["disabled", "forgotten"].includes(value.state) || value.created === false);
+}
+
+function renderAttachmentCollection(slot) {
+  if (!attachmentCollectionCurrent(slot)) return;
+  const focused = slot.content.contains(document.activeElement) || document.activeElement === $("#dialog-submit");
+  const saving = slot.phase === "pending", loading = !!slot.controller;
+  slot.content.setAttribute("aria-busy", String(saving || loading));
+  slot.content.replaceChildren(element("h3", { text: slot.preview?.filename ?? slot.file.name }));
+  const submit = $("#dialog-submit"); submit.textContent = "确认收藏"; submit.hidden = slot.phase !== "ready"; submit.disabled = loading || saving;
+  dialogSubmit = slot.phase === "ready" ? () => confirmAttachmentCollection(slot) : null;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = slot.phase === "ready" ? "取消" : "关闭";
+  if (slot.preview && ["ready", "pending"].includes(slot.phase)) {
+    slot.content.append(element("p", { class: "settings-role-hint", text: { text: "完整 UTF-8 文本", pdf: "PDF 文本层", docx: "DOCX 主文档正文" }[slot.preview.format] }), element("p", { class: "memory-source-content", text: slot.preview.content }), element("p", { class: "settings-role-hint", text: slot.preview.has_more ? "预览还有后文。" : "已显示本次正文。" }), element("p", { class: "settings-role-hint", text: slot.preview.processing_notice }));
+  }
+  const messages = { loading: "正在核对资料…", pending: "正在收藏…", unknown: "收藏结果尚未确认，请先核对。", present: "这份准确资料当前已登记。", error: slot.error };
+  if (slot.phase === "receipt") messages.receipt = slot.receipt.state === "disabled" ? "记忆未启用，本次未登记。" : slot.receipt.state === "forgotten" ? "这份资料已遗忘，本次未重新登记。" : `资料已登记 · ${memoryJobStates[slot.receipt.state]}`;
+  if (messages[slot.phase]) slot.content.append(element("p", { role: "status", text: messages[slot.phase] }));
+  if (slot.error && slot.phase === "unknown") slot.content.append(element("p", { class: "form-error", text: slot.error }));
+  const action = (text, callback) => {
+    const button = element("button", { type: "button", class: "text-button", text, disabled: loading, onClick: () => { if (attachmentCollectionCurrent(slot) && slot.content.contains(button) && !button.disabled) void callback(); } });
+    slot.content.append(button);
+  };
+  if (slot.phase === "unknown") action("核对结果", () => reconcileAttachmentCollection(slot));
+  if (["unknown", "error"].includes(slot.phase)) action("重新准备", () => prepareAttachmentCollection(slot, true));
+  if (slot.phase === "present" || (slot.phase === "receipt" && !["disabled", "forgotten"].includes(slot.receipt.state))) action("核原文", () => {
+    const binding = slot.attempt.binding;
+    return openCatalogSource({ source_id: binding.source_id, revision: binding.registered_revision, source: binding.source, session_id: binding.session_id, role: binding.role, principal: binding.principal, trusted_owner: binding.trusted_owner, total_bytes: binding.total_bytes }, slot.trigger, { uploadReturn: slot.trigger });
+  });
+  animatePanel(slot.content);
+  if (focused) (slot.phase === "ready" ? submit : $$("button", slot.content).find((button) => !button.disabled) ?? $("#dialog-close")).focus({ preventScroll: true });
+}
+
+async function openAttachmentCollection(file, trigger) {
+  const owner = connection;
+  if (!connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || state.view !== "uploads" || !file || trigger?.dataset.id !== file.id || !$("#other-view").contains(trigger) || typeof file.id !== "string" || !/^[a-f0-9]{32}$/.test(file.id)) return;
+  const content = element("div", { class: "memory-verification" });
+  openDialog({ title: "收藏到长期记忆", content, readOnly: true, returnUploadTrigger: trigger });
+  const attempt = attachmentCollectionAttempts.get(file.id);
+  const slot = attachmentCollectionDialog = { owner, file, trigger, content, viewVersion: viewRequestVersion, controller: null, attempt, preview: null, phase: attempt ? "unknown" : "loading", error: "" };
+  renderAttachmentCollection(slot);
+  if (!attempt) await prepareAttachmentCollection(slot);
+}
+
+async function prepareAttachmentCollection(slot, newIntent = false) {
+  if (!attachmentCollectionCurrent(slot) || slot.controller || slot.phase === "pending") return;
+  const previous = attachmentCollectionAttempts.get(slot.file.id);
+  if (previous && !newIntent) return;
+  const controller = new AbortController(); slot.controller = controller; slot.phase = "loading"; slot.preview = null; slot.error = "";
+  renderAttachmentCollection(slot);
+  try {
+    const page = await ownedRequest(`/uploads/${encodeURIComponent(slot.file.id)}/memory-preview`, { cache: "no-store", signal: controller.signal }, slot.owner);
+    if (!attachmentCollectionCurrent(slot) || slot.controller !== controller) return;
+    slot.preview = attachmentCollectionPreview(page, slot.file.id);
+    if (previous && attachmentCollectionAttempts.get(slot.file.id) === previous) attachmentCollectionAttempts.delete(slot.file.id);
+    slot.attempt = null; slot.phase = "ready";
+  } catch (error) {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) { slot.error = error.message; slot.phase = previous ? "unknown" : "error"; }
+  } finally {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) { slot.controller = null; renderAttachmentCollection(slot); }
+  }
+}
+
+async function confirmAttachmentCollection(slot) {
+  if (!attachmentCollectionCurrent(slot) || slot.phase !== "ready" || slot.controller || !slot.preview || attachmentCollectionAttempts.has(slot.file.id)) return;
+  const binding = attachmentCollectionBinding(slot.preview), attempt = { binding, state: "pending", controller: new AbortController() };
+  slot.attempt = attempt; attachmentCollectionAttempts.set(slot.file.id, attempt); slot.phase = "pending";
+  renderAttachmentCollection(slot);
+  try {
+    const receipt = await ownedRequest(`/uploads/${encodeURIComponent(slot.file.id)}/memory-collection`, { method: "POST", body: { source_revision: binding.source_revision, document_revision: binding.document_revision, registered_revision: binding.registered_revision }, cache: "no-store", signal: attempt.controller.signal }, slot.owner);
+    if (!attachmentCollectionReceipt(receipt, binding)) throw new Error("收藏回执无法完整核查。");
+    if (attachmentCollectionAttempts.get(slot.file.id) !== attempt || !attachmentCollectionCurrent(slot)) return;
+    attempt.state = "recorded"; attachmentCollectionAttempts.delete(slot.file.id); slot.receipt = receipt; slot.phase = "receipt";
+  } catch {
+    if (attachmentCollectionAttempts.get(slot.file.id) === attempt) { attempt.state = "unknown"; if (attachmentCollectionCurrent(slot)) slot.phase = "unknown"; }
+  } finally {
+    if (attachmentCollectionCurrent(slot)) renderAttachmentCollection(slot);
+  }
+}
+
+async function reconcileAttachmentCollection(slot) {
+  const attempt = slot.attempt;
+  if (!attachmentCollectionCurrent(slot) || slot.phase !== "unknown" || slot.controller || !attempt || attachmentCollectionAttempts.get(slot.file.id) !== attempt) return;
+  const binding = attempt.binding, controller = new AbortController(); slot.controller = controller; slot.error = "";
+  renderAttachmentCollection(slot);
+  try {
+    const query = new URLSearchParams({ id: binding.source_id, revision: binding.registered_revision });
+    const page = await ownedRequest(`/memory/source?${query}`, { cache: "no-store", signal: controller.signal }, slot.owner);
+    if (!attachmentCollectionCurrent(slot) || slot.controller !== controller || attachmentCollectionAttempts.get(slot.file.id) !== attempt) return;
+    const reader = { catalogSource: true, item: { source_id: binding.source_id, origin: { id: binding.source_id, digest: binding.registered_revision } } };
+    if (!validMemorySource(page, reader, 0) || page.id !== binding.source_id || page.digest !== binding.registered_revision || page.source !== binding.source || page.session_id !== binding.session_id || page.role !== binding.role || page.principal !== binding.principal || page.trusted_owner !== binding.trusted_owner || page.total_bytes !== binding.total_bytes) throw new Error("尚无法核对这份准确资料。");
+    attempt.state = "observed"; attachmentCollectionAttempts.delete(slot.file.id); slot.phase = "present";
+  } catch (error) {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) slot.error = [404, 409].includes(error.status) ? "资料目前不可核对，请稍后再查。" : error.message;
+  } finally {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) { slot.controller = null; renderAttachmentCollection(slot); }
+  }
 }
 
 async function refreshTeam(changes = {}, owner = connection) {
@@ -1959,10 +2103,10 @@ async function showCatalogSource(catalog, item, trigger) {
   await openCatalogSource(item, trigger);
 }
 
-async function openCatalogSource(item, trigger, { anchor = null, comparisonReturn = null } = {}) {
+async function openCatalogSource(item, trigger, { anchor = null, comparisonReturn = null, uploadReturn = null } = {}) {
   const offset = anchor?.offset ?? 0;
   const content = element("div", { class: "memory-verification" });
-  openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger });
+  openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger, returnUploadTrigger: uploadReturn });
   const origin = { ...item, id: item.source_id, digest: item.revision };
   const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [offset], sourceStart: offset, sourceAnchor: anchor, comparisonReturn, comparisonSources: comparisonReturn ? [comparisonReturn.pair.left_id, comparisonReturn.pair.right_id] : undefined, pageIndex: 0, page: null, editing: false };
   memoryDialog = slot;
@@ -3496,6 +3640,7 @@ async function handleAction(action, button) {
     if (file && !state.attachments.some((entry) => entry.id === file.id)) state.attachments.push(file);
     renderComposerAttachments(); await switchView("chat");
   }
+  if (action === "collect-attachment") await openAttachmentCollection(state.uploads.find((entry) => entry.id === button.dataset.id), button);
   if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
   if (action === "refresh-team") await refreshTeam();
   if (action === "view-task-brief") await showTaskBrief(button.dataset.commitment);
@@ -3518,7 +3663,10 @@ async function handleAction(action, button) {
   if (action === "stop") await stopRun(button);
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
   if (action === "refresh-approvals") await refreshApprovals();
-  if (action === "close-dialog") $("#app-dialog").close();
+  if (action === "close-dialog") {
+    if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
+    else $("#app-dialog").close();
+  }
   if (action === "copy-message") {
     const message = conversationItems(state.session).find((item) => item.kind === "message" && String(item.id) === button.dataset.id)?.message ?? state.session.messages.find((item) => String(item.id) === button.dataset.id);
     if (message) { await navigator.clipboard.writeText(message.content); toast("已复制"); }
@@ -3698,14 +3846,24 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   catch (error) { if (current()) { $("#dialog-error").textContent = error.message ?? String(error); $("#dialog-error").hidden = false; } }
   finally { if (current()) submit.disabled = false; }
 });
+$("#app-dialog").addEventListener("cancel", () => {
+  if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
+});
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseAttachmentCollection();
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
   releaseTaskDialog();
   releaseMemoryDialog();
   releaseHistoryDialog();
   const saved = dialogTeamView; dialogTeamView = null;
+  const uploadReturn = dialogUploadReturn; dialogUploadReturn = null;
+  if (uploadReturn && connectionCurrent(uploadReturn.owner) && state.auth.authenticated && state.view === "uploads") {
+    const root = $("#other-view");
+    const target = root.contains(uploadReturn.trigger) ? uploadReturn.trigger : $(".view-heading h2", root);
+    if (target) { if (target !== uploadReturn.trigger) target.tabIndex = -1; target.focus({ preventScroll: true }); }
+  }
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
   const memoryReturn = dialogMemoryReturn; dialogMemoryReturn = null;
   if (state.auth.authenticated && state.view === "memories" && memoryReturn) {

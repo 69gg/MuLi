@@ -1,6 +1,7 @@
 /** Browser-only interactive demo. Nothing in this module calls a MuLi server. */
 const encoder = new TextEncoder();
 const watchOutputBytes = 64 * 1024; // Server MAX_MATCH_PROOF_BYTES, also for the demo envelope.
+const previewNotesUploadId = "b".repeat(32);
 const clone = (value) => structuredClone(value);
 const timestamp = () => Date.now() / 1000;
 let sequence = 0;
@@ -82,8 +83,8 @@ export function createPreviewState() {
       { id: "reminder-review", kind: "reminder", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now },
       { id: "calendar-study", kind: "calendar_reminder", title: "早晨背单词", content: "每天留一点时间复习。", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "07:30", weekdays: [1, 2, 3, 4, 5] }, due_at: now + 7200, interval_seconds: null, enabled: true, fired_count: 0, created_at: now },
     ],
-    uploads: [{ id: "demo-notes", name: "项目整理示例.md", mime_type: "text/markdown", size: encoder.encode(notes).length, source: "preview", created_at: now - 3600 }],
-    files: new Map([["demo-notes", new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
+    uploads: [{ id: previewNotesUploadId, name: "项目整理示例.md", mime_type: "text/markdown", size: encoder.encode(notes).length, source: "preview", created_at: now - 3600 }],
+    files: new Map([[previewNotesUploadId, new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
     management: { plugins: [{ id: "preview-notes", name: "资料整理示例", version: "demo", status: "loaded" }], plans: [], update: { status: "checked", available: false, current: "交互预览", latest: "交互预览", checked_at: now } },
     extensions: { generation: 1, phase: "loaded", skills: { enabled: true, count: 2 }, mcp: mcpStatus(mcp), preview: true },
@@ -187,7 +188,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         member.status = "completed"; member.last_message = "已整理目标、行动清单与待确认事项。"; emit("team.updated", { agent_id: member.id });
         tool(run, "wait_agents", { agent_ids: [member.id] }, { reports: [{ agent_id: member.id, result: member.last_message }] }, () => {
           notify("整理结果已就绪", "演示队友已完成整理，你可以在对话和附件页查看结果。", run.session_id);
-          finish(run, `整理好了。\n\n### 先做这三件事\n1. **明确目标**：把“${run.prompt.slice(0, 48)}${run.prompt.length > 48 ? "…" : ""}”拆成可以核对的结果。\n2. **分工与复核**：队友整理资料，另一轮检查遗漏和边界。\n3. **交付并跟进**：把关键结论、待办与需要你确认的部分放在一起。\n\n我把示例整理文档附在下面了。你可以继续让我细化下一步，也可以去团队、记忆或设置页看看。\n\n*以上为浏览器内的流程演示，没有运行真实模型或工具。*`, ["demo-notes"]);
+          finish(run, `整理好了。\n\n### 先做这三件事\n1. **明确目标**：把“${run.prompt.slice(0, 48)}${run.prompt.length > 48 ? "…" : ""}”拆成可以核对的结果。\n2. **分工与复核**：队友整理资料，另一轮检查遗漏和边界。\n3. **交付并跟进**：把关键结论、待办与需要你确认的部分放在一起。\n\n我把示例整理文档附在下面了。你可以继续让我细化下一步，也可以去团队、记忆或设置页看看。\n\n*以上为浏览器内的流程演示，没有运行真实模型或工具。*`, [previewNotesUploadId]);
         });
       });
     }, delay * 2);
@@ -250,6 +251,27 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     return { items: selected, has_more: more, [key]: more ? selected.at(-1).id : null };
   };
   const status = () => ({ configured: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+
+  // This local demo backend reads only its bounded in-memory text blobs. It does
+  // not pretend to extract PDF/DOCX or use these digests to authorize real work.
+  const sha256 = async (raw) => {
+    if (!globalThis.crypto?.subtle) throw new Error("当前演示环境无法核对资料版本。");
+    return [...new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", raw))].map((value) => value.toString(16).padStart(2, "0")).join("");
+  };
+  const collectionFits = (value) => Array.from(JSON.stringify(value)).length <= state.settings.limits.max_output_chars;
+  async function collectionSnapshot(id) {
+    const file = state.uploads.find((entry) => entry.id === id), blob = state.files.get(id);
+    if (!file || !blob || !/^[a-f0-9]{32}$/u.test(id)) throw new Error("没有这份演示附件。");
+    if (!blob.type.startsWith("text/") || blob.size > Math.min(state.settings.uploads.max_file_bytes, state.settings.limits.max_file_bytes)) throw new Error("演示仅提供限额内 UTF-8 文本收藏；文档提取请在真实服务中使用。");
+    const raw = new Uint8Array(await blob.arrayBuffer()), content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw);
+    if (!content.trim() || content.includes("\0")) throw new Error("演示附件正文无效。");
+    const sourceRevision = await sha256(raw), sourceId = `attachment:${id}`, marker = `${sourceId}:${sourceRevision}`;
+    const source = { content, source: marker, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false };
+    // Match the existing source_digest field order and JSON spacing for text.
+    const packed = "{" + Object.entries(source).map(([key, value]) => `${JSON.stringify(key)}: ${JSON.stringify(value)}`).join(", ") + "}";
+    const identity = { attachment_id: id, source_revision: sourceRevision, format: "text", scope: "utf8_text", document_revision: null, source_id: sourceId, registered_revision: await sha256(encoder.encode(packed)), source: marker, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false };
+    return { file, content, identity };
+  }
 
   async function fetchPreview(input, options = {}) {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url, "http://preview.local");
@@ -483,6 +505,27 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     }
     if (parts[0] === "uploads") {
       if (parts.length === 1 && method === "GET") return response({ items: state.uploads });
+      if (parts.length === 3 && ((parts[2] === "memory-preview" && method === "GET") || (parts[2] === "memory-collection" && method === "POST"))) {
+        if (state.settings.disabled_tools.includes("memory_import_attachment")) return failure("附件收藏工具未启用。");
+        if (method === "POST" && (Object.keys(body).sort().join(",") !== "document_revision,registered_revision,source_revision" || ![body.source_revision, body.registered_revision].every((value) => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value)) || body.document_revision !== null)) return failure("请提交这次准备的准确资料版本。", 422);
+        let snapshot;
+        try { snapshot = await collectionSnapshot(id); } catch (error) { return failure(error.message); }
+        if (signal?.aborted) throw new DOMException("请求已取消", "AbortError");
+        if (disposed || state.settings.disabled_tools.includes("memory_import_attachment")) return failure("本次收藏已不可用。");
+        const { file, content, identity } = snapshot;
+        if (method === "GET") {
+          const text = Array.from(content).slice(0, 64).join(""), length = encoder.encode(text).length, total = encoder.encode(content).length;
+          const preview = { ...identity, filename: file.name, read_only: true, processing_notice: "本次只核对资料；确认时使用当时设置，后台整理可能向已配置服务发送正文。", field: "content", content: text, offset_bytes: 0, length_bytes: length, next_offset_bytes: length, total_bytes: total, has_more: length < total };
+          return collectionFits(preview) ? response(preview) : failure({ code: "output_budget", message: "完整资料身份及预览超过当前输出预算。" });
+        }
+        if (["source_revision", "document_revision", "registered_revision"].some((key) => body[key] !== identity[key])) return failure("资料版本已变化，请重新准备。", 409);
+        const existing = state.memorySources.find((item) => item.source_id === identity.source_id);
+        if (existing && existing.revision !== identity.registered_revision) return failure("这份资料已登记其它版本，请先核查。", 409);
+        const receipt = { ...identity, state: !state.settings.memory.enabled ? "disabled" : existing?.job.state ?? "queued", created: state.settings.memory.enabled && !existing };
+        if (!collectionFits(receipt)) return failure({ code: "output_budget", message: "完整收藏回执超过当前输出预算。" });
+        if (receipt.created) state.memorySources.unshift({ ...identity, revision: identity.registered_revision, content, total_bytes: encoder.encode(content).length, created_at: timestamp(), job: { state: "queued", attempts: 0, last_error: "" } });
+        return response(receipt);
+      }
       if (parts.length === 1 && method === "POST") {
         const blob = options.body instanceof Blob ? options.body : new Blob([options.body ?? ""]);
         if (blob.size > state.settings.uploads.max_file_bytes) return failure("文件超过预览附件大小上限。", 413);
@@ -490,7 +533,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         const totalBytes = [...state.files.values()].reduce((total, file) => total + file.size, 0);
         if (totalBytes + blob.size > state.previewLimits.max_upload_bytes) return failure("预览附件总容量已达上限，请刷新页面重置演示数据。", 413);
         const headers = new Headers(options.headers); let name = headers.get("X-File-Name") || "附件"; try { name = decodeURIComponent(name); } catch { /* Keep the visible original name. */ }
-        const item = { id: identifier("upload"), name, mime_type: blob.type || "application/octet-stream", size: blob.size, source: "preview", created_at: timestamp() };
+        const item = { id: (++sequence).toString(16).padStart(32, "0"), name, mime_type: blob.type || "application/octet-stream", size: blob.size, source: "preview", created_at: timestamp() };
         state.uploads.unshift(item); state.files.set(item.id, blob); emit("upload.created", item); return response(item);
       }
       if (["content", "download"].includes(parts[2]) && method === "GET") return state.files.has(id) ? new Response(state.files.get(id)) : failure("演示附件不存在。", 404);

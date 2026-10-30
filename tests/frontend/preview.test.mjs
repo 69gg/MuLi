@@ -1,7 +1,67 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createSSEParser } from "../../web/api.mjs";
 import { createPreviewState, createPreviewBackend, installPreview, installPreviewNavigation } from "../../web/preview.mjs";
+
+test("preview attachment collection prepares and registers complete local text without sending chat", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const file = backend.state.uploads[0], raw = await backend.state.files.get(file.id).text();
+  const before = structuredClone({ sources: backend.state.memorySources, messages: backend.state.messages, runs: backend.state.runs, events: backend.state.events });
+  const prepared = await json(backend, `/uploads/${file.id}/memory-preview`);
+  assert.equal(prepared.status, 200); const page = prepared.body;
+  assert.equal(page.attachment_id, file.id); assert.equal(page.filename, file.name); assert.equal(page.read_only, true);
+  assert.equal(page.format, "text"); assert.equal(page.scope, "utf8_text"); assert.equal(page.document_revision, null);
+  assert.equal(page.source_revision, createHash("sha256").update(raw).digest("hex"));
+  assert.match(page.registered_revision, /^[a-f0-9]{64}$/u); assert.notEqual(page.registered_revision, page.source_revision);
+  assert.equal(page.source_id, `attachment:${file.id}`); assert.equal(page.source, `${page.source_id}:${page.source_revision}`);
+  assert.equal(page.session_id, ""); assert.equal(page.principal, "external:attachment"); assert.equal(page.role, "tool"); assert.equal(page.trusted_owner, false);
+  assert.equal(page.total_bytes, Buffer.byteLength(raw)); assert.equal(page.length_bytes, Buffer.byteLength(page.content));
+  assert.ok(raw.startsWith(page.content)); assert.equal(page.has_more, page.length_bytes < page.total_bytes); assert.ok(page.content.length <= raw.length);
+  assert.deepEqual(backend.state.memorySources, before.sources); assert.equal(backend.state.requests.some(({ method }) => method === "POST"), false);
+  const binding = { source_revision: page.source_revision, document_revision: page.document_revision, registered_revision: page.registered_revision };
+  const saved = await json(backend, `/uploads/${file.id}/memory-collection`, "POST", binding);
+  assert.equal(saved.status, 200); assert.equal(saved.body.state, "queued"); assert.equal(saved.body.created, true);
+  assert.equal(saved.body.registered_revision, page.registered_revision); assert.equal(Object.hasOwn(saved.body, "content"), false);
+  assert.equal(backend.state.memorySources.length, before.sources.length + 1);
+  let content = "", offset = 0;
+  for (let count = 0; count < page.total_bytes; count++) {
+    const read = await json(backend, `/memory/source?${new URLSearchParams({ id: page.source_id, revision: page.registered_revision, offset_bytes: String(offset), length_bytes: "11" })}`);
+    assert.equal(read.status, 200); assert.equal(read.body.source, page.source); assert.equal(read.body.digest, page.registered_revision);
+    assert.equal(read.body.session_id, ""); assert.equal(read.body.principal, "external:attachment"); assert.equal(read.body.trusted_owner, false);
+    content += read.body.content;
+    if (!read.body.has_more) break;
+    assert.ok(read.body.next_offset_bytes > offset); offset = read.body.next_offset_bytes;
+  }
+  assert.equal(content, raw);
+  const repeated = await json(backend, `/uploads/${file.id}/memory-collection`, "POST", binding);
+  assert.equal(repeated.body.created, false); assert.equal(repeated.body.state, "queued");
+  assert.equal(backend.state.memorySources.length, before.sources.length + 1);
+  assert.deepEqual(backend.state.messages, before.messages); assert.deepEqual(backend.state.runs, before.runs); assert.deepEqual(backend.state.events, before.events);
+});
+
+test("preview collection rejects changed versions and output failures before registering any source", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const file = backend.state.uploads[0], path = `/uploads/${file.id}`, sources = structuredClone(backend.state.memorySources);
+  const page = (await json(backend, `${path}/memory-preview`)).body;
+  const binding = { source_revision: page.source_revision, document_revision: page.document_revision, registered_revision: page.registered_revision };
+  assert.equal((await json(backend, `${path}/memory-collection`, "POST", { ...binding, trusted_owner: true })).status, 422);
+  backend.state.files.set(file.id, new Blob(["确实变化的新演示正文🙂"], { type: "text/plain" }));
+  assert.equal((await json(backend, `${path}/memory-collection`, "POST", binding)).status, 409);
+  const fresh = (await json(backend, `${path}/memory-preview`)).body;
+  const current = { source_revision: fresh.source_revision, document_revision: fresh.document_revision, registered_revision: fresh.registered_revision };
+  const maxChars = backend.state.settings.limits.max_output_chars; backend.state.settings.limits.max_output_chars = 16;
+  const tooSmall = await json(backend, `${path}/memory-collection`, "POST", current);
+  assert.equal(tooSmall.status, 400); assert.equal(tooSmall.body.detail.code, "output_budget");
+  assert.equal((await json(backend, `${path}/memory-preview`)).status, 400);
+  backend.state.settings.limits.max_output_chars = maxChars; backend.state.settings.memory.enabled = false;
+  const disabled = await json(backend, `${path}/memory-collection`, "POST", current);
+  assert.equal(disabled.body.state, "disabled"); assert.equal(disabled.body.created, false);
+  backend.state.settings.disabled_tools.push("memory_import_attachment");
+  assert.equal((await json(backend, `${path}/memory-preview`)).status, 400);
+  assert.equal((await json(backend, `${path}/memory-collection`, "POST", current)).status, 400);
+  assert.deepEqual(backend.state.memorySources, sources); assert.deepEqual(backend.state.runs, {});
+});
 
 test("preview watch paging and exact cancellation stay local, including disabled processing", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());

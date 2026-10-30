@@ -121,6 +121,12 @@ class TranscriptionInput(Input):
     attachment_id: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
+class AttachmentCollectionInput(Input):
+    source_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    document_revision: str | None = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    registered_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+
+
 class LoginInput(Input):
     password: str = Field(min_length=1, max_length=1024)
 
@@ -276,6 +282,7 @@ def _create_app(
         local_services.media,
         attachment_reader=local_services.memory_attachment,
         document_reader=local_services.memory_document,
+        attachment_preparer=local_services.prepare_memory_attachment,
         transcript_reader=local_services.memory_transcript,
         webpage_reader=local_services.memory_webpage,
     )
@@ -817,6 +824,34 @@ def _create_app(
             content_disposition_type="inline" if inline else "attachment",
             headers={"Content-Security-Policy": "sandbox; default-src 'none'"},
         )
+
+    @app.get("/api/uploads/{identifier}/memory-preview")
+    async def prepare_attachment_collection(identifier: str, request: Request) -> dict[str, Any]:
+        try:
+            return await request_operation(
+                request,
+                memory_application.attachment_collection(
+                    identifier, None, closing=lambda: configuration_closing
+                ),
+                cancelled_message="资料核对已取消",
+            )
+        except PermissionError as error:
+            raise HTTPException(403, str(error)) from error
+
+    @app.post("/api/uploads/{identifier}/memory-collection")
+    async def collect_attachment(
+        identifier: str, body: AttachmentCollectionInput, request: Request
+    ) -> dict[str, Any]:
+        try:
+            return await request_operation(
+                request,
+                memory_application.attachment_collection(
+                    identifier, body.model_dump(), closing=lambda: configuration_closing
+                ),
+                cancelled_message="收藏请求已取消，请核对准确来源",
+            )
+        except PermissionError as error:
+            raise HTTPException(403, str(error)) from error
 
     @app.get("/api/conversation")
     async def conversation() -> dict[str, Any]:

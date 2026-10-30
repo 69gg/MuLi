@@ -20,8 +20,9 @@ from muli.attachment_memory_source import (
 from muli.attachments import ATTACHMENT_ID_PATTERN
 from muli.channels.types import NAMES as CHANNEL_NAMES
 from muli.document_settings import DocumentSettingsStore
-from muli.evidence import EvidenceError, json_size, validate_integer
+from muli.evidence import EvidenceError, content_page, json_size, validate_integer
 from muli.media import MediaService
+from muli.memory import source_digest
 from muli.memory_chunks import MemoryChunkSettings
 from muli.memory_context import MemoryContextProvider, PromptComposition, _PromptBudget
 from muli.memory_evidence import SOURCE_JOB_STATES, SOURCE_PAGE_LIMIT, MemoryEvidence, query_result
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
 
 AttachmentReader = Callable[[str], Awaitable[tuple[dict[str, Any], str]]]
 DocumentReader = Callable[[str, str], Awaitable[tuple[dict[str, Any], "DocumentView"]]]
+AttachmentContent = tuple[dict[str, Any], str, dict[str, str] | None]
+AttachmentPreparer = Callable[[str], Awaitable[AttachmentContent]]
 TranscriptReader = Callable[[str, str], Awaitable[tuple[dict[str, Any], str]]]
 WebpageReader = Callable[[str, str], Awaitable[tuple[dict[str, Any], str]]]
 
@@ -53,12 +56,14 @@ class MemoryApplication:
         document_reader: DocumentReader | None = None,
         transcript_reader: TranscriptReader | None = None,
         webpage_reader: WebpageReader | None = None,
+        attachment_preparer: AttachmentPreparer | None = None,
     ) -> None:
         self.runtime, self.media_factory = runtime, media_factory
         self.attachment_reader = attachment_reader
         self.document_reader = document_reader
         self.transcript_reader = transcript_reader
         self.webpage_reader = webpage_reader
+        self.attachment_preparer = attachment_preparer
         self._attachment_generation = object()
         self.media = media_factory()
         self.pipeline = self._pipeline()
@@ -1098,6 +1103,162 @@ class MemoryApplication:
             max_output_chars=self.runtime.config.settings.limits.max_output_chars,
         )
 
+    @staticmethod
+    async def _read_attachment(
+        identifier: str,
+        revision: str | None,
+        reader: AttachmentReader | None,
+        document_reader: DocumentReader | None,
+    ) -> AttachmentContent:
+        if revision is not None:
+            if not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{64}", revision) is None:
+                raise ValueError("文档收藏需要阅读结果中的完整 revision")
+            if document_reader is None:
+                raise ValueError("文档收藏读取服务未配置")
+            item, view = await document_reader(identifier, revision)
+            if view.revision != revision:
+                raise ValueError("文档提取版本已变化，未收藏")
+            return item, view.content.decode("utf-8", errors="strict"), view.metadata()
+        if reader is None:
+            raise ValueError("附件原始文本读取服务未配置")
+        item, content = await reader(identifier)
+        return item, content, None
+
+    def _collection_source(
+        self,
+        pipeline: MemoryPipeline,
+        identifier: str,
+        item: dict[str, Any],
+        content: str,
+        document: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        if len(content) > min(
+            pipeline.config.max_source_chars,
+            self.runtime.config.settings.memory.max_source_chars,
+        ):
+            raise ValueError("完整附件超过当前记忆来源上限，未收藏节选")
+        return self._attachment_source(
+            identifier, content, item["sha256"], item["created_at"], document=document
+        )
+
+    def _collection_policy(self) -> tuple[object, ...]:
+        settings = self.runtime.config.settings
+        return (
+            settings.memory.enabled,
+            settings.memory.max_source_chars,
+            settings.limits.max_file_bytes,
+            settings.limits.max_output_chars,
+            settings.uploads.max_file_bytes,
+            tuple(settings.disabled_tools),
+            self.pipeline.config.enabled,
+            self.pipeline.config.max_source_chars,
+            DocumentSettingsStore(self.runtime.store).read(),
+        )
+
+    def _collection_open(self, closing: Callable[[], bool]) -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        if closing() or self._closed or self.runtime._closing:
+            raise EvidenceError("evidence_changed", "收藏服务已关闭，请重新核对资料")
+        self.runtime.maintenance.admission.require()
+        if "memory_import_attachment" in self.runtime.config.settings.disabled_tools:
+            raise PermissionError("附件收藏工具未启用")
+
+    async def attachment_collection(
+        self,
+        identifier: str,
+        expected: dict[str, str | None] | None,
+        *,
+        closing: Callable[[], bool],
+    ) -> dict[str, Any]:
+        """Authenticated HTTP callers own authorization; preparation grants no future permit."""
+        runtime, task = self.runtime, asyncio.current_task()
+        async with runtime.configuration_lock:
+            self._collection_open(closing)
+            pipeline, generation = self.pipeline, self._attachment_generation
+            settings, policy = runtime.config.settings, self._collection_policy()
+            readers = self.attachment_reader, self.document_reader, self.attachment_preparer
+
+        try:
+            if expected is None:
+                if readers[2] is None:
+                    raise ValueError("附件收藏预览服务未配置")
+                item, content, document = await readers[2](identifier)
+            else:
+                item, content, document = await self._read_attachment(
+                    identifier, expected["document_revision"], readers[0], readers[1]
+                )
+        except OSError as error:
+            raise EvidenceError("attachment_unavailable", "附件文件不可用，请重新核对") from error
+        except EvidenceError as error:
+            if error.code == "revision_changed":
+                raise EvidenceError("evidence_changed", "文档提取版本变化，请重新核对") from error
+            raise
+
+        # Lock acquisition can itself suspend. Recheck only after owning it, then
+        # keep every final fence and the existing synchronous ingest in one turn.
+        async with runtime.configuration_lock:
+            self._collection_open(closing)
+            if (
+                asyncio.current_task() is not task
+                or self.pipeline is not pipeline
+                or self._attachment_generation is not generation
+                or runtime.config.settings is not settings
+                or self._collection_policy() != policy
+                or readers
+                != (self.attachment_reader, self.document_reader, self.attachment_preparer)
+                or runtime.store.bounded_object(
+                    "attachment", identifier, max_bytes=settings.limits.max_output_chars * 4
+                )
+                != item
+            ):
+                raise EvidenceError("evidence_changed", "收藏期间服务或资料变化，请重新核对")
+            source = self._collection_source(pipeline, identifier, item, content, document)
+            identity = {
+                "attachment_id": identifier,
+                "source_revision": item["sha256"],
+                "format": document["format"] if document else "text",
+                "scope": document["scope"] if document else "utf8_text",
+                "document_revision": document["revision"] if document else None,
+                "source_id": source["id"],
+                "registered_revision": source_digest(source, trusted_owner=False),
+                **{key: source[key] for key in ("source", "session_id", "role", "principal")},
+                "trusted_owner": False,
+            }
+            if expected is None:
+                raw = content.encode("utf-8")
+                return content_page(
+                    {
+                        **identity,
+                        "filename": item["name"],
+                        "read_only": True,
+                        "processing_notice": "这里只核对资料；确认时使用当时设置，后台整理可能向已配置服务发送正文。",
+                    },
+                    raw[: settings.limits.max_output_chars * 4],
+                    offset_bytes=0,
+                    total_bytes=len(raw),
+                    max_output_chars=settings.limits.max_output_chars,
+                )
+            if any(identity[key] != value for key, value in expected.items()):
+                raise EvidenceError("evidence_changed", "附件或完整正文版本变化，请重新核对")
+            states = (*SOURCE_JOB_STATES, "disabled", "forgotten")
+            for state in states:
+                for created in (False, True):
+                    if (
+                        json_size({**identity, "state": state, "created": created})
+                        > settings.limits.max_output_chars
+                    ):
+                        raise EvidenceError("output_budget", "完整收藏回执超过输出预算，未登记")
+            if not settings.memory.enabled:
+                return {**identity, "state": "disabled", "created": False}
+            result = pipeline.ingest(source, trusted_owner=False)
+            if result["state"] not in states or type(result["created"]) is not bool:
+                raise EvidenceError(
+                    "collection_unavailable", "收藏状态无法核查，请只读核对准确来源"
+                )
+            return {**identity, "state": result["state"], "created": result["created"]}
+
     def attachment_tools(self, runtime: Runtime) -> list[Tool]:
         reader = self.attachment_reader
         document_reader = self.document_reader
@@ -1113,22 +1274,11 @@ class MemoryApplication:
         async def collect(args: dict[str, Any]) -> Any:
             request = self._attachment_guard(pipeline, generation)
             identifier = args["id"]
-            document: dict[str, str] | None = None
-            if "revision" in args:
-                revision = args["revision"]
-                if not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{64}", revision) is None:
-                    raise ValueError("文档收藏需要阅读结果中的完整 revision")
-                if document_reader is None:
-                    raise ValueError("文档收藏读取服务未配置")
-                item, view = await document_reader(identifier, revision)
-                document = view.metadata()
-                if view.revision != revision:
-                    raise ValueError("文档提取版本已变化，未收藏")
-                content = view.content.decode("utf-8", errors="strict")
-            else:
-                if reader is None:
-                    raise ValueError("附件原始文本读取服务未配置")
-                item, content = await reader(identifier)
+            if "revision" in args and args["revision"] is None:
+                raise ValueError("文档收藏需要阅读结果中的完整 revision")
+            item, content, document = await self._read_attachment(
+                identifier, args.get("revision"), reader, document_reader
+            )
             self._attachment_guard(pipeline, generation, expected_request=request)
             receipt = {
                 "attachment_id": identifier,
@@ -1142,19 +1292,7 @@ class MemoryApplication:
                     "state": "disabled",
                     "created": False,
                 }
-            if len(content) > min(
-                pipeline.config.max_source_chars,
-                runtime.config.settings.memory.max_source_chars,
-            ):
-                raise ValueError("完整附件超过当前记忆来源上限，未收藏节选")
-            if document is None:
-                source = self._attachment_source(
-                    identifier, content, item["sha256"], item["created_at"]
-                )
-            else:
-                source = self._attachment_source(
-                    identifier, content, item["sha256"], item["created_at"], document=document
-                )
+            source = self._collection_source(pipeline, identifier, item, content, document)
             # The read is the final await. All admission and lifecycle fences
             # above remain valid through the existing synchronous ingest commits.
             return {**pipeline.ingest(source, trusted_owner=False), **receipt}
