@@ -1,5 +1,7 @@
 # 资料收件目录：实现与验收合同
 
+本页是开发合同与历史验证记录。日常使用请看[资料收件目录](file-inbox.md)。下文的独立通知路由描述原有未绑定来源；项目关联采用精确 Web 本地路由，合同见[项目收件方案](proactive-project-inbox-proposal.md)。
+
 2026-10-24。用户持续自主迭代授权下提出的下一场景：主人明确指定一个目录，资料到达后沐璃及时提醒，主人随后可让她查看与整理。已有文件管理、系统注意事项、默认路由和出站账本继续复用；不监控整个 Home，不让模型定时检查目录。
 
 ## 首片范围与实现选择
@@ -14,7 +16,7 @@
 
 新增固定 file-inbox 宿主生产者及 canonical 收件事实，沿现有 attention_source 适配器进入 AttentionInbox，不伪装成 system.log。收件对象、canonical 事件和首次冻结的 independent 路由同事务落盘，提交后才唤醒 EventBus；消费时重新验证事件 ID、来源对象、当前 scope、策略 revision 及启用状态，不能只信任同名总线事件。
 
-继续使用 system:attention 与既有只读回合，不执行 owner hooks、不提炼主人身份或偏好。文件名与正文均不是主人指令；文件事件不授予移动、外发、团队调度或配置权限。通知只称“出现新的候选资料”，提供有界记录定位、类型/大小/观察时间；若展示文件名，须限制长度并标成外部数据，不默认注入正文或完整绝对路径。宿主不自动读取、解析或注入文件正文；沐璃仍可依现有 workspace、只读工具权限和来源策略按需读取，所得正文继续作为外部资料。这里不新增全面禁止 fs_read/fs_search 的限制。
+继续使用 system:attention，不执行 owner hooks、不提炼主人身份或偏好。generic Attention 现有工具包含 read 与 channel_send；项目关联另行固定纯 read 和精确 Web 本地路由，实际权限均沿用户所选模式。文件名与正文均不是主人指令；文件事件不授予移动、团队调度或配置权限。通知只称“出现新的候选资料”，提供有界记录定位、类型/大小/观察时间；若展示文件名，须限制长度并标成外部数据，不默认注入正文或完整绝对路径。宿主不自动读取、解析或注入文件正文；沐璃仍可依现有 workspace、只读工具权限和来源策略按需读取，所得正文继续作为外部资料。这里不新增全面禁止 fs_read/fs_search 的限制。
 
 来源证明独立承载类型、策略 revision 与 watcher 代次，不扩展冒用 chiliarch 的二元组。生产者提交事实和最终 Attention 接纳均在既有配置锁下重做来源复核，后者使用与提交相邻的 admission_guard；不能只在事件第一次进入队列时检查。
 
@@ -84,6 +86,6 @@ MuLi 的只读 file_inbox_list/file_inbox_get 及同源认证入口提供有限�
 
 本次未做挂载、卸载、内核溢出或持久化实验。inotify 不通知挂载覆盖现有目录，网络文件系统远端变化也可能无事件；现有路径复核不等于对并发 namespace 切换的原子证明。本功能不能承诺这些静默缺口可被完整检测或自动补收，不能据此次探针声称生产 watcher 或完整路径竞态已验收。
 
-所有后续验证继续经 scripts/check_local.py，串行使用共享 2 GiB、单次 1 GiB、swap 0、单 CPU 与既有硬期限；没有证明目录绑定与事件缺口的结果，不宣称功能已交付。
+所有后续验证继续经 scripts/check_local.py，沿当前 AGENTS.md 与守卫实际核验的共享资源和硬期限串行执行；没有证明目录绑定与事件缺口的结果，不宣称功能已交付。
 
 依据：[inotify 事件与溢出](https://man7.org/linux/man-pages/man7/inotify.7.html)、[Python FD 就绪回调](https://docs.python.org/3/library/asyncio-eventloop.html#watching-file-descriptors)、[systemd.path 行为](https://www.freedesktop.org/software/systemd/man/latest/systemd.path.html)、[轻量库候选官方文档](https://inotify-simple.readthedocs.io/en/latest/)。调研通过 Context7 核对 Python 事件循环；该库未在 Context7 检索到，尚未安装或证明兼容。接口资料不是实际验收。

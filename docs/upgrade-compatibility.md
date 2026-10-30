@@ -10,7 +10,7 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。七域当前精确读写值为：`database`、`install_profile` 的 `reads=[1]`、`writes=1`；`configuration` 的 `reads=[2]`、`writes=2`；`objects`、`outbox` 的 `reads=[3]`、`writes=3`；`ingress`、`memory` 的 `reads=[4]`、`writes=4`。它们对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示旧全 `1`、三域 `2`、长期问题关注前的三域 `3`、2.114 的 `memory=1`、网页收藏前 `memory=2` 或来源偏好前 `memory=3` 完整库可直接启动新版。非托管 Linux 的六种精确旧合同、非托管 macOS 的精确 `(1,3,2,4,3,2,1)` 或 `(1,3,2,4,3,3,1)` 合同需要[显式停机固定升级](channel-ownership-format-upgrade.md)，macOS 还须满足物理路径、权限与无托管痕迹条件；托管跨格式切换、其它 macOS 旧格式与 Windows 旧库升级仍拒绝，各平台新装直接使用当前格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。七域当前精确读写值为：`database`、`install_profile` 的 `reads=[1]`、`writes=1`；`configuration` 的 `reads=[2]`、`writes=2`；`objects`、`outbox` 的 `reads=[3]`、`writes=3`；`memory` 的 `reads=[4]`、`writes=4`；`ingress` 的 `reads=[5]`、`writes=5`。它们对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示任何已声明的旧格式可以直接启动新版。Linux 和 macOS 独立安装只接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的精确完整前序；托管跨格式切换、其它 macOS 旧格式与 Windows 旧库升级仍拒绝，各平台新装直接使用当前格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 
@@ -20,7 +20,9 @@ ASR 转写收藏曾将 `memory=1` 扩为 `memory=2`，其余六域不变。新�
 
 明确收藏已留存网页快照曾将 `memory` 扩为 `3`，其余六域保持原值。新 marker `attachment:<id>:webpage:v1:<scope>:<sha256>` 只接受 `http_utf8_text_v1`、`html_static_text_v1`；来源头与完整正文共同绑定摘要，保留外部身份。网页收藏前的 `memory=2` reader 会拒绝该 marker，不能让新来源伪装成普通文本，也不能用未改 DDL 推导格式兼容。新 reader 在升级后的库中继续恢复原有文本、文档和 ASR 来源；已有精确完整 `(1,3,2,4,3,2,1)` 库须在受支持的停机入口升级，即使尚未收藏网页也不能直接准入。
 
-本次 `memory=4` 解释 `memory_watch/version=2` 的严格宿主来源偏好；旧 v1 仍为 Web，不推断原私聊偏好。新记录和 canonical match 只向 Web 主 AI 提供准确来源，不能授予外发权限；普通文字/partial 不带投递路线，显式渠道工具仍受原审批和当前 guard 约束。复用既有 ingress origin/claims 和原 outbox，不改这两域的格式。`memory=3` reader 必须在启动 worker 前拒绝 memory4，精确旧库按上述停机入口升级到 `(1,3,2,4,3,4,1)`；冻结 P reader 与证据范围见[来源偏好格式说明](fresh-format-admission.md#长期问题关注的格式边界)。
+`memory=4` 解释 `memory_watch/version=2` 的严格宿主来源偏好；旧 v1 仍为 Web，不推断原私聊偏好。普通文字/partial 不带投递路线，显式渠道工具仍受原审批和当前 guard 约束。这次记忆合同变化当时保留了 ingress 与 outbox；随后项目复核将 ingress 独立扩为 `5`。冻结 P reader 的历史记忆单域边界仍保留，见[来源偏好格式说明](fresh-format-admission.md#长期问题关注的格式边界)。
+
+项目复核的 `attention_project` 必须从 ingress 逐条保留到归档消息、按准确证明分批，并将新主人输入留给独立下一运行。2.136 及此前的 ingress4 reader 不理解这些合同，不能因 Web 路由或表结构未变而继续处理。`ingress=5` 因此只声明精确读写 `5`；原完整 `(1,3,2,4,3,4,1)` 被保存为停机升级前序。旧 slot 的真实准入和同格式切换判定均须拒绝新库，不自动改 marker 或给 A/B 回退开例外。具体证据见[项目输入格式边界](fresh-format-admission.md#项目资料复核的格式边界)。
 
 网页来源只在主人明确选择准确快照、主助手调用 `memory_import_webpage(id, revision)` 后登记；捕获、阅读、摘录和重开不自动入库。该入口核验本地完整快照，不再抓取网站，后台继续遵守既有提炼、遗忘及模型请求边界。格式变更不放宽普通附件白名单、主人身份或来源授权。来源字节、旧 reader 的实际拒绝和 fixture 证据范围见[网页来源合同](fresh-format-admission.md#网页快照来源的格式边界)。
 

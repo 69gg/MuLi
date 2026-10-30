@@ -2,7 +2,7 @@
 
 本片将完整格式声明接入真实 Runtime 构造。只有 `Store.open_runtime` 在本次调用中以 `O_CREAT|O_EXCL` 创建的新数据库，才有发布 `runtime_state.format_state_v1` 的资格。已有空文件、历史库、普通 `Store(path)` 创建的库，以及上次初始化中断留下的无标记库，都不会因为结构相同而获得认证。
 
-这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，其中的局部迁移标记不能替代完整声明。非托管 Linux 库可使用[停机固定升级入口](channel-ownership-format-upgrade.md)列出的六种精确完整前序：全 `1`、旧 OneBot 三域 `2`、长期问题关注前四渠道格式、转写收藏前 2.114 格式、网页收藏前 `memory=2` 格式及来源偏好前 `memory=3` 格式。非托管 macOS 仅支持其中完整 `(1,3,2,4,3,2,1)` 或 `(1,3,2,4,3,3,1)`，并须满足指南中的既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
+这是本版本持久编码与解释行为的合同。它不证明实际 uv 环境、ResolverContext、安装来源或现有配置已经认证，也不代替随包兼容 manifest、protocol 2 或 A/B 切换的独立核验。正常 Runtime 只接受当前完整格式；已有无标记库与旧格式都在恢复业务前拒绝，局部迁移标记不能替代完整声明。非托管 Linux 接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的七种精确前序；非托管 macOS 接纳其中完整 `(1,3,2,4,3,2,1)`、`(1,3,2,4,3,3,1)` 或 `(1,3,2,4,3,4,1)`，并须满足既有物理路径、权限与无托管痕迹条件。Windows、其它 macOS 旧格式与托管跨格式更新仍拒绝；其他旧库继续使用原发行版。
 
 ## 真实构造顺序
 
@@ -30,7 +30,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=4`、`outbox=3`、`memory=4`、`install_profile=1`。原三域 `2` 引入 OneBot 长期归属与持久 proof；原三域 `3` 将归属扩展至 Telegram、QQ 官方和微信，并按完整渠道身份隔离授权。长期问题关注改变 `configuration`、`ingress` 两域；ASR 转写收藏将 `memory` 从 `1` 扩为 `2`，网页收藏再扩为 `3`，本次保存关注来源偏好扩为 `4`，其余六域保持原值。旧完整三域 `3`、其余四域 `1` 保存为 `PRE_MEMORY_WATCH_FORMAT_STATE`；2.114 的完整合同保存为 `PRE_TRANSCRIPT_MEMORY_FORMAT_STATE`；网页收藏前的完整 `memory=2` 合同保存为 `PRE_WEBPAGE_MEMORY_FORMAT_STATE`；来源偏好前的完整 `memory=3` 合同保存为 `PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE`。它们与原全 `1`、三域 `2` 都只作为显式停机升级源，不能直接启动。ID 不是大小可比较的 schema 版本；修改以下语义时必须显式改合同或交付迁移，不能沿用相同 ID 仅靠表结构相同通过。
+完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=5`、`outbox=3`、`memory=4`、`install_profile=1`。此前七域完整前序保留为显式停机升级源；本次项目资料复核只将 ingress 从 `4` 扩为 `5`，原完整 `(1,3,2,4,3,4,1)` 保存为 `PRE_PROJECT_INBOX_FORMAT_STATE`。记忆来源、任务、未知回执和主配置的解释方式保持原合同。ID 不是大小可比较的 schema 版本；不能仅靠表结构相同沿用一个已经改变的解释合同。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |
@@ -43,6 +43,14 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 | `install_profile` | 接受尚未准备任何实例 profile/receipt 的缺省状态；本片不制造持久实例 profile。已有安装意图仅按 pinned uv adapter 有界解析，保留主 requirement/extras/with/constraints/overrides/python/entrypoint 与已支持 options；结果仍是 `intent_parsed/context_required`。索引/约束/凭据来源及 ResolverContext 未核齐时不能变成可安装证明。 | `parse_install_intent`、`InstallationReceipt/read_install_receipt`，以及现有安装 manifest 的独立核验；这些证据不由七 ID 自动生成。 |
 
 以上声明绑定当前可信应用代码的解释合同，不声称审计数据库内所有额外 SQL、插件或历史手工写入。额外插件私有表/其私有索引可保留；这不是插件完整性或任意触发器认证。正常配置和安装真实性仍由各自宿主核验负责。
+
+### 项目资料复核的格式边界
+
+`ingress=5` 为 `attention_project` 的持久来源、准确 Web 路由、按证明独立领取及项目段纯读提供准入边界。项目段从本运行实际首次领取的输入建立；原始路由及 reply origin 坏值不得通过归一化变成合法 Web 证明。新主人输入立即持久排队，项目在当前工具结算后结束，由独立下一运行处理，不在项目续轮重新解释为主人授权。
+
+冻结的[2.136 格式 reader](../tests/fixtures/format_admission_v2_136.py)与[声明](../tests/fixtures/compatibility_v2_136.json)来自签名 `e9813d711e21e38b6f5104e5aaed3ce2f9a09e4d` 原字节。[格式回归](../tests/test_project_inbox_format.py)核原字节摘要，并用旧实际准入函数拒绝新库；它是源码 oracle，不冒称安装了旧 wheel。旧运行的独立离线反证另确认 marker 丢失与同 run 认领新主人消息，不据此宣称首轮 Web 项目可以向平台外发。
+
+已有 ingress4 库须在既有排他、完整状态校验和 marker 原子提交边界升级。迁移保留原身份和业务行，不重放输入、来源或 unknown 投递；托管跨格式切换与 Windows 旧库升级仍不支持。旧 reader 与原 A/B 同格式判定拒绝升级后的库，不因候选启动失败而放宽格式。
 
 ### 长期问题关注的格式边界
 

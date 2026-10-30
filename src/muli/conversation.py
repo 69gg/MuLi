@@ -10,6 +10,7 @@ from muli.attachments import MAX_ATTACHMENT_IDS
 from muli.memory_source_failure import MAX_FAILURE_PROOF_BYTES, MemorySourceFailure
 from muli.memory_watches import MAX_MATCH_PROOF_BYTES, MemoryWatchMatch, match_routing
 from muli.proactive import FrozenRouting
+from muli.project_inbox import WEB_PROJECT_ROUTING, ProjectInboxBatch
 from muli.reply_origin import MAX_ROUTE_CHARS, ReplyOrigin
 from muli.store import Store, new_id
 
@@ -59,7 +60,10 @@ class Conversation:
         attention_routing: FrozenRouting | None = None,
         attention_memory_failure: MemorySourceFailure | None = None,
         attention_memory_watch: MemoryWatchMatch | None = None,
+        attention_project: ProjectInboxBatch | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if attention_project is not None and not internal:
+            raise ValueError("项目资料复核仅允许受信宿主入口")
         watch_routing: FrozenRouting | None = None
         if attention_memory_watch is not None:
             watch_routing = match_routing(self.store, attention_memory_watch)
@@ -89,6 +93,7 @@ class Conversation:
             attention_routing=None if attention_memory_watch is not None else attention_routing,
             attention_memory_failure=attention_memory_failure,
             attention_memory_watch=attention_memory_watch,
+            attention_project=attention_project,
         )
         if watch_routing is not None:
             # Only this Store-bound admission may replace the static local
@@ -117,6 +122,7 @@ class Conversation:
         attention_routing: FrozenRouting | None = None,
         attention_memory_failure: MemorySourceFailure | None = None,
         attention_memory_watch: MemoryWatchMatch | None = None,
+        attention_project: ProjectInboxBatch | None = None,
     ) -> dict[str, Any]:
         """Validate and build input without committing; host transactions may add trusted refs."""
         if not content.strip() or len(content) > MAX_CONTENT_CHARS:
@@ -153,6 +159,20 @@ class Conversation:
         }
         if reply_origin is not None:
             payload["reply_origin"] = reply_origin.dump()
+        if attention_project is not None:
+            if (
+                source != "system:attention"
+                or principal != "system:attention"
+                or route is not None
+                or attention_memory_failure is not None
+                or attention_memory_watch is not None
+                or attention_routing != WEB_PROJECT_ROUTING
+                or (reply_origin is not None and reply_origin != WEB_PROJECT_ROUTING.origin)
+                or not isinstance(attention_project, ProjectInboxBatch)
+                or ProjectInboxBatch.load(attention_project.dump()) != attention_project
+            ):
+                raise ValueError("项目资料复核需要准确宿主证明与 Web 本地来源")
+            payload["attention_project"] = attention_project.dump()
         if attention_routing is not None:
             if principal != "system:attention" or source != "system:attention":
                 raise ValueError("主动通知选路仅允许系统注意事项入口")

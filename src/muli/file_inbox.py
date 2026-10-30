@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from muli.evidence import EvidenceError
 from muli.maintenance import MaintenanceError
 from muli.management_projection import ProjectionError, _read_object
 from muli.platforms.file_watch import (
@@ -25,6 +27,7 @@ from muli.platforms.file_watch import (
 )
 from muli.proactive import FrozenRouting
 from muli.process import _wait_cleanup
+from muli.project_inbox import WEB_PROJECT_ROUTING, ProjectInboxProof, read_task_snapshot
 from muli.store import SQLITE_MAX_INTEGER, Store, new_id, now
 from muli.tools import Tool, parameters, string
 
@@ -36,7 +39,9 @@ RECORD_KIND = "file_inbox_record"
 EVENT_TYPE = "file_inbox.observed"
 SETTINGS_KIND = "file_inbox_settings"
 SETTINGS_ID = "current"
+BINDING_KIND = "file_inbox_project_binding"
 _OBJECT_BYTES = 16_384
+_NAME_BYTES = 1024
 
 
 class FileInboxSettings(BaseModel):
@@ -44,6 +49,7 @@ class FileInboxSettings(BaseModel):
 
     enabled: bool = Field(default=False, strict=True)
     path: str = Field(default="", max_length=4096)
+    project_id: str | None = Field(default=None, min_length=1)
     coalesce_seconds: float = Field(default=0.1, ge=0, le=5, allow_inf_nan=False)
     candidate_timeout_seconds: float = Field(default=30, ge=0.1, le=300, allow_inf_nan=False)
     max_candidates: int = Field(default=64, ge=1, le=256, strict=True)
@@ -58,13 +64,24 @@ class FileInboxError(ValueError):
         super().__init__(code)
 
 
+def _settings_data(settings: FileInboxSettings) -> dict[str, Any]:
+    value = settings.model_dump(mode="json")
+    if value["project_id"] is None:
+        del value["project_id"]
+    return value
+
+
+def _settings_signature(settings: FileInboxSettings) -> str:
+    return hashlib.sha256(json.dumps(_settings_data(settings), sort_keys=True).encode()).hexdigest()
+
+
 def _checked_settings(settings: FileInboxSettings) -> tuple[FileInboxSettings, dict[str, Any]]:
     try:
         checked = FileInboxSettings.model_validate(settings.model_dump(mode="python"))
         item: dict[str, Any] = {
             "id": SETTINGS_ID,
             "schema_version": 1,
-            "settings": checked.model_dump(mode="json"),
+            "settings": _settings_data(checked),
         }
         size = len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode("utf-8"))
     except (ValueError, TypeError, UnicodeError, RecursionError):
@@ -77,6 +94,28 @@ def _checked_settings(settings: FileInboxSettings) -> tuple[FileInboxSettings, d
 @dataclass(frozen=True, slots=True)
 class FileInboxSettingsStore:
     store: Store
+
+    def binding(self, settings: FileInboxSettings) -> dict[str, Any] | None:
+        try:
+            item = _read_object(self.store.db, BINDING_KIND, SETTINGS_ID, _OBJECT_BYTES)
+        except (ProjectionError, ValueError, RecursionError, sqlite3.Error):
+            raise FileInboxError("file_inbox_project_binding_invalid") from None
+        if item is None:
+            if settings.project_id is not None:
+                raise FileInboxError("file_inbox_project_binding_missing")
+            return None
+        if (
+            set(item) != {"id", "schema_version", "revision", "project_id", "settings_signature"}
+            or item["id"] != SETTINGS_ID
+            or type(item["schema_version"]) is not int
+            or item["schema_version"] != 1
+            or not isinstance(item["revision"], str)
+            or len(item["revision"]) != 32
+            or item["project_id"] != settings.project_id
+            or item["settings_signature"] != _settings_signature(settings)
+        ):
+            raise FileInboxError("file_inbox_project_binding_invalid")
+        return item
 
     def read(self) -> FileInboxSettings:
         try:
@@ -92,7 +131,9 @@ class FileInboxSettingsStore:
         except sqlite3.Error:
             raise FileInboxError("file_inbox_settings_read_failed") from None
         if item is None:
-            return FileInboxSettings()
+            settings = FileInboxSettings()
+            self.binding(settings)
+            return settings
         if (
             set(item) != {"id", "schema_version", "settings"}
             or item["id"] != SETTINGS_ID
@@ -102,23 +143,46 @@ class FileInboxSettingsStore:
         ):
             raise FileInboxError("file_inbox_settings_invalid")
         try:
-            return _checked_settings(FileInboxSettings.model_validate(item["settings"]))[0]
+            settings = _checked_settings(FileInboxSettings.model_validate(item["settings"]))[0]
+            self.binding(settings)
+            return settings
         except (ValueError, TypeError, RecursionError):
             raise FileInboxError("file_inbox_settings_invalid") from None
 
-    def replace(self, settings: FileInboxSettings) -> FileInboxSettings:
+    def replace(
+        self, settings: FileInboxSettings, *, max_task_bytes: int = _OBJECT_BYTES
+    ) -> FileInboxSettings:
         db = self.store.db
         if db.in_transaction:
             raise FileInboxError("file_inbox_settings_outer_transaction")
         if db.autocommit != sqlite3.LEGACY_TRANSACTION_CONTROL or db.isolation_level is None:
             raise FileInboxError("file_inbox_settings_transaction_mode_unsupported")
-        self.read()  # Never overwrite malformed data or an unknown future schema.
+        previous = self.read()  # Never overwrite malformed data or an unknown future schema.
+        binding = self.binding(previous)
         checked, item = _checked_settings(settings)
+        if checked.project_id is not None:
+            try:
+                task = read_task_snapshot(self.store, checked.project_id, max_bytes=max_task_bytes)
+            except EvidenceError:
+                raise FileInboxError("file_inbox_project_unavailable") from None
+            if task is None:
+                raise FileInboxError("file_inbox_project_unavailable")
+            if not _project_record_fits(checked.project_id):
+                raise FileInboxError("file_inbox_project_record_budget")
+        next_binding = {
+            "id": SETTINGS_ID,
+            "schema_version": 1,
+            "revision": binding["revision"]
+            if binding is not None and previous.project_id == checked.project_id
+            else new_id(),
+            "project_id": checked.project_id,
+            "settings_signature": _settings_signature(checked),
+        }
         try:
             self.store.event(
                 "file_inbox.settings.changed",
                 {"id": SETTINGS_ID, "enabled": checked.enabled},
-                objects=[(SETTINGS_KIND, item)],
+                objects=[(SETTINGS_KIND, item), (BINDING_KIND, next_binding)],
             )
         except sqlite3.Error:
             raise FileInboxError("file_inbox_settings_write_failed") from None
@@ -131,6 +195,8 @@ class FileInboxState:
     revision: str = ""
     enabled: bool = False
     code: str = "disabled"
+    project_id: str | None = None
+    binding_revision: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +218,7 @@ WatchFactory = Callable[..., Watch]
 
 def _signature(settings: FileInboxSettings, roots: list[str]) -> str:
     return hashlib.sha256(
-        json.dumps([settings.model_dump(), roots], sort_keys=True).encode()
+        json.dumps([_settings_data(settings), roots], sort_keys=True).encode()
     ).hexdigest()
 
 
@@ -169,13 +235,13 @@ def _valid_name(name: object) -> bool:
     if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\0" in name:
         return False
     try:
-        return len(name.encode("utf-8")) <= 1024
+        return len(name.encode("utf-8")) <= _NAME_BYTES
     except UnicodeError:
         return False
 
 
 def _valid_record(record: dict[str, Any]) -> bool:
-    if set(record) != {
+    fields = {
         "id",
         "proof",
         "kind",
@@ -184,7 +250,8 @@ def _valid_record(record: dict[str, Any]) -> bool:
         "code",
         "routing",
         "event_id",
-    }:
+    }
+    if set(record) not in (fields, fields | {"project_proof"}):
         return False
     if not isinstance(record["id"], str) or len(record["id"]) != 32:
         return False
@@ -208,6 +275,15 @@ def _valid_record(record: dict[str, Any]) -> bool:
         return False
     if type(record["event_id"]) is not int or not 1 <= record["event_id"] <= SQLITE_MAX_INTEGER:
         return False
+    if "project_proof" in record:
+        project = ProjectInboxProof.load(record["project_proof"], max_bytes=_OBJECT_BYTES)
+        if project is None or (
+            project.record_id,
+            project.event_id,
+            project.scope,
+            project.revision,
+        ) != (record["id"], record["event_id"], proof["scope"], proof["revision"]):
+            return False
     observed = record["observed_at"]
     if type(observed) not in {int, float} or not 0 <= observed < 1e12:
         return False
@@ -256,9 +332,127 @@ def read_record(
     if record["kind"] == "candidate" and state.code not in {"watching", "coverage_incomplete"}:
         return None
     routing = FrozenRouting.load(record["routing"])
-    if routing.classification != "independent" or routing.dump() != record["routing"]:
+    if "project_proof" in record:
+        project = ProjectInboxProof.load(record["project_proof"], max_bytes=_OBJECT_BYTES)
+        if (
+            project is None
+            or (project.project_id, project.binding_revision)
+            != (state.project_id, state.binding_revision)
+            or record["routing"] != WEB_PROJECT_ROUTING.dump()
+        ):
+            return None
+    elif routing.classification != "independent" or routing.dump() != record["routing"]:
         return None
     return record
+
+
+def _read_policy(store: Store) -> dict[str, Any] | None:
+    item = _read_object(store.db, POLICY_KIND, "current", _OBJECT_BYTES)
+    if item is None:
+        return None
+    fields = {
+        "id",
+        "signature",
+        "enabled",
+        "path",
+        "scope",
+        "revision",
+        "device",
+        "inode",
+        "code",
+        "gap_id",
+        "window_start",
+        "window_count",
+    }
+    if set(item) != fields or item["id"] != "current" or type(item["enabled"]) is not bool:
+        raise ValueError("file_inbox_policy_invalid")
+    if any(
+        not isinstance(item[field], str)
+        for field in ("signature", "path", "scope", "revision", "code")
+    ):
+        raise ValueError("file_inbox_policy_invalid")
+    if len(item["scope"]) != 32 or len(item["revision"]) != 32 or len(item["signature"]) != 64:
+        raise ValueError("file_inbox_policy_invalid")
+    if any(
+        item[field] is not None and (type(item[field]) is not int or item[field] < 0)
+        for field in ("device", "inode")
+    ):
+        raise ValueError("file_inbox_policy_invalid")
+    if item["gap_id"] is not None and (
+        not isinstance(item["gap_id"], str) or len(item["gap_id"]) != 32
+    ):
+        raise ValueError("file_inbox_policy_invalid")
+    if type(item["window_count"]) is not int or not 0 <= item["window_count"] <= 32:
+        raise ValueError("file_inbox_policy_invalid")
+    if type(item["window_start"]) not in {int, float} or not 0 <= item["window_start"] < 1e12:
+        raise ValueError("file_inbox_policy_invalid")
+    return item
+
+
+def _file_proof(identifier: str, scope: str, revision: str, generation: int) -> dict[str, Any]:
+    return {
+        "id": identifier,
+        "source": "file_inbox",
+        "scope": scope,
+        "revision": revision,
+        "watcher_generation": generation,
+    }
+
+
+def _record_data(
+    proof: dict[str, Any],
+    event_id: int,
+    metadata: FileMetadata | None,
+    code: str | None,
+    routing: FrozenRouting,
+    observed_at: float,
+    project: ProjectInboxProof | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": proof["id"],
+        "proof": proof,
+        "kind": "candidate" if metadata is not None else "gap",
+        "observed_at": observed_at,
+        "metadata": asdict(metadata) if metadata is not None else None,
+        "code": code,
+        "routing": routing.dump(),
+        "event_id": event_id,
+        **({"project_proof": project.dump()} if project is not None else {}),
+    }
+
+
+def _record_fits(record: dict[str, Any]) -> bool:
+    try:
+        return (
+            len(json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            <= _OBJECT_BYTES
+        )
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        return False
+
+
+def _project_record_fits(project_id: str) -> bool:
+    # Reserve the same complete canonical record that commit writes. Each
+    # permitted filename byte can require six JSON bytes (for example U+0001),
+    # so a character-count or UTF-8-only estimate would undercount real names.
+    identifier = "0" * 32
+    proof = _file_proof(identifier, identifier, identifier, SQLITE_MAX_INTEGER)
+    project = ProjectInboxProof(
+        identifier, SQLITE_MAX_INTEGER, identifier, identifier, identifier, project_id
+    )
+    maximum = 2 * SQLITE_MAX_INTEGER + 1
+    metadata = FileMetadata("\x01" * _NAME_BYTES, maximum, maximum, maximum, maximum, maximum)
+    return _record_fits(
+        _record_data(
+            proof,
+            SQLITE_MAX_INTEGER,
+            metadata,
+            None,
+            WEB_PROJECT_ROUTING,
+            sys.float_info.min,
+            project,
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -289,46 +483,7 @@ class FileInbox:
         self._settings = FileInboxSettings()
 
     def _policy(self) -> dict[str, Any] | None:
-        item = _read_object(self.store.db, POLICY_KIND, "current", _OBJECT_BYTES)
-        if item is None:
-            return None
-        fields = {
-            "id",
-            "signature",
-            "enabled",
-            "path",
-            "scope",
-            "revision",
-            "device",
-            "inode",
-            "code",
-            "gap_id",
-            "window_start",
-            "window_count",
-        }
-        if set(item) != fields or item["id"] != "current" or type(item["enabled"]) is not bool:
-            raise ValueError("file_inbox_policy_invalid")
-        if any(
-            not isinstance(item[field], str)
-            for field in ("signature", "path", "scope", "revision", "code")
-        ):
-            raise ValueError("file_inbox_policy_invalid")
-        if len(item["scope"]) != 32 or len(item["revision"]) != 32 or len(item["signature"]) != 64:
-            raise ValueError("file_inbox_policy_invalid")
-        if any(
-            item[field] is not None and (type(item[field]) is not int or item[field] < 0)
-            for field in ("device", "inode")
-        ):
-            raise ValueError("file_inbox_policy_invalid")
-        if item["gap_id"] is not None and (
-            not isinstance(item["gap_id"], str) or len(item["gap_id"]) != 32
-        ):
-            raise ValueError("file_inbox_policy_invalid")
-        if type(item["window_count"]) is not int or not 0 <= item["window_count"] <= 32:
-            raise ValueError("file_inbox_policy_invalid")
-        if type(item["window_start"]) not in {int, float} or not 0 <= item["window_start"] < 1e12:
-            raise ValueError("file_inbox_policy_invalid")
-        return item
+        return _read_policy(self.store)
 
     def _record_ids(self, limit: int, offset: int = 0) -> list[str]:
         # Canonical journal IDs define arrival order, including equal or reversed
@@ -374,7 +529,10 @@ class FileInbox:
         checked, _ = _checked_settings(settings)
         if checked.enabled:
             _path(checked.path, self.runtime.config.settings.workspace_roots)
-        self.settings_store.replace(checked)
+        limits = self.runtime.config.settings.limits
+        self.settings_store.replace(
+            checked, max_task_bytes=(limits.max_context_chars + limits.max_output_chars) * 4
+        )
 
         # Keep the caller's configuration lock until this owned source rebuild
         # settles, even when an HTTP observer disconnects or its task is cancelled.
@@ -390,6 +548,7 @@ class FileInbox:
     def settings_state(self) -> FileInboxState:
         try:
             desired = self.desired_settings()
+            binding = self.settings_store.binding(desired)
         except FileInboxError as error:
             return FileInboxState(code=error.code)
         try:
@@ -412,7 +571,14 @@ class FileInbox:
                 code = getattr(exc, "code", "watch_unavailable")
                 self._failed(code, self._generation)
         # Runtime generation gates callbacks only; durable policy gates committed facts.
-        return FileInboxState(policy["scope"], policy["revision"], active, code)
+        return FileInboxState(
+            policy["scope"],
+            policy["revision"],
+            active,
+            code,
+            desired.project_id,
+            binding["revision"] if desired.project_id is not None and binding is not None else "",
+        )
 
     def status(self) -> dict[str, Any]:
         state = self.settings_state()
@@ -453,6 +619,11 @@ class FileInbox:
             self._settings = self.desired_settings()
         except FileInboxError as error:
             self._failure = error.code
+            return
+        if self._settings.project_id is not None and not _project_record_fits(
+            self._settings.project_id
+        ):
+            self._failure = "file_inbox_project_record_budget"
             return
         settings = self.runtime.config.settings
         signature = _signature(self._settings, settings.workspace_roots)
@@ -593,28 +764,40 @@ class FileInbox:
 
     def _commit(self, policy: dict[str, Any], *, metadata: FileMetadata | None = None) -> None:
         identifier = new_id()
-        proof = {
-            "id": identifier,
-            "source": "file_inbox",
-            "scope": policy["scope"],
-            "revision": policy["revision"],
-            "watcher_generation": self._generation,
-        }
-        record = {
-            "id": identifier,
-            "proof": proof,
-            "kind": "candidate" if metadata is not None else "gap",
-            "observed_at": now(),
-            "metadata": asdict(metadata) if metadata is not None else None,
-            "code": None if metadata is not None else policy["code"],
-            "routing": FrozenRouting.independent(
-                self.runtime.config.settings, self.store.db
-            ).dump(),
-        }
+        proof = _file_proof(identifier, policy["scope"], policy["revision"], self._generation)
+        routing = (
+            WEB_PROJECT_ROUTING
+            if self._settings.project_id is not None
+            else FrozenRouting.independent(self.runtime.config.settings, self.store.db)
+        )
         with self.store.db:
             self._clean_admissions()
             event = self.store._event(EVENT_TYPE, proof)
-            record["event_id"] = event["id"]
+            project = None
+            if self._settings.project_id is not None:
+                binding = self.settings_store.binding(self._settings)
+                if binding is None:
+                    raise FileInboxError("file_inbox_project_binding_missing")
+                project = ProjectInboxProof(
+                    identifier,
+                    event["id"],
+                    policy["scope"],
+                    policy["revision"],
+                    binding["revision"],
+                    self._settings.project_id,
+                )
+                routing = WEB_PROJECT_ROUTING
+            record = _record_data(
+                proof,
+                event["id"],
+                metadata,
+                None if metadata is not None else policy["code"],
+                routing,
+                now(),
+                project,
+            )
+            if not _record_fits(record):
+                raise FileInboxError("coverage_incomplete")
             self.store._put(RECORD_KIND, record)
             if metadata is None:
                 policy["gap_id"] = identifier
@@ -792,7 +975,7 @@ class FileInbox:
         return [
             Tool(
                 "file_inbox_configure",
-                "完整替换资料收件目录策略；默认关闭，目录须在已有工作区内；不扫描历史，不扩大文件权限",
+                "完整替换收件策略；project_id显式绑定已有完整说明的未结束任务，省略/null解绑；不扫描历史、不扩大读取权限",
                 FileInboxSettings.model_json_schema(),
                 configure_items,
                 "write",

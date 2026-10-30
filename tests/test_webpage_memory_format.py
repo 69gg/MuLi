@@ -18,6 +18,7 @@ from test_channel_format_upgrade import snapshot as stored_rows
 from test_channel_format_upgrade import upgrade
 from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model, snapshot
+from test_project_inbox_format import frozen_e136_bytes, frozen_e136_reader
 
 from muli.attachment_memory_source import attachment_source_metadata, restore_attachment_source
 from muli.compatibility import CompatibilityManifest, assess_compatibility
@@ -26,6 +27,7 @@ from muli.document_reading import document_revision
 from muli.events import EventBus
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
+    PRE_PROJECT_INBOX_FORMAT_STATE,
     PRE_WEBPAGE_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
@@ -93,14 +95,15 @@ def legacy_sources() -> list[dict[str, Any]]:
 def test_m_reader_and_manifest_refuse_webpage_memory_contract(database: Path) -> None:
     old = frozen_m_reader("format_admission_v2_118.py")
     manifest = CompatibilityManifest.from_json(frozen_m_bytes("compatibility_v2_118.json"))
-    current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
-    )
+    memory4 = frozen_e136_reader()
+    current = CompatibilityManifest.from_json(frozen_e136_bytes("compatibility_v2_136.json"))
     assert manifest.release == "2.118.0"
     assert manifest.formats.memory.reads == (2,) and manifest.formats.memory.writes == 2
     assert current.formats.memory.reads == (4,) and current.formats.memory.writes == 4
     assert old.CURRENT_FORMAT_STATE == PRE_WEBPAGE_MEMORY_FORMAT_STATE
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    # Preserve the memory-only counterexample independently of ingress5.
+    assert memory4.CURRENT_FORMAT_STATE == PRE_PROJECT_INBOX_FORMAT_STATE
+    assert memory4.CURRENT_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "memory": 4,
     }
@@ -111,8 +114,10 @@ def test_m_reader_and_manifest_refuse_webpage_memory_contract(database: Path) ->
         old.require_current_format(replace(evidence, state=PRE_WEBPAGE_MEMORY_FORMAT_STATE))
         with pytest.raises(old.FormatAdmissionError, match="store_format_unsupported"):
             old.require_current_format(evidence)
+        with pytest.raises(old.FormatAdmissionError, match="store_format_unsupported"):
+            old.require_current_format(replace(evidence, state=PRE_PROJECT_INBOX_FORMAT_STATE))
         assert db.total_changes == 0
-    for state in (PRE_WEBPAGE_MEMORY_FORMAT_STATE, CURRENT_FORMAT_STATE):
+    for state in (PRE_WEBPAGE_MEMORY_FORMAT_STATE, PRE_PROJECT_INBOX_FORMAT_STATE):
         assessment = assess_compatibility(manifest, current, state, handoff_protocol=2)
         assert not assessment.format_compatible and assessment.domain == "memory"
     assert snapshot(database) == before

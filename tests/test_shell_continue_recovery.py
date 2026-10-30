@@ -1,4 +1,4 @@
-"""Reopen real continuation crash snapshots with this build and a frozen old build."""
+"""Candidate reopens crash snapshots; the real old build refuses their newer format."""
 
 from __future__ import annotations
 
@@ -59,6 +59,7 @@ import muli.store as store_module
 import muli.team as team_module
 from muli.attachments import Attachments
 from muli.config import ConfigFile
+from muli.format_admission import FormatAdmissionError
 from muli.local_services import LocalServices
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
 from muli.runtime import Runtime
@@ -177,6 +178,26 @@ async def main() -> dict[str, Any]:
     # construction intact; only attempted business connections are rejected.
     socket.socket.connect = refuse_connect
     socket.socket.connect_ex = refuse_connect
+    if consumer_kind == "previous":
+        attempts["recovery"] = 0
+
+        def refuse_recovery(runtime: Runtime) -> NoReturn:
+            attempts["recovery"] += 1
+            raise AssertionError("old consumer must refuse the format before business recovery")
+
+        Runtime._recover = refuse_recovery
+        try:
+            runtime = Runtime(ConfigFile(config_path), data_dir, client_factory=client_factory)
+        except FormatAdmissionError as error:
+            assert error.code == "store_format_unsupported", error.code
+            assert all(count == 0 for count in attempts.values()), attempts
+            return {
+                "modules": module_paths(), "continuation_api": has_continuation,
+                "format_refused": error.code, "attempts": attempts,
+            }
+        else:
+            await runtime.close()
+            raise AssertionError("old Runtime accepted the newer crash-snapshot format")
     runtime = Runtime(ConfigFile(config_path), data_dir, client_factory=client_factory)
     LocalServices(runtime, Attachments(runtime.store, config_path.parent / "attachments", runtime.config))
     assert runtime.config.path.resolve() == config_path
@@ -326,6 +347,12 @@ async def consume_snapshot(
     config = root / "config.json"
     shutil.copyfile(snapshot.config, config)
     shutil.copyfile(snapshot.data / "muli.sqlite3", data / "muli.sqlite3")
+    original_rows: tuple[str, ...] = ()
+    original_configuration = b""
+    if kind == "previous":
+        with closing(sqlite3.connect(data / "muli.sqlite3")) as db:
+            original_rows = tuple(db.iterdump())
+        original_configuration = config.read_bytes()
     cwd, home = root / "cwd", root / "home"
     cwd.mkdir()
     home.mkdir()
@@ -366,8 +393,23 @@ async def consume_snapshot(
     assert result["continuation_api"] is (kind == "candidate")
     for module, filename in result["modules"].items():
         assert Path(filename).resolve().is_relative_to(source / "src"), (module, filename)
-    assert result["live_shells"] == 0 and result["pending"] == 0
     assert snapshot.counter.read_text(encoding="utf-8").splitlines() == ["once"]
+    if kind == "previous":
+        assert result["format_refused"] == "store_format_unsupported"
+        assert result["attempts"] == {
+            "model_factory": 0,
+            "model_stream": 0,
+            "model_complete": 0,
+            "shell": 0,
+            "process": 0,
+            "network": 0,
+            "recovery": 0,
+        }
+        with closing(sqlite3.connect(data / "muli.sqlite3")) as db:
+            assert tuple(db.iterdump()) == original_rows
+        assert config.read_bytes() == original_configuration
+        return result
+    assert result["live_shells"] == 0 and result["pending"] == 0
     return result
 
 
@@ -492,6 +534,9 @@ async def test_real_crash_snapshots_reopen_without_shell_replay(
 ) -> None:
     for snapshot in crash_snapshots:
         result = await consume_snapshot(snapshot, consumer_source_root, tmp_path / "consumers")
+        if consumer_source_root[0] == "previous":
+            assert result["format_refused"] == "store_format_unsupported", snapshot.name
+            continue
         agent = result["agent"]
         was_running = snapshot.agent["status"] == "running"
         assert agent["status"] == ("interrupted" if was_running else "completed"), snapshot.name
@@ -535,6 +580,9 @@ async def test_old_and_candidate_consume_only_a_real_independent_queued_input(
             assert len(pending) == 1 and pending[0]["id"] == sent["receipt_id"]
             assert pending[0]["payload"]["source"].startswith("team:") and not snapshot.facts
     result = await consume_snapshot(snapshot, consumer_source_root, tmp_path / "consumer")
+    if consumer_source_root[0] == "previous":
+        assert result["format_refused"] == "store_format_unsupported"
+        return
     assert result["agent"]["status"] == "completed" and result["agent"]["generation"] == 2
     assert result["agent"]["completion_revision"] == snapshot.agent["completion_revision"] + 1
     assert result["agent"]["result"] == "EXACT_FRESH_INPUT_HANDLED_ONCE"

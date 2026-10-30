@@ -17,12 +17,14 @@ from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model
 from test_memory_watch_attention import components
 from test_memory_watch_origin_policy import bound_match
+from test_project_inbox_format import frozen_e136_bytes, frozen_e136_reader
 
 from muli.compatibility import CompatibilityManifest, assess_compatibility
 from muli.config import ConfigFile
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE,
+    PRE_PROJECT_INBOX_FORMAT_STATE,
     FormatAdmissionError,
 )
 from muli.format_evidence import FORMAT_STATE_KEY, read_format_evidence
@@ -60,14 +62,15 @@ def frozen_p_reader() -> ModuleType:
 def test_signed_p_reader_and_manifest_refuse_memory4_without_writes(database: Path) -> None:
     old = frozen_p_reader()
     manifest = CompatibilityManifest.from_json(frozen_p_bytes("compatibility_v2_120.json"))
-    current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
-    )
+    memory4 = frozen_e136_reader()
+    current = CompatibilityManifest.from_json(frozen_e136_bytes("compatibility_v2_136.json"))
     assert manifest.release == "2.120.0"
     assert manifest.formats.memory.reads == (3,) and manifest.formats.memory.writes == 3
     assert current.formats.memory.reads == (4,) and current.formats.memory.writes == 4
     assert old.CURRENT_FORMAT_STATE == PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    # Keep the historical memory-only boundary as CURRENT gains ingress5.
+    assert memory4.CURRENT_FORMAT_STATE == PRE_PROJECT_INBOX_FORMAT_STATE
+    assert memory4.CURRENT_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "memory": 4,
     }
@@ -77,9 +80,12 @@ def test_signed_p_reader_and_manifest_refuse_memory4_without_writes(database: Pa
         old.require_current_format(replace(evidence, state=PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE))
         with pytest.raises(old.FormatAdmissionError, match="store_format_unsupported"):
             old.require_current_format(evidence)
+        with pytest.raises(old.FormatAdmissionError, match="store_format_unsupported"):
+            old.require_current_format(replace(evidence, state=PRE_PROJECT_INBOX_FORMAT_STATE))
         assert db.total_changes == 0
-    assessment = assess_compatibility(manifest, current, CURRENT_FORMAT_STATE, handoff_protocol=2)
-    assert not assessment.format_compatible and assessment.domain == "memory"
+    for state in (PRE_MEMORY_WATCH_ORIGINS_FORMAT_STATE, PRE_PROJECT_INBOX_FORMAT_STATE):
+        assessment = assess_compatibility(manifest, current, state, handoff_protocol=2)
+        assert not assessment.format_compatible and assessment.domain == "memory"
     assert snapshot(database) == before
 
 

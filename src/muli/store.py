@@ -1743,7 +1743,15 @@ class Store:
                 routing = FrozenRouting.load(payload.get("attention_routing"))
                 key = (
                     *origin.destination_key,
-                    routing.batch_key if "attention_routing" in payload else "",
+                    json.dumps(
+                        [payload.get("attention_routing"), payload.get("reply_origin")],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if "attention_project" in payload
+                    else routing.batch_key
+                    if "attention_routing" in payload
+                    else "",
                     json.dumps(
                         payload.get("channel_ownership"), sort_keys=True, separators=(",", ":")
                     ),
@@ -1765,6 +1773,9 @@ class Store:
                     )
                     if payload.get("principal") == "system:attention"
                     and "attention_memory_watch" in payload
+                    else "",
+                    json.dumps(payload["attention_project"], sort_keys=True, separators=(",", ":"))
+                    if "attention_project" in payload
                     else "",
                 )
                 if destination is not None and key != destination:
@@ -1809,6 +1820,14 @@ class Store:
             message["task_control"] = payload["task_control"]
         if "attention_routing" in payload:
             message["attention_routing"] = FrozenRouting.load(payload["attention_routing"]).dump()
+        if "attention_project" in payload:
+            # Conversation already normalized trusted markers. Preserve even a
+            # malformed stored marker and its original routing evidence so
+            # Runtime rejects corruption rather than normalizing it to Web.
+            message["attention_project"] = payload["attention_project"]
+            message["reply_origin"] = payload.get("reply_origin")
+            if "attention_routing" in payload:
+                message["attention_routing"] = payload["attention_routing"]
         if "channel_ownership" in payload:
             message["channel_ownership"] = payload["channel_ownership"]
         if "channel_ownership_control" in payload:

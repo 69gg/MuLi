@@ -16,6 +16,7 @@ from muli.integrations.attention import ChiliarchAttentionState
 from muli.memory_source_failure import failure_current
 from muli.memory_watches import MATCH_EVENT, MAX_MATCH_PROOF_BYTES
 from muli.proactive import FrozenRouting
+from muli.project_inbox import ProjectInboxBatch, read_task_snapshot
 from muli.reminder_followup import read_followup_notice
 from muli.runtime import Runtime
 from muli.store import now
@@ -30,6 +31,10 @@ _HEADER = (
 
 class _ProducerPolicyChanged(ValueError):
     """Reconsume immediately so an invalidated source cannot block reminders."""
+
+
+class _ProjectTaskSnapshotChanged(ValueError):
+    """Refresh a current task snapshot once, without committing its old batch."""
 
 
 class AttentionInbox:
@@ -146,6 +151,11 @@ class AttentionInbox:
                 if self.runtime.config.settings.memory.enabled
                 else None
             ),
+            project_task_bytes=(
+                self.runtime.config.settings.limits.max_context_chars
+                + self.runtime.config.settings.limits.max_output_chars
+            )
+            * 4,
         )
         if source is None:
             return None
@@ -163,6 +173,8 @@ class AttentionInbox:
             "file_inbox_proof": asdict(source.file_inbox_proof)
             if source.file_inbox_proof
             else None,
+            "project_inbox_proof": source.project_inbox_proof,
+            "project_task_snapshot": source.project_task_snapshot,
             "reminder_proof": source.reminder_proof,
             "memory_failure_proof": source.memory_failure_proof,
             "memory_watch_proof": source.memory_watch_proof,
@@ -172,6 +184,14 @@ class AttentionInbox:
     @staticmethod
     def _content(records: list[dict[str, Any]]) -> str:
         header = _HEADER
+        if records and records[0].get("project_inbox_proof") is not None:
+            header += (
+                "这些记录属于明确绑定的项目资料，仅在Web本地复核。"
+                "先用 commitment_read 读取指定任务当前完整要求，再用 commitment_inspect 查看依据，"
+                "按任务引用用 attachment_read 读原附件，先 file_inbox_get 定位新文件再 fs_read。"
+                "记录已读、未读、缺失、引用和建议；不改变任务、不派工、不导入、不外发，"
+                "不把建议写成已完成验收，文件路径不证明到达时正文快照。\n"
+            )
         if any("followup" in record for record in records):
             header += (
                 "其中 followup 是约定复盘的任务定位，不是执行授权。"
@@ -191,6 +211,8 @@ class AttentionInbox:
                         "routing",
                         "producer_proof",
                         "file_inbox_proof",
+                        "project_inbox_proof",
+                        "project_task_snapshot",
                         "reminder_proof",
                         "memory_failure_proof",
                         "memory_watch_proof",
@@ -290,6 +312,28 @@ class AttentionInbox:
                     record["file_inbox_proof"]
                 ):
                     break
+                project_proof = record["project_inbox_proof"]
+                if records:
+                    first_project = records[0]["project_inbox_proof"]
+                    if bool(first_project) != bool(project_proof):
+                        break
+                    if (
+                        first_project is not None
+                        and project_proof is not None
+                        and (
+                            first_project.scope,
+                            first_project.revision,
+                            first_project.binding_revision,
+                            first_project.project_id,
+                        )
+                        != (
+                            project_proof.scope,
+                            project_proof.revision,
+                            project_proof.binding_revision,
+                            project_proof.project_id,
+                        )
+                    ):
+                        break
                 selected = FrozenRouting.load(record["routing"])
                 if routing is not None and routing.batch_key != selected.batch_key:
                     break
@@ -320,6 +364,11 @@ class AttentionInbox:
                 if len(self._content([*records, record])) > budget:
                     if records:
                         break
+                    if project_proof is not None:
+                        if after != self.cursor:
+                            self.store.put("attention_state", self._state(after, True))
+                        self._waiting = "budget"
+                        return False
                     if record["memory_failure_proof"] is not None:
                         # Source/revision identities are indivisible evidence.
                         # Keep the durable failed job; never publish half an ID.
@@ -349,6 +398,23 @@ class AttentionInbox:
             return False
         generation = self._generation
         watch_guard = self.runtime.memory_watch_guard
+        project = (
+            ProjectInboxBatch(
+                tuple(record["project_inbox_proof"] for record in records),
+                records[0]["project_task_snapshot"],
+            )
+            if records[0]["project_inbox_proof"] is not None
+            else None
+        )
+        if (
+            project is not None
+            and ProjectInboxBatch.load(
+                project.dump(), max_bytes=budget * 4, max_records=policy.batch_size
+            )
+            != project
+        ):
+            self._waiting = "budget"
+            return False
 
         def guard() -> None:
             if (
@@ -406,6 +472,18 @@ class AttentionInbox:
                     }
                     if current_file is None or read_record(self.store, event, current_file) is None:
                         raise _ProducerPolicyChanged("资料收件目录授权已改变")
+                project_snapshot = record["project_task_snapshot"]
+                if project_snapshot is not None:
+                    limits = self.runtime.config.settings.limits
+                    current_snapshot = read_task_snapshot(
+                        self.store,
+                        project_snapshot.project_id,
+                        max_bytes=(limits.max_context_chars + limits.max_output_chars) * 4,
+                    )
+                    if current_snapshot is None:
+                        raise _ProducerPolicyChanged("资料绑定的任务已结束或不可用")
+                    if current_snapshot != project_snapshot:
+                        raise _ProjectTaskSnapshotChanged("项目任务快照已改变")
                 proof = record["producer_proof"]
                 if proof is not None:
                     current = (
@@ -434,6 +512,14 @@ class AttentionInbox:
                     **(
                         {"file_inbox_proof": record["file_inbox_proof"]}
                         if record["file_inbox_proof"] is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "project_proof": record["project_inbox_proof"].dump(),
+                            "project_snapshot": record["project_task_snapshot"].dump(),
+                        }
+                        if record["project_inbox_proof"] is not None
                         else {}
                     ),
                     **(
@@ -473,6 +559,7 @@ class AttentionInbox:
                 admission_guard=guard,
                 routing=routing,
                 memory_failure=records[0]["memory_failure_proof"],
+                **({"project": project} if project is not None else {}),
                 **(
                     {"memory_watch": records[0]["memory_watch_proof"]}
                     if records[0]["memory_watch_proof"] is not None
@@ -496,12 +583,18 @@ class AttentionInbox:
 
     async def _run(self) -> None:
         await self.runtime.wake_pending_inputs()
+        project_refresh_cursor: int | None = None
         while True:
             revision = self.bus.revision
             try:
                 progressed = await self._consume()
             except asyncio.CancelledError:
                 raise
+            except _ProjectTaskSnapshotChanged:
+                self.last_error = None
+                self._waiting = "project_changed"
+                progressed = project_refresh_cursor != self.cursor
+                project_refresh_cursor = self.cursor
             except Exception as exc:
                 # Keep the cursor untouched on failure. Retry only on a real event or
                 # explicit restart, and never leak a payload/credential in status.
@@ -510,6 +603,8 @@ class AttentionInbox:
                 progressed = False
             else:
                 self.last_error = None
+                if progressed:
+                    project_refresh_cursor = None
             if progressed:
                 await asyncio.sleep(0)
                 continue
@@ -519,3 +614,4 @@ class AttentionInbox:
 
             async with self.bus.changed:
                 await self.bus.changed.wait_for(changed)
+            project_refresh_cursor = None

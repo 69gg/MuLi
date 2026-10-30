@@ -1,14 +1,14 @@
 {
   "metadata_version": 1,
   "distribution": "muli-agent",
-  "release": "2.136.0",
+  "release": "2.137.0",
   "handoff_protocol": 2,
   "requires_migration": false,
   "formats": {
     "database": {"reads": [1], "writes": 1},
     "objects": {"reads": [3], "writes": 3},
     "configuration": {"reads": [2], "writes": 2},
-    "ingress": {"reads": [4], "writes": 4},
+    "ingress": {"reads": [5], "writes": 5},
     "outbox": {"reads": [3], "writes": 3},
     "memory": {"reads": [4], "writes": 4},
     "install_profile": {"reads": [1], "writes": 1}

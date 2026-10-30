@@ -64,6 +64,7 @@ from muli.owner_text import OwnerTextKind, owner_text_marker
 from muli.permissions import ApprovalNotice, ApprovalSuperseded, Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
 from muli.process import run_process
+from muli.project_inbox import WEB_PROJECT_ROUTING, ProjectInboxBatch, project_batch_current
 from muli.providers import (
     ImageInput,
     Message,
@@ -126,6 +127,7 @@ class PreparedRequest:
     memory_watch_chars: int = 0
     tool_batch_seq: int | None = None
     shell_continuation: ShellContinuation | None = None
+    project_inbox: ProjectInboxBatch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -664,6 +666,11 @@ class Runtime:
         claimed_inputs: Sequence[dict[str, Any]] = (),
     ) -> PreparedRequest:
         self.system_events.clear_request(session_id)
+        project_inbox = (
+            previous.project_inbox
+            if previous is not None and previous.project_inbox is not None
+            else self._claimed_project(claimed_inputs)
+        )
         execution: TaskSnapshot | None = None
         selected: TaskSnapshot | None = None
         scheduled, frozen = self.scheduled_workflows.request_snapshot(session_id)
@@ -721,6 +728,9 @@ class Runtime:
                     and trigger.get("attention_routing") is not None
                     else None
                 )
+        if project_inbox is not None:
+            reply_origin = WEB_PROJECT_ROUTING.origin
+            attention_routing = WEB_PROJECT_ROUTING
         prepared = PreparedRequest(
             session_id,
             [],
@@ -733,6 +743,7 @@ class Runtime:
             memory_watch=memory_watch,
             memory_watch_guard=memory_watch_guard,
             memory_watch_chars=memory_watch_chars,
+            project_inbox=project_inbox,
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -766,6 +777,35 @@ class Runtime:
         finally:
             self._request_context.reset(token)
 
+    def _claimed_project(
+        self, claimed_inputs: Sequence[dict[str, Any]]
+    ) -> ProjectInboxBatch | None:
+        """Establish one project segment only from this run's actual input batch."""
+        if not any("attention_project" in message for message in claimed_inputs):
+            return None
+        project: ProjectInboxBatch | None = None
+        for message in claimed_inputs:
+            candidate = ProjectInboxBatch.load(
+                message.get("attention_project"),
+                max_bytes=self.attention_budget * 4,
+                max_records=self.config.settings.attention.batch_size,
+            )
+            if (
+                candidate is None
+                or message.get("source") != "system:attention"
+                or message.get("principal") != "system:attention"
+                or message.get("attention_routing") != WEB_PROJECT_ROUTING.dump()
+                or type(message["attention_routing"]["v"]) is not int
+                or message.get("route") is not None
+                or message.get("reply_origin") != WEB_PROJECT_ROUTING.origin.dump()
+                or "attention_memory_failure" in message
+                or "attention_memory_watch" in message
+                or (project is not None and candidate != project)
+            ):
+                raise ValueError("项目资料复核输入的宿主证明或 Web 本地来源无效")
+            project = candidate
+        return project
+
     def _guard_request(self, request: PreparedRequest, risk: str | None = None) -> None:
         if request.shell_continuation is not None and not self.store.pending_inputs(
             request.session_id
@@ -790,7 +830,15 @@ class Runtime:
             )
         ):
             raise MemoryWatchMatchExpired("长期问题回访依据已失效")
-        risk = risk or ("read" if request.consult is not None else "write")
+        if request.project_inbox is not None and (
+            risk not in {None, "read"}
+            or request.attention_routing != WEB_PROJECT_ROUTING
+            or request.reply_origin != WEB_PROJECT_ROUTING.origin
+        ):
+            raise PermissionError("项目资料复核只能在 Web 本地读取，不能操作或外发")
+        risk = risk or (
+            "read" if request.consult is not None or request.project_inbox is not None else "write"
+        )
         if request.consult is not None:
             if not isinstance(request.consult, ConsultRequest) or risk != "read":
                 raise PermissionError("咨询控制轮只能读取，不能执行操作或扩大授权")
@@ -1354,6 +1402,7 @@ class Runtime:
         routing: FrozenRouting | None = None,
         memory_failure: MemorySourceFailure | None = None,
         memory_watch: MemoryWatchMatch | None = None,
+        project: ProjectInboxBatch | None = None,
     ) -> dict[str, Any] | None:
         """Admit idle-only facts atomically; execution and report handoff defer admission."""
         async with self.configuration_lock:
@@ -1371,6 +1420,29 @@ class Runtime:
                 or not self._memory_watch_allowed(memory_watch, content_chars=len(content))
             ):
                 raise MemoryWatchMatchExpired("长期问题回访依据已失效")
+            if project is not None and (
+                not isinstance(project, ProjectInboxBatch)
+                or ProjectInboxBatch.load(
+                    project.dump(),
+                    max_bytes=self.attention_budget * 4,
+                    max_records=self.config.settings.attention.batch_size,
+                )
+                != project
+                or routing != WEB_PROJECT_ROUTING
+                or memory_failure is not None
+                or memory_watch is not None
+                or not project_batch_current(
+                    self.store,
+                    project,
+                    workspace_roots=self.config.settings.workspace_roots,
+                    max_task_bytes=(
+                        self.config.settings.limits.max_context_chars
+                        + self.config.settings.limits.max_output_chars
+                    )
+                    * 4,
+                )
+            ):
+                raise ValueError("项目资料复核需要准确有界证明与 Web 本地选路")
             session = self.main_session()
             if self.attention_busy or not self.maintenance.admission.allowed:
                 return None
@@ -1387,6 +1459,7 @@ class Runtime:
                 attention_routing=routing,
                 attention_memory_failure=memory_failure,
                 attention_memory_watch=memory_watch,
+                attention_project=project,
             )
             if inserted:
                 self._invalidate_voice_reply()
@@ -2986,7 +3059,7 @@ class Runtime:
             claimed = await self._claim_inputs(session_id, run_id, discard_stale=False)
             if discarded and not claimed:
                 return _ExecutionResult("")
-            prepared = await self._prepare_request(session_id)
+            prepared = await self._prepare_request(session_id, claimed_inputs=claimed)
             prepared = replace(prepared, shell_continuation=shell_continuation)
         else:
             self.team.consult.guard_control(consult, session_id)
@@ -3034,6 +3107,8 @@ class Runtime:
         async with self.client_factory(self.model_config(role)) as client:
             round_index = 0
             while round_index <= self.config.settings.limits.max_tool_steps:
+                if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
+                    return await self._interrupt_project(prepared)
                 if shell_continuation is not None and self.store.pending_inputs(session_id):
                     self.team.cancel_shell_continuation(
                         session_id, "独立新输入优先，旧自动续办已撤销"
@@ -3056,6 +3131,10 @@ class Runtime:
                 )
                 try:
                     async with self.capacity:
+                        if prepared.project_inbox is not None and self.store.pending_inputs(
+                            session_id
+                        ):
+                            return await self._interrupt_project(prepared)
                         if shell_continuation is not None and self.store.pending_inputs(session_id):
                             # Release capacity before claiming the independent
                             # input at the next safe boundary; no model was called.
@@ -3149,8 +3228,14 @@ class Runtime:
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
+                    if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
+                        return await self._interrupt_project(prepared)
                     claimed = []
-                    if consult is None and round_index < self.config.settings.limits.max_tool_steps:
+                    if (
+                        consult is None
+                        and prepared.project_inbox is None
+                        and round_index < self.config.settings.limits.max_tool_steps
+                    ):
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
                     if claimed:
@@ -3180,7 +3265,13 @@ class Runtime:
                     if paused is None and not returned:
                         try:
                             tool = round_tools.get(call.name)
-                            risk = tool.risk if tool else "read" if consult is not None else "write"
+                            risk = (
+                                tool.risk
+                                if tool is not None
+                                else "read"
+                                if consult is not None or prepared.project_inbox is not None
+                                else "write"
+                            )
                             self._guard_request(prepared, risk)
                         except TaskPaused as exc:
                             paused = exc
@@ -3309,8 +3400,14 @@ class Runtime:
                     await self.bus.emit("message.completed", {"message": final}, session_id)
                     return _ExecutionResult(final["content"], reply_origin=prepared.reply_origin)
                 self._guard_request(prepared)
+                if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
+                    return await self._interrupt_project(prepared)
                 claimed = []
-                if consult is None and round_index < self.config.settings.limits.max_tool_steps:
+                if (
+                    consult is None
+                    and prepared.project_inbox is None
+                    and round_index < self.config.settings.limits.max_tool_steps
+                ):
                     self.system_events.clear_request(session_id)
                     claimed = await self._claim_inputs(session_id, run_id)
                 prepared = (
@@ -3327,6 +3424,20 @@ class Runtime:
                         prepared = replace(prepared, shell_continuation=shell_continuation)
                 round_index += 1
             raise ValueError("模型调用达到步骤上限")
+
+    async def _interrupt_project(self, prepared: PreparedRequest) -> _ExecutionResult:
+        """Close this local segment without consuming the independent next input."""
+        assert prepared.project_inbox is not None
+        final = self.store.complete_message(
+            prepared.session_id,
+            "项目资料复核被新输入中断，尚未完成。",
+            interrupted=True,
+            delivery_routes=[],
+            reply_origin=WEB_PROJECT_ROUTING.origin.dump(),
+            attention_routing=WEB_PROJECT_ROUTING.dump(),
+        )
+        await self.bus.notify()
+        return _ExecutionResult(final["content"], final["id"], WEB_PROJECT_ROUTING.origin)
 
     def _round_tools(
         self,
@@ -3428,6 +3539,7 @@ class Runtime:
             for name, tool in tools.items()
             if name not in disabled
             and (not attention or tool.risk == "read" or name == "channel_send")
+            and (prepared is None or prepared.project_inbox is None or tool.risk == "read")
         }
 
     @staticmethod

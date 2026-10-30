@@ -79,7 +79,7 @@
 
 需要启用记忆和“记忆”类注意事项。`memory_watches` 下的 `max_active`、`batch_size`、`max_quote_chars` 可通过配置调整关注数量、单批处理量和引文范围；不需要安装额外模型或服务。
 
-来源偏好使用 `memory=4`。从旧资料格式升级时，需要按[停机升级说明](channel-ownership-format-upgrade.md)完成转换；已经使用当前格式的资料库不需要重复转换。Linux 独立安装及符合指南精确来源与路径条件的 macOS 独立安装支持转换；Windows、其它 macOS 旧格式和托管旧库请继续使用原版本，新装不受影响。
+来源偏好使用 `memory=4`，项目资料复核另需新的输入格式。已有资料库请按[停机升级说明](channel-ownership-format-upgrade.md)确认是否需要转换，不能只凭记忆版本判断。Linux 独立安装及符合指南精确来源与路径条件的 macOS 独立安装支持转换；Windows、其它 macOS 旧格式和托管旧库请继续使用原版本，新装不受影响。
 
 <a id="核查与更正"></a>
 
