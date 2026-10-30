@@ -562,13 +562,19 @@ async def test_owned_batch_cannot_select_another_bound_owner_at_enqueue_or_dispa
         sent: list[dict[str, Any]] = []
         manager = app.state.channel_application.manager
         dispatched: dict[str, dict[str, Any]] = {}
-        original_send = manager._send_item
+        original_delivery = manager.delivery
 
-        async def observed_send(item: dict[str, Any]) -> None:
-            dispatched[item["id"]] = item
-            await original_send(item)
-
-        monkeypatch.setattr(manager, "_send_item", observed_send)
+        def observed_delivery(identifier: str) -> dict[str, Any] | None:
+            item = original_delivery(identifier)
+            if (
+                item is not None
+                and item["state"] == "sending"
+                and item["next_part"] == 0
+                and item["payload"]["parts"][0].get("attachment_id") == attachment["id"]
+            ):
+                # Keep the claim's reread; later inspection returns fresh snapshots.
+                dispatched.setdefault(identifier, item)
+            return item
 
         async def platform(
             _transport: httpx.AsyncHTTPTransport, request: httpx.Request
@@ -586,10 +592,12 @@ async def test_owned_batch_cannot_select_another_bound_owner_at_enqueue_or_dispa
             yield b"bounded saved copy"
 
         attachment = await app.state.attachments.save(chunks(), "scope.txt", "text/plain")
+        monkeypatch.setattr(manager, "delivery", observed_delivery)
         original = manager._file
 
         async def held_file(identifier: str, name: str, *, media_mode: str = "file") -> Any:
             value = await original(identifier, name, media_mode=media_mode)
+            assert identifier == attachment["id"] and name == "onebot"
             assert value.data == b"bounded saved copy"
             read.set()
             await release.wait()
@@ -662,12 +670,19 @@ async def test_owned_batch_cannot_select_another_bound_owner_at_enqueue_or_dispa
             assert len(sent) == 1 and manager.delivery(text_id)["state"] == "sent"
             assert len(manager.deliveries()) == 2
             actual = manager.delivery(file_id)
+            assert actual is not None and actual["state"] == "sending"
             assert actual["route"]["target"] == actual["route"]["sender_id"] == "7"
             assert actual["payload"]["channel_ownership"]["input_id"]
+            assert actual["payload"]["parts"] == [{"attachment_id": attachment["id"]}]
+            in_flight = dispatched[file_id]
+            assert (in_flight is actual) is False
+            assert in_flight["state"] == "sending" and in_flight["next_part"] == 0
+            assert in_flight["route"] == actual["route"]
+            assert in_flight["payload"] == actual["payload"]
             # Fault-inject a different chat into the actual in-flight item after
             # the first fence and real file read. No receipt or proof is invented.
             route = {**actual["route"], "target": "8", "sender_id": "8"}
-            dispatched[file_id]["route"] = route
+            in_flight["route"] = route
             with runtime.store.db:
                 runtime.store.db.execute(
                     "UPDATE channel_outbox SET route=? WHERE id=?", (json.dumps(route), file_id)

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib.util
 import sys
+from dataclasses import replace
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import ModuleType
@@ -13,10 +14,15 @@ from typing import Any
 
 import pytest
 from test_compaction_objects_format import frozen_e141_reader
+from test_outbox_cancellation_format import frozen_e144_module
 from test_tool_loop_pressure import add_batch, configured, seeded
 
 from muli.context import context_size
-from muli.format_admission import CURRENT_FORMAT_STATE, PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+from muli.format_admission import (
+    CURRENT_FORMAT_STATE,
+    PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
+    PRE_OUTBOX_CANCELLATION_FORMAT_STATE,
+)
 from muli.format_evidence import read_format_evidence
 from muli.store import Store
 
@@ -144,11 +150,21 @@ async def test_actual_predecessor_projection_loses_input_only_after_bypassing_ob
         old_gate = frozen_e141_reader()
         assert evidence.state == CURRENT_FORMAT_STATE
         assert old_gate.CURRENT_FORMAT_STATE == PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
-        assert evidence.state.formats.model_dump() == {
+        historical_gate = frozen_e144_module("format_admission_v2_144.py")
+        assert historical_gate.CURRENT_FORMAT_STATE == PRE_OUTBOX_CANCELLATION_FORMAT_STATE
+        assert historical_gate.CURRENT_FORMAT_STATE.formats.model_dump() == {
             **old_gate.CURRENT_FORMAT_STATE.formats.model_dump(),
             "objects": 4,
         }
+        assert evidence.state.formats.model_dump() == {
+            **historical_gate.CURRENT_FORMAT_STATE.formats.model_dump(),
+            "outbox": 4,
+        }
         changes_before_gate = runtime.store.db.total_changes
+        historical_evidence = replace(evidence, state=historical_gate.CURRENT_FORMAT_STATE)
+        historical_gate.require_current_format(historical_evidence)
+        with pytest.raises(old_gate.FormatAdmissionError, match="^store_format_unsupported$"):
+            old_gate.require_current_format(historical_evidence)
         with pytest.raises(old_gate.FormatAdmissionError, match="^store_format_unsupported$"):
             old_gate.require_current_format(evidence)
         assert runtime.store.db.total_changes == changes_before_gate

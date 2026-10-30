@@ -466,12 +466,20 @@ async def test_owned_qq_dispatch_and_manual_retry_reject_a_tampered_reply_anchor
     content = b"bounded QQ reply attachment"
     read, release = asyncio.Event(), asyncio.Event()
     dispatched: dict[str, dict[str, Any]] = {}
-    original_send = manager._send_item
+    original_delivery = manager.delivery
     original_file = manager._file
 
-    async def observed_send(item: dict[str, Any]) -> None:
-        dispatched[item["id"]] = item
-        await original_send(item)
+    def observed_delivery(identifier: str) -> dict[str, Any] | None:
+        item = original_delivery(identifier)
+        if (
+            item is not None
+            and item["state"] == "sending"
+            and item["next_part"] == 0
+            and item["payload"]["parts"][0].get("attachment_id") == attachment["id"]
+        ):
+            # Keep the claim's reread; later inspection returns fresh snapshots.
+            dispatched.setdefault(identifier, item)
+        return item
 
     async def held_file(identifier: str, name: str, *, media_mode: str = "file") -> FileContent:
         file = await original_file(identifier, name, media_mode=media_mode)
@@ -485,7 +493,7 @@ async def test_owned_qq_dispatch_and_manual_retry_reject_a_tampered_reply_anchor
         yield content
 
     attachment = await case.channels.attachments.save(chunks(), "qq-reply.txt", "text/plain")
-    monkeypatch.setattr(manager, "_send_item", observed_send)
+    monkeypatch.setattr(manager, "delivery", observed_delivery)
     monkeypatch.setattr(manager, "_file", held_file)
     rounds = 0
     results: dict[str, dict[str, Any]] = {}
@@ -584,6 +592,11 @@ async def test_owned_qq_dispatch_and_manual_retry_reject_a_tampered_reply_anchor
         assert queued["payload"]["channel_ownership"] == proof
         assert queued["payload"]["parts"] == [{"attachment_id": attachment["id"], "sequence": 1}]
         assert queued["next_part"] == 0 and queued["receipts"] == []
+        in_flight = dispatched[file_id]
+        assert (in_flight is queued) is False
+        assert in_flight["state"] == "sending" and in_flight["next_part"] == 0
+        assert in_flight["route"] == queued["route"]
+        assert in_flight["payload"] == queued["payload"]
         runtime.channel_ownership.guard(proof, session_id=case.child_id)
         before = case.effects()
         assert len(before["outbox"]) == 2
@@ -592,7 +605,7 @@ async def test_owned_qq_dispatch_and_manual_retry_reject_a_tampered_reply_anchor
         # Keep the real stored input and proof intact. Fault-inject only the
         # queued anchor after its first guard and actual file validation.
         route = {**queued["route"], "reply_to": "qq-anchor-dispatch-another-message"}
-        dispatched[file_id]["route"] = route
+        in_flight["route"] = route
         with runtime.store.db:
             runtime.store.db.execute(
                 "UPDATE channel_outbox SET route=? WHERE id=?", (json.dumps(route), file_id)
