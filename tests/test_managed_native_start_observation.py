@@ -507,7 +507,8 @@ async def test_native_start_final_collection_reads_the_latest_fixed_file(
 
     monkeypatch.setattr(worker.Case, "drive", drive)
     monkeypatch.setenv(
-        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+        "MULI_NATIVE_EXECUTE_DEADLINE",
+        str(worker.time.monotonic() + worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS),
     )
     assert await worker.run("drive", observation.case.root) == 1
     result = worker.read_json(observation.case.root / "result.json")

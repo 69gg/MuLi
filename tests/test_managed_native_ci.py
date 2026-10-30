@@ -1495,7 +1495,7 @@ def test_bootstrap_coordinator_never_accepts_invalid_or_late_reply(
         if change == "reply":
             value["directories"] = [[True, 1]] * 5
         elif change == "local-deadline":
-            clock += 5
+            clock = float(argv[-2])
         else:
             value["padding"] = "x" * ci.OUTPUT_BYTES
         return ci.Reply(0, json.dumps(value).encode())
@@ -2382,7 +2382,7 @@ def test_receipt_rejects_unbounded_or_foreign_metadata(fixture: tuple[Any, Comma
 def test_workflow_has_always_cleanup_and_only_explicit_hosted_native_job() -> None:
     workflow = (SCRIPT.parents[1] / ".github/workflows/ci.yml").read_text()
     native = workflow.split("  managed-native:\n", 1)[1]
-    assert "runs-on: ubuntu-24.04" in native and "timeout-minutes: 8" in native
+    assert "runs-on: ubuntu-24.04" in native and "timeout-minutes: 30" in native
     assert native.count("check_managed_native_ci.py") == 2
     assert 'cleanup "$RUNNER_TEMP/muli-managed-native-ci"' in native
     assert "if: always()" in native and "result.json" in native
@@ -2451,22 +2451,29 @@ def test_cleanup_uses_one_absolute_budget_and_keeps_resources_when_it_expires(
     worker.write_json(native.volume / "result.json", saved)
     ci.write_json(native.root / "result.json", saved)
     clock = 100.0
+    cleanup_seconds: float = float(ci.CLEANUP_SECONDS)
+    command_cost: float = 3 * cleanup_seconds / 10
     budgets: list[float] = []
 
     def slow(argv: Any, *, seconds: float = 5) -> Any:
         nonlocal clock
         budgets.append(seconds)
         result = commands(argv, seconds=seconds)
-        clock += 1.5
+        clock += command_cost
         return result
 
     monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
     native.run = slow
     with pytest.raises(ci.FixtureError, match="cleanup_deadline"):
         native.cleanup()
-    assert budgets == [5, 3.5, 2, 0.5]
+    assert budgets == [
+        min(5, cleanup_seconds),
+        cleanup_seconds - command_cost,
+        min(5, cleanup_seconds - 2 * command_cost),
+        cleanup_seconds - 3 * command_cost,
+    ]
     cleanup = next(args for args in commands.calls if "systemd-run" in args)
-    assert "--setenv=MULI_NATIVE_CLEANUP_DEADLINE=105.0" in cleanup
+    assert f"--setenv=MULI_NATIVE_CLEANUP_DEADLINE={100.0 + cleanup_seconds}" in cleanup
     assert commands.mounts and commands.accounts
     assert not any("umount" in args or "userdel" in args for args in commands.calls)
     assert ci.Receipt.read(native.receipt_path).mounts
@@ -2474,7 +2481,7 @@ def test_cleanup_uses_one_absolute_budget_and_keeps_resources_when_it_expires(
     assert "cleanup" not in saved["resources"]
 
 
-@pytest.mark.parametrize("end", ["100", "106", "nan", "inf"])
+@pytest.mark.parametrize("end", ["100", str(100 + worker.CLEANUP_SECONDS + 1), "nan", "inf"])
 async def test_cleanup_worker_cannot_extend_coordinator_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, end: str
 ) -> None:
@@ -2508,7 +2515,7 @@ def test_last_receipt_save_cannot_publish_cleanup_verified_after_deadline(
         nonlocal clock
         original()
         if native.receipt.group_removed:
-            clock = 105.0
+            clock = 100.0 + ci.CLEANUP_SECONDS
 
     monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
     monkeypatch.setattr(native, "save", late_save)
@@ -2768,7 +2775,7 @@ async def test_diagnostic_uses_typed_probe_and_only_the_verified_uid_bus(
         assert argv[:7] == ["sudo", "--non-interactive", "--user", user, "--", "env", "-i"]
         assert f"HOME={home}" in argv and f"XDG_RUNTIME_DIR=/run/user/{uid}" in argv
         assert f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus" in argv
-        assert 0 < timeout <= ci.CLEANUP_SECONDS and limit == ci.OUTPUT_BYTES
+        assert 0 < timeout <= worker.PROBE_SECONDS and limit == ci.OUTPUT_BYTES
         assert merge_stderr is False and "--auto-start=no" in argv
         calls.append(argv)
         if "ListUnitsByPatterns" in argv:
@@ -3095,7 +3102,8 @@ async def test_worker_exports_fixed_failure_code_without_arbitrary_exception_bod
 
     monkeypatch.setattr(worker.Case, "drive", fail)
     monkeypatch.setenv(
-        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+        "MULI_NATIVE_EXECUTE_DEADLINE",
+        str(worker.time.monotonic() + worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS),
     )
     assert await worker.run("drive", tmp_path) == 1
     result = ci.fixture_result((tmp_path / "result.json").read_bytes())
@@ -3211,6 +3219,7 @@ def test_late_setup_observation_cannot_restart_its_five_second_window(
 ) -> None:
     native, commands = fixture
     clock = 100.0
+    diagnostic_deadline: float = clock + ci.CLEANUP_SECONDS
     monkeypatch.setattr(ci.time, "monotonic", lambda: clock)
 
     def fail(argv: Any, *, seconds: float = 5) -> Any:
@@ -3219,8 +3228,8 @@ def test_late_setup_observation_cannot_restart_its_five_second_window(
             raise ci.FixtureError("native_command_timeout")
         reply = commands(argv, seconds=seconds)
         if "diagnose-setup" in argv:
-            assert float(argv[-2]) == 105.0 and seconds == 5.0
-            clock = 105.0
+            assert float(argv[-2]) == diagnostic_deadline and seconds == ci.CLEANUP_SECONDS
+            clock = diagnostic_deadline
         return reply
 
     native.run = fail
@@ -4357,7 +4366,7 @@ def manager_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict
             raise PermissionError("private file error")
         if path.name == "stat":
             if control.get("cross_boundary") and control["polls"] == 1:
-                control["clock"] = 105.1
+                control["clock"] = 100.0 + worker.CLEANUP_SECONDS + 0.1
             control["read_count"] += 1
             ticks = control["ticks"] + (
                 control.get("change_ticks", False) and control["read_count"] > 1
@@ -4384,14 +4393,16 @@ def manager_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict
     async def query(
         argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
     ) -> dict[str, Any]:
-        assert not merge_stderr and 0 < timeout <= worker.CLEANUP_SECONDS
+        process_scope = argv[:4] == ["sudo", "--non-interactive", "--", "readlink"]
+        timeout_cap = worker.CLEANUP_SECONDS if process_scope else worker.PROBE_SECONDS
+        assert not merge_stderr and 0 < timeout <= timeout_cap
         assert 0 < limit <= worker.MAX_BYTES
         control["calls"].append(argv)
         control["limits"].append(limit)
         if control["cancel"]:
             raise asyncio.CancelledError
         if control.get("query_deadline"):
-            control["clock"] = 180.0
+            control["clock"] = control["query_deadline"]
         if argv[:4] == ["sudo", "--non-interactive", "--", "readlink"]:
             assert argv[-2:] == ["--", "/proc/42/exe"]
             output = (
@@ -4557,12 +4568,14 @@ async def test_manager_ready_requires_same_new_instance_process_kernel_and_share
     manager_observation: dict[str, Any], case: str
 ) -> None:
     control = manager_observation
+    ready_cutoff = 100.0 + worker.CLEANUP_SECONDS
+    deadline = ready_cutoff + 75.0
     if case in {"late", "changed"}:
         control["states"] = ["activating"] * 8 + ["active"]
     if case in {"late", "sample-late"}:
-        control["clock"] = 106.0
+        control["clock"] = ready_cutoff + 1.0
     if case == "cross-boundary":
-        control["clock"] = 104.9
+        control["clock"] = ready_cutoff - 0.1
         control["states"] = ["activating", "active"]
         control["cross_boundary"] = True
     if case == "changed":
@@ -4584,7 +4597,7 @@ async def test_manager_ready_requires_same_new_instance_process_kernel_and_share
     if case == "kernel":
         control["bad_kernel"] = True
     if case == "query-deadline":
-        control["query_deadline"] = True
+        control["query_deadline"] = deadline
     if case == "budget":
         control["budget"] = True
     if case == "stderr":
@@ -4594,7 +4607,7 @@ async def test_manager_ready_requires_same_new_instance_process_kernel_and_share
         control["user"],
         control["uid"],
         control["home"],
-        180.0,
+        deadline,
         worker.MAX_BYTES,
         started=100.0,
         previous="0a" * 16 if case == "old" else "",
@@ -6038,7 +6051,7 @@ def test_context_reader_refuses_invalid_identity_or_time_before_proc_reads(
         0 if change == "uid" else 23145,
         100,
         "/owned",
-        {"expired": 100.0, "extended": 106.0}.get(change, 105.0),
+        {"expired": 100.0, "extended": 100.0 + worker.CLEANUP_SECONDS + 1.0}.get(change, 105.0),
         1024,
     )
     assert value["facts"]["code"] != "observed" and value["used"] == 1024

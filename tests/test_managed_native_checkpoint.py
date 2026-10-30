@@ -349,6 +349,7 @@ async def test_later_complete_but_out_of_projection_range_round_keeps_history(
 
     control = manager_observation
     control["states"] = ["activating"]
+    control["clock"] = worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS + 100.0
     original = process.run_process
     calls = 0
 
@@ -372,7 +373,7 @@ async def test_later_complete_but_out_of_projection_range_round_keeps_history(
         control["user"],
         control["uid"],
         control["home"],
-        175.0,
+        control["clock"] + 75.0,
         worker.MAX_BYTES - 1024,
         started=started,
     )
@@ -468,7 +469,8 @@ def test_checkpoint_transport_preserves_original_packet_and_parent_deadline_gate
     native.prepare()
     clock = {"now": 100.0}
     monkeypatch.setattr(ci.time, "monotonic", lambda: clock["now"])
-    native.execute_deadline = 110.0
+    parent_deadline: float = clock["now"] + ci.CLEANUP_SECONDS
+    native.execute_deadline = parent_deadline + ci.CLEANUP_SECONDS
     summary = {
         "code": "native_deadline_exceeded",
         "stage": "manager_validation",
@@ -481,9 +483,9 @@ def test_checkpoint_transport_preserves_original_packet_and_parent_deadline_gate
     before = native.setup_bytes
 
     def run(argv: Any, *, seconds: float = 5) -> Any:
-        assert "manager-ready" in argv and seconds == 5.0
+        assert "manager-ready" in argv and seconds == ci.CLEANUP_SECONDS
         if case == "late":
-            clock["now"] = 105.0
+            clock["now"] = parent_deadline
         return ci.Reply(0, wire)
 
     native.run = run

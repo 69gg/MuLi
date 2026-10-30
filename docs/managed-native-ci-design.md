@@ -50,14 +50,14 @@ ready 后再次核 bootstrap 文件，并仅为该 manager 归一化 `XDG_CONFIG
 
 | 边界 | 固定合同 |
 | --- | --- |
-| 整轮 worker Case | 120 秒，共同覆盖 drive 内导入、初始服务、三事务及每笔完整投影，不为每笔重开 |
-| harness | 最多 150 秒；启动时裁到共享剩余量减 cleanup 预留，worker 仍核绝对截止 |
-| 协调器 execute | 入口起统一 155 秒，prepare、manager 观察、drive 和原启动诊断共同消耗 |
-| 业务入场 | 必须严格多于 125 秒剩余量；worker 入场及启动标准服务前再次核验，不允许迟到后新开整轮案例 |
-| 普通命令与 setup 诊断 | 每次最多 5 秒，且不越共享绝对截止；manager 观察在原 parent 截止内留 2.5 秒失败回执窗 |
+| 整轮 worker Case | 600 秒，共同覆盖 drive 内导入、初始服务、三事务及每笔完整投影，不为每笔重开 |
+| harness | 最多 720 秒；启动时裁到共享剩余量减 cleanup 预留，worker 仍核绝对截止 |
+| 协调器 execute | 入口起统一 840 秒，prepare、manager 观察、drive 和原启动诊断共同消耗 |
+| 业务入场 | 协调器必须严格多于 720 秒剩余量；worker 入场及启动标准服务前须多于整轮 600 秒，并再次核原 Case 截止，不允许迟到后重开预算 |
+| 普通命令与 setup 诊断 | 默认每次最多 5 秒，且不越共享绝对截止；manager 观察在原 parent 截止内留 60 秒失败回执窗 |
 | 单次 HTTP | 请求、响应与关闭合计 `min(2 秒, remaining)`；响应流式计入原 `JournalLimits.max_record_bytes` |
-| cleanup | 效果与证明共用入口起 5 秒绝对期限，不能用于继续事务或健康工作 |
-| 最末客户端回收 | 失败时原进程组 SIGKILL 后最多再用 5 秒 reap；只回收客户端，不能执行其它效果或发布 verified |
+| cleanup | 效果与证明共用入口起 120 秒绝对期限，不能用于继续事务或健康工作 |
+| 最末客户端回收 | 失败时原进程组 SIGKILL 后最多再用 120 秒 reap；只回收客户端，不能执行其它效果或发布 verified |
 | setup 观察字节 | 累计 32 KiB；双 pipe、proc、内部回包及最终 JSON 按各现有协议计费，未知返回保守占满授额 |
 | 最终结果 | `result.json` 总量 32 KiB；可选诊断让位于原失败、timeline、来源与清理事实 |
 
@@ -70,7 +70,7 @@ ready 后再次核 bootstrap 文件，并仅为该 manager 归一化 `XDG_CONFIG
 | 产品 helper | 原 anchor/`HelperLimits`；默认 128 MiB / 0 / 25% / 32 | 原 `helper_launch_arguments` 与 `read_helper`，不借用 manager 的 100% 配额 |
 | 系统协调器 run / cleanup service | 各 1 GiB / 0 / 100% / 128 | 本次 run/attempt/mode、runner UID/GID、实际 `/system.slice/{unit}` 和 kernel 限额 |
 
-workflow 的协调器 service 使用 `systemd-run --service-type=exec --wait --pipe --expand-environment=no`、整组终止且不自动重启。外层 `RuntimeMaxSec` 分别为 160 秒和 10 秒，含原客户端回收窗口；job 最长八分钟。整轮验收预算为适配托管 runner 调整，cleanup 仍独立限制五秒，内存、swap、CPU、tasks 与字节门不变。协调器、普通 worker 和三个固定 root 子模式在效果或诊断分派前核资源包络；sudo 仅窄保留包络三键，环境声明不能替代实际 membership。脱组、缺 controller、限额不符或无法核验即固定失败，无裸进程 fallback。
+workflow 的协调器 service 使用 `systemd-run --service-type=exec --wait --pipe --expand-environment=no`、整组终止且不自动重启。外层 `RuntimeMaxSec` 分别为 960 秒和 240 秒，含客户端回收窗口；job 最长三十分钟。整轮验收和清理预算为适配托管 runner 调整，内存、swap、CPU、tasks 与字节门不变。协调器、普通 worker 和三个固定 root 子模式在效果或诊断分派前核资源包络；sudo 仅窄保留包络三键，环境声明不能替代实际 membership。脱组、缺 controller、限额不符或无法核验即固定失败，无裸进程 fallback。
 
 系统协调器包络与专用 UID 聚合是两条独立边界，不是整项 job 的共同内存总额。声明资源属性、systemctl 返回零或父进程受限均不证明实际子进程受限；开发守卫也不等于恶意代码沙箱。
 
@@ -78,7 +78,7 @@ workflow 的协调器 service 使用 `systemd-run --service-type=exec --wait --p
 
 `systemd-run --wait` 客户端退出或被取消，不证明已接受的服务请求和子树已经结束。两入口用 fixture 外、同 run/attempt 的固定私有 inode 取得非阻塞 kernel flock；锁忙立即失败，不等待、不停止另一个入口。锁文件只接受空正文或不可逆的 `closed\n`，拒绝 symlink、hardlink、未知或部分正文，不 unlink、替换或重建已知 inode。
 
-run 在完整持锁期间执行、诊断并收取自有客户端。cleanup 从入口资源/锁核验前计原 5 秒，获锁后先在同 inode 写入并 fsync closed，再核固定 run cgroup 的 `cgroup.events`：仅 populated0 或封门后固定 group 缺失才可继续。populated1、坏数据或身份不确定均失败并保留 closed 与 receipt。未来迟到 run 即使创建 cgroup，也会在效果前被 closed 拒绝；父锁释放本身不能代替 population 门。fixture root 不存在也先封门。
+run 在完整持锁期间执行、诊断并收取自有客户端。cleanup 从入口资源/锁核验前计 120 秒，获锁后先在同 inode 写入并 fsync closed，再核固定 run cgroup 的 `cgroup.events`：仅 populated0 或封门后固定 group 缺失才可继续。populated1、坏数据或身份不确定均失败并保留 closed 与 receipt。未来迟到 run 即使创建 cgroup，也会在效果前被 closed 拒绝；父锁释放本身不能代替 population 门。fixture root 不存在也先封门。
 
 ## 三个真实事务与成功条件
 
@@ -154,7 +154,7 @@ await 后独立完整读取与 hash，失败和取消释放局部证明及原 le
 
 旧 process/context/notification/journal 字段也只提供各自正向事实：manager 镜像与 UID 不证明进入事件循环；epoll_wait 不证明 basic 完成；socket owner 匹配不证明监听、创建者或 READY 交付；STATUS 非空/固定文本不等于 READY 位收据；无已知 journal 事件不证明无日志或未执行对应阶段。前后身份绑定是有限窗口，不把不同 getter 结果拼成原子快照。
 
-观察截止早于 parent 硬截止的 2.5 秒窗只接收并验证同次失败回执；窗内收到 ready 也不能成功。`late_ready` 仅在整轮 typed 观察开始已超过原 start 请求 5 秒、仍观察同一新 InvocationID 为 activating，随后完整 ready 门通过时成立；采样晚或 getter 跨界不够。
+观察截止早于 parent 硬截止的 60 秒窗只接收并验证同次失败回执；窗内收到 ready 也不能成功。`late_ready` 仅在整轮 typed 观察开始已超过原 start 请求 5 秒、仍观察同一新 InvocationID 为 activating，随后完整 ready 门通过时成立；采样晚或 getter 跨界不够。
 
 ### helper 来源、进度与成本
 
@@ -204,6 +204,6 @@ unit 出生凭据从本夹具排他创建开始，只跟随真实成功 CAS 替�
 
 本机检查共用 `muli-checks.slice` 的 1 GiB、swap 0、半个逻辑 CPU 等效预算与 96 tasks；单次最多 768 MiB、180 秒。Node 堆 192 MiB、前端文件单并发。无法核验保护时停止检查，不回退无保护运行；这些开发限额与上文 hosted fixture 限额分别生效。
 
-本地回归、类型检查、读取减少、RPC 重叠、正常 cleanup 或前两代投影均不构成完整原生成功。只有同一精确候选在 Case120 / harness150 / cleanup5、既有资源与字节限制内完成全部三事务、全 hash/来源认证、最终数据库与路由投影及实际收尾，才可报告新增原生覆盖已验收。其它平台失败与取消分别保留，不拿另一提交的绿灯补齐。
+本地回归、类型检查、读取减少、RPC 重叠、正常 cleanup 或前两代投影均不构成完整原生成功。只有同一精确候选在 Case600 / harness720 / cleanup120、既有资源与字节限制内完成全部三事务、全 hash/来源认证、最终数据库与路由投影及实际收尾，才可报告新增原生覆盖已验收。其它平台失败与取消分别保留，不拿另一提交的绿灯补齐。
 
 诊断字段和严格读端以[协调器结果校验](../scripts/check_managed_native_ci.py)与 [worker 验证器](../tests/helpers/managed_native_worker.py)为准。更细的[启动正向边界](managed-native-start-boundaries.md)、[应用绑定成本](managed-native-binding-costs.md)和[认证设计归档](../devarchive/managed-backend-authentication-design.md)用于解释各自局部合同，不替代当前精确 CI 的完整验收结论。

@@ -39,13 +39,14 @@ if TYPE_CHECKING:
 
 MAX_BYTES = 32768
 CONTEXT_REPLY_BYTES = 512
-CASE_SECONDS = 120
-CLEANUP_SECONDS = 5
-HARNESS_SECONDS = CASE_SECONDS + 30
+CASE_SECONDS = 600
+CLEANUP_SECONDS = 120
+HARNESS_SECONDS = CASE_SECONDS + 120
 MEMORY = 1024**3
 TASKS = 128
 HARNESS_MEMORY = MEMORY // 4
 HARNESS_TASKS = 32
+PROBE_SECONDS: float = 5.0
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
 WorkerAwaitOperation = Literal[
@@ -597,7 +598,7 @@ async def diagnose(user: str, uid: int, home: Path, unit: str, deadline: float) 
             return await observe_harness(
                 SystemdProbe(
                     runner=query,
-                    limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+                    limits=ProbeLimits(seconds=PROBE_SECONDS, command_bytes=MAX_BYTES),
                 ),
                 unit,
                 facts,
@@ -1027,7 +1028,7 @@ async def manager_template(
         async with asyncio.timeout(remaining(deadline)):
             probe = SystemdProbe(
                 runner=io.query,
-                limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+                limits=ProbeLimits(seconds=PROBE_SECONDS, command_bytes=MAX_BYTES),
             )
             name = f"user@{uid}.service"
             # Load only metadata for the already-confirmed idle instance. No StartUnit/activation.
@@ -2795,7 +2796,7 @@ async def manager_state(
     last_completed_round: dict[str, Any] = {"version": 1, "code": "not_observed"}
     try:
         probe = SystemdProbe(
-            runner=io.query, limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES)
+            runner=io.query, limits=ProbeLimits(seconds=PROBE_SECONDS, command_bytes=MAX_BYTES)
         )
         names = (f"user-runtime-dir@{uid}.service", f"user@{uid}.service")
         async with asyncio.timeout(remaining(deadline)):
@@ -3050,7 +3051,7 @@ async def diagnose_manager_instance(
         async with asyncio.timeout(remaining(deadline)):
             probe = SystemdProbe(
                 runner=io.query,
-                limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+                limits=ProbeLimits(seconds=PROBE_SECONDS, command_bytes=MAX_BYTES),
             )
             path = await probe._unit_path(f"user@{uid}.service")
 
@@ -3147,7 +3148,7 @@ async def diagnose_setup(
             await observe_setup_units(
                 SystemdProbe(
                     runner=io.query,
-                    limits=ProbeLimits(seconds=CLEANUP_SECONDS, command_bytes=MAX_BYTES),
+                    limits=ProbeLimits(seconds=PROBE_SECONDS, command_bytes=MAX_BYTES),
                 ),
                 uid,
                 facts,

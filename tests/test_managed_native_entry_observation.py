@@ -740,7 +740,8 @@ async def test_failure_probe_interruption_preserves_saved_first_error_and_cleanu
     monkeypatch.setattr(worker.Case, "cleanup", cleanup)
     monkeypatch.setattr(linux_transaction, "SystemdProbe", probe)
     monkeypatch.setenv(
-        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+        "MULI_NATIVE_EXECUTE_DEADLINE",
+        str(worker.time.monotonic() + worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS),
     )
     assert await worker.run("drive", env.root) == 1
     result = worker.read_json(env.root / "result.json")

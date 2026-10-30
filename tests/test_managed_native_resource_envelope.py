@@ -661,28 +661,31 @@ def test_cleanup_lifecycle_passes_original_deadline_without_reset(
 ) -> None:
     root, lock = lifecycle
     select_entry("cleanup", envelope, root, monkeypatch)
-    now = [100.0]
+    started: float = 100.0
+    original_deadline: float = started + ci.CLEANUP_SECONDS
+    gate_finished: float = started + ci.CLEANUP_SECONDS * 3 / 5
+    now = [started]
     monkeypatch.setattr(ci.time, "monotonic", lambda: now[0])
     original_gate = ci.require_resource_envelope
 
     def slow_resource_gate(mode: str) -> None:
         original_gate(mode)
-        now[0] = 103.0
+        now[0] = gate_finished
 
     seen: list[float] = []
     instance = SimpleNamespace(cleanup_deadline=None)
 
     def cleanup(*, deadline: float | None = None) -> None:
         inherited = deadline if deadline is not None else instance.cleanup_deadline
-        assert inherited == 105.0, "resource/lock/closed checks must consume the original 5s"
-        assert now[0] == 103.0 and lock.read_bytes() == b"closed\n"
+        assert inherited == original_deadline, "resource/lock/closed checks consume one budget"
+        assert now[0] == gate_finished and lock.read_bytes() == b"closed\n"
         seen.append(inherited)
 
     instance.cleanup = cleanup
     monkeypatch.setattr(ci, "require_resource_envelope", slow_resource_gate)
     monkeypatch.setattr(ci, "NativeCI", lambda path: instance)
     assert ci.main() == 0
-    assert seen == [105.0]
+    assert seen == [original_deadline]
 
 
 @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
@@ -809,7 +812,7 @@ def test_expired_cleanup_never_seals_or_constructs_after_resource_gate(
 
     def expired(mode: str) -> None:
         original_gate(mode)
-        now[0] = 105.0
+        now[0] = 100.0 + ci.CLEANUP_SECONDS
 
     calls: list[Path] = []
     monkeypatch.setattr(ci, "require_resource_envelope", expired)

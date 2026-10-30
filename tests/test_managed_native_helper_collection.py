@@ -346,7 +346,8 @@ async def test_worker_reports_owned_probe_frames_without_exporting_private_failu
         monkeypatch.setattr(failure_diagnostics, "capture_failure", fail_capture)
     monkeypatch.setattr(worker.Case, "drive", drive)
     monkeypatch.setenv(
-        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+        "MULI_NATIVE_EXECUTE_DEADLINE",
+        str(worker.time.monotonic() + worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS),
     )
     assert await worker.run("drive", tmp_path) == 1
     persisted = (tmp_path / "result.json").read_text()
@@ -423,7 +424,8 @@ async def test_outer_cancel_records_real_wait_despite_stale_helper_exit_stage(
 
     monkeypatch.setattr(worker.Case, "drive", drive)
     monkeypatch.setenv(
-        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+        "MULI_NATIVE_EXECUTE_DEADLINE",
+        str(worker.time.monotonic() + worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS),
     )
     if location == "poll":
         monkeypatch.setattr(asyncio, "timeout", timeout)
@@ -434,7 +436,7 @@ async def test_outer_cancel_records_real_wait_despite_stale_helper_exit_stage(
         monkeypatch.setattr(collection.probe, "runner", query)
         task = asyncio.create_task(worker.run("drive", tmp_path))
         try:
-            async with asyncio.timeout(worker.CLEANUP_SECONDS):
+            async with asyncio.timeout(worker.PROBE_SECONDS):
                 await entered.wait()
                 task.cancel("private cancellation reason")
                 assert await task == 1
