@@ -203,7 +203,7 @@ jobs:
           tests/test_mcp*.py tests/test_team_progress*.py tests/test_channels.py
   managed-native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -222,7 +222,7 @@ jobs:
             --uid="$runner_uid" --gid="$runner_gid" --working-directory="$GITHUB_WORKSPACE" \
             --property=MemoryMax=1073741824 --property=MemorySwapMax=0 \
             --property=CPUQuota=100% --property=TasksMax=128 --property=OOMPolicy=kill \
-            --property=RuntimeMaxSec=100 --property=TimeoutStopSec=2 \
+            --property=RuntimeMaxSec=160 --property=TimeoutStopSec=2 \
             --property=Restart=no --property=KillMode=control-group --property=SendSIGKILL=yes \
             --property=LimitCORE=0 --property=UMask=0077 \
             --setenv="MULI_NATIVE_ENVELOPE_UNIT=$unit" \

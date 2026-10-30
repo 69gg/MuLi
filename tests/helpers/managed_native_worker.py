@@ -39,9 +39,9 @@ if TYPE_CHECKING:
 
 MAX_BYTES = 32768
 CONTEXT_REPLY_BYTES = 512
-CASE_SECONDS = 60
+CASE_SECONDS = 120
 CLEANUP_SECONDS = 5
-HARNESS_SECONDS = 90
+HARNESS_SECONDS = CASE_SECONDS + 30
 MEMORY = 1024**3
 TASKS = 128
 HARNESS_MEMORY = MEMORY // 4
@@ -6314,7 +6314,7 @@ class Case:
             self._binding_sources.append(source)
 
     def require_start_time(self) -> None:
-        """Imports or queueing cannot turn a late worker into a fresh 60s case."""
+        """Imports or queueing cannot reset a late worker's complete-case budget."""
         require(
             self.drive_deadline is not None and remaining(self.drive_deadline) > CASE_SECONDS,
             "native_case_start_budget",

@@ -532,11 +532,22 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                     disk = self._confirm(
                         record, desired, lease, after.service.unit.cgroup, proofs=postproofs
                     )
-                    # The following observation must authenticate its own bytes.
-                    assert postproofs is not None
-                    postproofs.python = None
-                    postproofs.packages = None
-                    confirmed = await self._probe(record)
+
+                    def final_preflight() -> None:
+                        assert postproofs is not None
+                        try:
+                            self._check(
+                                record,
+                                verified_python=postproofs.python,
+                                verified_packages=postproofs.packages,
+                            )
+                        finally:
+                            # Only the adjacent confirmation lends content;
+                            # the real probe await starts without its proofs.
+                            postproofs.python = None
+                            postproofs.packages = None
+
+                    confirmed = await self._probe(record, preflight=final_preflight)
                     if confirmed != after or disk != self._disk():
                         raise ObservationError("transaction_observation_changed")
                     if confirmed.unit_confirmed:
@@ -936,32 +947,50 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             del postproofs
             # Only the successful writer-held guard lends bytes to this
             # synchronous confirmation; discard them before the next await.
-            disk = self._confirm(
-                record,
-                role,
-                lease,
-                cgroup,
-                proofs=_FileProofs(
-                    python=self.controller_slot.resolved_python,
-                    packages=observed_packages,
-                ),
+            confirmation_proofs = _FileProofs(
+                python=self.controller_slot.resolved_python,
+                packages=observed_packages,
             )
             del observed_packages
-            final_postproofs = _FileProofs()
-            fresh = await self._probe(record, postproofs=final_postproofs)
-            if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
-                raise ObservationError("transaction_observation_changed")
-            effect_packages: PackageProofs = {}
-            self._guard(
-                record,
-                role,
-                lease,
-                cgroup,
-                verified_python=final_postproofs.python,
-                verified_packages=final_postproofs.packages,
-                observed_packages=effect_packages,
-            )
-            del final_postproofs
+
+            def final_preflight() -> None:
+                try:
+                    self._check(
+                        record,
+                        verified_python=confirmation_proofs.python,
+                        verified_packages=confirmation_proofs.packages,
+                    )
+                finally:
+                    # The last confirmation lends only content to the original
+                    # None preflight, never across the real manager await.
+                    confirmation_proofs.python = None
+                    confirmation_proofs.packages = None
+
+            try:
+                disk = self._confirm(record, role, lease, cgroup, proofs=confirmation_proofs)
+                final_postproofs = _FileProofs()
+                try:
+                    fresh = await self._probe(
+                        record, preflight=final_preflight, postproofs=final_postproofs
+                    )
+                    if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
+                        raise ObservationError("transaction_observation_changed")
+                    effect_packages: PackageProofs = {}
+                    self._guard(
+                        record,
+                        role,
+                        lease,
+                        cgroup,
+                        verified_python=final_postproofs.python,
+                        verified_packages=final_postproofs.packages,
+                        observed_packages=effect_packages,
+                    )
+                finally:
+                    final_postproofs.python = None
+                    final_postproofs.packages = None
+            finally:
+                confirmation_proofs.python = None
+                confirmation_proofs.packages = None
         # Only this successful post-await guard lends bytes to its adjacent
         # effect check. Reopen and verify identities; discard before dispatch.
         self._effect_guard(

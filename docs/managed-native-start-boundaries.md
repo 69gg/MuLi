@@ -60,7 +60,7 @@ source 撤销时移除对应 start 样本。最终可选 `resources.helper_start
 启动、健康或正常退出。旧回执缺少此字段仍有效；新字段只允许用于 helper 观察，
 且必须与原 state 一致。判定只读取原有有界 timeline，不增加查询或建立、恢复 source。
 
-`CASE_SECONDS=60` 是原生 worker 的整轮夹具预算：`Case` 从构造时起建立一个单调
+`CASE_SECONDS=120` 是原生 worker 的整轮夹具预算：`Case` 从构造时起建立一个单调
 deadline，`run()` 用同一个 `asyncio.timeout` 包围 `drive()` 的导入、初始服务启动、
 adopt A、switch B、故意目标失败的 switch A，以及每笔完整投影。它不是每笔产品
 事务的期限；产品 record/anchor 的 helper deadline 和 rollback reserve 独立保留。
@@ -132,7 +132,7 @@ cleanup。若来源观察元数据也装不下，则连同新来源撤下，当�
 没有 failure_collection 标签的顶层或样本内嵌新来源。旧回执没有这些字段仍有效。
 
 这明确增加至多一次失败诊断观察：`read_helper` 含多个 bus RPC 和 proc/kernel 读取，
-并非零新增查询。原单次 probe 至多 2s、每命令/文件及总结果字节上限、Case60s、外层
+并非零新增查询。单次 probe 至多 2s、每命令/文件及总结果字节上限、Case120s、外层
 绝对期限、资源限额与故障注入不变；失败即消耗机会，不轮询、不重试、不借 cleanup
 做健康工作。原始失败先落盘，诊断失败或中断仍保住首因和原清理顺序。新增 RPC、文件
 读取及入口片 write / replace 都有成本；不能声称全部原始 I/O 已统一计入 coordinator setup_bytes，

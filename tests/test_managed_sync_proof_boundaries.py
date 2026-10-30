@@ -32,7 +32,7 @@ from muli.managed_transaction import TransactionRecordV2
 from muli.management_transaction import FixedLock, Role, TransactionError, TransactionJournal
 from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_transaction import ObservationError
-from muli.platforms.managed_backend import _FileProofs
+from muli.platforms.managed_backend import _DiskBinding, _FileProofs
 from muli.platforms.managed_deployment import (
     DeploymentAnchor,
     ManagedDeploymentError,
@@ -45,6 +45,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux real sync
 
 type Window = Literal[
     "observe",
+    "observe-probe",
     "install-preflight",
     "install-files",
     "install-final",
@@ -53,6 +54,7 @@ type Window = Literal[
 
 _HANDOFF_PROBES: dict[Window, int] = {
     "observe": 2,
+    "observe-probe": 2,
     "install-preflight": 1,
     "install-files": 2,
     "install-final": 3,
@@ -61,13 +63,13 @@ _HANDOFF_PROBES: dict[Window, int] = {
 
 
 async def prepare_window(host: Host, window: Window) -> TransactionRecordV2:
-    return await prepare_stopped(host, "target", installed=window == "observe")
+    return await prepare_stopped(host, "target", installed=window in {"observe", "observe-probe"})
 
 
 async def dispatch(
     host: Host, record: TransactionRecordV2, window: Window
 ) -> BindingConfirmation | ManagedServiceObservation:
-    if window == "observe":
+    if window in {"observe", "observe-probe"}:
         return await host.backend.observe(record)
     return await host.backend.install(record, "target", host.data["target"])
 
@@ -82,6 +84,28 @@ def at_handoff(
     original = host.backend._probe
     entered: list[int] = []
     batches: list[_FileProofs] = []
+
+    if window == "observe-probe":
+        original_confirm = host.backend._confirm
+
+        def confirm(
+            current: TransactionRecordV2,
+            selected: Role,
+            lease: FixedLock,
+            cgroup: str,
+            *,
+            proofs: _FileProofs | None = None,
+        ) -> _DiskBinding:
+            result = original_confirm(current, selected, lease, cgroup, proofs=proofs)
+            assert host.probe.count == 2 and not entered
+            assert proofs is not None and proofs.python is not None and proofs.packages is not None
+            entered.append(host.probe.count)
+            batches.append(proofs)
+            callback()
+            return result
+
+        monkeypatch.setattr(host.backend, "_confirm", confirm)
+        return entered, batches
 
     if window == "install-probe":
         original_files = host.backend._install_files
@@ -138,6 +162,91 @@ def replace_leaf(path: Path, *, changed: bool) -> None:
     after = path.stat()
     assert (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("condition", ["nonstopped", "busy", "cgroup", "disk", "unit"])
+async def test_observe_skipped_or_unconfirmed_paths_keep_original_probe_boundaries(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, condition: str
+) -> None:
+    host = shared_host
+    record = await prepare_window(host, "observe-probe")
+    if condition == "nonstopped":
+        host.probe.snapshot = replace(
+            host.probe.snapshot,
+            unit=replace(host.probe.snapshot.unit, active_state="activating", sub_state="start"),
+        )
+    elif condition == "busy":
+        host.writer = host.journal.writer_lease().__enter__()
+    elif condition == "cgroup":
+        host.events.write_bytes(b"populated 1\n")
+    elif condition == "disk":
+        Path(host.anchor.config_path).write_bytes(b"foreign binding bytes")
+    else:
+        host.probe.loaded_unit = b"different loaded unit\n"
+
+    state_path = host.journal.directory.path / "state.json"
+    state, disk = state_path.read_bytes(), host.backend._disk()
+    commands, events = list(host.commands), host.events.read_bytes()
+    checks = observe_checks(host, monkeypatch)
+    entered, batches = at_handoff(host, monkeypatch, "observe-probe", lambda: None)
+    original_probe = host.backend._probe
+    preflights: list[bool] = []
+    postproofs_seen: list[_FileProofs] = []
+
+    async def probe(
+        current: TransactionRecordV2,
+        *,
+        preflight: Callable[[], None] | None = None,
+        postprocess: Callable[[ManagedProbeResult], Role | None] | None = None,
+        postproofs: _FileProofs | None = None,
+    ) -> ManagedProbeResult:
+        preflights.append(preflight is not None)
+        if postproofs is not None:
+            postproofs_seen.append(postproofs)
+        return await original_probe(
+            current, preflight=preflight, postprocess=postprocess, postproofs=postproofs
+        )
+
+    monkeypatch.setattr(host.backend, "_probe", probe)
+    try:
+        observation = await host.backend.observe(record)
+        if condition == "busy":
+            assert host.writer is not None
+            host.writer.check()
+    finally:
+        host.release_writer()
+
+    assert observation.confirmation is None and observation.writer_free == (condition != "busy")
+    assert (
+        observation.service
+        == {
+            "nonstopped": "starting",
+            "busy": "stopping",
+            "cgroup": "stopping",
+            "disk": "stopped",
+            "unit": "stopped",
+        }[condition]
+    )
+    if condition == "unit":
+        # A completed confirmation may lend content even when the manager has
+        # not loaded this unit. The original final probe withholds confirmation.
+        assert entered == [2] and len(batches) == 1
+        assert preflights == [False, False, True] and host.probe.count == 3
+        roles: list[Role | None] = [None] * 4 + ["target"] * 7 + [None] * 2
+    else:
+        assert entered == batches == []
+        assert preflights == [False, False] and host.probe.count == 2
+        roles = [None] * 4
+    assert [selected for _, selected in checks] == roles
+    assert all(current is record for current, _ in checks)
+    assert all(batch.python is None and batch.packages is None for batch in postproofs_seen)
+    same_record, same_disk = host.record() == record, host.backend._disk() == disk
+    assert same_record and same_disk and state_path.read_bytes() == state
+    assert host.record().deadline == record.deadline and host.events.read_bytes() == events
+    assert host.commands == commands and host.transport.calls == [] and host.writer is None
+    with host.journal.writer_lease() as lease:
+        lease.check()
+    host.control.check()
 
 
 @pytest.mark.parametrize("fault", ["running", "busy", "error", "disk"])
@@ -267,7 +376,15 @@ async def test_install_initial_handoff_still_reads_a_distinct_selected_python(
 
 
 @pytest.mark.parametrize(
-    "window", ["observe", "install-preflight", "install-files", "install-final", "install-probe"]
+    "window",
+    [
+        "observe",
+        "observe-probe",
+        "install-preflight",
+        "install-files",
+        "install-final",
+        "install-probe",
+    ],
 )
 @pytest.mark.parametrize(
     ("fault", "code"),
@@ -392,9 +509,25 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
         if fault in {"revision", "lease"}
         else ManagedDeploymentError
     )
+    # Observe has already completed its last effect guard in this new window.
+    # Its original final probe authenticates controller/metadata with role=None;
+    # do not introduce a later selected-file, lease or deadline authorization.
+    after_last_effect = window == "observe-probe" and fault in {
+        "selected",
+        "selected-replaced",
+        "selected-parent",
+        "lease",
+        "deadline",
+    }
     try:
-        with pytest.raises(expected, match=f"^{code}$"):
-            await dispatch(host, record, window)
+        if after_last_effect:
+            result = await dispatch(host, record, window)
+            assert isinstance(result, ManagedServiceObservation)
+            assert result.confirmation == expected_confirmation(record, "target")
+            assert result.service == "stopped" and result.writer_free
+        else:
+            with pytest.raises(expected, match=f"^{code}$"):
+                await dispatch(host, record, window)
     finally:
         metadata.chmod(mode)
         for parent, retained in moved.items():
@@ -406,8 +539,8 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
 
     assert entered == [_HANDOFF_PROBES[window]] and len(checkpoint) == 1
     disk, state, before_checks, before_python = checkpoint[0]
-    # This new handoff preserves the original role=None preflight. Selected
-    # executable/effect authorization still belongs to the final confirmation,
+    # Install's file-to-probe handoff preserves the original role=None preflight.
+    # Its selected/effect authorization belongs to the later final confirmation,
     # after the third probe and its independent role=None post-check.
     final_confirm_failure = window == "install-probe" and fault in {
         "selected",
@@ -419,8 +552,16 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
     extra_checks = 0 if window == "observe" and fault == "lease" else 1
     if final_confirm_failure:
         extra_checks = 3
+    elif after_last_effect:
+        extra_checks = 2
     assert len(checks) - before_checks == extra_checks
-    assert host.probe.count == entered[0] + int(final_confirm_failure)
+    assert host.probe.count == entered[0] + int(final_confirm_failure or after_last_effect)
+    if window == "observe-probe":
+        assert before_checks == 11
+        assert [selected for _, selected in checks] == (
+            [None] * 4 + ["target"] * 7 + [None] * extra_checks
+        )
+        assert reads.leaves[selected].bytes == before_payload[selected]
     assert host.commands == commands and host.transport.calls == [] and host.writer is None
     same_record = host.record() == current
     assert same_record and current.deadline == record.deadline
@@ -437,7 +578,11 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
             reads.leaves[controller].bytes - before_payload[controller] == reads.sizes[controller]
         )
     elif fault in {"selected", "selected-replaced"}:
-        assert reads.leaves[selected].bytes - before_payload[selected] == reads.sizes[selected]
+        copies = 0 if after_last_effect else 1
+        assert (
+            reads.leaves[selected].bytes - before_payload[selected]
+            == reads.sizes[selected] * copies
+        )
     elif fault == "python":
         assert (
             python.bytes - before_python
@@ -446,18 +591,30 @@ async def test_handoff_retains_fresh_files_metadata_and_effect_authorization(
     if fault == "both":
         # Controller failure still wins before any selected payload read.
         assert reads.leaves[selected].bytes == before_payload[selected]
+    if after_last_effect:
+        # These old successful paths still independently authenticate content
+        # after the third real manager read; only its sync preflight may borrow.
+        assert (
+            reads.leaves[controller].bytes - before_payload[controller] == reads.sizes[controller]
+        )
+        assert (
+            python.bytes - before_python
+            == host.backend.controller_slot.resolved_python.identity.size
+        )
 
 
+@pytest.mark.parametrize("window", ["install-probe", "observe-probe"])
 @pytest.mark.parametrize("stage", ["files", "preflight"])
 @pytest.mark.parametrize("cancel", [False, True], ids=["error", "cancel"])
-async def test_install_file_proof_is_discarded_on_sync_handoff_failure(
+async def test_file_proof_is_discarded_on_sync_handoff_failure(
     shared_host: Host,
     monkeypatch: pytest.MonkeyPatch,
+    window: Window,
     stage: Literal["files", "preflight"],
     cancel: bool,
 ) -> None:
     host = shared_host
-    record = await prepare_window(host, "install-probe")
+    record = await prepare_window(host, window)
     state_path = host.journal.directory.path / "state.json"
     state, commands = state_path.read_bytes(), list(host.commands)
     checks = observe_checks(host, monkeypatch)
@@ -493,14 +650,18 @@ async def test_install_file_proof_is_discarded_on_sync_handoff_failure(
             raise failure
         monkeypatch.setattr(host.backend, "_check", checked)
 
-    entered, batches = at_handoff(host, monkeypatch, "install-probe", change)
+    entered, batches = at_handoff(host, monkeypatch, window, change)
     with pytest.raises(type(failure)) as caught:
-        await dispatch(host, record, "install-probe")
+        await dispatch(host, record, window)
 
     assert caught.value is failure
     assert entered == [2] and len(batches) == len(disk) == 1
     assert batches[0].python is None and batches[0].packages is None
-    roles: list[Role | None] = ["target", None, "target", None] + ["target"] * 16
+    roles: list[Role | None] = (
+        [None] * 4 + ["target"] * 7
+        if window == "observe-probe"
+        else ["target", None, "target", None] + ["target"] * 16
+    )
     assert [selected for _, selected in checks] == roles + ([None] if stage == "preflight" else [])
     assert host.probe.count == 2 and host.backend._disk().digests == disk[0]
     same_record = host.record() == record
@@ -512,11 +673,12 @@ async def test_install_file_proof_is_discarded_on_sync_handoff_failure(
     host.control.check()
 
 
-async def test_install_probe_rehashes_controller_leaf_after_mode_change(
-    shared_host: Host, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("window", ["install-probe", "observe-probe"])
+async def test_file_probe_rehashes_controller_leaf_after_mode_change(
+    shared_host: Host, monkeypatch: pytest.MonkeyPatch, window: Window
 ) -> None:
     host = shared_host
-    record = await prepare_window(host, "install-probe")
+    record = await prepare_window(host, window)
     path = Path(host.backend.controller_slot.package.root) / "batch_payload/first.bin"
     mode = stat.S_IMODE(path.stat().st_mode)
     state_path = host.journal.directory.path / "state.json"
@@ -530,14 +692,15 @@ async def test_install_probe_rehashes_controller_leaf_after_mode_change(
         path.chmod(mode ^ stat.S_IXUSR)
         assert stat.S_IMODE(path.stat().st_mode) != mode
 
-    entered, batches = at_handoff(host, monkeypatch, "install-probe", change)
+    entered, batches = at_handoff(host, monkeypatch, window, change)
 
-    confirmation = await host.backend.install(record, "target", host.data["target"])
+    result = await dispatch(host, record, window)
 
+    confirmation = result.confirmation if isinstance(result, ManagedServiceObservation) else result
     assert confirmation == expected_confirmation(record, "target")
     assert entered == [2] and len(before) == len(batches) == 1
     assert batches[0].python is None and batches[0].packages is None
-    assert host.probe.count == 3 and len(checks) == 29
+    assert host.probe.count == 3 and len(checks) == (13 if window == "observe-probe" else 29)
     # Changed leaf mode revokes its synchronous content reuse; the next probe's
     # post-await check independently reads the same bytes once more.
     assert reads.leaves[path].bytes - before[0] == 2 * reads.sizes[path]
@@ -555,7 +718,15 @@ async def test_install_probe_rehashes_controller_leaf_after_mode_change(
 
 
 @pytest.mark.parametrize(
-    "window", ["observe", "install-preflight", "install-files", "install-final", "install-probe"]
+    "window",
+    [
+        "observe",
+        "observe-probe",
+        "install-preflight",
+        "install-files",
+        "install-final",
+        "install-probe",
+    ],
 )
 async def test_same_bytes_on_new_package_inode_are_reopened_and_fully_read(
     shared_host: Host, monkeypatch: pytest.MonkeyPatch, window: Window
@@ -606,13 +777,21 @@ async def test_same_bytes_on_new_package_inode_are_reopened_and_fully_read(
     assert next_guard[0][1] - before[0][1] == 1
     assert next_guard[0][2] - before[0][2] >= 2
     assert next_guard[0][3] - before[0][3] == 1
-    assert len(checks) == (13 if window == "observe" else 29)
+    assert len(checks) == (13 if window in {"observe", "observe-probe"} else 29)
     assert host.commands == [] and host.transport.calls == [] and host.record() == record
     assert host.writer is None
 
 
 @pytest.mark.parametrize(
-    "window", ["observe", "install-preflight", "install-files", "install-final", "install-probe"]
+    "window",
+    [
+        "observe",
+        "observe-probe",
+        "install-preflight",
+        "install-files",
+        "install-final",
+        "install-probe",
+    ],
 )
 async def test_handoff_rechecks_empty_cgroup_before_file_confirmation(
     shared_host: Host, monkeypatch: pytest.MonkeyPatch, window: Window
@@ -620,28 +799,45 @@ async def test_handoff_rechecks_empty_cgroup_before_file_confirmation(
     host = shared_host
     record = await prepare_window(host, window)
     disk: list[tuple[str, str | None, str]] = []
+    checks = observe_checks(host, monkeypatch)
 
     def populate() -> None:
         disk.append(host.backend._disk().digests)
         host.events.write_bytes(b"populated 1\n")
 
-    entered, _batches = at_handoff(host, monkeypatch, window, populate)
+    entered, batches = at_handoff(host, monkeypatch, window, populate)
     if window == "observe":
         result = await host.backend.observe(record)
         assert result.service == "stopping" and result.confirmation is None
+    elif window == "observe-probe":
+        result = await host.backend.observe(record)
+        # The final confirmation preceded this mutation. The original probe
+        # has no later cgroup effect guard and must not gain one through reuse.
+        assert result.service == "stopped" and result.writer_free
+        assert result.confirmation == expected_confirmation(record, "target")
+        assert [selected for _, selected in checks] == [None] * 4 + ["target"] * 7 + [None] * 2
     else:
         with pytest.raises(ObservationError, match="^cgroup_not_empty$"):
             await dispatch(host, record, window)
 
     assert entered == [_HANDOFF_PROBES[window]]
-    expected_probes = entered[0] + int(window == "install-probe")
+    expected_probes = entered[0] + int(window in {"install-probe", "observe-probe"})
     assert host.probe.count == expected_probes and host.backend._disk().digests == disk[0]
     assert host.commands == [] and host.transport.calls == [] and host.record() == record
     assert host.writer is None
+    assert all(batch.python is None and batch.packages is None for batch in batches)
 
 
 @pytest.mark.parametrize(
-    "window", ["observe", "install-preflight", "install-files", "install-final", "install-probe"]
+    "window",
+    [
+        "observe",
+        "observe-probe",
+        "install-preflight",
+        "install-files",
+        "install-final",
+        "install-probe",
+    ],
 )
 @pytest.mark.parametrize("fault", ["controller", "python", "cancel"])
 async def test_next_real_await_discards_bytes_and_rejects_changed_payload(

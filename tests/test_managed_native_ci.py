@@ -2156,7 +2156,7 @@ def test_actual_kernel_limits_cannot_be_just_property_claims(
         worker.kernel_limits(path, memory=ci.MEMORY, tasks=ci.TASKS)
 
 
-@pytest.mark.parametrize("seconds", [0, -1, 61])
+@pytest.mark.parametrize("seconds", [0, -1, worker.CASE_SECONDS + 1])
 def test_functional_budget_is_not_extended(seconds: float, tmp_path: Path) -> None:
     with pytest.raises(worker.NativeError, match="case_budget"):
         worker.Case(tmp_path, seconds=seconds)
@@ -2169,13 +2169,13 @@ def test_case_deadline_and_timeline_are_bounded_without_printing_private_data(
     monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
     case = worker.Case(tmp_path)
     case.note("transaction", generation="a" * 32, phase="verifying")
-    clock = 159
+    clock = case.deadline - 1
     assert worker.remaining(case.deadline) == 1
     case.note("transaction", generation="a" * 32, phase="verifying")
     assert len(case.result["timeline"]) == 1
     with pytest.raises(worker.NativeError, match="fact_invalid"):
         case.note("transaction", nonce="private")
-    clock = 160
+    clock = case.deadline
     with pytest.raises(worker.NativeError, match="deadline_exceeded"):
         worker.remaining(case.deadline)
 
@@ -2382,7 +2382,7 @@ def test_receipt_rejects_unbounded_or_foreign_metadata(fixture: tuple[Any, Comma
 def test_workflow_has_always_cleanup_and_only_explicit_hosted_native_job() -> None:
     workflow = (SCRIPT.parents[1] / ".github/workflows/ci.yml").read_text()
     native = workflow.split("  managed-native:\n", 1)[1]
-    assert "runs-on: ubuntu-24.04" in native and "timeout-minutes: 5" in native
+    assert "runs-on: ubuntu-24.04" in native and "timeout-minutes: 8" in native
     assert native.count("check_managed_native_ci.py") == 2
     assert 'cleanup "$RUNNER_TEMP/muli-managed-native-ci"' in native
     assert "if: always()" in native and "result.json" in native
@@ -4283,7 +4283,8 @@ def test_execute_clips_actual_harness_runtime_and_passes_absolute_deadline(
         if value.startswith("--property=RuntimeMaxSec=")
     )
     assert runtime == ci.HARNESS_SECONDS - 10
-    assert "--setenv=MULI_NATIVE_EXECUTE_DEADLINE=195.0" in launched
+    deadline = 100.0 + ci.HARNESS_SECONDS + ci.CLEANUP_SECONDS
+    assert f"--setenv=MULI_NATIVE_EXECUTE_DEADLINE={deadline}" in launched
 
 
 async def test_drive_without_coordinator_deadline_never_enters_business(
@@ -5596,7 +5597,11 @@ def test_manager_failure_evidence_write_error_keeps_original_failure(
     assert native.manager_failure["code"] == "native_manager_failed"
 
 
-@pytest.mark.parametrize("spent", [30.0, 95.0], ids=["case-margin", "execute-deadline"])
+@pytest.mark.parametrize(
+    "spent",
+    [ci.HARNESS_SECONDS - ci.CASE_SECONDS, ci.HARNESS_SECONDS + ci.CLEANUP_SECONDS],
+    ids=["case-margin", "execute-deadline"],
+)
 def test_preparation_cost_cannot_launch_a_case_with_insufficient_margin(
     fixture: tuple[Any, Commands],
     monkeypatch: pytest.MonkeyPatch,
@@ -5619,7 +5624,7 @@ def test_preparation_cost_cannot_launch_a_case_with_insufficient_margin(
     assert not any("systemd-run" in argv for argv in commands.calls)
 
 
-@pytest.mark.parametrize("left", [0.0, 60.0, 60.01])
+@pytest.mark.parametrize("left", [0.0, float(worker.CASE_SECONDS), worker.CASE_SECONDS + 0.01])
 def test_worker_rechecks_business_margin_without_resetting_case_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5633,7 +5638,7 @@ def test_worker_rechecks_business_margin_without_resetting_case_deadline(
     else:
         with pytest.raises(worker.NativeError):
             case.require_start_time()
-    assert case.deadline == 160.0
+    assert case.deadline == 100.0 + worker.CASE_SECONDS
 
 
 def test_result_collection_failure_preserves_first_client_error(
@@ -5756,7 +5761,7 @@ def test_fresh_cleanup_preserves_only_valid_owned_finite_readiness(
         readiness["elapsed_ms"] = {
             "elapsed-bool": True,
             "elapsed-negative": -1,
-            "elapsed-large": 95001,
+            "elapsed-large": (ci.HARNESS_SECONDS + ci.CLEANUP_SECONDS) * 1000 + 1,
         }[change]
     elif change == "late":
         readiness["late_ready"] = "private"

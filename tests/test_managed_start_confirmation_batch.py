@@ -654,7 +654,8 @@ async def test_start_first_probe_reuses_only_its_fresh_post_guard_bytes(
     )
     # Both post-probe/writer-guard pairs now use only their fresh post-check
     # bytes; all actual effects, independent opens and 14 checks still precede it.
-    assert controller_copies == 4
+    # The confirmation-to-preflight handoff removes one additional copy.
+    assert controller_copies == 3
 
 
 @pytest.mark.parametrize("failure_kind", ["metadata", "error", "cancel"])
@@ -988,7 +989,8 @@ async def test_start_second_probe_reuses_only_its_fresh_post_guard_bytes(
     )
     # All real effects, opens, bytes and 14 checks must pass before this red.
     # The second post-probe/writer-guard pair should save one further full read.
-    assert controller_copies == 4
+    # The confirmation-to-preflight handoff removes one additional copy.
+    assert controller_copies == 3
 
 
 @pytest.mark.parametrize(
