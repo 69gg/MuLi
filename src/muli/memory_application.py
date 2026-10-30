@@ -841,10 +841,11 @@ class MemoryApplication:
         main_id = self.runtime.store.existing_main_session_id()
         if main_id is None:
             raise ValueError("主会话身份无法核查")
-        records = self.watch_records(main_id, after_id=after_id, limit=limit)
+        self._watch_access("memory_watch_list")
+        records = self.watches.validated_records(main_id, after_id=after_id, limit=limit)
         items: list[dict[str, Any]] = []
         for record in records:
-            # records already validates the frozen routing against real ingress.
+            # The whole window already passed real ingress and owner validation.
             # Only these finite labels cross the HTTP boundary, never addresses.
             routing = (
                 FrozenRouting.load(record["routing"]) if record["version"] == 2 else FrozenRouting()
@@ -868,20 +869,37 @@ class MemoryApplication:
                     "reply_preference": preference,
                 }
             )
-        result = {
-            "items": items,
-            "after_id": after_id,
-            # A full window only promises another read, including a final empty one.
-            "has_more": len(records) == limit,
-            "next_after_id": records[-1]["id"] if len(records) == limit else None,
-            "processing": {
-                "enabled": self._watch_enabled(),
-                "paused": not self.runtime.maintenance.admission.allowed,
-            },
+        max_output_chars = self.watches.max_output_chars()
+        processing = {
+            "enabled": self._watch_enabled(),
+            "paused": not self.runtime.maintenance.admission.allowed,
         }
-        if json_size(result) > self.runtime.config.settings.limits.max_output_chars:
-            raise EvidenceError("output_budget", "长期留意清单超过输出预算，请减少每页数量")
-        return result
+
+        def page(count: int) -> dict[str, Any]:
+            selected = items[:count]
+            # A full read window still only promises another read, possibly empty.
+            more = count < len(items) or len(records) == limit
+            return {
+                "items": selected,
+                "after_id": after_id,
+                "has_more": more,
+                "next_after_id": selected[-1]["id"] if more else None,
+                "processing": processing,
+            }
+
+        # Validation and every preference projection finish before any fit test.
+        complete = page(len(items))
+        if self.watches.output_fits(complete, max_output_chars):
+            return complete
+        fitted: dict[str, Any] | None = None
+        for count in range(1, len(items)):
+            candidate = page(count)
+            if not self.watches.output_fits(candidate, max_output_chars):
+                break
+            fitted = candidate
+        if fitted is None:
+            raise EvidenceError("output_budget", "完整长期留意条目及分页信息超过当前输出预算")
+        return fitted
 
     async def cancel_watch(self, main_session_id: str, identifier: str) -> dict[str, Any]:
         self._watch_access("memory_watch_cancel")

@@ -169,6 +169,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     activateConnection();
     globalThis.ui = { state, renderMemories, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, renderComposerAttachments,
       activateConnection,
+      watchPending(id) { return memoryWatchPending.has(id); },
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       stopEvents() { globalController?.abort(); },
       get slot() { return memoryDialog; }, get path() { return memoryPath; }, get catalog() { return memorySources; }, get watches() { return memoryWatches; }, get submit() { return dialogSubmit; } };
@@ -1083,6 +1084,54 @@ test("memory watch tab reads a bounded fresh page and shows literal finite prefe
   assert.equal(h.requests.some((request) => request.method === "POST"), false);
 });
 
+test("a complete short watch page can continue and return through the real tab controls", async () => {
+  const first = watchRecord(1, { question: "前页长期问题：" + "完整背景".repeat(250) });
+  const last = watchRecord(2, { question: "后页长期问题：" + "后续背景".repeat(250) });
+  const h = harness(async (path) => {
+    assert.ok(path.startsWith("/memory/watches?"));
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("limit"), "20");
+    const after = query.get("after_id");
+    assert.ok(after === "" || after === first.id);
+    return after ? watchWindow([last], after) : watchWindow([first], "", { has_more: true, next_after_id: first.id });
+  });
+  await openWatches(h);
+  assert.ok(h.other.textContent.includes(first.question));
+  const root = h.other.firstElementChild, slot = h.ui.watches;
+  assert.equal(h.other.querySelectorAll(".memory-row").length, 1);
+  assert.equal(stopWatchButton(h, first.id).disabled, false);
+  assert.equal(h.button("继续翻页", h.other).disabled, false);
+  await clickMemoryButton(h, h.button("继续翻页", h.other));
+  assert.ok(h.other.textContent.includes(last.question)); assert.equal(h.other.textContent.includes(first.question), false);
+  assert.equal(stopWatchButton(h, first.id), null); assert.equal(stopWatchButton(h, last.id).disabled, false);
+  assert.equal(h.button("继续翻页", h.other).disabled, true);
+  await clickMemoryButton(h, h.button("上一页", h.other));
+  assert.ok(h.other.textContent.includes(first.question)); assert.equal(h.other.textContent.includes(last.question), false);
+  assert.equal(h.other.firstElementChild === root, true); assert.equal(h.ui.watches === slot, true);
+  assert.deepEqual(h.requests.map(({ path }) => new URLSearchParams(path.split("?")[1]).get("after_id")), ["", first.id, ""]);
+  assert.ok(h.requests.every(({ method, cache }) => (!method || method === "GET") && cache === "no-store"));
+});
+
+for (const [name, page] of [
+  ["an empty continuation", watchWindow([], "", { has_more: true, next_after_id: watchRecord(1).id })],
+  ["a cursor beyond its visible item", watchWindow([watchRecord(1)], "", { has_more: true, next_after_id: watchRecord(2).id })],
+  ["a different after echo", watchWindow([watchRecord(1)], watchRecord(2).id)],
+  ["duplicate visible ids", watchWindow([watchRecord(1), watchRecord(1)], "", { has_more: true, next_after_id: watchRecord(1).id })],
+  ["an incomplete question", watchWindow([watchRecord(1, { question: "" })], "", { has_more: true, next_after_id: watchRecord(1).id })],
+  ["an unknown preference channel", watchWindow([watchRecord(1, { reply_preference: { kind: "registered_channel", channel: "not-a-channel" } })], "", { has_more: true, next_after_id: watchRecord(1).id })],
+  ["a full window without continuation", watchWindow(Array.from({ length: 20 }, (_, index) => watchRecord(index + 1)), "", { has_more: false, next_after_id: null })],
+]) {
+  test(`watch short pages still reject ${name}`, async () => {
+    const h = harness(async () => page);
+    await openWatches(h);
+    assert.ok(h.other.textContent.includes("读取失败"));
+    assert.equal(h.other.textContent.includes("还没有长期留意登记"), false);
+    assert.equal(h.ui.watches.page === null, true);
+    assert.equal(h.button("继续翻页", h.other).disabled, true);
+    assert.equal(h.requests.length, 1); assert.equal(h.requests.some(({ method }) => method === "POST"), false);
+  });
+}
+
 test("a full watch window advances to an explicit empty end and can return without replacing its outer DOM", async () => {
   const items = Array.from({ length: 20 }, (_, index) => watchRecord(index + 1));
   const h = harness(async (path) => {
@@ -1192,6 +1241,36 @@ test("a lost stop response is reconciled by reading the actual cancelled record 
   assert.ok(h.other.textContent.includes("已重新读取当前窗口")); assert.ok(h.other.textContent.includes("已停止"));
   assert.equal(stopWatchButton(h, item.id).disabled, true);
 });
+
+for (const cancelled of [false, true]) {
+  test(`a budget-short watch page keeps an unseen unknown stop locked until its ${cancelled ? "cancelled" : "active"} record is actually read`, async () => {
+    const first = watchRecord(1), target = watchRecord(2); let reads = 0, writes = 0;
+    const h = harness(async (path, options = {}) => {
+      if (path.startsWith("/memory/watches?")) {
+        const after = new URLSearchParams(path.split("?")[1]).get("after_id");
+        if (++reads === 1) return watchWindow([first, target]);
+        return after ? watchWindow([{ ...target, state: cancelled ? "cancelled" : "active", revision: cancelled ? 2 : 1 }], after)
+          : watchWindow([first], "", { has_more: true, next_after_id: first.id });
+      }
+      assert.equal(path, "/memory/watches/cancel"); assert.equal(options.method, "POST");
+      assert.deepEqual(JSON.parse(options.body), { id: target.id });
+      writes++; throw new Error("停止回执在传输中丢失");
+    });
+    await openWatches(h); await clickMemoryButton(h, stopWatchButton(h, target.id));
+    await h.form.dispatch("submit");
+    assert.equal(reads, 2); assert.equal(writes, 1);
+    assert.equal(h.ui.watchPending(target.id), true);
+    assert.equal(stopWatchButton(h, target.id), null); assert.equal(stopWatchButton(h, first.id).disabled, false);
+    h.dialog.close(); await flush();
+    await clickMemoryButton(h, h.button("继续翻页", h.other));
+    assert.equal(reads, 3); assert.equal(writes, 1); assert.equal(h.ui.watchPending(target.id), false);
+    const stop = stopWatchButton(h, target.id);
+    assert.equal(stop.disabled, cancelled);
+    await clickMemoryButton(h, stop);
+    assert.equal(h.dialog.open, !cancelled); assert.equal(writes, 1);
+    assert.deepEqual(h.requests.map(({ method }) => method ?? "GET"), ["GET", "POST", "GET", "GET"]);
+  });
+}
 
 test("a GET started before a stop became unknown cannot unlock that attempt", async () => {
   const beforeUnknown = deferred(), afterUnknown = deferred(), stopped = deferred(), item = watchRecord(); let reads = 0;

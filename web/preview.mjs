@@ -1,5 +1,6 @@
 /** Browser-only interactive demo. Nothing in this module calls a MuLi server. */
 const encoder = new TextEncoder();
+const watchOutputBytes = 64 * 1024; // Server MAX_MATCH_PROOF_BYTES, also for the demo envelope.
 const clone = (value) => structuredClone(value);
 const timestamp = () => Date.now() / 1000;
 let sequence = 0;
@@ -345,8 +346,25 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       const after = url.searchParams.get("after_id") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !/^(?:[a-f0-9]{64})?$/u.test(after)) return failure("清单分页参数无效。", 422);
       const items = state.memoryWatches.filter((item) => item.id > after).sort((left, right) => left.id.localeCompare(right.id)).slice(0, limit).map((item) => Object.fromEntries(["id", "question", "match_terms", "state", "revision", "reply_preference"].map((field) => [field, item[field]])));
-      const result = { items, after_id: after, has_more: items.length === limit, next_after_id: items.length === limit ? items.at(-1).id : null, processing: { enabled: state.settings.memory.enabled && state.settings.attention.enabled && state.settings.attention.events.includes("memory"), paused: false } };
-      return JSON.stringify(result).length > state.settings.limits.max_output_chars ? failure({ code: "output_budget", message: "长期留意清单超过输出预算。" }) : response(result);
+      const maxChars = state.settings.limits.max_output_chars;
+      const processing = { enabled: state.settings.memory.enabled && state.settings.attention.enabled && state.settings.attention.events.includes("memory"), paused: false };
+      const page = (count) => {
+        const selected = items.slice(0, count), more = count < items.length || items.length === limit;
+        return { items: selected, after_id: after, has_more: more, next_after_id: more ? selected.at(-1).id : null, processing };
+      };
+      const fits = (value) => {
+        const packed = JSON.stringify(value);
+        return Array.from(packed).length <= maxChars && encoder.encode(packed).length <= watchOutputBytes;
+      };
+      const complete = page(items.length);
+      if (fits(complete)) return response(complete);
+      let fitted = null;
+      for (let count = 1; count < items.length; count++) {
+        const candidate = page(count);
+        if (!fits(candidate)) break;
+        fitted = candidate;
+      }
+      return fitted ? response(fitted) : failure({ code: "output_budget", message: "完整长期留意条目及分页信息超过当前输出预算。" });
     }
     if (path === "/memory/watches/cancel" && method === "POST") {
       if (state.settings.disabled_tools.includes("memory_watch_cancel")) return failure("资料关注工具未启用。");

@@ -504,11 +504,13 @@ class MemoryWatches:
             raise PermissionError("资料关注需要真实主会话")
 
     def _output(self, value: object) -> None:
-        if (
-            len(_encoded(value)) > MAX_MATCH_PROOF_BYTES
-            or len(_encoded(value).decode("utf-8")) > self.max_output_chars()
-        ):
+        if not self.output_fits(value, self.max_output_chars()):
             raise EvidenceError("output_budget", "完整资料关注结果超过当前输出预算")
+
+    @staticmethod
+    def output_fits(value: object, max_output_chars: int) -> bool:
+        raw = _encoded(value)
+        return len(raw) <= MAX_MATCH_PROOF_BYTES and len(raw.decode("utf-8")) <= max_output_chars
 
     @staticmethod
     def _storage(value: object) -> None:
@@ -629,6 +631,14 @@ class MemoryWatches:
     def records(
         self, main_session_id: str, *, after_id: str = "", limit: int = 20
     ) -> list[dict[str, Any]]:
+        result = self.validated_records(main_session_id, after_id=after_id, limit=limit)
+        self._output(result)
+        return result
+
+    def validated_records(
+        self, main_session_id: str, *, after_id: str = "", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Read a complete finite window before public projection; not tool output."""
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("资料关注每页需要 1–100 条")
         if not isinstance(after_id, str) or len(after_id) > 64:
@@ -643,7 +653,6 @@ class MemoryWatches:
         result = [_watch(self.store, _text(row["id"])) for row in rows]
         if any(item["main_session_id"] != main_session_id for item in result):
             raise PermissionError("资料关注属于其它会话")
-        self._output(result)
         return result
 
     def status(self) -> dict[str, Any]:
