@@ -92,3 +92,11 @@ RPC 仅包装原 `SystemdProbe._command`，固定分类为 GetUnit、Unit、Serv
 早期读数必须沿原 fixture、UID/PID/INVOCATION_ID、真实 main 和 helper source 门才能导出；未绑定的 startup 只给 unavailable/null。原 first_record、rows 与 source 条件和发布机会不变：过早异常、绑定失败或 kill 可能完全没有启动 payload，不为补齐数据增加文件、发布、轮询或重试。能发布的 partial 也不证明覆盖全部启动。startup 搭原两个 prefix 和一个 final；单快照与聚合都先裁 startup，再裁 breakdown，仍不够才沿旧整体诊断退让，保留原 failure/timeline/cleanup。
 
 这些点不读取 `/proc` 或文件叶，不持有认证证明，不增加 profile 或通用模块跟踪。time 首次导入、进入 hook 之前的 Python/系统调度仍未覆盖；main_entered 是通过身份门后的绑定点。wall 是同一单调时基下的有限区间，CPU 仅代表 helper 本进程；不同进程的 wall/CPU、包含式 guard 成本及 prepared→draining 间隔不能直接相加或当作可删除时间。离线新回归须实际 await helper coroutine 到真实 `_entry` 保留文件认证，再在受控 controller step 停下；只关闭 coroutine 不能证明入口两点。新候选尚未取得 hosted 数据，已验证性能收益仍为零，原生失败和原限额继续保留。
+
+### 配置模型的独立加载边界
+
+`LogLevel` 和原七字段 `SystemEventsSettings` 统一定义于轻量 `system_event_settings`，只依赖 typing/Pydantic；config 直接使用它，原 system_events 公开入口显式 re-export 同一对象。模型不反向导入 config、Store 或通知运行时，不复制类、不增加代理，也不人为覆盖 `__module__`。定义模块随提取改变；已有 JSON 配置的默认、字段、schema、严格校验与 frozen 合同继续保留，不新增 pickle 持久化兼容承诺。
+
+此边界移除的是 helper 为加载配置模型而附带的系统通知运行时导入；正常应用仍按原职责加载 SystemEvents。`transaction_url` 仍在原位置完整执行 `Settings.model_validate_json`，不改成仅取 server 子字段，不推迟必经 Settings/httpx/文件认证或跨 await 借证明。其它真正需要的运行时、失败诊断与 Store 路径不受永久禁止导入的规则约束。
+
+冷回归在新鲜 `-I -B` 进程显式选定目标工作树 src，并核真实模块文件，分别观察 config/managed_host 导入后有限通知入口未加载；另以 config-first 和 legacy-first 检验模型、LogLevel、字段工厂及默认实例身份。JSON/default/schema/往返/frozen 与既有非法值回归共同约束原配置合同，合法 server 下的其它非法配置仍须被 transaction_url 拒绝。M 已保留 TimeoutError 与 verified cleanup；其中约 2.6 秒仅为整个 host 传递导入区间，不能预填为本次净收益。此提取尚无新的 hosted 性能结论，原八点、完整三事务、发布次数、32 KiB、资源和 60/90/5 秒验收继续适用。

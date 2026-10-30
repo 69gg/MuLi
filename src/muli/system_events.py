@@ -16,8 +16,6 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-
 from muli import __version__
 from muli.channel_health import CHANNEL_RECEIVE_FAILURE_CODES
 from muli.events import EventBus
@@ -30,10 +28,11 @@ from muli.proactive import FrozenRouting
 from muli.reminder_followup import ReminderFollowupProof, read_followup_notice
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id
+from muli.system_event_settings import LogLevel as LogLevel
+from muli.system_event_settings import SystemEventsSettings as SystemEventsSettings
 from muli.update_evidence import update_notice_available
 from muli.voice_health import VOICE_FAILURE_CODES
 
-LogLevel = Literal["warning", "error", "critical"]
 _LEVELS = {"warning": logging.WARNING, "error": logging.ERROR, "critical": logging.CRITICAL}
 _COMPONENTS = frozenset(
     {
@@ -86,18 +85,6 @@ _HOST_FAILURES: dict[str, tuple[str, frozenset[str]]] = {
     "voice_listener": ("media", VOICE_FAILURE_CODES),
     "channel_receiver": ("channels", CHANNEL_RECEIVE_FAILURE_CODES),
 }
-
-
-class SystemEventsSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    enabled: bool = Field(default=True, strict=True)
-    notify_enabled: bool = Field(default=True, strict=True)
-    capture_level: LogLevel = "error"
-    notify_level: LogLevel = "error"
-    queue_capacity: int = Field(default=128, ge=1, le=4096, strict=True)
-    max_records: int = Field(default=1000, ge=1, le=10_000, strict=True)
-    dedup_seconds: float = Field(default=60, ge=1, le=3600, allow_inf_nan=False, strict=True)
 
 
 def _reference(value: Any) -> str | None:

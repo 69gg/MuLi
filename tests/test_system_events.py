@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from test_attention import attention_inputs, eventually
 from test_runtime import FakeClient, make_runtime
 
@@ -62,6 +63,76 @@ def test_settings_reject_unbounded_or_implicit_values(changes: dict[str, Any]) -
     assert policy.capture_level == policy.notify_level == "error"
     with pytest.raises(ValueError):
         SystemEventsSettings.model_validate(changes)
+
+
+def test_settings_keep_the_original_json_schema_defaults_roundtrip_and_frozen_policy() -> None:
+    from muli.config import Settings
+
+    defaults: dict[str, Any] = {
+        "enabled": True,
+        "notify_enabled": True,
+        "capture_level": "error",
+        "notify_level": "error",
+        "queue_capacity": 128,
+        "max_records": 1000,
+        "dedup_seconds": 60,
+    }
+    # This is the original public JSON schema, not a copied model definition.
+    schema: dict[str, Any] = {
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {"default": True, "title": "Enabled", "type": "boolean"},
+            "notify_enabled": {"default": True, "title": "Notify Enabled", "type": "boolean"},
+            "capture_level": {
+                "default": "error",
+                "enum": ["warning", "error", "critical"],
+                "title": "Capture Level",
+                "type": "string",
+            },
+            "notify_level": {
+                "default": "error",
+                "enum": ["warning", "error", "critical"],
+                "title": "Notify Level",
+                "type": "string",
+            },
+            "queue_capacity": {
+                "default": 128,
+                "minimum": 1,
+                "maximum": 4096,
+                "title": "Queue Capacity",
+                "type": "integer",
+            },
+            "max_records": {
+                "default": 1000,
+                "minimum": 1,
+                "maximum": 10_000,
+                "title": "Max Records",
+                "type": "integer",
+            },
+            "dedup_seconds": {
+                "default": 60,
+                "minimum": 1,
+                "maximum": 3600,
+                "title": "Dedup Seconds",
+                "type": "number",
+            },
+        },
+        "title": "SystemEventsSettings",
+        "type": "object",
+    }
+    policy = SystemEventsSettings()
+    assert json.loads(policy.model_dump_json()) == defaults
+    assert SystemEventsSettings.model_json_schema() == schema
+    assert Settings.model_json_schema()["$defs"]["SystemEventsSettings"] == schema
+    custom = defaults | {"enabled": False, "capture_level": "warning", "dedup_seconds": 1.5}
+    restored = SystemEventsSettings.model_validate_json(json.dumps(custom))
+    assert json.loads(restored.model_dump_json()) == custom
+    configured = Settings.model_validate({"system_events": custom})
+    assert configured.model_dump(mode="json")["system_events"] == custom
+    assert Settings.model_validate_json(configured.model_dump_json()).system_events == restored
+    with pytest.raises(ValidationError) as caught:
+        policy.enabled = False
+    assert caught.value.errors()[0]["type"] == "frozen_instance"
 
 
 async def test_thresholds_never_format_or_persist_log_payload(system: SystemEvents) -> None:
