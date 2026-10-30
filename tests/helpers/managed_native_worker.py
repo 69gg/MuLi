@@ -47,7 +47,8 @@ TASKS = 128
 HARNESS_MEMORY = MEMORY // 4
 HARNESS_TASKS = 32
 PROBE_SECONDS: float = 5.0
-HTTP_SECONDS = 2.0
+CASE_PROBE_SECONDS: float = 2.0
+HTTP_SECONDS: float = 30.0
 POLL_SECONDS = 0.1
 WorkerAwaitOperation = Literal[
     "command",
@@ -6516,7 +6517,7 @@ class Case:
                 argv = managed_helper_arguments(anchor, controller)
                 probe = SystemdProbe(
                     limits=ProbeLimits(
-                        seconds=min(HTTP_SECONDS, remaining(deadline)),
+                        seconds=min(CASE_PROBE_SECONDS, remaining(deadline)),
                         command_bytes=MAX_BYTES,
                         file_bytes=MAX_BYTES,
                     )
@@ -6938,7 +6939,7 @@ class Case:
         require(status == 200 and isinstance(plan.get("id"), str), "native_prepare_failed")
         request_id, routing = plan["id"], plan.get("routing")
         probe = ManagedSystemdProbe(
-            limits=ProbeLimits(seconds=HTTP_SECONDS, command_bytes=MAX_BYTES)
+            limits=ProbeLimits(seconds=CASE_PROBE_SECONDS, command_bytes=MAX_BYTES)
         )
         journal: TransactionJournal | None = None
         position: tuple[str, int] | None = None
@@ -7190,7 +7191,9 @@ class Case:
                     if str(error) != "native_http_unavailable":
                         raise
                     await self.pause()
-            probe = SystemdProbe(limits=ProbeLimits(seconds=HTTP_SECONDS, command_bytes=MAX_BYTES))
+            probe = SystemdProbe(
+                limits=ProbeLimits(seconds=CASE_PROBE_SECONDS, command_bytes=MAX_BYTES)
+            )
             initial = await probe.read(service)
             require(
                 initial.process is not None and initial.process.uid == os.geteuid(),
@@ -7232,7 +7235,7 @@ class Case:
         require(isinstance(history, list) and len(history) <= 3, "native_cleanup_history")
         probe = SystemdProbe(
             limits=ProbeLimits(
-                seconds=min(HTTP_SECONDS, remaining(self.deadline)), command_bytes=MAX_BYTES
+                seconds=min(CASE_PROBE_SECONDS, remaining(self.deadline)), command_bytes=MAX_BYTES
             )
         )
         state = self.root / "data/management/transaction-v1/state.json"

@@ -11,10 +11,10 @@ from test_runtime import FakeClient, make_runtime
 from test_task_briefs import attach_services, bind
 
 from muli.attention import AttentionInbox
-from muli.context import ContextLimitError
+from muli.context import ContextLimitError, pack_context
 from muli.local_services import LocalServices
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
-from muli.runtime import Runtime
+from muli.runtime import PreparedRequest, Runtime
 from muli.task_control import ControlConflict, OwnerControlRequest, TaskPaused
 from muli.tools import Tool, parameters
 
@@ -177,8 +177,20 @@ async def test_entered_handler_finishes_but_remaining_native_batch_is_paired(
             event for event in runtime.store.events(limit=100) if event["type"] == "tool.completed"
         ]
         assert [event["data"]["call_id"] for event in completed] == ["a", "b", "c"]
-        replay = await runtime._next_context(worker["id"])
+        with pytest.raises(TaskPaused):
+            await runtime._next_context(worker["id"])
+        # Inspect durable replay without admitting another model or tool turn.
+        replay = pack_context(
+            runtime._history_context(worker["id"], stored=messages, observe=False).messages,
+            runtime.config.settings.limits.max_context_chars,
+        )
         assert replay[-4].provider_data == native
+        assert [message.tool_call_id for message in replay if message.role == "tool"] == [
+            "a",
+            "b",
+            "c",
+        ]
+        assert runtime.store.messages(worker["id"]) == messages and len(seen) == 1
     finally:
         await runtime.close()
 
@@ -224,24 +236,38 @@ async def test_context_hook_keeps_original_brief_epoch_and_capacity_rechecks(
 ) -> None:
     runtime, services, item, worker, seen = await rig(tmp_path, [ModelTurn(content="不应调用")])
     entered, release = asyncio.Event(), asyncio.Event()
+    captured: list[PreparedRequest] = []
 
     async def hook(session_id: str, messages: list[Message]) -> list[Message]:
+        request = runtime.request_context(session_id)
+        assert request is not None and request.execution_scope is not None
+        captured.append(request)
         entered.set()
         await release.wait()
+        assert runtime.request_context(session_id) is request
         return messages
 
-    runtime.context_hooks.append(hook)
     try:
+        original = await runtime._prepare_request(worker["id"])
+        original_scope = original.execution_scope
+        assert original_scope is not None and original_scope.epoch == 0
+        assert json.loads(original_scope.brief_json) == item["brief"]
+        assert any(original_scope.context() in message.content for message in original.messages)
+        runtime.context_hooks.append(hook)
         preparation = asyncio.create_task(runtime._prepare_request(worker["id"]))
         await asyncio.wait_for(entered.wait(), 2)
+        assert len(captured) == 1
+        scope = captured[0].execution_scope
+        assert scope is not None and scope == original_scope
         command(runtime, services, item["id"], "pause", 0, "pause")
         command(runtime, services, item["id"], "request_replan", 1, "replan")
         release.set()
-        prepared = await preparation
-        assert prepared.execution_scope is not None and prepared.execution_scope.epoch == 0
-        assert any('"epoch":0' in message.content for message in prepared.messages)
-        with pytest.raises(TaskPaused):
-            runtime._guard_request(prepared)
+        with pytest.raises(TaskPaused) as paused:
+            await preparation
+        assert paused.value.observed_epoch == scope.epoch == 0
+        assert captured[0].execution_scope is scope
+        assert json.loads(scope.brief_json) == item["brief"]
+        assert runtime.task_control_current(item["id"])["control"]["epoch"] == 2
         assert not seen
     finally:
         release.set()
@@ -829,9 +855,8 @@ async def test_pause_scope_covers_inherited_children_and_more_than_management_pa
         assert len(runtime.team.list()) == 100
         for member in members:
             assert runtime.team.get(member["id"])["status"] == "paused"
-            prepared = await runtime._prepare_request(member["id"])
             with pytest.raises(TaskPaused):
-                runtime._guard_request(prepared)
+                await runtime._prepare_request(member["id"])
         with pytest.raises(TaskPaused):
             runtime._guard_request(frozen)
         runtime._guard_request(await runtime._prepare_request(other["id"]))

@@ -189,10 +189,11 @@ async def terminal_wait(
         # Leave the controller lock free for Case.transaction's real final lock.
         probe = ManagedSystemdProbe(
             runner=bus,
-            limits=ProbeLimits(seconds=worker.HTTP_SECONDS, command_bytes=worker.MAX_BYTES),
+            limits=ProbeLimits(seconds=worker.CASE_PROBE_SECONDS, command_bytes=worker.MAX_BYTES),
         )
 
         def create_probe(*, limits: ProbeLimits) -> ManagedSystemdProbe:
+            assert 0 < limits.seconds <= worker.CASE_PROBE_SECONDS
             probe.limits = limits
             return probe
 
