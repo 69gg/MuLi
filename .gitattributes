@@ -11,3 +11,5 @@
 /tests/fixtures/compatibility_v2_120.json -text
 /tests/fixtures/format_admission_v2_136.py -text
 /tests/fixtures/compatibility_v2_136.json -text
+/tests/fixtures/format_admission_v2_137.py -text
+/tests/fixtures/compatibility_v2_137.json -text

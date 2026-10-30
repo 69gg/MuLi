@@ -10,7 +10,7 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。七域当前精确读写值为：`database`、`install_profile` 的 `reads=[1]`、`writes=1`；`configuration` 的 `reads=[2]`、`writes=2`；`objects`、`outbox` 的 `reads=[3]`、`writes=3`；`memory` 的 `reads=[4]`、`writes=4`；`ingress` 的 `reads=[5]`、`writes=5`。它们对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示任何已声明的旧格式可以直接启动新版。Linux 和 macOS 独立安装只接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的精确完整前序；托管跨格式切换、其它 macOS 旧格式与 Windows 旧库升级仍拒绝，各平台新装直接使用当前格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
+[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。七域当前精确读写值为：`database`、`install_profile` 的 `reads=[1]`、`writes=1`；`configuration` 的 `reads=[2]`、`writes=2`；`objects`、`outbox` 的 `reads=[3]`、`writes=3`；`ingress`、`memory` 的 `reads=[5]`、`writes=5`。它们对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示任何已声明的旧格式可以直接启动新版。Linux 和 macOS 独立安装只接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的精确完整前序；托管跨格式切换、其它 macOS 旧格式与 Windows 旧库升级仍拒绝，各平台新装直接使用当前格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 
@@ -23,6 +23,8 @@ ASR 转写收藏曾将 `memory=1` 扩为 `memory=2`，其余六域不变。新�
 `memory=4` 解释 `memory_watch/version=2` 的严格宿主来源偏好；旧 v1 仍为 Web，不推断原私聊偏好。普通文字/partial 不带投递路线，显式渠道工具仍受原审批和当前 guard 约束。这次记忆合同变化当时保留了 ingress 与 outbox；随后项目复核将 ingress 独立扩为 `5`。冻结 P reader 的历史记忆单域边界仍保留，见[来源偏好格式说明](fresh-format-admission.md#长期问题关注的格式边界)。
 
 项目复核的 `attention_project` 必须从 ingress 逐条保留到归档消息、按准确证明分批，并将新主人输入留给独立下一运行。2.136 及此前的 ingress4 reader 不理解这些合同，不能因 Web 路由或表结构未变而继续处理。`ingress=5` 因此只声明精确读写 `5`；原完整 `(1,3,2,4,3,4,1)` 被保存为停机升级前序。旧 slot 的真实准入和同格式切换判定均须拒绝新库，不自动改 marker 或给 A/B 回退开例外。具体证据见[项目输入格式边界](fresh-format-admission.md#项目资料复核的格式边界)。
+
+明确收藏完整主答复将 `memory` 从 `4` 扩为 `5`，其余六域保持原值。稳定 `reply:<原message_id>` 来源与严格 `reply:v1:` marker 解释完整 assistant 原件及 producing run / 原输入证明，不能伪装为普通 conversation 或 owner 资料。旧完整 `(1,3,2,5,3,4,1)` 保留为 `PRE_REPLY_MEMORY_FORMAT_STATE`，只能在受支持的停机边界仅转换 marker；新 Runtime 在恢复业务前拒绝它，旧 slot 也必须拒绝 memory5。能解释升级后保留的旧来源 payload 不等于声明 `reads=[4,5]` 或准许新 writer 直接打开旧库；即使双方都能读新旧格式，现有判定仍要求双方 writes 精确等于当前格式。详细边界见[主答复来源格式](fresh-format-admission.md#明确收藏完整主答复的格式边界)。
 
 网页来源只在主人明确选择准确快照、主助手调用 `memory_import_webpage(id, revision)` 后登记；捕获、阅读、摘录和重开不自动入库。该入口核验本地完整快照，不再抓取网站，后台继续遵守既有提炼、遗忘及模型请求边界。格式变更不放宽普通附件白名单、主人身份或来源授权。来源字节、旧 reader 的实际拒绝和 fixture 证据范围见[网页来源合同](fresh-format-admission.md#网页快照来源的格式边界)。
 
@@ -80,6 +82,8 @@ result = assess_compatibility(base, candidate, current, handoff_protocol=protoco
 长期问题关注的格式回归冻结 2.112 的实际准入模块及随包 manifest：旧、新完整声明不能通过同格式判定，旧准入函数拒绝新 marker；新 Runtime 在恢复业务前拒绝旧 marker。固定停机升级覆盖精确源合同与业务字节保留。冻结旧模块使用当前未变的格式模型和证据读取器，不能称为真实 2.112 发行包运行证据，也没有下载旧包或验证任意历史版本。
 
 网页来源的格式回归另保留签名基线 `4c069a12cfe2bcbab062db44105c10de669861f3` 的 [2.118 准入 reader](../tests/fixtures/format_admission_v2_118.py)、[来源 reader](../tests/fixtures/attachment_memory_source_v2_118.py) 和 [manifest](../tests/fixtures/compatibility_v2_118.json) 原字节，摘要由[格式测试](../tests/test_webpage_memory_format.py)固定核验。它们覆盖旧 `memory=2` reader/声明拒绝新完整合同和网页 marker、新版保留旧来源解释、旧库构造早拒，以及显式升级时保留来源、遗忘、任务/checkpoint、关注和投递事实。测试复用当前未变共享模型与证据读取器，不表示安装运行旧发行包；ASR 的 2.114 `memory=1` 到 `memory=2` 历史 fixture 与断言继续保留，不改称直接证明网页格式兼容。
+
+[主答复格式回归](../tests/test_reply_memory_format.py)冻结签名候选 `12efd07f827e09d2de60bb7fff5170cc4e7d595f` 的 admission / manifest 原字节，执行旧实际 reader 并核对新旧完整状态上的双向拒绝。该基线的版本声明为 2.137.0，发布状态须另查，不能把签名候选称作成功发行。新旧来源业务行、原身份、墓碑、pending 输入和 unknown 投递的停机保留，与实际模型质量、原生系统服务及真实 managed A/B 是不同验收范围。
 
 原始纯判定的 145 项定向测试已于 2026-10-21 通过共享 guard，用时 0.15 秒、峰值 53.7 MiB；当时两文件 Ruff 与格式检查、单源码严格 mypy 通过，全部 swap 0。
 

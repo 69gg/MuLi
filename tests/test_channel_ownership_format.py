@@ -32,7 +32,7 @@ TARGET = FormatState(
         configuration=2,
         ingress=5,
         outbox=3,
-        memory=4,
+        memory=5,
         install_profile=1,
     ),
 )

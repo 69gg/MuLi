@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 from contextlib import closing
+from dataclasses import dataclass
 from typing import Any
 
 from muli.attachments import MAX_ATTACHMENT_IDS
@@ -16,6 +18,8 @@ from muli.evidence import (
     json_size,
     validate_integer,
 )
+from muli.management_transaction import _object
+from muli.reply_origin import ReplyOrigin
 from muli.store import Store
 
 _UTF8_MAX_BYTES = 4
@@ -23,6 +27,25 @@ _SQLITE_MAX_PARAMETER = (1 << 63) - 1
 _OPTIONAL_METADATA = ("source", "principal")
 _CONTINUATION_CURSOR_VERSION = 1
 _CONTINUATION_FILTER = "agents_parent_unfinished"
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedReplyEvidence:
+    message_id: str
+    session_id: str
+    seq: int
+    message_revision: str
+    content: str
+    created_at: int | float
+    producing_run_id: str
+    original_input_id: str
+
+
+def _reply_origin(value: object) -> ReplyOrigin:
+    origin = ReplyOrigin.load(value)
+    if origin.input_id is None or not isinstance(value, dict) or value != origin.dump():
+        raise EvidenceError("content_unavailable", "答复缺少完整规范的原始输入来源")
+    return origin
 
 
 def _archive_sequence(value: int, name: str, *, minimum: int = 0) -> None:
@@ -35,6 +58,166 @@ def _archive_sequence(value: int, name: str, *, minimum: int = 0) -> None:
 class HistoryEvidence:
     def __init__(self, store: Store) -> None:
         self.store = store
+
+    def _reply_owner_input(
+        self,
+        session_id: str,
+        input_id: str,
+        *,
+        max_bytes: int,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Point-prove one exact delivered owner input and its complete archive."""
+        row = self.store.db.execute(
+            "SELECT i.seq,i.delivered_seq,i.received,"
+            "CASE WHEN typeof(i.payload)='text' AND length(CAST(i.payload AS BLOB))<=? "
+            "THEN CAST(i.payload AS BLOB) END AS payload,"
+            "CASE WHEN typeof(i.run_id)='text' AND length(CAST(i.run_id AS BLOB))<=? "
+            "THEN CAST(i.run_id AS BLOB) END AS run_id "
+            "FROM ingress i JOIN message_order m ON m.message_id=i.id "
+            "AND m.session_id=i.session_id AND m.seq=i.delivered_seq "
+            "WHERE i.id=? AND i.session_id=? AND i.state='delivered'",
+            (max_bytes, max_bytes, input_id, session_id),
+        ).fetchone()
+        if row is None:
+            raise EvidenceError("content_unavailable", "原始主人输入的精确投递记录不可用")
+        if not isinstance(row["payload"], bytes) or not isinstance(row["run_id"], bytes):
+            raise EvidenceError("output_budget", "完整原始输入超过核查字节预算")
+        try:
+            payload = _object(row["payload"])
+            json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            producing_run = row["run_id"].decode("utf-8", errors="strict")
+            origin = ReplyOrigin.from_input(payload)
+            if (
+                payload.get("id") != input_id
+                or payload.get("session_id") != session_id
+                or payload.get("principal") != "owner"
+                or not isinstance(payload.get("content"), str)
+                or not isinstance(payload.get("source"), str)
+                or not producing_run
+                or (run_id is not None and producing_run != run_id)
+                or origin.input_id != input_id
+                or ("reply_origin" in payload and _reply_origin(payload["reply_origin"]) != origin)
+                or type(row["seq"]) is not int
+                or type(row["delivered_seq"]) is not int
+                or type(row["received"]) not in {int, float}
+                or not math.isfinite(row["received"])
+            ):
+                raise ValueError
+            archive = self.store.bounded_object(
+                "message", input_id, max_bytes=max_bytes, strict_json=True
+            )
+            projected = self.store.input_archive(
+                payload,
+                received=row["received"],
+                run_id=producing_run,
+                input_seq=row["seq"],
+            )
+            if (
+                archive is None
+                or archive.get("seq") != row["delivered_seq"]
+                or any(archive.get(key) != value for key, value in projected.items())
+                or _reply_origin(archive.get("reply_origin")) != origin
+            ):
+                raise ValueError
+            return archive
+        except EvidenceError:
+            raise
+        except (ValueError, TypeError, KeyError, RecursionError, UnicodeError) as error:
+            raise EvidenceError("content_unavailable", "原始主人输入与投递存档不一致") from error
+
+    def _completed_reply(
+        self,
+        session_id: str,
+        message_id: str,
+        revision: str,
+        *,
+        current_run_id: str,
+        before_seq: int,
+        max_context_chars: int,
+        max_source_chars: int,
+    ) -> CompletedReplyEvidence:
+        """Authenticate one complete final reply; never enumerate past messages or runs."""
+        budget = max_context_chars * _UTF8_MAX_BYTES
+        # JSON projection itself parses the object. Gate the complete raw bytes
+        # first, including non-content fields, before entering any slice query.
+        message = self.store.bounded_object(
+            "message", message_id, max_bytes=budget, strict_json=True
+        )
+        if message is None:
+            raise EvidenceError("content_unavailable", "原答复不存在或不属于当前主会话")
+        row = self.store.message_evidence_slice(
+            session_id,
+            message_id=message_id,
+            seq=None,
+            offset_bytes=0,
+            length_bytes=max_source_chars * _UTF8_MAX_BYTES,
+            metadata_bytes=budget,
+        )
+        if row is None:
+            raise EvidenceError("content_unavailable", "原答复不存在或不属于当前主会话")
+        metadata = self._metadata(row, max_context_chars)
+        if metadata["revision"] != revision:
+            raise EvidenceError("evidence_changed", "原答复版本已变化，请重新读取核对")
+        if (
+            row["content_type"] != "text"
+            or type(row["seq"]) is not int
+            or not 0 < row["seq"] < before_seq
+        ):
+            raise EvidenceError("content_unavailable", "只能收藏本次主人输入之前的完整答复")
+        if row["content_bytes"] > max_source_chars * _UTF8_MAX_BYTES:
+            raise EvidenceError("output_budget", "完整答复超过来源字节预算，未保存节选")
+        content = decode_utf8(row["content"], allow_incomplete_tail=False)
+        if len(content) > max_source_chars:
+            raise EvidenceError("output_budget", "完整答复超过来源字符预算，未保存节选")
+        if (
+            message.get("session_id") != session_id
+            or message.get("seq") != row["seq"]
+            or message.get("role") != "assistant"
+            or message.get("content") != content
+            or not content.strip()
+            or message.get("interrupted", False) is not False
+            or message.get("tool_calls", []) != []
+        ):
+            raise EvidenceError("content_unavailable", "目标不是可完整核查的主助手最终答复")
+        origin = _reply_origin(message.get("reply_origin"))
+        assert origin.input_id is not None
+        original = self._reply_owner_input(session_id, origin.input_id, max_bytes=budget)
+        producing_run_id = original["run_id"]
+        run = self.store.bounded_object("run", producing_run_id, max_bytes=budget, strict_json=True)
+        if (
+            producing_run_id == current_run_id
+            or original["seq"] >= row["seq"]
+            or _reply_origin(original.get("reply_origin")) != origin
+            or run is None
+            or run.get("session_id") != session_id
+            or run.get("status") != "completed"
+            or run.get("role") != "main"
+            or run.get("result_message_id") != message_id
+            or not isinstance(run.get("result"), str)
+            or run["result"] != content
+            or _reply_origin(run.get("reply_origin")) != origin
+        ):
+            raise EvidenceError("content_unavailable", "完整答复与已完成主运行的最终结果不一致")
+        timestamp = message.get("created_at")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise EvidenceError("content_unavailable", "原答复缺少有限的持久时间")
+        try:
+            finite = math.isfinite(timestamp)
+        except OverflowError as error:
+            raise EvidenceError("content_unavailable", "原答复缺少有限的持久时间") from error
+        if not finite:
+            raise EvidenceError("content_unavailable", "原答复缺少有限的持久时间")
+        return CompletedReplyEvidence(
+            message_id,
+            session_id,
+            row["seq"],
+            metadata["revision"],
+            content,
+            timestamp,
+            producing_run_id,
+            origin.input_id,
+        )
 
     def _continuation_cursor(self, token: str | None, main_id: str, max_output_chars: int) -> int:
         if token is None:

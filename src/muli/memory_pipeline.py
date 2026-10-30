@@ -27,9 +27,11 @@ from muli.memory_source_failure import (
 )
 from muli.memory_watches import record_source_completion
 from muli.proactive import FrozenRouting
+from muli.reply_memory_source import REPLY_SOURCE_PREFIX
 from muli.store import SQLITE_MAX_INTEGER, new_id, now
 
 Extractor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+SourceAdmission = Callable[[str], bool]
 _INDEX_ACTIVE = frozenset({"queued", "processing", "retry"})
 _INDEX_TERMINAL = frozenset({"done", "failed", "blocked", "cancelled"})
 _INDEX_ERRORS = ("embedding_changed", "index_failed", "index_timeout", "output_budget")
@@ -127,12 +129,14 @@ class MemoryPipeline:
         admission: Admission | None = None,
         max_plan_bytes: int | None = None,
         failure_routing: Callable[[], FrozenRouting | None] | None = None,
+        source_admission: SourceAdmission | None = None,
     ) -> None:
         self.memory, self.bus = memory, bus
         self.config = config or MemoryPipelineConfig()
         self.admission = admission or Admission()
         self.extractor, self.media = extractor, media
         self.failure_routing = failure_routing
+        self.source_admission = source_admission
         self.max_plan_bytes = (
             self.config.max_source_chars * 4 if max_plan_bytes is None else max_plan_bytes
         )
@@ -154,6 +158,7 @@ class MemoryPipeline:
         self._cache_revision = memory.revision
         self._last_error = ""
         self._index_closed = False
+        self._deferred_after = 0
         self.source_chunks = SourceChunks(memory)
 
     def ingest(self, message: Mapping[str, Any], *, trusted_owner: bool = False) -> dict[str, Any]:
@@ -166,11 +171,24 @@ class MemoryPipeline:
         )
         if source is None:
             return {"source_id": message.get("id"), "state": "forgotten", "created": False}
+        item = self._episode(source)
+        self._queue(source["id"])
+        job = self.job(source["id"])
+        self._wake.set()
+        return {
+            "source_id": source["id"],
+            "memory_id": item["id"],
+            "created": created,
+            "state": job["state"] if job else "deferred",
+        }
+
+    def _episode(self, source: dict[str, Any]) -> dict[str, Any]:
+        """Share the existing deduplicated archive episode with interrupted-job repair."""
         original = source["content"]
         marker = "\n[原文较长；完整内容保存在原始来源]"
         content = original if len(original) <= 12000 else original[: 12000 - len(marker)] + marker
         quote = original[: 12000 - len(marker)] if len(original) > 12000 else original
-        item = self.memory.save(
+        return self.memory.save(
             content,
             kind="observation",
             source=source["source"],
@@ -181,15 +199,6 @@ class MemoryPipeline:
             confidence=1.0,
             dedup_key="episodic:" + source["id"],
         )
-        self._queue(source["id"])
-        job = self.job(source["id"])
-        self._wake.set()
-        return {
-            "source_id": source["id"],
-            "memory_id": item["id"],
-            "created": created,
-            "state": job["state"] if job else "deferred",
-        }
 
     def _pending(self) -> int:
         jobs = int(
@@ -201,7 +210,11 @@ class MemoryPipeline:
         return jobs + int(plan is not None and plan["state"] in _INDEX_ACTIVE)
 
     def _queue(self, source_id: str) -> bool:
-        if self.job(source_id) is not None or self._pending() >= self.config.max_pending_jobs:
+        if (
+            not self._source_admitted(source_id)
+            or self.job(source_id) is not None
+            or self._pending() >= self.config.max_pending_jobs
+        ):
             return False
         timestamp = now()
         with self.memory.store.db:
@@ -211,10 +224,34 @@ class MemoryPipeline:
             )
         return cursor.rowcount == 1
 
-    def _admit_deferred(self) -> None:
+    def _admit_deferred(self) -> bool:
         available = self.config.max_pending_jobs - self._pending()
         if available <= 0:
-            return
+            return False
+        if self.source_admission is not None:
+            # One finite registration window per worker turn. Invalid optional
+            # sources consume a cursor position, never the entire queue's head.
+            window = min(available, self.config.max_candidates)
+            rows = self.memory.store.db.execute(
+                "SELECT rowid,CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB))<=? "
+                "THEN CAST(id AS BLOB) END AS id FROM memory_sources "
+                "WHERE rowid>? AND id NOT IN (SELECT source_id FROM memory_jobs) "
+                "ORDER BY rowid LIMIT ?",
+                (self.max_plan_bytes, self._deferred_after, window),
+            ).fetchall()
+            for row in rows:
+                self._deferred_after = row["rowid"]
+                if not isinstance(row["id"], bytes):
+                    continue
+                try:
+                    identifier = row["id"].decode("utf-8", errors="strict")
+                except UnicodeError:
+                    continue
+                self._queue(identifier)
+            if len(rows) < window:
+                self._deferred_after = 0
+                return False
+            return self._pending() < self.config.max_pending_jobs
         rows = self.memory.store.db.execute(
             "SELECT id FROM memory_sources WHERE id NOT IN (SELECT source_id FROM memory_jobs) "
             "ORDER BY created_at,id LIMIT ?",
@@ -222,6 +259,7 @@ class MemoryPipeline:
         ).fetchall()
         for row in rows:
             self._queue(row[0])
+        return False
 
     async def start(self) -> None:
         if not self.config.enabled or (self._worker is not None and not self._worker.done()):
@@ -508,7 +546,29 @@ class MemoryPipeline:
             blocked.pop(field)
         self._index_save(blocked, max_bytes=max_bytes)
 
+    def _source_admitted(self, source_id: str) -> bool:
+        if self.source_admission is None:
+            return True
+        try:
+            if self.source_admission(source_id):
+                return True
+            self._last_error = "source_unavailable"
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            UnicodeError,
+            RecursionError,
+            OverflowError,
+        ) as error:
+            self._last_error = (
+                error.code if isinstance(error, EvidenceError) else type(error).__name__
+            )
+        return False
+
     def _source_digest(self, source_id: str) -> str | None:
+        if not self._source_admitted(source_id):
+            return None
         row = self.memory.store.db.execute(
             "SELECT CASE WHEN typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 "
             "THEN CAST(digest AS BLOB) END AS digest FROM memory_sources s WHERE s.id=? "
@@ -1073,7 +1133,7 @@ class MemoryPipeline:
         while True:
             await self.admission.wait()
             self._wake.clear()
-            self._admit_deferred()
+            deferred_more = self._admit_deferred()
             row = self.memory.store.db.execute(
                 "SELECT source_id FROM memory_jobs WHERE state IN ('queued','retry') AND next_attempt<=? "
                 "ORDER BY next_attempt,created_at,source_id LIMIT 1",
@@ -1092,6 +1152,9 @@ class MemoryPipeline:
                 await asyncio.sleep(0)
                 continue
             if row is None:
+                if deferred_more:
+                    await asyncio.sleep(0)
+                    continue
                 deadline = self.memory.store.db.execute(
                     "SELECT min(next_attempt) FROM memory_jobs WHERE state IN ('queued','retry')"
                 ).fetchone()[0]
@@ -1117,6 +1180,17 @@ class MemoryPipeline:
 
     async def _run_job(self, source_id: str) -> None:
         if self._index_closed:
+            return
+        if not self._source_admitted(source_id):
+            # A queued archive may no longer fit current policy, or may have
+            # lost its proof. Retire this attempt before loading any full body.
+            with self.memory.store.db:
+                self.memory.store.db.execute(
+                    "UPDATE memory_jobs SET state='failed',last_error=?,updated_at=? "
+                    "WHERE source_id=? AND state IN ('queued','retry')",
+                    (self._last_error, now(), source_id),
+                )
+            await self._publish()
             return
         revision = self._source_digest(source_id)
         failed_revision: str | None = None
@@ -1161,6 +1235,16 @@ class MemoryPipeline:
                         )
                     if state == "failed":
                         failed_revision = revision
+        if not self._index_closed and not self._source_admitted(source_id):
+            # Late extraction/media results may outlive a tighter budget or a
+            # damaged archive. Release only this exact processing revision.
+            with self.memory.store.db:
+                self.memory.store.db.execute(
+                    "UPDATE memory_jobs SET state='failed',last_error=?,updated_at=? "
+                    "WHERE source_id=? AND state='processing' AND EXISTS "
+                    "(SELECT 1 FROM memory_sources s WHERE s.id=? AND s.digest=?)",
+                    (self._last_error, now(), source_id, source_id, revision),
+                )
         await self._publish(source_id, failed_revision=failed_revision)
 
     def _validated(self, payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
@@ -1247,6 +1331,8 @@ class MemoryPipeline:
         }
 
     async def _process(self, source_id: str) -> None:
+        if self._source_digest(source_id) is None:
+            return
         source, job = self.memory.source(source_id), self.job(source_id)
         if source is None or job is None:
             return
@@ -1256,6 +1342,11 @@ class MemoryPipeline:
 
         if not live():
             return
+        if source_id.startswith(REPLY_SOURCE_PREFIX):
+            # The read-only archive gate precedes any write. Repair this one
+            # interrupted episode before freezing the job's finite memory IDs;
+            # startup and the validator do not scan or re-ingest synchronously.
+            self._episode(source)
         checkpoint = job["checkpoint"]
         if "extraction" not in checkpoint:
             payload: dict[str, Any] = {"memories": [], "aliases": {}}
@@ -1291,7 +1382,9 @@ class MemoryPipeline:
             persist=lambda: self._checkpoint(source_id, checkpoint),
         )
         if chunk_ids is None:
-            if self.memory.source(source_id) is not None:
+            if self.memory.store.db.execute(
+                "SELECT 1 FROM memory_sources WHERE id=?", (source_id,)
+            ).fetchone():
                 raise ValueError("原文块来源已变化或超过当前限额")
             return
         identifiers = list(dict.fromkeys([*checkpoint["memory_ids"], *chunk_ids]))

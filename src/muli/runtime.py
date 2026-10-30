@@ -360,6 +360,51 @@ class Runtime:
         request = self._request_context.get()
         return request if request is not None and request.session_id == session_id else None
 
+    def _reply_memory_owner_input(
+        self, request: PreparedRequest, run_id: str
+    ) -> dict[str, Any] | None:
+        """Share exact owner-round admission between schema filtering and the handler."""
+        caller, input_id = request.session_id, request.reply_origin.input_id
+        if (
+            caller != self.store.existing_main_session_id()
+            or input_id is None
+            or request.consult is not None
+            or request.attention_routing is not None
+            or request.memory_failure is not None
+            or request.memory_watch is not None
+            or request.project_inbox is not None
+            or request.shell_continuation is not None
+            or request.channel_ownership is not None
+        ):
+            return None
+        budget = self.config.settings.limits.max_context_chars * 4
+        try:
+            session = self.store.bounded_object(
+                "session", caller, max_bytes=budget, strict_json=True
+            )
+            run = self.store.bounded_object("run", run_id, max_bytes=budget, strict_json=True)
+            if (
+                session is None
+                or session.get("kind") != "main"
+                or session.get("principal") != "owner"
+                or session.get("workflow_run_id")
+                or "scheduled_workflow" in session
+                or run is None
+                or run.get("session_id") != caller
+                or run.get("role") != "main"
+                or run.get("status") != "running"
+            ):
+                return None
+            archive = HistoryEvidence(self.store)._reply_owner_input(
+                caller, input_id, run_id=run_id, max_bytes=budget
+            )
+            if archive.get("reply_origin") != request.reply_origin.dump():
+                return None
+            return archive
+        except (EvidenceError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            # Optional write capability must disappear on an unprovable round.
+            return None
+
     def current_reply_origin(self) -> ReplyOrigin:
         session_id = self.tool_session_id
         request = self.request_context(session_id) if session_id is not None else None
@@ -3478,6 +3523,14 @@ class Runtime:
         )
         if not history_input or history_input[0] != "owner":
             tools.pop("history_find", None)
+        if "memory_import_reply" in tools and (
+            consult is not None
+            or workflow_step
+            or role != "main"
+            or prepared is None
+            or self._reply_memory_owner_input(prepared, run_id) is None
+        ):
+            tools.pop("memory_import_reply", None)
         if consult is not None:
             self.team.consult.guard_control(consult, session_id)
             return {

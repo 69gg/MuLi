@@ -7,6 +7,7 @@ import importlib.util
 import sqlite3
 import sys
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -16,6 +17,7 @@ from test_channel_format_upgrade import legacy_database, upgrade
 from test_channel_format_upgrade import snapshot as stored_rows
 from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model, snapshot
+from test_reply_memory_format import frozen_e137_bytes, frozen_e137_reader
 
 from muli.commitments import Commitments
 from muli.compatibility import CompatibilityManifest, assess_compatibility
@@ -25,6 +27,7 @@ from muli.events import EventBus
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     PRE_PROJECT_INBOX_FORMAT_STATE,
+    PRE_REPLY_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
 from muli.format_evidence import FORMAT_STATE_KEY, read_format_evidence
@@ -69,6 +72,9 @@ def test_e136_actual_reader_refuses_project_ingress_before_business_writes(datab
     before = snapshot(database)
     with closing(sqlite3.connect(database)) as db:
         evidence = read_format_evidence(db)
+        old.require_current_format(replace(evidence, state=PRE_PROJECT_INBOX_FORMAT_STATE))
+        with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
+            old.require_current_format(replace(evidence, state=PRE_REPLY_MEMORY_FORMAT_STATE))
         with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
             old.require_current_format(evidence)
         assert db.total_changes == 0
@@ -79,32 +85,31 @@ def test_e136_actual_reader_refuses_project_ingress_before_business_writes(datab
 def test_e136_manifest_refuses_project_inbox_same_format_switch(after_upgrade: bool) -> None:
     old = frozen_e136_reader()
     previous = CompatibilityManifest.from_json(frozen_e136_bytes("compatibility_v2_136.json"))
-    current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
-    )
+    ingress5 = frozen_e137_reader()
+    current = CompatibilityManifest.from_json(frozen_e137_bytes("compatibility_v2_137.json"))
     assert previous.release == "2.136.0"
     assert old.CURRENT_FORMAT_STATE == PRE_PROJECT_INBOX_FORMAT_STATE
     assert previous.formats.ingress.reads == (4,) and previous.formats.ingress.writes == 4
     assert current.formats.ingress.reads == (5,) and current.formats.ingress.writes == 5
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    # Freeze the ingress-only historical boundary as CURRENT gains memory5.
+    assert ingress5.CURRENT_FORMAT_STATE == PRE_REPLY_MEMORY_FORMAT_STATE
+    assert PRE_REPLY_MEMORY_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "ingress": 5,
     }
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_PROJECT_INBOX_FORMAT_STATE
+    state = PRE_REPLY_MEMORY_FORMAT_STATE if after_upgrade else PRE_PROJECT_INBOX_FORMAT_STATE
     result = assess_compatibility(previous, current, state, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "current_format_unreadable" and result.domain == "ingress"
     assert result.side == ("base" if after_upgrade else "candidate")
     assert assess_compatibility(
-        current, current, CURRENT_FORMAT_STATE, handoff_protocol=2
+        current, current, PRE_REPLY_MEMORY_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
 
 
 def test_reading_both_ingress_contracts_cannot_authorize_a_new_write_format() -> None:
     previous = CompatibilityManifest.from_json(frozen_e136_bytes("compatibility_v2_136.json"))
-    current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
-    )
+    current = CompatibilityManifest.from_json(frozen_e137_bytes("compatibility_v2_137.json"))
     # Deliberately grant both declarations mutual reading. The candidate's new
     # writes must still prevent the same-format protocol from changing data.
     declarations = tuple(
