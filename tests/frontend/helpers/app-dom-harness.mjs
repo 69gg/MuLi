@@ -97,7 +97,7 @@ export class DOMElement {
 
 export class DOMButton extends DOMElement {}
 
-export function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false, team = false } = {}) {
+export function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false, team = false, upload = () => {} } = {}) {
   const document = { events: {}, activeElement: null, createTextNode: (text) => new TextNode(text), addEventListener(name, callback) { (this.events[name] ??= []).push(callback); } };
   document.createElement = (tag) => tag === "button" ? new DOMButton(tag, document) : new DOMElement(tag, document);
   document.createElementNS = (_namespace, tag) => document.createElement(tag);
@@ -139,7 +139,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     createSessionState: composer ? createSessionState : () => ({ messages: [] }),
     createTeamPager: team ? createTeamPager : () => ({}), captureTeamView: team ? captureTeamView : () => null,
     createTaskControl, taskControlView,
-    uploadFile() {}, transcribeAttachment() {},
+    uploadFile: upload, transcribeAttachment() {},
     VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, managementRecoveryView, updateLabel, settingsExtras, SETTINGS_GROUPS,
     restoreTeamView: team ? restoreTeamView : () => {},
     sessionStorage: team ? taskStorage : {},

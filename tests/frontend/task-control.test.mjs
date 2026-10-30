@@ -90,6 +90,44 @@ test("unknown submission keeps an immutable body and stable ID across edit attem
   assert.equal(taskControlView(reloaded.state).busy, true);
 });
 
+test("task attachments are ordered, deeply frozen in unknown requests, and absent from the legacy empty body", () => {
+  const first = "a".repeat(32), second = "b".repeat(32);
+  const model = ready(detail(2, { epoch: 1 })); model.edit();
+  model.addAttachment(second); model.addAttachment(first); model.addAttachment(second);
+  const body = model.begin("request_replan");
+  assert.deepEqual(body.additional_attachment_ids, [second, first]);
+  assert.equal(Object.isFrozen(body), true); assert.equal(Object.isFrozen(body.additional_attachment_ids), true);
+  assert.throws(() => body.additional_attachment_ids.push("c".repeat(32)), TypeError);
+  model.fail(new Error("response lost"));
+  assert.equal(model.addAttachment("c".repeat(32)), false); model.removeAttachment(first); model.cancelEdit();
+  assert.deepEqual(model.state.attachmentIds, [second, first]);
+  const stored = JSON.parse(JSON.stringify(body)), restored = restoreTaskControlRequest(stored);
+  stored.additional_attachment_ids.reverse();
+  assert.deepEqual(restored.additional_attachment_ids, [second, first]);
+  assert.equal(Object.isFrozen(restored.additional_attachment_ids), true);
+  const reloaded = createTaskControl("task", { pending: restored });
+  assert.deepEqual(reloaded.state.attachmentIds, [second, first]);
+  assert.deepEqual(reloaded.begin("request_replan"), body);
+  const legacy = ready(detail(2, { epoch: 1 })); legacy.edit(); legacy.addAttachment(first); legacy.removeAttachment(first);
+  assert.deepEqual(legacy.begin("request_replan"), { action: "request_replan", expected_epoch: 1, request_id: "request-1", additional_requirements: "" });
+  for (const ids of [null, {}, "a", [1], ["not-an-upload-id"]]) assert.equal(restoreTaskControlRequest({ ...body, additional_attachment_ids: ids }), null);
+  assert.equal(restoreTaskControlRequest({ action: "pause", expected_epoch: 1, request_id: "pause", additional_attachment_ids: [first] }), null);
+});
+
+test("definite rejection keeps chosen attachments editable, while success, cancellation and 401 clear them", () => {
+  const id = "a".repeat(32), model = ready(detail(2, { epoch: 1 })); model.edit(); model.addAttachment(id);
+  const first = model.begin("request_replan");
+  model.fail({ status: 429, message: "队列已满" });
+  assert.deepEqual(model.state.attachmentIds, [id]); model.removeAttachment(id); model.addAttachment(id);
+  const second = model.begin("request_replan"); assert.notEqual(second.request_id, first.request_id);
+  model.complete(result(second, current(3, { epoch: 2, replan_request_id: "new" })));
+  assert.deepEqual(model.state.attachmentIds, []);
+  model.acceptDetail(detail(3, { epoch: 2 })); model.edit(); model.addAttachment(id); model.cancelEdit();
+  assert.deepEqual(model.state.attachmentIds, []);
+  model.edit(); model.addAttachment(id); model.begin("request_replan"); model.fail({ status: 401 });
+  assert.deepEqual(model.state.attachmentIds, []); assert.equal(model.state.submission, null);
+});
+
 test("rejected admission preserves the committed pause and editable requirements without an unknown retry", () => {
   for (const [status, code, message] of [[503, "model_unconfigured", "尚未配置主模型"], [429, "queue_full", "待处理任务已满"]]) {
     const model = ready(detail(2, { epoch: 1 }));
@@ -205,10 +243,11 @@ const rendererEnd = app.indexOf("\nasync function refreshTaskBriefDialog(", rend
 assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
 const renderDialog = runInNewContext(`(${app.slice(rendererStart, rendererEnd)})`, {
   taskControlView, taskDialogCurrent: () => true, document: { activeElement: null }, element: domElement,
+  renderTaskControlAttachments() {},
   $: () => null, $$: () => [],
 });
 function dialogSlot(model) {
-  const slot = { model, loading: false, readError: "", renderedDetail: model.state.detail };
+  const slot = { model, loading: false, readError: "", renderedDetail: model.state.detail, failedUploads: [] };
   for (const key of ["content", "brief", "readStatus", "panel", "status", "scope", "note", "error", "editor", "input", "actions", "plan"]) slot[key] = domElement("div");
   return slot;
 }

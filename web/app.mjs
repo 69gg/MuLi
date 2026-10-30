@@ -235,6 +235,7 @@ function invalidateConnection() {
   state.voiceSetupController?.release();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
+  releaseTaskDialog({ close: true });
   releaseMemoryWatches();
   closeChannelDeliveryDialog();
   releaseCapabilityCatalog();
@@ -1184,6 +1185,7 @@ function emptyState(iconName, title, description) {
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   releaseOwnerQuestionDialog({ close: true });
+  releaseTaskDialog({ close: true });
   if (channelDeliveryDialog && (view !== "settings" || state.settingsTab !== "channels")) closeChannelDeliveryDialog();
   if (view !== "settings") releaseCapabilityCatalog();
   releaseAnswerSpeech();
@@ -1666,11 +1668,13 @@ function saveTaskControl(model) {
   } catch { /* The in-memory request still keeps its retry ID if storage is unavailable. */ }
 }
 
-function releaseTaskDialog() {
-  if (!taskDialog) return;
-  const { model } = taskDialog;
-  taskDialog.readController?.abort();
-  taskDialog = null;
+function releaseTaskDialog({ close = false } = {}) {
+  const slot = taskDialog; taskDialog = null;
+  if (!slot) return;
+  const { model } = slot;
+  slot.readController?.abort(); slot.uploadController?.abort(); slot.writeController?.abort();
+  if (model.state.phase === "submitting") { model.fail(new Error("提交结果待确认")); saveTaskControl(model); }
+  if (close && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) $("#app-dialog").close();
   if (!model.state.submission) {
     taskControlModels.delete(model.state.id);
     model.clear();
@@ -1678,7 +1682,7 @@ function releaseTaskDialog() {
 }
 
 function clearTaskControls() {
-  taskDialog?.readController?.abort();
+  releaseTaskDialog();
   for (const model of taskControlModels.values()) model.clear();
   taskControlModels.clear(); taskDialog = null;
   try {
@@ -1687,7 +1691,58 @@ function clearTaskControls() {
 }
 
 function taskDialogCurrent(slot) {
-  return taskDialog === slot && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+  return !!slot && taskDialog === slot && connectionCurrent(slot.owner) && slot.viewVersion === viewRequestVersion && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+async function addTaskControlFiles(slot, files) {
+  const pending = [...files];
+  if (!pending.length || !taskDialogCurrent(slot) || slot.model.state.submission || slot.uploadController) return;
+  const controller = slot.uploadController = new AbortController();
+  const current = () => taskDialogCurrent(slot) && slot.uploadController === controller && !controller.signal.aborted;
+  slot.failedUploads = slot.failedUploads.filter(({ file }) => !pending.includes(file));
+  renderTaskBriefDialog(slot);
+  try {
+    for (const file of pending) {
+      if (!current()) return;
+      try {
+        const uploaded = await uploadFile(file, { signal: controller.signal });
+        if (!current()) return;
+        if (!uploaded || !slot.model.addAttachment(uploaded.id)) throw new Error("附件回执无效，请重试上传。");
+        state.uploads = [uploaded, ...state.uploads.filter((entry) => entry.id !== uploaded.id)];
+      } catch (error) {
+        if (!current()) return;
+        if (error.status === 401) { showLogin(); return; }
+        slot.failedUploads.push({ file, error: error.message ?? "上传失败，请重试。" });
+      }
+      if (current()) renderTaskBriefDialog(slot);
+    }
+  } finally {
+    if (current()) { slot.uploadController = null; renderTaskBriefDialog(slot); }
+  }
+}
+
+function renderTaskControlAttachments(slot) {
+  const data = slot.model.state, locked = !!data.submission, uploading = !!slot.uploadController;
+  slot.fileInput.disabled = locked || uploading; slot.addFile.disabled = locked || uploading;
+  slot.existingAttachment.disabled = locked || uploading;
+  slot.existingAttachment.replaceChildren(element("option", { value: "", text: "选择已有资料…" }), ...state.uploads.filter((file) => /^[a-f0-9]{32}$/.test(file.id) && !data.attachmentIds.includes(file.id)).map((file) => element("option", { value: file.id, text: file.name || `附件 ${file.id}` })));
+  slot.existingAttachment.value = "";
+  slot.selectedAttachments.replaceChildren(...data.attachmentIds.map((id) => {
+    const file = state.uploads.find((entry) => entry.id === id);
+    const remove = element("button", { type: "button", class: "text-button", text: "移除", disabled: locked || uploading, "aria-label": `移除资料 ${file?.name || id}`, onClick: () => {
+      if (taskDialogCurrent(slot) && slot.selectedAttachments.contains(remove) && !remove.disabled) { slot.model.removeAttachment(id); renderTaskBriefDialog(slot); }
+    } });
+    return element("div", { class: "task-control-heading", dataset: { taskAttachmentId: id }, title: id }, file ? renderAttachment(file, { compact: true }) : element("span", { text: `附件 ${id}` }), remove);
+  }));
+  slot.attachmentStatus.textContent = uploading ? "正在上传资料…" : "";
+  slot.attachmentStatus.hidden = !uploading;
+  slot.failedAttachments.replaceChildren(...slot.failedUploads.map(({ file, error }) => {
+    const retry = element("button", { type: "button", class: "text-button", text: "重试上传", disabled: locked || uploading, onClick: () => { if (taskDialogCurrent(slot) && slot.failedAttachments.contains(retry) && !retry.disabled) void addTaskControlFiles(slot, [file]); } });
+    const remove = element("button", { type: "button", class: "text-button", text: "移除", disabled: locked || uploading, "aria-label": `移除失败资料 ${file.name}`, onClick: () => {
+      if (taskDialogCurrent(slot) && slot.failedAttachments.contains(remove) && !remove.disabled) { slot.failedUploads = slot.failedUploads.filter((entry) => entry.file !== file); renderTaskBriefDialog(slot); }
+    } });
+    return element("div", {}, element("p", { class: "form-error", role: "alert", text: `${file.name}：${error}` }), retry, remove);
+  }));
 }
 
 function renderTaskBriefContent(root, item, { observed = false } = {}) {
@@ -1730,6 +1785,7 @@ function renderTaskBriefDialog(slot = taskDialog) {
   slot.editor.hidden = !data.editing;
   slot.input.disabled = !!data.submission;
   if (slot.input.value !== data.draft) slot.input.value = data.draft;
+  renderTaskControlAttachments(slot);
   const localButton = (label, action, callback, { primary = false, disabled = false } = {}) => {
     const button = element("button", { type: "button", class: primary ? "primary-button" : "secondary-button", disabled, dataset: { taskControlAction: action }, onClick: () => { if (taskDialogCurrent(slot) && slot.actions.contains(button) && !button.disabled) callback(); } }, label);
     return button;
@@ -1738,8 +1794,8 @@ function renderTaskBriefDialog(slot = taskDialog) {
   const actions = [];
   if (view.unknown) actions.push(localButton("重试原操作", "retry", () => void submitTaskControl(slot.model, data.submission.action), { primary: true }));
   else if (data.editing) {
-    actions.push(localButton(data.conflict ? "确认要求并重新规划" : "交沐璃重新规划", "replan", () => void submitTaskControl(slot.model, "request_replan"), { primary: true, disabled: !view.canReplan }));
-    actions.push(localButton("取消编辑", "cancel-edit", () => { slot.model.cancelEdit(); renderTaskBriefDialog(slot); }, { disabled: view.busy }));
+    actions.push(localButton(data.conflict ? "确认要求并重新规划" : "交沐璃重新规划", "replan", () => void submitTaskControl(slot.model, "request_replan"), { primary: true, disabled: !view.canReplan || !!slot.uploadController || !!slot.failedUploads.length }));
+    actions.push(localButton("取消编辑", "cancel-edit", () => { slot.uploadController?.abort(); slot.uploadController = null; slot.failedUploads = []; slot.model.cancelEdit(); renderTaskBriefDialog(slot); }, { disabled: view.busy }));
   } else if (view.paused) {
     actions.push(localButton("补充要求并交沐璃", "edit", () => { slot.model.edit(); renderTaskBriefDialog(slot); slot.input.focus(); }, { primary: true, disabled: !view.canReplan }));
     if (data.current.control.replan_request_id) actions.push(localButton("重新暂停", "pause", () => void submitTaskControl(slot.model, "pause"), { disabled: !view.canPause }));
@@ -1784,13 +1840,15 @@ async function refreshTaskBriefDialog(slot = taskDialog, owner = connection) {
 }
 
 async function submitTaskControl(model, action) {
-  const current = () => taskControlModels.get(model.state.id) === model;
-  if (!current() || model.state.phase === "submitting") return;
+  const slot = taskDialog, owner = slot?.owner;
+  const current = () => taskDialogCurrent(slot) && slot.model === model && taskControlModels.get(model.state.id) === model;
+  if (!current() || model.state.phase === "submitting" || slot.uploadController || slot.failedUploads.length) return;
+  const controller = slot.writeController = new AbortController();
   try {
     const body = model.begin(action);
     saveTaskControl(model);
     if (taskDialog?.model === model) renderTaskBriefDialog();
-    const result = await request(`/commitments/${encodeURIComponent(model.state.id)}/control`, { method: "POST", body });
+    const result = await ownedRequest(`/commitments/${encodeURIComponent(model.state.id)}/control`, { method: "POST", body, signal: controller.signal }, owner, current);
     if (!current()) return;
     model.complete(result);
     saveTaskControl(model);
@@ -1805,14 +1863,14 @@ async function submitTaskControl(model, action) {
       renderTaskBriefDialog();
       if (error.status === 409) await refreshTaskBriefDialog();
     } else if (!model.state.submission) taskControlModels.delete(model.state.id);
-  }
+  } finally { if (slot.writeController === controller) slot.writeController = null; }
 }
 
 async function showTaskBrief(identifier) {
   const model = taskControlModels.get(identifier) ?? createTaskControl(identifier, { pending: readSavedTaskControl(identifier) });
   const content = element("div", { class: "task-brief" });
   const slot = {
-    model, content, loading: false, refreshAgain: false, readError: "",
+    model, content, owner: connection, viewVersion: viewRequestVersion, loading: false, refreshAgain: false, readError: "", failedUploads: [],
     readStatus: element("p", { role: "status" }), brief: element("div"),
     panel: element("section", { class: "task-control-panel", "aria-label": "任务控制", hidden: true }),
     status: element("strong", { class: "task-control-status", "aria-live": "polite" }),
@@ -1820,10 +1878,17 @@ async function showTaskBrief(identifier) {
     error: element("p", { class: "form-error", role: "alert", hidden: true }),
     editor: element("div", { class: "task-control-editor", hidden: true }),
     input: element("textarea", { name: "additional_requirements", rows: 4, placeholder: "可留空，按当前要求重新规划" }),
+    fileInput: element("input", { type: "file", name: "additional_attachments", multiple: true, hidden: true }),
+    addFile: element("button", { type: "button", class: "text-button", text: "添加资料" }),
+    existingAttachment: element("select", { "aria-label": "选择已有资料" }), selectedAttachments: element("div"),
+    attachmentStatus: element("p", { class: "task-control-note", role: "status", hidden: true }), failedAttachments: element("div"),
     actions: element("div", { class: "task-control-actions" }), plan: element("div"),
   };
   slot.input.addEventListener("input", () => model.setDraft(slot.input.value));
-  slot.editor.append(element("label", { class: "field" }, element("span", { text: "补充要求" }), slot.input));
+  slot.addFile.addEventListener("click", () => { if (taskDialogCurrent(slot) && !slot.addFile.disabled) slot.fileInput.click(); });
+  slot.fileInput.addEventListener("change", () => { if (taskDialogCurrent(slot)) void addTaskControlFiles(slot, slot.fileInput.files ?? []); slot.fileInput.value = ""; });
+  slot.existingAttachment.addEventListener("change", () => { if (taskDialogCurrent(slot) && !slot.existingAttachment.disabled) { model.addAttachment(slot.existingAttachment.value); renderTaskBriefDialog(slot); } });
+  slot.editor.append(element("label", { class: "field" }, element("span", { text: "补充要求" }), slot.input), element("div", { class: "task-control-heading" }, slot.addFile, slot.existingAttachment), slot.fileInput, slot.selectedAttachments, slot.attachmentStatus, slot.failedAttachments);
   slot.panel.append(element("div", { class: "task-control-heading" }, slot.status, slot.scope), slot.note, slot.plan, slot.editor, slot.error, slot.actions);
   content.append(slot.brief, slot.readStatus, slot.panel);
   openDialog({ title: "任务说明", content, readOnly: true, onSubmit: null });

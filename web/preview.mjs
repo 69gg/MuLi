@@ -115,9 +115,9 @@ export function createPreviewState() {
     // with this page. Reading them never schedules or resumes any work.
     commitments: [
       { id: "preview-task-revisit", title: "回顾旧项目目标（本页示例）", status: "open", revision: 3, next_step: "核对完整说明，再由你决定如何提问。", evidence: "本页示例附件中的项目整理说明。", source_id: `attachment:${notesAttachmentId}`, created_at: now - 172800, updated_at: now - 86400, brief: { goal: "重新梳理旧项目的目标、交付物和待确认事项。\n保留原始背景和每一项约束，再整理一份便于讨论的清单。\n这是一条没有关联队友的本页示例任务。", constraints: ["先核对已有说明，不因旧任务而自动继续执行。", "完整保留中段要求：列出已知事实、尚未核验的内容和需要你确认的问题。", "仅展示本页模拟资料，不访问真实文件、模型或消息渠道。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
-      { id: "preview-task-waiting", title: "确认整理范围（本页示例）", status: "blocked", revision: 2, next_step: "等待你确认需要整理的范围。", created_at: now - 7200, updated_at: now - 3600, control: { epoch: 1, approved_epoch: 0, replan_request_id: null, plan: null }, brief: { goal: "确认示例项目哪些资料需要整理，以及最后希望得到什么。", constraints: ["范围未确认前保持账本受阻状态。", "查看说明或带入草稿都不会启动队友。"], evidence_refs: [] } },
+      { id: "preview-task-waiting", title: "确认整理范围（本页示例）", status: "blocked", revision: 2, next_step: "等待你确认需要整理的范围。", created_at: now - 7200, updated_at: now - 3600, control: { epoch: 1, approved_epoch: 0, replan_request_id: null, plan: null }, brief: { goal: "确认示例项目哪些资料需要整理，以及最后希望得到什么。", constraints: ["范围未确认前保持账本受阻状态。", "查看说明或带入草稿都不会启动队友。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
       { id: "preview-task-done", title: "整理项目清单（本页示例）", status: "done", revision: 4, next_step: "清单已保存，后续变化由你决定是否讨论。", created_at: now - 86400, updated_at: now - 3600, brief: { goal: "整理一份示例项目清单，区分已完成事项与待确认问题。", constraints: ["完成状态只表示本页保存的账本记录。", "保留原说明供回顾，不自动创建后续任务。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
-    ], ownerQuestions,
+    ], ownerQuestions, taskControlReceipts: [],
     workflows: [{ id: "workflow-review", name: "资料整理与复核", description: "先整理资料，再独立复核，最后汇总为一份简报。", mode: "auto", steps: [{ id: "research", title: "整理资料", role: "worker", prompt: "整理资料与来源。", depends_on: [] }, { id: "review", title: "独立复核", role: "reviewer", prompt: "核对结论与来源。", depends_on: ["research"] }], runs: [], created_at: now - 86400, updated_at: now - 3600 }],
     workflowRuns: [], schedules: [
       { id: "schedule-weekly", kind: "workflow_schedule", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null },
@@ -177,6 +177,11 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     result.has_brief = Object.hasOwn(item, "brief");
     if (item.control) result.control = { epoch: item.control.epoch, approved_epoch: item.control.approved_epoch, paused: item.control.epoch > item.control.approved_epoch, replan_requested: !!item.control.replan_request_id, has_plan: item.control.plan != null };
     return result;
+  };
+  const commitmentDetail = (item) => {
+    const control = { epoch: 0, approved_epoch: 0, replan_request_id: null, plan: null, ...item.control };
+    const scope = { member_count: state.members.filter((member) => member.commitment_id === item.id).length, active_workflow_count: 0, can_pause: true, blocked_reason: null };
+    return { ...item, control: { ...control, paused: control.epoch > control.approved_epoch, has_plan: control.plan != null, plan_epoch: control.plan?.epoch ?? null }, scope };
   };
   const trim = (items) => items.splice(state.previewLimits.max_items);
   const pendingRuns = () => Object.values(state.runs).filter((run) => ["running", "approval", "queued"].includes(run.status));
@@ -482,9 +487,40 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     if (parts[0] === "commitments" && parts.length === 2 && method === "GET") {
       const item = state.commitments.find((entry) => entry.id === id);
       if (!item) return failure("没有这条演示任务。", 404);
-      const control = { epoch: 0, approved_epoch: 0, replan_request_id: null, plan: null, ...item.control };
-      const scope = { member_count: state.members.filter((member) => member.commitment_id === id).length, active_workflow_count: 0, can_pause: true, blocked_reason: null };
-      return response({ ...item, control: { ...control, paused: control.epoch > control.approved_epoch, has_plan: control.plan != null, plan_epoch: control.plan?.epoch ?? null }, scope });
+      return response(commitmentDetail(item));
+    }
+    if (parts[0] === "commitments" && parts.length === 3 && parts[2] === "control" && method === "POST") {
+      const item = state.commitments.find((entry) => entry.id === id);
+      if (!item) return failure("没有这条演示任务。", 404);
+      const attachments = Object.hasOwn(body, "additional_attachment_ids") ? body.additional_attachment_ids : [];
+      if (Object.keys(body).some((key) => !["action", "expected_epoch", "request_id", "additional_requirements", "additional_attachment_ids"].includes(key))
+        || !["pause", "request_replan"].includes(body.action) || !Number.isSafeInteger(body.expected_epoch) || body.expected_epoch < 0 || typeof body.request_id !== "string" || !body.request_id.trim()
+        || !Array.isArray(attachments) || attachments.some((attachment) => typeof attachment !== "string" || !/^[a-f0-9]{32}$/.test(attachment))
+        || body.action === "pause" && (attachments.length || body.additional_requirements)
+        || body.action === "request_replan" && typeof body.additional_requirements !== "string") return failure("演示任务控制参数无效。", 422);
+      const normalized = { action: body.action, expected_epoch: body.expected_epoch, request_id: body.request_id, additional_requirements: body.additional_requirements ?? "", ...(attachments.length ? { additional_attachment_ids: attachments } : {}) };
+      const fingerprint = JSON.stringify(normalized), receipts = state.taskControlReceipts ??= [];
+      const previous = receipts.find((entry) => entry.task_id === id && entry.receipt.request_id === body.request_id);
+      if (previous) return previous.fingerprint === fingerprint ? response({ receipt: previous.receipt, current: commitmentDetail(item) }) : failure({ code: "request_conflict", message: "原请求已使用其它内容。", current: commitmentDetail(item) }, 409);
+      const current = commitmentDetail(item);
+      if (body.expected_epoch !== current.control.epoch) return failure({ code: "epoch_conflict", message: "任务要求已有更新。", current }, 409);
+      if (!item.brief) return failure("任务没有完整说明。", 400);
+      if (receipts.length >= state.previewLimits.max_items) return failure("演示任务控制回执已达上限。", 429);
+      const brief = clone(item.brief);
+      if (body.action === "request_replan") {
+        if (!current.control.paused) return failure({ code: "not_paused", message: "请先暂停任务。", current }, 409);
+        if (attachments.some((attachment) => !state.files.has(attachment) || !state.uploads.some((file) => file.id === attachment))) return failure("补充附件已经不可读取。", 400);
+        if (body.additional_requirements.trim()) brief.constraints.push(body.additional_requirements);
+        for (const attachment of attachments) if (!brief.evidence_refs.some((reference) => reference.kind === "attachment" && reference.id === attachment)) brief.evidence_refs.push({ kind: "attachment", id: attachment });
+        if (Array.from(JSON.stringify(brief)).length > state.settings.limits.max_context_chars) return failure("完整任务说明超过演示上下文预算。", 400);
+      }
+      const epoch = current.control.epoch + 1, receiptId = identifier("preview-task-control");
+      item.brief = brief; item.control = { ...item.control, epoch, approved_epoch: current.control.approved_epoch, replan_request_id: body.action === "request_replan" ? receiptId : null };
+      item.revision += 1; item.updated_at = timestamp();
+      const receipt = { id: receiptId, commitment_id: id, request_id: body.request_id, action: body.action, actor: "owner", epoch, revision: item.revision, created_at: item.updated_at, preview: true };
+      receipts.push({ task_id: id, fingerprint, receipt });
+      emit("commitment.updated", commitmentMetadata(item));
+      return response({ receipt, current: commitmentDetail(item) });
     }
     if (parts[0] === "commitments" && parts.length === 3 && parts[2] === "inspection" && method === "GET" && url.searchParams.get("section") === "owner_questions") {
       const params = url.searchParams, fail = (code, message, status = ({ evidence_not_found: 404, evidence_changed: 409 })[code] ?? 400) => failure({ code, message }, status);

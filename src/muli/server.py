@@ -153,6 +153,7 @@ class TaskControlInput(Input):
     expected_epoch: int = Field(ge=0, strict=True)
     request_id: str = Field(min_length=1, max_length=MAX_EVENT_ID_CHARS, strict=True)
     additional_requirements: str = Field(default="", strict=True)
+    additional_attachment_ids: AttachmentReferences = Field(default_factory=list)
 
 
 class ApprovalInput(Input):
@@ -835,6 +836,7 @@ def _create_app(
                     expected_epoch=body.expected_epoch,
                     request_id=body.request_id,
                     additional_requirements=body.additional_requirements,
+                    additional_attachment_ids=tuple(body.additional_attachment_ids),
                 ),
             )
         except (ControlConflict, ControlUnavailable) as exc:

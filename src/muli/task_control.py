@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+from muli.attachments import validate_attachment_ids
 from muli.commitments import Commitments
 from muli.context import ContextLimitError, context_size
 from muli.conversation import MAX_EVENT_ID_CHARS, Conversation
@@ -96,6 +97,7 @@ class OwnerControlRequest:
     expected_epoch: int
     request_id: str
     additional_requirements: str = ""
+    additional_attachment_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.action not in {"pause", "request_replan"}:
@@ -112,6 +114,11 @@ class OwnerControlRequest:
             self.action == "pause" and self.additional_requirements
         ):
             raise ValueError("pause 不能同时修改要求")
+        if not isinstance(self.additional_attachment_ids, tuple):
+            raise ValueError("任务附件引用必须是不可变序列")
+        validate_attachment_ids(list(self.additional_attachment_ids))
+        if self.action == "pause" and self.additional_attachment_ids:
+            raise ValueError("pause 不能同时追加附件")
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,6 +562,7 @@ class TaskControl:
         active_workflow_ids: Sequence[str] = (),
         expected_approved_epoch: int | None = None,
         reply_origin: ReplyOrigin | None = None,
+        attachment_validator: Callable[[object], list[str]] | None = None,
     ) -> ControlResult:
         """Only the authenticated owner endpoint may call this method."""
         with self._transaction():
@@ -568,6 +576,7 @@ class TaskControl:
                 active_workflow_ids=active_workflow_ids,
                 expected_approved_epoch=expected_approved_epoch,
                 reply_origin=reply_origin,
+                attachment_validator=attachment_validator,
             )
 
     def _owner_control_in_transaction(
@@ -583,6 +592,7 @@ class TaskControl:
         expected_approved_epoch: int | None = None,
         reply_origin: ReplyOrigin | None = None,
         scheduled_replan: JsonObject | None = None,
+        attachment_validator: Callable[[object], list[str]] | None = None,
     ) -> ControlResult:
         """Stage the ordinary owner control while the host owns its one transaction."""
         if not self.store.db.in_transaction:
@@ -597,6 +607,8 @@ class TaskControl:
         self._main(main_session_id)
         key = self._receipt_id(identifier, "owner", request.request_id)
         fields = {"commitment_id": identifier, **asdict(request)}
+        if not request.additional_attachment_ids:
+            fields.pop("additional_attachment_ids")
         # Keep historical fingerprints unchanged. The authenticated mobile event
         # already binds its source; duplicate receipts never retrofit that source.
         if expected_approved_epoch is not None:
@@ -629,9 +641,21 @@ class TaskControl:
             _positive(max_pending, "入站容量")
             if mode not in {"ask", "auto", "yolo"}:
                 raise ValueError("执行模式无效")
+            if request.additional_attachment_ids:
+                if attachment_validator is None:
+                    raise ControlUnavailable("attachments_unavailable", "附件能力尚未就绪")
+                attachment_validator(list(request.additional_attachment_ids))
             brief = self.commitments._validate_brief(item.get("brief"), stored=True)
             if request.additional_requirements.strip():
                 brief["constraints"].append(request.additional_requirements)
+            attachment_ids = {
+                ref["id"] for ref in brief["evidence_refs"] if ref["kind"] == "attachment"
+            }
+            brief["evidence_refs"].extend(
+                {"kind": "attachment", "id": attachment_id}
+                for attachment_id in request.additional_attachment_ids
+                if attachment_id not in attachment_ids
+            )
             item["brief"] = brief
         state = {
             **state,

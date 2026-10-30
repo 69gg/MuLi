@@ -1126,6 +1126,7 @@ class Runtime:
             active_workflow_ids=self.workflows.active_run_ids,
             expected_approved_epoch=expected_approved_epoch,
             reply_origin=reply_origin,
+            attachment_validator=self.team._attachment_references,
         )
         if result.created:
             self._invalidate_voice_reply()

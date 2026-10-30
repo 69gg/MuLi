@@ -5,6 +5,7 @@ import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
 import { createSessionState, hydrateSession, applyEvent, isRunning } from "../../web/state.mjs";
 import { createTeamPager } from "../../web/team.mjs";
+import { createTaskControl } from "../../web/task-control.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 
 // Exercise the real connection code; controlled promises/timers create races
@@ -71,9 +72,11 @@ function harness(t, handler = async (path) => payload(path)) {
         state.auth = { required: false, authenticated: true }; return owner;
       },
       setTaskDialog(slot) {
+        slot.owner = connection; slot.viewVersion = viewRequestVersion;
         taskDialog = slot; $("#app-dialog").open = true;
         $("#dialog-content").firstElementChild = slot.content;
       },
+      get taskDialog() { return taskDialog; },
       get owner() { return connection; }
     };
   `, context);
@@ -310,21 +313,25 @@ test("real global events merge independent session and notification reads while 
   assert.equal(h.ui.state.notifications[0].id, "notifications-final");
 });
 
-test("new connection takes over a task brief read and its old completion cannot unlock the new read", async (t) => {
-  const reads = [], accepted = [];
+test("new connection closes the old task brief and its completion cannot unlock a reopened read", async (t) => {
+  const reads = [];
   const h = harness(t, async () => { const pending = deferred(); reads.push(pending); return pending.promise; });
   h.ui.activate();
-  const slot = {
-    content: {}, loading: false,
-    model: { state: { id: "brief" }, acceptDetail(item) { accepted.push(item.id); return true; } },
-  };
+  const slot = { content: {}, loading: false, model: createTaskControl("brief") };
   h.ui.setTaskDialog(slot); const stale = h.ui.refreshTaskBriefDialog();
   const previous = slot.readController; const owner = h.ui.activate();
-  h.ui.revalidateVisibleState(owner); assert.equal(previous.signal.aborted, true);
-  assert.equal(reads.length, 2); reads[0].resolve({ id: "stale" }); await stale;
-  assert.equal(slot.loading, true); assert.equal(accepted.length, 0);
-  reads[1].resolve({ id: "fresh" }); await flush();
-  assert.equal(slot.loading, false); assert.deepEqual(accepted, ["fresh"]);
+  assert.equal(previous.signal.aborted, true); assert.equal(h.ui.taskDialog === null, true);
+  assert.equal(h.node("#app-dialog").open, false); assert.equal(slot.model.state.detail, null);
+  h.ui.revalidateVisibleState(owner); assert.equal(reads.length, 1, "换连接不得自动重开旧任务说明");
+  const reopened = { content: {}, loading: false, model: createTaskControl("brief") };
+  h.ui.setTaskDialog(reopened); h.ui.revalidateVisibleState(owner);
+  assert.equal(reads.length, 2);
+  const detail = (title) => ({ id: "brief", revision: 1, title, brief: { goal: title, constraints: [], evidence_refs: [] } });
+  reads[0].resolve(detail("stale")); await stale;
+  assert.equal(reopened.loading, true); assert.equal(reopened.model.state.detail, null); assert.equal(slot.model.state.detail, null);
+  reads[1].resolve(detail("fresh")); await flush();
+  assert.equal(reopened.loading, false); assert.equal(reopened.model.state.detail.title, "fresh");
+  assert.equal(slot.model.state.detail, null, "旧完成不能恢复已清理的任务说明");
 });
 
 test("post-connect revalidation refreshes the visible projection without requiring historical events", async (t) => {

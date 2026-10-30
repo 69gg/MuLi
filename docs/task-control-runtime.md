@@ -12,6 +12,18 @@
 
 纯 pause 只登记事实，清除旧重规划意图，不增加 main 输入或自动调用模型；无模型配置也可暂停。`request_replan` 明确登记主人重新规划的意图，允许追加完整要求；原始要求不被计划覆盖。启动、确认、输入容量释放和实际完成事件驱动通知投递，没有定时模型轮询。每页受 `limits.max_pending_runs` 限制，越过满邮箱继续扫描；重入事件会请求后续一轮处理，不丢失唯一容量释放唤醒。
 
+### 主人为原任务追加附件依据
+
+原认证 HTTP 控制入口的 `request_replan` 可同时提交 `additional_requirements` 与 `additional_attachment_ids`。附件先通过现有 `/api/uploads` 保存，再提交已登记 ID 的有序列表；省略或空列表保留原行为。HTTP 复用 `AttachmentReferences` 的 ID 格式、去重和数量上限，内部 `OwnerControlRequest` 使用不可变 tuple。`pause` 不能同时追加文字要求或附件；模型、队友报告和项目事件不能取得这个 owner 入口。
+
+Runtime 仍持有配置锁，TaskControl 在原 `BEGIN IMMEDIATE` 内先查相同 `request_id` 的回执，再调用既有附件设施核验新引用的登记和普通文件可用性。首次提交才校验附件；事务已成功但响应丢失时，须用原 `request_id`、epoch、完整文字和相同顺序的附件列表重核。即使附件后来被删除，也返回原回执；相同 ID 更换或重排列表则报冲突。空附件字段不进入指纹，保留历史空请求的准确去重语义。
+
+追加只把尚未存在的 `{kind:"attachment",id}` 写入原 `brief.evidence_refs`，保留完整目标、逐条旧限制和所有旧引用；与同次文字要求、revision、epoch、回执及 main ingress 一起原子提交。旧引用仍沿原 Commitments 解析契约处理。附件失效、队列满、预算不足、旧 epoch 或写入失败均不留下部分 brief 或主输入。没有就绪的附件设施时，非空请求拒绝提交。
+
+附件 ID 不冻结文件内容，也不保证日后仍能读取；上传、引用和计划确认均不表示文件内容已核查或任务完成。追加后任务仍暂停，主助手必须通过原 `commitment_read` 读取完整新旧依据，在下一轮使用固定快照调用 `task_approve_plan`，再由原通知机制交给同一范围的原队友。正文只由既有附件阅读工具按需读取，不自动放入模型。正常关闭重开保留 brief v1 的原有引用形状；本片没有新增持久字段或提高旧版本对其它数据域的读取能力。
+
+专用回归位于 `tests/test_task_control_attachments.py` 和 `tests/test_task_control_attachments_runtime.py`，使用临时 SQLite、真实 HTTP 上传与控制入口、假模型和真实 Team 调度覆盖追加、幂等、回滚、原队友续办与正常重开；不依赖真实账号、平台、网络或桌面。
+
 手机重规划后续回复在最终准入后的私有提交闭包中，将可信 `MobileControlSource` 转为 `ReplyOrigin`，与 owner 控制事实及 main ingress 同事务保存。公开 `OwnerControlRequest` 和 Web 请求不能指定该来源；既有指纹不变，重复领域回执原样返回，不补改旧 ingress。输入仍为 `source=task-control, principal=owner, route=null`，显式回复来源只用于外发归属，不增加权限。
 
 主会话同一运行的工具批次后和无工具续轮都使用实际 claim 的有限输入列表选择来源。严格匹配 `source=team:<id>, principal=agent:<id>` 的队内报告只补充当前请求证据；若没有其它新输入，沿用前一 `PreparedRequest` 的来源与主动通知选路。新主人输入、提醒等其它真实输入按其持久来源更新。首次准备、新运行及队友自身请求仍沿原规则；报告 metadata 和独立 Attention 路由不变，不查询全历史最近主人，也不保存永久目的地偏好。2.46仅覆盖重规划说明回本次手机，独立完成回报的新增持久关联见下节。该版十五文件431项相关整合、全147源码类型检查和独立后审通过，精确远端矩阵与正式发行已闭合，见[2.46审查](review-v2.46.md#发版闭合)。

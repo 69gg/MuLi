@@ -123,10 +123,15 @@ test("preview missing tasks and unimplemented routes stay explicit without fallb
     const result = await getJSON(backend, path);
     assert.equal(result.status, 501); assert.equal(result.body.preview, true); assert.equal(Object.hasOwn(result.body, "items"), false);
   }
-  for (const path of ["/commitment-directory", `/commitments/${id}/control`]) {
+  for (const path of ["/commitment-directory", `/commitments/${id}/unimplemented-control`]) {
     const result = await backend.fetch(`/api${path}`, { method: "POST", body: JSON.stringify({ action: "pause" }) });
     assert.equal(result.status, 501);
   }
+  const invalidControl = await backend.fetch(`/api/commitments/${id}/control`, { method: "POST", body: JSON.stringify({ action: "pause" }) });
+  assert.equal(invalidControl.status, 422, "已实现的控制入口必须明确拒绝缺失 epoch/request_id 的输入");
+  const rejected = await invalidControl.json();
+  assert.equal(rejected.preview, true); assert.equal(Object.hasOwn(rejected, "receipt"), false);
+  assert.equal(backend.state.taskControlReceipts?.length ?? 0, 0);
   assert.deepEqual(savedState(backend), before);
 });
 

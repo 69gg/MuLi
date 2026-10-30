@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import pytest
@@ -38,7 +38,10 @@ def test_mobile_cas_rejects_approval_change_without_changing_web_fingerprint(rig
     assert web.receipt["fingerprint"] == _digest(
         {
             "commitment_id": rig.identifier,
-            **asdict(OwnerControlRequest("pause", snapshot.epoch, "web-unchanged")),
+            "action": "pause",
+            "expected_epoch": snapshot.epoch,
+            "request_id": "web-unchanged",
+            "additional_requirements": "",
         }
     )
 

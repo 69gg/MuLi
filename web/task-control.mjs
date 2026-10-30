@@ -2,6 +2,9 @@
 const ACTIONS = new Set(["pause", "request_replan"]);
 const integer = (value) => Number.isSafeInteger(value) && value >= 0;
 const record = (value) => value && typeof value === "object" && !Array.isArray(value);
+const attachmentIds = (value) => Array.isArray(value) && value.every((id) => typeof id === "string" && /^[a-f0-9]{32}$/.test(id));
+const frozenAttachments = (value = []) => Object.freeze([...value]);
+const attachmentBody = (value) => value.length ? { additional_attachment_ids: frozenAttachments(value) } : {};
 
 export function taskControlRequestId() {
   if (globalThis.crypto.randomUUID) return globalThis.crypto.randomUUID();
@@ -12,7 +15,9 @@ export function taskControlRequestId() {
 export function restoreTaskControlRequest(value) {
   if (!record(value) || !ACTIONS.has(value.action) || !integer(value.expected_epoch) || typeof value.request_id !== "string" || !value.request_id) return null;
   if (value.action === "request_replan" && typeof value.additional_requirements !== "string") return null;
-  return Object.freeze({ action: value.action, expected_epoch: value.expected_epoch, request_id: value.request_id, ...(value.action === "request_replan" ? { additional_requirements: value.additional_requirements } : {}) });
+  const ids = Object.hasOwn(value, "additional_attachment_ids") ? value.additional_attachment_ids : [];
+  if (!attachmentIds(ids) || value.action === "pause" && ids.length) return null;
+  return Object.freeze({ action: value.action, expected_epoch: value.expected_epoch, request_id: value.request_id, ...(value.action === "request_replan" ? { additional_requirements: value.additional_requirements, ...attachmentBody(ids) } : {}) });
 }
 
 function validCurrent(value, identifier) {
@@ -41,9 +46,9 @@ export function taskControlView(state) {
 
 export function createTaskControl(identifier, { pending = null, createRequestId = taskControlRequestId } = {}) {
   const restored = restoreTaskControlRequest(pending);
-  const initial = () => ({ id: identifier, current: null, detail: null, draft: "", editing: false, phase: "ready", submission: null, receipt: null, error: "", errorCode: "", conflict: false });
+  const initial = () => ({ id: identifier, current: null, detail: null, draft: "", attachmentIds: frozenAttachments(), editing: false, phase: "ready", submission: null, receipt: null, error: "", errorCode: "", conflict: false });
   let state = initial();
-  if (restored) state = { ...state, submission: restored, phase: "unknown", draft: restored.additional_requirements ?? "", editing: restored.action === "request_replan" };
+  if (restored) state = { ...state, submission: restored, phase: "unknown", draft: restored.additional_requirements ?? "", attachmentIds: restored.additional_attachment_ids ?? frozenAttachments(), editing: restored.action === "request_replan" };
   const change = (patch) => { state = { ...state, ...patch }; };
   const acceptCurrent = (value) => {
     if (!validCurrent(value, identifier) || state.current && value.revision < state.current.revision) return false;
@@ -61,8 +66,14 @@ export function createTaskControl(identifier, { pending = null, createRequestId 
       return true;
     },
     edit() { if (!state.submission && taskControlView(state).canReplan) change({ editing: true, error: "", errorCode: "" }); },
-    cancelEdit() { if (!state.submission) change({ editing: false, draft: "", conflict: false, error: "", errorCode: "" }); },
+    cancelEdit() { if (!state.submission) change({ editing: false, draft: "", attachmentIds: frozenAttachments(), conflict: false, error: "", errorCode: "" }); },
     setDraft(value) { if (!state.submission) change({ draft: String(value) }); },
+    addAttachment(id) {
+      if (state.submission || !attachmentIds([id])) return false;
+      if (!state.attachmentIds.includes(id)) change({ attachmentIds: frozenAttachments([...state.attachmentIds, id]) });
+      return true;
+    },
+    removeAttachment(id) { if (!state.submission) change({ attachmentIds: frozenAttachments(state.attachmentIds.filter((entry) => entry !== id)) }); },
     begin(action) {
       if (state.submission) {
         if (state.phase === "unknown" && action === state.submission.action) {
@@ -73,7 +84,7 @@ export function createTaskControl(identifier, { pending = null, createRequestId 
       }
       const view = taskControlView(state);
       if (!ACTIONS.has(action) || !(action === "pause" ? view.canPause : view.canReplan)) throw new Error(view.workflowBlocked ? "先停止工作流或等待完成，再暂停。" : "请刷新并核对任务状态。");
-      const submission = Object.freeze({ action, expected_epoch: state.current.control.epoch, request_id: createRequestId(), ...(action === "request_replan" ? { additional_requirements: state.draft } : {}) });
+      const submission = Object.freeze({ action, expected_epoch: state.current.control.epoch, request_id: createRequestId(), ...(action === "request_replan" ? { additional_requirements: state.draft, ...attachmentBody(state.attachmentIds) } : {}) });
       change({ submission, phase: "submitting", error: "", errorCode: "", conflict: false });
       return submission;
     },
@@ -83,7 +94,7 @@ export function createTaskControl(identifier, { pending = null, createRequestId 
       if (receipt.request_id !== state.submission.request_id || receipt.action !== state.submission.action) throw new Error("提交回执不匹配，请重试原操作。");
       const action = state.submission.action;
       acceptCurrent(value.current); // An old receipt must not roll the current view back.
-      change({ submission: null, phase: "ready", receipt, error: "", errorCode: "", ...(action === "request_replan" ? { editing: false, draft: "" } : {}) });
+      change({ submission: null, phase: "ready", receipt, error: "", errorCode: "", ...(action === "request_replan" ? { editing: false, draft: "", attachmentIds: frozenAttachments() } : {}) });
     },
     fail(error) {
       if (error?.status === 401) { state = initial(); return; }
