@@ -31,6 +31,7 @@ from muli.failure_diagnostics import capture_failure
 from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.history_evidence import HistoryEvidence
 from muli.history_find import HistoryFind
+from muli.main_recovery_evidence import MainRecoveryEvidence
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
@@ -2705,6 +2706,20 @@ class Runtime:
                 not persona.prompt
                 and session.get("principal") == "owner"
                 and session_id == self.store.existing_main_session_id()
+                and "conversation_read" in self.tools
+                and "conversation_read" not in self.config.settings.disabled_tools
+            ):
+                prompt += (
+                    "\n主人要核查主助手自己上次的中断时，用 conversation_read 的 "
+                    "section=main_recovery 只读本会话宿主已恢复且仍中断的历史运行；"
+                    "first_input 仅为 start_only 起点，available 时再用 read_arguments 核原文。"
+                    "按 has_more/next_cursor 续查，omitted 或空候选页不表示查全；"
+                    "恢复时间不是中断时间，中断历史不等于待办，也不恢复旧授权或重放工具。"
+                )
+            if (
+                not persona.prompt
+                and session.get("principal") == "owner"
+                and session_id == self.store.existing_main_session_id()
                 and self.config.settings.memory.enabled
                 and "memory_correct" in self.tools
                 and "memory_correct" in self._coordinator_tools
@@ -3743,9 +3758,62 @@ class Runtime:
         async def recall(args: dict[str, Any]) -> Any:
             return self.memory.search(str(args["query"]), 8)
 
+        def owner_history_call(
+            name: str, handler: Callable[[dict[str, Any]], Awaitable[Any]]
+        ) -> tuple[str, str, str]:
+            caller = self.tool_session_id
+            execution = self._tool_execution.get()
+            request = self.request_context(caller) if caller is not None else None
+            active_tool = self._active_tool.get()
+            task = asyncio.current_task()
+            if (
+                self._closing
+                or caller is None
+                or caller != self.store.existing_main_session_id()
+                or execution is None
+                or execution != (caller, self.run_ids.get(caller))
+                or request is None
+                or request.consult is not None
+                or request.reply_origin.input_id is None
+                or task is None
+                or task.cancelling()
+                or self.tasks.get(caller) is not task
+                or caller in self._stopping
+                or active_tool is None
+                or active_tool.name != name
+                or active_tool.handler is not handler
+                or name in self.config.settings.disabled_tools
+            ):
+                raise PermissionError("跨会话查找仅供真实主人当前请求中的主助手直接调用")
+            self.maintenance.admission.require()
+            self._guard_request(request, "read")
+            if self.store.pending_inputs(caller):
+                raise PermissionError("收到新输入，请先重新规划历史查找")
+            return caller, execution[1], request.reply_origin.input_id
+
         async def read_conversation(args: dict[str, Any]) -> Any:
             evidence = HistoryEvidence(self.store)
             limits = self.config.settings.limits
+            if args.get("section") == "main_recovery":
+                if set(args) - {"section", "session_id", "cursor", "limit"}:
+                    raise EvidenceError("invalid_arguments", "恢复目录不能混用消息定位或正文参数")
+                owner, owner_run, owner_input = owner_history_call(
+                    "conversation_read", read_conversation
+                )
+                if args["session_id"] != owner:
+                    raise EvidenceError("invalid_arguments", "恢复目录只能读取当前主会话")
+                return MainRecoveryEvidence(self.store).read(
+                    owner,
+                    run_id=owner_run,
+                    input_id=owner_input,
+                    runtime_id=self._history_find_runtime_id,
+                    cursor=args.get("cursor"),
+                    limit=min(args.get("limit", 20), limits.max_search_results),
+                    max_output_chars=limits.max_output_chars,
+                    max_results=limits.max_search_results,
+                    max_context_chars=limits.max_context_chars,
+                    deadline=monotonic() + limits.max_search_seconds,
+                )
             if args.get("section") == "continuations":
                 if set(args) - {"section", "session_id", "cursor", "limit"}:
                     raise EvidenceError("invalid_arguments", "延续目录不能混用消息定位或正文参数")
@@ -3770,7 +3838,7 @@ class Runtime:
                     max_output_chars=limits.max_output_chars,
                 )
             if "section" in args or "cursor" in args:
-                raise EvidenceError("invalid_arguments", "section/cursor 仅用于延续目录")
+                raise EvidenceError("invalid_arguments", "section/cursor 仅用于特殊证据目录")
             if "message_id" in args or "seq" in args:
                 if "after" in args or "limit" in args:
                     raise EvidenceError(
@@ -3808,40 +3876,13 @@ class Runtime:
             )
 
         async def find_history(args: dict[str, Any]) -> Any:
-            caller = self.tool_session_id
-            execution = self._tool_execution.get()
-            request = self.request_context(caller) if caller is not None else None
-            active_tool = self._active_tool.get()
-            task = asyncio.current_task()
-            if (
-                self._closing
-                or caller is None
-                or caller != self.store.existing_main_session_id()
-                or execution is None
-                or execution != (caller, self.run_ids.get(caller))
-                or request is None
-                or request.consult is not None
-                or request.reply_origin.input_id is None
-                or task is None
-                or task.cancelling()
-                or self.tasks.get(caller) is not task
-                or caller in self._stopping
-                or active_tool is None
-                or active_tool.name != "history_find"
-                or active_tool.handler is not find_history
-                or "history_find" in self.config.settings.disabled_tools
-            ):
-                raise PermissionError("跨会话查找仅供真实主人当前请求中的主助手直接调用")
-            self.maintenance.admission.require()
-            self._guard_request(request, "read")
-            if self.store.pending_inputs(caller):
-                raise PermissionError("收到新输入，请先重新规划历史查找")
+            caller, run_id, input_id = owner_history_call("history_find", find_history)
             limits = self.config.settings.limits
             return HistoryFind(self.store).find_owned(
                 caller,
                 args["query"],
-                run_id=execution[1],
-                input_id=request.reply_origin.input_id,
+                run_id=run_id,
+                input_id=input_id,
                 runtime_id=self._history_find_runtime_id,
                 cursor=args.get("cursor"),
                 limit=min(args.get("limit", 20), limits.max_search_results),
@@ -4101,11 +4142,12 @@ class Runtime:
                 "conversation_read",
                 "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content。"
                 "续读使用 revision/next_offset_bytes；不恢复入库前丢失的正文，不读取附件或图片。"
-                "section=continuations 仅主助手只读列出直属未完队友，不恢复执行",
+                "section=continuations 仅主助手只读列出直属未完队友；main_recovery 仅真实主人"
+                "当前请求中的主助手发现本会话已恢复的中断主运行与有限原输入起点，不恢复执行",
                 parameters(
                     {
                         "session_id": string(),
-                        "section": {"type": "string", "enum": ["continuations"]},
+                        "section": {"type": "string", "enum": ["continuations", "main_recovery"]},
                         "cursor": string(),
                         "after": {"type": "integer", "minimum": 0},
                         "limit": {"type": "integer", "minimum": 1},

@@ -492,6 +492,87 @@ class Store:
             raise EvidenceError("content_unavailable", "持久对象无法完整核查") from exc
         return item
 
+    def main_recovery_window(
+        self, session_id: str, *, before_id: int | None, limit: int
+    ) -> builtins.list[int]:
+        """Select raw event keys before inspecting their type or JSON."""
+        if type(limit) is not int or not 1 <= limit <= _SESSION_RECORD_LIMIT:
+            raise ValueError("主运行恢复目录需要有限候选窗口及一个前瞻")
+        bounds: tuple[str | int, ...] = (session_id,)
+        predicate = ""
+        if before_id is not None:
+            if type(before_id) is not int or not 1 <= before_id <= SQLITE_MAX_INTEGER:
+                raise ValueError("主运行恢复目录续页位置必须是有效正序号")
+            predicate = " AND id<?"
+            bounds += (before_id,)
+        return [
+            int(row[0])
+            for row in self.db.execute(
+                "SELECT id FROM events WHERE session_id=?"
+                + predicate
+                + " ORDER BY id DESC LIMIT ?",
+                (*bounds, limit),
+            )
+        ]
+
+    def main_recovery_event(
+        self, session_id: str, event_id: int, *, max_bytes: int
+    ) -> dict[str, Any] | None:
+        """Read one event only when its complete type and data fit together."""
+        row = self.db.execute(
+            "SELECT id,CASE WHEN typeof(created_at) IN ('integer','real') "
+            "THEN created_at END AS created_at,"
+            "typeof(type) AS type_type,typeof(data) AS data_type,"
+            "length(CAST(type AS BLOB))+length(CAST(data AS BLOB)) AS size,"
+            "CASE WHEN typeof(type)='text' AND typeof(data)='text' "
+            "AND length(CAST(type AS BLOB))+length(CAST(data AS BLOB))<=:budget "
+            "THEN CAST(type AS BLOB) END AS type,"
+            "CASE WHEN typeof(type)='text' AND typeof(data)='text' "
+            "AND length(CAST(type AS BLOB))+length(CAST(data AS BLOB))<=:budget "
+            "THEN CAST(data AS BLOB) END AS data "
+            "FROM events WHERE id=:event_id AND session_id=:session_id",
+            {"budget": max_bytes, "event_id": event_id, "session_id": session_id},
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def main_recovery_run(self, run_id: str, *, max_bytes: int) -> dict[str, Any] | None:
+        """Charge complete JSON before parsing; never load the result into Python."""
+        row = self.db.execute(
+            "SELECT typeof(data) AS data_type,length(CAST(data AS BLOB)) AS size,"
+            "CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
+            "THEN CASE WHEN json_valid(data) THEN CASE WHEN json_type(data)='object' "
+            "AND NOT EXISTS(SELECT 1 FROM json_each(data) GROUP BY key HAVING count(*)>1) "
+            "THEN CAST(json_object('id',json_extract(data,'$.id'),"
+            "'session_id',json_extract(data,'$.session_id'),"
+            "'status',json_extract(data,'$.status')) AS BLOB) END END END AS metadata "
+            "FROM objects WHERE kind='run' AND id=?",
+            (max_bytes, run_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def main_recovery_first_input(self, run_id: str, *, max_bytes: int) -> dict[str, Any] | None:
+        """Inspect the first indexed ingress row, without skipping a broken first row."""
+        size = "+".join(
+            f"length(CAST({name} AS BLOB))"
+            for name in ("id", "session_id", "state", "run_id", "payload")
+        )
+        fields = ",".join(
+            f"CASE WHEN ({size})<=:budget AND typeof({name})='text' "
+            f"THEN CAST({name} AS BLOB) END AS {name}"
+            for name in ("id", "session_id", "state", "run_id", "payload")
+        )
+        row = self.db.execute(
+            "SELECT seq,CASE WHEN typeof(delivered_seq)='integer' "
+            "THEN delivered_seq END AS delivered_seq,"
+            "CASE WHEN typeof(received) IN ('integer','real') THEN received END AS received,("
+            + size
+            + ") AS size,"
+            + fields
+            + " FROM ingress WHERE run_id=:run_id ORDER BY seq LIMIT 1",
+            {"run_id": run_id, "budget": max_bytes},
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def ingress_audit_window(
         self, *, before_seq: int | None, limit: int
     ) -> Generator[int, None, None]:
@@ -1699,15 +1780,15 @@ class Store:
                 result.append(message)
         return result
 
-    def _archive_input(
-        self,
+    @staticmethod
+    def input_archive(
         payload: dict[str, Any],
         *,
         received: float,
         run_id: str | None,
         input_seq: int | None = None,
     ) -> dict[str, Any]:
-        """Archive an input in the caller's transaction, preserving trusted provenance."""
+        """Project the original archive fields, shared by writes and evidence checks."""
         message = {
             "id": payload["id"],
             "session_id": payload["session_id"],
@@ -1732,6 +1813,18 @@ class Store:
             message["channel_ownership"] = payload["channel_ownership"]
         if "channel_ownership_control" in payload:
             message["channel_ownership_control"] = payload["channel_ownership_control"]
+        return message
+
+    def _archive_input(
+        self,
+        payload: dict[str, Any],
+        *,
+        received: float,
+        run_id: str | None,
+        input_seq: int | None = None,
+    ) -> dict[str, Any]:
+        """Archive an input in the caller's transaction, preserving trusted provenance."""
+        message = self.input_archive(payload, received=received, run_id=run_id, input_seq=input_seq)
         if self.get("message", payload["id"]) is not None:
             raise ValueError("输入消息 ID 已经存档，不能覆盖历史")
         self._put("message", message)
