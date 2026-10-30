@@ -30,7 +30,9 @@ from muli.attention import AttentionInbox
 from muli.auth import COOKIE_NAME, Authentication
 from muli.candidate_online import OnlineSettings
 from muli.candidate_policy import CandidateSettings
+from muli.capability_catalog import CapabilityCatalog, CapabilityCatalogError
 from muli.channel_application import ChannelApplication
+from muli.channel_history import CHANNEL_HISTORY_PAGE_LIMIT
 from muli.channels import ChannelError
 from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
 from muli.conversation import MAX_EVENT_ID_CHARS
@@ -63,11 +65,13 @@ from muli.providers import ProviderError
 from muli.reply_origin import ReplyOrigin
 from muli.request_operation import request_operation
 from muli.runtime import Runtime
+from muli.saved_answer_voice import SavedAnswerVoice, SavedAnswerVoiceError
 from muli.service import UserService
 from muli.session_records import SessionRecords
 from muli.store import SQLITE_MAX_INTEGER, now
 from muli.task_control import ControlConflict, ControlUnavailable, OwnerControlRequest
 from muli.web_voice import WebVoiceError, WebVoiceInput
+from muli.workflow_sources import WorkflowSources
 
 if TYPE_CHECKING:
     from muli.platforms.linux_bootstrap import BootSession
@@ -119,6 +123,18 @@ class ChatInput(Input):
 
 class TranscriptionInput(Input):
     attachment_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class SavedAnswerSpeechInput(Input):
+    run_id: str = Field(min_length=1, max_length=200, strict=True)
+    revision: str = Field(min_length=1, max_length=200, strict=True)
+    confirmed: bool = Field(strict=True)
+
+
+class AttachmentCollectionInput(Input):
+    source_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    document_revision: str | None = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
+    registered_revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
 class LoginInput(Input):
@@ -276,6 +292,7 @@ def _create_app(
         local_services.media,
         attachment_reader=local_services.memory_attachment,
         document_reader=local_services.memory_document,
+        attachment_preparer=local_services.prepare_memory_attachment,
         transcript_reader=local_services.memory_transcript,
         webpage_reader=local_services.memory_webpage,
     )
@@ -289,6 +306,8 @@ def _create_app(
     runtime.maintenance.owner("memory_recovery", lambda: memory_application.idle)
     runtime.maintenance.owner("personal_io", lambda: personal_io.idle)
     configuration_closing = False
+    saved_answer_voice = SavedAnswerVoice(local_services, closing=lambda: configuration_closing)
+    runtime.maintenance.owner("saved_answer_voice", lambda: saved_answer_voice.idle)
     onboarding_task: asyncio.Task[None] | None = None
     runtime.maintenance.owner(
         "onboarding", lambda: onboarding_task is None or onboarding_task.done()
@@ -310,7 +329,11 @@ def _create_app(
             )
         runtime.validate_proactive_settings(target)
         if runtime.extensions.configuration_only(config.settings, target):
-            await runtime.extensions.apply_locked(target, persist=True)
+            saved_answer_voice.invalidate()
+            try:
+                await runtime.extensions.apply_locked(target, persist=True)
+            finally:
+                saved_answer_voice.reopen()
             return
         memory_application.pipeline.check_index_budget(target.limits.max_output_chars * 4)
         previous = config.settings.model_copy(deep=True)
@@ -324,6 +347,7 @@ def _create_app(
             await file_inbox.reconfigure()
             await attention.reconfigure()
             await web_voice.reconfigure()
+            saved_answer_voice.reopen()
 
         async def apply() -> None:
             try:
@@ -346,6 +370,7 @@ def _create_app(
 
         # The caller keeps configuration_lock until commit or recovery settles.
         # Disconnecting an observer must not strand half of the application stopped.
+        saved_answer_voice.invalidate()
         applying = asyncio.create_task(apply(), name="muli-configuration")
         if await _wait_cleanup(applying):
             raise asyncio.CancelledError
@@ -407,6 +432,8 @@ def _create_app(
     async def close_resources() -> None:
         nonlocal configuration_closing
         configuration_closing = True
+        # Invalidate before awaiting a configuration owner; join only outside its lock.
+        await saved_answer_voice.aclose()
         await memory_application.close_comparisons()
         try:
             await runtime.maintenance.settle_activation()
@@ -459,7 +486,9 @@ def _create_app(
     app.state.attachments, app.state.authentication = attachments, authentication
     app.state.local_services = local_services
     app.state.web_voice = web_voice
+    app.state.saved_answer_voice = saved_answer_voice
     plugins = PluginManager(runtime, app, config.path.resolve().parent / "plugins")
+    capabilities = CapabilityCatalog(runtime, plugins)
 
     def legacy_plugins_present() -> bool:
         if plugins.contexts or any(item["status"] == "failed" for item in plugins.inventory()):
@@ -488,6 +517,7 @@ def _create_app(
             "integration",
             "memory_recovery",
             "personal_io",
+            "saved_answer_voice",
             "management",
             "onboarding",
         }
@@ -723,6 +753,14 @@ def _create_app(
     async def commitments(status: str = "active") -> dict[str, Any]:
         return {"items": local_services.commitments.list(status)}
 
+    @app.get("/api/commitment-directory")
+    async def commitment_directory(
+        status: str = "active",
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, Any]:
+        return local_services.commitments.directory(status=status, cursor=cursor, limit=limit)
+
     def task_control_error(
         identifier: str, exc: ControlConflict | ControlUnavailable
     ) -> HTTPException:
@@ -818,6 +856,34 @@ def _create_app(
             headers={"Content-Security-Policy": "sandbox; default-src 'none'"},
         )
 
+    @app.get("/api/uploads/{identifier}/memory-preview")
+    async def prepare_attachment_collection(identifier: str, request: Request) -> dict[str, Any]:
+        try:
+            return await request_operation(
+                request,
+                memory_application.attachment_collection(
+                    identifier, None, closing=lambda: configuration_closing
+                ),
+                cancelled_message="资料核对已取消",
+            )
+        except PermissionError as error:
+            raise HTTPException(403, str(error)) from error
+
+    @app.post("/api/uploads/{identifier}/memory-collection")
+    async def collect_attachment(
+        identifier: str, body: AttachmentCollectionInput, request: Request
+    ) -> dict[str, Any]:
+        try:
+            return await request_operation(
+                request,
+                memory_application.attachment_collection(
+                    identifier, body.model_dump(), closing=lambda: configuration_closing
+                ),
+                cancelled_message="收藏请求已取消，请核对准确来源",
+            )
+        except PermissionError as error:
+            raise HTTPException(403, str(error)) from error
+
     @app.get("/api/conversation")
     async def conversation() -> dict[str, Any]:
         session = runtime.main_session()
@@ -880,6 +946,63 @@ def _create_app(
     @app.post("/api/team/{identifier}/stop")
     async def stop_agent(identifier: str) -> dict[str, Any]:
         return await runtime.team.stop(identifier)
+
+    @app.get(
+        "/api/capabilities",
+        description=(
+            "只读列出当前服务的完整轻量已注册工具目录（scope=registered_tools、complete=true），"
+            "不含 parameters；名称、用途和来源供客户端搜索筛选。enabled 仅反映已保存的停用设置，"
+            "目录不代表任一模型轮的会话、角色和权限裁剪结果。revision 是进程内唯一当前列表及对象"
+            "观察身份；同名对象替换、列表元数据、真实来源或停用设置变化会使旧详情失效。"
+            "不调用 schema/provider factory、模型、远程 RPC、插件 hook 或重载，不扫描配置目录。"
+            "成功 JSON envelope 受 limits.max_output_chars * 4 的 UTF-8 字节预算约束，"
+            "默认 96000 字节；超限整条拒绝，不返回部分目录。认证与同源规则保持，no-store；"
+            "维护状态仅精确放行本 GET 及 /api/capabilities/tools/{identifier} 的 GET。"
+        ),
+        responses={
+            413: {"description": "capability_payload_too_large：完整列表超过现有输出预算"},
+            422: {
+                "description": "capability_contract_invalid：非 JSON 元数据；"
+                "capability_contract_sensitive：真实注册名称或风险标签包含已发布代的已知凭据，整条拒绝"
+            },
+        },
+    )
+    async def capability_list() -> JSONResponse:
+        try:
+            return JSONResponse(capabilities.listing())
+        except CapabilityCatalogError as error:
+            raise HTTPException(error.status_code, {"code": error.code}) from None
+
+    @app.get(
+        "/api/capabilities/tools/{identifier}",
+        description=(
+            "只读展开 scope=registered_tools 的一个工具，revision 必须来自当前完整列表。"
+            "返回真实已注册 Tool.parameters 的完整 JSON，保留 required、enum、嵌套及 $ref，"
+            "不调用可覆盖的 schema 方法、provider factory、handler、模型、RPC、插件 hook 或重载。"
+            "revision 仅标识进程内当前列表和对象；同名替换使旧详情 409，不保存历史契约。"
+            "同一对象的参数就地更新时读取当前数据，不承诺旧参数回放或本轮可执行权限。"
+            "整个成功 JSON envelope 受 limits.max_output_chars * 4 UTF-8 字节预算限制，"
+            "默认 96000 字节。超限 413，非法 JSON/非有限数/循环 422；参数包含已发布 MCP 代"
+            "已知凭据时整体 422，不删字段、不截 JSON、不把脱敏内容称为原契约。"
+            "no-store；维护时仅精确放行单段非空 identifier 的本 GET，不放行其他子路径或写请求。"
+        ),
+        responses={
+            404: {"description": "capability_not_found：当前 revision 内没有该不透明工具 id"},
+            409: {"description": "capability_catalog_stale：观察已变化，需刷新完整目录"},
+            413: {"description": "capability_payload_too_large：完整契约超过现有 UTF-8 字节预算"},
+            422: {
+                "description": "revision 缺失或查询参数无效；capability_contract_invalid："
+                "契约不是完整合法 JSON；capability_contract_sensitive：含已知凭据，完整契约被拒绝"
+            },
+        },
+    )
+    async def capability_detail(
+        identifier: str, revision: Annotated[str, Query(min_length=1, max_length=200)]
+    ) -> JSONResponse:
+        try:
+            return JSONResponse(capabilities.detail(identifier, revision))
+        except CapabilityCatalogError as error:
+            raise HTTPException(error.status_code, {"code": error.code}) from None
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:
@@ -1145,6 +1268,68 @@ def _create_app(
             "deliveries": channel_application.manager.deliveries(),
         }
 
+    @app.get(
+        "/api/channels/deliveries",
+        description=(
+            "只读查询 MuLi 本地保存的当前绑定主人私聊发送记录。账号与主会话由当前配置确定；"
+            "游标不透明，目录不含正文或原始投递元数据，读取不会发送或重试。"
+        ),
+        responses={
+            400: {"description": "读取器拒绝无效游标、范围或输出预算"},
+            403: {"description": "渠道已停用或主人绑定已撤销"},
+            404: {"description": "不存在已保存的主会话"},
+            422: {"description": "查询参数缺失或未通过类型、边界校验"},
+        },
+    )
+    async def channel_deliveries(
+        channel: Annotated[str, Query(min_length=1)],
+        owner_id: Annotated[str, Query(min_length=1)],
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=CHANNEL_HISTORY_PAGE_LIMIT)] = 20,
+    ) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            try:
+                return channel_application.delivery_history(
+                    channel, owner_id, cursor=cursor, limit=limit
+                )
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
+
+    @app.get(
+        "/api/channels/deliveries/{identifier}/content",
+        description=(
+            "只读核查当前绑定主人私聊的准确发送分段。文本按 UTF-8 字节窗口返回，续读须携带"
+            "该分段 revision；附件分段只返回准确引用和空正文。平台确认不表示已读或已播放。"
+        ),
+        responses={
+            400: {"description": "读取器拒绝无效偏移、分段、范围或输出预算"},
+            403: {"description": "渠道已停用或主人绑定已撤销"},
+            404: {"description": "主会话、投递或分段不存在，或投递不属于当前私聊范围"},
+            409: {"description": "该分段正文已变化，需从字节偏移 0 重新读取"},
+            422: {"description": "查询参数缺失或未通过类型、边界校验"},
+        },
+    )
+    async def channel_delivery_content(
+        identifier: str,
+        channel: Annotated[str, Query(min_length=1)],
+        owner_id: Annotated[str, Query(min_length=1)],
+        part: Annotated[int, Query(ge=0)] = 0,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        revision: Annotated[str | None, Query(min_length=1)] = None,
+    ) -> dict[str, Any]:
+        async with runtime.configuration_lock:
+            try:
+                return channel_application.delivery_content(
+                    channel,
+                    owner_id,
+                    delivery_id=identifier,
+                    part=part,
+                    offset_bytes=offset_bytes,
+                    revision=revision,
+                )
+            except PermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
+
     @app.post("/api/channels/{name}/webhook")
     async def channel_webhook(name: str, request: Request) -> dict[str, Any]:
         if name not in {"onebot", "qq"}:
@@ -1312,6 +1497,28 @@ def _create_app(
                 updated = runtime._store_session(session, previous_mode=previous_mode)
             runtime.shell_mode_changed(session_id, previous_mode, session["mode"])
             return updated
+
+    @app.post("/api/sessions/{session_id}/messages/{message_id}/speech")
+    async def saved_answer_speech(
+        session_id: str, message_id: str, body: SavedAnswerSpeechInput, request: Request
+    ) -> dict[str, Any]:
+        if body.confirmed is not True:
+            raise HTTPException(400, "请明确确认将这条完整答复发送给语音服务并保存附件")
+        try:
+            return await request_operation(
+                request,
+                saved_answer_voice.synthesize(session_id, body.run_id, message_id, body.revision),
+                cancelled_message="语音请求已取消，执行结果未知且可能已计费；请勿自动重新生成",
+            )
+        except SavedAnswerVoiceError as error:
+            raise HTTPException(error.status_code, str(error)) from error
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            raise HTTPException(
+                409, "语音请求因关闭或配置变化取消，执行结果未知且可能已计费；请勿自动重新生成"
+            ) from None
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:
@@ -1516,6 +1723,22 @@ def _create_app(
     async def create_workflow(body: WorkflowInput) -> dict[str, Any]:
         return runtime.workflows.create(
             body.name, body.steps, body.description, body.mode or config.settings.default_mode
+        )
+
+    @app.get("/api/workflow-runs/{identifier}/inspection")
+    async def inspect_workflow_run(
+        identifier: str,
+        node_id: str | None = None,
+        revision: str | None = None,
+        offset_bytes: Annotated[int, Query(ge=0)] = 0,
+        length_bytes: Annotated[int | None, Query(ge=1)] = None,
+    ) -> dict[str, Any]:
+        return WorkflowSources(runtime).inspect(
+            identifier,
+            node_id=node_id,
+            revision=revision,
+            offset_bytes=offset_bytes,
+            length_bytes=length_bytes,
         )
 
     @app.post("/api/workflows/{identifier}/run")

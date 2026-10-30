@@ -426,7 +426,8 @@ class HistoryFind:
             raise EvidenceError("history_find_authority_unavailable", "主助手当前执行身份无法核验")
         remaining = budget.raw - stats.json_bytes
         row = self.store.db.execute(
-            "SELECT seq,delivered_seq,typeof(payload) AS payload_type,"
+            "SELECT seq,CASE WHEN typeof(delivered_seq)='integer' "
+            "THEN delivered_seq END AS delivered_seq,typeof(payload) AS payload_type,"
             "length(CAST(payload AS BLOB)) AS size,"
             "CASE WHEN typeof(payload)='text' AND length(CAST(payload AS BLOB))<=? "
             "THEN CAST(payload AS BLOB) END AS payload FROM ingress "
@@ -466,13 +467,21 @@ class HistoryFind:
         # claim_inputs archives ingress in seq order. The run_id index includes
         # rowid/seq, so its first row is also this run's earliest delivered mapping.
         first = self.store.db.execute(
-            "SELECT session_id=? AS same_session,state='delivered' AS delivered,delivered_seq,"
+            "SELECT session_id=? AS same_session,state='delivered' AS delivered,"
+            "CASE WHEN typeof(delivered_seq)='integer' THEN delivered_seq END AS delivered_seq,"
+            "length(CAST(id AS BLOB)) AS id_bytes,"
             "CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND ? "
             "THEN CAST(id AS BLOB) END AS input_id FROM ingress "
             "WHERE run_id=? ORDER BY seq LIMIT 1",
-            (owner.root, budget.mapping_id, owner.run),
+            (owner.root, min(budget.mapping_id, max(0, budget.raw - stats.json_bytes)), owner.run),
         ).fetchone()
         _check(deadline)
+        if (
+            first is not None
+            and type(first["id_bytes"]) is int
+            and first["id_bytes"] > budget.raw - stats.json_bytes
+        ):
+            raise _RawLimit(oversized=first["id_bytes"] > budget.raw)
         if (
             first is None
             or first["same_session"] != 1

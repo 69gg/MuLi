@@ -163,11 +163,19 @@ class _Connection:
 
 
 @dataclass(frozen=True, slots=True)
+class MCPToolOrigin:
+    tool: Tool
+    server: str | None
+    remote_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class MCPCandidate:
     config: JsonObject
     connections: dict[str, _Connection]
     catalogs: dict[str, tuple[_RemoteTool, ...]]
     tools: tuple[Tool, ...]
+    tool_origins: tuple[MCPToolOrigin, ...]
     statuses: tuple[JsonObject, ...]
     created: tuple[_Connection, ...]
     limits: MCPLimits
@@ -357,6 +365,7 @@ class MCPManager:
         self._receive_failed_callback: Callable[[str, str], None] | None = None
         self.retirement_errors: list[JsonObject] = []
         self.tools: list[Tool] = []
+        self.tool_origins: tuple[MCPToolOrigin, ...] = ()
         self._resource_save_factory: ResourceSaveFactory | None = None
 
     def set_resource_save_factory(self, factory: ResourceSaveFactory) -> None:
@@ -453,6 +462,10 @@ class MCPManager:
         for secret in sorted(generation.secrets, key=len, reverse=True):
             value = value.replace(secret, "••••")
         return value
+
+    def catalog_redact_text(self, value: str) -> str:
+        """Use only the accepted generation's already known secrets."""
+        return self._redact(value, self._generation) if self._generation is not None else value
 
     def _sanitize(self, value: Any, generation: _Generation) -> Any:
         if isinstance(value, str):
@@ -629,8 +642,8 @@ class MCPManager:
 
     def _tools_for(
         self, connection: _Connection, catalog: tuple[_RemoteTool, ...], generation: _Generation
-    ) -> list[Tool]:
-        tools: list[Tool] = []
+    ) -> list[MCPToolOrigin]:
+        origins: list[MCPToolOrigin] = []
         for remote in catalog:
 
             async def handler(
@@ -642,16 +655,15 @@ class MCPManager:
                 return await self._call(_connection, _remote, arguments, generation)
 
             description = self._redact(remote.description, generation)
-            tools.append(
-                Tool(
-                    _name(connection.name, remote.name),
-                    description,
-                    deepcopy(remote.schema),
-                    handler,
-                    risk="external",
-                )
+            tool = Tool(
+                _name(connection.name, remote.name),
+                description,
+                deepcopy(remote.schema),
+                handler,
+                risk="external",
             )
-        return tools
+            origins.append(MCPToolOrigin(tool, connection.name, remote.name))
+        return origins
 
     async def prepare(
         self,
@@ -684,6 +696,7 @@ class MCPManager:
         created: list[_Connection] = []
         statuses: list[JsonObject] = []
         tools: list[Tool] = []
+        tool_origins: list[MCPToolOrigin] = []
         total_bytes = 0
         try:
             for name, raw in config.get("mcpServers", {}).items():
@@ -755,7 +768,9 @@ class MCPManager:
                     total_bytes += size
                     connections[name] = connection
                     catalogs[name] = catalog
-                    tools.extend(self._tools_for(connection, catalog, generation))
+                    origins = self._tools_for(connection, catalog, generation)
+                    tools.extend(origin.tool for origin in origins)
+                    tool_origins.extend(origins)
                     status.update(
                         status="connected",
                         tool_count=len(catalog),
@@ -794,13 +809,18 @@ class MCPManager:
                 raise MCPPrepareError("manager_closed")
             # These fixed host tools are not remote directory entries and do
             # not consume the configured remote max_tools allowance.
-            tools.extend(self._resource_tools(connections, generation, limits))
-            tools.extend(self._prompt_tools(connections, generation, limits))
+            interfaces = [
+                *self._resource_tools(connections, generation, limits),
+                *self._prompt_tools(connections, generation, limits),
+            ]
+            tools.extend(interfaces)
+            tool_origins.extend(MCPToolOrigin(tool, None, None) for tool in interfaces)
             return MCPCandidate(
                 config,
                 connections,
                 catalogs,
                 tuple(tools),
+                tuple(tool_origins),
                 tuple(statuses),
                 tuple(created),
                 limits,
@@ -845,6 +865,7 @@ class MCPManager:
         self.config, self._connections = candidate.config, candidate.connections
         self._status = {item["name"]: item for item in candidate.statuses}
         self.tools = list(candidate.tools)
+        self.tool_origins = candidate.tool_origins
         self._limits = candidate.limits
         self.receive_policy = candidate.receive_policy
         self.max_tools = candidate.limits.max_tools
@@ -1709,6 +1730,7 @@ class MCPManager:
             self._status[name]["status"] = "close_failed" if connection.close_failed else "closed"
         self._connections.clear()
         self.tools.clear()
+        self.tool_origins = ()
         if self._retiring:
             # A whole Runtime reconfiguration must retain this owner until every
             # connection is reclaimed, just as candidate publication already does.

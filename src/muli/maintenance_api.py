@@ -96,6 +96,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/auth/status",
         "/api/settings",
         "/api/settings/schema",
+        "/api/capabilities",
         "/api/conversation",
         "/api/sessions",
         "/api/session-records",
@@ -110,6 +111,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/memory/status",
         "/api/memory/watches",
         "/api/channels",
+        "/api/channels/deliveries",
         "/api/approvals",
         "/api/notifications",
         "/api/reminders",
@@ -117,6 +119,7 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         "/api/workflow-runs/active",
         "/api/workflow-schedules",
         "/api/commitments",
+        "/api/commitment-directory",
         "/api/memories",
         "/api/memories/graph",
         "/api/uploads",
@@ -125,6 +128,15 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
     # These route families only read local Store/evidence/files. Capture, voice,
     # semantic queries, media/service probes and future APIs remain closed.
     parts = path.split("/")
+    if len(parts) == 5 and parts[2:4] == ["capabilities", "tools"] and parts[4]:
+        return True
+    if (
+        len(parts) == 6
+        and parts[2:4] == ["channels", "deliveries"]
+        and parts[4]
+        and parts[5] == "content"
+    ):
+        return True
     if len(parts) >= 4 and parts[2] == "sessions":
         return (
             len(parts) == 4
@@ -133,6 +145,8 @@ def passive_request_allowed(method: str, path: str, main_session: str | None) ->
         )
     if len(parts) >= 4 and parts[2] == "memories":
         return len(parts) == 4 or (len(parts) == 5 and parts[4] in {"source", "revisions"})
+    if len(parts) == 5 and parts[2] == "workflow-runs":
+        return bool(parts[3]) and parts[4] == "inspection"
     return (len(parts) == 4 and parts[2] == "commitments") or (
         len(parts) == 5 and parts[2] == "uploads" and parts[4] in {"download", "content"}
     )

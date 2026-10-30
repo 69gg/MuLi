@@ -31,6 +31,7 @@ from muli.failure_diagnostics import capture_failure
 from muli.format_admission import CURRENT_FORMAT_STATE
 from muli.history_evidence import HistoryEvidence
 from muli.history_find import HistoryFind
+from muli.main_recovery_evidence import MainRecoveryEvidence
 from muli.maintenance import BootPermit, Maintenance, MaintenanceError
 from muli.managed_boot import ManagedBootPermit
 from muli.managed_transaction import TransactionRecordV2
@@ -63,6 +64,7 @@ from muli.owner_text import OwnerTextKind, owner_text_marker
 from muli.permissions import ApprovalNotice, ApprovalSuperseded, Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
 from muli.process import run_process
+from muli.project_inbox import WEB_PROJECT_ROUTING, ProjectInboxBatch, project_batch_current
 from muli.providers import (
     ImageInput,
     Message,
@@ -97,6 +99,7 @@ from muli.tools.files import Files
 from muli.tools.mcp import MCPManager
 from muli.tools.web import Web
 from muli.topic_reminders import TopicReminders
+from muli.workflow_sources import WorkflowSources
 
 if TYPE_CHECKING:
     from muli.platforms.linux_bootstrap import BootSession
@@ -125,6 +128,7 @@ class PreparedRequest:
     memory_watch_chars: int = 0
     tool_batch_seq: int | None = None
     shell_continuation: ShellContinuation | None = None
+    project_inbox: ProjectInboxBatch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +360,49 @@ class Runtime:
     def request_context(self, session_id: str) -> PreparedRequest | None:
         request = self._request_context.get()
         return request if request is not None and request.session_id == session_id else None
+
+    def _owner_round_input(self, request: PreparedRequest, run_id: str) -> dict[str, Any] | None:
+        """Share exact owner-round admission between schema filtering and the handler."""
+        caller, input_id = request.session_id, request.reply_origin.input_id
+        if (
+            caller != self.store.existing_main_session_id()
+            or input_id is None
+            or request.consult is not None
+            or request.attention_routing is not None
+            or request.memory_failure is not None
+            or request.memory_watch is not None
+            or request.project_inbox is not None
+            or request.shell_continuation is not None
+            or request.channel_ownership is not None
+        ):
+            return None
+        budget = self.config.settings.limits.max_context_chars * 4
+        try:
+            session = self.store.bounded_object(
+                "session", caller, max_bytes=budget, strict_json=True
+            )
+            run = self.store.bounded_object("run", run_id, max_bytes=budget, strict_json=True)
+            if (
+                session is None
+                or session.get("kind") != "main"
+                or session.get("principal") != "owner"
+                or session.get("workflow_run_id")
+                or "scheduled_workflow" in session
+                or run is None
+                or run.get("session_id") != caller
+                or run.get("role") != "main"
+                or run.get("status") != "running"
+            ):
+                return None
+            archive = HistoryEvidence(self.store)._reply_owner_input(
+                caller, input_id, run_id=run_id, max_bytes=budget
+            )
+            if archive.get("reply_origin") != request.reply_origin.dump():
+                return None
+            return archive
+        except (EvidenceError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            # Optional write capability must disappear on an unprovable round.
+            return None
 
     def current_reply_origin(self) -> ReplyOrigin:
         session_id = self.tool_session_id
@@ -663,6 +710,11 @@ class Runtime:
         claimed_inputs: Sequence[dict[str, Any]] = (),
     ) -> PreparedRequest:
         self.system_events.clear_request(session_id)
+        project_inbox = (
+            previous.project_inbox
+            if previous is not None and previous.project_inbox is not None
+            else self._claimed_project(claimed_inputs)
+        )
         execution: TaskSnapshot | None = None
         selected: TaskSnapshot | None = None
         scheduled, frozen = self.scheduled_workflows.request_snapshot(session_id)
@@ -720,6 +772,9 @@ class Runtime:
                     and trigger.get("attention_routing") is not None
                     else None
                 )
+        if project_inbox is not None:
+            reply_origin = WEB_PROJECT_ROUTING.origin
+            attention_routing = WEB_PROJECT_ROUTING
         prepared = PreparedRequest(
             session_id,
             [],
@@ -732,6 +787,7 @@ class Runtime:
             memory_watch=memory_watch,
             memory_watch_guard=memory_watch_guard,
             memory_watch_chars=memory_watch_chars,
+            project_inbox=project_inbox,
         )
         self.system_events.bind_request(session_id, prepared.reply_origin)
         token = self._request_context.set(prepared)
@@ -765,6 +821,35 @@ class Runtime:
         finally:
             self._request_context.reset(token)
 
+    def _claimed_project(
+        self, claimed_inputs: Sequence[dict[str, Any]]
+    ) -> ProjectInboxBatch | None:
+        """Establish one project segment only from this run's actual input batch."""
+        if not any("attention_project" in message for message in claimed_inputs):
+            return None
+        project: ProjectInboxBatch | None = None
+        for message in claimed_inputs:
+            candidate = ProjectInboxBatch.load(
+                message.get("attention_project"),
+                max_bytes=self.attention_budget * 4,
+                max_records=self.config.settings.attention.batch_size,
+            )
+            if (
+                candidate is None
+                or message.get("source") != "system:attention"
+                or message.get("principal") != "system:attention"
+                or message.get("attention_routing") != WEB_PROJECT_ROUTING.dump()
+                or type(message["attention_routing"]["v"]) is not int
+                or message.get("route") is not None
+                or message.get("reply_origin") != WEB_PROJECT_ROUTING.origin.dump()
+                or "attention_memory_failure" in message
+                or "attention_memory_watch" in message
+                or (project is not None and candidate != project)
+            ):
+                raise ValueError("项目资料复核输入的宿主证明或 Web 本地来源无效")
+            project = candidate
+        return project
+
     def _guard_request(self, request: PreparedRequest, risk: str | None = None) -> None:
         if request.shell_continuation is not None and not self.store.pending_inputs(
             request.session_id
@@ -789,7 +874,15 @@ class Runtime:
             )
         ):
             raise MemoryWatchMatchExpired("长期问题回访依据已失效")
-        risk = risk or ("read" if request.consult is not None else "write")
+        if request.project_inbox is not None and (
+            risk not in {None, "read"}
+            or request.attention_routing != WEB_PROJECT_ROUTING
+            or request.reply_origin != WEB_PROJECT_ROUTING.origin
+        ):
+            raise PermissionError("项目资料复核只能在 Web 本地读取，不能操作或外发")
+        risk = risk or (
+            "read" if request.consult is not None or request.project_inbox is not None else "write"
+        )
         if request.consult is not None:
             if not isinstance(request.consult, ConsultRequest) or risk != "read":
                 raise PermissionError("咨询控制轮只能读取，不能执行操作或扩大授权")
@@ -1353,6 +1446,7 @@ class Runtime:
         routing: FrozenRouting | None = None,
         memory_failure: MemorySourceFailure | None = None,
         memory_watch: MemoryWatchMatch | None = None,
+        project: ProjectInboxBatch | None = None,
     ) -> dict[str, Any] | None:
         """Admit idle-only facts atomically; execution and report handoff defer admission."""
         async with self.configuration_lock:
@@ -1370,6 +1464,29 @@ class Runtime:
                 or not self._memory_watch_allowed(memory_watch, content_chars=len(content))
             ):
                 raise MemoryWatchMatchExpired("长期问题回访依据已失效")
+            if project is not None and (
+                not isinstance(project, ProjectInboxBatch)
+                or ProjectInboxBatch.load(
+                    project.dump(),
+                    max_bytes=self.attention_budget * 4,
+                    max_records=self.config.settings.attention.batch_size,
+                )
+                != project
+                or routing != WEB_PROJECT_ROUTING
+                or memory_failure is not None
+                or memory_watch is not None
+                or not project_batch_current(
+                    self.store,
+                    project,
+                    workspace_roots=self.config.settings.workspace_roots,
+                    max_task_bytes=(
+                        self.config.settings.limits.max_context_chars
+                        + self.config.settings.limits.max_output_chars
+                    )
+                    * 4,
+                )
+            ):
+                raise ValueError("项目资料复核需要准确有界证明与 Web 本地选路")
             session = self.main_session()
             if self.attention_busy or not self.maintenance.admission.allowed:
                 return None
@@ -1386,6 +1503,7 @@ class Runtime:
                 attention_routing=routing,
                 attention_memory_failure=memory_failure,
                 attention_memory_watch=memory_watch,
+                attention_project=project,
             )
             if inserted:
                 self._invalidate_voice_reply()
@@ -2705,6 +2823,22 @@ class Runtime:
                 not persona.prompt
                 and session.get("principal") == "owner"
                 and session_id == self.store.existing_main_session_id()
+                and "conversation_read" in self.tools
+                and "conversation_read" not in self.config.settings.disabled_tools
+            ):
+                prompt += (
+                    "\n主人要核查主助手自己上次的中断时，用 conversation_read 的 "
+                    "section=main_recovery 只读本会话宿主已恢复且仍中断的历史运行；"
+                    "宿主恢复记录只证明当时保存的关联与恢复时间，不证明中断时间。"
+                    "first_input 仅为 start_only 的有限输入起点，不等于完整请求或全部工具现场；"
+                    "available 时再用 read_arguments 核原文，缺失或变化的原文与未知结果须保留未知。"
+                    "按 has_more/next_cursor 续查，omitted 或空候选页不表示查全；"
+                    "中断历史不等于待办，也不恢复旧授权或重放工具。"
+                )
+            if (
+                not persona.prompt
+                and session.get("principal") == "owner"
+                and session_id == self.store.existing_main_session_id()
                 and self.config.settings.memory.enabled
                 and "memory_correct" in self.tools
                 and "memory_correct" in self._coordinator_tools
@@ -2969,7 +3103,7 @@ class Runtime:
             claimed = await self._claim_inputs(session_id, run_id, discard_stale=False)
             if discarded and not claimed:
                 return _ExecutionResult("")
-            prepared = await self._prepare_request(session_id)
+            prepared = await self._prepare_request(session_id, claimed_inputs=claimed)
             prepared = replace(prepared, shell_continuation=shell_continuation)
         else:
             self.team.consult.guard_control(consult, session_id)
@@ -3017,6 +3151,8 @@ class Runtime:
         async with self.client_factory(self.model_config(role)) as client:
             round_index = 0
             while round_index <= self.config.settings.limits.max_tool_steps:
+                if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
+                    return await self._interrupt_project(prepared)
                 if shell_continuation is not None and self.store.pending_inputs(session_id):
                     self.team.cancel_shell_continuation(
                         session_id, "独立新输入优先，旧自动续办已撤销"
@@ -3039,6 +3175,10 @@ class Runtime:
                 )
                 try:
                     async with self.capacity:
+                        if prepared.project_inbox is not None and self.store.pending_inputs(
+                            session_id
+                        ):
+                            return await self._interrupt_project(prepared)
                         if shell_continuation is not None and self.store.pending_inputs(session_id):
                             # Release capacity before claiming the independent
                             # input at the next safe boundary; no model was called.
@@ -3132,8 +3272,14 @@ class Runtime:
                 await self.bus.notify()
                 if not turn.tool_calls:
                     self._guard_request(prepared)
+                    if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
+                        return await self._interrupt_project(prepared)
                     claimed = []
-                    if consult is None and round_index < self.config.settings.limits.max_tool_steps:
+                    if (
+                        consult is None
+                        and prepared.project_inbox is None
+                        and round_index < self.config.settings.limits.max_tool_steps
+                    ):
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
                     if claimed:
@@ -3163,7 +3309,13 @@ class Runtime:
                     if paused is None and not returned:
                         try:
                             tool = round_tools.get(call.name)
-                            risk = tool.risk if tool else "read" if consult is not None else "write"
+                            risk = (
+                                tool.risk
+                                if tool is not None
+                                else "read"
+                                if consult is not None or prepared.project_inbox is not None
+                                else "write"
+                            )
                             self._guard_request(prepared, risk)
                         except TaskPaused as exc:
                             paused = exc
@@ -3292,8 +3444,14 @@ class Runtime:
                     await self.bus.emit("message.completed", {"message": final}, session_id)
                     return _ExecutionResult(final["content"], reply_origin=prepared.reply_origin)
                 self._guard_request(prepared)
+                if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
+                    return await self._interrupt_project(prepared)
                 claimed = []
-                if consult is None and round_index < self.config.settings.limits.max_tool_steps:
+                if (
+                    consult is None
+                    and prepared.project_inbox is None
+                    and round_index < self.config.settings.limits.max_tool_steps
+                ):
                     self.system_events.clear_request(session_id)
                     claimed = await self._claim_inputs(session_id, run_id)
                 prepared = (
@@ -3310,6 +3468,20 @@ class Runtime:
                         prepared = replace(prepared, shell_continuation=shell_continuation)
                 round_index += 1
             raise ValueError("模型调用达到步骤上限")
+
+    async def _interrupt_project(self, prepared: PreparedRequest) -> _ExecutionResult:
+        """Close this local segment without consuming the independent next input."""
+        assert prepared.project_inbox is not None
+        final = self.store.complete_message(
+            prepared.session_id,
+            "项目资料复核被新输入中断，尚未完成。",
+            interrupted=True,
+            delivery_routes=[],
+            reply_origin=WEB_PROJECT_ROUTING.origin.dump(),
+            attention_routing=WEB_PROJECT_ROUTING.dump(),
+        )
+        await self.bus.notify()
+        return _ExecutionResult(final["content"], final["id"], WEB_PROJECT_ROUTING.origin)
 
     def _round_tools(
         self,
@@ -3350,6 +3522,14 @@ class Runtime:
         )
         if not history_input or history_input[0] != "owner":
             tools.pop("history_find", None)
+        if "memory_import_reply" in tools and (
+            consult is not None
+            or workflow_step
+            or role != "main"
+            or prepared is None
+            or self._owner_round_input(prepared, run_id) is None
+        ):
+            tools.pop("memory_import_reply", None)
         if consult is not None:
             self.team.consult.guard_control(consult, session_id)
             return {
@@ -3363,8 +3543,18 @@ class Runtime:
                 for name, tool in tools.items()
                 if tool.risk == "read" or name in self._coordinator_tools
             }
+        source_round = (
+            not workflow_step
+            and role == "main"
+            and prepared is not None
+            and self._workflow_source_round(prepared, run_id)
+        )
         if not workflow_step and role != "reviewer":
-            tools["workflow_create"] = self._workflow_tool(mode, session_id, run_id)
+            tools["workflow_create"] = self._workflow_tool(
+                mode, session_id, run_id, allow_source=source_round
+            )
+        if source_round:
+            tools["workflow_inspect"] = self._workflow_inspect_tool(session_id, run_id)
         if role == "reviewer":
             tools = {name: tool for name, tool in tools.items() if tool.risk == "read"}
         elif not workflow_step:
@@ -3411,6 +3601,7 @@ class Runtime:
             for name, tool in tools.items()
             if name not in disabled
             and (not attention or tool.risk == "read" or name == "channel_send")
+            and (prepared is None or prepared.project_inbox is None or tool.risk == "read")
         }
 
     @staticmethod
@@ -3743,9 +3934,62 @@ class Runtime:
         async def recall(args: dict[str, Any]) -> Any:
             return self.memory.search(str(args["query"]), 8)
 
+        def owner_history_call(
+            name: str, handler: Callable[[dict[str, Any]], Awaitable[Any]]
+        ) -> tuple[str, str, str]:
+            caller = self.tool_session_id
+            execution = self._tool_execution.get()
+            request = self.request_context(caller) if caller is not None else None
+            active_tool = self._active_tool.get()
+            task = asyncio.current_task()
+            if (
+                self._closing
+                or caller is None
+                or caller != self.store.existing_main_session_id()
+                or execution is None
+                or execution != (caller, self.run_ids.get(caller))
+                or request is None
+                or request.consult is not None
+                or request.reply_origin.input_id is None
+                or task is None
+                or task.cancelling()
+                or self.tasks.get(caller) is not task
+                or caller in self._stopping
+                or active_tool is None
+                or active_tool.name != name
+                or active_tool.handler is not handler
+                or name in self.config.settings.disabled_tools
+            ):
+                raise PermissionError("跨会话查找仅供真实主人当前请求中的主助手直接调用")
+            self.maintenance.admission.require()
+            self._guard_request(request, "read")
+            if self.store.pending_inputs(caller):
+                raise PermissionError("收到新输入，请先重新规划历史查找")
+            return caller, execution[1], request.reply_origin.input_id
+
         async def read_conversation(args: dict[str, Any]) -> Any:
             evidence = HistoryEvidence(self.store)
             limits = self.config.settings.limits
+            if args.get("section") == "main_recovery":
+                if set(args) - {"section", "session_id", "cursor", "limit"}:
+                    raise EvidenceError("invalid_arguments", "恢复目录不能混用消息定位或正文参数")
+                owner, owner_run, owner_input = owner_history_call(
+                    "conversation_read", read_conversation
+                )
+                if args["session_id"] != owner:
+                    raise EvidenceError("invalid_arguments", "恢复目录只能读取当前主会话")
+                return MainRecoveryEvidence(self.store).read(
+                    owner,
+                    run_id=owner_run,
+                    input_id=owner_input,
+                    runtime_id=self._history_find_runtime_id,
+                    cursor=args.get("cursor"),
+                    limit=min(args.get("limit", 20), limits.max_search_results),
+                    max_output_chars=limits.max_output_chars,
+                    max_results=limits.max_search_results,
+                    max_context_chars=limits.max_context_chars,
+                    deadline=monotonic() + limits.max_search_seconds,
+                )
             if args.get("section") == "continuations":
                 if set(args) - {"section", "session_id", "cursor", "limit"}:
                     raise EvidenceError("invalid_arguments", "延续目录不能混用消息定位或正文参数")
@@ -3770,7 +4014,7 @@ class Runtime:
                     max_output_chars=limits.max_output_chars,
                 )
             if "section" in args or "cursor" in args:
-                raise EvidenceError("invalid_arguments", "section/cursor 仅用于延续目录")
+                raise EvidenceError("invalid_arguments", "section/cursor 仅用于特殊证据目录")
             if "message_id" in args or "seq" in args:
                 if "after" in args or "limit" in args:
                     raise EvidenceError(
@@ -3808,40 +4052,13 @@ class Runtime:
             )
 
         async def find_history(args: dict[str, Any]) -> Any:
-            caller = self.tool_session_id
-            execution = self._tool_execution.get()
-            request = self.request_context(caller) if caller is not None else None
-            active_tool = self._active_tool.get()
-            task = asyncio.current_task()
-            if (
-                self._closing
-                or caller is None
-                or caller != self.store.existing_main_session_id()
-                or execution is None
-                or execution != (caller, self.run_ids.get(caller))
-                or request is None
-                or request.consult is not None
-                or request.reply_origin.input_id is None
-                or task is None
-                or task.cancelling()
-                or self.tasks.get(caller) is not task
-                or caller in self._stopping
-                or active_tool is None
-                or active_tool.name != "history_find"
-                or active_tool.handler is not find_history
-                or "history_find" in self.config.settings.disabled_tools
-            ):
-                raise PermissionError("跨会话查找仅供真实主人当前请求中的主助手直接调用")
-            self.maintenance.admission.require()
-            self._guard_request(request, "read")
-            if self.store.pending_inputs(caller):
-                raise PermissionError("收到新输入，请先重新规划历史查找")
+            caller, run_id, input_id = owner_history_call("history_find", find_history)
             limits = self.config.settings.limits
             return HistoryFind(self.store).find_owned(
                 caller,
                 args["query"],
-                run_id=execution[1],
-                input_id=request.reply_origin.input_id,
+                run_id=run_id,
+                input_id=input_id,
                 runtime_id=self._history_find_runtime_id,
                 cursor=args.get("cursor"),
                 limit=min(args.get("limit", 20), limits.max_search_results),
@@ -4101,11 +4318,12 @@ class Runtime:
                 "conversation_read",
                 "核查已存会话证据。after/limit 读取消息目录；message_id 或 seq 读取单条 content。"
                 "续读使用 revision/next_offset_bytes；不恢复入库前丢失的正文，不读取附件或图片。"
-                "section=continuations 仅主助手只读列出直属未完队友，不恢复执行",
+                "section=continuations 仅主助手只读列出直属未完队友；main_recovery 仅真实主人"
+                "当前请求中的主助手发现本会话已恢复的中断主运行与有限原输入起点，不恢复执行",
                 parameters(
                     {
                         "session_id": string(),
-                        "section": {"type": "string", "enum": ["continuations"]},
+                        "section": {"type": "string", "enum": ["continuations", "main_recovery"]},
                         "cursor": string(),
                         "after": {"type": "integer", "minimum": 0},
                         "limit": {"type": "integer", "minimum": 1},
@@ -4417,8 +4635,132 @@ class Runtime:
             ),
         ]
 
-    def _workflow_tool(self, mode: Mode, session_id: str, run_id: str) -> Tool:
+    def _workflow_source_round(self, request: PreparedRequest, run_id: str) -> bool:
+        if (
+            request.execution_scope is not None
+            or request.selected_replan is not None
+            or self._owner_round_input(request, run_id) is None
+        ):
+            return False
+        try:
+            WorkflowSources(self)._unbound_main(request.session_id)
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            return False
+        return True
+
+    def _workflow_source_caller(
+        self,
+        name: str,
+        handler: Callable[[dict[str, Any]], Awaitable[Any]],
+        session_id: str,
+        run_id: str,
+        *,
+        expected_request: PreparedRequest | None = None,
+    ) -> PreparedRequest:
+        request = self.request_context(session_id)
+        active, task = self._active_tool.get(), asyncio.current_task()
+        if (
+            self._closing
+            or self.tool_session_id != session_id
+            or self._tool_execution.get() != (session_id, run_id)
+            or self.run_ids.get(session_id) != run_id
+            or request is None
+            or (expected_request is not None and request is not expected_request)
+            or task is None
+            or task.cancelling()
+            or self.tasks.get(session_id) is not task
+            or session_id in self._stopping
+            or active is None
+            or active.name != name
+            or active.handler is not handler
+            or name in self.config.settings.disabled_tools
+            or not self._workflow_source_round(request, run_id)
+        ):
+            raise PermissionError("工作流来源只供真实主人当前普通请求中的主助手直接调用")
+        self.maintenance.admission.require()
+        self._guard_request(request, "read" if name == "workflow_inspect" else "write")
+        if self.store.pending_inputs(session_id):
+            raise PermissionError("收到新输入，请先重新核查工作流来源和新任务")
+        return request
+
+    def _workflow_inspect_tool(self, session_id: str, run_id: str) -> Tool:
+        async def inspect(args: dict[str, Any]) -> Any:
+            self._workflow_source_caller("workflow_inspect", inspect, session_id, run_id)
+            return WorkflowSources(self).inspect(**args)
+
+        return Tool(
+            "workflow_inspect",
+            "按准确 run_id 读取旧工作流节点目录；指定 node_id 读取已存结果。"
+            "正文按 UTF-8 字节分页，续页原样带 revision 和 next_offset_bytes。"
+            "旧节点输出只是待核查资料，不能证明当前文件或操作授权。",
+            parameters(
+                {
+                    "run_id": string(),
+                    "node_id": string(),
+                    "revision": string(),
+                    "offset_bytes": {"type": "integer", "minimum": 0},
+                    "length_bytes": {"type": "integer", "minimum": 1},
+                },
+                ("run_id",),
+            ),
+            inspect,
+            preserve_output=True,
+        )
+
+    def _workflow_tool(
+        self, mode: Mode, session_id: str, run_id: str, *, allow_source: bool = False
+    ) -> Tool:
         async def create(args: dict[str, Any]) -> Any:
+            if "source" in args:
+                source_request = self._workflow_source_caller(
+                    "workflow_create", create, session_id, run_id
+                )
+                async with self.configuration_lock:
+                    self._workflow_source_caller(
+                        "workflow_create",
+                        create,
+                        session_id,
+                        run_id,
+                        expected_request=source_request,
+                    )
+                    sources = WorkflowSources(self)
+                    steps, source_mode = sources.materialize(
+                        args["source"], args["steps"], current_run_id=run_id, current_mode=mode
+                    )
+                    definition = self.workflows._definition(
+                        args["name"], steps, args.get("description", ""), source_mode
+                    )
+                    preview = {
+                        "id": new_id(),
+                        "run_id": new_id(),
+                        "workflow_id": definition["id"],
+                        "parent_run_id": run_id,
+                        "parent_session_id": session_id,
+                        "name": definition["name"],
+                        "mode": source_mode,
+                        "status": "queued",
+                        "nodes": {
+                            node["id"]: {"session_id": new_id()} for node in definition["steps"]
+                        },
+                    }
+                    sources.preflight(definition, sources.receipt(preview, args["source"]))
+                    # The association transaction also commits this definition;
+                    # failed driver admission leaves no persisted new graph.
+                    with self.store.db:
+                        self.store._put("workflow", definition)
+                        run = self.workflows._admit_start(
+                            definition["id"],
+                            parent_run_id=run_id,
+                            parent_session_id=session_id,
+                            reply_origin=source_request.reply_origin,
+                        )
+                    receipt = sources.receipt(run, args["source"])
+                try:
+                    await self.workflows._publish(run)
+                except BaseException:
+                    await self.workflows.cancel(run["id"])
+                    raise
+                return receipt
             request = self.request_context(session_id)
             reply_origin = request.reply_origin if request is not None else ReplyOrigin()
             workflow = self.workflows.create(
@@ -4445,22 +4787,43 @@ class Runtime:
             },
             ("id", "title", "prompt", "role", "depends_on"),
         )
+        properties: dict[str, Any] = {
+            "name": string(),
+            "description": string(),
+            "steps": {
+                "type": "array",
+                "items": step,
+                "minItems": 1,
+                "maxItems": self.config.settings.limits.max_workflow_steps,
+            },
+        }
+        if allow_source:
+            identifiers = {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": self.config.settings.limits.max_workflow_steps,
+                "uniqueItems": True,
+            }
+            properties["source"] = parameters(
+                {
+                    "run_id": string(),
+                    "revision": string(),
+                    "node_ids": identifiers,
+                    "targets": identifiers,
+                },
+                ("run_id", "revision", "node_ids", "targets"),
+            )
         return Tool(
             "workflow_create",
-            "创建并启动多agent依赖工作流。复杂任务应含独立reviewer节点；节点不可递归开队伍",
-            parameters(
-                {
-                    "name": string(),
-                    "description": string(),
-                    "steps": {
-                        "type": "array",
-                        "items": step,
-                        "minItems": 1,
-                        "maxItems": self.config.settings.limits.max_workflow_steps,
-                    },
-                },
-                ("name", "steps"),
+            "创建并启动多agent依赖工作流。复杂任务应含独立reviewer节点；节点不可递归开队伍"
+            + (
+                "。可选 source 仅把另一已收口普通主工作流的完整成功旧节点资料注入明确 targets；"
+                "先 workflow_inspect 取得准确 revision，仍须显式编写本次新 steps，不重试旧节点"
+                if allow_source
+                else ""
             ),
+            parameters(properties, ("name", "steps")),
             create,
             "write",
         )

@@ -233,3 +233,66 @@ test("snapshot and duplicate SSE events cannot append text or tool blocks twice"
   assert.equal(applyEvent(state, started) === state, true);
   assert.equal(conversationItems(state).filter((item) => item.kind === "tool").length, 1);
 });
+
+test("exact completed reply candidates remain bound to their saved revision across later main runs", () => {
+  const event = events();
+  const first = { id: "saved-first", session_id: "main", role: "assistant", content: "第一条完整最终答复。", evidence_revision: "first-revision" };
+  const second = { id: "saved-second", session_id: "main", role: "assistant", content: "第二条完整最终答复。", evidence_revision: "second-revision" };
+  const entries = [
+    event("run.started", { run_id: "first-run" }), event("message.completed", { message: first }),
+    event("run.completed", { run_id: "first-run", result_message_id: first.id }),
+    event("run.started", { run_id: "second-run" }), event("message.completed", { message: second }),
+    event("run.completed", { run_id: "second-run", result_message_id: second.id }),
+    event("run.started", { run_id: "third-run" }),
+  ];
+  const state = replay(entries);
+  assert.deepEqual(state.replyCandidates, [
+    { run_id: "first-run", message_id: first.id, revision: first.evidence_revision, completed: true },
+    { run_id: "second-run", message_id: second.id, revision: second.evidence_revision, completed: true },
+  ]);
+  assert.equal(state.runId, "third-run"); assert.equal(state.status, "running");
+  const restored = hydrateSession({ session: { id: "main" }, messages: [first, second], events: entries, live: { session_id: "main", status: "running", run_id: "third-run", pending_approvals: [] } });
+  assert.deepEqual(restored.replyCandidates, state.replyCandidates);
+});
+
+test("reply completion candidates never guess a last assistant when the result identity or revision is absent", () => {
+  const final = { id: "saved-final", role: "assistant", content: "完整正文。", evidence_revision: "original-revision" };
+  for (const completion of [{ run_id: "run" }, { run_id: "different-run", result_message_id: final.id }, { run_id: "run", result_message_id: "different-message" }]) {
+    const event = events();
+    const state = replay([event("run.started", { run_id: "run" }), event("message.completed", { message: final }), event("run.completed", completion)]);
+    assert.equal(state.replyCandidates.some((candidate) => candidate.completed), false);
+  }
+  const event = events();
+  const missingRevision = replay([event("run.started", { run_id: "run" }), event("message.completed", { message: { ...final, evidence_revision: undefined } }), event("run.completed", { run_id: "run", result_message_id: final.id })]);
+  assert.deepEqual(missingRevision.replyCandidates, []);
+  const absentEvents = hydrateSession({ messages: [final], events: [], session: { id: "main", status: "idle" } });
+  assert.deepEqual(absentEvents.replyCandidates, []);
+});
+
+test("hydration cannot bind an edited canonical revision to the original run's historical completion", () => {
+  const event = events();
+  const original = { id: "saved-final", session_id: "main", role: "assistant", content: "原最终正文。", evidence_revision: "original-revision" };
+  const edited = { ...original, content: "编辑后的正文。", evidence_revision: "edited-revision" };
+  const entries = [event("run.started", { run_id: "run" }), event("message.completed", { message: original }), event("run.completed", { run_id: "run", result_message_id: original.id })];
+  const restored = hydrateSession({ session: { id: "main", status: "idle" }, messages: [edited], events: entries });
+  assert.deepEqual(restored.replyCandidates, []);
+  assert.equal(conversationItems(restored).find((item) => item.message?.id === original.id).message.evidence_revision, edited.evidence_revision);
+  assert.equal(conversationItems(restored).find((item) => item.message?.id === original.id).message.content, edited.content);
+});
+
+test("editing and replacing canonical messages drops old proof and replay cannot revive it", () => {
+  const event = events();
+  const original = { id: "saved-final", role: "assistant", content: "原最终正文。", evidence_revision: "original-revision" };
+  const started = event("run.started", { run_id: "run" }), accepted = event("message.completed", { message: original });
+  const completed = event("run.completed", { run_id: "run", result_message_id: original.id });
+  let state = replay([started, accepted, completed]);
+  assert.equal(state.replyCandidates[0].completed, true);
+  state = applyEvent(state, event("message.completed", { message: { ...original, evidence_revision: "edited-revision", content: "新版正文。" } }));
+  assert.equal(state.replyCandidates.some((candidate) => candidate.completed), false);
+  state = applyEvent(state, event("message.completed", { message: original }));
+  state = applyEvent(state, completed);
+  assert.equal(state.replyCandidates.some((candidate) => candidate.completed), false);
+  state = { ...state, messages: [] };
+  state = applyEvent(state, event("reasoning.delta", { content: "其它事件也会剪除已经离开窗口的候选。" }));
+  assert.deepEqual(state.replyCandidates, []);
+});

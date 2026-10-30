@@ -6,13 +6,14 @@
 
 - [工作台](frontend.md)：聊天、审批、附件、主题与设置。
 - [模型](providers.md)：连接服务、推理参数、视觉和检索模型。
-- [个人记忆](memory.md)：自动整理、检索、原文核对与遗忘。
+- [个人记忆](memory.md)：自动整理、检索、收藏沐璃的完整答复、核对原文与遗忘。
 - [来源目录](memory-sources.md)：浏览已保存资料、定位整理失败的来源。
 - [资料变化](source-comparison.md)：核对两份已收藏正文的增删改动。
-- [多 agent 协作](workflows.md)：分工、工作流和查看进度。
+- [多 agent 协作](workflows.md)：分工、工作流、查看进度与带原资料继续。
+- [任务说明](task-briefs.md)：保存完整要求，在网页查找旧任务并带回对话。
 - [任务控制](task-control.md)：暂停任务、补充要求与继续。
 - [任务核查](task-inspection.md)：查阅要求、成果和已有依据。
-- [未完成的队友工作](continuations.md)：重新打开后查找直接队友的当前记录。
+- [上次工作记录](continuations.md)：重新打开后核查队友与主助手保留的中断记录。
 - [长对话](context.md)：自动压缩与历史查阅。
 - [找回历史原文](history-find.md)：按记得的文字定位旧消息或工具结果。
 
@@ -40,7 +41,7 @@
 - [提醒与主动事项](attention.md)：提醒、任务复盘和定时委托。
 - [话题提醒](topic-reminders.md)：下次提到指定文字时，在网页提醒一次。
 - [桌面通知](notifications.md)：在桌面接收提示。
-- [资料收件目录](file-inbox.md)：接收指定目录中的新资料。
+- [资料收件目录](file-inbox.md)：接收新资料，或关联任务主动复核。
 
 ## 扩展与维护
 

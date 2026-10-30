@@ -14,7 +14,9 @@ from test_runtime import FakeClient, make_runtime
 from muli.attention import AttentionInbox
 from muli.config import AttentionSettings, ConfigFile, Settings
 from muli.memory_source_failure import MemorySourceFailure
+from muli.memory_watches import MemoryWatchMatch
 from muli.proactive import FrozenRouting
+from muli.project_inbox import ProjectInboxBatch
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
 from muli.runtime import Runtime
 from muli.store import now
@@ -490,6 +492,8 @@ async def test_owner_admitted_while_attention_waits_for_config_lock_defers_atomi
         admission_guard: Callable[[], None] | None = None,
         routing: FrozenRouting | None = None,
         memory_failure: MemorySourceFailure | None = None,
+        memory_watch: MemoryWatchMatch | None = None,
+        project: ProjectInboxBatch | None = None,
     ) -> dict[str, Any] | None:
         attention_waiting.set()
         result = await original(
@@ -499,6 +503,8 @@ async def test_owner_admitted_while_attention_waits_for_config_lock_defers_atomi
             admission_guard=admission_guard,
             routing=routing,
             memory_failure=memory_failure,
+            memory_watch=memory_watch,
+            project=project,
         )
         results.append(result)
         return result

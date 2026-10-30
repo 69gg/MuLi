@@ -1,7 +1,67 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createSSEParser } from "../../web/api.mjs";
 import { createPreviewState, createPreviewBackend, installPreview, installPreviewNavigation } from "../../web/preview.mjs";
+
+test("preview attachment collection prepares and registers complete local text without sending chat", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const file = backend.state.uploads[0], raw = await backend.state.files.get(file.id).text();
+  const before = structuredClone({ sources: backend.state.memorySources, messages: backend.state.messages, runs: backend.state.runs, events: backend.state.events });
+  const prepared = await json(backend, `/uploads/${file.id}/memory-preview`);
+  assert.equal(prepared.status, 200); const page = prepared.body;
+  assert.equal(page.attachment_id, file.id); assert.equal(page.filename, file.name); assert.equal(page.read_only, true);
+  assert.equal(page.format, "text"); assert.equal(page.scope, "utf8_text"); assert.equal(page.document_revision, null);
+  assert.equal(page.source_revision, createHash("sha256").update(raw).digest("hex"));
+  assert.match(page.registered_revision, /^[a-f0-9]{64}$/u); assert.notEqual(page.registered_revision, page.source_revision);
+  assert.equal(page.source_id, `attachment:${file.id}`); assert.equal(page.source, `${page.source_id}:${page.source_revision}`);
+  assert.equal(page.session_id, ""); assert.equal(page.principal, "external:attachment"); assert.equal(page.role, "tool"); assert.equal(page.trusted_owner, false);
+  assert.equal(page.total_bytes, Buffer.byteLength(raw)); assert.equal(page.length_bytes, Buffer.byteLength(page.content));
+  assert.ok(raw.startsWith(page.content)); assert.equal(page.has_more, page.length_bytes < page.total_bytes); assert.ok(page.content.length <= raw.length);
+  assert.deepEqual(backend.state.memorySources, before.sources); assert.equal(backend.state.requests.some(({ method }) => method === "POST"), false);
+  const binding = { source_revision: page.source_revision, document_revision: page.document_revision, registered_revision: page.registered_revision };
+  const saved = await json(backend, `/uploads/${file.id}/memory-collection`, "POST", binding);
+  assert.equal(saved.status, 200); assert.equal(saved.body.state, "queued"); assert.equal(saved.body.created, true);
+  assert.equal(saved.body.registered_revision, page.registered_revision); assert.equal(Object.hasOwn(saved.body, "content"), false);
+  assert.equal(backend.state.memorySources.length, before.sources.length + 1);
+  let content = "", offset = 0;
+  for (let count = 0; count < page.total_bytes; count++) {
+    const read = await json(backend, `/memory/source?${new URLSearchParams({ id: page.source_id, revision: page.registered_revision, offset_bytes: String(offset), length_bytes: "11" })}`);
+    assert.equal(read.status, 200); assert.equal(read.body.source, page.source); assert.equal(read.body.digest, page.registered_revision);
+    assert.equal(read.body.session_id, ""); assert.equal(read.body.principal, "external:attachment"); assert.equal(read.body.trusted_owner, false);
+    content += read.body.content;
+    if (!read.body.has_more) break;
+    assert.ok(read.body.next_offset_bytes > offset); offset = read.body.next_offset_bytes;
+  }
+  assert.equal(content, raw);
+  const repeated = await json(backend, `/uploads/${file.id}/memory-collection`, "POST", binding);
+  assert.equal(repeated.body.created, false); assert.equal(repeated.body.state, "queued");
+  assert.equal(backend.state.memorySources.length, before.sources.length + 1);
+  assert.deepEqual(backend.state.messages, before.messages); assert.deepEqual(backend.state.runs, before.runs); assert.deepEqual(backend.state.events, before.events);
+});
+
+test("preview collection rejects changed versions and output failures before registering any source", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const file = backend.state.uploads[0], path = `/uploads/${file.id}`, sources = structuredClone(backend.state.memorySources);
+  const page = (await json(backend, `${path}/memory-preview`)).body;
+  const binding = { source_revision: page.source_revision, document_revision: page.document_revision, registered_revision: page.registered_revision };
+  assert.equal((await json(backend, `${path}/memory-collection`, "POST", { ...binding, trusted_owner: true })).status, 422);
+  backend.state.files.set(file.id, new Blob(["确实变化的新演示正文🙂"], { type: "text/plain" }));
+  assert.equal((await json(backend, `${path}/memory-collection`, "POST", binding)).status, 409);
+  const fresh = (await json(backend, `${path}/memory-preview`)).body;
+  const current = { source_revision: fresh.source_revision, document_revision: fresh.document_revision, registered_revision: fresh.registered_revision };
+  const maxChars = backend.state.settings.limits.max_output_chars; backend.state.settings.limits.max_output_chars = 16;
+  const tooSmall = await json(backend, `${path}/memory-collection`, "POST", current);
+  assert.equal(tooSmall.status, 400); assert.equal(tooSmall.body.detail.code, "output_budget");
+  assert.equal((await json(backend, `${path}/memory-preview`)).status, 400);
+  backend.state.settings.limits.max_output_chars = maxChars; backend.state.settings.memory.enabled = false;
+  const disabled = await json(backend, `${path}/memory-collection`, "POST", current);
+  assert.equal(disabled.body.state, "disabled"); assert.equal(disabled.body.created, false);
+  backend.state.settings.disabled_tools.push("memory_import_attachment");
+  assert.equal((await json(backend, `${path}/memory-preview`)).status, 400);
+  assert.equal((await json(backend, `${path}/memory-collection`, "POST", current)).status, 400);
+  assert.deepEqual(backend.state.memorySources, sources); assert.deepEqual(backend.state.runs, {});
+});
 
 test("preview watch paging and exact cancellation stay local, including disabled processing", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());
@@ -27,6 +87,45 @@ test("preview watch paging and exact cancellation stay local, including disabled
   assert.equal((await json(backend, "/memory/watches")).status, 400);
   assert.equal((await json(backend, "/memory/watches/cancel", "POST", { id: other.id })).status, 400);
   assert.deepEqual(backend.state.memoryWatches[1], other);
+});
+
+test("preview watch pages keep whole long questions and exact cancellation across short pages", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  backend.state.memoryWatches.forEach((item, index) => { item.question = `问题${index}：` + "完整背景".repeat(250); item.state = "active"; item.revision = 1; });
+  backend.state.settings.limits.max_output_chars = 2500;
+  const original = structuredClone(backend.state.memoryWatches), received = [];
+  let after = "";
+  for (let index = 0; index < original.length; index++) {
+    const response = await json(backend, `/memory/watches?after_id=${after}`);
+    assert.equal(response.status, 200);
+    const page = response.body;
+    assert.equal(page.after_id, after); assert.ok(page.items.length > 0);
+    if (index === 0) { assert.ok(page.items.length < original.length); assert.equal(page.has_more, true); }
+    assert.deepEqual(page.items, original.slice(received.length, received.length + page.items.length));
+    received.push(...page.items);
+    if (!page.has_more) { assert.equal(page.next_after_id, null); break; }
+    assert.equal(page.next_after_id, page.items.at(-1).id); after = page.next_after_id;
+  }
+  assert.deepEqual(received, original); assert.deepEqual(backend.state.memoryWatches, original);
+  assert.equal(backend.state.requests.some(({ method }) => method === "POST"), false);
+  const target = received.at(-1), stopped = await json(backend, "/memory/watches/cancel", "POST", { id: target.id });
+  assert.equal(stopped.status, 200); assert.equal(stopped.body.id, target.id);
+  assert.equal(stopped.body.state, "cancelled"); assert.equal(stopped.body.revision, target.revision + 1);
+  for (const item of original.filter((item) => item.id !== target.id)) {
+    assert.deepEqual(backend.state.memoryWatches.find((current) => current.id === item.id), item);
+  }
+  assert.equal(backend.state.requests.filter(({ method }) => method === "POST").length, 1);
+});
+
+test("preview does not replace an overbudget whole watch with a successful empty page", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  backend.state.memoryWatches = [{ ...backend.state.memoryWatches[0], question: "完整背景".repeat(300) }];
+  backend.state.settings.limits.max_output_chars = 1000;
+  const original = structuredClone(backend.state.memoryWatches);
+  const response = await json(backend, "/memory/watches");
+  assert.equal(response.status, 400); assert.equal(response.body.detail.code, "output_budget");
+  assert.equal(Object.hasOwn(response.body, "items"), false);
+  assert.deepEqual(backend.state.memoryWatches, original);
 });
 
 test("preview source discovery, UTF-8 reads and exact retries stay in local demo state", async (t) => {
@@ -71,6 +170,32 @@ test("preview source discovery, UTF-8 reads and exact retries stay in local demo
   assert.equal(backend.state.memorySources.find((entry) => entry.source_id === item.source_id).job.state, "done");
 });
 
+test("preview keeps a question's saved original separate from upload references and manual sending", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const uploads = structuredClone(backend.state.uploads), memories = structuredClone(backend.state.memories);
+  const sources = structuredClone(backend.state.memorySources), main = backend.state.sessions[0];
+  const catalog = await json(backend, "/memory/sources");
+  const item = catalog.body.items[0];
+  assert.match(item.source_id, /^attachment:[a-f0-9]{32}$/u);
+  assert.equal(item.principal, "external:attachment"); assert.equal(item.role, "tool"); assert.equal(item.trusted_owner, false);
+  assert.equal(backend.state.uploads.some((file) => `attachment:${file.id}` === item.source_id), false);
+  const original = await json(backend, `/memory/source?${new URLSearchParams({ id: item.source_id, revision: item.revision })}`);
+  assert.equal(original.status, 200); assert.equal(original.body.source_id, item.source_id); assert.equal(original.body.revision, item.revision);
+  assert.equal(original.body.source, item.source); assert.equal(original.body.principal, item.principal);
+  assert.equal(original.body.role, item.role); assert.equal(original.body.trusted_owner, false);
+  assert.ok(original.body.content.length > 0);
+  assert.deepEqual(backend.state.messages[main.id], []);
+  assert.deepEqual(backend.state.uploads, uploads); assert.deepEqual(backend.state.memories, memories); assert.deepEqual(backend.state.memorySources, sources);
+  assert.equal(backend.state.requests.some((entry) => entry.method === "POST"), false);
+
+  const content = `这份说明建议先做什么？\n${JSON.stringify({ id: item.source_id, revision: item.revision })}`;
+  const sent = await json(backend, `/sessions/${main.id}/messages`, "POST", { content, mode: "auto", attachment_ids: [] });
+  assert.equal(sent.status, 200); assert.equal(sent.body.message.content, content);
+  assert.deepEqual(sent.body.message.attachment_ids, []);
+  assert.equal(backend.state.requests.filter((entry) => entry.method === "POST").length, 1);
+  assert.deepEqual(backend.state.uploads, uploads);
+});
+
 test("preview compares its explicit demo pair and retains exact readable source coordinates", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());
   const sources = backend.state.memorySources.filter((item) => item.comparisonDemo);
@@ -95,6 +220,30 @@ async function json(backend, path, method = "GET", body) {
   const result = await backend.fetch(`/api${path}`, { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   return { status: result.status, body: await result.json() };
 }
+
+test("preview registered-tool catalog uses opaque observations and complete simulated contracts", async (t) => {
+  const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());
+  const before = structuredClone({ messages: backend.state.messages, runs: backend.state.runs, events: backend.state.events });
+  const result = await json(backend, "/capabilities");
+  assert.equal(result.status, 200); assert.equal(result.body.complete, true); assert.equal(result.body.scope, "registered_tools"); assert.equal(result.body.preview, true);
+  const catalog = result.body, tool = catalog.items[0];
+  assert.ok(tool.id); assert.notEqual(tool.id, tool.name); assert.deepEqual(tool.origin, { kind: "unrecorded" });
+  assert.equal(Object.hasOwn(tool, "parameters"), false);
+  const read = () => json(backend, `/capabilities/tools/${encodeURIComponent(tool.id)}?${new URLSearchParams({ revision: catalog.revision })}`);
+  const contract = await read();
+  assert.equal(contract.status, 200); assert.equal(contract.body.revision, catalog.revision); assert.equal(contract.body.tool.id, tool.id);
+  assert.deepEqual(contract.body.tool.parameters, { type: "object", properties: {}, additionalProperties: true });
+  assert.equal((await json(backend, `/capabilities/tools/${encodeURIComponent(tool.id)}`)).status, 422);
+  assert.equal((await json(backend, `/capabilities/tools/missing?${new URLSearchParams({ revision: catalog.revision })}`)).status, 404);
+  assert.deepEqual(backend.state.messages, before.messages); assert.deepEqual(backend.state.runs, before.runs); assert.deepEqual(backend.state.events, before.events);
+  await json(backend, "/settings", "PATCH", { disabled_tools: [tool.name] });
+  const stale = await read(); assert.equal(stale.status, 409); assert.equal(stale.body.detail.code, "capability_catalog_stale");
+  const fresh = await json(backend, "/capabilities");
+  assert.notEqual(fresh.body.revision, catalog.revision); assert.equal(fresh.body.items.find((item) => item.name === tool.name).enabled, false);
+  backend.state.settings.limits.max_output_chars = 1;
+  const rejected = await json(backend, "/capabilities");
+  assert.equal(rejected.status, 413); assert.equal(rejected.body.detail.code, "capability_payload_too_large"); assert.equal(Object.hasOwn(rejected.body, "items"), false);
+});
 
 test("preview calendar schedule paging and cancellation preserve the exact kind", async (t) => {
   const backend = createPreviewBackend({ delay: 0 }); t.after(() => backend.dispose());

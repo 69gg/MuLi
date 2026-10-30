@@ -39,6 +39,7 @@ function harness(controls, respond) {
     renderOtherView: () => renders.push("view"), renderChrome() {}, renderComposer() {},
     refreshSettingsResources: async () => renders.push("resources"),
     switchView: async () => renders.push("settings"),
+    releaseCapabilityCatalog() {},
   };
   runInNewContext(source.slice(start, end), context, { timeout: 1000 });
   const event = { preventDefault() {}, target: form };

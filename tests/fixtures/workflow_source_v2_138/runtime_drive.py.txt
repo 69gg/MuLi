@@ -1,0 +1,286 @@
+    async def _drive(
+        self,
+        session_id: str,
+        run_id: str,
+        role: str,
+        mode: Mode,
+        workflow_step: bool = False,
+        *,
+        consult: ConsultRequest | None = None,
+        shell_continuation: ShellContinuation | None = None,
+    ) -> str:
+        computer = self.computer
+        run = {
+            "id": run_id,
+            "session_id": session_id,
+            "status": "queued",
+            "role": role,
+            "created_at": now(),
+            "mode": mode,
+        }
+        self.store.put("run", run)
+        # Bind suppression before the first await: input claiming itself can fail,
+        # before ingress receives this run_id. Such failures must not wake us again.
+        attention_origin = (
+            self.store.db.execute(
+                "SELECT 1 FROM ingress WHERE session_id=? AND state='pending' "
+                "AND json_extract(payload,'$.principal')='system:attention' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            is not None
+        )
+        log_session = self.store.get("session", session_id) or {}
+        # Team registered this exact generation before its driver could run.
+        # Freeze only this run's terminal-failure notice before asynchronous logs
+        # can be consumed ahead of the terminal report's durable transaction.
+        notify_failure = (
+            not attention_origin
+            and consult is None
+            and shell_continuation is None
+            and not self.team.owns_run_report(session_id, run_id)
+        )
+        log_scope = self.system_events.begin_run(
+            run_id,
+            session_id,
+            main=log_session.get("kind") == "main"
+            and not workflow_step
+            and consult is None
+            and not log_session.get("workflow_run_id"),
+            notify=not attention_origin and consult is None,
+        )
+        try:
+            async with asyncio.timeout(self.config.settings.limits.max_run_seconds):
+                run["status"] = "running"
+                self.store.put("run", run)
+                await self.bus.emit("run.started", run, session_id)
+                execution_result = (
+                    await self._execute(
+                        session_id, run_id, role, mode, workflow_step, consult=consult
+                    )
+                    if consult is not None
+                    else await self._execute(
+                        session_id,
+                        run_id,
+                        role,
+                        mode,
+                        workflow_step,
+                        shell_continuation=shell_continuation,
+                    )
+                    if shell_continuation is not None
+                    else await self._execute(session_id, run_id, role, mode, workflow_step)
+                )
+                result = execution_result.content
+                self.system_events.clear_request(session_id)
+                # Child agents need the same capacity pool. Release the parent's slot first.
+                child_results: list[str] = []
+                reports: list[tuple[str, str]] = []
+                has_children = False
+                remaining = self.config.settings.limits.max_output_chars
+                after_id = ""
+                while children := self.workflows.child_run_ids(run_id, after_id=after_id):
+                    after_id = children[-1]
+                    for child_id in children:
+                        finished = await self.workflows.wait(child_id)
+                        if finished["status"] != "completed":
+                            raise ValueError(
+                                f"子工作流未成功完成：{finished['name']}（{finished['status']}）"
+                            )
+                        if remaining:
+                            separator = "\n\n" if has_children else ""
+                            pieces: list[str] = []
+                            for part in (
+                                separator,
+                                finished["name"],
+                                "\n",
+                                finished.get("result", ""),
+                            ):
+                                piece = str(part)[:remaining]
+                                if piece:
+                                    pieces.append(piece)
+                                    remaining -= len(piece)
+                                if not remaining:
+                                    break
+                            fragment = "".join(pieces)
+                            child_results.append(fragment)
+                            # Charge separators to the one parent budget, but
+                            # never send a separator-only fragment to another origin.
+                            content = fragment[len(separator) :]
+                            if content.strip():
+                                reports.append((child_id, content))
+                        has_children = True
+                if has_children:
+                    result = "".join(child_results)
+                    # An aggregate can have several frozen destinations. It is
+                    # not the earlier assistant message returned by _execute.
+                    execution_result = _ExecutionResult(result)
+                    if log_session.get("kind") == "main":
+                        # No report is committed until every child succeeded.
+                        # The synchronous batch cannot be split by cancellation.
+                        self.workflows.publish_results(run_id, session_id, reports)
+                        await self.bus.notify()
+                    else:
+                        # Team owns its existing parent-report route; its child
+                        # workflows must not bypass it with direct channel output.
+                        message = self.store.add_message(session_id, "assistant", result)
+                        await self.bus.emit("message.completed", {"message": message}, session_id)
+            run["status"], run["result"] = "completed", result
+            run["result_message_id"] = execution_result.message_id
+            run["reply_origin"] = (
+                execution_result.reply_origin.dump()
+                if execution_result.reply_origin is not None
+                else None
+            )
+            await self.bus.emit(
+                "run.completed",
+                {
+                    "run_id": run_id,
+                    "result_message_id": run["result_message_id"],
+                    "reply_origin": run["reply_origin"],
+                },
+                session_id,
+            )
+            return result
+        except asyncio.CancelledError:
+            run["status"] = "cancelled"
+            await self.bus.emit("run.cancelled", {"run_id": run_id}, session_id)
+            raise
+        except MemorySourceFailureExpired:
+            run.update(status="cancelled", result="", cancel_reason="memory_source_failure_expired")
+            await self.bus.emit(
+                "run.cancelled",
+                {"run_id": run_id, "reason": "memory_source_failure_expired"},
+                session_id,
+            )
+            return ""
+        except MemoryWatchMatchExpired:
+            run.update(status="cancelled", result="", cancel_reason="memory_watch_match_expired")
+            await self.bus.emit(
+                "run.cancelled",
+                {"run_id": run_id, "reason": "memory_watch_match_expired"},
+                session_id,
+            )
+            return ""
+        except TaskPaused as exc:
+            run.update(status="paused", pause_reason=str(exc), observed_epoch=exc.observed_epoch)
+            self.store.put("run", run)
+            await self.bus.emit(
+                "run.paused",
+                {"run_id": run_id, "reason": str(exc), "observed_epoch": exc.observed_epoch},
+                session_id,
+            )
+            raise
+        except Exception as exc:
+            run["status"] = "failed"
+            if self.config.settings.system_events.enabled:
+                try:
+                    run["failure_diagnostic"] = capture_failure(exc)
+                except Exception:
+                    # Optional evidence must never replace the original failure.
+                    pass
+            if self.system_logger is not None:
+                self.system_logger.error(
+                    "runtime_failed",
+                    extra={
+                        "muli_component": "runtime",
+                        "muli_code": "runtime_failed",
+                        "muli_run_id": run_id,
+                        "muli_session_id": session_id,
+                        "muli_notify": notify_failure,
+                    },
+                )
+            reason = (
+                str(exc)
+                if isinstance(exc, (ValueError, PermissionDenied, ProviderError))
+                else f"运行失败：{type(exc).__name__}"
+            )
+            if isinstance(exc, TimeoutError):
+                reason = "运行达到时间上限"
+            run["error"] = reason[:1000]
+            await self.bus.emit("run.failed", {"run_id": run_id, "error": run["error"]}, session_id)
+            raise
+        finally:
+            self.system_events.end_run(log_scope)
+            release_cancelled = False
+            if consult is not None and run["status"] != "completed":
+                self._repair_tail(session_id)
+            if run["status"] != "completed" and consult is None:
+                self.shells.invalidate(session_id)
+                shell_release = asyncio.create_task(self._settle_shell(session_id))
+                release_cancelled = await self.team._settle([shell_release])
+                if shell_release.cancelled():
+                    release_cancelled = True
+                if not shell_release.cancelled() and (shell_error := shell_release.exception()):
+                    run["shell_cleanup_error"] = type(shell_error).__name__
+                self._shell_requests.pop(session_id, None)
+                self._shell_mode_epochs.pop(session_id, None)
+            release = asyncio.create_task(computer.release_execution(session_id, run_id))
+            release_cancelled = await self.team._settle([release]) or release_cancelled
+            if release.cancelled():
+                release_cancelled = True
+                run["cleanup_error"] = "电脑引用回收被取消"
+            elif error := release.exception():
+                # Preserve the original result/unknown journal and unregister
+                # the driver even if the native cleanup itself fails.
+                run["cleanup_error"] = f"电脑引用回收失败：{type(error).__name__}"
+            if run["status"] not in {"completed", "paused"} and consult is None:
+                self._repair_tail(session_id)
+                with self._stopping_session(session_id):
+                    await self.team.cancel_children(session_id)
+                after_id = ""
+                while children := self.workflows.child_run_ids(run_id, after_id=after_id):
+                    after_id = children[-1]
+                    for child_id in children:
+                        child = self.store.get("workflow_run", child_id)
+                        if child is not None and child.get("status") in {
+                            "pending",
+                            "queued",
+                            "running",
+                        }:
+                            await self.workflows.cancel(child_id)
+            run["finished_at"] = now()
+            self.store.put("run", run)
+            session_updated = False
+            if self.run_ids.get(session_id) == run_id:
+                session = self.store.get("session", session_id)
+                if session:
+                    session["status"], session["updated_at"] = (
+                        "paused" if run["status"] == "paused" else "idle",
+                        now(),
+                    )
+                    # Terminal events precede asynchronous cleanup. Publish the
+                    # final session fact atomically with its invalidation so a
+                    # subscriber starting during cleanup cannot remain running.
+                    self.store.event(
+                        "session.updated",
+                        {"session_id": session_id, "status": session["status"]},
+                        session_id,
+                        objects=[("session", session)],
+                    )
+                    session_updated = True
+                    # A summary can become ready during the final stream. Its done
+                    # callback saw a running session, so settle it at this idle boundary.
+                    self.compaction.adopt(session_id)
+                self.tasks.pop(session_id, None)
+                self.run_ids.pop(session_id, None)
+                if consult is not None:
+                    self.team.consult.complete(consult, run)
+                if session and session.get("kind") == "main":
+                    self._wake_main()
+            if session_updated:
+                # This driver has released its session slot, but shutdown still
+                # owns its final notification and any diagnostic persistence.
+                finalizer = asyncio.current_task()
+                assert finalizer is not None
+                self._session_finalizers.add(finalizer)
+                try:
+                    notification = asyncio.create_task(self.bus.notify())
+                    release_cancelled = await self.team._settle([notification]) or release_cancelled
+                    if notification.cancelled():
+                        release_cancelled = True
+                    elif error := notification.exception():
+                        run["notification_error"] = f"会话更新通知失败：{type(error).__name__}"
+                        self.store.put("run", run)
+                finally:
+                    self._session_finalizers.discard(finalizer)
+            if release_cancelled:
+                raise asyncio.CancelledError

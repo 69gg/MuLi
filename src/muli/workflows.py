@@ -390,9 +390,28 @@ class WorkflowEngine:
                 "session_id": session_id,
                 "status": "pending",
             }
-        # 从首次 await 起，运行必须已经可由父任务找到并取消。
-        self.store.put_many([*associations, ("workflow_run", run)])
-        task = asyncio.create_task(self._drive(run), name=f"muli-workflow-{identifier}")
+        # No driver may run before its complete association transaction commits.
+        # The default deferred task factory cannot enter _drive without an await.
+        driver = self._drive(run)
+        task: asyncio.Task[None] | None = None
+        try:
+            with self.store.db:
+                for kind, item in [*associations, ("workflow_run", run)]:
+                    self.store._put(kind, item)
+                task = asyncio.create_task(driver, name=f"muli-workflow-{identifier}")
+        except BaseException:
+            if task is None:
+                driver.close()
+            else:
+                task.cancel()
+                # Admission never committed: consume disposal only, without the
+                # normal _done/on_idle business callbacks or a published run.
+                task.add_done_callback(
+                    lambda completed: None if completed.cancelled() else completed.exception()
+                )
+            raise
+        assert task is not None
+        # 从首次 await 起，已提交运行必须可由父任务找到并取消。
         self._tasks[identifier] = task
         task.add_done_callback(lambda completed: self._done(identifier, completed))
         return run

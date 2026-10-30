@@ -60,7 +60,7 @@ const state = {
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {}, managementRecoveryAttempt: null, managementReadVersion: 0,
   mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
-  team: { members: [], messages: [] }, recordQuery: "", approvals: [], approvalsError: "",
+  team: { members: [], messages: [] }, teamTab: "members", taskStatus: "active", recordQuery: "", approvals: [], approvalsError: "",
   auth: { required: false, authenticated: false },
 };
 let sessionController = null;
@@ -69,12 +69,23 @@ let connection = null;
 let sessionRequestVersion = 0;
 let viewRequestVersion = 0;
 let extensionReload = null;
+let capabilityCatalog = null;
 let queuedRender = false;
 let messageNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
+let dialogTaskReturn = null;
 let dialogMemoryReturn = null;
+let dialogUploadReturn = null;
+let answerSpeechDialog = null;
+let answerSpeechResults = [];
+let attachmentCollectionDialog = null;
+const attachmentCollectionAttempts = new Map();
 let taskDialog = null;
+let taskDirectory = null;
+let taskDirectoryDialog = null;
+const taskDirectoryPageSize = 20;
+const taskStatusLabels = { open: "待办", in_progress: "进行中", blocked: "受阻", done: "已完成", cancelled: "已取消" };
 let memoryDialog = null;
 let memoryPath = null;
 let memoryPathSequence = 0;
@@ -90,6 +101,9 @@ const memoryWatchPageSize = 20;
 let historyDialog = null;
 let dialogHistoryReturn = null;
 const historyPageSize = 50;
+let channelDeliveryDialog = null;
+let dialogChannelDeliveryReturn = null;
+const channelDeliveryPageSize = 20;
 let workflowActivity = null;
 const workflowStopping = new Set();
 const workflowPageSize = 50;
@@ -213,7 +227,12 @@ function connectionCurrent(owner) {
 
 function invalidateConnection() {
   state.voiceSetupController?.release();
+  releaseAnswerSpeech();
+  releaseAttachmentCollection();
   releaseMemoryWatches();
+  closeChannelDeliveryDialog();
+  releaseCapabilityCatalog();
+  releaseTaskDirectory();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -265,9 +284,9 @@ function beginConnection() {
 }
 
 /** Raw API calls keep a previous connection's 401 out of the login handler. */
-async function ownedRequest(path, options = {}, owner = connection) {
+async function ownedRequest(path, options = {}, owner = connection, current = () => true) {
   const cancelled = () => Object.assign(new Error("读取已失效"), { name: "AbortError" });
-  if (!connectionCurrent(owner)) throw cancelled();
+  if (!connectionCurrent(owner) || !current()) throw cancelled();
   const controller = new AbortController();
   const signals = [owner.controller.signal, options.signal].filter(Boolean);
   const abort = () => controller.abort();
@@ -277,10 +296,10 @@ async function ownedRequest(path, options = {}, owner = connection) {
   }
   try {
     const result = await apiRequest(path, { ...options, signal: controller.signal });
-    if (!connectionCurrent(owner) || controller.signal.aborted) throw cancelled();
+    if (!connectionCurrent(owner) || controller.signal.aborted || !current()) throw cancelled();
     return result;
   } catch (error) {
-    if (!connectionCurrent(owner) || controller.signal.aborted) throw cancelled();
+    if (!connectionCurrent(owner) || controller.signal.aborted || !current()) throw cancelled();
     if (error.status === 401) showLogin();
     throw error;
   } finally {
@@ -298,7 +317,7 @@ function showLogin() {
   releaseMemorySources();
   releaseWorkflowActivity();
   releaseRecordDirectory(); state.recordQuery = "";
-  dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null;
+  dialogTeamView = null; dialogMemoryReturn = null; dialogHistoryReturn = null; dialogUploadReturn = null;
   $("#app-dialog").close(); $("#dialog-content").replaceChildren(); dialogSubmit = null;
   globalController?.abort(); sessionController?.abort();
   state.connected = false; state.loading = false; state.auth.authenticated = false;
@@ -480,7 +499,9 @@ function onConversationScroll() {
 }
 
 function renderChat() {
+  syncAnswerSpeech();
   const items = conversationItems(state.session).filter((item) => item.kind !== "message" || ["user", "assistant"].includes(item.message.role) && (item.message.content || item.message.attachments?.length || item.message.attachment_ids?.length || item.message.pending || item.message.streaming));
+  const lastParts = new Map(items.filter((item) => item.kind === "message").map((item) => [String(item.message.id), String(item.id)]));
   $("#welcome").hidden = !!items.length || busy();
   const container = $("#messages");
   const ids = new Set(items.map((item) => String(item.id)));
@@ -526,6 +547,14 @@ function renderChat() {
       node.dataset.content = message.content ?? "";
     }
     node.classList.toggle("streaming", !!message.streaming);
+    const binding = lastParts.get(String(message.id)) === id ? savedAnswerBinding(String(message.id)) : null;
+    let speechAction = $('[data-action="generate-answer-speech"]', node);
+    if (binding && !speechAction) {
+      speechAction = actionButton("生成语音", "generate-answer-speech", "text-button", "play", { id: binding.message_id });
+      $(".message-actions", node).append(speechAction);
+    }
+    if (!binding) speechAction?.remove();
+    else Object.assign(speechAction.dataset, { run: binding.run_id, revision: binding.revision });
     const attachments = message.attachments ?? (message.attachment_ids ?? []).map((attachmentId) => state.uploads.find((file) => file.id === attachmentId) ?? { id: attachmentId, name: "附件" });
     const attachmentKey = JSON.stringify(attachments);
     if (node.dataset.attachments !== attachmentKey) {
@@ -686,7 +715,8 @@ async function connect() {
 function revalidateVisibleState(owner) {
   if (!connectionCurrent(owner)) return;
   // These projections used to receive missed changes from the global replay.
-  if (["workflows", "notifications", "team", "memories", "uploads"].includes(state.view)) void switchView(state.view, owner);
+  if (state.view === "team" && state.teamTab === "tasks") { const slot = createTaskDirectory(owner); renderOtherView(); renderTaskDirectoryList(slot); }
+  else if (["workflows", "notifications", "team", "memories", "uploads"].includes(state.view)) void switchView(state.view, owner);
   if (state.view === "records") renderSessions();
   if (taskDialog) void refreshTaskBriefDialog(taskDialog, owner);
   invalidateMemoryPath();
@@ -702,7 +732,7 @@ function waitToReconnect(milliseconds, signal) {
   });
 }
 
-async function subscribe(path, controller, { cursor = "", onEvent, onReconnect = () => {}, reportConnection = false, owner = connection } = {}) {
+async function subscribe(path, controller, { cursor = "", onEvent, onReconnect = () => {}, onDisconnect = () => {}, reportConnection = false, owner = connection } = {}) {
   let delay = 1000;
   let after = cursor;
   let opened = false;
@@ -720,6 +750,7 @@ async function subscribe(path, controller, { cursor = "", onEvent, onReconnect =
       if (error.status === 401) { showLogin(); return; }
     }
     if (!current()) return;
+    onDisconnect();
     if (reportConnection) { state.streamConnected = false; renderChrome(); }
     await waitToReconnect(delay, controller.signal);
     delay = Math.min(delay * 2, 12000);
@@ -730,7 +761,7 @@ function startGlobalEvents(owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
   globalController?.abort();
   globalController = new AbortController();
-  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onReconnect: () => { void refreshApprovals(owner); }, onEvent: (event) => {
+  void subscribe("/events", globalController, { owner, cursor: owner.position, reportConnection: true, onDisconnect: releaseAnswerSpeech, onReconnect: () => { releaseAnswerSpeech(); void refreshApprovals(owner); }, onEvent: (event) => {
     if (event.type === "approval.resolved" && typeof event.data?.id === "string") {
       state.approvals = state.approvals.filter((item) => item.id !== event.data.id); renderApprovalViews();
     }
@@ -751,10 +782,15 @@ function startGlobalEvents(owner = connection) {
       if (item?.id && ["reminder", "calendar_reminder"].includes(reminderKind(item))) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id || reminderKind(entry) !== reminderKind(item))];
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
-    if (event.type.startsWith("team.") && state.view === "team") void refreshTeam({}, owner);
+    if (event.type.startsWith("team.") && state.view === "team" && state.teamTab === "members") void refreshTeam({}, owner);
     if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog(taskDialog, owner);
+    if (event.type === "commitment.updated") markTaskDirectoryDirty(event.data);
     if (["memory.updated", "memory.forgotten"].includes(event.type)) { invalidateMemoryPath(); invalidateMemoryEvidence(event); }
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads(owner);
+    if (event.type === "channel.updated" && channelDeliveryDialogCurrent(channelDeliveryDialog)) {
+      channelDeliveryDialog.dirty = true;
+      if (channelDeliveryDialog.dirtyNotice) channelDeliveryDialog.dirtyNotice.hidden = false;
+    }
   } });
 }
 
@@ -763,19 +799,20 @@ function startSessionEvents(sessionId, owner = connection) {
   sessionController?.abort();
   sessionController = new AbortController();
   void subscribe(`/sessions/${encodeURIComponent(sessionId)}/events`, sessionController, {
-    cursor: state.session.cursor, owner,
+    cursor: state.session.cursor, owner, onDisconnect: releaseAnswerSpeech, onReconnect: releaseAnswerSpeech,
     onEvent: (event) => {
       if (event.session_id && event.session_id !== state.activeSession?.id) return;
       const next = applyEvent(state.session, event);
       if (next === state.session) return;
       state.session = next;
+      syncAnswerSpeech();
       if (["run.completed", "run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
   });
 }
 
-function resetMessageNodes() { $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
+function resetMessageNodes() { releaseAnswerSpeech(); $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
 
 async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
@@ -1061,13 +1098,19 @@ function resizeComposer() {
   const input = $("#message-input"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 220)}px`; renderComposer();
 }
 
-function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, onSubmit }) {
+function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, returnUploadTrigger = null, onSubmit }) {
+  releaseAnswerSpeech();
+  releaseAttachmentCollection();
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
   releaseTaskDialog();
+  releaseTaskDirectoryDialog();
+  dialogTaskReturn = null;
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
+  releaseChannelDeliveryDialog(); dialogChannelDeliveryReturn = null;
   dialogMemoryReturn = returnMemoryId ? { id: returnMemoryId, trigger: returnMemoryTrigger, pathButton: returnMemoryTrigger?.dataset.memoryPathRef ? memoryPath?.button : null } : null;
+  dialogUploadReturn = returnUploadTrigger ? { trigger: returnUploadTrigger, owner: connection } : null;
   const teamView = captureTeamView($("#other-view"));
   dialogTeamView = teamView?.inside ? teamView : null;
   $("#dialog-title").textContent = title;
@@ -1119,6 +1162,10 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  if (channelDeliveryDialog && (view !== "settings" || state.settingsTab !== "channels")) closeChannelDeliveryDialog();
+  if (view !== "settings") releaseCapabilityCatalog();
+  releaseAnswerSpeech();
+  releaseAttachmentCollection();
   if (view !== "settings") state.voiceSetupController?.release();
   if (view === "settings" && state.view === "settings" && state.settingsDraft && !state.viewError && !state.viewLoading && $(".settings-layout", $("#other-view"))) {
     collectSettingsForm(); renderOtherView(); return;
@@ -1128,6 +1175,7 @@ async function switchView(view, owner = connection) {
   releaseMemoryWatches();
   releaseWorkflowActivity();
   releaseRecordDirectory();
+  releaseTaskDirectory();
   if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
@@ -1137,6 +1185,14 @@ async function switchView(view, owner = connection) {
   state.view = view; state.viewError = ""; renderChrome();
   if (changedView) animatePanel(view === "chat" ? $("#chat-view") : $("#management-shell"));
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
+  if (view === "team" && state.teamTab === "tasks") {
+    const slot = createTaskDirectory(owner);
+    state.viewLoading = false; renderOtherView();
+    const heading = $(".view-heading h2", slot.root);
+    heading.tabIndex = -1; heading.focus({ preventScroll: true }); animatePanel(slot.root);
+    await loadTaskDirectory(slot);
+    return;
+  }
   if (view === "memories" && state.memoryTab === "sources") {
     state.viewLoading = false; renderOtherView();
     await loadMemorySources(memorySources);
@@ -1173,7 +1229,7 @@ async function switchView(view, owner = connection) {
   state.viewLoading = true; renderOtherView();
   try {
     if (view === "uploads") { const payload = await ownedRequest("/uploads", {}, owner); if (current()) state.uploads = collection(payload); }
-    if (view === "team") { const page = await teamPager.load({}, (path) => ownedRequest(path, {}, owner)); if (current() && page) state.team = page; }
+    if (view === "team") { const page = await teamPager.load({}, (path) => ownedRequest(path, {}, owner, current)); if (current() && page) state.team = page; }
     if (view === "memories") {
       const query = state.memoryQuery, sourceId = state.memorySourceId;
       const results = await Promise.allSettled([ownedRequest(memorySearchPath(query, sourceId), {}, owner), ownedRequest("/memories/graph", {}, owner)]);
@@ -1209,6 +1265,8 @@ async function switchView(view, owner = connection) {
 }
 
 function renderOtherView() {
+  syncChannelDeliveryScope();
+  syncCapabilityCatalogScope();
   const root = $("#other-view");
   if (state.viewLoading) { root.replaceChildren(element("div", { class: "view-content" }, emptyState("refresh", "正在读取…"))); return; }
   if (state.viewError) {
@@ -1229,6 +1287,7 @@ function renderOtherView() {
       }
       const panel = $(".settings-content", layout);
       const changedTab = panel.dataset.settingsTab !== state.settingsTab;
+      if (panel.dataset.settingsTab === "tools" && capabilityCatalog?.draft === state.settingsDraft) collectSettingsForm();
       panel.replaceChildren(renderSettingsPanel());
       panel.dataset.settingsTab = state.settingsTab;
       if (changedTab) animatePanel(panel);
@@ -1240,6 +1299,7 @@ function renderOtherView() {
   const nav = $(".settings-nav", root);
   const active = $(".settings-nav .active", root);
   if (nav && active && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = Math.max(0, active.offsetLeft - nav.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2);
+  if (state.view === "settings" && state.settingsTab === "tools" && capabilityCatalog && !capabilityCatalog.requested) void loadCapabilityCatalog(capabilityCatalog);
 }
 
 function animatePanel(node) {
@@ -1250,7 +1310,9 @@ function animatePanel(node) {
 
 function switchSettingsTab(tab) {
   if (!SETTINGS_GROUPS.some(([key]) => key === tab) || tab === state.settingsTab) return;
+  closeChannelDeliveryDialog();
   collectSettingsForm();
+  releaseCapabilityCatalog();
   state.settingsTab = tab;
   renderOtherView();
   $("#other-view").scrollTop = 0;
@@ -1265,12 +1327,122 @@ function renderThemeControl() {
 }
 
 function renderAttachment(file, { compact = false, removable = false } = {}) {
-  const kind = attachmentKind(file);
+  const kind = file.preview_url === null ? "file" : attachmentKind(file);
   const root = element("div", { class: `attachment ${compact ? "compact" : kind}` });
   if (!compact && kind === "image") root.append(element("a", { href: attachmentURL(file), target: "_blank", rel: "noopener", class: "attachment-preview", "aria-label": `查看 ${file.name}` }, element("img", { src: attachmentURL(file), alt: file.name || "图片附件", loading: "lazy" })));
   if (!compact && (kind === "audio" || kind === "video")) root.append(element(kind, { src: attachmentURL(file), controls: true, preload: "metadata", "aria-label": file.name || "媒体附件" }));
   root.append(element("div", { class: "attachment-info" }, icon(kind === "file" ? "attachment" : kind === "image" ? "sparkles" : "play"), element("span", { class: "attachment-name", text: file.name || "附件", title: file.name }), element("small", { text: formatBytes(file.size) }), removable ? iconButton("移除附件引用", "remove-attachment", "close", { id: file.id }) : element("a", { href: attachmentURL(file, true), download: file.name || "", class: "icon-button", "aria-label": `下载 ${file.name || "附件"}`, title: "下载" }, icon("download"))));
   return root;
+}
+
+function sameSavedAnswer(left, right) {
+  return !!left && !!right && ["session_id", "run_id", "message_id", "revision"].every((key) => left[key] === right[key]);
+}
+
+function savedAnswerBinding(messageId) {
+  const sessionId = state.mainSessionId;
+  if (!sessionId || state.activeSession?.id !== sessionId) return null;
+  const message = state.session.messages.find((item) => item.id === messageId);
+  if (!message || message.session_id !== sessionId || message.role !== "assistant" || typeof message.content !== "string" || !message.content.trim()
+    || message.pending || message.streaming || message.interrupted || message.paused || message.content_truncated || message.content_unavailable || message.content_provenance === "runtime_excerpt"
+    || message.tool_calls && (!Array.isArray(message.tool_calls) || message.tool_calls.length)
+    || typeof message.evidence_revision !== "string" || !message.evidence_revision.trim()) return null;
+  const candidate = state.session.replyCandidates?.find((item) => item.completed === true && item.message_id === message.id && item.revision === message.evidence_revision && typeof item.run_id === "string" && item.run_id);
+  return candidate ? Object.freeze({ session_id: sessionId, run_id: candidate.run_id, message_id: message.id, revision: message.evidence_revision }) : null;
+}
+
+function answerSpeechCurrent(slot) {
+  return !!slot && answerSpeechDialog === slot && connectionCurrent(slot.owner) && slot.owner.ready && slot.viewVersion === viewRequestVersion
+    && state.auth.authenticated && state.connected && state.streamConnected && state.view === "chat" && document.visibilityState !== "hidden"
+    && sameSavedAnswer(slot.binding, savedAnswerBinding(slot.binding.message_id)) && !slot.controller?.signal.aborted
+    && $("#messages").contains(slot.trigger) && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function releaseAnswerSpeech() {
+  const slot = answerSpeechDialog; answerSpeechDialog = null;
+  if (!slot) return;
+  if (slot.controller) {
+    slot.result.phase = "unknown"; slot.result.error = "";
+    slot.controller.abort(); slot.controller = null;
+  }
+  if ($("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) { dialogSubmit = null; $("#app-dialog").close(); }
+}
+
+function syncAnswerSpeech() {
+  if (answerSpeechDialog && !answerSpeechCurrent(answerSpeechDialog)) releaseAnswerSpeech();
+  answerSpeechResults = answerSpeechResults.filter((result) => sameSavedAnswer(result.binding, savedAnswerBinding(result.binding.message_id)));
+}
+
+function answerSpeechAttachment(value, binding) {
+  const file = value?.attachment;
+  if (!sameSavedAnswer(value, binding) || !file || typeof file.id !== "string" || !/^[a-f0-9]{32}$/.test(file.id)
+    || file.source !== "tts" || typeof file.name !== "string" || !file.name.trim() || typeof file.mime_type !== "string" || !file.mime_type
+    || !Number.isSafeInteger(file.size) || file.size <= 0 || file.url !== attachmentURL(file, true)
+    || (file.preview_url === null ? file.kind !== "file" : file.preview_url !== attachmentURL(file) || file.kind !== "audio" || !file.mime_type.startsWith("audio/"))) throw new Error("生成回执无法完整核查。");
+  return file;
+}
+
+function renderAnswerSpeech(slot) {
+  if (!answerSpeechCurrent(slot)) return;
+  const result = slot.result, phase = slot.confirmAgain ? "ready" : result.phase;
+  const submit = $("#dialog-submit"), focused = slot.content.contains(document.activeElement) || document.activeElement === submit;
+  slot.content.replaceChildren(); slot.content.setAttribute("aria-busy", String(phase === "pending"));
+  submit.textContent = "确认生成"; submit.hidden = phase !== "ready"; submit.disabled = phase === "pending";
+  dialogSubmit = phase === "ready" ? () => generateAnswerSpeech(slot) : null;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = phase === "ready" ? "取消" : "关闭";
+  if (phase === "ready") {
+    slot.content.append(element("p", { text: slot.preview ? "仅演示：在本页生成一段示例音频，供手动播放或下载。" : "这条完整答复会发送给配置的语音服务，并保存为音频附件。" }));
+    if (result.attempted) slot.content.append(element("p", { class: "settings-role-hint", text: slot.preview ? "再次生成仍只使用本页演示数据。" : "再次生成可能重复计费。" }));
+  } else if (phase === "pending") slot.content.append(element("p", { role: "status", text: "正在生成语音…" }));
+  else if (phase === "saved") {
+    slot.content.append(element("p", { role: "status", text: slot.preview ? "演示音频已生成，仅为本页示例提示音。" : "音频已保存。" }), renderAttachment(result.attachment));
+  } else {
+    slot.content.append(element("p", { role: "status", text: "生成结果未确认，可能已计费。" }));
+    if (result.error) slot.content.append(element("p", { class: "form-error", text: result.error }));
+  }
+  if (["saved", "unknown"].includes(phase)) {
+    const again = element("button", { type: "button", class: "text-button", text: "重新生成", onClick: () => {
+      if (answerSpeechCurrent(slot) && slot.content.contains(again)) { slot.confirmAgain = true; renderAnswerSpeech(slot); }
+    } });
+    slot.content.append(again);
+  }
+  if (focused) (phase === "ready" ? submit : $("#dialog-close")).focus({ preventScroll: true });
+}
+
+function openAnswerSpeech(trigger) {
+  const owner = connection, binding = savedAnswerBinding(trigger.dataset.id);
+  if (!binding || !connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || !state.connected || !state.streamConnected || state.view !== "chat" || document.visibilityState === "hidden"
+    || !$("#messages").contains(trigger) || trigger.dataset.run !== binding.run_id || trigger.dataset.revision !== binding.revision) return;
+  if (answerSpeechCurrent(answerSpeechDialog) && sameSavedAnswer(answerSpeechDialog.binding, binding)) return;
+  const content = element("div");
+  openDialog({ title: "生成语音", content, readOnly: true });
+  syncAnswerSpeech();
+  let result = answerSpeechResults.find((item) => sameSavedAnswer(item.binding, binding));
+  if (!result) { result = { binding, phase: "ready", attempted: false, attachment: null, error: "" }; answerSpeechResults.push(result); }
+  const slot = answerSpeechDialog = { owner, binding, result, trigger, content, viewVersion: viewRequestVersion, controller: null, confirmAgain: false, preview: state.status?.preview === true };
+  renderAnswerSpeech(slot);
+}
+
+async function generateAnswerSpeech(slot) {
+  if (!answerSpeechCurrent(slot) || slot.controller || !slot.confirmAgain && slot.result.phase !== "ready") return;
+  const controller = new AbortController(), result = slot.result;
+  slot.controller = controller; slot.confirmAgain = false;
+  result.phase = "pending"; result.attempted = true; result.attachment = null; result.error = "";
+  renderAnswerSpeech(slot);
+  try {
+    const binding = slot.binding;
+    const receipt = await ownedRequest(`/sessions/${encodeURIComponent(binding.session_id)}/messages/${encodeURIComponent(binding.message_id)}/speech`, {
+      method: "POST", body: { run_id: binding.run_id, revision: binding.revision, confirmed: true }, cache: "no-store", signal: controller.signal,
+    }, slot.owner, () => answerSpeechCurrent(slot) && slot.controller === controller);
+    const attachment = answerSpeechAttachment(receipt, binding);
+    if (!answerSpeechCurrent(slot) || slot.controller !== controller) return;
+    result.attachment = attachment; result.phase = "saved";
+  } catch (error) {
+    if (!answerSpeechCurrent(slot) || slot.controller !== controller) { if (answerSpeechDialog === slot) releaseAnswerSpeech(); return; }
+    result.phase = "unknown"; result.error = error.message ?? String(error);
+  } finally {
+    if (answerSpeechCurrent(slot) && slot.controller === controller) { slot.controller = null; renderAnswerSpeech(slot); }
+  }
 }
 
 function renderComposerAttachments() {
@@ -1303,17 +1475,155 @@ async function refreshUploads(owner = connection) {
 }
 
 function renderUploads() {
+  releaseAttachmentCollection();
   const root = element("div", { class: "view-content" }, viewHeading("附件", "文件保存在本地，发送时只引用附件。", actionButton("添加文件", "attach-files", "primary-button", "plus")));
   if (!state.uploads.length) root.append(emptyState("attachment", "还没有附件", "图片、文档与音视频都可以添加。"));
-  for (const file of state.uploads) root.append(element("article", { class: "upload-row" }, renderAttachment(file), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id })));
+  for (const file of state.uploads) root.append(element("article", { class: "upload-row" }, renderAttachment(file), element("div", { class: "row-actions" }, actionButton("收藏", "collect-attachment", "text-button", null, { id: file.id }), actionButton("带入对话", "use-attachment", "text-button", "chat", { id: file.id }))));
   return root;
+}
+
+function releaseAttachmentCollection() {
+  const slot = attachmentCollectionDialog; attachmentCollectionDialog = null;
+  if (!slot) return;
+  slot.controller?.abort();
+  if (slot.attempt?.state === "pending" && attachmentCollectionAttempts.get(slot.file.id) === slot.attempt) {
+    slot.attempt.state = "unknown"; slot.attempt.controller.abort();
+  }
+  if ($("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) { dialogSubmit = null; $("#app-dialog").close(); }
+}
+
+function attachmentCollectionCurrent(slot) {
+  return !!slot && attachmentCollectionDialog === slot && connectionCurrent(slot.owner) && slot.owner.ready && slot.viewVersion === viewRequestVersion && state.auth.authenticated && state.view === "uploads" && $("#other-view").contains(slot.trigger) && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function attachmentCollectionIdentity(value, id) {
+  const digest = (field) => typeof field === "string" && /^[a-f0-9]{64}$/.test(field);
+  if (!value || typeof id !== "string" || value.attachment_id !== id || !/^[a-f0-9]{32}$/.test(id) || value.source_id !== `attachment:${id}` || !digest(value.source_revision) || !digest(value.registered_revision) || value.session_id !== "" || value.role !== "tool" || value.principal !== "external:attachment" || value.trusted_owner !== false || typeof value.source !== "string") return false;
+  const scopes = { text: "utf8_text", pdf: "pdf_text_layer", docx: "docx_main_body_text" };
+  if (typeof value.format !== "string" || !Object.hasOwn(scopes, value.format) || value.scope !== scopes[value.format] || (value.format === "text" ? value.document_revision !== null : !digest(value.document_revision))) return false;
+  const marker = value.source.split(":");
+  return marker[0] === "attachment" && marker[1] === id && (value.format === "text"
+    ? marker.length === 3 && marker[2] === value.source_revision
+    : marker.length === 8 && marker[2] === "document" && marker[3] === "v1" && marker[4] === value.format && marker[5] === value.scope && marker[6] === value.source_revision && marker[7] === value.document_revision);
+}
+
+function attachmentCollectionPreview(value, id) {
+  if (!attachmentCollectionIdentity(value, id) || typeof value.filename !== "string" || !value.filename || value.read_only !== true || typeof value.processing_notice !== "string" || !value.processing_notice.trim() || value.field !== "content" || typeof value.content !== "string") throw new Error("资料预览无法完整核查，请重新准备。");
+  const length = new TextEncoder().encode(value.content).length;
+  if (![value.offset_bytes, value.length_bytes, value.next_offset_bytes, value.total_bytes].every((field) => Number.isSafeInteger(field) && field >= 0) || value.offset_bytes !== 0 || value.length_bytes !== length || value.next_offset_bytes !== length || length > value.total_bytes || value.total_bytes === 0 || typeof value.has_more !== "boolean" || value.has_more !== (length < value.total_bytes) || !length) throw new Error("资料预览范围不一致，请重新准备。");
+  return value;
+}
+
+function attachmentCollectionBinding(page) {
+  return Object.freeze(Object.fromEntries(["attachment_id", "source_revision", "format", "scope", "document_revision", "source_id", "registered_revision", "source", "session_id", "role", "principal", "trusted_owner", "total_bytes"].map((key) => [key, page[key]])));
+}
+
+function attachmentCollectionReceipt(value, binding) {
+  return attachmentCollectionIdentity(value, binding.attachment_id) && Object.keys(binding).filter((key) => key !== "total_bytes").every((key) => value[key] === binding[key]) && typeof value.created === "boolean" && typeof value.state === "string" && (Object.hasOwn(memoryJobStates, value.state) || ["disabled", "forgotten"].includes(value.state)) && (!["disabled", "forgotten"].includes(value.state) || value.created === false);
+}
+
+function renderAttachmentCollection(slot) {
+  if (!attachmentCollectionCurrent(slot)) return;
+  const focused = slot.content.contains(document.activeElement) || document.activeElement === $("#dialog-submit");
+  const saving = slot.phase === "pending", loading = !!slot.controller;
+  slot.content.setAttribute("aria-busy", String(saving || loading));
+  slot.content.replaceChildren(element("h3", { text: slot.preview?.filename ?? slot.file.name }));
+  const submit = $("#dialog-submit"); submit.textContent = "确认收藏"; submit.hidden = slot.phase !== "ready"; submit.disabled = loading || saving;
+  dialogSubmit = slot.phase === "ready" ? () => confirmAttachmentCollection(slot) : null;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = slot.phase === "ready" ? "取消" : "关闭";
+  if (slot.preview && ["ready", "pending"].includes(slot.phase)) {
+    slot.content.append(element("p", { class: "settings-role-hint", text: { text: "完整 UTF-8 文本", pdf: "PDF 文本层", docx: "DOCX 主文档正文" }[slot.preview.format] }), element("p", { class: "memory-source-content", text: slot.preview.content }), element("p", { class: "settings-role-hint", text: slot.preview.has_more ? "预览还有后文。" : "已显示本次正文。" }), element("p", { class: "settings-role-hint", text: slot.preview.processing_notice }));
+  }
+  const messages = { loading: "正在核对资料…", pending: "正在收藏…", unknown: "收藏结果尚未确认，请先核对。", present: "这份准确资料当前已登记。", error: slot.error };
+  if (slot.phase === "receipt") messages.receipt = slot.receipt.state === "disabled" ? "记忆未启用，本次未登记。" : slot.receipt.state === "forgotten" ? "这份资料已遗忘，本次未重新登记。" : `资料已登记 · ${memoryJobStates[slot.receipt.state]}`;
+  if (messages[slot.phase]) slot.content.append(element("p", { role: "status", text: messages[slot.phase] }));
+  if (slot.error && slot.phase === "unknown") slot.content.append(element("p", { class: "form-error", text: slot.error }));
+  const action = (text, callback) => {
+    const button = element("button", { type: "button", class: "text-button", text, disabled: loading, onClick: () => { if (attachmentCollectionCurrent(slot) && slot.content.contains(button) && !button.disabled) void callback(); } });
+    slot.content.append(button);
+  };
+  if (slot.phase === "unknown") action("核对结果", () => reconcileAttachmentCollection(slot));
+  if (["unknown", "error"].includes(slot.phase)) action("重新准备", () => prepareAttachmentCollection(slot, true));
+  if (slot.phase === "present" || (slot.phase === "receipt" && !["disabled", "forgotten"].includes(slot.receipt.state))) action("核原文", () => {
+    const binding = slot.attempt.binding;
+    return openCatalogSource({ source_id: binding.source_id, revision: binding.registered_revision, source: binding.source, session_id: binding.session_id, role: binding.role, principal: binding.principal, trusted_owner: binding.trusted_owner, total_bytes: binding.total_bytes }, slot.trigger, { uploadReturn: slot.trigger });
+  });
+  animatePanel(slot.content);
+  if (focused) (slot.phase === "ready" ? submit : $$("button", slot.content).find((button) => !button.disabled) ?? $("#dialog-close")).focus({ preventScroll: true });
+}
+
+async function openAttachmentCollection(file, trigger) {
+  const owner = connection;
+  if (!connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || state.view !== "uploads" || !file || trigger?.dataset.id !== file.id || !$("#other-view").contains(trigger) || typeof file.id !== "string" || !/^[a-f0-9]{32}$/.test(file.id)) return;
+  const content = element("div", { class: "memory-verification" });
+  openDialog({ title: "收藏到长期记忆", content, readOnly: true, returnUploadTrigger: trigger });
+  const attempt = attachmentCollectionAttempts.get(file.id);
+  const slot = attachmentCollectionDialog = { owner, file, trigger, content, viewVersion: viewRequestVersion, controller: null, attempt, preview: null, phase: attempt ? "unknown" : "loading", error: "" };
+  renderAttachmentCollection(slot);
+  if (!attempt) await prepareAttachmentCollection(slot);
+}
+
+async function prepareAttachmentCollection(slot, newIntent = false) {
+  if (!attachmentCollectionCurrent(slot) || slot.controller || slot.phase === "pending") return;
+  const previous = attachmentCollectionAttempts.get(slot.file.id);
+  if (previous && !newIntent) return;
+  const controller = new AbortController(); slot.controller = controller; slot.phase = "loading"; slot.preview = null; slot.error = "";
+  renderAttachmentCollection(slot);
+  try {
+    const page = await ownedRequest(`/uploads/${encodeURIComponent(slot.file.id)}/memory-preview`, { cache: "no-store", signal: controller.signal }, slot.owner);
+    if (!attachmentCollectionCurrent(slot) || slot.controller !== controller) return;
+    slot.preview = attachmentCollectionPreview(page, slot.file.id);
+    if (previous && attachmentCollectionAttempts.get(slot.file.id) === previous) attachmentCollectionAttempts.delete(slot.file.id);
+    slot.attempt = null; slot.phase = "ready";
+  } catch (error) {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) { slot.error = error.message; slot.phase = previous ? "unknown" : "error"; }
+  } finally {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) { slot.controller = null; renderAttachmentCollection(slot); }
+  }
+}
+
+async function confirmAttachmentCollection(slot) {
+  if (!attachmentCollectionCurrent(slot) || slot.phase !== "ready" || slot.controller || !slot.preview || attachmentCollectionAttempts.has(slot.file.id)) return;
+  const binding = attachmentCollectionBinding(slot.preview), attempt = { binding, state: "pending", controller: new AbortController() };
+  slot.attempt = attempt; attachmentCollectionAttempts.set(slot.file.id, attempt); slot.phase = "pending";
+  renderAttachmentCollection(slot);
+  try {
+    const receipt = await ownedRequest(`/uploads/${encodeURIComponent(slot.file.id)}/memory-collection`, { method: "POST", body: { source_revision: binding.source_revision, document_revision: binding.document_revision, registered_revision: binding.registered_revision }, cache: "no-store", signal: attempt.controller.signal }, slot.owner);
+    if (!attachmentCollectionReceipt(receipt, binding)) throw new Error("收藏回执无法完整核查。");
+    if (attachmentCollectionAttempts.get(slot.file.id) !== attempt || !attachmentCollectionCurrent(slot)) return;
+    attempt.state = "recorded"; attachmentCollectionAttempts.delete(slot.file.id); slot.receipt = receipt; slot.phase = "receipt";
+  } catch {
+    if (attachmentCollectionAttempts.get(slot.file.id) === attempt) { attempt.state = "unknown"; if (attachmentCollectionCurrent(slot)) slot.phase = "unknown"; }
+  } finally {
+    if (attachmentCollectionCurrent(slot)) renderAttachmentCollection(slot);
+  }
+}
+
+async function reconcileAttachmentCollection(slot) {
+  const attempt = slot.attempt;
+  if (!attachmentCollectionCurrent(slot) || slot.phase !== "unknown" || slot.controller || !attempt || attachmentCollectionAttempts.get(slot.file.id) !== attempt) return;
+  const binding = attempt.binding, controller = new AbortController(); slot.controller = controller; slot.error = "";
+  renderAttachmentCollection(slot);
+  try {
+    const query = new URLSearchParams({ id: binding.source_id, revision: binding.registered_revision });
+    const page = await ownedRequest(`/memory/source?${query}`, { cache: "no-store", signal: controller.signal }, slot.owner);
+    if (!attachmentCollectionCurrent(slot) || slot.controller !== controller || attachmentCollectionAttempts.get(slot.file.id) !== attempt) return;
+    const reader = { catalogSource: true, item: { source_id: binding.source_id, origin: { id: binding.source_id, digest: binding.registered_revision } } };
+    if (!validMemorySource(page, reader, 0) || page.id !== binding.source_id || page.digest !== binding.registered_revision || page.source !== binding.source || page.session_id !== binding.session_id || page.role !== binding.role || page.principal !== binding.principal || page.trusted_owner !== binding.trusted_owner || page.total_bytes !== binding.total_bytes) throw new Error("尚无法核对这份准确资料。");
+    attempt.state = "observed"; attachmentCollectionAttempts.delete(slot.file.id); slot.phase = "present";
+  } catch (error) {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) slot.error = [404, 409].includes(error.status) ? "资料目前不可核对，请稍后再查。" : error.message;
+  } finally {
+    if (attachmentCollectionCurrent(slot) && slot.controller === controller) { slot.controller = null; renderAttachmentCollection(slot); }
+  }
 }
 
 async function refreshTeam(changes = {}, owner = connection) {
   const version = viewRequestVersion;
-  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "team";
+  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "team" && state.teamTab === "members";
+  if (!current()) return;
   try {
-    const page = await teamPager.load(changes, (path) => ownedRequest(path, {}, owner));
+    const page = await teamPager.load(changes, (path) => ownedRequest(path, {}, owner, current));
     if (current() && page) { state.team = page; renderOtherView(); }
   } catch (error) { if (current()) showError(error); }
 }
@@ -1355,6 +1665,23 @@ function taskDialogCurrent(slot) {
   return taskDialog === slot && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
 }
 
+function renderTaskBriefContent(root, item, { observed = false } = {}) {
+  const evidenceOpen = $("details", root)?.open ?? false;
+  $("#dialog-title").textContent = item.title || "任务说明";
+  const revision = observed ? Number.isSafeInteger(item.revision) && item.revision > 0 ? `页面观察修订 ${item.revision}` : "修订无法准确核对" : `任务说明 · 修订 ${item.revision}`;
+  root.replaceChildren(element("small", { text: revision }));
+  if (!item.brief) root.append(element("p", { text: observed ? "尚未登记完整说明。" : "尚未登记任务说明。" }));
+  else {
+    root.append(element("h3", { text: "目标" }), element("p", { text: item.brief.goal }));
+    if (item.brief.constraints?.length) root.append(element("h3", { text: "要求" }), element("ul", {}, item.brief.constraints.map((text) => element("li", { text }))));
+    if (item.brief.evidence_refs?.length) {
+      const evidence = element("details", { class: "advanced-settings", open: evidenceOpen }, element("summary", { text: "依据" }));
+      for (const reference of item.brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
+      root.append(evidence);
+    }
+  }
+}
+
 function renderTaskBriefDialog(slot = taskDialog) {
   if (!slot || !taskDialogCurrent(slot)) return;
   const data = slot.model.state;
@@ -1362,21 +1689,8 @@ function renderTaskBriefDialog(slot = taskDialog) {
   const focused = document.activeElement;
   const focusedAction = slot.content.contains(focused) ? focused.dataset.taskControlAction : null;
   if (data.detail && slot.renderedDetail !== data.detail) {
-    const item = data.detail;
-    const evidenceOpen = $("details", slot.brief)?.open ?? false;
-    $("#dialog-title").textContent = item.title || "任务说明";
-    slot.brief.replaceChildren(element("small", { text: `任务说明 · 修订 ${item.revision}` }));
-    if (!item.brief) slot.brief.append(element("p", { text: "尚未登记任务说明。" }));
-    else {
-      slot.brief.append(element("h3", { text: "目标" }), element("p", { text: item.brief.goal }));
-      if (item.brief.constraints?.length) slot.brief.append(element("h3", { text: "要求" }), element("ul", {}, item.brief.constraints.map((text) => element("li", { text }))));
-      if (item.brief.evidence_refs?.length) {
-        const evidence = element("details", { class: "advanced-settings", open: evidenceOpen }, element("summary", { text: "依据" }));
-        for (const reference of item.brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
-        slot.brief.append(evidence);
-      }
-    }
-    slot.renderedDetail = item;
+    renderTaskBriefContent(slot.brief, data.detail);
+    slot.renderedDetail = data.detail;
   }
   slot.readStatus.textContent = slot.readError || (!data.detail ? "正在读取…" : !view.fresh ? slot.loading ? "任务说明有更新，正在读取…" : "任务说明有更新，请刷新。" : "");
   slot.readStatus.className = slot.readError ? "form-error" : "task-control-note";
@@ -1391,7 +1705,10 @@ function renderTaskBriefDialog(slot = taskDialog) {
   slot.editor.hidden = !data.editing;
   slot.input.disabled = !!data.submission;
   if (slot.input.value !== data.draft) slot.input.value = data.draft;
-  const localButton = (label, action, callback, { primary = false, disabled = false } = {}) => element("button", { type: "button", class: primary ? "primary-button" : "secondary-button", disabled, dataset: { taskControlAction: action }, onClick: callback }, label);
+  const localButton = (label, action, callback, { primary = false, disabled = false } = {}) => {
+    const button = element("button", { type: "button", class: primary ? "primary-button" : "secondary-button", disabled, dataset: { taskControlAction: action }, onClick: () => { if (taskDialogCurrent(slot) && slot.actions.contains(button) && !button.disabled) callback(); } }, label);
+    return button;
+  };
   const refresh = () => void refreshTaskBriefDialog(slot);
   const actions = [];
   if (view.unknown) actions.push(localButton("重试原操作", "retry", () => void submitTaskControl(slot.model, data.submission.action), { primary: true }));
@@ -1428,7 +1745,7 @@ async function refreshTaskBriefDialog(slot = taskDialog, owner = connection) {
   const current = () => connectionCurrent(owner) && taskDialogCurrent(slot) && slot.readController === controller;
   slot.loading = true; slot.readError = ""; slot.refreshAgain = false; renderTaskBriefDialog(slot);
   try {
-    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: controller.signal }, owner);
+    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: controller.signal }, owner, current);
     if (!current()) return;
     if (!slot.model.acceptDetail(item)) slot.readError = "任务说明已有更新，请再次刷新。";
   } catch (error) {
@@ -1490,8 +1807,222 @@ async function showTaskBrief(identifier) {
   await refreshTaskBriefDialog(slot);
 }
 
+function taskDirectoryDialogCurrent(slot) {
+  return !!slot && taskDirectoryDialog === slot && taskDirectoryCurrent(slot.directory) && slot.owner === slot.directory.owner && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function releaseTaskDirectoryDialog({ close = false } = {}) {
+  const slot = taskDirectoryDialog; taskDirectoryDialog = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null; slot.detail = null;
+  if (close && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) $("#app-dialog").close();
+  slot.content.replaceChildren();
+}
+
+function taskDirectoryDetail(item, identifier) {
+  const invalid = () => { throw new Error("任务说明响应不完整，请刷新核对。"); };
+  if (!item || item.id !== identifier || item.title !== undefined && typeof item.title !== "string") invalid();
+  const brief = item.brief;
+  if (brief != null) {
+    if (typeof brief !== "object" || Array.isArray(brief) || typeof brief.goal !== "string" || !brief.goal.trim() || !Array.isArray(brief.constraints) || brief.constraints.some((text) => typeof text !== "string") || !Array.isArray(brief.evidence_refs)) invalid();
+    for (const reference of brief.evidence_refs) {
+      if (!reference || !["message", "attachment"].includes(reference.kind) || typeof reference.id !== "string" || !reference.id || reference.kind === "message" && (typeof reference.session_id !== "string" || !reference.session_id || !Number.isSafeInteger(reference.seq) || reference.seq < 1)) invalid();
+    }
+  }
+  return item;
+}
+
+function renderTaskDirectoryBrief(slot) {
+  if (!taskDirectoryDialogCurrent(slot)) return;
+  if (slot.detail && slot.renderedDetail !== slot.detail) {
+    renderTaskBriefContent(slot.brief, slot.detail, { observed: true });
+    slot.renderedDetail = slot.detail;
+  }
+  const revision = slot.detail?.revision, accurate = Number.isSafeInteger(revision) && revision > 0;
+  slot.status.textContent = slot.error || (slot.dirty ? "任务说明有更新，请刷新后核对。" : slot.controller ? "正在读取任务说明…" : slot.detail && !accurate ? "修订无法准确核对，请刷新说明。" : "");
+  slot.status.className = slot.error ? "form-error" : "task-control-note";
+  slot.status.hidden = !slot.status.textContent;
+  const refresh = element("button", { type: "button", class: "secondary-button", text: "刷新说明", disabled: !!slot.controller, onClick: () => { if (taskDirectoryDialogCurrent(slot) && slot.actions.contains(refresh) && !refresh.disabled) void refreshTaskDirectoryBrief(slot); } });
+  slot.actions.replaceChildren(refresh);
+  if (slot.detail?.brief && accurate && !slot.dirty && !slot.error && !slot.controller) {
+    const detail = slot.detail;
+    const question = element("button", { type: "button", class: "primary-button", text: "带着任务提问", disabled: !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareTaskQuestion(slot, detail, question) });
+    slot.actions.append(question);
+  }
+}
+
+async function refreshTaskDirectoryBrief(slot) {
+  if (!taskDirectoryDialogCurrent(slot)) return;
+  slot.controller?.abort();
+  const controller = slot.controller = new AbortController();
+  slot.error = ""; slot.dirty = false; renderTaskDirectoryBrief(slot);
+  const current = () => taskDirectoryDialogCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.identifier)}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    slot.detail = taskDirectoryDetail(item, slot.identifier);
+    if (Number.isSafeInteger(slot.minimumRevision) && Number.isSafeInteger(item.revision) && item.revision < slot.minimumRevision) slot.dirty = true;
+    if (Number.isSafeInteger(item.revision) && item.revision > 0) slot.minimumRevision = Math.max(Number.isSafeInteger(slot.minimumRevision) ? slot.minimumRevision : 0, item.revision);
+  } catch (error) {
+    if (current()) slot.error = error.message;
+  } finally {
+    if (current()) { slot.controller = null; renderTaskDirectoryBrief(slot); }
+  }
+}
+
+async function showTaskDirectoryBrief(directory, item, trigger) {
+  if (!taskDirectoryCurrent(directory) || directory.controller || !directory.page?.items.includes(item) || !directory.result.contains(trigger) || trigger.disabled) return;
+  const slot = { directory, owner: directory.owner, identifier: item.id, minimumRevision: item.revision, trigger, content: element("div", { class: "task-brief" }), brief: element("div"), status: element("p", { role: "status" }), actions: element("div", { class: "task-control-actions" }), controller: null, detail: null, renderedDetail: null, dirty: false, error: "" };
+  slot.content.append(slot.brief, slot.status, element("p", { class: "task-control-note", text: "这是页面所见的任务说明。带入草稿后，沐璃仍需核对当前说明；不会自动继续任务。" }), slot.actions);
+  openDialog({ title: "任务说明", content: slot.content, readOnly: true });
+  taskDirectoryDialog = slot;
+  dialogTaskReturn = { directory, trigger };
+  await refreshTaskDirectoryBrief(slot);
+}
+
+async function prepareTaskQuestion(slot, detail, trigger) {
+  const owner = slot.owner;
+  if (!taskDirectoryDialogCurrent(slot) || !connectionCurrent(owner) || !owner.ready || !state.connected || slot.controller || slot.error || slot.dirty || slot.detail !== detail || !detail.brief || !Number.isSafeInteger(detail.revision) || detail.revision < 1 || !slot.actions.contains(trigger) || trigger.disabled) return;
+  const main = state.mainSessionId, draft = captureDraft();
+  if (!main || draft.session !== main) return;
+  const reference = `参考任务（页面观察修订 ${detail.revision}）：请先用 commitment_read 按 identifier 读取当前说明，核对与以下 observed_revision 的差异，再回答我的问题；这不是继续或批准操作的授权。\n${JSON.stringify({ identifier: detail.id, observed_revision: detail.revision })}`;
+  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+  const input = $("#message-input");
+  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入任务。", true); return; }
+  const navigation = viewRequestVersion + 1;
+  await switchView("chat", owner);
+  if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+  const current = captureDraft();
+  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入任务。"); return; }
+  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  resizeComposer(); input.focus();
+}
+
+function renderTeamTabs() {
+  return element("div", { class: "role-tabs team-tabs", role: "tablist", "aria-label": "团队视图" }, ...[["members", "队友"], ["tasks", "我的任务"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.teamTab === key ? "active" : "", text: label, "aria-selected": String(state.teamTab === key), dataset: { teamTab: key } })));
+}
+
+async function selectTeamTab(tab, trigger) {
+  if (!["members", "tasks"].includes(tab) || state.view !== "team" || !state.auth.authenticated || !connectionCurrent(connection) || !connection.ready || !$("#other-view").contains(trigger) || state.teamTab === tab) return;
+  const owner = connection, navigation = viewRequestVersion + 1;
+  state.teamTab = tab; teamPager.invalidate?.();
+  await switchView("team");
+  if (tab === "members" && connectionCurrent(owner) && navigation === viewRequestVersion && state.view === "team" && state.teamTab === tab) animatePanel($("#other-view").firstElementChild);
+}
+
+function createTaskDirectory(owner = connection) {
+  return taskDirectory = { owner, viewVersion: viewRequestVersion, status: state.taskStatus, cursor: null, starts: [null], page: null, controller: null, error: "", retry: null, dirty: false, root: null };
+}
+
+function taskDirectoryCurrent(slot) {
+  return !!slot && taskDirectory === slot && connectionCurrent(slot.owner) && slot.owner.ready && slot.viewVersion === viewRequestVersion && state.auth.authenticated && state.view === "team" && state.teamTab === "tasks" && state.taskStatus === slot.status && $("#other-view").firstElementChild === slot.root;
+}
+
+function releaseTaskDirectory() {
+  const slot = taskDirectory; taskDirectory = null;
+  releaseTaskDirectoryDialog({ close: true });
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.page = null; slot.retry = null; slot.starts = [];
+  slot.root?.replaceChildren();
+}
+
+function taskDirectoryPage(payload, cursor, starts) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!payload || !Array.isArray(payload.items) || payload.items.length > taskDirectoryPageSize || typeof payload.has_more !== "boolean" || payload.consistency !== "bounded_live" || !count(payload.scanned) || !count(payload.json_bytes) || !count(payload.omitted_total) || !payload.omitted || ["oversized", "invalid", "missing"].some((key) => !count(payload.omitted[key])) || !["limit", "candidate_budget", "output_budget", "raw_budget", "deadline", "end"].includes(payload.stopped)) throw new Error("任务目录响应不完整，请重新读取。");
+  const seen = new Set();
+  for (const item of payload.items) {
+    if (!item || typeof item.id !== "string" || !item.id || seen.has(item.id) || !Object.hasOwn(taskStatusLabels, item.status) || ["title", "next_step"].some((key) => item[key] !== undefined && typeof item[key] !== "string")) throw new Error("任务目录响应不完整，请重新读取。");
+    seen.add(item.id);
+  }
+  if (payload.has_more ? typeof payload.next_cursor !== "string" || !payload.next_cursor || payload.next_cursor === cursor || starts.includes(payload.next_cursor) : payload.next_cursor !== null) throw new Error("任务目录翻页位置无效，请重新读取。");
+  return payload;
+}
+
+async function loadTaskDirectory(slot, { status = slot.status, cursor = null, starts = [null], focus = false } = {}) {
+  if (!taskDirectoryCurrent(slot)) return;
+  slot.controller?.abort(); releaseTaskDirectoryDialog({ close: true });
+  const controller = slot.controller = new AbortController();
+  state.taskStatus = slot.status = status; slot.cursor = cursor; slot.starts = [...starts];
+  slot.page = null; slot.error = ""; slot.retry = { status, cursor, starts: [...starts], focus }; slot.dirty = false;
+  renderTaskDirectoryList(slot);
+  const current = () => taskDirectoryCurrent(slot) && slot.status === status && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const params = new URLSearchParams({ status, limit: taskDirectoryPageSize });
+    if (cursor !== null) params.set("cursor", cursor);
+    const payload = await ownedRequest(`/commitment-directory?${params}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    slot.page = taskDirectoryPage(payload, cursor, starts); slot.retry = null;
+  } catch (error) {
+    if (current()) slot.error = error.status === 404 ? "当前服务尚不支持任务目录。" : error.message;
+  } finally {
+    if (current()) {
+      slot.controller = null; renderTaskDirectoryList(slot);
+      if (focus && !$("#app-dialog").open) slot.position.focus({ preventScroll: true });
+    }
+  }
+}
+
+function renderTaskDirectory() {
+  const slot = taskDirectory;
+  if (!slot) return element("div", { class: "view-content" });
+  if (slot.root) return slot.root;
+  slot.refresh = element("button", { type: "button", class: "secondary-button", text: "刷新列表", onClick: () => { if (taskDirectoryCurrent(slot) && slot.root.contains(slot.refresh)) void loadTaskDirectory(slot, { focus: true }); } });
+  slot.filter = element("select", { class: "filter-select", "aria-label": "账本状态", onChange: () => { if (taskDirectoryCurrent(slot) && slot.root.contains(slot.filter)) void loadTaskDirectory(slot, { status: slot.filter.value, focus: true }); } }, ...[["active", "进行中（未结束）"], ["all", "全部"], ...Object.entries(taskStatusLabels)].map(([value, text]) => element("option", { value, text })));
+  slot.filter.value = slot.status;
+  slot.notice = element("p", { class: "record-list-status", role: "status" });
+  slot.navigation = element("nav", { class: "team-pagination", "aria-label": "任务目录分页" });
+  slot.result = element("div", { id: "task-directory-result", "aria-busy": "false" });
+  slot.root = element("div", { class: "view-content task-directory" }, viewHeading("团队", "保存的任务与协作进展。", slot.refresh), renderTeamTabs(), element("div", { class: "team-filter" }, element("label", {}, "账本状态", slot.filter)), element("p", { class: "task-control-note", text: "账本状态是已保存的登记；当前执行情况请到“队友”核对。" }), slot.notice, slot.navigation, slot.result);
+  return slot.root;
+}
+
+function renderTaskDirectoryNotice(slot) {
+  if (!taskDirectoryCurrent(slot)) return;
+  slot.refresh.disabled = !!slot.controller;
+  slot.notice.textContent = slot.controller ? "正在读取任务…" : slot.dirty ? "任务记录有更新，可刷新列表。" : !slot.page && !slot.error ? "请刷新列表读取任务。" : "";
+  slot.notice.hidden = !slot.notice.textContent;
+}
+
+function renderTaskDirectoryList(slot) {
+  if (!taskDirectoryCurrent(slot)) return;
+  renderTaskDirectoryNotice(slot); slot.filter.value = slot.status;
+  const page = slot.page;
+  slot.position = element("span", { class: "task-directory-position", tabIndex: -1, text: `第 ${slot.starts.length} 页${page ? ` · 本页 ${page.items.length} 条${page.has_more ? " · 尚有后页" : " · 已到本次末页"}` : ""}` });
+  const previous = element("button", { type: "button", class: "text-button", text: "上一页", disabled: !!slot.controller || slot.starts.length < 2, onClick: () => { if (taskDirectoryCurrent(slot) && slot.navigation.contains(previous) && !previous.disabled) void loadTaskDirectory(slot, { cursor: slot.starts.at(-2), starts: slot.starts.slice(0, -1), focus: true }); } });
+  const next = element("button", { type: "button", class: "text-button", text: "继续翻页", disabled: !!slot.controller || !page?.has_more, onClick: () => { if (taskDirectoryCurrent(slot) && slot.navigation.contains(next) && !next.disabled) void loadTaskDirectory(slot, { cursor: page.next_cursor, starts: [...slot.starts, page.next_cursor], focus: true }); } });
+  slot.navigation.replaceChildren(previous, slot.position, next);
+  slot.result.setAttribute("aria-busy", String(!!slot.controller)); slot.result.replaceChildren();
+  if (slot.error) {
+    slot.result.append(element("p", { class: "form-error", role: "alert", text: slot.error }));
+    const retry = element("button", { type: "button", class: "secondary-button", text: "重试读取", onClick: () => { if (taskDirectoryCurrent(slot) && slot.result.contains(retry) && slot.retry) void loadTaskDirectory(slot, slot.retry); } });
+    slot.result.append(retry);
+  }
+  if (!page) return;
+  if (page.omitted_total > 0) slot.result.append(element("p", { class: "task-control-note", text: `部分记录未能列出（本页 ${["oversized", "invalid", "missing"].reduce((sum, key) => sum + page.omitted[key], 0)} 条，累计 ${page.omitted_total} 条）。` }));
+  if (!["end", "limit"].includes(page.stopped)) slot.result.append(element("p", { class: "task-control-note", text: "本次读取达到范围限制，可继续翻页核对。" }));
+  for (const item of page.items) {
+    const button = element("button", { type: "button", class: "text-button", text: "查看任务说明", dataset: { taskIdentifier: item.id }, onClick: () => void showTaskDirectoryBrief(slot, item, button) });
+    slot.result.append(element("article", { class: "record-row task-directory-row" }, element("div", { class: "row-content" }, element("h3", { text: item.title || "未命名任务" }), item.next_step && element("p", { text: item.next_step }), element("div", { class: "row-meta", text: `账本状态：${taskStatusLabels[item.status]}` }), item.details_omitted && element("small", { class: "task-control-note", text: "摘要不完整，请查看任务说明。" })), button));
+  }
+  if (!page.items.length) slot.result.append(emptyState("info", page.has_more ? "本页没有匹配任务，仍有后页" : page.omitted_total ? "本页没有可展示的任务" : "当前筛选下没有任务"));
+}
+
+function markTaskDirectoryDirty(item) {
+  const slot = taskDirectory;
+  if (!taskDirectoryCurrent(slot)) return;
+  slot.dirty = true; renderTaskDirectoryNotice(slot);
+  const detail = taskDirectoryDialog;
+  if (taskDirectoryDialogCurrent(detail) && detail.identifier === item?.id) {
+    detail.dirty = true; detail.controller?.abort(); detail.controller = null;
+    if (Number.isSafeInteger(item.revision) && item.revision > 0) detail.minimumRevision = Math.max(Number.isSafeInteger(detail.minimumRevision) ? detail.minimumRevision : 0, item.revision);
+    renderTaskDirectoryBrief(detail);
+  }
+}
+
 function renderTeam() {
-  const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")));
+  if (state.teamTab === "tasks") return renderTaskDirectory();
+  const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")), renderTeamTabs());
   root.append(actionButton("与沐璃安排协作", "configure-prompt", "configuration-link", "chat", { prompt: "请帮我安排一组协作任务：" }));
   const filter = element("div", { class: "team-filter", role: "group", "aria-label": "团队筛选" });
   for (const [active, label] of [[false, "全部"], [true, "进行中"]]) {
@@ -1736,7 +2267,7 @@ function memoryWatchActionCurrent(slot, item, trigger) {
 function memoryWatchPage(value, after) {
   const bad = () => { throw new Error("长期留意清单无法完整核查，请刷新。"); };
   if (!value || value.after_id !== after || !Array.isArray(value.items) || value.items.length > memoryWatchPageSize || typeof value.has_more !== "boolean" || !value.processing || typeof value.processing.enabled !== "boolean" || typeof value.processing.paused !== "boolean") bad();
-  if (value.has_more !== (value.items.length === memoryWatchPageSize) || (value.has_more ? value.next_after_id !== value.items.at(-1)?.id : value.next_after_id !== null)) bad();
+  if ((value.items.length === memoryWatchPageSize && !value.has_more) || (value.has_more ? !value.items.length || value.next_after_id !== value.items.at(-1)?.id : value.next_after_id !== null)) bad();
   let previous = after;
   for (const item of value.items) {
     const preference = item?.reply_preference;
@@ -1851,6 +2382,10 @@ function memorySourceNotice(source) {
   return /^attachment:[a-f0-9]{32}:transcript:v1:asr_text:[a-f0-9]{64}$/.test(source ?? "") ? "ASR 转写文本；仅核验已保存转写，不证明原音频、说话者或转写准确性。" : "";
 }
 
+function attachmentMemorySource(item) {
+  return !!item && /^attachment:[a-f0-9]{32}$/.test(item.source_id) && item.principal === "external:attachment" && item.role === "tool" && item.trusted_owner === false;
+}
+
 function renderMemorySources(slot) {
   slot.filterInput = element("select", { "aria-label": "来源整理状态" }, element("option", { value: "", text: "全部状态" }), ...Object.entries(memoryJobStates).map(([key, label]) => element("option", { value: key, text: label })));
   slot.filterInput.value = slot.filter;
@@ -1888,7 +2423,7 @@ function updateMemorySources(slot) {
     const read = element("button", { type: "button", class: "text-button", text: "核原文", disabled: loading, onClick: () => void showCatalogSource(slot, item, read) });
     const search = element("button", { type: "button", class: "text-button", text: "在此来源内查找", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, search)) void changeMemorySource(item.source_id); } });
     const actions = element("div", { class: "row-actions" }, read, search);
-    if (/^attachment:[a-f0-9]{32}$/.test(item.source_id) && item.principal === "external:attachment" && item.role === "tool" && !item.trusted_owner) {
+    if (attachmentMemorySource(item)) {
       const left = element("button", { type: "button", class: "text-button", text: "选作比较左侧", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, left)) { slot.compareLeft = { source_id: item.source_id, revision: item.revision }; updateMemorySources(slot); } } });
       actions.append(left);
       if (slot.compareLeft) {
@@ -1919,7 +2454,7 @@ async function loadMemorySources(slot, { cursor = null, filter = slot?.filter ??
     const query = new URLSearchParams({ limit: String(memorySourcePageSize) });
     if (cursor) query.set("cursor", cursor);
     if (filter) query.set("state", filter);
-    const payload = await request(`/memory/sources?${query}`, { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(`/memory/sources?${query}`, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     slot.page = memorySourcePage(payload, cursor); slot.cursor = cursor;
   } catch (error) {
@@ -1955,10 +2490,10 @@ async function showCatalogSource(catalog, item, trigger) {
   await openCatalogSource(item, trigger);
 }
 
-async function openCatalogSource(item, trigger, { anchor = null, comparisonReturn = null } = {}) {
+async function openCatalogSource(item, trigger, { anchor = null, comparisonReturn = null, uploadReturn = null } = {}) {
   const offset = anchor?.offset ?? 0;
   const content = element("div", { class: "memory-verification" });
-  openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger });
+  openDialog({ title: "核查来源原文", content, readOnly: true, returnMemoryId: item.source_id, returnMemoryTrigger: trigger, returnUploadTrigger: uploadReturn });
   const origin = { ...item, id: item.source_id, digest: item.revision };
   const slot = { id: item.source_id, sourceId: item.source_id, catalogSource: true, content, item: { source_id: item.source_id, origin }, offsets: [offset], sourceStart: offset, sourceAnchor: anchor, comparisonReturn, comparisonSources: comparisonReturn ? [comparisonReturn.pair.left_id, comparisonReturn.pair.right_id] : undefined, pageIndex: 0, page: null, editing: false };
   memoryDialog = slot;
@@ -2075,13 +2610,14 @@ async function changeMemorySource(sourceId) {
 }
 
 async function searchMemories(query) {
+  const owner = connection;
   cancelMemorySearch(); releaseMemoryPath();
   const controller = new AbortController(), version = ++viewRequestVersion;
   memorySearchController = controller; state.memoryQuery = query;
   const sourceId = state.memorySourceId;
-  const current = () => memorySearchController === controller && version === viewRequestVersion && sourceId === state.memorySourceId && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
+  const current = () => connectionCurrent(owner) && memorySearchController === controller && version === viewRequestVersion && sourceId === state.memorySourceId && state.view === "memories" && state.memoryTab === "list" && state.auth.authenticated;
   try {
-    const payload = await request(memorySearchPath(query, sourceId), { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(memorySearchPath(query, sourceId), { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     state.memories = memorySearchItems(payload, sourceId); state.memoryQueryPartial = !!sourceId && payload.truncated === true;
     state.memoryQueryDegraded = !!sourceId && payload.degraded?.some((code) => code.startsWith("semantic_unavailable:")) === true;
@@ -2106,7 +2642,7 @@ function memoryGraphPath(item) {
 }
 
 function memoryPathCurrent(slot) {
-  return memoryPath === slot && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && state.memorySourceId === slot.sourceId && $("#other-view").contains(slot.region) && !slot.region.hidden;
+  return !!slot && memoryPath === slot && connectionCurrent(slot.owner) && state.view === "memories" && state.memoryTab === "list" && state.memoryQuery === slot.query && state.memorySourceId === slot.sourceId && $("#other-view").contains(slot.region) && !slot.region.hidden;
 }
 
 function releaseMemoryPath() {
@@ -2137,19 +2673,20 @@ async function toggleMemoryPath(id, button, region, query) {
   if (state.view !== "memories" || state.memoryTab !== "list" || state.memoryQuery !== query || !root.contains(button) || !root.contains(region)) return;
   if (memoryPath?.button === button) { releaseMemoryPath(); button.focus({ preventScroll: true }); return; }
   releaseMemoryPath();
-  const slot = { id: String(id), query, sourceId: state.memorySourceId, button, region, controller: null, via: null };
+  const slot = { owner: connection, id: String(id), query, sourceId: state.memorySourceId, button, region, controller: null, via: null };
   memoryPath = slot; region.hidden = false; button.setAttribute("aria-expanded", "true");
   await loadMemoryPath(slot);
 }
 
 async function loadMemoryPath(slot) {
   if (!memoryPathCurrent(slot)) return;
+  const owner = slot.owner;
   slot.controller?.abort(); slot.via = null;
   const controller = new AbortController(); slot.controller = controller;
   if (slot.region.contains(document.activeElement)) slot.button.focus({ preventScroll: true });
   slot.region.replaceChildren(element("p", { role: "status", text: "正在读取路径…" }));
   try {
-    const payload = await request(memorySearchPath(slot.query, slot.sourceId), { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(memorySearchPath(slot.query, slot.sourceId), { signal: controller.signal, cache: "no-store" }, owner);
     if (!memoryPathCurrent(slot) || slot.controller !== controller) return;
     const item = memorySearchItems(payload, slot.sourceId).find((item) => String(item.id) === slot.id), via = memoryGraphPath(item);
     if (item?.path_omitted === true) { memoryPathNotice(slot, "召回路径因预算省略，请重新检索。"); return; }
@@ -2251,6 +2788,7 @@ function resetMemoryReads(slot) {
   for (const key of ["readController", "sourceController", "historyController"]) { slot[key]?.abort(); slot[key] = null; }
   slot.sourceRegion?.replaceChildren(); slot.historyList?.replaceChildren();
   slot.page = null; slot.offsets = [0]; slot.pageIndex = 0;
+  slot.pageOwner = null;
   slot.comparisonReturn = null; slot.sourceAnchor = null; slot.sourceStart = 0;
 }
 
@@ -2390,7 +2928,7 @@ async function loadMemorySource(slot, offset, index) {
     const page = await ownedRequest(path, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     if (!validMemorySource(page, slot, offset)) { memoryUnavailable(slot, "原文响应不一致，请重新核查。"); return; }
-    slot.page = page; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
+    slot.page = page; slot.pageOwner = owner; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
   } catch (error) {
     if (!current()) return;
     if ([404, 409].includes(error.status)) { memoryUnavailable(slot, error.status === 404 ? "原文已不可用。" : "原文已更新，请重新核查。"); return; }
@@ -2415,18 +2953,47 @@ function renderMemorySource(slot) {
     const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => { if (slot.sourceRegion.contains(next) && page.has_more) void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1); } });
     const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `${slot.sourceStart > 0 ? "从变化位置起 · " : ""}第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
     slot.sourceRegion.append(element("nav", { class: "memory-source-navigation", "aria-label": "原文分段" }, previous, position, next));
+    if (sourceQuestionPage(slot, page)) {
+      const question = element("button", { type: "button", class: "text-button", text: "带资料提问", disabled: !!slot.sourceController || !!slot.sourceError || !connectionCurrent(slot.pageOwner) || !slot.pageOwner?.ready || !state.auth.authenticated || !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareSourceQuestion(slot, page, question) });
+      slot.sourceRegion.append(question);
+    }
     if (focused) position.focus({ preventScroll: true });
   }
   if (slot.sourceStart > 0) {
     const start = element("button", { type: "button", class: "text-button", text: "从头阅读", disabled: !!slot.sourceController, onClick: () => {
       if (!memoryDialogCurrent(slot) || !slot.sourceRegion.contains(start) || slot.sourceController) return;
-      slot.page = null; slot.offsets = [0]; slot.pageIndex = 0; slot.sourceStart = 0; slot.sourceAnchor = null;
+      slot.page = null; slot.pageOwner = null; slot.offsets = [0]; slot.pageIndex = 0; slot.sourceStart = 0; slot.sourceAnchor = null;
       void loadMemorySource(slot, 0, 0);
     } });
     slot.sourceRegion.append(start);
   }
   if (slot.sourceController) slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: "正在读取…" }));
   if (slot.sourceError) slot.sourceRegion.append(element("p", { class: "form-error", text: slot.sourceError }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemorySource(slot, slot.sourceRetry.offset, slot.sourceRetry.index) }));
+}
+
+function sourceQuestionPage(slot, page) {
+  const origin = slot.item?.origin;
+  return slot.catalogSource && slot.page === page && attachmentMemorySource(origin) && attachmentMemorySource(page)
+    && page.source_id === slot.item.source_id && page.source_id === origin.id && page.revision === origin.digest
+    && ["source", "principal", "role", "trusted_owner"].every((key) => page[key] === origin[key]);
+}
+
+async function prepareSourceQuestion(slot, page, trigger) {
+  const owner = slot.pageOwner;
+  if (!connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || !state.connected || !memoryDialogCurrent(slot) || !slot.sourceRegion.contains(trigger) || trigger.disabled || slot.sourceController || slot.sourceError || !sourceQuestionPage(slot, page)) return;
+  const main = state.mainSessionId, draft = captureDraft();
+  if (!main || draft.session !== main) return;
+  const reference = `参考资料：请先用 memory_source 按以下 id 和 revision 核对原文，再回答我的问题；不可用时请说明，不改用其他版本。\n${JSON.stringify({ id: page.source_id, revision: page.revision })}`;
+  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+  const input = $("#message-input");
+  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入资料。", true); return; }
+  const navigation = viewRequestVersion + 1;
+  await switchView("chat", owner);
+  if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+  const current = captureDraft();
+  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  resizeComposer(); input.focus();
 }
 
 async function loadMemoryHistory(slot) {
@@ -2458,7 +3025,7 @@ function workflowActivityCurrent(slot) {
 
 function releaseWorkflowActivity() {
   const slot = workflowActivity; workflowActivity = null;
-  slot?.controller?.abort(); slot?.definitionsController.abort(); slot?.schedulesController?.abort();
+  slot?.controller?.abort(); slot?.definitionsController.abort(); slot?.schedulesController?.abort(); slot?.sourceController?.abort();
   if (slot) { slot.page = null; slot.schedulesPage = null; slot.schedulesStopping.clear(); }
   $("#workflow-active-runs")?.replaceChildren();
   $("#workflow-schedules")?.replaceChildren();
@@ -2660,7 +3227,41 @@ function renderWorkflowRun(run) {
   for (const node of Object.values(run.nodes ?? {})) details.append(element("div", { class: "workflow-run-node" }, element("span", { class: "workflow-node-status", text: labels[node.status] ?? node.status }), element("span", { text: node.title ?? node.id }), node.session_id && actionButton("会话", "workflow-session", "text-button", undefined, { session: node.session_id })));
   if (run.result) details.append(element("div", { class: "workflow-run-result" }, renderMarkdown(run.result)));
   if (run.error) details.append(element("p", { class: "form-error", text: run.error }));
+  if (["completed", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status) && run.parent_session_id === state.mainSessionId && !run.commitment_id && !run.schedule_id) details.append(actionButton("带资料继续", "workflow-source-draft", "text-button", undefined, { id: run.id }));
   return details;
+}
+
+async function prepareWorkflowSourceDraft(identifier, trigger) {
+  const slot = workflowActivity, owner = connection, version = viewRequestVersion;
+  const selected = () => state.workflows.flatMap((item) => item.runs ?? []).find((run) => run.id === identifier);
+  const observed = selected(), main = state.mainSessionId, draft = captureDraft(), input = $("#message-input");
+  if (!workflowActivityCurrent(slot) || !connectionCurrent(owner) || !owner.ready || !state.connected || !main || draft.session !== main || !$("#other-view").contains(trigger) || trigger.closest("[data-workflow-history-run]")?.dataset.workflowHistoryRun !== identifier || trigger.disabled || !observed) return;
+  slot.sourceController?.abort();
+  const controller = slot.sourceController = new AbortController();
+  const current = () => connectionCurrent(owner) && workflowActivityCurrent(slot) && slot.sourceController === controller && !controller.signal.aborted && viewRequestVersion === version && selected() === observed && $("#other-view").contains(trigger);
+  trigger.disabled = true;
+  try {
+    const evidence = await ownedRequest(`/workflow-runs/${encodeURIComponent(identifier)}/inspection`, { signal: controller.signal, cache: "no-store" }, owner, current);
+    if (!current()) return;
+    if (evidence?.run_id !== identifier || typeof evidence.revision !== "string" || !/^[a-f0-9]{64}$/.test(evidence.revision)) throw new Error("工作流资料响应不完整，请重新读取。");
+    const reference = `参考工作流资料：请先用 workflow_inspect 核对下列运行和版本，再按我的新要求安排后续工作；不要重做旧操作。\n${JSON.stringify({ run_id: identifier, revision: evidence.revision })}`;
+    const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+    if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入资料。", true); return; }
+    const latest = captureDraft();
+    if (latest.session !== draft.session || latest.revision !== draft.revision || latest.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+    const navigation = viewRequestVersion + 1;
+    await switchView("chat", owner);
+    if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+    const next = captureDraft();
+    if (next.session !== draft.session || next.revision !== draft.revision || next.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+    if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+    resizeComposer(); input.focus();
+  } catch (error) {
+    if (current() && error.name !== "AbortError") showError(error);
+  } finally {
+    if (slot.sourceController === controller) slot.sourceController = null;
+    if (connectionCurrent(owner) && $("#other-view").contains(trigger)) trigger.disabled = false;
+  }
 }
 
 function workflowTemplates() {
@@ -2880,6 +3481,7 @@ async function refreshSettingsResources(owner = connection, current = () => true
     if (state.settingsStatusErrors.management) errors.management = state.settingsStatusErrors.management;
   }
   state.settingsStatusErrors = errors;
+  syncChannelDeliveryScope();
   if (canConfirm && managementCurrent && !attempt.pending && !Object.hasOwn(errors, "management")) attempt.confirmed = true;
 }
 
@@ -2991,10 +3593,207 @@ function deliveryLabel(value) {
 function renderDeliveries() {
   if (!state.channels) return null;
   const details = element("details", { class: "advanced-settings" }, element("summary", { text: "最近发送记录" }));
+  details.append(actionButton("查看发送内容", "channel-deliveries", "text-button field-top-space", "search"));
   const deliveries = state.channels.deliveries ?? [];
   if (!deliveries.length) details.append(element("p", { class: "settings-role-hint", text: "暂无发送记录。" }));
   for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown", "blocked"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
   return details;
+}
+
+function channelDeliveryScopes() {
+  if (state.settingsStatusErrors.channels || !state.mainSessionId) return [];
+  return CHANNELS.flatMap(([channel]) => {
+    const profile = state.settings?.channels?.[channel], status = state.channels?.channels?.[channel];
+    if (!profile?.enabled || status?.enabled !== true || typeof status.account_id !== "string" || !status.account_id || !Array.isArray(profile.owner_ids)) return [];
+    return [...new Set(profile.owner_ids)].filter((owner) => typeof owner === "string" && owner).map((ownerId) => ({ channel, ownerId, accountId: status.account_id, sessionId: state.mainSessionId, profile: JSON.stringify(profile) }));
+  });
+}
+
+function sameChannelDeliveryScope(left, right) {
+  return !!left && !!right && ["channel", "ownerId", "accountId", "sessionId", "profile"].every((key) => left[key] === right[key]);
+}
+
+function channelDeliveryDialogCurrent(slot) {
+  return !!slot && channelDeliveryDialog === slot && connectionCurrent(slot.owner) && state.auth.authenticated && state.view === "settings" && state.settingsTab === "channels"
+    && document.visibilityState !== "hidden" && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content
+    && (!slot.scope || channelDeliveryScopes().some((scope) => sameChannelDeliveryScope(scope, slot.scope)));
+}
+
+function releaseChannelDeliveryDialog() {
+  const slot = channelDeliveryDialog; channelDeliveryDialog = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.scope = null; slot.page = null; slot.bodyPage = null; slot.selected = null; slot.retry = null;
+  slot.starts = []; slot.offsets = []; slot.content.replaceChildren();
+}
+
+function closeChannelDeliveryDialog() {
+  if (!channelDeliveryDialog) return;
+  const owned = $("#dialog-content").firstElementChild === channelDeliveryDialog.content;
+  releaseChannelDeliveryDialog();
+  if (owned) $("#app-dialog").close();
+}
+
+function syncChannelDeliveryScope() {
+  if (channelDeliveryDialog && !channelDeliveryDialogCurrent(channelDeliveryDialog)) closeChannelDeliveryDialog();
+}
+
+function showChannelDeliveries(trigger) {
+  if (state.view !== "settings" || state.settingsTab !== "channels" || !connectionCurrent(connection) || !state.auth.authenticated) return;
+  const content = element("div", { class: "history-archive" });
+  openDialog({ title: "查看发送内容", content, readOnly: true });
+  const slot = channelDeliveryDialog = { owner: connection, content, scope: channelDeliveryScopes()[0] ?? null, controller: null, mode: "list", page: null, bodyPage: null, selected: null, cursor: null, starts: [null], offsets: [0], part: 0, offset: 0, revision: null, totalBytes: null, error: "", retry: null, dirty: false, focusAfterLoad: false, returnId: null };
+  dialogChannelDeliveryReturn = { owner: connection, trigger };
+  renderChannelDeliveryDialog(slot);
+  const heading = $("#dialog-title"); heading.tabIndex = -1; heading.focus({ preventScroll: true });
+}
+
+function selectChannelDeliveryScope(slot, channel, ownerId = null) {
+  if (!channelDeliveryDialogCurrent(slot)) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.scope = channelDeliveryScopes().find((scope) => scope.channel === channel && (ownerId === null || scope.ownerId === ownerId)) ?? null;
+  slot.mode = "list"; slot.page = null; slot.bodyPage = null; slot.selected = null;
+  slot.cursor = null; slot.starts = [null]; slot.offsets = [0]; slot.part = 0; slot.offset = 0; slot.revision = null; slot.totalBytes = null;
+  slot.error = ""; slot.retry = null; slot.dirty = false;
+  renderChannelDeliveryDialog(slot);
+  $(`[name="${ownerId === null ? "delivery-channel" : "delivery-owner"}"]`, slot.content)?.focus({ preventScroll: true });
+}
+
+function channelDeliveryHeaderValid(page, scope) {
+  return page?.source === "local" && page.coverage === "saved_by_muli" && page.consistency === "live" && page.channel === scope.channel && page.owner_id === scope.ownerId && page.account_id === scope.accountId && page.session_id === scope.sessionId;
+}
+
+function channelDeliveryMetadataValid(item) {
+  return item && ["pending", "retry", "sending", "sent", "failed", "blocked", "unknown"].includes(item.state)
+    && Number.isSafeInteger(item.total_parts) && item.total_parts > 0 && Number.isSafeInteger(item.confirmed_parts) && item.confirmed_parts >= 0 && item.confirmed_parts <= item.total_parts
+    && typeof item.created_at === "number" && Number.isFinite(item.created_at) && item.created_at > 0
+    && Array.isArray(item.attachment_ids) && item.attachment_ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256);
+}
+
+function channelDeliveryDirectoryValid(page, scope, cursor) {
+  return channelDeliveryHeaderValid(page, scope) && Array.isArray(page.items) && page.items.length <= channelDeliveryPageSize
+    && page.items.every((item) => channelDeliveryMetadataValid(item) && item.kind === "delivery" && item.role === "assistant" && typeof item.id === "string" && item.id && !item.id.includes("\0"))
+    && new Set(page.items.map((item) => item.id)).size === page.items.length && Number.isSafeInteger(page.omitted) && page.omitted >= 0 && typeof page.has_more === "boolean"
+    && (page.has_more ? typeof page.next_cursor === "string" && !!page.next_cursor && page.next_cursor !== cursor : page.next_cursor === null);
+}
+
+async function loadChannelDeliveryPage(slot, cursor = null, starts = [null], returnId = null) {
+  if (!channelDeliveryDialogCurrent(slot) || !slot.scope) return;
+  slot.focusAfterLoad = slot.content.contains(document.activeElement);
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const scope = slot.scope;
+  const current = () => channelDeliveryDialogCurrent(slot) && slot.controller === controller && slot.scope === scope;
+  slot.mode = "list"; slot.page = null; slot.bodyPage = null; slot.selected = null; slot.error = "";
+  slot.retry = () => void loadChannelDeliveryPage(slot, cursor, starts, returnId);
+  slot.revision = null; slot.totalBytes = null; slot.offsets = [0];
+  renderChannelDeliveryDialog(slot);
+  try {
+    const query = new URLSearchParams({ channel: scope.channel, owner_id: scope.ownerId, limit: String(channelDeliveryPageSize) });
+    if (cursor !== null) query.set("cursor", cursor);
+    const page = await ownedRequest(`/channels/deliveries?${query}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    if (!channelDeliveryDirectoryValid(page, scope, cursor)) throw new Error("发送记录响应不一致，请重新读取。");
+    slot.page = page; slot.cursor = cursor; slot.starts = starts; slot.returnId = returnId; slot.dirty = false;
+  } catch (error) {
+    if (!current()) return;
+    slot.error = error.status === 403 ? "当前渠道或主人绑定已不可读取，请刷新渠道状态重新选择。" : error.status === 404 ? "当前主会话或发送记录已不可用。" : error.message;
+    if (error.status === 403) slot.retry = null;
+  } finally {
+    if (current()) { slot.controller = null; renderChannelDeliveryDialog(slot); }
+  }
+}
+
+function channelDeliveryContentValid(page, slot, part, offset, revision, totalBytes) {
+  return channelDeliveryHeaderValid(page, slot.scope) && channelDeliveryMetadataValid(page) && page.delivery_id === slot.selected.id && page.part === part && page.total_parts === slot.selected.total_parts
+    && typeof page.revision === "string" && !!page.revision && (revision === null || page.revision === revision) && page.field === "content" && typeof page.content === "string"
+    && [page.offset_bytes, page.total_bytes, page.length_bytes, page.next_offset_bytes].every((value) => Number.isSafeInteger(value) && value >= 0)
+    && page.offset_bytes === offset && (totalBytes === null || page.total_bytes === totalBytes) && page.length_bytes === new TextEncoder().encode(page.content).length
+    && page.next_offset_bytes === offset + page.length_bytes && page.next_offset_bytes <= page.total_bytes && typeof page.has_more === "boolean" && page.has_more === (page.next_offset_bytes < page.total_bytes)
+    && (!page.has_more || page.length_bytes > 0) && (!page.attachment_ids.length || page.total_bytes === 0);
+}
+
+async function selectChannelDelivery(slot, item) {
+  if (!channelDeliveryDialogCurrent(slot)) return;
+  slot.selected = item; slot.page = null;
+  await loadChannelDeliveryContent(slot, 0);
+}
+
+async function loadChannelDeliveryContent(slot, part, offset = 0, offsets = [0], revision = null, totalBytes = null) {
+  if (!channelDeliveryDialogCurrent(slot) || !slot.selected || !Number.isSafeInteger(part) || part < 0 || part >= slot.selected.total_parts) return;
+  slot.focusAfterLoad = slot.content.contains(document.activeElement);
+  slot.controller?.abort(); const controller = new AbortController(); slot.controller = controller;
+  const scope = slot.scope, selected = slot.selected;
+  const current = () => channelDeliveryDialogCurrent(slot) && slot.controller === controller && slot.scope === scope && slot.selected === selected;
+  slot.mode = "body"; slot.bodyPage = null; slot.part = part; slot.offset = offset; slot.revision = revision; slot.totalBytes = totalBytes; slot.offsets = offsets; slot.error = "";
+  slot.retry = () => void loadChannelDeliveryContent(slot, part, offset, offsets, revision, totalBytes);
+  renderChannelDeliveryDialog(slot);
+  try {
+    const query = new URLSearchParams({ channel: scope.channel, owner_id: scope.ownerId, part: String(part), offset_bytes: String(offset) });
+    if (revision !== null) query.set("revision", revision);
+    const page = await ownedRequest(`/channels/deliveries/${encodeURIComponent(selected.id)}/content?${query}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    if (!channelDeliveryContentValid(page, slot, part, offset, revision, totalBytes)) throw new Error("分段正文响应不一致，请返回记录重新选择。");
+    slot.bodyPage = page; slot.revision = page.revision; slot.totalBytes = page.total_bytes;
+  } catch (error) {
+    if (!current()) return;
+    slot.error = error.status === 403 ? "当前渠道或主人绑定已不可读取，请刷新渠道状态重新选择。" : error.status === 404 ? "所选发送分段已不可用，请返回记录。" : error.status === 409 ? "所选发送分段已更新，请返回记录重新选择。" : error.message;
+    if ([403, 404, 409].includes(error.status)) { slot.retry = null; slot.offsets = [0]; slot.revision = null; slot.totalBytes = null; }
+  } finally {
+    if (current()) { slot.controller = null; renderChannelDeliveryDialog(slot); }
+  }
+}
+
+function channelDeliveryPartLabel(item, part) {
+  return part < item.confirmed_parts ? "平台已确认" : item.state === "unknown" && part === item.confirmed_parts ? "结果未知" : "尚未确认";
+}
+
+function renderChannelDeliveryAttachments(ids) {
+  return ids.map((id) => {
+    const file = state.uploads.find((entry) => entry.id === id);
+    return element("div", {}, element("p", { class: "history-note", text: `附件引用：${id}` }), file ? renderAttachment(file, { compact: true }) : element("p", { class: "history-note", text: "当前页面未载入此附件的元信息，可按准确引用核查。" }));
+  });
+}
+
+function renderChannelDeliveryDialog(slot) {
+  if (!channelDeliveryDialogCurrent(slot)) return;
+  const root = slot.content, focus = slot.focusAfterLoad && (root.contains(document.activeElement) || document.activeElement === document.body);
+  root.setAttribute("aria-busy", String(!!slot.controller)); root.replaceChildren();
+  if (slot.controller) $("#dialog-content").scrollTop = 0;
+  const scopes = channelDeliveryScopes(), channels = CHANNELS.filter(([name]) => scopes.some((scope) => scope.channel === name));
+  if (!slot.scope) { root.append(element("p", { role: "status", text: "请先应用一个已启用渠道和主人私聊绑定，再从这里核查发送记录。" })); return; }
+  const channel = selectField("消息渠道", "delivery-channel", slot.scope.channel, channels);
+  const owners = scopes.filter((scope) => scope.channel === slot.scope.channel).map((scope) => [scope.ownerId, scope.ownerId]);
+  const owner = selectField("主人私聊", "delivery-owner", slot.scope.ownerId, owners);
+  $("select", channel).addEventListener("change", (event) => selectChannelDeliveryScope(slot, event.target.value));
+  $("select", owner).addEventListener("change", (event) => selectChannelDeliveryScope(slot, slot.scope.channel, event.target.value));
+  root.append(element("div", { class: "field-row" }, channel, owner), element("p", { class: "history-note", text: `MuLi 本地保存的发送记录 · 账号 ${slot.scope.accountId} · 主人私聊 ${slot.scope.ownerId}。平台已确认不表示已读或已播放。` }));
+  if (state.channels?.preview === true) root.append(element("p", { class: "settings-notice", text: "当前显示本页模拟记录，没有连接或读取真实消息渠道。" }));
+  slot.dirtyNotice = element("p", { class: "settings-notice", role: "status", text: "渠道状态已有更新，可返回记录后手动刷新。", hidden: !slot.dirty }); root.append(slot.dirtyNotice);
+  if (slot.mode === "list") {
+    root.append(element("button", { type: "button", class: "text-button", text: slot.page ? "刷新记录" : "读取记录", onClick: () => void loadChannelDeliveryPage(slot) }));
+    if (slot.page) {
+      root.append(element("nav", { class: "history-navigation", "aria-label": "发送记录分页" }, element("button", { type: "button", class: "text-button", text: "上一页", disabled: slot.starts.length < 2, onClick: () => void loadChannelDeliveryPage(slot, slot.starts.at(-2), slot.starts.slice(0, -1)) }), element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.starts.length} 页 · ${slot.page.has_more ? "尚有更早记录" : "本次查询已到末页"}` }), element("button", { type: "button", class: "text-button", text: "下一页", disabled: !slot.page.has_more, onClick: () => void loadChannelDeliveryPage(slot, slot.page.next_cursor, [...slot.starts, slot.page.next_cursor]) })));
+      if (slot.page.omitted) root.append(element("p", { class: "history-note", text: `此页有 ${slot.page.omitted} 条候选记录未能完整核验，已省略。` }));
+      for (const item of slot.page.items) root.append(element("article", { class: "history-message" }, element("p", { text: `${deliveryLabel(item.state)} · 平台已确认 ${item.confirmed_parts}/${item.total_parts} 分段 · ${formatFullDate(item.created_at)}` }), element("p", { class: "history-note", text: `投递 ID：${item.id}` }), renderChannelDeliveryAttachments(item.attachment_ids), element("button", { type: "button", class: "text-button", text: "查看分段", dataset: { channelDeliveryId: item.id }, onClick: () => void selectChannelDelivery(slot, item) })));
+      if (!slot.page.items.length) root.append(element("p", { role: "status", text: slot.page.has_more ? "此页没有可展示记录，仍可手动读取下一页。" : "此页没有保存的发送记录。" }));
+    }
+  } else {
+    root.append(element("button", { type: "button", class: "text-button", text: "返回记录", onClick: () => void loadChannelDeliveryPage(slot, slot.cursor, slot.starts, slot.selected.id) }));
+    const item = slot.bodyPage ?? slot.selected;
+    root.append(element("p", { class: "history-note", text: `投递 ID：${slot.selected.id} · ${deliveryLabel(item.state)} · 平台已确认 ${item.confirmed_parts}/${item.total_parts} 分段` }), element("nav", { class: "history-navigation", "aria-label": "发送分段" }, element("button", { type: "button", class: "text-button", text: "上一分段", disabled: slot.part === 0, onClick: () => void loadChannelDeliveryContent(slot, slot.part - 1) }), element("span", { class: "history-position", tabIndex: -1, text: `分段 ${slot.part + 1}/${item.total_parts} · ${channelDeliveryPartLabel(item, slot.part)}` }), element("button", { type: "button", class: "text-button", text: "下一分段", disabled: slot.part + 1 >= item.total_parts, onClick: () => void loadChannelDeliveryContent(slot, slot.part + 1) })));
+    const page = slot.bodyPage;
+    if (page) {
+      root.append(element("nav", { class: "history-navigation", "aria-label": "分段正文窗口" }, element("button", { type: "button", class: "text-button", text: "上一窗口", disabled: slot.offsets.length < 2, onClick: () => void loadChannelDeliveryContent(slot, slot.part, slot.offsets.at(-2), slot.offsets.slice(0, -1), slot.revision, slot.totalBytes) }), element("span", { class: "history-position", tabIndex: -1, text: `字节 ${page.offset_bytes}–${page.next_offset_bytes}/${page.total_bytes} · ${page.has_more ? "尚有后文" : "已到本分段末尾"}` }), element("button", { type: "button", class: "text-button", text: "下一窗口", disabled: !page.has_more, onClick: () => void loadChannelDeliveryContent(slot, slot.part, page.next_offset_bytes, [...slot.offsets, page.next_offset_bytes], slot.revision, slot.totalBytes) })));
+      if (page.attachment_ids.length) root.append(...renderChannelDeliveryAttachments(page.attachment_ids));
+      else root.append(element("pre", { class: "history-content", text: page.content }));
+    }
+  }
+  if (slot.controller) root.append(element("p", { class: "history-note", role: "status", text: "正在读取…" }));
+  if (slot.error) root.append(element("p", { class: "form-error", role: "alert", text: slot.error }), slot.retry && element("button", { type: "button", class: "text-button", text: "重试读取", onClick: slot.retry }));
+  if (!slot.controller && slot.focusAfterLoad) {
+    if (focus) (slot.returnId && $$("[data-channel-delivery-id]", root).find((button) => button.dataset.channelDeliveryId === slot.returnId) || $(".history-position", root) || $("#dialog-title")).focus({ preventScroll: true });
+    slot.focusAfterLoad = false;
+  }
 }
 
 function renderInputSettings() {
@@ -3171,15 +3970,184 @@ function renderToolSettings() {
   const config = state.settingsDraft;
   const search = config.search ?? {};
   const computer = config.computer ?? {};
-  const list = element("div");
-  for (const tool of state.status?.tools ?? []) {
-    list.append(element("div", { class: "tool-permission-row" }, element("div", {}, element("h4", { text: tool.name }), element("p", { text: tool.description || (tool.enabled === false ? "未启用" : "已启用") })), element("span", { class: "row-tag", text: tool.risk || "工具" }), element("input", { type: "checkbox", class: "switch", name: `tool-enabled:${tool.name}`, checked: !(config.disabled_tools ?? []).includes(tool.name), role: "switch", "aria-label": `启用 ${tool.name}` })));
-  }
   return element("div", {},
     settingsSection("执行权限", selectField("默认模式", "default_mode", config.default_mode ?? "auto", Object.entries(MODES).map(([key, mode]) => [key, `${mode.label} · ${mode.description}`])), field("允许的工作目录", "workspace_roots", (config.workspace_roots ?? []).join("\n"), { type: "textarea", rows: 3, format: "lines", hint: "每行一个目录。" })),
     settingsSection("联网搜索", selectField("服务", "search.provider", search.provider ?? "searxng", [["searxng", "SearXNG"], ["brave", "Brave Search"], ["tavily", "Tavily"]]), field("服务地址", "search.base_url", search.base_url ?? "", { type: "url" }), element("div", { class: "field-row" }, field("API Key 环境变量", "search.api_key_env", search.api_key_env ?? ""), field("结果数量", "search.max_results", search.max_results ?? "", { type: "number", min: 1, max: 20 })), field("API Key", "search.api_key", search.api_key ?? "", { type: "password", placeholder: search.api_key_set ? "已配置，留空保留" : "可选" }), search.api_key_set && switchField("清除已存 API Key", "search.clear_api_key", false)),
     settingsSection("电脑操作", switchField("启用电脑操作", "computer.enabled", computer.enabled), field("后端", "computer.backend", computer.backend ?? "auto"), field("Linux Python 路径", "computer.python_path", computer.python_path ?? "", { placeholder: "使用默认运行环境" }), element("p", { text: state.status?.computer?.available ? "电脑操作已就绪。" : state.status?.computer?.reason || "电脑操作暂不可用。" })),
-    list.children.length ? settingsSection("已注册工具", list) : null);
+    renderCapabilityCatalog());
+}
+
+function releaseCapabilityCatalog() {
+  const slot = capabilityCatalog;
+  capabilityCatalog = null;
+  slot?.controller?.abort();
+  slot?.detailController?.abort();
+}
+
+function capabilityCatalogCurrent(slot) {
+  return !!slot && capabilityCatalog === slot && connectionCurrent(slot.owner) && state.auth.authenticated
+    && state.view === "settings" && state.settingsTab === "tools" && slot.draft === state.settingsDraft && slot.viewVersion === viewRequestVersion;
+}
+
+function syncCapabilityCatalogScope() {
+  if (capabilityCatalog && !capabilityCatalogCurrent(capabilityCatalog)) releaseCapabilityCatalog();
+}
+
+function clearCapabilityTool(slot) {
+  slot.detailController?.abort(); slot.detailController = null;
+  slot.detailVersion += 1; slot.selected = null; slot.detail = null; slot.detailLoading = false; slot.detailError = "";
+}
+
+function capabilityOriginLabel(origin, remote = true) {
+  if (origin.kind === "mcp") return `MCP · ${origin.server}${remote ? ` · ${origin.remote_name}` : ""}`;
+  if (origin.kind === "mcp_interface") return "MCP 接口";
+  if (origin.kind === "plugin") return `插件 · ${origin.plugin_id}`;
+  return "来源未记录 · 本地注册集合";
+}
+
+function capabilityOriginKey(origin) {
+  return JSON.stringify([origin.kind, origin.kind === "mcp" ? origin.server : origin.kind === "plugin" ? origin.plugin_id : null]);
+}
+
+function validCapabilityTool(tool) {
+  if (!tool || typeof tool.id !== "string" || !tool.id || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string"
+    || typeof tool.risk !== "string" || typeof tool.requires_approval !== "boolean" || typeof tool.enabled !== "boolean") return false;
+  const origin = tool.origin;
+  return !!origin && (origin.kind === "unrecorded" || origin.kind === "mcp_interface"
+    || origin.kind === "mcp" && typeof origin.server === "string" && typeof origin.remote_name === "string"
+    || origin.kind === "plugin" && typeof origin.plugin_id === "string");
+}
+
+function capabilityReadError(error, detail = false) {
+  const code = error.details?.detail?.code;
+  if (code === "capability_catalog_stale" || error.status === 409) return "工具目录已变化，请刷新目录后重新查看参数。";
+  if (code === "capability_contract_sensitive") return detail ? "参数契约包含敏感值，无法完整显示。" : "工具目录包含敏感值，无法完整显示。";
+  if (code === "capability_contract_invalid") return "工具契约不是可完整显示的 JSON，未显示参数。";
+  if (code === "capability_payload_too_large" || error.status === 413) return detail ? "参数契约超过当前显示限额，无法完整显示。" : "工具目录超过当前显示限额，未显示不完整列表。";
+  if (code === "capability_not_found" || error.status === 404 && detail) return "该工具详情已不可用，请刷新目录。";
+  return detail ? "暂时无法读取完整参数，请重试或刷新目录。" : "暂时无法读取工具目录，请刷新目录重试。";
+}
+
+function capabilityDraftLabel(tool) {
+  const enabled = !(state.settingsDraft.disabled_tools ?? []).includes(tool.name);
+  return `草稿：${enabled ? "启用" : "停用"}${enabled !== tool.enabled ? "（尚未保存）" : ""}`;
+}
+
+function renderCapabilityCatalog() {
+  syncCapabilityCatalogScope();
+  const slot = capabilityCatalog ??= { owner: connection, draft: state.settingsDraft, viewVersion: viewRequestVersion, requested: false, loading: false, version: 0,
+    controller: null, page: null, error: "", query: "", source: "", selected: null, detail: null, detailError: "", detailLoading: false, detailController: null, detailVersion: 0, root: null };
+  const search = element("input", { type: "search", value: slot.query, placeholder: "搜索名称、用途或来源", "aria-label": "搜索工具" });
+  const source = element("select", { "aria-label": "工具来源" });
+  const refresh = actionButton("刷新目录", "refresh-capability-catalog", "text-button", "refresh");
+  const root = settingsSection("已注册工具",
+    element("p", { text: `${state.status?.preview ? "这是当前页面内存中的模拟工具目录。" : "这里只展示当前服务已注册的工具。"}启用状态不代表某一轮模型获准调用；开关修改草稿，保存设置后生效。` }),
+    element("div", { class: "field-row" }, element("label", { class: "field" }, element("span", { text: "搜索工具" }), search), element("label", { class: "field" }, element("span", { text: "工具来源" }), source)),
+    element("div", { class: "capability-catalog-actions" }, refresh,
+      element("button", { type: "button", class: "text-button", text: "MCP 与 Skills 设置", dataset: { settingsTab: "connections" } }),
+      element("button", { type: "button", class: "text-button", text: "本地插件设置", dataset: { settingsTab: "maintenance" } })),
+    element("p", { id: "capability-catalog-status", role: "status", "aria-live": "polite" }),
+    element("div", { id: "capability-catalog-results" }), element("div", { id: "capability-catalog-detail" }));
+  slot.root = root;
+  search.addEventListener("input", () => {
+    if (!capabilityCatalogCurrent(slot) || slot.root !== root) return;
+    collectSettingsForm(); slot.query = search.value; clearCapabilityTool(slot); updateCapabilityCatalog(slot);
+  });
+  source.addEventListener("change", () => {
+    if (!capabilityCatalogCurrent(slot) || slot.root !== root) return;
+    collectSettingsForm(); slot.source = source.value; clearCapabilityTool(slot); updateCapabilityCatalog(slot);
+  });
+  updateCapabilityOrigins(slot);
+  updateCapabilityCatalog(slot, false);
+  return root;
+}
+
+function updateCapabilityOrigins(slot) {
+  const source = $('select[aria-label="工具来源"]', slot.root);
+  const origins = new Map((slot.page?.items ?? []).map((tool) => [capabilityOriginKey(tool.origin), capabilityOriginLabel(tool.origin, false)]));
+  if (slot.source && !origins.has(slot.source)) slot.source = "";
+  source.replaceChildren(element("option", { value: "", text: "全部来源" }), ...[...origins].map(([value, text]) => element("option", { value, text })));
+  source.value = slot.source;
+}
+
+function updateCapabilityCatalog(slot, collect = true) {
+  if (!capabilityCatalogCurrent(slot) || !slot.root) return;
+  if (collect) collectSettingsForm();
+  const refresh = $('[data-action="refresh-capability-catalog"]', slot.root);
+  refresh.disabled = slot.loading;
+  const status = $("#capability-catalog-status", slot.root);
+  const query = slot.query.trim().toLocaleLowerCase();
+  const items = (slot.page?.items ?? []).filter((tool) => (!slot.source || capabilityOriginKey(tool.origin) === slot.source)
+    && (!query || `${tool.name}\n${tool.description}\n${capabilityOriginLabel(tool.origin)}`.toLocaleLowerCase().includes(query)));
+  status.textContent = slot.loading ? "正在读取已注册工具…" : slot.error || (slot.page ? `显示 ${items.length} / ${slot.page.items.length} 个已注册工具。` : "尚未读取工具目录。");
+  status.className = slot.error ? "form-error" : "settings-role-hint";
+  const list = $("#capability-catalog-results", slot.root);
+  list.replaceChildren();
+  if (slot.page && !items.length) list.append(element("p", { class: "settings-role-hint", text: slot.page.items.length ? "没有匹配的工具，请调整搜索或来源筛选。" : "当前服务尚未注册工具。" }));
+  for (const tool of items) {
+    const draft = element("p", { text: capabilityDraftLabel(tool) });
+    const toggle = element("input", { type: "checkbox", class: "switch", name: `tool-enabled:${tool.name}`, checked: !(state.settingsDraft.disabled_tools ?? []).includes(tool.name), role: "switch", "aria-label": `启用 ${tool.name}` });
+    toggle.addEventListener("change", () => { if (capabilityCatalogCurrent(slot) && slot.root.contains(toggle)) { collectSettingsForm(); draft.textContent = capabilityDraftLabel(tool); } });
+    const view = actionButton("查看参数", "view-capability-tool", "text-button", undefined, { capabilityId: tool.id });
+    list.append(element("div", { class: "tool-permission-row" }, element("div", {}, element("h4", { text: tool.name }), element("p", { text: tool.description }),
+      element("p", { text: capabilityOriginLabel(tool.origin) }), element("p", { text: `已保存：${tool.enabled ? "启用" : "停用"}` }), draft,
+      element("p", { text: tool.requires_approval ? "调用需要审批" : "仍受当前执行模式与权限限制" }), view), element("span", { class: "row-tag", text: tool.risk || "工具" }), toggle));
+  }
+  const detail = $("#capability-catalog-detail", slot.root);
+  detail.replaceChildren();
+  if (slot.selected) {
+    detail.append(element("h4", { text: slot.selected.name }), actionButton("关闭参数", "close-capability-tool", "text-button"));
+    if (slot.detailLoading) detail.append(element("p", { role: "status", text: "正在读取完整参数…" }));
+    else if (slot.detailError) detail.append(element("p", { class: "form-error", role: "status", text: slot.detailError }));
+    else if (slot.detail) detail.append(element("details", { class: "advanced-settings", open: true }, element("summary", { text: "完整参数 JSON" }), element("pre", { class: "service-log", text: pretty(slot.detail.parameters) })));
+  }
+}
+
+async function loadCapabilityCatalog(slot = capabilityCatalog) {
+  if (!capabilityCatalogCurrent(slot)) return;
+  collectSettingsForm();
+  slot.controller?.abort(); clearCapabilityTool(slot);
+  const controller = new AbortController(), version = ++slot.version;
+  slot.controller = controller; slot.requested = true; slot.loading = true; slot.error = ""; slot.page = null;
+  const current = () => capabilityCatalogCurrent(slot) && slot.version === version;
+  updateCapabilityCatalog(slot);
+  try {
+    const page = await ownedRequest("/capabilities", { cache: "no-store", signal: controller.signal }, slot.owner, current);
+    if (!current()) return;
+    if (page?.scope !== "registered_tools" || typeof page.revision !== "string" || !page.revision || page.complete !== true || !Array.isArray(page.items)
+      || !page.items.every(validCapabilityTool) || new Set(page.items.map((tool) => tool.id)).size !== page.items.length) throw new Error("工具目录响应无效");
+    collectSettingsForm(); slot.page = page;
+    updateCapabilityOrigins(slot);
+  } catch (error) {
+    if (current() && error.name !== "AbortError") { collectSettingsForm(); slot.page = null; slot.error = capabilityReadError(error); }
+  } finally {
+    if (current()) { slot.loading = false; slot.controller = null; updateCapabilityCatalog(slot); }
+  }
+}
+
+async function loadCapabilityTool(id) {
+  const slot = capabilityCatalog, selected = slot?.page?.items.find((tool) => tool.id === id);
+  if (!capabilityCatalogCurrent(slot) || !selected || slot.loading) return;
+  collectSettingsForm(); clearCapabilityTool(slot);
+  const controller = new AbortController(), version = slot.detailVersion, revision = slot.page.revision;
+  slot.selected = selected; slot.detailController = controller; slot.detailLoading = true;
+  const current = () => capabilityCatalogCurrent(slot) && slot.detailVersion === version && slot.selected === selected && slot.page?.revision === revision;
+  updateCapabilityCatalog(slot);
+  try {
+    const page = await ownedRequest(`/capabilities/tools/${encodeURIComponent(selected.id)}?${new URLSearchParams({ revision })}`, { cache: "no-store", signal: controller.signal }, slot.owner, current);
+    if (!current()) return;
+    if (page?.scope !== "registered_tools" || page.revision !== revision || !validCapabilityTool(page.tool) || page.tool.id !== selected.id || page.tool.name !== selected.name
+      || !page.tool.parameters || typeof page.tool.parameters !== "object" || Array.isArray(page.tool.parameters)) throw new Error("工具参数响应无效");
+    collectSettingsForm(); slot.detail = page.tool;
+  } catch (error) {
+    if (current() && error.name !== "AbortError") {
+      collectSettingsForm(); slot.detailError = capabilityReadError(error, true);
+      if (error.status === 409) { slot.error = slot.detailError; slot.page = null; clearCapabilityTool(slot); }
+    }
+  } finally {
+    if (current()) { slot.detailLoading = false; slot.detailController = null; updateCapabilityCatalog(slot); }
+    else if (capabilityCatalogCurrent(slot) && !slot.page) updateCapabilityCatalog(slot);
+  }
 }
 
 function renderConnectionSettings() {
@@ -3360,6 +4328,7 @@ async function saveSettings(event) {
     const results = await Promise.allSettled([request("/settings"), refreshSettingsResources()]);
     if (results[0].status === "fulfilled") { state.settings = results[0].value; state.settingsDraft = structuredClone(state.settings); }
     if (results[1].status === "fulfilled" && !state.activeSession) state.mode = state.status?.mode || "auto";
+    releaseCapabilityCatalog();
     state.settingsSaveStatus = "已保存"; renderOtherView(); renderChrome(); renderComposer(); toast("设置已保存");
   } catch (error) { displaySettingsError(error); }
   finally { submit.disabled = false; }
@@ -3410,6 +4379,8 @@ async function refreshService() {
 }
 
 async function handleAction(action, button) {
+  if (action === "channel-deliveries") showChannelDeliveries(button);
+  if (action === "generate-answer-speech") openAnswerSpeech(button);
   if (action === "voice-setup-help") {
     state.voiceSetupController?.release();
     await switchView("chat");
@@ -3461,6 +4432,7 @@ async function handleAction(action, button) {
     if (file && !state.attachments.some((entry) => entry.id === file.id)) state.attachments.push(file);
     renderComposerAttachments(); await switchView("chat");
   }
+  if (action === "collect-attachment") await openAttachmentCollection(state.uploads.find((entry) => entry.id === button.dataset.id), button);
   if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; resizeComposer(); }
   if (action === "refresh-team") await refreshTeam();
   if (action === "view-task-brief") await showTaskBrief(button.dataset.commitment);
@@ -3483,7 +4455,12 @@ async function handleAction(action, button) {
   if (action === "stop") await stopRun(button);
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
   if (action === "refresh-approvals") await refreshApprovals();
-  if (action === "close-dialog") $("#app-dialog").close();
+  if (action === "close-dialog") {
+    if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) closeChannelDeliveryDialog();
+    else if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
+    else if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
+    else $("#app-dialog").close();
+  }
   if (action === "copy-message") {
     const message = conversationItems(state.session).find((item) => item.kind === "message" && String(item.id) === button.dataset.id)?.message ?? state.session.messages.find((item) => String(item.id) === button.dataset.id);
     if (message) { await navigator.clipboard.writeText(message.content); toast("已复制"); }
@@ -3512,6 +4489,7 @@ async function handleAction(action, button) {
   if (action === "remove-workflow-step") button.closest(".workflow-step-editor")?.remove();
   if (action === "run-workflow") await runWorkflow(button.dataset.id, button);
   if (action === "workflow-session") await loadSession(button.dataset.session, button);
+  if (action === "workflow-source-draft") await prepareWorkflowSourceDraft(button.dataset.id, button);
   if (action === "toggle-workflow-schedules") {
     const slot = workflowActivity;
     if (!workflowActivityCurrent(slot) || !$("#other-view").contains(button)) return;
@@ -3573,9 +4551,21 @@ async function handleAction(action, button) {
   if (action === "refresh-service") await refreshService();
   if (action === "reload-extensions") await requestExtensions(true);
   if (action === "recover-management-current") await recoverCurrentManagement();
+  if (["refresh-capability-catalog", "view-capability-tool", "close-capability-tool"].includes(action)) {
+    const slot = capabilityCatalog;
+    if (!capabilityCatalogCurrent(slot) || !slot.root.contains(button)) return;
+    if (action === "refresh-capability-catalog") return loadCapabilityCatalog(slot);
+    if (action === "view-capability-tool") return loadCapabilityTool(button.dataset.capabilityId);
+    collectSettingsForm(); clearCapabilityTool(slot); updateCapabilityCatalog(slot); return;
+  }
   if (action === "refresh-settings-status") {
     if (state.view === "settings" && state.settingsTab === "connections") return requestExtensions(false);
-    collectSettingsForm(); button.disabled = true; try { await refreshSettingsResources(); renderOtherView(); renderChrome(); } finally { button.disabled = false; }
+    const catalog = capabilityCatalog;
+    collectSettingsForm(); button.disabled = true; try {
+      await refreshSettingsResources();
+      if (catalog && capabilityCatalog === catalog) { if (capabilityCatalogCurrent(catalog)) collectSettingsForm(); releaseCapabilityCatalog(); }
+      renderOtherView(); renderChrome();
+    } finally { button.disabled = false; }
   }
   if (action === "retry-delivery") {
     const delivery = state.channels?.deliveries?.find((item) => item.id === button.dataset.id);
@@ -3600,6 +4590,7 @@ document.addEventListener("click", async (event) => {
     else if (button.dataset.settingsTab) switchSettingsTab(button.dataset.settingsTab);
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) await selectMemoryTab(button.dataset.memoryTab);
+    else if (button.dataset.teamTab) await selectTeamTab(button.dataset.teamTab, button);
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
   } catch (error) { showError(error); }
 });
@@ -3663,15 +4654,39 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   catch (error) { if (current()) { $("#dialog-error").textContent = error.message ?? String(error); $("#dialog-error").hidden = false; } }
   finally { if (current()) submit.disabled = false; }
 });
+$("#app-dialog").addEventListener("cancel", () => {
+  if (taskDirectoryDialog && $("#dialog-content").firstElementChild === taskDirectoryDialog.content) releaseTaskDirectoryDialog();
+  if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) releaseChannelDeliveryDialog();
+  if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
+  if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
+});
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseAnswerSpeech();
+  releaseAttachmentCollection();
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
   releaseTaskDialog();
+  releaseTaskDirectoryDialog();
   releaseMemoryDialog();
   releaseHistoryDialog();
+  releaseChannelDeliveryDialog();
+  const channelReturn = dialogChannelDeliveryReturn; dialogChannelDeliveryReturn = null;
+  if (channelReturn && connectionCurrent(channelReturn.owner) && state.auth.authenticated && state.view === "settings" && state.settingsTab === "channels") {
+    const root = $("#other-view");
+    const target = root.contains(channelReturn.trigger) ? channelReturn.trigger : $('[data-action="channel-deliveries"]', root);
+    target?.focus({ preventScroll: true });
+  }
   const saved = dialogTeamView; dialogTeamView = null;
+  const uploadReturn = dialogUploadReturn; dialogUploadReturn = null;
+  if (uploadReturn && connectionCurrent(uploadReturn.owner) && state.auth.authenticated && state.view === "uploads") {
+    const root = $("#other-view");
+    const target = root.contains(uploadReturn.trigger) ? uploadReturn.trigger : $(".view-heading h2", root);
+    if (target) { if (target !== uploadReturn.trigger) target.tabIndex = -1; target.focus({ preventScroll: true }); }
+  }
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
+  const taskReturn = dialogTaskReturn; dialogTaskReturn = null;
+  if (taskReturn && taskDirectoryCurrent(taskReturn.directory) && taskReturn.directory.result.contains(taskReturn.trigger)) taskReturn.trigger.focus({ preventScroll: true });
   const memoryReturn = dialogMemoryReturn; dialogMemoryReturn = null;
   if (state.auth.authenticated && state.view === "memories" && memoryReturn) {
     const root = $("#other-view"), fallback = $$("[data-action=memory-evidence]", root).find((button) => button.dataset.id === memoryReturn.id);
@@ -3705,7 +4720,7 @@ function recoverConnection() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") { voiceInput.cancel(); state.voiceSetupController?.release(); }
+  if (document.visibilityState === "hidden") { closeChannelDeliveryDialog(); releaseAnswerSpeech(); voiceInput.cancel(); state.voiceSetupController?.release(); }
   recoverConnection();
 });
 window.addEventListener("online", recoverConnection);

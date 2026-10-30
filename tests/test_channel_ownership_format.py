@@ -30,9 +30,9 @@ TARGET = FormatState(
         database=1,
         objects=3,
         configuration=2,
-        ingress=4,
+        ingress=5,
         outbox=3,
-        memory=4,
+        memory=5,
         install_profile=1,
     ),
 )

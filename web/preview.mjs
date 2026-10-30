@@ -1,5 +1,8 @@
 /** Browser-only interactive demo. Nothing in this module calls a MuLi server. */
 const encoder = new TextEncoder();
+const watchOutputBytes = 64 * 1024; // Server MAX_MATCH_PROOF_BYTES, also for the demo envelope.
+const previewNotesUploadId = "b".repeat(32);
+const commitmentStates = ["open", "in_progress", "blocked", "done", "cancelled"];
 const clone = (value) => structuredClone(value);
 const timestamp = () => Date.now() / 1000;
 let sequence = 0;
@@ -11,11 +14,24 @@ const failure = (detail, status = 400) => response({ detail, preview: true }, st
 const model = (name = "") => ({ protocol: "openai_chat", model: name, base_url: "", api_key_set: false, vision: !!name, stream: true, max_output_tokens: null, timeout: 60, max_retries: 1, reasoning: {}, thinking: {}, extra_body: {}, extra_headers: {}, max_response_bytes: 1048576 });
 const mcpStatus = (config) => Object.entries(config?.mcpServers ?? {}).map(([name, server]) => ({ name, status: server.enabled === false ? "disabled" : "connected" }));
 
+// A short local WAV tone demonstrates attachment controls, not speech synthesis.
+function previewSpeechAudio() {
+  const rate = 8000, samples = rate / 4, bytes = new Uint8Array(44 + samples * 2), data = new DataView(bytes.buffer);
+  const text = (offset, value) => bytes.set(encoder.encode(value), offset);
+  text(0, "RIFF"); data.setUint32(4, bytes.length - 8, true); text(8, "WAVE"); text(12, "fmt ");
+  data.setUint32(16, 16, true); data.setUint16(20, 1, true); data.setUint16(22, 1, true);
+  data.setUint32(24, rate, true); data.setUint32(28, rate * 2, true); data.setUint16(32, 2, true); data.setUint16(34, 16, true);
+  text(36, "data"); data.setUint32(40, samples * 2, true);
+  for (let index = 0; index < samples; index++) data.setInt16(44 + index * 2, Math.round(4000 * (1 - index / samples) * Math.sin(2 * Math.PI * 440 * index / rate)), true);
+  return new Blob([bytes], { type: "audio/wav" });
+}
+
 /** A fresh tab starts with fresh demo data; credentials are never persisted. */
 export function createPreviewState() {
   const now = timestamp();
   const main = { id: "preview-main", name: "沐璃", title: "与沐璃对话", role: "main", mode: "auto", status: "idle", created_at: now, updated_at: now };
   const notes = "# 项目整理示例\n\n先梳理目标，再分解任务，由队友执行、复核后汇总。\n\n此文件由前端预览生成，没有读取本机项目。\n";
+  const notesAttachmentId = "a".repeat(32), notesRevision = "a".repeat(64);
   const mcp = { mcpServers: { "示例资料库": { url: "https://mcp.preview.invalid/mcp", enabled: true, headers: {} } } };
   return {
     settings: {
@@ -49,6 +65,7 @@ export function createPreviewState() {
     },
     previewLimits: { max_upload_bytes: 20971520, max_uploads: 20, max_items: 50, max_message_chars: 64000 },
     sessions: [main], messages: { [main.id]: [] }, runs: {}, approvals: [], events: [], eventId: 0,
+    channelDeliveries: [{ id: "preview-delivery", channel: "onebot", account_id: "preview-bot", owner_id: "7", state: "unknown", confirmed_parts: 1, created_at: now - 1800, parts: [{ text: "这是本页模拟保存的发送正文🙂。\n记录与平台确认状态仅用于演示，没有连接真实消息渠道。" }, { attachment_id: previewNotesUploadId }, { text: "这是尚未确认的后续模拟分段。" }] }],
     notifications: [
       { id: "notice-welcome", title: "欢迎来到沐璃", content: "这是可操作的前端预览。发一条消息，体验规划、工具轨迹、审批和流式回答；设置只保存在当前页面。", type: "info", read: false, created_at: now },
       { id: "notice-review", title: "示例周报已整理", content: "队友已完成资料整理与交叉复核，示例附件可在附件页下载。", type: "task", read: true, created_at: now - 3600 },
@@ -63,7 +80,7 @@ export function createPreviewState() {
       { id: "3".repeat(64), question: "留意旧项目的设计回顾。", match_terms: ["设计", "回顾"], state: "cancelled", revision: 2, reply_preference: { kind: "registered_web" } },
     ],
     memorySources: [
-      { source_id: "preview-source-notes", source: "前端演示资料", content: notes, session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "a".repeat(64), created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
+      { source_id: `attachment:${notesAttachmentId}`, source: `attachment:${notesAttachmentId}:${notesRevision}`, content: notes, session_id: main.id, role: "tool", principal: "external:attachment", trusted_owner: false, revision: notesRevision, created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
       { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
       ...[["e", "c", "1", "期限：七日\n材料：学生证\n"], ["f", "d", "2", "期限：十日\n材料：身份证\n"]].map(([id, original, revision, content]) => ({ source_id: `attachment:${id.repeat(32)}`, source: `attachment:${id.repeat(32)}:${original.repeat(64)}`, content, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false, revision: revision.repeat(64), source_revision: original.repeat(64), format: "text", scope: "utf8_text", document_revision: null, attachment_id: id.repeat(32), created_at: now - 1800, job: { state: "done", attempts: 1, last_error: "" }, comparisonDemo: true })),
     ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),
@@ -71,6 +88,13 @@ export function createPreviewState() {
       { id: "demo-researcher", session_id: "preview-researcher", name: "资料整理", role: "worker", parent_id: main.id, task: "整理示例项目结构与待办", status: "completed", generation: 1, last_message: "结构梳理与清单已完成。", created_at: now - 3600 },
       { id: "demo-reviewer", session_id: "preview-reviewer", name: "独立复核", role: "reviewer", parent_id: main.id, task: "检查整理结果是否遗漏边界", status: "completed", generation: 1, last_message: "已核对范围，保留需要你确认的事项。", created_at: now - 3500 },
     ], teamMessages: [],
+    // Saved ledger examples are independent of the demo teammates and reset
+    // with this page. Reading them never schedules or resumes any work.
+    commitments: [
+      { id: "preview-task-revisit", title: "回顾旧项目目标（本页示例）", status: "open", revision: 3, next_step: "核对完整说明，再由你决定如何提问。", evidence: "本页示例附件中的项目整理说明。", source_id: `attachment:${notesAttachmentId}`, created_at: now - 172800, updated_at: now - 86400, brief: { goal: "重新梳理旧项目的目标、交付物和待确认事项。\n保留原始背景和每一项约束，再整理一份便于讨论的清单。\n这是一条没有关联队友的本页示例任务。", constraints: ["先核对已有说明，不因旧任务而自动继续执行。", "完整保留中段要求：列出已知事实、尚未核验的内容和需要你确认的问题。", "仅展示本页模拟资料，不访问真实文件、模型或消息渠道。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
+      { id: "preview-task-waiting", title: "确认整理范围（本页示例）", status: "blocked", revision: 2, next_step: "等待你确认需要整理的范围。", created_at: now - 7200, updated_at: now - 3600, control: { epoch: 1, approved_epoch: 0, replan_request_id: null, plan: null }, brief: { goal: "确认示例项目哪些资料需要整理，以及最后希望得到什么。", constraints: ["范围未确认前保持账本受阻状态。", "查看说明或带入草稿都不会启动队友。"], evidence_refs: [] } },
+      { id: "preview-task-done", title: "整理项目清单（本页示例）", status: "done", revision: 4, next_step: "清单已保存，后续变化由你决定是否讨论。", created_at: now - 86400, updated_at: now - 3600, brief: { goal: "整理一份示例项目清单，区分已完成事项与待确认问题。", constraints: ["完成状态只表示本页保存的账本记录。", "保留原说明供回顾，不自动创建后续任务。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
+    ],
     workflows: [{ id: "workflow-review", name: "资料整理与复核", description: "先整理资料，再独立复核，最后汇总为一份简报。", mode: "auto", steps: [{ id: "research", title: "整理资料", role: "worker", prompt: "整理资料与来源。", depends_on: [] }, { id: "review", title: "独立复核", role: "reviewer", prompt: "核对结论与来源。", depends_on: ["research"] }], runs: [], created_at: now - 86400, updated_at: now - 3600 }],
     workflowRuns: [], schedules: [
       { id: "schedule-weekly", kind: "workflow_schedule", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null },
@@ -80,8 +104,8 @@ export function createPreviewState() {
       { id: "reminder-review", kind: "reminder", title: "回顾本周目标", content: "看看已有成果、未核验部分和下一步。", due_at: now + 3600, interval_seconds: 604800, enabled: true, fired_count: 0, created_at: now },
       { id: "calendar-study", kind: "calendar_reminder", title: "早晨背单词", content: "每天留一点时间复习。", calendar: { version: 1, timezone: "Asia/Shanghai", local_time: "07:30", weekdays: [1, 2, 3, 4, 5] }, due_at: now + 7200, interval_seconds: null, enabled: true, fired_count: 0, created_at: now },
     ],
-    uploads: [{ id: "demo-notes", name: "项目整理示例.md", mime_type: "text/markdown", size: encoder.encode(notes).length, source: "preview", created_at: now - 3600 }],
-    files: new Map([["demo-notes", new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
+    uploads: [{ id: previewNotesUploadId, name: "项目整理示例.md", mime_type: "text/markdown", size: encoder.encode(notes).length, source: "preview", created_at: now - 3600 }],
+    files: new Map([[previewNotesUploadId, new Blob([notes], { type: "text/plain;charset=utf-8" })]]),
     service: { supported: true, unit: "muli-preview.service", installed: true, active: true, enabled: true, log: ["[预览] 所有服务操作均为内存模拟，不会安装或重启系统服务。"] },
     management: { plugins: [{ id: "preview-notes", name: "资料整理示例", version: "demo", status: "loaded" }], plans: [], update: { status: "checked", available: false, current: "交互预览", latest: "交互预览", checked_at: now } },
     extensions: { generation: 1, phase: "loaded", skills: { enabled: true, count: 2 }, mcp: mcpStatus(mcp), preview: true },
@@ -122,6 +146,14 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     state.notifications.unshift(item); state.notifications.splice(50); emit("notification.created", item); return item;
   };
   const session = (id) => state.sessions.find((item) => item.id === id);
+  const commitmentMatches = (item, status) => status === "all" || (status === "active" ? !["done", "cancelled"].includes(item.status) : item.status === status);
+  const commitmentMetadata = (item) => {
+    const fields = ["id", "status", "revision", "created_at", "updated_at", "title", "next_step", "assignee", "evidence", "source_id"];
+    const result = Object.fromEntries(fields.filter((field) => Object.hasOwn(item, field)).map((field) => [field, item[field]]));
+    result.has_brief = Object.hasOwn(item, "brief");
+    if (item.control) result.control = { epoch: item.control.epoch, approved_epoch: item.control.approved_epoch, paused: item.control.epoch > item.control.approved_epoch, replan_requested: !!item.control.replan_request_id, has_plan: item.control.plan != null };
+    return result;
+  };
   const trim = (items) => items.splice(state.previewLimits.max_items);
   const pendingRuns = () => Object.values(state.runs).filter((run) => ["running", "approval", "queued"].includes(run.status));
   const atCapacity = (items) => items.length >= state.previewLimits.max_items;
@@ -129,12 +161,12 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
   const activeRun = (id) => Object.values(state.runs).find((run) => run.session_id === id && ["running", "approval", "queued"].includes(run.status));
   const addMessage = (sessionId, role, content, attachmentIds = []) => {
     const list = state.messages[sessionId] ??= [];
-    const item = { id: identifier("message"), session_id: sessionId, role, principal: role === "user" ? "owner" : "assistant", source: "web", content, created_at: timestamp(), delivery_status: "delivered", seq: (list.at(-1)?.seq ?? 0) + 1, revision: "preview-1", attachment_ids: attachmentIds, attachments: state.uploads.filter((file) => attachmentIds.includes(file.id)) };
+    const item = { id: identifier("message"), session_id: sessionId, role, principal: role === "user" ? "owner" : "assistant", source: "web", content, created_at: timestamp(), delivery_status: "delivered", seq: (list.at(-1)?.seq ?? 0) + 1, revision: "preview-1", evidence_revision: identifier("revision"), attachment_ids: attachmentIds, attachments: state.uploads.filter((file) => attachmentIds.includes(file.id)) };
     list.push(item); if (list.length > 100) list.splice(0, list.length - 100); return item;
   };
   const detail = (id) => {
     const item = session(id), run = activeRun(id);
-    return { session: item, messages: state.messages[id] ?? [], events: [], after: String(state.eventId), live: { session_id: id, status: run?.status ?? "idle", run_id: run?.id ?? null, pending_approvals: state.approvals.filter((approval) => approval.session_id === id && approval.status === "pending") } };
+    return { session: item, messages: state.messages[id] ?? [], events: state.events.filter((event) => event.session_id === id), after: String(state.eventId), live: { session_id: id, status: run?.status ?? "idle", run_id: run?.id ?? null, pending_approvals: state.approvals.filter((approval) => approval.session_id === id && approval.status === "pending") } };
   };
   const tool = (run, name, args, result, complete) => {
     if (run.status !== "running") return;
@@ -149,7 +181,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (run.status !== "running") return;
       if (offset < chunks.length) { emit("message.delta", { content: chunks[offset++], run_id: run.id }, run.session_id); later(write, Math.min(delay, 35)); return; }
       const message = addMessage(run.session_id, "assistant", text, attachmentIds);
-      run.status = "completed"; run.result = text;
+      run.status = "completed"; run.result = text; run.result_message_id = message.id;
       const item = session(run.session_id); if (item) { item.status = "idle"; item.updated_at = timestamp(); }
       emit("message.completed", { message, run_id: run.id }, run.session_id);
       emit("run.completed", { run_id: run.id, result_message_id: message.id }, run.session_id);
@@ -185,7 +217,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         member.status = "completed"; member.last_message = "已整理目标、行动清单与待确认事项。"; emit("team.updated", { agent_id: member.id });
         tool(run, "wait_agents", { agent_ids: [member.id] }, { reports: [{ agent_id: member.id, result: member.last_message }] }, () => {
           notify("整理结果已就绪", "演示队友已完成整理，你可以在对话和附件页查看结果。", run.session_id);
-          finish(run, `整理好了。\n\n### 先做这三件事\n1. **明确目标**：把“${run.prompt.slice(0, 48)}${run.prompt.length > 48 ? "…" : ""}”拆成可以核对的结果。\n2. **分工与复核**：队友整理资料，另一轮检查遗漏和边界。\n3. **交付并跟进**：把关键结论、待办与需要你确认的部分放在一起。\n\n我把示例整理文档附在下面了。你可以继续让我细化下一步，也可以去团队、记忆或设置页看看。\n\n*以上为浏览器内的流程演示，没有运行真实模型或工具。*`, ["demo-notes"]);
+          finish(run, `整理好了。\n\n### 先做这三件事\n1. **明确目标**：把“${run.prompt.slice(0, 48)}${run.prompt.length > 48 ? "…" : ""}”拆成可以核对的结果。\n2. **分工与复核**：队友整理资料，另一轮检查遗漏和边界。\n3. **交付并跟进**：把关键结论、待办与需要你确认的部分放在一起。\n\n我把示例整理文档附在下面了。你可以继续让我细化下一步，也可以去团队、记忆或设置页看看。\n\n*以上为浏览器内的流程演示，没有运行真实模型或工具。*`, [previewNotesUploadId]);
         });
       });
     }, delay * 2);
@@ -247,7 +279,37 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     const selected = candidates.slice(0, limit), more = candidates.length > selected.length;
     return { items: selected, has_more: more, [key]: more ? selected.at(-1).id : null };
   };
-  const status = () => ({ configured: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+  const status = () => ({ configured: true, preview: true, model: state.settings.models.main.model || "MuLi · 交互演示", mode: state.settings.default_mode, running: Object.values(state.runs).filter((run) => ["running", "approval"].includes(run.status)).length, version: "前端交互预览", platform: "浏览器 · 仅内存", limits: state.settings.limits, tools: ["memory_query", "web_search", "fs_write", "spawn_agent", "wait_agents", "memory_save", "file_publish", "channel_send"].map((name) => ({ name, description: `预览 ${name} 的交互与运行轨迹`, risk: ["memory_query", "web_search", "wait_agents"].includes(name) ? "read" : "write", enabled: !state.settings.disabled_tools.includes(name) })), mcp: state.extensions.mcp, extensions: state.extensions, chiliarch: { status: state.settings.chiliarch.enabled ? "connected" : "disabled" }, computer: { available: false }, notifications: { available: false }, server: { restart_required: false } });
+  let capabilityObservation = null;
+  const capabilityDirectory = () => {
+    const tools = status().tools.map((tool) => ({ ...tool, requires_approval: false, origin: { kind: "unrecorded" } }));
+    const signature = JSON.stringify(tools);
+    if (capabilityObservation?.signature !== signature) capabilityObservation = { signature, revision: identifier("catalog"), items: tools.map((tool) => ({ id: identifier("capability"), ...tool })) };
+    return { scope: "registered_tools", revision: capabilityObservation.revision, complete: true, items: capabilityObservation.items, preview: true };
+  };
+  const capabilityResponse = (value) => encoder.encode(JSON.stringify(value)).byteLength <= state.settings.limits.max_output_chars * 4
+    ? response(value) : failure({ code: "capability_payload_too_large" }, 413);
+
+  // This local demo backend reads only its bounded in-memory text blobs. It does
+  // not pretend to extract PDF/DOCX or use these digests to authorize real work.
+  const sha256 = async (raw) => {
+    if (!globalThis.crypto?.subtle) throw new Error("当前演示环境无法核对资料版本。");
+    return [...new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", raw))].map((value) => value.toString(16).padStart(2, "0")).join("");
+  };
+  const collectionFits = (value) => Array.from(JSON.stringify(value)).length <= state.settings.limits.max_output_chars;
+  async function collectionSnapshot(id) {
+    const file = state.uploads.find((entry) => entry.id === id), blob = state.files.get(id);
+    if (!file || !blob || !/^[a-f0-9]{32}$/u.test(id)) throw new Error("没有这份演示附件。");
+    if (!blob.type.startsWith("text/") || blob.size > Math.min(state.settings.uploads.max_file_bytes, state.settings.limits.max_file_bytes)) throw new Error("演示仅提供限额内 UTF-8 文本收藏；文档提取请在真实服务中使用。");
+    const raw = new Uint8Array(await blob.arrayBuffer()), content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw);
+    if (!content.trim() || content.includes("\0")) throw new Error("演示附件正文无效。");
+    const sourceRevision = await sha256(raw), sourceId = `attachment:${id}`, marker = `${sourceId}:${sourceRevision}`;
+    const source = { content, source: marker, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false };
+    // Match the existing source_digest field order and JSON spacing for text.
+    const packed = "{" + Object.entries(source).map(([key, value]) => `${JSON.stringify(key)}: ${JSON.stringify(value)}`).join(", ") + "}";
+    const identity = { attachment_id: id, source_revision: sourceRevision, format: "text", scope: "utf8_text", document_revision: null, source_id: sourceId, registered_revision: await sha256(encoder.encode(packed)), source: marker, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false };
+    return { file, content, identity };
+  }
 
   async function fetchPreview(input, options = {}) {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url, "http://preview.local");
@@ -268,6 +330,17 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     if (["/auth/login", "/auth/logout"].includes(path) && method === "POST") return response({ authenticated: true, preview: true });
     if (path === "/ui/event-position") return response({ after: String(state.eventId) });
     if (path === "/status" && method === "GET") return response(status());
+    if (path === "/capabilities" && method === "GET") return capabilityResponse(capabilityDirectory());
+    const capabilityMatch = /^\/capabilities\/tools\/([^/]+)$/u.exec(path);
+    if (capabilityMatch && method === "GET") {
+      const catalog = capabilityDirectory(), revision = url.searchParams.get("revision");
+      if (!revision) return failure({ code: "capability_revision_required" }, 422);
+      if (revision !== catalog.revision) return failure({ code: "capability_catalog_stale" }, 409);
+      const tool = catalog.items.find((item) => item.id === decodeURIComponent(capabilityMatch[1]));
+      if (!tool) return failure({ code: "capability_not_found" }, 404);
+      // These are explicitly simulated contracts, without a real tool executor.
+      return capabilityResponse({ scope: catalog.scope, revision, tool: { ...tool, parameters: { type: "object", properties: {}, additionalProperties: true } }, preview: true });
+    }
     if (path === "/extensions" && method === "GET") return response(state.extensions);
     if (path === "/extensions/reload" && method === "POST") {
       if (state.extensions.phase !== "queued") {
@@ -285,13 +358,53 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         return response({ saved: true, preview: true });
       }
     }
+    if (["/commitments", "/commitment-directory"].includes(path) && method === "GET") {
+      const status = url.searchParams.get("status") ?? "active";
+      if (![...commitmentStates, "active", "all"].includes(status)) return failure("未知承诺状态。", 400);
+      const records = state.commitments.filter((item) => commitmentMatches(item, status));
+      if (path === "/commitments") return response({ items: records.sort((left, right) => right.updated_at - left.updated_at).slice(0, 100).map(commitmentMetadata) });
+      const limit = Number(url.searchParams.get("limit") ?? 20), cursor = url.searchParams.get("cursor");
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || cursor === "") return failure("演示任务目录分页参数无效。", 422);
+      let before = null;
+      if (cursor !== null) {
+        try {
+          const token = JSON.parse(cursor);
+          if (!Array.isArray(token) || token.length !== 3 || token[0] !== "preview-commitments" || token[1] !== status || typeof token[2] !== "string" || !token[2]) throw new Error("cursor");
+          before = token[2];
+        } catch { return failure("演示任务目录游标无效或不属于当前筛选。", 400); }
+      }
+      const candidates = records.filter((item) => before === null || item.id < before).sort((left, right) => left.id < right.id ? 1 : left.id > right.id ? -1 : 0);
+      const selected = candidates.slice(0, limit), more = candidates.length > selected.length;
+      return response({ items: selected.map(commitmentMetadata), has_more: more, next_cursor: more ? JSON.stringify(["preview-commitments", status, selected.at(-1).id]) : null, scanned: selected.length, json_bytes: selected.reduce((total, item) => total + encoder.encode(JSON.stringify(item)).length, 0), omitted: { oversized: 0, invalid: 0, missing: 0 }, omitted_total: 0, stopped: more ? "limit" : "end", consistency: "bounded_live" });
+    }
+    if (parts[0] === "commitments" && parts.length === 2 && method === "GET") {
+      const item = state.commitments.find((entry) => entry.id === id);
+      if (!item) return failure("没有这条演示任务。", 404);
+      const control = { epoch: 0, approved_epoch: 0, replan_request_id: null, plan: null, ...item.control };
+      const scope = { member_count: state.members.filter((member) => member.commitment_id === id).length, active_workflow_count: 0, can_pause: true, blocked_reason: null };
+      return response({ ...item, control: { ...control, paused: control.epoch > control.approved_epoch, has_plan: control.plan != null, plan_epoch: control.plan?.epoch ?? null }, scope });
+    }
     if (parts[0] === "sessions") {
       if (parts.length === 1 && method === "GET") return response({ items: state.sessions });
       if (parts.length === 2 && method === "GET") return session(id) ? response(detail(id)) : failure("没有这条演示会话。", 404);
       if (parts.length === 2 && method === "PATCH" && session(id)) { merge(session(id), { mode: body.mode ?? session(id).mode }); emit("session.updated", session(id), id); return response(session(id)); }
       if (parts.length === 2 && method === "DELETE" && id !== state.sessions[0].id) { state.sessions = state.sessions.filter((item) => item.id !== id); return response({ deleted: true }); }
       if (parts[2] === "stop" && method === "POST") { for (const run of Object.values(state.runs).filter((entry) => entry.session_id === id && ["running", "approval", "queued"].includes(entry.status))) cancelRun(run); return response({ stopped: true }); }
-      if (parts[2] === "messages" && method === "POST" && session(id)) {
+      if (parts.length === 5 && parts[2] === "messages" && parts[4] === "speech" && method === "POST") {
+        if (Object.keys(body).sort().join(",") !== "confirmed,revision,run_id" || body.confirmed !== true || typeof body.run_id !== "string" || typeof body.revision !== "string") return failure("请确认这条准确版本的完整演示答复。", 422);
+        const message = state.messages[id]?.find((item) => item.id === parts[3]), run = state.runs[body.run_id];
+        if (id !== state.sessions[0].id || !message || message.role !== "assistant" || message.interrupted || message.tool_calls?.length || !message.content.trim()
+          || message.evidence_revision !== body.revision || run?.session_id !== id || run.status !== "completed" || run.result_message_id !== message.id || run.result !== message.content) return failure("这条演示答复的完整来源已变化。", 409);
+        if (state.settings.disabled_tools.includes("speech_synthesize")) return failure("语音生成工具未启用。");
+        const blob = previewSpeechAudio(), totalBytes = [...state.files.values()].reduce((total, file) => total + file.size, 0);
+        if (blob.size > state.settings.uploads.max_file_bytes || totalBytes + blob.size > state.previewLimits.max_upload_bytes) return failure("演示附件容量已达上限。", 413);
+        if (state.files.size >= state.previewLimits.max_uploads) return failure("演示附件数量已达上限。", 429);
+        const fileId = (++sequence).toString(16).padStart(32, "0");
+        const attachment = { id: fileId, name: "演示提示音.wav", mime_type: blob.type, size: blob.size, source: "tts", created_at: timestamp(), url: `/api/uploads/${fileId}/download`, preview_url: `/api/uploads/${fileId}/content`, kind: "audio" };
+        state.uploads.unshift(attachment); state.files.set(fileId, blob); emit("upload.created", attachment);
+        return response({ session_id: id, run_id: run.id, message_id: message.id, revision: body.revision, attachment, preview: true });
+      }
+      if (parts.length === 3 && parts[2] === "messages" && method === "POST" && session(id)) {
         if (typeof body.content !== "string" || !body.content.trim()) return failure("先写一点想做的事吧。");
         if (body.content.length > state.previewLimits.max_message_chars) return failure("消息超过前端预览长度上限。", 413);
         if (pendingRuns().length >= runLimit()) return failure("演示任务队列已满，请完成审批或停止当前任务后再发送。", 429);
@@ -344,8 +457,25 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       const after = url.searchParams.get("after_id") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !/^(?:[a-f0-9]{64})?$/u.test(after)) return failure("清单分页参数无效。", 422);
       const items = state.memoryWatches.filter((item) => item.id > after).sort((left, right) => left.id.localeCompare(right.id)).slice(0, limit).map((item) => Object.fromEntries(["id", "question", "match_terms", "state", "revision", "reply_preference"].map((field) => [field, item[field]])));
-      const result = { items, after_id: after, has_more: items.length === limit, next_after_id: items.length === limit ? items.at(-1).id : null, processing: { enabled: state.settings.memory.enabled && state.settings.attention.enabled && state.settings.attention.events.includes("memory"), paused: false } };
-      return JSON.stringify(result).length > state.settings.limits.max_output_chars ? failure({ code: "output_budget", message: "长期留意清单超过输出预算。" }) : response(result);
+      const maxChars = state.settings.limits.max_output_chars;
+      const processing = { enabled: state.settings.memory.enabled && state.settings.attention.enabled && state.settings.attention.events.includes("memory"), paused: false };
+      const page = (count) => {
+        const selected = items.slice(0, count), more = count < items.length || items.length === limit;
+        return { items: selected, after_id: after, has_more: more, next_after_id: more ? selected.at(-1).id : null, processing };
+      };
+      const fits = (value) => {
+        const packed = JSON.stringify(value);
+        return Array.from(packed).length <= maxChars && encoder.encode(packed).length <= watchOutputBytes;
+      };
+      const complete = page(items.length);
+      if (fits(complete)) return response(complete);
+      let fitted = null;
+      for (let count = 1; count < items.length; count++) {
+        const candidate = page(count);
+        if (!fits(candidate)) break;
+        fitted = candidate;
+      }
+      return fitted ? response(fitted) : failure({ code: "output_budget", message: "完整长期留意条目及分页信息超过当前输出预算。" });
     }
     if (path === "/memory/watches/cancel" && method === "POST") {
       if (state.settings.disabled_tools.includes("memory_watch_cancel")) return failure("资料关注工具未启用。");
@@ -464,6 +594,27 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
     }
     if (parts[0] === "uploads") {
       if (parts.length === 1 && method === "GET") return response({ items: state.uploads });
+      if (parts.length === 3 && ((parts[2] === "memory-preview" && method === "GET") || (parts[2] === "memory-collection" && method === "POST"))) {
+        if (state.settings.disabled_tools.includes("memory_import_attachment")) return failure("附件收藏工具未启用。");
+        if (method === "POST" && (Object.keys(body).sort().join(",") !== "document_revision,registered_revision,source_revision" || ![body.source_revision, body.registered_revision].every((value) => typeof value === "string" && /^[a-f0-9]{64}$/u.test(value)) || body.document_revision !== null)) return failure("请提交这次准备的准确资料版本。", 422);
+        let snapshot;
+        try { snapshot = await collectionSnapshot(id); } catch (error) { return failure(error.message); }
+        if (signal?.aborted) throw new DOMException("请求已取消", "AbortError");
+        if (disposed || state.settings.disabled_tools.includes("memory_import_attachment")) return failure("本次收藏已不可用。");
+        const { file, content, identity } = snapshot;
+        if (method === "GET") {
+          const text = Array.from(content).slice(0, 64).join(""), length = encoder.encode(text).length, total = encoder.encode(content).length;
+          const preview = { ...identity, filename: file.name, read_only: true, processing_notice: "本次只核对资料；确认时使用当时设置，后台整理可能向已配置服务发送正文。", field: "content", content: text, offset_bytes: 0, length_bytes: length, next_offset_bytes: length, total_bytes: total, has_more: length < total };
+          return collectionFits(preview) ? response(preview) : failure({ code: "output_budget", message: "完整资料身份及预览超过当前输出预算。" });
+        }
+        if (["source_revision", "document_revision", "registered_revision"].some((key) => body[key] !== identity[key])) return failure("资料版本已变化，请重新准备。", 409);
+        const existing = state.memorySources.find((item) => item.source_id === identity.source_id);
+        if (existing && existing.revision !== identity.registered_revision) return failure("这份资料已登记其它版本，请先核查。", 409);
+        const receipt = { ...identity, state: !state.settings.memory.enabled ? "disabled" : existing?.job.state ?? "queued", created: state.settings.memory.enabled && !existing };
+        if (!collectionFits(receipt)) return failure({ code: "output_budget", message: "完整收藏回执超过当前输出预算。" });
+        if (receipt.created) state.memorySources.unshift({ ...identity, revision: identity.registered_revision, content, total_bytes: encoder.encode(content).length, created_at: timestamp(), job: { state: "queued", attempts: 0, last_error: "" } });
+        return response(receipt);
+      }
       if (parts.length === 1 && method === "POST") {
         const blob = options.body instanceof Blob ? options.body : new Blob([options.body ?? ""]);
         if (blob.size > state.settings.uploads.max_file_bytes) return failure("文件超过预览附件大小上限。", 413);
@@ -471,13 +622,55 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         const totalBytes = [...state.files.values()].reduce((total, file) => total + file.size, 0);
         if (totalBytes + blob.size > state.previewLimits.max_upload_bytes) return failure("预览附件总容量已达上限，请刷新页面重置演示数据。", 413);
         const headers = new Headers(options.headers); let name = headers.get("X-File-Name") || "附件"; try { name = decodeURIComponent(name); } catch { /* Keep the visible original name. */ }
-        const item = { id: identifier("upload"), name, mime_type: blob.type || "application/octet-stream", size: blob.size, source: "preview", created_at: timestamp() };
+        const item = { id: (++sequence).toString(16).padStart(32, "0"), name, mime_type: blob.type || "application/octet-stream", size: blob.size, source: "preview", created_at: timestamp() };
         state.uploads.unshift(item); state.files.set(item.id, blob); emit("upload.created", item); return response(item);
       }
       if (["content", "download"].includes(parts[2]) && method === "GET") return state.files.has(id) ? new Response(state.files.get(id)) : failure("演示附件不存在。", 404);
     }
     if (path === "/media/transcribe" && method === "POST") return response({ text: "这是一段演示转写。你可以编辑文字，再决定是否发送。", preview: true });
-    if (path === "/channels" && method === "GET") return response({ channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: 0 }, deliveries: [], proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
+    if (parts[0] === "channels" && parts[1] === "deliveries" && method === "GET") {
+      const channel = url.searchParams.get("channel"), ownerId = url.searchParams.get("owner_id"), profile = state.settings.channels[channel];
+      if (!profile?.enabled || !profile.owner_ids?.includes(ownerId)) return failure("当前演示渠道或主人绑定已不可读取。", 403);
+      const header = { source: "local", coverage: "saved_by_muli", consistency: "live", channel, account_id: profile.account_id ?? "preview-bot", owner_id: ownerId, session_id: state.sessions[0].id, preview: true };
+      const records = state.channelDeliveries.filter((item) => item.channel === channel && item.account_id === header.account_id && item.owner_id === ownerId);
+      const metadata = (item) => ({ state: item.state, confirmed_parts: item.confirmed_parts, total_parts: item.parts.length, created_at: item.created_at });
+      if (parts.length === 2) {
+        const limit = Number(url.searchParams.get("limit") ?? 20), cursor = url.searchParams.get("cursor"), prefix = ["preview-deliveries", channel, header.account_id, ownerId, header.session_id];
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return failure("演示记录分页参数无效。", 422);
+        let start = 0;
+        if (cursor !== null) {
+          try {
+            const value = JSON.parse(cursor);
+            if (!Array.isArray(value) || value.length !== 6 || !prefix.every((field, index) => field === value[index]) || !Number.isSafeInteger(value[5]) || value[5] < 0) throw new Error("cursor");
+            start = value[5];
+          } catch { return failure("演示游标不属于当前渠道与主人。", 400); }
+        }
+        const selected = records.slice(start, start + limit).map((item) => ({ id: item.id, kind: "delivery", role: "assistant", ...metadata(item), attachment_ids: item.parts.flatMap((part) => part.attachment_id ? [part.attachment_id] : []) }));
+        const result = () => ({ ...header, items: selected, omitted: 0, next_cursor: start + selected.length < records.length ? JSON.stringify([...prefix, start + selected.length]) : null, has_more: start + selected.length < records.length });
+        while (selected.length && !collectionFits(result())) selected.pop();
+        if (!collectionFits(result()) || !selected.length && start < records.length) return failure("演示发送记录超过当前输出预算。", 400);
+        return response(result());
+      }
+      if (parts.length === 4 && parts[3] === "content") {
+        const item = records.find((record) => record.id === parts[2]), part = Number(url.searchParams.get("part") ?? 0), offset = Number(url.searchParams.get("offset_bytes") ?? 0);
+        if (!Number.isSafeInteger(part) || part < 0 || !Number.isSafeInteger(offset) || offset < 0) return failure("演示分段或字节位置无效。", 422);
+        if (!item || part >= item.parts.length) return failure("没有这个演示发送分段。", 404);
+        const selected = item.parts[part], attachmentIds = selected.attachment_id ? [selected.attachment_id] : [], raw = encoder.encode(selected.text ?? "");
+        const revision = `sha256:${await sha256(encoder.encode(JSON.stringify([item.id, part, selected.text ?? "", attachmentIds])))}`, requestedRevision = url.searchParams.get("revision");
+        if (requestedRevision !== null && requestedRevision !== revision) return failure("演示发送分段已经变化。", 409);
+        if (offset > raw.length || offset && !requestedRevision || raw[offset] >= 0x80 && raw[offset] <= 0xbf) return failure("演示发送正文位置无效。", 400);
+        const base = { ...header, delivery_id: item.id, part, ...metadata(item), attachment_ids: attachmentIds, revision, field: "content", offset_bytes: offset, total_bytes: raw.length };
+        let end = Math.min(raw.length, offset + state.settings.limits.max_output_chars), content = "", value;
+        for (; end >= offset; end--) {
+          try { content = new TextDecoder("utf-8", { fatal: true }).decode(raw.slice(offset, end)); } catch { continue; }
+          value = { ...base, content, length_bytes: end - offset, next_offset_bytes: end, has_more: end < raw.length };
+          if (collectionFits(value)) break;
+        }
+        if (end < offset || end === offset && end < raw.length) return failure("演示发送正文超过当前输出预算。", 400);
+        return response(value);
+      }
+    }
+    if (path === "/channels" && method === "GET") return response({ preview: true, channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: state.channelDeliveries.length }, deliveries: state.channelDeliveries.map((item) => ({ id: item.id, name: item.channel, target: item.owner_id, state: item.state, created_at: item.created_at })), proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
     if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, health: { state: "idle", code: null, occurrence_id: null }, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
     if (path === "/voice/setup" && method === "POST") {
       if (body.confirmed !== true) return failure("请确认本次模拟录音。", 400);
