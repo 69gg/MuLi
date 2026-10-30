@@ -719,10 +719,10 @@ def test_no_bound_checkpoint_keeps_existing_large_diagnostic_contract(
     before = native.setup_bytes
     calls: list[tuple[str, ...]] = []
 
-    def run(argv: Any, *, seconds: float = 5) -> Any:
+    def run(argv: Any, *, seconds: float = ci.CLEANUP_SECONDS) -> Any:
         values = tuple(argv)
         calls.append(values)
-        assert values[3] == "diagnose-setup" and 0 < seconds <= 5
+        assert values[3] == "diagnose-setup" and 0 < seconds <= ci.CLEANUP_SECONDS
         return ci.Reply(1, b"")
 
     native.run = run

@@ -299,12 +299,12 @@ def test_parent_accounting_uses_real_ledger_and_wire_without_enlarging_packet(
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(ci.time, "monotonic", lambda: 100.0)
 
-    def run(argv: Any, *, seconds: float = 5) -> Any:
+    def run(argv: Any, *, seconds: float = ci.CLEANUP_SECONDS) -> Any:
         nonlocal actual_wire
         arguments = tuple(argv)
         calls.append(arguments)
         assert arguments[3] == "diagnose-manager-instance"
-        assert int(arguments[8]) == grant and 0 < seconds <= 5
+        assert int(arguments[8]) == grant and 0 < seconds <= ci.CLEANUP_SECONDS
         if case == "lost":
             raise TimeoutError("private loss must not become evidence")
         packet["used"] = grant if case in {"1024", "1025"} else 128

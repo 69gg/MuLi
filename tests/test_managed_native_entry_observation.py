@@ -469,9 +469,23 @@ def failure_probe(
 
 
 async def test_failure_window_authenticates_pending_source_once_without_transaction_progress(
-    entry_environment: EntryEnvironment, failure_probe: tuple[SystemdProbe, Any, Path]
+    entry_environment: EntryEnvironment,
+    failure_probe: tuple[SystemdProbe, Any, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env, (_, bus, _) = entry_environment, failure_probe
+    real_monotonic: Callable[[], float] = worker.time.monotonic
+    clock_origin: float = real_monotonic()
+
+    def monotonic() -> float:
+        return float(worker.HARNESS_SECONDS) + (real_monotonic() - clock_origin)
+
+    def monotonic_ns() -> int:
+        return int(monotonic() * 10**9)
+
+    # Keep the model clock moving, independent of a newly booted runner's uptime.
+    monkeypatch.setattr(worker.time, "monotonic", monotonic)
+    monkeypatch.setattr(worker.time, "monotonic_ns", monotonic_ns)
     case = _case(env)
     # This modelled Case deadline has passed; the original drive collection grant remains.
     case.start -= worker.CASE_SECONDS
@@ -493,9 +507,9 @@ async def test_failure_window_authenticates_pending_source_once_without_transact
         "outcome": "progress",
     }
     worker.write_json(env.root / "helper-entry-checkpoint.json", value)
-    await case._collect_failure_helper_source(
-        deadline=worker.time.monotonic() + worker.HTTP_SECONDS
-    )
+    collection_deadline: float = worker.time.monotonic() + worker.HTTP_SECONDS
+    assert 0 < case.start < case.deadline < worker.time.monotonic() < collection_deadline
+    await case._collect_failure_helper_source(deadline=collection_deadline)
     assert len(bus.calls) == 5  # read_helper's full double-sided RPC/proc/kernel proof.
     assert not any("ListUnitsByPatterns" in call or "ExecMainStatus" in call for call in bus.calls)
     assert case.result["resources"]["helper_source"] == source
@@ -508,9 +522,7 @@ async def test_failure_window_authenticates_pending_source_once_without_transact
     assert case.result["resources"]["helper_entry_checkpoint"] == value
     assert case.result["timeline"] == before and env.journal.read_current() == env.record
     assert ci.fixture_result(json.dumps(case.result).encode()) == case.result
-    await case._collect_failure_helper_source(
-        deadline=worker.time.monotonic() + worker.HTTP_SECONDS
-    )
+    await case._collect_failure_helper_source(deadline=collection_deadline)
     assert len(bus.calls) == 5
 
 
