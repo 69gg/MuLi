@@ -241,26 +241,88 @@ async def test_raw_body_budget_and_transport_contract_apply_to_all_responses(
     assert stream.is_closed
 
 
-async def test_absolute_deadline_closes_a_stalled_response(frozen: FrozenPolicy) -> None:
-    class Stalled(Chunks):
-        async def __aiter__(self) -> AsyncIterator[bytes]:
-            await asyncio.Event().wait()
-            yield b"unreachable"
+async def test_expired_deadline_does_not_construct_or_own_a_response(
+    frozen: FrozenPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from muli import candidate_online
 
-    body = Stalled()
-    with pytest.raises(CandidateError, match="candidate_online_unavailable"):
+    body = Chunks(b"unread")
+    stream = httpx.Response(200, stream=body)
+    clients: list[bool] = []
+    sent: list[httpx.Request] = []
+    consumed: list[bytes] = []
+
+    def construct(**_: Any) -> httpx.AsyncClient:
+        clients.append(True)
+        pytest.fail("An expired request must not construct a client")
+
+    def send(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return stream
+
+    monkeypatch.setattr(candidate_online.httpx, "AsyncClient", construct)
+    monkeypatch.setattr(candidate_online, "time", SimpleNamespace(monotonic=lambda: 1.0))
+    with pytest.raises(CandidateError, match="^candidate_deadline_exceeded$"):
         await receive(
             URL,
             settings=OnlineSettings(),
             limit=1024,
-            deadline=asyncio.get_running_loop().time() + 0.01,
+            deadline=1.0,
+            close_seconds=frozen.expected.limits.stop_seconds,
+            media_types=frozenset({"application/json"}),
+            consume=consumed.append,
+            verify=lambda: None,
+            transport=httpx.MockTransport(send),
+        )
+    assert not clients and not sent and not consumed
+    assert not stream.is_stream_consumed and not stream.is_closed and not body.closed
+
+
+async def test_absolute_deadline_closes_a_stalled_response(
+    frozen: FrozenPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from muli import candidate_online
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    class Stalled(Chunks):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            yield b"unreachable"
+
+    body = Stalled()
+    stream = httpx.Response(200, stream=body)
+    sent: list[httpx.Request] = []
+
+    def send(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return stream
+
+    # Isolate response ownership from the separately tested pre-response expiry.
+    # The synchronous transport reaches the body before its first suspension;
+    # asyncio's real timer still expires after the original 0.01 seconds.
+    monkeypatch.setattr(candidate_online, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    with pytest.raises(CandidateError, match="^candidate_online_unavailable$"):
+        await receive(
+            URL,
+            settings=OnlineSettings(),
+            limit=1024,
+            deadline=0.01,
             close_seconds=frozen.expected.limits.stop_seconds,
             media_types=frozenset({"application/json"}),
             consume=lambda _: None,
             verify=lambda: None,
-            transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body)),
+            transport=httpx.MockTransport(send),
         )
-    assert body.closed
+    assert len(sent) == 1 and entered.is_set() and cancelled.is_set()
+    assert stream.is_closed and body.closed
 
 
 @pytest.mark.parametrize("failure", ["timeout", "error"])
