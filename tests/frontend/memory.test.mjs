@@ -3,13 +3,17 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
+import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachments.mjs";
 import { CHANNELS } from "../../web/management.mjs";
+import { MODES, applyEvent, createSessionState, isRunning } from "../../web/state.mjs";
+import { mergeTranscript } from "../../web/voice-input.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 
 // Run the actual application functions and registered dialog close handler.
 // No browser library, server, model, account or real database is involved.
 // Compare DOM/slot identity through booleans: failed object diffs traverse the cyclic mock graph.
 const app = await readFile(new URL("../../web/app.mjs", import.meta.url), "utf8");
+const index = await readFile(new URL("../../web/index.html", import.meta.url), "utf8");
 const application = app.slice(app.indexOf("const ICONS ="), app.indexOf("\nfillIcons();"));
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
@@ -22,7 +26,7 @@ class DOMElement {
   constructor(tag, document) {
     this.tagName = tag.toUpperCase(); this.document = document; this.childNodes = []; this.parentNode = null;
     this.dataset = {}; this.attributes = {}; this.events = {}; this.className = "";
-    this._value = ""; this.name = ""; this.type = ""; this.hidden = false; this.disabled = false; this.open = false;
+    this._value = ""; this.name = ""; this.type = ""; this.hidden = false; this.disabled = false; this.open = false; this.style = {};
     this.classList = { toggle() {}, add() {}, remove() {} };
   }
   get children() { return this.childNodes.filter((node) => node instanceof DOMElement); }
@@ -113,7 +117,7 @@ async function openCatalog(h) {
   await clickMemoryButton(h, h.other.querySelector('[data-memory-tab="sources"]'));
 }
 
-function harness(handler = async () => { throw new Error("unexpected request"); }) {
+function harness(handler = async () => { throw new Error("unexpected request"); }, { composer = false } = {}) {
   const document = { events: {}, activeElement: null, createTextNode: (text) => new TextNode(text), addEventListener(name, callback) { (this.events[name] ??= []).push(callback); } };
   document.createElement = (tag) => tag === "button" ? new DOMButton(tag, document) : new DOMElement(tag, document);
   document.createElementNS = (_namespace, tag) => document.createElement(tag);
@@ -127,16 +131,28 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const close = node("button", "dialog-close", actions); close.dataset.action = "close-dialog"; node("button", "dialog-submit", actions);
   const other = node("div", "other-view"); const shell = node("div", "app-shell"); shell.className = "app-shell";
   node("div", "auth-gate"); node("input", "login-password");
-  for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll"]) node("div", id);
-  const requests = [], windowEvents = {}; let globalEvent = null;
+  for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll"]) node(id === "message-input" ? "textarea" : "div", id);
+  if (composer) {
+    const input = document.querySelector("#message-input");
+    input.maxLength = Number(index.match(/<textarea[^>]*\bid="message-input"[^>]*\bmaxlength="(\d+)"/)?.[1]);
+    assert.ok(Number.isSafeInteger(input.maxLength) && input.maxLength > 0);
+    input.setAttribute("maxlength", String(input.maxLength));
+    input.scrollHeight = 24;
+    for (const id of ["send-button", "stop-button", "composer-context", "composer-status", "composer-attachments", "voice-button", "voice-progress", "voice-status", "voice-stop", "voice-draft", "voice-draft-text", "chat-view"]) node("div", id);
+    // These cases exercise the real composer and submit handlers, without browser layout.
+    document.querySelector("#conversation-scroll").clientHeight = 0;
+  }
+  const requests = [], windowEvents = {}; let globalEvent = null, nextMessage = 0, voiceCallbacks = null;
   const context = {
     document, Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
     window: { addEventListener: (name, callback) => { windowEvents[name] = callback; } },
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,
+    crypto: { randomUUID: () => `memory-draft-${++nextMessage}` },
     setTimeout: () => 0, clearTimeout() {},
-    createSessionState: () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
+    MODES, applyEvent, isRunning, attachmentKind, attachmentURL, formatBytes, mergeTranscript,
+    createSessionState: composer ? createSessionState : () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
     uploadFile() {}, transcribeAttachment() {},
-    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, CHANNELS, restoreTeamView() {}, sessionStorage: {},
+    VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
@@ -145,12 +161,13 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   runInNewContext(application + `
     const realOtherView = renderOtherView;
     renderChrome = () => {}; renderOtherView = () => {}; renderChat = () => {}; toast = () => {};
+    ${composer ? "renderSessions = () => {};" : ""}
     const activateConnection = () => {
       const owner = beginConnection(); owner.ready = true;
       owner.sessions.start(); owner.notifications.start(); return owner;
     };
     activateConnection();
-    globalThis.ui = { state, renderMemories, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches,
+    globalThis.ui = { state, renderMemories, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, renderComposerAttachments,
       activateConnection,
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       stopEvents() { globalController?.abort(); },
@@ -160,7 +177,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const body = () => document.querySelector("#dialog-content").textContent;
   const button = (text, root = dialog) => root.querySelectorAll("button").find((entry) => entry.textContent === text);
   const expand = async (text) => { const details = dialog.querySelectorAll("details").find((entry) => entry.firstElementChild.textContent === text); assert.ok(details, `missing ${text}`); details.open = true; await details.dispatch("toggle"); await flush(); };
-  return { ui, requests, document, dialog, form, other, body, button, expand, windowEvents, emitGlobal: (event) => globalEvent(event) };
+  return { ui, requests, document, dialog, form, other, body, button, expand, windowEvents, emitGlobal: (event) => globalEvent(event), publishVoiceDraft: (draft) => voiceCallbacks.onDraft(draft) };
 }
 
 test("source tab explicitly advances empty candidate windows and keeps its outer layout", async () => {
@@ -289,6 +306,292 @@ test("catalog source reader uses exact source identity and UTF-8 paging without 
   assert.equal(new URLSearchParams(h.requests.at(-1).path.split("?")[1]).get("offset_bytes"), String(offset));
   await clickMemoryButton(h, h.button("上一段"));
   assert.ok(h.body().includes(first)); assert.equal(h.body().includes(last), false);
+});
+
+for (const running of [false, true]) {
+  test(`catalog originals prepare editable main drafts and use the original manual send path (${running ? "running" : "idle"})`, async () => {
+    const first = "外部资料首页🙂", last = "EXTERNAL_BODY_MUST_STAY_IN_SOURCE_退款条件";
+    const offset = Buffer.byteLength(first), total = offset + Buffer.byteLength(last);
+    const identifier = "1".repeat(32), revision = "a".repeat(64);
+    const item = catalogSource({ source_id: `attachment:${identifier}`, source: `attachment:${identifier}:${revision}`, revision, total_bytes: total });
+    const file = { id: "2".repeat(32), name: "既有草稿附件.txt", mime_type: "text/plain", size: 12 };
+    const mainId = "current-main";
+    const h = harness(async (path, options = {}) => {
+      if (path.startsWith("/memory/sources?")) return catalogPage([item]);
+      if (path.startsWith("/memory/source?")) {
+        const query = new URLSearchParams(path.split("?")[1]);
+        assert.equal(query.get("id"), item.source_id); assert.equal(query.get("revision"), revision);
+        const start = Number(query.get("offset_bytes"));
+        assert.ok(start === 0 || start === offset);
+        const content = start === 0 ? first : last;
+        return { id: item.source_id, session_id: item.session_id, source: item.source, role: item.role, principal: item.principal, trusted_owner: item.trusted_owner, digest: revision, created_at: item.created_at, source_id: item.source_id, revision, truncated: false, field: "content", content, offset_bytes: start, length_bytes: Buffer.byteLength(content), next_offset_bytes: start + Buffer.byteLength(content), total_bytes: total, has_more: start === 0 };
+      }
+      if (path === `/sessions/${mainId}/messages` && options.method === "POST") {
+        return { run_id: running ? "existing-run" : "new-run", queued: running, message: { id: "accepted-question", session_id: mainId, role: "user", principal: "owner", content: options.body.content, attachment_ids: [...options.body.attachment_ids], attachments: [file], created_at: 2, delivery_status: running ? "pending" : "delivered" } };
+      }
+      if (path === "/sessions") return { items: [{ id: mainId, status: "running" }] };
+      throw new Error(`unexpected request: ${path}`);
+    }, { composer: true });
+    h.ui.state.connected = true; h.ui.state.status = { configured: true, model: "fixture-model" };
+    h.ui.state.activeSession = { id: mainId, mode: "auto", status: running ? "running" : "idle" }; h.ui.state.mainSessionId = mainId;
+    h.ui.state.session.status = running ? "running" : "idle"; h.ui.state.session.runId = running ? "existing-run" : null;
+    h.ui.state.attachments = [file];
+    const attachments = h.ui.state.attachments;
+    const pendingVoice = { text: "尚未合并的语音草稿" }; h.ui.state.voiceDraft = pendingVoice;
+    const input = h.document.querySelector("#message-input"), question = "结合这份说明回答：退款条件会影响我的方案吗？";
+    input.value = question; await input.dispatch("input"); h.ui.renderComposerAttachments();
+    const captured = h.ui.captureDraft();
+
+    await openCatalog(h); await clickMemoryButton(h, h.button("核原文", h.other));
+    await clickMemoryButton(h, h.button("下一段"));
+    assert.ok(h.body().includes(last)); assert.equal(h.requests.length, 3);
+    const useSource = h.button("带资料提问");
+    assert.ok(useSource, "the original reader must offer 带资料提问 after its real page is read");
+    await clickMemoryButton(h, useSource);
+
+    const prepared = input.value;
+    assert.equal(h.ui.state.view, "chat"); assert.equal(h.dialog.open, false); assert.equal(h.ui.slot === null, true);
+    assert.equal(h.document.activeElement === input, true);
+    assert.ok(prepared.startsWith(question)); assert.ok(prepared.includes(JSON.stringify({ id: item.source_id, revision })));
+    const newline = String.fromCharCode(10), preparedLines = prepared.split(newline);
+    assert.equal(preparedLines.length, 4);
+    assert.deepEqual(preparedLines.slice(0, 2), [question, ""]);
+    assert.ok(preparedLines[2].startsWith("参考资料："));
+    assert.deepEqual(JSON.parse(preparedLines[3]), { id: item.source_id, revision });
+    for (const privateText of [first, last, item.session_id, item.principal, item.source]) assert.equal(prepared.includes(privateText), false);
+    assert.ok(h.ui.captureDraft().revision > captured.revision);
+    assert.equal(h.ui.state.attachments === attachments, true); assert.equal(h.ui.state.attachments[0] === file, true);
+    assert.equal(h.ui.state.voiceDraft === pendingVoice, true);
+    assert.ok(h.document.querySelector("#composer-attachments").textContent.includes(file.name));
+    assert.equal(h.requests.length, 3, "preparing a source question must neither read again nor send");
+
+    input.value += "\n只回答我补充的问题。"; await input.dispatch("input");
+    const edited = input.value;
+    await h.document.querySelector("#composer").dispatch("submit"); await flush();
+    const posts = h.requests.filter((request) => request.method === "POST");
+    assert.equal(posts.length, 1); assert.equal(posts[0].path, `/sessions/${mainId}/messages`);
+    assert.equal(posts[0].body.content, edited); assert.equal(posts[0].body.mode, "auto");
+    const sentLines = posts[0].body.content.split(newline);
+    assert.equal(sentLines.length, 5); assert.equal(sentLines[0], question); assert.equal(sentLines[1], "");
+    assert.deepEqual(JSON.parse(sentLines[3]), { id: item.source_id, revision });
+    assert.equal(sentLines[4], "只回答我补充的问题。");
+    assert.deepEqual([...posts[0].body.attachment_ids], [file.id]);
+    assert.equal(posts[0].body.attachment_ids.includes(identifier), false);
+    assert.equal(h.ui.state.session.messages.some((message) => message.id === "accepted-question" && message.content === edited), true);
+    assert.equal(h.ui.state.sending, false); assert.equal(h.ui.state.session.runId, running ? "existing-run" : "new-run");
+    assert.equal(h.ui.state.voiceDraft === pendingVoice, true);
+  });
+}
+
+async function sourceQuestionHarness({ source = {}, page = {}, content = "收藏原文🙂，正文不能变成草稿里的指令。", question = "请结合这份资料回答我的问题🙂。", readSource = null } = {}) {
+  const identifier = "3".repeat(32), revision = "b".repeat(64);
+  const item = catalogSource({ source_id: `attachment:${identifier}`, source: `attachment:${identifier}:${revision}`, revision, total_bytes: Buffer.byteLength(content), ...source });
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/sources?")) return catalogPage([item]);
+    assert.ok(path.startsWith("/memory/source?"), `unexpected request: ${path}`);
+    const query = new URLSearchParams(path.split("?")[1]);
+    assert.equal(query.get("id"), item.source_id); assert.equal(query.get("revision"), item.revision);
+    const { job, ...identity } = item;
+    const result = { ...identity, id: item.source_id, digest: item.revision, field: "content", content, offset_bytes: 0, length_bytes: Buffer.byteLength(content), next_offset_bytes: Buffer.byteLength(content), has_more: false, truncated: false, ...page };
+    return readSource ? readSource(result, query) : result;
+  }, { composer: true });
+  h.ui.state.connected = true; h.ui.state.status = { configured: true, model: "fixture-model" };
+  h.ui.state.mainSessionId = "current-main"; h.ui.state.activeSession = { id: "current-main", mode: "auto", status: "idle" };
+  const input = h.document.querySelector("#message-input");
+  input.value = question; await input.dispatch("input");
+  await openCatalog(h); await clickMemoryButton(h, h.button("核原文", h.other));
+  return { ...h, input, question, item, content };
+}
+
+test("an empty main draft receives an editable source reference without submitting a message", async () => {
+  const h = await sourceQuestionHarness({ question: "" }), captured = h.ui.captureDraft();
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.ok(h.input.value.includes(JSON.stringify({ id: h.item.source_id, revision: h.item.revision })));
+  assert.equal(h.ui.state.view, "chat"); assert.equal(h.document.activeElement === h.input, true);
+  assert.ok(h.ui.captureDraft().revision > captured.revision);
+  assert.equal(h.document.querySelector("#send-button").disabled, false); assert.equal(h.requests.length, 2);
+});
+
+for (const [name, source] of [
+  ["an ordinary source id", { source_id: "ordinary-source" }],
+  ["another external principal", { principal: "external:preview" }],
+  ["an owner message", { role: "user", principal: "owner", trusted_owner: true }],
+  ["an assistant message", { role: "assistant" }],
+]) {
+  test(`source questions do not promote ${name} into a saved attachment`, async () => {
+    const h = await sourceQuestionHarness({ source });
+    assert.ok(h.body().includes(h.content)); assert.equal(h.button("带资料提问"), undefined);
+    assert.equal(h.input.value, h.question); assert.equal(h.requests.length, 2);
+  });
+}
+
+test("a source page must retain its catalog's real external identity before it can prepare a question", async () => {
+  const h = await sourceQuestionHarness({ page: { principal: "external:other" } });
+  assert.ok(h.body().includes(h.content)); assert.equal(h.button("带资料提问"), undefined);
+  assert.equal(h.input.value, h.question);
+});
+
+test("source questions wait for a successful real read and require an explicit retry after failure", async () => {
+  const pending = deferred(); let attempts = 0;
+  const h = await sourceQuestionHarness({ readSource: (page) => ++attempts === 1 ? pending.promise : page });
+  assert.equal(h.button("带资料提问"), undefined); assert.equal(h.requests.length, 2);
+  pending.reject(new ApiError("原文暂时不可读", 500)); await flush();
+  assert.equal(h.button("带资料提问"), undefined); assert.ok(h.body().includes("原文暂时不可读"));
+  assert.equal(h.input.value, h.question); assert.equal(h.requests.length, 2);
+  await clickMemoryButton(h, h.button("重试"));
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.ok(h.input.value.includes(h.item.source_id)); assert.equal(h.requests.length, 3);
+});
+
+test("a detached first-page source button cannot write during or after the next real read", async () => {
+  const first = "首页🙂", last = "后文", pending = deferred();
+  const h = await sourceQuestionHarness({ content: first + last, readSource: (page, query) => Number(query.get("offset_bytes")) === 0
+    ? { ...page, content: first, length_bytes: Buffer.byteLength(first), next_offset_bytes: Buffer.byteLength(first), has_more: true, truncated: true }
+    : pending.promise.then(() => ({ ...page, content: last, offset_bytes: Buffer.byteLength(first), length_bytes: Buffer.byteLength(last), next_offset_bytes: Buffer.byteLength(first + last), truncated: true })) });
+  const old = h.button("带资料提问"); assert.ok(old && !old.disabled);
+  await clickMemoryButton(h, h.button("下一段"));
+  await clickMemoryButton(h, old);
+  assert.equal(h.input.value, h.question); assert.equal(h.ui.state.view, "memories");
+  pending.resolve(); await flush();
+  await clickMemoryButton(h, old); assert.equal(h.input.value, h.question);
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.ok(h.input.value.includes(h.item.source_id)); assert.equal(h.requests.length, 3);
+});
+
+test("a rendered source page keeps its reading connection until it is explicitly read again", async () => {
+  const h = await sourceQuestionHarness(), old = h.button("带资料提问"), slot = h.ui.slot;
+  h.ui.activateConnection(); h.ui.state.connected = true;
+  await clickMemoryButton(h, old);
+  assert.equal(h.input.value, h.question); assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.ui.slot === slot, true);
+  assert.equal(h.requests.length, 2);
+  await h.ui.loadMemorySource(slot, 0, 0);
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.ok(h.input.value.includes(h.item.source_id)); assert.equal(h.requests.length, 3);
+});
+
+for (const type of ["memory.updated", "memory.forgotten"]) {
+  test(`${type} removes the source question authority of an already rendered button`, async () => {
+    const h = await sourceQuestionHarness(), old = h.button("带资料提问");
+    h.ui.invalidateMemoryEvidence({ type, data: { memory_ids: [], source_id: h.item.source_id } });
+    await clickMemoryButton(h, old);
+    assert.equal(h.input.value, h.question); assert.equal(h.button("带资料提问"), undefined);
+    assert.equal(h.ui.slot.page === null, true); assert.equal(h.requests.length, 2);
+  });
+}
+
+for (const [name, change, expected] of [
+  ["new typed draft", (h) => { h.input.value = "导航时的新输入"; void h.input.dispatch("input"); }, "导航时的新输入"],
+  ["programmatic text with the same revision", (h) => { h.input.value = "没有触发 input 的新草稿"; }, "没有触发 input 的新草稿"],
+  ["replacement connection", (h) => { h.ui.activateConnection(); h.ui.state.connected = true; }, null],
+  ["replacement main identity", (h) => { h.ui.state.mainSessionId = "replacement-main"; }, null],
+  ["a newer navigation that also ends in chat", (h) => { void h.ui.switchView("memories"); void h.ui.switchView("chat"); }, null],
+]) {
+  test(`preparing a source question yields to ${name}`, async () => {
+    const h = await sourceQuestionHarness(), focus = h.input.focus.bind(h.input);
+    let armed = true;
+    h.input.focus = () => { focus(); if (armed) { armed = false; queueMicrotask(() => change(h)); } };
+    await clickMemoryButton(h, h.button("带资料提问"));
+    assert.equal(h.input.value, expected ?? h.question);
+    assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.ui.state.view, "chat");
+    assert.equal(h.requests.some((entry) => entry.method === "POST"), false);
+  });
+}
+
+test("source preparation preserves newer attachments and a pending voice draft across navigation", async () => {
+  const h = await sourceQuestionHarness(), focus = h.input.focus.bind(h.input);
+  const attachments = [{ id: "4".repeat(32) }], voice = { text: "导航期间到达的转写" };
+  let armed = true;
+  h.input.focus = () => { focus(); if (armed) { armed = false; queueMicrotask(() => { h.ui.state.attachments = attachments; h.ui.state.voiceDraft = voice; }); } };
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.ok(h.input.value.includes(h.item.source_id));
+  assert.equal(h.ui.state.attachments === attachments, true); assert.equal(h.ui.state.voiceDraft === voice, true);
+  assert.equal(h.requests.length, 2);
+});
+
+test("a late voice transcript cannot overwrite a source reference appended to the captured draft", async () => {
+  const h = await sourceQuestionHarness(), captured = h.ui.captureDraft();
+  await clickMemoryButton(h, h.button("带资料提问"));
+  const prepared = h.input.value;
+  h.publishVoiceDraft({ context: captured, text: "迟到的转写正文" });
+  assert.equal(h.input.value, prepared); assert.equal(h.ui.state.voiceDraft.text, "迟到的转写正文");
+  assert.equal(h.document.querySelector("#voice-draft-text").value, "迟到的转写正文");
+  assert.equal(h.requests.length, 2);
+});
+
+for (const oldConnection of [false, true]) {
+  test(`a source question read's ${oldConnection ? "old" : "current"} 401 keeps its original authentication meaning`, async () => {
+    const pending = deferred(), h = await sourceQuestionHarness({ readSource: () => pending.promise });
+    if (oldConnection) { h.ui.activateConnection(); h.ui.state.connected = true; }
+    pending.reject(new ApiError("SOURCE_401", 401)); await flush();
+    assert.equal(h.ui.state.auth.authenticated, oldConnection);
+    assert.equal(h.input.value, h.question); assert.equal(h.button("带资料提问"), undefined);
+    assert.equal(h.requests.length, 2);
+  });
+}
+
+test("source references deduplicate as editable text and respect the existing exact maxlength", async () => {
+  const h = await sourceQuestionHarness();
+  await clickMemoryButton(h, h.button("带资料提问"));
+  const prepared = h.input.value, revision = h.ui.captureDraft().revision;
+  await h.ui.switchView("memories"); await clickMemoryButton(h, h.button("核原文", h.other));
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.equal(h.input.value, prepared); assert.equal(h.ui.captureDraft().revision, revision);
+
+  h.input.value = h.question; await h.input.dispatch("input"); h.input.maxLength = prepared.length;
+  await h.ui.switchView("memories"); await clickMemoryButton(h, h.button("核原文", h.other));
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.equal(h.input.value, prepared);
+
+  h.input.value = h.question; await h.input.dispatch("input"); h.input.maxLength = prepared.length - 1;
+  const captured = h.ui.captureDraft();
+  await h.ui.switchView("memories"); await clickMemoryButton(h, h.button("核原文", h.other));
+  await clickMemoryButton(h, h.button("带资料提问"));
+  assert.equal(h.input.value, h.question); assert.equal(h.ui.captureDraft().revision, captured.revision);
+  assert.equal(h.dialog.open, true); assert.equal(h.ui.state.view, "memories");
+  assert.equal(h.requests.some((entry) => entry.method === "POST"), false);
+});
+
+for (const destination of ["catalog", "chat"]) {
+  test(`a previous source catalog's late 401 cannot replace the new ${destination}`, async () => {
+    const pending = deferred(), content = "NEW_CONNECTION_ORIGINAL", identifier = "5".repeat(32), revision = "a".repeat(64);
+    const item = catalogSource({ source_id: `attachment:${identifier}`, source: `attachment:${identifier}:${revision}`, total_bytes: Buffer.byteLength(content) });
+    let reads = 0;
+    const h = harness(async (path) => {
+      if (path.startsWith("/memory/sources?")) return ++reads === 1 ? pending.promise : catalogPage([item]);
+      assert.ok(path.startsWith("/memory/source?"));
+      const { job, ...identity } = item;
+      return { ...identity, id: item.source_id, digest: revision, field: "content", content, offset_bytes: 0, length_bytes: Buffer.byteLength(content), next_offset_bytes: Buffer.byteLength(content), has_more: false, truncated: false };
+    });
+    const opening = openCatalog(h); await flush();
+    const old = h.requests[0]; assert.equal(old.cache, "no-store"); assert.equal(old.signal.aborted, false);
+    h.ui.activateConnection();
+    await openCatalog(h);
+    await clickMemoryButton(h, h.button("核原文", h.other));
+    assert.ok(h.body().includes(content));
+    if (destination === "chat") await h.ui.switchView("chat");
+    const slot = h.ui.catalog, directory = h.other.textContent, memory = h.ui.slot, body = h.body(), title = h.document.querySelector("#dialog-title").textContent;
+    const input = h.document.querySelector("#message-input");
+    input.value = "新连接主草稿";
+    assert.equal(h.ui.state.auth.authenticated, true); assert.equal(old.signal.aborted, true);
+    assert.equal(h.requests.length, 3);
+
+    // The raw API deliberately ignores abort; the actual helper must reject its old 401 first.
+    pending.reject(new ApiError("OLD_CATALOG_401", 401)); await opening; await flush();
+    assert.equal(h.ui.state.auth.authenticated, true);
+    assert.equal(h.ui.state.view, destination === "catalog" ? "memories" : "chat");
+    assert.equal(h.ui.catalog === slot, true); assert.equal(h.other.textContent, directory); assert.equal(input.value, "新连接主草稿");
+    assert.equal(h.ui.slot === memory, true); assert.equal(h.body(), body); assert.equal(h.document.querySelector("#dialog-title").textContent, title);
+    assert.equal(h.dialog.open, destination === "catalog");
+    assert.equal(h.requests.length, 3); assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+  });
+}
+
+test("a current source catalog 401 still clears private state and asks for login", async () => {
+  const h = harness(async () => { throw new ApiError("CURRENT_CATALOG_401", 401); });
+  await openCatalog(h); await flush();
+  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.ui.catalog === null, true);
+  assert.equal(h.document.activeElement === h.document.querySelector("#login-password"), true);
+  assert.equal(h.requests.length, 1);
 });
 
 test("closing the catalog source reader aborts and rejects a late body", async () => {

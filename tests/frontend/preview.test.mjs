@@ -71,6 +71,32 @@ test("preview source discovery, UTF-8 reads and exact retries stay in local demo
   assert.equal(backend.state.memorySources.find((entry) => entry.source_id === item.source_id).job.state, "done");
 });
 
+test("preview keeps a question's saved original separate from upload references and manual sending", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const uploads = structuredClone(backend.state.uploads), memories = structuredClone(backend.state.memories);
+  const sources = structuredClone(backend.state.memorySources), main = backend.state.sessions[0];
+  const catalog = await json(backend, "/memory/sources");
+  const item = catalog.body.items[0];
+  assert.match(item.source_id, /^attachment:[a-f0-9]{32}$/u);
+  assert.equal(item.principal, "external:attachment"); assert.equal(item.role, "tool"); assert.equal(item.trusted_owner, false);
+  assert.equal(backend.state.uploads.some((file) => `attachment:${file.id}` === item.source_id), false);
+  const original = await json(backend, `/memory/source?${new URLSearchParams({ id: item.source_id, revision: item.revision })}`);
+  assert.equal(original.status, 200); assert.equal(original.body.source_id, item.source_id); assert.equal(original.body.revision, item.revision);
+  assert.equal(original.body.source, item.source); assert.equal(original.body.principal, item.principal);
+  assert.equal(original.body.role, item.role); assert.equal(original.body.trusted_owner, false);
+  assert.ok(original.body.content.length > 0);
+  assert.deepEqual(backend.state.messages[main.id], []);
+  assert.deepEqual(backend.state.uploads, uploads); assert.deepEqual(backend.state.memories, memories); assert.deepEqual(backend.state.memorySources, sources);
+  assert.equal(backend.state.requests.some((entry) => entry.method === "POST"), false);
+
+  const content = `这份说明建议先做什么？\n${JSON.stringify({ id: item.source_id, revision: item.revision })}`;
+  const sent = await json(backend, `/sessions/${main.id}/messages`, "POST", { content, mode: "auto", attachment_ids: [] });
+  assert.equal(sent.status, 200); assert.equal(sent.body.message.content, content);
+  assert.deepEqual(sent.body.message.attachment_ids, []);
+  assert.equal(backend.state.requests.filter((entry) => entry.method === "POST").length, 1);
+  assert.deepEqual(backend.state.uploads, uploads);
+});
+
 test("preview compares its explicit demo pair and retains exact readable source coordinates", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());
   const sources = backend.state.memorySources.filter((item) => item.comparisonDemo);

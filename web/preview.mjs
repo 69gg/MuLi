@@ -16,6 +16,7 @@ export function createPreviewState() {
   const now = timestamp();
   const main = { id: "preview-main", name: "沐璃", title: "与沐璃对话", role: "main", mode: "auto", status: "idle", created_at: now, updated_at: now };
   const notes = "# 项目整理示例\n\n先梳理目标，再分解任务，由队友执行、复核后汇总。\n\n此文件由前端预览生成，没有读取本机项目。\n";
+  const notesAttachmentId = "a".repeat(32), notesRevision = "a".repeat(64);
   const mcp = { mcpServers: { "示例资料库": { url: "https://mcp.preview.invalid/mcp", enabled: true, headers: {} } } };
   return {
     settings: {
@@ -63,7 +64,7 @@ export function createPreviewState() {
       { id: "3".repeat(64), question: "留意旧项目的设计回顾。", match_terms: ["设计", "回顾"], state: "cancelled", revision: 2, reply_preference: { kind: "registered_web" } },
     ],
     memorySources: [
-      { source_id: "preview-source-notes", source: "前端演示资料", content: notes, session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "a".repeat(64), created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
+      { source_id: `attachment:${notesAttachmentId}`, source: `attachment:${notesAttachmentId}:${notesRevision}`, content: notes, session_id: main.id, role: "tool", principal: "external:attachment", trusted_owner: false, revision: notesRevision, created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
       { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
       ...[["e", "c", "1", "期限：七日\n材料：学生证\n"], ["f", "d", "2", "期限：十日\n材料：身份证\n"]].map(([id, original, revision, content]) => ({ source_id: `attachment:${id.repeat(32)}`, source: `attachment:${id.repeat(32)}:${original.repeat(64)}`, content, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false, revision: revision.repeat(64), source_revision: original.repeat(64), format: "text", scope: "utf8_text", document_revision: null, attachment_id: id.repeat(32), created_at: now - 1800, job: { state: "done", attempts: 1, last_error: "" }, comparisonDemo: true })),
     ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),

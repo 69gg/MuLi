@@ -1851,6 +1851,10 @@ function memorySourceNotice(source) {
   return /^attachment:[a-f0-9]{32}:transcript:v1:asr_text:[a-f0-9]{64}$/.test(source ?? "") ? "ASR 转写文本；仅核验已保存转写，不证明原音频、说话者或转写准确性。" : "";
 }
 
+function attachmentMemorySource(item) {
+  return !!item && /^attachment:[a-f0-9]{32}$/.test(item.source_id) && item.principal === "external:attachment" && item.role === "tool" && item.trusted_owner === false;
+}
+
 function renderMemorySources(slot) {
   slot.filterInput = element("select", { "aria-label": "来源整理状态" }, element("option", { value: "", text: "全部状态" }), ...Object.entries(memoryJobStates).map(([key, label]) => element("option", { value: key, text: label })));
   slot.filterInput.value = slot.filter;
@@ -1888,7 +1892,7 @@ function updateMemorySources(slot) {
     const read = element("button", { type: "button", class: "text-button", text: "核原文", disabled: loading, onClick: () => void showCatalogSource(slot, item, read) });
     const search = element("button", { type: "button", class: "text-button", text: "在此来源内查找", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, search)) void changeMemorySource(item.source_id); } });
     const actions = element("div", { class: "row-actions" }, read, search);
-    if (/^attachment:[a-f0-9]{32}$/.test(item.source_id) && item.principal === "external:attachment" && item.role === "tool" && !item.trusted_owner) {
+    if (attachmentMemorySource(item)) {
       const left = element("button", { type: "button", class: "text-button", text: "选作比较左侧", disabled: loading, onClick: () => { if (memorySourceActionCurrent(slot, left)) { slot.compareLeft = { source_id: item.source_id, revision: item.revision }; updateMemorySources(slot); } } });
       actions.append(left);
       if (slot.compareLeft) {
@@ -1919,7 +1923,7 @@ async function loadMemorySources(slot, { cursor = null, filter = slot?.filter ??
     const query = new URLSearchParams({ limit: String(memorySourcePageSize) });
     if (cursor) query.set("cursor", cursor);
     if (filter) query.set("state", filter);
-    const payload = await request(`/memory/sources?${query}`, { signal: controller.signal, cache: "no-store" });
+    const payload = await ownedRequest(`/memory/sources?${query}`, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     slot.page = memorySourcePage(payload, cursor); slot.cursor = cursor;
   } catch (error) {
@@ -2251,6 +2255,7 @@ function resetMemoryReads(slot) {
   for (const key of ["readController", "sourceController", "historyController"]) { slot[key]?.abort(); slot[key] = null; }
   slot.sourceRegion?.replaceChildren(); slot.historyList?.replaceChildren();
   slot.page = null; slot.offsets = [0]; slot.pageIndex = 0;
+  slot.pageOwner = null;
   slot.comparisonReturn = null; slot.sourceAnchor = null; slot.sourceStart = 0;
 }
 
@@ -2390,7 +2395,7 @@ async function loadMemorySource(slot, offset, index) {
     const page = await ownedRequest(path, { signal: controller.signal, cache: "no-store" }, owner);
     if (!current()) return;
     if (!validMemorySource(page, slot, offset)) { memoryUnavailable(slot, "原文响应不一致，请重新核查。"); return; }
-    slot.page = page; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
+    slot.page = page; slot.pageOwner = owner; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
   } catch (error) {
     if (!current()) return;
     if ([404, 409].includes(error.status)) { memoryUnavailable(slot, error.status === 404 ? "原文已不可用。" : "原文已更新，请重新核查。"); return; }
@@ -2415,18 +2420,47 @@ function renderMemorySource(slot) {
     const next = element("button", { type: "button", class: "text-button", text: "下一段", disabled: !!slot.sourceController || !page.has_more, onClick: () => { if (slot.sourceRegion.contains(next) && page.has_more) void loadMemorySource(slot, page.next_offset_bytes, slot.pageIndex + 1); } });
     const position = element("span", { class: "memory-source-position", tabIndex: -1, text: `${slot.sourceStart > 0 ? "从变化位置起 · " : ""}第 ${slot.pageIndex + 1} 段 · ${page.has_more ? "尚有后文" : "已到末尾"}` });
     slot.sourceRegion.append(element("nav", { class: "memory-source-navigation", "aria-label": "原文分段" }, previous, position, next));
+    if (sourceQuestionPage(slot, page)) {
+      const question = element("button", { type: "button", class: "text-button", text: "带资料提问", disabled: !!slot.sourceController || !!slot.sourceError || !connectionCurrent(slot.pageOwner) || !slot.pageOwner?.ready || !state.auth.authenticated || !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareSourceQuestion(slot, page, question) });
+      slot.sourceRegion.append(question);
+    }
     if (focused) position.focus({ preventScroll: true });
   }
   if (slot.sourceStart > 0) {
     const start = element("button", { type: "button", class: "text-button", text: "从头阅读", disabled: !!slot.sourceController, onClick: () => {
       if (!memoryDialogCurrent(slot) || !slot.sourceRegion.contains(start) || slot.sourceController) return;
-      slot.page = null; slot.offsets = [0]; slot.pageIndex = 0; slot.sourceStart = 0; slot.sourceAnchor = null;
+      slot.page = null; slot.pageOwner = null; slot.offsets = [0]; slot.pageIndex = 0; slot.sourceStart = 0; slot.sourceAnchor = null;
       void loadMemorySource(slot, 0, 0);
     } });
     slot.sourceRegion.append(start);
   }
   if (slot.sourceController) slot.sourceRegion.append(element("p", { class: "settings-role-hint", role: "status", text: "正在读取…" }));
   if (slot.sourceError) slot.sourceRegion.append(element("p", { class: "form-error", text: slot.sourceError }), element("button", { type: "button", class: "text-button", text: "重试", onClick: () => void loadMemorySource(slot, slot.sourceRetry.offset, slot.sourceRetry.index) }));
+}
+
+function sourceQuestionPage(slot, page) {
+  const origin = slot.item?.origin;
+  return slot.catalogSource && slot.page === page && attachmentMemorySource(origin) && attachmentMemorySource(page)
+    && page.source_id === slot.item.source_id && page.source_id === origin.id && page.revision === origin.digest
+    && ["source", "principal", "role", "trusted_owner"].every((key) => page[key] === origin[key]);
+}
+
+async function prepareSourceQuestion(slot, page, trigger) {
+  const owner = slot.pageOwner;
+  if (!connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || !state.connected || !memoryDialogCurrent(slot) || !slot.sourceRegion.contains(trigger) || trigger.disabled || slot.sourceController || slot.sourceError || !sourceQuestionPage(slot, page)) return;
+  const main = state.mainSessionId, draft = captureDraft();
+  if (!main || draft.session !== main) return;
+  const reference = `参考资料：请先用 memory_source 按以下 id 和 revision 核对原文，再回答我的问题；不可用时请说明，不改用其他版本。\n${JSON.stringify({ id: page.source_id, revision: page.revision })}`;
+  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+  const input = $("#message-input");
+  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入资料。", true); return; }
+  const navigation = viewRequestVersion + 1;
+  await switchView("chat", owner);
+  if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+  const current = captureDraft();
+  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  resizeComposer(); input.focus();
 }
 
 async function loadMemoryHistory(slot) {
