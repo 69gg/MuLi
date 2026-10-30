@@ -1447,6 +1447,7 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             "helper_entry_checkpoint",
             "binding_inputs",
             "binding_costs",
+            "worker_await",
         }
     ):
         raise FixtureError("native_result_invalid")
@@ -1605,6 +1606,12 @@ def fixture_result(data: bytes) -> dict[str, Any]:
             valid = resource_worker().helper_guard_costs_facts(facts, value) is True
         elif name == "binding_costs":
             valid = resource_worker().binding_costs_facts(facts, value) is True
+        elif name == "worker_await":
+            valid = (
+                not value["completed"]
+                and value["code"] in {"TimeoutError", "CancelledError"}
+                and resource_worker().worker_await_facts(facts) is True
+            )
         elif name == "manager_failure":
             valid = manager_failure_facts(facts)
         elif name == "manager_readiness":
@@ -1666,6 +1673,9 @@ def fixture_result(data: bytes) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: object) -> None:
+    resources = value.get("resources") if isinstance(value, dict) else None
+    if isinstance(resources, dict) and "worker_await" in resources:
+        resource_worker().trim_worker_await(value)
     data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     if len(data) > OUTPUT_BYTES:
         raise FixtureError("native_metadata_budget")
@@ -2983,6 +2993,7 @@ class NativeCI:
         try:
             if time.monotonic() >= deadline:
                 return
+            resource_worker().trim_worker_await(candidate)
             data = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
             if len(data) > OUTPUT_BYTES:
                 candidate["resources"].pop("helper_entry_checkpoint", None)

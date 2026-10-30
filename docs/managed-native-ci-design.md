@@ -1,5 +1,34 @@
 # 真实 systemd 托管切换 CI 设计
 
+worker 另可输出一份 `resources.worker_await` version1 取消位置。它用于区分最后
+timeline 标签与真正被外层取消的等待：`helper_exit` 只表示此前记录过 helper 状态，
+不能据此认定正在等待 helper 退出。本字段也不是 helper 自己的执行栈。
+
+观测只在现有 worker await 外加入同步边界，不增加 await、task、probe、文件读写或
+helper 发布次数。固定标签为 `command`、`poll`、`http`、`helper_exists`、
+`helper_unit_path`、`helper_snapshot`、`helper_properties`、`managed_read`。
+真实 task 正在取消时先记最内层位置；原取消对象继续传播，只有同一取消实际逃出
+drive，或被已过期的 drive 外层 timeout 转换为直接以它为 cause 的 `TimeoutError`，
+才随原失败结果保存。普通返回、普通异常、直接抛出但未请求的 `CancelledError` 和
+HTTP 自己的短超时都不生成该位置，不跟任意异常链或导出异常正文、URL、路径及局部变量。
+
+字段只含版本、固定 operation、`outcome=cancelled`，以及相对原 Case.start 的
+`started_ns`、`cancelled_ns` 和原预算 `deadline_ns`。读端严格拒绝额外字段、未知标签、
+布尔冒充整数、逆序及越界时间，只接受尚未完成且 code 为 TimeoutError/CancelledError
+的结果。正常结束或未覆盖的等待点没有此字段；缺失不能补为零成本或推断具体挂点。
+新增位置共用原32KiB总结果门，原结果或后续 collector 合并超预算时先删除该可选字段，
+不挤掉原 code、timeline、helper source、清理事实或既有诊断。
+最终 helper 成本收取也在每个旧诊断候选的预算判断前让新增位置让位，接受候选时同步其删除，
+避免旧成本、历史、样本或失败来源事实先被拒绝后无法恢复；空间充足时仍保留新增位置。
+
+旧候选 `1a0c71ef121bb0cb87ce600dab6d51f3f4a59486` 的
+[原生作业](https://github.com/69gg/MuLi/actions/runs/40982335420/job/123825122034)
+仍在整轮60秒失败：前两代精确投影为28418/52544毫秒，第三代59831毫秒到 draining。
+60030毫秒的独立 helper 来源采集仍要求同代事务未 resolved；正常 resolved-only 尾部观察
+不能解释该路径，异常退栈后的 close 也尚未直接定位。worker 取消点只定位调用方等待，
+不能区分 helper 内部认证、业务 await 或异常 close，更不能证明原生功能已修复。
+Case60 / harness90 / cleanup5、全部 hash、认证、资源限额和完整三事务验收均保持。
+
 托管 helper 只在自建 probe 且 `runner is run_process` 时启用内部
 `join_interface_reads`；通用 probe 默认串行，注入 probe 原样保留身份与策略，
 注入 runner、manager 与 setup 不自动启用。同轮 Unit/Service 复用原白名单 busctl，

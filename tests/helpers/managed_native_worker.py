@@ -15,8 +15,8 @@ import stat
 import sys
 import sysconfig
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import closing
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import closing, contextmanager
 from functools import wraps
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -48,6 +48,16 @@ HARNESS_MEMORY = MEMORY // 4
 HARNESS_TASKS = 32
 HTTP_SECONDS = 2.0
 POLL_SECONDS = 0.1
+WorkerAwaitOperation = Literal[
+    "command",
+    "poll",
+    "http",
+    "helper_exists",
+    "helper_unit_path",
+    "helper_snapshot",
+    "helper_properties",
+    "managed_read",
+]
 HELPER_COST_SLOT_METRICS = ("slot_files_controller", "slot_files_selected")
 HELPER_GUARD_ROWS = 64
 HELPER_GUARD_PREFIXES = ("first_check_returned", "first_install_target_check_returned")
@@ -216,6 +226,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
+    trim_worker_await(value)
     data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     require(len(data) <= MAX_BYTES, "native_metadata_budget")
     temporary = path.with_suffix(".tmp")
@@ -4278,8 +4289,10 @@ def collect_helper_costs(
     previous_observation = result["resources"].pop("helper_source_observation", None)
     previous_starts = result["resources"].pop("helper_start_samples", [])
     result["resources"]["helper_costs"] = facts
+    trim_worker_await(result)
     if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
         result["resources"]["helper_costs"] = {"code": "not_observed", "reason": "output_budget"}
+        trim_worker_await(result)
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
             result["resources"].pop("helper_costs")
     history = result["resources"].get("helper_cost_history", [])
@@ -4295,6 +4308,7 @@ def collect_helper_costs(
                 "helper_cost_history": [*history, row],
             },
         }
+        trim_worker_await(candidate)
         if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
             budget = {
                 **result,
@@ -4303,11 +4317,12 @@ def collect_helper_costs(
                     "helper_costs": {"code": "not_observed", "reason": "output_budget"},
                 },
             }
+            trim_worker_await(budget)
             if len(json.dumps(budget, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
-                result["resources"]["helper_costs"] = budget["resources"]["helper_costs"]
+                result["resources"] = budget["resources"]
             break
         history = candidate["resources"]["helper_cost_history"]
-        result["resources"]["helper_cost_history"] = history
+        result["resources"] = candidate["resources"]
     partials = result["resources"].get("helper_cost_samples", [])
     for row in samples or []:
         if len(partials) >= 3:
@@ -4318,10 +4333,11 @@ def collect_helper_costs(
             **result,
             "resources": {**result["resources"], "helper_cost_samples": [*partials, row]},
         }
+        trim_worker_await(candidate)
         if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
             break
         partials = candidate["resources"]["helper_cost_samples"]
-        result["resources"]["helper_cost_samples"] = partials
+        result["resources"] = candidate["resources"]
     starts: list[dict[str, Any]] = []
     for row in previous_starts if start_samples is None else start_samples:
         if len(starts) >= 3:
@@ -4332,10 +4348,11 @@ def collect_helper_costs(
             **result,
             "resources": {**result["resources"], "helper_start_samples": [*starts, row]},
         }
+        trim_worker_await(candidate)
         if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
             break
         starts.append(row)
-        result["resources"]["helper_start_samples"] = list(starts)
+        result["resources"] = candidate["resources"]
     # Failure-entry facts are last: they cannot evict accepted costs or cleanup.
     for name, item in (
         ("helper_source_observation", previous_observation),
@@ -4347,8 +4364,9 @@ def collect_helper_costs(
         ):
             continue
         candidate = {**result, "resources": {**result["resources"], name: item}}
+        trim_worker_await(candidate)
         if len(json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()) <= MAX_BYTES:
-            result["resources"][name] = item
+            result["resources"] = candidate["resources"]
         elif name == "helper_source_observation":
             # Do not leave a newly adopted source looking like a pre-deadline proof.
             discard_helper_source_samples(result["resources"], item["source"])
@@ -4599,6 +4617,7 @@ def binding_costs_facts(value: object, result: dict[str, Any]) -> bool:
 
 def trim_binding_diagnostics(result: dict[str, Any]) -> None:
     """The original timeline, failure and cleanup always win the original byte budget."""
+    trim_worker_await(result)
     for detail in ("startup", "breakdown"):
         if len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES:
             costs = result["resources"].get("helper_guard_costs")
@@ -6109,6 +6128,41 @@ def install_hook() -> None:
     server.create_app = application
 
 
+def worker_await_facts(value: object) -> bool:
+    """A cancelled worker wait is a location, never a helper execution claim."""
+    if (
+        type(value) is not dict
+        or set(value)
+        != {"version", "operation", "outcome", "started_ns", "cancelled_ns", "deadline_ns"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or type(value["operation"]) is not str
+        or value["operation"] not in get_args(WorkerAwaitOperation)
+        or type(value["outcome"]) is not str
+        or value["outcome"] != "cancelled"
+        or any(type(value[key]) is not int for key in ("started_ns", "cancelled_ns", "deadline_ns"))
+    ):
+        return False
+    return (
+        0
+        <= value["started_ns"]
+        <= value["cancelled_ns"]
+        <= (HARNESS_SECONDS + CLEANUP_SECONDS) * 10**9
+        and 0 < value["deadline_ns"] <= CASE_SECONDS * 10**9
+    )
+
+
+def trim_worker_await(result: dict[str, Any]) -> None:
+    """Drop this optional location before displacing any original result facts."""
+    resources = result.get("resources")
+    if (
+        isinstance(resources, dict)
+        and "worker_await" in resources
+        and len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) > MAX_BYTES
+    ):
+        resources.pop("worker_await")
+
+
 class Case:
     def __init__(self, root: Path, *, seconds: float = CASE_SECONDS) -> None:
         require(0 < seconds <= CASE_SECONDS, "native_case_budget")
@@ -6128,6 +6182,8 @@ class Case:
         self._binding_inputs: dict[str, Any] = binding_unavailable()
         self._binding_sources: list[dict[str, Any]] = []
         self._failure_helper_attempted = False
+        self._worker_await_depth = 0
+        self._cancelled_await: tuple[asyncio.CancelledError, dict[str, Any]] | None = None
         self.result: dict[str, Any] = {
             "completed": False,
             "stage": self.stage,
@@ -6136,6 +6192,55 @@ class Case:
             "generations": [],
             "resources": {},
         }
+
+    @contextmanager
+    def await_operation(self, operation: WorkerAwaitOperation) -> Iterator[None]:
+        """Observe the existing await without adding a task, wait or publication."""
+        if self._worker_await_depth == 0:
+            self._cancelled_await = None
+        self._worker_await_depth += 1
+        started: int | None = None
+        try:
+            started = time.monotonic_ns() - int(self.start * 10**9)
+        except BaseException:
+            pass  # Optional clocks cannot replace the actual operation.
+        try:
+            yield
+        except asyncio.CancelledError as error:
+            try:
+                task = asyncio.current_task()
+                if (
+                    started is not None
+                    and task is not None
+                    and task.cancelling() > 0
+                    and (self._cancelled_await is None or self._cancelled_await[0] is not error)
+                ):
+                    value = {
+                        "version": 1,
+                        "operation": operation,
+                        "outcome": "cancelled",
+                        "started_ns": started,
+                        "cancelled_ns": time.monotonic_ns() - int(self.start * 10**9),
+                        "deadline_ns": int((self.deadline - self.start) * 10**9),
+                    }
+                    if worker_await_facts(value):
+                        self._cancelled_await = error, value
+            except BaseException:
+                pass  # Preserve the same cancellation, including observer failures.
+            raise
+        else:
+            if self._worker_await_depth == 1:
+                self._cancelled_await = None
+        finally:
+            self._worker_await_depth -= 1
+
+    def record_worker_await(self, error: BaseException) -> None:
+        """Promote only the cancellation that actually escaped the outer drive."""
+        candidate, self._cancelled_await = self._cancelled_await, None
+        if candidate is not None and (
+            error is candidate[0] or type(error) is TimeoutError and error.__cause__ is candidate[0]
+        ):
+            self.result["resources"]["worker_await"] = candidate[1]
 
     def note(self, stage: str, **facts: Any) -> None:
         require(re.fullmatch(r"[a-z_]{1,40}", stage) is not None, "native_stage_invalid")
@@ -6219,12 +6324,13 @@ class Case:
     async def command(self, *argv: str) -> str:
         from muli.process import run_process
 
-        result = await run_process(
-            list(argv),
-            timeout=min(5.0, remaining(self.deadline)),
-            limit=MAX_BYTES,
-            merge_stderr=False,
-        )
+        with self.await_operation("command"):
+            result = await run_process(
+                list(argv),
+                timeout=min(5.0, remaining(self.deadline)),
+                limit=MAX_BYTES,
+                merge_stderr=False,
+            )
         require(result.get("exit_code") == 0, "native_command_failed")
         output = result.get("output")
         if not isinstance(output, str):
@@ -6233,7 +6339,8 @@ class Case:
         return output
 
     async def pause(self) -> None:
-        await asyncio.sleep(min(POLL_SECONDS, remaining(self.deadline)))
+        with self.await_operation("poll"):
+            await asyncio.sleep(min(POLL_SECONDS, remaining(self.deadline)))
 
     async def http(
         self, client: Any, method: str, path: str, body: dict[str, Any] | None = None
@@ -6242,19 +6349,20 @@ class Case:
 
         size = min(HTTP_SECONDS, remaining(self.deadline))
         try:
-            async with asyncio.timeout(size):
-                async with client.stream(method, path, json=body) as response:
-                    require(
-                        response.headers.get("content-encoding", "identity") == "identity",
-                        "native_http_encoding",
-                    )
-                    data = bytearray()
-                    async for part in response.aiter_raw():
-                        data.extend(part)
-                        require(len(data) <= MAX_BYTES, "native_http_budget")
-                    result = json.loads(data)
-                    require(isinstance(result, dict), "native_http_object")
-                    return response.status_code, result
+            with self.await_operation("http"):
+                async with asyncio.timeout(size):
+                    async with client.stream(method, path, json=body) as response:
+                        require(
+                            response.headers.get("content-encoding", "identity") == "identity",
+                            "native_http_encoding",
+                        )
+                        data = bytearray()
+                        async for part in response.aiter_raw():
+                            data.extend(part)
+                            require(len(data) <= MAX_BYTES, "native_http_budget")
+                        result = json.loads(data)
+                        require(isinstance(result, dict), "native_http_object")
+                        return response.status_code, result
         except httpx.RequestError:
             raise NativeError("native_http_unavailable") from None
 
@@ -6621,7 +6729,8 @@ class Case:
             if error.args != ("systemd_observation_unavailable",):
                 raise error
             try:
-                exists = await probe.helper_exists(name)
+                with self.await_operation("helper_exists"):
+                    exists = await probe.helper_exists(name)
             except ObservationError:
                 raise error from None
             if exists:
@@ -6629,11 +6738,17 @@ class Case:
             self.note_helper_absence(name)
             return True
 
-        if not await probe.helper_exists(name):
+        with self.await_operation("helper_exists"):
+            exists = await probe.helper_exists(name)
+        if not exists:
             self.note_helper_absence(name)
             return True
         try:
-            snapshot = await probe._snapshot(await probe._unit_path(name))
+            read_snapshot = probe._snapshot
+            with self.await_operation("helper_unit_path"):
+                path = await probe._unit_path(name)
+            with self.await_operation("helper_snapshot"):
+                snapshot = await read_snapshot(path)
         except ObservationError as error:
             return await collected_after_failure(error)
         generations = [row for row in self.result["generations"] if row["helper"] == name]
@@ -6684,9 +6799,13 @@ class Case:
                 }
                 self._helper_source_groups[generation] = snapshot.cgroup
         try:
-            details = await probe._properties(
-                await probe._unit_path(name), "Service", (("Result", "s"), ("ExecMainStatus", "i"))
-            )
+            read_properties = probe._properties
+            with self.await_operation("helper_unit_path"):
+                path = await probe._unit_path(name)
+            with self.await_operation("helper_properties"):
+                details = await read_properties(
+                    path, "Service", (("Result", "s"), ("ExecMainStatus", "i"))
+                )
         except ObservationError as error:
             return await collected_after_failure(error)
         self.note(
@@ -6896,7 +7015,9 @@ class Case:
                             # After release, completion needs exact absence, not
                             # the configuration of a disappearing transient unit.
                             # A listing cannot create or restore a source identity.
-                            if await probe.helper_exists(name):
+                            with self.await_operation("helper_exists"):
+                                exists = await probe.helper_exists(name)
+                            if exists:
                                 await self.pause()
                                 continue
                             self.note_helper_absence(name)
@@ -6927,9 +7048,10 @@ class Case:
                                 "native_wrong_decision",
                             )
                             expected_role = "base" if expect_latest else "target"
-                            observed = await probe.read_managed(
-                                journal, record, anchor, controller, slots
-                            )
+                            with self.await_operation("managed_read"):
+                                observed = await probe.read_managed(
+                                    journal, record, anchor, controller, slots
+                                )
                             require(
                                 observed.service.process is not None
                                 and expected_role in observed.process_roles,
@@ -7198,6 +7320,7 @@ class Case:
 
 async def run(mode: str, root: Path) -> int:
     case = Case(root, seconds=CLEANUP_SECONDS if mode == "cleanup" else CASE_SECONDS)
+    drive_timeout: asyncio.Timeout | None = None
     try:
         if mode == "cleanup":
             deadline = float(os.environ.get("MULI_NATIVE_CLEANUP_DEADLINE", "nan"))
@@ -7218,7 +7341,7 @@ async def run(mode: str, root: Path) -> int:
             case.note("import")
             # The absolute budget also includes every synchronous import and
             # verification boundary before the first manager effect.
-            async with asyncio.timeout(remaining(case.deadline)):
+            async with asyncio.timeout(remaining(case.deadline)) as drive_timeout:
                 await case.drive()
         return 0
     except (Exception, asyncio.CancelledError) as error:
@@ -7227,6 +7350,12 @@ async def run(mode: str, root: Path) -> int:
             code = str(error)
         if mode != "cleanup":
             case.result["code"] = code
+            if isinstance(error, asyncio.CancelledError) or (
+                type(error) is TimeoutError
+                and drive_timeout is not None
+                and drive_timeout.expired()
+            ):
+                case.record_worker_await(error)
             case.note(case.stage)
             write_json(root / "result.json", case.result)
         print("native_" + mode + "_failed:" + case.stage + ":" + code, file=sys.stderr)

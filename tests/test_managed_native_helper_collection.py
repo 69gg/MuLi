@@ -7,6 +7,8 @@ import copy
 import json
 import os
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,9 @@ import pytest
 from helpers import managed_native_worker as worker
 from test_linux_helper_probe import NAME, HelperBus, setup
 from test_managed_native_ci import ci
+from test_managed_native_ci import fixture as fixture
 from test_managed_native_ci import forbid_real_effects as forbid_real_effects
+from test_managed_native_helper_costs import costs_result
 
 from muli import failure_diagnostics
 from muli.platforms.linux_transaction import ObservationError, SystemdProbe
@@ -365,3 +369,361 @@ async def test_worker_reports_owned_probe_frames_without_exporting_private_failu
             and type(frame["line"]) is int
             for frame in diagnostic["frames"]
         )
+
+
+@pytest.mark.parametrize("location", ["poll", "helper_snapshot"])
+async def test_outer_cancel_records_real_wait_despite_stale_helper_exit_stage(
+    collection: CollectionCase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    entered = asyncio.Event()
+    cancelled: list[asyncio.CancelledError] = []
+    timelines: list[list[dict[str, Any]]] = []
+    outer: asyncio.Timeout | None = None
+    original_timeout = asyncio.timeout
+
+    def timeout(seconds: float | None) -> asyncio.Timeout:
+        nonlocal outer
+        if outer is None:
+            outer = original_timeout(None)
+            return outer
+        return original_timeout(seconds)
+
+    async def sleep(seconds: float) -> None:
+        # Expire the actual outer asyncio timeout at the real poll await,
+        # without spending 60 seconds or changing any fixture budget constant.
+        assert outer is not None
+        outer.reschedule(asyncio.get_running_loop().time())
+        await asyncio.Future[None]()
+
+    async def query(
+        argv: list[str], *, timeout: float, limit: int, merge_stderr: bool
+    ) -> dict[str, Any]:
+        if "MainPID" in argv:
+            entered.set()
+            await asyncio.Future[None]()
+        return await collection.bus(argv, timeout=timeout, limit=limit, merge_stderr=merge_stderr)
+
+    async def drive(case: worker.Case) -> None:
+        case.note("helper_exit")
+        timelines.append(copy.deepcopy(case.result["timeline"]))
+        try:
+            if location == "poll":
+                with case.await_operation("http"):
+                    await case.pause()
+            else:
+                await case.helper_empty(collection.probe, NAME, collection.argv)
+        except asyncio.CancelledError as error:
+            cancelled.append(error)
+            assert case._cancelled_await is not None
+            assert case._cancelled_await[0] is error
+            raise
+
+    monkeypatch.setattr(worker.Case, "drive", drive)
+    monkeypatch.setenv(
+        "MULI_NATIVE_EXECUTE_DEADLINE", str(worker.time.monotonic() + worker.HARNESS_SECONDS)
+    )
+    if location == "poll":
+        monkeypatch.setattr(asyncio, "timeout", timeout)
+        monkeypatch.setattr(asyncio, "sleep", sleep)
+        assert await worker.run("drive", tmp_path) == 1
+    else:
+        collection.bus.arm("disabled")
+        monkeypatch.setattr(collection.probe, "runner", query)
+        task = asyncio.create_task(worker.run("drive", tmp_path))
+        try:
+            async with asyncio.timeout(worker.CLEANUP_SECONDS):
+                await entered.wait()
+                task.cancel("private cancellation reason")
+                assert await task == 1
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        assert collection.bus.listings == 1 and collection.bus.lookups == 1
+    result = ci.fixture_result((tmp_path / "result.json").read_bytes())
+    assert len(cancelled) == 1
+    assert result["stage"] == "helper_exit" and result["completed"] is False
+    assert result["code"] == ("TimeoutError" if location == "poll" else "CancelledError")
+    assert result["timeline"] == timelines[0]
+    facts = result["resources"]["worker_await"]
+    assert worker.worker_await_facts(facts) and facts["operation"] == location
+    assert "private" not in json.dumps(result) and str(tmp_path) not in json.dumps(result)
+
+
+async def test_worker_wait_normal_return_errors_and_unrequested_cancel_export_no_location(
+    tmp_path: Path,
+) -> None:
+    case = worker.Case(tmp_path)
+    token = object()
+
+    async def value() -> object:
+        await asyncio.sleep(0)
+        return token
+
+    with case.await_operation("http"), case.await_operation("managed_read"):
+        observed = await value()
+    assert observed is token and case._cancelled_await is None
+    for error in (RuntimeError("private failure"), asyncio.CancelledError("not a task cancel")):
+        with pytest.raises(type(error)) as caught, case.await_operation("http"):
+            raise error
+        assert caught.value is error
+        case.record_worker_await(error)
+        assert "worker_await" not in case.result["resources"]
+    assert case._worker_await_depth == 0
+
+
+async def test_http_own_timeout_is_not_an_outer_worker_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class WaitingClient:
+        @asynccontextmanager
+        async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[None]:
+            await asyncio.Future[None]()
+            yield None
+
+    case = worker.Case(tmp_path)
+    monkeypatch.setattr(worker, "HTTP_SECONDS", 0)
+    with pytest.raises(TimeoutError) as caught:
+        await case.http(WaitingClient(), "GET", "/private-path")
+    case.record_worker_await(caught.value)
+    assert case._cancelled_await is None
+    assert "worker_await" not in case.result["resources"]
+
+
+def _cancelled_worker_wait() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "operation": "poll",
+        "outcome": "cancelled",
+        "started_ns": 1,
+        "cancelled_ns": 2,
+        "deadline_ns": worker.CASE_SECONDS * 10**9,
+    }
+
+
+def _encode_result(result: dict[str, Any]) -> bytes:
+    return json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _padded_result(original: dict[str, Any], size: int) -> dict[str, Any]:
+    result = copy.deepcopy(original)
+    rows = [
+        {
+            "stage": "helper_exit",
+            "elapsed_ms": 0,
+            "helper": "a" * 100,
+            "boot": "b" * 100,
+            "request_id": "c" * 100,
+            "result": "d" * 100,
+            "state": "",
+            "phase": "",
+            "activation": "",
+        }
+        for _ in range(50)
+    ]
+    result["timeline"].extend(rows)
+    padding = size - len(_encode_result(result))
+    assert 0 <= padding <= len(rows) * 3 * 100
+    for row in rows:
+        for key in ("state", "phase", "activation"):
+            width = min(padding, 100)
+            row[key] = "a" * width
+            padding -= width
+    assert padding == 0 and len(_encode_result(result)) == size
+    assert ci.fixture_result(_encode_result(result)) == result
+    return result
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        {"operation": "private/path"},
+        {"outcome": "returned"},
+        {"started_ns": True},
+        {"cancelled_ns": 0},
+        {"cancelled_ns": (worker.HARNESS_SECONDS + worker.CLEANUP_SECONDS) * 10**9 + 1},
+        {"deadline_ns": worker.CASE_SECONDS * 10**9 + 1},
+        {"payload": "private"},
+    ],
+)
+def test_worker_cancel_location_rejects_unknown_fields_types_and_times(
+    tmp_path: Path, damage: dict[str, Any]
+) -> None:
+    case = worker.Case(tmp_path)
+    case.result["code"] = "TimeoutError"
+    facts = {**_cancelled_worker_wait(), **damage}
+    assert not worker.worker_await_facts(facts)
+    case.result["resources"]["worker_await"] = facts
+    with pytest.raises(ci.FixtureError, match="^native_result_invalid$"):
+        ci.fixture_result(json.dumps(case.result).encode())
+
+
+def test_worker_cancel_location_requires_an_uncompleted_cancellation_result(tmp_path: Path) -> None:
+    case = worker.Case(tmp_path)
+    case.result["resources"]["worker_await"] = _cancelled_worker_wait()
+    for completed, code in ((True, "TimeoutError"), (False, ""), (False, "ObservationError")):
+        case.result.update(completed=completed, code=code)
+        with pytest.raises(ci.FixtureError, match="^native_result_invalid$"):
+            ci.fixture_result(json.dumps(case.result).encode())
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "helper_costs",
+        "helper_cost_history",
+        "helper_cost_samples",
+        "helper_start_samples",
+        "helper_source_observation",
+        "helper_entry_checkpoint",
+    ],
+)
+def test_worker_cancel_location_yields_before_real_helper_cost_collection_budget(
+    tmp_path: Path, diagnostic: str
+) -> None:
+    original, facts = costs_result(version=3)
+    source = copy.deepcopy(original["resources"]["helper_source"])
+    original["resources"]["cleanup"] = "verified"
+    original["timeline"] = [
+        {
+            "stage": "transaction",
+            "elapsed_ms": 1,
+            "generation": source["generation"],
+            "revision": 3,
+            "phase": "activating",
+            "intent": "start_target",
+            "code": None,
+            "failure_code": None,
+            "rollback_attempted": False,
+        }
+    ]
+    retained: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    starts: list[dict[str, Any]] = []
+    row = {"source": source, "costs": copy.deepcopy(facts)}
+    if diagnostic == "helper_cost_history":
+        retained.append(row)
+    elif diagnostic == "helper_cost_samples":
+        samples.append({**row, "sample": {"kind": "install_returned", "revision": 3}})
+    elif diagnostic == "helper_start_samples":
+        starts.append(
+            {
+                **row,
+                "sample": {
+                    "kind": "start_command_entered",
+                    "revision": 3,
+                    "phase": "activating",
+                    "intent": "start_target",
+                    "role": "target",
+                    "elapsed_ms": 1,
+                },
+            }
+        )
+    elif diagnostic in {"helper_source_observation", "helper_entry_checkpoint"}:
+        original["resources"]["helper_source_observation"] = {
+            "source": copy.deepcopy(source),
+            "kind": "failure_collection",
+            "started_ns": 10**9,
+            "observed_ns": 61 * 10**9,
+            "case_deadline_ns": 61 * 10**9,
+            "elapsed_ms": 60_000,
+        }
+        if diagnostic == "helper_entry_checkpoint":
+            original["resources"]["helper_entry_checkpoint"] = {
+                "version": 1,
+                **source,
+                "revision": 3,
+                "boundary": "read_helper_dispatch",
+                "monotonic_ns": 60 * 10**9,
+                "outcome": "progress",
+            }
+    worker.write_json(tmp_path / "helper-costs.json", facts)
+    expected = copy.deepcopy(original)
+    expected["resources"]["helper_costs"] = copy.deepcopy(facts)
+    for name, rows in (
+        ("helper_cost_history", retained),
+        ("helper_cost_samples", samples),
+        ("helper_start_samples", starts),
+    ):
+        if rows:
+            expected["resources"][name] = copy.deepcopy(rows)
+    expected = _padded_result(expected, worker.MAX_BYTES - 1)
+    original["timeline"] = copy.deepcopy(expected["timeline"])
+
+    # The same private cost file and existing facts fit without the new field.
+    baseline = copy.deepcopy(original)
+    worker.collect_helper_costs(
+        tmp_path, baseline, retained=retained, samples=samples, start_samples=starts
+    )
+    assert baseline == expected
+    assert ci.fixture_result(_encode_result(baseline)) == baseline
+
+    candidate = copy.deepcopy(original)
+    candidate["resources"]["worker_await"] = _cancelled_worker_wait()
+    assert len(_encode_result(candidate)) <= worker.MAX_BYTES
+    assert ci.fixture_result(_encode_result(candidate)) == candidate
+    enlarged = copy.deepcopy(expected)
+    enlarged["resources"]["worker_await"] = _cancelled_worker_wait()
+    assert len(_encode_result(enlarged)) > worker.MAX_BYTES
+    worker.collect_helper_costs(
+        tmp_path, candidate, retained=retained, samples=samples, start_samples=starts
+    )
+    assert candidate["resources"].get(diagnostic) == expected["resources"][diagnostic]
+    assert candidate["resources"].get("helper_source") == source
+    assert candidate["resources"]["helper_costs"] == facts
+    assert candidate["code"] == "TimeoutError" and candidate["timeline"] == original["timeline"]
+    assert candidate["resources"]["cleanup"] == "verified"
+    assert "worker_await" not in candidate["resources"]
+    assert candidate == expected
+    worker.write_json(tmp_path / "collected-result.json", candidate)
+    saved = (tmp_path / "collected-result.json").read_bytes()
+    assert len(saved) <= worker.MAX_BYTES and ci.fixture_result(saved) == expected
+
+
+def test_worker_cancel_location_survives_helper_cost_collection_with_space(tmp_path: Path) -> None:
+    result, facts = costs_result(version=3)
+    result["resources"]["worker_await"] = _cancelled_worker_wait()
+    worker.write_json(tmp_path / "helper-costs.json", facts)
+    worker.collect_helper_costs(tmp_path, result)
+    assert result["resources"]["helper_costs"] == facts
+    assert result["resources"]["worker_await"] == _cancelled_worker_wait()
+    assert ci.fixture_result(_encode_result(result)) == result
+
+
+def test_worker_cancel_location_yields_to_original_result_and_collector_merge_budget(
+    tmp_path: Path, fixture: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, _ = fixture
+    native.root.mkdir(mode=0o700)
+    native.receipt = ci.Receipt("muli-ci-" + "1" * 12)
+    case = worker.Case(tmp_path)
+    case.note("helper_exit")
+    case.result["code"] = "TimeoutError"
+    facts = _cancelled_worker_wait()
+
+    original = _padded_result(case.result, worker.MAX_BYTES - 1)
+    candidate = copy.deepcopy(original)
+    candidate["resources"]["worker_await"] = facts
+    worker.write_json(tmp_path / "worker-result.json", candidate)
+    assert ci.fixture_result((tmp_path / "worker-result.json").read_bytes()) == original
+
+    small = copy.deepcopy(case.result)
+    small["resources"]["worker_await"] = facts
+    monkeypatch.setattr(native, "call", lambda argv: ci.Reply(0, _encode_result(small)))
+    assert native.collect_result() == small
+    delta = len(_encode_result(small)) - len(_encode_result(case.result))
+    original = _padded_result(case.result, ci.OUTPUT_BYTES - delta - 1)
+    candidate = copy.deepcopy(original)
+    candidate["resources"]["worker_await"] = facts
+    assert len(_encode_result(candidate)) == ci.OUTPUT_BYTES - 1
+    monkeypatch.setattr(native, "call", lambda argv: ci.Reply(0, _encode_result(candidate)))
+    native.manager_readiness = {"elapsed_ms": 1, "late_ready": False}
+    merged = native.collect_result()
+    expected = copy.deepcopy(original)
+    expected["resources"]["manager_readiness"] = native.manager_readiness
+    assert merged == expected
+    saved = (native.root / "result.json").read_bytes()
+    assert len(saved) <= ci.OUTPUT_BYTES and ci.fixture_result(saved) == expected
