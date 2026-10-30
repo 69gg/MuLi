@@ -559,12 +559,8 @@ class AttentionInbox:
                 admission_guard=guard,
                 routing=routing,
                 memory_failure=records[0]["memory_failure_proof"],
-                **({"project": project} if project is not None else {}),
-                **(
-                    {"memory_watch": records[0]["memory_watch_proof"]}
-                    if records[0]["memory_watch_proof"] is not None
-                    else {}
-                ),
+                memory_watch=records[0]["memory_watch_proof"],
+                project=project,
             )
         except _ProducerPolicyChanged:
             # Reconsume the bounded journal suffix so stale source facts cannot
