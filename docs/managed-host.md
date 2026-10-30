@@ -10,6 +10,8 @@ controller-python -I -m muli.managed_host --root ROOT recover
 
 `recover` 使用现有 launcher 的只读恢复路由核验 root、V2 record、固定 anchor 和 controller，再在原 journal 锁下调用 `ensure_managed_helper`。它不读取当前 selector、不导入 selected target，不构造 Runtime、Store 或 effects backend，也不直接 stop、install、start 或 activate。root 使用 anchor 冻结的路径；数据库须为 Runtime 既有的 `data_dir/muli.sqlite3`。配置/数据库只核无链接路径链及普通所有者文件，不读取 SQLite 内容。
 
+固定入口完整认证 controller 文件后，紧邻只核当前进程身份，避免重复扫描同一解释器和包；只读路由与等待两侧的独立认证保持。
+
 `ensure_managed_helper(control, anchor)` 已由管理宿主复用，调用者已持有同 journal 锁。调用进程可为当前 base/target；新 helper 的 executable 始终来自固定 controller。unit 名由 protocol 2、deployment digest 与完整 generation 共同摘要得到。同一代只使用该名称；已存在时必须通过现有 `SystemdProbe.read_helper` 核验 argv、PID、cgroup、资源属性及内核限制，不能 reset、改名或另起 helper。只有明确不存在时才调用一次 `systemd-run`，成功仅返回 `accepted`，不声称运行或恢复成功。
 
 实际 transient helper 命令为：
@@ -21,6 +23,12 @@ controller-python -I -m muli.managed_host --root ROOT run
 它复用 V1 已有的 `HelperLimits`、受限 runner、全部 systemd 资源属性和 nonce HTTP 协议。包括内存/零 swap/CPU/tasks、运行上限、停止期限、restart burst/delay、无 core、控制组 kill 与固定 umask。重启不会更改 record 的原始 deadline；controller 对每次实际效果继续使用更早的剩余期限。没有 `--wait`、`--scope`、自动清除 unit 或 application unit 生命周期依赖。
 
 `run` 在构造 backend 前核实际 helper 的 PID 等于当前 PID，且精确 argv 指向固定 controller。随后在同一个 journal controller 锁下使用 `ManagedTransactionController` 与 `ManagedLinuxBackend`，每个驱动 step 前再次核固定 anchor/controller、实际 helper 和 fresh record。base/target 的冻结 slot 元数据、兼容声明摘要、七领域声明与 snapshots 都必须一致；不会把 slot 声明当成环境/依赖认证。这里不先核对侧包文件，以免坏 target 阻止已冻结的 base 回退；实际 effects backend 对当前 role 的包、三文件、loaded unit、writer lease 和 cgroup 保留原有核验。
+
+每次同步 `_record` 新建一个私有元数据作用域，与 backend 复用实际 root FD、字节读取和围栏实现。anchor 和 launcher 各实际读取一次；同一个完整 slot digest 的私有字节只读取、核摘要并严格解析一次。因此 adopt、普通 switch、controller/base/target 三个完整身份不同的情况，分别读取一、二、三份 slot 元数据。共享 Python、包或兼容声明不合并不同完整 digest；每次 `_record` 都重新完整认证 controller 的 Python 和包，不扩大已有 `PackageProofs`。
+
+原读取顺序仍为 anchor、launcher/controller 认证、controller、首个 current、base/target 与各自快照、兼容检查、末次 current。命中本次已解析的 slot 时，在该逻辑读取位置用相对 root FD 的 nofollow stat 核对第一次真实读取的七字段身份，避免后面的 journal 或快照错误抢先掩盖已变的元数据。launcher/controller 小区段继续将错误包装为 `anchor_unavailable`，后续 slot、journal、快照和兼容错误保留原异常。
+
+正常返回前新增全体已读元数据叶的七字段末次围栏，并复核 root 的 owner/私有权限及完整祖先路径链；替换 inode、同 inode 改写后恢复原字节和 mtime、权限或祖先变化都撤销本次证明。异常路径仅关闭作用域 FD，保留最先发生的错误；两次真实 current 读取及 journal-directory fsync、原锁和快照检查保持。作用域在函数返回或抛错时结束，既不跨独立调用，也不跨 helper 观察的 await；等待两侧分别重新读取元数据并完整扫描 controller。
 
 驱动循环只提取到 V1/V2 共用的 typed `drive_loop`，不合并两种 proof 或角色语义。resolved、`recovery_required` 或 `activation=blocked` 即返回；取消传播并保留已耐久 intent，不在 finally 重试未知 start/activate。最终只读 hint 的丢失不能撤销 `released` 或再发 activate。V1 的公开入口、unit 名、资源参数与效果行为保持原样。
 

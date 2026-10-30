@@ -7,6 +7,8 @@ lives here; passing fake-backend tests does not prove a service restart.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
@@ -25,6 +27,9 @@ from muli.management_transaction import (
     TransactionRecord,
     Transition,
 )
+
+_LOGGER = logging.getLogger(__name__)
+_FAILURE_PREFIX = "muli.controller_failure.v1 "
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +97,7 @@ class _ControllerEffects[RecordT, ObservationT](Protocol):
     async def resume(self, record: RecordT) -> None: ...
     async def stop(self, record: RecordT, role: Role) -> None: ...
     async def start(self, record: RecordT, role: Role) -> None: ...
-    async def activate(self, record: RecordT, role: Role) -> None: ...
+    async def activate(self, record: RecordT, role: Role) -> ObservationT | None: ...
 
 
 class _ControllerPolicy[RecordT, ObservationT, ProofT](Protocol):
@@ -112,7 +117,7 @@ class _ControllerPolicy[RecordT, ObservationT, ProofT](Protocol):
     def restore_prefix_observed(self, record: RecordT, observation: ObservationT) -> bool: ...
     def matches(self, record: RecordT, observation: ObservationT, role: Role) -> bool: ...
     def installed(self, record: RecordT, observation: ObservationT, role: Role) -> bool: ...
-    async def install(self, record: RecordT, role: Role) -> None: ...
+    async def install(self, record: RecordT, role: Role) -> ObservationT | None: ...
     def proof(self, observation: ObservationT) -> ProofT | None: ...
     def accepts(
         self, record: RecordT, proof: ProofT, role: Role, *, released: bool = False
@@ -132,13 +137,16 @@ class _Controller[
         policy: _ControllerPolicy[RecordT, ObservationT, ProofT],
         *,
         operation_timeout: float = 5.0,
+        verify_continuation: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if not 0 < operation_timeout <= 30:
             raise ValueError("invalid_operation_timeout")
         self.control, self._effects, self.clock = control, backend, clock
         self._policy = policy
         self.operation_timeout = operation_timeout
+        self._verify_continuation = verify_continuation
         self._step_lock = asyncio.Lock()
+        self._failure_diagnostic_attempted = False
 
     def _move(
         self,
@@ -154,6 +162,32 @@ class _Controller[
             record, phase=phase, intent=intent, activation=activation, code=code, proof=proof
         )
 
+    def _capture_backend_failure(self, record: RecordT, exc: BaseException) -> None:
+        if self._failure_diagnostic_attempted:
+            return
+        # A failed diagnostic is not retried by a later rollback failure.
+        self._failure_diagnostic_attempted = True
+        try:
+            # The query-facing diagnostics module also imports projection/Store;
+            # keep that dependency out of controller module initialization.
+            from muli.failure_diagnostics import capture_failure
+
+            payload = {
+                "version": 1,
+                "generation": record.generation,
+                "revision": record.revision,
+                "intent": record.intent,
+                "diagnostic": capture_failure(exc),
+            }
+            _LOGGER.warning(
+                "%s%s",
+                _FAILURE_PREFIX,
+                json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+            )
+        except Exception:
+            # Optional evidence cannot replace the original transaction decision.
+            pass
+
     async def _call(self, record: RecordT, action: Callable[[], Awaitable[T]]) -> T:
         remaining = record.deadline.remaining(self.clock())
         if record.phase in {"activating", "verifying"}:
@@ -165,13 +199,16 @@ class _Controller[
                 return await action()
         except asyncio.CancelledError:
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            self._capture_backend_failure(record, exc)
             raise _BackendFailure("deadline_exceeded") from None
         except TransactionError as exc:
             if exc.code == "clock_invalid":
                 raise
+            self._capture_backend_failure(record, exc)
             raise _BackendFailure("backend_failed") from None
-        except Exception:
+        except Exception as exc:
+            self._capture_backend_failure(record, exc)
             raise _BackendFailure("backend_failed") from None
 
     def _failure(self, record: RecordT, code: Code) -> RecordT:
@@ -193,6 +230,52 @@ class _Controller[
             "verifying",
         }:
             return self._failure(record, "deadline_exceeded")
+        return None
+
+    def _terminal_result(self, record: RecordT, observation: ObservationT) -> RecordT | None:
+        if (
+            not observation.identity_matches
+            or observation.service == "foreign"
+            or not self._policy.allowed(record, observation)
+        ):
+            return self._failure(record, "foreign_state")
+        proof = self._policy.proof(observation)
+        role: Role = "target" if record.phase == "committed" else "base"
+        if (
+            not self._policy.matches(record, observation, role)
+            or observation.service != "running"
+            or observation.writer_free
+        ):
+            return self._failure(record, "health_failed")
+        if observation.activation_failed or observation.health_failed:
+            return self._failure(
+                record,
+                "activation_failed" if observation.activation_failed else "health_failed",
+            )
+        if (
+            proof is not None
+            and self._policy.accepts(record, proof, role, released=True)
+            and proof.boot == observation.boot
+        ):
+            activation: Literal["released", "released_degraded"] = (
+                "released_degraded" if proof.admission == "released_degraded" else "released"
+            )
+            return self._move(
+                record,
+                phase=record.phase,
+                activation=activation,
+                proof=proof,
+                code=record.code,
+            )
+        if proof is None:
+            # Missing HTTP evidence is not an explicit host failure.
+            return record
+        if proof.boot != observation.boot or not self._policy.accepts(record, proof, role):
+            return self._failure(record, "health_failed")
+        if record.health is not None and proof.boot != record.health.boot:
+            return self._move(record, phase=record.phase, proof=proof, code=record.code)
+        if record.activation == "blocked":
+            return record
         return None
 
     async def step(self) -> RecordT:
@@ -274,6 +357,64 @@ class _Controller[
                         return current
                 return self._failure(current, exc.code)
 
+    async def _installed_after_effect(self, record: RecordT, role: Role) -> bool:
+        confirmation = await self._call(record, lambda: self._policy.install(record, role))
+        if confirmation is None:
+            return False
+        if not self._policy.installed(record, confirmation, role):
+            raise _BackendFailure("backend_failed")
+        # The normal drive-loop authentication precedes every controller step.
+        # Combining these two steps must retain its next-effect authentication.
+        if self._verify_continuation is not None:
+            await self._call(record, self._verify_continuation)
+        return True
+
+    def _paused_health_result(
+        self,
+        record: RecordT,
+        observation: ObservationT,
+        role: Role,
+        *,
+        defer_invalid: bool = False,
+    ) -> RecordT:
+        """Share the original complete paused-health gates for both decisions."""
+        proof = self._policy.proof(observation)
+        if (
+            not self._policy.matches(record, observation, role)
+            or observation.service != "running"
+            or observation.writer_free
+            or observation.health_failed
+            or (
+                proof is not None
+                and (
+                    proof.boot != observation.boot or not self._policy.accepts(record, proof, role)
+                )
+            )
+        ):
+            return record if defer_invalid else self._failure(record, "health_failed")
+        if proof is None:
+            return record
+        return self._move(
+            record,
+            phase="committed" if role == "target" else "rolled_back",
+            proof=proof,
+            code=record.code if role == "base" else None,
+        )
+
+    def _started_health_result(
+        self, record: RecordT, observation: ObservationT, role: Role
+    ) -> RecordT:
+        """Only V2 may consume this observation after its first durable CAS."""
+        if not isinstance(record, TransactionRecordV2):
+            return record
+        remaining = record.deadline.remaining(self.clock())
+        if failed := self._deadline_result(record, remaining):
+            return failed
+        # No await/effect: the original intermediate revision remains durable
+        # if proof is absent/invalid or the second CAS fails. Activation belongs
+        # to the next independently authenticated controller step.
+        return self._paused_health_result(record, observation, role, defer_invalid=True)
+
     async def _step(
         self,
         record: RecordT,
@@ -315,8 +456,11 @@ class _Controller[
                 if observation.service != "stopped" or not observation.writer_free:
                     return self._failure(record, "foreign_state")
                 if not self._policy.installed(record, observation, "target"):
-                    await self._call(record, lambda: self._policy.install(record, "target"))
-                    return record
+                    if not await self._installed_after_effect(record, "target"):
+                        return record
+                    remaining = record.deadline.remaining(self.clock())
+                    if failed := self._deadline_result(record, remaining):
+                        return failed
                 started = self._move(record, phase="activating", intent="start_target")
                 await self._call(started, lambda: self._effects.start(started, "target"))
                 return started
@@ -325,28 +469,15 @@ class _Controller[
                 and observation.boot != record.identity.origin_boot
                 and self._policy.matches(record, observation, "target")
             ):
-                return self._move(record, phase="verifying")
+                verifying = self._move(record, phase="verifying")
+                return self._started_health_result(verifying, observation, "target")
             if observation.service in {"starting", "stopping"}:
                 return record
             # The start intent may have survived a crash before or after the
             # command. An inactive target is ambiguous, never an automatic retry.
             return self._failure(record, "ambiguous_start")
         if record.phase == "verifying":
-            if (
-                not self._policy.matches(record, observation, "target")
-                or observation.health_failed
-                or observation.service != "running"
-                or observation.writer_free
-            ):
-                return self._failure(record, "health_failed")
-            proof = self._policy.proof(observation)
-            if proof is not None:
-                if proof.boot != observation.boot or not self._policy.accepts(
-                    record, proof, "target"
-                ):
-                    return self._failure(record, "health_failed")
-                return self._move(record, phase="committed", proof=proof)
-            return record
+            return self._paused_health_result(record, observation, "target")
         if record.phase == "rolling_back":
             if record.intent == "stop_target":
                 if observation.service == "running":
@@ -366,8 +497,11 @@ class _Controller[
                 if observation.service != "stopped" or not observation.writer_free:
                     return self._failure(record, "foreign_state")
                 if not self._policy.installed(record, observation, "base"):
-                    await self._call(record, lambda: self._policy.install(record, "base"))
-                    return record
+                    if not await self._installed_after_effect(record, "base"):
+                        return record
+                    remaining = record.deadline.remaining(self.clock())
+                    if failed := self._deadline_result(record, remaining):
+                        return failed
                 started = self._move(
                     record, phase="rolling_back", intent="start_base", code=record.code
                 )
@@ -379,73 +513,28 @@ class _Controller[
                     and observation.boot != record.identity.origin_boot
                     and self._policy.matches(record, observation, "base")
                 ):
-                    return self._move(
+                    verifying = self._move(
                         record,
                         phase="rolling_back",
                         intent="verify_base",
                         code=record.code,
                     )
+                    return self._started_health_result(verifying, observation, "base")
                 if observation.service in {"starting", "stopping"}:
                     return record
                 return self._failure(record, "ambiguous_start")
-            proof = self._policy.proof(observation)
-            if (
-                not self._policy.matches(record, observation, "base")
-                or observation.service != "running"
-                or observation.writer_free
-                or observation.health_failed
-                or (
-                    proof is not None
-                    and (
-                        proof.boot != observation.boot
-                        or not self._policy.accepts(record, proof, "base")
-                    )
-                )
-            ):
-                return self._failure(record, "health_failed")
-            if proof is not None:
-                return self._move(record, phase="rolled_back", proof=proof, code=record.code)
-            return record
+            return self._paused_health_result(record, observation, "base")
         if record.phase in {"committed", "rolled_back"}:
-            proof = self._policy.proof(observation)
+            if result := self._terminal_result(record, observation):
+                return result
             role = "target" if record.phase == "committed" else "base"
-            if (
-                not self._policy.matches(record, observation, role)
-                or observation.service != "running"
-                or observation.writer_free
-            ):
-                return self._failure(record, "health_failed")
-            if observation.activation_failed or observation.health_failed:
-                return self._failure(
-                    record,
-                    "activation_failed" if observation.activation_failed else "health_failed",
-                )
-            if (
-                proof is not None
-                and self._policy.accepts(record, proof, role, released=True)
-                and proof.boot == observation.boot
-            ):
-                activation: Literal["released", "released_degraded"] = (
-                    "released_degraded" if proof.admission == "released_degraded" else "released"
-                )
-                return self._move(
-                    record,
-                    phase=record.phase,
-                    activation=activation,
-                    proof=proof,
-                    code=record.code,
-                )
-            if proof is None:
-                # A missing HTTP observation is not an explicit host failure.
-                # Keep the original deadline and do not resend activation.
-                return record
-            if proof.boot != observation.boot or not self._policy.accepts(record, proof, role):
-                return self._failure(record, "health_failed")
-            if record.health is not None and proof.boot != record.health.boot:
-                return self._move(record, phase=record.phase, proof=proof, code=record.code)
-            if record.activation == "blocked":
-                return record
-            await self._call(record, lambda: self._effects.activate(record, role))
+            receipt = await self._call(record, lambda: self._effects.activate(record, role))
+            if receipt is not None and isinstance(record, TransactionRecordV2):
+                remaining = record.deadline.remaining(self.clock())
+                if failed := self._deadline_result(record, remaining):
+                    return failed
+                if result := self._terminal_result(record, receipt):
+                    return result
             return record
         raise TransactionError("unsupported_phase")
 

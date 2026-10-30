@@ -75,7 +75,7 @@ CI 共21项作业，包含18项后端测试分片、质量、MCP 与 Linux 原�
 
 质量作业检查格式、类型、前端与发行包；可选集成作业另安装 MCP 和渠道依赖，覆盖默认环境可能跳过的 SDK 路径。每项保留 workflow 硬超时、有限并发和 Node 堆限制；诊断用的 `faulthandler_timeout` 不能代替终止期限。
 
-Windows 托管矩阵通过 [MSYS2 官方 action](https://github.com/msys2/setup-msys2) 复用 runner 已有环境，安装 [UCRT64 Poppler](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-poppler)，把其程序目录放到测试 PATH 前面并记录版本。这样真实 PDF 用例使用支持标准输入的转换器，避免命中 Git for Windows 附带的同名 Xpdf 程序。下载与安装仅发生在托管 runner；本机离线检查不安装转换器，也不改变真实文档用例的断言或可选依赖缺失行为。
+Windows 托管矩阵通过 [MSYS2 官方 action](https://github.com/msys2/setup-msys2) 复用 runner 已有环境，安装 [UCRT64 Poppler](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-poppler)，把其程序目录放到测试 PATH 前面并记录版本。安装步骤固定已核对的 action 提交，通过该实现支持的内部环境变量 `__SETUP_MSYS2_USE_MAIN_MIRROR_ONLY=true` 选择官方 `repo.msys2.org` 主镜像，避开曾在 pytest 前同步失败的重定向源；该开关不是公开输入，升级 action 时须重新核对[实现](https://github.com/msys2/setup-msys2/blob/ec48f7c5447b3140e2b088413ae3a55687bccb6e/index.js)。完整系统升级、签名校验及转换器版本检查保持启用。这样真实 PDF 用例使用支持标准输入的转换器，避免命中 Git for Windows 附带的同名 Xpdf 程序。下载与安装仅发生在托管 runner；本机离线检查不安装转换器，也不改变真实文档用例的断言或可选依赖缺失行为。
 
 Windows 原生无障碍测试仅在托管 CI 创建并操作自己的临时窗口，本机开发不读取或点击真实桌面。专用诊断工作流与完整跨平台 CI 的覆盖范围不同，不能相互代替。
 

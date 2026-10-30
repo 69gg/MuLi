@@ -12,6 +12,7 @@ from test_linux_transaction import FakeBus, write_stat
 from test_managed_launcher import _CONFIG, Deployment
 from test_managed_launcher import deployment as deployment
 
+from muli import failure_diagnostics
 from muli.managed_journal import RoleSnapshots
 from muli.managed_transaction import TransactionRecordV2, raw_snapshot
 from muli.management_transaction import TransactionJournal
@@ -132,6 +133,25 @@ async def test_stable_unit_and_exec_role_have_distinct_verified_arguments(host: 
     assert all("GetUnit" in call or "get-property" in call for call in host.bus.calls)
 
 
+async def test_real_managed_reader_remains_owned_in_exec_start_failure_diagnostic(
+    host: ProbeHost,
+) -> None:
+    signature, _ = host.bus.rows["ExecStart"]
+    host.bus.rows["ExecStart"] = (signature, [])
+    with pytest.raises(ObservationError, match="^unsupported_exec_start$") as caught:
+        await observe(host)
+    diagnostic = failure_diagnostics.capture_failure(caught.value)
+    assert failure_diagnostics.validate_failure_diagnostic(diagnostic) is not None
+    assert diagnostic["truncated"] is False
+    owned = diagnostic["frames"][-3:]
+    assert [(frame["module"], frame["function"]) for frame in owned] == [
+        ("muli.platforms.managed_probe", "ManagedSystemdProbe.read_managed"),
+        ("muli.platforms.linux_transaction", "SystemdProbe._snapshot"),
+        ("muli.platforms.linux_transaction", "SystemdProbe._snapshot_values"),
+    ]
+    assert all(type(frame["line"]) is int for frame in owned)
+
+
 async def test_same_binary_cannot_hide_a_foreign_lexical_python(host: ProbeHost) -> None:
     argv = list(managed_process_arguments(host.deployment.anchor, host.deployment.target))
     argv[0] = str(Path(host.deployment.target.prefix) / "bin/another-python")
@@ -189,6 +209,12 @@ async def test_unloaded_unit_only_observable_in_stopped_reconciliation(
 async def test_running_unit_needing_reload_never_becomes_health(host: ProbeHost) -> None:
     host.bus.rows["NeedDaemonReload"] = ("b", True)
     with pytest.raises(ObservationError, match="managed_unit_not_loaded"):
+        await observe(host)
+
+
+async def test_running_managed_unit_without_invocation_is_not_health(host: ProbeHost) -> None:
+    host.bus.rows["InvocationID"] = ("ay", [])
+    with pytest.raises(ObservationError, match="^invalid_invocation$"):
         await observe(host)
 
 

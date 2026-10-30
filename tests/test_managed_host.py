@@ -16,7 +16,9 @@ from test_managed_controller import FakeManagedService
 from test_management_helper import Probe as HelperProbe
 from test_management_helper import Runner
 
+import muli
 import muli.managed_host as host_module
+import muli.platforms.managed_deployment as deployment_module
 from muli.managed_controller import ManagedServiceObservation
 from muli.managed_host import (
     ensure_managed_helper,
@@ -27,15 +29,16 @@ from muli.managed_host import (
 )
 from muli.managed_journal import advance_managed, read_snapshots
 from muli.managed_transaction import TransactionRecordV2, TransitionV2
-from muli.management_transaction import Role, TransactionError, TransactionJournal
+from muli.management_transaction import JournalControl, Role, TransactionError, TransactionJournal
 from muli.platforms.filesystem_identity import FilesystemError
-from muli.platforms.installation import HelperLimits
+from muli.platforms.installation import FileFingerprint, HelperLimits
 from muli.platforms.linux_transaction import HelperSnapshot
 from muli.platforms.managed_deployment import (
     DeploymentAnchor,
     ManagedDeploymentError,
     SlotIdentity,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.managed_probe import ManagedSystemdProbe
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux managed helper/real locks")
@@ -86,7 +89,7 @@ def current_controller(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     def verify(slot: SlotIdentity) -> None:
         verified.append(slot.digest)
 
-    monkeypatch.setattr(host_module, "verify_current_slot", verify)
+    monkeypatch.setattr(host_module, "verify_current_process", verify)
     return verified
 
 
@@ -365,6 +368,150 @@ async def test_controller_changed_during_helper_await_cannot_enter_backend(
             environment.journal.directory.path, probe=probe, clock=environment.clock
         )
     assert not backend.instances and environment.journal.read_current() == environment.record
+
+
+@pytest.fixture
+def authentic_current_process(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch
+) -> SlotIdentity:
+    """Match only this process's names; all retained file checks remain real."""
+    controller = environment.slots["base"]
+    monkeypatch.setattr(sys, "executable", controller.lexical_python)
+    monkeypatch.setattr(sys, "prefix", controller.prefix)
+    monkeypatch.setattr(muli, "__file__", str(Path(controller.package.root) / "__init__.py"))
+    return controller
+
+
+async def test_real_host_authentication_hashes_controller_once_on_each_side_of_helper_await(
+    environment: Environment,
+    authentic_current_process: SlotIdentity,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    original_files = deployment_module.verify_slot_files
+    original_process = deployment_module.verify_current_process
+
+    def files(
+        slot: SlotIdentity,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
+        assert slot == authentic_current_process
+        events.append("files")
+        original_files(
+            slot,
+            verified_python=verified_python,
+            verified_packages=verified_packages,
+            observed_packages=observed_packages,
+        )
+
+    def process(slot: SlotIdentity) -> None:
+        events.append("process")
+        original_process(slot)
+
+    class ReachedBackend(Exception):
+        pass
+
+    def reached(*args: object, **kwargs: object) -> None:
+        events.append("backend")
+        raise ReachedBackend
+
+    monkeypatch.setattr(deployment_module, "verify_slot_files", files)
+    monkeypatch.setattr(deployment_module, "verify_current_process", process)
+    monkeypatch.setattr(host_module, "verify_current_process", process)
+    monkeypatch.setattr(host_module, "ManagedLinuxBackend", reached)
+    probe = Probe()
+    probe.after_read = lambda: events.append("helper_returned")
+
+    with pytest.raises(ReachedBackend):
+        await run_managed_helper(
+            environment.journal.directory.path, probe=probe, clock=environment.clock
+        )
+
+    # Entry and initial _record each retain their complete file check.
+    # Authentication then requires exactly one complete check before the RPC
+    # and another after it, with exact current-process validation on both sides.
+    assert events == [
+        "files",
+        "process",
+        "files",
+        "files",
+        "process",
+        "helper_returned",
+        "files",
+        "process",
+        "backend",
+    ]
+    assert len(probe.helper.reads) == 1
+    assert environment.journal.read_current() == environment.record
+
+
+@pytest.mark.parametrize(
+    "changed", ["package", "python", "interpreter", "prefix", "module", "revision", "cancel"]
+)
+async def test_real_host_rechecks_files_process_and_record_after_helper_await(
+    environment: Environment,
+    authentic_current_process: SlotIdentity,
+    monkeypatch: pytest.MonkeyPatch,
+    changed: str,
+) -> None:
+    controls: list[JournalControl] = []
+    entered: list[bool] = []
+    original_record = host_module._record
+
+    def record(
+        control: JournalControl, anchor: DeploymentAnchor
+    ) -> tuple[TransactionRecordV2, SlotIdentity, dict[Role, SlotIdentity]]:
+        controls.append(control)
+        return original_record(control, anchor)
+
+    def reached(*args: object, **kwargs: object) -> None:
+        entered.append(True)
+        raise AssertionError("unverified helper reached backend")
+
+    def drift() -> None:
+        controller = authentic_current_process
+        if changed == "package":
+            Path(controller.package.root, "__main__.py").write_text("changed", encoding="utf-8")
+        elif changed == "python":
+            replacement = environment.journal.directory.path.parent / "changed-python"
+            replacement.write_bytes(b"changed interpreter")
+            replacement.chmod(0o700)
+            lexical = Path(controller.lexical_python)
+            lexical.unlink()
+            lexical.symlink_to(replacement)
+        elif changed == "interpreter":
+            monkeypatch.setattr(sys, "executable", environment.slots["target"].lexical_python)
+        elif changed == "prefix":
+            monkeypatch.setattr(sys, "prefix", environment.slots["target"].prefix)
+        elif changed == "module":
+            monkeypatch.setattr(
+                muli,
+                "__file__",
+                str(Path(environment.slots["target"].package.root) / "__init__.py"),
+            )
+        elif changed == "revision":
+            advance_managed(
+                controls[-1], environment.record.position, TransitionV2(phase="draining")
+            )
+        else:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(host_module, "_record", record)
+    monkeypatch.setattr(host_module, "ManagedLinuxBackend", reached)
+    probe = Probe()
+    probe.after_read = drift
+    expected = asyncio.CancelledError if changed == "cancel" else ValueError
+    with pytest.raises(expected):
+        await run_managed_helper(
+            environment.journal.directory.path, probe=probe, clock=environment.clock
+        )
+    assert len(probe.helper.reads) == 1 and not entered
+    current = environment.journal.read_current()
+    assert isinstance(current, TransactionRecordV2)
+    assert current.phase == ("draining" if changed == "revision" else environment.record.phase)
 
 
 async def test_cancel_preserves_start_intent_without_finally_retry(

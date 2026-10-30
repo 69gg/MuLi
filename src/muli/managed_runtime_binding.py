@@ -20,8 +20,10 @@ from muli.platforms.managed_deployment import (
     DeploymentStore,
     SelectorStore,
     SlotIdentity,
-    verify_current_slot,
+    verify_current_process,
+    verify_slot_files,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.transaction_files import ConfigurationFile
 from muli.service import UserService
 from muli.store import Store
@@ -147,10 +149,12 @@ def verify_running_binding(
         selected_role = _selected_role(permit, record, role)
         binding = record.binding(selected_role)
         journal = permit.journal
+        controller_packages: PackageProofs = {}
         with DeploymentStore(journal.directory.path, journal.limits) as deployments:
             anchor = deployments.read_anchor(record.identity.deployment)
-            deployments.verify_anchor(anchor)
+            deployments.verify_anchor(anchor, observed_packages=controller_packages)
             slot = deployments.read_slot(binding.installation)
+            controller = deployments.read_slot(anchor.controller_slot)
         if (
             anchor.digest != record.identity.deployment
             or slot.digest != binding.installation
@@ -163,7 +167,15 @@ def verify_running_binding(
         ):
             raise RuntimeBindingError("runtime_binding_installation_changed")
         permit.check_paths(Path(anchor.config_path), journal.database)
-        verify_current_slot(slot)
+        # Share only content from this call's complete controller check. The
+        # selected slot still independently reopens files and walks its tree.
+        verify_slot_files(
+            slot,
+            verified_python=controller.resolved_python,
+            verified_packages=controller_packages,
+        )
+        verify_current_process(slot)
+        del controller_packages
         if isinstance(permit, ManagedBootPermit):
             if (
                 permit.anchor.digest != anchor.digest

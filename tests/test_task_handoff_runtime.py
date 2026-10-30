@@ -20,6 +20,7 @@ from test_runtime import FakeClient, make_runtime
 from test_task_control_runtime import wait_agent
 from test_teammate_attachment_runtime import completed, eventually, tool_result
 
+from muli.attention import AttentionInbox
 from muli.channels.manager import encoded
 from muli.compaction import closed_groups
 from muli.config import ConfigFile
@@ -82,6 +83,7 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence_to_draft_worker(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     control_channel: str,
     compact_and_reopen: bool,
 ) -> None:
@@ -503,6 +505,17 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
     app = create_app(runtime.config, runtime=runtime)
     original_manager = app.state.channel_application.manager
     manager = original_manager
+    inbox: AttentionInbox = app.state.attention
+    attention_changed = asyncio.Condition()
+    original_consume = inbox._consume
+
+    async def observe_consume() -> bool:
+        progressed = await original_consume()
+        async with attention_changed:
+            attention_changed.notify_all()
+        return progressed
+
+    monkeypatch.setattr(inbox, "_consume", observe_consume)
     try:
         async with AsyncExitStack() as stage:
             web = await enter_application(stage)
@@ -534,6 +547,81 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 runtime,
                 lambda: bool(completed(runtime, "旧执行者失败；已有外发结果未知，暂不重试")),
             )
+            failed_run_id = old["run_id"]
+
+            def failure_log_persisted() -> bool:
+                return runtime.system_events.status()["queued"] == 0 and any(
+                    record.get("session_id") == old_id and record.get("run_id") == failed_run_id
+                    for record in runtime.store.list("system_log")
+                )
+
+            await eventually(runtime, failure_log_persisted)
+            failure_logs = [
+                record
+                for record in runtime.store.list("system_log")
+                if record.get("session_id") == old_id and record.get("run_id") == failed_run_id
+            ]
+            assert len(failure_logs) == 1
+            failure_log = failure_logs[0]
+            assert failure_log["component"] == "runtime" and failure_log["code"] == "runtime_failed"
+            assert failure_log["notify"] is False and failure_log["producer"] == "legacy_local"
+            assert failure_log["routing"]["classification"] == "legacy_local"
+            failure_event = runtime.store.events(failure_log["event_id"] - 1, limit=1)[0]
+            assert failure_event["id"] == failure_log["event_id"]
+            assert failure_event["type"] == "system.log"
+            for field in ("id", "session_id", "run_id", "notify", "producer", "routing"):
+                assert failure_event["data"][field] == failure_log[field]
+            failure_report = runtime.store.get("team_report", failed_run_id)
+            assert failure_report is not None
+            assert failure_report["agent_id"] == old_id and failure_report["parent_id"] == main_id
+            assert failure_report["execution_status"] == "failed"
+            assert failure_report["status"] == "delivered"
+            assert failure_report["reply_origin"] == old["reply_origin"]
+            failed_run = runtime.store.get("run", failed_run_id)
+            assert failed_run is not None and failed_run["session_id"] == old_id
+            assert failed_run["status"] == "failed"
+
+            # A retained log is evidence, not a second input after its parent report.
+            # Observe a real, completed consumer pass before asserting its absence.
+            async with asyncio.timeout(4), attention_changed:
+                await attention_changed.wait_for(
+                    lambda: (
+                        inbox.cursor >= failure_log["event_id"]
+                        and inbox.cursor == runtime.store.event_position()
+                        and not runtime.tasks
+                        and runtime.system_events.status()["queued"] == 0
+                    )
+                )
+
+            def assert_failure_reported_once() -> None:
+                reports = [
+                    report
+                    for report in runtime.store.list("team_report")
+                    if report.get("agent_id") == old_id
+                ]
+                assert reports == [failure_report]
+                assert runtime.store.get("system_log", failure_log["id"]) == failure_log
+                report_inputs = runtime.store.db.execute(
+                    "SELECT id,state FROM ingress WHERE session_id=? "
+                    "AND json_extract(payload,'$.source')=? "
+                    "AND json_extract(payload,'$.principal')=?",
+                    (main_id, "team:" + old_id, "agent:" + old_id),
+                ).fetchall()
+                assert len(report_inputs) == 1 and report_inputs[0]["state"] == "delivered"
+                assert not [
+                    receipt
+                    for receipt in runtime.store.list("attention_receipt")
+                    if receipt["kind"] == "system_log" and receipt["record_id"] == failure_log["id"]
+                ]
+                attention_inputs = runtime.store.db.execute(
+                    "SELECT id FROM ingress WHERE session_id=? "
+                    "AND json_extract(payload,'$.source')='system:attention' "
+                    "AND json_extract(payload,'$.principal')='system:attention'",
+                    (main_id,),
+                ).fetchall()
+                assert attention_inputs == []
+
+            assert_failure_reported_once()
             assert old["reply_origin"]["kind"] == "web"
             assert old["reply_origin"]["input_id"] == assigned.json()["message"]["id"]
             assert manager.delivery(delivery_id)["state"] == "unknown"
@@ -601,6 +689,8 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
                 runtime,
                 lambda: bool(completed(runtime, replan_text)),
             )
+            assert main_round == 4
+            assert not unexpected_requests
             replan_messages = completed(runtime, replan_text)
             assert len(replan_messages) == 1
             history = await web.get(f"/api/sessions/{main_id}/messages")
@@ -1004,6 +1094,7 @@ async def test_owner_replans_failed_unknown_delivery_and_hands_original_evidence
             assert manager.delivery(delivery_id)["attempts"] == 1
             assert manager.delivery(delivery_id)["next_part"] == 0
             assert manager.delivery(delivery_id)["receipts"] == []
+            assert_failure_reported_once()
             assert len(worker_requests) == 3 and not unexpected_requests
             if control_channel == "onebot":
                 confirmations = 4 if compact_and_reopen else 3

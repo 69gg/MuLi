@@ -34,6 +34,7 @@ from muli.management_transaction import (
     TransactionError,
     TransactionJournal,
 )
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_controller import (
     CgroupObservation,
     transaction_request,
@@ -53,8 +54,10 @@ from muli.platforms.managed_deployment import (
     SelectorStore,
     SelectorValue,
     SlotIdentity,
+    _AuthenticationMismatch,
     verify_slot_files,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.managed_probe import (
     ManagedProbeResult,
     ManagedSystemdProbe,
@@ -79,6 +82,12 @@ class _DiskBinding:
             None if self.selector is None else self.selector.digest,
             self.unit.digest,
         )
+
+
+@dataclass(slots=True)
+class _FileProofs:
+    python: FileFingerprint | None = None
+    packages: PackageProofs | None = None
 
 
 class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
@@ -111,8 +120,12 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         self.anchor, self.controller_slot, self.slots = anchor, controller_slot, dict(slots)
         self.journal, self.control, self.clock = journal, control, clock
         self.operation_timeout, self.runner = operation_timeout, runner
-        self.probe = probe or ManagedSystemdProbe(
-            runner=runner, limits=ProbeLimits(seconds=operation_timeout / 4)
+        self.probe = (
+            probe
+            if probe is not None
+            else ManagedSystemdProbe(
+                runner=runner, limits=ProbeLimits(seconds=operation_timeout / 4)
+            )
         )
         if self.probe.limits.seconds > operation_timeout / 4:
             raise ObservationError("invalid_probe_timeout")
@@ -141,36 +154,79 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     async def __aexit__(self, *args: object) -> None:
         await self.client.aclose()
 
-    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+    def _check(
+        self,
+        record: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
         self.control.check()
         if self.control.read_current() != record:
             raise TransactionError("stale_revision")
         if record.identity.deployment != self.anchor.digest:
             raise ObservationError("managed_deployment_changed")
-        with DeploymentStore(Path(self.anchor.journal_root), self.journal.limits) as store:
+        slots = {self.anchor.controller_slot: self.controller_slot}
+        # The opposite role still requires actual metadata, not an executable
+        # package: a damaged target cannot prevent restoration of the base.
+        for selected in _ROLES:
+            binding, slot = record.binding(selected), self.slots[selected]
             if (
-                store.read_anchor(self.anchor.digest) != self.anchor
-                or store.read_slot(self.anchor.controller_slot) != self.controller_slot
+                binding.installation != slot.digest
+                or binding.compatibility != slot.compatibility_digest
+                or (binding.installation in slots and slots[binding.installation] != slot)
             ):
-                raise ObservationError("managed_deployment_changed")
-            store.verify_anchor(self.anchor)
-            # The opposite role is frozen metadata, not a requirement that its
-            # damaged package remain executable in order to restore the base.
-            for selected in _ROLES:
-                binding, slot = record.binding(selected), self.slots[selected]
-                if (
-                    binding.installation != slot.digest
-                    or binding.compatibility != slot.compatibility_digest
-                    or store.read_slot(binding.installation) != slot
-                ):
-                    raise ObservationError("managed_slot_changed")
-        # verify_anchor authenticated the controller in this synchronous check.
-        # Equal frozen installations share that proof only until this call returns.
-        if role is not None and self.slots[role] != self.controller_slot:
-            verify_slot_files(self.slots[role])
+                raise ObservationError("managed_slot_changed")
+            slots[binding.installation] = slot
 
-    def _effect_guard(self, record: TransactionRecordV2, role: Role | None) -> None:
-        self._check(record, role)
+        def verify_selected(slot: SlotIdentity) -> None:
+            # Keep the original selected-role verifier and kwargs boundary. It
+            # receives the actual record parsed inside this synchronous guard.
+            if verified_packages is None and observed_packages is None:
+                verify_slot_files(slot, verified_python=self.controller_slot.resolved_python)
+            else:
+                verify_slot_files(
+                    slot,
+                    verified_python=self.controller_slot.resolved_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
+
+        with DeploymentStore(Path(self.anchor.journal_root), self.journal.limits) as store:
+            try:
+                store._authenticate(
+                    self.anchor,
+                    slots,
+                    selected=None if role is None else record.binding(role).installation,
+                    verify_selected=verify_selected,
+                    verified_python=verified_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
+            except _AuthenticationMismatch as error:
+                raise ObservationError(error.code) from None
+
+    def _effect_guard(
+        self,
+        record: TransactionRecordV2,
+        role: Role | None,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
+        if verified_packages is None and observed_packages is None:
+            self._check(record, role, verified_python=verified_python)
+        else:
+            self._check(
+                record,
+                role,
+                verified_python=verified_python,
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
         remaining = record.deadline.remaining(self.clock())
         if record.phase in {"activating", "verifying"}:
             remaining -= record.deadline.rollback_reserve
@@ -178,9 +234,26 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise TimeoutError
 
     def _guard(
-        self, record: TransactionRecordV2, role: Role, lease: FixedLock, cgroup: str
+        self,
+        record: TransactionRecordV2,
+        role: Role,
+        lease: FixedLock,
+        cgroup: str,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
     ) -> None:
-        self._effect_guard(record, role)
+        if verified_packages is None and observed_packages is None:
+            self._effect_guard(record, role, verified_python=verified_python)
+        else:
+            self._effect_guard(
+                record,
+                role,
+                verified_python=verified_python,
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
         lease.check()
         if not self.cgroups.empty(cgroup):
             raise ObservationError("cgroup_not_empty")
@@ -221,12 +294,49 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 raise ObservationError("unsupported_managed_selector")
         return data
 
-    async def _probe(self, record: TransactionRecordV2) -> ManagedProbeResult:
-        self._check(record)
+    async def _probe(
+        self,
+        record: TransactionRecordV2,
+        *,
+        preflight: Callable[[], None] | None = None,
+        postprocess: Callable[[ManagedProbeResult], Role | None] | None = None,
+        postproofs: _FileProofs | None = None,
+    ) -> ManagedProbeResult:
+        if postproofs is not None:
+            postproofs.python = None
+            postproofs.packages = None
+        if preflight is None:
+            self._check(record)
+        else:
+            # An adjacent stronger synchronous guard includes authentication.
+            # Its result never replaces the independent post-await check.
+            preflight()
         result = await self.probe.read_managed(
             self.journal, record, self.anchor, self.controller_slot, self.slots
         )
-        self._check(record)
+        observed_packages: PackageProofs | None = {} if postproofs is not None else None
+        if postprocess is None:
+            if observed_packages is None:
+                self._check(record)
+            else:
+                self._check(record, observed_packages=observed_packages)
+        else:
+            try:
+                selected = postprocess(result)
+            except BaseException:
+                # Preserve controller authentication's precedence over a local
+                # observation error, without retaining proofs across the await.
+                self._check(record)
+                raise
+            if observed_packages is None:
+                self._check(record, selected)
+            else:
+                self._check(record, selected, observed_packages=observed_packages)
+        if postproofs is not None:
+            # Publish only after the independent post-await authentication and
+            # its final metadata/root fences have all returned successfully.
+            postproofs.python = self.controller_slot.resolved_python
+            postproofs.packages = observed_packages
         return result
 
     def _disk(self) -> _DiskBinding:
@@ -308,13 +418,29 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         role: Role,
         lease: FixedLock,
         cgroup: str,
+        *,
+        proofs: _FileProofs | None = None,
     ) -> _DiskBinding:
         expected = _files(record.binding(role))
+        batch = _FileProofs() if proofs is None else proofs
 
         def guard() -> None:
-            self._guard(record, role, lease, cgroup)
+            observed_packages: PackageProofs = {}
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=batch.python,
+                verified_packages=batch.packages,
+                observed_packages=observed_packages,
+            )
             if self._disk().digests != expected:
                 raise ObservationError("foreign_managed_binding")
+            # Only an adjacent synchronous file caller may share its batch.
+            # Every full guard and exact disk check must succeed before promotion.
+            batch.python = self.controller_slot.resolved_python
+            batch.packages = observed_packages
 
         order: tuple[Component, ...] = (
             ("configuration", "selector", "unit")
@@ -322,7 +448,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             else ("unit", "selector", "configuration")
         )
         for component in order:
-            guard()
+            # Each confirm enters this same guard before its first durable effect.
             if component == "selector":
                 with SelectorStore(Path(self.anchor.journal_root)) as selector:
                     selector.confirm(selector.read(), guard=guard)
@@ -339,23 +465,32 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         return self._disk()
 
     async def observe(self, record: TransactionRecordV2) -> ManagedServiceObservation:
-        before, disk = await self._probe(record), self._disk()
-        boot = before.service.unit.invocation if before.service.process is not None else None
+        disk: _DiskBinding | None = None
+        boot: str | None = None
         process: ManagedProcessIdentity | None = None
         proof: HealthProofV2 | None = None
-        if boot is not None:
-            role = self._owned(record, before, disk)
+
+        def bind(result: ManagedProbeResult) -> Role | None:
+            nonlocal disk, boot, process
+            disk = self._disk()
+            if result.service.process is None:
+                return None
+            boot = result.service.unit.invocation
+            role = self._owned(record, result, disk)
             selected: Role = "base" if role is None else role
             process = ManagedProcessIdentity(
                 record.binding(selected).entry,
                 record.binding(selected).installation,
                 record.binding(selected).compatibility,
             )
-            if not self._stop_only(record):
-                self._check(record, selected)
-                value = await self._request(record, boot, "readiness")
-                if value is not None:
-                    proof = self._proof(record, boot, value)
+            return None if self._stop_only(record) else selected
+
+        before = await self._probe(record, postprocess=bind)
+        assert disk is not None
+        if boot is not None and not self._stop_only(record):
+            value = await self._request(record, boot, "readiness")
+            if value is not None:
+                proof = self._proof(record, boot, value)
         writer_free, empty = False, False
         available = self.journal.writer_lease()
         lease: FixedLock | None = None
@@ -371,13 +506,21 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             else:
                 available.__exit__()
         confirmation: BindingConfirmation | None = None
-        try:
-            after = await self._probe(record)
-            if before != after or disk != self._disk():
+
+        def match(result: ManagedProbeResult) -> Role | None:
+            if before != result or disk != self._disk():
                 raise ObservationError("transaction_observation_changed")
             if boot is not None and not self._stop_only(record):
                 current_role = self._role(record, boot)
-                self._check(record, "base" if current_role is None else current_role)
+                return "base" if current_role is None else current_role
+            return None
+
+        postproofs = _FileProofs() if lease is not None else None
+        try:
+            if postproofs is None:
+                after = await self._probe(record, postprocess=match)
+            else:
+                after = await self._probe(record, postprocess=match, postproofs=postproofs)
             if self._stopped(after.service) and lease is not None:
                 lease.check()
                 empty = self.cgroups.empty(after.service.unit.cgroup)
@@ -386,8 +529,25 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                 )
                 if empty and disk.digests == _files(record.binding(desired)):
                     self._desired(record, desired)
-                    disk = self._confirm(record, desired, lease, after.service.unit.cgroup)
-                    confirmed = await self._probe(record)
+                    disk = self._confirm(
+                        record, desired, lease, after.service.unit.cgroup, proofs=postproofs
+                    )
+
+                    def final_preflight() -> None:
+                        assert postproofs is not None
+                        try:
+                            self._check(
+                                record,
+                                verified_python=postproofs.python,
+                                verified_packages=postproofs.packages,
+                            )
+                        finally:
+                            # Only the adjacent confirmation lends content;
+                            # the real probe await starts without its proofs.
+                            postproofs.python = None
+                            postproofs.packages = None
+
+                    confirmed = await self._probe(record, preflight=final_preflight)
                     if confirmed != after or disk != self._disk():
                         raise ObservationError("transaction_observation_changed")
                     if confirmed.unit_confirmed:
@@ -395,6 +555,9 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
                             record.position, desired, *disk.digests, loaded_unit=disk.unit.digest
                         )
         finally:
+            if postproofs is not None:
+                postproofs.python = None
+                postproofs.packages = None
             if lease is not None:
                 lease.__exit__()
         state: Literal["running", "stopped", "starting", "stopping", "foreign"]
@@ -457,7 +620,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
 
     async def _host_command(
         self, record: TransactionRecordV2, action: str, role: Role | None
-    ) -> None:
+    ) -> ManagedServiceObservation | None:
         if (
             action == "drain"
             and (record.phase != "draining" or role is not None)
@@ -470,7 +633,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             )
         ):
             raise ObservationError("transaction_effect_not_permitted")
-        before, disk = await self._probe(record), self._disk()
+        postproofs = _FileProofs()
+        before, disk = await self._probe(record, postproofs=postproofs), self._disk()
         boot = before.service.unit.invocation
         if (
             before.service.unit.active_state != "active"
@@ -479,22 +643,58 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             and (record.health is None or record.health.boot != boot)
         ):
             raise ObservationError("foreign_transaction_process")
-        self._effect_guard(record, "base" if role is None else role)
+        self._effect_guard(
+            record,
+            "base" if role is None else role,
+            verified_python=postproofs.python,
+            verified_packages=postproofs.packages,
+        )
+        del postproofs
         if action == "activate":
             attempt = record.generation, boot, role
             if self._activation_attempt == attempt:
-                return
+                return None
             self._activation_attempt = attempt
         value = await self._request(record, boot, action)
-        after = await self._probe(record)
-        self._check(record, "base" if role is None else role)
+        # Its post-probe role guard includes the full controller authentication;
+        # do not repeat that scan in the same synchronous segment.
+        after = await self._probe(
+            record, postprocess=lambda _result: "base" if role is None else role
+        )
         if before != after or disk != self._disk():
             raise ObservationError("transaction_observation_changed")
         if value is None:
-            return
+            return None
         if action == "activate":
-            if self._proof(record, boot, value).admission == "blocked":
+            proof = self._proof(record, boot, value)
+            if proof.admission == "blocked":
                 raise ObservationError("transaction_activation_failed")
+            if proof.admission not in {"released", "released_degraded"}:
+                return None
+            available = self.journal.writer_lease()
+            try:
+                available.__enter__()
+            except TransactionError as error:
+                if error.code != "lock_busy":
+                    raise
+            else:
+                available.__exit__()
+                return None
+            selected: Role = "base" if role is None else role
+            binding = record.binding(selected)
+            return ManagedServiceObservation(
+                identity_matches=True,
+                configuration=disk.configuration.digest,
+                selector=None if disk.selector is None else disk.selector.digest,
+                unit=disk.unit.digest,
+                service="running",
+                boot=boot,
+                writer_free=False,
+                process=ManagedProcessIdentity(
+                    binding.entry, binding.installation, binding.compatibility
+                ),
+                health=proof,
+            )
         elif (
             action == "drain"
             and value.get("state") not in {"waiting", "drained"}
@@ -504,6 +704,7 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             and value.get("boot") != boot
         ):
             raise ObservationError("invalid_transaction_reply")
+        return None
 
     async def drain(self, record: TransactionRecordV2) -> None:
         await self._host_command(record, "drain", None)
@@ -511,8 +712,10 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
     async def resume(self, record: TransactionRecordV2) -> None:
         await self._host_command(record, "resume", None)
 
-    async def activate(self, record: TransactionRecordV2, role: Role) -> None:
-        await self._host_command(record, "activate", role)
+    async def activate(
+        self, record: TransactionRecordV2, role: Role
+    ) -> ManagedServiceObservation | None:
+        return await self._host_command(record, "activate", role)
 
     async def stop(self, record: TransactionRecordV2, role: Role) -> None:
         if (record.phase, record.intent, role) not in {
@@ -521,7 +724,8 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             ("rolling_back", "stop_target", "target"),
         }:
             raise ObservationError("transaction_effect_not_permitted")
-        before, disk = await self._probe(record), self._disk()
+        postproofs = _FileProofs()
+        before, disk = await self._probe(record, postproofs=postproofs), self._disk()
         if self._stopped(before.service):
             return
         expected = (
@@ -536,15 +740,100 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             or before.service.unit.active_state == "deactivating"
         ):
             return
+
+        def preflight() -> None:
+            self._effect_guard(
+                record,
+                None,
+                verified_python=postproofs.python,
+                verified_packages=postproofs.packages,
+            )
+            # These bytes belong only to the preceding post-await guard.
+            # Clear them before _probe enters its next real observation await.
+            postproofs.python = None
+            postproofs.packages = None
+
         # Stop-only may terminate a precisely observed broken slot. It neither
         # grants health nor requires that slot's damaged package to run again.
-        self._effect_guard(record, None)
-        if before != await self._probe(record) or disk != self._disk():
+        final_postproofs = _FileProofs()
+        if (
+            before != await self._probe(record, preflight=preflight, postproofs=final_postproofs)
+            or disk != self._disk()
+        ):
             raise ObservationError("transaction_observation_changed")
-        self._effect_guard(record, None)
+        self._effect_guard(
+            record,
+            None,
+            verified_python=final_postproofs.python,
+            verified_packages=final_postproofs.packages,
+        )
+        del final_postproofs
         await self._command("stop")
 
-    async def install(self, record: TransactionRecordV2, role: Role, data: RoleSnapshots) -> None:
+    def _install_files(
+        self,
+        record: TransactionRecordV2,
+        role: Role,
+        data: RoleSnapshots,
+        lease: FixedLock,
+        cgroup: str,
+        *,
+        proofs: _FileProofs | None = None,
+    ) -> None:
+        # The caller may lend its immediately preceding post-probe bytes only
+        # to this synchronous scope, then clears them before the next await.
+        batch = _FileProofs() if proofs is None else proofs
+
+        def guard() -> None:
+            observed_packages: PackageProofs = {}
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=batch.python,
+                verified_packages=batch.packages,
+                observed_packages=observed_packages,
+            )
+            if self._disk().digests not in _prefixes(record):
+                raise ObservationError("foreign_managed_binding")
+            batch.python = self.controller_slot.resolved_python
+            batch.packages = observed_packages
+
+        order: tuple[Component, ...] = (
+            ("configuration", "selector", "unit")
+            if role == "target"
+            else ("unit", "selector", "configuration")
+        )
+        for component in order:
+            # The selected replace/confirm guards again before writing or syncing.
+            current = self._disk()
+            if component == "selector":
+                value = (
+                    None
+                    if data.selector is None
+                    else SelectorValue.model_validate_json(data.selector)
+                )
+                with SelectorStore(Path(self.anchor.journal_root)) as selector:
+                    selector.replace(current.selector, value, guard=guard)
+            else:
+                path = (
+                    self.anchor.config_path
+                    if component == "configuration"
+                    else self.anchor.unit_path
+                )
+                desired = data.configuration if component == "configuration" else data.unit
+                snapshot = current.configuration if component == "configuration" else current.unit
+                with ConfigurationFile(Path(path), self.journal.limits.max_snapshot_bytes) as file:
+                    if snapshot.data == desired:
+                        file.confirm(snapshot.digest, guard=guard)
+                    else:
+                        file.replace(snapshot.digest, desired, guard=guard)
+        self._confirm(record, role, lease, cgroup, proofs=batch)
+
+    async def install(
+        self, record: TransactionRecordV2, role: Role, data: RoleSnapshots
+    ) -> BindingConfirmation:
         if (record.phase, record.intent, role) not in {
             ("activating", "install_target", "target"),
             ("rolling_back", "restore_base", "base"),
@@ -552,70 +841,85 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
             raise ObservationError("transaction_effect_not_permitted")
         if data != self._desired(record, role):
             raise ObservationError("transaction_snapshot_changed")
-        self._check(record, role)
-        before = await self._probe(record)
-        if not self._stopped(before.service):
-            raise ObservationError("transaction_service_not_stopped")
-        with self.journal.writer_lease() as lease:
-            cgroup = before.service.unit.cgroup
-
-            def guard() -> None:
-                self._guard(record, role, lease, cgroup)
-                if self._disk().digests not in _prefixes(record):
-                    raise ObservationError("foreign_managed_binding")
-
-            guard()
-            if before != await self._probe(record):
-                raise ObservationError("transaction_observation_changed")
-            order: tuple[Component, ...] = (
-                ("configuration", "selector", "unit")
-                if role == "target"
-                else ("unit", "selector", "configuration")
+        initial_postproofs = _FileProofs()
+        try:
+            before = await self._probe(
+                record, preflight=lambda: self._check(record, role), postproofs=initial_postproofs
             )
-            for component in order:
-                guard()
-                current = self._disk()
-                if component == "selector":
-                    value = (
-                        None
-                        if data.selector is None
-                        else SelectorValue.model_validate_json(data.selector)
-                    )
-                    with SelectorStore(Path(self.anchor.journal_root)) as selector:
-                        selector.replace(current.selector, value, guard=guard)
-                else:
-                    path = (
-                        self.anchor.config_path
-                        if component == "configuration"
-                        else self.anchor.unit_path
-                    )
-                    desired = data.configuration if component == "configuration" else data.unit
-                    snapshot = (
-                        current.configuration if component == "configuration" else current.unit
-                    )
-                    with ConfigurationFile(
-                        Path(path), self.journal.limits.max_snapshot_bytes
-                    ) as file:
-                        if snapshot.data == desired:
-                            file.confirm(snapshot.digest, guard=guard)
-                        else:
-                            file.replace(snapshot.digest, desired, guard=guard)
-            self._confirm(record, role, lease, cgroup)
-            fresh = await self._probe(record)
-            if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
-                raise ObservationError("transaction_observation_changed")
-            if not fresh.unit_confirmed:
-                guard()
-                await self._command("daemon-reload")
-                guard()
-                fresh = await self._probe(record)
-            if (
-                not self._stopped(fresh.service)
-                or not fresh.unit_confirmed
-                or fresh.disk_unit != record.binding(role).unit.digest
-            ):
-                raise ObservationError("managed_unit_not_loaded")
-            self._confirm(record, role, lease, cgroup)
+            if not self._stopped(before.service):
+                raise ObservationError("transaction_service_not_stopped")
+            with self.journal.writer_lease() as lease:
+                cgroup = before.service.unit.cgroup
+
+                def guard() -> None:
+                    try:
+                        self._guard(
+                            record,
+                            role,
+                            lease,
+                            cgroup,
+                            verified_python=initial_postproofs.python,
+                            verified_packages=initial_postproofs.packages,
+                        )
+                        if self._disk().digests not in _prefixes(record):
+                            raise ObservationError("foreign_managed_binding")
+                    finally:
+                        initial_postproofs.python = None
+                        initial_postproofs.packages = None
+
+                postproofs = _FileProofs()
+
+                def final_preflight() -> None:
+                    try:
+                        self._check(
+                            record,
+                            verified_python=postproofs.python,
+                            verified_packages=postproofs.packages,
+                        )
+                    finally:
+                        # The final synchronous file confirmation lends only
+                        # content, never authentication across the probe await.
+                        postproofs.python = None
+                        postproofs.packages = None
+
+                try:
+                    if before != await self._probe(record, preflight=guard, postproofs=postproofs):
+                        raise ObservationError("transaction_observation_changed")
+                    self._install_files(record, role, data, lease, cgroup, proofs=postproofs)
+                    final_postproofs = _FileProofs()
+                    try:
+                        fresh = await self._probe(
+                            record, preflight=final_preflight, postproofs=final_postproofs
+                        )
+                        if not self._stopped(fresh.service) or fresh.service.unit.cgroup != cgroup:
+                            raise ObservationError("transaction_observation_changed")
+                        if not fresh.unit_confirmed:
+                            guard()
+                            final_postproofs.python = None
+                            final_postproofs.packages = None
+                            await self._command("daemon-reload")
+                            fresh = await self._probe(
+                                record, preflight=guard, postproofs=final_postproofs
+                            )
+                        if (
+                            not self._stopped(fresh.service)
+                            or not fresh.unit_confirmed
+                            or fresh.disk_unit != record.binding(role).unit.digest
+                        ):
+                            raise ObservationError("managed_unit_not_loaded")
+                        disk = self._confirm(record, role, lease, cgroup, proofs=final_postproofs)
+                        return BindingConfirmation(
+                            record.position, role, *disk.digests, loaded_unit=fresh.disk_unit
+                        )
+                    finally:
+                        final_postproofs.python = None
+                        final_postproofs.packages = None
+                finally:
+                    postproofs.python = None
+                    postproofs.packages = None
+        finally:
+            initial_postproofs.python = None
+            initial_postproofs.packages = None
 
     async def start(self, record: TransactionRecordV2, role: Role) -> None:
         if (record.phase, record.intent, role) not in {
@@ -624,16 +928,76 @@ class ManagedLinuxBackend(AbstractAsyncContextManager["ManagedLinuxBackend"]):
         }:
             raise ObservationError("transaction_effect_not_permitted")
         self._desired(record, role)
-        before = await self._probe(record)
+        postproofs = _FileProofs()
+        before = await self._probe(record, postproofs=postproofs)
         if not self._stopped(before.service):
             raise ObservationError("transaction_service_not_stopped")
         with self.journal.writer_lease() as lease:
             cgroup = before.service.unit.cgroup
-            self._guard(record, role, lease, cgroup)
-            disk = self._confirm(record, role, lease, cgroup)
-            fresh = await self._probe(record)
-            if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
-                raise ObservationError("transaction_observation_changed")
-            self._guard(record, role, lease, cgroup)
-        self._effect_guard(record, role)
+            observed_packages: PackageProofs = {}
+            self._guard(
+                record,
+                role,
+                lease,
+                cgroup,
+                verified_python=postproofs.python,
+                verified_packages=postproofs.packages,
+                observed_packages=observed_packages,
+            )
+            del postproofs
+            # Only the successful writer-held guard lends bytes to this
+            # synchronous confirmation; discard them before the next await.
+            confirmation_proofs = _FileProofs(
+                python=self.controller_slot.resolved_python,
+                packages=observed_packages,
+            )
+            del observed_packages
+
+            def final_preflight() -> None:
+                try:
+                    self._check(
+                        record,
+                        verified_python=confirmation_proofs.python,
+                        verified_packages=confirmation_proofs.packages,
+                    )
+                finally:
+                    # The last confirmation lends only content to the original
+                    # None preflight, never across the real manager await.
+                    confirmation_proofs.python = None
+                    confirmation_proofs.packages = None
+
+            try:
+                disk = self._confirm(record, role, lease, cgroup, proofs=confirmation_proofs)
+                final_postproofs = _FileProofs()
+                try:
+                    fresh = await self._probe(
+                        record, preflight=final_preflight, postproofs=final_postproofs
+                    )
+                    if before != fresh or disk != self._disk() or not fresh.unit_confirmed:
+                        raise ObservationError("transaction_observation_changed")
+                    effect_packages: PackageProofs = {}
+                    self._guard(
+                        record,
+                        role,
+                        lease,
+                        cgroup,
+                        verified_python=final_postproofs.python,
+                        verified_packages=final_postproofs.packages,
+                        observed_packages=effect_packages,
+                    )
+                finally:
+                    final_postproofs.python = None
+                    final_postproofs.packages = None
+            finally:
+                confirmation_proofs.python = None
+                confirmation_proofs.packages = None
+        # Only this successful post-await guard lends bytes to its adjacent
+        # effect check. Reopen and verify identities; discard before dispatch.
+        self._effect_guard(
+            record,
+            role,
+            verified_python=self.controller_slot.resolved_python,
+            verified_packages=effect_packages,
+        )
+        del effect_packages
         await self._command("start")

@@ -238,11 +238,29 @@ def setup(tmp_path: Path) -> Iterator[Scenario]:
 async def reach(
     controller: ManagedTransactionController, phase: str, intent: str | None = None
 ) -> TransactionRecordV2:
-    for _ in range(28):
-        record = await controller.step()
-        if record.phase == phase and (intent is None or record.intent == intent):
-            return record
-        assert not record.resolved and record.phase != "recovery_required"
+    original = controller.backend.observe
+    missing = False
+
+    async def observe(record: TransactionRecordV2) -> ManagedServiceObservation:
+        nonlocal missing
+        observation = await original(record)
+        if not missing and (record.phase, record.intent) == ("activating", "start_target"):
+            missing = True
+            return replace(observation, health=None)
+        return observation
+
+    with pytest.MonkeyPatch.context() as patch:
+        if phase == "verifying":
+            # Preserve the fault-injection window through an explicit missing
+            # proof, rather than assuming every healthy start pauses here.
+            patch.setattr(controller.backend, "observe", observe)
+        for _ in range(28):
+            record = await controller.step()
+            if record.phase == phase and (intent is None or record.intent == intent):
+                if phase == "verifying":
+                    assert missing and record.health is None
+                return record
+            assert not record.resolved and record.phase != "recovery_required"
     pytest.fail("expected managed phase not reached in 28 steps")
 
 

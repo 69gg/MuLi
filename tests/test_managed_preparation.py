@@ -177,16 +177,18 @@ class Host:
                 candidate=self.paths(candidate) if candidate is not None else None,
             )
 
-    def complete(self, prepared: PreparedManaged, *, project: bool = True) -> TransactionRecordV2:
+    def complete(
+        self, prepared: PreparedManaged, *, project: bool = True, boot: str = "fresh"
+    ) -> TransactionRecordV2:
         """Synthetic service completion, using real admission and final projection."""
         record = verifying(prepared.record)
-        record = move(record, TransitionV2(phase="committed", proof=proof(record, boot="fresh")))
+        record = move(record, TransitionV2(phase="committed", proof=proof(record, boot=boot)))
         record = move(
             record,
             TransitionV2(
                 phase="committed",
                 activation="released",
-                proof=proof(record, boot="fresh", admission="released"),
+                proof=proof(record, boot=boot, admission="released"),
             ),
         )
         data = read_snapshots(self.journal, record, "target")
@@ -204,7 +206,7 @@ class Host:
         assert previous is not None and self.runtime.boot_session is not None
         permit = ManagedBootPermit.acquire(
             self.journal,
-            boot="fresh",
+            boot=boot,
             plan=resolve_entry(self.journal.directory.path, purpose="service"),
             lease=previous.lease,
         )

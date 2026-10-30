@@ -135,7 +135,10 @@ jobs:
       - name: Install Windows PDF converter
         if: runner.os == 'Windows'
         id: pdf-msys2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        env:
+          # 已核对固定提交中的内部开关，避开曾同步失败的重定向镜像。
+          __SETUP_MSYS2_USE_MAIN_MIRROR_ONLY: 'true'
         with:
           msystem: UCRT64
           release: false
@@ -214,3 +217,71 @@ jobs:
       - run: >-
           uv run --extra mcp --extra channels pytest -q -o faulthandler_timeout=60
           tests/test_mcp*.py tests/test_team_progress*.py tests/test_channels.py
+  managed-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+      - run: uv sync --locked
+      - name: Real user-manager retained-slot transactions
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          unit="muli-native-envelope-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          exec sudo --non-interactive systemd-run --system --quiet --collect --wait --pipe \
+            --service-type=exec --expand-environment=no --unit="$unit" \
+            --uid="$runner_uid" --gid="$runner_gid" --working-directory="$GITHUB_WORKSPACE" \
+            --property=MemoryMax=1073741824 --property=MemorySwapMax=0 \
+            --property=CPUQuota=100% --property=TasksMax=128 --property=OOMPolicy=kill \
+            --property=RuntimeMaxSec=960 --property=TimeoutStopSec=2 \
+            --property=Restart=no --property=KillMode=control-group --property=SendSIGKILL=yes \
+            --property=LimitCORE=0 --property=UMask=0077 \
+            --setenv="MULI_NATIVE_ENVELOPE_UNIT=$unit" \
+            --setenv="MULI_NATIVE_ENVELOPE_UID=$runner_uid" \
+            --setenv="MULI_NATIVE_ENVELOPE_GID=$runner_gid" \
+            --setenv="GITHUB_RUN_ID=$GITHUB_RUN_ID" --setenv="GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" \
+            --setenv=GITHUB_ACTIONS=true --setenv=RUNNER_OS=Linux --setenv="RUNNER_TEMP=$RUNNER_TEMP" \
+            --setenv="HOME=$HOME" --setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            --setenv=LANG=C.UTF-8 --setenv=LC_ALL=C.UTF-8 \
+            "$GITHUB_WORKSPACE/.venv/bin/python" -I \
+            "$GITHUB_WORKSPACE/scripts/check_managed_native_ci.py" run "$RUNNER_TEMP/muli-managed-native-ci"
+      - name: Release only this fixture's user and mounts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          unit="muli-native-envelope-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          exec sudo --non-interactive systemd-run --system --quiet --collect --wait --pipe \
+            --service-type=exec --expand-environment=no --unit="$unit" \
+            --uid="$runner_uid" --gid="$runner_gid" --working-directory="$GITHUB_WORKSPACE" \
+            --property=MemoryMax=1073741824 --property=MemorySwapMax=0 \
+            --property=CPUQuota=100% --property=TasksMax=128 --property=OOMPolicy=kill \
+            --property=RuntimeMaxSec=240 --property=TimeoutStopSec=2 \
+            --property=Restart=no --property=KillMode=control-group --property=SendSIGKILL=yes \
+            --property=LimitCORE=0 --property=UMask=0077 \
+            --setenv="MULI_NATIVE_ENVELOPE_UNIT=$unit" \
+            --setenv="MULI_NATIVE_ENVELOPE_UID=$runner_uid" \
+            --setenv="MULI_NATIVE_ENVELOPE_GID=$runner_gid" \
+            --setenv="GITHUB_RUN_ID=$GITHUB_RUN_ID" --setenv="GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" \
+            --setenv=GITHUB_ACTIONS=true --setenv=RUNNER_OS=Linux --setenv="RUNNER_TEMP=$RUNNER_TEMP" \
+            --setenv="HOME=$HOME" --setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            --setenv=LANG=C.UTF-8 --setenv=LC_ALL=C.UTF-8 \
+            "$GITHUB_WORKSPACE/.venv/bin/python" -I \
+            "$GITHUB_WORKSPACE/scripts/check_managed_native_ci.py" cleanup "$RUNNER_TEMP/muli-managed-native-ci"
+      - name: Preserve bounded native transaction evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-native-evidence
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/muli-managed-native-ci/receipt.json
+            ${{ runner.temp }}/muli-managed-native-ci/result.json

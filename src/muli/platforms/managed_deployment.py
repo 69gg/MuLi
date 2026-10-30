@@ -11,8 +11,8 @@ import os
 import secrets
 import stat
 import sys
-from collections.abc import Callable
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Self
@@ -42,12 +42,15 @@ from muli.platforms.managed_launcher import (
     LaunchPlan as EntryPlan,
 )
 from muli.platforms.managed_launcher import (
+    PackageProofs,
     absolute,
     directory,
     fingerprint,
+    identity,
     object_bytes,
     package_fingerprint,
     python_fingerprint,
+    read_at,
     read_file,
 )
 from muli.platforms.managed_launcher import resolve_entry as resolve_entry
@@ -87,6 +90,10 @@ class ManagedDeploymentError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class _AuthenticationMismatch(ManagedDeploymentError):
+    """An actual parsed record differs from the backend's frozen expectation."""
 
 
 def require_unselected_without_record(root: Path) -> None:
@@ -254,19 +261,45 @@ def register_local_slot(
         raise ManagedDeploymentError("managed_slot_unsupported") from None
 
 
-def verify_slot_files(slot: SlotIdentity) -> None:
+def verify_slot_files(
+    slot: SlotIdentity,
+    *,
+    verified_python: FileFingerprint | None = None,
+    verified_packages: PackageProofs | None = None,
+    observed_packages: PackageProofs | None = None,
+) -> None:
     _platform()
     try:
-        _verify_slot_files(slot.model_dump(mode="json"))
+        if verified_packages is not None or observed_packages is not None:
+            _verify_slot_files(
+                slot.model_dump(mode="json"),
+                verified_python=(
+                    None if verified_python is None else verified_python.model_dump(mode="json")
+                ),
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
+        elif verified_python is None:
+            _verify_slot_files(slot.model_dump(mode="json"))
+        else:
+            _verify_slot_files(
+                slot.model_dump(mode="json"),
+                verified_python=verified_python.model_dump(mode="json"),
+            )
     except (OSError, ValueError):
         raise ManagedDeploymentError("managed_slot_changed") from None
 
 
 def verify_current_slot(slot: SlotIdentity) -> None:
     """Verify this process; sharing the same resolved Python is insufficient."""
+    verify_slot_files(slot)
+    verify_current_process(slot)
+
+
+def verify_current_process(slot: SlotIdentity) -> None:
+    """Check process identity after the caller's synchronous full slot check."""
     import muli
 
-    verify_slot_files(slot)
     if (
         str(Path(sys.executable).absolute()) != slot.lexical_python
         or str(Path(sys.prefix).absolute()) != slot.prefix
@@ -275,6 +308,106 @@ def verify_current_slot(slot: SlotIdentity) -> None:
         or str(Path(muli.__file__).absolute().parent) != slot.package.root
     ):
         raise ManagedDeploymentError("managed_process_mismatch")
+
+
+@dataclass(slots=True)
+class _MetadataScope:
+    """Actual private bytes and their first identities for one synchronous guard."""
+
+    _root: Path
+    _descriptor: int
+    _leaves: dict[str, tuple[dict[str, int], str]] = field(default_factory=dict)
+    _slots: dict[str, SlotIdentity] = field(default_factory=dict)
+
+    def _check_leaf(self, name: str, code: str) -> None:
+        try:
+            observed, _ = self._leaves[name]
+            if identity(os.stat(name, dir_fd=self._descriptor, follow_symlinks=False)) != observed:
+                raise ValueError("managed_file_changed")
+        except (OSError, ValueError):
+            raise ManagedDeploymentError(code) from None
+
+    def _read_record(self, prefix: str, expected: str, code: str) -> bytes:
+        try:
+            if len(expected) != 64 or any(value not in "0123456789abcdef" for value in expected):
+                raise ValueError("managed_digest_invalid")
+            name = f"{prefix}-{expected}.json"
+            data, observed = read_at(self._descriptor, name, _PRIVATE_BYTES, private=True)
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise ValueError("managed_record_changed")
+        except (OSError, ValueError):
+            raise ManagedDeploymentError(code) from None
+        self._leaves.setdefault(name, (observed, code))
+        return data
+
+    def read_anchor(self, expected: str) -> DeploymentAnchor:
+        try:
+            result = DeploymentAnchor.model_validate(
+                object_bytes(self._read_record("anchor", expected, "anchor_unavailable"))
+            )
+            if result.journal_root != str(self._root):
+                raise ValueError("foreign_root")
+            return result
+        except (OSError, ValueError):
+            raise ManagedDeploymentError("anchor_unavailable") from None
+
+    def read_slot(self, expected: str) -> SlotIdentity:
+        try:
+            if expected in self._slots:
+                # Keep the original logical read boundary: a later journal or
+                # snapshot failure must not hide a slot already changed here.
+                self._check_leaf(f"slot-{expected}.json", "managed_slot_unavailable")
+                return self._slots[expected]
+            data = self._read_record("slot", expected, "managed_slot_unavailable")
+            object_bytes(data)
+            result = SlotIdentity.model_validate_json(data)
+        except (OSError, ValueError):
+            raise ManagedDeploymentError("managed_slot_unavailable") from None
+        self._slots[expected] = result
+        return result
+
+    def verify_anchor(
+        self,
+        anchor: DeploymentAnchor,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
+        # Only this original launcher/controller group maps failures to anchor.
+        # Consumers' journal, snapshot and compatibility errors stay outside it.
+        try:
+            if anchor.journal_root != str(self._root):
+                raise ValueError("foreign_root")
+            data, observed = read_at(self._descriptor, LAUNCHER_NAME, _LAUNCHER_BYTES, private=True)
+            if {
+                "path": str(self._root / LAUNCHER_NAME),
+                "identity": observed,
+                "digest": hashlib.sha256(data).hexdigest(),
+            } != anchor.launcher.model_dump(mode="json"):
+                raise ValueError("foreign_launcher")
+            self._leaves.setdefault(LAUNCHER_NAME, (observed, "anchor_unavailable"))
+            controller = self.read_slot(anchor.controller_slot)
+            if verified_packages is None and observed_packages is None:
+                verify_slot_files(controller, verified_python=verified_python)
+            else:
+                verify_slot_files(
+                    controller,
+                    verified_python=verified_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
+        except (OSError, ValueError):
+            raise ManagedDeploymentError("anchor_unavailable") from None
+
+    def _finish(self) -> None:
+        # All seven fields also reject permission changes and same-inode writes
+        # whose caller restored the original bytes and mtime after consumption.
+        for name, (_, code) in self._leaves.items():
+            self._check_leaf(name, code)
+        current = os.fstat(self._descriptor)
+        if current.st_uid != os.geteuid() or stat.S_IMODE(current.st_mode) != 0o700:
+            raise ManagedDeploymentError("managed_directory_not_private")
 
 
 class DeploymentStore(AbstractContextManager["DeploymentStore"]):
@@ -330,6 +463,72 @@ class DeploymentStore(AbstractContextManager["DeploymentStore"]):
         except (OSError, ValueError):
             raise ManagedDeploymentError("anchor_unavailable") from None
 
+    @contextmanager
+    def _metadata_scope(self) -> Iterator[_MetadataScope]:
+        if self._unconfirmed:
+            raise ManagedDeploymentError("managed_write_unconfirmed")
+        self.directory.check()
+        with directory(self.root, private=True) as descriptor:
+            retained, current = os.fstat(self.directory.fd), os.fstat(descriptor)
+            if (retained.st_dev, retained.st_ino) != (current.st_dev, current.st_ino):
+                raise ManagedDeploymentError("managed_directory_changed")
+            metadata = _MetadataScope(self.root, descriptor)
+            yield metadata
+            metadata._finish()
+            # directory() performs its final full ancestor walk on normal exit.
+            # Body/finish errors only close the fd and preserve the first error.
+
+    def _authenticate(
+        self,
+        anchor: DeploymentAnchor,
+        slots: Mapping[str, SlotIdentity],
+        *,
+        selected: str | None,
+        verify_selected: Callable[[SlotIdentity], None],
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
+        """Authenticate one synchronous backend guard from actual private bytes.
+
+        ``verify_selected`` is the backend's trusted synchronous read-only slot
+        verifier, not an extension hook. All evidence remains on this stack;
+        the final leaf/root fences also follow the selected package scan.
+        """
+        if self._unconfirmed:
+            raise ManagedDeploymentError("managed_write_unconfirmed")
+        self.directory.check()
+        if anchor.controller_slot not in slots or (selected is not None and selected not in slots):
+            raise _AuthenticationMismatch("managed_deployment_changed")
+        with self._metadata_scope() as metadata:
+            actual_anchor = metadata.read_anchor(anchor.digest)
+            if actual_anchor != anchor:
+                raise _AuthenticationMismatch("managed_deployment_changed")
+
+            def read_slot(expected: str) -> SlotIdentity:
+                actual = metadata.read_slot(expected)
+                if actual != slots[expected]:
+                    raise _AuthenticationMismatch(
+                        "managed_deployment_changed"
+                        if expected == anchor.controller_slot
+                        else "managed_slot_changed"
+                    )
+                return actual
+
+            controller = read_slot(anchor.controller_slot)
+            metadata.verify_anchor(
+                anchor,
+                verified_python=verified_python,
+                verified_packages=verified_packages,
+                observed_packages=observed_packages,
+            )
+            actual_slots = {anchor.controller_slot: controller}
+            for expected in slots:
+                if expected not in actual_slots:
+                    actual_slots[expected] = read_slot(expected)
+            if selected is not None and selected != anchor.controller_slot:
+                verify_selected(actual_slots[selected])
+
     def _publish(self, name: str, data: bytes, *, guard: Callable[[], None]) -> None:
         if len(data) > _PRIVATE_BYTES:
             raise ManagedDeploymentError("managed_record_budget")
@@ -384,14 +583,31 @@ class DeploymentStore(AbstractContextManager["DeploymentStore"]):
         except (OSError, ValueError):
             raise ManagedDeploymentError("launcher_unavailable") from None
 
-    def verify_anchor(self, anchor: DeploymentAnchor) -> None:
+    def verify_anchor(
+        self,
+        anchor: DeploymentAnchor,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
         self._check()
         try:
             if anchor.journal_root != str(self.root) or fingerprint(
                 self.root / LAUNCHER_NAME, _LAUNCHER_BYTES
             ) != anchor.launcher.model_dump(mode="json"):
                 raise ValueError("foreign_launcher")
-            verify_slot_files(self.read_slot(anchor.controller_slot))
+            if verified_packages is None and observed_packages is None:
+                verify_slot_files(
+                    self.read_slot(anchor.controller_slot), verified_python=verified_python
+                )
+            else:
+                verify_slot_files(
+                    self.read_slot(anchor.controller_slot),
+                    verified_python=verified_python,
+                    verified_packages=verified_packages,
+                    observed_packages=observed_packages,
+                )
         except (OSError, ValueError):
             raise ManagedDeploymentError("anchor_unavailable") from None
 
@@ -448,7 +664,8 @@ class SelectorStore(AbstractContextManager["SelectorStore"]):
     def confirm(
         self, expected: SelectorSnapshot | None, *, guard: Callable[[], None]
     ) -> SelectorSnapshot | None:
-        guard()
+        if expected is None:
+            guard()
         self._expect(expected)
         if expected is None:
             self._unconfirmed = True

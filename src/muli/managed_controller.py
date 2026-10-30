@@ -7,7 +7,7 @@ exact journal revision before constructing a BindingConfirmation.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -87,11 +87,13 @@ class ManagedControllerBackend(
     Reopening already-desired files still confirms their data/parent durability;
     bytes alone do not establish completion. No start is repeated for a durable
     start intent. observe() must freshly establish a confirmation on reentry.
+    activate() may return a fresh, fully authenticated released observation from
+    its own request; None retains ordinary observation without resending it.
     """
 
     async def install(
         self, record: TransactionRecordV2, role: Role, data: RoleSnapshots
-    ) -> None: ...
+    ) -> BindingConfirmation | None: ...
 
 
 def _files(binding: RoleBinding) -> tuple[str, str | None, str]:
@@ -213,8 +215,30 @@ class _ManagedPolicy:
             loaded_unit=unit,
         )
 
-    async def install(self, record: TransactionRecordV2, role: Role) -> None:
-        await self.backend.install(record, role, read_snapshots(self.control.journal, record, role))
+    async def install(
+        self, record: TransactionRecordV2, role: Role
+    ) -> ManagedServiceObservation | None:
+        confirmation = await self.backend.install(
+            record, role, read_snapshots(self.control.journal, record, role)
+        )
+        if confirmation is None:
+            # Older/injected backends retain the original observe-on-reentry path.
+            return None
+        configuration, selector, unit = _files(record.binding(role))
+        if type(confirmation) is not BindingConfirmation or confirmation != BindingConfirmation(
+            record.position, role, configuration, selector, unit, loaded_unit=unit
+        ):
+            raise TransactionError("invalid_install_confirmation")
+        return ManagedServiceObservation(
+            identity_matches=True,
+            configuration=configuration,
+            selector=selector,
+            unit=unit,
+            service="stopped",
+            boot=None,
+            writer_free=True,
+            confirmation=confirmation,
+        )
 
     def proof(self, observation: ManagedServiceObservation) -> HealthProofV2 | None:
         return observation.health
@@ -240,6 +264,7 @@ class ManagedTransactionController(
         clock: Callable[[], ClockReading],
         *,
         operation_timeout: float = 5.0,
+        verify_continuation: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.backend = backend
         super().__init__(
@@ -248,4 +273,5 @@ class ManagedTransactionController(
             clock,
             _ManagedPolicy(control, backend),
             operation_timeout=operation_timeout,
+            verify_continuation=verify_continuation,
         )

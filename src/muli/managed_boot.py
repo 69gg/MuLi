@@ -39,10 +39,10 @@ from muli.platforms.managed_deployment import (
     EntryPlan,
     SelectorStore,
     SlotIdentity,
-    verify_current_slot,
+    verify_current_process,
     verify_slot_files,
 )
-from muli.platforms.managed_launcher import fingerprint
+from muli.platforms.managed_launcher import PackageProofs, fingerprint
 from muli.platforms.transaction_files import ConfigurationFile, _open_directory
 from muli.store import Store
 from muli.store_schema import ExistingStoreError
@@ -234,11 +234,13 @@ class ManagedBootPermit:
     def _observe(self) -> _Observation:
         record, role = self._record()
         binding = record.binding(role)
+        controller_packages: PackageProofs = {}
         with DeploymentStore(self.journal.directory.path, self.journal.limits) as source:
             anchor = source.read_anchor(record.identity.deployment)
             selected = source.read_slot(binding.installation)
             # The fixed controller must remain usable even when another role is selected.
-            verify_slot_files(source.read_slot(anchor.controller_slot))
+            controller = source.read_slot(anchor.controller_slot)
+            verify_slot_files(controller, observed_packages=controller_packages)
         if (
             anchor.database_path != str(self.journal.database)
             or anchor.journal_root != str(self.journal.directory.path)
@@ -251,7 +253,15 @@ class ManagedBootPermit:
             binding.entry == "managed" and binding.unit != anchor.managed_unit
         ):
             raise ManagedBootError("managed_binding_changed")
-        verify_current_slot(selected)
+        # Share only content from this observation's successful controller
+        # check. Keep the independent selected tree and actual process checks;
+        # a later _observe must read fresh content, even without an await.
+        verify_slot_files(
+            selected,
+            verified_python=controller.resolved_python,
+            verified_packages=controller_packages,
+        )
+        verify_current_process(selected)
         plan = self._plan
         argv = (
             selected.lexical_python,

@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from abc import ABCMeta
 from collections.abc import Iterator
 from pathlib import Path
 from types import FunctionType
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -162,6 +163,35 @@ def test_real_package_filename_and_qualname_cannot_forge_code_ownership() -> Non
         value = capture_failure(exc)
     assert all(frame["module"] == "unknown" for frame in value["frames"])
     assert "PRIVATE" not in json.dumps(value)
+
+
+@pytest.mark.parametrize("abc_subclass", [False, True])
+def test_unknown_metaclass_cannot_claim_original_package_method(
+    monkeypatch: pytest.MonkeyPatch, abc_subclass: bool
+) -> None:
+    class OtherMeta(type):
+        pass
+
+    class OtherABCMeta(ABCMeta):
+        pass
+
+    original = runtime_module.Runtime.new_session
+    meta = OtherABCMeta if abc_subclass else OtherMeta
+    replacement = meta("Runtime", (), {"new_session": original})
+
+    def forbidden(cls: type, name: str) -> Any:
+        raise AssertionError("custom metaclass attributes must not execute")
+
+    type.__setattr__(meta, "__getattribute__", forbidden)
+    monkeypatch.setitem(vars(runtime_module), "Runtime", replacement)
+    try:
+        original(cast(Runtime, object()))
+    except AttributeError as exc:
+        diagnostic = capture_failure(exc)
+    else:
+        raise AssertionError("the real package method must reach its missing-store boundary")
+    assert diagnostic["frames"]
+    assert all(frame["module"] == "unknown" for frame in diagnostic["frames"])
 
 
 def test_exception_group_does_not_expand_children() -> None:

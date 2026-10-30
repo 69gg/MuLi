@@ -38,6 +38,8 @@ _PHASES = {
     "recovery_required",
 }
 
+type PackageProofs = dict[str, dict[str, dict[str, Any]]]
+
 
 class LaunchError(ValueError):
     """Never include private paths, raw records or exception text in a result."""
@@ -202,30 +204,74 @@ def read_file(path: Path, limit: int, *, private: bool = False) -> tuple[bytes, 
         return read_at(descriptor, path.name, limit, private=private)
 
 
-def fingerprint(path: Path, limit: int) -> dict[str, object]:
+def _fingerprint_fd(
+    parent: int,
+    name: str,
+    path: Path,
+    limit: int,
+    descriptor: int,
+    before: dict[str, int],
+    *,
+    verified: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Read an already classified descriptor; its caller remains its sole owner."""
     hashed, size = hashlib.sha256(), 0
-    with directory(path.parent) as parent:
-        descriptor = os.open(
-            path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
-        )
-        with os.fdopen(descriptor, "rb") as source:
-            before = identity(os.fstat(source.fileno()))
-            if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
-                raise LaunchError("managed_file_unsupported")
+    if not stat.S_ISREG(before["mode"]) or before["size"] > limit:
+        raise LaunchError("managed_file_unsupported")
+    # Closing this buffered view never closes the caller-owned descriptor,
+    # including when fdopen, read or an identity check raises.
+    with os.fdopen(descriptor, "rb", closefd=False) as source:
+        # Reusing bytes never replaces this file's independent open, budget
+        # check, or descriptor and path identity checks.
+        if (
+            verified is not None
+            and verified.get("path") == str(path)
+            and verified.get("identity") == before
+            and type(verified.get("digest")) is str
+            and _DIGEST.fullmatch(verified["digest"]) is not None
+        ):
+            checksum = verified["digest"]
+        else:
             while chunk := source.read(min(65_536, limit - size + 1)):
                 size += len(chunk)
                 if size > limit:
                     raise LaunchError("managed_file_unsupported")
                 hashed.update(chunk)
-            after = identity(os.fstat(source.fileno()))
-        if before != after or before != identity(
-            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        ):
-            raise LaunchError("managed_file_changed")
-    return {"path": str(path), "identity": before, "digest": hashed.hexdigest()}
+            checksum = hashed.hexdigest()
+        after = identity(os.fstat(source.fileno()))
+    if before != after or before != identity(os.stat(name, dir_fd=parent, follow_symlinks=False)):
+        raise LaunchError("managed_file_changed")
+    return {"path": str(path), "identity": before, "digest": checksum}
 
 
-def python_fingerprint(entry: Path, limit: int) -> dict[str, object]:
+def _fingerprint_at(
+    parent: int,
+    name: str,
+    path: Path,
+    limit: int,
+    *,
+    verified: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
+    )
+    try:
+        before = identity(os.fstat(descriptor))
+        return _fingerprint_fd(parent, name, path, limit, descriptor, before, verified=verified)
+    finally:
+        os.close(descriptor)
+
+
+def fingerprint(
+    path: Path, limit: int, *, verified: dict[str, Any] | None = None
+) -> dict[str, object]:
+    with directory(path.parent) as parent:
+        return _fingerprint_at(parent, path.name, path, limit, verified=verified)
+
+
+def python_fingerprint(
+    entry: Path, limit: int, *, verified: dict[str, Any] | None = None
+) -> dict[str, object]:
     """Follow only a bounded chain of final-component interpreter links."""
     target = absolute(str(entry))
     links: list[tuple[Path, dict[str, int], str]] = []
@@ -243,7 +289,13 @@ def python_fingerprint(entry: Path, limit: int) -> dict[str, object]:
                 continue
             if not before["mode"] & 0o111:
                 raise LaunchError("managed_python_not_executable")
-            result = fingerprint(target, limit)
+            # Keep the independent leaf open and its full identity/hash checks;
+            # this parent's context still rewalks the path before releasing it.
+            result = (
+                _fingerprint_at(descriptor, target.name, target, limit)
+                if verified is None
+                else _fingerprint_at(descriptor, target.name, target, limit, verified=verified)
+            )
             break
     else:
         raise LaunchError("managed_python_link_budget")
@@ -256,14 +308,19 @@ def python_fingerprint(entry: Path, limit: int) -> dict[str, object]:
     return result
 
 
-def package_fingerprint(root: Path, limits: Mapping[str, int]) -> dict[str, object]:
+def package_fingerprint(
+    root: Path,
+    limits: Mapping[str, int],
+    *,
+    verified: dict[str, dict[str, Any]] | None = None,
+    observed: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, object]:
     """Hash a bounded, no-link package without importing it or reading pyc files."""
     hashed = hashlib.sha256()
     visited, files, size = 0, 0, 0
 
-    def walk(descriptor: int, prefix: str, depth: int) -> None:
+    def walk(descriptor: int, prefix: str, depth: int, before: dict[str, int]) -> None:
         nonlocal visited, files, size
-        before = identity(os.fstat(descriptor))
         names: list[str] = []
         with os.scandir(descriptor) as entries:
             for entry in entries:
@@ -275,36 +332,44 @@ def package_fingerprint(root: Path, limits: Mapping[str, int]) -> dict[str, obje
                 names.append(entry.name)
         for name in sorted(names):
             relative = prefix + name
-            current = identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False))
-            if stat.S_ISDIR(current["mode"]):
-                if depth >= limits["depth"]:
-                    raise LaunchError("managed_package_depth_budget")
-                child = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=descriptor,
-                )
-                try:
-                    if current != identity(os.fstat(child)):
-                        raise LaunchError("managed_file_changed")
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            try:
+                current = identity(os.fstat(child))
+                if stat.S_ISDIR(current["mode"]):
+                    if depth >= limits["depth"]:
+                        raise LaunchError("managed_package_depth_budget")
                     hashed.update(canonical([relative, "directory"]) + b"\n")
-                    walk(child, relative + "/", depth + 1)
+                    walk(child, relative + "/", depth + 1, current)
                     if current != identity(os.stat(name, dir_fd=descriptor, follow_symlinks=False)):
                         raise LaunchError("managed_file_changed")
-                finally:
-                    os.close(child)
-            else:
-                data, info = read_at(
-                    descriptor, name, min(limits["file_bytes"], limits["total_bytes"] - size)
-                )
-                size += info["size"]
-                files += 1
-                hashed.update(canonical([relative, info["size"], digest(data)]) + b"\n")
+                else:
+                    path = root / relative
+                    proof = _fingerprint_fd(
+                        descriptor,
+                        name,
+                        path,
+                        min(limits["file_bytes"], limits["total_bytes"] - size),
+                        child,
+                        current,
+                        verified=None if verified is None else verified.get(str(path)),
+                    )
+                    info = _dict(proof["identity"])
+                    size += info["size"]
+                    files += 1
+                    hashed.update(canonical([relative, info["size"], proof["digest"]]) + b"\n")
+                    if observed is not None:
+                        observed[str(path)] = proof
+            finally:
+                os.close(child)
         if before != identity(os.fstat(descriptor)):
             raise LaunchError("managed_directory_changed")
 
     with directory(root) as descriptor:
-        walk(descriptor, "", 0)
+        walk(descriptor, "", 0, identity(os.fstat(descriptor)))
     if files == 0:
         raise LaunchError("managed_package_empty")
     return {"root": str(root), "digest": hashed.hexdigest(), "files": files, "size": size}
@@ -340,7 +405,13 @@ def _limits(value: object) -> dict[str, int]:
     return limits
 
 
-def verify_slot_files(slot: dict[str, Any]) -> None:
+def verify_slot_files(
+    slot: dict[str, Any],
+    *,
+    verified_python: dict[str, Any] | None = None,
+    verified_packages: PackageProofs | None = None,
+    observed_packages: PackageProofs | None = None,
+) -> None:
     _version(slot)
     prefix = absolute(slot.get("prefix"))
     python = absolute(slot.get("lexical_python"))
@@ -352,7 +423,12 @@ def verify_slot_files(slot: dict[str, Any]) -> None:
     python_bytes = slot.get("python_bytes")
     if type(python_bytes) is not int or not 1 <= python_bytes <= 67_108_864:
         raise LaunchError("managed_record_invalid")
-    if python_fingerprint(python, python_bytes) != slot.get("resolved_python"):
+    actual_python = (
+        python_fingerprint(python, python_bytes)
+        if verified_python is None
+        else python_fingerprint(python, python_bytes, verified=verified_python)
+    )
+    if actual_python != slot.get("resolved_python"):
         raise LaunchError("managed_python_changed")
     if fingerprint(prefix / "pyvenv.cfg", limits["file_bytes"]) != slot.get("pyvenv"):
         raise LaunchError("managed_python_changed")
@@ -366,9 +442,29 @@ def verify_slot_files(slot: dict[str, Any]) -> None:
         or metadata["handoff_protocol"] != 2
         or metadata.get("requires_migration") is not False
         or metadata != slot.get("compatibility")
-        or package_fingerprint(root, limits) != package
     ):
         raise LaunchError("managed_slot_changed")
+    if verified_packages is None and observed_packages is None:
+        if package_fingerprint(root, limits) != package:
+            raise LaunchError("managed_slot_changed")
+    else:
+        # The complete slot includes its exact package root and all limits.
+        # Neither its aggregate package digest nor another role grants leaf
+        # evidence for this scope.
+        scope = digest(canonical(slot))
+        leaves: dict[str, dict[str, Any]] = {}
+        if (
+            package_fingerprint(
+                root,
+                limits,
+                verified=None if verified_packages is None else verified_packages.get(scope),
+                observed=leaves,
+            )
+            != package
+        ):
+            raise LaunchError("managed_slot_changed")
+        if observed_packages is not None:
+            observed_packages[scope] = leaves
 
 
 def _content(root: Path, prefix: str, expected: str) -> tuple[dict[str, Any], bytes]:
@@ -442,7 +538,11 @@ def resolve_entry(root: Path, *, purpose: str, arguments: Sequence[str] = ()) ->
     route_role = None if purpose == "recover" else _role(record, purpose)
     deployment, anchor = _anchor(root, record)
     controller, _ = _content(root, "slot", _hash(anchor.get("controller_slot")))
-    verify_slot_files(controller)
+    controller_packages: PackageProofs = {}
+    if purpose == "recover":
+        verify_slot_files(controller)
+    else:
+        verify_slot_files(controller, observed_packages=controller_packages)
     if purpose == "recover":
         if arguments:
             raise LaunchError("managed_arguments_invalid")
@@ -494,7 +594,13 @@ def resolve_entry(root: Path, *, purpose: str, arguments: Sequence[str] = ()) ->
     else:
         raise LaunchError("managed_record_invalid")
     slot, _ = _content(root, "slot", installation)
-    verify_slot_files(slot)
+    # Only this successful controller check lends content inside this routing
+    # call. The selected slot still reopens files and walks its complete tree.
+    verify_slot_files(
+        slot,
+        verified_python=_dict(controller["resolved_python"]),
+        verified_packages=controller_packages,
+    )
     python = absolute(slot.get("lexical_python"))
     config = absolute(anchor.get("config_path"))
     data_dir = absolute(anchor.get("data_dir"))

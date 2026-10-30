@@ -1,25 +1,39 @@
-# Linux 托管事务的效果后端
+# Linux 托管切换与恢复
 
-`ManagedLinuxBackend` 是 protocol 2 controller 的 Linux 效果适配器，已接入 CLI、helper 与启动宿主。完整入口的整合状态见[本地托管切换](managed-operations.md)。下述模块回归没有操作用户真实 systemd 服务；protocol 1 仍使用原后端。
+托管模式保留固定的控制安装和启动入口，用于在本地安装之间切换，并在失败时恢复原安装。公开入口已接线，但**当前候选的真实 systemd 原生整链验收尚未完成**；已有离线及受控进程验证不代表用户真实服务上的切换、回退或停机时长已经验证。
 
-后端消费同一 journal 的冻结 `RoleBinding`、`RoleSnapshots`、deployment anchor 和 slot metadata。它使用 `ManagedSystemdProbe` 分别观察稳定 unit 的 launcher argv、实际服务进程的角色解释器 argv，以及 boot、PID/start ticks、cgroup 和 loaded unit 属性。配置相同仍比较 selector 与真实 slot；不把配置摘要当成完整安装身份。
+## 正常使用
 
-任何效果前重读当前 revision、anchor 和 controller 文件。涉及健康、HTTP 激活、安装或启动时，还核当前角色的实际解释器、pyvenv、MuLi 包与兼容声明。另一角色只读冻结 metadata；损坏的 target 包不会阻止恢复仍完整的 base。仅 `stop_base` / `stop_target` 窗口可凭两次一致的精确进程、boot、argv、real executable、cgroup 和三文件观察停止已登记的损坏进程。该例外不产生健康证明，也不放松 foreign PID 或 cgroup 拒绝。
+首次接管当前完整保留安装使用 `self_adopt`，之后通过 `self_switch` 选择另一份兼容的本地安装。候选需要提供实际环境、环境内 Python 入口和 MuLi 包的绝对路径；接口不会创建环境、下载依赖或执行候选来猜测兼容性。切换需要实际用户批准，路径格式和管理 API 见[本地托管切换](managed-operations.md)。
 
-所有文件修改要求服务已经停止、cgroup 为空，并真实持有现有 writer lease。正向只按配置→selector→unit，回退只按 unit→selector→配置，接受范围是该代冻结正向或反向前缀。不会把三个文件各自的允许值任意组合。已有 desired 内容也调用文件及父目录耐久确认；不存在的 legacy selector 同样确认父目录。selector 只支持本产品 canonical JSON，非 canonical 快照在 prepare 时拒绝，后端再核，不悄悄重新序列化旧证据。
+切换继续使用同一份业务数据库。失败时恢复的是程序安装和本次事务保存的配置，不用旧数据库备份覆盖切换后新增的消息、审批或投递记录；这也不提供跨数据库格式的迁移回退。
 
-unit 变化后，后端必要时执行有界 `daemon-reload`，再从 fresh manager 属性证明当前 unit 已加载。命令返回零不算确认。只有同 revision、完整三文件耐久确认、空 cgroup、真实 lease 和 fresh loaded unit 证据才能产生 `BindingConfirmation`；start 在效果前独立重做这些核验。旧 boot、错误 nonce、错误格式/安装/配置证明均不能提交。原 deadline 和回退保留时间不续期；未知 start 不重复发送；激活请求超时或取消后只重观察，不由该后端盲目重发。
+查看进度可使用 `self_status` 或：
 
-旧 `LinuxControllerBackend` 仅将原 loopback URL 与有限 nonce HTTP 收发提取为共享函数。protocol 1 的角色判断、proof 核验、效果门和响应语义保持。HTTP 不继承代理、不跟随重定向、不解压，仍限制原始响应 bytes，503 readiness 和传输超时保持原观察语义。
+```sh
+MuLi management status
+```
 
-验证使用临时 slot 元数据、真实文件 CAS/fsync 和 flock；systemd、进程观察和 HTTP 都是有界 fake。覆盖同配置 switch/adopt、三文件顺序、写入错误和取消后的前缀重入、loaded unit 未生效、坏 target 停止与 base 恢复、foreign 进程拒绝、原 deadline/revision/安装证据重验，以及未知 start/激活超时。
+请求已排队、helper 已接受或进程已启动，都不等于切换完成。以当前事务的最终状态和结果为准。
 
-2026-10-21 本地实测全部经统一守卫串行执行，每次硬期限 30 秒，资源上限未提高。新文件 31 项按不重叠主题分三批全部通过：11 项 18.48 秒、9 项 15.13 秒、11 项 12.10 秒；两份旧 V1 controller/backend 文件全 83 项通过，0.53 秒。3 份源码 mypy 与 4 份 Python Ruff/格式通过。最终测试峰值 62.2 MiB，整轮最高为 mypy 的 127.8 MiB，swap 0。
+## 中断后如何处理
 
-首轮整文件到 30 秒被守卫清理，未算通过；当时顺序夹具只记 `confirm`，漏记已经完成 file+parent fsync 的 `replace`，导致一条断言失败。仅修正该夹具观测后按主题分批验证，没有提升时间/内存预算或删除回退顺序断言。
+先查询已有事务，不要为结果未知的操作另建一次切换。运行中的宿主可通过 `self_recover` 接续；需要命令行恢复时使用 `MuLi management recover`，固定控制安装不依赖候选程序正常启动。宿主仍在运行时，应优先使用宿主恢复入口，确认可能丢失返回的绑定。自定义配置、数据路径和 HTTP 用法见[本地托管切换](managed-operations.md)。
 
-独立只读复审已通过：核对冻结前缀、正逆序、两次进程观察、writer/cgroup 门、损坏 target 的 stop-only 例外，以及 V1 HTTP 提取的原语义。复审未把上述 fake 回归视为真实服务验收。
+恢复沿用原事务和原期限，不自动重复结果未知的启动或激活请求。出现 `recovery_required` 时，先保留当前状态、journal 和控制者日志，再核查原因；未决事务期间会拒绝普通管理操作。常见状态说明见[Linux 恢复入口](linux-recovery-operations.md)。
 
-这些模块证据不能证明真实 systemd 用户 manager 的加载或真实服务 exec/激活成功；共享已安装目录被外部程序修改也不是沙箱隔离。生产调用链已接线，另有[真实进程验收](managed-process-recovery.md)；该验收仍使用合成 manager 边界，不代表操作过用户真实服务。
+## 安全与兼容限制
 
-单次同步 `_check` 中，若当前角色与 controller 的完整 `SlotIdentity` 相等，复用本次 `verify_anchor` 已完成的文件核验，不再重复扫描同一安装。不同 slot 即使共享完全相同的解释器仍分别核验；结果不跨 `_check` 保存，下一次 guard 会重新读取和核验文件。所有效果前和 await 后的 guard、文件耐久确认及原期限保持原样。远端分项证据与性能验证边界见[恢复核验计时](managed-recovery-timing-design.md)。
+- 目前面向 Linux、标准同用户 systemd 服务、可核验的 cgroup 和受支持的本地持久文件系统。自定义 unit、drop-in、身份不符或不受支持的存储会被拒绝；macOS、Windows 不具备本页所述的同等切换验收。
+- 控制安装、选中安装、解释器、包文件、兼容声明及实际服务进程都会核验。配置相同或共享一个基础 Python 文件，不代表两份安装身份相同。等待完成后重新认证，旧健康结果不能替代当前状态。
+- 切换事务改写配置、安装选择或服务文件前，必须确认服务停止、cgroup 为空并持有独占写入锁。服务管理命令返回成功，还需确认 systemd 实际加载了预期 unit。
+- 受损候选不会自动判为健康。只有反复核实为本事务登记的进程，才允许在恢复窗口停止它，再恢复仍完整的原安装；不允许据此停止身份不符的进程。
+- 托管状态目录需要满足私有权限及完整路径核验，安装文件仍须核对实际身份和内容。这些检查不是阻止同一用户或管理员修改共享安装的沙箱；手工改写安装、selector 或 unit 可能使事务拒绝继续。
+
+既有 protocol 1 仍沿用原后端和恢复流程；本页说明 protocol 2 托管模式。
+
+## 到哪里排查
+
+先查看 `MuLi management status` 中的状态和错误码，再保留对应控制者日志。安装或文件变化时核对[安装身份](installation-manifest.md)与[文件系统条件](filesystem-identity.md)；进程、cgroup 或已加载 unit 不符时核对[服务入口与实际进程](managed-probe.md)。不要通过删除事务、改名 helper 或放宽校验来绕过拒绝。
+
+开发者所需的完整认证合同、历次失败与验证记录保留在[托管后端技术归档](../devarchive/managed-backend-authentication-design.md)。归档中的阶段结果不代替当前候选的原生验收。

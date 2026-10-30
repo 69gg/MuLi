@@ -20,7 +20,7 @@ from muli.reply_origin import (
     channel_account,
     validate_channel_owners,
 )
-from muli.system_events import SystemEventsSettings
+from muli.system_event_settings import SystemEventsSettings
 
 
 class Section(BaseModel):

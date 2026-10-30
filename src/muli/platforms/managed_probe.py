@@ -24,9 +24,13 @@ from muli.platforms.linux_transaction import (
     _read_regular,
 )
 from muli.platforms.managed_deployment import DeploymentAnchor, SlotIdentity
-from muli.service import UserService
+from muli.service import UNIT, UserService
 
 _ROLES: tuple[Role, ...] = ("base", "target")
+_UNIT_PATH = "/org/freedesktop/systemd1/unit/" + "".join(
+    chr(byte) if 65 <= byte <= 90 or 97 <= byte <= 122 or 48 <= byte <= 57 else f"_{byte:02x}"
+    for byte in UNIT.encode("ascii")
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +162,9 @@ class ManagedSystemdProbe(SystemdProbe):
         deadline = loop.time() + self.limits.seconds
         try:
             async with asyncio.timeout(self.limits.seconds):
-                path = await self._unit_path(service.unit)
+                # Unit/Service property lookup loads the fixed description in
+                # each RPC, even after a stopped unit was garbage-collected.
+                path = _UNIT_PATH
                 before = await self._snapshot(path)
                 loaded = frozenset(
                     record.binding(role).unit.digest

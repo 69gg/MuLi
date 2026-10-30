@@ -31,6 +31,7 @@ from muli.managed_transaction import (
     raw_snapshot,
 )
 from muli.management_transaction import Deadline, Intent, Phase, Role, TransactionJournal, _snapshot
+from muli.platforms.installation import FileFingerprint
 from muli.platforms.linux_transaction import (
     ProbeLimits,
     ProcessIdentity,
@@ -46,6 +47,7 @@ from muli.platforms.managed_deployment import (
     SelectorValue,
     SlotIdentity,
 )
+from muli.platforms.managed_launcher import PackageProofs
 from muli.platforms.managed_probe import (
     ManagedProbeResult,
     ManagedSystemdProbe,
@@ -314,30 +316,66 @@ class ObservedBackend(ManagedLinuxBackend):
     selected_calls: int = 0
     selected_seconds: float = 0.0
 
-    def _check(self, record: TransactionRecordV2, role: Role | None = None) -> None:
+    def _check(
+        self,
+        record: TransactionRecordV2,
+        role: Role | None = None,
+        *,
+        verified_python: FileFingerprint | None = None,
+        verified_packages: PackageProofs | None = None,
+        observed_packages: PackageProofs | None = None,
+    ) -> None:
         from muli.platforms import managed_backend, managed_deployment
 
         started = time.monotonic()
         self.check_calls += 1
         controller_verify = managed_deployment.verify_slot_files
         # The backend's existing private import is the selected-role lookup seam.
-        selected_verify = cast(
-            Callable[[SlotIdentity], None], vars(managed_backend)["verify_slot_files"]
-        )
+        selected_verify = cast(Callable[..., None], vars(managed_backend)["verify_slot_files"])
 
-        def controller(slot: SlotIdentity) -> None:
+        def controller(
+            slot: SlotIdentity,
+            *,
+            verified_python: FileFingerprint | None = None,
+            verified_packages: PackageProofs | None = None,
+            observed_packages: PackageProofs | None = None,
+        ) -> None:
             before = time.monotonic()
             self.controller_calls += 1
             try:
-                controller_verify(slot)
+                if verified_packages is not None or observed_packages is not None:
+                    controller_verify(
+                        slot,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
+                elif verified_python is None:
+                    controller_verify(slot)
+                else:
+                    controller_verify(slot, verified_python=verified_python)
             finally:
                 self.controller_seconds += time.monotonic() - before
 
-        def selected(slot: SlotIdentity) -> None:
+        def selected(
+            slot: SlotIdentity,
+            *,
+            verified_python: FileFingerprint | None = None,
+            verified_packages: PackageProofs | None = None,
+            observed_packages: PackageProofs | None = None,
+        ) -> None:
             before = time.monotonic()
             self.selected_calls += 1
             try:
-                selected_verify(slot)
+                if verified_packages is None and observed_packages is None:
+                    selected_verify(slot, verified_python=verified_python)
+                else:
+                    selected_verify(
+                        slot,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
             finally:
                 self.selected_seconds += time.monotonic() - before
 
@@ -348,7 +386,18 @@ class ObservedBackend(ManagedLinuxBackend):
                 patch.object(managed_deployment, "verify_slot_files", controller),
                 patch.object(managed_backend, "verify_slot_files", selected),
             ):
-                super()._check(record, role)
+                if verified_packages is not None or observed_packages is not None:
+                    super()._check(
+                        record,
+                        role,
+                        verified_python=verified_python,
+                        verified_packages=verified_packages,
+                        observed_packages=observed_packages,
+                    )
+                elif verified_python is None:
+                    super()._check(record, role)
+                else:
+                    super()._check(record, role, verified_python=verified_python)
         finally:
             self.check_seconds += time.monotonic() - started
 
@@ -390,6 +439,13 @@ async def observed_step(
 
 
 async def controller(root: Path) -> None:
+    import logging
+
+    # This child's merged output is a fixed handshake protocol, not a log sink.
+    # Keep optional production diagnostics out of this fixture's control pipe.
+    logger = logging.getLogger("muli.management_controller")
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
     with TransactionJournal(root / "journal", root / "data/muli.sqlite3", create=False) as journal:
         anchor, slots = deployment(journal)
         with journal.locked() as control:

@@ -1,14 +1,14 @@
 # Windows UIA probe 的固定阶段证据
 
-最新候选：2026-10-30 在首 probe 的原 Stopwatch 构造两侧追加固定观察点；
-本片等待根统一守卫检查，真实 Windows 新观察待验。它不改变原 12 秒期限，
-也不代表启动超时的根因已经查明或修复。以下保留前序观察与验证记录。
-
-状态：原八阶段及后续三个输入阶段的纯回归与静态检查已完成；2.43 候选的 Windows
-3.12 首 probe 仍超时且没有可见阶段。本文末新增同次首 probe 观察，源码与纯回归已
-编写，等待根统一检查与独立后审；真实 Windows 新观察待验。
-独立于已冻结的 Invoke 片；
-不改变已发布标签，不把增加诊断写成已查明或修复启动超时。
+状态：原八/十一/十四阶段、同次首 probe 观察、native19 与 2.140 Stopwatch 边界的
+历史观察及验证记录分别保留。
+本次 PR37 整合沿用 main 的 probe 不初始化 walker 行为及原 UTF-8/响应合同，
+保留真实 `probe_process_ready`；两个旧 walker 阶段仅保留名称兼容，不再发出。
+当前合并两个 UIA 初始化阶段（14、15）与首 probe 原 Stopwatch 两侧阶段（16、17），
+共十八个名称、最多十六行实际输出，并保留固定行首达毫秒。合并前初始化诊断候选的
+本地 **65 passed、6 Windows skipped** 及独立后审无 P1/P2 属于当时记录；本次
+十八名称整合后的纯诊断与通知接缝五文件已通过根守卫回归，共 124 项；真实 Windows 新观察待验。原 12 秒期限不变，
+本片独立于已冻结的 Invoke 片，不改变已发布标签，也不代表启动超时的根因已查明或修复。
 
 ## 已知事实与目标
 
@@ -42,9 +42,11 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 ## 固定阶段与一次性规则
 
 每行只允许 ASCII 协议 `muli-uia-stage=1:<stage>` 加换行，不含时间、ID、参数或正文。
-每个 helper 用固定十一位状态保存已尝试阶段，每位先置位再尝试写出；每阶段最多一次，
-整生命周期最多十一行，LF 合计 361 字节、CRLF 合计 372 字节，均不超过 512 字节，
-不因重复 probe 或其他请求增长。
+每个 helper 使用十八个固定阶段位，保留旧编号 0–13，UIA 初始化名称追加为 14、15，
+Stopwatch 名称追加为 16、17；每位先置位再尝试写出，每阶段最多一次。当前 helper
+跳过两个旧 walker 阶段，整生命周期最多十六行，不因重复 probe 或其他请求增长。
+旧十四名称完整序列的 512 字节断言继续作为兼容样本保留；当前十八名称全集核在原
+2048 字节 stderr 前缀内，不能把 512 字节称为新完整序列的上限。
 
 | stage | 紧邻的代码位置与能够证明的事实 |
 | --- | --- |
@@ -55,15 +57,23 @@ PowerShell，不替换 MTA，不改执行策略，不派生其他命令，也不
 | `input_line_received` | 首次有界读取返回非 null 值，即已取得 LF 结束的一整行；不证明 JSON 合法 |
 | `request_decoded` | 首次原 `ConvertFrom-Json` 调用返回后；尚未通过版本、ID 与 limits 校验 |
 | `probe_received` | 首个 probe 的原帧、版本与 limits 校验通过后，初始化前 |
+| `watch_starting` | 新编号 16；首个合法 probe 的原 `Stopwatch.StartNew()` 调用前 |
+| `watch_ready` | 新编号 17；同一原 Stopwatch 构造返回后，不证明其后的 UIA 初始化已完成 |
 | `uia_initializing` | 首次 `Initialize-Uia` 的版本/MTA/程序集检查开始前 |
+| `uia_host_validated` | 新编号 14；原 PowerShell 5.1 与 MTA 校验通过后、原 `Add-Type` 前 |
+| `uia_add_type_returned` | 新编号 15；原 `Add-Type` 返回后、原两项 GAC 校验前，不代表 GAC 校验已通过 |
 | `uia_ready` | 原 GAC 检查通过并设置 ready 后 |
+| `walker_initializing` | native19 历史 probe 的 getter 紧前；当前 probe 不初始化 walker，此名称仅作历史兼容 |
+| `walker_ready` | native19 历史 getter 返回后；当前 helper 不发出，不冒充当前 probe 已执行 getter |
+| `probe_process_ready` | probe 的原 `GetCurrentProcess`、`MainWindowHandle` 读取及 `Dispose` 全部返回后 |
 | `probe_encoded` | 首个 probe 的原成功 `Encode-Result` 返回后，原末次 deadline 检查前 |
 | `probe_write_returned` | 该成功 probe 的原 `$writer.WriteLine` 返回后；不是宿主已收到的证明 |
 
 三个 input 阶段仅位于 `requestCount=0` 分支，不能在解码前声称输入就是 probe。
-前三级和 UIA 初始化各只尝试一次；probe 的三级仅跟踪首个合法 probe，失败也不为
-后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求十一级全序；
-本次 CI 的新建 once probe 才核上述顺序。错误回执不冒充成功 encoded/write 阶段。
+前三级和 UIA 初始化各只尝试一次；probe 的固定阶段仅跟踪首个合法 probe，失败也不为
+后续 probe 重置。非 probe 可能先完成 UIA 初始化，因此一般会话不要求十八级全序；
+当前 CI 新建 once probe 核上述顺序中跳过两个旧 walker 名称的十六阶段子序列。
+错误回执不冒充成功 encoded/write 阶段，也不为补齐历史阶段重新执行 walker getter。
 
 标记通过 `[Console]::Error.WriteLine` 与 Flush 写出；仅固定字符串，整个写入置于
 best-effort try/catch，不使用 Write-Error 或异常格式化，不输出 `$Error`。
@@ -73,13 +83,20 @@ best-effort try/catch，不使用 Write-Error 或异常格式化，不输出 `$E
 
 ## 仅 CI 失败时导出
 
-首个 probe 用例保留原异常对象，沿既有 owner 收尾后再附加至多 4 KiB 的固定 JSON
-note；不得新增等待期限、跳过失败、改变异常 code/outcome 或让诊断/收尾异常覆盖
+首个 probe 用例保留原异常对象，沿既有 owner 收尾后再附加至多 4096 ASCII 字节
+（含前缀及前后两份快照）的固定 JSON note；不得新增等待期限、跳过失败、改变
+异常 code/outcome 或让诊断/收尾异常覆盖
 原异常。成功路径的清理失败仍是失败；取消仍传播。生产工具/API 不展示 stderr。
 
-投影只读取现有 2048 字节前缀，按完整 LF/CRLF 行精确匹配十一个固定标记；未知原文、
+测试侧的 stderr 包装每次只调用原 `read(size)` 一次，原字节完整返回给原 reader
+计费和保留；不增加 reader、读取或等待。`stage_arrival_ms` 仅记录原保留前缀内
+固定完整 LF/CRLF 行首次被读取时、相对同次 probe 开始的毫秒，向下取整并限于
+0 至 `2**31-1`，重复行不覆盖。它是宿主观察到完整行的时间，不是脚本执行时间；
+时钟或投影故障不能改变原管道、错误对象或清理。
+
+投影只读取现有 2048 字节前缀，按完整 LF/CRLF 行精确匹配十八个固定标记；未知原文、
 不完整行和非 ASCII 内容不导出。重复或乱序标为 `stage_sequence=invalid`，不据此
-推断业务成功。至多十一个枚举及固定标量：`stderr_prefix_capped`、发送计数 0/1、
+推断业务成功。至多十八个阶段枚举、对应首达毫秒及固定标量：`stderr_prefix_capped`、发送计数 0/1、
 lease.closed、process 存在、退出类别 running/zero/nonzero/unavailable、readers 是否
 全部终态、cleanup confirmed/unconfirmed。reader 终态不等于已读到 EOF；前缀达到
 上限只表示可能截断，不声称完整诊断。无路径、PID、nonce、环境、provider 名称、
@@ -97,10 +114,14 @@ cleanup discard 读到的阶段也可进入失败投影，并增加 `stderr_obse
 它的写出时间。未附着、观察失败或截断时仍不能把空前缀解释成无输出。下文保留
 先前候选的验证记录，这项诊断改进不代表原生响应超时的根因已解决。
 
+首达时间与清理前缀共用原 stderr 读取路径：正常 reader 同时记录完整行首达与有界前缀，
+清理 discard 只补前缀和实际 EOF，不给清理时才读到的阶段补造早先的到达时间。
+
 ## 验收与官方依据
 
-先用纯替身核十一行及字节上界、重复 probe 不新增标记（静态协议检查）、任意分块与
-CRLF/半行、未知/重复/乱序输入、2048 字节截断、完整 JSON note 预算。假 lease
+先用纯替身核旧十四名称兼容、当前十八名称和十六处调用及字节上界、重复 probe
+不新增标记（静态协议检查）、任意分块与 CRLF/半行、未知/重复/乱序输入、
+2048 字节截断、完整 JSON note 预算。假 lease
 事件门控证明 note 在自有清理后生成、原异常身份/outcome 和取消保留、清理失败不
 伪称回收；既有 reader 继续证明 stderr 全部计费。禁止在 Linux 启动 PS 或桌面。
 真实 Windows CI 保留现有 probe/三项只读与新增 Invoke 断言；失败 note 来自实际包内
@@ -282,8 +303,9 @@ PowerShell 阶段表在末尾追加物理索引 16、17，旧索引 0–15 保�
 `uia_initializing`。缺少任一新阶段的旧记录仍是合法子序列；重复或逆序仍标为
 invalid。`watch_ready` 只能证明原构造已返回；没有后续阶段不证明初始化未开始。
 
-既有十四阶段 `STAGES` 与其 512 字节夹具保持冻结，新增 `WATCH_STAGES` 后
-另行构成包含十八个名称的 `ALL_STAGES`，按原 `MAX_STDERR_BYTES=2048`
+既有十四阶段 `STAGES` 与其 512 字节夹具保持冻结，合并
+`UIA_INITIALIZATION_STAGES` 与 `WATCH_STAGES` 后另行构成包含十八个名称的
+`ALL_STAGES`，按原 `MAX_STDERR_BYTES=2048`
 核验完整白名单。原 1 MB 总计费、4 KiB note 预算、一次请求、TTL、绝对 12 秒
 和清理 owner 均不改变；新增标记自身的开销仍计入该次原期限。
 
@@ -292,3 +314,54 @@ invalid。`watch_ready` 只能证明原构造已返回；没有后续阶段不�
 预算测试同时覆盖新阶段。未启动本机 PowerShell、真实子进程或桌面；所有检查
 由根串行执行并收取守卫终态，尚未将本片计为已验证。下一次正常托管 CI 再核
 原生 probe 与清理，不通过增加期限、重试或跳过失败取得通过。
+
+## native19 Windows 3.13：初始化之后的最小分叉（候选待验）
+
+以下保留 native19 的历史失败与当时方案，不作为当前 helper 的执行顺序。
+原 run `40029000745` 的 Windows 3.13 job `120672256773` 唯一失败仍为首个
+`test_real_windows_system_module_probe_mta_and_owned_unicode_tree`：`read_timeout`，
+调用 12.23 秒；全任务为 3692 passed、2017 skipped、1 failed，151.31 秒。
+原 note 的十一阶段协议观察至 `uia_ready`，序列 valid、sent1、前缀未达 cap；
+清理后的 lease closed/process handle exists/exit nonzero/readers settled/cleanup
+confirmed 只证明该拥有生命周期已收口，不证明 helper 在超时前自然异常退出。
+
+当时 `uia_ready` 之后的成功路径仍含 `TreeWalker.ControlViewWalker` 静态 getter、
+两个有限容器构造、当前 Process 的 `MainWindowHandle` 和 `Dispose`、字段构造与
+JSON 编码。该 probe 没有调用 `Read-Targets`、`RootElement` 或读取窗口树，不能
+把窗口 provider 遍历当已证明原因。原阶段没有时间戳，12 秒覆盖完整 operation，
+也不能区分哪一步阻塞或 `uia_ready` 是否临近总期限才出现。
+
+native19 当时在 getter 前后及当前进程属性读取/释放之后追加编号 11–13，分别为
+`walker_initializing`、`walker_ready`、`probe_process_ready`，沿原 best-effort writer，
+不增进程、重试、预热或期限。其原纯回归曾核唯一调用、阶段顺序、旧八/十一阶段兼容、
+重复/逆序和逐字节截断，不能替代真实 PowerShell 执行与因果证明。
+
+该历史候选由根在原 30 秒守卫内串行验收：diagnostics、pending observation 与
+computer 三文件共 **68 passed**，pytest0.34s、守卫889ms、65.6MiB、swap0、exit0；
+相关 Python Ruff/格式及明确 `MYPYPATH=src:tests` 的限定 strict mypy 通过，
+类型检查守卫5.972s、331.6MiB、swap0、exit0。没有真实 PowerShell、进程或桌面。
+这些是合并前候选的记录，不证明本次整合通过或原 native19 超时根因已修复。
+
+## PR37 与当前 main 整合
+
+main 已将 walker、rows、reasons 与 visited 的初始化放入非 probe 分支。本次采用此
+行为，不能为保留两条历史标记而重新让 probe 访问 walker，也不能在没有实际 getter
+调用时输出 ready 标记。旧十四名称及原编号保留，读者仍可识别旧八、十一与十四
+阶段；合并 UIA 初始化编号 14、15 与 Stopwatch 编号 16、17 后，当前十八个名称
+只发十六个实际边界，包含当前进程读取和 Dispose 返回后的编号 13。
+原 UTF-8 输入、无 BOM 且严格编码的 stdout writer、成功/错误响应帧、Invoke outcome
+和最后写回路径不因冲突处理改变。
+
+对应回归核当前十六处 emitter、非 probe guard 中唯一 getter、真实 process-ready
+和原程序集调用的相对顺序；旧十四名称 codec、首达行分块/重复/未知/截断、完整
+4096 字节 note、原错误及取消身份、完整 stderr 计费和准确 owner 清理均保留。
+新增 Windows 程序集失败负控仅在临时脚本副本中将唯一原 `Add-Type` 调用替为固定
+throw，不替换正式 native 正控的包内 helper、真实窗口树或 Invoke 验收。
+
+合并前 PR37 初始化诊断候选的本地结果为 **65 passed、6 Windows skipped**，独立
+后审无 P1/P2；它不证明本次十八名称整合已通过本机检查或真实 Windows 验证。
+原 12 秒、2048 字节 stderr 前缀及 4096 字节 note 未放宽，本次真实新增 Windows
+用例尚待远端。Native49 `e135d4f` 的十二项通用作业成功（含 Windows）属于此前
+候选，不能证明当时十六名称初始化扩展或本次十八名称整合已实测，也不抹去
+Native48 Windows 3.12 的两个真实超时：
+一个阶段未观察到且 stderr 为空，另一个到达 `uia_initializing`；两者均确认 cleanup。

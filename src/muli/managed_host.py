@@ -43,7 +43,7 @@ from muli.platforms.managed_deployment import (
     DeploymentAnchor,
     DeploymentStore,
     SlotIdentity,
-    verify_current_slot,
+    verify_current_process,
 )
 from muli.platforms.managed_launcher import resolve_entry
 from muli.platforms.managed_probe import ManagedSystemdProbe
@@ -100,7 +100,8 @@ def _entry(root: Path) -> _Entry:
         ):
             raise TransactionError("managed_entry_changed")
         store.verify_anchor(anchor)
-        verify_current_slot(controller)
+        # The adjacent anchor check already authenticated these controller files.
+        verify_current_process(controller)
         if store.directory.read("state.json", anchor.journal.max_record_bytes) != data:
             raise TransactionError("managed_entry_changed")
         return _Entry(record, anchor, controller)
@@ -132,11 +133,14 @@ def _record(
     # constructing an application connection/configuration writer.
     _read_file(Path(anchor.config_path), 0, contents=False, private_owner=True)
     _read_file(journal.database, 0, contents=False, private_owner=True)
-    with DeploymentStore(journal.directory.path, journal.limits) as store:
-        if store.read_anchor(anchor.digest) != anchor:
+    with (
+        DeploymentStore(journal.directory.path, journal.limits) as store,
+        store._metadata_scope() as metadata,
+    ):
+        if metadata.read_anchor(anchor.digest) != anchor:
             raise TransactionError("managed_deployment_changed")
-        store.verify_anchor(anchor)
-        controller = store.read_slot(anchor.controller_slot)
+        metadata.verify_anchor(anchor)
+        controller = metadata.read_slot(anchor.controller_slot)
         record = control.read_current()
         if not isinstance(record, TransactionRecordV2):
             raise TransactionError("managed_transaction_required")
@@ -149,7 +153,7 @@ def _record(
         slots: dict[Role, SlotIdentity] = {}
         for role in _ROLES:
             binding = record.binding(role)
-            slot = store.read_slot(binding.installation)
+            slot = metadata.read_slot(binding.installation)
             if slot.compatibility_digest != binding.compatibility:
                 raise TransactionError("managed_compatibility_changed")
             read_snapshots(journal, record, role)
@@ -236,9 +240,13 @@ async def run_managed_helper(
 ) -> TransactionRecordV2:
     entry = _entry(root)
     anchor, limits = entry.anchor, entry.anchor.helper
-    observed = probe or ManagedSystemdProbe(
-        runner=runner, limits=ProbeLimits(seconds=limits.operation_timeout / 4)
-    )
+    observed = probe
+    if observed is None:
+        observed = ManagedSystemdProbe(
+            runner=runner,
+            limits=ProbeLimits(seconds=limits.operation_timeout / 4),
+            join_interface_reads=runner is run_process,
+        )
     if observed.limits.seconds > limits.operation_timeout / 4:
         raise TransactionError("invalid_probe_timeout")
     with TransactionJournal(
@@ -253,7 +261,9 @@ async def run_managed_helper(
                 current, current_controller, _ = _record(control, anchor)
                 if current.generation != original.generation or current_controller != controller:
                     raise TransactionError("transaction_changed")
-                verify_current_slot(controller)
+                # _record just authenticated all controller files. Only the
+                # current process identity remains in this synchronous segment.
+                verify_current_process(controller)
                 snapshot = await observed.read_helper(
                     managed_helper_unit_name(original),
                     managed_helper_arguments(anchor, controller),
@@ -261,9 +271,10 @@ async def run_managed_helper(
                 )
                 if snapshot.process.pid != os.getpid():
                     raise TransactionError("foreign_helper_process")
-                verify_current_slot(controller)
-                if _record(control, anchor)[0] != current:
+                after, after_controller, _ = _record(control, anchor)
+                if after != current or after_controller != controller:
                     raise TransactionError("transaction_changed")
+                verify_current_process(controller)
 
             # Authenticate the real helper before creating even a backend
             # client; each subsequent drive step repeats this authentication.
@@ -280,11 +291,20 @@ async def run_managed_helper(
                 operation_timeout=limits.operation_timeout,
             ) as backend:
                 driver = ManagedTransactionController(
-                    control, backend, clock, operation_timeout=limits.operation_timeout
+                    control,
+                    backend,
+                    clock,
+                    operation_timeout=limits.operation_timeout,
+                    verify_continuation=verify_helper,
                 )
 
                 def read() -> TransactionRecordV2:
-                    return _record(control, anchor)[0]
+                    # drive_loop has just authenticated the helper; this fresh
+                    # read only detects progress before the driver's own guards.
+                    record = control.read_current()
+                    if not isinstance(record, TransactionRecordV2):
+                        raise TransactionError("managed_transaction_required")
+                    return record
 
                 return await drive_loop(
                     driver.step, read, backend.observe, limits, clock, verify_helper
