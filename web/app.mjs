@@ -84,6 +84,8 @@ const attachmentCollectionAttempts = new Map();
 let taskDialog = null;
 let taskDirectory = null;
 let taskDirectoryDialog = null;
+let ownerQuestionDialog = null;
+const ownerQuestionAttempts = new Map();
 const taskDirectoryPageSize = 20;
 const taskStatusLabels = { open: "待办", in_progress: "进行中", blocked: "受阻", done: "已完成", cancelled: "已取消" };
 let memoryDialog = null;
@@ -233,6 +235,7 @@ function invalidateConnection() {
   closeChannelDeliveryDialog();
   releaseCapabilityCatalog();
   releaseTaskDirectory();
+  releaseOwnerQuestionDialog({ close: true });
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -1022,6 +1025,13 @@ function renderHistoryDialog(slot) {
   }
 }
 
+function acceptChatSubmission(result) {
+  if (result.message) state.session = applyEvent(state.session, { type: "message.completed", data: { message: result.message } });
+  const alreadyFinished = state.session.runId === result.run_id && ["completed", "cancelled", "failed"].includes(state.session.status);
+  state.session.runId = result.run_id;
+  if (!isRunning(state.session.status) && !alreadyFinished) state.session.status = "running";
+}
+
 async function sendMessage(event) {
   event.preventDefault();
   const input = $("#message-input");
@@ -1046,10 +1056,7 @@ async function sendMessage(event) {
     try {
       const result = await request(`/sessions/${encodeURIComponent(targetSession.id)}/messages`, { method: "POST", body: { content, mode, attachment_ids: attachments.map((file) => file.id) } });
       if (stillCurrent()) {
-        if (result.message) state.session = applyEvent(state.session, { type: "message.completed", data: { message: result.message } });
-        const alreadyFinished = state.session.runId === result.run_id && ["completed", "cancelled", "failed"].includes(state.session.status);
-        state.session.runId = result.run_id;
-        if (!isRunning(state.session.status) && !alreadyFinished) state.session.status = "running";
+        acceptChatSubmission(result);
         state.sending = false;
         if (result.queued && wasRunning) toast("补充消息已排队");
       }
@@ -1099,6 +1106,7 @@ function resizeComposer() {
 }
 
 function openDialog({ title, content, submitLabel = "保存", danger = false, readOnly = false, returnMemoryId = null, returnMemoryTrigger = null, returnUploadTrigger = null, onSubmit }) {
+  releaseOwnerQuestionDialog();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
   releaseMemorySourceRetry();
@@ -1162,6 +1170,7 @@ function emptyState(iconName, title, description) {
 
 async function switchView(view, owner = connection) {
   if (!connectionCurrent(owner) || !owner.ready) return;
+  releaseOwnerQuestionDialog({ close: true });
   if (channelDeliveryDialog && (view !== "settings" || state.settingsTab !== "channels")) closeChannelDeliveryDialog();
   if (view !== "settings") releaseCapabilityCatalog();
   releaseAnswerSpeech();
@@ -1847,7 +1856,8 @@ function renderTaskDirectoryBrief(slot) {
   if (slot.detail?.brief && accurate && !slot.dirty && !slot.error && !slot.controller) {
     const detail = slot.detail;
     const question = element("button", { type: "button", class: "primary-button", text: "带着任务提问", disabled: !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareTaskQuestion(slot, detail, question) });
-    slot.actions.append(question);
+    const pending = element("button", { type: "button", class: "secondary-button", text: "待回答的问题", onClick: () => { if (taskDirectoryDialogCurrent(slot) && slot.actions.contains(pending) && !pending.disabled) void showOwnerQuestions(slot); } });
+    slot.actions.append(question, pending);
   }
 }
 
@@ -1898,6 +1908,247 @@ async function prepareTaskQuestion(slot, detail, trigger) {
   resizeComposer(); input.focus();
 }
 
+function ownerQuestionCurrent(slot) {
+  return !!slot && ownerQuestionDialog === slot && connectionCurrent(slot.owner) && slot.owner.ready && state.auth.authenticated && state.connected
+    && slot.viewVersion === viewRequestVersion && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content
+    && (slot.mainId ? state.view === "chat" && state.mainSessionId === slot.mainId && state.activeSession?.id === slot.mainId : taskDirectoryCurrent(slot.directory));
+}
+
+function releaseOwnerQuestionDialog({ close = false } = {}) {
+  const slot = ownerQuestionDialog; ownerQuestionDialog = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  if (slot.sending) { slot.sending = false; state.sending = false; renderComposer(); }
+  if ($("#dialog-content").firstElementChild === slot.content) { dialogSubmit = null; if (close) $("#app-dialog").close(); }
+  slot.content.replaceChildren();
+}
+
+function ownerQuestionPage(page, taskId, status, cursor, starts) {
+  const invalid = () => { throw new Error("问题目录响应不完整，请重新读取。"); };
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!page || page.id !== taskId || page.section !== "owner_questions" || page.question_status !== status || page.authority !== "coordination_data" || page.source_completeness !== "candidate_window_only" || !/^[a-f0-9]{64}$/.test(page.revision) || !Array.isArray(page.items) || page.items.length > taskDirectoryPageSize || ["scanned", "omitted", "unavailable"].some((field) => !count(page[field])) || page.items.length > page.scanned || typeof page.has_more !== "boolean") invalid();
+  const seen = new Set();
+  for (const item of page.items) {
+    if (!item || !/^oq:[a-f0-9]{64}:[a-f0-9]{64}$/.test(item.question_id) || item.record_id !== item.question_id || seen.has(item.question_id) || !/^[a-f0-9]{64}$/.test(item.record_revision) || item.task_id !== taskId || typeof item.worker_id !== "string" || !item.worker_id || !["open", "answered", "cancelled", "stale"].includes(item.status) || status !== "all" && item.status !== status || !["open", "answered", "cancelled"].includes(item.recorded_status) || !["current", "paused", "stale", "unavailable"].includes(item.binding) || ["dispatch_allowed", "answered", "answer_recorded", "queued", "claimed"].some((field) => typeof item[field] !== "boolean") || !["not_dispatched", "queued", "claimed", "cancelled"].includes(item.delivery_state) || item.answered !== item.answer_recorded || item.queued !== (item.delivery_state === "queued") || item.claimed !== (item.delivery_state === "claimed") || item.dispatch_allowed && !(item.status === "answered" && item.binding === "current" && item.answer_recorded && item.delivery_state === "not_dispatched")) invalid();
+    seen.add(item.question_id);
+  }
+  if (page.has_more ? typeof page.next_cursor !== "string" || !page.next_cursor || page.next_cursor === cursor || starts.includes(page.next_cursor) : page.next_cursor !== null) invalid();
+  return page;
+}
+
+function ownerQuestionPath(taskId, { status, cursor = null, revision = null } = {}) {
+  const params = new URLSearchParams({ section: "owner_questions", question_status: status, limit: String(taskDirectoryPageSize) });
+  if (cursor !== null) params.set("cursor", cursor);
+  if (revision !== null) params.set("revision", revision);
+  return `/commitments/${encodeURIComponent(taskId)}/inspection?${params}`;
+}
+
+function questionWorker(identifier) {
+  return state.team.members.find((member) => member.id === identifier)?.name || identifier;
+}
+
+function questionState(item, record = null) {
+  if (item.status === "stale" || ["stale", "unavailable"].includes(item.binding)) return "原任务或资料已变化，问题仅供核查";
+  if ((record?.status ?? item.recorded_status) === "cancelled") return "问题已关闭";
+  const delivery = record ? record.delivery?.state ?? "not_dispatched" : item.delivery_state;
+  if (delivery === "claimed") return "原队友已领取答案，任务是否完成仍需核查";
+  if (delivery === "queued") return "答案已排队，原队友尚未领取";
+  if (delivery === "cancelled") return "交回已取消";
+  return (record ? record.answer !== null : item.answer_recorded) ? "答案已保存，尚未交回原队友" : item.binding === "paused" ? "待回答；原任务已暂停，可只保存答案" : "待主人回答";
+}
+
+async function showOwnerQuestions(detail) {
+  if (!taskDirectoryDialogCurrent(detail) || !detail.detail || detail.controller || detail.dirty || detail.error) return;
+  const slot = { owner: detail.owner, directory: detail.directory, taskId: detail.identifier, viewVersion: viewRequestVersion, content: element("div", { class: "task-brief" }), status: "open", cursor: null, starts: [null], page: null, controller: null, error: "", item: null, record: null, chunks: [], offset: 0, total: null, recordRevision: null, phase: "reading" };
+  openDialog({ title: "待回答的问题", content: slot.content, readOnly: true }); ownerQuestionDialog = slot;
+  await loadOwnerQuestions(slot);
+}
+
+async function loadOwnerQuestions(slot, { status = slot.status, cursor = null, starts = [null], revision = null } = {}) {
+  if (!ownerQuestionCurrent(slot) || slot.mainId) return;
+  slot.controller?.abort(); const controller = slot.controller = new AbortController();
+  Object.assign(slot, { status, cursor, starts: [...starts], page: null, item: null, record: null, chunks: [], offset: 0, total: null, error: "" }); renderOwnerQuestions(slot);
+  const current = () => ownerQuestionCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const page = await ownedRequest(ownerQuestionPath(slot.taskId, { status, cursor, revision }), { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (current()) slot.page = ownerQuestionPage(page, slot.taskId, status, cursor, starts);
+  } catch (error) { if (current()) slot.error = error.message; }
+  finally { if (current()) { slot.controller = null; renderOwnerQuestions(slot); } }
+}
+
+function ownerQuestionRecord(value, slot) {
+  if (!value || value.id !== slot.item.record_id || value.task_id !== slot.taskId || value.worker_id !== slot.item.worker_id || value.main_id !== state.mainSessionId || value.version !== 1 || typeof value.message !== "string" || !value.message.trim() || !["open", "answered", "cancelled"].includes(value.status) || !Array.isArray(value.attachment_ids) || value.attachment_ids.some((id) => typeof id !== "string" || !id) || !value.author || typeof value.author.run_id !== "string" || !Number.isSafeInteger(value.author.generation) || value.author.generation < 1 || value.answer !== null && (!value.answer || typeof value.answer.owner?.body !== "string" || !value.answer.owner.body.trim()) || value.delivery !== null && (!value.delivery || !["queued", "claimed", "cancelled"].includes(value.delivery.state))) throw new Error("问题原文响应不完整，请重新核对。");
+  return value;
+}
+
+function ownerQuestionContentPage(page, slot, offset, total, revision) {
+  const budget = (state.status?.limits?.max_context_chars ?? $("#message-input").maxLength) * 4;
+  if (!page || page.id !== slot.taskId || page.section !== "owner_questions" || page.record_id !== slot.item.record_id || !/^[a-f0-9]{64}$/.test(page.record_revision) || revision && page.record_revision !== revision || page.authority !== "coordination_data" || page.field !== "content" || typeof page.content !== "string" || ["offset_bytes", "length_bytes", "next_offset_bytes", "total_bytes"].some((field) => !Number.isSafeInteger(page[field]) || page[field] < 0) || page.offset_bytes !== offset || page.length_bytes !== new TextEncoder().encode(page.content).length || page.next_offset_bytes !== offset + page.length_bytes || page.next_offset_bytes > page.total_bytes || typeof page.has_more !== "boolean" || page.has_more !== (page.next_offset_bytes < page.total_bytes) || page.has_more && !page.length_bytes || total !== null && total !== page.total_bytes || !Number.isSafeInteger(budget) || budget <= 0 || page.total_bytes > budget) throw new Error("问题原文范围或版本无法完整核对，请重新读取。");
+  return page;
+}
+
+async function loadOwnerQuestionRecord(slot, item, { append = false } = {}) {
+  if (!ownerQuestionCurrent(slot) || slot.controller) return;
+  if (!append) Object.assign(slot, { item, record: null, chunks: [], offset: 0, total: null, recordRevision: item.record_revision });
+  const controller = slot.controller = new AbortController(), offset = slot.offset;
+  slot.error = ""; renderOwnerQuestions(slot);
+  const current = () => ownerQuestionCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const params = new URLSearchParams({ section: "owner_questions", record_id: item.record_id, offset_bytes: String(offset) });
+    if (slot.recordRevision) params.set("record_revision", slot.recordRevision);
+    const page = await ownedRequest(`/commitments/${encodeURIComponent(slot.taskId)}/inspection?${params}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    ownerQuestionContentPage(page, slot, offset, slot.total, slot.recordRevision);
+    slot.recordRevision = page.record_revision; slot.total = page.total_bytes; slot.offset = page.next_offset_bytes; slot.chunks.push(page.content);
+    if (!page.has_more) { slot.record = ownerQuestionRecord(JSON.parse(slot.chunks.join("")), slot); slot.chunks = []; }
+  } catch (error) { if (current()) { slot.error = error.message; if (slot.mainId) slot.bindingUnverified = true; } }
+  finally { if (current()) { slot.controller = null; renderOwnerQuestions(slot); } }
+}
+
+async function refreshOwnerQuestionState(slot) {
+  if (!ownerQuestionCurrent(slot) || slot.controller || !["accepted", "unknown"].includes(slot.phase)) return;
+  const controller = slot.controller = new AbortController();
+  const current = () => ownerQuestionCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  slot.bindingUnverified = true; renderOwnerQuestions(slot);
+  try {
+    // A question can leave the open filter when its answer is saved. Never
+    // scan later windows automatically to recover its current binding.
+    const payload = await ownedRequest(ownerQuestionPath(slot.taskId, { status: "all" }), { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    const page = ownerQuestionPage(payload, slot.taskId, "all", null, [null]);
+    const item = page.items.find((entry) => entry.record_id === slot.item.record_id);
+    if (!item || item.worker_id !== slot.item.worker_id) throw new Error("当前窗口无法核对原问题绑定，任务或问题可能已变化；请回到任务目录继续核查。");
+    slot.item = item; slot.bindingUnverified = false; slot.controller = null;
+    await loadOwnerQuestionRecord(slot, item);
+  } catch (error) { if (current()) slot.error = error.message; }
+  finally { if (current()) { slot.controller = null; renderOwnerQuestions(slot); } }
+}
+
+function questionReadView(slot) {
+  const root = element("section", { "aria-label": "原问题与回答" }), item = slot.item, record = slot.record;
+  if (!item) return root;
+  root.append(element("h3", { text: `原队友：${questionWorker(item.worker_id)}` }), element("p", { class: "task-control-note", text: slot.bindingUnverified ? "当前绑定尚未核查，以下仅为上次读取的原文。" : questionState(item, record) }));
+  if (!record) {
+    root.append(element("p", { text: slot.total === null ? "正在核对完整问题…" : `已读取 ${slot.offset}/${slot.total} 字节，尚未读完完整问题。` }));
+    if (!slot.controller && !slot.error && slot.total !== null && slot.offset < slot.total) {
+      const next = element("button", { type: "button", class: "text-button", text: "继续读取问题", onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(next) && slot.content.contains(root) && slot.item === item && !slot.controller) void loadOwnerQuestionRecord(slot, item, { append: true }); } }); root.append(next);
+    }
+    return root;
+  }
+  root.append(element("pre", { class: "memory-source-content", text: record.message }));
+  if (record.attachment_ids.length) root.append(element("p", { class: "task-control-note", text: `原问题附件：${record.attachment_ids.join("、")}` }));
+  root.append(element("p", { class: "task-control-note", text: `登记运行 ${record.author.run_id} · 原队友第 ${record.author.generation} 轮` }));
+  if (record.answer) root.append(element("h4", { text: "已保存的原答" }), element("pre", { class: "memory-source-content", text: record.answer.owner.body }));
+  return root;
+}
+
+function questionAnswerAllowed(item, action) {
+  return action === "continue" ? item.dispatch_allowed : item.status === "open" && (action === "record_only" ? ["current", "paused"].includes(item.binding) : action === "dispatch" && item.binding === "current");
+}
+
+function renderOwnerQuestions(slot) {
+  if (!ownerQuestionCurrent(slot)) return;
+  const root = slot.content; root.replaceChildren();
+  if (slot.mainId) { renderOwnerQuestionAnswer(slot); return; }
+  const filter = element("select", { "aria-label": "问题状态", onChange: () => { if (ownerQuestionCurrent(slot) && root.contains(filter)) void loadOwnerQuestions(slot, { status: filter.value }); } }, element("option", { value: "open", text: "未回答" }), element("option", { value: "all", text: "全部问题" })); filter.value = slot.status;
+  const refresh = element("button", { type: "button", class: "text-button", text: "刷新问题", disabled: !!slot.controller, onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(refresh) && !refresh.disabled) void loadOwnerQuestions(slot); } });
+  root.append(element("div", { class: "content-toolbar" }, filter, refresh));
+  if (slot.controller) root.append(element("p", { role: "status", text: "正在读取问题…" }));
+  if (slot.error) root.append(element("p", { role: "alert", class: "form-error", text: slot.error }));
+  const page = slot.page;
+  if (page) {
+    if (page.omitted || page.unavailable) root.append(element("p", { class: "task-control-note", text: `本页遗漏 ${page.omitted} 条、不可核查 ${page.unavailable} 条；不能据此判断问题已查全。` }));
+    if (!page.items.length) root.append(element("p", { text: page.has_more ? "本窗口没有匹配问题，仍有后页。" : page.omitted || page.unavailable ? "本页没有可展示的问题。" : "本次筛选没有登记的问题。" }));
+    for (const item of page.items) {
+      const select = element("button", { type: "button", class: "text-button", text: "查看原问题", dataset: { ownerQuestion: item.question_id }, disabled: !!slot.controller, onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(select) && !select.disabled && slot.page?.items.includes(item)) void loadOwnerQuestionRecord(slot, item); } });
+      root.append(element("article", { class: "record-row" }, element("div", { class: "row-content" }, element("strong", { text: questionWorker(item.worker_id) }), element("p", { text: questionState(item) })), select));
+    }
+    const previous = element("button", { type: "button", class: "text-button", text: "上一页问题", disabled: !!slot.controller || slot.starts.length < 2, onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(previous) && !previous.disabled) void loadOwnerQuestions(slot, { cursor: slot.starts.at(-2), starts: slot.starts.slice(0, -1), revision: page.revision }); } });
+    const next = element("button", { type: "button", class: "text-button", text: "继续翻阅问题", disabled: !!slot.controller || !page.has_more, onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(next) && !next.disabled) void loadOwnerQuestions(slot, { cursor: page.next_cursor, starts: [...slot.starts, page.next_cursor], revision: page.revision }); } });
+    root.append(element("nav", { class: "team-pagination", "aria-label": "问题目录分页" }, previous, element("span", { text: `第 ${slot.starts.length} 页` }), next));
+  }
+  root.append(questionReadView(slot));
+  if (slot.record && !slot.error && !slot.controller && (questionAnswerAllowed(slot.item, "record_only") || questionAnswerAllowed(slot.item, "continue"))) {
+    const answer = element("button", { type: "button", class: "primary-button", text: slot.item.answer_recorded ? "到主对话交回原答" : "到主对话回答", onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(answer) && !answer.disabled) void prepareOwnerQuestionAnswer(slot); } }); root.append(answer);
+  }
+}
+
+async function prepareOwnerQuestionAnswer(source) {
+  if (!ownerQuestionCurrent(source) || source.controller || source.error || !source.record || !source.page || source.recordRevision !== source.item.record_revision) return;
+  const owner = source.owner, main = state.mainSessionId, draft = captureDraft(), navigation = viewRequestVersion + 1;
+  if (!main || draft.session !== main) return;
+  const data = { taskId: source.taskId, item: source.item, record: source.record, recordRevision: source.recordRevision, proof: { status: source.status, cursor: source.cursor, revision: source.page.revision, starts: [...source.starts] } };
+  await switchView("chat", owner);
+  const latest = captureDraft();
+  if (!connectionCurrent(owner) || !owner.ready || !state.auth.authenticated || !state.connected || state.view !== "chat" || viewRequestVersion !== navigation || state.mainSessionId !== main || latest.session !== main || latest.revision !== draft.revision || latest.text !== draft.text) return;
+  const slot = { ...data, owner, mainId: main, viewVersion: viewRequestVersion, content: element("div", { class: "task-brief" }), controller: null, error: "", phase: "ready", action: data.item.answer_recorded ? "continue" : "record_only", answer: "", chunks: [], offset: 0, total: null };
+  slot.attemptKey = `${main}:${slot.item.record_id}:${slot.recordRevision}`;
+  const attempt = ownerQuestionAttempts.get(slot.attemptKey);
+  if (attempt) Object.assign(slot, { phase: attempt.phase, answer: attempt.answer, action: attempt.action });
+  openDialog({ title: "回答原队友的问题", content: slot.content, readOnly: true }); ownerQuestionDialog = slot; renderOwnerQuestions(slot);
+}
+
+function renderOwnerQuestionAnswer(slot) {
+  const root = slot.content, ready = slot.phase === "ready", waiting = slot.phase === "checking" || slot.phase === "submitting";
+  root.append(questionReadView(slot), element("p", { class: "task-control-note", text: "普通聊天草稿、附件和待处理语音保留在原输入框，本次只提交这里的答案。" }));
+  if (slot.action !== "continue") {
+    slot.answerInput = element("textarea", { name: "owner_answer", rows: 4, "aria-label": "给原队友的答案", value: slot.answer, disabled: !ready, required: true, maxLength: $("#message-input").maxLength, onInput: () => { if (ownerQuestionCurrent(slot) && slot.phase === "ready") slot.answer = slot.answerInput.value; } });
+    const actions = [["record_only", "只保存答案"], ...(slot.item.binding === "current" || !ready && slot.action === "dispatch" ? [["dispatch", "保存并交原队友"]] : [])];
+    const select = element("select", { "aria-label": "答案处理方式", disabled: !ready, onChange: () => { if (ownerQuestionCurrent(slot) && root.contains(select) && slot.phase === "ready") { slot.action = select.value; renderOwnerQuestions(slot); } } }, ...actions.map(([value, text]) => element("option", { value, text }))); select.value = slot.action;
+    root.append(element("label", { class: "field" }, element("span", { text: "你的答案" }), slot.answerInput), select);
+  }
+  if (slot.error) root.append(element("p", { role: "alert", class: "form-error", text: slot.error }));
+  if (waiting) root.append(element("p", { role: "status", text: slot.phase === "checking" ? "正在重新核对原问题与任务…" : "正在交给主助手…" }));
+  if (["accepted", "unknown"].includes(slot.phase)) {
+    root.append(element("p", { role: "status", text: slot.phase === "accepted" ? "已交主助手处理；是否保存或交回，请主动刷新核查实际问题状态。" : "本次提交未确认，不能重复发送。请核查主对话及实际问题状态。" }));
+    const refresh = element("button", { type: "button", class: "text-button", text: "刷新问题状态", disabled: !!slot.controller, onClick: () => { if (ownerQuestionCurrent(slot) && root.contains(refresh) && !refresh.disabled) void refreshOwnerQuestionState(slot); } }); root.append(refresh);
+  }
+  const submit = $("#dialog-submit"); submit.hidden = !ready; submit.disabled = !ready || state.sending;
+  submit.textContent = slot.action === "continue" ? "确认交回原队友" : slot.action === "dispatch" ? "确认保存并交原队友" : "确认保存答案";
+  dialogSubmit = ready ? () => submitOwnerQuestionAnswer(slot) : null;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = waiting || !ready ? "关闭" : "取消";
+}
+
+async function submitOwnerQuestionAnswer(slot) {
+  if (!ownerQuestionCurrent(slot) || slot.phase !== "ready" || slot.controller || state.sending) return;
+  if (!state.status?.configured) { slot.error = "请先配置主模型，再回答问题。"; renderOwnerQuestions(slot); return; }
+  const answer = slot.action === "continue" ? null : slot.answerInput.value;
+  if (answer !== null && !answer.trim()) { slot.error = "请填写你的答案。"; renderOwnerQuestions(slot); return; }
+  slot.answer = answer ?? "";
+  const command = slot.action === "continue" ? `/继续问题 ${slot.item.question_id}` : `/${slot.action === "dispatch" ? "回答并继续" : "回答问题"} ${slot.item.question_id}\n${answer}`;
+  if (command.length > $("#message-input").maxLength) { slot.error = "答案太长，请缩短后再提交。"; renderOwnerQuestions(slot); return; }
+  const previous = ownerQuestionAttempts.get(slot.attemptKey);
+  if (previous) { Object.assign(slot, { phase: previous.phase, answer: previous.answer, action: previous.action }); renderOwnerQuestions(slot); return; }
+  const controller = slot.controller = new AbortController(), mode = state.mode;
+  const current = () => ownerQuestionCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  slot.phase = "checking"; slot.error = ""; renderOwnerQuestions(slot);
+  let attempted = false;
+  try {
+    const payload = await ownedRequest(ownerQuestionPath(slot.taskId, slot.proof), { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    const page = ownerQuestionPage(payload, slot.taskId, slot.proof.status, slot.proof.cursor, slot.proof.starts);
+    const item = page.items.find((entry) => entry.record_id === slot.item.record_id);
+    if (page.revision !== slot.proof.revision || !item || item.record_revision !== slot.recordRevision || item.worker_id !== slot.item.worker_id || !questionAnswerAllowed(item, slot.action)) throw new Error("原问题、任务或交回条件已有变化，请回到任务重新核对。");
+    const params = new URLSearchParams({ section: "owner_questions", record_id: item.record_id, record_revision: slot.recordRevision, offset_bytes: "0" });
+    const bodyPage = await ownedRequest(`/commitments/${encodeURIComponent(slot.taskId)}/inspection?${params}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    ownerQuestionContentPage(bodyPage, slot, 0, null, slot.recordRevision);
+    if (!current() || state.sending || state.mode !== mode || !Object.hasOwn(MODES, mode)) throw new Error("主对话的提交状态或权限模式已变化，请重新核对。");
+    // Recheck both task metadata and the same complete body revision before submission.
+    const attempt = { phase: "unknown", answer: slot.answer, action: slot.action, command };
+    ownerQuestionAttempts.set(slot.attemptKey, attempt); attempted = true; slot.sending = true; state.sending = true; slot.phase = "submitting"; renderOwnerQuestions(slot); renderComposer();
+    const result = await ownedRequest(`/sessions/${encodeURIComponent(slot.mainId)}/messages`, { method: "POST", signal: controller.signal, body: { content: command, mode, attachment_ids: [] } }, slot.owner, current);
+    if (!current()) return;
+    if (!result || typeof result.run_id !== "string" || !result.run_id) throw new Error("主助手接纳结果无法核对。");
+    acceptChatSubmission(result); slot.phase = "accepted"; attempt.phase = "accepted"; void refreshSessions(slot.owner); renderChat();
+  } catch (error) {
+    if (current()) { slot.phase = attempted ? "unknown" : "blocked"; slot.error = error.message; }
+  } finally {
+    if (slot.sending) { slot.sending = false; state.sending = false; }
+    if (current()) { slot.controller = null; renderOwnerQuestions(slot); renderComposer(); }
+  }
+}
+
 function renderTeamTabs() {
   return element("div", { class: "role-tabs team-tabs", role: "tablist", "aria-label": "团队视图" }, ...[["members", "队友"], ["tasks", "我的任务"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.teamTab === key ? "active" : "", text: label, "aria-selected": String(state.teamTab === key), dataset: { teamTab: key } })));
 }
@@ -1920,6 +2171,7 @@ function taskDirectoryCurrent(slot) {
 
 function releaseTaskDirectory() {
   const slot = taskDirectory; taskDirectory = null;
+  if (ownerQuestionDialog?.directory === slot) releaseOwnerQuestionDialog({ close: true });
   releaseTaskDirectoryDialog({ close: true });
   if (!slot) return;
   slot.controller?.abort(); slot.controller = null;
@@ -1941,6 +2193,7 @@ function taskDirectoryPage(payload, cursor, starts) {
 
 async function loadTaskDirectory(slot, { status = slot.status, cursor = null, starts = [null], focus = false } = {}) {
   if (!taskDirectoryCurrent(slot)) return;
+  releaseOwnerQuestionDialog({ close: true });
   slot.controller?.abort(); releaseTaskDirectoryDialog({ close: true });
   const controller = slot.controller = new AbortController();
   state.taskStatus = slot.status = status; slot.cursor = cursor; slot.starts = [...starts];
@@ -2009,6 +2262,15 @@ function renderTaskDirectoryList(slot) {
 }
 
 function markTaskDirectoryDirty(item) {
+  if (ownerQuestionCurrent(ownerQuestionDialog) && ownerQuestionDialog.taskId === item?.id) {
+    const questions = ownerQuestionDialog;
+    questions.controller?.abort(); questions.controller = null;
+    if (questions.sending) { questions.sending = false; state.sending = false; renderComposer(); }
+    questions.bindingUnverified = true;
+    questions.error = "任务说明有更新，请关闭后重新核对任务与问题。";
+    if (questions.mainId && !["accepted", "unknown"].includes(questions.phase)) questions.phase = ownerQuestionAttempts.has(questions.attemptKey) ? "unknown" : "blocked";
+    renderOwnerQuestions(questions);
+  }
   const slot = taskDirectory;
   if (!taskDirectoryCurrent(slot)) return;
   slot.dirty = true; renderTaskDirectoryNotice(slot);
@@ -4655,6 +4917,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   finally { if (current()) submit.disabled = false; }
 });
 $("#app-dialog").addEventListener("cancel", () => {
+  if (ownerQuestionCurrent(ownerQuestionDialog)) releaseOwnerQuestionDialog();
   if (taskDirectoryDialog && $("#dialog-content").firstElementChild === taskDirectoryDialog.content) releaseTaskDirectoryDialog();
   if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) releaseChannelDeliveryDialog();
   if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
@@ -4662,6 +4925,7 @@ $("#app-dialog").addEventListener("cancel", () => {
 });
 $("#app-dialog").addEventListener("close", () => {
   if ($("#app-dialog").open) return;
+  releaseOwnerQuestionDialog();
   releaseAnswerSpeech();
   releaseAttachmentCollection();
   releaseMemorySourceRetry();

@@ -50,6 +50,330 @@ async function filter(h, status) {
   assert.ok(select); select.value = status; select.focus(); await select.dispatch("change"); await flush();
 }
 
+test("owner question management baseline reaches the real task brief before requiring the pending questions entry", async () => {
+  const item = task("question-task"), full = detail(item);
+  const h = await workspaceHarness(async (path) => {
+    if (path.startsWith("/commitment-directory?")) return directory([item]);
+    assert.equal(path, `/commitments/${item.id}`);
+    return full;
+  }, { members: [{ id: "question-worker", name: "登记问题的原队友", status: "idle", commitment_id: item.id }], open: false });
+  assert.equal(h.ui.state.viewError, "");
+  assert.ok(h.other.textContent.includes("登记问题的原队友"), "先证明真实团队页已经成功显示原队友");
+  await clickMemoryButton(h, h.button("我的任务", h.other));
+  assert.ok(h.other.textContent.includes(item.title), "先证明真实任务目录已经成功显示准确任务");
+  await openDetail(h, item.id);
+  assert.ok(h.body().includes(full.brief.goal));
+  for (const requirement of full.brief.constraints) assert.ok(h.body().includes(requirement), "完整任务要求必须已成功读回");
+  assert.ok(h.button("带着任务提问", h.dialog), "先证明既有任务说明交接入口已经正常显示");
+  assert.equal(h.requests.length, 3);
+  assert.equal(posts(h).length, 0);
+  assert.ok(h.button("待回答的问题", h.dialog), "准确任务详情应提供主动核查原队友持久问题的入口");
+});
+
+const ownerQuestionId = `oq:${"a".repeat(64)}:${"b".repeat(64)}`;
+const ownerQuestionMetadata = (fields = {}) => ({ question_id: ownerQuestionId, record_id: ownerQuestionId, record_revision: "d".repeat(64), task_id: "question-task", worker_id: "question-worker", status: "open", recorded_status: "open", binding: "current", dispatch_allowed: false, answered: false, answer_recorded: false, delivery_state: "not_dispatched", queued: false, claimed: false, cancellation_effect: "not_cancelled", task_completion: "separate_evidence_required", ...fields });
+const ownerQuestionBody = (fields = {}) => ({ id: ownerQuestionId, version: 1, task_id: "question-task", main_id: "main", worker_id: "question-worker", message: "请主人确认最终采用哪一版🙂？<script>只是原问题正文</script>", attachment_ids: ["original-question-file"], status: "open", notice: null, created_at: 100, updated_at: 100, author: { run_id: "original-worker-run", generation: 2, tool: { message_id: "original-tool-message", seq: 8 } }, answer: null, delivery: null, cancellation: null, ...fields });
+const ownerQuestionDirectory = (items = [ownerQuestionMetadata()], fields = {}) => ({ id: "question-task", section: "owner_questions", revision: "c".repeat(64), question_status: "open", authority: "coordination_data", source_completeness: "candidate_window_only", items, scanned: items.length, omitted: 0, unavailable: 0, has_more: false, next_cursor: null, ...fields });
+function ownerQuestionContent(record, offset = 0, { take = Infinity, revision = "d".repeat(64), ...fields } = {}) {
+  const raw = Buffer.from(JSON.stringify(record), "utf8"); let end = Math.min(raw.length, offset + take);
+  while (end < raw.length && (raw[end] & 0xc0) === 0x80) end -= 1;
+  return { id: record.task_id, section: "owner_questions", record_id: record.id, record_revision: revision, authority: "coordination_data", field: "content", content: raw.subarray(offset, end).toString("utf8"), offset_bytes: offset, total_bytes: raw.length, length_bytes: end - offset, next_offset_bytes: end, has_more: end < raw.length, ...fields };
+}
+
+async function ownerQuestionHarness(respond = async () => undefined, { metadata = ownerQuestionMetadata(), record = ownerQuestionBody() } = {}) {
+  const fixture = { metadata, record }, item = task("question-task");
+  const h = await workspaceHarness(async (path, options) => {
+    if (path.startsWith("/commitment-directory?")) return directory([item]);
+    if (path === `/commitments/${item.id}`) return detail(item);
+    const value = await respond(path, options, fixture);
+    if (value !== undefined) return value;
+    if (path.startsWith(`/commitments/${item.id}/inspection?`)) {
+      const params = query(path);
+      if (params.has("record_id")) return ownerQuestionContent(fixture.record, Number(params.get("offset_bytes") ?? 0), { revision: fixture.metadata.record_revision });
+      const status = params.get("question_status") ?? "open";
+      return ownerQuestionDirectory(status === "all" || fixture.metadata.status === status ? [fixture.metadata] : [], { question_status: status });
+    }
+    if (path === "/sessions") return { items: [{ id: "main", status: "running" }] };
+    assert.equal(path, "/sessions/main/messages"); assert.equal(options.method, "POST");
+    return { run_id: "question-main-run", queued: false, message: { id: "question-owner-input", session_id: "main", role: "user", principal: "owner", content: options.body.content, attachments: [], created_at: 200 } };
+  }, { members: [{ id: "question-worker", name: "问题的原队友", status: "idle", commitment_id: item.id }] });
+  await openDetail(h, item.id);
+  await clickMemoryButton(h, h.button("待回答的问题"));
+  if (metadata.status !== "open") {
+    const status = h.dialog.querySelector('[aria-label="问题状态"]'); status.value = "all"; await status.dispatch("change"); await flush();
+  }
+  return { h, fixture };
+}
+
+async function selectOwnerQuestion(h, identifier = ownerQuestionId) {
+  const button = h.dialog.querySelectorAll("[data-owner-question]").find((entry) => entry.dataset.ownerQuestion === identifier);
+  assert.ok(button, "真实问题目录必须能定位准确问题"); await clickMemoryButton(h, button);
+}
+
+async function prepareOwnerAnswer(h, answer = "采用第二版，并保留原要求。", action = "record_only") {
+  await selectOwnerQuestion(h);
+  await clickMemoryButton(h, h.button(action === "continue" ? "到主对话交回原答" : "到主对话回答"));
+  if (action !== "continue") {
+    const input = h.dialog.querySelector('[name="owner_answer"]'); assert.ok(input); input.value = answer; await input.dispatch("input");
+    const select = h.dialog.querySelector('[aria-label="答案处理方式"]'); assert.ok(select); select.value = action; await select.dispatch("change");
+  }
+}
+
+test("owner question management reads exact original text only after an explicit selection and returns to chat without submitting", async () => {
+  const { h, fixture } = await ownerQuestionHarness();
+  assert.ok(h.body().includes("问题的原队友")); assert.ok(h.body().includes("待主人回答"));
+  assert.equal(h.body().includes(fixture.record.message), false); assert.equal(posts(h).length, 0);
+  const input = h.document.querySelector("#message-input"), attachments = [{ id: "draft-file", name: "草稿附件.txt" }], voice = { text: "待合并语音" };
+  input.value = "原来没有发送的文字\n包括完整换行。"; await input.dispatch("input");
+  h.ui.state.attachments = attachments; h.ui.state.voiceDraft = voice; h.ui.renderComposerAttachments();
+  const before = h.ui.captureDraft();
+  await selectOwnerQuestion(h);
+  assert.ok(h.body().includes(fixture.record.message)); assert.ok(h.body().includes("original-question-file"));
+  assert.equal(h.dialog.querySelectorAll("script").length, 0);
+  await clickMemoryButton(h, h.button("到主对话回答"));
+  assert.equal(h.ui.state.view, "chat"); assert.equal(h.dialog.open, true);
+  assert.equal(h.document.querySelector("#dialog-title").textContent, "回答原队友的问题");
+  assert.equal(h.ui.captureDraft().text, before.text); assert.equal(h.ui.captureDraft().revision, before.revision);
+  assert.equal(h.ui.state.attachments === attachments, true); assert.equal(h.ui.state.voiceDraft === voice, true);
+  assert.equal(posts(h).length, 0); assert.equal(h.document.querySelector("#dialog-submit").textContent, "确认保存答案");
+  h.dialog.close(); await flush(); assert.equal(h.ui.submit, null);
+  assert.equal(input.value, before.text); assert.equal(h.ui.state.attachments === attachments, true); assert.equal(h.ui.state.voiceDraft === voice, true);
+});
+
+test("owner question management preserves empty candidate windows and exact status-bound cursors", async () => {
+  const cursor = "questions+/=下一窗口";
+  const { h } = await ownerQuestionHarness(async (path) => {
+    if (!path.includes("/inspection?")) return undefined;
+    const params = query(path); if (params.has("record_id")) return undefined;
+    if (params.get("question_status") === "all") return ownerQuestionDirectory([], { question_status: "all" });
+    if (params.has("cursor")) { assert.equal(params.get("cursor"), cursor); assert.equal(params.get("revision"), "c".repeat(64)); return ownerQuestionDirectory(); }
+    return ownerQuestionDirectory([], { scanned: 2, omitted: 2, unavailable: 1, has_more: true, next_cursor: cursor });
+  });
+  assert.ok(h.body().includes("仍有后页")); assert.ok(h.body().includes("不可核查 1 条"));
+  assert.equal(h.body().includes("本次筛选没有登记的问题"), false);
+  await clickMemoryButton(h, h.button("继续翻阅问题")); assert.ok(h.body().includes("问题的原队友"));
+  const status = h.dialog.querySelector('[aria-label="问题状态"]'); status.value = "all"; await status.dispatch("change"); await flush();
+  assert.equal(query(h.requests.at(-1).path).get("question_status"), "all"); assert.equal(query(h.requests.at(-1).path).has("cursor"), false);
+  assert.ok(h.body().includes("第 1 页")); assert.equal(posts(h).length, 0);
+});
+
+test("owner question management collects bounded UTF-8 pages before exposing an answer action", async () => {
+  const { h, fixture } = await ownerQuestionHarness(async (path, _options, source) => query(path).has("record_id") ? ownerQuestionContent(source.record, Number(query(path).get("offset_bytes")), { take: 97 }) : undefined);
+  await selectOwnerQuestion(h);
+  assert.equal(h.body().includes(fixture.record.message), false); assert.equal(h.button("到主对话回答") === undefined, true);
+  let windows = 1;
+  while (h.button("继续读取问题")) { assert.ok(windows++ < 20, "有限原文必须推进到准确末尾"); await clickMemoryButton(h, h.button("继续读取问题")); }
+  assert.ok(windows > 1); assert.ok(h.body().includes(fixture.record.message)); assert.ok(h.button("到主对话回答"));
+  const pages = h.requests.filter((entry) => query(entry.path).has("record_id"));
+  assert.ok(pages.every((entry) => query(entry.path).get("record_revision") === fixture.metadata.record_revision));
+  assert.equal(posts(h).length, 0);
+});
+
+for (const action of ["record_only", "dispatch", "continue"]) {
+  test(`owner question management explicitly submits ${action} through the main owner ingress and preserves every ordinary draft`, async () => {
+    const metadata = ownerQuestionMetadata(action === "continue" ? { status: "answered", recorded_status: "answered", answer_recorded: true, answered: true, dispatch_allowed: true } : {});
+    const record = ownerQuestionBody(action === "continue" ? { status: "answered", answer: { owner: { body: "之前保存的准确原答" } } } : {});
+    const { h } = await ownerQuestionHarness(undefined, { metadata, record });
+    h.ui.state.mode = "ask"; h.ui.state.session.status = "running"; h.ui.state.session.runId = "older-run";
+    const input = h.document.querySelector("#message-input"), text = "原草稿🙂\n不要附加命令", attachments = [{ id: "keep-file", name: "保留.txt" }], voice = { text: "保留语音" };
+    input.value = text; await input.dispatch("input"); h.ui.state.attachments = attachments; h.ui.state.voiceDraft = voice;
+    const before = h.ui.captureDraft(), answer = "  第二版🙂\n保留原段落。  ";
+    await prepareOwnerAnswer(h, answer, action);
+    assert.equal(posts(h).length, 0);
+    await h.form.dispatch("submit"); await flush();
+    assert.equal(posts(h).length, 1);
+    const sent = posts(h)[0], expected = action === "continue" ? `/继续问题 ${ownerQuestionId}` : `/${action === "dispatch" ? "回答并继续" : "回答问题"} ${ownerQuestionId}\n${answer}`;
+    assert.equal(sent.path, "/sessions/main/messages"); assert.equal(sent.body.content, expected); assert.equal(sent.body.mode, "ask"); assert.equal(sent.body.attachment_ids.length, 0);
+    assert.equal(input.value, text); assert.equal(h.ui.captureDraft().revision, before.revision);
+    assert.equal(h.ui.state.attachments === attachments, true); assert.equal(h.ui.state.voiceDraft === voice, true);
+    const inspections = h.requests.filter((entry) => entry.path.includes("/inspection?"));
+    assert.equal(inspections.length, action === "continue" ? 5 : 4, "目录、完整原文、提交前相同目录及相同正文修订均须核对");
+    assert.equal(query(inspections.at(-2).path).get("revision"), "c".repeat(64));
+    assert.equal(query(inspections.at(-1).path).get("record_revision"), metadata.record_revision);
+    assert.equal(h.ui.state.session.runId, "question-main-run"); assert.equal(h.ui.state.sending, false);
+    assert.ok(h.body().includes("已交主助手处理")); assert.equal(h.ui.submit, null); assert.equal(h.document.querySelector("#dialog-submit").hidden, true);
+    assert.equal(h.body().includes("原队友已领取答案"), false);
+    await h.form.dispatch("submit"); assert.equal(posts(h).length, 1);
+  });
+}
+
+test("owner question management renders real saved and claimed states only after an explicit refresh", async () => {
+  const { h, fixture } = await ownerQuestionHarness();
+  await prepareOwnerAnswer(h); await h.form.dispatch("submit"); await flush();
+  assert.equal(h.body().includes("答案已保存，尚未交回原队友"), false);
+  const count = h.requests.length; await flush(); assert.equal(h.requests.length, count, "接纳后没有后台轮询");
+  fixture.metadata = ownerQuestionMetadata({ record_revision: "e".repeat(64) });
+  fixture.record = ownerQuestionBody({ status: "answered", answer: { owner: { body: "准确的新原答" } }, delivery: { state: "claimed" } });
+  await clickMemoryButton(h, h.button("刷新问题状态"));
+  assert.ok(h.body().includes("准确的新原答")); assert.ok(h.body().includes("原队友已领取答案"));
+  assert.equal(h.ui.submit, null); assert.equal(posts(h).length, 1);
+});
+
+for (const [name, fields, recordFields] of [
+  ["paused", { binding: "paused" }, {}],
+  ["stale", { status: "stale", binding: "stale" }, {}],
+  ["closed", { status: "cancelled", recorded_status: "cancelled" }, { status: "cancelled" }],
+  ["queued", { status: "answered", recorded_status: "answered", answered: true, answer_recorded: true, delivery_state: "queued", queued: true }, { status: "answered", answer: { owner: { body: "原答" } }, delivery: { state: "queued" } }],
+  ["claimed", { status: "answered", recorded_status: "answered", answered: true, answer_recorded: true, delivery_state: "claimed", claimed: true }, { status: "answered", answer: { owner: { body: "原答" } }, delivery: { state: "claimed" } }],
+]) {
+  test(`owner question management preserves ${name} eligibility without inventing continuation`, async () => {
+    const { h } = await ownerQuestionHarness(undefined, { metadata: ownerQuestionMetadata(fields), record: ownerQuestionBody(recordFields) });
+    await selectOwnerQuestion(h);
+    if (name === "paused") {
+      await clickMemoryButton(h, h.button("到主对话回答"));
+      const select = h.dialog.querySelector('[aria-label="答案处理方式"]');
+      assert.equal(select.children.length, 1); assert.equal(select.value, "record_only");
+    } else {
+      assert.equal(h.button("到主对话回答") === undefined, true); assert.equal(h.button("到主对话交回原答") === undefined, true);
+    }
+    assert.equal(posts(h).length, 0);
+  });
+}
+
+test("owner question management rechecks changed task metadata before attempting any submission", async () => {
+  let directoryReads = 0;
+  const { h } = await ownerQuestionHarness(async (path) => {
+    if (!path.includes("/inspection?") || query(path).has("record_id")) return undefined;
+    return ++directoryReads === 1 ? undefined : ownerQuestionDirectory([ownerQuestionMetadata({ binding: "paused" })]);
+  });
+  await prepareOwnerAnswer(h, "请继续", "dispatch"); await h.form.dispatch("submit"); await flush();
+  assert.equal(directoryReads, 2); assert.equal(posts(h).length, 0); assert.equal(h.ui.submit, null);
+  assert.ok(h.body().includes("交回条件已有变化")); await h.form.dispatch("submit"); assert.equal(posts(h).length, 0);
+});
+
+test("owner question management rechecks the record revision after valid metadata and never guesses past a changed body", async () => {
+  let bodyReads = 0;
+  const { h } = await ownerQuestionHarness(async (path) => {
+    if (query(path).has("record_id") && ++bodyReads > 1) throw new ApiError("原记录版本已变化", 409, { detail: { code: "evidence_changed" } });
+  });
+  await prepareOwnerAnswer(h); await h.form.dispatch("submit"); await flush();
+  assert.equal(bodyReads, 2); assert.equal(posts(h).length, 0); assert.ok(h.body().includes("原记录版本已变化"));
+  assert.equal(h.ui.submit, null);
+});
+
+test("owner question management freezes unknown POST results across closing, reopening and retained submit callbacks", async () => {
+  const { h } = await ownerQuestionHarness(async (_path, options) => { if (options.method === "POST") throw new ApiError("回复前失联"); });
+  await prepareOwnerAnswer(h); const retained = h.ui.submit;
+  await h.form.dispatch("submit"); await flush();
+  assert.ok(h.body().includes("本次提交未确认，不能重复发送")); assert.equal(h.ui.submit, null);
+  await retained(); await h.form.dispatch("submit"); assert.equal(posts(h).length, 1);
+  h.dialog.close(); await flush();
+  await h.ui.switchView("team"); await openDetail(h, "question-task"); await clickMemoryButton(h, h.button("待回答的问题"));
+  await selectOwnerQuestion(h); await clickMemoryButton(h, h.button("到主对话回答"));
+  assert.ok(h.body().includes("本次提交未确认")); assert.equal(h.ui.submit, null); assert.equal(posts(h).length, 1);
+  await clickMemoryButton(h, h.button("刷新问题状态")); assert.equal(posts(h).length, 1);
+});
+
+const questionLeaves = [
+  ["closing the question dialog", async (h) => { h.dialog.close(); await flush(); }],
+  ["navigating to main chat", async (h) => h.ui.switchView("chat")],
+  ["a replacement connection", async (h) => { h.ui.activateConnection(); h.ui.state.connected = true; }],
+  ["a new authenticated owner", async (h) => { h.ui.showLogin(); h.ui.activateConnection(); h.ui.state.auth.authenticated = true; h.ui.state.connected = true; }],
+  ["pagehide", async (h) => h.windowEvents.pagehide()],
+];
+
+for (const [name, leave] of questionLeaves) {
+  for (const unauthorized of [false, true]) {
+    test(`owner question management ignores a late directory ${unauthorized ? "401" : "body"} after ${name}`, async () => {
+      const pending = deferred();
+      const { h } = await ownerQuestionHarness(async (path) => path.includes("/inspection?") ? pending.promise : undefined);
+      const signal = h.requests.at(-1).signal; await leave(h); assert.equal(signal.aborted, true);
+      if (unauthorized) pending.reject(new ApiError("OLD_QUESTION_401", 401)); else pending.resolve(ownerQuestionDirectory());
+      await flush(); assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.body().includes("问题的原队友"), false); assert.equal(posts(h).length, 0);
+    });
+  }
+}
+
+test("owner question management keeps a current question 401 effective", async () => {
+  const { h } = await ownerQuestionHarness(async (path) => { if (path.includes("/inspection?")) throw new ApiError("CURRENT_QUESTION_401", 401); });
+  assert.equal(h.ui.state.auth.authenticated, false); assert.equal(h.dialog.open, false); assert.equal(posts(h).length, 0);
+});
+
+test("owner question management aborts a preflight on navigation and a late 401 cannot submit or clear login", async () => {
+  const pending = deferred(); let directoryReads = 0;
+  const { h } = await ownerQuestionHarness(async (path) => path.includes("/inspection?") && !query(path).has("record_id") && ++directoryReads > 1 ? pending.promise : undefined);
+  await prepareOwnerAnswer(h); const submitting = h.form.dispatch("submit"); await flush();
+  const signal = h.requests.at(-1).signal;
+  await h.ui.switchView("team"); assert.equal(signal.aborted, true);
+  pending.reject(new ApiError("LATE_PREFLIGHT_401", 401)); await submitting; await flush();
+  assert.equal(posts(h).length, 0); assert.equal(h.ui.state.auth.authenticated, true);
+});
+
+test("owner question management treats cancellation during POST as unknown and never applies a stale receipt", async () => {
+  const pending = deferred();
+  const { h } = await ownerQuestionHarness(async (_path, options) => options.method === "POST" ? pending.promise : undefined);
+  const composer = h.document.querySelector("#message-input"), send = h.document.querySelector("#send-button");
+  composer.value = "原聊天的未发草稿"; await composer.dispatch("input");
+  assert.equal(send.disabled, false);
+  await prepareOwnerAnswer(h); const submitting = h.form.dispatch("submit"); await flush();
+  assert.equal(posts(h).length, 1); assert.equal(send.disabled, true); const signal = posts(h)[0].signal;
+  h.dialog.close(); await flush(); assert.equal(signal.aborted, true); assert.equal(h.ui.state.sending, false);
+  assert.equal(send.disabled, false, "关闭本次未知提交后，原草稿应立即可以继续手动发送");
+  assert.equal(composer.value, "原聊天的未发草稿");
+  pending.resolve({ run_id: "STALE_QUESTION_RUN" }); await submitting; await flush();
+  assert.notEqual(h.ui.state.session.runId, "STALE_QUESTION_RUN"); assert.equal(posts(h).length, 1);
+  await h.ui.switchView("team"); await openDetail(h, "question-task"); await clickMemoryButton(h, h.button("待回答的问题"));
+  await selectOwnerQuestion(h); await clickMemoryButton(h, h.button("到主对话回答"));
+  assert.ok(h.body().includes("本次提交未确认")); assert.equal(h.ui.submit, null);
+});
+
+test("owner question management post review refresh rechecks dynamic task metadata before clearing its update warning", async () => {
+  let changed = false, directoryReads = 0;
+  const { h } = await ownerQuestionHarness(async (path) => {
+    if (!path.includes("/inspection?") || query(path).has("record_id")) return undefined;
+    directoryReads += 1;
+    if (!changed) return undefined;
+    if (query(path).has("revision")) throw new ApiError("任务或问题目录已变化，请重新核对。", 409, { detail: { code: "evidence_changed" } });
+    return ownerQuestionDirectory([ownerQuestionMetadata({ binding: "paused" })], { revision: "e".repeat(64), question_status: query(path).get("question_status") });
+  });
+  await prepareOwnerAnswer(h); await h.form.dispatch("submit"); await flush();
+  assert.ok(h.body().includes("已交主助手处理")); assert.equal(posts(h).length, 1);
+  h.ui.startGlobalEvents(); await flush();
+  try {
+    changed = true; h.emitGlobal({ type: "commitment.updated", data: { id: "question-task", revision: 8 } }); await flush();
+    assert.ok(h.body().includes("任务说明有更新"));
+    const before = directoryReads;
+    await clickMemoryButton(h, h.button("刷新问题状态"));
+    assert.ok(directoryReads > before, "刷新实际问题状态必须重新核对可独立变化的任务绑定元数据");
+    assert.ok(/原任务已暂停|(?:任务|问题).*(?:有更新|已变化)/.test(h.body()), "同一正文修订不能抹去已经观察到的任务变化");
+    assert.equal(posts(h).length, 1); assert.equal(h.ui.submit, null);
+  } finally { h.ui.stopEvents(); }
+});
+
+test("owner question management post review task updates immediately restore the ordinary draft send button during POST", async () => {
+  const pending = deferred();
+  const { h } = await ownerQuestionHarness(async (_path, options) => options.method === "POST" ? pending.promise : undefined);
+  const composer = h.document.querySelector("#message-input"), send = h.document.querySelector("#send-button");
+  composer.value = "任务更新时仍应保留的普通草稿"; await composer.dispatch("input"); assert.equal(send.disabled, false);
+  await prepareOwnerAnswer(h); h.ui.startGlobalEvents(); await flush();
+  const submitting = h.form.dispatch("submit"); await flush();
+  assert.equal(posts(h).length, 1); assert.equal(send.disabled, true); const signal = posts(h)[0].signal;
+  try {
+    h.emitGlobal({ type: "commitment.updated", data: { id: "question-task", revision: 8 } }); await flush();
+    assert.equal(signal.aborted, true); assert.equal(h.ui.state.sending, false);
+    assert.ok(h.body().includes("本次提交未确认")); assert.equal(h.ui.submit, null);
+    assert.equal(send.disabled, false, "任务变化收回本次发送标记时必须立即刷新原草稿按钮");
+    assert.equal(composer.value, "任务更新时仍应保留的普通草稿"); assert.equal(posts(h).length, 1);
+  } finally { pending.resolve({ run_id: "OLD_TASK_UPDATED_RECEIPT" }); await submitting; await flush(); h.ui.stopEvents(); }
+});
+
+test("owner question management post review reopening an unknown submission preserves its exact answer and selected intent", async () => {
+  const { h } = await ownerQuestionHarness(async (_path, options) => { if (options.method === "POST") throw new ApiError("未取得本次接纳结果"); });
+  const answer = "  主人本次准确答案🙂\n第二段与末尾空白。  ";
+  await prepareOwnerAnswer(h, answer, "dispatch"); await h.form.dispatch("submit"); await flush();
+  assert.equal(posts(h).length, 1); assert.equal(posts(h)[0].body.content, `/回答并继续 ${ownerQuestionId}\n${answer}`);
+  assert.equal(h.dialog.querySelector('[name="owner_answer"]').value, answer);
+  assert.ok(h.body().includes("本次提交未确认")); assert.equal(h.ui.submit, null);
+  h.dialog.close(); await flush();
+  await h.ui.switchView("team"); await openDetail(h, "question-task"); await clickMemoryButton(h, h.button("待回答的问题"));
+  await selectOwnerQuestion(h); await clickMemoryButton(h, h.button("到主对话回答"));
+  assert.ok(h.body().includes("本次提交未确认")); assert.equal(posts(h).length, 1); assert.equal(h.ui.submit, null);
+  const restored = h.dialog.querySelector('[name="owner_answer"]'); assert.ok(restored); assert.equal(restored.disabled, true);
+  assert.equal(restored.value, answer, "同一版问题重新打开后必须保留本页准确提交原答而非空白框");
+  assert.equal(h.dialog.querySelector('[aria-label="答案处理方式"]').value, "dispatch");
+  await h.form.dispatch("submit"); assert.equal(posts(h).length, 1);
+});
+
 test("the task directory independently reads one bounded page and the complete read-only brief", async () => {
   const item = task("older-than-100"), full = detail(item);
   const h = await workspaceHarness(async (path) => {

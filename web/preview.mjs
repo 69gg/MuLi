@@ -33,6 +33,23 @@ export function createPreviewState() {
   const notes = "# 项目整理示例\n\n先梳理目标，再分解任务，由队友执行、复核后汇总。\n\n此文件由前端预览生成，没有读取本机项目。\n";
   const notesAttachmentId = "a".repeat(32), notesRevision = "a".repeat(64);
   const mcp = { mcpServers: { "示例资料库": { url: "https://mcp.preview.invalid/mcp", enabled: true, headers: {} } } };
+  // Persisted-looking examples only: no coordinator, mailbox or worker runs here.
+  const ownerQuestions = ["open", "saved", "queued", "claimed", "cancelled", "stale"].map((kind, index) => {
+    const id = `oq:${"a".repeat(64)}:${String(index + 1).repeat(64)}`, answered = ["saved", "queued", "claimed"].includes(kind);
+    const body = "按已有资料的版本整理，保留未核验项。（本页示例）";
+    const owner = { input_id: `preview-owner-answer-${kind}`, input_seq: index + 1, archive_seq: index + 1, run_id: `preview-owner-run-${kind}`, attachment_ids: [], reply_origin: { kind: "web" }, original_text: kind === "cancelled" ? `/取消问题 ${id}` : `/${kind === "saved" ? "回答问题" : "回答并继续"} ${id}\n${body}`, body: kind === "cancelled" ? null : body, source: "web", principal: "owner" };
+    return {
+      id, version: 1, task_id: "preview-task-waiting", main_id: main.id, worker_id: "demo-researcher",
+      message: "用哪一个文件版本做最终整理？🙂\n请确认后再继续，旧要求仍需保留。（本页示例）", attachment_ids: [previewNotesUploadId],
+      status: answered ? "answered" : kind === "cancelled" ? "cancelled" : "open", notice: "本页模拟记录；未连接真实队友，排队与领取仅为示例状态。",
+      created_at: now - 3600, updated_at: now - 1800,
+      author: { run_id: "preview-original-question-run", generation: 1, tool: { message_id: "preview-original-question-message", seq: 1 } },
+      answer: answered ? { revision: String(index + 1).repeat(64), interpretation: "按主人原答保存。（本页示例）", delivery: kind === "saved" ? "record_only" : "dispatch", recorded_at: now - 1800, owner } : null,
+      delivery: ["queued", "claimed"].includes(kind) ? { key: `owner-question-answer:${id}`, state: kind, input_id: `preview-answer-delivery-${kind}`, input_seq: index + 10, queued_at: now - 1800, claim: kind === "claimed" ? { run_id: "preview-claimed-run", message_id: "preview-claim-message", seq: 2, input_seq: index + 10, claimed_at: now - 900 } : null, interpretation: "交回原队友。（本页示例）", owner: { input_id: owner.input_id, same_as: "answer.owner" } } : null,
+      cancellation: kind === "cancelled" ? { interpretation: "主人关闭了这条示例问题。", owner } : null,
+      preview_binding: kind === "stale" ? "stale" : "current",
+    };
+  });
   return {
     settings: {
       models: { main: model("MuLi · 交互演示"), worker: model(), reviewer: model(), vision: model(), compactor: model(), memory_extractor: model() },
@@ -85,7 +102,7 @@ export function createPreviewState() {
       ...[["e", "c", "1", "期限：七日\n材料：学生证\n"], ["f", "d", "2", "期限：十日\n材料：身份证\n"]].map(([id, original, revision, content]) => ({ source_id: `attachment:${id.repeat(32)}`, source: `attachment:${id.repeat(32)}:${original.repeat(64)}`, content, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false, revision: revision.repeat(64), source_revision: original.repeat(64), format: "text", scope: "utf8_text", document_revision: null, attachment_id: id.repeat(32), created_at: now - 1800, job: { state: "done", attempts: 1, last_error: "" }, comparisonDemo: true })),
     ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),
     members: [
-      { id: "demo-researcher", session_id: "preview-researcher", name: "资料整理", role: "worker", parent_id: main.id, task: "整理示例项目结构与待办", status: "completed", generation: 1, last_message: "结构梳理与清单已完成。", created_at: now - 3600 },
+      { id: "demo-researcher", session_id: "preview-researcher", name: "资料整理", role: "worker", parent_id: main.id, commitment_id: "preview-task-waiting", task: "整理示例项目结构与待办", status: "completed", generation: 1, last_message: "结构梳理与清单已完成。", created_at: now - 3600 },
       { id: "demo-reviewer", session_id: "preview-reviewer", name: "独立复核", role: "reviewer", parent_id: main.id, task: "检查整理结果是否遗漏边界", status: "completed", generation: 1, last_message: "已核对范围，保留需要你确认的事项。", created_at: now - 3500 },
     ], teamMessages: [],
     // Saved ledger examples are independent of the demo teammates and reset
@@ -94,7 +111,7 @@ export function createPreviewState() {
       { id: "preview-task-revisit", title: "回顾旧项目目标（本页示例）", status: "open", revision: 3, next_step: "核对完整说明，再由你决定如何提问。", evidence: "本页示例附件中的项目整理说明。", source_id: `attachment:${notesAttachmentId}`, created_at: now - 172800, updated_at: now - 86400, brief: { goal: "重新梳理旧项目的目标、交付物和待确认事项。\n保留原始背景和每一项约束，再整理一份便于讨论的清单。\n这是一条没有关联队友的本页示例任务。", constraints: ["先核对已有说明，不因旧任务而自动继续执行。", "完整保留中段要求：列出已知事实、尚未核验的内容和需要你确认的问题。", "仅展示本页模拟资料，不访问真实文件、模型或消息渠道。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
       { id: "preview-task-waiting", title: "确认整理范围（本页示例）", status: "blocked", revision: 2, next_step: "等待你确认需要整理的范围。", created_at: now - 7200, updated_at: now - 3600, control: { epoch: 1, approved_epoch: 0, replan_request_id: null, plan: null }, brief: { goal: "确认示例项目哪些资料需要整理，以及最后希望得到什么。", constraints: ["范围未确认前保持账本受阻状态。", "查看说明或带入草稿都不会启动队友。"], evidence_refs: [] } },
       { id: "preview-task-done", title: "整理项目清单（本页示例）", status: "done", revision: 4, next_step: "清单已保存，后续变化由你决定是否讨论。", created_at: now - 86400, updated_at: now - 3600, brief: { goal: "整理一份示例项目清单，区分已完成事项与待确认问题。", constraints: ["完成状态只表示本页保存的账本记录。", "保留原说明供回顾，不自动创建后续任务。"], evidence_refs: [{ kind: "attachment", id: previewNotesUploadId }] } },
-    ],
+    ], ownerQuestions,
     workflows: [{ id: "workflow-review", name: "资料整理与复核", description: "先整理资料，再独立复核，最后汇总为一份简报。", mode: "auto", steps: [{ id: "research", title: "整理资料", role: "worker", prompt: "整理资料与来源。", depends_on: [] }, { id: "review", title: "独立复核", role: "reviewer", prompt: "核对结论与来源。", depends_on: ["research"] }], runs: [], created_at: now - 86400, updated_at: now - 3600 }],
     workflowRuns: [], schedules: [
       { id: "schedule-weekly", kind: "workflow_schedule", name: "每周资料回顾", enabled: true, blocked: false, due_at: now + 86400, interval_seconds: 604800, last_run_id: null, last_status: null },
@@ -383,6 +400,77 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       const control = { epoch: 0, approved_epoch: 0, replan_request_id: null, plan: null, ...item.control };
       const scope = { member_count: state.members.filter((member) => member.commitment_id === id).length, active_workflow_count: 0, can_pause: true, blocked_reason: null };
       return response({ ...item, control: { ...control, paused: control.epoch > control.approved_epoch, has_plan: control.plan != null, plan_epoch: control.plan?.epoch ?? null }, scope });
+    }
+    if (parts[0] === "commitments" && parts.length === 3 && parts[2] === "inspection" && method === "GET" && url.searchParams.get("section") === "owner_questions") {
+      const params = url.searchParams, fail = (code, message, status = ({ evidence_not_found: 404, evidence_changed: 409 })[code] ?? 400) => failure({ code, message }, status);
+      const allowed = ["section", "question_status", "cursor", "limit", "revision", "record_id", "record_revision", "offset_bytes", "length_bytes"];
+      if ([...params.keys()].some((key) => !allowed.includes(key))) return fail("invalid_arguments", "持久问题不接受其他核查参数。");
+      if ([...params.keys()].some((key) => params.getAll(key).length !== 1)) return fail("invalid_arguments", "演示问题参数不能重复。", 422);
+      for (const key of ["cursor", "revision", "record_id", "record_revision"]) if (params.has(key) && !params.get(key)) return fail("invalid_arguments", "问题修订与坐标不能为空。", 422);
+      const integer = (key, fallback) => params.has(key) && !/^\d+$/u.test(params.get(key)) ? NaN : Number(params.get(key) ?? fallback);
+      const limit = integer("limit", 20), offset = integer("offset_bytes", 0), length = integer("length_bytes", state.settings.limits.max_context_chars * 4);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1) return fail("invalid_arguments", "问题分页或字节参数无效。", 422);
+      const questionStatus = params.get("question_status") || "open", recordId = params.get("record_id"), recordRevision = params.get("record_revision");
+      if (!["open", "answered", "cancelled", "stale", "all"].includes(questionStatus)) return fail("invalid_arguments", "问题状态筛选无效。");
+      if (recordId !== null && !/^oq:[a-f0-9]{64}:[a-f0-9]{64}$/u.test(recordId)) return fail("invalid_arguments", "问题 ID 必须是完整宿主 ID。");
+      if (recordId !== null ? params.has("cursor") || params.has("question_status") : recordRevision !== null || offset !== 0 || params.has("length_bytes")) return fail("invalid_arguments", "原记录坐标不能混合目录筛选，续读需要准确 record_id。");
+      const task = clone(state.commitments.find((entry) => entry.id === id));
+      if (!task) return fail("evidence_not_found", "没有这条演示任务。");
+      const records = clone((state.ownerQuestions ?? []).filter((entry) => entry.task_id === id)).sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+      const revision = await sha256(encoder.encode(JSON.stringify([task, records, state.settings.limits.max_context_chars, state.settings.limits.max_output_chars])));
+      if (params.has("revision") && params.get("revision") !== revision) return fail("evidence_changed", "问题目录已改变，请从首页重读。");
+      const base = { id, section: "owner_questions", authority: "coordination_data" };
+      if (recordId !== null) {
+        const item = records.find((entry) => entry.id === recordId);
+        if (!item) return fail("evidence_not_found", "问题不属于该演示任务。");
+        if (item.preview_unavailable || encoder.encode(JSON.stringify(item)).length > state.settings.limits.max_context_chars * 4) return fail("content_unavailable", "这条演示原记录当前不可核查。");
+        const token = await sha256(encoder.encode(JSON.stringify(item)));
+        if (recordRevision !== null && recordRevision !== token) return fail("evidence_changed", "问题原记录已改变，请从首字节重读。");
+        if (offset && recordRevision === null) return fail("invalid_arguments", "续读原文须保持 record_revision。");
+        const fields = ["id", "version", "task_id", "main_id", "worker_id", "message", "attachment_ids", "status", "notice", "created_at", "updated_at", "author", "answer", "delivery", "cancellation"];
+        const view = Object.fromEntries(fields.map((key) => [key, item[key]])), raw = encoder.encode(JSON.stringify(view));
+        if (offset > raw.length || raw[offset] >= 0x80 && raw[offset] <= 0xbf) return fail("invalid_offset", "请使用上一页 next_offset_bytes 核查原文。");
+        let end = Math.min(raw.length, offset + Math.min(length, state.settings.limits.max_context_chars * 4));
+        while (end > offset && raw[end] >= 0x80 && raw[end] <= 0xbf) end--;
+        const text = Array.from(new TextDecoder("utf-8", { fatal: true }).decode(raw.slice(offset, end)));
+        const select = (count) => {
+          const content = text.slice(0, count).join(""), size = encoder.encode(content).length;
+          return { ...base, record_id: recordId, record_revision: token, field: "content", content, offset_bytes: offset, total_bytes: raw.length, length_bytes: size, next_offset_bytes: offset + size, has_more: offset + size < raw.length };
+        };
+        let low = 0, high = text.length;
+        while (low < high) { const middle = Math.ceil((low + high) / 2); if (collectionFits(select(middle))) low = middle; else high = middle - 1; }
+        const result = select(low);
+        return !collectionFits(result) || !low && result.has_more ? fail("output_budget", "预算不足以返回完整字符与原文坐标。") : response(result);
+      }
+      let after = "";
+      if (params.has("cursor")) {
+        try {
+          if (params.get("cursor").length > state.settings.limits.max_output_chars) throw new Error("cursor");
+          const cursor = JSON.parse(params.get("cursor"));
+          if (!Array.isArray(cursor) || cursor.length !== 5 || cursor[0] !== "preview-owner-questions" || cursor[1] !== id || cursor[2] !== revision || cursor[3] !== questionStatus || typeof cursor[4] !== "string" || !records.some((item) => item.id === cursor[4])) throw new Error("cursor");
+          after = cursor[4];
+        } catch { return fail("evidence_changed", "问题游标失效或筛选已改变。"); }
+      }
+      const candidates = records.filter((item) => item.id > after), maximum = Math.min(limit, state.settings.limits.max_search_results ?? limit), budget = state.settings.limits.max_context_chars * 4;
+      let remaining = budget, result = { ...base, revision, question_status: questionStatus, source_completeness: "candidate_window_only", items: [], scanned: 0, omitted: 0, unavailable: 0, has_more: false, next_cursor: null };
+      for (const [index, item] of candidates.slice(0, maximum).entries()) {
+        const candidate = { ...result, items: [...result.items], scanned: result.scanned + 1 }, size = encoder.encode(JSON.stringify(item)).length;
+        const withinBudget = size <= remaining;
+        if (withinBudget) remaining -= size;
+        if (item.preview_unavailable || !withinBudget) { candidate.unavailable++; candidate.omitted++; }
+        else {
+          const paused = (task.control?.epoch ?? 0) > (task.control?.approved_epoch ?? 0), observed = item.preview_binding ?? "current", binding = ["done", "cancelled"].includes(task.status) ? "stale" : observed !== "current" ? observed : paused ? "paused" : "current";
+          const status = item.status !== "cancelled" && !["current", "paused"].includes(binding) ? "stale" : item.status;
+          if (binding === "unavailable") candidate.unavailable++;
+          if (questionStatus !== "all" && status !== questionStatus) candidate.omitted++;
+          else candidate.items.push({ question_id: item.id, record_id: item.id, record_revision: await sha256(encoder.encode(JSON.stringify(item))), task_id: id, worker_id: item.worker_id, status, recorded_status: item.status, binding, dispatch_allowed: binding === "current" && item.status === "answered" && item.delivery === null, answered: item.answer !== null, answer_recorded: item.answer !== null, delivery_state: item.delivery?.state ?? "not_dispatched", queued: item.delivery?.state === "queued", claimed: item.delivery?.state === "claimed", cancellation_effect: item.status === "cancelled" ? item.delivery?.state === "claimed" ? "claimed_answer_cannot_be_retracted_task_not_stopped" : "question_closed" : "not_cancelled", task_completion: "separate_evidence_required" });
+        }
+        candidate.has_more = index + 1 < candidates.length;
+        candidate.next_cursor = candidate.has_more ? JSON.stringify(["preview-owner-questions", id, revision, questionStatus, item.id]) : null;
+        if (!collectionFits(candidate)) { if (!result.scanned) return fail("output_budget", "预算不足以返回问题目录首项与续页坐标。"); break; }
+        result = candidate;
+      }
+      return collectionFits(result) ? response(result) : fail("output_budget", "问题目录超过输出预算。");
     }
     if (parts[0] === "sessions") {
       if (parts.length === 1 && method === "GET") return response({ items: state.sessions });
