@@ -3,6 +3,32 @@ import assert from "node:assert/strict";
 import { createSSEParser } from "../../web/api.mjs";
 import { createPreviewState, createPreviewBackend, installPreview, installPreviewNavigation } from "../../web/preview.mjs";
 
+test("preview watch paging and exact cancellation stay local, including disabled processing", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const first = await json(backend, "/memory/watches?limit=1");
+  assert.equal(first.status, 200); assert.equal(first.body.items.length, 1); assert.equal(first.body.has_more, true);
+  const selected = first.body.items[0], other = structuredClone(backend.state.memoryWatches[1]);
+  assert.deepEqual(Object.keys(selected).sort(), ["id", "match_terms", "question", "reply_preference", "revision", "state"]);
+  const next = await json(backend, `/memory/watches?limit=1&after_id=${first.body.next_after_id}`);
+  assert.equal(next.body.items[0].id, other.id);
+  assert.equal((await json(backend, "/memory/watches?limit=101")).status, 422);
+  assert.equal((await json(backend, "/memory/watches/cancel", "POST", { id: selected.id, revision: 1 })).status, 422);
+  backend.state.settings.memory.enabled = false;
+  const disabled = await json(backend, "/memory/watches");
+  assert.equal(disabled.body.processing.enabled, false); assert.equal(disabled.body.items.length, 3);
+  const receipt = await json(backend, "/memory/watches/cancel", "POST", { id: selected.id });
+  assert.deepEqual(receipt.body, { id: selected.id, state: "cancelled", revision: selected.revision + 1 });
+  assert.deepEqual((await json(backend, "/memory/watches/cancel", "POST", { id: selected.id })).body, receipt.body);
+  assert.deepEqual(backend.state.memoryWatches[1], other);
+  const last = await json(backend, `/memory/watches?limit=1&after_id=${backend.state.memoryWatches.at(-1).id}`);
+  assert.deepEqual(last.body.items, []); assert.equal(last.body.has_more, false); assert.equal(last.body.next_after_id, null);
+  assert.deepEqual(Object.keys(backend.state.runs), []); assert.equal(backend.state.events.length, 0);
+  backend.state.settings.disabled_tools = ["memory_watch_list", "memory_watch_cancel"];
+  assert.equal((await json(backend, "/memory/watches")).status, 400);
+  assert.equal((await json(backend, "/memory/watches/cancel", "POST", { id: other.id })).status, 400);
+  assert.deepEqual(backend.state.memoryWatches[1], other);
+});
+
 test("preview source discovery, UTF-8 reads and exact retries stay in local demo state", async (t) => {
   const scheduled = new Set();
   t.mock.method(globalThis, "setTimeout", (callback) => { scheduled.add(callback); return callback; });

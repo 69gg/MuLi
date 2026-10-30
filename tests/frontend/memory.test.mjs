@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
+import { CHANNELS } from "../../web/management.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
 
 // Run the actual application functions and registered dialog close handler.
@@ -135,7 +136,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     setTimeout: () => 0, clearTimeout() {},
     createSessionState: () => ({ messages: [] }), createTeamPager: () => ({}), captureTeamView: () => null,
     uploadFile() {}, transcribeAttachment() {},
-    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, restoreTeamView() {}, sessionStorage: {},
+    VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, CHANNELS, restoreTeamView() {}, sessionStorage: {},
     formatTimestamp: (value) => value === undefined ? "未记录" : String(value), formatFullDate: String,
     apiRequest: async (path, options = {}) => { requests.push({ path, ...options }); return handler(path, options); },
     readEvents: async (_path, options) => { globalEvent = options.onEvent; await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true })); },
@@ -149,11 +150,11 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
       owner.sessions.start(); owner.notifications.start(); return owner;
     };
     activateConnection();
-    globalThis.ui = { state, renderMemories, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories,
+    globalThis.ui = { state, renderMemories, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches,
       activateConnection,
       useMemoryViews() { renderOtherView = () => { if (state.view === "memories") realOtherView(); }; },
       stopEvents() { globalController?.abort(); },
-      get slot() { return memoryDialog; }, get path() { return memoryPath; }, get catalog() { return memorySources; }, get submit() { return dialogSubmit; } };
+      get slot() { return memoryDialog; }, get path() { return memoryPath; }, get catalog() { return memorySources; }, get watches() { return memoryWatches; }, get submit() { return dialogSubmit; } };
   `, context);
   const ui = context.ui; ui.state.view = "memories"; ui.state.auth.authenticated = true;
   const body = () => document.querySelector("#dialog-content").textContent;
@@ -440,6 +441,47 @@ test("switching entries ignores a late old detail and does not replace the curre
   assert.equal(h.ui.slot.id, other.id); assert.ok(h.body().includes(other.content)); assert.equal(h.body().includes("当前记忆："), false);
 });
 
+for (const reader of ["detail", "source", "history"]) {
+  test(`a previous connection's late ${reader} 401 cannot log out or clear the new memory dialog`, async () => {
+    const pending = deferred(), item = fixtureMemory();
+    const other = fixtureMemory("memory-two", { content: "NEW_CONNECTION_MEMORY" });
+    const itemPath = `/memories/${item.id}`, otherPath = `/memories/${other.id}`;
+    const h = harness(async (path) => {
+      if (path === otherPath) return other;
+      if (path === itemPath) return reader === "detail" ? pending.promise : item;
+      if (reader === "source" && path.startsWith(`${itemPath}/source?`)) return pending.promise;
+      if (reader === "history" && path === `${itemPath}/revisions`) return pending.promise;
+      throw new Error(`unexpected request: ${path}`);
+    });
+    const opening = h.ui.showMemoryEvidence(item.id);
+    if (reader !== "detail") {
+      await opening;
+      await h.expand(reader === "source" ? "查看原文" : "修改历史");
+    }
+    const oldRequest = h.requests.at(-1);
+    assert.equal(oldRequest.cache, "no-store"); assert.equal(oldRequest.signal.aborted, false);
+    h.ui.activateConnection();
+    await h.ui.showMemoryEvidence(other.id);
+    const slot = h.ui.slot, body = h.body(), action = h.button("更正");
+    const title = h.document.querySelector("#dialog-title").textContent;
+    const requestCount = reader === "detail" ? 2 : 3;
+    assert.equal(oldRequest.signal.aborted, true);
+    assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.dialog.open, true);
+    assert.equal(slot.id, other.id); assert.ok(body.includes(other.content)); assert.ok(action);
+    assert.equal(h.requests.length, requestCount); assert.equal(h.requests.at(-1).path, otherPath);
+
+    // The handler deliberately ignores abort: a queued old 401 still reaches the real request helper.
+    pending.reject(new ApiError("OLD_CONNECTION_401", 401));
+    await opening; await flush();
+    assert.equal(h.ui.state.auth.authenticated, true);
+    assert.equal(h.ui.slot === slot, true); assert.equal(h.dialog.open, true);
+    assert.equal(h.body(), body); assert.equal(h.document.querySelector("#dialog-title").textContent, title);
+    assert.equal(h.button("更正") === action, true);
+    assert.equal(h.requests.length, requestCount, "a stale read must not retry or reopen evidence");
+    assert.ok(h.requests.every(({ method }) => !method || method === "GET"));
+  });
+}
+
 test("closing aborts and clears source/history, and both late responses remain invisible", async () => {
   const source = deferred(), history = deferred(), item = fixtureMemory();
   const h = harness(async (path) => path.includes("/source?") ? source.promise : path.endsWith("/revisions") ? history.promise : item);
@@ -708,6 +750,221 @@ async function clickMemoryButton(h, button) {
   for (const handler of h.document.events.click ?? []) await handler({ target: button, preventDefault() {} });
   await flush();
 }
+
+function watchRecord(index = 1, extra = {}) {
+  return { id: index.toString(16).padStart(64, "0"), question: "后续资料中留意琥珀航道", match_terms: ["琥珀航道", "水银镜片"], state: "active", revision: 1, reply_preference: { kind: "default_web" }, ...extra };
+}
+
+function watchWindow(items = [], after = "", extra = {}) {
+  return { items, after_id: after, has_more: items.length === 20, next_after_id: items.length === 20 ? items.at(-1).id : null, processing: { enabled: true, paused: false }, ...extra };
+}
+
+async function openWatches(h) {
+  h.ui.useMemoryViews(); h.other.replaceChildren(h.ui.renderMemories());
+  await clickMemoryButton(h, h.other.querySelector('[data-memory-tab="watches"]'));
+}
+
+function stopWatchButton(h, id) { return h.other.querySelector(`[data-watch-id="${id}"]`); }
+
+test("memory watch tab reads a bounded fresh page and shows literal finite preference labels", async () => {
+  const items = [watchRecord(1, { question: '<script>原问题</script>', reply_preference: { kind: "default_web" } }), watchRecord(2, { reply_preference: { kind: "registered_web" } }), watchRecord(3, { reply_preference: { kind: "registered_channel", channel: "onebot" } })];
+  const h = harness(async (path) => { assert.ok(path.startsWith("/memory/watches?")); return watchWindow(items, "", { processing: { enabled: false, paused: false } }); });
+  await openWatches(h);
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].cache, "no-store");
+  const query = new URLSearchParams(h.requests[0].path.split("?")[1]);
+  assert.equal(query.get("limit"), "20"); assert.equal(query.get("after_id"), "");
+  for (const text of [items[0].question, ...items[0].match_terms, "默认 Web", "登记时 Web", "登记时渠道 · OneBot", "资料检查未启用", "已登记"]) assert.ok(h.other.textContent.includes(text), text);
+  assert.equal(h.other.querySelector("script") === null, true);
+  assert.equal(stopWatchButton(h, items[0].id).disabled, false);
+  assert.equal(h.other.textContent.includes("正在检查"), false);
+  assert.equal(h.requests.some((request) => request.method === "POST"), false);
+});
+
+test("a full watch window advances to an explicit empty end and can return without replacing its outer DOM", async () => {
+  const items = Array.from({ length: 20 }, (_, index) => watchRecord(index + 1));
+  const h = harness(async (path) => {
+    const after = new URLSearchParams(path.split("?")[1]).get("after_id");
+    return after ? watchWindow([], after) : watchWindow(items);
+  });
+  await openWatches(h); const root = h.other.firstElementChild, slot = h.ui.watches;
+  assert.equal(h.button("继续翻页", h.other).disabled, false);
+  await clickMemoryButton(h, h.button("继续翻页", h.other));
+  assert.equal(new URLSearchParams(h.requests[1].path.split("?")[1]).get("after_id"), items.at(-1).id);
+  assert.ok(h.other.textContent.includes("这个窗口没有更多登记"));
+  assert.equal(h.button("继续翻页", h.other).disabled, true);
+  await clickMemoryButton(h, h.button("上一页", h.other));
+  assert.equal(h.other.firstElementChild === root, true); assert.equal(h.ui.watches === slot, true);
+  assert.equal(h.other.querySelectorAll(".memory-row").length, 20);
+});
+
+test("failed watch reads are not empty pages and do not authorize a stale cancellation", async () => {
+  let failed = true; const item = watchRecord();
+  const h = harness(async () => { if (failed) throw new Error("完整清单超过输出预算"); return watchWindow([item]); });
+  await openWatches(h);
+  assert.ok(h.other.textContent.includes("读取失败")); assert.equal(h.other.textContent.includes("还没有长期留意登记"), false);
+  failed = false; await clickMemoryButton(h, h.button("刷新清单", h.other));
+  const stale = stopWatchButton(h, item.id);
+  failed = true; await clickMemoryButton(h, h.button("刷新清单", h.other));
+  assert.equal(stopWatchButton(h, item.id).disabled, true);
+  await clickMemoryButton(h, stale);
+  assert.equal(h.dialog.open, false); assert.equal(h.requests.length, 3);
+});
+
+test("only the latest watch read can publish, including a late error from the superseded read", async () => {
+  const old = deferred(), latest = deferred(), item = watchRecord(); let reads = 0;
+  const h = harness(async () => ++reads === 1 ? watchWindow([item]) : reads === 2 ? old.promise : latest.promise);
+  await openWatches(h);
+  const slot = h.ui.watches, first = h.ui.loadMemoryWatches(slot), oldSignal = h.requests.at(-1).signal;
+  const second = h.ui.loadMemoryWatches(slot);
+  latest.resolve(watchWindow([{ ...item, question: "新读取结果" }])); await second;
+  assert.equal(oldSignal.aborted, true);
+  old.reject(new ApiError("迟到的认证错误", 401)); await first;
+  assert.equal(h.ui.state.auth.authenticated, true);
+  assert.ok(h.other.textContent.includes("新读取结果")); assert.equal(h.other.textContent.includes("迟到的认证错误"), false);
+});
+
+test("old watch rows and an already opened confirmation lose authority after a fresh page", async () => {
+  const item = watchRecord();
+  const h = harness(async () => watchWindow([item]));
+  await openWatches(h);
+  const old = stopWatchButton(h, item.id);
+  await clickMemoryButton(h, h.button("刷新清单", h.other));
+  await clickMemoryButton(h, old); assert.equal(h.dialog.open, false);
+  await clickMemoryButton(h, stopWatchButton(h, item.id)); assert.equal(h.dialog.open, true);
+  const callback = h.ui.submit;
+  await h.ui.loadMemoryWatches(h.ui.watches);
+  await assert.rejects(() => callback(h.form), /清单已变化/);
+  assert.equal(h.requests.some((request) => request.method === "POST"), false);
+});
+
+test("watch confirmation locks one id before awaiting and preserves other registrations", async () => {
+  const pending = deferred(), item = watchRecord(), other = watchRecord(2); let cancelled = false;
+  const h = harness(async (path, options) => {
+    if (path.startsWith("/memory/watches?")) return watchWindow([{ ...item, state: cancelled ? "cancelled" : "active", revision: cancelled ? 2 : 1 }, other]);
+    assert.equal(path, "/memory/watches/cancel"); assert.equal(options.method, "POST"); assert.deepEqual(JSON.parse(options.body), { id: item.id }); return pending.promise;
+  });
+  await openWatches(h); await clickMemoryButton(h, stopWatchButton(h, item.id));
+  assert.ok(h.body().includes(item.question) && h.body().includes("停止留意并保留记录"));
+  assert.equal(h.body().includes(item.id), false); assert.equal(h.body().includes("读取时修订"), false);
+  const callback = h.ui.submit, submission = callback(h.form);
+  assert.equal(stopWatchButton(h, item.id).disabled, true); assert.equal(stopWatchButton(h, other.id).disabled, false);
+  await assert.rejects(() => callback(h.form), /清单已变化/);
+  await h.ui.loadMemoryWatches(h.ui.watches);
+  assert.equal(stopWatchButton(h, item.id).disabled, true);
+  cancelled = true; pending.resolve({ id: item.id, state: "cancelled", revision: 2 }); await submission;
+  assert.equal(h.requests.filter((request) => request.method === "POST").length, 1);
+  assert.equal(stopWatchButton(h, item.id).disabled, true); assert.equal(stopWatchButton(h, other.id).disabled, false);
+  assert.ok(h.other.textContent.includes("已停止")); assert.equal(h.ui.submit, null);
+});
+
+test("unverifiable stop receipts require a successful GET and a new explicit confirmation", async () => {
+  const item = watchRecord();
+  for (const receipt of [null, { id: watchRecord(2).id, state: "cancelled", revision: 2 }, { id: item.id, state: "active", revision: 2 }, { id: item.id, state: "cancelled", revision: 1 }, { id: item.id, state: "cancelled", revision: Number.MAX_SAFE_INTEGER + 1 }]) {
+    let reads = 0, writes = 0;
+    const h = harness(async (path) => {
+      if (path.startsWith("/memory/watches?")) { if (++reads === 2) throw new Error("核对暂不可用"); return watchWindow([item]); }
+      writes++; return receipt;
+    });
+    await openWatches(h); const old = stopWatchButton(h, item.id);
+    await clickMemoryButton(h, old); await h.form.dispatch("submit");
+    assert.equal(writes, 1); assert.equal(reads, 2); assert.ok(h.other.textContent.includes("停止结果未确认"));
+    assert.equal(stopWatchButton(h, item.id).disabled, true); assert.equal(h.ui.submit, null);
+    h.dialog.close(); await flush();
+    await clickMemoryButton(h, h.button("刷新清单", h.other));
+    assert.equal(writes, 1); assert.equal(stopWatchButton(h, item.id).disabled, false);
+    await clickMemoryButton(h, old); assert.equal(h.dialog.open, false);
+    await clickMemoryButton(h, stopWatchButton(h, item.id)); assert.equal(h.dialog.open, true);
+    assert.equal(writes, 1); // A fresh row is eligible; the user has not submitted again.
+  }
+});
+
+test("a lost stop response is reconciled by reading the actual cancelled record without resending", async () => {
+  const item = watchRecord(); let cancelled = false;
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/watches?")) return watchWindow([{ ...item, state: cancelled ? "cancelled" : "active", revision: cancelled ? 2 : 1 }]);
+    cancelled = true; throw new Error("连接在服务器写入后中断");
+  });
+  await openWatches(h); await clickMemoryButton(h, stopWatchButton(h, item.id)); await h.form.dispatch("submit");
+  assert.deepEqual(h.requests.map((request) => request.method ?? "GET"), ["GET", "POST", "GET"]);
+  assert.ok(h.other.textContent.includes("已重新读取当前窗口")); assert.ok(h.other.textContent.includes("已停止"));
+  assert.equal(stopWatchButton(h, item.id).disabled, true);
+});
+
+test("a GET started before a stop became unknown cannot unlock that attempt", async () => {
+  const beforeUnknown = deferred(), afterUnknown = deferred(), stopped = deferred(), item = watchRecord(); let reads = 0;
+  const h = harness(async (path) => {
+    if (!path.startsWith("/memory/watches?")) return stopped.promise;
+    return ++reads === 1 ? watchWindow([item]) : reads === 2 ? beforeUnknown.promise : afterUnknown.promise;
+  });
+  await openWatches(h); await clickMemoryButton(h, stopWatchButton(h, item.id));
+  const submission = h.form.dispatch("submit"), reading = h.ui.loadMemoryWatches(h.ui.watches);
+  h.dialog.close(); await flush();
+  beforeUnknown.resolve(watchWindow([item])); await reading;
+  assert.equal(stopWatchButton(h, item.id).disabled, true); assert.ok(h.other.textContent.includes("结果未确认"));
+  stopped.resolve({ id: item.id, state: "cancelled", revision: 2 }); await flush();
+  assert.equal(reads, 3);
+  afterUnknown.resolve(watchWindow([item])); await submission;
+  assert.equal(stopWatchButton(h, item.id).disabled, false);
+  assert.equal(h.requests.filter((request) => request.method === "POST").length, 1);
+});
+
+test("leaving a watch page or logging out invalidates pending GETs and POSTs", async () => {
+  for (const leave of ["tab", "logout"]) {
+    const pending = deferred(), item = watchRecord();
+    const h = harness(async (path) => path.startsWith("/memory/watches?") ? watchWindow([item]) : pending.promise);
+    await openWatches(h); await clickMemoryButton(h, stopWatchButton(h, item.id));
+    const submission = h.form.dispatch("submit"), signal = h.requests.at(-1).signal;
+    if (leave === "tab") await clickMemoryButton(h, h.other.querySelector('[data-memory-tab="list"]'));
+    else h.ui.showLogin();
+    assert.equal(signal.aborted, true); assert.equal(h.ui.watches === null, true);
+    h.ui.openDialog({ title: "保留新对话框", content: h.document.createTextNode("当前内容"), readOnly: true });
+    pending.resolve({ id: item.id, state: "cancelled", revision: 2 }); await submission;
+    assert.equal(h.body(), "当前内容"); assert.equal(h.requests.length, 2); assert.equal(h.ui.watches === null, true);
+  }
+});
+
+test("reconnecting a watch page ignores its old GET even after a late successful response", async () => {
+  const pending = deferred(), item = watchRecord(); let reads = 0;
+  const h = harness(async () => ++reads === 1 ? watchWindow([item]) : reads === 2 ? pending.promise : watchWindow([{ ...item, question: "重连后的清单" }]));
+  await openWatches(h); const oldSlot = h.ui.watches, reading = h.ui.loadMemoryWatches(oldSlot), signal = h.requests.at(-1).signal;
+  h.ui.activateConnection(); await h.ui.switchView("memories");
+  const slot = h.ui.watches;
+  assert.equal(signal.aborted, true); assert.equal(slot === oldSlot, false);
+  pending.resolve(watchWindow([{ ...item, question: "旧连接清单" }])); await reading;
+  assert.equal(h.ui.watches === slot, true); assert.ok(h.other.textContent.includes("重连后的清单")); assert.equal(h.other.textContent.includes("旧连接清单"), false);
+});
+
+test("a late stop 401 from an old connection cannot log out or unlock the new connection's attempt", async () => {
+  const old = deferred(), current = deferred(), item = watchRecord(); let writes = 0, reads = 0, cancelled = false;
+  const h = harness(async (path) => {
+    if (path.startsWith("/memory/watches?")) { reads++; return watchWindow([{ ...item, question: reads === 1 ? "原连接的问题" : "重连后确认的问题", state: cancelled ? "cancelled" : "active", revision: cancelled ? 2 : 1 }]); }
+    return ++writes === 1 ? old.promise : current.promise;
+  });
+  await openWatches(h); await clickMemoryButton(h, stopWatchButton(h, item.id));
+  const oldSubmission = h.form.dispatch("submit"), oldSignal = h.requests.at(-1).signal;
+  h.ui.activateConnection(); await h.ui.switchView("memories");
+  const slot = h.ui.watches;
+  assert.equal(oldSignal.aborted, true); assert.equal(stopWatchButton(h, item.id).disabled, false);
+  await clickMemoryButton(h, stopWatchButton(h, item.id));
+  const callback = h.ui.submit, submission = h.form.dispatch("submit"), signal = h.requests.at(-1).signal;
+  old.reject(new ApiError("旧连接取消请求迟到的认证错误", 401)); await oldSubmission;
+  assert.equal(h.ui.state.auth.authenticated, true); assert.equal(h.ui.watches === slot, true);
+  assert.equal(signal.aborted, false); assert.equal(stopWatchButton(h, item.id).disabled, true);
+  assert.equal(h.dialog.open, true); assert.ok(h.body().includes("重连后确认的问题"));
+  await assert.rejects(() => callback(h.form), /清单已变化/);
+  assert.equal(writes, 2); assert.equal(reads, 2);
+  cancelled = true; current.resolve({ id: item.id, state: "cancelled", revision: 2 }); await submission;
+  assert.equal(writes, 2); assert.equal(reads, 3); assert.ok(h.other.textContent.includes("已停止"));
+});
+
+test("maintenance pauses watch writes without hiding current registrations", async () => {
+  const item = watchRecord();
+  const h = harness(async () => watchWindow([item], "", { processing: { enabled: true, paused: true } }));
+  await openWatches(h); assert.ok(h.other.textContent.includes(item.question));
+  assert.ok(h.other.textContent.includes("维护期间只读")); assert.equal(stopWatchButton(h, item.id).disabled, true);
+  await clickMemoryButton(h, stopWatchButton(h, item.id));
+  assert.equal(h.dialog.open, false); assert.equal(h.requests.length, 1);
+});
 
 test("DOM replacement keeps primitive text values rather than filtering boolean or nullish children", () => {
   const h = harness(), root = h.document.createElement("div");

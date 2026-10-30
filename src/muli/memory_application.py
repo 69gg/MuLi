@@ -18,6 +18,7 @@ from muli.attachment_memory_source import (
     restore_attachment_source,
 )
 from muli.attachments import ATTACHMENT_ID_PATTERN
+from muli.channels.types import NAMES as CHANNEL_NAMES
 from muli.document_settings import DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size, validate_integer
 from muli.media import MediaService
@@ -757,14 +758,11 @@ class MemoryApplication:
 
         async def list_watches(args: dict[str, Any]) -> Any:
             request = owner("memory_watch_list")
-            return watches.records(request.session_id, **args)
+            return self.watch_records(request.session_id, **args)
 
         async def cancel_watch(args: dict[str, Any]) -> Any:
             request = owner("memory_watch_cancel")
-            result = watches.cancel(request.session_id, args["id"])
-            # Let Attention and the runtime invalidate already queued evidence.
-            await runtime.bus.notify()
-            return result
+            return await self.cancel_watch(request.session_id, args["id"])
 
         settings = runtime.config.settings.memory_watches
         return [
@@ -825,6 +823,73 @@ class MemoryApplication:
                 preserve_output=True,
             ),
         ]
+
+    def _watch_access(self, tool_name: str) -> None:
+        if self._closed or self.runtime._closing:
+            raise ValueError("记忆服务正在关闭")
+        if tool_name in self.runtime.config.settings.disabled_tools:
+            raise ValueError("资料关注工具未启用")
+
+    def watch_records(
+        self, main_session_id: str, *, after_id: str = "", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Share bounded current-main reads without fabricating a model owner."""
+        self._watch_access("memory_watch_list")
+        return self.watches.records(main_session_id, after_id=after_id, limit=limit)
+
+    def watch_page(self, *, after_id: str = "", limit: int = 20) -> dict[str, Any]:
+        main_id = self.runtime.store.existing_main_session_id()
+        if main_id is None:
+            raise ValueError("主会话身份无法核查")
+        records = self.watch_records(main_id, after_id=after_id, limit=limit)
+        items: list[dict[str, Any]] = []
+        for record in records:
+            # records already validates the frozen routing against real ingress.
+            # Only these finite labels cross the HTTP boundary, never addresses.
+            routing = (
+                FrozenRouting.load(record["routing"]) if record["version"] == 2 else FrozenRouting()
+            )
+            preference: dict[str, str] = {"kind": "default_web"}
+            if routing.classification == "bound":
+                if routing.origin.kind == "web":
+                    preference = {"kind": "registered_web"}
+                else:
+                    route = routing.origin.delivery_routes()[0]
+                    name = route["name"]
+                    if name not in CHANNEL_NAMES:
+                        raise ValueError("资料关注的登记渠道无法核查")
+                    preference = {"kind": "registered_channel", "channel": name}
+            items.append(
+                {
+                    **{
+                        field: record[field]
+                        for field in ("id", "question", "match_terms", "state", "revision")
+                    },
+                    "reply_preference": preference,
+                }
+            )
+        result = {
+            "items": items,
+            "after_id": after_id,
+            # A full window only promises another read, including a final empty one.
+            "has_more": len(records) == limit,
+            "next_after_id": records[-1]["id"] if len(records) == limit else None,
+            "processing": {
+                "enabled": self._watch_enabled(),
+                "paused": not self.runtime.maintenance.admission.allowed,
+            },
+        }
+        if json_size(result) > self.runtime.config.settings.limits.max_output_chars:
+            raise EvidenceError("output_budget", "长期留意清单超过输出预算，请减少每页数量")
+        return result
+
+    async def cancel_watch(self, main_session_id: str, identifier: str) -> dict[str, Any]:
+        self._watch_access("memory_watch_cancel")
+        self.runtime.maintenance.admission.require()
+        result = self.watches.cancel(main_session_id, identifier)
+        # Let Attention and the runtime invalidate already queued evidence.
+        await self.runtime.bus.notify()
+        return result
 
     def index_tools(self, runtime: Runtime) -> list[Tool]:
         caller = runtime.tool_session_id

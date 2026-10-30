@@ -52,6 +52,57 @@ class ShellContinuation:
     revoked_reason: str = ""
 
 
+def guard_shell_continuation_identity(
+    record: ShellContinuation,
+    *,
+    agent: dict[str, Any],
+    session: dict[str, Any],
+    parent: dict[str, Any],
+    task: dict[str, Any],
+    snapshot: TaskSnapshot | None,
+    main_id: str | None,
+    current_run_id: str | None,
+    bound: bool = False,
+) -> None:
+    """Shared identity rules over supplied facts, without reads or scheduling."""
+    revision = record.revision + int(bound or agent.get("status") == "completed")
+    if (
+        parent.get("id") != main_id
+        or parent.get("kind") != "main"
+        or parent.get("principal") != "owner"
+        or parent.get("mode") != record.parent_mode
+        or session.get("kind") != "team"
+        or session.get("principal") != "owner"
+        or session.get("mode") != record.mode
+        or agent.get("mode") != record.mode
+        or agent.get("parent_id") != record.parent_id
+        or agent.get("session_id") != record.session_id
+        or agent.get("role") != "worker"
+        or session.get("workflow_run_id")
+        or agent.get("generation") != record.generation + int(bound)
+        or agent.get("completion_revision") != revision
+        or agent.get("run_id") != (record.bound_run_id if bound else record.run_id)
+        or agent.get("status") not in ({"running"} if bound else {"running", "completed"})
+        or task.get("status") in {None, "done", "cancelled"}
+        or snapshot != record.snapshot
+        or (bound and not record.admitted)
+        or (bound and current_run_id != record.bound_run_id)
+        or (
+            record.finished is not None
+            and (
+                record.finished.session_id != record.session_id
+                or record.finished.command_id != record.evidence["command_id"]
+                or record.finished.os_epoch != record.evidence["os_epoch"]
+                or (
+                    record.finished.state == "completed"
+                    and type(record.finished.exit_code) is not int
+                )
+            )
+        )
+    ):
+        raise PermissionError("原命令续办的身份、任务版本或执行资格已改变")
+
+
 class TeamManager:
     def __init__(self, runtime: Runtime) -> None:
         self.runtime = runtime
@@ -251,7 +302,6 @@ class TeamManager:
         session = runtime.store.get("session", record.session_id) or {}
         parent = runtime.store.get("session", record.parent_id) or {}
         task = runtime.store.get("commitment", record.snapshot.commitment_id) or {}
-        revision = record.revision + int(bound or agent.get("status") == "completed")
         if (
             self._shell_continuations.get(record.session_id) is not record
             or record.revoked_reason
@@ -262,44 +312,23 @@ class TeamManager:
             or self._parent_stopping(record.session_id)
             or runtime.shells is not record.manager
             or runtime._shell_generation != record.manager_generation
-            or parent.get("id") != runtime.store.existing_main_session_id()
-            or parent.get("kind") != "main"
-            or parent.get("principal") != "owner"
-            or parent.get("mode") != record.parent_mode
-            or session.get("kind") != "team"
-            or session.get("principal") != "owner"
-            or session.get("mode") != record.mode
-            or agent.get("mode") != record.mode
-            or agent.get("parent_id") != record.parent_id
-            or agent.get("session_id") != record.session_id
-            or agent.get("role") != "worker"
-            or session.get("workflow_run_id")
-            or agent.get("generation") != record.generation + int(bound)
-            or agent.get("completion_revision") != revision
-            or agent.get("run_id") != (record.bound_run_id if bound else record.run_id)
-            or agent.get("status") not in ({"running"} if bound else {"running", "completed"})
             or runtime.channel_ownership.for_agent(record.session_id) is not None
             or {"shell_run", "shell_read", "shell_continue_on_finish"}
             & set(runtime.config.settings.disabled_tools)
             or runtime.task_control is None
-            or task.get("status") in {None, "done", "cancelled"}
-            or runtime.task_control.execution_snapshot(record.session_id) != record.snapshot
-            or (bound and not record.admitted)
-            or (bound and runtime.run_ids.get(record.session_id) != record.bound_run_id)
-            or (
-                record.finished is not None
-                and (
-                    record.finished.session_id != record.session_id
-                    or record.finished.command_id != record.evidence["command_id"]
-                    or record.finished.os_epoch != record.evidence["os_epoch"]
-                    or (
-                        record.finished.state == "completed"
-                        and type(record.finished.exit_code) is not int
-                    )
-                )
-            )
         ):
             raise PermissionError("原命令续办的身份、任务版本或执行资格已改变")
+        guard_shell_continuation_identity(
+            record,
+            agent=agent,
+            session=session,
+            parent=parent,
+            task=task,
+            snapshot=runtime.task_control.execution_snapshot(record.session_id),
+            main_id=runtime.store.existing_main_session_id(),
+            current_run_id=runtime.run_ids.get(record.session_id),
+            bound=bound,
+        )
         runtime.task_control.guard_execution(
             record.snapshot, session_id=record.session_id, risk="write"
         )
@@ -307,6 +336,111 @@ class TeamManager:
         runtime.scheduled_task_replans._source(
             {"reply_origin": record.origin.dump(), "creator_session_id": record.parent_id}
         )
+
+    def inspect_shell_continuation(
+        self,
+        agent: dict[str, Any],
+        session: dict[str, Any],
+        task: dict[str, Any],
+        *,
+        stopping: bool,
+        maximum: int,
+        byte_budget: int,
+        execution: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Observe existing permission only; this never calls the execution guard."""
+        record = self._shell_continuations.get(agent["id"])
+        if record is None:
+            return {"availability": "available", "state": "none"}
+        runtime = self.runtime
+        unavailable = {"availability": "unavailable", "state": "unknown"}
+        if (
+            not record.paired
+            or record.revoked_reason
+            or self._closed
+            or runtime._closing
+            or not runtime.maintenance.admission.allowed
+            or stopping
+            or runtime.shells is not record.manager
+            or runtime._shell_generation != record.manager_generation
+            or runtime.store.db.execute(
+                "SELECT 1 FROM ingress WHERE session_id=? AND state='pending' LIMIT 1",
+                (record.session_id,),
+            ).fetchone()
+            is not None
+            or (agent.get("status") == "running" and execution.get("availability") != "available")
+            or {"shell_run", "shell_read", "shell_continue_on_finish"}
+            & set(runtime.config.settings.disabled_tools)
+            or runtime.task_control is None
+        ):
+            return unavailable
+        # A finite primary-key window precedes all assignment JSON classification.
+        # An incomplete or oversized window cannot prove absence of an assignment.
+        ownership = runtime.store.db.execute(
+            "SELECT CASE WHEN typeof(data)='text' AND length(CAST(data AS BLOB))<=? "
+            "THEN CASE WHEN json_valid(data) THEN "
+            "json_extract(data,'$.agent_id')=? AND "
+            "json_extract(data,'$.state') IN ('active','return_requested') END END "
+            "FROM (SELECT data FROM objects WHERE kind='channel_ownership' ORDER BY id LIMIT ?)",
+            (byte_budget, agent["id"], maximum + 1),
+        ).fetchall()
+        if len(ownership) > maximum or any(row[0] != 0 for row in ownership):
+            return unavailable
+        parent = runtime.store.bounded_object("session", record.parent_id, max_bytes=byte_budget)
+        if parent is None:
+            return unavailable
+        control = runtime.task_control
+        snapshot = control._snapshot(agent["id"], task)
+        control._budget(snapshot)
+        bound = record.bound_run_id is not None
+        guard_shell_continuation_identity(
+            record,
+            agent=agent,
+            session=session,
+            parent=parent,
+            task=task,
+            snapshot=snapshot,
+            main_id=runtime.store.existing_main_session_id(),
+            current_run_id=runtime.run_ids.get(agent["id"]),
+            bound=bound,
+        )
+        if snapshot.epoch != snapshot.approved_epoch:
+            return unavailable
+        original = runtime.store.bounded_object("run", record.run_id, max_bytes=byte_budget)
+        if (
+            original is None
+            or original.get("session_id") != agent["id"]
+            or original.get("status") != ("completed" if bound else agent["status"])
+        ):
+            return unavailable
+        source = runtime.store.db.execute(
+            "SELECT length(CAST(data AS BLOB)) FROM objects WHERE kind='message' AND id=?",
+            (record.origin.input_id,),
+        ).fetchone()
+        if source is None or not isinstance(source[0], int) or source[0] > byte_budget:
+            return unavailable
+        runtime.scheduled_task_replans._source(
+            {"reply_origin": record.origin.dump(), "creator_session_id": record.parent_id}
+        )
+        if bound:
+            if execution.get("availability") != "available" or execution.get("run_id") != (
+                record.bound_run_id
+            ):
+                return unavailable
+            state = "continuing"
+        elif record.finished is None:
+            state = "waiting_command"
+        elif record.finished.state == "completed":
+            state = "ready"
+        else:
+            return unavailable
+        return {
+            "availability": "available",
+            "state": state,
+            "command_id": record.evidence["command_id"],
+            "scope": "current_service_instance",
+            "automatic_resume_after_restart": False,
+        }
 
     def request_shell_continuation(
         self, session_id: str, run_id: str, request: PreparedRequest, command_id: str

@@ -25,7 +25,7 @@ export function createPreviewState() {
       limits: { max_parallel_agents: 3, max_pending_runs: 8, max_tool_steps: 24, max_run_seconds: 180, max_file_bytes: 10485760, max_output_chars: 6000, max_context_chars: 32000 },
       search: { provider: "searxng", base_url: "https://search.preview.invalid", max_results: 5 },
       memory: { enabled: true, auto_extract: true, max_candidates: 24, max_prompt_memories: 6 },
-      compaction: { enabled: true, threshold: 0.8 }, attention: { enabled: true },
+      compaction: { enabled: true, threshold: 0.8 }, attention: { enabled: true, events: ["memory"] },
       channels: {
         onebot: { enabled: true, base_url: "http://preview.invalid", owner_ids: ["7"], allowed_groups: [], receive_files: true, account_id: "preview-bot", token_set: false },
         telegram: { enabled: false, owner_ids: [], allowed_groups: [], receive_files: true, token_set: false },
@@ -57,6 +57,11 @@ export function createPreviewState() {
       { id: "memory-style", content: "你偏好简洁的中文说明，先给结论，再给必要依据。", kind: "preference", layer: "preference", source: "演示手动记录", source_id: null, trusted_owner: true, confidence: 1, version: 1, status: "active", entities: ["你", "中文说明"], relations: [{ subject: "你", predicate: "偏好", object: "中文说明" }], created_at: now - 7200, updated_at: now - 7200 },
       { id: "memory-project", content: "项目整理时，先确认当前目标，再把执行和复核交给不同队友。", kind: "procedural", layer: "procedural", source: "演示手动记录", source_id: null, trusted_owner: true, confidence: 1, version: 1, status: "active", entities: ["项目整理", "协作"], relations: [{ subject: "项目整理", predicate: "使用", object: "协作" }], created_at: now - 3600, updated_at: now - 3600 },
     ], memoryHistory: {},
+    memoryWatches: [
+      { id: "1".repeat(64), question: "以后收藏的笔记里，留意传送带题的功能关系。", match_terms: ["传送带", "功能关系"], state: "active", revision: 1, reply_preference: { kind: "default_web" } },
+      { id: "2".repeat(64), question: "留意收藏资料里的社团报名时间。", match_terms: ["社团", "报名"], state: "active", revision: 1, reply_preference: { kind: "registered_channel", channel: "onebot" } },
+      { id: "3".repeat(64), question: "留意旧项目的设计回顾。", match_terms: ["设计", "回顾"], state: "cancelled", revision: 2, reply_preference: { kind: "registered_web" } },
+    ],
     memorySources: [
       { source_id: "preview-source-notes", source: "前端演示资料", content: notes, session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "a".repeat(64), created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
       { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
@@ -333,6 +338,22 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       }
       if (item && method === "DELETE") { state.reminders = state.reminders.filter((entry) => entry.id !== id || reminderKind(entry) !== kind); return response({ deleted: true }); }
       return failure("没有这条演示提醒。", 404);
+    }
+    if (path === "/memory/watches" && method === "GET") {
+      if (state.settings.disabled_tools.includes("memory_watch_list")) return failure("资料关注工具未启用。");
+      const after = url.searchParams.get("after_id") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !/^(?:[a-f0-9]{64})?$/u.test(after)) return failure("清单分页参数无效。", 422);
+      const items = state.memoryWatches.filter((item) => item.id > after).sort((left, right) => left.id.localeCompare(right.id)).slice(0, limit).map((item) => Object.fromEntries(["id", "question", "match_terms", "state", "revision", "reply_preference"].map((field) => [field, item[field]])));
+      const result = { items, after_id: after, has_more: items.length === limit, next_after_id: items.length === limit ? items.at(-1).id : null, processing: { enabled: state.settings.memory.enabled && state.settings.attention.enabled && state.settings.attention.events.includes("memory"), paused: false } };
+      return JSON.stringify(result).length > state.settings.limits.max_output_chars ? failure({ code: "output_budget", message: "长期留意清单超过输出预算。" }) : response(result);
+    }
+    if (path === "/memory/watches/cancel" && method === "POST") {
+      if (state.settings.disabled_tools.includes("memory_watch_cancel")) return failure("资料关注工具未启用。");
+      if (Object.keys(body).length !== 1 || typeof body.id !== "string" || !/^[a-f0-9]{64}$/u.test(body.id)) return failure("只接受准确关注 id。", 422);
+      const item = state.memoryWatches.find((entry) => entry.id === body.id);
+      if (!item) return failure("演示关注不存在。", 400);
+      if (item.state === "active") { item.state = "cancelled"; item.revision++; }
+      return response({ id: item.id, state: item.state, revision: item.revision });
     }
     if (path === "/memory/sources" && method === "GET") {
       const filter = url.searchParams.get("state") ?? "", limit = Number(url.searchParams.get("limit") ?? 20);

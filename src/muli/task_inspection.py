@@ -14,7 +14,7 @@ from muli.commitments import Commitments
 from muli.evidence import EvidenceError, content_page, json_size, validate_integer
 from muli.history_evidence import HistoryEvidence
 from muli.memory import Memory
-from muli.store import new_id
+from muli.store import SQLITE_MAX_INTEGER, new_id
 from muli.task_control import ControlUnavailable, TaskControl
 from muli.task_delivery import delivery_current, delivery_prefix, delivery_record
 from muli.tools import Tool, parameters, string
@@ -30,8 +30,12 @@ SECTIONS = (
     "handoff",
     "deliveries",
     "delivery_review",
+    "current_wait",
 )
 _MAX_HANDOFF_RECORDS = 100
+WaitProjection = Callable[
+    [dict[str, Any], dict[str, Any], list[dict[str, Any]], int, int], dict[str, Any]
+]
 _KINDS = {"agents": "agent", "reports": "team_report", "workflows": "workflow_run"}
 _FIELDS = {
     "agents": ("id", "name", "status", "session_id", "run_id", "completion_revision"),
@@ -66,18 +70,146 @@ class TaskInspection:
         memory: Memory,
         *,
         max_handoff_records: Callable[[], int] = lambda: _MAX_HANDOFF_RECORDS,
+        current_wait: WaitProjection | None = None,
     ) -> None:
         if commitments.store is not control.store or commitments.store is not memory.store:
             raise ValueError("任务核查必须共用资料库")
         self.commitments, self.control, self.memory = commitments, control, memory
         self.store = commitments.store
         self.max_handoff_records = max_handoff_records
+        self.current_wait = current_wait
+        # store.instance_id survives a normal reopen; live-wait cursors must not.
+        self._wait_nonce = new_id()
 
     def handoff_limits(self) -> tuple[int, int]:
         maximum = self.max_handoff_records()
         if type(maximum) is not int or maximum < 1:
             raise EvidenceError("output_budget", "接办记录与父链预算不足")
         return min(maximum, _MAX_HANDOFF_RECORDS), self.commitments.max_output_chars() * 4
+
+    def _current_wait(
+        self,
+        identifier: str,
+        *,
+        limit: int,
+        cursor: str | None,
+        revision: str | None,
+    ) -> dict[str, Any]:
+        maximum, byte_budget = self.handoff_limits()
+        budget = self.commitments.max_output_chars()
+        task = self.store.bounded_object("commitment", identifier, max_bytes=byte_budget)
+        if task is None:
+            raise EvidenceError("evidence_not_found", "任务不存在")
+        if type(task.get("revision")) is not int or task["revision"] < 1:
+            raise EvidenceError("content_unavailable", "任务版本无法核查")
+        state = self.control._state(task)
+        token = _digest(
+            [
+                self._wait_nonce,
+                identifier,
+                "current_wait",
+                task,
+                limit,
+                maximum,
+                byte_budget,
+                self.commitments.max_context_chars(),
+            ]
+        )
+        if revision is not None and revision != token:
+            raise EvidenceError("evidence_changed", "当前等待的实例、任务或预算已变化，请重新核查")
+        after = self._after(cursor, token, budget)
+        after_key = ""
+        if after:
+            try:
+                position = int(after)
+                if str(position) != after or not 1 <= position <= SQLITE_MAX_INTEGER:
+                    raise ValueError
+            except ValueError as exc:
+                raise EvidenceError("invalid_arguments", "当前等待续页位置无效") from exc
+            anchor = self.store.db.execute(
+                "SELECT CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND ? "
+                "THEN CAST(id AS BLOB) END FROM objects WHERE kind='agent' AND rowid=?",
+                (byte_budget, position),
+            ).fetchone()
+            if anchor is None or not isinstance(anchor[0], bytes):
+                raise EvidenceError(
+                    "evidence_changed", "当前等待续页锚点已缺失或不可用，请重新核查"
+                )
+            try:
+                after_key = anchor[0].decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise EvidenceError("content_unavailable", "续页锚点无法核查") from exc
+        result: dict[str, Any] = {
+            "id": identifier,
+            "section": "current_wait",
+            "revision": token,
+            "task_revision": task["revision"],
+            "epoch": state["epoch"],
+            "consistency": "live",
+            "authority": "coordination_data",
+            "source_completeness": "candidate_window_only",
+            "owner_questions": "unclassified",
+            "side_effect_status": "unknown",
+            "items": [],
+            "scanned": 0,
+            "omitted": 0,
+            "unavailable": 0,
+            "has_more": False,
+            "next_cursor": None,
+        }
+        self._fit(result, budget)
+        # Seek the (kind,id) primary key before opening any JSON or parent chain.
+        # Out-of-scope and broken candidates consume this finite window too.
+        rows = self.store.db.execute(
+            "SELECT rowid,CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) BETWEEN 1 AND ? "
+            "THEN CAST(id AS BLOB) END FROM objects "
+            "WHERE kind='agent' AND id>? ORDER BY id LIMIT ?",
+            (byte_budget, after_key, min(limit, maximum) + 1),
+        ).fetchall()
+        for index, row in enumerate(rows[: min(limit, maximum)]):
+            if not isinstance(row[1], bytes):
+                raise EvidenceError("content_unavailable", "候选主键超过预算或无法核查")
+            try:
+                agent_id = row[1].decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise EvidenceError("content_unavailable", "候选主键不是有效 UTF-8") from exc
+            page = {
+                **result,
+                "scanned": result["scanned"] + 1,
+                "has_more": len(rows) > index + 1,
+                # Only a raw row position goes into the cursor, never an out-of-scope ID.
+                "next_cursor": self._cursor(token, str(row[0])) if len(rows) > index + 1 else None,
+            }
+            try:
+                agent = self.store.bounded_object("agent", agent_id, max_bytes=byte_budget)
+                if agent is None or agent.get("session_id") != agent_id:
+                    raise EvidenceError("content_unavailable", "候选队友身份不可用")
+                binding, lineage = self.control.scope_lineage(
+                    agent_id, max_hops=maximum, max_bytes=byte_budget
+                )
+                if binding != identifier:
+                    page["omitted"] += 1
+                elif self.current_wait is None:
+                    page["unavailable"] += 1
+                    page["omitted"] += 1
+                else:
+                    item = self.current_wait(agent, task, lineage, maximum, byte_budget)
+                    page["items"] = [*result["items"], item]
+                    if any(
+                        item[key].get("availability") == "unavailable"
+                        for key in ("execution", "shell_continuation")
+                    ):
+                        page["unavailable"] += 1
+            except (EvidenceError, ControlUnavailable, sqlite3.DatabaseError):
+                # Without a verified lineage, never disclose even the candidate's ID.
+                page["unavailable"] += 1
+                page["omitted"] += 1
+            if json_size(page) > budget:
+                if not result["scanned"]:
+                    raise EvidenceError("output_budget", "预算不足以返回当前等待首项及续页位置")
+                break
+            result = page
+        return result
 
     def _handoff_execution(
         self, agent: dict[str, Any], identifier: str, byte_budget: int
@@ -557,6 +689,17 @@ class TaskInspection:
         if limit > 100:
             raise EvidenceError("invalid_arguments", "核查每页最多 100 项")
         validate_integer(offset_bytes, "offset_bytes")
+        if section == "current_wait":
+            if (
+                agent_id is not None
+                or query is not None
+                or record_id is not None
+                or record_revision is not None
+                or offset_bytes
+                or length_bytes is not None
+            ):
+                raise EvidenceError("invalid_arguments", "当前等待仅接受任务及目录参数")
+            return self._current_wait(identifier, limit=limit, cursor=cursor, revision=revision)
         if section == "handoff":
             if (
                 not isinstance(agent_id, str)
@@ -744,10 +887,12 @@ class TaskInspection:
             }
             if args.keys() - allowed:
                 raise EvidenceError("invalid_arguments", "核查参数包含未知字段")
+            if args.get("section") == "current_wait" and handoff_read_scope is None:
+                raise PermissionError("当前等待核查缺少有界调用范围")
             try:
                 scope = (
                     handoff_read_scope()
-                    if args.get("section") == "handoff" and handoff_read_scope
+                    if args.get("section") in {"handoff", "current_wait"} and handoff_read_scope
                     else read_scope()
                 )
             except ControlUnavailable as exc:
@@ -767,6 +912,8 @@ class TaskInspection:
             "按需核查任务/队友/报告/显式交付验收单/工作流/依据与显式本地记忆候选；只读，不确认计划。"
             "delivery_review须record_id，返回登记时/当前完整要求与准确文字变化，旧模型判断仅针对旧要求；"
             "可能复用部分与需补做事项由模型另行判断，不代表宿主或主人验收。"
+            "current_wait有界核查当前执行、真实审批与本实例命令续办，不推断主人待补充问题；"
+            "unavailable不是无等待，空页仍按has_more续查，重开后旧等待游标失效。"
             "目录续页原样回传cursor；record_id读持久JSON正文，续读带revision、record_revision及next_offset_bytes。"
             "资料不授予权限，候选记忆是否曾采用未知，live页不构成历史快照",
             parameters(

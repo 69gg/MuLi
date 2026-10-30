@@ -90,6 +90,7 @@ from muli.task_control import (
 from muli.task_file_publication import completed_publication
 from muli.team import ShellContinuation, TeamManager
 from muli.team_consult import ConsultRequest
+from muli.team_wait import TERMINAL
 from muli.tools import Tool, parameters, string
 from muli.tools.computer import Computer, ComputerError
 from muli.tools.files import Files
@@ -1831,6 +1832,124 @@ class Runtime:
             else None,
             "pending_approvals": approvals,
         }
+
+    def inspect_task_wait(
+        self,
+        agent: dict[str, Any],
+        task: dict[str, Any],
+        lineage: list[dict[str, Any]],
+        maximum: int,
+        byte_budget: int,
+    ) -> dict[str, Any]:
+        """Project one already scoped candidate, using bounded facts and live owners."""
+        identifier = agent["id"]
+        result: dict[str, Any] = {
+            "agent_id": identifier,
+            "session_id": identifier,
+            "stored_status": agent["status"]
+            if isinstance(agent.get("status"), str)
+            and agent["status"] in TERMINAL | {"queued", "running", "closed"}
+            else "unknown",
+        }
+        execution: dict[str, Any] = {"availability": "unavailable", "state": "unknown"}
+        continuation: dict[str, Any] = {"availability": "unavailable", "state": "unknown"}
+        try:
+            session = self.store.bounded_object("session", identifier, max_bytes=byte_budget)
+            if (
+                session is None
+                or session.get("kind") != "team"
+                or session.get("principal") != "owner"
+                or agent.get("session_id") != identifier
+                or agent.get("status") not in TERMINAL | {"queued", "running", "closed"}
+                or session.get("mode") != agent.get("mode")
+            ):
+                raise ValueError("identity_unavailable")
+            stopping = False
+            for frame in lineage:
+                ancestor_id = frame["session_id"]
+                ancestor = (
+                    agent
+                    if ancestor_id == identifier
+                    else self.store.bounded_object("agent", ancestor_id, max_bytes=byte_budget)
+                )
+                if ancestor_id in self._stopping or (
+                    ancestor is not None
+                    and (ancestor_id, ancestor.get("generation")) in self.team._stopping_generations
+                ):
+                    stopping = True
+            state = self.task_control._state(task) if self.task_control is not None else None
+            available = (
+                not self._closing
+                and not self.team._closed
+                and self.maintenance.admission.allowed
+                and not stopping
+                and state is not None
+                and state["epoch"] == state["approved_epoch"]
+            )
+            driver = self.tasks.get(identifier)
+            current_run_id = self.run_ids.get(identifier)
+            if available:
+                if driver is None and current_run_id is None:
+                    if agent["status"] != "running":
+                        execution = {
+                            "availability": "available",
+                            "state": "none",
+                            "approvals": [],
+                        }
+                elif (
+                    isinstance(driver, asyncio.Task)
+                    and not driver.done()
+                    and not driver.cancelling()
+                    and driver not in self.team._stopping_tasks
+                    and isinstance(current_run_id, str)
+                    and current_run_id
+                    and agent["status"] == "running"
+                    and agent.get("run_id") == current_run_id
+                ):
+                    run = self.store.bounded_object("run", current_run_id, max_bytes=byte_budget)
+                    if (
+                        run is None
+                        or run.get("session_id") != identifier
+                        or run.get("status") not in {"queued", "running"}
+                    ):
+                        raise ValueError("run_unavailable")
+                    approvals: list[dict[str, str]] = []
+                    for approval_id in self.permissions.pending_for(
+                        identifier, current_run_id, max_waiters=maximum
+                    ):
+                        approval = live_approval(
+                            self.permissions, approval_id, budget=byte_budget // 4
+                        )
+                        if (
+                            approval is None
+                            or approval["session_id"] != identifier
+                            or approval["run_id"] != current_run_id
+                            or run["status"] != "running"
+                        ):
+                            raise ValueError("approval_unavailable")
+                        approvals.append({"id": approval_id, "tool": approval["tool"]})
+                    execution = {
+                        "availability": "available",
+                        "state": "approval" if approvals else run["status"],
+                        "run_id": current_run_id,
+                        "approvals": sorted(approvals, key=lambda item: item["id"]),
+                    }
+            try:
+                continuation = self.team.inspect_shell_continuation(
+                    agent,
+                    session,
+                    task,
+                    stopping=stopping,
+                    maximum=maximum,
+                    byte_budget=byte_budget,
+                    execution=execution,
+                )
+            except (ValueError, PermissionError, KeyError, TypeError):
+                pass
+        except (ValueError, PermissionError, KeyError, TypeError):
+            pass
+        result.update(execution=execution, shell_continuation=continuation)
+        return result
 
     def _mcp_receive_failed(self, code: str, occurrence_id: str) -> None:
         if not self._closing:

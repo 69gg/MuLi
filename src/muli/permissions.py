@@ -161,11 +161,21 @@ class Permissions:
             if not waiting:
                 del self._waiting[owner]
 
-    def pending_for(self, session_id: str, run_id: str) -> tuple[str, ...]:
+    def pending_for(
+        self, session_id: str, run_id: str, *, max_waiters: int | None = None
+    ) -> tuple[str, ...]:
         """Locate only this live execution's waiters, without reading other approvals."""
+        waiting = self._waiting.get((session_id, run_id), ())
+        if max_waiters is not None:
+            if type(max_waiters) is not int or max_waiters < 1:
+                raise ValueError("审批核查数量预算无效")
+            if len(waiting) > max_waiters:
+                raise ValueError("本执行的审批等待集合超过核查预算")
+            if any(identifier not in self.pending for identifier in waiting):
+                raise ValueError("本执行的审批等待关联缺失")
         return tuple(
             identifier
-            for identifier in self._waiting.get((session_id, run_id), ())
+            for identifier in waiting
             if (future := self.pending.get(identifier)) is not None and not future.done()
         )
 
