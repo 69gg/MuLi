@@ -9,9 +9,15 @@ from typing import Any
 
 import httpx
 import pytest
+from jsonschema import Draft202012Validator
 from test_runtime import FakeClient, make_runtime
 
-from muli.attachments import MAX_ATTACHMENT_IDS, Attachments, validate_attachment_ids
+from muli.attachments import (
+    ATTACHMENT_ID_PATTERN,
+    MAX_ATTACHMENT_IDS,
+    Attachments,
+    validate_attachment_ids,
+)
 from muli.auth import hash_password
 from muli.local_services import LocalServices
 from muli.providers import Message, StreamEvent, ToolCall
@@ -206,7 +212,86 @@ async def test_tool_dispatch_preserves_internal_sender_and_explicit_references(
         assert payload["principal"] == f"agent:{parent}"
         assert "private-body-marker" not in json.dumps(payload)
         assert runtime.team.get(created["id"])["reply_origin"] == origin
-    assert tools["send_message"].parameters == tools["send_input"].parameters
+    legacy_parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "description": ""},
+            "message": {"type": "string", "description": ""},
+            "wake": {"type": "boolean"},
+            "attachment_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": ATTACHMENT_ID_PATTERN},
+                "maxItems": MAX_ATTACHMENT_IDS,
+                "uniqueItems": True,
+                "description": "显式交给队友的附件ID；仅传引用，不读取正文或增加授权",
+            },
+        },
+        "required": ["target", "message"],
+        "additionalProperties": False,
+    }
+    # Ordinary delivery keeps its full contract; only send_input adds question actions.
+    assert tools["send_message"].parameters == legacy_parameters
+    assert tools["send_input"].parameters == {
+        **legacy_parameters,
+        "properties": {
+            **legacy_parameters["properties"],
+            "question": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"const": "register"},
+                            "key": {"type": "string", "description": "稳定提问去重键"},
+                        },
+                        "required": ["action", "key"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"const": "answer"},
+                            "id": {"type": "string", "description": "完整问题ID"},
+                            "delivery": {"enum": ["record_only", "dispatch"]},
+                        },
+                        "required": ["action", "id", "delivery"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"const": "dispatch"},
+                            "id": {"type": "string", "description": "完整问题ID"},
+                        },
+                        "required": ["action", "id"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"const": "cancel"},
+                            "id": {"type": "string", "description": "完整问题ID"},
+                        },
+                        "required": ["action", "id"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+        },
+        "allOf": [
+            {"if": {"required": ["question"]}, "then": {"not": {"required": ["wake"]}}},
+            {
+                "if": {
+                    "required": ["question"],
+                    "properties": {
+                        "question": {
+                            "properties": {"action": {"enum": ["answer", "dispatch", "cancel"]}}
+                        }
+                    },
+                },
+                "then": {"not": {"required": ["attachment_ids"]}},
+            },
+        ],
+    }
     assert tools["send_message"].risk == tools["send_input"].risk == "write"
     before = counts(runtime)
     for name in ("spawn_agent", "send_message", "send_input"):
@@ -228,6 +313,44 @@ async def test_tool_dispatch_preserves_internal_sender_and_explicit_references(
         ToolCall("unoffered", "spawn_agent", "{}"), {}, "yolo", parent, "test-run"
     )
     assert "未启用" in unavailable["error"]
+
+
+async def test_message_schemas_keep_legacy_delivery_and_scope_question_actions(
+    runtime: Runtime,
+) -> None:
+    identifier = await upload(runtime)
+    tools = {tool.name: tool for tool in runtime.team.tools(runtime.main_session()["id"], "yolo")}
+    ordinary = Draft202012Validator(tools["send_message"].parameters)
+    send_input = Draft202012Validator(tools["send_input"].parameters)
+    base = {"target": "worker-id", "message": "补充"}
+    for extra in (
+        {},
+        {"wake": False},
+        {"wake": True},
+        {"attachment_ids": [identifier]},
+        {"wake": False, "attachment_ids": [identifier]},
+        {"wake": True, "attachment_ids": [identifier]},
+    ):
+        ordinary.validate({**base, **extra})
+        send_input.validate({**base, **extra})
+
+    questions: list[dict[str, Any]] = [
+        {"action": "register", "key": "stable-question-key"},
+        {"action": "answer", "id": "question-id", "delivery": "record_only"},
+        {"action": "answer", "id": "question-id", "delivery": "dispatch"},
+        {"action": "dispatch", "id": "question-id"},
+        {"action": "cancel", "id": "question-id"},
+    ]
+    for question in questions:
+        args = {**base, "question": question}
+        send_input.validate(args)
+        assert not ordinary.is_valid(args)
+        for wake in (False, True):
+            assert not send_input.is_valid({**args, "wake": wake})
+        for references in ([], [identifier]):
+            assert send_input.is_valid({**args, "attachment_ids": references}) is (
+                question["action"] == "register"
+            )
 
 
 async def test_reference_and_agent_commit_rollback_together(runtime: Runtime) -> None:
