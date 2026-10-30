@@ -95,6 +95,8 @@ const ownerQuestionAttempts = new Map();
 const taskDirectoryPageSize = 20;
 const taskStatusLabels = { open: "待办", in_progress: "进行中", blocked: "受阻", done: "已完成", cancelled: "已取消" };
 let memoryDialog = null;
+const ownerPreferenceAttempts = new Map();
+const ownerPreferenceQuoteLimit = 12000; // MemorySourcePreferenceInput.quote 的 Unicode 码点上限。
 let memoryPath = null;
 let memoryPathSequence = 0;
 let memorySearchController = null;
@@ -378,6 +380,7 @@ function invalidateConnection() {
   if (historyDialog && $("#dialog-content").firstElementChild === historyDialog.content) $("#app-dialog").close();
   releaseHistoryDialog(); dialogHistoryReturn = null;
   releaseOwnerQuestionDialog({ close: true });
+  if (memoryDialog?.preference) { $("#app-dialog").close(); releaseMemoryDialog(); }
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -3352,6 +3355,7 @@ function renderMemoryGraph() {
 }
 
 function resetMemoryReads(slot) {
+  if (slot.preference) releaseOwnerPreference(slot);
   for (const key of ["readController", "sourceController", "historyController"]) { slot[key]?.abort(); slot[key] = null; }
   slot.sourceRegion?.replaceChildren(); slot.historyList?.replaceChildren();
   slot.page = null; slot.offsets = [0]; slot.pageIndex = 0;
@@ -3385,7 +3389,15 @@ function invalidateMemoryEvidence(event) {
   if (!slot || !memoryDialogCurrent(slot)) return;
   const data = event.data ?? {};
   const sourceUnresolved = slot.sourceId === undefined && !!slot.readController;
-  if (!(data.memory_ids ?? []).includes(slot.id) && !(data.source_id && (data.source_id === slot.sourceId || slot.comparisonSources?.includes(data.source_id) || sourceUnresolved))) return;
+  if (!(data.memory_ids ?? []).some((id) => id === slot.id || id === slot.preference?.receipt?.item?.id) && !(data.source_id && (data.source_id === slot.sourceId || slot.comparisonSources?.includes(data.source_id) || sourceUnresolved))) return;
+  if (slot.preference && slot.preference.phase !== "editing") {
+    const preference = slot.preference;
+    preference.controller?.abort(); preference.controller = null;
+    preference.attempt ??= { tuple: preference.tuple, state: "unknown" };
+    preference.attempt.state = "unknown"; ownerPreferenceAttempts.set(preference.key, preference.attempt);
+    preference.phase = "unknown"; preference.receipt = null; preference.error = "记忆已有变更，请核对当前结果。";
+    renderOwnerPreference(slot); return;
+  }
   resetMemoryReads(slot);
   if (slot.editing) {
     slot.invalidated = true; $("#dialog-submit").disabled = true;
@@ -3413,7 +3425,7 @@ async function refreshMemoryEvidence(slot, editing = false) {
   const controller = new AbortController(); slot.readController = controller;
   const current = () => connectionCurrent(owner) && memoryDialogCurrent(slot) && slot.readController === controller && !controller.signal.aborted;
   try {
-    const item = await ownedRequest(`/memories/${encodeURIComponent(slot.id)}`, { signal: controller.signal, cache: "no-store" }, owner);
+    const item = await ownedRequest(`/memories/${encodeURIComponent(slot.id)}`, { signal: controller.signal, cache: "no-store" }, owner, current);
     if (!current()) return;
     if (String(item?.id) !== slot.id) throw new Error("记忆响应不一致，请重新核查。");
     slot.item = item; slot.sourceId = item.source_id;
@@ -3492,7 +3504,7 @@ async function loadMemorySource(slot, offset, index) {
     const query = new URLSearchParams({ offset_bytes: String(offset), revision: origin.digest });
     if (slot.catalogSource) query.set("id", slot.sourceId);
     const path = slot.catalogSource ? `/memory/source?${query}` : `/memories/${encodeURIComponent(slot.id)}/source?${query}`;
-    const page = await ownedRequest(path, { signal: controller.signal, cache: "no-store" }, owner);
+    const page = await ownedRequest(path, { signal: controller.signal, cache: "no-store" }, owner, current);
     if (!current()) return;
     if (!validMemorySource(page, slot, offset)) { memoryUnavailable(slot, "原文响应不一致，请重新核查。"); return; }
     slot.page = page; slot.pageOwner = owner; slot.offsets = [...slot.offsets.slice(0, index), offset]; slot.pageIndex = index;
@@ -3524,6 +3536,10 @@ function renderMemorySource(slot) {
       const question = element("button", { type: "button", class: "text-button", text: "带资料提问", disabled: !!slot.sourceController || !!slot.sourceError || !connectionCurrent(slot.pageOwner) || !slot.pageOwner?.ready || !state.auth.authenticated || !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareSourceQuestion(slot, page, question) });
       slot.sourceRegion.append(question);
     }
+    if (ownerPreferenceSource(slot, page)) {
+      const remember = element("button", { type: "button", class: "text-button", text: "记作偏好", disabled: !!slot.sourceController || !!slot.sourceError, onClick: () => openOwnerPreference(slot, page, remember) });
+      slot.sourceRegion.append(remember);
+    }
     if (focused) position.focus({ preventScroll: true });
   }
   if (slot.sourceStart > 0) {
@@ -3543,6 +3559,121 @@ function sourceQuestionPage(slot, page) {
   return slot.catalogSource && slot.page === page && attachmentMemorySource(origin) && attachmentMemorySource(page)
     && page.source_id === slot.item.source_id && page.source_id === origin.id && page.revision === origin.digest
     && ["source", "principal", "role", "trusted_owner"].every((key) => page[key] === origin[key]);
+}
+
+function ownerPreferenceSource(slot, page) {
+  const origin = slot.item?.origin, owner = slot.pageOwner;
+  return slot.catalogSource && slot.page === page && !!page && connectionCurrent(owner) && owner.ready && state.connected && state.auth.authenticated
+    && state.view === "memories" && state.memoryTab === "sources" && typeof state.status?.store_instance_id === "string" && !!state.status.store_instance_id
+    && !!state.mainSessionId && page.session_id === state.mainSessionId && page.role === "user" && page.principal === "owner" && page.trusted_owner === true
+    && page.source_id === origin?.id && page.id === origin.id && page.revision === origin.digest && page.digest === origin.digest
+    && ["source", "session_id", "role", "principal", "trusted_owner", "total_bytes"].every((key) => page[key] === origin[key]);
+}
+
+function ownerPreferenceCurrent(slot, preference = slot.preference) {
+  return !!preference && slot.preference === preference && memoryDialogCurrent(slot) && connectionCurrent(preference.owner) && preference.owner.ready
+    && state.connected && state.auth.authenticated && state.view === "memories" && state.memoryTab === "sources"
+    && preference.store === state.status?.store_instance_id && preference.main === state.mainSessionId
+    && slot.sourceId === preference.source.source_id && slot.item?.origin?.digest === preference.source.revision;
+}
+
+function releaseOwnerPreference(slot) {
+  const preference = slot.preference; slot.preference = null;
+  if (preference.attempt && ownerPreferenceAttempts.get(preference.key) === preference.attempt) preference.attempt.state = "unknown";
+  preference.controller?.abort();
+}
+
+function openOwnerPreference(slot, page, trigger) {
+  if (!memoryDialogCurrent(slot) || slot.sourceController || slot.sourceError || !slot.sourceRegion.contains(trigger) || trigger.disabled || !ownerPreferenceSource(slot, page)) return;
+  const source = Object.freeze(Object.fromEntries(["source_id", "revision", "source", "session_id", "role", "principal", "trusted_owner", "total_bytes", "created_at"].map((key) => [key, page[key]])));
+  const store = state.status.store_instance_id, main = state.mainSessionId, key = JSON.stringify([store, main, source.source_id, source.revision]);
+  const attempt = ownerPreferenceAttempts.get(key);
+  slot.preference = { owner: slot.pageOwner, store, main, source, key, attempt, tuple: attempt?.tuple ?? null, original: page.content, quote: attempt?.tuple.quote ?? page.content, phase: attempt ? "unknown" : "editing", controller: null, receipt: null, error: "" };
+  renderOwnerPreference(slot);
+}
+
+function validOwnerPreferenceQuote(quote, original) {
+  return !!quote.trim() && Array.from(quote).length <= ownerPreferenceQuoteLimit && original.includes(quote);
+}
+
+function renderOwnerPreference(slot) {
+  if (!ownerPreferenceCurrent(slot)) return;
+  const preference = slot.preference, editing = preference.phase === "editing", busy = !!preference.controller;
+  $("#dialog-title").textContent = "记作长期偏好";
+  const submit = $("#dialog-submit"); submit.hidden = !editing; submit.textContent = "确认记住"; submit.disabled = busy;
+  dialogSubmit = editing ? () => requestOwnerPreference(slot, "confirm") : null;
+  $('#dialog-form .dialog-actions [data-action="close-dialog"]').textContent = editing ? "取消" : "关闭";
+  slot.content.setAttribute("aria-busy", String(busy));
+  slot.content.replaceChildren(element("p", { class: "settings-role-hint", text: `${state.status?.preview ? "本页内存模拟，只记住你确认的原话。" : "只记住你确认的原话，用作长期偏好。"} 每次最多选择 ${ownerPreferenceQuoteLimit} 个字符。` }));
+  if (editing) {
+    slot.content.append(element("p", { class: "memory-source-content", text: preference.original }), field("选取原话（逐字）", "quote", preference.quote, { type: "textarea", required: true, maxLength: preference.original.length }));
+    const input = $('textarea[name="quote"]', slot.content);
+    const changed = () => {
+      if (!ownerPreferenceCurrent(slot, preference) || preference.phase !== "editing" || !slot.content.contains(input)) return;
+      preference.quote = input.value; submit.disabled = !validOwnerPreferenceQuote(input.value, preference.original);
+    };
+    input.addEventListener("input", changed); changed();
+  } else slot.content.append(element("blockquote", { class: "memory-original-quote", text: preference.tuple.quote }));
+  const messages = { pending: "正在确认…", unknown: "结果尚未确认，请先核对，勿重复提交。", present: "对应条目当前存在。", absent: "当前没有找到对应条目。" };
+  if (messages[preference.phase]) slot.content.append(element("p", { role: "status", text: messages[preference.phase] }));
+  if (preference.error) slot.content.append(element("p", { class: "form-error", role: "status", text: preference.error }));
+  const item = preference.receipt?.item;
+  if (item) {
+    const status = { active: "生效中", conflict: "待核对", superseded: "已替代", forgotten: "已遗忘" }[item.status] ?? item.status;
+    slot.content.append(element("p", { class: "memory-current-content", text: item.content }), statusList([["记忆 ID", item.id], ["记忆版本", String(item.version)], ["类型", memoryKind(item.kind)], ["层次", memoryKind(item.layer)], ["状态", status], ["可信标记", item.trusted_owner ? "主人来源" : "未标为主人来源"]]), element("h3", { class: "memory-section-title", text: "条目原始引文" }), element("blockquote", { text: item.quote }));
+  }
+  const action = (text, callback) => {
+    const button = element("button", { type: "button", class: "text-button", text, disabled: busy, onClick: () => { if (ownerPreferenceCurrent(slot, preference) && slot.content.contains(button) && !button.disabled) void callback(button); } });
+    slot.content.append(button);
+  };
+  if (["unknown", "present", "absent"].includes(preference.phase)) action("核对结果", () => requestOwnerPreference(slot, "inspect"));
+  if (preference.phase === "absent") action("重新选择原话", () => { preference.phase = "editing"; preference.tuple = null; preference.error = ""; renderOwnerPreference(slot); });
+  if (item) {
+    action("核查条目", (button) => showMemoryEvidence(item.id, { trigger: button }));
+    action("核原文", (button) => openCatalogSource(preference.source, button));
+  }
+  slot.content.append(element("details", { class: "advanced-settings" }, element("summary", { text: "来源与版本" }), statusList([["来源 ID", preference.source.source_id], ["原文版本", preference.source.revision], ["原会话", preference.source.session_id], ["身份", preference.source.principal]])));
+  if (editing) $('textarea[name="quote"]', slot.content).focus({ preventScroll: true });
+}
+
+function validOwnerPreferenceReceipt(value, tuple) {
+  if (!value || Object.keys(value).sort().join(",") !== "item,quote,revision,source_id,state" || !["absent", "present"].includes(value.state)
+    || ["source_id", "revision", "quote"].some((key) => value[key] !== tuple[key])) return false;
+  if (value.state === "absent") return value.item === null;
+  const item = value.item;
+  return !!item && Object.keys(item).sort().join(",") === "content,id,kind,layer,quote,source_id,status,trusted_owner,version"
+    && ["id", "content", "kind", "layer", "quote", "status"].every((key) => typeof item[key] === "string" && !!item[key])
+    && item.source_id === tuple.source_id && typeof item.trusted_owner === "boolean" && Number.isSafeInteger(item.version) && item.version > 0;
+}
+
+async function requestOwnerPreference(slot, action) {
+  if (!ownerPreferenceCurrent(slot)) return;
+  const preference = slot.preference;
+  if (preference.controller || (action === "confirm" ? preference.phase !== "editing" || ownerPreferenceAttempts.has(preference.key) : !["unknown", "present", "absent"].includes(preference.phase))) return;
+  if (action === "confirm") {
+    const quote = $('textarea[name="quote"]', slot.content).value;
+    if (!validOwnerPreferenceQuote(quote, preference.original)) { preference.quote = quote; preference.error = `请选择这段原文中不超过 ${ownerPreferenceQuoteLimit} 个字符的连续原话。`; renderOwnerPreference(slot); return; }
+    preference.tuple = Object.freeze({ source_id: preference.source.source_id, revision: preference.source.revision, quote });
+    preference.attempt = { tuple: preference.tuple, state: "pending" }; ownerPreferenceAttempts.set(preference.key, preference.attempt);
+    preference.phase = "pending";
+  }
+  const controller = new AbortController(); preference.controller = controller; preference.error = "";
+  const current = () => ownerPreferenceCurrent(slot, preference) && preference.controller === controller && !controller.signal.aborted;
+  renderOwnerPreference(slot);
+  try {
+    const receipt = await ownedRequest("/memory/preferences/from-source", { method: "POST", body: { action, ...preference.tuple }, cache: "no-store", signal: controller.signal }, preference.owner, current);
+    if (!current()) return;
+    if (!validOwnerPreferenceReceipt(receipt, preference.tuple)) throw new Error("回执不完整，请核对结果。");
+    if (ownerPreferenceAttempts.get(preference.key) === preference.attempt) ownerPreferenceAttempts.delete(preference.key);
+    preference.attempt = null; preference.receipt = receipt; preference.phase = receipt.state;
+  } catch (error) {
+    if (!current()) return;
+    preference.attempt ??= { tuple: preference.tuple, state: "unknown" };
+    preference.attempt.state = "unknown"; ownerPreferenceAttempts.set(preference.key, preference.attempt);
+    preference.phase = "unknown"; preference.receipt = null; preference.error = error.message;
+  } finally {
+    if (current()) { preference.controller = null; renderOwnerPreference(slot); }
+  }
 }
 
 async function prepareSourceQuestion(slot, page, trigger) {

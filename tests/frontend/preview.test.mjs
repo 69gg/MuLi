@@ -198,6 +198,7 @@ test("preview keeps a question's saved original separate from upload references 
 
 test("preview compares its explicit demo pair and retains exact readable source coordinates", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const sourceCount = backend.state.memorySources.length;
   const sources = backend.state.memorySources.filter((item) => item.comparisonDemo);
   assert.equal(sources.length, 2);
   const [left, right] = sources;
@@ -213,7 +214,7 @@ test("preview compares its explicit demo pair and retains exact readable source 
   assert.equal((await compare({ ...pair, right_revision: "0".repeat(64) })).status, 409);
   assert.equal((await compare({ ...pair, cursor: "unrelated" })).status, 400);
   assert.equal((await (await compare({ ...pair, right_id: left.source_id, right_revision: left.revision })).json()).status, "equal");
-  assert.equal(backend.state.memorySources.length, 4);
+  assert.equal(backend.state.memorySources.length, sourceCount);
 });
 
 async function json(backend, path, method = "GET", body) {

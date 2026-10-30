@@ -181,6 +181,11 @@ class MemorySourceRetryInput(Input):
     revision: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
+class MemorySourcePreferenceInput(MemorySourceRetryInput):
+    action: Literal["inspect", "confirm"]
+    quote: str = Field(min_length=1, max_length=12000, strict=True)
+
+
 class MemoryWatchCancelInput(Input):
     id: str = Field(pattern=r"^[a-f0-9]{64}$", strict=True)
 
@@ -1280,6 +1285,27 @@ def _create_app(
             pipeline = memory_application.pipeline
         if result["accepted"]:
             await pipeline._publish(result["source_id"])
+        return result
+
+    @app.post("/api/memory/preferences/from-source")
+    async def owner_source_preference(body: MemorySourcePreferenceInput) -> dict[str, Any]:
+        """核对或明确保存当前主人原话为偏好；回执只说明现存条目的当前事实。
+
+        inspect 严格只读。两种操作均沿认证与维护准入；不登记来源、排队或调用模型。
+        item 仅含 id/version/kind/layer/status/content/quote/source_id/trusted_owner；
+        已更正或被替代的条目不会恢复，absent 不证明此前从未接纳这段原话。
+        """
+        async with runtime.configuration_lock:
+            if configuration_closing:
+                raise MaintenanceError("transaction_unavailable", "service_closing")
+            revision = runtime.memory.revision
+            result = memory_application.source_preference(body.model_dump())
+            changed = runtime.memory.revision != revision
+        if changed:
+            await runtime.bus.emit(
+                "memory.updated",
+                {"memory_ids": [result["item"]["id"]], "source_id": result["source_id"]},
+            )
         return result
 
     @app.post("/api/memory/reindex")

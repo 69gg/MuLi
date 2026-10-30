@@ -106,6 +106,7 @@ export function createPreviewState() {
     memorySources: [
       { source_id: `attachment:${notesAttachmentId}`, source: `attachment:${notesAttachmentId}:${notesRevision}`, content: notes, session_id: main.id, role: "tool", principal: "external:attachment", trusted_owner: false, revision: notesRevision, created_at: now - 3600, job: { state: "failed", attempts: 3, last_error: "RuntimeError" } },
       { source_id: "preview-source-guide", source: "前端演示资料", content: "这是已整理的示例原文🙂。\n所有操作只改变本页演示数据。", session_id: main.id, role: "tool", principal: "external:preview", trusted_owner: false, revision: "b".repeat(64), created_at: now - 7200, job: { state: "done", attempts: 1, last_error: "" } },
+      { source_id: "preview-owner-preference", source: "web", content: "讲数学题时，先给一个直观例子，再推公式。\n这是本页保存的主人原话示例。", session_id: main.id, role: "user", principal: "owner", trusted_owner: true, revision: "a".repeat(64), created_at: now - 7000, job: { state: "done", attempts: 1, last_error: "" } },
       ...[["e", "c", "1", "期限：七日\n材料：学生证\n"], ["f", "d", "2", "期限：十日\n材料：身份证\n"]].map(([id, original, revision, content]) => ({ source_id: `attachment:${id.repeat(32)}`, source: `attachment:${id.repeat(32)}:${original.repeat(64)}`, content, session_id: "", role: "tool", principal: "external:attachment", trusted_owner: false, revision: revision.repeat(64), source_revision: original.repeat(64), format: "text", scope: "utf8_text", document_revision: null, attachment_id: id.repeat(32), created_at: now - 1800, job: { state: "done", attempts: 1, last_error: "" }, comparisonDemo: true })),
     ].map((item) => ({ ...item, total_bytes: encoder.encode(item.content).length })),
     members: [
@@ -729,6 +730,29 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
       if (!content && offset < raw.length) return failure("本段不足以容纳一个完整字符。");
       const { content: original, job, ...metadata } = item;
       return response({ ...metadata, id: item.source_id, digest: item.revision, field: "content", content, offset_bytes: offset, length_bytes: end - offset, next_offset_bytes: end, total_bytes: raw.length, has_more: end < raw.length, truncated: offset > 0 || end < raw.length });
+    }
+    if (path === "/memory/preferences/from-source" && method === "POST") {
+      if (Object.keys(body).sort().join(",") !== "action,quote,revision,source_id" || !["inspect", "confirm"].includes(body.action)
+        || typeof body.source_id !== "string" || !body.source_id || typeof body.revision !== "string" || !/^[a-f0-9]{64}$/u.test(body.revision)
+        || typeof body.quote !== "string" || !body.quote.trim() || Array.from(body.quote).length > 12000) return failure("请选择准确来源、版本与逐字原话。", 422);
+      if (!state.settings.memory.enabled) return failure("记忆未启用。", 409);
+      const source = state.memorySources.find((item) => item.source_id === body.source_id);
+      if (!source) return failure("原文已不可用。", 404);
+      if (source.revision !== body.revision) return failure("原文版本已变化。", 409);
+      if (source.role !== "user" || source.principal !== "owner" || source.trusted_owner !== true || source.session_id !== state.sessions[0].id) return failure("此来源不是当前主对话的主人原话。", 409);
+      if (!source.content.includes(body.quote)) return failure("请选择原文中的连续原话。", 422);
+      const normalized = (value) => value.normalize("NFKC").toLowerCase().replace(/\s+/gu, " ").trim();
+      let item = state.memories.find((entry) => entry.source_id === source.source_id && typeof entry.quote === "string" && normalized(entry.quote) === normalized(body.quote));
+      const fresh = !item && body.action === "confirm";
+      if (fresh) item = { id: identifier("memory"), version: 1, kind: "preference", layer: "preference", status: "active", content: body.quote.trim(), quote: body.quote, source_id: source.source_id, trusted_owner: true };
+      const projected = item ? Object.fromEntries(["id", "version", "kind", "layer", "status", "content", "quote", "source_id", "trusted_owner"].map((key) => [key, item[key]])) : null;
+      const receipt = { state: item ? "present" : "absent", source_id: body.source_id, revision: body.revision, quote: body.quote, item: projected };
+      if (Array.from(JSON.stringify(receipt)).length > state.settings.limits.max_output_chars) return failure("完整偏好回执超过当前输出预算。", 400);
+      if (fresh) {
+        if (atCapacity(state.memories)) return failure("演示记忆数量已达上限。", 429);
+        state.memories.unshift({ ...item, source: source.source, confidence: 1, entities: [], relations: [], conflicts: [], created_at: timestamp(), updated_at: timestamp() });
+      }
+      return response(receipt);
     }
     if (path === "/memory/sources/compare" && method === "POST") {
       if (Object.keys(body).some((key) => !["left_id", "left_revision", "right_id", "right_revision", "cursor"].includes(key))) return failure("比较参数无效。", 422);

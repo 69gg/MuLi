@@ -58,6 +58,13 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False)
 
 
+def extraction_key(source_id: str, layer: str, content: str) -> str:
+    """Keep extraction writes and read-only outcome checks on the same identity."""
+    return hashlib.sha256(
+        _json([source_id, layer, normalize_entity(content)]).encode("utf-8")
+    ).hexdigest()
+
+
 def source_digest(source: Mapping[str, Any], *, trusted_owner: bool) -> str:
     """Use the same complete source identity for registration and host proofs."""
     return hashlib.sha256(
@@ -776,9 +783,7 @@ class Memory:
                 if layer in {"identity", "preference"} and not original["trusted_owner"]:
                     continue
                 content = str(proposal["content"])
-                key = hashlib.sha256(
-                    _json([source_id, layer, normalize_entity(content)]).encode("utf-8")
-                ).hexdigest()
+                key = extraction_key(source_id, layer, content)
                 identifier = self._save(
                     content=content,
                     kind=_LAYER_KIND[layer],
@@ -800,6 +805,44 @@ class Memory:
             self._rebuild_communities(affected)
             self._purge_orphans()
         return [item for identifier in identifiers if (item := self.get(identifier)) is not None]
+
+    def extraction_item(
+        self, source_id: str, layer: str, content: str, *, max_output_chars: int
+    ) -> dict[str, Any] | None:
+        """Read one current outcome without loading its graph, history or source."""
+        validate_integer(max_output_chars, "max_output_chars", minimum=1)
+        text_fields = ("id", "kind", "layer", "status", "content", "quote", "source_id")
+        fields = (*text_fields, "version", "trusted_owner")
+        valid = " AND ".join(f"typeof({field})='text'" for field in text_fields)
+        valid += (
+            " AND typeof(version)='integer' AND version>=1 "
+            "AND typeof(trusted_owner)='integer' AND trusted_owner IN (0,1)"
+        )
+        size = "+".join(f"length(CAST({field} AS BLOB))" for field in text_fields)
+        row = self.store.db.execute(
+            "WITH candidate AS (SELECT m.id,m.kind,x.layer,x.status,m.content,x.quote,"
+            "x.source_id,x.version,x.trusted_owner FROM memory_meta x "
+            "JOIN memories m ON m.id=x.memory_id WHERE x.dedup_key=?) "
+            f"SELECT ({valid}) AS valid,({size}) AS bytes,"
+            + ",".join(
+                f"CASE WHEN ({valid}) AND ({size})<=? THEN {field} END AS {field}"
+                for field in fields
+            )
+            + " FROM candidate",
+            (
+                extraction_key(source_id, layer, content),
+                *([min(max_output_chars * 4, sys.maxsize)] * len(fields)),
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        if not row["valid"]:
+            raise EvidenceError("content_unavailable", "现存记忆无法完整核查")
+        if row["bytes"] > min(max_output_chars * 4, sys.maxsize):
+            raise EvidenceError("output_budget", "当前记忆超过完整回执预算")
+        item = {field: row[field] for field in fields}
+        item["trusted_owner"] = bool(item["trusted_owner"])
+        return item
 
     def automatic_episode_id(self, source_id: str) -> str | None:
         """只投影仍可证明是指定来源初始自动归档副本的主键。"""

@@ -41,6 +41,7 @@ from muli.reply_memory_source import (
 )
 from muli.runtime import PreparedRequest, Runtime
 from muli.source_comparison import ComparisonPolicy, compare_sources
+from muli.store import new_id
 from muli.tools import Tool, parameters, string
 from muli.webpage_snapshot import WEBPAGE_NOTICE, parse_webpage_snapshot
 
@@ -1223,6 +1224,129 @@ class MemoryApplication:
             args["revision"],
             max_output_chars=self.runtime.config.settings.limits.max_output_chars,
         )
+
+    def source_preference(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Inspect or explicitly remember one exact quote from the current owner source."""
+        if args.keys() != {"action", "source_id", "revision", "quote"}:
+            raise EvidenceError("invalid_arguments", "偏好确认只接受操作、来源、版本与原话")
+        action, source_id, revision, quote = (
+            args["action"],
+            args["source_id"],
+            args["revision"],
+            args["quote"],
+        )
+        if (
+            not isinstance(action, str)
+            or action not in {"inspect", "confirm"}
+            or not isinstance(source_id, str)
+            or not 1 <= len(source_id) <= 200
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[a-f0-9]{64}", revision) is None
+            or not isinstance(quote, str)
+            or not quote.strip()
+            or not 1 <= len(quote) <= 12000
+        ):
+            raise EvidenceError("invalid_arguments", "请提供准确来源版本与连续的偏好原话")
+        runtime, memory = self.runtime, self.runtime.memory
+        settings = runtime.config.settings
+        if self._closed or runtime._closing or not settings.memory.enabled:
+            raise EvidenceError("invalid_arguments", "记忆处理未启用或正在关闭")
+        runtime.maintenance.admission.require()
+        main_id = runtime.store.existing_main_session_id()
+        main = (
+            runtime.store.bounded_object(
+                "session",
+                main_id,
+                max_bytes=settings.limits.max_output_chars * 4,
+                strict_json=True,
+            )
+            if main_id is not None
+            else None
+        )
+        if main is None or main.get("kind") != "main" or main.get("principal") != "owner":
+            raise EvidenceError("invalid_arguments", "当前持久主会话无法核对")
+        # Bound every field that source() will load before its complete text read.
+        row = runtime.store.db.execute(
+            "SELECT NOT EXISTS (SELECT 1 FROM memory_forgotten_sources f WHERE f.id=s.id) "
+            "AS available,typeof(content)='text' AS text_content,"
+            "length(CAST(content AS BLOB)) AS content_bytes,"
+            "(typeof(source)='text' AND length(CAST(source AS BLOB))<=? "
+            "AND typeof(created_at) IN ('integer','real')) AS metadata_valid,"
+            "(role='user' AND principal='owner' AND session_id=? "
+            "AND typeof(trusted_owner)='integer' AND trusted_owner=1) AS owner,"
+            "CASE WHEN typeof(digest)='text' AND length(CAST(digest AS BLOB))=64 "
+            "THEN CAST(digest AS BLOB) END AS digest "
+            "FROM memory_sources s WHERE s.id=?",
+            (1000 * 4, main_id, source_id),
+        ).fetchone()
+        if row is None or not row["available"]:
+            raise EvidenceError("evidence_not_found", "原文不存在或已被忘记")
+        if not row["owner"]:
+            raise EvidenceError("invalid_arguments", "只有当前主会话的真实主人原话可以确认偏好")
+        if not row["text_content"] or not row["metadata_valid"]:
+            raise EvidenceError("content_unavailable", "来源内容或身份元数据无法完整核查")
+        max_chars = min(settings.memory.max_source_chars, self.pipeline.config.max_source_chars)
+        if row["content_bytes"] > max_chars * 4:
+            raise EvidenceError("output_budget", "完整原文超过当前来源预算，未确认节选")
+        raw_digest = row["digest"]
+        if not isinstance(raw_digest, bytes) or raw_digest != revision.encode("ascii"):
+            raise EvidenceError("evidence_changed", "原文版本已变化，请重新核对")
+        original = memory.source(source_id)
+        if original is None:
+            raise EvidenceError("evidence_not_found", "原文不存在或已被忘记")
+        if len(original["content"]) > max_chars:
+            raise EvidenceError("output_budget", "完整原文超过当前来源字数预算，未确认节选")
+        if len(original["source"]) > 1000 or not math.isfinite(original["created_at"]):
+            raise EvidenceError("content_unavailable", "来源元数据无法完整核查")
+        if source_digest(original, trusted_owner=True) != revision:
+            raise EvidenceError("evidence_changed", "原文内容或身份已变化，请重新核对")
+        if quote not in original["content"]:
+            raise EvidenceError("invalid_arguments", "偏好原话必须逐字连续来自这份原文")
+        item = memory.extraction_item(
+            source_id, "preference", quote, max_output_chars=settings.limits.max_output_chars
+        )
+        absent = item is None
+        result: dict[str, Any] = {
+            "state": "absent" if item is None else "present",
+            "source_id": source_id,
+            "revision": revision,
+            "quote": quote,
+            "item": item,
+        }
+        if item is None and action == "confirm":
+            # new_id() has one fixed encoding. The other receipt fields are exact;
+            # allocate no durable identity or timestamp before this complete check.
+            item = {
+                "id": new_id(),
+                "version": 1,
+                "kind": "preference",
+                "layer": "preference",
+                "status": "active",
+                "content": quote.strip(),
+                "quote": quote,
+                "source_id": source_id,
+                "trusted_owner": True,
+            }
+            result.update(state="present", item=item)
+        if json_size(result) > settings.limits.max_output_chars:
+            raise EvidenceError("output_budget", "完整偏好回执超过当前输出预算，未确认")
+        if action == "confirm" and absent and item is not None:
+            # No await or source registration separates the preflight and commit.
+            saved = memory.apply_extraction(
+                source_id,
+                [
+                    {
+                        "layer": "preference",
+                        "content": quote,
+                        "quote": quote,
+                        "entities": [],
+                        "relations": [],
+                        "claim_key": "",
+                    }
+                ],
+            )[0]
+            result["item"] = {field: saved[field] for field in item}
+        return result
 
     @staticmethod
     async def _read_attachment(
