@@ -4133,7 +4133,7 @@ function proactiveRouteFields(destination, path) {
 }
 
 function deliveryLabel(value) {
-  return ({ pending: "待发送", retry: "待重试", sending: "发送中", sent: "已发送", failed: "发送失败", blocked: "原路投递受阻", unknown: "结果未知" })[value] ?? value;
+  return ({ pending: "待发送", retry: "待重试", sending: "发送中", sent: "已发送", failed: "发送失败", blocked: "原路投递受阻", unknown: "结果未知", cancelled: "已取消" })[value] ?? value;
 }
 
 function renderDeliveries() {
@@ -4142,7 +4142,7 @@ function renderDeliveries() {
   details.append(actionButton("查看发送内容", "channel-deliveries", "text-button field-top-space", "search"));
   const deliveries = state.channels.deliveries ?? [];
   if (!deliveries.length) details.append(element("p", { class: "settings-role-hint", text: "暂无发送记录。" }));
-  for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown", "blocked"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
+  for (const item of deliveries) details.append(element("article", { class: "management-item" }, element("div", { class: "management-item-heading" }, element("strong", { text: CHANNELS.find(([key]) => key === item.name)?.[1] ?? item.name }), element("span", { text: deliveryLabel(item.state) })), element("p", { text: [item.target ?? item.route?.target, item.created_at && formatFullDate(item.created_at)].filter(Boolean).join(" · ") }), item.state === "cancelled" && element("p", { class: "settings-role-hint", text: "已取消仅表示之后不再领取，不代表过去从未外发。" }), item.last_error && element("p", { class: "form-error", text: item.last_error }), ["failed", "unknown", "blocked"].includes(item.state) && actionButton("重试发送", "retry-delivery", "text-button field-top-space", "refresh", { id: item.id })));
   return details;
 }
 
@@ -4210,7 +4210,7 @@ function channelDeliveryHeaderValid(page, scope) {
 }
 
 function channelDeliveryMetadataValid(item) {
-  return item && ["pending", "retry", "sending", "sent", "failed", "blocked", "unknown"].includes(item.state)
+  return item && ["pending", "retry", "sending", "sent", "failed", "blocked", "unknown", "cancelled"].includes(item.state)
     && Number.isSafeInteger(item.total_parts) && item.total_parts > 0 && Number.isSafeInteger(item.confirmed_parts) && item.confirmed_parts >= 0 && item.confirmed_parts <= item.total_parts
     && typeof item.created_at === "number" && Number.isFinite(item.created_at) && item.created_at > 0
     && Array.isArray(item.attachment_ids) && item.attachment_ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256);
@@ -4320,6 +4320,7 @@ function renderChannelDeliveryDialog(slot) {
     if (slot.page) {
       root.append(element("nav", { class: "history-navigation", "aria-label": "发送记录分页" }, element("button", { type: "button", class: "text-button", text: "上一页", disabled: slot.starts.length < 2, onClick: () => void loadChannelDeliveryPage(slot, slot.starts.at(-2), slot.starts.slice(0, -1)) }), element("span", { class: "history-position", tabIndex: -1, text: `第 ${slot.starts.length} 页 · ${slot.page.has_more ? "尚有更早记录" : "本次查询已到末页"}` }), element("button", { type: "button", class: "text-button", text: "下一页", disabled: !slot.page.has_more, onClick: () => void loadChannelDeliveryPage(slot, slot.page.next_cursor, [...slot.starts, slot.page.next_cursor]) })));
       if (slot.page.omitted) root.append(element("p", { class: "history-note", text: `此页有 ${slot.page.omitted} 条候选记录未能完整核验，已省略。` }));
+      if (slot.page.items.some((item) => item.state === "cancelled")) root.append(element("p", { class: "history-note", text: "已取消仅表示之后不再领取；平台确认数不代表过去从未外发。" }));
       for (const item of slot.page.items) root.append(element("article", { class: "history-message" }, element("p", { text: `${deliveryLabel(item.state)} · 平台已确认 ${item.confirmed_parts}/${item.total_parts} 分段 · ${formatFullDate(item.created_at)}` }), element("p", { class: "history-note", text: `投递 ID：${item.id}` }), renderChannelDeliveryAttachments(item.attachment_ids), element("button", { type: "button", class: "text-button", text: "查看分段", dataset: { channelDeliveryId: item.id }, onClick: () => void selectChannelDelivery(slot, item) })));
       if (!slot.page.items.length) root.append(element("p", { role: "status", text: slot.page.has_more ? "此页没有可展示记录，仍可手动读取下一页。" : "此页没有保存的发送记录。" }));
     }
@@ -4327,6 +4328,7 @@ function renderChannelDeliveryDialog(slot) {
     root.append(element("button", { type: "button", class: "text-button", text: "返回记录", onClick: () => void loadChannelDeliveryPage(slot, slot.cursor, slot.starts, slot.selected.id) }));
     const item = slot.bodyPage ?? slot.selected;
     root.append(element("p", { class: "history-note", text: `投递 ID：${slot.selected.id} · ${deliveryLabel(item.state)} · 平台已确认 ${item.confirmed_parts}/${item.total_parts} 分段` }), element("nav", { class: "history-navigation", "aria-label": "发送分段" }, element("button", { type: "button", class: "text-button", text: "上一分段", disabled: slot.part === 0, onClick: () => void loadChannelDeliveryContent(slot, slot.part - 1) }), element("span", { class: "history-position", tabIndex: -1, text: `分段 ${slot.part + 1}/${item.total_parts} · ${channelDeliveryPartLabel(item, slot.part)}` }), element("button", { type: "button", class: "text-button", text: "下一分段", disabled: slot.part + 1 >= item.total_parts, onClick: () => void loadChannelDeliveryContent(slot, slot.part + 1) })));
+    if (item.state === "cancelled") root.append(element("p", { class: "history-note", text: "已取消仅表示之后不再领取；平台确认数不代表过去从未外发。" }));
     const page = slot.bodyPage;
     if (page) {
       root.append(element("nav", { class: "history-navigation", "aria-label": "分段正文窗口" }, element("button", { type: "button", class: "text-button", text: "上一窗口", disabled: slot.offsets.length < 2, onClick: () => void loadChannelDeliveryContent(slot, slot.part, slot.offsets.at(-2), slot.offsets.slice(0, -1), slot.revision, slot.totalBytes) }), element("span", { class: "history-position", tabIndex: -1, text: `字节 ${page.offset_bytes}–${page.next_offset_bytes}/${page.total_bytes} · ${page.has_more ? "尚有后文" : "已到本分段末尾"}` }), element("button", { type: "button", class: "text-button", text: "下一窗口", disabled: !page.has_more, onClick: () => void loadChannelDeliveryContent(slot, slot.part, page.next_offset_bytes, [...slot.offsets, page.next_offset_bytes], slot.revision, slot.totalBytes) })));

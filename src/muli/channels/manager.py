@@ -14,7 +14,9 @@ import httpx
 from muli.attachments import Attachments, file_io
 from muli.channel_health import POLLING_FAILURES
 from muli.events import EventBus
+from muli.evidence import decode_utf8
 from muli.maintenance import Admission
+from muli.management_transaction import _object
 from muli.permissions import ApprovalNotice
 from muli.proactive import FrozenRouting
 from muli.reply_origin import (
@@ -24,7 +26,7 @@ from muli.reply_origin import (
     authorize_route,
     channel_account,
 )
-from muli.store import Store, new_id, now
+from muli.store import SQLITE_MAX_INTEGER, Store, new_id, now
 
 from .adapters import QQ, Adapter, OneBot, Telegram
 from .types import (
@@ -925,6 +927,178 @@ class ChannelManager:
         ).fetchall()
         return [item for row in rows if (item := self.delivery(row[0])) is not None]
 
+    def _cancellation_record(
+        self, identifier: str, *, name: str, owner_id: str, max_bytes: int
+    ) -> tuple[dict[str, Any], tuple[bytes, bytes, bytes]]:
+        # The primary-key lookup admits the complete evidence before exporting
+        # any JSON. A valid-looking prefix is never enough to cancel a record.
+        bounded = (
+            "typeof(name)='text' AND typeof(state)='text' AND typeof(route)='text' "
+            "AND typeof(payload)='text' AND typeof(receipts)='text' "
+            "AND length(CAST(name AS BLOB))+length(CAST(state AS BLOB))"
+            "+length(CAST(route AS BLOB))+length(CAST(payload AS BLOB))"
+            "+length(CAST(receipts AS BLOB))<=:budget"
+        )
+        valid = "json_valid(route) AND json_valid(payload) AND json_valid(receipts)"
+        columns = ",".join(
+            f"CASE WHEN {bounded} THEN CASE WHEN {valid} THEN CAST({field} AS BLOB) END END AS {field}"
+            for field in ("route", "payload", "receipts")
+        )
+        row = self.store.db.execute(
+            f"SELECT CASE WHEN {bounded} THEN name END AS name,"
+            f"CASE WHEN {bounded} THEN state END AS state,"
+            "CASE WHEN typeof(next_part)='integer' THEN next_part END AS next_part,"
+            + columns
+            + " FROM channel_outbox WHERE id=:id",
+            {"id": identifier, "budget": max_bytes},
+        ).fetchone()
+        if row is None:
+            raise ChannelError("投递不存在或不属于所选主人私聊", status_code=404)
+        if row["name"] is None:
+            raise ChannelError("投递证据损坏或超过核查预算，未取消", status_code=409)
+        if row["name"] != name:
+            raise ChannelError("投递不存在或不属于所选主人私聊", status_code=404)
+        raw = tuple(row[field] for field in ("route", "payload", "receipts"))
+        if any(not isinstance(value, bytes) for value in raw):
+            raise ChannelError("投递证据损坏或超过核查预算，未取消", status_code=409)
+        route_raw, payload_raw, receipts_raw = raw
+        try:
+            route, payload = _object(route_raw), _object(payload_raw)
+            receipts = json.loads(decode_utf8(receipts_raw, allow_incomplete_tail=False))
+            # Reject duplicate object keys, nonfinite metadata and escaped lone
+            # surrogates rather than manufacturing a current source identity.
+            json.dumps([route, payload, receipts], ensure_ascii=False, allow_nan=False).encode(
+                "utf-8", errors="strict"
+            )
+        except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+            raise ChannelError("投递证据不能完整核验，未取消", status_code=409) from None
+        if (
+            route.get("name") != name
+            or route.get("account_id") != self._account(name)
+            or route.get("kind") != "private"
+            or route.get("sender_id") != owner_id
+            or route.get("target") != owner_id
+        ):
+            raise ChannelError("投递不存在或不属于当前账号与主人私聊", status_code=404)
+        self._route(name, route, outbound=True)
+        parts = payload.get("parts")
+        confirmed, state = row["next_part"], row["state"]
+        if (
+            not isinstance(parts, list)
+            or not parts
+            or any(
+                not isinstance(part, dict)
+                or not (
+                    (isinstance(part.get("text"), str) and "attachment_id" not in part)
+                    or (
+                        isinstance(part.get("attachment_id"), str)
+                        and bool(part["attachment_id"])
+                        and "text" not in part
+                    )
+                )
+                for part in parts
+            )
+            or type(confirmed) is not int
+            or not 0 <= confirmed <= len(parts)
+            or not isinstance(receipts, list)
+            or any(not isinstance(receipt, str) or not receipt for receipt in receipts)
+            or len(receipts) != confirmed
+            or state
+            not in {
+                "pending",
+                "retry",
+                "sending",
+                "sent",
+                "failed",
+                "blocked",
+                "unknown",
+                "cancelled",
+            }
+            or (state == "cancelled" and confirmed != 0)
+        ):
+            raise ChannelError("投递进度或回执不能完整核验，未取消", status_code=409)
+        return (
+            {
+                "id": identifier,
+                "channel": name,
+                "owner_id": owner_id,
+                "state": state,
+                "cancelled": state == "cancelled",
+                "confirmed_parts": confirmed,
+                "total_parts": len(parts),
+            },
+            (route_raw, payload_raw, receipts_raw),
+        )
+
+    async def cancel(
+        self,
+        identifier: str,
+        *,
+        name: str,
+        owner_id: str,
+        max_bytes: int,
+        admission_guard: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Commit no future dispatch; this cannot recall past platform effects."""
+        self.admission.require()
+        if (
+            self._closed
+            or not isinstance(identifier, str)
+            or not identifier
+            or "\x00" in identifier
+            or type(max_bytes) is not int
+            or not 1 <= max_bytes <= SQLITE_MAX_INTEGER
+        ):
+            raise ChannelError("取消需要当前管理器、准确投递 ID 与有效核查预算")
+        try:
+            if len(identifier.encode("utf-8", errors="strict")) > max_bytes:
+                raise ValueError
+        except (ValueError, UnicodeError):
+            raise ChannelError("投递 ID 超过预算或包含无效字符") from None
+        profile = self.config.profile(name)
+        if (
+            not profile.enabled
+            or not isinstance(owner_id, str)
+            or owner_id not in profile.owner_ids
+        ):
+            raise ChannelError("只能取消当前已启用渠道的已绑定主人私聊", status_code=403)
+        if admission_guard is not None:
+            admission_guard()
+        changed = False
+        with self.store.db:
+            result, raw = self._cancellation_record(
+                identifier, name=name, owner_id=owner_id, max_bytes=max_bytes
+            )
+            if result["state"] in {"pending", "retry"} and result["confirmed_parts"] == 0:
+                if admission_guard is not None:
+                    admission_guard()
+                changed = (
+                    self.store.db.execute(
+                        "UPDATE channel_outbox SET state='cancelled',updated_at=? "
+                        "WHERE id=? AND name=? AND state IN ('pending','retry') "
+                        "AND typeof(next_part)='integer' AND next_part=0 "
+                        "AND CAST(route AS BLOB)=? AND CAST(payload AS BLOB)=? AND CAST(receipts AS BLOB)=?",
+                        (now(), identifier, name, *raw),
+                    ).rowcount
+                    == 1
+                )
+                if changed:
+                    result.update(state="cancelled", cancelled=True)
+                else:
+                    result, _ = self._cancellation_record(
+                        identifier, name=name, owner_id=owner_id, max_bytes=max_bytes
+                    )
+        if changed:
+            self._wake.set()
+            try:
+                await self._publish()
+            except Exception:
+                # The durable decision stands even when event publication is
+                # unavailable. Existing waiters must still observe its terminal.
+                async with self.changed:
+                    self.changed.notify_all()
+        return result
+
     async def retry(self, identifier: str, *, allow_unknown: bool = False) -> dict[str, Any]:
         item = self.delivery(identifier)
         if item is None:
@@ -965,7 +1139,7 @@ class ChannelManager:
             return (
                 self._stopped
                 or item is None
-                or item["state"] in {"sent", "failed", "unknown", "blocked"}
+                or item["state"] in {"sent", "failed", "unknown", "blocked", "cancelled"}
             )
 
         async with self.changed:
@@ -1037,13 +1211,19 @@ class ChannelManager:
             await asyncio.sleep(0)
 
     async def _send_item(self, item: dict[str, Any]) -> None:
+        with self.store.db:
+            claimed = self.store.db.execute(
+                "UPDATE channel_outbox SET state='sending',attempts=attempts+1,updated_at=? "
+                "WHERE id=? AND state IN ('pending','retry')",
+                (now(), item["id"]),
+            ).rowcount
+            if not claimed:
+                return
+            current = self.delivery(item["id"])
+            assert current is not None
+            item = current
         adapter = self.adapters[item["name"]]
         adapter.delivery_started = False
-        with self.store.db:
-            self.store.db.execute(
-                "UPDATE channel_outbox SET state='sending',attempts=attempts+1,updated_at=? WHERE id=?",
-                (now(), item["id"]),
-            )
         try:
             self._outbox_guard(item["name"], item["route"], item["payload"])
             route = self._route(item["name"], item["route"], outbound=True)
@@ -1102,7 +1282,7 @@ class ChannelManager:
                 error.uncertain if isinstance(error, ChannelError) else adapter.delivery_started
             )
             retryable = isinstance(error, ChannelError) and error.retryable
-            attempts = item["attempts"] + 1
+            attempts = item["attempts"]
             state = (
                 "unknown"
                 if uncertain

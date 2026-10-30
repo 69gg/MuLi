@@ -146,7 +146,7 @@ PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE = FormatState(
         install_profile=1,
     ),
 )
-CURRENT_FORMAT_STATE = FormatState(
+PRE_OUTBOX_CANCELLATION_FORMAT_STATE = FormatState(
     metadata_version=1,
     formats=FormatVersions(
         database=1,
@@ -154,6 +154,18 @@ CURRENT_FORMAT_STATE = FormatState(
         configuration=2,
         ingress=7,
         outbox=3,
+        memory=5,
+        install_profile=1,
+    ),
+)
+CURRENT_FORMAT_STATE = FormatState(
+    metadata_version=1,
+    formats=FormatVersions(
+        database=1,
+        objects=4,
+        configuration=2,
+        ingress=7,
+        outbox=4,
         memory=5,
         install_profile=1,
     ),
@@ -179,6 +191,7 @@ def require_current_format(evidence: FormatEvidence) -> None:
         PRE_CHANNEL_REFERENCE_FORMAT_STATE,
         PRE_OWNER_QUESTION_FORMAT_STATE,
         PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
+        PRE_OUTBOX_CANCELLATION_FORMAT_STATE,
     ):
         raise FormatAdmissionError("store_format_upgrade_required")
     if evidence.state != CURRENT_FORMAT_STATE:

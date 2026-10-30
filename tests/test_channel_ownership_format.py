@@ -31,7 +31,7 @@ TARGET = FormatState(
         objects=4,
         configuration=2,
         ingress=7,
-        outbox=3,
+        outbox=4,
         memory=5,
         install_profile=1,
     ),

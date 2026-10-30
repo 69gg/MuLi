@@ -30,9 +30,9 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-当前完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，七域依次为 `(1,4,2,7,3,5,1)`。压缩快照保留同 run 多条主人原输入，将 objects 从 `3` 改为 `4`；主人问题的准确续接此前将 ingress 从 `6` 改为 `7`，渠道原生引用从 `5` 改为 `6`，明确收藏主答复将 memory 从 `4` 改为 `5`。各精确完整前序保留在准入模块与[停机升级指南](channel-ownership-format-upgrade.md)，不会只比较单个数字或因表结构相同放行。
+当前完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，七域依次为 `(1,4,2,7,4,5,1)`。单条待发取消将 outbox 从 `3` 改为 `4`；原 objects4、ingress7 和 memory5 继续保留。各精确完整前序保留在准入模块与[停机升级指南](channel-ownership-format-upgrade.md)，不会只比较单个数字或因表结构相同放行。
 
-`owner_question_answer` 从输入到归档保留同一问题、答案、任务和原队友证明，准确领取时在同一事务复核并更新状态，不与另一问题混批。旧 reader 会忽略这些约束，因此必须拒绝新库。登记问题续接当时保留 objects3；本次压缩合同独立提升到 objects4，原 ingress7 约束继续保留。独立问题记录不是执行锁，任务完成与主人验收不由答案记录代替。真实旧源码与方法级反证的范围见[冻结来源说明](../tests/fixtures/format-v2.140.md)。
+`owner_question_answer` 从输入到归档保留同一问题、答案、任务和原队友证明，准确领取时在同一事务复核并更新状态，不与另一问题混批。旧 reader 会忽略这些约束，因此必须拒绝新库。登记问题续接当时保留 objects3；此后压缩合同独立提升到 objects4，原 ingress7 约束继续保留。独立问题记录不是执行锁，任务完成与主人验收不由答案记录代替。真实旧源码与方法级反证的范围见[冻结来源说明](../tests/fixtures/format-v2.140.md)。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |
@@ -40,7 +40,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 | `objects` | `(kind,id)` 主键下的 JSON 对象、事件与消息顺序；run/session/approval/任务快照的原有状态语义；持久 approval 不等于当前活跃 future。执行身份、权限快照与 ReplyOrigin 分离；unknown 外部效果不能被重启或合成错误收据伪装成安全重试。压缩保留原始证据与来源边界，快照可用 `anchors` 保留同 run 多条主人原输入，继续读取原单 `anchor` 快照。 | `Store._put/event/messages`、`Runtime._recover/_execute`、Permissions、TeamManager、WorkflowEngine、Compactor 与 Conversation。 |
 | `configuration` | 缺文件采用 `Settings` 默认；Pydantic 沿用现有类型转换，未知字段拒绝，并非 `strict=True` JSON 合同。包含长期问题关注的 `memory_watches` 设置，完整序列化会写出其默认值。`validate_changes` 递归合并，渠道 destination/memory preference 等既有整体替换规则继续；候选配置仍需原有来源、授权及生命周期核验。外部 JSON 配置的原始 bytes/路径真实性不由数据库 marker 证明。 | `ConfigFile.__init__/validate_changes/_merge/replace`、Settings、server 的 `apply_configuration` 与 `Extensions.apply_locked`。 |
 | `ingress` | 持久输入 ID、原 payload 比较、有限队列及 pending/delivered/cancelled/quarantined 状态；完整 route/proof 与 principal 独立冻结；同来源前缀合批而不混入另一来源，领取与恢复维持已有原子性。`attention_memory_watch` 只允许本机宿主关注证明，按证明独立合批，在领取、模型请求及输出前复核当前关注、来源和生命周期；取消或遗忘后旧证明失效。来源文本与模型输出不能自行提升权限或猜收件人。 | `Store._enqueue_input/claim_inputs`、`Runtime.submit/_claim_inputs/_recover`、Conversation、AttentionInbox、渠道入站。 |
-| `outbox` | `channel_outbox` 的原 payload、media mode、route、proactive/proof、分片游标及收据；相同幂等键不同 payload 拒绝。`sending` 恢复为 unknown，unknown 不自动重发，blocked 需显式现有重试/重验。默认附件行为保留，voice 仅显式选择；发送时继续核当前授权与冻结来源。 | `ChannelManager.enqueue/recover`、发送循环及重试、`ChannelApplication`、`FrozenRouting/guard_delivery`、原平台 adapter。 |
+| `outbox` | `channel_outbox` 的原 payload、media mode、route、proactive/proof、分片游标及收据；相同幂等键不同 payload 拒绝。准确单条待发取消的 `cancelled` 是持久终态，与领取原子仲裁，不再被重试或重新领取；不表示平台撤回或过去没有副作用。`sending` 恢复为 unknown，unknown 不自动重发，blocked 需显式现有重试/重验。默认附件行为保留，voice 仅显式选择；发送时继续核当前授权与冻结来源。 | `ChannelManager.enqueue/recover`、发送循环及重试、`ChannelApplication`、`FrozenRouting/guard_delivery`、原平台 adapter。 |
 | `memory` | 原始 source/revision、记忆事实及版本、别名证据、关系与派生检索结构，以及文本、文档、ASR、网页快照和主人明确收藏的完整主答复来源的解释范围；`revision` 为非负 INTEGER，`alias_evidence_version=1`。答复来源保留 assistant 身份及稳定来源墓碑，证明原 producing run 与完整正文，不成为新授权。记忆绑定以 ID/version/source 元数据证明核验，不能由记忆正文自动授予身份、授权或渠道地址权限。禁止迁移重开不重建 meta、别名、词索引或关系。 | `Memory.__init__/_migrate_alias_evidence/register_source/save/edit/resolve_conflict`、MemoryPipeline、MemoryApplication、`attachment_memory_source`、`reply_memory_source`、`proactive_memory.check_preference`。 |
 | `install_profile` | 接受尚未准备任何实例 profile/receipt 的缺省状态；本片不制造持久实例 profile。已有安装意图仅按 pinned uv adapter 有界解析，保留主 requirement/extras/with/constraints/overrides/python/entrypoint 与已支持 options；结果仍是 `intent_parsed/context_required`。索引/约束/凭据来源及 ResolverContext 未核齐时不能变成可安装证明。 | `parse_install_intent`、`InstallationReceipt/read_install_receipt`，以及现有安装 manifest 的独立核验；这些证据不由七 ID 自动生成。 |
 
@@ -54,7 +54,7 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 前序源码来源为签名 Good 候选 `0c630d4696913850750b3d08126ba30d1552496c`，版本 `2.141.0`，不代表已发布或安装了旧 wheel。[格式回归](../tests/test_compaction_objects_format.py)执行冻结旧准入函数，复用当前共享的格式证据模型和 Store 构造支撑；这不等于完整运行旧版。旧 reader 绕过准入的投影诊断与真实准入拒绝是两类证据，不能相互替代。
 
-停机升级仅将已列明的完整前序 marker 转为当前格式，仍沿原独占、持久性、CAS 和关闭边界。新增前序与当前仅 objects3→4，其余六域精确相同。升级不改原 messages、旧 `compaction` / `compaction_snapshot` 或主人问题记录，不领取 pending、不执行任务，也不重放 unknown 投递。Windows 与托管跨格式升级范围保持原有拒绝；已有可支持的 Linux/macOS 独立资料库仍须先停机并完整备份。
+停机升级仅将已列明的完整前序 marker 转为当前格式，仍沿原独占、持久性、CAS 和关闭边界。“仅 objects3→4、其余六域相同”仅描述 2.141 与[冻结 2.144 源码](../tests/fixtures/format-v2.144.md)之间的历史边界；当前完整合同还包含 outbox4，须按当前列明的完整前序核验。升级不改原 messages、旧 `compaction` / `compaction_snapshot` 或主人问题记录，不领取 pending、不执行任务，也不重放 unknown 投递。Windows 与托管跨格式升级范围保持原有拒绝；已有可支持的 Linux/macOS 独立资料库仍须先停机并完整备份。
 
 ### 项目资料复核的格式边界
 

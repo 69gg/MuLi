@@ -19,6 +19,7 @@ from test_channel_format_upgrade import legacy_database, upgrade
 from test_channel_format_upgrade import snapshot as stored_rows
 from test_fresh_format_admission import database as database
 from test_fresh_format_admission import deny_construction_writes, no_model, snapshot
+from test_outbox_cancellation_format import frozen_e144_bytes, frozen_e144_module
 from test_project_inbox_format import upgrade_platform
 
 import muli.store as store_module
@@ -30,6 +31,7 @@ from muli.conversation import Conversation
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
     PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE,
+    PRE_OUTBOX_CANCELLATION_FORMAT_STATE,
     FormatAdmissionError,
     require_current_format,
 )
@@ -70,15 +72,17 @@ def frozen_e141_reader() -> ModuleType:
     return reader
 
 
-def current_manifest() -> CompatibilityManifest:
-    path = Path(__file__).parents[1] / "src" / "muli" / "compatibility.json"
-    return CompatibilityManifest.from_json(path.read_bytes())
+def objects4_manifest() -> CompatibilityManifest:
+    # Preserve the objects3 -> objects4 boundary as outbox advances separately.
+    return CompatibilityManifest.from_json(frozen_e144_bytes("compatibility_v2_144.json"))
 
 
 def test_e141_actual_admission_refuses_objects4_before_business_writes(database: Path) -> None:
     old = frozen_e141_reader()
     assert old.CURRENT_FORMAT_STATE == PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    historical = frozen_e144_module("format_admission_v2_144.py")
+    assert historical.CURRENT_FORMAT_STATE == PRE_OUTBOX_CANCELLATION_FORMAT_STATE
+    assert historical.CURRENT_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "objects": 4,
     }
@@ -87,6 +91,10 @@ def test_e141_actual_admission_refuses_objects4_before_business_writes(database:
         evidence = read_format_evidence(db)
         previous = replace(evidence, state=old.CURRENT_FORMAT_STATE)
         old.require_current_format(previous)
+        historical_evidence = replace(evidence, state=historical.CURRENT_FORMAT_STATE)
+        historical.require_current_format(historical_evidence)
+        with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
+            old.require_current_format(historical_evidence)
         with pytest.raises(old.FormatAdmissionError, match="^store_format_unsupported$"):
             old.require_current_format(evidence)
         with pytest.raises(FormatAdmissionError, match="^store_format_upgrade_required$"):
@@ -102,15 +110,20 @@ def test_managed_same_format_switch_refuses_both_compaction_directions(
     after_upgrade: bool, reverse: bool
 ) -> None:
     previous = CompatibilityManifest.from_json(frozen_e141_bytes("compatibility_v2_141.json"))
-    current = current_manifest()
+    current = objects4_manifest()
     assert previous.release == "2.141.0"
+    assert current.release == "2.144.0"
     assert previous.formats.objects.reads == (3,) and previous.formats.objects.writes == 3
     assert current.formats.objects.reads == (4,) and current.formats.objects.writes == 4
     assert current.formats.model_dump(exclude={"objects"}) == previous.formats.model_dump(
         exclude={"objects"}
     )
     assert not previous.requires_migration and not current.requires_migration
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+    state = (
+        PRE_OUTBOX_CANCELLATION_FORMAT_STATE
+        if after_upgrade
+        else PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+    )
     base, candidate = (current, previous) if reverse else (previous, current)
     result = assess_compatibility(base, candidate, state, handoff_protocol=2)
     assert not result.format_compatible
@@ -118,7 +131,7 @@ def test_managed_same_format_switch_refuses_both_compaction_directions(
     assert result.side == ("candidate" if after_upgrade == reverse else "base")
     for declaration, exact in (
         (previous, PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE),
-        (current, CURRENT_FORMAT_STATE),
+        (current, PRE_OUTBOX_CANCELLATION_FORMAT_STATE),
     ):
         assert assess_compatibility(
             declaration, declaration, exact, handoff_protocol=2
@@ -140,9 +153,13 @@ def test_reading_both_objects_contracts_cannot_authorize_different_writes(
                 )
             }
         )
-        for manifest in (previous, current_manifest())
+        for manifest in (previous, objects4_manifest())
     )
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+    state = (
+        PRE_OUTBOX_CANCELLATION_FORMAT_STATE
+        if after_upgrade
+        else PRE_MULTI_ANCHOR_COMPACTION_FORMAT_STATE
+    )
     result = assess_compatibility(declarations[0], declarations[1], state, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "write_format_change" and result.domain == "objects"

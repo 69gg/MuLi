@@ -30,6 +30,30 @@ test("preview delivery records are explicit local simulations and do not send or
   assert.equal((await read(backend, "/channels")).body.preview, true);
 });
 
+test("preview exposes cancelled saved content with zero confirmations and truthful terminal counts", async (t) => {
+  const backend = createPreviewBackend(); t.after(() => backend.dispose());
+  const before = structuredClone({ records: backend.state.channelDeliveries, messages: backend.state.messages, runs: backend.state.runs, events: backend.state.events });
+  const listing = await read(backend, listPath);
+  assert.equal(listing.status, 200);
+  const cancelled = listing.body.items.find((item) => item.state === "cancelled");
+  assert.ok(cancelled, "默认内存示例应能核查已取消的保存记录");
+  assert.equal(cancelled.confirmed_parts, 0); assert.ok(cancelled.total_parts > 1);
+  const path = `/channels/deliveries/${encodeURIComponent(cancelled.id)}/content?channel=onebot&owner_id=7&part=0&offset_bytes=0`;
+  const text = await read(backend, path);
+  assert.equal(text.status, 200); assert.equal(text.body.state, "cancelled");
+  assert.equal(text.body.confirmed_parts, 0); assert.match(text.body.content, /本页模拟保存/);
+  assert.equal(text.body.length_bytes, Buffer.byteLength(text.body.content));
+  const attachment = await read(backend, path.replace("part=0", "part=1"));
+  assert.equal(attachment.status, 200); assert.equal(attachment.body.state, "cancelled");
+  assert.deepEqual(attachment.body.attachment_ids, cancelled.attachment_ids);
+  const status = await read(backend, "/channels");
+  assert.equal(status.body.preview, true);
+  assert.equal(status.body.outbox.cancelled, backend.state.channelDeliveries.filter((item) => item.state === "cancelled").length);
+  assert.equal(status.body.outbox.unknown, backend.state.channelDeliveries.filter((item) => item.state === "unknown").length);
+  assert.deepEqual({ records: backend.state.channelDeliveries, messages: backend.state.messages, runs: backend.state.runs, events: backend.state.events }, before);
+  assert.ok(backend.state.requests.every((request) => request.method === "GET"));
+});
+
 test("preview UTF-8 windows retain content revision across confirmation changes and reject changed text", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());
   const record = backend.state.channelDeliveries[0], original = "核查🙂\n".repeat(200);
@@ -52,7 +76,7 @@ test("preview UTF-8 windows retain content revision across confirmation changes 
 
 test("preview continuation binds the exact active scope and keeps forbidden or missing reads explicit", async (t) => {
   const backend = createPreviewBackend(); t.after(() => backend.dispose());
-  const record = backend.state.channelDeliveries[0]; backend.state.channelDeliveries.push({ ...structuredClone(record), id: "preview-older" });
+  const record = backend.state.channelDeliveries[0]; backend.state.channelDeliveries = [record, { ...structuredClone(record), id: "preview-older" }];
   const first = await read(backend, listPath.replace("limit=20", "limit=1"));
   assert.equal(first.status, 200); assert.equal(first.body.has_more, true);
   const cursorPath = `${listPath.replace("limit=20", "limit=1")}&cursor=${encodeURIComponent(first.body.next_cursor)}`;

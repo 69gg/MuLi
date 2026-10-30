@@ -43,13 +43,13 @@ function contentPage(text = content, fields = {}) {
   return { ...scope, delivery_id: item.id, part: 0, state: item.state, confirmed_parts: item.confirmed_parts, total_parts: item.total_parts, created_at: item.created_at, attachment_ids: [], revision: "exact-part-revision", field: "content", content: text, offset_bytes: offset, total_bytes: total, length_bytes: Buffer.byteLength(text), next_offset_bytes: offset + Buffer.byteLength(text), has_more: offset + Buffer.byteLength(text) < total, ...fields };
 }
 
-async function deliveryHarness(handler, { owners = ["7"], draftOwners = owners } = {}) {
+async function deliveryHarness(handler, { owners = ["7"], draftOwners = owners, recentState = "unknown" } = {}) {
   const h = harness(handler);
   h.ui.state.view = "settings";
   h.ui.state.settings = { channels: { onebot: { enabled: true, owner_ids: owners } } };
   h.ui.state.settingsDraft = { channels: { onebot: { enabled: true, owner_ids: draftOwners } } };
   h.ui.state.mainSessionId = "main";
-  h.ui.state.channels = { channels: { onebot: { enabled: true, active: true, account_id: "bot", owner_count: owners.length } }, outbox: { unknown: 1 }, deliveries: [{ id: item.id, name: "onebot", target: "7", state: "unknown", created_at: 1 }] };
+  h.ui.state.channels = { channels: { onebot: { enabled: true, active: true, account_id: "bot", owner_count: owners.length } }, outbox: { [recentState]: 1 }, deliveries: [{ id: item.id, name: "onebot", target: "7", state: recentState, created_at: 1 }] };
   h.ui.useSettingsViews();
   await clickMemoryButton(h, h.button("消息渠道", h.other));
   return h;
@@ -68,6 +68,52 @@ async function readItem(h, id = item.id) {
 function assertOnlyReads(h) {
   assert.ok(h.requests.every((request) => request.method === undefined && request.path.startsWith("/channels/deliveries") && !request.path.includes("/retry")));
 }
+
+test("recent cancelled delivery has its terminal label and no retry or cancellation action", async () => {
+  const h = await deliveryHarness(async () => assert.fail("仅查看最近状态不应发送请求"), { recentState: "cancelled" });
+  const recent = h.other.querySelectorAll("details").find((node) => node.querySelector("summary")?.textContent === "最近发送记录");
+  assert.ok(recent);
+  assert.ok(recent.textContent.includes("已取消"), "已取消投递应有明确终态标签");
+  assert.equal(h.button("重试发送", recent) === undefined, true);
+  assert.equal(recent.querySelector('[data-action="cancel-delivery"]'), null);
+  assert.equal(h.requests.length, 0);
+});
+
+test("cancelled directory retains exact ID, saved attachments and zero platform confirmations", async () => {
+  const cancelled = { ...item, state: "cancelled", confirmed_parts: 0 };
+  const h = await deliveryHarness(async () => directory([cancelled]), { recentState: "cancelled" });
+  await readDirectory(h);
+  const selected = h.dialog.querySelectorAll("[data-channel-delivery-id]").find((node) => node.dataset.channelDeliveryId === cancelled.id);
+  assert.ok(selected, "取消终态不能被当作坏记录丢失");
+  assert.ok(h.body().includes("已取消 · 平台已确认 0/2 分段"));
+  assert.ok(h.body().includes("附件引用：exact-attachment-id"));
+  assert.ok(h.body().includes("不代表过去从未外发"));
+  assert.equal(h.button("重试发送") === undefined, true);
+  assert.equal(h.dialog.querySelector('[data-action="cancel-delivery"]'), null);
+  assert.equal(h.requests.length, 1); assertOnlyReads(h);
+});
+
+test("cancelled content remains readable when a pending directory changes before exact body read", async () => {
+  const pending = { ...item, state: "pending", confirmed_parts: 0 };
+  const h = await deliveryHarness(async (path) => {
+    if (!path.includes("/content?")) return directory([pending]);
+    const part = Number(new URL(path, "http://test.invalid").searchParams.get("part"));
+    return contentPage(part === 0 ? content : "", { part, state: "cancelled", confirmed_parts: 0, ...(part === 1 ? { attachment_ids: ["exact-attachment-id"] } : {}) });
+  });
+  await readDirectory(h);
+  assert.ok(h.ui.channelDeliverySlot.page, "先读到当前有效pending目录，再核查取消后的准确正文");
+  await readItem(h);
+  assert.ok(h.ui.channelDeliverySlot.bodyPage, "准确cancelled正文不能被拒绝为未知状态");
+  assert.equal(h.dialog.querySelector("pre").textContent, content);
+  assert.ok(h.body().includes("已取消 · 平台已确认 0/2 分段"));
+  assert.ok(h.body().includes("不代表过去从未外发"));
+  await clickMemoryButton(h, h.button("下一分段"));
+  assert.ok(h.body().includes("附件引用：exact-attachment-id"));
+  assert.ok(h.dialog.querySelector('[aria-label="发送分段"]').textContent.includes("尚未确认"));
+  assert.equal(h.dialog.querySelectorAll("audio,video,img").length, 0);
+  assert.equal(h.button("重试发送") === undefined, true);
+  assert.equal(h.requests.length, 3); assertOnlyReads(h);
+});
 
 test("delivery scope uses applied owners while preserving settings and chat drafts", async () => {
   const h = await deliveryHarness(async (path) => path.includes("/content?") ? contentPage() : directory(), { draftOwners: ["UNSAVED_OWNER"] });
@@ -153,7 +199,7 @@ test("confirmation checkpoints distinguish the unknown part and never autoplay k
 });
 
 test("directory responses reject wrong scopes, duplicate identities and malformed pagination", async () => {
-  for (const response of [directory([item], { channel: "telegram" }), directory([item], { owner_id: "8" }), directory([item], { account_id: "other" }), directory([item], { session_id: "other" }), directory([item, item]), directory([], { has_more: true }), directory([item], { omitted: -1 }), directory([item], { next_cursor: "unexpected" })]) {
+  for (const response of [directory([{ ...item, state: "future-state" }]), directory([item], { channel: "telegram" }), directory([item], { owner_id: "8" }), directory([item], { account_id: "other" }), directory([item], { session_id: "other" }), directory([item, item]), directory([], { has_more: true }), directory([item], { omitted: -1 }), directory([item], { next_cursor: "unexpected" })]) {
     const h = await deliveryHarness(async () => response); await readDirectory(h);
     assert.equal(h.ui.channelDeliverySlot.page === null, true); assert.ok(h.dialog.querySelector('[role="alert"]'));
     assert.equal(h.dialog.querySelectorAll("[data-channel-delivery-id]").length, 0);
@@ -162,7 +208,7 @@ test("directory responses reject wrong scopes, duplicate identities and malforme
 });
 
 test("body responses reject another delivery, part, scope and invalid UTF-8 byte windows", async () => {
-  for (const fields of [{ delivery_id: "another-id" }, { part: 1 }, { channel: "telegram" }, { owner_id: "8" }, { account_id: "another-account" }, { session_id: "another-main" }, { field: "payload" }, { offset_bytes: 1 }, { length_bytes: 1 }, { next_offset_bytes: 1 }, { total_bytes: 1 }, { has_more: true }, { content: "", length_bytes: 0, next_offset_bytes: 0, total_bytes: 1, has_more: true }, { confirmed_parts: 3 }]) {
+  for (const fields of [{ state: "future-state" }, { delivery_id: "another-id" }, { part: 1 }, { channel: "telegram" }, { owner_id: "8" }, { account_id: "another-account" }, { session_id: "another-main" }, { field: "payload" }, { offset_bytes: 1 }, { length_bytes: 1 }, { next_offset_bytes: 1 }, { total_bytes: 1 }, { has_more: true }, { content: "", length_bytes: 0, next_offset_bytes: 0, total_bytes: 1, has_more: true }, { confirmed_parts: 3 }]) {
     const h = await deliveryHarness(async (path) => path.includes("/content?") ? contentPage(content, fields) : directory());
     await readDirectory(h); await readItem(h);
     assert.equal(h.ui.channelDeliverySlot.bodyPage === null, true); assert.equal(h.dialog.querySelector("pre") === null, true);

@@ -1,7 +1,7 @@
 {
   "metadata_version": 1,
   "distribution": "muli-agent",
-  "release": "2.144.0",
+  "release": "2.145.0",
   "handoff_protocol": 2,
   "requires_migration": false,
   "formats": {
@@ -9,7 +9,7 @@
     "objects": {"reads": [4], "writes": 4},
     "configuration": {"reads": [2], "writes": 2},
     "ingress": {"reads": [7], "writes": 7},
-    "outbox": {"reads": [3], "writes": 3},
+    "outbox": {"reads": [4], "writes": 4},
     "memory": {"reads": [5], "writes": 5},
     "install_profile": {"reads": [1], "writes": 1}
   }

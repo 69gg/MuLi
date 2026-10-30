@@ -3794,6 +3794,14 @@ class Runtime:
             or self._owner_round_input(prepared, run_id) is None
         ):
             tools.pop("memory_import_reply", None)
+        if "channel_cancel" in tools and (
+            consult is not None
+            or workflow_step
+            or role != "main"
+            or prepared is None
+            or self._owner_round_input(prepared, run_id) is None
+        ):
+            tools.pop("channel_cancel", None)
         if consult is not None:
             self.team.consult.guard_control(consult, session_id)
             return {

@@ -382,6 +382,105 @@ def test_outgoing_empty_window_consumes_foreign_rows_and_survives_deleted_anchor
     assert tail["omitted"] == 0 and tail["next_cursor"] is None and not tail["has_more"]
 
 
+def test_cancelled_delivery_remains_in_exact_owner_history_with_zero_confirmations(
+    store: Store,
+) -> None:
+    identifier = delivery(
+        store,
+        state="cancelled",
+        parts=[{"text": "保存的取消前正文"}, {"attachment_id": "cancelled-file"}],
+    )
+    with store.db:
+        store.db.execute("UPDATE channel_outbox SET receipts='[]' WHERE id=?", (identifier,))
+    delivery(store, owner="8", state="cancelled")
+    delivery(store, state="future-state")
+    changes = store.db.total_changes
+    page = ChannelHistory(store).read(
+        "onebot",
+        "account",
+        "7",
+        "session",
+        direction="outgoing",
+        max_output_chars=2000,
+    )["outgoing"]
+    assert [item["id"] for item in page["items"]] == [identifier]
+    item = page["items"][0]
+    assert item["state"] == "cancelled"
+    assert item["confirmed_parts"] == 0 and item["total_parts"] == 2
+    assert item["attachment_ids"] == ["cancelled-file"]
+    assert page["omitted"] == 2 and not page["has_more"] and page["next_cursor"] is None
+    assert "content" not in item and "receipts" not in item
+    assert store.db.total_changes == changes
+
+
+def test_cancelled_body_keeps_exact_utf8_revision_and_saved_attachment_without_writes(
+    store: Store,
+) -> None:
+    text = "取消后仍可核查😀" * 200
+    identifier = delivery(
+        store,
+        parts=[{"text": text}, {"attachment_id": "cancelled-file"}],
+    )
+    reader = ChannelHistory(store)
+    first = reader.read_delivery(
+        "onebot", "account", "7", "session", delivery_id=identifier, max_output_chars=1000
+    )
+    assert first["state"] == "pending" and first["has_more"]
+    with store.db:
+        store.db.execute(
+            "UPDATE channel_outbox SET state='cancelled',receipts='[]' WHERE id=?",
+            (identifier,),
+        )
+    changes = store.db.total_changes
+    observed = first["content"]
+    page = first
+    for _ in range(20):
+        if not page["has_more"]:
+            break
+        page = reader.read_delivery(
+            "onebot",
+            "account",
+            "7",
+            "session",
+            delivery_id=identifier,
+            offset_bytes=page["next_offset_bytes"],
+            revision=first["revision"],
+            max_output_chars=1000,
+        )
+        assert page["state"] == "cancelled" and page["confirmed_parts"] == 0
+        assert page["total_parts"] == 2 and page["revision"] == first["revision"]
+        observed += page["content"]
+    assert not page["has_more"] and observed == text
+    attachment = reader.read_delivery(
+        "onebot",
+        "account",
+        "7",
+        "session",
+        delivery_id=identifier,
+        part=1,
+        max_output_chars=1000,
+    )
+    assert attachment["state"] == "cancelled" and attachment["confirmed_parts"] == 0
+    assert attachment["total_parts"] == 2 and attachment["attachment_ids"] == ["cancelled-file"]
+    assert attachment["content"] == "" and attachment["total_bytes"] == 0
+    assert not attachment["has_more"] and store.db.total_changes == changes
+
+
+def test_unrecognised_delivery_state_still_cannot_be_read_as_history_or_body(store: Store) -> None:
+    identifier = delivery(store, state="future-state")
+    reader = ChannelHistory(store)
+    page = reader.read(
+        "onebot", "account", "7", "session", direction="outgoing", max_output_chars=2000
+    )["outgoing"]
+    assert page["items"] == [] and page["omitted"] == 1
+    assert_code(
+        "content_unavailable",
+        lambda: reader.read_delivery(
+            "onebot", "account", "7", "session", delivery_id=identifier, max_output_chars=1000
+        ),
+    )
+
+
 def test_delivery_body_keeps_utf8_and_content_revision_across_send_state_changes(
     store: Store,
 ) -> None:

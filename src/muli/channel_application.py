@@ -595,6 +595,64 @@ class ChannelApplication:
                 "ownership": runtime.channel_ownership.status(),
             }
 
+        async def cancel(args: dict[str, Any]) -> dict[str, Any]:
+            caller = runtime.tool_session_id
+            execution = runtime._tool_execution.get()
+            request = runtime.request_context(caller) if caller is not None else None
+            task = asyncio.current_task()
+            manager, generation = self.manager, self._generation
+            expected = runtime.config.settings.channels.model_dump()
+
+            def guard() -> None:
+                active = runtime._active_tool.get()
+                if (
+                    runtime._closing
+                    or caller is None
+                    or execution is None
+                    or execution != (caller, runtime.run_ids.get(caller))
+                    or runtime.tool_session_id != caller
+                    or runtime._tool_execution.get() != execution
+                    or request is None
+                    or runtime.request_context(caller) is not request
+                    or task is None
+                    or task is not asyncio.current_task()
+                    or task.cancelling()
+                    or runtime.tasks.get(caller) is not task
+                    or caller in runtime._stopping
+                    or active is None
+                    or active.name != "channel_cancel"
+                    or active.handler is not cancel
+                    or "channel_cancel" in runtime.config.settings.disabled_tools
+                    or runtime._owner_round_input(request, execution[1]) is None
+                    or self.manager is not manager
+                    or self._generation != generation
+                    or runtime.config.settings.channels.model_dump() != expected
+                    or manager._closed
+                ):
+                    raise PermissionError("取消投递仅供真实主人当前请求中的主助手直接调用")
+                runtime.maintenance.admission.require()
+                runtime._guard_request(request, "write")
+                if runtime.store.pending_inputs(caller):
+                    raise PermissionError("收到新输入，请先重新核对待取消的准确投递")
+
+            guard()
+            if set(args) != {"channel", "owner_id", "delivery_id"} or any(
+                not isinstance(value, str) or not value for value in args.values()
+            ):
+                raise ValueError("取消投递只接受准确 channel、owner_id 和 delivery_id")
+            async with runtime.configuration_lock:
+                guard()
+                name, _account, owner, _main = self._delivery_scope(
+                    args["channel"], args["owner_id"]
+                )
+                return await manager.cancel(
+                    args["delivery_id"],
+                    name=name,
+                    owner_id=owner,
+                    max_bytes=runtime.config.settings.limits.max_context_chars * 4,
+                    admission_guard=guard,
+                )
+
         async def delegate(args: dict[str, Any]) -> dict[str, Any]:
             caller = runtime.tool_session_id
             execution = runtime._tool_execution.get()
@@ -807,6 +865,25 @@ class ChannelApplication:
                 "查看可选渠道与持久投递记录；不把排队当作已送达",
                 parameters({}),
                 status,
+            ),
+            Tool(
+                "channel_cancel",
+                "仅真实主人当前请求中的主助手按准确ID取消单条待发送投递。"
+                "先用channel_history核对渠道、当前绑定主人、原文与附件；有歧义先询问。"
+                "仅pending/retry且本地确认0段可提交；cancelled=true只承诺此后不再领取，"
+                "不证明过去从未发送，不是平台撤回。sending/unknown/sent及部分成功不改，"
+                "cancelled=false须如实报告。保留原记录与幂等键，不自动发修订版",
+                parameters(
+                    {
+                        "channel": {"type": "string", "enum": list(NAMES)},
+                        "owner_id": {**string("当前渠道已绑定的准确主人ID"), "minLength": 1},
+                        "delivery_id": {**string("核对后选择的准确出站投递ID"), "minLength": 1},
+                    },
+                    ("channel", "owner_id", "delivery_id"),
+                ),
+                cancel,
+                "write",
+                preserve_output=True,
             ),
             Tool(
                 "channel_reply_files",

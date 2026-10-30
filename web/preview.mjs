@@ -83,7 +83,10 @@ export function createPreviewState() {
     },
     previewLimits: { max_upload_bytes: 20971520, max_uploads: 20, max_items: 50, max_message_chars: 64000 },
     sessions: [main], messages: { [main.id]: [] }, runs: {}, approvals: [], events: [], eventId: 0,
-    channelDeliveries: [{ id: "preview-delivery", channel: "onebot", account_id: "preview-bot", owner_id: "7", state: "unknown", confirmed_parts: 1, created_at: now - 1800, parts: [{ text: "这是本页模拟保存的发送正文🙂。\n记录与平台确认状态仅用于演示，没有连接真实消息渠道。" }, { attachment_id: previewNotesUploadId }, { text: "这是尚未确认的后续模拟分段。" }] }],
+    channelDeliveries: [
+      { id: "preview-delivery", channel: "onebot", account_id: "preview-bot", owner_id: "7", state: "unknown", confirmed_parts: 1, created_at: now - 1800, parts: [{ text: "这是本页模拟保存的发送正文🙂。\n记录与平台确认状态仅用于演示，没有连接真实消息渠道。" }, { attachment_id: previewNotesUploadId }, { text: "这是尚未确认的后续模拟分段。" }] },
+      { id: "preview-cancelled-delivery", channel: "onebot", account_id: "preview-bot", owner_id: "7", state: "cancelled", confirmed_parts: 0, created_at: now - 3600, parts: [{ text: "这是本页模拟保存的取消投递🙂。\n已取消仅表示之后不再领取；平台确认 0/2 分段，不代表过去从未外发。没有连接或操作真实消息渠道。" }, { attachment_id: previewNotesUploadId }] },
+    ],
     notifications: [
       { id: "notice-welcome", title: "欢迎来到沐璃", content: "这是可操作的前端预览。发一条消息，体验规划、工具轨迹、审批和流式回答；设置只保存在当前页面。", source: "preview", session_id: main.id, type: "info", read: false, created_at: now },
       { id: "notice-review", title: "示例周报已整理", content: "本页模拟：队友完成资料整理与交叉复核，示例附件可在附件页下载。没有真实队友或外发。", source: "preview", session_id: main.id, type: "task", read: true, created_at: now - 3600 },
@@ -842,7 +845,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         return response(value);
       }
     }
-    if (path === "/channels" && method === "GET") return response({ preview: true, channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: { sent: 0, pending: 0, unknown: state.channelDeliveries.length }, deliveries: state.channelDeliveries.map((item) => ({ id: item.id, name: item.channel, target: item.owner_id, state: item.state, created_at: item.created_at })), proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
+    if (path === "/channels" && method === "GET") return response({ preview: true, channels: Object.fromEntries(Object.entries(state.settings.channels).filter(([name]) => name !== "proactive").map(([name, item]) => [name, { enabled: item.enabled, available: true, running: item.enabled, ...(["telegram", "weixin"].includes(name) ? { receive_health: { state: "idle", code: null, occurrence_id: null } } : {}), owner_count: item.owner_ids?.length ?? 0, group_count: item.allowed_groups?.length ?? 0, account_id: item.account_id ?? "preview-bot" }])), outbox: Object.fromEntries(["pending", "retry", "sending", "sent", "failed", "blocked", "unknown", "cancelled"].map((stateName) => [stateName, state.channelDeliveries.filter((item) => item.state === stateName).length])), deliveries: state.channelDeliveries.map((item) => ({ id: item.id, name: item.channel, target: item.owner_id, state: item.state, created_at: item.created_at })), proactive: { attention_enabled: true, model_configured: true, memory_status: { reason: "not_configured" } } });
     if (path === "/voice" && method === "GET") return response({ preview: true, enabled: state.settings.voice.enabled, available: false, running: false, browser_asr_ready: false, health: { state: "idle", code: null, occurrence_id: null }, setup: state.voiceSetup, speaker: { enrolled: state.voiceEnrolled }, reason: "前端预览不访问麦克风或声学设备；单次设置只返回模拟结果。" });
     if (path === "/voice/setup" && method === "POST") {
       if (body.confirmed !== true) return failure("请确认本次模拟录音。", 400);

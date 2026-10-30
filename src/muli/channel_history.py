@@ -21,7 +21,16 @@ _CURSOR_VERSION = 2
 CHANNEL_HISTORY_PAGE_LIMIT = 100
 _UTF8_MAX_BYTES = 4
 _DELIVERY_CHUNK_BYTES = 64 * 1024
-_DELIVERY_STATES = {"pending", "retry", "sending", "sent", "failed", "blocked", "unknown"}
+_DELIVERY_STATES = {
+    "pending",
+    "retry",
+    "sending",
+    "sent",
+    "failed",
+    "blocked",
+    "unknown",
+    "cancelled",
+}
 
 
 class ChannelHistory:
