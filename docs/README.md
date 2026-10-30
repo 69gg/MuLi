@@ -10,9 +10,10 @@
 - [来源目录](memory-sources.md)：浏览已保存资料、定位整理失败的来源。
 - [资料变化](source-comparison.md)：核对两份已收藏正文的增删改动。
 - [多 agent 协作](workflows.md)：分工、工作流和查看进度。
+- [任务说明](task-briefs.md)：保存完整要求，在网页查找旧任务并带回对话。
 - [任务控制](task-control.md)：暂停任务、补充要求与继续。
 - [任务核查](task-inspection.md)：查阅要求、成果和已有依据。
-- [未完成的队友工作](continuations.md)：重新打开后查找直接队友的当前记录。
+- [上次工作记录](continuations.md)：重新打开后核查队友与主助手保留的中断记录。
 - [长对话](context.md)：自动压缩与历史查阅。
 - [找回历史原文](history-find.md)：按记得的文字定位旧消息或工具结果。
 

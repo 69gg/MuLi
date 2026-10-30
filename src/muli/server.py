@@ -752,6 +752,14 @@ def _create_app(
     async def commitments(status: str = "active") -> dict[str, Any]:
         return {"items": local_services.commitments.list(status)}
 
+    @app.get("/api/commitment-directory")
+    async def commitment_directory(
+        status: str = "active",
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, Any]:
+        return local_services.commitments.directory(status=status, cursor=cursor, limit=limit)
+
     def task_control_error(
         identifier: str, exc: ControlConflict | ControlUnavailable
     ) -> HTTPException:

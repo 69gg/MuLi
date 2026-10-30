@@ -60,7 +60,7 @@ const state = {
   modelRole: "main", settingsDraft: null, service: null, settingsSaveStatus: "",
   management: null, channels: null, voice: null, capture: null, settingsStatusErrors: {}, managementRecoveryAttempt: null, managementReadVersion: 0,
   mainSessionId: null, uploads: [], attachments: [], uploading: 0, voiceDraft: null,
-  team: { members: [], messages: [] }, recordQuery: "", approvals: [], approvalsError: "",
+  team: { members: [], messages: [] }, teamTab: "members", taskStatus: "active", recordQuery: "", approvals: [], approvalsError: "",
   auth: { required: false, authenticated: false },
 };
 let sessionController = null;
@@ -74,6 +74,7 @@ let queuedRender = false;
 let messageNodes = new Map();
 let dialogSubmit = null;
 let dialogTeamView = null;
+let dialogTaskReturn = null;
 let dialogMemoryReturn = null;
 let dialogUploadReturn = null;
 let answerSpeechDialog = null;
@@ -81,6 +82,10 @@ let answerSpeechResults = [];
 let attachmentCollectionDialog = null;
 const attachmentCollectionAttempts = new Map();
 let taskDialog = null;
+let taskDirectory = null;
+let taskDirectoryDialog = null;
+const taskDirectoryPageSize = 20;
+const taskStatusLabels = { open: "待办", in_progress: "进行中", blocked: "受阻", done: "已完成", cancelled: "已取消" };
 let memoryDialog = null;
 let memoryPath = null;
 let memoryPathSequence = 0;
@@ -227,6 +232,7 @@ function invalidateConnection() {
   releaseMemoryWatches();
   closeChannelDeliveryDialog();
   releaseCapabilityCatalog();
+  releaseTaskDirectory();
   const owner = connection; connection = null;
   owner?.sessions.invalidate(); owner?.notifications.invalidate(); owner?.approvals.invalidate(); owner?.controller.abort();
   globalController?.abort(); sessionController?.abort();
@@ -709,7 +715,8 @@ async function connect() {
 function revalidateVisibleState(owner) {
   if (!connectionCurrent(owner)) return;
   // These projections used to receive missed changes from the global replay.
-  if (["workflows", "notifications", "team", "memories", "uploads"].includes(state.view)) void switchView(state.view, owner);
+  if (state.view === "team" && state.teamTab === "tasks") { const slot = createTaskDirectory(owner); renderOtherView(); renderTaskDirectoryList(slot); }
+  else if (["workflows", "notifications", "team", "memories", "uploads"].includes(state.view)) void switchView(state.view, owner);
   if (state.view === "records") renderSessions();
   if (taskDialog) void refreshTaskBriefDialog(taskDialog, owner);
   invalidateMemoryPath();
@@ -775,8 +782,9 @@ function startGlobalEvents(owner = connection) {
       if (item?.id && ["reminder", "calendar_reminder"].includes(reminderKind(item))) state.reminders = [item, ...state.reminders.filter((entry) => entry.id !== item.id || reminderKind(entry) !== reminderKind(item))];
       if (state.view === "notifications" && state.notificationTab === "reminders") renderOtherView();
     }
-    if (event.type.startsWith("team.") && state.view === "team") void refreshTeam({}, owner);
+    if (event.type.startsWith("team.") && state.view === "team" && state.teamTab === "members") void refreshTeam({}, owner);
     if (event.type === "commitment.updated" && taskDialog && event.data?.id === taskDialog.model.state.id) void refreshTaskBriefDialog(taskDialog, owner);
+    if (event.type === "commitment.updated") markTaskDirectoryDirty(event.data);
     if (["memory.updated", "memory.forgotten"].includes(event.type)) { invalidateMemoryPath(); invalidateMemoryEvidence(event); }
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads(owner);
     if (event.type === "channel.updated" && channelDeliveryDialogCurrent(channelDeliveryDialog)) {
@@ -1096,6 +1104,8 @@ function openDialog({ title, content, submitLabel = "保存", danger = false, re
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
   releaseTaskDialog();
+  releaseTaskDirectoryDialog();
+  dialogTaskReturn = null;
   releaseMemoryDialog();
   releaseHistoryDialog(); dialogHistoryReturn = null;
   releaseChannelDeliveryDialog(); dialogChannelDeliveryReturn = null;
@@ -1165,6 +1175,7 @@ async function switchView(view, owner = connection) {
   releaseMemoryWatches();
   releaseWorkflowActivity();
   releaseRecordDirectory();
+  releaseTaskDirectory();
   if (view !== state.view && (memoryDialog || historyDialog)) { $("#app-dialog").close(); releaseMemoryDialog(); releaseHistoryDialog(); }
   if (view !== "chat") voiceInput.cancel();
   if (state.view === "settings" && view !== "settings") collectSettingsForm();
@@ -1174,6 +1185,14 @@ async function switchView(view, owner = connection) {
   state.view = view; state.viewError = ""; renderChrome();
   if (changedView) animatePanel(view === "chat" ? $("#chat-view") : $("#management-shell"));
   if (view === "chat") { state.viewLoading = false; renderChat(); $("#message-input").focus(); return; }
+  if (view === "team" && state.teamTab === "tasks") {
+    const slot = createTaskDirectory(owner);
+    state.viewLoading = false; renderOtherView();
+    const heading = $(".view-heading h2", slot.root);
+    heading.tabIndex = -1; heading.focus({ preventScroll: true }); animatePanel(slot.root);
+    await loadTaskDirectory(slot);
+    return;
+  }
   if (view === "memories" && state.memoryTab === "sources") {
     state.viewLoading = false; renderOtherView();
     await loadMemorySources(memorySources);
@@ -1210,7 +1229,7 @@ async function switchView(view, owner = connection) {
   state.viewLoading = true; renderOtherView();
   try {
     if (view === "uploads") { const payload = await ownedRequest("/uploads", {}, owner); if (current()) state.uploads = collection(payload); }
-    if (view === "team") { const page = await teamPager.load({}, (path) => ownedRequest(path, {}, owner)); if (current() && page) state.team = page; }
+    if (view === "team") { const page = await teamPager.load({}, (path) => ownedRequest(path, {}, owner, current)); if (current() && page) state.team = page; }
     if (view === "memories") {
       const query = state.memoryQuery, sourceId = state.memorySourceId;
       const results = await Promise.allSettled([ownedRequest(memorySearchPath(query, sourceId), {}, owner), ownedRequest("/memories/graph", {}, owner)]);
@@ -1601,9 +1620,10 @@ async function reconcileAttachmentCollection(slot) {
 
 async function refreshTeam(changes = {}, owner = connection) {
   const version = viewRequestVersion;
-  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "team";
+  const current = () => connectionCurrent(owner) && version === viewRequestVersion && state.view === "team" && state.teamTab === "members";
+  if (!current()) return;
   try {
-    const page = await teamPager.load(changes, (path) => ownedRequest(path, {}, owner));
+    const page = await teamPager.load(changes, (path) => ownedRequest(path, {}, owner, current));
     if (current() && page) { state.team = page; renderOtherView(); }
   } catch (error) { if (current()) showError(error); }
 }
@@ -1645,6 +1665,23 @@ function taskDialogCurrent(slot) {
   return taskDialog === slot && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
 }
 
+function renderTaskBriefContent(root, item, { observed = false } = {}) {
+  const evidenceOpen = $("details", root)?.open ?? false;
+  $("#dialog-title").textContent = item.title || "任务说明";
+  const revision = observed ? Number.isSafeInteger(item.revision) && item.revision > 0 ? `页面观察修订 ${item.revision}` : "修订无法准确核对" : `任务说明 · 修订 ${item.revision}`;
+  root.replaceChildren(element("small", { text: revision }));
+  if (!item.brief) root.append(element("p", { text: observed ? "尚未登记完整说明。" : "尚未登记任务说明。" }));
+  else {
+    root.append(element("h3", { text: "目标" }), element("p", { text: item.brief.goal }));
+    if (item.brief.constraints?.length) root.append(element("h3", { text: "要求" }), element("ul", {}, item.brief.constraints.map((text) => element("li", { text }))));
+    if (item.brief.evidence_refs?.length) {
+      const evidence = element("details", { class: "advanced-settings", open: evidenceOpen }, element("summary", { text: "依据" }));
+      for (const reference of item.brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
+      root.append(evidence);
+    }
+  }
+}
+
 function renderTaskBriefDialog(slot = taskDialog) {
   if (!slot || !taskDialogCurrent(slot)) return;
   const data = slot.model.state;
@@ -1652,21 +1689,8 @@ function renderTaskBriefDialog(slot = taskDialog) {
   const focused = document.activeElement;
   const focusedAction = slot.content.contains(focused) ? focused.dataset.taskControlAction : null;
   if (data.detail && slot.renderedDetail !== data.detail) {
-    const item = data.detail;
-    const evidenceOpen = $("details", slot.brief)?.open ?? false;
-    $("#dialog-title").textContent = item.title || "任务说明";
-    slot.brief.replaceChildren(element("small", { text: `任务说明 · 修订 ${item.revision}` }));
-    if (!item.brief) slot.brief.append(element("p", { text: "尚未登记任务说明。" }));
-    else {
-      slot.brief.append(element("h3", { text: "目标" }), element("p", { text: item.brief.goal }));
-      if (item.brief.constraints?.length) slot.brief.append(element("h3", { text: "要求" }), element("ul", {}, item.brief.constraints.map((text) => element("li", { text }))));
-      if (item.brief.evidence_refs?.length) {
-        const evidence = element("details", { class: "advanced-settings", open: evidenceOpen }, element("summary", { text: "依据" }));
-        for (const reference of item.brief.evidence_refs) evidence.append(element("p", { text: reference.kind === "message" ? `会话 ${reference.session_id} · 消息 ${reference.seq}` : `附件 ${reference.id}` }));
-        slot.brief.append(evidence);
-      }
-    }
-    slot.renderedDetail = item;
+    renderTaskBriefContent(slot.brief, data.detail);
+    slot.renderedDetail = data.detail;
   }
   slot.readStatus.textContent = slot.readError || (!data.detail ? "正在读取…" : !view.fresh ? slot.loading ? "任务说明有更新，正在读取…" : "任务说明有更新，请刷新。" : "");
   slot.readStatus.className = slot.readError ? "form-error" : "task-control-note";
@@ -1681,7 +1705,10 @@ function renderTaskBriefDialog(slot = taskDialog) {
   slot.editor.hidden = !data.editing;
   slot.input.disabled = !!data.submission;
   if (slot.input.value !== data.draft) slot.input.value = data.draft;
-  const localButton = (label, action, callback, { primary = false, disabled = false } = {}) => element("button", { type: "button", class: primary ? "primary-button" : "secondary-button", disabled, dataset: { taskControlAction: action }, onClick: callback }, label);
+  const localButton = (label, action, callback, { primary = false, disabled = false } = {}) => {
+    const button = element("button", { type: "button", class: primary ? "primary-button" : "secondary-button", disabled, dataset: { taskControlAction: action }, onClick: () => { if (taskDialogCurrent(slot) && slot.actions.contains(button) && !button.disabled) callback(); } }, label);
+    return button;
+  };
   const refresh = () => void refreshTaskBriefDialog(slot);
   const actions = [];
   if (view.unknown) actions.push(localButton("重试原操作", "retry", () => void submitTaskControl(slot.model, data.submission.action), { primary: true }));
@@ -1718,7 +1745,7 @@ async function refreshTaskBriefDialog(slot = taskDialog, owner = connection) {
   const current = () => connectionCurrent(owner) && taskDialogCurrent(slot) && slot.readController === controller;
   slot.loading = true; slot.readError = ""; slot.refreshAgain = false; renderTaskBriefDialog(slot);
   try {
-    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: controller.signal }, owner);
+    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.model.state.id)}`, { signal: controller.signal }, owner, current);
     if (!current()) return;
     if (!slot.model.acceptDetail(item)) slot.readError = "任务说明已有更新，请再次刷新。";
   } catch (error) {
@@ -1780,8 +1807,222 @@ async function showTaskBrief(identifier) {
   await refreshTaskBriefDialog(slot);
 }
 
+function taskDirectoryDialogCurrent(slot) {
+  return !!slot && taskDirectoryDialog === slot && taskDirectoryCurrent(slot.directory) && slot.owner === slot.directory.owner && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content;
+}
+
+function releaseTaskDirectoryDialog({ close = false } = {}) {
+  const slot = taskDirectoryDialog; taskDirectoryDialog = null;
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null; slot.detail = null;
+  if (close && $("#app-dialog").open && $("#dialog-content").firstElementChild === slot.content) $("#app-dialog").close();
+  slot.content.replaceChildren();
+}
+
+function taskDirectoryDetail(item, identifier) {
+  const invalid = () => { throw new Error("任务说明响应不完整，请刷新核对。"); };
+  if (!item || item.id !== identifier || item.title !== undefined && typeof item.title !== "string") invalid();
+  const brief = item.brief;
+  if (brief != null) {
+    if (typeof brief !== "object" || Array.isArray(brief) || typeof brief.goal !== "string" || !brief.goal.trim() || !Array.isArray(brief.constraints) || brief.constraints.some((text) => typeof text !== "string") || !Array.isArray(brief.evidence_refs)) invalid();
+    for (const reference of brief.evidence_refs) {
+      if (!reference || !["message", "attachment"].includes(reference.kind) || typeof reference.id !== "string" || !reference.id || reference.kind === "message" && (typeof reference.session_id !== "string" || !reference.session_id || !Number.isSafeInteger(reference.seq) || reference.seq < 1)) invalid();
+    }
+  }
+  return item;
+}
+
+function renderTaskDirectoryBrief(slot) {
+  if (!taskDirectoryDialogCurrent(slot)) return;
+  if (slot.detail && slot.renderedDetail !== slot.detail) {
+    renderTaskBriefContent(slot.brief, slot.detail, { observed: true });
+    slot.renderedDetail = slot.detail;
+  }
+  const revision = slot.detail?.revision, accurate = Number.isSafeInteger(revision) && revision > 0;
+  slot.status.textContent = slot.error || (slot.dirty ? "任务说明有更新，请刷新后核对。" : slot.controller ? "正在读取任务说明…" : slot.detail && !accurate ? "修订无法准确核对，请刷新说明。" : "");
+  slot.status.className = slot.error ? "form-error" : "task-control-note";
+  slot.status.hidden = !slot.status.textContent;
+  const refresh = element("button", { type: "button", class: "secondary-button", text: "刷新说明", disabled: !!slot.controller, onClick: () => { if (taskDirectoryDialogCurrent(slot) && slot.actions.contains(refresh) && !refresh.disabled) void refreshTaskDirectoryBrief(slot); } });
+  slot.actions.replaceChildren(refresh);
+  if (slot.detail?.brief && accurate && !slot.dirty && !slot.error && !slot.controller) {
+    const detail = slot.detail;
+    const question = element("button", { type: "button", class: "primary-button", text: "带着任务提问", disabled: !state.connected || !state.mainSessionId || state.activeSession?.id !== state.mainSessionId, onClick: () => void prepareTaskQuestion(slot, detail, question) });
+    slot.actions.append(question);
+  }
+}
+
+async function refreshTaskDirectoryBrief(slot) {
+  if (!taskDirectoryDialogCurrent(slot)) return;
+  slot.controller?.abort();
+  const controller = slot.controller = new AbortController();
+  slot.error = ""; slot.dirty = false; renderTaskDirectoryBrief(slot);
+  const current = () => taskDirectoryDialogCurrent(slot) && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const item = await ownedRequest(`/commitments/${encodeURIComponent(slot.identifier)}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    slot.detail = taskDirectoryDetail(item, slot.identifier);
+    if (Number.isSafeInteger(slot.minimumRevision) && Number.isSafeInteger(item.revision) && item.revision < slot.minimumRevision) slot.dirty = true;
+    if (Number.isSafeInteger(item.revision) && item.revision > 0) slot.minimumRevision = Math.max(Number.isSafeInteger(slot.minimumRevision) ? slot.minimumRevision : 0, item.revision);
+  } catch (error) {
+    if (current()) slot.error = error.message;
+  } finally {
+    if (current()) { slot.controller = null; renderTaskDirectoryBrief(slot); }
+  }
+}
+
+async function showTaskDirectoryBrief(directory, item, trigger) {
+  if (!taskDirectoryCurrent(directory) || directory.controller || !directory.page?.items.includes(item) || !directory.result.contains(trigger) || trigger.disabled) return;
+  const slot = { directory, owner: directory.owner, identifier: item.id, minimumRevision: item.revision, trigger, content: element("div", { class: "task-brief" }), brief: element("div"), status: element("p", { role: "status" }), actions: element("div", { class: "task-control-actions" }), controller: null, detail: null, renderedDetail: null, dirty: false, error: "" };
+  slot.content.append(slot.brief, slot.status, element("p", { class: "task-control-note", text: "这是页面所见的任务说明。带入草稿后，沐璃仍需核对当前说明；不会自动继续任务。" }), slot.actions);
+  openDialog({ title: "任务说明", content: slot.content, readOnly: true });
+  taskDirectoryDialog = slot;
+  dialogTaskReturn = { directory, trigger };
+  await refreshTaskDirectoryBrief(slot);
+}
+
+async function prepareTaskQuestion(slot, detail, trigger) {
+  const owner = slot.owner;
+  if (!taskDirectoryDialogCurrent(slot) || !connectionCurrent(owner) || !owner.ready || !state.connected || slot.controller || slot.error || slot.dirty || slot.detail !== detail || !detail.brief || !Number.isSafeInteger(detail.revision) || detail.revision < 1 || !slot.actions.contains(trigger) || trigger.disabled) return;
+  const main = state.mainSessionId, draft = captureDraft();
+  if (!main || draft.session !== main) return;
+  const reference = `参考任务（页面观察修订 ${detail.revision}）：请先用 commitment_read 按 identifier 读取当前说明，核对与以下 observed_revision 的差异，再回答我的问题；这不是继续或批准操作的授权。\n${JSON.stringify({ identifier: detail.id, observed_revision: detail.revision })}`;
+  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
+  const input = $("#message-input");
+  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入任务。", true); return; }
+  const navigation = viewRequestVersion + 1;
+  await switchView("chat", owner);
+  if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
+  const current = captureDraft();
+  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入任务。"); return; }
+  if (merged !== draft.text) { input.value = merged; draftRevision += 1; }
+  resizeComposer(); input.focus();
+}
+
+function renderTeamTabs() {
+  return element("div", { class: "role-tabs team-tabs", role: "tablist", "aria-label": "团队视图" }, ...[["members", "队友"], ["tasks", "我的任务"]].map(([key, label]) => element("button", { type: "button", role: "tab", class: state.teamTab === key ? "active" : "", text: label, "aria-selected": String(state.teamTab === key), dataset: { teamTab: key } })));
+}
+
+async function selectTeamTab(tab, trigger) {
+  if (!["members", "tasks"].includes(tab) || state.view !== "team" || !state.auth.authenticated || !connectionCurrent(connection) || !connection.ready || !$("#other-view").contains(trigger) || state.teamTab === tab) return;
+  const owner = connection, navigation = viewRequestVersion + 1;
+  state.teamTab = tab; teamPager.invalidate?.();
+  await switchView("team");
+  if (tab === "members" && connectionCurrent(owner) && navigation === viewRequestVersion && state.view === "team" && state.teamTab === tab) animatePanel($("#other-view").firstElementChild);
+}
+
+function createTaskDirectory(owner = connection) {
+  return taskDirectory = { owner, viewVersion: viewRequestVersion, status: state.taskStatus, cursor: null, starts: [null], page: null, controller: null, error: "", retry: null, dirty: false, root: null };
+}
+
+function taskDirectoryCurrent(slot) {
+  return !!slot && taskDirectory === slot && connectionCurrent(slot.owner) && slot.owner.ready && slot.viewVersion === viewRequestVersion && state.auth.authenticated && state.view === "team" && state.teamTab === "tasks" && state.taskStatus === slot.status && $("#other-view").firstElementChild === slot.root;
+}
+
+function releaseTaskDirectory() {
+  const slot = taskDirectory; taskDirectory = null;
+  releaseTaskDirectoryDialog({ close: true });
+  if (!slot) return;
+  slot.controller?.abort(); slot.controller = null;
+  slot.page = null; slot.retry = null; slot.starts = [];
+  slot.root?.replaceChildren();
+}
+
+function taskDirectoryPage(payload, cursor, starts) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!payload || !Array.isArray(payload.items) || payload.items.length > taskDirectoryPageSize || typeof payload.has_more !== "boolean" || payload.consistency !== "bounded_live" || !count(payload.scanned) || !count(payload.json_bytes) || !count(payload.omitted_total) || !payload.omitted || ["oversized", "invalid", "missing"].some((key) => !count(payload.omitted[key])) || !["limit", "candidate_budget", "output_budget", "raw_budget", "deadline", "end"].includes(payload.stopped)) throw new Error("任务目录响应不完整，请重新读取。");
+  const seen = new Set();
+  for (const item of payload.items) {
+    if (!item || typeof item.id !== "string" || !item.id || seen.has(item.id) || !Object.hasOwn(taskStatusLabels, item.status) || ["title", "next_step"].some((key) => item[key] !== undefined && typeof item[key] !== "string")) throw new Error("任务目录响应不完整，请重新读取。");
+    seen.add(item.id);
+  }
+  if (payload.has_more ? typeof payload.next_cursor !== "string" || !payload.next_cursor || payload.next_cursor === cursor || starts.includes(payload.next_cursor) : payload.next_cursor !== null) throw new Error("任务目录翻页位置无效，请重新读取。");
+  return payload;
+}
+
+async function loadTaskDirectory(slot, { status = slot.status, cursor = null, starts = [null], focus = false } = {}) {
+  if (!taskDirectoryCurrent(slot)) return;
+  slot.controller?.abort(); releaseTaskDirectoryDialog({ close: true });
+  const controller = slot.controller = new AbortController();
+  state.taskStatus = slot.status = status; slot.cursor = cursor; slot.starts = [...starts];
+  slot.page = null; slot.error = ""; slot.retry = { status, cursor, starts: [...starts], focus }; slot.dirty = false;
+  renderTaskDirectoryList(slot);
+  const current = () => taskDirectoryCurrent(slot) && slot.status === status && slot.controller === controller && !controller.signal.aborted;
+  try {
+    const params = new URLSearchParams({ status, limit: taskDirectoryPageSize });
+    if (cursor !== null) params.set("cursor", cursor);
+    const payload = await ownedRequest(`/commitment-directory?${params}`, { signal: controller.signal, cache: "no-store" }, slot.owner, current);
+    if (!current()) return;
+    slot.page = taskDirectoryPage(payload, cursor, starts); slot.retry = null;
+  } catch (error) {
+    if (current()) slot.error = error.status === 404 ? "当前服务尚不支持任务目录。" : error.message;
+  } finally {
+    if (current()) {
+      slot.controller = null; renderTaskDirectoryList(slot);
+      if (focus && !$("#app-dialog").open) slot.position.focus({ preventScroll: true });
+    }
+  }
+}
+
+function renderTaskDirectory() {
+  const slot = taskDirectory;
+  if (!slot) return element("div", { class: "view-content" });
+  if (slot.root) return slot.root;
+  slot.refresh = element("button", { type: "button", class: "secondary-button", text: "刷新列表", onClick: () => { if (taskDirectoryCurrent(slot) && slot.root.contains(slot.refresh)) void loadTaskDirectory(slot, { focus: true }); } });
+  slot.filter = element("select", { class: "filter-select", "aria-label": "账本状态", onChange: () => { if (taskDirectoryCurrent(slot) && slot.root.contains(slot.filter)) void loadTaskDirectory(slot, { status: slot.filter.value, focus: true }); } }, ...[["active", "进行中（未结束）"], ["all", "全部"], ...Object.entries(taskStatusLabels)].map(([value, text]) => element("option", { value, text })));
+  slot.filter.value = slot.status;
+  slot.notice = element("p", { class: "record-list-status", role: "status" });
+  slot.navigation = element("nav", { class: "team-pagination", "aria-label": "任务目录分页" });
+  slot.result = element("div", { id: "task-directory-result", "aria-busy": "false" });
+  slot.root = element("div", { class: "view-content task-directory" }, viewHeading("团队", "保存的任务与协作进展。", slot.refresh), renderTeamTabs(), element("div", { class: "team-filter" }, element("label", {}, "账本状态", slot.filter)), element("p", { class: "task-control-note", text: "账本状态是已保存的登记；当前执行情况请到“队友”核对。" }), slot.notice, slot.navigation, slot.result);
+  return slot.root;
+}
+
+function renderTaskDirectoryNotice(slot) {
+  if (!taskDirectoryCurrent(slot)) return;
+  slot.refresh.disabled = !!slot.controller;
+  slot.notice.textContent = slot.controller ? "正在读取任务…" : slot.dirty ? "任务记录有更新，可刷新列表。" : !slot.page && !slot.error ? "请刷新列表读取任务。" : "";
+  slot.notice.hidden = !slot.notice.textContent;
+}
+
+function renderTaskDirectoryList(slot) {
+  if (!taskDirectoryCurrent(slot)) return;
+  renderTaskDirectoryNotice(slot); slot.filter.value = slot.status;
+  const page = slot.page;
+  slot.position = element("span", { class: "task-directory-position", tabIndex: -1, text: `第 ${slot.starts.length} 页${page ? ` · 本页 ${page.items.length} 条${page.has_more ? " · 尚有后页" : " · 已到本次末页"}` : ""}` });
+  const previous = element("button", { type: "button", class: "text-button", text: "上一页", disabled: !!slot.controller || slot.starts.length < 2, onClick: () => { if (taskDirectoryCurrent(slot) && slot.navigation.contains(previous) && !previous.disabled) void loadTaskDirectory(slot, { cursor: slot.starts.at(-2), starts: slot.starts.slice(0, -1), focus: true }); } });
+  const next = element("button", { type: "button", class: "text-button", text: "继续翻页", disabled: !!slot.controller || !page?.has_more, onClick: () => { if (taskDirectoryCurrent(slot) && slot.navigation.contains(next) && !next.disabled) void loadTaskDirectory(slot, { cursor: page.next_cursor, starts: [...slot.starts, page.next_cursor], focus: true }); } });
+  slot.navigation.replaceChildren(previous, slot.position, next);
+  slot.result.setAttribute("aria-busy", String(!!slot.controller)); slot.result.replaceChildren();
+  if (slot.error) {
+    slot.result.append(element("p", { class: "form-error", role: "alert", text: slot.error }));
+    const retry = element("button", { type: "button", class: "secondary-button", text: "重试读取", onClick: () => { if (taskDirectoryCurrent(slot) && slot.result.contains(retry) && slot.retry) void loadTaskDirectory(slot, slot.retry); } });
+    slot.result.append(retry);
+  }
+  if (!page) return;
+  if (page.omitted_total > 0) slot.result.append(element("p", { class: "task-control-note", text: `部分记录未能列出（本页 ${["oversized", "invalid", "missing"].reduce((sum, key) => sum + page.omitted[key], 0)} 条，累计 ${page.omitted_total} 条）。` }));
+  if (!["end", "limit"].includes(page.stopped)) slot.result.append(element("p", { class: "task-control-note", text: "本次读取达到范围限制，可继续翻页核对。" }));
+  for (const item of page.items) {
+    const button = element("button", { type: "button", class: "text-button", text: "查看任务说明", dataset: { taskIdentifier: item.id }, onClick: () => void showTaskDirectoryBrief(slot, item, button) });
+    slot.result.append(element("article", { class: "record-row task-directory-row" }, element("div", { class: "row-content" }, element("h3", { text: item.title || "未命名任务" }), item.next_step && element("p", { text: item.next_step }), element("div", { class: "row-meta", text: `账本状态：${taskStatusLabels[item.status]}` }), item.details_omitted && element("small", { class: "task-control-note", text: "摘要不完整，请查看任务说明。" })), button));
+  }
+  if (!page.items.length) slot.result.append(emptyState("info", page.has_more ? "本页没有匹配任务，仍有后页" : page.omitted_total ? "本页没有可展示的任务" : "当前筛选下没有任务"));
+}
+
+function markTaskDirectoryDirty(item) {
+  const slot = taskDirectory;
+  if (!taskDirectoryCurrent(slot)) return;
+  slot.dirty = true; renderTaskDirectoryNotice(slot);
+  const detail = taskDirectoryDialog;
+  if (taskDirectoryDialogCurrent(detail) && detail.identifier === item?.id) {
+    detail.dirty = true; detail.controller?.abort(); detail.controller = null;
+    if (Number.isSafeInteger(item.revision) && item.revision > 0) detail.minimumRevision = Math.max(Number.isSafeInteger(detail.minimumRevision) ? detail.minimumRevision : 0, item.revision);
+    renderTaskDirectoryBrief(detail);
+  }
+}
+
 function renderTeam() {
-  const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")));
+  if (state.teamTab === "tasks") return renderTaskDirectory();
+  const root = element("div", { class: "view-content" }, viewHeading("团队", "沐璃分派的任务与协作进展。", actionButton("刷新", "refresh-team", "secondary-button", "refresh")), renderTeamTabs());
   root.append(actionButton("与沐璃安排协作", "configure-prompt", "configuration-link", "chat", { prompt: "请帮我安排一组协作任务：" }));
   const filter = element("div", { class: "team-filter", role: "group", "aria-label": "团队筛选" });
   for (const [active, label] of [[false, "全部"], [true, "进行中"]]) {
@@ -4314,6 +4555,7 @@ document.addEventListener("click", async (event) => {
     else if (button.dataset.settingsTab) switchSettingsTab(button.dataset.settingsTab);
     else if (button.dataset.modelRole) { collectSettingsForm(); state.modelRole = button.dataset.modelRole; renderOtherView(); }
     else if (button.dataset.memoryTab) await selectMemoryTab(button.dataset.memoryTab);
+    else if (button.dataset.teamTab) await selectTeamTab(button.dataset.teamTab, button);
     else if (button.dataset.notificationTab) { state.notificationTab = button.dataset.notificationTab; renderOtherView(); }
   } catch (error) { showError(error); }
 });
@@ -4378,6 +4620,7 @@ $("#dialog-form").addEventListener("submit", async (event) => {
   finally { if (current()) submit.disabled = false; }
 });
 $("#app-dialog").addEventListener("cancel", () => {
+  if (taskDirectoryDialog && $("#dialog-content").firstElementChild === taskDirectoryDialog.content) releaseTaskDirectoryDialog();
   if (channelDeliveryDialog && $("#dialog-content").firstElementChild === channelDeliveryDialog.content) releaseChannelDeliveryDialog();
   if (answerSpeechDialog && $("#dialog-content").firstElementChild === answerSpeechDialog.content) releaseAnswerSpeech();
   if (attachmentCollectionDialog && $("#dialog-content").firstElementChild === attachmentCollectionDialog.content) releaseAttachmentCollection();
@@ -4389,6 +4632,7 @@ $("#app-dialog").addEventListener("close", () => {
   releaseMemorySourceRetry();
   releaseMemoryWatchCancel();
   releaseTaskDialog();
+  releaseTaskDirectoryDialog();
   releaseMemoryDialog();
   releaseHistoryDialog();
   releaseChannelDeliveryDialog();
@@ -4406,6 +4650,8 @@ $("#app-dialog").addEventListener("close", () => {
     if (target) { if (target !== uploadReturn.trigger) target.tabIndex = -1; target.focus({ preventScroll: true }); }
   }
   if (state.auth.authenticated && state.view === "team") restoreTeamView($("#other-view"), saved);
+  const taskReturn = dialogTaskReturn; dialogTaskReturn = null;
+  if (taskReturn && taskDirectoryCurrent(taskReturn.directory) && taskReturn.directory.result.contains(taskReturn.trigger)) taskReturn.trigger.focus({ preventScroll: true });
   const memoryReturn = dialogMemoryReturn; dialogMemoryReturn = null;
   if (state.auth.authenticated && state.view === "memories" && memoryReturn) {
     const root = $("#other-view"), fallback = $$("[data-action=memory-evidence]", root).find((button) => button.dataset.id === memoryReturn.id);
