@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any, NoReturn, Self, cast
 
@@ -17,7 +17,7 @@ from muli.management import SelfManagement
 from muli.proactive import FrozenRouting
 from muli.providers import Message, ModelClient, ModelTurn, StreamEvent, ToolCall
 from muli.reply_origin import ReplyOrigin
-from muli.runtime import Runtime
+from muli.runtime import PreparedRequest, Runtime
 from muli.server import create_app
 from muli.tools import Tool
 from muli.tools.mcp import MCPManager
@@ -244,8 +244,13 @@ async def test_capacity_wait_observes_the_current_catalog_before_starting_the_mo
     ready = asyncio.Event()
     original = runtime._prepare_request
 
-    async def prepared(session_id: str) -> Any:
-        value = await original(session_id)
+    async def prepared(
+        session_id: str,
+        *,
+        previous: PreparedRequest | None = None,
+        claimed_inputs: Sequence[dict[str, Any]] = (),
+    ) -> PreparedRequest:
+        value = await original(session_id, previous=previous, claimed_inputs=claimed_inputs)
         ready.set()
         return value
 
