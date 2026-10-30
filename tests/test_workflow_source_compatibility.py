@@ -42,7 +42,7 @@ def frozen_bytes(name: str) -> bytes:
 
 
 def test_historical_workflow_consumer_source_evidence_stays_frozen() -> None:
-    """共享依赖摘要属于历史 2.139 同格式证明，不据此放行当前 ingress6。"""
+    """共享依赖摘要属于历史 2.139 同格式证明，不据此放行当前 ingress7。"""
     manifest = json.loads(frozen_bytes("manifest.json"))
     assert manifest["baseline_commit"] == "5186d29a0748590d5c16c51823acf8f1d2c8e54f"
     assert manifest["baseline_release"] == "2.138.0"
@@ -156,7 +156,7 @@ async def test_current_workflow_source_journey_refuses_old_reader_before_recover
 
     old_reader = frozen_e139_reader()
     assert old_reader.CURRENT_FORMAT_STATE == PRE_CHANNEL_REFERENCE_FORMAT_STATE
-    assert CURRENT_FORMAT_STATE.formats.ingress == 6
+    assert CURRENT_FORMAT_STATE.formats.ingress == 7
     database = snapshot_dir / "muli.sqlite3"
     database_before = database.read_bytes()
     config = runtimes[0].config.path

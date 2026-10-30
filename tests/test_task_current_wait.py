@@ -102,7 +102,14 @@ def test_candidate_window_can_be_empty_with_a_real_next_page(
         runtime.store.db.set_trace_callback(None)
     assert [item["agent_id"] for item in second["items"]] == ["z-own"]
     assert second["items"][0]["execution"]["state"] == "none"
-    assert second["owner_questions"] == "unclassified"
+    assert second["owner_questions"] == {
+        "coverage": "explicit_only",
+        "read_arguments": {
+            "identifier": task_id,
+            "section": "owner_questions",
+            "question_status": "open",
+        },
+    }
     assert not second["has_more"] and second["next_cursor"] is None
     assert "私密" not in json.dumps(second, ensure_ascii=False)
     assert durable_state(runtime.store) == before and runtime.store.db.total_changes == changes

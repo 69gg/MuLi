@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -517,20 +518,104 @@ def test_sqlite_vm_budget_never_turns_a_partial_scan_into_unique_success(store: 
     assert store._channel_reference_read_active is False
 
 
+@pytest.mark.parametrize("position", ["frozen", "deadline", "beyond"])
 def test_time_budget_restores_busy_timeout_and_an_outer_transaction_is_never_taken_over(
     store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+    position: str,
 ) -> None:
-    confirmed(store)
+    identifier = confirmed(store)
     target = original(store)
     store.db.execute("PRAGMA busy_timeout=2345")
-    assert_code(
-        "channel_reference_search_incomplete", lambda: read(store, target, max_search_seconds=1e-9)
-    )
+    changes = store.db.total_changes
+    clock = 1.0
+    budget = 1e-9
+    deadline = clock + budget
+    assert deadline > clock
+    stop = {
+        "frozen": clock,
+        "deadline": deadline,
+        "beyond": math.nextafter(deadline, math.inf),
+    }[position]
+    bindings: list[tuple[str, str, str]] = []
+    statements: list[str] = []
+
+    def monotonic() -> float:
+        return clock
+
+    def authorize_then_advance(name: str, account: str, owner: str) -> None:
+        nonlocal clock
+        current_binding(name, account, owner)
+        assert store.db.in_transaction and store._channel_reference_read_active is True
+        bindings.append((name, account, owner))
+        clock = stop
+
+    # One real clock tick may cover the whole read on Windows Python 3.12.
+    # Advance only this module's clock after the real snapshot has begun.
+    monkeypatch.setattr("muli.channel_references.monotonic", monotonic)
+    store.db.set_trace_callback(statements.append)
+    try:
+        if position == "frozen":
+            page = read(store, target, authorize=authorize_then_advance, max_search_seconds=budget)
+            assert page["delivery_id"] == identifier
+            assert page["content"] == "旧方案 A：蓝笔，每日二十分钟。"
+        else:
+            assert_code(
+                "channel_reference_search_incomplete",
+                lambda: read(
+                    store, target, authorize=authorize_then_advance, max_search_seconds=budget
+                ),
+            )
+    finally:
+        store.db.set_trace_callback(None)
+    assert bindings == [("telegram", "account", "7")]
+    assert "BEGIN" in statements and "ROLLBACK" in statements
+    assert store.db.total_changes == changes
     assert store.db.execute("PRAGMA busy_timeout").fetchone()[0] == 2345
     assert not store.db.in_transaction and store._channel_reference_read_active is False
+    # An expired progress handler left installed would interrupt this query.
+    assert (
+        store.db.execute(
+            "WITH RECURSIVE counter(n) AS (VALUES(0) UNION ALL "
+            "SELECT n+1 FROM counter WHERE n<200) SELECT max(n) FROM counter"
+        ).fetchone()[0]
+        == 200
+    )
     store.db.execute("BEGIN")
     try:
         assert_code("channel_reference_transaction_active", lambda: read(store, target))
         assert store.db.in_transaction
     finally:
         store.db.rollback()
+
+
+def test_positive_time_budget_that_rounds_to_current_clock_expires_before_begin(
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    confirmed(store)
+    target = original(store)
+    store.db.execute("PRAGMA busy_timeout=2345")
+    changes = store.db.total_changes
+    clock = float(1 << 24)
+    budget = 1e-9
+    assert math.ulp(clock) > 2 * budget
+    assert clock + budget == clock
+    statements: list[str] = []
+
+    def monotonic() -> float:
+        return clock
+
+    monkeypatch.setattr("muli.channel_references.monotonic", monotonic)
+    store.db.set_trace_callback(statements.append)
+    try:
+        assert_code(
+            "channel_reference_search_incomplete",
+            lambda: read(store, target, max_search_seconds=budget),
+        )
+    finally:
+        store.db.set_trace_callback(None)
+    assert "BEGIN" not in statements
+    assert store.db.total_changes == changes
+    assert store.db.execute("PRAGMA busy_timeout").fetchone()[0] == 2345
+    assert not store.db.in_transaction and store._channel_reference_read_active is False

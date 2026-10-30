@@ -122,13 +122,25 @@ PRE_CHANNEL_REFERENCE_FORMAT_STATE = FormatState(
         install_profile=1,
     ),
 )
-CURRENT_FORMAT_STATE = FormatState(
+PRE_OWNER_QUESTION_FORMAT_STATE = FormatState(
     metadata_version=1,
     formats=FormatVersions(
         database=1,
         objects=3,
         configuration=2,
         ingress=6,
+        outbox=3,
+        memory=5,
+        install_profile=1,
+    ),
+)
+CURRENT_FORMAT_STATE = FormatState(
+    metadata_version=1,
+    formats=FormatVersions(
+        database=1,
+        objects=3,
+        configuration=2,
+        ingress=7,
         outbox=3,
         memory=5,
         install_profile=1,
@@ -153,6 +165,7 @@ def require_current_format(evidence: FormatEvidence) -> None:
         PRE_PROJECT_INBOX_FORMAT_STATE,
         PRE_REPLY_MEMORY_FORMAT_STATE,
         PRE_CHANNEL_REFERENCE_FORMAT_STATE,
+        PRE_OWNER_QUESTION_FORMAT_STATE,
     ):
         raise FormatAdmissionError("store_format_upgrade_required")
     if evidence.state != CURRENT_FORMAT_STATE:

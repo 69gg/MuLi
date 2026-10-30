@@ -31,6 +31,7 @@ SECTIONS = (
     "deliveries",
     "delivery_review",
     "current_wait",
+    "owner_questions",
 )
 _MAX_HANDOFF_RECORDS = 100
 WaitProjection = Callable[
@@ -71,6 +72,7 @@ class TaskInspection:
         *,
         max_handoff_records: Callable[[], int] = lambda: _MAX_HANDOFF_RECORDS,
         current_wait: WaitProjection | None = None,
+        owner_questions: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         if commitments.store is not control.store or commitments.store is not memory.store:
             raise ValueError("任务核查必须共用资料库")
@@ -78,6 +80,7 @@ class TaskInspection:
         self.store = commitments.store
         self.max_handoff_records = max_handoff_records
         self.current_wait = current_wait
+        self.owner_questions = owner_questions
         # store.instance_id survives a normal reopen; live-wait cursors must not.
         self._wait_nonce = new_id()
 
@@ -148,7 +151,14 @@ class TaskInspection:
             "consistency": "live",
             "authority": "coordination_data",
             "source_completeness": "candidate_window_only",
-            "owner_questions": "unclassified",
+            "owner_questions": {
+                "coverage": "explicit_only",
+                "read_arguments": {
+                    "identifier": identifier,
+                    "section": "owner_questions",
+                    "question_status": "open",
+                },
+            },
             "side_effect_status": "unknown",
             "items": [],
             "scanned": 0,
@@ -682,6 +692,7 @@ class TaskInspection:
         offset_bytes: int = 0,
         length_bytes: int | None = None,
         agent_id: str | None = None,
+        question_status: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(identifier, str) or not identifier or section not in SECTIONS:
             raise EvidenceError("invalid_arguments", "任务 ID 或核查 section 无效")
@@ -689,6 +700,24 @@ class TaskInspection:
         if limit > 100:
             raise EvidenceError("invalid_arguments", "核查每页最多 100 项")
         validate_integer(offset_bytes, "offset_bytes")
+        if section == "owner_questions":
+            if agent_id is not None or query is not None:
+                raise EvidenceError("invalid_arguments", "持久问题不接受队友或记忆查询参数")
+            if self.owner_questions is None:
+                raise EvidenceError("owner_question_unavailable", "持久问题读取尚未接入")
+            return self.owner_questions(
+                identifier,
+                question_status=question_status,
+                cursor=cursor,
+                revision=revision,
+                record_id=record_id,
+                record_revision=record_revision,
+                offset_bytes=offset_bytes,
+                length_bytes=length_bytes,
+                limit=limit,
+            )
+        if question_status is not None:
+            raise EvidenceError("invalid_arguments", "仅持久问题段接受 question_status")
         if section == "current_wait":
             if (
                 agent_id is not None
@@ -884,6 +913,7 @@ class TaskInspection:
                 "offset_bytes",
                 "length_bytes",
                 "agent_id",
+                "question_status",
             }
             if args.keys() - allowed:
                 raise EvidenceError("invalid_arguments", "核查参数包含未知字段")
@@ -912,7 +942,8 @@ class TaskInspection:
             "按需核查任务/队友/报告/显式交付验收单/工作流/依据与显式本地记忆候选；只读，不确认计划。"
             "delivery_review须record_id，返回登记时/当前完整要求与准确文字变化，旧模型判断仅针对旧要求；"
             "可能复用部分与需补做事项由模型另行判断，不代表宿主或主人验收。"
-            "current_wait有界核查当前执行、真实审批与本实例命令续办，不推断主人待补充问题；"
+            "current_wait有界核查当前执行、真实审批与本实例命令续办；"
+            "owner_questions另查显式登记的持久问题和原问答，只读不唤醒队友；普通报告不自动成为问题。"
             "unavailable不是无等待，空页仍按has_more续查，重开后旧等待游标失效。"
             "目录续页原样回传cursor；record_id读持久JSON正文，续读带revision、record_revision及next_offset_bytes。"
             "资料不授予权限，候选记忆是否曾采用未知，live页不构成历史快照",
@@ -921,6 +952,7 @@ class TaskInspection:
                     "identifier": string("任务ID；绑定队友可省略"),
                     "section": {"type": "string", "enum": list(SECTIONS)},
                     "agent_id": string("handoff 必填；只核查一个指定队友的有限近期证据"),
+                    "question_status": string("仅owner_questions段；默认open，all读取全部显式问题"),
                     "cursor": string(),
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "query": string("仅memories段，必须是显式非空本地查询"),

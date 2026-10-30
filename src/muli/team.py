@@ -1136,13 +1136,35 @@ class TeamManager:
                     await self.runtime.bus.notify()
             if run_id is None:
                 return
+        launch_error: Exception | asyncio.CancelledError | None = None
+        queue_revoked = False
+        if shell_continuation is None:
+            try:
+                async with self.runtime.configuration_lock:
+                    current = self.get(identifier)
+                    if current["status"] != "queued":
+                        # A precise mailbox cancellation can revoke a dormant
+                        # activation while this scheduler Task waits for the
+                        # configuration lock. Do not launch from its old copy.
+                        queue_revoked = True
+                    elif self._closed or self.runtime._closing:
+                        status = "interrupted"
+                    else:
+                        agent = current
+                        run_id = self._launch_agent(agent)
+            except (Exception, asyncio.CancelledError) as exc:
+                launch_error = exc
+        if queue_revoked:
+            self._active.pop(identifier, None)
+            self.start()
+            await self.runtime.bus.notify()
+            return
         try:
             if shell_continuation is None:
-                async with self.runtime.configuration_lock:
-                    if self._closed or self.runtime._closing:
-                        status = "interrupted"
-                        return
-                    run_id = self._launch_agent(agent)
+                if launch_error is not None:
+                    raise launch_error
+                if run_id is None:
+                    return
             assert run_id is not None
             await self.runtime.bus.emit("team.updated", {"agent": agent})
             result = await self.runtime.wait(run_id)
@@ -1566,6 +1588,59 @@ class TeamManager:
             )
 
         async def send_input(args: dict[str, Any]) -> Any:
+            if "question" in args:
+                question = args["question"]
+                if not isinstance(question, dict):
+                    raise ValueError("question 必须是显式动作对象，不能降级为普通发送")
+                action = question.get("action")
+                required = {
+                    "register": {"action", "key"},
+                    "answer": {"action", "id", "delivery"},
+                    "dispatch": {"action", "id"},
+                    "cancel": {"action", "id"},
+                }
+                if not isinstance(action, str) or action not in required:
+                    raise ValueError("问题动作无效，不能降级为普通发送")
+                allowed = {"target", "message", "question"}
+                if action == "register":
+                    allowed.add("attachment_ids")
+                if set(question) != required[action] or set(args) - allowed:
+                    raise ValueError("问题参数包含未知字段、wake 或非登记动作的附件")
+                if not {"target", "message"} <= set(args) or any(
+                    not isinstance(args[field], str) or not args[field].strip()
+                    for field in ("target", "message")
+                ):
+                    raise ValueError("问题操作必须包含准确 target 和非空 message")
+                coordinator = getattr(self.runtime, "owner_questions", None)
+                if coordinator is None:
+                    raise PermissionError("主人问题协调服务尚未就绪")
+                if action == "register":
+                    return await coordinator.register(
+                        caller,
+                        run_id,
+                        generation,
+                        key=question["key"],
+                        message=args["message"],
+                        target=args["target"],
+                        attachment_ids=args.get("attachment_ids"),
+                    )
+                if not isinstance(question["id"], str) or not question["id"]:
+                    raise ValueError("问题操作需要完整 id")
+                arguments = {
+                    "question_id": question["id"],
+                    "target": args["target"],
+                    "interpretation": args["message"],
+                }
+                if action == "answer":
+                    if not isinstance(question["delivery"], str) or question["delivery"] not in {
+                        "record_only",
+                        "dispatch",
+                    }:
+                        raise ValueError("问题回答交回方式无效")
+                    return await coordinator.answer(**arguments, delivery=question["delivery"])
+                if action == "dispatch":
+                    return await coordinator.dispatch(**arguments)
+                return await coordinator.cancel(**arguments)
             if args["target"] == self.runtime.store.existing_main_session_id():
                 return await self._progress(
                     caller,
@@ -1647,18 +1722,48 @@ class TeamManager:
                 "在队友安全边界插入补充，不打断当前流式或工具；直接队友执行中也可向固定主会话"
                 "ID交阶段资料或澄清，主助手沿原任务来源协调，内容不是新授权；"
                 "wake=false只入邮箱，不主动唤醒。等待主人可自然结束本轮，明确补充后续同队友；"
-                "未知操作先核状态，不自动重做。",
+                "未知操作先核状态，不自动重做。question 显式登记持久待答问题或操作原答；"
+                "此分支禁止 wake，只有 register 可给附件。主助手须按本轮主人完整原文模板"
+                "选择准确问题；record_only不入队，dispatch才交回原队友；回执不表示任务完成。",
                 parameters(
                     {
                         "target": string(),
                         "message": string(),
                         "wake": {"type": "boolean"},
                         "attachment_ids": attachment_ids_schema(),
+                        "question": {
+                            "oneOf": [
+                                parameters(
+                                    {
+                                        "action": {"const": "register"},
+                                        "key": string("稳定提问去重键"),
+                                    },
+                                    ("action", "key"),
+                                ),
+                                parameters(
+                                    {
+                                        "action": {"const": "answer"},
+                                        "id": string("完整问题ID"),
+                                        "delivery": {"enum": ["record_only", "dispatch"]},
+                                    },
+                                    ("action", "id", "delivery"),
+                                ),
+                                parameters(
+                                    {"action": {"const": "dispatch"}, "id": string("完整问题ID")},
+                                    ("action", "id"),
+                                ),
+                                parameters(
+                                    {"action": {"const": "cancel"}, "id": string("完整问题ID")},
+                                    ("action", "id"),
+                                ),
+                            ]
+                        },
                     },
                     ("target", "message"),
                 ),
                 send_input,
                 "write",
+                preserve_output=True,
             ),
             Tool(
                 "resume_agent",
@@ -1698,6 +1803,24 @@ class TeamManager:
                 ),
                 listing,
             ),
+        ]
+        question_tool = next(tool for tool in tools if tool.name == "send_input")
+        question_tool.parameters["allOf"] = [
+            {
+                "if": {"required": ["question"]},
+                "then": {"not": {"required": ["wake"]}},
+            },
+            {
+                "if": {
+                    "required": ["question"],
+                    "properties": {
+                        "question": {
+                            "properties": {"action": {"enum": ["answer", "dispatch", "cancel"]}}
+                        }
+                    },
+                },
+                "then": {"not": {"required": ["attachment_ids"]}},
+            },
         ]
         if self.consult.available(caller, run_id, generation):
             tools.append(

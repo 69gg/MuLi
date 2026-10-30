@@ -23,7 +23,9 @@ $script:traceStages = @(
     'muli-uia-stage=1:walker_ready',
     'muli-uia-stage=1:probe_process_ready',
     'muli-uia-stage=1:uia_host_validated',
-    'muli-uia-stage=1:uia_add_type_returned'
+    'muli-uia-stage=1:uia_add_type_returned',
+    'muli-uia-stage=1:watch_starting',
+    'muli-uia-stage=1:watch_ready'
 )
 
 function Write-Stage([int]$index) {
@@ -145,7 +147,9 @@ try {
                     Write-Stage 3
                 }
             }
+            if ($traceProbe) { Write-Stage 16 }
             $script:watch = [Diagnostics.Stopwatch]::StartNew()
+            if ($traceProbe) { Write-Stage 17 }
             Initialize-Uia
             Check-Deadline
             if ([string]$request.command -cne 'probe') {

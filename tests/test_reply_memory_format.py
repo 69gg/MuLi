@@ -93,7 +93,7 @@ def test_e137_manifest_refuses_reply_memory_same_format_switch(after_upgrade: bo
     assert old.CURRENT_FORMAT_STATE == PRE_REPLY_MEMORY_FORMAT_STATE
     assert previous.formats.memory.reads == (4,) and previous.formats.memory.writes == 4
     assert current.formats.memory.reads == (5,) and current.formats.memory.writes == 5
-    # Keep the historical memory-only boundary fixed as CURRENT gains ingress6.
+    # Keep the historical memory-only boundary fixed as CURRENT gains later ingress contracts.
     assert PRE_CHANNEL_REFERENCE_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "memory": 5,

@@ -61,6 +61,7 @@ from muli.memory_watches import (
 from muli.mobile_approvals import MobileApprovals, live_approval
 from muli.mobile_task_control import MobileControlSource, MobileTaskControl
 from muli.notifications import DesktopNotifier
+from muli.owner_questions import OwnerQuestions
 from muli.owner_text import OwnerTextKind, owner_text_marker
 from muli.permissions import ApprovalNotice, ApprovalSuperseded, Mode, PermissionDenied, Permissions
 from muli.proactive import FrozenRouting
@@ -294,6 +295,10 @@ class Runtime:
         self.configure()
         self._configure_workflows()
         self.team = TeamManager(self)
+        self.owner_questions = OwnerQuestions(self)
+        self.store.owner_question_admit_claim = self.owner_questions.admit_claim_in_transaction
+        self.store.owner_question_claimed = self.owner_questions.claimed_in_transaction
+        self.store.owner_question_cancelled = self.owner_questions.cancelled_in_transaction
         self._configure_compaction()
         self.extensions = Extensions(self)
         self.maintenance.owner("runtime", self.maintenance_idle)
@@ -3155,8 +3160,9 @@ class Runtime:
         self._repair_tail(session_id)
         if consult is None:
             discarded = self._cancel_stale_memory_inputs(session_id)
+            had_pending = bool(self.store.pending_inputs(session_id))
             claimed = await self._claim_inputs(session_id, run_id, discard_stale=False)
-            if discarded and not claimed:
+            if (discarded or had_pending) and not claimed:
                 return _ExecutionResult("")
             prepared = await self._prepare_request(session_id, claimed_inputs=claimed)
             prepared = replace(prepared, shell_continuation=shell_continuation)

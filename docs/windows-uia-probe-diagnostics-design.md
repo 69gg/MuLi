@@ -1,5 +1,9 @@
 # Windows UIA probe 的固定阶段证据
 
+最新候选：2026-10-30 在首 probe 的原 Stopwatch 构造两侧追加固定观察点；
+本片等待根统一守卫检查，真实 Windows 新观察待验。它不改变原 12 秒期限，
+也不代表启动超时的根因已经查明或修复。以下保留前序观察与验证记录。
+
 状态：原八阶段及后续三个输入阶段的纯回归与静态检查已完成；2.43 候选的 Windows
 3.12 首 probe 仍超时且没有可见阶段。本文末新增同次首 probe 观察，源码与纯回归已
 编写，等待根统一检查与独立后审；真实 Windows 新观察待验。
@@ -251,3 +255,40 @@ process、一次发送和一次清理，再要求新前后事实；旧投影均�
 queries 1、vm_steps 0；`3744 passed, 1457 skipped, 1 failed`。零 progress 回调不证明
 没有执行 SQLite；该失败仍如实保留。本片不改格式分类或预算，不用假时钟、skip 或
 后续不同候选成功掩盖此真实失败，也不把新增观察称为已修复 3.12 启动超时。
+
+## 2.140 首 probe 的 Stopwatch 边界缺口
+
+候选 `28cf` 的 CI `41056341049`，Windows 3.12 shard 3 中
+`test_real_windows_probe_does_not_initialize_the_tree_walker[None]` 仍以原
+`read_timeout` 失败。该次宿主已完成一次 spawn、write 和 drain；失败 note 的
+阶段序列有效且前缀未截断。宿主观察到 `script_entered=5155 ms`、
+`utility_ready=5984 ms`、`input_line_received=6000 ms`、
+`request_decoded=8547 ms`、`probe_received=9140 ms`；12 秒响应等待结束时
+仍未见 `uia_initializing`，自有 helper 与 readers 的原清理最终确认完成。
+
+这些毫秒是宿主读取到完整阶段行的时刻，不能当作脚本语句本身的执行时长；
+阶段 best effort 写入失败也可能导致缺失。现有证据不能证明 Stopwatch 阻塞，
+也不支持把本次失败直接归因于尚无阶段证据的 Add-Type、TreeWalker 或 COM。
+与旧候选没有任何阶段的失败不同，本次已观察到合法 probe 通过原协议校验。
+
+原 `probe_received` 与 `uia_initializing` 之间包含原
+`[Diagnostics.Stopwatch]::StartNew()` 及 `Initialize-Uia` 首次进入。最小诊断只在
+前者紧邻两侧各调用一次既有 `Write-Stage`：`watch_starting` 在调用前，
+`watch_ready` 在返回后。二者沿用首个合法 probe 的 `$traceProbe` 条件，
+不为其他命令或重复 probe 新增输出，不更改任何时钟、UIA 检查或响应顺序。
+
+PowerShell 阶段表在末尾追加物理索引 16、17，旧索引 0–15 保持不变；
+测试投影的逻辑顺序则是 `probe_received`、`watch_starting`、`watch_ready`、
+`uia_initializing`。缺少任一新阶段的旧记录仍是合法子序列；重复或逆序仍标为
+invalid。`watch_ready` 只能证明原构造已返回；没有后续阶段不证明初始化未开始。
+
+既有十四阶段 `STAGES` 与其 512 字节夹具保持冻结，新增 `WATCH_STAGES` 后
+另行构成包含十八个名称的 `ALL_STAGES`，按原 `MAX_STDERR_BYTES=2048`
+核验完整白名单。原 1 MB 总计费、4 KiB note 预算、一次请求、TTL、绝对 12 秒
+和清理 owner 均不改变；新增标记自身的开销仍计入该次原期限。
+
+纯回归补充检查追加物理索引与原 Stopwatch 两侧位置、watch 半行、缺失前级、
+重复及逆序；既有完整白名单、真实 reader 到达时刻投影和饱和毫秒的完整 note
+预算测试同时覆盖新阶段。未启动本机 PowerShell、真实子进程或桌面；所有检查
+由根串行执行并收取守卫终态，尚未将本片计为已验证。下一次正常托管 CI 再核
+原生 probe 与清理，不通过增加期限、重试或跳过失败取得通过。

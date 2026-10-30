@@ -10,7 +10,9 @@
 
 ## 随包声明与发行检查
 
-[`src/muli/compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的目标版本（以 `release` 为准）、`metadata_version=1` 和交接协议 2。七域当前精确读写值为：`database`、`install_profile` 的 `reads=[1]`、`writes=1`；`configuration` 的 `reads=[2]`、`writes=2`；`objects`、`outbox` 的 `reads=[3]`、`writes=3`；`ingress`、`memory` 的 `reads=[5]`、`writes=5`。它们对应 [`CURRENT_FORMAT_STATE`](../src/muli/format_admission.py) 及[当前七领域合同](fresh-format-admission.md#当前七领域合同)。`requires_migration=false` 只允许该目标格式上的同格式判定，不表示任何已声明的旧格式可以直接启动新版。Linux 和 macOS 独立安装只接纳[停机升级指南](channel-ownership-format-upgrade.md)列出的精确完整前序；托管跨格式切换、其它 macOS 旧格式与 Windows 旧库升级仍拒绝，各平台新装直接使用当前格式。`install_profile=1` 仍允许尚未准备 profile 的缺省状态，不生成 receipt、不证明 uv 环境或解析上下文。版本整合须同步 `pyproject.toml`、`muli.__version__`、`uv.lock` 和声明中的 `release`。
+随包 [`compatibility.json`](../src/muli/compatibility.json) 声明 `muli-agent` 的版本、元数据版本 1 和交接协议 2。当前七域精确读写为 `(1,3,2,7,3,5,1)`，与[当前合同](fresh-format-admission.md#当前七领域合同)一致。`requires_migration=false` 只允许当前格式上的同格式判定。已有 Linux/macOS 独立资料库须沿[停机指南](channel-ownership-format-upgrade.md)核对精确前序；托管跨格式切换和 Windows 旧库升级仍拒绝。新装直接使用当前格式。安装配置格式 `1` 仍允许缺省状态，不制造安装或环境验证回执。版本整合须同步项目版本、模块版本、锁文件与随包声明。
+
+登记问题的答案续接使用 ingress7：原问题、主人原答、准确任务和原队友必须从邮箱保留到归档，领取状态也在同一事务更新。旧6 reader不能忽略这些证明继续运行，因此双方同格式切换仍须拒绝。精确旧完整 `(1,3,2,6,3,5,1)` 只能沿受支持的停机入口转换；原件与方法级反证范围见[2.140来源说明](../tests/fixtures/format-v2.140.md)。
 
 未知主配置字段仍明确拒绝，增加默认关闭的字段也会在完整序列化时改变旧版读取能力，不能仅因默认值或 DDL 未变便沿用同格式声明。2.41 的资料收件因此采用现有 Store 中独立有版本的策略，不向主配置或管理快照加入 `file_inbox`；旧版忽略不认识的功能记录，不会因此取得收件能力。坏策略和未来版本不静默覆盖，具体跨版本读取证据见[2.41 审查](review-v2.41.md)。
 

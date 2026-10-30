@@ -74,7 +74,9 @@ def current_manifest() -> CompatibilityManifest:
     return CompatibilityManifest.from_json(path.read_bytes())
 
 
-def test_e139_actual_consumer_refuses_ingress6_before_business_writes(database: Path) -> None:
+def test_e139_actual_consumer_refuses_current_ingress_before_business_writes(
+    database: Path,
+) -> None:
     old = frozen_e139_reader()
     assert old.CURRENT_FORMAT_STATE == PRE_CHANNEL_REFERENCE_FORMAT_STATE
     before = snapshot(database)
@@ -91,7 +93,7 @@ def test_current_consumer_requires_explicit_upgrade_from_exact_ingress5(database
     old = frozen_e139_reader()
     assert CURRENT_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
-        "ingress": 6,
+        "ingress": 7,
     }
     with closing(sqlite3.connect(database)) as db:
         evidence = read_format_evidence(db)
@@ -103,7 +105,7 @@ def test_current_consumer_requires_explicit_upgrade_from_exact_ingress5(database
         assert db.total_changes == 0
 
 
-@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress6"])
+@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress7"])
 @pytest.mark.parametrize("reverse", [False, True], ids=["upgrade", "downgrade"])
 def test_managed_same_format_switch_refuses_both_native_reference_directions(
     after_upgrade: bool, reverse: bool
@@ -112,7 +114,7 @@ def test_managed_same_format_switch_refuses_both_native_reference_directions(
     current = current_manifest()
     assert previous.release == "2.139.0"
     assert previous.formats.ingress.reads == (5,) and previous.formats.ingress.writes == 5
-    assert current.formats.ingress.reads == (6,) and current.formats.ingress.writes == 6
+    assert current.formats.ingress.reads == (7,) and current.formats.ingress.writes == 7
     assert current.formats.model_dump(exclude={"ingress"}) == previous.formats.model_dump(
         exclude={"ingress"}
     )
@@ -130,7 +132,7 @@ def test_managed_same_format_switch_refuses_both_native_reference_directions(
     ).format_compatible
 
 
-@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress6"])
+@pytest.mark.parametrize("after_upgrade", [False, True], ids=["ingress5", "ingress7"])
 def test_reading_both_ingress_contracts_does_not_authorize_cross_format_writes(
     after_upgrade: bool,
 ) -> None:
@@ -140,7 +142,7 @@ def test_reading_both_ingress_contracts_does_not_authorize_cross_format_writes(
             update={
                 "formats": manifest.formats.model_copy(
                     update={
-                        "ingress": manifest.formats.ingress.model_copy(update={"reads": (5, 6)})
+                        "ingress": manifest.formats.ingress.model_copy(update={"reads": (5, 7)})
                     }
                 )
             }
@@ -368,7 +370,7 @@ def test_native_reference_upgrade_does_not_guess_an_input_contract(
             state = PRE_CHANNEL_REFERENCE_FORMAT_STATE.model_copy(
                 update={
                     "formats": PRE_CHANNEL_REFERENCE_FORMAT_STATE.formats.model_copy(
-                        update={"ingress": 6, "memory": 4} if source == "mixed" else {"ingress": 7}
+                        update={"ingress": 6, "memory": 4} if source == "mixed" else {"ingress": 8}
                     )
                 }
             )

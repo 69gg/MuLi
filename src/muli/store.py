@@ -121,6 +121,12 @@ _EVIDENCE_FROM = (
 
 
 class Store:
+    owner_question_admit_claim: Callable[[sqlite3.Row, dict[str, Any], str], bool] | None = None
+    owner_question_claimed: (
+        Callable[[sqlite3.Row, dict[str, Any], dict[str, Any], str], None] | None
+    ) = None
+    owner_question_cancelled: Callable[[sqlite3.Row, dict[str, Any] | None], None] | None = None
+
     def __init__(self, path: Path, *, durable: bool = False) -> None:
         self._runtime_lock: StoreConstructionLock | None = None
         try:
@@ -1917,12 +1923,31 @@ class Store:
         result: builtins.list[dict[str, Any]] = []
         destination: tuple[str, ...] | None = None
         with self.db:
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
             rows = self.db.execute(
                 "SELECT * FROM ingress WHERE session_id=? AND state='pending' ORDER BY seq LIMIT ?",
                 (session_id, limit),
             ).fetchall()
             for row in rows:
                 payload = json.loads(row["payload"])
+                question_answer = "owner_question_answer" in payload
+                if question_answer:
+                    if (
+                        self.owner_question_admit_claim is None
+                        or self.owner_question_claimed is None
+                        or self.owner_question_cancelled is None
+                    ):
+                        raise EvidenceError(
+                            "owner_question_unavailable", "问题答案领取缺少宿主核验，未交付输入"
+                        )
+                    if not self.owner_question_admit_claim(row, payload, run_id):
+                        self.db.execute(
+                            "UPDATE ingress SET state='cancelled' WHERE seq=? AND state='pending'",
+                            (row["seq"],),
+                        )
+                        self.owner_question_cancelled(row, payload)
+                        continue
                 origin = ReplyOrigin.from_input(payload)
                 routing = FrozenRouting.load(payload.get("attention_routing"))
                 key = (
@@ -1961,6 +1986,11 @@ class Store:
                     json.dumps(payload["attention_project"], sort_keys=True, separators=(",", ":"))
                     if "attention_project" in payload
                     else "",
+                    json.dumps(
+                        payload["owner_question_answer"], sort_keys=True, separators=(",", ":")
+                    )
+                    if question_answer
+                    else "",
                 )
                 if destination is not None and key != destination:
                     break  # Another recipient waits for the next replay-safe boundary.
@@ -1972,6 +2002,9 @@ class Store:
                     "UPDATE ingress SET state='delivered',delivered_seq=?,run_id=? WHERE seq=?",
                     (message["seq"], run_id, row["seq"]),
                 )
+                if question_answer:
+                    assert self.owner_question_claimed is not None
+                    self.owner_question_claimed(row, payload, message, run_id)
                 result.append(message)
         return result
 
@@ -2018,6 +2051,8 @@ class Store:
             message["channel_ownership_control"] = payload["channel_ownership_control"]
         if "channel_reference" in payload:
             message["channel_reference"] = payload["channel_reference"]
+        if "owner_question_answer" in payload:
+            message["owner_question_answer"] = payload["owner_question_answer"]
         return message
 
     def _archive_input(
@@ -2037,10 +2072,25 @@ class Store:
 
     def cancel_inputs(self, session_id: str) -> None:
         with self.db:
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            rows = self.db.execute(
+                "SELECT seq,id,session_id,state FROM ingress "
+                "WHERE session_id=? AND state='pending' AND CASE "
+                "WHEN json_valid(payload) THEN json_type(payload,'$.owner_question_answer') "
+                "IS NOT NULL ELSE 0 END ORDER BY seq",
+                (session_id,),
+            ).fetchall()
             self.db.execute(
                 "UPDATE ingress SET state='cancelled' WHERE session_id=? AND state='pending'",
                 (session_id,),
             )
+            for row in rows:
+                if self.owner_question_cancelled is None:
+                    raise EvidenceError(
+                        "owner_question_unavailable", "问题答案取消缺少宿主核验，未更改输入"
+                    )
+                self.owner_question_cancelled(row, None)
 
     def ingest(
         self,

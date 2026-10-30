@@ -30,7 +30,9 @@ SQLite WAL/SHM 与短锁文件可以发生文件系统变化。“准入拒绝�
 
 ## 当前七领域合同
 
-完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，`database=1`、`objects=3`、`configuration=2`、`ingress=5`、`outbox=3`、`memory=5`、`install_profile=1`。此前七域完整前序保留为显式停机升级源；项目资料复核曾将 ingress 从 `4` 扩为 `5`，原完整 `(1,3,2,4,3,4,1)` 保存为 `PRE_PROJECT_INBOX_FORMAT_STATE`。本次明确收藏主答复只将 memory 从 `4` 扩为 `5`，原完整 `(1,3,2,5,3,4,1)` 保存为 `PRE_REPLY_MEMORY_FORMAT_STATE`；不改变任务、未知回执、输入或主配置合同。ID 不是大小可比较的 schema 版本；不能仅靠表结构相同沿用一个已经改变的解释合同。
+当前完整值由 `format_admission.CURRENT_FORMAT_STATE` 声明：`metadata_version=1`，七域依次为 `(1,3,2,7,3,5,1)`。主人问题的准确续接将 ingress 从 `6` 改为 `7`；渠道原生引用此前从 `5` 改为 `6`，明确收藏主答复将 memory 从 `4` 改为 `5`。各精确完整前序保留在准入模块与[停机升级指南](channel-ownership-format-upgrade.md)，不会只比较单个数字或因表结构相同放行。
+
+`owner_question_answer` 从输入到归档保留同一问题、答案、任务和原队友证明，准确领取时在同一事务复核并更新状态，不与另一问题混批。旧 reader 会忽略这些约束，因此必须拒绝新库。独立问题记录不是执行锁，objects 合同仍为 `3`；任务完成与主人验收不由答案记录代替。真实旧源码与方法级反证的范围见[冻结来源说明](../tests/fixtures/format-v2.140.md)。
 
 | 领域 | 持久事实与解释边界 | 当前主要写入者 / 读取者 |
 | --- | --- | --- |

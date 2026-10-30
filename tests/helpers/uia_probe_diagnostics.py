@@ -19,6 +19,8 @@ STAGES = (
     "input_line_received",
     "request_decoded",
     "probe_received",
+    "watch_starting",
+    "watch_ready",
     "uia_initializing",
     "uia_host_validated",
     "uia_add_type_returned",
