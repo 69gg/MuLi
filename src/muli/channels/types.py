@@ -22,6 +22,30 @@ def is_mobile_control_text(text: str) -> bool:
     return text.lstrip().startswith(("/任务", "/暂停", "/调整", "/审批", "/批准", "/拒绝"))
 
 
+def normalize_channel_reference(value: object) -> dict[str, Any] | None:
+    """Validate the bounded host marker without accepting quoted message content."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or type(value.get("version")) is not int:
+        raise ValueError("渠道引用标记无效")
+    if value["version"] != 1:
+        raise ValueError("渠道引用标记版本无效")
+    if value.get("status") == "unavailable" and set(value) == {"version", "status"}:
+        return {"version": 1, "status": "unavailable"}
+    message_id = value.get("message_id")
+    if (
+        value.get("status") != "identified"
+        or set(value) != {"version", "status", "message_id"}
+        or not isinstance(message_id, str)
+        or not message_id
+        or message_id[0] == "0"
+        or not message_id.isascii()
+        or not message_id.isdecimal()
+    ):
+        raise ValueError("渠道引用消息 ID 无效")
+    return {"version": 1, "status": "identified", "message_id": message_id}
+
+
 class ChannelError(ValueError):
     def __init__(
         self,
@@ -181,6 +205,7 @@ class IncomingMessage:
     context_token: str = field(default="", repr=False)
     control_text: str = ""
     control_account_id: str = ""
+    channel_reference: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -147,6 +147,41 @@ class Adapter:
 class Telegram(Adapter):
     voice_mime_types = frozenset({"audio/mpeg", "audio/mp4", "audio/ogg"})
 
+    @staticmethod
+    def _channel_reference(message: dict[str, Any]) -> dict[str, Any] | None:
+        if not any(
+            field in message
+            for field in ("reply_to_message", "external_reply", "quote", "reply_to_story")
+        ):
+            return None
+        unavailable = {"version": 1, "status": "unavailable"}
+        if "external_reply" in message or "reply_to_story" in message:
+            return unavailable
+        quoted = message.get("reply_to_message")
+        if not isinstance(quoted, dict):
+            return unavailable
+        chat, quoted_chat = message.get("chat"), quoted.get("chat")
+        message_id = quoted.get("message_id")
+        thread, quoted_thread = message.get("message_thread_id"), quoted.get("message_thread_id")
+        if (
+            type(message_id) is not int
+            or message_id <= 0
+            or not isinstance(chat, dict)
+            or not isinstance(quoted_chat, dict)
+            or type(chat.get("id")) is not int
+            or type(quoted_chat.get("id")) is not int
+            or chat["id"] != quoted_chat["id"]
+            or chat.get("type") != quoted_chat.get("type")
+            or any(
+                "message_thread_id" in item
+                and (type(item["message_thread_id"]) is not int or item["message_thread_id"] <= 0)
+                for item in (message, quoted)
+            )
+            or thread != quoted_thread
+        ):
+            return unavailable
+        return {"version": 1, "status": "identified", "message_id": str(message_id)}
+
     def validate_media(self, file: FileContent) -> None:
         super().validate_media(file)
         if file.media_mode != "voice":
@@ -243,6 +278,7 @@ class Telegram(Adapter):
                 tuple(files),
                 control_text=control_text,
                 control_account_id=control_account,
+                channel_reference=self._channel_reference(message),
             ),
         )
 

@@ -36,6 +36,7 @@ from .types import (
     IncomingMessage,
     Submit,
     is_mobile_control_text,
+    normalize_channel_reference,
 )
 from .weixin import Weixin
 
@@ -351,6 +352,12 @@ class ChannelManager:
         profile = self.config.profile(name)
         if not profile.enabled:
             raise ChannelError("渠道未启用", status_code=404)
+        try:
+            channel_reference = normalize_channel_reference(message.channel_reference)
+        except ValueError as error:
+            raise ChannelError(str(error)) from None
+        if channel_reference is not None and name != "telegram":
+            raise ChannelError("原生引用当前仅支持 Telegram 私聊", status_code=403)
         # This shared gate also covers direct receive(), before fingerprints,
         # attachment staging or a durable inbound receipt can be created.
         route = self._route(
@@ -378,7 +385,7 @@ class ChannelManager:
             envelope = asdict(message)
             # Preserve fingerprints of ordinary messages accepted before control
             # evidence existed. Nonempty evidence remains part of the envelope.
-            for field in ("control_text", "control_account_id"):
+            for field in ("control_text", "control_account_id", "channel_reference"):
                 if not envelope[field]:
                     del envelope[field]
             fingerprint = hashlib.sha256(encoded(envelope).encode("utf-8")).hexdigest()
@@ -387,6 +394,12 @@ class ChannelManager:
                 old_envelope = dict(envelope)
                 old_envelope.pop("control_text", None)
                 old_envelope.pop("control_account_id", None)
+                legacy_fingerprint = hashlib.sha256(
+                    encoded(old_envelope).encode("utf-8")
+                ).hexdigest()
+            elif channel_reference is not None:
+                old_envelope = dict(envelope)
+                old_envelope.pop("channel_reference")
                 legacy_fingerprint = hashlib.sha256(
                     encoded(old_envelope).encode("utf-8")
                 ).hexdigest()
@@ -442,6 +455,14 @@ class ChannelManager:
                     self._errors[name] = "旧入站记录缺少内容指纹，重投内容未核验"
                     return {**json.loads(row["receipt"]), "fingerprint_verified": False}
                 if row["fingerprint"] != fingerprint:
+                    if (
+                        row["receipt"] is not None
+                        and legacy_fingerprint
+                        and row["fingerprint"] == legacy_fingerprint
+                    ):
+                        # An old completed event has no reference evidence.
+                        # Return it unchanged; never upgrade or replay its input.
+                        return dict(json.loads(row["receipt"]))
                     raise ChannelError("同一渠道消息 ID 的信封内容不一致", status_code=409)
                 if row["receipt"] is not None:
                     return dict(json.loads(row["receipt"]))
@@ -522,6 +543,7 @@ class ChannelManager:
                         _owner_text_chars=len(message.text)
                         if trusted and message.text.strip()
                         else None,
+                        _channel_reference=channel_reference,
                     )
                 except ValueError:
                     if trusted:
@@ -553,6 +575,7 @@ class ChannelManager:
             or message.kind != "private"
             or message.files
             or message.context_token
+            or message.channel_reference is not None
             or not message.control_text
             or not is_mobile_control_text(message.control_text)
             or message.control_text != message.text

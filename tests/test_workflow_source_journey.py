@@ -73,8 +73,8 @@ async def test_workflow_source_full_runtime_journey(
     )
     original = "第一段：SOURCE_A，资料已经整理。\n\n第二段：SOURCE_B，完整原件必须包含本段。\n"
     independent = "独立资料：INDEPENDENT_OK。\n"
-    source_path.write_text(original, encoding="utf-8")
-    independent_path.write_text(independent, encoding="utf-8")
+    source_path.write_text(original, encoding="utf-8", newline="\n")
+    independent_path.write_text(independent, encoding="utf-8", newline="\n")
     source_name, continuation_name = "有来源的真实失败计划", "沿用资料补本地草稿"
     continue_prefix = "按准确旧运行补做：\n"
     requests: list[str] = []

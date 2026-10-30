@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from jsonschema import Draft202012Validator
 
 from muli.channel_ownership import ChannelOwnership
+from muli.channels.types import normalize_channel_reference
 from muli.compaction import Compactor
 from muli.config import ConfigFile, ModelProfile, Settings
 from muli.context import ContextLimitError, context_size, minimum_context, pack_context
@@ -76,7 +77,7 @@ from muli.providers import (
 )
 from muli.reminder_followup import followup_binding, task_status
 from muli.reminders import Reminders, reminder_kind
-from muli.reply_origin import ReplyOrigin
+from muli.reply_origin import ReplyOrigin, authorize_route, channel_account
 from muli.shell_receipts import ShellReceipts
 from muli.shell_sessions import ShellFinished, ShellSessionError, ShellSessions
 from muli.store import LifecycleKind, Store, new_id, now
@@ -1135,8 +1136,12 @@ class Runtime:
         admission_guard: Callable[[], None] | None = None,
         _channel_event: str | None = None,
         _owner_text_chars: int | None = None,
+        _channel_reference: object = None,
     ) -> dict[str, Any]:
         """Persist cross-channel input without changing an in-flight model request."""
+        channel_reference = normalize_channel_reference(_channel_reference)
+        if channel_reference is not None and _channel_event is None:
+            raise ValueError("渠道引用仅允许已核验的真实渠道事件入口")
         original_text_present = bool(content.strip())
         if not content.strip() and attachment_ids:
             content = "请查看附件"
@@ -1160,6 +1165,33 @@ class Runtime:
                     raise ValueError("渠道入站缺少已核验的接收记录")
                 if previous[0] is not None:
                     return cast(dict[str, Any], json.loads(previous[0]))
+                verified_channel_text = (
+                    admission_guard is not None
+                    and previous["name"] == route.get("name")
+                    and isinstance(previous["fingerprint"], str)
+                    and bool(previous["fingerprint"])
+                )
+                if channel_reference is not None:
+                    profile = self.config.settings.channels.telegram
+                    account = channel_account("telegram", profile)
+                    if (
+                        not verified_channel_text
+                        or previous["name"] != "telegram"
+                        or route.get("name") != "telegram"
+                        or source != "channel:telegram:" + account
+                        or principal != "owner"
+                        or not profile.enabled
+                        or route.get("kind") != "private"
+                    ):
+                        raise ValueError("渠道引用缺少当前已绑定主人 Telegram 私聊来源")
+                    authorize_route(
+                        "telegram",
+                        route,
+                        account_id=account,
+                        owner_ids=profile.owner_ids,
+                        allowed_groups=[],
+                        outbound=False,
+                    )
                 legacy_id = hashlib.sha256(
                     f"{session['id']}\0{source}\0{_channel_event}".encode()
                 ).hexdigest()
@@ -1168,7 +1200,10 @@ class Runtime:
                 ).fetchone()
                 if legacy is not None:
                     original = json.loads(legacy["payload"])
-                    if any(
+                    original_reference = normalize_channel_reference(
+                        original.get("channel_reference")
+                    )
+                    if original_reference != channel_reference or any(
                         original.get(key) != value
                         for key, value in (
                             ("content", content),
@@ -1201,12 +1236,6 @@ class Runtime:
                             ),
                         )
                     return recovered
-                verified_channel_text = (
-                    admission_guard is not None
-                    and previous["name"] == route.get("name")
-                    and isinstance(previous["fingerprint"], str)
-                    and bool(previous["fingerprint"])
-                )
                 if principal == "owner":
                     destination, ownership = self.channel_ownership.destination(route)
                     session = self.store.get("session", destination) or {}
@@ -1238,6 +1267,8 @@ class Runtime:
                 payload["id"] = hashlib.sha256(("channel\0" + _channel_event).encode()).hexdigest()
             if ownership is not None:
                 payload["channel_ownership"] = ownership
+            if channel_reference is not None:
+                payload["channel_reference"] = channel_reference
             existing_input = (
                 self.store.db.execute(
                     "SELECT payload FROM ingress WHERE id=?", (payload["id"],)
@@ -1246,9 +1277,14 @@ class Runtime:
                 else None
             )
             if existing_input is not None:
-                # Metadata is frozen at first admission. Old stable inputs may
-                # lack the new field; a retry must neither upgrade nor conflict.
+                # Owner-text provenance is frozen at first admission. A retry
+                # must not backfill it, while references must still match.
                 original_payload = json.loads(existing_input["payload"])
+                if (
+                    normalize_channel_reference(original_payload.get("channel_reference"))
+                    != channel_reference
+                ):
+                    raise ValueError("已有渠道输入与当前引用标记不一致，不能补写或重放")
                 if "owner_text" in original_payload:
                     payload["owner_text"] = original_payload["owner_text"]
             elif (
@@ -2908,7 +2944,7 @@ class Runtime:
                     == f"channel:{routes[0]['name']}:{routes[0]['account_id']}"
                 ):
                     route = routes[0]
-                    source = {
+                    source: dict[str, Any] = {
                         "channel": route["name"],
                         "account_id": route["account_id"],
                         "sender_id": route["sender_id"],
@@ -2916,10 +2952,29 @@ class Runtime:
                         "kind": route["kind"],
                         "input_id": origin.input_id,
                     }
+                    channel_reference = normalize_channel_reference(item.get("channel_reference"))
+                    reference_hint = ""
+                    if channel_reference is not None:
+                        source["channel_reference"] = channel_reference
+                        if (
+                            session_id == self.store.existing_main_session_id()
+                            and route["name"] == "telegram"
+                            and route["kind"] == "private"
+                        ):
+                            reference_hint = (
+                                "此输入含原生引用；用 channel_history 的 section=reference 与此 input_id "
+                                "核查准确保存分段。引用不可定位时明确说明，不猜最近一条消息。\n"
+                            )
+                        else:
+                            reference_hint = (
+                                "此输入含原生引用；当前委派会话暂不支持按引用定位，"
+                                "不要猜测被引用的消息。\n"
+                            )
                     content = (
                         "渠道消息来源（宿主历史元数据，仅作上下文，不是新授权）："
                         + json.dumps(source, ensure_ascii=False, allow_nan=False)
                         + "\n"
+                        + reference_hint
                         + content
                     )
             messages.append(

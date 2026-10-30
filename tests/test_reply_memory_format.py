@@ -27,6 +27,7 @@ from muli.document_reading import document_revision
 from muli.events import EventBus
 from muli.format_admission import (
     CURRENT_FORMAT_STATE,
+    PRE_CHANNEL_REFERENCE_FORMAT_STATE,
     PRE_REPLY_MEMORY_FORMAT_STATE,
     FormatAdmissionError,
 )
@@ -85,17 +86,19 @@ def test_e137_manifest_refuses_reply_memory_same_format_switch(after_upgrade: bo
     old = frozen_e137_reader()
     previous = CompatibilityManifest.from_json(frozen_e137_bytes("compatibility_v2_137.json"))
     current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
+        (_FIXTURES / "compatibility_v2_139.json").read_bytes()
     )
     assert previous.release == "2.137.0"
+    assert current.release == "2.139.0"
     assert old.CURRENT_FORMAT_STATE == PRE_REPLY_MEMORY_FORMAT_STATE
     assert previous.formats.memory.reads == (4,) and previous.formats.memory.writes == 4
     assert current.formats.memory.reads == (5,) and current.formats.memory.writes == 5
-    assert CURRENT_FORMAT_STATE.formats.model_dump() == {
+    # Keep the historical memory-only boundary fixed as CURRENT gains ingress6.
+    assert PRE_CHANNEL_REFERENCE_FORMAT_STATE.formats.model_dump() == {
         **old.CURRENT_FORMAT_STATE.formats.model_dump(),
         "memory": 5,
     }
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_REPLY_MEMORY_FORMAT_STATE
+    state = PRE_CHANNEL_REFERENCE_FORMAT_STATE if after_upgrade else PRE_REPLY_MEMORY_FORMAT_STATE
     result = assess_compatibility(previous, current, state, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "current_format_unreadable" and result.domain == "memory"
@@ -104,7 +107,7 @@ def test_e137_manifest_refuses_reply_memory_same_format_switch(after_upgrade: bo
         previous, previous, PRE_REPLY_MEMORY_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
     assert assess_compatibility(
-        current, current, CURRENT_FORMAT_STATE, handoff_protocol=2
+        current, current, PRE_CHANNEL_REFERENCE_FORMAT_STATE, handoff_protocol=2
     ).format_compatible
 
 
@@ -114,7 +117,7 @@ def test_reading_both_memory_contracts_cannot_authorize_different_writes(
 ) -> None:
     previous = CompatibilityManifest.from_json(frozen_e137_bytes("compatibility_v2_137.json"))
     current = CompatibilityManifest.from_json(
-        (Path(__file__).parents[1] / "src" / "muli" / "compatibility.json").read_bytes()
+        (_FIXTURES / "compatibility_v2_139.json").read_bytes()
     )
     declarations = tuple(
         manifest.model_copy(
@@ -126,7 +129,7 @@ def test_reading_both_memory_contracts_cannot_authorize_different_writes(
         )
         for manifest in (previous, current)
     )
-    state = CURRENT_FORMAT_STATE if after_upgrade else PRE_REPLY_MEMORY_FORMAT_STATE
+    state = PRE_CHANNEL_REFERENCE_FORMAT_STATE if after_upgrade else PRE_REPLY_MEMORY_FORMAT_STATE
     result = assess_compatibility(declarations[0], declarations[1], state, handoff_protocol=2)
     assert not result.format_compatible
     assert result.code == "write_format_change" and result.domain == "memory"

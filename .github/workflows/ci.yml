@@ -63,19 +63,27 @@ jobs:
           - os: ubuntu-latest
             python: '3.12'
             shard: 1
-            shards: 2
+            shards: 3
           - os: ubuntu-latest
             python: '3.12'
             shard: 2
-            shards: 2
+            shards: 3
+          - os: ubuntu-latest
+            python: '3.12'
+            shard: 3
+            shards: 3
           - os: ubuntu-latest
             python: '3.13'
             shard: 1
-            shards: 2
+            shards: 3
           - os: ubuntu-latest
             python: '3.13'
             shard: 2
-            shards: 2
+            shards: 3
+          - os: ubuntu-latest
+            python: '3.13'
+            shard: 3
+            shards: 3
           - os: windows-latest
             python: '3.12'
             shard: 1

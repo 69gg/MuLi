@@ -28,7 +28,7 @@ from muli.format_evidence import (
 )
 from muli.management_transaction import _object
 from muli.proactive import FrozenRouting
-from muli.reply_origin import ReplyOrigin
+from muli.reply_origin import _ROUTE_FIELD_CHARS, ReplyOrigin
 from muli.store_initialization import (
     CreatedDatabase,
     StoreConstructionLock,
@@ -1538,6 +1538,190 @@ class Store:
         finally:
             cursor.close()
 
+    _channel_reference_read_active: bool = False
+
+    def channel_reference_delivery(
+        self,
+        *,
+        name: str,
+        account_id: str,
+        owner_id: str,
+        platform_message_id: str,
+        metadata_bytes: int,
+        source_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Prove a unique receipt inside the caller's progress-guarded snapshot.
+
+        Scan the complete scope, not a newest-N window. A malformed route cannot
+        exclude that scope, and malformed receipts cannot exclude a second hit.
+        Only a bounded ID and integer part metadata ever leave SQLite.
+        """
+        if not self._channel_reference_read_active or not self.db.in_transaction:
+            raise EvidenceError("channel_reference_unavailable", "引用定位需要独占的只读核验范围")
+        if any(
+            type(value) is not int or not 1 <= value <= SQLITE_MAX_INTEGER
+            for value in (metadata_bytes, source_bytes)
+        ):
+            raise ValueError("引用定位需要有限的完整字节预算")
+        bounds = {
+            "name": name,
+            "account_id": account_id,
+            "owner_id": owner_id,
+            "message_id": platform_message_id,
+            "budget": metadata_bytes,
+            "source_bytes": source_bytes,
+            "route_field_chars": _ROUTE_FIELD_CHARS,
+        }
+        route_fields = ("name", "account_id", "sender_id", "target", "kind")
+        route_valid = (
+            "CASE WHEN typeof(route)='text' AND length(CAST(route AS BLOB))<=:budget "
+            "THEN CASE WHEN json_valid(route) THEN CASE WHEN json_type(route)='object' AND "
+            + " AND ".join(
+                f"json_type(route,'$.{field}')='text' "
+                f"AND length(json_extract(route,'$.{field}'))>0 "
+                f"AND instr(json_extract(route,'$.{field}'),char(0))=0"
+                for field in route_fields
+            )
+            + " AND json_extract(route,'$.name')=channel_outbox.name "
+            "AND json_extract(route,'$.kind') IN ('private','group') "
+            "AND length(json_extract(route,'$.sender_id'))<=:route_field_chars "
+            "AND length(json_extract(route,'$.target'))<=:route_field_chars "
+            "AND (json_extract(route,'$.kind')!='private' "
+            "OR json_extract(route,'$.sender_id')=json_extract(route,'$.target')) "
+            "AND (SELECT count(*)=count(DISTINCT key) FROM json_each(route)) "
+            "THEN 1 ELSE 0 END ELSE 0 END ELSE 0 END"
+        )
+        with closing(
+            self.db.execute(
+                "SELECT 1 FROM channel_outbox WHERE name=:name AND (" + route_valid + ")=0 LIMIT 1",
+                bounds,
+            )
+        ) as rows:
+            if rows.fetchone() is not None:
+                raise EvidenceError(
+                    "channel_reference_search_incomplete",
+                    "渠道存在无法完整核验的路由，不能证明引用唯一",
+                )
+        # The preceding pass validated every route for this channel in the same
+        # snapshot. Keep other channels out of JSON functions even if SQLite
+        # reorders predicates and they contain malformed legacy data.
+        route_data = "CASE WHEN name=:name THEN route ELSE '{}' END"
+        scope = "name=:name AND " + " AND ".join(
+            f"json_extract({route_data},'$.{field}')={value}"
+            for field, value in (
+                ("name", ":name"),
+                ("account_id", ":account_id"),
+                ("sender_id", ":owner_id"),
+                ("target", ":owner_id"),
+                ("kind", "'private'"),
+            )
+        )
+        receipt_gate = (
+            "typeof(receipts)='text' AND length(CAST(receipts AS BLOB))"
+            "+length(CAST(route AS BLOB))+length(CAST(channel_outbox.id AS BLOB))<=:budget"
+        )
+        receipt_valid = (
+            "CASE WHEN " + receipt_gate + " THEN CASE WHEN json_valid(receipts) THEN "
+            "CASE WHEN json_type(receipts)='array' AND typeof(next_part)='integer' "
+            "AND next_part>=0 AND json_array_length(receipts)=next_part AND NOT EXISTS("
+            "SELECT 1 FROM json_each(receipts) r WHERE r.type!='text' OR "
+            "length(r.value)=0 OR instr(r.value,char(0))>0 "
+            "OR substr(r.value,1,1) NOT BETWEEN '1' AND '9' "
+            "OR r.value GLOB '*[^0-9]*') THEN 1 ELSE 0 END ELSE 0 END ELSE 0 END"
+        )
+        with closing(
+            self.db.execute(
+                "SELECT 1 FROM channel_outbox WHERE "
+                + scope
+                + " AND ("
+                + receipt_valid
+                + ")=0 LIMIT 1",
+                bounds,
+            )
+        ) as rows:
+            if rows.fetchone() is not None:
+                raise EvidenceError(
+                    "channel_reference_search_incomplete",
+                    "私聊存在损坏或超预算的发送回执，不能证明引用唯一",
+                )
+        receipt_data = (
+            "CASE WHEN "
+            + scope
+            + " THEN CASE WHEN "
+            + receipt_gate
+            + " THEN receipts ELSE '[]' END ELSE '[]' END"
+        )
+        with closing(
+            self.db.execute(
+                "SELECT CASE WHEN typeof(channel_outbox.id)='text' AND length(CAST(channel_outbox.id AS BLOB)) "
+                "BETWEEN 1 AND :budget THEN CAST(channel_outbox.id AS BLOB) END AS id,"
+                "r.key AS part,next_part FROM channel_outbox JOIN json_each("
+                + receipt_data
+                + ") r "
+                "WHERE r.type='text' AND r.value=:message_id LIMIT 2",
+                bounds,
+            )
+        ) as rows:
+            matches = rows.fetchall()
+        if len(matches) > 1:
+            raise EvidenceError(
+                "channel_reference_ambiguous", "同一私聊的多个已确认分段使用该平台消息 ID"
+            )
+        if not matches:
+            return None
+        match = matches[0]
+        if not isinstance(match["id"], bytes):
+            raise EvidenceError(
+                "channel_reference_search_incomplete", "引用投递的完整主键超过核验预算"
+            )
+        try:
+            delivery_id = match["id"].decode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise EvidenceError(
+                "channel_reference_search_incomplete", "引用投递主键不是有效 UTF-8"
+            ) from exc
+        if "\x00" in delivery_id:
+            raise EvidenceError("channel_reference_search_incomplete", "引用投递主键无效")
+        # Size the entire matching payload before any JSON extraction. Long
+        # saved text stays in SQLite; the existing delivery reader pages it.
+        data = (
+            "CASE WHEN typeof(payload)='text' AND length(CAST(payload AS BLOB))<=:source_bytes "
+            "THEN CASE WHEN json_valid(payload) THEN payload ELSE '{}' END ELSE '{}' END"
+        )
+        part_path = f"$.parts[{match['part']}]"
+        with closing(
+            self.db.execute(
+                "WITH record AS (SELECT " + data + " AS data FROM channel_outbox WHERE id=:id) "
+                "SELECT json_type(data)='object' AND "
+                "(SELECT count(*)=count(DISTINCT key) FROM json_each(data)) AS valid_object,"
+                "json_type(data,'$.parts') AS parts_type,json_array_length(data,'$.parts') AS total_parts,"
+                "CASE WHEN json_type(data,:path)='object' THEN "
+                "json_type(json_extract(data,:path),'$.text')='text' AND "
+                "(SELECT count(*)=1 FROM json_each(json_extract(data,:path))) ELSE 0 END AS text_part "
+                "FROM record",
+                {**bounds, "id": delivery_id, "path": part_path},
+            )
+        ) as rows:
+            record = rows.fetchone()
+        if (
+            record is None
+            or record["valid_object"] != 1
+            or record["parts_type"] != "array"
+            or type(record["total_parts"]) is not int
+            or not 0 <= match["part"] < match["next_part"] <= record["total_parts"]
+        ):
+            raise EvidenceError(
+                "channel_reference_search_incomplete", "引用分段与完整已确认发送元数据不一致"
+            )
+        if record["text_part"] != 1:
+            raise EvidenceError("channel_reference_not_text", "引用只支持已确认的单个纯文字分段")
+        return {
+            "delivery_id": delivery_id,
+            "part": match["part"],
+            "confirmed_parts": match["next_part"],
+            "total_parts": record["total_parts"],
+        }
+
     def message_evidence_max_seq(self, session_id: str) -> int:
         """Return the latest valid mapping without materializing message JSON in Python."""
         row = self.db.execute(
@@ -1832,6 +2016,8 @@ class Store:
             message["channel_ownership"] = payload["channel_ownership"]
         if "channel_ownership_control" in payload:
             message["channel_ownership_control"] = payload["channel_ownership_control"]
+        if "channel_reference" in payload:
+            message["channel_reference"] = payload["channel_reference"]
         return message
 
     def _archive_input(

@@ -222,6 +222,7 @@ async def test_ordinary_adapter_messages_replay_old_pre_control_fingerprints(
         legacy = asdict(message)
         legacy.pop("control_text")
         legacy.pop("control_account_id")
+        legacy.pop("channel_reference")
         key = hashlib.sha256(encoded([name, "123", message.event_id]).encode()).hexdigest()
         receipt = {"state": "pending", "id": "original"}
         with harness.store.db:
@@ -298,6 +299,7 @@ async def test_historical_command_receipt_cannot_be_upgraded_into_a_control_tick
     envelope = asdict(message)
     envelope.pop("control_text")
     envelope.pop("control_account_id")
+    envelope.pop("channel_reference")
     receipt = encoded({"id": "old-owner-input", "state": "pending"})
     if change == "unknown":
         receipt = encoded({"unexpected": "shape"})
