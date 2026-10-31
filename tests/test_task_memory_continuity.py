@@ -31,6 +31,7 @@ class ChildObservation:
     agent: dict[str, Any]
     query: str
     latest_user_id: str
+    host: Message
     baseline: str
     budget: int
     current_ids: list[str]
@@ -176,6 +177,7 @@ async def bound_request(
             session = runtime.store.get("session", session_id)
             if session is None or session.get("kind") != "team":
                 return messages
+            assert all(MEMORY_HEADING not in message.content for message in messages)
             request = runtime.request_context(session_id)
             assert request is not None and request.execution_scope is not None
             assert request.selected_replan is None
@@ -206,6 +208,7 @@ async def bound_request(
                     deepcopy(agent),
                     latest.content,
                     latest.source_message_id,
+                    deepcopy(messages[0]),
                     baseline,
                     budget,
                     [item["id"] for item in current],
@@ -235,6 +238,7 @@ async def bound_request(
                 if session is None or session.get("kind") != "team":
                     return messages
                 result.skills_calls += 1
+                assert all(MEMORY_HEADING not in message.content for message in messages)
                 if request_boundary == "rewritten-host":
                     return [
                         replace(
@@ -250,13 +254,11 @@ async def bound_request(
                 if not any(item.tool_call_id == "current-read" for item in messages):
                     return messages
                 observed = result.observations[-1]
-                prefix, separator, _ = messages[0].content.partition(MEMORY_HEADING)
-                assert separator
-                # Measure the original baseline, even against an implementation
-                # which already appended task material before extension hooks.
+                # Skills see necessary messages before optional memory. Reserve
+                # the exact serialized cost of the independent baseline message.
                 baseline = [
-                    replace(messages[0], content=prefix + MEMORY_HEADING + observed.baseline),
-                    *messages[1:],
+                    *messages,
+                    Message(role="system", content=MEMORY_HEADING + observed.baseline),
                     Message(role="system", content="固定技能资料："),
                 ]
                 maximum = runtime.config.settings.limits.max_context_chars
@@ -282,6 +284,9 @@ async def bound_request(
                 and runtime.team.get(result.observations[0].session_id)["status"] == "completed"
             ),
         )
+        runner = runtime.team._active.get(result.observations[0].session_id)
+        if runner is not None:
+            await asyncio.wait_for(asyncio.shield(runner), 4)
         expected_rounds = 2 if request_boundary == "whole-request" else 1
         assert len(result.observations) == len(result.requests) == expected_rounds
         if request_boundary is not None:
@@ -449,18 +454,22 @@ async def test_extension_changed_or_duplicated_host_keeps_the_original_memory_ba
     hosts = [
         message
         for message in result.requests[0]
-        if message.role == "system" and MEMORY_HEADING in message.content
+        if message.role == "system" and observed.host.content in message.content
     ]
-    if boundary == "rewritten-original-plus-pristine-copy":
-        assert len(hosts) == 2
-        assert hosts[0].content.endswith("\n扩展说明")
+    expected_hosts = {
+        "rewritten-host": ["扩展提供的固定说明。\n" + observed.host.content],
+        "duplicated-host": [observed.host.content, observed.host.content],
+        "rewritten-original-plus-pristine-copy": [
+            observed.host.content + "\n扩展说明",
+            observed.host.content,
+        ],
+    }
+    assert [message.content for message in hosts] == expected_hosts[boundary]
+    assert all(MEMORY_HEADING not in message.content for message in hosts)
     assert all(result.background[0]["id"] not in message.content for message in hosts), (
         "原宿主对象已被扩展改写，不能借其未改写副本继续补入任务背景"
     )
-    if boundary == "rewritten-original-plus-pristine-copy":
-        assert hosts[0].content.partition(MEMORY_HEADING)[2] == (observed.baseline + "\n扩展说明")
-        assert hosts[1].content.partition(MEMORY_HEADING)[2] == observed.baseline
-    else:
-        assert memory_payload(result.requests[0]) == observed.baseline
-        assert [item["id"] for item in memory_records(result.requests[0])] == [result.profile["id"]]
+    assert memory_payload(result.requests[0]) == observed.baseline
+    assert [item["id"] for item in memory_records(result.requests[0])] == [result.profile["id"]]
+    assert result.background[0]["id"] not in memory_payload(result.requests[0])
     assert result.skills_calls == len(result.observations) == len(result.requests) == 1

@@ -45,7 +45,7 @@ def save(
 ) -> dict[str, Any]:
     raw = content.encode("utf-8")
     document: dict[str, str] | None = None
-    if format_name == "text":
+    if format_name in {"text", "asr"}:
         checksum = hashlib.sha256(raw).hexdigest()
     else:
         checksum = hashlib.sha256(("original-binary:" + identifier).encode()).hexdigest()
@@ -56,7 +56,9 @@ def save(
             "revision": document_revision(checksum, raw),
         }
     source, created = memory.register_source(
-        attachment_source(identifier, content, checksum, 7.0, document=document)
+        attachment_source(
+            identifier, content, checksum, 7.0, document=document, transcript=format_name == "asr"
+        )
     )
     assert source is not None and created
     return source
@@ -157,6 +159,24 @@ async def test_document_extraction_and_memory_revisions_are_not_interchangeable(
     with pytest.raises(EvidenceError) as caught:
         await compare(memory, {**left, "digest": page["left"]["document_revision"]}, right)
     assert caught.value.code == "evidence_changed"
+
+
+@pytest.mark.parametrize("other_format", ["text", "docx"])
+async def test_asr_text_comparison_preserves_derived_scope_and_exact_source_bytes(
+    memory: Memory, other_format: str
+) -> None:
+    texts = {"left": "课堂转写🙂\n传送带旧解释\n", "right": "课堂转写🙂\n传送带新解释\n"}
+    left = save(memory, "a" * 32, texts["left"], format_name="asr")
+    right = save(memory, "b" * 32, texts["right"], format_name=other_format)
+    page = await compare(memory, left, right)
+    assert page["status"] == "changed"
+    identity = page["left"]
+    assert identity["format"] == "asr" and identity["scope"] == "asr_transcript_text"
+    assert identity["source_revision"] == hashlib.sha256(texts["left"].encode()).hexdigest()
+    assert identity["document_revision"] is None
+    assert identity["source"] == left["source"]
+    assert identity["revision"] != identity["source_revision"]
+    assert_original_spans(memory, page, texts)
 
 
 def changed_texts() -> tuple[str, str]:

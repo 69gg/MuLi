@@ -272,6 +272,7 @@ def _create_app(
         local_services.media,
         attachment_reader=local_services.memory_attachment,
         document_reader=local_services.memory_document,
+        transcript_reader=local_services.memory_transcript,
     )
     channel_application = ChannelApplication(runtime, attachments)
     personal_io = PersonalIO(runtime, local_services, attachments)

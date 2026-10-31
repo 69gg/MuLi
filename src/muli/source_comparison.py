@@ -17,7 +17,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from muli.attachment_memory_source import MAX_ATTACHMENT_SOURCE_BYTES, restore_attachment_source
+from muli.attachment_memory_source import (
+    MAX_ATTACHMENT_SOURCE_BYTES,
+    attachment_source_metadata,
+    restore_attachment_source,
+)
 from muli.attachments import ATTACHMENT_ID_PATTERN
 from muli.evidence import EvidenceError, decode_utf8, json_size, validate_integer
 from muli.memory import Memory, source_digest
@@ -174,12 +178,7 @@ def _load(memory: Memory, identifier: str, revision: str, policy: ComparisonPoli
         raise EvidenceError(
             "comparison_source_invalid", "收藏正文、来源摘要与附件出处无法一致核对"
         ) from error
-    marker = fields["source"][len(identifier) + 1 :]
-    document_revision: str | None
-    if _DIGEST.fullmatch(marker):
-        format_name, scope, checksum, document_revision = "text", "utf8_text", marker, None
-    else:
-        _, _, format_name, scope, checksum, document_revision = marker.split(":")
+    metadata = attachment_source_metadata(attachment_id, fields["source"])
     return _Source(
         content,
         raw,
@@ -191,10 +190,7 @@ def _load(memory: Memory, identifier: str, revision: str, policy: ComparisonPoli
             "revision": revision,
             "total_bytes": len(raw),
             "created_at": created,
-            "format": format_name,
-            "scope": scope,
-            "source_revision": checksum,
-            "document_revision": document_revision,
+            **metadata,
         },
     )
 

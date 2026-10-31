@@ -747,11 +747,42 @@ function comparisonContextFixture() {
   return { ...f, prefix, tail, offset };
 }
 
+function asrComparisonFixture() {
+  const f = comparisonFixture();
+  f.left.source = `${f.left.source_id}:transcript:v1:asr_text:${"c".repeat(64)}`;
+  for (const page of [f.first, f.last]) Object.assign(page.left, { source: f.left.source, format: "asr", scope: "asr_transcript_text", document_revision: null });
+  return f;
+}
+
 async function beginComparison(h) {
   await openCatalog(h);
   await clickMemoryButton(h, h.other.querySelectorAll("button").filter((button) => button.textContent === "选作比较左侧")[0]);
   await clickMemoryButton(h, h.other.querySelectorAll("button").filter((button) => button.textContent === "与所选比较")[1]);
 }
+
+test("ASR source catalog and comparison keep the saved-transcript explanation", async () => {
+  const f = asrComparisonFixture();
+  const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([f.left, f.right]) : f.first);
+  await beginComparison(h);
+  assert.ok(h.other.textContent.includes("ASR 转写文本"));
+  assert.ok(h.body().includes("ASR 转写文本"));
+  assert.ok(h.body().includes("不证明原音频、说话者或转写准确性"));
+  assert.ok(h.body().includes("asr_transcript_text"));
+  assert.ok(h.button("核对左侧原文"));
+});
+
+test("ASR comparison rejects original-document scope and mismatched transcript provenance", async () => {
+  for (const damage of ["scope", "document_revision", "marker"]) {
+    const f = asrComparisonFixture();
+    if (damage === "scope") f.first.left.scope = "utf8_text";
+    else if (damage === "document_revision") f.first.left.document_revision = "d".repeat(64);
+    else f.first.left.source = `${f.left.source_id}:${"c".repeat(64)}`;
+    const h = harness(async (path) => path.startsWith("/memory/sources?") ? catalogPage([f.left, f.right]) : f.first);
+    await beginComparison(h);
+    assert.ok(h.body().includes("资料比较响应不完整"), damage);
+    assert.equal(h.button("核对左侧原文") === undefined, true);
+  }
+});
 
 test("explicit source comparison keeps ordered revisions and advances complete diff pages", async () => {
   const f = comparisonFixture();

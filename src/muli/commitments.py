@@ -524,5 +524,6 @@ class Commitments:
                     }
                 ),
                 read_item,
+                preserve_output=True,
             ),
         ]

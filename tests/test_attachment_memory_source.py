@@ -6,7 +6,9 @@ import pytest
 
 from muli.attachment_memory_source import (
     MAX_ATTACHMENT_SOURCE_BYTES,
+    TRANSCRIPT_SCOPE,
     attachment_source,
+    attachment_source_metadata,
     restore_attachment_source,
 )
 from muli.document_reading import document_revision
@@ -120,3 +122,43 @@ def test_invalid_full_text_is_rejected(content: str) -> None:
 def test_invalid_source_timestamp_is_rejected(timestamp: int | float) -> None:
     with pytest.raises(ValueError, match="时间"):
         attachment_source(IDENTIFIER, CONTENT, CHECKSUM, timestamp, document=metadata())
+
+
+def test_saved_transcript_roundtrips_exact_bytes_with_derived_identity() -> None:
+    checksum = hashlib.sha256(CONTENT.encode("utf-8")).hexdigest()
+    saved = attachment_source(IDENTIFIER, CONTENT, checksum, 12, transcript=True)
+    assert saved["source"] == f"attachment:{IDENTIFIER}:transcript:v1:asr_text:{checksum}"
+    assert saved["id"] == "attachment:" + IDENTIFIER
+    assert saved["role"] == "tool" and saved["principal"] == "external:attachment"
+    assert saved["session_id"] == "" and saved["content"] == CONTENT
+    assert restore_attachment_source(IDENTIFIER, CONTENT, saved["source"], 12) == saved
+    assert attachment_source_metadata(IDENTIFIER, saved["source"]) == {
+        "format": "asr",
+        "scope": TRANSCRIPT_SCOPE,
+        "source_revision": checksum,
+        "document_revision": None,
+    }
+    ordinary = attachment_source(IDENTIFIER, CONTENT, checksum, 12)
+    assert ordinary["source"] != saved["source"]
+    with pytest.raises(ValueError, match="摘要"):
+        restore_attachment_source(IDENTIFIER, CONTENT + "变化", saved["source"], 12)
+    with pytest.raises(ValueError, match="混用"):
+        attachment_source(IDENTIFIER, CONTENT, CHECKSUM, 12, document=metadata(), transcript=True)
+
+
+@pytest.mark.parametrize("damage", ["identity", "version", "scope", "digest", "suffix"])
+def test_transcript_recovery_rejects_ambiguous_or_changed_scope(damage: str) -> None:
+    checksum = hashlib.sha256(CONTENT.encode("utf-8")).hexdigest()
+    marker = attachment_source(IDENTIFIER, CONTENT, checksum, 12, transcript=True)["source"]
+    if damage == "identity":
+        marker = marker.replace(IDENTIFIER, "b" * 32)
+    elif damage == "version":
+        marker = marker.replace(":v1:", ":v2:")
+    elif damage == "scope":
+        marker = marker.replace(":asr_text:", ":original_audio:")
+    elif damage == "digest":
+        marker = marker.replace(checksum, "0" * 64)
+    else:
+        marker += ":extra"
+    with pytest.raises(ValueError):
+        restore_attachment_source(IDENTIFIER, CONTENT, marker, 12)

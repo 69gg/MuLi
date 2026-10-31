@@ -39,6 +39,7 @@ async def _read_verified_artifact(
     byte_limit: Callable[[], int],
     revision: str | None,
     offset_bytes: int,
+    complete: bool = False,
 ) -> tuple[dict[str, Any], bytes]:
     """Share only the existing bounded, revision-bound file read, not source authority."""
     validate_integer(offset_bytes, "offset_bytes")
@@ -48,7 +49,19 @@ async def _read_verified_artifact(
     ):
         raise EvidenceError("invalid_arguments", "续读必须携带上一页的 revision")
     prefix, label = ("transcript", "转写") if source == "asr" else ("vision", "视觉解释")
-    item = attachments.get(identifier)
+
+    def metadata() -> dict[str, Any] | None:
+        if not complete:
+            return attachments.get(identifier)
+        return attachments.store.bounded_object(
+            "attachment",
+            identifier,
+            max_bytes=attachments.config.settings.limits.max_output_chars * 4,
+        )
+
+    item = metadata()
+    if item is None or item.get("id") != identifier:
+        raise EvidenceError(f"{prefix}_unavailable", f"{label}工件不存在或元数据无效")
     expected, size = item.get("sha256"), item.get("size")
     if (
         item.get("source") != source
@@ -63,7 +76,7 @@ async def _read_verified_artifact(
     if offset_bytes > size:
         raise EvidenceError("invalid_offset", f"offset_bytes 超过{label}末尾")
     path = attachments.path(identifier)
-    window = attachments.config.settings.limits.max_output_chars * 4
+    window = size if complete else attachments.config.settings.limits.max_output_chars * 4
 
     def read_page() -> bytes:
         return read_verified_window(
@@ -74,13 +87,14 @@ async def _read_verified_artifact(
             window=window,
             prefix=prefix,
             label=label,
+            validate_text=complete,
         )
 
     try:
         raw = await _owned(file_io(read_page))
     except OSError as exc:
         raise EvidenceError(f"{prefix}_unavailable", f"{label}文件不可用") from exc
-    if item != attachments.get(identifier) or size > byte_limit():
+    if item != metadata() or size > byte_limit():
         raise EvidenceError(f"{prefix}_changed", f"{label}元数据或读取上限已变化")
     return item, raw
 
@@ -92,6 +106,22 @@ class AudioTranscripts:
     def _byte_limit(self) -> int:
         settings = self.attachments.config.settings
         return min(settings.media.asr.max_response_bytes, settings.uploads.max_file_bytes)
+
+    async def read_complete(
+        self, identifier: str, *, revision: str, max_bytes: Callable[[], int]
+    ) -> tuple[dict[str, Any], bytes]:
+        """Read one complete saved ASR result, without calling ASR or trusting a preview."""
+        if not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{64}", revision) is None:
+            raise EvidenceError("invalid_arguments", "转写收藏需要完整 revision")
+        return await _read_verified_artifact(
+            self.attachments,
+            identifier,
+            source="asr",
+            byte_limit=lambda: min(self._byte_limit(), max_bytes()),
+            revision=revision,
+            offset_bytes=0,
+            complete=True,
+        )
 
     async def save(self, audio_id: str, text: str) -> dict[str, Any]:
         """The caller has already paid for ASR; storage errors never rerun it."""
