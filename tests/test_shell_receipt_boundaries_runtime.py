@@ -18,6 +18,7 @@ from test_task_briefs import attach_services
 from test_teammate_attachment_runtime import call, tool_result
 
 from muli.config import ConfigFile
+from muli.permissions import Mode
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
 from muli.runtime import Runtime
 from muli.server import create_app
@@ -59,8 +60,13 @@ async def test_current_owner_reads_old_evidence_but_real_delegated_session_canno
     session_id = runtime.main_session()["id"]
     command_id = save_fixture(runtime, tmp_path, session_id)
     worker_id = ""
+    worker_command = ""
 
     def worker_script() -> ShellScript:
+        nonlocal worker_command
+        worker_session = runtime.team.get("receipt-reader")["session_id"]
+        worker_command = save_fixture(runtime, tmp_path, worker_session)
+        yield call("worker-history", "shell_history")
         yield call("foreign-receipt", "shell_read", command_id=command_id)
         return "已按本会话权限核查。"
 
@@ -71,6 +77,8 @@ async def test_current_owner_reads_old_evidence_but_real_delegated_session_canno
         )
         worker_id = spawned["id"]
         yield call("wait-receipt-reader", "wait_agents", targets=[worker_id], timeout=2)
+        yield call("owner-history", "shell_history")
+        yield call("foreign-history", "shell_history", session_id=worker_id)
         yield call("owner-receipt", "shell_read", command_id=command_id)
         return "权限核查结束。"
 
@@ -87,6 +95,12 @@ async def test_current_owner_reads_old_evidence_but_real_delegated_session_canno
         agent = runtime.team.get(worker_id)
         assert agent["status"] == "completed"
         assert runtime.store.get("session", worker_id)["principal"] == "owner"
+        worker_history = result(runtime, worker_id, "worker-history")
+        owner_history = result(runtime, session_id, "owner-history")
+        assert worker_history["session_id"] == worker_id
+        assert [item["command_id"] for item in worker_history["items"]] == [worker_command]
+        assert [item["command_id"] for item in owner_history["items"]] == [command_id]
+        assert "error" in result(runtime, session_id, "foreign-history")
         assert result(runtime, worker_id, "foreign-receipt")["code"] == "not_found"
         owner = result(runtime, session_id, "owner-receipt")
         assert owner["receipt_source"] == "stored" and owner["output"] == "retained evidence"
@@ -96,8 +110,9 @@ async def test_current_owner_reads_old_evidence_but_real_delegated_session_canno
 
 
 @pytest.mark.parametrize("denial", ["non_owner", "disabled"])
+@pytest.mark.parametrize("name", ["shell_read", "shell_history"])
 async def test_stored_evidence_does_not_bypass_current_principal_or_tool_enablement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denial: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denial: str, name: str
 ) -> None:
     runtime = await shell_runtime(tmp_path)
     session_id = runtime.main_session()["id"]
@@ -112,9 +127,11 @@ async def test_stored_evidence_does_not_bypass_current_principal_or_tool_enablem
         raise AssertionError("当前调用拒绝时不得查询历史回执")
 
     if denial == "disabled":
-        runtime.config.update({"disabled_tools": ["shell_read"]})
+        runtime.config.update({"disabled_tools": [name]})
         await runtime.reconfigure()
-    monkeypatch.setattr(runtime.shell_receipts, "read", forbidden_lookup)
+    monkeypatch.setattr(
+        runtime.shell_receipts, "read" if name == "shell_read" else "history", forbidden_lookup
+    )
     rounds = 0
 
     class Reader(FakeClient):
@@ -125,9 +142,15 @@ async def test_stored_evidence_does_not_bypass_current_principal_or_tool_enablem
             rounds += 1
             if rounds == 1:
                 if denial == "disabled":
-                    assert "shell_read" not in {item["function"]["name"] for item in tools}
+                    assert name not in {item["function"]["name"] for item in tools}
                 turn = ModelTurn(
-                    tool_calls=[call("denied-receipt", "shell_read", command_id=command_id)]
+                    tool_calls=[
+                        call(
+                            "denied-receipt",
+                            name,
+                            **({"command_id": command_id} if name == "shell_read" else {}),
+                        )
+                    ]
                 )
             else:
                 tool_result(messages, "denied-receipt")
@@ -146,6 +169,71 @@ async def test_stored_evidence_does_not_bypass_current_principal_or_tool_enablem
         denied = result(runtime, session_id, "denied-receipt")
         assert "error" in denied and denied.get("receipt_source") is None
         assert lookups == 0 and runtime.shells.live_sessions() == ()
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("mode", ["ask", "auto", "yolo"])
+async def test_shell_history_uses_current_permission_mode_and_returns_only_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: Mode
+) -> None:
+    runtime = await shell_runtime(tmp_path)
+    session_id = runtime.main_session()["id"]
+    command_id = save_fixture(runtime, tmp_path, session_id)
+    pending = asyncio.Event()
+    lookups = 0
+    reviews: list[tuple[str, str]] = []
+    original_notify = runtime.bus.notify
+    original_history = runtime.shell_receipts.history
+
+    async def observe_pending() -> None:
+        if any(
+            runtime.permissions.pending_for(session_id, run_id)
+            for run_id in runtime.run_ids.values()
+        ):
+            pending.set()
+        await original_notify()
+
+    async def review(name: str, arguments: dict[str, Any], risk: str) -> tuple[bool, str]:
+        reviews.append((name, risk))
+        return True, "允许当前会话显式查询回执目录"
+
+    def lookup(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal lookups
+        lookups += 1
+        assert kwargs["limit"] == runtime.config.settings.limits.max_search_results
+        return original_history(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.bus, "notify", observe_pending)
+    monkeypatch.setattr(runtime.permissions, "review", review)
+    monkeypatch.setattr(runtime.shell_receipts, "history", lookup)
+
+    def script() -> ShellScript:
+        yield call(
+            "current-history",
+            "shell_history",
+            limit=runtime.config.settings.limits.max_search_results + 1,
+        )
+        return "目录核查完成。"
+
+    dialogue = ShellDialogue(script())
+    runtime.client_factory = lambda _config: ShellClient(dialogue)
+    try:
+        started = await runtime.submit("仅列本会话正常关闭后保留的回执。", mode=mode)
+        if mode == "ask":
+            await asyncio.wait_for(pending.wait(), 2)
+            assert lookups == 0
+            (approval,) = runtime.permissions.pending_for(session_id, started["run_id"])
+            stored = runtime.store.get("approval", approval)
+            assert stored["tool"] == "shell_history" and stored["risk"] == "read"
+            await runtime.permissions.resolve(approval, "approve")
+        async with asyncio.timeout(4):
+            await runtime.wait(started["run_id"])
+        page = result(runtime, session_id, "current-history")
+        assert [item["command_id"] for item in page["items"]] == [command_id]
+        assert "retained evidence" not in json.dumps(page)
+        assert lookups == 1 and runtime.shells.live_sessions() == ()
+        assert reviews == ([("shell_history", "read")] if mode == "auto" else [])
     finally:
         await runtime.close()
 
@@ -233,23 +321,27 @@ async def test_retired_execution_and_old_closure_cannot_read_but_current_call_ca
         await runtime.close()
 
 
+@pytest.mark.parametrize("name", ["shell_read", "shell_history"])
 async def test_stored_read_rechecks_current_qualification_before_delivery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     runtime = await shell_runtime(tmp_path)
     session_id = runtime.main_session()["id"]
     command_id = save_fixture(runtime, tmp_path, session_id)
-    original = runtime.shell_receipts.read
+    method = "read" if name == "shell_read" else "history"
+    original = getattr(runtime.shell_receipts, method)
 
     def revoke_after_lookup(*args: Any, **kwargs: Any) -> dict[str, Any]:
         page = original(*args, **kwargs)
-        runtime.config.update({"disabled_tools": ["shell_read"]})
+        runtime.config.update({"disabled_tools": [name]})
         return page
 
-    monkeypatch.setattr(runtime.shell_receipts, "read", revoke_after_lookup)
+    monkeypatch.setattr(runtime.shell_receipts, method, revoke_after_lookup)
 
     def script() -> ShellScript:
-        yield call("revoked-receipt", "shell_read", command_id=command_id)
+        yield call(
+            "revoked-receipt", name, **({"command_id": command_id} if name == "shell_read" else {})
+        )
         return "当前资格核查结束。"
 
     dialogue = ShellDialogue(script())
@@ -413,6 +505,11 @@ async def test_api_session_delete_is_atomic_and_normal_reopen_does_not_revive_re
     try:
         assert reopened.store.get("session", session_id) is None
         assert reopened.store.get(RECEIPT_KIND, receipt_key(session_id, command_id)) is None
+        with pytest.raises(ShellSessionError) as missing_directory:
+            reopened.shell_receipts.history(
+                session_id, limit=20, output_limit=6000, receipt_limit=6000
+            )
+        assert missing_directory.value.code == "not_found"
         assert reopened.shells.live_sessions() == ()
     finally:
         await reopened.close()

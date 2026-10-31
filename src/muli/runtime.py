@@ -1918,6 +1918,7 @@ class Runtime:
                 "task_schedule_replan_cancel",
                 "shell_run",
                 "shell_read",
+                "shell_history",
                 "shell_stop",
             }
         )
@@ -3212,7 +3213,7 @@ class Runtime:
             self.channel_ownership.guard_call(
                 prepared.channel_ownership, call.name, arguments, tool.risk
             )
-            if call.name in {"shell_run", "shell_read", "shell_stop"}:
+            if call.name in {"shell_run", "shell_read", "shell_history", "shell_stop"}:
                 live_shells = self.shells.live_sessions()
                 for identifier in tuple(self._shell_mode_epochs):
                     if identifier not in live_shells and identifier not in self.tasks:
@@ -3704,6 +3705,19 @@ class Runtime:
             self._shell_requests.pop(session_id, None)
             return result
 
+        async def shell_history(args: dict[str, Any]) -> Any:
+            session_id, _, guard = shell_caller("shell_history", "read")
+            limits = self.config.settings.limits
+            result = self.shell_receipts.history(
+                session_id,
+                cursor=args.get("cursor"),
+                limit=min(args.get("limit", 20), limits.max_search_results),
+                output_limit=limits.max_output_chars,
+                receipt_limit=limits.max_output_chars,
+            )
+            guard()
+            return result
+
         async def notify(args: dict[str, Any]) -> Any:
             item = self.store.put(
                 "notification",
@@ -4108,6 +4122,20 @@ class Runtime:
                     }
                 ),
                 read_shell,
+                preserve_output=True,
+            ),
+            Tool(
+                "shell_history",
+                "只列本调用会话正常关闭后保存的shell回执，按归档事件倒序，非命令执行时间。"
+                "用next_cursor继续下一页，再按选中的command_id用shell_read完整核查输出。"
+                "不读输出正文、不列当前运行、不创建进程；空目录不能证明命令从未执行",
+                parameters(
+                    {
+                        "cursor": {"type": "integer", "minimum": 1},
+                        "limit": {"type": "integer", "minimum": 1},
+                    }
+                ),
+                shell_history,
                 preserve_output=True,
             ),
             Tool(

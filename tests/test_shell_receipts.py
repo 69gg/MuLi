@@ -14,6 +14,7 @@ import pytest
 
 import muli.shell_receipts as receipts_module
 import muli.store as store_module
+from muli.evidence import json_size
 from muli.shell_protocol import ShellSpec
 from muli.shell_receipts import (
     MAX_ENVELOPE_BYTES,
@@ -83,6 +84,12 @@ def closed_commands(
 
 def read(receipts: ShellReceipts, command_id: str, **options: Any) -> dict[str, Any]:
     return receipts.read("owner", command_id, output_limit=6000, receipt_limit=6000, **options)
+
+
+def history(receipts: ShellReceipts, **options: Any) -> dict[str, Any]:
+    return receipts.history(
+        "owner", **{"limit": 20, "output_limit": 6000, "receipt_limit": 6000, **options}
+    )
 
 
 @pytest.fixture
@@ -321,6 +328,7 @@ def test_global_retention_uses_event_order_across_equal_and_reversed_clocks(
         read(receipts, first)
     second_event = store.get(RECEIPT_KIND, receipt_key("owner", second))["event_id"]
     assert read(receipts, second)["output"] == "second"
+    assert [item["command_id"] for item in history(receipts)["items"]] == [third, second]
     assert store.get(RECEIPT_KIND, receipt_key("owner", second))["event_id"] == second_event
     monkeypatch.setattr(store_module, "now", lambda: 1)
     with closed_commands(tmp_path, [(b"fourth", b"")], session_id="other") as manager:
@@ -328,6 +336,7 @@ def test_global_retention_uses_event_order_across_equal_and_reversed_clocks(
         receipts.archive(manager, max_records=2, output_limit=6000)
     assert store.get(RECEIPT_KIND, receipt_key("owner", second)) is None
     assert read(receipts, third)["output"] == "third"
+    assert [item["command_id"] for item in history(receipts)["items"]] == [third]
     assert (
         receipts.read("other", fourth, output_limit=6000, receipt_limit=6000)["output"] == "fourth"
     )
@@ -341,6 +350,8 @@ def test_global_retention_uses_event_order_across_equal_and_reversed_clocks(
         fifth = next(iter(manager._commands))
         receipts.archive(manager, max_records=1, output_limit=6000)
     assert read(receipts, fifth)["output"] == "fifth"
+    assert [item["command_id"] for item in history(receipts)["items"]] == [fifth]
+    assert receipts.history("other", limit=20, output_limit=6000, receipt_limit=6000)["items"] == []
     assert (
         store.db.execute("SELECT count(*) FROM objects WHERE kind=?", (RECEIPT_KIND,)).fetchone()[0]
         == 1
@@ -409,6 +420,8 @@ def test_noncompleted_terminal_evidence_never_certifies_an_exit(
         command_id = next(iter(manager._commands))
     page = read(ShellReceipts(store), command_id)
     assert page["state"] == state and page["exit_code"] is None
+    entry = history(ShellReceipts(store))["items"][0]
+    assert entry["state"] == state and entry["exit_code"] is None
 
 
 @pytest.mark.parametrize("missing", ["proof", "stdout_fence", "stderr_fence", "running"])
@@ -449,6 +462,9 @@ def test_delete_transaction_rolls_back_and_deleted_session_cannot_be_archived_ag
     with pytest.raises(ShellSessionError) as caught:
         read(receipts, command_id)
     assert caught.value.code == "not_found"
+    with pytest.raises(ShellSessionError) as missing_directory:
+        history(receipts)
+    assert missing_directory.value.code == "not_found"
     assert store.get(RECEIPT_KIND, receipt_key("owner", command_id)) is None
     assert (
         store.db.execute("SELECT count(*) FROM events WHERE type=?", (RECEIPT_EVENT,)).fetchone()[0]
@@ -472,3 +488,185 @@ def test_generic_store_reopen_preserves_unknown_feature_version(
         assert caught.value.code == "content_unavailable"
     finally:
         generic_reader.close()
+
+
+def test_history_pages_archive_events_without_refreshing_retention(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipts = ShellReceipts(store)
+    monkeypatch.setattr(store_module, "now", lambda: 100)
+    with closed_commands(tmp_path, [(b"first", b""), (b"second", b""), (b"third", b"")]) as manager:
+        identifiers = list(manager._commands)
+        receipts.archive(manager, max_records=3, output_limit=6000)
+    changed = store.db.total_changes
+    page = history(receipts, limit=1)
+    short_budget = json_size(page)
+    terminal_budget = json_size({**page, "next_cursor": None})
+    assert terminal_budget > short_budget
+    cursor: int | None = None
+    for expected in identifiers[:0:-1]:
+        page = history(receipts, cursor=cursor, limit=3, receipt_limit=short_budget)
+        assert json_size(page) <= short_budget
+        assert [item["command_id"] for item in page["items"]] == [expected]
+        cursor = page["next_cursor"]
+        assert cursor is not None
+    # A complete terminal page needs null, which is larger than a short event
+    # integer. Keep the original tight budget and require an explicit rejection.
+    with pytest.raises(ShellSessionError) as last_page:
+        history(receipts, cursor=cursor, limit=3, receipt_limit=short_budget)
+    assert last_page.value.code == "output_budget"
+    assert store.db.total_changes == changed
+
+    # Derive a separate sufficient budget from the actual complete single item,
+    # while retaining the rejecting boundary above and the system's original cap.
+    budget = max(short_budget, terminal_budget)
+    pages: list[dict[str, Any]] = []
+    cursor = None
+    for _ in identifiers:
+        page = history(receipts, cursor=cursor, limit=3, receipt_limit=budget)
+        assert json_size(page) <= budget and len(page["items"]) == 1
+        assert page["receipt_source"] == "stored" and page["order"] == "archive_event_desc"
+        assert page["shell_state"] == "closed" and page["shell_pid"] is None
+        pages.append(page)
+        cursor = page["next_cursor"]
+    assert cursor is None
+    assert [page["items"][0]["command_id"] for page in pages] == identifiers[::-1]
+    positions = [page["items"][0]["event_id"] for page in pages]
+    assert positions == sorted(positions, reverse=True)
+    assert len(set(positions)) == len(identifiers)
+    assert store.db.total_changes == changed
+
+
+def test_history_projects_metadata_without_materializing_or_decoding_output(
+    store: Store, saved: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved["output"]["chunks"][0][2] = "not Base64"
+    store.put(RECEIPT_KIND, saved)
+    original_object = receipts_module._object
+
+    def header_only(raw: bytes) -> dict[str, Any]:
+        value = original_object(raw)
+        assert "output" not in value and "chunks" not in value
+        return value
+
+    def forbidden(*args: Any, **kwargs: Any) -> NoReturn:
+        raise AssertionError("目录不得读完整对象或解码输出正文")
+
+    receipts = ShellReceipts(store)
+    with monkeypatch.context() as patch:
+        patch.setattr(receipts_module, "_object", header_only)
+        patch.setattr(receipts_module, "_decode", forbidden)
+        patch.setattr(base64, "b64decode", forbidden)
+        patch.setattr(store, "bounded_object", forbidden)
+        page = history(receipts)
+    assert [item["command_id"] for item in page["items"]] == [saved["command_id"]]
+    assert page["items"][0]["truncated"] is False
+    with pytest.raises(ShellSessionError) as caught:
+        read(receipts, saved["command_id"])
+    assert caught.value.code == "content_unavailable"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "future",
+        "extra_metadata",
+        "metadata_bytes",
+        "record_key",
+        "session",
+        "event_id",
+        "missing_event",
+        "event_session",
+        "event_type",
+        "event_data",
+        "missing_object",
+        "invalid_json",
+        "duplicate_field",
+        "envelope_bytes",
+        "counts",
+    ],
+)
+def test_history_does_not_report_corrupt_evidence_as_an_empty_directory(
+    store: Store, saved: dict[str, Any], corruption: str
+) -> None:
+    if corruption == "future":
+        saved["version"] += 1
+    elif corruption == "extra_metadata":
+        saved["metadata"]["unexpected"] = "field"
+    elif corruption == "metadata_bytes":
+        saved["metadata"]["cwd"] = "界" * MAX_METADATA_BYTES
+    elif corruption == "record_key":
+        saved["id"] = receipt_key("other", saved["command_id"])
+    elif corruption == "session":
+        saved["session_id"] = "other"
+    elif corruption == "event_id":
+        saved["event_id"] = 0
+    elif corruption == "counts":
+        saved["output"]["retained"] = True
+    if corruption in {
+        "future",
+        "extra_metadata",
+        "metadata_bytes",
+        "session",
+        "event_id",
+        "counts",
+    }:
+        store.put(RECEIPT_KIND, saved)
+    with store.db:
+        if corruption == "record_key":
+            store.db.execute(
+                "UPDATE objects SET data=? WHERE kind=? AND id=?",
+                (json.dumps(saved), RECEIPT_KIND, receipt_key("owner", saved["command_id"])),
+            )
+        elif corruption == "missing_event":
+            store.db.execute("DELETE FROM events WHERE id=?", (saved["event_id"],))
+        elif corruption == "event_session":
+            store.db.execute(
+                "UPDATE events SET session_id='other' WHERE id=?", (saved["event_id"],)
+            )
+        elif corruption == "event_type":
+            store.db.execute("UPDATE events SET type='other' WHERE id=?", (saved["event_id"],))
+        elif corruption == "event_data":
+            store.db.execute("UPDATE events SET data='{}' WHERE id=?", (saved["event_id"],))
+        elif corruption == "missing_object":
+            store.db.execute(
+                "DELETE FROM objects WHERE kind=? AND id=?", (RECEIPT_KIND, saved["id"])
+            )
+        elif corruption in {"invalid_json", "duplicate_field"}:
+            raw = (
+                "{"
+                if corruption == "invalid_json"
+                else json.dumps(saved).replace('"version": 1', '"version": 1, "version": 1')
+            )
+            store.db.execute(
+                "UPDATE objects SET data=? WHERE kind=? AND id=?",
+                (raw, RECEIPT_KIND, saved["id"]),
+            )
+        elif corruption == "envelope_bytes":
+            store.db.execute(
+                "UPDATE objects SET data=CAST(zeroblob(?) AS TEXT) WHERE kind=? AND id=?",
+                (MAX_ENVELOPE_BYTES + 1, RECEIPT_KIND, saved["id"]),
+            )
+    changed = store.db.total_changes
+    with pytest.raises(ShellSessionError) as caught:
+        history(ShellReceipts(store))
+    assert caught.value.code == "content_unavailable"
+    assert store.db.total_changes == changed
+
+
+def test_history_distinguishes_missing_session_empty_history_and_insufficient_budget(
+    store: Store, saved: dict[str, Any]
+) -> None:
+    receipts = ShellReceipts(store)
+    assert receipts.history("other", limit=20, output_limit=6000, receipt_limit=6000)["items"] == []
+    with pytest.raises(ShellSessionError) as missing:
+        receipts.history("missing", limit=20, output_limit=6000, receipt_limit=6000)
+    assert missing.value.code == "not_found"
+    empty = receipts.history("other", limit=20, output_limit=6000, receipt_limit=6000)
+    for budget in (1, json_size(empty)):
+        with pytest.raises(ShellSessionError) as small:
+            history(receipts, receipt_limit=budget)
+        assert small.value.code == "output_budget"
+    page = history(receipts, output_limit=1)
+    assert page["items"][0]["truncated"] is True
+    assert store.get(RECEIPT_KIND, saved["id"]) == saved
