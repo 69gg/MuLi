@@ -6,6 +6,7 @@ import argparse
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import uuid
@@ -13,11 +14,12 @@ from pathlib import Path
 
 # Operator policy: shared across repositories/worktrees, not multiplied per agent.
 SLICE = "muli-checks.slice"
-MEMORY_BYTES = 1024**3
-SHARED_MEMORY_BYTES = 2 * MEMORY_BYTES
-TASKS = 128
+MEMORY_BYTES = 768 * 1024**2
+SHARED_MEMORY_BYTES = 1024**3
+CPU_PERCENT = 50
+TASKS = 96
 MAX_SECONDS = 180
-NODE_HEAP_MB = 256
+NODE_HEAP_MB = 192
 NODE_TEST_TIMEOUT_MS = 15000
 MANAGER_TIMEOUT = 10
 BACKEND_BATCH_FILES = 32
@@ -33,14 +35,48 @@ def manager(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def local_temp_directory() -> Path:
+    """Keep persistent check scratch files on verified disk, outside tmpfs budgets."""
+    artifacts = Path(__file__).resolve().parents[1] / ".local-check-artifacts"
+    temporary = artifacts / "tmp"
+    for path in (artifacts, temporary):
+        path.mkdir(mode=0o700, exist_ok=True)
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise RuntimeError(f"Temporary directory must be an owner-only directory: {path}")
+    result = subprocess.run(
+        ["findmnt", "-T", str(temporary), "-n", "-o", "FSTYPE"],
+        check=True,
+        text=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=MANAGER_TIMEOUT,
+    )
+    lines = result.stdout.splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise RuntimeError("Cannot verify temporary directory filesystem")
+    filesystem = lines[0].strip()
+    if any(character.isspace() for character in filesystem) or filesystem in {
+        "tmpfs",
+        "ramfs",
+        "devtmpfs",
+    }:
+        raise RuntimeError(f"Temporary directory requires a disk filesystem: {filesystem}")
+    return temporary
+
+
 def verify_group(path: Path, memory: int, *, service: bool = False) -> None:
     for name, maximum in (("memory.max", memory), ("memory.swap.max", 0), ("pids.max", TASKS)):
         value = (path / name).read_text().strip()
         if value == "max" or int(value) > maximum:
             raise RuntimeError(f"Resource limit not enforced: {name}={value}")
     quota, period = (path / "cpu.max").read_text().split()
-    if quota == "max" or int(quota) > int(period):
-        raise RuntimeError("CPU quota exceeds one CPU")
+    if quota == "max" or int(quota) * 100 > int(period) * CPU_PERCENT:
+        raise RuntimeError(f"CPU quota exceeds {CPU_PERCENT}% of one CPU")
     if service and (path / "memory.oom.group").read_text().strip() != "1":
         raise RuntimeError("Whole-service OOM cleanup is not enabled")
 
@@ -193,13 +229,14 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
         raise RuntimeError("Local checks require Linux cgroup v2; no unbounded fallback")
     if not 1 <= seconds <= MAX_SECONDS:
         raise ValueError(f"seconds must be between 1 and {MAX_SECONDS}")
+    temporary = local_temp_directory()
     manager(
         "set-property",
         "--runtime",
         SLICE,
         f"MemoryMax={SHARED_MEMORY_BYTES}",
         "MemorySwapMax=0",
-        "CPUQuota=100%",
+        f"CPUQuota={CPU_PERCENT}%",
         f"TasksMax={TASKS}",
     )
     manager("start", SLICE)
@@ -207,7 +244,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
     properties = {
         "MemoryMax": str(MEMORY_BYTES),
         "MemorySwapMax": "0",
-        "CPUQuota": "100%",
+        "CPUQuota": f"{CPU_PERCENT}%",
         "TasksMax": str(TASKS),
         "OOMPolicy": "kill",
         "KillMode": "control-group",
@@ -221,6 +258,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
     }
     environment = {
         "PATH": os.environ.get("PATH", os.defpath),
+        "TMPDIR": str(temporary),
         "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
         "PYTHONPATH": str(Path.cwd() / "src"),
         "UV_OFFLINE": "1",
@@ -257,7 +295,12 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
         "--",
         *command,
     ]
-    print(f"{unit}: 1 GiB / shared 2 GiB, swap 0, shared 1 CPU, {seconds}s", flush=True)
+    print(
+        f"{unit}: {MEMORY_BYTES // 1024**2} MiB / "
+        f"shared {SHARED_MEMORY_BYTES // 1024**2} MiB, swap 0, "
+        f"shared CPU {CPU_PERCENT}%, {seconds}s",
+        flush=True,
+    )
     previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
 
     def interrupted(signum: int, frame: object) -> None:

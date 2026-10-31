@@ -27,3 +27,6 @@ htmlcov/
 *.sqlite3-shm
 *.sqlite3-wal
 .muli/
+
+# Local check artifacts
+.local-check-artifacts/
