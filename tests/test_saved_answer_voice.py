@@ -259,7 +259,9 @@ async def configure_speech(rig: MemoryRig, web: httpx.AsyncClient) -> None:
             },
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 200, (
+        f"语音设置未能保存：HTTP {response.status_code} {response.text}"
+    )
 
 
 async def complete_answer(
