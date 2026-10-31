@@ -2,6 +2,11 @@
 
 版本记录区分实际交付与历史回填；未完成验证的工作不作为发布完成的证据。
 
+## [2.150.0] — 2026-10-31
+
+- 并入 Windows UIA 控制台创建模式实验：测试侧仅在 `MULI_TEST_UIA_PROBE_SPAWN_MODE` 设置时包装一次 owned probe 的创建方式，保留原 argv、三条 PIPE、`CREATE_NO_WINDOW` 与 12 秒期限，未设置时行为不变；离线替身回归不启动进程或桌面。
+- 专用 `windows-native.yml` 拆出 probe 作业，按 Python 3.12/3.13 × `create-no-window`/`default` 对照原 no-walker 探测，`all-native` 仍需手动选择。仅补诊断手段，不声称修复 Windows UIA 间歇超时，也不改变生产启动路径。
+
 ## [2.149.0] — 2026-10-31
 
 - 在“记忆 → 来源”核对已保存的主人原话后，可选取连续片段明确记作长期偏好，保留出处，无需另外调用模型。
