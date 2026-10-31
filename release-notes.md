@@ -1,0 +1,3 @@
+- 已配置 MCP 工具返回完整成功的 typed `resource_link` 时，可用 `mcp_resources_list(source="tool_result")` 显式展示最近结果链接，再经原 `mcp_resource_read` 读取完整短文本；普通资源目录无需包含这些链接。
+- 仅接纳同连接、同代次最近调用的有界完整链接组；换代、较新调用、失败、取消或截断不恢复旧引用。链接元数据及正文保持不可信，结果引用在附件预检和远端请求前拒绝二进制保存，不增加后台抓取或权限。
+- 正式 Runtime/Team、锁定 SDK 与 MockTransport 旅程及五项独立负控均已通过，合相关旧回归共318个不同节点；全150源码strict、Ruff/393文件格式检查通过，非作者后审无剩余必须修复P1/P2。离线发布/兼容验证、精确远端CI与发行待完成，不代表真实服务器、账号或自然模型质量。见[候选审查](docs/review-v2.51.md)及[先红记录](docs/mcp-result-resources-proposal.md)。
