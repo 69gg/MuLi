@@ -53,6 +53,12 @@ python scripts/check_local.py run -- .venv/bin/python scripts/check_wheel.py
 
 失败后先看有限日志和相关代码，不循环触发同一个失控用例。比较 DOM 或含循环引用对象的身份时，断言布尔结果，避免失败报告递归展开整个对象图。
 
+### YAML 依赖的类型检查
+
+PyYAML 当前没有类型声明；`pyproject.toml` 仅为 `yaml.*` 设置库专用 `ignore_missing_imports`，统一覆盖根模块及子模块，不在每个导入上重复行内 ignore。YAML 导入值仍按 `Any` 处理；业务代码的严格检查与 unused-ignore 检查继续生效。
+
+`tests/test_typecheck_yaml.py` 使用实际项目配置和 YAML 导入，分别检查冷缓存、依赖类型变化后的暖缓存，并验证业务返回类型错误与多余 ignore 仍会报错。测试使用独立临时缓存，固定三次子进程检查，每次最多20秒，不安装依赖或重试。
+
 ## 托管 CI
 
 CI 共17项作业，包含14项后端测试分片、质量、MCP 与 Linux 原生作业，验证 Linux、macOS、Windows 与 Python 3.12/3.13。Linux 和 macOS 每个版本按测试文件分成两份不重叠集合，Windows 分成三份；全部分片合起来覆盖完整测试集合，同文件的参数化用例与夹具生命周期保持在一起。分组使用仓库相对文件名的稳定摘要，新增文件不会重排已有文件；pytest 自身的发现与忽略规则保持生效，分片不保证耗时均分。正式发布复用这17项验证，并另运行准备、PyPI 发布与 GitHub Release，共20项作业。

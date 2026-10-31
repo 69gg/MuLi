@@ -51,3 +51,7 @@ python_version = "3.12"
 files = ["src/muli"]
 strict = true
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["yaml.*"]
+ignore_missing_imports = true
