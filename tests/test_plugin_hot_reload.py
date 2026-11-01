@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import httpx
@@ -52,6 +53,30 @@ def write_plugin(
         f"    api.append_prompt({prompt!r})\n"
         f"    api.add_tool(Tool({tool!r}, 'demo', parameters({{}}), handle))\n"
         "    api.add_route('/ping', lambda: {'value': 'new'}, methods=['GET'])\n",
+        encoding="utf-8",
+    )
+
+
+def write_slow_plugin(directory: Path, identifier: str, marker: Path) -> None:
+    plugin = directory / identifier
+    plugin.mkdir(parents=True, exist_ok=True)
+    (plugin / "plugin.json").write_text(
+        json.dumps({"id": identifier, "api_version": 1}), encoding="utf-8"
+    )
+    (plugin / "main.py").write_text(
+        "import asyncio\n"
+        "from pathlib import Path\n"
+        "from typing import Any\n"
+        "from muli.plugins import PluginContext\n"
+        "from muli.tools import Tool, parameters\n\n"
+        "async def handle(args: dict[str, Any]) -> str:\n"
+        "    await asyncio.sleep(30)\n"
+        "    return 'late'\n\n"
+        "async def shutdown() -> None:\n"
+        f"    Path({str(marker)!r}).write_text('closed', encoding='utf-8')\n\n"
+        "def setup(api: PluginContext) -> None:\n"
+        "    api.add_tool(Tool('slow_tool', 'slow', parameters({}), handle))\n"
+        "    api.shutdown_hooks.append(shutdown)\n",
         encoding="utf-8",
     )
 
@@ -148,6 +173,65 @@ async def test_install_triggers_reload_without_restart(tmp_path: Path) -> None:
         assert not plugins.restart_required
     finally:
         await plugins.close()
+        await runtime.close()
+
+
+async def test_watcher_retries_after_backoff_and_drops_the_old_module(tmp_path: Path) -> None:
+    runtime, plugins, _ = setup(tmp_path)
+    directory = tmp_path / "plugins"
+    write_plugin(directory, "demo")
+    try:
+        await plugins.load()
+        (directory / "demo" / "main.py").write_text(
+            "raise RuntimeError('bad watched reload')\n", encoding="utf-8"
+        )
+        async with asyncio.timeout(3):
+            while "demo" not in plugins._next_attempt:
+                await asyncio.sleep(0.02)
+        assert plugins._generations["demo"].generation == 1
+        write_plugin(directory, "demo", prompt="fixed", tool="demo_v2", result="two")
+        async with asyncio.timeout(5):
+            while plugins._generations["demo"].generation < 2:
+                await asyncio.sleep(0.02)
+        assert plugins._generations["demo"].generation >= 2
+        assert plugins.contexts[0].prompt.strip() == "fixed"
+        assert await runtime.tools["demo_v2"].handler({}) == "two"
+        assert plugins._generations["demo"].module_name in sys.modules
+        async with asyncio.timeout(3):
+            while "_muli_plugin_demo_g1" in sys.modules:
+                await asyncio.sleep(0.02)
+    finally:
+        await plugins.close()
+        await runtime.close()
+
+
+async def test_close_retires_a_generation_that_is_still_draining(tmp_path: Path) -> None:
+    runtime, plugins, _ = setup(tmp_path)
+    directory = tmp_path / "plugins"
+    first_marker = tmp_path / "first-closed"
+    second_marker = tmp_path / "second-closed"
+    write_slow_plugin(directory, "demo", first_marker)
+    task: asyncio.Task[str] | None = None
+    try:
+        await plugins.load()
+        task = asyncio.create_task(runtime.tools["slow_tool"].handler({}))
+        async with asyncio.timeout(2):
+            while plugins._generations["demo"].active_calls != 1:
+                await asyncio.sleep(0.01)
+        write_slow_plugin(directory, "demo", second_marker)
+        record = await plugins.reload("demo")
+        assert record["generation"] == 2
+        assert any(
+            generation.generation == 1 and generation.state == "draining"
+            for generation in plugins._draining
+        )
+        await plugins.close()
+        assert first_marker.read_text(encoding="utf-8") == "closed"
+        assert second_marker.read_text(encoding="utf-8") == "closed"
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await runtime.close()
 
 

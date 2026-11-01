@@ -247,6 +247,7 @@ async def test_delegated_channel_turn_writes_bounded_summary_and_links_outbox(
         assert len(records) == 2
         failed = records[-1]
         assert failed["status"] == "failed" and failed["outcome"] == ""
+        assert failed["truncated"] is False
         assert failed["input_id"] and failed["run_id"] != record["run_id"]
 
         # 收回后旧代不能再写“成功”摘要。
