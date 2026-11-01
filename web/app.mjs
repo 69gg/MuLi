@@ -3,7 +3,7 @@ import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameCompo
 import { MODES, createSessionState, applyEvent, hydrateSession, conversationItems, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
-import { CHANNELS, loadSettingsResources, capabilityLabel, managementLabel, managementActionLabel, managementPlanLabel, managementRecoveryView, managementRecoveryReplyLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
+import { CHANNELS, loadSettingsResources, capabilityLabel, dependencyHint, managementLabel, managementActionLabel, managementPlanLabel, managementRecoveryView, managementRecoveryReplyLabel, updateLabel, retryChannelDelivery } from "./management.mjs";
 import { initializeTheme, toggleTheme } from "./theme.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "./attachments.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "./team.mjs";
@@ -4770,11 +4770,14 @@ function renderInputSettings() {
   const voiceStatus = state.voice; const captureStatus = state.capture;
   const voiceState = element("div", { id: "voice-status-summary" }, voiceStatus && voiceStatusSummary(voiceStatus));
   const captureState = captureStatus && statusList([["状态", capabilityLabel(captureStatus)], ["截图后端", captureStatus.screenshot?.backend || "未检测到"], ["录屏后端", captureStatus.recording?.backend || "未检测到"], ["采集权限", captureStatus.permission_verified ? "已验证" : "尚未验证"]]);
+  const captureDependencies = captureStatus?.enabled ? [dependencyHint(captureStatus.screenshot), dependencyHint(captureStatus.recording)].filter(Boolean) : [];
+  const playbackHint = voiceStatus?.enabled ? dependencyHint(voiceStatus.playback) : "";
   return element("div", {},
     settingsSection("网页语音输入", switchField("允许点击录音并生成草稿", "web_voice.enabled", state.settingsDraft.web_voice?.enabled), element("p", { text: "需要配置 ASR。转写只进入可编辑草稿，点击发送后才成为用户消息；与后台唤醒独立。" }), settingsJSON("web_voice", state.settingsDraft.web_voice ?? {}, ["enabled"])),
     settingsSection("语音", settingsResourceError("voice"), voiceState,
       voiceStatus?.last_error && element("p", { class: "form-error", text: voiceStatus.last_error }),
       voiceStatus?.reason && element("p", { class: "settings-role-hint", text: voiceStatus.reason }),
+      playbackHint && element("p", { class: "settings-role-hint", text: playbackHint }),
       switchField("启用语音唤醒", "voice.enabled", voice.enabled),
       field("唤醒词", "voice.wake_word", voice.wake_word ?? ""),
       selectField("计算设备", "voice.device", voice.device ?? "auto", [["auto", "自动"], ["cpu", "CPU"], ["rocm", "ROCm"], ["cuda", "CUDA"]]),
@@ -4784,6 +4787,7 @@ function renderInputSettings() {
       settingsJSON("voice", voice, ["enabled", "wake_word", "device", "input_device", "tts_enabled"], 10),
       element("button", { type: "button", class: "text-button field-top-space", text: "设置语音识别与合成模型", dataset: { settingsTab: "media" } }), statusDetails(voiceStatus)),
     settingsSection("截图与录屏", settingsResourceError("capture"), captureState,
+      ...captureDependencies.map((text) => element("p", { class: "settings-role-hint", text })),
       captureStatus?.reason && element("p", { class: "settings-role-hint", text: captureStatus.reason }),
       switchField("启用桌面采集", "computer.capture.enabled", capture.enabled),
       field("采集后端", "computer.capture.backend", capture.backend ?? "auto"),
@@ -5206,6 +5210,8 @@ function renderSystemSettings() {
   const config = state.settingsDraft;
   const limits = config.limits ?? {};
   const service = state.service;
+  const notifications = state.status?.notifications;
+  const notificationHint = notifications?.available === false && (notifications.enabled === true || notifications.supported === false) ? dependencyHint(notifications) : "";
   const serviceSection = settingsSection("用户服务", settingsResourceError("service"), statusList([["服务", service?.supported === false ? "当前系统不支持" : service?.unit || "状态未知"], ["安装", !service ? "状态未知" : service.installed ? "已安装" : "未安装"], ["状态", !service ? "状态未知" : service.active ? "运行中" : "未运行"], ["登录后启动", !service ? "状态未知" : service.enabled ? "已启用" : "未启用"]]));
   if (service?.supported) {
     const actions = element("div", { class: "service-actions" });
@@ -5222,7 +5228,7 @@ function renderSystemSettings() {
   if (service?.reason) serviceSection.append(element("p", { text: service.reason }));
   return element("div", {},
     settingsSection("工作台", statusList([["版本", state.status?.version], ["平台", state.status?.platform], ["运行任务", String(state.status?.running ?? 0)]]), element("div", { class: "field-row field-top-space" }, field("监听地址", "server.host", config.server?.host ?? ""), field("端口", "server.port", config.server?.port ?? "", { type: "number", min: 1, max: 65535 })), element("p", { text: "监听变更将排队执行重启事务。" }), element("div", { class: "system-links" }, element("a", { href: "/api/export", download: "muli-export.jsonl", class: "secondary-button export-button", text: "导出数据" }), element("a", { href: "/api/docs", target: "_blank", rel: "noopener", class: "secondary-button export-button", text: "API 参考" }))),
-    settingsSection("通知", switchField("桌面通知", "notifications.enabled", config.notifications?.enabled), state.status?.notifications?.available === false && element("p", { text: "桌面通知暂不可用。" }), state.status?.notifications?.last_error && element("p", { class: "form-error", text: state.status.notifications.last_error })),
+    settingsSection("通知", switchField("桌面通知", "notifications.enabled", config.notifications?.enabled), state.status?.notifications?.available === false && element("p", { text: "桌面通知暂不可用。" }), notificationHint && element("p", { class: "settings-role-hint", text: notificationHint }), notifications?.last_error && element("p", { class: "form-error", text: notifications.last_error })),
     settingsSection("访问", field("访问密码", "server.password", "", { type: "password", placeholder: config.server?.password_set ? "已设置，留空保留" : "尚未设置" }), config.server?.password_set && switchField("清除访问密码", "server.clear_password", false), state.auth.required && actionButton("退出登录", "logout", "secondary-button")),
     serviceSection,
     settingsSection("运行限制", element("div", { class: "field-row" }, field("并行 Agent 数", "limits.max_parallel_agents", limits.max_parallel_agents ?? "", { type: "number", min: 1 }), field("未完成任务上限", "limits.max_pending_runs", limits.max_pending_runs ?? "", { type: "number", min: 1, placeholder: "使用服务默认值" })), element("div", { class: "field-row" }, field("工具步骤上限", "limits.max_tool_steps", limits.max_tool_steps ?? "", { type: "number", min: 1 }), field("任务时限（秒）", "limits.max_run_seconds", limits.max_run_seconds ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("文件大小上限（字节）", "limits.max_file_bytes", limits.max_file_bytes ?? "", { type: "number", min: 1 }), field("工具输出字符上限", "limits.max_output_chars", limits.max_output_chars ?? "", { type: "number", min: 1 })), settingsJSON("limits", limits, ["max_parallel_agents", "max_pending_runs", "max_tool_steps", "max_run_seconds", "max_file_bytes", "max_output_chars"])),

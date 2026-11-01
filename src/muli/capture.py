@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from muli import system_dependencies
 from muli.config import CaptureSettings, Computer
 from muli.platforms.files import LocalFiles, artifact
 from muli.process import run_process
@@ -126,6 +127,58 @@ class Capture:
             raise ValueError("macOS 无声录屏的 capture.device 只能是视频设备或视频设备:none")
         return video + ":none"
 
+    def _candidates(self, recording: bool) -> list[str]:
+        wayland, display = os.environ.get("WAYLAND_DISPLAY"), os.environ.get("DISPLAY")
+        if self.platform == "linux":
+            if recording:
+                candidates = ["wf-recorder"] if wayland else ["ffmpeg"] if display else []
+            else:
+                candidates = (["grim", "gnome-screenshot"] if wayland else []) + (
+                    ["gnome-screenshot", "scrot", "ffmpeg"] if display else []
+                )
+            return list(dict.fromkeys(candidates))
+        if self.platform == "darwin":
+            return ["ffmpeg"] if recording else ["screencapture"]
+        if self.platform == "win32":
+            return ["ffmpeg"]
+        return []
+
+    def _install_candidates(self, recording: bool) -> list[str]:
+        """Candidates whose absence can actually be fixed by installing a package."""
+        if self.config.backend == "portal":
+            return []
+        candidates = self._candidates(recording)
+        if self.config.backend != "auto":
+            return [candidate for candidate in candidates if candidate == self.config.backend]
+        return candidates
+
+    def _dependency_tools(self, recording: bool) -> list[str]:
+        tools = self._install_candidates(recording)
+        if (
+            recording
+            and self.platform == "linux"
+            and os.environ.get("WAYLAND_DISPLAY")
+            and "wf-recorder" in tools
+        ):
+            tools = [*tools, "timeout"]
+        return tools
+
+    def _missing_reason(self, recording: bool) -> str:
+        missing = system_dependencies.missing_tools(self._dependency_tools(recording))
+        wayland_recording = (
+            recording and self.platform == "linux" and bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+        label = "录屏" if recording else "截图"
+        if missing:
+            reason = f"未找到可用的{label}工具（缺少：{'、'.join(missing)}）"
+        else:
+            reason = f"{label}候选工具已安装，但当前会话缺少运行条件"
+        if wayland_recording:
+            reason += "；Wayland 录屏还需要合成器支持 wlr-screencopy，GNOME 等环境可能不支持"
+        elif self.platform == "linux" and os.environ.get("WAYLAND_DISPLAY"):
+            reason += "；Wayland 截图还需要合成器支持相应协议"
+        return reason
+
     def _backend(self, recording: bool) -> tuple[str, str]:
         if self.config.backend == "portal":
             if self.platform != "linux" or recording:
@@ -136,22 +189,17 @@ class Capture:
                 if state["available"] and not state["stale"]
                 else ("", str(state["reason"] or "Portal 能力待刷新"))
             )
-        wayland, display = os.environ.get("WAYLAND_DISPLAY"), os.environ.get("DISPLAY")
-        if self.platform == "linux":
-            if recording:
-                candidates = ["wf-recorder"] if wayland else ["ffmpeg"] if display else []
-            else:
-                candidates = (["grim", "gnome-screenshot"] if wayland else []) + (
-                    ["gnome-screenshot", "scrot", "ffmpeg"] if display else []
-                )
-        elif self.platform == "darwin":
-            candidates = ["ffmpeg"] if recording else ["screencapture"]
-        elif self.platform == "win32":
-            candidates = ["ffmpeg"]
-        else:
-            return "", "该平台尚无图像采集后端"
+        candidates = self._candidates(recording)
         if self.config.backend != "auto":
             candidates = [candidate for candidate in candidates if candidate == self.config.backend]
+            if not candidates:
+                return "", f"配置的后端 {self.config.backend} 不适用于当前平台或图形会话"
+        if not candidates:
+            if self.platform == "linux" and not (
+                os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")
+            ):
+                return "", "未检测到图形会话（DISPLAY 或 WAYLAND_DISPLAY）；桌面采集不可用"
+            return "", "该平台尚无图像采集后端"
         for candidate in candidates:
             if shutil.which(candidate) is None:
                 continue
@@ -165,24 +213,31 @@ class Capture:
                 except ValueError as error:
                     return "", str(error)
             return candidate, ""
-        return "", "没有适用的桌面采集工具或图形会话；请查看平台文档"
+        return "", self._missing_reason(recording)
+
+    def _capability(self, recording: bool) -> dict[str, Any]:
+        backend, reason = self._backend(recording)
+        tools = self._dependency_tools(recording)
+        missing = [] if backend else system_dependencies.missing_tools(tools)
+        return {
+            "available": bool(backend),
+            "backend": backend,
+            "reason": reason,
+            "missing_tools": missing,
+            "install_hint": None
+            if backend or not missing
+            else system_dependencies.install_hint(tools, platform=self.platform),
+        }
 
     def status(self) -> dict[str, Any]:
-        screenshot, screenshot_reason = self._backend(False)
-        recording, recording_reason = self._backend(True)
+        screenshot = self._capability(False)
+        recording = self._capability(True)
         return {
             "enabled": self.config.enabled,
-            "available": self.config.enabled and bool(screenshot or recording),
-            "screenshot": {
-                "available": bool(screenshot),
-                "backend": screenshot,
-                "reason": screenshot_reason,
-            },
-            "recording": {
-                "available": bool(recording),
-                "backend": recording,
-                "reason": recording_reason,
-            },
+            "available": self.config.enabled
+            and bool(screenshot["available"] or recording["available"]),
+            "screenshot": screenshot,
+            "recording": recording,
             "portal": self._portal_state(),
             "permission_verified": False,
             "reason": "" if self.config.enabled else "桌面采集尚未启用",

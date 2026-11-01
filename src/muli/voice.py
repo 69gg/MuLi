@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from muli import system_dependencies
 from muli.config import VoiceSettings
 from muli.maintenance import Admission
 from muli.media import MediaService
@@ -48,22 +49,29 @@ class SystemPlayer:
     def __init__(self, *, platform: str | None = None) -> None:
         self.platform = platform or sys.platform
 
-    def _backend(self, mime_type: str) -> str:
+    def _candidates(self, mime_type: str) -> list[str]:
         if self.platform == "linux":
-            candidates = ["pw-play", *(["aplay"] if mime_type == "audio/wav" else []), "ffplay"]
-        elif self.platform == "darwin":
-            candidates = ["afplay", "ffplay"]
-        elif self.platform == "win32":
-            candidates = ["ffplay", *(["powershell"] if mime_type == "audio/wav" else [])]
-        else:
-            candidates = []
-        return next((name for name in candidates if shutil.which(name)), "")
+            return ["pw-play", *(["aplay"] if mime_type == "audio/wav" else []), "ffplay"]
+        if self.platform == "darwin":
+            return ["afplay", "ffplay"]
+        if self.platform == "win32":
+            return ["ffplay", *(["powershell"] if mime_type == "audio/wav" else [])]
+        return []
+
+    def _backend(self, mime_type: str) -> str:
+        return next((name for name in self._candidates(mime_type) if shutil.which(name)), "")
 
     def status(self) -> dict[str, Any]:
         backend = self._backend("audio/wav")
+        candidates = self._candidates("audio/wav")
+        missing = [] if backend else system_dependencies.missing_tools(candidates)
         return {
             "available": bool(backend),
             "backend": backend,
+            "missing_tools": missing,
+            "install_hint": None
+            if backend or not missing
+            else system_dependencies.install_hint(candidates, platform=self.platform),
             "runtime_verified": False,
             "reason": "" if backend else "没有已安装的本地音频播放后端",
         }
@@ -125,6 +133,9 @@ class SystemRecorder:
         self.config, self.files = config, files
         self.platform = platform or sys.platform
 
+    def _candidates(self) -> list[str]:
+        return ["arecord", "ffmpeg"] if self.platform == "linux" else ["ffmpeg"]
+
     def status(self) -> dict[str, Any]:
         backend = ""
         reason = "缺少已安装的 arecord 或 ffmpeg 录音后端"
@@ -135,11 +146,17 @@ class SystemRecorder:
                 reason = "此平台需要显式配置 voice.input_device"
             else:
                 backend = "ffmpeg"
+        candidates = self._candidates()
+        missing = [] if backend else system_dependencies.missing_tools(candidates)
         return {
             "available": bool(backend),
             "backend": backend,
             "input_device": self.config.input_device,
             "permission_verified": False,
+            "missing_tools": missing,
+            "install_hint": None
+            if backend or not missing
+            else system_dependencies.install_hint(candidates, platform=self.platform),
             "reason": "" if backend else reason,
         }
 

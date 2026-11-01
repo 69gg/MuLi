@@ -390,3 +390,27 @@ async def test_invalid_notice_does_not_kill_the_collector(
     await emit(notifier, "有效消息")
     await until(lambda: notifier.status()["sent"] == 1)
     assert notifier.status()["dropped"] == 3 and len(runner.calls) == 1
+
+
+def test_capability_reports_missing_notify_send_and_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(notifications.sys, "platform", "linux")
+    monkeypatch.setattr(
+        notifications.shutil, "which", lambda name: "/usr/bin/pacman" if name == "pacman" else None
+    )
+    result = notification_capability()
+    assert result["available"] is False
+    assert result["missing_tools"] == ["notify-send"]
+    assert result["install_hint"]["command"].endswith("libnotify")
+
+
+def test_available_notification_capability_has_no_missing_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(notifications.sys, "platform", "linux")
+    monkeypatch.setattr(notifications.shutil, "which", lambda name: "/bin/" + name)
+    result = notification_capability()
+    assert result["available"] is True
+    assert result["missing_tools"] == []
+    assert result["install_hint"] is None

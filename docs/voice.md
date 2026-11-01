@@ -168,9 +168,9 @@
 
 除首行外，本表字段均在 `voice` 节。`auto` 只检查可见设备，不加载推理框架；显示 GPU 可见不代表桥接程序已经支持，程序仍须自行处理设备能力。
 
-Linux 录音优先使用 `arecord`，其次是 FFmpeg 的 PulseAudio；macOS 使用 FFmpeg 的 avfoundation，Windows 使用 FFmpeg 的 dshow。后两者需要填写实际音频设备。
+Linux 录音优先使用 `arecord`，其次是 FFmpeg 的 PulseAudio；macOS 使用 FFmpeg 的 avfoundation，Windows 使用 FFmpeg 的 dshow。后两者需要填写实际音频设备。缺少这些工具时，语音状态的 `recorder`/`playback` 会返回 `missing_tools` 与包管理器安装提示；主助手可在你请求下安装，无法完成时再让你手动执行。
 
-播放会查找系统可用工具：Linux 的 `pw-play`、`aplay` 或 `ffplay`，macOS 的 `afplay` 或 `ffplay`，Windows 的 `ffplay` 或 PowerShell WAV 播放。具体文件是否能播取决于格式与设备，检测到工具不等于已验证硬件。
+播放会查找系统可用工具：Linux 的 `pw-play`、`aplay` 或 `ffplay`，macOS 的 `afplay` 或 `ffplay`，Windows 的 `ffplay` 或 PowerShell WAV 播放。具体文件是否能播取决于格式与设备，检测到工具不等于已验证硬件。缺少播放后端时同样会给出安装提示。
 
 ## 声学桥接协议
 

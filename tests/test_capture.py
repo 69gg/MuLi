@@ -212,3 +212,167 @@ async def test_macos_recording_rejects_audio_device_before_process_start(
     with pytest.raises(ValueError, match="无声录屏"):
         await capture.record(1)
     assert not capture.files.root.exists()
+
+
+@pytest.mark.parametrize(
+    ("recording", "expected_missing", "expected_package"),
+    [
+        (True, ["wf-recorder"], "wf-recorder"),
+        (False, ["grim", "gnome-screenshot"], "grim"),
+    ],
+)
+def test_wayland_missing_tools_report_specific_reason_and_install_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recording: bool,
+    expected_missing: list[str],
+    expected_package: str,
+) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pacman", "timeout"} else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux")
+    status = capture.status()["recording" if recording else "screenshot"]
+    assert status["available"] is False
+    assert status["missing_tools"] == expected_missing
+    assert expected_package in status["install_hint"]["command"]
+    assert ("wf-recorder" if recording else "grim") in status["reason"]
+    if recording:
+        assert "wlr-screencopy" in status["reason"]
+
+
+def test_x11_missing_ffmpeg_reports_install_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: "/usr/bin/pacman" if name == "pacman" else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux")
+    status = capture.status()["recording"]
+    assert status["missing_tools"] == ["ffmpeg"]
+    assert "ffmpeg" in status["reason"]
+    assert status["install_hint"]["command"].endswith("ffmpeg")
+
+
+def test_no_graphical_session_reports_session_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: "/usr/bin/pacman" if name == "pacman" else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux")
+    status = capture.status()
+    assert status["available"] is False
+    assert "图形会话" in status["recording"]["reason"]
+    assert status["recording"]["install_hint"] is None
+
+
+def test_available_backend_has_no_install_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(capture_module.shutil, "which", lambda name: "/bin/" + name)
+    capture = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux")
+    status = capture.status()
+    assert status["screenshot"]["available"] is True
+    assert status["screenshot"]["missing_tools"] == []
+    assert status["screenshot"]["install_hint"] is None
+    assert status["recording"]["available"] is True
+    assert status["recording"]["missing_tools"] == []
+    assert status["recording"]["install_hint"] is None
+
+
+def test_explicit_backend_hint_targets_that_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pacman", "sudo"} else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True, backend="scrot"), tmp_path, platform="linux")
+    status = capture.status()["screenshot"]
+    assert status["missing_tools"] == ["scrot"]
+    assert "scrot" in status["install_hint"]["command"]
+
+
+def test_portal_backend_does_not_suggest_packages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pacman", "sudo"} else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True, backend="portal"), tmp_path, platform="linux")
+    status = capture.status()["screenshot"]
+    assert status["available"] is False
+    assert "Portal" in status["reason"]
+    assert status["missing_tools"] == []
+    assert status["install_hint"] is None
+
+
+def test_wayland_recording_missing_timeout_is_installable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"wf-recorder", "pacman", "sudo"} else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux")
+    status = capture.status()["recording"]
+    assert status["available"] is False
+    assert status["missing_tools"] == ["timeout"]
+    assert status["install_hint"]["command"].endswith("coreutils")
+
+
+def test_xwayland_candidates_do_not_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":1")
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pacman", "sudo"} else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True), tmp_path, platform="linux")
+    status = capture.status()["screenshot"]
+    assert status["missing_tools"] == ["grim", "gnome-screenshot", "scrot", "ffmpeg"]
+
+
+def test_inapplicable_explicit_backend_reports_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(
+        capture_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pacman", "sudo"} else None,
+    )
+    capture = Capture(CaptureSettings(enabled=True, backend="scrot"), tmp_path, platform="linux")
+    status = capture.status()["screenshot"]
+    assert "不适用" in status["reason"]
+    assert status["missing_tools"] == []
+    assert status["install_hint"] is None

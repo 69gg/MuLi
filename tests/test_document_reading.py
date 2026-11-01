@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 import zipfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -406,3 +407,47 @@ async def test_pdf_timeout_reaps_actual_owned_converter(pdf_host: Host, tmp_path
     assert marker.exists()
     with pytest.raises(ProcessLookupError):
         os.kill(int(marker.read_text()), 0)
+
+
+async def test_pdf_converter_missing_reports_install_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import muli.document_reading as document_reading
+    import muli.system_dependencies as dependencies
+
+    async def missing(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(document_reading, "run_process", missing)
+    monkeypatch.setattr(
+        dependencies.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pacman", "sudo"} else None,
+    )
+    with pytest.raises(EvidenceError) as caught:
+        await document_reading._read_pdf(b"%PDF-1.4", DocumentSettings(), time.monotonic() + 30)
+    assert caught.value.code == "document_converter_unavailable"
+    assert "poppler" in str(caught.value)
+    assert "sudo -n" in str(caught.value)
+
+
+async def test_pdf_converter_missing_without_sudo_reports_plain_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import muli.document_reading as document_reading
+    import muli.system_dependencies as dependencies
+
+    async def missing(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(document_reading, "run_process", missing)
+    monkeypatch.setattr(
+        dependencies.shutil,
+        "which",
+        lambda name: "/usr/bin/pacman" if name == "pacman" else None,
+    )
+    with pytest.raises(EvidenceError) as caught:
+        await document_reading._read_pdf(b"%PDF-1.4", DocumentSettings(), time.monotonic() + 30)
+    message = str(caught.value)
+    assert "pacman" in message and "poppler" in message
+    assert "sudo" not in message

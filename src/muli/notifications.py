@@ -9,6 +9,7 @@ import unicodedata
 from typing import Any, Protocol
 from xml.sax.saxutils import escape
 
+from muli import system_dependencies
 from muli.config import DesktopNotifications
 from muli.events import EventBus
 from muli.maintenance import Admission
@@ -24,11 +25,16 @@ def notification_capability() -> dict[str, Any]:
     """仅检测平台和已有 CLI，不调用通知服务，也不保证桌面会话可达。"""
     supported = sys.platform == "linux"
     command = shutil.which("notify-send") if supported else None
+    missing = [] if command or not supported else system_dependencies.missing_tools(["notify-send"])
     return {
         "backend": "notify-send",
         "supported": supported,
         "available": bool(command),
         "command": command,
+        "missing_tools": missing,
+        "install_hint": system_dependencies.install_hint(["notify-send"], platform=sys.platform)
+        if missing
+        else None,
         "reason": (
             "当前仅支持 Linux notify-send"
             if not supported

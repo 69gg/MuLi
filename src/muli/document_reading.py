@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from muli import system_dependencies
 from muli.attachment_io import read_verified_window
 from muli.attachments import Attachments, file_io
 from muli.document_settings import DocumentSettings, DocumentSettingsStore
@@ -164,10 +165,23 @@ async def _read_pdf(source: bytes, settings: DocumentSettings, deadline: float) 
             strict_output=True,
         )
     except FileNotFoundError as error:
-        raise EvidenceError(
-            "document_converter_unavailable",
-            "未找到 PDF 转换器，请用 document_configure 配置 pdf_command",
-        ) from error
+        hint = (
+            system_dependencies.install_hint(["pdftotext"])
+            if settings.pdf_command[0] == "pdftotext"
+            else None
+        )
+        message = "未找到 PDF 转换器，请用 document_configure 配置 pdf_command"
+        elevated = hint.get("elevated_command") if hint else None
+        command = hint.get("command") if hint else None
+        if elevated:
+            message += f"；可先尝试非交互提权安装：{elevated}"
+        elif command:
+            message += f"；可按当前系统包管理器安装：{command}"
+        elif hint and hint.get("manager") is None:
+            message += "；未检测到可用的系统包管理器，请手动安装 poppler 后重试"
+        elif hint:
+            message += "；该平台没有已知的 pdftotext 包名，请手动安装 poppler 后重试"
+        raise EvidenceError("document_converter_unavailable", message) from error
     except TimeoutError as error:
         raise EvidenceError("document_timeout", "PDF 转换已超过期限，进程已收尾") from error
     except UnicodeDecodeError as error:

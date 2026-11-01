@@ -23,6 +23,15 @@ export function capabilityLabel(status) {
   return status.enabled ? "已启用" : "状态未知";
 }
 
+/** Explain one unavailable capability and, when known, the package command to fix it. */
+export function dependencyHint(item) {
+  if (!item || item.available) return "";
+  const reason = item.reason ?? "";
+  const hint = item.install_hint ?? {};
+  if (!hint.command) return [reason, hint.note].filter(Boolean).join("；");
+  return reason ? `${reason}；可安装：${hint.command}` : `可安装：${hint.command}`;
+}
+
 export function managementLabel(value) {
   return ({ pending: "待应用", applying: "正在应用", completed: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", sent: "已发送", sending: "发送中", unknown: "结果未知", loaded: "已加载", degraded: "运行异常", disabled: "未启用", error: "加载失败" })[value] ?? value ?? "状态未知";
 }

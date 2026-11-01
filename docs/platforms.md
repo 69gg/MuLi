@@ -1,6 +1,6 @@
 # 平台服务与桌面采集
 
-MuLi 使用系统已有的服务管理器和采集工具，不自动安装系统组件或下载模型。平台状态表示当前可探测到的能力，不能代替系统授权和实际操作确认。
+MuLi 使用系统已有的服务管理器和采集工具，不静默安装系统组件或下载模型。缺少依赖时，能力状态会给出具体工具、包名与当前默认包管理器的安装命令；是否执行由当前权限模式决定。平台状态表示当前可探测到的能力，不能代替系统授权和实际操作确认。
 
 ## 当前用户服务
 
@@ -67,6 +67,25 @@ macOS 安装后默认 `RunAtLoad=false`、`KeepAlive=false`，不承诺失败后
 | Windows | `ffmpeg gdigrab` | `ffmpeg gdigrab` | 默认源为 `desktop`，可用 `capture.device` 指定 |
 
 `backend="auto"` 只从当前平台适用且已安装的工具中选择，不自动选择 Portal。显式指定后端后，不会失败再偷偷换用另一后端。macOS 的 `capture.device` 接受视频设备索引/名称或 `视频设备:none`；`0:0`、`default:default` 等选择音频输入的值会被拒绝。录屏不录麦克风或系统音频。
+
+### 安装缺失的系统工具
+
+上表中的工具是截图、录屏、PDF 文字层、桌面通知和本地语音的必需依赖，缺失时对应功能不可用。MuLi 不会静默安装：截图、录屏、桌面通知和本地语音的状态会返回 `missing_tools` 与 `install_hint`（当前平台的默认包管理器、包名、建议命令和提权命令）；PDF 文字层缺失时，读取错误会附带同样的安装命令。主助手可在你的请求下先按提示安装；安装系统包属于持久变更，遵守当前权限模式（ask/auto 需要你批准，yolo 直接执行），安装后重新检查能力。Linux 系统包在存在 `sudo` 且非 root 时先尝试非交互提权（`sudo -n`），需要密码或无权限时不会停在交互提示等待；子 agent 只报告缺失，不得自行安装或提权。提权失败、没有可用包管理器或没有已知包名、安装失败时，她会停止并告诉你缺什么、受影响的功能以及可手动执行的命令。
+
+常见包名因发行版而异，以状态里的 `install_hint` 为准：
+
+| 工具 | 用途 | Arch | Debian/Ubuntu | Fedora |
+| --- | --- | --- | --- | --- |
+| `wf-recorder` | Wayland 录屏 | `wf-recorder` | `wf-recorder` | `wf-recorder` |
+| `grim` | Wayland 截图 | `grim` | `grim` | `grim` |
+| `gnome-screenshot` / `scrot` | X11 截图 | 同名 | 同名 | 同名 |
+| `ffmpeg` | X11 录屏、录音、播放 | `ffmpeg` | `ffmpeg` | `ffmpeg` |
+| `pdftotext` | PDF 文字层 | `poppler` | `poppler-utils` | `poppler-utils` |
+| `notify-send` | 桌面通知 | `libnotify` | `libnotify-bin` | `libnotify` |
+| `arecord` | Linux 录音 | `alsa-utils` | `alsa-utils` | `alsa-utils` |
+| `timeout` | Wayland 录屏限时 | `coreutils` | `coreutils` | `coreutils` |
+
+Wayland 会话下录屏只使用 `wf-recorder`，不会回退到 `ffmpeg x11grab`；合成器还需支持 `wlr-screencopy`，GNOME 等环境可能不支持。此时能力状态会明确返回缺少的工具与原因，而不是笼统的「不可用」。
 
 ### Wayland Portal 截图
 

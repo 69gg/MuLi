@@ -690,3 +690,45 @@ async def test_voice_reply_can_synthesize_and_close_still_tracks_the_outer_opera
         listening.cancel()
         await asyncio.gather(listening, return_exceptions=True)
         await worker.aclose()
+
+
+def test_recorder_reports_missing_tools_and_install_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        voice_module.shutil, "which", lambda name: "/usr/bin/pacman" if name == "pacman" else None
+    )
+    recorder = SystemRecorder(
+        VoiceSettings(), LocalFiles(tmp_path / "voice", 1024, 4096), platform="linux"
+    )
+    status = recorder.status()
+    assert status["available"] is False
+    assert status["missing_tools"] == ["arecord", "ffmpeg"]
+    assert status["install_hint"]["packages"] == ["alsa-utils"]
+    assert status["install_hint"]["command"].endswith("alsa-utils")
+
+
+def test_player_reports_missing_tools_and_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        voice_module.shutil, "which", lambda name: "/usr/bin/pacman" if name == "pacman" else None
+    )
+    status = SystemPlayer(platform="linux").status()
+    assert status["available"] is False
+    assert status["missing_tools"] == ["pw-play", "aplay", "ffplay"]
+    assert status["install_hint"]["packages"] == ["pipewire-audio"]
+
+
+def test_available_voice_backends_have_no_missing_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(voice_module.shutil, "which", lambda name: "/bin/" + name)
+    recorder = SystemRecorder(
+        VoiceSettings(), LocalFiles(tmp_path / "voice", 1024, 4096), platform="linux"
+    )
+    assert recorder.status()["available"] is True
+    assert recorder.status()["missing_tools"] == []
+    player = SystemPlayer(platform="linux")
+    assert player.status()["available"] is True
+    assert player.status()["missing_tools"] == []

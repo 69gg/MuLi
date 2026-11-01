@@ -8,6 +8,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 from muli import __version__
 from muli.config import ConfigFile, default_config_path, default_data_dir
@@ -235,10 +236,22 @@ def main() -> None:
             parser.error(getattr(exc, "code", "plugin_operation_failed"))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "doctor":
+        from muli.capture import Capture
         from muli.notifications import notification_capability
         from muli.tools.computer import Computer
 
         config = ConfigFile(args.config)
+        capture = Capture(
+            config.settings.computer.capture,
+            args.data_dir,
+            python_path=config.settings.computer.python_path,
+        )
+
+        async def doctor_status() -> dict[str, Any]:
+            if config.settings.computer.enabled:
+                await capture.refresh_portal()
+            return await Computer(config.settings, capture=capture).status()
+
         print(
             json.dumps(
                 {
@@ -246,7 +259,7 @@ def main() -> None:
                     "configured": config.settings.models.main.configured,
                     "config": str(args.config),
                     "data_dir": str(args.data_dir),
-                    "computer": asyncio.run(Computer(config.settings).status()),
+                    "computer": asyncio.run(doctor_status()),
                     "notifications": {
                         **notification_capability(),
                         "enabled": config.settings.notifications.enabled,
