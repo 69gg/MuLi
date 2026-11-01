@@ -190,7 +190,7 @@ def _elevated_command(command: str, manager: str) -> str | None:
     if manager not in _ELEVATED_MANAGERS:
         return None
     geteuid = getattr(os, "geteuid", None)
-    if callable(geteuid) and geteuid() == 0:
+    if not callable(geteuid) or geteuid() == 0:
         return None
     if shutil.which("sudo") is None:
         return None
