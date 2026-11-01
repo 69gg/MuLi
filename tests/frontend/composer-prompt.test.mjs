@@ -11,10 +11,19 @@ test("append keeps the existing draft and returns the previous text", () => {
 });
 
 test("an already included prompt is not appended twice", () => {
-  const result = applyComposerPrompt("参考任务", { ...base, text: "先看参考任务再回答" });
+  const text = "先看材料\n\n参考任务";
+  const result = applyComposerPrompt("参考任务", { ...base, text });
   assert.equal(result.ok, true);
   assert.equal(result.unchanged, true);
-  assert.equal(result.text, "先看参考任务再回答");
+  assert.equal(result.text, text);
+});
+
+test("a prompt that only appears inside the draft is still appended", () => {
+  const text = "先看参考任务再回答";
+  const result = applyComposerPrompt("参考任务", { ...base, text });
+  assert.equal(result.ok, true);
+  assert.equal(result.unchanged, undefined);
+  assert.equal(result.text, `${text}\n\n参考任务`);
 });
 
 test("replace requires confirmation only when text would be lost", () => {

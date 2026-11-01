@@ -270,7 +270,11 @@ async def test_update_retains_uv_tool_requirements_and_reports_constraint_failur
             return {"exit_code": 0, "output": '{"version": "2.0.0"}'}
         return {"exit_code": exit_code, "output": ""}
 
-    executable = root / "muli-agent" / "bin" / "muli"
+    executable = (
+        root / "muli-agent" / "Scripts" / "muli.exe"
+        if sys.platform == "win32"
+        else root / "muli-agent" / "bin" / "muli"
+    )
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setattr("muli.updates.shutil.which", lambda _: "uv")

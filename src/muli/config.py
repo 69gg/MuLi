@@ -239,7 +239,9 @@ class ModelProfile(Section):
         if self.protocol == "anthropic" and self.thinking.get("type") == "enabled":
             budget = self.thinking.get("budget_tokens")
             if type(budget) is not int or budget < 1024:
-                raise ValueError("Anthropic thinking.type=enabled 必须填写至少 1024 的 budget_tokens")
+                raise ValueError(
+                    "Anthropic thinking.type=enabled 必须填写至少 1024 的 budget_tokens"
+                )
         return self
 
 
@@ -522,11 +524,20 @@ class ChannelSettings(Section):
     # 渠道移交给子 Agent 后的宿主连续摘要；默认关闭，验证后再启用。
     continuity_digest: bool = False
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
+    owner_warnings: list[str] = Field(default_factory=list, exclude=True)
 
     @model_validator(mode="after")
     def validate_private_owners(self) -> ChannelSettings:
+        self.owner_warnings = []
         for name in OWNER_CHANNELS:
             profile: ChannelProfile = getattr(self, name)
+            if name == "weixin" and profile.enabled and not profile.owner_ids:
+                # 旧配置可能先启用微信、后补主人绑定；安全停用而不是让整份配置失效。
+                profile.enabled = False
+                self.owner_warnings.append(
+                    "微信渠道因缺少主人 ID（owner_ids）已停用；请重新绑定主人后再启用"
+                )
+                continue
             validate_channel_owners(name, profile.owner_ids, enabled=profile.enabled)
         return self
 
@@ -815,7 +826,11 @@ class ConfigFile:
 
     def replace(self, settings: Settings) -> Settings:
         """Atomically publish a fully validated snapshot, including intentional empty values."""
+        # The safe-disable warning is derived during validation; revalidation
+        # sees the already disabled channel and would otherwise drop it.
+        owner_warnings = list(settings.channels.owner_warnings)
         settings = Settings.model_validate(settings.model_dump())
+        settings.channels.owner_warnings = owner_warnings
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=".muli-", dir=self.path.parent)
         try:

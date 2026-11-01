@@ -186,14 +186,16 @@ class Updates:
 
     async def _health(self, prefix: Path, version: str, environment: dict[str, str]) -> bool:
         executable = (
-            prefix / "Scripts" / "muli.exe"
-            if sys.platform == "win32"
-            else prefix / "bin" / "muli"
+            prefix / "Scripts" / "muli.exe" if sys.platform == "win32" else prefix / "bin" / "muli"
         )
         if not executable.is_file():
             return False
         checked = await run_process(
-            [str(executable), "--version"], timeout=30, limit=1000, env=environment
+            [str(executable), "--version"],
+            timeout=30,
+            limit=1000,
+            env=environment,
+            merge_stderr=False,
         )
         if checked["exit_code"] or str(checked["output"]).strip() != version:
             return False
@@ -207,6 +209,7 @@ class Updates:
             timeout=60,
             limit=24000,
             env=environment,
+            merge_stderr=False,
         )
         if doctor["exit_code"]:
             return False

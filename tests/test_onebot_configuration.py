@@ -39,6 +39,17 @@ def test_owner_is_required_for_activation_but_not_for_a_disabled_connection(tmp_
         reopened.update({"channels": {"onebot": {"enabled": True}}})
 
 
+def test_enabled_weixin_without_an_owner_is_disabled_with_a_warning(tmp_path: Path) -> None:
+    config = ConfigFile(tmp_path / "config.json")
+    config.update({"channels": {"weixin": {"enabled": True}}})
+    assert config.settings.channels.weixin.enabled is False
+    assert config.settings.channels.owner_warnings == [
+        "微信渠道因缺少主人 ID（owner_ids）已停用；请重新绑定主人后再启用"
+    ]
+    reopened = ConfigFile(config.path)
+    assert reopened.settings.channels.weixin.enabled is False
+
+
 def test_direct_channel_manager_configuration_has_the_same_owner_requirement() -> None:
     with pytest.raises(ChannelError, match="主人 QQ 号"):
         ChannelsConfig(onebot=ChannelProfile(enabled=True))

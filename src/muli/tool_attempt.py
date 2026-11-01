@@ -177,7 +177,8 @@ class ToolAttempts:
         attempt.result_status = "not_executed"
         attempt.committed_at = now()
         attempt.updated_at = attempt.committed_at
-        attempt.error_code = error_code
+        if error_code is not None:
+            attempt.error_code = error_code
         if result_message_id is not None:
             attempt.result_message_id = result_message_id
         if persist:

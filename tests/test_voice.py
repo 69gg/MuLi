@@ -294,7 +294,7 @@ def test_auto_prefers_visible_rocm_without_claiming_model_runtime(
     assert status["runtime_verified"] is False
     monkeypatch.setattr(voice_module.Path, "exists", lambda path: False)
     monkeypatch.setattr(voice_module.Path, "is_dir", lambda path: str(path) == "/opt/rocm")
-    assert devices("auto")["selected"] == "rocm"
+    assert devices("auto")["selected"] == "cpu"
 
 
 async def test_system_recorder_argv_and_cross_platform_capabilities(

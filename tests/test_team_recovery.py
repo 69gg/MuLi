@@ -51,9 +51,7 @@ async def test_restart_marks_started_teammate_recovering_and_resume_replans(
     recovering_session, recovering = agent_record(
         "recovering-agent", parent["id"], run_id="agent-run"
     )
-    blocked_session, blocked = agent_record(
-        "blocked-agent", parent["id"], run_id="blocked-run"
-    )
+    blocked_session, blocked = agent_record("blocked-agent", parent["id"], run_id="blocked-run")
     runtime.store.put_many(
         [
             ("session", recovering_session),
@@ -82,9 +80,7 @@ async def test_restart_marks_started_teammate_recovering_and_resume_replans(
     recovered = Runtime(
         config,
         data_dir,
-        client_factory=lambda _: FakeClient(
-            [ModelTurn(content="恢复后重新规划完成")], []
-        ),
+        client_factory=lambda _: FakeClient([ModelTurn(content="恢复后重新规划完成")], []),
     )
     try:
         agent = recovered.team.get("recovering-agent")

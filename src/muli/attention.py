@@ -284,11 +284,7 @@ class AttentionInbox:
                 )
             )
         objects.extend(("notification", item) for item in notifications or [])
-        if (
-            session_id is not None
-            and records
-            and records[0]["file_inbox_proof"] is not None
-        ):
+        if session_id is not None and records and records[0]["file_inbox_proof"] is not None:
             input_id = hashlib.sha256(
                 f"{session_id}\0system:attention\0{batch_id}".encode()
             ).hexdigest()
@@ -571,7 +567,7 @@ class AttentionInbox:
             else None
         )
         delivered = outcome.delivered if outcome is not None else set()
-        if delivered and len(delivered) == len(records):
+        if outcome is not None and delivered and len(delivered) == len(records):
             await self.runtime.commit_attention_host(
                 self._receipt_objects(
                     records,
@@ -584,10 +580,8 @@ class AttentionInbox:
             )
             self._waiting = "host"
             return True
-        if delivered:
-            delivered_records = [
-                record for record in records if record["receipt_id"] in delivered
-            ]
+        if outcome is not None and delivered:
+            delivered_records = [record for record in records if record["receipt_id"] in delivered]
             await self.runtime.commit_attention_host(
                 self._receipt_objects(
                     delivered_records,

@@ -14,7 +14,7 @@ from typing import Any
 
 from muli.config import Settings
 from muli.store import new_id, now
-from muli.tools import Tool, parameters, string
+from muli.tools import Recovery, Tool, parameters, string
 
 
 class Files:
@@ -244,7 +244,7 @@ class Files:
         raise ValueError("未知文件操作")
 
     def tools(self) -> list[Tool]:
-        definitions: list[tuple[str, str, dict[str, Any], tuple[str, ...], str, str]] = [
+        definitions: list[tuple[str, str, dict[str, Any], tuple[str, ...], str, Recovery]] = [
             ("list", "列出目录（最多300项）", {}, ("path",), "read", "replayable"),
             ("read", "读取有限大小的 UTF-8 文件", {}, ("path",), "read", "replayable"),
             ("info", "查看文件元数据", {}, ("path",), "read", "replayable"),

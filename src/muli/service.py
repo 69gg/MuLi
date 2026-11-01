@@ -179,7 +179,7 @@ class UserService:
                 "Label": LAUNCH_LABEL,
                 "ProgramArguments": arguments,
                 "RunAtLoad": enabled,
-                "KeepAlive": {"SuccessfulExit": False},
+                "KeepAlive": {"SuccessfulExit": False} if enabled else False,
                 "ThrottleInterval": 10,
                 "ProcessType": "Background",
                 "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
@@ -353,17 +353,16 @@ WantedBy=default.target
         if record is not None and not record.resolved:
             raise ValueError("托管事务尚未完成，不能卸载用户服务")
         if self.platform == "linux":
-            await run_process(
-                ["systemctl", "--user", "disable", "--now", UNIT], timeout=10, limit=4000
-            )
+            await self._run(["systemctl", "--user", "disable", UNIT])
             self.path.unlink(missing_ok=True)
-            await run_process(["systemctl", "--user", "daemon-reload"], timeout=10, limit=4000)
+            await self._run(["systemctl", "--user", "daemon-reload"])
+            await self._run(["systemctl", "--user", "--no-block", "stop", UNIT])
         elif self.platform == "darwin":
             target = f"{self._launch_domain}/{LAUNCH_LABEL}"
+            self.path.unlink(missing_ok=True)
             loaded = await run_process(["launchctl", "print", target], timeout=5, limit=1000)
             if loaded["exit_code"] == 0:
-                await run_process(["launchctl", "bootout", target], timeout=10, limit=4000)
-            self.path.unlink(missing_ok=True)
+                await self._run(["launchctl", "bootout", target])
         else:
             await run_process(
                 ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], timeout=10, limit=4000

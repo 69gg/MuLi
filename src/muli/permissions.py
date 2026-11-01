@@ -83,9 +83,7 @@ class Permissions:
         timeout: int = 600,
         *,
         boot_epoch: str | None = None,
-        review_with_source: Callable[
-            [str, dict[str, Any], str], Awaitable[tuple[bool, str, str]]
-        ]
+        review_with_source: Callable[[str, dict[str, Any], str], Awaitable[tuple[bool, str, str]]]
         | None = None,
     ) -> None:
         self.store, self.bus, self.review, self.timeout = store, bus, review, timeout

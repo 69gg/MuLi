@@ -34,7 +34,10 @@ def test_launch_agent_literal_arguments_and_opt_in_autostart(tmp_path: Path) -> 
     payload = plistlib.loads(service.render().encode())
     assert payload["Label"] == "muli.agent"
     assert payload["RunAtLoad"] is False
-    assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert payload["KeepAlive"] is False
+    enabled = plistlib.loads(service.render(enabled=True).encode())
+    assert enabled["RunAtLoad"] is True
+    assert enabled["KeepAlive"] == {"SuccessfulExit": False}
     assert payload["ThrottleInterval"] == 10
     assert payload["ProgramArguments"][-5:] == [
         "--config",
@@ -281,8 +284,9 @@ async def test_uninstall_requires_confirmation_and_preserves_data(
     assert not service.path.exists()
     assert str(service.data_dir) in result["preserved"]
     assert str(service.config_path) in result["preserved"]
-    assert calls[0] == ["systemctl", "--user", "disable", "--now", "muli.service"]
-    assert calls[-1] == ["systemctl", "--user", "daemon-reload"]
+    assert calls[0] == ["systemctl", "--user", "disable", "muli.service"]
+    assert calls[-2] == ["systemctl", "--user", "daemon-reload"]
+    assert calls[-1] == ["systemctl", "--user", "--no-block", "stop", "muli.service"]
 
 
 async def test_launchd_uninstall_boots_out_and_removes_plist(

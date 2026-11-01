@@ -307,9 +307,7 @@ async def test_managed_installation_refuses_in_place_uv_upgrade(
     runtime = runtime_at(tmp_path)
     forbid_installation(monkeypatch)
     try:
-        updates = Updates(
-            runtime.config, runtime.store, runtime.bus, managed=lambda: True
-        )
+        updates = Updates(runtime.config, runtime.store, runtime.bus, managed=lambda: True)
         with pytest.raises(ValueError, match="managed_switch_required"):
             await updates.apply("2.0.0")
     finally:

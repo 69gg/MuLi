@@ -112,7 +112,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const close = node("button", "dialog-close", actions); close.dataset.action = "close-dialog"; node("button", "dialog-submit", actions);
   const other = node("div", "other-view"); const shell = node("div", "app-shell"); shell.className = "app-shell";
   node("div", "auth-gate"); node("input", "login-password");
-  for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll"]) node("div", id);
+  for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll", "composer-draft-state", "composer-draft-status", "composer-draft-recheck", "composer-draft-discard", "composer-prompt-undo"]) node("div", id);
   const heading = node("div", "other-heading", other); heading.className = "view-heading"; node("h2", "view-title", heading);
   const requests = [], windowEvents = {}, streams = new Map();
   const context = {

@@ -45,7 +45,6 @@ class HostChannelManager(Protocol):
         route: Mapping[str, Any] | None = None,
         automatic: bool = False,
         attention_routing: dict[str, Any] | None = None,
-        **kwargs: Any,
     ) -> dict[str, Any]: ...
 
 
@@ -90,21 +89,23 @@ def host_template(record: Mapping[str, Any]) -> HostNoticeTemplate | None:
         )
     if kind == "management":
         detail = _detail(record)
+        action = detail.get("action") if detail is not None else None
         if (
             detail is None
             or detail.get("status") != "completed"
-            or detail.get("action") not in _MANAGEMENT_ACTIONS
+            or not isinstance(action, str)
+            or action not in _MANAGEMENT_ACTIONS
         ):
             return None
         return HostNoticeTemplate(
             "management",
             "管理操作已完成",
-            f"管理操作 {detail['action']} 已完成。请打开沐璃工作台查看结果与回执。",
+            f"管理操作 {action} 已完成。请打开沐璃工作台查看结果与回执。",
         )
     if kind == "system_log":
         detail = _detail(record)
         code = detail.get("code") if detail is not None else None
-        if code not in HOST_LOG_CODES:
+        if not isinstance(code, str) or code not in HOST_LOG_CODES:
             return None
         return HostNoticeTemplate(
             "system_log",
@@ -134,7 +135,7 @@ class HostNoticeDelivery:
 
     @property
     def mode(self) -> str:
-        return self.runtime.config.settings.attention.host_delivery
+        return str(self.runtime.config.settings.attention.host_delivery)
 
     @staticmethod
     def _fallback(reason: str, template: HostNoticeTemplate) -> dict[str, Any]:
@@ -146,7 +147,9 @@ class HostNoticeDelivery:
             }
         }
 
-    def _notification(self, record: Mapping[str, Any], template: HostNoticeTemplate) -> dict[str, Any]:
+    def _notification(
+        self, record: Mapping[str, Any], template: HostNoticeTemplate
+    ) -> dict[str, Any]:
         receipt_id = record["receipt_id"]
         return {
             "id": f"host-notice:{receipt_id}",

@@ -39,8 +39,18 @@ pytestmark = pytest.mark.skipif(
 async def wait_team_state(
     runtime: Runtime, target: str, predicate: Callable[[dict[str, Any]], bool]
 ) -> dict[str, Any]:
-    async with asyncio.timeout(5), runtime.bus.changed:
-        await runtime.bus.changed.wait_for(lambda: predicate(runtime.team.get(target)))
+    try:
+        async with asyncio.timeout(5), runtime.bus.changed:
+            await runtime.bus.changed.wait_for(lambda: predicate(runtime.team.get(target)))
+    except TimeoutError:
+        agent = runtime.team.get(target)
+        task = runtime.tasks.get(target)
+        raise TimeoutError(
+            f"agent {target} never matched: status={agent.get('status')} "
+            f"generation={agent.get('generation')} task={task!r} "
+            f"done={task.done() if task else None} run_ids={runtime.run_ids.get(target)} "
+            f"active={target in runtime.team._active}"
+        ) from None
     return runtime.team.get(target)
 
 
@@ -612,14 +622,17 @@ async def test_only_a_complete_accepted_registration_pair_can_activate(
         runtime = state.runtime
         put_many = runtime.store.put_many
         completed = runtime._tool_completed
+        failed_once = False
 
         def persisted(items: list[tuple[str, dict[str, Any]]]) -> None:
-            if any(
+            nonlocal failed_once
+            if not failed_once and any(
                 kind == "message"
                 and item.get("role") == "tool"
                 and item.get("tool_call_id") == "wait-register"
                 for kind, item in items
             ):
+                failed_once = True
                 raise ValueError("injected registration-pair persistence failure")
             put_many(items)
 

@@ -195,5 +195,6 @@ def pack_context(
             "最新用户输入、完整任务说明、系统提示、当前轮原生协议数据或需完整保留的工具结果"
             "超过上下文字符预算；"
             "已完成操作仍保留在会话中，请拆分任务或提高上限"
+            f"（当前 {context_size(packed)} 字符，预算 {max_chars}）"
         )
     return packed

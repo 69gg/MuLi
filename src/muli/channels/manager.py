@@ -53,9 +53,7 @@ def continuity_reference(value: Mapping[str, Any] | None) -> dict[str, str] | No
         return None
     keys = ("id", "main_id", "agent_id", "run_id")
     if set(value) != set(keys) or any(
-        not isinstance(value.get(key), str)
-        or not value[key]
-        or len(value[key]) > 256
+        not isinstance(value.get(key), str) or not value[key] or len(value[key]) > 256
         for key in keys
     ):
         raise ChannelError("渠道连续摘要引用无效")

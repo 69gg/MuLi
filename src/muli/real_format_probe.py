@@ -81,12 +81,11 @@ def probe_format(path: Path, *, limits: FormatReadLimits | None = None) -> RealF
                     "FROM runtime_state WHERE name IN ('store_instance_v1','main_session')"
                 ).fetchall()
             )
-            store_instance, main_session = (
-                values.get("store_instance_v1"),
-                values.get("main_session"),
-            )
-            if not isinstance(store_instance, str) or not isinstance(main_session, str):
+            raw_store = values.get("store_instance_v1")
+            raw_session = values.get("main_session")
+            if not isinstance(raw_store, str) or not isinstance(raw_session, str):
                 raise FormatProbeError("format_probe_store_changed")
+            store_instance, main_session = raw_store, raw_session
             state = None
         row = db.execute("PRAGMA schema_version").fetchone()
         schema_version = int(row[0]) if row is not None else 0

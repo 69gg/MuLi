@@ -229,10 +229,7 @@ async def test_long_first_user_compacts_replays_and_survives_real_reopen(
             and active["summary"] in message.content
             and (
                 kind == "teammate"
-                or (
-                    "宿主固定约束" in message.content
-                    and "不能部署 production" in message.content
-                )
+                or ("宿主固定约束" in message.content and "不能部署 production" in message.content)
             )
             for message in replay
         )

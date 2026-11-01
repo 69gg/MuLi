@@ -80,6 +80,7 @@ async def test_owner_collects_saved_asr_only_after_real_phone_transcription(
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", offline_http)
     runtime, seen = make_runtime(tmp_path, [])
     runtime.config.update(attachment_settings(tmp_path, auto_extract=False))
+    runtime.config.update({"limits": {"max_context_chars": 36000, "max_output_chars": 10600}})
     await runtime.reconfigure()
     main_id = runtime.main_session()["id"]
     phase = "transcribe"
@@ -185,8 +186,22 @@ async def test_owner_collects_saved_asr_only_after_real_phone_transcription(
         return Main([], seen) if profile.model == "main" else FakeClient([], [])
 
     async def finish() -> dict[str, Any]:
-        await eventually(runtime, lambda: bool(completed(runtime, replies[phase])))
-        assert await asyncio.wait_for(runtime.wait(runs[phase]), 3) == replies[phase]
+        try:
+            await eventually(runtime, lambda: bool(completed(runtime, replies[phase])))
+            assert await asyncio.wait_for(runtime.wait(runs[phase]), 3) == replies[phase]
+        except Exception as exc:
+            failed = runtime.store.get("run", runs.get(phase, "")) or {}
+            raise AssertionError(
+                json.dumps(
+                    {
+                        "phase": phase,
+                        "status": failed.get("status"),
+                        "error": str(failed.get("error") or exc)[:180],
+                        "exception_type": type(exc).__name__,
+                    },
+                    ensure_ascii=False,
+                )
+            ) from exc
         run = runtime.store.get("run", runs[phase])
         assert run is not None and run["status"] == "completed"
         matches = completed(runtime, replies[phase])
@@ -313,6 +328,7 @@ async def test_saved_asr_chunks_and_relations_survive_phone_to_web_reopen_and_fo
     runtime.config.update(
         {
             "memory": {"context_max_chars": 0},
+            "limits": {"max_context_chars": 36000, "max_output_chars": 10600},
             "compaction": {"mode": "auto", "trigger_ratio": 0.25, "target_ratio": 0.2},
             "models": {
                 "memory_extractor": {

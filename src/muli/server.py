@@ -307,9 +307,7 @@ def _create_app(
         webpage_reader=local_services.memory_webpage,
     )
     channel_application = ChannelApplication(runtime, attachments)
-    attention.host_delivery = HostNoticeDelivery(
-        runtime, lambda: channel_application.manager
-    )
+    attention.host_delivery = HostNoticeDelivery(runtime, lambda: channel_application.manager)
     personal_io = PersonalIO(runtime, local_services, attachments)
     from muli.integrations.manager import IntegrationManager
 
@@ -1089,11 +1087,7 @@ def _create_app(
             "topic_reminders": runtime.topic_reminders.status(),
             "quota": {
                 **runtime.quota.status(),
-                "agents_running": sum(
-                    1
-                    for agent in runtime.team.list(active_only=True)
-                    if agent.get("status") == "running"
-                ),
+                "agents_running": runtime.team.count("running"),
                 "workflow_running": len(runtime.workflows.active_run_ids),
             },
             "limits": settings.limits.model_dump(),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -29,9 +28,7 @@ def _config(
 
 
 def test_legacy_aliases_load_without_rewriting_unknown_fields() -> None:
-    profile = ModelProfile.model_validate(
-        {"budget": 2048, "budget_send_or_not": False}
-    )
+    profile = ModelProfile.model_validate({"budget": 2048, "budget_send_or_not": False})
     assert profile.thinking_budget == 2048
     assert profile.send_thinking_budget is False
     assert profile.thinking_param is None

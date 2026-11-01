@@ -13,8 +13,8 @@ from typing import Any, Literal
 
 VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 HEADING = re.compile(r"^## \[(\d+\.\d+\.\d+)\](?:\s*—\s*(\d{4}-\d{2}-\d{2}))?", re.M)
-STATUSES = {"released", "untagged", "unpublished"}
-ReleaseStatus = Literal["released", "untagged", "unpublished"]
+STATUSES = {"released", "tagged", "untagged", "unpublished"}
+ReleaseStatus = Literal["released", "tagged", "untagged", "unpublished"]
 
 
 class ReleaseHistoryError(ValueError):
@@ -47,9 +47,19 @@ def changelog_versions(text: str) -> list[str]:
     if len(set(versions)) != len(versions):
         raise ReleaseHistoryError("CHANGELOG 版本重复")
     parsed = [version_parts(version) for version in versions]
-    if any(left <= right for left, right in zip(parsed, parsed[1:])):
+    if any(left <= right for left, right in zip(parsed, parsed[1:], strict=False)):
         raise ReleaseHistoryError("CHANGELOG 版本必须严格降序")
     return versions
+
+
+def changelog_sections(text: str) -> dict[str, str]:
+    """Return the description under each version heading."""
+    matches = list(HEADING.finditer(text))
+    sections: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        sections[match.group(1)] = text[match.end() : end].strip()
+    return sections
 
 
 def parse_history(value: object) -> tuple[list[ReleaseEntry], str]:
@@ -75,15 +85,15 @@ def parse_history(value: object) -> tuple[list[ReleaseEntry], str]:
             raise ReleaseHistoryError(f"{version} 状态必须是 released/untagged/unpublished")
         if type(legacy) is not bool:
             raise ReleaseHistoryError(f"{version} legacy 必须是布尔值")
-        if status == "released":
+        if status in {"released", "tagged"}:
             if tag != f"v{version}":
-                raise ReleaseHistoryError(f"{version} 已发布条目必须带匹配 tag")
+                raise ReleaseHistoryError(f"{version} 已打 tag 条目必须带匹配 tag")
         elif tag is not None:
             raise ReleaseHistoryError(f"{version} 未发布条目不能带 tag")
         entries.append(ReleaseEntry(version, status, tag, legacy))
     if len({entry.version for entry in entries}) != len(entries):
         raise ReleaseHistoryError("发布历史版本重复")
-    if any(left.parts <= right.parts for left, right in zip(entries, entries[1:])):
+    if any(left.parts <= right.parts for left, right in zip(entries, entries[1:], strict=False)):
         raise ReleaseHistoryError("发布历史版本必须严格降序")
     return entries, baseline
 
@@ -92,18 +102,18 @@ def _require_minor_continuity(entries: list[ReleaseEntry], baseline: tuple[int, 
     scoped = [entry.parts for entry in entries if entry.parts >= baseline]
     if not scoped:
         raise ReleaseHistoryError("发布历史没有 baseline 之后的版本")
-    major = scoped[0][0]
-    minors = {minor for entry_major, minor, _patch in scoped if entry_major == major}
-    lowest = min(minors)
-    for minor in range(lowest, scoped[0][1] + 1):
-        if minor not in minors:
-            raise ReleaseHistoryError(f"{major}.{minor}.0 未在发布历史中标记")
+    minors: dict[int, set[int]] = {}
+    for major, minor, _patch in scoped:
+        minors.setdefault(major, set()).add(minor)
+    for major, present in minors.items():
+        for minor in range(min(present), max(present) + 1):
+            if minor not in present:
+                raise ReleaseHistoryError(f"{major}.{minor}.0 未在发布历史中标记")
 
 
-def validate(
-    changelog: str, history: object, *, tag: str | None = None
-) -> dict[str, Any]:
+def validate(changelog: str, history: object, *, tag: str | None = None) -> dict[str, Any]:
     versions = changelog_versions(changelog)
+    sections = changelog_sections(changelog)
     entries, baseline_text = parse_history(history)
     listed = {entry.version for entry in entries}
     missing = [version for version in versions if version not in listed]
@@ -113,6 +123,8 @@ def validate(
     for entry in entries:
         if entry.version not in changelog_set and entry.status == "released":
             raise ReleaseHistoryError(f"{entry.version} 已发布但缺少 CHANGELOG 条目")
+        if entry.status == "released" and not sections.get(entry.version):
+            raise ReleaseHistoryError(f"{entry.version} 已发布但 CHANGELOG 说明为空")
     _require_minor_continuity(entries, version_parts(baseline_text))
     released = [entry for entry in entries if entry.status == "released"]
     if not released:
@@ -123,6 +135,7 @@ def validate(
     return {
         "releases": len(entries),
         "released": len(released),
+        "tagged": sum(entry.status == "tagged" for entry in entries),
         "untagged": sum(entry.status == "untagged" for entry in entries),
         "unpublished": sum(entry.status == "unpublished" for entry in entries),
         "highest": highest.version,

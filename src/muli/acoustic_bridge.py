@@ -102,13 +102,16 @@ def check_config(path: Path, *, requested_device: str = "auto") -> dict[str, Any
 
 
 def rocm_visible() -> bool:
-    """Host-level ROCm visibility only; never imports HIP or loads a model."""
-    return (Path("/dev/kfd").exists() and Path("/dev/dri").exists()) or Path("/opt/rocm").is_dir()
+    """Device-level ROCm visibility only; never imports HIP or loads a model."""
+    return Path("/dev/kfd").exists() and Path("/dev/dri").exists()
 
 
-def inspect_config(
-    config: BridgeConfig, *, requested_device: str = "auto"
-) -> dict[str, Any]:
+# sherpa-onnx v1.13.8 的 Python 接口只声明 cpu/cuda/coreml，未声明 ROCm。
+# 在无法确认引擎会加载 ROCm execution provider 前，内置适配器不把 rocm 传给引擎。
+ROCM_UNSUPPORTED = "sherpa-onnx v1.13.8 官方构建不支持 ROCm；未将 rocm 传给引擎"
+
+
+def inspect_config(config: BridgeConfig, *, requested_device: str = "auto") -> dict[str, Any]:
     """Share the same metadata preflight with the owner configuration workflow."""
     if requested_device not in ("auto", "cpu", "cuda", "rocm"):
         raise ValueError("未知声学请求设备")
@@ -124,18 +127,13 @@ def inspect_config(
     if installed and requested_device != "auto" and requested_device != provider:
         reason_code = "provider_mismatch"
         reason = "声学 provider 与请求设备不一致"
-    elif installed and provider == "rocm" and not rocm_visible():
+    elif installed and provider == "rocm":
         if requested_device == "auto":
             provider, fallback = "cpu", True
-            reason = "未检测到 ROCm 设备，auto 回退 CPU；需要 ROCm-enabled sherpa-onnx"
+            reason = ROCM_UNSUPPORTED + "，auto 回退 CPU"
         else:
             reason_code = "provider_unavailable"
-            reason = (
-                "未检测到 ROCm 设备（/dev/kfd、/dev/dri、/opt/rocm）；"
-                "需要 ROCm-enabled sherpa-onnx，不会回退 CPU"
-            )
-    elif installed and provider == "rocm":
-        reason = "需要 ROCm-enabled sherpa-onnx 构建；预检不加载模型，未验证 GPU"
+            reason = ROCM_UNSUPPORTED
     return {
         "available": installed and not reason_code,
         "configured_provider": config.provider,
@@ -209,11 +207,9 @@ def detect(config: BridgeConfig, request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("未知声学请求设备")
     if requested != "auto" and requested != config.provider:
         raise ValueError("请求的设备与声学配置 provider 不一致")
-    if requested == "rocm" and not rocm_visible():
-        raise ValueError("未检测到 ROCm 设备；需要 ROCm-enabled sherpa-onnx，不会回退 CPU")
-    provider = config.provider
-    if requested == "auto" and provider == "rocm" and not rocm_visible():
-        provider = "cpu"
+    if requested == "rocm":
+        raise ValueError(ROCM_UNSUPPORTED)
+    provider = "cpu" if config.provider == "rocm" else config.provider
     sample_rate, threshold = request.get("sample_rate"), request.get("threshold")
     if type(sample_rate) is not int or not 8000 <= sample_rate <= 48000:
         raise ValueError("声学采样率无效")

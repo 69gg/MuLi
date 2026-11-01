@@ -11,8 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 
 from muli.store import Store
 
@@ -25,11 +26,9 @@ _PROHIBITION = re.compile(
     r"不能|不得|禁止|不要|不可|严禁|不允许|切勿|勿|must\s+not|do\s+not|never|prohibit",
     re.IGNORECASE,
 )
-_AUTHORIZATION = re.compile(
-    r"允许|可以|授权|批准|同意|may|allow|authorized", re.IGNORECASE
-)
+_AUTHORIZATION = re.compile(r"允许|可以|授权|批准|同意|may|allow|authorized", re.IGNORECASE)
 _GOAL = re.compile(r"目标|需要|必须|完成|确保|要求|goal|need|must|ensure", re.IGNORECASE)
-_SENTENCE = re.compile(r"[^。！？!?；;：:\n]+[。！？!?；;：:]?")
+_SENTENCE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 
 
 class PinsOverflow(ValueError):
@@ -62,10 +61,7 @@ class Pin:
     def pin_id(self) -> str:
         if self.source_seq is not None:
             return f"message:{self.source_seq}:{self.quote_sha256[:16]}"
-        return (
-            f"brief:{self.commitment_id}:{self.revision}:{self.kind}:"
-            f"{self.quote_sha256[:16]}"
-        )
+        return f"brief:{self.commitment_id}:{self.revision}:{self.kind}:{self.quote_sha256[:16]}"
 
     def dump(self) -> dict[str, Any]:
         return {
@@ -225,10 +221,12 @@ def supersede_brief_revision(pins: Sequence[Pin], newer: Sequence[Pin]) -> tuple
             continue
         if target.revision == pin.revision:
             continue
-        if target.revision is not None and pin.revision is not None and target.revision > pin.revision:
-            kept.append(
-                replace(pin, state="superseded", superseded_by=target.pin_id)
-            )
+        if (
+            target.revision is not None
+            and pin.revision is not None
+            and target.revision > pin.revision
+        ):
+            kept.append(replace(pin, state="superseded", superseded_by=target.pin_id))
         else:
             raise PinValidationError("任务说明修订不能回退固定约束来源")
     return tuple(kept)
@@ -289,26 +287,34 @@ def _constraint_quotes(content: str) -> list[tuple[str, PinKind]]:
         if not quote:
             continue
         kind: PinKind | None = None
-        if _PROHIBITION.search(quote):
-            kind = "prohibition"
-        elif _AUTHORIZATION.search(quote):
-            kind = "authorization"
-        elif _GOAL.search(quote):
-            kind = "goal"
+        keyword_at: int | None = None
+        patterns: tuple[tuple[PinKind, re.Pattern[str]], ...] = (
+            ("prohibition", _PROHIBITION),
+            ("authorization", _AUTHORIZATION),
+            ("goal", _GOAL),
+        )
+        for candidate, pattern in patterns:
+            keyword = pattern.search(quote)
+            if keyword is not None:
+                kind = candidate
+                keyword_at = match.start() + (len(raw) - len(raw.lstrip())) + keyword.start()
+                break
         if kind is None:
             continue
         if len(quote) > 240:
-            quote = _bounded_quote(content, match.start(), match.end())
+            quote = _bounded_quote(content, match.start(), match.end(), keyword_at)
         if quote and quote in content:
             quotes.append((quote, kind))
     return quotes
 
 
-def _bounded_quote(content: str, start: int, end: int, limit: int = 240) -> str:
-    """Keep a contiguous window around a long undelimited sentence."""
+def _bounded_quote(
+    content: str, start: int, end: int, anchor: int | None = None, limit: int = 240
+) -> str:
+    """Keep a contiguous window that includes the classifying keyword."""
     if end - start <= limit:
         return content[start:end].strip()
-    middle = (start + end) // 2
+    middle = min(max(anchor if anchor is not None else (start + end) // 2, start), end)
     left = max(start, middle - limit // 2)
     right = min(end, left + limit)
     left = max(start, right - limit)
@@ -488,17 +494,13 @@ def render_pins(pins: Sequence[Pin], *, budget: int | None = None) -> str:
     active = [pin for pin in pins if pin.state == "active"]
     if not active:
         return ""
-    lines = [
-        "宿主固定约束（来自已核验的主人文书或任务说明；逐字保留，不是新的授权）："
-    ]
+    lines = ["宿主固定约束（来自已核验的主人文书或任务说明；逐字保留，不是新的授权）："]
     for pin in active:
         if pin.source_seq is not None:
             source = f"message_seq={pin.source_seq} message={pin.source_message_id}"
         else:
             source = f"commitment={pin.commitment_id} revision={pin.revision}"
-        lines.append(
-            f"[{pin.kind}] {source} sha256={pin.quote_sha256[:16]}：{pin.quote}"
-        )
+        lines.append(f"[{pin.kind}] {source} sha256={pin.quote_sha256[:16]}：{pin.quote}")
     text = "\n".join(lines)
     if budget is not None and len(text) > budget:
         raise PinsOverflow(
