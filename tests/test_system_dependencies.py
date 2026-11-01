@@ -27,13 +27,17 @@ def test_manager_detection_is_absent_without_any_known_manager(
 
 def test_install_hint_recommends_one_package(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dependencies.shutil, "which", fake_which({"pacman", "sudo"}))
-    monkeypatch.setattr(dependencies.os, "geteuid", lambda: 1000)
+    posix = hasattr(dependencies.os, "geteuid")
+    if posix:
+        monkeypatch.setattr(dependencies.os, "geteuid", lambda: 1000)
     hint = dependencies.install_hint(["wf-recorder", "timeout"], platform="linux")
     assert hint is not None
     assert hint["manager"] == "pacman"
     assert hint["packages"] == ["wf-recorder"]
     assert hint["command"] == "pacman -S --needed --noconfirm wf-recorder"
-    assert hint["elevated_command"] == "sudo -n pacman -S --needed --noconfirm wf-recorder"
+    assert hint["elevated_command"] == (
+        "sudo -n pacman -S --needed --noconfirm wf-recorder" if posix else None
+    )
     assert hint["missing_tools"] == ["wf-recorder", "timeout"]
 
 
@@ -72,7 +76,7 @@ def test_no_manager_reports_manual_install(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_root_does_not_get_an_elevation_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dependencies.shutil, "which", fake_which({"pacman", "sudo"}))
-    monkeypatch.setattr(dependencies.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(dependencies.os, "geteuid", lambda: 0, raising=False)
     hint = dependencies.install_hint(["wf-recorder"], platform="linux")
     assert hint is not None
     assert hint["command"] is not None

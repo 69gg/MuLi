@@ -433,8 +433,12 @@ async def test_pdf_converter_missing_reports_install_command(
     with pytest.raises(EvidenceError) as caught:
         await document_reading._read_pdf(b"%PDF-1.4", DocumentSettings(), time.monotonic() + 30)
     assert caught.value.code == "document_converter_unavailable"
-    assert "poppler" in str(caught.value)
-    assert "sudo -n" in str(caught.value)
+    message = str(caught.value)
+    assert "poppler" in message
+    if hasattr(os, "geteuid"):
+        assert "sudo -n" in message
+    else:
+        assert "pacman" in message
 
 
 async def test_pdf_converter_missing_without_sudo_reports_plain_command(
