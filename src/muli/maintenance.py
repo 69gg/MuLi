@@ -467,6 +467,17 @@ class Maintenance:
         challenge = record.rollback_challenge if role == "base" else record.challenge
         assert challenge is not None
         if isinstance(record, TransactionRecordV2):
+            from muli.real_format_probe import FormatProbeError, probe_format
+
+            try:
+                probe_format(permit.journal.database).verify(
+                    path=permit.journal.database,
+                    store_instance=self._core[0],
+                    main_session=self._core[1],
+                    state=record.observed_format,
+                )
+            except FormatProbeError as exc:
+                raise MaintenanceError("maintenance_format_probe_failed", exc.code) from None
             binding = record.binding(role or "base")
             return HealthProofV2(
                 generation=generation,

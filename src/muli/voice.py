@@ -105,7 +105,8 @@ def devices(requested: str) -> dict[str, Any]:
     """Probe device visibility only; do not import ML libraries or allocate a model."""
     visible = {
         "cpu": True,
-        "rocm": Path("/dev/kfd").exists() and Path("/dev/dri").exists(),
+        "rocm": (Path("/dev/kfd").exists() and Path("/dev/dri").exists())
+        or Path("/opt/rocm").is_dir(),
         "cuda": Path("/dev/nvidiactl").exists() or shutil.which("nvidia-smi") is not None,
     }
     selected = requested
@@ -233,7 +234,9 @@ class CommandDetector:
             from muli.acoustic_bridge import check_config
 
             try:
-                report = check_config(Path(self.command[4]))
+                report = check_config(
+                    Path(self.command[4]), requested_device=self.config.device
+                )
                 operation = "wake" if self.operation == "wake" else "speaker"
                 available = report["available"] and report[f"{operation}_configured"]
                 if (
@@ -241,7 +244,7 @@ class CommandDetector:
                     and self.config.device != report["configured_provider"]
                 ):
                     available = False
-                    report["reason"] = "声学 provider 与请求设备不一致；此适配器不支持 ROCm"
+                    report["reason"] = "声学 provider 与请求设备不一致"
                 if (
                     self.operation == "wake"
                     and report["wake_sample_rate"] != self.config.sample_rate

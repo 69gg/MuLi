@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol
 MAX_ROUTE_CHARS = 4096
 MAX_ORIGIN_ID_CHARS = 512
 PRIVATE_OWNER_CHANNELS: tuple[str, ...] = ("onebot", "telegram", "qq")
+OWNER_CHANNELS: tuple[str, ...] = (*PRIVATE_OWNER_CHANNELS, "weixin")
 _ROUTE_FIELDS = ("name", "account_id", "target", "sender_id", "kind", "reply_to")
 _ROUTE_FIELD_CHARS = 200
 
@@ -60,7 +61,7 @@ def validate_onebot_owners(owner_ids: Collection[str], *, enabled: bool) -> None
 def validate_channel_owners(name: str, owner_ids: Collection[str], *, enabled: bool) -> None:
     if name == "onebot":
         validate_onebot_owners(owner_ids, enabled=enabled)
-    elif name in PRIVATE_OWNER_CHANNELS:
+    elif name in OWNER_CHANNELS:
         if enabled and not owner_ids:
             raise ValueError(f"启用 {name} 必须填写已绑定主人 ID（owner_ids）")
         if any(

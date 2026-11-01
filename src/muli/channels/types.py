@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from muli.reply_origin import PRIVATE_OWNER_CHANNELS, validate_channel_owners
+from muli.reply_origin import OWNER_CHANNELS, validate_channel_owners
 
 ChannelName = Literal["onebot", "telegram", "qq", "weixin"]
 MAX_OUTGOING_TEXT_CHARS = 100_000
@@ -163,7 +163,7 @@ class ChannelsConfig:
 
     def __post_init__(self) -> None:
         try:
-            for name in PRIVATE_OWNER_CHANNELS:
+            for name in OWNER_CHANNELS:
                 profile = self.profile(name)
                 validate_channel_owners(name, profile.owner_ids, enabled=profile.enabled)
         except ValueError as error:

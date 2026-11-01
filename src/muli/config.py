@@ -15,7 +15,7 @@ from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from muli.reply_origin import (
-    PRIVATE_OWNER_CHANNELS,
+    OWNER_CHANNELS,
     authorize_route,
     channel_account,
     validate_channel_owners,
@@ -153,6 +153,15 @@ def _replace_mcp(current: dict[str, Any], replacement: dict[str, Any]) -> dict[s
     return _validate_mcp(result)
 
 
+def _nested_key_exists(value: dict[str, Any], parts: list[str]) -> bool:
+    current: Any = value
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
 class ModelProfile(Section):
     protocol: Literal["openai_chat", "openai_responses", "anthropic"] = "openai_chat"
     model: str = ""
@@ -170,6 +179,9 @@ class ModelProfile(Section):
     reasoning: dict[str, Any] = Field(default_factory=dict)
     thinking: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    thinking_param: str | None = None
+    thinking_budget: int | None = Field(default=None, strict=True, ge=1)
+    send_thinking_budget: bool = Field(default=True, strict=True)
     vision: bool = False
     extra_body: dict[str, Any] = Field(default_factory=dict)
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -181,10 +193,53 @@ class ModelProfile(Section):
     def configured(self) -> bool:
         return bool(self.model and self.base_url)
 
+    @field_validator("thinking_param")
+    @classmethod
+    def valid_thinking_param(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value.strip()
+            or len(value) > 200
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or any(not part for part in value.split("."))
+        ):
+            raise ValueError("thinking_param 必须是非空、无控制字符的点分字段名")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def thinking_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        for alias, field in (
+            ("budget", "thinking_budget"),
+            ("budget_send_or_not", "send_thinking_budget"),
+        ):
+            if alias not in result:
+                continue
+            if field in result:
+                raise ValueError(f"{alias} 不能与 {field} 同时填写")
+            result[field] = result.pop(alias)
+        return result
+
     @model_validator(mode="after")
     def required_output_limit(self) -> ModelProfile:
         if self.configured and self.protocol == "anthropic" and self.max_output_tokens is None:
             raise ValueError("Anthropic Messages 必须填写正整数 max_output_tokens")
+        if self.thinking_param is not None:
+            first = self.thinking_param.split(".", 1)[0]
+            if first in self.extra_body or _nested_key_exists(
+                self.extra_body, self.thinking_param.split(".")
+            ):
+                raise ValueError("thinking_param 不能覆盖 extra_body 中已有的字段")
+            if self.thinking or self.reasoning:
+                raise ValueError("thinking_param 不能与 thinking 或 reasoning 同时启用")
+        if self.protocol == "anthropic" and self.thinking.get("type") == "enabled":
+            budget = self.thinking.get("budget_tokens")
+            if type(budget) is not int or budget < 1024:
+                raise ValueError("Anthropic thinking.type=enabled 必须填写至少 1024 的 budget_tokens")
         return self
 
 
@@ -237,6 +292,7 @@ class Persona(Section):
     name: str = Field(default="沐璃", min_length=1, max_length=120)
     introduction: str = Field(default="", max_length=4000)
     prompt: str = Field(default="", max_length=64000)
+    prompt_scope: Literal["full", "base", "persona"] = "full"
     append: str = Field(default="", max_length=32000)
 
 
@@ -285,6 +341,10 @@ class PluginSettings(Section):
     disabled: list[str] = Field(default_factory=list)
     max_source_bytes: int = Field(default=256 * 1024, ge=1024)
     hook_timeout: float = Field(default=10, gt=0, le=120)
+    hot_reload: bool = False
+    watch_interval_seconds: float = Field(default=2.0, gt=0, le=60, allow_inf_nan=False)
+    debounce_seconds: float = Field(default=0.5, ge=0, le=10, allow_inf_nan=False)
+    drain_timeout: float = Field(default=10.0, gt=0, le=120, allow_inf_nan=False)
 
 
 class UpdateSettings(Section):
@@ -297,6 +357,8 @@ class UpdateSettings(Section):
 
 class Limits(Section):
     max_parallel_agents: int = Field(default=2, ge=1)
+    review_parallel: int = Field(default=1, ge=1, le=16)
+    safety_max_agents: int = Field(default=8, ge=1)
     max_pending_runs: int = Field(default=8, ge=1)
     max_tool_steps: int = Field(default=16, ge=1, le=100)
     max_run_seconds: int = Field(default=600, ge=10, le=7200)
@@ -457,11 +519,13 @@ class ChannelSettings(Section):
     max_pending_deliveries: int = Field(default=64, ge=1)
     max_attempts: int = Field(default=3, ge=1)
     retry_backoff_seconds: float = Field(default=5, ge=0)
+    # 渠道移交给子 Agent 后的宿主连续摘要；默认关闭，验证后再启用。
+    continuity_digest: bool = False
     proactive: ProactiveSettings = Field(default_factory=ProactiveSettings)
 
     @model_validator(mode="after")
     def validate_private_owners(self) -> ChannelSettings:
-        for name in PRIVATE_OWNER_CHANNELS:
+        for name in OWNER_CHANNELS:
             profile: ChannelProfile = getattr(self, name)
             validate_channel_owners(name, profile.owner_ids, enabled=profile.enabled)
         return self
@@ -522,6 +586,8 @@ class AttentionSettings(Section):
     batch_size: int = Field(default=8, ge=1, le=128, strict=True)
     max_chars: int = Field(default=4000, ge=512, le=32000, strict=True)
     coalesce_seconds: float = Field(default=0.25, ge=0, le=60, allow_inf_nan=False)
+    # shadow 只审计候选，保持既有 AI 复核；enforce 才由宿主固定模板直发。
+    host_delivery: Literal["off", "shadow", "enforce"] = "shadow"
 
     @field_validator("events")
     @classmethod

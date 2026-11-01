@@ -276,7 +276,12 @@ async def test_native_images_and_extension_hooks_survive_reconfigure(tmp_path: P
         image = ImageInput.from_bytes(b"small-inline-image", "image/png")
         runtime.store.add_message(session["id"], "user", "图片", images=[asdict(image)])
         await runtime.reconfigure()
-        assert "extension" in runtime.tools and runtime.context_hooks == [hook]
+        assert "extension" in runtime.tools
+        assert [
+            item
+            for item in runtime.context_hooks
+            if item is not runtime.channel_continuity.context_hook
+        ] == [hook]
         messages = await runtime.prepare_context(session["id"], runtime._history(session["id"]))
         assert messages[-2].images == [image]
         assert messages[-1].content == "扩展资料"

@@ -42,7 +42,7 @@ class SpeakerModel(BaseModel):
 
 class BridgeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    provider: Literal["cpu", "cuda"] = "cpu"
+    provider: Literal["cpu", "cuda", "rocm"] = "cpu"
     wake: WakeModel | None = None
     speaker: SpeakerModel | None = None
     max_audio_bytes: int = Field(default=2_000_000, ge=1024, le=16_000_000)
@@ -96,26 +96,58 @@ def _paths(config: BridgeConfig, operation: str) -> dict[str, str]:
     return {"model": str(config.model_path(config.speaker.model))}
 
 
-def check_config(path: Path) -> dict[str, Any]:
+def check_config(path: Path, *, requested_device: str = "auto") -> dict[str, Any]:
     """Metadata-only inspection; does not import native code or inspect model weights."""
-    return inspect_config(load_config(path))
+    return inspect_config(load_config(path), requested_device=requested_device)
 
 
-def inspect_config(config: BridgeConfig) -> dict[str, Any]:
+def rocm_visible() -> bool:
+    """Host-level ROCm visibility only; never imports HIP or loads a model."""
+    return (Path("/dev/kfd").exists() and Path("/dev/dri").exists()) or Path("/opt/rocm").is_dir()
+
+
+def inspect_config(
+    config: BridgeConfig, *, requested_device: str = "auto"
+) -> dict[str, Any]:
     """Share the same metadata preflight with the owner configuration workflow."""
+    if requested_device not in ("auto", "cpu", "cuda", "rocm"):
+        raise ValueError("未知声学请求设备")
     if config.wake is not None:
         _paths(config, "wake")
     if config.speaker is not None:
         _paths(config, "verify")
     installed = importlib.util.find_spec("sherpa_onnx") is not None
+    provider = config.provider
+    fallback = False
+    reason_code = ""
+    reason = "" if installed else "当前解释器未安装 sherpa-onnx；不会自动安装"
+    if installed and requested_device != "auto" and requested_device != provider:
+        reason_code = "provider_mismatch"
+        reason = "声学 provider 与请求设备不一致"
+    elif installed and provider == "rocm" and not rocm_visible():
+        if requested_device == "auto":
+            provider, fallback = "cpu", True
+            reason = "未检测到 ROCm 设备，auto 回退 CPU；需要 ROCm-enabled sherpa-onnx"
+        else:
+            reason_code = "provider_unavailable"
+            reason = (
+                "未检测到 ROCm 设备（/dev/kfd、/dev/dri、/opt/rocm）；"
+                "需要 ROCm-enabled sherpa-onnx，不会回退 CPU"
+            )
+    elif installed and provider == "rocm":
+        reason = "需要 ROCm-enabled sherpa-onnx 构建；预检不加载模型，未验证 GPU"
     return {
-        "available": installed,
+        "available": installed and not reason_code,
         "configured_provider": config.provider,
+        "effective_provider": provider,
+        "provider_fallback": fallback,
+        "provider_unavailable": reason_code == "provider_unavailable",
         "wake_configured": config.wake is not None,
         "wake_sample_rate": config.wake.sample_rate if config.wake else None,
         "speaker_configured": config.speaker is not None,
         "runtime_verified": False,
-        "reason": "" if installed else "当前解释器未安装 sherpa-onnx；不会自动安装",
+        "reason_code": reason_code,
+        "reason": reason,
     }
 
 
@@ -173,10 +205,15 @@ def detect(config: BridgeConfig, request: dict[str, Any]) -> dict[str, Any]:
     if operation not in ("wake", "verify"):
         raise ValueError("未知声学操作")
     requested = request.get("requested_device", "auto")
-    if requested not in ("auto", "cpu", "cuda"):
-        raise ValueError("此声学适配器不支持请求的设备（包括 ROCm）")
+    if requested not in ("auto", "cpu", "cuda", "rocm"):
+        raise ValueError("未知声学请求设备")
     if requested != "auto" and requested != config.provider:
         raise ValueError("请求的设备与声学配置 provider 不一致")
+    if requested == "rocm" and not rocm_visible():
+        raise ValueError("未检测到 ROCm 设备；需要 ROCm-enabled sherpa-onnx，不会回退 CPU")
+    provider = config.provider
+    if requested == "auto" and provider == "rocm" and not rocm_visible():
+        provider = "cpu"
     sample_rate, threshold = request.get("sample_rate"), request.get("threshold")
     if type(sample_rate) is not int or not 8000 <= sample_rate <= 48000:
         raise ValueError("声学采样率无效")
@@ -208,7 +245,7 @@ def detect(config: BridgeConfig, request: dict[str, Any]) -> dict[str, Any]:
         engine = importlib.import_module("sherpa_onnx")
     except ImportError as exc:
         raise ValueError("当前解释器未安装可用的 sherpa-onnx；不会自动安装") from exc
-    result: dict[str, Any] = {"configured_provider": config.provider}
+    result: dict[str, Any] = {"configured_provider": config.provider, "provider": provider}
     if operation == "wake":
         assert config.wake is not None
         options = config.wake.model_dump(exclude=set(paths))
@@ -216,7 +253,7 @@ def detect(config: BridgeConfig, request: dict[str, Any]) -> dict[str, Any]:
             **paths,
             **options,
             num_threads=1,
-            provider=config.provider,
+            provider=provider,
             keywords_threshold=threshold,
         )
         stream = detector.create_stream()
@@ -233,7 +270,7 @@ def detect(config: BridgeConfig, request: dict[str, Any]) -> dict[str, Any]:
         result.update(detected=detected, score_kind="decision", threshold=threshold)
     else:
         model = engine.SpeakerEmbeddingExtractorConfig(
-            **paths, num_threads=1, debug=False, provider=config.provider
+            **paths, num_threads=1, debug=False, provider=provider
         )
         if not model.validate():
             raise ValueError("声纹模型配置无效")

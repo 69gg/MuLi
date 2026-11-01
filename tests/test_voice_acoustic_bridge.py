@@ -81,8 +81,9 @@ async def test_builtin_preflight_rejects_before_process(
         "reason": "missing dependency" if reason == "dependency" else "",
     }
 
-    def check(path: Path) -> dict[str, Any]:
+    def check(path: Path, *, requested_device: str = "auto") -> dict[str, Any]:
         assert path == config_path
+        assert requested_device == ("rocm" if reason == "device" else "auto")
         if reason == "missing":
             raise FileNotFoundError(path)
         return report

@@ -34,7 +34,8 @@ def test_launch_agent_literal_arguments_and_opt_in_autostart(tmp_path: Path) -> 
     payload = plistlib.loads(service.render().encode())
     assert payload["Label"] == "muli.agent"
     assert payload["RunAtLoad"] is False
-    assert payload["KeepAlive"] is False
+    assert payload["KeepAlive"] == {"SuccessfulExit": False}
+    assert payload["ThrottleInterval"] == 10
     assert payload["ProgramArguments"][-5:] == [
         "--config",
         str(service.config_path.resolve()),
@@ -257,3 +258,75 @@ async def test_windows_restart_helper_deletes_itself_on_failure(
         await restart_module.restart(helper)
     assert calls[-1] == ["schtasks", "/Delete", "/TN", helper, "/F"]
     assert all("/Run" not in arguments for arguments in calls)
+
+
+async def test_uninstall_requires_confirmation_and_preserves_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    async def run(arguments: list[str], **kwargs: Any) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"exit_code": 0, "output": ""}
+
+    monkeypatch.setattr(service_module, "run_process", run)
+    monkeypatch.setattr(service_module.shutil, "which", lambda name: "/bin/" + name)
+    service = UserService(tmp_path / "config.json", tmp_path / "data", tmp_path, platform="linux")
+    service.path.write_text(service.render(), encoding="utf-8")
+    with pytest.raises(ValueError, match="confirm"):
+        await service.action("uninstall")
+    assert service.path.exists()
+    result = await service.action("uninstall", confirm=True)
+    assert result["action"] == "uninstall"
+    assert not service.path.exists()
+    assert str(service.data_dir) in result["preserved"]
+    assert str(service.config_path) in result["preserved"]
+    assert calls[0] == ["systemctl", "--user", "disable", "--now", "muli.service"]
+    assert calls[-1] == ["systemctl", "--user", "daemon-reload"]
+
+
+async def test_launchd_uninstall_boots_out_and_removes_plist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    async def run(arguments: list[str], **kwargs: Any) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"exit_code": 0, "output": ""}
+
+    monkeypatch.setattr(service_module, "run_process", run)
+    monkeypatch.setattr(service_module.shutil, "which", lambda name: "/bin/" + name)
+    monkeypatch.setattr(service_module.os, "getuid", lambda: 501, raising=False)
+    service = UserService(tmp_path / "config", tmp_path / "data", tmp_path, platform="darwin")
+    service.path.write_text(service.render(), encoding="utf-8")
+    await service.action("uninstall", confirm=True)
+    assert calls == [
+        ["launchctl", "print", "gui/501/muli.agent"],
+        ["launchctl", "bootout", "gui/501/muli.agent"],
+    ]
+    assert not service.path.exists()
+
+
+async def test_windows_uninstall_deletes_task_and_preserves_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    async def run(arguments: list[str], **kwargs: Any) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"exit_code": 0, "output": ""}
+
+    monkeypatch.setattr(service_module, "run_process", run)
+    monkeypatch.setattr(service_module.shutil, "which", lambda name: "/bin/" + name)
+    (tmp_path / "pythonw.exe").touch()
+    service = UserService(
+        tmp_path / "config",
+        tmp_path / "data",
+        tmp_path,
+        platform="win32",
+        executable=str(tmp_path / "python.exe"),
+    )
+    service.path.write_text(service.render(), encoding="utf-8")
+    await service.action("uninstall", confirm=True)
+    assert calls == [["schtasks", "/Delete", "/TN", "MuLi", "/F"]]
+    assert not service.path.exists()

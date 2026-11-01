@@ -10,6 +10,7 @@ import { VoiceSetup, voiceSetupLabel } from "../../../web/voice-setup.mjs";
 import { captureTeamView, createTeamPager, restoreTeamView } from "../../../web/team.mjs";
 import { createTaskControl, taskControlView } from "../../../web/task-control.mjs";
 import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../../web/composer-draft.mjs";
+import { applyComposerPrompt, REPLACE_CONFIRMATION } from "../../../web/composer-prompt.mjs";
 
 // Run the actual application functions and registered dialog close handler.
 // No browser library, server, model, account or real database is involved.
@@ -132,6 +133,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     // These cases exercise the real composer and submit handlers, without browser layout.
     node("div", "composer-draft-state"); node("span", "composer-draft-status");
     node("button", "composer-draft-recheck").dataset.action = "retry-composer-attachments";
+    node("button", "composer-prompt-undo").dataset.action = "undo-composer-prompt";
     node("button", "composer-draft-discard").dataset.action = "discard-composer-draft";
     document.querySelector("#conversation-scroll").clientHeight = 0;
   }
@@ -152,6 +154,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     createTeamPager: team ? createTeamPager : () => ({}), captureTeamView: team ? captureTeamView : () => null,
     createTaskControl, taskControlView,
     composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
+    applyComposerPrompt, REPLACE_CONFIRMATION,
     uploadFile: upload, transcribeAttachment: transcribe,
     VoiceInput: class { constructor(callbacks) { voiceCallbacks = callbacks; if (createVoiceInput) return createVoiceInput(callbacks); } cancel() {} status() { return { phase: "idle" }; } support() { return null; } }, VoiceSetup, voiceSetupLabel, CHANNELS, capabilityLabel, managementRecoveryView, updateLabel, settingsExtras, SETTINGS_GROUPS,
     restoreTeamView: team ? restoreTeamView : () => {},
@@ -170,7 +173,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
       owner.sessions.start(); owner.notifications.start(); owner.approvals.start(); return owner;
     };
     activateConnection();
-    globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, captureVoiceDraft, renderComposerAttachments,
+    globalThis.ui = { state, renderMemories, renderUploads, showMemoryEvidence, editMemory, openDialog, showLogin, invalidateMemoryEvidence, loadMemorySource, loadMemoryHistory, switchView, handleAction, startGlobalEvents, searchMemories, loadMemoryWatches, captureDraft, captureVoiceDraft, renderComposerAttachments, renderConfigurationOverview,
       activateConnection, connect,
       get capabilityCatalogSlot() { return capabilityCatalog; },
       watchPending(id) { return memoryWatchPending.has(id); },

@@ -78,7 +78,12 @@ class SelfManagement:
         )
         self.directory = runtime.data_dir / "management"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.updates = Updates(runtime.config, runtime.store, runtime.bus)
+        self.updates = Updates(
+            runtime.config,
+            runtime.store,
+            runtime.bus,
+            managed=lambda: isinstance(runtime.maintenance.permit, ManagedBootPermit),
+        )
         self.update_policy = CandidatePolicyStore(runtime.store)
         self.online_policy = OnlinePolicyStore(runtime.store)
         self.recovery = RecoveryHost(runtime, service, bound_address=bound_address)
@@ -196,6 +201,11 @@ class SelfManagement:
         if action != "configure" and changes:
             raise ValueError("只有配置操作接受配置变更")
         if action == "update":
+            if isinstance(self.runtime.maintenance.permit, ManagedBootPermit):
+                raise ValueError(
+                    "托管安装的跨版本更新必须使用 self_update 的 expected_policy，"
+                    "经 stage_update 转为候选 switch"
+                )
             self.updates.require_in_place_update()
         if apply_mode not in {"in_process", "restart_transaction"}:
             raise ValueError("未知配置应用方式")
@@ -213,8 +223,6 @@ class SelfManagement:
         ):
             apply_mode = "restart_transaction"
         if apply_mode == "restart_transaction":
-            if action == "update":
-                raise ValueError("跨版本恢复更新尚未支持")
             self.recovery.require_listener(candidate_settings)
             if action in {"adopt", "switch"} or isinstance(
                 self.runtime.maintenance.permit, ManagedBootPermit
@@ -710,6 +718,19 @@ class SelfManagement:
             target = self._target_settings(item)
             item["status"] = "applying"
             self.runtime.store.put("management", item)
+            if item["action"] == "update":
+                item["result"] = await self.updates.apply(item["version"])
+                if item["result"].get("health") == "failed":
+                    raise ValueError(
+                        "更新后健康检查失败，"
+                        f"rollback={item['result'].get('rollback', 'unavailable')}"
+                    )
+                if item.get("apply_mode") == "restart_transaction":
+                    item = await self.recovery.prepare(item, target)
+                    return
+                await self.service.action("restart")
+                item["status"] = "completed"
+                return
             if item["action"] == "restart" or item.get("apply_mode") == "restart_transaction":
                 item = await self.recovery.prepare(item, target)
                 return

@@ -75,11 +75,14 @@ def windows_task_xml(arguments: list[str], *, enabled: bool = False, logon: bool
     ET.SubElement(principal, "LogonType").text = "InteractiveToken"
     ET.SubElement(principal, "RunLevel").text = "LeastPrivilege"
     settings = ET.SubElement(root, "Settings")
+    ET.SubElement(settings, "AllowStartOnDemand").text = "true"
+    restart = ET.SubElement(settings, "RestartOnFailure")
+    ET.SubElement(restart, "Interval").text = "PT1M"
+    ET.SubElement(restart, "Count").text = "3"
     for key, value in {
         "MultipleInstancesPolicy": "IgnoreNew",
         "DisallowStartIfOnBatteries": "false",
         "StopIfGoingOnBatteries": "false",
-        "AllowStartOnDemand": "true",
         "Enabled": "true",
         "Hidden": "true",
         "ExecutionTimeLimit": "PT0S",
@@ -176,7 +179,8 @@ class UserService:
                 "Label": LAUNCH_LABEL,
                 "ProgramArguments": arguments,
                 "RunAtLoad": enabled,
-                "KeepAlive": False,
+                "KeepAlive": {"SuccessfulExit": False},
+                "ThrottleInterval": 10,
                 "ProcessType": "Background",
                 "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
             }
@@ -309,12 +313,24 @@ WantedBy=default.target
         if response["exit_code"]:
             raise ValueError(f"{self.backend} 用户服务操作失败，请检查用户会话日志")
 
-    async def action(self, action: str) -> dict[str, Any]:
+    async def action(self, action: str, *, confirm: bool = False) -> dict[str, Any]:
         capability = self.capability()
         if not capability["supported"]:
             raise ValueError(str(capability["reason"]))
-        if action not in {"install", "start", "stop", "restart", "enable", "disable"}:
+        if action not in {
+            "install",
+            "start",
+            "stop",
+            "restart",
+            "enable",
+            "disable",
+            "uninstall",
+        }:
             raise ValueError("未知服务操作")
+        if action == "uninstall":
+            if not confirm:
+                raise ValueError("卸载用户服务需要 confirm=true；配置、数据和日志会保留")
+            return await self._uninstall()
         if action != "install" and not self.path.exists():
             raise ValueError("请先安装用户服务")
         if self.platform == "linux":
@@ -328,6 +344,41 @@ WantedBy=default.target
         else:
             await self._task_action(action)
         return {"accepted": True, "action": action, "backend": self.backend}
+
+    async def _uninstall(self) -> dict[str, Any]:
+        from muli.managed_cli import managed_record
+
+        root = self.data_dir.absolute() / "management" / "transaction-v1"
+        record = managed_record(root)
+        if record is not None and not record.resolved:
+            raise ValueError("托管事务尚未完成，不能卸载用户服务")
+        if self.platform == "linux":
+            await run_process(
+                ["systemctl", "--user", "disable", "--now", UNIT], timeout=10, limit=4000
+            )
+            self.path.unlink(missing_ok=True)
+            await run_process(["systemctl", "--user", "daemon-reload"], timeout=10, limit=4000)
+        elif self.platform == "darwin":
+            target = f"{self._launch_domain}/{LAUNCH_LABEL}"
+            loaded = await run_process(["launchctl", "print", target], timeout=5, limit=1000)
+            if loaded["exit_code"] == 0:
+                await run_process(["launchctl", "bootout", target], timeout=10, limit=4000)
+            self.path.unlink(missing_ok=True)
+        else:
+            await run_process(
+                ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], timeout=10, limit=4000
+            )
+            self.path.unlink(missing_ok=True)
+        return {
+            "accepted": True,
+            "action": "uninstall",
+            "backend": self.backend,
+            "preserved": [
+                str(self.config_path),
+                str(self.data_dir),
+                str(self.log_path.parent),
+            ],
+        }
 
     async def _launch_action(self, action: str) -> None:
         target = f"{self._launch_domain}/{LAUNCH_LABEL}"

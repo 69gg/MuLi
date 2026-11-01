@@ -74,7 +74,7 @@ async def test_marked_store_rejects_every_unverified_target_before_installation(
         assert runtime.store.format_state is not None
         updates = Updates(runtime.config, runtime.store, runtime.bus)
         assert updates.capability() == {
-            "mode": "in_place",
+            "mode": "managed_switch",
             "format_eligible": False,
             "code": "verified_candidate_required",
         }
@@ -122,7 +122,7 @@ async def test_management_api_keeps_update_diagnostics_readable_after_marker_dam
             response = await client.get("/api/management")
             assert response.status_code == 200
             assert response.json()["update_capability"] == {
-                "mode": "in_place",
+                "mode": "managed_switch",
                 "format_eligible": False,
                 "code": "format_verification_failed",
             }
@@ -299,3 +299,18 @@ def test_unmarked_no_migration_store_still_requires_original_installation_check(
         }
     finally:
         opened.close()
+
+
+async def test_managed_installation_refuses_in_place_uv_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = runtime_at(tmp_path)
+    forbid_installation(monkeypatch)
+    try:
+        updates = Updates(
+            runtime.config, runtime.store, runtime.bus, managed=lambda: True
+        )
+        with pytest.raises(ValueError, match="managed_switch_required"):
+            await updates.apply("2.0.0")
+    finally:
+        await runtime.close()

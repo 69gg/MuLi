@@ -116,9 +116,9 @@ async def test_custom_persona_keeps_its_complete_override_and_append(tmp_path: P
             }
         )
         custom = prompt(runtime, main_id)
-        assert custom.startswith(override)
+        assert custom.startswith("安全边界（宿主固定")
         assert custom.count(override) == custom.count(append) == 1
-        assert _GUIDANCE not in custom
+        assert _GUIDANCE in custom
         assert "你是沐璃，生活在用户电脑中的数字生命与本地私人助手" not in custom
         for value in ("指定名字", "指定称呼", "指定形象资料"):
             assert value in custom
@@ -126,7 +126,7 @@ async def test_custom_persona_keeps_its_complete_override_and_append(tmp_path: P
         restored = prompt(runtime, main_id)
         default_guidance(restored, present=True)
         assert restored.count(append) == 1
-        assert _GUIDANCE not in custom and custom.count(append) == 1
+        assert _GUIDANCE in custom and custom.count(append) == 1
 
 
 @pytest.mark.parametrize("kind", ["team", "workflow", "main"])

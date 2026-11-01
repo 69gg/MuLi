@@ -11,6 +11,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from muli.events import EventBus
+from muli.quota import Lease, QuotaBroker
 from muli.reply_origin import ReplyOrigin
 from muli.store import Store, new_id, now
 from muli.task_control import TaskSnapshot
@@ -60,6 +61,7 @@ class WorkflowEngine:
         timeout: float = 600,
         max_output_chars: int = 24000,
         scope_admission: ScopeAdmission | None = None,
+        quota: QuotaBroker | None = None,
     ) -> None:
         if (
             max_parallel < 1
@@ -78,6 +80,7 @@ class WorkflowEngine:
         self._cancellations: dict[str, asyncio.Task[JsonObject]] = {}
         self._closed = False
         self.scope_admission = scope_admission
+        self.quota = quota
         self.on_idle: Callable[[], None] | None = None
         self._recover()
 
@@ -121,18 +124,36 @@ class WorkflowEngine:
                 run = self.store.get("workflow_run", identifier)
                 if run is None or run.get("status") not in _UNFINISHED:
                     continue
+                needs_owner = False
+                for node in run.get("nodes", {}).values():
+                    status = node.get("status")
+                    if status == "running" or (
+                        status in _UNFINISHED and node.get("started_at") is not None
+                    ):
+                        needs_owner = True
+                        node.update(
+                            status="interrupted",
+                            error="服务重启，节点已开始但未完成；需核查实际状态",
+                            finished_at=now(),
+                        )
+                        self._session_state(node["session_id"], "idle")
+                    elif status in {"pending", "queued"}:
+                        # Never started: keep it pending for an explicit resume.
+                        node.update(status="pending")
+                        node.pop("error", None)
+                        node.pop("finished_at", None)
+                        self._session_state(node["session_id"], "idle")
                 run.update(
                     status="interrupted",
-                    error="服务重启，工作流已中断",
+                    error=(
+                        "服务重启；有节点已开始，需主人核查后再继续"
+                        if needs_owner
+                        else "服务重启；未开始的节点保留 pending，等待显式继续"
+                    ),
+                    recovery_decision="needs_owner" if needs_owner else "resume_safe",
                     finished_at=now(),
                     updated_at=now(),
                 )
-                for node in run.get("nodes", {}).values():
-                    if node.get("status") in _UNFINISHED:
-                        node.update(
-                            status="interrupted", error="服务重启，节点未完成", finished_at=now()
-                        )
-                        self._session_state(node["session_id"], "idle")
                 self.store.put("workflow_run", run)
 
     def _validate(self, steps: Sequence[JsonObject]) -> list[JsonObject]:
@@ -601,8 +622,20 @@ class WorkflowEngine:
         await self._publish(run)
 
     async def _drive(self, run: JsonObject) -> None:
+        lease: Lease | None = None
         try:
             async with asyncio.timeout(self.timeout):
+                if self.quota is not None:
+                    run["quota_state"] = "waiting_quota"
+                    await self._publish(run)
+                    lease = await self.quota.acquire(
+                        (
+                            str(run.get("parent_session_id") or ""),
+                            str(run.get("commitment_id") or ""),
+                            run["id"],
+                        )
+                    )
+                    run.pop("quota_state", None)
                 run.update(status="running", started_at=now())
                 await self._publish(run)
                 await self._schedule(run)
@@ -615,6 +648,9 @@ class WorkflowEngine:
             await self._finish(run, "timed_out", "工作流达到总时间上限")
         except Exception as exc:
             await self._finish(run, "failed", f"工作流执行失败：{type(exc).__name__}")
+        finally:
+            if lease is not None and self.quota is not None:
+                self.quota.release(lease)
 
     def _cancellation(self, run_id: str) -> asyncio.Task[JsonObject]:
         if operation := self._cancellations.get(run_id):
