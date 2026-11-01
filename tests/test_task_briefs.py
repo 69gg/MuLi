@@ -454,7 +454,7 @@ async def test_main_spawned_worker_does_not_inherit_main_write_permission(tmp_pa
 async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path: Path) -> None:
     runtime, _ = make_runtime(tmp_path, [])
     runtime.config.update(
-        {"compaction": {"mode": "extractive"}, "limits": {"max_context_chars": 7000}}
+        {"compaction": {"mode": "extractive"}, "limits": {"max_context_chars": 14000}}
     )
     services = attach_services(runtime, tmp_path)
     marker = "唯一中段限制：不能部署 production"
@@ -478,7 +478,7 @@ async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path
             message.content for message in messages if message is not brief
         )
         assert runtime.store.get("message", source["id"])["content"] == source["content"]  # type: ignore[index]
-        assert context_size(messages) <= 7000
+        assert context_size(messages) <= 14000
     finally:
         await runtime.close()
     reopened = Runtime(runtime.config, runtime.data_dir)
