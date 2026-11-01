@@ -419,6 +419,12 @@ async def test_pdf_converter_missing_reports_install_command(
         raise FileNotFoundError
 
     monkeypatch.setattr(document_reading, "run_process", missing)
+    original_hint = dependencies.install_hint
+    monkeypatch.setattr(
+        dependencies,
+        "install_hint",
+        lambda tools, *, platform=None: original_hint(tools, platform="linux"),
+    )
     monkeypatch.setattr(
         dependencies.shutil,
         "which",
@@ -441,6 +447,12 @@ async def test_pdf_converter_missing_without_sudo_reports_plain_command(
         raise FileNotFoundError
 
     monkeypatch.setattr(document_reading, "run_process", missing)
+    original_hint = dependencies.install_hint
+    monkeypatch.setattr(
+        dependencies,
+        "install_hint",
+        lambda tools, *, platform=None: original_hint(tools, platform="linux"),
+    )
     monkeypatch.setattr(
         dependencies.shutil,
         "which",
