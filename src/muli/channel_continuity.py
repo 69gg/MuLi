@@ -131,7 +131,8 @@ class ChannelContinuity:
             "status": status,
             "created_at": now(),
             "outcome": outcome,
-            "truncated": status == "completed" and len(result) > MAX_OUTCOME_CHARS,
+            "truncated": (status == "completed" and len(result) > MAX_OUTCOME_CHARS)
+            or (status == "failed" and len(result) > MAX_ERROR_CHARS),
             "error": error,
             "input_id": input_id,
             "result_message_id": self._result_message(agent_id, run_id, status),

@@ -167,8 +167,9 @@ class PluginManager:
         self._loaded_settings = runtime.config.settings.plugins.model_dump()
         self._reload_lock = asyncio.Lock()
         self._watch_task: asyncio.Task[None] | None = None
-        self._drain_tasks: set[asyncio.Task[None]] = set()
+        self._drain_tasks: set[asyncio.Task[Any]] = set()
         self._fingerprints: dict[str, tuple[Any, ...]] = {}
+        self._digest_cache: dict[str, tuple[int, int, str]] = {}
         self._failures: dict[str, int] = {}
         self._next_attempt: dict[str, float] = {}
 
@@ -528,15 +529,22 @@ class PluginManager:
         if generation.state == "draining" and generation.active_calls == 0:
             self._schedule_retire(generation)
 
-    def _schedule_retire(self, generation: PluginGeneration) -> None:
-        task = asyncio.create_task(self._retire(generation), name="muli-plugin-retire")
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._drain_tasks.add(task)
-        task.add_done_callback(self._drain_tasks.discard)
+
+        def finished(completed: asyncio.Task[Any]) -> None:
+            self._drain_tasks.discard(completed)
+            if not completed.cancelled():
+                # Retrieve background failures so they cannot become unhandled.
+                completed.exception()
+
+        task.add_done_callback(finished)
+
+    def _schedule_retire(self, generation: PluginGeneration) -> None:
+        self._track_task(asyncio.create_task(self._retire(generation), name="muli-plugin-retire"))
 
     def _schedule_drain(self, generation: PluginGeneration) -> None:
-        task = asyncio.create_task(self._drain(generation), name="muli-plugin-drain")
-        self._drain_tasks.add(task)
-        task.add_done_callback(self._drain_tasks.discard)
+        self._track_task(asyncio.create_task(self._drain(generation), name="muli-plugin-drain"))
 
     async def _drain(self, generation: PluginGeneration) -> None:
         deadline = time.monotonic() + self.runtime.config.settings.plugins.drain_timeout
@@ -623,14 +631,27 @@ class PluginManager:
                 if path.is_symlink() or not path.is_file() or path.suffix == ".pyc":
                     continue
                 metadata = path.stat()
-                with path.open("rb") as source:
-                    data = source.read(settings.max_source_bytes + 1)
+                key = str(path)
+                cached = self._digest_cache.get(key)
+                if (
+                    cached is not None
+                    and cached[0] == metadata.st_size
+                    and cached[1] == metadata.st_mtime_ns
+                ):
+                    length = min(metadata.st_size, settings.max_source_bytes + 1)
+                    digest = cached[2]
+                else:
+                    with path.open("rb") as source:
+                        data = source.read(settings.max_source_bytes + 1)
+                    length = len(data)
+                    digest = hashlib.sha256(data[: settings.max_source_bytes]).hexdigest()
+                    self._digest_cache[key] = (metadata.st_size, metadata.st_mtime_ns, digest)
                 files.append(
                     (
                         path.relative_to(directory).as_posix(),
-                        len(data),
+                        length,
                         metadata.st_mtime_ns,
-                        hashlib.sha256(data[: settings.max_source_bytes]).hexdigest(),
+                        digest,
                     )
                 )
         except OSError:
@@ -825,9 +846,13 @@ class PluginManager:
             record.update(record_entry)
             if settings.hot_reload:
                 try:
-                    asyncio.get_running_loop().create_task(self.reload(identifier))
+                    task = asyncio.get_running_loop().create_task(
+                        self.reload(identifier), name="muli-plugin-reload"
+                    )
                 except RuntimeError:
                     self._restart_required = True
+                else:
+                    self._track_task(task)
             else:
                 self._restart_required = True
         return {

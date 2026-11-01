@@ -96,7 +96,10 @@ async def test_management_notification_is_recorded_without_external_text() -> No
     )
     assert outcome.delivered == {"r1"}
     assert outcome.notifications[0]["source"] == "host_notice"
-    assert "重启" not in outcome.notifications[0]["content"]
+    assert (
+        outcome.notifications[0]["content"]
+        == "管理操作 restart 已完成。请打开沐璃工作台查看结果与回执。"
+    )
 
 
 async def test_shadow_records_candidate_without_sending() -> None:
