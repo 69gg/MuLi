@@ -39,6 +39,31 @@ _PROTECTED_FIELDS = frozenset(
 )
 
 
+def _apply_thinking_budget(body: JsonObject, config: ModelConfig) -> None:
+    if not config.send_thinking_budget or config.thinking_param is None:
+        return
+    parts = config.thinking_param.split(".")
+    if parts[0] in _PROTECTED_FIELDS:
+        raise ValueError("thinking_param 不允许覆盖协议核心字段：" + parts[0])
+    if config.thinking_budget is None:
+        raise ValueError("thinking_param 已启用时必须填写 thinking_budget")
+    current = body
+    for part in parts[:-1]:
+        existing = current.get(part)
+        if existing is None:
+            child: JsonObject = {}
+            current[part] = child
+            current = child
+        elif isinstance(existing, dict):
+            current = existing
+        else:
+            raise ValueError("thinking_param 路径与现有请求字段冲突")
+    leaf = parts[-1]
+    if leaf in current and current[leaf] != config.thinking_budget:
+        raise ValueError("thinking_param 路径与现有请求字段冲突")
+    current[leaf] = config.thinking_budget
+
+
 def object_value(value: Any) -> JsonObject:
     return value if isinstance(value, dict) else {}
 
@@ -264,6 +289,7 @@ def build_request(
     if conflicts:
         raise ValueError("extra_body 不允许覆盖协议核心字段：" + ", ".join(sorted(conflicts)))
     body: JsonObject = deepcopy(config.extra_body)
+    _apply_thinking_budget(body, config)
     body.update(model=config.model, stream=stream)
     if config.thinking:
         body.setdefault("thinking", deepcopy(config.thinking))

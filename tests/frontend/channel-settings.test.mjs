@@ -46,13 +46,18 @@ test("bot activation requires private owners while preserving Weixin settings", 
   }
   assert.equal(controls.has("channels.weixin.allowed_groups"), true);
   assert.equal(controls.get("channels.weixin.owner_ids").label, "你的用户 ID");
-  assert.equal(controls.get("channels.weixin.owner_ids").input.required, false);
+  const weixinOwner = controls.get("channels.weixin.owner_ids");
+  assert.equal(weixinOwner.input.required, false);
+  const weixinToggle = controls.get("channels.weixin.enabled").input;
+  weixinToggle.events.change({ target: { checked: true } });
+  assert.equal(weixinOwner.input.required, true);
+  weixinToggle.events.change({ target: { checked: false } });
+  assert.equal(weixinOwner.input.required, false);
   const active = harness(true);
   active.context.renderChannelSettings();
-  for (const name of ["onebot", "telegram", "qq"]) {
+  for (const name of ["onebot", "telegram", "qq", "weixin"]) {
     assert.equal(active.controls.get(`channels.${name}.owner_ids`).input.required, true);
   }
-  assert.equal(active.controls.get("channels.weixin.owner_ids").input.required, false);
 });
 
 test("notification targets offer bot private chats and preserve Weixin choices", () => {

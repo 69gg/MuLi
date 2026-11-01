@@ -84,6 +84,7 @@ def live_approval(
             "risk",
             "status",
             "created_at",
+            "boot_epoch",
         }
         or item["id"] != identifier
         or not _ID.fullmatch(identifier)

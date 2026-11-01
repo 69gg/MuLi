@@ -29,6 +29,7 @@ from muli.channels.adapters import QQ, OneBot
 from muli.channels.crypto import aes_media, sign_qq, verify_qq
 from muli.config import ConfigFile
 from muli.events import EventBus
+from muli.reply_origin import authorize_route
 from muli.store import Store, now
 
 Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
@@ -1025,3 +1026,29 @@ async def test_legacy_inbound_schema_migrates_without_claiming_unknown_fingerpri
         for row in harness.store.db.execute("SELECT fingerprint FROM channel_inbound")
     )
     await harness.close()
+
+
+@pytest.mark.parametrize("name", ["onebot", "telegram", "qq", "weixin"])
+def test_enabled_channel_requires_a_bound_owner(name: str) -> None:
+    with pytest.raises(ChannelError, match="必须填写"):
+        ChannelsConfig(**{name: profile(owner_ids=[])})
+
+
+def test_weixin_owner_ids_are_bounded_and_groups_remain_opt_in() -> None:
+    with pytest.raises(ChannelError, match="owner_ids"):
+        ChannelsConfig(weixin=profile(owner_ids=[""]))
+    route = authorize_route(
+        "weixin",
+        {"sender_id": "7", "target": "99", "kind": "group"},
+        account_id="bot",
+        owner_ids=["7"],
+        allowed_groups=["99"],
+        outbound=True,
+    )
+    assert route == {
+        "name": "weixin",
+        "account_id": "bot",
+        "target": "99",
+        "sender_id": "7",
+        "kind": "group",
+    }

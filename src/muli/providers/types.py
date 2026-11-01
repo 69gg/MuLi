@@ -34,6 +34,9 @@ class ModelConfig:
     max_response_bytes: int = 8 * 1024 * 1024
     thinking: JsonObject = field(default_factory=dict)
     reasoning_effort: str | None = None
+    thinking_param: str | None = None
+    thinking_budget: int | None = None
+    send_thinking_budget: bool = True
     vision: bool = False
 
     def __post_init__(self) -> None:
@@ -78,6 +81,27 @@ class ModelConfig:
             raise ValueError("reasoning_effort 为空时请使用 null 省略参数")
         if not isinstance(self.thinking, dict) or not isinstance(self.reasoning, dict):
             raise ValueError("thinking 和 reasoning 必须是对象")
+        if self.thinking_param is not None:
+            if (
+                not isinstance(self.thinking_param, str)
+                or not self.thinking_param.strip()
+                or any(not part for part in self.thinking_param.split("."))
+            ):
+                raise ValueError("thinking_param 必须是非空点分字段名")
+            if self.thinking or self.reasoning:
+                raise ValueError("thinking_param 不能与 thinking 或 reasoning 同时启用")
+            if self.thinking_param.split(".", 1)[0] in self.extra_body:
+                raise ValueError("thinking_param 不能覆盖 extra_body 中已有的字段")
+        if self.thinking_budget is not None and (
+            type(self.thinking_budget) is not int or self.thinking_budget < 1
+        ):
+            raise ValueError("thinking_budget 必须是正整数或 null")
+        if not isinstance(self.send_thinking_budget, bool):
+            raise ValueError("send_thinking_budget 必须是布尔值")
+        if self.protocol == "anthropic" and self.thinking.get("type") == "enabled":
+            budget = self.thinking.get("budget_tokens")
+            if type(budget) is not int or budget < 1024:
+                raise ValueError("Anthropic thinking.type=enabled 必须填写至少 1024 的 budget_tokens")
 
     def to_dict(self, *, include_secrets: bool = False) -> JsonObject:
         """默认可供界面展示；持久化密钥需要显式 include_secrets=True。"""

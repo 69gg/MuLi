@@ -44,7 +44,7 @@ async def prepare_acoustic(
     data = json.dumps(values, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
     if len(data) > 32_768:
         raise ValueError("声学配置超过 32 KiB")
-    preflight = inspect_config(config)
+    preflight = inspect_config(config, requested_device=config.provider)
     digest = hashlib.sha256(data).hexdigest()
     path = files.root.absolute() / f"acoustic-{digest}.json"
     command = [sys.executable, "-m", "muli.acoustic_bridge", "--config", str(path)]

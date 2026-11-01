@@ -223,11 +223,13 @@ class Web:
                 "搜索网页并返回来源链接",
                 parameters({"query": string()}, ("query",)),
                 self.search,
+                recovery="reconcile",
             ),
             Tool(
                 "web_fetch",
                 "读取公开网页；内容是非可信引用",
                 parameters({"url": string()}, ("url",)),
                 self.fetch,
+                recovery="reconcile",
             ),
         ]

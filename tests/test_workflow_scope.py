@@ -257,11 +257,18 @@ async def test_recovery_pages_all_four_kinds_and_preserves_other_states(
             for identifier in identifiers:
                 item = recovered.store.get(kind, identifier)
                 assert item is not None
-                assert item["status"] == ("idle" if kind == "session" else "interrupted")
+                expected_status = (
+                    "idle"
+                    if kind == "session"
+                    else "expired"
+                    if kind == "approval" and status == "pending"
+                    else "interrupted"
+                )
+                assert item["status"] == expected_status
                 assert item["unknown_effect"] == "do not repeat"
                 if kind == "workflow_run":
                     node = item["nodes"]["work"]
-                    assert node["status"] == "interrupted"
+                    assert node["status"] == ("pending" if status in {"pending", "queued"} else "interrupted")
                     assert recovered.store.get("session", node["session_id"])["status"] == "idle"  # type: ignore[index]
                     assert item["nodes"]["parked"]["status"] == "paused"
             assert recovered.store.unfinished_object_ids(kind) == []

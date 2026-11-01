@@ -1,5 +1,6 @@
 import test from "node:test";
 import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "../../web/composer-draft.mjs";
+import { applyComposerPrompt, REPLACE_CONFIRMATION } from "../../web/composer-prompt.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -111,6 +112,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const requests = [], toasts = [], errors = [], windowEvents = {}; let globalEvent = null;
   const context = {
     composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment,
+    applyComposerPrompt, REPLACE_CONFIRMATION,
     document, Node: class { static [Symbol.hasInstance](value) { return value instanceof DOMElement || value instanceof TextNode; } },
     window: { addEventListener: (name, callback) => { windowEvents[name] = callback; } },
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask, MODES, toasts, errors,

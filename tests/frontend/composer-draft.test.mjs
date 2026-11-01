@@ -392,3 +392,46 @@ for (const focus of ["exact text and task reference", "ordered saved attachment 
     }
   });
 }
+
+test("configure prompt replaces only after confirmation, never sends, and can be undone", async (t) => {
+  const h = await appInstance(t, serverFixture(), pageStorage());
+  const input = inputOf(h), attachments = [older];
+  input.value = "原有草稿"; await input.dispatch("input");
+  h.ui.state.attachments = attachments; h.ui.renderComposerAttachments();
+  assert.equal(h.ui.state.activeSession?.id, h.ui.state.mainSessionId);
+  const trigger = h.document.createElement("button"); trigger.dataset.prompt = "请检查当前配置和未就绪的能力。"; h.document.body.append(trigger);
+  await h.ui.handleAction("configure-prompt", trigger); await flush();
+  assert.equal(input.value, "原有草稿");
+  assert.equal(h.ui.state.activeSession?.id, h.ui.state.mainSessionId);
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.document.querySelector("#dialog-title").textContent, "替换草稿");
+  assert.match(h.document.querySelector("#dialog-content").textContent, /附件与语音保留/);
+  assert.equal(posts(h).length, 0);
+  await h.form.dispatch("submit"); await flush();
+  assert.equal(input.value, "请检查当前配置和未就绪的能力。");
+  assert.deepEqual(Array.from(h.ui.state.attachments, (file) => file.id), [older.id]);
+  assert.equal(posts(h).length, 0);
+  const undo = h.document.querySelector("#composer-prompt-undo");
+  assert.equal(undo.hidden, false);
+  await h.ui.handleAction("undo-composer-prompt", undo);
+  assert.equal(input.value, "原有草稿");
+  assert.deepEqual(Array.from(h.ui.state.attachments, (file) => file.id), [older.id]);
+  assert.equal(posts(h).length, 0);
+});
+
+test("configuration overview replaces a draft only after confirmation and never auto-sends", async (t) => {
+  const h = await appInstance(t, serverFixture(), pageStorage());
+  h.ui.state.settingsDraft = { workspace_roots: [] };
+  h.ui.state.status = { ...h.ui.state.status, configured: true };
+  const input = inputOf(h);
+  input.value = "原有草稿"; await input.dispatch("input");
+  const form = h.ui.renderConfigurationOverview().querySelector("form");
+  form.querySelector("textarea").value = "每天晚上九点提醒我整理笔记";
+  await form.dispatch("submit"); await flush();
+  assert.equal(input.value, "原有草稿");
+  assert.equal(h.dialog.open, true);
+  assert.equal(h.document.querySelector("#dialog-title").textContent, "替换草稿");
+  await h.form.dispatch("submit"); await flush();
+  assert.equal(input.value, "请调整沐璃的配置：\n每天晚上九点提醒我整理笔记");
+  assert.equal(posts(h).length, 0);
+});
