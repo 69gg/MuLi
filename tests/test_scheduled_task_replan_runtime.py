@@ -87,7 +87,7 @@ async def exercise_original_task_schedule(
             "memory": {"auto_extract": False},
             "compaction": {"enabled": False},
             "attention": {"enabled": False},
-            "limits": {"max_context_chars": 16000, "max_output_chars": 6000, "max_pending_runs": 3},
+            "limits": {"max_output_chars": 6000, "max_pending_runs": 3},
             "models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}},
             "channels": {
                 "onebot": {
