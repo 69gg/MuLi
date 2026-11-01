@@ -192,7 +192,8 @@ class ChannelContinuity:
     def _deliveries(self, identifier: str) -> tuple[list[str], bool]:
         rows = self.runtime.store.db.execute(
             "SELECT id FROM channel_outbox "
-            "WHERE json_extract(payload,'$.channel_continuity.id')=? "
+            "WHERE CASE WHEN json_valid(payload) "
+            "THEN json_extract(payload,'$.channel_continuity.id') END=? "
             "ORDER BY created_at,id LIMIT ?",
             (identifier, MAX_DELIVERY_REFS + 1),
         ).fetchall()

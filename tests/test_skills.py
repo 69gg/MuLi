@@ -676,7 +676,7 @@ async def test_runtime_preflight_counts_other_pinned_context(host: Host) -> None
         snapshot = await skills.prepare(host.config.settings.skills)
         skills.publish(snapshot)
         turns.extend([read_turn(snapshot.entries[0]), ModelTurn(content="未激活，仍可继续")])
-        host.config.settings.limits.max_context_chars = 6000
+        host.config.settings.limits.max_context_chars = 6500
         session = runtime.new_session(mode="yolo")
         await runtime.start(session["id"], "读取指导")
         assert await runtime.tasks[session["id"]] == "未激活，仍可继续"

@@ -35,18 +35,22 @@ _PROTECTED_FIELDS = frozenset(
         "previous_response_id",
         "conversation",
         "n",
-        "max_tokens",
-        "max_completion_tokens",
-        "max_output_tokens",
     }
 )
+# Output limits may be supplied through extra_body (clamped below), but a
+# thinking budget must never take over the runtime-managed limit fields.
+_THINKING_PROTECTED_FIELDS = _PROTECTED_FIELDS | {
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+}
 
 
 def _apply_thinking_budget(body: JsonObject, config: ModelConfig) -> None:
     if not config.send_thinking_budget or config.thinking_param is None:
         return
     parts = config.thinking_param.split(".")
-    if parts[0] in _PROTECTED_FIELDS:
+    if parts[0] in _THINKING_PROTECTED_FIELDS:
         raise ValueError("thinking_param 不允许覆盖协议核心字段：" + parts[0])
     if config.thinking_budget is None:
         raise ValueError("thinking_param 已启用时必须填写 thinking_budget")
