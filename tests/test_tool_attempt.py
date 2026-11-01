@@ -34,9 +34,7 @@ async def test_attempt_phases_are_additive_objects(tmp_path: Path) -> None:
         assert runtime.store.get("tool_attempt", attempt.attempt_id)["phase"] == "planned"
         attempts.mark_started(attempt)
         assert runtime.store.get("tool_attempt", attempt.attempt_id)["phase"] == "started"
-        attempts.mark_committed(
-            attempt, result_status="completed", result_message_id="message-1"
-        )
+        attempts.mark_committed(attempt, result_status="completed", result_message_id="message-1")
         runtime.store.put("tool_attempt", attempt.dump())
         stored = runtime.store.get("tool_attempt", attempt.attempt_id)
         assert stored["phase"] == "committed"
@@ -130,9 +128,7 @@ async def test_repair_tail_uses_attempt_phases_without_replaying(tmp_path: Path)
             sid, "tool", json.dumps({"ok": True}), tool_call_id="committed"
         )
         runtime.store.put("message", result)
-        runtime.store.db.execute(
-            "DELETE FROM message_order WHERE message_id=?", (result["id"],)
-        )
+        runtime.store.db.execute("DELETE FROM message_order WHERE message_id=?", (result["id"],))
         runtime.store.db.commit()
         attempts.mark_committed(
             committed, result_status="completed", result_message_id=result["id"]

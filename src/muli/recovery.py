@@ -105,11 +105,7 @@ class RecoveryPlanner:
                 run_id,
                 {"approval_ids": pending},
             )
-        unsafe = [
-            item
-            for item in attempts
-            if item.get("phase") in {"started", "unknown"}
-        ]
+        unsafe = [item for item in attempts if item.get("phase") in {"started", "unknown"}]
         if unsafe:
             details = {
                 "attempts": [
@@ -131,7 +127,9 @@ class RecoveryPlanner:
                 run_id,
                 details,
             )
-        if any(item.get("phase") not in {"planned", "committed", "not_executed"} for item in attempts):
+        if any(
+            item.get("phase") not in {"planned", "committed", "not_executed"} for item in attempts
+        ):
             return RecoveryDecision(
                 "needs_owner",
                 "存在无法归类的中断工具尝试",

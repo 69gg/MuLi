@@ -565,7 +565,7 @@ async def configured(tmp_path: Path, *, channels: bool = False) -> Runtime:
         "compaction": {"enabled": False},
         "attention": {"enabled": False},
         "extensions": {"watch_enabled": False},
-        "limits": {"max_context_chars": 16000, "max_output_chars": 6000, "max_pending_runs": 3},
+        "limits": {"max_context_chars": 20000, "max_output_chars": 6000, "max_pending_runs": 3},
         "models": {"worker": {"model": "worker", "base_url": "https://unused.invalid/v1"}},
     }
     if channels:

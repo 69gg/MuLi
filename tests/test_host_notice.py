@@ -46,7 +46,9 @@ def record(
 
 def delivery(mode: str, manager: Any = None) -> HostNoticeDelivery:
     runtime = SimpleNamespace(
-        config=SimpleNamespace(settings=SimpleNamespace(attention=SimpleNamespace(host_delivery=mode)))
+        config=SimpleNamespace(
+            settings=SimpleNamespace(attention=SimpleNamespace(host_delivery=mode))
+        )
     )
     return HostNoticeDelivery(runtime, lambda: manager)
 
@@ -65,9 +67,7 @@ def test_only_fixed_host_templates_are_eligible() -> None:
     assert host_template(record("update")) is not None
     assert host_template(record("reminder")) is not None
     assert (
-        host_template(
-            record("management", detail={"status": "completed", "action": "update"})
-        )
+        host_template(record("management", detail={"status": "completed", "action": "update"}))
         is not None
     )
     assert host_template(record("system_log", detail={"code": "runtime_failed"})) is not None
@@ -79,9 +79,7 @@ def test_only_fixed_host_templates_are_eligible() -> None:
 
 async def test_enforce_delivers_with_frozen_route_and_removes_receipt() -> None:
     manager = Manager()
-    outcome = await delivery("enforce", manager).deliver(
-        [record("update")], guard=lambda: None
-    )
+    outcome = await delivery("enforce", manager).deliver([record("update")], guard=lambda: None)
     assert outcome.delivered == {"r1"}
     assert outcome.receipts["r1"]["host_delivery"]["template"] == "update"
     assert manager.calls[0]["kwargs"]["automatic"] is True
@@ -129,9 +127,7 @@ async def test_delivery_error_falls_back_without_claiming_success() -> None:
         async def enqueue(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("offline")
 
-    outcome = await delivery("enforce", Broken()).deliver(
-        [record("update")], guard=lambda: None
-    )
+    outcome = await delivery("enforce", Broken()).deliver([record("update")], guard=lambda: None)
     assert not outcome.delivered
     assert outcome.receipts["r1"]["host_fallback"]["reason"] == "delivery_error"
 

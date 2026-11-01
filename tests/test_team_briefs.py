@@ -13,7 +13,7 @@ async def test_task_brief_binding_inherits_to_descendants_and_cannot_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
-    monkeypatch.setattr(runtime.team, "start", lambda: None)
+    monkeypatch.setattr(runtime.team, "start", lambda **_kwargs: None)
     ledger = Commitments(runtime.store, runtime.bus)
     first = await ledger.save("first", brief={"goal": "first goal", "constraints": ["preserve"]})
     second = await ledger.save("second", brief={"goal": "second goal", "constraints": []})

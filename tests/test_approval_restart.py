@@ -66,9 +66,7 @@ async def test_restart_expires_pending_and_interrupts_claimed_approvals(
         recovered = runtime.store.events(after=before, session_id=sid)
         approval_events = [event for event in recovered if event["data"].get("kind") == "approval"]
         assert len(approval_events) == 3
-        assert all(
-            event["data"]["recovery_decision"] == "needs_owner" for event in approval_events
-        )
+        assert all(event["data"]["recovery_decision"] == "needs_owner" for event in approval_events)
         # The expired approval is no longer a pending blocker for the old run.
         run = runtime.store.get("run", "crashed-run")
         assert run is not None and run["status"] == "interrupted"

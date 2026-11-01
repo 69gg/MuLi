@@ -35,6 +35,9 @@ _PROTECTED_FIELDS = frozenset(
         "previous_response_id",
         "conversation",
         "n",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
     }
 )
 

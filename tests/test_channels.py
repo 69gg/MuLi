@@ -109,6 +109,14 @@ def onebot_body(payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
     return raw, {"X-Signature": signature}
 
 
+def test_weixin_without_owner_is_safely_disabled_in_the_frozen_transport_config() -> None:
+    source = profile(owner_ids=[], account_id="account", user_id="bot")
+    config = ChannelsConfig(weixin=source)
+    assert config.weixin.enabled is False
+    assert config.weixin.account_id == "account" and config.weixin.user_id == "bot"
+    assert source.enabled is True
+
+
 async def test_default_off_never_contacts_platform(tmp_path: Path) -> None:
     harness = Harness(tmp_path, ChannelsConfig(), unused)
     await harness.manager.start()
@@ -1028,7 +1036,7 @@ async def test_legacy_inbound_schema_migrates_without_claiming_unknown_fingerpri
     await harness.close()
 
 
-@pytest.mark.parametrize("name", ["onebot", "telegram", "qq", "weixin"])
+@pytest.mark.parametrize("name", ["onebot", "telegram", "qq"])
 def test_enabled_channel_requires_a_bound_owner(name: str) -> None:
     with pytest.raises(ChannelError, match="必须填写"):
         ChannelsConfig(**{name: profile(owner_ids=[])})

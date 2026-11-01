@@ -130,6 +130,8 @@ def main() -> None:
         arguments = [args.command]
         if args.command in {"service", "management"}:
             arguments.append(args.action)
+            if args.command == "service" and args.action == "uninstall" and args.confirm:
+                arguments.append("--confirm")
         elif args.command == "plugins":
             arguments.extend([args.action, args.identifier])
         elif args.command == "init":

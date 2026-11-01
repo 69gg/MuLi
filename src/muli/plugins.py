@@ -134,7 +134,7 @@ class PluginContext:
         self.routes.append((path, endpoint, list(methods)))
 
 
-@dataclass
+@dataclass(eq=False)
 class PluginGeneration:
     identifier: str
     generation: int
@@ -145,6 +145,7 @@ class PluginGeneration:
     model_factory: ClientFactory | None = None
     active_calls: int = 0
     state: str = "active"
+    fingerprints: tuple[Any, ...] = ()
 
 
 class PluginManager:
@@ -152,9 +153,12 @@ class PluginManager:
         self.runtime, self.app, self.directory = runtime, app, directory
         self.records: list[dict[str, Any]] = []
         self._generations: dict[str, PluginGeneration] = {}
+        self._generation_counts: dict[str, int] = {}
+        self._draining: set[PluginGeneration] = set()
         self._tools: dict[str, Tool] = {}
         # 绑定方法每次访问都是新对象，运行时用 `is` 识别工具归属，这里固定同一个可调用对象。
         self._tool_provider: ToolProvider = lambda _runtime: list(self._tools.values())
+        self.context_hook = self.context
         self._shadowed: dict[str, tuple[Tool, Any, bool]] = {}
         self._base_factory = runtime.client_factory
         self._started = False
@@ -193,6 +197,9 @@ class PluginManager:
         self._started = True
         settings = self.runtime.config.settings.plugins
         self._loaded_settings = settings.model_dump()
+        self.runtime.add_tool_provider(self._tool_provider, replace=True)
+        if self.context_hook not in self.runtime.context_hooks:
+            self.runtime.context_hooks.append(self.context_hook)
         if not settings.enabled:
             return
         try:
@@ -222,15 +229,12 @@ class PluginManager:
                 )
                 continue
             await self._activate(directory.name, settings)
-        self.runtime.add_tool_provider(self._tool_provider, replace=True)
-        self._refresh_tools()
-        self.runtime.context_hooks.append(self.context)
-        self._fingerprints = self._scan_fingerprints()
         if settings.hot_reload:
             self._watch_task = asyncio.create_task(self._watch(), name="muli-plugin-watch")
 
     async def _activate(self, identifier: str, settings: PluginSettings) -> None:
         record = self._record(identifier)
+        self._fingerprints[identifier] = self._fingerprints_for(self.directory / identifier)
         try:
             data = _manifest(self.directory / identifier, settings.max_source_bytes)
             if identifier in settings.disabled or data.get("enabled", True) is False:
@@ -246,8 +250,13 @@ class PluginManager:
             )
             if generation is None:
                 return
-            self._install_routes(generation)
+            try:
+                self._install_routes(generation)
+            except BaseException:
+                await self._retire(generation)
+                raise
             self._generations[identifier] = generation
+            self._fingerprints[identifier] = generation.fingerprints
             self._refresh_tools()
             self._refresh_factory()
             record.update(
@@ -274,8 +283,15 @@ class PluginManager:
                 self._restart_required = True
 
     def _next_generation(self, identifier: str) -> int:
+        # 计数器跨插件移除保留，旧代次退役时不会复用同名模块并误删新代次。
         current = self._generations.get(identifier)
-        return current.generation + 1 if current is not None else 1
+        previous = max(
+            self._generation_counts.get(identifier, 0),
+            current.generation if current is not None else 0,
+        )
+        generation = previous + 1
+        self._generation_counts[identifier] = generation
+        return generation
 
     async def _load_generation(
         self, identifier: str, settings: PluginSettings, generation: int
@@ -285,6 +301,7 @@ class PluginManager:
         if identifier in settings.disabled or data.get("enabled", True) is False:
             return None
         entry = _entry(directory, data, settings.max_source_bytes)
+        fingerprints = self._fingerprints_for(directory)
         module_name = f"_muli_plugin_{identifier}_g{generation}"
         spec = importlib.util.spec_from_file_location(
             module_name, entry, submodule_search_locations=[str(directory)]
@@ -320,7 +337,7 @@ class PluginManager:
                         await hook()
                 except Exception:
                     continue
-            sys.modules.pop(module_name, None)
+            self._drop_modules(module_name)
             raise
         result = PluginGeneration(
             identifier=identifier,
@@ -329,8 +346,11 @@ class PluginManager:
             module_name=module_name,
             tools=list(context.tools),
             model_factory=context.model_factory,
+            fingerprints=fingerprints,
         )
         result.tools = [self._wrap_tool(result, tool) for tool in context.tools]
+        # 目录和能力清单按对象身份核对；对外暴露的必须是实际注册的包装对象。
+        context.tools = list(result.tools)
         return result
 
     def _wrap_tool(self, generation: PluginGeneration, tool: Tool) -> Tool:
@@ -347,6 +367,12 @@ class PluginManager:
                 self._retire_if_drained(generation)
 
         return replace(tool, handler=handler)
+
+    @staticmethod
+    def _drop_modules(module_name: str) -> None:
+        for name in tuple(sys.modules):
+            if name == module_name or name.startswith(module_name + "."):
+                sys.modules.pop(name, None)
 
     def _install_routes(self, generation: PluginGeneration) -> None:
         try:
@@ -441,6 +467,9 @@ class PluginManager:
                 record.update(status="removed", error="", reload_pending=False)
                 return record
             try:
+                # Read the manifest before switching generations; a later
+                # failure must not leave the old generation already replaced.
+                data = _manifest(directory, settings.max_source_bytes)
                 generation = await self._load_generation(
                     identifier, settings, self._next_generation(identifier)
                 )
@@ -451,7 +480,11 @@ class PluginManager:
                     return record
                 if old is not None:
                     self._remove_routes(old)
-                self._install_routes(generation)
+                try:
+                    self._install_routes(generation)
+                except BaseException:
+                    await self._retire(generation)
+                    raise
             except Exception as exc:
                 if old is not None and not old.routes:
                     try:
@@ -471,9 +504,9 @@ class PluginManager:
                     self._restart_required = True
                 return record
             self._generations[identifier] = generation
+            self._fingerprints[identifier] = generation.fingerprints
             self._refresh_tools()
             self._refresh_factory()
-            data = _manifest(directory, settings.max_source_bytes)
             record.update(
                 name=str(data.get("name", identifier))[:120],
                 version=str(data.get("version", ""))[:80],
@@ -487,6 +520,7 @@ class PluginManager:
             self._next_attempt.pop(identifier, None)
             if old is not None:
                 old.state = "draining"
+                self._draining.add(old)
                 self._schedule_drain(old)
             return record
 
@@ -522,11 +556,9 @@ class PluginManager:
             except Exception:
                 continue
         self._remove_routes(generation)
-        for name in tuple(sys.modules):
-            if name == generation.module_name or name.startswith(
-                f"_muli_plugin_{generation.identifier}_"
-            ):
-                sys.modules.pop(name, None)
+        # 只清理本代次模块，不能按插件前缀删除可能已复用的新代次模块。
+        self._drop_modules(generation.module_name)
+        self._draining.discard(generation)
         if self._generations.get(generation.identifier) is generation:
             self._generations.pop(generation.identifier, None)
             self._refresh_tools()
@@ -553,9 +585,7 @@ class PluginManager:
                     else:
                         messages = [Message(role="system", content=block), *messages]
                 for hook in context.context_hooks:
-                    async with asyncio.timeout(
-                        self.runtime.config.settings.plugins.hook_timeout
-                    ):
+                    async with asyncio.timeout(self.runtime.config.settings.plugins.hook_timeout):
                         result = await hook(session_id, messages)
                     if not isinstance(result, list) or any(
                         not isinstance(item, Message) for item in result
@@ -579,8 +609,35 @@ class PluginManager:
                 record.pop("error_type", None)
         return messages
 
-    def _scan_fingerprints(self) -> dict[str, tuple[Any, ...]]:
+    def _fingerprints_for(self, directory: Path) -> tuple[Any, ...]:
         settings = self.runtime.config.settings.plugins
+        files: list[tuple[str, int, int, str]] = []
+        try:
+            candidates = [directory / "plugin.json", *directory.rglob("*.py")]
+            for path in sorted(candidates):
+                if any(
+                    part in {"__pycache__", ".venv", "venv", "node_modules", ".git"}
+                    for part in path.relative_to(directory).parts
+                ):
+                    continue
+                if path.is_symlink() or not path.is_file() or path.suffix == ".pyc":
+                    continue
+                metadata = path.stat()
+                with path.open("rb") as source:
+                    data = source.read(settings.max_source_bytes + 1)
+                files.append(
+                    (
+                        path.relative_to(directory).as_posix(),
+                        len(data),
+                        metadata.st_mtime_ns,
+                        hashlib.sha256(data[: settings.max_source_bytes]).hexdigest(),
+                    )
+                )
+        except OSError:
+            return ()
+        return tuple(files)
+
+    def _scan_fingerprints(self) -> dict[str, tuple[Any, ...]]:
         result: dict[str, tuple[Any, ...]] = {}
         try:
             directories = sorted(self.directory.iterdir())
@@ -590,67 +647,83 @@ class PluginManager:
             try:
                 if not directory.is_dir() or directory.is_symlink():
                     continue
-                manifest = directory / "plugin.json"
-                if not manifest.is_file():
+                if not (directory / "plugin.json").is_file():
                     continue
             except OSError:
                 continue
-            files: list[tuple[str, int, int, str]] = []
-            try:
-                for path in sorted([manifest, *directory.rglob("*.py")]):
-                    if path.is_symlink() or not path.is_file() or path.suffix == ".pyc":
-                        continue
-                    data = path.read_bytes()
-                    if len(data) > settings.max_source_bytes:
-                        data = data[: settings.max_source_bytes]
-                    files.append(
-                        (
-                            path.relative_to(directory).as_posix(),
-                            len(data),
-                            path.stat().st_mtime_ns,
-                            hashlib.sha256(data).hexdigest(),
-                        )
-                    )
-            except OSError:
-                continue
-            result[directory.name] = tuple(files)
+            result[directory.name] = self._fingerprints_for(directory)
         return result
 
     async def _watch(self) -> None:
         while not self._closed:
-            settings = self.runtime.config.settings.plugins
-            await asyncio.sleep(settings.watch_interval_seconds)
-            current = self._scan_fingerprints()
-            changed = [
-                identifier
-                for identifier, value in current.items()
-                if self._fingerprints.get(identifier) != value
-            ]
-            removed = [
-                identifier for identifier in self._fingerprints if identifier not in current
-            ]
-            if changed or removed:
-                await asyncio.sleep(settings.debounce_seconds)
-                current = self._scan_fingerprints()
-                for identifier in [*changed, *removed]:
-                    if identifier in current and current[identifier] != self._fingerprints.get(
-                        identifier
-                    ):
-                        await self._reload_watched(identifier)
-                    elif identifier not in current:
-                        await self._reload_watched(identifier)
-            self._fingerprints = current
+            try:
+                settings = self.runtime.config.settings.plugins
+                await asyncio.sleep(settings.watch_interval_seconds)
+                current = await asyncio.to_thread(self._scan_fingerprints)
+                changed = [
+                    identifier
+                    for identifier, value in current.items()
+                    if self._fingerprints.get(identifier) != value
+                ]
+                removed = [
+                    identifier for identifier in self._fingerprints if identifier not in current
+                ]
+                if changed or removed:
+                    await asyncio.sleep(settings.debounce_seconds)
+                    current = await asyncio.to_thread(self._scan_fingerprints)
+                    for identifier in [*changed, *removed]:
+                        if identifier in current and current[identifier] != self._fingerprints.get(
+                            identifier
+                        ):
+                            reloaded = await self._reload_watched(identifier)
+                        elif identifier not in current:
+                            reloaded = await self._reload_watched(identifier)
+                        else:
+                            reloaded = False
+                        if reloaded:
+                            # 实际重载后使用新代次保存的基线；跳过退避或失败时保留旧基线。
+                            generation = self._generations.get(identifier)
+                            if generation is not None:
+                                self._fingerprints[identifier] = generation.fingerprints
+                            elif identifier in current:
+                                self._fingerprints[identifier] = current[identifier]
+                            else:
+                                self._fingerprints.pop(identifier, None)
+                    for identifier, value in current.items():
+                        if identifier not in changed and identifier not in removed:
+                            self._fingerprints[identifier] = value
+                else:
+                    self._fingerprints = current
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._record("__watch__").update(
+                    status="degraded",
+                    error=f"{type(error).__name__}: {str(error)[:300]}",
+                    error_type=type(error).__name__,
+                )
 
-    async def _reload_watched(self, identifier: str) -> None:
+    async def _reload_watched(self, identifier: str) -> bool:
         if time.monotonic() < self._next_attempt.get(identifier, 0.0):
-            return
-        await self.reload(identifier)
+            return False
+        record = await self.reload(identifier)
+        return record.get("status") in {"loaded", "disabled", "removed"}
 
     async def reconfigure(self) -> None:
         if not self._started or self._closed:
             return
         settings = self.runtime.config.settings.plugins
-        self._loaded_settings = settings.model_dump()
+        current = settings.model_dump()
+        changed = current != self._loaded_settings
+        self._loaded_settings = current
+        if changed and not settings.hot_reload:
+            # 未开启热重载时，插件启停或源码变化只登记待重启，不在运行中替换。
+            if self._watch_task is not None:
+                self._watch_task.cancel()
+                await asyncio.gather(self._watch_task, return_exceptions=True)
+                self._watch_task = None
+            self._restart_required = True
+            return
         identifiers: set[str] = set(self._generations)
         try:
             identifiers.update(
@@ -668,7 +741,6 @@ class PluginManager:
             self._watch_task.cancel()
             await asyncio.gather(self._watch_task, return_exceptions=True)
             self._watch_task = None
-        self._fingerprints = self._scan_fingerprints()
 
     async def close(self) -> None:
         self._closed = True
@@ -682,6 +754,11 @@ class PluginManager:
         self._drain_tasks.clear()
         for generation in reversed(list(self._generations.values())):
             await self._retire(generation)
+        # A reload can leave an old generation draining after the current one
+        # has been removed; close must still run its shutdown hooks.
+        for generation in tuple(self._draining):
+            await self._retire(generation)
+        self._draining.clear()
         self.runtime.client_factory = self._base_factory
 
     def install(self, identifier: str, files: dict[str, str]) -> dict[str, Any]:
@@ -735,17 +812,17 @@ class PluginManager:
         settings = self.runtime.config.settings.plugins
         restart = not settings.hot_reload
         if self._started:
-            entry = {
+            record_entry = {
                 "name": str(data.get("name", identifier))[:120],
                 "version": str(data.get("version", ""))[:80],
                 "status": "installed",
                 "restart_required": restart,
             }
             if settings.hot_reload:
-                entry["reload_pending"] = True
+                record_entry["reload_pending"] = True
             record = self._record(identifier)
             record.pop("error", None)
-            record.update(entry)
+            record.update(record_entry)
             if settings.hot_reload:
                 try:
                     asyncio.get_running_loop().create_task(self.reload(identifier))

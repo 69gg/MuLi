@@ -496,6 +496,9 @@ class ManagedPreparation:
         )
         if not assessment.format_compatible:
             raise MaintenanceError(assessment.code)
+        if action == "switch" and selected.digest == source.slot.digest:
+            raise MaintenanceError("managed_switch_requires_different_slot")
+        await self._observe_process(permit, source)
         try:
             probe_format(permit.journal.database).verify(
                 path=permit.journal.database,
@@ -505,9 +508,6 @@ class ManagedPreparation:
             )
         except FormatProbeError as exc:
             raise MaintenanceError("managed_preparation_probe_failed", exc.code) from None
-        if action == "switch" and selected.digest == source.slot.digest:
-            raise MaintenanceError("managed_switch_requires_different_slot")
-        await self._observe_process(permit, source)
         # No await from this revalidation through prepared publication and return.
         runtime.validate_proactive_settings(target)
         helper = (

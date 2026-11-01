@@ -194,9 +194,9 @@ async def test_shell_history_uses_current_permission_mode_and_returns_only_metad
             pending.set()
         await original_notify()
 
-    async def review(name: str, arguments: dict[str, Any], risk: str) -> tuple[bool, str]:
+    async def review(name: str, arguments: dict[str, Any], risk: str) -> tuple[bool, str, str]:
         reviews.append((name, risk))
-        return True, "允许当前会话显式查询回执目录"
+        return True, "允许当前会话显式查询回执目录", "main"
 
     def lookup(*args: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal lookups
@@ -205,7 +205,7 @@ async def test_shell_history_uses_current_permission_mode_and_returns_only_metad
         return original_history(*args, **kwargs)
 
     monkeypatch.setattr(runtime.bus, "notify", observe_pending)
-    monkeypatch.setattr(runtime.permissions, "review", review)
+    monkeypatch.setattr(runtime.permissions, "review_with_source", review)
     monkeypatch.setattr(runtime.shell_receipts, "history", lookup)
 
     def script() -> ShellScript:

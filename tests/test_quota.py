@@ -49,9 +49,7 @@ async def test_team_agents_wait_for_quota_and_release_it(tmp_path: Path) -> None
     runtime, _ = make_runtime(
         tmp_path, [ModelTurn(content="一号完成"), ModelTurn(content="二号完成")]
     )
-    runtime.config.update(
-        {"limits": {"safety_max_agents": 1, "max_parallel_agents": 2}}
-    )
+    runtime.config.update({"limits": {"safety_max_agents": 1, "max_parallel_agents": 2}})
     await runtime.reconfigure()
     parent = runtime.new_session(mode="yolo")
     try:

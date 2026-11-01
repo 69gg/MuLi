@@ -14,6 +14,7 @@ export function applyComposerPrompt(prompt, {
   expectedText,
   maxChars = 64000,
   confirmed = false,
+  dedupe = true,
 } = {}) {
   if (typeof prompt !== "string" || !prompt.trim()) return { ok: false, reason: "empty" };
   if (!modes.has(mode)) return { ok: false, reason: "mode" };
@@ -24,7 +25,9 @@ export function applyComposerPrompt(prompt, {
   if (expectedText !== undefined && text !== expectedText) return { ok: false, reason: "stale" };
   if (!Number.isSafeInteger(maxChars) || maxChars < 1) return { ok: false, reason: "limit" };
   if (mode === "replace" && text && !confirmed) return { ok: false, reason: "confirmation_required" };
-  if (mode === "append" && text.includes(prompt)) return { ok: true, mode, text, previousText: text, unchanged: true };
+  if (mode === "append" && dedupe && (text === prompt || text.endsWith(`\n\n${prompt}`))) {
+    return { ok: true, mode, text, previousText: text, unchanged: true };
+  }
   const merged = mode === "append" && text ? `${text}\n\n${prompt}` : prompt;
   if (merged.length > maxChars) return { ok: false, reason: "too_long" };
   return { ok: true, mode, text: merged, previousText: text };

@@ -10,7 +10,7 @@ import pytest
 
 from muli import prompt_layers
 from muli.config import Persona
-from muli.plugins import PluginContext, PluginManager
+from muli.plugins import PluginContext, PluginGeneration, PluginManager
 from muli.providers import Message
 
 
@@ -116,17 +116,16 @@ def test_user_directory_rejects_invalid_utf8_and_oversized_files(tmp_path: Path)
 
 
 def test_plugin_prompt_is_appended_after_host_system_not_prepended(tmp_path: Path) -> None:
+    plugins = SimpleNamespace(hook_timeout=1.0, model_dump=lambda: {})
     runtime = SimpleNamespace(
-        config=SimpleNamespace(
-            settings=SimpleNamespace(plugins=SimpleNamespace(hook_timeout=1.0))
-        )
+        config=SimpleNamespace(settings=SimpleNamespace(plugins=plugins)),
+        client_factory=None,
     )
+    manager = PluginManager(runtime, app=None, directory=tmp_path)  # type: ignore[arg-type]
     context = PluginContext("demo", tmp_path, runtime, app=None)  # type: ignore[arg-type]
     context.prompt = "PLUGIN_TEXT"
-    manager = PluginManager.__new__(PluginManager)
-    manager.contexts = [context]
+    manager._generations["demo"] = PluginGeneration("demo", 1, context, "muli_demo_g1", [])
     manager.records = [{"id": "demo"}]
-    manager.runtime = runtime  # type: ignore[assignment]
 
     messages = asyncio.run(
         manager.context("session", [Message(role="system", content="HOST_SYSTEM")])
@@ -136,3 +135,5 @@ def test_plugin_prompt_is_appended_after_host_system_not_prepended(tmp_path: Pat
     assert messages[0].content.startswith("HOST_SYSTEM")
     assert messages[0].content.index("HOST_SYSTEM") < messages[0].content.index("外部插件资料")
     assert "PLUGIN_TEXT" in messages[0].content
+    assert "<muli_plugin_prompt>" in messages[0].content
+    assert "</muli_plugin_prompt>" in messages[0].content

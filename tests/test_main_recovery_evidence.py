@@ -714,7 +714,8 @@ async def test_main_recovery_hint_only_reaches_the_current_owner_main_with_its_r
         for guidance in ("section=main_recovery", "宿主恢复记录", "first_input"):
             assert (guidance in prompt) is (choice == "default")
         if choice == "persona":
-            assert prompt.startswith("用户定制人格正文")
+            assert prompt.startswith("安全边界（宿主固定")
+            assert "用户定制人格正文" in prompt
     finally:
         await runtime.close()
 

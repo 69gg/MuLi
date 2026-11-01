@@ -101,7 +101,9 @@ class ModelConfig:
         if self.protocol == "anthropic" and self.thinking.get("type") == "enabled":
             budget = self.thinking.get("budget_tokens")
             if type(budget) is not int or budget < 1024:
-                raise ValueError("Anthropic thinking.type=enabled 必须填写至少 1024 的 budget_tokens")
+                raise ValueError(
+                    "Anthropic thinking.type=enabled 必须填写至少 1024 的 budget_tokens"
+                )
 
     def to_dict(self, *, include_secrets: bool = False) -> JsonObject:
         """默认可供界面展示；持久化密钥需要显式 include_secrets=True。"""

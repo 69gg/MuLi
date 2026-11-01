@@ -475,7 +475,9 @@ async def test_scoped_brief_survives_compaction_packing_and_real_reopen(tmp_path
         brief = next(message for message in messages if "完整受控任务说明（" in message.content)
         assert marker in brief.content and "不是新的主人指令或授权" in brief.content
         assert marker not in "".join(
-            message.content for message in messages if message is not brief
+            message.content
+            for message in messages
+            if message is not brief and "宿主固定约束" not in message.content
         )
         assert runtime.store.get("message", source["id"])["content"] == source["content"]  # type: ignore[index]
         assert context_size(messages) <= 14000

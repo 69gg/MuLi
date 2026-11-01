@@ -10,8 +10,8 @@ import pytest
 from muli.compaction import Candidate, Compactor
 from muli.compaction_pins import (
     Pin,
-    PinValidationError,
     PinsOverflow,
+    PinValidationError,
     brief_pins,
     load_snapshot_pins,
     merge_pins,
@@ -95,12 +95,8 @@ def test_brief_revision_supersedes_only_with_newer_verified_source(tmp_path: Pat
     new_brief = {"goal": "核对新版本", "constraints": ["不能写入生产"]}
     _brief_revision(store, commitment_id, 1, old_brief)
     _brief_revision(store, commitment_id, 2, new_brief)
-    old = brief_pins(
-        {"id": commitment_id, "revision": 1, "brief": old_brief}
-    )
-    new = brief_pins(
-        {"id": commitment_id, "revision": 2, "brief": new_brief}
-    )
+    old = brief_pins({"id": commitment_id, "revision": 1, "brief": old_brief})
+    new = brief_pins({"id": commitment_id, "revision": 2, "brief": new_brief})
 
     merged = merge_pins(supersede_brief_revision(old, new), new)
     validate_pin_sources(store, merged)

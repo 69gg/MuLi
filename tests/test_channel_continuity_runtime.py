@@ -168,9 +168,7 @@ async def test_delegated_channel_turn_writes_bounded_summary_and_links_outbox(
                 count = phases["main"] = phases.get("main", 0) + 1
                 entry = injected(messages)
                 assert entry is not None
-                completed = next(
-                    item for item in entry["items"] if item["status"] == "completed"
-                )
+                completed = next(item for item in entry["items"] if item["status"] == "completed")
                 assert completed["outcome"] == long_reply[:400]
                 assert long_reply[400:] not in entry["content"]
                 assert completed["input_id"] and completed["result_message_id"]

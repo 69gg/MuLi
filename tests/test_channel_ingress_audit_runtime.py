@@ -673,7 +673,7 @@ async def test_reclaim_while_real_read_permission_waits_delivers_no_old_result(
             # history result and never reaches a further worker model round.
             assert len(interrupted) == 1 and interrupted[0]["interrupted"] is True
             unknown = json.loads(interrupted[0]["content"])
-            assert unknown["status"] == "unknown" and set(unknown) == {"status", "error"}
+            assert unknown["status"] == "not_executed" and set(unknown) == {"status", "reason"}
             assert len(delivered_results) == 2
             assert not any(
                 event["type"] in {"tool.started", "tool.completed"}

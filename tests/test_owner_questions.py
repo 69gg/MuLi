@@ -269,7 +269,7 @@ async def test_record_only_keeps_owner_original_separate_and_dispatches_one_mail
     assert rig.coordinator.read(rig.task_id)["items"] == []
     starts: list[None] = []
 
-    def observe_question_start() -> None:
+    def observe_question_start(**_kwargs: Any) -> None:
         # Runtime also revisits the global scheduler when it claims inputs,
         # flushes plan deliveries and settles a run. Keep the worker dormant,
         # but count only this real owner tool's dispatch effect.
@@ -333,7 +333,7 @@ async def test_cancelling_a_queued_answer_cancels_only_its_exact_ingress(
     rig = QuestionRig(runtime, services)
     await rig.register()
     with monkeypatch.context() as patch:
-        patch.setattr(runtime.team, "start", lambda: None)
+        patch.setattr(runtime.team, "start", lambda **_kwargs: None)
         assert (await rig.owner(f"/回答并继续 {rig.question_id}\n原答。", delivery="dispatch"))[0][
             "queued"
         ] is True
@@ -403,7 +403,7 @@ async def test_public_question_pages_preserve_original_authority_without_repeate
     await rig.register()
     command = f"/{'回答并继续' if combined else '回答问题'} {rig.question_id}\n按原要求补出处。"
     with monkeypatch.context() as patch:
-        patch.setattr(runtime.team, "start", lambda: None)
+        patch.setattr(runtime.team, "start", lambda **_kwargs: None)
         result = (await rig.owner(command, delivery="dispatch" if combined else "record_only"))[0]
         assert result["accepted"] is True
         if not combined:
@@ -569,7 +569,7 @@ async def test_queued_answer_becomes_stale_before_claim_and_never_reaches_the_mo
     rig = QuestionRig(runtime, services)
     await rig.register()
     with monkeypatch.context() as patch:
-        patch.setattr(runtime.team, "start", lambda: None)
+        patch.setattr(runtime.team, "start", lambda **_kwargs: None)
         assert (
             await rig.owner(f"/回答并继续 {rig.question_id}\n旧要求下的原答。", delivery="dispatch")
         )[0]["queued"] is True
@@ -629,7 +629,7 @@ async def test_cancel_all_questions_for_one_worker_restores_the_shared_dormant_a
     question_ids = [item["question_id"] for item in rig.register_results]
     assert len(question_ids) == 2 and question_ids[0] != question_ids[1]
     with monkeypatch.context() as patch:
-        patch.setattr(runtime.team, "start", lambda: None)
+        patch.setattr(runtime.team, "start", lambda **_kwargs: None)
         for identifier in question_ids:
             rig.question_id = identifier
             assert (
@@ -660,7 +660,7 @@ async def test_cancel_pending_questions_seeks_metadata_without_prefetching_paylo
     question_ids = [receipt["question_id"] for receipt in rig.register_results]
     assert len(question_ids) == 2 and question_ids[0] != question_ids[1]
     with monkeypatch.context() as patch:
-        patch.setattr(runtime.team, "start", lambda: None)
+        patch.setattr(runtime.team, "start", lambda **_kwargs: None)
         for identifier in question_ids:
             rig.question_id = identifier
             assert (
@@ -714,7 +714,7 @@ async def test_cancel_oversized_pending_answer_gates_bytes_before_decode_and_rol
     body = "合" * 2700
     assert (await rig.owner(f"/回答问题 {rig.question_id}\n{body}"))[0]["answer_recorded"] is True
     with monkeypatch.context() as patch:
-        patch.setattr(runtime.team, "start", lambda: None)
+        patch.setattr(runtime.team, "start", lambda **_kwargs: None)
         assert (await rig.owner(f"/继续问题 {rig.question_id}", action="dispatch"))[0][
             "queued"
         ] is True

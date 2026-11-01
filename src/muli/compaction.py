@@ -11,8 +11,8 @@ from typing import Any
 
 from muli.compaction_pins import (
     Pin,
-    PinValidationError,
     PinsOverflow,
+    PinValidationError,
     load_snapshot_pins,
     merge_pins,
     pins_budget,
@@ -172,6 +172,7 @@ class Compactor:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._forget_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pin_failures: dict[str, tuple[str, str]] = {}
 
     def status(self, session_id: str) -> dict[str, Any]:
         active = self.store.get("compaction", session_id) or {}
@@ -281,9 +282,7 @@ class Compactor:
             f"parent={active.get('parent_snapshot_id') or 'none'}。\n"
             "摘要可能省略事实；未知、未执行与失败不能当作成功。"
             "不确定先用 conversation_read 按 seq 核原文及回执，"
-            "参数用 field=tool_calls；不要自动重做副作用。\n"
-            + pins_text
-            + "摘要正文：\n"
+            "参数用 field=tool_calls；不要自动重做副作用。\n" + pins_text + "摘要正文：\n"
         )
 
     def _available_groups(
@@ -358,18 +357,74 @@ class Compactor:
         if new:
             pins = merge_pins(supersede_brief_revision(pins, new), new)
         pins = tuple(
-            replace(pin, added_snapshot=snapshot_id)
-            if pin.added_snapshot is None
-            else pin
+            replace(pin, added_snapshot=snapshot_id) if pin.added_snapshot is None else pin
             for pin in pins
         )
         validate_pin_sources(self.store, pins)
-        render_pins(pins, budget=pins_budget(self.max_chars()))
+        budget = pins_budget(self.max_chars())
+        try:
+            render_pins(pins, budget=budget)
+        except PinsOverflow:
+            pins = self._evict_pins(session_id, pins, budget)
+            render_pins(pins, budget=budget)
+        self._pin_failures.pop(session_id, None)
         return pins
+
+    def _evict_pins(self, session_id: str, pins: tuple[Pin, ...], budget: int) -> tuple[Pin, ...]:
+        """Drop the oldest, lowest-priority pins until the host budget fits."""
+        priority = {
+            "prohibition": 0,
+            "authorization": 1,
+            "goal": 2,
+            "unfinished_tool": 3,
+            "evidence": 4,
+        }
+        remaining = pins
+        while True:
+            active = [pin for pin in remaining if pin.state == "active"]
+            if not active:
+                return remaining
+            dropped = min(
+                active,
+                key=lambda pin: (
+                    -priority.get(pin.kind, len(priority)),
+                    pin.source_seq is None,
+                    pin.source_seq or 0,
+                    pin.commitment_id or "",
+                    pin.revision or 0,
+                    pin.quote_sha256,
+                ),
+            )
+            dropped_ids = {dropped.pin_id}
+            remaining = tuple(
+                pin
+                for pin in remaining
+                if pin.pin_id not in dropped_ids
+                and not (pin.state == "superseded" and pin.superseded_by in dropped_ids)
+            )
+            self.store.event(
+                "compaction.pins_evicted",
+                {
+                    "pin_id": dropped.pin_id,
+                    "kind": dropped.kind,
+                    "quote_sha256": dropped.quote_sha256,
+                    "budget": budget,
+                },
+                session_id,
+            )
+            try:
+                render_pins(remaining, budget=budget)
+            except PinsOverflow:
+                continue
+            return remaining
 
     def _pins_failed(self, session_id: str, error: Exception) -> None:
         code = getattr(error, "code", "pins_overflow")
         reason = str(error)
+        signature = (str(code), reason)
+        if self._pin_failures.get(session_id) == signature:
+            return
+        self._pin_failures[session_id] = signature
         if self.on_pins_overflow is not None:
             self.on_pins_overflow(session_id, str(code), reason)
             return
@@ -413,9 +468,7 @@ class Compactor:
             budget = max(128, int(self.max_chars() * self.settings().target_ratio) // 2)
             snapshot_id = new_id()
             try:
-                pins = self._collect_pins(
-                    session_id, previous, selected, snapshot_id=snapshot_id
-                )
+                pins = self._collect_pins(session_id, previous, selected, snapshot_id=snapshot_id)
             except (PinsOverflow, PinValidationError) as exc:
                 self._pins_failed(session_id, exc)
                 return None
@@ -588,9 +641,7 @@ class Compactor:
             pins = candidate.pins
         else:
             try:
-                pins = self._collect_pins(
-                    session_id, previous, records, snapshot_id=snapshot_id
-                )
+                pins = self._collect_pins(session_id, previous, records, snapshot_id=snapshot_id)
             except (PinsOverflow, PinValidationError) as exc:
                 self._pins_failed(session_id, exc)
                 return
@@ -600,7 +651,10 @@ class Compactor:
             "extractive",
         )
         if policy.mode == "auto":
-            source = extract(records, previous_text, self.max_chars(), compact_calls=compact_calls)
+            source_budget = self.max_chars()
+            if pins_text:
+                source_budget = max(128, source_budget - len(pins_text) - 2)
+            source = extract(records, previous_text, source_budget, compact_calls=compact_calls)
             if pins_text:
                 source = pins_text + "\n\n" + source
             try:
@@ -649,8 +703,7 @@ class Compactor:
         if not self.settings().enabled or candidate.fingerprint != self.fingerprint():
             return False
         if candidate.pins and (
-            candidate.pins_digest != pins_digest(candidate.pins)
-            or candidate.pins_version != 1
+            candidate.pins_digest != pins_digest(candidate.pins) or candidate.pins_version != 1
         ):
             return False
         if candidate.pins:

@@ -112,7 +112,9 @@ async def guarded_service_action(
     confirm: bool = False,
 ) -> dict[str, Any]:
     if service.platform != "linux":
-        return await service.action(action, confirm=confirm)
+        return await service.action(
+            action, **({"confirm": confirm} if action == "uninstall" else {})
+        )
     root = managed_root or service.data_dir.absolute() / "management" / "transaction-v1"
     managed = managed_record(root, required=managed_root is not None)
     if managed is not None:
@@ -135,7 +137,9 @@ async def guarded_service_action(
                 raise TransactionError("service_identity_changed")
             with ConfigurationFile(service.path, anchor.journal.max_snapshot_bytes) as unit:
                 unit.confirm(binding.unit.digest, guard=control.check)
-            return await service.action(action, confirm=confirm)
+            return await service.action(
+                action, **({"confirm": confirm} if action == "uninstall" else {})
+            )
     _check_unit(service, installing=action == "install")
     manifest = _published(root)
     with (
@@ -150,4 +154,6 @@ async def guarded_service_action(
         if record is not None and not record.resolved:
             raise TransactionError("transaction_in_progress")
         _check_unit(service, installing=action == "install")
-        return await service.action(action, confirm=confirm)
+        return await service.action(
+            action, **({"confirm": confirm} if action == "uninstall" else {})
+        )

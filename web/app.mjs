@@ -198,10 +198,11 @@ function saveComposerSnapshot(identity) {
   composerDraftNote = saved ? "已暂存本页草稿，尚未发送。" : "浏览器草稿未能保存，请保留当前页面。";
 }
 
-function promptComposition(prompt, { mode = "append", expected = null, maxChars = null, confirmed = true } = {}) {
+function promptComposition(prompt, { mode = "append", expected = null, maxChars = null, confirmed = true, dedupe = true } = {}) {
   const input = $("#message-input");
   return applyComposerPrompt(prompt, {
     mode,
+    dedupe,
     session: state.activeSession?.id,
     mainSession: state.mainSessionId,
     expectedSession: expected?.session,
@@ -214,16 +215,16 @@ function promptComposition(prompt, { mode = "append", expected = null, maxChars 
   });
 }
 
-function applyPromptToComposer(prompt, { mode = "append", expected = null, maxChars = null } = {}) {
-  const preview = promptComposition(prompt, { mode, expected, maxChars });
+function applyPromptToComposer(prompt, { mode = "append", expected = null, maxChars = null, dedupe = true } = {}) {
+  const preview = promptComposition(prompt, { mode, expected, maxChars, dedupe });
   if (!preview.ok) return preview;
   const commit = () => {
     // The draft may have changed while a replacement confirmation was open.
-    const current = promptComposition(prompt, { mode, expected, maxChars });
+    const current = promptComposition(prompt, { mode, expected, maxChars, dedupe });
     if (!current.ok) return current;
     if (current.unchanged) return current;
     const input = $("#message-input");
-    composerPromptUndo = { session: state.activeSession?.id, text: current.previousText };
+    composerPromptUndo = { session: state.activeSession?.id, text: current.previousText, applied: current.text };
     input.value = current.text;
     composerChanged(); resizeComposer(); renderComposerDraft(); input.focus();
     return current;
@@ -258,7 +259,9 @@ function renderComposerDraft() {
   $("#composer-draft-recheck").hidden = !blocked;
   $("#composer-draft-recheck").disabled = !!composerAttachmentCheck;
   $("#composer-draft-discard").disabled = !$("#message-input").value && !state.attachments.length;
-  $("#composer-prompt-undo").hidden = !composerPromptUndo || composerPromptUndo.session !== state.activeSession?.id;
+  $("#composer-prompt-undo").hidden = !composerPromptUndo
+    || composerPromptUndo.session !== state.activeSession?.id
+    || $("#message-input").value !== composerPromptUndo.applied;
 }
 
 function discardComposerDraft() {
@@ -5435,7 +5438,7 @@ async function handleAction(action, button) {
   if (action === "voice-draft-dismiss") { state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); }
   if (action === "voice-draft-append") {
     const text = $("#voice-draft-text").value;
-    const applied = applyPromptToComposer(text, { expected: captureDraft(), maxChars: state.status?.web_voice?.max_text_chars ?? 64000 });
+    const applied = applyPromptToComposer(text, { expected: captureDraft(), dedupe: false, maxChars: state.status?.web_voice?.max_text_chars ?? 64000 });
     if (!applied.ok) throw new Error(applied.reason === "too_long" ? "合并后的草稿超过上限，请先缩短内容。" : "草稿已变化，请重新加入转写。");
     state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput();
   }
@@ -5452,7 +5455,8 @@ async function handleAction(action, button) {
   if (action === "retry-composer-attachments") await checkComposerAttachments();
   if (action === "discard-composer-draft") discardComposerDraft();
   if (action === "undo-composer-prompt") {
-    if (composerPromptUndo && composerPromptUndo.session === state.activeSession?.id) {
+    if (composerPromptUndo && composerPromptUndo.session === state.activeSession?.id
+      && $("#message-input").value === composerPromptUndo.applied) {
       const input = $("#message-input");
       input.value = composerPromptUndo.text;
       composerPromptUndo = null;
@@ -5633,7 +5637,7 @@ $("#login-form").addEventListener("submit", async (event) => {
   catch (error) { $("#login-error").textContent = error.message; $("#login-error").hidden = false; }
   finally { button.disabled = false; }
 });
-$("#message-input").addEventListener("input", () => { composerChanged(); resizeComposer(); });
+$("#message-input").addEventListener("input", () => { composerChanged(); resizeComposer(); renderComposerDraft(); });
 $("#message-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
 });

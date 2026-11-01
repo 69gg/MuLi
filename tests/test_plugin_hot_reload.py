@@ -85,7 +85,9 @@ async def test_failed_reload_keeps_old_generation(tmp_path: Path) -> None:
     write_plugin(directory, "demo")
     try:
         await plugins.load()
-        (directory / "demo" / "main.py").write_text("raise RuntimeError('bad reload')\n", encoding="utf-8")
+        (directory / "demo" / "main.py").write_text(
+            "raise RuntimeError('bad reload')\n", encoding="utf-8"
+        )
         record = await plugins.reload("demo")
         assert record["status"] == "degraded"
         assert plugins.contexts[0].prompt.strip() == "v1"

@@ -463,6 +463,7 @@ class ChannelApplication:
         _, reason = check_preference(settings, self.runtime.store.db)
         return {
             **self.manager.status(),
+            "owner_warnings": list(settings.channels.owner_warnings),
             "proactive": {
                 **settings.channels.proactive.model_dump(),
                 "next_destination": selected.dump()["destination"],

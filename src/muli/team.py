@@ -237,6 +237,20 @@ class TeamManager:
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def count(self, status: str | None = None) -> int:
+        """Count agents without materialising an unbounded listing."""
+        if status is None:
+            row = self.runtime.store.db.execute(
+                "SELECT count(*) FROM objects WHERE kind='agent'"
+            ).fetchone()
+        else:
+            row = self.runtime.store.db.execute(
+                "SELECT count(*) FROM objects WHERE kind='agent' "
+                "AND json_extract(data,'$.status')=?",
+                (status,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def page(
         self, *, limit: int = 50, offset: int = 0, active_only: bool = False
     ) -> dict[str, Any]:
@@ -601,7 +615,9 @@ class TeamManager:
                 or len(self._active) >= self.runtime.config.settings.limits.max_pending_runs
             ):
                 continue
-            lease = self.runtime.quota.try_acquire((record.session_id, "", ""))
+            lease = self.runtime.quota.try_acquire(
+                (record.session_id, "", f"{record.run_id}:{record.generation}")
+            )
             if lease is None:
                 continue
             record.reserved = True
@@ -780,7 +796,8 @@ class TeamManager:
         text = self._message(origin, content)
         updated = (
             {**agent, "status": "queued"}
-            if wake and (agent["status"] in TERMINAL - {"paused"} or agent["status"] == "recovering")
+            if wake
+            and (agent["status"] in TERMINAL - {"paused"} or agent["status"] == "recovering")
             else agent
         )
         references = self._attachment_references(attachment_ids)
@@ -998,7 +1015,7 @@ class TeamManager:
                     (
                         agent["session_id"],
                         str(agent.get("commitment_id") or ""),
-                        "",
+                        f"{agent['id']}:{agent.get('generation', 0)}",
                     )
                 )
                 if lease is None:

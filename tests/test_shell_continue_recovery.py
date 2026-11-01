@@ -52,6 +52,8 @@ assert Path(os.environ["MULI_HOME"]).resolve().is_relative_to(config_path.parent
 sys.path.insert(0, str(source / "src"))
 
 import httpx
+from pydantic import ValidationError
+
 import muli.config as config_module
 import muli.runtime as runtime_module
 import muli.shell_sessions as shell_module
@@ -126,6 +128,35 @@ assert runtime_module.Runtime is Runtime
 assert store_module.Store.__module__ == "muli.store"
 assert config_module.default_home() == Path(os.environ["MULI_HOME"])
 
+def previous_config(path: Path) -> ConfigFile:
+    # Give the frozen build the config shape an actual older install would have.
+    # Config and store schemas evolve independently; this fixture isolates the
+    # store-format admission under test instead of failing on newer default keys.
+    # The file itself is left byte-identical.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    while True:
+        try:
+            settings = config_module.Settings.model_validate(data)
+            break
+        except ValidationError as error:
+            extras = [
+                item["loc"]
+                for item in error.errors()
+                if item["type"] == "extra_forbidden"
+            ]
+            if not extras:
+                raise
+            for location in extras:
+                target = data
+                for part in location[:-1]:
+                    target = target[part]
+                target.pop(location[-1], None)
+    result = config_module.ConfigFile.__new__(config_module.ConfigFile)
+    result.path = path
+    result.settings = settings
+    return result
+
+
 runtime: Runtime
 fresh_payload: dict[str, Any] | None = None
 
@@ -187,7 +218,7 @@ async def main() -> dict[str, Any]:
 
         Runtime._recover = refuse_recovery
         try:
-            runtime = Runtime(ConfigFile(config_path), data_dir, client_factory=client_factory)
+            runtime = Runtime(previous_config(config_path), data_dir, client_factory=client_factory)
         except FormatAdmissionError as error:
             assert error.code == "store_format_unsupported", error.code
             assert all(count == 0 for count in attempts.values()), attempts
@@ -553,7 +584,15 @@ async def test_real_crash_snapshots_reopen_without_shell_replay(
             expected = {**before}
             if expected["status"] in {"running", "queued", "pending"}:
                 expected["status"] = "interrupted"
-            assert after == expected, (snapshot.name, after)
+            comparable = {
+                key: value for key, value in after.items() if not key.startswith("recovery_")
+            }
+            # Only an interrupted run gains new terminal timestamps; completed
+            # runs must keep their original values.
+            for timestamp in ("finished_at", "updated_at"):
+                if timestamp not in expected:
+                    comparable.pop(timestamp, None)
+            assert comparable == expected, (snapshot.name, after)
         assert all(count == 0 for count in result["attempts"].values()), snapshot.name
 
 

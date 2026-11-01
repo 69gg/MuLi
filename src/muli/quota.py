@@ -1,8 +1,8 @@
 """跨团队与工作流的并行租约，避免各自的本地上限叠加后互相阻塞。
 
-租约按 ``(session_id, commitment_id, run_id)`` 幂等发放；同一执行重复申请返回
-原租约，不会重复占槽。总量仍由 ``max_parallel_agents`` 作为安全阀。租约只控制
-是否开始执行，不改变模型权限、审批或任务说明。
+租约按 ``(session_id, commitment_id, task_generation)`` 幂等发放；同一执行重复申请返回
+原租约，不会重复占槽；不同任务代次即使复用会话也不会继承尚未释放的租约。总量仍由
+``safety_max_agents`` 作为安全阀。租约只控制是否开始执行，不改变模型权限、审批或任务说明。
 """
 
 from __future__ import annotations
@@ -37,7 +37,8 @@ class QuotaBroker:
     def __init__(self, limit: Callable[[], int]) -> None:
         self._limit = limit
         self._leases: dict[Key, Lease] = {}
-        self._waiters: set[asyncio.Event] = set()
+        # 保持等待者的登记顺序，释放时按排队顺序唤醒。
+        self._waiters: list[asyncio.Event] = []
         self._listeners: list[Callable[[], None]] = []
 
     def add_listener(self, listener: Callable[[], None]) -> None:
@@ -84,11 +85,14 @@ class QuotaBroker:
             if lease is not None:
                 return lease
             event = asyncio.Event()
-            self._waiters.add(event)
+            self._waiters.append(event)
             try:
                 await event.wait()
             finally:
-                self._waiters.discard(event)
+                try:
+                    self._waiters.remove(event)
+                except ValueError:
+                    pass
 
     def release(self, lease: Lease) -> None:
         if lease.released or self._leases.get(lease.key) is not lease:

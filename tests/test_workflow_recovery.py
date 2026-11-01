@@ -25,9 +25,24 @@ async def test_workflow_recovery_preserves_pending_and_interrupts_started_nodes(
     data = tmp_path / "data"
     store = Store.open_runtime(data / "muli.sqlite3", default_mode="ask")
     sessions = {
-        "pending-node": {"id": "pending-node", "title": "待开始", "kind": "workflow", "status": "idle"},
-        "running-node": {"id": "running-node", "title": "已开始", "kind": "workflow", "status": "running"},
-        "parked-node": {"id": "parked-node", "title": "已暂停", "kind": "workflow", "status": "paused"},
+        "pending-node": {
+            "id": "pending-node",
+            "title": "待开始",
+            "kind": "workflow",
+            "status": "idle",
+        },
+        "running-node": {
+            "id": "running-node",
+            "title": "已开始",
+            "kind": "workflow",
+            "status": "running",
+        },
+        "parked-node": {
+            "id": "parked-node",
+            "title": "已暂停",
+            "kind": "workflow",
+            "status": "paused",
+        },
     }
     for session in sessions.values():
         store.put("session", session)

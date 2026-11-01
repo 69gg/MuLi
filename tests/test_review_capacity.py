@@ -6,7 +6,7 @@ from typing import Any
 
 from test_runtime import make_runtime
 
-from muli.providers import Message, ModelConfig, ModelTurn
+from muli.providers import Message, ModelTurn
 
 
 class SlowReviewClient:

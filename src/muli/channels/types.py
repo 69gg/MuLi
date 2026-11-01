@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -165,6 +165,11 @@ class ChannelsConfig:
         try:
             for name in OWNER_CHANNELS:
                 profile = self.profile(name)
+                if name == "weixin" and profile.enabled and not profile.owner_ids:
+                    # Frozen snapshots still need a safe disable; replace only
+                    # this profile and leave every other transport setting intact.
+                    object.__setattr__(self, name, replace(profile, enabled=False))
+                    continue
                 validate_channel_owners(name, profile.owner_ids, enabled=profile.enabled)
         except ValueError as error:
             raise ChannelError(str(error)) from None

@@ -15,9 +15,7 @@ async def test_resume_safe_only_when_no_started_attempt(tmp_path: Path) -> None:
         session = runtime.new_session()
         sid = str(session["id"])
         run_id = new_id()
-        runtime.store.put(
-            "run", {"id": run_id, "session_id": sid, "status": "interrupted"}
-        )
+        runtime.store.put("run", {"id": run_id, "session_id": sid, "status": "interrupted"})
         attempts = ToolAttempts(runtime.store)
         committed = attempts.begin(
             run_id=run_id,
