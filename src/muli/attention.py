@@ -12,6 +12,7 @@ from typing import Any
 from muli.config import AttentionSettings
 from muli.evidence import EvidenceError
 from muli.file_inbox import FileInboxState, read_record
+from muli.host_notice import HostNoticeDelivery
 from muli.integrations.attention import ChiliarchAttentionState
 from muli.memory_source_failure import failure_current
 from muli.memory_watches import MATCH_EVENT, MAX_MATCH_PROOF_BYTES
@@ -55,6 +56,8 @@ class AttentionInbox:
         self._generation = 0
         self._waiting = "stopped"
         self.last_error: str | None = None
+        # 服务器在渠道管理器建立后注入；测试或旧装配可保持 None。
+        self.host_delivery: HostNoticeDelivery | None = None
         # Construct before producers start: first-enable history is intentionally skipped,
         # but an overdue reminder emitted during application startup is a fresh event.
         self._initialize()
@@ -223,6 +226,76 @@ class AttentionInbox:
             ensure_ascii=False,
         )
 
+    def _receipt_objects(
+        self,
+        records: list[dict[str, Any]],
+        batch_id: str,
+        *,
+        extras: dict[str, dict[str, Any]] | None = None,
+        notifications: list[dict[str, Any]] | None = None,
+        advance: int | None = None,
+        session_id: str | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        objects: list[tuple[str, dict[str, Any]]] = []
+        if advance is not None:
+            objects.append(("attention_state", self._state(advance, True)))
+        for record in records:
+            objects.append(
+                (
+                    "attention_receipt",
+                    {
+                        "id": record["receipt_id"],
+                        "event_id": record["event_id"],
+                        "kind": record["kind"],
+                        "record_id": record["record_id"],
+                        "batch_id": batch_id,
+                        "routing": record["routing"],
+                        "status": "accepted",
+                        **(extras or {}).get(record["receipt_id"], {}),
+                        **(
+                            {"file_inbox_proof": record["file_inbox_proof"]}
+                            if record["file_inbox_proof"] is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "project_proof": record["project_inbox_proof"].dump(),
+                                "project_snapshot": record["project_task_snapshot"].dump(),
+                            }
+                            if record["project_inbox_proof"] is not None
+                            else {}
+                        ),
+                        **(
+                            {"producer_proof": record["producer_proof"]}
+                            if record["producer_proof"] is not None
+                            else {}
+                        ),
+                        **(
+                            {"memory_failure_proof": record["memory_failure_proof"].dump()}
+                            if record["memory_failure_proof"] is not None
+                            else {}
+                        ),
+                        **(
+                            {"memory_watch_proof": record["memory_watch_proof"].dump()}
+                            if record["memory_watch_proof"] is not None
+                            else {}
+                        ),
+                    },
+                )
+            )
+        objects.extend(("notification", item) for item in notifications or [])
+        if session_id is not None and records and records[0]["file_inbox_proof"] is not None:
+            input_id = hashlib.sha256(
+                f"{session_id}\0system:attention\0{batch_id}".encode()
+            ).hexdigest()
+            objects.append(
+                (
+                    "file_inbox_admission",
+                    {"id": input_id, "revision": records[0]["file_inbox_proof"]["revision"]},
+                )
+            )
+        return objects
+
     async def _wait_for_work(self) -> bool:
         main_id = self.runtime.main_session()["id"]
         task = self.runtime.tasks.get(main_id)
@@ -386,18 +459,9 @@ class AttentionInbox:
         if not records:
             self.store.put("attention_state", self._state(after, True))
             return True
-        if self.runtime.attention_busy:
-            return await self._wait_for_work()
-        session = self.runtime.main_session()
-        if (
-            self._pending()
-            or self.store.pending_inputs(session["id"])
-            >= self.runtime.config.settings.limits.max_pending_runs
-        ):
-            self._waiting = "backpressure"
-            return False
         generation = self._generation
         watch_guard = self.runtime.memory_watch_guard
+        session = self.runtime.main_session()
         project = (
             ProjectInboxBatch(
                 tuple(record["project_inbox_proof"] for record in records),
@@ -497,60 +561,62 @@ class AttentionInbox:
                         raise _ProducerPolicyChanged("chiliarch 消息提醒策略已改变")
 
         batch_id = f"events:{records[0]['event_id']}:{after}"
-        objects = [("attention_state", self._state(after, True))]
-        objects.extend(
-            (
-                "attention_receipt",
-                {
-                    "id": record["receipt_id"],
-                    "event_id": record["event_id"],
-                    "kind": record["kind"],
-                    "record_id": record["record_id"],
-                    "batch_id": batch_id,
-                    "routing": record["routing"],
-                    "status": "accepted",
-                    **(
-                        {"file_inbox_proof": record["file_inbox_proof"]}
-                        if record["file_inbox_proof"] is not None
-                        else {}
-                    ),
-                    **(
-                        {
-                            "project_proof": record["project_inbox_proof"].dump(),
-                            "project_snapshot": record["project_task_snapshot"].dump(),
-                        }
-                        if record["project_inbox_proof"] is not None
-                        else {}
-                    ),
-                    **(
-                        {"producer_proof": record["producer_proof"]}
-                        if record["producer_proof"] is not None
-                        else {}
-                    ),
-                    **(
-                        {"memory_failure_proof": record["memory_failure_proof"].dump()}
-                        if record["memory_failure_proof"] is not None
-                        else {}
-                    ),
-                    **(
-                        {"memory_watch_proof": record["memory_watch_proof"].dump()}
-                        if record["memory_watch_proof"] is not None
-                        else {}
-                    ),
-                },
-            )
-            for record in records
+        outcome = (
+            await self.host_delivery.deliver(records, guard=guard)
+            if self.host_delivery is not None
+            else None
         )
-        if records[0]["file_inbox_proof"] is not None:
-            input_id = hashlib.sha256(
-                f"{session['id']}\0system:attention\0{batch_id}".encode()
-            ).hexdigest()
-            objects.append(
-                (
-                    "file_inbox_admission",
-                    {"id": input_id, "revision": records[0]["file_inbox_proof"]["revision"]},
-                )
+        delivered = outcome.delivered if outcome is not None else set()
+        if outcome is not None and delivered and len(delivered) == len(records):
+            await self.runtime.commit_attention_host(
+                self._receipt_objects(
+                    records,
+                    batch_id,
+                    extras=outcome.receipts,
+                    notifications=outcome.notifications,
+                    advance=after,
+                ),
+                admission_guard=guard,
             )
+            self._waiting = "host"
+            return True
+        if outcome is not None and delivered:
+            delivered_records = [record for record in records if record["receipt_id"] in delivered]
+            await self.runtime.commit_attention_host(
+                self._receipt_objects(
+                    delivered_records,
+                    batch_id,
+                    extras=outcome.receipts,
+                    notifications=outcome.notifications,
+                ),
+                admission_guard=guard,
+            )
+            records = [record for record in records if record["receipt_id"] not in delivered]
+            routing = FrozenRouting.load(records[0]["routing"])
+            project = (
+                ProjectInboxBatch(
+                    tuple(record["project_inbox_proof"] for record in records),
+                    records[0]["project_task_snapshot"],
+                )
+                if records[0]["project_inbox_proof"] is not None
+                else None
+            )
+        if self.runtime.attention_busy:
+            return await self._wait_for_work()
+        if (
+            self._pending()
+            or self.store.pending_inputs(session["id"])
+            >= self.runtime.config.settings.limits.max_pending_runs
+        ):
+            self._waiting = "backpressure"
+            return False
+        objects = self._receipt_objects(
+            records,
+            batch_id,
+            extras=outcome.receipts if outcome is not None else None,
+            advance=after,
+            session_id=session["id"],
+        )
         try:
             receipt = await self.runtime.submit_attention(
                 self._content(records),

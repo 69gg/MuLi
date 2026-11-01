@@ -41,6 +41,7 @@ from muli.evidence import EvidenceError
 from muli.extensions import ExtensionError
 from muli.file_inbox import FileInbox, FileInboxSettings
 from muli.history_evidence import HistoryEvidence
+from muli.host_notice import HostNoticeDelivery
 from muli.integrations.attention import ChiliarchAttentionInput
 from muli.local_services import LocalServices
 from muli.maintenance import BootPermit, MaintenanceError
@@ -212,7 +213,8 @@ class PairInput(Input):
 
 
 class ServiceInput(Input):
-    action: Literal["install", "start", "restart", "stop", "enable", "disable"]
+    action: Literal["install", "start", "restart", "stop", "enable", "disable", "uninstall"]
+    confirm: bool = False
 
 
 class TransactionRequest(Input):
@@ -305,6 +307,7 @@ def _create_app(
         webpage_reader=local_services.memory_webpage,
     )
     channel_application = ChannelApplication(runtime, attachments)
+    attention.host_delivery = HostNoticeDelivery(runtime, lambda: channel_application.manager)
     personal_io = PersonalIO(runtime, local_services, attachments)
     from muli.integrations.manager import IntegrationManager
 
@@ -348,6 +351,7 @@ def _create_app(
 
         async def rebuild() -> None:
             await runtime.reconfigure()
+            await plugins.reconfigure()
             await memory_application.reconfigure()
             await channel_application.reconfigure()
             await personal_io.reconfigure()
@@ -1081,6 +1085,11 @@ def _create_app(
             "file_inbox": file_inbox.status(),
             "system_events": runtime.system_events.status(),
             "topic_reminders": runtime.topic_reminders.status(),
+            "quota": {
+                **runtime.quota.status(),
+                "agents_running": runtime.team.count("running"),
+                "workflow_running": len(runtime.workflows.active_run_ids),
+            },
             "limits": settings.limits.model_dump(),
         }
 
@@ -1947,7 +1956,7 @@ def _create_app(
             runtime.maintenance.require_configuration()
             from muli.management_cli import guarded_service_action
 
-            return await guarded_service_action(service, body.action)
+            return await guarded_service_action(service, body.action, confirm=body.confirm)
 
     @app.get("/api/export")
     async def export() -> StreamingResponse:

@@ -1,5 +1,6 @@
 import { request as apiRequest, readEvents, uploadFile, transcribeAttachment } from "./api.mjs";
 import { composerIdentity, createComposerDraft, MAX_DRAFT_ATTACHMENTS, sameComposerIdentity, validDraftAttachment } from "./composer-draft.mjs";
+import { applyComposerPrompt, REPLACE_CONFIRMATION } from "./composer-prompt.mjs";
 import { MODES, createSessionState, applyEvent, hydrateSession, conversationItems, isRunning, toolStatusLabel, formatTimestamp, parseJSONField, toDateTimeLocal, fromDateTimeLocal, formatFullDate, messagePresentation } from "./state.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { setPath, settingsPatch, changesListener, settingsExtras, mergeSettingsExtras, selectProactiveDestination, selectNotificationPreference, selectPreferenceDestination, preferenceStatusLabel, MODEL_ROLES, SETTINGS_GROUPS } from "./settings.mjs";
@@ -129,6 +130,7 @@ let composerPendingEdit = null;
 let composerAttachmentCheck = null;
 let composerSubmission = null;
 let composerDraftNote = "";
+let composerPromptUndo = null;
 let composerStorageWarning = false;
 const composerUploads = new Set();
 const previewDraftValues = new Map();
@@ -196,6 +198,46 @@ function saveComposerSnapshot(identity) {
   composerDraftNote = saved ? "已暂存本页草稿，尚未发送。" : "浏览器草稿未能保存，请保留当前页面。";
 }
 
+function promptComposition(prompt, { mode = "append", expected = null, maxChars = null, confirmed = true, dedupe = true } = {}) {
+  const input = $("#message-input");
+  return applyComposerPrompt(prompt, {
+    mode,
+    dedupe,
+    session: state.activeSession?.id,
+    mainSession: state.mainSessionId,
+    expectedSession: expected?.session,
+    revision: draftRevision,
+    expectedRevision: expected?.revision,
+    text: input.value,
+    expectedText: expected?.text,
+    maxChars: maxChars ?? (input.maxLength || 64000),
+    confirmed,
+  });
+}
+
+function applyPromptToComposer(prompt, { mode = "append", expected = null, maxChars = null, dedupe = true } = {}) {
+  const preview = promptComposition(prompt, { mode, expected, maxChars, dedupe });
+  if (!preview.ok) return preview;
+  const commit = () => {
+    // The draft may have changed while a replacement confirmation was open.
+    const current = promptComposition(prompt, { mode, expected, maxChars, dedupe });
+    if (!current.ok) return current;
+    if (current.unchanged) return current;
+    const input = $("#message-input");
+    composerPromptUndo = { session: state.activeSession?.id, text: current.previousText, applied: current.text };
+    input.value = current.text;
+    composerChanged(); resizeComposer(); renderComposerDraft(); input.focus();
+    return current;
+  };
+  if (mode === "replace" && preview.previousText) {
+    confirmAction("替换草稿", REPLACE_CONFIRMATION, "替换", () => {
+      if (!commit().ok) toast("草稿已变化，未替换。", true);
+    });
+    return { ...preview, pending: true };
+  }
+  return commit();
+}
+
 function stopComposerOperations() {
   composerPendingEdit = null;
   composerAttachmentCheck?.controller.abort(); composerAttachmentCheck = null;
@@ -217,12 +259,16 @@ function renderComposerDraft() {
   $("#composer-draft-recheck").hidden = !blocked;
   $("#composer-draft-recheck").disabled = !!composerAttachmentCheck;
   $("#composer-draft-discard").disabled = !$("#message-input").value && !state.attachments.length;
+  $("#composer-prompt-undo").hidden = !composerPromptUndo
+    || composerPromptUndo.session !== state.activeSession?.id
+    || $("#message-input").value !== composerPromptUndo.applied;
 }
 
 function discardComposerDraft() {
   stopComposerOperations(); voiceInput.cancel();
   const cleared = composerDraft.clear();
   $("#message-input").value = ""; state.attachments = []; draftRevision += 1;
+  composerPromptUndo = null;
   composerDraftNote = cleared ? "" : "浏览器草稿未能清除，请清除本页站点存储后再退出。";
   composerStorageWarning ||= !cleared;
   if (!cleared) toast(composerDraftNote, true);
@@ -237,6 +283,7 @@ async function restoreComposerDraft(owner, revision) {
   if (changed) {
     stopComposerOperations(); voiceInput.cancel();
     $("#message-input").value = ""; state.attachments = []; state.voiceDraft = null; $("#voice-draft-text").value = ""; draftRevision += 1;
+    composerPromptUndo = null;
     composerDraft.clear(); composerDraftNote = "";
   }
   composerDraftBinding = identity;
@@ -1055,7 +1102,7 @@ function historyDirectory(payload, sessionId, before, through) {
   return payload;
 }
 
-async function showHistoryArchive(sessionId, { trigger = null, title = "已保存记录", fromRecord = false } = {}) {
+async function showHistoryArchive(sessionId, { trigger = null, title = "运行记录", fromRecord = false } = {}) {
   if (!sessionId) return;
   const slot = openHistoryDialog(sessionId, "正文归档", trigger, "list");
   slot.recordTitle = title; slot.fromRecord = fromRecord;
@@ -1162,7 +1209,7 @@ function renderHistoryDialog(slot) {
         if (typeof message.content === "string") row.append(element("button", { type: "button", class: "text-button", text: "查看正文", dataset: { historyMessageId: message.id }, onClick: () => void selectHistoryMessage(slot, message) }));
         root.append(row);
       }
-      if (!slot.page.messages.length) root.append(element("p", { role: "status", text: "此页没有已保存记录。" }));
+      if (!slot.page.messages.length) root.append(element("p", { role: "status", text: "此页没有记录。" }));
     }
   }
   if (slot.controller) root.append(element("p", { role: "status", class: "history-note", text: "正在读取…" }));
@@ -1204,6 +1251,7 @@ async function sendMessage(event) {
   let pendingId = null;
   const stillCurrent = () => composerSubmission === submission && composerContextCurrent(owner, store, targetSession.id, intentVersion);
   input.value = ""; draftRevision += 1; state.attachments = []; renderComposerAttachments(); resizeComposer();
+  composerPromptUndo = null;
   const emptyRevision = draftRevision;
   composerDraftNote = "";
   state.sending = true; renderComposer();
@@ -2204,16 +2252,13 @@ async function prepareTaskQuestion(slot, detail, trigger) {
   const main = state.mainSessionId, draft = captureDraft();
   if (!main || draft.session !== main) return;
   const reference = `参考任务（页面观察修订 ${detail.revision}）：请先用 commitment_read 按 identifier 读取当前说明，核对与以下 observed_revision 的差异，再回答我的问题；这不是继续或批准操作的授权。\n${JSON.stringify({ identifier: detail.id, observed_revision: detail.revision })}`;
-  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
   const input = $("#message-input");
-  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入任务。", true); return; }
+  const preview = promptComposition(reference, { expected: draft });
+  if (!preview.ok) { toast(preview.reason === "too_long" ? "草稿太长，先缩短内容再带入任务。" : "草稿有变动，请重新带入任务。"); return; }
   const navigation = viewRequestVersion + 1;
   await switchView("chat", owner);
   if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
-  const current = captureDraft();
-  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入任务。"); return; }
-  if (merged !== draft.text) { input.value = merged; composerChanged(); }
-  resizeComposer(); input.focus();
+  if (!applyPromptToComposer(reference, { expected: draft }).ok) toast("草稿有变动，请重新带入任务。");
 }
 
 function ownerQuestionCurrent(slot) {
@@ -3682,16 +3727,13 @@ async function prepareSourceQuestion(slot, page, trigger) {
   const main = state.mainSessionId, draft = captureDraft();
   if (!main || draft.session !== main) return;
   const reference = `参考资料：请先用 memory_source 按以下 id 和 revision 核对原文，再回答我的问题；不可用时请说明，不改用其他版本。\n${JSON.stringify({ id: page.source_id, revision: page.revision })}`;
-  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
   const input = $("#message-input");
-  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入资料。", true); return; }
+  const preview = promptComposition(reference, { expected: draft });
+  if (!preview.ok) { toast(preview.reason === "too_long" ? "草稿太长，先缩短内容再带入资料。" : "草稿有变动，请重新带入资料。"); return; }
   const navigation = viewRequestVersion + 1;
   await switchView("chat", owner);
   if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
-  const current = captureDraft();
-  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
-  if (merged !== draft.text) { input.value = merged; composerChanged(); }
-  resizeComposer(); input.focus();
+  if (!applyPromptToComposer(reference, { expected: draft }).ok) toast("草稿有变动，请重新带入资料。");
 }
 
 async function loadMemoryHistory(slot) {
@@ -3943,17 +3985,12 @@ async function prepareWorkflowSourceDraft(identifier, trigger) {
     if (!current()) return;
     if (evidence?.run_id !== identifier || typeof evidence.revision !== "string" || !/^[a-f0-9]{64}$/.test(evidence.revision)) throw new Error("工作流资料响应不完整，请重新读取。");
     const reference = `参考工作流资料：请先用 workflow_inspect 核对下列运行和版本，再按我的新要求安排后续工作；不要重做旧操作。\n${JSON.stringify({ run_id: identifier, revision: evidence.revision })}`;
-    const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
-    if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入资料。", true); return; }
-    const latest = captureDraft();
-    if (latest.session !== draft.session || latest.revision !== draft.revision || latest.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
+    const preview = promptComposition(reference, { expected: draft });
+    if (!preview.ok) { toast(preview.reason === "too_long" ? "草稿太长，先缩短内容再带入资料。" : "草稿有变动，请重新带入资料。"); return; }
     const navigation = viewRequestVersion + 1;
     await switchView("chat", owner);
     if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
-    const next = captureDraft();
-    if (next.session !== draft.session || next.revision !== draft.revision || next.text !== draft.text) { toast("草稿有变动，请重新带入资料。"); return; }
-    if (merged !== draft.text) { input.value = merged; composerChanged(); }
-    resizeComposer(); input.focus();
+    if (!applyPromptToComposer(reference, { expected: draft }).ok) toast("草稿有变动，请重新带入资料。");
   } catch (error) {
     if (current() && error.name !== "AbortError") showError(error);
   } finally {
@@ -4035,7 +4072,7 @@ function renderNotifications() {
   slot.navigation = element("nav", { class: "record-pagination", "aria-label": "通知目录分页" });
   slot.result = element("div", { id: "notification-directory-result", "aria-busy": "false" });
   root.className += " notification-directory";
-  root.append(element("div", { class: "content-toolbar" }, slot.filter, slot.refresh, slot.mark), element("p", { class: "settings-role-hint", text: "下方只统计本页；侧栏徽标统计最近通知窗口（最多 200 条）及待批准事项。已读不代表已处理。" }), slot.notice, slot.navigation, slot.result);
+  root.append(element("div", { class: "content-toolbar" }, slot.filter, slot.refresh, slot.mark), element("p", { class: "settings-role-hint", text: "下方只统计本页；通知入口徽标统计最近通知窗口（最多 200 条）及待批准事项。已读不代表已处理。" }), slot.notice, slot.navigation, slot.result);
   slot.root = root;
   return root;
 }
@@ -4291,16 +4328,13 @@ async function prepareNotificationQuestion(slot, record, trigger) {
   if (!main || draft.session !== main) return;
   const sources = notificationReferences(record, true);
   const reference = `参考通知：请先用 notification_read 按以下 id 和 revision 核对保存的完整原文与来源，再回答我的问题；原提醒的当前约定须另外核查，已读不代表已处理。\n${JSON.stringify({ id: slot.id, revision: slot.revision })}${Object.keys(sources).length ? `\n已保存的来源定位：${JSON.stringify(sources)}` : ""}`;
-  const merged = draft.text.includes(reference) ? draft.text : draft.text ? `${draft.text}\n\n${reference}` : reference;
   const input = $("#message-input");
-  if (merged.length > input.maxLength) { toast("草稿太长，先缩短内容再带入通知。", true); return; }
+  const preview = promptComposition(reference, { expected: draft });
+  if (!preview.ok) { toast(preview.reason === "too_long" ? "草稿太长，先缩短内容再带入通知。" : "草稿有变动，请重新带入通知。"); return; }
   const navigation = viewRequestVersion + 1;
   await switchView("chat", owner);
   if (!connectionCurrent(owner) || !state.auth.authenticated || !state.connected || navigation !== viewRequestVersion || state.view !== "chat" || state.mainSessionId !== main || state.activeSession?.id !== main || $("#message-input") !== input) return;
-  const current = captureDraft();
-  if (current.session !== draft.session || current.revision !== draft.revision || current.text !== draft.text) { toast("草稿有变动，请重新带入通知。"); return; }
-  if (merged !== draft.text) { input.value = merged; composerChanged(); }
-  resizeComposer(); input.focus();
+  if (!applyPromptToComposer(reference, { expected: draft }).ok) toast("草稿有变动，请重新带入通知。");
 }
 
 function intervalLabel(seconds) {
@@ -4422,8 +4456,8 @@ function renderConfigurationOverview() {
     const content = input.value.trim();
     if (!content) return;
     await switchView("chat");
-    $("#message-input").value = `请调整沐璃的配置：\n${content}`; composerChanged(); resizeComposer();
-    if (state.status?.configured) $("#composer").requestSubmit();
+    const applied = applyPromptToComposer(`请调整沐璃的配置：\n${content}`, { mode: "replace" });
+    if (!applied.ok) toast(applied.reason === "too_long" ? "草稿太长，先缩短配置要求。" : "当前无法带入配置要求，请返回主会话重试。", true);
   } }, element("label", { class: "field" }, element("span", { text: "想调整什么？" }), element("textarea", { rows: 4, placeholder: "例如：每天晚上九点提醒我整理笔记", required: true, "aria-label": "配置要求" })), element("button", { type: "submit", class: "primary-button", text: "交给沐璃" }));
   const examples = element("div", { class: "configuration-examples" });
   for (const [label, prompt] of [["检查配置", "请检查当前配置和未就绪的能力。"], ["接入消息渠道", "帮我配置一个消息渠道，先告诉我需要哪些资料。"], ["配置语音", "请检查语音唤醒需要的本地组件，并帮我规划配置。"], ["查看更新", "请查看更新状态和待应用的管理操作。"]]) examples.append(actionButton(label, "configure-prompt", "text-button", undefined, { prompt }));
@@ -4472,9 +4506,10 @@ function renderChannelSettings() {
   for (const [key, label] of CHANNELS) {
     const profile = config[key] ?? {}; const path = `channels.${key}`; const status = channelStatus[key];
     const privateOwner = ["onebot", "telegram", "qq"].includes(key);
+    const requiresOwner = privateOwner || key === "weixin";
     const enabled = switchField("启用渠道", `${path}.enabled`, profile.enabled);
-    const owner = field(key === "onebot" ? "主人 QQ 号" : privateOwner ? "主人用户 ID" : "你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", required: privateOwner && Boolean(profile.enabled), hint: key === "onebot" ? "启用前必填。每行一个 QQ 号，仅接收主人私聊。" : privateOwner ? "启用前必填。每行一个平台用户 ID，仅接收主人私聊。" : "每行一个 ID。" });
-    if (privateOwner) $("input", enabled).addEventListener("change", (event) => { $("textarea", owner).required = event.target.checked; });
+    const owner = field(key === "onebot" ? "主人 QQ 号" : privateOwner ? "主人用户 ID" : "你的用户 ID", `${path}.owner_ids`, (profile.owner_ids ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines", required: requiresOwner && Boolean(profile.enabled), hint: key === "onebot" ? "启用前必填。每行一个 QQ 号，仅接收主人私聊。" : privateOwner ? "启用前必填。每行一个平台用户 ID，仅接收主人私聊。" : "启用前必填。每行一个微信用户 ID；群聊仍以主人身份发送。" });
+    if (requiresOwner) $("input", enabled).addEventListener("change", (event) => { $("textarea", owner).required = event.target.checked; });
     const credentials = element("details", { class: "advanced-settings" }, element("summary", { text: "连接凭据" }));
     for (const [name, title] of [["token", "令牌"], ["webhook_secret", "Webhook 密钥"], ["client_secret", "客户端密钥"]]) {
       credentials.append(field(title, `${path}.${name}`, profile[name] ?? "", { type: "password", placeholder: profile[`${name}_set`] ? "已配置，留空保留" : "按渠道需要填写" }));
@@ -4488,7 +4523,7 @@ function renderChannelSettings() {
       !privateOwner && field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
       switchField("接收附件", `${path}.receive_files`, profile.receive_files), credentials,
       settingsJSON(path, profile, commonFields),
-      status && statusList([["运行", capabilityLabel(status)], ...(status.receive_health ? [["后台接收", !status.enabled ? "已关闭" : ({ idle: "尚未验证", ready: "最近正常", failed: "故障" })[status.receive_health.state] ?? "尚未验证"]] : []), ["已授权用户", String(status.owner_count ?? 0)], ...(privateOwner ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
+      status && statusList([["运行", capabilityLabel(status)], ["语音发送", status.voice_supported ? "原生语音" : "仅文件"], ...(status.receive_health ? [["后台接收", !status.enabled ? "已关闭" : ({ idle: "尚未验证", ready: "最近正常", failed: "故障" })[status.receive_health.state] ?? "尚未验证"]] : []), ["已授权用户", String(status.owner_count ?? 0)], ...(privateOwner ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
       status?.last_error && element("p", { class: "form-error", text: status.last_error })));
   }
   root.append(renderProactiveSettings(config), settingsSection("发送队列", state.channels && statusList(Object.entries(state.channels.outbox ?? {}).map(([key, count]) => [deliveryLabel(key), String(count)])), settingsJSON("channels", config, [...CHANNELS.map(([key]) => key), "proactive"]), renderDeliveries()));
@@ -5227,11 +5262,11 @@ function renderSystemSettings() {
   if (service?.log) serviceSection.append(element("details", { class: "advanced-settings" }, element("summary", { text: "服务日志" }), element("pre", { class: "service-log", text: Array.isArray(service.log) ? service.log.join("\n") : service.log })));
   if (service?.reason) serviceSection.append(element("p", { text: service.reason }));
   return element("div", {},
-    settingsSection("工作台", statusList([["版本", state.status?.version], ["平台", state.status?.platform], ["运行任务", String(state.status?.running ?? 0)]]), element("div", { class: "field-row field-top-space" }, field("监听地址", "server.host", config.server?.host ?? ""), field("端口", "server.port", config.server?.port ?? "", { type: "number", min: 1, max: 65535 })), element("p", { text: "监听变更将排队执行重启事务。" }), element("div", { class: "system-links" }, element("a", { href: "/api/export", download: "muli-export.jsonl", class: "secondary-button export-button", text: "导出数据" }), element("a", { href: "/api/docs", target: "_blank", rel: "noopener", class: "secondary-button export-button", text: "API 参考" }))),
+    settingsSection("工作台", statusList([["版本", state.status?.version], ["平台", state.status?.platform], ["运行任务", String(state.status?.running ?? 0)], ["配额", state.status?.quota ? `${state.status.quota.leased ?? state.status.quota.used ?? 0}/${state.status.quota.limit}，等待 ${state.status.quota.waiting ?? 0}` : "状态未知"]]), element("div", { class: "field-row field-top-space" }, field("监听地址", "server.host", config.server?.host ?? ""), field("端口", "server.port", config.server?.port ?? "", { type: "number", min: 1, max: 65535 })), element("p", { text: "监听变更将排队执行重启事务。" }), element("div", { class: "system-links" }, element("a", { href: "/api/export", download: "muli-export.jsonl", class: "secondary-button export-button", text: "导出数据" }), element("a", { href: "/api/docs", target: "_blank", rel: "noopener", class: "secondary-button export-button", text: "API 参考" }))),
     settingsSection("通知", switchField("桌面通知", "notifications.enabled", config.notifications?.enabled), state.status?.notifications?.available === false && element("p", { text: "桌面通知暂不可用。" }), notificationHint && element("p", { class: "settings-role-hint", text: notificationHint }), notifications?.last_error && element("p", { class: "form-error", text: notifications.last_error })),
     settingsSection("访问", field("访问密码", "server.password", "", { type: "password", placeholder: config.server?.password_set ? "已设置，留空保留" : "尚未设置" }), config.server?.password_set && switchField("清除访问密码", "server.clear_password", false), state.auth.required && actionButton("退出登录", "logout", "secondary-button")),
     serviceSection,
-    settingsSection("运行限制", element("div", { class: "field-row" }, field("并行 Agent 数", "limits.max_parallel_agents", limits.max_parallel_agents ?? "", { type: "number", min: 1 }), field("未完成任务上限", "limits.max_pending_runs", limits.max_pending_runs ?? "", { type: "number", min: 1, placeholder: "使用服务默认值" })), element("div", { class: "field-row" }, field("工具步骤上限", "limits.max_tool_steps", limits.max_tool_steps ?? "", { type: "number", min: 1 }), field("任务时限（秒）", "limits.max_run_seconds", limits.max_run_seconds ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("文件大小上限（字节）", "limits.max_file_bytes", limits.max_file_bytes ?? "", { type: "number", min: 1 }), field("工具输出字符上限", "limits.max_output_chars", limits.max_output_chars ?? "", { type: "number", min: 1 })), settingsJSON("limits", limits, ["max_parallel_agents", "max_pending_runs", "max_tool_steps", "max_run_seconds", "max_file_bytes", "max_output_chars"])),
+    settingsSection("运行限制", element("div", { class: "field-row" }, field("并行 Agent 数", "limits.max_parallel_agents", limits.max_parallel_agents ?? "", { type: "number", min: 1 }), field("审查并行数", "limits.review_parallel", limits.review_parallel ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("未完成任务上限", "limits.max_pending_runs", limits.max_pending_runs ?? "", { type: "number", min: 1, placeholder: "使用服务默认值" }), field("Agent 安全阀", "limits.safety_max_agents", limits.safety_max_agents ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("工具步骤上限", "limits.max_tool_steps", limits.max_tool_steps ?? "", { type: "number", min: 1 }), field("工作流步骤上限", "limits.max_workflow_steps", limits.max_workflow_steps ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("任务时限（秒）", "limits.max_run_seconds", limits.max_run_seconds ?? "", { type: "number", min: 1 }), field("文件大小上限（字节）", "limits.max_file_bytes", limits.max_file_bytes ?? "", { type: "number", min: 1 })), element("div", { class: "field-row" }, field("工具输出字符上限", "limits.max_output_chars", limits.max_output_chars ?? "", { type: "number", min: 1 })), settingsJSON("limits", limits, ["max_parallel_agents", "review_parallel", "safety_max_agents", "max_pending_runs", "max_tool_steps", "max_workflow_steps", "max_run_seconds", "max_file_bytes", "max_output_chars"])),
     settingsSection("附件库", settingsJSON("uploads", config.uploads ?? {})));
 }
 
@@ -5359,7 +5394,7 @@ async function handleAction(action, button) {
     state.voiceSetupController?.release();
     await switchView("chat");
     const input = $("#message-input");
-    if (!input.value.trim()) { input.value = "请帮我配置本地语音：先检查状态并准备已有本地模型的配置，保持后台唤醒关闭，再指导我明确登记声纹和做一次有限验证。不要自动安装依赖或下载模型。"; composerChanged(); }
+    if (!input.value.trim()) applyPromptToComposer("请帮我配置本地语音：先检查状态并准备已有本地模型的配置，保持后台唤醒关闭，再指导我明确登记声纹和做一次有限验证。不要自动安装依赖或下载模型。");
     else toast("已保留草稿，可以直接请沐璃协助配置语音。");
     resizeComposer(); $("#message-input").focus();
   }
@@ -5402,11 +5437,10 @@ async function handleAction(action, button) {
   }
   if (action === "voice-draft-dismiss") { state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); }
   if (action === "voice-draft-append") {
-    const input = $("#message-input");
     const text = $("#voice-draft-text").value;
-    const merged = input.value ? `${input.value}\n${text}` : text;
-    if (merged.length > (state.status?.web_voice?.max_text_chars ?? 64000)) throw new Error("合并后的草稿超过上限，请先缩短内容。");
-    input.value = merged; composerChanged(); state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput(); resizeComposer(); input.focus();
+    const applied = applyPromptToComposer(text, { expected: captureDraft(), dedupe: false, maxChars: state.status?.web_voice?.max_text_chars ?? 64000 });
+    if (!applied.ok) throw new Error(applied.reason === "too_long" ? "合并后的草稿超过上限，请先缩短内容。" : "草稿已变化，请重新加入转写。");
+    state.voiceDraft = null; $("#voice-draft-text").value = ""; renderVoiceInput();
   }
   if (action === "remove-attachment") { const selected = state.attachments.filter((file) => file.id !== button.dataset.id); if (selected.length !== state.attachments.length) { state.attachments = selected; composerChanged(); } renderComposerAttachments(); }
   if (action === "use-attachment") {
@@ -5420,8 +5454,21 @@ async function handleAction(action, button) {
   if (action === "transcribe-saved-audio") openSavedAudio(button);
   if (action === "retry-composer-attachments") await checkComposerAttachments();
   if (action === "discard-composer-draft") discardComposerDraft();
+  if (action === "undo-composer-prompt") {
+    if (composerPromptUndo && composerPromptUndo.session === state.activeSession?.id
+      && $("#message-input").value === composerPromptUndo.applied) {
+      const input = $("#message-input");
+      input.value = composerPromptUndo.text;
+      composerPromptUndo = null;
+      composerChanged(); resizeComposer(); renderComposerDraft(); input.focus();
+    }
+  }
   if (action === "collect-attachment") await openAttachmentCollection(state.uploads.find((entry) => entry.id === button.dataset.id), button);
-  if (action === "configure-prompt") { await switchView("chat"); $("#message-input").value = button.dataset.prompt ?? ""; composerChanged(); resizeComposer(); }
+  if (action === "configure-prompt") {
+    await switchView("chat");
+    const applied = applyPromptToComposer(button.dataset.prompt ?? "", { mode: "replace" });
+    if (!applied.ok) toast("当前无法带入提示词，请返回主会话重试。", true);
+  }
   if (action === "refresh-team") await refreshTeam();
   if (action === "view-task-brief") await showTaskBrief(button.dataset.commitment);
   if (action === "filter-team") await refreshTeam({ offset: 0, activeOnly: button.dataset.active === "true" });
@@ -5590,7 +5637,7 @@ $("#login-form").addEventListener("submit", async (event) => {
   catch (error) { $("#login-error").textContent = error.message; $("#login-error").hidden = false; }
   finally { button.disabled = false; }
 });
-$("#message-input").addEventListener("input", () => { composerChanged(); resizeComposer(); });
+$("#message-input").addEventListener("input", () => { composerChanged(); resizeComposer(); renderComposerDraft(); });
 $("#message-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
 });

@@ -180,6 +180,18 @@ async def test_long_first_user_compacts_replays_and_survives_real_reopen(
         assert active is not None, "长首条 user 已过 target，但原回复未纳入受管压缩前缀"
         assert active["kind"] == "extractive" and active["covered_seq"] == records[1]["seq"]
         assert middle not in active["summary"]
+        assert active["pins_version"] == 1
+        if kind == "main":
+            assert any(
+                "不能部署 production" in pin["quote"]
+                for pin in active["pins"]
+                if pin["state"] == "active"
+            ), "长原文中的主人限制必须进入固定约束，不能被摘要静默丢弃"
+        else:
+            # A teammate prompt is delegated coordination text, not an owner
+            # message or TaskBriefInput; only those two host-verified sources
+            # may become pins.
+            assert active["pins"] == []
         assert runtime.store.get("message", source["id"]) == source
         release_second.set()
         assert await asyncio.wait_for(runtime.wait(target_runs[1]), timeout=2) == second_reply
@@ -215,6 +227,10 @@ async def test_long_first_user_compacts_replays_and_survives_real_reopen(
             message.role == "system"
             and "历史分层摘要，仅为资料" in message.content
             and active["summary"] in message.content
+            and (
+                kind == "teammate"
+                or ("宿主固定约束" in message.content and "不能部署 production" in message.content)
+            )
             for message in replay
         )
         assert all(message.source_message_id != source["id"] for message in replay)

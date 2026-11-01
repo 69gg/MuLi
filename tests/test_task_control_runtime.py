@@ -755,7 +755,7 @@ async def test_delivery_keyset_pass_reaches_paused_target_after_full_running_mai
     parked = runtime.team.get(second["target_session_id"])
     runtime.team._finish(parked, "paused", "旧请求已停靠", None)
     runtime.config.update({"limits": {"max_pending_runs": 1}})
-    monkeypatch.setattr(runtime.team, "start", lambda: None)
+    monkeypatch.setattr(runtime.team, "start", lambda **_kwargs: None)
     try:
         await runtime.flush_task_plan_deliveries()
         assert runtime.store.get("task_plan_delivery", first["id"])["state"] == "pending"  # type: ignore[index]
@@ -809,7 +809,7 @@ async def test_delivery_remembers_capacity_event_after_cursor_already_passed_tar
 
     monkeypatch.setattr(asyncio, "sleep", sleep)
     monkeypatch.setattr(services.task_control, "pending_deliveries", pending)
-    monkeypatch.setattr(runtime.team, "start", lambda: None)
+    monkeypatch.setattr(runtime.team, "start", lambda **_kwargs: None)
     try:
         flusher = asyncio.create_task(runtime.flush_task_plan_deliveries())
         await asyncio.wait_for(entered.wait(), 2)
@@ -1088,7 +1088,7 @@ async def test_report_capacity_release_during_keyset_pass_requests_one_event_ret
         await original_deliver(report)
 
     monkeypatch.setattr(runtime, "_wake_main", lambda: None)
-    monkeypatch.setattr(runtime.team, "start", lambda: None)
+    monkeypatch.setattr(runtime.team, "start", lambda **_kwargs: None)
     monkeypatch.setattr(runtime.team, "_deliver_report", deliver)
     monkeypatch.setattr(asyncio, "sleep", sleep)
     try:

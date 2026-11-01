@@ -112,7 +112,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
   const close = node("button", "dialog-close", actions); close.dataset.action = "close-dialog"; node("button", "dialog-submit", actions);
   const other = node("div", "other-view"); const shell = node("div", "app-shell"); shell.className = "app-shell";
   node("div", "auth-gate"); node("input", "login-password");
-  for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll"]) node("div", id);
+  for (const id of ["composer", "login-form", "message-input", "mode-select", "file-input", "conversation-scroll", "composer-draft-state", "composer-draft-status", "composer-draft-recheck", "composer-draft-discard", "composer-prompt-undo"]) node("div", id);
   const heading = node("div", "other-heading", other); heading.className = "view-heading"; node("h2", "view-title", heading);
   const requests = [], windowEvents = {}, streams = new Map();
   const context = {
@@ -192,7 +192,7 @@ test("directory navigation uses actual returned boundaries, one DOM page and a f
 
 test("empty archives and exhausted older pages are explicit and never loop or fetch automatically", async () => {
   const h = harness(async () => directory([])); await h.ui.showHistoryArchive("main");
-  assert.ok(h.body().includes("此页没有已保存记录"));
+  assert.ok(h.body().includes("此页没有记录"));
   assert.equal(h.button("更早一页").disabled, true); assert.equal(h.requests.length, 1);
   assert.equal(h.ui.slot.through, 0);
   const older = harness(async (path) => path.includes("before_seq") ? directory([], { through_seq: 5 }) : directory([message(5)], { has_older: true, next_before_seq: 5 }));

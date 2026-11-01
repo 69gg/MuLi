@@ -348,7 +348,8 @@ async def test_real_finish_ready_and_bound_generation_are_distinct_current_facts
         record = runtime.team._shell_continuations[state.target]
 
         def defer() -> None:
-            finished.set()
+            if record.finished is not None:
+                finished.set()
 
         try:
             with monkeypatch.context() as patch:

@@ -148,6 +148,9 @@ CREATE TABLE IF NOT EXISTS channel_outbox (
  next_attempt REAL NOT NULL,last_error TEXT NOT NULL DEFAULT '',receipts TEXT NOT NULL DEFAULT '[]',
  created_at REAL NOT NULL,updated_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS channel_outbox_ready ON channel_outbox(state,next_attempt,created_at);
+CREATE INDEX IF NOT EXISTS channel_outbox_continuity
+ ON channel_outbox(
+  CASE WHEN json_valid(payload) THEN json_extract(payload,'$.channel_continuity.id') END);
 """
 
 

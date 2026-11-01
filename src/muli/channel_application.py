@@ -332,6 +332,8 @@ class ChannelApplication:
     def _manager(self) -> ChannelManager:
         data = self.runtime.config.settings.channels.model_dump()
         data.pop("proactive")
+        # 连续摘要是宿主运行策略，不是渠道传输配置。
+        data.pop("continuity_digest", None)
         expected = self.runtime.config.settings.channels.model_dump()
         transport_settings = {
             name: value for name, value in expected.items() if name != "proactive"
@@ -461,6 +463,7 @@ class ChannelApplication:
         _, reason = check_preference(settings, self.runtime.store.db)
         return {
             **self.manager.status(),
+            "owner_warnings": list(settings.channels.owner_warnings),
             "proactive": {
                 **settings.channels.proactive.model_dump(),
                 "next_destination": selected.dump()["destination"],
@@ -789,6 +792,7 @@ class ChannelApplication:
                 attention_routing=routing.dump() if routing is not None else None,
                 admission_guard=guard,
                 ownership=request.channel_ownership,
+                continuity=runtime.channel_continuity.reference(request.channel_ownership),
             )
 
         return [

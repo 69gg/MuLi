@@ -75,8 +75,20 @@ class ApprovalNotice:
 
 
 class Permissions:
-    def __init__(self, store: Store, bus: EventBus, review: Review, timeout: int = 600) -> None:
+    def __init__(
+        self,
+        store: Store,
+        bus: EventBus,
+        review: Review,
+        timeout: int = 600,
+        *,
+        boot_epoch: str | None = None,
+        review_with_source: Callable[[str, dict[str, Any], str], Awaitable[tuple[bool, str, str]]]
+        | None = None,
+    ) -> None:
         self.store, self.bus, self.review, self.timeout = store, bus, review, timeout
+        self.boot_epoch = boot_epoch
+        self.review_with_source = review_with_source
         self.pending: dict[str, asyncio.Future[bool]] = {}
         self._waiting: dict[tuple[str, str], set[str]] = {}
 
@@ -95,14 +107,25 @@ class Permissions:
             return
         reason = "本次调用需要批准"
         if mode == "auto":
+            reviewer_source = "main"
             try:
-                allowed, reason = await self.review(tool, arguments, risk)
+                if self.review_with_source is not None:
+                    allowed, reason, reviewer_source = await self.review_with_source(
+                        tool, arguments, risk
+                    )
+                else:
+                    allowed, reason = await self.review(tool, arguments, risk)
             except Exception:  # noqa: BLE001 - review failures always require user approval
                 allowed, reason = False, "独立审查暂不可用"
             if allowed and risk not in {"destructive", "external", "computer"}:
                 await self.bus.emit(
                     "tool.reviewed",
-                    {"tool": tool, "allowed": True, "reason": reason},
+                    {
+                        "tool": tool,
+                        "allowed": True,
+                        "reason": reason,
+                        "reviewer_source": reviewer_source,
+                    },
                     session_id,
                 )
                 return
@@ -116,6 +139,7 @@ class Permissions:
             "risk": risk,
             "status": "pending",
             "created_at": now(),
+            "boot_epoch": self.boot_epoch,
         }
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self.pending[approval["id"]] = future
@@ -215,8 +239,17 @@ class Permissions:
             raise RuntimeError("审批决定不能嵌套提交")
         future = self.pending.get(identifier)
         approval = self.store.get("approval", identifier)
-        if future is None or future.done() or approval is None or approval["status"] != "pending":
-            raise ValueError("审批已结束或运行已中止")
+        if (
+            future is None
+            or future.done()
+            or approval is None
+            or approval["status"] != "pending"
+            or (
+                self.boot_epoch is not None
+                and approval.get("boot_epoch") not in {None, self.boot_epoch}
+            )
+        ):
+            raise ValueError("审批已结束、属于旧实例或运行已中止")
         approval["status"] = "approved" if decision == "approve" else "rejected"
         with self.store.db:
             self.store._event(

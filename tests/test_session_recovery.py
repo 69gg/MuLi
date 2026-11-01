@@ -89,7 +89,7 @@ async def test_restart_publishes_recovery_for_an_existing_subscriber_without_exe
         async with aclosing(runtime.bus.stream(before, sid)) as stream:
             wire = await anext(stream)
         assert json.loads(wire.split("data: ", 1)[1])["type"] == "session.recovered"
-        assert runtime.store.get("approval", "old-approval")["status"] == "interrupted"
+        assert runtime.store.get("approval", "old-approval")["status"] == "expired"
         assert not runtime.tasks and not runtime.permissions.pending
         assert runtime.store.messages(sid) == []
         runtime._recover()

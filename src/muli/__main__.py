@@ -101,8 +101,19 @@ def main() -> None:
     service = commands.add_parser("service", help="管理当前系统的用户后台服务")
     service.add_argument(
         "action",
-        choices=["status", "print", "install", "start", "stop", "restart", "enable", "disable"],
+        choices=[
+            "status",
+            "print",
+            "install",
+            "start",
+            "stop",
+            "restart",
+            "enable",
+            "disable",
+            "uninstall",
+        ],
     )
+    service.add_argument("--confirm", action="store_true", help="确认卸载用户服务；数据会保留")
     commands.add_parser("doctor", help="显示配置和本机能力")
     recovery = commands.add_parser("management", help="查看恢复事务或接续现有控制者")
     recovery.add_argument("action", choices=["status", "recover"])
@@ -119,6 +130,8 @@ def main() -> None:
         arguments = [args.command]
         if args.command in {"service", "management"}:
             arguments.append(args.action)
+            if args.command == "service" and args.action == "uninstall" and args.confirm:
+                arguments.append("--confirm")
         elif args.command == "plugins":
             arguments.extend([args.action, args.identifier])
         elif args.command == "init":
@@ -190,7 +203,10 @@ def main() -> None:
                     manager.status()
                     if args.action == "status"
                     else guarded_service_action(
-                        manager, args.action, managed_root=args.managed_root
+                        manager,
+                        args.action,
+                        managed_root=args.managed_root,
+                        confirm=args.confirm,
                     )
                 )
             except (OSError, ValueError) as exc:

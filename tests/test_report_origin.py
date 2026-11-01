@@ -465,7 +465,7 @@ async def test_nested_agents_send_resume_and_reopen_keep_original_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
-    monkeypatch.setattr(runtime.team, "start", lambda: None)
+    monkeypatch.setattr(runtime.team, "start", lambda **_kwargs: None)
     main = runtime.main_session()
     token = runtime._request_context.set(PreparedRequest(main["id"], [], reply_origin=origin()))
     try:
@@ -532,7 +532,7 @@ async def test_report_origin_and_ingress_handoff_commit_together(
 ) -> None:
     runtime, _ = make_runtime(tmp_path, [])
     monkeypatch.setattr(runtime, "_wake_main", lambda: None)
-    monkeypatch.setattr(runtime.team, "start", lambda: None)
+    monkeypatch.setattr(runtime.team, "start", lambda **_kwargs: None)
     report = {
         "id": "report",
         "parent_id": runtime.main_session()["id"],

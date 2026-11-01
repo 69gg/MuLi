@@ -20,6 +20,9 @@ _CLIENT_VERSION = (2 << 16) | (4 << 8) | 6
 
 
 class Weixin(Adapter):
+    # iLink 原生语音发送未实现；语音附件必须显式使用 media_mode=file。
+    voice_mime_types: frozenset[str] = frozenset()
+
     def ready(self) -> None:
         super().ready()
         if (

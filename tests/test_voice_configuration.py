@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from test_acoustic_bridge import configuration
 
+import muli.acoustic_bridge as bridge
 from muli.acoustic_bridge import load_config
 from muli.evidence import EvidenceError
 from muli.platforms.files import LocalFiles
@@ -49,6 +50,22 @@ async def test_prepare_reuses_exact_private_snapshot_without_applying_or_loading
     assert second == result and list(files.root.iterdir()) == [path]
     if os.name == "posix":
         assert path.stat().st_mode & 0o077 == 0
+
+
+async def test_prepare_preserves_explicit_rocm_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = models(tmp_path)
+    values["provider"] = "rocm"
+    files = LocalFiles(tmp_path / "private", 2_000_000, 20_000_000)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: object())
+    monkeypatch.setattr(bridge, "rocm_visible", lambda: False)
+    result = await prepare_acoustic(values, files, max_output_chars=10000, guard=allowed)
+    assert result["changes"]["voice"]["device"] == "rocm"
+    assert result["preflight"]["provider_unavailable"] is True
+    assert result["preflight"]["effective_provider"] == "rocm"
+    assert result["preflight"]["runtime_verified"] is False
+    assert load_config(Path(result["configuration_path"])).provider == "rocm"
 
 
 async def test_preparation_output_and_caller_gates_precede_any_write(tmp_path: Path) -> None:

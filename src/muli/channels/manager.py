@@ -47,6 +47,19 @@ def encoded(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
+def continuity_reference(value: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """只保存宿主给出的有界摘要引用，不接受任意 outbox 元数据。"""
+    if value is None:
+        return None
+    keys = ("id", "main_id", "agent_id", "run_id")
+    if set(value) != set(keys) or any(
+        not isinstance(value.get(key), str) or not value[key] or len(value[key]) > 256
+        for key in keys
+    ):
+        raise ChannelError("渠道连续摘要引用无效")
+    return {key: value[key] for key in keys}
+
+
 class _BlockedDelivery(ChannelError):
     pass
 
@@ -709,6 +722,7 @@ class ChannelManager:
         approval_notice: ApprovalNotice | None = None,
         admission_guard: Callable[[], None] | None = None,
         ownership: dict[str, Any] | None = None,
+        continuity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if admission_guard is not None:
             admission_guard()
@@ -817,6 +831,9 @@ class ChannelManager:
                 raise ChannelError("渠道归属投递缺少宿主验证")
             self.ownership_guard(ownership, selected)
             payload["channel_ownership"] = dict(ownership)
+        continuity_data = continuity_reference(continuity)
+        if continuity_data is not None:
+            payload["channel_continuity"] = continuity_data
         if automatic:
             payload["automatic"] = True
         if metadata is not None:
@@ -841,6 +858,10 @@ class ChannelManager:
                 or existing["route"] != selected
                 or existing["payload"].get("attention_routing") != metadata
                 or existing["payload"].get("approval_notice") != notice_data
+                or (
+                    existing["payload"].get("channel_continuity") is not None
+                    and existing["payload"].get("channel_continuity") != continuity_data
+                )
             ):
                 raise ChannelError("相同投递 ID 的内容或发送模式不一致", status_code=409)
             return existing

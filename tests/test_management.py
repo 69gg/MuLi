@@ -260,11 +260,23 @@ async def test_update_retains_uv_tool_requirements_and_reports_constraint_failur
     calls: list[list[str]] = []
 
     async def command(argv: list[str], **kwargs: Any) -> dict[str, Any]:
-        calls.append(argv)
+        if argv[0] == "uv":
+            calls.append(argv)
         if argv[1:] == ["tool", "dir"]:
             return {"exit_code": 0, "output": str(root)}
+        if argv[1:] == ["--version"]:
+            return {"exit_code": 0, "output": "2.0.0"}
+        if "doctor" in argv:
+            return {"exit_code": 0, "output": '{"version": "2.0.0"}'}
         return {"exit_code": exit_code, "output": ""}
 
+    executable = (
+        root / "muli-agent" / "Scripts" / "muli.exe"
+        if sys.platform == "win32"
+        else root / "muli-agent" / "bin" / "muli"
+    )
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setattr("muli.updates.shutil.which", lambda _: "uv")
     monkeypatch.setattr("muli.updates.run_process", command)
     monkeypatch.setattr("muli.updates.sys.prefix", str(root / "muli-agent"))
@@ -275,7 +287,11 @@ async def test_update_retains_uv_tool_requirements_and_reports_constraint_failur
                 await updates.apply("2.0.0")
         else:
             result = await updates.apply("2.0.0")
-            assert result == {"installed": "2.0.0", "source": "absent", "restart_required": True}
+            assert result["installed"] == "2.0.0"
+            assert result["source"] == "absent"
+            assert result["restart_required"] is True
+            assert result["health"] == "passed"
+            assert result["rollback"] == "not_needed"
         assert calls == [
             ["uv", "tool", "dir"],
             ["uv", "tool", "upgrade", "--no-python-downloads", "muli-agent==2.0.0"],

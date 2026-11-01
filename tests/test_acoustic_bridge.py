@@ -192,6 +192,7 @@ def test_wake_uses_relative_models_pcm_float32_and_exact_engine_threshold(
         "score_kind": "decision",
         "threshold": 0.62,
         "configured_provider": "cpu",
+        "provider": "cpu",
     }
     assert "score" not in result
     options = calls["wake_kwargs"]
@@ -224,6 +225,44 @@ def test_auto_uses_configured_cuda_without_claiming_gpu_execution(
     assert result["configured_provider"] == "cuda"
     assert calls["wake_kwargs"]["provider"] == "cuda"
     assert "runtime_verified" not in result
+
+
+def test_rocm_is_rejected_before_engine_and_auto_falls_back_to_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = bridge.load_config(configuration(tmp_path, provider="rocm"))
+    audio = wav(tmp_path / "audio.wav")
+    calls = fake_engine(monkeypatch)
+    automatic = bridge.detect(config, request(audio))
+    assert automatic["configured_provider"] == "rocm" and automatic["provider"] == "cpu"
+    assert calls["wake_kwargs"]["provider"] == "cpu"
+    imports = forbid_engine(monkeypatch)
+    with pytest.raises(ValueError, match="不支持 ROCm"):
+        bridge.detect(config, request(audio, requested_device="rocm"))
+    assert imports == []
+
+
+def test_rocm_preflight_reports_unavailable_without_claiming_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = bridge.load_config(configuration(tmp_path, provider="rocm"))
+    assert config.provider == "rocm"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: object())
+    explicit = bridge.inspect_config(config, requested_device="rocm")
+    assert explicit["available"] is False and explicit["provider_unavailable"] is True
+    assert explicit["reason_code"] == "provider_unavailable"
+    assert explicit["effective_provider"] == "rocm" and explicit["provider_fallback"] is False
+    assert explicit["runtime_verified"] is False
+    assert "不支持 ROCm" in explicit["reason"]
+    automatic = bridge.inspect_config(config)
+    assert automatic["available"] is True and automatic["provider_fallback"] is True
+    assert automatic["effective_provider"] == "cpu"
+    assert automatic["provider_unavailable"] is False
+    assert "不支持 ROCm" in automatic["reason"]
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
+    missing = bridge.inspect_config(config, requested_device="rocm")
+    assert missing["available"] is False and missing["provider_unavailable"] is False
+    assert "未安装 sherpa-onnx" in missing["reason"]
 
 
 def test_devices_thresholds_and_request_shape_fail_before_engine_import(
@@ -378,7 +417,7 @@ def test_config_rejects_missing_sections_invalid_limits_remote_or_missing_models
     path = configuration(tmp_path)
     original = json.loads(path.read_text(encoding="utf-8"))
     invalid: tuple[dict[str, Any], ...] = (
-        {"provider": "rocm"},
+        {"provider": "hip"},
         {"provider": True},
         {"wake": None, "speaker": None},
         {"max_audio_bytes": True},

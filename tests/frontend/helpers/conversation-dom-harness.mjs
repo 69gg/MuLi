@@ -151,7 +151,7 @@ export function harness({ realApprovals = false, interactive = false, handler = 
   const scroll = node("div", "conversation-scroll"); scroll.clientHeight = 200;
   const messages = node("div", "messages", scroll);
   if (realApprovals) node("div", "approval-region", scroll);
-  for (const id of ["welcome", "scroll-bottom", "run-status", "composer", "login-form", "message-input", "mode-select", "file-input"]) node("div", id);
+  for (const id of ["welcome", "scroll-bottom", "run-status", "composer", "login-form", "message-input", "mode-select", "file-input", "composer-draft-state", "composer-draft-status", "composer-draft-recheck", "composer-draft-discard", "composer-prompt-undo"]) node("div", id);
   if (interactive) {
     const dialog = node("dialog", "app-dialog"); node("h2", "dialog-title", dialog);
     const form = node("form", "dialog-form", dialog); node("div", "dialog-content", form); node("p", "dialog-error", form);

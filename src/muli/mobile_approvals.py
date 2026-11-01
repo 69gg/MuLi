@@ -72,19 +72,23 @@ def live_approval(
     if row is None or not isinstance(row["raw"], bytes):
         raise ValueError("approval_unavailable")
     item = _object(row["raw"])
+    required = {
+        "id",
+        "session_id",
+        "run_id",
+        "tool",
+        "arguments",
+        "reason",
+        "risk",
+        "status",
+        "created_at",
+    }
     if (
-        set(item)
-        != {
-            "id",
-            "session_id",
-            "run_id",
-            "tool",
-            "arguments",
-            "reason",
-            "risk",
-            "status",
-            "created_at",
-        }
+        set(item) not in (required, required | {"boot_epoch"})
+        or (
+            "boot_epoch" in item
+            and (not isinstance(item["boot_epoch"], str) or not item["boot_epoch"])
+        )
         or item["id"] != identifier
         or not _ID.fullmatch(identifier)
         or item["status"] != "pending"

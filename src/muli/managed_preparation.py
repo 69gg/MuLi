@@ -477,6 +477,17 @@ class ManagedPreparation:
             selected = source.slot
             if action == "restart" and target != runtime.config.settings:
                 raise MaintenanceError("restart_changes_configuration")
+        from muli.real_format_probe import FormatProbeError, probe_format
+
+        try:
+            probe_format(permit.journal.database).verify(
+                path=permit.journal.database,
+                store_instance=source.evidence.store_instance,
+                main_session=source.evidence.main_session,
+                state=source.evidence.state,
+            )
+        except FormatProbeError as exc:
+            raise MaintenanceError("managed_preparation_probe_failed", exc.code) from None
         assessment = assess_compatibility(
             source.slot.compatibility,
             selected.compatibility,
@@ -488,6 +499,15 @@ class ManagedPreparation:
         if action == "switch" and selected.digest == source.slot.digest:
             raise MaintenanceError("managed_switch_requires_different_slot")
         await self._observe_process(permit, source)
+        try:
+            probe_format(permit.journal.database).verify(
+                path=permit.journal.database,
+                store_instance=source.evidence.store_instance,
+                main_session=source.evidence.main_session,
+                state=source.evidence.state,
+            )
+        except FormatProbeError as exc:
+            raise MaintenanceError("managed_preparation_probe_failed", exc.code) from None
         # No await from this revalidation through prepared publication and return.
         runtime.validate_proactive_settings(target)
         helper = (

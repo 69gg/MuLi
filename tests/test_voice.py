@@ -270,11 +270,29 @@ def test_device_visibility_fallback_does_not_claim_model_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(voice_module.Path, "exists", lambda path: False)
+    monkeypatch.setattr(voice_module.Path, "is_dir", lambda path: False)
     monkeypatch.setattr(voice_module.shutil, "which", lambda name: None)
     status = devices("cuda")
     assert status["selected"] == "cpu"
     assert status["fallback"] is True
     assert status["runtime_verified"] is False
+    assert devices("auto")["selected"] == "cpu"
+    assert devices("rocm")["selected"] == "cpu"
+    assert devices("rocm")["fallback"] is True
+
+
+def test_auto_prefers_visible_rocm_without_claiming_model_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_module.Path, "exists", lambda path: path.name in {"kfd", "dri"})
+    monkeypatch.setattr(voice_module.Path, "is_dir", lambda path: False)
+    monkeypatch.setattr(voice_module.shutil, "which", lambda name: None)
+    status = devices("auto")
+    assert status["selected"] == "rocm"
+    assert status["visible"] == {"cpu": True, "rocm": True, "cuda": False}
+    assert status["runtime_verified"] is False
+    monkeypatch.setattr(voice_module.Path, "exists", lambda path: False)
+    monkeypatch.setattr(voice_module.Path, "is_dir", lambda path: str(path) == "/opt/rocm")
     assert devices("auto")["selected"] == "cpu"
 
 

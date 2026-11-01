@@ -233,7 +233,7 @@ class CommandDetector:
             from muli.acoustic_bridge import check_config
 
             try:
-                report = check_config(Path(self.command[4]))
+                report = check_config(Path(self.command[4]), requested_device=self.config.device)
                 operation = "wake" if self.operation == "wake" else "speaker"
                 available = report["available"] and report[f"{operation}_configured"]
                 if (
@@ -241,7 +241,7 @@ class CommandDetector:
                     and self.config.device != report["configured_provider"]
                 ):
                     available = False
-                    report["reason"] = "声学 provider 与请求设备不一致；此适配器不支持 ROCm"
+                    report["reason"] = "声学 provider 与请求设备不一致"
                 if (
                     self.operation == "wake"
                     and report["wake_sample_rate"] != self.config.sample_rate

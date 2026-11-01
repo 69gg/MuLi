@@ -61,7 +61,7 @@ async def test_real_round_under_pressure_keeps_evidence_through_each_codec(
                         **({"max_output_tokens": 4096} if protocol == "anthropic" else {}),
                     }
                 },
-                "limits": {"max_output_chars": 1600, "max_context_chars": 4000},
+                "limits": {"max_output_chars": 1600, "max_context_chars": 5000},
                 "compaction": {"enabled": False},
             }
         )

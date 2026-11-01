@@ -14,7 +14,7 @@ from typing import Any
 
 from muli.config import Settings
 from muli.store import new_id, now
-from muli.tools import Tool, parameters, string
+from muli.tools import Recovery, Tool, parameters, string
 
 
 class Files:
@@ -244,16 +244,17 @@ class Files:
         raise ValueError("未知文件操作")
 
     def tools(self) -> list[Tool]:
-        definitions: list[tuple[str, str, dict[str, Any], tuple[str, ...], str]] = [
-            ("list", "列出目录（最多300项）", {}, ("path",), "read"),
-            ("read", "读取有限大小的 UTF-8 文件", {}, ("path",), "read"),
-            ("info", "查看文件元数据", {}, ("path",), "read"),
+        definitions: list[tuple[str, str, dict[str, Any], tuple[str, ...], str, Recovery]] = [
+            ("list", "列出目录（最多300项）", {}, ("path",), "read", "replayable"),
+            ("read", "读取有限大小的 UTF-8 文件", {}, ("path",), "read", "replayable"),
+            ("info", "查看文件元数据", {}, ("path",), "read", "replayable"),
             (
                 "search",
                 "按文件名或文本搜索；最多检查2000个文件",
                 {"pattern": string(), "query": string()},
                 ("path",),
                 "read",
+                "replayable",
             ),
             (
                 "write",
@@ -261,6 +262,7 @@ class Files:
                 {"content": string(), "overwrite": {"type": "boolean"}},
                 ("path", "content"),
                 "write",
+                "never",
             ),
             (
                 "edit",
@@ -268,14 +270,16 @@ class Files:
                 {"old": string(), "new": string()},
                 ("path", "old", "new"),
                 "write",
+                "never",
             ),
-            ("mkdir", "创建目录", {}, ("path",), "write"),
+            ("mkdir", "创建目录", {}, ("path",), "write", "never"),
             (
                 "copy",
                 "复制一个有限大小的文件，不覆盖目标",
                 {"destination": string()},
                 ("path", "destination"),
                 "write",
+                "never",
             ),
             (
                 "move",
@@ -283,18 +287,20 @@ class Files:
                 {"destination": string()},
                 ("path", "destination"),
                 "destructive",
+                "never",
             ),
-            ("trash", "将文件/目录移入可恢复回收站", {}, ("path",), "destructive"),
+            ("trash", "将文件/目录移入可恢复回收站", {}, ("path",), "destructive", "never"),
             (
                 "restore",
                 "按回收记录恢复文件，不覆盖目标",
                 {"id": string()},
                 ("id",),
                 "write",
+                "never",
             ),
         ]
         result = []
-        for operation, description, properties, required, risk in definitions:
+        for operation, description, properties, required, risk, recovery in definitions:
 
             async def handle(arguments: dict[str, Any], op: str = operation) -> Any:
                 async with self._lock:
@@ -328,6 +334,7 @@ class Files:
                     parameters({"path": string("绝对路径"), **properties}, required),
                     handle,
                     risk,
+                    recovery=recovery,
                 )
             )
         return result

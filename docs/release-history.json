@@ -1,0 +1,761 @@
+{
+  "schema": 1,
+  "baseline": "2.0.0",
+  "releases": [
+    {
+      "version": "2.152.0",
+      "status": "released",
+      "tag": "v2.152.0"
+    },
+    {
+      "version": "2.151.0",
+      "status": "released",
+      "tag": "v2.151.0"
+    },
+    {
+      "version": "2.150.0",
+      "status": "released",
+      "tag": "v2.150.0"
+    },
+    {
+      "version": "2.149.0",
+      "status": "released",
+      "tag": "v2.149.0"
+    },
+    {
+      "version": "2.148.0",
+      "status": "released",
+      "tag": "v2.148.0"
+    },
+    {
+      "version": "2.147.0",
+      "status": "released",
+      "tag": "v2.147.0"
+    },
+    {
+      "version": "2.146.0",
+      "status": "unpublished"
+    },
+    {
+      "version": "2.145.0",
+      "status": "released",
+      "tag": "v2.145.0"
+    },
+    {
+      "version": "2.144.0",
+      "status": "unpublished"
+    },
+    {
+      "version": "2.143.0",
+      "status": "released",
+      "tag": "v2.143.0"
+    },
+    {
+      "version": "2.142.0",
+      "status": "unpublished"
+    },
+    {
+      "version": "2.141.0",
+      "status": "unpublished"
+    },
+    {
+      "version": "2.140.0",
+      "status": "unpublished"
+    },
+    {
+      "version": "2.139.0",
+      "status": "released",
+      "tag": "v2.139.0"
+    },
+    {
+      "version": "2.138.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.137.0",
+      "status": "released",
+      "tag": "v2.137.0"
+    },
+    {
+      "version": "2.136.0",
+      "status": "tagged",
+      "tag": "v2.136.0"
+    },
+    {
+      "version": "2.135.0",
+      "status": "released",
+      "tag": "v2.135.0"
+    },
+    {
+      "version": "2.134.0",
+      "status": "tagged",
+      "tag": "v2.134.0"
+    },
+    {
+      "version": "2.133.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.132.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.131.0",
+      "status": "released",
+      "tag": "v2.131.0"
+    },
+    {
+      "version": "2.130.0",
+      "status": "released",
+      "tag": "v2.130.0"
+    },
+    {
+      "version": "2.129.0",
+      "status": "released",
+      "tag": "v2.129.0"
+    },
+    {
+      "version": "2.128.0",
+      "status": "released",
+      "tag": "v2.128.0"
+    },
+    {
+      "version": "2.127.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.126.0",
+      "status": "released",
+      "tag": "v2.126.0"
+    },
+    {
+      "version": "2.125.0",
+      "status": "released",
+      "tag": "v2.125.0"
+    },
+    {
+      "version": "2.124.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.123.0",
+      "status": "released",
+      "tag": "v2.123.0"
+    },
+    {
+      "version": "2.122.0",
+      "status": "released",
+      "tag": "v2.122.0"
+    },
+    {
+      "version": "2.121.0",
+      "status": "released",
+      "tag": "v2.121.0"
+    },
+    {
+      "version": "2.120.0",
+      "status": "released",
+      "tag": "v2.120.0"
+    },
+    {
+      "version": "2.119.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.118.0",
+      "status": "released",
+      "tag": "v2.118.0"
+    },
+    {
+      "version": "2.117.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.116.0",
+      "status": "released",
+      "tag": "v2.116.0"
+    },
+    {
+      "version": "2.115.0",
+      "status": "released",
+      "tag": "v2.115.0"
+    },
+    {
+      "version": "2.114.0",
+      "status": "released",
+      "tag": "v2.114.0"
+    },
+    {
+      "version": "2.113.0",
+      "status": "released",
+      "tag": "v2.113.0"
+    },
+    {
+      "version": "2.112.0",
+      "status": "released",
+      "tag": "v2.112.0"
+    },
+    {
+      "version": "2.111.0",
+      "status": "released",
+      "tag": "v2.111.0"
+    },
+    {
+      "version": "2.110.0",
+      "status": "released",
+      "tag": "v2.110.0"
+    },
+    {
+      "version": "2.109.0",
+      "status": "released",
+      "tag": "v2.109.0"
+    },
+    {
+      "version": "2.108.0",
+      "status": "released",
+      "tag": "v2.108.0"
+    },
+    {
+      "version": "2.107.0",
+      "status": "released",
+      "tag": "v2.107.0"
+    },
+    {
+      "version": "2.106.0",
+      "status": "released",
+      "tag": "v2.106.0"
+    },
+    {
+      "version": "2.105.0",
+      "status": "released",
+      "tag": "v2.105.0"
+    },
+    {
+      "version": "2.104.0",
+      "status": "released",
+      "tag": "v2.104.0"
+    },
+    {
+      "version": "2.103.0",
+      "status": "released",
+      "tag": "v2.103.0"
+    },
+    {
+      "version": "2.102.0",
+      "status": "released",
+      "tag": "v2.102.0"
+    },
+    {
+      "version": "2.101.0",
+      "status": "released",
+      "tag": "v2.101.0"
+    },
+    {
+      "version": "2.100.0",
+      "status": "released",
+      "tag": "v2.100.0"
+    },
+    {
+      "version": "2.99.0",
+      "status": "released",
+      "tag": "v2.99.0"
+    },
+    {
+      "version": "2.98.0",
+      "status": "released",
+      "tag": "v2.98.0"
+    },
+    {
+      "version": "2.97.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.96.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.95.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.94.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.93.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.92.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.91.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.90.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.89.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.88.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.87.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.86.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.85.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.84.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.83.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.82.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.81.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.80.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.79.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.78.0",
+      "status": "untagged"
+    },
+    {
+      "version": "2.77.0",
+      "status": "released",
+      "tag": "v2.77.0"
+    },
+    {
+      "version": "2.76.0",
+      "status": "released",
+      "tag": "v2.76.0"
+    },
+    {
+      "version": "2.75.0",
+      "status": "released",
+      "tag": "v2.75.0"
+    },
+    {
+      "version": "2.74.0",
+      "status": "released",
+      "tag": "v2.74.0"
+    },
+    {
+      "version": "2.73.0",
+      "status": "released",
+      "tag": "v2.73.0"
+    },
+    {
+      "version": "2.72.0",
+      "status": "released",
+      "tag": "v2.72.0"
+    },
+    {
+      "version": "2.71.0",
+      "status": "released",
+      "tag": "v2.71.0"
+    },
+    {
+      "version": "2.70.0",
+      "status": "released",
+      "tag": "v2.70.0"
+    },
+    {
+      "version": "2.69.0",
+      "status": "released",
+      "tag": "v2.69.0"
+    },
+    {
+      "version": "2.68.0",
+      "status": "released",
+      "tag": "v2.68.0"
+    },
+    {
+      "version": "2.67.0",
+      "status": "released",
+      "tag": "v2.67.0"
+    },
+    {
+      "version": "2.66.0",
+      "status": "released",
+      "tag": "v2.66.0"
+    },
+    {
+      "version": "2.65.0",
+      "status": "released",
+      "tag": "v2.65.0"
+    },
+    {
+      "version": "2.64.0",
+      "status": "released",
+      "tag": "v2.64.0"
+    },
+    {
+      "version": "2.63.0",
+      "status": "released",
+      "tag": "v2.63.0"
+    },
+    {
+      "version": "2.62.0",
+      "status": "released",
+      "tag": "v2.62.0"
+    },
+    {
+      "version": "2.61.0",
+      "status": "released",
+      "tag": "v2.61.0"
+    },
+    {
+      "version": "2.60.0",
+      "status": "released",
+      "tag": "v2.60.0"
+    },
+    {
+      "version": "2.59.0",
+      "status": "released",
+      "tag": "v2.59.0"
+    },
+    {
+      "version": "2.58.0",
+      "status": "released",
+      "tag": "v2.58.0"
+    },
+    {
+      "version": "2.57.0",
+      "status": "released",
+      "tag": "v2.57.0"
+    },
+    {
+      "version": "2.56.0",
+      "status": "released",
+      "tag": "v2.56.0"
+    },
+    {
+      "version": "2.55.0",
+      "status": "released",
+      "tag": "v2.55.0"
+    },
+    {
+      "version": "2.54.0",
+      "status": "released",
+      "tag": "v2.54.0"
+    },
+    {
+      "version": "2.53.0",
+      "status": "released",
+      "tag": "v2.53.0"
+    },
+    {
+      "version": "2.52.0",
+      "status": "released",
+      "tag": "v2.52.0"
+    },
+    {
+      "version": "2.51.0",
+      "status": "released",
+      "tag": "v2.51.0"
+    },
+    {
+      "version": "2.50.0",
+      "status": "released",
+      "tag": "v2.50.0"
+    },
+    {
+      "version": "2.49.0",
+      "status": "released",
+      "tag": "v2.49.0"
+    },
+    {
+      "version": "2.48.0",
+      "status": "released",
+      "tag": "v2.48.0"
+    },
+    {
+      "version": "2.47.0",
+      "status": "released",
+      "tag": "v2.47.0"
+    },
+    {
+      "version": "2.46.0",
+      "status": "released",
+      "tag": "v2.46.0"
+    },
+    {
+      "version": "2.45.0",
+      "status": "released",
+      "tag": "v2.45.0"
+    },
+    {
+      "version": "2.44.0",
+      "status": "released",
+      "tag": "v2.44.0"
+    },
+    {
+      "version": "2.43.0",
+      "status": "released",
+      "tag": "v2.43.0"
+    },
+    {
+      "version": "2.42.0",
+      "status": "released",
+      "tag": "v2.42.0"
+    },
+    {
+      "version": "2.41.0",
+      "status": "released",
+      "tag": "v2.41.0"
+    },
+    {
+      "version": "2.40.0",
+      "status": "released",
+      "tag": "v2.40.0"
+    },
+    {
+      "version": "2.39.0",
+      "status": "released",
+      "tag": "v2.39.0"
+    },
+    {
+      "version": "2.38.0",
+      "status": "released",
+      "tag": "v2.38.0"
+    },
+    {
+      "version": "2.37.0",
+      "status": "released",
+      "tag": "v2.37.0"
+    },
+    {
+      "version": "2.36.0",
+      "status": "released",
+      "tag": "v2.36.0"
+    },
+    {
+      "version": "2.35.0",
+      "status": "released",
+      "tag": "v2.35.0"
+    },
+    {
+      "version": "2.34.0",
+      "status": "released",
+      "tag": "v2.34.0"
+    },
+    {
+      "version": "2.33.0",
+      "status": "released",
+      "tag": "v2.33.0"
+    },
+    {
+      "version": "2.32.1",
+      "status": "released",
+      "tag": "v2.32.1"
+    },
+    {
+      "version": "2.32.0",
+      "status": "released",
+      "tag": "v2.32.0"
+    },
+    {
+      "version": "2.31.0",
+      "status": "released",
+      "tag": "v2.31.0"
+    },
+    {
+      "version": "2.30.0",
+      "status": "released",
+      "tag": "v2.30.0"
+    },
+    {
+      "version": "2.29.0",
+      "status": "released",
+      "tag": "v2.29.0"
+    },
+    {
+      "version": "2.28.0",
+      "status": "released",
+      "tag": "v2.28.0"
+    },
+    {
+      "version": "2.27.0",
+      "status": "released",
+      "tag": "v2.27.0"
+    },
+    {
+      "version": "2.26.0",
+      "status": "released",
+      "tag": "v2.26.0"
+    },
+    {
+      "version": "2.25.0",
+      "status": "released",
+      "tag": "v2.25.0"
+    },
+    {
+      "version": "2.24.0",
+      "status": "released",
+      "tag": "v2.24.0"
+    },
+    {
+      "version": "2.23.0",
+      "status": "released",
+      "tag": "v2.23.0"
+    },
+    {
+      "version": "2.22.0",
+      "status": "released",
+      "tag": "v2.22.0"
+    },
+    {
+      "version": "2.21.0",
+      "status": "released",
+      "tag": "v2.21.0"
+    },
+    {
+      "version": "2.20.1",
+      "status": "released",
+      "tag": "v2.20.1"
+    },
+    {
+      "version": "2.20.0",
+      "status": "released",
+      "tag": "v2.20.0"
+    },
+    {
+      "version": "2.19.0",
+      "status": "released",
+      "tag": "v2.19.0"
+    },
+    {
+      "version": "2.18.0",
+      "status": "released",
+      "tag": "v2.18.0"
+    },
+    {
+      "version": "2.17.0",
+      "status": "released",
+      "tag": "v2.17.0"
+    },
+    {
+      "version": "2.16.0",
+      "status": "released",
+      "tag": "v2.16.0"
+    },
+    {
+      "version": "2.15.0",
+      "status": "released",
+      "tag": "v2.15.0"
+    },
+    {
+      "version": "2.14.0",
+      "status": "released",
+      "tag": "v2.14.0"
+    },
+    {
+      "version": "2.13.0",
+      "status": "released",
+      "tag": "v2.13.0"
+    },
+    {
+      "version": "2.12.0",
+      "status": "released",
+      "tag": "v2.12.0"
+    },
+    {
+      "version": "2.11.0",
+      "status": "released",
+      "tag": "v2.11.0"
+    },
+    {
+      "version": "2.10.0",
+      "status": "released",
+      "tag": "v2.10.0"
+    },
+    {
+      "version": "2.9.0",
+      "status": "released",
+      "tag": "v2.9.0"
+    },
+    {
+      "version": "2.8.0",
+      "status": "released",
+      "tag": "v2.8.0"
+    },
+    {
+      "version": "2.7.0",
+      "status": "released",
+      "tag": "v2.7.0"
+    },
+    {
+      "version": "2.6.0",
+      "status": "released",
+      "tag": "v2.6.0"
+    },
+    {
+      "version": "2.5.0",
+      "status": "released",
+      "tag": "v2.5.0"
+    },
+    {
+      "version": "2.4.0",
+      "status": "released",
+      "tag": "v2.4.0"
+    },
+    {
+      "version": "2.3.0",
+      "status": "released",
+      "tag": "v2.3.0"
+    },
+    {
+      "version": "2.2.0",
+      "status": "released",
+      "tag": "v2.2.0"
+    },
+    {
+      "version": "2.1.0",
+      "status": "released",
+      "tag": "v2.1.0"
+    },
+    {
+      "version": "2.0.0",
+      "status": "released",
+      "tag": "v2.0.0"
+    },
+    {
+      "version": "1.0.0",
+      "status": "released",
+      "tag": "v1.0.0",
+      "legacy": true
+    },
+    {
+      "version": "0.0.0",
+      "status": "released",
+      "tag": "v0.0.0",
+      "legacy": true
+    }
+  ]
+}

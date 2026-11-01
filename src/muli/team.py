@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 from muli.attachments import attachment_ids_schema, validate_attachment_ids
 from muli.evidence import EvidenceError, json_size
 from muli.permissions import Mode
+from muli.quota import Lease
 from muli.reply_origin import ReplyOrigin
 from muli.shell_sessions import ShellFinished, ShellFinishObserver, ShellSessions
 from muli.store import new_id, now
@@ -109,6 +110,7 @@ class TeamManager:
         self.attachments: Attachments | None = None
         self._active: dict[str, asyncio.Task[None]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._quota_leases: dict[asyncio.Task[None], Lease] = {}
         self._stopping_tasks: dict[asyncio.Task[Any], int] = {}
         self._stopping_generations: dict[tuple[str, int], int] = {}
         self._waiting: dict[str, set[str]] = {}
@@ -137,7 +139,23 @@ class TeamManager:
                 and run.get("session_id") == agent["session_id"]
                 else None
             )
-            self._finish(agent, "interrupted", "", run_id)
+            decision = runtime.recovery_planner.plan_agent(agent["id"])
+            agent.update(
+                recovery_decision=decision.status,
+                recovery_reason=decision.reason,
+                recovery_attempt_ids=list(decision.attempt_ids),
+            )
+            self._finish(
+                agent,
+                # 默认 shadow：可安全恢复的运行也先落为可观察的终态，等待主人
+                # 或主助手明确 resume；只有需要人工核查的决策保留 recovering。
+                "recovering" if decision.status == "needs_owner" else "interrupted",
+                "",
+                run_id,
+            )
+        # Releasing a workflow or team lease wakes the scheduler so queued
+        # identities can be reconsidered without polling.
+        runtime.quota.add_listener(self.start)
 
     def _finish(
         self,
@@ -218,6 +236,20 @@ class TeamManager:
             (max(1, min(limit, 1000)), max(0, offset)),
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def count(self, status: str | None = None) -> int:
+        """Count agents without materialising an unbounded listing."""
+        if status is None:
+            row = self.runtime.store.db.execute(
+                "SELECT count(*) FROM objects WHERE kind='agent'"
+            ).fetchone()
+        else:
+            row = self.runtime.store.db.execute(
+                "SELECT count(*) FROM objects WHERE kind='agent' "
+                "AND json_extract(data,'$.status')=?",
+                (status,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def page(
         self, *, limit: int = 50, offset: int = 0, active_only: bool = False
@@ -583,11 +615,22 @@ class TeamManager:
                 or len(self._active) >= self.runtime.config.settings.limits.max_pending_runs
             ):
                 continue
-            record.reserved = True
-            task = asyncio.create_task(
-                self._run(record.session_id, shell_continuation=record),
-                name=f"muli-shell-continuation-{record.session_id}",
+            lease = self.runtime.quota.try_acquire(
+                (record.session_id, "", f"{record.run_id}:{record.generation}")
             )
+            if lease is None:
+                continue
+            record.reserved = True
+            try:
+                task = asyncio.create_task(
+                    self._run(record.session_id, shell_continuation=record),
+                    name=f"muli-shell-continuation-{record.session_id}",
+                )
+            except BaseException:
+                record.reserved = False
+                self.runtime.quota.release(lease)
+                raise
+            self._quota_leases[task] = lease
             self._active[record.session_id] = task
             self._tasks.add(task)
             task.add_done_callback(self._done)
@@ -740,7 +783,7 @@ class TeamManager:
             raise PermissionError("该队友正在接管渠道；请使用真实渠道输入，或先收回后再派任务")
         if self._closed:
             raise ValueError("团队正在关闭")
-        if wake and agent["status"] in TERMINAL - {"paused"}:
+        if wake and (agent["status"] in TERMINAL - {"paused"} or agent["status"] == "recovering"):
             self._admit(replacing=agent["id"])
         origin = sender or self.runtime.main_session()["id"]
         if (
@@ -753,7 +796,8 @@ class TeamManager:
         text = self._message(origin, content)
         updated = (
             {**agent, "status": "queued"}
-            if wake and agent["status"] in TERMINAL - {"paused"}
+            if wake
+            and (agent["status"] in TERMINAL - {"paused"} or agent["status"] == "recovering")
             else agent
         )
         references = self._attachment_references(attachment_ids)
@@ -774,7 +818,7 @@ class TeamManager:
         if inserted and receipt["state"] == "pending":
             self.cancel_shell_continuation(agent["id"], "收到独立新输入，自动续办让位于正常输入")
         if wake:
-            self.start()
+            self.start(explicit=True)
         if inserted:
             await self.runtime.bus.emit(
                 "team.message", {"agent_id": agent["id"], "receipt_id": receipt["id"]}
@@ -916,7 +960,7 @@ class TeamManager:
         agent = self.get(target)
         if self.runtime.channel_ownership.for_agent(agent["id"]) is not None:
             raise PermissionError("受托渠道队友仅由真实渠道输入唤醒，请先收回再恢复普通任务")
-        if agent["status"] not in TERMINAL:
+        if agent["status"] not in TERMINAL and agent["status"] != "recovering":
             return agent
         if agent["status"] == "paused":
             if self._scope_paused(agent["session_id"]):
@@ -925,6 +969,9 @@ class TeamManager:
             self.runtime.store.put("agent", agent)
         else:
             self._admit(replacing=agent["id"])
+        if agent["status"] == "recovering":
+            agent["status"] = "queued"
+            self.runtime.store.put("agent", agent)
         if not self.runtime.store.pending_inputs(agent["session_id"]):
             await self.send(
                 agent["id"],
@@ -933,10 +980,10 @@ class TeamManager:
         else:
             agent["status"] = "queued"
             self.runtime.store.put("agent", agent)
-            self.start()
+            self.start(explicit=True)
         return self.get(agent["id"])
 
-    def start(self) -> None:
+    def start(self, *, explicit: bool = False) -> None:
         if self._closed or self.runtime._closing or not self.runtime.maintenance.admission.allowed:
             return
         after = 0
@@ -954,9 +1001,39 @@ class TeamManager:
                 agent = json.loads(row[1])
                 if agent["id"] in self._active or self._park_queued(agent):
                     continue
+                if (
+                    not explicit
+                    and (agent["id"], agent.get("generation", 0)) in self._stopping_generations
+                ):
+                    # A stop batch owns this identity's cleanup; never relaunch
+                    # it from the lease-release callback. Explicit new input or
+                    # resume belongs to a later intent and may start at once.
+                    continue
                 if len(self._active) >= limit:
                     continue
-                task = asyncio.create_task(self._run(agent["id"]), name=f"muli-agent-{agent['id']}")
+                lease = self.runtime.quota.try_acquire(
+                    (
+                        agent["session_id"],
+                        str(agent.get("commitment_id") or ""),
+                        f"{agent['id']}:{agent.get('generation', 0)}",
+                    )
+                )
+                if lease is None:
+                    if agent.get("quota_state") != "waiting_quota":
+                        agent.update(quota_state="waiting_quota", updated_at=now())
+                        self.runtime.store.put("agent", agent)
+                    continue
+                if agent.pop("quota_state", None) is not None:
+                    agent["updated_at"] = now()
+                    self.runtime.store.put("agent", agent)
+                try:
+                    task = asyncio.create_task(
+                        self._run(agent["id"]), name=f"muli-agent-{agent['id']}"
+                    )
+                except BaseException:
+                    self.runtime.quota.release(lease)
+                    raise
+                self._quota_leases[task] = lease
                 self._active[agent["id"]] = task
                 self._tasks.add(task)
                 task.add_done_callback(self._done)
@@ -986,6 +1063,7 @@ class TeamManager:
             return False
         identifier, epoch = paused
         reason = "任务已暂停，等待主人明确要求重新规划及主助手确认方案"
+        agent.pop("quota_state", None)
         agent.update(pause_reason=reason, observed_epoch=epoch)
         report = {
             "id": new_id(),
@@ -1007,6 +1085,9 @@ class TeamManager:
 
     def _done(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
+        lease = self._quota_leases.pop(task, None)
+        if lease is not None:
+            self.runtime.quota.release(lease)
         if not task.cancelled():
             task.exception()
 
@@ -1226,6 +1307,16 @@ class TeamManager:
                 run_id=run_id,
             )
             writes = []
+            try:
+                continuity = self.runtime.channel_continuity.record(
+                    agent, status=status, result=result, run_id=run_id
+                )
+            except PermissionError:
+                # 冲突归属已由渠道归属守卫处理；摘要不能阻断终态提交。
+                continuity = None
+            if continuity:
+                # 摘要与终态同一事务提交；撤销或失败轮次只记录真实状态。
+                writes.append(("channel_continuity", continuity))
             if (
                 (run_id or status == "paused")
                 and not waiting
@@ -1784,6 +1875,7 @@ class TeamManager:
                     ("targets",),
                 ),
                 wait,
+                preserve_output=True,
             ),
             Tool(
                 "stop_agent",

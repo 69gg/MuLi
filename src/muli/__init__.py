@@ -1,3 +1,3 @@
 """MuLi: a local, event-driven personal assistant."""
 
-__version__ = "2.151.0"
+__version__ = "2.152.0"
