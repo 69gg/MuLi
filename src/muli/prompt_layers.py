@@ -34,6 +34,15 @@ def _read_regular(path: Path, *, max_bytes: int, label: str) -> str:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
+        # O_NOFOLLOW is unavailable on Windows, so reject the link explicitly.
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise PromptLayerError(f"{label}无法安全打开：{path}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise PromptLayerError(f"{label}必须是非符号链接的普通文件：{path}")
+    try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
         raise

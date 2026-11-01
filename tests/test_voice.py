@@ -284,8 +284,7 @@ def test_device_visibility_fallback_does_not_claim_model_runtime(
 def test_auto_prefers_visible_rocm_without_claiming_model_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    visible = {"/dev/kfd", "/dev/dri"}
-    monkeypatch.setattr(voice_module.Path, "exists", lambda path: str(path) in visible)
+    monkeypatch.setattr(voice_module.Path, "exists", lambda path: path.name in {"kfd", "dri"})
     monkeypatch.setattr(voice_module.Path, "is_dir", lambda path: False)
     monkeypatch.setattr(voice_module.shutil, "which", lambda name: None)
     status = devices("auto")
