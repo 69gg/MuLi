@@ -7,11 +7,12 @@ from types import SimpleNamespace
 from typing import NoReturn
 
 import pytest
-from test_managed_launcher import Deployment
+from test_managed_launcher import _CONFIG, _UNIT, Deployment
 from test_managed_launcher import deployment as _launcher_deployment
 
 import muli
 from muli import managed_cli, management_cli
+from muli.managed_journal import RoleSnapshots
 from muli.management_transaction import TransactionError, TransactionJournal
 from muli.platforms import managed_deployment, managed_launcher
 from muli.platforms.managed_deployment import DeploymentAnchor, DeploymentStore, SelectorValue
@@ -177,6 +178,9 @@ async def test_ordinary_install_cannot_replace_managed_unit(
 ) -> None:
     if resolved:
         deployment.record("committed", "none", activation="released")
+        unit = Path(deployment.anchor.unit_path)
+        unit.parent.mkdir(exist_ok=True)
+        unit.write_bytes(_UNIT)
     called: list[str] = []
 
     async def action(service: UserService, action: str) -> dict[str, bool]:
@@ -184,14 +188,42 @@ async def test_ordinary_install_cannot_replace_managed_unit(
         return {"accepted": True}
 
     monkeypatch.setattr(UserService, "action", action)
+    service = UserService(*paths(deployment), Path(deployment.anchor.unit_path).parent)
+    monkeypatch.setattr(service, "capability", lambda: {"supported": True})
     with pytest.raises(
         TransactionError,
         match="managed_unit_replacement_forbidden" if resolved else "transaction_in_progress",
     ):
         await management_cli.guarded_service_action(
-            UserService(*paths(deployment)), "install", managed_root=deployment.root
+            service, "install", managed_root=deployment.root
         )
     assert not called
+
+
+async def test_install_restores_a_deleted_managed_unit_from_the_journal(
+    deployment: Deployment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = deployment.record("committed", "none", activation="released")
+    role = "target"
+    snapshots = RoleSnapshots(_CONFIG, deployment.target_selector.canonical(), _UNIT)
+    snapshots.verify(record.binding(role), 16384)
+    with TransactionJournal(deployment.root, Path(deployment.anchor.database_path)) as journal:
+        for name, data in snapshots.entries(record.generation, role).items():
+            journal.directory.replace(name, data)
+    calls: list[list[str]] = []
+
+    async def run(self: UserService, arguments: list[str], **kwargs: object) -> None:
+        calls.append(arguments)
+
+    monkeypatch.setattr(UserService, "_run", run)
+    service = UserService(*paths(deployment), Path(deployment.anchor.unit_path).parent)
+    monkeypatch.setattr(service, "capability", lambda: {"supported": True})
+    result = await management_cli.guarded_service_action(
+        service, "install", managed_root=deployment.root
+    )
+    assert result["accepted"] is True
+    assert calls == [["systemctl", "--user", "daemon-reload"]]
+    assert service.path.read_bytes() == _UNIT
 
 
 async def test_service_action_confirms_known_unit_and_rejects_manual_change(

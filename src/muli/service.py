@@ -308,9 +308,9 @@ WantedBy=default.target
             result["reason"] = f"无法读取服务状态：{exc}"
         return result
 
-    async def _run(self, arguments: list[str]) -> None:
+    async def _run(self, arguments: list[str], *, allow_failure: bool = False) -> None:
         response = await run_process(arguments, timeout=10, limit=16000)
-        if response["exit_code"]:
+        if response["exit_code"] and not allow_failure:
             raise ValueError(f"{self.backend} 用户服务操作失败，请检查用户会话日志")
 
     async def action(self, action: str, *, confirm: bool = False) -> dict[str, Any]:
@@ -356,7 +356,9 @@ WantedBy=default.target
             await self._run(["systemctl", "--user", "disable", UNIT])
             self.path.unlink(missing_ok=True)
             await self._run(["systemctl", "--user", "daemon-reload"])
-            await self._run(["systemctl", "--user", "--no-block", "stop", UNIT])
+            # The unit is already gone; a missing stop target must not turn a
+            # completed uninstall into a failure after files were removed.
+            await self._run(["systemctl", "--user", "--no-block", "stop", UNIT], allow_failure=True)
         elif self.platform == "darwin":
             target = f"{self._launch_domain}/{LAUNCH_LABEL}"
             self.path.unlink(missing_ok=True)

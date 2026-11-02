@@ -256,6 +256,26 @@ async def test_broken_admission_stays_blocked_and_diagnostic_does_not_raise(
         await runtime.close()
 
 
+async def test_health_timeout_is_reported_as_a_failed_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = runtime_at(tmp_path)
+    try:
+        updates = Updates(runtime.config, runtime.store, runtime.bus)
+        prefix = tmp_path / "prefix"
+        executable = prefix / "bin" / "muli"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("", encoding="utf-8")
+
+        async def timeout(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError("health check timed out")
+
+        monkeypatch.setattr("muli.updates.run_process", timeout)
+        assert await updates._health(prefix, "9.9.9", {}) is False
+    finally:
+        await runtime.close()
+
+
 async def test_update_rechecks_after_uv_directory_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -36,6 +36,7 @@ from muli.store_initialization import (
     StoreInitializationError,
 )
 from muli.store_schema import (
+    CHANNEL_CONTINUITY_INDEX,
     CHANNEL_SCHEMA,
     CORE_SCHEMA,
     NOTIFICATION_DIRECTORY_SCHEMA,
@@ -294,6 +295,8 @@ class Store:
             validate_existing_schema(self.db, "channel")
             return
         self.db.executescript(CHANNEL_SCHEMA)
+        with self.db:
+            self.db.execute(CHANNEL_CONTINUITY_INDEX)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(channel_inbound)")}
         if "fingerprint" not in columns:
             with self.db:

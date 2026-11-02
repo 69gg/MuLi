@@ -22,7 +22,12 @@ from muli.compaction_pins import (
     supersede_brief_revision,
     validate_pin_sources,
 )
+from muli.config import CompactionSettings
 from muli.store import Store, new_id
+
+
+async def _summarize(source: str, max_tokens: int) -> str:
+    return ""
 
 
 def _store(tmp_path: Path) -> Store:
@@ -147,6 +152,30 @@ def test_pin_overflow_is_explicit_and_preserves_old_snapshot(tmp_path: Path) -> 
     assert "不能删除原资料" in rendered
     with pytest.raises(PinsOverflow, match="超过预算"):
         render_pins(pins, budget=len(rendered) - 1)
+
+
+def test_eviction_never_drops_prohibitions_or_authorizations(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session = new_id()
+    quote = "不能删除原资料。"
+    pins = (
+        Pin(kind="prohibition", quote=quote, quote_sha256=quote_sha256(quote)),
+        Pin(
+            kind="authorization",
+            quote="允许读取日志。",
+            quote_sha256=quote_sha256("允许读取日志。"),
+        ),
+    )
+    compactor = Compactor(
+        store,
+        _summarize,
+        CompactionSettings,
+        max_chars=lambda: 4096,
+        max_jobs=lambda: 1,
+        fingerprint=lambda: "test",
+    )
+    with pytest.raises(PinsOverflow, match="超过预算"):
+        compactor._evict_pins(session, pins, 1)
 
 
 def test_compaction_snapshot_and_prefix_keep_pins_outside_body(tmp_path: Path) -> None:

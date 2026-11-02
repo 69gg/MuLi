@@ -227,7 +227,8 @@ class ChannelContinuity:
     def _recent(self, main_id: str) -> list[dict[str, Any]]:
         rows = self.runtime.store.db.execute(
             "SELECT id FROM objects WHERE kind='channel_continuity' "
-            "AND json_extract(data,'$.main_id')=? ORDER BY rowid DESC LIMIT ?",
+            "AND CASE WHEN json_valid(data) THEN json_extract(data,'$.main_id') END=? "
+            "ORDER BY rowid DESC LIMIT ?",
             (main_id, MAX_CONTEXT_SUMMARIES),
         ).fetchall()
         items = [item for row in rows if (item := self._load(row[0])) is not None]

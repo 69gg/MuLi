@@ -371,7 +371,11 @@ class Compactor:
         return pins
 
     def _evict_pins(self, session_id: str, pins: tuple[Pin, ...], budget: int) -> tuple[Pin, ...]:
-        """Drop the oldest, lowest-priority pins until the host budget fits."""
+        """Drop the oldest, lowest-priority pins until the host budget fits.
+
+        Prohibitions and authorizations are never evicted; if they alone exceed
+        the budget, the overflow must remain visible to the caller.
+        """
         priority = {
             "prohibition": 0,
             "authorization": 1,
@@ -379,10 +383,14 @@ class Compactor:
             "unfinished_tool": 3,
             "evidence": 4,
         }
+        protected = {"prohibition", "authorization"}
         remaining = pins
         while True:
-            active = [pin for pin in remaining if pin.state == "active"]
+            active = [
+                pin for pin in remaining if pin.state == "active" and pin.kind not in protected
+            ]
             if not active:
+                render_pins(remaining, budget=budget)
                 return remaining
             dropped = min(
                 active,

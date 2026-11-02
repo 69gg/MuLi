@@ -99,6 +99,20 @@ def test_released_entries_require_a_changelog_description() -> None:
         history_script.validate(changelog, data)
 
 
+def test_a_following_section_does_not_become_the_release_description() -> None:
+    data = history(
+        entry("2.2.0", "released", "v2.2.0"),
+        entry("2.1.0", "untagged"),
+        entry("2.0.0", "released", "v2.0.0"),
+    )
+    changelog = (
+        "## [2.2.0]\n\n## 已知问题\n\n- 二点二\n\n"
+        "## [2.1.0]\n\n- 二点一\n\n## [2.0.0]\n\n- 二点零\n"
+    )
+    with pytest.raises(history_script.ReleaseHistoryError, match="说明为空"):
+        history_script.validate(changelog, data)
+
+
 def test_tagged_entries_are_counted_separately_from_releases() -> None:
     data = history(
         entry("2.2.0", "tagged", "v2.2.0"),
