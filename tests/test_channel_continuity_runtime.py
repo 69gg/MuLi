@@ -77,6 +77,19 @@ async def test_continuity_digest_is_off_by_default(tmp_path: Path) -> None:
         await runtime.close()
 
 
+async def test_corrupt_continuity_rows_do_not_break_recent_lookup(tmp_path: Path) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    try:
+        with runtime.store.db:
+            runtime.store.db.execute(
+                "INSERT INTO objects(kind,id,data,updated) "
+                "VALUES('channel_continuity','broken','{',0)"
+            )
+        assert runtime.channel_continuity._recent("main") == []
+    finally:
+        await runtime.close()
+
+
 async def test_delegated_channel_turn_writes_bounded_summary_and_links_outbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -289,6 +289,24 @@ async def test_uninstall_requires_confirmation_and_preserves_data(
     assert calls[-1] == ["systemctl", "--user", "--no-block", "stop", "muli.service"]
 
 
+async def test_uninstall_tolerates_a_missing_unit_during_the_final_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    async def run(arguments: list[str], **kwargs: Any) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"exit_code": 1 if "stop" in arguments else 0, "output": ""}
+
+    monkeypatch.setattr(service_module, "run_process", run)
+    monkeypatch.setattr(service_module.shutil, "which", lambda name: "/bin/" + name)
+    service = UserService(tmp_path / "config.json", tmp_path / "data", tmp_path, platform="linux")
+    service.path.write_text(service.render(), encoding="utf-8")
+    result = await service.action("uninstall", confirm=True)
+    assert result["accepted"] is True
+    assert calls[-1][-2:] == ["stop", "muli.service"]
+
+
 async def test_launchd_uninstall_boots_out_and_removes_plist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

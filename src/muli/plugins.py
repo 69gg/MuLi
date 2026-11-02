@@ -168,6 +168,7 @@ class PluginManager:
         self._reload_lock = asyncio.Lock()
         self._watch_task: asyncio.Task[None] | None = None
         self._drain_tasks: set[asyncio.Task[Any]] = set()
+        self._retire_tasks: set[asyncio.Task[Any]] = set()
         self._fingerprints: dict[str, tuple[Any, ...]] = {}
         self._digest_cache: dict[str, tuple[int, int, str]] = {}
         self._failures: dict[str, int] = {}
@@ -529,11 +530,12 @@ class PluginManager:
         if generation.state == "draining" and generation.active_calls == 0:
             self._schedule_retire(generation)
 
-    def _track_task(self, task: asyncio.Task[Any]) -> None:
-        self._drain_tasks.add(task)
+    def _track_task(self, task: asyncio.Task[Any], *, retire: bool = False) -> None:
+        tasks = self._retire_tasks if retire else self._drain_tasks
+        tasks.add(task)
 
         def finished(completed: asyncio.Task[Any]) -> None:
-            self._drain_tasks.discard(completed)
+            tasks.discard(completed)
             if not completed.cancelled():
                 # Retrieve background failures so they cannot become unhandled.
                 completed.exception()
@@ -541,7 +543,10 @@ class PluginManager:
         task.add_done_callback(finished)
 
     def _schedule_retire(self, generation: PluginGeneration) -> None:
-        self._track_task(asyncio.create_task(self._retire(generation), name="muli-plugin-retire"))
+        self._track_task(
+            asyncio.create_task(self._retire(generation), name="muli-plugin-retire"),
+            retire=True,
+        )
 
     def _schedule_drain(self, generation: PluginGeneration) -> None:
         self._track_task(asyncio.create_task(self._drain(generation), name="muli-plugin-drain"))
@@ -550,7 +555,8 @@ class PluginManager:
         deadline = time.monotonic() + self.runtime.config.settings.plugins.drain_timeout
         while generation.active_calls and time.monotonic() < deadline and not self._closed:
             await asyncio.sleep(0.05)
-        await self._retire(generation)
+        # Retire as a separately tracked task so close() never cancels hooks.
+        self._schedule_retire(generation)
 
     async def _retire(self, generation: PluginGeneration) -> None:
         if generation.state == "retired":
@@ -710,11 +716,6 @@ class PluginManager:
                                 self._fingerprints[identifier] = current[identifier]
                             else:
                                 self._fingerprints.pop(identifier, None)
-                    for identifier, value in current.items():
-                        if identifier not in changed and identifier not in removed:
-                            self._fingerprints[identifier] = value
-                else:
-                    self._fingerprints = current
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -737,13 +738,14 @@ class PluginManager:
         current = settings.model_dump()
         changed = current != self._loaded_settings
         self._loaded_settings = current
-        if changed and not settings.hot_reload:
+        if not settings.hot_reload:
             # 未开启热重载时，插件启停或源码变化只登记待重启，不在运行中替换。
             if self._watch_task is not None:
                 self._watch_task.cancel()
                 await asyncio.gather(self._watch_task, return_exceptions=True)
                 self._watch_task = None
-            self._restart_required = True
+            if changed:
+                self._restart_required = True
             return
         identifiers: set[str] = set(self._generations)
         try:
@@ -758,10 +760,6 @@ class PluginManager:
             await self.reload(identifier)
         if settings.hot_reload and self._watch_task is None:
             self._watch_task = asyncio.create_task(self._watch(), name="muli-plugin-watch")
-        elif not settings.hot_reload and self._watch_task is not None:
-            self._watch_task.cancel()
-            await asyncio.gather(self._watch_task, return_exceptions=True)
-            self._watch_task = None
 
     async def close(self) -> None:
         self._closed = True
@@ -773,6 +771,9 @@ class PluginManager:
             task.cancel()
         await asyncio.gather(*self._drain_tasks, return_exceptions=True)
         self._drain_tasks.clear()
+        # Retire tasks own shutdown hooks; let them finish instead of cancelling.
+        await asyncio.gather(*self._retire_tasks, return_exceptions=True)
+        self._retire_tasks.clear()
         for generation in reversed(list(self._generations.values())):
             await self._retire(generation)
         # A reload can leave an old generation draining after the current one

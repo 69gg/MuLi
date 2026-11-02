@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 from muli.config import ConfigFile
@@ -57,7 +58,9 @@ def write_plugin(
     )
 
 
-def write_slow_plugin(directory: Path, identifier: str, marker: Path) -> None:
+def write_slow_plugin(
+    directory: Path, identifier: str, marker: Path, *, shutdown_delay: float = 0
+) -> None:
     plugin = directory / identifier
     plugin.mkdir(parents=True, exist_ok=True)
     (plugin / "plugin.json").write_text(
@@ -73,6 +76,7 @@ def write_slow_plugin(directory: Path, identifier: str, marker: Path) -> None:
         "    await asyncio.sleep(30)\n"
         "    return 'late'\n\n"
         "async def shutdown() -> None:\n"
+        f"    await asyncio.sleep({shutdown_delay!r})\n"
         f"    Path({str(marker)!r}).write_text('closed', encoding='utf-8')\n\n"
         "def setup(api: PluginContext) -> None:\n"
         "    api.add_tool(Tool('slow_tool', 'slow', parameters({}), handle))\n"
@@ -235,6 +239,30 @@ async def test_close_retires_a_generation_that_is_still_draining(tmp_path: Path)
         await runtime.close()
 
 
+async def test_close_waits_for_a_retire_task_instead_of_cancelling_its_hooks(
+    tmp_path: Path,
+) -> None:
+    runtime, plugins, _ = setup(tmp_path)
+    directory = tmp_path / "plugins"
+    first_marker = tmp_path / "first-closed"
+    second_marker = tmp_path / "second-closed"
+    write_slow_plugin(directory, "demo", first_marker, shutdown_delay=0.2)
+    try:
+        await plugins.load()
+        write_slow_plugin(directory, "demo", second_marker)
+        record = await plugins.reload("demo")
+        assert record["generation"] == 2
+        old = next(generation for generation in plugins._draining if generation.generation == 1)
+        async with asyncio.timeout(2):
+            while old.state != "retired":
+                await asyncio.sleep(0.01)
+        await plugins.close()
+        assert first_marker.read_text(encoding="utf-8") == "closed"
+        assert second_marker.read_text(encoding="utf-8") == "closed"
+    finally:
+        await runtime.close()
+
+
 async def test_watcher_reloads_changed_file(tmp_path: Path) -> None:
     runtime, plugins, _ = setup(tmp_path)
     directory = tmp_path / "plugins"
@@ -246,6 +274,58 @@ async def test_watcher_reloads_changed_file(tmp_path: Path) -> None:
             while plugins.contexts[0].prompt.strip() != "watched":
                 await asyncio.sleep(0.02)
         assert await runtime.tools["demo_v1"].handler({}) == "two"
+    finally:
+        await plugins.close()
+        await runtime.close()
+
+
+async def test_watch_keeps_the_baseline_of_plugins_that_were_not_reloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, plugins, _ = setup(tmp_path)
+    scans = [
+        {"one": ("b",), "two": ("a",)},
+        {"one": ("b",), "two": ("b",)},
+    ]
+    calls = 0
+
+    def scan() -> dict[str, tuple[str]]:
+        nonlocal calls
+        result = scans[min(calls, len(scans) - 1)]
+        calls += 1
+        return result
+
+    async def reload(identifier: str) -> bool:
+        plugins._closed = True
+        return False
+
+    plugins._fingerprints = {"one": ("a",), "two": ("a",)}
+    monkeypatch.setattr(plugins, "_scan_fingerprints", scan)
+    monkeypatch.setattr(plugins, "_reload_watched", reload)
+    try:
+        await asyncio.wait_for(plugins._watch(), 2)
+        assert plugins._fingerprints["one"] == ("a",)
+        assert plugins._fingerprints["two"] == ("a",)
+    finally:
+        await runtime.close()
+
+
+async def test_reconfigure_without_hot_reload_only_marks_restart_required(tmp_path: Path) -> None:
+    runtime, plugins, _ = setup(tmp_path, hot_reload=False)
+    directory = tmp_path / "plugins"
+    write_plugin(directory, "demo")
+    try:
+        await plugins.load()
+        generation = plugins._generations["demo"].generation
+        write_plugin(directory, "demo", prompt="changed", tool="demo_v2", result="two")
+        await plugins.reconfigure()
+        assert plugins._generations["demo"].generation == generation
+        assert plugins.contexts[0].prompt.strip() == "v1"
+        assert plugins.restart_required is False
+        runtime.config.update({"plugins": {"watch_interval_seconds": 0.5}})
+        await plugins.reconfigure()
+        assert plugins._generations["demo"].generation == generation
+        assert plugins.restart_required is True
     finally:
         await plugins.close()
         await runtime.close()

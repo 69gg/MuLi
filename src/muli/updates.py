@@ -190,27 +190,30 @@ class Updates:
         )
         if not executable.is_file():
             return False
-        checked = await run_process(
-            [str(executable), "--version"],
-            timeout=30,
-            limit=1000,
-            env=environment,
-            merge_stderr=False,
-        )
-        if checked["exit_code"] or str(checked["output"]).strip() != version:
+        try:
+            checked = await run_process(
+                [str(executable), "--version"],
+                timeout=30,
+                limit=1000,
+                env=environment,
+                merge_stderr=False,
+            )
+            if checked["exit_code"] or str(checked["output"]).strip() != version:
+                return False
+            doctor = await run_process(
+                [
+                    str(executable),
+                    "--config",
+                    str(self.config.path.resolve()),
+                    "doctor",
+                ],
+                timeout=60,
+                limit=24000,
+                env=environment,
+                merge_stderr=False,
+            )
+        except (OSError, TimeoutError):
             return False
-        doctor = await run_process(
-            [
-                str(executable),
-                "--config",
-                str(self.config.path.resolve()),
-                "doctor",
-            ],
-            timeout=60,
-            limit=24000,
-            env=environment,
-            merge_stderr=False,
-        )
         if doctor["exit_code"]:
             return False
         try:

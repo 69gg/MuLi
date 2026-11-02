@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 from muli.managed_cli import check_cli_paths, managed_record
+from muli.managed_journal import read_snapshots
 from muli.management_transaction import Role, TransactionError, TransactionJournal
 from muli.platforms.installation import InstallationManifest
 from muli.platforms.transaction_files import ConfigurationFile
-from muli.service import UserService
+from muli.service import UserService, _write_private
 
 
 def _published(root: Path) -> InstallationManifest | None:
@@ -122,7 +123,38 @@ async def guarded_service_action(
         if not managed.resolved:
             raise TransactionError("transaction_in_progress")
         if action == "install":
-            raise TransactionError("managed_unit_replacement_forbidden")
+            if str(service.path.absolute()) != anchor.unit_path:
+                raise TransactionError("service_identity_changed")
+            capability = service.capability()
+            if not capability["supported"]:
+                raise ValueError(str(capability["reason"]))
+            try:
+                service.path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise TransactionError("managed_unit_replacement_forbidden")
+            with (
+                TransactionJournal(
+                    root, Path(anchor.database_path), anchor.journal, create=False
+                ) as journal,
+                journal.locked() as control,
+            ):
+                if control.read_current() != managed:
+                    raise TransactionError("stale_revision")
+                snapshot_role: Role = "target" if managed.phase == "committed" else "base"
+                binding = managed.binding(snapshot_role)
+                if binding.entry == "managed" and binding.unit != anchor.managed_unit:
+                    raise TransactionError("service_identity_changed")
+                try:
+                    unit_text = read_snapshots(journal, managed, snapshot_role).unit.decode("utf-8")
+                except (OSError, ValueError):
+                    raise TransactionError("service_identity_changed") from None
+                # The unit was removed by an explicit uninstall; restore the
+                # journal-verified managed unit instead of an ordinary one.
+                _write_private(service.path, unit_text)
+                await service._run(["systemctl", "--user", "daemon-reload"])
+                return {"accepted": True, "action": "install", "backend": service.backend}
         with (
             TransactionJournal(
                 root, Path(anchor.database_path), anchor.journal, create=False

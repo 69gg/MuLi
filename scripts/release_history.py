@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 HEADING = re.compile(r"^## \[(\d+\.\d+\.\d+)\](?:\s*—\s*(\d{4}-\d{2}-\d{2}))?", re.M)
+SECTION = re.compile(r"^##(?:[ \t]|$)", re.M)
 STATUSES = {"released", "tagged", "untagged", "unpublished"}
 ReleaseStatus = Literal["released", "tagged", "untagged", "unpublished"]
 
@@ -53,11 +54,12 @@ def changelog_versions(text: str) -> list[str]:
 
 
 def changelog_sections(text: str) -> dict[str, str]:
-    """Return the description under each version heading."""
+    """Return the description under each version heading, ending at any next section."""
     matches = list(HEADING.finditer(text))
+    boundaries = [match.start() for match in SECTION.finditer(text)]
     sections: dict[str, str] = {}
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+    for match in matches:
+        end = next((start for start in boundaries if start > match.start()), len(text))
         sections[match.group(1)] = text[match.end() : end].strip()
     return sections
 

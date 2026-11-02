@@ -205,6 +205,29 @@ async def test_existing_open_has_no_directory_or_permission_operations(
     store.close()
 
 
+async def test_existing_store_without_the_optional_continuity_index_is_admitted(
+    database: Path,
+) -> None:
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("DROP INDEX channel_outbox_continuity")
+    store = Store.open_existing(database)
+    store.close()
+
+
+def test_new_channel_schema_creates_the_optional_continuity_index(tmp_path: Path) -> None:
+    store = Store(tmp_path / "new.sqlite3")
+    try:
+        store.prepare_channels()
+        assert (
+            store.db.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name='channel_outbox_continuity'"
+            ).fetchone()
+            is not None
+        )
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("nested", [False, True])
 def test_missing_database_is_never_created(tmp_path: Path, nested: bool) -> None:
     path = (tmp_path / "missing-parent" if nested else tmp_path) / "missing.db"
