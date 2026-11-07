@@ -858,12 +858,10 @@ class ChannelManager:
                 or existing["route"] != selected
                 or existing["payload"].get("attention_routing") != metadata
                 or existing["payload"].get("approval_notice") != notice_data
-                or (
-                    existing["payload"].get("channel_continuity") is not None
-                    and existing["payload"].get("channel_continuity") != continuity_data
-                )
             ):
                 raise ChannelError("相同投递 ID 的内容或发送模式不一致", status_code=409)
+            # A retry may omit or refresh the optional summary reference; the
+            # stored delivery keeps its original reference.
             return existing
         count = self.store.db.execute(
             "SELECT count(*) FROM channel_outbox WHERE state IN ('pending','retry','sending')"

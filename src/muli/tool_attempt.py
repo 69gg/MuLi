@@ -23,10 +23,12 @@ _TERMINAL: frozenset[str] = frozenset({"committed", "not_executed", "unknown"})
 _SAFE_PHASES: frozenset[str] = frozenset({"planned", "committed", "not_executed"})
 
 
-def attempt_id(run_id: str, call_id: str) -> str:
+def attempt_id(run_id: str, call_id: str, batch_seq: int | None = None) -> str:
     if not run_id or not call_id:
         raise ValueError("工具尝试缺少运行或调用标识")
-    return f"{run_id}:{call_id}"
+    if batch_seq is not None and (type(batch_seq) is not int or batch_seq < 1):
+        raise ValueError("工具尝试批次标识无效")
+    return f"{run_id}:{batch_seq}:{call_id}" if batch_seq is not None else f"{run_id}:{call_id}"
 
 
 def arguments_digest(arguments: Any) -> str:
@@ -51,6 +53,7 @@ class Attempt:
     risk: str
     recovery: Recovery
     arguments_digest: str
+    batch_seq: int | None = None
     phase: Phase = "planned"
     started_at: float | None = None
     committed_at: float | None = None
@@ -75,6 +78,7 @@ class Attempt:
             "risk": self.risk,
             "recovery": self.recovery,
             "arguments_digest": self.arguments_digest,
+            "batch_seq": self.batch_seq,
             "phase": self.phase,
             "started_at": self.started_at,
             "committed_at": self.committed_at,
@@ -99,6 +103,7 @@ class Attempt:
             risk=str(value.get("risk", "unknown")),
             recovery=value.get("recovery", "never"),
             arguments_digest=str(value.get("arguments_digest", "")),
+            batch_seq=(value["batch_seq"] if type(value.get("batch_seq")) is int else None),
             phase=value.get("phase", "planned"),
             started_at=value.get("started_at"),
             committed_at=value.get("committed_at"),
@@ -118,8 +123,8 @@ class ToolAttempts:
     def __init__(self, store: Store) -> None:
         self.store = store
 
-    def get(self, run_id: str, call_id: str) -> dict[str, Any] | None:
-        return self.store.get("tool_attempt", attempt_id(run_id, call_id))
+    def get(self, run_id: str, call_id: str, batch_seq: int | None = None) -> dict[str, Any] | None:
+        return self.store.get("tool_attempt", attempt_id(run_id, call_id, batch_seq))
 
     def begin(
         self,
@@ -132,8 +137,9 @@ class ToolAttempts:
         risk: str,
         recovery: Recovery,
         arguments: Any,
+        batch_seq: int | None = None,
     ) -> Attempt:
-        identifier = attempt_id(run_id, call_id)
+        identifier = attempt_id(run_id, call_id, batch_seq)
         existing = self.store.get("tool_attempt", identifier)
         if existing is not None:
             return Attempt.load(existing)
@@ -147,6 +153,7 @@ class ToolAttempts:
             risk,
             recovery,
             arguments_digest(arguments),
+            batch_seq=batch_seq,
         )
         self.store.put("tool_attempt", attempt.dump())
         return attempt

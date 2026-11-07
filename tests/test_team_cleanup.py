@@ -11,7 +11,7 @@ import pytest
 from test_runtime import FakeClient, make_runtime
 
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent, ToolCall
-from muli.store import Store
+from muli.store import Store, new_id, now
 
 
 async def test_runtime_close_settles_committed_team_finalizer_before_database_close(
@@ -1100,4 +1100,66 @@ async def test_stop_suppresses_old_reports_but_defers_resumed_generation_report(
         release.set()
         if stopper is not None:
             await asyncio.gather(stopper, return_exceptions=True)
+        await runtime.close()
+
+
+async def test_explicit_start_only_waives_cleanup_for_the_named_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    parent = runtime.new_session(mode="yolo")
+
+    def queued(name: str) -> dict[str, Any]:
+        identifier = new_id()
+        runtime.store.put_many(
+            [
+                (
+                    "session",
+                    {
+                        "id": identifier,
+                        "title": name,
+                        "kind": "team",
+                        "role": "worker",
+                        "mode": "yolo",
+                        "principal": "owner",
+                        "status": "idle",
+                        "created_at": now(),
+                        "updated_at": now(),
+                    },
+                ),
+                (
+                    "agent",
+                    {
+                        "id": identifier,
+                        "session_id": identifier,
+                        "name": name,
+                        "role": "worker",
+                        "parent_id": parent["id"],
+                        "mode": "yolo",
+                        "status": "queued",
+                        "created_at": now(),
+                        "updated_at": now(),
+                        "generation": 0,
+                        "completion_revision": 0,
+                    },
+                ),
+            ]
+        )
+        return runtime.team.get(identifier)
+
+    stopping = queued("停止清理中的队友")
+    named = queued("收到新输入的队友")
+    started: list[str] = []
+
+    async def run(agent_id: str) -> None:
+        started.append(agent_id)
+
+    monkeypatch.setattr(runtime.team, "_run", run)
+    runtime.team._stopping_generations[(stopping["id"], 0)] = 1
+    try:
+        runtime.team.start(explicit=named["id"])
+        await asyncio.gather(*tuple(runtime.team._tasks), return_exceptions=True)
+        assert started == [named["id"]]
+        assert runtime.team._stopping_generations[(stopping["id"], 0)] == 1
+    finally:
         await runtime.close()

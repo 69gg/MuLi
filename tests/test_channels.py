@@ -1060,3 +1060,25 @@ def test_weixin_owner_ids_are_bounded_and_groups_remain_opt_in() -> None:
         "sender_id": "7",
         "kind": "group",
     }
+
+
+async def test_duplicate_delivery_keeps_its_original_continuity_reference(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, ChannelsConfig(onebot=profile()), unused)
+    reference = {"id": "summary", "main_id": "main", "agent_id": "agent", "run_id": "run-1"}
+    first = await harness.manager.enqueue(
+        "onebot", "7", "answer", event_id="answer", continuity=reference
+    )
+    assert first["payload"]["channel_continuity"] == reference
+    changed = await harness.manager.enqueue(
+        "onebot",
+        "7",
+        "answer",
+        event_id="answer",
+        continuity={**reference, "run_id": "run-2"},
+    )
+    assert changed["id"] == first["id"]
+    assert changed["payload"]["channel_continuity"] == reference
+    omitted = await harness.manager.enqueue("onebot", "7", "answer", event_id="answer")
+    assert omitted["id"] == first["id"]
+    assert omitted["payload"]["channel_continuity"] == reference
+    await harness.close()
