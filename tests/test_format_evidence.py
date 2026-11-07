@@ -735,9 +735,7 @@ def test_begin_observation_calibrates_call_time_and_return_gap_without_relaxing_
         monkeypatch.setattr(evidence_module._Reader, "begin", begin)
 
     with pytest.raises(FormatEvidenceError) as caught:
-        evidence_module.read_optional_format_evidence(
-            reader, limits=FormatReadLimits(seconds=1.0)
-        )
+        evidence_module.read_optional_format_evidence(reader, limits=FormatReadLimits(seconds=1.0))
     error = caught.value
     assert error.code == str(error) == "format_read_timeout"
     value = _observation(error)
@@ -799,9 +797,7 @@ def test_unavailable_thread_clock_does_not_replace_original_format_timeout(
     )
     monkeypatch.setattr(evidence_module, "_rows", rows)
     with pytest.raises(FormatEvidenceError) as caught:
-        evidence_module.read_optional_format_evidence(
-            reader, limits=FormatReadLimits(seconds=1.0)
-        )
+        evidence_module.read_optional_format_evidence(reader, limits=FormatReadLimits(seconds=1.0))
     error = caught.value
     assert error.code == str(error) == "format_read_timeout"
     value = _observation(error)
