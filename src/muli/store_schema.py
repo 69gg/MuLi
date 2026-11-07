@@ -166,7 +166,7 @@ class ExistingStoreError(ValueError):
 
 
 class ExistingStoreLimits(StrictRecord):
-    seconds: float = Field(default=1.0, gt=0, le=5, allow_inf_nan=False)
+    seconds: float = Field(default=3.0, gt=0, le=5, allow_inf_nan=False)
     vm_steps: int = Field(default=200_000, ge=1, le=1_000_000)
     source_bytes: int = Field(default=32_768, ge=1, le=65_536)
     schema_objects: int = Field(default=96, ge=1, le=128)

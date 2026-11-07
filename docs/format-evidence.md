@@ -41,7 +41,7 @@ VM progress 按至多 100 条指令回调，`vm_steps` 限定累计回调覆盖�
 
 读取失败时，仅在最终 `FormatEvidenceError` 上附一条 `format_read_observation=` note；成功不添加观察结果。note 只含固定阶段 `setup/begin/optional/schema/marker/identity/main_object/cleanup` 的累计整数毫秒、总毫秒、失败阶段和本次查询/VM progress 计数，不含 SQL、路径、身份、正文、参数或底层异常。毫秒向下取整并饱和到有符号 32 位非负整数，单条 note 最多 1024 UTF-8 bytes。阶段累计包含清理，分别取整可能使各阶段之和略小于总量；这是同进程墙钟观察，不能据此断言 I/O 或调度根因。
 
-共享原入口单调期限，不续期，不增加查询或重试；默认 1 秒、8 查询及所有 VM/bytes/busy 限制不变。只在固定阶段边界采样，progress callback 不增加采样或格式化。先记录失败阶段再清理；清理失败仍优先返回 `format_cleanup_failed` 并记失败阶段为 cleanup，不能将准入失败改为成功。底层阻塞 I/O 仍不承诺 Python 硬期限。
+共享原入口单调期限，不续期，不增加查询或重试；默认 3 秒、8 查询及所有 VM/bytes/busy 限制不变。只在固定阶段边界采样，progress callback 不增加采样或格式化。先记录失败阶段再清理；清理失败仍优先返回 `format_cleanup_failed` 并记失败阶段为 cleanup，不能将准入失败改为成功。底层阻塞 I/O 仍不承诺 Python 硬期限。
 
 `Store.open_existing` 的固定错误映射只转发此读取器本次生成的 note，不复制任意 `__notes__`，不改变异常 code/str、公开响应或持久数据。此观测用于下一次失败同次定位，不代表已修复期限失败的根因。真实 Windows 期限边界未验证。
 

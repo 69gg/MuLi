@@ -54,7 +54,7 @@ class FormatEvidenceError(ValueError):
 
 
 class FormatReadLimits(StrictRecord):
-    seconds: float = Field(default=1.0, gt=0, le=5, allow_inf_nan=False)
+    seconds: float = Field(default=3.0, gt=0, le=5, allow_inf_nan=False)
     vm_steps: int = Field(default=100_000, ge=1, le=1_000_000)
     queries: int = Field(default=8, ge=1, le=16)
     schema_rows: int = Field(default=32, ge=2, le=128)

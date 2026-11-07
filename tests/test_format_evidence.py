@@ -391,7 +391,7 @@ def test_deadline_also_checked_between_fast_statements(
     _, _, reader = database
     ticks = iter((0.0, 0.0))
     monkeypatch.setattr(evidence_module, "monotonic", lambda: next(ticks, 2.0))
-    _error(reader, "format_read_timeout")
+    _error(reader, "format_read_timeout", seconds=1.0)
 
 
 def test_database_lock_is_not_retried_or_used_to_create_state(tmp_path: Path) -> None:
@@ -569,7 +569,7 @@ def test_failure_observation_uses_original_deadline_and_fixed_phases(
     monkeypatch.setattr(evidence_module, "_rows", rows)
     read = evidence_module.read_optional_format_evidence if optional else read_format_evidence
     with pytest.raises(FormatEvidenceError) as caught:
-        read(reader)
+        read(reader, limits=FormatReadLimits(seconds=1.0))
     error = caught.value
     assert str(error) == error.code == "format_read_timeout"
     value = _observation(error)
@@ -735,7 +735,9 @@ def test_begin_observation_calibrates_call_time_and_return_gap_without_relaxing_
         monkeypatch.setattr(evidence_module._Reader, "begin", begin)
 
     with pytest.raises(FormatEvidenceError) as caught:
-        evidence_module.read_optional_format_evidence(reader)
+        evidence_module.read_optional_format_evidence(
+            reader, limits=FormatReadLimits(seconds=1.0)
+        )
     error = caught.value
     assert error.code == str(error) == "format_read_timeout"
     value = _observation(error)
@@ -797,7 +799,9 @@ def test_unavailable_thread_clock_does_not_replace_original_format_timeout(
     )
     monkeypatch.setattr(evidence_module, "_rows", rows)
     with pytest.raises(FormatEvidenceError) as caught:
-        evidence_module.read_optional_format_evidence(reader)
+        evidence_module.read_optional_format_evidence(
+            reader, limits=FormatReadLimits(seconds=1.0)
+        )
     error = caught.value
     assert error.code == str(error) == "format_read_timeout"
     value = _observation(error)

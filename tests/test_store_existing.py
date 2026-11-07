@@ -611,7 +611,7 @@ async def test_schema_budget_note_distinguishes_progress_and_final_wall_gate(
     with closing(sqlite3.connect(database)) as db:
         previous = db.total_changes
         with pytest.raises(ExistingStoreError) as caught:
-            validate_existing_schema(db, "channel")
+            validate_existing_schema(db, "channel", limits=ExistingStoreLimits(seconds=1.0))
         note = schema_budget_note(caught.value)
         assert note["group"] == "channel" and note["trigger"] == "wall_clock"
         assert note["phase"] == ("schema" if expire_before_scan else "complete")
@@ -711,7 +711,7 @@ async def test_schema_budget_note_separates_setup_and_schema_time_without_relaxi
         previous_busy_timeout = db.execute("PRAGMA busy_timeout").fetchone()[0]
         changes = db.total_changes
         with pytest.raises(ExistingStoreError) as caught:
-            validate_existing_schema(db)
+            validate_existing_schema(db, limits=ExistingStoreLimits(seconds=1.0))
         note = schema_budget_note(caught.value)
         assert {key: note[key] for key in ("group", "phase", "trigger", "steps", "vm_limit")} == {
             "group": "all",
@@ -832,7 +832,7 @@ async def test_schema_budget_timing_invalid_samples_are_null_and_large_elapsed_i
     with closing(sqlite3.connect(database)) as db:
         changes = db.total_changes
         with pytest.raises(ExistingStoreError) as caught:
-            validate_existing_schema(db)
+            validate_existing_schema(db, limits=ExistingStoreLimits(seconds=1.0))
         note = schema_budget_note(caught.value)
         assert note["phase"] == "schema" and note["trigger"] == "wall_clock"
         expected = 2**31 - 1 if ending == 1e308 else None
@@ -941,7 +941,7 @@ async def test_current_format_channel_read_budget_precedes_client_creation(
         limits: ExistingStoreLimits,
     ) -> None:
         nonlocal now
-        now = 2.0
+        now = ExistingStoreLimits().seconds + 1.0
         original(db, definitions, limits)
 
     def client(**kwargs: Any) -> httpx.AsyncClient:
