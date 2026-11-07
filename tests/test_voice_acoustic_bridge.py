@@ -107,6 +107,49 @@ async def test_builtin_preflight_rejects_before_process(
         await detector.detect(Path("fake.wav"), reference=Path("reference.wav"))
 
 
+def test_status_keeps_a_provider_fallback_reason_while_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "acoustic.json"
+    command = [sys.executable, "-m", "muli.acoustic_bridge", "--config", str(config_path)]
+    report = {
+        "available": True,
+        "wake_configured": True,
+        "speaker_configured": True,
+        "wake_sample_rate": 16000,
+        "configured_provider": "rocm",
+        "effective_provider": "cpu",
+        "provider_fallback": True,
+        "runtime_verified": False,
+        "reason": "sherpa-onnx 不支持 ROCm，auto 回退 CPU",
+    }
+    monkeypatch.setattr(bridge, "check_config", lambda *args, **kwargs: report)
+    status = CommandDetector(VoiceSettings(wake_command=command), "wake").status()
+    assert status["available"] is True
+    assert status["provider_fallback"] is True
+    assert status["reason"] == "sherpa-onnx 不支持 ROCm，auto 回退 CPU"
+
+
+def test_status_reports_missing_configuration_only_when_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "acoustic.json"
+    command = [sys.executable, "-m", "muli.acoustic_bridge", "--config", str(config_path)]
+    report = {
+        "available": True,
+        "wake_configured": False,
+        "speaker_configured": False,
+        "wake_sample_rate": 16000,
+        "configured_provider": "cpu",
+        "runtime_verified": False,
+        "reason": "",
+    }
+    monkeypatch.setattr(bridge, "check_config", lambda *args, **kwargs: report)
+    status = CommandDetector(VoiceSettings(wake_command=command), "wake").status()
+    assert status["available"] is False
+    assert status["reason"] == "尚未配置wake声学模型"
+
+
 def test_preflight_never_confuses_separate_venvs_sharing_a_python_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

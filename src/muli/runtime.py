@@ -107,6 +107,7 @@ from muli.team import ShellContinuation, TeamManager
 from muli.team_consult import ConsultRequest
 from muli.team_wait import TERMINAL
 from muli.tool_attempt import ToolAttempts
+from muli.tool_attempt import attempt_id as tool_attempt_id
 from muli.tool_attempt import command_id as attempt_command_id
 from muli.tool_attempt import result_status as attempt_result_status
 from muli.tools import Tool, parameters, string
@@ -295,7 +296,7 @@ class Runtime:
                 self.config.settings.model_dump_json().encode("utf-8")
             ).hexdigest(),
         )
-        self._attempts: dict[tuple[str, str], Any] = {}
+        self._attempts: dict[tuple[str, int | None, str], Any] = {}
         self._request_context: ContextVar[PreparedRequest | None] = ContextVar(
             "muli_request", default=None
         )
@@ -3130,12 +3131,16 @@ class Runtime:
                 raise asyncio.CancelledError
 
     def _attempt_for_call(
-        self, session_id: str, call_id: str, run_id: str | None = None
+        self,
+        session_id: str,
+        call_id: str,
+        run_id: str | None = None,
+        batch_seq: int | None = None,
     ) -> dict[str, Any] | None:
         if run_id:
             # A run-scoped lookup must not fall back to another run's attempt
             # with the same call id; a missing record means this run has none.
-            return self.store.get("tool_attempt", f"{run_id}:{call_id}")
+            return self.store.get("tool_attempt", tool_attempt_id(run_id, call_id, batch_seq))
         row = self.store.db.execute(
             "SELECT data FROM objects WHERE kind='tool_attempt' "
             "AND json_extract(data,'$.session_id')=? AND json_extract(data,'$.call_id')=? "
@@ -3146,15 +3151,21 @@ class Runtime:
 
     def _repair_tail(self, session_id: str) -> None:
         """Journal the open tail using durable attempt phases, never replaying."""
-        pending: dict[str, str | None] = {}
+        pending: dict[str, tuple[str | None, int | None]] = {}
         for item in self.store.messages(session_id):
             if item["role"] != "tool":
-                pending = {call["id"]: item.get("run_id") for call in item.get("tool_calls", [])}
+                pending = {
+                    call["id"]: (item.get("run_id"), item.get("seq"))
+                    for call in item.get("tool_calls", [])
+                }
             else:
                 pending.pop(item.get("tool_call_id", ""), None)
-        for identifier, run_id in pending.items():
+        for identifier, (run_id, batch_seq) in pending.items():
             attempt = self._attempt_for_call(
-                session_id, identifier, run_id if isinstance(run_id, str) else None
+                session_id,
+                identifier,
+                run_id if isinstance(run_id, str) else None,
+                batch_seq if type(batch_seq) is int else None,
             )
             writes: list[tuple[str, dict[str, Any]]] = []
             if attempt is None:
@@ -3846,6 +3857,7 @@ class Runtime:
                             run_id,
                             round_tools,
                             error_code="channel_returned",
+                            batch_seq=prepared.tool_batch_seq,
                         )
                         await self._tool_completed(call, result, session_id)
                     elif paused is not None:
@@ -3857,6 +3869,7 @@ class Runtime:
                             run_id,
                             round_tools,
                             error_code="task_paused",
+                            batch_seq=prepared.tool_batch_seq,
                         )
                         await self._tool_completed(call, result, session_id)
                     elif self.store.pending_inputs(session_id):
@@ -3871,6 +3884,7 @@ class Runtime:
                             run_id,
                             round_tools,
                             error_code="new_input",
+                            batch_seq=prepared.tool_batch_seq,
                         )
                         await self._tool_completed(call, result, session_id)
                     else:
@@ -3962,7 +3976,7 @@ class Runtime:
                     writes: list[tuple[str, dict[str, Any]]] = [("message", tool_message)]
                     if publication is not None:
                         writes.append(("task_file_publication", publication))
-                    attempt = self._attempts.get((run_id, call.id))
+                    attempt = self._attempts.get((run_id, prepared.tool_batch_seq, call.id))
                     if attempt is not None:
                         status = attempt_result_status(result)
                         if status == "not_executed":
@@ -4003,7 +4017,7 @@ class Runtime:
                             )
                         writes.append(("tool_attempt", attempt.dump()))
                     self.store.put_many(writes)
-                    self._attempts.pop((run_id, call.id), None)
+                    self._attempts.pop((run_id, prepared.tool_batch_seq, call.id), None)
                     if self.team.shell_tool_completed(
                         session_id, run_id, prepared, assistant_message, call, result, tool_message
                     ):
@@ -4206,6 +4220,7 @@ class Runtime:
         session_id: str,
         run_id: str,
         arguments: Any,
+        batch_seq: int | None,
     ) -> Any:
         run = self.store.get("run", run_id) or {}
         attempt = self.tool_attempts.begin(
@@ -4217,8 +4232,9 @@ class Runtime:
             risk=tool.risk,
             recovery=tool.recovery,
             arguments=arguments,
+            batch_seq=batch_seq,
         )
-        self._attempts[(run_id, call.id)] = attempt
+        self._attempts[(run_id, batch_seq, call.id)] = attempt
         return attempt
 
     def _mark_not_executed(self, attempt: Any, *, error_code: str | None = None) -> None:
@@ -4243,7 +4259,10 @@ class Runtime:
             if call.name not in tools:
                 raise ValueError("工具未启用")
             tool = tools[call.name]
-            attempt = self._begin_tool_attempt(call, tool, session_id, run_id, call.arguments)
+            batch_seq = prepared.tool_batch_seq if prepared is not None else None
+            attempt = self._begin_tool_attempt(
+                call, tool, session_id, run_id, call.arguments, batch_seq
+            )
             arguments = json.loads(call.arguments)
             Draft202012Validator(tool.parameters).validate(arguments)
             if prepared is None:
@@ -4286,7 +4305,7 @@ class Runtime:
                 }
             # The started fact must be durable before the handler can act.
             attempt = self.tool_attempts.mark_started(attempt)
-            self._attempts[(run_id, call.id)] = attempt
+            self._attempts[(run_id, batch_seq, call.id)] = attempt
             await self.bus.emit(
                 "tool.started",
                 {"call_id": call.id, "name": call.name, "arguments": arguments},
@@ -4323,7 +4342,7 @@ class Runtime:
                     command = attempt_command_id(result)
                     if command is not None and attempt is not None:
                         attempt = self.tool_attempts.mark_started(attempt, command_id=command)
-                        self._attempts[(run_id, call.id)] = attempt
+                        self._attempts[(run_id, batch_seq, call.id)] = attempt
             finally:
                 self._active_tool.reset(active_token)
                 self._request_context.reset(request_token)
@@ -4394,12 +4413,15 @@ class Runtime:
         tools: dict[str, Tool],
         *,
         error_code: str,
+        batch_seq: int | None,
     ) -> None:
         """Stage a not-executed attempt; the common path commits its message."""
         tool = tools.get(call.name)
-        attempt = self._attempts.get((run_id, call.id))
+        attempt = self._attempts.get((run_id, batch_seq, call.id))
         if attempt is None and tool is not None:
-            attempt = self._begin_tool_attempt(call, tool, session_id, run_id, call.arguments)
+            attempt = self._begin_tool_attempt(
+                call, tool, session_id, run_id, call.arguments, batch_seq
+            )
         if attempt is not None:
             self.tool_attempts.mark_not_executed(attempt, error_code=error_code, persist=False)
 

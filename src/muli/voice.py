@@ -248,14 +248,15 @@ class CommandDetector:
                 ):
                     available = False
                     report["reason"] = "录音与唤醒模型的采样率不一致"
+                reason = report["reason"]
+                if not reason and not available:
+                    reason = f"尚未配置{operation}声学模型"
                 return {
                     **report,
                     "configured": configured,
                     "available": available,
                     "backend": "sherpa-onnx",
-                    "reason": (
-                        report["reason"] or f"尚未配置{operation}声学模型" if not available else ""
-                    ),
+                    "reason": reason,
                 }
             except (OSError, ValueError, ImportError):
                 return {

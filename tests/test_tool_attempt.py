@@ -11,8 +11,37 @@ from muli.tool_attempt import ToolAttempts, arguments_digest, attempt_id
 
 def test_attempt_ids_include_the_run_and_digest_arguments() -> None:
     assert attempt_id("run-a", "call-1") == "run-a:call-1"
+    assert attempt_id("run-a", "call-1", 3) == "run-a:3:call-1"
     assert attempt_id("run-a", "call-1") != attempt_id("run-b", "call-1")
     assert arguments_digest({"b": 2, "a": 1}) == arguments_digest({"a": 1, "b": 2})
+
+
+async def test_reused_call_ids_in_later_batches_keep_separate_attempts(tmp_path: Path) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    try:
+        run_id = new_id()
+        attempts = ToolAttempts(runtime.store)
+        shared = {
+            "run_id": run_id,
+            "call_id": "call-1",
+            "session_id": "session-1",
+            "generation": 1,
+            "tool": "fs_read",
+            "risk": "read",
+            "recovery": "replayable",
+            "arguments": {"path": "/tmp/a"},
+        }
+        first = attempts.begin(**shared, batch_seq=1)
+        second = attempts.begin(**shared, batch_seq=2)
+        again = attempts.begin(**shared, batch_seq=1)
+        assert first.attempt_id == f"{run_id}:1:call-1"
+        assert second.attempt_id == f"{run_id}:2:call-1"
+        assert again.attempt_id == first.attempt_id
+        assert first.batch_seq == 1 and second.batch_seq == 2
+        stored = attempts.get(run_id, "call-1", 2)
+        assert stored is not None and stored["attempt_id"] == second.attempt_id
+    finally:
+        await runtime.close()
 
 
 async def test_attempt_phases_are_additive_objects(tmp_path: Path) -> None:
@@ -84,13 +113,13 @@ async def test_repair_tail_uses_attempt_phases_without_replaying(tmp_path: Path)
             {"id": "committed", "name": "fs_read", "arguments": "{}"},
             {"id": "legacy", "name": "fs_read", "arguments": "{}"},
         ]
-        runtime.store.add_message(
+        batch = runtime.store.add_message(
             sid,
             "assistant",
             "",
             tool_calls=calls,
             run_id=run_id,
-        )
+        )["seq"]
         attempts = ToolAttempts(runtime.store)
         planned = attempts.begin(
             run_id=run_id,
@@ -101,6 +130,7 @@ async def test_repair_tail_uses_attempt_phases_without_replaying(tmp_path: Path)
             risk="write",
             recovery="never",
             arguments={},
+            batch_seq=batch,
         )
         started = attempts.begin(
             run_id=run_id,
@@ -111,6 +141,7 @@ async def test_repair_tail_uses_attempt_phases_without_replaying(tmp_path: Path)
             risk="write",
             recovery="never",
             arguments={},
+            batch_seq=batch,
         )
         attempts.mark_started(started)
         committed = attempts.begin(
@@ -122,6 +153,7 @@ async def test_repair_tail_uses_attempt_phases_without_replaying(tmp_path: Path)
             risk="read",
             recovery="replayable",
             arguments={},
+            batch_seq=batch,
         )
         attempts.mark_started(committed)
         result = runtime.store._message(

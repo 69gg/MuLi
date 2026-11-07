@@ -818,7 +818,7 @@ class TeamManager:
         if inserted and receipt["state"] == "pending":
             self.cancel_shell_continuation(agent["id"], "收到独立新输入，自动续办让位于正常输入")
         if wake:
-            self.start(explicit=True)
+            self.start(explicit=agent["id"])
         if inserted:
             await self.runtime.bus.emit(
                 "team.message", {"agent_id": agent["id"], "receipt_id": receipt["id"]}
@@ -980,10 +980,11 @@ class TeamManager:
         else:
             agent["status"] = "queued"
             self.runtime.store.put("agent", agent)
-            self.start(explicit=True)
+            self.start(explicit=agent["id"])
         return self.get(agent["id"])
 
-    def start(self, *, explicit: bool = False) -> None:
+    def start(self, *, explicit: str | None = None) -> None:
+        """Start queued agents; only the explicitly named identity may bypass cleanup."""
         if self._closed or self.runtime._closing or not self.runtime.maintenance.admission.allowed:
             return
         after = 0
@@ -1002,12 +1003,12 @@ class TeamManager:
                 if agent["id"] in self._active or self._park_queued(agent):
                     continue
                 if (
-                    not explicit
+                    agent["id"] != explicit
                     and (agent["id"], agent.get("generation", 0)) in self._stopping_generations
                 ):
                     # A stop batch owns this identity's cleanup; never relaunch
-                    # it from the lease-release callback. Explicit new input or
-                    # resume belongs to a later intent and may start at once.
+                    # it from the lease-release callback. Only the identity named
+                    # by explicit new input or resume may start at once.
                     continue
                 if len(self._active) >= limit:
                     continue
