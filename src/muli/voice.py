@@ -235,7 +235,8 @@ class CommandDetector:
             try:
                 report = check_config(Path(self.command[4]), requested_device=self.config.device)
                 operation = "wake" if self.operation == "wake" else "speaker"
-                available = report["available"] and report[f"{operation}_configured"]
+                missing_model = not report[f"{operation}_configured"]
+                available = report["available"] and not missing_model
                 if (
                     self.config.device != "auto"
                     and self.config.device != report["configured_provider"]
@@ -249,7 +250,9 @@ class CommandDetector:
                     available = False
                     report["reason"] = "录音与唤醒模型的采样率不一致"
                 reason = report["reason"]
-                if not reason and not available:
+                if missing_model:
+                    # A missing model is the actionable cause; a provider
+                    # fallback notice must not hide it.
                     reason = f"尚未配置{operation}声学模型"
                 return {
                     **report,

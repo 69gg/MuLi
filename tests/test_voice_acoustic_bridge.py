@@ -123,7 +123,11 @@ def test_status_keeps_a_provider_fallback_reason_while_available(
         "runtime_verified": False,
         "reason": "sherpa-onnx 不支持 ROCm，auto 回退 CPU",
     }
-    monkeypatch.setattr(bridge, "check_config", lambda *args, **kwargs: report)
+
+    def check(path: Path, *, requested_device: str = "auto") -> dict[str, Any]:
+        return report
+
+    monkeypatch.setattr(bridge, "check_config", check)
     status = CommandDetector(VoiceSettings(wake_command=command), "wake").status()
     assert status["available"] is True
     assert status["provider_fallback"] is True
@@ -144,10 +148,44 @@ def test_status_reports_missing_configuration_only_when_unavailable(
         "runtime_verified": False,
         "reason": "",
     }
-    monkeypatch.setattr(bridge, "check_config", lambda *args, **kwargs: report)
+
+    def check(path: Path, *, requested_device: str = "auto") -> dict[str, Any]:
+        return report
+
+    monkeypatch.setattr(bridge, "check_config", check)
     status = CommandDetector(VoiceSettings(wake_command=command), "wake").status()
     assert status["available"] is False
     assert status["reason"] == "尚未配置wake声学模型"
+
+
+def test_status_reports_a_missing_model_before_a_provider_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "acoustic.json"
+    command = [sys.executable, "-m", "muli.acoustic_bridge", "--config", str(config_path)]
+    report = {
+        "available": True,
+        "wake_configured": True,
+        "speaker_configured": False,
+        "wake_sample_rate": 16000,
+        "configured_provider": "rocm",
+        "effective_provider": "cpu",
+        "provider_fallback": True,
+        "runtime_verified": False,
+        "reason": "sherpa-onnx 不支持 ROCm，auto 回退 CPU",
+    }
+
+    def check(path: Path, *, requested_device: str = "auto") -> dict[str, Any]:
+        assert requested_device == "auto"
+        return report
+
+    monkeypatch.setattr(bridge, "check_config", check)
+    detector = CommandDetector(
+        VoiceSettings(wake_command=command, speaker_command=command), "verify"
+    )
+    status = detector.status()
+    assert status["available"] is False
+    assert status["reason"] == "尚未配置speaker声学模型"
 
 
 def test_preflight_never_confuses_separate_venvs_sharing_a_python_binary(
