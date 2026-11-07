@@ -13,7 +13,11 @@ import pytest
 
 import muli.format_evidence as evidence_module
 from muli.format_admission import CURRENT_FORMAT_STATE, FormatAdmissionError
-from muli.format_evidence import FormatEvidenceError, read_optional_format_evidence
+from muli.format_evidence import (
+    FormatEvidenceError,
+    FormatReadLimits,
+    read_optional_format_evidence,
+)
 from muli.store import Store
 from muli.store_initialization import CreatedDatabase, StoreInitializationError
 
@@ -167,7 +171,11 @@ def test_pristine_check_rechecks_content_after_scanning_sidecars(
 
 
 def delay_initial_setup(
-    path: Path, monkeypatch: pytest.MonkeyPatch, *, empty_only: bool
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    empty_only: bool,
+    delay: float = 1.25,
 ) -> list[str]:
     clock = [100.0]
     delayed: list[str] = []
@@ -186,7 +194,7 @@ def delay_initial_setup(
             and not delayed
             and (not empty_only or path.stat().st_size == 0)
         ):
-            clock[0] += 1.25
+            clock[0] += delay
             delayed.append(sql)
         return result
 
@@ -226,7 +234,9 @@ def test_existing_files_still_fail_closed_when_initial_setup_exceeds_its_deadlin
     else:
         Store.open_runtime(path, default_mode="auto").close()
     before = path.read_bytes()
-    delayed = delay_initial_setup(path, monkeypatch, empty_only=False)
+    delayed = delay_initial_setup(
+        path, monkeypatch, empty_only=False, delay=FormatReadLimits().seconds + 0.25
+    )
     with pytest.raises(FormatEvidenceError) as caught:
         Store.open_runtime(path, default_mode="auto").close()
     assert str(caught.value) == caught.value.code == "format_read_timeout"
