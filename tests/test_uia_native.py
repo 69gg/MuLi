@@ -52,6 +52,36 @@ def settings() -> Settings:
     return Settings.model_validate({"computer": {"enabled": True, "backend": "auto"}})
 
 
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def warm_native_uia() -> None:
+    """Load PowerShell and UI Automation before the deadline-bound probes."""
+    script = Path(module.__file__).with_name("uia_helper.ps1")
+    lease = AXHelperLease(
+        [
+            str(module._powershell()),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Mta",
+            "-File",
+            str(script),
+        ],
+        timeout=60,
+        ttl=60,
+        max_nodes=100,
+        once=True,
+    )
+    try:
+        await lease.request("targets", {})
+    except Exception:
+        pass  # Best-effort warmup; each real probe keeps its own deadline.
+    finally:
+        try:
+            await lease.aclose()
+        except Exception:
+            pass
+
+
 @pytest_asyncio.fixture
 async def native_form() -> AsyncIterator[NativeForm]:
     title = "muli-uia-" + uuid4().hex
