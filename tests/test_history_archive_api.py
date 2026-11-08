@@ -35,7 +35,7 @@ async def archive_case(tmp_path: Path) -> AsyncIterator[tuple[Runtime, httpx.Asy
 
 
 @pytest.mark.parametrize("main", [True, False])
-async def test_archive_reaches_before_live_tail_without_mutating_execution(
+async def test_archive_reaches_before_live_tail_and_live_tail_is_complete(
     archive_case: tuple[Runtime, httpx.AsyncClient], main: bool
 ) -> None:
     runtime, client = archive_case
@@ -53,7 +53,9 @@ async def test_archive_reaches_before_live_tail_without_mutating_execution(
     ]
     live_path = "/api/conversation" if main else f"/api/sessions/{sid}"
     live = (await client.get(live_path)).json()
-    assert len(live["messages"]) == 1000 and live["messages"][0]["id"] == expected[1]["id"]
+    # A refresh or another device gets the whole durable tail, not only the
+    # newest page; the archive still walks every record independently.
+    assert [item["id"] for item in live["messages"]] == [item["id"] for item in expected]
     changes = runtime.store.db.total_changes
     found: list[str] = []
     params: dict[str, int] = {"limit": 100}
