@@ -321,6 +321,12 @@ def consumer_source_root(request: pytest.FixtureRequest) -> tuple[str, Path]:
         return "candidate", candidate
     value = os.environ.get("MULI_PREVIOUS_SOURCE_ROOT")
     if not value:
+        # CI and local checkouts both keep the frozen consumer here; auto-detect
+        # it so a plain `pytest` run still exercises the real previous build.
+        local = candidate / ".local-check-artifacts/previous-consumer"
+        if local.is_dir():
+            value = str(local)
+    if not value:
         pytest.fail(
             "真正旧消费者验证需要显式 MULI_PREVIOUS_SOURCE_ROOT 指向精确冻结 U checkout；不能跳过",
             pytrace=False,
