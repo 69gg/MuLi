@@ -49,7 +49,19 @@ class NativeForm:
 
 
 def settings() -> Settings:
-    return Settings.model_validate({"computer": {"enabled": True, "backend": "auto"}})
+    # Hosted Windows runners cold-start the UIA client and provider RPC while
+    # enumerating desktop windows; keep the functional assertions but leave
+    # headroom over the 12 s product default. The default itself is covered by
+    # unit tests and is not changed here.
+    return Settings.model_validate(
+        {
+            "computer": {
+                "enabled": True,
+                "backend": "auto",
+                "operation_timeout_seconds": 60.0,
+            }
+        }
+    )
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
