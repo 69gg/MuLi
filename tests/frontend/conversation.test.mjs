@@ -136,6 +136,23 @@ test("layout-generated scroll does not leave following; a real upward gesture pa
   assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight);
 });
 
+test("an upward reader stays paused across composer layout changes until returning to the tail", () => {
+  const h = harness(); h.start(); h.emit("message.delta", { content: "答".repeat(1100) });
+  h.render(); h.flushFrames();
+  h.scroll.dispatch("wheel", { deltaY: -120 });
+  h.scroll.scrollTop = 100; h.scroll.dispatch("scroll"); h.scroll.scrollCalls.length = 0;
+  h.onComposer(() => { h.scroll.clientHeight = 80; });
+  h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, 100, "composer growth must not yank an upward reader to the tail");
+  assert.equal(h.scroll.scrollCalls.length, 0);
+  h.emit("message.delta", { content: "续".repeat(300) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, 100, "streamed output must respect the paused reader");
+  h.scroll.dispatch("wheel", { deltaY: 1000 });
+  h.scroll.scrollTop = h.scroll.scrollHeight; h.scroll.dispatch("scroll");
+  h.emit("message.delta", { content: "尾".repeat(200) }); h.render(); h.flushFrames();
+  assert.equal(h.scroll.scrollTop, h.scroll.scrollHeight - h.scroll.clientHeight, "a manual return to the tail resumes following");
+});
+
 test("scrolling upward inside the real reasoning pane does not cancel main conversation following", () => {
   const h = harness(); h.start(); h.emit("reasoning.delta", { content: "思".repeat(1100) });
   h.render(); h.flushFrames();

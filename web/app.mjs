@@ -140,6 +140,7 @@ let conversationFollowing = true;
 let conversationFollowFrame = null;
 let conversationResizeObserver = null;
 let conversationScrollIntent = null;
+let conversationGestureUntil = 0;
 let conversationTouchY = null;
 const voiceSetup = new VoiceSetup({
   request: (...args) => ownedRequest(...args),
@@ -662,6 +663,11 @@ function armConversationScroll(event, kind, upward) {
   const scroll = $("#conversation-scroll");
   const intent = { kind, upward, top: scroll.scrollTop };
   conversationScrollIntent = intent;
+  conversationGestureUntil = Date.now() + 250;
+  // A real upward gesture pauses following immediately. The scroll event may
+  // arrive after the next animation frame when streamed content changes layout,
+  // so waiting for it would let the old follow mode yank the reader back down.
+  if (upward === true) conversationFollowing = false;
   // Wheel/key default scrolling precedes the frame. A stale gesture must not
   // later turn a layout/programmatic scroll into an upward reading action.
   if (kind !== "scrollbar" && typeof requestAnimationFrame === "function") requestAnimationFrame(() => {
@@ -674,8 +680,12 @@ function onConversationScroll() {
   // Concurrent content growth must not erase a real upward gesture. Clamp the
   // starting position only to exclude a layout-only reduction of the range.
   const previousTop = intent && Math.min(intent.top, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+  const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 1;
+  const userGesture = !!intent || Date.now() <= conversationGestureUntil;
   if (intent && intent.upward !== false && scroll.scrollTop < previousTop) conversationFollowing = false;
-  else if (scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 1) conversationFollowing = true;
+  // Only a user gesture may resume following; a layout or programmatic scroll
+  // must not override the reader's explicit pause.
+  else if (userGesture && atBottom) conversationFollowing = true;
   if (intent?.kind === "scrollbar") {
     intent.top = scroll.scrollTop;
   } else conversationScrollIntent = null;
@@ -1000,7 +1010,7 @@ function startSessionEvents(sessionId, owner = connection) {
   });
 }
 
-function resetMessageNodes() { releaseAnswerSpeech(); $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationTouchY = null; }
+function resetMessageNodes() { releaseAnswerSpeech(); $("#messages").replaceChildren(); messageNodes = new Map(); conversationFollowing = true; conversationScrollIntent = null; conversationGestureUntil = 0; conversationTouchY = null; }
 
 async function loadSession(id, trigger = null) {
   if (id === state.mainSessionId) { await switchView("chat"); return; }
