@@ -104,7 +104,7 @@ def test_workflow_matrix_covers_each_runner_with_complete_disjoint_partitions(
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     suite = workflow["jobs"]["tests"]
     assert suite["timeout-minutes"] == 30
-    assert suite["strategy"]["max-parallel"] == 6
+    assert "max-parallel" not in suite["strategy"]
     assert suite["strategy"]["fail-fast"] is False
     matrix = suite["strategy"]["matrix"]
     assert set(matrix) == {"include"}

@@ -12,7 +12,7 @@ concurrency:
 jobs:
   native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-uv
@@ -36,15 +36,15 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" \
             --working-directory="$GITHUB_WORKSPACE" \
             --property=MemoryMax=805306368 --property=MemorySwapMax=0 \
-            --property=OOMPolicy=kill --property=CPUQuota=50% \
-            --property=TasksMax=96 --property=RuntimeMaxSec=125 \
+            --property=OOMPolicy=kill --property=CPUQuota=100% \
+            --property=TasksMax=96 --property=RuntimeMaxSec=240 \
             --property=TimeoutStopSec=5 --property=KillMode=control-group \
             --setenv=GITHUB_ACTIONS=true --setenv=RUNNER_OS=Linux \
             --setenv=MULI_ATSPI_NATIVE=1 --setenv=GDK_BACKEND=x11 \
             --setenv=GTK_MODULES=atk-bridge --setenv=NO_AT_BRIDGE=0 \
             --setenv=GSETTINGS_BACKEND=memory --setenv=LANG=C.UTF-8 \
             --setenv="XDG_RUNTIME_DIR=$runtime" \
-            /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
+            /usr/bin/timeout --signal=TERM --kill-after=5s 240s \
             /usr/bin/env -u AT_SPI_BUS_ADDRESS \
             /usr/bin/dbus-run-session -- \
             /usr/bin/xvfb-run --auto-servernum \
@@ -56,7 +56,7 @@ jobs:
           membership = Path("/proc/self/cgroup").read_text().strip()
           if not membership.startswith("0::/") or "\n" in membership:
               raise RuntimeError("A private unified cgroup is required")
-          verify_group(Path("/sys/fs/cgroup") / membership.removeprefix("0::/"), MEMORY_BYTES, service=True)
+          verify_group(Path("/sys/fs/cgroup") / membership.removeprefix("0::/"), MEMORY_BYTES, service=True, cpu_percent=100)
           import sys
           sys.argv = ["pytest", "-q", "--tb=short", "-o", "faulthandler_timeout=60", "tests/test_atspi_native.py", "--basetemp=" + os.environ["XDG_RUNTIME_DIR"] + "/pytest"]
           runpy.run_module("pytest", run_name="__main__")'

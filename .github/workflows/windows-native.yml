@@ -22,7 +22,6 @@ jobs:
     timeout-minutes: 5
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         python: ['3.12', '3.13']
         spawn_mode: [create-no-window, default]
@@ -45,7 +44,6 @@ jobs:
     timeout-minutes: 5
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         python: ['3.12', '3.13']
     steps:

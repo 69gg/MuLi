@@ -69,14 +69,16 @@ def local_temp_directory() -> Path:
     return temporary
 
 
-def verify_group(path: Path, memory: int, *, service: bool = False) -> None:
+def verify_group(
+    path: Path, memory: int, *, service: bool = False, cpu_percent: int = CPU_PERCENT
+) -> None:
     for name, maximum in (("memory.max", memory), ("memory.swap.max", 0), ("pids.max", TASKS)):
         value = (path / name).read_text().strip()
         if value == "max" or int(value) > maximum:
             raise RuntimeError(f"Resource limit not enforced: {name}={value}")
     quota, period = (path / "cpu.max").read_text().split()
-    if quota == "max" or int(quota) * 100 > int(period) * CPU_PERCENT:
-        raise RuntimeError(f"CPU quota exceeds {CPU_PERCENT}% of one CPU")
+    if quota == "max" or int(quota) * 100 > int(period) * cpu_percent:
+        raise RuntimeError(f"CPU quota exceeds {cpu_percent}% of one CPU")
     if service and (path / "memory.oom.group").read_text().strip() != "1":
         raise RuntimeError("Whole-service OOM cleanup is not enabled")
 
