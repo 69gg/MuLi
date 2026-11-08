@@ -16,7 +16,6 @@ from test_document_reading import docx
 
 import muli.document_reading as document_module
 from muli.attachment_memory_source import attachment_source
-from muli.config import Limits
 from muli.document_reading import document_revision
 from muli.memory import source_digest
 
@@ -498,8 +497,9 @@ async def test_http_collection_keeps_dedup_external_identity_and_forgotten_tombs
 
 async def test_public_budget_is_checked_before_any_collection_side_effect(tmp_path: Path) -> None:
     async with actual_app(tmp_path) as rig:
-        minimum = Limits.model_json_schema()["properties"]["max_output_chars"]["minimum"]
-        assert type(minimum) is int
+        # The default budget is now unlimited; pin a small explicit budget to
+        # keep exercising the pre-side-effect admission path.
+        minimum = 1000
         rig.runtime.config.update({"limits": {"max_output_chars": minimum}})
         async with connection(rig) as client:
             text = "完整正文仍应保留。"
