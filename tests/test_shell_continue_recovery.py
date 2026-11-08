@@ -139,14 +139,25 @@ def previous_config(path: Path) -> ConfigFile:
             settings = config_module.Settings.model_validate(data)
             break
         except ValidationError as error:
-            extras = [
+            # Unknown keys and newer budget values are config-schema evolution,
+            # not the store format under test. Drop either so the frozen build
+            # validates this crash snapshot with its own defaults; the file on
+            # disk stays byte-identical.
+            rejected = [
                 item["loc"]
                 for item in error.errors()
-                if item["type"] == "extra_forbidden"
+                if item["type"]
+                in {
+                    "extra_forbidden",
+                    "greater_than",
+                    "greater_than_equal",
+                    "less_than",
+                    "less_than_equal",
+                }
             ]
-            if not extras:
+            if not rejected:
                 raise
-            for location in extras:
+            for location in rejected:
                 target = data
                 for part in location[:-1]:
                     target = target[part]
