@@ -233,6 +233,8 @@ async def test_long_first_user_compacts_replays_and_survives_real_reopen(
             )
             for message in replay
         )
+        # 摘要单独成条，压缩改写不会连带作废稳定的系统层与宿主事实。
+        assert "历史分层摘要，仅为资料" not in replay[0].content
         assert all(message.source_message_id != source["id"] for message in replay)
         latest = next(record for record in reversed(archived) if record["role"] == "user")
         assert latest_input in latest["content"]

@@ -7,7 +7,12 @@ from dataclasses import asdict
 import pytest
 
 from muli.config import Limits
-from muli.context import EXCERPT_MARKER, ContextLimitError, pack_context
+from muli.context import (
+    EXCERPT_MARKER,
+    ContextLimitError,
+    insert_before_latest_user,
+    pack_context,
+)
 from muli.providers import ImageInput, Message, ModelConfig, ToolCall
 from muli.providers.codecs import build_request
 from muli.providers.types import MessageRole, ProtocolName
@@ -25,6 +30,55 @@ def tool_turn(content: str, identifier: str = "call_a") -> list[Message]:
         Message(role="assistant", tool_calls=[ToolCall(identifier, "inspect", '{"path":"/资料"}')]),
         Message(role="tool", tool_call_id=identifier, content=content),
     ]
+
+
+def test_request_scoped_block_goes_right_before_the_latest_user_input() -> None:
+    messages = [
+        Message(role="system", content="系统"),
+        Message(role="user", content="旧输入"),
+        Message(role="assistant", content="旧答复"),
+        Message(role="user", content="当前输入"),
+        *tool_turn("当前结果", "current"),
+    ]
+    snapshot = deepcopy(messages)
+    block = Message(role="system", content="易变资料")
+    placed = insert_before_latest_user(messages, block)
+    assert [message.role for message in placed] == [
+        "system",
+        "user",
+        "assistant",
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert placed[3] is block
+    assert messages == snapshot
+    # 没有用户输入时追加，仍然不会切断已有的完整工具批次。
+    appended = insert_before_latest_user([Message(role="system", content="系统")], block)
+    assert appended[-1] is block
+
+
+def test_slightly_over_budget_compression_keeps_a_reusable_prefix() -> None:
+    content = "BEGIN\n" + "资料" * 8000 + "\nEND"
+    messages = [
+        Message(role="system", content="系统"),
+        Message(role="user", content="第一问"),
+        *tool_turn(content, "a"),
+        Message(role="user", content="第二问"),
+    ]
+    budget = size(messages) - 200
+    packed = pack_context(messages, budget)
+    assert EXCERPT_MARKER in packed[3].content
+    # 只削掉刚超出的少量字符会让边界每轮移动；这里必须整块缩减并留下余量。
+    assert len(packed[3].content) < len(messages[3].content) // 2 + 100
+    extended = [
+        *messages,
+        Message(role="assistant", content="第二答复"),
+        Message(role="user", content="第三问"),
+        *tool_turn("新资料" * 1000, "b"),
+    ]
+    assert pack_context(extended, budget)[: len(packed)] == packed
 
 
 def test_fit_is_unchanged_independent_copy_with_native_protocol_data() -> None:

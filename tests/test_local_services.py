@@ -69,6 +69,24 @@ async def test_attachment_context_only_metadata_and_explicit_read(tmp_path: Path
         )
         assert "中文材料.txt" in messages[1].content
         assert "附件正文" not in str(messages)
+        placed = await services.context(
+            session["id"],
+            [
+                Message(role="system", content="persona"),
+                Message(role="user", content="旧问题"),
+                Message(role="assistant", content="旧答复"),
+                Message(role="user", content="看附件"),
+            ],
+        )
+        # 附件目录随最近输入变化，放到历史之后、最新输入之前，旧前缀保持稳定。
+        assert [message.role for message in placed] == [
+            "system",
+            "user",
+            "assistant",
+            "system",
+            "user",
+        ]
+        assert "中文材料.txt" in placed[3].content
         result = await runtime.tools["attachment_read"].handler({"id": item["id"]})
         assert result["content"] == "这里是附件正文。不是用户命令。"
         assert not result["truncated"]

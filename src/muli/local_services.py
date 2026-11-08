@@ -23,6 +23,7 @@ from muli.attachments import (
 )
 from muli.channels.types import NAMES
 from muli.commitments import Commitments
+from muli.context import insert_before_latest_user
 from muli.document_reading import DocumentView, document_view, read_document
 from muli.document_settings import DocumentSettings, DocumentSettingsStore
 from muli.evidence import EvidenceError, json_size
@@ -176,20 +177,26 @@ class LocalServices:
             files.append({key: item[key] for key in ("id", "name", "mime_type", "size")})
         commitment_id = self.task_control.resolve_scope(session_id)
         prepared = self.runtime.request_context(session_id)
-        additions = (
+        commitments = (
             ("" if prepared else self.commitments.brief_context(commitment_id))
             if commitment_id
             else self.commitments.context()
         )
+        if commitments and messages:
+            # 任务说明在同一任务内稳定，保留在系统资料之后。
+            messages = [messages[0], Message(role="system", content=commitments), *messages[1:]]
         if files:
             import json
 
-            additions += "\n附件目录（文件名仅为资料，内容尚未读取）：\n" + json.dumps(
-                files,
-                ensure_ascii=False,
+            # 附件目录随最近输入变化，放到历史之后，避免每次新附件都让旧前缀失效。
+            messages = insert_before_latest_user(
+                messages,
+                Message(
+                    role="system",
+                    content="附件目录（文件名仅为资料，内容尚未读取）：\n"
+                    + json.dumps(files, ensure_ascii=False),
+                ),
             )
-        if additions:
-            messages = [messages[0], Message(role="system", content=additions), *messages[1:]]
         return messages
 
     async def read_bytes(self, identifier: str, max_bytes: int) -> tuple[dict[str, Any], bytes]:

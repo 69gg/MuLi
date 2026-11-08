@@ -15,7 +15,7 @@ from muli.channel_references import ChannelReferences
 from muli.channels import ChannelError, ChannelManager, ChannelProfile, ChannelsConfig
 from muli.channels.types import NAMES, IncomingMessage
 from muli.config import ChannelProfile as ConfigChannelProfile
-from muli.context import context_size
+from muli.context import context_size, insert_before_latest_user
 from muli.evidence import EvidenceError
 from muli.mobile_approvals import is_approval_command
 from muli.mobile_task_control import MobileControlRejected, MobileControlSource
@@ -96,7 +96,8 @@ class ChannelApplication:
             return messages
         if not messages:
             return messages
-        candidate = [messages[0], Message("system", content), *messages[1:]]
+        # 本轮来源元数据随输入变化；放到历史之后，旧系统提示和历史才能继续命中缓存。
+        candidate = insert_before_latest_user(messages, Message("system", content))
         # Every real channel input already carries its source in history. This
         # optional current-request hint must not crowd out preserved tool results.
         if context_size(candidate) > self.runtime.config.settings.limits.max_context_chars:

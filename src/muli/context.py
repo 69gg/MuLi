@@ -31,6 +31,20 @@ def _text_data(message: Message) -> dict[str, object]:
     return data
 
 
+def insert_before_latest_user(messages: Sequence[Message], block: Message) -> list[Message]:
+    """把只属于本次请求的资料放到最新用户输入之前。
+
+    提示词缓存复用最长不变前缀；持久历史只在尾部增长，因此每次请求都会变化的
+    资料不能放在历史之前。放到尽可能靠后的合法位置，才能让系统提示、历史原文和
+    已压缩的旧轮次保持逐字不变。没有用户输入时追加到末尾。
+    """
+    index = next(
+        (index for index in range(len(messages) - 1, -1, -1) if messages[index].role == "user"),
+        len(messages),
+    )
+    return [*messages[:index], block, *messages[index:]]
+
+
 def _validate_pairs(messages: Sequence[Message]) -> None:
     pending: set[str] = set()
     for message in messages:
@@ -65,7 +79,12 @@ def _excerpt(content: str, keep: int) -> str:
 
 
 def _compress(message: Message, current_size: int, max_chars: int) -> int:
-    """压到可容纳的最长头尾摘录；不足时留最短摘录供后续候选继续压缩。"""
+    """压到可容纳的最长头尾摘录；不足时留最短摘录供后续候选继续压缩。
+
+    单次至少减半：只削掉刚超出的少量字符时，下一条消息一增长就要重算边界，
+    缓存前缀会从最早的历史开始失效。整块缩减会留出余量，让同一段逐字内容
+    连续多轮复用，直到新历史把余量用掉再压下一块。
+    """
     original = message.content
     if len(original) < 3:
         return current_size
@@ -87,7 +106,9 @@ def _compress(message: Message, current_size: int, max_chars: int) -> int:
             low = middle
         else:
             high = middle - 1
-    message.content = _excerpt(original, low)
+    # 精确贴边会让边界随每轮增长反复移动；整块减半保持前缀稳定。
+    keep = min(low, max(2, len(original) // 2))
+    message.content = _excerpt(original, keep)
     return fixed_size + len(json.dumps(message.content, ensure_ascii=False))
 
 
@@ -184,6 +205,7 @@ def pack_context(
 
     不补齐、不执行工具；调用方须先为中断且结果未知的调用补明确的未知结果。
     最新用户输入、系统提示、工具参数、思考和 provider_data 均不截断。
+    从最旧的候选开始整块缩减，使旧前缀在后续请求中保持逐字不变，便于提示词缓存。
     最新完整工具批次中的宿主 preserve_content 标记同样保留完整正文；
     新输入不消耗待读回执；新回答或工具批次后，旧标记才允许正常节选。
     """

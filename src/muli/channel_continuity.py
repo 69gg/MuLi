@@ -14,7 +14,7 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from muli.context import context_size
+from muli.context import context_size, insert_before_latest_user
 from muli.evidence import EvidenceError
 from muli.providers import Message
 from muli.store import SQLITE_MAX_INTEGER, now
@@ -288,7 +288,8 @@ class ChannelContinuity:
                 ensure_ascii=False,
                 allow_nan=False,
             )
-            candidate = [messages[0], Message("system", content), *messages[1:]]
+            # 新移交摘要会随渠道消息增加而变化；放到历史之后，避免旧前缀整体失效。
+            candidate = insert_before_latest_user(messages, Message("system", content))
             if len(content) <= budget and (
                 context_size(candidate) <= self.runtime.config.settings.limits.max_context_chars
             ):

@@ -27,6 +27,7 @@ from muli.candidate_preparation import create_attempt
 from muli.candidate_process_plan import CANDIDATE_PROCESS_PROTOCOL, persist_process, read_process
 from muli.candidate_update import CandidateUpdates, CapturedCandidate, PreviewRequest, UpdateRequest
 from muli.config import Settings
+from muli.context import insert_before_latest_user
 from muli.diagnostics import (
     DEFAULT_LOG_LINES,
     DEFAULT_LOG_SEGMENT,
@@ -167,8 +168,9 @@ class SelfManagement:
                     if self.updates.capability()["format_eligible"]
                     else "此资料库需要托管候选更新；先配置来源并核验，不能用批准代替格式证据。"
                 )
-            messages.insert(
-                1,
+            # 版本资料只在发现更新时出现，属于易变提示；放到历史之后。
+            messages = insert_before_latest_user(
+                messages,
                 Message(
                     role="system",
                     content=(
