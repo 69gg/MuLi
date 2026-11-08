@@ -271,13 +271,19 @@ class MemoryPipeline:
 
     def recover(self) -> None:
         """Requeue local interrupted work without starting model/media calls."""
+        # A restart interrupts an in-flight attempt; it is not a failed attempt,
+        # so the retry budget starts clean or the job could exhaust it on boot.
         with self.memory.store.db:
             self.memory.store.db.execute(
-                "UPDATE memory_jobs SET state='queued',updated_at=? WHERE state='processing'",
-                (now(),),
+                "UPDATE memory_jobs SET state='queued',attempts=0,next_attempt=?,"
+                "last_error='',updated_at=? WHERE state='processing'",
+                (now(), now()),
             )
         plan = self._current_index_plan()
         if plan is not None and plan["state"] in _INDEX_ACTIVE:
+            if plan["state"] == "processing":
+                plan.update(attempts=0, next_attempt=now(), last_error="")
+                self._index_save(plan)
             try:
                 self._index_admit(plan)
             except EvidenceError as error:
