@@ -162,8 +162,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .send-button:hover { background: var(--accent-dark); transform: translateY(-1px); }
 .send-button:disabled { background: var(--selected); color: var(--muted); opacity: 1; }
 .send-button svg { width: 17px; height: 17px; }
-.stop-button { background: var(--surface-2); color: var(--accent); }
-.stop-button svg { width: 12px; height: 12px; fill: currentColor; }
 .composer-footnote { display: flex; justify-content: space-between; gap: 15px; color: var(--muted); font-size: 9px; padding: 10px 2px 0; }
 .keyboard-hint { white-space: nowrap; }
 .keyboard-hint > span { padding: 0 6px; color: var(--muted); }
@@ -470,7 +468,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .composer { padding: 17px 16px 11px 19px; background: var(--surface); border-color: var(--line); border-radius: 16px; }
 .composer textarea { font-size: 14px; min-height: 42px; }
 .composer-actions { display: flex; align-items: center; gap: 9px; }
-.composer-actions .stop-button { width: 32px; height: 32px; background: var(--surface-2); }
 .composer-options { gap: 8px; }
 .composer-options select { font-size: 11px; }
 .composer-attachments { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 0 13px; }
@@ -603,7 +600,7 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
   .composer-footnote { font-size: 9px; padding-top: 9px; }
   .workspace-controls { bottom: 15px; left: 15px; gap: 9px; }
   .workspace-controls .icon-button { width: 34px; height: 34px; }
-  .send-button, .composer-actions .stop-button { width: 36px; height: 36px; }
+  .send-button { width: 36px; height: 36px; }
   .scroll-bottom { bottom: 220px; }
   .message-body { font-size: 13px; }
   .message.user .message-body { max-width: 95%; padding: 11px 14px; }

@@ -243,7 +243,7 @@ def _completed_publication(
             not isinstance(arguments, dict)
             or set(arguments) != {"path"}
             or not isinstance(arguments["path"], str)
-            or str(runtime.files.path(arguments["path"])) != source.path
+            or str(runtime.files.publishable(arguments["path"])) != source.path
         ):
             return None
     except (ValueError, TypeError, PermissionError):

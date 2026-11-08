@@ -398,7 +398,7 @@ class TaskDelivery:
                 not isinstance(arguments, dict)
                 or set(arguments) != {"path"}
                 or not isinstance(arguments["path"], str)
-                or str(self.runtime.files.path(arguments["path"])) != proof["source_path"]
+                or str(self.runtime.files.publishable(arguments["path"])) != proof["source_path"]
                 or not isinstance(result, dict)
                 or result.get("id") != attachment_id
                 or json.dumps(result, ensure_ascii=False) != message["content"]

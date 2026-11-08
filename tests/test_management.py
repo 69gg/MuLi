@@ -94,6 +94,51 @@ async def test_self_configuration_waits_for_idle_and_keeps_secrets_private(tmp_p
         await runtime.close()
 
 
+async def test_self_configuration_exposes_real_values_and_local_paths(tmp_path: Path) -> None:
+    runtime, plugins = setup_runtime(tmp_path)
+    runtime.config.update(
+        {
+            "models": {
+                "main": {
+                    "model": "fixture-model",
+                    "base_url": "https://unused.invalid/v1",
+                    "api_key": "visible-fixture-key",
+                    "extra_headers": {"X-Secret": "visible-header"},
+                }
+            },
+            "channels": {"telegram": {"token": "visible-channel-token"}},
+        }
+    )
+
+    async def apply(settings: Settings) -> None:
+        runtime.config.replace(settings)
+        await runtime.reconfigure()
+
+    manager = SelfManagement(
+        runtime, plugins, UserService(runtime.config.path, runtime.data_dir), apply
+    )
+    try:
+        configuration = await runtime.tools["self_config"].handler({})
+        encoded = json.dumps(configuration, ensure_ascii=False)
+        assert "visible-fixture-key" in encoded
+        assert "visible-header" in encoded
+        assert "visible-channel-token" in encoded
+        assert "••••" not in encoded
+        assert configuration["models"]["main"]["api_key"] == "visible-fixture-key"
+        assert configuration["paths"]["config_file"] == str(runtime.config.path.resolve())
+        assert configuration["paths"]["data_dir"] == str(runtime.data_dir.resolve())
+        assert configuration["paths"]["database"].endswith("muli.sqlite3")
+        assert Path(configuration["paths"]["source_reference"]).name == "source"
+        assert Path(configuration["paths"]["installed_package"]).name == "muli"
+        description = runtime.tools["self_config"].description
+        assert str(runtime.config.path.resolve()) in description
+        assert str(runtime.data_dir.resolve()) in description
+        assert str(configuration["paths"]["source_reference"]) in description
+    finally:
+        await manager.close()
+        await runtime.close()
+
+
 async def test_log_tool_survives_reconfigure_without_changing_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -603,8 +603,6 @@ function renderComposer() {
   $("#mode-select").disabled = running;
   $("#send-button").disabled = (!input.value.trim() && !state.attachments.length) || state.sending || state.uploading > 0 || !state.activeSession || !state.connected || state.attachments.some((file) => file.draftStatus);
   $("#send-button").setAttribute("aria-label", running ? "发送补充消息" : "发送消息");
-  $("#stop-button").hidden = !running;
-  $("#stop-button").disabled = state.sending || !state.activeSession;
   $("#composer-context").textContent = state.session.queued?.length ? `${state.session.queued.length} 条待处理` : "";
   $("#composer-context").hidden = !state.session.queued?.length;
   $("#composer-context").classList.toggle("has-queued", !!state.session.queued?.length);
@@ -1295,14 +1293,6 @@ async function approve(id, decision, button) {
     owner.approvalDecisions.delete(id);
     if (connectionCurrent(owner)) renderApprovalViews();
   }
-}
-
-async function stopRun(button) {
-  if (!state.activeSession) return;
-  button.disabled = true;
-  try { await request(`/sessions/${encodeURIComponent(state.activeSession.id)}/stop`, { method: "POST" }); toast("已发送停止请求"); }
-  catch (error) { showError(error); }
-  renderComposer();
 }
 
 function resizeComposer() {
@@ -5483,7 +5473,6 @@ async function handleAction(action, button) {
   if (action === "refresh") { await connect(); if (!["chat", "records"].includes(state.view)) await switchView(state.view); }
   if (action === "retry-view") await switchView(state.view);
   if (action === "scroll-bottom") scrollToBottom(true, true);
-  if (action === "stop") await stopRun(button);
   if (action === "approval") await approve(button.dataset.id, button.dataset.decision, button);
   if (action === "refresh-approvals") await refreshApprovals();
   if (action === "close-dialog") {

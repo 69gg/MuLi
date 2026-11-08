@@ -19,26 +19,46 @@ from muli.tools import Recovery, Tool, parameters, string
 
 class Files:
     def __init__(
-        self, settings: Settings, data_dir: Path, *, readonly_roots: list[Path] | None = None
+        self,
+        settings: Settings,
+        data_dir: Path,
+        *,
+        readonly_roots: list[Path] | None = None,
+        config_path: Path | None = None,
     ) -> None:
         self.settings = settings
         self.roots = [Path(root).expanduser().resolve() for root in settings.workspace_roots]
         self.trash = data_dir / "trash"
         self.readonly_roots = [root.resolve() for root in readonly_roots or []]
+        self.config_path = config_path.expanduser().resolve() if config_path is not None else None
         self._lock = asyncio.Lock()
 
     def path(self, value: str) -> Path:
         if not value:
             raise ValueError("路径不能为空")
         candidate = Path(value).expanduser().resolve()
-        if not any(candidate == root or root in candidate.parents for root in self.roots):
+        if self.config_path is not None and candidate == self.config_path:
+            return candidate
+        if not any(
+            candidate == root or root in candidate.parents
+            for root in [*self.roots, *self.readonly_roots]
+        ):
             raise PermissionError("路径不在配置的访问目录内")
         if candidate == self.trash.resolve() or self.trash.resolve() in candidate.parents:
             raise PermissionError("回收站请使用专用恢复工具")
         return candidate
 
+    def publishable(self, value: str) -> Path:
+        """附件发布只接受工作目录内的文件，不把配置、数据库或源码复制成下载件。"""
+        path = self.path(value)
+        if not any(path == root or root in path.parents for root in self.roots):
+            raise PermissionError("只能发布工作目录内的文件")
+        return path
+
     def editable(self, value: str) -> Path:
         path = self.path(value)
+        if self.config_path is not None and path == self.config_path:
+            return path
         if path in self.roots or path == Path(path.anchor):
             raise PermissionError("不能修改访问根目录本身")
         if any(

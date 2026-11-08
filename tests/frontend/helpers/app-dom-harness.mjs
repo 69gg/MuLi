@@ -121,7 +121,7 @@ export function harness(handler = async () => { throw new Error("unexpected requ
     assert.ok(Number.isSafeInteger(input.maxLength) && input.maxLength > 0);
     input.setAttribute("maxlength", String(input.maxLength));
     input.scrollHeight = 24;
-    for (const id of ["send-button", "stop-button", "composer-context", "composer-status", "composer-attachments", "voice-button", "voice-progress", "voice-status", "voice-stop", "voice-draft", "voice-draft-text", "chat-view"]) {
+    for (const id of ["send-button", "composer-context", "composer-status", "composer-attachments", "voice-button", "voice-progress", "voice-status", "voice-stop", "voice-draft", "voice-draft-text", "chat-view"]) {
       const control = node(voiceControls && ["voice-button", "voice-stop"].includes(id) ? "button" : "div", id);
       if (voiceControls && control.tagName === "BUTTON") {
         const markup = index.match(new RegExp(`<button\\b[^>]*\\bid="${id}"[^>]*>`))?.[0];

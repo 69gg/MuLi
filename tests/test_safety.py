@@ -70,6 +70,48 @@ def test_configuration_views_hide_secrets_and_support_response_limits(
     assert not config.settings.models.main.stream
 
 
+def test_files_read_source_and_data_and_write_exact_config_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    source = home / "source"
+    source.mkdir()
+    readme = source / "README.md"
+    readme.write_text("源码参考", encoding="utf-8")
+    data_dir = home / "data"
+    data_dir.mkdir()
+    note = data_dir / "note.txt"
+    note.write_text("数据", encoding="utf-8")
+    config_path = home / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    files = Files(
+        Settings(workspace_roots=[str(workspace)]),
+        data_dir,
+        readonly_roots=[source, data_dir],
+        config_path=config_path,
+    )
+    assert files._execute("read", {"path": str(readme)})["content"] == "源码参考"
+    assert files._execute("read", {"path": str(note)})["content"] == "数据"
+    with pytest.raises(PermissionError):
+        files._execute("write", {"path": str(readme), "content": "x", "overwrite": True})
+    assert files._execute("read", {"path": str(config_path)})["content"] == "{}"
+    files._execute("write", {"path": str(config_path), "content": '{"a":1}', "overwrite": True})
+    assert config_path.read_text(encoding="utf-8") == '{"a":1}'
+    outside = home / "other.txt"
+    outside.write_text("other", encoding="utf-8")
+    with pytest.raises(PermissionError):
+        files._execute("read", {"path": str(outside)})
+    for blocked in (readme, note, config_path):
+        with pytest.raises(PermissionError):
+            files.publishable(str(blocked))
+    inside = workspace / "result.txt"
+    inside.write_text("result", encoding="utf-8")
+    assert files.publishable(str(inside)) == inside.resolve()
+
+
 def test_mcp_redacted_roundtrip_preserves_values_and_supports_deletion(tmp_path: Path) -> None:
     config = ConfigFile(tmp_path / "config.json")
     config.update(

@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextvars import ContextVar
 from copy import deepcopy
@@ -2525,6 +2526,45 @@ class Runtime:
         )
         await self.bus.notify()
 
+    def self_paths(self) -> dict[str, Any]:
+        """Exact local locations MuLi owns or may read; never redacted."""
+        settings = self.config.settings
+        config_path = self.config.path.expanduser().resolve()
+        config_dir = config_path.parent
+        home = default_home().expanduser().resolve()
+        data_dir = self.data_dir.expanduser().resolve()
+        skills = (
+            Path(settings.skills.directory).expanduser().resolve()
+            if settings.skills.directory
+            else (home / "skills").resolve()
+        )
+        mcp = (
+            Path(settings.extensions.mcp_directory).expanduser().resolve()
+            if settings.extensions.mcp_directory
+            else (home / "mcp.d").resolve()
+        )
+        return {
+            "config_file": str(config_path),
+            "data_dir": str(data_dir),
+            "database": str(data_dir / "muli.sqlite3"),
+            "attachments": str(data_dir / "attachments"),
+            "trash": str(data_dir / "trash"),
+            "logs": str(data_dir / "logs"),
+            "management": str(data_dir / "management"),
+            "voice": str(data_dir / "voice"),
+            "user_dir": str(home),
+            "source_reference": str(config_dir / "source"),
+            "installed_package": str(Path(__file__).resolve().parent),
+            "plugins": str(config_dir / "plugins"),
+            "prompts": str(home / "prompts"),
+            "skills": str(skills),
+            "mcp": str(mcp),
+            "workspace_roots": [
+                str(Path(root).expanduser().resolve()) for root in settings.workspace_roots
+            ],
+            "cwd": os.getcwd(),
+        }
+
     def configure(self) -> None:
         settings = self.config.settings
         self.capacity = asyncio.Semaphore(settings.limits.max_parallel_agents)
@@ -2543,7 +2583,9 @@ class Runtime:
             readonly_roots=[
                 self.config.path.resolve().parent / "source",
                 Path(__file__).resolve().parent,
+                self.data_dir.resolve(),
             ],
+            config_path=self.config.path,
         )
         if not hasattr(self, "shells"):
             self.shells = ShellSessions(
@@ -3830,6 +3872,7 @@ class Runtime:
                     )
                 paused: TaskPaused | None = None
                 returned = False
+                deferred = False
                 for call in turn.tool_calls:
                     spent += 1
                     if paused is None and not returned:
@@ -3872,10 +3915,10 @@ class Runtime:
                             batch_seq=prepared.tool_batch_seq,
                         )
                         await self._tool_completed(call, result, session_id)
-                    elif self.store.pending_inputs(session_id):
+                    elif deferred:
                         result = {
                             "status": "not_executed",
-                            "reason": "收到新输入，尚未开始的调用留待重新规划",
+                            "reason": "收到新输入；本轮已开始的工具调用结束后再处理，该调用尚未开始，留待重新规划",
                         }
                         self._record_skipped_tool(
                             call,
@@ -4018,6 +4061,11 @@ class Runtime:
                         writes.append(("tool_attempt", attempt.dump()))
                     self.store.put_many(writes)
                     self._attempts.pop((run_id, prepared.tool_batch_seq, call.id), None)
+                    # A new input never interrupts a tool call that already
+                    # started. Claim it only after this call's result is
+                    # durable, at the next tool boundary.
+                    if self.store.pending_inputs(session_id):
+                        deferred = True
                     if self.team.shell_tool_completed(
                         session_id, run_id, prepared, assistant_message, call, result, tool_message
                     ):
@@ -4297,12 +4345,8 @@ class Runtime:
                 run_id,
                 reply_origin=prepared.reply_origin,
             )
-            if self.store.pending_inputs(session_id):
-                self._mark_not_executed(attempt, error_code="new_input")
-                return {
-                    "status": "not_executed",
-                    "reason": "审批或审查期间收到新输入；该操作尚未开始，留待重新规划",
-                }
+            # A pending new input does not revoke an approved call. The tool
+            # call stays atomic; the input is claimed after its durable result.
             # The started fact must be durable before the handler can act.
             attempt = self.tool_attempts.mark_started(attempt)
             self._attempts[(run_id, batch_seq, call.id)] = attempt
@@ -4327,22 +4371,15 @@ class Runtime:
                     and self._shell_mode_epochs.get(session_id) != shell_epoch
                 ):
                     raise PermissionError("shell 审批期间执行模式已改变，请重新规划")
-                if self.store.pending_inputs(session_id):
-                    self._mark_not_executed(attempt, error_code="new_input")
-                    result = {
-                        "status": "not_executed",
-                        "reason": "操作开始前收到新输入；该调用尚未执行，留待重新规划",
-                    }
-                else:
-                    handler_started = True
-                    result = await tool.handler(arguments)
-                    # Shell receipts identify the only durable evidence of an
-                    # external command. Persist that identity before any later
-                    # await can be interrupted.
-                    command = attempt_command_id(result)
-                    if command is not None and attempt is not None:
-                        attempt = self.tool_attempts.mark_started(attempt, command_id=command)
-                        self._attempts[(run_id, batch_seq, call.id)] = attempt
+                handler_started = True
+                result = await tool.handler(arguments)
+                # Shell receipts identify the only durable evidence of an
+                # external command. Persist that identity before any later
+                # await can be interrupted.
+                command = attempt_command_id(result)
+                if command is not None and attempt is not None:
+                    attempt = self.tool_attempts.mark_started(attempt, command_id=command)
+                    self._attempts[(run_id, batch_seq, call.id)] = attempt
             finally:
                 self._active_tool.reset(active_token)
                 self._request_context.reset(request_token)
@@ -4522,9 +4559,8 @@ class Runtime:
                     or self.shells is not shell_manager
                     or self._shell_generation != shell_generation
                     or self._shell_mode_epochs.get(session_id, 0) != mode_epoch
-                    or self.store.pending_inputs(session_id)
                 ):
-                    raise PermissionError("shell 执行身份、配置或新输入已改变，请重新规划")
+                    raise PermissionError("shell 执行身份、配置或执行模式已改变，请重新规划")
                 current = self.store.bounded_object(
                     "session",
                     session_id,

@@ -429,7 +429,7 @@ async def test_untrusted_input_and_failed_final_admission_leave_main_approval_li
 
 
 @pytest.mark.parametrize("window", ["approved-before-handler", "handler-running"])
-async def test_new_input_never_reverses_approval_or_cancels_an_entered_handler(
+async def test_new_input_never_reverses_approval_or_cancels_a_started_tool_call(
     tmp_path: Path, window: str
 ) -> None:
     entered, release = asyncio.Event(), asyncio.Event()
@@ -471,17 +471,17 @@ async def test_new_input_never_reverses_approval_or_cancels_an_entered_handler(
         assert incoming["run_id"] == started["run_id"]
         assert runtime.store.get("approval", approval["id"])["status"] == "approved"
         assert future.result() is True and not handler_cancelled
-        if window == "handler-running":
-            assert effects == ["once"] and not runtime.tasks[started["session_id"]].done()
+        # The approved call stays atomic even when the new input is already
+        # durable; its result is committed before the input is claimed.
+        async with asyncio.timeout(3):
+            await entered.wait()
+        assert effects == ["once"] and not runtime.tasks[started["session_id"]].done()
         release.set()
         async with asyncio.timeout(3):
             assert await runtime.wait(started["run_id"]) == "已处理新输入"
         assert not handler_cancelled
         result = next(message for message in seen[1] if message.tool_call_id == "original")
-        if window == "handler-running":
-            assert effects == ["once"] and json.loads(result.content) == "executed"
-        else:
-            assert effects == [] and json.loads(result.content)["status"] == "not_executed"
+        assert effects == ["once"] and json.loads(result.content) == "executed"
     finally:
         release.set()
         await runtime.close()

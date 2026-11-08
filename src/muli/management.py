@@ -987,7 +987,8 @@ class SelfManagement:
     def tools(self, runtime: Runtime) -> list[Tool]:
         async def configuration(args: dict[str, Any]) -> Any:
             return {
-                **runtime.config.public(),
+                **runtime.config.private(),
+                "paths": runtime.self_paths(),
                 "candidate_update_policy": self.update_policy.read().model_dump(mode="json"),
                 "candidate_online_policy": self.online_policy.read().model_dump(mode="json"),
                 "mcp_receive_policy": runtime.extensions.receive_policy_status(),
@@ -1087,10 +1088,22 @@ class SelfManagement:
         async def install(args: dict[str, Any]) -> Any:
             return self.plugins.install(str(args["id"]), args["files"])
 
+        paths = runtime.self_paths()
+        path_summary = "；".join(
+            f"{name}={','.join(value) if isinstance(value, list) else value}"
+            for name, value in paths.items()
+        )
+
         return [
             Tool(
                 "self_config",
-                "查看自身配置（密钥隐藏）及独立策略；MCP接收策略显示期望值与实际代次值",
+                "查看自身完整真实配置（含密钥原值）、本机路径及独立策略；MCP接收策略显示"
+                "期望值与实际代次值。本机真实路径："
+                + path_summary
+                + "。config_file、data_dir、source_reference、installed_package 始终可读；"
+                "plugins、prompts、skills、mcp 在 workspace_roots 内可读写。"
+                "config_file 可直接改但需重启；self_configure 的 changes "
+                "可直接设置 api_key、token、client_secret。HTTP设置接口仍使用脱敏视图",
                 parameters({}),
                 configuration,
             ),
@@ -1117,7 +1130,8 @@ class SelfManagement:
             ),
             Tool(
                 "self_configure",
-                "校验配置补丁并排队；轮到的纯扩展可运行中应用，其它变更等空闲；监听变更须恢复重启事务",
+                "校验配置补丁并排队；changes 可直接设置 api_key、token、client_secret 等真实值；"
+                "轮到的纯扩展可运行中应用，其它变更等空闲；监听变更须恢复重启事务",
                 parameters(
                     {
                         "changes": {"type": "object"},

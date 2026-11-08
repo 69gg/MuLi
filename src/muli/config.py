@@ -784,6 +784,14 @@ class ConfigFile:
                 )
         return data
 
+    def private(self) -> dict[str, Any]:
+        """Return the owner's full local configuration, including secret values.
+
+        This view is for MuLi's own tools only. HTTP and browser responses must
+        keep using ``public()`` so credentials are not exposed to remote clients.
+        """
+        return self.settings.model_dump()
+
     def validate_changes(self, changes: dict[str, Any]) -> Settings:
         changes = copy.deepcopy(changes)
         channels = changes.get("channels")

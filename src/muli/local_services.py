@@ -631,7 +631,7 @@ class LocalServices:
             return await self.save_speech(result)
 
         async def publish(args: dict[str, Any]) -> Any:
-            path: Path = runtime.files.path(str(args["path"]))
+            path: Path = runtime.files.publishable(str(args["path"]))
             if not path.is_file():
                 raise ValueError("只能发送普通文件")
             if path.stat().st_size > runtime.config.settings.uploads.max_file_bytes:
@@ -802,7 +802,7 @@ class LocalServices:
             ),
             Tool(
                 "file_publish",
-                "将允许访问目录内的本地文件保存为可下载附件，返回发送用ID和链接",
+                "将工作目录内的本地文件保存为可下载附件，返回发送用ID和链接；配置、数据库和源码只读参考不发布",
                 parameters({"path": string()}, ("path",)),
                 publish,
                 "write",
