@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/setup-uv
         with:
           python-version: '3.13'
       - run: uv sync --locked
@@ -128,7 +128,7 @@ jobs:
           ref: dff5772bec99e8127d1b926c147332bfd29fdc8c
           path: .local-check-artifacts/previous-consumer
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/setup-uv
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked --extra channels
@@ -210,7 +210,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/setup-uv
         with:
           python-version: '3.13'
       - run: uv sync --locked --extra mcp --extra channels
@@ -222,7 +222,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/setup-uv
         with:
           python-version: '3.13'
       - run: uv sync --locked
