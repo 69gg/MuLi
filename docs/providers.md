@@ -41,11 +41,11 @@ embedding、reranker、ASR 和 TTS 是独立服务，不继承主模型。
 
 Anthropic Messages 必须提供 `max_tokens`，因此已完整配置的 Anthropic 角色必须显式填写 `max_output_tokens`。留空继承主模型的角色不必重复填写。`MuLi init` 仅在选择 Anthropic 时询问这个必填值；OpenAI 的初始设置默认不配置它。
 
-所有已配置的模型还必须填写真实的 `context_window`（上下文长度，token）。`muli init` 会询问主模型的上下文长度，并据此设置 `limits.max_context_chars`；工作台模型表单对每个已填写模型 ID 或服务地址的角色都要求填写。留空继承主模型的角色沿用主模型的设置。`context_window` 必须能容纳当前字符预算，否则配置会被拒绝，避免请求超过模型窗口。
+所有已配置的模型还必须填写真实的 `context_window`（上下文长度，token）。`muli init` 会询问主模型的上下文长度，并据此设置 `limits.max_context_chars`；工作台模型表单对每个已填写模型 ID 或服务地址的角色都要求填写。留空继承主模型的角色沿用主模型的设置。除 `reviewer` 外，`context_window` 必须能容纳当前字符预算，否则配置会被拒绝，避免请求超过模型窗口。`reviewer` 只接收一次无工具的审查请求（工具名、参数、风险和工作区根），不接收对话历史，因此只需容纳 16000 字符的审查请求；如果单次工具参数超过它的窗口，auto 审查会失败并转人工审批。工作流中的 reviewer 节点仍是完整的只读会话，配置很短的审查模型时可能触发压缩或上下文不足。
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `context_window` | 128000（旧配置缺省） | 模型真实上下文长度（token）；新建配置必须填写，且须容纳 `limits.max_context_chars` |
+| `context_window` | 128000（旧配置缺省） | 模型真实上下文长度（token）；新建配置必须填写。除 `reviewer` 外须容纳 `limits.max_context_chars`；`reviewer` 须容纳 16000 字符的审查请求 |
 | `temperature` | 留空 | 不发送此参数；设置后须在 0–2 之间 |
 | `top_p` | 留空 | 不发送此参数；设置后须在 0–1 之间 |
 | `stream` | `true` | 使用流式响应；关闭后仍能显示完成结果 |

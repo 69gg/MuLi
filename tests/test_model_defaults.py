@@ -171,6 +171,43 @@ async def test_empty_llm_roles_inherit_complete_primary_but_not_http_services(
         await runtime.close()
 
 
+def test_reviewer_may_use_a_shorter_context_window_than_the_shared_budget() -> None:
+    def build(**roles: dict[str, Any]) -> Settings:
+        models: dict[str, Any] = {
+            "main": {
+                "model": "main",
+                "base_url": "https://model.test/v1",
+                "context_window": 128000,
+            },
+            "reviewer": {
+                "model": "reviewer",
+                "base_url": "https://review.test/v1",
+                "context_window": 32000,
+            },
+        }
+        models.update(roles)
+        return Settings.model_validate({"models": models, "limits": {"max_context_chars": 96000}})
+
+    assert build().models.reviewer.context_window == 32000
+    with pytest.raises(ValidationError, match="reviewer"):
+        build(
+            reviewer={
+                "model": "reviewer",
+                "base_url": "https://review.test/v1",
+                "context_window": 8000,
+            }
+        )
+    # Other roles still have to hold the full shared request budget.
+    with pytest.raises(ValidationError, match="worker"):
+        build(
+            worker={
+                "model": "worker",
+                "base_url": "https://worker.test/v1",
+                "context_window": 32000,
+            }
+        )
+
+
 async def test_inherited_reviewer_has_its_own_toolless_context(tmp_path: Path) -> None:
     config = ConfigFile(tmp_path / "config.json")
     config.update(

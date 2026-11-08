@@ -28,6 +28,10 @@ class Section(BaseModel):
 
 
 SECRET_PLACEHOLDER = "••••"
+# The auto reviewer receives the review prompt and one tool call, never the
+# conversation. A model only needs to hold this bounded request, not the full
+# limits.max_context_chars budget.
+REVIEW_CONTEXT_CHARS = 16_000
 
 
 def _mcp_url(value: str) -> SplitResult:
@@ -724,13 +728,19 @@ class Settings(Section):
 
     @model_validator(mode="after")
     def context_budget_fits_models(self) -> Settings:
-        """Every configured model must be able to hold the shared request budget."""
+        """Every configured model must hold the budget its role actually receives."""
         ceiling = self.limits.max_context_chars
         for name in ("main", "reviewer", "worker", "vision", "compactor", "memory_extractor"):
             profile = getattr(self.models, name)
-            if profile.configured and ceiling > int(profile.context_window * 0.75):
+            if not profile.configured:
+                continue
+            # The reviewer is a toolless single-call check; it does not receive
+            # the conversation, so a shorter context window is sufficient.
+            required = min(ceiling, REVIEW_CONTEXT_CHARS) if name == "reviewer" else ceiling
+            if required > int(profile.context_window * 0.75):
+                budget = "审查请求预算" if name == "reviewer" else "limits.max_context_chars"
                 raise ValueError(
-                    f"{name} 模型的 context_window 不足以容纳 limits.max_context_chars；"
+                    f"{name} 模型的 context_window 不足以容纳 {budget}；"
                     "请填写真实上下文长度或降低字符预算"
                 )
         return self
