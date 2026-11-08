@@ -344,6 +344,7 @@ async def test_web_delivery_query_and_reader_errors_remain_distinct(
 ) -> None:
     runtime, web = channel_web
     runtime.main_session()
+    runtime.config.update({"limits": {"max_output_chars": 1000}})
     identifier = delivery(runtime.store, account="saved-bot")
     params = {"channel": "onebot", "owner_id": "7"}
     for invalid in (
