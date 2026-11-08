@@ -81,9 +81,10 @@ class WorkflowSources:
     def _snapshot(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any], str]:
         run = self._read("workflow_run", self._identifier(run_id, "run_id"))
         nodes = run.get("nodes")
+        limit = self.limits.max_workflow_steps
         if (
             not isinstance(nodes, dict)
-            or not 1 <= len(nodes) <= self.limits.max_workflow_steps
+            or not 1 <= len(nodes) <= (limit if limit > 0 else len(nodes))
             or any(not isinstance(node, dict) for node in nodes.values())
         ):
             raise EvidenceError("content_unavailable", "工作流节点快照缺失或超过节点预算")
@@ -235,7 +236,8 @@ class WorkflowSources:
             )
         selected = self._ids(source["node_ids"], "node_ids")
         targets = self._ids(source["targets"], "targets")
-        if len(selected) > self.limits.max_workflow_steps:
+        limit = self.limits.max_workflow_steps
+        if limit > 0 and len(selected) > limit:
             raise EvidenceError("output_budget", "来源节点超过工作流节点预算")
         normalized = self.runtime.workflows._validate(steps)
         if set(targets) - {node["id"] for node in normalized}:

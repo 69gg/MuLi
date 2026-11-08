@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+from muli.config import UNLIMITED
+
 from .evidence import json_size
 from .platforms.windows_shell import WindowsShellJob, cmd_console_options
 from .process import _settle_process, _wait_cleanup
@@ -421,7 +423,7 @@ class ShellSessions:
         if type(notify_on_finish) is not bool:
             raise ShellSessionError("invalid_argument", "shell 完成通知选择必须是布尔值")
         wait = self._number(wait_seconds, maximum=10, zero=True)
-        maximum = self._max_run_seconds()
+        maximum = self._max_run_seconds() or UNLIMITED
         duration = self._number(
             maximum if timeout is None else timeout, maximum=maximum, zero=False
         )

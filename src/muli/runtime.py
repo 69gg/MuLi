@@ -1372,8 +1372,9 @@ class Runtime:
             "保留上一层仍未解决的承诺，明确已撤销或更正的要求；不能把计划写成已执行，"
             "不能创造授权，不能把工具失败/未知改为成功。仅输出摘要，不回答原始任务。"
         )
+        run_limit = self.config.settings.limits.max_run_seconds
         async with asyncio.timeout(
-            min(config.timeout, self.config.settings.limits.max_run_seconds)
+            config.timeout if run_limit <= 0 else min(config.timeout, run_limit)
         ):
             # Compactor owns a separate single-request quota and a bounded job queue.
             # An idle-session summary must not acquire the sole foreground model slot.
@@ -1953,8 +1954,8 @@ class Runtime:
             self.bus,
             self.run_step,
             max_parallel=self.config.settings.limits.max_parallel_agents or UNLIMITED,
-            max_steps=self.config.settings.limits.max_workflow_steps,
-            timeout=self.config.settings.limits.max_run_seconds,
+            max_steps=self.config.settings.limits.max_workflow_steps or UNLIMITED,
+            timeout=self.config.settings.limits.max_run_seconds or UNLIMITED,
             max_output_chars=self.config.settings.limits.max_output_chars,
             max_pending_runs=self.config.settings.limits.max_pending_runs,
             scope_admission=self._workflow_admission,
@@ -2938,7 +2939,9 @@ class Runtime:
             notify=not attention_origin and consult is None,
         )
         try:
-            async with asyncio.timeout(self.config.settings.limits.max_run_seconds):
+            async with asyncio.timeout(
+                self.config.settings.limits.max_run_seconds or UNLIMITED
+            ):
                 run["status"] = "running"
                 self.store.put("run", run)
                 await self.bus.emit("run.started", run, session_id)
@@ -5593,7 +5596,7 @@ class Runtime:
                 "type": "array",
                 "items": step,
                 "minItems": 1,
-                "maxItems": self.config.settings.limits.max_workflow_steps,
+                "maxItems": self.config.settings.limits.max_workflow_steps or UNLIMITED,
             },
         }
         if allow_source:
@@ -5601,7 +5604,7 @@ class Runtime:
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
                 "minItems": 1,
-                "maxItems": self.config.settings.limits.max_workflow_steps,
+                "maxItems": self.config.settings.limits.max_workflow_steps or UNLIMITED,
                 "uniqueItems": True,
             }
             properties["source"] = parameters(

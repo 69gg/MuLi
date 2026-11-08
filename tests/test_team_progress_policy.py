@@ -449,7 +449,8 @@ async def test_finish_diagnostic_distinguishes_completed_probe_from_driver_final
         await original_release(session_id, run_id)
         released.set()
         await asyncio.wait_for(
-            finish_release.wait(), timeout=runtime.config.settings.limits.max_run_seconds
+            finish_release.wait(),
+            timeout=runtime.config.settings.limits.max_run_seconds or 10,
         )
 
     async def probe(caller: str, table: dict[str, Tool]) -> None:

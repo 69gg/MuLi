@@ -165,10 +165,12 @@ class TeamConsult:
             raise ValueError("咨询问题不能为空")
         if len(question) > limits.max_context_chars:
             raise ValueError("咨询问题超过当前上下文预算")
+        run_limit = limits.max_run_seconds
         if (
             isinstance(wait_seconds, bool)
             or not math.isfinite(wait_seconds)
-            or not 0 < wait_seconds <= limits.max_run_seconds
+            or not 0 < wait_seconds
+            or (run_limit > 0 and wait_seconds > run_limit)
         ):
             raise ValueError("咨询等待时间超出运行预算")
         if run_id in self._requests:

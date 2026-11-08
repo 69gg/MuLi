@@ -54,7 +54,8 @@ class ScheduledWorkflows:
     def _budget(self) -> int:
         limits = self.runtime.config.settings.limits
         return (
-            limits.max_context_chars * 2 + limits.max_output_chars * limits.max_workflow_steps
+            limits.max_context_chars * 2
+            + limits.max_output_chars * max(1, limits.max_workflow_steps)
         ) * 4
 
     def _read(self, kind: str, identifier: str) -> JsonObject:

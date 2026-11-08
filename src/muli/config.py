@@ -378,11 +378,11 @@ class Limits(Section):
     max_pending_runs: int = Field(default=8, ge=1)
     # 0 means unlimited: the model keeps its tools until it stops calling them.
     max_tool_steps: int = Field(default=0, ge=0)
-    max_run_seconds: int = Field(default=600, ge=10, le=7200)
+    max_run_seconds: int = Field(default=0, ge=0)
     max_file_bytes: int = Field(default=2_000_000, ge=1024, le=20_000_000)
     max_output_chars: int = Field(default=24000, ge=1000, le=100000)
     max_context_chars: int = Field(default=96000, ge=4000, le=1000000)
-    max_workflow_steps: int = Field(default=12, ge=1)
+    max_workflow_steps: int = Field(default=0, ge=0)
     approval_timeout: int = Field(default=600, ge=10, le=86400)
     max_search_entries: int = Field(default=2000, ge=1, le=20000)
     max_search_results: int = Field(default=100, ge=1, le=1000)
