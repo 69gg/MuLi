@@ -21,7 +21,13 @@ mcp = ["fastmcp>=2.13,<3"]
 channels = ["cryptography>=43,<48"]
 
 [dependency-groups]
-dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<2", "ruff>=0.14,<1", "mypy>=1.18,<2"]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<2",
+    "ruff>=0.14,<1",
+    "mypy>=1.18,<2",
+    "pytest-xdist>=3,<4",
+]
 
 [build-system]
 requires = ["hatchling==1.32.4"]
