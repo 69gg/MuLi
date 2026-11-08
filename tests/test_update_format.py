@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,49 @@ async def test_management_api_keeps_update_diagnostics_readable_after_marker_dam
             }
     finally:
         await app.state.close()
+
+
+async def test_periodic_update_check_uses_the_configured_interval(tmp_path: Path) -> None:
+    runtime = runtime_at(tmp_path)
+    runtime.config.update({"updates": {"check_on_start": False, "interval_hours": 1 / 3600}})
+    manager = manager_for(runtime)
+    calls: list[bool] = []
+
+    async def fake_check(*, independent: bool = False) -> dict[str, Any]:
+        calls.append(independent)
+        return {"available": False}
+
+    manager.updates.check = fake_check  # type: ignore[method-assign]
+    try:
+        await manager.start()
+        for _ in range(40):
+            if calls:
+                break
+            await asyncio.sleep(0.05)
+        assert calls == [True]
+    finally:
+        await manager.close()
+        await runtime.close()
+
+
+async def test_zero_update_interval_disables_periodic_checks(tmp_path: Path) -> None:
+    runtime = runtime_at(tmp_path)
+    runtime.config.update({"updates": {"check_on_start": False, "interval_hours": 0}})
+    manager = manager_for(runtime)
+    calls: list[bool] = []
+
+    async def fake_check(*, independent: bool = False) -> dict[str, Any]:
+        calls.append(independent)
+        return {"available": False}
+
+    manager.updates.check = fake_check  # type: ignore[method-assign]
+    try:
+        await manager.start()
+        await asyncio.sleep(0.2)
+        assert calls == []
+    finally:
+        await manager.close()
+        await runtime.close()
 
 
 async def test_version_notice_and_context_preserve_actual_installation_capability(

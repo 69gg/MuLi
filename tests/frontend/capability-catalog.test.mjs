@@ -37,7 +37,7 @@ function detail(tool = alpha, revision = "opaque-observation") {
 function defaultSettings() {
   return { disabled_tools: [], default_mode: "auto", workspace_roots: [],
     search: { provider: "searxng", base_url: "", api_key_env: "", max_results: 5, api_key: "" }, computer: { enabled: false, backend: "auto", python_path: "" },
-    chiliarch: { enabled: false, base_url: "", agent_id: "" }, mcp: { mcpServers: {} }, plugins: { enabled: false, disabled: [] }, updates: { check_on_start: false } };
+    chiliarch: { enabled: false, base_url: "", agent_id: "" }, mcp: { mcpServers: {} }, plugins: { enabled: false, disabled: [] }, updates: { check_on_start: false, interval_hours: 2 } };
 }
 
 async function catalogHarness(respond, { composer = false } = {}) {

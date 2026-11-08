@@ -18,6 +18,7 @@ def test_interactive_settings_preserve_optional_wire_parameters() -> None:
             "openai_responses",
             "example-model",
             "https://model.invalid/v1",
+            "128000",
             "y",
             "high",
             "{}",
@@ -31,6 +32,8 @@ def test_interactive_settings_preserve_optional_wire_parameters() -> None:
     result = prompt_settings(lambda _: next(answers), lambda _: next(secrets))
     profile = result["models"]["main"]
     assert profile["max_output_tokens"] is None
+    assert profile["context_window"] == 128000
+    assert result["limits"]["max_context_chars"] == 96000
     assert profile["thinking"] == {}
     assert profile["vision"] is True and profile["reasoning_effort"] == "high"
     assert profile["extra_body"] == {"vendor_budget": 4096}
@@ -45,6 +48,7 @@ def test_initialize_anthropic_requires_and_saves_explicit_output_limit(tmp_path:
             "anthropic",
             "claude",
             "https://model.invalid/v1",
+            "128000",
             "2048",
             "n",
             "",
@@ -77,10 +81,23 @@ def test_initialize_anthropic_requires_and_saves_explicit_output_limit(tmp_path:
 def test_initialize_anthropic_rejects_invalid_output_limit_without_files(
     tmp_path: Path, value: str
 ) -> None:
-    answers = iter(["用户", "anthropic", "claude", "https://model.invalid/v1", value])
+    answers = iter(["用户", "anthropic", "claude", "https://model.invalid/v1", "128000", value])
     path = tmp_path / "config.json"
     data = tmp_path / "data"
     with pytest.raises(ValueError, match="max_output_tokens"):
+        initialize(path, data, read=lambda _: next(answers), secret=lambda _: "")
+    assert not path.exists()
+    assert not data.exists()
+
+
+@pytest.mark.parametrize("value", ["0", "8191", "1e3", "１２８０００", "10000001"])
+def test_initialize_rejects_invalid_context_window_without_files(
+    tmp_path: Path, value: str
+) -> None:
+    answers = iter(["用户", "openai_chat", "test", "https://model.invalid/v1", value])
+    path = tmp_path / "config.json"
+    data = tmp_path / "data"
+    with pytest.raises(ValueError, match="context_window"):
         initialize(path, data, read=lambda _: next(answers), secret=lambda _: "")
     assert not path.exists()
     assert not data.exists()
@@ -105,6 +122,7 @@ def test_initialize_hashes_password_before_save(tmp_path: Path) -> None:
             "openai_chat",
             "test-model",
             "https://test.invalid/v1",
+            "128000",
             "n",
             "",
             "{}",
@@ -127,7 +145,9 @@ def test_initialize_hashes_password_before_save(tmp_path: Path) -> None:
 
 
 def test_invalid_parameters_create_no_partial_configuration(tmp_path: Path) -> None:
-    answers = iter(["用户", "openai_chat", "test", "https://test.invalid/v1", "n", "", "[]"])
+    answers = iter(
+        ["用户", "openai_chat", "test", "https://test.invalid/v1", "128000", "n", "", "[]"]
+    )
     with pytest.raises(ValueError, match="JSON 对象"):
         initialize(
             tmp_path / "config.json",

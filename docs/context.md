@@ -33,6 +33,7 @@
 | `compaction.enabled` | 是否启用后台压缩，默认开启 |
 | `compaction.mode` | `auto` 使用摘要模型；`extractive` 使用本地摘录 |
 | `models.compactor` | 单独配置摘要模型，留空则继承主模型 |
+| `models.*.context_window` | 该模型真实的上下文长度（token），已配置的模型必填；`muli init` 会据此设置字符预算 |
 | `compaction.trigger_ratio` | 达到多少上下文占用时开始整理，默认 0.75 |
 | `compaction.target_ratio` | 整理后的目标比例，默认 0.4，须小于触发比例 |
 | `compaction.max_summary_tokens` | 摘要输出上限，默认 1600 |

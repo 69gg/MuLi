@@ -438,8 +438,10 @@ test("model token requirements follow the selected protocol without losing edits
   h.ui.state.modelRole = "main";
   const main = h.ui.renderModelSettings(); h.other.append(main);
   const token = main.querySelectorAll("input").find((input) => input.name === "models.main.max_output_tokens");
+  const mainContext = main.querySelectorAll("input").find((input) => input.name === "models.main.context_window");
   const protocol = main.querySelector("select");
   assert.equal(token.value, ""); assert.equal(token.required, false);
+  assert.equal(mainContext.required, true);
   assert.equal(token.closest("details") === null, true);
   token.value = "2048"; protocol.value = "anthropic"; await protocol.dispatch("change");
   assert.equal(token.required, true); assert.equal(token.value, "2048");
@@ -448,12 +450,13 @@ test("model token requirements follow the selected protocol without losing edits
   h.ui.state.modelRole = "worker";
   const worker = h.ui.renderModelSettings(); h.other.replaceChildren(worker);
   const workerToken = worker.querySelectorAll("input").find((input) => input.name === "models.worker.max_output_tokens");
+  const workerContext = worker.querySelectorAll("input").find((input) => input.name === "models.worker.context_window");
   const model = worker.querySelectorAll("input").find((input) => input.name === "models.worker.model");
-  assert.equal(workerToken.required, false);
+  assert.equal(workerToken.required, false); assert.equal(workerContext.required, false);
   model.value = "configured-model"; await model.dispatch("input");
-  assert.equal(workerToken.required, true);
+  assert.equal(workerToken.required, true); assert.equal(workerContext.required, true);
   model.value = ""; await model.dispatch("input");
-  assert.equal(workerToken.required, false);
+  assert.equal(workerToken.required, false); assert.equal(workerContext.required, false);
 });
 
 test("the main record returns to the only live conversation without opening or creating another session", async () => {

@@ -77,10 +77,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .status-dot.warning { background: #b39b6e; }
 .main-workspace { min-width: 0; flex: 1; display: flex; flex-direction: column; background: var(--canvas); }
 .topbar { height: 76px; min-height: 76px; padding: 0 30px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
-.topbar-actions { display: flex; align-items: center; gap: 15px; }
-.model-indicator { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; padding: 7px 0; }
-.model-indicator span:nth-child(2) { max-width: 200px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.model-indicator svg { width: 12px; height: 12px; color: var(--muted); }
 .icon-button { width: 30px; height: 30px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex-shrink: 0; transition: background .15s, color .15s; }
 .icon-button:hover, .icon-button[aria-pressed="true"] { color: var(--accent); background: var(--selected); }
 .workspace-body { display: flex; flex: 1; min-height: 0; min-width: 0; }
@@ -479,7 +475,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .composer-options select { font-size: 11px; }
 .composer-attachments { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 0 13px; }
 .composer-draft-state { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
-.composer-draft-state > span { flex: 1; }
 .draft-attachment small { color: var(--muted); white-space: nowrap; }
 .voice-progress { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-bottom: 12px; font-size: 12px; color: var(--muted); }
 .voice-progress > span { flex: 1; min-width: 150px; }
@@ -593,11 +588,6 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
   .workspace-brand img { width: 32px; height: 32px; }
   .workspace-brand > span { font-size: 19px; }
   .workspace-brand small { display: none; }
-  .topbar-actions { gap: 10px; }
-  .model-indicator { font-size: 10px; }
-  .model-indicator span:nth-child(2) { max-width: 150px; }
-  .model-indicator [data-icon] { display: none; }
-  .topbar-actions .icon-button { width: 34px; height: 34px; }
   .conversation-scroll { padding: 10px 20px 20px; }
   .welcome { min-height: 320px; padding-bottom: 25px; }
   .welcome-illustration { width: min(310px, 90vw); max-height: 215px; }

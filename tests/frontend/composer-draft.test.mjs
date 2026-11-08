@@ -88,7 +88,8 @@ test("snapshot consumption failure stops the real submit before any POST and pre
   await h.document.querySelector("#composer").dispatch("submit"); await flush();
   assert.equal(posts(h).length, 0); assert.equal(inputOf(h).value, "原页面工作草稿");
   assert.deepEqual(Array.from(h.ui.state.attachments, (file) => file.id), [older.id, recent.id]);
-  assert.equal(storage.getItem(COMPOSER_DRAFT_KEY), raw); assert.match(h.document.querySelector("#composer-draft-status").textContent, /尚未发送/);
+  assert.equal(storage.getItem(COMPOSER_DRAFT_KEY), raw);
+  assert.equal(h.document.querySelector("#composer-draft-status"), null);
 });
 
 test("a lost accepted-send receipt can refill untouched memory but never reappears after refresh or render", async (t) => {
@@ -245,14 +246,16 @@ for (const outcome of ["success", "401"]) {
   });
 }
 
-test("discard removes only this snapshot and selected references without deleting files or stopping a run", async (t) => {
+test("composer no longer renders a draft status or discard row", async (t) => {
   const storage = savedPage(), backend = serverFixture(), h = await appInstance(t, backend, storage);
   storage.setItem("muli.task-control:keep", "unrelated");
   h.ui.state.session.status = "running"; h.ui.state.session.runId = "existing-run";
-  await clickMemoryButton(h, h.document.querySelector("#composer-draft-discard"));
-  assert.equal(inputOf(h).value, ""); assert.equal(h.ui.state.attachments.length, 0); assert.equal(storage.getItem(COMPOSER_DRAFT_KEY), null);
+  assert.equal(h.document.querySelector("#composer-draft-discard"), null);
+  assert.equal(h.document.querySelector("#composer-draft-status"), null);
+  assert.equal(h.document.querySelector("#composer-draft-state").hidden, true);
+  assert.equal(inputOf(h).value, "原页面工作草稿");
   assert.equal(storage.getItem("muli.task-control:keep"), "unrelated"); assert.equal(h.ui.state.session.runId, "existing-run"); assert.equal(h.ui.state.session.status, "running");
-  assert.equal(h.ui.state.uploads.some((file) => file.id === older.id), true); assert.equal(posts(h).length, 0);
+  assert.equal(posts(h).length, 0);
 });
 
 for (const change of ["store", "main"]) {
@@ -300,15 +303,12 @@ test("explicit logout clears the draft before the request and its failure cannot
   assert.equal(JSON.parse(storage.getItem(COMPOSER_DRAFT_KEY)).text, inputOf(h).value);
 });
 
-test("discard during attachment verification revokes the real read and its late 401", async (t) => {
-  const remote = deferred(), storage = savedPage(), backend = serverFixture(); let options;
-  backend.controls.metadata = (_ids, value) => { options = value; return remote.promise; };
-  const h = await appInstance(t, backend, storage, { wait: false });
-  await clickMemoryButton(h, h.document.querySelector("#composer-draft-discard"));
-  assert.equal(options.signal.aborted, true); inputOf(h).value = "丢弃后写的新草稿"; await inputOf(h).dispatch("input");
-  remote.reject(new ApiError("旧核查迟到401", 401)); await h.connecting;
-  assert.equal(inputOf(h).value, "丢弃后写的新草稿"); assert.equal(h.ui.state.attachments.length, 0); assert.equal(h.ui.state.auth.authenticated, true);
-  assert.equal(JSON.parse(storage.getItem(COMPOSER_DRAFT_KEY)).text, inputOf(h).value); assert.equal(posts(h).length, 0);
+test("a restored draft stays editable without a discard action", async (t) => {
+  const storage = savedPage(), backend = serverFixture(), h = await appInstance(t, backend, storage);
+  assert.equal(h.document.querySelector("#composer-draft-discard"), null);
+  assert.equal(h.document.querySelector("#composer-draft-status"), null);
+  assert.equal(inputOf(h).value, "原页面工作草稿");
+  assert.equal(posts(h).length, 0);
 });
 
 test("ordinary text merged from completed ASR is saved while a pending voice draft is not", async (t) => {
@@ -327,7 +327,7 @@ test("ordinary text merged from completed ASR is saved while a pending voice dra
 test("denied browser writes preserve in-memory editing and do not block an ordinary submission with no old snapshot", async (t) => {
   const storage = pageStorage(), backend = serverFixture(); storage.setItem = () => { throw new Error("quota"); }; backend.controls.submit = () => ({ run_id: "memory-only-run" });
   const h = await appInstance(t, backend, storage); inputOf(h).value = "无法暂存时仍可编辑的原文字"; await inputOf(h).dispatch("input");
-  assert.match(h.document.querySelector("#composer-draft-status").textContent, /未能保存/); assert.equal(inputOf(h).value, "无法暂存时仍可编辑的原文字");
+  assert.equal(h.document.querySelector("#composer-draft-status"), null); assert.equal(inputOf(h).value, "无法暂存时仍可编辑的原文字");
   await h.document.querySelector("#composer").dispatch("submit"); await flush();
   assert.equal(posts(h).length, 1); assert.equal(posts(h)[0].body.content, "无法暂存时仍可编辑的原文字");
 });
@@ -336,7 +336,7 @@ test("preview draft editing never touches the real browser storage and a fresh a
   const backend = serverFixture(); backend.controls.status.preview = true;
   const accesses = [], storage = Object.fromEntries(["getItem", "setItem", "removeItem"].map((method) => [method, () => { accesses.push(method); throw new Error("preview cannot use real session storage"); }]));
   const first = await appInstance(t, backend, storage); inputOf(first).value = "仅存在预览页面内存的草稿"; await inputOf(first).dispatch("input");
-  assert.match(first.document.querySelector("#composer-draft-status").textContent, /已暂存/); first.windowEvents.pagehide();
+  assert.equal(first.document.querySelector("#composer-draft-status"), null); first.windowEvents.pagehide();
   const second = await appInstance(t, backend, storage); assert.equal(inputOf(second).value, ""); assert.equal(posts(second).length, 0); assert.deepEqual(accesses, []);
 });
 

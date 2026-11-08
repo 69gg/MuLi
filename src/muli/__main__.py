@@ -124,7 +124,18 @@ def main() -> None:
         "upgrade-channel-ownership", help="停机升级支持的旧格式（Linux；macOS 仅精确 memory2）"
     )
     args = parser.parse_args()
-    if args.command not in {None, "serve", "upgrade-channel-ownership"}:
+    auto_init = False
+    if args.command is None and not args.config.exists():
+        print("未检测到配置或数据目录，先运行 muli init。")
+        args.command = "init"
+        args.defaults = False
+        args.no_source = False
+        args.no_service = False
+        auto_init = True
+    elif args.command is None and not args.data_dir.exists():
+        print(f"未检测到数据目录 {args.data_dir}，将创建后启动。")
+        args.data_dir.mkdir(parents=True, exist_ok=True)
+    if args.command not in {None, "serve", "upgrade-channel-ownership"} and not auto_init:
         from muli.managed_cli import route_command
 
         arguments = [args.command]

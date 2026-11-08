@@ -28,6 +28,10 @@ async def test_model_follows_complete_directory_pages_to_a_task_beyond_the_old_5
         runtime.config.update(
             {
                 "persona": {"prompt": "test"},
+                "models": {
+                    "main": {"context_window": 320000},
+                    "reviewer": {"context_window": 320000},
+                },
                 "limits": {"max_context_chars": 240000},
                 "compaction": {"enabled": False},
             }

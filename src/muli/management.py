@@ -94,6 +94,7 @@ class SelfManagement:
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._check: asyncio.Task[dict[str, Any]] | None = None
+        self._update_loop: asyncio.Task[None] | None = None
         self._applying: asyncio.Task[Any] | None = None
         self._candidate_cleanup: asyncio.Task[None] | None = None
         runtime.maintenance.owner("management", lambda: self.idle)
@@ -479,6 +480,37 @@ class SelfManagement:
         self._wake.set()
         if self.runtime.config.settings.updates.check_on_start:
             self._check = asyncio.create_task(self.updates.check(independent=True))
+        self._update_loop = asyncio.create_task(self._periodic_updates(), name="muli-update-check")
+
+    async def _periodic_updates(self) -> None:
+        """Check at a configurable interval without blocking startup or turns.
+
+        The loop re-reads the interval at most once a minute so a settings change
+        applies without rebuilding Management. A disabled interval (0) keeps the
+        task alive but performs no requests until it is enabled again.
+        """
+        elapsed = 0.0
+        while not self._closing:
+            interval = float(self.runtime.config.settings.updates.interval_hours)
+            if interval <= 0:
+                elapsed = 0.0
+                await asyncio.sleep(60)
+                continue
+            target = interval * 3600
+            if elapsed < target:
+                step = min(target - elapsed, 60.0)
+                await asyncio.sleep(step)
+                elapsed += step
+                continue
+            elapsed = 0.0
+            try:
+                await self.updates.check(independent=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Updates.check already records bounded failures; a transient
+                # error must not terminate the only periodic check.
+                pass
 
     async def _idle(self) -> None:
         while self.runtime.busy:
@@ -852,13 +884,14 @@ class SelfManagement:
         self._closing = True
         tasks = [
             task
-            for task in (self._worker, self._check, self._candidate_cleanup)
+            for task in (self._worker, self._check, self._update_loop, self._candidate_cleanup)
             if task is not None
         ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._worker = self._check = None
+        self._update_loop = None
         self._candidate_cleanup = None
 
     async def recover(self) -> dict[str, Any]:

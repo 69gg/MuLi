@@ -129,7 +129,6 @@ let composerDraftBinding = null;
 let composerPendingEdit = null;
 let composerAttachmentCheck = null;
 let composerSubmission = null;
-let composerDraftNote = "";
 let composerPromptUndo = null;
 let composerStorageWarning = false;
 const composerUploads = new Set();
@@ -194,8 +193,10 @@ function composerChanged() {
 
 function saveComposerSnapshot(identity) {
   const saved = composerDraft.save(identity, $("#message-input").value, state.attachments);
-  if (!saved) composerStorageWarning = true;
-  composerDraftNote = saved ? "已暂存本页草稿，尚未发送。" : "浏览器草稿未能保存，请保留当前页面。";
+  if (!saved && !composerStorageWarning) {
+    composerStorageWarning = true;
+    toast("浏览器草稿未能保存，请保留当前页面。", true);
+  }
 }
 
 function promptComposition(prompt, { mode = "append", expected = null, maxChars = null, confirmed = true, dedupe = true } = {}) {
@@ -253,26 +254,13 @@ function composerContextCurrent(owner, identity, session, version) {
 
 function renderComposerDraft() {
   const blocked = state.attachments.some((file) => file.draftStatus);
-  const text = blocked ? "附件尚未全部核查，请核查或移除后再发送。" : composerDraftNote || (composerStorageWarning ? "浏览器草稿未能保存，请保留当前页面。" : "");
-  $("#composer-draft-state").hidden = !text && !$("#message-input").value && !state.attachments.length;
-  $("#composer-draft-status").textContent = text;
+  const undo = composerPromptUndo
+    && composerPromptUndo.session === state.activeSession?.id
+    && $("#message-input").value === composerPromptUndo.applied;
+  $("#composer-draft-state").hidden = !blocked && !undo;
   $("#composer-draft-recheck").hidden = !blocked;
   $("#composer-draft-recheck").disabled = !!composerAttachmentCheck;
-  $("#composer-draft-discard").disabled = !$("#message-input").value && !state.attachments.length;
-  $("#composer-prompt-undo").hidden = !composerPromptUndo
-    || composerPromptUndo.session !== state.activeSession?.id
-    || $("#message-input").value !== composerPromptUndo.applied;
-}
-
-function discardComposerDraft() {
-  stopComposerOperations(); voiceInput.cancel();
-  const cleared = composerDraft.clear();
-  $("#message-input").value = ""; state.attachments = []; draftRevision += 1;
-  composerPromptUndo = null;
-  composerDraftNote = cleared ? "" : "浏览器草稿未能清除，请清除本页站点存储后再退出。";
-  composerStorageWarning ||= !cleared;
-  if (!cleared) toast(composerDraftNote, true);
-  renderComposerAttachments(); resizeComposer();
+  $("#composer-prompt-undo").hidden = !undo;
 }
 
 async function restoreComposerDraft(owner, revision) {
@@ -284,15 +272,18 @@ async function restoreComposerDraft(owner, revision) {
     stopComposerOperations(); voiceInput.cancel();
     $("#message-input").value = ""; state.attachments = []; state.voiceDraft = null; $("#voice-draft-text").value = ""; draftRevision += 1;
     composerPromptUndo = null;
-    composerDraft.clear(); composerDraftNote = "";
+    composerDraft.clear();
   }
   composerDraftBinding = identity;
   const saved = composerDraft.read(identity);
-  if (saved.unavailable) { composerStorageWarning = true; composerDraftNote = "浏览器草稿无法读取，请保留当前页面。"; }
+  if (saved.unavailable && !composerStorageWarning) {
+    composerStorageWarning = true;
+    toast("浏览器草稿无法读取，请保留当前页面。", true);
+  }
   if (!changed && draftRevision === revision && !$("#message-input").value && !state.attachments.length && saved.record) {
     $("#message-input").value = saved.record.text;
     state.attachments = saved.record.attachments.map((file) => ({ ...file, draftStatus: "checking" }));
-    draftRevision += 1; composerDraftNote = "已恢复本页草稿，尚未发送。";
+    draftRevision += 1;
   }
   if (!changed && pendingEdit?.owner === owner && pendingEdit.revision === draftRevision && (!pendingEdit.identity || sameComposerIdentity(pendingEdit.identity, identity)) && !saved.invalid && !saved.unavailable) saveComposerSnapshot(identity);
   renderComposerAttachments(); resizeComposer();
@@ -579,8 +570,6 @@ function renderChrome() {
     node.classList.toggle("active", selected);
     node.setAttribute("aria-current", selected ? "page" : "false");
   });
-  $("#model-label").textContent = state.status?.model || (state.loading ? "读取模型…" : state.connected ? "配置模型" : "未连接");
-  $("#model-dot").className = `status-dot${state.connected && state.status?.configured ? " online" : state.connected ? " warning" : ""}`;
   $("#settings-attention").hidden = !state.connected || !!state.status?.configured;
   $("#connection-label").textContent = state.loading ? "连接工作台…" : state.connected ? state.streamConnected ? "工作台已连接" : "实时连接重连中" : "工作台未连接";
   $("#connection-dot").className = `status-dot${state.connected ? state.streamConnected ? " online" : " warning" : ""}`;
@@ -1238,9 +1227,9 @@ async function sendMessage(event) {
   const input = $("#message-input");
   const originalText = input.value, content = originalText.trim();
   if ((!content && !state.attachments.length) || state.sending || state.uploading || !state.connected || !state.activeSession) return;
-  if (state.attachments.some((file) => file.draftStatus)) { composerDraftNote = "请先核查或移除未确认的附件。"; renderComposerDraft(); return; }
+  if (state.attachments.some((file) => file.draftStatus)) { toast("请先核查或移除未确认的附件。", true); renderComposerDraft(); return; }
   if (!state.status?.configured) { state.settingsTab = "models"; await switchView("settings"); toast("先配置一个主模型，即可开始对话。"); return; }
-  if (composerDraftBinding && !composerDraft.consume()) { composerDraftNote = "浏览器草稿未能清除，尚未发送；请先处理存储问题再重试。"; renderComposerDraft(); return; }
+  if (composerDraftBinding && !composerDraft.consume()) { toast("浏览器草稿未能清除，尚未发送；请先处理存储问题再重试。", true); renderComposerDraft(); return; }
   composerPendingEdit = null;
   const owner = connection, store = state.status?.store_instance_id, targetSession = state.activeSession;
   const intentVersion = sessionRequestVersion;
@@ -1253,7 +1242,6 @@ async function sendMessage(event) {
   input.value = ""; draftRevision += 1; state.attachments = []; renderComposerAttachments(); resizeComposer();
   composerPromptUndo = null;
   const emptyRevision = draftRevision;
-  composerDraftNote = "";
   state.sending = true; renderComposer();
   try {
     if (stillCurrent()) {
@@ -1279,7 +1267,7 @@ async function sendMessage(event) {
       state.sending = false;
       if (draftRevision === emptyRevision && !input.value && !state.attachments.length) {
         input.value = originalText; state.attachments = attachments; draftRevision += 1;
-        composerDraftNote = "发送结果未确认，请先核查记录；重新编辑后才保存为新草稿。";
+        toast("发送结果未确认，请先核查记录；重新编辑后才保存为新草稿。", true);
         // A lost receipt is not a fresh unsent draft. Only another edit saves it.
         renderComposerAttachments(); resizeComposer();
       }
@@ -4910,7 +4898,7 @@ function renderMaintenanceSettings() {
   return element("div", {}, settingsResourceError("management"),
     settingsSection("本地插件", switchField("启用插件", "plugins.enabled", plugins.enabled), field("禁用的插件 ID", "plugins.disabled", (plugins.disabled ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }), inventory,
       management?.plugins_restart_required && element("p", { class: "settings-notice", text: "插件配置已保存，重启后生效。" }), settingsJSON("plugins", plugins, ["enabled", "disabled"])),
-    settingsSection("版本更新", statusList([["状态", updateLabel(management)], ["当前版本", update?.current ?? state.status?.version], ["最新版本", update?.latest], ["上次检查", update?.checked_at ? formatFullDate(update.checked_at) : "—"]]), switchField("启动时检查更新", "updates.check_on_start", updates.check_on_start), settingsJSON("updates", updates, ["check_on_start"]), actionButton("交给沐璃检查", "configure-prompt", "text-button", "chat", { prompt: "请检查 MuLi 的更新状态，有更新时先告诉我版本与变更。" })),
+    settingsSection("版本更新", statusList([["状态", updateLabel(management)], ["当前版本", update?.current ?? state.status?.version], ["最新版本", update?.latest], ["上次检查", update?.checked_at ? formatFullDate(update.checked_at) : "—"]]), switchField("启动时检查更新", "updates.check_on_start", updates.check_on_start), field("定时检查间隔（小时，0 关闭）", "updates.interval_hours", updates.interval_hours ?? 2, { type: "number", min: 0, max: 168, step: 0.5 }), settingsJSON("updates", updates, ["check_on_start", "interval_hours"]), actionButton("交给沐璃检查", "configure-prompt", "text-button", "chat", { prompt: "请检查 MuLi 的更新状态，有更新时先告诉我版本与变更。" })),
     settingsSection("管理操作", element("div", { id: "management-current-recovery", class: "management-item", "aria-live": "polite" }, ...managementRecoveryContent()), plans),
     state.status?.server?.restart_required && element("p", { class: "settings-notice", text: "监听配置已保存，重启后生效。" }));
 }
@@ -4925,6 +4913,7 @@ function renderModelSettings() {
   const protocolField = selectField("协议", `${path}.protocol`, protocol, [["openai_chat", "OpenAI · Chat Completions"], ["openai_responses", "OpenAI · Responses"], ["anthropic", "Anthropic · Messages"]]);
   const modelField = field("模型名称", `${path}.model`, model.model ?? "", { placeholder: "填写提供商的模型 ID", required: role === "main" });
   const baseField = field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" });
+  const contextField = field("上下文长度（Token）", `${path}.context_window`, model.context_window ?? "", { type: "number", min: 8192, max: 10000000, step: 1, required: role === "main", hint: "用于上下文压缩；所有已配置的模型都必须填写。" });
   const token = field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值", hint: "Anthropic 配置需要填写；其它协议可留空。" });
   const advanced = element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }),
     element("div", { class: "field-row" }, field("Temperature", `${path}.temperature`, model.temperature ?? "", { type: "number", step: .1, min: 0, max: 2, placeholder: "使用模型默认值" }), field("Top P", `${path}.top_p`, model.top_p ?? "", { type: "number", step: .05, min: 0, max: 1, placeholder: "使用模型默认值" })),
@@ -4940,11 +4929,16 @@ function renderModelSettings() {
     model.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false));
   const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未单独配置时，复用主模型。", vision: "主模型支持图片时复用主模型；否则需要单独配置支持图片的视觉模型。" };
   const content = element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
-    settingsSection("模型连接", protocolField, modelField, baseField, field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), token, switchField("支持图片", `${path}.vision`, model.vision), advanced));
+    settingsSection("模型连接", protocolField, modelField, baseField, contextField, field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), token, switchField("支持图片", `${path}.vision`, model.vision), advanced));
   const protocolInput = $("select", protocolField);
   const modelInput = $("input", modelField);
   const baseInput = $("input", baseField);
-  const updateRequired = () => { $("input", token).required = protocolInput.value === "anthropic" && (role === "main" || !!modelInput.value.trim() || !!baseInput.value.trim()); };
+  const contextInput = $("input", contextField);
+  const updateRequired = () => {
+    const configured = role === "main" || !!modelInput.value.trim() || !!baseInput.value.trim();
+    $("input", token).required = protocolInput.value === "anthropic" && configured;
+    contextInput.required = configured;
+  };
   protocolInput.addEventListener("change", updateRequired);
   modelInput.addEventListener("input", updateRequired);
   baseInput.addEventListener("input", updateRequired);
@@ -5415,8 +5409,11 @@ async function handleAction(action, button) {
   if (action === "voice-setup-cancel") await voiceSetup.stop();
   if (action === "toggle-theme") { toggleTheme(); renderThemeControl(); }
   if (action === "logout") {
-    discardComposerDraft();
-    voiceInput.cancel(); state.voiceDraft = null; $("#voice-draft-text").value = "";
+    stopComposerOperations(); voiceInput.cancel();
+    const cleared = composerDraft.clear();
+    $("#message-input").value = ""; state.attachments = []; draftRevision += 1; composerPromptUndo = null;
+    if (!cleared) toast("浏览器草稿未能清除，请清除本页站点存储后再退出。", true);
+    state.voiceDraft = null; $("#voice-draft-text").value = "";
     state.settings = null; state.settingsDraft = null; state.session = createSessionState(); resetMessageNodes(); showLogin();
     composerDraftBinding = null;
     try { await apiRequest("/auth/logout", { method: "POST" }); } catch (error) { if (!connection && !state.auth.authenticated) showError(error); }
@@ -5453,7 +5450,6 @@ async function handleAction(action, button) {
   }
   if (action === "transcribe-saved-audio") openSavedAudio(button);
   if (action === "retry-composer-attachments") await checkComposerAttachments();
-  if (action === "discard-composer-draft") discardComposerDraft();
   if (action === "undo-composer-prompt") {
     if (composerPromptUndo && composerPromptUndo.session === state.activeSession?.id
       && $("#message-input").value === composerPromptUndo.applied) {

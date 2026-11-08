@@ -54,6 +54,12 @@ def prompt_settings(
     base_url = ask("API 基础地址（包含 /v1 等版本前缀）")
     if not model or not base_url:
         raise ValueError("请填写主模型 ID 和 API 基础地址；只建空配置可使用 --defaults")
+    context_value = ask("主模型上下文长度（tokens，必填）", "128000")
+    if not context_value.isascii() or not context_value.isdecimal():
+        raise ValueError("context_window 必须填写正整数")
+    context_window = int(context_value)
+    if not 8192 <= context_window <= 10_000_000:
+        raise ValueError("context_window 必须在 8192 到 10000000 之间")
     api_key = secret("API key（本地保存，留空表示无密钥）：").strip()
     max_output_tokens: int | None = None
     if protocol == "anthropic":
@@ -80,6 +86,7 @@ def prompt_settings(
                 "base_url": base_url,
                 "api_key": api_key,
                 "max_output_tokens": max_output_tokens,
+                "context_window": context_window,
                 "vision": vision,
                 "reasoning_effort": effort,
                 "thinking": thinking,
@@ -87,6 +94,10 @@ def prompt_settings(
                 "extra_body": extra,
             }
         },
+        # The existing compaction and request budgets are character-based.
+        # 0.75 chars per token keeps the default 128k model at the historical
+        # 96k character budget and leaves room for the system prompt.
+        "limits": {"max_context_chars": max(4000, min(1_000_000, int(context_window * 0.75)))},
         "server": {"host": host, "port": port, "password": password},
         "onboarding_pending": True,
     }

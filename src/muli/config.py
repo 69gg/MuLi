@@ -169,6 +169,9 @@ class ModelProfile(Section):
     api_key: str = ""
     api_key_env: str = ""
     max_output_tokens: int | None = Field(default=None, strict=True, ge=128, le=131072)
+    # Required by init and the settings form for every configured model; the
+    # default keeps older configurations readable without inventing a migration.
+    context_window: int = Field(default=128000, strict=True, ge=8192, le=10_000_000)
     timeout: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=2, ge=0, le=5)
     stream: bool = True
@@ -351,6 +354,8 @@ class PluginSettings(Section):
 
 class UpdateSettings(Section):
     check_on_start: bool = True
+    # 0 disables the periodic check while keeping the startup check available.
+    interval_hours: float = Field(default=2, ge=0, le=168, allow_inf_nan=False)
     metadata_url: str = "https://pypi.org/pypi/muli-agent/json"
     repository: str = "https://github.com/69gg/MuLi.git"
     timeout: float = Field(default=8, gt=0, le=30)
@@ -716,6 +721,19 @@ class Settings(Section):
         if not roots:
             raise ValueError("至少配置一个文件访问根目录")
         return [str(Path(root).expanduser().resolve()) for root in roots]
+
+    @model_validator(mode="after")
+    def context_budget_fits_models(self) -> Settings:
+        """Every configured model must be able to hold the shared request budget."""
+        ceiling = self.limits.max_context_chars
+        for name in ("main", "reviewer", "worker", "vision", "compactor", "memory_extractor"):
+            profile = getattr(self.models, name)
+            if profile.configured and ceiling > int(profile.context_window * 0.75):
+                raise ValueError(
+                    f"{name} 模型的 context_window 不足以容纳 limits.max_context_chars；"
+                    "请填写真实上下文长度或降低字符预算"
+                )
+        return self
 
 
 def default_data_dir() -> Path:

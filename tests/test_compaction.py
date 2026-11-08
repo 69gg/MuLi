@@ -88,6 +88,39 @@ async def test_background_summary_installs_only_closed_prefix_and_keeps_live_suf
         store.close()
 
 
+async def test_pressure_waits_for_an_inflight_background_summary(tmp_path: Path) -> None:
+    store = Store(tmp_path / "journal.sqlite3")
+    history(store)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def summarize(source: str, max_tokens: int) -> str:
+        entered.set()
+        await release.wait()
+        return "待办承诺：继续检查；b 的结果未知，不能重做。"
+
+    compactor = Compactor(
+        store,
+        summarize,
+        CompactionSettings,
+        max_chars=lambda: 5000,
+        max_jobs=lambda: 2,
+        fingerprint=lambda: "config",
+    )
+    try:
+        compactor.observe("session")
+        await asyncio.wait_for(entered.wait(), 2)
+        pending = asyncio.create_task(compactor.pressure_candidate("session", []))
+        await asyncio.sleep(0)
+        assert not pending.done()
+        release.set()
+        candidate = await asyncio.wait_for(pending, 2)
+        assert candidate is not None and candidate.requires_preview
+    finally:
+        release.set()
+        await compactor.close()
+        store.close()
+
+
 @pytest.mark.parametrize("change", ["prefix", "generation", "config"])
 async def test_candidate_rejected_when_snapshot_no_longer_matches(
     tmp_path: Path, change: str

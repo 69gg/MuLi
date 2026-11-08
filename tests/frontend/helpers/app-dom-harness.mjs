@@ -131,10 +131,9 @@ export function harness(handler = async () => { throw new Error("unexpected requ
       }
     }
     // These cases exercise the real composer and submit handlers, without browser layout.
-    node("div", "composer-draft-state"); node("span", "composer-draft-status");
+    node("div", "composer-draft-state");
     node("button", "composer-draft-recheck").dataset.action = "retry-composer-attachments";
     node("button", "composer-prompt-undo").dataset.action = "undo-composer-prompt";
-    node("button", "composer-draft-discard").dataset.action = "discard-composer-draft";
     document.querySelector("#conversation-scroll").clientHeight = 0;
   }
   const requests = [], windowEvents = {}, savedTaskControls = new Map(); let globalEvent = null, nextMessage = 0, voiceCallbacks = null;

@@ -40,6 +40,25 @@ def test_defaults_cli_creates_local_configuration_without_network_or_service(
     assert str(config) in output and "MuLi serve" in output
 
 
+def test_bare_cli_initializes_when_the_data_directory_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, data = isolated_command(monkeypatch, tmp_path, [])
+    monkeypatch.setattr("muli.initialization.prompt_settings", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        "muli.initialization.clone_source", lambda *args, **kwargs: {"reason": "跳过"}
+    )
+
+    async def no_service(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"accepted": False, "completed": [], "reason": "跳过"}
+
+    monkeypatch.setattr("muli.initialization.start_background", no_service)
+    main()
+    assert config.exists() and data.is_dir()
+    output = capsys.readouterr().out
+    assert "未检测到配置或数据目录" in output and "已创建" in output
+
+
 def test_cli_never_overwrites_existing_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

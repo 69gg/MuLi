@@ -41,8 +41,11 @@ embedding、reranker、ASR 和 TTS 是独立服务，不继承主模型。
 
 Anthropic Messages 必须提供 `max_tokens`，因此已完整配置的 Anthropic 角色必须显式填写 `max_output_tokens`。留空继承主模型的角色不必重复填写。`MuLi init` 仅在选择 Anthropic 时询问这个必填值；OpenAI 的初始设置默认不配置它。
 
+所有已配置的模型还必须填写真实的 `context_window`（上下文长度，token）。`muli init` 会询问主模型的上下文长度，并据此设置 `limits.max_context_chars`；工作台模型表单对每个已填写模型 ID 或服务地址的角色都要求填写。留空继承主模型的角色沿用主模型的设置。`context_window` 必须能容纳当前字符预算，否则配置会被拒绝，避免请求超过模型窗口。
+
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `context_window` | 128000（旧配置缺省） | 模型真实上下文长度（token）；新建配置必须填写，且须容纳 `limits.max_context_chars` |
 | `temperature` | 留空 | 不发送此参数；设置后须在 0–2 之间 |
 | `top_p` | 留空 | 不发送此参数；设置后须在 0–1 之间 |
 | `stream` | `true` | 使用流式响应；关闭后仍能显示完成结果 |
