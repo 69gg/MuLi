@@ -22,6 +22,7 @@ MAX_LOG_LINES = 200
 DEFAULT_LOG_SEGMENT = "current"
 LOG_SEGMENTS = (DEFAULT_LOG_SEGMENT, "previous")
 LOG_TIMEOUT = 5
+LOG_BUDGET = 24000
 _MASK = "[hidden]"
 
 
@@ -130,7 +131,9 @@ async def read_service_logs(
         raise ValueError(f"lines 必须为 1 至 {MAX_LOG_LINES} 的整数")
     if type(segment) is not str or segment not in LOG_SEGMENTS:
         raise ValueError("segment 必须为 current 或 previous")
-    budget = config.settings.limits.max_output_chars
+    # A service log read stays a small, fixed diagnostic; it is not a model
+    # output, so the unlimited output budget must not turn it into a full dump.
+    budget = min(config.settings.limits.max_output_chars, LOG_BUDGET)
     secrets = _secrets(config, mcp_config() if mcp_config is not None else None)
     result: dict[str, Any] = {
         "source": "journal" if service.platform == "linux" else "service_file",
