@@ -3717,9 +3717,10 @@ class Runtime:
         session = self.store.get("session", session_id) or {}
         workflow_step = workflow_step or bool(session.get("workflow_run_id"))
         spent = 0
+        tool_step_limit = self.config.settings.limits.max_tool_steps
         async with self.client_factory(self.model_config(role)) as client:
             round_index = 0
-            while round_index <= self.config.settings.limits.max_tool_steps:
+            while tool_step_limit <= 0 or round_index <= tool_step_limit:
                 if prepared.project_inbox is not None and self.store.pending_inputs(session_id):
                     return await self._interrupt_project(prepared)
                 if shell_continuation is not None and self.store.pending_inputs(session_id):
@@ -3813,8 +3814,8 @@ class Runtime:
                     set(identifiers)
                 ) != len(identifiers):
                     raise ValueError("模型返回了无效或重复的工具调用 ID")
-                remaining = self.config.settings.limits.max_tool_steps - spent
-                if len(turn.tool_calls) > remaining:
+                remaining = tool_step_limit - spent if tool_step_limit > 0 else None
+                if remaining is not None and len(turn.tool_calls) > remaining:
                     # Reject before journaling an assistant call batch or executing any
                     # part of it; truncating native calls would break signed replay.
                     raise ValueError(f"模型工具调用批次超过剩余预算（{remaining}）；该批次未执行")
@@ -3848,7 +3849,7 @@ class Runtime:
                     if (
                         consult is None
                         and prepared.project_inbox is None
-                        and round_index < self.config.settings.limits.max_tool_steps
+                        and (tool_step_limit <= 0 or round_index < tool_step_limit)
                     ):
                         self.system_events.clear_request(session_id)
                         claimed = await self._claim_inputs(session_id, run_id)
@@ -4093,7 +4094,7 @@ class Runtime:
                 if (
                     consult is None
                     and prepared.project_inbox is None
-                    and round_index < self.config.settings.limits.max_tool_steps
+                    and (tool_step_limit <= 0 or round_index < tool_step_limit)
                 ):
                     self.system_events.clear_request(session_id)
                     claimed = await self._claim_inputs(session_id, run_id)
@@ -4141,7 +4142,8 @@ class Runtime:
     ) -> dict[str, Tool]:
         # Materialize after capacity admission. One dict binds the schemas and
         # handlers for this whole response, including approval waits and pairing.
-        if spent >= self.config.settings.limits.max_tool_steps:
+        limit = self.config.settings.limits.max_tool_steps
+        if limit > 0 and spent >= limit:
             return {}
         tools = self.session_tools(session_id)
         owner_input = prepared.reply_origin.input_id if prepared is not None else None

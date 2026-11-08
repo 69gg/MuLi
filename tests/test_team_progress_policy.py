@@ -187,7 +187,7 @@ async def finish(
             "(type IN ('run.completed','run.failed') AND json_extract(data,'$.run_id')=?)) "
             "GROUP BY type",
             (
-                runtime.config.settings.limits.max_tool_steps,
+                max(1, runtime.config.settings.limits.max_tool_steps),
                 identifier,
                 identifier,
                 run.get("id", ""),

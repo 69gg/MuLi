@@ -229,7 +229,8 @@ async def exercise_reindex(
             nonlocal imported, queried, indexed, available, status, duplicate, found_source
             assert self.role == "main"
             number = rounds[phase] = rounds.get(phase, 0) + 1
-            assert number <= runtime.config.settings.limits.max_tool_steps
+            limit = runtime.config.settings.limits.max_tool_steps
+            assert limit <= 0 or number <= limit
             assert runs.setdefault(phase, runtime.run_ids[main_id]) == runtime.run_ids[main_id]
             if number == 1:
                 if phase in {"collect", "collect-other"}:

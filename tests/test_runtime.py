@@ -302,6 +302,7 @@ async def test_oversized_native_tool_batch_fails_before_any_call_or_replay_is_st
         },
     )
     runtime, seen = make_runtime(tmp_path, [turn])
+    runtime.config.update({"limits": {"max_tool_steps": 16}})
     try:
         session = runtime.new_session(mode="yolo")
         started = await runtime.start(session["id"], "必须保留的当前任务")

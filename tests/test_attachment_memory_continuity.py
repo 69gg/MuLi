@@ -455,7 +455,8 @@ async def test_collected_attachment_survives_compaction_cross_phone_reopen_and_f
                 yield StreamEvent("done", turn=ModelTurn(content="已收到遗忘队友的完成回报。"))
                 return
             number = rounds[phase] = rounds.get(phase, 0) + 1
-            assert number <= active.config.settings.limits.max_tool_steps
+            limit = active.config.settings.limits.max_tool_steps
+            assert limit <= 0 or number <= limit
             assert runs.setdefault(phase, active.run_ids[main_id]) == active.run_ids[main_id]
             if phase == "catalog":
                 if number == 1:

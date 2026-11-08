@@ -371,7 +371,8 @@ class Limits(Section):
     review_parallel: int = Field(default=1, ge=1, le=16)
     safety_max_agents: int = Field(default=8, ge=1)
     max_pending_runs: int = Field(default=8, ge=1)
-    max_tool_steps: int = Field(default=16, ge=1, le=100)
+    # 0 means unlimited: the model keeps its tools until it stops calling them.
+    max_tool_steps: int = Field(default=0, ge=0)
     max_run_seconds: int = Field(default=600, ge=10, le=7200)
     max_file_bytes: int = Field(default=2_000_000, ge=1024, le=20_000_000)
     max_output_chars: int = Field(default=24000, ge=1000, le=100000)
