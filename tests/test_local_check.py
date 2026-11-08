@@ -161,6 +161,7 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
         assert "--property=TasksMax=96" in command
         assert "--setenv=UV_CACHE_DIR=/existing-uv-cache" in command
         assert "--setenv=UV_PYTHON_DOWNLOADS=never" in command
+        assert "--setenv=MULI_PREVIOUS_SOURCE_ROOT=/frozen/consumer" in command
         assert all("PRIVATE_TEST_TOKEN" not in argument for argument in command)
         raise KeyboardInterrupt
 
@@ -172,6 +173,7 @@ def test_cancel_cleans_own_service_and_keeps_shared_budget(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TMPDIR", "/inherited-ram-temp")
     monkeypatch.setenv("UV_CACHE_DIR", "/existing-uv-cache")
+    monkeypatch.setenv("MULI_PREVIOUS_SOURCE_ROOT", "/frozen/consumer")
     monkeypatch.setenv("PRIVATE_TEST_TOKEN", "synthetic-not-forwarded")
     monkeypatch.setattr(checker.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setattr(checker.Path, "is_file", lambda _: True)
