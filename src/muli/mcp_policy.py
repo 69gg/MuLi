@@ -36,7 +36,10 @@ class ReceivePolicy(StrictRecord):
 
 def checked_policy(policy: ReceivePolicy) -> ReceivePolicy:
     try:
-        return ReceivePolicy.model_validate(policy.model_dump(mode="python"))
+        # Revalidate the raw field values. model_dump would serialize an
+        # already-corrupted field and emit a pydantic warning before the
+        # validation error this function turns into mcp_policy_invalid.
+        return ReceivePolicy.model_validate(dict(policy))
     except (ValueError, TypeError):
         raise ReceivePolicyError("mcp_policy_invalid") from None
 
