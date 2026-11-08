@@ -291,7 +291,7 @@ async def test_reply_collection_survives_real_compaction_reopen_and_private_work
                 "trigger_ratio": 0.25,
                 "target_ratio": 0.2,
             },
-            "limits": {"max_output_chars": 6000},
+            "limits": {"max_context_chars": 48000, "max_output_chars": 6000},
             "models": {
                 "worker": {"model": "worker", "base_url": "https://unused.invalid/v1"},
                 "compactor": {"model": "compactor", "base_url": "https://unused.invalid/v1"},

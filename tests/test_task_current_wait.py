@@ -20,6 +20,10 @@ from muli.task_inspection import TaskInspection
 @pytest.fixture
 async def wait_case(tmp_path: Path) -> AsyncIterator[tuple[Runtime, LocalServices, str]]:
     runtime, _ = make_runtime(tmp_path, [])
+    # These cases assert how oversized handoff records are hidden. Pin the old
+    # bounded envelope so "oversized" stays meaningful after budgets default
+    # to unlimited.
+    runtime.config.update({"limits": {"max_output_chars": 24000}})
     services = attach_services(runtime, tmp_path)
     task = await services.commitments.save(
         "当前等待", brief={"goal": "私密目标不进入等待页", "constraints": []}
