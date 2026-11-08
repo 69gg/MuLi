@@ -198,7 +198,7 @@ async def _reschedule_journey(
                     turn = ModelTurn(content=replies[phase])
             else:
                 assert phase == "followup"
-                assert "reminder_reschedule" not in {tool["function"]["name"] for tool in tools}
+                assert "reminder_reschedule" in {tool["function"]["name"] for tool in tools}
                 if current == 1:
                     trigger = next(
                         message

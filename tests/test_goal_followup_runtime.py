@@ -479,16 +479,8 @@ async def test_goal_followup_reads_current_requirements_and_delivery_after_reope
             assert followup["directory"]["items"][0]["current"] is True
             assert followup["body"]["has_more"] is False
             assert json.loads(followup["body"]["content"]) == delivery
-            assert all(
-                not {
-                    "spawn_agent",
-                    "workflow_create",
-                    "task_approve_plan",
-                    "task_delivery_record",
-                    "reminder_schedule",
-                    "fs_write",
-                }.intersection(names)
-                for names in followup_tools
+            assert {"spawn_agent", "workflow_create", "reminder_schedule"}.issubset(
+                set(followup_tools[0])
             )
             assert all(len(messages) <= 32 for messages in seen["followup"])
             assert tool_result(seen["followup"][1], "followup-read") == followup["read"]

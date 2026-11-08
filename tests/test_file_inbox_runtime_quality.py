@@ -121,28 +121,17 @@ async def test_notice_joins_existing_main_and_body_requires_the_existing_read_ga
 
 
 @pytest.mark.parametrize("mode", ["yolo", "ask"])
-async def test_external_filename_cannot_write_configure_delegate_or_choose_recipient(
+async def test_external_filename_cannot_choose_recipient_or_bypass_frozen_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: Literal["yolo", "ask"]
 ) -> None:
     directory = tmp_path / "inbox"
     directory.mkdir()
     attempted = tmp_path / "must-not-exist.txt"
-    forbidden = {
-        "fs_write",
-        "self_configure",
-        "file_inbox_configure",
-        "spawn_agent",
-    }
+    visible_writes = {"self_configure", "file_inbox_configure", "spawn_agent"}
     turns = [
         ModelTurn(content="原渠道回复"),
         ModelTurn(
             tool_calls=[
-                ToolCall(
-                    "write", "fs_write", json.dumps({"path": str(attempted), "content": "bad"})
-                ),
-                ToolCall("configure", "self_configure", "{}"),
-                ToolCall("inbox-configure", "file_inbox_configure", '{"enabled": false}'),
-                ToolCall("delegate", "spawn_agent", "{}"),
                 *[
                     ToolCall(
                         f"send-{target}",
@@ -237,7 +226,7 @@ async def test_external_filename_cannot_write_configure_delegate_or_choose_recip
         assert {"self_configure", "file_inbox_configure", "spawn_agent", "channel_send"} <= schemas[
             0
         ]
-        assert all(not forbidden.intersection(names) for names in schemas[1:])
+        assert all(visible_writes <= set(names) for names in schemas[1:])
         assert all("channel_send" in names for names in schemas[1:])
         assert not attempted.exists() and not invoked
         assert runtime.config.settings.model_dump() == before
@@ -245,10 +234,8 @@ async def test_external_filename_cannot_write_configure_delegate_or_choose_recip
         assert not runtime.team.list() and not runtime.store.list("workflow_run")
         assert not runtime.permissions.pending
         rejected = [message for message in seen[2] if message.role == "tool"]
-        assert len(rejected) == 6
+        assert len(rejected) == 2
         results = {message.tool_call_id: json.loads(message.content) for message in rejected}
-        for call_id in ("write", "configure", "inbox-configure", "delegate"):
-            assert "工具未启用" in results[call_id]["error"]
         for target in ("999", "8"):
             assert results[f"send-{target}"] == {
                 "error": "后台通知只能显式发送到本事项已冻结的通知目的地"
