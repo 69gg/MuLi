@@ -2568,9 +2568,7 @@ class Runtime:
 
     def configure(self) -> None:
         settings = self.config.settings
-        self.capacity = asyncio.Semaphore(
-            settings.limits.max_parallel_agents or UNLIMITED
-        )
+        self.capacity = asyncio.Semaphore(settings.limits.max_parallel_agents or UNLIMITED)
         self.review_capacity = asyncio.Semaphore(settings.limits.review_parallel or UNLIMITED)
         self.permissions = Permissions(
             self.store,
@@ -2939,9 +2937,7 @@ class Runtime:
             notify=not attention_origin and consult is None,
         )
         try:
-            async with asyncio.timeout(
-                self.config.settings.limits.max_run_seconds or UNLIMITED
-            ):
+            async with asyncio.timeout(self.config.settings.limits.max_run_seconds or UNLIMITED):
                 run["status"] = "running"
                 self.store.put("run", run)
                 await self.bus.emit("run.started", run, session_id)

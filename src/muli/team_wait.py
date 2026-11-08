@@ -345,11 +345,7 @@ class TeamWait:
         if not identifiers or len(identifiers) > limits.max_pending_runs:
             raise ValueError("等待目标为空或超过未完成任务预算")
         run_limit = limits.max_run_seconds
-        if (
-            not math.isfinite(timeout)
-            or timeout <= 0
-            or (run_limit > 0 and timeout > run_limit)
-        ):
+        if not math.isfinite(timeout) or timeout <= 0 or (run_limit > 0 and timeout > run_limit):
             raise ValueError("等待时间超出运行预算")
         incremental = (
             IncrementalWait(self.team, identifiers, caller, cursor) if cursor is not None else None

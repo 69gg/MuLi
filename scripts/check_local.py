@@ -276,9 +276,7 @@ def run(command: list[str], seconds: int, *, backend: bool = False) -> int:
     # Test fixtures select their inputs through MULI_* switches (for example the
     # frozen previous-consumer checkout); the service does not inherit them
     # automatically, so forward only the project's own namespace.
-    environment.update(
-        (key, value) for key, value in os.environ.items() if key.startswith("MULI_")
-    )
+    environment.update((key, value) for key, value in os.environ.items() if key.startswith("MULI_"))
     invocation = [
         "systemd-run",
         "--user",
