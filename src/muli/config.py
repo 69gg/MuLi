@@ -31,10 +31,6 @@ SECRET_PLACEHOLDER = "••••"
 # Sentinel used where an internal API needs a concrete integer but the owner
 # configured 0 (unlimited). It is far above any real workload.
 UNLIMITED = 2**31 - 1
-# The auto reviewer receives the review prompt and one tool call, never the
-# conversation. A model only needs to hold this bounded request, not the full
-# limits.max_context_chars budget.
-REVIEW_CONTEXT_CHARS = 16_000
 
 
 def _mcp_url(value: str) -> SplitResult:
