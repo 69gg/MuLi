@@ -298,14 +298,26 @@ class Updates:
                 ["git", "status", "--porcelain"], cwd=source, timeout=10, env=environment
             )
             if status["exit_code"] == 0 and not status["output"].strip():
-                pulled = await run_process(
-                    ["git", "-c", "http.proxy=", "pull", "--ff-only", "--depth", "1"],
+                # A shallow reference checkout cannot fast-forward across the
+                # fetch boundary; fetch the tip and reset to it instead.
+                fetched = await run_process(
+                    ["git", "-c", "http.proxy=", "fetch", "--depth", "1", "origin", "main"],
                     cwd=source,
                     timeout=45,
                     limit=4000,
                     env=environment,
                 )
-                source_status = "updated" if pulled["exit_code"] == 0 else "update_failed"
+                if fetched["exit_code"] == 0:
+                    reset = await run_process(
+                        ["git", "-c", "http.proxy=", "reset", "--hard", "FETCH_HEAD"],
+                        cwd=source,
+                        timeout=15,
+                        limit=4000,
+                        env=environment,
+                    )
+                    source_status = "updated" if reset["exit_code"] == 0 else "update_failed"
+                else:
+                    source_status = "update_failed"
             else:
                 source_status = "local_changes_preserved"
         return {
