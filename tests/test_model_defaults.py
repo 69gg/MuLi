@@ -171,7 +171,7 @@ async def test_empty_llm_roles_inherit_complete_primary_but_not_http_services(
         await runtime.close()
 
 
-def test_reviewer_may_use_a_shorter_context_window_than_the_shared_budget() -> None:
+def test_context_window_does_not_gate_request_budgets() -> None:
     def build(**roles: dict[str, Any]) -> Settings:
         models: dict[str, Any] = {
             "main": {
@@ -186,26 +186,30 @@ def test_reviewer_may_use_a_shorter_context_window_than_the_shared_budget() -> N
             },
         }
         models.update(roles)
-        return Settings.model_validate({"models": models, "limits": {"max_context_chars": 96000}})
+        return Settings.model_validate({"models": models})
 
     assert build().models.reviewer.context_window == 32000
-    with pytest.raises(ValidationError, match="reviewer"):
+    assert (
         build(
             reviewer={
                 "model": "reviewer",
                 "base_url": "https://review.test/v1",
-                "context_window": 8000,
+                "context_window": 16000,
             }
-        )
-    # Other roles still have to hold the full shared request budget.
-    with pytest.raises(ValidationError, match="worker"):
+        ).models.reviewer.context_window
+        == 16000
+    )
+    # A shorter worker window is accepted too: no character budget gates it.
+    assert (
         build(
             worker={
                 "model": "worker",
                 "base_url": "https://worker.test/v1",
-                "context_window": 32000,
+                "context_window": 16000,
             }
-        )
+        ).models.worker.context_window
+        == 16000
+    )
 
 
 async def test_inherited_reviewer_has_its_own_toolless_context(tmp_path: Path) -> None:

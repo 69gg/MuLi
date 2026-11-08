@@ -452,19 +452,19 @@
     "batch_size": 8
   },
   "limits": {
-    "max_parallel_agents": 2,
-    "max_pending_runs": 8,
+    "max_parallel_agents": 0,
+    "max_pending_runs": 0,
     "max_tool_steps": 0,
-    "max_run_seconds": 600,
-    "max_file_bytes": 2000000,
-    "max_output_chars": 24000,
-    "max_context_chars": 96000,
-    "max_workflow_steps": 12,
+    "max_run_seconds": 0,
+    "max_file_bytes": 0,
+    "max_output_chars": 0,
+    "max_context_chars": 0,
+    "max_workflow_steps": 0,
     "approval_timeout": 600,
-    "max_search_entries": 2000,
-    "max_search_results": 100,
-    "max_search_depth": 16,
-    "max_search_seconds": 10.0
+    "max_search_entries": 0,
+    "max_search_results": 0,
+    "max_search_depth": 0,
+    "max_search_seconds": 0
   },
   "server": {
     "host": "127.0.0.1",

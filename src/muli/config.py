@@ -370,24 +370,39 @@ class UpdateSettings(Section):
 
 
 class Limits(Section):
-    # 0 means unlimited for the runtime budgets below. Explicit positive values
-    # still work as operator-set caps.
+    # 0 means unlimited. Explicit positive values still work as operator caps.
     max_parallel_agents: int = Field(default=0, ge=0)
     review_parallel: int = Field(default=0, ge=0)
     safety_max_agents: int = Field(default=0, ge=0)
-    max_pending_runs: int = Field(default=8, ge=1)
-    # 0 means unlimited: the model keeps its tools until it stops calling them.
+    max_pending_runs: int = Field(default=0, ge=0)
     max_tool_steps: int = Field(default=0, ge=0)
     max_run_seconds: int = Field(default=0, ge=0)
-    max_file_bytes: int = Field(default=2_000_000, ge=1024, le=20_000_000)
-    max_output_chars: int = Field(default=24000, ge=1000, le=100000)
-    max_context_chars: int = Field(default=96000, ge=4000, le=1000000)
+    max_file_bytes: int = Field(default=0, ge=0)
+    max_output_chars: int = Field(default=0, ge=0)
+    max_context_chars: int = Field(default=0, ge=0)
     max_workflow_steps: int = Field(default=0, ge=0)
     approval_timeout: int = Field(default=600, ge=10, le=86400)
-    max_search_entries: int = Field(default=2000, ge=1, le=20000)
-    max_search_results: int = Field(default=100, ge=1, le=1000)
-    max_search_depth: int = Field(default=16, ge=1, le=64)
-    max_search_seconds: float = Field(default=10, gt=0, le=60)
+    max_search_entries: int = Field(default=0, ge=0)
+    max_search_results: int = Field(default=0, ge=0)
+    max_search_depth: int = Field(default=0, ge=0)
+    max_search_seconds: float = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def expand_unlimited(self) -> Limits:
+        """Give concrete ceilings to call sites that require a positive integer."""
+        for name, ceiling in (
+            ("max_pending_runs", 10_000),
+            ("max_file_bytes", 100_000_000),
+            ("max_output_chars", 1_000_000),
+            ("max_context_chars", 4_000_000),
+            ("max_search_entries", 1_000_000),
+            ("max_search_results", 100_000),
+            ("max_search_depth", 1_000),
+            ("max_search_seconds", 86_400.0),
+        ):
+            if getattr(self, name) == 0:
+                setattr(self, name, ceiling)
+        return self
 
 
 class Search(Section):
@@ -731,25 +746,6 @@ class Settings(Section):
         if not roots:
             raise ValueError("至少配置一个文件访问根目录")
         return [str(Path(root).expanduser().resolve()) for root in roots]
-
-    @model_validator(mode="after")
-    def context_budget_fits_models(self) -> Settings:
-        """Every configured model must hold the budget its role actually receives."""
-        ceiling = self.limits.max_context_chars
-        for name in ("main", "reviewer", "worker", "vision", "compactor", "memory_extractor"):
-            profile = getattr(self.models, name)
-            if not profile.configured:
-                continue
-            # The reviewer is a toolless single-call check; it does not receive
-            # the conversation, so a shorter context window is sufficient.
-            required = min(ceiling, REVIEW_CONTEXT_CHARS) if name == "reviewer" else ceiling
-            if required > int(profile.context_window * 0.75):
-                budget = "审查请求预算" if name == "reviewer" else "limits.max_context_chars"
-                raise ValueError(
-                    f"{name} 模型的 context_window 不足以容纳 {budget}；"
-                    "请填写真实上下文长度或降低字符预算"
-                )
-        return self
 
 
 def default_data_dir() -> Path:

@@ -337,13 +337,12 @@ def test_invalid_budget_is_rejected(budget: int) -> None:
 
 
 def test_pending_run_config_limit_defaults_and_bounds() -> None:
-    assert Limits().max_pending_runs == 8
+    assert Limits().max_pending_runs == 10_000
     assert Limits(max_pending_runs=1024).max_pending_runs == 1024
     assert Limits(max_parallel_agents=129).max_parallel_agents == 129
     assert Limits(max_workflow_steps=256).max_workflow_steps == 256
-    for value in (0, -1):
-        with pytest.raises(ValueError):
-            Limits(max_pending_runs=value)
+    with pytest.raises(ValueError):
+        Limits(max_pending_runs=-1)
 
 
 def test_image_bytes_use_media_budget_and_native_image_stays_intact() -> None:

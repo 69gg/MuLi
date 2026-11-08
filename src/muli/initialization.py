@@ -94,10 +94,9 @@ def prompt_settings(
                 "extra_body": extra,
             }
         },
-        # The existing compaction and request budgets are character-based.
-        # 0.75 chars per token keeps the default 128k model at the historical
-        # 96k character budget and leaves room for the system prompt.
-        "limits": {"max_context_chars": max(4000, min(1_000_000, int(context_window * 0.75)))},
+        # Character budgets default to unlimited; only the model's real
+        # context_window limits a request now.
+        "limits": {},
         "server": {"host": host, "port": port, "password": password},
         "onboarding_pending": True,
     }

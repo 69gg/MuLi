@@ -33,7 +33,7 @@ def test_interactive_settings_preserve_optional_wire_parameters() -> None:
     profile = result["models"]["main"]
     assert profile["max_output_tokens"] is None
     assert profile["context_window"] == 128000
-    assert result["limits"]["max_context_chars"] == 96000
+    assert result["limits"] == {}
     assert profile["thinking"] == {}
     assert profile["vision"] is True and profile["reasoning_effort"] == "high"
     assert profile["extra_body"] == {"vendor_budget": 4096}
