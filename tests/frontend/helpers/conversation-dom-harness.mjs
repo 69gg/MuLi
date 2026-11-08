@@ -11,11 +11,11 @@ const application = app.slice(app.indexOf("const ICONS ="), app.indexOf("\nfillI
 
 // Shared from conversation.test.mjs. Geometry remains deterministic text-sized
 // layout; the application still renders every conversation and dialog node.
-class TextNode {
+export class TextNode {
   constructor(text) { this.textContent = String(text); this.parentNode = null; }
 }
 
-class DOMElement {
+export class DOMElement {
   constructor(tag, document) {
     this.tagName = tag.toUpperCase(); this.document = document; this.parentNode = null; this.childNodes = [];
     this.dataset = {}; this.attributes = {}; this.events = {}; this.className = "";
@@ -140,6 +140,7 @@ export function harness({ realApprovals = false, interactive = false, handler = 
     createTextNode: (text) => new TextNode(text),
     createElement: (tag) => new DOMElement(tag, document),
     createElementNS: (_namespace, tag) => new DOMElement(tag, document),
+    createDocumentFragment: () => new DOMElement("#fragment", document),
   };
   document.body = document.createElement("body"); document.activeElement = document.body;
   document.querySelector = (selector) => document.body.querySelector(selector);

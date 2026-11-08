@@ -109,15 +109,28 @@ svg { display: block; width: 18px; height: 18px; flex: 0 0 auto; }
 .message-body p:last-child { margin-bottom: 0; }
 .message-body h2, .message-body h3, .message-body h4, .message-body h5 { font-size: 16px; font-weight: 600; margin: 22px 0 10px; color: var(--text); }
 .message-body h3 { font-size: 15px; }
-.message-body h4, .message-body h5 { font-size: 14px; }
+.message-body h4, .message-body h5, .message-body h6 { font-size: 14px; }
 .message-body ul, .message-body ol { padding-left: 22px; margin: 10px 0 16px; }
 .message-body li { padding-left: 2px; margin: 3px 0; }
+.message-body li > ul, .message-body li > ol { margin: 4px 0 6px; }
 .message-body blockquote { border-left: 2px solid #b3cdd8; margin: 14px 0; padding-left: 16px; color: var(--muted); }
+.message-body blockquote > :last-child { margin-bottom: 0; }
 .message-body a { color: var(--muted); text-underline-offset: 3px; }
+.message-body del { color: var(--muted); }
+.message-body hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
 .message-body code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .88em; background: var(--surface-2); padding: 2px 5px; border-radius: 4px; }
 .message-body pre { background: var(--surface-2); border: 1px solid var(--selected); border-radius: 9px; overflow-x: auto; padding: 16px 18px; line-height: 1.65; margin: 14px 0; position: relative; }
 .message-body pre[data-language]::before { content: attr(data-language); display: block; color: var(--muted); font-size: 10px; margin-bottom: 8px; }
-.message-body pre code { padding: 0; background: none; font-size: 12px; }
+.message-body pre code { padding: 0; background: none; font-size: 12px; white-space: pre; }
+.markdown-table-wrap { margin: 14px 0; overflow-x: auto; }
+.markdown-table { border-collapse: collapse; width: 100%; font-size: .92em; line-height: 1.7; }
+.markdown-table th, .markdown-table td { border: 1px solid var(--line); padding: 7px 11px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.markdown-table th { background: var(--surface-2); font-weight: 600; color: var(--text); white-space: nowrap; }
+.markdown-table code { white-space: pre-wrap; }
+.workflow-run-result .markdown-table-wrap { margin: 10px 0; }
+.workflow-run-result .markdown-table { font-size: 11px; }
+.workflow-run-result pre { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; padding: 10px 12px; line-height: 1.65; margin: 10px 0; }
+.workflow-run-result pre code { padding: 0; background: none; white-space: pre; }
 .message.streaming .message-body::after { content: ""; width: 5px; height: 13px; background: #6d97a8; display: inline-block; margin-left: 4px; border-radius: 1px; animation: blink 1.2s infinite; }
 .message-actions { display: flex; gap: 4px; margin-top: 7px; opacity: 0; transition: opacity .15s; }
 .message:hover .message-actions, .message:focus-within .message-actions { opacity: 1; }
