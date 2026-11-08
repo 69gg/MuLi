@@ -35,7 +35,7 @@ from muli.capability_catalog import CapabilityCatalog, CapabilityCatalogError
 from muli.channel_application import ChannelApplication
 from muli.channel_history import CHANNEL_HISTORY_PAGE_LIMIT
 from muli.channels import ChannelError
-from muli.config import ConfigFile, Settings, default_config_path, default_data_dir
+from muli.config import UNLIMITED, ConfigFile, Settings, default_config_path, default_data_dir
 from muli.conversation import MAX_EVENT_ID_CHARS
 from muli.evidence import EvidenceError
 from muli.extensions import ExtensionError
@@ -732,7 +732,9 @@ def _create_app(
         return {**message, "attachments": files}
 
     def visible_messages(session_id: str) -> list[dict[str, Any]]:
-        history = runtime.store.messages(session_id)
+        # A refresh or a different device must see the same durable history, not
+        # only the last page of it. The store still streams rows, never deltas.
+        history = runtime.store.messages(session_id, limit=UNLIMITED)
         delivered = {item["id"] for item in history}
         pending = runtime.conversation.pending(session_id)
         return [
@@ -1505,7 +1507,10 @@ def _create_app(
             raise KeyError(session_id)
         return {
             "session": session,
-            "messages": [decorated_message(item) for item in runtime.store.messages(session_id)],
+            "messages": [
+                decorated_message(item)
+                for item in runtime.store.messages(session_id, limit=UNLIMITED)
+            ],
             "events": runtime.store.recent_events(session_id, 3000),
         }
 
