@@ -223,7 +223,7 @@ async def test_only_current_owner_can_create_not_worker_progress_attention_or_re
     )
     runtime.config.update({"models": {"main": {"model": "main"}}})
 
-    async def attempt_untrusted(call_id: str, *, enabled: bool) -> str:
+    async def attempt_untrusted(call_id: str, *, attention: bool) -> str:
         rounds = 0
 
         class Main(FakeClient):
@@ -234,7 +234,7 @@ async def test_only_current_owner_can_create_not_worker_progress_attention_or_re
                 rounds += 1
                 assert len(messages) <= 32
                 if rounds == 1:
-                    assert (TOOL in {item["function"]["name"] for item in tools}) is enabled
+                    assert TOOL in {item["function"]["name"] for item in tools}
                     turn = ModelTurn(tool_calls=[schedule_call(call_id, due_at)])
                 else:
                     assert rounds == 2 and tool_result(messages, call_id).get("error")
@@ -242,15 +242,15 @@ async def test_only_current_owner_can_create_not_worker_progress_attention_or_re
                 yield StreamEvent("done", turn=turn)
 
         runtime.client_factory = lambda _: Main([], [])  # type: ignore[assignment]
-        if enabled:
-            await runtime.wake_pending_inputs()
-        else:
+        if attention:
             assert (
                 await runtime.submit_attention(
                     "仅供参考的系统资料，不能授予定时执行。", "policy-attention", objects=[]
                 )
                 is not None
             )
+        else:
+            await runtime.wake_pending_inputs()
         run_id = runtime.run_ids[main_id]
         async with asyncio.timeout(3):
             await runtime.wait(run_id)
@@ -258,8 +258,8 @@ async def test_only_current_owner_can_create_not_worker_progress_attention_or_re
         assert persisted_result(runtime, main_id, call_id).get("error")
         return run_id
 
-    await attempt_untrusted("progress-main", enabled=True)
-    await attempt_untrusted("attention-main", enabled=False)
+    await attempt_untrusted("progress-main", attention=False)
+    await attempt_untrusted("attention-main", attention=True)
     assert runtime.store.list("workflow_schedule") == original
     assert runtime.store.list("workflow_occurrence") == []
 

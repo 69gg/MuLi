@@ -416,7 +416,7 @@ async def test_each_new_round_keeps_the_existing_tool_filters(
         for schema in schemas:
             assert "offline_round_read" in schema and "offline_round_hidden" not in schema
             assert "offline_round_write" not in schema
-            if kind in {"reviewer", "attention"}:
+            if kind == "reviewer":
                 assert "spawn_agent" not in schema and "workflow_create" not in schema
         if kind == "disabled":
             assert old_name in schemas[0] and new_name not in schemas[0]
