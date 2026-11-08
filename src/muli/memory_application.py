@@ -738,7 +738,8 @@ class MemoryApplication:
                 runtime._guard_request(request, "read")
 
         check()
-        if len(self._comparisons) >= runtime.config.settings.limits.max_parallel_agents:
+        comparison_limit = runtime.config.settings.limits.max_parallel_agents
+        if comparison_limit > 0 and len(self._comparisons) >= comparison_limit:
             raise EvidenceError("comparison_busy", "本地比较容量已满，请等当前比较结束")
         with runtime.maintenance.admission.operation():
             task = asyncio.create_task(

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from muli.config import UNLIMITED
+
 from muli.integrations.attention import (
     MESSAGE_TYPES,
     ChiliarchAttentionError,
@@ -247,7 +249,7 @@ class IntegrationManager:
             "execution_mode": "managed",
             "state": "busy" if self._active else "idle",
             "active_task_ids": list(self._active),
-            "capacity": self.runtime.config.settings.limits.max_parallel_agents,
+            "capacity": self.runtime.config.settings.limits.max_parallel_agents or UNLIMITED,
             "queued_tasks": len(self._records("chiliarch_task", state="queued")),
             "adapter": "muli",
             "supports_resume": False,
@@ -457,7 +459,9 @@ class IntegrationManager:
                 break
             if self.last_error:
                 continue
-            capacity = self.runtime.config.settings.limits.max_parallel_agents - len(self._active)
+            capacity = (
+                self.runtime.config.settings.limits.max_parallel_agents or UNLIMITED
+            ) - len(self._active)
             for record in self._records("chiliarch_task", state="queued")[: max(0, capacity)]:
                 identifier = record["id"]
                 if identifier in self._active:

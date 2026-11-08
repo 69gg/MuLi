@@ -28,6 +28,9 @@ class Section(BaseModel):
 
 
 SECRET_PLACEHOLDER = "••••"
+# Sentinel used where an internal API needs a concrete integer but the owner
+# configured 0 (unlimited). It is far above any real workload.
+UNLIMITED = 2**31 - 1
 # The auto reviewer receives the review prompt and one tool call, never the
 # conversation. A model only needs to hold this bounded request, not the full
 # limits.max_context_chars budget.
@@ -367,9 +370,11 @@ class UpdateSettings(Section):
 
 
 class Limits(Section):
-    max_parallel_agents: int = Field(default=2, ge=1)
-    review_parallel: int = Field(default=1, ge=1, le=16)
-    safety_max_agents: int = Field(default=8, ge=1)
+    # 0 means unlimited for the runtime budgets below. Explicit positive values
+    # still work as operator-set caps.
+    max_parallel_agents: int = Field(default=0, ge=0)
+    review_parallel: int = Field(default=0, ge=0)
+    safety_max_agents: int = Field(default=0, ge=0)
     max_pending_runs: int = Field(default=8, ge=1)
     # 0 means unlimited: the model keeps its tools until it stops calling them.
     max_tool_steps: int = Field(default=0, ge=0)

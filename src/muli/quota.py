@@ -12,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from muli.config import UNLIMITED
+
 Key = tuple[str, str, str]
 
 
@@ -46,7 +48,8 @@ class QuotaBroker:
             self._listeners.append(listener)
 
     def _limit_value(self) -> int:
-        return max(1, int(self._limit()))
+        value = int(self._limit())
+        return value if value > 0 else UNLIMITED
 
     @property
     def used(self) -> int:

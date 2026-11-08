@@ -31,7 +31,7 @@ from muli.compaction_pins import (
     owner_constraint_pins,
     snapshot_pins,
 )
-from muli.config import ConfigFile, ModelProfile, Settings, default_home
+from muli.config import UNLIMITED, ConfigFile, ModelProfile, Settings, default_home
 from muli.context import (
     ContextLimitError,
     context_size,
@@ -1952,7 +1952,7 @@ class Runtime:
             self.store,
             self.bus,
             self.run_step,
-            max_parallel=self.config.settings.limits.max_parallel_agents,
+            max_parallel=self.config.settings.limits.max_parallel_agents or UNLIMITED,
             max_steps=self.config.settings.limits.max_workflow_steps,
             timeout=self.config.settings.limits.max_run_seconds,
             max_output_chars=self.config.settings.limits.max_output_chars,
@@ -2567,8 +2567,10 @@ class Runtime:
 
     def configure(self) -> None:
         settings = self.config.settings
-        self.capacity = asyncio.Semaphore(settings.limits.max_parallel_agents)
-        self.review_capacity = asyncio.Semaphore(settings.limits.review_parallel)
+        self.capacity = asyncio.Semaphore(
+            settings.limits.max_parallel_agents or UNLIMITED
+        )
+        self.review_capacity = asyncio.Semaphore(settings.limits.review_parallel or UNLIMITED)
         self.permissions = Permissions(
             self.store,
             self.bus,

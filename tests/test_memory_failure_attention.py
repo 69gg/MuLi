@@ -611,6 +611,8 @@ async def test_forgetting_while_waiting_for_capacity_never_enters_model_stream(
     tmp_path: Path,
 ) -> None:
     runtime, seen = make_runtime(tmp_path, [])
+    runtime.config.update({"limits": {"max_parallel_agents": 2}})
+    runtime.configure()
     inbox, pipeline = components(runtime)
     entered = asyncio.Event()
 
