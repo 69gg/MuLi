@@ -124,7 +124,9 @@ async def test_real_json_budget_keeps_a_complete_unit_then_restores_both_streams
         material_index = next(
             index for index, message in enumerate(request) if MEMORY_HEADING in message.content
         )
-        assert all(message.role in {"system", "developer"} for message in request[:material_index])
+        # 记忆资料随本轮查询变化，位于持久历史之后、最新输入之前；它本身仍是系统资料。
+        assert request[material_index].role in {"system", "developer"}
+        assert request[material_index + 1].role == "user"
         for item in memory_records(request):
             original = originals[item["id"]]
             assert original is not None
