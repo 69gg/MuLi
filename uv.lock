@@ -678,7 +678,7 @@ wheels = [
 
 [[package]]
 name = "muli-agent"
-version = "2.154.0"
+version = "2.155.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
