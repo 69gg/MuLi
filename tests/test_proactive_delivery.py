@@ -459,14 +459,10 @@ async def test_real_runtime_sends_only_explicit_text_and_tokens_remain_streamed(
         await application.start()
         await update(runtime, independent=True)
         await inbox.start()
-        await eventually(lambda: bool(runtime.permissions.pending))
-        approval_id = next(iter(runtime.permissions.pending))
-        approval = runtime.store.get("approval", approval_id)
-        assert approval is not None and approval["tool"] == "channel_send"
-        assert approval["risk"] == "external" and sent == []
-        await runtime.permissions.resolve(approval_id, "approve")
         await wait_for_reply(runtime, "核实后的完整报告")
         await eventually(lambda: len(sent) == 1 and not runtime.tasks)
+        # auto mode lets a reviewed channel_send run without a second owner prompt.
+        assert not runtime.permissions.pending
         replies = [
             m
             for m in runtime.store.messages(runtime.main_session()["id"])
