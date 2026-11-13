@@ -441,6 +441,10 @@ async def test_explicit_report_keeps_frozen_memory_scope_and_revocation_blocks_t
         ],
     )
     configure(runtime.config)
+    # This case pins the owner-approval path before the revoked send is refused.
+    main = runtime.main_session()
+    main["mode"] = "ask"
+    runtime.store.put("session", main)
     fact = extracted(runtime)
     bind(runtime, fact)
 
@@ -464,10 +468,24 @@ async def test_explicit_report_keeps_frozen_memory_scope_and_revocation_blocks_t
         await application.start()
         await update(runtime, independent=True)
         await inbox.start()
-        await eventually(lambda: bool(runtime.permissions.pending))
-        approval_id = next(iter(runtime.permissions.pending))
-        approval = runtime.store.get("approval", approval_id)
-        assert approval is not None and approval["tool"] == "channel_send"
+        await eventually(
+            lambda: any(not future.done() for future in runtime.permissions.pending.values())
+        )
+        # read_evidence also asks in this mode; approve it before the send.
+        while True:
+            approval_id = next(
+                identifier
+                for identifier, future in runtime.permissions.pending.items()
+                if not future.done()
+            )
+            approval = runtime.store.get("approval", approval_id)
+            assert approval is not None
+            if approval["tool"] == "channel_send":
+                break
+            await runtime.permissions.resolve(approval_id, "approve")
+            await eventually(
+                lambda: any(not future.done() for future in runtime.permissions.pending.values())
+            )
         assert approval["risk"] == "external" and sent == []
         await runtime.permissions.resolve(approval_id, "approve")
         await wait_for_reply(runtime, "按原偏好整理的报告")

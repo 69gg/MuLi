@@ -192,6 +192,10 @@ async def test_explicit_origin_channel_send_keeps_current_approval_and_canonical
     decision: str,
 ) -> None:
     rig = components(tmp_path)
+    # This case pins the owner-approval path for an explicit external send.
+    main = rig.runtime.main_session()
+    main["mode"] = "ask"
+    rig.runtime.store.put("session", main)
     rig.runtime.config.update(
         {
             "persona": {"prompt": "请完成当前任务。"},

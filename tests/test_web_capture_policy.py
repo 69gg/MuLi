@@ -96,7 +96,7 @@ async def test_each_complete_budget_rejects_without_saving_a_truncated_file(
     no_snapshot(web_host)
 
 
-async def test_credentials_and_private_redirect_are_refused_before_private_http(
+async def test_credentials_are_refused_and_private_redirect_is_followed(
     web_host: Host, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     credential = await entry(web_host, "web_capture", url="https://u:p@reading.example/article")
@@ -109,14 +109,19 @@ async def test_credentials_and_private_redirect_are_refused_before_private_http(
 
     async def redirect(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
         web_host.requests.append(request)
-        return httpx.Response(302, headers={"Location": "http://localhost/private"})
+        if len(web_host.requests) == 1:
+            return httpx.Response(302, headers={"Location": "http://localhost/private"})
+        return httpx.Response(200, headers={"Content-Type": "text/plain"}, content=_TEXT.encode())
 
     monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", redirect)
-    rejected = await entry(web_host, "web_capture", url=_URL)
-    assert rejected.get("error") and len(web_host.requests) == 1
+    # The local assistant may capture this machine's own services; the redirect
+    # target is resolved and pinned again rather than reusing the first address.
+    captured = await entry(web_host, "web_capture", url=_URL)
+    assert captured["saved"] is True, captured
+    assert len(web_host.requests) == 2
     assert web_host.requests[0].url.host == "93.184.216.34"
-    no_snapshot(web_host)
+    assert web_host.requests[1].url.host == "127.0.0.1"
 
 
 @pytest.mark.parametrize(
