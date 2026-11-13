@@ -149,6 +149,64 @@ async def test_auto_independent_review_allows_read(tmp_path: Path) -> None:
         await runtime.close()
 
 
+async def test_auto_review_allows_destructive_tools_without_owner_approval(tmp_path: Path) -> None:
+    target = tmp_path / "old.txt"
+    target.write_text("old")
+    runtime, _ = make_runtime(
+        tmp_path,
+        [
+            ModelTurn(tool_calls=[ToolCall("c1", "fs_trash", json.dumps({"path": str(target)}))]),
+            ModelTurn(content="已清理"),
+        ],
+    )
+    try:
+        session = runtime.new_session(mode="auto")
+        await runtime.start(session["id"], "把 old.txt 移进回收站")
+        await runtime.tasks[session["id"]]
+        assert not target.exists()
+        assert not runtime.permissions.pending
+        assert any(e["type"] == "tool.reviewed" for e in runtime.store.events())
+    finally:
+        await runtime.close()
+
+
+async def test_auto_reviewer_sees_the_owner_goal(tmp_path: Path) -> None:
+    path = tmp_path / "report.txt"
+    runtime, seen = make_runtime(tmp_path, [])
+    turns = [
+        ModelTurn(
+            tool_calls=[
+                ToolCall("c1", "fs_write", json.dumps({"path": str(path), "content": "ok"}))
+            ]
+        ),
+        ModelTurn(content="完成"),
+    ]
+    prompts: list[list[Message]] = []
+
+    class ReviewClient(FakeClient):
+        async def complete(
+            self,
+            messages: list[Message],
+            tools: Any = (),
+            *,
+            attempt_guard: Callable[[], None] | None = None,
+        ) -> ModelTurn:
+            prompts.append(list(messages))
+            return ModelTurn(content='{"allow":true,"reason":"符合当前目标"}')
+
+    runtime.client_factory = lambda config: ReviewClient(turns, seen)  # type: ignore[assignment]
+    try:
+        session = runtime.new_session(mode="auto")
+        await runtime.start(session["id"], "把结论写进 report.txt")
+        await runtime.tasks[session["id"]]
+        assert path.read_text() == "ok"
+        assert prompts
+        reviewed = json.loads(prompts[0][1].content or "{}")
+        assert "把结论写进 report.txt" in json.dumps(reviewed["conversation"], ensure_ascii=False)
+    finally:
+        await runtime.close()
+
+
 async def test_invalid_tool_arguments_never_run(tmp_path: Path) -> None:
     runtime, seen = make_runtime(
         tmp_path,

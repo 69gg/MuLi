@@ -12,7 +12,7 @@
 
 ## 一个已接纳操作的权限边界
 
-取回、校验和一次保存属于同一个明确的 `risk=external` 操作；描述和审批参数须说明它会进行远端请求与本地持久保存。现权限模型只有单个 risk，external 在 auto 模式也不因独立审查通过而自动放行；yolo 仍是现有显式策略。不得降为 read/write 或新造复合 risk。复用 reviewer、Attention、main 协调工具、disabled 和最终无工具轮的现有过滤，不额外授予主会话调用资格。
+取回、校验和一次保存属于同一个明确的 `risk=external` 操作；描述和审批参数须说明它会进行远端请求与本地持久保存。现权限模型只有单个 risk；auto 模式下独立审查通过即可放行，审查会带上主人当前目标作为判断依据。yolo 仍是现有显式策略。不得降为 read/write 或新造复合 risk。复用 reviewer、Attention、main 协调工具、disabled 和最终无工具轮的现有过滤，不额外授予主会话调用资格。
 
 工具由应用组合层注入现有附件保存能力；MCPManager 不导入 Runtime、LocalServices 或 Attachments。可使用一个有类型的可选保存回调，未装配时不提供保存入口；回调只复用同一个 `Attachments.save(source="mcp")`。依赖随 Runtime 重新配置重新装配，不保留指向旧 Store 的回调，也不新建 manager 或 writer。
 

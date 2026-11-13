@@ -117,7 +117,7 @@ class Permissions:
                     allowed, reason = await self.review(tool, arguments, risk)
             except Exception:  # noqa: BLE001 - review failures always require user approval
                 allowed, reason = False, "独立审查暂不可用"
-            if allowed and risk not in {"destructive", "external", "computer"}:
+            if allowed:
                 await self.bus.emit(
                     "tool.reviewed",
                     {
