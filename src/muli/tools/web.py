@@ -46,7 +46,7 @@ class PageText:
     downloaded_bytes: int
 
 
-async def public_url(url: str) -> tuple[httpx.URL, str, str]:
+async def public_url(url: str, *, allow_private: bool = False) -> tuple[httpx.URL, str, str]:
     parsed = urlparse(url)
     if (
         parsed.scheme not in {"http", "https"}
@@ -54,14 +54,18 @@ async def public_url(url: str) -> tuple[httpx.URL, str, str]:
         or parsed.username
         or parsed.password
     ):
-        raise ValueError("仅允许公开 HTTP(S) 页面")
+        raise ValueError("仅允许 HTTP(S) 页面")
     addresses = await asyncio.get_running_loop().getaddrinfo(
         parsed.hostname,
         parsed.port or (443 if parsed.scheme == "https" else 80),
         type=socket.SOCK_STREAM,
     )
-    if not addresses or any(
-        not ipaddress.ip_address(address[4][0]).is_global for address in addresses
+    # The reader is a local assistant: it may read this machine's own services.
+    # Channel attachment downloads still pass allow_private=False because their
+    # URLs come from untrusted message text.
+    if not addresses or (
+        not allow_private
+        and any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses)
     ):
         raise ValueError("网页读取不允许访问本机、内网或保留地址")
     original = httpx.URL(url)
@@ -158,7 +162,7 @@ class Web:
                     parsed = urlparse(url)
                     if parsed.username is not None or parsed.password is not None:
                         raise ValueError("网页留存不接受带凭据的 URL，包括空凭据")
-                target, host, tls_hostname = await public_url(url)
+                target, host, tls_hostname = await public_url(url, allow_private=True)
                 check()
                 if strict_utf8:
                     # A capture is a public static response, never a cookie session.

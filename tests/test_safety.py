@@ -274,16 +274,17 @@ def test_fetch_redirect_revalidates_destination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        requests = 0
+        requests: list[httpx.Request] = []
 
         async def resolve(host: str, *_: Any, **__: Any) -> list[tuple[Any, ...]]:
             ip = "127.0.0.1" if host == "localhost" else "93.184.216.34"
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 80))]
 
-        def handle(_: httpx.Request) -> httpx.Response:
-            nonlocal requests
-            requests += 1
-            return httpx.Response(302, headers={"Location": "http://localhost/private"})
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(302, headers={"Location": "http://localhost/private"})
+            return httpx.Response(200, headers={"Content-Type": "text/plain"}, text="local content")
 
         client_class = httpx.AsyncClient
         monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
@@ -292,9 +293,13 @@ def test_fetch_redirect_revalidates_destination(
             "AsyncClient",
             lambda **kwargs: client_class(transport=httpx.MockTransport(handle), **kwargs),
         )
-        with pytest.raises(ValueError, match="内网"):
-            await web.Web(Settings()).fetch({"url": "https://example.org/"})
-        assert requests == 1
+        # The local assistant may read this machine's own services; the redirect
+        # target is still resolved and pinned again instead of reusing the first IP.
+        result = await web.Web(Settings()).fetch({"url": "https://example.org/"})
+        assert result["content"] == "local content"
+        assert len(requests) == 2
+        assert requests[1].url.host == "127.0.0.1"
+        assert requests[1].headers["host"] == "localhost"
 
     asyncio.run(scenario())
 
