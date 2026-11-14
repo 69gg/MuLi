@@ -68,14 +68,20 @@
       "model": "填写语音模型ID",
       "base_url": "https://provider.example/v1",
       "api_key_env": "MULI_TTS_KEY",
-      "voice": "填写服务支持的音色",
-      "response_format": "mp3"
+      "api": "audio",
+      "voice": "可留空，由服务默认",
+      "response_format": "mp3",
+      "tags_enabled": false
     }
   }
 }
 ```
 
-要发到渠道，应另行明确要求发送。沐璃可用 `channel_send` 将附件作为原生语音发送，仍需准确、已授权的目标，并遵守原审批规则：
+`api` 默认 `audio`，使用 OpenAI 标准 `POST /v1/audio/speech`。若服务只在 chat completions 里返回音频（例如小米 mimo-v2.5-tts），改为 `"api": "chat"`：自然语言语气放在 `user` 消息，待朗读文本放在 `assistant` 消息，响应中的 base64 音频会被解码保存。`voice` 为空时不发送音色字段。
+
+`tags_enabled=true` 时，提示词会告诉沐璃可以在文本开头使用 `(风格)` 标签；标签只是示例，不写死列表。自然语言语气仍通过 `style` 参数传入。标签是否被服务理解取决于服务本身，不保证生效。
+
+在渠道里，`voice_speak` 会直接回复本轮真实私聊的原生语音；也可以显式调用 `channel_send` 控制目标与发送方式，仍需准确、已授权的目标，并遵守原审批规则：
 
 - Telegram 支持 MP3、M4A、Ogg/Opus。
 - OneBot 需远端确认支持发送录音。

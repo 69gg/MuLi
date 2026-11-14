@@ -288,11 +288,18 @@ class HTTPServiceProfile(Section):
         return bool(self.model and self.base_url)
 
 
+class TTSServiceProfile(HTTPServiceProfile):
+    """OpenAI audio endpoint by default; chat mode follows chat-completions TTS."""
+
+    api: Literal["audio", "chat"] = "audio"
+    tags_enabled: bool = False
+
+
 class MediaSettings(Section):
     embedding: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
     reranker: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
     asr: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
-    tts: HTTPServiceProfile = Field(default_factory=HTTPServiceProfile)
+    tts: TTSServiceProfile = Field(default_factory=TTSServiceProfile)
 
 
 class Persona(Section):

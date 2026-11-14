@@ -386,7 +386,7 @@ async def test_tts_voice_format_speed_and_instructions(
 
 
 @pytest.mark.asyncio
-async def test_tts_omits_unset_parameters_and_requires_voice() -> None:
+async def test_tts_omits_unset_parameters_and_allows_empty_voice() -> None:
     requests: list[JsonObject] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -395,11 +395,97 @@ async def test_tts_omits_unset_parameters_and_requires_voice() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         media = MediaService(MediaConfig(tts=service_config()), client=http)
-        with pytest.raises(ProviderError, match="音色"):
-            await media.synthesize("你好")
-        assert not requests
+        await media.synthesize("你好")
+        assert requests[0] == {
+            "model": "service-model",
+            "input": "你好",
+            "response_format": "mp3",
+        }
         await media.synthesize("你好", "custom-voice")
-        assert "speed" not in requests[0] and "instructions" not in requests[0]
+        assert requests[1]["voice"] == "custom-voice"
+        assert "speed" not in requests[1] and "instructions" not in requests[1]
+
+
+@pytest.mark.asyncio
+async def test_chat_tts_puts_style_in_user_and_text_in_assistant() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "audio": {"data": base64.b64encode(AUDIO).decode("ascii")},
+                        }
+                    }
+                ]
+            },
+        )
+
+    config = service_config(api="chat", voice="", response_format="mp3")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        media = MediaService(MediaConfig(tts=config), client=http)
+        speech = await media.synthesize("(开心)今天很棒", style="轻快上扬")
+    assert requests[0].url.path == "/v1/chat/completions"
+    body = json.loads(requests[0].content)
+    assert body["messages"] == [
+        {"role": "user", "content": "轻快上扬"},
+        {"role": "assistant", "content": "(开心)今天很棒"},
+    ]
+    assert "audio" not in body
+    assert speech.data == AUDIO and speech.mime_type == "audio/wav"
+    assert speech.extension == ".wav"
+
+
+@pytest.mark.asyncio
+async def test_chat_tts_sends_voice_and_reads_data_uri_content() -> None:
+    requests: list[JsonObject] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        encoded = base64.b64encode(AUDIO).decode("ascii")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": f"data:audio/wav;base64,{encoded}",
+                        }
+                    }
+                ]
+            },
+        )
+
+    config = service_config(api="chat", voice="mimo-voice", response_format="mp3")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        media = MediaService(MediaConfig(tts=config), client=http)
+        speech = await media.synthesize("你好", style="温柔")
+    assert requests[0]["audio"] == {"voice": "mimo-voice", "format": "mp3"}
+    assert speech.data == AUDIO and speech.mime_type == "audio/wav"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,error",
+    [
+        ({}, "choices"),
+        ({"choices": [{"message": {"role": "assistant"}}]}, "音频数据"),
+        ({"choices": [{"message": {"audio": {"data": "not base64!"}}}]}, "base64"),
+    ],
+)
+async def test_chat_tts_rejects_missing_or_invalid_audio(payload: JsonObject, error: str) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    ) as http:
+        media = MediaService(MediaConfig(tts=service_config(api="chat")), client=http)
+        with pytest.raises(ProviderError, match=error):
+            await media.synthesize("你好")
 
 
 @pytest.mark.asyncio

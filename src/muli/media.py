@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import math
 from collections.abc import Sequence
@@ -78,6 +80,8 @@ class ServiceConfig:
     instructions: str = ""
     document_instruction: str = ""
     query_extra_body: JsonObject = field(default_factory=dict)
+    api: str = "audio"
+    tags_enabled: bool = False
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.base_url)
@@ -112,6 +116,8 @@ class ServiceConfig:
             not math.isfinite(self.speed) or not 0.25 <= self.speed <= 4
         ):
             raise ValueError("语速必须在 0.25 到 4 之间或使用 null 省略")
+        if self.api not in {"audio", "chat"}:
+            raise ValueError("TTS api 只支持 audio 或 chat")
 
     def to_dict(self, *, include_secrets: bool = False) -> JsonObject:
         result: JsonObject = asdict(self)
@@ -168,6 +174,50 @@ def _number(value: Any) -> float:
     if not math.isfinite(number):
         raise ProviderError("媒体模型返回非有限数值")
     return number
+
+
+def _speech_type(data: bytes) -> tuple[str, str] | None:
+    """Recognize the common containers so chat TTS can return wav or mp3 freely."""
+    if data.startswith(b"ID3"):
+        return "audio/mpeg", ".mp3"
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xF6) == 0xF0:
+        return "audio/aac", ".aac"
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return "audio/mpeg", ".mp3"
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WAVE":
+        return "audio/wav", ".wav"
+    if data.startswith(b"OggS"):
+        return "audio/ogg", ".opus"
+    if data.startswith(b"fLaC"):
+        return "audio/flac", ".flac"
+    return None
+
+
+def _base64_audio(value: str) -> bytes:
+    text = value.strip()
+    if text.startswith("data:"):
+        _, _, text = text.partition(",")
+    try:
+        return base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        raise ProviderError("TTS 返回的音频不是有效 base64") from None
+
+
+def _chat_audio(value: Any) -> bytes:
+    choices = value.get("choices") if isinstance(value, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ProviderError("TTS chat 响应缺少 choices")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ProviderError("TTS chat 响应缺少 message")
+    audio = message.get("audio")
+    data = audio.get("data") if isinstance(audio, dict) else audio
+    if isinstance(data, str) and data.strip():
+        return _base64_audio(data)
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return _base64_audio(content)
+    raise ProviderError("TTS chat 响应缺少音频数据")
 
 
 def _image_type(data: bytes) -> str | None:
@@ -516,24 +566,61 @@ class MediaService:
             raise ProviderError("ASR 返回结果缺少 text")
         return text
 
-    async def synthesize(self, text: str, voice: str | None = None) -> SpeechResult:
+    async def synthesize(
+        self, text: str, voice: str | None = None, style: str = ""
+    ) -> SpeechResult:
         config = self._service("tts")
-        selected_voice = config.voice if voice is None else voice
-        if not text.strip() or not selected_voice.strip():
-            raise ProviderError("TTS 需要非空文本和显式配置的音色")
+        if not text.strip():
+            raise ProviderError("TTS 需要非空文本")
         if config.response_format not in _SPEECH_FORMATS:
             raise ProviderError("TTS response_format 不支持")
-        body = self._body(config, {"input", "voice", "response_format", "stream_format"})
-        body.update(input=text, voice=selected_voice, response_format=config.response_format)
+        selected_voice = (config.voice if voice is None else voice).strip()
+        if config.api == "chat":
+            return await self._synthesize_chat(config, text, selected_voice, style)
+        body = self._body(
+            config, {"input", "voice", "response_format", "stream_format", "instructions", "speed"}
+        )
+        body.update(input=text, response_format=config.response_format)
+        if selected_voice:
+            body["voice"] = selected_voice
         if config.speed is not None:
             body["speed"] = config.speed
-        if config.instructions:
-            body["instructions"] = config.instructions
+        instructions = style.strip() or config.instructions
+        if instructions:
+            body["instructions"] = instructions
         data = await self._send(config, "/audio/speech", body, audio_output=config.response_format)
         if not data:
             raise ProviderError("TTS 返回空音频")
         mime_type, extension = _SPEECH_FORMATS[config.response_format]
         return SpeechResult(data, mime_type, extension)
+
+    async def _synthesize_chat(
+        self, config: ServiceConfig, text: str, voice: str, style: str
+    ) -> SpeechResult:
+        """Chat-completions TTS keeps the style direction in user and the text in assistant."""
+        direction = (
+            style.strip()
+            or config.instructions.strip()
+            or "请用自然、清晰、适合口语的语气朗读下面这段文字。"
+        )
+        body = self._body(config, {"messages", "modalities", "audio", "stream"})
+        body.update(
+            messages=[
+                {"role": "user", "content": direction},
+                {"role": "assistant", "content": text},
+            ]
+        )
+        if voice:
+            body["audio"] = {"voice": voice, "format": config.response_format}
+        data = await self._send(config, "/chat/completions", body)
+        audio = _chat_audio(_json_value(data))
+        if not audio:
+            raise ProviderError("TTS 返回空音频")
+        detected = _speech_type(audio)
+        mime_type, extension = (
+            detected if detected is not None else _SPEECH_FORMATS[config.response_format]
+        )
+        return SpeechResult(audio, mime_type, extension)
 
 
 __all__ = [
