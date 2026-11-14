@@ -3,6 +3,11 @@
   "baseline": "2.0.0",
   "releases": [
     {
+      "version": "2.158.1",
+      "status": "released",
+      "tag": "v2.158.1"
+    },
+    {
       "version": "2.158.0",
       "status": "released",
       "tag": "v2.158.0"
