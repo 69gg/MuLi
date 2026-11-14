@@ -201,8 +201,6 @@ RestartSec=5
 TimeoutStopSec=15
 UMask=0077
 NoNewPrivileges=true
-MemoryMax=512M
-CPUQuota=50%
 TasksMax=64
 Environment=PYTHONUNBUFFERED=1
 

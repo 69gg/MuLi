@@ -19,8 +19,8 @@ def test_systemd_literal_arguments_escape_percent_and_dollar(tmp_path: Path) -> 
     service = UserService(path, tmp_path / "data", platform="linux")
     rendered = service.render()
     assert "$${HOME} %%i" in rendered
-    assert "MemoryMax=512M" in rendered
-    assert "CPUQuota=50%" in rendered
+    assert "MemoryMax" not in rendered and "CPUQuota" not in rendered
+    assert "TasksMax=64" in rendered
     assert "WantedBy=default.target" in rendered
     assert quote_unit('a"b\\c') == '"a\\"b\\\\c"'
     with pytest.raises(ValueError):

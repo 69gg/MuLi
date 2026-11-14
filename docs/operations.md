@@ -112,6 +112,6 @@ MuLi --config "/绝对路径/config.json" --data-dir "/绝对路径/data" serve
 | 配置、更新或重启停在恢复阶段 | 先运行 `MuLi management status` 查看；按[恢复操作](linux-recovery-operations.md)接续。宿主不在运行时可用 `MuLi management recover`，不要反复新建相同操作。 |
 | 某次任务失败 | 在工作台保留运行 ID，请沐璃查询故障位置；参见[故障诊断](failure-diagnostics.md)。 |
 
-默认前台模型执行并发为 2，每次运行最长 600 秒、最多 16 次工具调用；可在执行预算中调整。systemd 用户服务另有默认的 512 MiB 内存、50% CPU 和 64 个任务限制。提高应用预算不会自动提高系统服务限制。
+默认前台模型执行并发为 2，每次运行最长 600 秒、最多 16 次工具调用；可在执行预算中调整。systemd 用户服务不再设置内存或 CPU 上限，仅保留 64 个任务限制；已有服务需重新执行服务安装才会重写单元文件。
 
 电脑操作、截图和录屏依赖当前桌面与授权；语音默认关闭，还需要相应录音、声学组件与 ASR/TTS 配置。按需阅读[电脑操作](computer.md)、[平台支持](platforms.md)、[语音](voice.md)、[提醒与主动事项](attention.md)及[桌面通知](notifications.md)。
