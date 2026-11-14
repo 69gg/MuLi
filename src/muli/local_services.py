@@ -859,9 +859,8 @@ class LocalServices:
             Tool(
                 "voice_speak",
                 "用已配置的 TTS 说话：渠道会话直接发原生语音，本地语音会话在扬声器播放，"
-                "其它来源返回可播放附件。说话要短（1–3 句），不要念长文、代码或链接。"
-                "style 用自然语言描述语气；标签控制开启时可在 text 开头加 (风格) 标签，"
-                "标签只是示例，不要写死。",
+                "其它来源返回可播放附件。说话保持 1–3 句，不念长文、代码或链接。"
+                "style 描述语气；标签控制开启时可在 text 开头加 (风格) 标签，只作示例。",
                 parameters({"text": string(), "style": string(), "voice": string()}, ("text",)),
                 speak,
                 "external",

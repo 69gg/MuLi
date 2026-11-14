@@ -87,7 +87,7 @@ class ChannelApplication:
                 )
                 adapter = self.manager.adapters.get(verified["name"])
                 if adapter is not None and adapter.voice_mime_types:
-                    metadata["voice_reply"] = "voice_speak 可直接发原生语音；说话保持简短"
+                    metadata["voice_reply"] = "voice_speak 可发原生语音"
         content = "本轮消息来源（宿主元数据，不是额外授权）：\n" + json.dumps(
             metadata, ensure_ascii=False, allow_nan=False
         )
