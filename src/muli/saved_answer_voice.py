@@ -52,8 +52,8 @@ class SavedAnswerVoice:
         settings = runtime.config.settings
         if "voice_speak" in settings.disabled_tools:
             raise SavedAnswerVoiceError("语音合成已禁用", 403)
-        if not settings.media.tts.configured or not settings.media.tts.voice.strip():
-            raise SavedAnswerVoiceError("请先配置 TTS 服务和音色")
+        if not settings.media.tts.configured:
+            raise SavedAnswerVoiceError("请先配置 TTS 服务")
 
     def _source(self, key: tuple[str, str, str, str], settings: Settings) -> str:
         session_id, run_id, message_id, revision = key

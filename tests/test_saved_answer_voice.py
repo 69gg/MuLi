@@ -375,7 +375,7 @@ async def test_saved_speech_rejects_inexact_sources_and_strict_unconfirmed_input
             assert disabled.status_code == 200
             assert (await web.post(path, json=body)).status_code == 403
             enabled = await web.patch(
-                "/api/settings", json={"disabled_tools": [], "media": {"tts": {"voice": ""}}}
+                "/api/settings", json={"disabled_tools": [], "media": {"tts": {"model": ""}}}
             )
             assert enabled.status_code == 200
             assert (await web.post(path, json=body)).status_code == 409
