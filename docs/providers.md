@@ -93,7 +93,7 @@ Anthropic Messages 必须提供 `max_tokens`，因此已完整配置的 Anthropi
 | `embedding` | `/embeddings` | 可选的语义向量服务；维度和查询指令须与模型一致 |
 | `reranker` | `/rerank` | 可选的结果重排服务；这是兼容服务接口，不是 OpenAI 官方接口 |
 | `asr` | `/audio/transcriptions` | 录音转文字，可设置语言与服务支持的返回格式 |
-| `tts` | `/audio/speech` | 文字转语音，必须设置供应商支持的 `voice` |
+| `tts` | `/audio/speech` 或 `/chat/completions` | 文字转语音；`api` 默认 `audio`，`voice` 可留空由服务默认 |
 
 图片理解使用 `models.vision`，不在 `media` 下。上传图片不会自动调用视觉；显式要求看图时，优先使用已声明视觉能力的主模型，否则使用配置的独立视觉模型。
 
@@ -138,7 +138,7 @@ Anthropic Messages 必须提供 `max_tokens`，因此已完整配置的 Anthropi
 }
 ```
 
-TTS 默认格式为 `mp3`，也可按服务能力选择 `opus`、`aac`、`flac`、`wav` 或 `pcm`；PCM 是原始音频，不是 WAV 文件。可选速度范围为 0.25–4，留空不发送。ASR 的返回格式可按服务支持选择 `json`、`verbose_json`、`diarized_json`、`text`、`srt` 或 `vtt`。
+TTS 默认格式为 `mp3`，也可按服务能力选择 `opus`、`aac`、`flac`、`wav` 或 `pcm`；PCM 是原始音频，不是 WAV 文件。可选速度范围为 0.25–4，留空不发送。`voice` 留空时不发送音色字段，由服务使用默认音色。若服务只在 chat completions 中返回音频（例如小米 `mimo-v2.5-tts`），把 `api` 设为 `"chat"`：语气指导放在 `user` 消息，待朗读文本放在 `assistant` 消息，响应中的 base64 音频会被解码保存。`tags_enabled` 开启后，提示词会提示可用 `(风格)` 标签，但标签是否生效取决于服务。ASR 的返回格式可按服务支持选择 `json`、`verbose_json`、`diarized_json`、`text`、`srt` 或 `vtt`。
 
 这些 HTTP 能力包含在基础安装中，不需要另外安装视觉或语音模型包，也不会自动下载本地模型。网页录音、声学唤醒和渠道语音还需要相应配置与权限，见[语音说明](voice.md)。
 
