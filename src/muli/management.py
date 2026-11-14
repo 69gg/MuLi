@@ -79,12 +79,7 @@ class SelfManagement:
         )
         self.directory = runtime.data_dir / "management"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.updates = Updates(
-            runtime.config,
-            runtime.store,
-            runtime.bus,
-            managed=lambda: isinstance(runtime.maintenance.permit, ManagedBootPermit),
-        )
+        self.updates = Updates(runtime.config, runtime.store, runtime.bus)
         self.update_policy = CandidatePolicyStore(runtime.store)
         self.online_policy = OnlinePolicyStore(runtime.store)
         self.recovery = RecoveryHost(runtime, service, bound_address=bound_address)
@@ -155,19 +150,7 @@ class SelfManagement:
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         update = self.runtime.store.get("update", "latest")
         if update and update.get("available"):
-            if self.updates.candidate_configured():
-                instruction = (
-                    "已配置候选来源；先用self_update_preview核验；在线模式需提供目标version，"
-                    "将返回的expected_policy和expected_artifact原样用于self_update，"
-                    "经真实用户批准后准备和切换。依赖仍需本地材料。"
-                    "预览或批准均不代表候选已经安装或通过服务健康检查。"
-                )
-            else:
-                instruction = (
-                    "self_update仍须检查实际安装条件并经真实用户批准。"
-                    if self.updates.capability()["format_eligible"]
-                    else "此资料库需要托管候选更新；先配置来源并核验，不能用批准代替格式证据。"
-                )
+            instruction = "可以直接用 self_update 升级并重启；执行前须经真实用户批准。"
             # 版本资料只在发现更新时出现，属于易变提示；放到历史之后。
             messages = insert_before_latest_user(
                 messages,
@@ -204,11 +187,6 @@ class SelfManagement:
         if action != "configure" and changes:
             raise ValueError("只有配置操作接受配置变更")
         if action == "update":
-            if isinstance(self.runtime.maintenance.permit, ManagedBootPermit):
-                raise ValueError(
-                    "托管安装的跨版本更新必须使用 self_update 的 expected_policy，"
-                    "经 stage_update 转为候选 switch"
-                )
             self.updates.require_in_place_update()
         if apply_mode not in {"in_process", "restart_transaction"}:
             raise ValueError("未知配置应用方式")
@@ -1111,14 +1089,14 @@ class SelfManagement:
             ),
             Tool(
                 "self_update_configure",
-                "完整替换候选更新策略；先读取现值，省略项恢复默认。只保存策略，不安装或切换",
+                "可选的高级候选更新策略，一般更新不需要；只保存策略，不安装或切换",
                 CandidateSettings.model_json_schema(),
                 configure_update,
                 "write",
             ),
             Tool(
                 "self_update_online_configure",
-                "完整替换匿名在线候选策略；默认关闭。只保存策略，不下载；依赖仍需本地wheelhouse",
+                "可选的高级在线候选策略，一般更新不需要；默认关闭，只保存策略，不下载",
                 OnlineSettings.model_json_schema(),
                 configure_online,
                 "write",
@@ -1212,14 +1190,14 @@ class SelfManagement:
             ),
             Tool(
                 "self_update_preview",
-                "核验候选策略；在线模式须给精确version，仅取小元数据，返回同次审批需完整带回的expected_policy/expected_artifact",
+                "可选：预览候选策略并返回 expected_policy；直接更新一般不需要",
                 PreviewRequest.model_json_schema(),
                 preview_update,
                 preserve_output=True,
             ),
             Tool(
                 "self_update",
-                "更新并重启；托管安装须先preview，完整带回expected_policy及在线expected_artifact，依赖仍需本地材料；始终需真实用户批准",
+                "直接用 uv tool upgrade 更新并重启；始终需真实用户批准，失败时尝试回退到本地 wheel",
                 UpdateRequest.model_json_schema(),
                 update,
                 "external",

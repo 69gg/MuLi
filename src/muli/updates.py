@@ -5,9 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sqlite3
 import sys
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -40,11 +38,9 @@ def direct_environment() -> dict[str, str]:
 
 
 class UpdateCapability(TypedDict):
-    mode: Literal["in_place", "managed_switch"]
+    mode: Literal["in_place"]
     format_eligible: bool
-    code: Literal[
-        "installation_check_required", "verified_candidate_required", "format_verification_failed"
-    ]
+    code: Literal["installation_check_required"]
 
 
 class Updates:
@@ -53,34 +49,20 @@ class Updates:
         config: ConfigFile,
         store: Store,
         bus: EventBus,
-        *,
-        managed: Callable[[], bool] | None = None,
     ) -> None:
         self.config, self.store, self.bus = config, store, bus
-        self._managed = managed
 
     def capability(self) -> UpdateCapability:
-        """Format eligibility only; this neither inspects uv nor authorizes effects."""
-        try:
-            self.store.revalidate_format()
-        except (ValueError, sqlite3.Error):
-            return {
-                "mode": "managed_switch",
-                "format_eligible": False,
-                "code": "format_verification_failed",
-            }
-        marked = self.store.format_state is not None
-        managed = marked or self.candidate_configured()
+        """The owner always upgrades in place; the database marker is not a gate."""
         return {
-            "mode": "managed_switch" if managed else "in_place",
-            "format_eligible": not marked,
-            "code": "verified_candidate_required" if marked else "installation_check_required",
+            "mode": "in_place",
+            "format_eligible": True,
+            "code": "installation_check_required",
         }
 
     def require_in_place_update(self) -> None:
-        capability = self.capability()
-        if not capability["format_eligible"]:
-            raise ValueError(capability["code"])
+        """Kept as the single update admission point; it no longer blocks."""
+        return
 
     def candidate_configured(self) -> bool:
         """A notice hint only; actual boot, materials and policy need preview."""
@@ -135,18 +117,10 @@ class Updates:
         if item["available"]:
             identifier = "update-" + item["latest"]
             if self.store.get("notification", identifier) is None:
-                eligible = self.capability()["format_eligible"]
                 notice = {
                     "id": identifier,
                     "title": "沐璃有新版本",
-                    "content": f"{item['latest']} 已发布。"
-                    + (
-                        "可以让沐璃检查安装条件并在你同意后更新。"
-                        if eligible
-                        else "已配置本地候选来源，可以让沐璃先预检，再经你同意后准备和切换。"
-                        if self.candidate_configured()
-                        else "当前资料库需要托管候选更新，先配置来源并核验候选格式。"
-                    ),
+                    "content": f"{item['latest']} 已发布。可以让沐璃直接升级并重启，升级前会请求你批准。",
                     "source": "update",
                     "update_evidence": update_evidence(item),
                     "read": False,
@@ -256,10 +230,8 @@ class Updates:
 
     async def apply(self, version: str) -> dict[str, Any]:
         release_version(version)
-        if self._managed is not None and self._managed():
-            raise ValueError("managed_switch_required")
-        # Approval is not evidence that the target preserves the admitted format.
-        # Recheck here as well as at planning, before discovering or invoking uv.
+        # The owner can always upgrade in place. Keep the old admission helper
+        # callable for callers that still gate on it, but it no longer blocks.
         self.require_in_place_update()
         uv = shutil.which("uv")
         if uv is None:

@@ -54,59 +54,71 @@ def manager_for(runtime: Runtime) -> SelfManagement:
     )
 
 
-def forbid_installation(monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_discovery(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Format rejection must precede uv discovery")
+def fake_installation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[list[str]]:
+    root = tmp_path / "tools"
+    calls: list[list[str]] = []
 
-    async def no_process(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("Format rejection must precede subprocesses")
+    async def process(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+        calls.append(argv)
+        if argv[1:] == ["tool", "dir"]:
+            return {"exit_code": 0, "output": str(root)}
+        if argv[1:2] == ["tool"] and "upgrade" in argv:
+            return {"exit_code": 0, "output": ""}
+        raise AssertionError(f"unexpected subprocess: {argv}")
 
-    monkeypatch.setattr("muli.updates.shutil.which", no_discovery)
-    monkeypatch.setattr("muli.updates.run_process", no_process)
+    async def healthy(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr("muli.updates.shutil.which", lambda _: "uv")
+    monkeypatch.setattr("muli.updates.run_process", process)
+    monkeypatch.setattr("muli.updates.sys.prefix", str(root / "muli-agent"))
+    monkeypatch.setattr(Updates, "_health", healthy)
+    return calls
 
 
-@pytest.mark.parametrize("version", ["2.0.0", "99.0.0"])
-async def test_marked_store_rejects_every_unverified_target_before_installation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
-) -> None:
+async def test_marked_store_reports_direct_in_place_update(tmp_path: Path) -> None:
     runtime = runtime_at(tmp_path)
-    forbid_installation(monkeypatch)
     try:
         assert runtime.store.format_state is not None
         updates = Updates(runtime.config, runtime.store, runtime.bus)
         assert updates.capability() == {
-            "mode": "managed_switch",
-            "format_eligible": False,
-            "code": "verified_candidate_required",
+            "mode": "in_place",
+            "format_eligible": True,
+            "code": "installation_check_required",
         }
-        with pytest.raises(ValueError, match="^verified_candidate_required$"):
-            await updates.apply(version)
     finally:
         await runtime.close()
 
 
-async def test_marked_plan_rejected_without_snapshot_or_queue_event(tmp_path: Path) -> None:
+async def test_marked_store_upgrades_directly_with_uv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = runtime_at(tmp_path)
+    calls = fake_installation(monkeypatch, tmp_path)
+    try:
+        updates = Updates(runtime.config, runtime.store, runtime.bus)
+        result = await updates.apply("99.0.0")
+        assert result["installed"] == "99.0.0"
+        assert result["health"] == "passed" and result["restart_required"] is True
+        assert any("upgrade" in argv for argv in calls)
+    finally:
+        await runtime.close()
+
+
+async def test_marked_plan_queues_without_a_candidate_snapshot(tmp_path: Path) -> None:
     runtime = runtime_at(tmp_path)
     manager = manager_for(runtime)
     try:
-        before_files = tuple(sorted(manager.directory.glob("*.json")))
-        before_event = runtime.store.event_position()
-        with pytest.raises(ValueError, match="^verified_candidate_required$"):
-            await manager.stage("update", version="99.0.0")
-        assert manager.plans() == []
-        assert tuple(sorted(manager.directory.glob("*.json"))) == before_files
-        assert runtime.store.event_position() == before_event
-        status = await runtime.tools["self_status"].handler({})
-        assert status["update_capability"] == manager.updates.capability()
-        assert runtime.tools["self_update"].requires_approval
+        item = await manager.stage("update", version="99.0.0")
+        assert item["status"] == "pending" and item["action"] == "update"
+        assert [plan["id"] for plan in manager.plans()] == [item["id"]]
+        assert "candidate" not in item
     finally:
         await manager.close()
         await runtime.close()
 
 
-async def test_management_api_keeps_update_diagnostics_readable_after_marker_damage(
-    tmp_path: Path,
-) -> None:
+async def test_management_api_reports_in_place_after_marker_damage(tmp_path: Path) -> None:
     runtime = runtime_at(tmp_path)
     app = create_app(runtime.config, runtime.data_dir, runtime)
     try:
@@ -115,7 +127,7 @@ async def test_management_api_keeps_update_diagnostics_readable_after_marker_dam
         ) as client:
             response = await client.get("/api/management")
             assert response.status_code == 200
-            assert response.json()["update_capability"]["code"] == "verified_candidate_required"
+            assert response.json()["update_capability"]["mode"] == "in_place"
             with runtime.store.db:
                 runtime.store.db.execute(
                     "DELETE FROM runtime_state WHERE name=?", (FORMAT_STATE_KEY,)
@@ -123,9 +135,9 @@ async def test_management_api_keeps_update_diagnostics_readable_after_marker_dam
             response = await client.get("/api/management")
             assert response.status_code == 200
             assert response.json()["update_capability"] == {
-                "mode": "managed_switch",
-                "format_eligible": False,
-                "code": "format_verification_failed",
+                "mode": "in_place",
+                "format_eligible": True,
+                "code": "installation_check_required",
             }
     finally:
         await app.state.close()
@@ -174,9 +186,7 @@ async def test_zero_update_interval_disables_periodic_checks(tmp_path: Path) -> 
         await runtime.close()
 
 
-async def test_version_notice_and_context_preserve_actual_installation_capability(
-    tmp_path: Path,
-) -> None:
+async def test_version_notice_and_context_recommend_direct_update(tmp_path: Path) -> None:
     runtime = runtime_at(tmp_path)
     manager = manager_for(runtime)
     try:
@@ -191,11 +201,11 @@ async def test_version_notice_and_context_preserve_actual_installation_capabilit
         notices = runtime.store.list("notification")
         assert len(notices) == 1
         assert "99.0.0 已发布" in notices[0]["content"]
+        assert "直接升级并重启" in notices[0]["content"]
         context = await manager.context(runtime.main_session()["id"], [])
         assert len(context) == 1
-        assert "先配置来源并核验候选格式" in notices[0]["content"]
-        assert "先配置来源并核验" in context[0].content
-        assert "可更新到" not in context[0].content
+        assert "self_update" in context[0].content
+        assert "候选" not in context[0].content
     finally:
         await manager.close()
         await runtime.close()
@@ -203,7 +213,7 @@ async def test_version_notice_and_context_preserve_actual_installation_capabilit
 
 async def test_legacy_update_diagnostics_do_not_need_runtime_admission(tmp_path: Path) -> None:
     # Normal Runtime refuses this unmarked store. The low-level diagnostic reader
-    # still reports its original eligibility without manufacturing a new marker.
+    # still reports the same direct-update capability.
     store = legacy_store(tmp_path / "legacy.sqlite3")
     updates = Updates(ConfigFile(tmp_path / "config.json"), store, EventBus(store))
     try:
@@ -219,19 +229,15 @@ async def test_legacy_update_diagnostics_do_not_need_runtime_admission(tmp_path:
         notices = store.list("notification")
         assert len(notices) == 1
         assert "99.0.0 已发布" in notices[0]["content"]
-        assert "检查安装条件" in notices[0]["content"]
+        assert "直接升级并重启" in notices[0]["content"]
         assert store.format_state is None
     finally:
         store.close()
 
 
-@pytest.mark.parametrize("damaged", [False, True])
-async def test_candidate_notice_is_only_a_configured_hint_not_installation_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damaged: bool
-) -> None:
+async def test_candidate_policy_is_only_an_optional_hint(tmp_path: Path) -> None:
     runtime = runtime_at(tmp_path)
     manager = manager_for(runtime)
-    forbid_installation(monkeypatch)
     CandidatePolicyStore(runtime.store).replace(
         CandidateSettings(
             enabled=True,
@@ -240,8 +246,6 @@ async def test_candidate_notice_is_only_a_configured_hint_not_installation_autho
             uv_executable=str(tmp_path / "absent-uv"),
         )
     )
-    if damaged:
-        runtime.store.put("update_policy", {"id": "candidate-v1", "schema_version": 999})
     try:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
@@ -253,29 +257,19 @@ async def test_candidate_notice_is_only_a_configured_hint_not_installation_autho
             result = await manager.updates.check(client, independent=True)
         assert result["available"] and result["status"] == "checked"
         context = await manager.context(runtime.main_session()["id"], [])
-        notice = runtime.store.list("notification")[0]["content"]
-        if damaged:
-            assert "先配置来源" in notice
-            assert "已配置本地候选来源" not in context[0].content
-        else:
-            assert "先预检" in notice
-            assert "self_update_preview" in context[0].content
-            assert "expected_policy" in context[0].content
-            assert "不代表候选已经安装" in context[0].content
-        assert not manager.plans()
-        assert not (tmp_path / "absent-retained").exists()
-        assert not manager.updates.capability()["format_eligible"]
+        assert "候选" not in context[0].content
+        assert manager.updates.capability()["format_eligible"]
     finally:
         await manager.close()
         await runtime.close()
 
 
 @pytest.mark.parametrize("mutation", ["delete", "unknown"])
-async def test_broken_admission_stays_blocked_and_diagnostic_does_not_raise(
+async def test_damaged_marker_does_not_block_updates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
     runtime = runtime_at(tmp_path)
-    forbid_installation(monkeypatch)
+    calls = fake_installation(monkeypatch, tmp_path)
     try:
         state = runtime.store.format_state
         assert state is not None
@@ -292,10 +286,9 @@ async def test_broken_admission_stays_blocked_and_diagnostic_does_not_raise(
                     (json.dumps(changed), FORMAT_STATE_KEY),
                 )
         updates = Updates(runtime.config, runtime.store, runtime.bus)
-        assert updates.capability()["code"] == "format_verification_failed"
-        with pytest.raises(ValueError, match="^format_verification_failed$"):
-            await updates.apply("99.0.0")
-        assert runtime.store.format_state == state
+        assert updates.capability()["mode"] == "in_place"
+        assert (await updates.apply("99.0.0"))["health"] == "passed"
+        assert calls
     finally:
         await runtime.close()
 
@@ -320,7 +313,7 @@ async def test_health_timeout_is_reported_as_a_failed_check(
         await runtime.close()
 
 
-async def test_update_rechecks_after_uv_directory_observation(
+async def test_update_does_not_recheck_the_database_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = legacy_store(tmp_path / "legacy.sqlite3")
@@ -328,29 +321,31 @@ async def test_update_rechecks_after_uv_directory_observation(
     root = tmp_path / "tools"
     calls: list[list[str]] = []
 
-    def invalid() -> None:
-        raise ValueError("fixture_format_changed")
-
-    async def directory(argv: list[str], **kwargs: Any) -> dict[str, Any]:
+    async def process(argv: list[str], **kwargs: Any) -> dict[str, Any]:
         calls.append(argv)
-        assert argv == ["uv", "tool", "dir"]
-        monkeypatch.setattr(store, "revalidate_format", invalid)
-        return {"exit_code": 0, "output": str(root)}
+        if argv[1:] == ["tool", "dir"]:
+            return {"exit_code": 0, "output": str(root)}
+        if argv[1:2] == ["tool"] and "upgrade" in argv:
+            return {"exit_code": 0, "output": ""}
+        raise AssertionError(f"unexpected subprocess: {argv}")
+
+    async def healthy(*args: Any, **kwargs: Any) -> bool:
+        return True
 
     monkeypatch.setattr("muli.updates.shutil.which", lambda _: "uv")
-    monkeypatch.setattr("muli.updates.run_process", directory)
+    monkeypatch.setattr("muli.updates.run_process", process)
     monkeypatch.setattr("muli.updates.sys.prefix", str(root / "muli-agent"))
+    monkeypatch.setattr(Updates, "_health", healthy)
     try:
-        with pytest.raises(ValueError, match="^format_verification_failed$"):
-            await updates.apply("99.0.0")
-        assert calls == [["uv", "tool", "dir"]]
+        result = await updates.apply("99.0.0")
+        assert result["health"] == "passed"
+        assert calls[0] == ["uv", "tool", "dir"]
+        assert any("upgrade" in argv for argv in calls[1:])
     finally:
         store.close()
 
 
-def test_unmarked_no_migration_store_still_requires_original_installation_check(
-    tmp_path: Path,
-) -> None:
+def test_unmarked_no_migration_store_reports_in_place(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     opened = legacy_store(path)
     try:
@@ -365,14 +360,15 @@ def test_unmarked_no_migration_store_still_requires_original_installation_check(
         opened.close()
 
 
-async def test_managed_installation_refuses_in_place_uv_upgrade(
+async def test_managed_installation_uses_the_same_in_place_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = runtime_at(tmp_path)
-    forbid_installation(monkeypatch)
+    calls = fake_installation(monkeypatch, tmp_path)
     try:
-        updates = Updates(runtime.config, runtime.store, runtime.bus, managed=lambda: True)
-        with pytest.raises(ValueError, match="managed_switch_required"):
-            await updates.apply("2.0.0")
+        updates = Updates(runtime.config, runtime.store, runtime.bus)
+        result = await updates.apply("2.0.0")
+        assert result["health"] == "passed"
+        assert any("upgrade" in argv for argv in calls)
     finally:
         await runtime.close()
