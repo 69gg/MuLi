@@ -321,8 +321,6 @@ class Runtime:
         self._shell_generation = 0
         self._shell_mode_epochs: dict[str, int] = {}
         self._shell_requests: dict[str, PreparedRequest] = {}
-        self._voice_reply_epoch = 0
-        self._voice_reply_changed = asyncio.Event()
         self._stopping: dict[str, int] = {}
         self.tasks: dict[str, asyncio.Task[str]] = {}
         self._session_finalizers: set[asyncio.Task[Any]] = set()
@@ -501,20 +499,6 @@ class Runtime:
         session_id = self.tool_session_id
         request = self.request_context(session_id) if session_id is not None else None
         return request.reply_origin if request is not None else ReplyOrigin()
-
-    @property
-    def voice_reply_epoch(self) -> int:
-        """Ephemeral revocation only; neither a durable receipt nor authorization."""
-        return self._voice_reply_epoch
-
-    @property
-    def voice_reply_changed(self) -> asyncio.Event:
-        return self._voice_reply_changed
-
-    def _invalidate_voice_reply(self) -> None:
-        self._voice_reply_epoch += 1
-        self._voice_reply_changed.set()
-        self._voice_reply_changed = asyncio.Event()
 
     def validate_proactive_settings(self, target: Settings) -> None:
         """Validate newly selected evidence again when a queued config is applied."""
@@ -1205,8 +1189,6 @@ class Runtime:
             reply_origin=reply_origin,
             attachment_validator=self.team._attachment_references,
         )
-        if result.created:
-            self._invalidate_voice_reply()
         if result.created and self._selected_replans.get(session["id"]) == identifier:
             # A duplicate old receipt must not clear a newer selection.
             self._selected_replans.pop(session["id"], None)
@@ -1634,9 +1616,6 @@ class Runtime:
             if inserted and principal == "owner" and receipt["state"] == "pending":
                 self.team.consult.invalidate(session["id"], "收到主人新输入，原咨询已失效")
                 self.shell_mode_changed(session["id"], previous_mode, session["mode"])
-            if inserted and principal == "owner":
-                self._invalidate_voice_reply()
-            voice_reply_epoch = self.voice_reply_epoch
             if inserted:
                 for hook in self.message_hooks:
                     try:
@@ -1681,7 +1660,6 @@ class Runtime:
             "queued": receipt["state"] == "pending",
             "duplicate": not inserted,
             "quarantined": receipt["state"] == "quarantined",
-            "voice_reply_epoch": voice_reply_epoch,
         }
 
     def _supersede_main_approvals(
@@ -1809,8 +1787,6 @@ class Runtime:
                 attention_memory_watch=memory_watch,
                 attention_project=project,
             )
-            if inserted:
-                self._invalidate_voice_reply()
             self._wake_main()
         if inserted:
             await self.bus.emit("attention.queued", {"message": receipt}, session["id"])
@@ -2118,7 +2094,6 @@ class Runtime:
         if self.busy:
             raise ValueError("请先停止运行中的任务")
         self.channel_ownership.reconcile()
-        self._invalidate_voice_reply()
         await self.compaction.close()
         await self.workflows.close()
         await self.mcp.close()
@@ -2728,8 +2703,6 @@ class Runtime:
         self.shell_mode_changed(session_id, previous_mode, session["mode"])
         message = self.store.add_message(session_id, "user", content)
         self.team.consult.invalidate(session_id, "收到新的会话输入，原咨询已失效")
-        if session.get("kind") == "main":
-            self._invalidate_voice_reply()
         run_id = self._launch(session, "main", cast(Mode, session["mode"]))
         return {"run_id": run_id, "session_id": session_id, "message": message}
 
@@ -2823,9 +2796,6 @@ class Runtime:
                 self.team.cancel_shell_continuation(record.session_id, "会话已被显式停止")
         self.team.consult.invalidate(session_id, "会话已停止，咨询不再接收回答")
         self.shells.invalidate(session_id)
-        invalidate_reply = session_id == self.store.existing_main_session_id()
-        if invalidate_reply:
-            self._invalidate_voice_reply()
         pending = self.store.pending_inputs(session_id) if cancel_pending else 0
         try:
             with self._stopping_session(session_id):
@@ -5669,7 +5639,6 @@ class Runtime:
         if self._close_task is None:
             self._closing = True
             self.team.consult.invalidate(None, "运行时正在关闭，咨询不再接收回答")
-            self._invalidate_voice_reply()
             self._close_task = asyncio.create_task(self._close_resources())
         cancelled = await self.team._settle([self._close_task])
         if cancelled:

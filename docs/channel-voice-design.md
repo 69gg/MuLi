@@ -4,7 +4,7 @@
 
 ## 最小合同
 
-`speech_synthesize` 已通过当前配置的 TTS 保存本地附件并返回 ID；`audio_transcribe` 按需读取附件转录。新增的发送路径是 `channel_send(media_mode="voice", attachment_ids=[id])`，不自动录音、合成、播放或发送其他音频。
+`voice_speak` 已通过当前配置的 TTS 合成并按来源投递：渠道私聊直接发送原生语音，本地语音会话在扬声器播放，其它来源保存为附件；`audio_transcribe` 按需读取附件转录。仍可用 `channel_send(media_mode="voice", attachment_ids=[id])` 显式控制目标，不自动录音、合成、播放或发送其他音频。
 
 `media_mode` 仅有 `file` 与 `voice`，默认 `file`，表示原有附件发送路径。这里的 file 不承诺各平台客户端都显示为普通文档：QQ 原有音频附件的富媒体处理保持不变。voice 必须恰好带一个受支持的本地音频附件；可带文字，文字继续按原规则作为先行独立分段。预先拒绝不支持的渠道与格式，不自动降级或转码。
 

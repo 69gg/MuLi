@@ -309,6 +309,8 @@ def _create_app(
     channel_application = ChannelApplication(runtime, attachments)
     attention.host_delivery = HostNoticeDelivery(runtime, lambda: channel_application.manager)
     personal_io = PersonalIO(runtime, local_services, attachments)
+    local_services.voice_delivery = channel_application.deliver_voice
+    local_services.voice_playback = personal_io.play_speech
     from muli.integrations.manager import IntegrationManager
 
     integration = IntegrationManager(runtime, closing=lambda: configuration_closing)

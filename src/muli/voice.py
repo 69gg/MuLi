@@ -854,22 +854,17 @@ class VoiceWorker:
                 path = self.files.save(speech.data, speech.extension)
             return artifact(path, speech.mime_type)
 
-    async def reply(self, text: str, *, admission_guard: Callable[[], None]) -> None:
-        """One locally admitted answer; saved audio is never retried implicitly."""
-        if not self.config.enabled or not self.config.tts_enabled or not self.config.reply_enabled:
-            raise ValueError("自动语音回复尚未启用")
+    async def play_file(self, path: Path, mime_type: str) -> None:
+        """Play one already admitted attachment; never synthesizes or retries."""
+        if not self.config.tts_enabled or not self.config.reply_enabled:
+            raise ValueError("本机语音播放未启用")
         async with self._operation(), self._capture_lock:
-            admission_guard()
-            self.last_reply["state"] = "synthesizing"
-            speech = await self.media.synthesize(text)
-            if speech.extension not in {".mp3", ".opus", ".aac", ".flac", ".wav", ".pcm"}:
-                raise ValueError("语音合成返回未知文件格式")
-            async with self.files.lock:
-                path = self.files.save(speech.data, speech.extension)
-                self.last_reply["audio"] = artifact(path, speech.mime_type)
-            admission_guard()
-            self.last_reply["state"] = "playing"
-            await self.player.play(path, speech.mime_type)
+            self.last_reply = {"state": "playing", "mime_type": mime_type}
+            try:
+                await self.player.play(path, mime_type)
+            except Exception:
+                self.last_reply["state"] = "failed"
+                raise
             self.last_reply["state"] = "played"
             self.last_error = ""
 

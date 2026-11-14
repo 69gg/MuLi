@@ -371,9 +371,7 @@ async def test_saved_speech_rejects_inexact_sources_and_strict_unconfirmed_input
             rig.runtime.store.put("run", run)
             rig.runtime.store.put("message", final)
             path, body = speech_request(run, final)
-            disabled = await web.patch(
-                "/api/settings", json={"disabled_tools": ["speech_synthesize"]}
-            )
+            disabled = await web.patch("/api/settings", json={"disabled_tools": ["voice_speak"]})
             assert disabled.status_code == 200
             assert (await web.post(path, json=body)).status_code == 403
             enabled = await web.patch(

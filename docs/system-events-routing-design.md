@@ -37,7 +37,7 @@ systemd 的 stdout/stderr 原生 priority 不一定对应 Python 文本中的 ER
 
 ## 语音复用
 
-现有 `audio_transcribe` 已按附件 ID 调用 ASR；`speech_synthesize` 已生成音频附件并保存。`file_publish` 和 `channel_send` 复用附件登记及持久出站队列。2.14 的 `media_mode=file|voice` 已明确区分发送表现形式，不能仅凭 audio MIME 宣称所有渠道都产生语音气泡。
+现有 `audio_transcribe` 已按附件 ID 调用 ASR；`voice_speak` 已能合成并按来源发声或保存附件。`file_publish` 和 `channel_send` 复用附件登记及持久出站队列。2.14 的 `media_mode=file|voice` 已明确区分发送表现形式，不能仅凭 audio MIME 宣称所有渠道都产生语音气泡。
 
 默认文件模式保留 Telegram sendDocument 和 QQ 按 audio MIME 上传的行为；显式语音支持 Telegram sendVoice 与 OneBot record，不支持的渠道或格式明确拒绝，不自动转码、安装大库或降级。协议替身验收与真实账号收发分别记录。
 

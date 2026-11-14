@@ -228,7 +228,7 @@ AI 显式发送的内容会保留在外发记录中，重启后仍可查询。`p
 | OneBot | MP3、WAV、Ogg、FLAC、MP4 音频、WebM 音频；须远端 `can_send_record` 同意，具体编码取决于服务实现 |
 | QQ 官方、iLink | 暂不提供 `voice` 模式；仍可按文件发送 |
 
-先用 `speech_synthesize` 或 `file_publish` 取得附件 ID，再发送：
+在本轮真实私聊里，`voice_speak` 会合成并直接发送原生语音，不需要先取附件 ID。需要显式控制目标或复用已有音频时，也可先用 `file_publish` 取得附件 ID，再调用 `channel_send`：
 
 ```json
 {

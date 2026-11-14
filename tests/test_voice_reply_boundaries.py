@@ -22,7 +22,7 @@ from test_runtime import FakeClient, make_runtime
 from test_voice import FakeDetector, FakePlayer, FakeRecorder
 
 import muli.voice as voice_module
-from muli.config import ConfigFile, VoiceSettings
+from muli.config import VoiceSettings
 from muli.context import context_size
 from muli.platforms.files import LocalFiles
 from muli.providers import Message, ModelConfig, ModelTurn, StreamEvent
@@ -36,21 +36,6 @@ WEB_INPUT = "我现在改用网页继续。"
 WEB_ANSWER = "已切换到网页继续。"
 PROMPT_AUDIO = b"ID3-OFFLINE-BOUNDARY-PROMPT"
 ANSWER_AUDIO = b"ID3-OFFLINE-BOUNDARY-ANSWER"
-
-
-class UncertainPlayer(FakePlayer):
-    """The output device starts accepting bytes, then loses its result channel."""
-
-    def __init__(self) -> None:
-        super().__init__(True)
-        self.started: list[tuple[bytes, str]] = []
-
-    async def play(self, path: Path, mime_type: str) -> None:
-        audio = path.read_bytes()
-        if audio == ANSWER_AUDIO:
-            self.started.append((audio, mime_type))
-            raise OSError("synthetic playback result channel lost after start")
-        await super().play(path, mime_type)
 
 
 @dataclass
@@ -298,14 +283,15 @@ async def voice_case(
         await app.state.close()
 
 
-async def test_default_reply_disabled_keeps_verified_voice_text_without_final_audio(
+async def test_verified_voice_input_never_auto_plays(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with voice_case(tmp_path, monkeypatch, reply_enabled=None) as case:
+    # reply_enabled only permits the voice_speak tool to use the speaker; a
+    # completed voice conversation must not synthesize or play on its own.
+    async with voice_case(tmp_path, monkeypatch, reply_enabled=True) as case:
         await case.listen()
         await case.completed_voice()
         await settled(lambda: not case.runtime.tasks)
-        assert case.app.state.personal_io._reply_task is None
         assert case.worker.last_reply == {} and len(case.seen) == 1
         case.prompt_only()
 
@@ -325,126 +311,4 @@ async def test_unverified_voice_is_quarantined_without_main_run_or_final_audio(
             ).fetchone()[0]
             == 0
         )
-        assert case.app.state.personal_io._reply_task is None
         case.prompt_only()
-
-
-@pytest.mark.parametrize("action", ["new_owner_input", "stop_completed_run"])
-async def test_tts_http_is_revoked_by_real_owner_control_after_main_completed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
-) -> None:
-    async with voice_case(tmp_path, monkeypatch, block_tts=True) as case:
-        await case.listen()
-        await asyncio.wait_for(case.tts_entered.wait(), 3)
-        run_id = await case.completed_voice()
-        main_id = case.runtime.main_session()["id"]
-        if action == "new_owner_input":
-            response = await case.web.post(
-                f"/api/sessions/{main_id}/messages", json={"content": WEB_INPUT}
-            )
-            assert response.status_code == 200
-            assert (
-                await asyncio.wait_for(case.runtime.wait(response.json()["run_id"]), 3)
-                == WEB_ANSWER
-            )
-        else:
-            response = await case.web.post(f"/api/sessions/{main_id}/stop", json={})
-            assert response.status_code == 200 and response.json() == {"stopped": True}
-        await asyncio.wait_for(case.tts_cancelled.wait(), 3)
-        await settled(lambda: case.app.state.personal_io._reply_task is None)
-        assert case.worker.last_reply["state"] == "cancelled"
-        assert case.runtime.store.get("run", run_id)["status"] == "completed"
-        assert case.tts_inputs == ["请说", VOICE_ANSWER]
-        assert case.player.played == [(PROMPT_AUDIO, "audio/mpeg")]
-        assert len(case.seen) == (2 if action == "new_owner_input" else 1)
-
-
-async def test_settings_disable_replaces_worker_and_revokes_its_tts_http(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async with voice_case(tmp_path, monkeypatch, block_tts=True) as case:
-        await case.listen()
-        await asyncio.wait_for(case.tts_entered.wait(), 3)
-        run_id = await case.completed_voice()
-        await settled(lambda: not case.runtime.busy)
-        response = await case.web.patch("/api/settings", json={"voice": {"enabled": False}})
-        assert response.status_code == 200 and response.json()["voice"]["enabled"] is False
-        await asyncio.wait_for(case.tts_cancelled.wait(), 3)
-        current = case.app.state.personal_io.voice
-        assert current is not case.worker and current.status()["running"] is False
-        assert case.worker.status()["closed"] is True
-        with pytest.raises(ValueError):
-            await case.worker.listen_once()
-        assert case.worker.last_reply["state"] == "cancelled"
-        assert case.runtime.store.get("run", run_id)["status"] == "completed"
-        assert case.runtime.store.db.execute("SELECT count(*) FROM ingress").fetchone()[0] == 1
-        assert case.tts_inputs == ["请说", VOICE_ANSWER]
-        assert case.player.played == [(PROMPT_AUDIO, "audio/mpeg")]
-
-
-async def test_personal_io_close_does_not_cancel_the_shielded_main_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async with voice_case(tmp_path, monkeypatch, block_main=True) as case:
-        await case.listen()
-        await asyncio.wait_for(case.main_entered.wait(), 3)
-        await settled(lambda: case.worker.last_reply.get("run_id") == case.ingress()["run_id"])
-        run_id = case.ingress()["run_id"]
-        assert isinstance(run_id, str)
-        task = case.runtime.tasks[case.runtime.main_session()["id"]]
-        assert not task.done() and case.worker.last_reply["state"] == "waiting"
-        await asyncio.wait_for(case.app.state.personal_io.close(), 3)
-        assert not task.done() and not task.cancelled() and not case.main_cancelled.is_set()
-        assert case.runtime.store.get("run", run_id)["status"] == "running"
-        assert case.worker.last_reply["state"] == "cancelled"
-        case.main_release.set()
-        assert await asyncio.wait_for(case.runtime.wait(run_id), 3) == VOICE_ANSWER
-        assert case.runtime.store.get("run", run_id)["status"] == "completed"
-        case.prompt_only()
-
-
-async def test_uncertain_player_result_keeps_audio_and_normal_reopen_does_not_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    player = UncertainPlayer()
-    async with voice_case(tmp_path, monkeypatch, player=player) as case:
-        await case.listen()
-        run_id = await case.completed_voice()
-        await settled(lambda: case.worker.last_reply.get("state") == "unknown")
-        await settled(lambda: case.app.state.personal_io._reply_task is None)
-        assert player.started == [(ANSWER_AUDIO, "audio/mpeg")]
-        assert player.played == [(PROMPT_AUDIO, "audio/mpeg")]
-        artifact_path = Path(case.worker.last_reply["audio"]["path"])
-        assert artifact_path.read_bytes() == ANSWER_AUDIO
-        assert case.tts_inputs == ["请说", VOICE_ANSWER] and len(case.seen) == 1
-        config_path, data_dir = case.runtime.config.path, case.runtime.data_dir
-
-    # Normal application shutdown finished above. With the acoustic wake bridge
-    # unavailable on reopen, no new recording can be mistaken for a resumed ticket.
-    case.wake.configured = False
-
-    def no_model(config: ModelConfig) -> FakeClient:
-        raise AssertionError("normal reopen must not regenerate the completed voice answer")
-
-    reopened = Runtime(ConfigFile(config_path), data_dir, client_factory=no_model)  # type: ignore[arg-type]
-    app = create_app(reopened.config, reopened.data_dir, reopened)
-    try:
-        async with (
-            app.router.lifespan_context(app),
-            httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://localhost:8765"
-            ) as web,
-        ):
-            assert app.state.personal_io.voice.status()["running"] is False
-            assert app.state.personal_io.voice.last_reply == {}
-            assert app.state.personal_io._reply_task is None
-            assert reopened.store.get("run", run_id)["status"] == "completed"
-            history = await web.get(f"/api/sessions/{reopened.main_session()['id']}")
-            assert history.status_code == 200
-            assert sum(item["content"] == VOICE_ANSWER for item in history.json()["messages"]) == 1
-            assert artifact_path.read_bytes() == ANSWER_AUDIO
-            assert case.tts_inputs == ["请说", VOICE_ANSWER]
-            assert player.started == [(ANSWER_AUDIO, "audio/mpeg")]
-            assert reopened.store.db.execute("SELECT count(*) FROM ingress").fetchone()[0] == 1
-    finally:
-        await app.state.close()

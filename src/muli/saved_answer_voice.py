@@ -50,7 +50,7 @@ class SavedAnswerVoice:
         if not runtime.maintenance.admission.allowed or runtime.maintenance.configuration_blocked:
             raise SavedAnswerVoiceError("维护期间不能生成语音")
         settings = runtime.config.settings
-        if "speech_synthesize" in settings.disabled_tools:
+        if "voice_speak" in settings.disabled_tools:
             raise SavedAnswerVoiceError("语音合成已禁用", 403)
         if not settings.media.tts.configured or not settings.media.tts.voice.strip():
             raise SavedAnswerVoiceError("请先配置 TTS 服务和音色")

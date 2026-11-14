@@ -610,7 +610,7 @@ export function createPreviewBackend({ state = createPreviewState(), delay = 140
         const message = state.messages[id]?.find((item) => item.id === parts[3]), run = state.runs[body.run_id];
         if (id !== state.sessions[0].id || !message || message.role !== "assistant" || message.interrupted || message.tool_calls?.length || !message.content.trim()
           || message.evidence_revision !== body.revision || run?.session_id !== id || run.status !== "completed" || run.result_message_id !== message.id || run.result !== message.content) return failure("这条演示答复的完整来源已变化。", 409);
-        if (state.settings.disabled_tools.includes("speech_synthesize")) return failure("语音生成工具未启用。");
+        if (state.settings.disabled_tools.includes("voice_speak")) return failure("语音生成工具未启用。");
         const blob = previewSpeechAudio(), totalBytes = [...state.files.values()].reduce((total, file) => total + file.size, 0);
         if (blob.size > state.settings.uploads.max_file_bytes || totalBytes + blob.size > state.previewLimits.max_upload_bytes) return failure("演示附件容量已达上限。", 413);
         if (state.files.size >= state.previewLimits.max_uploads) return failure("演示附件数量已达上限。", 429);

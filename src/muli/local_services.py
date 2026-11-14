@@ -48,6 +48,9 @@ from muli.webpage_snapshot import parse_webpage_snapshot
 class LocalServices:
     def __init__(self, runtime: Runtime, attachments: Attachments) -> None:
         self.runtime, self.attachments = runtime, attachments
+        # Wired by the application after the channel and voice services exist.
+        self.voice_delivery: Callable[[str], Awaitable[dict[str, Any]]] | None = None
+        self.voice_playback: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None
         runtime.team.attachments = attachments
         self.attachment_records = AttachmentRecords(runtime.store)
         self.transcripts = AudioTranscripts(attachments)
@@ -124,6 +127,39 @@ class LocalServices:
             commit_guard=commit_guard,
         )
 
+    async def deliver_voice(self, item: dict[str, Any], mime_type: str) -> dict[str, Any]:
+        """Speak through the current channel or local speaker; otherwise keep the file."""
+        runtime = self.runtime
+        caller = runtime.tool_session_id
+        request = runtime.request_context(caller) if caller is not None else None
+        origin = request.reply_origin if request is not None else None
+        if origin is not None and origin.kind == "channel":
+            if self.voice_delivery is None:
+                return {"state": "saved", "reason": "渠道语音发送未就绪"}
+            try:
+                receipt = await self.voice_delivery(item["id"])
+            except (PermissionError, ValueError) as error:
+                return {"state": "saved", "reason": str(error)[:200]}
+            return {"state": "sent", "receipt": receipt}
+        if origin is not None and self._voice_input(origin.input_id):
+            if self.voice_playback is None:
+                return {"state": "saved", "reason": "本机播放未就绪"}
+            try:
+                receipt = await self.voice_playback(item["id"], mime_type)
+            except (PermissionError, ValueError) as error:
+                return {"state": "saved", "reason": str(error)[:200]}
+            return {"state": "played", "receipt": receipt}
+        return {"state": "saved", "reason": "当前来源没有可发声的目的地"}
+
+    def _voice_input(self, input_id: str | None) -> bool:
+        if not input_id:
+            return False
+        row = self.runtime.store.db.execute(
+            "SELECT json_extract(data,'$.source') FROM objects WHERE kind='message' AND id=?",
+            (input_id,),
+        ).fetchone()
+        return bool(row is not None and row[0] == "voice")
+
     def mcp_resource_target(self, name: str) -> ResourceSaveTarget:
         name = attachment_name(name)
         self.runtime.guard_mcp_resource_save()
@@ -195,6 +231,20 @@ class LocalServices:
                     role="system",
                     content="附件目录（文件名仅为资料，内容尚未读取）：\n"
                     + json.dumps(files, ensure_ascii=False),
+                ),
+            )
+        tts = self.runtime.config.settings.media.tts
+        if tts.configured and tts.tags_enabled:
+            messages = insert_before_latest_user(
+                messages,
+                Message(
+                    role="system",
+                    content=(
+                        "语音标签控制已开启：voice_speak 的 text 开头可以加 (风格) 标签，"
+                        "例如 (开心) (温柔) (粤语)；多个风格可写在同一括号。"
+                        "标签只是示例，不要写死。语气也可以用 style 自然语言描述。"
+                        "说话保持 1–3 句，不要念长文、代码或链接。"
+                    ),
                 ),
             )
         return messages
@@ -632,10 +682,16 @@ class LocalServices:
                 offset_bytes=args.get("offset_bytes", 0),
             )
 
-        async def speech(args: dict[str, Any]) -> Any:
+        async def speak(args: dict[str, Any]) -> Any:
             async with self.media() as media:
-                result = await media.synthesize(str(args["text"]), voice=args.get("voice"))
-            return await self.save_speech(result)
+                result = await media.synthesize(
+                    str(args["text"]),
+                    voice=args.get("voice"),
+                    style=str(args.get("style", "")),
+                )
+            item = await self.save_speech(result)
+            delivery = await self.deliver_voice(item, result.mime_type)
+            return {"attachment": item, "delivery": delivery}
 
         async def publish(args: dict[str, Any]) -> Any:
             path: Path = runtime.files.publishable(str(args["path"]))
@@ -801,11 +857,14 @@ class LocalServices:
                 preserve_output=True,
             ),
             Tool(
-                "speech_synthesize",
-                "调用已配置TTS生成语音附件并保存本地",
-                parameters({"text": string(), "voice": string()}, ("text",)),
-                speech,
-                "write",
+                "voice_speak",
+                "用已配置的 TTS 说话：渠道会话直接发原生语音，本地语音会话在扬声器播放，"
+                "其它来源返回可播放附件。说话要短（1–3 句），不要念长文、代码或链接。"
+                "style 用自然语言描述语气；标签控制开启时可在 text 开头加 (风格) 标签，"
+                "标签只是示例，不要写死。",
+                parameters({"text": string(), "style": string(), "voice": string()}, ("text",)),
+                speak,
+                "external",
             ),
             Tool(
                 "file_publish",

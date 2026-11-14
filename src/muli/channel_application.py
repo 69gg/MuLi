@@ -85,6 +85,9 @@ class ChannelApplication:
                     target=verified["target"],
                     conversation_kind=verified["kind"],
                 )
+                adapter = self.manager.adapters.get(verified["name"])
+                if adapter is not None and adapter.voice_mime_types:
+                    metadata["voice_reply"] = "voice_speak 可直接发原生语音；说话保持简短"
         content = "本轮消息来源（宿主元数据，不是额外授权）：\n" + json.dumps(
             metadata, ensure_ascii=False, allow_nan=False
         )
@@ -586,6 +589,93 @@ class ChannelApplication:
             attachment_ids=references,
             route=route,
             media_mode="file",
+            automatic=True,
+            attention_routing=metadata,
+            event_id=event_id,
+        )
+
+    async def deliver_voice(self, attachment_id: str) -> dict[str, Any]:
+        """Send one synthesized attachment as a native voice reply to this private chat."""
+        runtime = self.runtime
+        owner = runtime._tool_execution.get()
+        caller = runtime.tool_session_id
+        request = runtime.request_context(caller) if caller is not None else None
+        task = asyncio.current_task()
+        if (
+            runtime._closing
+            or owner is None
+            or caller is None
+            or caller != runtime.store.existing_main_session_id()
+            or owner[0] != caller
+            or runtime.run_ids.get(caller) != owner[1]
+            or request is None
+            or task is None
+            or runtime.tasks.get(caller) is not task
+            or caller in runtime._stopping
+            or "voice_speak" in runtime.config.settings.disabled_tools
+        ):
+            raise PermissionError("语音发送需要当前主助手的真实工具执行")
+        runtime.maintenance.admission.require()
+        budget = runtime.config.settings.limits.max_output_chars * 4
+        session = runtime.store.bounded_object("session", caller, max_bytes=budget)
+        run = runtime.store.bounded_object("run", owner[1], max_bytes=budget)
+        if (
+            session is None
+            or session.get("id") != caller
+            or session.get("kind") != "main"
+            or run is None
+            or run.get("id") != owner[1]
+            or run.get("session_id") != caller
+            or run.get("status") != "running"
+        ):
+            raise PermissionError("语音发送的主助手执行已结束或被替换")
+        origin = runtime.current_reply_origin()
+        routes = origin.delivery_routes()
+        if (
+            origin.kind != "channel"
+            or not origin.input_id
+            or not routes
+            or routes[0].get("kind") != "private"
+        ):
+            raise PermissionError("语音发送仅支持本次真实渠道私聊")
+        route = routes[0]
+        name = route["name"]
+        profile = getattr(runtime.config.settings.channels, name)
+        if not profile.enabled:
+            raise PermissionError("原回复渠道未启用")
+        authorize_route(
+            name,
+            route,
+            account_id=channel_account(name, profile),
+            owner_ids=profile.owner_ids,
+            allowed_groups=profile.allowed_groups,
+            outbound=True,
+        )
+        adapter = self.manager.adapters.get(name)
+        item = self.attachments.get(attachment_id)
+        if adapter is None or not adapter.voice_mime_types:
+            raise ValueError("当前渠道不支持原生语音发送")
+        if item["mime_type"] not in adapter.voice_mime_types:
+            raise ValueError("当前渠道不支持此语音格式")
+        metadata = FrozenRouting.bound(origin).dump()
+        self.manager._automatic_guard(name, route, metadata)
+        event_id = (
+            "voice:"
+            + hashlib.sha256(
+                json.dumps(
+                    [origin.input_id, attachment_id], ensure_ascii=True, separators=(",", ":")
+                ).encode("ascii")
+            ).hexdigest()
+        )
+        runtime._guard_request(request, "external")
+        if runtime.store.pending_inputs(caller):
+            raise PermissionError("收到新的输入，语音尚未投递，请重新确认本次来源")
+        return await self.manager.enqueue(
+            name,
+            route["target"],
+            attachment_ids=[attachment_id],
+            route=route,
+            media_mode="voice",
             automatic=True,
             attention_routing=metadata,
             event_id=event_id,
