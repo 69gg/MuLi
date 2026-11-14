@@ -23,8 +23,8 @@ MCP 和 Skills 支持目录发现与热重载，Python 插件启停或修改仍�
 | 功能 | 工具或管理入口 | 使用提示 |
 | --- | --- | --- |
 | MCP 接收限制 | `self_mcp_receive_configure`；`GET/PUT /api/management/mcp-receive-policy` | 见 [HTTP/SSE 接收策略](mcp.md#httpsse-接收策略) |
-| 本地候选更新 | `self_update_configure`；`GET/PUT /api/management/update-policy` | 默认关闭；先读现值，再完整替换 |
-| 在线候选材料 | `self_update_online_configure`；`GET/PUT /api/management/update-online-policy` | 默认关闭；不自动下载依赖 |
+| 可选本地候选 | `self_update_configure`；`GET/PUT /api/management/update-policy` | 一般更新不需要；默认关闭；先读现值，再完整替换 |
+| 可选在线候选 | `self_update_online_configure`；`GET/PUT /api/management/update-online-policy` | 一般更新不需要；默认关闭；不自动下载依赖 |
 | 资料收件目录 | `file_inbox_configure`；`GET/PUT /api/file-inbox/settings` | 默认关闭；见[资料收件目录](file-inbox.md) |
 
 完整替换策略时，省略字段会恢复默认值。保存策略不等于已经连接、下载或安装成功。
@@ -35,17 +35,15 @@ MCP 和 Skills 支持目录发现与热重载，Python 插件启停或修改仍�
 
 `self_adopt` 可将当前保留安装迁入托管；`self_switch` 可切换到另一份已保留的兼容本地安装。两者使用安装、配置与 launcher 的绝对路径，不自动下载或创建环境。请先按[本地托管切换](managed-operations.md)准备材料，不要覆盖原控制安装或候选安装。
 
-托管候选更新按以下顺序进行：
+更新按以下顺序进行：
 
 1. 服务启动时会进行一次有限的新版本元数据检查，失败不阻止启动，也不会自动安装；之后按 `updates.interval_hours`（默认 2 小时，`0` 关闭）在后台重复检查，有新版本时通知沐璃。
-2. 用 `self_status` 查看 `update_capability`，确认当前安装支持哪种更新方式。开发虚拟环境不会被自动替换；要求独立候选的安装不能用原位覆盖绕过检查。
-3. 用 `self_update_preview` 查看候选。启用在线策略时，可传 `{"version":"精确版本"}` 选择版本。
-4. 将预览返回的 `expected_policy`，以及在线预览的 `expected_artifact`，原样交给 `self_update`。**无论 ask、auto 还是 yolo，更新都需真实用户批准。**
-5. 持续查看管理计划与服务状态。批准、下载完成或包安装成功，都不能单独证明新服务已经可用。
+2. 用 `self_update({"version":"精确版本"})` 直接执行 `uv tool upgrade` 并重启，版本可省略以使用最新版。**无论 ask、auto 还是 yolo，更新都需真实用户批准。**
+3. 批准、下载完成或包安装成功，都不能单独证明新服务已经可用；更新后核对服务健康与实际版本。
 
-仅当 `update_capability` 允许旧原位更新，且实际安装检查通过时，可使用 `self_update({"version":"精确版本"})`；这条路径不要求候选预览，仍需真实用户批准。它不提供自动版本回退，不满足安装条件时不能绕过检查。
+开发虚拟环境不会被自动替换；数据库格式标记不再阻止原位升级。更新失败时，如果本地有可用的 MuLi wheel，会尝试回退安装；它不提供自动版本回退，也不承诺跨数据库迁移回滚。
 
-本地候选策略需指定已准备的 wheelhouse、保留目录与 uv 绝对路径。在线策略只在批准后下载一枚 MuLi wheel，默认上限 8 MiB、最大可配置 32 MiB，不自动获取依赖或新 Python。详细准备方式见[候选材料说明](bounded-online-candidate-design.md)。遇到互不兼容约束需用户先明确调整。
+`self_update_configure`、`self_update_online_configure` 和 `self_update_preview` 是可选的候选流程，只在需要独立保留安装或在线 wheel 时使用，不影响普通更新。本地候选策略需指定已准备的 wheelhouse、保留目录与 uv 绝对路径；在线策略只在批准后下载一枚 MuLi wheel，默认上限 8 MiB、最大可配置 32 MiB，不自动获取依赖或新 Python。详细准备方式见[候选材料说明](bounded-online-candidate-design.md)。
 
 未解决的恢复操作会阻止普通配置与扩展换代。此时使用 `self_recover` 或 `POST /api/management/transactions/recover` 接续原操作；它不重新执行结果未知的业务操作，也不自动重新安装。证据不足时会保留阻断，不能靠重复调用宣称恢复。更新不承诺跨数据库迁移回滚，源码参考中的本地修改也不会被重置。
 

@@ -16,7 +16,7 @@
 
 路径示例不是默认目录，必须按实际安装提供；不能把可执行文件的真实链接目标代替环境内的词法 Python 入口。接口不创建环境、不下载依赖、不执行候选来猜测兼容性。包必须提供真实兼容声明，并通过当前七领域格式、解释器、包文件、标准 Linux 用户服务和实际进程观察验证。历史无认证格式的库不会自动补证或迁移。
 
-`self_switch` 与 `self_update` 一样需要真实用户批准；approve 也不替代候选兼容验证。普通原位 `self_update` 的原有格式限制继续有效，不能通过它覆盖托管环境。迁入后的普通 `service install` 不能覆盖稳定服务入口。
+`self_switch` 与 `self_update` 一样需要真实用户批准；approve 也不替代候选兼容验证。普通原位 `self_update` 直接执行 `uv tool upgrade`，不再以托管身份或数据库格式标记为由拒绝；需要独立保留安装或显式切换时仍使用 `self_switch`。迁入后的普通 `service install` 不能覆盖稳定服务入口。
 
 管理 API 复用 `POST /api/management/transactions`：
 

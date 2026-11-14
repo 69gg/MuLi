@@ -126,7 +126,7 @@ ASR 转写收藏将当时的 `memory=1` 扩为 `memory=2`，新增 `attachment:<
 
 Runtime 与 ChannelApplication 重配置入口先核；server 在关闭可用组件之前核一次，在全部 close awaits 后、保存候选配置之前再核；Extensions 在最后一次异步 fingerprint 后、无 await 的 persist/publish 前核，失败丢弃未发布候选连接。预先坏状态不会先关闭组件；关闭途中发生变化时不保存 target，仍传播失败并沿用原有恢复策略，不承诺所有组件一定可恢复。
 
-与本片配套的更新能力检查会重核 admitted 状态，已标记库暂拒 Runtime 内原位自动升级，直到完整候选切换接通；legacy 沿用原安装检查。版本查询与通知仍可用，不许诺批准即可安装。`format_state` 不等于 `migration_allowed`：已有禁止迁移入口也可打开无标记 legacy。跨 data-dir 共享同一 uv 环境、手工外部升级或直接运行不识别 marker 的旧程序，不在当前 Runtime 封口的全局控制范围内。
+更新能力不再以该标记作为门禁：`update_capability` 恒为原位更新，`self_update` 直接执行 `uv tool upgrade`，标记只用于打开数据库时的只读核验。版本查询与通知仍可用。`format_state` 不等于 `migration_allowed`：已有禁止迁移入口也可打开无标记 legacy。跨 data-dir 共享同一 uv 环境、手工外部升级或直接运行不识别 marker 的旧程序，不在当前 Runtime 封口的全局控制范围内。
 
 ## 回归范围
 
