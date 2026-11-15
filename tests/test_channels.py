@@ -27,6 +27,7 @@ from muli.channels import (
 )
 from muli.channels.adapters import QQ, OneBot
 from muli.channels.crypto import aes_media, sign_qq, verify_qq
+from muli.channels.weixin import Weixin, qr_base_url
 from muli.config import ConfigFile
 from muli.events import EventBus
 from muli.reply_origin import authorize_route
@@ -676,6 +677,40 @@ async def test_weixin_context_private_media_roundtrip_and_wire_protocol(
     await harness.close()
 
 
+async def test_remote_requests_keep_only_static_protocol_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def public(url: str) -> tuple[httpx.URL, str, str]:
+        return httpx.URL(url), "cdn.invalid", "cdn.invalid"
+
+    monkeypatch.setattr("muli.channels.http.public_url", public)
+    seen: list[httpx.Headers] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        return httpx.Response(200, content=b"ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = OneBot(profile(), client)
+        await adapter.http.request(
+            "GET",
+            "https://cdn.invalid/file",
+            remote=True,
+            headers={
+                "Authorization": "Bearer SECRET",
+                "Cookie": "session=SECRET",
+                "iLink-App-Id": "bot",
+                "iLink-App-ClientVersion": "123",
+                "X-WECHAT-UIN": "MTIzNA==",
+            },
+        )
+    assert "authorization" not in seen[0] and "cookie" not in seen[0]
+    assert seen[0]["ilink-app-id"] == "bot"
+    assert seen[0]["ilink-app-clientversion"] == "123"
+    assert seen[0]["x-wechat-uin"] == "MTIzNA=="
+    assert seen[0]["host"] == "cdn.invalid"
+
+
 async def test_decoded_response_limit_and_safe_errors() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"x" * 100)
@@ -1082,3 +1117,76 @@ async def test_duplicate_delivery_keeps_its_original_continuity_reference(tmp_pa
     assert omitted["id"] == first["id"]
     assert omitted["payload"]["channel_continuity"] == reference
     await harness.close()
+
+
+async def test_weixin_qr_login_uses_unauthenticated_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def public(url: str) -> tuple[httpx.URL, str, str]:
+        return httpx.URL(url), "ilink.invalid", "ilink.invalid"
+
+    monkeypatch.setattr("muli.channels.http.public_url", public)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("get_bot_qrcode"):
+            assert request.method == "POST"
+            assert json.loads(request.content) == {"local_token_list": []}
+            return httpx.Response(
+                200, json={"qrcode": "session-1", "qrcode_img_content": "https://wx.invalid/q/1"}
+            )
+        assert request.url.path.endswith("get_qrcode_status")
+        assert request.url.params["qrcode"] == "session-1"
+        assert request.url.params["verify_code"] == "1234"
+        return httpx.Response(200, json={"status": "wait"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = Weixin(
+            profile(account_id="account", user_id="bot_user", base_url="https://ilink.invalid"),
+            client,
+        )
+        assert await adapter.qr_login_start() == ("session-1", "https://wx.invalid/q/1")
+        await adapter.qr_login_poll("session-1", "https://login.invalid", verify_code="1234")
+
+    for request in requests:
+        assert "authorization" not in request.headers
+        assert request.headers["ilink-app-id"] == "bot"
+    assert requests[1].url == httpx.URL(
+        "https://login.invalid/ilink/bot/get_qrcode_status?qrcode=session-1&verify_code=1234"
+    )
+
+
+async def test_weixin_qr_login_rejects_incomplete_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def public(url: str) -> tuple[httpx.URL, str, str]:
+        return httpx.URL(url), "ilink.invalid", "ilink.invalid"
+
+    monkeypatch.setattr("muli.channels.http.public_url", public)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"qrcode": "session-1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = Weixin(
+            profile(account_id="account", user_id="bot_user", base_url="https://ilink.invalid"),
+            client,
+        )
+        with pytest.raises(ChannelError, match="二维码"):
+            await adapter.qr_login_start()
+
+
+def test_qr_base_url_accepts_only_bare_https_origins() -> None:
+    assert qr_base_url("https://ilinkai.weixin.qq.com") == "https://ilinkai.weixin.qq.com"
+    assert qr_base_url(" https://ilinkai.weixin.qq.com/ ") == "https://ilinkai.weixin.qq.com"
+    for value in (
+        "http://ilinkai.weixin.qq.com",
+        "https://ilinkai.weixin.qq.com/path",
+        "https://user:pass@ilinkai.weixin.qq.com",
+        "https://ilinkai.weixin.qq.com:8443",
+        "https://ilinkai.weixin.qq.com?query=1",
+        "",
+    ):
+        with pytest.raises(ChannelError, match="登录地址"):
+            qr_base_url(value)

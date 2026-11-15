@@ -14,6 +14,12 @@ from muli.tools.web import public_url
 
 from .types import ChannelError, ChannelProfile, valid_url
 
+# Remote requests rebuild their headers so no credential can leak to a resolved
+# host; only static protocol headers survive, never Authorization or cookies.
+_REMOTE_HEADERS = frozenset(
+    {"content-type", "ilink-app-id", "ilink-app-clientversion", "x-wechat-uin"}
+)
+
 
 class ChannelHTTP:
     def __init__(self, client: httpx.AsyncClient, profile: ChannelProfile) -> None:
@@ -38,9 +44,12 @@ class ChannelHTTP:
                 if remote:
                     target, host, tls = await public_url(url)
                     original_headers = kwargs.get("headers", {})
-                    kwargs["headers"] = {"Host": host}
-                    if "Content-Type" in original_headers:
-                        kwargs["headers"]["Content-Type"] = original_headers["Content-Type"]
+                    kwargs["headers"] = {
+                        name: value
+                        for name, value in original_headers.items()
+                        if name.lower() in _REMOTE_HEADERS
+                    }
+                    kwargs["headers"]["Host"] = host
                     kwargs["extensions"] = {"sni_hostname": tls}
                 else:
                     target = httpx.URL(url)

@@ -7,7 +7,7 @@ import hashlib
 import math
 import secrets
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from muli import __version__
 
@@ -16,6 +16,7 @@ from .crypto import aes_key, aes_media
 from .types import ChannelError, FileContent, IncomingMessage, PollBatch, RemoteFile
 
 PROTOCOL_VERSION = "2.4.6"
+DEFAULT_WEIXIN_BASE_URL = "https://ilinkai.weixin.qq.com"
 _CLIENT_VERSION = (2 << 16) | (4 << 8) | 6
 
 
@@ -42,6 +43,60 @@ class Weixin(Adapter):
             "iLink-App-ClientVersion": str(_CLIENT_VERSION),
             "X-WECHAT-UIN": base64.b64encode(uin.encode("ascii")).decode("ascii"),
         }
+
+    @staticmethod
+    def _qr_headers() -> dict[str, str]:
+        # The QR endpoints are unauthenticated; a stale bot token must not
+        # participate in a fresh login.
+        uin = str(int.from_bytes(secrets.token_bytes(4), "big"))
+        return {
+            "Content-Type": "application/json",
+            "iLink-App-Id": "bot",
+            "iLink-App-ClientVersion": str(_CLIENT_VERSION),
+            "X-WECHAT-UIN": base64.b64encode(uin.encode("ascii")).decode("ascii"),
+        }
+
+    async def qr_login_start(self) -> tuple[str, str]:
+        """Request one iLink QR payload and its encoded login content."""
+        result = await self.http.json(
+            "POST",
+            self.endpoint("ilink/bot/get_bot_qrcode?bot_type=3"),
+            json={"local_token_list": []},
+            headers=self._qr_headers(),
+            timeout=max(self.profile.timeout, 20),
+            remote=True,
+        )
+        qrcode = result.get("qrcode")
+        content = result.get("qrcode_img_content")
+        if (
+            not isinstance(qrcode, str)
+            or not qrcode.strip()
+            or len(qrcode) > 2048
+            or not isinstance(content, str)
+            or not content.strip()
+            or len(content) > 8192
+        ):
+            raise ChannelError("iLink 二维码响应格式错误")
+        return qrcode.strip(), content.strip()
+
+    async def qr_login_poll(
+        self, qrcode: str, base_url: str, *, verify_code: str = ""
+    ) -> dict[str, Any]:
+        """One long poll of an iLink login session; no bot credentials are sent."""
+        if not isinstance(qrcode, str) or not qrcode or len(qrcode) > 2048:
+            raise ChannelError("iLink 二维码会话无效")
+        endpoint = (
+            qr_base_url(base_url) + "/ilink/bot/get_qrcode_status?qrcode=" + quote(qrcode, safe="")
+        )
+        if verify_code:
+            endpoint += "&verify_code=" + quote(verify_code, safe="")
+        return await self.http.json(
+            "GET",
+            endpoint,
+            headers=self._qr_headers(),
+            timeout=max(self.profile.timeout, 40),
+            remote=True,
+        )
 
     async def call(
         self,
@@ -274,3 +329,26 @@ class Weixin(Adapter):
         if len(content) > self.profile.max_file_bytes:
             raise ChannelError("iLink 解密后文件超过上限")
         return FileContent(file.name, file.mime_type, content)
+
+
+def qr_base_url(value: str) -> str:
+    """Accept only a bare HTTPS origin returned by the QR status endpoint."""
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ChannelError("iLink 登录地址无效")
+    parsed = urlsplit(value.strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ChannelError("iLink 登录地址无效") from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+    ):
+        raise ChannelError("iLink 登录地址无效")
+    return "https://" + parsed.hostname

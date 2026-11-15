@@ -16,9 +16,9 @@ MuLi 支持 Telegram、OneBot/NapCat、QQ 官方机器人和微信 iLink。它�
 | Telegram | `token_env`、`owner_ids`；使用 `getUpdates` 长轮询，默认地址 `https://api.telegram.org` |
 | OneBot/NapCat | `base_url`、必填的主人 QQ 号 `owner_ids`、`webhook_secret_env`；配置反向 HTTP 到 MuLi 的 `/api/channels/onebot/webhook`，两端密钥一致 |
 | QQ 官方机器人 | `app_id`、`client_secret_env`、`owner_ids`；平台回调地址为 MuLi 的 `/api/channels/qq/webhook` |
-| 微信 iLink | `token_env`、`account_id`、`user_id`、`owner_ids`；使用 `getupdates` 长轮询 |
+| 微信 iLink | `token_env`、`account_id`、`user_id`、`owner_ids`；也可用 `channel_bind` 扫码自动填写；使用 `getupdates` 长轮询 |
 
-Telegram 长轮询不能与平台 webhook 同时使用；已有 webhook 需要管理员先移除。QQ 回调需要平台能访问的 HTTPS 地址及相应权限。iLink 凭据由用户提供，MuLi 不做扫码登录，也不读取其他程序的凭据文件。
+Telegram 长轮询不能与平台 webhook 同时使用；已有 webhook 需要管理员先移除。QQ 回调需要平台能访问的 HTTPS 地址及相应权限。iLink 支持在网页里扫码绑定：主助手用 `channel_bind` 的 `weixin_qr` 生成二维码图片（自动显示在回复里），用户用手机确认后自动写入凭据、把扫码用户设为主人并启用微信渠道；MuLi 不读取其他程序的凭据文件。
 
 Telegram、OneBot、QQ 官方机器人启用前必须绑定主人；若要清空主人绑定，请同时关闭该渠道。OneBot 须填写数字 QQ 号；Telegram 填写真实用户 ID，QQ 官方机器人填写平台提供的用户 openid，不能使用昵称或备注。外部渠道只发送助手的文字回复和显式发送的附件，不发送思考链或工具调用通知。
 
@@ -39,6 +39,15 @@ Telegram、OneBot、QQ 官方机器人启用前必须绑定主人；若要清空
 ```
 
 `token`、`webhook_secret`、`client_secret` 在公开配置中脱敏。配置了环境变量名但运行环境中没有该变量时，不回退到明文值。后台服务的环境可能与当前终端不同，修改后需要确认服务实际读取到了变量。
+
+### 微信扫码绑定
+
+在网页主对话里让沐璃绑定微信，它会调用 `channel_bind` 的 `weixin_qr`：生成 iLink 登录二维码并以附件形式显示在这条回复里，同时在后台轮询状态。用手机扫码并确认后，登录结果会自动写入 `channels.weixin`（`token`、`account_id`、`user_id`、`base_url`），把扫码用户加入 `owner_ids` 并启用渠道；凭据不会出现在事件、工具结果或聊天正文里。
+
+- `weixin_status` 查询当前扫码会话；二维码过期后需要重新生成。
+- 需要微信数字验证码时用 `weixin_verify` 提交，最多 8 位数字。
+- `weixin_cancel` 取消轮询；配置排队失败时可用 `weixin_apply` 重试写入。
+- 该工具只允许主助手在主人当前的网页请求中调用，不读取或覆盖其它程序的凭据文件。
 
 ### 后台接收状态
 
@@ -74,17 +83,15 @@ Telegram、微信的“后台接收”区分尚未验证、最近正常和故障
 
 QQ 默认 API 地址为 `https://api.bot.qq.com`，iLink 为 `https://ilinkai.weixin.qq.com`。配置地址不能含账号密码、query 或 fragment。OneBot 可以明确使用本地 HTTP 地址；附件下载地址不能借此访问本机、内网或重定向目标。
 
-### 可选依赖
+### 依赖
 
-QQ 签名和 iLink 媒体加密需要 `channels` 扩展中的 `cryptography`。Telegram、OneBot 文本不依赖它。使用发行包时：
+QQ 签名、iLink 媒体加密和二维码图片依赖已包含在发行包中（`cryptography`、`qrcode`），无需额外 extra。`mcp` 仍是可选扩展：
 
 ```bash
-uv tool install "muli-agent[channels]"
+uv tool install "muli-agent[mcp]"
 ```
 
-同时使用 MCP 时安装 `muli-agent[mcp,channels]`，并保留原先的自定义索引、Python 或 `--with` 参数。安装后重启服务。发行包名是 `muli-agent`，命令为 `MuLi` / `muli`。
-
-源码环境使用 `uv sync --locked --extra channels`，启动使用 `uv run --extra channels MuLi serve`；需要 MCP 时两条命令都加 `--extra mcp`。不带所需 extra 的同步或运行命令可能移除对应依赖。安装依赖不会自动启用渠道。
+源码环境使用 `uv sync --locked`，启动使用 `uv run MuLi serve`；需要 MCP 时两条命令都加 `--extra mcp`。安装依赖不会自动启用渠道。
 
 ## 身份与回复路由
 

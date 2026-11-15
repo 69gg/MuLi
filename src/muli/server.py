@@ -543,6 +543,7 @@ def _create_app(
         }
     )
     app.state.management, app.state.plugins = management, plugins
+    channel_application.stage_configuration = management.stage
     app.state.memory_application = memory_application
     app.state.attention = attention
     app.state.file_inbox = file_inbox

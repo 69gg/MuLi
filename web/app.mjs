@@ -985,6 +985,7 @@ function startGlobalEvents(owner = connection) {
     if (event.type === "commitment.updated") markTaskDirectoryDirty(event.data);
     if (["memory.updated", "memory.forgotten"].includes(event.type)) { invalidateMemoryPath(); invalidateMemoryEvidence(event); }
     if (event.type === "upload.created" && state.view === "uploads") void refreshUploads(owner);
+    if (event.type === "weixin.bound") toast(event.data?.message || "微信已绑定，配置正在应用。");
     if (event.type === "channel.updated" && channelDeliveryDialogCurrent(channelDeliveryDialog)) {
       channelDeliveryDialog.dirty = true;
       if (channelDeliveryDialog.dirtyNotice) channelDeliveryDialog.dirtyNotice.hidden = false;
@@ -4520,9 +4521,10 @@ function renderChannelSettings() {
       enabled,
       field("服务地址", `${path}.base_url`, profile.base_url ?? "", { type: "url" }),
       owner,
+      ...(key === "weixin" ? [field("iLink account_id", `${path}.account_id`, profile.account_id ?? "", { hint: "扫码绑定会自动填写；手工填写时需与 token 对应。" }), field("iLink user_id", `${path}.user_id`, profile.user_id ?? "", { hint: "扫码绑定会自动填写扫码用户的 ID。" })] : []),
       !privateOwner && field("允许的群组 ID", `${path}.allowed_groups`, (profile.allowed_groups ?? []).join("\n"), { type: "textarea", rows: 2, format: "lines" }),
       switchField("接收附件", `${path}.receive_files`, profile.receive_files), credentials,
-      settingsJSON(path, profile, commonFields),
+      settingsJSON(path, profile, key === "weixin" ? [...commonFields, "account_id", "user_id"] : commonFields),
       status && statusList([["运行", capabilityLabel(status)], ["语音发送", status.voice_supported ? "原生语音" : "仅文件"], ...(status.receive_health ? [["后台接收", !status.enabled ? "已关闭" : ({ idle: "尚未验证", ready: "最近正常", failed: "故障" })[status.receive_health.state] ?? "尚未验证"]] : []), ["已授权用户", String(status.owner_count ?? 0)], ...(privateOwner ? [["接收范围", "仅主人私聊"]] : [["允许的群组", String(status.group_count ?? 0)]])]),
       status?.last_error && element("p", { class: "form-error", text: status.last_error })));
   }

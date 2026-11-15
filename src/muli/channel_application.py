@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from muli.attachments import Attachments, attachment_ids_schema
@@ -26,6 +26,7 @@ from muli.providers import Message
 from muli.reply_origin import authorize_route, channel_account
 from muli.runtime import Runtime
 from muli.tools import Tool, parameters, string
+from muli.weixin_binding import WeixinBinding
 
 
 class ChannelApplication:
@@ -33,8 +34,23 @@ class ChannelApplication:
         self.runtime, self.attachments = runtime, attachments
         self._generation = 0
         self.manager = self._manager()
+        self.stage_configuration: Callable[..., Awaitable[dict[str, Any]]] | None = None
+        self.weixin_binding = WeixinBinding(
+            runtime,
+            attachments,
+            lambda: self.manager.adapters["weixin"],
+            self._stage_configuration,
+        )
         runtime.add_tool_provider(self.tools)
         runtime.context_hooks.append(self.context)
+
+    async def _stage_configuration(
+        self, action: str, changes: dict[str, Any], *, apply_mode: str = "in_process"
+    ) -> dict[str, Any]:
+        stage = self.stage_configuration
+        if stage is None:
+            raise ValueError("配置管理尚未就绪")
+        return await stage(action, changes, apply_mode=apply_mode)
 
     async def context(self, session_id: str, messages: list[Message]) -> list[Message]:
         request = self.runtime.request_context(session_id)
@@ -491,6 +507,7 @@ class ChannelApplication:
 
     async def close(self) -> None:
         self._generation += 1
+        await self.weixin_binding.close()
         await self.manager.close()
 
     async def reconfigure(self) -> None:
@@ -498,6 +515,12 @@ class ChannelApplication:
         self.runtime.channel_ownership.reconcile()
         await self.close()
         self.manager = self._manager()
+        self.weixin_binding = WeixinBinding(
+            self.runtime,
+            self.attachments,
+            lambda: self.manager.adapters["weixin"],
+            self._stage_configuration,
+        )
         await self.start()
 
     async def _reply_files(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -886,6 +909,38 @@ class ChannelApplication:
                 continuity=runtime.channel_continuity.reference(request.channel_ownership),
             )
 
+        async def bind(args: dict[str, Any]) -> dict[str, Any]:
+            caller = runtime.tool_session_id
+            execution = runtime._tool_execution.get()
+            request = runtime.request_context(caller) if caller is not None else None
+            task = asyncio.current_task()
+            if (
+                runtime._closing
+                or caller is None
+                or execution is None
+                or execution != (caller, runtime.run_ids.get(caller))
+                or request is None
+                or task is None
+                or runtime.tasks.get(caller) is not task
+                or caller != runtime.store.existing_main_session_id()
+                or runtime._owner_round_input(request, execution[1]) is None
+                or "channel_bind" in runtime.config.settings.disabled_tools
+            ):
+                raise PermissionError("微信绑定仅允许主助手在主人当前请求中发起")
+            action = str(args.get("action", ""))
+            session_id = str(args.get("session_id", "")).strip()
+            if action == "weixin_qr":
+                return await self.weixin_binding.start()
+            if action == "weixin_status":
+                return await self.weixin_binding.status(session_id)
+            if action == "weixin_verify":
+                return await self.weixin_binding.verify(session_id, str(args.get("code", "")))
+            if action == "weixin_cancel":
+                return await self.weixin_binding.cancel(session_id)
+            if action == "weixin_apply":
+                return await self.weixin_binding.apply(session_id)
+            raise ValueError("未知绑定操作")
+
         return [
             Tool(
                 "channel_delegate",
@@ -960,6 +1015,33 @@ class ChannelApplication:
                 "查看可选渠道与持久投递记录；不把排队当作已送达",
                 parameters({}),
                 status,
+            ),
+            Tool(
+                "channel_bind",
+                "绑定消息渠道。weixin_qr 生成 iLink 登录二维码并在后台自动轮询："
+                "二维码图片会自动显示在网页，用户扫码确认后自动写入凭据、"
+                "把扫码用户设为主人并启用微信渠道；状态可用 weixin_status 查询，"
+                "需要数字验证码时用 weixin_verify，排队失败可 weixin_apply 重试。"
+                "仅在主人当前 Web 请求中发起；不读取或覆盖其它渠道凭据",
+                parameters(
+                    {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "weixin_qr",
+                                "weixin_status",
+                                "weixin_verify",
+                                "weixin_cancel",
+                                "weixin_apply",
+                            ],
+                        },
+                        "session_id": string("weixin_qr 返回的扫码会话 ID"),
+                        "code": string("微信要求的数字验证码"),
+                    },
+                    ("action",),
+                ),
+                bind,
+                "write",
             ),
             Tool(
                 "channel_cancel",

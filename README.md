@@ -71,13 +71,13 @@ MuLi service restart
 MuLi doctor
 ```
 
-也可在工作台设置中管理服务和查看日志。QQ 官方机器人与微信 iLink 需要可选依赖：
+也可在工作台设置中管理服务和查看日志。QQ 官方机器人与微信 iLink 所需依赖已随发行包安装，包括二维码扫码绑定；MCP 仍是可选扩展：
 
 ```bash
-uv tool install 'muli-agent[channels]'
+uv tool install 'muli-agent[mcp]'
 ```
 
-同时使用 MCP 时，可安装 `muli-agent[mcp,channels]`。安装后按[渠道说明](docs/channels.md)完成接入。
+安装后按[渠道说明](docs/channels.md)完成接入。
 
 ## 使用指南
 
