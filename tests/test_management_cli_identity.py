@@ -109,7 +109,7 @@ async def test_unresolved_matching_unit_refuses_raw_actions(
         await guarded_service_action(installed.service, "restart")
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo", "oversized", "custom"])
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "oversized", "entry"])
 async def test_unverified_unit_never_reaches_service_control(
     installed: Installed, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
@@ -123,9 +123,9 @@ async def test_unverified_unit_never_reaches_service_control(
     elif kind == "fifo":
         os.mkfifo(path)
     elif kind == "oversized":
-        path.write_bytes(standard + b"extra")
+        path.write_bytes(standard + b"#" * (1 << 20))
     else:
-        path.write_bytes(standard.replace(b"Restart=on-failure", b"Restart=no"))
+        path.write_bytes(standard.replace(b'"serve"', b'"doctor"'))
 
     async def unexpected(action: str) -> Never:
         raise AssertionError("unit verification must finish before control")
@@ -133,6 +133,25 @@ async def test_unverified_unit_never_reaches_service_control(
     monkeypatch.setattr(installed.service, "action", unexpected)
     with pytest.raises(TransactionError, match="service_identity_"):
         await guarded_service_action(installed.service, "install")
+
+
+async def test_stale_unit_is_refreshed_by_install_but_not_by_control(
+    installed: Installed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = installed.service.path
+    path.write_bytes(path.read_bytes().replace(b"TasksMax=64", b"TasksMax=64\nMemoryMax=512M"))
+    calls: list[str] = []
+
+    async def action(name: str) -> dict[str, Any]:
+        calls.append(name)
+        return {"accepted": True}
+
+    monkeypatch.setattr(installed.service, "action", action)
+    with pytest.raises(TransactionError, match="service_identity_changed"):
+        await guarded_service_action(installed.service, "restart")
+    assert calls == []
+    result = await guarded_service_action(installed.service, "install")
+    assert result["accepted"] and calls == ["install"]
 
 
 async def test_unit_is_rechecked_after_the_authority_is_locked(

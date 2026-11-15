@@ -32,12 +32,22 @@ def _check_paths(
         raise TransactionError("boot_paths_changed")
 
 
+_UNIT_LIMIT = 1 << 20
+
+
+def _exec_start(data: bytes) -> bytes | None:
+    for line in data.splitlines():
+        if line.startswith(b"ExecStart="):
+            return line
+    return None
+
+
 def _check_unit(service: UserService, *, installing: bool) -> None:
     # The unit name is shared across data roots. Never choose its transaction
     # authority from caller paths until its actual standard entry matches them.
     expected = service.render().encode("utf-8")
     try:
-        with ConfigurationFile(service.path, len(expected)) as source:
+        with ConfigurationFile(service.path, _UNIT_LIMIT) as source:
             actual = source.read().data
     except FileNotFoundError:
         if installing:
@@ -45,8 +55,14 @@ def _check_unit(service: UserService, *, installing: bool) -> None:
         raise TransactionError("service_unit_missing") from None
     except (OSError, ValueError):
         raise TransactionError("service_identity_unverified") from None
-    if actual != expected:
-        raise TransactionError("service_identity_changed")
+    if actual == expected:
+        return
+    # A release can change directives outside ExecStart. Reinstalling is the
+    # documented way to refresh them, but only for the same entry; control
+    # actions still require the exact current unit.
+    if installing and _exec_start(actual) == _exec_start(expected):
+        return
+    raise TransactionError("service_identity_changed")
 
 
 async def management_action(
