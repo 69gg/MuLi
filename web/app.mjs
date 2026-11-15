@@ -1004,6 +1004,8 @@ function startSessionEvents(sessionId, owner = connection) {
       if (next === state.session) return;
       state.session = next;
       syncAnswerSpeech();
+      const published = event.type === "message.completed" ? event.data?.message?.attachment_ids : null;
+      if (Array.isArray(published) && published.some((identifier) => !state.uploads.some((file) => file.id === identifier))) void refreshUploadIndex(owner);
       if (["run.completed", "run.failed", "run.cancelled", "run.paused", "session.recovered"].includes(event.type)) { state.sending = false; void refreshSessions(owner); }
       queueRender();
     },
@@ -1697,6 +1699,16 @@ async function addFiles(files) {
   }
   if (current() && state.view === "uploads") renderOtherView();
   composerUploads.delete(controller);
+}
+
+async function refreshUploadIndex(owner = connection) {
+  if (!connectionCurrent(owner)) return;
+  try {
+    const payload = await ownedRequest("/uploads", {}, owner);
+    if (!connectionCurrent(owner)) return;
+    state.uploads = collection(payload);
+    queueRender();
+  } catch { /* the next full refresh will retry */ }
 }
 
 async function refreshUploads(owner = connection) {

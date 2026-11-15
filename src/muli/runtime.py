@@ -321,6 +321,7 @@ class Runtime:
         self._shell_generation = 0
         self._shell_mode_epochs: dict[str, int] = {}
         self._shell_requests: dict[str, PreparedRequest] = {}
+        self._published_attachments: dict[str, list[str]] = {}
         self._stopping: dict[str, int] = {}
         self.tasks: dict[str, asyncio.Task[str]] = {}
         self._session_finalizers: set[asyncio.Task[Any]] = set()
@@ -494,6 +495,18 @@ class Runtime:
         except (EvidenceError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
             # Optional write capability must disappear on an unprovable round.
             return None
+
+    def record_published_attachment(self, identifier: str) -> None:
+        """Show a file published in this run with the next assistant message."""
+        owner = self._tool_execution.get()
+        if owner is None or not isinstance(identifier, str) or not identifier:
+            return
+        published = self._published_attachments.setdefault(owner[1], [])
+        if identifier not in published:
+            published.append(identifier)
+
+    def _take_published_attachments(self, run_id: str) -> list[str]:
+        return self._published_attachments.pop(run_id, [])
 
     def current_reply_origin(self) -> ReplyOrigin:
         session_id = self.tool_session_id
@@ -3060,6 +3073,7 @@ class Runtime:
             await self.bus.emit("run.failed", {"run_id": run_id, "error": run["error"]}, session_id)
             raise
         finally:
+            self._published_attachments.pop(run_id, None)
             self.system_events.end_run(log_scope)
             release_cancelled = False
             if consult is not None and run["status"] != "completed":
@@ -3769,12 +3783,14 @@ class Runtime:
                     if partial and not isinstance(
                         error, (MemorySourceFailureExpired, MemoryWatchMatchExpired)
                     ):
+                        published = self._take_published_attachments(run_id)
                         self.store.complete_message(
                             session_id,
                             partial,
                             interrupted=True,
                             delivery_routes=delivery_routes,
                             reply_origin=prepared.reply_origin.dump(),
+                            **({"attachment_ids": published} if published else {}),
                         )
                         await self.bus.notify()
                     raise
@@ -3797,6 +3813,7 @@ class Runtime:
                 messages.append(turn.to_message())
                 if prepared.attention_routing is not None and turn.tool_calls:
                     delivery_routes = []
+                published = self._take_published_attachments(run_id)
                 assistant_message = self.store.complete_message(
                     session_id,
                     turn.content,
@@ -3812,6 +3829,7 @@ class Runtime:
                         if prepared.attention_routing is not None
                         else {}
                     ),
+                    **({"attachment_ids": published} if published else {}),
                 )
                 if turn.tool_calls:
                     prepared = replace(prepared, tool_batch_seq=assistant_message["seq"])

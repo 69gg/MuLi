@@ -702,6 +702,7 @@ class LocalServices:
             source = capture_source(runtime, path)
             item = await self.attachments.import_file(path)
             stage_publication(runtime, source, item)
+            runtime.record_published_attachment(item["id"])
             await runtime.bus.emit("attachment.published", item)
             return item
 
