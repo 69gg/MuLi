@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -98,5 +99,20 @@ def test_existing_identity_read_never_creates_or_returns_invalid_marker(
         )
         assert store.db.total_changes == writes
         assert store.list("session") == []
+    finally:
+        store.close()
+
+
+def test_list_breaks_equal_update_times_by_newest_write(tmp_path: Path) -> None:
+    store = Store(tmp_path / "order.db")
+    try:
+        # Windows clock resolution can give every write the same timestamp; the
+        # recent-object window must still prefer later inserts over rowid order.
+        for index in range(4):
+            store.db.execute(
+                "INSERT INTO objects VALUES('note',?,?,1.0)",
+                (f"n{index}", json.dumps({"id": f"n{index}"})),
+            )
+        assert [item["id"] for item in store.list("note", 2)] == ["n3", "n2"]
     finally:
         store.close()

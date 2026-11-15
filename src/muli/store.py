@@ -844,7 +844,7 @@ class Store:
 
     def list(self, kind: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.db.execute(
-            "SELECT data FROM objects WHERE kind=? ORDER BY updated DESC LIMIT ?",
+            "SELECT data FROM objects WHERE kind=? ORDER BY updated DESC, rowid DESC LIMIT ?",
             (kind, limit),
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
