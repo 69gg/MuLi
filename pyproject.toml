@@ -6,7 +6,7 @@ authors = [{name = "Null", email = "pylindex@qq.com"}]
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.119,<1", "httpx>=0.28,<1", "jsonschema>=4.23,<5", "packaging>=25,<26", "pydantic>=2.12,<3", "pyyaml>=6.0.3,<7", "tzdata>=2026.5", "uvicorn>=0.38,<1"]
+dependencies = ["cryptography>=43,<48", "fastapi>=0.119,<1", "httpx>=0.28,<1", "jsonschema>=4.23,<5", "packaging>=25,<26", "pydantic>=2.12,<3", "pyyaml>=6.0.3,<7", "qrcode>=8,<9", "tzdata>=2026.5", "uvicorn>=0.38,<1"]
 
 [project.scripts]
 muli = "muli.__main__:main"
