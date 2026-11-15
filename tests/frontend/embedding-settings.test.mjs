@@ -17,7 +17,12 @@ function harness(embedding = {}) {
   const context = {
     state: { settingsDraft: { media: { embedding } } },
     element, field, pretty: (value) => JSON.stringify(value, null, 2),
-    switchField: field, settingsSection: () => null, settingsJSON: () => null,
+    switchField: field, selectField: (label, name, value, options = []) => {
+      const control = { label, name, value, options: { choices: options } };
+      controls.set(name, control);
+      return control;
+    },
+    settingsSection: () => null, settingsJSON: () => null,
     $: (selector, parent) => {
       assert.equal(selector, "details.advanced-settings");
       return parent.children.find((node) => node.tag === "details" && node.props.class === "advanced-settings");
