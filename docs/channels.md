@@ -81,7 +81,7 @@ Telegram、微信的“后台接收”区分尚未验证、最近正常和故障
 | `channels.max_attempts` | 每段或附件最多尝试 3 次 |
 | `channels.retry_backoff_seconds` | 重试等待基数 5 秒 |
 
-QQ 默认 API 地址为 `https://api.bot.qq.com`，iLink 为 `https://ilinkai.weixin.qq.com`。配置地址不能含账号密码、query 或 fragment。OneBot 可以明确使用本地 HTTP 地址；附件下载地址不能借此访问本机、内网或重定向目标。
+QQ 默认 API 地址为 `https://api.bot.qq.com`，iLink 为 `https://ilinkai.weixin.qq.com`。配置地址不能含账号密码、query 或 fragment。OneBot 可以明确使用本地 HTTP 地址；附件上传和下载也允许本机、内网与保留地址，但仍不跟随重定向。
 
 ### 依赖
 

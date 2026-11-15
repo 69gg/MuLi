@@ -737,8 +737,12 @@ def test_profiles_validate_and_public_masks_secrets(monkeypatch: pytest.MonkeyPa
         profile(timeout=float("inf"))
 
 
-async def test_owner_attachment_local_address_is_rejected_without_http(tmp_path: Path) -> None:
-    harness = Harness(tmp_path, ChannelsConfig(onebot=profile(receive_files=True)), unused)
+async def test_owner_attachment_local_address_is_downloaded(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "127.0.0.1"
+        return httpx.Response(200, content=b"PRIVATE")
+
+    harness = Harness(tmp_path, ChannelsConfig(onebot=profile(receive_files=True)), handler)
     await harness.manager.receive(
         "onebot",
         IncomingMessage(
@@ -749,9 +753,10 @@ async def test_owner_attachment_local_address_is_rejected_without_http(tmp_path:
             files=(RemoteFile("secret.txt", url="http://127.0.0.1/private"),),
         ),
     )
-    assert harness.received[0]["content"].startswith("继续处理文字")
-    assert "附件未接收" in harness.received[0]["content"]
-    assert not harness.attachments.list()
+    received = harness.received[0]
+    assert received["content"].startswith("继续处理文字")
+    assert len(received["attachment_ids"]) == 1
+    assert harness.attachments.path(received["attachment_ids"][0]).read_bytes() == b"PRIVATE"
     await harness.close()
 
 
@@ -1190,3 +1195,12 @@ def test_qr_base_url_accepts_only_bare_https_origins() -> None:
     ):
         with pytest.raises(ChannelError, match="登录地址"):
             qr_base_url(value)
+
+
+async def test_public_url_allows_local_addresses() -> None:
+    from muli.tools.web import public_url
+
+    target, host, tls = await public_url("http://localhost:8765/page")
+    assert target.host in {"127.0.0.1", "::1"}
+    assert host == "localhost:8765"
+    assert tls == "localhost"
