@@ -5645,6 +5645,16 @@ $("#login-form").addEventListener("submit", async (event) => {
   finally { button.disabled = false; }
 });
 $("#message-input").addEventListener("input", () => { composerChanged(); resizeComposer(); renderComposerDraft(); });
+$("#message-input").addEventListener("paste", (event) => {
+  const clipboard = event.clipboardData;
+  const files = [...(clipboard?.files ?? [])];
+  if (!files.length && clipboard?.items) {
+    for (const item of clipboard.items) if (item.kind === "file") { const file = item.getAsFile(); if (file) files.push(file); }
+  }
+  if (!files.length) return;
+  event.preventDefault();
+  void addFiles(files);
+});
 $("#message-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#composer").requestSubmit(); }
 });
