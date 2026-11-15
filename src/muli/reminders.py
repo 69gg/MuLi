@@ -238,7 +238,8 @@ class Reminders:
 
     def records(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.store.db.execute(
-            "SELECT kind,id,data FROM objects WHERE kind IN (?,?) ORDER BY updated DESC LIMIT ?",
+            "SELECT kind,id,data FROM objects WHERE kind IN (?,?) "
+            "ORDER BY updated DESC, rowid DESC LIMIT ?",
             (*_REMINDER_KINDS, limit),
         ).fetchall()
         result: list[dict[str, Any]] = []

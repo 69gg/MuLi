@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -430,6 +431,22 @@ async def test_real_change_during_timeout_cancellation_is_not_lost(
             with store.db:
                 store.db.execute("DROP TRIGGER reject_racing_notice")
         await close_clock(engine, store, injected)
+
+
+async def test_reminder_catalog_and_store_list_share_newest_first_ties(
+    tmp_path: Path,
+) -> None:
+    runtime, _ = make_runtime(tmp_path, [])
+    try:
+        for identifier in ("r1", "r2"):
+            runtime.store.db.execute(
+                "INSERT INTO objects VALUES('reminder',?,?,1.0)",
+                (identifier, json.dumps({"id": identifier, "enabled": True})),
+            )
+        assert [item["id"] for item in runtime.reminders.records()] == ["r2", "r1"]
+        assert [item["id"] for item in runtime.store.list("reminder")] == ["r2", "r1"]
+    finally:
+        await runtime.close()
 
 
 async def test_queued_clock_diagnostic_cannot_commit_a_later_unsettled_transaction(
