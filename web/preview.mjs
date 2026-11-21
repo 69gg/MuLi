@@ -60,7 +60,7 @@ export function createPreviewState() {
       limits: { max_parallel_agents: 3, max_pending_runs: 8, max_tool_steps: 24, max_run_seconds: 180, max_file_bytes: 10485760, max_output_chars: 6000, max_context_chars: 32000 },
       search: { provider: "searxng", base_url: "https://search.preview.invalid", max_results: 5 },
       memory: { enabled: true, auto_extract: true, max_candidates: 24, max_prompt_memories: 6 },
-      compaction: { enabled: true, threshold: 0.8 }, attention: { enabled: true, events: ["memory"] },
+      compaction: { enabled: true, idle_after_hours: 1, idle_trigger_percent: 10, trigger_ratio: 0.75, target_ratio: 0.4 }, attention: { enabled: true, events: ["memory"] },
       channels: {
         onebot: { enabled: true, base_url: "http://preview.invalid", owner_ids: ["7"], allowed_groups: [], receive_files: true, account_id: "preview-bot", token_set: false },
         telegram: { enabled: false, owner_ids: [], allowed_groups: [], receive_files: true, token_set: false },

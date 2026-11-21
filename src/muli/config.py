@@ -315,6 +315,8 @@ class CompactionSettings(Section):
     enabled: bool = True
     mode: Literal["auto", "extractive"] = "auto"
     trigger_ratio: float = Field(default=0.75, gt=0.2, lt=1)
+    idle_after_hours: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    idle_trigger_percent: int = Field(default=10, strict=True, ge=1, le=100)
     target_ratio: float = Field(default=0.4, gt=0.1, lt=0.8)
     max_summary_tokens: int = Field(default=1600, ge=128)
 

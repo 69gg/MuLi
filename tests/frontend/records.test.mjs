@@ -5,9 +5,9 @@ import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
 import { ApiError } from "../../web/api.mjs";
 import { VoiceSetup, voiceSetupLabel } from "../../web/voice-setup.mjs";
-import { createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning } from "../../web/state.mjs";
+import { createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning, parseJSONField } from "../../web/state.mjs";
 import { attachmentKind, attachmentURL, formatBytes } from "../../web/attachments.mjs";
-import { MODEL_ROLES } from "../../web/settings.mjs";
+import { MODEL_ROLES, mergeSettingsExtras, setPath, settingsExtras } from "../../web/settings.mjs";
 
 // Exercise the actual records page, global SSE and dialog handlers with native DOM text semantics.
 // No browser dependency, service, model, account or real database is involved.
@@ -123,6 +123,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
     AbortController, TextEncoder, URLSearchParams, console, queueMicrotask,
     setTimeout: () => 0, clearTimeout() {},
     createSessionState, hydrateSession, applyEvent, messagePresentation, isRunning, attachmentKind, attachmentURL, formatBytes, MODEL_ROLES,
+    parseJSONField, mergeSettingsExtras, setPath, settingsExtras,
     createTeamPager: () => ({}), captureTeamView: () => null, restoreTeamView() {},
     renderMarkdown: (text) => { const node = document.createElement("p"); node.textContent = text; return node; },
     uploadFile() {}, transcribeAttachment() {}, VoiceInput: class { cancel() {} }, VoiceSetup, voiceSetupLabel, sessionStorage: {},
@@ -138,7 +139,7 @@ function harness(handler = async () => { throw new Error("unexpected request"); 
       owner.sessions.start(); owner.notifications.start(); return owner;
     };
     activateConnection();
-    globalThis.ui = { state, renderOtherView, renderModelSettings, renderSessions, refreshSessions, loadRecordDirectory, releaseRecordDirectory, recordDirectoryPage, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
+    globalThis.ui = { state, renderOtherView, renderModelSettings, renderMediaSettings, collectSettingsForm, renderSessions, refreshSessions, loadRecordDirectory, releaseRecordDirectory, recordDirectoryPage, showHistoryArchive, loadSession, openDialog, showLogin, switchView, handleAction, startGlobalEvents, startSessionEvents,
       activateConnection, connect,
       get slot() { return recordDirectory; }, get historySlot() { return historyDialog; }, get draftRevision() { return draftRevision; },
       stopEvents() { globalController?.abort(); sessionController?.abort(); } };
@@ -430,6 +431,28 @@ test("nullable metadata, unknown status and invalid dates remain neutral; titles
   assert.equal(h.other.querySelectorAll("time").every((node) => node.textContent === "日期未记录"), true);
   assert.equal(h.ui.slot.page.items.every((item) => item.created_at === null && item.updated_at === null), true);
   assert.equal(h.other.textContent.includes("已完成"), false); assert.equal(h.other.textContent.includes("false"), false); assert.equal(h.other.textContent.includes("null"), false);
+});
+
+test("idle compaction settings survive collecting and redrawing the media form", () => {
+  const h = harness();
+  h.ui.state.settingsDraft = { compaction: { enabled: true, idle_after_hours: 1, idle_trigger_percent: 10 } };
+  const form = h.node("form", "settings-form", h.other);
+  form.append(h.ui.renderMediaSettings());
+  const input = (name) => form.querySelectorAll("input").find((field) => field.name === `compaction.${name}`);
+  const hours = input("idle_after_hours");
+  const percent = input("idle_trigger_percent");
+  const advanced = form.querySelector('[name="compaction"]');
+  assert.equal(hours.value, "1");
+  assert.equal(percent.value, "10");
+  assert.deepEqual(JSON.parse(advanced.value), { enabled: true });
+  hours.value = "0.5";
+  percent.value = "35";
+  h.ui.collectSettingsForm();
+  assert.equal(h.ui.state.settingsDraft.compaction.idle_after_hours, 0.5);
+  assert.equal(h.ui.state.settingsDraft.compaction.idle_trigger_percent, 35);
+  form.replaceChildren(h.ui.renderMediaSettings());
+  assert.equal(input("idle_after_hours").value, "0.5");
+  assert.equal(input("idle_trigger_percent").value, "35");
 });
 
 test("model token requirements follow the selected protocol without losing edits or requiring an empty secondary role", async () => {

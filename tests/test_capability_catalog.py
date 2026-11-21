@@ -149,6 +149,7 @@ async def test_default_real_registration_fits_existing_budget_and_is_passive(
         assert [item["name"] for item in catalog["items"]] == [
             tool.name for tool in runtime.tools.values()
         ]
+        assert [item["name"] for item in catalog["items"] if item["approval_exempt"]] == ["compact"]
         assert len({item["id"] for item in catalog["items"]}) == len(runtime.tools)
         assert all("parameters" not in item for item in catalog["items"])
         assert len(response.content) <= Limits().max_output_chars * 4

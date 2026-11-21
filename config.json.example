@@ -218,6 +218,8 @@
     "enabled": true,
     "mode": "auto",
     "trigger_ratio": 0.75,
+    "idle_after_hours": 1,
+    "idle_trigger_percent": 10,
     "target_ratio": 0.4,
     "max_summary_tokens": 1600
   },

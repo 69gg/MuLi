@@ -174,7 +174,7 @@ chiliarch 的工作流能力使用原生目标、任务与验收操作：
 
 agent 身份申请操作时发送 `agent.request`：`payload={request_id, operation, arguments, message, metadata}`；结果从 `request.resolved` 返回。`request_id` 是稳定业务身份，与 envelope ID 分开。并非每个操作都会立即执行，权限与审批仍由 chiliarch 统一入口处理；请求已接收、审批已通过、执行已完成与结果已验收是不同状态。
 
-MuLi 的 `ask/auto/yolo` 应在本地统一工具入口落实，不能让外部事件或下级 agent 绕过它。它与 chiliarch 的审批模式分别生效；尤其 MuLi 的 ask 是每次工具调用询问用户，而 chiliarch 当前 ask 只针对会改变状态的操作。
+MuLi 的 `ask/auto/yolo` 应在本地统一工具入口落实，不能让外部事件或下级 agent 绕过它。两套审批模式分别生效。MuLi 的 `ask` 对需要审批的工具逐次询问用户。chiliarch 当前的 `ask` 只针对会改变状态的操作。
 
 ## 验证
 

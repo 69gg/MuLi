@@ -20,6 +20,10 @@ def test_shipped_configuration_example_uses_the_current_application_schema() -> 
     assert not settings.computer.enabled and not settings.computer.capture.enabled
     assert not settings.voice.enabled and not settings.web_voice.enabled
     assert not settings.notifications.enabled
+    assert settings.compaction.idle_after_hours == Settings().compaction.idle_after_hours == 1
+    assert (
+        settings.compaction.idle_trigger_percent == Settings().compaction.idle_trigger_percent == 10
+    )
     assert all(
         not getattr(settings.channels, name).enabled
         for name in ("onebot", "telegram", "qq", "weixin")

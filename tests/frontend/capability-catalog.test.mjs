@@ -76,6 +76,17 @@ const toggle = (h, tool = alpha) => h.other.querySelector(`[name="tool-enabled:$
 const detailButton = (h, tool = alpha) => h.other.querySelectorAll('[data-action="view-capability-tool"]').find((button) => button.dataset.capabilityId === tool.id);
 const onlyReads = (h) => assert.ok(h.requests.every((request) => request.method === undefined));
 
+test("the catalog distinguishes approval exemption from the current mode", async () => {
+  const compact = { ...beta, id: "compact-entry", name: "compact", requires_approval: false, approval_exempt: true };
+  const h = await catalogHarness(async (path) => path === "/capabilities" ? directory([compact, beta, alpha]) : undefined);
+  const rows = h.other.querySelectorAll(".tool-permission-row");
+  const textFor = (name) => rows.find((row) => row.querySelector("h4").textContent === name).textContent;
+  assert.match(textFor("compact"), /无需审批/);
+  assert.match(textFor(beta.name), /调用需要审批/);
+  assert.match(textFor(alpha.name), /仍受当前执行模式与权限限制/);
+  onlyReads(h);
+});
+
 test("the real catalog filters local text and real origins and displays the exact schema as text", async () => {
   const h = await catalogHarness();
   assert.equal(searchInput(h).name, ""); assert.equal(sourceInput(h).name, "");

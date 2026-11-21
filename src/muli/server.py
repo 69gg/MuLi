@@ -1073,6 +1073,7 @@ def _create_app(
                     "description": tool.description,
                     "risk": tool.risk,
                     "requires_approval": tool.requires_approval,
+                    "approval_exempt": runtime.tool_skips_approval(tool),
                     "enabled": tool.name not in settings.disabled_tools,
                 }
                 for tool in runtime.tools.values()

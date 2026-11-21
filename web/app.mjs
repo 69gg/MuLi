@@ -4977,7 +4977,14 @@ function renderMediaSettings() {
     if (key === "embedding") $("details.advanced-settings", details).append(field("查询专用参数", `${path}.query_extra_body`, pretty(config.query_extra_body ?? {}), { type: "textarea", rows: 3, json: true, format: "json" }));
     root.append(details);
   }
-  root.append(settingsSection("记忆与上下文", settingsJSON("memory", state.settingsDraft.memory ?? {}, [], 10, "记忆处理"), settingsJSON("compaction", state.settingsDraft.compaction ?? {}, [], 7, "上下文压缩"), state.settingsDraft.attention && settingsJSON("attention", state.settingsDraft.attention, [], 7, "主动关注")));
+  const compaction = state.settingsDraft.compaction ?? {};
+  root.append(settingsSection("记忆与上下文",
+    settingsJSON("memory", state.settingsDraft.memory ?? {}, [], 10, "记忆处理"),
+    element("div", { class: "field-row" },
+      field("压缩前的空闲时长（小时，0 关闭）", "compaction.idle_after_hours", compaction.idle_after_hours ?? "", { type: "number", min: 0, step: "any" }),
+      field("空闲压缩的上下文占用（%）", "compaction.idle_trigger_percent", compaction.idle_trigger_percent ?? "", { type: "number", min: 1, max: 100, step: 1 })),
+    settingsJSON("compaction", compaction, ["idle_after_hours", "idle_trigger_percent"], 7, "上下文压缩"),
+    state.settingsDraft.attention && settingsJSON("attention", state.settingsDraft.attention, [], 7, "主动关注")));
   return root;
 }
 
@@ -5026,7 +5033,8 @@ function capabilityOriginKey(origin) {
 
 function validCapabilityTool(tool) {
   if (!tool || typeof tool.id !== "string" || !tool.id || typeof tool.name !== "string" || !tool.name || typeof tool.description !== "string"
-    || typeof tool.risk !== "string" || typeof tool.requires_approval !== "boolean" || typeof tool.enabled !== "boolean") return false;
+    || typeof tool.risk !== "string" || typeof tool.requires_approval !== "boolean" || typeof tool.enabled !== "boolean"
+    || (tool.approval_exempt !== undefined && typeof tool.approval_exempt !== "boolean")) return false;
   const origin = tool.origin;
   return !!origin && (origin.kind === "unrecorded" || origin.kind === "mcp_interface"
     || origin.kind === "mcp" && typeof origin.server === "string" && typeof origin.remote_name === "string"
@@ -5106,7 +5114,7 @@ function updateCapabilityCatalog(slot, collect = true) {
     const view = actionButton("查看参数", "view-capability-tool", "text-button", undefined, { capabilityId: tool.id });
     list.append(element("div", { class: "tool-permission-row" }, element("div", {}, element("h4", { text: tool.name }), element("p", { text: tool.description }),
       element("p", { text: capabilityOriginLabel(tool.origin) }), element("p", { text: `已保存：${tool.enabled ? "启用" : "停用"}` }), draft,
-      element("p", { text: tool.requires_approval ? "调用需要审批" : "仍受当前执行模式与权限限制" }), view), element("span", { class: "row-tag", text: tool.risk || "工具" }), toggle));
+      element("p", { text: tool.requires_approval ? "调用需要审批" : tool.approval_exempt ? "无需审批" : "仍受当前执行模式与权限限制" }), view), element("span", { class: "row-tag", text: tool.risk || "工具" }), toggle));
   }
   const detail = $("#capability-catalog-detail", slot.root);
   detail.replaceChildren();

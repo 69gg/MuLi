@@ -85,7 +85,7 @@ def now() -> float:
     return time.time()
 
 
-def message_text_size(record: dict[str, Any]) -> int:
+def message_text_size(record: dict[str, Any], *, utf8: bool = False) -> int:
     """Text context accounting excludes inline media, whose bytes have their own limit."""
     data = dict(record)
     if data.get("images"):
@@ -93,7 +93,8 @@ def message_text_size(record: dict[str, Any]) -> int:
             {**image, "data": f"[inline image: {len(image.get('data', ''))} base64 chars]"}
             for image in data["images"]
         ]
-    return len(json.dumps(data, ensure_ascii=False))
+    text = json.dumps(data, ensure_ascii=False)
+    return len(text.encode("utf-8")) if utf8 else len(text)
 
 
 _EVIDENCE_METADATA = ("role", "source", "principal", "evidence_revision", "attachment_ids")
@@ -848,6 +849,19 @@ class Store:
             (kind, limit),
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def next_idle_session(self, *, inactive_before: float, after_id: str) -> tuple[str, str] | None:
+        row = self.db.execute(
+            "SELECT id,json_extract(data,'$.role') AS role FROM objects "
+            "WHERE kind='session' AND id>? AND json_extract(data,'$.status') IN ('idle','paused') "
+            f"AND coalesce(({_SESSION_RECORD_UPDATED}),({_SESSION_RECORD_CREATED}))<=? "
+            "AND NOT EXISTS (SELECT 1 FROM ingress WHERE session_id=objects.id AND state='pending') "
+            "AND (SELECT o.updated FROM message_order m JOIN objects o "
+            "ON o.kind='message' AND o.id=m.message_id WHERE m.session_id=objects.id "
+            "ORDER BY m.seq DESC LIMIT 1)<=? ORDER BY id LIMIT 1",
+            (after_id, inactive_before, inactive_before),
+        ).fetchone()
+        return (row["id"], row["role"] or "main") if row is not None else None
 
     def session_record_rows(
         self,

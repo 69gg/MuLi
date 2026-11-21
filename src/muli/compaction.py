@@ -7,7 +7,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Literal
 
 from muli.compaction_pins import (
     Pin,
@@ -27,6 +27,17 @@ from muli.store import Store, message_text_size, new_id, now
 SummaryFunction = Callable[[str, int], Awaitable[str]]
 PinsFunction = Callable[[str, dict[str, Any], Sequence[dict[str, Any]]], Sequence[Pin]]
 PinOverflowNotice = Callable[[str, str, str], None]
+ScheduleStatus = Literal[
+    "scheduled",
+    "disabled",
+    "unavailable",
+    "already_pending",
+    "busy",
+    "below_threshold",
+    "nothing_to_compact",
+]
+
+_ESTIMATED_BYTES_PER_TOKEN = 4
 
 
 def digest(records: list[dict[str, Any]]) -> str:
@@ -551,36 +562,55 @@ class Compactor:
             self._ready.pop(candidate.session_id, None)
             self._attempted.pop(candidate.session_id, None)
 
-    def observe(self, session_id: str) -> None:
-        if (
-            self._closed
-            or not self.settings().enabled
-            or session_id in self._tasks
-            or session_id in self._ready
-            or session_id in self._forget_tasks
-        ):
-            return
+    async def compact_idle(self, session_id: str, context_window: int) -> None:
+        if self.observe(session_id, idle_context_window=context_window) == "scheduled":
+            # Cancelling the scanner leaves the compactor in charge of the summary.
+            await asyncio.wait([self._tasks[session_id]])
+
+    def observe(
+        self,
+        session_id: str,
+        *,
+        idle_context_window: int | None = None,
+        requested: bool = False,
+    ) -> ScheduleStatus:
+        policy = self.settings()
+        if not policy.enabled:
+            return "disabled"
+        if self._closed or session_id in self._forget_tasks:
+            return "unavailable"
+        if session_id in self._tasks or session_id in self._ready:
+            return "already_pending"
         if len(self._tasks) + len(self._ready) >= self.max_jobs():
-            return
+            return "busy"
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return
+            return "unavailable"
+        maximum = self.max_chars()
         active = self.store.get("compaction", session_id) or {}
         base_cutoff = int(active.get("covered_seq", 0))
         # Snapshot size is bounded before starting network work; old native data is
         # removed only as a whole group and is never used as replacement protocol data.
-        records = self.store.message_prefix(
-            session_id, after=base_cutoff, max_chars=self.max_chars() * 4
-        )
-        if (
-            sum(message_text_size(item) for item in records) + len(active.get("summary", ""))
-            < self.max_chars() * self.settings().trigger_ratio
-        ):
-            return
+        records = self.store.message_prefix(session_id, after=base_cutoff, max_chars=maximum * 4)
+        previous_summary = str(active.get("summary", ""))
+        if not requested:
+            ratio = (
+                policy.trigger_ratio
+                if idle_context_window is None
+                else (policy.idle_trigger_percent / 100)
+            )
+            history_chars = sum(message_text_size(item) for item in records) + len(previous_summary)
+            if history_chars < maximum * ratio:
+                if idle_context_window is None:
+                    return "below_threshold"
+                history_bytes = sum(message_text_size(item, utf8=True) for item in records)
+                history_bytes += len(previous_summary.encode("utf-8"))
+                if history_bytes < idle_context_window * _ESTIMATED_BYTES_PER_TOKEN * ratio:
+                    return "below_threshold"
         available = self._available_groups(session_id, records)
         selected: list[dict[str, Any]] = []
-        target = self.max_chars() * (1 - self.settings().target_ratio)
+        target = maximum * (1 - policy.target_ratio)
         size = 0
         has_assistant = False
         for group in available:
@@ -592,18 +622,26 @@ class Compactor:
             if size >= target and has_assistant:
                 break
         if not has_assistant:
-            return
+            return "nothing_to_compact"
         fingerprint = self.fingerprint()
         attempt = (int(active.get("generation", 0)), int(selected[-1]["seq"]), fingerprint)
         if self._attempted.get(session_id) == attempt:
-            return
+            return "already_pending"
         self._attempted[session_id] = attempt
+        budget = None
+        if requested or idle_context_window is not None:
+            # A low threshold can select much less than the usual summary budget.
+            budget = min(
+                max(128, int(maximum * policy.target_ratio) // 2),
+                (size + len(previous_summary)) // 2,
+            )
         task = asyncio.create_task(
-            self._prepare(session_id, selected, active, fingerprint),
+            self._prepare(session_id, selected, active, fingerprint, budget=budget),
             name=f"muli-compact-{session_id}",
         )
         self._tasks[session_id] = task
         task.add_done_callback(lambda completed: self._done(session_id, completed))
+        return "scheduled"
 
     def _done(self, session_id: str, task: asyncio.Task[None]) -> None:
         owned = self._tasks.get(session_id) is task

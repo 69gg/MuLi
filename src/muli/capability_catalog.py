@@ -121,6 +121,7 @@ class CapabilityCatalog:
             "description": redact(tool.description),
             "risk": tool.risk,
             "requires_approval": tool.requires_approval,
+            "approval_exempt": self.runtime.tool_skips_approval(tool),
             "enabled": tool.name not in disabled,
             "origin": origin,
         }
