@@ -9,7 +9,8 @@ export function resolveTheme(saved, prefersDark = false) {
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   document.querySelector('meta[name="color-scheme"]')?.setAttribute("content", theme);
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#14262d" : "#edf4f6");
+  const canvasColor = getComputedStyle(document.documentElement).getPropertyValue("--canvas").trim();
+  if (canvasColor) document.querySelector('meta[name="theme-color"]')?.setAttribute("content", canvasColor);
   document.dispatchEvent(new CustomEvent("muli:themechange", { detail: theme }));
   return theme;
 }

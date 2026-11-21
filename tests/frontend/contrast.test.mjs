@@ -14,7 +14,7 @@ test("light and dark body, hints, placeholders and button text retain WCAG AA co
     const block = css.slice(css.indexOf(`${theme} {`)).split("}", 1)[0];
     const tokens = Object.fromEntries([...block.matchAll(/--([\w-]+):\s*(#[\da-f]{6});/gi)].map(([, key, value]) => [key, value]));
     for (const foreground of ["text", "text-strong", "muted", "faint", "accent", "accent-dark", "danger", "success"]) {
-      for (const background of ["canvas", "surface", "surface-2", "sidebar", "selected"]) {
+      for (const background of ["canvas", "surface", "surface-2", "sidebar", "hover", "selected"]) {
         assert.ok(contrast(tokens[foreground], tokens[background]) >= 4.5, `${theme}: ${foreground} on ${background} must be at least 4.5:1`);
       }
     }
@@ -25,4 +25,10 @@ test("light and dark body, hints, placeholders and button text retain WCAG AA co
     const rule = css.slice(css.indexOf(`${selector} {`)).split("}", 1)[0];
     assert.match(rule, /color:\s*var\(--muted\)/, `${selector} should use the readable text token`);
   }
+});
+
+test("conversation typography gives prose and reasoning separate readable type styles", () => {
+  assert.match(css, /\.message-body \{ font-size: 16px;/);
+  assert.match(css, /\.reasoning-content \{[^}]*font: 15px\/1\.8 var\(--font-serif\);/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*animation: none !important/);
 });
