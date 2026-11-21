@@ -767,6 +767,23 @@ def default_config_path() -> Path:
     return Path(os.environ.get("MULI_CONFIG", default_home() / "config.json")).expanduser()
 
 
+def _fill_config_defaults(
+    data: dict[str, Any], resolved: dict[str, Any], supplied: dict[str, Any]
+) -> int:
+    added = 0
+    for key, value in resolved.items():
+        if key not in data and key not in supplied:
+            data[key] = value
+            added += 1
+        elif (
+            isinstance(value, dict)
+            and isinstance(data.get(key), dict)
+            and isinstance(supplied.get(key), dict)
+        ):
+            added += _fill_config_defaults(data[key], value, supplied[key])
+    return added
+
+
 class ConfigFile:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -810,6 +827,27 @@ class ConfigFile:
         keep using ``public()`` so credentials are not exposed to remote clients.
         """
         return self.settings.model_dump()
+
+    def sync_defaults(self) -> int:
+        """Fill missing fields in an existing, unchanged configuration."""
+        path = self.path.resolve()
+        try:
+            source = path.read_bytes()
+        except FileNotFoundError:
+            return 0
+        settings = Settings.model_validate_json(source)
+        if settings != self.settings:
+            raise ValueError("configuration_changed")
+        data = json.loads(source)
+        # The validated, explicitly set fields account for legacy aliases. The
+        # raw document keeps owner-provided values and nested vendor options.
+        added = _fill_config_defaults(
+            data, settings.model_dump(mode="json"), settings.model_dump(exclude_unset=True)
+        )
+        if added:
+            Settings.model_validate(data)
+            self._write(path, data, expected=source)
+        return added
 
     def validate_changes(self, changes: dict[str, Any]) -> Settings:
         changes = copy.deepcopy(changes)
@@ -876,18 +914,24 @@ class ConfigFile:
         owner_warnings = list(settings.channels.owner_warnings)
         settings = Settings.model_validate(settings.model_dump())
         settings.channels.owner_warnings = owner_warnings
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=".muli-", dir=self.path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(settings.model_dump(), handle, ensure_ascii=False, indent=2)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(name, self.path)
-        finally:
-            Path(name).unlink(missing_ok=True)
+        self._write(self.path, settings.model_dump())
         self.settings = settings
         return settings
+
+    @staticmethod
+    def _write(path: Path, data: dict[str, Any], *, expected: bytes | None = None) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".muli-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if expected is not None and path.read_bytes() != expected:
+                raise ValueError("configuration_changed")
+            os.replace(name, path)
+        finally:
+            Path(name).unlink(missing_ok=True)
 
     @classmethod
     def _merge(

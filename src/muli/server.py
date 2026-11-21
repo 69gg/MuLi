@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -421,6 +422,28 @@ def _create_app(
 
     runtime.maintenance.on_configuration_release(wake_onboarding)
 
+    startup_defaults_pending = True
+
+    def sync_startup_defaults() -> None:
+        nonlocal startup_defaults_pending
+        if (
+            not startup_defaults_pending
+            or configuration_closing
+            or runtime.maintenance.configuration_blocked
+        ):
+            return
+        startup_defaults_pending = False
+        logger = logging.getLogger("muli.config")
+        try:
+            added = config.sync_defaults()
+        except (OSError, ValueError) as error:
+            logger.warning("启动配置未补写 error_type=%s", type(error).__name__)
+        else:
+            if added:
+                logger.info("启动配置已补写 defaults_added=%d", added)
+
+    runtime.maintenance.on_configuration_release(sync_startup_defaults)
+
     async def activate_components() -> None:
         # This callback also runs only after a managed boot has a durable final
         # decision. Passive/probation construction never prepares derived DDL.
@@ -487,6 +510,7 @@ def _create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             await management.recovery.recover()
+            sync_startup_defaults()
             if not (runtime.maintenance.permit and runtime.maintenance.permit.probation):
                 await activate_components()
             yield
