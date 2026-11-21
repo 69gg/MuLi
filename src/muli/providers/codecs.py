@@ -425,10 +425,11 @@ def build_request(
     return body
 
 
-def parse_usage(raw: JsonObject, protocol: str) -> Usage:
-    def count(value: Any) -> int:
-        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+def token_count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
+
+def parse_usage(raw: JsonObject, protocol: str) -> Usage:
     if protocol == "openai_chat":
         details = object_value(raw.get("completion_tokens_details"))
         cached = object_value(raw.get("prompt_tokens_details")).get("cached_tokens")
@@ -446,15 +447,15 @@ def parse_usage(raw: JsonObject, protocol: str) -> Usage:
         input_tokens, output_tokens = raw.get("input_tokens"), raw.get("output_tokens")
         if protocol == "anthropic":
             input_tokens = (
-                count(input_tokens)
-                + count(raw.get("cache_read_input_tokens"))
-                + count(raw.get("cache_creation_input_tokens"))
+                token_count(input_tokens)
+                + token_count(raw.get("cache_read_input_tokens"))
+                + token_count(raw.get("cache_creation_input_tokens"))
             )
     return Usage(
-        count(input_tokens),
-        count(output_tokens),
-        count(details.get("reasoning_tokens")),
-        count(cached),
+        token_count(input_tokens),
+        token_count(output_tokens),
+        token_count(details.get("reasoning_tokens")),
+        token_count(cached),
         deepcopy(raw),
     )
 

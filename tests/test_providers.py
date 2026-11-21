@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import replace
@@ -479,7 +480,10 @@ async def test_responses_stream_preserves_completed_reasoning_and_function_items
 
 
 @pytest.mark.asyncio
-async def test_anthropic_stream_keeps_signature_redacted_blocks_and_tool_input() -> None:
+async def test_anthropic_stream_keeps_signature_redacted_blocks_and_tool_input(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="muli.providers.client")
     events: list[JsonObject | str] = [
         {
             "type": "message_start",
@@ -490,6 +494,7 @@ async def test_anthropic_stream_keeps_signature_redacted_blocks_and_tool_input()
                 "usage": {
                     "input_tokens": 5,
                     "cache_read_input_tokens": 2,
+                    "cache_creation_input_tokens": 3,
                     "output_tokens": 0,
                 },
             },
@@ -566,7 +571,9 @@ async def test_anthropic_stream_keeps_signature_redacted_blocks_and_tool_input()
             [Message("user", "查词")], TOOLS
         )
     assert turn.content == "你好" and turn.reasoning == "想"
-    assert turn.usage.input_tokens == 7 and turn.usage.output_tokens == 4
+    assert turn.usage.input_tokens == 10 and turn.usage.output_tokens == 4
+    assert "input_tokens=10 output_tokens=4" in caplog.text
+    assert "cache_read_tokens=2 cache_write_tokens=3 anthropic_cache_requested=True" in caplog.text
     assert turn.tool_calls == [ToolCall("call_1", "lookup", '{"q":"词"}')]
     blocks = turn.provider_data["content_blocks"]
     assert blocks[:2] == [
@@ -577,7 +584,10 @@ async def test_anthropic_stream_keeps_signature_redacted_blocks_and_tool_input()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial_status", [429, 503])
-async def test_transient_failure_retries_before_output(initial_status: int) -> None:
+async def test_transient_failure_retries_before_output(
+    initial_status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="muli.providers.client")
     calls = 0
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -592,6 +602,13 @@ async def test_transient_failure_retries_before_output(initial_status: int) -> N
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         turn = await ModelClient(config(stream=False), http).complete([Message("user", "hi")])
     assert calls == 2 and turn.content == "你好"
+    failed, completed = [
+        record.getMessage() for record in caplog.records if record.name == "muli.providers.client"
+    ]
+    assert failed.split("request=")[1].split()[0] == completed.split("request=")[1].split()[0]
+    assert f"status={initial_status}" in failed and "retry=True" in failed
+    assert "protocol=openai_chat stream=False attempts=2" in completed
+    assert "cache_read_tokens=3 cache_write_tokens=0" in completed
 
 
 @pytest.mark.asyncio
@@ -690,7 +707,7 @@ async def test_stream_disconnect_retries_only_before_output(visible: bool) -> No
 
 
 @pytest.mark.asyncio
-async def test_auth_error_has_no_retry_or_secret_disclosure() -> None:
+async def test_auth_error_has_no_retry_or_secret_disclosure(caplog: pytest.LogCaptureFixture) -> None:
     calls = 0
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -700,8 +717,10 @@ async def test_auth_error_has_no_retry_or_secret_disclosure() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         with pytest.raises(ProviderError, match="HTTP 401") as error:
-            await ModelClient(config(), http).complete([Message("user", "hi")])
+            await ModelClient(config(), http).complete([Message("user", "private prompt")])
     assert calls == 1 and "secret-key" not in str(error.value)
+    assert "secret-key" not in caplog.text and "private prompt" not in caplog.text
+    assert "status=401" in caplog.text and "retry=False" in caplog.text
 
 
 @pytest.mark.asyncio

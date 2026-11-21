@@ -17,6 +17,7 @@ from muli.service import UserService
 
 async def _serve(args: argparse.Namespace) -> None:
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
 
     from muli.server import create_app
 
@@ -62,6 +63,11 @@ async def _serve(args: argparse.Namespace) -> None:
                 host=config.settings.server.host,
                 port=port,
                 log_level="info",
+                log_config=LOGGING_CONFIG
+                | {
+                    "loggers": LOGGING_CONFIG["loggers"]
+                    | {"muli": {"handlers": ["default"], "level": "INFO", "propagate": False}}
+                },
                 access_log=False,
                 timeout_graceful_shutdown=5,
                 workers=1,

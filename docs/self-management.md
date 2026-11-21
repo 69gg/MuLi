@@ -51,6 +51,8 @@ MCP 和 Skills 支持目录发现与热重载，Python 插件启停或修改仍�
 
 ## 主动读取自身日志
 
+服务日志会记录启动时补齐的配置项数量、模型协议、流式设置、尝试次数和耗时。成功时还记录输入、输出、思考和缓存读写 token 数，失败时记录 HTTP 状态或传输错误类型、是否已输出部分结果及重试等待时间。可用同一个 `request` 标识追踪一次模型调用的多次尝试。日志只记录这些诊断字段，请求内容、上游正文和密钥不写入日志。
+
 - `self_logs({"lines":40})`：读取最近服务日志，`lines` 范围 1–200，`segment` 默认 `current`。Linux 查询当前用户的 `muli.service`；macOS、Windows 读取服务启动器管理的 `data/logs/service.log`。开发模式可能没有对应日志。
 - `self_logs({"segment":"previous","lines":40})`：macOS、Windows 只读启动器仍保留的 `data/logs/service.log.1`，缺失或不可读时返回 `unavailable`，不回退当前文件。Linux 不支持这一文件段，返回 `unavailable/previous_segment_unsupported`，不会改查 journal 的其它范围。结果中的 `segment` 标明本次选择；旧文件不一定对应上次启动，也不包含更早已覆盖的日志。两次读取之间可能再次轮转，不能把段选择当作稳定历史游标。
 - `self_events({"limit":20,"level":"error"})`：查询保留的结构化系统事件，可按组件、错误代码和运行或会话 ID 过滤；用返回的 `next_before_event_id` 继续翻页。详见[系统事件](system-events.md)。
