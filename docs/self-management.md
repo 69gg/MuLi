@@ -106,7 +106,7 @@ MuLi service start
 
 修复后，可停机运行 `MuLi plugins enable personal` 再启动。两条变更命令只修改 `plugins.disabled` 中的对应 ID，不删插件或资料；`enable` 不会覆盖全局 `plugins.enabled` 或插件清单里的停用设置。可信 Python 插件的既有副作用无法靠停用回滚。
 
-`persona.prompt` 替换基础提示词，`persona.append` 追加个性设定，插件的 `append_prompt` 再追加内容。日常记忆和长对话不需要编写插件，分别见[记忆](memory.md)与[长对话](context.md)。
+默认人格减少机械复述和客服式话术，遇到困难时回应具体关切和下一步。篇幅、排版和标点按内容、渠道与用户要求来。需要自定义语气时，可用 `persona.append` 追加设定，或将 `persona.prompt_scope` 设为 `persona`，通过 `persona.prompt` 替换人格层。插件的 `append_prompt` 可再追加内容。日常记忆和长对话分别见[记忆](memory.md)与[长对话](context.md)。
 
 ## 持续工作账本
 

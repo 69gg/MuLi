@@ -59,6 +59,13 @@ def test_default_layers_render_in_fixed_order(tmp_path: Path) -> None:
     assert positions == sorted(positions)
 
 
+def test_default_persona_keeps_warmth_and_technical_detail(tmp_path: Path) -> None:
+    text = _build(tmp_path, Persona())
+    assert "回应眼前的具体难处" in text
+    assert "按需要展开条件、术语和细节" in text
+    assert "篇幅、排版和标点按当下的内容、渠道与用户要求来" in text
+
+
 @pytest.mark.parametrize(
     ("scope", "custom", "has_base", "has_persona"),
     [
