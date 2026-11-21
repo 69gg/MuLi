@@ -188,6 +188,8 @@ class ModelProfile(Section):
     thinking_param: str | None = None
     thinking_budget: int | None = Field(default=None, strict=True, ge=1)
     send_thinking_budget: bool = Field(default=True, strict=True)
+    anthropic_prompt_cache: bool = Field(default=True, strict=True)
+    anthropic_adaptive_thinking: bool = Field(default=True, strict=True)
     vision: bool = False
     extra_body: dict[str, Any] = Field(default_factory=dict)
     extra_headers: dict[str, str] = Field(default_factory=dict)

@@ -61,7 +61,16 @@ Anthropic Messages 必须提供 `max_tokens`，因此已完整配置的 Anthropi
 
 ## 思考与高级参数
 
-按模型文档配置 `reasoning`、`thinking` 或 `reasoning_effort`。不要仅因为模型名称里含有某个词就打开思考。
+在「设置 → 模型 → 模型连接」选用 Anthropic Messages 后，可为每个模型角色设置以下开关。
+
+| 配置项 | 默认值 | 行为 |
+| --- | --- | --- |
+| `anthropic_prompt_cache` | `true` | 使用 Anthropic 官方自动提示词缓存，发送顶层 `cache_control`，让上游随对话推进缓存断点。关掉后省略该字段。 |
+| `anthropic_adaptive_thinking` | `true` | 对已识别、支持该能力的 Claude 模型请求自适应思考和摘要。上游返回摘要时，网页在「思考过程」中显示。 |
+
+自动缓存默认有效期为 5 分钟。需要自定义 TTL 时，可通过 `extra_body.cache_control` 设置。上游决定是否写入或命中，提示词长度低于模型门槛时不会缓存。兼容代理若不接受顶层字段，可以关闭自动缓存。OpenAI 协议沿用供应商的缓存机制。 [Anthropic 提示词缓存](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+
+显式配置的 `thinking`、兼容 `reasoning`、`extra_body.thinking` 或已启用的自定义预算映射优先。未知模型 ID 可用高级参数手动配置。对上游默认开启思考且允许关闭的模型，关闭开关会在当前 effort 支持时请求关闭或仅保留工具间思考。强制思考的模型及不支持关闭的 effort 组合仍按上游规则运行。 [Anthropic 思考配置](https://platform.claude.com/docs/en/build-with-claude/thinking#configuring-thinking)
 
 | 参数 | OpenAI Chat | OpenAI Responses | Anthropic Messages |
 | --- | --- | --- | --- |
@@ -78,7 +87,7 @@ Anthropic Messages 必须提供 `max_tokens`，因此已完整配置的 Anthropi
 }
 ```
 
-手动思考预算至少 1024，并且小于实际输出上限。自适应或关闭模式不要附带手动预算；能否使用这些模式及 effort 值，以服务支持情况为准。空思考对象表示省略，显式关闭应使用服务支持的关闭参数。
+手动思考预算至少 1024，并且小于实际输出上限。其他模式省略手动预算，具体模式和 effort 值由上游决定。空思考对象沿用开关和模型默认行为，`reasoning_effort` 留空时沿用上游默认值。
 
 `extra_body` 和 `extra_headers` 用于兼容服务的附加参数与请求头。普通使用无需填写。高级参数不能替代消息、工具、鉴权地址等由沐璃管理的请求内容；显式输出上限也不能被它扩大。OpenAI Chat 默认映射到 `max_completion_tokens`，仅支持旧字段的服务可按其要求使用 `extra_body.max_tokens`，不要同时发送两个相冲突的上限字段。
 

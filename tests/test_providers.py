@@ -35,12 +35,87 @@ def config(protocol: ProtocolName = "openai_chat", **options: Any) -> ModelConfi
         options.setdefault("max_output_tokens", 4096)
     return ModelConfig(
         protocol=protocol,
-        model="test-model",
+        model=options.pop("model", "test-model"),
         base_url="https://example.test/v1/",
         api_key="secret-key",
         retry_backoff=0,
         **options,
     )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_automatic_cache_is_top_level_and_can_be_disabled(stream: bool) -> None:
+    messages = [Message("system", "规则"), Message("user", "问题")]
+    default = build_request(config("anthropic"), messages, TOOLS, stream=stream)
+    assert default["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in default["messages"][0]["content"][0]
+    cache = {"type": "ephemeral", "ttl": "1h"}
+    manual = build_request(
+        config("anthropic", extra_body={"cache_control": cache}), messages, TOOLS, stream=stream
+    )
+    assert manual["cache_control"] == cache
+    disabled = build_request(
+        config("anthropic", anthropic_prompt_cache=False, extra_body={"cache_control": cache}),
+        messages,
+        TOOLS,
+        stream=stream,
+    )
+    assert "cache_control" not in disabled
+
+
+@pytest.mark.parametrize(
+    ("model", "enabled", "effort", "expected"),
+    [
+        ("claude-sonnet-4-6", True, None, "adaptive"),
+        ("claude-opus-4-8-20260901", True, "medium", "adaptive"),
+        ("claude-haiku-4-5-20251001", True, None, None),
+        ("vendor-claude-sonnet-4-6", True, None, None),
+        ("claude-sonnet-4-6", False, None, None),
+        ("claude-opus-5-5", False, None, None),
+        ("claude-haiku-5-5", False, "high", "disabled"),
+        ("claude-opus-5", False, "max", None),
+        ("claude-sonnet-5-5", False, None, "between_tools"),
+        ("claude-sonnet-5", False, None, "disabled"),
+    ],
+)
+def test_anthropic_adaptive_thinking_uses_model_capabilities(
+    model: str, enabled: bool, effort: str | None, expected: str | None
+) -> None:
+    body = build_request(
+        config(
+            "anthropic", model=model, anthropic_adaptive_thinking=enabled, reasoning_effort=effort
+        ),
+        [Message("user", "问题")],
+        [],
+        stream=True,
+    )
+    if expected is None:
+        assert "thinking" not in body
+    elif expected == "adaptive":
+        assert body["thinking"] == {"type": "adaptive", "display": "summarized"}
+    else:
+        assert body["thinking"] == {"type": expected}
+    assert body.get("output_config") == ({"effort": effort} if effort is not None else None)
+
+
+def test_anthropic_respects_manual_thinking_and_openai_ignores_switches() -> None:
+    messages = [Message("user", "问题")]
+    body = build_request(
+        config(
+            "anthropic",
+            model="claude-sonnet-4-6",
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            extra_body={"thinking": {"type": "adaptive", "display": "omitted"}},
+        ),
+        messages,
+        [],
+        stream=False,
+    )
+    assert body["thinking"] == {"type": "adaptive", "display": "omitted"}
+    for protocol in ("openai_chat", "openai_responses"):
+        wire = build_request(config(protocol, model="claude-opus-5-5"), messages, [], stream=False)
+        assert "cache_control" not in wire
+        assert "thinking" not in wire
 
 
 @pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic"])

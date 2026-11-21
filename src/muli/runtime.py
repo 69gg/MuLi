@@ -2716,6 +2716,8 @@ class Runtime:
             thinking_param=profile.thinking_param,
             thinking_budget=profile.thinking_budget,
             send_thinking_budget=profile.send_thinking_budget,
+            anthropic_prompt_cache=profile.anthropic_prompt_cache,
+            anthropic_adaptive_thinking=profile.anthropic_adaptive_thinking,
             vision=profile.vision,
             stream=getattr(profile, "stream", True),
             max_response_bytes=getattr(profile, "max_response_bytes", 8_388_608),

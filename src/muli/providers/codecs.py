@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
@@ -44,6 +45,46 @@ _THINKING_PROTECTED_FIELDS = _PROTECTED_FIELDS | {
     "max_completion_tokens",
     "max_output_tokens",
 }
+
+# Anthropic Messages model support table:
+# https://platform.claude.com/docs/en/build-with-claude/thinking#configuring-thinking
+# Values describe the request to send when MuLi's adaptive thinking is off.
+_ANTHROPIC_ADAPTIVE_MODELS = {
+    "claude-sonnet-4-6": None,
+    "claude-opus-4-6": None,
+    "claude-opus-4-7": None,
+    "claude-opus-4-8": None,
+    "claude-sonnet-5": "disabled",
+    "claude-opus-5": "disabled",
+    "claude-haiku-5-5": "disabled",
+    "claude-sonnet-5-5": "between_tools",
+    "claude-opus-5-5": None,
+    "claude-fable-5": None,
+    "claude-fable-5-1": None,
+    "claude-fable-5-2": None,
+    "claude-mythos-5": None,
+    "claude-mythos-5-1": None,
+    "claude-mythos-5-2": None,
+    "claude-mythos-preview": None,
+}
+
+
+def _apply_anthropic_defaults(body: JsonObject, config: ModelConfig) -> None:
+    if config.anthropic_prompt_cache:
+        body.setdefault("cache_control", {"type": "ephemeral"})
+    else:
+        body.pop("cache_control", None)
+    if "thinking" in body or (config.thinking_param and config.send_thinking_budget):
+        return
+    model = re.sub(r"-(?:latest|[0-9]{8})$", "", config.model.lower())
+    if model not in _ANTHROPIC_ADAPTIVE_MODELS:
+        return
+    if config.anthropic_adaptive_thinking:
+        body["thinking"] = {"type": "adaptive", "display": "summarized"}
+    elif (thinking_type := _ANTHROPIC_ADAPTIVE_MODELS[model]) is not None:
+        effort = object_value(body.get("output_config")).get("effort")
+        if model == "claude-sonnet-5" or effort not in ("xhigh", "max"):
+            body["thinking"] = {"type": thinking_type}
 
 
 def _apply_thinking_budget(body: JsonObject, config: ModelConfig) -> None:
@@ -348,6 +389,7 @@ def build_request(
             if not isinstance(output_config, dict):
                 raise ValueError("Anthropic output_config 必须是对象")
             output_config.setdefault("effort", config.reasoning_effort)
+        _apply_anthropic_defaults(body, config)
         if "stop" in body:
             body.setdefault("stop_sequences", body.pop("stop"))
         if "parallel_tool_calls" in body:
@@ -370,14 +412,14 @@ def build_request(
         if not isinstance(thinking, dict):
             raise ValueError("Anthropic thinking 必须是对象")
         thinking_type = thinking.get("type")
-        if thinking_type not in {"enabled", "adaptive", "disabled"}:
-            raise ValueError("Anthropic thinking.type 必须是 enabled/adaptive/disabled")
+        if thinking_type not in ("enabled", "adaptive", "disabled", "between_tools"):
+            raise ValueError("Anthropic thinking.type 必须是 enabled/adaptive/disabled/between_tools")
         if thinking_type == "enabled":
             budget = thinking.get("budget_tokens")
             if type(budget) is not int or not 1024 <= budget < body[token_field]:
                 raise ValueError("Anthropic thinking.budget_tokens 必须至少为 1024 且小于输出上限")
         elif "budget_tokens" in thinking:
-            raise ValueError("Anthropic adaptive/disabled thinking 请省略 budget_tokens")
+            raise ValueError("Anthropic 只有手动思考模式接受 budget_tokens")
     if tools:
         body["tools"] = _tools(tools, config.protocol)
     return body

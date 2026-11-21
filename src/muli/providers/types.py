@@ -38,6 +38,8 @@ class ModelConfig:
     thinking_budget: int | None = None
     send_thinking_budget: bool = True
     vision: bool = False
+    anthropic_prompt_cache: bool = True
+    anthropic_adaptive_thinking: bool = True
 
     def __post_init__(self) -> None:
         if self.protocol not in {"openai_chat", "openai_responses", "anthropic"}:

@@ -4929,6 +4929,10 @@ function renderModelSettings() {
   const baseField = field("API Base URL", `${path}.base_url`, model.base_url ?? "", { type: "url", placeholder: "填写服务地址" });
   const contextField = field("上下文长度（Token）", `${path}.context_window`, model.context_window ?? "", { type: "number", min: 8192, max: 10000000, step: 1, required: role === "main", hint: "用于上下文压缩；所有已配置的模型都必须填写。" });
   const token = field("最大输出 Token", `${path}.max_output_tokens`, model.max_output_tokens ?? "", { type: "number", min: 128, max: 131072, step: 1, placeholder: "使用服务默认值", hint: "Anthropic 配置需要填写；其它协议可留空。" });
+  const anthropicOptions = element("div", { hidden: protocol !== "anthropic" },
+    switchField("自动提示词缓存", `${path}.anthropic_prompt_cache`, model.anthropic_prompt_cache !== false),
+    switchField("自适应思考", `${path}.anthropic_adaptive_thinking`, model.anthropic_adaptive_thinking !== false),
+    element("p", { class: "settings-role-hint", text: "自适应思考取决于模型能力。高级参数里的显式 Thinking 优先。" }));
   const advanced = element("details", { class: "advanced-settings" }, element("summary", { text: "高级参数" }),
     element("div", { class: "field-row" }, field("Temperature", `${path}.temperature`, model.temperature ?? "", { type: "number", step: .1, min: 0, max: 2, placeholder: "使用模型默认值" }), field("Top P", `${path}.top_p`, model.top_p ?? "", { type: "number", step: .05, min: 0, max: 1, placeholder: "使用模型默认值" })),
     field("超时（秒）", `${path}.timeout`, model.timeout ?? "", { type: "number", min: 1, max: 600, placeholder: "使用服务默认值" }),
@@ -4943,7 +4947,7 @@ function renderModelSettings() {
     model.api_key_set && switchField("清除已存 API Key", `${path}.clear_api_key`, false));
   const hints = { worker: "未单独配置时，复用主模型。", compactor: "未单独配置时，复用主模型。", memory_extractor: "用于后台提取记忆；未配置时复用主模型。", reviewer: "未单独配置时，复用主模型。", vision: "主模型支持图片时复用主模型；否则需要单独配置支持图片的视觉模型。" };
   const content = element("div", {}, tabs, hints[role] && element("p", { class: "settings-role-hint", text: hints[role] }),
-    settingsSection("模型连接", protocolField, modelField, baseField, contextField, field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), token, switchField("支持图片", `${path}.vision`, model.vision), advanced));
+    settingsSection("模型连接", protocolField, modelField, baseField, contextField, field("API Key", `${path}.api_key`, model.api_key ?? "", { type: "password", placeholder: model.api_key_set ? "已配置，留空保留" : "输入 API Key", hint: model.api_key_set ? "已有密钥不会显示。" : undefined }), token, switchField("支持图片", `${path}.vision`, model.vision), anthropicOptions, advanced));
   const protocolInput = $("select", protocolField);
   const modelInput = $("input", modelField);
   const baseInput = $("input", baseField);
@@ -4951,6 +4955,7 @@ function renderModelSettings() {
   const updateRequired = () => {
     const configured = role === "main" || !!modelInput.value.trim() || !!baseInput.value.trim();
     $("input", token).required = protocolInput.value === "anthropic" && configured;
+    anthropicOptions.hidden = protocolInput.value !== "anthropic";
     contextInput.required = configured;
   };
   protocolInput.addEventListener("change", updateRequired);

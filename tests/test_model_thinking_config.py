@@ -123,6 +123,8 @@ def test_runtime_passes_canonical_thinking_fields(tmp_path: Path) -> None:
                     "thinking_param": "vendor_budget",
                     "thinking_budget": 2048,
                     "send_thinking_budget": False,
+                    "anthropic_adaptive_thinking": False,
+                    "anthropic_prompt_cache": False,
                 }
             }
         }
@@ -133,3 +135,5 @@ def test_runtime_passes_canonical_thinking_fields(tmp_path: Path) -> None:
     assert profile.thinking_param == "vendor_budget"
     assert profile.thinking_budget == 2048
     assert profile.send_thinking_budget is False
+    assert profile.anthropic_adaptive_thinking is False
+    assert profile.anthropic_prompt_cache is False
