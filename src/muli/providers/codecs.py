@@ -413,7 +413,9 @@ def build_request(
             raise ValueError("Anthropic thinking 必须是对象")
         thinking_type = thinking.get("type")
         if thinking_type not in ("enabled", "adaptive", "disabled", "between_tools"):
-            raise ValueError("Anthropic thinking.type 必须是 enabled/adaptive/disabled/between_tools")
+            raise ValueError(
+                "Anthropic thinking.type 必须是 enabled/adaptive/disabled/between_tools"
+            )
         if thinking_type == "enabled":
             budget = thinking.get("budget_tokens")
             if type(budget) is not int or not 1024 <= budget < body[token_field]:

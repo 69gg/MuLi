@@ -707,7 +707,9 @@ async def test_stream_disconnect_retries_only_before_output(visible: bool) -> No
 
 
 @pytest.mark.asyncio
-async def test_auth_error_has_no_retry_or_secret_disclosure(caplog: pytest.LogCaptureFixture) -> None:
+async def test_auth_error_has_no_retry_or_secret_disclosure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     calls = 0
 
     def handler(_: httpx.Request) -> httpx.Response:
